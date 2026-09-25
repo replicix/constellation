@@ -38,6 +38,8 @@ use std::sync::{Arc, Mutex};
 pub enum OpKind {
     Put,
     Get,
+    /// A `HEAD` (`get_opts` with `head: true`), counted apart from `GET`.
+    Head,
 }
 
 /// Which calls (counted per rule, 1-based, over calls whose path contains
@@ -300,7 +302,12 @@ impl ObjectStore for FaultyStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        match self.fault_for(OpKind::Get, location) {
+        let kind = if options.head {
+            OpKind::Head
+        } else {
+            OpKind::Get
+        };
+        match self.fault_for(kind, location) {
             None | Some(Fault::AppliedThen(_)) | Some(Fault::AppliedThenTimeout) => {
                 self.inner.get_opts(location, options).await
             }

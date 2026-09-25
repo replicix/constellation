@@ -414,43 +414,19 @@ impl Filesystem for FuseFs {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let name = checked_name!(name, reply);
-        let ino = match self.meta.allocate_ino(parent) {
-            Ok(ino) => ino,
-            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+        let caller = Caller {
+            uid: req.uid(),
+            gid: req.gid(),
+            pid: req.pid(),
         };
-        let result = if self.meta.is_scratch_dir(parent).unwrap_or(false)
-            || self.meta.scratch_getattr(parent).ok().flatten().is_some()
-        {
-            self.meta
-                .scratch_create(parent, &name, ino, mode, req.uid(), req.gid())
-                .map_err(|e| errno(&e))
-        } else {
-            self.mutate_op(
-                parent,
-                constellation_meta::MutateOp::Create {
-                    parent,
-                    name: name.into_owned(),
-                    ino,
-                    mode,
-                    uid: req.uid(),
-                    gid: req.gid(),
-                },
-            )
-            .and_then(|()| {
-                self.meta
-                    .getattr(ino)
-                    .map_err(|e| errno(&e))?
-                    .ok_or(libc::EIO)
-            })
-        };
-        match result {
-            Ok(attr) => {
+        match self.create_or_open(parent, &name, mode, flags, &caller) {
+            Ok((attr, _created)) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
                 reply.created(
                     self.ttl(),

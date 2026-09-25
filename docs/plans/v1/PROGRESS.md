@@ -22103,3 +22103,284 @@ Harness (prefix `constellation-harness-m16fix`), all PASS:
 frequency-limited): the syncs added are on rare paths (promises, seals,
 epoch changes, a grant horizon at most once a second); the placement
 count is one relaxed atomic per root fast-path write.
+
+## Fix: OVH real-S3 findings (O_CREAT race, shared-dir create latency, untar, 409)
+
+Branch `fix-ovh-findings` at main `df14686`. Sources: the OVH run
+(`constellation-m14/OVH-BRUTAL-REPORT.md`, findings 1, 4, 5, 6) and the
+EC2 round 3 (`EC2-ROUND3-REPORT.md`, run with the `5384772` allowlist fix:
+it reproduces findings 1, 4 and 6 unchanged on AWS, so none of them was
+the allowlist lockout; the harness confirms it — `inbox ops 0` on every
+node, every forward went over P2P).
+
+### 1. `open(O_CREAT)` without `O_EXCL` got `EEXIST` (High, POSIX)
+
+**Root cause.** The kernel sends FUSE `create` only after its own lookup
+missed, but on a cluster that lookup can be stale: another node's create
+of the name lands in between. Every path then reports the lost race as
+`EEXIST` — the sequencer's fast path (`execute_mutate` → `MetaError::Exists`),
+a delegate's, a forward (`MutateOutcome::Exists`, whose hint installs the
+winner's entry), the S3 inbox (`Errno(EEXIST)`) — and `fusefs_ops::create`
+returned it whatever the flags. For a create the kernel believes it made
+(`FMODE_CREATED`) it has no retry, so the application saw `EEXIST` with no
+`O_EXCL`; SQLite, whose `open(O_RDWR|O_CREAT)` failed, fell back to
+read-only ("attempt to write a readonly database"). Not in the core: the
+FUSE layer only.
+
+**Fix** (`ConstellationFs::create_or_open`, `crates/cli/src/fusefs.rs`;
+`create` calls it). Without `O_EXCL`, an `EEXIST` from any path looks the
+name up behind the lookup's read wait (`strict_read`: the refusal's hint
+or observed position covers the winner's entry) and opens what is there:
+- a regular file is opened here with a fresh handle and its current
+  attributes (a pending write's size included), after the permission check
+  the kernel skips for a file it believes this call created (mode bits,
+  owner/group/other, supplementary groups from `/proc/<pid>/status`, root
+  bypass; the mount enables no ACLs) and the `O_TRUNC` it skips too
+  (`setattr(size = 0)`, fenced under a lapsed lock grant like `setattr`);
+- a directory is `EISDIR` (as `open(O_CREAT)` of one is);
+- a symlink, FIFO or device node is `ESTALE`: `do_filp_open` repeats the
+  walk once with `LOOKUP_REVAL`, which finds the entry and opens it the
+  ordinary way (follows the link, opens the FIFO);
+- a name gone again (unlinked meanwhile) is created afresh, up to 8 times.
+With `O_EXCL` the `EEXIST` stands. `mknod` (always exclusive) is unchanged.
+
+**Evidence.** New harness scenario `concurrent-create-no-excl` (four
+nodes, `CREATE_RACE_ROUNDS` 20): on the unfixed binary the first round
+failed exactly like the report, `b`, `c`, `d` `EEXIST` 3/3
+(`race/p0 (Plain): open(O_CREAT) without O_EXCL failed on ["b","c","d"]`).
+Fixed: **5/5 PASS** (seeds 1–5): per run 20 rounds each of plain
+(`O_CREAT`, every racer `pwrite`s its byte, the file ends `abcd` on every
+node), `O_TRUNC` and `O_EXCL` (exactly one winner, the rest `EEXIST`) on
+the sequencer plus three forwarders; plain and `O_EXCL` in a subtree
+delegated to `b`; plain and `O_EXCL` between the sequencer and `d` cut
+from every peer (24 ops through the S3 inbox per run); 10 rounds of two
+nodes first-touching a new SQLite database (`CREATE TABLE IF NOT EXISTS`
++ insert), no failure. Unit tests `fusefs::create_or_open_tests` (5): an
+absent name is created; a lost race opens the winner without `O_EXCL`
+(`O_RDWR`/`O_WRONLY`/`O_RDONLY`) and is `EEXIST` with it; `O_TRUNC`
+truncates what it found; directory `EISDIR`, symlink and FIFO `ESTALE`;
+the permission check (owner, group, other, `O_TRUNC` needs write, root).
+
+### 2. A non-owner's small-file create+write+close cost an S3 round trip (Medium, perf)
+
+**What the round trip was** (harness, S3 100 ms away each way, counting
+proxies, debug logs). Not the inbox (0 inbox ops), not the chunk (the
+bench's payload repeats per node, so every close but the first is a dedup
+hit on the owner and the non-owners alike), not a ReadIndex, a recall or
+a split. It is plan 30 M5's stale-base rule: the close's forwarded
+`SetManifest` finds the file's `Create` — the same requester's op a
+millisecond earlier — still in the sequencer's unshipped journal, so the
+reply carries `base: None`; the requester cannot install it as a shadow
+and waits for its transaction (`AwaitingLog`). The only thing that
+answered that wait was the log: the sequencer's next ship (one S3 PUT,
+serialized behind the one in flight) and the segment's stream back. Trace
+of one non-owner file: create forwarded and answered in 1 ms, close's
+forward answered in 1 ms with `base=None`, the close returns 406 ms later
+when segment 27 (its own row) is applied. Measured: non-owner
+`SmallWrite` p50 407–414 ms on all three non-owners against 2 ms on the
+sequencer (= the reports' 53 ms AWS / 402 ms OVH, one PUT each).
+
+Plan 30 §M9 says this should not wait for S3: with a backup the holder
+streams each backup-acknowledged transaction to the subscribers ahead of
+S3 ("visibility no longer waits for S3"). Two gaps kept it from doing so:
+- the requester's `AwaitingLog` op was answered only from applied
+  segments (`answer_awaiting_log`), never when the pre-S3 stream installed
+  its very transaction here (the rows were in the replica, the op still
+  waited for S3);
+- the backups themselves were excluded from the stream-ahead ("a backup
+  holds these rows already in its tail") — but a tail is not the
+  namespace: the backup's own clients waited for S3 on every such op.
+
+**Fix** (core, `crates/authority/src/core/{client,backup}.rs`, meta
+`adopt_streamed`):
+- `on_stream_ahead` collects this node's own rids among the transactions
+  it installed; `answer_awaiting_streamed` answers each op of theirs in
+  `AwaitingLog`: it adopts the streamed entry as the node's own op
+  (`Meta::adopt_streamed`: the M9 rule `install_shadow` already applied
+  when a stream beat the reply — stranded by a takeover it replays by rid),
+  notes the op's keys as covered at the reply's position (as a shadow
+  does) and finishes it. The same check runs when the reply arrives after
+  the stream (`on_mutate_reply`). Only for a reply whose position names no
+  delegation stream: the root's stream carries its journal, not the
+  delegate streams an op may have been evaluated behind; those still wait
+  for the log (a first version without that condition turned
+  `delegated-holder-cut` seed 1607 into a spec violation — see the
+  pre-existing failures below — so it stays conservative).
+- the stream-ahead goes to every subscriber, the backups included.
+- `status.ack.awaited_log` / `awaited_log_streamed` count both.
+
+**Evidence.** New harness scenario `nonowner-op-latency` (four nodes,
+placement off so the root stays the sequencer, waits for the backup,
+then S3 100 ms each way; each node in turn times what an untar does per
+entry). Unfixed binary: non-owner `SmallWrite` p50 407–414 ms, a whole
+`tar` file (create/write/close/`utimensat`/`chmod`) 815–828 ms, against
+2–3 ms on the sequencer; `chmod`/`link`/`chown`/`utimensat` right after a
+forwarded close 205–218 ms (their base is the close's unshipped row).
+Fixed, **5/5 PASS**: non-owners (the backup `b` included) `SmallWrite`
+p50 5.9–14 ms, `TarFile` 18–29 ms, attribute ops 5–7 ms, mkdir/symlink
+2 ms; 101–105 of each non-owner's ~107 waiting forwards answered from
+the stream (the rest by the log). Core unit/sim: new sim test
+`an_accepted_forward_is_answered_from_the_pre_s3_stream` (five
+`long-backup` seeds where the path runs; linearizability, convergence
+and strict acknowledgement order checked by `run_seed`; zero answered
+without the fix).
+
+**Still costs S3 by a documented rule** (not changed):
+- *No backup.* Until one is committed (the first seconds after a mount,
+  `backup_stable_ms` 2 s plus the CAS) or when no peer is within
+  `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (WAN), `durable_jseq` makes every
+  acknowledgement under `ack=local` wait for the log while a backup could
+  be had (`backup.rs`, "nothing is acknowledged under Local … on nobody's
+  disk but ours"), and there is no stream-ahead. A WAN-only cluster's
+  forward behind its own unshipped row still waits for the log.
+- *A delegated directory.* With placement on (the default), a directory
+  one node dominates is delegated to it (and a hot shared one split into
+  hash ranges); other nodes' ops forward to that delegate, whose reply
+  behind its own unappended rows is `base: None` too and waits for the
+  root's append and ship (one S3 PUT). The harness saw this when the
+  scenario ran with placement on (`b` dominated `shared` and got it;
+  `c`/`d` then paid ~205 ms per op). The OVH/EC2 4-writer shared-directory
+  runs may have been in this state. Follow-up: stream a delegate's
+  appended rows ahead too, or let a delegate answer from its own stream.
+- An attempt at a protocol-level fix — the holder names the requester's
+  own unshipped rids (`ReplyBase::after`) so the requester stacks the new
+  shadow on its own previous ones — is **unsound** with M3's retirement
+  and was dropped: a segment retiring stacked shadows re-applies their
+  records on top of the state they already produced, and `create f3;
+  rename f3 f1` replayed over its own result leaves both names
+  (`long-backup` seed 50412, spec violation). Shadows are only safe one
+  per key.
+
+### 3. Untar at ~0.63 s/file (Informational)
+
+Two costs, both now measured with request-kind evidence:
+- **A non-owner's per-entry forwards** (item 2): the close, then
+  `utimensat`, then `chmod` of the file each waited for the previous row's
+  ship: ~2–3 S3 round trips per file on a non-owner (815 ms per `tar`
+  file in the harness at 200 ms/request). Fixed with item 2 (18–29 ms).
+- **Write-through** (`writeback.mode = through`): the effective default
+  (`main.rs` fills `through` when neither the flag nor the registry sets
+  one; plan 08 §3: "`through` (today's behavior, stays the default):
+  `close()` seals and uploads inline"). A file with new content pays its
+  chunk's S3 PUT in `close()` on every node, the owner included — EC2
+  round 3's controlled test: 1.5 ms/file same content, 60 ms/file unique.
+  The harness's request log adds that it is more than one PUT: every chunk
+  upload first GETs `gc/condemned` (`put_chunk_mode` → `gc::is_condemned`,
+  "checking the pointer at each dedup decision"), then PUTs — two
+  serialized round trips per unique small file on the sequencer
+  (`UniqueWrite` p50 407 ms at 200 ms/request: `GET gc/` + `PUT chunks/`
+  per file) and three on a non-owner, whose adaptive dedup ladder had
+  switched to `Probe` (`HEAD chunks/` first; 611 ms). A non-owner's close
+  also uploads before it forwards the manifest in *both* modes
+  (`commit_manifest_forwarded`: the log must never name a chunk S3 lacks,
+  and the holder's ship gate only knows its own pending uploads), so
+  `--write-mode back` helps the sequencer's closes only.
+
+  Not changed here: which durability `close()` promises is a product
+  decision. Options for the coordinator: (a) make `back` the default for
+  the sequencer's own closes (its ship already waits for its uploads —
+  plan 08's invariant — so correctness holds; the cost is that a close
+  acknowledges bytes that live only on that node's disk until drained,
+  plan 08's "permanent node loss before drain" row); (b) keep `through`
+  but overlap the `gc/condemned` read with the conditional create
+  (reading the pointer during, not before, the PUT is never less
+  conservative; a create that turns out to be a dedup hit on a condemned
+  chunk then re-PUTs unconditionally) — one round trip saved per chunk;
+  (c) document `constellation write-mode <fs> back` for bulk imports
+  (untar, rsync), flipping back afterwards, as plan 08 intended.
+
+### 4. OVH answers a losing conditional write with 409 before 412 (Informational)
+
+`crates/store-s3/src/cas.rs` (plan 30 §M4 item 1) already maps it right:
+a 409 on `If-None-Match` is `AlreadyExists` wrapping the raw HTTP error
+and classifies `Busy` (retried as the same attempt, never a dedup hit or
+a lost race); on `If-Match` `object_store` retries 409s itself
+(`retry_on_conflict` — the "Encountered server error with status 409"
+lines the OVH run saw) and one that outlasts them is `Busy` too; a 412
+is `Lost` (or `Won` only when the read-back is byte-for-byte our body).
+The existing tests used the fault injector's imitation of the error; new
+tests drive the **real** `object_store` S3 client against a scripted HTTP
+responder: `the_real_s3_clients_409_is_busy_and_412_is_lost` (409 and 412
+on create and update) and `a_409_then_412_is_a_lost_race_not_success_or_an_error`
+(OVH's 409, 409, 412 sequence is `Lost` after two retries; a 409 that
+never clears is the store's transient error; a content-addressed create
+answered 409 then 200 is a creation, not a hit). One site bypassed the
+classifier: the GC journal append's create-if-absent turned a 409 into a
+failed GC round — now `create_content_addressed` (its uuid key makes an
+existing object our own landed write), test
+`a_409_on_the_gc_journal_append_retries`. (The prune report's append is
+best-effort and ignores every error; the doctor's capability probes read
+a refusal of any kind as "enforced", which is right for that question.)
+
+### 5. `mount` could not find `meta.json` for minutes after `fs create` on OVH
+
+**What mount does.** No LIST: `load_fs` is a plain `GET meta.json`, twice
+(the E2E-passphrase check before the fork, then the runtime), and any 404
+became "no filesystem found at this prefix (missing meta.json)". EC2
+round 3 saw that 404 for 4 min 47 s – 7 min 19 s after `fs create` while
+`aws s3api head-object` of the same key succeeded throughout: on that
+store a `GET` disagreed with the object's existence for minutes (a cached
+negative answer fits: a `GET` of the key before it existed — `doctor`
+did exactly that — and a lag of the same few minutes every time).
+
+**Fix** (`ChunkStore::load_fs`, `fs_exists`, `crates/store-s3/src/store.rs`;
+doctor in `main.rs`):
+- a 404 from the `GET` is believed only if a `HEAD` agrees ("no
+  filesystem", at once, as before); when the `HEAD` finds the object the
+  `GET` is retried with backoff (250 ms doubling to 5 s), alternating a
+  plain and a ranged (`bytes=0-`) request, for up to
+  `CONSTELLATION_META_READ_WAIT_S` (600 s), with one warning; past that it
+  fails with an error naming the inconsistency instead of "no
+  filesystem";
+- `doctor` checks for a filesystem with a `HEAD` and GETs `meta.json` only
+  once it exists, so it no longer plants a negative `GET` answer for the
+  `mount` that follows `fs create`.
+Tests (FaultyStore, which now counts `HEAD` apart from `GET`):
+`a_get_404_that_a_head_contradicts_is_retried_not_believed`,
+`a_get_404_that_a_head_confirms_is_no_filesystem` (no wait),
+`a_get_that_never_catches_up_names_the_inconsistency`. Not reproducible
+locally (floci is consistent); unverified against OVH itself. Scope note:
+the log tail also GETs keys before they exist (`get_run` probes the next
+segment); on OVH the P2P log stream masked it (visibility p50 205 ms), but
+a node tailing S3 alone could see the same lag there.
+
+### Tests run
+
+- `cargo fmt`, `cargo clippy --tests` (constellation, authority, meta,
+  store-s3, harness, api): clean.
+- Unit: constellation 226, store-s3 198, meta, api, authority lib 87 +
+  3: all pass. `cargo test -p constellation-authority --release`: 85
+  passed, 8 ignored (includes the new sim test and the adjusted
+  `regression_refused_forward_is_not_re_executed`: seed 50068 no longer
+  journals a refusal because the schedule moved — the same thing that
+  happened to 50064 in M9 round 2 — so it stays for its strict checks and
+  50069 now pins the refusal-journaling path).
+- Long sweeps with the final code (default seed counts): `long_backup`,
+  `long_delegated`, `long_random`, `long_flex`, `long_strict` pass;
+  `long_locks` failed on `locks-delegated` seed 196102 (mutual exclusion
+  violated, node 2 and node 3 both `Exclusive` on one inode). Pre-existing
+  and nondeterministic: replaying that seed fails 10/20 on a main
+  `df14686` build and 11/20 on this branch — for the M14 owner.
+  Earlier in the work (before the backup stream-ahead change),
+  `long_delegated` 400 seeds passed 6/6 runs on main and on this branch,
+  `long_backup` 400 passed on both.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-ovhfix`):
+  `concurrent-create-no-excl` 5/5, `nonowner-op-latency` 5/5 (and FAIL on
+  the unfixed main build, numbers above); neighbours once each, all PASS:
+  `forwarded-mutations`, `sqlite-two-nodes`, `flock-cross-node`,
+  `delegated-subtrees`, `shared-dir-multi-writer`, `hash-range-split-merge`,
+  `cross-range-rename`, `backup-failover`, `backup-departs`,
+  `backup-partition`, `backup-failover-with-delegation`,
+  `visibility-after-burst`, `cto-strict`, `ack-s3-failover`.
+  `session-forwarded-ryw` failed 1 of 7 runs here and 1 of 6 on a main
+  (`df14686`) build, same message ("an acknowledgement (the close's
+  manifest commit) returned before its row was durable") — pre-existing.
+- Pre-existing sim flakes found while A/B-ing (main `df14686`, built
+  from `git archive` in a scratch dir): `long_delegated` seed 70162 fails
+  nondeterministically on main too (10/150 single-seed runs; 3/150 with
+  this change); `delegated-holder-cut` seeds outside the tested range
+  1600..1612 fail on main (20 of 1600..1799: 16 "did not reach
+  quiescence", 4 history violations — 1629, 1686, 1719, 1769 — of the
+  same class as this branch's first-version 1607, e.g. 1686
+  "`Unlink("d2/f3")` took effect in the log but the spec refuses it") —
+  worth their own investigation (M11 delegation × holder failover).

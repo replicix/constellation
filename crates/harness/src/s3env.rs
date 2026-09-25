@@ -155,6 +155,11 @@ impl S3Env {
             .create_proxy("s3", "0.0.0.0:4567", &format!("{}:4566", self.floci_name))
     }
 
+    /// The S3 proxy [`Self::s3_proxy`] created (for toxics on it later).
+    pub fn existing_s3_proxy(&self) -> Proxy<'_> {
+        self.toxiproxy.proxy("s3")
+    }
+
     /// A request-counting relay chained *in front of* toxiproxy, for
     /// scenarios that assert on S3 request classes (plan 26). Clients
     /// given `counter.endpoint()` still go through every toxic:

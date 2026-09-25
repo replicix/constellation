@@ -32,6 +32,9 @@ mod m7;
 mod m8;
 /// Plan 30 §M9: backup peers, seal-based failover, `ack=s3`.
 mod m9;
+/// The OVH real-S3 run's findings: the create race, a non-owner's
+/// per-op S3 round trip.
+mod ovh;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -809,6 +812,18 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M14: two nodes under --locks cluster; an exclusive flock on one refuses (EWOULDBLOCK) and blocks the other until the unlock, shared locks coexist, fcntl ranges conflict across nodes and F_GETLK sees the remote holder, a write under the lock is read by the next holder; then --locks local for the record (both nodes hold LOCK_EX at once)",
         requires: &[],
         run: m14::flock_cross_node,
+    },
+    Scenario {
+        name: "concurrent-create-no-excl",
+        desc: "OVH finding 1: four nodes open(O_CREAT) the same new name at once, without O_EXCL: every open succeeds on the one inode (and every racer's byte lands in it); with O_EXCL exactly one wins and the rest get EEXIST; on the sequencer and forwarding nodes, in a delegated subtree and through the S3 inbox; SQLite first-touching a new database from two nodes never fails",
+        requires: &[],
+        run: ovh::concurrent_create_no_excl,
+    },
+    Scenario {
+        name: "nonowner-op-latency",
+        desc: "OVH findings 4 and 6: under injected S3 latency, each of four nodes in turn runs the per-entry syscalls of an untar into one shared directory (open(O_CREAT|O_EXCL)+write+close, mkdir, symlink, link, chmod, chown, utimensat); a non-owner's median stays under half an S3 round trip (forwarded over P2P) like the sequencer's, except the write-through close of a new chunk",
+        requires: &[],
+        run: ovh::nonowner_op_latency,
     },
     Scenario {
         name: "sqlite-two-nodes",

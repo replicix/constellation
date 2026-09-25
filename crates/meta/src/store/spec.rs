@@ -537,6 +537,30 @@ fn streamed_entry_with(
     Ok(None)
 }
 
+/// Plan 30 §M9: when the holder's pre-S3 stream installed `rid`'s
+/// transaction here already (a live `Streamed` entry completing it),
+/// adopt the op as this node's own — stranded by a takeover, it replays
+/// by rid as a shadow would — and report `true`: the op's effect is in
+/// this replica, in the holder's order. `false`: no such entry.
+fn adopt_streamed_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    rid: Rid,
+    op: &MutateOp,
+) -> Result<bool, MetaError> {
+    let Some(spec_seq) = streamed_entry_completing(tx, meta, rid)? else {
+        return Ok(false);
+    };
+    if let Some(v) = tx.get(&meta.spec, seq_key(spec_seq))? {
+        let mut row: SpecRow = postcard::from_bytes(&v)?;
+        if let SpecKind::Streamed { own, .. } = &mut row.kind {
+            *own = Some((rid, op.clone()));
+        }
+        put_row(tx, &meta.spec, spec_seq, &row)?;
+    }
+    Ok(true)
+}
+
 /// Plan 30 §M9: the live `Shadow` for `rid`, if any: its spec seq, epoch
 /// and op.
 fn shadow_row_for(
@@ -1787,6 +1811,25 @@ impl Meta {
         self.install_shadow_from(rid, epoch, 0, op, records)
     }
 
+    /// The OVH run's finding 4: an accepted forward this replica could
+    /// not install (the holder evaluated it behind unshipped work on its
+    /// keys) whose transaction the holder's pre-S3 stream has installed
+    /// here since: adopt it (see `adopt_streamed_tx`) and report `true` —
+    /// the op is answered now, not when its segment reaches S3. `false`:
+    /// the stream has not carried it (or the log has: `completed`
+    /// answers it then).
+    pub fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError> {
+        let mut tx = self.db.write_tx();
+        if tx.get(&self.completed, rid.to_key())?.is_some() {
+            return Ok(false);
+        }
+        if adopt_streamed_tx(&mut tx, self, rid, op)? {
+            tx.commit()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// [`Self::install_shadow`] for a reply accepted by a delegate of
     /// generation `gen` (plan 30 §M11; 0: the root).
     pub fn install_shadow_from(
@@ -1813,14 +1856,7 @@ impl Meta {
         // would (a conflict copy on refusal). The reply counts as
         // installed (backup seeds 1122 and 1407: "not installed" sent
         // the op down the lease path a second time).
-        if let Some(spec_seq) = streamed_entry_completing(&tx, self, rid)? {
-            if let Some(v) = tx.get(&self.spec, seq_key(spec_seq))? {
-                let mut row: SpecRow = postcard::from_bytes(&v)?;
-                if let SpecKind::Streamed { own, .. } = &mut row.kind {
-                    *own = Some((rid, op.clone()));
-                }
-                put_row(&mut tx, &self.spec, spec_seq, &row)?;
-            }
+        if adopt_streamed_tx(&mut tx, self, rid, op)? {
             tx.commit()?;
             return Ok(true);
         }

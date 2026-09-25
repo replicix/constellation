@@ -1380,6 +1380,13 @@ ids) and its position (`head_seq`, the lease). They sample again at 30,
 60 and 120 s: a late agreement is slowness, and a node still serving
 other content after two minutes is a divergence.
 
+## Findings of the real-S3 runs (OVH, EC2)
+
+| Scenario | What it checks |
+|---|---|
+| `concurrent-create-no-excl` | four nodes `open(O_CREAT)` one new name at once, **without** `O_EXCL`: every open succeeds on the one inode and every racer's byte lands in it (also with `O_TRUNC`); with `O_EXCL` exactly one wins and the rest get `EEXIST`. On the sequencer and three forwarding nodes, in a subtree delegated to `b`, and through the S3 inbox (`d` cut from every peer). Two nodes first-touching a new SQLite database never fail (needs `sqlite3`, else that part is skipped). `CREATE_RACE_ROUNDS` (20) |
+| `nonowner-op-latency` | with S3 100 ms away each way and the sequencer's backup up, each of four nodes in turn runs what an untar does per entry into one shared directory (create+write+close, a whole `tar` file: create/close/`utimensat`/`chmod`, mkdir, symlink, link, chmod, chown, `utimensat`); every node's median stays under half an S3 round trip, the non-owners' included (their forwards are answered from the pre-S3 stream, not the log). The write-through close of a new chunk (`UniqueWrite`) pays its PUT on every node and is reported, not asserted. Placement is off so the root stays the sequencer. `NONOWNER_LAT_MS` (100), `NONOWNER_OPS` (12), `NONOWNER_ONLY`/`NONOWNER_NODES` narrow a run |
+
 ## xfstests
 
 The nightly container builds pinned xfstests-dev revision

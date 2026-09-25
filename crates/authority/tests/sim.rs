@@ -1544,10 +1544,14 @@ fn regression_refused_forward_is_not_re_executed() {
     // reply sends it down the lease path a second time.
     // Round 2: 50064 stopped journaling a refusal once the holder
     // streamed holes and resent once (the schedule moved); it stays for
-    // its strict checks, and 50068 pins the refusal-journaling path.
+    // its strict checks, and 50068 pinned the refusal-journaling path —
+    // until the OVH fix answered an accepted forward from the pre-S3
+    // stream (the schedule moved again: 50068 journals none now); it
+    // stays for its strict checks and 50069 pins the path.
     for (seed, cfg, alias) in [
         (50064u64, long_backup_config(), "long-backup"),
         (50068, long_backup_config(), "long-backup"),
+        (50069, long_backup_config(), "long-backup"),
         (50126, long_backup_config(), "long-backup"),
         (50277, acks3(), "long-acks3"),
         (753, backup_config(), "backup"),
@@ -1584,7 +1588,7 @@ fn regression_refused_forward_is_not_re_executed() {
         let journaled: u64 = report.stats.values().map(|s| s.refusals_journaled).sum();
         // (The refusal-journaling seeds; the others pin different paths.)
         assert!(
-            journaled >= 1 || !matches!(seed, 50068 | 50126 | 50277),
+            journaled >= 1 || !matches!(seed, 50069 | 50126 | 50277),
             "seed {seed} no longer refuses a forward ({journaled})"
         );
     }
@@ -1702,6 +1706,30 @@ fn regression_backup_crash_classes() {
             "seed {seed}: the double fault was not recognised"
         );
     }
+}
+
+/// The OVH run's finding 4: a forward accepted behind unshipped work on
+/// its keys (a non-owning node's close after its create) is answered
+/// once the holder's pre-S3 stream installed its transaction here, not
+/// when its segment comes back from S3 — and every such seed still
+/// passes the linearizability, convergence and strict acknowledgement
+/// checks (`run_seed`). The seeds are `long-backup` ones where the path
+/// runs.
+#[test]
+fn an_accepted_forward_is_answered_from_the_pre_s3_stream() {
+    let mut answered = 0;
+    for seed in [50065u64, 50069, 50073, 50079, 50080] {
+        let report = run_seed(seed, long_backup_config()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=long-backup")
+        });
+        assert!(report.converged_checked, "seed {seed} did not converge");
+        answered += report
+            .stats
+            .values()
+            .map(|s| s.awaited_log_streamed)
+            .sum::<u64>();
+    }
+    assert!(answered > 0, "no forward was answered from the stream");
 }
 
 /// Plan 30 §M9: the long configuration with backups (and, every other

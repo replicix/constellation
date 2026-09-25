@@ -32,6 +32,14 @@ impl Toxiproxy {
         anyhow::bail!("toxiproxy API not ready after {timeout_s}s")
     }
 
+    /// A handle on the proxy `name`, created earlier.
+    pub fn proxy(&self, name: &str) -> Proxy<'_> {
+        Proxy {
+            tp: self,
+            name: name.to_string(),
+        }
+    }
+
     /// Create a proxy listening on `listen` (inside the toxiproxy
     /// container) forwarding to `upstream`.
     pub fn create_proxy(&self, name: &str, listen: &str, upstream: &str) -> Result<Proxy<'_>> {

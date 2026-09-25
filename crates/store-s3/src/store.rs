@@ -17,6 +17,19 @@ use uuid::Uuid;
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// How long [`ChunkStore::load_fs`] keeps retrying a `GET` of
+/// `meta.json` that answers 404 while a `HEAD` finds the object
+/// (`CONSTELLATION_META_READ_WAIT_S`, default 600 s: the OVH run's lag was
+/// up to ~7 minutes).
+pub fn meta_read_wait() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("CONSTELLATION_META_READ_WAIT_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(600),
+    )
+}
+
 /// `meta.json`: filesystem identity and settings (DESIGN.md §2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsMeta {
@@ -285,13 +298,29 @@ impl ChunkStore {
     }
 
     /// Load `meta.json`; `NotFound` when the prefix holds no filesystem.
+    ///
+    /// A `GET` answered 404 is only believed once a `HEAD` agrees: the
+    /// OVH run saw `mount` fail with "missing meta.json" for 4-7 minutes
+    /// after `fs create` while a `HEAD` of the very key succeeded
+    /// throughout — a `GET` read (a negative answer cached, or a replica
+    /// that lags) disagreeing with the object's existence. When the
+    /// `HEAD` finds it, the `GET` is retried with backoff (alternating a
+    /// plain and a ranged request) for up to [`meta_read_wait`], saying
+    /// so, and then fails with an error that names the inconsistency
+    /// instead of "no filesystem".
     pub async fn load_fs(&self) -> Result<FsMeta, StoreError> {
-        let res = match self.store.get(&layout::meta_json()).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) => return Err(StoreError::NotFound),
+        self.load_fs_waiting(meta_read_wait()).await
+    }
+
+    /// [`Self::load_fs`] with an explicit wait for a `GET` that disagrees
+    /// with the `HEAD`.
+    pub async fn load_fs_waiting(&self, wait: std::time::Duration) -> Result<FsMeta, StoreError> {
+        let key = layout::meta_json();
+        let bytes = match self.store.get(&key).await {
+            Ok(r) => r.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => self.meta_json_behind_a_404(wait).await?,
             Err(e) => return Err(e.into()),
         };
-        let bytes = res.bytes().await?;
         let meta: FsMeta = serde_json::from_slice(&bytes)?;
         if meta.format_version > FORMAT_VERSION {
             return Err(StoreError::Meta(format!(
@@ -300,6 +329,77 @@ impl ChunkStore {
             )));
         }
         Ok(meta)
+    }
+
+    /// Whether `meta.json` exists, by `HEAD` alone (`doctor`: a `GET` of
+    /// the key before `fs create` is what a store that caches negative
+    /// answers would keep serving to the `mount` after it).
+    pub async fn fs_exists(&self) -> Result<bool, StoreError> {
+        match self.store.head(&layout::meta_json()).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `load_fs`'s `GET` said 404: `NotFound` if a `HEAD` agrees, else
+    /// the body once a `GET` serves it (see [`Self::load_fs`]).
+    async fn meta_json_behind_a_404(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<bytes::Bytes, StoreError> {
+        let key = layout::meta_json();
+        let started = std::time::Instant::now();
+        let mut backoff = std::time::Duration::from_millis(250);
+        let mut attempt = 0u32;
+        let mut warned = false;
+        loop {
+            let head = match self.store.head(&key).await {
+                Ok(head) => head,
+                Err(object_store::Error::NotFound { .. }) => return Err(StoreError::NotFound),
+                Err(e) => return Err(e.into()),
+            };
+            if !warned {
+                warned = true;
+                tracing::warn!(
+                    key = %key,
+                    size = head.size,
+                    wait_s = wait.as_secs(),
+                    "meta.json exists (HEAD) but a GET answered 404: the backend's reads \
+                     disagree; retrying the GET"
+                );
+            }
+            if started.elapsed() >= wait {
+                return Err(StoreError::Meta(format!(
+                    "meta.json exists (HEAD answers {} bytes) but every GET for {:?} answered \
+                     404 — the backend serves inconsistent reads; retry the mount later \
+                     (CONSTELLATION_META_READ_WAIT_S sets the wait)",
+                    head.size,
+                    started.elapsed()
+                )));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+            attempt += 1;
+            // Alternate a ranged GET with the plain one: a cache in front
+            // of the store keyed on the request's shape answers them apart.
+            let options = object_store::GetOptions {
+                range: (attempt % 2 == 1).then_some(object_store::GetRange::Offset(0)),
+                ..Default::default()
+            };
+            match self.store.get_opts(&key, options).await {
+                Ok(r) => {
+                    tracing::info!(
+                        attempt,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "meta.json read after the backend's GET caught up"
+                    );
+                    return Ok(r.bytes().await?);
+                }
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Change the E2E passphrase: rewrap the master key in `meta.json`
@@ -903,6 +1003,71 @@ mod tests {
 
     fn store() -> ChunkStore {
         ChunkStore::new(Arc::new(InMemory::new()))
+    }
+
+    /// The OVH run: after `fs create`, a `GET` of `meta.json` answered
+    /// 404 for minutes while a `HEAD` found it. `load_fs` believes the
+    /// 404 only when a `HEAD` agrees; otherwise it retries the `GET`.
+    #[tokio::test(start_paused = true)]
+    async fn a_get_404_that_a_head_contradicts_is_retried_not_believed() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        s.create_fs(&FsMeta::new(DEFAULT_CHUNK_SIZE, "raw"))
+            .await
+            .unwrap();
+        faulty.script(
+            OpKind::Get,
+            "meta.json",
+            Calls::First(3),
+            Fault::Status(404),
+        );
+        let meta = s
+            .load_fs_waiting(std::time::Duration::from_secs(60))
+            .await
+            .expect("read once the GET caught up");
+        assert_eq!(meta.chunk_size, DEFAULT_CHUNK_SIZE);
+        assert_eq!(faulty.calls(OpKind::Get, "meta.json"), 4);
+        assert!(faulty.calls(OpKind::Head, "meta.json") >= 1);
+        assert!(s.fs_exists().await.unwrap());
+    }
+
+    /// A 404 that a `HEAD` confirms is "no filesystem", at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_get_404_that_a_head_confirms_is_no_filesystem() {
+        use crate::faulty::{FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            s.load_fs_waiting(std::time::Duration::from_secs(60)).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(faulty.calls(OpKind::Get, "meta.json"), 1);
+        assert_eq!(faulty.calls(OpKind::Head, "meta.json"), 1);
+        assert!(!s.fs_exists().await.unwrap());
+    }
+
+    /// A `GET` that never catches up fails after the wait with an error
+    /// that names the inconsistency, not "no filesystem".
+    #[tokio::test(start_paused = true)]
+    async fn a_get_that_never_catches_up_names_the_inconsistency() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        s.create_fs(&FsMeta::new(DEFAULT_CHUNK_SIZE, "raw"))
+            .await
+            .unwrap();
+        faulty.script(OpKind::Get, "meta.json", Calls::Every, Fault::Status(404));
+        let err = s
+            .load_fs_waiting(std::time::Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Meta(m) if m.contains("inconsistent")),
+            "{err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

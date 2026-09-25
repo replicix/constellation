@@ -48,7 +48,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::Meta;
-use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta, StoreError};
+use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -1003,9 +1003,15 @@ fn main() -> Result<()> {
             let report = rt.block_on(constellation_store_s3::probe_cas_semantics(store.inner()))?;
             doctor::print_cas_report(&report)?;
             print!("filesystem at prefix .............. ");
-            match rt.block_on(store.load_fs()) {
-                Ok(meta) => println!("ok ({}, format v{})", meta.uuid, meta.format_version),
-                Err(StoreError::NotFound) => println!("none (run `constellation fs create`)"),
+            // `HEAD` first: a `GET` of a `meta.json` that does not exist
+            // yet is the answer a store caching negative reads keeps
+            // serving to the `mount` after `fs create` (the OVH run).
+            match rt.block_on(store.fs_exists()) {
+                Ok(false) => println!("none (run `constellation fs create`)"),
+                Ok(true) => match rt.block_on(store.load_fs()) {
+                    Ok(meta) => println!("ok ({}, format v{})", meta.uuid, meta.format_version),
+                    Err(e) => bail!(e),
+                },
                 Err(e) => bail!(e),
             }
             Ok(())
@@ -4616,6 +4622,8 @@ impl constellation_api::StatusSource for DaemonStatus {
                     streamed_ahead: stats.streamed_ahead,
                     streamed_installed: stats.streamed_installed,
                     streamed_dropped: stats.streamed_dropped,
+                    awaited_log: stats.awaited_log,
+                    awaited_log_streamed: stats.awaited_log_streamed,
                     backup_persisted: stats.backup_persisted,
                     seals: stats.seals,
                     backup_takeovers: stats.backup_takeovers,

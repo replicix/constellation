@@ -7,7 +7,7 @@
 
 use crate::{layout, StoreError};
 use constellation_fs_core::ChunkHash;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -191,12 +191,11 @@ pub async fn append_journal(
     entry: &GcJournalEntry,
 ) -> Result<(), StoreError> {
     let key = layout::gc_journal(entry.ts, &uuid::Uuid::new_v4().to_string());
-    store
-        .put_opts(
-            &key,
-            PutPayload::from(serde_json::to_vec(entry)?),
-            PutOptions::from(PutMode::Create),
-        )
+    // The key is fresh (a uuid), so an object already there can only be
+    // this very write landed behind a lost reply; a 409 (the OVH run's
+    // finding 5: some stores answer a conditional write with 409 before
+    // settling) retries rather than failing the GC round.
+    crate::cas::create_content_addressed(store.as_ref(), &key, serde_json::to_vec(entry)?.into())
         .await?;
     Ok(())
 }
@@ -205,6 +204,24 @@ pub async fn append_journal(
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    /// The OVH run's finding 5: a 409 on the GC journal's create-if-
+    /// absent is retried, not a failed round.
+    #[tokio::test]
+    async fn a_409_on_the_gc_journal_append_retries() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        let faulty = FaultyStore::new();
+        let store: Arc<dyn ObjectStore> = faulty.clone();
+        faulty.script(OpKind::Put, "gc", Calls::First(2), Fault::Status(409));
+        let entry = GcJournalEntry {
+            key: "chunks/x".into(),
+            rule: "test".into(),
+            evidence: serde_json::Value::Null,
+            ts: 1,
+        };
+        append_journal(&store, &entry).await.unwrap();
+        assert_eq!(faulty.calls(OpKind::Put, "gc"), 3);
+    }
 
     /// Plan 30 §M4 item 1: the condemned pointer's CAS under each error
     /// code. A 409 is retried; a publish that landed behind a 412 is ours;

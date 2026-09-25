@@ -683,6 +683,20 @@ impl Core {
                     return;
                 }
                 self.stats.awaited_log += 1;
+                // Plan 30 §M9 (the OVH run's finding 4): the holder's
+                // pre-S3 stream carried the transaction here ahead of
+                // this reply — installed already, in the holder's order.
+                if self.adopt_streamed(rid, &position, replica) {
+                    replica.note_covering(KeySet::from_records(&records), position);
+                    self.finish(
+                        now,
+                        rid,
+                        MutateOutcome::Accepted { epoch, records },
+                        replica,
+                        out,
+                    );
+                    return;
+                }
                 let c = self.clients.get_mut(&rid).expect("present");
                 c.phase = Phase::AwaitingLog { epoch, position };
                 self.nudge(now, out);
@@ -1293,6 +1307,80 @@ impl Core {
             .is_some_and(|c| c.origin == Origin::Client)
         {
             replica.raise_observed(position);
+        }
+    }
+
+    /// Whether the pre-S3 stream installed `rid`'s transaction here
+    /// (adopting it as this node's op): then an accepted reply this
+    /// replica could not install as a shadow is answered at once.
+    ///
+    /// Only for a reply evaluated at no delegation stream position
+    /// (`position.streams` empty): the root's stream carries its own
+    /// journal, not the delegate streams the op may have been evaluated
+    /// behind, so such a reply still waits for the log, which orders
+    /// both.
+    fn adopt_streamed(&mut self, rid: Rid, position: &Position, replica: &dyn Replica) -> bool {
+        if !position.streams.is_empty() {
+            return false;
+        }
+        let Some(op) = self.clients.get(&rid).map(|c| c.op.clone()) else {
+            return false;
+        };
+        match replica.adopt_streamed(rid, &op) {
+            Ok(true) => {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    "accepted forward answered from the pre-S3 stream"
+                );
+                self.stats.awaited_log_streamed += 1;
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(%error, node = self.cfg.node_id, ?rid, "failed to adopt a streamed transaction");
+                false
+            }
+        }
+    }
+
+    /// Plan 30 §M9 (the OVH run's findings 4 and 6): the holder's pre-S3
+    /// stream just installed the transactions completing `installed`
+    /// (with their keys): every op of this node waiting for the log
+    /// among them — a forward accepted behind unshipped work on its keys,
+    /// as a close after a create or a `utimensat` after a close from a
+    /// non-owning node is — has its effect here now, in the holder's
+    /// order: answer it, as an installed shadow would be. Before, it
+    /// waited for the segment to reach S3 and come back, one S3 round
+    /// trip per such op although the stream had delivered it.
+    pub(crate) fn answer_awaiting_streamed(
+        &mut self,
+        now: Ms,
+        installed: &[(Rid, KeySet)],
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        for (rid, keys) in installed {
+            let Some((epoch, position)) = self.clients.get(rid).and_then(|c| match c.phase {
+                Phase::AwaitingLog { epoch, position } => Some((epoch, position)),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if !self.adopt_streamed(*rid, &position, replica) {
+                continue;
+            }
+            replica.note_covering(keys.clone(), position);
+            self.finish(
+                now,
+                *rid,
+                MutateOutcome::Accepted {
+                    epoch,
+                    records: Vec::new(),
+                },
+                replica,
+                out,
+            );
         }
     }
 

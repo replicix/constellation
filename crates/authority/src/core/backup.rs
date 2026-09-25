@@ -1296,13 +1296,12 @@ impl Core {
             return;
         }
         let start = from.max(self.ack.streamed_through) + 1;
-        // A backup holds these rows already (in its tail); only the
-        // other subscribers gain from the stream-ahead.
-        let subscribers: Vec<NodeId> = self
-            .stream_subscribers()
-            .into_iter()
-            .filter(|n| !self.ack.peers.contains_key(n))
-            .collect();
+        // Every subscriber, the backups included: a backup holds these
+        // rows in its tail, but not in its namespace — without the
+        // stream-ahead its own clients' forwards and reads waited for S3
+        // (the OVH run's finding 4: the backup's small-file writes cost
+        // an S3 round trip each, the other non-owners' did not).
+        let subscribers: Vec<NodeId> = self.stream_subscribers();
         if subscribers.is_empty() {
             self.ack.streamed_through = to;
             return;
@@ -1746,7 +1745,6 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let _ = (now, out);
         if !self.cfg.pre_s3_streaming
             || self.lease.held.is_some()
             || self.lease.epoch_held()
@@ -1759,6 +1757,7 @@ impl Core {
             self.bk.ahead_next = None;
             return;
         }
+        let mut completed: Vec<(constellation_meta::Rid, constellation_meta::KeySet)> = Vec::new();
         for tx in txs {
             let Some((e, next)) = self.bk.ahead_next else {
                 self.stats.streamed_dropped += 1;
@@ -1799,6 +1798,14 @@ impl Core {
                         "streamed transaction installed ahead of the log"
                     );
                     self.stats.streamed_installed += 1;
+                    let keys = constellation_meta::KeySet::from_records(&tx.records);
+                    for rec in &tx.records {
+                        if let constellation_meta::LogRecord::Completed { rid } = rec {
+                            if rid.node == self.cfg.node_id {
+                                completed.push((*rid, keys.clone()));
+                            }
+                        }
+                    }
                     replica.note_covering(
                         constellation_meta::KeySet::from_records(&tx.records),
                         constellation_meta::Position {
@@ -1818,6 +1825,11 @@ impl Core {
                     self.bk.ahead_next = None;
                 }
             }
+        }
+        // This node's own ops among them that wait for the log have their
+        // effect here now.
+        if !completed.is_empty() {
+            self.answer_awaiting_streamed(now, &completed, replica, out);
         }
     }
 

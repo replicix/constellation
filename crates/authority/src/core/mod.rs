@@ -479,6 +479,10 @@ pub struct Stats {
     /// Accepted forwards not installed ahead of the log because the
     /// holder reported a stale base; answered once the log carried them.
     pub awaited_log: u64,
+    /// Plan 30 §M9 (the OVH run's finding 4): accepted forwards that
+    /// could not install as a shadow answered from the pre-S3 stream
+    /// (their transaction installed here) instead of the log.
+    pub awaited_log_streamed: u64,
     /// Ops of this node whose wait its own acquisition made moot
     /// (`resolve_moot_waits`): accepted forwards awaiting the log from an
     /// earlier epoch, and inbox ops durable under an earlier epoch —

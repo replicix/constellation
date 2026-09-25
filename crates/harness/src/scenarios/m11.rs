@@ -222,7 +222,7 @@ fn dump_logs_on_failure(scenario: &str, clients: &[Client], result: &Result<()>)
 
 /// `constellation delegate <path> --to <node>` through the root's
 /// control socket.
-fn delegate(root: &Client, path: &str, node: u64) -> Result<serde_json::Value> {
+pub(super) fn delegate(root: &Client, path: &str, node: u64) -> Result<serde_json::Value> {
     let resp = root.control(&serde_json::json!({"cmd": "delegate", "path": path, "node": node}))?;
     anyhow::ensure!(
         resp["resp"] == "ok",
@@ -245,7 +245,7 @@ fn undelegate(root: &Client, path: &str) -> Result<serde_json::Value> {
 
 /// Wait until `delegate` holds a live (not stopped) grant on `dir`, the
 /// directory named `path` on the root.
-fn wait_installed(delegate: &Client, path: &str, deadline: Duration) -> Result<u64> {
+pub(super) fn wait_installed(delegate: &Client, path: &str, deadline: Duration) -> Result<u64> {
     let mut gen = 0;
     eventually(
         &format!("{} holds the delegation of {path}", delegate.name),
@@ -367,7 +367,7 @@ fn s3_tally(p: &CountingProxy) -> String {
 
 /// The requests by method and key prefix (`PUT chunks/` ...), most
 /// frequent first.
-fn s3_breakdown(p: &CountingProxy) -> String {
+pub(super) fn s3_breakdown(p: &CountingProxy) -> String {
     let mut by: std::collections::BTreeMap<String, usize> = Default::default();
     for r in p.requests() {
         let path = r.path();

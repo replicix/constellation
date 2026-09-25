@@ -96,6 +96,9 @@ pub trait Replica {
         op: &MutateOp,
         records: &[LogRecord],
     ) -> Result<bool, MetaError>;
+    /// The pre-S3 stream installed `rid`'s transaction here already:
+    /// adopt it as this node's own op (`Meta::adopt_streamed`).
+    fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError>;
     /// Install the entry behind `rid`'s `Exists` refusal ahead of the
     /// log. `false` when not installed: this replica already has the
     /// refusal (applied, or streamed ahead of the log with whatever the
@@ -462,6 +465,10 @@ impl Replica for Meta {
 
     fn journal_acked_seq(&self) -> Result<u64, MetaError> {
         Meta::journal_acked_seq(self)
+    }
+
+    fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError> {
+        Meta::adopt_streamed(self, rid, op)
     }
 
     fn install_shadow(

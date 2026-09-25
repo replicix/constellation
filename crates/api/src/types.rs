@@ -1536,6 +1536,14 @@ pub struct AckStatus {
     pub streamed_installed: u64,
     #[serde(default)]
     pub streamed_dropped: u64,
+    /// Accepted forwards of this node that could not install as a
+    /// shadow (the holder ran unshipped work on their keys before them)
+    /// and waited for their transaction, and of those, the ones the
+    /// pre-S3 stream answered before the log did.
+    #[serde(default)]
+    pub awaited_log: u64,
+    #[serde(default)]
+    pub awaited_log_streamed: u64,
     #[serde(default)]
     pub backup_persisted: u64,
     #[serde(default)]

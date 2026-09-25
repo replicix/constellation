@@ -564,4 +564,193 @@ mod tests {
             assert!(out.is_err(), "{key}");
         }
     }
+
+    // ---- the OVH run's finding 5, against the real S3 client ----
+
+    /// A one-shot HTTP responder: answers the n-th request with
+    /// `statuses[n]` (the last one repeats), recording each request's
+    /// method. Enough of HTTP/1.1 for `object_store`'s S3 client.
+    async fn scripted_s3(statuses: Vec<u16>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut n = 0usize;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let status = statuses[n.min(statuses.len() - 1)];
+                n += 1;
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Headers, then the body its Content-Length names.
+                    let head_end = loop {
+                        let Ok(k) = sock.read(&mut chunk).await else {
+                            return;
+                        };
+                        if k == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..k]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + len {
+                        let Ok(k) = sock.read(&mut chunk).await else {
+                            return;
+                        };
+                        if k == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..k]);
+                    }
+                    log.lock()
+                        .unwrap()
+                        .push(head.split(' ').next().unwrap_or("").to_string());
+                    let (reason, body) = match status {
+                        200 => ("OK", String::new()),
+                        409 => (
+                            "Conflict",
+                            "<Error><Code>OperationAborted</Code><Message>A conflicting \
+                             conditional operation is currently in progress against this \
+                             resource.</Message></Error>"
+                                .to_string(),
+                        ),
+                        412 => (
+                            "Precondition Failed",
+                            "<Error><Code>PreconditionFailed</Code></Error>".to_string(),
+                        ),
+                        _ => ("Error", String::new()),
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nETag: \"e1\"\r\n\
+                         Connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn real_s3(endpoint: &str) -> Arc<dyn ObjectStore> {
+        Arc::new(
+            object_store::aws::AmazonS3Builder::new()
+                .with_endpoint(endpoint)
+                .with_allow_http(true)
+                .with_bucket_name("b")
+                .with_region("us-east-1")
+                .with_access_key_id("k")
+                .with_secret_access_key("s")
+                .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+                .with_retry(object_store::RetryConfig {
+                    max_retries: 0,
+                    retry_timeout: Duration::from_secs(5),
+                    backoff: Default::default(),
+                })
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// The OVH run's finding 5: OVH answers a losing conditional write
+    /// with 409 Conflict before settling on 412. The *real* S3 client's
+    /// error for a 409 (not the fault injector's imitation) must classify
+    /// as `Busy` on both a create and an update — never a lost race,
+    /// never success — and a 412 as `Lost`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_real_s3_clients_409_is_busy_and_412_is_lost() {
+        let update = PutMode::Update(UpdateVersion {
+            e_tag: Some("\"e0\"".into()),
+            version: None,
+        });
+        for (status, mode, want) in [
+            (409, PutMode::Create, CasCode::Busy),
+            (409, update.clone(), CasCode::Busy),
+            (412, PutMode::Create, CasCode::Lost),
+            (412, update.clone(), CasCode::Lost),
+        ] {
+            let (endpoint, _) = scripted_s3(vec![status]).await;
+            let store = real_s3(&endpoint);
+            let err = store
+                .put_opts(
+                    &p("k"),
+                    PutPayload::from_static(b"mine"),
+                    PutOptions::from(mode.clone()),
+                )
+                .await
+                .expect_err("scripted failure");
+            assert_eq!(
+                classify(&err, &mode),
+                Some(want),
+                "{status} on {mode:?}: {err}"
+            );
+        }
+    }
+
+    /// 409 then 412, as OVH answers a losing create: the attempt is
+    /// retried after the 409 and the 412 decides it — a lost race, with
+    /// no success and no hard error on the way. On a content-addressed
+    /// create the 412 is the dedup hit (the object is there), never the
+    /// 409.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_409_then_412_is_a_lost_race_not_success_or_an_error() {
+        let (endpoint, seen) = scripted_s3(vec![409, 409, 412]).await;
+        let store = real_s3(&endpoint);
+        let out = put_conditional(
+            store.as_ref(),
+            &p("k"),
+            Bytes::from_static(b"mine"),
+            PutMode::Create,
+            Verify::Caller,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, CasPut::Lost);
+        assert_eq!(*seen.lock().unwrap(), vec!["PUT", "PUT", "PUT"]);
+
+        let (endpoint, seen) = scripted_s3(vec![409, 409, 409, 409, 409, 409, 409]).await;
+        let store = real_s3(&endpoint);
+        let out = put_conditional_with(
+            store.as_ref(),
+            &p("k"),
+            Bytes::from_static(b"mine"),
+            PutMode::Create,
+            Verify::Caller,
+            2,
+        )
+        .await;
+        assert!(
+            out.is_err(),
+            "a 409 that never clears is the store's (transient) error: {out:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 3);
+
+        // Content-addressed: 409 is retried, never a hit; 200 creates.
+        let (endpoint, seen) = scripted_s3(vec![409, 200]).await;
+        let store = real_s3(&endpoint);
+        let existed = create_content_addressed(store.as_ref(), &p("c"), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(!existed, "a 409 passed for a dedup hit");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
 }
