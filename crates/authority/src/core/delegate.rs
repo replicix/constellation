@@ -1645,7 +1645,7 @@ impl Core {
 
     // ----------------------------------------------------- renewals
 
-    fn deleg_renew_now(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    pub(crate) fn deleg_renew_now(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
         let Some(root) = self.root_node() else {
             // Learn the holder, and try again after a tick: the first
             // renewal of a grant installed from an S3 tail (no P2P
@@ -1833,8 +1833,14 @@ impl Core {
         if until > d.until {
             d.until = until;
         }
-        // Renew at half the ttl.
-        let at = sent.plus(ttl_ms / 2);
+        // Renew at half the ttl — at a quarter while this generation has
+        // lock grants out: they are capped by what is left of it, and a
+        // grant needs at least `2 × margin` of it (`lock_min_grant_ms`).
+        let at = if replica.locks().has_grants_of_gen(gen) {
+            sent.plus(ttl_ms / 4)
+        } else {
+            sent.plus(ttl_ms / 2)
+        };
         let t = self.set_timer(at.max(now.plus(1)), Timer::DelegRenew(gen), out);
         let d = self.dl.mine.get_mut(&gen).expect("present");
         d.renew_timer = Some(t);

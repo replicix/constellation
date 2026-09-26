@@ -4313,6 +4313,102 @@ mod locks {
     const X: LockMode = LockMode::Exclusive;
     const S: LockMode = LockMode::Shared;
 
+    /// The rounds harness scenario (EC2 campaign 5's `index.lock`
+    /// stall): a delegate's grants are capped by what is left of its
+    /// delegation, which it renews at half its 5 s ttl — so it had as
+    /// little as 1.5 s of authority, granted a lock of that ttl, and the
+    /// holder (honouring `ttl − margin`, renewing at `ttl/2`) let it
+    /// lapse before its first renewal while `git` still held the
+    /// `flock`; the owner outwaited it and granted the lock to the other
+    /// node. Now a delegate with less than `2 × margin` left grants
+    /// nothing: the request parks and the delegation is renewed at once;
+    /// once renewed, the grant is a full one.
+    #[test]
+    fn a_delegate_with_little_authority_left_renews_before_granting() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let f = h.meta.allocate_ino(dir).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Create {
+                    parent: dir,
+                    name: "turn.lock".into(),
+                    ino: f,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 2,
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node: 3,
+                    gen: 7,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let d = h.core.dl.mine.get_mut(&7).expect("installed");
+        // 1.5 s of the delegation left: a 0.5 s lock at most.
+        d.until = h.now.plus(1_500);
+        d.renew = None;
+        let out = request(&mut h, 2, 9, f, X, true);
+        assert!(
+            lock_replies(&out)
+                .iter()
+                .all(|(_, _, o)| !matches!(o, LockOutcome::Granted { .. })),
+            "granted on 1.5 s of authority: {out:?}"
+        );
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::DelegRenew { gen: 7, .. })),
+            "the delegation is not renewed at once: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_short_authority_waits, 1);
+        // Renewed: the parked request is granted at the waiter tick, for
+        // long enough to be renewed.
+        let d = h.core.dl.mine.get_mut(&7).expect("installed");
+        d.until = h.now.plus(4_000);
+        d.renew = None;
+        let tick = timers(&out, TimerKind::LockWaiterTick);
+        assert!(!tick.is_empty(), "no waiter tick: {out:?}");
+        h.advance(100);
+        let out = h.step(Event::Timer { id: tick[0] });
+        let granted: Vec<u64> = pushes(&out)
+            .into_iter()
+            .map(|(_, _, o)| o)
+            .chain(lock_replies(&out).into_iter().map(|(_, _, o)| o))
+            .filter_map(|o| match o {
+                LockOutcome::Granted { ttl_ms, .. } => Some(ttl_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(granted.len(), 1, "{out:?}");
+        assert!(granted[0] >= 2_000, "a {}-ms grant", granted[0]);
+    }
+
     fn holder_with_file() -> (Harness, Ino) {
         let mut h = Harness::new(1);
         h.hold(1, None);
@@ -5314,6 +5410,45 @@ mod locks {
         }
     }
 
+    /// A delegate's short grant (2 s: honoured for 1 s): the renewal tick
+    /// comes at its renewal point, half-way through the window, not at
+    /// the ttl/4 cadence (1.25 s, after the window closed: the grant
+    /// lapsed under the application's `flock` and the owner handed the
+    /// lock on — the rounds harness scenario).
+    #[test]
+    fn a_short_grant_is_renewed_inside_its_window() {
+        let mut r = requester();
+        let sent = r.now;
+        let req = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::Granted {
+                    id: GrantId { node: 1, seq: 1 },
+                    mode: X,
+                    ttl_ms: 2_000,
+                    position: Position::ZERO,
+                },
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let held = r.meta.locks().held(42).expect("installed");
+        assert_eq!(held.until_ms, sent.0 + 1_000);
+        assert_eq!(held.renew_at_ms, sent.0 + 500);
+        let tick = timer_of(&out, TimerKind::LockRenewTick);
+        assert_eq!(r.core.timer_at(tick), Some(sent.plus(500)));
+        r.now = sent.plus(500);
+        let out = r.step(Event::Timer { id: tick });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockRenew { .. })),
+            "not renewed inside the window: {out:?}"
+        );
+    }
+
     /// The grant is installed honoured until sent + ttl − margin; the
     /// renewal tick renews it at the owner from ttl/2; a recall with no
     /// local lock flushes, then releases.
@@ -5333,7 +5468,8 @@ mod locks {
         assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
         let held = r.meta.locks().held(42).expect("installed");
         assert_eq!(held.until_ms, sent.0 + 5_000 - 1_000);
-        assert_eq!(held.renew_at_ms, sent.0 + 2_500);
+        // Half-way through the window it is honoured for (ttl − margin).
+        assert_eq!(held.renew_at_ms, sent.0 + 2_000);
         let tick = timer_of(&out, TimerKind::LockRenewTick);
         // Too early: nothing renewed, the tick re-arms.
         r.advance(1_000);

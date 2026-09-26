@@ -231,11 +231,24 @@ S3 cut of one node (each node reaches S3 through its own relay); there
 a stale turn is only reported (a turn can begin before writes that a
 crashed node held unshipped are replayed), and a commit it would lose
 still fails the end-state check.
-`GIT_FLOCK_SECS` sets the duration (60 s, 150 s with faults),
-`GIT_FLOCK_NODES` the node count (2–4), `GIT_FLOCK_COMMITTERS=last` makes
-the last two nodes commit (neither is the sequencer), and
-`GIT_FLOCK_S3_LATENCY_MS` / `GIT_FLOCK_ENV=K=V,...` add S3 latency and
-mount environment.
+Every variant also checks the marker file the previous turn wrote under
+the lock after its commit (campaign 5's check, done right: one marker for
+the last commit by anyone), and that no two turns held the lock at once
+(each turn records when it got and released it).
+`git-under-flock-b2b` is campaign 5's shape: back to back, 5–20 files per
+commit (new files and appends to any tracked file), with the turn
+duration reported per decile and the slowest turns broken into steps; a
+turn over `GIT_FLOCK_MAX_TURN_S` (30 s) or any failed turn fails it.
+`git-under-flock-rounds` runs that workload `GIT_FLOCK_ROUNDS` (3) times,
+each in a new repository, against the same daemons (the stall campaign 5
+saw "never on a daemon's first workload"); the last round mounts the
+fresh node and checks every round's repository.
+`GIT_FLOCK_SECS` sets the duration (60 s; 150 s with faults, 180 s for
+b2b, 90 s per round), `GIT_FLOCK_NODES` the node count (2–4),
+`GIT_FLOCK_COMMITTERS=last` makes the last two nodes commit (neither is
+the sequencer), `GIT_FLOCK_S3_LATENCY_MS` / `GIT_FLOCK_ENV=K=V,...` add S3
+latency and mount environment, and `GIT_FLOCK_RUST_LOG` sets the
+daemons' `RUST_LOG`.
 
 `atime-eventual` (plan 20) mounts two nodes with `--atime relatime`: a
 cold read on one node must eventually advance `atime` on the holder,

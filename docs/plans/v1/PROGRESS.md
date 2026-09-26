@@ -25013,3 +25013,123 @@ whatever the ETA.
    members to keep following the epoch holder's stream (or the holder
    to stream epoch journal records), a design question across M9 and
    M10.
+
+## Fix: git under back-to-back turns (campaign 5 E-1/E-2)
+
+EC2 campaign 5 ran the git-under-flock workload back to back on ee3f65b
+and reported (E-2) hundreds of stale reads and one two-way
+`refs/heads/master` fork on OVH, and (E-1) `git add` failing with
+`index.lock: File exists` from both nodes for minutes, with a live
+kernel stack of a hung FUSE `CREATE` — "never on a daemon's first
+workload, then on every later one".
+
+**E-2 is a measurement artifact; no stale read or fork happened.** The
+worker compares its `HEAD` with a marker the *other* committer wrote
+after its last commit. When a committer takes two turns in a row (the
+other's turn failed on the `index.lock` stall, or lost the lock race),
+its `HEAD` is its own newer commit and the check fires. All 759
+recorded events (475 AWS, 284 OVH) are exactly that: `observed_head`
+equals the node's own last commit in every one. The OVH "fork" at t30
+is a linear history: node a's `a6d84df` is the child of the others'
+`6d87816` and was committed at t+11.3 s during the 15.6 s snapshot (the
+workers were not paused). The local scenario now uses one marker for
+the last commit by anyone plus the in-memory last-acknowledged check; no
+stale turn in any fault-free run on 216ce6c, 71dc7e7 or this branch.
+
+**E-1 root cause 1: the turn lock was not exclusive.** In the
+campaign's own logs (`t_lock_acquire` after `flock`, `t_commit_done`
+before `LOCK_UN`) the next committer took the lock 1–3 s before the
+previous turn ended: 17 overlaps in A1, 9 and 13 in the gc variant.
+Two `git` processes then ran at once and one hit the other's
+`index.lock`. `git-under-flock-rounds` reproduced it locally (51–57
+overlapping turns in round 2 or 3). The debug log showed why: the lock
+owner was a *delegate* (placement delegated the round's directory to a
+committer), and a delegate caps a grant at what is left of its own
+delegation (renewed at half its 5 s TTL): grants of 1.5 s and 2.1 s.
+The holder honours a grant for `ttl − margin` (0.5 s, 1.1 s) and
+renewed at `ttl/2` (0.75 s, 1.04 s), on a tick armed at the `ttl/4`
+cadence (1.25 s): after the window had closed. The grant lapsed under
+`git`'s `flock` (fencing I/O only on the lock file itself), the owner
+outwaited it ("a lock grant's recall went unanswered" — the holder had
+simply stopped honouring it) and granted the lock to the other node.
+Fixes (`authority/core/locks.rs`, `delegate.rs`, `meta/locks.rs`):
+- renewal point `sent + (ttl − margin)/2`, half-way through the window
+  the grant is honoured for (`locks::renew_point`); the renewal tick is
+  armed for the earliest renewal point of any held grant, not only the
+  cadence, and re-armed when a renewal answer shortens a window;
+- a delegate grants nothing on less than `2 × margin` of authority: the
+  request parks (or `WouldBlock`), and the delegation is renewed at
+  once (`lock_short_authority_waits`); a lock renewal that finds it that
+  short also renews the delegation at once; while a generation has lock
+  grants out, the delegate renews it at `ttl/4` instead of `ttl/2`.
+Unit tests: `a_delegate_with_little_authority_left_renews_before_granting`,
+`a_short_grant_is_renewed_inside_its_window`, `a_renewal_comes_inside_the_window`;
+`a_requester_installs_renews_and_releases_on_recall` now expects the
+renewal at 2 s (was 2.5 s).
+
+**E-1 root cause 2: a daemon gets slower the longer it serves (the
+"cumulative state").** In the campaign's A1 run turns went 1–4 s for
+26 minutes, then 10, 17, 22 … 83, 163 s; locally a root's CPU stayed at
+~125% in round 3 with every turn step (edit, add, commit) slower. A
+profile (pprof in a throwaway build) of the root put the time in
+skip-list and merge iteration under `has_dirty`, `releasable_prefix`
+(the pending-upload view behind every stream and ship plan),
+`take_journal`, `dirty_snapshot`: keyspaces with a tiny live set but an
+insert and a delete per operation (`dirty`, `pending_upload`, the
+journal, `journal_tx`, speculation, …), read from their start on every
+sync round, walking every tombstone since the last compaction to reach
+the last level — which a small keyspace rarely gets. `Meta::vacuum_churn`
+(a `meta-vacuum` thread, every 10 s) flushes and major-compacts such a
+keyspace once its entry count (tombstones included) passes 4096 and four
+times what the previous vacuum left. Unit test
+`the_vacuum_compacts_a_churned_keyspace_once`. Before: round 3 turns
+3–7 s median per decile, root at 120–130% CPU; after: 1–2 s, no growth
+across rounds.
+
+The campaign's hung `CREATE` (37 s, a `tmp_obj` of the `git add`
+holding `index.lock`) fits the slowdown: it was captured at the stage
+where the A1 run's turns took 30–160 s. Not proven: the daemon logs of
+that moment were not kept, and locally no single create hung for long
+(the slowest mutations logged in the failing rounds run were 0.5–0.75 s
+each, many per turn).
+
+**Diagnostics kept.** `CONSTELLATION_SLOW_OP_MS` (default 2000): a FUSE
+mutation or create, and an authority-core client op, slower than it is
+logged at WARN; the core's line lists the states the op went through
+(forwarded to whom, parked at a delegate, waiting for an
+acknowledgement).
+
+**Harness.** `gitflock.rs` restructured: every variant checks the shared
+marker and the in-memory last commit under the lock, records each
+turn's lock interval and fails on overlapping turns (reported only under
+faults), and prints turn durations per decile with the slowest turns'
+steps. New `git-under-flock-b2b` (campaign 5 shape: back to back, 5–20
+files per commit, appends to any tracked file; fails on a turn over
+`GIT_FLOCK_MAX_TURN_S` = 30 s or any failed turn) and
+`git-under-flock-rounds` (the b2b workload `GIT_FLOCK_ROUNDS` = 3 times,
+each in a new repository, against the same daemons; fresh node and all
+repositories checked at the end). `GIT_FLOCK_RUST_LOG` sets the daemons'
+`RUST_LOG`.
+
+**Results** (branch `fix-git-b2b` on main 27f919c, prefix
+`constellation-harness-gitb2b`):
+- before (216ce6c / 71dc7e7 + slow-op logging), `git-under-flock-rounds`
+  400 s/round: seed 3 FAILED twice (51 and 57 overlapping turns, 70–82
+  failed turns, longest 31–38 s), seed 4 FAILED (14 overlaps, 24 failed
+  turns); with only the lock fixes seed 4 PASSED but round 3 turns still
+  grew (median per decile up to 7.6 s, longest 14.5 s); with the vacuum
+  too, seed 5 PASSED with round 3 at 2.0–3.4 s (vs 2.7–6.6 s on the same
+  seed without it).
+- final: `git-under-flock-rounds` 3/3 PASS (seeds 21–23, 90 s/round, no
+  stale turn, no overlap, longest turn 5.6 s), `git-under-flock-b2b` 3/3
+  PASS, `git-under-flock` 2/2, `git-under-flock-gc` 1/1,
+  `git-under-flock-faults` 3/3 PASS (seed 61: 0 of 199 turns stale, 2
+  overlaps, both around a killed holder).
+- A/B at 400 s/round, seed 3 (the heavy configuration): main 27f919c
+  FAILED in round 2 (42 overlapping turns; median per decile rising to
+  6.9 s, longest 12.7 s); this branch PASSED all three rounds (691
+  turns, no overlap, no stale turn, round 3 median ≤ 3.3 s, longest
+  7.3 s).
+- Tests: meta and authority (release; sim 98, lib 113) pass; cli 241,
+  net, harness pass; `long_locks` and `long_delegated` (500 seeds) pass;
+  clippy and fmt clean.

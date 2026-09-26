@@ -130,6 +130,11 @@ pub(crate) struct LockState {
     test_by_req: BTreeMap<OpId, OpId>,
     renews: BTreeMap<OpId, RenewInFlight>,
     renew_timer: Option<TimerId>,
+    /// When `renew_timer` fires.
+    renew_at: Option<Ms>,
+    /// Delegate: generations whose renewal a lock renewal asked for
+    /// (too little of the delegation left to extend the grant by much).
+    deleg_renew_wanted: std::collections::BTreeSet<u64>,
     /// A lease read to relearn the owner for renewals is in flight.
     relearning: bool,
     /// Flush attempts per inode with a release in flight.
@@ -284,6 +289,13 @@ impl Core {
 
     fn lock_margin_ms(&self) -> i64 {
         self.cfg.expiry_margin_ms as i64
+    }
+
+    /// The shortest grant worth making: its holder honours it for
+    /// `ttl − margin` and renews half-way through that, so under
+    /// `2 × margin` there is barely time for one renewal round trip.
+    fn lock_min_grant_ms(&self) -> i64 {
+        (2 * self.lock_margin_ms()).min(self.lock_ttl_ms())
     }
 
     /// A restamp for a grant that changed owner (a move, a reclaim, a
@@ -533,8 +545,20 @@ impl Core {
             return Err(conflicting);
         }
         let ttl = self.lock_ttl_ms().min(cap_ms);
-        if ttl <= 0 {
-            return Ok(LockOutcome::Busy);
+        if ttl < self.lock_min_grant_ms() {
+            // Too little authority left to grant anything the holder
+            // could keep (a delegate late in its delegation's window): the
+            // request waits for the delegation's renewal (parked, or
+            // `WouldBlock`), which is asked for now. A grant this short
+            // lapsed at its holder before its first renewal.
+            if gen != 0 {
+                self.stats.lock_short_authority_waits += 1;
+                self.deleg_renew_now(now, gen, out);
+                return Err(Vec::new());
+            }
+            if ttl <= 0 {
+                return Ok(LockOutcome::Busy);
+            }
         }
         let until = base.0.min(now.0) + ttl + self.lock_margin_ms();
         if !replica.note_grant_horizon(until) {
@@ -1246,6 +1270,9 @@ impl Core {
             to: from,
             msg: PeerMsg::LockRenewed { req, results },
         });
+        for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
+            self.deleg_renew_now(now, gen, out);
+        }
     }
 
     fn lock_renew_one(
@@ -1265,6 +1292,11 @@ impl Core {
         let ttl = self.lock_ttl_ms().min(cap_ms);
         if ttl <= 0 {
             return LockRenewResult::NotOwner { owner: 0 };
+        }
+        if gen != 0 && ttl < self.lock_min_grant_ms() {
+            // A delegate short of authority: renew the delegation now
+            // (the caller does), so the next renewal gives more.
+            self.lk.deleg_renew_wanted.insert(gen);
         }
         let until = now.0 + ttl + self.lock_margin_ms();
         if let Some((mode, recalled)) = replica.locks().extend(id, from, until) {
@@ -1742,7 +1774,7 @@ impl Core {
                     id,
                     mode,
                     until_ms: o.sent_at.0 + ttl - margin,
-                    renew_at_ms: o.sent_at.0 + ttl / 2,
+                    renew_at_ms: constellation_meta::locks::renew_point(o.sent_at.0, ttl, margin),
                     owner: from,
                     recalled: false,
                     position,
@@ -1776,8 +1808,9 @@ impl Core {
                     }
                     let t = self.set_timer(now.plus(1), Timer::LockRenewTick, out);
                     self.lk.renew_timer = Some(t);
+                    self.lk.renew_at = Some(now.plus(1));
                 } else {
-                    self.lock_arm_renew_tick(now, out);
+                    self.lock_arm_renew_tick(now, replica, out);
                 }
                 out.push(Action::ControlDone {
                     op,
@@ -1884,13 +1917,32 @@ impl Core {
 
     // ------------------------------------------------------------ renewals
 
-    fn lock_arm_renew_tick(&mut self, now: Ms, out: &mut Vec<Action>) {
-        if self.lk.renew_timer.is_some() {
-            return;
+    /// Arm the renewal tick: at the ttl/4 cadence, or sooner when a held
+    /// grant's renewal point comes first. A delegate's grants can be
+    /// short (capped by what is left of its delegation), with a window
+    /// under the cadence: a tick at the cadence alone came after it
+    /// closed, and the grant lapsed under the application's lock.
+    fn lock_arm_renew_tick(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let mut at = now.plus((self.cfg.lock_ttl_ms / 4).max(50));
+        if let Some(first) = replica
+            .locks()
+            .held_all()
+            .iter()
+            .filter(|(_, h)| h.renewing.is_none() && h.until_ms > now.0)
+            .map(|(_, h)| h.renew_at_ms)
+            .min()
+        {
+            at = at.min(Ms(first.max(now.0 + 1)));
         }
-        let at = now.plus((self.cfg.lock_ttl_ms / 4).max(50));
+        if let Some((t, armed)) = self.lk.renew_timer.zip(self.lk.renew_at) {
+            if armed <= at {
+                return;
+            }
+            self.cancel_timer(t, out);
+        }
         let t = self.set_timer(at, Timer::LockRenewTick, out);
         self.lk.renew_timer = Some(t);
+        self.lk.renew_at = Some(at);
     }
 
     pub(crate) fn on_lock_renew_tick(
@@ -1900,6 +1952,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.lk.renew_timer = None;
+        self.lk.renew_at = None;
         let mut relearn = false;
         // A cache nobody locked for a while is given back (its renewals
         // would otherwise go on forever).
@@ -1936,6 +1989,9 @@ impl Core {
                     let me = self.cfg.node_id;
                     let r = self.lock_renew_one(now, me, ino, h.id, h.mode, replica);
                     self.lock_apply_renew_result(now, ino, h.id, now, r, replica, out);
+                    for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
+                        self.deleg_renew_now(now, gen, out);
+                    }
                 }
                 Route::Node(n) if self.cfg.p2p && self.reaches(now, n) => {
                     by_owner.entry(n).or_default().push((ino, h));
@@ -1997,7 +2053,7 @@ impl Core {
             });
         }
         if replica.locks().held_count() > 0 || !self.lk.renews.is_empty() {
-            self.lock_arm_renew_tick(now, out);
+            self.lock_arm_renew_tick(now, replica, out);
         }
     }
 
@@ -2040,6 +2096,7 @@ impl Core {
         }
         let t = self.set_timer(now.plus(1), Timer::LockRenewTick, out);
         self.lk.renew_timer = Some(t);
+        self.lk.renew_at = Some(now.plus(1));
     }
 
     pub(crate) fn on_lock_renewed(
@@ -2065,6 +2122,10 @@ impl Core {
         );
         for (ino, id, result) in results {
             self.lock_apply_renew_result(now, ino, id, sent, result, replica, out);
+        }
+        // The answer may carry a shorter window than the tick allows for.
+        if replica.locks().held_count() > 0 {
+            self.lock_arm_renew_tick(now, replica, out);
         }
     }
 

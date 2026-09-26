@@ -521,6 +521,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: gitflock::git_under_flock_gc,
     },
     Scenario {
+        name: "git-under-flock-b2b",
+        desc: "campaign 5's back-to-back git-under-flock: 5-20 files per commit, marker-file stale check, no overlapping turns, bounded turn duration",
+        requires: &["git"],
+        run: gitflock::git_under_flock_b2b,
+    },
+    Scenario {
+        name: "git-under-flock-rounds",
+        desc: "git-under-flock-b2b several times in a row, each in a new repository, against the same daemons",
+        requires: &["git"],
+        run: gitflock::git_under_flock_rounds,
+    },
+    Scenario {
         name: "git-under-flock-faults",
         desc: "git-under-flock under kill -9 (holder, committers, whole cluster), SIGSTOP, P2P isolation and S3 cuts",
         requires: &["git"],

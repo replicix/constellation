@@ -360,6 +360,7 @@ impl NodeRuntime {
         }
         let meta = Arc::new(Meta::open(&db_path)?);
         meta.scratch_purge_all()?;
+        spawn_vacuum(&meta);
         if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
             bail!(
                 "this state directory has permanently left the cluster \
@@ -1967,6 +1968,31 @@ async fn reread_slack(
             let _ = sync_tx.send(fusefs::SyncRequest::Slack(meta.epoch_slack()));
         }
         Err(e) => tracing::debug!(error = %e, "re-reading meta.json for epoch_slack failed"),
+    }
+}
+
+/// Keep the churn keyspaces' tombstones bounded (`Meta::vacuum_churn`):
+/// checked every 10 s, on a thread of its own (a compaction blocks), for
+/// as long as the replica is open.
+fn spawn_vacuum(meta: &Arc<Meta>) {
+    let weak = Arc::downgrade(meta);
+    let spawned = std::thread::Builder::new()
+        .name("meta-vacuum".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let Some(meta) = weak.upgrade() else {
+                return;
+            };
+            match meta.vacuum_churn() {
+                Ok(done) if !done.is_empty() => {
+                    tracing::debug!(keyspaces = ?done, "vacuumed churn keyspaces")
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "vacuuming churn keyspaces failed"),
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not start the metadata vacuum thread");
     }
 }
 

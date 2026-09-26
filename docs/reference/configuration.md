@@ -180,6 +180,7 @@ Plan 30 M6–M8. See [Close-to-open modes](features/cto-modes.md).
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_CTO` | `bounded` | `bounded`, `strict` | default for `--cto`; the flag wins |
+| `CONSTELLATION_SLOW_OP_MS` | `2000` | milliseconds; `0` turns it off | a FUSE mutation or create, or a client op of the authority core, slower than this is logged at WARN (the core's line lists the states the op went through: forwarded, parked at a delegate, waiting for an acknowledgement, ...) |
 | `CONSTELLATION_SESSION_WAIT_MS` | `2000` | milliseconds; `0` disables the wait | how long a read waits for this node's replica to reach the position its client already observed (read-your-writes, monotonic reads). On timeout the read answers from the replica and is counted as degraded, never an error |
 | `CONSTELLATION_READ_INDEX_BUDGET_MS` | `2000` | milliseconds, at least 1 | how long a strict read waits for the sequencer's ReadIndex answer before it reads the replica anyway (degraded) |
 | `CONSTELLATION_READ_DELEGATIONS` | on | boolean | this node, as sequencer, grants read delegations to strict readers. Off: every strict read costs a round trip. Always off with P2P off |

@@ -429,7 +429,13 @@ impl Filesystem for FuseFs {
             gid: req.gid(),
             pid: req.pid(),
         };
-        match self.create_or_open(parent, &name, mode, flags, &caller) {
+        let started = std::time::Instant::now();
+        let result = self.create_or_open(parent, &name, mode, flags, &caller);
+        let took = started.elapsed();
+        if took >= crate::fusefs::slow_fuse_op() {
+            tracing::warn!(parent, name = %name, ?took, ok = result.is_ok(), "slow FUSE create");
+        }
+        match result {
             Ok((attr, _created)) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
                 reply.created(

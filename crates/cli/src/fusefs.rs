@@ -1977,8 +1977,13 @@ impl ConstellationFs {
                 .next_rid_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
+        let started = std::time::Instant::now();
         let result = self.mutate_op_rebasable_with_rid(h, part_hint_ino, &op, rid);
         h.acked.lock().unwrap().push(rid.seq);
+        let took = started.elapsed();
+        if took >= slow_fuse_op() {
+            tracing::warn!(?rid, ?took, ?op, ok = result.is_ok(), "slow FUSE mutation");
+        }
         result
     }
 
@@ -4768,4 +4773,20 @@ mod durable_ack_tests {
         assert_eq!(meta.getattr(file.ino).unwrap().unwrap().size, 5);
         assert_eq!(meta.session().stats().fast_acks_waited, 0);
     }
+}
+
+/// A FUSE request slower than this is logged (`CONSTELLATION_SLOW_OP_MS`,
+/// default 2000 ms; 0 turns it off).
+pub(crate) fn slow_fuse_op() -> Duration {
+    static D: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        match std::env::var("CONSTELLATION_SLOW_OP_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2000)
+        {
+            0 => Duration::MAX,
+            ms => Duration::from_millis(ms),
+        }
+    })
 }

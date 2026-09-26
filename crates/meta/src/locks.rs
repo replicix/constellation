@@ -76,6 +76,19 @@ impl LockMode {
     }
 }
 
+/// When a holder renews a grant of `ttl_ms` it sent for at `sent_ms`:
+/// half-way through the window it honours it for (`ttl − margin`), not at
+/// `ttl/2`. A delegate's grants are capped by what is left of its own
+/// delegation, so a ttl as short as `margin` plus a second is routine
+/// there; renewing at `ttl/2` came after the window had closed for any
+/// ttl under `2 × margin`, the grant lapsed while the application still
+/// held its lock, and the owner outwaited it and granted the lock to
+/// another node (the rounds harness scenario: two `git commit`s under one
+/// `flock` at once, git's `index.lock` stall on EC2).
+pub fn renew_point(sent_ms: i64, ttl_ms: i64, margin_ms: i64) -> i64 {
+    sent_ms + (ttl_ms - margin_ms).max(0) / 2
+}
+
 /// A grant's identity: minted by the sequencer that made it, kept
 /// across reclaims and delegation moves.
 #[derive(
@@ -560,6 +573,11 @@ impl LockTables {
         self.lock().grants.len()
     }
 
+    /// Whether this owner's table has a grant made under generation `gen`.
+    pub fn has_grants_of_gen(&self, gen: u64) -> bool {
+        self.lock().grants.values().any(|g| g.gen == gen)
+    }
+
     // ------------------------------------------------------ node: grants
 
     pub fn held(&self, ino: u64) -> Option<HeldGrant> {
@@ -752,7 +770,7 @@ impl LockTables {
         if let Some(h) = g.held.get_mut(&ino).filter(|h| h.id == id) {
             h.renewing = None;
             h.until_ms = h.until_ms.max(sent_ms + ttl_ms - margin_ms);
-            h.renew_at_ms = h.renew_at_ms.max(sent_ms + ttl_ms / 2);
+            h.renew_at_ms = h.renew_at_ms.max(renew_point(sent_ms, ttl_ms, margin_ms));
             h.recalled |= recalled;
             if now_id != id {
                 h.id = now_id;
@@ -1377,6 +1395,18 @@ mod tests {
             t.install_held(7, held(LockMode::Exclusive, 100)),
             Installed::Released
         );
+    }
+
+    #[test]
+    fn a_renewal_comes_inside_the_window() {
+        // 5 s at a 1 s margin: honoured for 4 s, renewed at 2 s.
+        assert_eq!(renew_point(100, 5_000, 1_000), 2_100);
+        // A delegate's short grant: honoured for 1.076 s, renewed at 538 ms
+        // (at `ttl/2` it would have been after the window closed).
+        assert_eq!(renew_point(0, 2_076, 1_000), 538);
+        for ttl in [1_000i64, 1_500, 2_000, 2_500, 5_000] {
+            assert!(renew_point(0, ttl, 1_000) <= (ttl - 1_000).max(0));
+        }
     }
 
     #[test]

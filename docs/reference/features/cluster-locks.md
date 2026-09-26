@@ -92,9 +92,26 @@ same as for [read delegations](cto-modes.md#read-delegations):
 - `margin` is the lease's expiry margin (`min(1 s, lease TTL / 4)`), so
   the rule holds while clocks stay within half the margin of each other.
 
-Renewals go out at half the TTL, one `LockRenew` message per owning
-sequencer carrying every grant that is due. A grant is renewed only
+A grant is renewed half-way through the window the node honours it for
+(`(ttl − margin) / 2` after the send: 2 s at the defaults), one
+`LockRenew` message per owning sequencer carrying every grant that is
+due; the renewal tick is armed for the earliest renewal point, so a
+short grant is renewed inside its window too. A grant is renewed only
 while it is still honoured; a lapsed grant is never renewed.
+
+A delegate's grants are capped by what is left of its own delegation,
+so it keeps that authority topped up: while it has grants out it renews
+the delegation at a quarter of its TTL, a lock renewal that finds less
+than `2 × margin` of it left renews it at once, and it grants nothing
+new on less than `2 × margin` (the request waits for the delegation's
+renewal). Before, it could hand out a grant of barely more than the
+margin, which its holder then honoured for a fraction of a second: the
+grant lapsed while the application still held its lock, and the owner
+granted the lock to another node (two `git commit`s under one `flock`
+at once, EC2 campaign 5's `index.lock: File exists` stall; harness
+`git-under-flock-rounds`). Note that a lapsed grant fences I/O only on
+the locked file: an application that guards *other* files with the
+lock, as git does, runs on unprotected, so the grant must not lapse.
 
 A node whose grant lapsed (for example, because it was partitioned from
 the sequencer for longer than the TTL) is **fenced** on that file:

@@ -372,3 +372,37 @@ fn getattr_throughput_sanity() {
         "getattr throughput over {N} inodes: single-threaded {single:.0} ops/s, 16 threads {multi:.0} ops/s"
     );
 }
+
+// ------------------------------------------------------- churn vacuum
+
+/// EC2 campaign 5: a keyspace whose live set stays small but sees an
+/// insert and a delete per operation (`dirty` here: marked by every
+/// namespace write, cleared by every publish) keeps the deletes as
+/// tombstones, and every "is anything dirty?" probe walks them. The
+/// vacuum compacts such a keyspace once it has grown past its threshold
+/// and leaves it alone until it has grown fourfold again.
+#[test]
+fn the_vacuum_compacts_a_churned_keyspace_once() {
+    let meta = Meta::open_in_memory().unwrap();
+    for i in 0..1200 {
+        let name = format!("f{i}");
+        meta.create(ROOT_INO, &name, 0o644, 0, 0).unwrap();
+        meta.unlink(ROOT_INO, &name).unwrap();
+        let observed = meta
+            .read_consistent(|snap| meta.dirty_snapshot(snap))
+            .unwrap();
+        meta.clear_dirty_upto(&observed).unwrap();
+    }
+    assert!(!meta.has_dirty());
+    let done = meta.vacuum_churn().unwrap();
+    assert!(done.contains(&"dirty"), "vacuumed {done:?}");
+    assert!(!meta.has_dirty());
+    let again = meta.vacuum_churn().unwrap();
+    assert!(!again.contains(&"dirty"), "vacuumed again: {again:?}");
+    // The namespace is untouched.
+    let f = meta.create(ROOT_INO, "after", 0o644, 0, 0).unwrap();
+    assert_eq!(
+        meta.lookup(ROOT_INO, "after").unwrap().map(|a| a.ino),
+        Some(f.ino)
+    );
+}

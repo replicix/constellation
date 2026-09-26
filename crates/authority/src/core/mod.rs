@@ -711,6 +711,10 @@ pub struct Stats {
     /// Root: grants held back while a new tenure waited for its
     /// inherited delegates' stream heads.
     pub lock_tenure_waits: u64,
+    /// Delegate: requests held back because too little of the
+    /// delegation was left to grant a lock worth holding (the
+    /// delegation's renewal is asked for at once).
+    pub lock_short_authority_waits: u64,
     /// Node side.
     pub lock_requests: u64,
     pub lock_unavailable: u64,
@@ -1312,6 +1316,7 @@ impl Core {
             self.withdraw_lost_deps_inbox_ops(now, replica, &mut out);
         }
         self.locks_after_event(now, replica, &mut out);
+        self.note_client_states(now);
         out
     }
 

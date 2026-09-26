@@ -135,6 +135,26 @@ pub(crate) struct ClientOp {
     /// afresh before it proceeds, so they order after the replays it
     /// waited for.
     pub deps_held: bool,
+    /// When the op was submitted, and the states it went through since
+    /// (`(ms after submission, state)`, at most [`HISTORY_CAP`]): a slow
+    /// op is logged with them when it finishes (`finish`).
+    pub submitted: Ms,
+    pub history: Vec<(i64, String)>,
+}
+
+/// How many state changes a client op remembers for its slow-op log.
+pub(crate) const HISTORY_CAP: usize = 24;
+
+/// A client op slower than this is logged, with its states, when it
+/// finishes (`CONSTELLATION_SLOW_OP_MS`, default 2000; 0 turns it off).
+fn slow_op_ms() -> i64 {
+    static MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("CONSTELLATION_SLOW_OP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000)
+    })
 }
 
 impl ClientOp {
@@ -152,6 +172,55 @@ impl ClientOp {
             Phase::AwaitingLog { .. } => ClientPhase::AwaitingLog,
             Phase::Recalling => ClientPhase::Recalling,
         }
+    }
+}
+
+impl super::Core {
+    /// Note every in-flight client op's state if it changed (run after
+    /// each event): what [`Self::log_if_slow`] logs for a slow op.
+    pub(crate) fn note_client_states(&mut self, now: Ms) {
+        if slow_op_ms() <= 0 || self.clients.is_empty() {
+            return;
+        }
+        let pending_exec = &self.dl.pending_exec;
+        let parked_local = &self.rd.parked_local;
+        for (rid, c) in self.clients.iter_mut() {
+            let mut state = format!("{:?}", c.phase_kind());
+            if let Phase::Forwarded { holder, .. } = c.phase {
+                state.push_str(&format!("->{holder}"));
+            }
+            if pending_exec.contains(rid) {
+                state.push_str("+delegate-parked");
+            }
+            if parked_local.contains_key(rid) {
+                state.push_str("+ack-parked");
+            }
+            if c.history.last().is_none_or(|(_, s)| *s != state) && c.history.len() < HISTORY_CAP {
+                c.history.push((now.since(c.submitted), state));
+            }
+        }
+    }
+
+    /// A client op that took longer than `CONSTELLATION_SLOW_OP_MS` is
+    /// logged with the states it went through.
+    fn log_if_slow(&self, now: Ms, rid: Rid, c: &ClientOp, outcome: &str, replica: &dyn Replica) {
+        let took = now.since(c.submitted);
+        if slow_op_ms() <= 0 || took < slow_op_ms() {
+            return;
+        }
+        tracing::warn!(
+            node = self.cfg.node_id,
+            ?rid,
+            took_ms = took,
+            op = ?c.op,
+            outcome,
+            attempts = c.attempts,
+            redirected = c.redirected,
+            deps = ?c.deps,
+            applied = ?replica.applied_position(),
+            history = ?c.history,
+            "slow client op"
+        );
     }
 }
 
@@ -331,6 +400,8 @@ impl Core {
                 deps,
                 also_client: false,
                 deps_held: false,
+                submitted: now,
+                history: Vec::new(),
             },
         );
         // Causal order after a generation ended with this node's writes
@@ -1760,6 +1831,7 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        self.log_if_slow(now, rid, &c, "in doubt", replica);
         self.cancel_timer(c.deadline, out);
         if let Some(t) = c.timer {
             self.cancel_timer(t, out);
@@ -1832,6 +1904,7 @@ impl Core {
         let Some(c) = self.clients.remove(&rid) else {
             return;
         };
+        self.log_if_slow(now, rid, &c, &format!("{outcome:?}"), replica);
         self.cancel_timer(c.deadline, out);
         if let Some(t) = c.timer {
             self.cancel_timer(t, out);

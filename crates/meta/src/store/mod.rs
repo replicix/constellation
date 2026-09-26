@@ -597,6 +597,9 @@ pub struct Meta {
     /// they touched, so another node's write is visible without waiting
     /// out the attribute/entry TTL).
     foreign_apply_hook: std::sync::OnceLock<ForeignApplyHook>,
+    /// [`Meta::vacuum_churn`]: each churn keyspace's entry count right
+    /// after its last vacuum.
+    vacuum_baselines: std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
     usage: UsageTracker,
     /// How many times [`Meta::sync`] ran (M16: the tests pin that every
     /// safety-relevant write — a promise, an epoch join or ack, a seal, a
@@ -605,6 +608,10 @@ pub struct Meta {
     #[allow(dead_code)]
     path: Option<PathBuf>,
 }
+
+/// [`Meta::vacuum_churn`] leaves a keyspace alone below this many
+/// entries (tombstones included): scanning that many is cheap.
+pub const VACUUM_MIN_ENTRIES: usize = 4096;
 
 /// See [`Meta::set_foreign_apply_hook`].
 pub type ForeignApplyHook = Box<dyn Fn(&[crate::record::LogRecord]) + Send + Sync>;
@@ -746,6 +753,7 @@ impl Meta {
             read_delegations: crate::readdeleg::ReadDelegations::default(),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
+            vacuum_baselines: Default::default(),
             usage: UsageTracker::new(0, 0),
             syncs: AtomicU64::new(0),
             path,
@@ -1313,6 +1321,65 @@ impl Meta {
     /// all, without paying for a full [`Self::dirty_snapshot`].
     pub fn has_dirty(&self) -> bool {
         self.dirty.first_key_value().is_some()
+    }
+
+    /// Purge the tombstones of this node's churn keyspaces (EC2 campaign
+    /// 5: a daemon that has served a while gets slower and slower).
+    ///
+    /// Several keyspaces hold only a small live set but see an insert
+    /// and a delete for nearly every operation: `dirty` (every namespace
+    /// write, cleared by each publish), `pending_upload` (every chunk
+    /// written, cleared once uploaded), the journal and its transaction
+    /// index (every op, deleted when shipped), the speculation rows, the
+    /// `completed` retention. An LSM keeps the tombstones until a
+    /// compaction reaches the last level, and the hot paths read these
+    /// keyspaces from their start — `has_dirty` and `dirty_snapshot` on
+    /// every sync round, the pending-upload view behind every stream and
+    /// ship plan, the journal scans behind every ship — so each of them
+    /// walked every delete since the keyspace was last compacted: a
+    /// root at 125% CPU and turns of a git workload ten times slower an
+    /// hour in (the `git-under-flock-rounds` harness scenario profile:
+    /// `has_dirty` and `releasable_prefix` in skip-list and merge
+    /// iteration). A keyspace whose entry count (tombstones included)
+    /// has grown past four times what the previous vacuum left, and past
+    /// [`VACUUM_MIN_ENTRIES`], has its memtable flushed and is compacted
+    /// to its last level, which drops them. Returns the keyspaces vacuumed.
+    pub fn vacuum_churn(&self) -> Result<Vec<&'static str>, MetaError> {
+        let churn: [(&'static str, &SingleWriterTxKeyspace); 13] = [
+            ("dirty", &self.dirty),
+            ("pending_upload", &self.pending_upload),
+            ("journal", &self.journal_ks),
+            ("journal_tx", &self.journal_tx),
+            ("spec", &self.spec),
+            ("spec_live", &self.spec_live),
+            ("pending_replay", &self.pending_replay),
+            ("completed", &self.completed),
+            ("atime_journal", &self.atime_journal),
+            ("backup_tail", &self.backup_tail),
+            ("orphans", &self.orphans),
+            ("chunk_ref_by_ino", &self.chunk_ref_by_ino),
+            ("local", &self.local),
+        ];
+        let mut done = Vec::new();
+        let mut baselines = self
+            .vacuum_baselines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (name, ks) in churn {
+            let ks = ks.inner();
+            let len = ks.approximate_len();
+            let base = baselines.get(name).copied().unwrap_or(0);
+            if len < VACUUM_MIN_ENTRIES || len < base.saturating_mul(4) {
+                continue;
+            }
+            ks.rotate_memtable()
+                .map_err(|e| MetaError::Invalid(format!("vacuum {name}: {e}")))?;
+            ks.major_compact()
+                .map_err(|e| MetaError::Invalid(format!("vacuum {name}: {e}")))?;
+            baselines.insert(name, ks.approximate_len());
+            done.push(name);
+        }
+        Ok(done)
     }
 }
 
