@@ -1496,12 +1496,19 @@ impl Driver {
                     outcome,
                 },
             })),
-            SyncRequest::PeerLockReleased { from, ino, grant } => {
-                Some(Internal::Event(Event::Peer {
-                    from,
-                    msg: PeerMsg::LockReleased { ino, grant },
-                }))
-            }
+            SyncRequest::PeerLockReleased {
+                from,
+                ino,
+                grant,
+                position,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::LockReleased {
+                    ino,
+                    grant,
+                    position,
+                },
+            })),
             SyncRequest::PeerLockMirror { from, ver, grants } => {
                 Some(Internal::Event(Event::Peer {
                     from,
@@ -1945,11 +1952,16 @@ impl Driver {
                 };
                 self.one_way(to, payload);
             }
-            PeerMsg::LockReleased { ino, grant } => {
+            PeerMsg::LockReleased {
+                ino,
+                grant,
+                position,
+            } => {
                 let payload = Payload::LockReleased {
                     from: self.node_id,
                     ino,
                     grant: crate::locks::grant_wire(grant),
+                    position: position.to_postcard(),
                 };
                 self.one_way(to, payload);
             }

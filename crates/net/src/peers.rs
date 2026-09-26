@@ -1282,8 +1282,13 @@ async fn handle_stream<S: PeerService>(
             service.lock_granted(from, ino, sent, outcome);
             Some(Payload::Ok { req_id: 0 })
         }
-        Payload::LockReleased { from, ino, grant } => {
-            service.lock_released(from, ino, grant);
+        Payload::LockReleased {
+            from,
+            ino,
+            grant,
+            position,
+        } => {
+            service.lock_released(from, ino, grant, &position);
             Some(Payload::Ok { req_id: 0 })
         }
         Payload::LockMirror { from, ver, grants } => {

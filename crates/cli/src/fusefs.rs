@@ -564,6 +564,8 @@ pub enum SyncRequest {
         from: u64,
         ino: Ino,
         grant: constellation_meta::locks::GrantId,
+        /// The releaser's frontier (`PeerMsg::LockReleased::position`).
+        position: constellation_meta::Position,
     },
     /// Plan 30 §M14, one way: the holder's grant table (this node backs
     /// it up).

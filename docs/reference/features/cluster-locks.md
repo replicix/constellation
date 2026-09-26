@@ -158,13 +158,37 @@ node, without the sequencer.
 
 ### Coherence from one holder to the next
 
-A grant carries the sequencer's position for the file. Before the local
-lock is taken, the node waits for its replica to reach that position
-and drops the kernel's cached pages and attributes for the file. The
-kernel invalidation is waited for at most 1 s. Together with the
+A grant carries a position, and before the local lock is taken the node
+waits for its replica to reach it and drops the kernel's cached pages
+and attributes for the file (the invalidation is waited for at most
+1 s). The position covers *everything* the previous holders did under
+the lock, not only the locked file:
+
+- the sequencer's position for the file;
+- joined with what each releasing node had seen or been acknowledged
+  when it released (`LockReleased` carries its session frontier: the
+  positions of every reply its clients got, from the root and from
+  delegates, and — when the releaser is the root holder — its whole
+  unshipped journal). The owner keeps the join per file and every later
+  grant of the file carries it. A grant that was outwaited instead of
+  released carries the owner's own position.
+
+The position also becomes the new holder's session watermark, so a read
+of *any* file on that node waits for it (bounded by
+`CONSTELLATION_SESSION_WAIT_MS`), and the kernel's caches of every file
+another node changed are dropped when the replica changes, including
+on the holder that executed the change for it. Together with the
 flush-before-release in the previous section, this gives lock-protected
-read-modify-write across nodes: the previous holder's writes are in the
-log before its grant moves, and the next holder reads them.
+read-modify-write across nodes for a set of files guarded by one lock:
+the previous holder's writes are in the log before its grant moves, and
+the next holder reads them. Git under an `flock` turn file is the
+standard case: without it the next committer could read the
+`refs/heads/master` the previous one had replaced and commit on top of
+the old commit, losing the other's (EC2 campaign 4 B-1; the
+`git-under-flock` harness scenario). The join lives in the owner's
+memory: when the file's lock table moves to another owner (a delegation
+granted or recalled, a takeover) before the next grant, that grant
+carries only the new owner's position.
 
 ### Failover
 

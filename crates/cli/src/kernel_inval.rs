@@ -21,7 +21,13 @@
 //! FUSE worker may ever wait for this thread.
 //!
 //! Only a replica's *foreign* applies are reported (a local write went
-//! through this kernel already). Views mounted on a subtree translate
+//! through this kernel already) — and, just as foreign to this kernel,
+//! another node's op executed here as the holder, a delegate or from the
+//! inbox, a delegate's transaction appended here as the root, and a
+//! transaction streamed here ahead of the log (`Replica::
+//! note_foreign_executed`; EC2 campaign 4 B-1: a holder served another
+//! node's `rename` over git's `refs/heads/master` from its caches for up
+//! to the TTL). Views mounted on a subtree translate
 //! their root; snapshot views are frozen and never registered.
 //! `CONSTELLATION_KERNEL_INVALIDATE=0` turns it off (the TTL bound then
 //! applies as before).

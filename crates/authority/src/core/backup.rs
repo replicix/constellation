@@ -1920,6 +1920,7 @@ impl Core {
             }
             match replica.install_streamed(epoch, tx.first, tx.last, &tx.records) {
                 Ok(()) => {
+                    replica.note_foreign_executed(&tx.records);
                     tracing::debug!(
                         node = self.cfg.node_id,
                         from,

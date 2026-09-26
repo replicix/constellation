@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod coop_churn;
+/// EC2 campaign 4 B-1/B-2: a git repository committed to by two nodes
+/// taking turns under `flock`.
+mod gitflock;
 /// Plan 30 §M10: flexible-quorum continuation epochs.
 mod m10;
 /// Plan 30 §M11: delegated sub-sequencers, one log.
@@ -503,6 +506,24 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "same-path conflict races across 3 local mounts (constellation-chaos Ci profile)",
         requires: &[],
         run: chaos_ci,
+    },
+    Scenario {
+        name: "git-under-flock",
+        desc: "two nodes alternately git commit under an flock turn file; every node and a fresh one agree on every .git file, fsck is clean, no acknowledged commit is lost",
+        requires: &["git"],
+        run: gitflock::git_under_flock,
+    },
+    Scenario {
+        name: "git-under-flock-gc",
+        desc: "git-under-flock with git gc (pack + prune loose objects) under the lock every 8 commits",
+        requires: &["git"],
+        run: gitflock::git_under_flock_gc,
+    },
+    Scenario {
+        name: "git-under-flock-faults",
+        desc: "git-under-flock under kill -9 (holder, committers, whole cluster), SIGSTOP, P2P isolation and S3 cuts",
+        requires: &["git"],
+        run: gitflock::git_under_flock_faults,
     },
     Scenario {
         name: "chaos-soak-4",

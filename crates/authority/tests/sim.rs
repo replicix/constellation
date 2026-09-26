@@ -424,13 +424,16 @@ fn regression_scripted_s3_error_codes() {
 
 /// Plan 30 §M3a's requester speculation as shipped: an accepted forward's
 /// records are installed ahead of the log even when the holder evaluated
-/// the op on state this replica has not applied yet. The simulation finds
-/// the divergence (the core's default refuses such a base and waits for
-/// the log instead — `PeerMsg::MutateReply::base`; plan 30 §M6 is where
-/// positions on replies land for good). Like `today_finds_bug_a` in the
-/// model crate, this asserts the checker *finds* it.
+/// the op on state this replica has not applied yet. The simulation used
+/// to find the divergence here (the core's default refuses such a base
+/// and waits for the log instead — `PeerMsg::MutateReply::base`). Every
+/// one it found was a tailed segment applied *on top of* speculation that
+/// is later in the log than it; since EC2 campaign 4 B-2 the segment goes
+/// in under the speculation it overlaps, and 600 seeds (500..1100) found
+/// none. The window is closed at the meta layer as well: this now asserts
+/// convergence.
 #[test]
-fn stale_base_speculation_is_found() {
+fn stale_base_speculation_converges() {
     let cfg = SimConfig {
         random_faults: 0,
         ops_per_client: 10,
@@ -441,24 +444,10 @@ fn stale_base_speculation_is_found() {
         }),
         ..SimConfig::default()
     };
-    let mut found = None;
     for seed in 500..560 {
-        if let Err(e) = run_seed(seed, cfg.clone()) {
-            found = Some((seed, e));
-            break;
-        }
+        run_seed(seed, cfg.clone())
+            .unwrap_or_else(|e| panic!("stale-base speculation, seed {seed}: {e}"));
     }
-    let (seed, e) = found.expect("no seed diverged with stale-base speculation on");
-    eprintln!(
-        "stale-base speculation found at seed {seed}:\n{}",
-        e.lines().next().unwrap_or("")
-    );
-    assert!(
-        e.contains("did not converge")
-            || e.contains("not the log prefix")
-            || e.contains("linearizable"),
-        "unexpected failure shape: {e}"
-    );
 }
 
 /// Plan 30 §M6: clients read the names they write (and others) from
@@ -971,7 +960,7 @@ fn stream_gap_config() -> SimConfig {
 fn streams_carry_the_log_and_save_tail_gets() {
     let mut on = StreamTotals::default();
     let mut off = StreamTotals::default();
-    for seed in 500..560 {
+    for seed in 500..1100 {
         let cfg = SimConfig {
             read_ratio: 0.3,
             random_faults: 0,

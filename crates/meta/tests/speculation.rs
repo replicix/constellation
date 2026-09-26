@@ -808,7 +808,20 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                         recs.len(),
                         recs.len() + journal.len()
                     ));
-                    events.push(Event::Segment(recs));
+                    // Log order (EC2 campaign 4 B-2): the segment precedes
+                    // every op of this replica still outstanding — none of
+                    // them is in the log yet. (Non-overlapping ones commute;
+                    // the replica rewinds under the overlapping ones.)
+                    let at = events
+                        .iter()
+                        .position(|e| match e {
+                            Event::Speculation(i, _) | Event::Local(i, _) => {
+                                specs[*i].fate == Fate::Outstanding
+                            }
+                            Event::Segment(_) => false,
+                        })
+                        .unwrap_or(events.len());
+                    events.insert(at, Event::Segment(recs));
                 }
                 // Another node takes over: the holder's unshipped journal is
                 // stranded with it.
@@ -899,8 +912,9 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
     }
 
     // The reference: the durable log plus the speculation that survived,
-    // in the order this replica applied them (a late segment already moved
-    // before the local work it was inserted under). Retired requester
+    // in log order — a segment before whatever of this replica was still
+    // outstanding when it arrived (a late segment before the local work
+    // it was inserted under, a tailed one before the shadows and hints). Retired requester
     // speculation is left out — the segment that retired it carries the
     // same records — and so is stranded speculation. A local transaction
     // stays unless stranded: shipping it made it durable in place.
@@ -1118,4 +1132,147 @@ fn a_streamed_transaction_goes_under_a_shadow_whose_reply_overtook_it() {
     assert!(!meta.has_outstanding_speculation());
     assert_eq!(mode(&meta), 0o640);
     assert_eq!(raw_ns(&meta), raw_ns(&reference));
+}
+
+/// EC2 campaign 4 B-2: git's loose object on a requester — `create tmp`,
+/// `link tmp obj`, `unlink tmp`, each installed as a shadow before the
+/// segment carrying the `create` arrives (the holder's ship is slower than
+/// git's three syscalls on real S3). Applied on top of the shadows, the
+/// segment re-created the inode with one link (the tmp name was gone),
+/// its `link` found `obj` in place and added none, and its `unlink tmp`
+/// dropped the inode: `obj` dangled on this replica, and on every fresh
+/// node once this one published. The segment now goes in under the
+/// shadows it overlaps (rolled back, then redone on top). Both as one
+/// segment and as one per op.
+#[test]
+fn a_segment_under_a_git_objects_shadows_keeps_the_object() {
+    for split in [false, true] {
+        let meta = Meta::open_in_memory().unwrap();
+        let x = ino(1);
+        let c = vec![create("tmp", x, 10), completed(rid(1))];
+        let l = vec![
+            LogRecord::Link {
+                ino: x,
+                parent: ROOT_INO,
+                name: "obj".into(),
+                time_ns: 11,
+            },
+            completed(rid(2)),
+        ];
+        let u = vec![unlink("tmp", 12), completed(rid(3))];
+        assert!(meta
+            .install_shadow(rid(1), 1, &create_op("tmp", x), &c)
+            .unwrap());
+        assert!(meta
+            .install_shadow(
+                rid(2),
+                1,
+                &MutateOp::Link {
+                    ino: x,
+                    parent: ROOT_INO,
+                    name: "obj".into()
+                },
+                &l
+            )
+            .unwrap());
+        assert!(meta
+            .install_shadow(
+                rid(3),
+                1,
+                &MutateOp::Unlink {
+                    parent: ROOT_INO,
+                    name: "tmp".into()
+                },
+                &u
+            )
+            .unwrap());
+        let a = meta.getattr(x).unwrap().expect("inode after shadows");
+        assert_eq!(a.nlink, 1);
+        if split {
+            apply(&meta, 1, 1, &c);
+            apply(&meta, 2, 1, &l);
+            apply(&meta, 3, 1, &u);
+        } else {
+            let all: Vec<LogRecord> = c.iter().chain(&l).chain(&u).cloned().collect();
+            apply(&meta, 1, 1, &all);
+        }
+        assert!(
+            meta.lookup(ROOT_INO, "obj").unwrap().is_some(),
+            "split {split}"
+        );
+        let a = meta
+            .getattr(x)
+            .unwrap()
+            .unwrap_or_else(|| panic!("split {split}: inode gone"));
+        assert_eq!(a.nlink, 1, "split {split}");
+    }
+}
+
+/// EC2 campaign 4 B-2, on the root: its own git client's ops in a
+/// delegated subtree are shadows here (the delegate executed them), and
+/// the delegate's stream then brings the same transactions for the root
+/// to append. Appending the `create` over the shadows of the `link` and
+/// the `unlink` that followed it dropped the object's inode the same way.
+#[test]
+fn a_root_appending_a_delegates_git_object_keeps_the_object() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let gen = 5;
+    let x = ino(1);
+    let ops: Vec<(Rid, MutateOp, Vec<LogRecord>)> = vec![
+        (
+            rid(1),
+            create_op("tmp", x),
+            vec![create("tmp", x, 10), completed(rid(1))],
+        ),
+        (
+            rid(2),
+            MutateOp::Link {
+                ino: x,
+                parent: ROOT_INO,
+                name: "obj".into(),
+            },
+            vec![
+                LogRecord::Link {
+                    ino: x,
+                    parent: ROOT_INO,
+                    name: "obj".into(),
+                    time_ns: 11,
+                },
+                completed(rid(2)),
+            ],
+        ),
+        (
+            rid(3),
+            MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "tmp".into(),
+            },
+            vec![unlink("tmp", 12), completed(rid(3))],
+        ),
+    ];
+    for (r, op, recs) in &ops {
+        assert!(meta.install_shadow_from(*r, 1, gen, op, recs).unwrap());
+    }
+    for (idx, (r, _, recs)) in ops.iter().enumerate() {
+        let body: Vec<LogRecord> = recs
+            .iter()
+            .filter(|rec| !matches!(rec, LogRecord::Completed { .. }))
+            .cloned()
+            .collect();
+        assert!(meta
+            .apply_delegate_tx(
+                &body,
+                Some(*r),
+                gen,
+                idx as u64 + 1,
+                constellation_meta::Position::ZERO
+            )
+            .unwrap());
+        assert!(meta.lookup(ROOT_INO, "obj").unwrap().is_some() || idx == 0);
+    }
+    assert!(meta.lookup(ROOT_INO, "tmp").unwrap().is_none());
+    assert!(meta.lookup(ROOT_INO, "obj").unwrap().is_some());
+    let a = meta.getattr(x).unwrap().expect("the object's inode");
+    assert_eq!(a.nlink, 1);
 }

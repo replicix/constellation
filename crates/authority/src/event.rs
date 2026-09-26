@@ -570,6 +570,13 @@ pub enum PeerMsg {
     LockReleased {
         ino: Ino,
         grant: constellation_meta::locks::GrantId,
+        /// Everything the releasing node's clients had seen or been
+        /// acknowledged when it released (`Replica::frontier`): the next
+        /// grant of the file carries it, so what the previous holder
+        /// wrote to *other* files under the lock is visible under the
+        /// next one too (EC2 campaign 4 B-1: git's refs and objects
+        /// under an `flock` turn file).
+        position: constellation_meta::Position,
     },
     /// Plan 30 §M14: renew the grants this node holds at the owner.
     LockRenew {

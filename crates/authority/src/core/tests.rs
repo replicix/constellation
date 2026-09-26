@@ -4337,6 +4337,132 @@ mod locks {
         assert_eq!(h.core.stats.lock_recalls_released, 1);
     }
 
+    /// EC2 campaign 4 B-1: a lock orders *every* write of its previous
+    /// holder before the next holder's reads, not only the locked file's.
+    /// The release carries what its node was acknowledged (here: the
+    /// root's unshipped journal through 77 and a delegation stream,
+    /// neither about the locked file), and every later grant of the file
+    /// carries it — the next one, and one after a holder that released
+    /// with nothing new.
+    #[test]
+    fn a_grant_carries_what_the_previous_holder_released_at() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(2, OpId(7), o)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        let (g2, _) = granted(o);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let mut released = Position {
+            seq: 3,
+            pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 77 }),
+            streams: constellation_meta::Streams::NONE,
+        };
+        assert!(released.streams.raise(5, 9));
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: released,
+            },
+        });
+        let rs = lock_replies(&out);
+        let [(
+            3,
+            OpId(8),
+            LockOutcome::Granted {
+                id: g3, position, ..
+            },
+        )] = rs.as_slice()
+        else {
+            panic!("expected node 3's grant: {out:?}")
+        };
+        assert!(
+            position.dominates(&released),
+            "the grant {position:?} does not cover the release {released:?}"
+        );
+        // Node 3 releases having seen nothing new; node 4's grant still
+        // orders after node 2's writes.
+        let g3 = *g3;
+        let out = request(&mut h, 4, 9, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g3,
+                position: Position::ZERO,
+            },
+        });
+        let rs = lock_replies(&out);
+        let [(4, OpId(9), LockOutcome::Granted { position, .. })] = rs.as_slice() else {
+            panic!("expected node 4's grant: {out:?}")
+        };
+        assert!(position.dominates(&released), "{position:?}");
+    }
+
+    /// The same when the previous holder is the root holder itself: its
+    /// own clients' writes sit in its unshipped journal and raised no
+    /// frontier, so its release covers the whole journal.
+    #[test]
+    fn the_holders_own_release_covers_its_unshipped_journal() {
+        let (mut h, ino) = holder_with_file();
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: false,
+            },
+        });
+        assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
+        let local = LocalLock {
+            owner: 9,
+            pid: 1,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(
+            h.meta.locks().local_set(ino, local, h.now.0),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        // The holder's client writes another file under the lock.
+        let op = h.create("refs");
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let journal = h.meta.journal_position(1).expect("unshipped");
+        let out = request(&mut h, 2, 7, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        assert!(h.meta.locks().local_unlock(ino, 9, 0, u64::MAX, h.now.0));
+        let out = h.step(Event::Control {
+            op: OpId(6),
+            req: Control::LockIdle { ino },
+        });
+        let flush = out
+            .iter()
+            .find_map(|a| match a {
+                Action::LockFlush { ino: i, grant } if *i == ino => Some(*grant),
+                _ => None,
+            })
+            .expect("a flush before the release");
+        let out = h.step(Event::LockFlushed {
+            ino,
+            grant: flush,
+            ok: true,
+        });
+        let rs = lock_replies(&out);
+        let [(2, OpId(7), LockOutcome::Granted { position, .. })] = rs.as_slice() else {
+            panic!("expected the waiter's grant: {out:?}")
+        };
+        assert!(
+            position.pending >= Some(journal),
+            "the grant {position:?} does not cover the holder's journal {journal:?}"
+        );
+    }
+
     /// Two peers: the second conflicting request recalls the first grant
     /// and parks; the release grants it. Shared grants coexist.
     #[test]
@@ -4367,12 +4493,20 @@ mod locks {
         let g3 = rs.iter().find(|r| r.0 == 3).unwrap().3;
         let out = h.step(Event::Peer {
             from: 2,
-            msg: PeerMsg::LockReleased { ino, grant: g2 },
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
         });
         assert!(lock_replies(&out).is_empty(), "one still held: {out:?}");
         let out = h.step(Event::Peer {
             from: 3,
-            msg: PeerMsg::LockReleased { ino, grant: g3 },
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g3,
+                position: constellation_meta::Position::ZERO,
+            },
         });
         let [(4, OpId(9), LockOutcome::Granted { mode: X, .. })] = lock_replies(&out).as_slice()
         else {
@@ -4472,7 +4606,11 @@ mod locks {
         h.now = t0.plus(3_000);
         let out = h.step(Event::Peer {
             from: 2,
-            msg: PeerMsg::LockReleased { ino, grant: g2 },
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
         });
         let ps = pushes(&out);
         let [(3, _, o)] = ps.as_slice() else {
@@ -4531,7 +4669,11 @@ mod locks {
         park(&mut h, 4, 12, ino);
         let out = h.step(Event::Peer {
             from: 2,
-            msg: PeerMsg::LockReleased { ino, grant: g2 },
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
         });
         let rs = lock_replies(&out);
         let [(4, OpId(12), o)] = rs.as_slice() else {
@@ -4549,7 +4691,11 @@ mod locks {
         h.now = t0.plus(20_000);
         h.step(Event::Peer {
             from: 4,
-            msg: PeerMsg::LockReleased { ino, grant: g4 },
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g4,
+                position: constellation_meta::Position::ZERO,
+            },
         });
         assert_eq!(h.core.stats.lock_waiters_dropped, 2);
         assert_eq!(h.core.lock_view().waiters, 0);
@@ -4681,7 +4827,11 @@ mod locks {
         assert!(lock_replies(&out).is_empty(), "conflicts with X: {out:?}");
         let out = h.step(Event::Peer {
             from: 2,
-            msg: PeerMsg::LockReleased { ino, grant: gx },
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: gx,
+                position: constellation_meta::Position::ZERO,
+            },
         });
         let rs = lock_replies(&out);
         let [(
@@ -4705,7 +4855,11 @@ mod locks {
         let g2 = h.meta.locks().own_grant(ino, 2, h.now.0).unwrap().id;
         let out = h.step(Event::Peer {
             from: 2,
-            msg: PeerMsg::LockReleased { ino, grant: g2 },
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
         });
         let rs = lock_replies(&out);
         let [(3, OpId(11), LockOutcome::Granted { id, mode: X, .. })] = rs.as_slice() else {

@@ -1291,6 +1291,9 @@ impl Core {
             match executed {
                 Ok(records) => {
                     replica.remember_outcome(rid, &records);
+                    if rid.node != self.cfg.node_id {
+                        replica.note_foreign_executed(&records);
+                    }
                     if admitted {
                         self.lease.touch(now);
                     }

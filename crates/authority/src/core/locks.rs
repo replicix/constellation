@@ -173,7 +173,24 @@ pub(crate) struct LockState {
     /// handoff installs each once: a grant released or replaced here
     /// since is not revived).
     moved_seen: BTreeMap<u64, std::collections::BTreeSet<GrantId>>,
+    /// Owner side, per inode: what the holders that released their
+    /// grants on it had seen or been acknowledged (`LockReleased`'s
+    /// position, joined). Every later grant on the inode carries it, so a
+    /// lock orders *all* of the previous holder's writes before the next
+    /// holder's reads, not only the locked file's: an application that
+    /// keeps several files consistent under one lock (git's objects and
+    /// refs under an `flock` turn file, EC2 campaign 4 B-1) otherwise
+    /// read the refs the previous holder had replaced — up to a ship
+    /// interval stale — and committed on top of them, losing the other
+    /// node's commits. In memory: a grant that moves to another owner
+    /// before it is asked for again falls back to that owner's position.
+    floors: BTreeMap<Ino, Position>,
 }
+
+/// How many inodes' release positions an owner remembers
+/// ([`LockState::floors`]); past it the oldest-inode entries go, which
+/// can only make a later grant carry less than it could.
+const FLOORS_CAP: usize = 4096;
 
 impl LockState {
     pub(crate) fn container_sizes(&self) -> Vec<(&'static str, usize)> {
@@ -499,7 +516,7 @@ impl Core {
         };
         self.stats.lock_grants += 1;
         self.lk.mirror_dirty = true;
-        let position = self.lock_position(ino, replica);
+        let position = self.lock_grant_position(from, ino, replica);
         tracing::debug!(
             node = self.cfg.node_id,
             to = from,
@@ -562,6 +579,57 @@ impl Core {
             seq: self.ship.head_seq,
             pending,
             streams: Default::default(),
+        }
+    }
+
+    /// [`Self::lock_position`] joined with what the previous holders of
+    /// `ino` released at ([`LockState::floors`]): the position a grant
+    /// to `to` carries. A root holder's grant to itself leaves out its own
+    /// tenure's journal: its replica holds that already, and the session
+    /// counts only shipped journal as reached, so its reads would wait
+    /// for the next ship.
+    fn lock_grant_position(&self, to: NodeId, ino: Ino, replica: &dyn Replica) -> Position {
+        let own = self.lock_position(ino, replica);
+        let mut p = match self.lk.floors.get(&ino) {
+            Some(floor) => own.join(floor),
+            None => own,
+        };
+        if to == self.cfg.node_id && self.lease.held.is_some() {
+            let epoch = self.lease.epoch().unwrap_or(0);
+            if p.pending.is_some_and(|j| j.epoch == epoch) {
+                p.pending = None;
+            }
+        }
+        p
+    }
+
+    /// Everything this node's clients were acknowledged, as a sequencer
+    /// included: its session frontier, plus — as the root holder — its
+    /// whole unshipped journal (its own clients' writes live there and
+    /// raise no frontier). A delegate's own executions are in the
+    /// frontier already (its stream index).
+    fn lock_release_floor(&self, replica: &dyn Replica) -> Position {
+        let mut p = replica.frontier();
+        if self.lease.epoch().is_some() && self.lease.held.is_some() {
+            let epoch = self.lease.epoch().unwrap_or(0);
+            p = p.join(&Position {
+                seq: self.ship.head_seq,
+                pending: replica.journal_position(epoch),
+                streams: Default::default(),
+            });
+        }
+        p
+    }
+
+    /// Remember that a holder released `ino` at `position`.
+    fn lock_note_floor(&mut self, ino: Ino, position: &Position) {
+        if *position == Position::ZERO {
+            return;
+        }
+        let e = self.lk.floors.entry(ino).or_insert(Position::ZERO);
+        *e = e.join(position);
+        while self.lk.floors.len() > FLOORS_CAP {
+            self.lk.floors.pop_first();
         }
     }
 
@@ -849,15 +917,21 @@ impl Core {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_released(
         &mut self,
         now: Ms,
         from: NodeId,
         ino: Ino,
         grant: GrantId,
+        position: Position,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Whether or not the grant is still ours to forget (it may have
+        // been outwaited meanwhile), what its holder did under it must be
+        // visible under the next grant.
+        self.lock_note_floor(ino, &position);
         if replica
             .locks()
             .get(grant)
@@ -904,6 +978,11 @@ impl Core {
             return;
         }
         self.stats.lock_recalls_expired += 1;
+        // The holder never said what it did under the grant. What it was
+        // acknowledged is in some sequencer's journal: this one's, at
+        // least, is covered by what this node has now.
+        let floor = self.lock_release_floor(replica);
+        self.lock_note_floor(g.ino, &floor);
         tracing::info!(
             node = self.cfg.node_id,
             holder = g.node,
@@ -1947,14 +2026,19 @@ impl Core {
             return;
         }
         self.stats.lock_released += 1;
+        let position = self.lock_release_floor(replica);
         match self.lock_route(now, ino, replica) {
             Route::Me { .. } => {
                 let me = self.cfg.node_id;
-                self.on_lock_released(now, me, ino, grant, replica, out);
+                self.on_lock_released(now, me, ino, grant, position, replica, out);
             }
             Route::Node(n) => out.push(Action::Send {
                 to: n,
-                msg: PeerMsg::LockReleased { ino, grant },
+                msg: PeerMsg::LockReleased {
+                    ino,
+                    grant,
+                    position,
+                },
             }),
             Route::Unknown => {
                 // The owner (whoever it is) outwaits it.

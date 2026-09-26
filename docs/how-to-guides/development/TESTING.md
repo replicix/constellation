@@ -214,6 +214,29 @@ boundaries where all files are closed, matching close-to-open
 durability semantics; cross-node checks poll with a deadline because
 propagation is asynchronous (sync interval + FUSE TTLs).
 
+`git-under-flock` (EC2 campaign 4 B-1/B-2) mounts four nodes; two of
+them alternately `git commit` (a note appended and three fresh files per
+commit) to one repository, taking turns under `flock` on a turn file.
+Under the lock each committer first checks that `refs/heads/master`
+reads as the last acknowledged commit (a stale read there is the lost
+update the soak found: commits based on an old `HEAD`). After the run
+every node drains, a fresh node mounts from the bucket, and on every
+node, the fresh one included, the repository tree (every `.git` file:
+path, size, link count, content) must be identical, `git fsck --full`
+clean, and every acknowledged commit present and an ancestor of `HEAD`.
+`git-under-flock-gc` also runs `git gc` under the lock every 8 commits;
+`git-under-flock-faults` injects `kill -9` (a random node, the lease
+holder or the whole cluster), `SIGSTOP`, P2P isolation of one node and an
+S3 cut of one node (each node reaches S3 through its own relay); there
+a stale turn is only reported (a turn can begin before writes that a
+crashed node held unshipped are replayed), and a commit it would lose
+still fails the end-state check.
+`GIT_FLOCK_SECS` sets the duration (60 s, 150 s with faults),
+`GIT_FLOCK_NODES` the node count (2–4), `GIT_FLOCK_COMMITTERS=last` makes
+the last two nodes commit (neither is the sequencer), and
+`GIT_FLOCK_S3_LATENCY_MS` / `GIT_FLOCK_ENV=K=V,...` add S3 latency and
+mount environment.
+
 `atime-eventual` (plan 20) mounts two nodes with `--atime relatime`: a
 cold read on one node must eventually advance `atime` on the holder,
 and — with S3 cut via toxiproxy — reads must keep succeeding at full
@@ -1487,7 +1510,9 @@ cargo test -p constellation-authority --test sim -- --ignored long_random   # AU
 A failing seed prints its replay command. The regression tests
 (`regression_bug_a_slow_holder_replies`,
 `regression_bug_b_holder_dies_with_unshipped_forwards`,
-`regression_scripted_s3_error_codes`, `stale_base_speculation_is_found`,
+`regression_scripted_s3_error_codes`, `stale_base_speculation_converges`
+(it used to find a divergence with stale-base speculation on; EC2
+campaign 4 B-2 closed that window in the meta layer),
 `regression_inbox_p2p_off` — M13's inbox with P2P off: ops answered
 through the log, sustained demand escalating to a lease request —
 `regression_inbox_batch_withdrawn_before_p2p_forward`,

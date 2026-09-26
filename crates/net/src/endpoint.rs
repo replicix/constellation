@@ -761,7 +761,7 @@ pub trait PeerService: Send + Sync + 'static {
     ) {
     }
     /// Plan 30 §M14, one way: a holder released a grant.
-    fn lock_released(&self, _from: u64, _ino: u64, _grant: (u64, u64)) {}
+    fn lock_released(&self, _from: u64, _ino: u64, _grant: (u64, u64), _position: &[u8]) {}
     /// Plan 30 §M14, one way: the holder's grant table, for a backup.
     fn lock_mirror(&self, _from: u64, _ver: u64, _grants: Vec<u8>) {}
     /// Holder offered us this lease (placement). Default ignores it.

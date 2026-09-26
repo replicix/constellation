@@ -821,6 +821,9 @@ impl Core {
             match replica.delegate_execute(op, Some(rid), gen, deps) {
                 Ok((records, idx)) => {
                     replica.remember_outcome(rid, &records);
+                    if rid.node != self.cfg.node_id {
+                        replica.note_foreign_executed(&records);
+                    }
                     self.stats.deleg_executed += 1;
                     if let Some(d) = self.dl.mine.get_mut(&gen) {
                         d.executed += 1;
@@ -1200,6 +1203,7 @@ impl Core {
                 }
                 match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
                     Ok(_) => {
+                        replica.note_foreign_executed(&tx.records);
                         cursor = tx.idx;
                         drained += 1;
                     }
@@ -2518,6 +2522,7 @@ impl Core {
             }
             match replica.apply_delegate_tx(&tx.records, tx.rid, gen, tx.idx, tx.deps) {
                 Ok(_) => {
+                    replica.note_foreign_executed(&tx.records);
                     cursor = tx.idx;
                     appended += 1;
                     if self.cfg.placement {

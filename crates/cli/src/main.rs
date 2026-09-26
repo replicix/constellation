@@ -3300,7 +3300,7 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn lock_released(&self, from: u64, ino: u64, grant: (u64, u64)) {
+    fn lock_released(&self, from: u64, ino: u64, grant: (u64, u64), position: &[u8]) {
         if crate::fault::p2p_denied(from) {
             return;
         }
@@ -3308,6 +3308,7 @@ impl constellation_net::PeerService for P2pBridge {
             from,
             ino,
             grant: crate::locks::grant_of(grant),
+            position: constellation_meta::Position::from_postcard(position),
         });
     }
 

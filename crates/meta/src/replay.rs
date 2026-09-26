@@ -360,6 +360,22 @@ fn apply_one(
     if let Some(t) = rec.stamp_ns() {
         crate::hlc::observe(t);
     }
+    // EC2 campaign 4 B-2: an inode is created once — inos are never
+    // reused — so a durable create whose ino already exists here is this
+    // very record applied again, over state that already holds it and
+    // possibly later ops: a root appending a delegate's transaction over
+    // its own shadow of the op, a record redone or re-shipped. Re-running
+    // it re-created the inode with one link and put its name back: under
+    // git's loose object (`create tmp`, `link tmp obj`, `unlink tmp`) the
+    // `link` then found `obj` in place and added no link, and the `unlink
+    // tmp` dropped the inode under `obj`. The first application stands.
+    if durable {
+        if let Some(ino) = primary_ino(rec) {
+            if ns::get_inode_record(tx, &meta.ns, ino)?.is_some() {
+                return Ok(Applied::Done);
+            }
+        }
+    }
     match rec {
         LogRecord::Mkdir {
             parent,

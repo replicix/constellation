@@ -312,10 +312,18 @@ impl ClusterLocks {
     }
 
     /// A grant arrived: what the previous holder wrote under its lock is
-    /// at or before `position`. Wait for the replica to reach it, then
-    /// drop the kernel's pages and attributes of the file, which may
-    /// predate it.
+    /// at or before `position` — to this file and to every other one
+    /// (the owner joins the releaser's frontier in). Wait for the replica
+    /// to reach it, then drop the kernel's pages and attributes of the
+    /// file, which may predate it.
+    ///
+    /// `position` also becomes this session's `observed` watermark, so a
+    /// read of any *other* file waits for it too, however the wait for
+    /// the locked file itself ended (a speculation that covers it, or the
+    /// session budget): the application reads the refs next to the lock
+    /// file, not only the lock file (EC2 campaign 4 B-1).
     fn granted(&self, ino: Ino, position: &Position) {
+        self.meta.session().raise_observed(*position);
         let waited = self.meta.session_wait_at(&[ReadKey::Ino(ino)], position);
         tracing::debug!(target: "constellation::locks", ino, ?position, ?waited, "lock granted");
         if let Some(inval) = &self.inval {

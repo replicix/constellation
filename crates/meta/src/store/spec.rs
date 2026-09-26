@@ -2469,7 +2469,51 @@ impl Meta {
             .filter(|(_, entry)| matches!(entry, LiveEntry::Local { .. }))
             .map(|(seq, _)| *seq)
             .min();
-        let rolled_back = |spec_seq: u64| first_local.is_some_and(|cutoff| spec_seq >= cutoff);
+        // EC2 campaign 4 B-2: the same for outstanding speculation of any
+        // other kind that this segment's records overlap (or that it
+        // retires): the segment is earlier in the log than it, so its
+        // records must apply *under* it, not on top. Applied on top, a
+        // record re-runs against state that already holds its own effect
+        // and later ones, and replay is not idempotent across that: git's
+        // loose object — `create tmp`, `link tmp obj`, `unlink tmp` — shadowed
+        // here before the segment with the `create` arrived, re-created the
+        // inode with `nlink 1` (the tmp name was gone), the `link` found
+        // `obj` already there and added no link, and the `unlink tmp`
+        // then dropped the inode under `obj`. A dangling `obj` on this
+        // replica, published by it as the next holder: every fresh node
+        // lost the object. A shadow the segment completes and a streamed
+        // row it confirms are its own records; the rest are later ops.
+        let first_overlap = {
+            let mut first: Option<u64> = None;
+            for (spec_seq, entry) in &live {
+                let candidate = match entry {
+                    LiveEntry::Local { .. } => false,
+                    LiveEntry::Streamed { .. }
+                        if confirmed.iter().any(|(s, _, _)| s == spec_seq) =>
+                    {
+                        false
+                    }
+                    LiveEntry::Shadow { rid, .. } if completes.contains(rid) => true,
+                    _ => match tx.get(&self.spec, seq_key(*spec_seq))? {
+                        Some(v) => {
+                            let row: SpecRow = postcard::from_bytes(&v)?;
+                            let touched = row_touches(&tx, self, &row)?;
+                            records.iter().any(|rec| touched.conflicts(rec))
+                        }
+                        None => false,
+                    },
+                };
+                if candidate && first.is_none_or(|f| *spec_seq < f) {
+                    first = Some(*spec_seq);
+                }
+            }
+            first
+        };
+        let first_rewind = match (first_local, first_overlap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let rolled_back = |spec_seq: u64| first_rewind.is_some_and(|cutoff| spec_seq >= cutoff);
         let mut skipped_rows: HashSet<u64> = confirmed
             .iter()
             .filter(|(spec_seq, _, _)| !rolled_back(*spec_seq))
@@ -2505,8 +2549,8 @@ impl Meta {
             &filtered
         };
         let mut inserted_before_local = false;
-        let skipped = if let Some(cutoff) = first_local {
-            inserted_before_local = true;
+        let skipped = if let Some(cutoff) = first_rewind {
+            inserted_before_local = first_local.is_some();
             // Plan 30 §M11: a delegate holds `Local` rows (its unretired
             // stream transactions) older than its shadows and hints, so
             // the insert-and-redo path is its ordinary one. What this

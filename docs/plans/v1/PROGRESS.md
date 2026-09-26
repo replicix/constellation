@@ -23757,3 +23757,172 @@ Doc conflicts (TESTING.md, PROGRESS.md) resolved by keeping both.
   backup-failover-with-delegation, shared-dir-multi-writer,
   hash-range-split-merge, cross-range-rename, forwarded-mutations,
   nonowner-op-latency, session-forwarded-ryw.
+
+## Fix: git-under-flock divergence and lost objects (campaign 4 B-1/B-2)
+
+EC2 campaign 4 Part B: two nodes alternately `git commit` to one shared
+repository under an `flock` turn file. After a 2 h soak with faults,
+every node agreed on `HEAD` but each walked a different slice of history
+(1574 / 67 / 1379 / 707 commits), `git fsck` found missing objects on
+three of four nodes, and a fresh node mounted from the bucket saw node
+b's 67 (B-2: the objects were missing from what the bucket describes).
+It is two bugs.
+
+**B-1: the next lock holder read the previous holder's replaced refs
+(fault-free, reproduced on main 5face1b and edd3d5d).** The new
+`git-under-flock` scenario checks, under the turn lock, that
+`refs/heads/master` reads as the last acknowledged commit. On main 48 of
+97 turns failed that check in a fault-free 60 s run (every turn of the
+committer on the lease holder), and without the check git committed on
+top of the stale ref: 68 of 123 acknowledged commits were not ancestors
+of `HEAD` — the soak's ~70 dangling commits. Two causes:
+- *Kernel caches on the holder.* `kernel_inval` dropped the kernel's
+  caches only for records applied from a *segment*. The holder executes
+  another node's forwarded op (git's `rename master.lock master`) in
+  place and never tails it, so its kernel kept serving the replaced
+  dentry and inode for up to the 1 s FUSE TTL (the stale window measured
+  0.5–0.8 s every time). `Replica::note_foreign_executed` now feeds the
+  same invalidation from every path that changes a replica without going
+  through its kernel: a forwarded op executed as the holder, a delegate or
+  from the inbox (rid of another node), a delegate transaction appended by
+  the root, and a transaction installed from the pre-S3 stream. This
+  alone made the scenario pass.
+- *The grant's position covered only the locked file.* `lock_position`
+  carried the shipped head plus the unshipped journal only if it touched
+  the lock file, and no delegation stream at all, so a next holder whose
+  replica lagged (a non-holder, a slow stream, a delegated `.git`) could
+  read the other files as they were before the previous holder's turn.
+  `LockReleased` now carries the releaser's session frontier
+  (`SessionState::frontier`: `deps` without overflow — every reply
+  position its clients got, root and delegate streams — plus, for the
+  root holder, its whole unshipped journal); the owner joins it per inode
+  (`LockState::floors`, in memory, capped at 4096 inodes) into every
+  later grant, and an outwaited grant contributes the owner's own
+  position. The FUSE side makes the grant position its `observed`
+  watermark, so a read of any file waits for it. A root holder's grant to
+  itself leaves out its own tenure's journal (the session counts only
+  shipped journal as reached). Unit tests
+  `a_grant_carries_what_the_previous_holder_released_at`,
+  `the_holders_own_release_covers_its_unshipped_journal`. This part did
+  not change the local fault-free result (the holder ships at once and
+  the stream is fast; I could not build a local case where it matters),
+  but it is what "the previous holder's writes are visible under the
+  next grant" requires once the writes sit in a delegate's stream or an
+  unshipped journal.
+
+**B-2: a replica dropped a git object's inode and published the
+dangling name (found in the bucket, reproduced in unit tests).** The
+kept prefix's log (121,822 segments, decoded with the new
+`crates/authority/examples/dump_log.rs`) replayed in order contains
+every "missing" object: e.g. `.git/objects/7a/6f9350…` is `create
+tmp_obj_g6PZ2j` (seq 112190), `write_manifest` + `link … 6f9350…`
+(112191), `unlink tmp_obj_g6PZ2j` (112192), node b as holder, epoch 20,
+never unlinked again. The commit chain (read with the new
+`crates/store-s3/examples/commit_probe.rs`, run read-only on EC2) shows
+the dentry present with its inode from commit 3405 (author b, epoch
+20) and the **inode key gone, the dentry left pointing at it** from
+commit 3615 — node c's first publish as holder (epoch 23, after the
+full-cluster kill). A lookup of the name then answers `ENOENT`
+("unable to mmap … No such file or directory"), and a fresh node
+bootstraps exactly that. Node c had applied the object's records in a
+state where the `unlink tmp` found the inode with one link while `obj`
+still named it: the signature of the create being applied *again* over
+state that already held it and the later `link`/`unlink`. Replay is not
+idempotent across that: the second `create tmp` found no `tmp` (it was
+unlinked), re-created the inode with `nlink 1` and no manifest, the
+`link` found `obj` already there and added no link, and `unlink tmp`
+dropped the inode under `obj`. Two paths are pinned by tests that fail
+on main:
+- a tailed segment applied *on top of* outstanding speculation that is
+  later in the log (`a_segment_under_a_git_objects_shadows_keeps_the_object`:
+  a requester's shadows of all three ops, then the segment); and
+- a root appending a delegate's transaction over its own shadow of the
+  same op and the ones after it
+  (`a_root_appending_a_delegates_git_object_keeps_the_object`).
+
+Which path hit node c in the soak is not provable any more (its daemon
+log is gone); both fixes cover every re-application of a create:
+- `apply_segment_rows` puts a tailed segment *under* the outstanding
+  speculation it overlaps or retires (the rewind path M3b already used
+  for `Local` rows now starts at the oldest such shadow, hint or
+  unconfirmed streamed row): those rows are rolled back, the segment
+  applied in its log place, and what still stands redone.
+- `apply_one`: a durable `create`/`mkdir`/`symlink`/`mknod` whose inode
+  already exists is that record again (inodes are never reused) and
+  changes nothing.
+
+The rewind change closed the meta-level stale-base window as a side
+effect: `a_hint_installed_on_a_stale_base_diverges` now converges
+(renamed `…_converges`), and `stale_base_speculation_is_found` found no
+divergence in 600 seeds (500..1100), so it is now
+`stale_base_speculation_converges` (seeds 500..560). The speculation
+property test's reference model applied a segment after this replica's
+still-outstanding speculation (application order); it now puts it before
+(log order), which is what the replica does.
+
+**Harness.** `git-under-flock` (4 nodes, two committers, a note and
+three new files per commit, the stale-ref check under the lock, then
+drain, a fresh node, and on every node the whole repository tree —
+every `.git` file's path, size, link count and content — `git fsck
+--full` and every acknowledged commit present and an ancestor of
+`HEAD`), `git-under-flock-gc` (`git gc` under the lock every 8
+commits), `git-under-flock-faults` (kill -9 of a random node, the lease
+holder or the whole cluster; SIGSTOP; P2P isolation of one node; an S3
+cut of one node through per-node relays). Knobs in TESTING.md.
+
+**Results** (worktree `constellation-gitdiv`, rebased on main 5face1b,
+prefix `constellation-harness-gitdiv`):
+- main 5face1b, fault-free `git-under-flock`: FAIL, 48/97 stale turns.
+  4798008 the same (48/98), and before the stale check existed 68 of
+  123 acknowledged commits were missing from `HEAD`'s history.
+- fixed, fault-free: `git-under-flock` 8/8 PASS (seeds 1, 11–17; 60 s,
+  150–160 commits each, no stale turn); `git-under-flock-gc` 6/6 PASS;
+  with `GIT_FLOCK_COMMITTERS=last` (neither committer the sequencer)
+  PASS, also with log streams, delegation and placement off.
+- fixed, `git-under-flock-faults` (150 s, 12–15 faults each): 10/10 with
+  every node and a fresh one identical, `fsck` clean and every
+  acknowledged commit (90–302 per run) an ancestor of `HEAD`. Seeds 31
+  and 32 were reported FAILED by the first version of the scenario for
+  1 and 2 stale turns; under faults a turn can begin before writes a
+  crashed node held unshipped are replayed (Layer A), so the scenario
+  now only reports those (seed 36: 5 of 90), and 33–40 PASS on the final
+  binaries. The scenario also aborts a killed node's FUSE connection:
+  once a `git` request stayed waiting on the dead mount and the lazy
+  unmount behind it hung the harness until the connection was aborted
+  by hand.
+- B-2 never reproduced locally (floci ships in about a millisecond, so a
+  requester's shadows rarely get ahead of their segment); the unit tests
+  are its regression.
+- Tests (release): meta all (the speculation property test and its long
+  variant included); authority lib 100, `meta_repro` 3, sim 95 (10
+  ignored). Debug: cli 237, net, harness pass. clippy and fmt clean.
+  Long sweeps, 1000 seeds each: `long_delegated`, `long_backup`,
+  `long_locks`, `long_random`, `long_strict`, `long_backup_hot` pass. In
+  a *debug* build five sim tests (`delegated_marker_order_holds`,
+  `long_delegated_seed_70051_finishes`, `…70075_keeps_stream_order`,
+  `regression_long_delegated_seeds`,
+  `regression_long_delegated_backup_seeds`) panic on main already: the
+  sim's `split_name` looks up `""` for a name with a leading `/` and
+  trips `keys::dentry`'s debug assertion; they pass in release.
+- Debugging aids kept as examples: `crates/authority/examples/dump_log.rs`
+  (a directory of downloaded segments to JSON lines) and
+  `crates/store-s3/examples/commit_probe.rs` (read-only walk of a commit
+  chain printing when given dentry/inode keys change, with author, epoch
+  and `applied`).
+
+**Found on the way (not fixed here).**
+- A liveness bug in seal-based failover. With all four nodes' S3 cut at
+  once (5.5 s) around a holder whose backup sealed its epoch, the cluster
+  formed a continuation epoch and then stayed stuck for good: every node
+  reported `holder 1`, the holder reported `lost: true`, `epoch.active:
+  true`, nothing shipped and FUSE ops hung (the scenario now cuts S3 per
+  node, as the soak did). Separately, after a P2P isolation of the holder
+  its old backup kept `sealed_epoch: 1` and the holder re-invited it
+  every ~100 ms ("a backup sealed our epoch" 3194 times in 5 min); a
+  node's FUSE mutations then stalled for ~220 s (the harness's next
+  fault waited that long on an unlink; seeds 31 and 36) until a later
+  fault moved the cluster on. Logs of the permanent hang:
+  `/tmp/claude-1000/-home-bra-cvs-constellation/84196101-2583-4642-a2f2-afbc29380f8e/scratchpad/gitdiv/epochhang/`.
+- Under faults, a lock whose previous grant was outwaited (its holder
+  stuck) carries only the owner's position; one turn in 302 then read a
+  stale ref for more than 5 s (no commit was lost in the end).

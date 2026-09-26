@@ -289,6 +289,24 @@ always a prefix of the durable log plus speculation it can take back:
   *before* them: they are rolled back, the segment applied, and they are
   redone on top through the replay path — exactly what every other
   replica computes once they ship after it.
+- **A tailed segment goes under the speculation it overlaps.** The
+  segment is earlier in the log than every shadow, hint or streamed
+  transaction still outstanding here, so when its records touch any of
+  their keys (or it completes a shadow) the same rewind puts it in its
+  log place: those rows are rolled back, the segment applied, and what
+  still stands redone on top. Applied on top instead, a record re-ran
+  against state that already held its own effect and later ones, and
+  replay is not idempotent across that (EC2 campaign 4 B-2: git's loose
+  object — `create tmp`, `link tmp obj`, `unlink tmp` — re-created with
+  one link under the shadow of the `unlink`, so the segment's own
+  `unlink tmp` dropped the inode under `obj`; the replica published the
+  dangling name as holder and every fresh node lost the object).
+  Independently, a durable `create`/`mkdir`/`symlink`/`mknod` whose inode
+  already exists is that record applied again (inodes are never reused)
+  and changes nothing: the first application stands. That covers the
+  paths that apply a durable transaction over speculation of their own,
+  such as a root appending a delegate's transaction over its shadow of
+  the same op.
 - **Replay by rid.** Each stranded op is queued, in original order, and
   sent again with its original rid down the ordinary forward path to
   whoever holds the lease now; if a queued op cannot reach a holder for

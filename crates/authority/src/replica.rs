@@ -270,6 +270,19 @@ pub trait Replica {
     /// plus every delegation stream position this node holds or was
     /// answered with); `None` when they overflow `Streams`.
     fn deps(&self) -> Option<Position>;
+    /// What a cluster lock's release carries: `deps`, never overflowing
+    /// (`SessionState::frontier`).
+    fn frontier(&self) -> Position;
+    /// `records` changed this replica without passing through this
+    /// node's kernel: another node's op executed here (as the holder, a
+    /// delegate or from the inbox), a delegate's transaction appended
+    /// here as the root, or the holder's transaction streamed here ahead
+    /// of the log. The kernel's caches of what they touch are dropped, as
+    /// for an applied segment (plan 30 §M7). Without it a holder served
+    /// another node's replaced file (git's `refs/heads/master` after a
+    /// `rename` over it) from its kernel caches for up to the FUSE TTL
+    /// (EC2 campaign 4 B-1).
+    fn note_foreign_executed(&self, records: &[LogRecord]);
     /// Plan 30 §M11: a sequencer answered this node's client at `pos`.
     fn note_frontier(&self, pos: &Position);
     /// The namespace, for ownership walks.
@@ -833,6 +846,14 @@ impl Replica for Meta {
 
     fn deps(&self) -> Option<Position> {
         self.session().deps()
+    }
+
+    fn frontier(&self) -> Position {
+        self.session().frontier()
+    }
+
+    fn note_foreign_executed(&self, records: &[LogRecord]) {
+        self.note_foreign_applied(records);
     }
 
     fn note_frontier(&self, pos: &Position) {

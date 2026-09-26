@@ -779,7 +779,12 @@ strict mode (cross-node byte-range locks) had never been built.
   flushes the file's dirty data before it releases. The next grant
   carries a position the new holder waits for, and it drops its kernel
   cache of the file, so lock-protected read-modify-write works across
-  nodes.
+  nodes. The position covers every file, not only the locked one: a
+  release carries the releaser's session frontier (every reply its
+  clients got, and a root holder's unshipped journal), the owner joins
+  it into every later grant of the file, and the new holder makes it
+  its session watermark (EC2 campaign 4 B-1: git's refs under an
+  `flock` turn file).
 - Grants are cached after the last unlock, so an uncontended re-lock
   costs nothing.
 - After a fast takeover, the successor waits out a grace period and

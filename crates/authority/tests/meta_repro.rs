@@ -165,16 +165,17 @@ fn a_shadow_survives_an_unrelated_rename_tailed_under_it() {
     assert_eq!(listing(&requester), listing_at(&segments, 19));
 }
 
-/// The divergence: an `EEXIST` hint whose entry the holder read *after*
-/// two unshipped renames of `f1` (seqs 14 and 15), installed on a replica
-/// at applied 13. The hint's entry (`f1 -> f0's inode`) lands next to the
-/// still-present `f0`, and the renames then evict the wrong inode. This
-/// is plan 30 §M3a's known window ("closing it precisely needs the
-/// holder's journal position in replies", §M6); the authority core
-/// refuses such a base (`PeerMsg::MutateReply::base`) and the simulation
-/// shows the divergence with `speculate_on_stale_base` on.
+/// An `EEXIST` hint whose entry the holder read *after* two unshipped
+/// renames of `f1` (seqs 14 and 15), installed on a replica at applied
+/// 13. The hint's entry (`f1 -> f0's inode`) lands next to the
+/// still-present `f0`, and the renames used to evict the wrong inode:
+/// plan 30 §M3a's known window, which the authority core avoids by
+/// refusing such a base (`PeerMsg::MutateReply::base`). EC2 campaign 4
+/// B-2 closed it in the meta layer too: a tailed segment overlapping
+/// outstanding speculation goes in *under* it (the hint is rolled back,
+/// the renames applied, the hint redone or retired), so it converges.
 #[test]
-fn a_hint_installed_on_a_stale_base_diverges() {
+fn a_hint_installed_on_a_stale_base_converges() {
     let segments = holder_log();
     let requester = fresh(2);
     for seq in 1..=13 {
@@ -192,10 +193,5 @@ fn a_hint_installed_on_a_stale_base_diverges() {
         apply(&requester, &segments, seq);
     }
     assert!(!requester.has_outstanding_speculation());
-    assert_ne!(
-        listing(&requester),
-        listing_at(&segments, 19),
-        "installing a hint read on a base this replica had not applied must diverge \
-         (if this now converges, the meta layer closed the window: flip this test)"
-    );
+    assert_eq!(listing(&requester), listing_at(&segments, 19));
 }

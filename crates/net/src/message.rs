@@ -511,11 +511,15 @@ pub enum Payload {
     LockRecalled {
         req_id: u64,
     },
-    /// One way: the holder released `grant`.
+    /// One way: the holder released `grant`. `position`: what its
+    /// clients had seen or been acknowledged (a postcard
+    /// `constellation_meta::Position`), which the next grant carries.
     LockReleased {
         from: u64,
         ino: u64,
         grant: (u64, u64),
+        #[serde(default)]
+        position: Vec<u8>,
     },
     /// Renew grants at their owner; answered by [`Payload::LockRenewed`].
     LockRenew {

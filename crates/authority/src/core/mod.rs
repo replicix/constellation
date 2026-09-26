@@ -1480,9 +1480,11 @@ impl Core {
                 self.on_lock_recall(now, from, req, ino, grant, replica, out)
             }
             PeerMsg::LockRecalled { req } => self.on_lock_recalled_ack(req),
-            PeerMsg::LockReleased { ino, grant } => {
-                self.on_lock_released(now, from, ino, grant, replica, out)
-            }
+            PeerMsg::LockReleased {
+                ino,
+                grant,
+                position,
+            } => self.on_lock_released(now, from, ino, grant, position, replica, out),
             PeerMsg::LockRenew { req, entries } => {
                 self.on_lock_renew(now, from, req, entries, replica, out)
             }

@@ -406,6 +406,9 @@ impl Core {
         let outcome = match replica.execute(op, Some(rid)) {
             Ok(records) => {
                 replica.remember_outcome(rid, &records);
+                if rid.node != self.cfg.node_id {
+                    replica.note_foreign_executed(&records);
+                }
                 self.lease.touch(now);
                 self.nudge(now, out);
                 // (`_executed`: plus what an unlink or rename changed

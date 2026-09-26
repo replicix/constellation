@@ -633,6 +633,43 @@ impl SessionState {
         })
     }
 
+    /// Everything this node's clients have seen or been acknowledged:
+    /// [`Self::deps`], except that a stream table that does not fit
+    /// keeps the generations that do (the highest ones: the older a
+    /// generation, the likelier it is applied or void everywhere).
+    ///
+    /// A cluster lock's release carries it (EC2 campaign 4 B-1): the
+    /// next holder waits for it, so every file the releaser wrote under
+    /// the lock — not only the locked one — reads as the releaser left
+    /// it.
+    pub fn frontier(&self) -> Position {
+        if let Some(p) = self.deps() {
+            return p;
+        }
+        let g = self.inner.lock().unwrap();
+        let mut all: std::collections::BTreeMap<u64, u64> = g.observed.streams.iter().collect();
+        for (gen, idx) in g.frontier.iter().chain(g.streams.iter()) {
+            if g.voided.contains(gen) {
+                continue;
+            }
+            let e = all.entry(*gen).or_insert(0);
+            *e = (*e).max(*idx);
+        }
+        let mut streams = Streams::NONE;
+        for (gen, idx) in all.into_iter().rev().take(STREAMS_CAP) {
+            streams.raise(gen, idx);
+        }
+        Position {
+            seq: g.observed.seq.max(g.frontier_log.seq).max(g.applied_seq),
+            pending: g
+                .observed
+                .pending
+                .max(g.frontier_log.pending)
+                .max(g.applied),
+            streams,
+        }
+    }
+
     /// Plan 30 §M11: this replica holds delegation stream `gen` through
     /// `idx` — applied from a segment carrying the row's origin, executed
     /// here as the delegate, or appended here as the root.
