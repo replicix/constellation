@@ -4463,6 +4463,153 @@ mod locks {
         );
     }
 
+    /// A release position with a pending journal row and a stream.
+    fn a_release() -> Position {
+        let mut p = Position {
+            seq: 3,
+            pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 77 }),
+            streams: constellation_meta::Streams::NONE,
+        };
+        assert!(p.streams.raise(5, 9));
+        p
+    }
+
+    /// Node 2 holds `ino` exclusively and releases at `released`.
+    fn grant_and_release(h: &mut Harness, ino: Ino, released: Position) {
+        let out = request(h, 2, 70, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(2, _, o)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        let (g2, _) = granted(o);
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: released,
+            },
+        });
+    }
+
+    /// Owner changes keep lock-to-unlock coherence: a fast successor
+    /// installs the predecessor's mirrored floor under the whole
+    /// namespace, so its first grant covers a release it never saw.
+    #[test]
+    fn a_fast_successor_grants_over_the_mirrored_floor() {
+        let released = a_release();
+        // The predecessor mirrors every floor it knows.
+        let (mut h1, ino) = holder_with_file();
+        grant_and_release(&mut h1, ino, released);
+        {
+            let lease = &mut h1.core.lease.held.as_mut().unwrap().0;
+            lease.backups = vec![2];
+            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        }
+        // (Answered `Busy` without fresh S3 liveness; the mirror of the
+        // table as it stands goes out after the event either way.)
+        h1.core.lk.mirror_dirty = true;
+        let out = request(&mut h1, 3, 71, ino, S, true);
+        let mirrored = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::LockMirror { floor, .. } if to == 2 => Some(*floor),
+                _ => None,
+            })
+            .expect("a mirror to the backup");
+        assert!(mirrored.dominates(&released), "{mirrored:?}");
+        // The backup takes over with that mirror.
+        let mut h2 = Harness::new(2);
+        let op = h2.create("f");
+        constellation_meta::execute_mutate(&h2.meta, &op, None).unwrap();
+        let MutateOp::Create { ino: ino2, .. } = op else {
+            unreachable!()
+        };
+        h2.core.lease.cached_holder = Some(1);
+        h2.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockMirror {
+                ver: 1,
+                grants: Vec::new(),
+                floor: mirrored,
+            },
+        });
+        h2.hold(2, None);
+        let now = h2.now;
+        h2.core.lock_install_mirror(now, &h2.meta);
+        let out = request(&mut h2, 3, 72, ino2, X, true);
+        let rs = lock_replies(&out);
+        let [(3, _, LockOutcome::Granted { position, .. })] = rs.as_slice() else {
+            panic!("expected a grant: {out:?}")
+        };
+        assert!(
+            position.dominates(&released),
+            "the successor's grant {position:?} does not cover the release {released:?}"
+        );
+        assert!(h2.core.stats.lock_dir_floors > 0);
+    }
+
+    /// A holder that lost its lease and holds it again keeps its floors
+    /// (positions are the cluster's), and its new tenure's first grant
+    /// floors everything with what it has.
+    #[test]
+    fn floors_survive_a_lease_gone_and_back() {
+        let released = a_release();
+        let (mut h, ino) = holder_with_file();
+        grant_and_release(&mut h, ino, released);
+        let now = h.now;
+        let mut out = Vec::new();
+        h.core.lock_on_lease_gone(now, &h.meta, &mut out);
+        h.hold(2, None);
+        let out = request(&mut h, 3, 73, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(3, _, LockOutcome::Granted { position, .. })] = rs.as_slice() else {
+            panic!("expected a grant: {out:?}")
+        };
+        assert!(position.dominates(&released), "{position:?}");
+        assert!(h.core.stats.lock_dir_floors > 0, "no tenure floor noted");
+    }
+
+    /// An outwaited generation's subtree gets this root's own position as
+    /// a floor (its holders' releases are lost with the delegate).
+    #[test]
+    fn an_outwaited_generation_leaves_a_floor_on_its_subtree() {
+        let (mut h, ino) = holder_with_file();
+        // Unshipped journal here: what the delegate's appended stream
+        // would be.
+        let op = h.create("appended");
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let journal = h.meta.journal_position(1).expect("unshipped");
+        let now = h.now;
+        h.core
+            .lock_on_generation_outwaited(now, 9, constellation_fs_core::types::ROOT_INO);
+        // (The subtree grace is not what this test is about.)
+        h.core.lk.grace.clear();
+        // The next event notes the floor.
+        let out = request(&mut h, 3, 74, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(3, _, o)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        let (g3, _) = granted(o);
+        assert!(h.core.stats.lock_dir_floors > 0);
+        let out = request(&mut h, 4, 75, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g3,
+                position: Position::ZERO,
+            },
+        });
+        let rs = lock_replies(&out);
+        let [(4, _, LockOutcome::Granted { position, .. })] = rs.as_slice() else {
+            panic!("expected node 4's grant: {out:?}")
+        };
+        assert!(position.pending >= Some(journal), "{position:?}");
+    }
+
     /// Two peers: the second conflicting request recalls the first grant
     /// and parks; the release grants it. Shared grants coexist.
     #[test]

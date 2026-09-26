@@ -698,6 +698,12 @@ pub struct Stats {
     /// Delegate: generations that started inside the root's lock grace
     /// (carried with their first granting renewal).
     pub lock_graces_inherited: u64,
+    /// Subtree/namespace lock floors noted (moves, recalls, outwaits,
+    /// takeovers, mirrors).
+    pub lock_dir_floors: u64,
+    /// Root: grants held back while a new tenure waited for its
+    /// inherited delegates' stream heads.
+    pub lock_tenure_waits: u64,
     /// Node side.
     pub lock_requests: u64,
     pub lock_unavailable: u64,
@@ -1051,7 +1057,7 @@ pub struct Core {
     /// Plan 30 §M11 phase 2b: the placement window (the root).
     pl: placement::PlacementState,
     /// Plan 30 §M14.
-    lk: locks::LockState,
+    pub(crate) lk: locks::LockState,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
     last_now: Ms,
     stopped: bool,
@@ -1409,7 +1415,13 @@ impl Core {
                 through,
                 refused,
             } => self.on_delegate_stream_ack(now, req, gen, through, refused, replica, out),
-            PeerMsg::DelegRenew { req, gen, backup } => {
+            PeerMsg::DelegRenew {
+                req,
+                gen,
+                backup,
+                stream_head,
+            } => {
+                self.lock_note_delegate_head(from, gen, stream_head);
                 self.on_deleg_renew(now, from, req, gen, backup, replica, out)
             }
             PeerMsg::DelegRenewed {
@@ -1418,6 +1430,7 @@ impl Core {
                 ttl_ms,
                 locks,
                 lock_grace_ms,
+                lock_floor,
             } => {
                 // The renewal installs the generation's window first; the
                 // handoff is tagged with the generation itself. A grace
@@ -1427,6 +1440,9 @@ impl Core {
                 self.on_deleg_renewed(now, req, gen, ttl_ms, replica, out);
                 if ttl_ms > 0 && !serving {
                     self.lock_take_grace(now, gen, lock_grace_ms);
+                }
+                if ttl_ms > 0 {
+                    self.lock_take_floor(gen, &lock_floor);
                 }
                 if ttl_ms > 0 && !locks.is_empty() {
                     self.lock_install_moved(now, gen, locks, replica);
@@ -1491,7 +1507,9 @@ impl Core {
             PeerMsg::LockRenewed { req, results } => {
                 self.on_lock_renewed(now, from, req, results, replica, out)
             }
-            PeerMsg::LockMirror { ver, grants } => self.on_lock_mirror(from, ver, grants),
+            PeerMsg::LockMirror { ver, grants, floor } => {
+                self.on_lock_mirror(from, ver, grants, floor)
+            }
             PeerMsg::LockTest { req, ino, mode } => {
                 self.on_lock_test(now, from, req, ino, mode, replica, out)
             }

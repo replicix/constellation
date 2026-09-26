@@ -149,8 +149,8 @@ pub(crate) enum ParkedWhat {
         req: OpId,
         gen: u64,
         through: u64,
-        /// Plan 30 §M14: the lock grants handed back with it.
-        locks: Vec<constellation_meta::locks::Grant>,
+        /// Plan 30 §M14: the lock grants (and floor) handed back with it.
+        locks: constellation_meta::locks::LockHandback,
     },
 }
 

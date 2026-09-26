@@ -148,7 +148,7 @@ pub(crate) struct LockState {
     recall_by_req: BTreeMap<OpId, GrantId>,
     /// Subtree grace after an outwaited delegate: `(dir, until)`.
     pub(crate) grace: Vec<(Ino, Ms)>,
-    mirror_dirty: bool,
+    pub(crate) mirror_dirty: bool,
     mirror_ver: u64,
     /// This node as a backup: the holder's last mirror.
     bk_mirror: Option<(u64, Vec<Grant>)>,
@@ -182,10 +182,50 @@ pub(crate) struct LockState {
     /// refs under an `flock` turn file, EC2 campaign 4 B-1) otherwise
     /// read the refs the previous holder had replaced — up to a ship
     /// interval stale — and committed on top of them, losing the other
-    /// node's commits. In memory: a grant that moves to another owner
-    /// before it is asked for again falls back to that owner's position.
+    /// node's commits. In memory, and moved with the table: a subtree's
+    /// floor rides its delegation's granting renewals and its recall
+    /// answer, the join of all of them the backup mirror, and every new
+    /// tenure floors everything with its own position first (see
+    /// [`LockState::dir_floors`]).
     floors: BTreeMap<Ino, Position>,
+    /// Floors for *every* inode under a directory (`ROOT_INO`: all):
+    /// what an owner change leaves where the per-inode floors were lost
+    /// or summarized — a subtree handed to or back from a delegate, an
+    /// outwaited delegate's subtree, the predecessor's mirrored floors
+    /// after a fast takeover, and this tenure's own floor after any
+    /// takeover. Joined into every later grant under the directory. Few
+    /// entries (past [`DIR_FLOORS_CAP`] they fold into the root's).
+    dir_floors: Vec<(Ino, Position)>,
+    /// Every floor noted here, joined (what the backup mirror carries).
+    floor_all: Position,
+    /// Root: the floor of each generation's subtree at its move, re-sent
+    /// with every granting renewal (a join: resending is harmless), and
+    /// raised by a release that reaches this root after the move.
+    handed_floor: BTreeMap<u64, Position>,
+    /// Root: subtrees of outwaited generations whose floor is noted at
+    /// the next event (with this root's position then).
+    pending_dir_floors: Vec<Ino>,
+    /// A new tenure (start, or after the lease was gone): its first grant
+    /// notes this node's whole position as a floor on everything first —
+    /// the predecessor's floors are gone with it, and what it knew is in
+    /// the log this tenure tailed (and, fast, its backup tail).
+    tenure_floor_due: bool,
+    /// Backup: the floor that came with the last mirror.
+    bk_floor: Position,
+    /// A new tenure: the inherited live generations whose delegate has
+    /// not renewed with this root yet (`None`: not collected yet). Until
+    /// every one has, this root makes no new grant: the floors the
+    /// previous tenure held may name their streams past what this root
+    /// was re-streamed, and a renewal carries the delegate's head.
+    tenure_waiting: Option<std::collections::BTreeSet<u64>>,
+    /// The heads those renewals carried, for the tenure floor.
+    tenure_heads: Vec<(u64, u64)>,
 }
+
+/// How many subtree floors an owner keeps before folding them into one
+/// on the whole namespace (conservative: a larger floor only waits
+/// longer).
+const DIR_FLOORS_CAP: usize = 64;
 
 /// How many inodes' release positions an owner remembers
 /// ([`LockState::floors`]); past it the oldest-inode entries go, which
@@ -468,6 +508,12 @@ impl Core {
         out: &mut Vec<Action>,
         replica: &dyn Replica,
     ) -> Result<LockOutcome, Vec<Grant>> {
+        // A new root tenure grants nothing until its floor is known
+        // (parked, or `WouldBlock`; reclaims go on).
+        if gen == 0 && !self.lock_tenure_floor_ready(replica) {
+            self.stats.lock_tenure_waits += 1;
+            return Err(Vec::new());
+        }
         let own = replica.locks().own_grant(ino, from, now.0);
         if own.is_some_and(|g| g.recalled) {
             // Recalled: the node gives it up once its local locks are
@@ -591,9 +637,14 @@ impl Core {
     fn lock_grant_position(&self, to: NodeId, ino: Ino, replica: &dyn Replica) -> Position {
         let own = self.lock_position(ino, replica);
         let mut p = match self.lk.floors.get(&ino) {
-            Some(floor) => own.join(floor),
+            Some(floor) => constellation_meta::locks::floor_join(&own, floor),
             None => own,
         };
+        for (dir, floor) in &self.lk.dir_floors {
+            if *dir == constellation_fs_core::types::ROOT_INO || replica.is_under(ino, *dir) {
+                p = constellation_meta::locks::floor_join(&p, floor);
+            }
+        }
         if to == self.cfg.node_id && self.lease.held.is_some() {
             let epoch = self.lease.epoch().unwrap_or(0);
             if p.pending.is_some_and(|j| j.epoch == epoch) {
@@ -610,13 +661,30 @@ impl Core {
     /// frontier already (its stream index).
     fn lock_release_floor(&self, replica: &dyn Replica) -> Position {
         let mut p = replica.frontier();
+        // Its own executions as a delegate: the session frontier can
+        // trail them (it records what replies and streams brought here,
+        // and a delegate's own client ops reach it later — sim
+        // `locks-delegated-writes` seed 200981: a turn written under the
+        // lock at its generation's index 5 released at `(gen, 4)`).
+        for gen in self.dl.mine.keys() {
+            let idx = replica.delegate_idx(*gen);
+            if idx > 0 {
+                let mut own = Position::ZERO;
+                if own.streams.raise(*gen, idx) {
+                    p = constellation_meta::locks::floor_join(&p, &own);
+                }
+            }
+        }
         if self.lease.epoch().is_some() && self.lease.held.is_some() {
             let epoch = self.lease.epoch().unwrap_or(0);
-            p = p.join(&Position {
-                seq: self.ship.head_seq,
-                pending: replica.journal_position(epoch),
-                streams: Default::default(),
-            });
+            p = constellation_meta::locks::floor_join(
+                &p,
+                &Position {
+                    seq: self.ship.head_seq,
+                    pending: replica.journal_position(epoch),
+                    streams: Default::default(),
+                },
+            );
         }
         p
     }
@@ -627,10 +695,145 @@ impl Core {
             return;
         }
         let e = self.lk.floors.entry(ino).or_insert(Position::ZERO);
-        *e = e.join(position);
+        *e = constellation_meta::locks::floor_join(e, position);
         while self.lk.floors.len() > FLOORS_CAP {
             self.lk.floors.pop_first();
         }
+        self.lk.floor_all = constellation_meta::locks::floor_join(&self.lk.floor_all, position);
+        self.lk.mirror_dirty = true;
+    }
+
+    /// A new root tenure's first grants wait for its floor (see
+    /// [`LockState::tenure_waiting`]); `true` once it is noted. Only the
+    /// root's own grants (`gen == 0`) ask.
+    fn lock_tenure_floor_ready(&mut self, replica: &dyn Replica) -> bool {
+        if !self.lk.tenure_floor_due {
+            return true;
+        }
+        let me = self.cfg.node_id;
+        if self.lk.tenure_waiting.is_none() {
+            self.lk.tenure_waiting = Some(
+                self.dl
+                    .gens
+                    .iter()
+                    .filter(|(_, g)| !g.ended && g.node != me)
+                    .map(|(gen, _)| *gen)
+                    .collect(),
+            );
+        }
+        let ended: Vec<u64> = self
+            .lk
+            .tenure_waiting
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|gen| self.dl.gens.get(gen).is_none_or(|g| g.ended))
+            .collect();
+        if let Some(w) = self.lk.tenure_waiting.as_mut() {
+            for gen in ended {
+                w.remove(&gen);
+            }
+        }
+        if self
+            .lk
+            .tenure_waiting
+            .as_ref()
+            .is_some_and(|w| !w.is_empty())
+        {
+            return false;
+        }
+        self.lk.tenure_floor_due = false;
+        self.lk.tenure_waiting = None;
+        let mut floor = self.lock_release_floor(replica);
+        for (gen, head) in std::mem::take(&mut self.lk.tenure_heads) {
+            let mut p = Position::ZERO;
+            if p.streams.raise(gen, head) {
+                floor = constellation_meta::locks::floor_join(&floor, &p);
+            }
+        }
+        self.lock_note_dir_floor(constellation_fs_core::types::ROOT_INO, &floor);
+        true
+    }
+
+    /// Root: a delegate renewed `gen` with its stream `head`.
+    pub(crate) fn lock_note_delegate_head(&mut self, from: NodeId, gen: u64, head: u64) {
+        if !self.dl.gens.get(&gen).is_some_and(|g| g.node == from) {
+            return;
+        }
+        if let Some(w) = self.lk.tenure_waiting.as_mut() {
+            if w.remove(&gen) && head > 0 {
+                self.lk.tenure_heads.push((gen, head));
+            }
+        }
+    }
+
+    /// Delegate: every renewal sent in this event carries this node's
+    /// executed stream head of its generation.
+    fn lock_fill_renew_heads(&self, replica: &dyn Replica, out: &mut [Action]) {
+        for a in out.iter_mut() {
+            if let Action::Send {
+                msg:
+                    PeerMsg::DelegRenew {
+                        gen, stream_head, ..
+                    },
+                ..
+            } = a
+            {
+                *stream_head = replica.delegate_idx(*gen);
+            }
+        }
+    }
+
+    /// Remember that every inode under `dir` may have been released at
+    /// `position` (see [`LockState::dir_floors`]).
+    fn lock_note_dir_floor(&mut self, dir: Ino, position: &Position) {
+        use constellation_meta::locks::floor_join;
+        if *position == Position::ZERO {
+            return;
+        }
+        match self.lk.dir_floors.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, p)) => *p = floor_join(p, position),
+            None => self.lk.dir_floors.push((dir, *position)),
+        }
+        if self.lk.dir_floors.len() > DIR_FLOORS_CAP {
+            let all = self
+                .lk
+                .dir_floors
+                .drain(..)
+                .fold(Position::ZERO, |a, (_, p)| floor_join(&a, &p));
+            self.lk
+                .dir_floors
+                .push((constellation_fs_core::types::ROOT_INO, all));
+        }
+        self.lk.floor_all = floor_join(&self.lk.floor_all, position);
+        self.stats.lock_dir_floors += 1;
+        self.lk.mirror_dirty = true;
+    }
+
+    /// The floor of the subtree under `dir`: its inodes' floors (those
+    /// `under` accepts) and the directory floors over or under it.
+    fn lock_subtree_floor(
+        &self,
+        dir: Ino,
+        under: impl Fn(Ino) -> bool,
+        replica: &dyn Replica,
+    ) -> Position {
+        use constellation_meta::locks::floor_join;
+        let mut p = Position::ZERO;
+        for (ino, f) in &self.lk.floors {
+            if under(*ino) {
+                p = floor_join(&p, f);
+            }
+        }
+        for (d, f) in &self.lk.dir_floors {
+            if *d == constellation_fs_core::types::ROOT_INO
+                || replica.is_under(dir, *d)
+                || replica.is_under(*d, dir)
+            {
+                p = floor_join(&p, f);
+            }
+        }
+        p
     }
 
     fn lock_recall(&mut self, now: Ms, g: Grant, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -932,6 +1135,19 @@ impl Core {
         // been outwaited meanwhile), what its holder did under it must be
         // visible under the next grant.
         self.lock_note_floor(ino, &position);
+        // A release that reaches this root after the inode's subtree was
+        // delegated (it was routed by the releaser's older view): the
+        // floor follows the subtree with the next granting renewal.
+        if self.cfg.delegation && !replica.delegation_table().is_empty() {
+            let keys = Self::read_keys(ino, None);
+            if let constellation_meta::delegation::Ownership::Delegated(d) =
+                replica.resolve_ownership(&keys)
+            {
+                if let Some(f) = self.lk.handed_floor.get_mut(&d.gen) {
+                    *f = constellation_meta::locks::floor_join(f, &position);
+                }
+            }
+        }
         if replica
             .locks()
             .get(grant)
@@ -2048,18 +2264,28 @@ impl Core {
 
     // ------------------------------------------------------------ mirror
 
-    pub(crate) fn on_lock_mirror(&mut self, from: NodeId, ver: u64, grants: Vec<Grant>) {
+    pub(crate) fn on_lock_mirror(
+        &mut self,
+        from: NodeId,
+        ver: u64,
+        grants: Vec<Grant>,
+        floor: Position,
+    ) {
         if self.root_node() != Some(from) {
             return;
         }
         if self.lk.bk_mirror.as_ref().is_none_or(|(v, _)| ver > *v) {
             self.lk.bk_mirror = Some((ver, grants));
+            // Floors only grow: joined across mirrors.
+            self.lk.bk_floor = constellation_meta::locks::floor_join(&self.lk.bk_floor, &floor);
         }
     }
 
     /// A fast takeover (this node was the backup): the mirror is this
     /// tenure's table, restamped; M9's floor covers what it misses.
     pub(crate) fn lock_install_mirror(&mut self, now: Ms, replica: &dyn Replica) {
+        let floor = std::mem::take(&mut self.lk.bk_floor);
+        self.lock_note_dir_floor(constellation_fs_core::types::ROOT_INO, &floor);
         let Some((_, grants)) = self.lk.bk_mirror.take() else {
             return;
         };
@@ -2098,6 +2324,54 @@ impl Core {
             self.lk.mirror_dirty = true;
             self.lk.handoff.entry(gen).or_default().extend(moved);
         }
+        // The subtree's lock floor goes with it (with every granting
+        // renewal: a join, so a resend is harmless).
+        if let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) {
+            let floor = self.lock_subtree_floor(
+                dir,
+                |ino| {
+                    let keys = Self::read_keys(ino, None);
+                    matches!(
+                        replica.resolve_ownership(&keys),
+                        constellation_meta::delegation::Ownership::Delegated(d) if d.gen == gen
+                    )
+                },
+                replica,
+            );
+            self.lk.handed_floor.insert(gen, floor);
+        }
+    }
+
+    /// Root: the lock floor a granting renewal of `gen` carries.
+    pub(crate) fn lock_floor_for_generation(&self, gen: u64) -> Position {
+        self.lk.handed_floor.get(&gen).copied().unwrap_or_default()
+    }
+
+    /// Delegate: a granting renewal carried the subtree's floor.
+    pub(crate) fn lock_take_floor(&mut self, gen: u64, floor: &Position) {
+        if *floor == Position::ZERO {
+            return;
+        }
+        let Some(dir) = self.dl.mine.get(&gen).map(|d| d.dir) else {
+            return;
+        };
+        self.lock_note_dir_floor(dir, floor);
+    }
+
+    /// Delegate: the generation is recalled — its grants and its
+    /// subtree's floor go back with the answer.
+    pub(crate) fn lock_hand_back(
+        &mut self,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> constellation_meta::locks::LockHandback {
+        let dir = self.dl.mine.get(&gen).map(|d| d.dir);
+        let grants = self.lock_take_generation(gen, replica);
+        let floor = match dir {
+            Some(dir) => self.lock_subtree_floor(dir, |ino| replica.is_under(ino, dir), replica),
+            None => Position::ZERO,
+        };
+        constellation_meta::locks::LockHandback { grants, floor }
     }
 
     /// Root: what to hand a delegate with a granting renewal — what is
@@ -2152,9 +2426,13 @@ impl Core {
         &mut self,
         now: Ms,
         gen: u64,
-        grants: Vec<Grant>,
+        back: constellation_meta::locks::LockHandback,
         replica: &dyn Replica,
     ) {
+        let constellation_meta::locks::LockHandback { grants, floor } = back;
+        if let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) {
+            self.lock_note_dir_floor(dir, &floor);
+        }
         if let Some(handed) = self.lk.handed.get_mut(&gen) {
             handed.retain(|h| !grants.iter().any(|g| g.node == h.node && g.ino == h.ino));
         }
@@ -2280,6 +2558,10 @@ impl Core {
     pub(crate) fn lock_on_generation_outwaited(&mut self, now: Ms, gen: u64, dir: Ino) {
         let until = Ms(self.restamp(now));
         self.lk.grace.push((dir, until));
+        // Its holders' releases are lost with it: what they could have
+        // seen is at most what this root has once it appended the
+        // delegate's stream — noted at the next event.
+        self.lk.pending_dir_floors.push(dir);
         self.stats.lock_grace_periods += 1;
         // Anything not yet handed over returns to this table at the next
         // event (it never left this node).
@@ -2354,7 +2636,8 @@ impl Core {
         self.stats.lock_grace_periods += 1;
     }
 
-    pub(crate) fn locks_start(&self, replica: &dyn Replica) {
+    pub(crate) fn locks_start(&mut self, replica: &dyn Replica) {
+        self.lk.tenure_floor_due = true;
         replica
             .locks()
             .seed_ids(u64::from(self.cfg.incarnation) << 40);
@@ -2383,7 +2666,13 @@ impl Core {
         self.lk.recall_by_req.clear();
         self.lk.handoff.clear();
         self.lk.handed.clear();
+        self.lk.handed_floor.clear();
         self.lk.grace.clear();
+        // The floors stay (positions are the cluster's, not the
+        // tenure's); a next tenure here floors everything again first.
+        self.lk.tenure_floor_due = true;
+        self.lk.tenure_waiting = None;
+        self.lk.tenure_heads.clear();
         let waiters = std::mem::take(&mut self.lk.waiters);
         for w in waiters {
             if let Some(t) = w.held_timer {
@@ -2415,18 +2704,28 @@ impl Core {
         if !returns.is_empty() {
             self.lock_install_moved(now, 0, returns, replica);
         }
+        self.lock_fill_renew_heads(replica, out);
+        let dirs = std::mem::take(&mut self.lk.pending_dir_floors);
+        if !dirs.is_empty() {
+            let floor = self.lock_release_floor(replica);
+            for dir in dirs {
+                self.lock_note_dir_floor(dir, &floor);
+            }
+        }
         if self.lk.mirror_dirty {
             self.lk.mirror_dirty = false;
             let backups = self.lease.backups();
             if !backups.is_empty() && self.root_usable(now) {
                 self.lk.mirror_ver += 1;
                 let grants = replica.locks().grants_snapshot();
+                let floor = self.lk.floor_all;
                 for b in backups {
                     out.push(Action::Send {
                         to: *b,
                         msg: PeerMsg::LockMirror {
                             ver: self.lk.mirror_ver,
                             grants: grants.clone(),
+                            floor,
                         },
                     });
                 }

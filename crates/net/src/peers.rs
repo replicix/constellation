@@ -1159,9 +1159,10 @@ async fn handle_stream<S: PeerService>(
             req_id,
             gen,
             backup,
+            stream_head,
         } => Some(
             service
-                .deleg_renew_requested(from, req_id, gen, backup)
+                .deleg_renew_requested(from, req_id, gen, backup, stream_head)
                 .await,
         ),
         Payload::DelegRecall {
@@ -1291,8 +1292,13 @@ async fn handle_stream<S: PeerService>(
             service.lock_released(from, ino, grant, &position);
             Some(Payload::Ok { req_id: 0 })
         }
-        Payload::LockMirror { from, ver, grants } => {
-            service.lock_mirror(from, ver, grants);
+        Payload::LockMirror {
+            from,
+            ver,
+            grants,
+            floor,
+        } => {
+            service.lock_mirror(from, ver, grants, floor);
             Some(Payload::Ok { req_id: 0 })
         }
         Payload::Ping { .. } => Some(Payload::Pong {

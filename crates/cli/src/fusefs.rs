@@ -367,10 +367,17 @@ pub enum SyncRequest {
         gen: u64,
         /// Phase 2b: the delegate's backup peer (0: none).
         backup: u64,
+        /// Plan 30 §M14: the delegate's executed stream head.
+        stream_head: u64,
         /// Answered with the ttl and (§M14) the root's lock grants under
         /// the subtree, handed over with the first renewal, and the
         /// remaining lock grace on it (ms).
-        reply: tokio::sync::oneshot::Sender<(u64, Vec<constellation_meta::locks::Grant>, u64)>,
+        reply: tokio::sync::oneshot::Sender<(
+            u64,
+            Vec<constellation_meta::locks::Grant>,
+            u64,
+            constellation_meta::Position,
+        )>,
     },
     /// Plan 30 §M11: the root recalls a generation this node holds;
     /// answered with the highest stream index executed here (and, §M14,
@@ -379,7 +386,7 @@ pub enum SyncRequest {
         root: u64,
         dir: Ino,
         gen: u64,
-        reply: tokio::sync::oneshot::Sender<(u64, Vec<constellation_meta::locks::Grant>)>,
+        reply: tokio::sync::oneshot::Sender<(u64, constellation_meta::locks::LockHandback)>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to this backup;
     /// answered `(acked, sealed)`.
@@ -573,6 +580,7 @@ pub enum SyncRequest {
         from: u64,
         ver: u64,
         grants: Vec<constellation_meta::locks::Grant>,
+        floor: constellation_meta::Position,
     },
     /// Final flush + release on unmount; the core stops afterwards.
     Shutdown {

@@ -204,6 +204,17 @@ pub struct SimConfig {
     /// Plan 30 §M14's non-vacuity knob: clients perform I/O even when
     /// `fenced` says the grant lapsed (the checker must catch it).
     pub lock_ignore_fence: bool,
+    /// Plan 30 §M14 (lock-to-unlock coherence): an exclusive holder
+    /// writes a turn number into the lock file's mtime under its lock,
+    /// and a later holder on another node, once its grant's session wait
+    /// is over, must read that turn or a later one. Gaps fail the seed.
+    pub lock_writes: bool,
+    /// `lock_writes`: where the turn is written — a data file per lock
+    /// file (`dk<i>`) in this directory (`""`: the root), a different
+    /// owner's than the lock files' puts the write where only the grant's
+    /// floor (the releaser's frontier) orders it before the next holder
+    /// (git's refs under its `flock` turn file). `None`: the lock file.
+    pub lock_data_dir: Option<String>,
 }
 
 /// See `SimConfig::fast_path`.
@@ -419,6 +430,8 @@ impl Default for SimConfig {
             lock_io_ms: (5, 60),
             lock_dir: None,
             lock_ignore_fence: false,
+            lock_writes: false,
+            lock_data_dir: None,
         }
     }
 }
@@ -689,6 +702,11 @@ fn ns_ret(outcome: &MutateOutcome) -> Result<NsRet, String> {
 /// the root before the clients start); a bare name is in the root.
 pub fn split_name(meta: &Meta, name: &str) -> (u64, String) {
     match name.rfind('/') {
+        // `"/x"`: a name in the root directory written with its (empty)
+        // directory — the marker workload's home or other directory is
+        // the root's `""`. Looking `""` up trips `keys::dentry`'s debug
+        // assertion (five sim tests panicked in debug builds only).
+        Some(0) => (ROOT_INO, name[1..].to_string()),
         Some(i) => {
             let dir = &name[..i];
             let parent = meta
@@ -1167,6 +1185,7 @@ fn with_locks(rng: &mut StdRng, steps: Vec<Step>, cfg: &SimConfig) -> Vec<Step> 
                 blocking: !rng.random_bool(cfg.lock_nonblocking_ratio.clamp(0.0, 1.0)),
                 ios: rng.random_range(cfg.lock_ios.0..=cfg.lock_ios.1),
                 io_ms: rng.random_range(cfg.lock_io_ms.0..=cfg.lock_io_ms.1),
+                write: cfg.lock_writes && mode == constellation_meta::locks::LockMode::Exclusive,
             }));
         }
     }
@@ -2037,6 +2056,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             cluster.locks.trace().join("\n    ")
         ));
     }
+    let gaps = cluster.locks.visibility_gaps();
+    if !gaps.is_empty() && std::env::var_os("AUTHORITY_SIM_VISIBILITY").is_some() {
+        return Err(format!(
+            "lock visibility gap (plan 30 §M14): {} ({} gap(s))\n  faults: {:?}\n  \
+             lock trace (last events):\n    {}",
+            gaps[0],
+            gaps.len(),
+            fault_log.lock().unwrap(),
+            cluster.locks.trace().join("\n    ")
+        ));
+    }
     report.faults = fault_log.lock().unwrap().clone();
     report.simulated_ms = clock.elapsed_ms();
     if let Some(f) = failures.lock().unwrap().first() {
@@ -2069,6 +2099,33 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .load(std::sync::atomic::Ordering::Relaxed);
     }
     report.acked_rolled_back = rolled_back_acked;
+    // Plan 30 §M14: a later holder read an older turn than the one
+    // written under the previous exclusive lock — unless that write's
+    // acknowledgement was itself rolled back (tentative: `Local`'s L2
+    // window, a crashed sequencer's unshipped journal).
+    let stale: Vec<String> = cluster
+        .locks
+        .stale_reads()
+        .into_iter()
+        .filter(|(missed, read, _)| {
+            // The missed turn's acknowledgement rolled back, or the value
+            // read is an older turn replayed late over the newer ones
+            // (`Local`: a crashed sequencer's stranded op, replayed by rid
+            // — its effect lands where the replay does).
+            !tentative.contains(missed) && !read.is_some_and(|r| tentative.contains(&r))
+        })
+        .map(|(_, _, s)| s)
+        .collect();
+    if !stale.is_empty() && cfg.lock_writes {
+        return Err(format!(
+            "stale read under a lock (plan 30 §M14, lock-to-unlock coherence): {} ({} stale \
+             read(s))\n  faults: {:?}\n  lock trace (last events):\n    {}",
+            stale[0],
+            stale.len(),
+            fault_log.lock().unwrap(),
+            cluster.locks.trace().join("\n    ")
+        ));
+    }
     if let Some(busy) = locks_stuck {
         return Err(format!(
             "lock state never drained after the workload (node, requests, waiters, recalls): \
@@ -2545,12 +2602,22 @@ async fn setup_lock_files(
     failures: &Arc<Mutex<Vec<String>>>,
 ) {
     let handle = cluster.get(1);
-    let names: Vec<String> = (0..cfg.lock_files)
+    let mut names: Vec<String> = (0..cfg.lock_files)
         .map(|i| match &cfg.lock_dir {
             Some(d) => format!("{d}/lk{i}"),
             None => format!("lk{i}"),
         })
         .collect();
+    let data_dir = cfg.lock_data_dir.as_ref().filter(|_| cfg.lock_writes);
+    if let Some(d) = data_dir {
+        names.extend((0..cfg.lock_files).map(|i| {
+            if d.is_empty() {
+                format!("dk{i}")
+            } else {
+                format!("{d}/dk{i}")
+            }
+        }));
+    }
     for (i, name) in names.iter().enumerate() {
         let thread = (1 << 21) + i as u64;
         let rid = handle.next_rid();
@@ -2595,9 +2662,11 @@ async fn setup_lock_files(
             })
         });
         if let (Some(inos), true) = (inos, everywhere) {
-            cluster
-                .locks
-                .set_files(names.iter().cloned().zip(inos).collect());
+            let n = cfg.lock_files;
+            let mut files: Vec<(String, u64)> = names.iter().cloned().zip(inos).collect();
+            let data: Vec<u64> = files.split_off(n).into_iter().map(|(_, i)| i).collect();
+            cluster.locks.set_files(files);
+            cluster.locks.set_data(data);
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

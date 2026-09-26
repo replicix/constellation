@@ -46,6 +46,9 @@ pub struct LockStep {
     pub blocking: bool,
     pub ios: u32,
     pub io_ms: u64,
+    /// Write a turn number into the lock file's mtime under the lock
+    /// (`SimConfig::lock_writes`).
+    pub write: bool,
 }
 
 /// A lock acquisition that has not completed within this much simulated
@@ -78,6 +81,20 @@ pub struct LockCounters {
     pub abandoned: u64,
     /// The longest acquisition (simulated ms).
     pub max_wait_ms: u64,
+    /// Plan 30 §M14 (lock-to-unlock coherence): grants whose holder was
+    /// checked against the frontier the previous exclusive holder on
+    /// another node had at its unlock, and those whose replica did not
+    /// reach it once the grant's session wait was over.
+    pub visibility_checks: u64,
+    pub visibility_gaps: u64,
+    /// `lock_writes`: turns written and acknowledged under a lock, reads
+    /// by the next holder on another node, and reads that found an older
+    /// turn (a stale read under the lock: a failure).
+    pub turns_written: u64,
+    pub turn_reads: u64,
+    pub stale_turn_reads: u64,
+    /// Reads that found an unacknowledged older turn landed late.
+    pub late_unacked_turns: u64,
 }
 
 struct InIo {
@@ -97,6 +114,28 @@ struct GhostInner {
     counters: LockCounters,
     /// The last lock events, for a violation's report.
     trace: VecDeque<String>,
+    /// Per inode, the last exclusive holder's unlock: its node and its
+    /// session frontier then (everything its node had been acknowledged).
+    last_release: BTreeMap<u64, (NodeId, u64, constellation_meta::Position)>,
+    visibility_gaps: Vec<String>,
+    /// `lock_writes`: the next turn number, and per inode the last turn
+    /// acknowledged under an exclusive lock `(turn, node, at)`.
+    next_turn: i64,
+    last_turn: BTreeMap<u64, (i64, NodeId, u64, constellation_meta::Rid)>,
+    /// Per lock file (by index), the data file its turns go to (empty:
+    /// the lock file itself).
+    data: Vec<u64>,
+    /// Every turn written, by its rid.
+    turn_rids: BTreeMap<i64, constellation_meta::Rid>,
+    /// Turns whose write was acknowledged under the lock.
+    turns_acked: std::collections::BTreeSet<i64>,
+    /// `(the missed turn's rid, the read turn's rid, the report)`.
+    #[allow(clippy::type_complexity)]
+    stale_reads: Vec<(
+        constellation_meta::Rid,
+        Option<constellation_meta::Rid>,
+        String,
+    )>,
 }
 
 /// The mutual-exclusion ghost and the lock clients' counters.
@@ -135,6 +174,21 @@ impl LockGhost {
         })
     }
 
+    pub fn set_data(&self, data: Vec<u64>) {
+        self.with(|g| g.data = data);
+    }
+
+    /// Where the turns under lock file `file` are written.
+    fn data_ino(&self, file: usize, lock_ino: u64) -> u64 {
+        self.with(|g| {
+            if g.data.is_empty() {
+                lock_ino
+            } else {
+                g.data[file % g.data.len()]
+            }
+        })
+    }
+
     pub fn inos(&self) -> Vec<u64> {
         self.with(|g| g.inos.clone())
     }
@@ -149,6 +203,145 @@ impl LockGhost {
 
     pub fn violations(&self) -> Vec<String> {
         self.with(|g| g.violations.clone())
+    }
+
+    pub fn visibility_gaps(&self) -> Vec<String> {
+        self.with(|g| g.visibility_gaps.clone())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn stale_reads(
+        &self,
+    ) -> Vec<(
+        constellation_meta::Rid,
+        Option<constellation_meta::Rid>,
+        String,
+    )> {
+        self.with(|g| g.stale_reads.clone())
+    }
+
+    fn take_turn(&self, rid: constellation_meta::Rid) -> i64 {
+        self.with(|g| {
+            g.next_turn += 1;
+            // Well past any real clock's ns, so no other write of the
+            // file's mtime can look like a turn.
+            let turn = 4_000_000_000_000_000_000 + g.next_turn;
+            g.turn_rids.insert(turn, rid);
+            turn
+        })
+    }
+
+    fn turn_acked(
+        &self,
+        ino: u64,
+        turn: i64,
+        node: NodeId,
+        at_ms: u64,
+        rid: constellation_meta::Rid,
+    ) {
+        self.with(|g| {
+            g.counters.turns_written += 1;
+            g.turns_acked.insert(turn);
+            let e = g.last_turn.entry(ino).or_insert((0, node, at_ms, rid));
+            if turn > e.0 {
+                *e = (turn, node, at_ms, rid);
+            }
+        });
+    }
+
+    /// A holder on `node` with a fresh grant read the file's mtime: it
+    /// must be the last turn another node wrote under the lock, or later.
+    fn turn_read(&self, ino: u64, node: NodeId, at_ms: u64, read: Option<i64>) {
+        self.with(|g| {
+            let Some((turn, by, at, rid)) = g.last_turn.get(&ino).copied() else {
+                return;
+            };
+            if by == node {
+                return;
+            }
+            g.counters.turn_reads += 1;
+            if read.is_some_and(|m| m >= turn) {
+                return;
+            }
+            // An older turn whose write was never acknowledged under its
+            // lock (the client gave up on it: in doubt, still in an inbox
+            // or a retry) landed late over the newer ones: the write
+            // outlived its lock, which no grant can order (PROGRESS.md,
+            // the fence's flush-start limit).
+            if read.is_some_and(|m| g.turn_rids.contains_key(&m) && !g.turns_acked.contains(&m)) {
+                g.counters.late_unacked_turns += 1;
+                return;
+            }
+            g.counters.stale_turn_reads += 1;
+            let seed = g.seed;
+            let read_rid = read.and_then(|m| g.turn_rids.get(&m).copied());
+            g.stale_reads.push((
+                rid,
+                read_rid,
+                format!(
+                "seed {seed}: ino {ino:#x}: node {node} read turn {read:?} at t={at_ms} under a \
+                 fresh grant; node {by} had written turn {turn} under its lock (acked t={at}, \
+                 rid {rid:?})"
+            ),
+            ));
+        });
+    }
+
+    /// An exclusive holder on `node` unlocked `ino` with its node's
+    /// session at `frontier`.
+    pub fn released(
+        &self,
+        ino: u64,
+        node: NodeId,
+        at_ms: u64,
+        frontier: constellation_meta::Position,
+    ) {
+        self.with(|g| {
+            g.last_release.insert(ino, (node, at_ms, frontier));
+        });
+    }
+
+    /// `node` enters a critical section on `ino` with a grant it was just
+    /// given (and waited for): its replica must have what the previous
+    /// exclusive holder on another node had been acknowledged when it
+    /// unlocked — the grant's position carries that ("lock-to-unlock
+    /// coherence", PROGRESS.md "Fix: git-under-flock divergence").
+    /// `own_epoch`: the root lease epoch `node` holds, if it does — its
+    /// own tenure's journal is in its replica (it executed it), though
+    /// the session counts only shipped journal as reached (the core's
+    /// grant to itself leaves that journal out for the same reason).
+    pub fn check_visible(
+        &self,
+        ino: u64,
+        node: NodeId,
+        at_ms: u64,
+        meta: &Meta,
+        own_epoch: Option<u64>,
+    ) {
+        self.with(|g| {
+            let Some((prev, released_at, mut frontier)) = g.last_release.get(&ino).copied() else {
+                return;
+            };
+            if prev == node {
+                return;
+            }
+            if frontier
+                .pending
+                .is_some_and(|p| Some(p.epoch) == own_epoch)
+            {
+                frontier.pending = None;
+            }
+            g.counters.visibility_checks += 1;
+            if meta.session().reaches(&frontier) {
+                return;
+            }
+            g.counters.visibility_gaps += 1;
+            let seed = g.seed;
+            g.visibility_gaps.push(format!(
+                "seed {seed}: ino {ino:#x}: node {node} entered at t={at_ms} without what node                  {prev} had at its unlock (t={released_at}): {frontier:?}; applied {:?}",
+                meta.applied_seq().ok()
+            ));
+        });
     }
 
     pub fn trace(&self) -> Vec<String> {
@@ -351,6 +544,9 @@ pub async fn client_lock(
         )
     };
     let mut after_grant = false;
+    // The step got a grant and its session wait completed.
+    let mut fresh_grant = false;
+    let mut grant_position = constellation_meta::Position::ZERO;
     let mut regrants = 0u32;
     loop {
         let Some(h) = same(&cluster, node, inc) else {
@@ -423,10 +619,17 @@ pub async fn client_lock(
                         );
                         // The session wait at the grant's position (polled:
                         // this runtime is single-threaded).
+                        // As the FUSE layer does (`cli::locks::granted`):
+                        // the grant's position is the session's watermark
+                        // for every later read on this node.
+                        h.meta.session().raise_observed(position);
+                        grant_position = position;
                         let keys = [ReadKey::Ino(ino)];
                         let mut spent = 0;
+                        fresh_grant = true;
                         while !h.meta.session_ready_at(&keys, &position) {
                             if spent >= wait_budget_ms || !h.alive() {
+                                fresh_grant = false;
                                 ghost.count(|c| c.position_timeouts += 1);
                                 ghost.note(
                                     clock.elapsed_ms(),
@@ -479,6 +682,7 @@ pub async fn client_lock(
     // The critical section.
     let mut entered = false;
     let mut fenced = false;
+    let mut wrote = false;
     for _ in 0..step.ios {
         let Some(h) = same(&cluster, node, inc) else {
             if entered {
@@ -502,7 +706,104 @@ pub async fn client_lock(
         }
         if !entered {
             ghost.enter(ino, node, thread, step.mode, clock.elapsed_ms());
+            if fresh_grant && !wrote {
+                let own_epoch = h.view().s3_held.map(|(e, _)| e);
+                ghost.check_visible(ino, node, clock.elapsed_ms(), &h.meta, own_epoch);
+                let data = ghost.data_ino(step.file, ino);
+                // A read of the data file waits for the watermark, as a
+                // FUSE read would (`session_wait_at` on its keys).
+                let keys = [ReadKey::Ino(data)];
+                let mut spent = 0;
+                let mut ready = true;
+                while !h.meta.session_ready_at(&keys, &grant_position) {
+                    if spent >= wait_budget_ms || !h.alive() {
+                        ready = false;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    spent += 5;
+                }
+                if ready {
+                    let read = constellation_meta::MetaStore::getattr(&*h.meta, data)
+                        .ok()
+                        .flatten()
+                        .map(|a| a.mtime_ns);
+                    ghost.turn_read(data, node, clock.elapsed_ms(), read);
+                } else {
+                    ghost.count(|c| c.position_timeouts += 1);
+                }
+            }
             entered = true;
+            if step.write && !wrote {
+                wrote = true;
+                // The turn, written under the lock and awaited (as an
+                // application's write + fsync would be).
+                let data = ghost.data_ino(step.file, ino);
+                let rid = h.next_rid();
+                let turn = ghost.take_turn(rid);
+                // The holder is in I/O while the write is awaited, for as
+                // long as its grant is honoured; once it lapses the write
+                // may land after another node's grant (the fence's
+                // flush-start limit: the turn check exempts it as
+                // unacknowledged), so it leaves then.
+                let mut rx = h.submit(
+                    rid,
+                    constellation_meta::MutateOp::Setattr {
+                        ino: data,
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        size: None,
+                        atime_ns: None,
+                        mtime_ns: Some(turn),
+                    },
+                );
+                let t_write = clock.elapsed_ms();
+                let under = h.meta.locks().honoured(ino, h.clock.now().0).map(|g| g.id);
+                let mut lapsed_once = false;
+                let reply = loop {
+                    match tokio::time::timeout(Duration::from_millis(5), &mut rx).await {
+                        Ok(r) => break Some(r),
+                        Err(_) => {
+                            let lapsed = same(&cluster, node, inc)
+                                .is_none_or(|h| h.meta.locks().fenced(ino, h.clock.now().0));
+                            lapsed_once |= lapsed;
+                            if lapsed && entered {
+                                ghost.leave(
+                                    ino,
+                                    node,
+                                    thread,
+                                    clock.elapsed_ms(),
+                                    "lapsed during a write",
+                                );
+                                entered = false;
+                            }
+                            if clock.elapsed_ms() > t_write + 3_000 {
+                                break None;
+                            }
+                        }
+                    }
+                };
+                let acked = matches!(
+                    reply,
+                    Some(Ok(constellation_authority::action::ClientReply::Outcome(
+                        constellation_meta::MutateOutcome::Accepted { .. }
+                    )))
+                );
+                // Acknowledged while the grant it was written under is
+                // still honoured (not another thread's later one): the
+                // write is the holder's under its lock.
+                if acked
+                    && !lapsed_once
+                    && under.is_some()
+                    && same(&cluster, node, inc).is_some_and(|h| {
+                        h.meta.locks().honoured(ino, h.clock.now().0).map(|g| g.id) == under
+                    })
+                {
+                    ghost.turn_acked(data, turn, node, clock.elapsed_ms(), rid);
+                }
+                continue;
+            }
         }
         ghost.count(|c| c.ios += 1);
         tokio::time::sleep(Duration::from_millis(step.io_ms)).await;
@@ -516,6 +817,9 @@ pub async fn client_lock(
     };
     if entered && !fenced {
         ghost.leave(ino, node, thread, clock.elapsed_ms(), "unlock");
+        if step.mode == LockMode::Exclusive {
+            ghost.released(ino, node, clock.elapsed_ms(), h.meta.session().frontier());
+        }
     }
     let idle = h
         .meta

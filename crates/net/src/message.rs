@@ -345,6 +345,9 @@ pub enum Payload {
         /// Phase 2b: the delegate's backup peer (0: none).
         #[serde(default)]
         backup: u64,
+        /// Plan 30 §M14: the delegate's executed stream head for `gen`.
+        #[serde(default)]
+        stream_head: u64,
     },
     DelegRenewed {
         req_id: u64,
@@ -359,6 +362,10 @@ pub enum Payload {
         /// none) — see `PeerMsg::DelegRenewed::lock_grace_ms`.
         #[serde(default)]
         lock_grace_ms: u64,
+        /// Plan 30 §M14: postcard of the subtree's lock floor (a
+        /// `constellation_meta::Position`; empty: none).
+        #[serde(default)]
+        lock_floor: Vec<u8>,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops and answers the highest stream index it executed.
@@ -376,6 +383,9 @@ pub enum Payload {
         /// subtree, handed back to the root.
         #[serde(default)]
         locks: Vec<u8>,
+        /// Plan 30 §M14: postcard of the subtree's lock floor.
+        #[serde(default)]
+        lock_floor: Vec<u8>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
     /// `Vec<DelegateTx>`), and the backup's contiguous hold (or `sealed`).
@@ -537,6 +547,9 @@ pub enum Payload {
         from: u64,
         ver: u64,
         grants: Vec<u8>,
+        /// Postcard of every lock floor the holder knows, joined.
+        #[serde(default)]
+        floor: Vec<u8>,
     },
     /// `getlk`: is a conflicting grant held elsewhere? Answered by
     /// [`Payload::LockTestReply`].
@@ -1061,6 +1074,7 @@ mod tests {
                 ttl_ms: 3,
                 locks: vec![1, 2, 3],
                 lock_grace_ms: 4,
+                lock_floor: vec![5],
             },
         ] {
             let signed = Signed::new(&k, &payload).unwrap();

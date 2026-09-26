@@ -2967,16 +2967,18 @@ impl constellation_net::PeerService for P2pBridge {
         req_id: u64,
         gen: u64,
         backup: u64,
+        stream_head: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
-            let (ttl_ms, locks, lock_grace_ms) = if self
+            let (ttl_ms, locks, lock_grace_ms, lock_floor) = if self
                 .nudge
                 .send(fusefs::SyncRequest::PeerDelegRenew {
                     from,
                     gen,
                     backup,
+                    stream_head,
                     reply,
                 })
                 .is_ok()
@@ -2991,6 +2993,7 @@ impl constellation_net::PeerService for P2pBridge {
                 ttl_ms,
                 locks: crate::locks::grants_wire(&locks),
                 lock_grace_ms,
+                lock_floor: crate::locks::floor_wire(&lock_floor),
             }
         })
     }
@@ -3023,7 +3026,8 @@ impl constellation_net::PeerService for P2pBridge {
                 req_id,
                 gen,
                 through,
-                locks: crate::locks::grants_wire(&locks),
+                locks: crate::locks::grants_wire(&locks.grants),
+                lock_floor: crate::locks::floor_wire(&locks.floor),
             }
         })
     }
@@ -3312,7 +3316,7 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn lock_mirror(&self, from: u64, ver: u64, grants: Vec<u8>) {
+    fn lock_mirror(&self, from: u64, ver: u64, grants: Vec<u8>, floor: Vec<u8>) {
         if crate::fault::p2p_denied(from) {
             return;
         }
@@ -3320,6 +3324,7 @@ impl constellation_net::PeerService for P2pBridge {
             from,
             ver,
             grants: crate::locks::grants_of(&grants),
+            floor: crate::locks::floor_of(&floor),
         });
     }
 

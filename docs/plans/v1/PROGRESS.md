@@ -23926,3 +23926,212 @@ prefix `constellation-harness-gitdiv`):
 - Under faults, a lock whose previous grant was outwaited (its holder
   stuck) carries only the owner's position; one turn in 302 then read a
   stale ref for more than 5 s (no commit was lost in the end).
+
+## Fix: lock floors survive owner changes
+
+(coder, 2026-09-26; uncommitted on `fix-lock-floors` = main ee3f65b.)
+
+main ee3f65b made a grant carry what the previous holders released at
+(`LockState::floors`, per inode, in the owner's memory). This change
+makes those floors survive a change of owner. Building a check for it
+also found and fixed two more gaps in lock-to-unlock coherence and two
+lock bugs. Separately, `split_name` in the sim no longer trips a debug
+assertion (item 7).
+
+### 1. Floors move with the lock table (`core/locks.rs`)
+
+- **Two new floor kinds.** A floor on a whole subtree
+  (`LockState::dir_floors`, where `ROOT_INO` covers everything) is
+  joined into every grant under that directory. `floor_all` is the
+  join of every floor the owner knows. Joins go through
+  `locks::floor_join` in `meta`. `Position::join` drops the other side's
+  streams entirely when the result would pass the 8-stream cap;
+  `floor_join` keeps the newest generations instead.
+- **A delegation is granted.** `lock_on_delegated` takes a floor for
+  the subtree (`handed_floor[gen]`): the per-inode floors under it,
+  joined with the directory floors above or inside it.
+  - Every granting `DelegRenewed` carries that floor in a new
+    `lock_floor` field. Resending a join is harmless.
+  - The delegate puts it on the subtree (`lock_take_floor`).
+  - A release that reaches the root after the move raises that floor.
+- **A delegation is recalled.** `DelegRecalled` now carries a
+  `LockHandback { grants, floor }`. The floor is the join of the
+  delegate's floors under the subtree. The root puts it on the subtree.
+- **An outwaited generation.** Its holders' releases are lost with it.
+  At the next event, the root puts its own release floor (its position
+  after appending the delegate's stream) on the subtree.
+- **The backup mirror.** `LockMirror` carries `floor_all`. A fast
+  successor puts it on the whole namespace (`lock_install_mirror`).
+- **A new tenure** (a takeover, a restart, or the lease back after
+  losing it) makes no new root grant until every inherited live
+  generation has renewed with it. Requests park, or get `WouldBlock`
+  if non-blocking; reclaims still go through.
+  - `DelegRenew` now carries `stream_head`: the delegate's executed
+    index. The core fills it in after the event
+    (`lock_fill_renew_heads`), so `delegate.rs` only adds the field.
+  - The tenure then puts its own release floor, joined with those heads,
+    on the whole namespace (`lock_tenure_floor_ready`).
+  - Why it waits: a restarted root granted before node 3 had
+    re-streamed its generation to it. The grant carried `(gen 3, 4)`,
+    but the write under the previous lock was at index 7 or 8 (sim
+    `locks-released-writes` seed 201666).
+  - The cost is at most one delegation renewal interval of held-back
+    root grants after a takeover.
+  - New stat: `lock_tenure_waits`.
+- **The release floor** (`lock_release_floor`) now also joins the
+  releaser's own executed index of every generation it is the delegate
+  of. Its session frontier had not caught up with its own client's
+  write at the time of the release.
+- Floors are no longer lost with the lease (`lock_on_lease_gone`),
+  since positions belong to the cluster, not to a tenure.
+
+The wire changes run through `PeerMsg`, `net::Payload` (all new fields
+are `#[serde(default)]`), the `PeerService` trait and the driver:
+- `DelegRenewed.lock_floor`;
+- `DelegRecalled.lock_floor`;
+- `LockMirror.floor`;
+- `DelegRenew.stream_head`.
+
+### 2. The session watermark dropped a grant's floor (`meta/session.rs`)
+
+`SessionState::check` waited for `observed.join(floor)`, and
+`raise_observed` kept `observed.join(pos)`. When the two together named
+more than 8 generations, `Position::join` kept only the left side's
+streams, so a grant's whole stream floor was not waited for. A shadow
+covering the key at the old watermark then answered the read.
+
+This happened in `locks-delegated-writes` seed 200981. The sim
+re-delegates constantly after cross-subtree operations, so 9 or more
+generations at once is ordinary. The new holder read the previous
+turn under the new lock.
+
+`Inner::join_owed` now drops the stream entries the replica already
+reaches before joining.
+- `check` uses the joined target when it fits. When it does not, it
+  checks both positions on their own; neither is dropped.
+- `raise_observed` keeps the newest generations only when more than 8
+  unapplied streams are owed at once.
+
+### 3. Two lock bugs found by the new check (`meta/locks.rs`)
+
+- **An exclusive local lock was unfenced under a shared grant**
+  (`locks-released-writes` seed 211727). A holder's exclusive grant
+  lapsed while its thread waited on a write. Another thread's pending
+  shared request then brought a shared grant, which replaced the lapsed
+  one. `fenced` checked only that some grant was honoured, so the
+  exclusive holder's next I/O went through while node 1 also held a
+  shared grant. `fenced_at` now requires the honoured grant's mode to
+  cover the strongest local lock.
+- **A superseded grant id was installed late** (`locks-released-writes`
+  seed 211029, two exclusive holders):
+  - Node 3 had two waiters on one inode. The owner served both in one
+    pass, and the second grant (`…779`) replaced the first (`…778`) in
+    its table.
+  - Node 3 received `…779` first, used it and released it.
+  - The push of `…778` then arrived. Node 3 installed it, although the
+    owner no longer knew it, and granted itself over node 2's new grant.
+  - Fix: `LockTables::newest` keeps the newest sequence installed per
+    inode and minting owner (up to 4096 entries). An older id from the
+    same owner is refused like a released one, and the waiter asks
+    again.
+
+### 4. A sim check for lock-to-unlock coherence (`tests/sim/locks.rs`)
+
+With `SimConfig::lock_writes`, every exclusive holder writes a *turn*
+(a `Setattr` of a unique mtime) under its lock and waits for the
+reply.
+- `lock_data_dir` puts the turn in a data file `dk<i>` of another
+  owner's directory. Only the grant's floor then orders the write
+  before the next holder, as with git's refs under its turn file.
+- A later holder on another node, with a fresh grant, raises
+  `observed` to the grant's position as `cli::locks::granted` does.
+  It waits on the data file's key as a FUSE read would, then reads the
+  turn. It must see that turn or a later one.
+- Exemptions:
+  - the missed turn's acknowledgement rolled back (`Local`'s L2
+    window);
+  - the value read is an older turn replayed late;
+  - the value read is a turn never acknowledged under its lock (a write
+    that outlived its grant: the fence's flush-start limit).
+- A turn counts as acknowledged only if the grant it was written under
+  is still the honoured one at the reply.
+- While the write is awaited, the writer stays "in I/O" for the
+  mutual-exclusion ghost until its grant lapses.
+
+New configs, each with stream drop, reorder and cut faults:
+- `locks-writes`;
+- `locks-delegated-writes` (lock files in `d1`, turns in `d2`);
+- `locks-released-writes`;
+- `locks-failover-backup-writes`.
+
+They are in `replay_seed`, in `long_locks` (seeds 199000+ to 202000+)
+and in the CI test `locks_writes_are_visible_to_the_next_holder`.
+- Non-vacuity: with no floors at all (grants carry only the owner's
+  position), 16–23 of 150 seeds per configuration read a stale turn.
+- The owner-change paths themselves did not show up as a difference in
+  the sim: with the moves disabled (a temporary switch, removed), the
+  same 300 seeds passed both ways. What the sim found were the other
+  gaps above.
+- The unit tests pin the moves instead.
+
+A diagnostic stays in: `AUTHORITY_SIM_VISIBILITY=1` makes a node that
+does not reach the previous holder's session frontier fail the seed.
+Its counters are `visibility_checks` and `visibility_gaps`.
+
+### 5. The sim checker for 195356 (last section's fix)
+
+The lock changes altered seed 195356's schedule, so it no longer
+reaches the window it failed in. The agreement of the two checkers is
+now pinned by a history unit test,
+`a_refusal_that_observed_a_tentative_effect_is_in_flight_for_both_checkers`.
+It builds the seed's shape and asserts that the generic tester fails
+it without the observers and passes it with them.
+
+### 6. Tests
+
+- `core::tests::locks`:
+  - `a_fast_successor_grants_over_the_mirrored_floor` fails without the
+    mirror floor, checked;
+  - `floors_survive_a_lease_gone_and_back`;
+  - `an_outwaited_generation_leaves_a_floor_on_its_subtree`.
+- `meta`:
+  - `floor_join_keeps_the_newest_streams_past_the_cap`;
+  - `an_older_grant_of_the_same_owner_is_refused_after_a_newer_one`;
+  - `an_exclusive_local_lock_under_a_shared_grant_is_fenced`;
+  - `session::a_floor_past_the_streams_cap_is_still_waited_for`.
+- `sim`: `locks_writes_are_visible_to_the_next_holder`,
+  `regression_lock_writes_seeds` (200981, 210344, 201666, 211727,
+  211029, 201890 and 201959), and the history unit test above.
+- Model: not extended. The Stateright lock model has no data and no
+  positions; the sim's turn check serves as the executable
+  specification of coherence.
+
+### 7. Five debug-only sim panics
+
+`delegated_marker_order_holds`, `long_delegated_seed_70051_finishes`,
+`long_delegated_seed_70075_keeps_stream_order`,
+`regression_long_delegated_seeds` and
+`regression_long_delegated_backup_seeds` panicked in debug builds only.
+The marker workload names a root-directory file `"/m…"` (its directory
+is `""`), and `split_name` looked up `""`. `split_name` now maps a
+leading `/` to the root. All five pass in debug.
+
+### Results (final code)
+
+| Sweep | Seeds | Result |
+|---|---|---|
+| `long_locks`' 8 configurations + `locks-released-delegated` + the 4 `-writes` configurations | 2000 each (`start..start+1000` and `start+10000..start+11000`) | 26000 pass |
+| `long_backup`, `long_random`, `long_backup_hot`, `long_delegated`, `long_strict` | 1000 each | all pass |
+
+- `constellation-authority --release`: 103 lib + 3 + 98 sim passed (10
+  ignored);
+- `constellation-meta`: all passed;
+- `constellation` bin 237, `constellation-net` 90;
+- the five debug sim tests pass;
+- `cargo fmt --all -- --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean.
+
+**Residual:** a grant that was outwaited instead of released still
+carries only the owner's own position; what its holder did is at most
+what some sequencer acknowledged. The session watermark keeps only the
+newest 8 generations when more than 8 unapplied ones are owed at once.

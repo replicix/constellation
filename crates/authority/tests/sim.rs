@@ -330,6 +330,10 @@ fn replay_seed() {
         Ok("locks-pause") => locks_pause_config(),
         Ok("locks-delegated") => locks_delegated_config(),
         Ok("locks-released-delegated") => locks_released_delegated_config(),
+        Ok("locks-delegated-writes") => with_lock_writes(locks_delegated_config(), "d2"),
+        Ok("locks-released-writes") => with_lock_writes(locks_released_delegated_config(), "d2"),
+        Ok("locks-failover-backup-writes") => with_lock_writes(locks_failover_backup_config(), ""),
+        Ok("locks-writes") => with_lock_writes(locks_config(), ""),
         Ok("locks-nofence") => SimConfig {
             lock_ignore_fence: true,
             ..locks_partition_config()
@@ -343,6 +347,21 @@ fn replay_seed() {
             read_ratio: 0.3,
             ..SimConfig::default()
         },
+    };
+    // Plan 30 §M14: `AUTHORITY_SIM_LOCK_WRITES=1` adds the lock-to-unlock
+    // coherence check (turns written under exclusive locks) to any
+    // lock configuration.
+    // `AUTHORITY_SIM_LOCK_DATA_DIR=<dir>|root` writes the turns into data
+    // files there instead of into the lock files.
+    let config = SimConfig {
+        lock_writes: config.lock_writes
+            || std::env::var("AUTHORITY_SIM_LOCK_WRITES").as_deref() == Ok("1"),
+        lock_data_dir: match std::env::var("AUTHORITY_SIM_LOCK_DATA_DIR").as_deref() {
+            Ok("root") => Some(String::new()),
+            Ok(d) => Some(d.to_string()),
+            Err(_) => config.lock_data_dir.clone(),
+        },
+        ..config
     };
     match run_seed(seed, config) {
         Ok(report) => eprintln!("seed {seed} passed: {report:#?}"),
@@ -3362,6 +3381,27 @@ fn regression_locks_released_delegated_seed_198670() {
     });
 }
 
+/// Plan 30 §M14, lock-to-unlock coherence across owner changes: every
+/// exclusive holder writes a turn under its lock into a data file of
+/// *another* owner's directory (`d2`, delegated to node 3, while the lock
+/// files are in `d1`), so only the grant's floor — what the previous
+/// holder had been acknowledged — orders that write before the next
+/// holder's read; the log streams drop, reorder and cut frames, so
+/// replicas lag. `base` is the lock configuration it extends.
+fn with_lock_writes(base: SimConfig, data_dir: &str) -> SimConfig {
+    SimConfig {
+        lock_writes: true,
+        lock_data_dir: Some(data_dir.into()),
+        stream_faults: StreamFaults {
+            drop_p: 0.04,
+            reorder_p: 0.04,
+            cut_p: 0.02,
+            drop_segment_frames: Vec::new(),
+        },
+        ..base
+    }
+}
+
 /// Plan 30 §M14: the lock counters summed over a run's nodes.
 #[derive(Debug, Default)]
 struct M14Totals {
@@ -3410,6 +3450,12 @@ impl M14Totals {
         c.position_timeouts += l.position_timeouts;
         c.abandoned += l.abandoned;
         c.max_wait_ms = c.max_wait_ms.max(l.max_wait_ms);
+        c.visibility_checks += l.visibility_checks;
+        c.visibility_gaps += l.visibility_gaps;
+        c.turns_written += l.turns_written;
+        c.turn_reads += l.turn_reads;
+        c.stale_turn_reads += l.stale_turn_reads;
+        c.late_unacked_turns += l.late_unacked_turns;
         for s in r.stats.values() {
             self.grants += s.lock_grants;
             self.requests += s.lock_requests;
@@ -3586,13 +3632,13 @@ fn regression_locks_released_takeover_grace_follows_the_delegation() {
 /// L2 window, allowed without a backup) failed the generic tester, which
 /// had no such exemption, while the log-witnessed check counted it as
 /// `observed_tentative` (PROGRESS.md "Fix: locks-faults 195356 and the
-/// delegated grace gap").
+/// delegated grace gap"). The lock floors changed its schedule (it no
+/// longer reaches that window); the checkers' agreement is pinned by
+/// `history::tests::a_refusal_that_observed_a_tentative_effect_is_in_flight_for_both_checkers`.
 #[test]
 fn regression_locks_faults_refusal_observed_a_rolled_back_effect() {
-    let report = run_seed(195_356, locks_faults_config())
+    run_seed(195_356, locks_faults_config())
         .unwrap_or_else(|e| panic!("locks-faults seed 195356: {e}"));
-    assert_eq!(report.observed_tentative, 1);
-    assert!(report.stateright_checked, "the generic tester did not run");
 }
 
 /// `locks-delegated` seeds where two nodes held exclusive grants on one
@@ -3611,6 +3657,98 @@ fn regression_locks_delegated_handoff_overtaken_by_recall() {
     for seed in [196_102, 96_425, 96_805, 196_004] {
         run_seed(seed, locks_delegated_config()).unwrap_or_else(|e| {
             panic!("locks-delegated seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-delegated")
+        });
+    }
+}
+
+/// Plan 30 §M14, lock-to-unlock coherence: every exclusive holder writes
+/// a turn under its lock into a data file of another owner, and every
+/// later holder on another node reads that turn or a later one once its
+/// grant's session wait is over — with the grant floors moved by
+/// delegation moves and recalls, and mirrored to a fast successor
+/// (PROGRESS.md "Fix: lock floors survive owner changes"). A stale read
+/// fails the seed. Without any floor, 16–23 of 150 seeds per
+/// configuration read a stale turn.
+#[test]
+fn locks_writes_are_visible_to_the_next_holder() {
+    for (label, cfg, seeds) in [
+        (
+            "locks-writes",
+            with_lock_writes(locks_config(), ""),
+            99_000..99_040,
+        ),
+        (
+            "locks-delegated-writes",
+            with_lock_writes(locks_delegated_config(), "d2"),
+            99_100..99_140,
+        ),
+        (
+            "locks-released-writes",
+            with_lock_writes(locks_released_delegated_config(), "d2"),
+            99_200..99_240,
+        ),
+        (
+            "locks-failover-backup-writes",
+            with_lock_writes(locks_failover_backup_config(), ""),
+            99_300..99_340,
+        ),
+    ] {
+        let t = run_m14(label, cfg, seeds);
+        assert!(t.clients.turns_written > 200, "{label}: {t:?}");
+        assert!(t.clients.turn_reads > 100, "{label}: {t:?}");
+        assert_eq!(t.clients.stale_turn_reads, 0, "{label}: {t:?}");
+    }
+}
+
+/// Seeds of the lock-writes configurations that failed while this was
+/// built (PROGRESS.md "Fix: lock floors survive owner changes"): a grant
+/// floor past the session's streams cap dropped (200981), a delegate's
+/// own executions missing from its release (200981), a new tenure
+/// granting before its inherited delegates re-streamed (201666), an
+/// exclusive local lock left unfenced under a shared grant (211727), a
+/// superseded grant id installed late (211029), and the checker's own
+/// refinements (201890, 201959, 210344).
+#[test]
+fn regression_lock_writes_seeds() {
+    for (label, cfg, seed) in [
+        (
+            "locks-delegated-writes",
+            with_lock_writes(locks_delegated_config(), "d2"),
+            200_981,
+        ),
+        (
+            "locks-delegated-writes",
+            with_lock_writes(locks_delegated_config(), "d2"),
+            210_344,
+        ),
+        (
+            "locks-released-writes",
+            with_lock_writes(locks_released_delegated_config(), "d2"),
+            201_666,
+        ),
+        (
+            "locks-released-writes",
+            with_lock_writes(locks_released_delegated_config(), "d2"),
+            211_727,
+        ),
+        (
+            "locks-released-writes",
+            with_lock_writes(locks_released_delegated_config(), "d2"),
+            211_029,
+        ),
+        (
+            "locks-released-writes",
+            with_lock_writes(locks_released_delegated_config(), "d2"),
+            201_890,
+        ),
+        (
+            "locks-released-writes",
+            with_lock_writes(locks_released_delegated_config(), "d2"),
+            201_959,
+        ),
+    ] {
+        run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
         });
     }
 }
@@ -3688,5 +3826,25 @@ fn long_locks() {
         "locks-released-delegated",
         locks_released_delegated_config(),
         198_000..198_000 + n,
+    );
+    run_m14(
+        "locks-writes",
+        with_lock_writes(locks_config(), ""),
+        199_000..199_000 + n,
+    );
+    run_m14(
+        "locks-delegated-writes",
+        with_lock_writes(locks_delegated_config(), "d2"),
+        200_000..200_000 + n,
+    );
+    run_m14(
+        "locks-released-writes",
+        with_lock_writes(locks_released_delegated_config(), "d2"),
+        201_000..201_000 + n,
+    );
+    run_m14(
+        "locks-failover-backup-writes",
+        with_lock_writes(locks_failover_backup_config(), ""),
+        202_000..202_000 + n,
     );
 }

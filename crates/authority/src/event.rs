@@ -471,6 +471,13 @@ pub enum PeerMsg {
         gen: u64,
         /// Phase 2b: the delegate's backup peer, if it appends to one.
         backup: Option<NodeId>,
+        /// Plan 30 §M14: the highest stream index the delegate executed
+        /// under `gen` when it sent this (filled in after the event, see
+        /// `Core::lock_fill_renew_heads`). A new root tenure floors its
+        /// lock grants with every inherited generation's head: a release
+        /// the previous tenure recorded may name a stream index the new
+        /// root has not been re-streamed yet.
+        stream_head: u64,
     },
     DelegRenewed {
         req: OpId,
@@ -486,6 +493,11 @@ pub enum PeerMsg {
         /// delegate that starts serving with this renewal refuses new
         /// grants (and accepts reclaims) as long, plus the margin.
         lock_grace_ms: u64,
+        /// Plan 30 §M14: the lock floor of the subtree at the move (what
+        /// its holders released at, as the root knew it): the delegate
+        /// joins it into every grant under the subtree, so the move does
+        /// not lose "the next holder reads what the previous one wrote".
+        lock_floor: constellation_meta::Position,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops executing under it and answers with the highest
@@ -501,8 +513,9 @@ pub enum PeerMsg {
         gen: u64,
         through: u64,
         /// Plan 30 §M14: the delegate's lock grants under the subtree,
-        /// handed back (restamped by the root).
-        locks: Vec<constellation_meta::locks::Grant>,
+        /// handed back (restamped by the root), and the subtree's lock
+        /// floor as the delegate knew it.
+        locks: constellation_meta::locks::LockHandback,
     },
     /// Phase 2b: a delegate appends its stream transactions to its
     /// backup before acknowledging them; the backup answers with what it
@@ -592,6 +605,9 @@ pub enum PeerMsg {
     LockMirror {
         ver: u64,
         grants: Vec<constellation_meta::locks::Grant>,
+        /// Every lock floor the holder knows, joined: a fast successor
+        /// puts it under the whole namespace.
+        floor: constellation_meta::Position,
     },
     /// Plan 30 §M14: `getlk` — whether another node holds a conflicting
     /// grant.

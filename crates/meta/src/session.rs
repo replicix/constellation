@@ -449,6 +449,36 @@ struct Inner {
 }
 
 impl Inner {
+    /// `a` joined with `b`, for a watermark: stream entries this replica
+    /// already reaches (applied that far, or voided) are dropped first —
+    /// they wait for nothing — so the cap is spent on what is still
+    /// owed. `None`: what is still owed does not fit the cap. The plain
+    /// [`Position::join`] kept `a`'s streams and dropped *all* of `b`'s on
+    /// an overflow: a lock grant's floor naming a ninth generation was
+    /// then not waited for (sim `locks-delegated-writes` seed 200981, a
+    /// stale read under the lock).
+    fn join_owed(&self, a: &Position, b: &Position) -> Option<Position> {
+        let mut owed: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        for (g, i) in a.streams.iter().chain(b.streams.iter()) {
+            if i == 0 || self.voided.contains(&g) || self.streams.get(&g).is_some_and(|m| *m >= i) {
+                continue;
+            }
+            let e = owed.entry(g).or_insert(0);
+            *e = (*e).max(i);
+        }
+        let mut streams = Streams::NONE;
+        for (g, i) in owed {
+            if !streams.raise(g, i) {
+                return None;
+            }
+        }
+        Some(Position {
+            seq: a.seq.max(b.seq),
+            pending: a.pending.max(b.pending),
+            streams,
+        })
+    }
+
     fn applied_position(&self) -> Position {
         let mut streams = Streams::NONE;
         for (g, i) in &self.streams {
@@ -819,7 +849,27 @@ impl SessionState {
     /// A reply whose effects are not installed here observed `pos`.
     pub fn raise_observed(&self, pos: Position) {
         let mut g = self.inner.lock().unwrap();
-        let next = g.observed.join(&pos);
+        // Past the cap even after dropping what is reached (nine
+        // generations owed at once), the newest are kept: the oldest
+        // generations' streams are the likeliest in the log already.
+        let next = match g.join_owed(&g.observed, &pos) {
+            Some(p) => p,
+            None => {
+                let mut all: std::collections::BTreeMap<u64, u64> =
+                    g.observed.streams.iter().collect();
+                for (gen, i) in pos.streams.iter() {
+                    let e = all.entry(gen).or_insert(0);
+                    *e = (*e).max(i);
+                }
+                let kept: Vec<(u64, u64)> = all.into_iter().rev().take(STREAMS_CAP).collect();
+                Position {
+                    seq: g.observed.seq.max(pos.seq),
+                    pending: g.observed.pending.max(pos.pending),
+                    streams: Streams::NONE,
+                }
+                .with_streams_wire(&kept)
+            }
+        };
         if next != g.observed {
             g.observed = next;
             drop(g);
@@ -917,15 +967,20 @@ impl SessionState {
             return None;
         }
         let g = self.inner.lock().unwrap();
-        let target = g.observed.join(floor);
-        if g.reaches(&target) {
+        // Both watermarks, joined when what they still owe fits the cap,
+        // else each on its own (never one dropped: see `join_owed`).
+        let targets: Vec<Position> = match g.join_owed(&g.observed, floor) {
+            Some(t) => vec![t],
+            None => vec![g.observed, *floor],
+        };
+        if targets.iter().all(|t| g.reaches(t)) {
             return Some(SessionWait::Fast);
         }
         let covered = keys.iter().all(|k| {
             g.covering
                 .iter()
                 .filter(|(ks, _)| ks.covers(k))
-                .any(|(_, p)| p.dominates(&target))
+                .any(|(_, p)| targets.iter().all(|t| p.dominates(t)))
         });
         covered.then_some(SessionWait::Covered)
     }
@@ -1267,6 +1322,41 @@ mod tests {
         );
         assert_eq!(a.hint_floor(), 6);
         assert_eq!(c.hint_floor(), 9);
+    }
+
+    /// A lock grant's floor naming streams the observed watermark does
+    /// not, past the cap together: the floor must still be waited for,
+    /// and a shadow covering the key at the observed watermark alone must
+    /// not answer (sim `locks-delegated-writes` seed 200981: the join
+    /// dropped the floor's streams and a covered read returned the old
+    /// turn under the new holder's lock).
+    #[test]
+    fn a_floor_past_the_streams_cap_is_still_waited_for() {
+        let s = SessionState::default();
+        let mut observed = Position::ZERO;
+        for g in 1..=6 {
+            assert!(observed.streams.raise(g, 1));
+        }
+        s.raise_observed(observed);
+        let mut floor = Position::ZERO;
+        for g in 7..=14 {
+            assert!(floor.streams.raise(g, 1));
+        }
+        let k = [ReadKey::Ino(9)];
+        // A shadow of an older write of the key, at the observed state.
+        s.note_covering(
+            KeySet {
+                dentries: Vec::new(),
+                inos: vec![9],
+            },
+            observed,
+        );
+        assert!(!s.ready(&k, 0, false, &floor), "the floor was dropped");
+        // Once the replica has what is owed, it is ready.
+        for g in 1..=14 {
+            s.note_stream(g, 1);
+        }
+        assert!(s.ready(&k, 0, false, &floor));
     }
 
     #[test]

@@ -60,6 +60,10 @@ pub type MutateReplyParts = (MutateOutcome, Option<u64>, Position, u64);
 /// Plan 30 §M14: an owner's answer to a `LockRenew`.
 pub type LockRenewResults = Vec<(constellation_fs_core::Ino, GrantId, LockRenewResult)>;
 
+/// A delegation renewal's answer: the ttl, the lock grants handed over,
+/// the remaining lock grace (ms) and the subtree's lock floor.
+type DelegRenewReply = (u64, Vec<Grant>, u64, constellation_meta::Position);
+
 /// The core's observable state, refreshed after every event, for
 /// `status` and the background tickers (placement, atime, prune).
 #[derive(Debug, Clone, Default)]
@@ -627,8 +631,9 @@ pub struct Driver {
     /// Plan 30 §M11: peers' delegate-stream batches, renewals and
     /// recalls this node is answering.
     deleg_stream_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
-    deleg_renew_replies: HashMap<OpId, oneshot::Sender<(u64, Vec<Grant>, u64)>>,
-    deleg_recall_replies: HashMap<OpId, oneshot::Sender<(u64, Vec<Grant>)>>,
+    deleg_renew_replies: HashMap<OpId, oneshot::Sender<DelegRenewReply>>,
+    deleg_recall_replies:
+        HashMap<OpId, oneshot::Sender<(u64, constellation_meta::locks::LockHandback)>>,
     /// Plan 30 §M14: peers' lock requests, recalls, renewals and tests
     /// this node is answering.
     lock_request_replies: HashMap<OpId, oneshot::Sender<LockOutcome>>,
@@ -1128,6 +1133,7 @@ impl Driver {
                 from,
                 gen,
                 backup,
+                stream_head,
                 reply,
             } => {
                 let req = self.control_id();
@@ -1138,6 +1144,7 @@ impl Driver {
                         req,
                         gen,
                         backup: (backup != 0).then_some(backup),
+                        stream_head,
                     },
                 }))
             }
@@ -1509,12 +1516,15 @@ impl Driver {
                     position,
                 },
             })),
-            SyncRequest::PeerLockMirror { from, ver, grants } => {
-                Some(Internal::Event(Event::Peer {
-                    from,
-                    msg: PeerMsg::LockMirror { ver, grants },
-                }))
-            }
+            SyncRequest::PeerLockMirror {
+                from,
+                ver,
+                grants,
+                floor,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::LockMirror { ver, grants, floor },
+            })),
             SyncRequest::Shutdown { reply } => {
                 control(Control::Shutdown, ControlReply::Done(reply))
             }
@@ -1835,10 +1845,11 @@ impl Driver {
                 ttl_ms,
                 locks,
                 lock_grace_ms,
+                lock_floor,
                 ..
             } => {
                 if let Some(tx) = self.deleg_renew_replies.remove(&req) {
-                    let _ = tx.send((ttl_ms, locks, lock_grace_ms));
+                    let _ = tx.send((ttl_ms, locks, lock_grace_ms, lock_floor));
                 }
             }
             PeerMsg::DelegRecalled {
@@ -1965,11 +1976,12 @@ impl Driver {
                 };
                 self.one_way(to, payload);
             }
-            PeerMsg::LockMirror { ver, grants } => {
+            PeerMsg::LockMirror { ver, grants, floor } => {
                 let payload = Payload::LockMirror {
                     from: self.node_id,
                     ver,
                     grants: crate::locks::grants_wire(&grants),
+                    floor: crate::locks::floor_wire(&floor),
                 };
                 self.one_way(to, payload);
             }
@@ -2139,7 +2151,12 @@ impl Driver {
                     }
                 });
             }
-            PeerMsg::DelegRenew { req, gen, backup } => {
+            PeerMsg::DelegRenew {
+                req,
+                gen,
+                backup,
+                stream_head,
+            } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let from = self.node_id;
@@ -2158,6 +2175,7 @@ impl Driver {
                         req_id: req.0,
                         gen,
                         backup: backup.unwrap_or(0),
+                        stream_head,
                     };
                     let reply = tokio::time::timeout(
                         timeout,
@@ -2171,6 +2189,7 @@ impl Driver {
                             ttl_ms,
                             locks,
                             lock_grace_ms,
+                            lock_floor,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
@@ -2180,6 +2199,7 @@ impl Driver {
                                     ttl_ms,
                                     locks: crate::locks::grants_of(&locks),
                                     lock_grace_ms,
+                                    lock_floor: crate::locks::floor_of(&lock_floor),
                                 },
                             }));
                         }
@@ -2221,6 +2241,7 @@ impl Driver {
                             gen,
                             through,
                             locks,
+                            lock_floor,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
@@ -2228,7 +2249,10 @@ impl Driver {
                                     req,
                                     gen,
                                     through,
-                                    locks: crate::locks::grants_of(&locks),
+                                    locks: constellation_meta::locks::LockHandback {
+                                        grants: crate::locks::grants_of(&locks),
+                                        floor: crate::locks::floor_of(&lock_floor),
+                                    },
                                 },
                             }));
                         }

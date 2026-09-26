@@ -1686,7 +1686,12 @@ impl Core {
         self.dl.mine.get_mut(&gen).expect("present").renew_backup = backup;
         out.push(Action::Send {
             to: root,
-            msg: PeerMsg::DelegRenew { req, gen, backup },
+            msg: PeerMsg::DelegRenew {
+                req,
+                gen,
+                backup,
+                stream_head: 0,
+            },
         });
     }
 
@@ -1749,6 +1754,11 @@ impl Core {
         } else {
             (Vec::new(), 0)
         };
+        let lock_floor = if ttl_ms > 0 {
+            self.lock_floor_for_generation(gen)
+        } else {
+            Default::default()
+        };
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::DelegRenewed {
@@ -1757,6 +1767,7 @@ impl Core {
                 ttl_ms,
                 locks,
                 lock_grace_ms,
+                lock_floor,
             },
         });
     }
@@ -1849,7 +1860,7 @@ impl Core {
         let through = replica.delegate_idx(gen);
         // Plan 30 §M14: the subtree's lock grants go back with the answer;
         // its waiters are told to ask the root.
-        let locks = self.lock_take_generation(gen, replica);
+        let locks = self.lock_hand_back(gen, replica);
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.stopped = true;
             self.stats.deleg_recalls_received += 1;

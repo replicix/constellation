@@ -185,10 +185,46 @@ the next holder reads them. Git under an `flock` turn file is the
 standard case: without it the next committer could read the
 `refs/heads/master` the previous one had replaced and commit on top of
 the old commit, losing the other's (EC2 campaign 4 B-1; the
-`git-under-flock` harness scenario). The join lives in the owner's
-memory: when the file's lock table moves to another owner (a delegation
-granted or recalled, a takeover) before the next grant, that grant
-carries only the new owner's position.
+`git-under-flock` harness scenario).
+
+The join lives in the owner's memory, so it moves with the lock table
+when the owner changes:
+- **A delegation granted.** The root sends the subtree's floor with
+  every renewal it grants: the join of its per-file floors under the
+  subtree and of any floor on a directory above or inside it. The
+  delegate puts that floor on the whole subtree.
+- **A delegation recalled.** The delegate's answer carries the
+  subtree's floor back. A delegate that is outwaited instead leaves
+  the root's own position, taken once the root has appended the
+  delegate's stream, as the subtree's floor.
+- **A takeover.** The holder mirrors the join of every floor it knows
+  to its backups, and a fast successor puts it on the whole namespace.
+  Any new tenure (a takeover, a restart, the lease back after losing
+  it) makes no new grant until every delegation it inherited has
+  renewed with it. Each renewal carries the stream index its delegate
+  has executed. The tenure then floors the whole namespace with its own
+  position joined with those indices. A release that the previous
+  tenure recorded may name a delegate's stream beyond what that
+  delegate has re-streamed to the new root, and the renewal is how the
+  new root learns how far the stream goes.
+
+A floor on a directory or on the whole namespace is coarser than a
+per-file one. It can make a grant wait for a position that the file
+does not need, but only once: floors are watermarks, and a reached one
+costs nothing. A node's session watermark holds at most 8 delegation
+streams, and streams the node has already applied are dropped first.
+The wait on the grant itself always covers the grant's whole floor. A
+later read of another file could lose a stream only when more than 8
+unapplied streams are owed at once; the newest are kept then. A grant
+that was outwaited instead of released still carries only the owner's
+own position.
+
+Two node-side rules keep a holder's I/O inside its grant. An exclusive
+local lock is fenced unless the honoured grant is exclusive too. This
+matters when the exclusive grant lapsed and another local process's
+request then brought a shared one. A grant whose id is older than one
+the same owner already gave this node for the file is refused: the
+owner has replaced it.
 
 ### Failover
 

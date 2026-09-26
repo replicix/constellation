@@ -605,6 +605,45 @@ mod tests {
         assert!(check_linearizable_witnessed(&events, &tentative, &second_only).is_ok());
     }
 
+    /// `locks-faults` seed 195356's shape (the L2 window seen by a third
+    /// party): t1's create of `f0` is acknowledged, rolled back with its
+    /// crashed holder and replayed after t2's next op; t2's own create of
+    /// `f0` was refused on the strength of it. The witnessed check counts
+    /// the refusal as an observer of a tentative effect; the generic
+    /// tester must then treat it as in flight too (it failed the history
+    /// before, while the witnessed check passed it).
+    #[test]
+    fn a_refusal_that_observed_a_tentative_effect_is_in_flight_for_both_checkers() {
+        let inv = |thread, r, op| HistEvt::Invoke {
+            thread,
+            rid: rid(r),
+            op,
+        };
+        let ret = |thread, r, ret| HistEvt::Return {
+            thread,
+            rid: rid(r),
+            ret,
+        };
+        let events = vec![
+            inv(1, 1, NsOp::Create("f0".into())),
+            ret(1, 1, NsRet::Ok),
+            inv(2, 2, NsOp::Create("f0".into())),
+            ret(2, 2, NsRet::Eexist),
+            // In the log before t1's replay: nothing removed `f0` between
+            // the refusal and this create but t1's rolled-back effect.
+            inv(2, 3, NsOp::Create("f0".into())),
+            ret(2, 3, NsRet::Ok),
+        ];
+        let tentative: HashSet<Rid> = [rid(1)].into_iter().collect();
+        let log = [(rid(3), (2, 0)), (rid(1), (3, 0))].into_iter().collect();
+        let w = check_linearizable_witnessed(&events, &tentative, &log).expect("witnessed");
+        assert_eq!(w.observed_tentative, 1);
+        assert!(w.observers.contains(&rid(2)));
+        assert!(check_linearizable(&events, &tentative).is_err());
+        let in_flight: HashSet<Rid> = tentative.union(&w.observers).copied().collect();
+        assert!(check_linearizable(&events, &in_flight).is_ok());
+    }
+
     #[test]
     fn the_witnessed_check_places_refusals_in_their_window() {
         // t1: create a → Ok (log 1). t2: create a → Eexist, invoked after

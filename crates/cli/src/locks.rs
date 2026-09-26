@@ -559,6 +559,21 @@ pub fn grants_wire(grants: &[Grant]) -> Vec<u8> {
     postcard::to_allocvec(grants).unwrap_or_default()
 }
 
+/// A lock floor on the wire (empty: none).
+pub fn floor_wire(p: &constellation_meta::Position) -> Vec<u8> {
+    if *p == constellation_meta::Position::ZERO {
+        return Vec::new();
+    }
+    p.to_postcard()
+}
+
+pub fn floor_of(bytes: &[u8]) -> constellation_meta::Position {
+    if bytes.is_empty() {
+        return constellation_meta::Position::ZERO;
+    }
+    constellation_meta::Position::from_postcard(bytes)
+}
+
 pub fn grants_of(bytes: &[u8]) -> Vec<Grant> {
     if bytes.is_empty() {
         return Vec::new();

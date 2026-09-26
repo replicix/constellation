@@ -103,6 +103,37 @@ pub struct Grant {
     pub gen: u64,
 }
 
+/// What a delegate hands back to the root with its recall answer: the
+/// subtree's grants and the *floor* its holders released at (every
+/// position a later grant under the subtree must carry — see
+/// `core::locks`'s `LockState::floors`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockHandback {
+    pub grants: Vec<Grant>,
+    pub floor: Position,
+}
+
+/// Join two lock floors (positions: watermarks, so the join is what both
+/// cover). Unlike [`Position::join`], a streams overflow does not drop
+/// the other side's streams wholesale: the newest generations are kept
+/// (an older generation's stream has long reached the log, which `seq`
+/// covers).
+pub fn floor_join(a: &Position, b: &Position) -> Position {
+    let mut all: BTreeMap<u64, u64> = a.streams_wire().into_iter().collect();
+    for (g, i) in b.streams_wire() {
+        let e = all.entry(g).or_insert(0);
+        *e = (*e).max(i);
+    }
+    let mut kept: Vec<(u64, u64)> = all.into_iter().rev().collect();
+    kept.truncate(crate::session::STREAMS_CAP);
+    Position {
+        seq: a.seq.max(b.seq),
+        pending: a.pending.max(b.pending),
+        streams: Default::default(),
+    }
+    .with_streams_wire(&kept)
+}
+
 /// What installing a grant on the node side did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Installed {
@@ -213,6 +244,15 @@ struct Inner {
     /// Ids this node released or dropped (the last few hundred): a
     /// reply that crosses the release is refused.
     released: std::collections::VecDeque<GrantId>,
+    /// Node side: per `(inode, minting owner)`, the newest grant sequence
+    /// this node installed. An owner keeps one grant per node and inode,
+    /// and every grant is a fresh id, so an older id from the same owner
+    /// arriving later is one the owner already replaced (two waiters of
+    /// this node on one inode answered in one pass: the second grant
+    /// replaced the first in the owner's table, and the first one's push
+    /// landed after the second was released — sim `locks-released-writes`
+    /// seed 211029, two exclusive holders). Refused like a released id.
+    newest: BTreeMap<(u64, u64), u64>,
     /// Node side: inodes whose dirty data may have been written under a
     /// grant that ended without the release's flush (see
     /// [`LockTables::take_discard`]); `Owed`: it was discarded while no
@@ -229,6 +269,9 @@ enum Taint {
 }
 
 const RELEASED_KEPT: usize = 512;
+/// Past this many `(inode, owner)` pairs the oldest inodes' go (a lost
+/// entry only admits what it would have refused before).
+const NEWEST_KEPT: usize = 4096;
 
 impl Inner {
     fn tombstone(&mut self, id: GrantId) {
@@ -245,9 +288,26 @@ impl Inner {
     }
 
     /// Local locks on `ino` and no honoured grant.
+    /// Local locks on `ino` and no honoured grant *covering* them. An
+    /// exclusive local lock under a shared grant is fenced too: its
+    /// exclusive grant lapsed and another local owner's request brought a
+    /// shared one, which other nodes may share (sim
+    /// `locks-released-writes` seed 211727: the exclusive holder's next
+    /// write went through under node 3's shared grant while node 1 held
+    /// one too).
     fn fenced_at(&self, ino: u64, now_ms: i64) -> bool {
-        self.local.get(&ino).is_some_and(|v| !v.is_empty())
-            && !self.held.get(&ino).is_some_and(|h| h.until_ms > now_ms)
+        let Some(v) = self.local.get(&ino).filter(|v| !v.is_empty()) else {
+            return false;
+        };
+        let needed = if v.iter().any(|l| l.write) {
+            LockMode::Exclusive
+        } else {
+            LockMode::Shared
+        };
+        !self
+            .held
+            .get(&ino)
+            .is_some_and(|h| h.until_ms > now_ms && h.mode.covers(needed))
     }
 }
 
@@ -532,6 +592,15 @@ impl LockTables {
         let mut g = self.lock();
         if g.released.contains(&held.id) {
             return Installed::Released;
+        }
+        let key = (ino, held.id.node);
+        if g.newest.get(&key).is_some_and(|seq| *seq > held.id.seq) {
+            g.tombstone(held.id);
+            return Installed::Released;
+        }
+        g.newest.insert(key, held.id.seq);
+        while g.newest.len() > NEWEST_KEPT {
+            g.newest.pop_first();
         }
         if g.pending_recalls
             .remove(&ino)
@@ -1056,6 +1125,78 @@ mod tests {
         assert!(t.install_if_consistent(copy(3, 3, LockMode::Shared)));
         assert!(!t.install_if_consistent(copy(3, 3, LockMode::Shared)));
         assert_eq!(t.grants_len(), 2);
+    }
+
+    #[test]
+    fn an_older_grant_of_the_same_owner_is_refused_after_a_newer_one() {
+        let t = LockTables::default();
+        let mk = |seq| HeldGrant {
+            id: GrantId { node: 2, seq },
+            ..held(LockMode::Exclusive, 100)
+        };
+        assert!(matches!(t.install_held(7, mk(9)), Installed::Ok { .. }));
+        // The older one's push lands after the newer one (which the owner
+        // made to replace it).
+        assert_eq!(t.install_held(7, mk(8)), Installed::Released);
+        assert_eq!(t.held(7).map(|h| h.id.seq), Some(9));
+        // Another owner's ids are not compared.
+        assert!(matches!(
+            t.install_held(
+                7,
+                HeldGrant {
+                    id: GrantId { node: 3, seq: 1 },
+                    ..held(LockMode::Exclusive, 100)
+                }
+            ),
+            Installed::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn an_exclusive_local_lock_under_a_shared_grant_is_fenced() {
+        let t = LockTables::default();
+        t.install_held(7, held(LockMode::Exclusive, 100));
+        assert_eq!(t.local_set(7, lk(1, true, 0, 10), 0), LocalOutcome::Done);
+        assert!(!t.fenced(7, 0));
+        // The exclusive grant is replaced by a shared one (another local
+        // owner's request after the exclusive one lapsed).
+        t.install_held(
+            7,
+            HeldGrant {
+                id: GrantId { node: 1, seq: 2 },
+                ..held(LockMode::Shared, 100)
+            },
+        );
+        assert!(
+            t.fenced(7, 0),
+            "an exclusive local lock needs an exclusive grant"
+        );
+    }
+
+    #[test]
+    fn floor_join_keeps_the_newest_streams_past_the_cap() {
+        let mut a = Position::ZERO;
+        for g in 1..=8 {
+            assert!(a.streams.raise(g, 10 * g));
+        }
+        let mut b = Position {
+            seq: 4,
+            pending: Some(crate::session::JournalPos { epoch: 2, jseq: 5 }),
+            streams: Default::default(),
+        };
+        assert!(b.streams.raise(9, 1));
+        assert!(b.streams.raise(3, 99));
+        let j = floor_join(&a, &b);
+        assert_eq!(j.seq, 4);
+        assert_eq!(j.pending, b.pending);
+        let s: BTreeMap<u64, u64> = j.streams_wire().into_iter().collect();
+        // Generation 1 (the oldest) made room for 9; 3 took the max.
+        assert!(!s.contains_key(&1), "{s:?}");
+        assert_eq!(s.get(&9), Some(&1));
+        assert_eq!(s.get(&3), Some(&99));
+        assert_eq!(s.get(&8), Some(&80));
+        // `Position::join` would have dropped b's streams wholesale.
+        assert!(!a.join(&b).streams_wire().iter().any(|(g, _)| *g == 9));
     }
 
     #[test]
