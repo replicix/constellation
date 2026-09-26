@@ -201,6 +201,8 @@ pub struct CountingProxy {
     stop: Arc<AtomicBool>,
     /// Plan 30 M0's per-node S3 switch: see [`Self::cut`].
     cut: Arc<AtomicBool>,
+    /// A black hole instead of a refusal: see [`Self::blackhole`].
+    hole: Arc<AtomicBool>,
 }
 
 impl CountingProxy {
@@ -216,13 +218,28 @@ impl CountingProxy {
         let desyncs = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let cut = Arc::new(AtomicBool::new(false));
+        let hole = Arc::new(AtomicBool::new(false));
         let upstream = upstream.to_string();
         {
-            let (log, desyncs, stop, cut) =
-                (log.clone(), desyncs.clone(), stop.clone(), cut.clone());
+            let (log, desyncs, stop, cut, hole) = (
+                log.clone(),
+                desyncs.clone(),
+                stop.clone(),
+                cut.clone(),
+                hole.clone(),
+            );
             std::thread::spawn(move || {
+                // Connections accepted while black-holed: held open,
+                // never read, never answered — dropped (closed) on heal.
+                let mut parked: Vec<TcpStream> = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
+                    if !parked.is_empty() && !hole.load(Ordering::Relaxed) {
+                        parked.clear();
+                    }
                     match listener.accept() {
+                        Ok((client, _)) if hole.load(Ordering::Relaxed) => {
+                            parked.push(client);
+                        }
                         Ok((client, _)) => {
                             // While cut, a client retrying its connection
                             // must see every attempt fail, not just watch
@@ -233,15 +250,16 @@ impl CountingProxy {
                                 let _ = client.shutdown(std::net::Shutdown::Both);
                                 continue;
                             }
-                            let (log, desyncs, stop, upstream, cut) = (
+                            let (log, desyncs, stop, upstream, cut, hole) = (
                                 log.clone(),
                                 desyncs.clone(),
                                 stop.clone(),
                                 upstream.clone(),
                                 cut.clone(),
+                                hole.clone(),
                             );
                             std::thread::spawn(move || {
-                                let _ = relay(client, &upstream, log, desyncs, stop, cut);
+                                let _ = relay(client, &upstream, log, desyncs, stop, cut, hole);
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -258,6 +276,7 @@ impl CountingProxy {
             desyncs,
             stop,
             cut,
+            hole,
         })
     }
 
@@ -275,12 +294,25 @@ impl CountingProxy {
         self.cut.store(true, Ordering::Relaxed);
     }
 
-    /// Undo [`Self::cut`]: new connections relay normally again.
-    /// Connections closed while cut are not reopened — the S3 client
-    /// reconnects on its own retry, exactly as it would after a real
-    /// outage.
+    /// Undo [`Self::cut`] and [`Self::blackhole`]: new connections relay
+    /// normally again. Connections closed while cut are not reopened —
+    /// the S3 client reconnects on its own retry, exactly as it would
+    /// after a real outage; connections that sat in the black hole are
+    /// closed now.
     pub fn heal(&self) {
         self.cut.store(false, Ordering::Relaxed);
+        self.hole.store(false, Ordering::Relaxed);
+    }
+
+    /// Black-hole this proxy's S3 path, the way a firewall `DROP` does
+    /// (the EC2 S3-cut tests' shape): nothing is refused, nothing is
+    /// answered. Relaying connections stop forwarding in both directions
+    /// (what the client sends is swallowed), and new connections are
+    /// accepted and then left hanging, so every request the node makes
+    /// waits out its own timeouts instead of failing fast. [`Self::heal`]
+    /// closes them all.
+    pub fn blackhole(&self) {
+        self.hole.store(true, Ordering::Relaxed);
     }
 
     pub fn requests(&self) -> Vec<Request> {
@@ -331,6 +363,7 @@ fn relay(
     desyncs: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     cut: Arc<AtomicBool>,
+    hole: Arc<AtomicBool>,
 ) -> Result<()> {
     client.set_nodelay(true).ok();
     let server = TcpStream::connect(upstream).context("counting proxy upstream connect")?;
@@ -342,10 +375,26 @@ fn relay(
     // upstream -> client: a plain copy, nothing to parse.
     let back = {
         let (mut from, mut to) = (server.try_clone()?, client.try_clone()?);
-        let (stop, cut) = (stop.clone(), cut.clone());
+        let (stop, cut, hole) = (stop.clone(), cut.clone(), hole.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 64 << 10];
+            let mut holed = false;
             loop {
+                // Black-holed: forward nothing; healed afterwards: this
+                // connection lost bytes in the hole, so close it.
+                if hole.load(Ordering::Relaxed) {
+                    holed = true;
+                    std::thread::sleep(Duration::from_millis(50));
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    continue;
+                }
+                if holed {
+                    let _ = from.shutdown(std::net::Shutdown::Both);
+                    let _ = to.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
                 // Checked every iteration, so a connection idling inside
                 // the blocking `read` below (bounded by the 100ms timeout
                 // set above) still notices a cut within one poll tick.
@@ -357,8 +406,8 @@ fn relay(
                 match from.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if cut.load(Ordering::Relaxed) {
-                            continue; // shut down at the top of the loop
+                        if cut.load(Ordering::Relaxed) || hole.load(Ordering::Relaxed) {
+                            continue; // shut down / swallowed at the top of the loop
                         }
                         if to.write_all(&buf[..n]).is_err() {
                             break;
@@ -379,7 +428,29 @@ fn relay(
     let (mut from, mut to) = (client, server.try_clone()?);
     let mut parser = RequestParser::default();
     let mut buf = [0u8; 64 << 10];
+    let mut holed = false;
     loop {
+        if hole.load(Ordering::Relaxed) {
+            // Swallow what the client sends (so its writes never block
+            // on a full socket) and forward none of it.
+            holed = true;
+            match from.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(ref e) if would_block(e) => {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            continue;
+        }
+        if holed {
+            let _ = from.shutdown(std::net::Shutdown::Both);
+            let _ = to.shutdown(std::net::Shutdown::Both);
+            break;
+        }
         if cut.load(Ordering::Relaxed) {
             let _ = from.shutdown(std::net::Shutdown::Both);
             let _ = to.shutdown(std::net::Shutdown::Both);
@@ -388,6 +459,12 @@ fn relay(
         match from.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                // Likewise for a black hole: what arrived after it began
+                // goes nowhere.
+                if hole.load(Ordering::Relaxed) {
+                    holed = true;
+                    continue;
+                }
                 // A read that was already blocking when the cut came
                 // returns what arrived after it: drop it, or a request
                 // the node made after `cut()` returned could still reach

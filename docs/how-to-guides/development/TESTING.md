@@ -1015,6 +1015,40 @@ relay of its own so requests can be attributed per role):
   - `cto-second-node-joins`: a lone strict node keeps a kernel cache
     (TTL half the lease margin); a second node mounts and writes, and the
     first node's very next open must see it (the latch).
+  - `cto-strict-root` (EC2 finding R2-4, campaign 4's A-0): nodes mount
+    a fresh filesystem at the same moment — two (strict, then bounded),
+    four and three (strict) — and two in order (strict); every node's
+    root must be owned by the mounting user and writable. Before the fix the concurrent strict round left the root
+    `root:root 0755` for good (`adopt_root` was one `Policy::System`
+    attempt, and the strict kernel-cache drain kept the new holder's
+    gate shut for that attempt).
+- **EC2 real-S3 findings** (`crates/harness/src/scenarios/ec2.rs`):
+  - `s3-cut-one-node`: three nodes; a non-holder's S3 is black-holed
+    (`CountingProxy::blackhole`: accepted, never answered — a firewall
+    `DROP`, not a refusal) with the product's S3 retry budget
+    (`Client::without_env`). Under `--write-mode back` and `through`, a
+    create + write + close with and without `fsync` must complete during
+    the cut (the drain hands its chunks to a peer, which uploads them:
+    `status.writeback.handoffs_*`), be visible on the other nodes, and an
+    `ls -la` of a 300-file directory (every write shard), an `ls -la` of
+    the closing file's own directory and a root `stat` on the cut node
+    must answer while a close is in flight. A `back` close's chunks
+    (forwarded as pending, awaited at the sequencer) are handed off too.
+    Then the cut node's S3 is *refused* for 25 s (its rounds fail fast):
+    it must propose no continuation epoch (`status.epoch.proposals`; a
+    live member's `Pong` says it reaches S3) and every close completes.
+  - `p2p-partition-one-node`: four nodes, placement off, all writing to
+    one directory; one loses P2P to the rest (`CONSTELLATION_FAULT_P2P_
+    DENY_FILE` both ways, S3 everywhere) for 40 s. The lease must not
+    change hands (the isolated node's inbox escalation used to take it,
+    or bounce it around the majority), majority writes stay under 12 s,
+    the isolated node's writes complete through the inbox; then the
+    holder itself is isolated and the others' writes must also stay
+    under 12 s. Prints `inbox.leases_kept_for_p2p_side`.
+  - `idle-cost`: four converged nodes idle for 120 s on the product's
+    default intervals; S3 requests per node per minute by kind and key
+    area, on each node's relay and in `status.s3` (they agree). Budget
+    60/min per node (measured ~40).
 - **Plan 30 M9 scenarios** (each prints the nodes' `status.ack` block:
   the lease's acknowledgement policy, backups and candidate, the durable
   journal seq, parked acknowledgements, whether the fast path is gated;

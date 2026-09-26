@@ -1,0 +1,768 @@
+//! Reproductions of the EC2 real-S3 findings (the M14 brutal test).
+//!
+//! - `s3-cut-one-node`: three nodes; one non-holder loses S3 the way a
+//!   firewall `DROP` takes it (a black hole: nothing refused, nothing
+//!   answered) while its P2P path to the holder stays up. Its FUSE
+//!   operations must only wait for what genuinely needs its own S3: a
+//!   create + write + close (with and without `fsync`) under
+//!   `--write-mode back` and `through` completes while the cut lasts
+//!   (the holder takes the chunks over P2P and uploads them itself), the
+//!   file is visible on the other nodes, and an unrelated `ls -la`, an
+//!   `ls -la` of the closing file's own directory and a root `stat` on
+//!   the cut node answer at once even while a close is in flight. The cut node runs with the product's S3 retry budget, not
+//!   the harness's short one.
+//! - `p2p-partition-one-node`: four writing nodes, one loses P2P to the
+//!   other three (S3 everywhere). Its inbox demand must not move the
+//!   lease off the majority (no change of hands at all), the majority's
+//!   writes keep forwarding, the isolated node's go through the inbox;
+//!   then the holder itself is isolated and the others' writes stall
+//!   only for the detection. Everything converges.
+//! - `idle-cost`: four idle nodes on the product's default intervals;
+//!   S3 requests per node per minute on the wire and in `status.s3`.
+//!
+//! (`cto-strict-root`, finding R2-4, lives with the other `--cto`
+//! scenarios in `m8.rs`.)
+
+use super::{eventually, lease_of, setup, ts, wait_for_p2p};
+use crate::client::Client;
+use crate::reqlog::CountingProxy;
+use crate::s3env::BUCKET;
+use anyhow::Result;
+use std::io::Write;
+use std::time::{Duration, Instant};
+
+fn node(
+    root: &std::path::Path,
+    name: &str,
+    proxy: &CountingProxy,
+    backend: &str,
+) -> Result<Client> {
+    Ok(Client::new(root, name, &proxy.endpoint(), backend)?
+        .with_own_node_key()
+        // The product's S3 retry budget (10 retries within 30 s),
+        // not the harness's short one (the EC2 nodes ran with 180 s).
+        .without_env("CONSTELLATION_S3_MAX_RETRIES")
+        .without_env("CONSTELLATION_S3_RETRY_TIMEOUT_MS"))
+}
+
+/// Run `f` on a thread; `Some(result, elapsed)` if it finished within
+/// `within`, `None` (still running; joined later by the caller through
+/// the returned handle) otherwise.
+fn timed<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (std::thread::JoinHandle<(T, Duration)>, Instant) {
+    let started = Instant::now();
+    (
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let r = f();
+            (r, t.elapsed())
+        }),
+        started,
+    )
+}
+
+fn wait_done<T>(h: &std::thread::JoinHandle<T>, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if h.is_finished() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.is_finished()
+}
+
+fn write_file(path: std::path::PathBuf, content: Vec<u8>, fsync: bool) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(&content)?;
+    if fsync {
+        f.sync_all()?;
+    }
+    drop(f);
+    Ok(())
+}
+
+/// `ls -la dir`: readdir plus a stat of every entry.
+fn ls_la(dir: &std::path::Path) -> std::io::Result<usize> {
+    let mut n = 0;
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        std::fs::symlink_metadata(e.path())?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+pub fn s3_cut_one_node(_seed: u64) -> Result<()> {
+    const NAME: &str = "s3-cut-one-node";
+    /// How long each FUSE op on the cut node may take while the cut lasts.
+    /// (The fix: ~6 s to find the node's S3 path stalled, then one
+    /// peer upload; the bug: the whole outage.)
+    const OP_BUDGET: Duration = Duration::from_secs(20);
+    /// An unrelated metadata read on the cut node.
+    const READ_BUDGET: Duration = Duration::from_secs(5);
+    let (env, root) = setup(NAME)?;
+    env.s3_proxy()?;
+    let (pa, pb, pc) = (
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+    );
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let mut a = node(root.path(), "a", &pa, &backend)?;
+    let mut b = node(root.path(), "b", &pb, &backend)?;
+    let mut c = node(root.path(), "c", &pc, &backend)?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    c.mount()?;
+    let mut failures: Vec<String> = Vec::new();
+    let result = (|| -> Result<()> {
+        wait_for_p2p(&[&a, &b, &c])?;
+        // 300 files in one directory: their inode numbers cover every
+        // write shard (ino mod 256), so an `ls -la` of it stats a file
+        // in the shard of whatever the cut node is closing.
+        std::fs::create_dir(a.mnt.join("d"))?;
+        for i in 0..300 {
+            std::fs::write(a.mnt.join(format!("d/f{i:03}")), format!("f{i}"))?;
+        }
+        eventually("A holds the lease", Duration::from_secs(20), || {
+            anyhow::ensure!(lease_of(&a)?["held"] == true, "{}", lease_of(&a)?);
+            Ok(())
+        })?;
+        eventually("d/ complete on C", Duration::from_secs(30), || {
+            anyhow::ensure!(ls_la(&c.mnt.join("d"))? == 300, "not yet");
+            Ok(())
+        })?;
+        anyhow::ensure!(std::fs::read(c.mnt.join("d/f000"))? == b"f0");
+
+        for mode in ["back", "through"] {
+            c.set_write_mode(mode)?;
+            eprintln!("    {NAME}: [{mode}] black-holing C's S3");
+            pc.blackhole();
+            let cut = Instant::now();
+            let mut round_fail = |what: String| {
+                eprintln!("    {NAME}: [{mode}] FAIL: {what}");
+                failures.push(format!("[{mode}] {what}"));
+            };
+            // Warm reads: already answered locally.
+            let t = Instant::now();
+            let n = ls_la(&c.mnt.join("d"))?;
+            eprintln!(
+                "    {NAME}: [{mode}] ls -la d/ ({n} entries) took {:?}",
+                t.elapsed()
+            );
+            for (fsync, file) in [(false, "new"), (true, "synced")] {
+                let name = format!("{file}-{mode}");
+                let content = format!("{name}:{}", "x".repeat(5000)).into_bytes();
+                let path = c.mnt.join(&name);
+                let (h, _) = {
+                    let (path, content) = (path.clone(), content.clone());
+                    timed(move || write_file(path, content, fsync))
+                };
+                // While the close is in flight: unrelated reads on C.
+                std::thread::sleep(Duration::from_millis(300));
+                let (ls, _) = {
+                    let d = c.mnt.join("d");
+                    timed(move || ls_la(&d))
+                };
+                let (st, _) = {
+                    let r = c.mnt.clone();
+                    timed(move || std::fs::metadata(&r).map(|_| ()))
+                };
+                // The OVH run's variant: `ls -la` of the directory the
+                // closing file is in (it stats that very file).
+                let (same, _) = {
+                    let r = c.mnt.clone();
+                    timed(move || ls_la(&r))
+                };
+                let ls_ok = wait_done(&ls, READ_BUDGET);
+                let st_ok = wait_done(&st, READ_BUDGET);
+                let same_ok = wait_done(&same, READ_BUDGET);
+                let done = wait_done(&h, OP_BUDGET);
+                let label = if fsync {
+                    "create+write+fsync+close"
+                } else {
+                    "create+write+close"
+                };
+                if done {
+                    let (r, took) = h.join().expect("writer");
+                    eprintln!("    {NAME}: [{mode}] {label} {name}: {r:?} in {took:?}");
+                    if let Err(e) = r {
+                        round_fail(format!("{label} {name} failed while C's S3 was cut: {e}"));
+                    }
+                } else {
+                    round_fail(format!(
+                        "{label} {name} still blocked after {OP_BUDGET:?} of C's S3 cut"
+                    ));
+                    // Joined after the heal below.
+                    std::mem::forget(h);
+                }
+                if !ls_ok {
+                    round_fail(format!(
+                        "ls -la d/ on C blocked > {READ_BUDGET:?} while a close was in flight"
+                    ));
+                } else {
+                    let (r, took) = ls.join().expect("ls");
+                    eprintln!("    {NAME}: [{mode}] concurrent ls -la d/: {r:?} in {took:?}");
+                }
+                if !same_ok {
+                    round_fail(format!(
+                        "ls -la of the closing file's own directory on C blocked > {READ_BUDGET:?}"
+                    ));
+                } else {
+                    let (r, took) = same.join().expect("ls same dir");
+                    eprintln!(
+                        "    {NAME}: [{mode}] concurrent ls -la / (same dir): {r:?} in {took:?}"
+                    );
+                }
+                if !st_ok {
+                    round_fail(format!(
+                        "stat of the root on C blocked > {READ_BUDGET:?} while a close was in flight"
+                    ));
+                } else {
+                    let (r, took) = st.join().expect("stat");
+                    eprintln!("    {NAME}: [{mode}] concurrent stat /: {r:?} in {took:?}");
+                }
+                if done {
+                    for x in [&a, &b] {
+                        let p = x.mnt.join(&name);
+                        let seen = eventually(
+                            &format!("{name} visible on {} during the cut", x.name),
+                            Duration::from_secs(10),
+                            || {
+                                anyhow::ensure!(
+                                    std::fs::read(&p).ok().as_deref() == Some(&content[..]),
+                                    "not yet"
+                                );
+                                Ok(())
+                            },
+                        );
+                        if let Err(e) = seen {
+                            round_fail(format!("{e:#}"));
+                        }
+                    }
+                }
+            }
+            let wb = c.control_status()?["writeback"].clone();
+            eprintln!(
+                "    {NAME}: [{mode}] C during the cut ({:?}): writeback {wb}",
+                cut.elapsed()
+            );
+            pc.heal();
+            eprintln!("    {NAME}: [{mode}] healed after {:?}", cut.elapsed());
+            eventually(
+                "C's pending uploads drain after the heal",
+                Duration::from_secs(120),
+                || {
+                    let p = c.control_status()?["writeback"]["pending_uploads"].as_u64();
+                    anyhow::ensure!(p == Some(0), "pending {p:?}");
+                    Ok(())
+                },
+            )?;
+            for x in [&a, &b, &c] {
+                for file in ["new", "synced"] {
+                    let name = format!("{file}-{mode}");
+                    let want = format!("{name}:{}", "x".repeat(5000)).into_bytes();
+                    eventually(
+                        &format!("{name} converged on {}", x.name),
+                        Duration::from_secs(120),
+                        || {
+                            anyhow::ensure!(
+                                std::fs::read(x.mnt.join(&name)).ok().as_deref() == Some(&want[..]),
+                                "not yet"
+                            );
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
+        }
+
+        // EC2 follow-up 3c: a *refused* S3 path (fails fast, so C's
+        // rounds fail and it would propose a continuation epoch) for 25 s
+        // under `back`: C proposes no epoch (a live member reaches S3),
+        // and every close completes and is visible elsewhere meanwhile.
+        c.set_write_mode("back")?;
+        let proposals_before = c.control_status()?["epoch"]["proposals"]
+            .as_u64()
+            .unwrap_or(0);
+        eprintln!("    {NAME}: [refused] cutting C's S3 (refused, not black-holed) for 25 s");
+        pc.cut();
+        let cut = Instant::now();
+        let mut i = 0;
+        let mut own_outage = false;
+        while cut.elapsed() < Duration::from_secs(25) {
+            let name = format!("refused-{i}");
+            let content = format!("{name}:{}", "y".repeat(3000)).into_bytes();
+            let (h, _) = {
+                let (path, content) = (c.mnt.join(&name), content.clone());
+                timed(move || write_file(path, content, false))
+            };
+            if !wait_done(&h, OP_BUDGET) {
+                failures.push(format!(
+                    "[refused] close of {name} still blocked after {OP_BUDGET:?}"
+                ));
+                std::mem::forget(h);
+                break;
+            }
+            let (r, took) = h.join().expect("writer");
+            eprintln!("    {NAME}: [refused] close {name}: {r:?} in {took:?}");
+            if let Err(e) = r {
+                failures.push(format!("[refused] close of {name} failed: {e}"));
+            }
+            let e = c.control_status()?["epoch"].clone();
+            own_outage |= e["own_s3_outage"] == true;
+            if e["active"] == true {
+                failures.push(format!("[refused] C is in a continuation epoch: {e}"));
+                break;
+            }
+            i += 1;
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        let e = c.control_status()?["epoch"].clone();
+        let proposals = e["proposals"].as_u64().unwrap_or(0) - proposals_before;
+        eprintln!("    {NAME}: [refused] C's epoch during the cut: {e} (proposals {proposals}, own outage seen {own_outage})");
+        if proposals > 0 {
+            failures.push(format!(
+                "[refused] C proposed {proposals} continuation epoch(s) while its peers reached S3"
+            ));
+        }
+        pc.heal();
+        for x in [&a, &b] {
+            for j in 0..i {
+                let name = format!("refused-{j}");
+                let want = format!("{name}:{}", "y".repeat(3000)).into_bytes();
+                eventually(
+                    &format!("{name} on {}", x.name),
+                    Duration::from_secs(120),
+                    || {
+                        anyhow::ensure!(
+                            std::fs::read(x.mnt.join(&name)).ok().as_deref() == Some(&want[..]),
+                            "not yet"
+                        );
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    pc.heal();
+    let _ = c.unmount();
+    let _ = b.unmount();
+    let _ = a.unmount();
+    result?;
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+fn node_id(c: &Client) -> Result<u64> {
+    c.control_status()?["node_id"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("{} reports no node id", c.name))
+}
+
+/// The P2P deny file of a client (`fault::p2p_denied`).
+fn deny_path(c: &Client) -> std::path::PathBuf {
+    c.state_dir().join("p2p-deny")
+}
+
+/// A writer thread: `name-<n>` files under `dir` every `every`, until
+/// `stop`; returns every (started-at, latency, result) it saw.
+type WriteLog = Vec<(Instant, Duration, std::result::Result<String, String>)>;
+
+fn writer(
+    dir: std::path::PathBuf,
+    name: &'static str,
+    every: Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<WriteLog> {
+    std::thread::spawn(move || {
+        let mut log = Vec::new();
+        let mut n = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let file = format!("{name}-{n:05}");
+            let t = Instant::now();
+            let r = std::fs::write(dir.join(&file), file.as_bytes())
+                .map(|_| file.clone())
+                .map_err(|e| format!("{file}: {e}"));
+            log.push((t, t.elapsed(), r));
+            n += 1;
+            std::thread::sleep(every);
+        }
+        log
+    })
+}
+
+/// EC2 finding 2: one node loses P2P to the other three (S3 reachable
+/// everywhere) while all four write. The isolated node's writes go
+/// through the S3 inbox (plan 30 §M13) and, sustained, escalate to
+/// asking for the lease — which must not move the lease off the side of
+/// the partition that is using it over P2P: the majority's writes keep
+/// forwarding at LAN latency the whole time, the isolated node's still
+/// complete (through the inbox), and everything converges after the
+/// heal.
+pub fn p2p_partition_one_node(_seed: u64) -> Result<()> {
+    const NAME: &str = "p2p-partition-one-node";
+    const PARTITION: Duration = Duration::from_secs(40);
+    /// A majority write may take this long during the partition (the
+    /// detection of the dead link on the first forward included).
+    const MAJORITY_BUDGET: Duration = Duration::from_secs(12);
+    let (env, root) = setup(NAME)?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let mut clients = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        let c = Client::new(root.path(), name, &env.direct_endpoint, &backend)?
+            .with_own_node_key()
+            // The EC2 run's shape: one sequencer, no subtree delegated (a
+            // live delegation pins the root lease on its own).
+            .with_env("CONSTELLATION_DELEGATION_PLACEMENT", "off");
+        let deny = deny_path(&c).display().to_string();
+        clients.push(c.with_env("CONSTELLATION_FAULT_P2P_DENY_FILE", &deny));
+    }
+    clients[0].fs_create()?;
+    for c in clients.iter_mut() {
+        c.mount()?;
+    }
+    let result = (|| -> Result<()> {
+        let refs: Vec<&Client> = clients.iter().collect();
+        wait_for_p2p(&refs)?;
+        let (a, b, c, d) = (&clients[0], &clients[1], &clients[2], &clients[3]);
+        // Everyone writes into one shared directory.
+        std::fs::create_dir(a.mnt.join("w"))?;
+        eventually("A holds the lease", Duration::from_secs(20), || {
+            anyhow::ensure!(lease_of(a)?["held"] == true, "{}", lease_of(a)?);
+            Ok(())
+        })?;
+        for x in [b, c, d] {
+            eventually("dirs everywhere", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("w").is_dir(), "not on {}", x.name);
+                Ok(())
+            })?;
+        }
+        let ids: Vec<u64> = [a, b, c, d]
+            .iter()
+            .map(|x| node_id(x))
+            .collect::<Result<_>>()?;
+        let d_id = ids[3];
+        eprintln!("    {NAME}: node ids a/b/c/d = {ids:?}");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let every = Duration::from_millis(100);
+        let wb = writer(b.mnt.join("w"), "b", every, stop.clone());
+        let wc = writer(c.mnt.join("w"), "c", every, stop.clone());
+        let wd = writer(d.mnt.join("w"), "d", every, stop.clone());
+        std::thread::sleep(Duration::from_secs(5));
+        // Cut d off from a, b and c, both ways.
+        std::fs::write(
+            deny_path(d),
+            format!("{}\n{}\n{}\n", ids[0], ids[1], ids[2]),
+        )?;
+        for x in [a, b, c] {
+            std::fs::write(deny_path(x), format!("{d_id}\n"))?;
+        }
+        let cut = Instant::now();
+        eprintln!("    {NAME}: d partitioned from a, b, c (P2P only; S3 everywhere)");
+        let mut holders = Vec::new();
+        while cut.elapsed() < PARTITION {
+            let l = lease_of(a)?;
+            let holder = l["holder"].as_u64().unwrap_or(0);
+            if holders.last().map(|(_, h)| *h) != Some(holder) {
+                eprintln!("    {NAME}: +{:?} holder {holder} ({l})", cut.elapsed());
+                holders.push((cut.elapsed(), holder));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        for x in [a, b, c, d] {
+            let _ = std::fs::remove_file(deny_path(x));
+        }
+        let healed = Instant::now();
+        eprintln!("    {NAME}: healed after {:?}", cut.elapsed());
+        std::thread::sleep(Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let logs = [
+            ("b", wb.join().expect("b")),
+            ("c", wc.join().expect("c")),
+            ("d", wd.join().expect("d")),
+        ];
+        let mut failures = Vec::new();
+        let cut_at = healed - cut.elapsed();
+        for (who, log) in &logs {
+            let during: Vec<Duration> = log
+                .iter()
+                .filter(|(t, lat, _)| *t + *lat >= cut_at && *t <= healed)
+                .map(|(_, lat, _)| *lat)
+                .collect();
+            let errors: Vec<&String> = log
+                .iter()
+                .filter_map(|(_, _, r)| r.as_ref().err())
+                .collect();
+            eprintln!(
+                "    {NAME}: {who}: {} writes, {} during the partition: {}; errors {}",
+                log.len(),
+                during.len(),
+                super::m8::dist(during.clone()),
+                errors.len()
+            );
+            for e in errors.iter().take(3) {
+                eprintln!("    {NAME}: {who}:   {e}");
+            }
+            if !errors.is_empty() {
+                failures.push(format!("{who}: {} writes failed", errors.len()));
+            }
+            let max = during.iter().max().copied().unwrap_or_default();
+            if *who != "d" && max > MAJORITY_BUDGET {
+                failures.push(format!(
+                    "{who} (majority side) had a write take {max:?} during the partition"
+                ));
+            }
+        }
+        if holders.iter().any(|(_, h)| *h == d_id) {
+            failures.push(format!(
+                "the lease moved to the isolated node {d_id} during the partition: {holders:?}"
+            ));
+        }
+        // Nor may the isolated node's demand bounce it around the
+        // majority (each move a release, a CAS and a new epoch's gate).
+        if holders.len() > 1 {
+            failures.push(format!(
+                "the lease changed hands {} time(s) during the partition: {holders:?}",
+                holders.len() - 1
+            ));
+        }
+        let kept: u64 = [a, b, c]
+            .iter()
+            .map(|x| {
+                x.control_status()
+                    .ok()
+                    .and_then(|s| s["inbox"]["leases_kept_for_p2p_side"].as_u64())
+                    .unwrap_or(0)
+            })
+            .sum();
+        eprintln!("    {NAME}: rounds the majority's holder kept the lease from the isolated wanter: {kept}");
+        // Everything acknowledged is everywhere.
+        for (who, log) in &logs {
+            let files: Vec<&String> = log.iter().filter_map(|(_, _, r)| r.as_ref().ok()).collect();
+            for x in [a, b, c, d] {
+                eventually(
+                    &format!("{who}'s {} files on {}", files.len(), x.name),
+                    Duration::from_secs(60),
+                    || {
+                        for f in &files {
+                            let got = std::fs::read(x.mnt.join("w").join(f.as_str()))
+                                .map_err(|e| anyhow::anyhow!("{f}: {e}"))?;
+                            anyhow::ensure!(got == f.as_bytes(), "{f} differs");
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
+
+        // Phase 2: the holder itself is the isolated node (S3 still
+        // reachable). The other side's writes must stall only for the
+        // detection, and the lease must end up on their side.
+        // Whoever holds it now (a node's `lease.holder` is its cached
+        // view; `held` is the holder's own word).
+        // (After the heal the lease may still be moving: wait until one
+        // node has held it for a few seconds running.)
+        let mut hx: Option<&Client> = None;
+        let mut since = Instant::now();
+        eventually(
+            "one node holds the lease steadily",
+            Duration::from_secs(60),
+            || {
+                // A write keeps someone holding (an idle lease is
+                // released once the writers stopped).
+                let _ = std::fs::write(b.mnt.join("w/poke"), b"poke");
+                let now = [a, b, c, d]
+                    .into_iter()
+                    .find(|x| lease_of(x).is_ok_and(|l| l["held"] == true));
+                if now.map(|x| &x.name) != hx.map(|x| &x.name) {
+                    hx = now;
+                    since = Instant::now();
+                }
+                anyhow::ensure!(
+                    hx.is_some() && since.elapsed() >= Duration::from_secs(3),
+                    "not yet"
+                );
+                Ok(())
+            },
+        )?;
+        let hx = hx.expect("found");
+        let holder = node_id(hx)?;
+        let rest: Vec<&Client> = [a, b, c, d]
+            .into_iter()
+            .filter(|x| x.name != hx.name)
+            .collect();
+        let rest_ids: Vec<u64> = rest.iter().map(|x| node_id(x)).collect::<Result<_>>()?;
+        eprintln!(
+            "    {NAME}: phase 2: isolating the holder {} ({holder})",
+            hx.name
+        );
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let names: [&'static str; 3] = ["p", "q", "r"];
+        let ws: Vec<_> = rest
+            .iter()
+            .zip(names)
+            .map(|(x, n)| (n, writer(x.mnt.join("w"), n, every, stop.clone())))
+            .collect();
+        std::thread::sleep(Duration::from_secs(3));
+        std::fs::write(
+            deny_path(hx),
+            rest_ids
+                .iter()
+                .map(|i| format!("{i}\n"))
+                .collect::<String>(),
+        )?;
+        for x in &rest {
+            std::fs::write(deny_path(x), format!("{holder}\n"))?;
+        }
+        let cut = Instant::now();
+        let mut moved = None;
+        while cut.elapsed() < Duration::from_secs(30) {
+            if let Some(x) = rest
+                .iter()
+                .find(|x| lease_of(x).is_ok_and(|l| l["held"] == true))
+            {
+                moved = Some((cut.elapsed(), x.name.clone()));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        let cut_at = Instant::now() - cut.elapsed();
+        for x in [a, b, c, d] {
+            let _ = std::fs::remove_file(deny_path(x));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut failures = Vec::new();
+        eprintln!("    {NAME}: phase 2: the lease moved to {moved:?} after the holder's isolation");
+        // The isolated holder still has S3: it reconfigures its silent
+        // backup out and keeps serving the others through the inbox
+        // (plan 30 §M13) until their sustained demand moves the lease
+        // (no P2P demand keeps it there). Either way the other side's
+        // writes stall only for the detection.
+        if moved.is_none() {
+            failures.push("phase 2: the lease never left the isolated holder".to_string());
+        }
+        for (who, h) in ws {
+            let log = h.join().expect("writer");
+            let during: Vec<Duration> = log
+                .iter()
+                .filter(|(t, lat, _)| *t + *lat >= cut_at)
+                .map(|(_, lat, _)| *lat)
+                .collect();
+            let errors = log.iter().filter(|(_, _, r)| r.is_err()).count();
+            eprintln!(
+                "    {NAME}: phase 2: {who}: {}; errors {errors}",
+                super::m8::dist(during.clone())
+            );
+            let max = during.iter().max().copied().unwrap_or_default();
+            if errors > 0 || max > MAJORITY_BUDGET {
+                failures.push(format!(
+                    "phase 2: {who}: {errors} errors, slowest write {max:?}"
+                ));
+            }
+        }
+        anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
+        Ok(())
+    })();
+    for c in clients.iter_mut().rev() {
+        let _ = std::fs::remove_file(deny_path(c));
+        let _ = c.unmount();
+    }
+    result
+}
+
+/// EC2 finding R2-2: what an idle cluster costs in S3 requests, with the
+/// product's defaults (the harness's 200 ms sync interval off). Four
+/// nodes converge, then sit idle; every node's requests are counted on
+/// its own relay, by kind and key area, and against the daemon's own
+/// `status.s3` counters (which must agree with the wire). Prints
+/// requests per node per idle minute; fails over `IDLE_BUDGET_PER_MIN`.
+pub fn idle_cost(_seed: u64) -> Result<()> {
+    const NAME: &str = "idle-cost";
+    const IDLE: Duration = Duration::from_secs(120);
+    /// Requests per node per idle minute.
+    const IDLE_BUDGET_PER_MIN: f64 = 60.0;
+    let (env, root) = setup(NAME)?;
+    env.s3_proxy()?;
+    let proxies: Vec<CountingProxy> = (0..4)
+        .map(|_| env.counting_proxy())
+        .collect::<Result<_>>()?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let mut clients = Vec::new();
+    for (name, p) in ["a", "b", "c", "d"].into_iter().zip(&proxies) {
+        clients.push(
+            node(root.path(), name, p, &backend)?.without_env("CONSTELLATION_SYNC_INTERVAL_MS"),
+        );
+    }
+    clients[0].fs_create()?;
+    for c in clients.iter_mut() {
+        c.mount()?;
+    }
+    let result =
+        (|| -> Result<()> {
+            let refs: Vec<&Client> = clients.iter().collect();
+            wait_for_p2p(&refs)?;
+            std::fs::write(clients[0].mnt.join("marker"), b"idle")?;
+            for x in &clients[1..] {
+                eventually("marker everywhere", Duration::from_secs(60), || {
+                    anyhow::ensure!(std::fs::read(x.mnt.join("marker"))? == b"idle", "not yet");
+                    Ok(())
+                })?;
+            }
+            // Past the write's own after-effects (the ship, the commit, the
+            // lease's idle release, the backups' reconfigurations).
+            std::thread::sleep(Duration::from_secs(45));
+            let before: Vec<serde_json::Value> = clients
+                .iter()
+                .map(|c| c.control_status().map(|s| s["s3"].clone()))
+                .collect::<Result<_>>()?;
+            for p in &proxies {
+                p.reset();
+            }
+            std::thread::sleep(IDLE);
+            let minutes = IDLE.as_secs_f64() / 60.0;
+            let mut worst = 0.0f64;
+            for ((c, p), b) in clients.iter().zip(&proxies).zip(&before) {
+                p.ensure_sane()?;
+                let reqs = p.requests();
+                let t = crate::reqlog::tally(&reqs);
+                let s = c.control_status()?;
+                let after = &s["s3"];
+                let d = |k: &str| after[k].as_u64().unwrap_or(0) - b[k].as_u64().unwrap_or(0);
+                let per_min = t.total() as f64 / minutes;
+                worst = worst.max(per_min);
+                eprintln!(
+                "    {NAME}: {} ({}): {:.1} requests/min idle: {t}\n        by area: {}\n        \
+                 status.s3 delta: GET {} HEAD {} PUT {} LIST {} DELETE {}; ship rounds {} \
+                 reconcile rounds {}",
+                c.name,
+                if s["lease"]["held"] == true { "holder" } else { "follower" },
+                per_min,
+                crate::reqlog::breakdown(&reqs),
+                d("get"),
+                d("head"),
+                d("put"),
+                d("list"),
+                d("delete"),
+                s["spool"]["ship_rounds_completed"],
+                s["coop"]["reconcile_rounds"],
+            );
+            }
+            anyhow::ensure!(
+            worst <= IDLE_BUDGET_PER_MIN,
+            "an idle node issued {worst:.1} S3 requests per minute (budget {IDLE_BUDGET_PER_MIN})"
+        );
+            Ok(())
+        })();
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}

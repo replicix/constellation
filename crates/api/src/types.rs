@@ -663,6 +663,32 @@ pub struct StatusReport {
     /// every counter zero.
     #[serde(default)]
     pub prune: PruneStatus,
+    /// Object-store requests this daemon has issued since it started
+    /// (every filesystem it serves), by kind and by key area.
+    #[serde(default)]
+    pub s3: S3RequestStatus,
+}
+
+/// Object-store requests by kind (one per call the daemon makes; a
+/// request's own retries inside the S3 client are not counted again),
+/// and by `<KIND> <area>`, the area being the key's first segment under
+/// the filesystem prefix (`log`, `leases`, `nodes`, `chunks`, …).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct S3RequestStatus {
+    #[serde(default)]
+    pub get: u64,
+    #[serde(default)]
+    pub head: u64,
+    #[serde(default)]
+    pub put: u64,
+    #[serde(default)]
+    pub list: u64,
+    #[serde(default)]
+    pub delete: u64,
+    #[serde(default)]
+    pub copy: u64,
+    #[serde(default)]
+    pub by_area: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -812,6 +838,18 @@ pub struct WritebackStatus {
     /// The oldest of them, in seconds (0: none).
     #[serde(default)]
     pub remote_chunks_oldest_s: u64,
+    /// EC2 finding 1: drains that handed their chunks to a peer because
+    /// this node's own uploads made no progress (this node's S3 path
+    /// was down), how many succeeded, and the chunks they covered.
+    #[serde(default)]
+    pub handoffs_sent: u64,
+    #[serde(default)]
+    pub handoffs_ok: u64,
+    #[serde(default)]
+    pub handoff_chunks: u64,
+    /// Chunks this node fetched from a peer and uploaded for it.
+    #[serde(default)]
+    pub handoff_chunks_accepted: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -928,6 +966,13 @@ pub struct EpochStatus {
     /// 0: none).
     #[serde(default)]
     pub promise_until_ms: i64,
+    /// EC2 follow-up 3c: this node's S3 is failing while a live member's
+    /// works — its own outage, not the bucket's: it proposes no epoch.
+    #[serde(default)]
+    pub own_s3_outage: bool,
+    /// Proposals this node made (sent to its members).
+    #[serde(default)]
+    pub proposals: u64,
     /// Plan 30 §M10 counters (the core's): promises persisted and PUT;
     /// promise requests answered and refused; TTL-takeover promise checks
     /// run, takeovers refused for too few promises, flush re-claims
@@ -1102,6 +1147,11 @@ pub struct InboxStatus {
     pub escalations: u64,
     #[serde(default)]
     pub lease_requests: u64,
+    /// EC2 finding 2: rounds in which this node, holding the lease,
+    /// kept it from wanters across a P2P partition from the nodes using
+    /// it.
+    #[serde(default)]
+    pub leases_kept_for_p2p_side: u64,
     #[serde(default)]
     pub inbox_ops: u64,
     #[serde(default)]

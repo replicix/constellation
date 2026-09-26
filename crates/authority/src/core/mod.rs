@@ -542,6 +542,9 @@ pub struct Stats {
     /// M13: batches a requester deleted itself before forwarding the op
     /// over P2P instead (the holder became reachable again).
     pub inbox_withdrawn_ops: u64,
+    /// EC2 follow-up: ops waiting in the inbox forwarded over P2P once
+    /// the holder became reachable (it polls only unconnected requesters).
+    pub inbox_rerouted_to_p2p: u64,
     /// M5 round 4: forwards that first had to withdraw *more than one*
     /// durable batch of the same rid (the op was submitted to the inbox
     /// more than once under one epoch).
@@ -564,6 +567,10 @@ pub struct Stats {
     pub inbox_largest_batch_ops: u64,
     pub inbox_escalations: u64,
     pub inbox_lease_requests: u64,
+    /// EC2 finding 2: rounds in which this holder kept the lease its
+    /// wanters asked for because they are across a P2P partition from
+    /// the nodes using it.
+    pub leases_kept_for_p2p_side: u64,
     // ---- M8: cto=strict ----
     /// Holder: ReadIndex requests answered with a position, and refused
     /// (not the holder, or fenced).
@@ -1042,6 +1049,12 @@ pub struct Core {
     last_recovery: Option<String>,
     roster: Vec<NodeId>,
     links: BTreeMap<NodeId, PeerLink>,
+    /// EC2 finding 2: as the holder, when each other node last had a
+    /// mutation executed here over P2P (a forward), and when each last
+    /// had one executed through the S3 inbox — which side of a P2P
+    /// partition uses the lease (`Core::keeps_lease_for_p2p_side`).
+    demand_p2p: BTreeMap<NodeId, Ms>,
+    demand_inbox: BTreeMap<NodeId, Ms>,
     pub(crate) inbox: inbox::InboxState,
     stream: stream::StreamState,
     /// M8: ReadIndex requests, grants being recalled, parked acks.
@@ -1102,6 +1115,8 @@ impl Core {
             last_recovery: None,
             roster: Vec::new(),
             links: BTreeMap::new(),
+            demand_p2p: BTreeMap::new(),
+            demand_inbox: BTreeMap::new(),
             inbox: inbox::InboxState::default(),
             stream: stream::StreamState::default(),
             rd: readindex::ReadState::default(),

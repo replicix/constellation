@@ -734,6 +734,24 @@ impl Peers {
         )
     }
 
+    /// [`Self::ping_node`] with the answer's S3 word: `None` when the
+    /// node did not answer, `Some(s3_ok)` when it did.
+    pub async fn ping_node_s3(&self, node_id: u64) -> Option<bool> {
+        let inner = self.inner.as_ref()?;
+        match self
+            .request_to_node(
+                node_id,
+                &Payload::Ping {
+                    node_id: inner.node_id,
+                },
+            )
+            .await
+        {
+            Ok(Payload::Pong { s3_ok, .. }) => Some(s3_ok),
+            _ => None,
+        }
+    }
+
     pub async fn announce_epoch_activate(&self, activation: &crate::EpochActivation) {
         let Some(inner) = self.inner.as_ref() else {
             return;
@@ -1303,6 +1321,7 @@ async fn handle_stream<S: PeerService>(
         }
         Payload::Ping { .. } => Some(Payload::Pong {
             node_id: service.node_id(),
+            s3_ok: service.s3_ok(),
         }),
         Payload::EpochPropose {
             epoch_id,
@@ -1365,6 +1384,34 @@ async fn handle_stream<S: PeerService>(
                 .await,
         ),
         Payload::ReconcileRequest { queries } => Some(service.reconcile_requested(queries).await),
+        Payload::ChunkHandoff {
+            requester,
+            req_id,
+            hashes,
+        } => {
+            // Fetch from the peer that actually asked, never from a node
+            // it names on someone else's behalf.
+            let sender = inner
+                .peers
+                .lock()
+                .unwrap()
+                .values()
+                .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
+                .map(|p| p.node_id);
+            if sender == Some(requester) {
+                Some(
+                    service
+                        .chunk_handoff_requested(requester, req_id, hashes)
+                        .await,
+                )
+            } else {
+                tracing::warn!(peer = %hex, requester, "dropping a chunk handoff not sent by its requester");
+                Some(Payload::ChunkHandoffReply {
+                    req_id,
+                    uploaded: false,
+                })
+            }
+        }
         Payload::ChunkRequest { hash } => {
             let served = service.serve_chunk(hash, hex.to_string()).await;
             let status = match &served {
@@ -1407,6 +1454,7 @@ async fn handle_stream<S: PeerService>(
         | Payload::LockRecalled { .. }
         | Payload::LockRenewed { .. }
         | Payload::LockTestReply { .. }
+        | Payload::ChunkHandoffReply { .. }
         | Payload::Ok { .. } => None,
     };
     let served_us = t0.elapsed().as_micros() as u64;

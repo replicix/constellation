@@ -163,6 +163,9 @@ pub(crate) struct Reconfig {
 #[derive(Debug, Default)]
 pub(crate) struct AckState {
     pub peers: BTreeMap<NodeId, BackupPeer>,
+    /// Candidates that answered `sealed` for the epoch held: never asked
+    /// again for it (EC2 follow-up (e)).
+    pub(crate) refused_epoch: BTreeMap<NodeId, Epoch>,
     /// A peer streamed to before it is added to the lease.
     pub candidate: Option<NodeId>,
     pub(crate) reconfig: Option<Reconfig>,
@@ -255,6 +258,13 @@ pub(crate) struct BackupState {
     /// `ack=s3` fast takeover: since when the known holder has been
     /// silent on P2P.
     holder_silent_since: Option<Ms>,
+    /// EC2 follow-up 3b: this node restarted holding a backup role and
+    /// has not yet had a P2P link to its holder since: its downtime (and
+    /// the redial) is not the holder's silence.
+    restarted: bool,
+    /// The lease read in flight is a restarted backup's probe (not
+    /// sealed first): it seals and takes over only an expired lease.
+    restart_probe: bool,
 }
 
 /// How many early `StreamAhead` batches a subscriber keeps.
@@ -321,6 +331,7 @@ impl Core {
             self.bk.role = Some(role);
             self.bk.acked = replica.backup_acked(role.epoch);
             self.bk.last_heard = now;
+            self.bk.restarted = true;
             self.lease.cached_holder = Some(role.holder);
             self.arm_backup_watch(now, out);
         }
@@ -637,6 +648,24 @@ impl Core {
             return;
         }
         let holding = self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.epoch_held();
+        if !holding
+            && self.lease.holds_unexpired(now, &self.cfg)
+            && self.lease.ack_policy() != AckPolicy::S3
+            && self.cfg.p2p
+            && !self.ack.peers.is_empty()
+        {
+            // EC2 follow-up 3a: the lease is held but inside its expiry
+            // margin — a renewal still in flight on a slow S3. Nothing new
+            // is admitted, but the backups keep hearing from this holder
+            // (heartbeats never wait on S3): a silent holder is sealed by
+            // its backup after `backup_takeover_ms`, and a live one sealed
+            // that way fails its forwarded writes until it reconfigures.
+            // Past the lease's own expiry this stops, as before.
+            self.backup_stream(now, replica, out);
+            self.report_durable(replica);
+            self.complete_ready(now, replica, out);
+            return;
+        }
         if !holding {
             if !self.ack.peers.is_empty() || self.ack.candidate.is_some() {
                 self.ack.peers.clear();
@@ -744,7 +773,16 @@ impl Core {
     }
 
     fn backup_select(&mut self, now: Ms, _replica: &dyn Replica, _out: &mut Vec<Action>) {
-        let candidates = self.backup_candidates(now);
+        // EC2 follow-up (e): a node that sealed the epoch held can never
+        // back it: neither a candidate nor a reason to hold
+        // acknowledgements back waiting for one.
+        let epoch = self.lease.epoch();
+        self.ack.refused_epoch.retain(|_, e| Some(*e) == epoch);
+        let candidates: Vec<NodeId> = self
+            .backup_candidates(now)
+            .into_iter()
+            .filter(|n| !self.ack.refused_epoch.contains_key(n))
+            .collect();
         self.ack.eligible = Some(!candidates.is_empty());
         if self.ack.candidate.is_some()
             || self.ack.reconfig.is_some()
@@ -1201,7 +1239,13 @@ impl Core {
             if self.ack.candidate == Some(from) {
                 self.ack.candidate = None;
                 self.ack.peers.remove(&from);
+                // EC2 follow-up (e): a candidate that sealed this epoch (a
+                // seal persisted from an earlier tenure of it) refuses it
+                // for good. Not asked again this tenure: before, the next
+                // housekeeping tick (~100 ms) brought it up again, forever.
+                self.ack.refused_epoch.insert(from, epoch);
             } else {
+                self.ack.refused_epoch.insert(from, epoch);
                 self.drop_backup(now, from, "sealed");
             }
             return;
@@ -1502,6 +1546,7 @@ impl Core {
             }
         }
         self.bk.last_heard = now;
+        self.bk.restarted = false;
         self.lease.cached_holder = Some(holder);
         self.bk.holder_silent_since = None;
         // What is acknowledged is held *contiguously* (or is in the log:
@@ -1619,6 +1664,22 @@ impl Core {
             // seals; `backup_watch_after_epoch` resumes the watch.)
             return;
         }
+        // EC2 follow-up 3b: a restarted backup has heard nothing because
+        // it was down, and redials its holder only now. Silence counts
+        // from the moment a link to the holder is up; until then the
+        // holder's own word is its lease: read it (not sealed first), and
+        // seal and take over only if it expired.
+        if self.bk.restarted && self.bk.sealed < role.epoch {
+            if self.links.get(&role.holder).is_some_and(|l| l.connected) {
+                self.bk.restarted = false;
+                self.bk.last_heard = self.bk.last_heard.max(now);
+            } else {
+                let op = self.issue_s3(S3Op::LeaseGet, S3For::TakeoverGet, out);
+                self.bk.takeover_get = Some(op);
+                self.bk.restart_probe = true;
+                return;
+            }
+        }
         let silent = now.since(self.bk.last_heard);
         if silent < self.cfg.backup_takeover_ms as i64 {
             let id = self.set_timer(
@@ -1658,6 +1719,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.bk.takeover_get = None;
+        let probe = std::mem::take(&mut self.bk.restart_probe);
         let S3Result::LeaseGet(Ok(object)) = result else {
             self.arm_backup_watch(now, out);
             return;
@@ -1672,6 +1734,30 @@ impl Core {
                     && !lease.released
                     && lease.backups.contains(&self.cfg.node_id) =>
             {
+                if probe {
+                    // A restarted backup's probe (3b): the holder is
+                    // renewing — alive; wait for its link. An expired
+                    // lease is a holder gone: seal and take over now.
+                    if !lease.is_expired(now.0) {
+                        self.lease.note_object(now, &lease);
+                        self.arm_backup_watch(now, out);
+                        return;
+                    }
+                    if self.bk.sealed < role.epoch {
+                        if !replica.backup_seal(role.epoch) {
+                            self.arm_backup_watch(now, out);
+                            return;
+                        }
+                        self.bk.sealed = role.epoch;
+                        self.stats.seals += 1;
+                        tracing::warn!(
+                            node = self.cfg.node_id,
+                            holder = role.holder,
+                            epoch = role.epoch,
+                            "restarted backup: the holder's lease expired; sealed its epoch to take over"
+                        );
+                    }
+                }
                 self.lease.note_object(now, &lease);
                 self.lease.takeover_permit = Some((role.epoch, role.holder));
                 self.permit_interrupts_handoff_wait(out);

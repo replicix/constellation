@@ -112,10 +112,13 @@ impl Filesystem for FuseFs {
                 // caches a stale one. The ino is only known after the
                 // lookup, so re-read the row under the shard lock.
                 let writes = self.writes.lock(attr.ino);
-                if let Some(ws) = writes.get(&attr.ino) {
-                    attr.size = ws.file_len;
-                } else if let Ok(Some(fresh)) = self.meta.getattr(attr.ino) {
-                    attr = fresh;
+                if !writes.contains_key(&attr.ino) {
+                    if let Ok(Some(fresh)) = self.meta.getattr(attr.ino) {
+                        attr = fresh;
+                    }
+                }
+                if let Some(len) = self.writes.pending_len(&writes, attr.ino) {
+                    attr.size = len;
                 }
                 drop(writes);
                 reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0))
@@ -164,9 +167,10 @@ impl Filesystem for FuseFs {
             });
         match attr {
             Ok(Some(mut attr)) => {
-                // Pending writes shadow the committed size.
-                if let Some(ws) = writes.get(&ino) {
-                    attr.size = ws.file_len;
+                // Pending writes shadow the committed size (a session
+                // detached by an in-flight flush or read included).
+                if let Some(len) = self.writes.pending_len(&writes, ino) {
+                    attr.size = len;
                 }
                 drop(writes);
                 let attr = if requested_ino == constellation_fs_core::types::ROOT_INO {
@@ -1425,11 +1429,27 @@ fn reply_xattr(value: Vec<u8>, size: u32, reply: ReplyXattr) {
 impl ConstellationFs {
     fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, i32> {
         // Serve pending (unflushed) state when present so read-after-write
-        // within an open handle is coherent. Held for the whole read: the
-        // FUSE dispatch already serializes ops per-request, and a chunk
-        // read is bounded (a few MiB), same cost as the old full-clone.
-        let mut writes = self.writes.lock(ino);
-        let ws = writes.get_mut(&ino);
+        // within an open handle is coherent. The inode's operation lock
+        // orders the read against writes and flushes of the same file for
+        // its whole duration; the session is detached from its shard so
+        // a chunk fetch (which may wait on S3) holds no shard lock
+        // (EC2 finding 1).
+        let _op = self.inode_ops.lock(ino);
+        let ws = self.writes.detach(ino);
+        let result = self.do_read_detached(ino, ws.as_ref(), offset, size);
+        if let Some(ws) = ws {
+            self.writes.reattach(ino, ws);
+        }
+        result
+    }
+
+    fn do_read_detached(
+        &self,
+        ino: Ino,
+        ws: Option<&WriteState>,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, i32> {
         let manifest = self.load_manifest(ino)?;
         let attr = self.meta.getattr(ino).map_err(|e| errno(&e))?;
         let committed_len = attr.as_ref().map(|a| a.size).unwrap_or(manifest.file_len);
@@ -1563,6 +1583,7 @@ impl ConstellationFs {
                 return Err(libc::ENOSPC);
             }
         }
+        let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
         let hashes = self.chunk_list(&manifest)?;
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
@@ -1633,6 +1654,7 @@ impl ConstellationFs {
     }
 
     fn truncate(&self, ino: Ino, new_size: u64) -> Result<(), i32> {
+        let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
         let mut writes = self.writes.lock(ino);
         self.truncate_locked(&mut writes, ino, new_size, &manifest)
@@ -1711,6 +1733,9 @@ impl ConstellationFs {
             return Err(libc::EOPNOTSUPP);
         }
         let end = offset.checked_add(length).ok_or(libc::EFBIG)?;
+        // Held across the truncate and the boundary writes below (the
+        // lock is re-entrant on this thread).
+        let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
         let old_size = self.writes.lock(ino)
             .get(&ino)
@@ -1784,6 +1809,7 @@ impl ConstellationFs {
     }
 
     fn seek_sparse(&self, ino: Ino, offset: u64, whence: i32) -> Result<i64, i32> {
+        let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
         let mut chunks = self.chunk_list(&manifest)?;
         let writes = self.writes.lock(ino);

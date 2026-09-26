@@ -95,6 +95,8 @@ pub(crate) struct InboxState {
     resync: Option<OpId>,
     /// Ops durable in a holder's inbox, waiting on the log.
     pub(crate) pending: BTreeMap<Rid, InboxKey>,
+    /// EC2 finding 2: when `keeps_lease_for_p2p_side` last logged.
+    kept_logged_at: Option<Ms>,
     pub(crate) recheck_timer: Option<TimerId>,
     pub(crate) retry_timer: Option<TimerId>,
     // ---- escalation (round 3b) ----
@@ -262,6 +264,90 @@ impl Core {
             return true;
         }
         now.since(since) < self.cfg.inbox_p2p_grace_ms as i64
+    }
+
+    /// EC2 finding 2: a mutation of `node`'s executed here, over P2P
+    /// (`p2p`) or through the S3 inbox.
+    pub(crate) fn note_demand(&mut self, now: Ms, node: NodeId, p2p: bool) {
+        let map = if p2p {
+            &mut self.demand_p2p
+        } else {
+            &mut self.demand_inbox
+        };
+        map.insert(node, now);
+    }
+
+    /// EC2 finding 2: whether this holder keeps the lease its wanters
+    /// asked for because they are on the far side of a P2P partition from
+    /// the nodes using it.
+    ///
+    /// M13's escalation hands the lease to sustained S3-inbox demand —
+    /// right when nobody has a P2P path (the `lease-handover` shape), but
+    /// in a partition of an otherwise connected cluster it moved the
+    /// lease *to the isolated node*: the EC2 run's holder released to it
+    /// after the wanted grace, and every other node's writes then went
+    /// through the inbox (or waited) until it idle-released 37 s later —
+    /// a 44 s stall on the majority side while S3 and a backup were fine
+    /// everywhere. So: when every wanter is one this holder cannot reach
+    /// over P2P, and nodes it can reach have used it over P2P within the
+    /// escalation window, the lease stays unless the far side is bigger
+    /// (in nodes that used the lease in the window; the holder counts for
+    /// its own side). A holder nobody reaches over P2P (an isolated
+    /// holder) has no P2P demand and still hands over. Availability only:
+    /// who holds the lease is still decided by CAS and TTL alone.
+    pub(crate) fn keeps_lease_for_p2p_side(&mut self, now: Ms) -> bool {
+        if !self.cfg.p2p || self.lease.wanted.is_empty() {
+            return false;
+        }
+        let window = self.cfg.escalate_window_ms.max(self.cfg.wanted_grace_ms) as i64;
+        let wanted = self.lease.wanted.clone();
+        // The same notion of "connected" the inbox's poll schedule uses:
+        // a wanter still linked over P2P is served by a handoff as ever.
+        let connected = |core: &Self, id: &NodeId| core.links.get(id).is_some_and(|l| l.connected);
+        if wanted.iter().any(|w| connected(self, w)) {
+            return false;
+        }
+        let me = self.cfg.node_id;
+        self.demand_p2p.retain(|_, at| now.since(*at) <= window);
+        self.demand_inbox.retain(|_, at| now.since(*at) <= window);
+        let recent: Vec<NodeId> = self.demand_p2p.keys().copied().collect();
+        let mut near = 1usize;
+        for node in recent {
+            if node != me && !wanted.contains(&node) && connected(self, &node) {
+                near += 1;
+            }
+        }
+        if near == 1 {
+            return false;
+        }
+        let mut far: std::collections::BTreeSet<NodeId> = wanted.iter().copied().collect();
+        far.extend(self.demand_inbox.keys().copied().filter(|n| *n != me));
+        let keep = near >= far.len();
+        if keep {
+            self.stats.leases_kept_for_p2p_side += 1;
+        }
+        if keep && self.demand_note_due(now) {
+            tracing::info!(
+                node = me,
+                wanted = ?wanted,
+                near,
+                far = far.len(),
+                "keeping the lease: its wanters are across a P2P partition from the nodes using it"
+            );
+        }
+        keep
+    }
+
+    /// Rate-limits `keeps_lease_for_p2p_side`'s log line.
+    fn demand_note_due(&mut self, now: Ms) -> bool {
+        let due = self
+            .inbox
+            .kept_logged_at
+            .is_none_or(|at| now.since(at) >= 10_000);
+        if due {
+            self.inbox.kept_logged_at = Some(now);
+        }
+        due
     }
 
     /// What a P2P exchange with `holder` just said: anything heard ends
@@ -621,6 +707,40 @@ impl Core {
                     } else {
                         self.inbox_enqueue(now, rid, new_epoch, replica, out);
                     }
+                }
+                Some(l)
+                    if self.cfg.forwarding
+                        && l.holder != self.cfg.node_id
+                        && l.holder != 0
+                        && l.epoch == epoch
+                        && !l.is_claimable(now.0)
+                        && self.links.get(&l.holder).is_some_and(|k| k.connected)
+                        && self.reaches(now, l.holder) =>
+                {
+                    // EC2 follow-up: the op went to the inbox while the
+                    // holder was not (yet) P2P-reachable — a node mounting
+                    // together with others often learns the holder from
+                    // the lease before its link to it is up. The link is
+                    // up now, and a holder polls only the inboxes of
+                    // requesters it is *not* connected to, so the batch
+                    // would sit until the inbox deadline (2×TTL), then the
+                    // op went in doubt (EIO). Forward it by rid instead;
+                    // `send_forward` withdraws the batch first, and a
+                    // holder that executed it already answers from
+                    // `completed` (exactly once either way).
+                    self.inbox.pending.remove(&rid);
+                    self.stats.inbox_rerouted_to_p2p += 1;
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        ?rid,
+                        holder = l.holder,
+                        "inbox: the holder is reachable over P2P now; forwarding the waiting op"
+                    );
+                    if let Some(c) = self.clients.get_mut(&rid) {
+                        c.attempts = 0;
+                        c.redirected = 0;
+                    }
+                    self.send_forward(now, rid, l.holder, out);
                 }
                 Some(l) if l.is_claimable(now.0) => {
                     // The holder is gone; whoever takes over drains the
@@ -1023,6 +1143,7 @@ impl Core {
         // Plan 30 §M8: another node's ops — the lone-node kernel latch.
         self.note_foreign(now, replica, out);
         for batch in &run {
+            self.note_demand(now, batch.node, false);
             if batch.wants_lease {
                 self.lease.note_wanted(now, batch.node);
             }

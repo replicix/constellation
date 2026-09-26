@@ -479,7 +479,8 @@ protocol, message bounds and counters.
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_S3_MAX_RETRIES` | object_store default | count | override `RetryConfig.max_retries` for `s3://` backends |
-| `CONSTELLATION_S3_RETRY_TIMEOUT_MS` | object_store default | milliseconds | override `RetryConfig.retry_timeout` for `s3://` backends |
+| `CONSTELLATION_S3_RETRY_TIMEOUT_MS` | 30000 | milliseconds | override `RetryConfig.retry_timeout` for `s3://` backends (object_store's own default is 180 s) |
+| `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS` | 6000 | milliseconds, 0 disables | a drain (write-through close, a non-holder's forwarded close, `fsync`) waiting while this node's S3 path makes no progress (no upload and no other S3 request completes) for this long hands its chunks to a peer that can reach S3, which uploads them |
 | `CONSTELLATION_CAS_BUSY_RETRIES` | `5` | count | plan 30 M4: how many times a conditional PUT answered `409 Conflict` (another conditional write on the key in flight) is retried as the same attempt, backing off 50 ms doubling to 1 s, before the round reports the store's error. See [write-path hygiene](features/write-path-hygiene.md) |
 
 ### Existence hints

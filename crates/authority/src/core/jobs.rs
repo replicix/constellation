@@ -1186,7 +1186,10 @@ impl Core {
             // keep the journal out of S3 forever; the flush's re-claim
             // CAS is the arbiter, and it fails if an admin leave fenced
             // the lease).
-            if self.epoch.frozen && !self.lease.epoch_held() {
+            // (A frozen epoch that carries no lease has no hold owner:
+            // every member probes, or nobody would ever close it — the
+            // follow-up (d) hang: S3 back, the cluster frozen for good.)
+            if self.epoch.frozen && !self.lease.epoch_held() && self.pr.carried.is_some() {
                 self.finish_round(now, None, replica, out);
                 return;
             }
@@ -1374,6 +1377,21 @@ impl Core {
             self.round_ship(now, 0, replica, out);
             return;
         }
+        // The holder's periodic look at its own stream (`held_tail_
+        // staleness_ms`): nobody else may have appended, so one GET of
+        // the next sequence answers it (EC2 finding R2-2: a full-width
+        // probe cost an idle holder ~100 GET-404s a minute); a hit is
+        // followed by a full-width run like any saturated probe.
+        if self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.epoch_held() {
+            self.set_phase(
+                Phase::Tail {
+                    then: TailThen::Round,
+                },
+                None,
+            );
+            self.issue_tail_width(1, out);
+            return;
+        }
         // M7: the holder's stream has delivered everything it reported;
         // S3 has nothing a round could find sooner.
         if self.stream_covers_tail(now) {
@@ -1507,6 +1525,13 @@ impl Core {
         // Plan 30 §M14: nor while lock grants are live (a successor would
         // start a grace; the holders keep their locks instead).
         if replica.locks().grants_len() > 0 {
+            self.finish_round(now, None, replica, out);
+            return;
+        }
+        // EC2 finding 2: the wanters are across a P2P partition from a
+        // holder its own side is using: the lease stays (they keep being
+        // served through the inbox).
+        if self.keeps_lease_for_p2p_side(now) {
             self.finish_round(now, None, replica, out);
             return;
         }
@@ -2722,7 +2747,12 @@ impl Core {
                 // no holder to ship past `base`).
                 let holds =
                     self.lease.epoch_held() || (self.lease.held.is_some() && !self.lease.lost);
-                if !holds && self.ship.head_seq <= self.epoch.base {
+                // EC2 follow-up (d): an epoch that carries no lease has no
+                // holder to publish past `base` — nothing was written under
+                // it, and without this every member waited for that
+                // publication forever. Any member closes it once S3 is
+                // back; the lease is then CAS's again, as before the epoch.
+                if !holds && self.pr.carried.is_some() && self.ship.head_seq <= self.epoch.base {
                     self.finish_round(now, None, replica, out);
                     return;
                 }

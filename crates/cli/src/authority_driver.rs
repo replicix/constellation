@@ -727,6 +727,16 @@ impl Driver {
         self.refresh();
         self.dispatch(out);
         self.report_epoch(true);
+        // EC2 finding 1 × 4798008: chunks `back` closes forwarded as
+        // pending are handed to a peer while this node's S3 path makes no
+        // progress (checked every second; independent of the rounds,
+        // which may be stuck on the same unreachable S3).
+        {
+            let handoff = self.chunk_handoff();
+            if handoff.possible() {
+                tokio::spawn(forwarded_handoff_watch(handoff));
+            }
+        }
         // The peer directory and the roster, on a ticker like the
         // daemon's registry poll.
         {
@@ -1027,9 +1037,21 @@ impl Driver {
             }
             SyncRequest::DrainInode { ino, reply } => {
                 let upload = self.uploader();
+                let handoff = (ino != 0).then(|| self.chunk_handoff());
                 tokio::spawn(async move {
-                    let r = upload.run((ino != 0).then_some(ino)).await;
-                    let _ = reply.send(r.map(|_| ()).map_err(|e| format!("{e:#}")));
+                    let r = drain_with_handoff(upload, handoff, ino).await;
+                    let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                });
+                None
+            }
+            SyncRequest::AcceptHandoff {
+                requester,
+                hashes,
+                reply,
+            } => {
+                let handoff = self.chunk_handoff();
+                tokio::spawn(async move {
+                    let _ = reply.send(handoff.accept(requester, hashes).await);
                 });
                 None
             }
@@ -1531,6 +1553,20 @@ impl Driver {
         }
     }
 
+    fn chunk_handoff(&self) -> ChunkHandoff {
+        ChunkHandoff {
+            node_id: self.node_id,
+            meta: self.deps.meta.clone(),
+            cache: self.deps.cache.clone(),
+            store: self.deps.chunk_store.clone(),
+            compression: self.deps.compression,
+            upload: self.deps.upload.clone(),
+            peers: self.deps.peers.clone(),
+            view: self.deps.view.clone(),
+            sync_tx: self.sync_tx.clone(),
+        }
+    }
+
     fn uploader(&self) -> Uploader {
         Uploader {
             cache: self.deps.cache.clone(),
@@ -1602,7 +1638,9 @@ impl Driver {
                         if round && epochs.is_open() {
                             epochs.check_liveness().await;
                             let _ = sync_tx.send(SyncRequest::EpochChanged);
-                            if epochs.is_frozen() && !holds {
+                            // (A frozen epoch that carries no lease has no
+                            // hold owner: its members flush and close it.)
+                            if epochs.is_frozen() && !holds && epochs.carrier().0.is_some() {
                                 let _ = tx.send(Internal::Event(Event::UploadsDone {
                                     op,
                                     result: UploadResult::Skip,
@@ -3351,6 +3389,346 @@ impl Uploader {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+/// EC2 finding 1: how long a drain (a write-through close, a forwarded
+/// manifest's pre-publication upload, an `fsync`) waits on this node's
+/// S3 path making no progress — no upload and no other S3 request
+/// completing — before it hands its chunks to a peer
+/// (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`, default 6000, longer than
+/// the 5 s registry poll so a working link always shows a completion
+/// inside it; 0 disables).
+fn chunk_handoff_after_ms() -> u64 {
+    static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        std::env::var("CONSTELLATION_CHUNK_HANDOFF_AFTER_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6000)
+    })
+}
+
+/// How long a peer may take to fetch and upload a handoff's chunks.
+const CHUNK_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Hashes per `ChunkHandoff` message (a frame is at most 64 KiB).
+const CHUNK_HANDOFF_BATCH: usize = 512;
+/// After a drain needed a handoff, the next drains hand off at once for
+/// this long while uploads still make no progress.
+const CHUNK_HANDOFF_STICKY_MS: i64 = 30_000;
+
+/// Upload `ino`'s pending chunks (every pending chunk for `ino == 0`),
+/// handing them to a peer when this node's own S3 path makes no progress
+/// (EC2 finding 1: a node that lost S3 but not its peers blocked every
+/// close for the whole outage). Plan 08's invariant is untouched — a
+/// forwarded manifest still names only chunks S3 has — it is only who
+/// puts them there that changes. This node's own upload keeps running
+/// in the background either way (a repeat PUT of content-addressed data
+/// is harmless).
+async fn drain_with_handoff(
+    upload: Uploader,
+    handoff: Option<ChunkHandoff>,
+    ino: constellation_fs_core::Ino,
+) -> Result<()> {
+    let (tx, mut done) = tokio::sync::oneshot::channel();
+    let stats = upload.upload.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(upload.run((ino != 0).then_some(ino)).await);
+    });
+    let stopped = || anyhow::anyhow!("the drain task stopped");
+    let after_ms = chunk_handoff_after_ms();
+    let Some(handoff) = handoff.filter(|h| after_ms > 0 && h.possible()) else {
+        return done.await.unwrap_or_else(|_| Err(stopped()));
+    };
+    let after = std::time::Duration::from_millis(after_ms);
+    let now = constellation_store_s3::lease::now_unix_ms();
+    let sticky = now
+        - stats
+            .handoff
+            .last_needed_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+        < CHUNK_HANDOFF_STICKY_MS;
+    let mut tried = false;
+    let mut wait = if sticky && stats.uploads_stalled(after_ms as i64) {
+        // S3 was just found unreachable and nothing has gone up since:
+        // do not make this close wait the whole detection time again.
+        std::time::Duration::from_millis(50)
+    } else {
+        after
+    };
+    loop {
+        match tokio::time::timeout(wait, &mut done).await {
+            Ok(result) => {
+                let result = result.unwrap_or_else(|_| Err(stopped()));
+                if let Err(error) = &result {
+                    if !tried {
+                        tracing::info!(ino, %error, "drain failed; handing its chunks to a peer");
+                        if handoff.hand_off(ino).await {
+                            return Ok(());
+                        }
+                    }
+                }
+                return result;
+            }
+            Err(_) if !tried && stats.uploads_stalled(after_ms as i64) => {
+                tried = true;
+                tracing::info!(
+                    ino,
+                    waited_ms = wait.as_millis() as u64,
+                    "no upload has completed on this node for a while: handing the drain's chunks to a peer"
+                );
+                if handoff.hand_off(ino).await {
+                    return Ok(());
+                }
+            }
+            Err(_) => {}
+        }
+        wait = after;
+    }
+}
+
+/// Once this node's S3 path has made no progress for
+/// `chunk_handoff_after_ms`, hand the chunks `back` closes forwarded as
+/// pending to a peer (checked every second: a cheap in-memory look while
+/// nothing is forwarded).
+async fn forwarded_handoff_watch(handoff: ChunkHandoff) {
+    let after_ms = chunk_handoff_after_ms();
+    if after_ms == 0 {
+        return;
+    }
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if handoff.upload.has_forwarded() && handoff.upload.uploads_stalled(after_ms as i64) {
+            handoff.hand_off_forwarded().await;
+        }
+    }
+}
+
+/// EC2 finding 1: moving chunks through a peer when this node cannot
+/// reach S3 — the requester's side (`hand_off`) and the peer's
+/// (`accept`).
+#[derive(Clone)]
+struct ChunkHandoff {
+    node_id: u64,
+    meta: Arc<Meta>,
+    cache: Arc<DiskCache>,
+    store: Arc<ChunkStore>,
+    compression: CompressionSetting,
+    upload: Arc<crate::UploadRuntime>,
+    peers: constellation_net::Peers,
+    view: Arc<LeaseView>,
+    /// This node's own sync task: an accepted handoff acks the remote
+    /// rows the uploaded chunks satisfy (`SyncRequest::ChunksDurable`).
+    sync_tx: mpsc::UnboundedSender<SyncRequest>,
+}
+
+impl ChunkHandoff {
+    fn possible(&self) -> bool {
+        self.peers.is_enabled() && self.upload.coop.is_some()
+    }
+
+    /// Hand `ino`'s pending chunks to a peer — the lease holder first,
+    /// then any other connected peer — and, once one has them in S3,
+    /// acknowledge them here as uploaded. `false`: nobody could.
+    async fn hand_off(&self, ino: constellation_fs_core::Ino) -> bool {
+        let rows = match self.meta.pending_uploads() {
+            Ok(rows) => rows,
+            Err(_) => return false,
+        };
+        let hashes: Vec<constellation_fs_core::ChunkHash> = rows
+            .iter()
+            .filter(|(_, i)| *i == ino)
+            .map(|(h, _)| *h)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.hand_off_hashes(hashes, &[], ino).await
+    }
+
+    /// Hand `hashes` (pending here) to a peer: the nodes in `first`, then
+    /// the lease holder, then any other connected peer. Once one has them
+    /// in S3 they are acknowledged here as uploaded, and reported to the
+    /// nodes a `back` close forwarded them to (`UploadRuntime::note_up`),
+    /// exactly as if this node's own upload had put them there. `false`:
+    /// nobody could. (`ino` is for the log line; 0 for a round's.)
+    async fn hand_off_hashes(
+        &self,
+        hashes: Vec<constellation_fs_core::ChunkHash>,
+        first: &[u64],
+        ino: constellation_fs_core::Ino,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(coop) = self.upload.coop.clone() else {
+            return false;
+        };
+        let hashes: Vec<constellation_fs_core::ChunkHash> = hashes
+            .into_iter()
+            .filter(|h| self.meta.upload_pending_for_hash(h).unwrap_or(false))
+            .collect();
+        if hashes.is_empty() {
+            // Uploaded meanwhile (or by another drain).
+            return true;
+        }
+        self.upload
+            .handoff
+            .last_needed_ms
+            .store(constellation_store_s3::lease::now_unix_ms(), Relaxed);
+        self.upload.handoff.sent.fetch_add(1, Relaxed);
+        let _offer = coop.offer(&hashes);
+        let holder = self.view.status().holder;
+        let mut targets: Vec<u64> = Vec::new();
+        for n in first.iter().copied().chain([holder]) {
+            if n != 0 && n != self.node_id && !targets.contains(&n) {
+                targets.push(n);
+            }
+        }
+        for p in self.peers.snapshot() {
+            if p.node_id != self.node_id && !targets.contains(&p.node_id) && p.connected && !p.ro {
+                targets.push(p.node_id);
+            }
+        }
+        let req_id = constellation_store_s3::lease::now_unix_ms() as u64;
+        'peer: for peer in targets {
+            for batch in hashes.chunks(CHUNK_HANDOFF_BATCH) {
+                let payload = constellation_net::Payload::ChunkHandoff {
+                    requester: self.node_id,
+                    req_id,
+                    hashes: batch.iter().map(|h| h.0).collect(),
+                };
+                match self
+                    .peers
+                    .request_to_node_timeout(peer, &payload, CHUNK_HANDOFF_TIMEOUT)
+                    .await
+                {
+                    Ok(constellation_net::Payload::ChunkHandoffReply {
+                        uploaded: true, ..
+                    }) => {}
+                    other => {
+                        tracing::info!(peer, ino, reply = ?other.map(|_| ()), "chunk handoff refused or failed");
+                        continue 'peer;
+                    }
+                }
+            }
+            // Every chunk is in S3 now: this node's claims on them are
+            // satisfied, whichever inode made them.
+            let set: std::collections::HashSet<_> = hashes.iter().copied().collect();
+            if let Ok(rows) = self.meta.pending_uploads() {
+                for (hash, i) in rows {
+                    if set.contains(&hash) {
+                        let _ = self.meta.ack_upload(&hash, i);
+                    }
+                }
+            }
+            for hash in &hashes {
+                self.upload.existence.insert(hash);
+                self.upload.note_up(hash);
+                if !self.meta.upload_pending_for_hash(hash).unwrap_or(true) {
+                    self.cache
+                        .set_state(hash, constellation_fs_core::cache::ChunkState::Clean);
+                }
+            }
+            self.upload.handoff.ok.fetch_add(1, Relaxed);
+            self.upload
+                .handoff
+                .chunks
+                .fetch_add(hashes.len() as u64, Relaxed);
+            tracing::info!(
+                peer,
+                ino,
+                chunks = hashes.len(),
+                "a peer uploaded this node's chunks"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// This node's upload of chunks a `back` close forwarded as pending
+    /// (4798008: the sequencer holds back everything naming them until
+    /// they are up) is making no progress: hand them to the nodes that
+    /// await them, so the rest of the cluster sees the closes this node
+    /// made while its own S3 path is down. One at a time.
+    async fn hand_off_forwarded(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.upload.handoff.round_busy.swap(true, Relaxed) {
+            return;
+        }
+        let forwarded = self.upload.forwarded_pending();
+        if !forwarded.is_empty() {
+            let mut first: Vec<u64> = forwarded.iter().flat_map(|(_, n)| n.clone()).collect();
+            first.sort_unstable();
+            first.dedup();
+            let hashes = forwarded.into_iter().map(|(h, _)| h).collect();
+            tracing::info!(
+                awaited_by = ?first,
+                "no upload has completed on this node for a while: handing chunks a back close forwarded to a peer"
+            );
+            self.hand_off_hashes(hashes, &first, 0).await;
+        }
+        self.upload.handoff.round_busy.store(false, Relaxed);
+    }
+
+    /// A peer that cannot reach S3 handed us `hashes`: fetch each from it,
+    /// upload it, and keep a clean copy (a reader here, or one asking us,
+    /// is served without S3). `true` once every one is in S3.
+    async fn accept(&self, requester: u64, hashes: Vec<constellation_fs_core::ChunkHash>) -> bool {
+        use futures::StreamExt;
+        let Some(coop) = self.upload.coop.clone() else {
+            return false;
+        };
+        let uploaded = hashes.clone();
+        let results: Vec<Result<()>> = futures::stream::iter(hashes.into_iter().map(|hash| {
+            let coop = coop.clone();
+            async move {
+                let data = coop.fetch_handed_off(requester, &hash).await?;
+                let mode = self.upload.put_mode(&hash, data.len());
+                self.store
+                    .put_chunk_mode(&hash, &data, self.compression, mode)
+                    .await?;
+                self.upload.existence.insert(&hash);
+                if !self.cache.contains(&hash) {
+                    let _ = self.cache.insert(
+                        &hash,
+                        &data,
+                        constellation_fs_core::cache::ChunkState::Clean,
+                    );
+                }
+                self.upload
+                    .handoff
+                    .accepted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        }))
+        .buffer_unordered(4)
+        .collect()
+        .await;
+        let failed = results.iter().filter(|r| r.is_err()).count();
+        if failed > 0 {
+            tracing::warn!(
+                requester,
+                failed,
+                error = ?results.into_iter().find_map(|r| r.err()).map(|e| format!("{e:#}")),
+                "could not upload a peer's handed-off chunks"
+            );
+            return false;
+        }
+        // Chunks the requester forwarded here as pending (a `back` close)
+        // are up now: ack the rows that hold its manifests back, as its
+        // own report would.
+        let (reply, done) = tokio::sync::oneshot::channel();
+        if self
+            .sync_tx
+            .send(SyncRequest::ChunksDurable {
+                from: requester,
+                hashes: uploaded,
+                reply,
+            })
+            .is_ok()
+        {
+            let _ = done.await;
+        }
+        true
     }
 }
 

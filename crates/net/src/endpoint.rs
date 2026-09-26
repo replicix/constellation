@@ -500,6 +500,21 @@ pub trait PeerService: Send + Sync + 'static {
     > {
         Box::pin(async move { Err(ChunkDecline::Busy) })
     }
+    /// EC2 finding 1: `requester` (which cannot reach S3) hands us chunks
+    /// to fetch from it and upload. Default refuses.
+    fn chunk_handoff_requested(
+        &self,
+        _requester: u64,
+        req_id: u64,
+        _hashes: Vec<[u8; 32]>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::ChunkHandoffReply {
+                req_id,
+                uploaded: false,
+            }
+        })
+    }
     /// Non-holder asked us to journal `op`. Default declines with an
     /// empty outcome; callers treat that as `MutateOutcome::Busy`.
     #[allow(clippy::too_many_arguments)]
@@ -773,6 +788,11 @@ pub trait PeerService: Send + Sync + 'static {
     fn peer_rtts(&self, _node_id: u64, _rtts: Vec<(u64, u16)>) {}
     /// This node's id, for `Ping`/`Pong`.
     fn node_id(&self) -> u64;
+    /// EC2 follow-up 3c: whether this node's own S3 path works, for
+    /// `Pong::s3_ok`. Default: unknown (`false`).
+    fn s3_ok(&self) -> bool {
+        false
+    }
 }
 
 /// A live P2P endpoint.

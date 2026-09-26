@@ -2511,6 +2511,15 @@ struct P2pBridge {
 }
 
 impl constellation_net::PeerService for P2pBridge {
+    /// EC2 follow-up 3c: this daemon's S3 path works right now: its last
+    /// request was answered, recently, with nothing hanging (see
+    /// `backend::s3_path_ok`), and its last sync round did not fail.
+    /// Positive evidence only: a node cut a moment ago stops saying so at
+    /// its first failed or hanging request.
+    fn s3_ok(&self) -> bool {
+        !self.epochs.s3_failing() && backend::s3_path_ok(S3_OK_RECENT_MS, S3_OK_HANG_MS)
+    }
+
     fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
         tracing::debug!(part, seq, epoch, "peer published a segment");
         // The core decides: a node following the holder's log stream has
@@ -3032,6 +3041,31 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    fn chunk_handoff_requested(
+        &self,
+        requester: u64,
+        req_id: u64,
+        hashes: Vec<[u8; 32]>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let sent = self
+                .nudge
+                .send(fusefs::SyncRequest::AcceptHandoff {
+                    requester,
+                    hashes: hashes
+                        .into_iter()
+                        .map(constellation_fs_core::ChunkHash)
+                        .collect(),
+                    reply,
+                })
+                .is_ok();
+            let uploaded = sent && receive.await.unwrap_or(false);
+            constellation_net::Payload::ChunkHandoffReply { req_id, uploaded }
+        })
+    }
+
     fn read_index_requested(
         &self,
         requester: u64,
@@ -3436,7 +3470,7 @@ async fn start_p2p(
         }
         Err(e) => tracing::warn!(error = %e, "could not serialize our P2P address"),
     }
-    refresh_peers(&peers, store, None).await;
+    let _ = refresh_peers(&peers, store, None).await;
     tracing::info!(
         node_id,
         peers = peers.snapshot().len(),
@@ -3451,17 +3485,30 @@ async fn refresh_peers(
     peers: &constellation_net::Peers,
     store: std::sync::Arc<dyn object_store::ObjectStore>,
     epochs: Option<&epoch::EpochManager>,
-) {
+) -> Option<constellation_store_s3::RegistryScan> {
     if !peers.is_enabled() {
-        return;
+        return None;
     }
-    // The peer directory is tolerant of unreadable records (a peer we
-    // cannot dial only loses its fast path); the epoch roster is not,
-    // so it gets its own fail-closed read (`crate::epoch::refresh_roster`).
+    // One LIST of the registry serves both reads (EC2 finding R2-2: they
+    // used to list and read every record separately, every 5 s). The
+    // peer directory is tolerant of unreadable records (a peer we cannot
+    // dial only loses its fast path); the epoch roster is not, so it
+    // takes the scan's fail-closed view (`crate::epoch::apply_roster`).
+    let scan = constellation_store_s3::registry_scan(store.as_ref()).await;
     if let Some(epochs) = epochs {
-        crate::epoch::refresh_roster(epochs, store.clone()).await;
+        crate::epoch::apply_roster(
+            epochs,
+            match &scan {
+                Ok(scan) => scan.roster(),
+                Err(e) => Err(constellation_store_s3::StoreError::Registry(format!(
+                    "registry unreachable: {e}"
+                ))),
+            },
+            scan.is_err(),
+        );
     }
-    match constellation_store_s3::list_nodes(store).await {
+    let scan = scan.ok();
+    match scan.as_ref().map(|scan| scan.live()).ok_or(()) {
         Ok(nodes) => {
             let records: Vec<constellation_net::PeerEnrollment> = nodes
                 .into_iter()
@@ -3480,10 +3527,11 @@ async fn refresh_peers(
                 .collect();
             peers.refresh_registry(records);
         }
-        Err(e) => {
-            tracing::debug!(error = %e, "registry refresh failed; keeping the cached peer set")
+        Err(()) => {
+            tracing::debug!("registry refresh failed; keeping the cached peer set")
         }
     }
+    scan
 }
 
 /// Send one control-API request to a running mount and print the answer.
@@ -3835,7 +3883,20 @@ struct UploadRuntime {
     /// they are reported to every peer — a node that awaits one acks it,
     /// the rest ignore the report.
     inherited: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
+    /// EC2 finding 1: when a chunk PUT (or existence probe) last
+    /// completed on this node, unix ms — how a drain that is taking long
+    /// tells a slow upload (progress) from an unreachable S3 (none), and
+    /// only the latter hands its chunks to a peer.
+    last_put_ms: std::sync::atomic::AtomicI64,
+    /// EC2 finding 1: chunk handoffs (`authority_driver::ChunkHandoff`).
+    handoff: HandoffStats,
 }
+
+/// `Pong::s3_ok` (EC2 follow-up 3c): the last answer at most this old
+/// (a working node makes a request at least every 5 s, the registry
+/// poll), and no request hanging longer than [`S3_OK_HANG_MS`].
+const S3_OK_RECENT_MS: i64 = 15_000;
+const S3_OK_HANG_MS: i64 = 3_000;
 
 /// The `durable_reports` key of a report owed to every peer.
 const REPORT_TO_ALL: u64 = 0;
@@ -3917,6 +3978,20 @@ fn probe_min_bytes() -> u64 {
         .unwrap_or(256 * 1024)
 }
 
+/// EC2 finding 1: this node's chunk handoffs, for `status`.
+#[derive(Default)]
+struct HandoffStats {
+    sent: std::sync::atomic::AtomicU64,
+    ok: std::sync::atomic::AtomicU64,
+    chunks: std::sync::atomic::AtomicU64,
+    accepted: std::sync::atomic::AtomicU64,
+    /// When a drain last needed a handoff (unix ms): while recent, and
+    /// uploads still make no progress, the next drain hands off at once.
+    last_needed_ms: std::sync::atomic::AtomicI64,
+    /// A round's handoff of forwarded chunks is in flight.
+    round_busy: std::sync::atomic::AtomicBool,
+}
+
 /// Releases a drain's claim on its chunks when it ends, however it ends.
 struct InFlightClaim<'a> {
     upload: &'a UploadRuntime,
@@ -3984,7 +4059,20 @@ impl UploadRuntime {
             remote_polls: Default::default(),
             reported: Default::default(),
             inherited: Default::default(),
+            last_put_ms: std::sync::atomic::AtomicI64::new(0),
+            handoff: HandoffStats::default(),
         }
+    }
+
+    /// EC2 finding 1: whether this node's S3 path has made no progress for
+    /// `for_ms`: no chunk PUT and no S3 request of any kind has succeeded
+    /// (`backend::last_s3_completion_ms`) in that long.
+    pub(crate) fn uploads_stalled(&self, for_ms: i64) -> bool {
+        let last = self
+            .last_put_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(backend::last_s3_completion_ms());
+        constellation_store_s3::lease::now_unix_ms() - last >= for_ms
     }
 
     /// `hashes` went out in a manifest forwarded to `to` while still
@@ -4030,6 +4118,23 @@ impl UploadRuntime {
         hashes: impl IntoIterator<Item = constellation_fs_core::ChunkHash>,
     ) {
         self.inherited.lock().unwrap().extend(hashes);
+    }
+
+    /// Whether any chunk forwarded as pending is still owed a report.
+    pub(crate) fn has_forwarded(&self) -> bool {
+        !self.forwarded.lock().unwrap().is_empty()
+    }
+
+    /// Chunks forwarded as pending that are still pending here, with the
+    /// nodes they were forwarded to (EC2 finding 1: what a round hands to
+    /// a peer when this node's S3 path is down).
+    pub(crate) fn forwarded_pending(&self) -> Vec<(constellation_fs_core::ChunkHash, Vec<u64>)> {
+        self.forwarded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, nodes)| (*h, nodes.iter().copied().collect()))
+            .collect()
     }
 
     /// `hash` is up: owe its report to every node it was forwarded to
@@ -4227,6 +4332,8 @@ impl UploadRuntime {
             remote_polls: Default::default(),
             reported: Default::default(),
             inherited: Default::default(),
+            last_put_ms: std::sync::atomic::AtomicI64::new(0),
+            handoff: HandoffStats::default(),
         }
     }
 }
@@ -4485,6 +4592,10 @@ async fn upload_dirty_chunks_pass(
             for attempt in 0..3 {
                 match store.put_chunk_mode(&hash, &data, compression, mode).await {
                     Ok(result) => {
+                        upload.last_put_ms.store(
+                            constellation_store_s3::lease::now_unix_ms(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         let now = std::time::Instant::now();
                         // A Probe hit only performed HEAD; counting the
                         // chunk's logical bytes as uploaded would report
@@ -4639,25 +4750,95 @@ async fn upload_dirty_chunks_pass(
 /// costs nothing (and needs no lease) on every subsequent mount; when it
 /// does apply, it takes the lease like any other mutation (through the
 /// authority core).
+///
+/// EC2 finding R2-4: one attempt is not enough. A `Policy::System` op
+/// gives up the moment its acquisition does not open the view, and a
+/// fresh acquisition routinely waits a moment behind its takeover gate —
+/// under `--cto strict`, when two nodes mount together, the kernel-cache
+/// drain the first sight of the other node arms (plan 30 §M8) keeps the
+/// gate shut for a second. Both nodes then answered "deferred" (the
+/// holder's own attempt refused by its gate, the other's forward refused
+/// by the holder's), nobody retried, and the root stayed genesis' `root:
+/// root 0755` — unwritable by the mounting user and, without
+/// `allow_other`, by root too. So: retry until the root has an owner
+/// (this node's attempt or anyone else's, seen by tailing), for a short
+/// while before the mount appears and then in the background.
 async fn adopt_root(
+    meta: &std::sync::Arc<Meta>,
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    forward: &std::sync::Arc<forward::ForwardState>,
+    node_id: u64,
+) -> Result<()> {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        return Ok(());
+    }
+    /// How long the mount waits for the root to have an owner before it
+    /// appears anyway (and keeps adopting in the background).
+    const BEFORE_MOUNT: std::time::Duration = std::time::Duration::from_secs(10);
+    const RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+    let started = std::time::Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        if adopt_root_once(meta, sync_tx, forward, node_id).await? {
+            if attempts > 1 {
+                tracing::info!(attempts, "root directory owner adopted");
+            }
+            return Ok(());
+        }
+        if started.elapsed() >= BEFORE_MOUNT {
+            break;
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+    tracing::warn!(
+        attempts,
+        "root directory still has no owner; mounting anyway and adopting it in the background"
+    );
+    let (meta, sync_tx, forward) = (meta.clone(), sync_tx.clone(), forward.clone());
+    tokio::spawn(async move {
+        let mut wait = std::time::Duration::from_secs(1);
+        loop {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(std::time::Duration::from_secs(60));
+            match adopt_root_once(&meta, &sync_tx, &forward, node_id).await {
+                Ok(true) => {
+                    tracing::info!("root directory owner adopted");
+                    return;
+                }
+                Ok(false) => {}
+                // The sync task is gone: the mount is shutting down.
+                Err(_) => return,
+            }
+        }
+    });
+    Ok(())
+}
+
+/// One adoption attempt: `Ok(true)` once the root has an owner (it
+/// already had one, or this attempt gave it one), `Ok(false)` when the
+/// attempt was deferred (the lease is held elsewhere or not open yet).
+async fn adopt_root_once(
     meta: &std::sync::Arc<Meta>,
     sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
     forward: &forward::ForwardState,
     node_id: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
-    if euid == 0 {
-        return Ok(());
-    }
     // Another node may already have done it; make sure we have its log.
+    // A tail that fails (S3 unreachable) is not fatal: the replica we
+    // have decides, and a later attempt tails again.
     let (reply, rx) = tokio::sync::oneshot::channel();
     sync_tx
         .send(fusefs::SyncRequest::TailToHead { reply })
         .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("sync task stopped"))?
-        .map_err(anyhow::Error::msg)?;
+    match rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::debug!(%error, "root adoption: tail failed"),
+        Err(_) => anyhow::bail!("sync task stopped"),
+    }
     let root =
         constellation_meta::MetaStore::getattr(&**meta, constellation_fs_core::types::ROOT_INO)?;
     tracing::debug!(
@@ -4667,7 +4848,7 @@ async fn adopt_root(
         "root adoption check"
     );
     if !matches!(root, Some(a) if a.uid == 0) {
-        return Ok(());
+        return Ok(true);
     }
     let op = constellation_meta::MutateOp::Setattr {
         ino: constellation_fs_core::types::ROOT_INO,
@@ -4691,12 +4872,14 @@ async fn adopt_root(
     match rx.await {
         Ok(constellation_authority::ClientReply::Outcome(
             constellation_meta::MutateOutcome::Accepted { .. },
-        )) => Ok(()),
-        // Another node holds authority; it either already adopted the
-        // root or will, and its record reaches us by tailing.
-        _ => {
-            tracing::info!("root adoption deferred: partition lease held elsewhere");
-            Ok(())
+        )) => Ok(true),
+        Err(_) => anyhow::bail!("sync task stopped"),
+        // Another node holds authority (it adopts the root itself, or a
+        // later attempt here reaches it), or this node's own fresh
+        // acquisition has not opened its view yet (a takeover gate).
+        other => {
+            tracing::info!(reply = ?other, "root adoption deferred; retrying");
+            Ok(false)
         }
     }
 }
@@ -5207,6 +5390,26 @@ impl constellation_api::StatusSource for DaemonStatus {
                                 / 1000
                         })
                         .unwrap_or(0),
+                    handoffs_sent: self
+                        .upload
+                        .handoff
+                        .sent
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    handoffs_ok: self
+                        .upload
+                        .handoff
+                        .ok
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    handoff_chunks: self
+                        .upload
+                        .handoff
+                        .chunks
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    handoff_chunks_accepted: self
+                        .upload
+                        .handoff
+                        .accepted
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 }
             },
             forwarded_ok: self.forward.ok.load(std::sync::atomic::Ordering::Relaxed),
@@ -5292,6 +5495,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                     last_parse_error: s.last_parse_error.lock().ok().and_then(|g| g.clone()),
                 }
             },
+            s3: backend::s3_request_counts(),
         }
     }
 

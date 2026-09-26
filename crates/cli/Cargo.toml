@@ -37,8 +37,9 @@ serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 rpassword = "7.5.4"
 zeroize = "1.9.0"
+# The object store's trait is an `async_trait` (`backend::CountingStore`).
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
-async-trait = "0.1"
 futures = "0.3"

@@ -189,20 +189,154 @@ fn covers(written: &[(u64, u64)], start: u64, end: u64) -> bool {
     reached >= end
 }
 
-/// Per-inode write serialization without making unrelated files contend on
-/// one process-wide mutex. FUSE can dispatch callbacks concurrently, while
-/// operations on the same inode retain their previous ordering. The shard
-/// count is deliberately larger than the maximum automatic FUSE worker count
-/// so a slow write-through flush rarely stalls an unrelated inode.
-struct WriteShards([Mutex<HashMap<Ino, WriteState>>; WRITE_SHARDS]);
+/// The open write sessions, sharded so unrelated files do not contend on
+/// one process-wide mutex. A shard lock is only ever held for short,
+/// local work: never across an S3 request, a forward, or a drain (EC2
+/// finding 1: a close stuck on a black-holed S3 held its shard, and with
+/// it the `getattr`/`lookup` of every inode sharing the shard — an
+/// unrelated `ls -la` on that node hung for the whole outage). Ordering
+/// between operations on the *same* inode is [`InodeOps`]' job.
+///
+/// `detached` carries the pending size of an inode whose session is out
+/// of its map while an operation works on it without the shard lock (a
+/// flush publishing it, a read overlaying it): `getattr` and `lookup`
+/// read it under the shard lock exactly as they read a session's size.
+struct WriteShards {
+    maps: [Mutex<HashMap<Ino, WriteState>>; WRITE_SHARDS],
+    detached: [Mutex<HashMap<Ino, u64>>; WRITE_SHARDS],
+}
 
 impl WriteShards {
     fn new() -> Self {
-        Self(std::array::from_fn(|_| Mutex::new(HashMap::new())))
+        Self {
+            maps: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            detached: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
     }
 
     fn lock(&self, ino: Ino) -> std::sync::MutexGuard<'_, HashMap<Ino, WriteState>> {
-        self.0[ino as usize % WRITE_SHARDS].lock().unwrap()
+        self.maps[ino as usize % WRITE_SHARDS].lock().unwrap()
+    }
+
+    /// The pending size of `ino`'s session: in the map, or detached. Call
+    /// with the inode's shard lock held (`shard`).
+    fn pending_len(&self, shard: &HashMap<Ino, WriteState>, ino: Ino) -> Option<u64> {
+        shard.get(&ino).map(|ws| ws.file_len).or_else(|| {
+            self.detached[ino as usize % WRITE_SHARDS]
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .copied()
+        })
+    }
+
+    /// Take `ino`'s session out of its map (under the shard lock, so a
+    /// `getattr` sees either the session or its detached size, never
+    /// neither). The caller holds `ino`'s [`InodeOps`] lock and must
+    /// [`Self::reattach`] (or [`Self::retire`]) it.
+    fn detach(&self, ino: Ino) -> Option<WriteState> {
+        let mut shard = self.lock(ino);
+        let ws = shard.remove(&ino)?;
+        self.detached[ino as usize % WRITE_SHARDS]
+            .lock()
+            .unwrap()
+            .insert(ino, ws.file_len);
+        Some(ws)
+    }
+
+    /// Put a detached session back.
+    fn reattach(&self, ino: Ino, ws: WriteState) {
+        let mut shard = self.lock(ino);
+        self.detached[ino as usize % WRITE_SHARDS]
+            .lock()
+            .unwrap()
+            .remove(&ino);
+        shard.insert(ino, ws);
+    }
+
+    /// A detached session is gone for good: published (its committed row
+    /// now carries the size), or dropped by a failed flush.
+    fn retire(&self, ino: Ino) {
+        let _shard = self.lock(ino);
+        self.detached[ino as usize % WRITE_SHARDS]
+            .lock()
+            .unwrap()
+            .remove(&ino);
+    }
+}
+
+/// A flush that did not publish: the errno, and the session to put back
+/// (`None`: it is gone — the failure happened before anything could be
+/// retried from it, as it always was).
+struct FlushFail {
+    errno: i32,
+    ws: Option<Box<WriteState>>,
+}
+
+/// Per-inode ordering of the operations that read or change a write
+/// session (`read`, `write`, `truncate`, `fallocate`, `lseek`, and the
+/// flush that publishes it), held across their slow parts — the chunk
+/// fetch, the forward, the drain — so the per-inode order a single
+/// shard lock used to give survives [`WriteShards`] releasing it. Only
+/// operations on the same inode wait. Re-entrant on one thread
+/// (`fallocate` truncates and writes through the public paths).
+struct InodeOps {
+    shards: [InodeOpShard; 64],
+}
+
+/// Held inodes (owner thread, depth) and the condvar their waiters sleep on.
+type InodeOpShard = (
+    Mutex<HashMap<Ino, (std::thread::ThreadId, u32)>>,
+    std::sync::Condvar,
+);
+
+struct InodeOpGuard<'a> {
+    ops: &'a InodeOps,
+    ino: Ino,
+}
+
+impl InodeOps {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| {
+                (Mutex::new(HashMap::new()), std::sync::Condvar::new())
+            }),
+        }
+    }
+
+    fn lock(&self, ino: Ino) -> InodeOpGuard<'_> {
+        let me = std::thread::current().id();
+        let (m, cv) = &self.shards[ino as usize % 64];
+        let mut held = m.lock().unwrap();
+        loop {
+            match held.get_mut(&ino) {
+                None => {
+                    held.insert(ino, (me, 1));
+                    break;
+                }
+                Some((owner, depth)) if *owner == me => {
+                    *depth += 1;
+                    break;
+                }
+                Some(_) => held = cv.wait(held).unwrap(),
+            }
+        }
+        InodeOpGuard { ops: self, ino }
+    }
+}
+
+impl Drop for InodeOpGuard<'_> {
+    fn drop(&mut self) {
+        let (m, cv) = &self.ops.shards[self.ino as usize % 64];
+        let mut held = m.lock().unwrap();
+        if let Some((_, depth)) = held.get_mut(&self.ino) {
+            *depth -= 1;
+            if *depth == 0 {
+                held.remove(&self.ino);
+                drop(held);
+                cv.notify_all();
+            }
+        }
     }
 }
 
@@ -261,9 +395,21 @@ pub enum SyncRequest {
         ino: Ino,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Upload `ino`'s pending chunks (all of them for `ino == 0`). EC2
+    /// finding 1: when this node's own uploads make no progress for
+    /// `chunk_handoff_after`, the chunks are handed to a peer that can
+    /// reach S3 (`ChunkHandoff`), and the drain succeeds once that peer
+    /// has them in S3.
     DrainInode {
         ino: Ino,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// EC2 finding 1: `requester` cannot reach S3 and hands us `hashes`
+    /// to fetch from it and upload; `reply` is whether all are in S3.
+    AcceptHandoff {
+        requester: u64,
+        hashes: Vec<ChunkHash>,
+        reply: tokio::sync::oneshot::Sender<bool>,
     },
     /// Tail to the log head without shipping or publishing anything
     /// (plan 29 M3a: in-daemon GC's liveness-freshness gate). Never
@@ -695,6 +841,8 @@ pub struct ConstellationFs {
     rt: Handle,
     chunk_size: u32,
     writes: WriteShards,
+    /// Per-inode ordering of write-session operations (see [`InodeOps`]).
+    inode_ops: InodeOps,
     /// Open handle counts per inode, for orphan reaping on last close.
     opens: Mutex<HashMap<Ino, u32>>,
     /// Sequential readahead.
@@ -850,6 +998,7 @@ impl ConstellationFs {
             rt: deps.rt,
             chunk_size,
             writes: WriteShards::new(),
+            inode_ops: InodeOps::new(),
             opens: Mutex::new(HashMap::new()),
             prefetch,
             scan,
@@ -1443,6 +1592,10 @@ impl ConstellationFs {
     /// chunks and their pending-upload claims) and the kernel's pages of
     /// the file, which hold the same bytes. `true` if there were any.
     fn discard_lock_writes(&self, ino: Ino) -> bool {
+        // After any flush of the file in flight (it holds the session
+        // detached from its shard): what it publishes was its to publish,
+        // as when the flush held the shard throughout.
+        let _op = self.inode_ops.lock(ino);
         let ws = self.writes.lock(ino).remove(&ino);
         let Some(mut ws) = ws else {
             return false;
@@ -2405,14 +2558,47 @@ impl ConstellationFs {
     /// healed S3 connection does not become application-visible EIO in
     /// local-fsync mode.
     fn flush_inode(&self, ino: Ino, force_through: bool) -> Result<(), i32> {
-        // Keep this inode's shard locked until publication completes. That
-        // preserves per-inode request ordering under fuser's concurrent
-        // dispatch; unrelated inodes continue through the other shards.
-        let mut writes = self.writes.lock(ino);
-        let ws = match writes.remove(&ino) {
-            Some(ws) => ws,
-            None => return Ok(()),
+        // The inode's operation lock, not its shard lock, is what keeps
+        // per-inode request order across the publication: the session is
+        // detached from its shard (its size stays visible to `getattr`
+        // and `lookup`) so the compose, the commit — a forward — and the
+        // drain run with no shard held (EC2 finding 1).
+        let _op = self.inode_ops.lock(ino);
+        let Some(ws) = self.writes.detach(ino) else {
+            return Ok(());
         };
+        match self.flush_detached(ino, ws, force_through) {
+            Ok(drain) => {
+                self.writes.retire(ino);
+                if drain {
+                    self.drain_inode(ino)?;
+                }
+                Ok(())
+            }
+            Err(FlushFail {
+                errno,
+                ws: Some(ws),
+            }) => {
+                self.writes.reattach(ino, *ws);
+                Err(errno)
+            }
+            Err(FlushFail { errno, ws: None }) => {
+                self.writes.retire(ino);
+                Err(errno)
+            }
+        }
+    }
+
+    /// [`Self::flush_inode`]'s body, on a detached session: `Ok(true)`
+    /// when the published chunks still have to be drained to S3 before
+    /// the close returns (write-through).
+    fn flush_detached(
+        &self,
+        ino: Ino,
+        ws: WriteState,
+        force_through: bool,
+    ) -> Result<bool, FlushFail> {
+        let dropped = |errno| FlushFail { errno, ws: None };
         let epoch_active = self.sync.as_ref().is_some_and(|h| {
             h.epoch_active
                 .as_ref()
@@ -2420,28 +2606,26 @@ impl ConstellationFs {
         });
         let base = match &ws.base {
             Some(m) => m.clone(),
-            None => self.load_manifest(ino)?,
+            None => self.load_manifest(ino).map_err(dropped)?,
         };
-        let (manifest_bytes, dirty_hashes) = self.compose_manifest(&ws, &base, ws.file_len)?;
+        let (manifest_bytes, dirty_hashes) = self
+            .compose_manifest(&ws, &base, ws.file_len)
+            .map_err(dropped)?;
         if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
             for hash in &dirty_hashes {
                 self.meta
                     .add_pending_upload(hash, ino)
-                    .map_err(|e| errno(&e))?;
+                    .map_err(|e| dropped(errno(&e)))?;
             }
             self.meta
                 .scratch_set_manifest(ino, &manifest_bytes, ws.file_len)
-                .map_err(|e| errno(&e))?;
+                .map_err(|e| dropped(errno(&e)))?;
             ws.staging.discard();
-            if force_through {
-                self.drain_inode(ino)?;
-            }
-            return Ok(());
+            return Ok(force_through);
         }
         self.finish_flush(
             ino,
             ws,
-            &mut writes,
             base,
             manifest_bytes,
             dirty_hashes,
@@ -2620,13 +2804,12 @@ impl ConstellationFs {
         &self,
         ino: Ino,
         ws: WriteState,
-        writes: &mut HashMap<Ino, WriteState>,
         base: Manifest,
         manifest_bytes: Vec<u8>,
         dirty_hashes: Vec<ChunkHash>,
         force_through: bool,
         epoch_active: bool,
-    ) -> Result<(), i32> {
+    ) -> Result<bool, FlushFail> {
         // Plan 30 §M3b: a local commit is admitted through the lease view
         // (counted in flight until the commit returns) so a release's final
         // flush cannot miss it — see `lease.rs`'s module doc, "The
@@ -2674,9 +2857,11 @@ impl ConstellationFs {
                 (gated && committed.is_ok()).then(|| self.meta.journal_tip().unwrap_or(u64::MAX));
             drop(owned);
             drop(admitted);
-            if let Err(error) = committed {
-                writes.insert(ino, ws);
-                return Err(error);
+            if let Err(errno) = committed {
+                return Err(FlushFail {
+                    errno,
+                    ws: Some(Box::new(ws)),
+                });
             }
             if let (Some(h), Some(jseq), Some((base, bytes, dirty))) = (&self.sync, jseq, retry) {
                 if !self.local_ack_durable(h, jseq) {
@@ -2685,11 +2870,13 @@ impl ConstellationFs {
                     // again through the core, which resolves it — the
                     // base check refuses a duplicate and the rebase then
                     // lays this flush over whatever survived.
-                    if let Err(error) =
+                    if let Err(errno) =
                         self.commit_manifest_forwarded(ino, &ws, base, bytes, dirty, false)
                     {
-                        writes.insert(ino, ws);
-                        return Err(error);
+                        return Err(FlushFail {
+                            errno,
+                            ws: Some(Box::new(ws)),
+                        });
                     }
                 }
             }
@@ -2699,7 +2886,7 @@ impl ConstellationFs {
             if let Some(h) = &self.sync {
                 self.recall_after_local_inos(h, vec![ino]);
             }
-        } else if let Err(error) = self.commit_manifest_forwarded(
+        } else if let Err(errno) = self.commit_manifest_forwarded(
             ino,
             &ws,
             base,
@@ -2707,8 +2894,10 @@ impl ConstellationFs {
             dirty_hashes,
             self.defers_upload(ino, force_through, epoch_active),
         ) {
-            writes.insert(ino, ws);
-            return Err(error);
+            return Err(FlushFail {
+                errno,
+                ws: Some(Box::new(ws)),
+            });
         }
         // The staged bytes now live in the durable chunk cache (and are
         // enrolled in `pending_upload`); the staging file is scratch
@@ -2720,10 +2909,7 @@ impl ConstellationFs {
                 .effective(force_through, false, handle.fsync_s3)
                 == crate::writeback::WriteMode::Through
         });
-        if through && !epoch_active {
-            self.drain_inode(ino)?;
-        }
-        Ok(())
+        Ok(through && !epoch_active)
     }
 
     /// Commit a whole-file manifest as the lease holder, rebasing if our
@@ -3220,8 +3406,8 @@ impl ConstellationFs {
         let Some(mut attr) = current else {
             return Ok(None);
         };
-        if let Some(ws) = writes.get(&ino) {
-            attr.size = ws.file_len;
+        if let Some(len) = self.writes.pending_len(&writes, ino) {
+            attr.size = len;
         }
         Ok(Some(attr))
     }
@@ -3282,10 +3468,38 @@ mod write_shard_tests {
         let _same_inode_guard = writes.lock(1);
 
         assert!(matches!(
-            writes.0[1].try_lock(),
+            writes.maps[1].try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
         ));
-        assert!(writes.0[2].try_lock().is_ok());
+        assert!(writes.maps[2].try_lock().is_ok());
+    }
+
+    /// EC2 finding 1: the inode lock orders operations on one inode only,
+    /// re-entrantly on one thread; another inode — even one sharing the
+    /// write shard — is never held up by it.
+    #[test]
+    fn inode_ops_block_only_the_same_inode_and_reenter() {
+        let ops = std::sync::Arc::new(InodeOps::new());
+        let outer = ops.lock(7);
+        let inner = ops.lock(7);
+        drop(inner);
+        // Same shard of `InodeOps` (and of `WriteShards`): free.
+        let other = ops.lock(7 + 64 * WRITE_SHARDS as u64);
+        drop(other);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = {
+            let ops = ops.clone();
+            std::thread::spawn(move || {
+                let _g = ops.lock(7);
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(outer);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        t.join().unwrap();
     }
 }
 
@@ -4433,6 +4647,66 @@ mod durable_ack_tests {
             .filter(|(_, i)| *i == ino)
             .collect();
         assert_eq!(pending.len(), 1, "the chunk stays enrolled for the upload");
+    }
+
+    /// EC2 finding 1: a close waiting on its drain (S3 unreachable) holds
+    /// the inode's operation lock, never its write shard — `getattr` and
+    /// `lookup` of every inode sharing the shard (the round-1 `ls -la`)
+    /// answer at once, and the file's own size is its new one — while a
+    /// write to the same file still waits for the close to finish.
+    #[test]
+    fn a_close_stuck_in_its_drain_holds_no_write_shard() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+        fs.sync
+            .as_ref()
+            .unwrap()
+            .write_mode
+            .set(crate::writeback::WriteMode::Through);
+        fs.do_write(file.ino, 0, b"hello").unwrap();
+        std::thread::scope(|scope| {
+            let close = scope.spawn(|| fs.flush_inode(file.ino, false));
+            let started = std::time::Instant::now();
+            let reply = loop {
+                match core.try_recv() {
+                    Ok(SyncRequest::DrainInode { ino, reply }) => {
+                        assert_eq!(ino, file.ino);
+                        break reply;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(5),
+                            "the close never asked for its drain"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            };
+            assert!(
+                fs.writes.maps[file.ino as usize % WRITE_SHARDS]
+                    .try_lock()
+                    .is_ok(),
+                "a close waiting on S3 holds its write shard"
+            );
+            let shard = fs.writes.lock(file.ino);
+            let size = fs
+                .writes
+                .pending_len(&shard, file.ino)
+                .unwrap_or_else(|| meta.getattr(file.ino).unwrap().unwrap().size);
+            drop(shard);
+            assert_eq!(size, 5);
+            let write = scope.spawn(|| fs.do_write(file.ino, 5, b"!"));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !write.is_finished(),
+                "a write overtook the same file's close"
+            );
+            reply.send(Ok(())).unwrap();
+            close.join().unwrap().unwrap();
+            write.join().unwrap().unwrap();
+        });
     }
 
     #[test]

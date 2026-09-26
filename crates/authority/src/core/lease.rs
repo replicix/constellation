@@ -173,6 +173,18 @@ impl LeaseState {
         }
     }
 
+    /// EC2 follow-up 3a: this node holds the lease and it has not
+    /// expired — though it may be inside its expiry margin (a renewal in
+    /// flight on a slow S3), where nothing new is admitted. Its backups
+    /// keep hearing from it meanwhile.
+    pub fn holds_unexpired(&self, now: Ms, cfg: &Config) -> bool {
+        !self.lost
+            && self.epoch_hold.is_none()
+            && self.held.as_ref().is_some_and(|(lease, _)| {
+                lease.holder == cfg.node_id && lease.expires_in_ms(now.0) > 0
+            })
+    }
+
     /// `LeaseView::fenced`: a release in its final section, or the
     /// takeover gate pending. A peer's forwarded op is answered `Busy`.
     pub fn fenced(&self) -> bool {

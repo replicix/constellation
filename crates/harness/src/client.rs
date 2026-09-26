@@ -60,6 +60,9 @@ fn bin() -> PathBuf {
         })
 }
 
+/// [`Client::without_env`]'s marker value.
+const UNSET: &str = "\u{0}unset";
+
 impl Client {
     /// Prepare a client working under `root` (not yet mounted).
     pub fn new(root: &Path, name: &str, endpoint: &str, backend: &str) -> Result<Self> {
@@ -108,6 +111,13 @@ impl Client {
         self
     }
 
+    /// Remove a variable the harness sets for every client by default
+    /// (e.g. its short S3 retry budget), so the mount runs with the
+    /// product default instead.
+    pub fn without_env(self, key: &str) -> Self {
+        self.with_env(key, UNSET)
+    }
+
     /// Override `--cache-size` (bytes) at mount time.
     pub fn with_cache_size(mut self, bytes: u64) -> Self {
         self.cache_size = Some(bytes);
@@ -148,7 +158,11 @@ impl Client {
             .env("CONSTELLATION_S3_MAX_RETRIES", "2")
             .env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "2000");
         for (k, v) in &self.env {
-            c.env(k, v);
+            if v == UNSET {
+                c.env_remove(k);
+            } else {
+                c.env(k, v);
+            }
         }
         c
     }

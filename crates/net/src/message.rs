@@ -111,6 +111,12 @@ pub enum Payload {
     },
     Pong {
         node_id: u64,
+        /// EC2 follow-up 3c: the answering node's own S3 path works (its
+        /// last sync round did not fail). A would-be proposer of a
+        /// continuation epoch that hears it from a live member is not in
+        /// a bucket outage, only its own S3 is gone: it does not propose.
+        /// Advisory only: `false` changes nothing.
+        s3_ok: bool,
     },
     /// Propose a continuation epoch (DESIGN.md §5.3). Recipients persist
     /// the promise locally BEFORE replying; activation is a later
@@ -563,6 +569,25 @@ pub enum Payload {
         req_id: u64,
         outcome: LockTestOutcomeWire,
     },
+    /// EC2 finding 1: `requester` cannot reach S3 but must make chunks
+    /// durable there before its close may publish a manifest naming them
+    /// (every chunk a segment references is in S3 first). The recipient,
+    /// a peer that can, fetches each of `hashes` from the requester
+    /// (an ordinary [`Payload::ChunkRequest`], which the requester serves
+    /// although the chunks are still dirty there), verifies it, uploads
+    /// it, and answers [`Payload::ChunkHandoffReply`] once every one is
+    /// in S3.
+    ChunkHandoff {
+        requester: u64,
+        req_id: u64,
+        hashes: Vec<[u8; 32]>,
+    },
+    /// Answer to [`Payload::ChunkHandoff`]: whether every chunk is now
+    /// durable in S3.
+    ChunkHandoffReply {
+        req_id: u64,
+        uploaded: bool,
+    },
 }
 
 /// Plan 30 §M14: `constellation_authority::LockOutcome` on the wire.
@@ -823,7 +848,14 @@ mod tests {
     #[test]
     fn frame_roundtrip_over_a_duplex() {
         let k = key();
-        let msg = Signed::new(&k, &Payload::Pong { node_id: 42 }).unwrap();
+        let msg = Signed::new(
+            &k,
+            &Payload::Pong {
+                node_id: 42,
+                s3_ok: true,
+            },
+        )
+        .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -832,7 +864,13 @@ mod tests {
             let (mut a, mut b) = tokio::io::duplex(4096);
             write_frame(&mut a, &msg).await.unwrap();
             let got = read_frame(&mut b).await.unwrap();
-            assert_eq!(got.verify().unwrap().1, Payload::Pong { node_id: 42 });
+            assert_eq!(
+                got.verify().unwrap().1,
+                Payload::Pong {
+                    node_id: 42,
+                    s3_ok: true,
+                }
+            );
         });
     }
 

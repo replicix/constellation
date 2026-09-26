@@ -193,6 +193,7 @@ pub fn status(
         escalated: view.escalated,
         escalations: s.inbox_escalations,
         lease_requests: s.inbox_lease_requests,
+        leases_kept_for_p2p_side: s.leases_kept_for_p2p_side,
         inbox_ops: s.inbox_answered,
         local_ops,
     }

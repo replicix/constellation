@@ -619,3 +619,103 @@ pub fn cto_second_node_joins(_seed: u64) -> Result<()> {
     let _ = a.unmount();
     result
 }
+
+/// EC2 finding R2-4: a fresh `--cto strict` cluster whose nodes mount at
+/// the same moment must come up with a usable root — owned by the
+/// mounting user (the first mount's `adopt_root`), writable, and the same
+/// on every node — exactly like a bounded mount. Two nodes mount
+/// concurrently (the EC2 driver's shape), then each checks the root's
+/// owner and creates a directory in it; a third round mounts in order.
+pub fn cto_strict_root(_seed: u64) -> Result<()> {
+    const NAME: &str = "cto-strict-root";
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    let (env, root) = setup(NAME)?;
+    let mut failures = Vec::new();
+    // (round, mode, nodes, concurrent). EC2 campaign 4's A-0: two or more
+    // nodes' first mount of a new filesystem at the same instant.
+    for (round, mode, nodes, concurrent) in [
+        (0, "strict", 2, true),
+        (1, "bounded", 2, true),
+        (2, "strict", 2, false),
+        (3, "strict", 4, true),
+        (4, "strict", 3, true),
+    ] {
+        let backend = format!("s3://{BUCKET}/{NAME}-{round}-{}", ts());
+        let mut clients = Vec::new();
+        for who in ["a", "b", "c", "d"].iter().take(nodes) {
+            clients.push(
+                Client::new(
+                    root.path(),
+                    &format!("{who}{round}"),
+                    &env.direct_endpoint,
+                    &backend,
+                )?
+                .with_own_node_key()
+                .with_env("CONSTELLATION_CTO", mode),
+            );
+        }
+        clients[0].fs_create()?;
+        let mounted = if concurrent {
+            std::thread::scope(|s| -> Result<()> {
+                let joins: Vec<_> = clients.iter_mut().map(|c| s.spawn(|| c.mount())).collect();
+                for j in joins {
+                    j.join().expect("mount")?;
+                }
+                Ok(())
+            })
+        } else {
+            clients.iter_mut().try_for_each(|c| c.mount())
+        };
+        let result = mounted.and_then(|()| -> Result<()> {
+            for c in &clients {
+                let started = Instant::now();
+                let md = std::fs::metadata(&c.mnt)?;
+                eprintln!(
+                    "    {NAME}: round {round} ({mode}, {nodes} nodes, concurrent={concurrent}) {}: root uid={} gid={} mode={:o} (stat {:?})",
+                    c.name,
+                    md.uid(),
+                    md.gid(),
+                    md.mode() & 0o7777,
+                    started.elapsed()
+                );
+            }
+            for c in &clients {
+                // The root may take a moment to reach a node that did not
+                // adopt it itself (its record arrives by stream or tail).
+                eventually(
+                    &format!("{}'s root is owned by the mounting user", c.name),
+                    Duration::from_secs(10),
+                    || {
+                        let md = std::fs::metadata(&c.mnt)?;
+                        anyhow::ensure!(
+                            md.uid() == uid,
+                            "{} root uid {} (want {uid}), mode {:o}",
+                            c.name,
+                            md.uid(),
+                            md.mode() & 0o7777
+                        );
+                        Ok(())
+                    },
+                )?;
+                std::fs::create_dir(c.mnt.join(format!("d-{}", c.name)))
+                    .with_context(|| format!("mkdir in {}'s root", c.name))?;
+            }
+            Ok(())
+        });
+        if let Err(e) = &result {
+            eprintln!("    {NAME}: round {round} failed: {e:#}");
+            for c in &clients {
+                eprintln!("    {NAME}: {} log:\n{}", c.name, c.tail_log_n(30));
+            }
+            failures.push(format!(
+                "round {round} ({mode}, {nodes} nodes, concurrent={concurrent}): {e:#}"
+            ));
+        }
+        for c in clients.iter_mut().rev() {
+            let _ = c.unmount();
+        }
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}

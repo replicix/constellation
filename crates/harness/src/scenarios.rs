@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod coop_churn;
+mod ec2;
 /// EC2 campaign 4 B-1/B-2: a git repository committed to by two nodes
 /// taking turns under `flock`.
 mod gitflock;
@@ -173,7 +174,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "epoch-peer-reaching-s3-declines",
-        desc: "plan 30 M10: only the holder loses S3; its peer reaches S3 and declines the continuation epoch, so when the holder then dies the peer (its backup) seals and writes within seconds instead of staying frozen (EROFS)",
+        desc: "plan 30 M10: only the holder loses S3; its peer reaches S3 (and says so), so the holder proposes no continuation epoch, and when it then dies the peer (its backup) seals and writes within seconds instead of staying frozen (EROFS)",
         requires: &[],
         run: epoch_peer_reaching_s3_declines,
     },
@@ -734,6 +735,30 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M8: a lone strict node keeps a kernel cache (free on a single node); a second node joins and writes, and the first node's very next open sees it (the latch turns the cache off and drains it before acking the newcomer)",
         requires: &[],
         run: m8::cto_second_node_joins,
+    },
+    Scenario {
+        name: "cto-strict-root",
+        desc: "EC2 finding R2-4: two nodes mount a fresh filesystem at once (strict, bounded) and in order (strict); every node's root must be owned by the mounting user and writable",
+        requires: &[],
+        run: m8::cto_strict_root,
+    },
+    Scenario {
+        name: "s3-cut-one-node",
+        desc: "EC2 finding 1 / R2-1: a non-holder's S3 is black-holed (P2P intact, product S3 retry budget); create+write+close with and without fsync under --write-mode back and through completes during the cut and is visible elsewhere, and unrelated ls -la / stat on that node answer at once while a close is in flight",
+        requires: &[],
+        run: ec2::s3_cut_one_node,
+    },
+    Scenario {
+        name: "p2p-partition-one-node",
+        desc: "EC2 finding 2: one of four writing nodes loses P2P to the others (S3 everywhere); its sustained inbox demand must not move the lease off the majority, whose writes keep forwarding at LAN latency; the isolated node's writes complete through the S3 inbox; everything converges after the heal",
+        requires: &[],
+        run: ec2::p2p_partition_one_node,
+    },
+    Scenario {
+        name: "idle-cost",
+        desc: "EC2 finding R2-2: four converged nodes idle for two minutes with the product's default intervals; S3 requests per node per minute, by kind and key area, on each node's own relay and in status.s3",
+        requires: &[],
+        run: ec2::idle_cost,
     },
     Scenario {
         name: "backup-failover",
@@ -3812,8 +3837,12 @@ fn backup_takeover_held_chunks(name: &str, returns: bool) -> Result<()> {
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
             .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
     };
-    let mut c0 =
-        tune(Client::new(root.path(), "c0", &a_s3.endpoint(), &backend)?).with_write_mode("back");
+    // A's chunks must stay unreachable: no handing them to B, which
+    // reaches S3 and would upload them (the EC2 fix's chunk handoff —
+    // `s3-cut-one-node` covers that path).
+    let mut c0 = tune(Client::new(root.path(), "c0", &a_s3.endpoint(), &backend)?)
+        .with_write_mode("back")
+        .with_env("CONSTELLATION_CHUNK_HANDOFF_AFTER_MS", "0");
     let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
     c0.fs_create()?;
     c0.mount()?;
@@ -4086,37 +4115,32 @@ fn epoch_peer_reaching_s3_declines(_seed: u64) -> Result<()> {
         })?;
         let a_epoch = lease_of(&c0)?["epoch"].as_u64().unwrap_or(0);
         a_s3.cut();
-        // A proposes once S3 has failed for a round interval: wait for its
-        // first proposal to be answered either way.
-        eventually("A proposes an epoch", Duration::from_secs(20), || {
-            let a_log = c0.log_text();
-            anyhow::ensure!(
-                a_log.contains("epoch propose not acked")
-                    || a_log.contains("continuation epoch active"),
-                "A has proposed nothing yet"
-            );
-            Ok(())
-        })?;
-        std::thread::sleep(Duration::from_millis(500));
-        let b_epoch = c1.control_status()?["epoch"].clone();
+        // EC2 follow-up 3c: A's rounds fail, but B answers A's liveness
+        // ping saying its own S3 works: A's outage is its own, not the
+        // bucket's, and A proposes no epoch at all (before, it proposed —
+        // holding its epoch open, no S3 acquisition, while B declined —
+        // every backoff). B's decline stays the second line of defence
+        // (`handle_propose_checked`'s unit tests).
+        eventually(
+            "A sees its S3 outage is its own",
+            Duration::from_secs(20),
+            || {
+                let e = c0.control_status()?["epoch"].clone();
+                anyhow::ensure!(e["own_s3_outage"] == true, "not yet: {e}");
+                Ok(())
+            },
+        )?;
+        std::thread::sleep(Duration::from_secs(3));
+        let a_e = c0.control_status()?["epoch"].clone();
+        let proposed = c0.log_text().contains("epoch propose not acked")
+            || c0.log_text().contains("continuation epoch active")
+            || a_e["proposals"].as_u64().unwrap_or(0) > 0;
         let declined = c1.log_text().contains("not a bucket outage");
-        eprintln!("    {NAME}: B declined: {declined}; B epoch {b_epoch}");
-        if declined {
-            // The declined proposer drops its own promise (it used to
-            // stay `Promised` — open — for good).
-            eventually(
-                "A's declined promise is dropped",
-                Duration::from_secs(10),
-                || {
-                    let e = c0.control_status()?["epoch"].clone();
-                    anyhow::ensure!(
-                        e["members"].as_array().is_some_and(|m| m.is_empty()),
-                        "A still has an open promise: {e}"
-                    );
-                    Ok(())
-                },
-            )?;
-        }
+        eprintln!("    {NAME}: A proposed: {proposed}; B declined: {declined}; A epoch {a_e}");
+        anyhow::ensure!(
+            !proposed && !declined,
+            "A proposed a continuation epoch though B reaches S3: {a_e}"
+        );
         c0.pause()?;
         paused = true;
         let frozen = std::time::Instant::now();
@@ -4146,7 +4170,6 @@ fn epoch_peer_reaching_s3_declines(_seed: u64) -> Result<()> {
             took < Duration::from_secs(10),
             "B took {took:?} to write after A froze"
         );
-        anyhow::ensure!(declined, "B did not decline A's proposal");
         Ok(())
     })();
     if paused {

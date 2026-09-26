@@ -926,9 +926,9 @@ impl NodeRuntime {
                     (peers.clone(), store.inner().clone(), epochs.clone());
                 peers.set_refresher(Arc::new(move || {
                     let (p, store_inner, epochs) = (p.clone(), store_inner.clone(), epochs.clone());
-                    Box::pin(
-                        async move { crate::refresh_peers(&p, store_inner, Some(&epochs)).await },
-                    )
+                    Box::pin(async move {
+                        let _ = crate::refresh_peers(&p, store_inner, Some(&epochs)).await;
+                    })
                 }));
             }
             // Accept inbound peer connections.
@@ -988,12 +988,21 @@ impl NodeRuntime {
                     let mut tick: u64 = 0;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        crate::refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
+                        let scan =
+                            crate::refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
                         let _ = sync_tx.send(fusefs::SyncRequest::Roster(epochs.roster()));
                         peers.probe_all().await;
                         tick += 1;
                         if tick.is_multiple_of(SLACK_REREAD_TICKS) {
                             reread_slack(&store_inner, &sync_tx).await;
+                        }
+                        // The scan just listed and (ETag-cached) read our
+                        // record: live, so there is nothing to check. Only
+                        // an absent or retired one is read directly before
+                        // anything stops (EC2 finding R2-2: this GET was
+                        // one per node every 5 s).
+                        if scan.as_ref().is_some_and(|s| s.is_live(node_id)) {
+                            continue;
                         }
                         match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
                             Ok(None) => {

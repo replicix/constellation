@@ -55,6 +55,9 @@ impl Core {
     ) {
         replica.forget_acked_through(rid.node, rid.incarnation, acked_through);
         self.note_foreign(now, replica, out);
+        if from != self.cfg.node_id {
+            self.note_demand(now, from, true);
+        }
         if self.cfg.placement && self.cfg.delegation && self.root_usable(now) {
             let dirs = Core::dirs_of_keys(&keys_of_op(&op), replica);
             self.place_note(from, dirs);

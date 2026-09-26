@@ -49,6 +49,12 @@ pub struct EpochManager {
     machine: Mutex<EpochMachine>,
     roster: Mutex<Vec<u64>>,
     s3_failure_since: Mutex<Option<std::time::Instant>>,
+    /// EC2 follow-up 3c: at this node's last proposal attempt a live
+    /// member said its S3 works (see `maybe_propose`); cleared by this
+    /// node's next successful round or a proposal attempt that found none.
+    peers_reach_s3: std::sync::atomic::AtomicBool,
+    /// Proposals made (`status.epoch.proposals`).
+    proposals: std::sync::atomic::AtomicU64,
     /// How long S3 must have been failing before a proposal (the sync
     /// interval at least: one full round's worth of failures, not a
     /// blip inside one).
@@ -107,6 +113,8 @@ impl EpochManager {
             machine: Mutex::new(machine),
             roster: Mutex::new(Vec::new()),
             s3_failure_since: Mutex::new(None),
+            peers_reach_s3: std::sync::atomic::AtomicBool::new(false),
+            proposals: std::sync::atomic::AtomicU64::new(0),
             propose_grace: Mutex::new(std::time::Duration::from_millis(500)),
             active: Arc::new(AtomicBool::new(false)),
             frozen: Arc::new(AtomicBool::new(false)),
@@ -215,6 +223,8 @@ impl EpochManager {
             epoch_slack: self.slack(),
             carrier: self.carrier().0.map(|c| c.node),
             promise_until_ms: self.meta.promise_issued().unwrap_or(0),
+            own_s3_outage: self.peers_reach_s3(),
+            proposals: self.proposals.load(Ordering::Relaxed),
             ..Default::default()
         }
     }
@@ -252,6 +262,14 @@ impl EpochManager {
 
     pub fn note_s3_success(&self) {
         *self.s3_failure_since.lock().unwrap() = None;
+        self.peers_reach_s3.store(false, Ordering::Relaxed);
+    }
+
+    /// EC2 follow-up 3c: a live member answered that its S3 works, so this
+    /// node's S3 failure is its own, not a bucket outage (for `status`
+    /// and tests).
+    pub fn peers_reach_s3(&self) -> bool {
+        self.peers_reach_s3.load(Ordering::Relaxed)
     }
 
     /// See `propose_grace`: never below 500 ms.
@@ -457,12 +475,36 @@ impl EpochManager {
                 .filter(|id| *id != self.node_id)
                 .collect();
             let answers =
-                futures::future::join_all(others.iter().map(|id| self.peers.ping_node(*id))).await;
+                futures::future::join_all(others.iter().map(|id| self.peers.ping_node_s3(*id)))
+                    .await;
+            // EC2 follow-up 3c: a live member whose S3 worked just now
+            // says this is not a bucket outage — only this node lost S3.
+            // Such a proposal is declined anyway (a member that reaches S3
+            // declines), and meanwhile this node's promise holds its epoch
+            // open: no S3 acquisition, rounds that only probe — its
+            // closes stalled. So no proposal this time (each attempt asks
+            // again: in a real bucket outage the members stop answering
+            // `s3_ok` at their first failed or hanging request, and the
+            // epoch forms).
+            if let Some(reaching) = others
+                .iter()
+                .zip(&answers)
+                .find(|(_, a)| **a == Some(true))
+                .map(|(id, _)| *id)
+            {
+                self.peers_reach_s3.store(true, Ordering::Relaxed);
+                tracing::info!(
+                    member = reaching,
+                    "not proposing a continuation epoch: a live member reaches S3 (only this node's S3 is away)"
+                );
+                return Ok(false);
+            }
+            self.peers_reach_s3.store(false, Ordering::Relaxed);
             live.extend(
                 others
                     .iter()
                     .zip(answers)
-                    .filter(|(_, up)| *up)
+                    .filter(|(_, up)| up.is_some())
                     .map(|(id, _)| *id),
             );
         }
@@ -481,6 +523,7 @@ impl EpochManager {
             tracing::debug!("not proposing an epoch: this node's promise has not expired");
             return Ok(false);
         }
+        self.proposals.fetch_add(1, Ordering::Relaxed);
         let epoch_id = format!("{}-{}", self.node_id, now_ms());
         let p = EpochPromise::new(epoch_id.clone(), members.clone(), base.clone(), now_ms());
         {
@@ -706,7 +749,30 @@ pub async fn refresh_roster(
     epochs: &EpochManager,
     store: Arc<dyn object_store::ObjectStore>,
 ) -> Option<Vec<u64>> {
-    match constellation_store_s3::write_eligible_roster(store).await {
+    let roster = constellation_store_s3::write_eligible_roster(store).await;
+    let unreachable = roster
+        .as_ref()
+        .is_err_and(|e| !matches!(e, constellation_store_s3::StoreError::Registry(_)));
+    apply_roster(epochs, roster, unreachable)
+}
+
+/// Install a roster read: a complete one is the roster; an incomplete
+/// registry (a record that vanished or does not parse) empties it
+/// (continuation epochs stay unavailable: fail closed); an unreachable
+/// one (`unreachable`) keeps the last complete roster.
+pub fn apply_roster(
+    epochs: &EpochManager,
+    roster: Result<Vec<u64>, constellation_store_s3::StoreError>,
+    unreachable: bool,
+) -> Option<Vec<u64>> {
+    match roster {
+        Err(e) if unreachable => {
+            tracing::warn!(
+                error = %e,
+                "registry unreachable; keeping the last complete write-eligible roster"
+            );
+            None
+        }
         Ok(roster) => {
             epochs.set_roster(roster.clone());
             Some(roster)

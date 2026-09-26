@@ -136,7 +136,9 @@ next append, which is the group commit. The backup refuses appends from
 a sealed epoch or an older holder, stores them in its `backup_tail`
 keyspace, and replies. It trims its copy as segments ship. An idle
 backup gets a heartbeat append every `CONSTELLATION_BACKUP_HEARTBEAT_MS`
-(300 ms).
+(300 ms). Heartbeats never wait on S3: they continue while a slow lease
+renewal leaves the lease inside its expiry margin (nothing new is
+admitted then), and stop only once the lease has actually expired.
 
 **Acknowledgement.** Under `Backup`, the holder answers a mutation
 (accepted *or refused*: a refusal was evaluated against the same
@@ -167,6 +169,17 @@ A backup that has heard nothing from its holder for
 4. re-applies its backup tail, deduplicated by rid, as its own journal
    (the marker records the takeover with a `TailFollows` record);
 5. opens its view.
+
+A node that answers an append with `sealed` (it sealed that epoch,
+possibly in an earlier life) is dropped and never invited again for the
+epoch, and no acknowledgement waits for it as a backup that could be
+had.
+
+A backup that restarts with its role persisted does not count its own
+downtime as the holder's silence: silence counts from the moment its
+P2P link to the holder is up. Until then it re-reads the lease every
+`CONSTELLATION_BACKUP_TAKEOVER_MS` and seals and takes over only a lease
+that has expired (a holder that stopped renewing).
 
 Why it is safe: the old holder needs every listed backup to acknowledge
 anything it acknowledges, so after the seal it can acknowledge nothing,
@@ -359,7 +372,15 @@ Operational rules:
   single crashed holder then blocks TTL failover until it returns or is
   retired with `constellation leave --node-id`, which also fences its
   leases.
-- A member that can still reach S3 declines to join an epoch.
+- An epoch whose claim resolution carried no lease has no hold owner:
+  once S3 is back, any member closes it, frozen or not (nothing was
+  written under it), and the lease is decided by CAS again.
+- A member that can still reach S3 declines to join an epoch. A node
+  whose own S3 fails while a live member answers its liveness ping
+  saying its S3 works (`Pong.s3_ok`) does not propose at all (its
+  outage is its own, not the bucket's: `status.epoch.own_s3_outage`)
+  until its own S3 works again; its closes meanwhile hand their chunks
+  to a peer that reaches S3 (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`).
 - Writes inside an epoch are acknowledged on the hold owner's disk
   alone (no backups).
 - A TTL takeover costs one `heartbeat/` LIST even at `f = 0`.

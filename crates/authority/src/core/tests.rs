@@ -3065,6 +3065,34 @@ mod pipelined_appends {
         );
         assert_eq!(b.meta.backup_acked(1).unwrap(), txs[1].last);
     }
+
+    /// EC2 follow-up 3a: under very slow S3 the holder's lease can sit
+    /// inside its expiry margin while a renewal is still in flight — no
+    /// new mutation is admitted, but the lease is not lost. The holder
+    /// must keep its backups hearing from it (heartbeats never wait on
+    /// S3): before, it dropped its backup set, went silent, and the
+    /// backup sealed the live holder's epoch 1.5 s later.
+    #[test]
+    fn a_holder_whose_renewal_is_slow_keeps_heartbeating_its_backup() {
+        let mut h = holder_with_candidate();
+        let tip = journal(&h, "a", 1);
+        let sent = appends(&journaled(&mut h, 900));
+        ack(&mut h, sent[0].0, tip);
+        // 9.3 s of a 10 s lease: inside the 1 s margin, not expired.
+        h.advance(9_300);
+        assert!(h.core.lease.ship_epoch(h.now, h.core.config()).is_none());
+        let out = journaled(&mut h, 901);
+        assert!(
+            h.core.ack.peers.contains_key(&2),
+            "the backup set was dropped while the lease is still held"
+        );
+        assert_eq!(appends(&out).len(), 1, "no heartbeat: {out:?}");
+        // Past the lease's own expiry the holder stops: the backup may
+        // seal and take over.
+        h.advance(1_000);
+        let _ = journaled(&mut h, 902);
+        assert!(h.core.ack.peers.is_empty(), "an expired lease heartbeats");
+    }
 }
 
 /// Plan 30 §M10: heartbeat promises, the TTL takeover's promise check,
@@ -4170,6 +4198,86 @@ mod backup_crash {
             h.core.lease.classify(now, &cfg, Some((local, tag())), 0),
             Plan::Claim { .. }
         ));
+    }
+
+    /// EC2 follow-up 3b: a node that restarts with a persisted backup
+    /// role has heard nothing because it was down. Before, it sealed its
+    /// (healthy) holder's epoch 1.5 s after mounting and, still listed,
+    /// took the lease over. Now silence counts from when a link to the
+    /// holder is up; until then the lease is read, and only an expired
+    /// one is sealed and taken over.
+    #[test]
+    fn a_restarted_backup_does_not_take_its_downtime_for_holder_silence() {
+        for expired in [false, true] {
+            let meta = Meta::open_in_memory().unwrap();
+            meta.set_node_prefix(2).unwrap();
+            crate::replica::Replica::set_backup_role(
+                &meta,
+                constellation_meta::BackupRole {
+                    holder: 1,
+                    epoch: 1,
+                    config_version: 2,
+                },
+            );
+            let mut cfg = Config::defaults(2, 1);
+            cfg.ttl_ms = 10_000;
+            let mut core = Core::new(cfg);
+            let mut h = Harness {
+                core: Core::new(Config::defaults(2, 1)),
+                meta,
+                now: Ms(1_000_000),
+            };
+            let mut out = Vec::new();
+            core.start(h.now, &h.meta, &mut out);
+            h.core = core;
+            let links = |connected: bool| Event::Peers {
+                links: vec![crate::event::PeerLink {
+                    node: 1,
+                    connected,
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                }],
+            };
+            h.step(links(false));
+            let watch = timers(&out, TimerKind::BackupWatch)[0];
+            h.advance(1_600);
+            let out = h.step(Event::Timer { id: watch });
+            assert_eq!(h.core.stats.seals, 0, "sealed on its own downtime");
+            let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+            let expires = if expired {
+                h.now.0 - 1
+            } else {
+                h.now.0 + 5_000
+            };
+            let out = h.step(Event::S3 {
+                op: get,
+                result: S3Result::LeaseGet(Ok(Some((backup_lease(1, 1, expires, vec![2]), tag())))),
+            });
+            if expired {
+                assert_eq!(
+                    h.core.stats.seals, 1,
+                    "an expired holder: seal and take over"
+                );
+                assert_eq!(h.meta.backup_sealed_epoch().unwrap(), 1);
+                assert!(h.core.lease.takeover_permit.is_some(), "{out:?}");
+                continue;
+            }
+            assert_eq!(h.core.stats.seals, 0, "a renewing holder was sealed");
+            // The link comes up: from now on silence counts as before.
+            h.step(links(true));
+            let watch = timers(&out, TimerKind::BackupWatch)[0];
+            h.advance(1_600);
+            let out = h.step(Event::Timer { id: watch });
+            assert_eq!(h.core.stats.seals, 0, "{out:?}");
+            let watch = timers(&out, TimerKind::BackupWatch)[0];
+            h.advance(1_600);
+            h.step(Event::Timer { id: watch });
+            assert_eq!(
+                h.core.stats.seals, 1,
+                "a holder silent over a live link is sealed"
+            );
+        }
     }
 }
 
@@ -5813,4 +5921,308 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
         "d1/g is streamed speculation here: only the log can order the reply"
     );
     assert_eq!(h.core.stats.deleg_executed, 2);
+}
+/// EC2 finding 2: a holder whose wanter is across a P2P partition from
+/// the nodes using the lease keeps it (the wanter is served through the
+/// inbox); with no P2P demand of its own side — an isolated holder, or
+/// M13's no-P2P shape — it hands over after the wanted grace as before.
+#[test]
+fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
+    fn links(h: &mut Harness, connected: &[NodeId]) {
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: connected.contains(&node),
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                })
+                .collect(),
+        });
+    }
+    /// Run one round from the poll timer; whether it released the lease.
+    fn round_releases(h: &mut Harness) -> bool {
+        let mut out = Vec::new();
+        h.core.start(h.now, &h.meta, &mut out);
+        let Some(poll) = timers(&out, TimerKind::Poll).first().copied() else {
+            return false;
+        };
+        let mut out = h.step(Event::Timer { id: poll });
+        for _ in 0..8 {
+            if let Some(op) = out.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                out = h.step(Event::UploadsDone {
+                    op,
+                    result: UploadResult::Done { held: 0 },
+                });
+                continue;
+            }
+            let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
+                .into_iter()
+                .map(|(op, req)| (op, req.clone()))
+                .collect();
+            match ops.as_slice() {
+                [(_, S3Op::LeaseSwap { lease, .. })] if lease.released => return true,
+                // The round renews first.
+                [(op, S3Op::LeaseSwap { .. })] => {
+                    out = h.step(Event::S3 {
+                        op: *op,
+                        result: S3Result::LeasePut(Ok(tag())),
+                    });
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+    for (case, connected, p2p_users, keep) in [
+        // Node 4 is cut off; 2 and 3 forward to us over P2P: keep.
+        ("majority holder", &[2, 3][..], &[2, 3][..], true),
+        // 2+2: holder and 2 vs 3 and 4 (both want): a tie keeps it.
+        ("even split", &[2][..], &[2][..], true),
+        // Nobody on our side used it over P2P: hand over (M13 as ever).
+        ("no p2p demand", &[2, 3][..], &[][..], false),
+        // An isolated holder: nobody reaches it, the wanter takes over.
+        ("isolated holder", &[][..], &[][..], false),
+    ] {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        links(&mut h, connected);
+        let wanters: Vec<NodeId> = (2..=4).filter(|n| !connected.contains(n)).collect();
+        // Past the dwell; the wanters asked (inbox batches with
+        // `wants_lease`), and the near side forwarded, within the window.
+        h.advance(6_000);
+        for w in &wanters {
+            h.core.note_demand(h.now, *w, false);
+            h.core.lease.note_wanted(h.now, *w);
+        }
+        for u in p2p_users {
+            h.core.note_demand(h.now, *u, true);
+        }
+        h.advance(h.core.config().wanted_grace_ms + 100);
+        let released = round_releases(&mut h);
+        assert_eq!(!released, keep, "{case}: released {released}");
+        if keep {
+            assert!(h.core.stats.leases_kept_for_p2p_side > 0, "{case}");
+        }
+    }
+}
+
+/// EC2 follow-up (d): a continuation epoch that carries no lease (the
+/// claim resolution found the holder's claim stale) and then froze (a
+/// member went missing) has no hold owner. Before, only a hold owner
+/// probed a frozen epoch and only a holder closed one, so once S3 came
+/// back nobody ever closed it: nothing shipped, and FUSE hung for good.
+/// Now every member of such an epoch probes and, S3 back, closes it.
+#[test]
+fn a_frozen_epoch_carrying_no_lease_is_closed_once_s3_is_back() {
+    let mut h = Harness::new(2);
+    h.step(Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Epoch {
+            open: true,
+            active: true,
+            frozen: true,
+            flushing: false,
+            base: 0,
+            members: vec![1, 2, 3, 4],
+            carrier: None,
+            stale_below: 2,
+        },
+    });
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let out = h.step(Event::Timer { id: poll });
+    let probe = s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+        .map(|(op, _)| op)
+        .unwrap_or_else(|| panic!("a frozen epoch with no hold owner is never probed: {out:?}"));
+    let out = h.step(Event::S3 {
+        op: probe,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("S3 is back but the epoch is not flushed: {out:?}"));
+    let out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    assert!(
+        out.iter().any(|a| matches!(a, Action::EpochClose)),
+        "the epoch is not closed: {out:?}"
+    );
+}
+
+/// EC2 follow-up (e): a candidate backup that answers `sealed` for the
+/// epoch held (a seal it persisted for it before) is not asked again for
+/// that epoch — before, the next housekeeping tick brought it up again,
+/// every ~100 ms, forever — and does not keep acknowledgements waiting
+/// for a backup that cannot be had.
+#[test]
+fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
+    let mut h = Harness::new(1);
+    h.step(Event::Roster {
+        write_eligible: vec![1, 2],
+    });
+    h.step(Event::Peers {
+        links: vec![crate::event::PeerLink {
+            node: 2,
+            connected: true,
+            last_seen: Some(h.now),
+            rtt_ms: Some(1),
+            since: Some(Ms(h.now.0 - 60_000)),
+        }],
+    });
+    h.hold(1, None);
+    let mut invited = 0;
+    let mut sealed_answers = 0;
+    for i in 0..20u64 {
+        if let Some(id) = h.core.ack.tick_timer {
+            h.step(Event::Timer { id });
+        } else {
+            h.step(Event::Control {
+                op: OpId(900 + i),
+                req: Control::Journaled,
+            });
+        }
+        if h.core.ack.candidate == Some(2) {
+            invited += 1;
+            // Answer every append in flight: sealed.
+            let reqs: Vec<OpId> = h.core.ack.peers[&2]
+                .inflight
+                .iter()
+                .map(|e| e.req)
+                .collect();
+            for req in reqs {
+                sealed_answers += 1;
+                h.step(Event::Peer {
+                    from: 2,
+                    msg: PeerMsg::BackupAck {
+                        req,
+                        epoch: 1,
+                        acked: 0,
+                        sealed: true,
+                    },
+                });
+            }
+        }
+        h.advance(200);
+    }
+    assert!(sealed_answers >= 1, "the candidate was never streamed to");
+    assert_eq!(invited, 1, "re-invited a backup that sealed the epoch");
+    assert_eq!(h.core.ack.eligible, Some(false), "still waiting for it");
+}
+
+/// EC2 follow-up (the 4-node `cto-strict-root` EIO): an op that went to
+/// the holder's inbox because the holder was not yet reachable over P2P
+/// (a node mounting with others learned the holder from the lease before
+/// its link was up) is forwarded by rid once the link is up — the holder
+/// polls only unconnected requesters' inboxes, so before, the op waited
+/// out the inbox deadline (2×TTL) and answered EIO.
+#[test]
+fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
+    use constellation_store_s3::inbox::InboxKey;
+    let mut h = Harness::new(1);
+    let rid = h.rid(1);
+    h.core.lease.cached_holder = Some(2);
+    let mut out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: h.create("a"),
+    });
+    // Into the inbox (as when the forward could not be sent).
+    h.core.inbox_enqueue(h.now, rid, 1, &h.meta, &mut out);
+    for _ in 0..6 {
+        let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
+            .into_iter()
+            .map(|(o, r)| (o, r.clone()))
+            .collect();
+        let mut next = Vec::new();
+        for (op, req) in ops {
+            let result = match req {
+                S3Op::InboxLastN { .. } => S3Result::InboxLastN(Ok(None)),
+                S3Op::InboxPut { .. } => S3Result::InboxPut(Ok(())),
+                _ => continue,
+            };
+            next.extend(h.step(Event::S3 { op, result }));
+        }
+        if next.is_empty() {
+            break;
+        }
+        out = next;
+    }
+    assert!(
+        matches!(
+            h.core.clients().next(),
+            Some((_, ClientPhase::InboxWaiting))
+        ),
+        "{:?}",
+        h.core.clients().collect::<Vec<_>>()
+    );
+    // The link to the holder comes up; the recheck reads the lease.
+    h.step(Event::Peers {
+        links: vec![crate::event::PeerLink {
+            node: 2,
+            connected: true,
+            last_seen: Some(h.now),
+            rtt_ms: Some(1),
+            since: Some(h.now),
+        }],
+    });
+    let id = h.core.inbox.recheck_timer.expect("a recheck armed");
+    h.advance(1_100);
+    let out = h.step(Event::Timer { id });
+    let get = s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::LeaseGet))
+        .map(|(op, _)| op)
+        .expect("the recheck reads the lease");
+    let lease = Lease {
+        v: 1,
+        partition: "p0".into(),
+        holder: 2,
+        epoch: 1,
+        expires_unix_ms: h.now.0 + 30_000,
+        released: false,
+        wanted_by: Vec::new(),
+        backups: Vec::new(),
+        config_version: 1,
+        ack_policy: constellation_store_s3::AckPolicy::Local,
+        granted_delegations: false,
+        retired: Vec::new(),
+    };
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((lease, tag())))),
+    });
+    // The batch is withdrawn first, then the op is forwarded.
+    let (op, req) = s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::InboxDelete { .. }))
+        .unwrap_or_else(|| panic!("the waiting op was not re-routed: {out:?}"));
+    assert!(matches!(
+        req,
+        S3Op::InboxDelete {
+            key: InboxKey { node: 1, .. }
+        }
+    ));
+    let out = h.step(Event::S3 {
+        op,
+        result: S3Result::InboxDelete(Ok(())),
+    });
+    assert!(
+        matches!(sends(&out).first(), Some((2, PeerMsg::MutateRequest { rid: r, .. })) if *r == rid),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 1);
 }

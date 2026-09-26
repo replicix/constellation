@@ -827,8 +827,10 @@ fn regression_every_inbox_batch_of_a_rid_is_withdrawn() {
     // Re-pinned after plan 30 M9's rebase (the holder journals refusals
     // now, which shifts every schedule): `find_multi_batch_withdraw_seeds`
     // over 10000–11999 found 13 seeds on this tree; these two reach it
-    // twice each.
-    for seed in [10729, 11608] {
+    // twice each. EC2 follow-up (an inbox-waiting op is forwarded once the
+    // holder is reachable) moved the schedules again: 10396 and 11750
+    // reach it four times each now (10729 and 11608 no longer do).
+    for seed in [10396, 11750] {
         let report = run_seed(seed, long_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         let multi: u64 = report
             .stats

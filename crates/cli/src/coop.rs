@@ -226,6 +226,31 @@ pub struct Coop {
     /// Exact mode: peers that need a reconciliation session.
     sync_tx: tokio::sync::mpsc::UnboundedSender<u64>,
     sync_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u64>>>,
+    /// EC2 finding 1: dirty chunks this node has handed to a peer to
+    /// upload for it (`ChunkHandoff`), served to peers while the handoff
+    /// is in flight although they are not durable yet (counted: several
+    /// handoffs may offer one chunk).
+    offered: Mutex<HashMap<ChunkHash, u32>>,
+}
+
+/// [`Coop::offer`]'s claim: the chunks stay servable until it drops.
+pub(crate) struct Offer {
+    coop: Arc<Coop>,
+    hashes: Vec<ChunkHash>,
+}
+
+impl Drop for Offer {
+    fn drop(&mut self) {
+        let mut offered = self.coop.offered.lock().unwrap();
+        for hash in &self.hashes {
+            if let Some(n) = offered.get_mut(hash) {
+                *n -= 1;
+                if *n == 0 {
+                    offered.remove(hash);
+                }
+            }
+        }
+    }
 }
 
 /// Global and per-peer serving concurrency, under one lock so the
@@ -311,7 +336,44 @@ impl Coop {
             sync_tx,
             sync_rx: Mutex::new(Some(sync_rx)),
             config,
+            offered: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// EC2 finding 1: make `hashes` servable to peers — dirty or not —
+    /// while the returned claim lives (a `ChunkHandoff` in flight).
+    pub(crate) fn offer(self: &Arc<Self>, hashes: &[ChunkHash]) -> Offer {
+        let mut offered = self.offered.lock().unwrap();
+        for hash in hashes {
+            *offered.entry(*hash).or_default() += 1;
+        }
+        Offer {
+            coop: self.clone(),
+            hashes: hashes.to_vec(),
+        }
+    }
+
+    fn is_offered(&self, hash: &ChunkHash) -> bool {
+        self.offered.lock().unwrap().contains_key(hash)
+    }
+
+    /// EC2 finding 1: fetch `hash` from `peer` for a `ChunkHandoff` it
+    /// sent us (it offered the chunk), verified like any peer fetch.
+    pub(crate) async fn fetch_handed_off(&self, peer: u64, hash: &ChunkHash) -> Result<Vec<u8>> {
+        let busy_until = Instant::now() + Duration::from_secs(5);
+        match self
+            .fetch_from(
+                SourceId::Peer(peer),
+                hash,
+                DecodePriority::Demand,
+                busy_until,
+            )
+            .await
+        {
+            FetchResult::Data { data, .. } => Ok(data),
+            FetchResult::Miss(why) => anyhow::bail!("peer {peer} declined {hash}: {why:?}"),
+            _ => anyhow::bail!("fetching {hash} from peer {peer} failed"),
+        }
     }
 
     #[cfg(test)]
@@ -437,15 +499,24 @@ impl Coop {
         hash: [u8; 32],
         from_hex: &str,
     ) -> Result<Vec<u8>, ChunkDecline> {
-        if !self.config.enabled {
+        // A chunk handed off to a peer (EC2 finding 1) is served to it
+        // although dirty, and whether or not the cooperative cache is on.
+        let offered = self.is_offered(&ChunkHash(hash));
+        if !self.config.enabled && !offered {
             return Err(ChunkDecline::Busy);
         }
         let _slot = self.try_serve_slot(from_hex).ok_or(ChunkDecline::Busy)?;
         let this = self.clone();
-        let read = tokio::task::spawn_blocking(move || this.cache.get_servable(&ChunkHash(hash)))
-            .await
-            .map_err(|_| ChunkDecline::Busy)?
-            .map_err(|_| ChunkDecline::Busy)?;
+        let read = tokio::task::spawn_blocking(move || {
+            if offered {
+                this.cache.get(&ChunkHash(hash))
+            } else {
+                this.cache.get_servable(&ChunkHash(hash))
+            }
+        })
+        .await
+        .map_err(|_| ChunkDecline::Busy)?
+        .map_err(|_| ChunkDecline::Busy)?;
         let Some(data) = read else {
             return Err(self.absence_reason(&hash));
         };

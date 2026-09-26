@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use constellation_store_s3::{ChunkStore, FsMeta, MissingFs, StoreError};
 use object_store::prefix::PrefixStore;
 use object_store::ObjectStore;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Where a backend URL resolved to: the store a command actually talks
@@ -54,7 +55,16 @@ pub async fn open_backend_described(url: &str) -> Result<(Arc<dyn ObjectStore>, 
         if bucket.is_empty() {
             bail!("missing bucket in {url:?}");
         }
-        let mut retry = object_store::RetryConfig::default();
+        // EC2 finding 1: object_store's default retry budget (180 s) put up
+        // to three minutes of retries on an unreachable S3 behind every
+        // request — including the ones a FUSE operation waits on (a chunk
+        // no peer has, a write-through upload no peer can take over).
+        // Every caller here has its own retry loop (sync rounds, uploads,
+        // lease renewals), so one request series gives up after 30 s.
+        let mut retry = object_store::RetryConfig {
+            retry_timeout: std::time::Duration::from_secs(30),
+            ..object_store::RetryConfig::default()
+        };
         if let Ok(n) = std::env::var("CONSTELLATION_S3_MAX_RETRIES") {
             if let Ok(n) = n.parse() {
                 retry.max_retries = n;
@@ -78,11 +88,12 @@ pub async fn open_backend_described(url: &str) -> Result<(Arc<dyn ObjectStore>, 
             url: url.to_string(),
             s3: Some(resolution),
         };
-        if prefix.is_empty() {
-            Ok((Arc::new(s3), info))
+        let s3: Arc<dyn ObjectStore> = if prefix.is_empty() {
+            Arc::new(s3)
         } else {
-            Ok((Arc::new(PrefixStore::new(s3, prefix)), info))
-        }
+            Arc::new(PrefixStore::new(s3, prefix))
+        };
+        Ok((Arc::new(CountingStore { inner: s3 }), info))
     } else {
         let path = url.strip_prefix("file://").unwrap_or(url);
         if !path.starts_with('/') {
@@ -153,9 +164,293 @@ pub fn missing_fs_message(
     msg
 }
 
+/// EC2 finding R2-2: every object-store request this daemon issues, by
+/// kind and key area, for `status` (the tester could count sync rounds,
+/// not requests).
+#[derive(Default)]
+struct RequestCounts {
+    get: AtomicU64,
+    head: AtomicU64,
+    put: AtomicU64,
+    list: AtomicU64,
+    delete: AtomicU64,
+    copy: AtomicU64,
+    by_area: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+}
+
+fn counts() -> &'static RequestCounts {
+    static COUNTS: std::sync::OnceLock<RequestCounts> = std::sync::OnceLock::new();
+    COUNTS.get_or_init(RequestCounts::default)
+}
+
+fn count(kind: &'static str, location: Option<&object_store::path::Path>) {
+    let c = counts();
+    let n = match kind {
+        "GET" => &c.get,
+        "HEAD" => &c.head,
+        "PUT" => &c.put,
+        "LIST" => &c.list,
+        "DELETE" => &c.delete,
+        _ => &c.copy,
+    };
+    n.fetch_add(1, Ordering::Relaxed);
+    let area = location
+        .and_then(|l| l.as_ref().split('/').next().map(str::to_string))
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| "/".to_string());
+    *c.by_area
+        .lock()
+        .unwrap()
+        .entry(format!("{kind} {area}"))
+        .or_default() += 1;
+}
+
+/// EC2 finding 1: when S3 last answered a request (unix ms; 0: never) —
+/// a success, or an answer that is an error of the request (not found, a
+/// failed precondition), which proves the path works as well. A
+/// black-holed S3 path answers nothing: every request waits out its
+/// timeouts and retries, then fails. A drain whose own uploads make no
+/// progress hands its chunks to a peer only while this is old too, so
+/// one slow upload on a slow but working link (the registry poll and the
+/// sync rounds keep completing around it) is not mistaken for an outage.
+static LAST_COMPLETED_MS: AtomicI64 = AtomicI64::new(0);
+/// When a request last failed without an answer (unix ms; 0: never).
+static LAST_FAILED_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Requests in flight: id → start (unix ms), for [`s3_path_ok`] to tell
+/// a hanging (black-holed) path from an idle one.
+fn in_flight() -> &'static std::sync::Mutex<std::collections::HashMap<u64, i64>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, i64>>> =
+        std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+/// Registers a request in flight until dropped.
+struct Flight(u64);
+
+impl Flight {
+    fn start() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        in_flight()
+            .lock()
+            .unwrap()
+            .insert(id, constellation_store_s3::lease::now_unix_ms());
+        Flight(id)
+    }
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        in_flight().lock().unwrap().remove(&self.0);
+    }
+}
+
+fn completed() {
+    LAST_COMPLETED_MS.store(
+        constellation_store_s3::lease::now_unix_ms(),
+        Ordering::Relaxed,
+    );
+}
+
+/// Record a request's outcome: answered (success or a request error), or
+/// failed without an answer.
+fn note<T>(r: &object_store::Result<T>) {
+    use object_store::Error as E;
+    match r {
+        Ok(_)
+        | Err(E::NotFound { .. })
+        | Err(E::Precondition { .. })
+        | Err(E::AlreadyExists { .. })
+        | Err(E::NotModified { .. }) => {
+            completed();
+            // The latest word is an answer.
+            LAST_FAILED_MS.store(0, Ordering::Relaxed);
+        }
+        Err(_) => LAST_FAILED_MS.store(
+            constellation_store_s3::lease::now_unix_ms(),
+            Ordering::Relaxed,
+        ),
+    }
+}
+
+/// When S3 last answered a request (unix ms; 0: never).
+pub fn last_s3_completion_ms() -> i64 {
+    LAST_COMPLETED_MS.load(Ordering::Relaxed)
+}
+
+/// EC2 follow-up 3c: whether this daemon's S3 path is working right now,
+/// as far as its own requests show: the last one answered (no failure
+/// since), within `recent_ms`, and no request has been hanging for more
+/// than `hang_ms` (a black hole answers nothing and fails nothing for a
+/// long while).
+pub fn s3_path_ok(recent_ms: i64, hang_ms: i64) -> bool {
+    let now = constellation_store_s3::lease::now_unix_ms();
+    let answered = LAST_COMPLETED_MS.load(Ordering::Relaxed);
+    let failed = LAST_FAILED_MS.load(Ordering::Relaxed);
+    if answered == 0 || failed >= answered || now - answered >= recent_ms {
+        return false;
+    }
+    let oldest = in_flight().lock().unwrap().values().copied().min();
+    oldest.is_none_or(|start| now - start < hang_ms)
+}
+
+/// The counts so far (`status.s3`).
+pub fn s3_request_counts() -> constellation_api::S3RequestStatus {
+    let c = counts();
+    constellation_api::S3RequestStatus {
+        get: c.get.load(Ordering::Relaxed),
+        head: c.head.load(Ordering::Relaxed),
+        put: c.put.load(Ordering::Relaxed),
+        list: c.list.load(Ordering::Relaxed),
+        delete: c.delete.load(Ordering::Relaxed),
+        copy: c.copy.load(Ordering::Relaxed),
+        by_area: c.by_area.lock().unwrap().clone(),
+    }
+}
+
+/// An S3 backend that counts what it is asked (`RequestCounts`).
+#[derive(Debug)]
+struct CountingStore {
+    inner: Arc<dyn ObjectStore>,
+}
+
+impl std::fmt::Display for CountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        count("PUT", Some(location));
+        let _flight = Flight::start();
+        let r = self.inner.put_opts(location, payload, opts).await;
+        note(&r);
+        r
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        count("PUT", Some(location));
+        let _flight = Flight::start();
+        let r = self.inner.put_multipart_opts(location, opts).await;
+        note(&r);
+        r
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        count(if options.head { "HEAD" } else { "GET" }, Some(location));
+        let _flight = Flight::start();
+        let r = self.inner.get_opts(location, options).await;
+        note(&r);
+        r
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        use futures::StreamExt;
+        self.inner.delete_stream(
+            locations
+                .inspect(|l| {
+                    if let Ok(l) = l {
+                        count("DELETE", Some(l));
+                    }
+                })
+                .boxed(),
+        )
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        count("LIST", prefix);
+        self.inner.list(prefix).inspect(note).boxed()
+    }
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        count("LIST", prefix);
+        self.inner
+            .list_with_offset(prefix, offset)
+            .inspect(note)
+            .boxed()
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        count("LIST", prefix);
+        let _flight = Flight::start();
+        let r = self.inner.list_with_delimiter(prefix).await;
+        note(&r);
+        r
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        count("COPY", Some(to));
+        let _flight = Flight::start();
+        let r = self.inner.copy_opts(from, to, options).await;
+        note(&r);
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EC2 follow-up 3c: the path is OK after an answer (a 404 counts),
+    /// not after a failure, and not while a request hangs.
+    #[test]
+    fn s3_path_ok_needs_a_recent_answer_and_nothing_hanging() {
+        note::<()>(&Err(object_store::Error::NotFound {
+            path: "x".into(),
+            source: "404".into(),
+        }));
+        assert!(s3_path_ok(15_000, 3_000), "an answer (404) proves the path");
+        note::<()>(&Err(object_store::Error::Generic {
+            store: "S3",
+            source: "error sending request".into(),
+        }));
+        assert!(
+            !s3_path_ok(15_000, 3_000),
+            "a failure since the last answer"
+        );
+        note::<()>(&Ok(()));
+        assert!(s3_path_ok(15_000, 3_000));
+        let hanging = Flight::start();
+        in_flight().lock().unwrap().insert(
+            hanging.0,
+            constellation_store_s3::lease::now_unix_ms() - 5_000,
+        );
+        assert!(!s3_path_ok(15_000, 3_000), "a request hanging 5 s");
+        drop(hanging);
+        assert!(s3_path_ok(15_000, 3_000));
+    }
 
     #[tokio::test]
     async fn local_paths_accepted() {

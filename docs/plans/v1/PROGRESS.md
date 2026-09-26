@@ -24135,3 +24135,681 @@ leading `/` to the root. All five pass in debug.
 carries only the owner's own position; what its holder did is at most
 what some sequencer acknowledged. The session watermark keeps only the
 newest 8 generations when more than 8 unapplied ones are owed at once.
+## Fix: EC2 real-S3 findings (cto=strict root, S3-cut close stall, partition takeover, idle cost)
+
+Coder, 2026-09-25, branch `fix-ec2-findings` at main `5384772`. Source:
+`constellation-m14/EC2-BRUTAL-REPORT.md` (Findings 1–3 and Round 2) and
+its logs. Every finding was reproduced locally first with a new harness
+scenario (`crates/harness/src/scenarios/ec2.rs`, plus `cto-strict-root`
+in `m8.rs`) that fails before the fix and passes after it. Local timings
+below come from a CPU-limited machine: they show which wait fired, not
+how fast anything is.
+
+### 1. `--cto strict` root is `root:root 0755` and unwritable (R2-4) — High
+
+**Root cause.** Genesis creates the root as `0:0 0755`. The first mount
+hands it to the mounting user in `adopt_root` (`main.rs`) with one
+`Policy::System` Setattr through the core. A System op does not wait:
+one forward to the known holder, then at most one acquisition, and if
+that acquisition does not open the view it answers `InDoubt`. Under
+`--cto strict`, two nodes mounting together see each other at once
+(`note_foreign`), and that arms the one-time kernel-cache drain (1 s).
+The drain joins the read-delegation quarantine, so the node that wins
+the lease finishes its acquisition with the takeover gate still shut
+(`GateStep::Wait`, "takeover gate waits out the read-delegation
+quarantine"). Its own adoption was then answered in doubt ("root
+adoption deferred"). The other node's forward was refused by the gated
+holder, and its acquisition found the lease held, so it deferred too.
+Nobody tried again, and the root stayed genesis' for good. Without
+`allow_other` the kernel also refuses root (`sudo mkdir` got EACCES).
+Bounded mounts arm no drain, which is why they worked. It is not
+specific to M14: main has the same code path.
+
+**Fix.** `adopt_root` retries until the root has an owner: its own
+attempt, or anyone's, seen by tailing. It retries every 250 ms for up to
+10 s before the mount appears, then keeps going in the background with
+backoff (1 s doubling to 60 s). A failed tail no longer fails the mount.
+
+On EC2 the tested binary predated main's allowlist fix (`5384772`).
+The joining node's forward may also have been refused that way, but the
+holder's own deferral is the gate: it reproduces on `5384772`, which has
+that fix.
+
+**Evidence.** `cto-strict-root` (two nodes mounting at once, strict and
+then bounded, then in order, strict; the root must be the user's and
+`mkdir` must work on both nodes):
+- before (main `5384772` binary, same scenario): round 0 (strict,
+  concurrent) failed. Both nodes showed `uid=0 gid=0 mode=755`, and both
+  logs said `root adoption deferred`; the holder's log had "takeover gate
+  waits out the read-delegation quarantine" just before. Rounds 1 and 2
+  passed.
+- after: 11/11 passed, with every root `1000:1000` from the first stat.
+
+### 2. S3 cut on one node blocks create+close for the whole outage (Finding 1, R2-1) — Medium-High
+
+**What the close waited on.** Not the metadata sync round. The create
+is forwarded over P2P and returned at once (`forwarded_ok` 5 in the
+cut node's status). The close (`flush_inode`) of a non-holder calls
+`commit_manifest_forwarded`, which uploads the file's chunks
+(`drain_inode`) *before* forwarding the manifest. That is plan 08's
+invariant: every chunk a segment references is in S3 before the
+segment ships, and the holder ships forwarded manifests on its own
+schedule. So `--write-mode back` could not help a non-holder: the
+upload is inline in its close in both modes. With a firewall DROP,
+each PUT waited out object_store's retries (10 retries, 180 s budget).
+The uploader makes 3 attempts per chunk. The close returned only when
+S3 came back. The "sync round failed / registry unreachable" log lines
+are the background loop failing alongside it; they block nothing.
+
+**The unrelated `ls` (round 1).** The stuck close held its write shard
+(`WriteShards`, `ino % 256`) for the whole flush, including the drain.
+`getattr` and `lookup` of *every* inode in that shard waited behind it,
+the root among them whenever `ino ≡ 1 (mod 256)`. So an `ls -la` of a
+directory with a few hundred files hit the stuck shard. `do_read` held
+its shard across chunk fetches the same way.
+
+**Fix.**
+- *Chunk handoff* (`authority_driver::drain_with_handoff`,
+  `ChunkHandoff`). A drain whose node's S3 path makes no progress hands
+  the chunks to a peer that can reach S3: the lease holder first, then
+  any other connected peer. "No progress" means no chunk PUT and no
+  other S3 request succeeded for `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`,
+  default 6 s. That is longer than the 5 s registry poll, so a slow but
+  working link always shows a success inside the window, and one long
+  upload is not mistaken for an outage. Only successes count: a
+  black-holed request fails only after its whole retry budget. The
+  requester sends `Payload::ChunkHandoff { hashes }`. The peer fetches
+  each chunk from the requester with an ordinary `ChunkRequest`: the
+  requester serves its dirty chunks while the handoff is in flight
+  (`Coop::offer`). The peer verifies each chunk's hash, uploads it,
+  keeps a clean copy, and answers once all are in S3. The requester
+  then acknowledges its pending rows and forwards the manifest as
+  before. So plan 08's invariant holds unchanged: only *who* uploads
+  changes. This serves both modes and `fsync`. `through` still means
+  "in S3 before the close returns". After a handoff, the next drains
+  hand off at once for 30 s while there is still no progress. The
+  node's own upload keeps running in the background; a repeat PUT of
+  content-addressed data is harmless. Status:
+  `writeback.handoffs_sent/ok`, `handoff_chunks`,
+  `handoff_chunks_accepted`.
+- *No shard lock across slow work* (`fusefs.rs`). New `InodeOps` is a
+  per-inode lock, re-entrant on one thread. It orders `read`, `write`,
+  `truncate`, `fallocate`, `lseek` and `flush` on the *same* inode. A
+  flush (and a read that overlays a session) *detaches* the session
+  from its shard, and `WriteShards::detached` keeps its pending size
+  visible to `getattr`/`lookup`. So compose, commit (forward) and drain
+  run with no shard held. The ordering argument `getattr` relied on
+  holds: the session and its detached size are swapped under the shard
+  lock, and the detached size is retired only after the commit.
+- *Bounded S3 waits.* The product's default `RetryConfig.retry_timeout`
+  is now 30 s instead of object_store's 180 s
+  (`CONSTELLATION_S3_RETRY_TIMEOUT_MS` still overrides it). Every caller
+  has its own retry loop.
+
+**What still waits or fails.** With no reachable peer that can reach
+S3 (a single node, P2P off, every peer also cut), a write-through close
+or `fsync` still needs S3, as documented. It waits for the node's own
+upload, now at most about 3 × 30 s, and then returns EIO. A
+non-holder keeps the unpublished session, so a later flush retries. A
+holder's commit stands, and its rounds keep uploading. A back-mode close on the *holder*
+never waited (its round drains). A read of a chunk no peer has still
+needs S3. Warm metadata and cached reads were never affected.
+
+**Evidence.** `s3-cut-one-node`: three nodes; C, a non-holder, is
+black-holed (`CountingProxy::blackhole`: accepted, never answered, like
+a firewall DROP) and runs the product's S3 retry budget. For `back` and
+then `through`, during the cut:
+- a create+write+close and a create+write+fsync+close on C, and their
+  visibility on A and B;
+- concurrently on C: an `ls -la` of a 300-file directory (it covers
+  every write shard), an `ls -la` of the closing file's own directory
+  (the OVH run's variant), and a root `stat`.
+
+Results:
+- before (main `5384772` binary): all four closes were still blocked
+  after 20 s of cut, and completed only after the heal. The other
+  directory's `ls -la` blocked for more than 5 s three times out of
+  four, the same directory's four times out of four, and the root
+  `stat` once.
+- after, 11 runs: the first close after the cut takes 6.0 s (the
+  detection window), then hands off; every later close takes 60–130 ms
+  (sticky) in both modes, with and without `fsync`. All concurrent
+  reads answered within 21 ms, the root `stat` within 2 ms. The files
+  are visible on A and B during the cut; C's pending uploads are 0
+  after the heal. `status.writeback`: `handoffs_ok` 2 per mode, one
+  chunk each.
+- The OVH run (Finding 2) is the same stall: an `fsync` and an `ls` of
+  the same directory hung for the ~82–85 s of retry exhaustion, which
+  is the shard lock (the `ls` stats the file whose flush holds it) and
+  the inline upload. Both are covered above.
+- Unit test `a_close_stuck_in_its_drain_holds_no_write_shard`: the
+  shard is free and the size is visible while the drain waits, and a
+  write to the same file waits. It fails before the fix, because the
+  flush held the shard. Also `inode_ops_block_only_the_same_inode_and_reenter`.
+
+### 3. A single-node P2P partition stalls the majority 25–44 s (Finding 2) — Medium
+
+**What the 44 s was.** None of the suspected causes; this was not a
+failover at all:
+- the lease TTL (60 s): nobody waited for an expiry;
+- the 3 s non-backup takeover delay;
+- an isolated holder renewing;
+- promise waits.
+
+From `ec2-logs/part1` (node ids: a=4, b=2, c=3, d=1; d was isolated;
+b held the lease, with a as its backup):
+1. 12:05:46–49: a, b and c evicted their P2P connections to d.
+2. 12:05:55: d's forwards had nowhere to go, so it used the S3 inbox
+   (plan 30 §M13). Its sustained demand escalated: "inbox: sustained
+   demand; asking for the lease". d wrote itself into the lease's
+   `wanted_by`.
+3. 12:06:02–03: b, the healthy holder serving the majority over P2P,
+   saw a wanter. It was past the 5 s dwell and the 5 s wanted grace
+   (`wants_handoff`), so it idle-released the lease.
+4. 12:06:04: a, b's backup, saw the holder go silent (it had released)
+   and sealed: "holder silent: sealed its epoch; reading the lease to
+   take over". It found itself no longer a listed backup and stood
+   down. A false alarm with no effect.
+5. 12:06:06.9: d won the CAS: "acquired the lease node=1 epoch=2".
+6. From then on every majority write had to reach d through the S3
+   inbox, after its forward to the old holder timed out. d polled
+   their inboxes.
+7. 12:06:44: d idle-released, 30 s after its last write
+   (`idle_release_ms`).
+8. 12:06:48: a acquired epoch 3.
+
+The majority probe's 36.6 s is the span from the start of the
+partition to the end of d's tenure. The 2+2 split followed the same
+path: the holder released to the far side's inbox wanters, and a
+waited out an in-doubt inbox wait before its own acquisition.
+
+So the design's "detection + 1 CAS (~1–2 s)" (§3) never came into
+play. That row is for a holder that is *away*. Here the holder was
+healthy, and M13's escalation handed the lease to the one node nobody
+could reach over P2P. Escalation is right when nobody has P2P (the
+`lease-handover` shape) and wrong in a partition of a connected
+cluster.
+
+**Fix** (`Core::keeps_lease_for_p2p_side`, `core/inbox.rs`, checked in
+`round_release`). The holder now records which nodes had mutations
+executed over P2P (`on_mutate_request`) and which through its inbox,
+within the escalation window. It keeps the lease when all of these
+hold:
+- every wanter is one it is not P2P-connected to (the inbox poll's
+  notion of "connected");
+- some node it *is* connected to used it over P2P in the window;
+- that side (itself included) is at least as large as the far side
+  (wanters plus inbox users).
+
+The far side keeps being served through the inbox. An isolated
+holder has no P2P demand, so it hands over as before. So does the no-P2P
+M13 shape (`cfg.p2p` off, or no P2P users). This is availability only:
+who may write is still decided by CAS and TTL alone, and a voluntary
+release that does not happen cannot break safety. No model change was
+needed: the Stateright model's release is already nondeterministic.
+Counter: `inbox.leases_kept_for_p2p_side`.
+
+**Evidence.**
+- Unit test `a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users`,
+  covering majority, even split, no P2P demand and an isolated holder.
+  It fails without the rule.
+- `p2p-partition-one-node`: four nodes, placement off, all writing
+  into one shared directory; d is cut off from a, b and c for 40 s
+  (deny files both ways, S3 everywhere).
+  - Before: the lease changed hands 5 times in 40 s (a→b→c→b→c→b), each
+    time a release to d's escalation that a majority node happened to
+    win. On EC2, d won it.
+  - After, 11 runs: the lease never changed hands (the holder kept it
+    in 1069–1373 rounds a run). Majority writes: p99 23–83 ms, max
+    ≤ 161 ms. d's writes went through the inbox: p50 32–41 ms, max
+    3.8–4.8 s (the first op's detection). No errors, and everything
+    converged.
+  - Before (main `5384772` binary, same scenario): the lease changed
+    hands 5 times in 40 s (1→3→2→3→2→3), moving to epoch 2 on the way.
+  - Phase 2 isolates the holder itself. The isolated holder
+    reconfigures its silent backup out by CAS ("removing a backup … link
+    down") before the backup's 1.5 s seal. It still has S3, so it is not
+    "away", and it keeps serving the others through the inbox. Their
+    writes stalled only for detection (the forward timeouts plus the
+    3 s P2P grace); the lease moved to their side once their escalation
+    asked (it has no P2P demand). Measured: the others' writes max
+    3.3–5.0 s; the lease left the isolated holder after 8.9–10.8 s.
+  - Seal-based failover proper (a dead or S3-less holder) is
+    `backup-failover`'s and passes.
+- The OVH run (Finding 3) is the same mechanism.
+  - Its partition log shows d's inbox escalation at 13:30:58. The
+    holder (node 1) idle-released at 13:31:05. Node 4 won the CAS and
+    released again at 13:31:23, and the isolated node won the next one
+    at 13:31:24, holding the lease until 13:32:31.
+  - The 21.5 s non-holder-side probe of the 2+2 split is the holder
+    releasing to the far side's inbox wanters. With the rule, a tie
+    keeps the lease and the far side is served through the inbox.
+  - The ~80 s takeover after a crash is the design's "no backup: TTL"
+    row (60 s TTL plus margin): a holder killed before its backup set
+    was configured, or right after it released and re-acquired.
+  - A seal takeover needs a listed backup. The holder brings one up
+    about 3 s after an acquisition (`bringing up a backup` in every
+    log).
+- The allowlist bug fixed in main `5384772` does not explain the
+  partitions. The P2P links existed and died at the cut (the eviction
+  lines), long after mount.
+
+### 4. Idle cost (R2-2) — Low
+
+**Measured** with `idle-cost`: four nodes, the product's default
+intervals (the harness's 200 ms sync interval removed), 120 s idle, each
+node on its own counting relay. The relay counts and the new
+`status.s3` counters agree exactly.
+- Before: holder 237 requests/min (GET `log` 96, GET `nodes` 108, LIST
+  `nodes` 30, LIST `designations` 6, PUT `leases` 2); followers
+  144/min (GET `nodes` ~104, LIST `nodes` 23, GET `log` 6, LIST
+  `designations` 6, GET `commits` 4.5). That matches plan 26's own idle
+  budget formula (`idle-cluster-is-quiet`: two registry reads of
+  1 LIST + N GETs, plus the own record, every 5 s), so it was the
+  design, but the design grows as O(N) per node and O(N²) per cluster,
+  and two thirds of it re-read objects that had not changed. The EC2
+  tester's "~6 ship rounds/min" are mostly free: a round costs S3 only
+  when the stream backstop or the holder's staleness probe is due.
+  Reconcile rounds are P2P only.
+- Reductions implemented:
+  - `store-s3::registry_scan`: one LIST of `nodes/` serves the roster
+    and the peer directory (they listed and read separately). Records
+    are read only when the listing's ETag, size or mtime changed since
+    they were last read, from a per-store cache.
+  - The 5 s own-record check reuses the scan: it GETs only when the
+    scan did not see the record live.
+  - The holder's periodic look at its own stream
+    (`held_tail_staleness_ms`) is one GET of the next sequence
+    instead of a full-width run. A hit is followed by a full run.
+  - The roster stays fail-closed (a vanished or unparseable record
+    still aborts it).
+- After (7 runs), per node per minute: holder 27, followers 29.5. The
+  holder makes LIST `nodes` 12, LIST `designations` 6, GET `log` 6 and
+  PUT `leases` 2. A follower makes GET `commits` 4.5 in place of the
+  lease PUTs. No GET of `nodes` at all while the registry is unchanged.
+- What remains is the 5 s registry LIST, the 10 s designation LIST, the
+  stream backstop or the holder's staleness probe, the commit-chain
+  poll and the renewals. Proposed, not done: take
+  membership changes from gossip and poll the registry every 30–60 s
+  as a backstop, which would take the LIST rate to ~1–2/min.
+- `status.s3` (new): object-store requests by kind (GET, HEAD, PUT,
+  LIST, DELETE, COPY) and by `KIND area`, counted by a wrapper around
+  the S3 store (`backend::CountingStore`).
+
+### Tests
+
+- Unit tests, all green:
+  - `constellation-store-s3` (193, 2 ignored): new
+    `an_unchanged_registry_is_listed_not_re_read`, and
+    `torn_registry_reads_are_re_read` adapted to the cache.
+  - `constellation-net`, `constellation-api`.
+  - `constellation-authority --release` (76 + 3 + 74 sim, 7 ignored).
+    `regression_refused_forward_is_not_re_executed` pinned seed 50068
+    for its non-vacuity check. The schedule moved and 50068 no longer
+    journals a refusal, while 50064 does again, so 50064 pins it now; a
+    scan of seeds 50000–50159 journals refusals in nearly every one.
+  - Ignored long sweeps (`long_random`, `long_strict`, `long_backup`,
+    `long_flex`, `long_delegated`): all green.
+  - `constellation` bin (220): three new tests. The pre-existing
+    `random_write_truncate_fallocate_sequences_match_a_model` fails on
+    unmodified main too (a debug assertion in `ChunkLayout::chunk_len`
+    via a rebased flush, seed 34). It is flagged as a separate task, and
+    the run above skips it.
+- `cargo clippy --workspace --all-targets`: clean.
+- Harness:
+  - The new scenarios on the final build: `cto-strict-root`,
+    `s3-cut-one-node` and `p2p-partition-one-node` 11/11 each, and
+    `idle-cost` 7/7 (budget 60/min). All four fail on main `5384772`.
+  - Neighbours that passed: `backup-failover` ×2, `forwarded-mutations`
+    ×2, all six `session-*`, `epoch-peer-reaching-s3-declines`,
+    `epoch-missing-node`, `epoch-holder-retired`,
+    `epoch-slack-zero-unchanged`, `cto-strict` ×2,
+    `cto-second-node-joins`, `idle-cluster-is-quiet` ×2,
+    `fresh-node-bootstrap`, `lease-handover`, `backup-partition`,
+    `p2p-partition-tolerance` ×2, `writeback-fsync`, `writeback-drain`,
+    `commit-strips-pending-upload`, `s3-outage`,
+    `inbox-sporadic-write-p2p-off`, `inbox-holder-takeover-pending-batch`,
+    `inbox-requester-crash-mid-batch`,
+    `takeover-marker-strands-promptly`, `holder-crash-phantom-shadow`,
+    `holder-crash-phantom-new-holder`, `deposed-reintegration` and
+    `chaos-ci`.
+  - `backup-takeover-holds-missing-chunks` and
+    `backup-takeover-drops-held-chunks` failed at first. Their premise
+    is a chunk no node can upload, and the handoff now lets B upload A's
+    chunk, so A's write-through close succeeds. The scenario turns the
+    handoff off on A (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS=0`); both
+    pass.
+  - Pre-existing flakes, the same failure on the main `5384772` binary
+    (flagged as a separate task):
+    - `epoch-member-lost`, a bare EIO at ~17 s: main 5/8, this branch
+      6/9.
+    - `delegate-partition`, "the root lost its lease" after a 40 s
+      stuck replay (the inbox deadline): main 1/8, this branch 4/13.
+      With the handoff disabled it passed 2/2, and no failing run shows
+      any chunk handoff.
+  - Timings are from a CPU-limited host, so budgets are generous:
+    20 s for a close during the cut (the fix takes about 6 s; the bug
+    takes the whole outage), 5 s for a read, and 12 s for a majority
+    write.
+
+Product:
+- `crates/cli/src/main.rs`: `adopt_root`, `UploadRuntime`
+  handoff/progress, the P2P bridge's `chunk_handoff_requested`,
+  `refresh_peers` and `status.s3`.
+- `crates/cli/src/authority_driver.rs`: `drain_with_handoff`,
+  `ChunkHandoff`.
+- `crates/cli/src/fusefs.rs` and `fusefs_ops.rs`: `WriteShards` detach,
+  `InodeOps`, the flush restructure, two unit tests.
+- `crates/cli/src/coop.rs`: `offer`, `fetch_handed_off`, serving offered
+  dirty chunks.
+- `crates/cli/src/backend.rs`: `CountingStore`, the 30 s retry budget.
+- `crates/cli/src/epoch.rs` (`apply_roster`), `crates/cli/src/node_runtime.rs`
+  (the own-record check reuses the scan), `crates/cli/src/inbox.rs`,
+  `crates/cli/Cargo.toml` (async-trait).
+- `crates/net/src/{message,endpoint,peers}.rs`: `ChunkHandoff` and its
+  reply.
+- `crates/authority/src/core/{inbox,jobs,holder,mod}.rs`: the
+  partition-side lease rule, demand tracking, the one-GET holder
+  probe; `core/tests.rs` (test), `tests/sim.rs` (seed repin).
+- `crates/store-s3/src/{nodes,lib}.rs`: `registry_scan` and
+  `RegistryScan`, the record cache, a test.
+- `crates/api/src/{types,lib}.rs`: `S3RequestStatus`, writeback handoff
+  counters, `inbox.leases_kept_for_p2p_side`.
+
+Harness:
+- `crates/harness/src/scenarios/ec2.rs` (new).
+- `crates/harness/src/scenarios/m8.rs`: `cto-strict-root`.
+- `crates/harness/src/scenarios.rs`: registrations, and the missing-chunks
+  scenarios' handoff opt-out.
+- `crates/harness/src/reqlog.rs`: `CountingProxy::blackhole`.
+- `crates/harness/src/client.rs`: `without_env`.
+
+Docs: `docs/how-to-guides/development/TESTING.md`,
+`docs/reference/configuration.md`.
+
+### Round 2 (coder, 2026-09-26): rebase onto `216ce6c`, campaign 4's A-0, six availability fixes
+
+The branch was rebased onto main `5face1b`, then onto `ee3f65b` (the
+git-divergence fix; conflicts only in `scenarios.rs`'s module list and
+PROGRESS), then onto `216ce6c` (lock floors; a PROGRESS conflict only). The coder cannot create commits here: signing fails. So the
+branch `fix-ec2-findings` now points at `216ce6c`, with this whole piece
+of work uncommitted in the worktree: the rebased WIP commit `0272326`
+plus both rounds. `0272326` itself is untouched. The tester's gate-1 notes on
+the old base were dropped: they covered a tree that no longer exists.
+The conflicts were in `backend.rs` (the counting store around the new
+`BackendInfo`), `main.rs` (the `UploadRuntime` fields of both sides),
+`fusefs.rs` (the new `defer_upload` argument to
+`commit_manifest_forwarded`, and both tests), `api/types.rs`,
+`core/tests.rs`, `sim.rs` (main's seed pin was kept) and PROGRESS.
+
+**Composition with main.**
+- *4798008 (non-owner `back` closes forward at once, their chunks
+  awaited at the sequencer).*
+  - This covers the part of the S3-cut stall that was a `back` close's
+    own upload. It does not cover the rest: under a cut, the sequencer
+    holds back everything that names those chunks, and the forwarder's
+    reply waits for the log. A `back` close on the cut node blocked for
+    the whole outage on `5face1b` (`s3-cut-one-node` on the main binary:
+    blocked > 20 s, completed at the heal).
+  - The handoff now covers these chunks too. A driver-wide watcher,
+    checked every second and independent of the rounds (which may be
+    stuck on the same S3), runs `hand_off_forwarded` once the node's S3
+    path has made no progress for `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`.
+    It hands the chunks forwarded as pending
+    (`UploadRuntime::forwarded_pending`) to the nodes that await them
+    first.
+  - The accepting peer uploads them and then acks its own remote rows
+    (`SyncRequest::ChunksDurable` to itself, as the forwarder's report
+    would). The forwarder acks its pending rows and owes the usual
+    reports (`note_up`).
+  - Result: the first `back` close after a cut takes about 6 s (the
+    detection window), and the rest take milliseconds.
+  - `through`/`fsync` drains keep the per-drain handoff, unchanged.
+- *fc3c5f6 (lock fence at every publication point).* The fence runs in
+  `flush`/`release`/`fsync` before `flush_inode`, so it composes with
+  the per-inode `InodeOps` lock. `discard_lock_writes` now takes the
+  inode lock: it waits for a flush in flight, which holds the session
+  detached from its shard, exactly as it waited for the shard before.
+  The new `open` path's size overlay reads a detached session's size too.
+- *59c559a (`BackendInfo`).* `open_backend_described` returns the
+  counting store with its info. `put_mode` takes the chunk length:
+  `ChunkHandoff::accept` passes it.
+- *Harness.* `CountingProxy::blackhole` let a request through if its
+  read was already blocking when the black hole began (the leak that
+  made one `back` close look instant); such bytes are now swallowed in
+  both directions.
+
+**A-0: `--cto strict` root on a concurrent first mount.** Campaign 4's
+binary (`edd3d5d`) predates the `adopt_root` retry. The retry covers the
+concurrent case: every node retries until the root has an owner, its
+own attempt or another node's seen by tailing. `cto-strict-root` now
+also mounts four and three strict nodes at once. On the final build the
+root was `1000:1000` from the first `stat` on every node, in 22 of 22
+runs (10 in the gate loop, 12 alone).
+
+A second, unrelated failure showed up about once in 15 multi-node
+rounds: one node's `mkdir` answered EIO after exactly 120 s (2×TTL). The
+root ownership was right in those runs too. A debug-logged
+reproduction:
+- Every time, the failing node was the one that had first acquired the
+  lease and then handed it over.
+- Its first op learned the new holder from the lease before its P2P link
+  to that holder was in the link table ("holder learned from the lease
+  … reaches=false inbox=true"), so the op went to the S3 inbox.
+- A holder polls only the inboxes of requesters it is not P2P-connected
+  to, and this requester was connected. The batch sat until the inbox
+  deadline, the op went in doubt, and EIO.
+
+The same shape is the `delegate-partition` flake: a replay submitted to
+the inbox just before the heal. Fix (`on_inbox_recheck`):
+- While an op waits in the inbox, the recheck (every 1 s) forwards it
+  by rid once the holder is connected and reachable over P2P under the
+  same epoch.
+- `send_forward` withdraws the batch first (M5's rule), and a holder that
+  had executed it answers from `completed`: exactly once either way.
+- Counter: `inbox_rerouted_to_p2p`.
+- Test: `an_inbox_op_is_forwarded_once_the_holder_is_reachable` (fails
+  before: the op kept waiting).
+- `regression_every_inbox_batch_of_a_rid_is_withdrawn`'s non-vacuity
+  seeds moved: re-pinned to 10396 and 11750 with
+  `find_multi_batch_withdraw_seeds` over 10000–11999.
+
+**3a: a slow lease renewal made the holder stop heartbeating its
+backup.**
+- Cause: `backup_after_event` treated a lease inside its expiry margin
+  (`ship_epoch` is `None`, e.g. while a renewal is in flight on a 2 s S3)
+  as not held. It cleared the backup set and stopped the appends and
+  heartbeats. After 1.5 s the backup sealed the live holder's epoch.
+- Fix: `LeaseState::holds_unexpired`. While the lease is held, not lost
+  and not yet expired, the holder keeps streaming to its backups
+  (heartbeats included) and admits nothing new. Past the lease's own
+  expiry it stops as before, so a holder that really lost S3 is still
+  sealed and replaced within the design's time.
+- Test: `a_holder_whose_renewal_is_slow_keeps_heartbeating_its_backup`
+  (fails before: the backup set was dropped).
+
+**3b: a restarted backup sealed its healthy holder 1.5 s after
+remounting.**
+- Cause: `backup_start` arms the seal watch with `last_heard = now`, so
+  the downtime and the redial counted as the holder's silence.
+- Fix (`bk.restarted`): after a restart with a persisted role, silence
+  counts only from the moment a P2P link to the holder is up (the link
+  table's `connected`). Any append from the holder also ends the restart
+  state.
+  - Until the link is up, the watch reads the lease instead of sealing
+    (`restart_probe`).
+  - A lease that is still being renewed is a live holder: keep waiting.
+  - An expired lease is a holder gone: seal, then take over as before.
+  - A lease that no longer lists this node, or has moved on: drop the
+    role.
+- Safety is unchanged: sealing and the takeover CAS are the same.
+- Cost: at most one lease GET per 1.5 s until the link to the holder is
+  up.
+- Test: `a_restarted_backup_does_not_take_its_downtime_for_holder_silence`
+  (a renewing lease is not sealed; a live link then silent is sealed; an
+  expired lease is sealed and claimed). It fails before: sealed on its
+  own downtime.
+
+**3c: a node that alone lost S3 proposed continuation epochs.**
+- Cause: each round failure started a proposal. The proposer persisted
+  its promise before asking, and its epoch was open meanwhile: no S3
+  acquisition, rounds that only probe. The members declined ("reaches
+  S3"), and the proposer retried every `PROPOSE_BACKOFF` (5 s).
+- Fix:
+  - `Pong` now carries `s3_ok`, from `backend::s3_path_ok(15 s, 3 s)`.
+    It holds while the daemon's last S3 request was answered — a
+    success, or a request error such as 404 or 412 — within 15 s, with
+    no unanswered failure since and no request hanging for more than
+    3 s. The last sync round must also not have failed.
+    - This is positive evidence only. A node that was just cut stops
+      saying `true` at its first failed request (a refused path) or
+      after 3 s of a hanging one (a black hole).
+    - A node that says `false` only lets the proposal go ahead, to be
+      declined as before.
+  - `maybe_propose` already pings every roster member. If a live member
+    says `s3_ok`, the node proposes nothing: no promise, no open epoch,
+    and `status.epoch.own_s3_outage`. It asks again at every attempt, so
+    a real bucket outage still forms its epoch.
+  - The member's decline stays as the second line of defence.
+  - Closes meanwhile hand their chunks to a peer (above).
+  - `status.epoch.proposals` counts proposals.
+- Two earlier versions were wrong:
+  - The first latched "peers reach S3" until the node's own next
+    success, and read the member's side as "no failed round yet". It
+    broke `epoch-missing-node` (the other member was cut too, but had
+    not failed a round yet).
+  - The second used "a success within 4 s". An idle member (its rounds
+    skip S3 while the log stream covers the tail) then said `false`, and
+    the lone-cut holder proposed twice in `epoch-peer-reaching-s3-declines`.
+  - The answered/failed/hanging signal above replaced both.
+  - Test: `s3_path_ok_needs_a_recent_answer_and_nothing_hanging`.
+- Tests:
+  - `epoch-peer-reaching-s3-declines` now asserts that the S3-cut holder
+    proposes nothing (and still fails over when frozen). On the `5face1b`
+    binary it proposed 3 times in ~20 s and B declined 3 times; now 0.
+    The binary runs of this and of `s3-cut-one-node` are the "before"
+    evidence.
+  - `s3-cut-one-node` gained a phase with the node's S3 *refused* (fast
+    failures) for 25 s under `back`: every close took 5–11 ms and there
+    were no proposals.
+
+**(d) A permanent hang after a seal plus a cluster-wide S3 cut**
+(the git-divergence coder's `git-under-flock-faults`, logs in its
+`epochhang/`).
+- Timeline:
+  1. S3 was cut on all four nodes and a continuation epoch formed.
+  2. A member that had sealed the holder's epoch reported `known = 2`.
+     The claim resolution therefore found the holder's epoch-1 claim
+     stale, and the epoch carried no lease (`carrier=None stale_below=2`).
+     The holder deposed itself (`lost`).
+  3. The epoch then froze (a member missing).
+- Cause:
+  - A frozen epoch was probed only by its hold owner.
+  - A probing non-holder waited for "the epoch holder publishes past
+    `base`".
+  - With no carrier there is no holder at all, so once S3 returned
+    nobody probed, nobody closed, nothing shipped, and FUSE hung for
+    good.
+- Fix (`core/jobs.rs`, and the driver's frozen-epoch upload skip): an
+  epoch that carries no lease has no hold to protect and nothing written
+  under it. Every member probes it and, with S3 back, closes it, frozen
+  or not. The lease is then CAS's again, exactly as before the epoch.
+- Test: `a_frozen_epoch_carrying_no_lease_is_closed_once_s3_is_back`
+  (fails before: the frozen round never probed).
+
+**(e) A sealed candidate re-invited every ~100 ms.**
+- Cause: a candidate that answers `sealed` (it sealed that epoch,
+  possibly in an earlier life) was dropped. The next housekeeping tick
+  selected it again ("a backup sealed our epoch", 3194 times in the
+  logs). While it stayed "eligible", `durable_jseq` also held
+  acknowledgements back for a backup that could be had.
+- Fix: `AckState::refused_epoch`. A node that answered `sealed` for the
+  epoch held (as candidate or listed backup) is excluded from candidates
+  and from eligibility for that epoch.
+- Test: `a_candidate_that_sealed_the_epoch_is_not_reinvited` (fails
+  before: invited 5 times in 4 s; after, once, and `eligible` is false).
+
+The Stateright model is unchanged: (d) is a liveness rule (which member
+may close a carrier-less epoch on S3's return, a decision the CAS
+arbitrates), and (e) only narrows backup selection. Both are covered by
+the authority sweeps below.
+
+**Results (final build, rebased on `216ce6c`).**
+- Unit tests: `cargo fmt --check` and `cargo clippy --workspace
+  --all-targets -D warnings` clean. `cargo test --workspace --release`:
+  1219 passed, 0 failed, 32 ignored. That includes `constellation` 241,
+  authority lib 106 + sim 95, store-s3 208 and net 90 + 3.
+- Sweeps (release, on the final tree), all passing:
+  - `long_random`, `long_backup`, `long_delegated` and `long_flex` at 500;
+  - `long_locks` at 300 (×8 configs).
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-ec2fix`),
+  final build:
+  - `cto-strict-root`, `s3-cut-one-node` and `p2p-partition-one-node`:
+    5/5 each.
+    - In `s3-cut-one-node`, a `back` close takes about 6 s once after
+      the cut, then about 60 ms; `through` about 60 ms.
+    - In its refused phase, closes take 5–16 ms with no proposals. The
+      node's rounds do not fail there on this tree (its uploads are
+      handed off and the stream covers its tail), so the no-proposal
+      rule itself is exercised by `epoch-peer-reaching-s3-declines`.
+  - `idle-cost` 1/1: holder 27, followers 29.5 requests/min.
+  - Neighbours, all passed once each:
+    - `git-under-flock-faults` (164 acknowledged commits intact on 4
+      nodes and a fresh one);
+    - `epoch-peer-reaching-s3-declines`, `epoch-missing-node`,
+      `epoch-holder-retired`;
+    - `backup-failover`, `backup-partition`,
+      `backup-takeover-holds-missing-chunks`,
+      `deposed-reintegration-backup`;
+    - `forwarded-mutations`, `session-forwarded-ryw`,
+      `session-ryw-after-holder-kill`, `cto-strict`;
+    - `small-file-write-path`, `nonowner-back-crash`;
+    - `flock-cross-node`, `lock-failover`, `lock-fence-at-close`,
+      `lock-holder-partitioned`;
+    - `lease-handover`, `p2p-partition-tolerance`, `delegate-partition`,
+      `inbox-holder-takeover-pending-batch`, `chaos-ci`.
+- On the `ee3f65b` build before the last rebase:
+  - `cto-strict-root` 8/8 after the inbox fix (it failed about 1 in 15
+    before it);
+  - `delegate-partition` 5/5 (4 reruns + 1);
+  - `epoch-peer-reaching-s3-declines` 5/5 (0 proposals);
+  - `epoch-missing-node` 3/3;
+  - a full neighbour loop of about 40 scenarios, including
+    `inbox-sporadic-write-p2p-off`, `inbox-requester-crash-mid-batch`
+    and `lease-handover`.
+- `epoch-member-lost` still fails with its bare EIO at ~17 s, as it does
+  on main (4/4 on `5face1b` alternated with this branch). It is filed
+  as a separate task.
+
+Files (round 2):
+- `crates/cli/src/authority_driver.rs`: the forwarded-chunk watcher,
+  `hand_off_hashes` and `hand_off_forwarded`, the accept-side remote
+  ack, and the frozen carrier-less epoch's upload.
+- `crates/cli/src/main.rs`: `forwarded_pending`, `has_forwarded`,
+  `s3_ok`, `S3_OK_RECENT_MS` and `S3_OK_HANG_MS`.
+- `crates/cli/src/backend.rs`: the `BackendInfo` merge, and the
+  answered/failed/in-flight tracking (`s3_path_ok`) with a unit test.
+- `crates/cli/src/epoch.rs`: the no-proposal rule, `own_s3_outage` and
+  `proposals`.
+- `crates/cli/src/fusefs.rs`: the inode lock in `discard_lock_writes`,
+  and the open path's detached-size overlay.
+- `crates/authority/src/core/backup.rs`: 3a (heartbeats while the lease
+  is unexpired), 3b (restarted backup) and (e) (`refused_epoch`).
+- `crates/authority/src/core/lease.rs`: `holds_unexpired`.
+- `crates/authority/src/core/jobs.rs`: (d).
+- `crates/authority/src/core/inbox.rs`: the inbox op forwarded once the
+  holder is reachable.
+- `crates/authority/src/core/mod.rs`: `inbox_rerouted_to_p2p`.
+- `crates/authority/src/core/tests.rs`: six new tests.
+- `crates/authority/tests/sim.rs`: the multi-batch seed repin.
+- `crates/net/src/{message,peers,endpoint}.rs`: `Pong.s3_ok` and
+  `ping_node_s3`.
+- `crates/api/src/types.rs`: the epoch fields.
+- `crates/harness/src/scenarios/{ec2,m8}.rs` and `scenarios.rs`:
+  `cto-strict-root` with 3 and 4 nodes, the refused phase,
+  `epoch-peer-reaching-s3-declines`, the phase-2 poke, and
+  `gitflock` kept in the module list.
+- `crates/harness/src/reqlog.rs`: the black-hole leak.
+- Docs: `durability-and-failover.md` (heartbeats, a sealed candidate, a
+  restarted backup, a carrier-less epoch, the own-outage rule) and
+  `TESTING.md`.
