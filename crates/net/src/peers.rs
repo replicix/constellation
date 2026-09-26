@@ -734,14 +734,14 @@ impl Peers {
         )
     }
 
-    /// [`Self::ping_node`] with the answer's S3 word: `None` when the
-    /// node did not answer, `Some(s3_ok)` when it did.
+    /// [`Self::ping_node`] asking the node to probe S3 (`PingS3`): `None`
+    /// when it did not answer, `Some(s3_ok)` when it did.
     pub async fn ping_node_s3(&self, node_id: u64) -> Option<bool> {
         let inner = self.inner.as_ref()?;
         match self
             .request_to_node(
                 node_id,
-                &Payload::Ping {
+                &Payload::PingS3 {
                     node_id: inner.node_id,
                 },
             )
@@ -1319,9 +1319,13 @@ async fn handle_stream<S: PeerService>(
             service.lock_mirror(from, ver, grants, floor);
             Some(Payload::Ok { req_id: 0 })
         }
+        Payload::PingS3 { .. } => Some(Payload::Pong {
+            node_id: service.node_id(),
+            s3_ok: service.s3_probe().await,
+        }),
         Payload::Ping { .. } => Some(Payload::Pong {
             node_id: service.node_id(),
-            s3_ok: service.s3_ok(),
+            s3_ok: false,
         }),
         Payload::EpochPropose {
             epoch_id,

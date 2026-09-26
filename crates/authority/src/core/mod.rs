@@ -1894,10 +1894,18 @@ impl Core {
                 self.stats.epoch_stale_claims += 1;
                 let mine = self.lease.epoch().unwrap_or(0);
                 self.deposed(now, 0, stale_below, mine, replica, out);
-            } else if self.lease.usable(now, &self.cfg)
-                && self.carries_mine()
-                && self.epoch_may_carry(members)
-            {
+            } else if !self.lease.lost && self.carries_mine() && self.epoch_may_carry(members) {
+                // The activation carries exactly this node's lease (the
+                // claim it acked: same epoch and expiry, `carries_mine`).
+                // Adopted whether or not the lease is still inside its
+                // usable window *now*: the claim was usable when acked,
+                // and the activation can arrive after the expiry margin
+                // (`epoch-member-lost`: 40 ms late, the hold was never
+                // adopted, the epoch carried a lease nobody held, and
+                // every write in it failed). Safe for the reason the
+                // restart path below gives: nobody else can hold the
+                // carried lease — the members promise nothing while the
+                // epoch is open, so no taker gets past the promise check.
                 let epoch = self.lease.epoch().unwrap_or(1);
                 self.lease.adopt_epoch_hold(now, epoch);
                 replica.set_holder_epoch(0);

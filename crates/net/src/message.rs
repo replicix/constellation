@@ -109,13 +109,22 @@ pub enum Payload {
     Ping {
         node_id: u64,
     },
+    /// A would-be proposer of a continuation epoch asks whether this node
+    /// reaches S3: the recipient probes S3 now (one bounded lease GET,
+    /// skipped when its own rounds are failing) and answers `Pong` with
+    /// `s3_ok` (EC2 follow-up 3c; the epoch-member-lost fix: a stale
+    /// last-success time is not evidence).
+    PingS3 {
+        node_id: u64,
+    },
     Pong {
         node_id: u64,
-        /// EC2 follow-up 3c: the answering node's own S3 path works (its
-        /// last sync round did not fail). A would-be proposer of a
-        /// continuation epoch that hears it from a live member is not in
-        /// a bucket outage, only its own S3 is gone: it does not propose.
-        /// Advisory only: `false` changes nothing.
+        /// EC2 follow-up 3c: answering a [`Payload::PingS3`], the node's
+        /// S3 probe just succeeded. A would-be proposer of a continuation
+        /// epoch that hears it from a live member is not in a bucket
+        /// outage, only its own S3 is gone: it does not propose. Always
+        /// `false` for a plain `Ping`. Advisory only: `false` changes
+        /// nothing.
         s3_ok: bool,
     },
     /// Propose a continuation epoch (DESIGN.md §5.3). Recipients persist

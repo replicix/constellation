@@ -61,6 +61,12 @@ pub struct EpochManager {
     propose_grace: Mutex<std::time::Duration>,
     pub active: Arc<AtomicBool>,
     pub frozen: Arc<AtomicBool>,
+    /// The FUSE write gate (`EROFS`): the epoch is frozen, or it is active
+    /// but carries no lease — nobody in it holds authority, so no write
+    /// can execute until S3 returns and the epoch closes (the
+    /// `epoch-member-lost` fix: such writes used to wait out the acquire
+    /// deadline and answer `EIO`).
+    pub writes_refused: Arc<AtomicBool>,
     pub blocks_takeover: Arc<AtomicBool>,
     flushing: AtomicBool,
     /// Plan 30 §M10: `f`.
@@ -75,6 +81,11 @@ pub struct EpochManager {
 
 /// How long a proposer waits after a declined proposal before the next.
 const PROPOSE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// After a live member answered that it reaches S3 (`PingS3`): the next
+/// proposal attempt waits this long (every attempt makes each member probe
+/// S3; a bucket outage beginning meanwhile costs at most this much).
+const REACHES_S3_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long a proposer waits for each member's answer. A member probes
 /// S3 before it answers (`handle_propose_checked`, bounded by the
@@ -118,6 +129,7 @@ impl EpochManager {
             propose_grace: Mutex::new(std::time::Duration::from_millis(500)),
             active: Arc::new(AtomicBool::new(false)),
             frozen: Arc::new(AtomicBool::new(false)),
+            writes_refused: Arc::new(AtomicBool::new(false)),
             blocks_takeover: Arc::new(AtomicBool::new(false)),
             flushing: AtomicBool::new(false),
             slack: AtomicU32::new(0),
@@ -133,6 +145,9 @@ impl EpochManager {
         let m = self.machine.lock().unwrap();
         self.active.store(m.is_active(), Ordering::Relaxed);
         self.frozen.store(m.is_frozen(), Ordering::Relaxed);
+        let carrierless = m.is_active() && self.carrier.lock().unwrap().0.is_none();
+        self.writes_refused
+            .store(m.is_frozen() || carrierless, Ordering::Relaxed);
         self.blocks_takeover
             .store(m.blocks_s3_takeover(), Ordering::Relaxed);
         if let Some(p) = m.current() {
@@ -477,15 +492,14 @@ impl EpochManager {
             let answers =
                 futures::future::join_all(others.iter().map(|id| self.peers.ping_node_s3(*id)))
                     .await;
-            // EC2 follow-up 3c: a live member whose S3 worked just now
-            // says this is not a bucket outage — only this node lost S3.
+            // EC2 follow-up 3c: a live member whose S3 probe just
+            // succeeded (`PingS3`) says this is not a bucket outage — only this node lost S3.
             // Such a proposal is declined anyway (a member that reaches S3
             // declines), and meanwhile this node's promise holds its epoch
             // open: no S3 acquisition, rounds that only probe — its
             // closes stalled. So no proposal this time (each attempt asks
-            // again: in a real bucket outage the members stop answering
-            // `s3_ok` at their first failed or hanging request, and the
-            // epoch forms).
+            // again: in a real bucket outage the members' probes fail,
+            // within `EPOCH_MEMBER_S3_PROBE`, and the epoch forms).
             if let Some(reaching) = others
                 .iter()
                 .zip(&answers)
@@ -493,6 +507,10 @@ impl EpochManager {
                 .map(|(id, _)| *id)
             {
                 self.peers_reach_s3.store(true, Ordering::Relaxed);
+                // Each attempt costs every member an S3 probe: ask again
+                // in a second, not every failed round.
+                *self.propose_after.lock().unwrap() =
+                    Some(std::time::Instant::now() + REACHES_S3_BACKOFF);
                 tracing::info!(
                     member = reaching,
                     "not proposing a continuation epoch: a live member reaches S3 (only this node's S3 is away)"
@@ -981,6 +999,44 @@ mod tests {
         });
         assert!(!mgr.handle_abort("1-8", 1));
         assert!(mgr.is_active());
+    }
+
+    /// `epoch-member-lost`: an active epoch that carries no lease has no
+    /// authority anywhere; its writes are refused at once (`EROFS`), as a
+    /// frozen epoch's are, instead of waiting out the acquire deadline.
+    /// One carrying a lease writes.
+    #[test]
+    fn an_epoch_carrying_no_lease_refuses_writes() {
+        for (id, carrier) in [
+            ("1-1", None),
+            (
+                "1-2",
+                Some(EpochCarrier {
+                    node: 1,
+                    epoch: 1,
+                    expires_unix_ms: 1,
+                }),
+            ),
+        ] {
+            let (mgr, _meta) = manager(2, 0);
+            mgr.set_roster(vec![1, 2]);
+            let ack = mgr.handle_propose_checked(id.into(), vec![1, 2], vec![], 1, 0, false);
+            assert!(accepted(&ack), "{ack:?}");
+            assert!(!mgr.writes_refused.load(Ordering::Relaxed), "promised only");
+            mgr.handle_activate(constellation_net::EpochActivation {
+                epoch_id: id.into(),
+                members: vec![1, 2],
+                base: vec![],
+                carrier,
+                stale_below: 0,
+            });
+            assert!(mgr.is_active());
+            assert_eq!(
+                mgr.writes_refused.load(Ordering::Relaxed),
+                carrier.is_none(),
+                "{carrier:?}"
+            );
+        }
     }
 
     #[test]

@@ -3141,7 +3141,18 @@ fn epoch_clients(env: &S3Env, root: &std::path::Path, backend: &str) -> Result<(
     let tune = |client: Client, key: &str| {
         client
             .with_env("CONSTELLATION_NODE_KEY", key)
-            .with_env("CONSTELLATION_LEASE_TTL_MS", "5000")
+            // Plan 30 §M10: an epoch carries the holder's lease only while
+            // the lease is usable when the members ack (`EpochClaimView`),
+            // and these scenarios write inside the epoch, which needs the
+            // carried lease. With the 5 s TTL they used before M10, the
+            // window from the S3 cut to the end of the lease's usability
+            // was as short as 5 − 3.3 (renewed at about half TTL) − 1
+            // (margin) ≈ 0.7 s, less than a formation takes (a failed
+            // round, the proposal grace, pings, acks): whenever the cut
+            // fell just before a renewal the epoch formed carrying nothing,
+            // and `epoch-member-lost`'s write after the resume failed.
+            // 20 s leaves at least 9 s, as the M10 scenarios have it.
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "20000")
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
     };
@@ -3289,7 +3300,7 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
     c0.mount()?;
     c1.mount()?;
     wait_for_p2p(&[&c0, &c1])?;
-    std::fs::create_dir(c0.mnt.join("shared"))?;
+    std::fs::create_dir(c0.mnt.join("shared")).context("mkdir shared")?;
     eventually("shared visible", Duration::from_secs(20), || {
         anyhow::ensure!(c1.mnt.join("shared").is_dir());
         Ok(())
@@ -3320,7 +3331,8 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
             Ok(())
         },
     )?;
-    std::fs::write(c0.mnt.join("shared/after-resume"), b"ok")?;
+    std::fs::write(c0.mnt.join("shared/after-resume"), b"ok")
+        .context("A's write after the epoch resumed")?;
     proxy.heal()?;
     eventually("resumed write converges", Duration::from_secs(40), || {
         anyhow::ensure!(std::fs::read(c1.mnt.join("shared/after-resume"))? == b"ok");

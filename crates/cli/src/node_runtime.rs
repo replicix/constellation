@@ -1168,7 +1168,7 @@ impl NodeRuntime {
                 forward.clone(),
                 stop.clone(),
                 departed.clone(),
-                epochs.frozen.clone(),
+                epochs.writes_refused.clone(),
             );
             let sync_tx = sync_tx.clone();
             let prune_stats = prune_stats.clone();
@@ -1425,7 +1425,7 @@ impl NodeRuntime {
                     lease: self.lease.clone(),
                     delegates: self.delegates.clone(),
                     acquire_deadline: self.acquire_deadline,
-                    epoch_frozen: Some(self.epochs.frozen.clone()),
+                    epoch_frozen: Some(self.epochs.writes_refused.clone()),
                     epoch_active: Some(self.epochs.active.clone()),
                     departed: Some(departed),
                     read_only_member: self.read_only_member,

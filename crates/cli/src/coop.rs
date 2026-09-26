@@ -1966,7 +1966,7 @@ mod tests {
 
     /// Plan 30 §M15 round 3: `coop-cache-hit`'s burst. A cold reader
     /// asks one holder for 8 chunks at once (a demand read plus its
-    /// readahead) while S3 is 200 ms away. The holder serves at most
+    /// readahead) while S3 is slow. The holder serves at most
     /// `MAX_PER_PEER_SERVES` (4) at a time per requester. Every chunk
     /// must come from the peer and none from S3: the excess queues on the
     /// requester's slots instead of being declined `Busy` and spilled to
@@ -2002,11 +2002,19 @@ mod tests {
         peers_a.refresh_registry(registry.clone());
         peers_b.refresh_registry(registry);
 
-        // S3 holds every chunk, 200 ms away: a fallback would succeed,
-        // just slowly — and would show up in `s3_fetches`.
+        // S3 holds every chunk, 2 s away: a fallback would succeed, just
+        // slowly — and would show up in `s3_fetches`. The scenario's S3 is
+        // ~200 ms away; 2 s keeps the test about the queueing, not about
+        // this machine's speed. The queued chunks may wait for a slot as
+        // long as the S3 ETA, and an S3 hedge (armed after the peer's
+        // ~13 ms prior deadline) only wins if the peer is slower than S3.
+        // At 200 ms a loaded runner could lose either race. A `Busy`
+        // decline (the pre-fix behaviour) spills to S3 whatever the ETA,
+        // so the regression still shows.
+        const S3_MS: f64 = 2_000.0;
         let s3 = Arc::new(DelayedGets {
             inner: Arc::new(object_store::memory::InMemory::new()),
-            delay: Duration::from_millis(200),
+            delay: Duration::from_millis(S3_MS as u64),
         });
         let store = Arc::new(ChunkStore::new(s3));
         let chunks: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8 + 1; CHUNK]).collect();
@@ -2049,12 +2057,12 @@ mod tests {
         for d in published.deltas {
             b.apply_set_delta(1, d);
         }
-        // B has measured S3 at ~200 ms first byte, as the scenario's
-        // reader has by the time it reads.
+        // B has measured S3's first byte, as the scenario's reader has by
+        // the time it reads.
         {
             let mut sel = b.selector.lock().unwrap();
             for _ in 0..8 {
-                sel.record_ok(SourceId::S3, 200.0, CHUNK as u64, 205.0);
+                sel.record_ok(SourceId::S3, S3_MS, CHUNK as u64, S3_MS + 5.0);
             }
         }
         assert_eq!(b.holders(&hashes[0]), vec![1], "B's mirror names A");

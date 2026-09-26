@@ -24813,3 +24813,203 @@ Files (round 2):
 - Docs: `durability-and-failover.md` (heartbeats, a sealed candidate, a
   restarted backup, a carrier-less epoch, the own-outage rule) and
   `TESTING.md`.
+
+## Fix: `epoch-member-lost` (EIO at ~17 s on every run, main too)
+
+### Root cause: the scenario's 5 s lease TTL against M10's usable-claim rule
+
+`epoch-member-lost` (and `continuation-epoch`, which shares
+`epoch_clients`) ran nodes with `CONSTELLATION_LEASE_TTL_MS=5000`, from
+before M10. Since M10, a continuation epoch carries the holder's lease
+only if the holder's claim was *usable* (more than the 1 s margin before
+expiry) when it acked (`resolve_epoch_claims`, `EpochClaimView.held`).
+The lease renews at about half TTL, so with a 5 s TTL the time from
+the S3 cut to the lease becoming unusable can be as short as
+5 − 3.3 − 1 ≈ 0.7 s. A formation takes longer than that: a failed
+round, the 500 ms proposal grace, the members' S3 probes, pings and
+acks. Whenever the cut fell just before a renewal, the epoch formed
+carrying no lease. With no authority in the epoch, the scenario's
+`mkdir` after the resume waited out the acquire deadline and answered
+`EIO`, at the same 17 s every time.
+
+The expectation (A writes after B returns) is still right. What was
+wrong was the scenario's TTL. With 20 s, the window is at least 9 s, as
+in the M10 scenarios. A/B check: the unmodified `71dc7e7` binaries with
+only the scenario's TTL raised to 20 s pass 5/5.
+
+The scenario fix alone makes it green. Three product fragilities showed
+up in the same traces and are fixed too:
+
+1. **Stale "a live member reaches S3" evidence (3c regression).** 3c's
+   no-proposal rule asked members through `Pong.s3_ok`, which came from
+   a cached "a recent S3 request succeeded" signal
+   (`backend.rs`: `s3_path_ok`). After a bucket-wide cut, that signal
+   stayed true for about 2 s (`S3_OK_RECENT_MS` / `S3_OK_HANG_MS`), which
+   delayed formation by the same amount and shrank the carry window
+   further. Now a new `Payload::PingS3` asks the member to probe S3 on
+   demand: a lease GET bounded by `EPOCH_MEMBER_S3_PROBE` (300 ms), the
+   same probe a member runs before acking a proposal, and skipped when
+   its own rounds are failing. The member answers `Pong{s3_ok}` with the
+   result. A plain `Ping` always answers `s3_ok: false`. The proposer
+   backs off 1 s (`REACHES_S3_BACKOFF`) after a "reaches S3" answer
+   instead of asking again every failed round. The cached signal and its
+   in-flight tracking in `backend.rs` are removed.
+2. **A carried lease whose activation arrived inside the margin was not
+   adopted.** `on_epoch_state` adopted the hold only while
+   `lease.usable()`. In one trace the activation reached the holder
+   40 ms after the margin began, so the epoch carried A's lease but A
+   did not hold it, and nobody could write. Adoption now requires only
+   `!lease.lost` (plus `carries_mine()` and `epoch_may_carry`). This is
+   safe for the same reason as the restart re-adoption path: while the
+   epoch is open, its members promise nothing, so no taker can act on
+   the lease's expiry.
+3. **A carrier-less epoch answered `EIO` after the acquire deadline.**
+   No write can execute in an epoch that carries no lease, so the FUSE
+   gate now refuses writes at once with `EROFS`, as it does for a frozen
+   epoch. The new `EpochManager.writes_refused` is
+   `frozen || (active && no carrier)`. It feeds `SyncHandle.epoch_frozen`
+   and the pruner.
+
+### Found on the way: a member and the epoch's holder waited on each other for 60 s after S3 returned
+
+With the 20 s TTL, `continuation-epoch` reliably carries A's lease, and
+B's write reaches A as a forward. That made it fail 2/2: the epoch was
+still active 40 s after the heal. The cycle:
+
+- B's forwarded manifest names chunks that stay enrolled on B. An epoch
+  close does not drain them, and `defers_upload` is false in an epoch,
+  so A records them as awaited from B.
+- Once S3 is back, A's flush, a complete upload pass (`run_complete`),
+  waits for B's `ChunksDurable` report before it publishes, up to
+  `CONSTELLATION_REMOTE_CHUNK_WAIT_S` (60 s).
+- B's round, on finding S3 back in a carried epoch it does not hold
+  (`TailThen::EpochProbe`, `head_seq <= epoch.base`), finished without
+  uploading anything, waiting for A's publication. That gate dates from
+  M5, and the wait on A's side from 4798008.
+
+In the logs, B's pending upload and A's epoch close both happen exactly
+60 s after the heal. At TTL 5 this path was rarely taken. A's lease
+expired within seconds of the cut, so B's write most likely took the
+P2P-only lease handoff (B journals it locally). When the epoch formed
+carrying nothing, the write failed instead: one such
+`continuation-epoch` failure, `EIO` at 15.5 s, is in this session's
+earlier batch logs.
+
+The fix is in `core/jobs.rs`. While a member waits for the holder's
+publication, its probed round still issues
+`UploadDirtyChunks { complete: false }`. The round stays unprobed, so
+`on_uploads_done` closes nothing and the member closes the epoch only
+after the holder publishes, as before. Chunks are content-addressed:
+uploading them never needs the lease.
+
+### Test hardening: `coop::a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3`
+
+The test passed 24/24 in parallel and 16/16 alongside 40 CPU-spinning
+processes, but it had two timing assumptions, both bounded by its
+200 ms fake S3:
+
+- the queued chunks wait for a serving slot only as long as the S3 ETA
+  (`peer_slot`, 200 ms);
+- an S3 hedge, armed after the peer's ~13 ms prior deadline, wins if the
+  peer is slower than 213 ms.
+
+A loaded runner could lose either race. The fake S3 is now 2 s away and
+B's selector is primed to match (`S3_MS`). The test still catches the
+regression it was written for, because a `Busy` decline spills to S3
+whatever the ETA.
+
+### Tests
+
+- `authority::core::tests`:
+  - `a_carried_lease_is_held_though_its_activation_came_inside_the_margin`;
+  - `a_member_uploads_its_chunks_while_the_carrier_has_not_published`.
+  - Both fail without their fix.
+- `cli::epoch::tests::an_epoch_carrying_no_lease_refuses_writes`.
+- `cli::backend::tests::a_request_error_counts_as_an_answer` replaces
+  the removed `s3_path_ok` test.
+
+### Files
+
+- `crates/net/src/{message,peers,endpoint}.rs`: `Payload::PingS3`, the
+  `s3_probe` service hook (replacing `s3_ok`), and `ping_node_s3` sending
+  `PingS3`.
+- `crates/cli/src/main.rs`: `P2pBridge::probe_s3`, used by `s3_probe`
+  and `epoch_proposed`; the S3_OK constants are removed; the gate is
+  wired to `writes_refused`.
+- `crates/cli/src/backend.rs`: `s3_path_ok` and in-flight tracking
+  removed.
+- `crates/cli/src/epoch.rs`: `writes_refused`, `REACHES_S3_BACKOFF`, and
+  a test.
+- `crates/cli/src/node_runtime.rs`, `crates/cli/src/fusefs.rs`: the gate
+  uses `writes_refused`.
+- `crates/cli/src/coop.rs`: the burst test's hardening.
+- `crates/authority/src/core/mod.rs`: late-activation adoption.
+- `crates/authority/src/core/jobs.rs`: the member's upload while it
+  waits for the holder's publication.
+- `crates/authority/src/core/tests.rs`: two tests.
+- `crates/harness/src/scenarios.rs`: `epoch_clients` TTL 20 s with its
+  rationale, and error contexts in `epoch_member_lost`.
+- Docs: `durability-and-failover.md` (the usable-claim window, `EROFS`
+  in a carrier-less epoch, late adoption, `PingS3`, a member's upload
+  during the close) and `TESTING.md`.
+
+### Results
+
+- fmt clean; clippy `--workspace --all-targets -D warnings` clean.
+- Unit tests:
+  - `constellation` bin: 241;
+  - `constellation-net`: all pass;
+  - `constellation-authority` debug: lib, plus sim 98 (10 ignored);
+  - `constellation-authority --release`: lib 111, 3, sim 98.
+- Coop burst test after hardening: 24/24 in parallel alongside 40
+  CPU-spinning processes.
+- Scenarios, final code (`CONSTELLATION_HARNESS_DOCKER_PREFIX=
+  constellation-harness-epochlost`):
+  - `epoch-member-lost` 5/5 (14.4–14.9 s); also 5/5 on the code before
+    the `jobs.rs` fix;
+  - `continuation-epoch` 5/5 (53–56 s; 2/2 failures before the
+    `jobs.rs` fix);
+  - `epoch-peer-reaching-s3-declines`, `epoch-missing-node`,
+    `epoch-holder-retired`, `epoch-slack-zero-unchanged`: 1/1 each;
+  - `s3-cut-one-node` 1/1 (2/2 before the `jobs.rs` fix);
+  - `p2p-partition-one-node` 1/1 (before the `jobs.rs` fix).
+- A/B: the `71dc7e7` binaries with only the scenario's TTL raised to
+  20 s pass `epoch-member-lost` 5/5.
+- `long_flex` with 1000 seeds:
+  - `flex` 1000/1000;
+  - `flex-crash` fails only seed 30702 (a sweep of all 1000 seeds).
+  - The same seed fails the same way on clean `71dc7e7`, so the failure
+    predates this change (see below).
+
+### Open findings (not fixed here)
+
+1. **`flex-crash` seed 30702: a safety violation on `71dc7e7`.**
+   Reproduce with `AUTHORITY_SIM_CONFIG=flex-crash
+   AUTHORITY_SIM_SEED=30702 cargo test -p constellation-authority --release
+   --test sim replay_seed -- --exact`.
+   - The violation: `Unlink("f3")` by rid (1,1,4) took effect at log
+     seq 20 (epoch 2, node 1), but the spec answers it `Enoent`. Node 3,
+     holding epoch 1, had removed `f3` at seq 18 (`Unlink`, rid (2,1,7)),
+     yet node 1's epoch-2 takeover (marker at seq 19) executed against a
+     state that has seq 13's `Create(f3)` but not seq 18.
+   - The faults: a 1↔3 partition from t=548 for 3448 ms; an epoch outage
+     at t=1200 in which [1,3] lose S3 and P2P to [2] for 5000 ms with
+     holder 3; the epoch [1,3] forms at t=4000; a `leases/` PUT fault
+     (`AppliedThenTimeout`, p≈0.2) at t=4718; the outage heals at t=6200.
+   - The failure is deterministic and was never exercised before: round
+     2 ran 500 seeds, 30000–30499.
+   - It needs its own investigation of the takeover's tail against a
+     drained epoch journal.
+2. **In a carried epoch, a member's forwarded op can wait 40 s.** In
+   `continuation-epoch` with the carried lease, B's forward to A is
+   accepted at once, but the holder evaluated it against state B has
+   not applied (`!base_ok`), so it parks in `AwaitingLog`. During the
+   epoch the log cannot deliver, and B dropped the holder's pre-S3
+   stream at activation ("no longer following a holder"), so
+   `adopt_streamed` cannot help either. The op sits until the 40 s
+   forward deadline puts it in doubt, and B's retry then completes it.
+   That stall accounts for most of the scenario's 53 s. Nothing fails
+   for the user, but writes from members stall. The likely fix is for
+   members to keep following the epoch holder's stream (or the holder
+   to stream epoch journal records), a design question across M9 and
+   M10.

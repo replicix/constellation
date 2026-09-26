@@ -214,37 +214,6 @@ fn count(kind: &'static str, location: Option<&object_store::path::Path>) {
 /// one slow upload on a slow but working link (the registry poll and the
 /// sync rounds keep completing around it) is not mistaken for an outage.
 static LAST_COMPLETED_MS: AtomicI64 = AtomicI64::new(0);
-/// When a request last failed without an answer (unix ms; 0: never).
-static LAST_FAILED_MS: AtomicI64 = AtomicI64::new(0);
-
-/// Requests in flight: id → start (unix ms), for [`s3_path_ok`] to tell
-/// a hanging (black-holed) path from an idle one.
-fn in_flight() -> &'static std::sync::Mutex<std::collections::HashMap<u64, i64>> {
-    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, i64>>> =
-        std::sync::OnceLock::new();
-    IN_FLIGHT.get_or_init(Default::default)
-}
-
-/// Registers a request in flight until dropped.
-struct Flight(u64);
-
-impl Flight {
-    fn start() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        in_flight()
-            .lock()
-            .unwrap()
-            .insert(id, constellation_store_s3::lease::now_unix_ms());
-        Flight(id)
-    }
-}
-
-impl Drop for Flight {
-    fn drop(&mut self) {
-        in_flight().lock().unwrap().remove(&self.0);
-    }
-}
 
 fn completed() {
     LAST_COMPLETED_MS.store(
@@ -253,46 +222,26 @@ fn completed() {
     );
 }
 
-/// Record a request's outcome: answered (success or a request error), or
-/// failed without an answer.
+/// Record a request's outcome: answered (success or a request error such
+/// as not-found or a failed precondition, which proves the path works) or
+/// not.
 fn note<T>(r: &object_store::Result<T>) {
     use object_store::Error as E;
-    match r {
+    if matches!(
+        r,
         Ok(_)
-        | Err(E::NotFound { .. })
-        | Err(E::Precondition { .. })
-        | Err(E::AlreadyExists { .. })
-        | Err(E::NotModified { .. }) => {
-            completed();
-            // The latest word is an answer.
-            LAST_FAILED_MS.store(0, Ordering::Relaxed);
-        }
-        Err(_) => LAST_FAILED_MS.store(
-            constellation_store_s3::lease::now_unix_ms(),
-            Ordering::Relaxed,
-        ),
+            | Err(E::NotFound { .. })
+            | Err(E::Precondition { .. })
+            | Err(E::AlreadyExists { .. })
+            | Err(E::NotModified { .. })
+    ) {
+        completed();
     }
 }
 
 /// When S3 last answered a request (unix ms; 0: never).
 pub fn last_s3_completion_ms() -> i64 {
     LAST_COMPLETED_MS.load(Ordering::Relaxed)
-}
-
-/// EC2 follow-up 3c: whether this daemon's S3 path is working right now,
-/// as far as its own requests show: the last one answered (no failure
-/// since), within `recent_ms`, and no request has been hanging for more
-/// than `hang_ms` (a black hole answers nothing and fails nothing for a
-/// long while).
-pub fn s3_path_ok(recent_ms: i64, hang_ms: i64) -> bool {
-    let now = constellation_store_s3::lease::now_unix_ms();
-    let answered = LAST_COMPLETED_MS.load(Ordering::Relaxed);
-    let failed = LAST_FAILED_MS.load(Ordering::Relaxed);
-    if answered == 0 || failed >= answered || now - answered >= recent_ms {
-        return false;
-    }
-    let oldest = in_flight().lock().unwrap().values().copied().min();
-    oldest.is_none_or(|start| now - start < hang_ms)
 }
 
 /// The counts so far (`status.s3`).
@@ -330,7 +279,6 @@ impl ObjectStore for CountingStore {
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
         count("PUT", Some(location));
-        let _flight = Flight::start();
         let r = self.inner.put_opts(location, payload, opts).await;
         note(&r);
         r
@@ -341,7 +289,6 @@ impl ObjectStore for CountingStore {
         opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         count("PUT", Some(location));
-        let _flight = Flight::start();
         let r = self.inner.put_multipart_opts(location, opts).await;
         note(&r);
         r
@@ -352,7 +299,6 @@ impl ObjectStore for CountingStore {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         count(if options.head { "HEAD" } else { "GET" }, Some(location));
-        let _flight = Flight::start();
         let r = self.inner.get_opts(location, options).await;
         note(&r);
         r
@@ -400,7 +346,6 @@ impl ObjectStore for CountingStore {
         prefix: Option<&object_store::path::Path>,
     ) -> object_store::Result<object_store::ListResult> {
         count("LIST", prefix);
-        let _flight = Flight::start();
         let r = self.inner.list_with_delimiter(prefix).await;
         note(&r);
         r
@@ -412,7 +357,6 @@ impl ObjectStore for CountingStore {
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
         count("COPY", Some(to));
-        let _flight = Flight::start();
         let r = self.inner.copy_opts(from, to, options).await;
         note(&r);
         r
@@ -423,33 +367,21 @@ impl ObjectStore for CountingStore {
 mod tests {
     use super::*;
 
-    /// EC2 follow-up 3c: the path is OK after an answer (a 404 counts),
-    /// not after a failure, and not while a request hangs.
+    /// An answer — a 404 included — is progress; a transport failure is
+    /// not.
     #[test]
-    fn s3_path_ok_needs_a_recent_answer_and_nothing_hanging() {
-        note::<()>(&Err(object_store::Error::NotFound {
-            path: "x".into(),
-            source: "404".into(),
-        }));
-        assert!(s3_path_ok(15_000, 3_000), "an answer (404) proves the path");
+    fn a_request_error_counts_as_an_answer() {
+        LAST_COMPLETED_MS.store(0, Ordering::Relaxed);
         note::<()>(&Err(object_store::Error::Generic {
             store: "S3",
             source: "error sending request".into(),
         }));
-        assert!(
-            !s3_path_ok(15_000, 3_000),
-            "a failure since the last answer"
-        );
-        note::<()>(&Ok(()));
-        assert!(s3_path_ok(15_000, 3_000));
-        let hanging = Flight::start();
-        in_flight().lock().unwrap().insert(
-            hanging.0,
-            constellation_store_s3::lease::now_unix_ms() - 5_000,
-        );
-        assert!(!s3_path_ok(15_000, 3_000), "a request hanging 5 s");
-        drop(hanging);
-        assert!(s3_path_ok(15_000, 3_000));
+        assert_eq!(last_s3_completion_ms(), 0);
+        note::<()>(&Err(object_store::Error::NotFound {
+            path: "x".into(),
+            source: "404".into(),
+        }));
+        assert!(last_s3_completion_ms() > 0);
     }
 
     #[tokio::test]

@@ -344,7 +344,10 @@ stranded-branch recovery:
   heals S3, and verifies ordered drain, convergence, and zero conflicts.
 - `epoch-member-lost` stops one promised member with `SIGSTOP`; the
   survivor must freeze and return `EROFS`, then resume cleanly when the
-  member returns and converge after S3 heals.
+  member returns and converge after S3 heals. Both scenarios run a 20 s
+  lease TTL: an epoch carries only a usable lease, and at 5 s a cut just
+  before a renewal left about 0.7 s for the formation, so the epoch
+  carried nothing.
 - `deposed-reintegration` (rewritten for plan 30 M3b) strands three
   edits on holder A while its S3 path is cut: a new file
   (`clean-from-a`), an overwrite of a baseline file B never touches
@@ -1036,7 +1039,8 @@ relay of its own so requests can be attributed per role):
     (forwarded as pending, awaited at the sequencer) are handed off too.
     Then the cut node's S3 is *refused* for 25 s (its rounds fail fast):
     it must propose no continuation epoch (`status.epoch.proposals`; a
-    live member's `Pong` says it reaches S3) and every close completes.
+    live member answers its `PingS3` probe with `Pong.s3_ok`) and every
+    close completes.
   - `p2p-partition-one-node`: four nodes, placement off, all writing to
     one directory; one loses P2P to the rest (`CONSTELLATION_FAULT_P2P_
     DENY_FILE` both ways, S3 everywhere) for 40 s. The lease must not

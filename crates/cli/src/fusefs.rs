@@ -1641,7 +1641,9 @@ impl ConstellationFs {
         }
         if let Some(frozen) = &h.epoch_frozen {
             if frozen.load(std::sync::atomic::Ordering::Relaxed) {
-                tracing::error!("refusing mutation: continuation epoch frozen (lost a member)");
+                tracing::error!(
+                    "refusing mutation: continuation epoch frozen (lost a member) or carrying no lease"
+                );
                 return Err(libc::EROFS);
             }
         }

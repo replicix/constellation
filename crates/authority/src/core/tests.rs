@@ -2580,6 +2580,25 @@ mod epoch_rules {
         h
     }
 
+    /// `epoch-member-lost`: the activation carrying this node's lease can
+    /// arrive after the lease entered its expiry margin (the claim was
+    /// usable when acked). The hold is adopted anyway — before, it was
+    /// not, the epoch carried a lease nobody held, and every write failed.
+    #[test]
+    fn a_carried_lease_is_held_though_its_activation_came_inside_the_margin() {
+        let mut h = holder_with(AckPolicy::Local, vec![]);
+        h.advance(9_300);
+        assert!(
+            !h.core.lease.usable(h.now, h.core.config()),
+            "inside the margin"
+        );
+        h.step(epoch(true, true, vec![1, 2]));
+        assert!(
+            h.core.lease.epoch_held(),
+            "the carried lease was not adopted"
+        );
+    }
+
     /// (a) An `ack=s3` lease is never carried: the epoch activates
     /// without this node's authority, and the S3 lease stays what it
     /// was (its acknowledgements wait for S3).
@@ -6061,6 +6080,65 @@ fn a_frozen_epoch_carrying_no_lease_is_closed_once_s3_is_back() {
         out.iter().any(|a| matches!(a, Action::EpochClose)),
         "the epoch is not closed: {out:?}"
     );
+}
+
+/// `continuation-epoch` with a carried lease: a member that forwarded a
+/// write to the epoch's holder keeps the write's chunks enrolled. Once S3
+/// is back the holder's flush waits for them before it publishes, and
+/// the member used to wait for that publication before it uploaded
+/// anything, so each waited on the other for the 60 s remote-chunk
+/// limit. The member now uploads its chunks while it waits, and closes
+/// nothing until the holder has published.
+#[test]
+fn a_member_uploads_its_chunks_while_the_carrier_has_not_published() {
+    let mut h = Harness::new(2);
+    h.step(Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Epoch {
+            open: true,
+            active: true,
+            frozen: false,
+            flushing: false,
+            base: 0,
+            members: vec![1, 2],
+            carrier: Some(crate::event::Carrier {
+                node: 1,
+                epoch: 1,
+                expires_unix_ms: h.now.0 + 20_000,
+            }),
+            stale_below: 1,
+        },
+    });
+    assert!(!h.core.lease.epoch_held(), "node 1 carries the epoch");
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let out = h.step(Event::Timer { id: poll });
+    let probe = s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+        .map(|(op, _)| op)
+        .unwrap_or_else(|| panic!("the open epoch is not probed: {out:?}"));
+    let out = h.step(Event::S3 {
+        op: probe,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("S3 is back but the member's chunks stay local: {out:?}"));
+    let out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    assert!(
+        !out.iter().any(|a| matches!(a, Action::EpochClose)),
+        "closed before the carrier published: {out:?}"
+    );
+    assert!(h.core.epoch.open, "the epoch stays open");
 }
 
 /// EC2 follow-up (e): a candidate backup that answers `sealed` for the

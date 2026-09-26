@@ -372,17 +372,33 @@ Operational rules:
   single crashed holder then blocks TTL failover until it returns or is
   retired with `constellation leave --node-id`, which also fences its
   leases.
-- An epoch whose claim resolution carried no lease has no hold owner:
-  once S3 is back, any member closes it, frozen or not (nothing was
+- An epoch carries a lease only if the holder's claim was usable
+  (outside the lease margin) when it acked. With the default half-TTL
+  renewal, an outage that starts just before a renewal leaves the holder
+  about `TTL/2 − margin` for a formation; short TTLs can miss it.
+- An epoch whose claim resolution carried no lease has no hold owner, so
+  no write can execute under it: its members refuse writes with `EROFS`
+  (as a frozen epoch does) rather than letting them time out as `EIO`.
+  Once S3 is back, any member closes it, frozen or not (nothing was
   written under it), and the lease is decided by CAS again.
+- A holder whose carried lease reaches it after the lease margin (the
+  activation took a moment) still adopts the hold: members promise
+  nothing while the epoch is open, so no taker can act on the expiry.
 - A member that can still reach S3 declines to join an epoch. A node
-  whose own S3 fails while a live member answers its liveness ping
-  saying its S3 works (`Pong.s3_ok`) does not propose at all (its
-  outage is its own, not the bucket's: `status.epoch.own_s3_outage`)
-  until its own S3 works again; its closes meanwhile hand their chunks
+  whose own S3 fails asks every live member to probe S3 (`PingS3`,
+  answered by a lease GET bounded at 300 ms: `Pong.s3_ok`); if any
+  reaches it, the node does not propose (its outage is its own, not the
+  bucket's: `status.epoch.own_s3_outage`) and asks again 1 s later,
+  until its own S3 works again. Its closes meanwhile hand their chunks
   to a peer that reaches S3 (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`).
+  The probe is fresh each time, so a cluster-wide outage is not
+  mistaken for a local one.
 - Writes inside an epoch are acknowledged on the hold owner's disk
-  alone (no backups).
+  alone (no backups). A write another member forwards to the hold owner
+  leaves its chunks on that member. Once S3 is back, the member uploads
+  them while it waits for the hold owner to publish (it closes the
+  epoch only after that publication), and the hold owner's flush waits
+  for them (`CONSTELLATION_REMOTE_CHUNK_WAIT_S`) before it publishes.
 - A TTL takeover costs one `heartbeat/` LIST even at `f = 0`.
 
 ### Epochs and fast takeovers

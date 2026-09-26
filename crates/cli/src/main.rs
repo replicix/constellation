@@ -2510,14 +2510,36 @@ struct P2pBridge {
     placement: std::sync::Arc<placement::Placement>,
 }
 
+impl P2pBridge {
+    /// Plan 30 §M10's member-side S3 probe: one lease GET, bounded by
+    /// [`EPOCH_MEMBER_S3_PROBE`]. A member whose own rounds are failing at
+    /// S3 is in the outage and answers at once (a probe would only delay
+    /// an epoch's formation, eating into the carried lease's window).
+    async fn probe_s3(&self) -> bool {
+        !self.epochs.s3_failing() && {
+            let leases = constellation_store_s3::LeaseStore::new(
+                self.store.clone(),
+                constellation_store_s3::log::PARTITION,
+                constellation_store_s3::LeaseMode::Cas,
+            );
+            matches!(
+                tokio::time::timeout(EPOCH_MEMBER_S3_PROBE, leases.get()).await,
+                Ok(Ok(_))
+            )
+        }
+    }
+}
+
 impl constellation_net::PeerService for P2pBridge {
-    /// EC2 follow-up 3c: this daemon's S3 path works right now: its last
-    /// request was answered, recently, with nothing hanging (see
-    /// `backend::s3_path_ok`), and its last sync round did not fail.
-    /// Positive evidence only: a node cut a moment ago stops saying so at
-    /// its first failed or hanging request.
-    fn s3_ok(&self) -> bool {
-        !self.epochs.s3_failing() && backend::s3_path_ok(S3_OK_RECENT_MS, S3_OK_HANG_MS)
+    /// EC2 follow-up 3c, as fixed for `epoch-member-lost`: a would-be
+    /// proposer asks (`PingS3`), and this member probes S3 now — the same
+    /// bounded lease GET a proposal's member rule uses — rather than
+    /// trusting a last-answer time: a follower on the holder's log stream
+    /// may not have made an S3 request for seconds, and in a real bucket
+    /// outage its stale "yes" delayed the epoch past the holder's usable
+    /// lease (it formed carrying nothing, and every write failed).
+    fn s3_probe(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(self.probe_s3())
     }
 
     fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
@@ -2712,17 +2734,7 @@ impl constellation_net::PeerService for P2pBridge {
             // A member whose own rounds are failing at S3 is in the
             // outage: it joins at once (a probe would only delay the
             // formation, eating into the carried lease's usable window).
-            let reaches_s3 = !self.epochs.s3_failing() && {
-                let leases = constellation_store_s3::LeaseStore::new(
-                    self.store.clone(),
-                    constellation_store_s3::log::PARTITION,
-                    constellation_store_s3::LeaseMode::Cas,
-                );
-                matches!(
-                    tokio::time::timeout(EPOCH_MEMBER_S3_PROBE, leases.get()).await,
-                    Ok(Ok(_))
-                )
-            };
+            let reaches_s3 = self.probe_s3().await;
             self.epochs.handle_propose_checked(
                 epoch_id,
                 members,
@@ -3892,12 +3904,6 @@ struct UploadRuntime {
     handoff: HandoffStats,
 }
 
-/// `Pong::s3_ok` (EC2 follow-up 3c): the last answer at most this old
-/// (a working node makes a request at least every 5 s, the registry
-/// poll), and no request hanging longer than [`S3_OK_HANG_MS`].
-const S3_OK_RECENT_MS: i64 = 15_000;
-const S3_OK_HANG_MS: i64 = 3_000;
-
 /// The `durable_reports` key of a report owed to every peer.
 const REPORT_TO_ALL: u64 = 0;
 
@@ -4996,7 +5002,7 @@ impl DaemonStatus {
             lease_mode: self.lease_mode,
             read_only_member: self.read_only_member,
             departed: self.departed.clone(),
-            epoch_frozen: Some(self.epochs.frozen.clone()),
+            epoch_frozen: Some(self.epochs.writes_refused.clone()),
             stats: self.prune_stats.clone(),
             replica_lag: lag,
         }

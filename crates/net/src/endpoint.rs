@@ -788,10 +788,10 @@ pub trait PeerService: Send + Sync + 'static {
     fn peer_rtts(&self, _node_id: u64, _rtts: Vec<(u64, u16)>) {}
     /// This node's id, for `Ping`/`Pong`.
     fn node_id(&self) -> u64;
-    /// EC2 follow-up 3c: whether this node's own S3 path works, for
-    /// `Pong::s3_ok`. Default: unknown (`false`).
-    fn s3_ok(&self) -> bool {
-        false
+    /// EC2 follow-up 3c: probe this node's own S3 path now, for a
+    /// `PingS3`'s `Pong::s3_ok`. Default: unknown (`false`).
+    fn s3_probe(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async { false })
     }
 }
 

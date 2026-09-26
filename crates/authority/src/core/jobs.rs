@@ -2753,7 +2753,25 @@ impl Core {
                 // publication forever. Any member closes it once S3 is
                 // back; the lease is then CAS's again, as before the epoch.
                 if !holds && self.pr.carried.is_some() && self.ship.head_seq <= self.epoch.base {
-                    self.finish_round(now, None, replica, out);
+                    // Still waiting for the holder's publication — but
+                    // upload this node's own pending chunks now (the
+                    // round stays unprobed, so `on_uploads_done` closes
+                    // nothing). A write this member forwarded to the
+                    // holder inside the epoch left its chunks enrolled
+                    // here, and the holder's flush waits for them
+                    // (`remote_chunk_wait`) before it publishes: waiting
+                    // for that publication first made each side wait for
+                    // the other until the 60 s limit (`continuation-epoch`
+                    // with a carried lease). Chunks are content-addressed:
+                    // uploading them never needs the lease.
+                    let op = self.op_id();
+                    self.set_phase(Phase::Upload, Some(op));
+                    out.push(Action::UploadDirtyChunks {
+                        op,
+                        ino: None,
+                        round: true,
+                        complete: false,
+                    });
                     return;
                 }
                 if let Some(Job {
