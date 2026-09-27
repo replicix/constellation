@@ -74,9 +74,12 @@ no mandatory services beyond the bucket.
   restic-class deduplicated point-in-time history with zero scan cost (the
   change journal replaces the tree walk).
 
-If home internet dies while both desktop and laptop are on the LAN, they form
-a continuation epoch (all write-eligible nodes present) and keep working at
-full speed, flushing to S3 when it returns.
+If home internet dies while the write-eligible nodes are on the LAN, they
+form a continuation epoch and keep working at full speed, flushing to S3
+when it returns. By default an epoch needs every write-eligible node; with
+`epoch_slack = 1` (`constellation fs set epoch-slack`) the others also
+form one while the laptop is away
+([DESIGN.md §5.3](DESIGN.md#53-continuation-epochs)).
 
 Current pain this replaces: syncthing scans millions of files, burns CPU,
 knows nothing about locking or client state, and produces conflict copies for

@@ -2,29 +2,57 @@
 
 Companion documents: [GOALS.md](GOALS.md), [DECISIONS.md](DECISIONS.md),
 [TESTING.md](../how-to-guides/development/TESTING.md). The v1 phased
-roadmap is at [ROADMAP.md](../plans/v1/ROADMAP.md).
+roadmap is at [ROADMAP.md](../plans/v1/ROADMAP.md). This document explains
+how the system works and why; the reference pages under
+[`reference/features/`](../reference/features/) have the exact rules,
+knobs and status fields, and the ADRs record the alternatives rejected.
+
+## Table of Contents
+
+- [1. Overview](#1-overview)
+  - [Hard constraints](#hard-constraints)
+- [2. S3 Bucket Layout](#2-s3-bucket-layout)
+- [3. Data Plane](#3-data-plane)
+- [4. Metadata Plane](#4-metadata-plane)
+- [5. Write Authority: the One Rule](#5-write-authority-the-one-rule)
+- [6. Consistency Modes](#6-consistency-modes)
+- [7. Caching and Data Movement](#7-caching-and-data-movement)
+- [8. Security](#8-security)
+- [9. Failure Handling](#9-failure-handling)
+- [10. Control Plane](#10-control-plane)
+- [11. Scale Targets](#11-scale-targets)
+- [12. Metadata-DB and FUSE Fast Paths](#12-metadata-db-and-fuse-fast-paths)
+- [13. Snapshots and Clones](#13-snapshots-and-clones)
+- [14. Garbage Collection](#14-garbage-collection)
 
 ## 1. Overview
 
 Every node runs the same single binary: FUSE mount + daemon + CLI + web UI.
 The only mandatory infrastructure is one S3-compatible bucket, which stores
-data chunks, the metadata log, leases, and the node registry. Peers connect
-directly (iroh QUIC, NAT-traversed, encrypted) as a latency fast path;
-correctness never depends on P2P.
+data chunks, the metadata log and its commit chain, the root lease, and the
+node registry. Peers connect directly (iroh QUIC, NAT-traversed, encrypted)
+as a latency fast path: they forward mutations to the node that sequences
+them, stream the log to each other, back each other up, and serve each
+other's cached chunks. Correctness never depends on P2P; S3 remains the
+arbiter of record.
 
 ```
             +----------------- node -----------------+
   app ----> | FUSE (fuser)                            |
-            |   VFS core: inodes, leases, caches      |
-            |   meta store (SQLite, engine trait)     |
+            |   VFS core: sessions, locks, caches     |
+            |   authority core (sans-IO): lease,      |
+            |     sequencing, delegation, failover    |
+            |   meta store (fjall: replica, journal,  |
+            |     speculation)                        |
             |   chunk cache (disk, LRU/pin/dirty)     |
-            |   iroh endpoint + gossip                |<===> peers (QUIC)
+            |   iroh endpoint: forwards, log streams, |<===> peers (QUIC)
+            |     backups, gossip                     |
             |   control API (unix socket) + web UI    |
             +--------------------+--------------------+
                                  |
                                  v
-            S3 bucket: chunks/  log/  leases/  checkpoints/
-                       snaps/  nodes/  keys/
+            S3 bucket: chunks/  log/  commits/  packs/  blobs/
+                       leases/  nodes/  inbox/  heartbeat/  ...
 ```
 
 Trust model: **membership = bucket access.** Valid credentials (`AWS_*` env,
@@ -33,34 +61,77 @@ it a read-only follower (auto-detected). Constellation never requires the
 ability to change bucket policy or IAM.
 
 Enrollment is self-service on first mount (CAS-claim a cluster-unique node
-id into `nodes/`). **Unmount is a temporary departure** — the registry
+id into `nodes/`). **Unmount is a temporary departure**: the registry
 record stays, so the node remains write-eligible and may return with S3.
 **`constellation leave` is the permanent departure** (§8): it retires the
-registry record so survivors can form continuation epochs without waiting
-forever. Heartbeats and missed pings never drop a member (ADR-12: safety
-never depends on failure detection).
+registry record, so the node no longer counts toward a continuation
+epoch's quorum (§5.3). Heartbeats and missed pings never drop a member.
+
+### Hard constraints
+
+Five constraints bind every mechanism below (plan 30 §2). A mechanism
+that cannot meet one is not built.
+
+1. **Portable S3 only.** GET, PUT, LIST and DELETE, plus
+   `If-None-Match: *` and `If-Match` on PUT. Nothing AWS-only: no S3
+   Express One Zone, no conditional DELETE, no `RenameObject`
+   ([ADR-27](DECISIONS.md#adr-27-portable-s3-only-and-one-bucket)).
+2. **One bucket.** A filesystem lives under one prefix of one bucket. No
+   second bucket for disaster recovery and no quorum across buckets; a
+   bucket outage is survived with authority that already exists (§9).
+3. **A single node degrades to plain behaviour.** No peer means no
+   backup, no delegation, no promise and no message: a single node pays
+   nothing for the cluster machinery.
+4. **No WAN round trip on every write.** Anything synchronous with a peer
+   (a backup, a delegate) is chosen by measured RTT, never by assuming a
+   LAN, so a cluster across continents still acknowledges at local speed.
+5. **Safety never depends on failure detection**
+   ([ADR-12](DECISIONS.md#adr-12-safety-never-depends-on-failure-detection)).
+   Timeouts and silence decide only *when* to try something. What decides
+   *whether* it is safe is a CAS on S3, a seal, a log-slot CAS, a lease
+   margin, or a promise. A false suspicion costs availability, never
+   correctness.
 
 ## 2. S3 Bucket Layout
 
+The keys, as `crates/store-s3/src/layout.rs` and `nodes.rs` write them:
+
 ```
 <prefix>/
-  meta.json                     # fs UUID, format version, settings, E2E flag
-  nodes/<node-id>.json          # self-enrolled members (pubkey, P2P addr, ro);
-                                # leave writes a tombstone {retired:true} —
-                                # the id is never recycled
-  heartbeat/<node-id>           # liveness beacons (~15-30 s), UX only
-  leases/<partition-id>.json    # CAS lease objects (the arbiter)
-  log/<partition-id>/<seq>.zst  # ordered metadata log segments
-  checkpoints/<partition-id>/<txid>.zst # periodic log-compaction checkpoints
-  snaps/<snap-id>.json          # user snapshots: name, path, tree root hash (§13)
-  holds/<node-id>.json          # TTL'd open-handle holds on orphaned inodes (§3)
-  chunks/<a>/<b>/<hash>         # content-addressed blocks (sharded by hash)
-  keys/keyring                  # only in E2E mode: wrapped DEKs
+  meta.json                       # fs UUID, format version, chunk size, compression,
+                                  # gossip secret, E2E key envelope, quota,
+                                  # ack_policy, epoch_slack
+  nodes/<id:08x>.json             # self-enrolled members (pubkey, P2P addr, ro);
+                                  # leave writes a tombstone {retired:true} —
+                                  # the id is never recycled
+  leases/p0.json                  # the root lease: the one arbiter of write authority (§4)
+  leases/_gc.json, _prune.json    # singleton leases for bucket GC (§14) and pruning
+  log/p0/<seq:016x>.zst           # the metadata log: ordered, CAS-created segments (§4)
+  commits/<seq:016x>              # the commit chain: CAS-created roots of the metadata tree
+  packs/<hash>, packs/<hash>.idx  # packed metadata-tree nodes and their indexes
+  blobs/<hash>                    # metadata values too large to inline in a tree node
+  inbox/<epoch>/<node>/<n>        # forwarded mutations from nodes with no P2P path (§4)
+  heartbeat/<node:016x>.json      # continuation-epoch promises, written on demand;
+                                  # never written while epoch_slack = 0 (§5.3)
+  designations/<path-hash>.json   # offline designations (§5.2)
+  snaps/<snap-id>.json            # user snapshots: name, path, tree root hash (§13)
+  holds/<node-id>.json            # TTL'd holds the GC honours (§3, §14)
+  gc/                             # condemned-set pointers, candidate bookkeeping,
+                                  # the deletion journal (§14)
+  prune/journal/                  # the retention pruner's reports
+  chunks/<aa>/<bb>/<hash>         # content-addressed data blocks (sharded by hash)
 ```
 
-Required S3 features: GET/PUT/DELETE/LIST plus conditional writes
-(`If-None-Match: *` for create, `If-Match: <etag>` for CAS). Verified by
-`constellation fs create` / `doctor`.
+The segment, commit, inbox and heartbeat keys are zero-padded hex, so
+lexicographic order is numeric order and a LIST with an offset is a seek.
+In E2E mode the only secret in the bucket is the passphrase-wrapped master
+key inside `meta.json` (§8); there is no separate keyring object.
+
+Required S3 features are exactly hard constraint 1. `constellation fs
+create` preflights them and refuses a backend without create-if-absent;
+`constellation doctor` probes them and the provider's error codes (some
+answer a losing conditional write with 409 before 412; see
+[Write-path hygiene](../reference/features/write-path-hygiene.md#conditional-writes-and-their-error-codes)).
 
 **Why two shard levels under `chunks/`**: AWS partitions on the *full key
 string* at arbitrary byte positions — delimiters have no special meaning —
@@ -77,7 +148,8 @@ matters. Deeper sharding would help neither and hurt directory-backed
 stores. Expected load (3–10 nodes × ~16 in-flight prefetch) sits near a
 single partition's baseline; burst cases (mass `pin` of a cold dataset) may
 see brief 503s while S3 splits, absorbed by the client's standard
-exponential backoff.
+exponential backoff. `packs/` and `blobs/` are flat: they hold thousands of
+objects where `chunks/` holds millions.
 
 ## 3. Data Plane
 
@@ -112,8 +184,7 @@ exponential backoff.
   writes under that path (nearest-ancestor wins); never recompresses existing
   objects. Incompressible guard: if compressed >= original, store raw.
   Compression runs across chunks on a worker pool; zstd internal MT only for
-  big single blobs (checkpoints). Order in E2E mode:
-  compress-then-encrypt.
+  big single blobs. Order in E2E mode: compress-then-encrypt.
 - **Manifest spill**: a file's metadata row stores the chunk list inline when
   <= 8 chunks (~32 MiB; covers >99.9% of files per the reference census);
   larger files store the 32-byte hash of a *manifest blob* (the serialized
@@ -123,27 +194,92 @@ exponential backoff.
   object), `cdc` (future: content-defined chunking). Reservations cost bytes
   now to guarantee zero migrations later.
 - Old chunks are immutable; edits create new objects. Unreferenced objects
-  are removed by background GC (checkpoint- and snapshot-aware, grace
-  period, fsck-verifiable; coordination in §14). GC roots: live manifests,
-  checkpoint state, and every snapshot tree (§13).
+  are removed by background GC (snapshot-aware, grace period,
+  fsck-verifiable; coordination in §14).
 
 ### Write path (partial writes)
 
 `write()` materializes only the touched chunk(s) (cold: one 4 MiB GET),
 applies the edit in the cache and marks the chunk dirty; repeated writes
-coalesce. On `close()`/`fsync()`: re-hash, compress, (encrypt,) PUT new
-chunk(s) + new manifest in parallel, then journal a small log record.
-Other nodes re-fetch only changed chunks: a 1-byte edit of a 1 GB file syncs
-~4 MiB. `fsync` modes: **default** = locally durable + journaled, S3 flush
-async within a bounded lag (safe: leases fence other writers); **paranoid** =
-`fsync` returns only after chunk + log record are on S3.
+coalesce. On `close()`/`fsync()` the node re-hashes, compresses (and
+encrypts) the new chunk(s) and uploads them in parallel, then commits the
+new manifest as one small metadata operation at the file's sequencer (§4).
+Other nodes re-fetch only changed chunks: a 1-byte edit of a 1 GB file
+syncs ~4 MiB.
+
+One invariant holds in every mode: **the log never names a chunk S3
+lacks.** A reader anywhere can therefore fetch every chunk a shipped
+manifest names.
+
+What `close()` and `fsync()` wait for is set per mount; what an
+acknowledgement of the manifest means is set per filesystem:
+
+- `--write-mode through` (the default): `close()` returns once the chunks
+  are in S3 and the manifest is committed and acknowledged. A small new
+  file costs one S3 request (the conditional create of its chunk) and one
+  S3 round trip per close, on the sequencer and on any other node alike.
+- `--write-mode back`: `close()` returns once the uploads are queued
+  durably on local disk, with no S3 round trip in the close. The
+  manifest ships only once its chunks are up. `fsync`, `O_SYNC`,
+  `O_DSYNC`, `--fsync-mode s3` and a cluster lock's release always act
+  as `through`. Meant for bulk imports (`tar x`, `rsync`); `constellation
+  write-mode` switches a running mount.
+- `--fsync-mode local` (default): `fsync()` forces the node's metadata
+  store to disk. `--fsync-mode s3`: `fsync()` also waits until the inode's
+  chunks and records are in the bucket.
+- The acknowledgement policy (`fs create --ack-policy local|s3`, fixed
+  for the filesystem) decides whether an acknowledged mutation lives on
+  the sequencer, on a backup, or in S3 (§4, §9).
+
+The exact per-mode contract, and what `back` gives up, are in
+[Durability and failover](../reference/features/durability-and-failover.md#--fsync-mode-and---write-mode).
+
+**A non-owner's `back` close.** A node that is not the file's sequencer
+forwards the manifest at once, naming the chunks still uploading on it.
+The sequencer enrolls them as pending uploads it awaits from that node,
+*before* it executes the op, so every existing gate applies: the root's
+ship plan defers the transaction and what depends on it, a delegate's
+stream and backup feed stop before it, and the pre-S3 stream (§4) stops
+before it for every subscriber except the forwarder, which has the bytes.
+The forwarder reports the chunks once they are up (`ChunksDurable`); if
+the report never comes, the sequencer checks S3 itself (2 s, doubling to
+16 s). Readers on the sequencer, the only node that sees the manifest
+early, wait for the chunk (`CONSTELLATION_REMOTE_CHUNK_WAIT_S`, 60 s).
+The simpler "acknowledge the close locally, forward later" was rejected:
+the close would be acknowledged before the sequencer validated it, a
+`Conflict` after the close would have no write session left to rebase
+and would become a conflict copy, `--cto strict` would no longer see
+every completed close, and the node's own reads would need a new kind of
+speculation.
+
+**Dedup and the condemned check.** A chunk upload is a create-if-absent,
+or a `HEAD` first when a positive hint (the existence cache, a peer's
+chunk set) says the chunk is probably there already. A chunk below
+`CONSTELLATION_PROBE_MIN_BYTES` (256 KiB) never probes on a guess: a
+miss would cost a second serialized round trip, a hit only resends a
+small body. Only a dedup hit, an upload that finds its chunk already in S3
+and relies on it, needs GC's condemned pointer, and reads it after the
+hit (§14).
+
+**One node losing S3.** If a node's own S3 path makes no progress for
+`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS` (6 s), its drains hand the chunks
+to a peer that reaches S3 (the lease holder first): the peer fetches them
+from this node over P2P, verifies their hashes, uploads them, and
+answers once they are in S3. The invariant is unchanged; only *who*
+uploads changes, and `through` still means "in S3 before `close()`
+returns". Later drains hand off at once while there is still no progress
+(for 30 s). With no such peer (a single node, P2P off, every peer cut
+too), a write-through close or `fsync` still needs S3: it fails with
+`EIO` once the node's own upload has used its retry budget (about
+3 × 30 s). A flush holds only a per-inode lock while it drains, so
+`stat` and `ls` of other files never wait behind it.
 
 ### Streaming writes: files larger than the cache
 
 Reads are size-unbounded by construction (prefetch ahead, evict clean
 behind: a 10 TB file streams through a 50 GB cache). Writes get the same
 property via **eager chunk upload**: because chunks are immutable,
-content-addressed, and invisible until the manifest + log record commit at
+content-addressed, and invisible until the manifest commits at
 `close()`, the daemon uploads a chunk as soon as the writer moves past it —
 hash, compress, PUT, demote dirty → clean → evictable. The cache then holds
 only the in-flight window, and maximum file size is bounded by S3, not
@@ -211,7 +347,7 @@ know client opens; Constellation avoids the problem with explicit claims.)
   push-invalidate the inode's pages (§12), so reads through their existing
   handles return the new bytes after flush + propagation (ms on a LAN) — no
   reopen needed, which for an orphan is impossible anyway. Concurrent
-  orphan writers serialize through the partition lease like any file.
+  orphan writers serialize at the file's sequencer like any file.
   (Contrast NFS: silly-rename `.nfsXXXX` name resurrection, and remote
   holders notice writes only when the attribute cache times out, seconds
   later.) Scratch shortcut: an orphan with a single local
@@ -227,189 +363,538 @@ know client opens; Constellation avoids the problem with explicit claims.)
 
 ## 4. Metadata Plane
 
+The metadata plane is one ordered log in S3, one lease that decides who
+appends to it, and a full replica on every node. Everything else in this
+section exists to make that simple shape fast (forwarding, delegation,
+streaming) and safe to fail over (request ids, speculation, positions).
+
 ### Local store
 
-Every node keeps a **full metadata replica** in SQLite (chosen by benchmark —
-see DECISIONS.md ADR-9; the store sits behind an engine trait, LMDB is a
-future alternative). Core tables:
+Every node keeps a **full metadata replica** in [fjall](https://github.com/fjall-rs/fjall)
+3, an LSM key-value store (plan 29,
+[29-fjall-metadata-engine.md](../plans/v1/done/29-fjall-metadata-engine.md);
+it replaced SQLite, the choice ADR-9 records). One writer transaction at a
+time keeps "namespace change + journal row" atomic; readers take lock-free
+snapshots. The keyspaces that matter here:
 
-```sql
-inode  (ino PK, kind, size, mode, uid, gid, nlink, mtime, ctime,
-        chunk_info BLOB,      -- typed: inline list | manifest hash
-        comp_setting NULLABLE, -- explicit compression override, if any
-        rsize, rcount)         -- recursive aggregates for dirs (§12)
-dentry (parent, name, ino, PK(parent,name)) WITHOUT ROWID
-partition (part_id PK, root_ino, log_pos, lease_state, ...)
-cache  (hash PK, size, state {clean|pinned|dirty}, atime)   -- LRU accounting
-journal (seq PK, record BLOB)  -- local ops not yet flushed to S3
-```
+- `ns`: the replicated namespace, in plan 28's key encoding (inodes,
+  dentries, spilled xattrs, reverse links, and subsystem rows such as the
+  delegation table and the quota). Its key set is exactly what a published
+  commit holds.
+- `journal` and `journal_tx`: the local operations not yet in the log,
+  with one row per transaction (where it ends, its op and rid, its epoch).
+- `spec`, `spec_live`, `pending_replay`: the speculation log (below).
+- `completed`: `rid → outcome` for every request the log has executed or
+  refused.
+- `backup_tail`: on a backup, the holder's unshipped journal (§9).
+- `orphans`, `pending_upload`, `dirty`, `chunk_ref`, `local`: unlinked-but-open
+  inodes, the upload queue, and node-local bookkeeping.
+
+Every write to `ns` goes through one funnel that records the before-image
+of each key it changes when the change is speculative. Commits reach OS
+buffers, not stable storage; state that safety rests on is synced before
+it is acted on (§9). Keyspaces with a tiny live set and a delete per
+operation (the journal, the upload queue, speculation) are compacted in
+the background once they churn, so a daemon does not slow down with
+uptime.
 
 The full tree is browsable offline on every node (`ls`/`stat`/`find` always
 work); file *content* is readable as far as the chunk cache reaches.
 
-### Metadata log
+### One log, one root lease
 
-Each **partition** (see below) has one ordered log stream on S3. A segment is
-a zstd batch of records; each record:
+There is one log, `log/p0/<seq:016x>.zst`, and one lease over it,
+`leases/p0.json`. (Plan 29 removed the per-subtree partitions and their
+two-record cross-partition renames; plan 30 scales writes out with
+delegations over the one log instead, below.)
 
-```
-{seq, txid, node_id, sig, op, args...}
-  op ∈ {mkdir, create, unlink, rename, link, symlink, setattr,
-        write_manifest, set_comp, part_split, part_merge, rename_xpart,
-        unlink_subtree, copy_manifest, snap_create, snap_delete, clone, ...}
-```
+- **Segments** are zstd batches of `LogRecord`s, CAS-created with
+  `If-None-Match`: a sequence-number collision is the conflict detector.
+  Each segment is stamped with the lease epoch (fencing: a deposed
+  holder's late segment is refused) and with the journal position it
+  ships through. A transaction is never split across segments, so an op
+  and its `Completed { rid }` always land together. The holder ships
+  whatever is journaled every sync round (500 ms, or at once when a
+  `close()` or `fsync()` nudges it), in segments of at most 4 MiB.
+- **Records** are the namespace operations (`mkdir`, `create`, `unlink`,
+  `rename`, `link`, `symlink`, `setattr`, `write_manifest`, xattrs,
+  `snap_create`, `snap_delete`, `clone`, quota, atime) plus plan 30's
+  control records: `Completed { rid }` and `Refused { rid, errno }`
+  (exactly-once, below), `InboxAck` (the S3 inbox), `Delegate` and
+  `Recall` (the delegation table), and `TailFollows` (a sealed backup's
+  takeover, §9). The set is an append-only registry, like the manifest
+  entry types.
+- **The commit chain** (plan 28,
+  [28-s3-native-metadata-store.md](../plans/v1/done/28-s3-native-metadata-store.md))
+  replaced checkpoints. Only the lease holder publishes commits: a
+  content-addressed tree of the namespace (`packs/`, `blobs/`) whose root
+  is CAS-created at `commits/<seq>` and records the log position it
+  covers (`applied`). A new node restores the head commit and replays the
+  log from there. Commits are log prefixes: the holder substitutes the
+  before-image of every key its unshipped journal touched
+  ([Write-path hygiene](../reference/features/write-path-hygiene.md#who-publishes-commits)).
+- **The root lease** grants exclusive *append* authority over the log.
+  The object records the holder, the epoch, the expiry, `released`, the
+  nodes waiting for it (`wanted_by`), and since plan 30 the backups, a
+  `config_version`, the `ack_policy`, whether the tenure granted read
+  delegations, and the nodes retired while it named them. The TTL is 60 s,
+  renewed at about half-TTL, and a lease is *usable* only with more than
+  its expiry margin, `min(1 s, TTL/4)`, left.
+- **Leases are sticky.** A holder releases only when a node has asked
+  for the lease (`wanted_by`), its journal is empty, it has held the lease
+  for 5 s, and it has been idle for 30 s or the request is 5 s old. It
+  never releases while a delegation or a lock grant is live (both are
+  capped by the lease), or while the only nodes asking are across a P2P
+  partition from a side that is using it (they are served through the
+  inbox instead). The holder may also move the lease to the
+  write-rate-weighted medoid of the writers
+  ([ADR-15](DECISIONS.md#adr-15-holder-driven-placement-no-election),
+  [Lease placement](../reference/features/lease-placement.md)); since
+  plan 30, placing subtrees on their writers (below) matters more.
+- **Acquire and takeover.** A node acquires the lease by CAS (create, or
+  swap an expired or released object), tails the log to head, ships an
+  epoch marker at the next slot (which fences the old epoch in the log),
+  and keeps its view closed behind a *takeover gate* until the
+  predecessor's stranded work is settled (below). There is no "offline
+  branch" to reintegrate any more: a predecessor's unshipped tail is
+  replayed by its requesters (Layer A), re-shipped by a sealed backup
+  (Layer B), or does not exist (`ack=s3`); see §9.
 
-(`unlink_subtree` and `copy_manifest` back the bulk-delete and reflink fast
-paths in §12; `snap_*`/`clone` back snapshots (§13); like the manifest entry
-types, unknown ops are a versioned, append-only registry.)
+### Request ids and exactly-once
 
-Segments are appended with `If-None-Match` on `log/<part>/<seq>` — the
-sequence number collision is the conflict detector; losers re-tail and retry.
-Followers tail segments (poll + gossip push) and apply them to their replica.
-Periodic **checkpoints** compact a partition's history; segments older than
-the checkpoint are GC'd. Point-in-time restore falls out of
-checkpoint+segments.
+Every mutation carries a request id `Rid { node, incarnation, seq }`,
+assigned once per FUSE operation and kept across every retry, redirect,
+replay and path (P2P, inbox, lease). The incarnation is bumped at every
+mount. Executing an op appends `Completed { rid }` in the same
+transaction; a definitive refusal appends `Refused { rid, errno }`. Every
+replica folds these into `completed`, and a sequencer answers a rid it
+already executed from there (or from an in-memory map of recent
+outcomes), never executing it twice.
 
-### Partitions
+A forward whose reply times out is *in doubt*. The requester retries the
+same rid: the same holder three times with backoff, up to two redirects,
+then the lease path, which tails to head and checks `completed`. Log GC
+keeps every segment younger than `CONSTELLATION_COMPLETION_RETENTION_S`
+(900 s), so the check always covers the op's whole window; an op still in
+doubt at its deadline (twice the lease TTL) fails with `EIO`, never with
+a re-execution. The same identity makes replays, backup re-shipping,
+inbox drains and delegate streams exactly-once without further machinery
+([ADR-18](DECISIONS.md#adr-18-exactly-once-forwarding-with-request-ids),
+[Forwarded mutations](../reference/features/forwarded-mutations.md#exactly-once-identity-and-in-doubt-handling)).
 
-A filesystem starts as a single partition rooted at `/`. Partitions **split
-and merge automatically** at directory boundaries (triggered by offline
-designation, long-lived foreign leases, or log traffic thresholds) — never
-user-managed. Split/merge are log records; no data moves. Cross-partition
-renames use a linked two-record commit (`rename_xpart` pair with a shared
-transaction id; both streams must contain the pair for the rename to be
-final, with a documented recovery rule for half-committed pairs).
+### The replica is a log prefix plus explicit speculation
 
-### Leases (the authority mechanism)
+A node often applies effects before the log has them: a requester's
+*shadow* of its acknowledged forward, an `Exists` hint from a refusal, the
+holder's own unshipped transactions, records streamed ahead of S3, a
+delegate's unappended transactions. Each is *speculation*: written with
+the before-images of every key it touches, in the same transaction, and
+retired when the log confirms it.
 
-A lease on `leases/<part>.json` (CAS-updated, TTL ~60 s, renewed at half-TTL)
-grants one node exclusive write authority over a partition. The holder is
-also the partition's **sequencer**: other nodes normally forward mutations to
-it over iroh instead of moving the lease for each writer.
+A segment from a later epoch *strands* older speculation, and so does a
+deposition. Recovery rolls back to the earliest stranded entry, redoes
+what still stands, and replays the stranded ops **by rid** through the
+current sequencer. A replay the namespace no longer admits is a genuine
+conflict and becomes a `.constellation-conflict/` copy; that is the only
+source of conflict copies. A tailed segment that overlaps outstanding
+speculation is applied *under* it (rolled back, applied in its log place,
+redone), so a replica never holds a log record on top of state from later
+in the log. A new holder's takeover gate strands, applies any backup
+tail, runs its replay queue and drains the inbox before its view opens,
+so it never validates against phantom state
+([ADR-19](DECISIONS.md#adr-19-the-replica-is-a-log-prefix-plus-explicit-speculation),
+[Forwarded mutations](../reference/features/forwarded-mutations.md#speculation-and-stranded-op-recovery)).
 
-- The sequencer validates and journals both local and forwarded ops at
-  local-FS speed, then flushes segments asynchronously (bounded lag, default
-  ~5 s / ~4 MiB). A forwarded ack means the holder journal contains the
-  records; it does not mean the segment is already on S3.
-- Leases are sticky across brief idle periods. A holder releases after about
-  30 seconds without a mutation, avoiding churn between bursty writers.
-- The holder observes recent per-writer operation rates and peer RTT vectors.
-  It may migrate placement to the write-rate-weighted medoid of the writers,
-  after hysteresis and dwell checks, so forwarding cost falls without an
-  election.
-- Acquire: CAS-create or CAS-swap an expired/released lease, after applying
-  the previous holder's flushed log. Transfer is P2P-accelerated (holder
-  flushes + hands off in one RTT) with the S3 CAS as the commit point.
-- Fencing: every lease has an epoch counter; log segments carry it; a
-  deposed holder's late flushes are rejected by sequence+epoch mismatch.
-- Expired lease + unreachable holder: takeover is legal only after applying
-  everything the holder flushed; the holder's unflushed tail (bounded lag)
-  becomes an offline branch handled by reintegration rules (default modes
-  prevent this by construction — see availability matrix).
+### Positions and log streams
+
+Every reply carries the **position** it was evaluated at: the log
+sequence, plus the unshipped journal position `(epoch, jseq)` if it had
+one, plus per-delegation stream positions. A replica can tell from a
+segment's `through` and its delegation origins whether it has everything
+a position names. Positions are the currency of §6's session guarantees,
+strict reads and lock handoffs.
+
+Followers receive shipped segments over **direct log streams** from the
+holder (`LogSubscribe`), applied through the same code as S3 tailing,
+fencing included; a gap, timeout or slow subscriber falls back to S3
+tailing. Gossip carries only hints, membership and digests (this
+supersedes ADR-17's payload push). Under a backup (§9), the holder also
+streams backup-acknowledged transactions **ahead of S3**, contiguously
+from the applied log, and subscribers apply them as speculation: a
+forward waiting for its own transaction is answered from that stream
+instead of from the next S3 round trip
+([Close-to-open modes](../reference/features/cto-modes.md#direct-log-streams),
+[Durability and failover](../reference/features/durability-and-failover.md#pre-s3-streaming)).
+
+### Acknowledgement and durability
+
+What a sequencer's acknowledgement means is the tenure's `ack_policy`,
+chosen per filesystem and topology
+([ADR-21](DECISIONS.md#adr-21-layered-durability-and-seal-based-failover)):
+
+- **`Local`** (Layer A, always, free): the op is on the sequencer's disk;
+  its requester keeps it as speculation and replays it by rid if the
+  sequencer dies.
+- **`Backup`** (Layer B, automatic when a peer is within
+  `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, 5 ms): the holder streams whole
+  journal transactions to its backup and acknowledges only what every
+  listed backup holds. Failover takes about 1.5 s and loses nothing
+  acknowledged.
+- **`S3`** (Layer C, `fs create --ack-policy s3`): acknowledged once its
+  segment is in the log, group-committed per sync round.
+
+A cluster whose peers are all far away picks no backup and stays at local
+speed (hard constraint 4). §9 has the failover rules.
+
+### Delegated sub-sequencers
+
+One lease and one sequencer for the whole namespace would make every
+other writer pay a round trip to it, across an ocean if need be. So the
+root delegates subtrees to their dominant writers over P2P, keeping one
+lease and one log
+([ADR-23](DECISIONS.md#adr-23-delegated-sub-sequencers-over-one-log),
+[Delegations](../reference/features/delegations.md)):
+
+- `Delegate { dir, node, gen }` and `Recall { dir, gen }` records keep a
+  replicated delegation table. Delegations never overlap and never nest.
+  A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s), is renewed by the
+  delegate, and is capped by the root lease.
+- **Ownership** is a local ancestor walk: a dentry belongs to the
+  delegation containing its parent; an inode's own keys to the one
+  containing its primary link's parent. An op whose keys have two owners
+  is cross-subtree.
+- The delegate validates against its replica (authoritative for the
+  subtree, since every write there goes through it), journals as
+  speculation, acknowledges under its own durability layer (a backup
+  chosen by RTT to *it*), and streams its transactions in order to the
+  root. The root appends them without re-validating, in order, and only
+  once each transaction's `deps` (the delegate stream positions the
+  requester had observed) are in its replica: no replica ever holds a
+  record whose causes are missing.
+- **Cross-subtree ops** (renames and hard links across delegations,
+  `rmdir` or rename of a delegated root) go to the root, which *recalls*
+  the delegations involved first (the delegate drains and stops, or is
+  outwaited), then executes alone. There is no two-phase commit.
+- **Placement** is automatic: the root sees every op's origin and
+  delegates the *topmost* directory one node dominates (at least 70% of
+  its ops in a 30 s window, above a rate floor), recalling when the share
+  stays below 50% for a minute, with a cool-down before it moves again.
+- **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
+  clock stamps merged by `max` and `nlink` changes are deltas, so creates
+  in one directory commute and hold their parent only *shared*. A
+  directory can be split into up to 16 name-hash ranges (GIGA+), each
+  delegated separately, but only to a node that dominates that range:
+  names hashed uniformly across writers give no range a dominant writer,
+  and splitting such a directory measured slower than leaving it with the
+  root.
+
+A node writing its own subtree therefore runs at local speed, and S3
+request counts do not change, since there is still one log. Offline
+designations (§5.2) reuse the same machinery without TTL expiry.
+Leaseless optimistic commits, which would remove the sequencer
+altogether, stay deferred
+([ADR-28](DECISIONS.md#adr-28-leaseless-optimistic-commits-stay-deferred)).
+
+### The S3 inbox
+
+A requester with no P2P path to the holder (P2P off, the holder not in its
+peer directory, or an outage to it longer than
+`CONSTELLATION_INBOX_P2P_GRACE_MS`, 3 s) forwards through the bucket: it
+CAS-creates batches `inbox/<epoch>/<node>/<n>`, the holder polls each
+such requester with an adaptive backoff (and never one it is P2P-connected
+to), and outcomes ride the log (`Completed`, `Refused`, `InboxAck`). An op
+waiting in the inbox is re-sent over P2P by the same rid as soon as the
+holder is reachable again. Sustained demand (8 inbox ops, or 1.5 s of
+waiting, within 10 s) escalates to a lease request: a create storm still
+moves the lease, a sporadic write does not. Locks and strict ReadIndex
+never go through the inbox
+([ADR-24](DECISIONS.md#adr-24-the-hybrid-s3-inbox-for-writes-without-a-p2p-path),
+[Forwarded mutations](../reference/features/forwarded-mutations.md#the-inbox-forwarding-without-p2p)).
+
+### Locks
+
+Cluster `flock`/`fcntl` locks are leased grants kept by the owning
+sequencer (the root or the delegate of the file), in the same core that
+sequences the file's mutations. §6 explains them.
 
 ## 5. Write Authority: the One Rule
 
 > A node may alter a subtree only while it holds an unexpired **authority
 > chain** rooted in something that cannot be concurrently claimed.
 
-Three roots exist; all transitions between them are explicit, signed, and
-persisted before activation. Safety never depends on failure detection —
-heartbeats (`heartbeat/*`, P2P keepalives) feed status UX only.
+Three roots exist:
 
-Forwarding adds **requesters**, not appenders. The lease holder remains the
-only node that assigns authoritative order and appends the partition log.
-S3 CAS lease ownership, fencing epochs, and takeover rules are unchanged.
-An unreachable or declining holder makes the requester fall back to the
-ordinary S3-backed lease path.
+- **the root lease** (§4), claimed by CAS on S3;
+- **offline designations** (§5.2), non-stealable claims on a path;
+- **continuation epochs** (§5.3), persisted agreements among the nodes
+  of a P2P component during a bucket outage.
 
-### 5.1 Leases (default)
+Every other grant is **derived** from the root lease and capped by it:
+delegations (§4), read delegations (§6) and lock grants (§6). All derived
+grants share one time discipline. The holder of a grant honours it until
+`sent + ttl − margin` on its own clock, measured from when it sent the
+request; the grantor treats it as live until `granted + ttl + margin` on
+its clock; `margin` is the lease's expiry margin, `min(1 s, TTL/4)`. The
+rule is safe while clocks drift apart by less than half the margin
+(`margin > 2 × drift`), the same assumption the lease itself makes. A
+grantor never gives more than it has left, so a grant never outlives the
+lease it came from.
 
-Section 4. The desktop that touches everything simply keeps its leases warm
-and runs at local speed.
+All transitions between roots are explicit and persisted before they take
+effect. Heartbeats and silence now drive liveness decisions — a backup
+seals a silent holder, an `ack=s3` peer takes one over, a node publishes a
+promise when asked — but none of them fences anything. The fences are the
+S3 CAS, the backup's seal, the log-slot CAS, the lease margin and the
+promise (hard constraint 5).
+
+### 5.1 Requesters, sequencers and the one appender
+
+A node that does not own the keys of a mutation is a *requester*: it
+forwards the op with its rid to the *owning sequencer*, which is the root
+lease holder or the delegate of the subtree (or hash range). Sequencers
+validate and order; only the root **appends** to the log. A requester
+with a stale table is redirected (`NotHolder`, at most two hops).
+
+If the owner does not answer, the requester retries the same rid (§4),
+then goes through the S3 inbox if it has no P2P path to the holder, or
+the lease path if it does. The lease path is the one mechanism that works
+with nothing but S3: the requester registers in `wanted_by`, and the
+holder releases (§4) or its lease expires and the requester takes it by
+CAS. `CONSTELLATION_FORWARD=off` restores writer-follows-lease for every
+write.
 
 ### 5.2 Offline designation
 
 `constellation offline <path>` / `online <path>` — CAS-enforced, exactly one
-designee per path, overlap-checked.
+designee per path, overlap-checked (`designations/`).
 
-- **Designee reachable → everyone still writes.** Other nodes' authority for
-  the subtree becomes a short-TTL *delegation* granted by the designee, and
-  their flushes require the designee's ack. Invariant: at any instant the
-  designee provably holds all committed changes, so its offline writes are
-  always linear continuations. Cost: ~1 RTT to the designee per foreign
-  flush (sub-ms on a LAN).
-- **Designee unreachable → delegations expire**, others go read-only on that
-  path; the designee writes indefinitely (its root claim is non-stealable)
-  and reintegrates on reconnect. `offline --ro` grants a read guarantee
-  without write authority.
+A designation is a **non-stealable delegation** to the designee
+(`Delegate { designated: true }`): the same machinery as §4's delegations,
+without TTL expiry, never recalled by placement or by a cross-subtree op.
+
+- **Designee reachable → everyone still writes.** Other nodes' ops under
+  the path are forwarded to the designee and sequenced there, and it
+  streams them to the root like any delegate. At any instant the designee
+  holds every change under the path, so its offline writes are always
+  linear continuations.
+- **Designee unreachable → others cannot write under the path.** An op
+  under a designation that reaches the root is refused with `EROFS`; a
+  cross-subtree op involving one with `EXDEV`. The designee keeps writing
+  indefinitely, with or without S3 (its claim cannot be stolen), and its
+  stream reaches the root when it reconnects.
+- `offline --ro` grants a read guarantee (a pin) without write authority
+  and creates no delegation.
 
 ### 5.3 Continuation epochs
 
-If S3 is unreachable but the P2P-connected component contains **all
-write-eligible nodes** (every *live* non-read-only registry record —
-read-only followers and leave-tombstones with `retired: true` do not
-count), members sign and locally persist a continuation epoch: leases
-transfer P2P, writes journal locally, everything flushes when S3
-returns. Majority quorum is deliberately insufficient (a minority node
-with S3 access could legally take expired leases). If the component loses
-a member mid-epoch, the remaining nodes go read-only; the departed member
-persisted its epoch promise and must not take epoch-held leases via S3
-until holders flush — both sides freeze, no conflict. Promises are
-persisted before activation (crash-safe).
+When S3 is unreachable, nodes that still reach each other over P2P may
+form a **continuation epoch**: leases move among the members over P2P,
+writes journal locally, and everything flushes when S3 returns
+([ADR-22](DECISIONS.md#adr-22-flexible-quorum-continuation-epochs-with-promises),
+[Durability and failover](../reference/features/durability-and-failover.md#flexible-continuation-epochs)).
 
-Shrinking the write-eligible roster is an **operator action**
-(`constellation leave`, §8), never a timeout: an unmounted or
-P2P-unreachable node still counts until explicitly retired, so a
-remaining component cannot open an epoch while a still-enrolled writer
-might take expired leases via S3.
+The danger is a missing node that still reaches S3 and takes an expired
+lease the epoch is using. With `epoch_slack = 0` (the default) the epoch
+therefore needs **every** write-eligible node: every live, non-read-only
+registry record. Majority quorum is deliberately insufficient. With
+`epoch_slack = f` (`fs create --epoch-slack`, `fs set epoch-slack`) it
+needs `N − f`, and the missing nodes are held off by **promises**:
 
-### Availability matrix (per subtree)
+- A promise is a node's word that it joins no epoch before a given time
+  (`heartbeat/<node>`, persisted and synced locally before the PUT). It
+  is published on demand only: when a would-be taker asks over P2P, when
+  the node sees a lease expire unrenewed and nobody can ask it, or when
+  its slack changes. A steady cluster writes none.
+- A node joins an epoch only once its own last promise has expired, and
+  promises nothing while its epoch is open.
+- An S3 takeover of an expired lease another node held needs `f` *other*
+  nodes whose promises outlast the lease's recorded expiry. A taker's `f`
+  promisers and an epoch's `N − f` members must share a node, whose
+  promise would have to be both expired and binding.
+- The promise TTL is at most a quarter of the lease TTL, and a taker
+  honours the largest slack any node advertises, so changing `f` is safe
+  while it propagates.
 
-| situation | designee/holder | others |
+What an epoch may carry:
+
+- It carries a node's lease only if nobody outside the epoch can take
+  that lease over early: a `Local` lease, or a `Backup` lease whose
+  backups are all members. An `S3` lease is never carried, since any peer
+  may take it over before its expiry (§9).
+- It carries a lease only if the holder's claim was usable (outside the
+  margin) when it joined. An epoch that ends up carrying no lease has no
+  one to sequence writes, and refuses them at once with `EROFS`.
+- No delegations exist inside an epoch (the root recalls them when it
+  opens), and writes are acknowledged on the epoch holder's disk alone.
+- A member that can still reach S3 declines to join. A node whose own S3
+  fails first asks every member to probe S3; if any does reach it, the
+  outage is its own and it proposes nothing (its closes hand their chunks
+  to a peer instead, §3).
+
+If the component loses a member mid-epoch, the epoch **freezes**:
+members refuse writes (`EROFS`) until it recovers or S3 returns. Shrinking
+the write-eligible roster beyond `f` is an **operator action**
+(`constellation leave`, §8), never a timeout: an unmounted or unreachable
+node still counts until it is retired. An admin leave also fences the
+retired node's leases, and epoch members abandon an epoch that carried a
+retired node's lease. A node that enrolls during an epoch is a known gap.
+
+### Availability matrix
+
+Per subtree, with P2P on and the defaults unless stated. "Write" means the
+op executes and is acknowledged; "EROFS" means it is refused at once.
+
+| Situation | Sequencer (holder, delegate or designee) | Other nodes |
 |---|---|---|
-| all connected | write (local speed) | write (close-to-open) |
-| node isolated, no designation | that node: read-only | write |
-| designee isolated | write | read-only on path |
-| S3 down, all writers on LAN | write (epoch) | write (epoch) |
-| S3 down, writer missing from LAN | read-only | read-only |
+| All connected | write at local speed | write: one round trip to the sequencer, local speed in a subtree delegated to them |
+| One node cut from P2P, S3 up | write | the cut node writes through the S3 inbox (a few S3 round trips per op); no cluster locks or strict ReadIndex for it |
+| Holder cut from P2P, S3 up | writes, serves the others through their inbox until their demand moves the lease to their side | write through the inbox, then locally once the lease moves |
+| One node loses S3, P2P up | write; its closes hand their chunks to a peer after 6 s | write |
+| Holder dies, a backup within the RTT budget | — | write again in ≈ 1.5 s (seal-based takeover), nothing acknowledged lost |
+| Holder dies, `ack=s3` | — | write again in ≈ 1.5 s (any peer takes over), nothing acknowledged lost |
+| Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
+| Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its backup's seal |
+| Delegate cut from the root | stops sequencing at `sent + ttl − margin`; its unstreamed ops are replayed through the root | write through the root once it reclaims the subtree |
+| Designee isolated | write | `EROFS` under the path |
+| S3 down, at least `N − f` write-eligible nodes connected | write (epoch) | write (epoch) |
+| S3 down, fewer than `N − f` connected | writes until its lease's TTL, then refuses | cannot acquire; reads work |
+| S3 down, `ack=s3` | acknowledgements stall until S3 returns | the same |
 
 ## 6. Consistency Modes
 
-- **close-to-open (default)**: `open()` sees the latest completed `close()`
-  cluster-wide; concurrent writers on different nodes serialize via lease
-  transfer.
-- **strict (per mount/subtree)**: cross-node byte-range `fcntl` locks and
-  pre-close visibility; every conflicting op pays coordination RTTs.
-- **relaxed (per node/subtree, explicit opt-in)**: write locally, sync in
-  background, conflicts *detected* and materialized on reintegration
-  (never silent). Intended for backup followers and web fleets.
+Three things together define what a reader sees:
+
+- **Session guarantees, always**: a node never answers a read from a
+  state older than one its clients have already seen.
+- **Close-to-open, per mount**: `--cto bounded` (the default) or
+  `--cto strict`.
+- **Cluster locks, per daemon**: `--locks cluster` (the default whenever
+  P2P is on) or `local`.
+
+Concurrent writers on different nodes serialize at the owning sequencer by
+forwarding, not by moving a lease
+([ADR-4](DECISIONS.md#adr-4-consistency-default--close-to-open-strict-and-relaxed-opt-ins),
+[ADR-20](DECISIONS.md#adr-20-positions-session-guarantees-and-two-close-to-open-modes)).
+The "relaxed" mode of earlier designs (write locally, detect conflicts on
+reintegration) has not been built.
+
+### Session guarantees
+
+A node keeps an `observed` watermark: the positions (§4) of replies whose
+effects it has not installed locally, such as a refusal, an `Exists`
+without a hint, or an op that waited for the log. An accepted forward
+installed as a shadow does not raise it: the shadow already covers its
+keys. Every FUSE read path (`lookup`, `getattr`, `readlink`, `open`, the
+first `readdir` chunk, `getxattr`, `listxattr`) waits until the replica
+reaches `observed`, unless speculation already covers the keys it reads.
+The wait is bounded by `CONSTELLATION_SESSION_WAIT_MS` (2 s); on timeout
+the read answers from the replica and is counted as degraded. The result
+is read-your-writes and monotonic reads for every client of a node, at no
+cost when the node is idle
+([Close-to-open modes](../reference/features/cto-modes.md#session-guarantees)).
+
+### Close-to-open: bounded and strict
+
+- **`bounded`** (default): an open reads the local replica, which follows
+  the log within the visibility bound: the log stream's delivery on a
+  healthy cluster, S3 tailing otherwise. Session guarantees still hold per
+  node.
+- **`strict`**: an `open`, `lookup` or first `readdir` chunk on a node that
+  is not the sequencer sees every `close()` another node completed before
+  it began. It asks the owning sequencer for a position (**ReadIndex**)
+  and waits for its replica to reach it; the answer is a position, not a
+  record, so a later segment of an older write can never regress it. The
+  answer may carry a **read delegation** (5 s, capped by the lease), under
+  which later opens of that inode are local. Before acknowledging any
+  mutation that touches a delegated inode (including an unlinked or
+  replaced one), the sequencer recalls the delegation or outwaits it; a
+  forward held longer than half its timeout is answered `Held` and
+  retried by rid. The sequencer persists a grant horizon before it
+  answers, so it grants nothing new after a restart until earlier grants
+  have expired, and a fast successor waits the horizon out before it
+  acknowledges anything. Kernel caches have a zero TTL under strict,
+  except on a sequencer that has not yet seen another node.
+
+Strict costs nothing on a single node, about one round trip for a first
+open on a LAN, and one WAN round trip for a write-then-open across
+continents, the minimum strict close-to-open allows at that distance.
+With P2P off there is no ReadIndex: a strict open tails S3 to head, so the
+sequencer's own unshipped writes become visible at its next ship. A
+`--write-mode back` writer's content becomes readable elsewhere only once
+its chunks are up
+([Close-to-open modes](../reference/features/cto-modes.md#strict-reads-readindex)).
+
+### Cluster locks
+
+`flock` and `fcntl` locks exclude each other across nodes
+([ADR-25](DECISIONS.md#adr-25-cluster-locks-are-leased-grants-from-the-owning-sequencer),
+[Cluster locks](../reference/features/cluster-locks.md)):
+
+- **Grants.** The owning sequencer gives nodes whole-file shared or
+  exclusive *grants*; byte ranges and lock owners are resolved on the node
+  under its grant. A grant is cached after the last unlock, so an
+  uncontended re-lock costs no message.
+- **Leased, with one time discipline.** A grant lasts
+  `CONSTELLATION_LOCK_TTL_MS` (5 s), capped by the sequencer's own
+  authority, and follows §5's discipline. It is renewed half-way through
+  the window its holder honours it for, so a short grant is renewed
+  inside its window too. A delegate grants nothing on less than
+  `2 × margin` of delegation left, and keeps its delegation topped up
+  while it has grants out.
+- **Conflicts** recall the other grants; a recalled node flushes the
+  file's dirty data to the log before it releases. Blocking requests park
+  first-in first-out at the sequencer; non-blocking ones get `EAGAIN` and
+  the recall still goes out.
+- **Coherence from one holder to the next.** A grant carries a position
+  the new holder waits for, and it drops its kernel cache of the file.
+  The position covers every file, not only the locked one: a release
+  carries the releaser's session frontier (every reply its clients got,
+  and a root holder's unshipped journal), the owner joins it into every
+  later grant of the file, and the new holder makes it its session
+  watermark. These *floors* live in the owner's memory and move with the
+  lock table when the owner changes: to a delegate and back, to a fast
+  successor through the backup mirror, and a new tenure grants nothing
+  until every inherited delegation has renewed with it. That is what
+  keeps lock-protected read-modify-write of a *set* of files correct
+  across nodes (git's refs under an `flock` turn file).
+- **Fencing.** A node whose grant lapsed (for example, partitioned past
+  the lock TTL) fails I/O with `EIO` on the files it holds locks on,
+  until they are unlocked or a new grant arrives (NFSv4's rule), and its
+  writes under the lapsed grant are never published. The limit: only I/O
+  on the *locked* file is fenced. An application that guards other files
+  with the lock, as git does, runs on unprotected once the grant has
+  lapsed, which is why renewal must happen inside the window.
+- **Failover.** After a TTL takeover every old grant has already lapsed,
+  so there is nothing to reclaim. After a fast takeover the successor
+  waits out a grace period and accepts reclaims. A delegation's first
+  renewal carries what is left of any root grace over its subtree.
+- **Limits.** A blocked lock wait cannot be interrupted, there is no
+  deadlock detection, and one process's `flock` and `fcntl` locks on the
+  same file conflict. Locks never use the S3 inbox: with P2P off the mode
+  is `local`.
 
 ### Staleness, precisely
 
 Two invariants define what "stale" can and cannot mean here:
 
 1. **Cache staleness ≡ replica staleness.** Every kernel cache (entries,
-   attrs, negative entries, pages — §12) is invalidated in the same step
-   that applies a remote log record to the replica, so caching never adds
-   staleness beyond log-propagation lag. (Contrast NFS-style TTL caches,
-   which stay stale even after the server knows better.) And because
-   records apply in log order, a node's view is always a consistent
-   *prefix* of the authoritative history — "the world as of txid N,"
-   never a mix.
-2. **Reads may be stale; writes never act on stale state.** Every conflicting
-   write is validated by the partition lease holder, either locally or as a
-   forwarded request. Holding or acquiring the lease requires applying the
-   predecessor's flushed log (§4). A write based on an outdated requester
-   view therefore serializes against the holder's authoritative state and
-   fails cleanly (e.g. ENOENT), rather than conflicting.
-
-For a forwarded mutation, the requester immediately stores the acked records
-as a local **shadow** and applies them to its replica. It therefore sees its
-own accepted operation before the holder's segment reaches S3. When the
-holder publishes a small segment, `SegmentPublished` may carry the compressed
-segment bytes; peers can apply that payload directly. Larger segments carry
-only the usual hint to tail S3. In both cases S3 remains the durable source,
-and later tailing reconciles the shadow with the authoritative stream.
+   attributes, pages — §12) is invalidated in the same step
+   that applies another node's change to the replica
+   (`FUSE_NOTIFY_INVAL_*`): a tailed or streamed segment, a forwarded op
+   the holder or a delegate executed in place, a delegate transaction the
+   root appended, a transaction streamed ahead of S3. So caching adds no
+   staleness beyond propagation lag. (Contrast NFS-style TTL caches, which
+   stay stale even after the server knows better.) And a node's view is
+   always a prefix of the authoritative history plus explicit speculation
+   ahead of it: its own acknowledged ops, and records streamed
+   contiguously from the log. It is never a mix of unrelated states.
+2. **Reads may be stale; writes never act on stale state.** Every write
+   is validated by the owning sequencer, whose replica is authoritative
+   for its keys. Acquiring the lease requires applying the predecessor's
+   log and passing the takeover gate (stranded speculation rolled back and
+   replayed, backup tail applied, inbox drained). A write based on an
+   outdated requester view therefore serializes against the sequencer's
+   state and fails cleanly (e.g. `ENOENT`), rather than conflicting.
 
 Worked example: node A deletes a file at t=0; node B `stat()`s it 1 ns
 later and still sees it. Correct: no signal from A has reached B, so there
@@ -417,10 +902,10 @@ is no happens-before edge — serializing B's read before A's delete is a
 legal ordering (nothing short of paying a round trip per stat could do
 better; that is strict mode). The case that must work — A deletes, *then
 tells B out of band*, then B looks — does: A's "done" is meaningful after
-`close()`/flush, and B applies the record via gossip-pushed tailing
-(milliseconds on a LAN). If B instead tries to *write* over the deleted
-path, invariant 2 forces its op after the delete regardless of what it had
-seen.
+`close()`/flush, and B receives the record over the direct log stream
+(milliseconds on a LAN); under `--cto strict`, B's ReadIndex makes it hold
+by construction. If B instead tries to *write* over the deleted path,
+invariant 2 forces its op after the delete regardless of what it had seen.
 
 ## 7. Caching and Data Movement
 
@@ -430,36 +915,36 @@ seen.
   throttle writes → ENOSPC. Cached chunks are stored decompressed by default
   (config knob) for pread-fast reads.
 - **`constellation pin <path>` / `unpin`**: fully cache a subtree,
-  non-evictable, **eagerly push-synced**: flushed records propagate via
-  gossip, pinned nodes fetch new chunks immediately from the best source (LAN
-  peer preferred) in parallel with the S3 upload. Admission check up front
+  non-evictable, **eagerly push-synced**: pinned nodes fetch new chunks
+  as soon as the records arrive, from the best source (LAN peer
+  preferred) in parallel with the S3 upload. Admission check up front
   (pinned set must fit the budget). `unpin` demotes to evictable.
 - **Prefetcher** (after mountpoint-s3): per-handle sequential detection,
   adaptive readahead 1 → ~16 chunks in flight, reset on seek; random reads
   fetch only the needed chunk (ranged within it if partial). Pins reuse the
   prefetcher at full parallelism.
-- **Cooperative cache**: nodes gossip bloom-filter digests (+deltas) of their
-  cached chunk sets (~10 bits/entry, ~1% FPR). A local miss checks peer
-  digests *locally* — zero per-request messages — then fetches from the
-  best source. Chunks are self-verifying (hash), so peer serving needs no
-  trust or invalidation. Rendezvous hashing is a composable alternative
-  policy.
+- **Cooperative cache**: a local miss is fetched from a peer that has the
+  chunk, found *locally*, with zero per-request messages. Every node
+  keeps an **exact mirror** of each peer's published chunk set (its clean
+  or pinned chunks, keyed by 8-byte hash prefixes): pushed deltas every
+  250 ms keep mirrors current, a small summary heartbeat detects drift,
+  and range-based set reconciliation (Negentropy-style additive
+  fingerprints over hash-prefix ranges) repairs any gap. So a peer fetch
+  never goes to a node that does not have the chunk, and a removal
+  propagates within one tick
+  ([ADR-26](DECISIONS.md#adr-26-exact-chunk-location-reconciliation-replaces-bloom-digests),
+  [Cooperative cache membership](../reference/features/cooperative-cache.md)).
+  The older bloom-filter digests (~1% false positives, add-only deltas)
+  remain available as `CONSTELLATION_COOP_DIGEST=bloom`. Chunks are
+  self-verifying (hash), so peer serving needs no trust or invalidation,
+  and a wrong mirror only costs a declined fetch; S3 remains the source of
+  truth.
   A cache may be a thin slice of the dataset or the whole of it: a node
   is free to dedicate one or more full local drives, so 1–4 TiB is an
   ordinary size. Each node sizes and evicts independently; nothing
-  assumes peers have equal cache budgets. The digest is advisory (a peer
-  may have evicted since advertising, or not yet advertised a new chunk);
-  S3 remains the source of truth.
-  A single bloom is capped at 16 KiB so it fits one gossip frame
-  (~13k chunks). Larger caches are split by hash prefix into as many
-  buckets as that node's own size needs (128 for 4 TiB at 4 MiB chunks).
-  Receivers store each peer's buckets separately, use *that* peer's
-  bucket count on lookup, and cap what they will retain (~4 MiB/peer)
-  so the largest cache cannot dictate everyone else's memory. Full
-  snapshots rotate one hash-prefix bucket per interval (~5 kbit/s for 4 TiB);
-  add-only deltas cover inserts between rotations. Membership changes
-  are a journal on the cache (`take_digest_events`), not a full-set clone
-  on every tick.
+  assumes peers have equal cache budgets. A mirror costs its receiver
+  8–12 bytes per peer chunk; a peer with more than 8M chunks is not
+  mirrored.
 - **Latency-adaptive source selection**: per-source EWMA of TTFB and goodput
   (S3 and each peer, learned from real transfers), peer RTT (free from QUIC)
   and path type, error rate, queue depth. Pick min predicted
@@ -482,29 +967,32 @@ seen.
   leave **tombstones** the record (`retired: true`, `retired_unix`) rather
   than DELETE, so numeric ids (log-segment origin, ino prefixes) are never
   reused by a later claim. Unmount alone never leaves — the live record
-  stays and still blocks continuation epochs until retired.
+  stays and still counts toward a continuation epoch's quorum until
+  retired (§5.3).
 
-  - **Self-leave** (`constellation leave --state-dir …`): refuse if a
-    continuation epoch is open locally, or if this node holds a stranded
-    deposed journal (`reintegrate` first). Refuse live offline
+  - **Self-leave** (`constellation leave <fs>`): refuse if a
+    continuation epoch is open locally, or if this node was deposed and
+    its recovery has not run yet (`reintegrate` first). Refuse live offline
     designations unless `--force` (courtesy; force never skips the epoch
-    or stranded-journal checks). Then flush the journal, release every
-    partition lease, write the tombstone, persist `left=1` in the local
-    state dir, stop writing, and unmount. Remount of that state dir fails
-    until the operator uses a **fresh** `--state-dir` (new id).
-  - **Admin leave** (`leave --state-dir <live-peer> --node-id N`): a
+    or deposition checks). Then flush the journal, release the lease,
+    write the tombstone, persist `left=1` in the local state dir, stop
+    writing, and unmount. Remount of that state dir fails until the
+    operator uses a **fresh** state dir (new id).
+  - **Admin leave** (`constellation leave <fs> --node-id N`): a
     still-mounted peer with bucket write tombstones another member. It
     does not flush that node's journal. Refuse if `N` is the calling
     node, or if `N` currently holds a live lease or unreleased
-    designation, unless `--force`. A still-running target that sees its
-    own record vanished or retired must stop writing (treat as
-    deposition).
+    designation, unless `--force`. It also **fences** `N`'s leases: the
+    lease object records `N` as retired, so `N` can never claim it again
+    whatever it believes it holds, and epoch members abandon an epoch that
+    carried `N`'s lease. A still-running target that sees its own record
+    vanished or retired must stop writing (treat as deposition).
   - **Rejoin** is new enrollment: mount with a new state dir (or delete
-    the old one) and claim a fresh id. Optional `--rejoin` sugar on a
-    spent state dir is not required.
+    the old one) and claim a fresh id.
 
-  Peers refresh `nodes/` periodically (~5 s); after a leave, survivors
-  observe the smaller write-eligible roster without remounting.
+  Peers refresh `nodes/` periodically (~5 s, one LIST; records are
+  re-read only when they changed); after a leave, survivors observe the
+  smaller write-eligible roster without remounting.
 - **Discovery unpublished by default**: peers learn addresses from the
   registry, so a leaked NodeId is not dialable by outsiders. Optional
   iroh relays (`CONSTELLATION_P2P_RELAY`, default off) add NAT/internet
@@ -515,17 +1003,22 @@ seen.
   credential.
 - **Encryption at rest**: default = S3 SSE + TLS (provider trusted;
   credentials alone suffice to mount). Optional **E2E passphrase mode** (per
-  filesystem, at `fs create`): per-partition XChaCha20-Poly1305 DEKs wrapped
-  in `keys/keyring` by an argon2id passphrase-derived KEK; mounting needs
-  credentials + passphrase; unwrapped DEKs live in mlock'd RAM only.
+  filesystem, at `fs create`): a random master key, wrapped in `meta.json`
+  by an argon2id passphrase-derived key; every data key (per-log
+  XChaCha20-Poly1305 DEKs, the addressing key, the gossip topic seed) is
+  derived from it, so changing the passphrase rewraps one envelope and
+  rotates nothing. Mounting needs credentials + passphrase; unwrapped keys
+  live in mlock'd RAM only. Registry, lease, designation and heartbeat
+  objects stay plaintext: they carry coordination data, not names or
+  contents.
 - **Keyed addressing in E2E mode**: plain plaintext hashes as object keys
   would let the provider hash a known file and test for its chunks in the
   bucket (confirmation-of-file, the convergent-encryption leak). E2E
   filesystems therefore address chunks with **keyed blake3**
-  (`blake3::keyed_hash`) under a per-filesystem secret from the keyring.
-  Dedup still works within the filesystem (same key everywhere), the
-  provider learns nothing from object names, and the choice is fixed at
-  `fs create` — a per-FS setting, never a migration.
+  (`blake3::keyed_hash`) under a per-filesystem secret derived from the
+  master key. Dedup still works within the filesystem (same key
+  everywhere), the provider learns nothing from object names, and the
+  choice is fixed at `fs create` — a per-FS setting, never a migration.
 - **Access = IAM.** Whole filesystem (bucket prefix): grant credentials
   with read or read-write as needed; read-only creds make a read-only
   follower member. Subtrees cannot be IAM-scoped independently — content
@@ -553,25 +1046,142 @@ scopes *used* space to the mounted view — a subtree or snapshot mount
 walks its own root — while free space reports whole-filesystem headroom
 under the cap, which is what a writer can actually consume.
 
-| failure | behavior |
+### What "persisted" means
+
+A node's store commits to OS buffers (fjall `PersistMode::Buffer`): a
+commit survives a crash of the process, and the kernel writes it back
+within seconds, but a power loss or kernel crash can drop the last
+commits unless something synced them (an `fsync()` on the mount, an
+orderly shutdown). State that *safety* rests on is synced before it is
+acted on: a promise and the epoch join gate, an epoch's persisted state,
+a seal, the read-grant horizon. So a power loss can make a node forget
+work, never a promise. Backup appends are committed, not synced; that is
+Layer B's single-failure contract below
+([Durability and failover](../reference/features/durability-and-failover.md#what-on-disk-means)).
+
+### Failover by topology
+
+| Topology | Policy | Added acknowledgement latency | Holder crashes and returns before a takeover | Holder away past a takeover | Failover |
+|---|---|---|---|---|---|
+| Single node | `Local` | none | nothing lost | n/a | n/a |
+| Only distant peers (no backup in budget) | `Local` (Layer A) | none | nothing lost | forwarded ops replayed by their requesters; the holder's own unshipped writes come back as a replay when it returns | lease TTL (60 s) + margin |
+| A peer within the RTT budget | `Backup` (Layer B) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS, ≈ 1.5 s |
+| `fs create --ack-policy s3` | `S3` (Layer C) | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS with P2P; the TTL without |
+
+"Nothing lost" is the single-failure contract: any failure of one machine,
+power included. A power loss of the holder and every backup together can
+lose `Backup`-acknowledged writes of the last seconds; `ack=s3` (or
+`fsync()` with `--fsync-mode s3`) covers that. For the first seconds of a
+tenure, while a backup that could be had is being brought up, a `Local`
+holder acknowledges nothing that rests on its disk alone: those
+acknowledgements wait for S3.
+
+### Seal-based failover
+
+A backup that hears nothing from its holder for
+`CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s) **seals**: it persists and
+syncs "epoch *e* sealed" and refuses every later epoch-*e* append. The
+old holder needs every listed backup's acknowledgement for anything it
+acknowledges, so after the seal it can acknowledge nothing more, whether
+it is dead, slow or only cut off from this backup. The backup then
+re-reads the lease, CASes it to epoch *e*+1, tails S3 to head, ships its
+epoch marker (with `TailFollows`, so readers know the predecessor's tail
+comes back after it), re-ships its backup tail deduplicated by rid, and
+opens. A holder's CAS removing a silent backup and that backup's takeover
+CAS are on the same lease version (`config_version`), so exactly one
+wins. A node that is not a listed backup waits 3 s past a `Backup`
+lease's expiry before claiming it, so a backup gets there first.
+
+Under `ack=s3`, every acknowledged record is in a log slot below the
+taker's marker, so any peer may take a silent holder over (silence is
+read from its log stream, so this needs P2P); a holder that renewed its
+lease recently has proven it reaches S3 and keeps it.
+
+A fast successor (seal or `ack=s3`) waits out the previous tenure's
+read-delegation and lock grants before it acknowledges a mutation or
+grants a lock, and accepts lock reclaims meanwhile. A TTL successor has
+nothing to wait for: every grant was capped by the lease that expired
+([Durability and failover](../reference/features/durability-and-failover.md#seal-based-failover)).
+
+Three rules keep false alarms cheap: a holder whose lease renewal is
+merely slow keeps heartbeating its backup until the lease actually
+expires; a backup that restarts counts silence only from the moment its
+link to the holder is up; and a node that answered "sealed" for an epoch
+is never invited back as its backup.
+
+### Nobody observes a tentative effect
+
+Under `Backup` and `S3`, the holder's reads and its answers to other
+clients' ops wait until any unshipped rows they would observe are
+durable, so no client of any node sees an effect a failover could roll
+back. Under `Local` without a backup, a refusal can observe the holder's
+acknowledged-but-unshipped effect, which a crash of the holder then rolls
+back and replays later; that window is the price of Layer A's zero
+latency.
+
+### Delegates
+
+- **Crash, no backup**: the root reclaims the grant after `ttl + margin`
+  (≈ 6 s) and ends the generation; requesters replay their acknowledged
+  ops by rid through the root.
+- **Crash, with a backup**: the root has the delegate's backup seal,
+  drains what it holds, and continues.
+- **Partitioned from the root**: the delegate stops at
+  `sent + ttl − margin`, before the root may reclaim; its unstreamed
+  transactions are stranded and replayed by rid.
+- **Root fails over**: the new root inherits the live generations, whose
+  grants were capped by the old lease. After a TTL takeover they are
+  already dead; after a fast takeover the delegates re-stream from what
+  the log has, and a backup that was itself a delegate rolls back its own
+  unappended rows and replays them after the predecessor's tail, never
+  ahead of it.
+- A dependency on a delegate transaction that was acknowledged but never
+  appended is never executed around: the op waits (`Held`) until its own
+  replay has landed
+  ([Delegations](../reference/features/delegations.md#failures)).
+
+### Lock holders
+
+A node partitioned from a file's sequencer past the lock TTL loses its
+grant and is fenced: `EIO` on the locked files until they are unlocked.
+The sequencer outwaits the grant (`granted + ttl + margin`) before
+granting the lock elsewhere, so the fence always comes first. With P2P up
+but the sequencer unreachable, a non-blocking lock fails with `ENOLCK`
+and a blocking one keeps retrying.
+
+### Other failures
+
+| Failure | Behavior |
 |---|---|
-| node crash | journal + epoch promises replay from local DB; dirty chunks re-upload; leases re-acquired or expire naturally |
-| S3 outage | reads from cache; writes continue under held leases/epoch; flush resumes on return |
-| lease holder unreachable | requester tries handoff, then falls back to lease release/TTL and S3 CAS takeover after applying the flushed log |
-| holder crashes after forwarding ack | acked records may remain in its stranded journal; lease fencing prevents a second history and reintegration surfaces the stranded branch |
-| P2P down, S3 up | everything works, minus the fast path (higher latencies) |
-| clock skew | TTLs measured with margins; correctness relies on CAS ordering, never wall clocks |
+| node crash | journal, speculation, backup tail, seals, promises and epoch state reload from the local store; stranded ops replay by rid; dirty chunks re-upload; the lease is re-acquired or expires |
+| forward times out (holder slow or gone) | same-rid retries, then the inbox (no P2P path) or the lease path; resolved exactly once; `EIO` at the client deadline (2 × TTL), never a re-execution |
+| holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies |
+| P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
+| clock skew | lease, delegation, read-delegation and lock timing all assume `margin > 2 × drift` (±500 ms at the defaults); correctness otherwise relies on CAS ordering, never wall clocks |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |
 | logical quota exceeded | ENOSPC on write/truncate/fallocate growth (best-effort; see above) |
 | DB disk full | read-only mode + flush-to-recover; alarms in status/UI |
 | corrupted chunk (local or S3) | hash verification on every read; local → refetch, S3 → error + fsck report (peer copies may heal) |
+
+### Poison records
+
+A pending upload whose chunk is gone from the local cache (a disk fault,
+a manual deletion) cannot ever reach S3. It no longer blocks the node's
+whole ship: each ship holds back only the transactions whose manifest
+names such a chunk and every later transaction that touches the same keys
+(a `chmod`, rename or unlink of that file). Everything else ships.
+`status.held` lists what is held, and `constellation repair drop-held`
+turns a held manifest into a conflict copy with the lost chunks as holes
+and replays its dependents by rid
+([Write-path hygiene](../reference/features/write-path-hygiene.md#held-records-statusheld)).
 
 ### What an S3 outage blocks
 
 A node cannot distinguish "S3 is down globally" from "I am partitioned off,"
 so the rules below are safe in both cases. Principle: **reads never block;
 writes remain allowed exactly as far as pre-existing authority reaches, and
-new authority cannot be created.**
+new authority cannot be created** (hard constraint 2: there is no second
+bucket to fall back to).
 
 Never blocked:
 
@@ -587,43 +1197,57 @@ Blocked immediately:
 - Acquiring write authority the node does not already hold — lease
   acquire/steal is an S3 CAS. Exception: inside a continuation epoch, leases
   transfer P2P among epoch members.
+- Every write from a node with no P2P path to the holder: the S3 inbox is
+  in the bucket.
+- Acknowledgements under `ack=s3`: they wait for a segment that cannot be
+  written. An `S3` lease is never carried into an epoch.
 - Visibility of new commits from nodes with no P2P path to us.
-- Enrollment, leave, GC, checkpoints, snapshot create/delete — deferred or
-  rejected cleanly when S3 is down; none load-bearing. Leave never
-  auto-fires on unmount or a missed heartbeat.
+- Enrollment, leave, GC, commit publication, snapshot create/delete —
+  deferred or rejected cleanly when S3 is down; none load-bearing. Leave
+  never auto-fires on unmount or a missed heartbeat.
 
 Degrades on a timer — writes under a held lease:
 
 - The holder keeps writing at local speed (journal locally, flush later),
   but lease *renewal* is also an S3 CAS. At TTL expiry the subtree goes
   **read-only**: if the outage is really just this node's partition, a node
-  with working S3 can legally take the expired lease (ADR-12: safety never
-  depends on failure detection).
+  with working S3 can legally take the expired lease (with `f > 0` only
+  with `f` promises; a `Backup` lease only after the 3 s non-backup
+  grace). A FUSE op still in doubt at its deadline (2 × TTL) fails with
+  `EIO`, never re-executed.
 
 Escape hatches (both are pre-arranged, non-stealable authority):
 
 - **Offline designation** (§5.2): no TTL-steal on the designee's claim — it
   writes through any outage, indefinitely. This is exactly what
   `offline <path>` buys over a plain lease.
-- **Continuation epoch** (§5.3): all write-eligible nodes in one P2P
-  component keep writing collectively; nobody outside the component can take
-  a lease without violating a persisted promise.
+- **Continuation epoch** (§5.3): at least `N − f` write-eligible nodes in
+  one P2P component keep writing collectively; nobody outside the
+  component can take a lease without violating a persisted promise.
 
-Three-machine example: home internet dies → desktop + laptop keep writing
-(epoch). Laptop alone with no S3 → read-only after TTL, unless its paths
-were marked `offline`. Laptop remote *with* S3 → it writes normally; the
-nodes that lost S3 follow the rules above.
+One node losing S3 while its peers still reach it is not an outage: its
+closes hand their chunks to a peer after 6 s (§3), its metadata forwards
+over P2P as usual, and it proposes no epoch, since a member it asks
+reaches S3.
+
+Three-machine example (desktop, laptop, server, all write-eligible): home
+internet dies with all three on the LAN → they form an epoch and keep
+writing. With the default `f = 0`, the laptop away and S3 down means no
+epoch at all; with `f = 1`, desktop and server form one without it, while
+the laptop alone (one of three) cannot. The laptop alone with no S3 is
+read-only after the TTL, unless its paths were marked `offline`. The
+laptop remote *with* S3 writes normally; the nodes that lost S3 follow the
+rules above.
 
 Cost bound: during an outage the journal and dirty chunks accumulate on
 local disk, so outage duration is bounded by cache/DB space — then the
 evict → throttle → ENOSPC ladder above applies. The spool is fully
-observable: `constellation status --spool` and the web UI dashboard show
-outstanding unflushed state — journal records and dirty-chunk count/bytes
-per partition, oldest unflushed op age, current flush lag vs the bounded-lag
-target, spool growth rate, and estimated headroom (time-to-full at the
-current rate) — with warning thresholds surfaced as alerts and exported via
-`/metrics`, so a user can see spooling build up long before the throttle
-engages.
+observable: `constellation status` and the web UI dashboard show
+outstanding unflushed state — journal records and dirty-chunk count/bytes,
+oldest unflushed op age, current flush lag, spool growth rate, and
+estimated headroom (time-to-full at the current rate) — with warning
+thresholds surfaced as alerts and exported via `/metrics`, so a user can
+see spooling build up long before the throttle engages.
 
 ## 10. Control Plane
 
@@ -636,21 +1260,25 @@ hit rates, prefetch efficiency, pins), leases/designations (+ admin
 force-release), snapshots/clones (create, browse, delete, mounts),
 compression settings, ops (log tail, fsck, doctor), Prometheus `/metrics`.
 
-CLI highlights: `fs create|mount|umount`, `mount [SOURCE[@snap]] MOUNTPOINT`,
-`leave [--node-id N] [--force]`, `pin|unpin`, `offline|online`,
-`snapshot create|ls|delete|diff`, `clone <path@snap> <dest>`,
-`compression set|get`, `status [--spool]` (includes `node_id` /
-`enrolled`), `inspect <path>`, `cache ls|stat|prune|evict|verify`,
-`gc run|verify`, `log tail`, `fsck [--repair]`, `doctor`, `host init`.
+CLI highlights: `fs create|set|passwd|list`, `mount [SOURCE[@snap]]
+MOUNTPOINT`, `umount`, `export`, `status` (includes `node_id` /
+`enrolled` and the spool), `doctor`, `pin|unpin|pins`,
+`offline|online|designations`, `delegate|undelegate|delegations`,
+`leave [--node-id N] [--force]`, `reintegrate`, `write-mode`, `quota`,
+`prune`, `inspect <path>`, `cache ls|stat|prune`, `log tail`,
+`snapshot create|ls|delete`, `clone <path@snap> <dest>`, `gc run|verify`,
+`fsck`, `repair drop-held`. The knobs are in
+[Configuration](../reference/configuration.md).
 
 ## 11. Scale Targets
 
 Designed/tested for 1–10M files, 1–5 TB, 3–10 nodes. Reference census
-(11.9M entries, 1.3 TiB): SQLite replica ~2 GB (79 B/row measured),
-checkpoint ~1 GB pre-zstd, cooperative-cache digest ~12 MB. The partitioned log format
-and typed manifest entries are the two guarantees that growing to 100M+
-files (partial replicas, leveled compaction, packing) never requires an
-on-bucket format migration.
+(11.9M entries, 1.3 TiB). The fjall replica was the most compact engine in
+ADR-9's benchmark of the census corpus (0.66 GB, against SQLite's 1.60 GB).
+A cooperative-cache mirror costs 8–12 bytes per peer chunk. Two format
+choices keep growth to 100M+ files free of on-bucket migrations: typed
+manifest entries (§3), and the commit chain's content-addressed tree
+(plan 28), which a node can read partially rather than replicate whole.
 
 ## 12. Metadata-DB and FUSE Fast Paths
 
@@ -660,7 +1288,17 @@ architecture *always* knows — every remote change arrives as a log record —
 which unlocks the aggressive end of every knob below. Complemented by what
 an indexed, transactional replica answers directly.
 
-### Enabled by the SQLite replica
+Not every item below is built yet. Built: push invalidation, the
+recursive aggregates (`user.constellation.rsize`), `SEEK_HOLE`/`SEEK_DATA`,
+metadata-only `fallocate`/`truncate`, and time travel as snapshots (§13).
+Designed but not built: `constellation find`, `constellation changes`, the
+`unlink_subtree` and `copy_manifest` records (and so `copy_file_range`),
+stable readdir cursors (`readdir` resumes by position today), negative
+dentry caching (a lookup miss is answered `ENOENT`, which the kernel does
+not cache), `READDIRPLUS`, the writeback cache with `FOPEN_KEEP_CACHE`,
+and FUSE passthrough.
+
+### Enabled by the local replica
 
 - **Instant search** (`locate`/Everything-style): indexes on name, size,
   mtime, kind answer `constellation find` in milliseconds over 10M files
@@ -670,36 +1308,35 @@ an indexed, transactional replica answers directly.
   `constellation changes --since <txid>` (CLI + API stream) gives backup
   tools, indexers, and build systems exact deltas — no tree scans, ever.
   Zero extra cost; the log exists.
-- **O(1) recursive aggregates**: per-directory recursive size/count columns
-  maintained transactionally during log application. `du -sh` on any subtree
-  is one row read (exposed via `user.constellation.rsize` xattr and the UI);
-  pin admission checks become one indexed query instead of a walk.
+- **O(1) recursive aggregates**: per-directory recursive size/count
+  maintained transactionally during log application. `du -sh` on any
+  subtree is one row read (exposed via `user.constellation.rsize` xattr and
+  the UI); pin admission checks become one indexed query instead of a walk.
 - **Bulk namespace ops as transactions**: recursive delete/chown/chmod run
-  as one SQL transaction emitting one compact log record
-  (`unlink_subtree`, §4) — `rm -rf` on a million files in milliseconds,
-  syncing to other nodes as a single record.
-- **Stable readdir cursors**: DB cursors give exact resumption offsets for
-  arbitrarily large directories, avoiding FUSE's classic skipped/duplicated
-  readdir entries.
-- **Time travel**: checkpoint + log replay into a temp DB = read-only mount
-  of the tree as of txid T; content addressing keeps old chunks alive until
-  GC. Named, GC-protected freezes of this are **snapshots** (§13).
+  as one transaction emitting one compact log record (`unlink_subtree`)
+  — `rm -rf` on a million files in milliseconds, syncing to other nodes as
+  a single record.
+- **Stable readdir cursors**: key-ordered cursors give exact resumption
+  offsets for arbitrarily large directories, avoiding FUSE's classic
+  skipped/duplicated readdir entries.
+- **Time travel**: a commit of the tree as of log position T = a read-only
+  view of the tree as it was; content addressing keeps old chunks alive
+  until GC. Named, GC-protected freezes of this are **snapshots** (§13).
 
 ### Enabled by the FUSE API
 
 - **`READDIRPLUS`**: attributes returned with each dentry from a single
-  `dentry JOIN inode` query — kills the stat-storm that slows `ls -la`,
-  `find`, and rsync on every network FS.
-- **Long kernel TTLs + push invalidation**: entry/attr timeouts can be long
-  once `notify_inval_entry`/`notify_inval_inode` is wired for every remote
-  record. That notification coverage may still be incomplete, so current
-  correctness must not assume every kernel cache is invalidated immediately.
-- **Negative dentry caching**: ENOENT answers use a short polling backstop
-  until notification coverage is complete. Segment push — including direct
-  application of small `SegmentPublished` payloads — shortens the freshness
-  window; eventual S3 polling closes it when P2P is unavailable.
+  replica scan — kills the stat-storm that slows `ls -la`, `find`, and
+  rsync on every network FS.
+- **Kernel TTLs + push invalidation**: every change from another node is
+  pushed to the kernel with `notify_inval_entry`/`notify_inval_inode`
+  (§6, invariant 1), so the entry/attribute TTL (1 s under `--cto
+  bounded`, 0 under strict) is only a backstop.
+- **Negative dentry caching**: ENOENT answers cached as negative entries
+  under the same TTL and invalidated by the same push, so repeated misses
+  (compilers probing include paths, `PATH` lookups) stay in the kernel.
 - **`copy_file_range` / reflink as pure metadata**: content addressing makes
-  every copy a manifest copy (`copy_manifest`, §4) with chunks shared
+  every copy a manifest copy (`copy_manifest`) with chunks shared
   automatically — instant, zero-I/O copies of any size.
 - **`SEEK_HOLE`/`SEEK_DATA`**: the chunk list knows exactly where holes are,
   so `cp --sparse`, rsync, and tar skip them instead of reading zeros.
@@ -809,77 +1446,95 @@ shared objects and is coordinated as follows.
 
 ### Who runs it
 
-One node at a time, holding a **GC lease** (`leases/_gc.json`) — the same
-CAS + TTL + fencing-epoch machinery as subtree leases, reused unchanged.
-Any member is eligible; scheduling prefers always-on nodes (configurable
-weight; the backup server is the natural home), with `constellation gc run
-[--orphans]` for manual triggers. Coordination-wise, GC is just another
-lease holder.
+One node at a time, holding the `_gc` singleton lease (`leases/_gc.json`),
+the same CAS + TTL object as the root lease. Every daemon runs a round on
+its own cadence (`CONSTELLATION_GC_INTERVAL_S`, daily by default), and
+`constellation gc run` triggers one by hand; a node that finds the lease
+held skips the round. GC authors no log records: a round tails the log to
+head like any follower.
 
-### When (three cadences, cheapest first)
+### What a round collects
 
-- **Continuous, every node**: **deref tracking** — while applying log
-  records, each replica records the txid at
-  which a chunk's last reference disappeared. Free, and it makes the GC
-  candidate set a local query: no bucket LIST for reference GC.
-- **Periodic (default daily), under the GC lease**: the **reference
-  sweep** — delete chunks whose last dereference is older than
-  `gc.horizon` (default days), minus the exemptions below. Also collected:
-  log segments older than the newest checkpoint (with a retention floor)
-  and superseded checkpoints.
-- **Rare / on-demand**: the **orphan sweep**, the only LIST-based pass —
-  bucket keys vs. the replica's known-chunk set, catching uploads from
-  crashed or abandoned writes that never committed a manifest. Expensive at
-  10M+ keys; weekly/monthly or explicit.
+- **Chunks**, from one LIST-based orphan pass over `chunks/`: a chunk is
+  a candidate when it was last written more than `gc.horizon` ago
+  (`CONSTELLATION_GC_HORIZON_S`, 7 days) and nothing protects it — no
+  live manifest in the round's replica (tailed to head first), no
+  snapshot tree, no live `holds/` record, no current condemned list.
+  (Plan 28 replaced the continuously maintained dereference index with
+  this pass and a reachability walk; the bucket is the only source of
+  truth.)
+- **Log segments** below the head commit's `applied` position minus
+  `CONSTELLATION_LOG_RETENTION_SEGMENTS` (128) **and** older than the
+  completion retention (900 s), so an in-doubt op's coverage rule always
+  holds (§4).
+- **Metadata**: commits beyond the retained window, and packs and blobs
+  that a reachability walk from the retained commits, snapshots and holds
+  no longer reaches (compacting partly dead packs), under the same
+  condemn-wait-recheck handshake as chunks
+  ([Configuration](../reference/configuration.md#garbage-collection)).
 
 ### The dedup race, and the layered defense
 
 The dangerous race is not delete-vs-read but **delete-vs-dedup**: a writer
 may commit a manifest referencing an existing chunk *without uploading it*
-(dedup hit) — and an offline designee may reference a chunk by hash without
-even holding its bytes, flushing days later. Deleting such a chunk between
-check and commit would create a committed reference to nothing. Defense in
-depth:
+(a dedup hit). Deleting such a chunk between the hit and the commit would
+create a committed reference to nothing. Defense in depth:
 
-1. **Horizon**: only chunks unreferenced for longer than `gc.horizon` are
+1. **Horizon**: only chunks last written more than `gc.horizon` ago are
    candidates — one number kills every short-window race (flush lag, crash
    windows, epoch flushes).
-2. **Condemned-list handshake**: before deleting, the GC holder publishes
-   the condemned set (CAS'd object + gossip broadcast) and waits one full
-   lease TTL. Freshness rides on lease renewal — every active writer
-   re-reads the condemned pointer at TTL/2 renewal anyway — and writers
-   treat condemned chunks as *absent* for dedup: they re-upload instead of
-   referencing (an identical-content PUT is idempotent and resurrects the
-   chunk). A writer that hasn't renewed is, by definition, no longer
-   authoritative and cannot commit.
-3. **Offline exemption**: chunks whose last reference lay under a subtree
-   with an active offline designation are exempt until that designation
-   reintegrates — checkable locally, since designations are log records.
-4. **Open-handle holds**: chunks of orphaned-but-open inodes are exempt
-   while any node's TTL'd `holds/` record covers them (§3, unlink while
-   open); expired holds release the exemption automatically. The mark
-   phase reads all `holds/*` from the bucket (one LIST of a
-   usually-empty prefix + node-count tiny GETs) — the bucket record is
-   the authoritative claim, gossip only a freshness hint — so the sweep
-   honors holds regardless of which node runs it, including the node
-   that performed the unlink.
-5. **Reintegration verification** (backstop): a flushing node HEADs any
-   dedup-referenced chunk it never held bytes for and re-uploads from local
-   data or raises a visible, fsck-reported error — never a silent dangle.
+2. **Condemned-list handshake**: before deleting, the round CAS-publishes
+   its candidates as the condemned pointer (`gc/condemned.json`, with an
+   epoch) and announces it over gossip, waits one full lease TTL, tails
+   the log to head again and re-checks liveness. A writer that is not
+   authoritative by then can no longer commit.
+   **Writers read the pointer only after a dedup hit.** If the upload
+   found its object absent (the create created it, or a `HEAD` missed and
+   the bytes were PUT), the pointer is not read at all: with the object
+   absent, a create and an unconditional PUT leave the bucket in the same
+   state, and the pointer only ever chose between them. If the object was
+   there, the writer reads the pointer *after* that answer (`If-None-Match`
+   on the last ETag, so usually a bodyless `304`):
+   - the hash is listed → upload the bytes anyway;
+   - no pointer was ever published → the hit is sound;
+   - the hash is not listed and the pointer is the same one the writer
+     had read before it sent its existence request → sound: no round
+     published in between, so the round whose list was current deletes
+     nothing of it;
+   - otherwise (the pointer moved, or nothing was read before: the first
+     hit after a mount) → a `HEAD` sent after the read decides.
+
+   Every execution of this order is one the older "read the pointer
+   first" order could produce, so the argument above carries over, and a
+   unique small file costs one S3 request instead of two.
+3. **Re-upload guard**: an identical-content PUT "resurrects" a condemned
+   chunk only if it lands after the delete. So the delete loop `HEAD`s
+   each candidate first and keeps any object whose `Last-Modified` moved
+   past the marked listing's (by more than a `HEAD`'s one-second
+   resolution): that object is not the one marked, and keeping it cannot
+   dangle anything. Portable S3 has no conditional DELETE, so a write
+   landing in the `HEAD`→`DELETE` gap remains possible: it needs a
+   condemned hit re-PUT in that very gap *and* a commit after the round's
+   second tail.
+4. **Open-handle holds**: chunks named by a live `holds/*` record are
+   exempt (§3, unlink while open). The bucket record is the authoritative
+   claim, so the sweep honors holds regardless of which node runs it.
 
 Snapshot trees and clones are GC roots (§13); the grace behavior for
 deleted snapshots is defined there.
 
 ### Falling behind segment GC
 
-A node offline longer than log retention cannot tail its gap; it rebuilds
-its replica from the latest checkpoint instead (checkpoints are full
-state). A documented, tested recovery path, not an error.
+A node offline longer than log retention cannot tail its gap: the
+segments are gone. The only rebuild is the fresh-node path, restoring the
+head commit and replaying the log from its `applied` position (§4), and
+it runs when a state dir has no replica. A running tail does not yet
+detect such a gap on its own: it probes the next sequence number, which
+GC has deleted. This is a known gap.
 
 ### Auditability
 
-The GC holder journals every deletion with its evidence (rule applied,
-deref txid, condemned-set epoch) to a GC journal in the bucket;
+Every deletion is journaled with its evidence (rule applied, the mark's
+evidence, the condemned-set epoch) under `gc/journal/`;
 `fsck` cross-checks deletions post-hoc, and `gc verify` runs the mark phase
 without sweeping to report what *would* be collected and why.
-
