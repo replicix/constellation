@@ -326,18 +326,32 @@ know client opens; Constellation avoids the problem with explicit claims.)
   open handles additionally marks the orphan held locally and keeps
   serving those handles normally.
 - **GC protection = holds**: a node with open handles on orphaned inodes
-  advertises them in a TTL'd `holds/<node-id>` record (renewed on the
-  heartbeat cadence, gossiped for freshness). The §14 sweep treats held
-  inodes' chunks as referenced. Crash safety falls out: a dead node stops
-  renewing, its holds expire, orphans reap — no leaked cruft.
+  advertises them in a TTL'd `holds/<node-id>.json` record (`cli::holds`):
+  the inodes and every chunk hash their manifests name, with an expiry.
+  The §14 sweep keeps every chunk (and metadata node) a live hold names,
+  both when it marks and again right before it deletes. Crash safety
+  falls out: a dead node stops renewing, its hold expires, orphans reap —
+  no leaked cruft.
 - **Zero cost on the hot paths**: normal `open()` never touches holds — the
   record exists only for the rare intersection *open handle × unlinked
-  inode*. It is one batched object per node (all its orphans; absent when
-  the set is empty, the usual state), written asynchronously on set changes
-  and refreshed per heartbeat — neither `open()` nor `unlink()` waits on
-  it. Asynchrony is safe because the GC horizon (days) already protects
-  freshly-dereferenced chunks; a hold only needs visibility before the next
-  sweep, not before the syscall returns.
+  inode*. It is one object per node (all its held orphans; absent when the
+  set is empty, the usual state), written by a background task that the
+  sync task nudges after every applied segment and that otherwise runs
+  every `CONSTELLATION_HOLD_REFRESH_MS` (half the lease TTL; the expiry
+  is three refresh periods out) — neither `open()` nor `unlink()` waits
+  on it. The same task reaps every orphan no view has open, which is
+  what removes a foreign unlink's record from a node that never had the
+  file open.
+- **What the asynchrony costs, precisely**: a GC round waits one lease
+  TTL between publishing its candidates and deleting, and re-reads holds
+  right before deleting, so a node that has applied the unlink by then
+  and can reach S3 is covered. The horizon does *not* help here — it is
+  measured from the chunk's write time, and a long-open old file is the
+  common case (a log rotated away under a reader). A node that applies
+  the unlink later than that — it lags the log by more than a lease TTL,
+  or is partitioned from S3 — may find the chunks gone when it next reads
+  uncached bytes: `EIO` on that handle, the edge noted below. This never
+  dangles a committed reference: no committed state names an orphan.
 - **Last close, cluster-wide**: when the final hold disappears (release or
   TTL expiry), the inode's chunks deref and ride the normal GC horizon.
 - **Writes to orphans** are allowed (POSIX): flushed as inode-keyed log
@@ -1453,16 +1467,31 @@ its own cadence (`CONSTELLATION_GC_INTERVAL_S`, daily by default), and
 held skips the round. GC authors no log records: a round tails the log to
 head like any follower.
 
+A round outlives one lease TTL by construction (it waits a full TTL
+between condemning and deleting), so the lease is **renewed through the
+round and every destructive step is fenced on it**: the grace wait renews
+every third of the TTL, and the delete loop — chunks, blobs, dead packs,
+compaction batches, incomplete packs — renews (a CAS on the lease
+object's ETag) before its first delete and every 64 deletes after that.
+A refused renewal means another round took the lease; the round stops
+on the spot. The fence is the store's CAS, never the round's clock: a
+round whose process paused for minutes is stopped the same way. Without
+this a second round could take the lapsed lease and publish a new
+condemned pointer while the first was still deleting, which is exactly
+the premise the writer-side argument below rests on.
+
 ### What a round collects
 
 - **Chunks**, from one LIST-based orphan pass over `chunks/`: a chunk is
   a candidate when it was last written more than `gc.horizon` ago
   (`CONSTELLATION_GC_HORIZON_S`, 7 days) and nothing protects it — no
   live manifest in the round's replica (tailed to head first), no
-  snapshot tree, no live `holds/` record, no current condemned list.
-  (Plan 28 replaced the continuously maintained dereference index with
-  this pass and a reachability walk; the bucket is the only source of
-  truth.)
+  snapshot tree, no live `holds/` record. A hash the current condemned
+  pointer already lists is a candidate *again*: the new pointer carries
+  everything an interrupted or paused round could still delete (see
+  below). (Plan 28 replaced the continuously maintained dereference
+  index with this pass and a reachability walk; the bucket is the only
+  source of truth.)
 - **Log segments** below the head commit's `applied` position minus
   `CONSTELLATION_LOG_RETENTION_SEGMENTS` (128) **and** older than the
   completion retention (900 s), so an in-doubt op's coverage rule always
@@ -1507,6 +1536,19 @@ create a committed reference to nothing. Defense in depth:
    Every execution of this order is one the older "read the pointer
    first" order could produce, so the argument above carries over, and a
    unique small file costs one S3 request instead of two.
+
+   The premise of that argument is that **a hash absent from the current
+   pointer is deleted by no round at all**. Two things hold it up, and
+   neither depends on timing: the lease fencing above (a round deletes
+   only while its own list is current, or at most one fenced batch past
+   the moment another round took the lease), and the carry-over (the new
+   round's pointer lists every still-present, still-unprotected hash the
+   old pointer listed, so whatever that batch deletes is on the new list
+   too — or was found protected by the new round, in which case the
+   committing writer's dedup hit either preceded the old round's
+   publication, and so its commit preceded the old round's post-wait
+   re-check, or saw the old pointer and re-uploaded, which rule 3
+   catches).
 3. **Re-upload guard**: an identical-content PUT "resurrects" a condemned
    chunk only if it lands after the delete. So the delete loop `HEAD`s
    each candidate first and keeps any object whose `Last-Modified` moved
@@ -1517,20 +1559,50 @@ create a committed reference to nothing. Defense in depth:
    condemned hit re-PUT in that very gap *and* a commit after the round's
    second tail.
 4. **Open-handle holds**: chunks named by a live `holds/*` record are
-   exempt (§3, unlink while open). The bucket record is the authoritative
-   claim, so the sweep honors holds regardless of which node runs it.
+   exempt (§3, unlink while open), at the mark and again at the re-check
+   right before deletion — the TTL wait between the two is the window a
+   node has to claim a file that was unlinked under its open handle. The
+   bucket record is the authoritative claim, so the sweep honors holds
+   regardless of which node runs it.
 
 Snapshot trees and clones are GC roots (§13); the grace behavior for
 deleted snapshots is defined there.
 
 ### Falling behind segment GC
 
-A node offline longer than log retention cannot tail its gap: the
-segments are gone. The only rebuild is the fresh-node path, restoring the
-head commit and replaying the log from its `applied` position (§4), and
-it runs when a state dir has no replica. A running tail does not yet
-detect such a gap on its own: it probes the next sequence number, which
-GC has deleted. This is a known gap.
+A node offline (or partitioned) longer than log retention cannot tail
+its gap: the segments are gone. A GET-next `404` cannot tell "at head"
+from "pruned past", and a replica that took the `404` for the head would
+serve stale state for ever — and, taking the lease, would CAS-create its
+epoch marker into the deleted slot and fork the log. The answer is one
+LIST with offset from the cursor (`LogStore::first_segment_from`):
+nothing at or after it is the head, the cursor itself is a segment that
+landed meanwhile, anything later is a gap. Retention only ever deletes a
+contiguous prefix below a commit's `applied`, so the answer cannot go
+stale in the direction that matters.
+
+- **Before a lease claim, always.** The takeover CAS is preceded by the
+  check unless the acquisition reached a handoff's reported head, or is
+  re-adopting this node's own lease (the object still names it, so nobody
+  else appended). Segments above a holder's head are above every floor
+  any round could have used: floors come from commits, commits from
+  holders, and the CAS fences any later holder. A gap found here ends the
+  acquisition unacquired; nothing was written.
+- **On a running tail**, when a gossip hint or the direct stream's
+  reported head lies at or past the cursor (at most every
+  `CONSTELLATION_LOG_GAP_HINT_CHECK_MS`), once on the first empty probe
+  after a mount, and as a backstop every `CONSTELLATION_LOG_GAP_CHECK_MS`
+  (5 minutes: one LIST against roughly 150 idle GETs). A holder never
+  checks; it is the sole appender.
+- **At mount**, before anything tails or a view opens.
+
+A gap rebuilds the replica in place: a side replica is bootstrapped from
+the head commit plus the retained log (the fresh-node path, §4) and its
+namespace swapped in; node-local state (identity, the journal, pending
+uploads, `completed`) stays. The cursor restarts from the rebuilt
+position. An op stranded in the gap cannot be resolved against
+`completed` and fails with `EIO` rather than being re-executed
+([Configuration](../reference/configuration.md#garbage-collection)).
 
 ### Auditability
 

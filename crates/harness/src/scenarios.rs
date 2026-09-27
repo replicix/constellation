@@ -284,6 +284,24 @@ pub const SCENARIOS: &[Scenario] = &[
         run: gc_dedup_race,
     },
     Scenario {
+        name: "gc-open-orphan-hold",
+        desc: "DESIGN §3: a file unlinked on A while open on B is claimed by B's holds/<node>.json; GC keeps its chunk until B closes it, then reclaims it",
+        requires: &[],
+        run: gc_open_orphan_hold,
+    },
+    Scenario {
+        name: "log-retention-gap-follower",
+        desc: "DESIGN §14: a running follower frozen while GC pruned the log past its position rebuilds from the head commit on resume and converges; it then takes the lease and appends only above the head",
+        requires: &[],
+        run: log_retention_gap_follower,
+    },
+    Scenario {
+        name: "log-retention-gap-taker",
+        desc: "DESIGN §14: a node stopped while GC pruned the log past its position rebuilds at mount, converges, and its lease takeover never creates a segment in a pruned slot",
+        requires: &[],
+        run: log_retention_gap_taker,
+    },
+    Scenario {
         name: "fsck-repair",
         desc: "fsck detects and repairs a missing chunk, orphan, and torn segment",
         requires: &[],
@@ -1604,6 +1622,291 @@ fn gc_dedup_race(_seed: u64) -> Result<()> {
         "GC deleted content committed during condemned wait"
     );
     client.unmount()
+}
+
+/// Object keys under `prefix` (one LIST page; the scenarios below list a
+/// few dozen keys at most).
+fn raw_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
+    let body = ureq::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
+        .call()
+        .with_context(|| format!("listing {prefix}"))?
+        .into_string()?;
+    let mut keys = Vec::new();
+    let mut rest = body.as_str();
+    while let Some(start) = rest.find("<Key>") {
+        let after = &rest[start + 5..];
+        let Some(end) = after.find("</Key>") else {
+            break;
+        };
+        keys.push(after[..end].to_string());
+        rest = &after[end..];
+    }
+    Ok(keys)
+}
+
+/// The log segment sequence numbers under `prefix`, ascending.
+fn log_segments(endpoint: &str, prefix: &str) -> Result<Vec<u64>> {
+    let mut seqs: Vec<u64> = raw_keys(endpoint, &format!("{prefix}/log/p0/"))?
+        .iter()
+        .filter_map(|k| u64::from_str_radix(k.rsplit('/').next()?.strip_suffix(".zst")?, 16).ok())
+        .collect();
+    seqs.sort_unstable();
+    Ok(seqs)
+}
+
+/// DESIGN.md §3 "Unlink while open", across nodes. B opens a file; A
+/// unlinks it. Nothing in the bucket names the chunk any more, and its
+/// age passes the (zeroed) horizon, so only B's `holds/<node>.json` keeps
+/// a GC round from deleting it under B's open handle. Once B closes the
+/// file the hold is withdrawn and the next round reclaims the chunk.
+fn gc_open_orphan_hold(_seed: u64) -> Result<()> {
+    let (env, root) = setup("gc-open-orphan-hold")?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("gc-hold-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mk = |name: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "1000")
+            .with_env("CONSTELLATION_GC_HORIZON_S", "0")
+            .with_env("CONSTELLATION_HOLD_REFRESH_MS", "300")
+            .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000"))
+    };
+    let mut a = mk("hold-a")?;
+    let mut b = mk("hold-b")?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    let content = b"unlinked on a while open on b".to_vec();
+    std::fs::write(a.mnt.join("held"), &content)?;
+    eventually("B sees the file", Duration::from_secs(30), || {
+        anyhow::ensure!(std::fs::read(b.mnt.join("held"))? == content);
+        Ok(())
+    })?;
+    let holds_prefix = format!("{prefix}/holds/");
+    anyhow::ensure!(
+        raw_keys(&env.direct_endpoint, &holds_prefix)?.is_empty(),
+        "no hold before anything is unlinked"
+    );
+
+    // B holds the file open; A unlinks it.
+    let mut handle = std::fs::File::open(b.mnt.join("held"))?;
+    std::fs::remove_file(a.mnt.join("held"))?;
+    eventually("B publishes its hold", Duration::from_secs(30), || {
+        let keys = raw_keys(&env.direct_endpoint, &holds_prefix)?;
+        anyhow::ensure!(keys.len() == 1, "holds: {keys:?}");
+        Ok(())
+    })?;
+    let output = a.gc_run()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gc run failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        raw_exists(&env.direct_endpoint, &chunk_key(&prefix, &content)),
+        "GC deleted a chunk B holds open: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let mut through_handle = Vec::new();
+    {
+        use std::io::{Read, Seek};
+        handle.seek(std::io::SeekFrom::Start(0))?;
+        handle.read_to_end(&mut through_handle)?;
+    }
+    anyhow::ensure!(
+        through_handle == content,
+        "B's handle reads the unlinked file"
+    );
+    anyhow::ensure!(
+        std::fs::metadata(b.mnt.join("held")).is_err(),
+        "the name is gone on B"
+    );
+
+    // B closes the file: the hold is withdrawn and the chunk reclaimed.
+    drop(handle);
+    eventually("B withdraws its hold", Duration::from_secs(30), || {
+        let keys = raw_keys(&env.direct_endpoint, &holds_prefix)?;
+        anyhow::ensure!(keys.is_empty(), "holds: {keys:?}");
+        Ok(())
+    })?;
+    let output = a.gc_run()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "second gc run failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        !raw_exists(&env.direct_endpoint, &chunk_key(&prefix, &content)),
+        "the closed orphan's chunk survived GC: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    b.unmount()?;
+    a.unmount()
+}
+
+/// How the lagging node misses the log in [`log_retention_gap`].
+#[derive(Clone, Copy)]
+enum GapMode {
+    /// B keeps running, frozen (SIGSTOP) while the log moves and is
+    /// pruned; on resume its running tail must find the gap.
+    Frozen,
+    /// B is cleanly unmounted (its replica stays on disk) and remounted
+    /// after the prune: the mount-time check must find the gap, and B is
+    /// the lease taker right away.
+    Restarted,
+}
+
+fn log_retention_gap_follower(seed: u64) -> Result<()> {
+    log_retention_gap(seed, GapMode::Frozen)
+}
+
+fn log_retention_gap_taker(seed: u64) -> Result<()> {
+    log_retention_gap(seed, GapMode::Restarted)
+}
+
+/// DESIGN.md §14 "Falling behind segment GC". A short retention window
+/// (2 segments, no completion floor) and frequent commits let a GC round
+/// prune the log past B's position while B is away. B must rebuild its
+/// replica from the head commit and converge on the model, and — the
+/// safety half — B's later lease takeover must never create a segment
+/// in a pruned slot: every segment the log ends up with is above the
+/// floor the prune left, and a fresh node C bootstraps to the same
+/// state, which a forked log could not give.
+fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
+    let name = match mode {
+        GapMode::Frozen => "log-retention-gap-follower",
+        GapMode::Restarted => "log-retention-gap-taker",
+    };
+    let (env, root) = setup(name)?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("gap-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let mk = |name: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
+            .with_env("CONSTELLATION_LEASE_TTL_MS", "1000")
+            .with_env("CONSTELLATION_LOG_RETENTION_SEGMENTS", "2")
+            .with_env("CONSTELLATION_COMPLETION_RETENTION_S", "0")
+            .with_env("CONSTELLATION_GC_HORIZON_S", "0")
+            .with_env("CONSTELLATION_PUBLISH_IDLE_S", "1")
+            .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
+            .with_env("CONSTELLATION_LOG_GAP_CHECK_MS", "2000")
+            // The S3 slow path only: the fork this guards against is an
+            // S3 takeover's, and hints would find the gap sooner.
+            .with_env("CONSTELLATION_P2P", "off"))
+    };
+    let mut model = Model::default();
+    let mut wl = Workload::new(seed, "w");
+    let mut a = mk("gap-a")?;
+    let mut b = mk("gap-b")?;
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    wl.run_block(&a.mnt, &mut model, 20)?;
+    eventually(
+        "B converges before the gap",
+        Duration::from_secs(60),
+        || model.verify(&b.mnt),
+    )?;
+    match mode {
+        GapMode::Frozen => b.pause()?,
+        GapMode::Restarted => b.unmount()?,
+    }
+
+    // A ships a segment per close (paced past the shipper's round trip)
+    // and commits every second, so the head commit's applied position
+    // runs far past B's; GC then prunes everything below it but two.
+    let before = log_segments(&env.direct_endpoint, &prefix)?;
+    for i in 0..30 {
+        let p = format!("gap-{i}");
+        let bytes = format!("segment {i} while B is away").into_bytes();
+        std::fs::write(a.mnt.join(&p), &bytes)?;
+        model.write_file(std::path::Path::new(&p), bytes);
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let output = a.gc_run()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gc run failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pruned = log_segments(&env.direct_endpoint, &prefix)?;
+    let floor = *pruned.first().context("an empty log after the prune")?;
+    let b_position = *before.last().context("no segment before the gap")?;
+    anyhow::ensure!(
+        floor > b_position + 1,
+        "the prune did not pass B's position: B at {b_position}, log {pruned:?}"
+    );
+    eprintln!(
+        "    {name}: B at {b_position}, log pruned to {}..={} ({} segments)",
+        floor,
+        pruned.last().unwrap(),
+        pruned.len()
+    );
+
+    // B comes back and must converge (a rebuild from the head commit).
+    match mode {
+        GapMode::Frozen => b.resume()?,
+        GapMode::Restarted => {
+            // A leaves first: B is the taker at its very first round.
+            a.unmount()?;
+            b.mount()?;
+        }
+    }
+    eventually("B converges after the gap", Duration::from_secs(90), || {
+        model.verify(&b.mnt)
+    })
+    .with_context(|| {
+        format!(
+            "--- B log ---
+{}",
+            b.tail_log_n(60)
+        )
+    })?;
+    anyhow::ensure!(
+        b.log_text().contains("rebuilding"),
+        "B did not report a rebuild:
+{}",
+        b.tail_log_n(60)
+    );
+    if matches!(mode, GapMode::Frozen) {
+        a.unmount()?;
+    }
+
+    // B writes: it takes the lease and appends only above the head.
+    let proof = b"written by b after the gap".to_vec();
+    std::fs::write(b.mnt.join("from-b"), &proof)?;
+    model.write_file(std::path::Path::new("from-b"), proof);
+    eventually("B's write ships", Duration::from_secs(60), || {
+        let now = log_segments(&env.direct_endpoint, &prefix)?;
+        anyhow::ensure!(now.last() > pruned.last(), "log unchanged: {now:?}");
+        Ok(())
+    })?;
+    let after = log_segments(&env.direct_endpoint, &prefix)?;
+    anyhow::ensure!(
+        after.iter().all(|&s| s >= floor),
+        "a segment appeared below the pruned floor {floor}: {after:?}"
+    );
+    anyhow::ensure!(
+        after.first() == pruned.first() && after.len() > pruned.len(),
+        "B's segments did not append above the head: before {pruned:?}, after {after:?}"
+    );
+    b.unmount()?;
+
+    // A fresh node sees one history: the model's.
+    let mut c = mk("gap-c")?;
+    c.mount()?;
+    model.verify(&c.mnt).with_context(|| {
+        format!(
+            "--- C log ---
+{}",
+            c.tail_log_n(40)
+        )
+    })?;
+    c.unmount()
 }
 
 fn fsck_repair(_seed: u64) -> Result<()> {

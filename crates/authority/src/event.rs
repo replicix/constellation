@@ -709,6 +709,8 @@ pub enum S3Result {
     SegmentPut(Result<(), CasFailure>),
     /// `S3Op::SegmentRun`: the contiguous run present from `from`.
     SegmentRun(Result<Vec<(Seq, Vec<u8>)>, S3Failure>),
+    /// `S3Op::SegmentGap`: the lowest segment at or after `from`, if any.
+    SegmentGap(Result<Option<Seq>, S3Failure>),
     /// `S3Op::InboxPut`: created (or found to be this very batch, already
     /// landed), or why not.
     InboxPut(Result<(), CasFailure>),

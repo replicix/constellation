@@ -104,12 +104,16 @@ pub fn snapshots_prefix() -> Path {
     Path::from("snaps")
 }
 
-pub fn registry(node_id: &str) -> Path {
-    Path::from(format!("registry/{node_id}.json"))
+/// `holds/<node:016x>.json`: a node's open-orphan claim (DESIGN.md §3
+/// "Unlink while open", `cli::holds`). Zero-padded hex like the other
+/// per-node keys. A GC round keeps every chunk (and, for the metadata
+/// tree, every node) a live hold names.
+pub fn hold(node: u64) -> Path {
+    Path::from(format!("holds/{node:016x}.json"))
 }
 
-pub fn hold(node_id: &str) -> Path {
-    Path::from(format!("holds/{node_id}.json"))
+pub fn holds_prefix() -> Path {
+    Path::from("holds")
 }
 
 pub fn gc_condemned() -> Path {

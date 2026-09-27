@@ -189,6 +189,8 @@ Plan 30 M6–M8. See [Close-to-open modes](features/cto-modes.md).
 | `CONSTELLATION_LOG_STREAM_HEARTBEAT_MS` | `1000` | milliseconds; `0` means the default | the holder's heartbeat frame to a subscriber it has sent nothing to |
 | `CONSTELLATION_LOG_STREAM_TIMEOUT_MS` | `3500` | milliseconds; `0` means the default | a subscription with no frame for this long is dead; the subscriber falls back to S3 and resubscribes |
 | `CONSTELLATION_LOG_STREAM_BACKSTOP_MS` | `10000` | milliseconds; `0` means the default | a caught-up subscriber still probes S3 with one GET this often |
+| `CONSTELLATION_LOG_GAP_CHECK_MS` | `300000` | milliseconds; `0` means the default | a follower whose GET-next probe found nothing confirms with one LIST, this often, that it is at the head and not past a pruned log (DESIGN.md §14 "Falling behind segment GC"); a lease takeover always checks |
+| `CONSTELLATION_LOG_GAP_HINT_CHECK_MS` | `5000` | milliseconds; `0` means the default | the same check, at most this often, when a gossip hint or the stream's head lies past the cursor |
 | `CONSTELLATION_LOG_STREAM_QUEUE` | `1024` | frames, positive | frames queued per subscriber |
 | `CONSTELLATION_LOG_STREAM_BUFFER_BYTES` | `33554432` (32 MiB) | bytes, positive | segment bytes queued per subscriber before the holder drops it back to S3 tailing. The holder never waits for a subscriber |
 | `CONSTELLATION_KERNEL_INVALIDATE` | on | boolean | push kernel entry and inode invalidations for records applied from other nodes |
@@ -517,6 +519,7 @@ hinted), never "proven absent".
 | `CONSTELLATION_COMPACT_BYTES_PER_S` | `33554432` (32 MiB/s) | bytes per second; `0` unpaced | read budget for metadata pack deletion and compaction in a GC round |
 | `CONSTELLATION_GC_THREADS` | one per core | threads; `0` means one per core | width of the metadata mark and pack rewrite pools |
 | `CONSTELLATION_COMPLETION_RETENTION_S` | `900` | seconds | plan 30 M2: the floor below which a log segment is never pruned (see below and [Exactly-once and speculation](#exactly-once-and-speculation)) |
+| `CONSTELLATION_HOLD_REFRESH_MS` | half the lease TTL | milliseconds | how often a node re-stamps its open-orphan hold (`holds/<node>.json`, DESIGN.md §3); the hold expires three refresh periods after its last write |
 
 Log retention is evaluated against the position a fresh replica resumes
 from: the head plan 28 commit's `applied` position. With no commit yet
@@ -532,7 +535,17 @@ matter how far ahead the head commit has moved). A node that
 re-bootstraps across a gap wider than the retention window cannot
 resolve an op stranded in that gap; such an op fails with `EIO` rather
 than being retried or re-executed. (A bootstrap from a base the log was
-pruned past refuses instead of replaying from the gap.)
+pruned past refuses instead of replaying from the gap.) A replica the
+log was pruned past — at mount, on a running tail, or when it tries to
+take the lease — is rebuilt from the head commit rather than left
+probing a deleted slot (DESIGN.md §14 "Falling behind segment GC";
+`CONSTELLATION_LOG_GAP_CHECK_MS` above).
+
+The `_gc` lease is renewed through the round and every delete batch is
+fenced on it (a CAS on the lease object); a round that lost the lease to
+another round stops at once. A round's candidate pass re-lists hashes
+the current condemned pointer already names, so the pointer always
+carries everything an interrupted round could still delete.
 
 Metadata GC (plan 28 S7b) runs as a second phase of every GC round:
 commit retention by the two knobs above, a reachability mark from the

@@ -254,6 +254,10 @@ pub struct NodeRuntime {
     /// for a recalled grant.
     locks_cluster: bool,
     lock_flushers: Arc<crate::locks::LockFlushers>,
+    /// Open-orphan holds (DESIGN.md §3): every view's open-handle table,
+    /// and the writer of this node's `holds/<node>.json`.
+    hold_sources: Arc<crate::holds::HoldSources>,
+    holds: Arc<crate::holds::Holds>,
     pins: Arc<pin::PinManager>,
     reintegration: Arc<reintegrate::ReintegrationState>,
     stop: Arc<AtomicBool>,
@@ -355,7 +359,8 @@ impl NodeRuntime {
         let db_path = state_dir.join("meta.db");
         // Fresh node: rebuild the replica from the commit chain plus log
         // replay (or, with no commit yet, a genesis replay of the whole log).
-        if !db_path.exists() {
+        let existing_replica = db_path.exists();
+        if !existing_replica {
             crate::startup::phase("bootstrapping the metadata replica from S3");
             rt.block_on(shipper::bootstrap(&db_path, &log))
                 .context("bootstrapping metadata replica")?;
@@ -363,6 +368,14 @@ impl NodeRuntime {
         crate::startup::phase("opening meta.db");
         let meta = Arc::new(Meta::open(&db_path)?);
         meta.scratch_purge_all()?;
+        if existing_replica {
+            // A replica the log was pruned past while this node was
+            // offline is rebuilt from the head commit before anything
+            // tails or mounts (DESIGN.md §14 "Falling behind segment GC").
+            crate::startup::phase("checking the replica against the retained log");
+            rt.block_on(shipper::rebuild_if_pruned(&meta, &log, &state_dir))
+                .context("checking the replica against the retained log")?;
+        }
         spawn_vacuum(&meta);
         if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
             bail!(
@@ -860,6 +873,17 @@ impl NodeRuntime {
         ));
         let pending_acks: Arc<std::sync::Mutex<Vec<u64>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Open-orphan holds (DESIGN.md §3): the writer is built here so
+        // the sync task can nudge it; its loop starts once `stop` exists.
+        let hold_sources = Arc::new(crate::holds::HoldSources::default());
+        let holds = crate::holds::Holds::new(
+            store.inner().clone(),
+            store.clone(),
+            meta.clone(),
+            node_id,
+            hold_sources.clone(),
+            crate::holds::HoldConfig::from_env(core_config.ttl_ms),
+        );
         // The core's IO driver: the sync task (plan 30 M5).
         {
             let driver = crate::authority_driver::Driver::new(
@@ -893,6 +917,7 @@ impl NodeRuntime {
                         Arc::new(move |ino| flushers.flush(ino))
                     },
                     fault_reply_delay_ms: fault_forward_delay_ms,
+                    holds: Some(holds.clone()),
                 },
                 sync_tx.clone(),
                 sync_rx,
@@ -1135,6 +1160,7 @@ impl NodeRuntime {
             });
         }
         let stop = Arc::new(AtomicBool::new(false));
+        rt.spawn(holds.clone().run(stop.clone()));
         // Read-time atime flush ticker (plan 20). Off-mode accumulators
         // never queue anything, so this loop drains empty and is cheap;
         // it only does work when the operator opted in.
@@ -1274,6 +1300,8 @@ impl NodeRuntime {
             cto_strict,
             locks_cluster,
             lock_flushers,
+            hold_sources,
+            holds,
             pins,
             reintegration,
             stop,
@@ -1565,12 +1593,15 @@ impl NodeRuntime {
         let fs = Arc::new(fs);
         let flusher: std::sync::Weak<dyn crate::locks::LockFlush> =
             Arc::downgrade(&(fs.clone() as Arc<dyn crate::locks::LockFlush>));
+        let open_handles: std::sync::Weak<dyn crate::holds::OpenHandles> =
+            Arc::downgrade(&(fs.clone() as Arc<dyn crate::holds::OpenHandles>));
         let mut session = fuser::Session::new(fusefs::FuseFs(fs), &mountpoint, &fuse_config)
             .context("FUSE mount")?;
         let unmounter = session.unmount_callable();
 
         let id = MountId(self.next_mount_id.fetch_add(1, Ordering::Relaxed));
         self.lock_flushers.register(id.0, flusher);
+        self.hold_sources.register(id.0, open_handles);
         if let (Some(k), false) = (&self.kernel_inval, frozen_view) {
             k.register(id.0, session.notifier(), view_root);
         }
@@ -1595,6 +1626,8 @@ impl NodeRuntime {
                 k.unregister(id.0);
             }
             node.lock_flushers.unregister(id.0);
+            node.hold_sources.unregister(id.0);
+            node.holds.nudge();
             tracing::info!("FUSE detached");
             if let Some(path) = ephemeral_clone {
                 if let Err(e) = crate::remove_live_subtree(&node.meta, &path) {
@@ -1854,6 +1887,9 @@ impl NodeRuntime {
             }
         });
         flush.context("final log flush")?;
+        // No view is left to hold an orphan open: withdraw the claim now
+        // rather than let its TTL run out.
+        self.rt.block_on(self.holds.withdraw());
         tracing::info!("clean unmount drain complete");
         Ok(())
     }

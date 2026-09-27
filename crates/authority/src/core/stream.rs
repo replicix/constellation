@@ -734,6 +734,16 @@ impl Core {
         }
     }
 
+    /// The holder's highest reported sequence on a live stream, if any.
+    pub(crate) fn stream_head(&self) -> Option<Seq> {
+        self.stream.sub.as_ref().filter(|s| s.live).map(|s| s.head)
+    }
+
+    /// The highest sequence a gossip hint named.
+    pub(crate) fn stream_hinted(&self) -> Seq {
+        self.stream.hinted
+    }
+
     /// A gossip hint named `seq`.
     pub(crate) fn stream_note_hint(&mut self, seq: Seq) {
         self.stream.hinted = self.stream.hinted.max(seq);

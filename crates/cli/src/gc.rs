@@ -5,15 +5,15 @@
 //! job with — see `store-s3::mark`'s module doc for why the reachability
 //! walk from commit roots makes it unnecessary). Before any chunk DELETE
 //! this module CAS-publishes the complete condemned set and waits a lease
-//! TTL; writers independently treat those hashes as dedup misses.
+//! TTL; writers independently treat those hashes as dedup misses. The
+//! `_gc` singleton lease is renewed through the wait and every delete
+//! batch is fenced on it (`run_chunks`'s doc has the argument).
 
 use anyhow::{Context, Result};
-use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::ChunkHash;
 use constellation_meta::Meta;
 use constellation_store_s3::{
-    append_journal, publish_condemned, read_condemned, GcJournalEntry, LeaseMode, LogStore,
-    SnapshotStore,
+    append_journal, publish_condemned, GcJournalEntry, LeaseMode, LogStore, SnapshotStore,
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -167,8 +167,9 @@ pub async fn run(
     tail: &GcTail,
 ) -> Result<GcReport> {
     let config = GcConfig::from_env();
-    let lease =
+    let mut lease =
         crate::singleton::SingletonLease::acquire(object_store.clone(), "_gc", lease_mode).await?;
+    tracing::info!(epoch = lease.epoch(), verify_only, "bucket GC round starts");
     let result = run_held(
         object_store,
         chunks,
@@ -178,6 +179,7 @@ pub async fn run(
         verify_only,
         peers,
         tail,
+        &mut lease,
     )
     .await;
     lease.release().await;
@@ -194,6 +196,7 @@ async fn run_held(
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
     tail: &GcTail,
+    lease: &mut crate::singleton::SingletonLease,
 ) -> Result<GcReport> {
     // Chunks first: their snapshot roots are read from the metadata tree,
     // which the second phase compacts.
@@ -206,19 +209,39 @@ async fn run_held(
         verify_only,
         peers,
         tail,
+        lease,
     )
     .await?;
     let tree_config =
         crate::mtree_gc::MtreeGcConfig::from_env(config.horizon_ms, config.lease_ttl_ms);
     report.metadata = Some(
-        crate::mtree_gc::run(store, chunks.e2e_keys(), &meta, &tree_config, verify_only).await?,
+        crate::mtree_gc::run(
+            store,
+            chunks.e2e_keys(),
+            &meta,
+            &tree_config,
+            verify_only,
+            lease,
+        )
+        .await?,
     );
     Ok(report)
 }
 
+/// Deletes between two fence checks (`SingletonLease::renew`).
+const DELETE_FENCE_EVERY: usize = 64;
+
+/// A chunk round's first half: candidates marked and CAS-published as the
+/// condemned pointer. `sweep_chunks` is the second half, after the grace
+/// wait.
+struct Marked {
+    candidates: Vec<Mark>,
+    condemned: constellation_store_s3::CondemnedList,
+}
+
 /// Chunk candidates come from a single pass: LIST `chunks/` and mark
 /// anything older than the horizon that is not in the protected set (live
-/// manifests of the replica, snapshot roots, holds, or already condemned).
+/// manifests of the replica, snapshot roots, holds).
 /// Plan 28 §P10 retired the `deref` index and its per-replica bookkeeping —
 /// any node, or an external job with bucket credentials, can GC by reading
 /// roots, so this LIST-based orphan pass is the only candidate source now.
@@ -234,6 +257,47 @@ async fn run_held(
 /// deletion, not just before marking. Either tail failing aborts the
 /// round with nothing marked or deleted rather than proceed against a
 /// replica view this pass could not vouch for.
+///
+/// # A round's deletes happen only while its own list is current
+///
+/// `CondemnedView`'s argument (store-s3 `gc.rs`) rests on one premise:
+/// every chunk a round deletes is on the condemned pointer from the
+/// moment that round published it until the delete lands. Two things
+/// hold it up, and neither depends on timing:
+///
+/// 1. **The `_gc` lease is renewed through the round and every delete
+///    batch is fenced on it.** The lease used to be acquired once and
+///    never renewed, while the round waits a full TTL after publishing:
+///    by delete time it had lapsed, a second round (every daemon runs its
+///    own daily tick) could take it and publish a new pointer, and the
+///    first round kept deleting under a list that was no longer current.
+///    Now the wait renews the lease as it goes (`hold_for`) and the delete
+///    loop renews — a CAS on the lease object's ETag — before its first
+///    delete and every `DELETE_FENCE_EVERY` deletes after that; a refused
+///    renewal (`singleton::Fenced`) stops the round on the spot. A round
+///    whose process paused for minutes is stopped the same way: the fence
+///    is the store's CAS, not the round's clock.
+/// 2. **A new round carries the previous round's undeleted candidates.**
+///    The candidate pass no longer skips hashes that are already on the
+///    pointer: a chunk that is still present, still older than the
+///    horizon and still unprotected is a candidate again, so the pointer
+///    the new round publishes lists every chunk an interrupted (or
+///    paused) round could still delete. Between a fenced renewal and the
+///    delete it guards, the previous round may land at most
+///    `DELETE_FENCE_EVERY` deletes — and each of those is of a hash the
+///    new list carries (a writer reading the new pointer treats it as
+///    condemned and uploads), or of a hash the new round found protected.
+///    The protected case cannot dangle either: a manifest naming the hash
+///    was committed by a writer whose dedup hit either preceded the old
+///    round's publication (then its commit preceded the old round's
+///    post-wait tail and re-check, which kept the chunk) or saw the old
+///    pointer list the hash and re-uploaded it (then the old round's
+///    `HEAD` sees the newer object and keeps it, modulo the `HEAD`→
+///    `DELETE` gap portable S3 leaves open, see rule 3 in DESIGN.md §14).
+///
+/// So a hash absent from the *current* pointer is deleted by no round at
+/// all, which is exactly what `CondemnedView` needs of "the round whose
+/// list was current".
 #[allow(clippy::too_many_arguments)]
 async fn run_chunks(
     store: Arc<dyn ObjectStore>,
@@ -244,13 +308,54 @@ async fn run_chunks(
     verify_only: bool,
     peers: Option<&constellation_net::Peers>,
     tail: &GcTail,
+    lease: &mut crate::singleton::SingletonLease,
 ) -> Result<GcReport> {
-    tail.tail_to_head(&meta, lease_mode)
+    let marked = match mark_chunks(
+        &store,
+        &chunks,
+        &meta,
+        lease_mode,
+        config,
+        verify_only,
+        tail,
+    )
+    .await?
+    {
+        Ok(marked) => marked,
+        Err(report) => return Ok(report),
+    };
+    if let Some(peers) = peers {
+        peers.announce_condemned(marked.condemned.epoch).await;
+    }
+    // One complete authority TTL is mandatory. A writer which has not
+    // refreshed by then can no longer commit under a valid partition
+    // lease. The `_gc` lease is renewed along the way: it must still be
+    // this round's when the deletes start.
+    lease
+        .hold_for(std::time::Duration::from_millis(config.lease_ttl_ms))
+        .await
+        .context("waiting out the condemned-list grace period")?;
+    sweep_chunks(&store, &chunks, &meta, lease_mode, tail, lease, marked).await
+}
+
+/// The mark phase: tail, list, protect, publish. `Err(report)` is an
+/// early, complete report (verify-only, or nothing to condemn).
+#[allow(clippy::too_many_arguments)]
+async fn mark_chunks(
+    store: &Arc<dyn ObjectStore>,
+    chunks: &Arc<constellation_store_s3::ChunkStore>,
+    meta: &Arc<Meta>,
+    lease_mode: LeaseMode,
+    config: &GcConfig,
+    verify_only: bool,
+    tail: &GcTail,
+) -> Result<std::result::Result<Marked, GcReport>> {
+    tail.tail_to_head(meta, lease_mode)
         .await
         .context("tailing the metadata log to head before marking chunk GC candidates")?;
     let now = constellation_store_s3::lease::now_unix_ms();
-    let live = live_roots(&chunks, &meta).await?;
-    let snapshots = snapshot_roots(&chunks, store.clone()).await?;
+    let live = live_roots(chunks, meta).await?;
+    let snapshots = snapshot_roots(chunks, store.clone()).await?;
     let holds = hold_roots(store.clone(), now).await?;
     let protected: HashSet<_> = live
         .iter()
@@ -259,20 +364,13 @@ async fn run_chunks(
         .copied()
         .collect();
 
-    let condemned: HashSet<_> = read_condemned(&store)
-        .await?
-        .into_iter()
-        .flat_map(|list| list.hashes)
-        .filter_map(|value| ChunkHash::from_hex(&value))
-        .collect();
-    let known: HashSet<_> = protected.iter().chain(condemned.iter()).copied().collect();
     let mut candidates = Vec::new();
     let prefix = Path::from("chunks");
     for object in store.list(Some(&prefix)).try_collect::<Vec<_>>().await? {
         let Some(hash) = object.location.filename().and_then(ChunkHash::from_hex) else {
             continue;
         };
-        if !known.contains(&hash)
+        if !protected.contains(&hash)
             && object.last_modified.timestamp_millis() <= now - config.horizon_ms
         {
             candidates.push(Mark {
@@ -283,40 +381,63 @@ async fn run_chunks(
             });
         }
     }
-    candidates.extend(metadata_candidates(&store, chunks.e2e_keys(), config, now).await?);
+    candidates.extend(metadata_candidates(store, chunks.e2e_keys(), config, now).await?);
     candidates.sort_by(|a, b| a.key.cmp(&b.key));
 
     if verify_only || candidates.is_empty() {
-        return Ok(GcReport {
+        return Ok(Err(GcReport {
             verify_only,
             candidates,
             deleted: Vec::new(),
             condemned_epoch: None,
             metadata: None,
-        });
+        }));
     }
 
     let condemned_hashes: Vec<_> = candidates
         .iter()
         .filter_map(|mark| mark.hash.map(|hash| hash.to_hex()))
         .collect();
-    let condemned = publish_condemned(&store, condemned_hashes, now).await?;
-    if let Some(peers) = peers {
-        peers.announce_condemned(condemned.epoch).await;
-    }
-    // One complete authority TTL is mandatory. A writer which has not
-    // refreshed by then can no longer commit under a valid partition lease.
-    tokio::time::sleep(std::time::Duration::from_millis(config.lease_ttl_ms)).await;
+    let condemned = publish_condemned(store, condemned_hashes, now).await?;
+    Ok(Ok(Marked {
+        candidates,
+        condemned,
+    }))
+}
 
-    tail.tail_to_head(&meta, lease_mode).await.context(
+/// The sweep phase, after the grace wait: tail again, re-check liveness,
+/// and delete behind the lease fence.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_chunks(
+    store: &Arc<dyn ObjectStore>,
+    chunks: &Arc<constellation_store_s3::ChunkStore>,
+    meta: &Arc<Meta>,
+    lease_mode: LeaseMode,
+    tail: &GcTail,
+    lease: &mut crate::singleton::SingletonLease,
+    marked: Marked,
+) -> Result<GcReport> {
+    let Marked {
+        candidates,
+        condemned,
+    } = marked;
+    tail.tail_to_head(meta, lease_mode).await.context(
         "tailing the metadata log to head after the condemned-list wait, before deletion",
     )?;
-    let refreshed_live = live_roots(&chunks, &meta).await?;
-    let refreshed_snaps = snapshot_roots(&chunks, store.clone()).await?;
+    let refreshed_live = live_roots(chunks, meta).await?;
+    let refreshed_snaps = snapshot_roots(chunks, store.clone()).await?;
+    // Holds are re-read too: a node that applied an unlink of a file it
+    // has open publishes its hold asynchronously (`cli::holds`), and the
+    // wait above is the window it gets before this round's deletes.
+    let refreshed_holds =
+        hold_roots(store.clone(), constellation_store_s3::lease::now_unix_ms()).await?;
     let mut deleted = Vec::new();
     for mark in &candidates {
         if let Some(hash) = mark.hash {
-            if refreshed_live.contains(&hash) || refreshed_snaps.contains(&hash) {
+            if refreshed_live.contains(&hash)
+                || refreshed_snaps.contains(&hash)
+                || refreshed_holds.contains(&hash)
+            {
                 continue;
             }
             let Ok(now_there) = store.head(&Path::from(mark.key.clone())).await else {
@@ -334,9 +455,19 @@ async fn run_chunks(
                 continue;
             }
         }
+        // The fence: this round's list is current only while this round
+        // holds the `_gc` lease, and the lease object's CAS is the proof.
+        if deleted.len() % DELETE_FENCE_EVERY == 0 {
+            lease.renew().await.with_context(|| {
+                format!(
+                    "chunk GC stopped after {} delete(s): the round is no longer the lease holder",
+                    deleted.len()
+                )
+            })?;
+        }
         store.delete(&Path::from(mark.key.clone())).await?;
         append_journal(
-            &store,
+            store,
             &GcJournalEntry {
                 key: mark.key.clone(),
                 rule: mark.rule.clone(),
@@ -348,7 +479,7 @@ async fn run_chunks(
         deleted.push(mark.key.clone());
     }
     Ok(GcReport {
-        verify_only,
+        verify_only: false,
         candidates,
         deleted,
         condemned_epoch: Some(condemned.epoch),
@@ -371,14 +502,7 @@ async fn live_roots(
 ) -> Result<HashSet<ChunkHash>> {
     let mut roots = HashSet::new();
     for bytes in meta.live_manifests()? {
-        let manifest = Manifest::decode(&bytes)?;
-        match manifest.chunks {
-            ChunkInfo::Inline(hashes) => roots.extend(hashes.into_values()),
-            ChunkInfo::Spilled(spill) => {
-                roots.insert(spill);
-                roots.extend(decode_chunk_list(&chunks.get_chunk(&spill).await?)?.into_values());
-            }
-        }
+        roots.extend(crate::holds::manifest_chunk_hashes(chunks, &bytes).await?);
     }
     Ok(roots)
 }
@@ -433,10 +557,15 @@ impl Drop for ScratchDir {
     }
 }
 
-async fn hold_roots(store: Arc<dyn ObjectStore>, now: i64) -> Result<HashSet<ChunkHash>> {
+/// Every chunk hash a live (unexpired) `holds/*` object names
+/// (`cli::holds`).
+pub(crate) async fn hold_roots(
+    store: Arc<dyn ObjectStore>,
+    now: i64,
+) -> Result<HashSet<ChunkHash>> {
     let mut roots = HashSet::new();
     for object in store
-        .list(Some(&Path::from("holds")))
+        .list(Some(&constellation_store_s3::layout::holds_prefix()))
         .try_collect::<Vec<_>>()
         .await?
     {
@@ -490,7 +619,7 @@ fn collect_hash_strings(value: &serde_json::Value, out: &mut HashSet<ChunkHash>)
 /// there to have tailed. Retention only ever *widens* what survives, so
 /// this can only keep more segments than the seq-based floor alone,
 /// never fewer.
-async fn metadata_candidates(
+pub(crate) async fn metadata_candidates(
     store: &Arc<dyn ObjectStore>,
     keys: Option<&constellation_store_s3::SharedE2eKeys>,
     config: &GcConfig,
@@ -543,6 +672,199 @@ async fn metadata_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use constellation_store_s3::ChunkStore;
+    use object_store::memory::InMemory;
+
+    /// A `_gc` lease for a test round, with an explicit TTL.
+    async fn gc_lease(
+        store: &Arc<dyn ObjectStore>,
+        ttl_ms: u64,
+    ) -> crate::singleton::SingletonLease {
+        crate::singleton::SingletonLease::acquire_with_ttl(
+            store.clone(),
+            "_gc",
+            LeaseMode::Cas,
+            ttl_ms,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn fast_config() -> GcConfig {
+        GcConfig {
+            horizon_ms: 0,
+            retention_segments: 128,
+            lease_ttl_ms: 1,
+            completion_retention_ms: 0,
+        }
+    }
+
+    /// A replica whose only live file names `hash` (an inline manifest).
+    fn replica_with_live(node: u64, hash: Option<ChunkHash>) -> Arc<Meta> {
+        use constellation_fs_core::manifest::{ChunkInfo, Manifest};
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_fs_core::ChunkLayout;
+        use constellation_meta::MetaStore;
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.set_node_prefix(node).unwrap();
+        if let Some(hash) = hash {
+            let file = meta.create(ROOT_INO, "live", 0o644, 0, 0).unwrap();
+            let manifest = Manifest {
+                layout: ChunkLayout::new(4096),
+                file_len: 4,
+                chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
+            }
+            .encode();
+            meta.set_manifest(file.ino, &manifest, 4).unwrap();
+        }
+        meta
+    }
+
+    /// Carry-over: a hash the current condemned pointer already lists is a
+    /// candidate again when it is still present, old and unprotected, so
+    /// the pointer the new round publishes carries every chunk an
+    /// interrupted or paused round could still delete. (Before: the
+    /// candidate pass skipped anything already condemned, and a writer
+    /// reading the new pointer trusted a dedup hit on a chunk the old
+    /// round was deleting.)
+    #[tokio::test]
+    async fn a_round_carries_the_previous_rounds_undeleted_candidates() {
+        use constellation_store_s3::{read_condemned, CompressionSetting};
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+        let old = ChunkHash::of(b"condemned by the previous round");
+        let fresh = ChunkHash::of(b"first seen unreferenced by this round");
+        for bytes in [
+            &b"condemned by the previous round"[..],
+            &b"first seen unreferenced by this round"[..],
+        ] {
+            chunks
+                .put_chunk(&ChunkHash::of(bytes), bytes, CompressionSetting::RAW)
+                .await
+                .unwrap();
+        }
+        // The previous round's pointer, still current: it lists `old`.
+        publish_condemned(&store, vec![old.to_hex()], 1)
+            .await
+            .unwrap();
+
+        let meta = replica_with_live(1, None);
+        let tail = GcTail::standalone(LogStore::new(store.clone()), &meta).unwrap();
+        let marked = mark_chunks(
+            &store,
+            &chunks,
+            &meta,
+            LeaseMode::Cas,
+            &fast_config(),
+            false,
+            &tail,
+        )
+        .await
+        .unwrap()
+        .expect("something to condemn");
+        let candidates: HashSet<_> = marked.candidates.iter().filter_map(|m| m.hash).collect();
+        assert!(
+            candidates.contains(&old),
+            "the previous round's undeleted candidate is carried"
+        );
+        assert!(candidates.contains(&fresh));
+        let pointer = read_condemned(&store).await.unwrap().unwrap();
+        assert_eq!(pointer.epoch, 2);
+        assert!(pointer.hashes.contains(&old.to_hex()));
+        assert!(pointer.hashes.contains(&fresh.to_hex()));
+    }
+
+    /// A round whose lease lapsed mid-wait (a pause of any length: the
+    /// test's short TTL stands in for minutes) and whose lease another
+    /// round then took deletes nothing more: its first fenced renewal is
+    /// refused. The second round's replica sees `w` as live and drops it
+    /// from its pointer; the first round's replica does not — without the
+    /// fence the first round deleted `w` under a pointer that no longer
+    /// listed it, the dangle the writer-side argument excludes.
+    #[tokio::test]
+    async fn a_paused_round_deletes_nothing_once_another_round_took_the_lease() {
+        use constellation_store_s3::CompressionSetting;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+        let x = ChunkHash::of(b"unreferenced everywhere");
+        let w = ChunkHash::of(b"referenced by the time the second round marks");
+        for bytes in [
+            &b"unreferenced everywhere"[..],
+            &b"referenced by the time the second round marks"[..],
+        ] {
+            chunks
+                .put_chunk(&ChunkHash::of(bytes), bytes, CompressionSetting::RAW)
+                .await
+                .unwrap();
+        }
+
+        // Round 1 marks and publishes, then pauses past its lease TTL.
+        let meta_1 = replica_with_live(1, None);
+        let tail_1 = GcTail::standalone(LogStore::new(store.clone()), &meta_1).unwrap();
+        let mut lease_1 = gc_lease(&store, 30).await;
+        let marked_1 = mark_chunks(
+            &store,
+            &chunks,
+            &meta_1,
+            LeaseMode::Cas,
+            &fast_config(),
+            false,
+            &tail_1,
+        )
+        .await
+        .unwrap()
+        .expect("round 1 condemns x and w");
+        assert_eq!(marked_1.condemned.hashes.len(), 2);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        // Round 2 takes the lapsed lease and runs to completion. Its
+        // replica has `w` live (a writer committed a manifest naming it
+        // after re-uploading it — here simply: it is live).
+        let meta_2 = replica_with_live(2, Some(w));
+        let tail_2 = GcTail::standalone(LogStore::new(store.clone()), &meta_2).unwrap();
+        let mut lease_2 = gc_lease(&store, 30).await;
+        let report_2 = run_chunks(
+            store.clone(),
+            chunks.clone(),
+            meta_2.clone(),
+            LeaseMode::Cas,
+            &fast_config(),
+            false,
+            None,
+            &tail_2,
+            &mut lease_2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report_2.deleted,
+            vec![constellation_store_s3::layout::chunk_key(&x).to_string()]
+        );
+        assert!(!chunks.has_chunk(&x).await.unwrap());
+        assert!(chunks.has_chunk(&w).await.unwrap());
+
+        // Round 1 resumes: fenced before its first delete.
+        let error = sweep_chunks(
+            &store,
+            &chunks,
+            &meta_1,
+            LeaseMode::Cas,
+            &tail_1,
+            &mut lease_1,
+            marked_1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::singleton::Fenced>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            chunks.has_chunk(&w).await.unwrap(),
+            "a paused round must not delete under a pointer that is no longer its own"
+        );
+        lease_2.release().await;
+    }
 
     #[test]
     fn horizon_and_exemptions_filter_candidates() {
@@ -685,6 +1007,133 @@ mod tests {
         assert!(!reuploaded_since_marked(&no_evidence, t + 5000));
     }
 
+    /// DESIGN.md §3 "Unlink while open", across nodes: node A unlinks a
+    /// file node B has open (B applied the unlink and keeps the orphan in
+    /// its own replica). Nothing in the bucket names the chunk any more,
+    /// so a GC round run from A's replica would delete it under B's open
+    /// handle — unless B's `holds/<node>.json` claims it. Once B closes
+    /// the file and withdraws its hold, the next round reclaims the
+    /// chunk.
+    #[tokio::test]
+    async fn a_chunk_held_open_on_another_node_survives_gc() {
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::MetaStore;
+        use constellation_store_s3::CompressionSetting;
+        use std::sync::Mutex;
+
+        struct Opens(Mutex<Vec<constellation_fs_core::Ino>>);
+        impl crate::holds::OpenHandles for Opens {
+            fn open_inos(&self) -> Vec<constellation_fs_core::Ino> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+        let content = b"open on node b, unlinked on node a";
+        let hash = ChunkHash::of(content);
+        chunks
+            .put_chunk(&hash, content, CompressionSetting::RAW)
+            .await
+            .unwrap();
+
+        let meta_a = replica_with_live(1, Some(hash));
+        let mut ship_a = crate::authority_driver::Standalone::new(
+            meta_a.clone(),
+            store.clone(),
+            1,
+            LeaseMode::Cas,
+        );
+        let meta_b = Arc::new(Meta::open_in_memory().unwrap());
+        meta_b.set_node_prefix(2).unwrap();
+        let mut ship_b = crate::authority_driver::Standalone::new(
+            meta_b.clone(),
+            store.clone(),
+            2,
+            LeaseMode::Cas,
+        );
+        assert!(ship_a.acquire().await.unwrap());
+        ship_a.sync().await.unwrap();
+        ship_b.tail_to_head().await.unwrap();
+        let ino = meta_b.child_ino(ROOT_INO, "live").unwrap().unwrap();
+
+        // A unlinks (nobody has it open on A: reaped at once, as the FUSE
+        // unlink path does) and ships; B applies it with the file open.
+        meta_a.unlink(ROOT_INO, "live").unwrap();
+        meta_a.reap_orphan(ino).unwrap();
+        ship_a.sync().await.unwrap();
+        ship_b.tail_to_head().await.unwrap();
+        assert_eq!(meta_b.orphans().unwrap(), vec![ino]);
+        assert!(meta_b.manifest(ino).unwrap().is_some());
+
+        let view = Arc::new(Opens(Mutex::new(vec![ino])));
+        let sources = Arc::new(crate::holds::HoldSources::default());
+        sources.register(
+            1,
+            Arc::downgrade(&view) as std::sync::Weak<dyn crate::holds::OpenHandles>,
+        );
+        let holds = crate::holds::Holds::new(
+            store.clone(),
+            chunks.clone(),
+            meta_b.clone(),
+            2,
+            sources,
+            crate::holds::HoldConfig {
+                refresh: std::time::Duration::from_millis(10),
+                ttl: std::time::Duration::from_secs(60),
+            },
+        );
+        holds.refresh_once().await.unwrap();
+
+        let tail_a = GcTail::standalone(LogStore::new(store.clone()), &meta_a).unwrap();
+        let mut lease = gc_lease(&store, 60_000).await;
+        let report = run_chunks(
+            store.clone(),
+            chunks.clone(),
+            meta_a.clone(),
+            LeaseMode::Cas,
+            &fast_config(),
+            false,
+            None,
+            &tail_a,
+            &mut lease,
+        )
+        .await
+        .unwrap();
+        assert!(
+            report.candidates.iter().all(|m| m.hash != Some(hash)),
+            "a held chunk is not even a candidate: {:?}",
+            report.candidates
+        );
+        assert!(chunks.has_chunk(&hash).await.unwrap());
+        assert!(
+            meta_b.manifest(ino).unwrap().is_some(),
+            "B still serves its handle from the orphan record"
+        );
+
+        // B closes the file: the hold is withdrawn, the orphan reaped, and
+        // the next round reclaims the chunk.
+        view.0.lock().unwrap().clear();
+        holds.refresh_once().await.unwrap();
+        assert!(meta_b.orphans().unwrap().is_empty());
+        let report = run_chunks(
+            store.clone(),
+            chunks.clone(),
+            meta_a.clone(),
+            LeaseMode::Cas,
+            &fast_config(),
+            false,
+            None,
+            &tail_a,
+            &mut lease,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.deleted.len(), 1);
+        assert!(!chunks.has_chunk(&hash).await.unwrap());
+        lease.release().await;
+    }
+
     /// Plan 29 M3a: chunk GC's liveness view is the *local* replica
     /// (`live_roots` reads `meta.live_manifests`), so a replica that has
     /// not tailed a writer's dedup-hit commit must not mark that chunk —
@@ -780,6 +1229,7 @@ mod tests {
             completion_retention_ms: 0,
         };
         let tail = GcTail::standalone(LogStore::new(store.clone()), &meta_b).unwrap();
+        let mut lease = gc_lease(&store, 60_000).await;
         let report = run_chunks(
             store.clone(),
             chunks.clone(),
@@ -789,6 +1239,7 @@ mod tests {
             false,
             None,
             &tail,
+            &mut lease,
         )
         .await
         .unwrap();

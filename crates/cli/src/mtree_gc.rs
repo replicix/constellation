@@ -184,19 +184,32 @@ pub fn run<'a>(
     meta: &'a Meta,
     config: &'a MtreeGcConfig,
     verify_only: bool,
+    lease: &'a mut crate::singleton::SingletonLease,
 ) -> futures::future::BoxFuture<'a, Result<MtreeGcReport>> {
     // Boxed with an explicit `Send` bound: the daemon spawns the GC tick,
     // and leaving this future's `Send`-ness to inference inside that
     // spawn trips rustc's higher-ranked lifetime limits.
-    Box::pin(run_inner(store, keys, meta, config, verify_only))
+    Box::pin(run_inner(store, keys, meta, config, verify_only, lease))
 }
 
+/// The `_gc` lease is the round's fence (`cli::singleton`, `gc.rs`'s
+/// `run_chunks` doc): the grace wait renews it as it goes, and every
+/// destructive batch below — blob deletes, dead-pack deletes, compaction
+/// batches, incomplete-body deletes — is preceded by a renewal CAS. A
+/// refused renewal means another round holds the lease and has published
+/// (or will publish) its own condemned lists; this round stops at once,
+/// however long it was paused. The condemned-pack and condemned-blob
+/// lists are *replaced*, not appended to: that is why this fence is what
+/// keeps "a publisher never names a node in a condemned pack" exact — the
+/// list a round deletes under is the list a publisher sees, or the round
+/// does not delete.
 async fn run_inner(
     store: Arc<dyn ObjectStore>,
     keys: Option<&constellation_store_s3::SharedE2eKeys>,
     meta: &Meta,
     config: &MtreeGcConfig,
     verify_only: bool,
+    lease: &mut crate::singleton::SingletonLease,
 ) -> Result<MtreeGcReport> {
     let sealing = constellation_store_s3::TreeSealing::for_keys(keys);
     let chain = CommitChain::new(store.clone()).with_sealing(sealing.clone());
@@ -285,7 +298,10 @@ async fn run_inner(
     constellation_store_s3::publish_condemned_packs(&store, &condemned, now as u64, now).await?;
     constellation_store_s3::publish_condemned_blobs(&store, &eligible_blobs, now as u64, now)
         .await?;
-    tokio::time::sleep(config.grace).await;
+    lease
+        .hold_for(config.grace)
+        .await
+        .context("waiting out the condemned-pack grace period")?;
     let now = constellation_store_s3::lease::now_unix_ms();
     let retained = retained_commits(store.clone(), expired.clone()).await?;
     reader.cache.refresh_catalog().await?;
@@ -310,6 +326,10 @@ async fn run_inner(
     // list (unreferenced and past the horizon at the first mark) and
     // *still* unreferenced at the re-mark — the same "re-check right
     // before the destructive step" rule the pack sweep applies below.
+    lease
+        .renew()
+        .await
+        .context("metadata GC stopped before its blob deletes")?;
     for hash in &eligible_blobs {
         if live.blob_hashes.contains(hash) {
             continue; // referenced again since the first mark: survives
@@ -334,6 +354,10 @@ async fn run_inner(
     .with_pacer(Arc::new(RatePacer(config.compact_bytes_per_s)));
     let mut cursor = load_cursor(meta, KV_CURSOR_DEAD)?;
     loop {
+        lease
+            .renew()
+            .await
+            .context("metadata GC stopped before a dead-pack delete batch")?;
         let batch = compactor.delete_dead(&sweep, BATCH_PACKS, cursor).await?;
         report.packs_deleted += batch.deleted.len();
         report.delete_failures += batch.delete_failures.len();
@@ -345,6 +369,10 @@ async fn run_inner(
     }
     let mut cursor = load_cursor(meta, KV_CURSOR_COMPACT)?;
     loop {
+        lease
+            .renew()
+            .await
+            .context("metadata GC stopped before a compaction batch")?;
         let batch = compactor
             .compact(&sweep, &live.nodes, BATCH_PACKS, cursor)
             .await?;
@@ -361,6 +389,10 @@ async fn run_inner(
     }
     // Bodies whose index never arrived: still incomplete after the wait
     // means no writer is finishing them.
+    lease
+        .renew()
+        .await
+        .context("metadata GC stopped before its incomplete-pack deletes")?;
     for pack in incomplete.clone() {
         let hex = pack.to_hex();
         let indexed = store.head(&layout::pack_index(&hex)).await.is_ok();
@@ -673,6 +705,19 @@ mod tests {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
+    /// The `_gc` lease a test round runs under (any round needs one:
+    /// its grace wait and destructive batches are fenced on it).
+    async fn gc_lease(store: &Arc<dyn ObjectStore>) -> crate::singleton::SingletonLease {
+        crate::singleton::SingletonLease::acquire_with_ttl(
+            store.clone(),
+            "_gc",
+            constellation_store_s3::LeaseMode::Cas,
+            60_000,
+        )
+        .await
+        .unwrap()
+    }
+
     /// Retention must delete a contiguous prefix: a young commit (e.g. an
     /// author with a skewed clock) stops the scan, so no live commit is
     /// ever followed by a deleted one (`CommitChain::discover_head`
@@ -760,6 +805,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_round_reclaims_what_retired_commits_kept_and_nothing_else() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut lease = gc_lease(&store).await;
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
@@ -799,7 +845,7 @@ mod tests {
         let seqs = chain.list_from(0).await.unwrap();
         assert_eq!(seqs.len(), 7);
 
-        let report = run(store.clone(), None, &meta, &config(2), false)
+        let report = run(store.clone(), None, &meta, &config(2), false, &mut lease)
             .await
             .unwrap();
         assert_eq!(report.commits_deleted, vec![1, 2, 3, 4, 5]);
@@ -836,7 +882,7 @@ mod tests {
         assert!(readable(&store, next.root(SHARD0).unwrap()).await > 0);
 
         // A second round finds nothing more to do for the retained set.
-        let again = run(store.clone(), None, &meta, &config(8), true)
+        let again = run(store.clone(), None, &meta, &config(8), true, &mut lease)
             .await
             .unwrap();
         assert!(again.commits_deleted.is_empty());
@@ -934,6 +980,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_live_blob_survives() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut lease = gc_lease(&store).await;
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
@@ -945,7 +992,7 @@ mod tests {
             .hash(target.as_bytes());
         assert!(blob_exists(&store, hash), "blob must be durable first");
 
-        let report = run(store.clone(), None, &meta, &config(64), false)
+        let report = run(store.clone(), None, &meta, &config(64), false, &mut lease)
             .await
             .unwrap();
         assert_eq!(report.blobs_deleted, 0, "{report:?}");
@@ -959,6 +1006,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_dead_blob_survives_its_first_round_and_dies_after_the_horizon() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut lease = gc_lease(&store).await;
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
@@ -980,7 +1028,9 @@ mod tests {
         cfg.horizon_ms = 1_000_000_000; // effectively "never on the first sighting"
 
         // Round 1: first sighting. Recorded, not eligible, survives.
-        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        let report = run(store.clone(), None, &meta, &cfg, false, &mut lease)
+            .await
+            .unwrap();
         assert_eq!(report.blob_candidates, 1, "{report:?}");
         assert_eq!(report.blobs_eligible, 0, "{report:?}");
         assert_eq!(report.blobs_deleted, 0, "{report:?}");
@@ -992,7 +1042,9 @@ mod tests {
         // Round 2: the candidate is now past the horizon and still
         // unreferenced, so it is condemned, survives the re-mark check
         // (nothing re-referenced it), and is deleted.
-        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        let report = run(store.clone(), None, &meta, &cfg, false, &mut lease)
+            .await
+            .unwrap();
         assert_eq!(report.blobs_eligible, 1, "{report:?}");
         assert_eq!(report.blobs_deleted, 1, "{report:?}");
         assert!(!blob_exists(&store, hash), "blob must be gone");
@@ -1009,6 +1061,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_blob_re_referenced_between_rounds_survives() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut lease = gc_lease(&store).await;
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
@@ -1024,7 +1077,9 @@ mod tests {
 
         let mut cfg = config(1);
         cfg.horizon_ms = 1_000_000_000;
-        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        let report = run(store.clone(), None, &meta, &cfg, false, &mut lease)
+            .await
+            .unwrap();
         assert_eq!(report.blob_candidates, 1, "{report:?}");
         backdate_blob_candidates(&store, cfg.horizon_ms + 1).await;
 
@@ -1033,7 +1088,9 @@ mod tests {
         meta.symlink(ROOT_INO, "second", &target, 0, 0).unwrap();
         writer.publish(1).await.unwrap().unwrap();
 
-        let report = run(store.clone(), None, &meta, &cfg, false).await.unwrap();
+        let report = run(store.clone(), None, &meta, &cfg, false, &mut lease)
+            .await
+            .unwrap();
         assert_eq!(report.blobs_eligible, 0, "{report:?}");
         assert_eq!(report.blobs_deleted, 0, "{report:?}");
         assert_eq!(

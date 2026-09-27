@@ -85,6 +85,12 @@ enum Phase {
     Upload,
     /// A `SegmentRun` outstanding; `then` says what the tail was for.
     Tail { then: TailThen },
+    /// A `SegmentGap` outstanding after an empty tail: is the cursor at
+    /// the head, or past the retained log?
+    GapCheck { then: TailThen },
+    /// The replica is being rebuilt from the head commit after a
+    /// retention gap (`Action::RebuildReplica` outstanding).
+    RetentionRebuild { op: OpId },
     /// `LeaseSwap(renewed)` outstanding (`retry`: after a `wanted_by`
     /// edit was re-read).
     Renew {
@@ -372,6 +378,180 @@ impl Core {
         if let Some(job) = self.job.as_mut() {
             job.op = Some(op);
             job.width = width;
+        }
+    }
+
+    // ---- the retention gap check (DESIGN.md §14 "Falling behind
+    // segment GC") ----
+    //
+    // A GET-next `404` cannot tell "at head" from "pruned past": GC
+    // deletes segments below the head commit's `applied` minus the
+    // retention window once they are old enough, and a replica that was
+    // offline (or partitioned) past that point probes a deleted slot for
+    // ever, believing itself current — and, worse, could CAS-create its
+    // takeover marker into that deleted slot and fork the log. One LIST
+    // with offset answers exactly (`S3Op::SegmentGap`): nothing at or
+    // after the cursor means head; a later segment means the range was
+    // pruned and the replica must be rebuilt from the head commit.
+    //
+    // When it runs: always before a takeover CAS, unless the acquisition
+    // reached a handoff's reported head (segments above a holder's head
+    // are above every floor any round could have used: floors come from
+    // commits, commits from holders, and the CAS fences any later
+    // holder). For a follower's rounds: when a gossip hint or the stream's
+    // reported head lies at or past the cursor (rate-limited), and as a
+    // backstop every `gap_check_ms` — plus once on the first empty probe
+    // after a mount. A holder never checks: it is the sole appender.
+
+    /// Whether the empty tail just applied should be followed by a LIST
+    /// before `then` proceeds.
+    fn gap_check_due(&self, now: Ms, then: TailThen) -> bool {
+        if self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.lost {
+            return false;
+        }
+        let next = self.ship.next_seq;
+        match then {
+            TailThen::Takeover | TailThen::CatchUp => {
+                !self.catch_up_reached() && !self.readopting_own_lease()
+            }
+            TailThen::Round | TailThen::Control | TailThen::Recover => {
+                let since = self
+                    .gap_checked_at
+                    .map(|at| now.since(at))
+                    .unwrap_or(i64::MAX);
+                let hinted = self.stream_hinted() >= next
+                    || self.stream_head().is_some_and(|head| head >= next);
+                (hinted && since >= self.cfg.gap_hint_check_ms as i64)
+                    || since >= self.cfg.gap_check_ms as i64
+            }
+            TailThen::EpochProbe | TailThen::Marker | TailThen::Ship => false,
+        }
+    }
+
+    /// M4's re-adoption of this node's own lease after a restart: the
+    /// object still names this node, so nobody else has appended since it
+    /// last did, and its cursor is the head. Exact, and not a clock
+    /// judgment: had another node taken the lease, the object would name
+    /// that node.
+    fn readopting_own_lease(&self) -> bool {
+        matches!(
+            &self.pending_plan,
+            Some(Plan::Claim { prev, .. }) if prev.holder == self.cfg.node_id
+        )
+    }
+
+    /// An acquisition that caught up to a handoff's reported head: the
+    /// cursor is provably above every retention floor.
+    fn catch_up_reached(&self) -> bool {
+        matches!(
+            self.job.as_ref().map(|j| &j.what),
+            Some(What::Acquire {
+                catch_up: Some((target, _)),
+                ..
+            }) if self.ship.head_seq >= *target
+        )
+    }
+
+    fn issue_gap_check(&mut self, then: TailThen, out: &mut Vec<Action>) {
+        let from = self.ship.next_seq;
+        let op = self.issue_s3(S3Op::SegmentGap { from }, S3For::Job, out);
+        self.set_phase(Phase::GapCheck { then }, Some(op));
+    }
+
+    fn after_gap_check(
+        &mut self,
+        now: Ms,
+        then: TailThen,
+        first: Option<Seq>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.gap_checked_at = Some(now);
+        let next = self.ship.next_seq;
+        match first {
+            None => {
+                // At head. A catch-up whose target lies beyond what exists
+                // (the departing holder counted a segment that never
+                // landed) is complete as far as the log goes.
+                if let Some(What::Acquire {
+                    catch_up: Some((target, _)),
+                    ..
+                }) = self.job.as_mut().map(|j| &mut j.what)
+                {
+                    *target = (*target).min(self.ship.head_seq);
+                }
+                self.after_tail(now, then, replica, out);
+            }
+            Some(first) if first <= next => {
+                // A segment landed between the probe and the LIST.
+                self.set_phase(Phase::Tail { then }, None);
+                self.issue_tail(out);
+            }
+            Some(first) => {
+                tracing::error!(
+                    node = self.cfg.node_id,
+                    cursor = next,
+                    first_retained = first,
+                    journal = replica.journal_len().unwrap_or(0),
+                    "the log was pruned past this replica's position; \
+                     rebuilding the replica from the head commit"
+                );
+                self.stats.retention_gaps += 1;
+                self.pending_plan = None;
+                let op = self.op_id();
+                self.set_phase(Phase::RetentionRebuild { op }, Some(op));
+                out.push(Action::RebuildReplica { op });
+            }
+        }
+    }
+
+    /// The retention rebuild finished: the cursor restarts from the
+    /// rebuilt replica's applied position (the head commit's, plus the
+    /// retained log after it) and the job ends — a round quietly, an
+    /// acquisition unacquired (its op retries from the new position), a
+    /// tail-to-head answered.
+    fn retention_rebuild_done(
+        &mut self,
+        now: Ms,
+        ok: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let error = if ok {
+            let applied = replica.applied_seq().unwrap_or(0);
+            self.ship.next_seq = applied + 1;
+            self.ship.head_seq = applied;
+            replica.clear_streamed();
+            tracing::warn!(
+                node = self.cfg.node_id,
+                applied,
+                "replica rebuilt from the head commit after a log retention gap"
+            );
+            None
+        } else {
+            Some("rebuilding the replica after a log retention gap failed".to_string())
+        };
+        match self.job.as_ref().map(|j| j.kind()) {
+            Some(JobKind::Acquire) => self.finish_acquire(now, false, replica, out),
+            Some(JobKind::TailToHead) => {
+                if let Some(Job {
+                    what: What::TailToHead { control },
+                    ..
+                }) = self.job.take()
+                {
+                    let result = match error {
+                        None => Ok(ControlOk::Done),
+                        Some(error) => Err(error),
+                    };
+                    out.push(Action::ControlDone {
+                        op: control,
+                        result: result.clone(),
+                    });
+                    self.read_tail_done(control, &result, out);
+                }
+                self.start_next_job(now, replica, out);
+            }
+            _ => self.finish_round(now, error, replica, out),
         }
     }
 
@@ -1100,6 +1280,10 @@ impl Core {
         let Some(job) = self.job.as_ref() else {
             return;
         };
+        if matches!(job.phase, Phase::RetentionRebuild { op: o } if o == op) {
+            self.retention_rebuild_done(now, ok, replica, out);
+            return;
+        }
         if !matches!(job.phase, Phase::Recover { op: o } if o == op) {
             return;
         }
@@ -2361,11 +2545,21 @@ impl Core {
         match (phase, result) {
             // ---- tails ----
             (Phase::Tail { then }, S3Result::SegmentRun(Ok(run))) => {
+                let empty = run.is_empty();
                 match self.apply_run(now, run, replica, out) {
                     Ok(true) => self.issue_tail(out),
+                    Ok(false) if empty && self.gap_check_due(now, then) => {
+                        self.issue_gap_check(then, out)
+                    }
                     Ok(false) => self.after_tail(now, then, replica, out),
                     Err(error) => self.job_failed(now, error, replica, out),
                 }
+            }
+            (Phase::GapCheck { then }, S3Result::SegmentGap(Ok(first))) => {
+                self.after_gap_check(now, then, first, replica, out)
+            }
+            (Phase::GapCheck { .. }, S3Result::SegmentGap(Err(e))) => {
+                self.job_failed(now, format!("log gap check: {}", e.0), replica, out)
             }
             (
                 Phase::Tail {

@@ -899,6 +899,11 @@ impl Driver {
                         .await
                         .map_err(|e| S3Failure(e.to_string())),
                 ),
+                S3Op::SegmentGap { from } => S3Result::SegmentGap(
+                    log.first_segment_from(from)
+                        .await
+                        .map_err(|e| S3Failure(e.to_string())),
+                ),
                 S3Op::InboxPut { batch } => {
                     let inbox = InboxStore::new(store.clone());
                     S3Result::InboxPut(

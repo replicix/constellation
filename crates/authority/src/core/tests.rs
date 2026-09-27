@@ -139,6 +139,23 @@ fn s3_ops(actions: &[Action]) -> Vec<(OpId, &S3Op)> {
         .collect()
 }
 
+/// Answer a retention gap check in `out` with "at head" (the first empty
+/// probe after a mount, and every takeover's, LISTs the log once:
+/// `Core::gap_check_due`), returning what the answer produced; `out`
+/// itself when there is none.
+fn at_head(h: &mut Harness, out: Vec<Action>) -> Vec<Action> {
+    match s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::SegmentGap { .. }))
+    {
+        Some((op, _)) => h.step(Event::S3 {
+            op,
+            result: S3Result::SegmentGap(Ok(None)),
+        }),
+        None => out,
+    }
+}
+
 fn timers(actions: &[Action], kind: TimerKind) -> Vec<TimerId> {
     actions
         .iter()
@@ -566,10 +583,11 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
     // clears the deposition: the op is queued for replay by rid.
     let (tail, req) = s3_ops(&out)[0];
     assert!(matches!(req, S3Op::SegmentRun { .. }));
-    let _ = h.step(Event::S3 {
+    let out = h.step(Event::S3 {
         op: tail,
         result: S3Result::SegmentRun(Ok(Vec::new())),
     });
+    let _ = at_head(&mut h, out);
     assert!(!h.core.lease().lost);
     assert_eq!(h.core.stats.depositions, 1);
     assert_eq!(h.core.stats.local_rolled_back, 1);
@@ -1911,10 +1929,11 @@ fn a_caught_up_stream_skips_the_tail_until_the_backstop() {
         runs[0].1, 1,
         "a caught-up stream's backstop probe is one GET"
     );
-    sub.step(Event::S3 {
+    let out = sub.step(Event::S3 {
         op: runs[0].0,
         result: S3Result::SegmentRun(Ok(Vec::new())),
     });
+    let _ = at_head(&mut sub, out);
     // Within the backstop period: no S3 tail at all.
     sub.advance(1_000);
     sub.step(Event::Peer {
@@ -3750,6 +3769,13 @@ fn a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition() {
         op: tail,
         result: S3Result::SegmentRun(Ok(Vec::new())),
     });
+    // A takeover confirms an empty tail with a LIST before its CAS.
+    let (gap, req) = only_s3(&out);
+    assert!(matches!(req, S3Op::SegmentGap { from: 1 }), "{req:?}");
+    let out = h.step(Event::S3 {
+        op: gap,
+        result: S3Result::SegmentGap(Ok(None)),
+    });
     let (cas, req) = only_s3(&out);
     assert!(matches!(req, S3Op::LeaseSwap { .. }), "{req:?}");
     let out = h.step(Event::S3 {
@@ -3778,6 +3804,251 @@ fn a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition() {
         None,
         "the acquisition must finish once the deposition voided its gate"
     );
+}
+
+/// The retention gap check (DESIGN.md §14 "Falling behind segment GC").
+mod retention_gap {
+    use super::*;
+
+    /// Run one round on a follower: poll timer, then the upload step.
+    fn round(h: &mut Harness) -> Vec<Action> {
+        h.core.nudge(h.now, &mut Vec::new());
+        let poll = h
+            .core
+            .timers
+            .iter()
+            .find(|(_, (t, _))| matches!(t, Timer::Poll))
+            .map(|(id, _)| *id)
+            .expect("poll timer");
+        let mut all = h.step(Event::Timer { id: poll });
+        let upload = all.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        });
+        if let Some(op) = upload {
+            all.extend(h.step(Event::UploadsDone {
+                op,
+                result: UploadResult::Done { held: 0 },
+            }));
+        }
+        all
+    }
+
+    fn one(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
+        s3_ops(out)
+            .into_iter()
+            .find(|(_, r)| pred(r))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no matching S3 request in {out:?}"))
+    }
+
+    fn any_swap(out: &[Action]) -> bool {
+        s3_ops(out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. }))
+    }
+
+    /// A taker whose next slot was pruned (its GET-next found nothing, the
+    /// LIST finds a later segment) never CASes the lease: it rebuilds the
+    /// replica from the head commit and the acquisition fails, to be
+    /// retried from the new position. Before, the empty probe read as
+    /// "at head", the CAS won, and the takeover marker was created in
+    /// the deleted slot — a forked log.
+    #[test]
+    fn a_takeover_across_a_pruned_gap_rebuilds_instead_of_claiming() {
+        let mut h = Harness::new(1);
+        h.core.cfg.takeover_promise_check = false;
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.now,
+            super::super::jobs::JobReq::Acquire {
+                reason: "test",
+                ask_handoff: false,
+            },
+            &h.meta,
+            &mut out,
+        );
+        let get = one(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease_of(3, 1, h.now.0 - 1), tag())))),
+        });
+        let tail = one(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        assert!(!any_swap(&out), "no CAS before the gap check: {out:?}");
+        let gap = one(&out, |r| matches!(r, S3Op::SegmentGap { from: 1 }));
+        // Segments 1..=5 were pruned; the log resumes at 6.
+        let out = h.step(Event::S3 {
+            op: gap,
+            result: S3Result::SegmentGap(Ok(Some(6))),
+        });
+        assert!(!any_swap(&out), "{out:?}");
+        let rebuild = out
+            .iter()
+            .find_map(|a| match a {
+                Action::RebuildReplica { op } => Some(*op),
+                _ => None,
+            })
+            .expect("a rebuild");
+        assert_eq!(h.core.stats.retention_gaps, 1);
+        let out = h.step(Event::RebuildDone {
+            op: rebuild,
+            ok: true,
+        });
+        assert!(!any_swap(&out), "{out:?}");
+        assert_eq!(h.core.job(), None, "the acquisition ended unacquired");
+        assert!(h.core.lease().held.is_none());
+        // The cursor restarts from the (here: unchanged) replica.
+        assert_eq!(h.core.ship.next_seq, h.meta.applied_seq().unwrap() + 1);
+    }
+
+    /// An empty takeover tail whose LIST says "at head" claims as before.
+    #[test]
+    fn a_takeover_at_the_head_claims_after_its_gap_check() {
+        let mut h = Harness::new(1);
+        h.core.cfg.takeover_promise_check = false;
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.now,
+            super::super::jobs::JobReq::Acquire {
+                reason: "test",
+                ask_handoff: false,
+            },
+            &h.meta,
+            &mut out,
+        );
+        let get = one(&out, |r| matches!(r, S3Op::LeaseGet));
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease_of(3, 1, h.now.0 - 1), tag())))),
+        });
+        let tail = one(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let gap = one(&out, |r| matches!(r, S3Op::SegmentGap { .. }));
+        let out = h.step(Event::S3 {
+            op: gap,
+            result: S3Result::SegmentGap(Ok(None)),
+        });
+        assert!(any_swap(&out), "{out:?}");
+        assert_eq!(h.core.stats.retention_gaps, 0);
+    }
+
+    /// A follower: the first empty probe after a mount is confirmed by a
+    /// LIST; within `gap_check_ms` and without a hint, later empty probes
+    /// are not; a gossip hint at or past the cursor triggers one; a gap
+    /// found rebuilds the replica and ends the round.
+    #[test]
+    fn a_follower_checks_once_at_start_on_hints_and_on_the_backstop() {
+        let mut h = Harness::new(1);
+        h.core.cfg.gap_check_ms = 300_000;
+        h.core.cfg.gap_hint_check_ms = 5_000;
+        // First round after the mount: probe, then one LIST.
+        let out = round(&mut h);
+        let tail = one(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let gap = one(&out, |r| matches!(r, S3Op::SegmentGap { from: 1 }));
+        let _ = h.step(Event::S3 {
+            op: gap,
+            result: S3Result::SegmentGap(Ok(None)),
+        });
+        assert_eq!(h.core.job(), None);
+        // Second round, soon after, no hint: no LIST.
+        h.advance(1_000);
+        let out = round(&mut h);
+        let tail = one(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        assert!(
+            !s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::SegmentGap { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.job(), None);
+        // A hint names segment 10 while the cursor is at 1: the probe's
+        // empty answer is checked, the gap found, the replica rebuilt.
+        h.advance(6_000);
+        let _ = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::SegmentPublished { seq: 10, epoch: 1 },
+        });
+        let out = round(&mut h);
+        let tail = one(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let gap = one(&out, |r| matches!(r, S3Op::SegmentGap { from: 1 }));
+        let out = h.step(Event::S3 {
+            op: gap,
+            result: S3Result::SegmentGap(Ok(Some(8))),
+        });
+        let rebuild = out
+            .iter()
+            .find_map(|a| match a {
+                Action::RebuildReplica { op } => Some(*op),
+                _ => None,
+            })
+            .expect("a rebuild");
+        let _ = h.step(Event::RebuildDone {
+            op: rebuild,
+            ok: true,
+        });
+        assert_eq!(h.core.stats.retention_gaps, 1);
+        assert_eq!(h.core.job(), None, "the round ended");
+        // Much later, no hint: the backstop LIST.
+        h.advance(300_000);
+        let out = round(&mut h);
+        let tail = one(&out, |r| matches!(r, S3Op::SegmentRun { .. }));
+        let out = h.step(Event::S3 {
+            op: tail,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        // A segment that landed between the probe and the LIST is tailed.
+        let gap = one(&out, |r| matches!(r, S3Op::SegmentGap { .. }));
+        let out = h.step(Event::S3 {
+            op: gap,
+            result: S3Result::SegmentGap(Ok(Some(1))),
+        });
+        one(&out, |r| matches!(r, S3Op::SegmentRun { from: 1, .. }));
+    }
+
+    /// A holder never gap-checks: it is the sole appender. (Its round may
+    /// skip the tail altogether, or probe its own stream once.)
+    #[test]
+    fn a_holder_never_gap_checks() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        h.core.ship.held_tail_at = None;
+        let mut out = round(&mut h);
+        if let Some((op, _)) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+        {
+            out = h.step(Event::S3 {
+                op,
+                result: S3Result::SegmentRun(Ok(Vec::new())),
+            });
+        }
+        assert!(
+            !s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::SegmentGap { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.retention_gaps, 0);
+    }
 }
 
 /// Plan 30 §M9 fixes from the backup-crash sweeps (`fix-backup-crash`).
@@ -3893,6 +4164,7 @@ mod backup_crash {
             op: tail,
             result: S3Result::SegmentRun(Ok(Vec::new())),
         });
+        let out = at_head(&mut h, out);
         let cas = find_s3(&out, |r| matches!(r, S3Op::LeaseSwap { .. }));
         // The CAS applies, but its reply is a timeout.
         let _ = h.step(Event::S3 {
@@ -3933,6 +4205,7 @@ mod backup_crash {
             {
                 let result = match req {
                     S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                    S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
                     S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
                     other => panic!("unexpected {other:?}"),
                 };
@@ -4027,7 +4300,7 @@ mod backup_crash {
             op: get,
             result: S3Result::LeaseGet(Ok(Some((mine, tag())))),
         });
-        for _ in 0..4 {
+        for _ in 0..5 {
             if h.core.lease.gate.is_some() {
                 break;
             }
@@ -4037,6 +4310,7 @@ mod backup_crash {
             {
                 let result = match req {
                     S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                    S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
                     S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
                     other => panic!("unexpected {other:?}"),
                 };

@@ -874,6 +874,38 @@ fn find_multi_batch_withdraw_seeds() {
     }
 }
 
+/// Seeds of `flex_crash_config` whose run adopts a carried hold late
+/// (`flex_crash_seed_30299_restarted_member_adopts_the_carried_hold`'s
+/// property); a finder for when a schedule change moves that seed.
+/// `AUTHORITY_SIM_START`/`AUTHORITY_SIM_SEEDS` as for `long_random`.
+#[test]
+#[ignore]
+fn find_late_adopted_hold_seeds() {
+    let start: u64 = std::env::var("AUTHORITY_SIM_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+    let seeds: u64 = std::env::var("AUTHORITY_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
+    for seed in start..start + seeds {
+        match run_seed(seed, flex_crash_config()) {
+            Ok(report) => {
+                let adopted: u64 = report
+                    .stats
+                    .values()
+                    .map(|s| s.epoch_holds_adopted_late)
+                    .sum();
+                if adopted > 0 {
+                    eprintln!("late-adopted hold: seed {seed} ({adopted})");
+                }
+            }
+            Err(e) => eprintln!("seed {seed} failed: {e}"),
+        }
+    }
+}
+
 /// Plan 30 M5 round 5: `release_gated` re-enters itself through `finish`,
 /// so an op later in its ready list can already be finished by the
 /// nested pass; the outer loop then indexed a removed entry (`no entry
@@ -3151,10 +3183,16 @@ fn long_sessions_seed_10146_recovered_segment_is_in_the_base_window() {
 /// carried its own lease with no hold adopted; nobody could hold or
 /// close the epoch and no taker got promises. Now a member restarting
 /// into an open epoch whose carrier is its own lease adopts the hold.
+///
+/// The retention gap check (an extra S3 LIST before a takeover CAS and
+/// on a follower's first empty probe) changed the schedule, and seed
+/// 30299 no longer restarts a member into its own carried epoch; seed
+/// 30908 does (`find_late_adopted_hold_seeds`). 30299 still runs clean.
 #[test]
 fn flex_crash_seed_30299_restarted_member_adopts_the_carried_hold() {
-    let report = run_seed(30299, flex_crash_config())
-        .unwrap_or_else(|e| panic!("flex-crash seed 30299: {e}"));
+    run_seed(30299, flex_crash_config()).unwrap_or_else(|e| panic!("flex-crash seed 30299: {e}"));
+    let report = run_seed(30908, flex_crash_config())
+        .unwrap_or_else(|e| panic!("flex-crash seed 30908: {e}"));
     let adopted: u64 = report
         .stats
         .values()

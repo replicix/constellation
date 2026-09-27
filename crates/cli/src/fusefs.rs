@@ -3162,6 +3162,13 @@ impl ConstellationFs {
 /// the sequencer, the inode's chunks uploaded (write-back included: the
 /// next holder must be able to fetch them), and the local journal synced
 /// (the log too under `--fsync-mode s3`).
+/// The open-orphan hold writer's view of this filesystem (`crate::holds`).
+impl crate::holds::OpenHandles for ConstellationFs {
+    fn open_inos(&self) -> Vec<Ino> {
+        self.opens.lock().unwrap().keys().copied().collect()
+    }
+}
+
 impl crate::locks::LockFlush for ConstellationFs {
     fn flush_for_lock(&self, ino: Ino) -> bool {
         // The release's flush publishes only what its grant still covers:

@@ -179,6 +179,7 @@ fn s3_kind(op: &S3Op) -> &'static str {
         S3Op::LeaseSwap { .. } => "LeaseSwap",
         S3Op::SegmentPut { .. } => "SegmentPut",
         S3Op::SegmentRun { .. } => "SegmentRun",
+        S3Op::SegmentGap { .. } => "SegmentGap",
         S3Op::InboxPut { .. } => "InboxPut",
         S3Op::InboxRun { .. } => "InboxRun",
         S3Op::InboxDrain { .. } => "InboxDrain",
@@ -227,6 +228,10 @@ pub struct DriverDeps {
     /// delay every forwarded-mutation reply this node sends, after the
     /// op executed (bug A's trigger). 0 in production.
     pub fault_reply_delay_ms: u64,
+    /// The open-orphan hold writer (`crate::holds`), nudged after every
+    /// applied segment so a foreign unlink of a locally open file is
+    /// claimed within a round trip. `None` in tools and tests.
+    pub holds: Option<Arc<crate::holds::Holds>>,
 }
 
 /// Plan 30 §M7: frames queued for one log-stream subscriber, at most
@@ -463,6 +468,8 @@ pub fn load_config(
     );
     c.stream_timeout_ms = env_ms("CONSTELLATION_LOG_STREAM_TIMEOUT_MS", c.stream_timeout_ms);
     c.stream_backstop_ms = env_ms("CONSTELLATION_LOG_STREAM_BACKSTOP_MS", c.stream_backstop_ms);
+    c.gap_check_ms = env_ms("CONSTELLATION_LOG_GAP_CHECK_MS", c.gap_check_ms);
+    c.gap_hint_check_ms = env_ms("CONSTELLATION_LOG_GAP_HINT_CHECK_MS", c.gap_hint_check_ms);
     // Plan 30 §M8: read delegations (granted to `cto=strict` readers
     // that ask; on unless `CONSTELLATION_READ_DELEGATIONS` is 0/off/false)
     // and their TTL. A forwarded reply held for recalls answers `Held`
@@ -816,7 +823,28 @@ impl Driver {
             let started = std::time::Instant::now();
             let int_pending = self.int_rx.len();
             let sync_pending = self.sync_rx.len();
+            let applies_segments = matches!(
+                &event,
+                Event::S3 {
+                    result: S3Result::SegmentRun(Ok(run)),
+                    ..
+                } if !run.is_empty()
+            ) || matches!(
+                &event,
+                Event::Peer {
+                    msg: PeerMsg::LogStream {
+                        segment: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            );
             let actions = self.core.handle(now(), event, &*self.deps.meta);
+            if applies_segments {
+                if let Some(holds) = &self.deps.holds {
+                    holds.nudge();
+                }
+            }
             let handled_us = started.elapsed().as_micros() as u64;
             // The mirror first: a FUSE thread must see the releasing flag
             // before the release's IO starts.
@@ -1751,10 +1779,10 @@ impl Driver {
                     let log = self.deps.log.clone();
                     let state_dir = self.deps.state_dir.clone();
                     tokio::spawn(async move {
-                        let ok = match rebuild_deposed(&meta, &log, &state_dir).await {
+                        let ok = match rebuild_replica(&meta, &log, &state_dir).await {
                             Ok(()) => true,
                             Err(error) => {
-                                tracing::warn!(error = %format!("{error:#}"), "rebuilding the deposed replica failed");
+                                tracing::warn!(error = %format!("{error:#}"), "rebuilding the replica failed");
                                 false
                             }
                         };
@@ -3094,6 +3122,9 @@ impl Driver {
                 S3Op::SegmentRun { from, width } => {
                     S3Result::SegmentRun(log.get_run(from, width).await.map_err(s3_failure))
                 }
+                S3Op::SegmentGap { from } => {
+                    S3Result::SegmentGap(log.first_segment_from(from).await.map_err(s3_failure))
+                }
                 S3Op::InboxPut { batch } => {
                     // The inbox carries no pending-chunk list (a P2P forward
                     // does): a manifest goes through it only once its
@@ -3732,11 +3763,18 @@ impl ChunkHandoff {
     }
 }
 
-/// A deposition recovery with uncaptured journal rows (holder capture
-/// off): rebuild the namespace from the shared log through a side replica
-/// bootstrapped from the head commit, and swap it in.
-async fn rebuild_deposed(meta: &Meta, log: &LogStore, state_dir: &std::path::Path) -> Result<()> {
-    let view_path = state_dir.join(".deposition-rebuild.db");
+/// Rebuild the namespace from the shared log through a side replica
+/// bootstrapped from the head commit, and swap it in (`Action::
+/// RebuildReplica`): a deposition recovery with uncaptured journal rows
+/// (holder capture off), or a replica the log was pruned past (`Core::
+/// after_gap_check`). Node-local state — identity, the journal, pending
+/// uploads, `completed` — stays; the replicated namespace is replaced.
+pub(crate) async fn rebuild_replica(
+    meta: &Meta,
+    log: &LogStore,
+    state_dir: &std::path::Path,
+) -> Result<()> {
+    let view_path = state_dir.join(".replica-rebuild.db");
     let _ = std::fs::remove_dir_all(&view_path);
     crate::shipper::bootstrap(&view_path, log)
         .await
@@ -3766,6 +3804,9 @@ pub struct Standalone {
     queue: std::collections::VecDeque<Event>,
     pending_s3: std::collections::VecDeque<(OpId, S3Op)>,
     pending_publish: std::collections::VecDeque<(OpId, u64)>,
+    /// `Action::RebuildReplica`s to run (the retention-gap tests need a
+    /// real one).
+    pending_rebuild: std::collections::VecDeque<OpId>,
     /// Timers due now, fired in order.
     due: std::collections::VecDeque<constellation_authority::TimerId>,
 }
@@ -3813,6 +3854,7 @@ impl Standalone {
             queue: Default::default(),
             pending_s3: Default::default(),
             pending_publish: Default::default(),
+            pending_rebuild: Default::default(),
             due: Default::default(),
         };
         this.absorb(out);
@@ -3831,6 +3873,7 @@ impl Standalone {
         while !self.queue.is_empty()
             || !self.pending_s3.is_empty()
             || !self.pending_publish.is_empty()
+            || !self.pending_rebuild.is_empty()
         {
             self.step().await?;
         }
@@ -3840,6 +3883,12 @@ impl Standalone {
     /// Tail the log to head (no lease touched).
     pub async fn tail_to_head(&mut self) -> Result<()> {
         self.control(Control::TailToHead).await.map(|_| ())
+    }
+
+    /// Ship everything, publish, release the lease and stop (a clean
+    /// unmount's final flush).
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.control(Control::Shutdown).await.map(|_| ())
     }
 
     /// Take the lease if it is free.
@@ -3907,6 +3956,24 @@ impl Standalone {
         } else if let Some((op, req)) = self.pending_s3.pop_front() {
             let result = self.run_s3(req).await;
             self.queue.push_back(Event::S3 { op, result });
+        } else if let Some(op) = self.pending_rebuild.pop_front() {
+            // A real rebuild (the retention-gap tests need one): the side
+            // replica lives in a private temp dir.
+            let dir = std::env::temp_dir().join(format!(
+                "constellation-standalone-rebuild-{}-{}",
+                std::process::id(),
+                op.0
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let ok = match rebuild_replica(&self.meta, &self.log, &dir).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "standalone rebuild failed");
+                    false
+                }
+            };
+            let _ = std::fs::remove_dir_all(&dir);
+            self.queue.push_back(Event::RebuildDone { op, ok });
         } else if let Some((op, epoch)) = self.pending_publish.pop_front() {
             let ok = match self.publisher.as_mut() {
                 Some(p) => match p.publish(epoch).await {
@@ -3945,6 +4012,9 @@ impl Standalone {
             ),
             S3Op::SegmentRun { from, width } => {
                 S3Result::SegmentRun(self.log.get_run(from, width).await.map_err(s3_failure))
+            }
+            S3Op::SegmentGap { from } => {
+                S3Result::SegmentGap(self.log.first_segment_from(from).await.map_err(s3_failure))
             }
             S3Op::InboxPut { .. } => S3Result::InboxPut(Err(CasFailure::Failed("no inbox".into()))),
             S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
@@ -3994,9 +4064,7 @@ impl Standalone {
                         ok: false,
                     })
                 }
-                Action::RebuildReplica { op } => {
-                    self.queue.push_back(Event::RebuildDone { op, ok: false })
-                }
+                Action::RebuildReplica { op } => self.pending_rebuild.push_back(op),
                 // No FUSE views here: nothing unflushed to flush.
                 Action::LockFlush { ino, grant } => self.queue.push_back(Event::LockFlushed {
                     ino,

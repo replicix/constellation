@@ -122,6 +122,15 @@ pub struct Config {
     pub sync_interval_ms: u64,
     pub idle_max_ms: u64,
     pub tail_width: usize,
+    /// How often a follower whose GET-next probe found nothing confirms,
+    /// with one LIST, that the empty probe means "at head" rather than
+    /// "pruned past" (`Core::gap_check_due`; DESIGN.md §14 "Falling
+    /// behind segment GC"). A hint or a stream head past the cursor
+    /// triggers the same check at most every `gap_hint_check_ms`. The
+    /// takeover CAS never relies on the interval: a claim is preceded by
+    /// the check unless a handoff's head was reached.
+    pub gap_check_ms: u64,
+    pub gap_hint_check_ms: u64,
     /// A tree publisher exists (a read-only member has none).
     pub publisher: bool,
     pub publish_every: u64,
@@ -356,6 +365,8 @@ impl Config {
             sync_interval_ms: 500,
             idle_max_ms: 10_000,
             tail_width: 16,
+            gap_check_ms: 300_000,
+            gap_hint_check_ms: 5_000,
             publisher: true,
             publish_every: 32,
             publish_idle_ms: 30_000,
@@ -469,6 +480,9 @@ pub struct Stats {
     pub replay_conflicts: u64,
     pub epoch_markers: u64,
     pub depositions: u64,
+    /// The log was found pruned past this replica's cursor and the
+    /// replica was rebuilt from the head commit.
+    pub retention_gaps: u64,
     pub takeovers: u64,
     pub handoffs_served: u64,
     pub handoffs_declined: u64,
@@ -1040,6 +1054,9 @@ pub struct Core {
     held_back: u64,
     /// An acquisition's classified plan, kept across its takeover tail.
     pending_plan: Option<Plan>,
+    /// When the last retention gap check ran (`None`: never since start,
+    /// so the first empty probe after a mount runs one).
+    gap_checked_at: Option<Ms>,
     marker_attempts: u32,
     ship_attempts: u32,
     ship_purpose: jobs::ShipPurpose,
@@ -1110,6 +1127,7 @@ impl Core {
             publishing: None,
             held_back: 0,
             pending_plan: None,
+            gap_checked_at: None,
             marker_attempts: 0,
             ship_attempts: 0,
             ship_purpose: jobs::ShipPurpose::Journal,

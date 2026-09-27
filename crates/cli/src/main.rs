@@ -17,6 +17,7 @@ mod fsck;
 mod fusefs;
 mod gc;
 mod held;
+mod holds;
 mod inbox;
 mod kernel_inval;
 mod lease;

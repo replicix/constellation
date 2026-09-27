@@ -186,8 +186,12 @@ pub enum LogRecord {
     /// into `completed`, and every dedup site answers the rid with that
     /// errno from then on — a refusal is an outcome, never re-evaluated
     /// (see `docs/reference/features/forwarded-mutations.md`, "The inbox").
-    /// Touches no inode/dentry (see `TouchSet::add`). Only inbox-executed
-    /// ops produce this record; a P2P refusal still rides its reply.
+    /// Touches no inode/dentry (see `TouchSet::add`). The inbox path is
+    /// where it started; plan 30 §M9 made every definitive refusal an
+    /// outcome, so the holder (`core::holder::record_refusal`) and a
+    /// delegate (`core::delegate::record_delegate_refusal`) journal one
+    /// for a P2P-forwarded op too, alongside the reply that carries it —
+    /// a retry by rid after a takeover finds the outcome in the log.
     Refused { rid: Rid, errno: i32 },
     /// Plan 30 §M13: position `(n, i)` of requester `node`'s inbox batch
     /// under `epoch` has an outcome (executed, refused or deduplicated)

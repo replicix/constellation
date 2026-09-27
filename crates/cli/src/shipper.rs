@@ -122,6 +122,45 @@ async fn replay_from(meta: &Meta, log: &LogStore, part: &str, start: u64) -> Res
     Ok(replayed)
 }
 
+/// A mount of an existing replica: if the log was pruned past its
+/// applied position while it was offline (DESIGN.md §14 "Falling behind
+/// segment GC"), rebuild the namespace from the head commit before the
+/// sync task tails — the running core would find the gap on its first
+/// probe (`Core::gap_check_due`), but a mount should not serve a stale
+/// replica even briefly, and a rebuild before any view opens costs no
+/// open handle. Returns whether a rebuild happened. The check is one LIST
+/// with offset (`LogStore::first_segment_from`), the same question the
+/// core asks: nothing at or after `applied + 1` is "at head", `applied +
+/// 1` itself is "there is a tail to apply", anything later is a gap.
+pub async fn rebuild_if_pruned(
+    meta: &Meta,
+    log: &LogStore,
+    state_dir: &std::path::Path,
+) -> Result<bool> {
+    let applied = meta.applied_seq()?;
+    let next = applied + 1;
+    match log
+        .with_partition(PARTITION)
+        .first_segment_from(next)
+        .await
+        .context("checking the log for a retention gap")?
+    {
+        Some(first) if first > next => {
+            tracing::warn!(
+                applied,
+                first_retained = first,
+                "the log was pruned past this replica's position while it was \
+                 offline; rebuilding the namespace from the head commit"
+            );
+            crate::authority_driver::rebuild_replica(meta, log, state_dir)
+                .await
+                .context("rebuilding the replica after a log retention gap")?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Build a fresh local replica from S3. Used when the state dir has no
 /// metadata DB: a fresh mount, or a read-only member, which bootstraps
 /// from commits published by writers exactly like everyone else.
@@ -323,6 +362,128 @@ mod tests {
         assert!(fresh
             .chunk_ref_exists(&constellation_fs_core::ChunkHash([0; 32]))
             .is_ok());
+    }
+
+    /// DESIGN.md §14 "Falling behind segment GC": a replica the log was
+    /// pruned past (offline longer than retention; here `retention_
+    /// segments = 2`) rebuilds itself from the head commit instead of
+    /// stalling on a deleted slot — at mount (`rebuild_if_pruned`), on a
+    /// running tail (the core's gap check), and, the safety half, when it
+    /// tries to take the lease: the takeover never CASes across the gap,
+    /// so no epoch marker is ever created in a pruned slot (before: the
+    /// GET-next `404` read as "at head", the CAS won, and the marker
+    /// forked the log at the old position).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replica_the_log_was_pruned_past_rebuilds_and_never_appends_below_the_head() {
+        use object_store::ObjectStoreExt;
+        let store = StdArc::new(InMemory::new());
+        let backend = store.clone() as StdArc<dyn ObjectStore>;
+        let log = LogStore::new(backend.clone());
+        let mut a = node(&store, 1);
+        // Two followers stop tailing after segment 1: one will tail again
+        // (the follower path), one will try to take the lease (the taker
+        // path). A third never tails before its mount-time check.
+        let mut b = node(&store, 2);
+        let mut c = node(&store, 3);
+        let dir_d = tempfile::TempDir::new().unwrap();
+        let db_d = dir_d.path().join("d.db");
+        a.meta.mkdir(1, "d0", 0o755, 0, 0).unwrap();
+        a.sync().await;
+        b.driver.tail_to_head().await.unwrap();
+        c.driver.tail_to_head().await.unwrap();
+        bootstrap(&db_d, &log).await.unwrap();
+        assert_eq!(b.meta.applied_seq().unwrap(), 1);
+        assert_eq!(Meta::open(&db_d).unwrap().applied_seq().unwrap(), 1);
+
+        // A ships a segment per directory and publishes as it goes; the
+        // head commit's applied position ends far past 1.
+        for i in 1..8 {
+            a.meta.mkdir(1, &format!("d{i}"), 0o755, 0, 0).unwrap();
+            a.sync().await;
+            a.driver.publish().await.unwrap();
+        }
+        let head = a.meta.applied_seq().unwrap();
+        assert!(head >= 8, "{head}");
+        // Retention (the real rule, with a two-segment window and no
+        // completion floor) prunes everything below `applied - 2`.
+        let config = crate::gc::GcConfig {
+            horizon_ms: 0,
+            retention_segments: 2,
+            lease_ttl_ms: 1,
+            completion_retention_ms: 0,
+        };
+        let marks = crate::gc::metadata_candidates(
+            &backend,
+            None,
+            &config,
+            constellation_store_s3::lease::now_unix_ms(),
+        )
+        .await
+        .unwrap();
+        assert!(!marks.is_empty());
+        for mark in &marks {
+            store
+                .delete(&object_store::path::Path::from(mark.key.as_str()))
+                .await
+                .unwrap();
+        }
+        let retained = log.list_segments().await.unwrap();
+        let floor = *retained.first().unwrap();
+        assert!(
+            floor > 2,
+            "segment 2 (B's next slot) was pruned: {retained:?}"
+        );
+        a.driver.shutdown().await.unwrap();
+
+        // The follower path: B's tail-to-head finds the gap and rebuilds.
+        b.driver.tail_to_head().await.unwrap();
+        assert_replicas_equal(&b.meta, &a.meta);
+        assert_eq!(b.meta.applied_seq().unwrap(), a.meta.applied_seq().unwrap());
+        assert_eq!(
+            log.list_segments().await.unwrap(),
+            retained,
+            "a follower's rebuild writes nothing to the log"
+        );
+
+        // The taker path: C tries to take the released lease from its
+        // stale position. The acquisition ends unacquired, the replica is
+        // rebuilt, and the log is untouched — no marker in the pruned
+        // slot 2.
+        assert!(
+            !c.driver.acquire().await.unwrap(),
+            "an acquisition across a pruned gap must not succeed"
+        );
+        assert_eq!(
+            log.list_segments().await.unwrap(),
+            retained,
+            "no segment was created below the head"
+        );
+        assert_replicas_equal(&c.meta, &a.meta);
+        // From the rebuilt position the next acquisition succeeds (A
+        // released cleanly: no epoch marker is needed) and C's first ship
+        // lands at head + 1.
+        assert!(c.driver.acquire().await.unwrap());
+        assert_eq!(log.list_segments().await.unwrap(), retained);
+        c.meta.mkdir(1, "from-c", 0o755, 0, 0).unwrap();
+        c.driver.sync().await.unwrap();
+        let after = log.list_segments().await.unwrap();
+        assert_eq!(after.first(), Some(&floor));
+        assert_eq!(*after.last().unwrap(), head + 1, "{after:?}");
+
+        // The mount path: a replica opened at its old position is
+        // rebuilt before anything tails.
+        let meta_d = Meta::open(&db_d).unwrap();
+        assert!(rebuild_if_pruned(&meta_d, &log, dir_d.path())
+            .await
+            .unwrap());
+        assert!(meta_d.applied_seq().unwrap() >= head);
+        assert!(meta_d.child_ino(1, "d7").unwrap().is_some());
+        assert!(
+            !rebuild_if_pruned(&meta_d, &log, dir_d.path())
+                .await
+                .unwrap(),
+            "a replica inside the retained log is left alone"
+        );
     }
 
     /// A bootstrap base older than the log's retention floor must fail

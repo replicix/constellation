@@ -154,6 +154,13 @@ pub enum S3Op {
     /// GET-next: the contiguous run of segments from `from`, `width` in
     /// flight.
     SegmentRun { from: Seq, width: usize },
+    /// The lowest segment at or after `from` that exists (one LIST with
+    /// offset, first key only): the retention gap check behind an empty
+    /// `SegmentRun` (`Core::gap_check_due`). `None` says `from` is the
+    /// head; `Some(from)` says a segment landed meanwhile; `Some(later)`
+    /// says retention pruned `from..later` and the replica must be
+    /// rebuilt from the head commit.
+    SegmentGap { from: Seq },
     /// M13: CAS-create `inbox/<epoch>/<node>/<n>` (`InboxStore::put_batch`;
     /// a key already holding this very batch counts as landed).
     InboxPut { batch: InboxBatch },

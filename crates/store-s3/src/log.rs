@@ -216,6 +216,37 @@ impl LogStore {
         Ok(seqs)
     }
 
+    /// The lowest segment sequence at or after `from` that exists, from
+    /// one LIST-with-offset that reads only its first key. This is the
+    /// authoritative answer to the question a GET-next `404` cannot
+    /// settle: "is `from` the head, or was it pruned?" — `None` says
+    /// head, `Some(from)` says a segment landed in the meantime, and
+    /// `Some(later)` says retention removed `from..later` (DESIGN.md
+    /// §14 "Falling behind segment GC"). Every S3 this project targets
+    /// lists strongly consistently after a write, and a segment is
+    /// never overwritten, so the answer cannot go stale in the direction
+    /// that matters: a `None` or `Some(from)` may become `Some(from)` as
+    /// the holder appends, but a pruned gap never closes.
+    pub async fn first_segment_from(&self, from: u64) -> Result<Option<u64>, StoreError> {
+        let prefix = layout::log_prefix(&self.partition);
+        let offset = layout::log_segment(&self.partition, from.saturating_sub(1));
+        let mut stream = self.store.list_with_offset(Some(&prefix), &offset);
+        while let Some(meta) = stream.try_next().await? {
+            let Some(seq) = meta
+                .location
+                .filename()
+                .and_then(|name| name.strip_suffix(".zst"))
+                .and_then(|name| u64::from_str_radix(name, 16).ok())
+            else {
+                continue; // the `sealed` marker
+            };
+            if seq >= from {
+                return Ok(Some(seq));
+            }
+        }
+        Ok(None)
+    }
+
     /// Mark this partition's stream sealed (after a merge into a parent).
     pub async fn seal(&self) -> Result<(), StoreError> {
         self.store
@@ -341,6 +372,26 @@ mod tests {
             "a saturated run is what tells the tailer it may be far behind"
         );
         assert!(s.get_run(1, 0).await.unwrap().is_empty());
+    }
+
+    /// The gap probe behind a GET-next `404`: head, a segment that
+    /// landed meanwhile, or a pruned range.
+    #[tokio::test]
+    async fn first_segment_from_tells_head_from_a_pruned_gap() {
+        let s = ls();
+        for seq in [3u64, 4, 5] {
+            s.put_segment(seq, b"x").await.unwrap();
+        }
+        s.seal().await.unwrap();
+        // 1 and 2 were pruned: a replica at applied=0 or 1 has a gap.
+        assert_eq!(s.first_segment_from(1).await.unwrap(), Some(3));
+        assert_eq!(s.first_segment_from(2).await.unwrap(), Some(3));
+        // At the head, or inside the retained range: exact.
+        assert_eq!(s.first_segment_from(3).await.unwrap(), Some(3));
+        assert_eq!(s.first_segment_from(5).await.unwrap(), Some(5));
+        assert_eq!(s.first_segment_from(6).await.unwrap(), None);
+        assert_eq!(s.first_segment_from(u64::MAX).await.unwrap(), None);
+        assert_eq!(ls().first_segment_from(1).await.unwrap(), None);
     }
 
     #[tokio::test]

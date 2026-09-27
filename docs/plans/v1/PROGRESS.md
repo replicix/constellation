@@ -25241,3 +25241,78 @@ kill; id 5 claimed by the `rm -rf`'d state dir's P2P-off mount). That is
 the expected consequence of wiping a state dir (the id lives there, the
 key on the host); peers dialling id 1 reach id 5's endpoint. Worth a
 look at how a dead, never-retired id ages out, but it is not the hang.
+
+## Fix: GC lease fencing, log-retention gap, orphan holds
+
+Three safety findings from the DESIGN.md rewrite, verified against the
+code and fixed (branch `fix-gc-retention`).
+
+**1. The `_gc` lease lapsed before a round deleted (real).**
+`SingletonLease` had acquire/release only, while a chunk round sleeps
+one lease TTL after publishing its condemned pointer and the metadata
+phase sleeps another. A second round (every daemon's daily tick, or a
+manual `gc run`) could take the lapsed lease and publish a new pointer
+that omitted the first round's still-undeleted hashes (`known` excluded
+anything already condemned), so a writer's `CondemnedView` verdict was
+`Sound` on a chunk the first round was deleting — the premise of the
+whole dedup/GC argument. Fix: `SingletonLease::renew` (a CAS on the
+lease object's ETag; `Fenced` on conflict) and `hold_for` (the grace
+wait, renewing every TTL/3). `gc::run_chunks` is split into
+`mark_chunks` and `sweep_chunks`; the sweep renews before its first
+delete and every 64 deletes, and stops on `Fenced` however long the
+process was paused. `mtree_gc::run` renews through its grace wait and
+before blob deletes, dead-pack deletes, every compaction batch and the
+incomplete-pack deletes. The candidate pass no longer skips hashes on
+the current pointer (carry-over), so a new round's pointer lists every
+chunk an interrupted round could still delete; the argument is written
+in `run_chunks`'s doc and DESIGN.md §14. Holds are re-read at delete
+time too.
+
+**2. A replica behind log GC never noticed (real, and a fork).** The
+running tail probed `applied + 1` only; a node offline past retention
+read the `404` as "at head", and a takeover CAS from that position
+created its epoch marker in the deleted slot. Fix: `S3Op::SegmentGap`
+(`LogStore::first_segment_from`: one LIST with offset, first key) —
+always before a takeover CAS unless the acquisition reached a handoff's
+head or re-adopts this node's own lease; on a running tail when a hint
+or the stream head passes the cursor (rate-limited by
+`CONSTELLATION_LOG_GAP_HINT_CHECK_MS`), once on the first empty probe
+after a mount, and every `CONSTELLATION_LOG_GAP_CHECK_MS` (5 min) as a
+backstop; never on a holder. A gap rebuilds the replica in place
+(`Action::RebuildReplica`, the deposition rebuild generalised to
+`rebuild_replica`), resets the cursor, and ends the job (an acquisition
+unacquired). `shipper::rebuild_if_pruned` does the same at mount before
+anything tails. `Stats.retention_gaps` counts them.
+
+**3. Nothing wrote `holds/` (real).** `live_manifests` walks the `ns`
+inode range only; a foreign unlink moves the record to the node-local
+`orphans` keyspace, so an orphan held open on B protected nothing, and
+its chunks (old enough for the horizon: a long-open file) were deleted
+under B's handle. New `cli::holds`: a per-node task that writes
+`holds/<node:016x>.json` (inodes + every chunk hash their manifests
+name, `expires_unix_ms` three refresh periods out), re-stamped every
+`CONSTELLATION_HOLD_REFRESH_MS` (half the lease TTL) and nudged by the
+sync task after every applied segment; withdrawn when the set empties
+and at a clean unmount. The same pass reaps orphans no view has open
+(they used to linger until the next bootstrap). DESIGN §3 now states
+what the asynchrony guarantees and what it does not.
+
+Also: the stale `LogRecord::Refused` comment (holder and delegates
+journal refusals too) and the dead `layout::registry` helper
+(`layout::hold` now takes a `u64` and has a `holds_prefix` sibling).
+
+**Tests.** `singleton`: lapse + takeover fences the first holder. `gc`:
+carry-over; a paused round deletes nothing once another round took the
+lease (two replicas, the second seeing the chunk live); a chunk held
+open on another node survives GC and is reclaimed after the close.
+`holds`: claim, reap, withdraw, and `gc::hold_roots` reads it. `log`:
+`first_segment_from`. Core: takeover across a pruned gap rebuilds
+instead of claiming (no `LeaseSwap` ever); at head it claims after the
+check; a follower checks once at start, on hints, and on the backstop;
+a holder never checks. `shipper`: a replica pruned past rebuilds on a
+tail, a takeover from it never appends below the head, and the mount
+check rebuilds. Harness: `gc-open-orphan-hold`,
+`log-retention-gap-follower` (SIGSTOP'd follower), `log-retention-gap-
+taker` (restarted node is the taker at mount); both gap scenarios
+assert every segment stays above the pruned floor and a fresh node
+verifies the model.
