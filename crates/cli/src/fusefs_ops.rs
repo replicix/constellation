@@ -62,6 +62,7 @@ impl Filesystem for FuseFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
+        let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(name, reply);
         match self.lookup_synthetic(parent, &name) {
             Ok(Some((_ino, attr))) => {
@@ -206,6 +207,7 @@ impl Filesystem for FuseFs {
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
+        let _inflight = self.inflight.enter(&[ino]);
         let atime_ns = _atime.map(time_or_now_ns);
         let mtime_ns = mtime.map(time_or_now_ns);
         // An explicit atime set must drop any queued read-bump for this
@@ -290,6 +292,7 @@ impl Filesystem for FuseFs {
     ) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
+        let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(name, reply);
         let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
@@ -336,6 +339,7 @@ impl Filesystem for FuseFs {
     ) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
+        let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(name, reply);
         let kind = match mode & libc::S_IFMT {
             libc::S_IFREG | 0 => InodeKind::File,
@@ -395,6 +399,7 @@ impl Filesystem for FuseFs {
         let newparent = newparent.0;
         let ino = self.real_ino(ino);
         let newparent = self.real_ino(newparent);
+        let _inflight = self.inflight.enter(&[ino, newparent]);
         let name = checked_name!(newname, reply);
         let op = constellation_meta::MutateOp::Link {
             ino,
@@ -423,6 +428,7 @@ impl Filesystem for FuseFs {
     ) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
+        let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(name, reply);
         let caller = Caller {
             uid: req.uid(),
@@ -460,6 +466,7 @@ impl Filesystem for FuseFs {
     ) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
+        let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(link_name, reply);
         let target = target.to_string_lossy();
         let ino = match self.meta.allocate_ino(parent) {
@@ -487,6 +494,7 @@ impl Filesystem for FuseFs {
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
+        let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(name, reply);
         let target = self.meta.lookup(parent, &name);
         let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
@@ -538,6 +546,7 @@ impl Filesystem for FuseFs {
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let parent = parent.0;
         let parent = self.real_ino(parent);
+        let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(name, reply);
         let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some())
@@ -581,6 +590,7 @@ impl Filesystem for FuseFs {
         let newparent = newparent.0;
         let parent = self.real_ino(parent);
         let newparent = self.real_ino(newparent);
+        let _inflight = self.inflight.enter(&[parent, newparent]);
         let name = name.to_string_lossy().into_owned();
         let newname = newname.to_string_lossy().into_owned();
         let src_scratch = self.meta.is_scratch_dir(parent).unwrap_or(false)
@@ -745,6 +755,7 @@ impl Filesystem for FuseFs {
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
+        let _inflight = self.inflight.enter(&[ino]);
         if ConstellationFs::is_synthetic(ino) {
             match self.read_frozen(ino, offset, size as u64) {
                 Ok(data) => reply.data(&data),
@@ -776,6 +787,7 @@ impl Filesystem for FuseFs {
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
+        let _inflight = self.inflight.enter(&[ino]);
         if ConstellationFs::is_synthetic(ino) {
             reply.error(Errno::from_i32(libc::EROFS));
             return;
@@ -928,6 +940,7 @@ impl Filesystem for FuseFs {
         let ino = ino.0;
         let visible_ino = ino;
         let ino = self.real_ino(ino);
+        let _inflight = self.inflight.enter(&[ino]);
         if ConstellationFs::is_synthetic(ino) {
             let entries = match self.synthetic_entries(ino) {
                 Ok(entries) => entries,
@@ -1285,6 +1298,7 @@ impl Filesystem for FuseFs {
     ) {
         let ino = ino.0;
         let ino = self.real_ino(ino);
+        let _inflight = self.inflight.enter(&[ino]);
         gate!(self, ino, reply);
         if self.lock_fenced(ino) {
             reply.error(Errno::from_i32(libc::EIO));

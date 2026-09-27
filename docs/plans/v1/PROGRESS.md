@@ -25591,3 +25591,111 @@ check rebuilds. Harness: `gc-open-orphan-hold`,
 taker` (restarted node is the taker at mount); both gap scenarios
 assert every segment stays above the pruned floor and a fresh node
 verifies the model.
+
+## Fix: FUSE reverse-invalidation deadlock
+
+EC2 campaign 6 finding B-1's residue: `a432373` made `mount`/`status`
+survive a `kill -9`ed daemon that lingers as a zombie with one thread in
+`fuse_reverse_inval_entry`; this fixes why the thread is there and what
+releases it.
+
+**Mechanism (confirmed against Linux v6.8 `fs/fuse/dir.c`, `dev.c`).** A
+kernel invalidation is a `write(2)` on `/dev/fuse` served synchronously:
+`FUSE_NOTIFY_INVAL_ENTRY` → `fuse_notify_inval_entry` takes
+`down_read(&fc->killsb)` and calls `fuse_reverse_inval_entry`, which
+takes the parent directory's `i_rwsem` with `inode_lock_nested` — a
+plain `down_write`, neither interruptible nor killable.
+`FUSE_NOTIFY_INVAL_INODE` with a byte range locks the file's pages
+(`invalidate_inode_pages2_range`). The VFS holds that same `i_rwsem` for
+every `lookup` (slow path), `create`, `mkdir`, `mknod`, `symlink`,
+`link`, `unlink`, `rmdir`, `rename`, `readdir` and directory `setattr`
+from before the request is queued to the daemon until the daemon answers
+it; `read`/`write` hold page locks the same way. So a notification for a
+directory with a request in flight blocks until that request is
+answered. Alive, that only parks the invalidation thread (nothing waits
+on it: the queue has no back-pressure, the one waiter — the lock-grant
+path — is bounded); it does *not* hang FUSE requests, and a daemon-side
+deadlock was not found (the `InodeOps` lock, the write shards, the meta
+funnel and the session wait are never held while a notification is
+written, and no FUSE worker waits for the thread). `kill -9`ed in that
+state it is fatal: the kernel ends the dead daemon's requests only when
+its last `/dev/fuse` descriptor closes (`fuse_dev_release` →
+`fuse_abort_conn` at `dev_count == 0`), the descriptors close only when
+the last thread exits, and the blocked thread cannot exit until the
+request it waits on ends — a cycle only `/sys/fs/fuse/connections/<n>/
+abort` (or `umount -f`) breaks; a plain `umount` blocks on `killsb`
+behind it. The connection's `waiting=2` in the campaign evidence is that
+request plus the operator's `stat`. Reproduced locally in the harness on
+the first try (`fuse-inval-storm`, below): the killed holder's
+`kernel-inval` thread in `fuse_reverse_inval_entry`, D state, leader `Z`
+with SIGKILL pending, connection `waiting=3`, released by the abort.
+Campaign 5's E-1 (hung `CREATE`) is *not* this mechanism: a
+notification blocked behind a `CREATE` never delays the `CREATE`'s
+answer; E-1's request was unanswered by the daemon itself.
+
+**Fix.**
+- `kernel_inval`: notifications still come from the one dedicated
+  thread over a queue nothing blocks on, but the thread now decides
+  under its lock and sends outside it, coalesces (one pending entry per
+  invalidation, the latest apply's deadline), and *holds a notification
+  back while a FUSE request is known to be in flight on its inode*
+  (`InFlight`, an `InFlightGuard` at the top of every handler during
+  which the kernel holds a lock a notification needs: `lookup`,
+  `readdir`, `setattr`, the namespace mutations, `read`, `write`,
+  `fallocate`; the lock requests are not counted, so the M14 pre-grant
+  invalidation is unaffected). It is sent the moment the last such
+  request is answered (the guard drop wakes the thread) and *dropped*
+  once held back longer than `DEFER_MAX` (lookup TTL + 500 ms): what the
+  kernel cached before the apply has expired by then, so sending would
+  only park the thread for that request's whole service time. The
+  residual window is the kernel's enqueue-to-read gap and the
+  check-to-`inode_lock` race, microseconds each, but under a storm on
+  one directory that directory's `i_rwsem` is held almost continuously,
+  so the window is hit (1 of 3 kills in the scenario). A watchdog logs a
+  notification blocked longer than `CONSTELLATION_KERNEL_INVAL_STALL_S`
+  (5 s) with the in-flight count on its inode.
+- Because that window cannot be closed from user space, two releases:
+  `daemon_lock::abort_stale_mounts` — the daemon records each view
+  (`<state_dir>/mounts/<id>`: mountpoint, fs name) and whoever next
+  takes `daemon.lock` aborts the recorded mounts' FUSE connections from
+  `/proc/self/mountinfo` (a FUSE superblock's `0:<minor>` is the
+  connection number; the fusectl files belong to the mounting user) —
+  and a *zombie reaper*: `constellation zombie-reaper` (hidden), a tiny
+  separate process each daemon spawns with no descriptor of its own,
+  which polls `daemon.lock`'s holder every 500 ms, exits when the lock
+  is released, and once the kernel classifies its parent as wedged
+  (`daemon_lock::classify`, the takeover's own verdict) for 2 s aborts
+  the recorded mounts and logs to `<state_dir>/reaper.log`. The zombie,
+  its lock and its socket then go within seconds instead of at the next
+  mount.
+
+**Harness.** `fuse-inval-storm`: three nodes, 2 workers each,
+create+write/rename/unlink/readdir in one shared directory at full speed
+for 12 s per round, kill -9 of the lease holder mid-load, 3 rounds; no
+completed op over 45 s, no worker hangs, the holder exits within 5 s
+(`Client::kill9_within`, which on a wedge reports every thread's state
+and `wchan` and aborts the connection itself), remount within 60 s, the
+directory converges everywhere, no conflict. `Client::kill9_within`;
+`zombie_diagnosis` reads only `status`/`comm`/`wchan` (a task's `stat`
+blocks behind the wedge).
+
+**Results** (branch `fix-fuse-inval-deadlock`, prefix
+`constellation-harness-fuseinval`):
+- `kernel_inval` unit tests (14: coalescing, gating on one and two
+  requests, attribute-only never held back, drop past the bound with the
+  waiter told, a blocked send blocks no `InFlightGuard` and is visible
+  to the watchdog, the watchdog's repeat period) and `daemon_lock` (9,
+  incl. mountinfo parsing and stale-record handling); cli 262 and
+  harness 14 unit tests pass; clippy and fmt clean.
+- `fuse-inval-storm` PASS: 53,966 ops, p50 1.3 ms, p99 31 ms, max 1.66
+  s (a lease failover), 0 errors on surviving nodes; holder exit after
+  kill -9: 20 ms, 20 ms, 2.53 s — the third kill landed in the residual
+  window (`kernel-inval` in `fuse_reverse_inval_entry`, 2 requests
+  waiting) and the reaper aborted the connection; remounts 1.3–2.5 s;
+  no invalidation stall warning. Rerun after the rebase onto `f5fb658`:
+  PASS, 40,480 ops, every holder exit 20 ms (0/3 reaped).
+- `holder-kill-rejoin` PASS (10 rounds; remount p50 106 ms, max 110 ms;
+  first write after a remount p50 6.7 ms, max 10.4 s), `git-under-flock`
+  PASS, `git-under-flock-rounds` PASS, `chaos-ci` PASS.
+- pjdfstest (private compose project, floci on 14566, `--no-cache`
+  image): 8798 passed, 0 failed, empty baseline.

@@ -185,6 +185,18 @@ enum Command {
         #[arg(long)]
         s3: Option<String>,
     },
+    /// (internal) The daemon's zombie reaper: watches the daemon that
+    /// spawned it and, once the kernel has killed it but a thread wedged
+    /// inside a FUSE notification keeps it a zombie holding its mounts,
+    /// lock and socket (campaign 6 B-1), aborts those mounts' FUSE
+    /// connections so the zombie can go.
+    #[command(hide = true)]
+    ZombieReaper {
+        #[arg(long)]
+        parent: u32,
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Show filesystem information from the backend, or live daemon
     /// status (spool backlog, cache, every mounted view) from a
     /// registered name / mount's state dir.
@@ -1040,6 +1052,7 @@ fn main() -> Result<()> {
         Command::Fs {
             command: FsCommand::List,
         } => cmd_fs_list(&rt),
+        Command::ZombieReaper { parent, state_dir } => daemon_lock::reaper_main(parent, &state_dir),
         Command::Doctor { target, s3 } => {
             let reg = registry::Registry::load()?;
             let t = target::resolve(&target, &reg);
@@ -2032,6 +2045,25 @@ fn cmd_mount_body(
                 took_over,
                 "daemon.lock taken: this process becomes the daemon"
             );
+            // Whatever the previous daemon of this state dir left
+            // mounted serves nothing any more; a mount it left wedged
+            // (campaign 6 B-1) would hang the stale-mountpoint check
+            // below and keep its zombie alive until aborted.
+            for stale in daemon_lock::abort_stale_mounts(state_dir) {
+                tracing::warn!(
+                    %stale,
+                    "a mount of the previous daemon of this state dir was left behind"
+                );
+                if stale.connection.is_some() {
+                    eprintln!("previous daemon's mount left behind: {stale}");
+                }
+            }
+            // And should this daemon end the same way, its reaper does
+            // the abort within seconds instead of at the next mount.
+            match daemon_lock::spawn_reaper(state_dir) {
+                Ok(pid) => tracing::info!(reaper_pid = pid, "zombie reaper started"),
+                Err(e) => tracing::warn!(error = %e, "the zombie reaper could not be started"),
+            }
             startup::phase("starting the node runtime");
             let handle = rt.handle().clone();
             let node = match node_runtime::NodeRuntime::start(

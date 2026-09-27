@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 /// The index of the client that holds the lease, within `deadline`. On
 /// failure, every node's lease and acknowledgement state and log tail.
-fn current_holder(clients: &[Client], deadline: Duration) -> Result<usize> {
+pub(super) fn current_holder(clients: &[Client], deadline: Duration) -> Result<usize> {
     let mut holder = None;
     let waited = eventually("some node holds the lease", deadline, || {
         for (i, c) in clients.iter().enumerate() {

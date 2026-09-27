@@ -193,7 +193,8 @@ Plan 30 M6–M8. See [Close-to-open modes](features/cto-modes.md).
 | `CONSTELLATION_LOG_GAP_HINT_CHECK_MS` | `5000` | milliseconds; `0` means the default | the same check, at most this often, when a gossip hint or the stream's head lies past the cursor |
 | `CONSTELLATION_LOG_STREAM_QUEUE` | `1024` | frames, positive | frames queued per subscriber |
 | `CONSTELLATION_LOG_STREAM_BUFFER_BYTES` | `33554432` (32 MiB) | bytes, positive | segment bytes queued per subscriber before the holder drops it back to S3 tailing. The holder never waits for a subscriber |
-| `CONSTELLATION_KERNEL_INVALIDATE` | on | boolean | push kernel entry and inode invalidations for records applied from other nodes |
+| `CONSTELLATION_KERNEL_INVALIDATE` | on | boolean | push kernel entry and inode invalidations for records applied from other nodes. A notification is held back while a FUSE request is in flight on its inode (the kernel would block it behind that request) and dropped once it is older than the lookup TTL |
+| `CONSTELLATION_KERNEL_INVAL_STALL_S` | `5` | seconds, positive | a kernel invalidation blocked in the kernel longer than this is logged at WARN with the request count in flight on its inode |
 
 ### Backups, acknowledgement, and failover
 

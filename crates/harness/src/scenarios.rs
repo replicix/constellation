@@ -19,6 +19,9 @@ mod ec2;
 /// EC2 campaign 4 B-1/B-2: a git repository committed to by two nodes
 /// taking turns under `flock`.
 mod gitflock;
+/// EC2 campaign 6 B-1: FUSE reverse invalidations under sustained
+/// directory mutation from every node, with the holder `kill -9`ed.
+mod inval_storm;
 /// Plan 30 §M10: flexible-quorum continuation epochs.
 mod m10;
 /// Plan 30 §M11: delegated sub-sequencers, one log.
@@ -834,6 +837,12 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "campaign 6 B-1: four nodes, backups on; HOLDER_KILL_ROUNDS (10) rounds of kill -9 the lease holder (plain, with a flock held on it, or a backup instead) and remount it with P2P on within 60 s, then every node converges; prints the remount-time distribution",
         requires: &[],
         run: rejoin::holder_kill_rejoin,
+    },
+    Scenario {
+        name: "fuse-inval-storm",
+        desc: "campaign 6 B-1 (the deadlock): three nodes create, rename and unlink in one shared directory at full speed for INVAL_STORM_SECS (12) s per round, so every node's kernel is invalidated for the others' ops while it has requests in flight on that directory; INVAL_STORM_ROUNDS (3) rounds, each with kill -9 of the lease holder mid-load: no op exceeds its bound, no worker hangs, the killed daemon exits within 5 s (no zombie wedged in fuse_reverse_inval_entry), it remounts within 60 s and the directory converges everywhere",
+        requires: &[],
+        run: inval_storm::fuse_inval_storm,
     },
     Scenario {
         name: "stale-daemon-lock",

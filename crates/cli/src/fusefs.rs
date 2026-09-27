@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
-const TTL: Duration = Duration::from_secs(1);
+pub(crate) const TTL: Duration = Duration::from_secs(1);
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_STATFS_TTL_S: u64 = 5;
 
@@ -804,6 +804,9 @@ pub struct FsDependencies {
     /// and the control plane; the setxattr gate records the last policy
     /// parse rejection here.
     pub prune_stats: Arc<crate::prune::PruneStats>,
+    /// The kernel invalidation thread's registry of FUSE requests in
+    /// flight (`kernel_inval`); `InFlight::disabled()` without one.
+    pub inflight: crate::kernel_inval::InFlight,
 }
 
 const SYNTHETIC_INO_BIT: u64 = 1 << 63;
@@ -881,6 +884,10 @@ pub struct ConstellationFs {
     pub(crate) atime: Arc<crate::atime::AtimeAccumulator>,
     /// Prune counters (plan 22), shared node-wide.
     pub(crate) prune_stats: Arc<crate::prune::PruneStats>,
+    /// Requests in flight, for the kernel invalidation thread: a
+    /// notification for an inode with a request in flight would block
+    /// in the kernel until that request is answered (`kernel_inval`).
+    inflight: crate::kernel_inval::InFlight,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -1022,6 +1029,7 @@ impl ConstellationFs {
             statfs_ttl: statfs_ttl_from_env(),
             atime: deps.atime,
             prune_stats: deps.prune_stats,
+            inflight: deps.inflight,
         }
     }
 
@@ -3704,6 +3712,7 @@ mod quota_tests {
                     crate::atime::AtimeStats::new(),
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
+                inflight: crate::kernel_inval::InFlight::disabled(),
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,
@@ -3981,6 +3990,7 @@ mod quota_tests {
                     crate::atime::AtimeStats::new(),
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
+                inflight: crate::kernel_inval::InFlight::disabled(),
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,
@@ -4050,6 +4060,7 @@ mod pending_row_tests {
                     crate::atime::AtimeStats::new(),
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
+                inflight: crate::kernel_inval::InFlight::disabled(),
             },
             chunk,
             CompressionSetting::RAW,
@@ -4572,6 +4583,7 @@ mod durable_ack_tests {
                     crate::atime::AtimeStats::new(),
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
+                inflight: crate::kernel_inval::InFlight::disabled(),
             },
             constellation_fs_core::DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,

@@ -557,6 +557,67 @@ impl Client {
         Ok(())
     }
 
+    /// [`Self::kill9`] that requires the process to be gone within
+    /// `within`: how long it took. A `kill -9`ed daemon whose last thread
+    /// is wedged in the kernel (EC2 campaign 6 B-1: inside a FUSE
+    /// reverse-invalidation write, behind a request it can no longer
+    /// answer) stays a zombie instead; that fails with the zombie's
+    /// thread states and `wchan`s — after aborting its FUSE connection so
+    /// the mount, the zombie and the lock are cleaned up all the same.
+    pub fn kill9_within(&mut self, within: Duration) -> Result<Duration> {
+        let mut child = self.child.take().context("not mounted")?;
+        let pid = child.id();
+        child.kill().context("SIGKILL")?;
+        let t = Instant::now();
+        let mut exited = false;
+        while t.elapsed() < within {
+            if child.try_wait()?.is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let took = t.elapsed();
+        let diagnosis = if exited {
+            None
+        } else {
+            Some(zombie_diagnosis(pid))
+        };
+        if !exited {
+            // Release it: abort the connection of its mount, which ends
+            // the requests its wedged thread waits behind.
+            if let Some(n) = fuse_connection_of(&self.mnt) {
+                let _ = std::fs::write(format!("/sys/fs/fuse/connections/{n}/abort"), "1\n");
+            }
+            let t2 = Instant::now();
+            while t2.elapsed() < Duration::from_secs(10) && child.try_wait()?.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        // The kernel keeps a dead FUSE mount around; detach it (bounded:
+        // a detach of a wedged mount would itself hang).
+        if let Ok(mut fm) = Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(&self.mnt)
+            .spawn()
+        {
+            let t3 = Instant::now();
+            while t3.elapsed() < Duration::from_secs(10) && fm.try_wait()?.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if fm.try_wait()?.is_none() {
+                let _ = fm.kill();
+            }
+        }
+        match diagnosis {
+            None => Ok(took),
+            Some(d) => bail!(
+                "{} (pid {pid}) did not exit within {within:?} of kill -9: {d}",
+                self.name
+            ),
+        }
+    }
+
     /// Freeze the daemon (SIGSTOP): the process stays alive with its
     /// mount and unshipped journal intact but stops renewing its lease —
     /// the "unreachable holder" case from DESIGN.md §4.
@@ -820,6 +881,73 @@ impl Drop for Client {
             let _ = child.wait();
         }
     }
+}
+
+/// What `/proc` says about a process that did not exit after `kill -9`:
+/// its state and thread count, and every thread's state and `wchan`
+/// (readable without root, unlike `stack`).
+fn zombie_diagnosis(pid: u32) -> String {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let mut out = String::new();
+    for key in ["State:", "Threads:", "SigPnd:", "ShdPnd:"] {
+        if let Some(line) = status.lines().find(|l| l.starts_with(key)) {
+            out.push_str(
+                line.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .as_str(),
+            );
+            out.push_str("; ");
+        }
+    }
+    if out.is_empty() {
+        return format!("/proc/{pid} is gone (reaped by someone else?)");
+    }
+    // Only `status`, `comm` and `wchan`: reading a task's `stat` can
+    // block behind the very thing being diagnosed (`do_task_stat` takes
+    // locks a thread stuck in the kernel may hold).
+    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        for task in tasks.flatten() {
+            let tid = task.file_name().to_string_lossy().into_owned();
+            let state = std::fs::read_to_string(task.path().join("status"))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("State:"))
+                        .map(|l| l.trim_start_matches("State:").trim().to_string())
+                })
+                .unwrap_or_else(|| "?".into());
+            let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            let wchan = std::fs::read_to_string(task.path().join("wchan")).unwrap_or_default();
+            out.push_str(&format!(
+                "thread {tid} ({}): {state} in {}; ",
+                comm.trim(),
+                wchan.trim()
+            ));
+        }
+    }
+    out
+}
+
+/// The FUSE connection number (`/sys/fs/fuse/connections/<n>`) of the
+/// mount at `mountpoint`, from `/proc/self/mountinfo` (a FUSE
+/// superblock's device is `0:<n>`).
+fn fuse_connection_of(mountpoint: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let want = mountpoint.to_string_lossy();
+    for line in text.lines() {
+        let (pre, post) = line.split_once(" - ")?;
+        let pre: Vec<&str> = pre.split(' ').collect();
+        if pre.len() < 5 || !post.starts_with("fuse ") || pre[4] != want {
+            continue;
+        }
+        if let Some((_, minor)) = pre[2].split_once(':') {
+            if let Ok(n) = minor.parse() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn is_mountpoint(p: &Path) -> bool {

@@ -1446,6 +1446,10 @@ impl NodeRuntime {
         let departed = self.departed.clone();
         let mut fs = fusefs::ConstellationFs::new(
             fusefs::FsDependencies {
+                inflight: self
+                    .kernel_inval
+                    .as_ref()
+                    .map_or_else(crate::kernel_inval::InFlight::disabled, |k| k.inflight()),
                 meta: self.meta.clone(),
                 store: self.store.clone(),
                 cache: self.cache.clone(),
@@ -1557,6 +1561,7 @@ impl NodeRuntime {
             }
         }
 
+        let mount_record_name = fs_name.clone();
         let options = vec![
             fuser::MountOption::FSName(fs_name),
             fuser::MountOption::DefaultPermissions,
@@ -1601,6 +1606,13 @@ impl NodeRuntime {
         let unmounter = session.unmount_callable();
 
         let id = MountId(self.next_mount_id.fetch_add(1, Ordering::Relaxed));
+        // So that a takeover after a kill can abort this mount's
+        // connection if it is left wedged (`daemon_lock::abort_stale_mounts`).
+        if let Err(e) =
+            crate::daemon_lock::record_mount(&self.state_dir, id.0, &mountpoint, &mount_record_name)
+        {
+            tracing::warn!(error = %e, "recording the mount in the state dir failed");
+        }
         self.lock_flushers.register(id.0, flusher);
         self.hold_sources.register(id.0, open_handles);
         if let (Some(k), false) = (&self.kernel_inval, frozen_view) {
@@ -1626,6 +1638,7 @@ impl NodeRuntime {
             if let Some(k) = &node.kernel_inval {
                 k.unregister(id.0);
             }
+            crate::daemon_lock::forget_mount(&node.state_dir, id.0);
             node.lock_flushers.unregister(id.0);
             node.hold_sources.unregister(id.0);
             node.holds.nudge();
