@@ -16,6 +16,7 @@ hash-verified, and a peer that declines or fails costs latency only.
   - [Memory](#memory)
 - [False-positive accounting](#false-positive-accounting)
 - [Upload existence hints](#upload-existence-hints)
+- [Freshly written chunks](#freshly-written-chunks)
 - [Environment variables](#environment-variables)
 - [Status and metrics](#status-and-metrics)
 - [Comparing the modes](#comparing-the-modes)
@@ -158,6 +159,29 @@ bloom (`CONSTELLATION_EXISTENCE_BLOOM_BYTES`). It is not exchanged
 between peers, it is RSS-capped, and a false positive there costs one
 HEAD.
 
+## Freshly written chunks
+
+A file another node has just written becomes visible here over the log
+stream (or the pre-S3 stream) within milliseconds of its close, but the
+writer's delta advertising its chunk is gossiped on the 250 ms tick and
+usually arrives later. Until it does, no mirror lists a holder. So every
+manifest this node applies from another node leaves a hint for 30 s: its
+chunk hashes and the node that wrote them, the node of the request id in
+the transaction's `Completed` record (the requester whose close uploaded
+them, whoever sequenced it). A fetch of a chunk that no mirror lists
+asks that node first, with S3 as the hedge and the last resort. A hint
+that turns out wrong (the writer evicted the chunk) costs one declined
+request; it is counted in `fresh_hint_misses`, not as a false positive,
+and does not penalize the peer. Without it, every read of a file another
+node had just written cost one S3 GET: 0.19 s per small file from
+us-west-2 to a bucket in Milan (EC2 campaign 6).
+
+The selector learns a source's goodput only from transfers of at least
+64 KiB. A small file's "goodput" is latency noise (10 bytes in half a
+millisecond is 20 KB/s), and it used to price a LAN peer's next 4 MiB
+ETA at minutes, so after the first small file read from a peer every
+later read went to S3.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -186,6 +210,9 @@ status` expose the counters below. `/metrics` exports a subset:
   `reconcile_cpu_us`: the exact-mode sessions this node initiated. The
   CPU counter covers both sides of the rounds this node took part in.
 - `local_set_entries`, `peer_set_entries`, `peer_set_bytes`
+- `fresh_hint_hits`, `fresh_hint_misses`: fetches of a chunk no mirror
+  listed yet, from the node that wrote it
+  ([Freshly written chunks](#freshly-written-chunks))
 
 ## Comparing the modes
 

@@ -255,6 +255,16 @@ pub(crate) struct BackupState {
     /// applied ([`Core::retry_stream_ahead`]) instead of dropped, which
     /// sent every forward whose reply waited for them to the log.
     ahead_waiting: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>)>,
+    /// Subscriber: `StreamAhead` transactions that did not follow what
+    /// this replica holds — a batch arrived while a job had the cursor,
+    /// or after an earlier one was lost — kept until the log closes the
+    /// gap ([`Core::retry_stream_ahead`]). The holder streams each
+    /// transaction once: dropping them left the cursor behind the
+    /// stream for as long as the writer kept writing (every later batch
+    /// was "not contiguous" too), so this node saw every write only
+    /// through S3 — one segment PUT and the ship pacing, 0.4-5 s at
+    /// 300 ms per S3 request (EC2 campaign 6, visibility-s3-latency).
+    ahead_gapped: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>)>,
     /// `ack=s3` fast takeover: since when the known holder has been
     /// silent on P2P.
     holder_silent_since: Option<Ms>,
@@ -1978,12 +1988,23 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if self.cfg.pre_s3_streaming
+            && self.lease.held.is_none()
+            && !self.lease.epoch_held()
+            && self.lease.cached_holder == Some(from)
+            && epoch == self.ship.max_epoch
+            && !self.cursor_free()
+        {
+            // A job moves the cursor: follow the log first, then these.
+            self.bk.ahead_next = None;
+            self.park_gapped(from, epoch, base, txs);
+            return;
+        }
         if !self.cfg.pre_s3_streaming
             || self.lease.held.is_some()
             || self.lease.epoch_held()
             || self.lease.cached_holder != Some(from)
             || epoch != self.ship.max_epoch
-            || !self.cursor_free()
         {
             tracing::trace!(
                 node = self.cfg.node_id,
@@ -2010,10 +2031,13 @@ impl Core {
             return;
         }
         let mut completed: Vec<(constellation_meta::Rid, constellation_meta::KeySet)> = Vec::new();
-        for tx in txs {
+        let mut txs = txs.into_iter();
+        while let Some(tx) = txs.next() {
             let Some((e, next)) = self.bk.ahead_next else {
-                self.stats.streamed_dropped += 1;
-                continue;
+                // The cursor is lost until the next segment re-syncs it.
+                let rest: Vec<BackupTx> = std::iter::once(tx).chain(txs).collect();
+                self.park_gapped(from, epoch, base, rest);
+                break;
             };
             if e != epoch || tx.first < next {
                 // Already in the log (or superseded): nothing to do.
@@ -2031,11 +2055,13 @@ impl Core {
                     next,
                     base,
                     head = self.ship.head_seq,
-                    "stream-ahead transaction dropped: not contiguous"
+                    "stream-ahead transaction parked: not contiguous"
                 );
-                self.stats.streamed_dropped += 1;
-                self.bk.ahead_next = None;
-                continue;
+                // What lies between reaches this node in a segment; these
+                // follow it.
+                let rest: Vec<BackupTx> = std::iter::once(tx).chain(txs).collect();
+                self.park_gapped(from, epoch, base, rest);
+                break;
             }
             if tx.records.is_empty() {
                 // A hole (round 2): rows the holder shipped and dropped
@@ -2127,6 +2153,27 @@ impl Core {
             let (from, epoch, base, txs) = self.bk.ahead_waiting.pop_front().expect("front");
             self.on_stream_ahead(now, from, epoch, base, txs, replica, out);
         }
+        // The log may have closed the gap before parked transactions (or
+        // re-synced a lost cursor): install what now follows it; what the
+        // log already holds is skipped, what is still ahead of a gap
+        // waits again.
+        for (from, epoch, base, txs) in std::mem::take(&mut self.bk.ahead_gapped) {
+            self.on_stream_ahead(now, from, epoch, base, txs, replica, out);
+        }
+    }
+
+    /// Keep `txs` for [`Core::retry_stream_ahead`] (the oldest go once
+    /// [`AHEAD_WAITING_MAX`] batches wait).
+    fn park_gapped(&mut self, from: NodeId, epoch: Epoch, base: Seq, txs: Vec<BackupTx>) {
+        if txs.is_empty() {
+            return;
+        }
+        if self.bk.ahead_gapped.len() >= AHEAD_WAITING_MAX {
+            if let Some((_, _, _, old)) = self.bk.ahead_gapped.pop_front() {
+                self.stats.streamed_dropped += old.len() as u64;
+            }
+        }
+        self.bk.ahead_gapped.push_back((from, epoch, base, txs));
     }
 
     // ------------------------------------------- `ack=s3` fast takeover

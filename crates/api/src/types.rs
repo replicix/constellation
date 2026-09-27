@@ -889,6 +889,13 @@ pub struct CoopStatus {
     /// Peer had dropped the chunk within its recent-removal window.
     #[serde(default)]
     pub peer_stale_misses: u64,
+    /// Fetches of a chunk no mirror listed yet from the node that wrote
+    /// the manifest naming it (a file another node just wrote): served,
+    /// and declined (the fetch then went on to S3).
+    #[serde(default)]
+    pub fresh_hint_hits: u64,
+    #[serde(default)]
+    pub fresh_hint_misses: u64,
     /// Digest-plane traffic (summaries, deltas, rounds, or blooms).
     #[serde(default)]
     pub digest_bytes_sent: u64,

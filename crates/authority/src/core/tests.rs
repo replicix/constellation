@@ -1758,6 +1758,76 @@ fn a_segment_behind_the_stream_keeps_its_cursor() {
     assert_eq!(sub.core.stats.streamed_dropped, 0);
 }
 
+/// EC2 campaign 6 (visibility-s3-latency): the stream carries each
+/// transaction once. A subscriber that lost one (a batch that arrived
+/// while a job had its cursor) used to drop every later batch too — none
+/// followed its cursor — so it saw the writer's files only through S3
+/// until the writer paused. The later batches wait for the segment that
+/// closes the gap and are installed then; the stream is live again.
+#[test]
+fn stream_ahead_after_a_lost_transaction_resumes_once_the_log_closes_the_gap() {
+    let (mut holder, mut sub, req) = stream_pair();
+    submit_create(&mut holder, 1, "a");
+    let (p1, through) = holder_ship(&mut holder, 1, 100);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: segment_frame(req, 1, 1, p1),
+    });
+    // `b` is streamed but never reaches the subscriber.
+    submit_create(&mut holder, 2, "b");
+    let lost = Replica::journal_txs_from(&holder.meta, through + 1, 100);
+    assert_eq!(lost.len(), 1);
+    let b_rows = lost[0].records.len();
+    // `c` arrives: it does not follow what the subscriber holds.
+    submit_create(&mut holder, 3, "c");
+    let c = Replica::journal_txs_from(&holder.meta, lost[0].last + 1, 100);
+    assert_eq!(c.len(), 1);
+    let c_last = c[0].last;
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::StreamAhead {
+            epoch: 1,
+            base: 1,
+            txs: c,
+        },
+    });
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "c")
+        .unwrap()
+        .is_none());
+    assert_eq!(sub.core.stats.streamed_dropped, 0, "kept, not dropped");
+    // The log brings `b` (segment 2, through `b` only): `c` follows it now.
+    let (p2, _) = holder_ship(&mut holder, 2, b_rows);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: segment_frame(req, 2, 2, p2),
+    });
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "b")
+        .unwrap()
+        .is_some());
+    assert!(
+        MetaStore::lookup(&sub.meta, ROOT_INO, "c")
+            .unwrap()
+            .is_some(),
+        "installed ahead of the log once the gap closed"
+    );
+    // And the stream continues from there: `d` installs at once.
+    submit_create(&mut holder, 4, "d");
+    let d = Replica::journal_txs_from(&holder.meta, c_last + 1, 100);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::StreamAhead {
+            epoch: 1,
+            base: 2,
+            txs: d,
+        },
+    });
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "d")
+        .unwrap()
+        .is_some());
+    assert_eq!(sub.core.stats.streamed_installed, 2);
+    assert_eq!(sub.core.stats.streamed_dropped, 0);
+}
+
 /// A manifest whose chunk is still uploading on the node that forwarded
 /// it (`Meta::enroll_remote_chunks`) is streamed ahead to that node — it
 /// has the bytes, and its close may be waiting for the transaction — and

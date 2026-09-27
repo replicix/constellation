@@ -26,6 +26,13 @@ pub const HYSTERESIS: f64 = 0.20;
 /// ordinary jitter does not fire a second request on every fetch.
 const HEDGE_SLACK: f64 = 1.5;
 const ALPHA: f64 = 0.25;
+/// A transfer smaller than this teaches nothing about goodput: its body
+/// time is a few packets of latency and scheduling noise. A 10-byte
+/// chunk read in 0.5 ms "measured" 20 KB/s, which priced the next 4 MiB
+/// ETA at minutes, so the first small file read from a LAN peer handed
+/// every later read to S3 (EC2 campaign 6, D2 on OVH: 0.2 s per read of
+/// a small file another node had in cache).
+pub const GOODPUT_MIN_SAMPLE_BYTES: u64 = 64 * 1024;
 /// Prior for a **peer** we have never timed: LAN-ish 2 ms TTFB and
 /// 100 MiB/s. Real samples replace this within a handful of fetches.
 const PEER_PRIOR_TTFB_MS: f64 = 2.0;
@@ -83,8 +90,12 @@ pub struct SourceStats {
     pub in_flight: u32,
     /// Outcomes recorded (ok + miss + err). Cancelled races do not count.
     pub samples: u64,
-    /// Successful transfers only — lat/BW EWMAs are priors until this is > 0.
+    /// Successful transfers only — the TTFB EWMA is a prior until this
+    /// is > 0.
     pub ok_samples: u64,
+    /// Successful transfers of at least [`GOODPUT_MIN_SAMPLE_BYTES`]:
+    /// `goodput_bps` is a prior until this is > 0.
+    pub goodput_samples: u64,
     pub transport_rtt_ms: Option<f64>,
     pub path: PathKind,
     /// Open wall-clock window for [`aggregate_bps`].
@@ -111,6 +122,7 @@ impl SourceStats {
             in_flight: 0,
             samples: 0,
             ok_samples: 0,
+            goodput_samples: 0,
             transport_rtt_ms: None,
             path: PathKind::Unknown,
             window_started: Instant::now(),
@@ -130,6 +142,7 @@ impl SourceStats {
             in_flight: 0,
             samples: 0,
             ok_samples: 0,
+            goodput_samples: 0,
             transport_rtt_ms: None,
             path: PathKind::Unknown,
             window_started: Instant::now(),
@@ -166,7 +179,7 @@ impl SourceStats {
         // Until a real transfer lands, do not claim LAN goodput. A known
         // probe RTT means we are likely on a WAN path — budget a slow
         // body so S3 can compete; otherwise keep the cold prior.
-        let goodput = if self.ok_samples == 0 {
+        let goodput = if self.goodput_samples == 0 {
             match self.transport_rtt_ms {
                 Some(rtt) if rtt >= 50.0 => S3_PRIOR_GOODPUT_BPS,
                 _ => self.goodput_bps,
@@ -281,7 +294,7 @@ impl Selector {
     /// still running.
     pub fn hedge_deadline_ms(&self, id: SourceId, size: u64) -> u64 {
         let s = self.stats(id);
-        let goodput = if s.ok_samples == 0 {
+        let goodput = if s.goodput_samples == 0 {
             match s.transport_rtt_ms {
                 Some(rtt) if rtt >= 50.0 => S3_PRIOR_GOODPUT_BPS,
                 _ => s.goodput_bps,
@@ -348,14 +361,15 @@ impl Selector {
             let high = ttfb_ms.max(s.ttfb_ewma_ms);
             s.ttfb_p95_ms = ALPHA * high * 1.5 + (1.0 - ALPHA) * s.ttfb_p95_ms;
         }
-        if total_ms > ttfb_ms && bytes > 0 {
+        if total_ms > ttfb_ms && bytes >= GOODPUT_MIN_SAMPLE_BYTES {
             let body_s = ((total_ms - ttfb_ms) / 1000.0).max(0.000_001);
             let gp = bytes as f64 / body_s;
-            s.goodput_bps = if s.ok_samples == 0 {
+            s.goodput_bps = if s.goodput_samples == 0 {
                 gp
             } else {
                 ALPHA * gp + (1.0 - ALPHA) * s.goodput_bps
             };
+            s.goodput_samples += 1;
         }
         // Aggregate path rate: sum bytes across concurrent completions in a
         // wall-clock window. Per-stream `goodput_bps` alone looks like a few
@@ -531,6 +545,33 @@ mod tests {
         let prior = s.stats(SourceId::S3).goodput_bps;
         s.record_ok(SourceId::S3, 200.0, MIB, 200.0);
         assert_eq!(s.stats(SourceId::S3).goodput_bps, prior);
+    }
+
+    /// Campaign 6 D2-OVH: small files read from a LAN peer must not
+    /// price the peer out against S3. A tiny transfer's "goodput" is
+    /// latency noise; it leaves the estimate (and the cold-peer rule)
+    /// alone, while its first byte still counts.
+    #[test]
+    fn a_tiny_transfer_does_not_teach_goodput() {
+        let mut s = Selector::default();
+        let peer = SourceId::Peer(2);
+        let prior = s.stats(peer).goodput_bps;
+        // A 10-byte chunk: first byte at 1 ms, done 0.5 ms later.
+        s.record_ok(peer, 1.0, 10, 1.5);
+        assert_eq!(s.stats(peer).goodput_bps, prior);
+        assert_eq!(s.stats(peer).goodput_samples, 0);
+        assert_eq!(s.stats(peer).ok_samples, 1);
+        assert_eq!(s.stats(peer).ttfb_ewma_ms, 1.0);
+        // S3 answered the same way at WAN latency: the peer still wins.
+        s.record_ok(SourceId::S3, 150.0, 10, 150.5);
+        for _ in 0..5 {
+            assert_eq!(s.pick(&[peer, SourceId::S3], 4 * MIB), peer);
+            s.record_ok(peer, 1.0, 10, 1.5);
+        }
+        // A real transfer is still learned.
+        s.record_ok(peer, 1.0, MIB, 11.0);
+        assert_eq!(s.stats(peer).goodput_samples, 1);
+        assert!((s.stats(peer).goodput_bps - MIB as f64 / 0.01).abs() < 1.0);
     }
 
     #[test]

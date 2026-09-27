@@ -947,6 +947,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: ovh::delegated_op_latency,
     },
     Scenario {
+        name: "visibility-s3-latency",
+        desc: "campaign 6 D2-OVH: every S3 request >= 300 ms; a non-holder, then the holder, writes a paced series of small files (write+fsync+close, write-through) while two other nodes poll for each in order; cross-node visibility p99 < 2 s (it travels over P2P, never waits for S3)",
+        requires: &[],
+        run: ovh::visibility_s3_latency,
+    },
+    Scenario {
+        name: "sqlite-first-touch-latency",
+        desc: "campaign 6 A-1: every S3 request >= 300 ms; 50 rounds of two nodes (two non-holders, then the holder and a non-holder) running CREATE TABLE IF NOT EXISTS + INSERT on one new SQLite database at once: no round fails (no disk I/O error), every database holds both rows on every node",
+        requires: &["sqlite3"],
+        run: ovh::sqlite_first_touch_latency,
+    },
+    Scenario {
         name: "sqlite-two-nodes",
         desc: "plan 30 M14: concurrent sqlite3 writers on one database from two nodes (rollback journal, fcntl locks, busy_timeout); PRAGMA integrity_check ok on both, every committed row present",
         requires: &["sqlite3"],

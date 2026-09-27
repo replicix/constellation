@@ -1257,11 +1257,21 @@ impl NodeRuntime {
                 .context("automatic reintegration after mount")?;
         }
 
-        let kernel_inval = crate::kernel_inval::enabled().then(|| {
-            let k = crate::kernel_inval::KernelInvalidator::start();
-            meta.set_foreign_apply_hook(k.hook());
-            k
-        });
+        let kernel_inval =
+            crate::kernel_inval::enabled().then(crate::kernel_inval::KernelInvalidator::start);
+        {
+            // Every foreign apply feeds the kernel invalidations and the
+            // cooperative cache's fresh-chunk hints (who wrote the chunks
+            // a new manifest names, `coop::fresh`).
+            let inval = kernel_inval.as_ref().map(|k| k.hook());
+            let coop = coop.clone();
+            meta.set_foreign_apply_hook(Box::new(move |records| {
+                if let Some(inval) = &inval {
+                    inval(records);
+                }
+                coop.note_foreign_records(records);
+            }));
+        }
         let node = Arc::new(NodeRuntime {
             kernel_inval,
             node_id,

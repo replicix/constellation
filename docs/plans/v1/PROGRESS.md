@@ -25736,3 +25736,150 @@ blocks behind the wedge).
   PASS, `git-under-flock-rounds` PASS, `chaos-ci` PASS.
 - pjdfstest (private compose project, floci on 14566, `--no-cache`
   image): 8798 passed, 0 failed, empty baseline.
+## Fix: OVH visibility latency and sqlite first-touch EIO
+
+EC2 campaign 6 (`constellation-m14/EC2-CAMPAIGN6-REPORT.md`) reported
+two OVH-only findings: D2-OVH, cross-node visibility p50 95.6 s / p99
+160 s against AWS's 88 ms / 124 ms, and A-1, SQLite's first-touch race
+failing with `disk I/O error` in 4 of 40 rounds.
+
+**A-1: the lock fence, already fixed on main by `a1bed13`.** The
+campaign ran `216ce6c`. Placement delegated the race directory to one
+of the two racers at 03:45:23, and the failing rounds (a 14 and 17, b
+15 and 19) began then. Under a delegate a lock grant was capped at the
+delegation's remaining 1.5–2.1 s, and its renewal was scheduled at
+`ttl/2`, after the window the holder honours it for had closed. The
+grant lapsed while SQLite held its `fcntl` lock across write-through
+`fsync`s, which take an S3 round trip each on OVH, and the node fenced
+I/O on the file. The new `sqlite-first-touch-latency` scenario
+reproduces it on `216ce6c`: every round in the delegated directory
+fails, and `strace` shows `pwrite64(3, …) = -1 EIO` then
+`fdatasync(3) = -1 EIO` on the database. On main it passes 50/50 and
+100/100, and on OVH 80/80 (with placement delegating the directory
+mid-race) plus 80/80 twice more.
+
+**D2-OVH: the 95 s figure is not a propagation delay.** It could not be
+reproduced on a healthy cluster, nor after four holder kills: the same
+driver's baseline gave p50 0.41–0.46 s. The report kept only a summary,
+but the summary pins the shape. The latencies are uniform over exactly
+the first run's 132 s write span (p50 95.6, mean 95.3, p90 148.1,
+p99 160.1, max 161.2 s), and there were no timeouts although the
+poller's per-file timeout was 30 s. The only consistent reading is that
+every file was first read within a few seconds of the others, about
+161 s after the start and 28 s after the writer ended: latency then
+falls linearly from 161 s to 29 s. The poll JSON was written at
+15:34:04, which rules out the other reading (lag growing per event). So
+the poller started, or one syscall of it returned, 160 s late. That was
+node `b` of that session, which had the B-1 wedged daemon and the SSH
+loss.
+
+Measuring the visibility path with S3 injected at ≥300 ms per request
+(and on OVH) did find several places where it waited for S3:
+
+1. **Reading a file another node had just written cost one S3 GET**
+   (0.19 s on OVH, 305 ms in the harness). The writer's coop delta is
+   gossiped on the 250 ms tick, and the manifest arrives first over the
+   stream. So no mirror listed the chunk and the fetch went to S3.
+   *Fix* (`coop/fresh.rs`, `coop.rs`, `node_runtime.rs`,
+   `net/peers.rs::knows`): each manifest applied from another node
+   leaves a 30 s hint mapping its chunks to the writing node. That node
+   is the rid's node in the transaction's `Completed`, which follows
+   the transaction's first record. A fetch no mirror can serve asks the
+   writer first, with S3 as the hedge and last resort. A wrong hint
+   costs one declined request (`fresh_hint_misses`) and neither counts
+   as a false positive nor penalizes the peer. New status counters:
+   `coop.fresh_hint_hits`, `coop.fresh_hint_misses`.
+2. **A small file read from a peer poisoned the selector.** Goodput
+   was learned from any transfer, and a 10-byte chunk read in 0.5 ms
+   "measured" 20 KB/s. That priced the peer's next 4 MiB ETA at
+   minutes, so every later read went to S3. It also explains the first
+   (discarded) D2 run's 0.2 s per read of files long in a peer's cache.
+   *Fix* (`sources.rs`): goodput is learned only from transfers of at
+   least 64 KiB (`goodput_samples`). TTFB is still learned from every
+   transfer.
+3. **Root lease placement moved the lease away from the active
+   writer.** The 60 s window still favoured the previous phase's
+   writer, so the holder offered it the lease while writing itself. The
+   claim failed, but it registered `wanted_by`. Five seconds later the
+   holder released between two of its own closes, the other node never
+   took the lease, and the holder took it back through S3. Writes and
+   reads stalled for 3–5 s at 300 ms per request.
+   *Fix*: a move must also pay off over the last two buckets, and
+   buckets now rotate while idle (`placement.rs`). An offered node
+   claims only if its own clients wrote in the last 3 s
+   (`Placement::writing_now`, `main.rs::lease_offered`). A claim of an
+   offer does not register `wanted_by`
+   (`authority/core/jobs.rs`, the `Busy` plan).
+4. **A pre-S3 stream subscriber that missed one transaction dropped
+   every later one.** The loss happened when a batch arrived while an
+   acquire job held the cursor. Later batches were "not contiguous"
+   until the writer paused, because the holder streams each transaction
+   once, so that node saw every write only through S3: 0.4–5 s from
+   close. *Fix* (`authority/core/backup.rs`): such batches are parked
+   (`ahead_gapped`, bounded like `ahead_waiting`) and re-offered after
+   every applied segment. They install as soon as the log closes the
+   gap. Transactions the log already holds are skipped.
+
+**Harness**: `visibility-s3-latency` and `sqlite-first-touch-latency`
+(`scenarios/ovh.rs`). Both use the product defaults: 500 ms sync
+round, 60 s lease, the default S3 retry budget, and placement on.
+- `visibility-s3-latency` asserts a p99 under 2 s from open to read.
+  It also asserts a median under half an S3 round trip from close to
+  read, and at most `events/10` S3 chunk GETs per poller.
+- `sqlite-first-touch-latency` asserts no failed round and both rows in
+  every database on every node.
+
+Unit tests:
+- `coop::fresh` (4): attribution, spilled manifests, expiry and bounds.
+- `sources::a_tiny_transfer_does_not_teach_goodput`.
+- `placement::a_finished_burst_does_not_pull_the_lease_from_the_writer_of_now`
+  and `idle_time_rotates_the_buckets`.
+- `core::tests::stream_ahead_after_a_lost_transaction_resumes_once_the_log_closes_the_gap`,
+  which fails without the fix.
+
+**Results** (branch `fix-ovh-visibility`,
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-ovhvis`):
+- `visibility-s3-latency` before (a432373 behaviour, measured while
+  fixing):
+  - With no lease move, from close p50 305–310 ms, which is the read's
+    S3 GET, with one GET per file on each poller.
+  - Runs with a placement move, a stale `wanted_by` or a lost stream
+    batch: p99 3.7–5.4 s.
+- After, 9/9 in a row (6 before the rebase, 3 after):
+  - From close p50 3–11 ms, 0 chunk GETs, 0 stream drops.
+  - p99 from open 0.32–0.92 s. The maximum of 2.0 s is the one
+    legitimate handoff to the writer: about 1.2 s of S3 CAS, tail and
+    marker at 300 ms per request.
+- `sqlite-first-touch-latency`: 50/50 on main (twice) and with the fix
+  (three times). On `216ce6c` every delegated round fails.
+- **EC2 against OVH**, 3 nodes, 300 events each way, write+fsync+close
+  every 50 ms, two pollers, 40 SQLite rounds.
+
+  | | open→read p50 | p99 | read cost p50 | poller chunk GETs | SQLite |
+  |---|---|---|---|---|---|
+  | `a432373` | 0.41–0.46 s | 0.45–0.56 s | 0.19 s | 1 per file (598 on c) | 80/80 |
+  | fix | 0.217–0.220 s | 0.29–0.31 s | 4.4 ms | 0 | 80/80 |
+
+  The writer's own write-through close is 0.21 s (one PUT), so
+  visibility now costs about one P2P hop after the close.
+- Neighbours: `forwarded-mutations`, `nonowner-op-latency`,
+  `delegated-op-latency`, `sqlite-two-nodes`, `backup-failover`,
+  `concurrent-create-no-excl`, `coop-cache-hit`, `coop-fallback`,
+  `coop-exact-churn`, `lease-handover`, `sticky-lease-handoff-over-s3`,
+  `p2p-handover`, `cto-bounded` and `auto-placement` PASS.
+  `visibility-after-burst` 8/9 (p50 55 ms against main's 78–93 ms). The
+  one failure is the known main flake: 17 S3 backstop GETs with the
+  stream live.
+- Unit tests of cli, net, api, harness and authority pass. The
+  authority `long_*` sweeps: `long_backup`, `long_backup_hot`, `long_random`,
+  `long_delegated`, `long_strict`, `long_flex`, `long_locks` pass; clippy
+  (`-D warnings`) and fmt clean. Rebased on main 84a59be; the three
+  `visibility-s3-latency` runs, two `sqlite-first-touch-latency` runs and
+  the neighbours above re-run there, all PASS. (The EC2 binary, sha256
+  fd01909f…, was built before that rebase.)
+
+**Not fixed here** (for other owners): a lease handoff under slow S3
+still stalls the writer about 1.2–1.6 s (CAS, tail, marker). During a
+backup reconfiguration or commit publish at 300 ms per request, a
+backup sometimes still seals a live holder (`holder silent`, 1.5 s), as
+PROGRESS already notes for M9 under very slow S3.

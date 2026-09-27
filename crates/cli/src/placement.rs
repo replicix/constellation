@@ -20,6 +20,16 @@ const DWELL: Duration = Duration::from_secs(60);
 /// among four co-located writers hammering one inode, each holder
 /// "recommending" a peer purely off sub-millisecond jitter.
 const MIN_ABS_IMPROVEMENT_MS: f64 = 5.0;
+/// The newest buckets (the last 5-10 s): a move must also pay off for
+/// who is writing *now*. The 60 s window alone moved the lease away from
+/// a holder that had just started writing to a node whose burst had
+/// ended; that node never wrote again, the holder's next close had to
+/// take the lease back through S3, and every writer and reader stalled
+/// for the round trips of two handoffs (3-5 s at 300 ms per S3 request;
+/// EC2 campaign 6, the visibility-s3-latency scenario).
+const RECENT_BUCKETS: usize = 2;
+/// See [`Placement::writing_now`].
+const OFFER_ACTIVE: Duration = Duration::from_secs(3);
 
 pub fn placement_enabled() -> bool {
     match std::env::var("CONSTELLATION_LEASE_PLACEMENT") {
@@ -44,6 +54,8 @@ pub struct Placement {
     /// peer_id -> (from_id -> rtt_ms)
     rtts: Mutex<HashMap<u64, HashMap<u64, u16>>>,
     pub last_reason: Mutex<Option<String>>,
+    /// When this node's own clients last wrote (see [`Self::writing_now`]).
+    last_own: Mutex<Option<Instant>>,
 }
 
 impl Placement {
@@ -56,17 +68,23 @@ impl Placement {
             last_migrate: Mutex::new(None),
             rtts: Mutex::new(HashMap::new()),
             last_reason: Mutex::new(None),
+            last_own: Mutex::new(None),
         }
     }
 
+    /// One new bucket per [`BUCKET_MS`] elapsed (an idle stretch leaves
+    /// empty buckets behind, so "recent" means recent).
     fn maybe_rotate(&self) {
         let mut last = self.last_rotate.lock().unwrap();
-        if last.elapsed() < Duration::from_millis(BUCKET_MS) {
+        let due = (last.elapsed().as_millis() / u128::from(BUCKET_MS)) as usize;
+        if due == 0 {
             return;
         }
-        *last = Instant::now();
+        *last += Duration::from_millis(BUCKET_MS * due as u64);
         let mut buckets = self.buckets.lock().unwrap();
-        buckets.push_back(Bucket::default());
+        for _ in 0..due.min(WINDOW_BUCKETS) {
+            buckets.push_back(Bucket::default());
+        }
         while buckets.len() > WINDOW_BUCKETS {
             buckets.pop_front();
         }
@@ -79,7 +97,28 @@ impl Placement {
     /// An op of this node's own client the core executed (or had
     /// forwarded).
     pub fn note_local(&self, node_id: u64) {
-        self.note_ops(node_id, 1);
+        self.note_own(node_id, 1);
+    }
+
+    /// `n` writes by this node's own clients (`node_id` is this node).
+    pub fn note_own(&self, node_id: u64, n: u64) {
+        if n > 0 {
+            *self.last_own.lock().unwrap() = Some(Instant::now());
+        }
+        self.note_ops(node_id, n);
+    }
+
+    /// Whether this node's own clients wrote in the last
+    /// [`OFFER_ACTIVE`]. An offered lease is claimed only then: the
+    /// holder's window (up to a minute of history) can name a node whose
+    /// writes have ended, and taking the lease there only moves the
+    /// sequencer away from whoever writes now — through S3, a few round
+    /// trips each way.
+    pub fn writing_now(&self) -> bool {
+        self.last_own
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() < OFFER_ACTIVE)
     }
 
     /// `n` writes by `node`. The holder's own FUSE fast path executes
@@ -103,9 +142,15 @@ impl Placement {
     }
 
     fn ops_window(&self) -> HashMap<u64, u64> {
+        self.ops_last(WINDOW_BUCKETS)
+    }
+
+    /// Ops per node in the newest `n` buckets.
+    fn ops_last(&self, n: usize) -> HashMap<u64, u64> {
+        self.maybe_rotate();
         let buckets = self.buckets.lock().unwrap();
         let mut out = HashMap::new();
-        for b in buckets.iter() {
+        for b in buckets.iter().rev().take(n) {
             for (id, n) in &b.ops {
                 *out.entry(*id).or_insert(0) += *n;
             }
@@ -195,6 +240,17 @@ impl Placement {
         if best_cost >= HYSTERESIS * self_cost {
             return None;
         }
+        // And for the writers of the last few seconds: a candidate that
+        // is not writing now (or a holder that writes alone now) keeps
+        // the lease where it is.
+        let recent = self.ops_last(RECENT_BUCKETS);
+        let (Some(here), Some(there)) = (self.cost(self_id, &recent), self.cost(best, &recent))
+        else {
+            return None;
+        };
+        if recent.get(&best).copied().unwrap_or(0) == 0 || there >= HYSTERESIS * here {
+            return None;
+        }
         Some((best, self_cost, best_cost))
     }
 
@@ -256,5 +312,39 @@ mod tests {
             None,
             "the holder's own writes keep it"
         );
+    }
+
+    /// Campaign 6: a remote writer's burst fills the window, then it
+    /// stops and the holder starts writing. The window alone still
+    /// favours the old writer; the lease must stay with the holder, who
+    /// is the one writing now.
+    #[test]
+    fn a_finished_burst_does_not_pull_the_lease_from_the_writer_of_now() {
+        let p = Placement::new();
+        p.note_peer_rtts(1, vec![(2, 50)]);
+        p.note_ops(2, 60);
+        // The burst ended two buckets ago; the holder writes since.
+        {
+            let mut b = p.buckets.lock().unwrap();
+            b.push_back(Bucket::default());
+            b.push_back(Bucket::default());
+        }
+        p.note_ops(1, 35);
+        assert_eq!(p.best_holder(1, &[2]), None);
+        // Were the old writer still writing now, the move stands.
+        p.note_ops(2, 60);
+        assert_eq!(p.best_holder(1, &[2]).map(|(n, _, _)| n), Some(2));
+    }
+
+    #[test]
+    fn idle_time_rotates_the_buckets() {
+        let p = Placement::new();
+        p.note_ops(2, 10);
+        *p.last_rotate.lock().unwrap() -= Duration::from_millis(BUCKET_MS * 3);
+        assert!(
+            p.ops_last(RECENT_BUCKETS).is_empty(),
+            "15 s ago is not recent"
+        );
+        assert_eq!(p.ops_window().get(&2), Some(&10));
     }
 }

@@ -245,7 +245,12 @@ whose ship waits for the chunks, or with a later stream once they are
 up. The node that forwarded such a manifest is the exception: it has the
 bytes, so it is streamed past it. A batch that arrives before the
 segment it follows (the two travel on different streams) waits for that
-segment instead of being dropped.
+segment instead of being dropped. So does one that does not follow what
+the subscriber holds (it arrived while a job had the replica's cursor,
+or an earlier batch was lost): the holder streams each transaction only
+once, so dropping it left the subscriber behind the stream, seeing every
+later write through S3 until the writer paused. It waits until a segment
+closes the gap and is installed then.
 
 A continuation epoch's hold owner streams its journal the same way, as
 it grows (its writes are acknowledged on its disk alone), to the members

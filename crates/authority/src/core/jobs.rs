@@ -2046,8 +2046,22 @@ impl Core {
                     "lease held by another node"
                 );
                 // Register in `wanted_by` (best effort, result ignored) and,
-                // once, ask the holder over P2P for a fast handoff.
-                if !prev.wanted_by.contains(&self.cfg.node_id) {
+                // once, ask the holder over P2P for a fast handoff. Not for
+                // a claim of the holder's own placement offer: the holder
+                // offers again while the move still pays, whereas a
+                // registration outlives the reason for it — the holder
+                // released to a node whose burst had ended, while it was
+                // writing itself, and had to take the lease back through
+                // S3 (seconds of stalled writes and reads at 300 ms per
+                // request; EC2 campaign 6, visibility-s3-latency).
+                let offered = matches!(
+                    &self.job.as_ref().expect("job").what,
+                    What::Acquire {
+                        reason: "claim-offer",
+                        ..
+                    }
+                );
+                if !offered && !prev.wanted_by.contains(&self.cfg.node_id) {
                     self.issue_s3(
                         S3Op::LeaseSwap {
                             lease: prev.wanting(self.cfg.node_id),

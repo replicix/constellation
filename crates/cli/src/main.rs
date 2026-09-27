@@ -3574,6 +3574,11 @@ impl constellation_net::PeerService for P2pBridge {
     }
 
     fn lease_offered(&self, _part: String, epoch: u64) {
+        // Only while this node writes: see `Placement::writing_now`.
+        if !self.placement.writing_now() {
+            tracing::debug!(epoch, "declining a lease offer: not writing now");
+            return;
+        }
         let _ = self.nudge.send(fusefs::SyncRequest::ClaimOffer { epoch });
     }
 

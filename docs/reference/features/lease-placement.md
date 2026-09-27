@@ -97,8 +97,20 @@ Placement recommends a move only when:
 - `best_cost < 0.7 × current_cost` (30% or greater improvement);
 - the improvement is at least 5 ms of RTT-weighted cost in absolute
   terms, so co-located writers do not trade the lease on sub-millisecond
-  jitter; and
+  jitter;
+- the move also pays off over the last two buckets (5–10 s): the
+  candidate wrote there, and its cost over them is below 0.7 × the
+  holder's; and
 - at least 60 seconds have elapsed since the previous successful migration.
+
+The offered node claims the lease only if its own clients wrote in the
+last 3 s, and a claim the holder declines does not add the node to the
+lease's `wanted_by` (the holder offers again while the move still pays).
+Without these, a minute of history could hand the lease from a holder
+that had just started writing to a node whose burst had ended; that
+node never wrote again, the holder's next close had to take the lease
+back through S3, and every writer and reader stalled for two handoffs'
+S3 round trips (3–5 s at 300 ms per request; `visibility-s3-latency`).
 
 These thresholds prevent small RTT changes or short bursts from moving the
 lease repeatedly.

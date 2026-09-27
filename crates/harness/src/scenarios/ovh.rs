@@ -675,3 +675,409 @@ fn op_latency(name: &'static str, delegated: bool) -> Result<()> {
     }
     result
 }
+
+/// The product defaults the latency scenarios below mount with (the
+/// harness otherwise shortens S3 retries and the sync round for every
+/// client, which is not what the EC2 runs measured).
+const PRODUCT_DEFAULTS: [(&str, &str); 4] = [
+    ("CONSTELLATION_SYNC_INTERVAL_MS", "500"),
+    ("CONSTELLATION_LEASE_TTL_MS", "60000"),
+    ("CONSTELLATION_S3_MAX_RETRIES", "\u{0}unset"),
+    ("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "\u{0}unset"),
+];
+
+/// One paced write+`fsync`+close of `v<i>` holding `"<tag>:<i>"` (a
+/// chunk no node has yet). Returns (when the open began, when the close
+/// returned).
+fn vis_write(dir: &Path, tag: &str, i: usize) -> Result<(Instant, Instant)> {
+    use std::io::Write;
+    let t0 = Instant::now();
+    let mut f = std::fs::File::create(dir.join(format!("v{i}")))?;
+    f.write_all(format!("{tag}:{i}").as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    Ok((t0, Instant::now()))
+}
+
+/// What one poller saw of one event.
+#[derive(Clone, Copy, Default, Debug)]
+struct Seen {
+    /// The first successful read of the right content.
+    at: Option<Instant>,
+    /// How long that one successful open+read took.
+    read_cost: Duration,
+    /// Failed attempts before it (the name missing, or wrong content).
+    misses: u32,
+}
+
+/// Campaign 6's D2 poller: every event in order, polling each until its
+/// content reads back (or `deadline` passes).
+fn vis_poll(dir: &Path, tag: &str, events: usize, deadline: Duration) -> Vec<Seen> {
+    let mut out = vec![Seen::default(); events];
+    let end = Instant::now() + deadline;
+    for (i, seen) in out.iter_mut().enumerate() {
+        let want = format!("{tag}:{i}");
+        while Instant::now() < end {
+            let t = Instant::now();
+            if std::fs::read(dir.join(format!("v{i}"))).ok().as_deref() == Some(want.as_bytes()) {
+                seen.at = Some(Instant::now());
+                seen.read_cost = t.elapsed();
+                break;
+            }
+            seen.misses += 1;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    out
+}
+
+/// Campaign 6 finding D2-OVH: with the S3 bucket an ocean away (every
+/// request >= 2 x `VISLAT_MS`), one node writes a paced series of small
+/// files (write+`fsync`+close each, the default `--write-mode through`)
+/// while two others poll for each in order, as the EC2 D2 driver did.
+/// Visibility travels over P2P (the holder's log stream and its pre-S3
+/// stream) and must not wait for S3: every poller's p99, measured from
+/// the writer's `open` to the first read of the right content, stays
+/// under `VISLAT_P99_MS` (2 s). The content of a file another node just
+/// wrote comes from the writer, not the bucket: a poller's median from
+/// the writer's close to its read stays under half an S3 round trip,
+/// and the pollers GET (almost) no chunks. Runs twice: a non-holder
+/// writing (its closes forwarded to the holder; root lease placement
+/// moves the lease to it), then the other node writing.
+pub fn visibility_s3_latency(_seed: u64) -> Result<()> {
+    const NAME: &str = "visibility-s3-latency";
+    let lat = knob("VISLAT_MS", 150);
+    let events = knob("VISLAT_EVENTS", 60) as usize;
+    let interval = Duration::from_millis(knob("VISLAT_INTERVAL_MS", 50));
+    let bound = Duration::from_millis(knob("VISLAT_P99_MS", 2000));
+    // Diagnosis: `VISLAT_RUST_LOG=<filter>` for the mounts, and
+    // `VISLAT_KEEP_LOGS=1` keeps their logs even when the run passes.
+    let mut extra = PRODUCT_DEFAULTS.to_vec();
+    let filter = std::env::var("VISLAT_RUST_LOG").unwrap_or_default();
+    if !filter.is_empty() {
+        extra.push(("RUST_LOG", filter.as_str()));
+    }
+    let pin = std::env::var_os("VISLAT_PIN_LEASE").is_some();
+    if pin {
+        extra.push(("CONSTELLATION_LEASE_PLACEMENT", "off"));
+    }
+    let (env, _root, mut clients, proxies) = cluster(NAME, &["a", "b", "c"], &extra, 3)?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        std::fs::create_dir(a.mnt.join("vis-b"))?;
+        std::fs::create_dir(a.mnt.join("vis-a"))?;
+        for x in &clients {
+            eventually("vis dirs visible", Duration::from_secs(30), || {
+                anyhow::ensure!(x.mnt.join("vis-a").is_dir() && x.mnt.join("vis-b").is_dir());
+                Ok(())
+            })?;
+        }
+        let backups = super::m9::wait_for_backup(a, Duration::from_secs(60))?;
+        eprintln!("    {NAME}: a holds the lease, backups {backups:?}");
+        env.existing_s3_proxy().latency(lat, 0)?;
+        eprintln!(
+            "    {NAME}: S3 latency injected: every request >= {:?}",
+            Duration::from_millis(2 * lat)
+        );
+        let mut failures = Vec::new();
+        // (writer, pollers)
+        for (w, pollers) in [(1usize, [0usize, 2]), (0, [1, 2])] {
+            let writer = &clients[w];
+            let sub = format!("vis-{}", writer.name);
+            let holder = clients
+                .iter()
+                .find(|c| lease_of(c).is_ok_and(|l| l["held"] == true))
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            eprintln!("    {NAME}: writer {}, lease holder {holder}", writer.name);
+            let tag = writer.name.clone();
+            for p in &proxies {
+                p.reset();
+            }
+            let handles: Vec<_> = pollers
+                .iter()
+                .map(|&k| {
+                    let dir = clients[k].mnt.join(&sub);
+                    let who = clients[k].name.clone();
+                    let tag = tag.clone();
+                    std::thread::spawn(move || {
+                        (who, vis_poll(&dir, &tag, events, Duration::from_secs(120)))
+                    })
+                })
+                .collect();
+            let wdir = writer.mnt.join(&sub);
+            let mut written = Vec::new();
+            for i in 0..events {
+                let (t0, t1) = vis_write(&wdir, &tag, i)
+                    .with_context(|| format!("{}: write {i}", writer.name))?;
+                written.push((t0, t1));
+                let spent = t1 - t0;
+                if spent < interval {
+                    std::thread::sleep(interval - spent);
+                }
+            }
+            let close_cost: Vec<Duration> = written.iter().map(|(a, b)| *b - *a).collect();
+            eprintln!(
+                "    {NAME}: writer {}: write+fsync+close {}",
+                writer.name,
+                dist(close_cost)
+            );
+            for h in handles {
+                let (who, seen) = h.join().map_err(|_| anyhow::anyhow!("poller panicked"))?;
+                let mut lat_open = Vec::new();
+                let mut lat_close = Vec::new();
+                let mut lat_close_all = Vec::new();
+                let mut costs = Vec::new();
+                let mut missing = 0;
+                for (i, (s, (t0, t1))) in seen.iter().zip(&written).enumerate() {
+                    match s.at {
+                        Some(at) => {
+                            lat_open.push(at.saturating_duration_since(*t0));
+                            lat_close.push(at.saturating_duration_since(*t1));
+                            lat_close_all.push(at.saturating_duration_since(*t1));
+                            costs.push(s.read_cost);
+                            if std::env::var_os("VIS_DEBUG").is_some() {
+                                eprintln!(
+                                    "      {who} v{i}: +{:?} after open, +{:?} after close, \
+                                     read {:?}, {} misses",
+                                    at.saturating_duration_since(*t0),
+                                    at.saturating_duration_since(*t1),
+                                    s.read_cost,
+                                    s.misses
+                                );
+                            }
+                        }
+                        None => missing += 1,
+                    }
+                }
+                let mut sorted = lat_open.clone();
+                sorted.sort();
+                let p99 = sorted
+                    .get(((sorted.len() as f64 - 1.0) * 0.99).round() as usize)
+                    .copied()
+                    .unwrap_or_default();
+                eprintln!(
+                    "    {NAME}: writer {} -> poller {who}: from open {}; from close {}; \
+                     successful read {}; never seen {missing}",
+                    writer.name,
+                    dist(lat_open),
+                    dist(lat_close),
+                    dist(costs)
+                );
+                if missing > 0 {
+                    failures.push(format!(
+                        "{who} never saw {missing} of {}'s files",
+                        writer.name
+                    ));
+                }
+                if p99 >= bound {
+                    failures.push(format!(
+                        "writer {} -> {who}: visibility p99 {p99:?} >= {bound:?}",
+                        writer.name
+                    ));
+                }
+                let after_close = p50(lat_close_all.clone());
+                if after_close >= Duration::from_millis(lat) {
+                    failures.push(format!(
+                        "writer {} -> {who}: median from close to read {after_close:?} >= half \
+                         an S3 round trip ({lat} ms): the read waited for S3",
+                        writer.name
+                    ));
+                }
+            }
+            for (k, p) in proxies.iter().enumerate() {
+                if k == w {
+                    continue;
+                }
+                let gets = p
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method == "GET" && !r.is_list() && r.area() == "chunks")
+                    .count();
+                if gets > events / 10 {
+                    failures.push(format!(
+                        "writer {}: poller {} GET {gets} chunks from S3 for {events} files its \
+                         peer had",
+                        writer.name, clients[k].name
+                    ));
+                }
+            }
+            let breakdown = proxies
+                .iter()
+                .zip(&clients)
+                .map(|(p, c)| format!("[{}] {}", c.name, s3_breakdown(p)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("    {NAME}: writer {}: S3 {breakdown}", writer.name);
+        }
+        for x in &clients {
+            let s = x.control_status()?;
+            eprintln!(
+                "    {NAME}: {}: coop peer hits {} fresh-hint hits {} misses {}, S3 fetches {}, \
+                 hedges {}; streamed ahead {} installed {} dropped {}; log stream {}",
+                x.name,
+                s["coop"]["peer_hits"],
+                s["coop"]["fresh_hint_hits"],
+                s["coop"]["fresh_hint_misses"],
+                s["coop"]["s3_fetches"],
+                s["coop"]["hedges_fired"],
+                s["ack"]["streamed_ahead"],
+                s["ack"]["streamed_installed"],
+                s["ack"]["streamed_dropped"],
+                s["log_stream"]
+            );
+        }
+        env.existing_s3_proxy().remove_all_toxics()?;
+        anyhow::ensure!(failures.is_empty(), "{NAME}: {failures:#?}");
+        Ok(())
+    })();
+    if result.is_err() || std::env::var_os("VISLAT_KEEP_LOGS").is_some() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}
+
+/// Campaign 6 finding A-1 (and campaign 4's): SQLite's first touch of a
+/// new database from two nodes at once hit `disk I/O error` on the OVH
+/// bucket (4 of 40 rounds) and never on AWS. The failing rounds began
+/// the moment placement delegated the race directory to one of the two
+/// racers. Under injected S3 latency (every request >= 2 x
+/// `SQLITE_LAT_MS`, so every write-through `fsync` holds SQLite's lock
+/// for a few hundred ms), `SQLITE_ROUNDS` (50) rounds of two nodes
+/// running `CREATE TABLE IF NOT EXISTS` + `INSERT` on one new database,
+/// cycling through every pair of the three nodes, alternately in a
+/// directory the root sequences and in one delegated to `b` (so the
+/// locks are granted by a delegate, capped by its delegation): no round
+/// may fail, and every database holds both rows on every node.
+pub fn sqlite_first_touch_latency(_seed: u64) -> Result<()> {
+    const NAME: &str = "sqlite-first-touch-latency";
+    if !sqlite_available() {
+        eprintln!("    {NAME}: no sqlite3 on the host; skipped");
+        return Ok(());
+    }
+    let lat = knob("SQLITE_LAT_MS", 150);
+    let rounds = knob("SQLITE_ROUNDS", 50) as usize;
+    let mut extra = PRODUCT_DEFAULTS.to_vec();
+    // The delegation below stays put (placement would recall it once
+    // its share drops).
+    extra.push(("CONSTELLATION_DELEGATION_PLACEMENT", "off"));
+    let (env, _root, mut clients, _proxies) = cluster(NAME, &["a", "b", "c"], &extra, 3)?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        std::fs::create_dir(a.mnt.join("race"))?;
+        std::fs::create_dir(a.mnt.join("deleg"))?;
+        for x in &clients {
+            eventually("race dirs visible", Duration::from_secs(30), || {
+                anyhow::ensure!(x.mnt.join("race").is_dir() && x.mnt.join("deleg").is_dir());
+                Ok(())
+            })?;
+        }
+        super::m9::wait_for_backup(a, Duration::from_secs(60))?;
+        delegate(a, "/deleg", node_id(&clients[1])?)?;
+        let gen = wait_installed(&clients[1], "/deleg", Duration::from_secs(30))?;
+        eprintln!("    {NAME}: /deleg delegated to b (gen {gen})");
+        env.existing_s3_proxy().latency(lat, 0)?;
+        let mut failures = Vec::new();
+        let started = Instant::now();
+        const PAIRS: [[usize; 2]; 3] = [[1, 2], [0, 1], [0, 2]];
+        for i in 0..rounds {
+            let pair = PAIRS[(i / 2) % 3];
+            let dir = if i % 2 == 0 { "race" } else { "deleg" };
+            let name = format!("{dir}/first-touch-{i}.db");
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = pair
+                .iter()
+                .map(|&k| {
+                    let db = clients[k].mnt.join(&name);
+                    let who = clients[k].name.clone();
+                    let barrier = barrier.clone();
+                    // Diagnosis: `SQLITE_STRACE_DIR=<dir>` records every
+                    // failed syscall of each racer (`strace -Z`).
+                    let strace = std::env::var("SQLITE_STRACE_DIR")
+                        .ok()
+                        .map(|d| format!("{d}/round{i}-{who}.strace"));
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let t = Instant::now();
+                        let mut cmd = match &strace {
+                            Some(out) => {
+                                let mut c = std::process::Command::new("strace");
+                                c.args(["-f", "-Z", "-tt", "-o", out, "sqlite3"]);
+                                c
+                            }
+                            None => std::process::Command::new("sqlite3"),
+                        };
+                        let out = cmd
+                            .arg("-cmd")
+                            .arg(".timeout 10000")
+                            .arg(&db)
+                            .arg(format!(
+                                "CREATE TABLE IF NOT EXISTS t(node TEXT); \
+                                 INSERT INTO t VALUES('{who}');"
+                            ))
+                            .output();
+                        (who, t.elapsed(), out)
+                    })
+                })
+                .collect();
+            for h in handles {
+                let (who, took, out) = h.join().expect("sqlite racer");
+                let out = out.context("running sqlite3")?;
+                if !out.status.success() {
+                    let msg = format!(
+                        "round {i}: {who} after {took:?}: {}{}",
+                        String::from_utf8_lossy(&out.stdout).trim(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                    eprintln!("    {NAME}: FAILED {msg}");
+                    failures.push(msg);
+                }
+            }
+        }
+        eprintln!(
+            "    {NAME}: {rounds} rounds in {:?}, {} failed",
+            started.elapsed(),
+            failures.len()
+        );
+        env.existing_s3_proxy().remove_all_toxics()?;
+        // Every database holds both racers' rows, on every node.
+        anyhow::ensure!(failures.is_empty(), "{NAME}: {failures:#?}");
+        for x in &clients {
+            eventually(
+                &format!("{} reads both rows of every database", x.name),
+                Duration::from_secs(60),
+                || {
+                    for i in 0..rounds {
+                        let dir = if i % 2 == 0 { "race" } else { "deleg" };
+                        let name = format!("{dir}/first-touch-{i}.db");
+                        let out = std::process::Command::new("sqlite3")
+                            .arg("-cmd")
+                            .arg(".timeout 10000")
+                            .arg(x.mnt.join(&name))
+                            .arg("SELECT count(*) FROM t;")
+                            .output()?;
+                        let rows = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        anyhow::ensure!(
+                            out.status.success() && rows == "2",
+                            "{}: {name} holds {rows:?} rows ({})",
+                            x.name,
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        );
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}

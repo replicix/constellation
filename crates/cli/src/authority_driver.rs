@@ -891,7 +891,7 @@ impl Driver {
         // M16: the root lease's placement counts them too (it hears of
         // core-executed ops through `Action::Reply` only).
         let fast_ops = self.deps.delegates.take_fast_path_ops();
-        self.deps.placement.note_ops(self.node_id, fast_ops);
+        self.deps.placement.note_own(self.node_id, fast_ops);
         let cfg = self.core.config();
         let lease = self.core.lease();
         self.deps

@@ -971,7 +971,11 @@ invariant 2 forces its op after the delete regardless of what it had seen.
   remain available as `CONSTELLATION_COOP_DIGEST=bloom`. Chunks are
   self-verifying (hash), so peer serving needs no trust or invalidation,
   and a wrong mirror only costs a declined fetch; S3 remains the source of
-  truth.
+  truth. A chunk no mirror lists yet, named by a manifest just applied
+  from another node, is asked of the node that wrote it first (the
+  writer's delta usually arrives after the manifest), so reading a file
+  another node has just closed costs no S3 GET
+  ([Freshly written chunks](../reference/features/cooperative-cache.md#freshly-written-chunks)).
   A cache may be a thin slice of the dataset or the whole of it: a node
   is free to dedicate one or more full local drives, so 1–4 TiB is an
   ordinary size. Each node sizes and evicts independently; nothing

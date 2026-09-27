@@ -334,6 +334,19 @@ impl Peers {
         peer.is_some_and(|p| self.is_self(&p))
     }
 
+    /// Whether `node_id` is a peer this node can dial (in the roster, not
+    /// this node itself), without copying the roster.
+    pub fn knows(&self, node_id: u64) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        if node_id == inner.node_id {
+            return false;
+        }
+        let peer = inner.peers.lock().unwrap().get(&node_id).cloned();
+        peer.is_some_and(|p| !self.is_self(&p))
+    }
+
     /// [`Peers::snapshot`] without entries that are really this node:
     /// the roster to initiate traffic from.
     pub fn remote_snapshot(&self) -> Vec<Peer> {

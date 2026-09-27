@@ -27,9 +27,12 @@
 //!
 //! Rendezvous hashing (an alternative to "whoever already has it") is
 //! intentionally not wired; the selector only ranks sources that already
-//! claim the chunk.
+//! claim the chunk — or, for a chunk no mirror lists yet, the node that
+//! wrote the manifest naming it ([`fresh`]: a new file read on another
+//! node before the writer's delta arrived).
 
 mod exact;
+mod fresh;
 
 use crate::sources::{Selector, SourceId};
 use anyhow::{bail, Result};
@@ -207,6 +210,10 @@ struct Counters {
     reconcile_failures: AtomicU64,
     /// Part of `digest_cpu_us` spent answering or applying rounds.
     reconcile_cpu_us: AtomicU64,
+    /// Fetches of a chunk no mirror listed, from the node that wrote the
+    /// manifest naming it ([`fresh`]): served, or declined.
+    fresh_hint_hits: AtomicU64,
+    fresh_hint_misses: AtomicU64,
 }
 
 pub struct Coop {
@@ -245,6 +252,9 @@ pub struct Coop {
     /// dirty chunks, and a reader tries them when no digest names a
     /// holder.
     epoch_members: Mutex<Option<Arc<Mutex<Vec<u64>>>>>,
+    /// Who wrote the chunks of the manifests recently applied from
+    /// other nodes ([`fresh`]).
+    fresh: Mutex<fresh::FreshHints>,
 }
 
 /// [`Coop::offer`]'s claim: the chunks stay servable until it drops.
@@ -352,7 +362,29 @@ impl Coop {
             config,
             offered: Mutex::new(HashMap::new()),
             epoch_members: Mutex::new(None),
+            fresh: Mutex::new(fresh::FreshHints::default()),
         })
+    }
+
+    /// The hook for the manifests the replica applies from other nodes
+    /// (`Meta::set_foreign_apply_hook`): remember who wrote their chunks,
+    /// so a read that finds no mirror listing one asks the writer before
+    /// S3 ([`fresh`]).
+    pub fn note_foreign_records(&self, records: &[constellation_meta::LogRecord]) {
+        if !self.config.enabled {
+            return;
+        }
+        let written = fresh::written_chunks(records);
+        if written.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut hints = self.fresh.lock().unwrap();
+        for (origin, hash) in written {
+            if origin != self.node_id {
+                hints.note(origin, &hash, now);
+            }
+        }
     }
 
     /// EC2 finding 1: make `hashes` servable to peers — dirty or not —
@@ -638,15 +670,29 @@ impl Coop {
         self.config.enabled && !self.holders(hash).is_empty()
     }
 
-    fn candidates(&self, hash: &ChunkHash) -> Vec<SourceId> {
+    /// The sources to rank for `hash`, and the peer among them that is
+    /// only there on a [`fresh`] hint (no mirror lists the chunk yet).
+    fn candidates(&self, hash: &ChunkHash) -> (Vec<SourceId>, Option<u64>) {
         let mut cands = Vec::new();
+        let mut hinted = None;
         if self.config.enabled {
             for id in self.holders(hash) {
                 cands.push(SourceId::Peer(id));
             }
+            if cands.is_empty() {
+                hinted = self
+                    .fresh
+                    .lock()
+                    .unwrap()
+                    .origin(hash, Instant::now())
+                    .filter(|id| self.peers.is_enabled() && self.peers.knows(*id));
+                if let Some(id) = hinted {
+                    cands.push(SourceId::Peer(id));
+                }
+            }
         }
         cands.push(SourceId::S3);
-        cands
+        (cands, hinted)
     }
 
     /// Cache-first fetch with source selection. Inserts a successful
@@ -705,7 +751,7 @@ impl Coop {
                     if !r.is_success() {
                         self.selector.lock().unwrap().end(src);
                     }
-                    if let Some(fetched) = self.settle(hash, src, r, read_back) {
+                    if let Some(fetched) = self.settle(hash, src, r, read_back, None) {
                         self.counters
                             .epoch_member_fetches
                             .fetch_add(1, Ordering::Relaxed);
@@ -714,7 +760,7 @@ impl Coop {
                 }
             }
         }
-        let cands = self.candidates(hash);
+        let (cands, hinted) = self.candidates(hash);
         let size = u64::from(self.chunk_size);
         let (primary, hedge, deadline, s3_eta_ms) = {
             let mut sel = self.selector.lock().unwrap();
@@ -766,7 +812,7 @@ impl Coop {
         let result = if let Some(hsrc) = hedge {
             let sleep = tokio::time::sleep(Duration::from_millis(deadline));
             tokio::select! {
-                r = &mut primary_f => self.settle(hash, primary, r, read_back),
+                r = &mut primary_f => self.settle(hash, primary, r, read_back, hinted),
                 _ = sleep => {
                     self.counters.hedges_fired.fetch_add(1, Ordering::Relaxed);
                     self.selector.lock().unwrap().begin(hsrc);
@@ -778,11 +824,11 @@ impl Coop {
                             match r {
                                 result if result.is_success() => {
                                     self.selector.lock().unwrap().end(hsrc);
-                                    self.settle(hash, primary, result, read_back)
+                                    self.settle(hash, primary, result, read_back, hinted)
                                 }
                                 other => {
-                                    self.note_fail(hash, primary, &other);
-                                    self.settle(hash, hsrc, hedge_f.await, read_back)
+                                    self.note_fail(hash, primary, &other, hinted);
+                                    self.settle(hash, hsrc, hedge_f.await, read_back, hinted)
                                 }
                             }
                         }
@@ -790,12 +836,12 @@ impl Coop {
                             match r {
                                 result if result.is_success() => {
                                     self.selector.lock().unwrap().record_cancelled(primary);
-                                    self.settle(hash, hsrc, result, read_back)
+                                    self.settle(hash, hsrc, result, read_back, hinted)
                                 }
                                 other => {
                                     self.selector.lock().unwrap().end(hsrc);
-                                    self.note_fail(hash, hsrc, &other);
-                                    self.settle(hash, primary, primary_f.await, read_back)
+                                    self.note_fail(hash, hsrc, &other, hinted);
+                                    self.settle(hash, primary, primary_f.await, read_back, hinted)
                                 }
                             }
                         }
@@ -803,7 +849,7 @@ impl Coop {
                 }
             }
         } else {
-            self.settle(hash, primary, primary_f.await, read_back)
+            self.settle(hash, primary, primary_f.await, read_back, hinted)
         };
 
         match result {
@@ -823,7 +869,7 @@ impl Coop {
     ) -> Result<Fetched> {
         self.selector.lock().unwrap().begin(SourceId::S3);
         let r = self.fetch_s3_spilled(hash, priority).await;
-        match self.settle(hash, SourceId::S3, r, read_back) {
+        match self.settle(hash, SourceId::S3, r, read_back, None) {
             Some(fetched) => Ok(fetched),
             None => bail!("chunk {} unavailable from peers and S3", hash.to_hex()),
         }
@@ -855,12 +901,14 @@ impl Coop {
         .ok()
     }
 
+    /// `hinted`: the peer that was a candidate only on a [`fresh`] hint.
     fn settle(
         &self,
         requested: &ChunkHash,
         src: SourceId,
         r: FetchResult,
         read_back: bool,
+        hinted: Option<u64>,
     ) -> Option<Fetched> {
         match r {
             FetchResult::Data {
@@ -875,8 +923,13 @@ impl Coop {
                 selector.record_transport(src, rtt, path);
                 selector.record_ok(src, ttfb_ms, n, total_ms);
                 drop(selector);
-                if matches!(src, SourceId::Peer(_)) {
+                if let SourceId::Peer(id) = src {
                     self.counters.peer_hits.fetch_add(1, Ordering::Relaxed);
+                    if hinted == Some(id) {
+                        self.counters
+                            .fresh_hint_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 let bytes = data.len() as u64;
                 let _ = self.cache.insert(requested, &data, ChunkState::Clean);
@@ -920,14 +973,26 @@ impl Coop {
                 })
             }
             other => {
-                self.note_fail(requested, src, &other);
+                self.note_fail(requested, src, &other, hinted);
                 None
             }
         }
     }
 
-    fn note_fail(&self, hash: &ChunkHash, src: SourceId, r: &FetchResult) {
+    fn note_fail(&self, hash: &ChunkHash, src: SourceId, r: &FetchResult, hinted: Option<u64>) {
         let mut sel = self.selector.lock().unwrap();
+        if let (SourceId::Peer(id), FetchResult::Miss(_)) = (src, r) {
+            if hinted == Some(id) {
+                // A hint is a guess (the writer may have evicted the
+                // chunk, or a rid-less transaction was misattributed):
+                // no false positive, no penalty for the peer.
+                sel.end(src);
+                self.counters
+                    .fresh_hint_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         match r {
             FetchResult::Miss(why) => {
                 sel.record_miss(src);
@@ -1076,7 +1141,8 @@ impl Coop {
                 // Lat/BW stay None until a real transfer — priors must not
                 // look like measurements next to probe RTT.
                 ttfb_ms_ewma: (s.ok_samples > 0).then_some(s.ttfb_ewma_ms),
-                goodput_mbps_ewma: (s.ok_samples > 0).then_some(s.goodput_bps * 8.0 / 1_000_000.0),
+                goodput_mbps_ewma: (s.goodput_samples > 0)
+                    .then_some(s.goodput_bps * 8.0 / 1_000_000.0),
                 aggregate_mbps_ewma: (s.ok_samples > 0)
                     .then_some(s.aggregate_bps_live() * 8.0 / 1_000_000.0),
                 hit_rate: s.hit_rate,
@@ -1121,6 +1187,8 @@ impl Coop {
             reconcile_rounds: self.counters.reconcile_rounds.load(Ordering::Relaxed),
             reconcile_failures: self.counters.reconcile_failures.load(Ordering::Relaxed),
             reconcile_cpu_us: self.counters.reconcile_cpu_us.load(Ordering::Relaxed),
+            fresh_hint_hits: self.counters.fresh_hint_hits.load(Ordering::Relaxed),
+            fresh_hint_misses: self.counters.fresh_hint_misses.load(Ordering::Relaxed),
             local_set_entries: self.local.lock().unwrap().keys.len() as u64,
             peer_set_entries,
             peer_set_bytes,
@@ -1908,7 +1976,7 @@ mod tests {
             },
         );
         put_bucket(&disabled, 2, 1, &[h(1)], 0, 1);
-        assert_eq!(disabled.candidates(&ChunkHash(h(1))), vec![SourceId::S3]);
+        assert_eq!(disabled.candidates(&ChunkHash(h(1))).0, vec![SourceId::S3]);
         assert_eq!(
             disabled.serve_chunk(h(1), "peer").await,
             Err(ChunkDecline::Busy)
