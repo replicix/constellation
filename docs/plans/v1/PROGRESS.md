@@ -25014,6 +25014,281 @@ whatever the ETA.
    to stream epoch journal records), a design question across M9 and
    M10.
 
+### Round 2 (2026-09-27): flex-crash 0..20000, members follow the epoch stream
+
+Both open findings above are fixed. Base: `7a681ee` (rebased over
+`a1bed13`'s lock-renewal timing, `Meta::vacuum_churn` and slow-op
+logging, and `7a681ee`'s DESIGN.md; no conflicts).
+
+#### 1. flex-crash: seed 30702 and the 35 seeds a wider sweep found
+
+**Seed 30702.** Node 1 was partitioned from holder 3 while 3 shipped
+seq 14–18. Then both lost S3 and formed an epoch carrying 3's lease. 3
+handed its hold, whose journal was empty, to node 1 over P2P. Node 1 was
+still at seq 13 and executed against it: its `Unlink(f3)` took effect
+after seq 18 had already removed `f3`. Outside an epoch a successor
+catches up to the handoff's `head_seq` from S3; inside one it cannot,
+and the epoch-mode handoff ignored `head_seq`.
+- Fix: `PeerMsg::LeaseRequest` (and `Payload::LeaseRequest`) now carries
+  `epoch_applied: Option<Seq>`: `Some(applied)` asks for an epoch hold
+  transfer, `None` for the S3 handoff.
+- The holder hands its hold only to a requester at its head; otherwise
+  it declines and the requester forwards (`epoch_handoffs_behind`).
+
+A sweep of `flex-crash` 0..20000 on `27f919c` failed 35 seeds. Of the 26
+I checked on `71dc7e7`, 20 failed there too, so most predate round 2.
+With the seed 30702 fix, 26 still failed, in these classes:
+- **A hold re-adopted after it had left** (seed 166).
+  - Node 2 handed its journal-less hold to node 1, which journaled under
+    it and crashed.
+  - The freeze re-reported the epoch, and M12's restart-adoption path
+    (seed 30299's rule) adopted the carried hold a second time.
+  - Node 2 then flushed nothing, closed the epoch and released the
+    lease; node 1's acknowledged journal later met epoch 2.
+  - Fix: a node persists the carried lease `(epoch, expiry)` whose hold
+    it let go (`epoch_hold_ended`, synced before a handoff reply). It
+    records this whenever the hold goes: a handoff, the close, a
+    release in a frozen epoch, a deposition.
+  - Neither restart path (`restore_epoch_hold`, the seed 30299 rule)
+    adopts that hold again. A hold handed back clears the marker.
+  - The persisted hold is no longer overwritten while a restarted
+    owner's hold still waits to be re-adopted.
+- **An epoch request answered by an S3 release** (seed 2236).
+  - The requester's epoch was active while the holder's was still
+    frozen.
+  - The handoff job flushed and released the S3 lease. The requester
+    adopted a local hold on the strength of the reply, and a third node
+    claimed the freed lease beside it.
+  - Fix: the two kinds are never crossed. An epoch request is answered
+    only by the hold transfer, an S3 request only by the handoff job.
+- **A member closing while the carrier still held the epoch** (seed 4309
+  and most of the "two authorities" seeds).
+  - A member's rule was to close once a segment past its `base` exists.
+  - A member paused at the activation had a `base` below the holder's
+    pre-outage segments. Tailing those after the heal closed its epoch,
+    it promised, and a third node took over the lease the paused holder
+    still held as the epoch's authority.
+  - Fix: once S3 is back, a member that does not own the hold reads the
+    lease object (`Phase::EpochCarrierCheck`). It closes only when the
+    carried lease is gone (re-claimed with a new expiry, released, or
+    another holder).
+  - Meanwhile it still uploads its own pending chunks, which is the
+    round-1 fix for `continuation-epoch`'s 60 s mutual wait.
+- **An op refused though already sent** (seed 10248).
+  - A frozen epoch refused every op waiting for the lease with `EROFS`,
+    including one already forwarded, whose reply had been lost.
+  - Its resubmission did not check `completed`, executed a second time,
+    and answered `EEXIST` for its own create.
+  - Fix: a sent op gets the log's answer if this node has applied one,
+    else it goes in doubt (`EIO`, retried by rid, in doubt again).
+- **A landed write answered in doubt** (seed 2140). The deadline fired
+  between a takeover's CAS and its gate, and only a non-holder consulted
+  `completed`. Fix: `Core::settled_outcome` also answers a holder's own
+  journaled outcome once the lease's policy makes it durable. A deposed
+  holder's never.
+- **The epoch journal published as the log prefix** (seeds 11719,
+  19585).
+  - A paused carrier resumed, adopted the hold (`holder_epoch` 0) and
+    journaled forwarded ops uncaptured.
+  - A publish it had queued as S3 holder then ran on `publish_basis`'s
+    AsIs branch ("a non-holder's uncaptured writes are pre-M3b
+    leftovers").
+  - Fix: uncaptured unshipped writes now defer the publish. In the
+    daemon they only arise under authority: an epoch hold, or the window
+    between its close and the flush's re-claim.
+  - The old branch stays for unit tests of the tree publisher, which
+    publish local writes nothing shipped
+    (`Meta::set_publish_unshipped_for_tests`, via
+    `mtree_publish::test_meta`).
+
+The sim's debug narration now stamps each line `t=<simulated ms>`, the
+fault log's clock.
+
+#### 2. Members keep following the hold owner's log stream during an epoch
+
+As decided, an epoch is exactly when S3 cannot deliver the log, so the
+P2P stream is the only path.
+- `stream_serving`: the epoch hold owner keeps serving. Its ring holds
+  the segments it shipped before the outage, so a member that missed
+  some, like seed 30702's partitioned node, catches up.
+- `stream_upstream`: members keep following it (the "no longer
+  following a holder" drop at activation is gone). A giver of the hold
+  switches to the new owner.
+- The hold owner streams its epoch journal ahead as it grows
+  (`backup_after_event` → `stream_ahead_soon`, up to the journal tip).
+  This is M9's `StreamAhead` path unchanged: members install it as
+  `Streamed` speculation, retired by the segments the flush ships at the
+  close or stranded by a later epoch.
+- A (re)subscribing member gets the epoch journal from its start again;
+  what it holds already it skips.
+- **Nothing is acknowledged that could not be delivered.** A forward
+  reply whose `base` names the holder's unshipped journal still waits in
+  `AwaitingLog`. It is answered only when the stream has installed that
+  journal in order (`answer_awaiting_streamed` / `adopt_streamed`),
+  never on the reply alone. A member whose applied log is below the
+  batch's `base` keeps it waiting, as in M9.
+- **The one change to M9's rules: the chunk gate is lifted inside an
+  active epoch.**
+  - The gate stops the stream at a manifest whose chunks are not in S3.
+    In an epoch nothing can be in S3 until the close, so it would stop
+    the stream at the first file write. In `continuation-epoch` that was
+    A's write, which B's forward depended on.
+  - Every such chunk is on a member: the hold owner's own writes, or a
+    member's forwarded close.
+  - So while an epoch is open, `Coop` serves its dirty chunks to peers,
+    and a reader asks the epoch's members when no digest names a holder
+    (`EpochManager::members_open` → `Coop::set_epoch_members`).
+- **A livelock the first version had** (seeds 1072, 2247, 3098, 11548,
+  12286, 14556, growing to 6–9 GB).
+  - The stream's gap rule nudges a round when the stream shows a
+    sequence it lacks, so S3 can supply it.
+  - A frozen member's round ends at once, and each round's drain nudged
+    the next: a zero-delay poll loop at one simulated instant.
+  - Fix: no gap nudges while an epoch is open. S3 is what the epoch
+    lacks, and its probe rounds keep their own cadence.
+
+Counters: `status.epoch.streamed_ahead` (hold owner), `streamed_installed`
+and `forwards_streamed` (member), `handoffs_behind`.
+
+#### Tests
+
+- `authority::core::tests`:
+  - `an_epoch_hold_goes_only_to_a_requester_at_the_holders_head`
+    (fails without the rule);
+  - `a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile`
+    replaces round 1's member-upload test;
+  - the handoff tests use the new `LeaseRequest`.
+- `tests/sim.rs`:
+  - `flex_crash_seed_30702_an_epoch_hold_goes_only_to_a_caught_up_member`;
+  - `flex_crash_regression_seeds`: all 35 seeds from `27f919c` plus the
+    six livelock seeds;
+  - `flex_members_follow_the_epoch_holders_stream`: 40 flex seeds; hold
+    owners stream, members install, and member forwards are answered
+    from the stream;
+  - `sweep_config` accepts `flex` and `flex-crash`, and prints the
+    epoch-stream installs.
+- `continuation-epoch` asserts B's forwarded write completes within 10 s
+  and prints what B installed from A's stream.
+
+#### Results (final code, on `7a681ee`)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) clean.
+- Sims:
+  - `flex-crash` 0..20000: every seed passes. The per-seed run under a
+    4 GB `ulimit -v` reported 15 exit-101s that all pass when rerun
+    without the cap (the cap under 16 parallel processes); none timed
+    out or aborted.
+  - `flex` 0..20000: every seed passes; in process, members installed
+    224 810 transactions from an epoch's stream, and 39 212 forwards
+    were answered from a stream.
+  - `long_flex`, `long_backup`, `long_random` (1000 seeds each) pass.
+  - `constellation-authority --release` passes: lib, meta_repro 3, sim
+    101.
+- Unit tests: `constellation` (cli 241), `-net`, `-meta`, `-api` all
+  pass (713 tests in total with the authority suite).
+- Scenarios (prefix `constellation-harness-epochlost`):
+  - `continuation-epoch` 5/5, 13–18 s (was 53–56 s). B's write took
+    7–15 ms (was 40 s); B installed 4 transactions from A's stream, and
+    one of its forwards was answered by it.
+  - `epoch-member-lost` 5/5.
+  - `epoch-peer-reaching-s3-declines`, `epoch-missing-node`,
+    `epoch-holder-retired`, `epoch-slack-zero-unchanged`,
+    `s3-cut-one-node`, `p2p-partition-one-node`, `deposed-reintegration`,
+    `forwarded-mutations` and `coop-cache-hit` pass.
+
+#### Review: chunks named by streamed epoch manifests
+
+Lifting M9's chunk gate inside an epoch needs three things to stay true.
+They do, and here is where:
+- **(a) The log never names a chunk S3 lacks.**
+  - Every forward names the chunks still pending on its sender
+    (`authority_driver.rs`, the `MutateRequest` arm, via
+    `forwarded_pending_chunks`). The holder enrolls them as remote pending
+    rows before it executes (`enroll_remote_chunks`).
+  - The ship plan defers a transaction naming a pending chunk, and
+    everything depending on it (`store::held::take_shippable` / `plan`).
+    `through` stops below the first skipped row
+    (`Session::journal_through_after`).
+  - The close's complete pass waits `CONSTELLATION_REMOTE_CHUNK_WAIT_S`
+    for such chunks, then ships what does not need them (`run_complete`).
+  - Publishes substitute before-images or defer (`publish_basis_at`).
+  - Streaming changes none of this: it happens on members, never on the
+    ship path.
+  - If the chunk's owner never returns, the transaction stays deferred
+    (never shipped), and the owner's upload pass keeps polling S3 for the
+    chunk.
+- **(b) A reader never gets wrong bytes.**
+  - Peer bytes are verified against the hash (`Coop::fetch_from`).
+  - With no member holding the chunk and S3 away or lacking it, the read
+    fails with `EIO`.
+  - If a later epoch strands the manifest (a takeover), it rolls back
+    like any speculation.
+- **(c) A member never publishes a streamed record.** Streamed
+  transactions are `Streamed` speculation with before-images
+  (`install_streamed`), and any outstanding speculation defers the
+  publish (`publish_basis_at`). They retire only by the segment that
+  ships them: rows-confirmed, or covered by a `through` that stops below
+  a deferred transaction.
+
+New coverage:
+- `meta/tests/speculation.rs::a_streamed_manifest_held_back_by_its_chunk_stays_speculation_until_it_ships`:
+  - the member defers its publishes;
+  - a segment shipping a later transaction past the deferred manifest
+    does not retire it (the test fails if `through` claims it);
+  - the manifest either retires when its segment lands, or is rolled
+    back when a later epoch strands it.
+- The harness scenario `epoch-member-dies-with-chunk`, end to end with
+  real chunks: see TESTING.md.
+- The coop read path was tightened for it. The first version added the
+  members as extra selector candidates, so a miss on the first member
+  could fall through to S3 without asking the one that had the chunk.
+  Now a chunk no digest names is asked of each member in turn
+  (`status.coop.epoch_member_fetches`), then the usual sources.
+
+**Found in the post-rebase sweep (on `acc977a`): flex-crash seed 16755.**
+- The hold owner closed its epoch with nothing to flush, so it never
+  touched the lease object.
+- The member-close rule of this round (close once the carried lease has
+  moved) then left the member waiting for good.
+- Its forwards got `NotHolder` from the former owner, and its clients
+  went in doubt.
+- Seeds where the owner journaled something re-claim the lease through
+  the flush, which is why the earlier sweeps passed.
+- Fix:
+  - a hold owner that closes its epoch records the obligation with the
+    ended hold (`epoch_hold_ended`, persisted, so a restart keeps it);
+  - it queues an `epoch-close-reclaim` acquisition of its own carried
+    lease (no promises needed) until the lease object shows the carried
+    lease moved (`Core::epoch_reclaim_due` / `epoch_reclaim_settle`).
+- Tests: `a_hold_owner_with_nothing_to_flush_reclaims_the_carried_lease_at_the_close`
+  (fails without the fix), and seed 16755 in `flex_crash_regression_seeds`.
+
+**Found: a liveness gap, older than this change.**
+- The epoch hold owner journals uncaptured (`holder_epoch` 0 under an
+  epoch hold, since M5), so the ship plan cannot tell what depends on a
+  deferred transaction.
+- It defers everything journaled after the first one (`store::held`'s
+  opaque rule), the owner's own writes after the close included.
+- In the scenario, the log stays at its pre-epoch head until C returns.
+  Nothing is unsafe (all of it stays acknowledged on the owner and
+  ships once C is back), but it stalls, and `repair drop-held` covers
+  only unrecoverable chunks, not a pending remote one.
+- Fixing it means capturing under an epoch hold, which touches how a
+  deposed hold owner recovers (today it rebuilds from the head commit
+  because its rows are uncaptured). That is a design change for M3b and
+  M10, not part of this fix.
+
+#### Known limits
+
+- After a mid-epoch hold transfer, the new owner's journal is its own
+  sequence, so members drop its stream-ahead as not contiguous. Their
+  forwards wait for the log, as before this change. Transfers need an
+  empty journal and a caught-up requester, and the members keep
+  following the log stream.
+- A member reading another member's epoch write fetches the chunk from
+  the members (the digest lists clean chunks only). With more than two
+  members that may take a miss or two before the right one answers.
+
 ## Fix: git under back-to-back turns (campaign 5 E-1/E-2)
 
 EC2 campaign 5 ran the git-under-flock workload back to back on ee3f65b

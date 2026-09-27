@@ -548,7 +548,7 @@ mod tests {
     async fn dangling_detector_never_silently_truncates() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let chunks = constellation_store_s3::ChunkStore::new(object_store.clone());
-        let meta = Meta::open_in_memory().unwrap();
+        let meta = crate::mtree_publish::test_meta();
         let file = meta.create(1, "lost", 0o644, 0, 0).unwrap();
         let hash = chunks.hash(b"missing");
         let manifest =
@@ -587,7 +587,7 @@ mod tests {
         use constellation_store_s3::{BlobStore, CommitChain, NodeCache, PackStore};
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let dir = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
         for i in 0..300 {
             meta.create(dir, &format!("f{i}"), 0o644, 0, 0).unwrap();

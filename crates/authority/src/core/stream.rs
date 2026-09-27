@@ -35,8 +35,8 @@
 //!
 //! # Epoch changes
 //!
-//! A node serves only while it holds the lease (not deposed, not in a
-//! continuation epoch). Losing, releasing or handing it off ends every
+//! A node serves only while it holds the lease or a continuation epoch's
+//! hold (not deposed). Losing, releasing or handing it off ends every
 //! subscription (`LogStreamEnd`); a subscriber that learns of a different
 //! holder (a newer segment, a lease read, a redirect) or takes the lease
 //! itself drops its stream. A new holder's first streamed segment is its
@@ -44,6 +44,20 @@
 //! deposed (it has not yet noticed) only ever streams segments that are
 //! in S3 at those sequences, which the subscriber's own fencing handles
 //! exactly as a tail would.
+//!
+//! # Continuation epochs
+//!
+//! An epoch is exactly when S3 cannot deliver, so the stream is the only
+//! path by which a member learns the hold owner's log. The hold owner
+//! keeps serving (its ring: the segments it shipped before the outage, so
+//! a member that missed some catches up — flex-crash seed 30702's
+//! partitioned member), and it streams its epoch journal ahead
+//! (`StreamAhead`, M9's machinery: installed as `Streamed` speculation,
+//! retired by the segments its flush ships at the close, stranded if a
+//! later epoch's segments come first). Members keep following it, so a
+//! forward reply whose `base` names the holder's unshipped journal is
+//! answered once the stream reaches it — never before — instead of
+//! waiting for a log that cannot arrive until S3 returns.
 //!
 //! # Holder side, bounded
 //!
@@ -167,13 +181,13 @@ impl Core {
         }
     }
 
-    /// This node may serve its log: it holds the lease through S3.
+    /// This node may serve its log: it holds the lease through S3, or a
+    /// continuation epoch's hold.
     fn stream_serving(&self) -> bool {
         self.cfg.log_streams
             && self.cfg.p2p
-            && self.lease.held.is_some()
+            && (self.lease.held.is_some() || self.lease.epoch_held())
             && !self.lease.lost
-            && !self.lease.epoch_held()
     }
 
     /// Plan 30 §M9: the subscribers this holder serves (pre-S3 streaming
@@ -319,6 +333,13 @@ impl Core {
                 last_sent: now,
             },
         );
+        if self.epoch_streams_ahead() {
+            // A (re)subscribing member may have missed stream-ahead
+            // batches (nothing ships during an epoch to carry them
+            // later): stream the epoch journal again from its start;
+            // what a subscriber holds already it skips.
+            self.restream_ahead();
+        }
         let backlog: Vec<(Seq, Vec<u8>)> = self
             .stream
             .ring
@@ -418,9 +439,8 @@ impl Core {
         if self.lease.held.is_some() || self.lease.epoch_held() || self.lease.lost {
             return None;
         }
-        if self.epoch.open {
-            return None;
-        }
+        // (A member of an open continuation epoch keeps following the
+        // hold owner: see the module comment.)
         let holder = self.lease.cached_holder?;
         (holder != 0 && holder != self.cfg.node_id).then_some(holder)
     }
@@ -689,8 +709,15 @@ impl Core {
             self.stats.stream_applied += applied;
             self.answer_awaiting_log(now, replica, out);
         }
-        // Missing a sequence the stream will not deliver: S3 has it.
+        // Missing a sequence the stream will not deliver: S3 has it. (Not
+        // during an epoch: S3 is what the epoch is without, and its probe
+        // rounds keep their own cadence. Flex-crash seed 1072: a frozen
+        // member, whose round ends at once, was nudged again by every
+        // round's drain — a zero-delay poll loop.)
         let next = self.ship.next_seq;
+        if self.epoch.open {
+            return;
+        }
         if let Some(sub) = self.stream.sub.as_ref() {
             let gap = sub.buf.first_key_value().is_some_and(|(s, _)| *s > next);
             if sub.live && (gap || next <= sub.head) {

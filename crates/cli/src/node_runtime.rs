@@ -728,6 +728,7 @@ impl NodeRuntime {
             node_id,
             fsmeta.chunk_size,
         );
+        coop.set_epoch_members(epochs.members_open.clone());
         let upload = Arc::new(crate::UploadRuntime::new(
             caps.create_if_absent,
             Some(coop.clone()),

@@ -1652,11 +1652,12 @@ pub fn run_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         });
     }
-    // `RUST_LOG=constellation_authority=debug` narrates a replay.
+    // `RUST_LOG=constellation_authority=debug` narrates a replay, each
+    // line stamped with the simulated time (`t=` ms, as the fault log).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
-        .without_time()
+        .with_timer(SimTime)
         .try_init();
     install_panic_hook();
     let me = std::thread::current().id();
@@ -1682,6 +1683,7 @@ pub fn run_seed(seed: u64, cfg: SimConfig) -> Result<Report, String> {
 async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let mut rng = StdRng::seed_from_u64(seed);
     let clock = Clock::start();
+    SIM_START.with(|t| t.set(Some(tokio::time::Instant::now())));
     let bucket = Bucket::new(seed, cfg.s3_latency);
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
     bus.set_stream_faults(cfg.stream_faults.clone());
@@ -2780,5 +2782,25 @@ fn home_dir(dirs: &[String], node: NodeId, client: u64) -> String {
         (None, k) => dirs[((k - 1) as usize) % dirs.len()].clone(),
         (Some(b), 0) => dirs[b].clone(),
         (Some(b), k) => dirs[(b + k as usize) % dirs.len()].clone(),
+    }
+}
+
+thread_local! {
+    /// This thread's run start, for [`SimTime`].
+    static SIM_START: std::cell::Cell<Option<tokio::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Log timestamps in simulated milliseconds since the run started.
+struct SimTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for SimTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        match SIM_START.with(|t| t.get()) {
+            Some(start) if tokio::runtime::Handle::try_current().is_ok() => {
+                write!(w, "t={}", start.elapsed().as_millis())
+            }
+            _ => write!(w, "t=?"),
+        }
     }
 }

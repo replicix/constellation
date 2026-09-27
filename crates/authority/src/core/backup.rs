@@ -682,9 +682,18 @@ impl Core {
                 self.ack.shipped_through = 0;
                 self.ack.shipped_rows.clear();
             }
-            self.ack.streamed_through = 0;
-            self.ack.ahead_of.clear();
-            self.ack.stream_ahead_pending = false;
+            if self.epoch_streams_ahead() {
+                // A continuation epoch's hold owner: its journal is
+                // acknowledged on its disk alone (`durable_jseq`) and
+                // streams ahead to the members as it grows.
+                if replica.journal_tip() > self.ack.streamed_through {
+                    self.stream_ahead_soon(now, replica, out);
+                }
+            } else {
+                self.ack.streamed_through = 0;
+                self.ack.ahead_of.clear();
+                self.ack.stream_ahead_pending = false;
+            }
             self.ack.acked_hwm = 0;
             self.report_durable(replica);
             self.watch_s3_holder(now, replica, out);
@@ -1319,7 +1328,11 @@ impl Core {
             return;
         }
         let from = self.ack.streamed_through;
-        let to = self.durable_jseq();
+        let to = if self.epoch_streams_ahead() {
+            replica.journal_tip()
+        } else {
+            self.durable_jseq()
+        };
         self.stream_ahead(now, from, to, replica, out);
         let id = self.set_timer(
             now.plus(self.cfg.stream_ahead_holdoff_ms.max(1)),
@@ -1339,10 +1352,29 @@ impl Core {
         if !std::mem::take(&mut self.ack.stream_ahead_pending) {
             return;
         }
-        if self.lease.held.is_none() || self.lease.ack_policy() != AckPolicy::Backup {
+        let backed = self.lease.held.is_some() && self.lease.ack_policy() == AckPolicy::Backup;
+        if !backed && !self.epoch_streams_ahead() {
             return;
         }
         self.stream_ahead_soon(now, replica, out);
+    }
+
+    /// Plan 30 §M10 × §M9: this node owns an active continuation epoch's
+    /// hold, and streams its journal ahead to the members following its
+    /// log stream (see `stream.rs`'s module comment).
+    pub(crate) fn epoch_streams_ahead(&self) -> bool {
+        self.cfg.pre_s3_streaming
+            && self.lease.epoch_held()
+            && !self.lease.lost
+            && self.epoch.active
+            && !self.epoch.frozen
+    }
+
+    /// Stream the epoch journal again from its start (a member
+    /// subscribed): the next stream-ahead pass resends everything.
+    pub(crate) fn restream_ahead(&mut self) {
+        self.ack.streamed_through = 0;
+        self.ack.ahead_of.clear();
     }
 
     /// The durable range `(from, to]` just became backup-acked: stream it
@@ -1394,7 +1426,20 @@ impl Core {
                 .collect()
         };
         let txs = window(start);
-        let common = replica.releasable_prefix(&txs, None).min(txs.len());
+        // In an active epoch every pending chunk is on a member (the hold
+        // owner's own writes, or a member's forwarded close): the members
+        // serve them to each other (`coop`), and nothing could upload
+        // them before the close anyway, so the S3 gate would stop the
+        // stream at the first file write for the whole epoch.
+        let in_epoch = self.epoch_streams_ahead();
+        let releasable = |txs: &[BackupTx], n: Option<NodeId>| {
+            if in_epoch {
+                txs.len()
+            } else {
+                replica.releasable_prefix(txs, n)
+            }
+        };
+        let common = releasable(&txs, None).min(txs.len());
         if common < txs.len() {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -1421,13 +1466,10 @@ impl Core {
             let own;
             let (list, upto) = if cursor > self.ack.streamed_through {
                 own = window(cursor + 1);
-                let upto = replica.releasable_prefix(&own, Some(n)).min(own.len());
+                let upto = releasable(&own, Some(n)).min(own.len());
                 (&own, upto)
             } else {
-                let upto = replica
-                    .releasable_prefix(&txs, Some(n))
-                    .max(common)
-                    .min(txs.len());
+                let upto = releasable(&txs, Some(n)).max(common).min(txs.len());
                 (&txs, upto)
             };
             let batch: Vec<BackupTx> = list[..upto]
@@ -1455,6 +1497,9 @@ impl Core {
         self.ack.streamed_through = through;
         self.ack.ahead_of.retain(|_, c| *c > through);
         self.stats.streamed_ahead += sent;
+        if in_epoch {
+            self.stats.epoch_streamed_ahead += sent;
+        }
         let _ = now;
     }
 
@@ -2018,6 +2063,9 @@ impl Core {
                         "streamed transaction installed ahead of the log"
                     );
                     self.stats.streamed_installed += 1;
+                    if self.epoch.open {
+                        self.stats.epoch_streamed_installed += 1;
+                    }
                     let keys = constellation_meta::KeySet::from_records(&tx.records);
                     for rec in &tx.records {
                         if let constellation_meta::LogRecord::Completed { rid } = rec {

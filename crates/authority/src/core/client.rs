@@ -1299,7 +1299,29 @@ impl Core {
             .map(|(rid, _)| *rid)
             .collect();
         for rid in waiting {
-            self.finish(now, rid, MutateOutcome::Errno(errno), replica, out);
+            // Flex-crash seed 10248: not an op sent anywhere before — it
+            // may have taken effect (a forward whose reply was lost), so
+            // "refused" would be a lie, and its resubmission would not
+            // check `completed`: it executed a second time and answered
+            // `EEXIST` for its own create. The log's answer if this node
+            // has applied it (a node holding nothing has `completed` rows
+            // from applied segments only, as at the deadline); otherwise
+            // in doubt (`EIO`, retryable by rid; the resubmission is in
+            // doubt too).
+            let sent = self
+                .clients
+                .get(&rid)
+                .is_some_and(|c| c.forwarded || c.attempts > 0);
+            if !sent {
+                self.finish(now, rid, MutateOutcome::Errno(errno), replica, out);
+                continue;
+            }
+            if let Some(outcome) = self.settled_outcome(rid, replica) {
+                self.stats.forward_indoubt_resolved += 1;
+                self.finish(now, rid, outcome, replica, out);
+                continue;
+            }
+            self.finish_in_doubt(now, rid, replica, out);
         }
     }
 
@@ -1573,6 +1595,9 @@ impl Core {
                     "accepted forward answered from the pre-S3 stream"
                 );
                 self.stats.awaited_log_streamed += 1;
+                if self.epoch.open {
+                    self.stats.epoch_forwards_streamed += 1;
+                }
                 if !position.streams.is_empty() {
                     self.stats.awaited_log_streamed_deleg += 1;
                 }
@@ -1793,29 +1818,52 @@ impl Core {
         if let Some(t) = c.timer.take() {
             self.cancel_timer(t, out);
         }
-        // Plan 30 §M9: not in doubt if the log already answered it. A
-        // node that holds no lease has `completed` rows only from applied
-        // segments (speculation records none), so one here is the rid's
-        // outcome in the log (acks3 seed 700087: the deposed holder's own
-        // write had landed in its last segment before a pause; its
-        // durability wait was aborted, the retries timed out, and the
-        // client heard `EIO` for a write the log carried).
-        if self.lease.held.is_none() && !self.lease.epoch_held() {
-            let epoch = self.ship.max_epoch;
-            if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
-                self.stats.forward_indoubt_resolved += 1;
-                tracing::debug!(
-                    node = self.cfg.node_id,
-                    ?rid,
-                    "deadline: the log answered the op; not in doubt"
-                );
-                self.finish(now, rid, outcome, replica, out);
-                return;
-            }
+        if let Some(outcome) = self.settled_outcome(rid, replica) {
+            self.stats.forward_indoubt_resolved += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                "deadline: the log answered the op; not in doubt"
+            );
+            self.finish(now, rid, outcome, replica, out);
+            return;
         }
         self.stats.in_doubt += 1;
         tracing::debug!(node = self.cfg.node_id, ?rid, "op goes in doubt");
         self.finish_in_doubt(now, rid, replica, out);
+    }
+
+    /// What this replica can answer for `rid` without running it, at a
+    /// point where the op would otherwise go in doubt: its `completed`
+    /// row, if that row is an outcome a client may hear now.
+    ///
+    /// Plan 30 §M9: a node that holds no lease has `completed` rows only
+    /// from applied segments (speculation records none), so one here is
+    /// the rid's outcome in the log (acks3 seed 700087: the deposed
+    /// holder's own write had landed in its last segment before a pause;
+    /// its durability wait was aborted, the retries timed out, and the
+    /// client heard `EIO` for a write the log carried). A holder's row may
+    /// be in its own unshipped journal instead: answered only when that
+    /// journal is durable under the lease's policy (flex-crash seed 2140:
+    /// the deadline fired between a takeover's CAS and its gate, and the
+    /// client heard `EIO` for a rename the log carried at seq 7). A
+    /// deposed holder's journal will be rolled back: never answered.
+    pub(crate) fn settled_outcome(&self, rid: Rid, replica: &dyn Replica) -> Option<MutateOutcome> {
+        let holds = self.lease.held.is_some() || self.lease.epoch_held();
+        if !holds {
+            return completed_as_outcome(replica, rid, self.ship.max_epoch);
+        }
+        if self.lease.lost {
+            return None;
+        }
+        let epoch = self.lease.epoch().unwrap_or(self.ship.max_epoch);
+        let outcome = completed_as_outcome(replica, rid, epoch)?;
+        let position = Position {
+            seq: self.ship.head_seq,
+            pending: replica.journal_position(epoch),
+            streams: Default::default(),
+        };
+        self.ack_need(&position).is_none().then_some(outcome)
     }
 
     /// The op is neither executed here nor answered by anyone: the client

@@ -1276,3 +1276,102 @@ fn a_root_appending_a_delegates_git_object_keeps_the_object() {
     let a = meta.getattr(x).unwrap().expect("the object's inode");
     assert_eq!(a.nlink, 1);
 }
+
+/// Plan 30 §M10 × §M9 (members follow a continuation epoch's stream): a
+/// member installs the hold owner's streamed transactions ahead of the
+/// log, including a manifest whose chunk is on another member only (in
+/// an epoch nothing reaches S3 before the close). That manifest must stay
+/// speculation until the segment carrying it lands — and it lands only
+/// once its chunk is in S3 (the holder's ship plan defers it and stops
+/// `through` below it; `store::held`). Meanwhile:
+/// - the member publishes nothing (its outstanding speculation defers
+///   every commit);
+/// - a later transaction the holder shipped past it retires alone: the
+///   out-of-order segment's `through` stops below the deferred one;
+/// - if the chunk's owner never returns and a later epoch's segment comes
+///   first (a takeover), the manifest is stranded and rolled back: the
+///   member's namespace is the log's again.
+#[test]
+fn a_streamed_manifest_held_back_by_its_chunk_stays_speculation_until_it_ships() {
+    let (f, g) = (ino(70), ino(71));
+    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let seg1 = [create("f", f, t0), create("g", g, t0 + 1)];
+    let r_manifest = Rid {
+        node: 3,
+        incarnation: 1,
+        seq: 1,
+    };
+    let r_chmod = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    let manifest_tx = [
+        LogRecord::WriteManifest {
+            ino: f,
+            base_manifest: None,
+            manifest: vec![0xAB; 24],
+            size: 4096,
+            time_ns: t0 + 2,
+        },
+        completed(r_manifest),
+    ];
+    let chmod_tx = [chmod(g, 0o600, t0 + 3), completed(r_chmod)];
+    let basis = |m: &Meta| m.read_consistent(|snap| m.publish_basis_at(snap)).unwrap();
+
+    // The log as it will read once the chunk is up: seq 2 is the chmod
+    // the holder shipped past the deferred manifest, seq 3 the manifest.
+    let shipped = Meta::open_in_memory().unwrap();
+    apply(&shipped, 1, 1, &seg1);
+    let only_chmod = Meta::open_in_memory().unwrap();
+    apply(&only_chmod, 1, 1, &seg1);
+    apply(&only_chmod, 2, 1, &chmod_tx);
+    shipped
+        .apply_segment_rows(2, 1, 0, &[4, 5], &[], &chmod_tx, &TouchSet::default())
+        .unwrap();
+    shipped
+        .apply_segment_rows(3, 1, 5, &[2, 3], &[], &manifest_tx, &TouchSet::default())
+        .unwrap();
+
+    let member = |then_ship: bool| {
+        let meta = Meta::open_in_memory().unwrap();
+        apply(&meta, 1, 1, &seg1);
+        // The holder's epoch journal: jseq 2–3 the manifest, 4–5 the chmod.
+        meta.install_streamed(1, 2, 3, &manifest_tx).unwrap();
+        meta.install_streamed(1, 4, 5, &chmod_tx).unwrap();
+        assert!(meta.has_outstanding_speculation());
+        assert_eq!(basis(&meta), PublishBasis::Defer, "nothing published");
+        // The holder ships the chmod ahead of the deferred manifest: its
+        // `through` stops below jseq 2 (`journal_through_after`).
+        meta.apply_segment_rows(2, 1, 1, &[4, 5], &[], &chmod_tx, &TouchSet::default())
+            .unwrap();
+        assert!(
+            meta.has_outstanding_speculation(),
+            "the deferred manifest was retired by a segment that did not carry it"
+        );
+        assert_eq!(basis(&meta), PublishBasis::Defer, "nothing published");
+        assert!(meta.completed_position(r_manifest).unwrap().is_none());
+        if then_ship {
+            meta.apply_segment_rows(3, 1, 5, &[2, 3], &[], &manifest_tx, &TouchSet::default())
+                .unwrap();
+        } else {
+            // Its chunk's owner never came back; another node took the
+            // lease over (epoch 2) and its marker strands the epoch-1
+            // speculation.
+            meta.strand_below_epoch(2).unwrap();
+        }
+        meta
+    };
+
+    let meta = member(true);
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(raw_ns(&meta), raw_ns(&shipped));
+
+    let meta = member(false);
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(
+        raw_ns(&meta),
+        raw_ns(&only_chmod),
+        "the stranded manifest was not rolled back"
+    );
+}

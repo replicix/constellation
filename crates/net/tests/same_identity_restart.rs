@@ -45,6 +45,7 @@ impl PeerService for Recorder {
         &self,
         part: String,
         _requester: u64,
+        _epoch_applied: Option<u64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::LeaseHandoff {

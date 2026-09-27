@@ -1089,12 +1089,16 @@ impl Driver {
             SyncRequest::Acquire { reply } => {
                 control(Control::Acquire, ControlReply::Acquire(reply))
             }
-            SyncRequest::HandOff { requester, reply } => {
+            SyncRequest::HandOff {
+                requester,
+                epoch_applied,
+                reply,
+            } => {
                 let req = self.control_id();
                 self.handoff_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from: requester,
-                    msg: PeerMsg::LeaseRequest { req },
+                    msg: PeerMsg::LeaseRequest { req, epoch_applied },
                 }))
             }
             SyncRequest::Mutate {
@@ -2615,7 +2619,7 @@ impl Driver {
                     }
                 });
             }
-            PeerMsg::LeaseRequest { req } => {
+            PeerMsg::LeaseRequest { req, epoch_applied } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let requester = self.node_id;
@@ -2625,6 +2629,7 @@ impl Driver {
                     let payload = Payload::LeaseRequest {
                         part: PARTITION.to_string(),
                         requester,
+                        epoch_applied,
                     };
                     if denied {
                         // Fault injection: the link to this peer is cut —

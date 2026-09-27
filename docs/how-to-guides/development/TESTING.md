@@ -353,8 +353,19 @@ stranded-branch recovery:
 
 - `continuation-epoch` cuts S3 for both write-eligible nodes while P2P
   remains healthy, asserts the all-member epoch through the control API,
-  writes real file data from both nodes using a P2P-only lease handoff,
-  heals S3, and verifies ordered drain, convergence, and zero conflicts.
+  writes real file data from both nodes (B's write is forwarded to A and
+  must complete within 10 s: B follows A's log stream through the epoch
+  and A streams its epoch journal ahead; before, it waited 40 s for the
+  log), heals S3, and verifies ordered drain, convergence, and zero
+  conflicts. It prints how many transactions B installed from the stream.
+- `epoch-member-dies-with-chunk`: three nodes, all lose S3; C writes two
+  files in the epoch (manifests forwarded to A and streamed to B, chunks
+  only on C) and B reads the first from C
+  (`status.coop.epoch_member_fetches`). C stops: B's read of the second
+  fails with `EIO`, never other bytes; S3 returns for A and B, A defers
+  the manifests (`status.held.deferred`) and B keeps them as speculation,
+  and a fresh S3-only node never meets a manifest naming a missing chunk.
+  C comes back and every node reads both files.
 - `epoch-member-lost` stops one promised member with `SIGSTOP`; the
   survivor must freeze and return `EROFS`, then resume cleanly when the
   member returns and converge after S3 heals. Both scenarios run a 20 s
@@ -1692,6 +1703,21 @@ configuration with backups, crashes and partitions (odd seeds under
 backup-strict | backup-crash | backup-crash-slow | acks3-crash |
 backup-departs | backup-partition | long-backup | long-acks3` replays
 them.
+
+Plan 30 §M10's continuation epochs: `flex` (two of three nodes lose S3
+and the third, form an epoch of 2/3 and keep writing) and `flex-crash`
+(plus a crash with restart and random faults); `long_flex`
+(`#[ignore]`, `AUTHORITY_SIM_SEEDS`) runs both. `sweep_config` takes
+`AUTHORITY_SIM_CONFIG=flex | flex-crash` for large parallel sweeps
+(`AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`)
+and prints how many transactions members installed from an epoch's
+stream. `flex_crash_regression_seeds` pins every flex-crash seed below
+20 000 that ever failed, `flex_crash_seed_30702_an_epoch_hold_goes_only_to_a_caught_up_member`
+the handoff rule, and `flex_members_follow_the_epoch_holders_stream`
+the epoch stream (members install the hold owner's journal and their
+forwards are answered from it). `RUST_LOG=constellation_authority=debug`
+narrates a replay with each line stamped `t=<simulated ms>`, the fault
+log's clock.
 
 The checker design, settled in phase 2: the exact log-witnessed
 linearizability check runs on every seed; Stateright's

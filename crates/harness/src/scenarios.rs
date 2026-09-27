@@ -854,6 +854,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m10::epoch_missing_node,
     },
     Scenario {
+        name: "epoch-member-dies-with-chunk",
+        desc: "plan 30 M10 x M9: 3 nodes, f = 0, all lose S3; C writes two files in the epoch (manifests streamed to B, chunks only on C), B reads the first from C; C stops: B's read of the second fails (never other bytes), S3 returns and A ships everything but the manifests naming C's chunks (deferred; a fresh S3-only node reads the files empty, never a missing chunk), B keeps them as speculation; C returns and every node reads both files",
+        requires: &[],
+        run: m10::epoch_member_dies_with_chunk,
+    },
+    Scenario {
         name: "epoch-holder-retired",
         desc: "plan 30 M10: f = 1; A and B form an epoch carrying A's lease, A writes and is killed; B's frozen epoch keeps everyone out until the operator retires A (leave --node-id: the lease is fenced), B abandons the epoch, writes resume through a takeover with a promise, and A's state dir can never mount again",
         requires: &[],
@@ -3560,7 +3566,29 @@ fn continuation_epoch(_seed: u64) -> Result<()> {
     // every write is sitting in some journal while S3 is cut. (This used
     // to require B's own backlog to be non-empty, which the forward path
     // legitimately leaves at zero: a flaky assertion, not an ordering bug.)
-    std::fs::write(c1.mnt.join("b/from-b"), b"epoch-b")?;
+    // Plan 30 §M10 × §M9: B keeps following A's log stream through the
+    // epoch, and A streams its epoch journal ahead, so a forward whose
+    // reply names A's unshipped journal (B's own create before this
+    // write, above all) is answered as soon as the stream delivers it.
+    // Before, it waited for a log that could not arrive until S3
+    // returned: 40 s, then in doubt and retried. The bound is generous
+    // (a loaded, frequency-limited runner); the stall it rules out is
+    // the forward deadline.
+    let started = std::time::Instant::now();
+    std::fs::write(c1.mnt.join("b/from-b"), b"epoch-b").context("B's write in the epoch")?;
+    let took = started.elapsed();
+    anyhow::ensure!(
+        took < Duration::from_secs(10),
+        "B's write took {took:?} inside the epoch (the member waited for the log instead of \
+         the holder's stream): B status {}",
+        c1.control_status()?
+    );
+    let b_epoch = c1.control_status()?["epoch"].clone();
+    println!(
+        "continuation-epoch: B's write took {took:?}; B installed {} transactions from A's \
+         stream, {} of its forwards answered by it",
+        b_epoch["streamed_installed"], b_epoch["forwards_streamed"]
+    );
     let a_status = c0.control_status()?;
     let b_status = c1.control_status()?;
     anyhow::ensure!(

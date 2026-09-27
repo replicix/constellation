@@ -67,6 +67,10 @@ pub struct EpochManager {
     /// `epoch-member-lost` fix: such writes used to wait out the acquire
     /// deadline and answer `EIO`).
     pub writes_refused: Arc<AtomicBool>,
+    /// The members of the active (or frozen) epoch, else empty: they
+    /// serve one another the chunks their epoch writes named, which
+    /// nothing can upload before the close (`Coop::set_epoch_members`).
+    pub members_open: Arc<Mutex<Vec<u64>>>,
     pub blocks_takeover: Arc<AtomicBool>,
     flushing: AtomicBool,
     /// Plan 30 §M10: `f`.
@@ -130,6 +134,7 @@ impl EpochManager {
             active: Arc::new(AtomicBool::new(false)),
             frozen: Arc::new(AtomicBool::new(false)),
             writes_refused: Arc::new(AtomicBool::new(false)),
+            members_open: Arc::new(Mutex::new(Vec::new())),
             blocks_takeover: Arc::new(AtomicBool::new(false)),
             flushing: AtomicBool::new(false),
             slack: AtomicU32::new(0),
@@ -148,6 +153,10 @@ impl EpochManager {
         let carrierless = m.is_active() && self.carrier.lock().unwrap().0.is_none();
         self.writes_refused
             .store(m.is_frozen() || carrierless, Ordering::Relaxed);
+        *self.members_open.lock().unwrap() = match m.current() {
+            Some(p) if m.is_active() || m.is_frozen() => p.members.clone(),
+            _ => Vec::new(),
+        };
         self.blocks_takeover
             .store(m.blocks_s3_takeover(), Ordering::Relaxed);
         if let Some(p) = m.current() {

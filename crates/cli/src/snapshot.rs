@@ -688,7 +688,7 @@ mod tests {
     /// xattrs and manifests, and GC's view of its chunks is the frozen one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_tree_snapshot_is_frozen_against_source_and_clone_writes() {
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let source = meta.mkdir(1, "source", 0o755, 1, 1).unwrap();
         meta.set_xattr(
             source.ino,

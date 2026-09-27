@@ -247,6 +247,14 @@ bytes, so it is streamed past it. A batch that arrives before the
 segment it follows (the two travel on different streams) waits for that
 segment instead of being dropped.
 
+A continuation epoch's hold owner streams its journal the same way, as
+it grows (its writes are acknowledged on its disk alone), to the members
+that keep following its log stream. The chunk rule is lifted there: no
+chunk can reach S3 before the close, and the members serve one another
+their dirty chunks while the epoch is open. A member that (re)subscribes
+gets the epoch journal from its start again. See
+[Flexible continuation epochs](#flexible-continuation-epochs).
+
 ### `--fsync-mode` and `--write-mode`
 
 These are older, per-mount knobs that combine with the policies above:
@@ -395,10 +403,38 @@ Operational rules:
   mistaken for a local one.
 - Writes inside an epoch are acknowledged on the hold owner's disk
   alone (no backups). A write another member forwards to the hold owner
-  leaves its chunks on that member. Once S3 is back, the member uploads
-  them while it waits for the hold owner to publish (it closes the
-  epoch only after that publication), and the hold owner's flush waits
-  for them (`CONSTELLATION_REMOTE_CHUNK_WAIT_S`) before it publishes.
+  leaves its chunks on that member.
+- Members keep following the hold owner's log stream through the epoch
+  (S3 cannot deliver the log then, so the stream is the only way). The
+  hold owner keeps serving the segments it shipped before the outage,
+  and it streams its epoch journal ahead as it grows: members install
+  those transactions as speculation (retired by the segments the flush
+  ships at the close). A forwarded write whose reply depends on the hold
+  owner's unshipped journal completes as soon as the stream delivers
+  it, and not before: it never waits for the log (which used to cost the
+  40 s forward deadline, then `EIO` and a retry). Members serve one
+  another the chunks their epoch writes name (dirty, not in S3 until
+  the close), and a reader asks the members when no digest names a
+  holder.
+- The hold moves to another member over P2P only if its journal is
+  empty and the requester has applied the holder's whole log (inside
+  an epoch it could not catch up from S3). A node that hands its hold
+  away, or closes its epoch, persists that and never adopts that hold
+  again, even after a restart.
+- Once S3 is back, a member that does not own the hold closes its epoch
+  only after reading the lease object and finding the carried lease
+  gone (re-claimed by the hold owner's flush, released, or taken over):
+  before that the hold owner may still hold the epoch's authority, and
+  the member keeps promising nothing. Meanwhile it uploads its own
+  pending chunks, which the hold owner's flush waits for
+  (`CONSTELLATION_REMOTE_CHUNK_WAIT_S`) before it publishes. The hold
+  owner re-claims the carried lease when it closes, even with nothing to
+  flush (the obligation is persisted), so the members always see it
+  move.
+- An op already sent to a holder is never refused `EROFS` when an epoch
+  freezes: it may have taken effect. It gets the log's answer if this
+  node has applied one, else `EIO` (in doubt, retried by the same
+  request id).
 - A TTL takeover costs one `heartbeat/` LIST even at `f = 0`.
 
 ### Epochs and fast takeovers
@@ -425,6 +461,13 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 - A node that enrolls during an open epoch is not accounted for.
 - An epoch's hold owner that dies leaves the other members frozen until
   it returns or is retired.
+- A member that dies holding the only copy of a chunk its epoch write
+  named (a forwarded close; nothing reaches S3 during an epoch): other
+  members reading that file get `EIO` (never other bytes), and the hold
+  owner defers the write's manifest until the chunk is in S3. The epoch
+  journal carries no before-images, so the owner defers everything it
+  journaled after that write too: the log does not move past it until
+  the member returns (`status.held.deferred`).
 
 ## Configuration
 
@@ -464,7 +507,9 @@ See [Configuration](../configuration.md) for parsing rules.
 - `epoch`: `epoch_slack`, `carrier`, `promise_until_ms`,
   `promise_puts`, `promise_requests_answered`,
   `promise_requests_refused`, `promise_checks`,
-  `takeovers_refused_promises`, `promise_flush_exempt`, `stale_claims`.
+  `takeovers_refused_promises`, `promise_flush_exempt`, `stale_claims`,
+  `streamed_ahead` (hold owner), `streamed_installed`,
+  `forwards_streamed` (member), `handoffs_behind`.
 
 ## Troubleshooting
 

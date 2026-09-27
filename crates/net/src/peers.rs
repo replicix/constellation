@@ -502,6 +502,7 @@ impl Peers {
         let payload = Payload::LeaseRequest {
             part: part.to_string(),
             requester: inner.node_id,
+            epoch_applied: None,
         };
         for peer in peers {
             let started = Instant::now();
@@ -1117,9 +1118,15 @@ async fn handle_stream<S: PeerService>(
             return Ok(());
         }
         Payload::CondemnedPublished { .. } => None,
-        Payload::LeaseRequest { part, requester } => {
-            Some(service.lease_requested(part, requester).await)
-        }
+        Payload::LeaseRequest {
+            part,
+            requester,
+            epoch_applied,
+        } => Some(
+            service
+                .lease_requested(part, requester, epoch_applied)
+                .await,
+        ),
         Payload::MutateRequest {
             part,
             requester,
@@ -1592,6 +1599,7 @@ mod tests {
             &self,
             part: String,
             requester: u64,
+            _epoch_applied: Option<u64>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
             self.lease_asks
                 .lock()
@@ -1926,6 +1934,7 @@ mod tests {
             &self,
             part: String,
             _requester: u64,
+            _epoch_applied: Option<u64>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
             Box::pin(async move {
                 Payload::LeaseHandoff {
@@ -2214,6 +2223,7 @@ mod tests {
             &self,
             part: String,
             _requester: u64,
+            _epoch_applied: Option<u64>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
             Box::pin(async move {
                 Payload::LeaseHandoff {

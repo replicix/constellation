@@ -309,8 +309,18 @@ pub enum PeerMsg {
         gen: u64,
     },
     /// "I want the lease" (`Payload::LeaseRequest`), sent to the holder.
+    /// `epoch_applied`: `Some(applied)` asks for a continuation epoch's
+    /// P2P-only hold transfer and carries the requester's applied
+    /// sequence, which must be at the holder's head (nothing reaches S3
+    /// during an epoch, so a successor behind the holder's log could
+    /// never catch up before it executes: flex-crash seed 30702). `None`
+    /// asks for the S3 handoff (flush, release, the requester claims).
+    /// The holder declines a request for the other kind (seed 2236: an
+    /// S3 release answered an epoch request, and the requester's local
+    /// hold stood beside the next S3 holder).
     LeaseRequest {
         req: OpId,
+        epoch_applied: Option<Seq>,
     },
     /// The holder's answer (`Payload::LeaseHandoff`): it flushed and
     /// released (`released: true`, and `head_seq` is its last shipped
@@ -650,7 +660,7 @@ impl PeerMsg {
     pub fn requests(&self) -> Option<OpId> {
         match self {
             PeerMsg::MutateRequest { req, .. }
-            | PeerMsg::LeaseRequest { req }
+            | PeerMsg::LeaseRequest { req, .. }
             | PeerMsg::LogSubscribe { req, .. }
             | PeerMsg::ReadIndex { req, .. }
             | PeerMsg::DelegationRecall { req, .. }

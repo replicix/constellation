@@ -431,6 +431,8 @@ pub enum SyncRequest {
     /// the requester then waits the lease out through S3.
     HandOff {
         requester: u64,
+        /// `Payload::LeaseRequest::epoch_applied`.
+        epoch_applied: Option<u64>,
         reply: tokio::sync::oneshot::Sender<Option<HandoffResult>>,
     },
     /// A peer forwarded a mutation to this node as (believed) holder.

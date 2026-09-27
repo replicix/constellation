@@ -2304,16 +2304,20 @@ fn sweep_config() {
         "long-delegated-backup" => long_delegated_backup_config(),
         "placement-hot" => placement_hot_config(),
         "backup-hot" => backup_hot_config(),
+        "flex" => flex_config(),
+        "flex-crash" => flex_crash_config(),
         other => panic!("sweep_config: unknown config {other}"),
     };
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let streamed_deleg = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let epoch_streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
     let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut handles = Vec::new();
     for _ in 0..threads {
         let (next, failures, label) = (next.clone(), failures.clone(), label.clone());
         let (streamed, streamed_deleg) = (streamed.clone(), streamed_deleg.clone());
+        let epoch_streamed = epoch_streamed.clone();
         handles.push(std::thread::spawn(move || loop {
             let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if seed >= start + seeds {
@@ -2325,6 +2329,7 @@ fn sweep_config() {
                     for s in report.stats.values() {
                         streamed.fetch_add(s.awaited_log_streamed, ord);
                         streamed_deleg.fetch_add(s.awaited_log_streamed_deleg, ord);
+                        epoch_streamed.fetch_add(s.epoch_streamed_installed, ord);
                     }
                 }
                 Err(e) => {
@@ -2341,11 +2346,13 @@ fn sweep_config() {
     let mut f = failures.lock().unwrap().clone();
     f.sort_unstable();
     eprintln!(
-        "sweep {label} {start}..{}: {} failing: {f:?}; answered from the stream: {} ({} a delegate's)",
+        "sweep {label} {start}..{}: {} failing: {f:?}; answered from the stream: {} ({} a delegate's); \
+         installed from an epoch's stream: {}",
         start + seeds,
         f.len(),
         streamed.load(std::sync::atomic::Ordering::Relaxed),
         streamed_deleg.load(std::sync::atomic::Ordering::Relaxed),
+        epoch_streamed.load(std::sync::atomic::Ordering::Relaxed),
     );
     assert!(f.is_empty(), "failing seeds: {f:?}");
 }
@@ -3199,6 +3206,78 @@ fn flex_crash_seed_30299_restarted_member_adopts_the_carried_hold() {
         .map(|s| s.epoch_holds_adopted_late)
         .sum();
     assert!(adopted > 0, "the carried hold was never adopted late");
+}
+
+/// Every flex-crash seed below 20 000 that failed on `27f919c` (35, all
+/// but six on `71dc7e7` too): a hold re-adopted after it was handed away
+/// or closed (166, 2236), an epoch handoff answered with an S3 release
+/// (2236), a member closing before the carrier left the epoch (4309 and
+/// most of the "two authorities" seeds), an op refused `EROFS` although
+/// sent (10248), a deadline answered in doubt for a landed write (2140),
+/// the epoch journal published as the log prefix (11719, 19585). And
+/// the seeds the epoch stream first livelocked (a frozen member nudged
+/// into a zero-delay poll loop by the stream's gap rule, growing to
+/// gigabytes): 1072, 2247, 3098, 11548, 12286, 14556. And 16755: a hold
+/// owner that closed with nothing to flush left the expired carried lease
+/// standing, and its member waited for good.
+#[test]
+fn flex_crash_regression_seeds() {
+    for seed in [
+        1072, 2247, 3098, 11548, 12286, 14556, 16755, 166, 2140, 2236, 3007, 3863, 4100, 4127,
+        4309, 5597, 6234, 6556, 6975, 7111, 8777, 9232, 10248, 10403, 10717, 10995, 11719, 13836,
+        16803, 17036, 18055, 18145, 18266, 18299, 18316, 18318, 18584, 19324, 19470, 19497, 19585,
+        19856,
+    ] {
+        run_seed(seed, flex_crash_config())
+            .unwrap_or_else(|e| panic!("flex-crash seed {seed}: {e}"));
+    }
+}
+
+/// Plan 30 §M10 × §M9: the members of a continuation epoch keep following
+/// the hold owner's log stream, and it streams its epoch journal ahead.
+/// The flex workload has clients on every node, so the member forwards
+/// its writes to the hold owner; a reply whose `base` names the holder's
+/// unshipped epoch journal used to wait for a log that could not arrive
+/// before S3 returned (`continuation-epoch`'s 40 s stall, then in doubt).
+/// Now the stream delivers it: installed ahead of the log, answered, and
+/// every seed still checks out (the streamed transactions are retired by
+/// the segments the flush ships at the close, or stranded).
+#[test]
+fn flex_members_follow_the_epoch_holders_stream() {
+    let (mut installed, mut answered, mut ahead) = (0, 0, 0);
+    for seed in 20_000..20_040 {
+        let report =
+            run_seed(seed, flex_config()).unwrap_or_else(|e| panic!("flex seed {seed}: {e}"));
+        for s in report.stats.values() {
+            installed += s.epoch_streamed_installed;
+            answered += s.epoch_forwards_streamed;
+            ahead += s.epoch_streamed_ahead;
+        }
+    }
+    assert!(ahead > 0, "no hold owner streamed its epoch journal");
+    assert!(installed > 0, "no member installed the epoch stream");
+    assert!(
+        answered > 0,
+        "no member's forward was answered from the epoch stream"
+    );
+}
+
+/// flex-crash seed 30702: node 1 was partitioned from holder 3 while 3
+/// shipped seq 14–18, then both lost S3 and formed an epoch carrying 3's
+/// lease. 3 handed its (journal-empty) hold to node 1 over P2P, and node
+/// 1, still at seq 13, executed against a state the log had moved past:
+/// its `Unlink(f3)` took effect after seq 18 had removed `f3`. Now an
+/// epoch hold goes only to a requester that applied the holder's whole
+/// log; node 1 forwards instead.
+#[test]
+fn flex_crash_seed_30702_an_epoch_hold_goes_only_to_a_caught_up_member() {
+    let report = run_seed(30702, flex_crash_config())
+        .unwrap_or_else(|e| panic!("flex-crash seed 30702: {e}"));
+    let behind: u64 = report.stats.values().map(|s| s.epoch_handoffs_behind).sum();
+    assert!(
+        behind > 0,
+        "no handoff to a member behind the log was declined"
+    );
 }
 
 /// Plan 30 §M11 phase 2b round 2: the seed whose successor root replayed

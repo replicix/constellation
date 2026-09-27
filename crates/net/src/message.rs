@@ -90,9 +90,14 @@ pub enum Payload {
         epoch: u64,
     },
     /// "I want the lease for `part`." Sent directly to the holder.
+    /// `epoch_applied`: `Some(applied)` asks for a continuation epoch's
+    /// P2P-only hold transfer (nothing reaches S3 during an epoch, so the
+    /// holder hands its hold only to a requester that has applied its
+    /// whole log); `None` asks for the S3 handoff.
     LeaseRequest {
         part: String,
         requester: u64,
+        epoch_applied: Option<u64>,
     },
     /// Holder's answer: it flushed and released, so the requester can
     /// CAS-claim now. `released: false` means it declined (still busy).
@@ -833,6 +838,7 @@ mod tests {
             &Payload::LeaseRequest {
                 part: "p0".into(),
                 requester: 1,
+                epoch_applied: None,
             },
         )
         .unwrap();

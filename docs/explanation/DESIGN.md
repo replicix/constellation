@@ -536,7 +536,9 @@ supersedes ADR-17's payload push). Under a backup (§9), the holder also
 streams backup-acknowledged transactions **ahead of S3**, contiguously
 from the applied log, and subscribers apply them as speculation: a
 forward waiting for its own transaction is answered from that stream
-instead of from the next S3 round trip
+instead of from the next S3 round trip. A continuation epoch's holder
+(§5.3) streams its journal ahead the same way, and its members keep
+following it
 ([Close-to-open modes](../reference/features/cto-modes.md#direct-log-streams),
 [Durability and failover](../reference/features/durability-and-failover.md#pre-s3-streaming)).
 
@@ -740,6 +742,18 @@ What an epoch may carry:
   one to sequence writes, and refuses them at once with `EROFS`.
 - No delegations exist inside an epoch (the root recalls them when it
   opens), and writes are acknowledged on the epoch holder's disk alone.
+- Members keep following the epoch holder's log stream, the only way the
+  log can reach them while S3 is away, and the holder streams its
+  journal ahead as it grows (§4, "Positions and log streams"). A member's
+  forwarded write therefore completes in one round trip; its reply is
+  never answered before the stream has delivered what it depends on.
+  Members serve each other the chunks their epoch writes name.
+- The hold moves to another member only if the holder's journal is empty
+  and the requester has applied the holder's whole log. A node that
+  handed its hold away, or closed its epoch, never takes that hold back,
+  even after a restart. A member closes its epoch only once the carried
+  lease is gone from S3 (the holder re-claimed it by its flush, released
+  it, or lost it).
 - A member that can still reach S3 declines to join. A node whose own S3
   fails first asks every member to probe S3; if any does reach it, the
   outage is its own and it proposes nothing (its closes hand their chunks

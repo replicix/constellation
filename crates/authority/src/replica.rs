@@ -428,6 +428,13 @@ pub trait Replica {
     /// so a restarted hold owner re-adopts it and can flush its journal.
     fn epoch_hold_persisted(&self) -> Option<Epoch>;
     fn persist_epoch_hold(&self, hold: Option<Epoch>) -> Result<(), MetaError>;
+    /// The carried lease (`epoch`, `expires_unix_ms`) whose epoch hold
+    /// this node owned and let go — handed to a peer, or closed with its
+    /// epoch (`local["epoch_hold_ended"]`): it never re-adopts that hold,
+    /// even after a restart. The flag: it closed the epoch itself and
+    /// still owes the re-claim of that lease (`Core::epoch_reclaim_due`).
+    fn epoch_hold_ended(&self) -> Option<(Epoch, i64, bool)>;
+    fn persist_epoch_hold_ended(&self, ended: Option<(Epoch, i64, bool)>) -> Result<(), MetaError>;
 }
 
 impl Replica for Meta {
@@ -1085,5 +1092,21 @@ impl Replica for Meta {
         // (Written only when it changes; synced like the epoch's other
         // persisted state, M16.)
         Meta::kv_set_durable(self, "epoch_hold", &hold.unwrap_or(0).to_string())
+    }
+
+    fn epoch_hold_ended(&self) -> Option<(Epoch, i64, bool)> {
+        let v = Meta::kv_get(self, "epoch_hold_ended").ok().flatten()?;
+        let mut parts = v.split(':');
+        let epoch = parts.next()?.parse().ok()?;
+        let expires = parts.next()?.parse().ok()?;
+        let reclaim = parts.next() == Some("1");
+        Some((epoch, expires, reclaim))
+    }
+
+    fn persist_epoch_hold_ended(&self, ended: Option<(Epoch, i64, bool)>) -> Result<(), MetaError> {
+        let v = ended
+            .map(|(e, x, r)| format!("{e}:{x}:{}", u8::from(r)))
+            .unwrap_or_default();
+        Meta::kv_set_durable(self, "epoch_hold_ended", &v)
     }
 }

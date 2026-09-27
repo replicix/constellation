@@ -61,6 +61,10 @@ const BUSY_RETRY_MAX: Duration = Duration::from_millis(20);
 /// whatever the S3 ETA says (a peer chunk request is bounded at 5 s).
 const MAX_PEER_WAIT_MS: f64 = 5_000.0;
 
+/// How long an epoch member's chunk fetch waits for a serving slot on
+/// another member (see `Coop::epoch_members`).
+const EPOCH_MEMBER_FETCH_WAIT: Duration = Duration::from_secs(2);
+
 fn exceeds_digest_capacity(entries: usize) -> bool {
     entries > (MAX_BUCKETS as usize).saturating_mul(ENTRIES_PER_BUCKET)
 }
@@ -179,6 +183,9 @@ struct Counters {
     peer_misses: AtomicU64,
     peer_errors: AtomicU64,
     s3_fetches: AtomicU64,
+    /// Chunks fetched from another member of an open continuation epoch
+    /// (its dirty epoch writes; see `Coop::epoch_members`).
+    epoch_member_fetches: AtomicU64,
     hedges_fired: AtomicU64,
     bytes_served: AtomicU64,
     stale_digests_pruned: AtomicU64,
@@ -231,6 +238,13 @@ pub struct Coop {
     /// is in flight although they are not durable yet (counted: several
     /// handoffs may offer one chunk).
     offered: Mutex<HashMap<ChunkHash, u32>>,
+    /// Plan 30 §M10: the members of this node's open continuation epoch
+    /// (empty outside one). Their epoch writes' chunks cannot reach S3
+    /// before the close, yet a member installs the others' manifests
+    /// from the hold owner's stream: members serve one another their
+    /// dirty chunks, and a reader tries them when no digest names a
+    /// holder.
+    epoch_members: Mutex<Option<Arc<Mutex<Vec<u64>>>>>,
 }
 
 /// [`Coop::offer`]'s claim: the chunks stay servable until it drops.
@@ -337,6 +351,7 @@ impl Coop {
             sync_rx: Mutex::new(Some(sync_rx)),
             config,
             offered: Mutex::new(HashMap::new()),
+            epoch_members: Mutex::new(None),
         })
     }
 
@@ -351,6 +366,28 @@ impl Coop {
             coop: self.clone(),
             hashes: hashes.to_vec(),
         }
+    }
+
+    /// Wire the epoch manager's member list (see `epoch_members`).
+    pub(crate) fn set_epoch_members(&self, members: Arc<Mutex<Vec<u64>>>) {
+        *self.epoch_members.lock().unwrap() = Some(members);
+    }
+
+    /// The other members of this node's open continuation epoch.
+    fn epoch_peers(&self) -> Vec<u64> {
+        self.epoch_members
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| {
+                m.lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .filter(|n| *n != self.node_id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn is_offered(&self, hash: &ChunkHash) -> bool {
@@ -500,8 +537,10 @@ impl Coop {
         from_hex: &str,
     ) -> Result<Vec<u8>, ChunkDecline> {
         // A chunk handed off to a peer (EC2 finding 1) is served to it
-        // although dirty, and whether or not the cooperative cache is on.
-        let offered = self.is_offered(&ChunkHash(hash));
+        // although dirty, and whether or not the cooperative cache is on;
+        // so is every chunk while a continuation epoch is open (its
+        // members read one another's epoch writes; see `epoch_members`).
+        let offered = self.is_offered(&ChunkHash(hash)) || !self.epoch_peers().is_empty();
         if !self.config.enabled && !offered {
             return Err(ChunkDecline::Busy);
         }
@@ -648,6 +687,33 @@ impl Coop {
         } else {
             DecodePriority::Background
         };
+        // Plan 30 §M10: in an open continuation epoch a chunk no digest
+        // names may be another member's epoch write — dirty there (digests
+        // list clean chunks only) and not in S3 before the close. Ask each
+        // member in turn before the usual sources. The bytes are verified
+        // against the hash like any peer's, so a member that lacks the
+        // chunk, is gone or answers garbage costs a miss, never wrong
+        // data; with none holding it the read fails (S3 has it neither).
+        if self.config.enabled && self.holders(hash).is_empty() {
+            let members = self.epoch_peers();
+            if !members.is_empty() {
+                let until = Instant::now() + EPOCH_MEMBER_FETCH_WAIT;
+                for id in members {
+                    let src = SourceId::Peer(id);
+                    self.selector.lock().unwrap().begin(src);
+                    let r = self.fetch_from(src, hash, priority, until).await;
+                    if !r.is_success() {
+                        self.selector.lock().unwrap().end(src);
+                    }
+                    if let Some(fetched) = self.settle(hash, src, r, read_back) {
+                        self.counters
+                            .epoch_member_fetches
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(fetched);
+                    }
+                }
+            }
+        }
         let cands = self.candidates(hash);
         let size = u64::from(self.chunk_size);
         let (primary, hedge, deadline, s3_eta_ms) = {
@@ -1033,6 +1099,7 @@ impl Coop {
             peer_misses: self.counters.peer_misses.load(Ordering::Relaxed),
             peer_errors: self.counters.peer_errors.load(Ordering::Relaxed),
             s3_fetches: self.counters.s3_fetches.load(Ordering::Relaxed),
+            epoch_member_fetches: self.counters.epoch_member_fetches.load(Ordering::Relaxed),
             hedges_fired: self.counters.hedges_fired.load(Ordering::Relaxed),
             bytes_served_to_peers: self.counters.bytes_served.load(Ordering::Relaxed),
             stale_digests_pruned: self.counters.stale_digests_pruned.load(Ordering::Relaxed),
@@ -1939,6 +2006,7 @@ mod tests {
             &self,
             part: String,
             _requester: u64,
+            _epoch_applied: Option<u64>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
             Box::pin(async move {
                 Payload::LeaseHandoff {

@@ -409,10 +409,12 @@ pub trait PeerService: Send + Sync + 'static {
         None
     }
     /// A peer wants `part`'s lease. Returns the reply to send.
+    /// `epoch_applied`: see `Payload::LeaseRequest`.
     fn lease_requested(
         &self,
         part: String,
         requester: u64,
+        epoch_applied: Option<u64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>;
     /// A peer proposed a continuation epoch. Persist the promise, then
     /// reply with an ack. Default declines (P2P-disabled / tests).
@@ -1383,6 +1385,7 @@ mod tests {
                 &Payload::LeaseRequest {
                     part: "p0".into(),
                     requester: 2,
+                    epoch_applied: None,
                 },
             ),
         )

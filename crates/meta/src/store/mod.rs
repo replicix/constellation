@@ -539,6 +539,10 @@ pub struct Meta {
     /// and a deposed holder rebuilds its namespace from the head commit
     /// instead of rolling back (`cli::recovery::recover_deposed`).
     pub(crate) holder_capture: AtomicBool,
+    /// Unit tests of the tree publisher only: publish `ns` as it stands
+    /// though this node's unshipped journal holds uncaptured writes
+    /// (`Meta::publish_basis_at`). Never set by the daemon.
+    pub(crate) publish_unshipped: AtomicBool,
     /// Plan 30 §M12: whether the delegation table names any live
     /// delegation (maintained by `delegation::write_table_tx`): the
     /// root's FUSE fast path reads this atomic before it looks at the
@@ -741,6 +745,7 @@ impl Meta {
             recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             holder_epoch: Arc::new(AtomicU64::new(0)),
             holder_capture: AtomicBool::new(holder_capture_default()),
+            publish_unshipped: AtomicBool::new(false),
             deleg_any: AtomicBool::new(false),
             deleg_gate: std::sync::RwLock::new(()),
             held: std::sync::Mutex::new(held::HeldSummary::default()),
@@ -1028,6 +1033,12 @@ impl Meta {
     /// publisher treats as uncaptured (it defers).
     pub fn set_holder_capture(&self, on: bool) {
         self.holder_capture.store(on, Ordering::Relaxed);
+    }
+
+    /// For unit tests of the tree publisher, which publish local writes
+    /// nothing shipped: treat them as the log (see `publish_unshipped`).
+    pub fn set_publish_unshipped_for_tests(&self, on: bool) {
+        self.publish_unshipped.store(on, Ordering::Relaxed);
     }
 
     // ---- incarnation (plan 30 §M2) ----

@@ -471,16 +471,31 @@ impl Core {
     /// the handoff job; in an active continuation epoch the hold is
     /// simply let go (nothing ships during an epoch); otherwise decline —
     /// the requester waits the lease out through S3, which is always
-    /// correct.
+    /// correct. The two kinds are never crossed: an epoch request
+    /// (`epoch_applied: Some`) is answered only by the hold transfer, an
+    /// S3 request only by the handoff job.
     pub(crate) fn on_lease_request(
         &mut self,
         now: Ms,
         from: NodeId,
         req: OpId,
+        epoch_applied: Option<Seq>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
+        let decline = |core: &mut Self, out: &mut Vec<Action>| {
+            core.stats.handoffs_declined += 1;
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::LeaseHandoff {
+                    req,
+                    released: false,
+                    epoch: core.lease.epoch().unwrap_or(0),
+                    head_seq: None,
+                },
+            });
+        };
         // Plan 30 §M11: no handoff while a delegation is live (the root
         // stays; see `round_release`).
         let can_serve = self.lease.ship_epoch(now, &self.cfg).is_some()
@@ -500,7 +515,19 @@ impl Core {
             });
             return;
         }
-        if self.epoch.active && !self.epoch.frozen && self.lease.epoch_held() {
+        let epoch_transfer = self.epoch.active && !self.epoch.frozen && self.lease.epoch_held();
+        if epoch_transfer != epoch_applied.is_some() {
+            // Flex-crash seed 2236: the requester's epoch was active, this
+            // node's still frozen; the handoff job flushed and released
+            // the S3 lease, the requester adopted a local hold on the
+            // strength of the reply, and a third node claimed the freed
+            // lease beside it. (And an S3 requester — no member of this
+            // epoch — cannot take its hold.)
+            decline(self, out);
+            return;
+        }
+        if epoch_transfer {
+            let applied = epoch_applied.unwrap_or(0);
             // Plan 30 §M10 (found by the M10 simulation's first epoch
             // runs, pre-M10 behaviour): a hold with an unshipped journal is
             // not handed over. Nothing ships during an epoch, so the
@@ -510,21 +537,33 @@ impl Core {
             // requester forwards to this node instead; its file writes'
             // manifests go forwarded too, their chunks uploaded when S3
             // returns (`fusefs::commit_manifest_forwarded`).
-            if replica.journal_len().unwrap_or(1) > 0 {
-                self.stats.handoffs_declined += 1;
-                out.push(Action::Send {
-                    to: from,
-                    msg: PeerMsg::LeaseHandoff {
-                        req,
-                        released: false,
-                        epoch: self.lease.epoch().unwrap_or(0),
-                        head_seq: None,
-                    },
-                });
+            // `flex-crash` seed 30702: nor to a requester that has not
+            // applied this node's whole log. The successor catches up to
+            // `head_seq` from S3 outside an epoch; inside one it cannot,
+            // and it would execute against a state missing segments this
+            // node shipped before the outage (seq 14–18 there, streamed
+            // while the requester was partitioned from this node): an
+            // unlink of a file the log had already removed took effect.
+            // It forwards to this node instead.
+            let behind = applied < self.ship.head_seq;
+            if behind {
+                self.stats.epoch_handoffs_behind += 1;
+            }
+            if behind || replica.journal_len().unwrap_or(1) > 0 {
+                decline(self, out);
+                return;
+            }
+            // The hold leaves for good: persisted before the reply, so no
+            // path (the restart adoption above all) takes it back while
+            // the successor journals under it.
+            if !self.end_epoch_hold(replica, false) {
+                decline(self, out);
                 return;
             }
             let epoch = self.lease.epoch().unwrap_or(1);
             self.lease.release_local();
+            // The hold owner now: this node follows its log stream.
+            self.lease.cached_holder = Some(from);
             self.deleg_on_lease_gone(now, replica, out);
             replica.set_holder_epoch(0);
             self.stats.handoffs_served += 1;

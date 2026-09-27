@@ -958,16 +958,15 @@ impl LogPrefixView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublishBasis {
     /// `ns` as it stands is the log-prefix state at `applied_seq` (nothing
-    /// outstanding), or — for a node that holds no lease — the pre-M3b
-    /// behaviour for its uncaptured local writes.
+    /// outstanding).
     AsIs,
     /// `ns` with this overlay is the log-prefix state: the holder's
     /// unshipped journal, substituted by its before-images.
     Substituted(LogPrefixView),
     /// No commit can reflect this replica right now: requester speculation
-    /// (a shadow or hint) is outstanding, or this holder's unshipped
-    /// journal was not captured (holder capture off — the fallback — or a
-    /// transaction from before it was switched on).
+    /// (a shadow or hint) is outstanding, or this node's unshipped journal
+    /// was not captured (holder capture off — the fallback — a transaction
+    /// from before it was switched on, or a continuation epoch's hold).
     Defer,
 }
 
@@ -979,11 +978,17 @@ impl Meta {
             return Ok(PublishBasis::Defer);
         }
         if counter_get(snap, &self.local, KV_UNCAPTURED_TX_COUNT)? > 0 {
-            return Ok(if self.holder_epoch() != 0 {
-                PublishBasis::Defer
-            } else {
-                PublishBasis::AsIs
-            });
+            // Unshipped work with no before-images: no commit can be the
+            // log prefix. (This used to publish `ns` as it stands when
+            // `holder_epoch` was 0, taking such writes for a non-holder's
+            // pre-M3b leftovers — but a continuation epoch's hold owner
+            // journals uncaptured with `holder_epoch` 0 too: flex-crash
+            // seed 11719 published its epoch journal as the prefix at the
+            // last shipped seq.)
+            if self.publish_unshipped.load(Ordering::Relaxed) && self.holder_epoch() == 0 {
+                return Ok(PublishBasis::AsIs);
+            }
+            return Ok(PublishBasis::Defer);
         }
         if counter_get(snap, &self.local, KV_LOCAL_SPEC_COUNT)? == 0 {
             return Ok(PublishBasis::AsIs);

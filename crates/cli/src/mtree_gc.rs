@@ -806,7 +806,7 @@ mod tests {
     async fn a_round_reclaims_what_retired_commits_kept_and_nothing_else() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut lease = gc_lease(&store).await;
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
         let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
@@ -895,7 +895,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_publisher_never_names_a_condemned_pack() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let dir = TempDir::new().unwrap();
         let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap().ino;
         for i in 0..50 {
@@ -981,7 +981,7 @@ mod tests {
     async fn a_live_blob_survives() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut lease = gc_lease(&store).await;
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
 
@@ -1007,7 +1007,7 @@ mod tests {
     async fn a_dead_blob_survives_its_first_round_and_dies_after_the_horizon() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut lease = gc_lease(&store).await;
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
 
@@ -1062,7 +1062,7 @@ mod tests {
     async fn a_blob_re_referenced_between_rounds_survives() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut lease = gc_lease(&store).await;
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
 
@@ -1108,7 +1108,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_publisher_defers_rather_than_name_a_condemned_blob() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let dir = TempDir::new().unwrap();
         let mut writer = publisher(&meta, &store, &dir);
 

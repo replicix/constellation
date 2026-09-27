@@ -807,6 +807,17 @@ pub struct Stats {
     /// M12 round 2: epoch holds adopted by a member that restarted into
     /// an open epoch carrying its own lease (flex-crash seed 30299).
     pub epoch_holds_adopted_late: u64,
+    /// Continuation-epoch handoffs declined because the requester had not
+    /// applied this holder's whole log (flex-crash seed 30702).
+    pub epoch_handoffs_behind: u64,
+    /// Journal transactions a continuation epoch's hold owner streamed
+    /// ahead to members, and those a member installed (plan 30 §M10 ×
+    /// §M9: members keep following the hold owner's log stream).
+    pub epoch_streamed_ahead: u64,
+    pub epoch_streamed_installed: u64,
+    /// A member's accepted forwards whose `base` only the epoch stream
+    /// could deliver, answered once it did.
+    pub epoch_forwards_streamed: u64,
 }
 
 /// The log cursor and ship bookkeeping (`Shipper::PartState` + `SpoolInfo`).
@@ -1368,7 +1379,9 @@ impl Core {
                 position,
                 gen,
             } => self.on_mutate_reply(now, from, req, outcome, (base, position, gen), replica, out),
-            PeerMsg::LeaseRequest { req } => self.on_lease_request(now, from, req, replica, out),
+            PeerMsg::LeaseRequest { req, epoch_applied } => {
+                self.on_lease_request(now, from, req, epoch_applied, replica, out)
+            }
             PeerMsg::LeaseHandoff {
                 req,
                 released,
@@ -1907,6 +1920,18 @@ impl Core {
     ) {
         let before = self.epoch;
         self.epoch = state;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            open = state.open,
+            active = state.active,
+            frozen = state.frozen,
+            flushing = state.flushing,
+            carried = ?self.pr.carried,
+            held = ?self.lease.held.as_ref().map(|(l, _)| (l.epoch, l.expires_unix_ms)),
+            hold = ?self.lease.epoch_hold(),
+            lost = self.lease.lost,
+            "epoch state"
+        );
         self.deleg_on_epoch(now, state.active && !state.frozen, replica, out);
         if state.active && !before.active {
             self.skip_ship = true;
@@ -1962,7 +1987,20 @@ impl Core {
             && self.pr.restored_hold.is_none()
             && !replica.lost_persisted()
         {
-            if let Some(c) = self.pr.carried.filter(|c| c.node == self.cfg.node_id) {
+            // Not a hold this node already owned and let go. Flex-crash
+            // seed 166: it gave its journal-less hold to node 1, which
+            // journaled under it and crashed; the freeze re-reported the
+            // epoch and this path adopted the carried hold a second time,
+            // flushed nothing, closed the epoch and released the lease,
+            // and node 1's acknowledged journal met a newer epoch. Seed
+            // 2236: a report after its own close adopted the hold again
+            // beside the next S3 holder.
+            let ended = |c: &crate::event::Carrier| self.hold_ended_is(c.epoch, c.expires_unix_ms);
+            if let Some(c) = self
+                .pr
+                .carried
+                .filter(|c| c.node == self.cfg.node_id && !ended(c))
+            {
                 tracing::info!(
                     node = self.cfg.node_id,
                     epoch = c.epoch,

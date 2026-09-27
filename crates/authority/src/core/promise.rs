@@ -154,6 +154,11 @@ pub(crate) struct PromiseState {
     /// open).
     pub persisted_hold: Option<Epoch>,
     pub restored_hold: Option<Epoch>,
+    /// The carried lease (epoch, expiry) whose hold this node owned and
+    /// let go — handed to a peer, or closed with the epoch (persisted):
+    /// never re-adopted (flex-crash seeds 166, 2236). The flag: this node
+    /// closed the epoch itself and owes the lease's re-claim.
+    pub hold_ended: Option<(Epoch, i64, bool)>,
     /// This node closed its epoch while owning the hold, and its journal
     /// has not all reached the log yet: it is still the epoch's
     /// authority, and promises nothing.
@@ -182,6 +187,7 @@ impl Core {
         self.pr.issued = replica.promise_issued();
         self.pr.restored_hold = replica.epoch_hold_persisted();
         self.pr.persisted_hold = self.pr.restored_hold;
+        self.pr.hold_ended = replica.epoch_hold_ended();
         self.advertise_slack(now, replica, out);
     }
 
@@ -308,10 +314,21 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        // The hold's owner is persisted, whichever path moved it.
+        // The hold's owner is persisted, whichever path moved it — but not
+        // while a restarted owner's persisted hold waits to be re-adopted
+        // (its epoch not reported yet): a second crash then would lose it.
+        // A hold that goes away ends for good (`end_epoch_hold`): a
+        // handoff, the close, a handoff job's release in a frozen epoch
+        // (flex-crash seed 2236), a deposition.
+        self.epoch_reclaim_settle(replica);
         let hold = self.lease.epoch_hold();
-        if hold != self.pr.persisted_hold && replica.persist_epoch_hold(hold).is_ok() {
-            self.pr.persisted_hold = hold;
+        if hold != self.pr.persisted_hold && self.pr.restored_hold.is_none() {
+            if hold.is_none() {
+                self.end_epoch_hold(replica, false);
+            }
+            if replica.persist_epoch_hold(hold).is_ok() {
+                self.pr.persisted_hold = hold;
+            }
         }
         if self.pr.flush_pending && replica.journal_len().unwrap_or(1) == 0 {
             self.pr.flush_pending = false;
@@ -444,6 +461,87 @@ impl Core {
         }
     }
 
+    /// This node lets its epoch hold go for good (a handoff, the close):
+    /// record the carried lease so nothing adopts that hold again here.
+    /// `closed`: it closed the epoch itself (S3 is back), and owes the
+    /// carried lease's re-claim (`epoch_reclaim_due`). `false` if it
+    /// could not be persisted.
+    pub(crate) fn end_epoch_hold(&mut self, replica: &dyn Replica, closed: bool) -> bool {
+        let Some(c) = self.pr.carried else {
+            return true;
+        };
+        let ended = Some((c.epoch, c.expires_unix_ms, closed));
+        let same = self
+            .pr
+            .hold_ended
+            .is_some_and(|(e, x, _)| (e, x) == (c.epoch, c.expires_unix_ms));
+        if same && !closed {
+            return true;
+        }
+        if self.pr.hold_ended == ended {
+            return true;
+        }
+        if let Err(error) = replica.persist_epoch_hold_ended(ended) {
+            tracing::warn!(node = self.cfg.node_id, %error, "persisting the ended epoch hold failed");
+            return false;
+        }
+        self.pr.hold_ended = ended;
+        true
+    }
+
+    /// Whether the carried lease `hold_ended` names is `c`'s.
+    pub(crate) fn hold_ended_is(&self, epoch: Epoch, expires_unix_ms: i64) -> bool {
+        self.pr
+            .hold_ended
+            .is_some_and(|(e, x, _)| (e, x) == (epoch, expires_unix_ms))
+    }
+
+    /// This node closed its epoch as the hold owner and the carried lease
+    /// — its own — still stands in S3 as far as it knows: it re-claims it.
+    /// Members close only once the carried lease has moved (the rule in
+    /// `jobs::epoch_carrier_checked`); a hold owner with nothing to flush
+    /// used to leave it standing, expired, and every member waited for
+    /// good (flex-crash seed 16755). The re-claim needs no promises (its
+    /// own lease), and an idle holder releases it later as usual.
+    pub(crate) fn epoch_reclaim_due(&self) -> bool {
+        let Some((epoch, expires, true)) = self.pr.hold_ended else {
+            return false;
+        };
+        let carried_mine = self.pr.carried.is_some_and(|c| {
+            c.node == self.cfg.node_id && (c.epoch, c.expires_unix_ms) == (epoch, expires)
+        });
+        let moved = self.lease.last_seen.as_ref().is_some_and(|l| {
+            l.released
+                || l.holder != self.cfg.node_id
+                || (l.epoch, l.expires_unix_ms) != (epoch, expires)
+        });
+        carried_mine && !moved && !self.lease.lost && !self.epoch.open && self.lease.held.is_none()
+    }
+
+    /// The re-claim `epoch_reclaim_due` asked for is done (or moot): the
+    /// lease object is no longer the carried one.
+    fn epoch_reclaim_settle(&mut self, replica: &dyn Replica) {
+        let Some((epoch, expires, true)) = self.pr.hold_ended else {
+            return;
+        };
+        let moved = self.lease.last_seen.as_ref().is_some_and(|l| {
+            l.released
+                || l.holder != self.cfg.node_id
+                || (l.epoch, l.expires_unix_ms) != (epoch, expires)
+        }) || self
+            .lease
+            .held
+            .as_ref()
+            .is_some_and(|(l, _)| (l.epoch, l.expires_unix_ms) != (epoch, expires));
+        if moved
+            && replica
+                .persist_epoch_hold_ended(Some((epoch, expires, false)))
+                .is_ok()
+        {
+            self.pr.hold_ended = Some((epoch, expires, false));
+        }
+    }
+
     /// A restarted hold owner: its epoch is still open, so it re-adopts
     /// the hold it persisted (it alone journaled under it; the flush its
     /// members wait for is its to do).
@@ -459,6 +557,11 @@ impl Core {
             return;
         }
         self.pr.restored_hold = None;
+        if self.pr.hold_ended.map(|(e, _, _)| e) == Some(epoch) {
+            // Handed away before the crash (persisted before the reply):
+            // the successor owns it.
+            return;
+        }
         tracing::info!(
             node = self.cfg.node_id,
             epoch,

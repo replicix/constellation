@@ -865,6 +865,9 @@ pub struct CoopStatus {
     pub peer_errors: u64,
     #[serde(default)]
     pub s3_fetches: u64,
+    /// Chunks fetched from another member of an open continuation epoch.
+    #[serde(default)]
+    pub epoch_member_fetches: u64,
     #[serde(default)]
     pub hedges_fired: u64,
     #[serde(default)]
@@ -991,6 +994,20 @@ pub struct EpochStatus {
     pub promise_flush_exempt: u64,
     #[serde(default)]
     pub stale_claims: u64,
+    /// Members keep following the hold owner's log stream during an
+    /// epoch: journal transactions the hold owner streamed ahead, those
+    /// this member installed, and this member's forwards the stream
+    /// answered.
+    #[serde(default)]
+    pub streamed_ahead: u64,
+    #[serde(default)]
+    pub streamed_installed: u64,
+    #[serde(default)]
+    pub forwards_streamed: u64,
+    /// Epoch hold transfers declined because the requester had not
+    /// applied the holder's whole log.
+    #[serde(default)]
+    pub handoffs_behind: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

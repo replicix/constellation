@@ -1161,7 +1161,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let chunks = Arc::new(ChunkStore::new(store.clone()));
 
-        let meta_a = Arc::new(Meta::open_in_memory().unwrap());
+        let meta_a = Arc::new(crate::mtree_publish::test_meta());
         meta_a.set_node_prefix(1).unwrap();
         let mut ship_a = crate::authority_driver::Standalone::new(
             meta_a.clone(),
@@ -1170,7 +1170,7 @@ mod tests {
             LeaseMode::Cas,
         );
 
-        let meta_b = Arc::new(Meta::open_in_memory().unwrap());
+        let meta_b = Arc::new(crate::mtree_publish::test_meta());
         meta_b.set_node_prefix(2).unwrap();
         let mut ship_b = crate::authority_driver::Standalone::new(
             meta_b.clone(),

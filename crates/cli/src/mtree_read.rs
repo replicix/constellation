@@ -676,7 +676,7 @@ mod tests {
         files: u64,
     ) -> (Arc<dyn ObjectStore>, Arc<Meta>, Commit, Vec<Ino>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         let mut inos = Vec::new();
         for d in 0..dirs {
             let dir = meta
@@ -913,7 +913,7 @@ mod tests {
             Some(Arc::new(constellation_store_s3::E2eKeys::generate())),
         ] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            let meta = Arc::new(Meta::open_in_memory().unwrap());
+            let meta = Arc::new(crate::mtree_publish::test_meta());
             let manifest = vec![0xab; 40_000];
             let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
             meta.set_manifest(f.ino, &manifest, 1 << 20).unwrap();
@@ -940,7 +940,7 @@ mod tests {
             let boot_dir = TempDir::new().unwrap();
             let boot_reader =
                 ChainReader::for_store(Arc::clone(&store), keys.as_ref(), boot_dir.path()).unwrap();
-            let fresh = Arc::new(Meta::open_in_memory().unwrap());
+            let fresh = Arc::new(crate::mtree_publish::test_meta());
             bootstrap_from_commit(&boot_reader, Arc::clone(&fresh))
                 .await
                 .unwrap()
@@ -971,7 +971,7 @@ mod tests {
 
         let scratch = TempDir::new().unwrap();
         let reader = ChainReader::for_store(Arc::clone(&store), None, scratch.path()).unwrap();
-        let fresh = Arc::new(Meta::open_in_memory().unwrap());
+        let fresh = Arc::new(crate::mtree_publish::test_meta());
         let loaded = bootstrap_from_commit(&reader, Arc::clone(&fresh))
             .await
             .unwrap()

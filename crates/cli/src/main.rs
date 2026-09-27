@@ -2729,6 +2729,7 @@ impl constellation_net::PeerService for P2pBridge {
         &self,
         part: String,
         requester: u64,
+        epoch_applied: Option<u64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -2744,6 +2745,7 @@ impl constellation_net::PeerService for P2pBridge {
                 .nudge
                 .send(fusefs::SyncRequest::HandOff {
                     requester,
+                    epoch_applied,
                     reply: tx,
                 })
                 .is_err()
@@ -5170,6 +5172,10 @@ impl constellation_api::StatusSource for DaemonStatus {
         epoch.takeovers_refused_promises = stats.takeovers_refused_promises;
         epoch.promise_flush_exempt = stats.promise_flush_exempt;
         epoch.stale_claims = stats.epoch_stale_claims;
+        epoch.streamed_ahead = stats.epoch_streamed_ahead;
+        epoch.streamed_installed = stats.epoch_streamed_installed;
+        epoch.forwards_streamed = stats.epoch_forwards_streamed;
+        epoch.handoffs_behind = stats.epoch_handoffs_behind;
         let coop = self.coop.report();
         let s3_coop = coop.per_source.iter().find(|s| s.id == "s3").cloned();
         let peer_snap = self.peers.snapshot();
@@ -6116,6 +6122,8 @@ impl constellation_api::StatusSource for DaemonStatus {
         self.sync_tx
             .send(fusefs::SyncRequest::HandOff {
                 requester: self.node_id,
+                // The S3 handoff job (declined inside an active epoch).
+                epoch_applied: None,
                 reply,
             })
             .map_err(|_| "sync task is not running".to_string())?;

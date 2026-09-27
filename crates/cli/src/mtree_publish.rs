@@ -1033,6 +1033,15 @@ fn assert_publish_future_is_send(publisher: &mut TreePublisher) {
     is_send(publisher.publish(0));
 }
 
+/// A `Meta` for unit tests that publish local writes nothing shipped
+/// (`Meta::set_publish_unshipped_for_tests`).
+#[cfg(test)]
+pub(crate) fn test_meta() -> Meta {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_publish_unshipped_for_tests(true);
+    meta
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,7 +1067,7 @@ mod tests {
         fn new() -> Fixture {
             Fixture {
                 store: Arc::new(InMemory::new()),
-                meta: Arc::new(Meta::open_in_memory().unwrap()),
+                meta: Arc::new(crate::mtree_publish::test_meta()),
                 dirs: Vec::new(),
             }
         }
@@ -1117,7 +1126,7 @@ mod tests {
             store: Arc<dyn ObjectStore>,
             from: &TreePublisher,
         ) -> Peer {
-            let meta = Arc::new(Meta::open_in_memory().unwrap());
+            let meta = Arc::new(crate::mtree_publish::test_meta());
             meta.set_node_prefix(node_id).unwrap();
             let records: Vec<LogRecord> = self
                 .meta
@@ -1211,7 +1220,7 @@ mod tests {
         assert_eq!(commit.applied, 5);
 
         // A follower that tailed the same records (durable, unjournaled).
-        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let meta = Arc::new(crate::mtree_publish::test_meta());
         meta.set_node_prefix(2).unwrap();
         let records: Vec<LogRecord> = f
             .meta

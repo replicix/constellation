@@ -144,6 +144,10 @@ enum Phase {
     /// Plan 30 §M10: a TTL takeover's promise check (`promise.rs`); the
     /// plan waits in `pending_plan`.
     PromiseCheck,
+    /// A member's epoch probe found S3 back: `LeaseGet` outstanding, to
+    /// learn whether the carried lease is still the epoch's (see
+    /// `epoch_carrier_checked`).
+    EpochCarrierCheck,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1439,6 +1443,10 @@ impl Core {
                         if self.lease.epoch_held() {
                             // Plan 30 §M10: silent until the journal is in.
                             self.pr.flush_pending = true;
+                            // And the carried lease is re-claimed, whether
+                            // or not anything waits to ship: members close
+                            // only once it has moved (`epoch_reclaim_due`).
+                            self.end_epoch_hold(replica, true);
                         }
                         out.push(Action::EpochClose);
                         self.skip_ship = false;
@@ -1609,6 +1617,17 @@ impl Core {
                     self.queued_jobs.push_back(JobReq::Acquire {
                         reason: "ship-pending-journal",
                         ask_handoff: self.cfg.p2p,
+                    });
+                } else if self.lease.gate.is_none()
+                    && self.epoch_reclaim_due()
+                    && !self
+                        .queued_jobs
+                        .iter()
+                        .any(|j| matches!(j, JobReq::Acquire { .. }))
+                {
+                    self.queued_jobs.push_back(JobReq::Acquire {
+                        reason: "epoch-close-reclaim",
+                        ask_handoff: false,
                     });
                 }
                 // A holder with nothing else to ship may still sit on a
@@ -1956,7 +1975,10 @@ impl Core {
                     );
                     out.push(Action::Send {
                         to: holder,
-                        msg: PeerMsg::LeaseRequest { req },
+                        msg: PeerMsg::LeaseRequest {
+                            req,
+                            epoch_applied: Some(replica.applied_seq().unwrap_or(0)),
+                        },
                     });
                 }
                 _ => self.finish_acquire(now, false, replica, out),
@@ -2064,7 +2086,10 @@ impl Core {
                     );
                     out.push(Action::Send {
                         to: holder,
-                        msg: PeerMsg::LeaseRequest { req },
+                        msg: PeerMsg::LeaseRequest {
+                            req,
+                            epoch_applied: None,
+                        },
                     });
                     return;
                 }
@@ -2882,6 +2907,13 @@ impl Core {
             (Phase::Get, S3Result::LeaseGet(Ok(object))) => {
                 self.acquire_classified(now, object, replica, out)
             }
+            (Phase::EpochCarrierCheck, S3Result::LeaseGet(Ok(object))) => {
+                self.epoch_carrier_checked(now, object.map(|(l, _)| l), replica, out)
+            }
+            (Phase::EpochCarrierCheck, S3Result::LeaseGet(Err(_))) => {
+                // S3 is away again: the epoch stays open.
+                self.finish_round(now, None, replica, out);
+            }
             (Phase::Get, S3Result::LeaseGet(Err(e))) => {
                 tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease read failed");
                 self.finish_acquire(now, false, replica, out);
@@ -2941,48 +2973,18 @@ impl Core {
                 // no holder to ship past `base`).
                 let holds =
                     self.lease.epoch_held() || (self.lease.held.is_some() && !self.lease.lost);
-                // EC2 follow-up (d): an epoch that carries no lease has no
-                // holder to publish past `base` — nothing was written under
-                // it, and without this every member waited for that
-                // publication forever. Any member closes it once S3 is
-                // back; the lease is then CAS's again, as before the epoch.
-                if !holds && self.pr.carried.is_some() && self.ship.head_seq <= self.epoch.base {
-                    // Still waiting for the holder's publication — but
-                    // upload this node's own pending chunks now (the
-                    // round stays unprobed, so `on_uploads_done` closes
-                    // nothing). A write this member forwarded to the
-                    // holder inside the epoch left its chunks enrolled
-                    // here, and the holder's flush waits for them
-                    // (`remote_chunk_wait`) before it publishes: waiting
-                    // for that publication first made each side wait for
-                    // the other until the 60 s limit (`continuation-epoch`
-                    // with a carried lease). Chunks are content-addressed:
-                    // uploading them never needs the lease.
-                    let op = self.op_id();
-                    self.set_phase(Phase::Upload, Some(op));
-                    out.push(Action::UploadDirtyChunks {
-                        op,
-                        ino: None,
-                        round: true,
-                        complete: false,
-                    });
+                // (EC2 follow-up (d): an epoch that carries no lease has no
+                // holder; any member closes it once S3 is back, and the
+                // lease is then CAS's again, as before the epoch.)
+                if !holds && self.pr.carried.is_some() {
+                    // The epoch carries another member's lease: it stays
+                    // open here until that holder has taken its authority
+                    // back to S3. Ask the lease object.
+                    let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
+                    self.set_phase(Phase::EpochCarrierCheck, Some(op));
                     return;
                 }
-                if let Some(Job {
-                    what: What::Round { epoch_probed, .. },
-                    ..
-                }) = self.job.as_mut()
-                {
-                    *epoch_probed = true;
-                }
-                let op = self.op_id();
-                self.set_phase(Phase::Upload, Some(op));
-                out.push(Action::UploadDirtyChunks {
-                    op,
-                    ino: None,
-                    round: true,
-                    complete: true,
-                });
+                self.epoch_probe_close(out);
             }
             TailThen::Marker => {
                 if self.lease.gate.is_none() {
@@ -3128,6 +3130,80 @@ impl Core {
         }
     }
 
+    /// The epoch probe's round may close the epoch: mark it probed and
+    /// run the complete upload pass; `on_uploads_done` closes.
+    fn epoch_probe_close(&mut self, out: &mut Vec<Action>) {
+        if let Some(Job {
+            what: What::Round { epoch_probed, .. },
+            ..
+        }) = self.job.as_mut()
+        {
+            *epoch_probed = true;
+        }
+        let op = self.op_id();
+        self.set_phase(Phase::Upload, Some(op));
+        out.push(Action::UploadDirtyChunks {
+            op,
+            ino: None,
+            round: true,
+            complete: true,
+        });
+    }
+
+    /// A member of an epoch carrying another member's lease read the lease
+    /// object once S3 was back. It closes the epoch only once that object
+    /// is no longer the carried lease: the holder re-claimed it (its flush
+    /// ships the epoch's journal under it), released it, or lost it.
+    /// Until then the holder may still own the epoch's authority, and this
+    /// member keeps promising nothing. (Flex-crash seed 4309: the rule was
+    /// "a segment past `base`", and a member paused at the activation had
+    /// a `base` below the holder's pre-outage segments; tailing those
+    /// after the heal closed its epoch, it promised, and a third node took
+    /// the lease over while the paused holder still held the epoch.)
+    fn epoch_carrier_checked(
+        &mut self,
+        now: Ms,
+        object: Option<Lease>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(l) = &object {
+            self.lease.note_object(now, l);
+        }
+        let carried = self.pr.carried;
+        let still_carried = match (&object, carried) {
+            (Some(l), Some(c)) => {
+                !l.released
+                    && l.holder == c.node
+                    && l.epoch == c.epoch
+                    && l.expires_unix_ms == c.expires_unix_ms
+            }
+            _ => false,
+        };
+        if !still_carried {
+            self.epoch_probe_close(out);
+            return;
+        }
+        let _ = replica;
+        // Still waiting for the holder — but upload this node's own
+        // pending chunks now (the round stays unprobed, so
+        // `on_uploads_done` closes nothing). A write this member forwarded
+        // to the holder inside the epoch left its chunks enrolled here,
+        // and the holder's flush waits for them (`remote_chunk_wait`)
+        // before it publishes: waiting for the holder first made each
+        // side wait for the other until the 60 s limit
+        // (`continuation-epoch` with a carried lease). Chunks are
+        // content-addressed: uploading them never needs the lease.
+        let op = self.op_id();
+        self.set_phase(Phase::Upload, Some(op));
+        out.push(Action::UploadDirtyChunks {
+            op,
+            ino: None,
+            round: true,
+            complete: false,
+        });
+    }
+
     /// A peer answered the acquisition's `LeaseRequest`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lease_handoff(
@@ -3161,6 +3237,15 @@ impl Core {
             // §M10: the predecessor hands over only with an empty journal
             // (`on_lease_request`).
             let mine = self.lease.epoch().unwrap_or(epoch).max(1);
+            if self
+                .pr
+                .carried
+                .is_some_and(|c| self.hold_ended_is(c.epoch, c.expires_unix_ms))
+                && replica.persist_epoch_hold_ended(None).is_ok()
+            {
+                // Handed back to this node: its own again.
+                self.pr.hold_ended = None;
+            }
             self.lease.adopt_epoch_hold(now, mine);
             replica.set_holder_epoch(0);
             self.lease.gate = Some(PendingGate {
