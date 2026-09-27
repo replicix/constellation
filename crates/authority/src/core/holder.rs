@@ -589,7 +589,7 @@ impl Core {
         }
         self.enqueue_job(
             now,
-            super::jobs::JobReq::Handoff { req, from },
+            super::jobs::JobReq::Handoff { req, from, at: now },
             replica,
             out,
         );

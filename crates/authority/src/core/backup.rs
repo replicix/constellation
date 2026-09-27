@@ -184,6 +184,10 @@ pub(crate) struct AckState {
     /// latest one that succeeded without revealing a deposition.
     pub s3_sent: BTreeMap<OpId, Ms>,
     pub last_s3_fresh: Ms,
+    /// EWMA of this node's S3 request round trips (ms, 0 until the
+    /// first): what a handoff's successor needs to claim the lease
+    /// scales with it (`Core::begin_handoff_pause`).
+    pub s3_rtt_ms: u64,
     /// The `MarkGranting` CAS in flight.
     marking: Option<OpId>,
     /// What the replica's durability gate was last told.
@@ -479,9 +483,15 @@ impl Core {
 
     /// A successful S3 result proves liveness as of the request's send
     /// time — unless it revealed a deposition (a foreign lease object).
-    pub(crate) fn note_s3_liveness(&mut self, op: OpId, result: &S3Result) {
+    pub(crate) fn note_s3_liveness(&mut self, now: Ms, op: OpId, result: &S3Result) {
         let Some(sent) = self.ack.s3_sent.remove(&op) else {
             return;
+        };
+        let rtt = now.since(sent).max(0) as u64;
+        self.ack.s3_rtt_ms = if self.ack.s3_rtt_ms == 0 {
+            rtt
+        } else {
+            (self.ack.s3_rtt_ms * 3 + rtt) / 4
         };
         let fresh = match result {
             S3Result::SegmentRun(Ok(_))
@@ -1879,6 +1889,14 @@ impl Core {
                 replica.backup_clear();
             }
         }
+    }
+
+    /// This node backs nobody any more; its tail is void.
+    pub(crate) fn backup_role_ends(&mut self, replica: &dyn Replica) {
+        self.bk.role = None;
+        self.bk.acked = 0;
+        self.bk.held.clear();
+        replica.backup_clear();
     }
 
     /// The takeover gate (after the marker and the strand): apply what is

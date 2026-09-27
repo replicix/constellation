@@ -821,6 +821,120 @@ fn a_handoff_is_declined_while_the_journal_cannot_drain() {
     assert!(h.core.job().is_none());
 }
 
+/// A claim of the holder's placement offer asks the holder over P2P
+/// before anything touches S3: a declined claim (the holder writes more
+/// now, `placement::declines_claim`) costs no S3 request at all, and
+/// the requester settles as a non-holder.
+#[test]
+fn a_claimed_offer_asks_the_holder_first_and_a_decline_costs_no_s3() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let out = h.step(Event::Control {
+        op: OpId(900),
+        req: Control::ClaimOffer { epoch: 1 },
+    });
+    assert!(
+        s3_ops(&out).is_empty(),
+        "no S3 before the holder answers: {out:?}"
+    );
+    let req = match sends(&out)[..] {
+        [(2, PeerMsg::LeaseRequest { req, .. })] => *req,
+        ref other => panic!("expected one LeaseRequest to the holder: {other:?}"),
+    };
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::LeaseHandoff {
+            req,
+            released: false,
+            epoch: 1,
+            head_seq: None,
+        },
+    });
+    assert!(s3_ops(&out).is_empty(), "a decline costs no S3: {out:?}");
+    assert!(h.core.lease().held.is_none());
+    assert!(h.core.job().is_none(), "the acquisition ended");
+}
+
+/// `visibility-s3-latency`: a lease request queued behind a round that
+/// outlasts the requester's wait (a ship loop under slow S3) is
+/// declined when it reaches the slot — no flush, no release: the
+/// requester gave up, and a release would leave the lease to nobody.
+#[test]
+fn a_handoff_request_that_waited_past_its_timeout_is_declined() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let out = h.step(Event::Timer { id: poll });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the round uploads first");
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::LeaseRequest {
+            req: OpId(5),
+            epoch_applied: None,
+        },
+    });
+    assert!(sends(&out).is_empty());
+    // The round outlives the requester's wait.
+    h.advance(h.core.config().handoff_request_timeout_ms + 1);
+    let mut out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    // Let the round finish (it renews first: half the TTL went by).
+    let mut declined = false;
+    for _ in 0..10 {
+        assert!(
+            !s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseSwap { lease, .. } if lease.released)),
+            "nothing is released: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::UploadDirtyChunks { round: false, .. })),
+            "no handoff flush: {out:?}"
+        );
+        if sends(&out).iter().any(|(to, m)| {
+            *to == 2
+                && matches!(
+                    m,
+                    PeerMsg::LeaseHandoff {
+                        req: OpId(5),
+                        released: false,
+                        ..
+                    }
+                )
+        }) {
+            declined = true;
+            break;
+        }
+        let Some((op, req)) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+        else {
+            break;
+        };
+        let result = match req {
+            S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+            other => panic!("unexpected {other:?}"),
+        };
+        out = h.step(Event::S3 { op, result });
+    }
+    assert!(declined, "the stale request is declined");
+    assert!(h.core.lease().held.is_some());
+    assert!(!h.core.lease().releasing);
+}
+
 #[test]
 fn a_lost_renewal_deposes_and_the_round_recovers() {
     let mut h = Harness::new(1);

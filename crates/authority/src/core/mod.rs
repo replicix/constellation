@@ -1619,7 +1619,7 @@ impl Core {
             tracing::debug!(node = self.cfg.node_id, ?op, "stale S3 result dropped");
             return;
         };
-        self.note_s3_liveness(op, &result);
+        self.note_s3_liveness(now, op, &result);
         match purpose {
             S3For::Job => self.on_job_s3(now, op, result, replica, out),
             S3For::LearnHolder(rid) => self.on_holder_learned(now, rid, result, replica, out),

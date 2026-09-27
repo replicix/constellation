@@ -1147,6 +1147,7 @@ impl NodeRuntime {
                     }
                     placement.gossip_rtts(&peers, node_id).await;
                     if let Some(best) = placement.recommend(node_id, &peers) {
+                        placement.note_offer(best);
                         let _ = peers
                             .request_to_node(
                                 best,

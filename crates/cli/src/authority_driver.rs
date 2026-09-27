@@ -1113,6 +1113,17 @@ impl Driver {
                 epoch_applied,
                 reply,
             } => {
+                if self.deps.placement.declines_claim(self.node_id, requester) {
+                    // This node's own clients write more than the
+                    // requester's right now: the offer it made is stale.
+                    // Nothing is flushed or released, no S3 request.
+                    tracing::info!(
+                        requester,
+                        "declining a claim of our lease offer: this node writes more now"
+                    );
+                    let _ = reply.send(None);
+                    return None;
+                }
                 let req = self.control_id();
                 self.handoff_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {

@@ -26189,3 +26189,94 @@ static mutex while they run.
 - Scenarios (prefix `constellation-harness-epochcap`):
   `epoch-member-dies-with-chunk` seed 42 (C returns) and seed 43
   (`drop-held --remote`) pass, 43–44 s each.
+## Fix: placement no longer flips the lease away from the active writer
+
+`visibility-s3-latency` failed about one run in five with a lease flip at
+the phase switch: node b claimed a's placement offer, and a released the
+lease while a itself had started writing. Then a took the lease back
+through S3 after its 2 s handoff pause, and the pollers saw 3–5 s gaps.
+The logs of several such runs show four causes:
+
+1. **A claim that went stale was still served.** The holder queued b's
+   lease request behind a round whose ship loop never ran dry under
+   sustained writes, and served it 12 s later. By then b had given up
+   (the request times out after 5 s) and a was the writer. The release
+   left the lease to nobody, and a's writes took it back through S3.
+   *Fix* (`authority/core/jobs.rs`, `holder.rs`):
+   `JobReq::Handoff` carries its arrival time, and `begin_handoff`
+   declines a request older than `handoff_request_timeout_ms`, with no
+   flush and no release.
+   *Fix:* a round's ship loop yields to a waiting non-round job after
+   the segment in flight (the round ends and the next ships the rest),
+   so a request gets the slot within one segment PUT.
+2. **The claim was judged only when the offer was made.** Offers use up
+   to a minute of history.
+   *Fix* (`cli/placement.rs`, `authority_driver.rs`, `node_runtime.rs`):
+   the holder remembers its offer (`note_offer`) and keeps timestamped
+   op counts for the last 10 s (`ops_within`). A claim of its offer is
+   declined at arrival while its own clients wrote more than the
+   claimant's in the last 3 s (`declines_claim`). There are no new
+   offers for 30 s after a decline (`DECLINE_QUIET`), so the decision
+   settles. Other lease requests (nodes that cannot forward) keep
+   today's rules.
+3. **The claim cost S3 before the holder could say no, and froze the
+   claimant's view.** An offer claim read the lease from S3 first. It
+   then sat in `Phase::LeaseRequest` for up to 5 s, during which the
+   claimant applied neither log-stream frames nor pre-S3 transactions
+   (`cursor_free`).
+   *Fix:* a claim of an offer asks the holder over P2P first
+   (`begin_acquire`), so a decline costs no S3 request.
+   *Fix:* `Phase::LeaseRequest` leaves the replica cursor free. The
+   answer is followed by a catch-up tail anyway.
+4. **The handoff raced back.** a's pause was a fixed 2 s. At 300 ms per
+   request, b's claim (catch-up tail, lease read, CAS, marker) could
+   outlast it, and a's writes retried acquisition and won.
+   *Fix:* `Core::begin_handoff_pause` pauses for at least
+   `handoff_pause_ms` and eight observed S3 round trips (an EWMA kept
+   in `note_s3_liveness`).
+   *Fix:* a node handed the lease by the holder it backs ends its
+   backup role (`backup_role_ends`). That holder flushed everything
+   before releasing, so its silence is the handoff. Before this, the
+   claimant sealed the released epoch 1.5 s later, in the middle of its
+   own claim.
+
+Hysteresis is unchanged (recent-bucket check, 0.7 ratio, 60 s dwell).
+The rules above only decline or delay a move, never force one, and
+safety still rests on the lease CAS and the log slot.
+
+**The residual 0.3–0.6 s `ship_landed` → `ack_journal` stall** (seen at
+1.5 s per S3 request in the slow-seal work) did not reproduce on a
+quiet host. With `ack_journal_rows_at` instrumented (write-lock wait,
+row acks, journal length, commit, prune), two `slow-s3-no-seal` runs of
+90 s and 180 s had no call over 50 ms. The earlier stalls happened
+while cargo test and long_* sweeps ran on the same host. It looks like
+host contention (fjall commits and the uploader competing for CPU and
+disk), not a lock held across waitable work, so nothing was changed.
+The driver's "slow core step" warning (≥ 500 ms) stays to catch it.
+
+**Tests:**
+- Unit tests (`core/tests.rs`):
+  - `a_handoff_request_that_waited_past_its_timeout_is_declined`
+    fails without the staleness rule.
+  - `a_claimed_offer_asks_the_holder_first_and_a_decline_costs_no_s3`.
+- Placement test: `a_claim_is_declined_while_the_holder_writes_more`.
+
+**Results** (prefix `constellation-harness-placeflip`):
+- `visibility-s3-latency`: 10/10 in each of three batches, the last
+  one on main `2ff95df` after the rebase.
+  Before the fix, the same batch failed 2/10, and 4/10 with the claim
+  and pause changes alone, before the stale-request and yield rules.
+  With the fix, p99 open→read is 0.32–0.91 s. In the runs where the
+  lease moved to the writer, the move was a clean handoff with no flop.
+- Neighbouring scenarios pass: `lease-handover`,
+  `sticky-lease-handoff-over-s3`, `p2p-handover`, `auto-placement`,
+  `backup-failover`, `backup-departs`, `forwarded-mutations`,
+  `nonowner-op-latency`, `delegated-op-latency`,
+  `sqlite-first-touch-latency`, `visibility-after-burst`,
+  `slow-s3-no-seal` and `holder-kill-rejoin`.
+- Unit tests of authority, cli and net pass.
+- All 7 `long_*` sweeps pass, again after the rebase. After the rebase
+  these neighbours were re-run and pass: `lease-handover`,
+  `sticky-lease-handoff-over-s3`, `auto-placement`, `backup-failover`
+  and `slow-s3-no-seal`.
+- clippy (`-D warnings`) and fmt are clean.

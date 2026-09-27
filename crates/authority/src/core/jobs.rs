@@ -36,6 +36,8 @@ pub(crate) enum JobReq {
     Handoff {
         req: OpId,
         from: NodeId,
+        /// When the request arrived (see `begin_handoff`'s staleness rule).
+        at: Ms,
     },
     TailToHead {
         control: OpId,
@@ -319,7 +321,9 @@ impl Core {
                     reason,
                     ask_handoff,
                 } => self.begin_acquire(now, reason, ask_handoff, replica, out),
-                JobReq::Handoff { req, from } => self.begin_handoff(now, req, from, replica, out),
+                JobReq::Handoff { req, from, at } => {
+                    self.begin_handoff(now, req, from, at, replica, out)
+                }
                 JobReq::TailToHead { control } => {
                     // Plan 30 §M8: strict reads arriving from now on are
                     // not covered by this tail; they queue the next.
@@ -350,7 +354,16 @@ impl Core {
     pub(crate) fn cursor_free(&self) -> bool {
         match &self.job {
             None => true,
-            Some(job) => matches!(job.phase, Phase::Upload | Phase::Tail { .. }),
+            // (An acquisition waiting for the holder's answer to its
+            // lease request touches no replica state until the answer
+            // comes, and then tails anyway: a claim of a placement offer
+            // must not freeze this node's view of the holder's writes
+            // for as long as the holder takes to answer — up to the
+            // request timeout, `visibility-s3-latency`.)
+            Some(job) => matches!(
+                job.phase,
+                Phase::Upload | Phase::Tail { .. } | Phase::LeaseRequest { .. }
+            ),
         }
     }
 
@@ -1788,7 +1801,7 @@ impl Core {
         {
             tracing::info!(node = self.cfg.node_id, "idle-releasing the lease");
             self.lease.releasing = true;
-            self.lease.begin_handoff_pause(now, &self.cfg);
+            self.begin_handoff_pause(now);
             self.release_after_atime(now, replica, out);
             return;
         }
@@ -1807,7 +1820,7 @@ impl Core {
                 self.job.as_ref().map(|j| &j.what),
                 Some(What::Round { head_before, .. }) if self.ship.head_seq != *head_before
             );
-            self.lease.begin_handoff_pause(now, &self.cfg);
+            self.begin_handoff_pause(now);
             if moved {
                 self.nudged = true;
             }
@@ -1965,6 +1978,21 @@ impl Core {
 
     // ---- acquire ----
 
+    /// Close new local mutations while the lease is handed off or
+    /// released. The successor needs a few S3 round trips to claim it
+    /// (catch up to the head, read, CAS, ship its marker); an old holder
+    /// whose own writes retried acquisition before that took the lease
+    /// straight back through S3 at slow S3 (a flip and a flop, several
+    /// seconds of stalled writes on both nodes). So the pause is at least
+    /// `handoff_pause_ms` and eight observed S3 round trips.
+    pub(crate) fn begin_handoff_pause(&mut self, now: Ms) {
+        let ms = self
+            .cfg
+            .handoff_pause_ms
+            .max(self.ack.s3_rtt_ms.saturating_mul(8));
+        self.lease.pause_until = now.plus(ms);
+    }
+
     fn begin_acquire(
         &mut self,
         now: Ms,
@@ -2049,6 +2077,38 @@ impl Core {
                 "continuation epoch open: no S3 acquisition"
             );
             self.finish_acquire(now, false, replica, out);
+            return;
+        }
+        // A claim of the holder's placement offer asks the holder first,
+        // over P2P: it re-checks the move against who writes now and may
+        // decline (`placement::Placement::declines_claim`), and a decline
+        // then costs no S3 request at all. Only a handoff is followed by
+        // the S3 claim (catch-up, lease read, CAS).
+        let offered_by = self
+            .lease
+            .cached_holder
+            .filter(|h| *h != self.cfg.node_id && self.lease.held.is_none());
+        if let (Some(holder), true) = (offered_by, reason == "claim-offer" && ask_handoff) {
+            let req = self.op_id();
+            self.set_phase(
+                Phase::LeaseRequest {
+                    req,
+                    epoch_mode: false,
+                },
+                None,
+            );
+            self.set_timer(
+                now.plus(self.cfg.handoff_request_timeout_ms),
+                super::Timer::JobRequestTimeout(req),
+                out,
+            );
+            out.push(Action::Send {
+                to: holder,
+                msg: PeerMsg::LeaseRequest {
+                    req,
+                    epoch_applied: None,
+                },
+            });
             return;
         }
         let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
@@ -2458,10 +2518,28 @@ impl Core {
         now: Ms,
         req: OpId,
         from: NodeId,
+        at: Ms,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) else {
+        // A request that waited for the slot longer than its requester
+        // waits for the answer is declined: the requester has given up
+        // (and gone on forwarding), so a release now would leave the
+        // lease to nobody, and this holder's own writes would take it
+        // back through S3 once its pause ran out (`visibility-s3-
+        // latency`: a claim queued 12 s behind a round's ship loop under
+        // slow S3, served while this node was the one writing).
+        let stale = now.since(at) >= self.cfg.handoff_request_timeout_ms as i64;
+        if stale {
+            tracing::info!(
+                node = self.cfg.node_id,
+                requester = from,
+                waited_ms = now.since(at),
+                "declining a stale lease request: its requester stopped waiting"
+            );
+        }
+        let epoch = self.lease.ship_epoch(now, &self.cfg).filter(|_| !stale);
+        let Some(epoch) = epoch else {
             self.stats.handoffs_declined += 1;
             out.push(Action::Send {
                 to: from,
@@ -2572,7 +2650,7 @@ impl Core {
                     return;
                 }
                 if self.lease.held.is_some() && !self.lease.lost {
-                    self.lease.begin_handoff_pause(now, &self.cfg);
+                    self.begin_handoff_pause(now);
                     self.release_after_atime(now, replica, out);
                 } else {
                     self.finish_flush_job(now, true, replica, out);
@@ -2914,6 +2992,22 @@ impl Core {
                     // between two segments once half the TTL is gone.
                     ShipPurpose::Journal if kind == JobKind::Round && self.renew_due(now) => {
                         self.issue_renew(now, true, out);
+                    }
+                    // A job waits for the slot (a lease request above
+                    // all): the round ends after this segment and the
+                    // next round ships the rest. Under sustained writes
+                    // the ship loop never runs dry, and a lease request
+                    // used to wait past its requester's timeout, to be
+                    // served (or, now, declined) long after it mattered.
+                    ShipPurpose::Journal
+                        if kind == JobKind::Round
+                            && self
+                                .queued_jobs
+                                .iter()
+                                .any(|j| !matches!(j, JobReq::Round { .. })) =>
+                    {
+                        self.nudged = true;
+                        self.round_publish(now, replica, out);
                     }
                     ShipPurpose::Journal => match kind {
                         JobKind::Round => self.round_ship(now, 0, replica, out),
@@ -3348,7 +3442,6 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let _ = from;
         let Some(job) = self.job.as_ref() else {
             return;
         };
@@ -3394,6 +3487,24 @@ impl Core {
             });
             self.acquire_gate(now, replica, out);
             return;
+        }
+        // This node backed the holder that just handed it the lease: the
+        // holder flushed its whole journal to the log before releasing,
+        // so the backup tail is void, and its silence from now on is the
+        // handoff, not a failure — sealing it (1.5 s later) only raced
+        // this node's own claim.
+        if self
+            .bk
+            .role
+            .is_some_and(|r| r.holder == from && r.epoch == epoch)
+        {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                holder = from,
+                epoch,
+                "handed the lease by the holder this node backs: backup role ends"
+            );
+            self.backup_role_ends(replica);
         }
         if let Some(Job {
             what: What::Acquire {

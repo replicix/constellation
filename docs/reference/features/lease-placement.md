@@ -105,7 +105,20 @@ Placement recommends a move only when:
 
 The offered node claims the lease only if its own clients wrote in the
 last 3 s, and a claim the holder declines does not add the node to the
-lease's `wanted_by` (the holder offers again while the move still pays).
+lease's `wanted_by`. The claim goes to the holder over P2P before
+anything touches S3. The holder judges it again when it arrives: it
+declines while its own clients wrote more than the claimant's in the
+last 3 s (the burst that made the offer has ended, and the holder is
+now the writer). After a decline it makes no new offer for 30 s, so the
+decision settles instead of cycling. A declined claim costs no S3
+request. A lease request of any kind that waited in the holder's job
+queue longer than its requester waits (5 s) is declined when it reaches
+the slot, never served late. A round's ship loop yields to a waiting
+job after the segment in flight, so a request gets the slot within one
+segment PUT even under sustained writes. The old holder then keeps its
+own writes paused for at least eight observed S3 round trips (and at
+least 2 s), long enough for the successor's claim to land, instead of
+taking the lease straight back.
 Without these, a minute of history could hand the lease from a holder
 that had just started writing to a node whose burst had ended; that
 node never wrote again, the holder's next close had to take the lease

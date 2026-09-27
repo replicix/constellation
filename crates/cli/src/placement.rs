@@ -30,6 +30,13 @@ const MIN_ABS_IMPROVEMENT_MS: f64 = 5.0;
 const RECENT_BUCKETS: usize = 2;
 /// See [`Placement::writing_now`].
 const OFFER_ACTIVE: Duration = Duration::from_secs(3);
+/// How long a claim counts as the answer to an offer this node made
+/// ([`Placement::declines_claim`]).
+const OFFER_VALID: Duration = Duration::from_secs(10);
+/// Timestamped op counts kept for [`Placement::ops_within`].
+const RECENT_KEEP: Duration = Duration::from_secs(10);
+/// See [`Placement::declined`].
+const DECLINE_QUIET: Duration = Duration::from_secs(30);
 
 pub fn placement_enabled() -> bool {
     match std::env::var("CONSTELLATION_LEASE_PLACEMENT") {
@@ -56,6 +63,15 @@ pub struct Placement {
     pub last_reason: Mutex<Option<String>>,
     /// When this node's own clients last wrote (see [`Self::writing_now`]).
     last_own: Mutex<Option<Instant>>,
+    /// The last [`RECENT_KEEP`] of op counts, timestamped: who is
+    /// writing *now*, at a finer grain than the 5 s buckets.
+    recent: Mutex<VecDeque<(Instant, u64, u64)>>,
+    /// The node this holder last offered the lease to, and when.
+    offered: Mutex<Option<(u64, Instant)>>,
+    /// When this holder last declined a claim of its offer: no new offer
+    /// for [`DECLINE_QUIET`] (the decision settles rather than cycling
+    /// offer, claim, decline every evaluation).
+    declined: Mutex<Option<Instant>>,
 }
 
 impl Placement {
@@ -69,7 +85,52 @@ impl Placement {
             rtts: Mutex::new(HashMap::new()),
             last_reason: Mutex::new(None),
             last_own: Mutex::new(None),
+            recent: Mutex::new(VecDeque::new()),
+            offered: Mutex::new(None),
+            declined: Mutex::new(None),
         }
+    }
+
+    /// Ops of `node` in the last `window` (at most [`RECENT_KEEP`]).
+    pub fn ops_within(&self, node: u64, window: Duration) -> u64 {
+        let recent = self.recent.lock().unwrap();
+        recent
+            .iter()
+            .rev()
+            .take_while(|(at, _, _)| at.elapsed() < window)
+            .filter(|(_, n, _)| *n == node)
+            .map(|(_, _, ops)| *ops)
+            .sum()
+    }
+
+    /// This holder offered the lease to `node`.
+    pub fn note_offer(&self, node: u64) {
+        *self.offered.lock().unwrap() = Some((node, Instant::now()));
+    }
+
+    /// Whether this holder should decline `requester`'s claim of its
+    /// offer. A placement offer is made on up to a minute of history and
+    /// claimed a moment later; by then the holder may be the one writing
+    /// (a burst on the requester ended and one here began). Handing the
+    /// lease over then moved the sequencer away from the active writer,
+    /// whose next writes took it back through S3 — a flip and a flop,
+    /// seconds of stalls at slow S3 (`visibility-s3-latency`, 1 in 5).
+    /// So a claim is declined while this node's clients wrote more than
+    /// the requester's in the last [`OFFER_ACTIVE`]. Only claims of an
+    /// offer this node made in the last [`OFFER_VALID`] are judged: other
+    /// lease requests (a node that cannot forward) keep today's rules.
+    pub fn declines_claim(&self, self_id: u64, requester: u64) -> bool {
+        let offered = self
+            .offered
+            .lock()
+            .unwrap()
+            .is_some_and(|(n, at)| n == requester && at.elapsed() < OFFER_VALID);
+        let decline = offered
+            && self.ops_within(self_id, OFFER_ACTIVE) > self.ops_within(requester, OFFER_ACTIVE);
+        if decline {
+            *self.declined.lock().unwrap() = Some(Instant::now());
+        }
+        decline
     }
 
     /// One new bucket per [`BUCKET_MS`] elapsed (an idle stretch leaves
@@ -130,10 +191,21 @@ impl Placement {
             return;
         }
         self.maybe_rotate();
-        let mut buckets = self.buckets.lock().unwrap();
-        if let Some(b) = buckets.back_mut() {
-            *b.ops.entry(node).or_insert(0) += n;
+        {
+            let mut buckets = self.buckets.lock().unwrap();
+            if let Some(b) = buckets.back_mut() {
+                *b.ops.entry(node).or_insert(0) += n;
+            }
         }
+        let now = Instant::now();
+        let mut recent = self.recent.lock().unwrap();
+        while recent
+            .front()
+            .is_some_and(|(at, _, _)| now.duration_since(*at) >= RECENT_KEEP)
+        {
+            recent.pop_front();
+        }
+        recent.push_back((now, node, n));
     }
 
     pub fn note_peer_rtts(&self, from: u64, rtts: Vec<(u64, u16)>) {
@@ -193,6 +265,14 @@ impl Placement {
                     return None;
                 }
             }
+        }
+        if self
+            .declined
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() < DECLINE_QUIET)
+        {
+            return None;
         }
         // Candidates must have a direct path.
         let direct: Vec<u64> = peers
@@ -334,6 +414,35 @@ mod tests {
         // Were the old writer still writing now, the move stands.
         p.note_ops(2, 60);
         assert_eq!(p.best_holder(1, &[2]).map(|(n, _, _)| n), Some(2));
+    }
+
+    /// `visibility-s3-latency`: the holder offers the lease to a node
+    /// whose burst dominated the window; by the time the claim arrives
+    /// the holder is the one writing. It declines; once it is idle and
+    /// the requester writes again, it hands over. A claim it never
+    /// offered is not judged here.
+    #[test]
+    fn a_claim_is_declined_while_the_holder_writes_more() {
+        let p = Placement::new();
+        p.note_ops(2, 50);
+        p.note_offer(2);
+        assert!(
+            !p.declines_claim(1, 2),
+            "the requester writes, the holder not"
+        );
+        p.note_ops(1, 60);
+        assert!(p.declines_claim(1, 2), "the holder writes more now");
+        assert!(!p.declines_claim(1, 3), "never offered to node 3");
+        // Older than the active window: only what happens now counts.
+        {
+            let mut r = p.recent.lock().unwrap();
+            let old = Instant::now() - OFFER_ACTIVE - Duration::from_millis(1);
+            for e in r.iter_mut() {
+                e.0 = old;
+            }
+        }
+        p.note_ops(2, 1);
+        assert!(!p.declines_claim(1, 2));
     }
 
     #[test]
