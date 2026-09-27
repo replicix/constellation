@@ -305,6 +305,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: log_retention_gap_taker,
     },
     Scenario {
+        name: "log-retention-gap-open-orphan",
+        desc: "DESIGN §3+§14: a frozen follower with an unlinked file open goes through a retention-gap rebuild; its handle keeps reading the right bytes until close, its hold keeps GC off the chunk, and the close reclaims it",
+        requires: &[],
+        run: log_retention_gap_open_orphan,
+    },
+    Scenario {
         name: "fsck-repair",
         desc: "fsck detects and repairs a missing chunk, orphan, and torn segment",
         requires: &[],
@@ -1639,6 +1645,29 @@ fn gc_dedup_race(_seed: u64) -> Result<()> {
     client.unmount()
 }
 
+/// `Client::gc_run` with a deadline: a GC round that has not finished by
+/// then is killed and its output reported, rather than the scenario
+/// hanging on it.
+fn gc_run_bounded(client: &Client, deadline: Duration) -> Result<std::process::Output> {
+    let mut child = client.gc_process()?;
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if start.elapsed() > deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            anyhow::bail!(
+                "gc run did not finish within {deadline:?}; killed. stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Object keys under `prefix` (one LIST page; the scenarios below list a
 /// few dozen keys at most).
 fn raw_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
@@ -1771,10 +1800,18 @@ enum GapMode {
     /// after the prune: the mount-time check must find the gap, and B is
     /// the lease taker right away.
     Restarted,
+    /// `Frozen`, with a file B has open that A unlinked before the
+    /// freeze: the rebuild must keep the orphan for B's handle (and B's
+    /// hold must keep GC off its chunk) until B closes it.
+    FrozenWithOpenOrphan,
 }
 
 fn log_retention_gap_follower(seed: u64) -> Result<()> {
     log_retention_gap(seed, GapMode::Frozen)
+}
+
+fn log_retention_gap_open_orphan(seed: u64) -> Result<()> {
+    log_retention_gap(seed, GapMode::FrozenWithOpenOrphan)
 }
 
 fn log_retention_gap_taker(seed: u64) -> Result<()> {
@@ -1793,6 +1830,7 @@ fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
     let name = match mode {
         GapMode::Frozen => "log-retention-gap-follower",
         GapMode::Restarted => "log-retention-gap-taker",
+        GapMode::FrozenWithOpenOrphan => "log-retention-gap-open-orphan",
     };
     let (env, root) = setup(name)?;
     let _proxy = env.s3_proxy()?;
@@ -1807,6 +1845,9 @@ fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
             .with_env("CONSTELLATION_PUBLISH_IDLE_S", "1")
             .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")
             .with_env("CONSTELLATION_LOG_GAP_CHECK_MS", "2000")
+            // The open-orphan mode freezes B for several seconds: its
+            // hold must outlive the freeze (three refreshes = 15 s).
+            .with_env("CONSTELLATION_HOLD_REFRESH_MS", "5000")
             // The S3 slow path only: the fork this guards against is an
             // S3 takeover's, and hints would find the gap sooner.
             .with_env("CONSTELLATION_P2P", "off"))
@@ -1824,8 +1865,31 @@ fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
         Duration::from_secs(60),
         || model.verify(&b.mnt),
     )?;
+    // The open-orphan mode: B opens a file, A unlinks it, B applies the
+    // unlink (its hold appears) — then B is frozen with the handle open.
+    let orphan_bytes = b"unlinked on a, open on b across the rebuild".to_vec();
+    let holds_prefix = format!("{prefix}/holds/");
+    let mut orphan_handle = None;
+    eprintln!("    {name}: step: converged before the gap");
+    if matches!(mode, GapMode::FrozenWithOpenOrphan) {
+        std::fs::write(a.mnt.join("orphan"), &orphan_bytes)?;
+        eventually("B sees the file", Duration::from_secs(30), || {
+            anyhow::ensure!(std::fs::read(b.mnt.join("orphan"))? == orphan_bytes);
+            Ok(())
+        })?;
+        orphan_handle = Some(std::fs::File::open(b.mnt.join("orphan"))?);
+        eprintln!("    {name}: step: orphan open on B");
+        std::fs::remove_file(a.mnt.join("orphan"))?;
+        eprintln!("    {name}: step: unlinked on A");
+        eventually("B publishes its hold", Duration::from_secs(30), || {
+            let keys = raw_keys(&env.direct_endpoint, &holds_prefix)?;
+            anyhow::ensure!(keys.len() == 1, "holds: {keys:?}");
+            Ok(())
+        })?;
+    }
+    eprintln!("    {name}: step: hold published; B goes away");
     match mode {
-        GapMode::Frozen => b.pause()?,
+        GapMode::Frozen | GapMode::FrozenWithOpenOrphan => b.pause()?,
         GapMode::Restarted => b.unmount()?,
     }
 
@@ -1841,20 +1905,51 @@ fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
         std::thread::sleep(Duration::from_millis(120));
     }
     std::thread::sleep(Duration::from_secs(3));
-    let output = a.gc_run()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "gc run failed: {}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let pruned = log_segments(&env.direct_endpoint, &prefix)?;
-    let floor = *pruned.first().context("an empty log after the prune")?;
-    let b_position = *before.last().context("no segment before the gap")?;
-    anyhow::ensure!(
-        floor > b_position + 1,
-        "the prune did not pass B's position: B at {b_position}, log {pruned:?}"
-    );
+    eprintln!("    {name}: step: files written; running gc");
+    // While B is frozen, any early return must thaw it first: dropping
+    // a paused client hangs in its unmount (the daemon cannot answer).
+    let thaw = |b: &Client, e: anyhow::Error| -> anyhow::Error {
+        if matches!(mode, GapMode::Frozen | GapMode::FrozenWithOpenOrphan) {
+            let _ = b.resume();
+        }
+        e
+    };
+    // With B frozen and a FUSE fd of B's held by this process (the
+    // open-orphan mode), GC must not be a forked process: see
+    // `Client::gc_run_control`.
+    if orphan_handle.is_some() {
+        a.gc_run_control().map_err(|e| thaw(&b, e))?;
+    } else {
+        let output = gc_run_bounded(&a, Duration::from_secs(120)).map_err(|e| thaw(&b, e))?;
+        if !output.status.success() {
+            return Err(thaw(
+                &b,
+                anyhow::anyhow!(
+                    "gc run failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+    }
+    eprintln!("    {name}: step: gc done");
+    let pruned = log_segments(&env.direct_endpoint, &prefix).map_err(|e| thaw(&b, e))?;
+    let floor = *pruned
+        .first()
+        .context("an empty log after the prune")
+        .map_err(|e| thaw(&b, e))?;
+    let b_position = *before
+        .last()
+        .context("no segment before the gap")
+        .map_err(|e| thaw(&b, e))?;
+    if floor <= b_position + 1 {
+        return Err(thaw(
+            &b,
+            anyhow::anyhow!(
+                "the prune did not pass B's position: B at {b_position}, log {pruned:?}"
+            ),
+        ));
+    }
     eprintln!(
         "    {name}: B at {b_position}, log pruned to {}..={} ({} segments)",
         floor,
@@ -1864,7 +1959,7 @@ fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
 
     // B comes back and must converge (a rebuild from the head commit).
     match mode {
-        GapMode::Frozen => b.resume()?,
+        GapMode::Frozen | GapMode::FrozenWithOpenOrphan => b.resume()?,
         GapMode::Restarted => {
             // A leaves first: B is the taker at its very first round.
             a.unmount()?;
@@ -1887,7 +1982,38 @@ fn log_retention_gap(seed: u64, mode: GapMode) -> Result<()> {
 {}",
         b.tail_log_n(60)
     );
-    if matches!(mode, GapMode::Frozen) {
+    if let Some(mut handle) = orphan_handle.take() {
+        // The orphan came through the rebuild: the handle still reads the
+        // right bytes (the name is gone), the hold still claims the
+        // chunk against a GC round, and the close reclaims it.
+        use std::io::{Read, Seek};
+        let mut got = Vec::new();
+        handle.seek(std::io::SeekFrom::Start(0))?;
+        handle.read_to_end(&mut got)?;
+        anyhow::ensure!(got == orphan_bytes, "B's handle after the rebuild");
+        anyhow::ensure!(std::fs::metadata(b.mnt.join("orphan")).is_err());
+        a.gc_run_control().context("gc run with the orphan open")?;
+        anyhow::ensure!(
+            raw_exists(&env.direct_endpoint, &chunk_key(&prefix, &orphan_bytes)),
+            "GC deleted the chunk of an orphan held open across a rebuild"
+        );
+        got.clear();
+        handle.seek(std::io::SeekFrom::Start(0))?;
+        handle.read_to_end(&mut got)?;
+        anyhow::ensure!(got == orphan_bytes, "B's handle after GC");
+        drop(handle);
+        eventually("B withdraws its hold", Duration::from_secs(30), || {
+            let keys = raw_keys(&env.direct_endpoint, &holds_prefix)?;
+            anyhow::ensure!(keys.is_empty(), "holds: {keys:?}");
+            Ok(())
+        })?;
+        a.gc_run_control().context("gc run after the close")?;
+        anyhow::ensure!(
+            !raw_exists(&env.direct_endpoint, &chunk_key(&prefix, &orphan_bytes)),
+            "the closed orphan's chunk survived GC"
+        );
+    }
+    if matches!(mode, GapMode::Frozen | GapMode::FrozenWithOpenOrphan) {
         a.unmount()?;
     }
 

@@ -352,6 +352,11 @@ know client opens; Constellation avoids the problem with explicit claims.)
   or is partitioned from S3 — may find the chunks gone when it next reads
   uncached bytes: `EIO` on that handle, the edge noted below. This never
   dangles a committed reference: no committed state names an orphan.
+- **Held across a rebuild**: a namespace rebuild on the holding node (a
+  deposition recovery, a retention-gap rebuild, §14) carries the orphans
+  its views have open across the swap, records and manifests included,
+  and re-stamps the hold from the rebuilt replica; a node with several
+  views reaps on `unlink` only when no view has the inode open.
 - **Last close, cluster-wide**: when the final hold disappears (release or
   TTL expiry), the inode's chunks deref and ride the normal GC horizon.
 - **Writes to orphans** are allowed (POSIX): flushed as inode-keyed log

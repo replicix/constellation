@@ -18,6 +18,7 @@ use constellation_authority::segment::decode;
 use constellation_meta::{Meta, MetaStore};
 use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::LogStore;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Default for `CONSTELLATION_PUBLISH_IDLE_S`: publish whenever `ns` has
@@ -152,7 +153,8 @@ pub async fn rebuild_if_pruned(
                 "the log was pruned past this replica's position while it was \
                  offline; rebuilding the namespace from the head commit"
             );
-            crate::authority_driver::rebuild_replica(meta, log, state_dir)
+            // No view is mounted yet: no orphan can be open.
+            crate::authority_driver::rebuild_replica(meta, log, state_dir, &HashSet::new)
                 .await
                 .context("rebuilding the replica after a log retention gap")?;
             Ok(true)
@@ -484,6 +486,135 @@ mod tests {
                 .unwrap(),
             "a replica inside the retained log is left alone"
         );
+    }
+
+    /// A retention-gap rebuild on a node with an unlinked file open: the
+    /// orphan record (and its manifest) survive the namespace swap, so
+    /// the handle keeps reading, and the node's hold still claims the
+    /// chunk afterwards; an orphan nobody has open is dropped by the
+    /// rebuild like any other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebuild_keeps_the_orphans_a_view_has_open() {
+        use constellation_fs_core::manifest::{ChunkInfo, Manifest};
+        use constellation_fs_core::{ChunkHash, ChunkLayout};
+        use constellation_store_s3::{ChunkStore, CompressionSetting};
+        use object_store::ObjectStoreExt;
+        use std::sync::Mutex;
+
+        struct Opens(Mutex<Vec<constellation_fs_core::Ino>>);
+        impl crate::holds::OpenHandles for Opens {
+            fn open_inos(&self) -> Vec<constellation_fs_core::Ino> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        let store = StdArc::new(InMemory::new());
+        let backend = store.clone() as StdArc<dyn ObjectStore>;
+        let chunks = Arc::new(ChunkStore::new(backend.clone()));
+        let mut a = node(&store, 1);
+        let mut b = node(&store, 2);
+        let content = b"open on b across a rebuild";
+        let hash = ChunkHash::of(content);
+        chunks
+            .put_chunk(&hash, content, CompressionSetting::RAW)
+            .await
+            .unwrap();
+        let manifest = Manifest {
+            layout: ChunkLayout::new(4096),
+            file_len: content.len() as u64,
+            chunks: ChunkInfo::Inline([(0u64, hash)].into_iter().collect()),
+        }
+        .encode();
+        let open = a.meta.create(1, "open", 0o644, 0, 0).unwrap();
+        a.meta
+            .set_manifest(open.ino, &manifest, content.len() as u64)
+            .unwrap();
+        let closed = a.meta.create(1, "closed", 0o644, 0, 0).unwrap();
+        a.sync().await;
+        b.driver.tail_to_head().await.unwrap();
+        // A unlinks both (nothing open on A) and ships; B applies with
+        // `open` held open by a view.
+        a.meta.unlink(1, "open").unwrap();
+        a.meta.unlink(1, "closed").unwrap();
+        a.meta.reap_orphan(open.ino).unwrap();
+        a.meta.reap_orphan(closed.ino).unwrap();
+        a.sync().await;
+        b.driver.tail_to_head().await.unwrap();
+        assert_eq!(b.meta.orphans().unwrap().len(), 2);
+        let view = StdArc::new(Opens(Mutex::new(vec![open.ino])));
+        let sources = Arc::new(crate::holds::HoldSources::default());
+        sources.register(
+            1,
+            StdArc::downgrade(&view) as std::sync::Weak<dyn crate::holds::OpenHandles>,
+        );
+        let holds = crate::holds::Holds::new(
+            backend.clone(),
+            chunks.clone(),
+            b.meta.clone(),
+            2,
+            sources,
+            crate::holds::HoldConfig {
+                refresh: std::time::Duration::from_millis(10),
+                ttl: std::time::Duration::from_secs(60),
+            },
+        );
+        holds.refresh_once().await.unwrap();
+        b.driver.set_holds(holds.clone());
+        assert_eq!(
+            b.meta.orphans().unwrap(),
+            vec![open.ino],
+            "the closed one reaped"
+        );
+
+        // The log moves on and is pruned past B.
+        for i in 0..8 {
+            a.meta.mkdir(1, &format!("d{i}"), 0o755, 0, 0).unwrap();
+            a.sync().await;
+            a.driver.publish().await.unwrap();
+        }
+        let config = crate::gc::GcConfig {
+            horizon_ms: 0,
+            retention_segments: 2,
+            lease_ttl_ms: 1,
+            completion_retention_ms: 0,
+        };
+        for mark in crate::gc::metadata_candidates(
+            &backend,
+            None,
+            &config,
+            constellation_store_s3::lease::now_unix_ms(),
+        )
+        .await
+        .unwrap()
+        {
+            store
+                .delete(&object_store::path::Path::from(mark.key.as_str()))
+                .await
+                .unwrap();
+        }
+        b.driver.tail_to_head().await.unwrap();
+        assert_replicas_equal(&b.meta, &a.meta);
+
+        // The open orphan came through the rebuild; the hold still names
+        // its chunk; the last close reaps it and withdraws the hold.
+        assert_eq!(b.meta.orphans().unwrap(), vec![open.ino]);
+        assert_eq!(b.meta.manifest(open.ino).unwrap(), Some(manifest));
+        assert_eq!(b.meta.getattr(open.ino).unwrap().unwrap().nlink, 0);
+        holds.refresh_once().await.unwrap();
+        let roots = crate::gc::hold_roots(
+            backend.clone(),
+            constellation_store_s3::lease::now_unix_ms(),
+        )
+        .await
+        .unwrap();
+        assert!(roots.contains(&hash));
+        view.0.lock().unwrap().clear();
+        holds.refresh_once().await.unwrap();
+        assert!(b.meta.orphans().unwrap().is_empty());
+        assert!(backend
+            .head(&constellation_store_s3::layout::hold(2))
+            .await
+            .is_err());
     }
 
     /// A bootstrap base older than the log's retention floor must fail

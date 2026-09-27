@@ -25592,6 +25592,43 @@ taker` (restarted node is the taker at mount); both gap scenarios
 assert every segment stays above the pruned floor and a fresh node
 verifies the model.
 
+**Follow-up (branch `fix-orphan-views`): open orphans across views and
+rebuilds.** Two edges the fix above noted. (1) The FUSE `unlink` fast
+reap consulted only the unlinking view's own `opens`, so on a node with
+several views an inode another view had open was reaped under its
+handle. `ConstellationFs::reap_after_unlink` now asks the hold writer's
+view registry (`HoldSources::is_open`) as well, keeps the orphan when
+any view has it open, and nudges the hold writer so the claim is
+published at once. (2) `Meta::replace_ns_from_rebuilt` (a deposition
+recovery or a retention-gap rebuild) wiped the local `orphans`, so an
+open handle on an unlinked file lost its inode. It now takes the set of
+orphans some view has open (`Holds::open_orphans`, asked right before
+the swap by `authority_driver::rebuild_replica`) and carries their
+records — manifest included — across; a kept inode the rebuilt namespace
+still names (this node's own unshipped unlink, rolled back) is the
+namespace's, not an orphan. The hold writer is nudged after the swap so
+the claim is re-stamped from the rebuilt replica; the mount-time rebuild
+keeps nothing (no view is mounted yet). Tests: `fusefs`
+`unlink_does_not_reap_an_inode_another_view_has_open`; meta
+`rebuild_orphans` (kept, dropped, re-linked cases); `shipper`
+`a_rebuild_keeps_the_orphans_a_view_has_open` (a real retention-gap
+rebuild through the Standalone driver with a `Holds` writer: the orphan
+and its manifest survive, the hold still names the chunk, the close
+reaps and withdraws); harness `log-retention-gap-open-orphan` (B frozen
+with an unlinked file open through the prune; after the rebuild its
+handle reads the right bytes, a GC round keeps the chunk, the close
+withdraws the hold and the next round reclaims it).
+
+Harness gotcha found on the way (`Client::gc_run_control`): a scenario
+that holds a file open on a SIGSTOP'd mount must not spawn a process
+while it holds that fd — `fork` duplicates the FUSE fd and exec's
+close-on-exec sends the frozen daemon a `flush` the child waits on
+uninterruptibly, so the child never runs and cannot be reaped until the
+daemon is thawed; and dropping a paused `Client` hangs in its unmount
+the same way. The open-orphan scenario runs GC over A's control socket
+instead, and thaws B before any early return (`gc_run_bounded` bounds
+the forked variant used by the other modes).
+
 ## Fix: FUSE reverse-invalidation deadlock
 
 EC2 campaign 6 finding B-1's residue: `a432373` made `mount`/`status`

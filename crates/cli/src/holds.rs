@@ -80,6 +80,11 @@ impl HoldSources {
         self.views.lock().unwrap().retain(|(i, _)| *i != id);
     }
 
+    /// Whether any live view has `ino` open.
+    pub fn is_open(&self, ino: Ino) -> bool {
+        self.open_inos().contains(&ino)
+    }
+
     /// The union of every live view's open inodes.
     pub fn open_inos(&self) -> HashSet<Ino> {
         let views: Vec<Arc<dyn OpenHandles>> = self
@@ -179,6 +184,27 @@ impl Holds {
     /// after a release of an orphan).
     pub fn nudge(&self) {
         self.nudge.notify_one();
+    }
+
+    /// Every view's open-handle table.
+    pub fn sources(&self) -> &HoldSources {
+        &self.sources
+    }
+
+    /// The orphans some view has open right now, without reaping the
+    /// rest: what a namespace rebuild must carry across
+    /// (`authority_driver::rebuild_replica`). Orphans before opens, as
+    /// in [`Self::held_orphans`].
+    pub fn open_orphans(&self) -> Result<HashSet<Ino>> {
+        let orphans = self.meta.orphans().context("listing orphans")?;
+        if orphans.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let open = self.sources.open_inos();
+        Ok(orphans
+            .into_iter()
+            .filter(|ino| open.contains(ino))
+            .collect())
     }
 
     /// The periodic loop, until `stop`.

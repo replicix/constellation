@@ -629,7 +629,8 @@ fn with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition() {
 
     let side = Meta::open_in_memory().unwrap();
     side.mkdir(ROOT_INO, "from-the-log", 0o755, 0, 0).unwrap();
-    meta.replace_ns_from_rebuilt(&side).unwrap();
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
     assert!(meta.lookup(ROOT_INO, "uncaptured").unwrap().is_none());
     assert!(meta.lookup(ROOT_INO, "from-the-log").unwrap().is_some());
     assert_eq!(meta.journal_len().unwrap(), 0);

@@ -237,7 +237,8 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
     step!(meta, "replace_ns_from_rebuilt", {
         let side = Meta::open_in_memory().unwrap();
         side.mkdir(ROOT_INO, "reconciled", 0o755, 0, 0).unwrap();
-        meta.replace_ns_from_rebuilt(&side).unwrap();
+        meta.replace_ns_from_rebuilt(&side, &Default::default())
+            .unwrap();
     });
 }
 

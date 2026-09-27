@@ -1782,14 +1782,26 @@ impl Driver {
                     let meta = self.deps.meta.clone();
                     let log = self.deps.log.clone();
                     let state_dir = self.deps.state_dir.clone();
+                    let holds = self.deps.holds.clone();
                     tokio::spawn(async move {
-                        let ok = match rebuild_replica(&meta, &log, &state_dir).await {
+                        let keep = || {
+                            holds
+                                .as_ref()
+                                .and_then(|h| h.open_orphans().ok())
+                                .unwrap_or_default()
+                        };
+                        let ok = match rebuild_replica(&meta, &log, &state_dir, &keep).await {
                             Ok(()) => true,
                             Err(error) => {
                                 tracing::warn!(error = %format!("{error:#}"), "rebuilding the replica failed");
                                 false
                             }
                         };
+                        // The kept orphans' claim is re-stamped from the
+                        // rebuilt replica at once.
+                        if let Some(h) = &holds {
+                            h.nudge();
+                        }
                         let _ = tx.send(Internal::Event(Event::RebuildDone { op, ok }));
                     });
                 }
@@ -3774,10 +3786,17 @@ impl ChunkHandoff {
 /// (holder capture off), or a replica the log was pruned past (`Core::
 /// after_gap_check`). Node-local state — identity, the journal, pending
 /// uploads, `completed` — stays; the replicated namespace is replaced.
+/// `keep_orphans` is asked right before the swap for the orphans some
+/// view still has open (`Holds::open_orphans`): those records survive it
+/// (`Meta::replace_ns_from_rebuilt`), so an open handle on an unlinked
+/// file keeps reading through a rebuild.
 pub(crate) async fn rebuild_replica(
     meta: &Meta,
     log: &LogStore,
     state_dir: &std::path::Path,
+    keep_orphans: &(dyn Fn() -> std::collections::HashSet<constellation_fs_core::Ino>
+          + Send
+          + Sync),
 ) -> Result<()> {
     let view_path = state_dir.join(".replica-rebuild.db");
     let _ = std::fs::remove_dir_all(&view_path);
@@ -3785,7 +3804,7 @@ pub(crate) async fn rebuild_replica(
         .await
         .context("bootstrapping the shared log for a deposition rebuild")?;
     let side = Meta::open(&view_path)?;
-    meta.replace_ns_from_rebuilt(&side)?;
+    meta.replace_ns_from_rebuilt(&side, &keep_orphans())?;
     drop(side);
     let _ = std::fs::remove_dir_all(&view_path);
     Ok(())
@@ -3812,6 +3831,9 @@ pub struct Standalone {
     /// `Action::RebuildReplica`s to run (the retention-gap tests need a
     /// real one).
     pending_rebuild: std::collections::VecDeque<OpId>,
+    /// The open-orphan hold writer whose open set a rebuild preserves
+    /// (tests; `None` keeps nothing).
+    holds: Option<Arc<crate::holds::Holds>>,
     /// Timers due now, fired in order.
     due: std::collections::VecDeque<constellation_authority::TimerId>,
 }
@@ -3860,6 +3882,7 @@ impl Standalone {
             pending_s3: Default::default(),
             pending_publish: Default::default(),
             pending_rebuild: Default::default(),
+            holds: None,
             due: Default::default(),
         };
         this.absorb(out);
@@ -3888,6 +3911,11 @@ impl Standalone {
     /// Tail the log to head (no lease touched).
     pub async fn tail_to_head(&mut self) -> Result<()> {
         self.control(Control::TailToHead).await.map(|_| ())
+    }
+
+    /// The hold writer whose open orphans a rebuild keeps.
+    pub fn set_holds(&mut self, holds: Arc<crate::holds::Holds>) {
+        self.holds = Some(holds);
     }
 
     /// Ship everything, publish, release the lease and stop (a clean
@@ -3970,7 +3998,14 @@ impl Standalone {
                 op.0
             ));
             let _ = std::fs::create_dir_all(&dir);
-            let ok = match rebuild_replica(&self.meta, &self.log, &dir).await {
+            let holds = self.holds.clone();
+            let keep = || {
+                holds
+                    .as_ref()
+                    .and_then(|h| h.open_orphans().ok())
+                    .unwrap_or_default()
+            };
+            let ok = match rebuild_replica(&self.meta, &self.log, &dir, &keep).await {
                 Ok(()) => true,
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "standalone rebuild failed");

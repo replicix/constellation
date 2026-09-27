@@ -807,6 +807,10 @@ pub struct FsDependencies {
     /// The kernel invalidation thread's registry of FUSE requests in
     /// flight (`kernel_inval`); `InFlight::disabled()` without one.
     pub inflight: crate::kernel_inval::InFlight,
+    /// The node's open-orphan hold writer (`crate::holds`), whose view
+    /// registry says whether *any* view has an inode open: `unlink`'s
+    /// fast reap asks it before reaping. `None` in unit tests.
+    pub holds: Option<Arc<crate::holds::Holds>>,
 }
 
 const SYNTHETIC_INO_BIT: u64 = 1 << 63;
@@ -888,6 +892,7 @@ pub struct ConstellationFs {
     /// notification for an inode with a request in flight would block
     /// in the kernel until that request is answered (`kernel_inval`).
     inflight: crate::kernel_inval::InFlight,
+    holds: Option<Arc<crate::holds::Holds>>,
 }
 
 fn staging_errno(e: &crate::staging::StagingError) -> i32 {
@@ -1030,7 +1035,31 @@ impl ConstellationFs {
             atime: deps.atime,
             prune_stats: deps.prune_stats,
             inflight: deps.inflight,
+            holds: deps.holds,
         }
+    }
+
+    /// The name is gone (a local `unlink` just succeeded): reap the
+    /// orphan now if no handle anywhere on this node keeps it — this
+    /// view's own table *and* every other view's, through the hold
+    /// writer's registry (a second view of the same node used to be
+    /// invisible here, and its open handle lost the inode). Otherwise
+    /// the orphan stays for the handles, and the hold writer is nudged so
+    /// the claim reaches the bucket at once. Returns whether it reaped.
+    pub(crate) fn reap_after_unlink(&self, ino: Ino) -> bool {
+        let open_here = self.opens.lock().unwrap().get(&ino).copied().unwrap_or(0) > 0;
+        let open_elsewhere = self
+            .holds
+            .as_ref()
+            .is_some_and(|h| h.sources().is_open(ino));
+        if open_here || open_elsewhere {
+            if let Some(h) = &self.holds {
+                h.nudge();
+            }
+            return false;
+        }
+        let _ = self.meta.reap_orphan(ino);
+        true
     }
 
     /// Logical used space for the *mounted view*: `(bytes, file_count)`.
@@ -3713,12 +3742,57 @@ mod quota_tests {
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
                 inflight: crate::kernel_inval::InFlight::disabled(),
+                holds: None,
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,
         );
         std::mem::forget(rt);
         (fs, dir)
+    }
+
+    /// A second view of the same node has the inode open: `unlink`'s
+    /// fast reap must not reap it (before, only the unlinking view's own
+    /// table was consulted). With no handle anywhere it reaps.
+    #[test]
+    fn unlink_does_not_reap_an_inode_another_view_has_open() {
+        use crate::holds::{HoldConfig, HoldSources, Holds, OpenHandles};
+        use std::sync::Mutex;
+        struct OtherView(Mutex<Vec<Ino>>);
+        impl OpenHandles for OtherView {
+            fn open_inos(&self) -> Vec<Ino> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.set_node_prefix(1).unwrap();
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let (mut fs, _tmpdir) = test_fs(meta.clone());
+        let other = Arc::new(OtherView(Mutex::new(vec![f.ino])));
+        let sources = Arc::new(HoldSources::default());
+        sources.register(
+            2,
+            Arc::downgrade(&other) as std::sync::Weak<dyn OpenHandles>,
+        );
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        fs.holds = Some(Holds::new(
+            store.clone(),
+            Arc::new(ChunkStore::new(store)),
+            meta.clone(),
+            1,
+            sources,
+            HoldConfig {
+                refresh: std::time::Duration::from_secs(1),
+                ttl: std::time::Duration::from_secs(3),
+            },
+        ));
+        meta.unlink(ROOT_INO, "f").unwrap();
+        assert!(!fs.reap_after_unlink(f.ino), "open in another view: kept");
+        assert!(meta.getattr(f.ino).unwrap().is_some());
+        assert_eq!(meta.orphans().unwrap(), vec![f.ino]);
+        other.0.lock().unwrap().clear();
+        assert!(fs.reap_after_unlink(f.ino), "open nowhere: reaped");
+        assert!(meta.getattr(f.ino).unwrap().is_none());
     }
 
     #[test]
@@ -3991,6 +4065,7 @@ mod quota_tests {
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
                 inflight: crate::kernel_inval::InFlight::disabled(),
+                holds: None,
             },
             DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,
@@ -4061,6 +4136,7 @@ mod pending_row_tests {
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
                 inflight: crate::kernel_inval::InFlight::disabled(),
+                holds: None,
             },
             chunk,
             CompressionSetting::RAW,
@@ -4584,6 +4660,7 @@ mod durable_ack_tests {
                 )),
                 prune_stats: crate::prune::PruneStats::new(),
                 inflight: crate::kernel_inval::InFlight::disabled(),
+                holds: None,
             },
             constellation_fs_core::DEFAULT_CHUNK_SIZE,
             CompressionSetting::RAW,

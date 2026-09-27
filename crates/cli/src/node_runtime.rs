@@ -1484,6 +1484,7 @@ impl NodeRuntime {
                 snapshots: self.snapshots.clone(),
                 atime: self.atime.clone(),
                 prune_stats: self.prune_stats.clone(),
+                holds: Some(self.holds.clone()),
             },
             self.fsmeta.chunk_size,
             self.compression,

@@ -530,12 +530,9 @@ impl Filesystem for FuseFs {
         };
         match result {
             Ok(()) => {
-                // No open handles anywhere (single node): reap now.
+                // No open handle in any view of this node: reap now.
                 if let Ok(Some(attr)) = target {
-                    let opens = self.opens.lock().unwrap();
-                    if opens.get(&attr.ino).copied().unwrap_or(0) == 0 {
-                        let _ = self.meta.reap_orphan(attr.ino);
-                    }
+                    self.reap_after_unlink(attr.ino);
                 }
                 reply.ok()
             }

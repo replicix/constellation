@@ -311,9 +311,31 @@ impl Meta {
     /// `atime` from a snapshot of `side`, copy its local blobs, rebuild the
     /// derived `chunk_ref`/`xattr_by_name` indexes and the usage counters
     /// from the new `ns`, and adopt `side`'s `applied_seq`.
-    pub fn replace_ns_from_rebuilt(&self, side: &Meta) -> Result<(), MetaError> {
+    ///
+    /// `keep_orphans`: inodes some view of this node has open as orphans
+    /// (`cli::holds::Holds::open_orphans`). Their records — manifest
+    /// included, the node-local state a handle reads through — survive
+    /// the swap; every other orphan is `side`'s to decide (a rebuilt
+    /// replica reaps them all). A kept inode that `side`'s namespace
+    /// still names is not an orphan there (the unlink was this node's
+    /// own, unshipped, and the rebuild rolled it back): the namespace
+    /// record wins and the orphan copy is dropped.
+    pub fn replace_ns_from_rebuilt(
+        &self,
+        side: &Meta,
+        keep_orphans: &std::collections::HashSet<Ino>,
+    ) -> Result<(), MetaError> {
         let side_snap = side.db.read_tx();
         let mut tx = self.db.write_tx();
+        let mut kept: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for &ino in keep_orphans {
+            if side_snap.get(&side.ns, keys::inode(ino))?.is_some() {
+                continue;
+            }
+            if let Some(v) = tx.get(&self.orphans, ino.to_be_bytes())? {
+                kept.push((ino.to_be_bytes().to_vec(), v.to_vec()));
+            }
+        }
         // The namespace is replaced wholesale, so every key that was live
         // before or is live after has to be treated as changed for the
         // next publish's sake: dirty each existing key while clearing it,
@@ -349,6 +371,9 @@ impl Meta {
         for guard in side_snap.iter(&side.orphans) {
             let (k, v) = guard.into_inner()?;
             tx.insert(&self.orphans, k.to_vec(), v.to_vec());
+        }
+        for (k, v) in kept {
+            tx.insert(&self.orphans, k, v);
         }
         for guard in side_snap.iter(&side.atime) {
             let (k, v) = guard.into_inner()?;

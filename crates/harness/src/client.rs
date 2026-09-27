@@ -457,6 +457,31 @@ impl Client {
         Ok(self.gc_process()?.wait_with_output()?)
     }
 
+    /// Run one GC round inside this client's daemon over its control
+    /// socket (what `constellation gc run` does when a daemon holds the
+    /// state dir), without spawning a process. A scenario that holds a
+    /// file open on a *frozen* (SIGSTOP'd) mount must use this: forking
+    /// duplicates that FUSE fd and exec's close-on-exec sends the frozen
+    /// daemon a `flush` the child then waits on, uninterruptibly.
+    pub fn gc_run_control(&self) -> Result<serde_json::Value> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::time::Duration;
+        let sock = self.state.join("control.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
+            .with_context(|| format!("connecting to {}", sock.display()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+        stream.write_all(b"{\"cmd\":\"gc_run\",\"verify_only\":false}\n")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        let resp: serde_json::Value = serde_json::from_str(&line)?;
+        anyhow::ensure!(
+            resp["resp"] == "gc_report",
+            "gc run failed: {resp}; log:\n{}",
+            self.tail_log_n(60)
+        );
+        Ok(resp["report"].clone())
+    }
+
     pub fn fsck(&self, repair: bool) -> Result<std::process::Output> {
         let mut args = vec![
             "fsck",
