@@ -804,6 +804,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: ec2::idle_cost,
     },
     Scenario {
+        name: "idle-cost-link-flap",
+        desc: "idle-cost with the lease holder's P2P links flagged down for 5 s every 15 s (a late ping round under host load): the holder polls idle requesters' inboxes cold, never hot, and the per-node budget holds",
+        requires: &[],
+        run: ec2::idle_cost_link_flap,
+    },
+    Scenario {
         name: "backup-failover",
         desc: "plan 30 M9: 3 nodes, 20 s lease TTL; three rounds of: 30 files written on the holder, the holder killed, its backup peer seals and holds within seconds (never the TTL), every acknowledged file is on it, the dead node remounts and converges; prints the failover-time distribution and the backup-policy write latency",
         requires: &[],

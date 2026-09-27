@@ -685,61 +685,124 @@ pub fn p2p_partition_one_node(_seed: u64) -> Result<()> {
 /// `status.s3` counters (which must agree with the wire). Prints
 /// requests per node per idle minute; fails over `IDLE_BUDGET_PER_MIN`.
 pub fn idle_cost(_seed: u64) -> Result<()> {
-    const NAME: &str = "idle-cost";
+    idle_cost_run("idle-cost", false)
+}
+
+/// `idle-cost` with the lease holder's P2P links flapping: every
+/// `FLAP_EVERY` its peer directory flags every peer down for `FLAP_DOWN`
+/// (the fault deny file), as one late registry-tick ping round did under
+/// host load in the gate run on 7dfc05b — where the holder then polled
+/// each requester's inbox in its hot window from scratch (96 GETs in the
+/// two minutes, the budget blown). A requester with no recent demand is
+/// polled cold, and a link that comes back keeps its schedule, so the
+/// budget holds however often the links flap.
+pub fn idle_cost_link_flap(_seed: u64) -> Result<()> {
+    idle_cost_run("idle-cost-link-flap", true)
+}
+
+fn idle_cost_run(scenario: &'static str, flap: bool) -> Result<()> {
     const IDLE: Duration = Duration::from_secs(120);
     /// Requests per node per idle minute.
     const IDLE_BUDGET_PER_MIN: f64 = 60.0;
-    let (env, root) = setup(NAME)?;
+    const FLAP_EVERY: Duration = Duration::from_secs(15);
+    const FLAP_DOWN: Duration = Duration::from_secs(5);
+    /// The holder's inbox GETs while flapping: three idle requesters,
+    /// each polled once when first seen down and then at most once per
+    /// cold ceiling (10 s).
+    const FLAP_INBOX_GETS: usize = 3 * (1 + IDLE.as_secs() as usize / 10);
+    let (env, root) = setup(scenario)?;
     env.s3_proxy()?;
     let proxies: Vec<CountingProxy> = (0..4)
         .map(|_| env.counting_proxy())
         .collect::<Result<_>>()?;
-    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let backend = format!("s3://{BUCKET}/{scenario}-{}", ts());
     let mut clients = Vec::new();
     for (name, p) in ["a", "b", "c", "d"].into_iter().zip(&proxies) {
-        clients.push(
-            node(root.path(), name, p, &backend)?.without_env("CONSTELLATION_SYNC_INTERVAL_MS"),
-        );
+        let c = node(root.path(), name, p, &backend)?.without_env("CONSTELLATION_SYNC_INTERVAL_MS");
+        let deny = deny_path(&c).display().to_string();
+        clients.push(if flap {
+            c.with_env("CONSTELLATION_FAULT_P2P_DENY_FILE", &deny)
+        } else {
+            c
+        });
     }
     clients[0].fs_create()?;
     for c in clients.iter_mut() {
         c.mount()?;
     }
-    let result =
-        (|| -> Result<()> {
-            let refs: Vec<&Client> = clients.iter().collect();
-            wait_for_p2p(&refs)?;
-            std::fs::write(clients[0].mnt.join("marker"), b"idle")?;
-            for x in &clients[1..] {
-                eventually("marker everywhere", Duration::from_secs(60), || {
-                    anyhow::ensure!(std::fs::read(x.mnt.join("marker"))? == b"idle", "not yet");
-                    Ok(())
-                })?;
+    let result = (|| -> Result<()> {
+        let refs: Vec<&Client> = clients.iter().collect();
+        wait_for_p2p(&refs)?;
+        std::fs::write(clients[0].mnt.join("marker"), b"idle")?;
+        for x in &clients[1..] {
+            eventually("marker everywhere", Duration::from_secs(60), || {
+                anyhow::ensure!(std::fs::read(x.mnt.join("marker"))? == b"idle", "not yet");
+                Ok(())
+            })?;
+        }
+        // Past the write's own after-effects (the ship, the commit, the
+        // lease's idle release, the backups' reconfigurations).
+        std::thread::sleep(Duration::from_secs(45));
+        let before: Vec<serde_json::Value> = clients
+            .iter()
+            .map(|c| c.control_status().map(|s| s["s3"].clone()))
+            .collect::<Result<_>>()?;
+        // The holder, and everyone else's node id (what its deny file
+        // lists while its links are down).
+        let holder = clients
+            .iter()
+            .position(|c| c.control_status().is_ok_and(|s| s["lease"]["held"] == true))
+            .unwrap_or(0);
+        let others: Vec<String> = clients
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != holder)
+            .map(|(_, c)| node_id(c).map(|id| id.to_string()))
+            .collect::<Result<_>>()?;
+        for p in &proxies {
+            p.reset();
+        }
+        if flap {
+            let deny = deny_path(&clients[holder]);
+            let started = Instant::now();
+            let mut flaps = 0;
+            let mut down = false;
+            while started.elapsed() < IDLE {
+                let phase = started.elapsed().as_millis() % FLAP_EVERY.as_millis();
+                let want = phase >= (FLAP_EVERY - FLAP_DOWN).as_millis();
+                if want != down {
+                    if want {
+                        std::fs::write(&deny, others.join("\n") + "\n")?;
+                        flaps += 1;
+                    } else {
+                        std::fs::remove_file(&deny)?;
+                    }
+                    down = want;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            // Past the write's own after-effects (the ship, the commit, the
-            // lease's idle release, the backups' reconfigurations).
-            std::thread::sleep(Duration::from_secs(45));
-            let before: Vec<serde_json::Value> = clients
-                .iter()
-                .map(|c| c.control_status().map(|s| s["s3"].clone()))
-                .collect::<Result<_>>()?;
-            for p in &proxies {
-                p.reset();
-            }
+            let _ = std::fs::remove_file(&deny);
+            eprintln!(
+                "    {scenario}: {}'s links flagged down {flaps} times for {FLAP_DOWN:?} in \
+                     {IDLE:?}",
+                clients[holder].name
+            );
+        } else {
             std::thread::sleep(IDLE);
-            let minutes = IDLE.as_secs_f64() / 60.0;
-            let mut worst = 0.0f64;
-            for ((c, p), b) in clients.iter().zip(&proxies).zip(&before) {
-                p.ensure_sane()?;
-                let reqs = p.requests();
-                let t = crate::reqlog::tally(&reqs);
-                let s = c.control_status()?;
-                let after = &s["s3"];
-                let d = |k: &str| after[k].as_u64().unwrap_or(0) - b[k].as_u64().unwrap_or(0);
-                let per_min = t.total() as f64 / minutes;
-                worst = worst.max(per_min);
-                eprintln!(
-                "    {NAME}: {} ({}): {:.1} requests/min idle: {t}\n        by area: {}\n        \
+        }
+        let minutes = IDLE.as_secs_f64() / 60.0;
+        let mut worst = 0.0f64;
+        for ((c, p), b) in clients.iter().zip(&proxies).zip(&before) {
+            p.ensure_sane()?;
+            let reqs = p.requests();
+            let t = crate::reqlog::tally(&reqs);
+            let s = c.control_status()?;
+            let after = &s["s3"];
+            let d = |k: &str| after[k].as_u64().unwrap_or(0) - b[k].as_u64().unwrap_or(0);
+            let per_min = t.total() as f64 / minutes;
+            worst = worst.max(per_min);
+            eprintln!(
+                "    {scenario}: {} ({}): {:.1} requests/min idle: {t}\n        by area: {}\n        \
                  status.s3 delta: GET {} HEAD {} PUT {} LIST {} DELETE {}; ship rounds {} \
                  reconcile rounds {}",
                 c.name,
@@ -754,14 +817,27 @@ pub fn idle_cost(_seed: u64) -> Result<()> {
                 s["spool"]["ship_rounds_completed"],
                 s["coop"]["reconcile_rounds"],
             );
-            }
-            anyhow::ensure!(
+        }
+        anyhow::ensure!(
             worst <= IDLE_BUDGET_PER_MIN,
             "an idle node issued {worst:.1} S3 requests per minute (budget {IDLE_BUDGET_PER_MIN})"
         );
-            Ok(())
-        })();
+        if flap {
+            let inbox_gets = proxies[holder]
+                .requests()
+                .iter()
+                .filter(|r| !r.is_list() && r.area() == "inbox")
+                .count();
+            anyhow::ensure!(
+                inbox_gets <= FLAP_INBOX_GETS,
+                "the holder polled idle requesters' inboxes {inbox_gets} times while its \
+                     links flapped (at most {FLAP_INBOX_GETS}: one each, then the cold ceiling)"
+            );
+        }
+        Ok(())
+    })();
     for c in clients.iter_mut().rev() {
+        let _ = std::fs::remove_file(deny_path(c));
         let _ = c.unmount();
     }
     result

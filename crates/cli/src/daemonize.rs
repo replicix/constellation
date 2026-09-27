@@ -55,6 +55,8 @@ impl Verdict {
     /// non-zero) without leaving a PID file behind — this daemon is not
     /// going to keep running.
     pub fn failure(self, message: &str) -> Result<()> {
+        // One line: the parent reads the verdict up to its newline.
+        let message = message.replace('\n', " ");
         self.send(format!("ERR:{message}\n").as_bytes())
     }
 
@@ -96,6 +98,53 @@ fn redirect_stdio_to_log(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The status pipe, both ends close-on-exec. `fork` keeps them (the
+/// child needs its write end), but nothing the daemon later *executes*
+/// may inherit the write end: the parent waits for the verdict line, and
+/// before that line arrives only EOF — every write end closed — tells it
+/// the child died. A descendant holding a copy (the zombie reaper, which
+/// lives as long as the daemon) would turn a child that dies before
+/// reporting into a parent hung for the daemon's lifetime. (Before the
+/// parent stopped at the verdict line, it also hung every successful
+/// daemonized `mount` until the reaper exited: harness
+/// `named-shared-daemon` took 583 s.)
+fn status_pipe() -> std::io::Result<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `fds` is a valid 2-element buffer for `pipe2(2)`.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: `fds` is a valid 2-element buffer for `pipe(2)`; the
+        // process is single-threaded here (see `fork_if_needed`), so no
+        // exec can slip in between `pipe` and `fcntl`.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for fd in fds {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// The child's verdict: the first complete line on the status pipe, or
+/// whatever arrived before EOF when the child died without finishing
+/// one. It never waits past the line: the child keeps serving (and its
+/// write end open) after reporting.
+fn read_verdict(pipe: impl Read) -> String {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let _ = std::io::BufReader::new(pipe).read_line(&mut line);
+    line.trim_end_matches('\n').to_string()
+}
+
 /// Fork unless `foreground` (or `CONSTELLATION_NO_DAEMONIZE`) says not
 /// to. Never returns in the parent on the daemonizing path: it blocks
 /// reading the child's verdict, prints it, and exits the process with
@@ -107,12 +156,7 @@ pub fn fork_if_needed(foreground: bool, state_dir: &Path) -> Result<Outcome> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
 
-    let mut fds = [0i32; 2];
-    // SAFETY: `fds` is a valid 2-element buffer for `pipe(2)` to fill.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("creating status pipe");
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let (read_fd, write_fd) = status_pipe().context("creating status pipe")?;
 
     // SAFETY: `fork()` is safe to call here specifically because this
     // runs before the tokio runtime, the shipper, any lease keeper, the
@@ -132,11 +176,9 @@ pub fn fork_if_needed(foreground: bool, state_dir: &Path) -> Result<Outcome> {
         unsafe {
             libc::close(write_fd);
         }
-        let mut pipe_read = unsafe { std::fs::File::from_raw_fd(read_fd) };
-        let mut buf = Vec::new();
-        let _ = pipe_read.read_to_end(&mut buf);
-        let text = String::from_utf8_lossy(&buf);
-        let verdict = text.lines().next_back().unwrap_or("");
+        let pipe_read = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let text = read_verdict(pipe_read);
+        let verdict = text.as_str();
         if let Some(message) = verdict.strip_prefix("ERR:") {
             eprintln!("mount failed: {message}");
             std::process::exit(1);
@@ -172,4 +214,59 @@ pub fn fork_if_needed(foreground: bool, state_dir: &Path) -> Result<Outcome> {
         write_fd,
         state_dir: state_dir.to_path_buf(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+
+    #[test]
+    fn the_status_pipe_is_close_on_exec_at_both_ends() {
+        let (r, w) = status_pipe().unwrap();
+        for fd in [r, w] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "fd {fd} flags {flags:#x}"
+            );
+        }
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+    }
+
+    /// The verdict is read up to its line, not to EOF: the child (and
+    /// anything it spawned) keeps the write end open while it serves.
+    #[test]
+    fn the_verdict_is_read_without_waiting_for_eof() {
+        let (r, w) = status_pipe().unwrap();
+        let mut writer = unsafe { std::fs::File::from_raw_fd(w) };
+        writer.write_all(b"OK\n").unwrap();
+        let reader = unsafe { std::fs::File::from_raw_fd(r) };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_verdict(reader));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("read_verdict waited for EOF with the write end still open");
+        assert_eq!(got, "OK");
+        drop(writer);
+    }
+
+    #[test]
+    fn a_child_that_dies_before_reporting_reads_as_no_verdict() {
+        let (r, w) = status_pipe().unwrap();
+        unsafe { libc::close(w) };
+        let reader = unsafe { std::fs::File::from_raw_fd(r) };
+        assert_eq!(read_verdict(reader), "");
+        let (r, w) = status_pipe().unwrap();
+        let mut writer = unsafe { std::fs::File::from_raw_fd(w) };
+        writer.write_all(b"ERR:bad --s3\n").unwrap();
+        drop(writer);
+        let reader = unsafe { std::fs::File::from_raw_fd(r) };
+        assert_eq!(read_verdict(reader), "ERR:bad --s3");
+    }
 }

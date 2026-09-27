@@ -674,6 +674,28 @@ impl PollBackoff {
         self
     }
 
+    /// Start past the hot window, on the plain schedule: the state of a
+    /// requester that has not been heard from. The hot tier is for a
+    /// requester that is writing right now, which only a hit shows; one
+    /// that is merely newly polled (a new roster member, a P2P link that
+    /// just went down) starts at the base interval and backs off. Without
+    /// this a link flap cost `hot_grace` GETs in a fraction of a second
+    /// per requester (harness `idle-cost`: 96 inbox GETs on an idle
+    /// holder, three links flagged down by one late ping round).
+    pub fn past_hot(mut self) -> Self {
+        self.idle_rounds = self.hot_grace;
+        self
+    }
+
+    /// Start cold: the state of a requester with no sign of recent
+    /// demand (none of its writes seen within about the warm span), which
+    /// the warm tier — "has submitted recently" — does not describe
+    /// either. A hit makes it hot, then warm, as ever.
+    pub fn gone_cold(mut self) -> Self {
+        self.idle_rounds = self.hot_grace.saturating_add(COLD_AFTER_ROUNDS);
+        self
+    }
+
     /// Whether this requester has gone cold (see the type doc).
     pub fn is_cold(&self) -> bool {
         self.idle_rounds >= self.hot_grace.saturating_add(COLD_AFTER_ROUNDS)
@@ -811,7 +833,8 @@ impl InboxPoller {
         self.cursors.entry(node).or_insert(RequesterCursor {
             next_n: 0,
             backoff: PollBackoff::two_tier(self.base_ms, self.warm_max_ms, self.cold_max_ms)
-                .with_hot(self.hot_ms, self.hot_grace),
+                .with_hot(self.hot_ms, self.hot_grace)
+                .past_hot(),
         });
     }
 
@@ -1494,6 +1517,31 @@ mod tests {
         assert_eq!(b.delay_ms(), 10_000);
         // Never hotter than the base interval allows.
         assert_eq!(PollBackoff::new(50, 1_000).with_hot(500, 1).delay_ms(), 50);
+    }
+
+    /// A requester nobody has heard from starts on the plain schedule,
+    /// never in the hot window: only a hit opens it.
+    #[test]
+    fn a_new_requester_is_not_hot_until_it_hits() {
+        let mut b = PollBackoff::two_tier(500, 2_000, 10_000)
+            .with_hot(20, 25)
+            .past_hot();
+        assert!(!b.is_hot());
+        assert_eq!(b.delay_ms(), 500);
+        b.miss();
+        assert_eq!(b.delay_ms(), 1_000);
+        b.hit();
+        assert!(b.is_hot());
+        assert_eq!(b.delay_ms(), 20);
+        let mut b = PollBackoff::two_tier(500, 2_000, 10_000)
+            .with_hot(20, 25)
+            .gone_cold();
+        assert!(b.is_cold());
+        assert_eq!(b.delay_ms(), 10_000);
+        b.miss();
+        assert_eq!(b.delay_ms(), 10_000);
+        b.hit();
+        assert_eq!(b.delay_ms(), 20);
     }
 
     /// The two-tier schedule: warm ceiling for about a minute of misses,

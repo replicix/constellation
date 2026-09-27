@@ -1084,6 +1084,13 @@ relay of its own so requests can be attributed per role):
     default intervals; S3 requests per node per minute by kind and key
     area, on each node's relay and in `status.s3` (they agree). Budget
     60/min per node (measured ~40).
+  - `idle-cost-link-flap`: `idle-cost` with the lease holder's peer
+    directory flagging every link down (the P2P deny file) for 5 s every
+    15 s, as one late registry-tick ping round does under host load. The
+    same budget, and the holder's inbox GETs stay at most one per idle
+    requester plus one per cold ceiling (39): a flap never makes it poll
+    hot or from scratch (the gate on 7dfc05b saw 96 inbox GETs; the old
+    schedule costs ~2,500 here).
 - **Plan 30 M9 scenarios** (each prints the nodes' `status.ack` block:
   the lease's acknowledgement policy, backups and candidate, the durable
   journal seq, parked acknowledgements, whether the fast path is gated;

@@ -74,6 +74,21 @@ struct RequesterPoll {
     next_n: u64,
     due_at: Ms,
     in_flight: Option<OpId>,
+    /// The width of the poll in flight (or of the last one).
+    width: usize,
+    /// The last poll found batches: the next one fetches a full-width
+    /// run. Otherwise a poll is one GET of the next batch — nothing is
+    /// expected, and a full-width probe cost `inbox_poll_width` GET-404s
+    /// per idle poll (the log tail's EC2 finding R2-2 lesson, again).
+    full: bool,
+    /// Polled now: in the roster or the peer directory, and not
+    /// P2P-connected. A requester that stops being polled (its link came
+    /// back, it left the roster) keeps its entry for the rest of the
+    /// tenure — cursor, backoff and due time — so a link that flaps
+    /// resumes its schedule where it was instead of starting over: an
+    /// idle requester's polls never outrun its backoff, however often
+    /// the directory flags it down and up.
+    active: bool,
 }
 
 #[derive(Debug)]
@@ -150,7 +165,7 @@ impl InboxState {
             tracked_requesters: self
                 .holder
                 .as_ref()
-                .map(|h| h.requesters.len() as u64)
+                .map(|h| h.requesters.values().filter(|r| r.active).count() as u64)
                 .unwrap_or(0),
             escalated: cfg.escalation && self.escalated_since.is_some(),
         }
@@ -946,6 +961,27 @@ impl Core {
         ids
     }
 
+    /// Whether `node` has shown demand recently enough that a holder
+    /// starting to poll it should poll it warm: a mutation of its seen
+    /// here over P2P or through the inbox within the warm span (the warm
+    /// ceiling times `COLD_AFTER_ROUNDS`, when a silent requester would
+    /// have gone cold anyway), or it wants the lease. With P2P off the
+    /// inbox is every requester's only path and each is tracked once per
+    /// tenure, so all start warm as before.
+    fn inbox_recent_demand(&self, now: Ms, node: NodeId) -> bool {
+        if !self.cfg.p2p {
+            return true;
+        }
+        let span = self
+            .cfg
+            .inbox_warm_max_ms
+            .saturating_mul(constellation_store_s3::inbox::COLD_AFTER_ROUNDS as u64)
+            as i64;
+        let recent =
+            |m: &BTreeMap<NodeId, Ms>| m.get(&node).is_some_and(|at| now.since(*at) <= span);
+        recent(&self.demand_p2p) || recent(&self.demand_inbox) || self.lease.wanted.contains(&node)
+    }
+
     /// The holder's inbox work, from the end of every round and from the
     /// poll timer: GC what shipped, then GET-next every due requester.
     pub(crate) fn inbox_holder_tick(
@@ -984,23 +1020,47 @@ impl Core {
             self.cfg.inbox_hot_grace,
             self.cfg.inbox_poll_width.max(1),
         );
+        let fresh: Vec<(NodeId, bool)> = {
+            let known = self.inbox.holder.as_ref().expect("set above");
+            tracked
+                .iter()
+                .filter(|id| !known.requesters.contains_key(id))
+                .map(|id| (*id, self.inbox_recent_demand(now, *id)))
+                .collect()
+        };
         let holder = self.inbox.holder.as_mut().expect("set above");
-        holder.requesters.retain(|id, _| tracked.contains(id));
-        for id in &tracked {
-            holder.requesters.entry(*id).or_insert_with(|| {
-                tracing::debug!(
-                    node = self.cfg.node_id,
-                    requester = id,
-                    epoch,
-                    "inbox: tracking a requester"
-                );
+        for (id, rp) in holder.requesters.iter_mut() {
+            rp.active = tracked.contains(id);
+        }
+        for (id, demand) in fresh {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                requester = id,
+                epoch,
+                demand,
+                "inbox: tracking a requester"
+            );
+            // Polled at once, then never hot — only a hit (a requester
+            // writing right now) earns that — and warm only on a sign of
+            // recent demand; otherwise cold, what an idle requester
+            // costs. Nothing but demand ever moves it back up.
+            let backoff = PollBackoff::two_tier(base, warm, cold).with_hot(hot, grace);
+            holder.requesters.insert(
+                id,
                 RequesterPoll {
-                    backoff: PollBackoff::two_tier(base, warm, cold).with_hot(hot, grace),
+                    backoff: if demand {
+                        backoff.past_hot()
+                    } else {
+                        backoff.gone_cold()
+                    },
                     next_n: 0,
                     due_at: now,
                     in_flight: None,
-                }
-            });
+                    width: 1,
+                    full: false,
+                    active: true,
+                },
+            );
         }
 
         // GC: batches whose rows have shipped, all but each requester's
@@ -1037,16 +1097,21 @@ impl Core {
             next_due = Some(now.plus(base));
         }
         for (node, rp) in holder.requesters.iter_mut() {
-            if rp.in_flight.is_some() || waiting.contains(node) {
+            if !rp.active || rp.in_flight.is_some() || waiting.contains(node) {
                 continue;
             }
             if rp.due_at <= now {
-                polls.push((*node, rp.next_n));
+                rp.width = if rp.full || rp.backoff.is_hot() {
+                    width
+                } else {
+                    1
+                };
+                polls.push((*node, rp.next_n, rp.width));
             } else {
                 next_due = Some(next_due.map_or(rp.due_at, |d: Ms| d.min(rp.due_at)));
             }
         }
-        for (node, from) in polls {
+        for (node, from, width) in polls {
             let op = self.issue_s3(
                 S3Op::InboxRun {
                     epoch,
@@ -1111,8 +1176,11 @@ impl Core {
                 return;
             }
         };
-        let width = self.cfg.inbox_poll_width.max(1);
+        // Saturated against the width actually fetched: a one-GET probe
+        // that hits is followed at once by a full-width run.
+        let width = rp.width.max(1);
         if run.is_empty() {
+            rp.full = false;
             rp.backoff.miss();
             rp.due_at = now.plus(rp.backoff.delay_ms());
             let at = rp.due_at;
@@ -1120,6 +1188,7 @@ impl Core {
             return;
         }
         rp.backoff.hit();
+        rp.full = true;
         self.stats.inbox_poll_hits += 1;
         tracing::debug!(
             node = self.cfg.node_id,

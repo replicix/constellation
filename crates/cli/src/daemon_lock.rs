@@ -536,6 +536,10 @@ const REAPER_GRACE: Duration = Duration::from_secs(2);
 
 const REAPER_POLL: Duration = Duration::from_millis(500);
 
+/// Consecutive polls a live parent must look unlocked before the reaper
+/// leaves (see `reaper_main`).
+const REAPER_RELEASED_POLLS: u32 = 3;
+
 /// Start the zombie reaper for this daemon: `constellation zombie-reaper`
 /// as a separate process with no descriptor of ours (stdio to null, all
 /// else close-on-exec), so it survives our `kill -9` and shares no fate
@@ -584,13 +588,26 @@ pub fn spawn_reaper(state_dir: &Path) -> Result<u32> {
 pub fn reaper_main(parent: u32, state_dir: &Path) -> Result<()> {
     let lock = state_dir.join(LOCK_NAME);
     let mut wedged_since: Option<Instant> = None;
+    let mut released_polls = 0u32;
     loop {
         std::thread::sleep(REAPER_POLL);
         if lock_holder_pid(&lock) != Some(parent) {
             // Released (a clean exit, a crash whose file table closed, a
             // takeover), or `/proc/locks` unreadable: nothing to reap.
-            return Ok(());
+            // Leaving is for good, so a live parent must look released on
+            // several polls running: `/proc/locks` is a seq_file read a
+            // page per call, each call resuming at an index into a list
+            // other processes keep changing, so one read can skip our
+            // line on a busy host.
+            released_polls += 1;
+            if released_polls >= REAPER_RELEASED_POLLS
+                || !Path::new(&format!("/proc/{parent}")).exists()
+            {
+                return Ok(());
+            }
+            continue;
         }
+        released_polls = 0;
         let holder = classify_pid(parent);
         let Holder::Wedged { why, .. } = holder else {
             wedged_since = None;

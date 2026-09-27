@@ -604,7 +604,15 @@ out of order; the rid dedups either way.
    roster minus itself minus the peers it is P2P-connected to, so a
    single node and a healthy P2P cluster poll nothing; a node that
    appears in the roster is polled at the next round (the registry poll
-   nudges one). Batches execute in order through the same dedup a P2P
+   nudges one). A requester the holder starts polling is polled once at
+   once and is never hot until a poll hits; it starts warm only if it
+   wrote recently (a P2P forward or an inbox op within about a minute,
+   or it wants the lease), cold otherwise (with P2P off every requester
+   starts warm, once per tenure). A requester whose link comes back
+   keeps its cursor and schedule for the rest of the tenure, so a
+   flapping link never polls faster than one that stayed down. An idle
+   poll fetches one batch; only a poll after a hit fetches
+   `CONSTELLATION_INBOX_POLL_WIDTH`. Batches execute in order through the same dedup a P2P
    forward gets (`recent`, `completed`), and an op whose `deps` name a
    delegate stream the holder does not have yet waits for it (a marker
    is never appended ahead of the data a delegate acknowledged before

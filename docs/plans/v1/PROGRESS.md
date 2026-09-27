@@ -26434,3 +26434,156 @@ flush; it follows the owner's stream again).
   `continuation-epoch`, `epoch-member-lost`, `coop-fallback`, `chaos-ci`
   pass. (Before the rebase: 9 more runs of the scenario, seeds 42–47,
   43, 45, 49, and the same neighbours, all pass.)
+
+## Fix: idle inbox poll burst; named-shared-daemon duration
+
+The gate run on `7dfc05b` was green but for two findings: `idle-cost`
+failed 1 in 4 (the holder issued 96 `GET inbox` in the idle window,
+74.5 requests/min against a budget of 60), and `named-shared-daemon`
+took 583.7 s against its documented 1.4 s (plan 29 M3a's run). Both are
+product bugs, not host load.
+
+### 1. `idle-cost`: a P2P link flap made the holder poll hot, from scratch
+
+**Root cause.** The holder polls the inbox of every requester in the
+roster or the peer directory that it is not P2P-connected to. The peer
+directory flags a link down on any failed or timed-out RPC; the registry
+tick pings every peer every 5 s with a 500 ms bound, so on a loaded host
+one late ping round flags links down until the next exchange. Each time
+a requester went from connected to not connected, the holder tracked it
+afresh: the new `PollBackoff` started at `idle_rounds = 0`, which is the
+**hot** window (`CONSTELLATION_INBOX_HOT_MS` 20 ms for 25 polls), from
+cursor 0. Each poll also fetched the full `CONSTELLATION_INBOX_POLL_WIDTH`
+(4 GETs). Reconnecting dropped the state, so the next flap started over.
+The gate's 96 GETs fit one requester flagged down for about one peer
+tick: 24 hot polls × 4 GETs. The requester side never used the inbox
+during such a flap anyway: `reaches` only treats the path as gone after a
+real forward failure plus `CONSTELLATION_INBOX_P2P_GRACE_MS`.
+
+**Fix** (`crates/authority/src/core/inbox.rs`,
+`crates/store-s3/src/inbox.rs`). The backoff no longer resets without a
+reason tied to demand:
+- A requester the holder starts polling is polled once, at once, and is
+  never hot. Only a hit opens the hot window. It starts warm (plain
+  doubling from the sync interval, `PollBackoff::past_hot`) only on a
+  sign of recent demand: a P2P forward or inbox op from it within the
+  warm span (warm ceiling × `COLD_AFTER_ROUNDS`, about a minute), or it
+  wants the lease. Otherwise it starts cold (`PollBackoff::gone_cold`):
+  one poll per 10 s. With P2P off every requester starts warm, as
+  before; it is tracked once per tenure.
+- A requester that stops being polled (its link came back, or it left
+  the roster) keeps its entry for the rest of the tenure: cursor,
+  backoff, due time. A flapping link resumes its schedule, so it never
+  polls faster than a requester that stayed down all along. Keeping the
+  cursor also ends a latent gap: a requester re-tracked from cursor 0
+  after GC had deleted its consumed batches (all but the newest) probed
+  a deleted key forever, and its new batches waited for the in-doubt
+  deadline.
+- An idle poll is one GET of the next batch. Only the poll after a hit
+  (and every poll in the hot window) fetches the full width. Saturation
+  is judged against the width actually fetched, so a one-GET hit is
+  followed at once by a full-width run. This is the log tail's EC2
+  finding R2-2 rule, applied to the inbox.
+
+The bound: an idle requester costs the holder one GET when first seen
+down in a tenure, then at most one per cold ceiling (6/min). A requester
+with recent demand costs at most what the warm schedule costs if it stays
+down: about 35 GETs over its first minute, then 6/min.
+
+**Tests.**
+- `core::tests::a_flapping_p2p_link_never_polls_an_idle_requester_faster_than_its_backoff`:
+  two minutes, every link down 5 s in 10.
+  - Idle requesters: each poll is 1 GET, gaps are at least the cold
+    ceiling, 39 polls in all.
+  - A requester with recent demand starts warm, is never polled faster
+    than the base interval, and is polled no more than a requester that
+    stayed down.
+  - The pre-fix core fails it at once: gaps of 20 ms, 25 hot polls per
+    flap.
+- `core::tests::an_inbox_poll_is_one_get_until_it_hits`: one GET, a hit,
+  then an immediate full-width poll, and full width while hot.
+- `store-s3` `a_new_requester_is_not_hot_until_it_hits`.
+- New scenario `idle-cost-link-flap`: `idle-cost` with the holder's peer
+  directory flagging every link down (the P2P deny file) 5 s in every
+  15 s. It asserts the budget and at most 39 holder inbox GETs. The
+  pre-fix core (same harness, `CONSTELLATION_BIN`) blows it: holder at
+  1263.5 requests/min, 2468 `GET inbox`. With the fix: 41.5/min, 24
+  `GET inbox`.
+- Documentation: `forwarded-mutations.md` (the poll schedule),
+  `configuration.md` (`CONSTELLATION_INBOX_POLL_WIDTH` applies after a
+  hit), `TESTING.md`.
+
+Seen in passing, not changed: the holder's deny-file flap also makes its
+backups seal its epoch ("a backup sealed our epoch", 3 extra lease PUTs),
+which is the intended behaviour for a real holder–backup partition. A
+requester that withdraws a batch before a P2P forward (`InboxWithdraw`)
+leaves a hole in its numbering. If the holder had not consumed that
+batch, GET-next stops at the hole, and the requester's later batches in
+the epoch are only resolved through the in-doubt deadline and the lease
+path. Worth a look.
+
+### 2. `named-shared-daemon`: the daemonized `mount` waited for the reaper
+
+**Root cause.** A regression from `b2c3436` (the zombie reaper). The
+daemonizing `mount` forks and the parent waits on a status pipe for the
+child's verdict. The pipe was created with `pipe(2)`, not
+close-on-exec, and the parent read it **to EOF**. The daemon then spawns
+`constellation zombie-reaper`, which inherited the pipe's write end and
+lives as long as the daemon. So the first `mount myfs` returned only
+when the reaper exited, not when the daemon sent `OK`. Startup itself
+took 44 ms (the startup phase log: "startup complete: daemon serving
+… total_ms=44"). On this host the main binary's run hung past its
+1500 s timeout, with the parent in `anon_pipe_read` and the reaper
+holding the pipe as fd 4.
+
+The gate's run ended after 583 s, most likely because the reaper exited
+early. It leaves when `/proc/locks` does not show the daemon's flock.
+`/proc/locks` is a seq_file read a page per `read(2)`, and each call
+resumes at an index into a list other processes keep changing, so a
+read can skip a line. Measured here: a held flock's line was missing
+from 60 of 46 216 reads under lock churn. The reaper would then exit for
+good and leave its daemon unguarded.
+
+**Fix** (`crates/cli/src/daemonize.rs`, `crates/cli/src/daemon_lock.rs`):
+- The status pipe is created close-on-exec: `pipe2(O_CLOEXEC)`, or
+  `fcntl` off Linux. `fork` keeps both ends; nothing the daemon executes
+  inherits them.
+- The parent reads the verdict **line**, not to EOF. A failure message
+  is flattened to one line.
+- The reaper leaves only after 3 consecutive polls (1.5 s) show the lock
+  released, or at once if the parent is gone.
+
+**Tests.** `daemonize::tests::{the_status_pipe_is_close_on_exec_at_both_ends,
+the_verdict_is_read_without_waiting_for_eof,
+a_child_that_dies_before_reporting_reads_as_no_verdict}`.
+`named-shared-daemon` now takes 1.3–2.6 s. `fuse-inval-storm` still
+passes: the reaper released the one wedged round in 2.17 s.
+
+### Files
+
+`crates/authority/src/core/{inbox,tests}.rs`, `crates/store-s3/src/inbox.rs`,
+`crates/cli/src/{daemonize,daemon_lock}.rs`,
+`crates/harness/src/scenarios.rs`, `crates/harness/src/scenarios/ec2.rs`,
+docs: `forwarded-mutations.md`, `configuration.md`, `TESTING.md`.
+
+### Results (prefix `constellation-harness-idleinbox`, host load 2–64 of 32)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) clean.
+- `constellation-authority`: lib 131 tests, sim suite 104 tests; store-s3
+  inbox 19 tests; the `constellation` package's tests. All pass.
+- `idle-cost` 11/11: holder 27.0 requests/min, followers 29.5, zero
+  `GET inbox` in every run.
+- `idle-cost-link-flap` 4/4: holder 41.5/min, 24 `GET inbox`.
+- `named-shared-daemon` 7/7: 1.3–2.6 s.
+- One more run each of `named-shared-daemon`, `idle-cost`,
+  `idle-cost-link-flap` and `inbox-sporadic-write-p2p-off` after the
+  rebase onto `059c3f7`: same numbers.
+- Inbox and P2P-loss scenarios pass:
+  - `inbox-create-storm-p2p-off`: 3315 ops/s.
+  - `inbox-sporadic-write-p2p-off`: p50 589 ms, p99 1.09 s.
+  - `inbox-requester-crash-mid-batch`, `inbox-holder-takeover-pending-batch`.
+  - `p2p-partition-one-node`, `concurrent-create-no-excl`.
+  - `sticky-lease-handoff-over-s3`, `create-storm-s3-only`,
+    `idle-cluster-is-quiet`, `lease-handover`, `publish-only-holder`.
+  - `p2p-partition-tolerance`, `delegate-partition`.
+- `fuse-inval-storm`, `forward-timeout-reexec` pass.

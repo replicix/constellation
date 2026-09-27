@@ -7599,3 +7599,198 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
     );
     assert_eq!(h.core.stats.inbox_rerouted_to_p2p, 1);
 }
+
+/// Gate run on 7dfc05b, harness `idle-cost`: an idle holder issued 96
+/// inbox GETs in two minutes (budget 60 requests per minute in all).
+/// Under host load one registry-tick ping round timed out, the peer
+/// directory flagged every link down until the next probe, and the
+/// holder tracked each requester afresh: in the hot window (25 GETs at
+/// 20 ms) and from cursor zero, and again at the next flap. Now a new
+/// requester is never hot (only a hit makes it so) and is warm only on
+/// recent demand, cold otherwise; one whose link comes back keeps its
+/// cursor, backoff and due time for the rest of the tenure, so a flapping
+/// link never polls faster than a requester that stayed down all along.
+#[test]
+fn a_flapping_p2p_link_never_polls_an_idle_requester_faster_than_its_backoff() {
+    fn links(h: &mut Harness, up: bool) {
+        h.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: up,
+                    last_seen: None,
+                    rtt_ms: None,
+                    since: None,
+                })
+                .collect(),
+        });
+    }
+    /// Two minutes, every link down for 5 s out of every 10 s (a ping
+    /// round that times out, then the next probe that succeeds); every
+    /// poll answered empty. The poll times per requester.
+    fn flap(h: &mut Harness) -> BTreeMap<NodeId, Vec<Ms>> {
+        let mut polls: BTreeMap<NodeId, Vec<Ms>> = BTreeMap::new();
+        let mut t = 0;
+        while t <= RUN_MS {
+            if t % 1_000 == 0 {
+                // The lease stays held (renewals are not the subject).
+                if t % 5_000 == 0 {
+                    h.hold(1, None);
+                }
+                links(h, (t / 5_000) % 2 == 1);
+            }
+            let mut out = Vec::new();
+            h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+            while let Some((op, node)) = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+                S3Op::InboxRun {
+                    node, from, width, ..
+                } => {
+                    assert_eq!(*from, 0, "an idle requester's cursor never moves");
+                    assert_eq!(*width, 1, "an idle poll is one GET");
+                    Some((op, *node))
+                }
+                _ => None,
+            }) {
+                polls.entry(node).or_default().push(h.now);
+                out.retain(|a| !matches!(a, Action::S3 { op: o, .. } if *o == op));
+                let more = h.step(Event::S3 {
+                    op,
+                    result: S3Result::InboxRun(Ok(Vec::new())),
+                });
+                out.extend(more);
+            }
+            h.advance(STEP_MS);
+            t += STEP_MS;
+        }
+        polls
+    }
+    const STEP_MS: u64 = 20;
+    const RUN_MS: u64 = 120_000;
+
+    // Nobody has written: every requester is polled once when first
+    // seen down, then at the cold ceiling at most.
+    let mut h = Harness::new(1);
+    assert!(h.core.cfg.inbox && h.core.cfg.p2p);
+    let (base, cold) = (h.core.cfg.sync_interval_ms, h.core.cfg.inbox_cold_max_ms);
+    assert!(h.core.cfg.inbox_hot_ms < base);
+    h.hold(1, None);
+    let polls = flap(&mut h);
+    assert_eq!(
+        polls.len(),
+        3,
+        "every requester is polled while down: {polls:?}"
+    );
+    for (node, at) in &polls {
+        let gaps: Vec<i64> = at.windows(2).map(|w| w[1].since(w[0])).collect();
+        assert!(
+            gaps.iter().all(|g| *g >= cold as i64),
+            "idle requester {node} polled faster than the cold ceiling: {gaps:?}"
+        );
+        assert!(at.len() as u64 <= 1 + RUN_MS / cold, "{node}: {at:?}");
+    }
+    let total: usize = polls.values().map(Vec::len).sum();
+    eprintln!("idle: {total} inbox polls in {RUN_MS} ms of flapping");
+    // 3 requesters × (1 + 120 s / 10 s) at the very most, i.e. well under
+    // `idle-cost`'s budget even with every link down all the time.
+    assert!(total <= 39, "{total}");
+
+    // Requester 2 wrote over P2P just before: it starts warm (never hot),
+    // and still never polls faster than one that stayed down all along.
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.core.note_demand(h.now, 2, true);
+    let polls = flap(&mut h);
+    let continuous = {
+        let mut b = constellation_store_s3::inbox::PollBackoff::two_tier(
+            base,
+            h.core.cfg.inbox_warm_max_ms,
+            cold,
+        );
+        let (mut at, mut n) = (0u64, 0u64);
+        while at <= RUN_MS {
+            n += 1;
+            at += b.delay_ms();
+            b.miss();
+        }
+        n
+    };
+    let at = &polls[&2];
+    let gaps: Vec<i64> = at.windows(2).map(|w| w[1].since(w[0])).collect();
+    assert!(
+        gaps.first().is_some_and(|g| *g < cold as i64),
+        "a requester with recent demand starts warm: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().all(|g| *g >= base as i64),
+        "polled faster than the base interval (hot without a hit): {gaps:?}"
+    );
+    assert!(
+        at.len() as u64 <= continuous,
+        "{} polls in {RUN_MS} ms of flapping, more than the {continuous} of a requester down \
+         the whole time",
+        at.len()
+    );
+    assert!(
+        polls[&3].len() as u64 <= 1 + RUN_MS / cold,
+        "3 has no demand"
+    );
+}
+
+/// An idle poll is one GET (the next batch); a hit is followed at once by
+/// a full-width run, and the width stays full while the requester is hot.
+#[test]
+fn an_inbox_poll_is_one_get_until_it_hits() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    // Node 2 wrote over P2P a moment ago, and its link is down now.
+    h.core.note_demand(h.now, 2, true);
+    h.step(Event::Peers {
+        links: vec![crate::event::PeerLink {
+            node: 2,
+            connected: false,
+            last_seen: None,
+            rtt_ms: None,
+            since: None,
+        }],
+    });
+    let full = h.core.cfg.inbox_poll_width;
+    assert!(full > 1);
+    let poll = |out: &[Action]| {
+        s3_ops(out).into_iter().find_map(|(op, r)| match r {
+            S3Op::InboxRun {
+                node: 2,
+                from,
+                width,
+                ..
+            } => Some((op, *from, *width)),
+            _ => None,
+        })
+    };
+    let mut out = Vec::new();
+    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    let (op, from, width) = poll(&out).expect("polled at once");
+    assert_eq!((from, width), (0, 1));
+    let a = h.create("a");
+    let out = h.step(Event::S3 {
+        op,
+        result: S3Result::InboxRun(Ok(vec![inbox_batch(2, 0, 1, &a)])),
+    });
+    assert!(h.meta.child_ino(ROOT_INO, "a").unwrap().is_some());
+    // Saturated at width 1: polled again at once, at full width.
+    let mut out = out;
+    if poll(&out).is_none() {
+        h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    }
+    let (op, from, width) = poll(&out).expect("a one-GET hit is followed at once");
+    assert_eq!((from, width), (1, full));
+    h.step(Event::S3 {
+        op,
+        result: S3Result::InboxRun(Ok(Vec::new())),
+    });
+    // Hot: the next poll is soon and still full width.
+    h.advance(h.core.cfg.inbox_hot_ms);
+    let mut out = Vec::new();
+    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    let (_, from, width) = poll(&out).expect("hot after a hit");
+    assert_eq!((from, width), (1, full));
+}
