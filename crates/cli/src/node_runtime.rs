@@ -315,6 +315,7 @@ impl NodeRuntime {
             );
         }
 
+        crate::startup::phase("opening the backend and meta.json");
         let (backend, backend_info) = rt
             .block_on(crate::backend::open_backend_described(&s3))
             .context("opening backend")?;
@@ -355,9 +356,11 @@ impl NodeRuntime {
         // Fresh node: rebuild the replica from the commit chain plus log
         // replay (or, with no commit yet, a genesis replay of the whole log).
         if !db_path.exists() {
+            crate::startup::phase("bootstrapping the metadata replica from S3");
             rt.block_on(shipper::bootstrap(&db_path, &log))
                 .context("bootstrapping metadata replica")?;
         }
+        crate::startup::phase("opening meta.db");
         let meta = Arc::new(Meta::open(&db_path)?);
         meta.scratch_purge_all()?;
         spawn_vacuum(&meta);
@@ -370,6 +373,7 @@ impl NodeRuntime {
         }
         // Node identity: claim a cluster-unique id on first mount of this
         // state dir; it scopes ino allocation and marks log segment origin.
+        crate::startup::phase("resolving the node identity in the registry");
         let first_mount = meta.kv_get("node_id")?.is_none();
         let node_id: u64 = match meta.kv_get("node_id")? {
             Some(v) => v.parse().context("corrupt node_id in state dir")?,
@@ -511,6 +515,7 @@ impl NodeRuntime {
         // If-Match; a backend without it can only be driven safely by one
         // node at a time, so say so loudly and fall back to create-only
         // lease semantics instead of refusing to mount at all.
+        crate::startup::phase("probing the backend's conditional writes");
         let caps = rt
             .block_on(store.probe_conditional_writes())
             .context("probing backend conditional writes")?;
@@ -588,12 +593,14 @@ impl NodeRuntime {
         // reaching other nodes through S3 polling. Built before `fs` because
         // the offline-designation gate (phase 4a) needs it for delegation
         // requests.
+        crate::startup::phase("starting P2P (endpoint bind, registry peers)");
         let peers = rt.block_on(crate::start_p2p(
             &fsmeta,
             e2e_keys.as_ref(),
             store.inner().clone(),
             node_id,
         ));
+        crate::startup::phase("configuring the node (roster, designations, lease)");
         let _gc_task = {
             let interval = std::env::var("CONSTELLATION_GC_INTERVAL_S")
                 .ok()
@@ -907,9 +914,11 @@ impl NodeRuntime {
         }
         let _ = sync_tx.send(fusefs::SyncRequest::Roster(initial_roster));
         if !read_only_member {
+            crate::startup::phase("adopting the root directory owner");
             rt.block_on(crate::adopt_root(&meta, &sync_tx, &forward, node_id))
                 .context("adopting the root directory owner")?;
         }
+        crate::startup::phase("starting the node's background tasks");
         let bridge = Arc::new(crate::P2pBridge {
             node_id,
             nudge: sync_tx.clone(),

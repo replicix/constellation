@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn ack_of(c: &Client) -> Result<serde_json::Value> {
+pub(super) fn ack_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["ack"].clone())
 }
 
@@ -162,7 +162,7 @@ pub(super) fn c_deny_path(root: &std::path::Path, name: &str) -> std::path::Path
     root.join(name).join("deny")
 }
 
-fn unmount_all(clients: &mut [Client]) {
+pub(super) fn unmount_all(clients: &mut [Client]) {
     for c in clients.iter_mut().rev() {
         let _ = c.unmount();
     }
@@ -220,7 +220,7 @@ pub(super) fn wait_holds(c: &Client, after: u64, deadline: Duration) -> Result<D
 }
 
 /// Every `names` file reads as its own name on `c`.
-fn all_visible(c: &Client, names: &[String], deadline: Duration) -> Result<()> {
+pub(super) fn all_visible(c: &Client, names: &[String], deadline: Duration) -> Result<()> {
     eventually(&format!("{} sees every file", c.name), deadline, || {
         for name in names {
             let got = std::fs::read(c.mnt.join(name))
@@ -238,7 +238,11 @@ fn all_visible(c: &Client, names: &[String], deadline: Duration) -> Result<()> {
 
 /// `count` files `<tag>-<i>` (content = name) written on `c`; the
 /// open+write+close latencies.
-fn write_files(c: &Client, tag: &str, count: usize) -> Result<(Vec<String>, Vec<Duration>)> {
+pub(super) fn write_files(
+    c: &Client,
+    tag: &str,
+    count: usize,
+) -> Result<(Vec<String>, Vec<Duration>)> {
     let mut names = Vec::new();
     let mut lat = Vec::new();
     for i in 0..count {

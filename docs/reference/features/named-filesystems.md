@@ -95,6 +95,33 @@ endpoint. `mount myfs /mnt` followed by `mount myfs:/sub /mnt2` from a
 already held, and sends `MountAdd` over the control socket instead of
 starting a new process.
 
+A held `daemon.lock` is not by itself proof of a daemon that will answer:
+the lock and the control socket belong to the holder's file table, which
+outlives `kill -9` for as long as any thread of that process is still in
+the kernel (EC2 campaign 6, finding B-1: a killed lease holder lingered
+as a zombie with one thread stuck, its listener accepting connections
+nobody served). So the second invocation first pings the holder
+(`CONSTELLATION_CONTROL_TIMEOUT_MS`, default 10 s) and attaches only to
+a daemon that answers; a holder that does not answer is classified from
+`/proc`:
+
+- alive (running, sleeping, stopped, or a zombie leader whose other
+  threads can still run): never taken over — the mount keeps trying
+  until `CONSTELLATION_ATTACH_TIMEOUT_MS` (default 120 s; a daemon still
+  bootstrapping has no socket yet) and then fails, naming the pid and
+  its state;
+- killed by the kernel (thread-group leader a zombie and SIGKILL
+  pending, or every remaining thread past `exit_mm`): taken over — its
+  lock file is moved to `daemon.lock.wedged-<pid>` (the zombie keeps its
+  lock on that inode), the stale `control.sock` and `daemon.pid` are
+  removed, and the mount becomes the daemon on a fresh lock.
+
+`constellation status` is bounded by the same control timeout. The
+daemon logs each startup phase with its duration, and a
+`startup-watchdog` thread warns every `CONSTELLATION_STARTUP_WARN_S`
+(30) that a phase is still running, so a stuck startup names its phase
+in `daemon.log`.
+
 ## Daemonization
 
 `mount` backgrounds itself by default (fork + `setsid`, matching

@@ -111,6 +111,19 @@ impl Client {
         self
     }
 
+    /// [`Self::with_env`] on a client already in place (takes effect on
+    /// the next spawned command; a later value for the same key wins).
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        self.env.push((key.to_string(), value.to_string()));
+    }
+
+    /// Undo [`Self::set_env`]: the next spawned command does not see
+    /// `key` at all.
+    pub fn unset_env(&mut self, key: &str) {
+        self.env.retain(|(k, _)| k != key);
+        self.env.push((key.to_string(), UNSET.to_string()));
+    }
+
     /// Remove a variable the harness sets for every client by default
     /// (e.g. its short S3 retry budget), so the mount runs with the
     /// product default instead.
@@ -270,7 +283,39 @@ impl Client {
         self.mount_view(None, &[])
     }
 
+    /// [`Self::mount`] that must have its mountpoint up within `within`
+    /// (instead of `CONSTELLATION_HARNESS_MOUNT_TIMEOUT_S`). A mount that
+    /// exits first fails with `mount died at startup` and the log tail
+    /// (and the client is unmounted again); one still running at the
+    /// deadline is killed and fails with `did not appear within`.
+    pub fn mount_within(&mut self, within: Duration) -> Result<()> {
+        self.mount_view_within(None, &[], within)
+    }
+
+    /// The daemon's pid, if mounted.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
+    /// `constellation status / --state-dir <state>` as a child process:
+    /// the CLI path (not the socket shortcut of [`Self::control_status`]),
+    /// for scenarios that test the CLI's own bounds.
+    pub fn status_cli(&self) -> Result<std::process::Output> {
+        Ok(self
+            .cmd(&["status", "/", "--state-dir", self.state.to_str().unwrap()])
+            .output()?)
+    }
+
     pub fn mount_view(&mut self, inner: Option<&str>, extra: &[&str]) -> Result<()> {
+        self.mount_view_within(inner, extra, client_timeout())
+    }
+
+    fn mount_view_within(
+        &mut self,
+        inner: Option<&str>,
+        extra: &[&str],
+        within: Duration,
+    ) -> Result<()> {
         if self.child.is_some() {
             bail!("{} already mounted", self.name);
         }
@@ -315,12 +360,13 @@ impl Client {
             .spawn()
             .context("spawning mount")?;
         self.child = Some(child);
-        let deadline = Instant::now() + client_timeout();
+        let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             if is_mountpoint(&self.mnt) {
                 return Ok(());
             }
             if let Some(st) = self.child.as_mut().unwrap().try_wait()? {
+                self.child = None;
                 bail!(
                     "{} mount died at startup ({st}): {}",
                     self.name,
@@ -329,10 +375,13 @@ impl Client {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        if let Some(mut child) = self.child.take() {
+            child.kill().ok();
+            let _ = child.wait();
+        }
         bail!(
-            "{} mount did not appear within {:?}: {}",
+            "{} mount did not appear within {within:?}: {}",
             self.name,
-            client_timeout(),
             self.tail_log()
         )
     }

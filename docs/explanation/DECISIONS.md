@@ -940,3 +940,41 @@ appears only on workloads that ADR-23 does not already cover.
 
 **See**: plan 30 §5; plan 28
 [§P3](../plans/v1/done/28-s3-native-metadata-store.md#p3--concurrency-optimistic-commit-with-structural-rebase-leases-demoted).
+
+## ADR-29: A state dir is taken over only from a process the kernel has already killed
+
+**Context**: `mount` takes `daemon.lock` (`flock`) to decide between
+becoming the daemon and attaching to the one that holds it. EC2
+campaign 6 (finding B-1) showed that a held lock is not proof of a
+daemon that will answer: a `kill -9`ed lease holder lingered as a zombie
+whose last thread was stuck in the kernel, so its file table — the lock
+and the `control.sock` listener — stayed alive, and every remount
+attached to a listener nobody served and waited forever.
+
+**Decision**: a lock holder is pinged before anything is asked of it,
+every wait on it is bounded, and a holder that does not answer is
+classified from `/proc`, not from a timeout. Only a process the kernel
+itself reports as killed — thread-group leader a zombie and SIGKILL
+pending, or every remaining thread past `exit_mm` — is taken over: its
+lock inode is moved aside (the zombie keeps its lock on it) and the
+mount becomes the daemon on a fresh lock. A holder that can still run
+(sleeping, stopped by SIGSTOP, busy, or a zombie leader with live
+threads) is never taken over; the mount fails within the attach timeout,
+naming the pid and its state.
+
+**Consequences**: a rejoining node never blocks its startup on a dead
+predecessor, and the mutual exclusion the lock provides (one writer of
+`meta.db` per state dir) is preserved without a liveness guess: the
+only process displaced is one that can never run user code again. A
+holder that is alive but wedged needs an operator (`kill -9`; if it then
+lingers, abort its FUSE connection under
+`/sys/fs/fuse/connections/*/abort`), and the next mount takes over.
+
+**Rejected**: taking over on a timeout alone (a stopped or busy daemon
+would be displaced while it could still write `meta.db`); never taking
+over (the campaign's node could not rejoin until its kernel state was
+resolved by hand).
+
+**See**: `crates/cli/src/daemon_lock.rs`; the `stale-daemon-lock` and
+`holder-kill-rejoin` harness scenarios;
+[named filesystems](../reference/features/named-filesystems.md).

@@ -22,9 +22,10 @@ pub use types::{
     WritebackStatus,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -369,7 +370,10 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
     Ok(())
 }
 
-/// One-shot client call against a daemon's control socket.
+/// One-shot client call against a daemon's control socket. Unbounded:
+/// some requests (prune, GC, fsck, leave) are answered only when the
+/// work is done. A caller that must not hang on a daemon that never
+/// answers uses [`call_bounded`], or [`ping`] first.
 pub async fn call(sock: &Path, req: &Request) -> Result<Response> {
     let stream = UnixStream::connect(sock)
         .await
@@ -385,6 +389,54 @@ pub async fn call(sock: &Path, req: &Request) -> Result<Response> {
         .await?
         .context("daemon closed the connection without a response")?;
     Ok(serde_json::from_str(&line)?)
+}
+
+/// [`call`] with a deadline on the whole exchange (connect, send, wait
+/// for the answer). A daemon whose listener is still open but that will
+/// never answer — the campaign 6 B-1 shape: a `kill -9`ed daemon whose
+/// last thread is stuck in the kernel keeps its socket and its lock —
+/// accepts the connection and then says nothing; without a bound the
+/// caller parks forever.
+pub async fn call_bounded(sock: &Path, req: &Request, within: Duration) -> Result<Response> {
+    match tokio::time::timeout(within, call(sock, req)).await {
+        Ok(resp) => resp,
+        Err(_) => bail!(
+            "the daemon at {} did not answer within {within:?}",
+            sock.display()
+        ),
+    }
+}
+
+/// Is the daemon behind `sock` alive *and answering*? A bare `connect`
+/// succeeding proves only that a listener exists (a wedged process keeps
+/// its listener); a `Ping` answered within `within` proves the daemon's
+/// runtime is serving. `Ok(false)` when there is no listener at all
+/// (no socket file, or a stale one nobody listens on).
+pub async fn ping(sock: &Path, within: Duration) -> Result<bool> {
+    if !sock.exists() {
+        return Ok(false);
+    }
+    match tokio::time::timeout(within, call(sock, &Request::Ping)).await {
+        Ok(Ok(Response::Pong)) => Ok(true),
+        Ok(Ok(other)) => bail!("unexpected answer to ping: {other:?}"),
+        Ok(Err(e)) if is_connect_error(&e) => Ok(false),
+        Ok(Err(e)) => Err(e),
+        Err(_) => bail!(
+            "the daemon at {} accepted the connection but did not answer a ping within {within:?}",
+            sock.display()
+        ),
+    }
+}
+
+fn is_connect_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        })
+    })
 }
 
 #[cfg(test)]

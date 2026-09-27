@@ -25133,3 +25133,111 @@ repositories checked at the end). `GIT_FLOCK_RUST_LOG` sets the daemons'
 - Tests: meta and authority (release; sim 98, lib 113) pass; cli 241,
   net, harness pass; `long_locks` and `long_delegated` (500 seeds) pass;
   clippy and fmt clean.
+
+## Fix: rejoin hang after a lease holder's kill -9 (campaign 6 B-1)
+
+EC2 campaign 6 (AWS soak, binary 216ce6c) killed node b with `kill -9`
+while it held the lease; every remount of that node then hung
+indefinitely (300 s driver timeout, then 20+ minutes), the innermost
+daemon parked in `futex_do_wait` with nothing in its log past the
+thread plan. The report attributed it to P2P-enabled startup because a
+fresh state dir "still hung" and `CONSTELLATION_P2P=off` "succeeded".
+
+**Root cause: the previous daemon was not dead, and `mount` attached to
+it without a bound.** The evidence pins it: the killed daemon 161984 was
+still there as a zombie (`State: Z`, `Threads: 2`, `ShdPnd`
+0x100 = SIGKILL pending, 15 minutes after the kill) — its last thread
+was stuck in the kernel on its way out, so its file table, and with it
+the `flock` on `daemon.lock` and the `control.sock` listener, stayed
+alive. The hung remount had 9 threads and no `daemon.lock` fd (it had
+*not* become the daemon), one connected unix stream (the control
+socket), its main thread in `block_on`: `take_state_dir_lock` found the
+lock held (`EWOULDBLOCK` → `Attach`), the kernel accepted the connection
+to a listener nobody served, and `constellation_api::call` waited
+forever for `MountAdd`'s answer. So did the six `constellation status`
+invocations piled up since 04:20 in the same `ps` listing. P2P was never
+started (no UDP socket; `start_p2p` runs after the bootstrap anyway).
+`lslocks | grep c6baws` showed nothing because it cannot resolve a
+zombie's fd paths. The two "P2P" observations are artifacts: the fresh
+state dir has a new `daemon.lock` inode (the zombie's lock is on the old
+one) and both of those manual mounts were run with `timeout 25` — the
+P2P-off mount of the same fs took 25 s (19.5 s of replica load). Today's
+re-run on the same host (`trace/`): the "hung" trace-1 daemon had 33
+threads including 8 fjall workers and a running tokio worker in every
+snapshot — bootstrapping under `RUST_LOG=trace` — and was killed at
+t+50 s; trace-2 (`iroh=trace` only) succeeded at ~50 s. The captured
+`/tmp/c6_trace_*.log` files hold only the pre-fork parent's output
+(269 lines, 100 ms); the daemon's log is `<state dir>/daemon.log`.
+Why the kernel kept that one thread is not in the evidence (a FUSE
+request wait that only the process's own `/dev/fuse` release can abort
+is the classic shape); the fix does not depend on it.
+
+**Fix** (ADR-29; `crates/cli/src/daemon_lock.rs`, `startup.rs`,
+`main.rs`; `crates/api/src/lib.rs`):
+- `constellation_api::call_bounded` and `ping`: a control call with a
+  deadline; a liveness probe that distinguishes "no listener" from "a
+  listener that does not answer".
+- `mount` with `daemon.lock` held pings the holder
+  (`CONSTELLATION_CONTROL_TIMEOUT_MS`, 10 s) before attaching, attaches
+  with a bound, and keeps retrying (a daemon still bootstrapping has no
+  socket yet) until `CONSTELLATION_ATTACH_TIMEOUT_MS` (120 s), then
+  fails naming the holder's pid and state. The pre-fork
+  `daemon_socket_is_live` pings too (a bare `connect` is what misled it).
+- A holder that does not answer is classified from `/proc` (`/proc/locks`
+  names the locker by inode; `daemon.pid` is the fallback): only a
+  process the kernel has already killed — leader a zombie and SIGKILL
+  pending, or every remaining thread past `exit_mm` — is taken over:
+  its lock file is moved to `daemon.lock.wedged-<pid>` (the zombie keeps
+  its lock on that inode), the stale `control.sock`/`daemon.pid` are
+  removed, and the mount becomes the daemon on a fresh lock. Takeovers
+  serialise on `daemon.takeover.lock` and re-verify the holder. Anything
+  alive (sleeping, stopped, busy, a zombie leader with live threads) is
+  never displaced: safety never depends on a liveness guess.
+- `constellation status` (and `prune status`) are bounded the same way.
+- Startup phases: every phase of `mount` (`taking daemon.lock`, probing,
+  attaching, backend, bootstrap, `meta.db`, identity, CAS probe, P2P,
+  root adoption, background tasks, views) is logged with its duration
+  and a `startup-watchdog` thread warns every
+  `CONSTELLATION_STARTUP_WARN_S` (30) that a phase is still running,
+  with the thread count; a stuck startup now names its phase in
+  `daemon.log`.
+- Test hook `CONSTELLATION_FAULT_ASSUME_WEDGED_PID` (the classifier's
+  verdict for a pid; no test can fabricate a thread stuck in the kernel).
+
+**Harness** (`crates/harness/src/scenarios/rejoin.rs`;
+`harness mute-daemon` hidden subcommand; `Client::mount_within`,
+`pid`, `status_cli`, `set_env`/`unset_env`):
+- `holder-kill-rejoin`: four nodes (M9 cluster, backups on),
+  `HOLDER_KILL_ROUNDS` (10) rounds of kill -9 the holder / the holder
+  with a `flock` held on it / one of its backups, wait 0, 1.5 or 4 s,
+  remount with P2P on within 60 s, converge; a write on the returning
+  node claims or forwards (the lease is claimed on demand: an idle
+  cluster after a kill legitimately has no holder); the dead node's
+  lock is taken by another node within 60 s.
+- `stale-daemon-lock`: the exact condition with the mute stand-in: a
+  live mute holder → the mount exits within the bound naming it,
+  `status` fails within the control timeout, no takeover; classified as
+  killed → the next mount rotates the lock, serves the old data, logs
+  the takeover and its phases; a clean remount after the holder is gone.
+
+**Results** (branch `fix-rejoin-hang`, rebased on main 7a681ee, prefix
+`constellation-harness-rejoin`):
+- `stale-daemon-lock` 5/5 PASS (mount against the live mute holder gives
+  up after 9 s with a 6 s attach timeout; `status` after 2 s; takeover
+  mount in 4 s).
+- `holder-kill-rejoin` 5/5 PASS, 50 rounds: remount p50 104–110 ms, max
+  420 ms (bound 60 s); first write after a remount p50 5–20 ms, max
+  10.4 s (a holder killed with a flock held; its lease reclaimed inside
+  the 20 s TTL); the dead node's lock taken after 8.4–19.1 s (its grant
+  outwaited, plan 30 M14).
+- `backup-failover` (failover p50 1.5 s), `forwarded-mutations`,
+  `chaos-ci` PASS; cli 248 unit tests (7 new in `daemon_lock`, including
+  node b's `/proc/161984/status` verbatim), api tests, harness tests
+  pass; clippy and fmt clean.
+
+**Not fixed here**: node b's registry has two non-retired rows for the
+same host key (id 1 from the soak start, never heartbeated after the
+kill; id 5 claimed by the `rm -rf`'d state dir's P2P-off mount). That is
+the expected consequence of wiping a state dir (the id lives there, the
+key on the host); peers dialling id 1 reach id 5's endpoint. Worth a
+look at how a dead, never-retired id ages out, but it is not the hang.

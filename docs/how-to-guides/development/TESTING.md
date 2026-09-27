@@ -1122,6 +1122,30 @@ relay of its own so requests can be attributed per role):
     backup out or the sealed backup has taken over — never two holders
     — and after the heal every file is everywhere with no conflict and
     exactly one holder.
+- **Campaign 6 B-1 scenarios** (`crates/harness/src/scenarios/rejoin.rs`):
+  a node `kill -9`ed while it held the lease hung on its remount. The
+  hang was in the state-dir handshake, not P2P: the killed daemon's last
+  thread was stuck in the kernel, so its `daemon.lock` flock and its
+  `control.sock` listener outlived it, and the remount attached to a
+  listener nobody served, forever.
+  - `holder-kill-rejoin`: four nodes (the M9 cluster, backups on);
+    `HOLDER_KILL_ROUNDS` (10) rounds of "5 files written on the holder,
+    then kill -9 the holder / the holder with a `flock` held on it / one
+    of its backups, wait 0, 1.5 or 4 s, remount it with P2P on within
+    60 s, every node converges on every file"; prints the remount-time
+    distribution and each node's seal/takeover counters.
+  - `stale-daemon-lock`: one node; after a clean unmount, `harness
+    mute-daemon` (a hidden subcommand) holds `daemon.lock` and a
+    `control.sock` listener that accepts and never answers. A mount
+    (`CONSTELLATION_CONTROL_TIMEOUT_MS=2000`,
+    `CONSTELLATION_ATTACH_TIMEOUT_MS=6000`) must exit within the bound
+    naming the live holder's pid and refusing to take over; `status`
+    must fail within the control timeout; with the holder classified as
+    killed by the kernel (`CONSTELLATION_FAULT_ASSUME_WEDGED_PID`, the
+    stand-in for a zombie with SIGKILL pending, which no test can
+    fabricate) the next mount rotates the lock (`daemon.lock.wedged-<pid>`),
+    serves the old data, and logs the takeover and its startup phases;
+    a clean remount after the holder is gone serves everything.
 - **Plan 30 M11 scenarios** (`crates/harness/src/scenarios/m11.rs`):
   delegated sub-sequencers, one log. Every mount has a 20 s lease TTL,
   idle release off, no backup peer (`CONSTELLATION_BACKUP_RTT_BUDGET_MS=0`),

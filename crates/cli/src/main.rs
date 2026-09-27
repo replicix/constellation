@@ -5,6 +5,7 @@ mod authority_driver;
 mod backend;
 mod coop;
 mod cto;
+mod daemon_lock;
 mod daemonize;
 mod designation;
 mod doctor;
@@ -41,6 +42,7 @@ mod singleton;
 mod snapshot;
 mod sources;
 mod staging;
+mod startup;
 mod target;
 mod writeback;
 
@@ -658,12 +660,41 @@ fn ensure_allow_other_supported(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Is a daemon already serving this state dir? A successful connect to the
-/// control socket means yes — a new `mount` will attach to it rather than
-/// unlock the keyring itself, so it needs no passphrase.
+/// Is a daemon already serving this state dir? A `Ping` answered within
+/// the control timeout means yes — a new `mount` will attach to it rather
+/// than unlock the keyring itself, so it needs no passphrase. A bare
+/// `connect` succeeding is not enough (campaign 6 B-1: a daemon the
+/// kernel has killed keeps its listener while one thread is stuck on its
+/// way out, and accepts connections it will never answer). Runs through
+/// a throwaway runtime that is fully dropped before the caller forks.
 fn daemon_socket_is_live(state_dir: &Path) -> bool {
     let sock = state_dir.join(constellation_api::SOCKET_NAME);
-    std::os::unix::net::UnixStream::connect(sock).is_ok()
+    if !sock.exists() {
+        return false;
+    }
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    let live = rt.block_on(constellation_api::ping(
+        &sock,
+        daemon_lock::control_timeout(),
+    ));
+    drop(rt);
+    match live {
+        Ok(live) => live,
+        Err(e) => {
+            tracing::warn!(
+                sock = %sock.display(),
+                error = %e,
+                "a daemon holds this state dir's control socket but does not answer; \
+                 not attaching to it"
+            );
+            false
+        }
+    }
 }
 
 /// For an interactive E2E mount, prompt for the passphrase *before* the
@@ -1072,9 +1103,12 @@ fn main() -> Result<()> {
                 target.context("TARGET (a registered filesystem name) or --s3 is required")?;
             let (_, dir) = resolve_target(&target, state_dir)?;
             let sock = dir.join(constellation_api::SOCKET_NAME);
-            let resp = rt.block_on(constellation_api::call(
+            // Bounded: a daemon the kernel has killed but that still holds
+            // its listener (campaign 6 B-1) must not park `status` forever.
+            let resp = rt.block_on(constellation_api::call_bounded(
                 &sock,
                 &constellation_api::Request::Status,
+                daemon_lock::control_timeout(),
             ))?;
             match resp {
                 constellation_api::Response::Status(s) => {
@@ -1868,51 +1902,136 @@ fn cmd_mount_body(
     // the attach is refused for that reason, wait for the old daemon to
     // release the lock, then loop: the next `take_state_dir_lock` will
     // return `BecomeDaemon`.
+    //
+    // Campaign 6 B-1: the lock holder may be a daemon the kernel has
+    // already killed whose last thread is stuck in the kernel; it keeps
+    // its lock and its listener, and never answers. Every wait here is
+    // bounded (`daemon_lock::attach_timeout`), the holder is pinged
+    // before anything is asked of it, and a holder the kernel says can
+    // never run again is taken over (`daemon_lock::take_over`); a holder
+    // that is alive but mute makes this mount fail, explained, within
+    // the bound.
+    startup::phase("taking daemon.lock");
+    let attach_started = std::time::Instant::now();
+    let attach_deadline = daemon_lock::attach_timeout();
+    let mut took_over = false;
+    let fail = |verdict: Option<daemonize::Verdict>, msg: String| -> Result<()> {
+        if let Some(v) = verdict {
+            v.failure(&msg)?;
+            std::process::exit(1);
+        }
+        bail!(msg)
+    };
     let lock_outcome = loop {
         match take_state_dir_lock(state_dir)? {
-            LockOutcome::Attach => match rt.block_on(attach_views(&sock, &views))? {
-                AttachOutcome::Attached => {
-                    for view in &views {
-                        println!("mounted {} at {}", view.subtree, view.mountpoint.display());
-                    }
-                    if let Some(v) = verdict {
-                        v.success_attached()?;
-                    }
-                    return Ok(());
-                }
-                AttachOutcome::DaemonShuttingDown => {
-                    eprintln!(
-                        "existing daemon for this mount is shutting down (draining); \
-                         waiting for it to exit before taking over…"
-                    );
-                    // Wait for the old daemon to release the lock / remove
-                    // its socket. Bounded so a genuinely wedged daemon
-                    // surfaces an error rather than spinning forever.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-                    while sock.exists() && std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
-                    if sock.exists() {
-                        let msg = "existing daemon is still shutting down after 600s; \
-                             not taking over (retry once it has exited)"
-                            .to_string();
-                        if let Some(v) = verdict {
-                            v.failure(&msg)?;
-                            std::process::exit(1);
+            LockOutcome::Attach => {
+                startup::phase("probing the daemon that holds daemon.lock");
+                let probe = rt.block_on(constellation_api::ping(
+                    &sock,
+                    daemon_lock::control_timeout(),
+                ));
+                match probe {
+                    Ok(true) => {}
+                    other => {
+                        let holder = daemon_lock::holder_for_takeover(state_dir);
+                        match (&other, &holder) {
+                            (_, daemon_lock::Holder::Wedged { pid, why, .. }) if !took_over => {
+                                tracing::warn!(
+                                    pid,
+                                    why,
+                                    "daemon.lock is held by a daemon the kernel has killed; \
+                                     taking the state dir over"
+                                );
+                                eprintln!(
+                                    "previous daemon (pid {pid}) is dead but still holds this \
+                                     state dir: {why}; taking over"
+                                );
+                                daemon_lock::take_over(state_dir, *pid)?;
+                                took_over = true;
+                                continue;
+                            }
+                            _ => {}
                         }
-                        bail!(msg);
+                        let detail = match &other {
+                            Ok(_) => "its control socket is not up".to_string(),
+                            Err(e) => format!("{e:#}"),
+                        };
+                        if attach_started.elapsed() >= attach_deadline {
+                            return fail(
+                                verdict,
+                                format!(
+                                    "another daemon holds {}/daemon.lock but could not be attached \
+                                     to within {attach_deadline:?}: {detail}; {holder}. Not taking \
+                                     its state dir over while it can still run: if it is stuck, \
+                                     kill it and retry; if it then lingers as a zombie, its last \
+                                     thread is stuck in the kernel (abort its FUSE connection under \
+                                     /sys/fs/fuse/connections/*/abort) and the next mount takes over",
+                                    state_dir.display()
+                                ),
+                            );
+                        }
+                        tracing::info!(
+                            %holder,
+                            detail,
+                            waited_s = attach_started.elapsed().as_secs(),
+                            "daemon.lock is held; retrying the attach"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
                     }
-                    // Old daemon is gone: loop and re-take the lock, which
-                    // now yields `BecomeDaemon`.
-                    continue;
                 }
-            },
+                startup::phase("attaching views to the running daemon");
+                let remaining = attach_deadline.saturating_sub(attach_started.elapsed());
+                match rt.block_on(attach_views(&sock, &views, remaining))? {
+                    AttachOutcome::Attached => {
+                        for view in &views {
+                            println!("mounted {} at {}", view.subtree, view.mountpoint.display());
+                        }
+                        startup::done("attached");
+                        if let Some(v) = verdict {
+                            v.success_attached()?;
+                        }
+                        return Ok(());
+                    }
+                    AttachOutcome::DaemonShuttingDown => {
+                        eprintln!(
+                            "existing daemon for this mount is shutting down (draining); \
+                         waiting for it to exit before taking over…"
+                        );
+                        // Wait for the old daemon to release the lock / remove
+                        // its socket. Bounded so a genuinely wedged daemon
+                        // surfaces an error rather than spinning forever.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(600);
+                        while sock.exists() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        if sock.exists() {
+                            return fail(
+                                verdict,
+                                "existing daemon is still shutting down after 600s; \
+                             not taking over (retry once it has exited)"
+                                    .to_string(),
+                            );
+                        }
+                        // Old daemon is gone: loop and re-take the lock, which
+                        // now yields `BecomeDaemon`.
+                        continue;
+                    }
+                }
+            }
             LockOutcome::BecomeDaemon => break LockOutcome::BecomeDaemon,
         }
     };
     match lock_outcome {
         LockOutcome::Attach => unreachable!("attach handled in the loop above"),
         LockOutcome::BecomeDaemon => {
+            tracing::info!(
+                state_dir = %state_dir.display(),
+                took_over,
+                "daemon.lock taken: this process becomes the daemon"
+            );
+            startup::phase("starting the node runtime");
             let handle = rt.handle().clone();
             let node = match node_runtime::NodeRuntime::start(
                 node_runtime::NodeConfig {
@@ -1944,6 +2063,7 @@ fn cmd_mount_body(
             // what this invocation added.
             let mut added = Vec::new();
             let mut errors = Vec::new();
+            startup::phase("mounting views");
             for view in &views {
                 match node.add_mount(view.view_config(fuse_threads)) {
                     Ok(id) => added.push((id, view)),
@@ -1972,6 +2092,7 @@ fn cmd_mount_body(
                 }
                 bail!(message);
             }
+            startup::done("daemon serving");
             if let Some(v) = verdict {
                 v.success_daemon()?;
             }
@@ -2006,15 +2127,27 @@ enum AttachOutcome {
     DaemonShuttingDown,
 }
 
-async fn attach_views(sock: &Path, views: &[ViewSpec]) -> Result<AttachOutcome> {
+/// Attach every view through the running daemon's control socket. Each
+/// `MountAdd` is bounded by what is left of `within` (campaign 6 B-1: a
+/// listener nobody serves must not park this process forever).
+async fn attach_views(
+    sock: &Path,
+    views: &[ViewSpec],
+    within: std::time::Duration,
+) -> Result<AttachOutcome> {
+    let started = std::time::Instant::now();
     for view in views {
-        let resp = constellation_api::call(
+        let remaining = within
+            .saturating_sub(started.elapsed())
+            .max(std::time::Duration::from_secs(1));
+        let resp = constellation_api::call_bounded(
             sock,
             &constellation_api::Request::MountAdd {
                 subtree: view.inner_path(),
                 mountpoint: view.mountpoint.clone(),
                 opts: view.mount_opts(),
             },
+            remaining,
         )
         .await
         .with_context(|| format!("attaching {}", view.mountpoint.display()))?;
@@ -3646,7 +3779,13 @@ fn run_prune_command(rt: &tokio::runtime::Runtime, command: PruneCommand) -> Res
             let (_, dir) = resolve_target(&target, state_dir)?;
             rt.block_on(async {
                 let sock = dir.join(constellation_api::SOCKET_NAME);
-                match constellation_api::call(&sock, &constellation_api::Request::Status).await? {
+                match constellation_api::call_bounded(
+                    &sock,
+                    &constellation_api::Request::Status,
+                    daemon_lock::control_timeout(),
+                )
+                .await?
+                {
                     constellation_api::Response::Status(report) => {
                         println!("{}", serde_json::to_string_pretty(&report.prune)?);
                         Ok(())

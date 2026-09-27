@@ -96,6 +96,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Test helper for `stale-daemon-lock`: hold `daemon.lock` and a
+    /// `control.sock` listener in STATE_DIR that accepts connections and
+    /// never answers, until killed (a stand-in for a daemon the kernel has
+    /// killed whose last thread is stuck in the kernel).
+    #[command(hide = true)]
+    MuteDaemon { state_dir: std::path::PathBuf },
     /// Snapshot a local directory into an anonymized corpus manifest.
     CorpusSnapshot {
         /// Directory to walk (`.git` / `.hg` / `.svn` skipped).
@@ -209,6 +215,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::CorpusSnapshot { src, out, seed } => corpus::snapshot_cmd(src, out, seed),
+        Command::MuteDaemon { state_dir } => mute_daemon(&state_dir),
     }
 }
 
@@ -274,4 +281,40 @@ fn run(
         );
     }
     Ok(())
+}
+
+/// See `Command::MuteDaemon`.
+fn mute_daemon(state_dir: &std::path::Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(state_dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(state_dir.join("daemon.lock"))?;
+    // SAFETY: `lock` owns a valid open fd for the duration of the call.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!(
+            "daemon.lock is already held: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let sock = state_dir.join("control.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = std::os::unix::net::UnixListener::bind(&sock)?;
+    std::fs::write(state_dir.join("daemon.pid"), std::process::id().to_string())?;
+    eprintln!(
+        "mute daemon {} holding {}",
+        std::process::id(),
+        state_dir.display()
+    );
+    // Keep every accepted connection open (a closed one would give the
+    // client EOF, which is an answer of sorts) and never read or write.
+    let mut held = Vec::new();
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => held.push(stream),
+            Err(e) => bail!("accept: {e}"),
+        }
+    }
 }

@@ -39,6 +39,9 @@ mod m9;
 /// The OVH real-S3 run's findings: the create race, a non-owner's
 /// per-op S3 round trip.
 mod ovh;
+/// Campaign 6 B-1: a lease holder's `kill -9` and its rejoin, and a
+/// `daemon.lock` still held by a daemon the kernel has killed.
+mod rejoin;
 /// The small-file write path: S3 round trips per close, `back` for
 /// non-owners.
 mod writepath;
@@ -807,6 +810,18 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M9 (strict): a reader holds a read delegation from the holder, which dies; the backup takes over inside the lease and its first write of that file is acknowledged only past the delegation horizon: no read the reader starts after the acknowledgement is stale, and no strict read degrades",
         requires: &[],
         run: m9::backup_failover_with_delegation,
+    },
+    Scenario {
+        name: "holder-kill-rejoin",
+        desc: "campaign 6 B-1: four nodes, backups on; HOLDER_KILL_ROUNDS (10) rounds of kill -9 the lease holder (plain, with a flock held on it, or a backup instead) and remount it with P2P on within 60 s, then every node converges; prints the remount-time distribution",
+        requires: &[],
+        run: rejoin::holder_kill_rejoin,
+    },
+    Scenario {
+        name: "stale-daemon-lock",
+        desc: "campaign 6 B-1: daemon.lock and control.sock held by a process that never answers: a mount fails within the attach timeout naming the live holder (no takeover of anything that can run), `status` fails within the control timeout, and once the holder counts as killed by the kernel the next mount takes the state dir over and serves",
+        requires: &[],
+        run: rejoin::stale_daemon_lock,
     },
     Scenario {
         name: "backup-partition",
