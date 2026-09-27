@@ -95,6 +95,9 @@ enum Phase {
     /// edit was re-read).
     Renew {
         retry: bool,
+        /// Issued between two segments of a round's ship loop (the
+        /// renewal came due while it shipped): the loop resumes after it.
+        mid_ship: bool,
         /// Plan 30 §M10: the object the swap writes. On success the held
         /// lease becomes exactly it (it used to be recomputed at the
         /// result's time, an expiry later than the object's by the
@@ -104,7 +107,7 @@ enum Phase {
     },
     /// `LeaseGet` after a lost renewal CAS (`final_probe`: the second
     /// swap lost too, so this read is the deposition probe).
-    RenewReread { final_probe: bool },
+    RenewReread { final_probe: bool, mid_ship: bool },
     /// The gate's epoch-marker `SegmentPut` outstanding.
     Marker { attempts: u32 },
     /// M13: the gate's `InboxDrain` outstanding.
@@ -1498,34 +1501,62 @@ impl Core {
         self.round_renew(now, replica, out);
     }
 
-    fn round_renew(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
-        let due = match &self.lease.held {
-            Some((lease, _)) => {
-                self.ship.renew_now || lease.expires_in_ms(now.0) <= (self.cfg.ttl_ms / 2) as i64
+    /// Whether the held lease should be renewed now: half its TTL is
+    /// gone (or a deposition hint asked for it).
+    fn renew_due(&self, now: Ms) -> bool {
+        !self.lease.lost
+            && match &self.lease.held {
+                Some((lease, _)) => {
+                    self.ship.renew_now
+                        || lease.expires_in_ms(now.0) <= (self.cfg.ttl_ms / 2) as i64
+                }
+                None => false,
             }
-            None => false,
-        };
-        if due && !self.lease.lost {
-            let (mine, tag) = self.lease.held.clone().expect("held");
-            let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
-            let op = self.issue_s3(
-                S3Op::LeaseSwap {
-                    lease: renewed.clone(),
-                    tag,
-                },
-                S3For::Job,
-                out,
-            );
-            self.set_phase(
-                Phase::Renew {
-                    retry: false,
-                    sent: Box::new(renewed),
-                },
-                Some(op),
-            );
+    }
+
+    fn issue_renew(&mut self, now: Ms, mid_ship: bool, out: &mut Vec<Action>) {
+        let (mine, tag) = self.lease.held.clone().expect("held");
+        let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
+        let op = self.issue_s3(
+            S3Op::LeaseSwap {
+                lease: renewed.clone(),
+                tag,
+            },
+            S3For::Job,
+            out,
+        );
+        self.set_phase(
+            Phase::Renew {
+                retry: false,
+                mid_ship,
+                sent: Box::new(renewed),
+            },
+            Some(op),
+        );
+    }
+
+    fn round_renew(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.renew_due(now) {
+            self.issue_renew(now, false, out);
             return;
         }
         self.round_gate(now, replica, out);
+    }
+
+    /// Where a round goes after its renewal: the gate (the renewal
+    /// opened the round), or back into the ship loop it interrupted.
+    fn round_after_renew(
+        &mut self,
+        now: Ms,
+        mid_ship: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if mid_ship {
+            self.round_ship(now, 0, replica, out);
+        } else {
+            self.round_gate(now, replica, out);
+        }
     }
 
     fn round_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -2613,7 +2644,12 @@ impl Core {
                 self.job_failed(now, format!("tailing: {}", e.0), replica, out)
             }
             // ---- renewal ----
-            (Phase::Renew { ref sent, .. }, S3Result::LeasePut(Ok(tag))) => {
+            (
+                Phase::Renew {
+                    ref sent, mid_ship, ..
+                },
+                S3Result::LeasePut(Ok(tag)),
+            ) => {
                 if self.lease.held.is_none() {
                     self.lease_gone_mid_job(now, kind, replica, out);
                     return;
@@ -2621,11 +2657,22 @@ impl Core {
                 let renewed = (**sent).clone();
                 self.lease.renewed(now, renewed, tag);
                 self.ship.renew_now = false;
-                self.round_gate(now, replica, out);
+                self.round_after_renew(now, mid_ship, replica, out);
             }
-            (Phase::Renew { retry, .. }, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
+            (
+                Phase::Renew {
+                    retry, mid_ship, ..
+                },
+                S3Result::LeasePut(Err(CasFailure::Conflict)),
+            ) => {
                 let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
-                self.set_phase(Phase::RenewReread { final_probe: retry }, Some(op));
+                self.set_phase(
+                    Phase::RenewReread {
+                        final_probe: retry,
+                        mid_ship,
+                    },
+                    Some(op),
+                );
             }
             (Phase::Renew { .. }, S3Result::LeasePut(Err(CasFailure::Failed(e)))) => {
                 // A round that cannot reach S3 fails (as `run_sync_round`
@@ -2638,7 +2685,13 @@ impl Core {
                     out,
                 );
             }
-            (Phase::RenewReread { final_probe }, S3Result::LeaseGet(Ok(current))) => {
+            (
+                Phase::RenewReread {
+                    final_probe,
+                    mid_ship,
+                },
+                S3Result::LeaseGet(Ok(current)),
+            ) => {
                 let Some((mine, _)) = self.lease.held.clone() else {
                     self.lease_gone_mid_job(now, kind, replica, out);
                     return;
@@ -2651,7 +2704,7 @@ impl Core {
                             // Only the tag was stale (a retried PUT landing
                             // twice): adopt it and carry on.
                             self.lease.renewed(now, cur, tag);
-                            self.round_gate(now, replica, out);
+                            self.round_after_renew(now, mid_ship, replica, out);
                         } else {
                             // Lost the CAS to a `wanted_by` edit: renew
                             // against the fresh object.
@@ -2668,6 +2721,7 @@ impl Core {
                             self.set_phase(
                                 Phase::Renew {
                                     retry: true,
+                                    mid_ship,
                                     sent: Box::new(renewed),
                                 },
                                 Some(op),
@@ -2798,6 +2852,16 @@ impl Core {
                     return;
                 }
                 match purpose {
+                    // Plan 30 × campaign 6: a round ships until the
+                    // journal is empty, and with writes arriving faster
+                    // than one segment PUT (slow S3) that is never: the
+                    // lease, renewed only as a round opens, lapsed under
+                    // a live, writing holder — its backups stopped
+                    // hearing from it at expiry and sealed it. Renew
+                    // between two segments once half the TTL is gone.
+                    ShipPurpose::Journal if kind == JobKind::Round && self.renew_due(now) => {
+                        self.issue_renew(now, true, out);
+                    }
                     ShipPurpose::Journal => match kind {
                         JobKind::Round => self.round_ship(now, 0, replica, out),
                         _ => self.flush_continue(now, 0, replica, out),

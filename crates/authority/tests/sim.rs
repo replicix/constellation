@@ -1533,6 +1533,28 @@ fn pre_s3_streaming_installs_and_retires() {
     assert!(t.streamed_installed > 20, "{t:?}");
 }
 
+/// Slow S3 and no fault at all (slow-s3-no-seal): every S3 request
+/// takes about a twelfth of the lease TTL and the clients keep the
+/// holder's journal non-empty, so its rounds ship back to back. No
+/// backup ever seals the live holder and nobody takes its lease over:
+/// the holder renews between two segments (it used to renew only as a
+/// round opened, and a round that never ran dry let the lease lapse).
+#[test]
+fn slow_s3_never_seals_a_live_holder() {
+    let cfg = SimConfig {
+        s3_latency: (400, 600),
+        clients_per_node: 3,
+        ops_per_client: 40,
+        random_faults: 0,
+        join_fresh: false,
+        ..backup_config()
+    };
+    let t = run_m9("slow-s3-live", cfg, 3000..3016);
+    assert!(t.appends > 100, "no backup streaming happened: {t:?}");
+    assert_eq!(t.seals, 0, "a live holder was sealed: {t:?}");
+    assert_eq!(t.backup_takeovers, 0, "{t:?}");
+}
+
 /// Plan 30 §M9's checks are not vacuous: today's `Local` policy with a
 /// holder crash does roll acknowledged ops back (plan 30 §1.2's L2
 /// window), and the strict-durability check catches it.
@@ -2962,11 +2984,13 @@ fn shared_dir_fast_path_respects_the_ranges() {
 /// M12 round 2: without the admission the root executes, on its fast
 /// path, names the log has given to a range's delegate — two winners
 /// for one create or unlink (the tester's `chaos-soak-4` under the
-/// placement). The checker catches it on these seeds.
+/// placement). The checker catches it on these seeds (a few in sixty:
+/// which seeds hit the window moves with any change of schedule, such as
+/// the mid-ship lease renewal, so the range is wide).
 #[test]
 fn shared_dir_unchecked_fast_path_is_caught() {
     let mut caught = 0;
-    for seed in 77_000..77_010 {
+    for seed in 77_000..77_060 {
         if let Err(e) = run_seed(seed, shared_dir_fast_path_unchecked_config()) {
             eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
             caught += 1;

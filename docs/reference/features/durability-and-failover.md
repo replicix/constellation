@@ -139,6 +139,12 @@ backup gets a heartbeat append every `CONSTELLATION_BACKUP_HEARTBEAT_MS`
 (300 ms). Heartbeats never wait on S3: they continue while a slow lease
 renewal leaves the lease inside its expiry margin (nothing new is
 admitted then), and stop only once the lease has actually expired.
+The renewal itself never waits behind the log either: a sync round
+ships until the journal is empty, which under sustained writes and slow
+S3 can take longer than the lease lasts, so a renewal that comes due
+between two segments goes out before the next one. (It used to wait
+for the round's end; the lease lapsed under a live, writing holder, and
+its backup, which stops hearing heartbeats at expiry, sealed it.)
 
 **Acknowledgement.** Under `Backup`, the holder answers a mutation
 (accepted *or refused*: a refusal was evaluated against the same
@@ -174,6 +180,17 @@ A node that answers an append with `sealed` (it sealed that epoch,
 possibly in an earlier life) is dropped and never invited again for the
 epoch, and no acknowledgement waits for it as a backup that could be
 had.
+
+The 1.5 s window does not adapt to S3 latency, and does not need to:
+nothing on the heartbeat path touches S3 (the backup channel is P2P
+only, the renewal is never starved by the ship loop), and backups are
+chosen within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (5 ms), so the window
+is several hundred times the link's RTT. Scaling it with the P2P RTT
+would change nothing inside the budget. A longer window would only delay
+a genuine failover, and the seal is safe at any threshold, so there is
+nothing to gain in safety either. `slow-s3-no-seal` (1.5 s per S3
+request, three minutes of writes from every node) checks that no live
+holder is sealed.
 
 A backup that restarts with its role persisted does not count its own
 downtime as the holder's silence: silence counts from the moment its

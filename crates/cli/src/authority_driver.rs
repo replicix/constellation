@@ -52,6 +52,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+/// A core step (handle + refresh + dispatch) longer than this is logged:
+/// nothing else on the node's authority path — a holder's backup
+/// heartbeats included — runs meanwhile (a third of the default 1.5 s
+/// seal window).
+const SLOW_STEP_US: u64 = 500_000;
+
 /// What a forwarded mutation's reply carries back to the bridge: the
 /// outcome, plan 30 §M6's `base`, the position and (§M11) the executing
 /// delegation generation (0: the root).
@@ -865,6 +871,19 @@ impl Driver {
                 waited_us,
                 "core step"
             );
+            let step_us = handled_us + refreshed_us + dispatched_us;
+            if step_us >= SLOW_STEP_US {
+                // Everything the core does (backup heartbeats included)
+                // waits for this step: a long one silences the node.
+                tracing::warn!(
+                    event = kind,
+                    actions = ?action_kinds,
+                    handled_us,
+                    refreshed_us,
+                    dispatched_us,
+                    "slow core step"
+                );
+            }
             step_end = std::time::Instant::now();
             if self.core.stopped() {
                 break;

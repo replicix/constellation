@@ -166,8 +166,42 @@ impl Pool {
             Suspicion::Unanswered => PROBE_WINDOW,
             Suspicion::Restarted => RESTART_PROBE_WINDOW,
         };
+        // The peer's other connections (the ones it dialed to us, other
+        // ALPNs), and what each had received when the probe began; and
+        // the addresses this one talks to.
+        let others = self.other_connections(id, stable);
+        let addrs: Vec<iroh::TransportAddr> = conn
+            .paths()
+            .iter()
+            .map(|p| p.remote_addr().clone())
+            .collect();
         if self.alive(&conn, id, window).await {
             tracing::debug!(peer = %id.fmt_short(), ?why, "pooled connection answered its probe");
+        } else if others.iter().any(|(c, rx, at)| {
+            c.close_reason().is_none()
+                && c.stats().udp_rx.datagrams > *rx
+                && at.as_ref().is_some_and(|a| addrs.contains(a))
+        }) {
+            // This connection is dead, but the peer is not: another
+            // connection to the same address (the same incarnation — a
+            // restarted one listens on a new port) received datagrams
+            // meanwhile. Drop this one only. Closing them all (the dead-
+            // incarnation remedy below) cut a live lease holder's
+            // backup appends mid-flight — the holder's own connection
+            // to its backup was fine — and the backup sealed it
+            // (slow-s3-no-seal: a forward stuck on a broken pooled
+            // connection timed out, the probe found that connection
+            // silent, and every connection to the holder was closed).
+            tracing::info!(
+                peer = %id.fmt_short(),
+                ?why,
+                window_ms = window.as_millis() as u64,
+                "pooled P2P connection is dead, the peer is not (another connection to it is \
+                 live); replacing only this one"
+            );
+            if let Some(conn) = self.unpool(&gate, stable).await {
+                conn.close(iroh::endpoint::VarInt::from_u32(0), b"unresponsive");
+            }
         } else {
             tracing::info!(
                 peer = %id.fmt_short(),
@@ -244,6 +278,34 @@ impl Pool {
             Some(conn) if conn.stable_id() == stable => slot.take(),
             _ => None,
         }
+    }
+
+    /// Every open connection to `id` other than `stable`'s, with its
+    /// received-datagram count now and its selected path's address.
+    fn other_connections(
+        &self,
+        id: iroh::EndpointId,
+        stable: usize,
+    ) -> Vec<(iroh::endpoint::Connection, u64, Option<iroh::TransportAddr>)> {
+        let tracked = self.tracked.lock().unwrap();
+        tracked
+            .get(&id)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|weak| weak.upgrade())
+                    .filter(|c| c.stable_id() != stable && c.close_reason().is_none())
+                    .map(|c| {
+                        let rx = c.stats().udp_rx.datagrams;
+                        let at = c
+                            .paths()
+                            .iter()
+                            .find(|p| p.is_selected())
+                            .map(|p| p.remote_addr().clone());
+                        (c, rx, at)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn track(&self, conn: &iroh::endpoint::Connection) {

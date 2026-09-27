@@ -1549,6 +1549,15 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        tracing::trace!(
+            target: "constellation_authority::ack_wait",
+            node = self.cfg.node_id,
+            from,
+            epoch,
+            from_jseq,
+            txs = txs.len(),
+            "backup append received"
+        );
         self.note_foreign(now, replica, out);
         let reply = |acked: u64, sealed: bool, out: &mut Vec<Action>| {
             out.push(Action::Send {

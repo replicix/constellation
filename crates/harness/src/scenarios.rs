@@ -45,6 +45,7 @@ mod ovh;
 /// Campaign 6 B-1: a lease holder's `kill -9` and its rejoin, and a
 /// `daemon.lock` still held by a daemon the kernel has killed.
 mod rejoin;
+mod slowseal;
 /// The small-file write path: S3 round trips per close, `back` for
 /// non-owners.
 mod writepath;
@@ -945,6 +946,12 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "nonowner-op-latency with the shared directory delegated to b (placement off, backups on): the other nodes' ops go to the delegate, and a reply it evaluated behind its own unappended rows is answered from the root's pre-S3 stream of its append, not from S3; every non-owner's median stays under half an S3 round trip except the write-through close of a new chunk",
         requires: &[],
         run: ovh::delegated_op_latency,
+    },
+    Scenario {
+        name: "slow-s3-no-seal",
+        desc: "every S3 request >= 1.5 s (SLOWSEAL_LAT_MS 750 each way), product lease/sync/retry defaults, root lease pinned: three nodes write small files, rename and mkdir for SLOWSEAL_SECS (180) s; no backup ever seals the live holder, the holder keeps its lease and epoch and (almost always) a backup",
+        requires: &[],
+        run: slowseal::slow_s3_no_seal,
     },
     Scenario {
         name: "visibility-s3-latency",

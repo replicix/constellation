@@ -25883,3 +25883,106 @@ still stalls the writer about 1.2–1.6 s (CAS, tail, marker). During a
 backup reconfiguration or commit publish at 300 ms per request, a
 backup sometimes still seals a live holder (`holder silent`, 1.5 s), as
 PROGRESS already notes for M9 under very slow S3.
+
+## Fix: a live holder is no longer sealed under slow S3
+
+Seen during the OVH visibility fix: with every S3 request taking 300 ms
+or more, a backup sometimes stopped hearing from a live, writing holder
+for `CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s) and sealed it ("holder
+silent"). Nothing is lost when that happens, but the holder can no
+longer acknowledge anything until it reconfigures. The new
+`slow-s3-no-seal` scenario reproduces it every time on main `7dfc05b`:
+- at 1.5 s per request, a seal and a lost lease at t+54 s (runs 1 and
+  2) and at t+148 s (the run after the first fix);
+- at 300 ms per request, at t+56–58 s in 3 runs out of 3.
+
+**Root cause 1: the lease renewal waited behind the ship loop**
+(`authority/core/jobs.rs`).
+- A round renews once, right after its upload step, and then ships
+  segments until the journal is empty.
+- With writers on every node and one segment PUT per S3 round trip, the
+  journal never ran dry, so the round never ended. The logs show no
+  renewal for the whole 60 s TTL: acquired at 18:51:25.97, the backup
+  sealed at 18:52:27.2.
+- At expiry the holder stops heartbeating by design, since a TTL
+  takeover is then legitimate, and 1.5 s later its backup sealed it.
+- *Fix:* when a round's segment lands and the renewal is due (half the
+  TTL gone, or `renew_now`), the renewal goes out before the next
+  segment. `Phase::Renew`/`RenewReread` carry `mid_ship`, so the round
+  resumes its ship loop afterwards rather than restarting at the gate.
+  This change is `renew_due`, `issue_renew` and `round_after_renew`.
+
+**Root cause 2: a P2P connection-pool probe cut a live holder's
+appends** (`net/src/endpoint.rs`).
+- Under slow S3 a forward from the backup to the holder stayed
+  unanswered past its timeout, and the pooled b→a connection it used
+  had stopped receiving datagrams. The probe (3 s) found it silent and
+  took the dead-incarnation remedy: it closed every connection to the
+  peer.
+- That included the holder's own a→b connection, which was delivering
+  heartbeat appends in under a millisecond right up to the eviction.
+  The holder's next appends went nowhere until a re-dial 2.3 s later,
+  and the backup sealed it.
+- *Fix:* the probe notes the peer's other connections and their
+  receive counters when it starts. If one of them, to the same remote
+  address (a restarted incarnation listens on a new port), received
+  datagrams during the probe, the peer is alive. In that case only the
+  dead pooled connection is dropped (logged as "replacing only this
+  one"); the full eviction stays for a peer that is silent everywhere.
+
+**Diagnostics:**
+- The driver warns on a core step of 500 ms or more ("slow core step"),
+  because a holder's heartbeats cannot go out during one.
+- The backup traces every append it receives
+  (`constellation_authority::ack_wait`), next to the holder's existing
+  "backup append sent".
+
+**The 1.5 s threshold** stays fixed and is not scaled with S3 latency
+(DESIGN rule: safety never depends on it):
+- Nothing on the heartbeat path touches S3 any more.
+- Backups are chosen within the 5 ms RTT budget, so the window is
+  hundreds of times the link RTT.
+- A longer window would only slow a genuine failover.
+
+One residual stall is visible but does not seal: at 1.5 s per request
+the holder's `ship_landed` → `ack_journal` step sometimes takes
+0.3–0.6 s (fjall write-transaction contention with the uploader and
+publisher), well under the window. It is logged by the new slow-step
+warning and left for the owners of the meta store.
+
+**Tests:**
+- Harness `slow-s3-no-seal` (`scenarios/slowseal.rs`): 1.5 s per S3
+  request, product defaults, placement off, all three nodes writing for
+  180 s. It asserts no seal, an unchanged holder and epoch, and a
+  backup at least 90% of the time.
+- Core unit test `a_renewal_due_mid_ship_goes_out_between_two_segments`.
+- Sim `slow_s3_never_seals_a_live_holder`: backup config, S3 at
+  400–600 ms (a twelfth of the TTL), 3 clients × 40 ops per node, no
+  faults. It asserts 0 seals and 0 takeovers.
+- Both tests fail without the mid-ship renewal: the sim run gave 72
+  seals, 16 backup takeovers and 27 takeovers over 16 seeds, against 0
+  with the fix.
+- `shared_dir_unchecked_fast_path_is_caught` (a negative control) was
+  widened from 10 to 60 seeds. The new schedule moved which seeds hit
+  its window (4 of 60 now); it still catches the bug.
+
+**Results** (prefix `constellation-harness-slowseal`):
+- `slow-s3-no-seal`:
+  - 1.5 s per request, before any fix: seal at t+54 s, 2 of 2 runs.
+  - After the renewal fix only: seal at t+148 s, the P2P eviction path.
+  - With both fixes: 8 of 8 runs of 180 s with no seal, 3 of them
+    with the final version of the pool fix (the same-address check).
+    The holder kept its epoch and had a backup the whole time, 307–315
+    ops per run.
+  - 300 ms per request: 1 of 1 run of 150 s passed.
+- Unit tests of cli, net and authority pass. The authority `long_*`
+  sweeps pass: `long_backup`, `long_backup_hot`, `long_random`,
+  `long_delegated`, `long_strict`, `long_flex` and `long_locks`.
+- Neighbouring scenarios pass: `backup-failover`, `backup-departs`,
+  `backup-partition`, `backup-failover-with-delegation`,
+  `forwarded-mutations`, `nonowner-op-latency`, `lease-handover`,
+  `p2p-handover` and `holder-kill-rejoin`.
+- `visibility-s3-latency` passed 4 of 5. The one failure was the
+  phase-switch lease offer the previous entry notes (a released to b
+  while a was writing, then took the lease back through S3). That race
+  is unrelated to this change and still open.

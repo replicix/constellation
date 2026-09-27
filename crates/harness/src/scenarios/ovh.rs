@@ -363,7 +363,7 @@ pub fn concurrent_create_no_excl(_seed: u64) -> Result<()> {
     result
 }
 
-fn keep_logs(scenario: &str, clients: &[Client]) {
+pub(super) fn keep_logs(scenario: &str, clients: &[Client]) {
     let dir = std::env::temp_dir().join(format!("harness-{scenario}-logs-{}", super::ts()));
     if std::fs::create_dir_all(&dir).is_ok() {
         for c in clients {

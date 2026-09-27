@@ -525,6 +525,96 @@ fn a_holders_handoff_queues_behind_the_round_then_flushes_and_releases() {
     assert!(h.core.job().is_none());
 }
 
+/// Slow S3 (slow-s3-no-seal): a round ships until the journal is empty,
+/// and with writes arriving faster than one segment PUT that is never.
+/// The lease was renewed only as a round opened, so under a live,
+/// writing holder it lapsed, its backups stopped hearing from it at
+/// expiry and sealed it. A renewal that comes due between two segments
+/// goes out before the next segment, and the ship loop resumes after it.
+#[test]
+fn a_renewal_due_mid_ship_goes_out_between_two_segments() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let submit = |h: &mut Harness, seq: u64, name: &str| {
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid: h.rid(seq),
+            op: h.create(name),
+        });
+        assert!(matches!(
+            replies(&out)[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ));
+    };
+    submit(&mut h, 1, "a");
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let out = h.step(Event::Timer { id: poll });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the round uploads first");
+    let mut out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    // Tail (nothing new) until the round ships its first segment.
+    let first = loop {
+        let (op, req) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+            .expect("the round issues S3 requests");
+        match req {
+            S3Op::SegmentPut { .. } => break op,
+            S3Op::SegmentRun { .. } => {
+                out = h.step(Event::S3 {
+                    op,
+                    result: S3Result::SegmentRun(Ok(Vec::new())),
+                })
+            }
+            S3Op::SegmentGap { .. } => {
+                out = h.step(Event::S3 {
+                    op,
+                    result: S3Result::SegmentGap(Ok(None)),
+                })
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    // While that PUT is slow, more is written and half the TTL goes by.
+    submit(&mut h, 2, "b");
+    h.advance(6_000);
+    let out = h.step(Event::S3 {
+        op: first,
+        result: S3Result::SegmentPut(Ok(())),
+    });
+    let (renew, req) = s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+        .expect("an S3 request after the segment");
+    assert!(
+        matches!(req, S3Op::LeaseSwap { lease, .. } if !lease.released),
+        "the renewal goes out before the next segment: {req:?}"
+    );
+    let expires_before = h.core.lease().held.as_ref().unwrap().0.expires_unix_ms;
+    let out = h.step(Event::S3 {
+        op: renew,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    assert!(h.core.lease().held.as_ref().unwrap().0.expires_unix_ms > expires_before);
+    assert_eq!(h.core.job(), Some(JobKind::Round), "the round goes on");
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::SegmentPut { .. })),
+        "and ships what was written meanwhile: {out:?}"
+    );
+}
+
 #[test]
 fn a_lost_renewal_deposes_and_the_round_recovers() {
     let mut h = Harness::new(1);
