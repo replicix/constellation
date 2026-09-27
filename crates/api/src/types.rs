@@ -694,6 +694,21 @@ pub struct S3RequestStatus {
     pub copy: u64,
     #[serde(default)]
     pub by_area: std::collections::BTreeMap<String, u64>,
+    /// Requests that failed other than as an error of the request itself
+    /// (see `last_answered_unix_ms`): a transport error or timeout after
+    /// the client's own retries, a 5xx, a refusal.
+    #[serde(default)]
+    pub unanswered: u64,
+    /// When S3 last answered a request (unix ms; 0: never) — a success,
+    /// or an error of the request itself (not found, a failed
+    /// precondition), which proves the path works as well.
+    #[serde(default)]
+    pub last_answered_unix_ms: i64,
+    /// When a request last went unanswered (unix ms; 0: never), and why.
+    #[serde(default)]
+    pub last_unanswered_unix_ms: i64,
+    #[serde(default)]
+    pub last_unanswered_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

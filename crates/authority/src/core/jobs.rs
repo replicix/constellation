@@ -314,9 +314,7 @@ impl Core {
                 return;
             };
             match req {
-                JobReq::Round { poll_triggered } => {
-                    self.begin_round(now, poll_triggered, replica, out)
-                }
+                JobReq::Round { poll_triggered } => self.begin_round(poll_triggered, out),
                 JobReq::Acquire {
                     reason,
                     ask_handoff,
@@ -1371,13 +1369,7 @@ impl Core {
 
     // ---- the round ----
 
-    fn begin_round(
-        &mut self,
-        now: Ms,
-        poll_triggered: bool,
-        replica: &dyn Replica,
-        out: &mut Vec<Action>,
-    ) {
+    fn begin_round(&mut self, poll_triggered: bool, out: &mut Vec<Action>) {
         self.nudged = false;
         tracing::trace!(node = self.cfg.node_id, poll_triggered, "round begins");
         self.job = Some(Job {
@@ -1397,19 +1389,21 @@ impl Core {
         if self.epoch.open {
             // A continuation epoch is open: writes are local, nothing
             // ships; the round only probes whether S3 is back. Frozen (a
-            // member is missing), only the hold's owner probes: when S3
-            // is back it flushes and closes like an active epoch's holder
+            // member is missing) or not, every member probes: the hold's
+            // owner flushes and closes like an active epoch's holder
             // would (plan 30 §M10 — a member that never returns must not
             // keep the journal out of S3 forever; the flush's re-claim
             // CAS is the arbiter, and it fails if an admin leave fenced
-            // the lease).
-            // (A frozen epoch that carries no lease has no hold owner:
-            // every member probes, or nobody would ever close it — the
-            // follow-up (d) hang: S3 back, the cluster frozen for good.)
-            if self.epoch.frozen && !self.lease.epoch_held() && self.pr.carried.is_some() {
-                self.finish_round(now, None, replica, out);
-                return;
-            }
+            // the lease), and a member closes once the carried lease has
+            // moved (`epoch_carrier_checked`), which it learns only by
+            // asking S3. (Fix "S3 client recovery after a cut": a frozen
+            // member used to skip its probe, so it stayed in the epoch —
+            // applying nothing, its stream from the owner ended by the
+            // close — until the missing member returned and unfroze it:
+            // `epoch-member-dies-with-chunk`'s B.) A frozen epoch that
+            // carries no lease has no hold owner either: every member
+            // probes, or nobody would ever close it (the follow-up (d)
+            // hang: S3 back, the cluster frozen for good).
             self.set_phase(
                 Phase::Tail {
                     then: TailThen::EpochProbe,
@@ -2746,6 +2740,12 @@ impl Core {
         match (phase, result) {
             // ---- tails ----
             (Phase::Tail { then }, S3Result::SegmentRun(Ok(run))) => {
+                // S3 answered: a round's failure from before (an outage)
+                // is not the state any more, even when the tail finds
+                // nothing new. (`status.spool.last_ship_error` kept a cut's
+                // "error sending request" for minutes on a node at head,
+                // which read as an S3 client that never recovered.)
+                self.ship.last_error = None;
                 let empty = run.is_empty();
                 match self.apply_run(now, run, replica, out) {
                     Ok(true) => self.issue_tail(out),

@@ -496,7 +496,12 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
 ///   operator. A fresh node reading the bucket never sees a manifest
 ///   naming a chunk S3 lacks (that read would fail);
 /// - B keeps both manifests as speculation (`speculation.outstanding`),
-///   so nothing B publishes contains them.
+///   so nothing B publishes contains them;
+/// - B converges promptly, C still away (fix "S3 client recovery after a
+///   cut, and stream resubscription after an epoch"): its S3 client
+///   answers right after the heal (its chunk-fetch burst met the cut),
+///   its frozen epoch closes once A's flush moved the carried lease, it
+///   applies A's write, and it follows A's stream again.
 ///
 /// Then, by the seed's parity: C comes back — its chunks go up, A ships
 /// the manifests, and every node (the fresh one included) reads both
@@ -624,6 +629,10 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
     // S3 returns for A and B; C stays gone.
     pa.heal();
     pb.heal();
+    let healed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let healed = Instant::now();
     eventually(
         "A's epoch closes with the manifests deferred",
         Duration::from_secs(120),
@@ -639,9 +648,15 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
             Ok(())
         },
     )?;
-    eventually("B's epoch closes", Duration::from_secs(120), || {
+    // Closed, not merely frozen (a frozen member's epoch is inactive but
+    // open): B learns from S3 that A's flush moved the carried lease.
+    eventually("B's epoch closes", Duration::from_secs(60), || {
         let s = b.control_status()?;
-        anyhow::ensure!(s["epoch"]["active"] != true, "B: {}", s["epoch"]);
+        anyhow::ensure!(
+            s["epoch"]["active"] != true && s["epoch"]["epoch_id"].is_null(),
+            "B: {}",
+            s["epoch"]
+        );
         anyhow::ensure!(
             s["speculation"]["outstanding"].as_u64().unwrap_or(0) > 0,
             "B no longer holds C's manifests as speculation: {}",
@@ -742,26 +757,92 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
         anyhow::ensure!(got == after, "D has {} bytes of c/after-close", got.len());
         Ok(())
     })?;
-    let pb_at_heal = pb.tally().total();
-    // B's own view of it is reported, not asserted: after the cut and
-    // heal B's S3 client can stay wedged for minutes (every request
-    // fails "error sending request" while its proxy relays them), and B
-    // holds no stream from A after A's flush — a finding outside this
-    // fix (the old scenario never needed B's S3 after the heal). B still
-    // holds C's manifests as speculation.
-    match std::fs::read(b.mnt.join("c/after-close")) {
-        Ok(got) if got == after => eprintln!("    {NAME}: B has A's write already"),
-        other => {
-            let sb = b.control_status()?;
-            eprintln!(
-                "    {NAME}: B without A's write yet ({other:?}): spool {} speculation {} proxy \
-                 relayed {} since the heal",
-                sb["spool"],
-                sb["speculation"],
-                pb.tally().total().saturating_sub(pb_at_heal)
+    // Fix "S3 client recovery after a cut, and stream resubscription
+    // after an epoch": B converges promptly after the heal, while C is
+    // still away. Its S3 client answers again at once (its chunk-fetch
+    // burst for C's file met the cut: nothing of that may linger), its
+    // epoch closes once A's flush has moved the carried lease (a frozen
+    // member used to skip the probe that learns it, and stayed in the
+    // epoch until C returned), it applies A's write, and it follows A's
+    // stream again (A ended it at the close).
+    let b_view = |b: &Client| -> String {
+        b.control_status()
+            .map(|s| {
+                format!(
+                    "epoch {} spool {} log_stream {} s3 {{unanswered {}, last answered {}, \
+                     last unanswered {} {}}}; its relay counted {} requests",
+                    s["epoch"],
+                    s["spool"],
+                    s["log_stream"],
+                    s["s3"]["unanswered"],
+                    s["s3"]["last_answered_unix_ms"],
+                    s["s3"]["last_unanswered_unix_ms"],
+                    s["s3"]["last_unanswered_error"],
+                    pb.tally().total()
+                )
+            })
+            .unwrap_or_else(|e| format!("status: {e:#}"))
+    };
+    eventually(
+        "B's S3 client answers after the heal",
+        Duration::from_secs(20),
+        || {
+            let s = b.control_status()?;
+            let answered = s["s3"]["last_answered_unix_ms"].as_i64().unwrap_or(0);
+            anyhow::ensure!(answered > healed_at, "B: {}", b_view(&b));
+            Ok(())
+        },
+    )?;
+    eventually(
+        "B has A's write after the close, with C away",
+        Duration::from_secs(30),
+        || {
+            let got = std::fs::read(b.mnt.join("c/after-close"))
+                .with_context(|| format!("B: {}", b_view(&b)))?;
+            anyhow::ensure!(
+                got == after,
+                "B has {} bytes of c/after-close: {}",
+                got.len(),
+                b_view(&b)
             );
-        }
+            Ok(())
+        },
+    )?;
+    eventually(
+        "B follows A's stream again after the close",
+        Duration::from_secs(30),
+        || {
+            let s = b.control_status()?;
+            anyhow::ensure!(
+                s["log_stream"]["upstream"].as_u64() == Some(a_id)
+                    && s["log_stream"]["live"] == true,
+                "B: {}",
+                b_view(&b)
+            );
+            Ok(())
+        },
+    )?;
+    {
+        let s = b.control_status()?;
+        let failed_at = s["s3"]["last_unanswered_unix_ms"].as_i64().unwrap_or(0);
+        // What was in flight at the heal fails within its retry budget
+        // (2 s); nothing may fail after that.
+        anyhow::ensure!(
+            failed_at < healed_at + 10_000,
+            "B's S3 requests still fail after the heal: {}",
+            b_view(&b)
+        );
+        anyhow::ensure!(
+            s["spool"]["last_ship_error"].is_null(),
+            "B still reports a ship error: {}",
+            b_view(&b)
+        );
     }
+    eprintln!(
+        "    {NAME}: B converged {:.1}s after the heal: {}",
+        healed.elapsed().as_secs_f64(),
+        b_view(&b)
+    );
     anyhow::ensure!(
         b.control_status()?["speculation"]["outstanding"]
             .as_u64()
@@ -845,7 +926,7 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
         // in the log, so its own copies roll back like B's streamed ones.
         c.resume()?;
         pc.heal();
-        for x in [&a, &c, &d] {
+        for x in [&a, &b, &c, &d] {
             eventually(
                 &format!("{} converges on the dropped files", x.name),
                 Duration::from_secs(120),
@@ -874,12 +955,7 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
                 },
             )?;
         }
-        let sb = b.control_status()?;
-        eprintln!(
-            "    {NAME}: B after the drop: spool {} speculation {}",
-            sb["spool"], sb["speculation"]
-        );
-        ensure_no_conflicts(&[&c, &d])?;
+        ensure_no_conflicts(&[&b, &c, &d])?;
     }
     for x in [&mut a, &mut b, &mut c, &mut d] {
         x.unmount()?;

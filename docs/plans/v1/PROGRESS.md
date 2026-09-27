@@ -26189,6 +26189,7 @@ static mutex while they run.
 - Scenarios (prefix `constellation-harness-epochcap`):
   `epoch-member-dies-with-chunk` seed 42 (C returns) and seed 43
   (`drop-held --remote`) pass, 43–44 s each.
+
 ## Fix: placement no longer flips the lease away from the active writer
 
 `visibility-s3-latency` failed about one run in five with a lease flip at
@@ -26280,3 +26281,156 @@ The driver's "slow core step" warning (≥ 500 ms) stays to catch it.
   `sticky-lease-handoff-over-s3`, `auto-placement`, `backup-failover`
   and `slow-s3-no-seal`.
 - clippy (`-D warnings`) and fmt are clean.
+
+## Fix: S3 client recovery after a cut, and stream resubscription after an epoch
+
+Base: `451b4bd` (written on `2ff95df`, rebased over `451b4bd`; no
+code conflict). Follow-up to the finding in "Fix: capture under an epoch
+hold" §5: in `epoch-member-dies-with-chunk`, after the cut and heal, B
+(a member; C, the third member, is paused) looked like its S3 client
+stayed wedged for minutes, and held no log stream from A after A's
+close flush, so it applied nothing new until C returned.
+
+### 1. The "wedged S3 client" was neither the client nor the relay
+
+Reproduced on the unfixed code (seed 42, `RUST_LOG` with
+`constellation_authority::stream=debug`, `CHAOS_KEEP_TMP=1`), B's log
+after the heal has no transport error at all: its last "error sending
+request" is from inside the cut; its registry LISTs (every ~6 s) and the
+coop fetch's S3 GET of C's chunk (a 404) are answered right after the
+heal. What looked like a wedge was two things:
+
+- `status.spool.last_ship_error` is sticky: it is set by a failed round
+  and cleared only when a segment is applied or shipped. B's only failed
+  round was inside the cut (`tailing: … error sending request`), and B
+  applied nothing afterwards (below), so its status kept that error for
+  as long as the scenario looked — minutes.
+- B made almost no S3 requests after the heal, because its rounds did
+  not probe S3 at all (§2), so "B's proxy relayed N" did not move either.
+
+To settle the product-vs-harness question directly,
+`crates/harness/tests/s3_cut_heal.rs` runs the daemons' own S3 client
+(`configure_s3_client`: object_store's S3 client with the daemons' retry
+policy; the harness's retry budget of 2 retries / 2 s) through the
+harness's counting relay (`CountingProxy`) against a keep-alive HTTP
+stand-in, with a warm pool of 15 idle connections and a 15-way GET burst
+in flight when the fault comes:
+
+- `a_cut_in_the_middle_of_a_burst_heals_at_once`: the cut kills the
+  burst; while cut, 15 more GETs fail fast and the relay counts and
+  forwards none of them; after `heal()` the next 15-way burst succeeds in
+  full (~10 ms) and every request is counted and served upstream, and so
+  does the one after it (on the refilled pool);
+- `a_black_hole_in_the_middle_of_a_burst_heals_at_once`: the same with
+  `blackhole()` (a firewall DROP): the stalled burst stays stalled, the
+  heal closes what sat in the hole, the stalled requests return at once,
+  and the next bursts succeed in full.
+
+So the relay models a cut and a heal faithfully (new connections refused
+while cut, relayed after; old connections closed), and the client keeps
+nothing across a network failure: object_store has no breaker or backoff
+state between requests, hyper drops a pooled connection the peer closed,
+and `get_run` spawns its GETs (no cancellation-closed connections).
+`s3-cut-one-node` covers the product client against toxiproxy-level
+black-holing (unchanged, passes).
+
+Changes:
+- `jobs.rs`: a successful S3 tail clears `ship.last_error` (a round that
+  reaches S3 and finds nothing new is not a failing round), so
+  `last_ship_error` names the current state, not the last outage.
+- `status.s3` (`S3RequestStatus`, `backend.rs`) also reports
+  `unanswered` (requests that failed other than as an error of the
+  request itself), `last_answered_unix_ms`, `last_unanswered_unix_ms` and
+  `last_unanswered_error`: "S3 fails now" and "S3 failed once, nothing
+  asked since" are told apart without reading logs.
+- `store_s3::configure_s3_client` (in `aws_auth.rs`): the retry policy
+  (30 s budget, `CONSTELLATION_S3_MAX_RETRIES`,
+  `CONSTELLATION_S3_RETRY_TIMEOUT_MS`) and conditional PUTs moved out of
+  `cli/backend.rs`, so the test above builds exactly the daemons' client.
+
+### 2. A frozen member never probed S3, so it never closed its epoch
+
+The actual defect. C paused, B's epoch is *frozen* (a member is missing:
+writes refuse with EROFS). `Core::begin_round` let only the hold owner
+probe a frozen epoch (`frozen && !epoch_held && carried → finish_round`,
+M10), and the driver mirrored it (a frozen non-owner's upload pass →
+`UploadResult::Skip`). But a member of an epoch carrying a lease closes
+only through its probe: it tails S3, reads the lease object, and closes
+once the carried lease has moved (`epoch_carrier_checked`). So after A's
+flush re-claimed the lease, B stayed in the epoch — applying nothing
+from S3, closing nothing — until C returned and unfroze it (seed 42: A
+closed at 21:10:46, B at 21:10:57, the moment C resumed).
+
+Every member now probes, frozen or not (`begin_round`), and the driver
+runs a frozen member's upload pass (its own chunks, content-addressed;
+the close's complete pass). Safety is unchanged: a member still closes
+only when the lease object is no longer the carried lease, exactly the
+non-frozen rule (flex-crash seed 4309's). If the missing member is the
+hold owner, the carried lease stands and the members stay in the epoch,
+as before — now asking S3 each round, like a non-frozen member.
+
+Test: `a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile`
+now runs for `frozen` false and true (it probes, uploads its own chunks
+while the carried lease stands, closes once it moved).
+
+### 3. A member parked the hold owner's stream at the close
+
+At its close the hold owner stops serving (`release_local`: it holds
+nothing until its flush re-claims the lease), so it ends every
+subscription; the member *parks* it (M7: not asked again until the log
+moves past the head it had then — for an idle holder that let the lease
+go). "The log moved" was read off the member's own cursor only, which
+moves only by applying — from S3 or from the stream it no longer had. A
+member whose S3 cannot show the flush never followed the holder again.
+
+`stream_after_event` now unparks once `max(head_seq, hinted)` passes the
+parking head: a gossip `SegmentPublished` hint of the flush's segment is
+the log moving. After the fix, in the scenario, B resubscribes 0.6 s
+after A's close (its probe tailed A's flush segment), and the stream
+delivers A's later segments (seed 42: seq 4 and 5 applied from the
+stream).
+
+Test: `a_parked_holder_is_asked_again_once_a_hint_shows_the_log_moved`
+(fails without the change).
+
+### 4. `epoch-member-dies-with-chunk` asserts B
+
+B's view is asserted, not reported, with C still away:
+- "B's epoch closes" requires the epoch closed (`epoch_id` gone), not
+  merely inactive (a frozen epoch is inactive), within 60 s of A's close;
+- B's S3 client answers after the heal (`s3.last_answered_unix_ms` past
+  the heal, 20 s);
+- B has A's write after the close (30 s);
+- B follows A's stream again (`log_stream.upstream` A, live; 30 s);
+- nothing of B's goes unanswered later than 10 s after the heal, and
+  `last_ship_error` is clear.
+- The drop-held branch (odd seeds) now also requires B to converge on
+  the dropped files and on A's write, and B has no conflicts.
+
+### Files
+
+`crates/authority/src/core/{jobs,stream,tests}.rs`,
+`crates/cli/src/{authority_driver,backend}.rs`, `crates/api/src/types.rs`,
+`crates/store-s3/src/{aws_auth,lib}.rs`, `crates/harness/Cargo.toml`,
+`crates/harness/tests/s3_cut_heal.rs`,
+`crates/harness/src/scenarios/m10.rs`; docs:
+`durability-and-failover.md` (a frozen member closes after the owner's
+flush; it follows the owner's stream again).
+
+### Results (final code, rebased on `451b4bd`)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) clean.
+- authority lib 129 (new: the parked-holder test; the member-close test
+  runs frozen too); harness lib 14 and `s3_cut_heal` 2; the workspace
+  outside the harness (1279 tests) passes.
+- Sims (release): the CI suite 104 pass; `flex` 0..20000 and
+  `flex-crash` 0..20000 every seed passes (flex-crash: 13 444 dropped
+  for a departed member, all converge); before the rebase also
+  `long_flex` 1000 (flex 1000 + flex-crash 1000, all converge).
+- Scenarios (prefix `constellation-harness-s3wedge`):
+  `epoch-member-dies-with-chunk` seeds 42–47 (both branches) pass,
+  43–48 s each; B converges 6.9–11.9 s after the heal (A's 5 s
+  remote-chunk wait included). Neighbours `s3-cut-one-node`,
+  `continuation-epoch`, `epoch-member-lost`, `coop-fallback`, `chaos-ci`
+  pass. (Before the rebase: 9 more runs of the scenario, seeds 42–47,
+  43, 45, 49, and the same neighbours, all pass.)

@@ -146,7 +146,8 @@ pub(crate) struct StreamState {
     holder_link_up: bool,
     /// A holder that refused or ended a subscription, and the log head
     /// then: it is not asked again until the log has moved past that head
-    /// (someone shipped — it again, or a new holder the tail will name).
+    /// (someone shipped — it again, or a new holder the tail will name),
+    /// as this node's cursor or a gossip hint (`hinted`) shows.
     /// Keeps an idle cluster, whose holder let the lease go, from asking
     /// it every backoff period for ever.
     parked: Option<(NodeId, Seq)>,
@@ -811,7 +812,15 @@ impl Core {
         }
         let mut want = self.stream_upstream();
         if let (Some(w), Some((parked, head))) = (want, self.stream.parked) {
-            if w == parked && self.ship.head_seq <= head {
+            // The log moved past the parking head: this node applied past
+            // it, or a gossip hint names a segment past it. The hint is
+            // all a node without a working S3 path has: a hold owner ends
+            // its streams when its epoch closes (it holds nothing until
+            // its flush re-claims the lease), and a member that could not
+            // tail S3 never asked it again — it applied nothing new until
+            // the epoch's missing member returned
+            // (`epoch-member-dies-with-chunk`'s B).
+            if w == parked && self.ship.head_seq.max(self.stream.hinted) <= head {
                 want = None;
             } else {
                 self.stream.parked = None;

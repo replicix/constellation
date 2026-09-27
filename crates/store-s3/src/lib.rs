@@ -35,7 +35,9 @@ pub(crate) mod scripted_http;
 pub mod snapshot;
 pub mod store;
 
-pub use aws_auth::{amazon_s3_builder, amazon_s3_builder_resolved, S3Resolution};
+pub use aws_auth::{
+    amazon_s3_builder, amazon_s3_builder_resolved, configure_s3_client, S3Resolution,
+};
 
 pub use blobs::BlobStore;
 pub use codec::{Codec, CompressionSetting};

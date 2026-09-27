@@ -234,6 +234,39 @@ pub async fn amazon_s3_builder_resolved(
     Ok((builder, resolution))
 }
 
+/// The request policy every S3 client of a daemon or command gets, on
+/// top of where it points and who it signs as: conditional PUTs by ETag,
+/// and a bounded retry budget.
+///
+/// EC2 finding 1: object_store's default retry budget (180 s) put up to
+/// three minutes of retries on an unreachable S3 behind every request —
+/// including the ones a FUSE operation waits on (a chunk no peer has, a
+/// write-through upload no peer can take over). Every caller has its own
+/// retry loop (sync rounds, uploads, lease renewals), so one request
+/// series gives up after 30 s (`CONSTELLATION_S3_RETRY_TIMEOUT_MS`,
+/// `CONSTELLATION_S3_MAX_RETRIES` override it).
+pub fn configure_s3_client(builder: AmazonS3Builder) -> AmazonS3Builder {
+    let mut retry = object_store::RetryConfig {
+        retry_timeout: Duration::from_secs(30),
+        ..object_store::RetryConfig::default()
+    };
+    if let Some(n) = std::env::var("CONSTELLATION_S3_MAX_RETRIES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+    {
+        retry.max_retries = n;
+    }
+    if let Some(ms) = std::env::var("CONSTELLATION_S3_RETRY_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        retry.retry_timeout = Duration::from_millis(ms);
+    }
+    builder
+        .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
+        .with_retry(retry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

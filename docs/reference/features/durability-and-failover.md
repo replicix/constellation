@@ -411,6 +411,12 @@ Operational rules:
   (as a frozen epoch does) rather than letting them time out as `EIO`.
   Once S3 is back, any member closes it, frozen or not (nothing was
   written under it), and the lease is decided by CAS again.
+- A member of an epoch that carries a lease closes it once S3 is back
+  and the lease object is no longer the carried lease (the hold owner's
+  flush re-claimed it), frozen or not: a missing member (paused, dead)
+  does not keep the others in the epoch after the owner's flush. The
+  owner ends its log streams at the close; a member follows it again as
+  soon as the flush's first segment is announced (gossip) or tailed.
 - A holder whose carried lease reaches it after the lease margin (the
   activation took a moment) still adopts the hold: members promise
   nothing while the epoch is open, so no taker can act on the expiry.

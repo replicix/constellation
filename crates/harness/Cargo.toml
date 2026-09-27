@@ -32,3 +32,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq = { version = "2", features = ["json"] }
 zstd.workspace = true
+
+[dev-dependencies]
+# `tests/s3_cut_heal.rs`: the daemons' own S3 client through the counting
+# relay, across a cut and a heal.
+constellation-store-s3.workspace = true
+object_store.workspace = true
+tokio.workspace = true

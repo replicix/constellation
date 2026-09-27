@@ -55,33 +55,11 @@ pub async fn open_backend_described(url: &str) -> Result<(Arc<dyn ObjectStore>, 
         if bucket.is_empty() {
             bail!("missing bucket in {url:?}");
         }
-        // EC2 finding 1: object_store's default retry budget (180 s) put up
-        // to three minutes of retries on an unreachable S3 behind every
-        // request — including the ones a FUSE operation waits on (a chunk
-        // no peer has, a write-through upload no peer can take over).
-        // Every caller here has its own retry loop (sync rounds, uploads,
-        // lease renewals), so one request series gives up after 30 s.
-        let mut retry = object_store::RetryConfig {
-            retry_timeout: std::time::Duration::from_secs(30),
-            ..object_store::RetryConfig::default()
-        };
-        if let Ok(n) = std::env::var("CONSTELLATION_S3_MAX_RETRIES") {
-            if let Ok(n) = n.parse() {
-                retry.max_retries = n;
-            }
-        }
-        if let Ok(ms) = std::env::var("CONSTELLATION_S3_RETRY_TIMEOUT_MS") {
-            if let Ok(ms) = ms.parse() {
-                retry.retry_timeout = std::time::Duration::from_millis(ms);
-            }
-        }
         let (builder, resolution) = constellation_store_s3::amazon_s3_builder_resolved(bucket)
             .await
             .with_context(|| format!("resolving AWS credentials for {url:?}"))?;
         tracing::debug!(url, %resolution, "S3 backend resolved");
-        let s3 = builder
-            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
-            .with_retry(retry)
+        let s3 = constellation_store_s3::configure_s3_client(builder)
             .build()
             .with_context(|| format!("building S3 client for {url:?}"))?;
         let info = BackendInfo {
@@ -222,20 +200,34 @@ fn completed() {
     );
 }
 
+/// Requests S3 did not answer, and the last one's time and error
+/// (`status.s3`): with [`LAST_COMPLETED_MS`], what tells an S3 path that
+/// fails now from a node that failed once and has not asked since.
+static UNANSWERED: AtomicU64 = AtomicU64::new(0);
+static LAST_UNANSWERED_MS: AtomicI64 = AtomicI64::new(0);
+static LAST_UNANSWERED_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Record a request's outcome: answered (success or a request error such
 /// as not-found or a failed precondition, which proves the path works) or
 /// not.
 fn note<T>(r: &object_store::Result<T>) {
     use object_store::Error as E;
-    if matches!(
-        r,
+    match r {
         Ok(_)
-            | Err(E::NotFound { .. })
-            | Err(E::Precondition { .. })
-            | Err(E::AlreadyExists { .. })
-            | Err(E::NotModified { .. })
-    ) {
-        completed();
+        | Err(E::NotFound { .. })
+        | Err(E::Precondition { .. })
+        | Err(E::AlreadyExists { .. })
+        | Err(E::NotModified { .. }) => completed(),
+        Err(e) => {
+            UNANSWERED.fetch_add(1, Ordering::Relaxed);
+            LAST_UNANSWERED_MS.store(
+                constellation_store_s3::lease::now_unix_ms(),
+                Ordering::Relaxed,
+            );
+            let mut text = e.to_string();
+            text.truncate(400);
+            *LAST_UNANSWERED_ERROR.lock().unwrap() = Some(text);
+        }
     }
 }
 
@@ -255,6 +247,10 @@ pub fn s3_request_counts() -> constellation_api::S3RequestStatus {
         delete: c.delete.load(Ordering::Relaxed),
         copy: c.copy.load(Ordering::Relaxed),
         by_area: c.by_area.lock().unwrap().clone(),
+        unanswered: UNANSWERED.load(Ordering::Relaxed),
+        last_answered_unix_ms: LAST_COMPLETED_MS.load(Ordering::Relaxed),
+        last_unanswered_unix_ms: LAST_UNANSWERED_MS.load(Ordering::Relaxed),
+        last_unanswered_error: LAST_UNANSWERED_ERROR.lock().unwrap().clone(),
     }
 }
 

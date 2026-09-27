@@ -1685,10 +1685,6 @@ impl Driver {
                     let sync_tx = self.sync_tx.clone();
                     let bulk = self.bulk_pass.clone();
                     let wait = self.round_upload_wait;
-                    // Plan 30 §M10: a frozen epoch's hold owner still
-                    // flushes once S3 is back (the core only runs the
-                    // upload for it after its probe found S3).
-                    let holds = self.core.lease().epoch_held();
                     tokio::spawn(async move {
                         if round && crate::fault::sync_held() {
                             let _ = tx.send(Internal::Event(Event::UploadsDone {
@@ -1700,15 +1696,14 @@ impl Driver {
                         if round && epochs.is_open() {
                             epochs.check_liveness().await;
                             let _ = sync_tx.send(SyncRequest::EpochChanged);
-                            // (A frozen epoch that carries no lease has no
-                            // hold owner: its members flush and close it.)
-                            if epochs.is_frozen() && !holds && epochs.carrier().0.is_some() {
-                                let _ = tx.send(Internal::Event(Event::UploadsDone {
-                                    op,
-                                    result: UploadResult::Skip,
-                                }));
-                                return;
-                            }
+                            // Plan 30 §M10: frozen or not, the core runs
+                            // an epoch round's upload only once its probe
+                            // found S3 — the hold owner's to flush, a
+                            // member's to upload its own chunks and to
+                            // close once the carried lease has moved
+                            // (`epoch_carrier_checked`). A frozen member's
+                            // pass used to be skipped here, so it closed
+                            // only once the missing member returned.
                         }
                         let result = if ino.is_none() {
                             bulk.run(upload, tx.clone(), complete, wait).await

@@ -2525,6 +2525,50 @@ fn serving_follows_the_lease() {
         .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::LogStreamEnd { refused: true, .. })));
 }
 
+/// A holder that ended the stream (its epoch closed: it holds nothing
+/// until its flush re-claims the lease) is not asked again until the log
+/// moves — and a gossip hint of its next segment is that move, for a
+/// subscriber whose own S3 tail cannot show it. Before, only the
+/// subscriber's own cursor unparked it: without S3 it never followed the
+/// holder again (`epoch-member-dies-with-chunk`'s B, after the close).
+#[test]
+fn a_parked_holder_is_asked_again_once_a_hint_shows_the_log_moved() {
+    let (_holder, mut sub, req) = stream_pair();
+    let subscribes = |out: &[Action]| {
+        sends(out)
+            .iter()
+            .filter(|(to, m)| *to == 1 && matches!(m, PeerMsg::LogSubscribe { .. }))
+            .count()
+    };
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::LogStreamEnd {
+            req,
+            refused: false,
+        },
+    });
+    assert_eq!(sub.core.stream_view().upstream, 0, "the stream is gone");
+    // Parked: past every backoff, nothing new in the log, no resubscribe.
+    sub.advance(sub.core.config().stream_retry_max_ms + 1);
+    let out = sub.step(Event::Peers { links: Vec::new() });
+    assert_eq!(subscribes(&out), 0, "asked a parked holder again: {out:?}");
+    // The holder shipped its next segment (the flush): the hint names it.
+    let next = sub.core.ship().next_seq;
+    let out = sub.step(Event::Peer {
+        from: 0,
+        msg: PeerMsg::SegmentPublished {
+            seq: next,
+            epoch: 1,
+        },
+    });
+    assert_eq!(
+        subscribes(&out),
+        1,
+        "the log moved, but the holder is not asked again: {out:?}"
+    );
+    assert_eq!(sub.core.stream_view().upstream, 1);
+}
+
 /// With one node there is nobody to stream from or to.
 #[test]
 fn a_lone_node_never_subscribes() {
@@ -7296,93 +7340,100 @@ fn a_hold_owner_with_nothing_to_flush_reclaims_the_carried_lease_at_the_close() 
 /// pending chunks and closes nothing (`continuation-epoch`: a write it
 /// forwarded left its chunks here, and the holder's flush waits for them
 /// before it publishes — each used to wait for the other for 60 s).
+/// The same holds while the epoch is frozen.
 #[test]
 fn a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile() {
-    let open = |h: &mut Harness, expires: i64| {
-        h.step(Event::Control {
-            op: OpId(1 << 40),
-            req: Control::Epoch {
-                open: true,
-                active: true,
-                frozen: false,
-                flushing: false,
-                base: 0,
-                members: vec![1, 2],
-                carrier: Some(crate::event::Carrier {
-                    node: 1,
-                    epoch: 1,
-                    expires_unix_ms: expires,
-                }),
-                stale_below: 1,
-            },
-        });
-        assert!(!h.core.lease.epoch_held(), "node 1 carries the epoch");
-        let mut out = Vec::new();
-        h.core.start(h.now, &h.meta, &mut out);
-        let poll = timers(&out, TimerKind::Poll)[0];
-        let out = h.step(Event::Timer { id: poll });
-        let probe = s3_ops(&out)
-            .into_iter()
-            .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
-            .map(|(op, _)| op)
-            .unwrap_or_else(|| panic!("the open epoch is not probed: {out:?}"));
+    // Frozen too (a member is missing): a frozen member used to skip
+    // its probe, so it never learned the carrier had moved and stayed in
+    // the epoch until the missing member returned
+    // (`epoch-member-dies-with-chunk`'s B).
+    for frozen in [false, true] {
+        let open = |h: &mut Harness, expires: i64| {
+            h.step(Event::Control {
+                op: OpId(1 << 40),
+                req: Control::Epoch {
+                    open: true,
+                    active: true,
+                    frozen,
+                    flushing: false,
+                    base: 0,
+                    members: vec![1, 2],
+                    carrier: Some(crate::event::Carrier {
+                        node: 1,
+                        epoch: 1,
+                        expires_unix_ms: expires,
+                    }),
+                    stale_below: 1,
+                },
+            });
+            assert!(!h.core.lease.epoch_held(), "node 1 carries the epoch");
+            let mut out = Vec::new();
+            h.core.start(h.now, &h.meta, &mut out);
+            let poll = timers(&out, TimerKind::Poll)[0];
+            let out = h.step(Event::Timer { id: poll });
+            let probe = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::SegmentRun { .. }))
+                .map(|(op, _)| op)
+                .unwrap_or_else(|| panic!("the open epoch is not probed: {out:?}"));
+            let out = h.step(Event::S3 {
+                op: probe,
+                result: S3Result::SegmentRun(Ok(Vec::new())),
+            });
+            s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| matches!(r, S3Op::LeaseGet))
+                .map(|(op, _)| op)
+                .unwrap_or_else(|| panic!("S3 is back but the lease is not read: {out:?}"))
+        };
+        let upload_of = |out: &[Action]| {
+            out.iter()
+                .find_map(|a| match a {
+                    Action::UploadDirtyChunks { op, complete, .. } => Some((*op, *complete)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no upload pass: {out:?}"))
+        };
+        // The carried lease still stands: upload, close nothing.
+        let mut h = Harness::new(2);
+        let expires = h.now.0 + 20_000;
+        let get = open(&mut h, expires);
+        let object = lease_of(1, 1, expires);
         let out = h.step(Event::S3 {
-            op: probe,
-            result: S3Result::SegmentRun(Ok(Vec::new())),
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((object, tag())))),
         });
-        s3_ops(&out)
-            .into_iter()
-            .find(|(_, r)| matches!(r, S3Op::LeaseGet))
-            .map(|(op, _)| op)
-            .unwrap_or_else(|| panic!("S3 is back but the lease is not read: {out:?}"))
-    };
-    let upload_of = |out: &[Action]| {
-        out.iter()
-            .find_map(|a| match a {
-                Action::UploadDirtyChunks { op, complete, .. } => Some((*op, *complete)),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no upload pass: {out:?}"))
-    };
-    // The carried lease still stands: upload, close nothing.
-    let mut h = Harness::new(2);
-    let expires = h.now.0 + 20_000;
-    let get = open(&mut h, expires);
-    let object = lease_of(1, 1, expires);
-    let out = h.step(Event::S3 {
-        op: get,
-        result: S3Result::LeaseGet(Ok(Some((object, tag())))),
-    });
-    let (upload, complete) = upload_of(&out);
-    assert!(!complete, "only this node's own chunks");
-    let out = h.step(Event::UploadsDone {
-        op: upload,
-        result: UploadResult::Done { held: 0 },
-    });
-    assert!(
-        !out.iter().any(|a| matches!(a, Action::EpochClose)),
-        "closed while the carrier may still hold the epoch: {out:?}"
-    );
-    assert!(h.core.epoch.open, "the epoch stays open");
-    // The holder re-claimed it (a new expiry): the epoch is over.
-    let mut h = Harness::new(2);
-    let expires = h.now.0 + 20_000;
-    let get = open(&mut h, expires);
-    let object = lease_of(1, 1, expires + 7_000);
-    let out = h.step(Event::S3 {
-        op: get,
-        result: S3Result::LeaseGet(Ok(Some((object, tag())))),
-    });
-    let (upload, complete) = upload_of(&out);
-    assert!(complete, "the closing round's complete pass");
-    let out = h.step(Event::UploadsDone {
-        op: upload,
-        result: UploadResult::Done { held: 0 },
-    });
-    assert!(
-        out.iter().any(|a| matches!(a, Action::EpochClose)),
-        "the epoch is not closed: {out:?}"
-    );
+        let (upload, complete) = upload_of(&out);
+        assert!(!complete, "only this node's own chunks");
+        let out = h.step(Event::UploadsDone {
+            op: upload,
+            result: UploadResult::Done { held: 0 },
+        });
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::EpochClose)),
+            "closed while the carrier may still hold the epoch: {out:?}"
+        );
+        assert!(h.core.epoch.open, "the epoch stays open");
+        // The holder re-claimed it (a new expiry): the epoch is over.
+        let mut h = Harness::new(2);
+        let expires = h.now.0 + 20_000;
+        let get = open(&mut h, expires);
+        let object = lease_of(1, 1, expires + 7_000);
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((object, tag())))),
+        });
+        let (upload, complete) = upload_of(&out);
+        assert!(complete, "the closing round's complete pass");
+        let out = h.step(Event::UploadsDone {
+            op: upload,
+            result: UploadResult::Done { held: 0 },
+        });
+        assert!(
+            out.iter().any(|a| matches!(a, Action::EpochClose)),
+            "the epoch is not closed: {out:?}"
+        );
+    }
 }
 
 /// EC2 follow-up (e): a candidate backup that answers `sealed` for the
