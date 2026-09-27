@@ -98,6 +98,41 @@ impl Drop for PendingLocalOpGuard {
 }
 
 thread_local! {
+    static PENDING_OBSERVED: std::cell::RefCell<Option<Vec<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Fix "capture under an epoch hold": the `ns` keys a transaction that
+/// writes nothing *observed* — a refusal's op looked at its names and
+/// inodes and was refused because of what it found. Recorded in its
+/// `journal_tx` row (`JournalTx::observed`) so the ship plan keeps it
+/// behind a deferred or held transaction that touched them: shipped
+/// ahead, the log carried a refusal its own prefix could not explain
+/// (flex-crash seed 481: `rename f2 f3` refused `ENOENT` at a log
+/// position where `f2` existed, the rename that took it away deferred
+/// behind a departed member's chunk). Same thread-local scoping as
+/// [`PendingLocalOp`]; never an op to replay.
+pub(crate) struct PendingObserved;
+
+impl PendingObserved {
+    pub(crate) fn set(keys: Vec<Vec<u8>>) -> PendingObservedGuard {
+        PENDING_OBSERVED.with(|c| *c.borrow_mut() = Some(keys));
+        PendingObservedGuard
+    }
+
+    pub(crate) fn take() -> Option<Vec<Vec<u8>>> {
+        PENDING_OBSERVED.with(|c| c.borrow_mut().take())
+    }
+}
+
+pub(crate) struct PendingObservedGuard;
+
+impl Drop for PendingObservedGuard {
+    fn drop(&mut self) {
+        PENDING_OBSERVED.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+thread_local! {
     static PENDING_DELEGATE: std::cell::Cell<Option<PendingDelegate>> = const { std::cell::Cell::new(None) };
 }
 

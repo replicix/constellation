@@ -9,6 +9,7 @@
 //! `Core::handle`; results come back through the node's event queue.
 
 use super::bus::Bus;
+use super::chunks::ChunkWorld;
 use super::clock::Clock;
 use super::store::Bucket;
 use constellation_authority::action::ControlOk;
@@ -73,6 +74,7 @@ pub struct CoreView {
     pub lost: bool,
     pub gate_pending: bool,
     pub job: Option<constellation_authority::core::JobKind>,
+    pub job_phase: Option<String>,
     pub clients_in_flight: usize,
     pub next_seq: Seq,
     pub events_handled: u64,
@@ -181,6 +183,8 @@ pub struct NodeEnv {
     /// seeded constant per node.
     pub clock_skew_ms: i64,
     pub seed: u64,
+    /// Fix "capture under an epoch hold": the modelled chunks.
+    pub world: Arc<ChunkWorld>,
 }
 
 impl NodeEnv {
@@ -240,12 +244,15 @@ impl NodeHandle {
             in_doubt: env.in_doubt.clone(),
         });
         env.bus.attach(id, tx.clone());
+        env.world.register(id, meta.clone());
         let cfg = (env.config)(id, incarnation);
         let driver = Driver {
             id,
             meta: meta.clone(),
             core: Core::new(cfg),
             store: env.bucket.handle(id),
+            bucket: env.bucket.clone(),
+            world: env.world.clone(),
             bus: env.bus.clone(),
             clock: env.clock_of(id),
             tx: tx.clone(),
@@ -339,6 +346,8 @@ struct Driver {
     meta: Arc<Meta>,
     core: Core,
     store: Arc<dyn object_store::ObjectStore>,
+    bucket: Arc<Bucket>,
+    world: Arc<ChunkWorld>,
     bus: Arc<Bus>,
     clock: Clock,
     tx: mpsc::UnboundedSender<Event>,
@@ -511,6 +520,7 @@ impl Driver {
                     .filter(|k| k.contains("Lock")),
                 _ => None,
             };
+            self.before_core(&event);
             let actions = self.core.handle(now, event, &*self.meta);
             if debug && (debug_event.contains("Lock") || lock_timer.is_some()) {
                 let debug_event = match &lock_timer {
@@ -629,6 +639,7 @@ impl Driver {
         view.lost = lease.lost;
         view.gate_pending = lease.gate.is_some();
         view.job = self.core.job();
+        view.job_phase = self.core.job_phase();
         view.clients_in_flight = self.core.clients().count();
         view.next_seq = self.core.ship().next_seq;
         view.events_handled += 1;
@@ -767,9 +778,13 @@ impl Driver {
                     self.timers.remove(&id);
                     self.timer_kinds.remove(&id);
                 }
-                Action::UploadDirtyChunks { op, .. } => {
-                    // No chunks in this simulation: every upload pass is
-                    // immediately complete and holds nothing back.
+                Action::UploadDirtyChunks { op, ino, .. } => {
+                    // The modelled pass (`chunks.rs`): this node's own
+                    // dirty chunks go up when S3 is reachable, remote rows
+                    // are acked once their chunk is there; nothing is
+                    // ever unrecoverable, so nothing is held back.
+                    self.world
+                        .upload_pass(self.id, &self.meta, ino, !self.bucket.is_cut(self.id));
                     let _ = self.tx.send(Event::UploadsDone {
                         op,
                         result: UploadResult::Done { held: 0 },
@@ -875,9 +890,29 @@ impl Driver {
         }
     }
 
+    /// What the daemon does around the core for a forwarded manifest
+    /// (`authority_driver.rs`, the `MutateRequest` arm): the chunks still
+    /// pending on the sender are enrolled here, before the op executes.
+    fn before_core(&self, event: &Event) {
+        if let Event::Peer {
+            from,
+            msg:
+                PeerMsg::MutateRequest {
+                    op: MutateOp::SetManifest { ino, manifest, .. },
+                    ..
+                },
+        } = event
+        {
+            self.world
+                .enroll_forwarded(&self.meta, *from, *ino, manifest);
+        }
+    }
+
     fn spawn_s3(&self, op: OpId, req: S3Op) {
         let store = self.store.clone();
         let tx = self.tx.clone();
+        let world = self.world.clone();
+        let id = self.id;
         tokio::spawn(async move {
             let leases = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
             let log = LogStore::new(store.clone());
@@ -892,6 +927,7 @@ impl Driver {
                     S3Result::LeasePut(leases.try_swap(&lease, &tag).await.map_err(cas_failure))
                 }
                 S3Op::SegmentPut { seq, payload } => {
+                    world.check_segment(id, seq, &payload);
                     S3Result::SegmentPut(log.put_segment(seq, &payload).await.map_err(cas_failure))
                 }
                 S3Op::SegmentRun { from, width } => S3Result::SegmentRun(

@@ -1174,6 +1174,19 @@ impl Core {
         Ok(())
     }
 
+    /// The job's phase, for diagnostics (the simulation's quiescence
+    /// report): its `Debug` form, without payloads.
+    pub fn job_phase(&self) -> Option<String> {
+        self.job.as_ref().map(|j| {
+            let text = format!("{:?}", j.phase);
+            text.split(['{', '('])
+                .next()
+                .unwrap_or(&text)
+                .trim()
+                .to_string()
+        })
+    }
+
     /// `LeaseKeeper::mark_lost` plus what the keeper's callers do next.
     /// Plan 30 §M9: every acknowledgement parked for durability is
     /// answered as not given (the requester retries by rid).
@@ -1781,9 +1794,23 @@ impl Core {
         }
         if backlog > 0 {
             // Force the backlog to zero: close the fast path for a while
-            // so the next round can drain and release.
+            // so the next round can drain and release — but follow up
+            // at once only if this round moved the log. A backlog that
+            // did not ship is one the plan defers or holds (a manifest
+            // waiting for a chunk only another node has, `store::held`),
+            // and a round that ships nothing re-run with no delay is a
+            // busy loop for as long as that node is away (fix "capture
+            // under an epoch hold": flex seed 1007's holder ran 684 433
+            // rounds at one instant). The poll retries at its cadence,
+            // and the chunk's arrival nudges nothing it needs to.
+            let moved = matches!(
+                self.job.as_ref().map(|j| &j.what),
+                Some(What::Round { head_before, .. }) if self.ship.head_seq != *head_before
+            );
             self.lease.begin_handoff_pause(now, &self.cfg);
-            self.nudged = true;
+            if moved {
+                self.nudged = true;
+            }
         }
         self.finish_round(now, None, replica, out);
     }
@@ -2517,6 +2544,32 @@ impl Core {
                         self.set_phase(Phase::FlushPublish { op }, Some(op));
                         return;
                     }
+                }
+                // Fix "capture under an epoch hold": a handoff whose flush
+                // could not drain the journal — what is left is deferred
+                // (a manifest waiting for a chunk only another node has)
+                // or held — is declined, not served. Released, the lease
+                // moves and the successor's epoch strands those rows
+                // here: rolled back, replayed by rid through it, deferred
+                // there again, and the next handoff back repeats it —
+                // flex-crash seed 3021 bounced its lease to epoch 111
+                // this way, every bounce a rollback and a replay of the
+                // same acknowledged writes. The requester forwards to
+                // this node meanwhile, as an idle holder with a backlog
+                // already makes it (`idle_release_due`).
+                let undrained = replica.journal_len().unwrap_or(0);
+                let handoff = matches!(
+                    self.job.as_ref().map(|j| &j.what),
+                    Some(What::Handoff { .. })
+                );
+                if handoff && undrained > 0 {
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        undrained,
+                        "handoff declined: the journal cannot drain (deferred or held rows)"
+                    );
+                    self.finish_flush_job(now, false, replica, out);
+                    return;
                 }
                 if self.lease.held.is_some() && !self.lease.lost {
                     self.lease.begin_handoff_pause(now, &self.cfg);
@@ -3313,8 +3366,13 @@ impl Core {
             // A continuation epoch's P2P-only handoff: local authority,
             // gated like a takeover (no marker: nothing ships). Plan 30
             // §M10: the predecessor hands over only with an empty journal
-            // (`on_lease_request`).
-            let mine = self.lease.epoch().unwrap_or(epoch).max(1);
+            // (`on_lease_request`). The hold's epoch is the one this
+            // node's flush will ship under (`epoch_hold_epoch_for`): the
+            // carried lease's for the carrier, the next for anyone else,
+            // so what it journals and captures under the hold is not
+            // stranded by its own flush gate, and the positions it
+            // answers with are reached only by the flush's segments.
+            let mine = self.epoch_hold_epoch_for(epoch);
             if self
                 .pr
                 .carried
@@ -3324,8 +3382,7 @@ impl Core {
                 // Handed back to this node: its own again.
                 self.pr.hold_ended = None;
             }
-            self.lease.adopt_epoch_hold(now, mine);
-            replica.set_holder_epoch(0);
+            self.adopt_epoch_hold(now, mine, replica);
             self.lease.gate = Some(PendingGate {
                 epoch: mine,
                 takeover: false,

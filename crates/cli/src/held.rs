@@ -20,12 +20,26 @@ pub fn status(meta: &Meta) -> constellation_api::HeldStatus {
             }
         }
     }
+    let now_ms = constellation_store_s3::lease::now_unix_ms();
+    let remote = meta
+        .remote_chunks()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| constellation_api::RemoteChunkStatus {
+            ino: r.ino,
+            path: meta.path_of(r.ino).ok(),
+            node: r.node,
+            chunk: r.hash.to_hex(),
+            age_s: (now_ms - r.enrolled_ms).max(0) as u64 / 1000,
+        })
+        .collect();
     constellation_api::HeldStatus {
         transactions: summary.transactions,
         records: summary.records,
         oldest_seq: summary.oldest_seq,
         opaque: summary.opaque,
         deferred: summary.deferred,
+        remote,
         inodes: inodes
             .into_iter()
             .map(|(ino, held)| constellation_api::HeldInodeStatus {
@@ -38,13 +52,21 @@ pub fn status(meta: &Meta) -> constellation_api::HeldStatus {
     }
 }
 
-/// `constellation repair drop-held <ino>`: roll the inode's held records
-/// back, queue what depended on them for replay by rid, and leave the
-/// conflict copies to the replay drain (`recovery::drain_pending_replays`
-/// materializes each refused replay within a tick or so).
-pub fn drop_held(meta: &Meta, ino: u64) -> Result<String, String> {
+/// `constellation repair drop-held <ino> [--remote]`: roll the inode's
+/// held records back, queue what depended on them for replay by rid, and
+/// leave the conflict copies to the replay drain
+/// (`recovery::drain_pending_replays` materializes each refused replay
+/// within a tick or so). `remote`: the records are deferred on chunks
+/// another node forwarded as pending and never uploaded; they are
+/// declared unrecoverable first (`Meta::drop_held_remote`).
+pub fn drop_held(meta: &Meta, ino: u64, remote: bool) -> Result<String, String> {
     let now = constellation_fs_core::types::now_ns() / 1_000_000_000;
-    let dropped = meta.drop_held(ino, now).map_err(|e| e.to_string())?;
+    let dropped = if remote {
+        meta.drop_held_remote(ino, now)
+    } else {
+        meta.drop_held(ino, now)
+    }
+    .map_err(|e| e.to_string())?;
     Ok(format!(
         "inode {ino}: {} held transaction(s) dropped into a conflict copy under \
          {}/ (lost chunks become holes), {} dependent transaction(s) rolled back and queued \

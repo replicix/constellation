@@ -829,12 +829,26 @@ garbage line without the separator
         assert_eq!(flock_pid_in(locks, "103:01:1"), None);
     }
 
+    /// `takeover_rotates_the_held_lock` sets the process-wide
+    /// `CONSTELLATION_FAULT_ASSUME_WEDGED_PID` to this very process's pid
+    /// while it runs; a test that classifies this process's own lock in
+    /// parallel would see it as wedged (flaky under full-suite load). The
+    /// two hold this while they run.
+    static WEDGED_HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn wedged_hook_guard() -> std::sync::MutexGuard<'static, ()> {
+        WEDGED_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The real thing on this host: a lock this process holds is
     /// attributed to this process, and this process is live.
     #[cfg(target_os = "linux")]
     #[test]
     fn own_flock_is_found_and_live() {
         use std::os::fd::AsRawFd;
+        let _hook = wedged_hook_guard();
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(LOCK_NAME);
         let file = std::fs::File::create(&lock).unwrap();
@@ -860,6 +874,7 @@ garbage line without the separator
     #[test]
     fn takeover_rotates_the_held_lock() {
         use std::os::fd::AsRawFd;
+        let _hook = wedged_hook_guard();
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(LOCK_NAME);
         let file = std::fs::File::create(&lock).unwrap();

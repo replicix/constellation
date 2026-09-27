@@ -34,7 +34,7 @@ pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
 pub use store::spec::{
-    Refusal, SegmentApplied, ShippedRows, SpecKind, SpeculationCounts, Stranded, StrandedOp,
+    Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,
     LOCAL_REPLAY_INCARNATION,
 };
 pub use store::{

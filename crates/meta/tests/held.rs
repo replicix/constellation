@@ -243,7 +243,11 @@ fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
         (dropped.dropped, dropped.requeued, dropped.pending_removed),
         (1, 1, 1)
     );
-    assert_eq!(s.meta.journal_len().unwrap(), 0);
+    assert_eq!(
+        s.meta.journal_len().unwrap(),
+        1,
+        "the dropped op's refusal waits to ship"
+    );
     assert!(s.meta.pending_uploads().unwrap().is_empty());
     assert!(s.meta.unrecoverable_chunks().unwrap().is_empty());
     assert_eq!(s.meta.held_summary().transactions, 0);
@@ -278,11 +282,167 @@ fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
         "{:?}",
         dependent.op
     );
-    // Nothing is held any more: the next plan ships everything.
-    assert!(batch(&s.meta).is_empty());
+    // Nothing is held any more: the next plan ships everything — the
+    // dropped op's outcome (fix "capture under an epoch hold": a
+    // requester's shadow of it rolls back on it).
+    let recs = records(&batch(&s.meta));
+    assert!(
+        matches!(recs.as_slice(), [LogRecord::Refused { rid, errno: 5 }] if *rid == seed.rid),
+        "{recs:?}"
+    );
     assert!(
         s.meta.drop_held(s.broken, 1).is_err(),
         "nothing left to drop"
+    );
+}
+
+/// `repair drop-held --remote` (fix "capture under an epoch hold"): a
+/// manifest another node forwarded naming a chunk still pending there
+/// (`enroll_remote_chunks`) is *deferred*, not held — the plan ships
+/// around it, and plain `drop-held` has nothing to drop. When that node
+/// is gone for good, `--remote` declares the chunk unrecoverable and
+/// drops it the held way: the seed becomes a refused replay (a conflict
+/// copy with the chunk as a hole), its dependent is rolled back and
+/// queued, the remote-marked pending row goes, and the plan is clean.
+#[test]
+fn drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let away = ChunkHash::of(b"only on the node that died");
+    let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+    // The forward arrives: its chunk is enrolled before the op executes.
+    meta.enroll_remote_chunks(file, &[away], 7).unwrap();
+    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19)
+        .unwrap();
+    meta.setattr(file, Some(0o600), None, None, None, None, None)
+        .unwrap();
+    let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
+
+    // Deferred, not held: the create of `file` and everything unrelated
+    // ships; the manifest and its chmod wait.
+    let rows = batch(&meta);
+    let recs = records(&rows);
+    assert!(
+        recs.iter().all(|r| !matches!(
+            r,
+            LogRecord::WriteManifest { .. } | LogRecord::Setattr { .. }
+        )),
+        "{recs:?}"
+    );
+    assert!(recs
+        .iter()
+        .any(|r| matches!(r, LogRecord::Create { ino, .. } if *ino == other)));
+    let summary = meta.held_summary();
+    assert_eq!(
+        (summary.transactions, summary.deferred),
+        (0, 2),
+        "{summary:?}"
+    );
+    assert_eq!(meta.remote_chunks().unwrap().len(), 1);
+    ship(&meta, &rows, 1);
+    let err = meta.drop_held(file, 1).unwrap_err().to_string();
+    assert!(err.contains("--remote"), "{err}");
+
+    let dropped = meta.drop_held_remote(file, 4321).unwrap();
+    assert_eq!(
+        (dropped.dropped, dropped.requeued, dropped.pending_removed),
+        (1, 1, 1)
+    );
+    assert_eq!(meta.journal_len().unwrap(), 1, "the refusal waits to ship");
+    assert!(meta.pending_uploads().unwrap().is_empty());
+    assert!(meta.remote_chunks().unwrap().is_empty());
+    assert!(meta.unrecoverable_chunks().unwrap().is_empty());
+    assert_eq!(mode_of(&meta, file), 0o644, "the chmod was rolled back");
+    assert!(meta.manifest(file).unwrap().is_none());
+    let queued = meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 2, "{queued:?}");
+    let refusal = queued[0].refused.as_ref().expect("the seed is refused");
+    assert!(refusal.reason.contains("drop-held"), "{refusal:?}");
+    assert_eq!(refusal.ts_unix, 4321);
+    let MutateOp::SetManifest { ino, manifest, .. } = &queued[0].op else {
+        panic!("{:?}", queued[0].op);
+    };
+    assert_eq!(*ino, file);
+    let kept = Manifest::decode(manifest).unwrap();
+    assert_eq!(kept.file_len, 19);
+    assert_eq!(kept.chunks, ChunkInfo::Inline(BTreeMap::new()), "a hole");
+    assert!(queued[1].refused.is_none(), "the dependent replays");
+    // The dropped op's outcome is in the journal, to ship: a requester's
+    // shadow of it is rolled back by it, and a retry by rid is refused.
+    let recs = records(&batch(&meta));
+    assert!(
+        matches!(recs.as_slice(), [LogRecord::Refused { rid, errno: 5 }] if *rid == queued[0].rid),
+        "{recs:?}"
+    );
+    assert!(meta.drop_held_remote(file, 1).is_err(), "nothing left");
+}
+
+/// Fix "capture under an epoch hold": a refusal writes nothing, but its
+/// op *observed* the keys it was refused on (`JournalTx::observed`). One
+/// refused because of the deferred transaction's state — a link of the
+/// deferred file's inode — is deferred with it; one on an unrelated name
+/// ships. Shipped ahead, the log carried a refusal its own prefix could
+/// not explain (flex-crash seed 481: `rename f2 f3` refused `ENOENT` at
+/// a position where `f2` existed).
+#[test]
+fn a_refusal_that_observed_a_deferred_transactions_keys_is_deferred_with_it() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let away = ChunkHash::of(b"pending on another node");
+    let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+    meta.enroll_remote_chunks(file, &[away], 7).unwrap();
+    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19)
+        .unwrap();
+    let rid = |seq: u64| constellation_meta::Rid {
+        node: 3,
+        incarnation: 1,
+        seq,
+    };
+    // Refused because `file` (whose manifest is deferred) already exists
+    // under that name: it looked at the file's inode.
+    meta.journal_refusal(
+        rid(1),
+        17,
+        Some(&MutateOp::Link {
+            ino: file,
+            parent: ROOT_INO,
+            name: "file".into(),
+        }),
+    )
+    .unwrap();
+    // Refused on a name nothing deferred touched.
+    meta.journal_refusal(
+        rid(2),
+        2,
+        Some(&MutateOp::Unlink {
+            parent: ROOT_INO,
+            name: "missing".into(),
+        }),
+    )
+    .unwrap();
+    let recs = records(&batch(&meta));
+    let refused: Vec<u64> = recs
+        .iter()
+        .filter_map(|r| match r {
+            LogRecord::Refused { rid, .. } => Some(rid.seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        vec![2],
+        "only the unrelated refusal ships: {recs:?}"
+    );
+    assert!(
+        !recs
+            .iter()
+            .any(|r| matches!(r, LogRecord::WriteManifest { .. })),
+        "the manifest is deferred"
+    );
+    let summary = meta.held_summary();
+    assert_eq!(
+        summary.deferred, 2,
+        "the manifest and the refusal on it: {summary:?}"
     );
 }
 

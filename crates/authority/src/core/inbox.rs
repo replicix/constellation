@@ -1397,7 +1397,12 @@ impl Core {
                         }
                         super::delegate::RecallPlan::Refuse(errno) => {
                             // Phase 2b: a designation is involved.
-                            replica.journal_inbox_refusal(rid, errno, ack)?;
+                            replica.journal_inbox_refusal(
+                                rid,
+                                errno,
+                                ack,
+                                decoded.as_ref().ok(),
+                            )?;
                             self.stats.inbox_refused_ops += 1;
                             continue;
                         }
@@ -1428,12 +1433,12 @@ impl Core {
                 Err(MetaError::Conflict) => {
                     // A stale manifest base: `ESTALE` on the log, and the
                     // requester rebases from its own replica.
-                    replica.journal_inbox_refusal(rid, libc::ESTALE, ack)?;
+                    replica.journal_inbox_refusal(rid, libc::ESTALE, ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }
                 Err(error) => {
                     let errno = super::client::meta_errno(&error);
-                    replica.journal_inbox_refusal(rid, errno, ack)?;
+                    replica.journal_inbox_refusal(rid, errno, ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }
             }

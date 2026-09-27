@@ -363,9 +363,16 @@ stranded-branch recovery:
   only on C) and B reads the first from C
   (`status.coop.epoch_member_fetches`). C stops: B's read of the second
   fails with `EIO`, never other bytes; S3 returns for A and B, A defers
-  the manifests (`status.held.deferred`) and B keeps them as speculation,
-  and a fresh S3-only node never meets a manifest naming a missing chunk.
-  C comes back and every node reads both files.
+  the manifests (`status.held.deferred`, `held.remote` naming C's
+  chunks) and B keeps them as speculation, and a fresh S3-only node
+  never meets a manifest naming a missing chunk. A's own write after
+  the close reaches S3 (the log head moves; the fresh node reads it)
+  while C is away — the epoch journal is captured, so only C's writes
+  wait. Then, by the seed's parity: an even seed brings C back and every
+  node reads both files; an odd seed gives C up with `repair drop-held
+  <ino> --remote` on A, and every node converges on the two files as
+  empty (conflict copies on A, the refusals in the log, B's streamed
+  copies and C's own rolled back once C returns).
 - `epoch-member-lost` stops one promised member with `SIGSTOP`; the
   survivor must freeze and return `EROFS`, then resume cleanly when the
   member returns and converge after S3 heals. Both scenarios run a 20 s

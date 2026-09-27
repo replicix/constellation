@@ -107,7 +107,7 @@ impl Meta {
                 }
             }
             if !completes.is_empty() {
-                retire_tx(tx, self, &completes, applied_seq, None)?;
+                retire_tx(tx, self, &completes, applied_seq)?;
             }
         }
         if let Some(&upto) = journal_seqs.iter().max() {

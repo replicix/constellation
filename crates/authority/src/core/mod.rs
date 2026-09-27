@@ -763,6 +763,9 @@ pub struct Stats {
     /// applied base, or out of order).
     pub streamed_installed: u64,
     pub streamed_dropped: u64,
+    /// Stream-ahead transactions this replica held already (a restarted
+    /// subscriber, or the holder streaming from its start again).
+    pub streamed_held_already: u64,
     /// Backup: appends persisted, epochs sealed, takeovers completed by
     /// seal, and how many transactions a takeover re-applied.
     pub backup_persisted: u64,
@@ -1955,8 +1958,7 @@ impl Core {
                 // carried lease — the members promise nothing while the
                 // epoch is open, so no taker gets past the promise check.
                 let epoch = self.lease.epoch().unwrap_or(1);
-                self.lease.adopt_epoch_hold(now, epoch);
-                replica.set_holder_epoch(0);
+                self.adopt_epoch_hold(now, epoch, replica);
             }
         } else if state.active
             && self.lease.usable(now, &self.cfg)
@@ -1967,8 +1969,7 @@ impl Core {
             // Re-affirming (a holder carrying S3 authority through an
             // epoch that was already active when it acquired).
             let epoch = self.lease.epoch().unwrap_or(1);
-            self.lease.adopt_epoch_hold(now, epoch);
-            replica.set_holder_epoch(0);
+            self.adopt_epoch_hold(now, epoch, replica);
         }
         // M12 round 2 (flex-crash seed 30299): the epoch carries this
         // node's own lease, but the hold was never adopted — the node was
@@ -2009,8 +2010,7 @@ impl Core {
                 );
                 self.stats.epoch_holds_adopted_late += 1;
                 self.skip_ship = true;
-                self.lease.adopt_epoch_hold(now, c.epoch);
-                replica.set_holder_epoch(0);
+                self.adopt_epoch_hold(now, c.epoch, replica);
             }
         }
         self.restore_epoch_hold(now, replica);

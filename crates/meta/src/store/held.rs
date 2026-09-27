@@ -111,6 +111,11 @@ use std::sync::atomic::Ordering;
 
 const POISON_PREFIX: &[u8] = b"poisoned/";
 
+/// The errno a dropped op's `Refused` record carries (`EIO`): the write
+/// was acknowledged and then lost with its chunk; its conflict copy is
+/// the artifact.
+const DROPPED_ERRNO: i32 = 5;
+
 /// Plan 30 §M9 × §M4: a spilled manifest adopted from a predecessor's
 /// backup tail whose chunk list is not expanded into pending rows yet:
 /// `adopted-spill/<ino><blob hash>`. While one exists its inode's
@@ -410,8 +415,18 @@ fn plan(
             Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
             None => None,
         };
+        // What the transaction observed without writing (a refusal's op:
+        // `JournalTx::observed`): a dependency like a written key, but
+        // it taints nothing after it. A refusal shipped ahead of the
+        // deferred transaction it was refused because of put a refusal
+        // in the log that the log's own prefix could not explain
+        // (flex-crash seed 481).
+        let observed: Vec<Vec<u8>> = local::get_journal_tx(r, meta, tx.first)?
+            .map(|row| row.observed)
+            .unwrap_or_default();
         let held = opaque
             || !seeds.is_empty()
+            || observed.iter().any(|k| tainted.contains(k))
             || match &keys {
                 Some(keys) => keys.iter().any(|k| tainted.contains(k)),
                 // Unknown keys: held once anything is.
@@ -427,6 +442,7 @@ fn plan(
         }
         let deferred = opaque_deferred
             || !seed_inos(&tx, pending).is_empty()
+            || observed.iter().any(|k| deferred_keys.contains(k))
             || match &keys {
                 Some(keys) => keys.iter().any(|k| deferred_keys.contains(k)),
                 None => !out.deferred.is_empty(),
@@ -636,12 +652,58 @@ impl Meta {
     /// `constellation repair drop-held <ino>` (see the module doc's
     /// "Dropping"). `now_unix` stamps the conflict copies' names.
     pub fn drop_held(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
+        self.drop_held_with(ino, now_unix, false)
+    }
+
+    /// `constellation repair drop-held <ino> --remote`: the same for a
+    /// transaction *deferred* on chunks another node forwarded as pending
+    /// (`store::remote`) whose owner is gone for good — a continuation
+    /// epoch member that died with the only copy of its epoch write's
+    /// chunk (nothing reaches S3 in an epoch). The operator declares
+    /// those chunks unrecoverable here; from then on it is the held case:
+    /// the inode's manifests naming them become refused replays whose
+    /// conflict copies carry the missing chunks as holes, their
+    /// dependents are rolled back and replayed by rid, and the pending
+    /// rows go. Nothing is dropped silently: the requester's op is a
+    /// refusal or a conflict copy, never lost.
+    pub fn drop_held_remote(&self, ino: Ino, now_unix: i64) -> Result<DroppedHeld, MetaError> {
+        self.drop_held_with(ino, now_unix, true)
+    }
+
+    fn drop_held_with(
+        &self,
+        ino: Ino,
+        now_unix: i64,
+        remote: bool,
+    ) -> Result<DroppedHeld, MetaError> {
         let mut tx = self.db.write_tx();
+        if remote {
+            // The inode's remote-pending chunks are unrecoverable from
+            // here on: marked in the same transaction, so the plan below
+            // sees them as poisoned seeds.
+            let hashes = super::remote::remote_pending_for_ino_tx(&tx, self, ino)?;
+            if hashes.is_empty() {
+                return Err(MetaError::Invalid(format!(
+                    "nothing is deferred for inode {ino} on another node's chunks: no pending \
+                     upload of it is marked remote (see `status`'s `held.remote`)"
+                )));
+            }
+            let mut fresh = 0i64;
+            for hash in &hashes {
+                let key = poison_key(hash, ino);
+                if tx.get(&self.local, &key)?.is_none() {
+                    tx.insert(&self.local, key, Vec::new());
+                    fresh += 1;
+                }
+            }
+            counter_add_tx(&mut tx, &self.local, KV_POISONED_COUNT, fresh)?;
+        }
         let poisoned = read_poisoned(&tx, self)?;
         let Some(missing) = poisoned.get(&ino).cloned() else {
             return Err(MetaError::Invalid(format!(
                 "nothing is held for inode {ino}: no unrecoverable pending chunk is recorded \
-                 for it"
+                 for it (a transaction deferred on another node's pending chunks needs \
+                 `--remote`)"
             )));
         };
         let held = plan(&tx, self, &poisoned, &PoisonMap::new())?;
@@ -680,6 +742,10 @@ impl Meta {
         seqs.extend(seeds.iter().map(|(_, seq, _)| *seq));
         let staged = UsageTracker::staging();
         spec::strand_seqs_tx(&mut tx, self, &staged, &seqs)?;
+        // The rids whose ops are dropped: their outcome goes in the log
+        // (`Refused`), so a requester's shadow of one is rolled back
+        // and a retry by rid is answered the same way everywhere.
+        let mut refused_rids: Vec<crate::rid::Rid> = Vec::new();
         let refusal = |hashes: &BTreeSet<ChunkHash>| spec::Refusal {
             reason: format!(
                 "dropped by `constellation repair drop-held {ino}`: chunk(s) {} unrecoverable",
@@ -717,6 +783,7 @@ impl Meta {
                 size,
             };
             spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing))?;
+            refused_rids.push(rid);
         }
         // Replays of this inode's manifest already queued by an earlier
         // deposition: the same treatment.
@@ -757,7 +824,35 @@ impl Meta {
                 op,
                 refusal(&missing),
             )?;
+            refused_rids.push(queued.rid);
             queued_dropped += 1;
+        }
+        // Fix "capture under an epoch hold": the dropped ops' outcome, in
+        // the log. Before this the requester of a dropped op (a member
+        // whose epoch write the owner dropped, or a deposed owner that
+        // replayed it) kept its shadow for good: no `Completed` was ever
+        // coming, and only a takeover would have stranded it.
+        if !refused_rids.is_empty() {
+            let local = self.begin_local(&tx)?;
+            let now_ms = now_unix.saturating_mul(1000);
+            for rid in &refused_rids {
+                let position = journal::append_tx(
+                    &mut tx,
+                    &self.journal_ks,
+                    &self.local,
+                    &self.completed,
+                    &LogRecord::Refused {
+                        rid: *rid,
+                        errno: DROPPED_ERRNO,
+                    },
+                )?;
+                tx.insert(
+                    &self.completed,
+                    rid.to_key(),
+                    Meta::encode_refused_row(position, now_ms, DROPPED_ERRNO),
+                );
+            }
+            self.finish_local(&mut tx, local)?;
         }
         let mut pending_removed = 0;
         let mut marks_removed = 0i64;
@@ -772,6 +867,12 @@ impl Meta {
             if tx.get(&self.local, poison_key(hash, ino))?.is_some() {
                 tx.remove(&self.local, poison_key(hash, ino));
                 marks_removed += 1;
+            }
+            // A row another node was to upload (`--remote`): its mark
+            // goes with the row.
+            let remote = super::remote::remote_key(hash, ino);
+            if tx.get(&self.local, &remote)?.is_some() {
+                tx.remove(&self.local, remote);
             }
         }
         counter_add_tx(&mut tx, &self.local, KV_POISONED_COUNT, -marks_removed)?;

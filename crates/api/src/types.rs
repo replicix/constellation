@@ -164,9 +164,14 @@ pub enum Request {
     MountList,
     /// Plan 30 §M4: `constellation repair drop-held <ino>` — discard the
     /// journal records held back behind `ino`'s unrecoverable chunk(s)
-    /// into a conflict copy (see `StatusReport::held`).
+    /// into a conflict copy (see `StatusReport::held`). `remote`: the
+    /// chunks are ones another node forwarded as pending and never
+    /// uploaded (that node is gone for good); they are declared
+    /// unrecoverable first (`held.remote` lists them).
     DropHeld {
         ino: u64,
+        #[serde(default)]
+        remote: bool,
     },
 }
 
@@ -1543,6 +1548,28 @@ pub struct HeldStatus {
     /// drop-held <ino>` discards its held records.
     #[serde(default)]
     pub inodes: Vec<HeldInodeStatus>,
+    /// Pending chunks another node forwarded as still uploading there
+    /// (`--write-mode back`, or any write inside a continuation epoch):
+    /// the transactions naming them are deferred (counted in
+    /// `deferred`) until that node uploads them, or the sequencer finds
+    /// them in S3. If the node is gone for good, `constellation repair
+    /// drop-held <ino> --remote` drops them.
+    #[serde(default)]
+    pub remote: Vec<RemoteChunkStatus>,
+}
+
+/// One chunk the sequencer waits for another node to upload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteChunkStatus {
+    pub ino: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The node expected to upload it.
+    pub node: u64,
+    /// Hex hash.
+    pub chunk: String,
+    /// Seconds since it was enrolled.
+    pub age_s: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

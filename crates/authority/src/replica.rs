@@ -79,11 +79,20 @@ pub trait Replica {
         rid: Rid,
     ) -> Result<Vec<LogRecord>, MetaError>;
     /// Journal a refusal (`Refused { rid, errno }`) with its position.
-    fn journal_inbox_refusal(&self, rid: Rid, errno: i32, ack: InboxAck) -> Result<(), MetaError>;
+    fn journal_inbox_refusal(
+        &self,
+        rid: Rid,
+        errno: i32,
+        ack: InboxAck,
+        op: Option<&MutateOp>,
+    ) -> Result<(), MetaError>;
     /// Plan 30 §M9: journal a forwarded op's definitive refusal by rid
     /// (`Meta::journal_refusal`), so every later execution of the rid
     /// dedups to the same errno.
-    fn journal_refusal(&self, rid: Rid, errno: i32) -> Result<(), MetaError>;
+    /// `op`: the refused op, whose observed keys keep the refusal behind
+    /// a deferred transaction they depend on (`JournalTx::observed`).
+    fn journal_refusal(&self, rid: Rid, errno: i32, op: Option<&MutateOp>)
+        -> Result<(), MetaError>;
     /// The journal seq the next row lands at, and the highest shipped.
     fn journal_next_seq(&self) -> Result<u64, MetaError>;
     fn journal_acked_seq(&self) -> Result<u64, MetaError>;
@@ -404,6 +413,10 @@ pub trait Replica {
         last: u64,
         records: &[LogRecord],
     ) -> Result<(), MetaError>;
+    /// The highest journal seq of `epoch` this replica holds as streamed
+    /// speculation (`Meta::streamed_tip`): a stream-ahead below it is
+    /// already here.
+    fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError>;
     /// The holder's durability watermark for its own reads
     /// (`Meta::durability_pending`).
     fn set_durable(&self, gate: bool, jseq: u64, lost: bool);
@@ -516,12 +529,23 @@ impl Replica for Meta {
         r
     }
 
-    fn journal_inbox_refusal(&self, rid: Rid, errno: i32, ack: InboxAck) -> Result<(), MetaError> {
-        Meta::journal_inbox_refusal(self, rid, errno, ack)
+    fn journal_inbox_refusal(
+        &self,
+        rid: Rid,
+        errno: i32,
+        ack: InboxAck,
+        op: Option<&MutateOp>,
+    ) -> Result<(), MetaError> {
+        Meta::journal_inbox_refusal(self, rid, errno, ack, op)
     }
 
-    fn journal_refusal(&self, rid: Rid, errno: i32) -> Result<(), MetaError> {
-        Meta::journal_refusal(self, rid, errno)
+    fn journal_refusal(
+        &self,
+        rid: Rid,
+        errno: i32,
+        op: Option<&MutateOp>,
+    ) -> Result<(), MetaError> {
+        Meta::journal_refusal(self, rid, errno, op)
     }
 
     fn journal_next_seq(&self) -> Result<u64, MetaError> {
@@ -1051,6 +1075,10 @@ impl Replica for Meta {
         records: &[LogRecord],
     ) -> Result<(), MetaError> {
         Meta::install_streamed(self, epoch, first, last, records)
+    }
+
+    fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError> {
+        Meta::streamed_tip(self, epoch)
     }
 
     fn set_durable(&self, gate: bool, jseq: u64, lost: bool) {

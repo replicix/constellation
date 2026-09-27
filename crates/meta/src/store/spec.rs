@@ -1520,6 +1520,20 @@ fn insert_streamed_tx(
     Ok(())
 }
 
+/// See [`Meta::streamed_tip`].
+fn streamed_tip_tx(r: &impl Readable, meta: &Meta, epoch: u64) -> Result<Option<u64>, MetaError> {
+    if counter_get(r, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {
+        return Ok(None);
+    }
+    Ok(read_live(r, meta)?
+        .into_iter()
+        .filter_map(|(_, entry)| match entry {
+            LiveEntry::Streamed { epoch: e, last } if e == epoch => Some(last),
+            _ => None,
+        })
+        .max())
+}
+
 /// Roll back and take out every outstanding entry `strands` selects (see
 /// [`rewind_tx`]).
 fn strand_tx(
@@ -1540,25 +1554,14 @@ fn strand_tx(
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, None)?.0)
 }
 
-/// Plan 30 §M9: what a segment says about the shipping tenure's journal,
-/// for retiring `Streamed` entries: its epoch, the journal seq it ships
-/// through, and the journal seqs of its rows.
-#[derive(Clone, Copy, Debug)]
-pub struct ShippedRows<'a> {
-    pub epoch: u64,
-    pub through: u64,
-    pub rows: &'a [u64],
-}
-
-/// Retire every outstanding shadow whose rid `completes` names, every
-/// hint whose floor `applied_seq` has reached, and every streamed
-/// transaction `shipped` confirms.
+/// Retire every outstanding shadow whose rid `completes` names and every
+/// hint whose floor `applied_seq` has reached. A streamed transaction
+/// retires only rows-confirmed (`apply_segment_rows` converts it).
 pub(crate) fn retire_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     completes: &HashSet<Rid>,
     applied_seq: u64,
-    shipped: Option<ShippedRows<'_>>,
 ) -> Result<usize, MetaError> {
     let mut retired = 0;
     if counter_get(tx, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {
@@ -1578,10 +1581,11 @@ pub(crate) fn retire_tx(
             LiveEntry::Shadow { rid, .. } => completes.contains(&rid),
             LiveEntry::Hint { floor, .. } => applied_seq >= floor,
             // Rows-confirmed entries are converted by `apply_segment_rows`
-            // (their records were skipped); one confirmed by `through`
-            // alone shipped in a segment that did not name its rows.
-            LiveEntry::Streamed { epoch, last } => shipped
-                .is_some_and(|s| s.epoch == epoch && s.through >= last && !s.rows.contains(&last)),
+            // (their records were skipped). One the tenure shipped past
+            // without naming its rows was dropped on the holder, and is
+            // stranded there before this runs (never confirmed: its
+            // effects are not in the log).
+            LiveEntry::Streamed { .. } => false,
             LiveEntry::Local { .. } => false,
         };
         if done {
@@ -1966,6 +1970,24 @@ pub(crate) fn refuse_queued_tx(
     Ok(())
 }
 
+/// Take every queued replay of a rid in `rids` out of the queue (the
+/// log refused the rid: nothing to replay). Returns how many.
+pub(crate) fn drop_queued_of_rids_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    rids: &HashSet<Rid>,
+) -> Result<usize, MetaError> {
+    let mut dropped = 0;
+    for queued in read_pending_replays(&*tx, meta)? {
+        if rids.contains(&queued.rid) {
+            tx.remove(&meta.pending_replay, seq_key(queued.queue_seq));
+            counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, -1)?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
+}
+
 /// The queued replay at `key`, if any: `(rid, op)`.
 pub(crate) fn queued_at(
     r: &impl Readable,
@@ -2174,9 +2196,19 @@ impl Meta {
         Ok(true)
     }
 
+    /// The highest journal seq of `epoch` installed here as a `Streamed`
+    /// entry still outstanding (`None`: nothing of that epoch): what a
+    /// stream-ahead need not deliver again. A scan of the live set,
+    /// which is small; one counter read when it is empty.
+    pub fn streamed_tip(&self, epoch: u64) -> Result<Option<u64>, MetaError> {
+        let r = self.db.read_tx();
+        streamed_tip_tx(&r, self, epoch)
+    }
+
     /// Plan 30 §M9: install one of the holder's backup-acked journal
     /// transactions (rows `first..=last` of its tenure at `epoch`) ahead
     /// of the log, as a `Streamed` entry (see [`SpecKind::Streamed`]).
+    /// Installed already (see the first check): nothing happens.
     pub fn install_streamed(
         &self,
         epoch: u64,
@@ -2185,6 +2217,19 @@ impl Meta {
         records: &[LogRecord],
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
+        // Fix "capture under an epoch hold": already installed here —
+        // the holder streams its journal from the start again for a
+        // (re)subscriber, and a subscriber that restarted lost the
+        // in-memory cursor that skipped what it holds while its replica
+        // kept the entries (flex-backup seed 1230: a member back from a
+        // crash re-applied the epoch journal it already held on top of
+        // itself — a rename of a name a later create had reused). The
+        // stream is contiguous and in order, so a transaction at or
+        // below the highest installed one of this epoch is one this
+        // replica has (or a hole it stepped over).
+        if streamed_tip_tx(&tx, self, epoch)?.is_some_and(|tip| first <= tip) {
+            return Ok(());
+        }
         // The mirror of `install_shadow`'s rule: this node's own op,
         // whose reply installed a shadow first, is not applied a second
         // time from the stream. The shadow *becomes* the streamed entry
@@ -2386,12 +2431,46 @@ impl Meta {
                 _ => None,
             })
             .collect();
+        // Fix "capture under an epoch hold": the log refuses a rid this
+        // node holds a shadow of. The holder accepted the op, then let
+        // it go — `repair drop-held` (poisoned or `--remote`) turned it
+        // into a refused replay whose conflict copy the holder makes —
+        // and journaled the outcome. The shadow's effect never reaches
+        // the log: rolled back here, and its replay dropped rather than
+        // queued (the outcome is final, the copy exists; a replay would
+        // only be answered "refused" and make a second copy).
+        let refused: HashSet<Rid> = records
+            .iter()
+            .filter_map(|rec| match rec {
+                LogRecord::Refused { rid, .. } => Some(*rid),
+                _ => None,
+            })
+            .collect();
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         let stranded = strand_tx(&mut tx, self, &staged, |entry| {
-            entry.stranded_by(epoch)
-                && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid))
+            (entry.stranded_by(epoch)
+                && !matches!(entry, LiveEntry::Shadow { rid, .. } if completes.contains(rid)))
+                || matches!(entry, LiveEntry::Shadow { rid, .. } if refused.contains(rid))
+                // A streamed transaction of this tenure the segment ships
+                // *past* (`through` at or beyond its last row) without
+                // naming its rows is gone from the holder's journal: it
+                // was dropped there (`repair drop-held`, the poisoned or
+                // the `--remote` case), never shipped, and never will be —
+                // `journal_through_after` stops below any row still held
+                // back or deferred. Its effects go with it: rolled back
+                // here like any stranded speculation (a later streamed
+                // transaction on the same keys is rolled back and redone
+                // by the rewind; on the holder it was requeued by rid and
+                // comes back through the log). Retiring it as confirmed
+                // (M9's first rule) kept the dropped write in the member's
+                // replica for good.
+                || matches!(entry, LiveEntry::Streamed { epoch: e, last }
+                    if *e == epoch && through >= *last && !rows.contains(last))
         })?;
+        if !refused.is_empty() && stranded.shadows > 0 {
+            drop_queued_of_rids_tx(&mut tx, self, &refused)?;
+        }
         // Plan 30 §M11: this node's own delegate transactions the segment
         // carries — their segment rows are skipped below, and the
         // transactions retire after the apply.
@@ -2612,17 +2691,7 @@ impl Meta {
             };
             apply_batch_tx(&mut tx, self, cx, records, pending, &staged, false)?.0
         };
-        let mut retired = retire_tx(
-            &mut tx,
-            self,
-            &completes,
-            seq,
-            Some(ShippedRows {
-                epoch,
-                through,
-                rows,
-            }),
-        )?;
+        let mut retired = retire_tx(&mut tx, self, &completes, seq)?;
         for (spec_seq, _, _) in &confirmed {
             if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
                 let mut row: SpecRow = postcard::from_bytes(&v)?;

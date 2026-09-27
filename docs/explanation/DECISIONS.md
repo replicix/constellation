@@ -620,6 +620,29 @@ access could legally take an expired lease: two writers). A steady
 heartbeat refresh (it costs PUTs forever for an event that may never
 happen). A second bucket as a witness (ADR-27).
 
+**Amendment (capture under an epoch hold)**: the hold owner's epoch
+journal is speculation in ADR-19's sense — captured with before-images,
+under the epoch its flush will ship under: the carried lease's epoch
+for the carrier, the next epoch for a member that took the hold over
+(what its flush CAS on the carried object grants; nothing else can
+touch that object while the epoch is open). Since M5 the hold had set
+the capture epoch to 0 and journaled uncaptured, so the ship plan after
+the close, unable to tell what depended on a transaction deferred on a
+member's chunk, deferred everything after it: one member away with the
+only copy of a chunk stalled the whole cluster's log at its pre-epoch
+head. Now the plan skips exactly that transaction and its dependents
+(a refusal counts as depending on the keys it observed), the publisher
+substitutes, a deposed hold owner rolls back and replays by rid, and a
+member gone for good is an operator decision: `repair drop-held <ino>
+--remote` drops the write into a conflict copy whose refusal ships —
+members' streamed copies and the requester's shadow roll back on it.
+Consequences on the rules above: a member's streamed copy of a
+transaction the tenure shipped past without naming is rolled back
+(it was dropped), never confirmed; a stream-ahead a member already holds
+is not installed again; a handoff whose flush cannot drain the journal
+is declined (the deferred rows would bounce between epochs); a round
+that shipped nothing does not follow itself at once.
+
 **See**: plan 30 §M10;
 [Durability and failover — flexible continuation epochs](../reference/features/durability-and-failover.md#flexible-continuation-epochs);
 [`crates/authority/src/core/promise.rs`](../../crates/authority/src/core/promise.rs),

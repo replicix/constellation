@@ -542,6 +542,45 @@ impl Core {
         }
     }
 
+    /// Take the continuation epoch's hold at `epoch`, and capture under
+    /// it. The hold owner's journal is speculation like any holder's
+    /// (ADR-19): its transactions are captured with their before-images,
+    /// so the ship plan after the close skips exactly a transaction that
+    /// waits for a member's chunk (and its dependents) instead of
+    /// everything journaled after it, the publisher substitutes them,
+    /// and a deposed hold owner rolls back and replays by rid instead of
+    /// rebuilding from the head commit. Before this, the hold set
+    /// `Meta::holder_epoch` to 0 (since M5) and journaled uncaptured:
+    /// one member away with the only copy of a chunk stalled the whole
+    /// cluster's log at its pre-epoch head (`epoch-member-dies-with-chunk`).
+    ///
+    /// `epoch` is the epoch the flush will ship under, so nothing of the
+    /// hold's journal is stranded by the flush's own acquisition gate
+    /// (`strand_for_takeover(gate.epoch)`), and a member's position
+    /// `(epoch, jseq)` is reached by the flush's segments and by nothing
+    /// earlier: see [`Self::epoch_hold_epoch_for`].
+    pub(crate) fn adopt_epoch_hold(&mut self, now: Ms, epoch: Epoch, replica: &dyn Replica) {
+        self.lease.adopt_epoch_hold(now, epoch);
+        replica.set_holder_epoch(self.lease.epoch_hold().unwrap_or(0));
+    }
+
+    /// The epoch a hold this node takes over P2P journals under: the
+    /// epoch its flush CAS grants once the epoch closes
+    /// (`LeaseState::granted_lease`'s rule on the carried lease object,
+    /// which nothing else can touch while the epoch is open — its
+    /// members promise nothing, and a taker needs their promises). The
+    /// carrier re-adopts its own lease at the same epoch; anyone else
+    /// takes it over at the next one. A chain of transfers stays at
+    /// that next epoch (the object is still the carrier's). Without the
+    /// carrier known (no activation seen), the giver's epoch.
+    pub(crate) fn epoch_hold_epoch_for(&self, giver_epoch: Epoch) -> Epoch {
+        match self.pr.carried {
+            Some(c) if c.node == self.cfg.node_id => c.epoch.max(1),
+            Some(c) => c.epoch.max(1) + 1,
+            None => giver_epoch.max(1),
+        }
+    }
+
     /// A restarted hold owner: its epoch is still open, so it re-adopts
     /// the hold it persisted (it alone journaled under it; the flush its
     /// members wait for is its to do).
@@ -568,8 +607,7 @@ impl Core {
             "re-adopting the persisted epoch hold"
         );
         self.skip_ship = true;
-        self.lease.adopt_epoch_hold(now, epoch);
-        replica.set_holder_epoch(0);
+        self.adopt_epoch_hold(now, epoch, replica);
     }
 
     /// The activation's resolution says this node's claim is stale.

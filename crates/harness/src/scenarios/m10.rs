@@ -19,7 +19,7 @@
 //! rule is the model's and the core tests' (`m9_*`, `epoch_rules`); here
 //! the lease is `Local` so the epoch always carries it.
 
-use super::{ensure_no_conflicts, eventually, lease_of, setup, ts, wait_for_p2p};
+use super::{ensure_no_conflicts, eventually, lease_of, log_segment_seqs, setup, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::reqlog::CountingProxy;
 use crate::s3env::BUCKET;
@@ -488,15 +488,23 @@ pub fn epoch_holder_retired(_seed: u64) -> Result<()> {
 /// holds the only copy of the second file's chunk), and:
 /// - B's read of the second file fails; it never returns other bytes;
 /// - S3 returns for A and B: the epoch closes, and A's ship defers the
-///   two manifests, which wait for C's chunks (`held.deferred`), and —
-///   the epoch journal being uncaptured — everything journaled after the
-///   first of them. A fresh node reading the bucket never sees a manifest
+///   two manifests, which wait for C's chunks (`held.deferred`) — and
+///   only them (fix "capture under an epoch hold": the epoch journal is
+///   captured, so the plan skips exactly a deferred transaction and its
+///   dependents): A's own write after the close reaches S3 and B while
+///   C is away, and `status.held.remote` names C's chunks for the
+///   operator. A fresh node reading the bucket never sees a manifest
 ///   naming a chunk S3 lacks (that read would fail);
 /// - B keeps both manifests as speculation (`speculation.outstanding`),
 ///   so nothing B publishes contains them.
 ///
-/// C comes back: its chunks go up, A ships the manifests, and every node
-/// (the fresh one included) reads both files.
+/// Then, by the seed's parity: C comes back — its chunks go up, A ships
+/// the manifests, and every node (the fresh one included) reads both
+/// files; or C is given up — `constellation repair drop-held <ino>
+/// --remote` on A turns each write into a conflict copy with the chunk
+/// as a hole, its refusal reaches the log, B's streamed copies and C's
+/// own shadows (once it is back) roll back, and every node converges on
+/// the two files as empty. Nothing is lost silently either way.
 pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
     const NAME: &str = "epoch-member-dies-with-chunk";
     let (env, root) = setup(NAME)?;
@@ -507,7 +515,14 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
         env.counting_proxy()?,
         env.counting_proxy()?,
     );
-    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let prefix = format!("{NAME}-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let log_head = || -> Result<u64> {
+        Ok(log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?
+            .last()
+            .copied()
+            .unwrap_or(0))
+    };
     // A's close flush waits this long for chunks a member forwarded as
     // pending before it ships what does not need them.
     let extra = [("CONSTELLATION_REMOTE_CHUNK_WAIT_S", "5")];
@@ -531,6 +546,7 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
         })?;
     }
     let a_id = node_id(&a)?;
+    let c_id = node_id(&c)?;
 
     pa.cut();
     pb.cut();
@@ -638,13 +654,58 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
         anyhow::bail!("B read c/only-on-c ({} bytes) with C gone", got.len());
     }
 
-    // A fresh node, S3 only: the log names no chunk S3 lacks. C's files
-    // are absent (their creates wait with the manifests, or depend on
-    // them) or empty — and readable either way: a manifest naming C's
-    // chunk would fail here. (Everything A journaled after the first of
-    // C's manifests waits too: the epoch hold journals uncaptured, so the
-    // ship plan cannot tell what depends on a deferred transaction and
-    // defers the rest — `store::held`'s opaque rule.)
+    // Fix "capture under an epoch hold": only C's manifests (and what
+    // depends on them) wait. A's own write after the close ships while
+    // C is away — the log moves, and B applies it — with the manifests
+    // still deferred.
+    let head_before = log_head()?;
+    let after = b"written on A after the close, while C is away".to_vec();
+    std::fs::write(a.mnt.join("c/after-close"), &after).context("A's write after the close")?;
+    eventually(
+        "A's own write reaches S3 while C's chunks are away",
+        Duration::from_secs(60),
+        || {
+            let s = a.control_status()?;
+            anyhow::ensure!(
+                s["held"]["deferred"].as_u64().unwrap_or(0) >= 2,
+                "A no longer defers C's manifests: {}",
+                s["held"]
+            );
+            anyhow::ensure!(
+                !s["held"]["opaque"].as_bool().unwrap_or(true),
+                "the epoch journal was uncaptured: {}",
+                s["held"]
+            );
+            let head = log_head()?;
+            anyhow::ensure!(
+                head > head_before,
+                "the log is still at {head}: A spool {} held {}\n--- A log ---\n{}",
+                s["spool"],
+                s["held"],
+                a.tail_log_n(40)
+            );
+            Ok(())
+        },
+    )?;
+    // What the operator sees: the chunks A waits for, and whose.
+    let remote = a.control_status()?["held"]["remote"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    anyhow::ensure!(
+        remote.len() >= 2 && remote.iter().all(|r| r["node"].as_u64() == Some(c_id)),
+        "status does not name C's chunks under held.remote: {remote:?}"
+    );
+    let deferred_inos: std::collections::BTreeSet<u64> =
+        remote.iter().filter_map(|r| r["ino"].as_u64()).collect();
+    eprintln!(
+        "    {NAME}: A after the close: held {} remote {:?}",
+        a.control_status()?["held"],
+        remote
+            .iter()
+            .map(|r| format!("{}:{}@{}", r["ino"], r["path"], r["node"]))
+            .collect::<Vec<_>>()
+    );
     let a_status = a.control_status()?;
     eprintln!(
         "    {NAME}: A after the close: held {} spool {}",
@@ -676,32 +737,150 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
         );
     }
 
-    // C returns: its chunks go up, A ships the manifests, all converge.
-    c.resume()?;
-    pc.heal();
-    for x in [&a, &b, &c, &d] {
+    eventually("D (S3 only) has A's write", Duration::from_secs(60), || {
+        let got = std::fs::read(d.mnt.join("c/after-close"))?;
+        anyhow::ensure!(got == after, "D has {} bytes of c/after-close", got.len());
+        Ok(())
+    })?;
+    let pb_at_heal = pb.tally().total();
+    // B's own view of it is reported, not asserted: after the cut and
+    // heal B's S3 client can stay wedged for minutes (every request
+    // fails "error sending request" while its proxy relays them), and B
+    // holds no stream from A after A's flush — a finding outside this
+    // fix (the old scenario never needed B's S3 after the heal). B still
+    // holds C's manifests as speculation.
+    match std::fs::read(b.mnt.join("c/after-close")) {
+        Ok(got) if got == after => eprintln!("    {NAME}: B has A's write already"),
+        other => {
+            let sb = b.control_status()?;
+            eprintln!(
+                "    {NAME}: B without A's write yet ({other:?}): spool {} speculation {} proxy \
+                 relayed {} since the heal",
+                sb["spool"],
+                sb["speculation"],
+                pb.tally().total().saturating_sub(pb_at_heal)
+            );
+        }
+    }
+    anyhow::ensure!(
+        b.control_status()?["speculation"]["outstanding"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "B no longer holds C's manifests as speculation"
+    );
+
+    if seed.is_multiple_of(2) {
+        // C returns: its chunks go up, A ships the manifests, all converge.
+        c.resume()?;
+        pc.heal();
+        for x in [&a, &b, &c, &d] {
+            eventually(
+                &format!("{} reads C's files", x.name),
+                Duration::from_secs(120),
+                || {
+                    for (path, want) in [("c/early", &early), ("c/only-on-c", &only)] {
+                        let got = std::fs::read(x.mnt.join(path))?;
+                        anyhow::ensure!(
+                            &got == want,
+                            "{} has {} bytes of {path}",
+                            x.name,
+                            got.len()
+                        );
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        eventually("A's journal drains", Duration::from_secs(60), || {
+            let s = a.control_status()?;
+            anyhow::ensure!(
+                s["spool"]["journal_backlog"].as_u64() == Some(0),
+                "A: {}",
+                s["spool"]
+            );
+            Ok(())
+        })?;
+        ensure_no_conflicts(&[&a, &b, &c, &d])?;
+    } else {
+        // C is given up: the operator drops what waits for its chunks.
+        for ino in &deferred_inos {
+            let reply =
+                a.control(&serde_json::json!({ "cmd": "drop_held", "ino": ino, "remote": true }))?;
+            anyhow::ensure!(reply["resp"] == "ok", "drop-held --remote failed: {reply}");
+            eprintln!("    {NAME}: {}", reply["detail"]);
+        }
         eventually(
-            &format!("{} reads C's files", x.name),
-            Duration::from_secs(120),
+            "A drains, and the conflict copies exist",
+            Duration::from_secs(90),
             || {
-                for (path, want) in [("c/early", &early), ("c/only-on-c", &only)] {
-                    let got = std::fs::read(x.mnt.join(path))?;
-                    anyhow::ensure!(&got == want, "{} has {} bytes of {path}", x.name, got.len());
-                }
+                let s = a.control_status()?;
+                anyhow::ensure!(
+                    s["spool"]["journal_backlog"].as_u64() == Some(0)
+                        && s["held"]["deferred"].as_u64() == Some(0)
+                        && s["held"]["remote"].as_array().is_some_and(|r| r.is_empty()),
+                    "A: spool {} held {}",
+                    s["spool"],
+                    s["held"]
+                );
+                // The copies live beside the files: `c/.constellation-conflict/`.
+                let dir = a.mnt.join("c/.constellation-conflict");
+                let names: Vec<String> = std::fs::read_dir(&dir)
+                    .map(|d| {
+                        d.filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                anyhow::ensure!(
+                    names.iter().any(|n| n.starts_with("early@"))
+                        && names.iter().any(|n| n.starts_with("only-on-c@")),
+                    "conflict copies on A: {names:?} (spool {})",
+                    s["spool"]
+                );
                 Ok(())
             },
         )?;
-    }
-    eventually("A's journal drains", Duration::from_secs(60), || {
-        let s = a.control_status()?;
-        anyhow::ensure!(
-            s["spool"]["journal_backlog"].as_u64() == Some(0),
-            "A: {}",
-            s["spool"]
+        // C comes back with its bytes, too late: its writes were refused
+        // in the log, so its own copies roll back like B's streamed ones.
+        c.resume()?;
+        pc.heal();
+        for x in [&a, &c, &d] {
+            eventually(
+                &format!("{} converges on the dropped files", x.name),
+                Duration::from_secs(120),
+                || {
+                    for path in ["c/early", "c/only-on-c"] {
+                        let got = std::fs::read(x.mnt.join(path))?;
+                        anyhow::ensure!(
+                            got.is_empty(),
+                            "{} still has {} bytes of {path}",
+                            x.name,
+                            got.len()
+                        );
+                    }
+                    let got = std::fs::read(x.mnt.join("c/after-close"))?;
+                    anyhow::ensure!(got == after, "{} lost c/after-close", x.name);
+                    let s = x.control_status()?;
+                    anyhow::ensure!(
+                        s["speculation"]["outstanding"].as_u64() == Some(0)
+                            && s["spool"]["journal_backlog"].as_u64() == Some(0),
+                        "{}: speculation {} spool {}",
+                        x.name,
+                        s["speculation"],
+                        s["spool"]
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        let sb = b.control_status()?;
+        eprintln!(
+            "    {NAME}: B after the drop: spool {} speculation {}",
+            sb["spool"], sb["speculation"]
         );
-        Ok(())
-    })?;
-    ensure_no_conflicts(&[&a, &b, &c, &d])?;
+        ensure_no_conflicts(&[&c, &d])?;
+    }
     for x in [&mut a, &mut b, &mut c, &mut d] {
         x.unmount()?;
     }

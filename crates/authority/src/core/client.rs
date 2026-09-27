@@ -1526,7 +1526,7 @@ impl Core {
                 // (long-acks3 seed 50277: EEXIST for a name a newer
                 // holder had already renamed away).
                 let errno = meta_errno(&error);
-                self.record_refusal(rid, errno, replica);
+                self.record_refusal(rid, errno, Some(&op), replica);
                 (MutateOutcome::Errno(errno), None)
             }
         };

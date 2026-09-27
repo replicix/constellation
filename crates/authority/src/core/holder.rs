@@ -426,7 +426,7 @@ impl Core {
                 _ => MutateOutcome::Errno(libc::EAGAIN),
             },
             Err(MetaError::Exists) => {
-                self.record_refusal(rid, libc::EEXIST, replica);
+                self.record_refusal(rid, libc::EEXIST, Some(op), replica);
                 match named_child(op) {
                     Some((parent, name)) => match replica.entry_as_record(parent, name) {
                         Some(record) => MutateOutcome::Exists {
@@ -440,7 +440,7 @@ impl Core {
             }
             Err(e) => {
                 let errno = meta_errno(&e);
-                self.record_refusal(rid, errno, replica);
+                self.record_refusal(rid, errno, Some(op), replica);
                 MutateOutcome::Errno(errno)
             }
         };
@@ -458,8 +458,17 @@ impl Core {
     /// unshipped journal work like any other: the reply's position
     /// carries it, and under `Backup`/`S3` the acknowledgement waits for
     /// it.
-    pub(crate) fn record_refusal(&mut self, rid: Rid, errno: i32, replica: &dyn Replica) {
-        if let Err(error) = replica.journal_refusal(rid, errno) {
+    /// `op`: the refused op, so the row records what it observed
+    /// (`JournalTx::observed`) and the ship plan keeps the refusal behind
+    /// a deferred transaction that produced that state.
+    pub(crate) fn record_refusal(
+        &mut self,
+        rid: Rid,
+        errno: i32,
+        op: Option<&MutateOp>,
+        replica: &dyn Replica,
+    ) {
+        if let Err(error) = replica.journal_refusal(rid, errno, op) {
             tracing::warn!(node = self.cfg.node_id, ?rid, errno, %error, "could not journal a refusal");
             return;
         }

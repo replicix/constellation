@@ -1375,3 +1375,156 @@ fn a_streamed_manifest_held_back_by_its_chunk_stays_speculation_until_it_ships()
         "the stranded manifest was not rolled back"
     );
 }
+
+/// Fix "capture under an epoch hold", `repair drop-held --remote`: the
+/// chunk's owner never came back and the operator dropped the deferred
+/// manifest on the holder (a conflict copy there; the rows leave its
+/// journal). The holder's next segment, same epoch, ships *past* the
+/// dropped rows — `through` beyond them, its rows not named — and the
+/// member must roll its streamed copy back, not keep it as confirmed
+/// (M9's first rule retired it by `through` alone, and the dropped write
+/// stayed in the member's namespace for good). A later streamed
+/// transaction on the same inode (its chmod) is rolled back with it and
+/// comes back only through the log.
+#[test]
+fn a_streamed_transaction_the_tenure_ships_past_is_rolled_back() {
+    let (f, g) = (ino(72), ino(73));
+    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let seg1 = [create("f", f, t0), create("g", g, t0 + 1)];
+    let rid = |node: u64| Rid {
+        node,
+        incarnation: 1,
+        seq: 1,
+    };
+    let manifest_tx = [
+        LogRecord::WriteManifest {
+            ino: f,
+            base_manifest: None,
+            manifest: vec![0xAB; 24],
+            size: 4096,
+            time_ns: t0 + 2,
+        },
+        completed(rid(3)),
+    ];
+    // Depends on the manifest (the same inode); requeued by rid on the
+    // holder when the manifest is dropped, and re-journaled after.
+    let chmod_f_tx = [chmod(f, 0o600, t0 + 3), completed(rid(2))];
+    let chmod_g_tx = [chmod(g, 0o640, t0 + 4), completed(rid(4))];
+    // What the holder ships after the drop: the unrelated chmod (its
+    // rows 6–7, through 7: past the dropped 2–3 and the requeued 4–5).
+    let replayed_chmod_f = [chmod(f, 0o600, t0 + 5), completed(rid(2))];
+
+    let member = Meta::open_in_memory().unwrap();
+    apply(&member, 1, 1, &seg1);
+    member.install_streamed(1, 2, 3, &manifest_tx).unwrap();
+    member.install_streamed(1, 4, 5, &chmod_f_tx).unwrap();
+    member.install_streamed(1, 6, 7, &chmod_g_tx).unwrap();
+    assert_eq!(member.speculation_counts().unwrap().outstanding, 3);
+    assert!(member.manifest(f).unwrap().is_some());
+
+    member
+        .apply_segment_rows(2, 1, 7, &[6, 7], &[], &chmod_g_tx, &TouchSet::default())
+        .unwrap();
+    assert!(
+        member.manifest(f).unwrap().is_none(),
+        "the dropped manifest stayed in the member's namespace"
+    );
+    assert_eq!(
+        member.getattr(f).unwrap().unwrap().mode & 0o7777,
+        0o644,
+        "the chmod streamed after the dropped manifest was kept"
+    );
+    assert_eq!(member.getattr(g).unwrap().unwrap().mode & 0o7777, 0o640);
+    assert!(
+        !member.has_outstanding_speculation(),
+        "{:?}",
+        member.speculation_counts()
+    );
+
+    // The requeued chmod comes back through the log.
+    member
+        .apply_segment_rows(
+            3,
+            1,
+            9,
+            &[8, 9],
+            &[],
+            &replayed_chmod_f,
+            &TouchSet::default(),
+        )
+        .unwrap();
+    let expected = Meta::open_in_memory().unwrap();
+    apply(&expected, 1, 1, &seg1);
+    apply(&expected, 2, 1, &chmod_g_tx);
+    apply(&expected, 3, 1, &replayed_chmod_f);
+    assert_eq!(raw_ns(&member), raw_ns(&expected));
+}
+
+/// Fix "capture under an epoch hold": installing a streamed transaction
+/// this replica already holds (the holder streams from its start again;
+/// a restarted subscriber lost the cursor that skipped it) changes
+/// nothing — flex-backup seed 1230's member re-applied `rename f2 f3`
+/// after a later create had reused `f2`.
+#[test]
+fn a_streamed_transaction_installed_twice_is_installed_once() {
+    let (f2, f3) = (ino(80), ino(81));
+    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let meta = Meta::open_in_memory().unwrap();
+    apply(&meta, 1, 1, &[create("f2", f2, t0)]);
+    let rename = [
+        LogRecord::Rename {
+            parent: ROOT_INO,
+            name: "f2".into(),
+            new_parent: ROOT_INO,
+            new_name: "f3".into(),
+            time_ns: t0 + 1,
+        },
+        completed(rid(1)),
+    ];
+    let recreate = [create("f2", f3, t0 + 2), completed(rid(2))];
+    meta.install_streamed(1, 2, 3, &rename).unwrap();
+    meta.install_streamed(1, 4, 5, &recreate).unwrap();
+    assert_eq!(meta.streamed_tip(1).unwrap(), Some(5));
+    let before = raw_ns(&meta);
+    meta.install_streamed(1, 2, 3, &rename).unwrap();
+    meta.install_streamed(1, 4, 5, &recreate).unwrap();
+    assert_eq!(raw_ns(&meta), before, "installed twice");
+    assert_eq!(meta.speculation_counts().unwrap().outstanding, 2);
+    assert_eq!(
+        MetaStore::lookup(&meta, ROOT_INO, "f3")
+            .unwrap()
+            .map(|e| e.ino),
+        Some(f2),
+        "the rename kept the inode it moved"
+    );
+    assert_eq!(meta.streamed_tip(2).unwrap(), None);
+}
+
+/// Fix "capture under an epoch hold": the log refuses a rid this node
+/// holds a shadow of (the holder dropped the op: `repair drop-held`).
+/// The shadow is rolled back and nothing is queued for replay — the
+/// outcome is final and the holder's conflict copy is the artifact.
+#[test]
+fn a_refused_rid_in_the_log_rolls_its_shadow_back_without_a_replay() {
+    let meta = Meta::open_in_memory().unwrap();
+    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    apply(&meta, 1, 1, &[create("a", ino(90), t0)]);
+    let r = rid(31);
+    let records = [create("b", ino(91), t0 + 1), completed(r)];
+    assert!(meta
+        .install_shadow(r, 1, &create_op("b", ino(91)), &records)
+        .unwrap());
+    assert!(MetaStore::lookup(&meta, ROOT_INO, "b").unwrap().is_some());
+    apply(&meta, 2, 1, &[LogRecord::Refused { rid: r, errno: 5 }]);
+    assert!(
+        MetaStore::lookup(&meta, ROOT_INO, "b").unwrap().is_none(),
+        "the shadow's effect was kept although the log refused its rid"
+    );
+    let counts = meta.speculation_counts().unwrap();
+    assert_eq!(
+        (counts.outstanding, counts.pending_replay),
+        (0, 0),
+        "{counts:?}"
+    );
+    assert!(meta.pending_replays().unwrap().is_empty());
+}

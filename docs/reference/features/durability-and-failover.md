@@ -426,6 +426,15 @@ Operational rules:
 - Writes inside an epoch are acknowledged on the hold owner's disk
   alone (no backups). A write another member forwards to the hold owner
   leaves its chunks on that member.
+- The hold owner journals its epoch writes captured (before-images),
+  as an ordinary holder does, under the epoch its flush will ship under.
+  At the close the flush ships everything the plan can: a manifest
+  waiting for a member's chunk is *deferred* (`status.held.deferred`),
+  and only what depends on it waits with it; the hold owner's own later
+  writes and every other node's reach S3 meanwhile. `status.held.remote`
+  lists each awaited chunk with the node expected to upload it and how
+  long it has waited. A deposed hold owner recovers like a deposed
+  holder: its journal is rolled back and replayed by request id.
 - Members keep following the hold owner's log stream through the epoch
   (S3 cannot deliver the log then, so the stream is the only way). The
   hold owner keeps serving the segments it shipped before the outage,
@@ -486,10 +495,14 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 - A member that dies holding the only copy of a chunk its epoch write
   named (a forwarded close; nothing reaches S3 during an epoch): other
   members reading that file get `EIO` (never other bytes), and the hold
-  owner defers the write's manifest until the chunk is in S3. The epoch
-  journal carries no before-images, so the owner defers everything it
-  journaled after that write too: the log does not move past it until
-  the member returns (`status.held.deferred`).
+  owner defers that write's manifest (and what depends on it) until the
+  chunk is in S3 — the member returns and uploads it, or the operator
+  gives the member up with `constellation repair drop-held <ino>
+  --remote` ([Write-path hygiene](write-path-hygiene.md#a-chunk-only-a-departed-node-had)).
+  Everything else keeps shipping.
+- A member whose own S3 path stays broken after the outage cannot read
+  the lease object, so it cannot tell the epoch is over: it stays frozen
+  (`EROFS`) until its S3 works or the missing member returns over P2P.
 
 ## Configuration
 
@@ -531,7 +544,11 @@ See [Configuration](../configuration.md) for parsing rules.
   `promise_requests_refused`, `promise_checks`,
   `takeovers_refused_promises`, `promise_flush_exempt`, `stale_claims`,
   `streamed_ahead` (hold owner), `streamed_installed`,
-  `forwards_streamed` (member), `handoffs_behind`.
+  `forwards_streamed` (member), `handoffs_behind`;
+- `held`: `deferred` (transactions waiting for a chunk still uploading,
+  a member's included) and `remote[]` (each awaited chunk: `ino`,
+  `path`, `node`, `chunk`, `age_s`); see
+  [Write-path hygiene](write-path-hygiene.md#statusheld).
 
 ## Troubleshooting
 

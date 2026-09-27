@@ -59,9 +59,11 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
         let payload = log.get_segment(*seq).await.expect("segment");
         let seg = segment::decode(&payload).expect("decode");
         describe.push(format!(
-            "seq {seq} epoch {} node {} records {:?}",
+            "seq {seq} epoch {} node {} through {} rows {:?} records {:?}",
             seg.epoch,
             seg.node,
+            seg.through,
+            seg.rows,
             seg.records
                 .iter()
                 .map(|r| match r {

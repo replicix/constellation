@@ -191,9 +191,10 @@ impl Meta {
         rid: Rid,
         errno: i32,
         ack: InboxAck,
+        op: Option<&crate::mutate::MutateOp>,
     ) -> Result<(), MetaError> {
         let _pending = PendingInboxAck::set(ack);
-        self.journal_refusal(rid, errno)
+        self.journal_refusal(rid, errno, op)
     }
 
     /// Plan 30 §M9: the holder refused a *forwarded* op by rid: the same
@@ -206,7 +207,19 @@ impl Meta {
     /// have changed (the long-backup seeds 50064 and 50126: a refused
     /// unlink / create executed a second time and succeeded, after its
     /// client had been told ENOENT / EEXIST).
-    pub fn journal_refusal(&self, rid: Rid, errno: i32) -> Result<(), MetaError> {
+    ///
+    /// `op`, when known, is the refused op: the names and inodes it looked
+    /// at are recorded as the transaction's observed keys
+    /// (`JournalTx::observed`), so the ship plan never ships the refusal
+    /// ahead of a deferred transaction that produced what it saw
+    /// (`journal::PendingObserved`).
+    pub fn journal_refusal(
+        &self,
+        rid: Rid,
+        errno: i32,
+        op: Option<&crate::mutate::MutateOp>,
+    ) -> Result<(), MetaError> {
+        let _observed = op.map(|op| journal::PendingObserved::set(observed_keys(op)));
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
         let position = journal::append_tx(
@@ -313,6 +326,26 @@ impl Meta {
     }
 }
 
+/// The `ns` keys an op reads to decide its outcome: its dentries and the
+/// inodes it changes (`TouchSet::from_op`, without the parent
+/// directories' shared holds — a refusal's reason never rests on a
+/// directory's times or link count).
+pub(crate) fn observed_keys(op: &crate::mutate::MutateOp) -> Vec<Vec<u8>> {
+    let touched = crate::replay::TouchSet::from_op(op);
+    let mut out: Vec<Vec<u8>> = touched
+        .dentries
+        .iter()
+        .map(|(parent, name)| constellation_mtree::keys::dentry(*parent, name.as_bytes()))
+        .collect();
+    out.extend(
+        touched
+            .inos
+            .iter()
+            .map(|ino| constellation_mtree::keys::inode(*ino)),
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,7 +443,8 @@ mod tests {
     #[test]
     fn a_refusal_is_a_completed_row_that_completed_position_does_not_report() {
         let m = Meta::open_in_memory().unwrap();
-        m.journal_inbox_refusal(rid(5), EEXIST, ack(1, 0)).unwrap();
+        m.journal_inbox_refusal(rid(5), EEXIST, ack(1, 0), None)
+            .unwrap();
         assert_eq!(m.refused_errno(rid(5)).unwrap(), Some(EEXIST));
         assert_eq!(m.completed_position(rid(5)).unwrap(), None);
         assert_eq!(m.inbox_ack(3, 7).unwrap(), Some(ack(1, 0)));

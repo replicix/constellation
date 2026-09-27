@@ -11,6 +11,7 @@
 mod sim {
     pub mod bus;
     pub mod check;
+    pub mod chunks;
     pub mod clock;
     pub mod cto;
     pub mod epochs;
@@ -1938,19 +1939,38 @@ fn long_backup() {
 /// takeover of the expired lease must be refused (no promise outlasts
 /// the expiry: the members are silent). Then S3 returns, the epoch
 /// flushes, everyone converges.
+///
+/// Fix "capture under an epoch hold": clients write the files they
+/// create (one chunk each, dirty on the writer: `sim::chunks`), and once
+/// the epoch is active a member other than the hold owner dies — with
+/// the only copy of a chunk the owner's epoch journal names, when it
+/// has one — and returns with its disk 6 s later, after the outage
+/// heals. The owner's flush defers exactly that transaction and its
+/// dependents, ships the rest, and the write ships once the member's
+/// chunk is up. Every run checks that no segment ever names a chunk S3
+/// lacks and that the log never stalls behind a deferred transaction.
 fn flex_config() -> SimConfig {
     SimConfig {
         ops_per_client: 8,
         random_faults: 0,
         epoch_slack: 1,
+        chunk_writes: 0.3,
         core: std::sync::Arc::new(sim::run::flex_core_config),
-        faults: vec![ScheduledFault {
-            at_ms: 1_200,
-            kind: FaultKind::EpochOutage {
-                members: 2,
-                for_ms: 5_000,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::EpochOutage {
+                    members: 2,
+                    for_ms: 5_000,
+                },
             },
-        }],
+            ScheduledFault {
+                at_ms: 2_500,
+                kind: FaultKind::CrashEpochMember {
+                    restart_ms: Some(6_000),
+                },
+            },
+        ],
         ..SimConfig::default()
     }
 }
@@ -1965,12 +1985,23 @@ fn flex_unchecked_config() -> SimConfig {
 }
 
 /// The outage plus a crash of a random node with restart, and the CI's
-/// random faults on top.
+/// random faults on top. The epoch member that dies (see `flex_config`)
+/// never returns here: the run's end applies the operator procedure,
+/// `repair drop-held --remote` on every node awaiting its chunks, and
+/// the dropped writes become conflict copies (refused replays), never
+/// silent loss; everything else converges.
 fn flex_crash_config() -> SimConfig {
+    let mut faults = flex_config().faults;
+    for f in &mut faults {
+        if let FaultKind::CrashEpochMember { restart_ms } = &mut f.kind {
+            *restart_ms = None;
+        }
+    }
     SimConfig {
         random_faults: 2,
         read_ratio: 0.3,
         join_fresh: false,
+        faults,
         ..flex_config()
     }
 }
@@ -1996,6 +2027,15 @@ struct FlexTotals {
     promise_answers: u64,
     flush_exempt: u64,
     samples: u64,
+    /// Fix "capture under an epoch hold" (`sim::chunks`).
+    chunk_writes: u64,
+    chunks_uploaded: u64,
+    remote_enrolled: u64,
+    remote_acked: u64,
+    deferred_seen: u64,
+    remote_dropped: u64,
+    members_gone: u64,
+    converged: u64,
 }
 
 fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTotals {
@@ -2008,6 +2048,14 @@ fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTot
         t.epochs += report.epochs_formed;
         t.missing_node += report.epochs_missing_node;
         t.samples += report.authority_samples;
+        t.chunk_writes += report.chunk_writes;
+        t.chunks_uploaded += report.chunks_uploaded;
+        t.remote_enrolled += report.remote_enrolled;
+        t.remote_acked += report.remote_acked;
+        t.deferred_seen += report.deferred_seen;
+        t.remote_dropped += report.remote_dropped;
+        t.members_gone += report.member_gone as u64;
+        t.converged += report.converged_checked as u64;
         for s in report.stats.values() {
             t.refused += s.takeovers_refused_promises;
             t.promise_checks += s.promise_checks;
@@ -2065,6 +2113,47 @@ fn flex_without_the_promise_check_is_found() {
 fn flex_epochs_survive_crashes_and_faults() {
     let t = run_flex("flex-crash", flex_crash_config(), 1100..1160);
     assert!(t.epochs > 0, "{t:?}");
+}
+
+/// Fix "capture under an epoch hold": in `flex_config` a member dies
+/// with the only copy of a chunk the hold owner's epoch journal names
+/// and returns after the outage. The owner journals captured under the
+/// hold, so its flush defers only that write and its dependents and the
+/// log keeps moving (every run fails on a stall behind a deferred
+/// transaction, and on a segment naming a chunk S3 lacks); the write
+/// ships once the member's chunk is up, and everything converges.
+#[test]
+fn flex_a_member_dies_with_the_only_copy_of_a_chunk_and_returns() {
+    let t = run_flex("flex", flex_config(), 1000..1040);
+    assert!(t.chunk_writes > 0 && t.chunks_uploaded > 0, "{t:?}");
+    assert!(
+        t.remote_enrolled > 0,
+        "no forwarded manifest ever named a chunk pending on its sender: {t:?}"
+    );
+    assert!(
+        t.deferred_seen > 0,
+        "no ship plan ever deferred a transaction on a member's chunk: {t:?}"
+    );
+    assert_eq!(t.members_gone, 0, "{t:?}");
+    assert_eq!(t.remote_dropped, 0, "nothing needs dropping: {t:?}");
+    assert_eq!(t.converged, t.seeds, "every seed converges: {t:?}");
+}
+
+/// The same member never returns (`flex_crash_config`): the log still
+/// moves, and at the end the operator procedure drops what waited for
+/// its chunks into conflict copies — the cluster is then quiescent and
+/// converged on the log, with no silent loss (each dropped write is a
+/// refused replay).
+#[test]
+fn flex_crash_a_member_gone_for_good_is_dropped_by_the_operator() {
+    let t = run_flex("flex-crash", flex_crash_config(), 1100..1160);
+    assert!(t.members_gone > 0, "{t:?}");
+    assert!(
+        t.remote_dropped > 0,
+        "no run ever had a transaction to drop for a departed member: {t:?}"
+    );
+    assert!(t.deferred_seen > 0, "{t:?}");
+    assert_eq!(t.converged, t.seeds, "every seed converges: {t:?}");
 }
 
 /// Plan 30 §M10's documented gap: a node enrolled *during* an epoch is
@@ -2333,6 +2422,13 @@ fn sweep_config() {
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let streamed_deleg = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let epoch_streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Fix "capture under an epoch hold": [remote rows enrolled, ship
+    // plans seen deferring, transactions dropped for a departed member].
+    let chunks = std::sync::Arc::new([
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ]);
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
     let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut handles = Vec::new();
@@ -2340,6 +2436,7 @@ fn sweep_config() {
         let (next, failures, label) = (next.clone(), failures.clone(), label.clone());
         let (streamed, streamed_deleg) = (streamed.clone(), streamed_deleg.clone());
         let epoch_streamed = epoch_streamed.clone();
+        let chunks = chunks.clone();
         handles.push(std::thread::spawn(move || loop {
             let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if seed >= start + seeds {
@@ -2353,6 +2450,9 @@ fn sweep_config() {
                         streamed_deleg.fetch_add(s.awaited_log_streamed_deleg, ord);
                         epoch_streamed.fetch_add(s.epoch_streamed_installed, ord);
                     }
+                    chunks[0].fetch_add(report.remote_enrolled, ord);
+                    chunks[1].fetch_add(report.deferred_seen, ord);
+                    chunks[2].fetch_add(report.remote_dropped, ord);
                 }
                 Err(e) => {
                     let head: String = e.lines().take(3).collect::<Vec<_>>().join(" | ");
@@ -2369,12 +2469,16 @@ fn sweep_config() {
     f.sort_unstable();
     eprintln!(
         "sweep {label} {start}..{}: {} failing: {f:?}; answered from the stream: {} ({} a delegate's); \
-         installed from an epoch's stream: {}",
+         installed from an epoch's stream: {}; remote chunks enrolled: {}, ship plans deferring: {}, \
+         dropped for a departed member: {}",
         start + seeds,
         f.len(),
         streamed.load(std::sync::atomic::Ordering::Relaxed),
         streamed_deleg.load(std::sync::atomic::Ordering::Relaxed),
         epoch_streamed.load(std::sync::atomic::Ordering::Relaxed),
+        chunks[0].load(std::sync::atomic::Ordering::Relaxed),
+        chunks[1].load(std::sync::atomic::Ordering::Relaxed),
+        chunks[2].load(std::sync::atomic::Ordering::Relaxed),
     );
     assert!(f.is_empty(), "failing seeds: {f:?}");
 }
@@ -3266,12 +3370,20 @@ fn flex_crash_regression_seeds() {
 /// Now the stream delivers it: installed ahead of the log, answered, and
 /// every seed still checks out (the streamed transactions are retired by
 /// the segments the flush ships at the close, or stranded).
+///
+/// On `flex_config` without its member crash (fix "capture under an
+/// epoch hold"): the sim's counters are per incarnation, so the crashed
+/// member's installs die with its restart, and its re-streamed journal
+/// is (rightly) skipped after it — the crash variant has its own tests.
 #[test]
 fn flex_members_follow_the_epoch_holders_stream() {
+    let mut cfg = flex_config();
+    cfg.faults
+        .retain(|f| !matches!(f.kind, FaultKind::CrashEpochMember { .. }));
     let (mut installed, mut answered, mut ahead) = (0, 0, 0);
     for seed in 20_000..20_040 {
         let report =
-            run_seed(seed, flex_config()).unwrap_or_else(|e| panic!("flex seed {seed}: {e}"));
+            run_seed(seed, cfg.clone()).unwrap_or_else(|e| panic!("flex seed {seed}: {e}"));
         for s in report.stats.values() {
             installed += s.epoch_streamed_installed;
             answered += s.epoch_forwards_streamed;

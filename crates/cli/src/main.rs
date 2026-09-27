@@ -389,8 +389,16 @@ enum RepairCommand {
     /// Records that only depended on them are rolled back and replayed.
     DropHeld {
         target: String,
-        /// The inode `status` lists under `held.inodes`.
+        /// The inode `status` lists under `held.inodes` (or, with
+        /// `--remote`, under `held.remote`).
         ino: u64,
+        /// The inode's records wait for chunks another node forwarded as
+        /// pending (`held.remote`) and that node is gone for good: declare
+        /// those chunks unrecoverable and drop the records the same way.
+        /// Never use it for a node that will come back: its chunks would
+        /// upload and the write would ship by itself.
+        #[arg(long)]
+        remote: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -1220,13 +1228,14 @@ fn main() -> Result<()> {
                 RepairCommand::DropHeld {
                     target,
                     ino,
+                    remote,
                     state_dir,
                 },
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
             rt.block_on(control_call(
                 &dir,
-                constellation_api::Request::DropHeld { ino },
+                constellation_api::Request::DropHeld { ino, remote },
             ))
         }
         Command::Leave {
@@ -6181,8 +6190,8 @@ impl constellation_api::StatusSource for DaemonStatus {
         self.log_buffer.tail(lines)
     }
 
-    fn drop_held(&self, ino: u64) -> std::result::Result<String, String> {
-        held::drop_held(&self.meta, ino)
+    fn drop_held(&self, ino: u64, remote: bool) -> std::result::Result<String, String> {
+        held::drop_held(&self.meta, ino, remote)
     }
 
     fn doctor(&self) -> std::result::Result<constellation_api::DoctorStatus, String> {

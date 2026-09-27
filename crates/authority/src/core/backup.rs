@@ -247,7 +247,7 @@ pub(crate) struct BackupState {
     /// Subscriber: the next journal seq a `StreamAhead` may install for
     /// `(epoch, jseq)` — contiguity with what the log and earlier batches
     /// gave us.
-    ahead_next: Option<(Epoch, u64)>,
+    pub(crate) ahead_next: Option<(Epoch, u64)>,
     /// Subscriber: `StreamAhead` batches that arrived before the log
     /// segment they follow (`base`) — the holder streams them right after
     /// shipping it, on another QUIC stream, so they often overtake it.
@@ -2055,6 +2055,25 @@ impl Core {
                 }
                 self.stats.streamed_dropped += 1;
                 self.bk.ahead_next = None;
+                continue;
+            }
+            // Fix "capture under an epoch hold": what the replica holds
+            // already (as streamed speculation still outstanding) is not
+            // installed again. The cursor is in memory: a subscriber that
+            // restarted derives it from the log's `through`, below the
+            // journal it had streamed before — and a holder whose flush
+            // deferred part of its epoch journal (a member's chunk) keeps
+            // those rows unshipped and re-streams them to a (re)subscriber
+            // (flex-backup seed 1230: node 1 re-applied the epoch journal
+            // it held on top of itself). The replica is the truth.
+            let held_tip = replica.streamed_tip(epoch).ok().flatten();
+            if held_tip.is_some_and(|tip| tx.first <= tip) {
+                self.stats.streamed_held_already += 1;
+                self.bk.ahead_next = Some((epoch, tx.last + 1));
+                replica.note_streamed(constellation_meta::JournalPos {
+                    epoch,
+                    jseq: tx.last,
+                });
                 continue;
             }
             if tx.first != next {

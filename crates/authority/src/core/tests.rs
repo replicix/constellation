@@ -615,6 +615,212 @@ fn a_renewal_due_mid_ship_goes_out_between_two_segments() {
     );
 }
 
+/// Fix "capture under an epoch hold": a holder another node wants the
+/// lease from, whose whole backlog is a transaction deferred on a chunk
+/// only an absent node has, does not run rounds back to back until that
+/// node returns: a round that moved nothing re-arms the poll at its
+/// cadence (flex seed 1007 spun 684 433 rounds at one simulated instant).
+#[test]
+fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    submit_create(&mut h, 1, "f");
+    let ino = h.meta.child_ino(ROOT_INO, "f").unwrap().unwrap();
+    let away = constellation_fs_core::ChunkHash::of(b"only node 2 has it");
+    // Node 2 forwarded the file's manifest with its chunk still pending
+    // there; enrolled before the op executes, as the driver does.
+    h.meta.enroll_remote_chunks(ino, &[away], 2).unwrap();
+    let manifest = constellation_fs_core::Manifest {
+        layout: constellation_fs_core::ChunkLayout::new(4096),
+        file_len: 7,
+        chunks: constellation_fs_core::ChunkInfo::Inline(std::collections::BTreeMap::from([(
+            0u64, away,
+        )])),
+    }
+    .encode();
+    let rid = h.rid(2);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: MutateOp::SetManifest {
+            ino,
+            base_manifest: None,
+            manifest,
+            size: 7,
+        },
+    });
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+    // Node 2 wants the lease, and the dwell and grace have passed.
+    let long_ago = Ms(h.now.0 - 1_000_000);
+    h.core.lease.wanted = vec![2];
+    h.core.lease.wanted_since = Some(long_ago);
+    h.core.lease.held_since = Some(long_ago);
+    h.core.lease.last_write = long_ago;
+    assert!(h.core.lease.wants_handoff(h.now, h.core.config()));
+
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let mut poll = timers(&out, TimerKind::Poll)[0];
+    let mut delayed = None;
+    for round in 0..6 {
+        // Drive the round to its end: the upload pass reports nothing
+        // held, the S3 ops are answered, and every action is collected.
+        let mut polls: Vec<(TimerId, Ms)> = Vec::new();
+        let mut acts = h.step(Event::Timer { id: poll });
+        loop {
+            polls.extend(acts.iter().filter_map(|a| match a {
+                Action::SetTimer {
+                    id,
+                    at,
+                    kind: TimerKind::Poll,
+                } => Some((*id, *at)),
+                _ => None,
+            }));
+            if let Some(upload) = acts.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                acts = h.step(Event::UploadsDone {
+                    op: upload,
+                    result: UploadResult::Done { held: 0 },
+                });
+                continue;
+            }
+            if let Some((op, req)) = s3_ops(&acts).first().map(|(o, r)| (*o, (*r).clone())) {
+                let result = match req {
+                    S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                    S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                    S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                    other => panic!("unexpected S3 op in the round: {other:?}"),
+                };
+                acts = h.step(Event::S3 { op, result });
+                continue;
+            }
+            break;
+        }
+        let (id, at) = polls.last().copied().expect("the poll is re-armed");
+        if at > h.now {
+            delayed = Some(round);
+            break;
+        }
+        // The first round shipped the create and may follow up at once;
+        // a round that moved nothing must not.
+        assert_eq!(
+            round, 0,
+            "round {round} moved nothing and re-armed the poll at once"
+        );
+        poll = id;
+    }
+    let held = h.meta.held_summary();
+    assert_eq!(held.deferred, 1, "{held:?}");
+    assert!(
+        Replica::journal_len(&h.meta).unwrap() > 0,
+        "the manifest waits"
+    );
+    assert!(
+        delayed.is_some(),
+        "the rounds never settled to the poll cadence"
+    );
+    assert!(h.core.job().is_none(), "no round follows at once");
+}
+
+/// Fix "capture under an epoch hold": a handoff whose flush cannot drain
+/// the journal (a manifest deferred on a chunk only an absent node has)
+/// is declined; the lease stays, and the requester keeps forwarding.
+/// Released, the successor's epoch would strand the deferred rows here
+/// and they would be replayed and deferred there — the lease bounced to
+/// epoch 111 in flex-crash seed 3021.
+#[test]
+fn a_handoff_is_declined_while_the_journal_cannot_drain() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    submit_create(&mut h, 1, "f");
+    let ino = h.meta.child_ino(ROOT_INO, "f").unwrap().unwrap();
+    let away = constellation_fs_core::ChunkHash::of(b"only node 2 has it");
+    h.meta.enroll_remote_chunks(ino, &[away], 2).unwrap();
+    let manifest = constellation_fs_core::Manifest {
+        layout: constellation_fs_core::ChunkLayout::new(4096),
+        file_len: 7,
+        chunks: constellation_fs_core::ChunkInfo::Inline(std::collections::BTreeMap::from([(
+            0u64, away,
+        )])),
+    }
+    .encode();
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(2),
+        op: MutateOp::SetManifest {
+            ino,
+            base_manifest: None,
+            manifest,
+            size: 7,
+        },
+    });
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+    let mut out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::LeaseRequest {
+            req: OpId(5),
+            epoch_applied: None,
+        },
+    });
+    assert_eq!(h.core.job(), Some(JobKind::Handoff));
+    // Drive the handoff's flush: the upload pass, the create ships, the
+    // manifest stays deferred.
+    let mut answered = None;
+    for _ in 0..8 {
+        if let Some(a) = sends(&out).iter().find_map(|(to, m)| match m {
+            PeerMsg::LeaseHandoff { released, .. } if *to == 2 => Some(*released),
+            _ => None,
+        }) {
+            answered = Some(a);
+            break;
+        }
+        if let Some(upload) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+            continue;
+        }
+        if let Some((op, req)) = s3_ops(&out).first().map(|(o, r)| (*o, (*r).clone())) {
+            let result = match req {
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::LeaseSwap { lease, .. } => {
+                    assert!(
+                        !lease.released,
+                        "released the lease with a deferred journal"
+                    );
+                    S3Result::LeasePut(Ok(tag()))
+                }
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                other => panic!("unexpected S3 op in the handoff: {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+            continue;
+        }
+        break;
+    }
+    assert_eq!(
+        answered,
+        Some(false),
+        "the handoff was not declined: {out:?}"
+    );
+    assert!(h.core.lease().held.is_some(), "the lease stays");
+    assert_eq!(h.core.stats.handoffs_declined, 1);
+    assert_eq!(h.meta.held_summary().deferred, 1);
+    assert!(h.core.job().is_none());
+}
+
 #[test]
 fn a_lost_renewal_deposes_and_the_round_recovers() {
     let mut h = Harness::new(1);
@@ -1846,6 +2052,68 @@ fn a_segment_behind_the_stream_keeps_its_cursor() {
         .unwrap()
         .is_some());
     assert_eq!(sub.core.stats.streamed_dropped, 0);
+}
+
+/// Fix "capture under an epoch hold": a subscriber holds `b` and `c`
+/// from the stream; a restart re-derives its cursor from the log (below
+/// them) and the holder streams from its start again — the replica is
+/// the truth, and neither is applied a second time (flex-backup seed
+/// 1230 re-applied a member's epoch journal on top of itself). A new
+/// transaction after them still installs.
+#[test]
+fn a_restarted_subscriber_does_not_reinstall_what_it_holds() {
+    let (mut holder, mut sub, req) = stream_pair();
+    submit_create(&mut holder, 1, "a");
+    let (p1, through) = holder_ship(&mut holder, 1, 100);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: segment_frame(req, 1, 1, p1),
+    });
+    submit_create(&mut holder, 2, "b");
+    submit_create(&mut holder, 3, "c");
+    let txs = Replica::journal_txs_from(&holder.meta, through + 1, 100);
+    assert_eq!(txs.len(), 2);
+    let batch = PeerMsg::StreamAhead {
+        epoch: 1,
+        base: 1,
+        txs: txs.clone(),
+    };
+    sub.step(Event::Peer {
+        from: 1,
+        msg: batch.clone(),
+    });
+    assert_eq!(sub.core.stats.streamed_installed, 2);
+    let before = sub.meta.ns_dump().unwrap();
+    // The restart: the cursor is the log's `through` again.
+    sub.core.bk.ahead_next = Some((1, through + 1));
+    sub.step(Event::Peer {
+        from: 1,
+        msg: batch,
+    });
+    assert_eq!(sub.core.stats.streamed_installed, 2, "not installed again");
+    assert_eq!(sub.core.stats.streamed_held_already, 2);
+    assert_eq!(sub.core.stats.streamed_dropped, 0);
+    assert_eq!(
+        sub.meta.ns_dump().unwrap(),
+        before,
+        "the replica is unchanged"
+    );
+    submit_create(&mut holder, 4, "d");
+    let after_c = txs[1].last;
+    let txs = Replica::journal_txs_from(&holder.meta, after_c + 1, 100);
+    assert_eq!(txs.len(), 1);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::StreamAhead {
+            epoch: 1,
+            base: 1,
+            txs,
+        },
+    });
+    assert!(MetaStore::lookup(&sub.meta, ROOT_INO, "d")
+        .unwrap()
+        .is_some());
+    assert_eq!(sub.core.stats.streamed_installed, 3);
 }
 
 /// EC2 campaign 6 (visibility-s3-latency): the stream carries each
@@ -3729,6 +3997,123 @@ mod m10 {
         assert!(h.core.lease.epoch_held(), "the hold stays");
         assert!(ask(&mut h, 6, 18), "a caught-up member takes the hold");
         assert!(!h.core.lease.epoch_held());
+        assert_eq!(h.meta.holder_epoch(), 0, "capture ends with the hold");
+    }
+
+    /// Fix "capture under an epoch hold": the hold owner journals as a
+    /// holder does (ADR-19) — `Meta::holder_epoch` is the hold's epoch,
+    /// so a write under the hold is a captured `Local` row with its
+    /// before-images, not an uncaptured transaction (which held the
+    /// whole journal behind the first deferred one, and made a deposed
+    /// owner rebuild from the head commit).
+    #[test]
+    fn the_hold_owner_captures_its_epoch_journal() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let expires = h.core.lease.held.as_ref().unwrap().0.expires_unix_ms;
+        activate(
+            &mut h,
+            Some(Carrier {
+                node: 1,
+                epoch: 1,
+                expires_unix_ms: expires,
+            }),
+            1,
+        );
+        assert_eq!(h.core.lease.epoch_hold(), Some(1));
+        assert_eq!(h.meta.holder_epoch(), 1, "capture is on under the hold");
+        submit_create(&mut h, 1, "under-the-hold");
+        let counts = h.meta.speculation_counts().unwrap();
+        assert_eq!(counts.local, 1, "the epoch write is a captured Local row");
+        assert_eq!(
+            h.meta.uncaptured_tx_count().unwrap(),
+            0,
+            "nothing journaled under the hold is uncaptured"
+        );
+    }
+
+    /// The hold a member takes over P2P journals under the epoch its
+    /// flush CAS will grant (the carried lease's successor); the carrier
+    /// re-adopting its own lease stays at the carried epoch. So the
+    /// flush's gate strands nothing of the hold's captured journal, and
+    /// a position `(epoch, jseq)` a member is answered with is reached
+    /// only by the flush's segments, never by the marker alone.
+    #[test]
+    fn a_transferred_hold_journals_under_the_epoch_its_flush_will_claim() {
+        let mut h = Harness::new(2);
+        h.core.cfg.epoch_slack = 1;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 1,
+                connected: true,
+                last_seen: None,
+                rtt_ms: None,
+                since: None,
+            }],
+        });
+        h.core.lease.cached_holder = Some(1);
+        let expires = h.now.plus(10_000).0;
+        activate(
+            &mut h,
+            Some(Carrier {
+                node: 1,
+                epoch: 4,
+                expires_unix_ms: expires,
+            }),
+            4,
+        );
+        assert_eq!(h.core.epoch_hold_epoch_for(4), 5, "a transferee's hold");
+        let out = h.step(Event::Control {
+            op: OpId(700),
+            req: Control::Acquire,
+        });
+        let req = match sends(&out)[0] {
+            (1, PeerMsg::LeaseRequest { req, epoch_applied }) => {
+                assert_eq!(*epoch_applied, Some(0));
+                *req
+            }
+            other => panic!("{other:?}"),
+        };
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LeaseHandoff {
+                req,
+                released: true,
+                epoch: 4,
+                head_seq: Some(0),
+            },
+        });
+        assert_eq!(h.core.lease.epoch_hold(), Some(5));
+        assert_eq!(h.meta.holder_epoch(), 5, "captures under the hold's epoch");
+        let now = h.now;
+        let granted = h.core.lease.granted_lease(
+            now,
+            h.core.config(),
+            Some(&Lease::granted("p0", 1, 4, 10_000)),
+        );
+        assert_eq!(
+            granted.epoch, 5,
+            "the flush CAS on the carried object grants the same epoch"
+        );
+
+        // The carrier itself, handed its hold back, stays at the carried
+        // epoch: its flush re-adopts its own lease.
+        let mut c = Harness::new(1);
+        c.hold(4, None);
+        let expires = c.core.lease.held.as_ref().unwrap().0.expires_unix_ms;
+        activate(
+            &mut c,
+            Some(Carrier {
+                node: 1,
+                epoch: 4,
+                expires_unix_ms: expires,
+            }),
+            4,
+        );
+        assert_eq!(c.core.epoch_hold_epoch_for(4), 4);
     }
 
     #[test]

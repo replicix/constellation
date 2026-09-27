@@ -4,6 +4,7 @@
 
 use super::bus::{Bus, StreamFaults};
 use super::check;
+use super::chunks::{ChunkWorld, CHUNK_SIZE};
 use super::clock::Clock;
 use super::history::dir_of;
 use super::history::{check_linearizable, check_linearizable_witnessed, History, NsOp, NsRet};
@@ -11,6 +12,7 @@ use super::node::{read_lease, CommitRecord, NodeEnv, NodeHandle};
 use super::store::{Bucket, Fault, OpKind, Rule, When};
 use constellation_authority::{ClientReply, Config, NodeId, Stats};
 use constellation_fs_core::types::ROOT_INO;
+use constellation_fs_core::ChunkHash;
 use constellation_meta::{Meta, MutateOp, MutateOutcome, Rid};
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
@@ -64,6 +66,14 @@ pub enum FaultKind {
     /// Plan 30 §M9: cut P2P between the holder and its first listed
     /// backup (S3 stays reachable to both) for `for_ms`.
     PartitionBackup { for_ms: u64 },
+    /// Fix "capture under an epoch hold": once a continuation epoch is
+    /// active, kill a member that is not the hold owner — preferably one
+    /// whose epoch write's chunk the owner awaits (`chunks.rs`), so the
+    /// owner's transaction stays deferred at the close. Restart it with
+    /// its disk after `restart_ms` (its chunks then upload and the write
+    /// ships), or never (`None`: the run's end applies the operator
+    /// procedure, `repair drop-held --remote`).
+    CrashEpochMember { restart_ms: Option<u64> },
     /// Plan 30 §M9: cut the current holder's path to S3 for `for_ms` (it
     /// keeps acknowledging through its backup; what it journals meanwhile
     /// is the backup's tail).
@@ -178,6 +188,10 @@ pub struct SimConfig {
     /// node enrolled during an epoch is plan 30 §M10's documented gap
     /// (`flex_node_enrolled_during_an_epoch_is_the_known_gap`).
     pub join_fresh: bool,
+    /// Fix "capture under an epoch hold": after a `Create`, with this
+    /// probability the client writes the file — one fresh chunk, dirty on
+    /// its node until its upload pass (`chunks.rs`).
+    pub chunk_writes: f64,
     /// M12 round 2: model the daemon's FUSE fast path — a node holding a
     /// usable lease executes its own client ops outside the core
     /// (`fusefs::mutate_op_rebasable_with_rid`), asking
@@ -414,6 +428,7 @@ impl Default for SimConfig {
             rtts: Vec::new(),
             epoch_slack: 0,
             join_fresh: true,
+            chunk_writes: 0.0,
             dirs: Vec::new(),
             delegations: Vec::new(),
             designations: Vec::new(),
@@ -488,6 +503,17 @@ pub struct Report {
     pub in_doubt_answers: usize,
     /// Plan 30 §M14: what the lock clients saw.
     pub locks: super::locks::LockCounters,
+    /// Fix "capture under an epoch hold": the chunk model's counters
+    /// (`chunks.rs`): writes, chunks uploaded, remote rows enrolled and
+    /// acked, ship plans seen deferring, transactions dropped by the
+    /// end-of-run operator procedure, and whether a member died for good.
+    pub chunk_writes: u64,
+    pub chunks_uploaded: u64,
+    pub remote_enrolled: u64,
+    pub remote_acked: u64,
+    pub deferred_seen: u64,
+    pub remote_dropped: u64,
+    pub member_gone: bool,
 }
 
 pub struct Cluster {
@@ -813,6 +839,9 @@ pub enum Step {
     Op(NsOp),
     /// Plan 30 §M6: look a name up in the local replica.
     Read(String),
+    /// Fix "capture under an epoch hold": write the file (a manifest
+    /// naming one fresh chunk, dirty on this node).
+    Write(String),
     /// Plan 30 §M14: a lock, a critical section, the unlock.
     Lock(super::locks::LockStep),
 }
@@ -926,8 +955,9 @@ async fn client_thread(
     ignore_fence: bool,
 ) {
     for step in steps {
-        let op = match step {
-            Step::Op(op) => op,
+        let (op, write) = match step {
+            Step::Op(op) => (Some(op), None),
+            Step::Write(name) => (None, Some(name)),
             Step::Read(name) => {
                 let handle = cluster.get(node);
                 if handle.alive() {
@@ -965,8 +995,18 @@ async fn client_thread(
         }
         let handle = cluster.get(node);
         let rid = handle.next_rid();
-        let mop = mutate_op(&handle.meta, &op);
-        history.invoke(thread, rid, op.clone());
+        let mop = match (&op, &write) {
+            (Some(op), _) => mutate_op(&handle.meta, op),
+            (None, Some(name)) => match write_op(&cluster, node, rid, name) {
+                Some(mop) => mop,
+                // The name is not here (unlinked, or its create refused).
+                None => continue,
+            },
+            (None, None) => unreachable!(),
+        };
+        if let Some(op) = &op {
+            history.invoke(thread, rid, op.clone());
+        }
         let mut attempts = 0u32;
         loop {
             let handle = cluster.get(node);
@@ -1000,6 +1040,12 @@ async fn client_thread(
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
+                }
+                // A write's outcome is not part of the namespace history
+                // (its effect is checked by convergence and the chunk
+                // rule); any definitive answer ends it.
+                Ok(ClientReply::Outcome(_)) if op.is_none() => {
+                    cluster.note_answered();
                 }
                 Ok(ClientReply::Outcome(outcome)) => match ns_ret(&outcome) {
                     Ok(ret) => {
@@ -1161,6 +1207,54 @@ fn with_reads(rng: &mut StdRng, ops: Vec<NsOp>, names: usize, ratio: f64) -> Vec
         }
     }
     out
+}
+
+/// Fix "capture under an epoch hold": after each `Create`, with `ratio`,
+/// a write of the file (`Step::Write`). Drawn from its own generator, so
+/// a config without writes replays exactly the schedules it had.
+fn with_writes(rng: &mut StdRng, steps: Vec<Step>, ratio: f64) -> Vec<Step> {
+    if ratio <= 0.0 {
+        return steps;
+    }
+    let mut out = Vec::new();
+    for step in steps {
+        let created = match &step {
+            Step::Op(NsOp::Create(n)) => Some(n.clone()),
+            _ => None,
+        };
+        out.push(step);
+        if let Some(name) = created {
+            if rng.random_bool(ratio.min(1.0)) {
+                out.push(Step::Write(name));
+            }
+        }
+    }
+    out
+}
+
+/// The op behind a `Step::Write`: the file's manifest naming one fresh
+/// chunk, dirty on `node` (the world's dirty set plus the node's own
+/// `pending_upload` row, as the FUSE close leaves them). `None` when the
+/// name is not in the local replica.
+fn write_op(cluster: &Cluster, node: NodeId, rid: Rid, name: &str) -> Option<MutateOp> {
+    let handle = cluster.get(node);
+    let (parent, leaf) = split_name(&handle.meta, name);
+    let ino = handle.meta.child_ino(parent, &leaf).ok().flatten()?;
+    let hash = ChunkHash::of(
+        format!(
+            "chunk:{}:{}:{}:{}",
+            cluster.env.seed, rid.node, rid.incarnation, rid.seq
+        )
+        .as_bytes(),
+    );
+    cluster.env.world.write(node, hash);
+    handle.meta.add_pending_upload(&hash, ino).ok()?;
+    Some(MutateOp::SetManifest {
+        ino,
+        base_manifest: None,
+        manifest: ChunkWorld::manifest(hash),
+        size: CHUNK_SIZE as u64,
+    })
 }
 
 /// Plan 30 §M14: interleave lock steps with `steps` (after each op, with
@@ -1599,6 +1693,99 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bus.set_partition(lease.holder, backup, false);
         }
+        FaultKind::CrashEpochMember { restart_ms } => {
+            crash_epoch_member(&cluster, fault.at_ms, restart_ms, &note).await;
+        }
+    }
+}
+
+/// `FaultKind::CrashEpochMember`: waits up to 15 s for an active epoch
+/// whose hold owner is known; the victim is a live member other than the
+/// owner — first choice, one whose chunk the owner already awaits
+/// (`Meta::remote_chunks`), then one with dirty chunks, then any, the
+/// lower tiers only after the epoch has been active for 3 s.
+async fn crash_epoch_member(
+    cluster: &Arc<Cluster>,
+    at_ms: u64,
+    restart_ms: Option<u64>,
+    note: &impl Fn(String),
+) {
+    let world = cluster.env.world.clone();
+    let mut active_for = 0u32;
+    let mut picked: Option<(NodeId, NodeId, &'static str)> = None;
+    for _ in 0..150 {
+        let ids = cluster.ids();
+        let live = |id: &NodeId| cluster.get(*id).alive();
+        let owner = ids
+            .iter()
+            .copied()
+            .find(|id| live(id) && cluster.get(*id).view().epoch_held);
+        if let Some(owner) = owner {
+            active_for += 1;
+            let members: Vec<NodeId> = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    *id != owner && live(id) && cluster.get(*id).shared.epoch.lock().unwrap().active
+                })
+                .collect();
+            let awaited: BTreeSet<NodeId> = cluster
+                .get(owner)
+                .meta
+                .remote_chunks()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.node)
+                .collect();
+            if let Some(m) = members.iter().copied().find(|m| awaited.contains(m)) {
+                picked = Some((owner, m, "a chunk the owner awaits"));
+                break;
+            }
+            if active_for >= 30 {
+                let dirty = members
+                    .iter()
+                    .copied()
+                    .filter(|m| world.dirty_on(*m) > 0)
+                    .max_by_key(|m| world.dirty_on(*m));
+                if let Some(m) = dirty {
+                    picked = Some((owner, m, "dirty chunks"));
+                    break;
+                }
+                if let Some(m) = members.first().copied() {
+                    picked = Some((owner, m, "no chunks"));
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let Some((owner, node, why)) = picked else {
+        note(format!(
+            "t={at_ms} crash-epoch-member: no active epoch with a hold owner"
+        ));
+        return;
+    };
+    note(format!(
+        "t={} crash epoch member {node} ({why}; hold owner {owner}; restart {restart_ms:?})",
+        cluster.env.clock.elapsed_ms()
+    ));
+    let now = cluster.env.clock.now().0;
+    cluster
+        .note_takedown(node, restart_ms.map(|r| now + r as i64), at_ms)
+        .await;
+    let meta = cluster.crash(node);
+    match restart_ms {
+        Some(after) => {
+            tokio::time::sleep(Duration::from_millis(after)).await;
+            note(format!(
+                "t={} epoch member {node} returns with its disk",
+                cluster.env.clock.elapsed_ms()
+            ));
+            cluster.restart(node, Some(meta));
+        }
+        None => {
+            world.gone.lock().unwrap().insert(node);
+        }
     }
 }
 
@@ -1618,6 +1805,85 @@ async fn wait_for_locker(cluster: &Arc<Cluster>) -> Option<NodeId> {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     None
+}
+
+/// Fix "capture under an epoch hold": the operator procedure. On every
+/// live node, a remote-pending row whose chunk is never coming
+/// (`ChunkWorld::hopeless`: its uploader is gone for good, or awaits it
+/// in turn from one that is) and every inode with an unrecoverable
+/// (poisoned) chunk are dropped — `constellation repair drop-held <ino>
+/// --remote` and `drop-held <ino>` — once they have been seen hopeless
+/// for `after_ms` of simulated time (`None`: at once), as an operator
+/// watching `status.held.remote`'s ages would. The dropped writes become
+/// refused replays and conflict copies, their outcome goes in the log,
+/// and everything that waited on them moves on.
+fn operator_drop_hopeless(
+    cluster: &Arc<Cluster>,
+    world: &Arc<ChunkWorld>,
+    fault_log: &Arc<Mutex<Vec<String>>>,
+    after_ms: Option<u64>,
+    first_seen: &mut BTreeMap<(NodeId, u64, bool), u64>,
+) {
+    let now_ms = cluster.env.clock.elapsed_ms();
+    for id in cluster.ids() {
+        let n = cluster.get(id);
+        if !n.alive() {
+            continue;
+        }
+        let mut inos: BTreeSet<(u64, bool)> = n
+            .meta
+            .remote_chunks()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| world.hopeless(&r.hash, r.node))
+            .map(|r| (r.ino, true))
+            .collect();
+        inos.extend(
+            n.meta
+                .unrecoverable_chunks()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, ino)| (ino, false)),
+        );
+        for (ino, remote) in inos {
+            let since = *first_seen.entry((id, ino, remote)).or_insert(now_ms);
+            if after_ms.is_some_and(|after| now_ms < since + after) {
+                continue;
+            }
+            let now_unix = n.clock.now().0 / 1000;
+            let dropped = if remote {
+                n.meta.drop_held_remote(ino, now_unix)
+            } else {
+                n.meta.drop_held(ino, now_unix)
+            };
+            match dropped {
+                Ok(d) => {
+                    world.remote_dropped.fetch_add(
+                        (d.dropped + d.queued_dropped) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    // What the drop rolled back is tentative for the
+                    // checkers, as a deposition's rollback is (the core's
+                    // counters do not move for an operator's drop): the
+                    // dropped writes (refused replays) and their
+                    // dependents, re-executed after later ops.
+                    if let Ok(queue) = n.meta.pending_replays() {
+                        let mut t = n.shared.tentative.lock().unwrap();
+                        for q in queue {
+                            t.insert(q.rid);
+                        }
+                    }
+                    fault_log.lock().unwrap().push(format!(
+                        "t={now_ms} node {id}: repair drop-held {ino:#x}{}: {d:?}",
+                        if remote { " --remote" } else { "" }
+                    ));
+                }
+                Err(e) => fault_log.lock().unwrap().push(format!(
+                    "t={now_ms} node {id}: repair drop-held {ino:#x} refused: {e}"
+                )),
+            }
+        }
+    }
 }
 
 /// Run one seed. `Err` carries the failure and the replay command.
@@ -1700,6 +1966,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         fast_path: cfg.fast_path,
         clock_skew_ms: cfg.clock_skew_ms,
         seed,
+        world: ChunkWorld::new(),
     };
     let cluster = Arc::new(Cluster {
         nodes: Mutex::new(BTreeMap::new()),
@@ -1780,6 +2047,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             // reads replays exactly the schedules it had before M6.
             let mut read_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x5e55);
             let steps = with_reads(&mut read_rng, ops, cfg.names, cfg.read_ratio);
+            let mut write_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0xc4a1);
+            let steps = with_writes(&mut write_rng, steps, cfg.chunk_writes);
             // Plan 30 §M14: locks from their own generator too.
             let mut lock_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x10c5);
             let steps = with_locks(&mut lock_rng, steps, &cfg);
@@ -1839,6 +2108,81 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             f,
             fault_log.clone(),
         )));
+    }
+    // Fix "capture under an epoch hold": through the whole run, per
+    // node, consecutive samples with shippable rows left unshipped behind
+    // a deferred transaction while it holds the lease with S3 up — the
+    // log must not stall on one absent member's chunk.
+    let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stall_violations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    if cfg.chunk_writes > 0.0 {
+        let (cluster, stop, violations) = (
+            cluster.clone(),
+            sampler_stop.clone(),
+            stall_violations.clone(),
+        );
+        let fault_log = fault_log.clone();
+        tokio::spawn(async move {
+            let world = cluster.env.world.clone();
+            let mut stalled: BTreeMap<NodeId, u32> = BTreeMap::new();
+            let mut first_seen = BTreeMap::new();
+            let mut ticks = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                ticks += 1;
+                // The operator, watching `status`: a write whose chunk is
+                // never coming is dropped 20 s after it shows.
+                if ticks.is_multiple_of(4) {
+                    operator_drop_hopeless(
+                        &cluster,
+                        &world,
+                        &fault_log,
+                        Some(20_000),
+                        &mut first_seen,
+                    );
+                }
+                for id in cluster.ids() {
+                    let n = cluster.get(id);
+                    if !n.alive() {
+                        stalled.remove(&id);
+                        continue;
+                    }
+                    let held = n.meta.held_summary();
+                    if held.deferred == 0 {
+                        stalled.remove(&id);
+                        continue;
+                    }
+                    world
+                        .deferred_seen
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let v = n.view();
+                    let sequencing = v.held_epoch.is_some()
+                        && !v.epoch_held
+                        && !v.gate_pending
+                        && !v.lost
+                        && !cluster.env.bucket.is_cut(id);
+                    let shippable =
+                        constellation_authority::Replica::take_journal(&*n.meta, 10_000)
+                            .map(|b| b.len())
+                            .unwrap_or(0);
+                    if sequencing && shippable > 0 {
+                        let c = stalled.entry(id).or_insert(0);
+                        *c += 1;
+                        if *c == 20 {
+                            violations.lock().unwrap().push(format!(
+                                "t={} node {id} kept {shippable} shippable journal row(s) \
+                                 unshipped for 5 s behind {} deferred transaction(s) (held \
+                                 {held:?})",
+                                cluster.env.clock.elapsed_ms(),
+                                held.deferred
+                            ));
+                        }
+                    } else {
+                        stalled.remove(&id);
+                    }
+                }
+            }
+        });
     }
     super::node::note_waiting("run", "clients".into());
     // A client whose op is never answered would run the clock forever
@@ -1928,9 +2272,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let mut waited = 0u64;
     let mut quiescent = false;
     let mut extra_settles = 0u64;
+    let world = cluster.env.world.clone();
     while waited < cfg.settle_ms {
         tokio::time::sleep(Duration::from_millis(250)).await;
         waited += 250;
+        if cfg.chunk_writes > 0.0 {
+            // The operator procedure (see `operator_drop_hopeless`), again
+            // at the settle's cadence for what appeared after the
+            // clients finished.
+            if waited.is_multiple_of(3_000) {
+                operator_drop_hopeless(&cluster, &world, &fault_log, None, &mut BTreeMap::new());
+            }
+        }
         // A hint installed after the settle write (a replayed op refused
         // with `EEXIST` after the last segment shipped) retires only when
         // the log moves past its floor: write again, as a busy cluster
@@ -2277,6 +2630,34 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             report.marker_violations, report.marker_checks, report.faults
         ));
     }
+    // Fix "capture under an epoch hold": the chunk rule and the log's
+    // liveness behind a deferred transaction.
+    {
+        let violations = world.violations.lock().unwrap().clone();
+        if let Some(what) = violations.first() {
+            return Err(format!(
+                "a segment named a chunk S3 does not hold: {what} ({} violation(s))\n  faults: {:?}",
+                violations.len(),
+                fault_log.lock().unwrap()
+            ));
+        }
+        sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stall_violations = stall_violations.lock().unwrap().clone();
+        if let Some(what) = stall_violations.first() {
+            return Err(format!(
+                "the log stalled behind a deferred transaction: {what}\n  faults: {:?}",
+                fault_log.lock().unwrap()
+            ));
+        }
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        report.chunk_writes = world.writes.load(ord);
+        report.chunks_uploaded = world.uploaded.load(ord);
+        report.remote_enrolled = world.remote_enrolled.load(ord);
+        report.remote_acked = world.remote_acked.load(ord);
+        report.deferred_seen = world.deferred_seen.load(ord);
+        report.remote_dropped = world.remote_dropped.load(ord);
+        report.member_gone = !world.gone.lock().unwrap().is_empty();
+    }
     let counts = bucket.counts();
     report.s3_puts = counts.puts;
     report.s3_gets = counts.gets;
@@ -2322,8 +2703,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     })
                     .unwrap_or_default();
                 format!(
-                    "node {}: journal {:?} held {:?} speculation {:?} live {:?} replays {}",
+                    "node {}: job {:?} journal {:?} held {:?} speculation {:?} live {:?} replays {}",
                     n.id,
+                    n.view().job_phase,
                     rows,
                     n.meta.held_summary(),
                     n.meta.speculation_counts().ok(),

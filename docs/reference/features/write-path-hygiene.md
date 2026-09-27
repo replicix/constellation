@@ -119,6 +119,8 @@ through it.
 | `oldest_seq` | the oldest held journal sequence |
 | `opaque` | holder capture is off, so a held transaction's keys are unknown and everything after it is held too |
 | `inodes[]` | each inode with unrecoverable chunks: `ino`, `path`, `missing_chunks` (hex), `seeds` |
+| `deferred` | transactions waiting (not held) for a chunk still uploading — this node's, or one another node forwarded as pending |
+| `remote[]` | each chunk another node is expected to upload: `ino`, `path`, `node`, `chunk` (hex), `age_s` |
 
 The web UI shows a red "held" line with the paths, and
 `constellation_held_transactions` is exported as a metric.
@@ -148,6 +150,48 @@ lease to make it locally, and `status.speculation.copies_pending` /
 `copies_stalled` (and the `constellation_speculation_copies_stalled`
 metric, and a red dashboard note) show it. A copy is never dropped. It needs holder capture on (the default); with it off the
 command refuses, because uncaptured records cannot be rolled back.
+
+The dropped op's outcome is journaled as a refusal (`Refused`, `EIO`)
+and ships with the log: a node that still holds the write as
+speculation — its requester's shadow, or a copy streamed ahead of the
+log — rolls it back when the refusal arrives, and a retry by request id
+is answered refused everywhere. Nothing is lost silently: the copy is
+the artifact.
+
+### A chunk only a departed node had
+
+A manifest another node forwarded before its chunks were in S3 (a
+`--write-mode back` close, or any write inside a continuation epoch,
+where nothing reaches S3 until the close) is *deferred* on the
+sequencer, not held: `status.held.deferred` counts it and
+`status.held.remote` names the chunk and the node expected to upload it.
+It ships by itself once that node's upload pass puts the chunk up (or
+the sequencer finds it in S3). Everything that does not depend on it
+keeps shipping.
+
+If that node is gone for good — its disk with it — the write can never
+complete. The procedure:
+
+1. On the sequencer, `constellation status` → `held.remote`: note the
+   `ino`, `path`, `node` and `age_s` of each awaited chunk. An `age_s`
+   growing past any plausible return, with the node absent from the
+   registry, is the signal; a node that merely rebooted uploads its
+   chunks when it is back, and nothing needs doing.
+2. Decide per inode. `constellation repair drop-held myfs <ino> --remote`
+   declares that inode's remote chunks unrecoverable and then does what
+   `drop-held` does: the manifest becomes a conflict copy with the
+   missing chunks as holes, its dependents are rolled back and replayed,
+   the pending rows go, and the refusal ships. Run it on the node that
+   lists the inode; a node that took the lease over after a deposition
+   may list the same write again (the deposed node's replay forwarded
+   it on) and drops it the same way.
+3. If the node comes back after all, its chunks are still content
+   addressed: a new write of the file uses them, but the dropped write
+   stays a refusal (its requester's copy of it was rolled back; the
+   conflict copy has what survived).
+
+Never use `--remote` for a node that will return: its write would ship
+by itself, and the drop turns an acknowledged write into a refusal.
 
 ### Who publishes commits
 

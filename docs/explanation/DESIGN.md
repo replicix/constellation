@@ -747,6 +747,18 @@ What an epoch may carry:
   one to sequence writes, and refuses them at once with `EROFS`.
 - No delegations exist inside an epoch (the root recalls them when it
   opens), and writes are acknowledged on the epoch holder's disk alone.
+- The hold owner's epoch journal is speculation like any holder's
+  unshipped journal (§4, ADR-19): captured with before-images, under
+  the epoch its flush will ship under (the carried lease's for the
+  carrier; the next one for a member that took the hold over, which is
+  what its flush CAS grants). So the flush's ship plan skips exactly a
+  transaction that waits for a chunk only a member has, and what depends
+  on it, and ships the rest; the publisher substitutes them; and a
+  deposed hold owner rolls back and replays by rid like any deposed
+  holder. A write whose chunk's only copy is on a member gone for good
+  is dropped by the operator (`repair drop-held --remote`, §9): a
+  refused replay and a conflict copy, its refusal in the log, never
+  silent loss.
 - Members keep following the epoch holder's log stream, the only way the
   log can reach them while S3 is away, and the holder streams its
   journal ahead as it grows (§4, "Positions and log streams"). A member's
@@ -1261,6 +1273,11 @@ Escape hatches (both are pre-arranged, non-stealable authority):
 - **Continuation epoch** (§5.3): at least `N − f` write-eligible nodes in
   one P2P component keep writing collectively; nobody outside the
   component can take a lease without violating a persisted promise.
+  After the outage, the flush ships everything except what waits for a
+  chunk a member still holds (deferred, `status.held`), and the log
+  keeps moving for everything else; a member gone for good with the
+  only copy of such a chunk is an operator decision (`repair drop-held
+  <ino> --remote` on the node that lists it under `held.remote`).
 
 One node losing S3 while its peers still reach it is not an outage: its
 closes hand their chunks to a peer after 6 s (§3), its metadata forwards

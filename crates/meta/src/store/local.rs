@@ -135,6 +135,12 @@ pub(crate) struct JournalTx {
     /// it was submitted (its causal dependencies), recorded as the
     /// record's `deps`.
     pub deps: crate::session::Position,
+    /// The `ns` keys the transaction observed without writing them — a
+    /// refusal's op (`journal::PendingObserved`): the ship plan treats
+    /// them as dependencies (`store::held`). Empty for a transaction
+    /// that wrote what it read.
+    #[serde(default)]
+    pub observed: Vec<Vec<u8>>,
 }
 
 /// The leading fields of a [`JournalTx`], decoded without the (possibly
@@ -386,6 +392,7 @@ impl Meta {
                 rid,
                 op,
                 deps,
+                observed: journal::PendingObserved::take().unwrap_or_default(),
             },
         )
     }
@@ -452,7 +459,7 @@ impl Meta {
                 return Ok(false);
             }
             let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
-            self.journal_refusal(*r, *errno)?;
+            self.journal_refusal(*r, *errno, None)?;
             self.note_log_idx(gen, idx)?;
             return Ok(true);
         }
@@ -504,7 +511,7 @@ impl Meta {
         deps: crate::session::Position,
     ) -> Result<u64, MetaError> {
         let _d = journal::PendingDelegate::set(gen, None, deps);
-        self.journal_refusal(rid, errno)?;
+        self.journal_refusal(rid, errno, None)?;
         self.delegate_idx(gen)
     }
 
@@ -712,6 +719,17 @@ impl Meta {
     pub fn local_speculation_count(&self) -> Result<u64, MetaError> {
         let r = self.db.read_tx();
         counter_get(&r, &self.local, KV_LOCAL_SPEC_COUNT)
+    }
+
+    /// How many unshipped transactions were journaled without
+    /// before-images (holder capture off, or from before it was on): one
+    /// counter read. With any, the ship plan holds everything after the
+    /// first held or deferred transaction (`store::held`'s opaque rule)
+    /// and the publisher defers. A continuation epoch's hold owner
+    /// captures like any holder, so an epoch journal counts none.
+    pub fn uncaptured_tx_count(&self) -> Result<u64, MetaError> {
+        let r = self.db.read_tx();
+        counter_get(&r, &self.local, KV_UNCAPTURED_TX_COUNT)
     }
 
     /// Plan 30 §M3b: execute a stranded transaction that had no op of its

@@ -47,7 +47,7 @@ use std::collections::{BTreeSet, HashMap};
 
 const REMOTE_PREFIX: &[u8] = b"remote-chunk/";
 
-fn remote_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
+pub(crate) fn remote_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
     let mut k = REMOTE_PREFIX.to_vec();
     k.extend_from_slice(&hash.0);
     k.extend_from_slice(&ino.to_be_bytes());
@@ -202,6 +202,29 @@ impl<'a, R: Readable> PendingView<'a, R> {
         }
         Ok(false)
     }
+}
+
+/// The chunks `ino`'s live remote-pending rows name (marks with their
+/// pending row), for `repair drop-held --remote`.
+pub(crate) fn remote_pending_for_ino_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    ino: Ino,
+) -> Result<Vec<ChunkHash>, MetaError> {
+    let mut out = Vec::new();
+    for guard in r.prefix(&meta.local, REMOTE_PREFIX) {
+        let (k, v) = guard.into_inner()?;
+        let Some(mark) = decode_mark(&k, &v) else {
+            continue;
+        };
+        if mark.ino == ino
+            && r.get(&meta.pending_upload, cr_key(&mark.hash, mark.ino))?
+                .is_some()
+        {
+            out.push(mark.hash);
+        }
+    }
+    Ok(out)
 }
 
 impl Meta {

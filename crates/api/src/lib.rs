@@ -11,7 +11,7 @@ pub mod web;
 
 pub use types::{
     AckStatus, CasProbeStatus, CtoStatus, HeldInodeStatus, HeldStatus, LockStatus, LogStreamStatus,
-    PeerPathsStatus, S3RequestStatus, SessionStatus,
+    PeerPathsStatus, RemoteChunkStatus, S3RequestStatus, SessionStatus,
 };
 pub use types::{
     AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DelegationReport, DelegationStatus,
@@ -152,7 +152,7 @@ pub trait StatusSource: Send + Sync + 'static {
 
     /// Plan 30 §M4: discard the records held back behind `ino`'s
     /// unrecoverable chunk(s) into a conflict copy.
-    fn drop_held(&self, _ino: u64) -> std::result::Result<String, String> {
+    fn drop_held(&self, _ino: u64, _remote: bool) -> std::result::Result<String, String> {
         Err("drop-held is not supported by this daemon".into())
     }
 
@@ -324,7 +324,7 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
         Request::MountList => Response::Mounts {
             mounts: source.mount_list(),
         },
-        Request::DropHeld { ino } => result(source.drop_held(ino)),
+        Request::DropHeld { ino, remote } => result(source.drop_held(ino, remote)),
     }
 }
 

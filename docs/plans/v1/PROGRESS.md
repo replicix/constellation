@@ -25986,3 +25986,206 @@ warning and left for the owners of the meta store.
   phase-switch lease offer the previous entry notes (a released to b
   while a was writing, then took the lease back through S3). That race
   is unrelated to this change and still open.
+
+## Fix: capture under an epoch hold
+
+Base: `dbeeed2` (rebased over `84a59be`, `7dfc05b`, `dbeeed2`; one
+textual conflict in `core/tests.rs`, tests added at the same anchors).
+
+### The gap
+
+A continuation epoch's hold owner journaled uncaptured: `adopt_epoch_hold`
+set `Meta::holder_epoch` to 0 (since M5), so `begin_local` opened no
+capture. After the close, the flush's ship plan (`store::held`) could not
+tell what depended on a transaction deferred on a member's chunk, and its
+opaque rule deferred everything journaled after it — the owner's own
+later writes included. One member away with the only copy of one chunk
+stalled the whole cluster's log at its pre-epoch head
+(`epoch-member-dies-with-chunk`), and `repair drop-held` had nothing to
+offer: the rows were deferred on a *remote* pending chunk, not poisoned.
+
+### 1. The hold owner captures (ADR-19 applied to the hold)
+
+- `Core::adopt_epoch_hold` (promise.rs) adopts the hold and sets
+  `Meta::holder_epoch` to the hold's epoch, at every adoption site
+  (activation, re-affirmation, the late adoption of seed 30299, the
+  restart re-adoption, the P2P transfer). The journal under the hold is
+  ordinary `Local` speculation: before-images, `journal_tx` rows with
+  the op and rid.
+- **The hold's epoch is the epoch the flush will ship under**
+  (`epoch_hold_epoch_for`): the carried lease's epoch for the carrier
+  (its flush re-adopts its own lease, `granted_lease` keeps the epoch),
+  the next epoch for a member that took the hold over P2P (its flush
+  CAS on the carried object grants `prev.epoch + 1`; nothing else can
+  touch that object while the epoch is open: the members promise
+  nothing, a taker needs their promises). A chain of transfers stays at
+  that next epoch. So:
+  - the flush's acquisition gate (`strand_for_takeover(gate.epoch)`)
+    strands nothing of the hold's journal — the rows are *at* the gate
+    epoch, never below it;
+  - a member's position `(epoch, jseq)` from a transferee's reply is
+    reached only by the flush's segments, not by the marker alone
+    (`JournalPos` orders epoch-first; before, a transferee held at the
+    carried epoch and its flush shipped at the next: the marker
+    "reached" every position of the hold, one segment before the work);
+  - a deposed hold owner recovers as a deposed holder: `mark_lost`'s
+    floor is above the hold epoch, `recover_deposed` rolls back and
+    queues replays by rid, and `RebuildReplica` is reached only with
+    capture off (the fallback stays as the fallback; nothing composes
+    the two).
+- Reviewed and unchanged: `publish_basis_at` (now `Substituted` for a
+  hold owner's journal instead of `Defer`; the flex-crash seed 11719
+  guard stays), `journal_through_after` (stops below the first skipped
+  row, now effective), the M5 stale-base rule (positions and `base` are
+  what they were), the stream-ahead's records (the journal rows; members
+  install them as before), `run_complete` (ships what does not need the
+  chunks after `CONSTELLATION_REMOTE_CHUNK_WAIT_S`).
+
+### 2. What the sim then found (all fixed)
+
+- **A round that shipped nothing followed itself at once** (flex seed
+  1007: 684 433 rounds at one simulated instant). `round_release`'s
+  "force the backlog to zero" nudged whenever a backlog remained; a
+  backlog the plan defers never ships. It nudges only if the round moved
+  the log. Test: `a_backlog_that_cannot_ship_does_not_spin_the_rounds`.
+- **A member's streamed copy of a dropped transaction was confirmed by
+  `through` alone** (M9's first retirement rule): the holder dropped the
+  rows (`repair drop-held`), its next segment's `through` passed them
+  without naming them, and the member kept the write for good.
+  `apply_segment_rows` strands such a `Streamed` entry (rollback, the
+  rewind redoes what stands); `retire_tx` confirms streamed rows only
+  rows-confirmed. Test:
+  `a_streamed_transaction_the_tenure_ships_past_is_rolled_back`.
+- **A restarted subscriber re-applied the epoch journal it already
+  held** (flex-backup seed 1230): its in-memory stream cursor restarted
+  at the log's `through`, below what it had streamed, and the holder
+  re-streamed from its start (it must: the flush deferred part of the
+  journal, so it is still unshipped). `Meta::streamed_tip(epoch)` is the
+  truth: `install_streamed` at or below it is a no-op, and
+  `on_stream_ahead` steps its cursor over it
+  (`stats.streamed_held_already`). Tests:
+  `a_restarted_subscriber_does_not_reinstall_what_it_holds`,
+  `a_streamed_transaction_installed_twice_is_installed_once`.
+- **A refusal shipped ahead of the deferred transaction it was refused
+  because of** (flex-crash seed 481: `rename f2 f3` refused `ENOENT` at
+  a log position where `f2` existed — the rename that took it away was
+  deferred). A refusal writes nothing, so its captured key set was
+  empty. `journal_refusal` now takes the refused op and records the keys
+  it *observed* (`JournalTx::observed`, `journal::PendingObserved`); the
+  plan treats them as dependencies (deferred or held with them, tainting
+  nothing after). Test:
+  `a_refusal_that_observed_a_deferred_transactions_keys_is_deferred_with_it`.
+- **A dropped op's requester kept its shadow for good** (the sim's
+  `drop-held --remote` runs). `drop_held` now journals `Refused { rid,
+  EIO }` for each dropped rid (it ships with the log); a segment's
+  `Refused` strands the shadow of that rid without queuing a replay
+  (the outcome is final, the conflict copy is the artifact). Test:
+  `a_refused_rid_in_the_log_rolls_its_shadow_back_without_a_replay`.
+- **A handoff whose flush could not drain bounced the lease** (flex-crash
+  seed 3021: epoch 111). Released with deferred rows, the successor's
+  epoch stranded them, they replayed there, deferred there, and the next
+  handoff back repeated it. A handoff is declined while the journal
+  cannot drain (`flush_continue`); the requester forwards meanwhile.
+  Test: `a_handoff_is_declined_while_the_journal_cannot_drain`.
+
+### 3. `repair drop-held <ino> --remote`
+
+`Meta::drop_held_remote`: the inode's remote-pending chunks
+(`remote-chunk/` marks with a pending row) are marked unrecoverable in
+the same transaction, then it is the held case: the manifest becomes a
+refused replay whose conflict copy has the chunks as holes, dependents
+roll back and replay by rid, pending rows and remote marks go, the
+refusal ships. `status.held.remote[]` lists every awaited chunk (`ino`,
+`path`, `node`, `chunk`, `age_s`) for the operator; the CLI flag, the
+control request (`DropHeld { ino, remote }`) and the procedure are in
+`write-path-hygiene.md` ("A chunk only a departed node had"). Test:
+`drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk`.
+
+### 4. Model and sim
+
+- `sim::chunks` (`tests/sim/chunks.rs`): a chunk model. `Step::Write`
+  (after a `Create`, `SimConfig::chunk_writes`) names one fresh chunk,
+  dirty on the writer; a `MutateRequest` carrying a manifest enrolls,
+  on the receiver, the chunks still pending on the sender (asked of the
+  sender's replica, as `forwarded_pending_chunks` asks the local one);
+  `UploadDirtyChunks` uploads own chunks when S3 is up and acks remote
+  rows once their chunk is in S3; every segment PUT is checked at PUT
+  time (a manifest naming a chunk S3 lacks fails the run). Own rows
+  without bytes anywhere (a replay's adopted manifest of a dead node's
+  chunk) are poisoned, as the daemon's pass does.
+- `FaultKind::CrashEpochMember { restart_ms }`: once an epoch is
+  active, kill a member other than the hold owner — first one whose
+  chunk the owner awaits — with its disk; restart it later or never.
+  `flex_config`: `chunk_writes 0.3`, the member returns 6 s later (after
+  the outage heals). `flex_crash_config`: it never returns.
+- A run-long sampler fails the run if a lease holder with S3 up keeps
+  shippable rows unshipped for 5 s behind a deferred transaction (the
+  log must not stall). `operator_drop_hopeless` is the operator: a
+  remote row whose chunk is never coming (its uploader gone for good, or
+  awaiting it in turn from one that is: `ChunkWorld::hopeless`) is
+  dropped 20 s after it shows, and poisoned inodes with it; what the
+  drop rolled back is tentative for the checkers as a deposition's
+  rollback is. Quiescence and convergence then hold on the whole log.
+- Tests: `flex_a_member_dies_with_the_only_copy_of_a_chunk_and_returns`
+  (40 seeds: remote rows enrolled, plans deferring, nothing dropped,
+  all converge) and
+  `flex_crash_a_member_gone_for_good_is_dropped_by_the_operator` (60
+  seeds: members gone, drops, all converge).
+  `flex_members_follow_the_epoch_holders_stream` runs on the config
+  without the member crash (the sim's counters are per incarnation).
+  `sweep_config` prints the chunk counters.
+
+### 5. Harness, `epoch-member-dies-with-chunk`
+
+After the close: A's own write reaches S3 while C is away (the log head
+moves; the fresh S3-only node D reads it), `held.deferred` stays at C's
+two manifests with `held.opaque` false, and `held.remote` names C's
+chunks. Then by the seed's parity: even, C returns and every node reads
+both files; odd, `drop-held --remote` on A for both inodes, A drains
+(the refusals ship), `c/.constellation-conflict/` has both copies, and
+A, C (back) and D converge on the files as empty.
+
+B's view is reported, not asserted: **finding, outside this fix** — after
+the cut and heal, B's S3 client stays wedged for minutes (every request
+fails "error sending request" within ms while B's proxy relays them
+upstream: B's chunk-fetch burst for C's file hit the cut), and B holds no
+stream from A after A's flush, so B applies nothing new until C returns
+(it then reads C's files from C via coop, as before). The old scenario
+never needed B's S3 after the heal. Worth a look: the S3 client after a
+connection-level cut with concurrent requests, and a member's
+re-subscription to the holder's stream after the flush.
+
+### 6. `daemon_lock` flake
+
+`takeover_rotates_the_held_lock` sets the process-wide
+`CONSTELLATION_FAULT_ASSUME_WEDGED_PID` to the test's own pid;
+`own_flock_is_found_and_live` in parallel saw itself wedged. Both hold a
+static mutex while they run.
+
+### Files
+
+`crates/authority/src/core/{promise,jobs,mod,backup,holder,client,inbox}.rs`,
+`crates/authority/src/replica.rs`, `crates/authority/src/core/tests.rs`,
+`crates/authority/tests/sim.rs`, `crates/authority/tests/sim/{chunks,run,node,check}.rs`,
+`crates/meta/src/store/{local,spec,held,remote,inbox,journal,writes}.rs`,
+`crates/meta/src/lib.rs`, `crates/meta/tests/{held,speculation}.rs`,
+`crates/api/src/{lib,types}.rs`, `crates/cli/src/{held,main,daemon_lock}.rs`,
+`crates/harness/src/scenarios/m10.rs`, docs: `DESIGN.md` §5.3/§9,
+`DECISIONS.md` (ADR-22 amendment), `durability-and-failover.md`,
+`write-path-hygiene.md`, `TESTING.md`.
+
+### Results (final code, on `dbeeed2`)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) clean.
+- Sims (release): the CI suite 104 pass; `flex` 0..20000 and
+  `flex-crash` 0..20000 every seed passes (flex-crash: 58 838 remote
+  rows enrolled, 13 469 transactions dropped for a departed member,
+  every run converged; flex: 59 010 remote rows, none dropped);
+  `long_flex` 1000 (flex 1000 + flex-crash 1000: 650 members gone, 668
+  drops, all converge), `long_backup` 1000, `long_random` 1000,
+  `long_delegated` 1000 pass.
+- Unit and integration suites: `constellation-meta` 163, authority lib
+  126, and the workspace outside the harness (1248 tests) pass.
+- Scenarios (prefix `constellation-harness-epochcap`):
+  `epoch-member-dies-with-chunk` seed 42 (C returns) and seed 43
+  (`drop-held --remote`) pass, 43–44 s each.
