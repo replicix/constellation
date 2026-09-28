@@ -730,6 +730,42 @@ impl SessionState {
         self.cv.notify_all();
     }
 
+    /// What a restart forgets (EC2 campaign 7, the `git-under-flock-
+    /// causal` reader): the stream indices and the voided generations
+    /// live here in memory, and a replica that opens its store again
+    /// re-applies nothing below its applied position — so a generation
+    /// whose `Recall` it applied before the restart is neither held nor
+    /// voided afterwards, and a watermark naming it (a lock grant's
+    /// floor: the releaser's frontier, which still names the stream it
+    /// was answered from) is never reached: every read under it waits
+    /// the whole session budget, for the rest of the process. Seed from
+    /// what the store persists: every generation up to the table's
+    /// `max_gen` is held through the log's index of it, and one the
+    /// table no longer lists is voided at that cut.
+    pub fn seed_generations(
+        &self,
+        max_gen: u64,
+        live: &std::collections::BTreeSet<u64>,
+        log_idx: &dyn Fn(u64) -> u64,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        for gen in 1..=max_gen {
+            let idx = log_idx(gen);
+            let cur = g.streams.entry(gen).or_insert(0);
+            if idx > *cur {
+                *cur = idx;
+            }
+            if !live.contains(&gen) {
+                g.voided.insert(gen);
+                g.observed.streams.lower(gen, idx);
+                let e = g.void_cuts.entry(gen).or_insert(0);
+                *e = (*e).max(idx);
+            }
+        }
+        drop(g);
+        self.cv.notify_all();
+    }
+
     /// The log's cut of voided generation `gen` (see `Inner::void_cuts`).
     /// Only raised: rows of the generation the log carries after its
     /// `Recall` (a root that was itself the delegate ships its own rows
@@ -1218,6 +1254,47 @@ mod tests {
 
     fn jp(epoch: u64, jseq: u64) -> Option<JournalPos> {
         Some(JournalPos { epoch, jseq })
+    }
+
+    /// EC2 campaign 7 (`git-under-flock-causal`, reader `b` after its
+    /// remount): a lock grant's floor named generation 1 at index 816,
+    /// ended before the restart; the fresh session state knew neither
+    /// the generation nor its end, so every read waited the budget. A
+    /// seeded state reaches the floor at once (the generation is void),
+    /// still holds live generation 2 at what the log has of it, and a
+    /// dependency past the ended generation's cut is lost.
+    #[test]
+    fn a_reopened_session_reaches_a_floor_on_a_generation_that_ended_before_the_restart() {
+        let floor = |g: u64, i: u64| {
+            let mut streams = Streams::NONE;
+            assert!(streams.raise(g, i));
+            Position {
+                seq: 0,
+                pending: None,
+                streams,
+            }
+        };
+        let s = SessionState::default();
+        assert!(!s.reaches(&floor(1, 816)), "unknown before the seed");
+        let live: std::collections::BTreeSet<u64> = [2].into_iter().collect();
+        let log_idx = |g: u64| match g {
+            1 => 816,
+            2 => 370,
+            _ => 0,
+        };
+        s.seed_generations(2, &live, &log_idx);
+        assert!(s.reaches(&floor(1, 816)), "the ended generation is void");
+        assert!(s.reaches(&floor(1, 900)), "void past its cut too");
+        assert!(
+            s.deps_lost(&floor(1, 900)),
+            "but a write's dependency past the cut is lost"
+        );
+        assert!(!s.deps_lost(&floor(1, 816)));
+        assert!(
+            s.reaches(&floor(2, 370)),
+            "the live generation is held through the log's index"
+        );
+        assert!(!s.reaches(&floor(2, 371)), "and no further");
     }
 
     /// Plan 30 §M9 × §M6 (backup seed 607661, backup-crash-slow 600066):

@@ -2597,6 +2597,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         witness.observers.extend(w.observers);
     }
     report.observed_tentative = witness.observed_tentative;
+    // EC2 campaign 7, finding B-1: across directories and owners, the
+    // log keeps every node's program order (see `history.rs`).
+    super::history::check_session_order(&events, &tentative, &oracle.completed_at)
+        .map_err(lin_context)?;
     if strict_durability && witness.observed_tentative > 0 {
         return Err(lin_context(format!(
             "{} refusal(s) observed an acknowledged effect that was later rolled back              (impossible under a durable acknowledgement policy)",

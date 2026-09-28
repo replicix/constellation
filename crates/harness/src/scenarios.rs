@@ -564,6 +564,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: gitflock::git_under_flock_rounds,
     },
     Scenario {
+        name: "git-under-flock-causal",
+        desc: "git-under-flock-b2b with reading nodes: a reflog line or ref naming a commit means every object it needs is visible (causal order), the ref never regresses, fsck under the turn lock is clean, a reader survives kill -9",
+        requires: &["git"],
+        run: gitflock::git_under_flock_causal,
+    },
+    Scenario {
         name: "git-under-flock-faults",
         desc: "git-under-flock under kill -9 (holder, committers, whole cluster), SIGSTOP, P2P isolation and S3 cuts",
         requires: &["git"],

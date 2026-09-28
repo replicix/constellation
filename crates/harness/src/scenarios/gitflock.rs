@@ -40,15 +40,40 @@
 //! - `git-under-flock-rounds`: the b2b workload several times in a row
 //!   (`GIT_FLOCK_ROUNDS`, default 3), each in a new repository, against
 //!   the same daemons (campaign 5: the stall "never on a daemon's first
-//!   workload, then on every later one").
+//!   workload, then on every later one");
+//! - `git-under-flock-causal` (EC2 campaign 7, finding B-1): the b2b
+//!   workload with every node that does not commit *reading*. A reader
+//!   watches the reflog and `refs/heads/master` through its own mount
+//!   and, for every commit either names, checks that the commit object,
+//!   its tree and every object under it exist: git writes all of them
+//!   before it appends the reflog line, and appends the reflog before it
+//!   renames the ref, so a reader that sees the publication must see the
+//!   objects (causal order: no effect visible before what it follows).
+//!   The ref must never regress either. Every `GIT_FLOCK_FSCK_EVERY_S`
+//!   (20) the reader takes the turn lock, checks that the ref is the last
+//!   acknowledged commit, and runs `git fsck --full`. The lock matters:
+//!   fsck scans the object directories first and reads the refs and
+//!   reflogs afterwards, so a commit that lands in between makes it
+//!   report `missing blob/tree/commit` and `invalid reflog entry` on any
+//!   filesystem (campaign 7's checkpoints ran it while a turn was still
+//!   in flight; `git fsck --full` racing a committer on a local disk
+//!   reports the same). A reader is killed and remounted
+//!   `GIT_FLOCK_READER_RESTARTS` (2) times and keeps checking while it
+//!   catches up. The killed reader may be the sequencer or its backup,
+//!   so once a restart happened the committers' turn checks (a stale
+//!   ref under the lock, overlapping turns, a failed or slow turn) are
+//!   reported as under faults, not fatal; the readers' checks and the
+//!   end-state verification are.
 //!
 //! Knobs: `GIT_FLOCK_SECS` (workload duration, per round), `GIT_FLOCK_NODES`
-//! (2-4), `GIT_FLOCK_COMMITTERS=last` (the last two nodes commit, so
-//! neither is the sequencer), `GIT_FLOCK_S3_LATENCY_MS`,
+//! (2-4; causal: 3-4), `GIT_FLOCK_COMMITTERS=last` (the last two nodes
+//! commit, so neither is the sequencer; causal: the sequencer then reads),
+//! `GIT_FLOCK_S3_LATENCY_MS`,
 //! `GIT_FLOCK_ENV=K=V,...` (extra mount environment), `GIT_FLOCK_RUST_LOG`
 //! (the daemons' `RUST_LOG`), `GIT_FLOCK_ROUNDS`,
-//! `GIT_FLOCK_MAX_TURN_S` (b2b/rounds: a turn longer than this fails the
-//! run; default 30).
+//! `GIT_FLOCK_MAX_TURN_S` (b2b/rounds/causal: a turn longer than this
+//! fails the run; default 30), `GIT_FLOCK_FSCK_EVERY_S`,
+//! `GIT_FLOCK_READER_RESTARTS`.
 
 use super::m9::{c_deny_path, node_id};
 use super::{eventually, journal_drained, lease_of, setup, ts, wait_for_p2p};
@@ -78,12 +103,15 @@ enum Variant {
     Faults,
     B2b,
     Rounds,
+    /// Campaign 7's B-1: readers check causal order while the b2b
+    /// workload runs.
+    Causal,
 }
 
 impl Variant {
     /// Campaign 5's commit shape (5–20 files, appends to tracked files).
     fn campaign_shape(self) -> bool {
-        matches!(self, Variant::B2b | Variant::Rounds)
+        matches!(self, Variant::B2b | Variant::Rounds | Variant::Causal)
     }
 }
 
@@ -132,6 +160,10 @@ pub(super) fn git_under_flock_b2b(seed: u64) -> Result<()> {
 
 pub(super) fn git_under_flock_rounds(seed: u64) -> Result<()> {
     run("git-under-flock-rounds", seed, Variant::Rounds)
+}
+
+pub(super) fn git_under_flock_causal(seed: u64) -> Result<()> {
+    run("git-under-flock-causal", seed, Variant::Causal)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -402,6 +434,423 @@ fn committer(
                 .push(format!("{name}#{i}: {e:#}"));
             std::thread::sleep(Duration::from_millis(300));
         }
+    }
+}
+
+/// What one reader saw (`Variant::Causal`).
+#[derive(Default)]
+struct ReaderLog {
+    /// Commits checked (the reflog and the ref each name one).
+    checked: u64,
+    /// A publication (a reflog line, the ref) visible before an object
+    /// the commit it names depends on.
+    violations: Vec<String>,
+    /// `refs/heads/master` moved to a commit that does not descend from
+    /// what it read before.
+    regressions: Vec<String>,
+    /// `git fsck --full` under the turn lock: runs, and what they found.
+    fscks: u64,
+    fsck_problems: Vec<String>,
+    /// The ref under the turn lock was not the last acknowledged commit.
+    stale: Vec<String>,
+    /// Reads that failed for another reason than a missing object
+    /// (reported, not fatal: a reader is killed now and then).
+    read_errors: Vec<String>,
+}
+
+/// `git args...` with a deadline: a reader must not hang the run on a
+/// mount that stopped answering.
+fn git_within(
+    repo: &Path,
+    home: &Path,
+    args: &[&str],
+    within: Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=gitflock", "-c", "user.email=gitflock@test"])
+        .args(args)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running git {args:?}"))?;
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let out_t = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out.read_to_end(&mut v);
+        v
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err.read_to_end(&mut v);
+        v
+    });
+    let t = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if t.elapsed() > within {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "git {args:?} in {} did not finish within {within:?}",
+                repo.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_t.join().unwrap_or_default(),
+        stderr: err_t.join().unwrap_or_default(),
+    })
+}
+
+fn is_oid(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether the loose object is visible: `Ok(true)` present, `Ok(false)`
+/// `ENOENT`, `Err` anything else.
+fn object_visible(git_dir: &Path, oid: &str) -> std::io::Result<bool> {
+    match std::fs::metadata(git_dir.join("objects").join(&oid[..2]).join(&oid[2..])) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Everything commit `oid` needs: itself, its tree, every tree and blob
+/// under it — all written by git before the commit was published. `Err`
+/// when the commit or its tree cannot be read.
+fn closure_of(repo: &Path, home: &Path, oid: &str) -> Result<Vec<String>> {
+    let commit = git_within(
+        repo,
+        home,
+        &["cat-file", "-p", oid],
+        Duration::from_secs(60),
+    )?;
+    if !commit.status.success() {
+        bail!(
+            "cat-file -p {oid}: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&commit.stdout);
+    let tree = text
+        .lines()
+        .find_map(|l| l.strip_prefix("tree "))
+        .context("a commit without a tree line")?
+        .to_string();
+    let listing = git_within(
+        repo,
+        home,
+        &["ls-tree", "-r", "-t", &tree],
+        Duration::from_secs(120),
+    )?;
+    if !listing.status.success() {
+        bail!(
+            "ls-tree {tree}: {}",
+            String::from_utf8_lossy(&listing.stderr).trim()
+        );
+    }
+    let mut objects = vec![oid.to_string(), tree];
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        // `<mode> <type> <oid>\t<path>`
+        if let Some(o) = line.split_whitespace().nth(2) {
+            if is_oid(o) {
+                objects.push(o.to_string());
+            }
+        }
+    }
+    Ok(objects)
+}
+
+/// The commit `oid`, named by `via` (a reflog line, the ref), must have
+/// every object it depends on visible. What is missing is polled until
+/// it appears (how long that took is part of the finding) or 15 s pass.
+fn check_publication(
+    repo: &Path,
+    git_dir: &Path,
+    home: &Path,
+    oid: &str,
+    via: &str,
+) -> Option<String> {
+    let t = Instant::now();
+    let mut first: Option<String> = None;
+    loop {
+        let problem = match object_visible(git_dir, oid) {
+            Ok(false) => Some(format!("the commit object {oid} is missing")),
+            Err(e) => Some(format!("the commit object {oid}: {e}")),
+            Ok(true) => match closure_of(repo, home, oid) {
+                Err(e) => Some(format!("{e:#}")),
+                Ok(objects) => {
+                    let mut missing = Vec::new();
+                    let mut errors = Vec::new();
+                    for o in &objects {
+                        match object_visible(git_dir, o) {
+                            Ok(true) => {}
+                            Ok(false) => missing.push(o.clone()),
+                            Err(e) => errors.push(format!("{o}: {e}")),
+                        }
+                    }
+                    if missing.is_empty() && errors.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "{} of the {} objects it needs missing{}{}",
+                            missing.len(),
+                            objects.len(),
+                            missing
+                                .iter()
+                                .take(3)
+                                .map(|m| format!(" {m}"))
+                                .collect::<String>(),
+                            errors
+                                .iter()
+                                .take(3)
+                                .map(|e| format!("; {e}"))
+                                .collect::<String>()
+                        ))
+                    }
+                }
+            },
+        };
+        match problem {
+            None => {
+                return first.map(|p| {
+                    format!(
+                        "{via} named {oid} with {p}; all visible after {:?}",
+                        t.elapsed()
+                    )
+                });
+            }
+            Some(p) => {
+                if first.is_none() {
+                    first = Some(p.clone());
+                }
+                if t.elapsed() > Duration::from_secs(15) {
+                    return Some(format!(
+                        "{via} named {oid} with {}; still {p} after {:?}",
+                        first.unwrap(),
+                        t.elapsed()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Under the turn lock (no commit in flight): the ref must be the last
+/// acknowledged commit, and `git fsck --full` must be clean.
+fn fsck_under_lock(
+    name: &str,
+    mnt: &Path,
+    repo: &Path,
+    home: &Path,
+    paths: &Paths,
+    shared: &Shared,
+    log: &Mutex<ReaderLog>,
+) {
+    let lf = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(mnt.join(&paths.turn))
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log.lock()
+                .unwrap()
+                .read_errors
+                .push(format!("{name}: opening the turn file: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = flock(&lf, libc::LOCK_EX) {
+        log.lock()
+            .unwrap()
+            .read_errors
+            .push(format!("{name}: flock: {e}"));
+        return;
+    }
+    let want = shared.last.lock().unwrap().clone();
+    if let Some(want) = want {
+        let seen = master_ref(repo);
+        if seen != want {
+            let t = Instant::now();
+            let mut now = seen.clone();
+            while now != want && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(20));
+                now = master_ref(repo);
+            }
+            log.lock().unwrap().stale.push(format!(
+                "{name}: under the turn lock refs/heads/master read {seen}; the last acknowledged commit is {want}; {}",
+                if now == want {
+                    format!("caught up after {:?}", t.elapsed())
+                } else {
+                    format!("still {now} after {:?}", t.elapsed())
+                }
+            ));
+        }
+    }
+    let out = git_within(
+        repo,
+        home,
+        &["fsck", "--full", "--no-dangling"],
+        Duration::from_secs(600),
+    );
+    let mut l = log.lock().unwrap();
+    l.fscks += 1;
+    match out {
+        Ok(o) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            if !o.status.success() || text.contains("missing") || text.contains("invalid reflog") {
+                l.fsck_problems.push(format!(
+                    "{name}: git fsck --full under the turn lock: {}",
+                    text.lines().take(6).collect::<Vec<_>>().join(" | ")
+                ));
+            }
+        }
+        Err(e) => l.fsck_problems.push(format!("{name}: {e:#}")),
+    }
+    drop(l);
+    let _ = flock(&lf, libc::LOCK_UN);
+}
+
+/// One reader: every 50 ms, read the reflog and the ref through this
+/// mount and check every commit they newly name (`check_publication`);
+/// the ref must only ever move to a descendant; every `fsck_every`,
+/// `fsck_under_lock`. A dead mount (killed, being remounted) is waited
+/// out, and the reflog and ref are re-read from scratch afterwards.
+#[allow(clippy::too_many_arguments)]
+fn reader(
+    name: String,
+    mnt: PathBuf,
+    home: PathBuf,
+    stop: Arc<AtomicBool>,
+    paths: Paths,
+    log: Arc<Mutex<ReaderLog>>,
+    shared: Arc<Shared>,
+    quiet: Arc<Mutex<()>>,
+    fsck_every: Duration,
+) {
+    let repo = mnt.join(&paths.repo);
+    let git_dir = repo.join(".git");
+    let mut checked: BTreeSet<String> = BTreeSet::new();
+    let mut reflog_lines = 0usize;
+    let mut last_ref: Option<String> = None;
+    let mut last_fsck = Instant::now();
+    let mut alive = true;
+    while !stop.load(Ordering::SeqCst) {
+        if !mnt.join(ALIVE).exists() {
+            alive = false;
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        if !alive {
+            alive = true;
+            reflog_lines = 0;
+            last_ref = None;
+        }
+        // The reflog: every line names the commit the ref moved to.
+        match std::fs::read_to_string(git_dir.join("logs/HEAD")) {
+            Ok(text) => {
+                let lines: Vec<&str> = text.lines().collect();
+                if lines.len() < reflog_lines {
+                    reflog_lines = 0;
+                }
+                for (k, line) in lines.iter().enumerate().skip(reflog_lines) {
+                    let Some(oid) = line.split(' ').nth(1) else {
+                        continue;
+                    };
+                    if is_oid(oid) && checked.insert(oid.to_string()) {
+                        log.lock().unwrap().checked += 1;
+                        if let Some(p) = check_publication(
+                            &repo,
+                            &git_dir,
+                            &home,
+                            oid,
+                            &format!("reflog line {}", k + 1),
+                        ) {
+                            log.lock().unwrap().violations.push(format!("{name}: {p}"));
+                        }
+                    }
+                }
+                reflog_lines = lines.len();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let mut l = log.lock().unwrap();
+                if l.read_errors.len() < 50 {
+                    l.read_errors
+                        .push(format!("{name}: reading logs/HEAD: {e}"));
+                }
+            }
+        }
+        // The ref.
+        let r = master_ref(&repo);
+        if is_oid(&r) && last_ref.as_deref() != Some(r.as_str()) {
+            if checked.insert(r.clone()) {
+                log.lock().unwrap().checked += 1;
+                if let Some(p) = check_publication(&repo, &git_dir, &home, &r, "refs/heads/master")
+                {
+                    log.lock().unwrap().violations.push(format!("{name}: {p}"));
+                }
+            }
+            if let Some(prev) = &last_ref {
+                match git_within(
+                    &repo,
+                    &home,
+                    &["merge-base", "--is-ancestor", prev, &r],
+                    Duration::from_secs(60),
+                ) {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) if o.status.code() == Some(1) => {
+                        log.lock().unwrap().regressions.push(format!(
+                            "{name}: refs/heads/master went from {prev} to {r}, which does not descend from it"
+                        ));
+                    }
+                    Ok(o) => {
+                        let mut l = log.lock().unwrap();
+                        if l.read_errors.len() < 50 {
+                            l.read_errors.push(format!(
+                                "{name}: merge-base --is-ancestor {prev} {r}: {}",
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let mut l = log.lock().unwrap();
+                        if l.read_errors.len() < 50 {
+                            l.read_errors.push(format!("{name}: {e:#}"));
+                        }
+                    }
+                }
+            }
+            last_ref = Some(r);
+        }
+        if last_fsck.elapsed() >= fsck_every {
+            last_fsck = Instant::now();
+            let _quiet = quiet.lock().unwrap();
+            if mnt.join(ALIVE).exists() {
+                fsck_under_lock(&name, &mnt, &repo, &home, &paths, &shared, &log);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -689,7 +1138,7 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
         "GIT_FLOCK_SECS",
         match variant {
             Variant::Faults => 150,
-            Variant::B2b => 180,
+            Variant::B2b | Variant::Causal => 180,
             Variant::Rounds => 90,
             _ => 60,
         },
@@ -699,7 +1148,12 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
     } else {
         1
     };
-    let n_nodes = env_u64("GIT_FLOCK_NODES", 4).clamp(2, 4) as usize;
+    // Causal: two committers and at least one reader.
+    let n_nodes = if variant == Variant::Causal {
+        env_u64("GIT_FLOCK_NODES", 3).clamp(3, 4) as usize
+    } else {
+        env_u64("GIT_FLOCK_NODES", 4).clamp(2, 4) as usize
+    };
     let (env, root) = setup(scenario)?;
     let proxy = env.s3_proxy()?;
     // `GIT_FLOCK_S3_LATENCY_MS`: a slower bucket, so a follower's replica
@@ -887,6 +1341,36 @@ fn workload(
             })
         })
         .collect();
+    // Causal: every other node reads, and is restarted now and then.
+    let readers: Vec<usize> = if variant == Variant::Causal {
+        (0..clients.len())
+            .filter(|i| !committers.contains(i))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let reader_logs: Vec<Arc<Mutex<ReaderLog>>> = readers.iter().map(|_| Arc::default()).collect();
+    let reader_quiet: Vec<Arc<Mutex<()>>> = readers.iter().map(|_| Arc::default()).collect();
+    let fsck_every = Duration::from_secs(env_u64("GIT_FLOCK_FSCK_EVERY_S", 20));
+    let reader_threads: Vec<_> = readers
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| {
+            let c = &clients[i];
+            let (name, mnt) = (c.name.clone(), c.mnt.clone());
+            let (home, stop, log) = (home.to_path_buf(), stop.clone(), reader_logs[k].clone());
+            let (shared, paths, quiet) = (shared.clone(), paths.clone(), reader_quiet[k].clone());
+            std::thread::spawn(move || {
+                reader(name, mnt, home, stop, paths, log, shared, quiet, fsck_every)
+            })
+        })
+        .collect();
+    let restarts_wanted = if variant == Variant::Causal && !readers.is_empty() {
+        env_u64("GIT_FLOCK_READER_RESTARTS", 2)
+    } else {
+        0
+    };
+    let mut restarts_done = 0u64;
     let mut rng = StdRng::seed_from_u64(seed);
     let mut faults = Vec::new();
     let mut fault_err = None;
@@ -903,12 +1387,45 @@ fn workload(
                     break;
                 }
             }
+        } else if restarts_done < restarts_wanted
+            && started.elapsed()
+                >= Duration::from_secs(secs * (restarts_done + 1) / (restarts_wanted + 1))
+        {
+            // A reader is killed and remounted; it keeps checking while
+            // it catches up (campaign 7's part C: the errors right after
+            // a killed node rejoined). Not during its fsck under the
+            // turn lock.
+            let k = rng.random_range(0..readers.len());
+            let who = readers[k];
+            let name = clients[who].name.clone();
+            let r = (|| -> Result<()> {
+                let _quiet = reader_quiet[k].lock().unwrap();
+                mark_dead(&clients[who]);
+                std::thread::sleep(Duration::from_millis(rng.random_range(0..300)));
+                crash(&mut clients[who])?;
+                std::thread::sleep(Duration::from_millis(rng.random_range(500..3000)));
+                mount_live(&mut clients[who])
+            })();
+            restarts_done += 1;
+            match r {
+                Ok(()) => eprintln!(
+                    "    {label}: reader {name} killed and remounted ({:?})",
+                    started.elapsed()
+                ),
+                Err(e) => {
+                    fault_err = Some(e.context(format!("restarting reader {name}")));
+                    break;
+                }
+            }
         } else {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
     stop.store(true, Ordering::SeqCst);
     for w in workers {
+        let _ = w.join();
+    }
+    for w in reader_threads {
         let _ = w.join();
     }
     if let Some(e) = fault_err {
@@ -966,15 +1483,29 @@ fn workload(
         return Ok(acked);
     }
     let mut problems = Vec::new();
+    // Causal: a killed reader may be the sequencer or its backup, so a
+    // restart is a fault for the committers: a lock grant lapses while
+    // the turn is in flight (the design's documented limit: the turn
+    // then runs unprotected), a forward to the dead sequencer fails a
+    // git step. As under faults these are reported, not fatal; the
+    // readers' checks and `verify` still are.
+    let faulted = variant == Variant::Causal && restarts_done > 0;
+    let mut report = |what: String| {
+        if faulted {
+            eprintln!("    {label}: {what} (a reader was killed and remounted; reported)");
+        } else {
+            problems.push(what);
+        }
+    };
     if !overlaps.is_empty() {
-        problems.push(format!(
+        report(format!(
             "{} turns held the turn lock at the same time as another (a broken lock), e.g. {}",
             overlaps.len(),
             overlaps[0]
         ));
     }
     if !stale.is_empty() {
-        problems.push(format!(
+        report(format!(
             "{} of {} turns began with a stale refs/heads/master or marker under the turn lock, e.g. {}",
             stale.len(),
             turns.len(),
@@ -984,12 +1515,90 @@ fn workload(
     if variant.campaign_shape() {
         let limit = Duration::from_secs(env_u64("GIT_FLOCK_MAX_TURN_S", 30));
         if max > limit {
-            problems.push(format!(
+            report(format!(
                 "the longest turn took {max:?} (limit {limit:?}; median per decile {deciles})"
             ));
         }
         if errors > 0 {
-            problems.push(format!("{errors} turns failed (see above)"));
+            report(format!("{errors} turns failed (see above)"));
+        }
+    }
+    for (k, l) in reader_logs.iter().enumerate() {
+        let l = l.lock().unwrap();
+        let name = &clients[readers[k]].name;
+        eprintln!(
+            "    {label}: reader {name} checked {} commits ({} violations, {} regressions), {} fsck runs under the lock ({} failed, {} began stale), {} read errors{}",
+            l.checked,
+            l.violations.len(),
+            l.regressions.len(),
+            l.fscks,
+            l.fsck_problems.len(),
+            l.stale.len(),
+            l.read_errors.len(),
+            l.read_errors
+                .iter()
+                .take(5)
+                .map(|e| format!("\n      {e}"))
+                .collect::<String>()
+        );
+        anyhow::ensure!(
+            l.checked >= 4,
+            "reader {name} checked only {} commits",
+            l.checked
+        );
+        for (what, list) in [
+            (
+                "publications visible before an object they depend on",
+                &l.violations,
+            ),
+            (
+                "ref moves to a commit not descending from the previous one",
+                &l.regressions,
+            ),
+            ("fsck runs under the turn lock failed", &l.fsck_problems),
+            (
+                "fsck runs under the turn lock began with a stale ref",
+                &l.stale,
+            ),
+        ] {
+            if !list.is_empty() {
+                problems.push(format!(
+                    "reader {name}: {} {what}, e.g. {}",
+                    list.len(),
+                    list.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+                ));
+            }
+        }
+    }
+    if variant == Variant::Causal {
+        // Whether the run exercised delegation: the placement's grants
+        // and recalls, the delegates' executions and what the root
+        // appended from their streams.
+        let n = |v: &serde_json::Value, key: &str| v[key].as_u64().unwrap_or(0);
+        for c in clients.iter() {
+            if let Ok(s) = c.control_status() {
+                let d = &s["delegation"];
+                // The session counters too: a reader whose watermark
+                // names a position it never reaches shows up as reads
+                // timing out on the session budget (its fsck crawls).
+                let se = &s["session"];
+                eprintln!(
+                    "    {label}: {} delegation: placed {} recalled {} | as delegate: executed {} streamed {} deps-waits {} | as root: appended {} deps-unsatisfied {} exec-parked {} | session: reads {} waited {} timeouts {} wait {} ms",
+                    c.name,
+                    n(d, "place_delegated"),
+                    n(d, "place_recalled"),
+                    n(d, "executed") + n(d, "fast_path_executed"),
+                    n(d, "streamed_txs"),
+                    n(d, "deps_waits"),
+                    n(d, "appended_txs"),
+                    n(d, "deps_unsatisfied_at_append"),
+                    n(d, "exec_parked"),
+                    n(se, "reads"),
+                    n(se, "waited"),
+                    n(se, "timeouts"),
+                    n(se, "wait_ms_total"),
+                );
+            }
         }
     }
     if !problems.is_empty() {

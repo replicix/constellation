@@ -764,10 +764,16 @@ impl Meta {
             path,
         };
         meta.bootstrap()?;
-        meta.deleg_any.store(
-            !meta.delegation_table().is_empty(),
-            std::sync::atomic::Ordering::Release,
-        );
+        let table = meta.delegation_table();
+        meta.deleg_any
+            .store(!table.is_empty(), std::sync::atomic::Ordering::Release);
+        // Plan 30 §M11: the session state's generations survive a
+        // restart (see `SessionState::seed_generations`).
+        let live: std::collections::BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
+        meta.session
+            .seed_generations(table.max_gen(), &live, &|gen| {
+                meta.log_stream_idx(gen).unwrap_or(0)
+            });
         Ok(meta)
     }
 

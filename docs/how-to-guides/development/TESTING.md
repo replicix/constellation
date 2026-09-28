@@ -243,8 +243,28 @@ turn over `GIT_FLOCK_MAX_TURN_S` (30 s) or any failed turn fails it.
 each in a new repository, against the same daemons (the stall campaign 5
 saw "never on a daemon's first workload"); the last round mounts the
 fresh node and checks every round's repository.
+`git-under-flock-causal` (EC2 campaign 7, finding B-1) runs the b2b
+workload with every node that does not commit reading through its own
+mount: a reader watches the reflog and `refs/heads/master` and, for
+every commit either names, checks that the commit object, its tree and
+every object under it are visible (git writes them all before the
+reflog line, and the reflog line before the ref rename, so a reader
+that sees the publication must see the objects); the ref must never
+move to a commit that does not descend from the previous one; every
+`GIT_FLOCK_FSCK_EVERY_S` (20 s) the reader takes the turn lock, checks
+that the ref is the last acknowledged commit and runs `git fsck
+--full`. The lock is what makes fsck meaningful: it scans the object
+directories first and reads the refs and reflogs afterwards, so run
+while a commit is in flight it reports `missing blob/tree/commit` and
+`invalid reflog entry` on any filesystem. A reader is killed and
+remounted `GIT_FLOCK_READER_RESTARTS` (2) times and keeps checking
+while it catches up; since the killed reader may be the sequencer or
+its backup, the committers' turn checks (stale ref, overlapping,
+failed or slow turns) are then reported as under faults, not fatal.
+It needs 3–4 nodes (3 by default); with `GIT_FLOCK_COMMITTERS=last`
+the sequencer is a reader.
 `GIT_FLOCK_SECS` sets the duration (60 s; 150 s with faults, 180 s for
-b2b, 90 s per round), `GIT_FLOCK_NODES` the node count (2–4),
+b2b and causal, 90 s per round), `GIT_FLOCK_NODES` the node count (2–4),
 `GIT_FLOCK_COMMITTERS=last` makes the last two nodes commit (neither is
 the sequencer), `GIT_FLOCK_S3_LATENCY_MS` / `GIT_FLOCK_ENV=K=V,...` add S3
 latency and mount environment, and `GIT_FLOCK_RUST_LOG` sets the

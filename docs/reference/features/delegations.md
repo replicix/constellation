@@ -129,7 +129,13 @@ executed (a delegate or the root answers `Held`; an inbox op stays in
 the inbox and its requester withdraws it), and the requester re-sends
 it with fresh `deps` once its own replays have landed. A node holds its
 new writes while it has stranded ops of its own to replay, so its
-writes stay in the order it issued them.
+writes stay in the order it issued them. Which generations a replica
+holds, and which have ended, is rebuilt when it reopens its store
+(from the delegation table's highest generation and live rows, and the
+log's per-generation index): a watermark naming a generation that
+ended before a restart — a lock grant's floor carries the releaser's
+frontier — is reached at once, instead of every read waiting out the
+session budget for the rest of the process.
 
 Replies from a delegate carry `(gen, idx)` in their position, so the
 session guarantees of [Close-to-open modes](cto-modes.md) cover

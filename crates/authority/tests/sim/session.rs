@@ -52,6 +52,10 @@ fn names_of(op: &NsOp) -> Vec<&str> {
 enum Kind {
     Own,
     Observed,
+    /// Set by observing another node's write: everything that node had
+    /// been acknowledged before it issued that write (EC2 campaign 7,
+    /// finding B-1: git's objects before the ref that names them).
+    Causal,
 }
 
 pub fn check_sessions(
@@ -96,27 +100,47 @@ pub fn check_sessions(
     names.sort();
     names.dedup();
     let mut presence: HashMap<String, Vec<bool>> = HashMap::new();
+    // Per name and state, the success that last touched it: the op a
+    // read of the name in that state observed.
+    let mut touched: HashMap<String, Vec<Option<Rid>>> = HashMap::new();
     for n in &names {
         let mut v = vec![false];
+        let mut by = vec![None];
         let mut cur = false;
+        let mut last = None;
         for (rid, _) in &successes {
             let (_, op) = &invoke[rid];
-            match op {
-                NsOp::Create(x) | NsOp::Put(x) if x == n => cur = true,
-                NsOp::Unlink(x) if x == n => cur = false,
+            let hit = match op {
+                NsOp::Create(x) | NsOp::Put(x) if x == n => {
+                    cur = true;
+                    true
+                }
+                NsOp::Unlink(x) if x == n => {
+                    cur = false;
+                    true
+                }
                 NsOp::Rename(a, b) => {
+                    let mut hit = false;
                     if a == n {
                         cur = false;
+                        hit = true;
                     }
                     if b == n {
                         cur = true;
+                        hit = true;
                     }
+                    hit
                 }
-                _ => {}
+                _ => false,
+            };
+            if hit {
+                last = Some(*rid);
             }
             v.push(cur);
+            by.push(last);
         }
         presence.insert(n.clone(), v);
+        touched.insert(n.clone(), by);
     }
     let first_at_or_after = |name: &str, from: usize, want: bool| -> Option<usize> {
         let v = presence.get(name)?;
@@ -133,6 +157,81 @@ pub fn check_sessions(
         }
     }
     let n_states = successes.len();
+    // Causal floors (EC2 campaign 7, finding B-1). A session that
+    // observed `name` as `want` in some state of `lo..=hi` observed the
+    // write that last set it there — when that is one op `b` across
+    // every such state (else nothing is attributed). `b`'s node had, by
+    // the time it issued `b`, been acknowledged every earlier op of its
+    // own that returned before `b` was invoked: they precede `b` in the
+    // log (a delegate waits for the requester's `deps`; the root parks
+    // on the delegate streams they name), and whatever installs `b`
+    // ahead of the log (a contiguous streamed prefix, the delegate's own
+    // execution after the same wait, a refusal's position the reader
+    // waits for) carries them too. So the observer's later reads of
+    // their names must reflect them: one floor per name, at the index
+    // after the latest such op. The observer's own writes are covered
+    // by read-your-writes; tentative ops are exempt.
+    let causal_floors = |name: &str,
+                         lo: usize,
+                         hi: usize,
+                         want: bool,
+                         observer: (u64, u32)|
+     -> Vec<(String, usize, String)> {
+        let (Some(p), Some(t)) = (presence.get(name), touched.get(name)) else {
+            return Vec::new();
+        };
+        let hi = hi.min(p.len() - 1);
+        let mut setter: Option<Rid> = None;
+        for s in lo..=hi {
+            if p[s] != want {
+                continue;
+            }
+            match (setter, t[s]) {
+                // The initial state: nothing was observed.
+                (_, None) => return Vec::new(),
+                (None, Some(b)) => setter = Some(b),
+                (Some(a), Some(b)) if a != b => return Vec::new(),
+                _ => {}
+            }
+        }
+        let Some(b) = setter else {
+            return Vec::new();
+        };
+        if tentative.contains(&b) || (b.node, b.incarnation) == observer {
+            return Vec::new();
+        }
+        let Some((inv_b, op_b)) = invoke.get(&b) else {
+            return Vec::new();
+        };
+        let mut floors: BTreeMap<String, usize> = BTreeMap::new();
+        for (a, (ret_a, r_a)) in &ret {
+            if *r_a != NsRet::Ok
+                || (a.node, a.incarnation) != (b.node, b.incarnation)
+                || ret_a >= inv_b
+                || tentative.contains(a)
+            {
+                continue;
+            }
+            let Some(ia) = index_of.get(a) else {
+                continue;
+            };
+            let (_, op_a) = &invoke[a];
+            for n in names_of(op_a) {
+                let e = floors.entry(n.to_string()).or_insert(0);
+                *e = (*e).max(ia + 1);
+            }
+        }
+        floors
+            .into_iter()
+            .map(|(n, f)| {
+                let by = format!(
+                    "causal: {name} seen as {want} was set by {op_b:?} rid {b:?}, and its node had been acknowledged {n} (log index {}) before issuing it",
+                    f - 1
+                );
+                (n, f, by)
+            })
+            .collect()
+    };
 
     // Per session: (return tick, name, floor, kind, what set it).
     type Session = (u64, u32);
@@ -185,13 +284,18 @@ pub fn check_sessions(
                     .unwrap_or(n_states)
                     .min(n_states);
                 if let Some(k) = first_at_or_after(name, lo, want).filter(|k| *k <= hi) {
-                    obs.entry(session).or_default().push((
+                    let causal = causal_floors(name, k, hi, want, session);
+                    let list = obs.entry(session).or_default();
+                    list.push((
                         *rt,
                         name.to_string(),
                         k,
                         Kind::Observed,
                         format!("refusal {op:?} -> {r:?} rid {rid:?}"),
                     ));
+                    for (n, f, by) in causal {
+                        list.push((*rt, n, f, Kind::Causal, by));
+                    }
                 }
             }
             _ => {}
@@ -223,13 +327,27 @@ pub fn check_sessions(
                 // would otherwise be "explained" by a far-future state and
                 // make the next, fresh read look non-monotonic.
                 Some(_) if r.timed_out => {}
-                Some(k) => list.push((
-                    r.ret,
-                    r.name.clone(),
-                    k,
-                    Kind::Observed,
-                    format!("read of {} by t{} -> {}", r.name, r.thread, r.present),
-                )),
+                Some(k) => {
+                    // The latest state the read can have seen: before
+                    // every success invoked after it returned.
+                    let hi = index_of
+                        .iter()
+                        .filter(|(b, _)| invoke[*b].0 > r.ret)
+                        .map(|(_, ib)| *ib)
+                        .min()
+                        .unwrap_or(n_states);
+                    let causal = causal_floors(&r.name, k, hi, r.present, session);
+                    list.push((
+                        r.ret,
+                        r.name.clone(),
+                        k,
+                        Kind::Observed,
+                        format!("read of {} by t{} -> {}", r.name, r.thread, r.present),
+                    ));
+                    for (n, f, by) in causal {
+                        list.push((r.ret, n, f, Kind::Causal, by));
+                    }
+                }
                 None => {
                     let tentative_name = tentative_names.get(&r.name).is_some_and(|t| *t < r.ret);
                     let Some((_, _, _, kind, by)) = binding else {
@@ -274,6 +392,7 @@ pub fn check_sessions(
                         let checker = match kind {
                             Kind::Own => "read_your_writes",
                             Kind::Observed => "monotonic_reads",
+                            Kind::Causal => "causal_order",
                         };
                         report.violations.push((checker.to_string(), what));
                     }
@@ -352,6 +471,66 @@ mod tests {
         // A tentative create exempts the name.
         let tentative: HashSet<Rid> = [rid(1, 1)].into_iter().collect();
         let r = check_sessions(&events, &ticks, &bad, &tentative, &HashMap::new());
+        assert!(r.violations.is_empty(), "{r:?}");
+    }
+
+    /// Campaign 7's B-1 shape: node 1 creates `d1/a` (an object), and
+    /// once that returned, `d2/b` (the ref naming it) — different
+    /// directories, possibly different owners. Node 2 that read `d2/b`
+    /// present must read `d1/a` present afterwards; reading `d1/a`
+    /// absent before it saw `d2/b` is plain staleness.
+    #[test]
+    fn observing_a_write_carries_what_its_node_wrote_before() {
+        let events = vec![
+            HistEvt::Invoke {
+                thread: 16,
+                rid: rid(1, 1),
+                op: NsOp::Create("d1/a".into()),
+            },
+            HistEvt::Return {
+                thread: 16,
+                rid: rid(1, 1),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 16,
+                rid: rid(1, 2),
+                op: NsOp::Create("d2/b".into()),
+            },
+            HistEvt::Return {
+                thread: 16,
+                rid: rid(1, 2),
+                ret: NsRet::Ok,
+            },
+        ];
+        let ticks = vec![0, 1, 2, 3];
+        let log: HashMap<Rid, (u64, usize)> = [(rid(1, 1), (1, 0)), (rid(1, 2), (1, 1))]
+            .into_iter()
+            .collect();
+        let none = HashSet::new();
+        let bad = vec![read(2, "d2/b", true, 4, 5), read(2, "d1/a", false, 6, 7)];
+        let r = check_sessions(&events, &ticks, &bad, &none, &log);
+        let kinds: Vec<&str> = r.violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["causal_order"], "{r:?}");
+        let good = vec![
+            read(2, "d1/a", false, 2, 3),
+            read(2, "d2/b", true, 4, 5),
+            read(2, "d1/a", true, 6, 7),
+        ];
+        let r = check_sessions(&events, &ticks, &good, &none, &log);
+        assert!(r.violations.is_empty(), "{r:?}");
+        // The two creates in flight together: `d2/b` carries nothing.
+        let overlapping = vec![
+            events[0].clone(),
+            events[2].clone(),
+            events[1].clone(),
+            events[3].clone(),
+        ];
+        let r = check_sessions(&overlapping, &ticks, &bad, &none, &log);
+        assert!(r.violations.is_empty(), "{r:?}");
+        // A tentative `d1/a` carries nothing either.
+        let tentative: HashSet<Rid> = [rid(1, 1)].into_iter().collect();
+        let r = check_sessions(&events, &ticks, &bad, &tentative, &log);
         assert!(r.violations.is_empty(), "{r:?}");
     }
 }

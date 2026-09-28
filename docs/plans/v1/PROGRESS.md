@@ -26731,3 +26731,197 @@ The batch is withdrawn with a **tombstone**, not a DELETE.
   - `p2p-partition-tolerance`, `p2p-handover`, `p2p-same-identity-restart`.
   - `idle-cost` (holder 27.0/min), `idle-cost-link-flap` (41.5/min).
   - `git-under-flock-faults` (228 s).
+
+## Fix: a ref visible before its objects (campaign 7 B-1)
+
+EC2 campaign 7's Finding B-1: at 3 of 6 fault-free checkpoints of the
+git-under-flock run (both backends), and once in the soak right after a
+killed node rejoined, `git fsck --full` through one node's mount
+reported `missing blob/tree/commit` and `error: HEAD: invalid reflog
+entry <oid>`, with that node's `HEAD` one or two commits behind the
+others. Read as: a later write of the committer (the reflog line, the
+ref) visible before earlier writes it causally follows (the objects).
+
+### What happened
+
+It is the checkpoint's method, not the filesystem. The evidence
+(`campaign7-logs/b_gitflock_{aws,ovh}_{a,b}.jsonl`, the committers'
+own per-turn timestamps, against `b_faultfree_checkpoints_*.json`)
+shows every affected snapshot was taken while a turn was still in
+flight on a committer:
+
+- AWS checkpoint 2 (t=2508.9): `b#414` (`6e0be1c1`) took the turn lock
+  at 2403.9 the moment `a#409` (`a1b04d82`) released it and committed
+  at 2411.5; the workers then paused until 2512.7. Node `a`'s
+  snapshot read `HEAD` = `a1b04d82` and its fsck missed exactly the
+  blobs and tree of `b#414` (`0f…`, `19…`, `28…`: object directories
+  scanned before `b` wrote them) while finding the commit in `6e/`,
+  scanned after.
+- OVH checkpoint 1 (t=1248.1): `a#71` held the lock 1201.0–1210.9
+  while node `a` was snapshotted: `HEAD` = `9bb84158` (`b#78`), and the
+  five missing objects are `a#71`'s own.
+- OVH checkpoint 3 (t=3646.4): `b#222` (`6e18ba0b`) committed at
+  3610.9 and `a#175` (`d3384fd7`) at 3630.3, while `a`, then `b`, `c`,
+  `d` were snapshotted in turn. Node `a` (snapshotted first, `HEAD` =
+  `f11d6976`) reports `invalid reflog entry 6e18ba0b` and `missing
+  commit 6e18ba0b`; node `c` (snapshotted third, `HEAD` = `6e18ba0b`)
+  reports `invalid reflog entry d3384fd7` and `d3384fd7`'s objects
+  missing; node `d`, snapshotted last, is clean at `d3384fd7`.
+
+`git fsck --full` scans every `objects/xx/` directory first
+(`fsck_object_dir`) and reads the refs and reflogs afterwards
+(`get_default_heads`), marking each scanned object `HAS_OBJ`; a reflog
+entry or a reachable object without that flag is exactly `invalid
+reflog entry` / `missing`. A commit that lands between the scan and
+the ref read produces this on any filesystem: `git fsck --full` in a
+loop against one committer on this host's local disk reported
+`missing blob/tree/commit` and `invalid reflog entry` in 104 of 113
+runs. The "lagging" node is simply the one whose snapshot overlapped
+the commit; the ones snapshotted after it show the commit's `HEAD`.
+
+The soak's checkpoint (node `d` right after a restart) ran the same
+fsck against a repository its workers kept committing to.
+
+So the candidates were checked and none is a mechanism:
+
+- Sequencers and streams: a delegate waits for the requester's `deps`
+  before it executes (`core::delegate`, rule 1); the root parks an
+  execution — its own or a forwarded one — until the delegate streams
+  its `deps` name are appended (`core::holder`, `deleg_deps_waits`);
+  the root appends a delegate batch only once the batch's `deps` are
+  in its replica (`deps_unsatisfied_at_append`, asserted 0 by the sim);
+  the pre-S3 stream is a contiguous prefix of the applied log. So the
+  log keeps every node's program order across owners, and everything
+  installed ahead of it does too.
+- Negative dentries: a lookup miss is answered `reply.error(ENOENT)`
+  (`fusefs_ops::lookup`), which the kernel does not cache.
+- A restarted node tails from its replica, applying segments in
+  order; speculation is installed under the log, never over it.
+
+### Regression checks
+
+- Harness `git-under-flock-causal` (`crates/harness/src/scenarios/
+  gitflock.rs`, `Variant::Causal`): the b2b workload with every node
+  that does not commit *reading*. Every 50 ms a reader re-reads
+  `.git/logs/HEAD` and `refs/heads/master` through its mount and, for
+  every commit either newly names, checks that the commit object, its
+  tree and every object under it (`cat-file -p`, `ls-tree -r -t`, then
+  a `stat` per object) are visible; a miss is polled until it heals
+  (the delay is part of the finding) and is a violation either way.
+  The ref must only move to a descendant of what it read before
+  (`merge-base --is-ancestor`). Every `GIT_FLOCK_FSCK_EVERY_S` (20 s)
+  the reader takes the turn lock — no commit in flight, which is what
+  fsck needs — checks that the ref is the last acknowledged commit,
+  and runs `git fsck --full --no-dangling`. A reader is killed and
+  remounted `GIT_FLOCK_READER_RESTARTS` (2) times and keeps checking
+  while it catches up. Three nodes by default (the holder commits);
+  with `GIT_FLOCK_NODES=4 GIT_FLOCK_COMMITTERS=last` the holder and a
+  follower read. The run prints each node's placement, delegate and
+  root counters, so it shows whether delegation was exercised.
+- Sim, two properties (`crates/authority/tests/sim/{history,session}.rs`,
+  wired in `run.rs`):
+  - `check_session_order`, enforced in every configuration: across
+    directories and owners, the log keeps every node's program order:
+    a non-tentative success that returned to a node before the same
+    node invoked another op precedes it in the log. (The witnessed
+    linearizability check orders real time within a directory only,
+    since different owners order their keys independently.)
+  - Causal floors in `check_sessions` (checker `causal_order`,
+    enforced when reads wait): a session that observed another node's
+    write — by a read, or by a refusal — must from then on see every
+    write that node had been acknowledged before it issued that one
+    (one floor per name, at the index after the latest such op). The
+    observed write is attributed only when one op set the name in
+    every state the read could have seen; tentative ops and the
+    session's own writes (read-your-writes) are left out.
+  - Unit tests for both: the B-1 shape (`d1/a` then `d2/b` by one
+    node; another node that read `d2/b` present must read `d1/a`
+    present), the reversed log, overlapping ops, a tentative first op.
+- `TESTING.md` describes the scenario and its knobs.
+
+### What the scenario found: a reopened session never reaches a floor on an ended generation
+
+`git-under-flock-causal` with `GIT_FLOCK_S3_LATENCY_MS=150`, four
+nodes and `GIT_FLOCK_COMMITTERS=last` (the sequencer and its backup
+read, and are the ones killed): after reader `b` — the root until its
+kill; `c`, its backup, took the lease over — was remounted, its `git
+fsck --full` under the turn lock did not finish in 600 s. Not a hang:
+`status.session` showed `timeouts 310, wait_ms_total 620343`, and the
+one logged wait names the reason: `observed` = `streams [(1, 816)]`,
+`applied` = `streams [(2, 370)]`. Generation 1 (`c`'s delegation under
+`b`'s tenure) had ended at the takeover; the turn lock's grant carried
+the releaser's frontier, which still named it, and `locks::granted`
+made that the session watermark. `SessionState` keeps the stream
+indices and the voided generations in memory only, and a replica that
+reopens its store re-applies nothing below its applied position, so
+`b` after the restart knew neither generation 1 nor its end: the floor
+was unreachable for the rest of the process, and every read on `b`
+waited the whole 2 s session budget (`session_wait` answers degraded
+after it). A `git fsck` is thousands of reads.
+
+Fix: `SessionState::seed_generations`, called at the end of
+`Meta::open` from what the store persists — the delegation table's
+`max_gen` and live rows (`ns`, replicated) and the log's per-generation
+appended index (`local`): every generation up to `max_gen` is held
+through the log's index of it, and one the table no longer lists is
+voided at that cut (`void_cuts` too, so a write's dependency past it
+is still *lost*, as a `Recall` applied live would leave it). A fresh
+node bootstrapping from a commit has no per-generation indices and
+seeds ended generations at cut 0: reads reach them at once, and a
+write that depends on such a generation is held and re-sent with
+fresh `deps` (`hold_for_lost_deps`) — strictly better than before,
+when an execution parked on it for good. Unit test
+`a_reopened_session_reaches_a_floor_on_a_generation_that_ended_before_the_restart`.
+The scenario's summary now prints every node's session counters
+(`reads`, `waited`, `timeouts`, `wait_ms_total`) next to its
+delegation counters.
+
+### Files
+
+- `crates/harness/src/scenarios/gitflock.rs`, `crates/harness/src/scenarios.rs`
+- `crates/authority/tests/sim/{history,session,run}.rs`
+- `crates/meta/src/session.rs`, `crates/meta/src/store/mod.rs`
+- Docs: `TESTING.md`, `delegations.md`
+
+### Results (on `b89c048`, prefixes `constellation-harness-causalgit{,2,3}`, host load 11–18 of 32)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) are clean.
+- Test suites, all pass: `constellation-authority` lib 133, sim suite
+  107, meta_repro 3; `constellation-meta` 97 (+ its other binaries);
+  `constellation` package 281; `constellation-harness` lib 14.
+- Long sims with the new checks enforced, 2000 seeds each:
+  `long_random`, `long_delegated`, `long_backup` and `long_backup_hot`
+  pass (before the session fix); `long_delegated` 500 seeds again after
+  it.
+- `git fsck --full` in a loop against one committer on this host's
+  local disk (zfs, git 2.43): 104 of 113 runs report `missing
+  blob/tree/commit`, some `invalid reflog entry` — B-1's signature
+  without Constellation.
+- `git-under-flock-causal`, all pass, every reader 0 violations, 0
+  regressions, every fsck under the lock clean and not stale, 0 read
+  errors:
+  - 3 nodes (the holder commits, `c` reads, killed twice): seeds 42,
+    43, 9 and 21 (176–256 commits checked each); seed 5 with
+    `GIT_FLOCK_SECS=300 GIT_FLOCK_READER_RESTARTS=3` (355 commits, 14
+    fscks). Delegation was exercised in every run: the placement
+    delegated `b`'s directory to `b` (1210–3424 transactions executed
+    there and appended by the root, with 6–36 `deps` waits).
+  - 4 nodes, `GIT_FLOCK_COMMITTERS=last` (the holder `a` and `b` read
+    and are the ones killed): seed 7 (214 commits checked per reader).
+  - 4 nodes, `GIT_FLOCK_COMMITTERS=last`, `GIT_FLOCK_S3_LATENCY_MS=150`,
+    `GIT_FLOCK_SECS=240`, seed 11: before the session fix, reader `b`'s
+    fsck under the lock ran past 600 s with `session timeouts 310,
+    wait 620 s` (the finding above); with it, 0 timeouts on every node
+    (`wait` 2–328 ms) and the run passes. Its committers' turn checks
+    are reported, not fatal (the sequencer and its backup were killed):
+    7 overlapping turns and 5 failed `git add`/`commit` steps around
+    the two takeovers under 150 ms S3 latency, the documented
+    lapsed-grant limit; the end state verified on every node and a
+    fresh one.
+- The other gitflock scenarios: `git-under-flock` (102 s),
+  `git-under-flock-gc` (72 s), `git-under-flock-b2b` (225 s),
+  `git-under-flock-faults` (203 s) pass.
+- Delegation and visibility scenarios, all pass: `delegated-subtrees`,
+  `marker-order`, `delegated-op-latency`, `delegate-crash`,
+  `cross-subtree-rename`, `visibility-after-burst`,
+  `visibility-s3-latency`, `p2p-invalidation`.

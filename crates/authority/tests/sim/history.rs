@@ -556,6 +556,82 @@ pub struct Witness {
     pub observers: HashSet<Rid>,
 }
 
+/// Plan 30 §M6/§M11 (EC2 campaign 7, finding B-1): the log keeps every
+/// node's program order across directories and owners. A success that
+/// returned to a node before the same node invoked another op precedes
+/// it in the log, whichever sequencer executed each: a delegate waits
+/// for the requester's `deps` before it executes, and the root parks an
+/// execution until the delegate streams its `deps` name are appended.
+/// So a replica that tails the log — and whatever is installed ahead of
+/// it as a contiguous prefix — never shows the later effect without the
+/// earlier one (git: a ref or reflog line without the objects it
+/// names). `check_linearizable_witnessed` checks real time within a
+/// directory only (different owners order their keys independently);
+/// this is the cross-directory rule that still holds: one node's own
+/// order. Tentative ops (rolled back, replayed by rid) are exempt.
+pub fn check_session_order(
+    events: &[HistEvt],
+    tentative: &HashSet<Rid>,
+    completed_at: &std::collections::HashMap<Rid, (u64, usize)>,
+) -> Result<(), String> {
+    use std::collections::HashMap;
+    let mut invoke_at: HashMap<Rid, usize> = HashMap::new();
+    let mut return_at: HashMap<Rid, usize> = HashMap::new();
+    for (i, e) in events.iter().enumerate() {
+        match e {
+            HistEvt::Invoke { rid, .. } => {
+                invoke_at.insert(*rid, i);
+            }
+            HistEvt::Return { rid, .. } => {
+                return_at.insert(*rid, i);
+            }
+        }
+    }
+    // Per session (node incarnation), its non-tentative successes:
+    // (return index, invoke index, log position, rid).
+    type Op = (usize, usize, (u64, usize), Rid);
+    let mut sessions: HashMap<(u64, u32), Vec<Op>> = HashMap::new();
+    for (rid, pos) in completed_at {
+        if tentative.contains(rid) {
+            continue;
+        }
+        let (Some(inv), Some(ret)) = (invoke_at.get(rid), return_at.get(rid)) else {
+            continue;
+        };
+        sessions
+            .entry((rid.node, rid.incarnation))
+            .or_default()
+            .push((*ret, *inv, *pos, *rid));
+    }
+    for ops in sessions.values_mut() {
+        ops.sort_by_key(|(ret, ..)| *ret);
+        let mut by_invoke = ops.clone();
+        by_invoke.sort_by_key(|(_, inv, ..)| *inv);
+        // Of the ops returned before the current one was invoked, the
+        // one furthest along the log.
+        let mut furthest: Option<((u64, usize), Rid)> = None;
+        let mut returned = 0;
+        for (_, inv, pos, rid) in &by_invoke {
+            while returned < ops.len() && ops[returned].0 < *inv {
+                let (_, _, p, r) = ops[returned];
+                if furthest.is_none_or(|(fp, _)| p > fp) {
+                    furthest = Some((p, r));
+                }
+                returned += 1;
+            }
+            if let Some((fp, fr)) = furthest {
+                if fp > *pos {
+                    return Err(format!(
+                        "rid {fr:?} returned to node {} before it invoked rid {rid:?}, but follows it in the log ({fp:?} after {pos:?}): the log breaks the node's program order",
+                        rid.node
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +642,51 @@ mod tests {
             incarnation: 1,
             seq,
         }
+    }
+
+    /// Node 1 creates `d1/a`, and once that returned, `d2/b`. The log
+    /// must hold them in that order, whichever owner appended each; a
+    /// tentative `d1/a` (rolled back, replayed later) is exempt.
+    #[test]
+    fn the_log_keeps_a_nodes_program_order_across_directories() {
+        let events = vec![
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(1),
+                op: NsOp::Create("d1/a".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(1),
+                ret: NsRet::Ok,
+            },
+            HistEvt::Invoke {
+                thread: 1,
+                rid: rid(2),
+                op: NsOp::Create("d2/b".into()),
+            },
+            HistEvt::Return {
+                thread: 1,
+                rid: rid(2),
+                ret: NsRet::Ok,
+            },
+        ];
+        let none = HashSet::new();
+        let in_order = [(rid(1), (1, 0)), (rid(2), (1, 1))].into_iter().collect();
+        assert!(check_session_order(&events, &none, &in_order).is_ok());
+        let reversed = [(rid(1), (2, 0)), (rid(2), (1, 0))].into_iter().collect();
+        let err = check_session_order(&events, &none, &reversed).unwrap_err();
+        assert!(err.contains("program order"), "{err}");
+        let tentative: HashSet<Rid> = [rid(1)].into_iter().collect();
+        assert!(check_session_order(&events, &tentative, &reversed).is_ok());
+        // Two ops in flight together are unordered.
+        let overlapping = vec![
+            events[0].clone(),
+            events[2].clone(),
+            events[1].clone(),
+            events[3].clone(),
+        ];
+        assert!(check_session_order(&overlapping, &none, &reversed).is_ok());
     }
 
     #[test]
