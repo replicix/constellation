@@ -1119,10 +1119,18 @@ pub struct InboxStatus {
     pub submitted_batches: u64,
     #[serde(default)]
     pub submitted_ops: u64,
-    /// Ops re-submitted under a newer epoch because a takeover stranded
-    /// their batch.
+    /// Ops re-submitted by rid: under a newer epoch because a takeover
+    /// stranded their batch, or in a new batch because one they shared
+    /// was withdrawn.
     #[serde(default)]
     pub resubmitted_ops: u64,
+    /// Requester: batches this node withdrew (overwrote with a tombstone)
+    /// before forwarding their op over P2P or holding it back.
+    #[serde(default)]
+    pub withdrawn_ops: u64,
+    /// Holder: withdrawn batches its polls read and stepped past.
+    #[serde(default)]
+    pub tombstones_read: u64,
     /// Forwards the inbox could not take (no live holder to leave them
     /// with, S3 refused the batch, or the in-doubt deadline passed); they
     /// took the lease path.

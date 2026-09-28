@@ -1289,19 +1289,22 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
             "nothing is forwarded while a batch is still durable: {out:?}"
         );
         let (op, req) = s3_ops(&out)[0];
-        assert_eq!(req, &S3Op::InboxDelete { key: *key }, "batches go in order");
+        assert!(
+            matches!(req, S3Op::InboxTombstone { batch } if batch.key() == *key && batch.is_tombstone()),
+            "batches go in order, each overwritten with a tombstone: {req:?}"
+        );
         assert!(matches!(
             h.core.clients().next(),
             Some((_, ClientPhase::InboxWithdraw))
         ));
         out = h.step(Event::S3 {
             op,
-            result: S3Result::InboxDelete(Ok(())),
+            result: S3Result::InboxTombstone(Ok(())),
         });
     }
     assert!(
         matches!(sends(&out)[0].1, PeerMsg::MutateRequest { rid: r, .. } if *r == rid),
-        "forwarded once every batch is gone: {out:?}"
+        "forwarded once every batch is withdrawn: {out:?}"
     );
     assert_eq!(h.core.stats.inbox_withdrawn_ops, 3);
     assert_eq!(h.core.stats.inbox_multi_batch_withdrawals, 1);
@@ -1323,7 +1326,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
     });
     assert_eq!(replies(&out).len(), 1);
 
-    // A delete that fails leaves the batch drainable: the op takes the
+    // A withdrawal that fails leaves the batch drainable: the op takes the
     // lease path instead of forwarding past it.
     let rid2 = h.rid(2);
     h.core.in_doubt_rids.insert(rid2);
@@ -1341,10 +1344,10 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
         op: h.create("b"),
     });
     let (op, req) = s3_ops(&out)[0];
-    assert!(matches!(req, S3Op::InboxDelete { .. }));
+    assert!(matches!(req, S3Op::InboxTombstone { .. }));
     let out = h.step(Event::S3 {
         op,
-        result: S3Result::InboxDelete(Err(crate::event::S3Failure("500".into()))),
+        result: S3Result::InboxTombstone(Err(crate::event::S3Failure("500".into()))),
     });
     assert!(sends(&out).is_empty(), "{out:?}");
     assert!(matches!(
@@ -7504,7 +7507,6 @@ fn a_candidate_that_sealed_the_epoch_is_not_reinvited() {
 /// out the inbox deadline (2×TTL) and answered EIO.
 #[test]
 fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
-    use constellation_store_s3::inbox::InboxKey;
     let mut h = Harness::new(1);
     let rid = h.rid(1);
     h.core.lease.cached_holder = Some(2);
@@ -7581,17 +7583,15 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
     // The batch is withdrawn first, then the op is forwarded.
     let (op, req) = s3_ops(&out)
         .into_iter()
-        .find(|(_, r)| matches!(r, S3Op::InboxDelete { .. }))
+        .find(|(_, r)| matches!(r, S3Op::InboxTombstone { .. }))
         .unwrap_or_else(|| panic!("the waiting op was not re-routed: {out:?}"));
     assert!(matches!(
         req,
-        S3Op::InboxDelete {
-            key: InboxKey { node: 1, .. }
-        }
+        S3Op::InboxTombstone { batch } if batch.node == 1 && batch.is_tombstone()
     ));
     let out = h.step(Event::S3 {
         op,
-        result: S3Result::InboxDelete(Ok(())),
+        result: S3Result::InboxTombstone(Ok(())),
     });
     assert!(
         matches!(sends(&out).first(), Some((2, PeerMsg::MutateRequest { rid: r, .. })) if *r == rid),
@@ -7793,4 +7793,188 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
     h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
     let (_, from, width) = poll(&out).expect("hot after a hit");
     assert_eq!((from, width), (1, full));
+}
+
+/// Answer the requester's inbox numbering and batch PUTs in `out` until
+/// nothing more is asked; every PUT's batch, in order.
+fn land_inbox_puts(
+    h: &mut Harness,
+    mut out: Vec<Action>,
+) -> (Vec<Action>, Vec<constellation_store_s3::inbox::InboxBatch>) {
+    let mut puts = Vec::new();
+    let mut rest = Vec::new();
+    for _ in 0..16 {
+        let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
+            .into_iter()
+            .map(|(o, r)| (o, r.clone()))
+            .collect();
+        let mut next = Vec::new();
+        for (op, req) in ops {
+            let result = match req {
+                S3Op::InboxLastN { .. } => S3Result::InboxLastN(Ok(None)),
+                S3Op::InboxPut { batch } => {
+                    puts.push(batch);
+                    S3Result::InboxPut(Ok(()))
+                }
+                _ => continue,
+            };
+            next.extend(h.step(Event::S3 { op, result }));
+        }
+        rest.extend(out.into_iter().filter(|a| {
+            !matches!(
+                a,
+                Action::S3 {
+                    req: S3Op::InboxLastN { .. } | S3Op::InboxPut { .. },
+                    ..
+                }
+            )
+        }));
+        if next.is_empty() {
+            break;
+        }
+        out = next;
+    }
+    (rest, puts)
+}
+
+/// Withdraw hole: a requester withdrawing an inbox batch before a P2P
+/// forward used to DELETE it, leaving a hole at its number; a holder that
+/// had not read it GET-nexted the hole forever, and every later batch of
+/// that requester in the epoch waited for the in-doubt deadline and the
+/// lease path. Now the batch is overwritten with a tombstone (same key,
+/// no ops), and the other ops it carried go back to the front of the
+/// queue, into the next batch, under their rids.
+#[test]
+fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let (a, b, c) = (h.rid(1), h.rid(2), h.rid(3));
+    let mut out = Vec::new();
+    for (rid, name) in [(a, "a"), (b, "b")] {
+        out.extend(h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: h.create(name),
+        }));
+        // Into the inbox (as when the forward could not be sent).
+        h.core.inbox_enqueue(h.now, rid, 1, &h.meta, &mut out);
+    }
+    let (_, puts) = land_inbox_puts(&mut h, out);
+    assert_eq!(puts.len(), 1, "a and b share one batch: {puts:?}");
+    assert_eq!((puts[0].n, puts[0].ops.len()), (0, 2));
+    let key0 = puts[0].key();
+
+    // a finds a P2P path (or must be held back): withdrawn first.
+    let mut out = Vec::new();
+    h.core.send_forward(h.now, a, 2, &mut out);
+    let (op, req) = s3_ops(&out)[0];
+    match req {
+        S3Op::InboxTombstone { batch } => {
+            assert_eq!(batch.key(), key0);
+            assert!(batch.is_tombstone(), "{batch:?}");
+        }
+        other => panic!("withdrawn by {other:?}, not a tombstone"),
+    }
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .all(|(_, r)| !matches!(r, S3Op::InboxDelete { .. })),
+        "a withdrawal never deletes (a hole stops the holder's GET-next): {out:?}"
+    );
+    // Meanwhile c is queued behind the PUT that will carry b again.
+    let out = h.step(Event::S3 {
+        op,
+        result: S3Result::InboxTombstone(Ok(())),
+    });
+    assert!(
+        matches!(sends(&out).first(), Some((2, PeerMsg::MutateRequest { rid, .. })) if *rid == a),
+        "a is forwarded once its batch is a tombstone: {out:?}"
+    );
+    let mut out = out;
+    out.extend(h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: c,
+        op: h.create("c"),
+    }));
+    h.core.inbox_enqueue(h.now, c, 1, &h.meta, &mut out);
+    let (_, puts) = land_inbox_puts(&mut h, out);
+    let rids: Vec<Vec<u64>> = puts
+        .iter()
+        .map(|p| p.ops.iter().map(|o| o.rid.seq).collect())
+        .collect();
+    assert_eq!(
+        puts.first().map(|p| p.n),
+        Some(1),
+        "the next batch number, never the withdrawn one: {rids:?}"
+    );
+    assert_eq!(
+        rids.concat(),
+        vec![2, 3],
+        "b is re-submitted, ahead of c, and a is not: {rids:?}"
+    );
+    let cb = h.core.clients.get(&b).unwrap();
+    assert!(
+        !cb.inbox_keys.contains(&key0),
+        "b no longer waits on the tombstone: {:?}",
+        cb.inbox_keys
+    );
+    assert_eq!(h.core.inbox.pending.get(&b).map(|k| k.n), Some(1));
+    assert_eq!(h.core.stats.inbox_withdrawn_ops, 1);
+    assert_eq!(h.core.stats.inbox_resubmitted_ops, 1);
+}
+
+/// The holder side of the withdraw hole: a tombstone is read, executes
+/// nothing and is stepped past, so the requester's next batch runs at
+/// once instead of waiting behind a key that will never fill.
+#[test]
+fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
+    use constellation_store_s3::inbox::{InboxBatch, InboxKey};
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.core.note_demand(h.now, 2, true);
+    h.step(Event::Peers {
+        links: vec![crate::event::PeerLink {
+            node: 2,
+            connected: false,
+            last_seen: None,
+            rtt_ms: None,
+            since: None,
+        }],
+    });
+    let poll = |out: &[Action]| {
+        s3_ops(out).into_iter().find_map(|(op, r)| match r {
+            S3Op::InboxRun { node: 2, from, .. } => Some((op, *from)),
+            _ => None,
+        })
+    };
+    let mut out = Vec::new();
+    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    let (op, from) = poll(&out).expect("polled");
+    assert_eq!(from, 0);
+    let tombstone = InboxBatch::tombstone(
+        InboxKey {
+            epoch: 1,
+            node: 2,
+            n: 0,
+        },
+        1,
+        0,
+    );
+    let mut out = h.step(Event::S3 {
+        op,
+        result: S3Result::InboxRun(Ok(vec![tombstone])),
+    });
+    if poll(&out).is_none() {
+        h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    }
+    let (op, from) = poll(&out).expect("polled again at once past the tombstone");
+    assert_eq!(from, 1, "the cursor steps past the withdrawn batch");
+    let a = h.create("a");
+    h.step(Event::S3 {
+        op,
+        result: S3Result::InboxRun(Ok(vec![inbox_batch(2, 1, 1, &a)])),
+    });
+    assert!(h.meta.child_ino(ROOT_INO, "a").unwrap().is_some());
+    assert_eq!(h.core.stats.inbox_tombstones_read, 1);
+    assert_eq!(h.core.stats.inbox_executed_ops, 1);
 }

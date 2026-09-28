@@ -175,6 +175,12 @@ pub enum S3Op {
     InboxDrain { below_epoch: Epoch },
     /// M13: DELETE one batch.
     InboxDelete { key: InboxKey },
+    /// The requester's withdrawal of one of its own durable batches:
+    /// overwrite it, unconditionally, with `batch` — the same key and no
+    /// ops (`InboxBatch::tombstone`). A DELETE left a hole in the
+    /// numbering that stopped the holder's GET-next for good; the
+    /// holder reads a tombstone, executes nothing and moves on.
+    InboxTombstone { batch: InboxBatch },
     /// M13: LIST-last this node's batch numbering under `epoch`.
     InboxLastN { epoch: Epoch, node: NodeId },
     /// Plan 30 §M10: LIST `heartbeat/` and GET every promise object.

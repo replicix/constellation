@@ -553,9 +553,13 @@ pub struct Stats {
     pub inbox_submitted_batches: u64,
     pub inbox_submitted_ops: u64,
     pub inbox_resubmitted_ops: u64,
-    /// M13: batches a requester deleted itself before forwarding the op
-    /// over P2P instead (the holder became reachable again).
+    /// M13: batches a requester withdrew itself (overwrote with a
+    /// tombstone) before forwarding the op over P2P instead (the holder
+    /// became reachable again) or holding it back.
     pub inbox_withdrawn_ops: u64,
+    /// Holder: withdrawn batches (tombstones) its polls read and stepped
+    /// past.
+    pub inbox_tombstones_read: u64,
     /// EC2 follow-up: ops waiting in the inbox forwarded over P2P once
     /// the holder became reachable (it polls only unconnected requesters).
     pub inbox_rerouted_to_p2p: u64,

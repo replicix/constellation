@@ -729,6 +729,8 @@ pub enum S3Result {
     /// `S3Op::InboxDrain`: every batch below the epoch, in key order.
     InboxDrain(Result<Vec<InboxBatch>, S3Failure>),
     InboxDelete(Result<(), S3Failure>),
+    /// `S3Op::InboxTombstone`: the batch now holds no ops.
+    InboxTombstone(Result<(), S3Failure>),
     /// `S3Op::InboxLastN`: the highest batch number this node wrote
     /// under the epoch, if any (a previous incarnation's).
     InboxLastN(Result<Option<u64>, S3Failure>),

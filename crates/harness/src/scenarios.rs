@@ -804,6 +804,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: ec2::idle_cost,
     },
     Scenario {
+        name: "inbox-withdraw-hole",
+        desc: "withdraw hole: a requester's unread inbox batch is withdrawn when its P2P link to the holder comes back (a tombstone, not a DELETE); cut again, its next inbox writes behind that batch number each complete within 20 s, not the 60 s in-doubt deadline; everything converges",
+        requires: &[],
+        run: ec2::inbox_withdraw_hole,
+    },
+    Scenario {
         name: "idle-cost-link-flap",
         desc: "idle-cost with the lease holder's P2P links flagged down for 5 s every 15 s (a late ping round under host load): the holder polls idle requesters' inboxes cold, never hot, and the per-node budget holds",
         requires: &[],

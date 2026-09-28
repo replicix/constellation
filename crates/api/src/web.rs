@@ -245,6 +245,16 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         status.inbox.poll_hits
     );
     gauge!(
+        "constellation_inbox_withdrawn_ops_total",
+        "Inbox batches this node withdrew (overwrote with a tombstone) before a P2P forward.",
+        status.inbox.withdrawn_ops
+    );
+    gauge!(
+        "constellation_inbox_tombstones_read_total",
+        "Withdrawn inbox batches this node's polls read and stepped past as holder.",
+        status.inbox.tombstones_read
+    );
+    gauge!(
         "constellation_inbox_unavailable_total",
         "Forwards the inbox could not take; they took the lease path.",
         status.inbox.unavailable

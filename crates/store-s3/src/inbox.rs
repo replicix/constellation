@@ -67,6 +67,21 @@
 //! the drain deduplicates and deletes). Batches of older epochs are
 //! deleted without exception.
 //!
+//! ### Withdrawal leaves a tombstone, never a hole
+//!
+//! A requester whose op went to the inbox and then finds a P2P path to
+//! the holder (or must hold the op back) withdraws the batch before it
+//! forwards the op, so the holder can never run it a second time from
+//! the inbox. It used to DELETE the batch, which left a hole at `n`: a
+//! holder that had not read it yet GET-nexted `n` forever, and every
+//! later batch of that requester in the epoch waited for the in-doubt
+//! deadline and the lease path. Now the batch is overwritten by a
+//! *tombstone* — the same key, no ops ([`InboxStore::put_tombstone`]) —
+//! which the holder reads, executes nothing for and steps past. The
+//! other ops the batch carried are re-submitted by the requester under
+//! their rids; a holder that read the batch before the overwrite ran
+//! them already and deduplicates the copies.
+//!
 //! ### Why an ambiguous PUT is safe to retry
 //!
 //! A PUT whose response was lost may or may not have landed. The retry
@@ -164,6 +179,26 @@ pub struct InboxBatch {
 }
 
 impl InboxBatch {
+    /// What a requester's withdrawal leaves at `key`: the batch, with no
+    /// ops. The key stays taken, so the numbering has no hole for the
+    /// holder's GET-next to stop at (module doc, "Withdrawal").
+    pub fn tombstone(key: InboxKey, incarnation: u32, now_unix_ms: i64) -> Self {
+        Self {
+            epoch: key.epoch,
+            node: key.node,
+            incarnation,
+            n: key.n,
+            submitted_unix_ms: now_unix_ms,
+            ops: Vec::new(),
+            wants_lease: false,
+        }
+    }
+
+    /// A withdrawn batch (see [`InboxBatch::tombstone`]).
+    pub fn is_tombstone(&self) -> bool {
+        self.ops.is_empty()
+    }
+
     pub fn key(&self) -> InboxKey {
         InboxKey {
             epoch: self.epoch,
@@ -467,6 +502,27 @@ impl InboxStore {
             }
         }
         Ok(out)
+    }
+
+    /// Withdraw a batch: overwrite it, unconditionally, with `tombstone`
+    /// ([`InboxBatch::tombstone`]). A plain PUT, one of the portable
+    /// verbs; S3's read-after-write consistency means a holder's GET sees
+    /// either the batch or the tombstone, the same two outcomes a DELETE
+    /// raced against it had. Landing on a key the holder already
+    /// consumed and deleted is harmless: the tombstone carries nothing,
+    /// and the next takeover's drain sweeps it.
+    pub async fn put_tombstone(&self, tombstone: &InboxBatch) -> Result<(), StoreError> {
+        if !tombstone.is_tombstone() {
+            return Err(StoreError::CorruptObject(
+                "an inbox tombstone must carry no ops".to_string(),
+            ));
+        }
+        let key = tombstone.key().path();
+        let body = self.seal(&key, &tombstone.encode()?)?;
+        self.store
+            .put(&key, bytes::Bytes::from(body).into())
+            .await?;
+        Ok(())
     }
 
     /// Unconditional DELETE; a missing key is success (whoever got there
@@ -1117,6 +1173,51 @@ mod tests {
         assert!(s.get_run(2, 5, 0, 8).await.unwrap().is_empty());
         assert_eq!(s.get_run(1, 5, 1, 2).await.unwrap().len(), 2);
         assert!(s.get_run(1, 5, 0, 0).await.unwrap().is_empty());
+    }
+
+    /// A withdrawal overwrites the batch with a tombstone rather than
+    /// deleting it: the run stays contiguous, so the holder's GET-next
+    /// reaches the batches after it, and LIST-last still counts it.
+    #[tokio::test]
+    async fn a_tombstone_keeps_the_run_contiguous() {
+        let s = mem();
+        for n in 0..3u64 {
+            s.put_batch(&batch(1, 5, n, vec![op(5, n)])).await.unwrap();
+        }
+        let key = InboxKey {
+            epoch: 1,
+            node: 5,
+            n: 1,
+        };
+        s.put_tombstone(&InboxBatch::tombstone(key, 1, 0))
+            .await
+            .unwrap();
+        let run = s.get_run(1, 5, 0, 8).await.unwrap();
+        assert_eq!(run.iter().map(|b| b.n).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(!run[0].is_tombstone());
+        assert!(run[1].is_tombstone(), "the withdrawn batch carries nothing");
+        assert!(!run[2].is_tombstone());
+        // Idempotent (every co-batched op's withdrawal writes the same).
+        s.put_tombstone(&InboxBatch::tombstone(key, 1, 9))
+            .await
+            .unwrap();
+        assert!(s.get_batch(key).await.unwrap().unwrap().is_tombstone());
+        // The last batch withdrawn: LIST-last still resumes past it.
+        let last = InboxKey { n: 2, ..key };
+        s.put_tombstone(&InboxBatch::tombstone(last, 1, 0))
+            .await
+            .unwrap();
+        assert_eq!(s.last_n(1, 5).await.unwrap(), Some(2));
+        // Only an empty batch is a tombstone.
+        assert!(s
+            .put_tombstone(&batch(1, 5, 7, vec![op(5, 7)]))
+            .await
+            .is_err());
+        assert!(s
+            .get_batch(InboxKey { n: 7, ..key })
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

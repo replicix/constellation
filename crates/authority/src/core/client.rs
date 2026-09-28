@@ -800,11 +800,21 @@ impl Core {
             if c.inbox_keys.len() > 1 && !matches!(c.phase, Phase::InboxWithdraw { .. }) {
                 self.stats.inbox_multi_batch_withdrawals += 1;
             }
+            // Withdrawn by overwriting the batch with a tombstone, not by
+            // DELETE: the key stays taken, so the holder's GET-next reads
+            // past it to this node's later batches instead of stopping at
+            // a hole (co-batched ops are re-submitted by
+            // `on_inbox_withdrawn`).
             c.phase = Phase::InboxWithdraw { holder };
             self.cancel_timer(timer, out);
             self.inbox.pending.remove(&rid);
+            let batch = constellation_store_s3::inbox::InboxBatch::tombstone(
+                key,
+                self.cfg.incarnation,
+                now.0,
+            );
             self.issue_s3(
-                S3Op::InboxDelete { key },
+                S3Op::InboxTombstone { batch },
                 super::S3For::InboxWithdraw(rid),
                 out,
             );

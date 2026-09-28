@@ -1421,6 +1421,19 @@ relay of its own so requests can be attributed per role):
   success — not `EIO` — exactly once, `r1` and `r2` agree on one inode,
   some node's `drained_batches` rose, and the epoch-1 batch objects are
   gone from the bucket.
+- **`inbox-withdraw-hole`**. Three nodes, P2P on; the requester `b` is
+  cut from the holder `a` over P2P (the deny files), and `a`'s inbox
+  polls are paused (`CONSTELLATION_FAULT_INBOX_POLL_PAUSE_FILE`), so
+  `b`'s write sits unread in its inbox. The link comes back: `b`
+  withdraws the batch (`status.inbox.withdrawn_ops`) and forwards the
+  write over P2P. Then `b` is cut again and the polls resume. `b`'s next
+  three writes go through the inbox, numbered after the withdrawn
+  batch. Each must finish within 20 s (the in-doubt deadline is 60 s),
+  none may take the lease path, and the holder must have read the
+  tombstone (`tombstones_read`). Everything converges after the heal.
+  Before the fix the withdrawal DELETEd the batch. The holder then
+  probed the hole forever and executed none of the later writes: the
+  first took the lease path after 18 s and pulled the lease to `b`.
 
 All of them poll the control API and the mounted namespace with
 `eventually` rather than sleeping and hoping. (Since plan 30 M4 only the

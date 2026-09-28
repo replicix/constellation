@@ -742,7 +742,8 @@ fn regression_inbox_p2p_off() {
 }
 
 /// Plan 30 M5 phase 2: an op submitted to the holder's inbox during an
-/// outage must be withdrawn (its batch deleted) before it is forwarded
+/// outage must be withdrawn (its batch overwritten with a tombstone;
+/// deleted, before the withdraw-hole fix) before it is forwarded
 /// over P2P once the holder is back. Seed 794 found the gap: the
 /// restarted holder re-acquired its own epoch (no takeover, no drain),
 /// answered the forward with EEXIST (no `completed` witness), and the
@@ -775,6 +776,63 @@ fn regression_inbox_batch_withdrawn_before_p2p_forward() {
         "no seed in 794..994 withdraws a batch before forwarding"
     );
 }
+
+/// Withdraw hole: node 2's P2P link to the initial holder flaps (cut
+/// 2.5 s, up 1 s, five times) while every client writes. A write of 2's
+/// goes to the inbox during a cut, is withdrawn and forwarded when the
+/// link comes back, and 2's next writes go to the inbox at the next cut.
+fn withdraw_hole_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 16,
+        faults: (0..5)
+            .map(|i| ScheduledFault {
+                at_ms: 500 + i * 3_500,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 2_500,
+                },
+            })
+            .collect(),
+        ..SimConfig::default()
+    }
+}
+
+/// Withdraw hole: a withdrawal overwrites the batch with a tombstone
+/// instead of deleting it, and a holder that reads one steps past it to
+/// the requester's later batches (a deleted key stopped its GET-next for
+/// the rest of the epoch, and those batches' ops waited for the in-doubt
+/// deadline and the lease path). Every seed passes every check
+/// (exactly-once by rid, linearizability, convergence); the sweep must
+/// reach a holder reading a tombstone.
+#[test]
+fn regression_a_holder_steps_past_a_withdrawn_inbox_batch() {
+    let (mut read, mut withdrawn, mut unavailable, mut answered, mut rtt) = (0, 0, 0, 0, 0);
+    for seed in 0..SEEDS_WITHDRAW_HOLE {
+        let report =
+            run_seed(seed, withdraw_hole_config()).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert!(report.converged_checked, "seed {seed} did not converge");
+        for s in report.stats.values() {
+            read += s.inbox_tombstones_read;
+            withdrawn += s.inbox_withdrawn_ops;
+            unavailable += s.inbox_unavailable;
+            answered += s.inbox_answered;
+            rtt += s.inbox_round_trip_ms_total;
+        }
+    }
+    eprintln!(
+        "withdraw hole: {withdrawn} withdrawals, {read} tombstones read by a holder, \
+         {unavailable} inbox ops that took the lease path; {answered} answered through the inbox, \
+         mean round trip {} ms",
+        rtt / answered.max(1)
+    );
+    assert!(
+        read > 0,
+        "no holder read a withdrawn batch ({withdrawn} withdrawals)"
+    );
+}
+
+const SEEDS_WITHDRAW_HOLE: u64 = 40;
 
 /// Plan 30 M5 phase 2: a resubmitted in-doubt rid that waited behind an
 /// earlier op of its node (the key gate) must still consult `completed`

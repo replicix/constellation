@@ -973,6 +973,12 @@ impl Driver {
                         .await
                         .map_err(|e| S3Failure(e.to_string())),
                 ),
+                S3Op::InboxTombstone { batch } => S3Result::InboxTombstone(
+                    InboxStore::new(store.clone())
+                        .put_tombstone(&batch)
+                        .await
+                        .map_err(|e| S3Failure(e.to_string())),
+                ),
                 S3Op::InboxLastN { epoch, node } => S3Result::InboxLastN(
                     InboxStore::new(store.clone())
                         .last_n(epoch, node)

@@ -1212,7 +1212,13 @@ impl Core {
         // Plan 30 §M8: another node's ops — the lone-node kernel latch.
         self.note_foreign(now, replica, out);
         for batch in &run {
-            self.note_demand(now, batch.node, false);
+            if batch.is_tombstone() {
+                // A withdrawn batch: nothing to run, and no demand (its
+                // ops went over P2P or back into a later batch).
+                self.stats.inbox_tombstones_read += 1;
+            } else {
+                self.note_demand(now, batch.node, false);
+            }
             if batch.wants_lease {
                 self.lease.note_wanted(now, batch.node);
             }
@@ -1286,11 +1292,18 @@ impl Core {
         }
     }
 
-    /// The requester's own batch delete before a P2P forward
-    /// (`Phase::InboxWithdraw`): gone means the forward proceeds; a
-    /// failed delete leaves the batch drainable, so the op takes the
-    /// lease path instead, where this node's own gate drains it and
-    /// `completed` is exact.
+    /// The requester's own batch withdrawal before a P2P forward
+    /// (`Phase::InboxWithdraw`): the batch is a tombstone now, so the
+    /// forward proceeds; a failed overwrite leaves the batch drainable,
+    /// so the op takes the lease path instead, where this node's own gate
+    /// drains it and `completed` is exact.
+    ///
+    /// The tombstone withdrew every op the batch carried. The others
+    /// still waiting on it (co-batched ops that are not being forwarded
+    /// themselves) are re-submitted by rid, at the front of the queue in
+    /// their submission order: a holder that read the batch before the
+    /// overwrite executed them already and deduplicates the copies by
+    /// rid; one that reads the tombstone runs them from the new batch.
     pub(crate) fn on_inbox_withdrawn(
         &mut self,
         now: Ms,
@@ -1306,13 +1319,14 @@ impl Core {
             return;
         };
         match result {
-            S3Result::InboxDelete(Ok(())) => {
+            S3Result::InboxTombstone(Ok(())) => {
                 // `send_forward` withdraws the next batch, if any, before
                 // it forwards.
-                if !c.inbox_keys.is_empty() {
-                    c.inbox_keys.remove(0);
-                }
+                let key = (!c.inbox_keys.is_empty()).then(|| c.inbox_keys.remove(0));
                 self.stats.inbox_withdrawn_ops += 1;
+                if let Some(key) = key {
+                    self.inbox_resubmit_cobatched(now, key, replica, out);
+                }
                 self.send_forward(now, rid, holder, out);
             }
             other => {
@@ -1325,6 +1339,49 @@ impl Core {
                 self.lease_path(now, rid, replica, out);
             }
         }
+    }
+
+    /// `key` is a tombstone now: every op still waiting on it alone goes
+    /// back to the front of the submission queue (see
+    /// `on_inbox_withdrawn`). An op being withdrawn itself, or waiting on
+    /// a later batch too, only forgets the key.
+    fn inbox_resubmit_cobatched(
+        &mut self,
+        now: Ms,
+        key: InboxKey,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let mut again: Vec<(u64, Rid)> = Vec::new();
+        for (rid, c) in self.clients.iter_mut() {
+            if !c.inbox_keys.contains(&key) || matches!(c.phase, Phase::InboxWithdraw { .. }) {
+                continue;
+            }
+            c.inbox_keys.retain(|k| *k != key);
+            if matches!(c.phase, Phase::InboxWaiting { .. })
+                && self.inbox.pending.get(rid) == Some(&key)
+            {
+                c.phase = Phase::InboxQueued { epoch: key.epoch };
+                again.push((c.order, *rid));
+            }
+        }
+        if again.is_empty() {
+            return;
+        }
+        again.sort_unstable();
+        let rids: Vec<Rid> = again.into_iter().map(|(_, rid)| rid).collect();
+        for rid in &rids {
+            self.inbox.pending.remove(rid);
+        }
+        self.stats.inbox_resubmitted_ops += rids.len() as u64;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?key,
+            ops = rids.len(),
+            "inbox: re-submitting the ops a withdrawn batch also carried"
+        );
+        self.inbox_requeue_front(&rids, key.epoch);
+        self.inbox_kick(now, replica, out);
     }
 
     pub(crate) fn on_inbox_gc(&mut self, now: Ms, key: InboxKey, result: S3Result) {

@@ -575,9 +575,17 @@ there the lease must move, as it does today. `status.inbox.escalated`,
 `escalations`, `lease_requests`, `inbox_ops` and `local_ops` show which
 regime a node is in. An escalation is dropped if the holder becomes
 reachable over P2P again. Before an op that went into the inbox is
-forwarded over a P2P path that came back, the requester withdraws
-(deletes) its own batch, so the op is not executed through both paths
-out of order; the rid dedups either way.
+forwarded over a P2P path that came back (or held back because a
+dependency was lost), the requester withdraws its own batch, so the op
+is not executed through both paths out of order; the rid dedups either
+way. It withdraws by overwriting the batch with a **tombstone** (the
+same key, no ops; one plain PUT), never by DELETE: a deleted key was a
+hole in the numbering, and a holder that had not read it GET-nexted it
+forever while every later batch of that requester in the epoch waited
+for the in-doubt deadline. The holder reads the tombstone, executes
+nothing and steps past it. Other ops the withdrawn batch carried are
+re-submitted by rid at the front of the queue; a holder that read the
+batch before the overwrite deduplicates the copies.
 
 1. The op, with its rid and its `deps` (what this node had observed,
    including the delegate streams it was answered from, as a P2P
@@ -668,9 +676,10 @@ and takes the lease path, whose takeover gate drains the batch and whose
 in-doubt check then finds the rid.
 
 `status.inbox` reports both roles' counters (`submitted_ops`,
-`pending_ops`, `resubmitted_ops`, `unavailable`, `executed_ops`,
-`refused_ops`, `deduped_ops`, `drained_batches`, `polls`, `poll_hits`,
-`gc_deleted`, `tracked_requesters`), exported as `constellation_inbox_*`.
+`pending_ops`, `resubmitted_ops`, `withdrawn_ops`, `unavailable`,
+`executed_ops`, `refused_ops`, `deduped_ops`, `drained_batches`, `polls`,
+`poll_hits`, `tombstones_read`, `gc_deleted`, `tracked_requesters`),
+exported as `constellation_inbox_*`.
 
 Locks and `cto=strict` ReadIndex never go through the inbox: with no P2P
 path, cluster locks are unavailable and a strict open tails S3 instead

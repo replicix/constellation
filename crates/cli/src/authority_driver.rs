@@ -190,6 +190,7 @@ fn s3_kind(op: &S3Op) -> &'static str {
         S3Op::InboxRun { .. } => "InboxRun",
         S3Op::InboxDrain { .. } => "InboxDrain",
         S3Op::InboxDelete { .. } => "InboxDelete",
+        S3Op::InboxTombstone { .. } => "InboxTombstone",
         S3Op::InboxLastN { .. } => "InboxLastN",
         S3Op::HeartbeatRead => "HeartbeatRead",
         S3Op::HeartbeatPut { .. } => "HeartbeatPut",
@@ -3189,6 +3190,9 @@ impl Driver {
                         Err(e) => Err(e),
                     })
                 }
+                S3Op::InboxRun { .. } if crate::fault::inbox_polls_paused() => {
+                    S3Result::InboxRun(Ok(Vec::new()))
+                }
                 S3Op::InboxRun {
                     epoch,
                     node,
@@ -3205,6 +3209,9 @@ impl Driver {
                 }
                 S3Op::InboxDelete { key } => {
                     S3Result::InboxDelete(inbox.delete(key).await.map_err(s3_failure))
+                }
+                S3Op::InboxTombstone { batch } => {
+                    S3Result::InboxTombstone(inbox.put_tombstone(&batch).await.map_err(s3_failure))
                 }
                 S3Op::InboxLastN { epoch, node } => {
                     S3Result::InboxLastN(inbox.last_n(epoch, node).await.map_err(s3_failure))
@@ -4085,6 +4092,7 @@ impl Standalone {
             S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
             S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
             S3Op::InboxDelete { .. } => S3Result::InboxDelete(Ok(())),
+            S3Op::InboxTombstone { .. } => S3Result::InboxTombstone(Ok(())),
             S3Op::InboxLastN { .. } => S3Result::InboxLastN(Ok(None)),
             S3Op::HeartbeatRead => S3Result::Heartbeats(Ok(Vec::new())),
             S3Op::HeartbeatPut { .. } => S3Result::HeartbeatPut(Ok(())),

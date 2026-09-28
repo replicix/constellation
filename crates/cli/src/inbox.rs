@@ -163,6 +163,8 @@ pub fn status(
         submitted_batches: s.inbox_submitted_batches,
         submitted_ops: s.inbox_submitted_ops,
         resubmitted_ops: s.inbox_resubmitted_ops,
+        withdrawn_ops: s.inbox_withdrawn_ops,
+        tombstones_read: s.inbox_tombstones_read,
         unavailable: s.inbox_unavailable,
         pending_ops: view.pending_ops,
         next_n: view.next_n,

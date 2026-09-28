@@ -50,6 +50,20 @@ pub fn sync_held() -> bool {
     true
 }
 
+/// `CONSTELLATION_FAULT_INBOX_POLL_PAUSE_FILE=<path>`: while that file
+/// exists, every inbox GET-next this node makes as holder answers "no new
+/// batch" without asking S3 — a holder that has not got round to a
+/// requester's batch yet, for as long as the harness needs (the
+/// `inbox-withdraw-hole` scenario's withdrawal of a batch nobody read).
+pub fn inbox_polls_paused() -> bool {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("CONSTELLATION_FAULT_INBOX_POLL_PAUSE_FILE").map(PathBuf::from)
+    })
+    .as_ref()
+    .is_some_and(|p| p.exists())
+}
+
 /// `CONSTELLATION_FAULT_P2P_DENY_FILE=<path>`: while that file exists,
 /// every backup append and pre-S3 stream batch to or from the node ids
 /// it lists (one per line) is dropped on this node — a partition between

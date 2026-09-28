@@ -26587,3 +26587,147 @@ docs: `forwarded-mutations.md`, `configuration.md`, `TESTING.md`.
     `idle-cluster-is-quiet`, `lease-handover`, `publish-only-holder`.
   - `p2p-partition-tolerance`, `delegate-partition`.
 - `fuse-inval-storm`, `forward-timeout-reexec` pass.
+
+## Fix: the inbox withdraw hole
+
+Seen while fixing the idle inbox poll burst. It is a pre-existing bug.
+
+A requester whose op went to the holder's S3 inbox withdraws the batch
+before it forwards the op over P2P. This happens in two cases:
+- its P2P path to the holder came back (the recheck's reroute, or any
+  later forward of the rid);
+- the op's `deps` were lost with their generation
+  (`withdraw_lost_deps_inbox_ops`).
+
+It withdrew by DELETE, which left a hole at the batch's number. Batch
+numbers are dense per `(epoch, node)`, and the holder's GET-next stops
+at the first missing key. So a holder that had not read the batch yet
+probed that key for the rest of the epoch. Every later batch of the
+requester in the epoch then waited out the in-doubt deadline (2 × TTL)
+and took the lease path, which pulls the lease to the requester.
+
+The lost-deps case hit it every time. The holder halts on such a batch
+(`Halt::Recall`), re-polls it at the halted cadence until the requester
+withdraws it, and then re-polled the deleted key forever. The DELETE
+also dropped the batch's other ops. Group commit puts every op queued
+during a PUT into one batch, so those ops waited for the deadline too.
+
+### Fix
+
+The batch is withdrawn with a **tombstone**, not a DELETE.
+- **The tombstone.** The same key, the same batch identity, and no ops
+  (`InboxBatch::tombstone`). It is written by one unconditional plain
+  PUT (`InboxStore::put_tombstone`, the new `S3Op::InboxTombstone`).
+  - The key stays taken, so the numbering has no hole. The holder
+    reads the tombstone, executes nothing, and steps past it to the
+    requester's next batch (`inbox_tombstones_read`).
+  - The drain and LIST-last treat it as an ordinary empty batch. GC
+    deletes it like any other batch.
+  - The batch format is unchanged.
+- **Exactly-once.** S3's read-after-write consistency means a racing
+  holder GET sees either the batch or the tombstone. Those are the same
+  two outcomes as the DELETE had, so exactly-once by rid is unchanged:
+  a holder that read the batch first has executed it, and answers the
+  P2P forward from `recent`/`completed`.
+  - A tombstone that lands on a key the holder already consumed and
+    deleted carries nothing. The next takeover's drain sweeps it.
+  - Withdrawing the same key again, for every op of the batch, writes
+    the same tombstone, so repeats are harmless.
+- **The batch's other ops** (`inbox_resubmit_cobatched`). Once the
+  tombstone lands, every op that was waiting on that batch alone is
+  re-submitted by rid:
+  - it goes back to the front of the queue, in submission order, into
+    the next batch;
+  - `resubmitted_ops` counts it;
+  - a holder that read the original deduplicates the copy by rid.
+
+  Ops that are being withdrawn themselves, or that also wait on a later
+  batch, only forget the key.
+- **Status.** `status.inbox` gains `withdrawn_ops` (requester) and
+  `tombstones_read` (holder), exported as
+  `constellation_inbox_withdrawn_ops_total` and
+  `constellation_inbox_tombstones_read_total`.
+- **New test-only fault point:**
+  `CONSTELLATION_FAULT_INBOX_POLL_PAUSE_FILE`. While the file exists,
+  the holder's inbox GET-next answers "nothing new".
+
+### Tests
+
+- Unit (`core::tests`):
+  - `a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted`:
+    `a` and `b` share batch 0, and `a` is withdrawn. The withdrawal is
+    a tombstone for key 0 and never a DELETE. `a` is forwarded. `b` is
+    re-submitted ahead of a later `c` in batch 1, never at 0, and no
+    longer waits on key 0.
+  - `a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one`:
+    the poll reads the tombstone at 0, polls from 1 at once, and
+    executes batch 1.
+  - Three existing withdraw tests now expect the tombstone.
+- store-s3 `a_tombstone_keeps_the_run_contiguous`: GET-next runs
+  through a tombstone, overwriting is idempotent, LIST-last counts a
+  tombstone, and a batch with ops is refused as a tombstone.
+- Sim `regression_a_holder_steps_past_a_withdrawn_inbox_batch`
+  (`withdraw_hole_config`): node 2's P2P link to the initial holder is
+  cut for 2.5 s five times while every client writes.
+  - 40 seeds in CI: 47 withdrawals, 7 tombstones read by a holder.
+  - 1000 seeds, run once: 1012 withdrawals and 200 tombstones read.
+    Every seed passes every check (exactly-once by rid,
+    linearizability, convergence).
+- Harness `inbox-withdraw-hole`, in 4 steps:
+  1. The holder's polls are paused and `b` is cut from it, so `b`'s
+     write is batch 0, unread.
+  2. The link comes back: `b` withdraws the batch and forwards the
+     write, which is answered in 4 s.
+  3. `b` is cut again and the polls resume. `b`'s next three writes go
+     through the inbox; each must finish within 20 s, and none may take
+     the lease path.
+  4. The heal: every write converges everywhere.
+
+  Results:
+  - Fixed: 5/5 pass. The first write takes 3.2 s (the failed forward
+    and the P2P grace), the next two ~45 ms. The holder read 1
+    tombstone and executed 6 inbox ops; the lease path was taken 0
+    times.
+  - Against a main build with only the pause fault added: the holder
+    executed 0 inbox ops, `f2` took the lease path after 18 s and
+    pulled the lease to `b`, and the scenario fails.
+- Documentation: `forwarded-mutations.md` (the withdrawal, the status
+  counters), `TESTING.md`, and the store-s3 inbox module doc
+  ("Withdrawal leaves a tombstone, never a hole").
+
+### Files
+
+- `crates/store-s3/src/inbox.rs`
+- `crates/authority/src/{action,event}.rs`
+- `crates/authority/src/core/{client,inbox,mod,tests}.rs`
+- `crates/authority/tests/sim.rs`, `crates/authority/tests/sim/node.rs`
+- `crates/cli/src/{authority_driver,fault,inbox}.rs`
+- `crates/api/src/{types,web}.rs`
+- `crates/harness/src/scenarios.rs`, `crates/harness/src/scenarios/ec2.rs`
+- Docs: `forwarded-mutations.md`, `TESTING.md`
+
+### Results (on `cb847f8`, prefix `constellation-harness-inboxhole`, host load 5–14 of 32)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) are clean.
+- Test suites:
+  - `constellation-authority`: lib 133, sim suite 105, meta_repro 3.
+  - `constellation-store-s3`: 211.
+  - `constellation` package: 281.
+  - `constellation-api`: 4.
+  - All pass.
+- Long sims, 2000 seeds each: `long_random`, `long_delegated` and
+  `long_backup` pass.
+- Harness scenarios, all pass:
+  - `inbox-withdraw-hole`: 5/5.
+  - `inbox-create-storm-p2p-off`: 3315 ops/s.
+  - `inbox-sporadic-write-p2p-off`: p50 567 ms, p99 1.10 s.
+  - `inbox-requester-crash-mid-batch`, `inbox-holder-takeover-pending-batch`.
+  - `p2p-partition-one-node`: 3/3.
+    - Phase 2's slowest majority write was 11.4 s once (budget 12 s),
+      9.9 s and 9.0 s in the other runs. Phase 2 is the lease moving
+      off an isolated holder, not the inbox.
+  - `concurrent-create-no-excl`, `delegate-partition`, `lease-handover`.
+  - `sticky-lease-handoff-over-s3`, `create-storm-s3-only`.
+  - `p2p-partition-tolerance`, `p2p-handover`, `p2p-same-identity-restart`.
+  - `idle-cost` (holder 27.0/min), `idle-cost-link-flap` (41.5/min).
+  - `git-under-flock-faults` (228 s).

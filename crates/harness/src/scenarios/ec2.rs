@@ -842,3 +842,182 @@ fn idle_cost_run(scenario: &'static str, flap: bool) -> Result<()> {
     }
     result
 }
+
+/// The withdraw hole. A requester whose op went to the holder's S3 inbox
+/// withdraws the batch before forwarding the op over a P2P path that
+/// came back. It used to DELETE the batch, leaving a hole at its number:
+/// a holder that had not read it yet GET-nexted the hole for the rest of
+/// the epoch, and every later inbox write of that requester waited for
+/// the in-doubt deadline (2 × TTL) and then the lease path. Now the
+/// batch is overwritten with a tombstone the holder steps past.
+///
+/// Three nodes, P2P on; `b` is the requester, `a` the holder (`c` only
+/// keeps it from being a pair). The holder's inbox polls are paused
+/// (`CONSTELLATION_FAULT_INBOX_POLL_PAUSE_FILE`) and `b` is cut from `a`
+/// over P2P: `b`'s write goes into its inbox and nobody reads it. The
+/// link comes back: `b` withdraws the batch and forwards the write. Cut
+/// again, polls resumed: `b`'s next writes go through the inbox and must
+/// each complete within `WRITE_BUDGET`, far under the deadline; the
+/// holder must have read the tombstone. Then everything converges.
+pub fn inbox_withdraw_hole(_seed: u64) -> Result<()> {
+    const NAME: &str = "inbox-withdraw-hole";
+    const TTL_MS: u64 = 30_000;
+    /// One inbox write: the failed forward and the P2P grace (3 s), the
+    /// holder's poll at its cold ceiling (10 s), a ship. The in-doubt
+    /// deadline, which the hole made every write wait for, is 60 s.
+    const WRITE_BUDGET: Duration = Duration::from_secs(20);
+    let (env, root) = setup(NAME)?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let mut clients = Vec::new();
+    for name in ["a", "b", "c"] {
+        let c = Client::new(root.path(), name, &env.direct_endpoint, &backend)?
+            .with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
+            // Nothing but the inbox moves `b`'s writes: no delegation of
+            // its directory, no escalation to the lease, and no backup
+            // for the cut to seal.
+            .with_env("CONSTELLATION_DELEGATION_PLACEMENT", "off")
+            .with_env("CONSTELLATION_INBOX_ESCALATE", "off")
+            .with_env("CONSTELLATION_BACKUPS", "0");
+        let deny = deny_path(&c).display().to_string();
+        let pause = c.state_dir().join("inbox-poll-pause").display().to_string();
+        clients.push(
+            c.with_env("CONSTELLATION_FAULT_P2P_DENY_FILE", &deny)
+                .with_env("CONSTELLATION_FAULT_INBOX_POLL_PAUSE_FILE", &pause),
+        );
+    }
+    clients[0].fs_create()?;
+    for c in clients.iter_mut() {
+        c.mount()?;
+    }
+    let result = (|| -> Result<()> {
+        let refs: Vec<&Client> = clients.iter().collect();
+        wait_for_p2p(&refs)?;
+        let (a, b, c) = (&clients[0], &clients[1], &clients[2]);
+        std::fs::create_dir(a.mnt.join("w"))?;
+        eventually("a holds the lease", Duration::from_secs(20), || {
+            anyhow::ensure!(lease_of(a)?["held"] == true, "{}", lease_of(a)?);
+            Ok(())
+        })?;
+        for x in [b, c] {
+            eventually("w everywhere", Duration::from_secs(20), || {
+                anyhow::ensure!(x.mnt.join("w").is_dir(), "not on {}", x.name);
+                Ok(())
+            })?;
+        }
+        let (a_id, b_id) = (node_id(a)?, node_id(b)?);
+        let inbox = |x: &Client, k: &str| -> Result<u64> {
+            Ok(x.control_status()?["inbox"][k].as_u64().unwrap_or(0))
+        };
+        let pause = a.state_dir().join("inbox-poll-pause");
+        let cut = |on: bool| -> Result<()> {
+            if on {
+                std::fs::write(deny_path(a), format!("{b_id}\n"))?;
+                std::fs::write(deny_path(b), format!("{a_id}\n"))?;
+            } else {
+                let _ = std::fs::remove_file(deny_path(a));
+                let _ = std::fs::remove_file(deny_path(b));
+            }
+            Ok(())
+        };
+        let write = |name: &'static str| {
+            let path = b.mnt.join("w").join(name);
+            std::thread::spawn(move || {
+                let t = Instant::now();
+                let r = std::fs::write(&path, name.as_bytes()).map_err(|e| format!("{name}: {e}"));
+                (r, t.elapsed())
+            })
+        };
+
+        // 1. Polls paused, b cut from a: b's write sits unread in its inbox.
+        std::fs::write(&pause, b"paused")?;
+        cut(true)?;
+        std::thread::sleep(Duration::from_secs(2));
+        let submitted = inbox(b, "submitted_batches")?;
+        let first = write("f1");
+        eventually("b's write is in its inbox", Duration::from_secs(30), || {
+            anyhow::ensure!(
+                inbox(b, "submitted_batches")? > submitted,
+                "{}",
+                b.control_status()?["inbox"]
+            );
+            Ok(())
+        })?;
+        let next_n = inbox(b, "next_n")?;
+        eprintln!(
+            "    {NAME}: b's write is batch {} of its inbox, unread",
+            next_n - 1
+        );
+
+        // 2. The link comes back: b withdraws the batch and forwards.
+        cut(false)?;
+        let (r, took) = first.join().expect("f1");
+        r.map_err(|e| anyhow::anyhow!(e))?;
+        let withdrawn = inbox(b, "withdrawn_ops")?;
+        eprintln!(
+            "    {NAME}: f1 answered after {took:?} over P2P; b withdrew {withdrawn} batch(es)"
+        );
+        anyhow::ensure!(
+            withdrawn >= 1,
+            "b's batch was not withdrawn: {}",
+            b.control_status()?["inbox"]
+        );
+
+        // 3. Cut again, polls resumed: b's next writes use the inbox,
+        // behind the withdrawn batch's number.
+        let unavailable = inbox(b, "unavailable")?;
+        cut(true)?;
+        std::fs::remove_file(&pause)?;
+        std::thread::sleep(Duration::from_secs(2));
+        let mut slow = Vec::new();
+        for name in ["f2", "f3", "f4"] {
+            let (r, took) = write(name).join().expect(name);
+            r.map_err(|e| anyhow::anyhow!(e))?;
+            eprintln!("    {NAME}: {name} took {took:?} through the inbox");
+            if took > WRITE_BUDGET {
+                slow.push(format!("{name} {took:?}"));
+            }
+        }
+        let (tombstones, executed) = (inbox(a, "tombstones_read")?, inbox(a, "executed_ops")?);
+        eprintln!(
+            "    {NAME}: a read {tombstones} tombstone(s), executed {executed} inbox op(s); \
+             b next batch {}, lease path {}",
+            inbox(b, "next_n")?,
+            inbox(b, "unavailable")? - unavailable
+        );
+        anyhow::ensure!(
+            slow.is_empty(),
+            "inbox writes behind a withdrawn batch took over {WRITE_BUDGET:?}: {slow:?}"
+        );
+        anyhow::ensure!(tombstones >= 1, "the holder never read the withdrawn batch");
+        anyhow::ensure!(executed >= 3, "the holder executed {executed} inbox ops");
+        anyhow::ensure!(
+            inbox(b, "unavailable")? == unavailable,
+            "an inbox write took the lease path"
+        );
+
+        // 4. Healed: every write everywhere, once.
+        cut(false)?;
+        for x in [a, b, c] {
+            eventually(
+                &format!("f1..f4 on {}", x.name),
+                Duration::from_secs(60),
+                || {
+                    for f in ["f1", "f2", "f3", "f4"] {
+                        let got = std::fs::read(x.mnt.join("w").join(f))
+                            .map_err(|e| anyhow::anyhow!("{f}: {e}"))?;
+                        anyhow::ensure!(got == f.as_bytes(), "{f} differs on {}", x.name);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    for c in clients.iter_mut().rev() {
+        let _ = std::fs::remove_file(deny_path(c));
+        let _ = c.unmount();
+    }
+    result
+}
