@@ -1,0 +1,130 @@
+[package]
+name = "constellation-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+postcard = { version = "1.1.3", features = ["alloc"] }
+serde_json = "1"
+blake3 = "1"
+iroh = "1"
+
+constellation-net = { path = "../crates/net" }
+constellation-fs-core = { path = "../crates/fs-core" }
+constellation-mtree = { path = "../crates/mtree" }
+constellation-store-s3 = { path = "../crates/store-s3" }
+constellation-meta = { path = "../crates/meta" }
+constellation-api = { path = "../crates/api" }
+
+[patch.crates-io]
+fjall = { path = "../vendor/fjall" }
+
+# Prevent this from being interpreted as a member of the parent workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "net_signed_decode"
+path = "fuzz_targets/net_signed_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_payload_postcard"
+path = "fuzz_targets/net_payload_postcard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_reconcile_keys"
+path = "fuzz_targets/net_reconcile_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_reconcile_respond"
+path = "fuzz_targets/net_reconcile_respond.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_reconcile_session"
+path = "fuzz_targets/net_reconcile_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_bloom"
+path = "fuzz_targets/net_bloom.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fscore_manifest"
+path = "fuzz_targets/fscore_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fscore_tree"
+path = "fuzz_targets/fscore_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mtree_node"
+path = "fuzz_targets/mtree_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mtree_record"
+path = "fuzz_targets/mtree_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_object"
+path = "fuzz_targets/store_object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_inbox_pack"
+path = "fuzz_targets/store_inbox_pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_request"
+path = "fuzz_targets/api_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "meta_blobs"
+path = "fuzz_targets/meta_blobs.rs"
+test = false
+doc = false
+bench = false

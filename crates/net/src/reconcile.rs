@@ -521,6 +521,16 @@ fn get_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
         }
         v |= u64::from(b & 0x7f) << shift;
         if b & 0x80 == 0 {
+            // Reject a non-minimal (overlong) encoding: a terminating zero
+            // byte after at least one continuation byte carries no value
+            // bits, so the same gap had a shorter canonical form. `encode_keys`
+            // only ever emits minimal varints, so nothing legitimate produces
+            // this; accepting it would let two distinct byte strings decode to
+            // the same key set (wire malleability). Found by the
+            // `net_reconcile_keys` fuzz target's round-trip invariant.
+            if shift > 0 && b == 0 {
+                return None;
+            }
             return Some(v);
         }
     }
@@ -848,6 +858,12 @@ impl Mirror {
         else {
             return DeltaOutcome::Malformed;
         };
+        // The sender caps a delta at `MAX_DELTA_KEYS` before encoding, so
+        // a decoded delta larger than that was forged: refuse it rather
+        // than let a peer push an unbounded key list into the mirror.
+        if adds.len() + removes.len() > MAX_DELTA_KEYS {
+            return DeltaOutcome::Malformed;
+        }
         let on_base = self.keys.root_fingerprint() == d.base;
         // Removes before adds: a key both removed and re-added in one
         // tick is published as an add only, so order only matters for
@@ -1080,6 +1096,22 @@ mod tests {
         assert!(decode_keys(0, &[0x80]).is_none());
         // An 11-byte varint is refused.
         assert!(decode_keys(0, &[0xff; 11]).is_none());
+        // A non-minimal (overlong) varint is refused: `0x80 0x00` and
+        // `0x81 0x00` both terminate with a redundant zero byte after a
+        // continuation, so a peer cannot smuggle a second byte string that
+        // decodes to the same key set. (Regression: net_reconcile_keys fuzz.)
+        assert!(decode_keys(0, &[0x80, 0x00]).is_none());
+        assert!(decode_keys(0, &[0x81, 0x00]).is_none());
+        // The exact fuzz-found case: a 7-continuation varint padded with a
+        // trailing zero byte.
+        assert!(decode_keys(
+            u64::from_le_bytes([0xcc; 8]),
+            &[0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0x00, 0x01]
+        )
+        .is_none());
+        // The minimal form of the same leading value is still accepted.
+        assert!(decode_keys(0, &[0x00]).is_some());
+        assert!(decode_keys(0, &[0x81, 0x01]).is_some());
     }
 
     #[test]
@@ -1317,6 +1349,40 @@ mod tests {
             root: [0; 16],
             adds: vec![0x80],
             removes: vec![],
+        };
+        assert_eq!(m.apply_delta(&d), DeltaOutcome::Malformed);
+        assert!(m.keys.is_empty());
+    }
+
+    #[test]
+    fn a_delta_over_the_key_cap_is_refused_without_side_effects() {
+        let mut m = Mirror::default();
+        // One key past the cap in the adds list alone: decodable, but
+        // larger than any honest sender would ship.
+        let adds: Vec<Key> = (1..=(MAX_DELTA_KEYS as u64 + 1)).collect();
+        let d = Delta {
+            incarnation: 1,
+            seq: 1,
+            base: KeySet::new().root_fingerprint(),
+            root: [0; 16],
+            adds: encode_keys(0, &adds),
+            removes: vec![],
+        };
+        assert_eq!(m.apply_delta(&d), DeltaOutcome::Malformed);
+        assert!(m.keys.is_empty(), "an oversized delta must not be applied");
+        // Split across both lists so their sum trips the cap even though
+        // neither alone would look outsized.
+        let half = MAX_DELTA_KEYS as u64 / 2 + 1;
+        let adds: Vec<Key> = (1..=half).collect();
+        let removes: Vec<Key> = (half + 1..=half + half).collect();
+        assert!(adds.len() + removes.len() > MAX_DELTA_KEYS);
+        let d = Delta {
+            incarnation: 1,
+            seq: 1,
+            base: KeySet::new().root_fingerprint(),
+            root: [0; 16],
+            adds: encode_keys(0, &adds),
+            removes: encode_keys(0, &removes),
         };
         assert_eq!(m.apply_delta(&d), DeltaOutcome::Malformed);
         assert!(m.keys.is_empty());

@@ -106,7 +106,14 @@ impl Tree {
         } else {
             Vec::new()
         };
-        let mut entries = Vec::with_capacity(count);
+        // `count` is attacker/corruption-controlled (a `u32` off the bucket),
+        // and each entry costs `MIN_ENTRY_BYTES`, so a valid blob of `count`
+        // entries needs at least `count * MIN_ENTRY_BYTES` more bytes. Cap the
+        // pre-allocation at what the remaining input could actually hold: a
+        // larger `count` is guaranteed truncated and fails in the loop below,
+        // but reserving for it first would let a tiny object abort the process
+        // in `handle_alloc_error`. See `manifest::decode_chunk_list`.
+        let mut entries = Vec::with_capacity(count.min(input.len() / MIN_ENTRY_BYTES));
         for _ in 0..count {
             let name = String::from_utf8(read_bytes(&mut input)?.to_vec())
                 .map_err(|_| CoreError::CorruptTree("entry name is not UTF-8".into()))?;
@@ -228,9 +235,22 @@ fn read_optional_bytes<'a>(input: &mut &'a [u8]) -> Result<Option<&'a [u8]>, Cor
     }
 }
 
+/// Smallest byte cost of one encoded [`TreeEntry`]: a 4-byte empty-name
+/// length prefix, the 1-byte kind, `mode`/`uid`/`gid` (4 each), `size` and
+/// `mtime` (8 each), and the one-byte `target`/hash tags. A `CTR2` entry
+/// adds a 4-byte empty-xattr count, so 35 is a safe lower bound for both
+/// formats and only ever *over*-estimates how many entries could fit.
+const MIN_ENTRY_BYTES: usize = 35;
+/// Smallest byte cost of one encoded xattr: a 4-byte name length prefix and
+/// a 4-byte value length prefix, both empty.
+const MIN_XATTR_BYTES: usize = 8;
+
 fn read_xattrs(input: &mut &[u8]) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
     let count = read_u32(input)? as usize;
-    let mut xattrs = Vec::with_capacity(count);
+    // Bounded like `Tree::decode`: never reserve for more xattrs than the
+    // remaining input could encode, so a crafted count cannot force a
+    // process-aborting allocation.
+    let mut xattrs = Vec::with_capacity(count.min(input.len() / MIN_XATTR_BYTES));
     for _ in 0..count {
         let name = String::from_utf8(read_bytes(input)?.to_vec())
             .map_err(|_| CoreError::CorruptTree("xattr name is not UTF-8".into()))?;
@@ -321,5 +341,49 @@ mod tests {
         encoded.pop();
         assert!(Tree::decode(&encoded).is_err());
         assert!(Tree::decode(b"wrong").is_err());
+    }
+
+    /// A tiny blob that claims billions of entries (or xattrs) must fail
+    /// cleanly as truncated, never reserve a `Vec` sized from the untrusted
+    /// count — which would abort the process in `handle_alloc_error`.
+    #[test]
+    fn a_huge_entry_count_does_not_allocate() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MAGIC_V1);
+        put_u32(&mut encoded, u32::MAX); // claims ~4.29B entries in ~8 bytes
+        assert!(matches!(
+            Tree::decode(&encoded),
+            Err(CoreError::CorruptTree(_))
+        ));
+
+        // Same for the file-level xattr count of a CTR2 blob.
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MAGIC_V2);
+        put_u32(&mut encoded, 0); // entry count
+        put_u32(&mut encoded, u32::MAX); // file xattr count
+        assert!(matches!(
+            Tree::decode(&encoded),
+            Err(CoreError::CorruptTree(_))
+        ));
+
+        // And for a per-entry xattr count.
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MAGIC_V2);
+        put_u32(&mut encoded, 1); // one entry
+        put_u32(&mut encoded, 0); // no file xattrs
+        put_bytes(&mut encoded, b"f"); // name
+        encoded.push(InodeKind::File.as_u8());
+        put_u32(&mut encoded, 0o644);
+        put_u32(&mut encoded, 0);
+        put_u32(&mut encoded, 0);
+        put_u64(&mut encoded, 0);
+        encoded.extend_from_slice(&0i64.to_le_bytes());
+        put_optional_bytes(&mut encoded, None);
+        encoded.push(0); // no manifest/tree hash
+        put_u32(&mut encoded, u32::MAX); // per-entry xattr count
+        assert!(matches!(
+            Tree::decode(&encoded),
+            Err(CoreError::CorruptTree(_))
+        ));
     }
 }

@@ -47,6 +47,14 @@ const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// unbounded work.
 const MAX_CONCURRENT_STREAMS: usize = 32;
 
+/// How long an accepted inbound stream may stay silent before we drop
+/// it. A peer that opens a bidi stream and never sends its request frame
+/// would otherwise hold one of the [`MAX_CONCURRENT_STREAMS`] permits for
+/// that connection indefinitely; generous enough for a WAN round trip
+/// plus a cold QUIC dial, short enough that a stalled opener frees its
+/// slot promptly.
+const INBOUND_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One known peer, as learned from the node registry.
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -922,25 +930,48 @@ pub async fn run_gossip<S: PeerService>(
                 deps,
                 pending,
             } => {
-                let _ = service
-                    .mutate_requested(
-                        part.clone(),
-                        *requester,
-                        *req_id,
-                        *epoch_seen,
-                        op.clone(),
-                        *rid,
-                        *acked_through,
-                        deps.clone(),
-                        pending.clone(),
-                    )
-                    .await;
+                // The request carries `rid`/`acked_through`, which mutate
+                // per-requester exactly-once dedup state: an enrolled peer
+                // must not speak for another node's `requester`.
+                if !peers.node_id_for_key(&hex).is_some_and(|id| id == *requester) {
+                    tracing::warn!(peer = %hex, requester, "dropping a gossip mutate claiming another node");
+                } else {
+                    // Don't head-of-line-block gossip behind one mutate:
+                    // the reply is discarded here, so run it off the
+                    // receive loop.
+                    let service = service.clone();
+                    let (part, op, deps, pending) =
+                        (part.clone(), op.clone(), deps.clone(), pending.clone());
+                    let (requester, req_id, epoch_seen, rid, acked_through) =
+                        (*requester, *req_id, *epoch_seen, *rid, *acked_through);
+                    tokio::spawn(async move {
+                        let _ = service
+                            .mutate_requested(
+                                part,
+                                requester,
+                                req_id,
+                                epoch_seen,
+                                op,
+                                rid,
+                                acked_through,
+                                deps,
+                                pending,
+                            )
+                            .await;
+                    });
+                }
             }
             Payload::LeaseOffer { part, epoch } => {
                 service.lease_offered(part.clone(), *epoch);
             }
             Payload::PeerRtts { node_id, rtts } => {
-                service.peer_rtts(*node_id, rtts.clone());
+                // Placement input: an enrolled peer must not publish RTTs
+                // as if they were another node's measurements.
+                if peers.node_id_for_key(&hex).is_some_and(|id| id == *node_id) {
+                    service.peer_rtts(*node_id, rtts.clone());
+                } else {
+                    tracing::debug!(peer = %hex, node_id, "dropping peer-rtts claiming another node");
+                }
             }
             Payload::CondemnedPublished { epoch } => {
                 tracing::debug!(epoch, "GC condemned pointer was published");
@@ -955,16 +986,24 @@ pub async fn run_gossip<S: PeerService>(
                 bucket,
                 buckets,
             } => {
-                service.cache_digest(crate::endpoint::DigestSnapshot {
-                    node_id: *node_id,
-                    generation: *generation,
-                    bits: bits.clone(),
-                    nbits: *nbits,
-                    k: *k,
-                    n: *n,
-                    bucket: *bucket,
-                    buckets: *buckets,
-                });
+                // A digest is keyed by node id in the receiver's per-node
+                // map (up to 4 MiB per entry in bloom mode): an enrolled
+                // peer must not impersonate another node's digest, nor
+                // fabricate distinct node ids to grow that map.
+                if peers.node_id_for_key(&hex).is_some_and(|id| id == *node_id) {
+                    service.cache_digest(crate::endpoint::DigestSnapshot {
+                        node_id: *node_id,
+                        generation: *generation,
+                        bits: bits.clone(),
+                        nbits: *nbits,
+                        k: *k,
+                        n: *n,
+                        bucket: *bucket,
+                        buckets: *buckets,
+                    });
+                } else {
+                    tracing::debug!(peer = %hex, node_id, "dropping a cache digest claiming another node");
+                }
             }
             Payload::CacheDigestDelta {
                 node_id,
@@ -972,12 +1011,16 @@ pub async fn run_gossip<S: PeerService>(
                 adds,
                 buckets,
             } => {
-                service.cache_digest_delta(crate::endpoint::DigestDelta {
-                    node_id: *node_id,
-                    generation: *generation,
-                    adds: adds.clone(),
-                    buckets: *buckets,
-                });
+                if peers.node_id_for_key(&hex).is_some_and(|id| id == *node_id) {
+                    service.cache_digest_delta(crate::endpoint::DigestDelta {
+                        node_id: *node_id,
+                        generation: *generation,
+                        adds: adds.clone(),
+                        buckets: *buckets,
+                    });
+                } else {
+                    tracing::debug!(peer = %hex, node_id, "dropping a cache digest delta claiming another node");
+                }
             }
             Payload::CacheSummary { node_id, summary } => {
                 // Exact mirrors are only worth anything if a summary
@@ -1087,6 +1130,21 @@ async fn handle_conn<S: PeerService>(
     }
 }
 
+/// Registry node id enrolled under the pubkey the stream is signed by,
+/// if any. A frame's signer is already pinned to the connection's peer
+/// (see `handle_stream`), so this is that peer's node id: arms whose
+/// payload names a node on whose behalf it claims to act compare against
+/// it, so an enrolled peer cannot speak for another node.
+fn sender_node_id(inner: &Inner, hex: &str) -> Option<u64> {
+    inner
+        .peers
+        .lock()
+        .unwrap()
+        .values()
+        .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
+        .map(|p| p.node_id)
+}
+
 /// One request/response exchange on its own bidirectional stream.
 ///
 /// Errors here are scoped to the stream: a malformed or unauthorized
@@ -1100,7 +1158,12 @@ async fn handle_stream<S: PeerService>(
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let req = read_frame(&mut recv).await?;
+    // Bound the wait for the request frame so a peer that opens a stream
+    // and then sends nothing cannot pin one of this connection's stream
+    // permits (see [`INBOUND_READ_TIMEOUT`]).
+    let req = tokio::time::timeout(INBOUND_READ_TIMEOUT, read_frame(&mut recv))
+        .await
+        .map_err(|_| anyhow::anyhow!("inbound stream idle past the read deadline"))??;
     let read_us = t0.elapsed().as_micros() as u64;
     let (author, payload) = req.verify()?;
     // The signer must be the peer we authorized, so an allowed peer
@@ -1150,32 +1213,36 @@ async fn handle_stream<S: PeerService>(
             acked_through,
             deps,
             pending,
-        } => Some(
-            service
-                .mutate_requested(
-                    part,
-                    requester,
-                    req_id,
-                    epoch_seen,
-                    op,
-                    rid,
-                    acked_through,
-                    deps,
-                    pending,
+        } => {
+            // The request carries `rid`/`acked_through`, which mutate
+            // per-requester exactly-once dedup state: only the node that
+            // actually sent it may name itself as `requester`, never a
+            // peer on another node's behalf.
+            if sender_node_id(inner, hex) == Some(requester) {
+                Some(
+                    service
+                        .mutate_requested(
+                            part,
+                            requester,
+                            req_id,
+                            epoch_seen,
+                            op,
+                            rid,
+                            acked_through,
+                            deps,
+                            pending,
+                        )
+                        .await,
                 )
-                .await,
-        ),
+            } else {
+                tracing::warn!(peer = %hex, requester, "dropping a mutate request not sent by its requester");
+                None
+            }
+        }
         Payload::ChunksDurable { from, hashes } => {
             // Only the node that forwarded the chunks as pending speaks
             // for them, never a peer on its behalf.
-            let sender = inner
-                .peers
-                .lock()
-                .unwrap()
-                .values()
-                .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
-                .map(|p| p.node_id);
-            if sender == Some(from) {
+            if sender_node_id(inner, hex) == Some(from) {
                 service.chunks_durable(from, hashes).await;
             } else {
                 tracing::warn!(peer = %hex, from, "dropping a chunks-durable report not sent by its node");
@@ -1870,6 +1937,67 @@ mod tests {
         })
         .await
         .expect("digest killed unrelated gossip");
+    }
+
+    /// A cache digest must be bound to its signer: an enrolled peer that
+    /// claims a *different* node's id is dropped (it could otherwise
+    /// impersonate that node's digest, or fabricate distinct ids to grow
+    /// the receiver's per-node digest map), while a digest carrying the
+    /// signer's own id is delivered.
+    #[tokio::test]
+    async fn a_cache_digest_is_bound_to_its_signer() {
+        let (holder, asker, service) = pair(false).await;
+        let holder_id = holder.node_addr().unwrap().id;
+        let asker_id = asker.node_addr().unwrap().id;
+        let mut holder_rx = holder.join_topic(vec![asker_id]).await.unwrap();
+        let mut asker_rx = asker.join_topic(vec![holder_id]).await.unwrap();
+        let asker_service = Arc::new(Recorder::default());
+        let serving = asker.clone();
+        let svc = asker_service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+        let (holder_joined, asker_joined) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(holder_rx.joined(), asker_rx.joined())
+        })
+        .await
+        .expect("gossip peers did not join");
+        holder_joined.unwrap();
+        asker_joined.unwrap();
+        tokio::spawn(run_gossip(holder.clone(), holder_rx, service.clone()));
+        tokio::spawn(run_gossip(asker.clone(), asker_rx, asker_service));
+
+        let digest = |node_id: u64| Payload::CacheDigest {
+            node_id,
+            generation: 1,
+            nbits: 64,
+            k: crate::bloom::K,
+            n: crate::bloom::ENTRIES_PER_BUCKET as u64,
+            bits: vec![0u8; 8],
+            bucket: 0,
+            buckets: 1,
+        };
+        // The asker is enrolled as node 2 in the holder's registry. A
+        // digest claiming node 3 must be dropped; the one claiming its
+        // own node 2 must land. Sent in that order on one connection, so
+        // the arrival of the second proves the first was refused.
+        asker.gossip(digest(3)).await.unwrap();
+        asker.gossip(digest(2)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !service.digests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the matching digest never crossed gossip");
+        let got = service.digests.lock().unwrap();
+        let ids: Vec<u64> = got.iter().map(|d| d.node_id).collect();
+        assert_eq!(
+            ids,
+            vec![2],
+            "only the signer's own digest should be delivered"
+        );
     }
 
     /// A peer that is not enrolled in the registry must be refused even

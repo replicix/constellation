@@ -1,0 +1,5 @@
+# Generated fuzzing state — reproducible from the harnesses, not source.
+target/
+corpus/
+artifacts/
+coverage/
