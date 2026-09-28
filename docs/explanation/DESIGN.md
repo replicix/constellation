@@ -559,8 +559,9 @@ chosen per filesystem and topology
 - **`Backup`** (Layer B, automatic when a peer is within
   `CONSTELLATION_BACKUP_RTT_BUDGET_MS`, 5 ms): the holder streams whole
   journal transactions to its backup and acknowledges only what every
-  listed backup holds. Failover takes about 1.5 s and loses nothing
-  acknowledged.
+  listed backup holds. Failover takes about 1.5 s in the harness and
+  2.3–4.7 s from `kill -9` to a new holder on EC2 ([RESULTS](../../bench/remote/RESULTS.md#failover-time)), and loses
+  nothing acknowledged.
 - **`S3`** (Layer C, `fs create --ack-policy s3`): acknowledged once its
   segment is in the log, group-committed per sync round.
 
@@ -795,8 +796,8 @@ op executes and is acknowledged; "EROFS" means it is refused at once.
 | One node cut from P2P, S3 up | write | the cut node writes through the S3 inbox (a few S3 round trips per op); no cluster locks or strict ReadIndex for it |
 | Holder cut from P2P, S3 up | writes, serves the others through their inbox until their demand moves the lease to their side | write through the inbox, then locally once the lease moves |
 | One node loses S3, P2P up | write; its closes hand their chunks to a peer after 6 s | write |
-| Holder dies, a backup within the RTT budget | — | write again in ≈ 1.5 s (seal-based takeover), nothing acknowledged lost |
-| Holder dies, `ack=s3` | — | write again in ≈ 1.5 s (any peer takes over), nothing acknowledged lost |
+| Holder dies, a backup within the RTT budget | — | write again in ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 (seal-based takeover), nothing acknowledged lost |
+| Holder dies, `ack=s3` | — | write again in ≈ 1.5 s in the harness, not measured on EC2 (any peer takes over), nothing acknowledged lost |
 | Holder dies, no backup (`Local`) | — | write again after the lease TTL (60 s) plus margin; acknowledged forwards are replayed by their requesters; with `f > 0` the taker needs `f` promises |
 | Delegate dies | — | writes under its subtree wait for the root to reclaim it (TTL + margin ≈ 6 s), or for its backup's seal |
 | Delegate cut from the root | stops sequencing at `sent + ttl − margin`; its unstreamed ops are replayed through the root | write through the root once it reclaims the subtree |
@@ -811,7 +812,9 @@ Three things together define what a reader sees:
 
 - **Session guarantees, always**: a node never answers a read from a
   state older than one its clients have already seen.
-- **Close-to-open, per mount**: `--cto bounded` (the default) or
+- **Close-to-open, per mount**: `--cto bounded` (the default, chosen
+  from the EC2 measurements in
+  [ADR-30](DECISIONS.md#adr-30---cto-bounded-stays-the-default)) or
   `--cto strict`.
 - **Cluster locks, per daemon**: `--locks cluster` (the default whenever
   P2P is on) or `local`.
@@ -868,6 +871,15 @@ sequencer's own unshipped writes become visible at its next ship. A
 `--write-mode back` writer's content becomes readable elsewhere only once
 its chunks are up
 ([Close-to-open modes](../reference/features/cto-modes.md#strict-reads-readindex)).
+
+`bounded` is the default
+([ADR-30](DECISIONS.md#adr-30---cto-bounded-stays-the-default)). On EC2,
+`strict` cost about 9× `bounded` per warm `stat` (about 0.3 ms more per
+call, on AWS S3 and OVH alike), and `bounded` passed every correctness
+check, including lock-coordinated git and SQLite, whose coherence comes
+from the lock grant (see Cluster locks below). `strict` is for a reader that learns
+of another node's `close()` out of band, with no lock between them
+([Choosing a mode](../reference/features/cto-modes.md#choosing-a-mode)).
 
 ### Cluster locks
 
@@ -1114,7 +1126,7 @@ Layer B's single-failure contract below
 |---|---|---|---|---|---|
 | Single node | `Local` | none | nothing lost | n/a | n/a |
 | Only distant peers (no backup in budget) | `Local` (Layer A) | none | nothing lost | forwarded ops replayed by their requesters; the holder's own unshipped writes come back as a replay when it returns | lease TTL (60 s) + margin |
-| A peer within the RTT budget | `Backup` (Layer B) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS, ≈ 1.5 s |
+| A peer within the RTT budget | `Backup` (Layer B) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS: ≈ 1.5 s in the harness, 2.3–4.7 s on EC2 ([RESULTS](../../bench/remote/RESULTS.md#failover-time)) |
 | `fs create --ack-policy s3` | `S3` (Layer C) | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS with P2P; the TTL without |
 
 "Nothing lost" is the single-failure contract: any failure of one machine,

@@ -1113,7 +1113,7 @@ pub const SCENARIOS: &[Scenario] = &[
 ];
 
 /// Plan 30 M0: scenarios that reproduce a known, not-yet-fixed bug
-/// (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md` §1.1).
+/// (`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md` §1.1).
 /// Kept out of [`SCENARIOS`] so a bare `harness run` (no names) never
 /// treats a documented bug as a regression: these are expected to FAIL
 /// until the milestone that fixes the underlying bug moves them into
@@ -8957,7 +8957,7 @@ fn holder_ships_under_forward_load(_seed: u64) -> Result<()> {
     Ok(())
 }
 
-/// Bug A (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`
+/// Bug A (`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md`
 /// §1.1), fixed by plan 30 M2's exactly-once forwarding: without a rid,
 /// `request_mutate_with` maps a forward timeout to `Busy`, and
 /// `mutate_op_rebasable`'s fallback (`crates/cli/src/fusefs.rs`) then
@@ -9382,7 +9382,7 @@ fn fresh_node(env: &S3Env, root: &std::path::Path, backend: &str, expect: &[u8])
     Ok(d)
 }
 
-/// Bug B (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`
+/// Bug B (`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md`
 /// §1.1), third-node-takeover shape, as plan 30 M3a's regression test. A
 /// requester (B) applies an accepted forwarded create ahead of the log
 /// (a speculation-log shadow); the holder (A) dies before shipping it, and

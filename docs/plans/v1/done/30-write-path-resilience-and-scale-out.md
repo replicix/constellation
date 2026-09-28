@@ -1,5 +1,9 @@
 # Plan 30 — Exactly-once, recoverable, session-consistent writes, then scale-out authority
 
+**Status: done (2026-09-28).** Every milestone M0–M16 landed on main.
+What was delivered, what changed on the way, what is left open, and the
+verification record are in [§7 Close-out](#7-close-out).
+
 Read `docs/plans/v1/CONVENTIONS.md` first, then plans 28 and 29 (the
 metadata plane this plan builds on).
 
@@ -1129,3 +1133,274 @@ on that workload.
 - Set reconciliation:
   - RBSR: https://arxiv.org/pdf/2212.13567
   - Negentropy: https://github.com/hoytech/negentropy
+
+## 7. Close-out
+
+Plan 30 ran from 2026-09-22 to 2026-09-28. The day-by-day record,
+including every tester gate, is in
+[PROGRESS.md](../PROGRESS.md) under the "Plan 30 …" and "Fix: …"
+sections. This section summarizes it.
+
+### 7.1 Delivered
+
+| Milestone | Delivered | Commits |
+|---|---|---|
+| M0 | Failing scenarios for bugs A and B, the `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` knob, a per-node S3 switch (`CountingProxy::cut`/`heal`), the `KNOWN_BUG_REPROS` registry (empty today) | `b6ed7df` |
+| M1 | `crates/model`: Stateright model that finds A and B as counterexamples; later extended with variants for every protocol milestone | `dccfde1` |
+| M2 | Request ids, `Completed { rid }`, the `completed` keyspace, holder dedup, same-rid in-doubt retry, completion retention in log GC (ADR-18) | `d6a2192`, `2c5249a` |
+| M2b | The holder's ship round is no longer cancelled by forwarded requests; no keepers lock across S3 I/O on the ordinary ship path | `ea36020` |
+| M3 | Speculation log with before-images, stranding, rollback and replay by rid, takeover gate, log-prefix publishing, deposed-holder replay (ADR-19). Holder-side capture kept: the perf gate passed after round 2 | `01e4f93` (M3a), `5e18214` (M3b) |
+| M4 | CAS error-code handling at every site and in `doctor`, poison-record isolation (`status.held`, `repair drop-held`), holder-only publishing, exactly-once/convergence/Elle-style checkers in `crates/chaos` | `33adc8e` |
+| M5 | The sans-IO authority core (`crates/authority`), deterministic simulation with seeded faults and a replay command | `617499b` |
+| M6 | Positions on every reply, the `observed` watermark, read waits bounded by `CONSTELLATION_SESSION_WAIT_MS` (ADR-20) | `92c4078` |
+| M7 | Direct log streams (`LogSubscribe`), gossip without payloads, `visibility-after-burst` | `0f9583d` |
+| M8 | `--cto strict`: ReadIndex, read delegations, recalls, grant horizon | `e0437df` |
+| M9 | Backup peer, seal-based failover, `ack=s3`, pre-S3 streaming (ADR-21) | `0e1017b`, `2522402` |
+| M10 | Flexible-quorum continuation epochs: `epoch_slack`, promises, the claim rules, `leave --node-id` fencing (ADR-22) | `ee7243b` |
+| M11 | Delegated sub-sequencers over one log: manual delegation, automatic placement, designations as delegations, delegate backups, root failover with delegates (ADR-23) | `578ff9c` (2a), `d214b1c` (2b) |
+| M12 | HLC timestamps, commutative parent attributes, shared parent holds, GIGA+ name-hash ranges, placement on by default | `87cfe36` |
+| M13 | The hybrid S3 inbox: writes without a P2P path, escalation to a lease request under sustained demand (ADR-24) | `296749d` |
+| M14 | Cluster `flock`/`fcntl` as leased grants from the owning sequencer, `EIO` fencing, `--locks cluster` by default with P2P (ADR-25) | `df14686` |
+| M15 | Exact chunk-location reconciliation replaces bloom digests (ADR-26) | `b325f4d` |
+| M16 | ADR-18–28, reference pages for `cto` modes, durability and failover, delegations and cluster locks, every knob in `configuration.md`; the code/doc discrepancy fixes; DESIGN.md and GOALS.md rewritten; real-S3 verification (§7.4); the `cto` default decision (ADR-30); this close-out | `3caec49`, `3c58839`, `7a681ee`, and the fixes in §7.2 |
+
+### 7.2 Deviations from the plan
+
+Decisions made while the milestones were designed:
+
+- **M5**: the core is its own crate, `crates/authority`, not
+  `crates/cli/src/authority/`.
+- **M8**: a ReadIndex answer is a position, not the inode record. A
+  record installed as a hint could be regressed by a later segment of an
+  older write. Under strict the kernel's cache TTLs are 0.
+- **M9**: the acknowledgement policy is the filesystem's
+  (`fs create --ack-policy local|s3`), not a per-mount `--ack`.
+  Delegates, the inbox and fast takeovers all key off the tenure's
+  policy (`3c58839`). Backup appends are not fsynced: the contract is
+  single-failure, and a simultaneous power loss of the holder and every
+  backup is `ack=s3`'s job. Safety state (promises, the epoch join gate,
+  epoch state, seals, the read-grant horizon) is synced before it is
+  acted on (`3c58839`).
+- **M10**: promises are published on demand, not refreshed every 5 s
+  (hard constraint 6; steady-state heartbeat PUTs are about 0). An epoch
+  carries a lease only if its policy is `Local`, or `Backup` with every
+  backup a member, and only if the claim was usable when the member
+  acknowledged. A holder that never returns is retired with
+  `leave --node-id`, which fences its leases.
+- **M11**: `deps` are M6 positions with delegation streams
+  (`DelegPosition`), capped at 8 streams; an op with more goes to the
+  root. Designations are non-stealable delegations.
+- **M12**: a hot directory is split into name-hash ranges only where a
+  range has a dominant writer. Splitting a directory whose ranges have
+  no dominant writer measured slower than leaving it alone.
+- **M13**: the user's "hybrid" (2026-09-23). The inbox serves sporadic
+  writes; sustained demand asks for the lease. The escalation thresholds
+  became 8 ops or 1.5 s of waiting per 10 s (the plan said 20 ops or
+  3 s). Refusals ride the log as `Refused { rid, errno }`.
+- **M14**: the sequencer grants whole-file shared or exclusive grants
+  to nodes, and byte ranges and lock owners are resolved on the node.
+  The plan had a per-`(node, lock_owner)` table at the sequencer.
+  Lock state is not replicated to backups: after a fast takeover the
+  successor runs a grace period and accepts reclaims, and after a TTL
+  takeover every old grant has already lapsed.
+- **M15**: the bloom digests stay available as
+  `CONSTELLATION_COOP_DIGEST=bloom`.
+
+Changes forced by bugs found in testing (each has a "Fix:" section in
+PROGRESS.md):
+
+- **Lock floors** (`ee3f65b`, `216ce6c`). A lock grant carries the
+  releaser's session frontier, not just the locked file's position,
+  because git guards other files (its objects and refs) with one turn
+  lock (campaign 4 B-1). The floors move with the lock table through
+  delegations and recalls, and a grant's floor is never dropped.
+- **Grant timing** (`fc3c5f6`, `a1bed13`). A queued request's grant
+  counts from its arrival. A grant is renewed inside the window its
+  holder honours. A delegate grants nothing on less than 2 × margin of
+  authority (campaign 5 E-1: grants lapsed while git held the lock).
+- **Flexible-epoch capture** (`2ff95df`). The epoch hold owner captures
+  speculation like any holder (ADR-19 applied to the hold). A
+  transaction deferred on a departed member's chunk then holds back only
+  what depends on it, and `repair drop-held <ino> --remote` gives the
+  member up. Related epoch fixes: `27f919c`, `f5fb658`, `059c3f7`.
+- **Inbox tombstone** (`b89c048`). A withdrawn batch is replaced by a
+  tombstone, not deleted. A DELETE left a hole that the holder's
+  GET-next stopped at, so every later batch of that requester waited out
+  the in-doubt deadline. Also: inbox ops carry `deps` (`3c58839`), and a
+  P2P link flap no longer starts hot polling (`cb847f8`).
+- **Holds, GC fencing, retention-gap rebuild** (`acc977a`, `84a59be`).
+  Nothing wrote `holds/`, so a file held open after another node's
+  unlink could lose its chunks to GC. A per-node hold writer now
+  publishes open orphans. GC deletes are fenced by a renewed `_gc`
+  lease. A replica behind log retention used to read the gap as "at
+  head", and a takeover from there forked the log. It now detects the
+  gap (`SegmentGap`) and rebuilds from the head commit.
+- **FUSE invalidation reaper** (`b2c3436`, `a432373`, ADR-29). A
+  `kill -9`ed daemon could linger as a zombie with one thread in
+  `fuse_reverse_inval_entry`, holding `daemon.lock`. Notifications are
+  now held back while a request is in flight on their inode. A zombie
+  reaper process aborts a wedged daemon's FUSE connections. `mount`
+  takes a state dir over only from a process the kernel has killed.
+- **Request watchdog and ended generations** (`2929121`, `5437fa6`).
+  A lock grant's floor could name delegation generations that a
+  restarted node no longer knew had ended. Every read on that node then
+  paid the full session wait (campaign 7 B-2). Ended generations are
+  now voided from the persisted delegation table. A watermark still
+  unreached after `CONSTELLATION_SESSION_WATERMARK_TTL_MS` (10 s) is
+  dropped with a warning; this bounds the session guarantee where the
+  plan had none. A FUSE request watchdog (`status.fuse_requests`,
+  `CONSTELLATION_FUSE_REQUEST_STALL_S`) reports stalled requests with
+  their stage.
+- **Availability under partial S3 loss** (`71dc7e7`). A node that loses
+  S3 hands its chunks to a peer that can reach S3, so a close no longer
+  blocks for the outage. A stuck flush no longer holds its write shard.
+  An inbox-escalated lease request no longer makes a healthy holder
+  release. `--cto strict` root adoption retries until the root has an
+  owner.
+- **Slow S3** (`dbeeed2`, `451b4bd`, `7dfc05b`). A holder renews in the
+  middle of its ship loop, so its backup no longer seals it. Placement
+  never moves the lease away from the node writing now. A chunk just
+  written on another node is fetched from its writer, not from S3.
+- **Small-file write path** (`4798008`, `edd3d5d`). One S3 request per
+  small-file close: the condemned pointer is read only after a dedup
+  hit. A non-owner's `back` close forwards at once, with its chunks
+  awaited at the sequencer. The pre-S3 stream answers a forward waiting
+  for its own transaction. `open(O_CREAT)` without `O_EXCL` opens a
+  racing winner instead of failing with `EEXIST`.
+- **Idle cost** (`71dc7e7`). One registry LIST serves the roster and
+  the peer directory, and records are re-read only when they change. An
+  idle node went from 144–237 to 27–30 requests per minute in the
+  harness (26–28 on EC2). `status.s3`
+  counts requests by kind and area.
+- **Churned keyspaces** (`a1bed13`). Keyspaces with an insert and a
+  delete per op are compacted as they grow, so daemons no longer slow
+  down with uptime.
+- **The fjall shutdown deadlock** (`72ddb91`). fjall 3.1.10 is vendored
+  with a fix, until upstream ships it.
+
+### 7.3 Left open
+
+Known limits, documented with the features:
+
+- Durability and failover
+  ([known limits](../../../reference/features/durability-and-failover.md#known-limits)):
+  - A simultaneous power loss of the holder and every backup can lose
+    `Backup`-acknowledged writes of the last few seconds.
+  - One backup survives one failure.
+  - With P2P off there is no backup, no fast takeover and no pre-S3
+    streaming.
+  - A node that enrolls during an open epoch is not accounted for.
+  - A dead hold owner freezes the other members until it returns or is
+    retired.
+  - A member that dies with the only copy of a chunk makes that file
+    `EIO` for the others until it returns or `drop-held --remote`.
+  - A member whose S3 path stays broken stays frozen (`EROFS`).
+- Cluster locks
+  ([limits](../../../reference/features/cluster-locks.md#limits)):
+  - A blocked wait cannot be interrupted (fuser 0.18 delivers no
+    `FUSE_INTERRUPT`).
+  - No deadlock detection.
+  - `flock` and `fcntl` of one process conflict.
+  - `getlk` reports grants.
+  - Adjacent ranges of one owner are not merged.
+- **The fencing limit.** A lapsed grant fences I/O only on the locked
+  file. An application that guards other files with the lock (git) runs
+  on unprotected, which is why grants must not lapse. The fence is also
+  checked when a flush starts, not when it lands: a flush stalled past
+  `2 × margin` can publish after another node was granted the lock.
+- Delegations ([delegations](../../../reference/features/delegations.md)):
+  - No sub-delegation.
+  - Cross-subtree operations recall and go to the root.
+  - A requester whose observed stream set is full goes to the root.
+  - A delegate does not stream its appended rows ahead of S3, so a
+    forward that waits behind a delegate's unappended row waits for the
+    root's ship (PROGRESS, "Fix: OVH real-S3 findings", item 2).
+- `cto` modes
+  ([known gaps](../../../reference/features/cto-modes.md#known-gaps)):
+  - A listing waits on the applied position even when speculation
+    covers it.
+  - A `--write-mode back` writer's content is not strict close-to-open
+    until its chunks are up.
+- Forwarding: the inbox's `MAX_BATCH_BYTES` is not enforced.
+- Epochs (PROGRESS, "Fix: `epoch-member-lost`", known limits): after a
+  mid-epoch hold transfer, members' forwards wait for the log.
+- Leaseless optimistic commits stay deferred (ADR-28).
+
+Not done from the plan's M16 list:
+
+- No EC2 delegation-throughput row. Delegation was measured only on
+  one host.
+- Phase A rows 1, 2, 5 and 6 were not rerun in the original matrix
+  form. Round 3's A/B and the campaigns' measurements cover them
+  ([RESULTS.md](../../../../bench/remote/RESULTS.md#plan-30-real-s3-results)).
+- The registry LIST every 5 s could move to gossip, with a 30–60 s
+  backstop poll (proposed in the idle-cost fix, not done).
+
+Open real-S3 findings:
+
+- **Campaign 8 A-1 (High, OVH only, open).** A non-holder whose S3 was
+  cut forwarded a `create` to the holder. The forward sat in
+  `WaitingLease` until the 120 s in-doubt deadline and returned `EIO`.
+  The same test on AWS completed in 6.5 s.
+- **Campaign 8 B-1 (informational, open).** The git worker's "stale
+  HEAD at turn start" rate rose from 2.4% to 72.7% on AWS (37.5% to
+  66.2% on OVH) between `cb847f8` and `5437fa6`. The causal reader saw
+  0 violations. Needs a design check against the session changes in
+  `2929121`/`5437fa6`.
+- **First-failover outlier (open).** Campaign 6 D1: the first holder
+  kill on a fresh filesystem took 59.8 s on both backends. Later rounds
+  took 2.5–4.1 s. Not investigated; campaign 4's run did not show it.
+- **Round 3's `rename_unlink` p99 at 4 nodes** was +9–17% on `df14686`
+  against `5384772`. Not investigated.
+- **Scale on OVH.** A fresh mount of a 200k-entry namespace did not
+  finish within 600 s (campaign 6 C2). Not rerun.
+- **Measurements still missing.** Failover time on OVH, and a
+  trustworthy failover distribution on the final binary: campaign 7's
+  E1 driver was flawed. Campaign 7's retention-gap rebuild test did not
+  force a gap. Campaign 8 Parts C–E cover all three; they were still
+  running when this was written.
+
+### 7.4 Verification record
+
+**Local gates** (reports in `constellation-m14/GATE-REPORT-*.md`, not in
+the repo):
+
+- **`7dfc05b`: green.**
+  - fmt and clippy clean; 1275 workspace tests; model tests.
+  - Ten authority-sim sweeps, including `long_locks` at 13 configs ×
+    1000 seeds.
+  - 167 of 170 harness scenarios passed; 2 were skipped (no `fio`).
+    `idle-cost` failed 1 in 4 (a holder inbox-poll burst), fixed in
+    `cb847f8`. `named-shared-daemon` took 583.7 s, also fixed in
+    `cb847f8`.
+  - pjdfstest 8798/8798; smoke and integration passed; truncate fuzz at
+    2000 seeds.
+- **`5437fa6`: not green.**
+  - 1312 workspace tests; 138 model tests.
+  - Gate 3: `long-delegated-backup` seed 70232 hung. A backup's clear
+    wiped delegate-backup rows and the ack ping-ponged. Fixed in
+    `efea39f`; 0 failing in 70000..80000.
+  - Gate 4: `commit-strips-pending-upload` failed 4/4. It was a stale
+    but consistent read (0 bytes at log position 39), not corruption.
+    The scenario now waits for the joiner to reach the log head
+    (`de835b3`).
+  - Everything else was clean: 172 of 175 scenarios, pjdfstest
+    8798/8798, smoke, integration, fuzz.
+- After those two fixes, the record has targeted reruns only. A full
+  gate run on current main is still to do.
+
+**Real-S3 runs** on 4 × c5n.2xlarge in us-west-2 (three AZs), against
+AWS S3 in us-west-2 and OVH Object Storage in Milan. Reports are in
+`constellation-m14/`; measurements are in
+[bench/remote/RESULTS.md](../../../../bench/remote/RESULTS.md#plan-30-real-s3-results).
+
+| Run (date, binary) | Scope | Key results | Findings → fix |
+|---|---|---|---|
+| EC2 brutal (09-25, `b4e7cbe-dirty`, M14 WIP) | AWS: crash storms, freezes, partitions, S3 cut, truncate, dir storm, locks, cluster restart | Every acknowledged write was verified on every node: 778, 240, 640, 320 and 480 files. Lock counters exact | S3 cut blocked create+close for the outage → `71dc7e7`. Partition stalled the majority 25–44 s (inbox escalation made the holder release) → `71dc7e7`. `--cto strict` root unwritable → `71dc7e7`. Idle cost → `71dc7e7`. "Lock recovery ~2 min" was a driver artifact; the real gap (a queued grant timed from service) → `fc3c5f6` |
+| OVH brutal (09-25, same binary) | The same scenarios on OVH, plus AWS-vs-OVH perf | Data correct in every scenario (1769, 2199, 1000, 800 files) | `O_CREAT` race `EEXIST` → `edd3d5d`. Non-owner shared-dir create ~400 ms → `edd3d5d`. Slow untar → `edd3d5d`, `4798008`. 409 before 412 was already handled (M4), and a GC journal append was fixed (`edd3d5d`) |
+| Round 3 (09-25, `df14686` vs `5384772`) | Create race on AWS, shared-dir latency, scale, M14 perf A/B | Base lost 55% of `flock` increments; M14 was exact at 5–6× p50. Dedup 500:1 on both backends | `O_CREAT` race confirmed on AWS → `edd3d5d`. OVH "mount lag" was a driver env bug (the OVH profile bound only to `mkdir`); `59c559a` names the store asked. `rename_unlink` p99 open |
+| Campaign 4 (09-25, `edd3d5d`) | Fix verification, 2 h soaks with faults, scale, measurements | 200k files, 10 GiB and a 100k-entry dir correct; failover p50 3.54 s; visibility p50 28 ms | git under `flock`: stale refs and objects missing from the bucket → `ee3f65b`. Strict root on a concurrent first mount → `71dc7e7` (adoption retry). SQLite `disk I/O error` in 1 of 20 rounds (the grant lapse diagnosed in campaign 6 A-1) → `a1bed13` |
+| Campaign 5 (09-25/26, `5face1b`, `ee3f65b`) | git under `flock`, paced and back to back, with faults | Paced run clean on both backends; 0 dangling commits; fresh-node bootstraps exact | `index.lock` stall (grants lapsed under a delegate) → `a1bed13`. Stale reads and the "fork" were a worker artifact. Access key logged → `7da859b` |
+| Campaign 6 (09-26/27, `216ce6c`, `7a681ee`, `a432373`) | Races, lock recovery, 2 h soak, scale, measurements | Soak converged byte for byte; 199,992 files; `back` untar 29× faster than `through` on AWS | Zombie daemon wedged `daemon.lock` → `a432373`, `b2c3436`. OVH visibility 95 s was a wedged poller node, but the work found real S3 waits → `7dfc05b`. SQLite EIO under a delegate → `a1bed13`. First-failover 60 s outlier open |
+| Campaign 7 (09-27/28, `2ff95df`, `cb847f8`) | Races, git under `flock`, GC/retention, 3 h soak, measurements | Parts A and D passed, except that the retention-gap test did not force a gap; the soak converged; visibility p50 33 ms AWS / 210 ms OVH; strict ~9× bounded on `stat` | `mount` CLI hang (the reaper inherited the status pipe) → `cb847f8`. "Ref before objects" was the checkpoint snapshotting a turn in flight; causal checks added in `2929121`. Permanent read wait after restarts → `5437fa6`. Failover driver unreliable |
+| Campaign 8 (09-28, `5437fa6`) | Campaign 7 repeated with hardened drivers | **In progress.** Part A clean on AWS; Part B: 0 causal violations and 0 ref regressions on both backends | A-1 (OVH S3-cut `create` 120 s) and B-1 (stale-HEAD rate) open, §7.3 |

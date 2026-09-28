@@ -10,6 +10,7 @@ with `--cto`.
 
 - [Terminology](#terminology)
 - [Modes](#modes)
+  - [Choosing a mode](#choosing-a-mode)
 - [Details](#details)
   - [Positions](#positions)
   - [Session guarantees](#session-guarantees)
@@ -59,8 +60,37 @@ The mode is per mount (`--cto bounded|strict`), with
 stored in the registry. A sequencer serves strict readers whatever its
 own mount's mode is.
 
-The default is `bounded`. Plan 30 M16 decides from the EC2 measurements
-whether to change it.
+### Choosing a mode
+
+The default is `bounded`
+([ADR-30](../../explanation/DECISIONS.md#adr-30---cto-bounded-stays-the-default)).
+On EC2, with four nodes in one region, `strict` cost about 9× what
+`bounded` costs per `stat` on a warm cache: 30 `stat`s took 10.15 ms
+against 1.17 ms on AWS S3, and 10.19 ms against 1.07 ms on OVH. That is
+about 0.3 ms more per call, the same on both backends, because under
+`strict` every call reaches the daemon (see
+[Cost by topology](#cost-by-topology)). `bounded` passed every
+correctness check of those runs, including concurrent first mounts, the
+`O_CREAT` race, and git and SQLite shared under cluster locks.
+
+Keep `bounded` when:
+
+- nodes share files through cluster locks (`flock`, `fcntl`: git,
+  SQLite). A lock grant makes the new holder wait for everything the
+  previous holder wrote, whatever the mode (see
+  [Cluster locks](cluster-locks.md));
+- each node works in its own files or subtree;
+- the workload is open- or `stat`-heavy (builds, `find`, `git status`,
+  serving files).
+
+Use `strict` on the reading node when it must see a `close()` on another
+node that it learned about out of band, with no lock between them. For
+example, a job writes its output and signals a job on another node
+through a queue, an HTTP call or `ssh`; or a fleet serves files right
+after an uploader on another node closes them. Under `bounded` such a
+reader can see the old content until the log reaches it: tens of
+milliseconds on AWS and a few hundred on OVH at the measured p99, more
+under load.
 
 ## Details
 
@@ -255,8 +285,9 @@ next ship.
 
 ### Cost by topology
 
-Measured on one host behind an S3 emulator (plan 30 M8); WAN numbers
-come from `bench/remote`.
+Measured on one host behind an S3 emulator (plan 30 M8), except the
+EC2 rows (four nodes in one AWS region; see
+[RESULTS.md](../../../bench/remote/RESULTS.md#plan-30-real-s3-results)).
 
 | Topology | Bounded | Strict |
 |---|---|---|
@@ -264,6 +295,8 @@ come from `bench/remote`.
 | LAN, first open | local | ≈ 0.4–0.5 ms (one round trip) |
 | LAN, open under a delegation | local | ≈ 80–120 µs |
 | LAN, open right after another node's close | 12–16 of 80 opens saw stale content | p50 ≈ 1 ms, 0 of 80 stale |
+| EC2, same region, warm `stat` (30 calls) | 1.17 ms in total on AWS S3, 1.07 ms on OVH | 10.15 ms on AWS S3, 10.19 ms on OVH |
+| EC2, same region, open on another node than the writer | warm p50 0.15 ms; cold p50 27.4 ms, p99 44.1 ms | warm p50 0.39 ms; cold p50 29.5 ms, p99 76.8 ms |
 | Across continents, file nobody else writes | local | one WAN round trip on the first open, then local |
 | Across continents, write then open | stale until the log arrives | one WAN round trip, the minimum strict close-to-open allows |
 
@@ -365,7 +398,7 @@ reads.
 
 ## References
 
-- Plan 30 §M6–§M8 ([plan](../../plans/v1/wip/30-write-path-resilience-and-scale-out.md))
+- Plan 30 §M6–§M8 ([plan](../../plans/v1/done/30-write-path-resilience-and-scale-out.md))
 - [ADR-20](../../explanation/DECISIONS.md#adr-20-positions-session-guarantees-and-two-close-to-open-modes)
 - [`crates/meta/src/session.rs`](../../../crates/meta/src/session.rs),
   [`crates/meta/src/readdeleg.rs`](../../../crates/meta/src/readdeleg.rs),

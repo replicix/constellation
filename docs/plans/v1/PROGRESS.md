@@ -8620,7 +8620,7 @@ which is dedup-safe by construction.
 
 `crates/cli/src/{inbox,lease,node_runtime,main}.rs`,
 `crates/api/src/{types,web}.rs`, `crates/harness/src/scenarios.rs`,
-`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`,
+`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md`,
 `docs/reference/features/forwarded-mutations.md`,
 `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md`.
 
@@ -27255,3 +27255,36 @@ underneath was already there: it came with delegate backups
 - `sweep_config long-delegated-backup` 70000..80000: 0 failing.
 - `long_backup`, `long_delegated`, `long_random` at 2000 seeds: pass.
 - `sweep_config flex-crash` 0..5000: 0 failing.
+
+## Plan 30 — close-out: **DONE** (2026-09-28)
+
+Plan 30 is done: M0–M16 are on main, and the plan moved to
+[`done/30-write-path-resilience-and-scale-out.md`](done/30-write-path-resilience-and-scale-out.md).
+Its [§7 Close-out](done/30-write-path-resilience-and-scale-out.md#7-close-out)
+records what each milestone delivered, where the build deviated from
+the plan, what is left open, and the verification record (the local
+gates on `7dfc05b` and `5437fa6`, the EC2 brutal, OVH brutal and round 3
+runs, and EC2/OVH campaigns 4–8).
+
+| Item | State | Where |
+|---|---|---|
+| Plan and its DESIGN.md notes moved from `wip/` to `done/`; every link to them updated (reference pages, ADRs, code comments) | done | `docs/plans/v1/done/30-*.md`, `docs/plans/v1/README.md` |
+| Close-out section: delivered per milestone, deviations, open items, verification record | done | plan §7 |
+| The `cto` default: `bounded` stays, from campaign 7's measurement (strict ~9× bounded per warm `stat`, ~0.3 ms more per call) and every correctness check passing under `bounded` | done | ADR-30 in `docs/explanation/DECISIONS.md`; `docs/reference/features/cto-modes.md` ("Choosing a mode", EC2 rows in "Cost by topology") |
+| Plan-30 EC2/OVH measurements: failover, visibility, S3 requests per op, idle cost, `cto` cost, untar `through` vs `back`, AWS vs OVH, the M14 A/B, scale; unreliable and proxy rows marked | done | `bench/remote/RESULTS.md` ("Plan 30 real-S3 results") |
+
+### Plan 30 exit criteria
+
+- [x] Every milestone M0–M16 committed (plan §7.1)
+- [x] ADRs 18–30, reference pages, `configuration.md`, DESIGN.md
+- [x] Real-S3 verification on AWS and OVH (plan §7.4). Campaign 8 was
+  still running at close-out; its Parts C–E measurements go into
+  `bench/remote/RESULTS.md` when its report is final
+- [x] `cto` default decided (ADR-30)
+- [ ] A full gate run on main after `efea39f`/`de835b3`: the last full
+  gate (`5437fa6`) was not green, and its two findings have since been
+  fixed and rerun as targeted tests only
+- [ ] Open real-S3 findings (plan §7.3): campaign 8 A-1 (OVH S3-cut
+  `create` in doubt for 120 s), campaign 8 B-1 (stale-HEAD rate), the
+  60 s first failover on a fresh filesystem, round 3's `rename_unlink`
+  p99

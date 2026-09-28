@@ -279,7 +279,7 @@ the source. The rejection above still holds.
 ---
 
 The ADRs below come from plan 30 ([write-path resilience and
-scale-out](../plans/v1/wip/30-write-path-resilience-and-scale-out.md)).
+scale-out](../plans/v1/done/30-write-path-resilience-and-scale-out.md)).
 Each gives the context, the decision, its consequences, the alternatives
 rejected, and where it lives. The plan's §2 hard constraints (portable
 S3 only, one bucket, single-node degradation, no WAN round trip on every
@@ -414,7 +414,10 @@ session anomaly (a node not seeing its own refused create's winner, for
 example) needed its own point fix. Cross-node visibility after a write
 burst measured p50 16 s and p99 21 s on EC2 (plan 30 M7 later found
 that this run largely measured the benchmark, whose pollers started
-only after the writer finished; M16 re-measures it). Follower delivery rode
+only after the writer finished; the M16 EC2 campaigns re-measured it
+with concurrent pollers at p50 28–34 ms on AWS and about 210 ms on OVH,
+see [RESULTS.md](../../bench/remote/RESULTS.md#plan-30-real-s3-results)).
+Follower delivery rode
 gossip payloads (ADR-17), which were capped in size and fell back to S3
 for anything larger.
 
@@ -459,8 +462,8 @@ close-to-open allows at that distance. A writer whose file is delegated
 to a silent reader waits up to the delegation's TTL plus the lease
 margin (6 s at the defaults). With P2P off there is no ReadIndex: a
 strict open tails S3 to head, so the sequencer's own unshipped writes
-are visible only after its next ship. The default stays `bounded`; plan 30 M16
-decides from the EC2 measurements whether to change it. The first
+are visible only after its next ship. The default stays `bounded`,
+decided from the EC2 measurements in ADR-30. The first
 visibility root causes found were a ship blocked behind the whole upload
 pass, an `fsync` drain behind the bulk upload queue, and the kernel's 1 s
 cache TTL; all three are fixed.
@@ -1001,3 +1004,64 @@ resolved by hand).
 **See**: `crates/cli/src/daemon_lock.rs`; the `stale-daemon-lock` and
 `holder-kill-rejoin` harness scenarios;
 [named filesystems](../reference/features/named-filesystems.md).
+
+## ADR-30: `--cto bounded` stays the default
+
+**Context**: ADR-20 built two close-to-open modes and left the default
+to plan 30 M16, to be decided from real-S3 measurements. The EC2
+campaigns measured both modes on AWS S3 (us-west-2) and on OVH (Milan)
+with four nodes in one region.
+
+**Decision**: `bounded` stays the default. `strict` remains a per-mount
+opt-in (`--cto strict`, or `CONSTELLATION_CTO=strict`).
+
+- **What strict costs.** Campaign 7 (`cb847f8`) timed 30 warm `stat`s:
+  1.17 ms under `bounded` and 10.15 ms under `strict` on AWS, 1.07 ms
+  and 10.19 ms on OVH. That is about 9× the per-op cost of `bounded`,
+  roughly 0.3 ms more per `stat` (0.04 ms against 0.34 ms), the same on
+  both backends. Under `strict` the kernel caches nothing (TTL 0), so
+  each call reaches the daemon; a warm `bounded` `stat` is answered by
+  the kernel. Campaign 4 (`edd3d5d`) found the same on cross-node opens:
+  warm p50 0.15 ms against 0.39 ms, cold p99 44 ms against 77 ms. A lone
+  sequencer pays nothing (campaign 6, one node: no difference).
+- **What bounded gives up.** Nothing that the campaigns' correctness
+  checks could see. Campaigns 7 and 8 passed every check under
+  `bounded`:
+  - concurrent 4-node first mounts (root owned by the mounting user,
+    `mkdir` works);
+  - the `O_CREAT` race and SQLite first touch;
+  - exact lock counters after a holder kill, and the lock fence;
+  - git under a `flock` turn lock: campaign 8 found 0 causal violations
+    and 0 ref regressions in 568 checks on AWS and 246 on OVH;
+  - 3 h soaks with faults, which converged byte for byte.
+
+  Lock-coordinated sharing gets its cross-node coherence from the lock
+  grant, which carries the releaser's frontier (ADR-25), not from the
+  `cto` mode. Visibility under `bounded` was p50 28–34 ms and p99
+  53–76 ms on AWS, and p50 about 210 ms and p99 250–350 ms on OVH.
+
+**Consequences**: open- and stat-heavy workloads (builds, `find`,
+`git status`, web serving) keep kernel caching and pay nothing for
+close-to-open. Choose `strict` on the *reading* node when a reader must
+see a `close()` on another node that it learned about out of band,
+without a cluster lock between them. For example: a job on one node
+writes output and signals a job on another node through a queue, an
+HTTP call or `ssh`; a fleet serves files right after an uploader
+elsewhere closes them. On one host, 12–16 of 80 `bounded` opens right
+after another node's close saw the old content; `strict` saw none, and
+campaign 4 found 0 stale reads in 1000 strict close-to-open iterations
+on AWS and 300 on OVH. Strict costs one round trip to the sequencer on a
+first open (one WAN round trip across continents) and about 0.3 ms per
+call afterwards. With P2P off it guarantees only what is already in the
+log.
+
+**Rejected**: `strict` by default (its cost falls on every open and
+`stat` of every workload, including the lock-coordinated ones that do
+not need it, and it turns off kernel attribute caching). Switching modes
+per directory automatically (not built; nothing in the measurements
+called for it).
+
+**See**: [Close-to-open modes](../reference/features/cto-modes.md#choosing-a-mode);
+[RESULTS.md](../../bench/remote/RESULTS.md#plan-30-real-s3-results);
+plan 30 [§7](../plans/v1/done/30-write-path-resilience-and-scale-out.md#7-close-out).
+Amends ADR-20.

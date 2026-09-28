@@ -59,7 +59,7 @@ opt-in.
 |---|---|---|---|---|---|
 | Single node | `Local` | none | nothing lost | n/a | n/a |
 | Only distant peers | `Local` | none | nothing lost | forwarded ops are replayed by their requesters; the holder's own un-shipped writes come back when it returns, as a replay | lease TTL (60 s default) |
-| A peer within the RTT budget | `Backup` (automatic) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS (≈ 1.5 s measured) |
+| A peer within the RTT budget | `Backup` (automatic) | one round trip to the backup | nothing lost | nothing lost | detection + one CAS (≈ 1.5 s in the harness; 2.3–4.7 s from `kill -9` to a new holder on EC2, with one unexplained 60 s first failover on a fresh filesystem; see [RESULTS.md](../../../bench/remote/RESULTS.md#failover-time)) |
 | `fs create --ack-policy s3`, any topology | `S3` | one S3 round trip per group commit | nothing lost | nothing lost | detection + one CAS (needs P2P) |
 
 There is no `backup` setting: `Backup` is chosen automatically when a
@@ -554,7 +554,7 @@ See [Configuration](../configuration.md) for parsing rules.
 - `held`: `deferred` (transactions waiting for a chunk still uploading,
   a member's included) and `remote[]` (each awaited chunk: `ino`,
   `path`, `node`, `chunk`, `age_s`); see
-  [Write-path hygiene](write-path-hygiene.md#statusheld).
+  [Write-path hygiene](write-path-hygiene.md#held-records-statusheld).
 
 ## Troubleshooting
 
@@ -597,7 +597,7 @@ Expected: an `S3` lease is never carried into a continuation epoch
 
 ## References
 
-- Plan 30 §3, §M9, §M10 ([plan](../../plans/v1/wip/30-write-path-resilience-and-scale-out.md))
+- Plan 30 §3, §M9, §M10 ([plan](../../plans/v1/done/30-write-path-resilience-and-scale-out.md))
 - [ADR-21](../../explanation/DECISIONS.md#adr-21-layered-durability-and-seal-based-failover),
   [ADR-22](../../explanation/DECISIONS.md#adr-22-flexible-quorum-continuation-epochs-with-promises)
 - [`crates/authority/src/core/backup.rs`](../../../crates/authority/src/core/backup.rs),

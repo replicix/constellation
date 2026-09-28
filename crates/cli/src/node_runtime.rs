@@ -92,7 +92,7 @@ fn clear_stale_mount(mountpoint: &std::path::Path) {
 /// the keepers lock has been released, so the delay races only the
 /// requester's own `CONSTELLATION_FORWARD_TIMEOUT_MS` deadline and
 /// blocks nothing else on this node. This reproduces bug A
-/// (`docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md`
+/// (`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md`
 /// §1.1): the requester's forward times out, `request_mutate_with` maps
 /// that to `Busy`, `mutate_op_rebasable` falls back to acquiring the
 /// lease, and it re-executes locally an op the holder already applied.

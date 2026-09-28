@@ -389,7 +389,7 @@ Recall the delegations, or turn placement off, to let it move.
 
 ## References
 
-- Plan 30 §M11–§M12 ([plan](../../plans/v1/wip/30-write-path-resilience-and-scale-out.md))
+- Plan 30 §M11–§M12 ([plan](../../plans/v1/done/30-write-path-resilience-and-scale-out.md))
 - [ADR-23](../../explanation/DECISIONS.md#adr-23-delegated-sub-sequencers-over-one-log)
 - [`crates/authority/src/core/delegate.rs`](../../../crates/authority/src/core/delegate.rs),
   [`crates/authority/src/core/placement.rs`](../../../crates/authority/src/core/placement.rs),

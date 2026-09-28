@@ -238,7 +238,7 @@ read-back covers.
 
 ## References
 
-- `docs/plans/v1/wip/30-write-path-resilience-and-scale-out.md` §M4
+- `docs/plans/v1/done/30-write-path-resilience-and-scale-out.md` §M4
 - `crates/store-s3/src/cas.rs`, `crates/store-s3/src/probe.rs`
 - `crates/meta/src/store/held.rs`
 - `crates/cli/src/mtree_publish.rs` (`TreePublisher::follow_head`)

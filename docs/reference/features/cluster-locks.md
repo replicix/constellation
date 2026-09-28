@@ -421,7 +421,7 @@ off. Use `--locks local`, or turn P2P on.
 
 ## References
 
-- Plan 30 §M14 ([plan](../../plans/v1/wip/30-write-path-resilience-and-scale-out.md))
+- Plan 30 §M14 ([plan](../../plans/v1/done/30-write-path-resilience-and-scale-out.md))
 - [ADR-25](../../explanation/DECISIONS.md#adr-25-cluster-locks-are-leased-grants-from-the-owning-sequencer)
 - [`crates/authority/src/core/locks.rs`](../../../crates/authority/src/core/locks.rs) (protocol),
   [`crates/meta/src/locks.rs`](../../../crates/meta/src/locks.rs) (tables),

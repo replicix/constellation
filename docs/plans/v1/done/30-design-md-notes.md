@@ -1,5 +1,13 @@
 # Plan 30 M16 — notes for the DESIGN.md rewrite (§4–§6, §9)
 
+**Status: consumed.** DESIGN.md and GOALS.md were rewritten from these
+notes in `7a681ee` ("DESIGN.md describes the system as built after plan
+30"), including the items under "Stale text outside §4–§6 and §9". The
+line numbers below refer to DESIGN.md as of `df14686` and no longer
+match. The notes are kept as the record of what the rewrite had to
+change; see the plan's
+[close-out](30-write-path-resilience-and-scale-out.md#7-close-out).
+
 Input for the coordinator's rewrite of `docs/explanation/DESIGN.md`
 (coordinator-only, per plan 30 §M16). For each section: the stale
 sentences, quoted with their line numbers in DESIGN.md as of main

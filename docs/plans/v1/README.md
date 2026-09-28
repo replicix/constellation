@@ -53,7 +53,7 @@ Execution protocol:
 | 27 | `done/27-merkle-packed-checkpoints.md` | done (superseded by 28) | checkpoint = packed Merkle tree + sidecar — goals delivered via plan 28's prolly-tree format (option B); plan as written not shipped | 26 |
 | 28 | `done/28-s3-native-metadata-store.md` | done | S3-native metadata: prolly tree + packs + CAS commit chain replace the checkpoint; reachability GC + compaction | 27 |
 | 29 | `done/29-fjall-metadata-engine.md` | done | fjall 3 local engine, partitions removed, key-delta publishing, concurrent ordered forwarding | 28 |
-| 30 | `wip/30-write-path-resilience-and-scale-out.md` | wip | exactly-once forwarding, speculation log, session consistency + `cto=strict`, layered durability, flexible epochs, delegated sub-sequencers, strict locks | 29 |
+| 30 | `done/30-write-path-resilience-and-scale-out.md` | done | exactly-once forwarding, speculation log, session consistency + `cto=strict`, layered durability, flexible epochs, delegated sub-sequencers, strict locks | 29 |
 
 "Committed in practice": the plan does not technically build on the
 intermediate milestones, but the protocol is strictly sequential, so
