@@ -4,6 +4,16 @@
 //! `127.0.0.1`. Remote operation belongs behind an SSH/iroh tunnel; widening
 //! the bind address without adding authentication would expose destructive
 //! control requests.
+//!
+//! Binding loopback is not enough on its own: a page the operator visits in
+//! a browser can point a name it controls at `127.0.0.1` (DNS rebinding) and
+//! then issue *same-origin* requests to this API — fsck repair, prune,
+//! `mount_add`, `leave`, every destructive endpoint — with no credential to
+//! steal because there is none. This is the class of CVE-2025-49596. The
+//! [`guard_rebinding`] middleware closes it by refusing any request whose
+//! `Host` header (or, when present, `Origin`) does not name the loopback
+//! interface: a rebinding attacker's page still carries its own domain in
+//! those headers, while `curl` and the same-page UI carry a loopback host.
 
 use crate::{dispatch, DownloadSession, Request, Response, StatusSource};
 use axum::{
@@ -34,21 +44,100 @@ struct AppState {
 pub async fn serve(port: u16, source: Arc<dyn StatusSource>) -> anyhow::Result<SocketAddr> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let address = listener.local_addr()?;
-    let state = AppState { source };
-    let app = Router::new()
-        .route("/api", post(api))
-        .route("/api/status", get(status))
-        .route("/api/download", get(download))
-        .route("/metrics", get(metrics))
-        .route("/", get(index))
-        .route("/{*path}", get(asset))
-        .with_state(state);
+    let app = router(source);
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::warn!(%error, "web UI server stopped");
         }
     });
     Ok(address)
+}
+
+/// Assemble the router, guard included. Split out of [`serve`] (a purely
+/// mechanical refactor — the wiring is unchanged) so tests can drive the
+/// full stack in-process without binding a socket.
+fn router(source: Arc<dyn StatusSource>) -> Router {
+    let state = AppState { source };
+    Router::new()
+        .route("/api", post(api))
+        .route("/api/status", get(status))
+        .route("/api/download", get(download))
+        .route("/metrics", get(metrics))
+        .route("/", get(index))
+        .route("/{*path}", get(asset))
+        .with_state(state)
+        // Applied last so it wraps the whole router: every route, static
+        // asset included, passes the DNS-rebinding check first.
+        .layer(axum::middleware::from_fn(guard_rebinding))
+}
+
+/// Loopback authorities a browser or `curl` may legitimately name when
+/// reaching this API. Anything else in a `Host`/`Origin` header is treated
+/// as a rebinding attempt (see the module doc).
+const ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// Is `host` — a raw `Host` header value or the authority of an `Origin` —
+/// one of the loopback names, with or without a trailing `:port`?
+fn is_allowed_host(host: &str) -> bool {
+    if ALLOWED_HOSTS.contains(&host) {
+        return true;
+    }
+    // Strip a `:port` suffix and re-check. `rsplit_once` takes the *last*
+    // colon: for `127.0.0.1:8080` / `localhost:8080` that is the port
+    // separator, and for the bracketed IPv6 form `[::1]:8080` it is also
+    // the port (the address's own colons stay inside the brackets). A bare
+    // `[::1]`, whose last colon is inside the address, never reaches here —
+    // it matched exactly above. We accept the stripped form only when what
+    // remains is exactly an allowed host, so `evil.example:80` is refused.
+    matches!(host.rsplit_once(':'), Some((h, _)) if ALLOWED_HOSTS.contains(&h))
+}
+
+/// The host part of an `Origin` header (`scheme://host[:port]`, or the
+/// literal `null`) is a loopback name.
+fn is_allowed_origin(origin: &str) -> bool {
+    match origin.split_once("://") {
+        // Origin never carries a path, so everything after `://` is the
+        // authority; apply the same loopback rules as the `Host` check.
+        Some((_, authority)) => is_allowed_host(authority),
+        None => false,
+    }
+}
+
+/// DNS-rebinding guard (see the module doc). Rejects with 403 and a
+/// plain-text reason when the `Host` header is missing or names a
+/// non-loopback address, or when an `Origin` header is present and points
+/// at a cross-site page.
+async fn guard_rebinding(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> HttpResponse {
+    let headers = request.headers();
+    // HTTP/1.1 requires a Host header; a request without one is either
+    // malformed or a deliberate attempt to slip past the check, so refuse.
+    let host_ok = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_allowed_host);
+    if !host_ok {
+        return (
+            StatusCode::FORBIDDEN,
+            "refused: Host header is missing or not a loopback address (DNS-rebinding guard)\n",
+        )
+            .into_response();
+    }
+    // Browsers attach Origin on cross-site fetches; a same-page UI fetch or
+    // a `curl` sends none or a loopback one. A present, non-loopback Origin
+    // is the rebinding signal even if the Host somehow passed.
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) {
+        if !is_allowed_origin(origin) {
+            return (
+                StatusCode::FORBIDDEN,
+                "refused: cross-origin request to the localhost API (DNS-rebinding guard)\n",
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 async fn api(State(state): State<AppState>, Json(request): Json<Request>) -> Json<Response> {
@@ -486,5 +575,80 @@ fn embedded(path: &str) -> HttpResponse {
             .body(Body::from(file.data))
             .expect("static response is valid"),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// The rebinding guard rejects before any route handler runs, so the
+    /// allowed cases only reach the static `GET /` handler and never touch
+    /// the source. This stub therefore need not produce a real report.
+    struct NeverAsked;
+    impl StatusSource for NeverAsked {
+        fn status(&self) -> crate::StatusReport {
+            unimplemented!("the DNS-rebinding guard tests never reach a handler that reads status")
+        }
+    }
+
+    /// Drive `GET /` through the full router with the given headers and
+    /// return the response status. `/` maps to the embedded `index.html`,
+    /// which exists, so an allowed request yields `200 OK` and a rejected
+    /// one `403 FORBIDDEN` from the guard.
+    async fn get_root(headers: &[(&str, &str)]) -> StatusCode {
+        let app = router(Arc::new(NeverAsked));
+        let mut builder = HttpRequest::builder().method("GET").uri("/");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        app.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn missing_host_is_refused() {
+        assert_eq!(get_root(&[]).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn foreign_host_is_refused() {
+        assert_eq!(
+            get_root(&[("host", "evil.example")]).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_ip_with_port_is_allowed() {
+        assert_eq!(get_root(&[("host", "127.0.0.1:8080")]).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn localhost_is_allowed() {
+        assert_eq!(get_root(&[("host", "localhost")]).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ipv6_loopback_with_port_is_allowed() {
+        assert_eq!(get_root(&[("host", "[::1]:8080")]).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cross_site_origin_is_refused() {
+        assert_eq!(
+            get_root(&[("host", "localhost"), ("origin", "http://evil.example")]).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_origin_is_allowed() {
+        assert_eq!(
+            get_root(&[("host", "localhost"), ("origin", "http://localhost:8080")]).await,
+            StatusCode::OK
+        );
     }
 }

@@ -602,8 +602,15 @@ impl Filesystem for FuseFs {
         let parent = self.real_ino(parent);
         let newparent = self.real_ino(newparent);
         let _inflight = self.inflight.enter(&[parent, newparent]);
-        let name = name.to_string_lossy().into_owned();
-        let newname = newname.to_string_lossy().into_owned();
+        // Enforce NAME_MAX on both names, like every other name-taking op;
+        // rename previously converted them with `to_string_lossy` directly
+        // and so accepted names the metadata plane would otherwise store
+        // over the POSIX limit. `checked_name!` replies ENAMETOOLONG and
+        // returns for an over-long name (`reply` is consumed only on that
+        // diverging path, so it stays available for the second check and
+        // the operation itself).
+        let name = checked_name!(name, reply).into_owned();
+        let newname = checked_name!(newname, reply).into_owned();
         let src_scratch = self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some();
         let dst_scratch = self.meta.is_scratch_dir(newparent).unwrap_or(false)
@@ -1646,7 +1653,11 @@ impl ConstellationFs {
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let mut writes = self.writes.lock(ino);
         let ws = self.write_state(&mut writes, ino, &manifest)?;
-        let write_end = offset + data.len() as u64;
+        // Guard the range arithmetic: a huge offset near u64::MAX would
+        // otherwise overflow and panic here while holding the write-shard
+        // lock (poisoning it — see WriteShards::lock). Refuse with EFBIG,
+        // as `do_fallocate` already does for the same overflow.
+        let write_end = offset.checked_add(data.len() as u64).ok_or(libc::EFBIG)?;
         let new_file_len = ws.file_len.max(write_end);
         self.quota_check(ino, new_file_len)?;
         ws.staging

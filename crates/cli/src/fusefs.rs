@@ -216,15 +216,25 @@ impl WriteShards {
 
     fn lock(&self, ino: Ino) -> std::sync::MutexGuard<'_, HashMap<Ino, WriteState>> {
         let m = &self.maps[ino as usize % WRITE_SHARDS];
+        // Recover from poison instead of propagating it. If a fuser worker
+        // panics while holding a shard guard, the guarded map is still
+        // structurally valid — it maps inodes to their write sessions, and
+        // a half-finished op does not break that invariant. Propagating the
+        // poison (the old `unwrap()` / `panic!`) turned one worker's panic
+        // into a cascade: every later op on any inode hashing to this shard
+        // would panic too, killing workers one by one until the whole mount
+        // wedged kernel-side (uninterruptible). Taking the inner guard, as
+        // the rest of the codebase does (see fuse_watch.rs), keeps a
+        // poisoned shard from wedging the mount.
         match m.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 crate::fuse_watch::stage("write shard lock");
-                let guard = m.lock().unwrap();
+                let guard = m.lock().unwrap_or_else(|e| e.into_inner());
                 crate::fuse_watch::stage("running");
                 guard
             }
-            Err(std::sync::TryLockError::Poisoned(e)) => panic!("{e}"),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         }
     }
 
@@ -317,7 +327,13 @@ impl InodeOps {
     fn lock(&self, ino: Ino) -> InodeOpGuard<'_> {
         let me = std::thread::current().id();
         let (m, cv) = &self.shards[ino as usize % 64];
-        let mut held = m.lock().unwrap();
+        // Recover from poison rather than propagating it, for the same
+        // reason as `WriteShards::lock`: the guarded map (inode -> owning
+        // thread + re-entrancy depth) stays structurally valid across a
+        // panic, and letting the poison through would panic every later op
+        // on any inode hashing to this shard, wedging the mount worker by
+        // worker. Matches fuse_watch.rs's `unwrap_or_else(|e| e.into_inner())`.
+        let mut held = m.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             match held.get_mut(&ino) {
                 None => {
@@ -330,7 +346,7 @@ impl InodeOps {
                 }
                 Some(_) => {
                     crate::fuse_watch::stage("inode operation lock");
-                    held = cv.wait(held).unwrap();
+                    held = cv.wait(held).unwrap_or_else(|e| e.into_inner());
                     crate::fuse_watch::stage("running");
                 }
             }
@@ -342,7 +358,10 @@ impl InodeOps {
 impl Drop for InodeOpGuard<'_> {
     fn drop(&mut self) {
         let (m, cv) = &self.ops.shards[self.ino as usize % 64];
-        let mut held = m.lock().unwrap();
+        // Recover from poison here too: a poisoned held-map must still be
+        // updated on guard drop, or the depth bookkeeping leaks and waiters
+        // on this shard never wake.
+        let mut held = m.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, depth)) = held.get_mut(&self.ino) {
             *depth -= 1;
             if *depth == 0 {

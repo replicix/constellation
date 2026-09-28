@@ -6421,9 +6421,23 @@ impl constellation_api::StatusSource for DaemonStatus {
         mountpoint: &std::path::Path,
         opts: &constellation_api::MountViewOpts,
     ) -> std::result::Result<String, String> {
-        let fuse_threads = opts
-            .fuse_threads
-            .unwrap_or_else(|| parallelism::thread_plan().fuse);
+        // `fuse_threads` arrives straight from an unauthenticated API caller
+        // and flows into fuser's `n_threads`, one OS thread each: an
+        // unbounded value is a thread-spawn DoS. Reject anything outside a
+        // sane band rather than clamp, so the caller learns the request was
+        // wrong instead of silently getting a different mount. The
+        // CLI-driven mount path derives its count from `thread_plan()`
+        // (already capped at `FUSE_THREAD_HARD_MAX`), so only this API path
+        // needs the guard.
+        let fuse_threads = match opts.fuse_threads {
+            Some(n) if !(1..=1024).contains(&n) => {
+                return Err(format!(
+                    "fuse_threads must be between 1 and 1024, got {n}"
+                ));
+            }
+            Some(n) => n,
+            None => parallelism::thread_plan().fuse,
+        };
         let id = self
             .node
             .add_mount(node_runtime::ViewConfig {

@@ -23,3 +23,6 @@ bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# In-process driving of the web router for the DNS-rebinding guard tests
+# (`ServiceExt::oneshot`); already in the lockfile via axum.
+tower = { version = "0.5", features = ["util"] }

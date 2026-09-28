@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 pub const SOCKET_NAME: &str = "control.sock";
@@ -351,22 +351,62 @@ pub fn serve(state_dir: &Path, source: Arc<dyn StatusSource>) -> Result<PathBuf>
     Ok(sock)
 }
 
+/// Ceiling on the bytes we will buffer for one control-socket request
+/// line. A valid request (one JSON object per line) is tiny; this cap
+/// exists only so a client that connects and then sends bytes without ever
+/// sending a newline cannot make us grow an unbounded buffer — a trivial
+/// local denial of service. 8 MiB is far above any real request and well
+/// below anything that threatens the daemon's memory.
+const MAX_REQUEST_LINE: u64 = 8 * 1024 * 1024;
+
 async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()> {
     let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
+    let mut reader = BufReader::new(r);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // `take` yields EOF after the cap, so `read_until` returns without
+        // a newline once a line runs long instead of buffering forever.
+        // Reading one extra byte lets us tell a line that is exactly at the
+        // cap from one that overruns it.
+        let n = (&mut reader)
+            .take(MAX_REQUEST_LINE + 1)
+            .read_until(b'\n', &mut buf)
+            .await?;
+        if n == 0 {
+            break; // clean EOF: the peer closed the connection
+        }
+        if !buf.ends_with(b"\n") {
+            // No delimiter within the cap. Either the peer closed mid-line
+            // (nothing complete to answer) or it is deliberately holding
+            // the connection open with an over-long line; in the latter
+            // case tell it why before closing, then stop reading.
+            if buf.len() as u64 > MAX_REQUEST_LINE {
+                let resp = Response::Error {
+                    message: format!(
+                        "request line exceeds the {MAX_REQUEST_LINE}-byte limit; closing connection"
+                    ),
+                };
+                let mut out = serde_json::to_vec(&resp)?;
+                out.push(b'\n');
+                let _ = w.write_all(&out).await;
+            }
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        let resp = match serde_json::from_str::<Request>(&line) {
+        let resp = match serde_json::from_str::<Request>(line) {
             Ok(request) => dispatch(source.as_ref(), request),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
         };
-        let mut buf = serde_json::to_vec(&resp)?;
-        buf.push(b'\n');
-        w.write_all(&buf).await?;
+        let mut out = serde_json::to_vec(&resp)?;
+        out.push(b'\n');
+        w.write_all(&out).await?;
     }
     Ok(())
 }
