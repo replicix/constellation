@@ -27263,7 +27263,7 @@ Plan 30 is done: M0–M16 are on main, and the plan moved to
 Its [§7 Close-out](done/30-write-path-resilience-and-scale-out.md#7-close-out)
 records what each milestone delivered, where the build deviated from
 the plan, what is left open, and the verification record (the local
-gates on `7dfc05b` and `5437fa6`, the EC2 brutal, OVH brutal and round 3
+gates on `7dfc05b`, `5437fa6` and `361ab50`, the EC2 brutal, OVH brutal and round 3
 runs, and EC2/OVH campaigns 4–8).
 
 | Item | State | Where |
@@ -27277,17 +27277,24 @@ runs, and EC2/OVH campaigns 4–8).
 
 - [x] Every milestone M0–M16 committed (plan §7.1)
 - [x] ADRs 18–30, reference pages, `configuration.md`, DESIGN.md
-- [x] Real-S3 verification on AWS and OVH (plan §7.4). Campaign 8 was
-  still running at close-out; its Parts C–E measurements go into
-  `bench/remote/RESULTS.md` when its report is final
+- [x] Real-S3 verification on AWS and OVH (plan §7.4). Campaign 8
+  completed on 2026-09-28 (all five parts, both backends); its
+  measurements are in `bench/remote/RESULTS.md`
 - [x] `cto` default decided (ADR-30)
-- [ ] A full gate run on main after `efea39f`/`de835b3`: the last full
-  gate (`5437fa6`) was not green, and its two findings have since been
-  fixed and rerun as targeted tests only
-- [ ] Open real-S3 findings (plan §7.3): campaign 8 A-1 (OVH S3-cut
-  `create` in doubt for 120 s), campaign 8 B-1 (stale-HEAD rate), the
-  60 s first failover on a fresh filesystem, round 3's `rename_unlink`
-  p99
+- [x] A full gate run on main after `efea39f`/`de835b3`: `361ab50`,
+  green (`constellation-m14/GATE-REPORT-361ab50….md`). The `5437fa6`
+  gate was not green; its two findings (the
+  `commit-strips-pending-upload` stale-view check → `de835b3`, sim seed
+  70232 → `efea39f`) passed there
+- [x] Campaign 8's findings resolved (plan §7.3): A-1 (S3-cut `create`
+  in doubt for 120 s after a holder restart, not OVH-specific) fixed in
+  `62268ff`; B-1 (stale-HEAD rate) a worker metric artifact, with the
+  lock fairness it exposed fixed in `27941de` and diagnosed by
+  `3fc395c`
+- Still open, as plan §7.3 lists them: its known limits, and the older
+  real-S3 findings (the 60 s first failover on a fresh filesystem,
+  round 3's `rename_unlink` p99, OVH scale, a trustworthy failover
+  distribution)
 
 ## Campaign 8 B-1: the "stale local HEAD at turn start" rate
 

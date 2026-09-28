@@ -259,12 +259,21 @@ each run found, and the commits that fixed it, is in plan 30
 | Campaign 4 | 2026-09-25 | `edd3d5d` | AWS; OVH for the soak and part of Part A |
 | Campaign 5 | 2026-09-25/26 | `5face1b`, `ee3f65b` | both (git under `flock` only) |
 | Campaign 6 | 2026-09-26/27 | `216ce6c` (Parts A–C), `7a681ee` then `a432373` (Part D) | both |
+| Campaign 7 | 2026-09-27/28 | `2ff95df` (Parts A, B, D), `cb847f8` (Parts C, E) | both |
+| Campaign 8 | 2026-09-28 | `5437fa6` (Parts A–E) | both |
 
 The campaign 6 report names `a432373` for Part C, but Part C ran on
 2026-09-26, before that commit existed; by date it ran `216ce6c`. `7a681ee`
 changed only docs over `a1bed13`.
-| Campaign 7 | 2026-09-27/28 | `2ff95df` (Parts A, B, D), `cb847f8` (Parts C, E) | both |
-| Campaign 8 | 2026-09-28 | `5437fa6` | both; **in progress**, measurements pending |
+
+Campaign 8's two findings are resolved. A-1, a 120 s `create` on an
+S3-cut node, was not OVH-specific; it is fixed in `62268ff` (see
+"Failover time" below). B-1, a rise in the git worker's "stale HEAD at
+turn start" rate, was a metric artifact: the worker compared its `HEAD`
+with the other committer's marker, and its `HEAD` was always the latest
+commit by anyone. The turn-hogging it exposed led to `27941de` (the
+lock queue is served in arrival order), with lock-fairness diagnostics
+in `3fc395c`.
 
 ### Failover time
 
@@ -278,7 +287,8 @@ these are seal-based takeovers.
 | Campaign 6 D1 | `7a681ee` | AWS | p50 3.90 s, mean 9.24 s; round 0 59.79 s, rounds 1–9 2.5–4.1 s | round 0 is the first failover on a fresh filesystem; unexplained |
 | Campaign 6 D1 | `7a681ee` | OVH | round 0 59.82 s, round 1 6.0 s | **unreliable**: 8 of 10 rounds recorded "no holder found" (driver bug) |
 | Campaign 7 E1 | `cb847f8` | both | nominal p50 2.66 s, p99 2.79 s from 5 AWS rounds | **unreliable**: the driver waited for one fixed survivor to become holder and misread fast remounts as failures |
-| Campaign 8 E | `5437fa6` | both | pending | corrected driver |
+| Campaign 8 E | `5437fa6` | AWS | p50 2.60 s, max 2.63 s from 5 of 10 rounds; all 10 remounts succeeded (2.50–2.65 s) | **unreliable**: the same method as campaign 7 (poll one fixed survivor for `lease.held`), so only the rounds where that survivor became holder have a time |
+| Campaign 8 E | `5437fa6` | OVH | p50 3.52 s, max 3.57 s from 5 of 10 rounds; all 10 remounts succeeded (5.99–6.37 s) | **unreliable**: the same |
 
 Related availability measurements:
 
@@ -289,13 +299,25 @@ Related availability measurements:
 | | Campaign 8, `5437fa6` | 0.46 s | 0.86 s |
 | S3 cut on one node; create+write+`fsync`+close on it | EC2/OVH brutal, `b4e7cbe-dirty` | blocked for the outage (75–90 s) | blocked for the outage (85 s+) |
 | | Campaign 7, `2ff95df` | 6.1 s | 6.7 s |
-| | Campaign 8, `5437fa6` | 6.46 s | 120 s, `EIO` (open finding A-1) |
+| | Campaign 8, `5437fa6` | 6.46 s | 120 s, `EIO` (finding A-1) |
+| The same, right after a holder restart (the A-1 timing) | A-1 rerun, main before `62268ff` | 120 s, `EIO` | 120 s, `EIO` |
+| | A-1 rerun, `62268ff` | create 0.25 s (close 6.0 s) | create 1.0 s (close 6.2 s) |
 | `kill -9` + remount, 20 rounds | Campaigns 7 (`2ff95df`) and 8 (`5437fa6`) | 20/20, no zombies; ~7.5 s per round in campaign 8 | the same |
 
 The brutal runs' majority-side stall was not a failover: an isolated
 node's inbox escalation made the healthy holder release its lease
 (fixed in `71dc7e7`). The S3-cut stall was a close uploading inline; a
 node with no S3 now hands its chunks to a peer (`71dc7e7`).
+
+Campaign 8's 120 s `create` on OVH (finding A-1) was not OVH-specific.
+The lease holder had restarted about 1.5 s before the cut; the cut node
+forwarded over a stale pooled connection to the old holder, and then
+waited on a lease path that only S3 could advance. Rebuilding that state
+on purpose gave the same 120 s `EIO` on AWS. `62268ff` keeps a node
+without S3 forwarding over P2P and has a restarted holder re-adopt its
+lease when a forward arrives. The A-1 reruns used the campaign's cut on
+the same four hosts, with `CONSTELLATION_BACKUPS=0`; details are in
+PROGRESS.md ("Fix: a create on an S3-cut node sat in doubt for 120 s").
 
 ### Visibility latency
 
@@ -316,21 +338,23 @@ the writer's write, so on OVH it includes the writer's own close (one
 | Campaign 7 Part A | `2ff95df` | 500 | 33.4 ms / 56.0 ms | 210 ms / 298 ms | 0 timeouts |
 | Campaign 7 E2 | `cb847f8` | 200 | writer 29.6 / 76.3 ms; poller 59.0 / 113.9 ms | writer 209.7 / 347.8 ms; poller 272.5 / 668.9 ms | 0 timeouts |
 | Campaign 8 Part A | `5437fa6` | 500 | 33.6 ms / 53.0 ms | 216 ms / 247 ms | 0 timeouts |
+| Campaign 8 E | `5437fa6` | 200 | writer 30.4 / 98.2 ms; poller 61.1 / 123.0 ms | writer 210 / 305 ms; poller 272 / 683 ms | 0 timeouts |
 
 ### S3 requests per operation
 
-Campaign 7 E3 (`cb847f8`): requests per 100 operations, as the report
-gives them (GET / HEAD / PUT / LIST).
+Requests per 100 operations (GET / HEAD / PUT / LIST): campaign 7 E3
+(`cb847f8`) as its report gives them, campaign 8 E (`5437fa6`) from its
+`e_s3_by_op_*.json` deltas. Campaign 8 counted no DELETEs.
 
-| Operation | AWS | OVH |
-|---|---|---|
-| create | 45 / 6 / 111 / 13 | 45 / 6 / 110 / 14 |
-| write | 57 / 8 / 115 / 13 | 56 / 6 / 114 / 11 |
-| read | 9 / 0 / 2 / 13 | 21 / 4 / 6 / 12 |
-| stat | 4 / 0 / 1 / 12 | 5 / 0 / 1 / 13 |
-| readdir | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
-| rename | 45 / 6 / 92 / 13 | 45 / 6 / 90 / 12 |
-| unlink | 45 / 6 / 93 / 12 | 42 / 4 / 90 / 14 |
+| Operation | AWS, campaign 7 | AWS, campaign 8 | OVH, campaign 7 | OVH, campaign 8 |
+|---|---|---|---|---|
+| create | 45 / 6 / 111 / 13 | 44 / 6 / 111 / 12 | 45 / 6 / 110 / 14 | 45 / 6 / 111 / 11 |
+| write | 57 / 8 / 115 / 13 | 45 / 6 / 111 / 12 | 56 / 6 / 114 / 11 | 45 / 8 / 114 / 12 |
+| read | 9 / 0 / 2 / 13 | 20 / 2 / 4 / 12 | 21 / 4 / 6 / 12 | 19 / 2 / 4 / 12 |
+| stat | 4 / 0 / 1 / 12 | 5 / 0 / 1 / 12 | 5 / 0 / 1 / 13 | 6 / 0 / 2 / 12 |
+| readdir | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| rename | 45 / 6 / 92 / 13 | 44 / 6 / 82 / 12 | 45 / 6 / 90 / 12 | 45 / 6 / 84 / 12 |
+| unlink | 45 / 6 / 93 / 12 | 33 / 4 / 86 / 12 | 42 / 4 / 90 / 14 | 31 / 4 / 83 / 12 |
 
 Earlier runs (EC2 brutal R2-2,
 campaigns 4 and 6) had no request counters and reported
@@ -349,6 +373,7 @@ Four mounted, idle nodes. S3 requests per minute per node.
 | Harness `idle-cost` | before `71dc7e7` | holder 237, followers 144 | local; registry GETs for every record every 5 s |
 | Harness `idle-cost` | `71dc7e7` | holder 27, followers 29.5 | local |
 | Campaign 7 E4, 15 min | `cb847f8` | AWS 26.3–28.1; OVH 25.7–27.7 | |
+| Campaign 8 E, 15 min | `5437fa6` | AWS 26.3–28.0; OVH 25.7–27.2 | the top figure is node a, the lease holder for most of the window |
 | EC2 brutal R2-2, 616 s | `b4e7cbe-dirty` | 5.4–6.0 ship rounds and ~1.5 reconcile rounds per minute | **proxy** |
 | Campaign 4, 300 s | `edd3d5d` | 6.2–6.6 ship rounds per minute | **proxy** |
 | Campaign 6 D4, 15 min | `7a681ee`/`a432373` | AWS 6.0–39.3, node b 185.5; OVH 8.3–9.5, node b 233.7 ship rounds per minute | **proxy**; node b's outlier unexplained (it had the wedged daemon earlier in that run) |
@@ -365,7 +390,7 @@ commit-chain poll and the lease renewals.
 | Campaign 4 | `edd3d5d` | close-to-open probe: write+close on A, then open+read on B | — | 0 stale in 1000 iterations (AWS) and 300 (OVH); p50 821 ms (AWS) and 1144 ms (OVH) per iteration, including the driver's round trips |
 | Campaign 6 D5 | `7a681ee`, both | 1000 warm `stat`s on one node | p50 0.006 ms; p99 0.47 ms (AWS), 0.53 ms (OVH) | p50 0.006–0.007 ms; p99 0.63 ms (AWS), 0.37 ms (OVH) |
 | Campaign 7 E5 | `cb847f8`, both | 30 warm `stat`s | 1.17 ms (AWS), 1.07 ms (OVH) | 10.15 ms (AWS), 10.19 ms (OVH) |
-| Campaign 8 E | `5437fa6` | | pending | pending |
+| Campaign 8 E | `5437fa6`, both | 30 warm `stat`s | 1.28 ms (AWS), 1.09 ms (OVH) | 9.58 ms (AWS), 9.14 ms (OVH) |
 
 Campaign 6's run was on a lone node, which is its own sequencer, so
 `strict` added nothing. Campaign 7's report gives each figure for the
@@ -373,6 +398,7 @@ Campaign 6's run was on a lone node, which is its own sequencer, so
 (0.04 against 0.34 ms). That is the ~9× behind keeping `bounded` as the
 default
 ([ADR-30](../../docs/explanation/DECISIONS.md#adr-30---cto-bounded-stays-the-default)).
+Campaign 8 measured 7.5× (AWS) and 8.4× (OVH).
 
 ### Untar: default (`through`) vs `--write-mode back`
 
@@ -385,7 +411,8 @@ default
 | Campaign 6 D6 | the same | the same, `back` | all in 21.7 s (810 files/s), 5 ship rounds | all in 140.0 s (125 files/s), 8 ship rounds |
 | Campaign 7 E6 | `cb847f8` | the same, default | done in ~10 min 13 s (~29 files/s; includes `fs create` and mount) | 6,504 files in 1200 s, not finished (~5.4 files/s) |
 | Campaign 7 E6 | `cb847f8` | the same, `back` | copy done; the `umount` drain passed the driver's 60 s | not reached |
-| Campaign 8 E | `5437fa6` | the same, both modes | pending | pending |
+| Campaign 8 E | `5437fa6` | the same, default | all 17,559 in 594.4 s (~29.5 files/s); `umount` clean | not finished at the 3600 s bound: the report puts it at ~16,018 of 17,559 files, still progressing (~4.4 files/s) |
+| Campaign 8 E | `5437fa6` | the same, `back` | all 17,559 in 115.5 s (~152 files/s); the `umount` drain passed the driver's 180 s bound, still uploading (15,148 of 17,493 chunks), and the driver killed it | all 17,559 in 110.4 s (~159 files/s); `umount` clean within 180 s |
 
 Under `through` (the default), each file with new content pays its
 chunk's S3 PUT in `close()`. Since `4798008` that is one request per
@@ -394,6 +421,9 @@ runs at about one PUT latency per file: ~35 ms on AWS, ~0.2 s on OVH.
 `back` acknowledges from a durable local queue and uploads in parallel.
 The OVH brutal and round 3 figures predate `edd3d5d` and `4798008`, when
 a non-owner's close also waited for the log.
+Campaign 8's `back` copy on AWS took 115.5 s, against campaign 6's
+21.7 s for the same tree; the campaign 8 report does not examine the
+difference.
 
 ### AWS vs OVH
 
@@ -484,5 +514,12 @@ A `flock`-protected counter with 4 nodes × 4 threads ended at 1000 of
 
 - Delegation throughput on EC2 (plan 30 M11 measured it on one host
   only).
-- Failover time on OVH, and a trustworthy failover distribution on the
-  final binary: campaign 8 Part E was still running.
+- A trustworthy failover distribution. Campaign 8 Part E ran ten holder
+  kills per backend on `5437fa6`, but its driver kept campaign 7's
+  detection method, so only the 5 rounds per backend where the polled
+  survivor became holder have a time (every remount succeeded).
+- How long a `--write-mode back` unmount takes to drain 17,559 files on
+  AWS: campaign 8's driver killed it at its 180 s bound, still
+  uploading.
+- The default-mode untar of the linux headers on OVH to completion: it
+  passed campaign 8's 3600 s bound, still progressing.

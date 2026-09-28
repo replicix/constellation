@@ -1336,17 +1336,33 @@ Not done from the plan's M16 list:
 - The registry LIST every 5 s could move to gossip, with a 30–60 s
   backstop poll (proposed in the idle-cost fix, not done).
 
+Resolved real-S3 findings of campaign 8:
+
+- **A-1 (High), fixed in `62268ff`.** A non-holder whose S3 was cut
+  forwarded a `create` to the holder; the forward sat in `WaitingLease`
+  until the 120 s in-doubt deadline and returned `EIO`. It was first
+  seen on OVH, but it is not OVH-specific. The holder had restarted
+  about 1.5 s before the cut, the requester's pooled connection to it
+  was stale, and the lease path it then waited on only advanced through
+  S3. Rebuilt on purpose, the same state gave a 120 s `EIO` on AWS too.
+  `62268ff` keeps a node without S3 forwarding over P2P and has a
+  restarted holder re-adopt its lease when a forward arrives. On EC2,
+  with the campaign's cut, the create went from 120 s `EIO` to 0.25 s
+  (AWS) and 1.0 s (OVH).
+- **B-1 (informational), a metric artifact.** The git worker's "stale
+  HEAD at turn start" rate rose from 2.4% to 72.7% on AWS (37.5% to
+  66.2% on OVH) between `cb847f8` and `5437fa6`. The worker compared
+  its `HEAD` with the *other* committer's marker, so every turn that
+  followed the same committer's own turn counted; in every flagged turn
+  `HEAD` was the latest commit by anyone, and `session.timeouts` was 0.
+  The turn-hogging it exposed (16–28 s waits while the releaser
+  re-locked) led to `27941de`, which serves the lock queue in arrival
+  order, keeps an unused grant's waiter in place and follows a grant's
+  id change on recall. `3fc395c` added the lock-fairness counters and
+  the gitflock scenarios' fairness report.
+
 Open real-S3 findings:
 
-- **Campaign 8 A-1 (High, OVH only, open).** A non-holder whose S3 was
-  cut forwarded a `create` to the holder. The forward sat in
-  `WaitingLease` until the 120 s in-doubt deadline and returned `EIO`.
-  The same test on AWS completed in 6.5 s.
-- **Campaign 8 B-1 (informational, open).** The git worker's "stale
-  HEAD at turn start" rate rose from 2.4% to 72.7% on AWS (37.5% to
-  66.2% on OVH) between `cb847f8` and `5437fa6`. The causal reader saw
-  0 violations. Needs a design check against the session changes in
-  `2929121`/`5437fa6`.
 - **First-failover outlier (open).** Campaign 6 D1: the first holder
   kill on a fresh filesystem took 59.8 s on both backends. Later rounds
   took 2.5–4.1 s. Not investigated; campaign 4's run did not show it.
@@ -1354,11 +1370,12 @@ Open real-S3 findings:
   against `5384772`. Not investigated.
 - **Scale on OVH.** A fresh mount of a 200k-entry namespace did not
   finish within 600 s (campaign 6 C2). Not rerun.
-- **Measurements still missing.** Failover time on OVH, and a
-  trustworthy failover distribution on the final binary: campaign 7's
-  E1 driver was flawed. Campaign 7's retention-gap rebuild test did not
-  force a gap. Campaign 8 Parts C–E cover all three; they were still
-  running when this was written.
+- **Measurements still missing.** A trustworthy failover distribution:
+  campaign 8 Part E timed ten holder kills per backend on `5437fa6`
+  (p50 2.60 s AWS, 3.52 s OVH; every remount succeeded), but kept
+  campaign 7's detection method, so only 5 of 10 rounds per backend
+  have a time. Campaign 8 Part D did force a retention-gap rebuild on
+  both backends, with no data loss.
 
 ### 7.4 Verification record
 
@@ -1386,8 +1403,19 @@ the repo):
     (`de835b3`).
   - Everything else was clean: 172 of 175 scenarios, pjdfstest
     8798/8798, smoke, integration, fuzz.
-- After those two fixes, the record has targeted reruns only. A full
-  gate run on current main is still to do.
+- **`361ab50`: green.** The full gate after those two fixes.
+  - fmt and clippy clean; 1349 workspace tests; 138 model tests.
+  - Authority-sim sweeps clean, including `long_locks` at 13 configs ×
+    1000 seeds and `long-delegated-backup` over seeds 70000..80000
+    (seed 70232 included): 0 failing.
+  - 173 of 175 harness scenarios passed; 2 were skipped (no `fio`).
+    `commit-strips-pending-upload` passed 3 of 3.
+  - pjdfstest 8798/8798; smoke and integration passed; truncate fuzz at
+    2000 seeds.
+- `3fc395c`, `62268ff` and `27941de` (campaign 8's lock-fairness
+  diagnostics, A-1 fix and lock-queue fix) came after `361ab50`. Each
+  has its own unit, sim and harness runs in PROGRESS.md, and `62268ff`
+  its EC2 rerun.
 
 **Real-S3 runs** on 4 × c5n.2xlarge in us-west-2 (three AZs), against
 AWS S3 in us-west-2 and OVH Object Storage in Milan. Reports are in
@@ -1403,4 +1431,4 @@ AWS S3 in us-west-2 and OVH Object Storage in Milan. Reports are in
 | Campaign 5 (09-25/26, `5face1b`, `ee3f65b`) | git under `flock`, paced and back to back, with faults | Paced run clean on both backends; 0 dangling commits; fresh-node bootstraps exact | `index.lock` stall (grants lapsed under a delegate) → `a1bed13`. Stale reads and the "fork" were a worker artifact. Access key logged → `7da859b` |
 | Campaign 6 (09-26/27, `216ce6c`, `7a681ee`, `a432373`) | Races, lock recovery, 2 h soak, scale, measurements | Soak converged byte for byte; 199,992 files; `back` untar 29× faster than `through` on AWS | Zombie daemon wedged `daemon.lock` → `a432373`, `b2c3436`. OVH visibility 95 s was a wedged poller node, but the work found real S3 waits → `7dfc05b`. SQLite EIO under a delegate → `a1bed13`. First-failover 60 s outlier open |
 | Campaign 7 (09-27/28, `2ff95df`, `cb847f8`) | Races, git under `flock`, GC/retention, 3 h soak, measurements | Parts A and D passed, except that the retention-gap test did not force a gap; the soak converged; visibility p50 33 ms AWS / 210 ms OVH; strict ~9× bounded on `stat` | `mount` CLI hang (the reaper inherited the status pipe) → `cb847f8`. "Ref before objects" was the checkpoint snapshotting a turn in flight; causal checks added in `2929121`. Permanent read wait after restarts → `5437fa6`. Failover driver unreliable |
-| Campaign 8 (09-28, `5437fa6`) | Campaign 7 repeated with hardened drivers | **In progress.** Part A clean on AWS; Part B: 0 causal violations and 0 ref regressions on both backends | A-1 (OVH S3-cut `create` 120 s) and B-1 (stale-HEAD rate) open, §7.3 |
+| Campaign 8 (09-28, `5437fa6`) | Campaign 7 repeated with hardened drivers: races, git under `flock`, 3 h soak, forced retention-gap rebuild, measurements | All five parts completed on both backends. Parts B and C converged, including fresh S3 bootstraps; Part D's forced retention-gap rebuild lost nothing; 0 causal violations and 0 ref regressions; 20/20 kill-9/remount cycles; strict 7.5–8.4× bounded on `stat`; `back` untar in 110–116 s where the default took 594 s (AWS) or did not finish in an hour (OVH) | A-1 (S3-cut `create` in doubt for 120 s after a holder restart; not OVH-specific) → `62268ff`. B-1 (stale-HEAD rate) was a worker metric artifact; the turn-hogging it showed → `27941de`, diagnostics `3fc395c`. Failover driver still unreliable |
