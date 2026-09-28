@@ -376,21 +376,21 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
         if n == 0 {
             break; // clean EOF: the peer closed the connection
         }
-        if !buf.ends_with(b"\n") {
-            // No delimiter within the cap. Either the peer closed mid-line
-            // (nothing complete to answer) or it is deliberately holding
-            // the connection open with an over-long line; in the latter
-            // case tell it why before closing, then stop reading.
-            if buf.len() as u64 > MAX_REQUEST_LINE {
-                let resp = Response::Error {
-                    message: format!(
-                        "request line exceeds the {MAX_REQUEST_LINE}-byte limit; closing connection"
-                    ),
-                };
-                let mut out = serde_json::to_vec(&resp)?;
-                out.push(b'\n');
-                let _ = w.write_all(&out).await;
-            }
+        // No delimiter within the cap: either an over-long line the peer
+        // is holding the connection open with (tell it why, then stop
+        // reading), or the peer's last request, sent without a trailing
+        // newline before it closed its side — answered like any other,
+        // as the line reader this replaced did.
+        let last = !buf.ends_with(b"\n");
+        if last && buf.len() as u64 > MAX_REQUEST_LINE {
+            let resp = Response::Error {
+                message: format!(
+                    "request line exceeds the {MAX_REQUEST_LINE}-byte limit; closing connection"
+                ),
+            };
+            let mut out = serde_json::to_vec(&resp)?;
+            out.push(b'\n');
+            let _ = w.write_all(&out).await;
             break;
         }
         let line = String::from_utf8_lossy(&buf);
@@ -407,6 +407,9 @@ async fn handle(stream: UnixStream, source: Arc<dyn StatusSource>) -> Result<()>
         let mut out = serde_json::to_vec(&resp)?;
         out.push(b'\n');
         w.write_all(&out).await?;
+        if last {
+            break;
+        }
     }
     Ok(())
 }
@@ -631,6 +634,26 @@ mod tests {
         fn cache_prune(&self, target_bytes: u64) -> std::result::Result<String, String> {
             Ok(format!("pruned to {target_bytes} bytes"))
         }
+    }
+
+    /// A client's last request may arrive without a trailing newline,
+    /// followed by end of stream; it is answered like any other.
+    #[tokio::test]
+    async fn a_final_request_without_a_newline_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = serve(dir.path(), Arc::new(Fake)).unwrap();
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(&serde_json::to_vec(&Request::Ping).unwrap())
+            .await
+            .unwrap();
+        w.shutdown().await.unwrap();
+        let line = BufReader::new(r).lines().next_line().await.unwrap();
+        let line = line.expect("the unterminated request must still be answered");
+        assert!(matches!(
+            serde_json::from_str::<Response>(&line).unwrap(),
+            Response::Pong
+        ));
     }
 
     #[tokio::test]

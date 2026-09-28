@@ -353,18 +353,45 @@ impl Pool {
 /// [`Pool::evict`]), and on an inbound one — a peer dialing us afresh
 /// may be a new incarnation behind a connection we still pool — has the
 /// pooled connection probed.
+///
+/// An inbound handshake completes before any allowlist check: the QUIC
+/// handshake proves only that the peer holds *some* key, and the
+/// registry check happens later, in the ALPN handler. Tracking every
+/// inbound connection here would let anyone who can reach the endpoint
+/// grow [`Pool::tracked`] without bound — one entry per fresh random
+/// key, each pinning its dead connection's allocation through the weak
+/// handle — before ever being refused. So an inbound connection is
+/// tracked and probed only when its key is already on the allowlist;
+/// a peer that enrolled since the last registry read is admitted by the
+/// handler's refresh as before, and its restart, if any, is caught by
+/// the registry path (`Peers::refresh_registry` → `suspect_restart`).
 #[derive(Debug)]
-struct InboundWatch(Weak<Pool>);
+struct InboundWatch {
+    pool: Weak<Pool>,
+    allow: Weak<Mutex<Allowlist>>,
+}
 
 impl iroh::endpoint::EndpointHooks for InboundWatch {
     fn after_handshake<'a>(
         &'a self,
         conn: &'a iroh::endpoint::Connection,
     ) -> impl std::future::Future<Output = iroh::endpoint::AfterHandshakeOutcome> + Send + 'a {
-        if let Some(pool) = self.0.upgrade() {
-            pool.track(conn);
-            if conn.side() == iroh::endpoint::Side::Server {
-                pool.suspect(conn.remote_id(), Suspicion::Restarted);
+        if let Some(pool) = self.pool.upgrade() {
+            let inbound = conn.side() == iroh::endpoint::Side::Server;
+            // `contains`, not `check`: the handler's own `check` must be
+            // the one that arms the miss-refresh cooldown.
+            let known = !inbound
+                || self.allow.upgrade().is_some_and(|allow| {
+                    allow
+                        .lock()
+                        .unwrap()
+                        .contains(&crate::identity::hex32(conn.remote_id().as_bytes()))
+                });
+            if known {
+                pool.track(conn);
+                if inbound {
+                    pool.suspect(conn.remote_id(), Suspicion::Restarted);
+                }
             }
         }
         async { iroh::endpoint::AfterHandshakeOutcome::accept() }
@@ -925,6 +952,7 @@ impl P2p {
     pub async fn spawn_with(key: SecretKey, topic: TopicId, relay: RelayPolicy) -> Result<Self> {
         let lookup = MemoryLookup::new();
         let pool = Arc::new(Pool::new(key.clone()));
+        let allow = Arc::new(Mutex::new(Allowlist::new()));
         let relay_mode = relay.to_iroh()?;
         let relay_label = relay.label();
         let endpoint = Endpoint::builder(presets::Minimal)
@@ -935,7 +963,10 @@ impl P2p {
             .secret_key(key.clone())
             .address_lookup(lookup.clone())
             .alpns(vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()])
-            .hooks(InboundWatch(Arc::downgrade(&pool)))
+            .hooks(InboundWatch {
+                pool: Arc::downgrade(&pool),
+                allow: Arc::downgrade(&allow),
+            })
             .bind()
             .await
             .context("binding the iroh endpoint")?;
@@ -947,7 +978,7 @@ impl P2p {
             gossip,
             topic,
             key,
-            allow: Arc::new(Mutex::new(Allowlist::new())),
+            allow,
             lookup,
             sender: Arc::new(tokio::sync::Mutex::new(None)),
             pool,
@@ -1332,6 +1363,12 @@ impl P2p {
                 *slot = None;
             }
         }
+    }
+
+    /// How many remote endpoint ids have a tracked connection.
+    #[cfg(test)]
+    pub(crate) fn tracked_peers(&self) -> usize {
+        self.pool.tracked.lock().unwrap().len()
     }
 
     #[cfg(test)]

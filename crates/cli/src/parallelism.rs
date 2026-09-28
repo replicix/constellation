@@ -2,7 +2,7 @@
 
 use std::num::NonZeroUsize;
 
-const FUSE_THREAD_HARD_MAX: usize = 64;
+pub(crate) const FUSE_THREAD_HARD_MAX: usize = 64;
 const TOKIO_THREAD_HARD_MAX: usize = 32;
 const BLOCKING_THREAD_HARD_MAX: usize = 256;
 const FUSE_BUFFER_BYTES: u64 = 16 * 1024 * 1024;

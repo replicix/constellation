@@ -347,14 +347,14 @@ pub async fn registry_scan(store: &dyn ObjectStore) -> Result<RegistryScan, Stor
     let mut records = Vec::new();
     for m in metas {
         // Only objects whose key is a node id are registry records.
-        let is_node_record = m
+        let Some(key_id) = m
             .location
             .filename()
             .and_then(|f| f.strip_suffix(".json"))
-            .is_some_and(|stem| u64::from_str_radix(stem, 16).is_ok());
-        if !is_node_record {
+            .and_then(|stem| u64::from_str_radix(stem, 16).ok())
+        else {
             continue;
-        }
+        };
         let key = m.location.to_string();
         if let Some(info) =
             record_key(store, &m).and_then(|k| record_cache().lock().unwrap().get(&k).cloned())
@@ -364,6 +364,19 @@ pub async fn registry_scan(store: &dyn ObjectStore) -> Result<RegistryScan, Stor
         }
         // A torn read is re-read (`crate::control`).
         let read = match read_record(store, &m.location).await {
+            // `claim_node_id` makes the *key* unique; the body's `node_id`
+            // is what every reader keys on. A record whose body names a
+            // different node than its key is not that node's record —
+            // whichever node wrote it — and must not be able to stand in
+            // for one (the peer directory would route "node N" to it).
+            Ok(Some((info, _))) if info.node_id != key_id => {
+                tracing::warn!(
+                    key,
+                    claimed = info.node_id,
+                    "ignoring a registry record whose node id does not match its key"
+                );
+                continue;
+            }
             Ok(Some((info, meta))) => {
                 if let Some(k) = record_key(store, &meta) {
                     let mut cache = record_cache().lock().unwrap();
@@ -533,6 +546,24 @@ mod tests {
     /// A torn registry GET (see `crate::control`) is re-read: it must not
     /// drop a live peer from `list_nodes`, fail the fail-closed roster,
     /// or make `publish_p2p` refuse.
+    /// A registry object whose body claims another node's id is ignored:
+    /// only the record at `nodes/<id>.json` speaks for node `id`.
+    #[tokio::test]
+    async fn a_record_claiming_another_nodes_id_is_ignored() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let id = claim_node_id(store.clone()).await.unwrap();
+        let own = object_store::path::Path::from(format!("nodes/{id:08x}.json"));
+        let body = store.get(&own).await.unwrap().bytes().await.unwrap();
+        // The same body, at a key for a node that never claimed anything.
+        let forged = object_store::path::Path::from(format!("nodes/{:08x}.json", id + 0xfe));
+        store
+            .put(&forged, object_store::PutPayload::from(body))
+            .await
+            .unwrap();
+        assert_eq!(write_eligible_roster(store.clone()).await.unwrap(), vec![id]);
+        assert_eq!(list_nodes(store.clone()).await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn torn_registry_reads_are_re_read() {
         use crate::faulty::{Calls, Fault, FaultyStore, OpKind};

@@ -147,6 +147,97 @@ structurally valid), matching the existing `fuse_watch` convention.
   through a saturating `size_delta`, so a hostile inode `size` near `u64::MAX`
   can neither go silently negative nor panic at `i64::MIN`.
 
+## Round two
+
+A second pass over what the first round had not covered: the direct-stream
+P2P handlers whose identity fields were left unbound, the pre-authentication
+QUIC handshake path, the E2E encryption layer, every remaining object read
+back from the bucket (`meta.json`, the node registry, leases, designations,
+snapshots, the GC pointer, heartbeats, delegation tables), an adversarial
+review of the round-one diff itself, and `cargo audit` against the lockfile.
+
+### 7. `meta.json` chunk size trusted on load (HIGH)
+
+`crates/store-s3/src/store.rs`. `validate_chunk_size` ran only at `fs create`;
+`load_fs` returned whatever the bucket held. Every read and write path divides
+by `chunk_size` (`ChunkLayout::chunk_count`/`slices`, and the FUSE write path
+directly), so `"chunk_size": 0` in a corrupt or hostile `meta.json` panicked
+each node the moment it touched a file — a cluster-wide crash loop from one
+object — and `u32::MAX` drove 4 GiB allocations per chunk read.
+
+Fix: validate on load; an invalid `meta.json` fails the mount with an error.
+
+### 8. P2P identity binding, completed (MEDIUM)
+
+`crates/net/src/peers.rs`. Round one bound the claimed node id to the signing
+key for four message types; every other request that names its sender
+(`BackupAppend.holder`, `DelegRecall.root`, `LockRecall.owner`,
+`ReadRecall.holder`, `DelegateStream.from`, `EpochPropose.proposer`, …) still
+reached its handler unchecked. Every constructor fills these fields with the
+sending node's own id, so a mismatch is only ever a forgery. The check now
+runs once at dispatch for all of them (`claimed_node_id`), where the
+authenticated identity lives, instead of handler by handler.
+
+Also fixed: the binding looked the sender up in the *dial* directory, which
+omits a peer whose registry address does not parse even though it stays on
+the allowlist — such a peer's forwarded writes would have been dropped as
+forged. Identity now resolves through a separate key→node map built from
+every registry record.
+
+### 9. Pre-authentication connection tracking (MEDIUM)
+
+`crates/net/src/endpoint.rs`. The QUIC handshake completes before the
+allowlist check (which happens in the ALPN handler), and the after-handshake
+hook tracked every inbound connection for later eviction — keyed by the
+remote's key, holding a weak handle that pins the dead connection's
+allocation. Anyone who could reach the endpoint could grow that map without
+bound, one fresh random key per connection, before ever being refused. Inbound
+connections are now tracked only when their key is already on the allowlist.
+
+### 10. Registry and designation records trusted their body over their key (MEDIUM)
+
+`crates/store-s3/src/nodes.rs`, `designation.rs`. `claim_node_id` makes the
+registry *key* unique, but readers keyed on the body's `node_id`, so a second
+object claiming an existing node's id could take over that id in the peer
+directory (routing "node N" to another endpoint). Likewise a designation
+stored at any key other than its own path's hash counted in every overlap
+check yet could never be released — a permanent, cheap `offline <path>`
+denial. Both readers now ignore a record whose body does not match its key
+(as `heartbeat.rs` already did).
+
+### 11. Unchecked epoch arithmetic on bucket-writable fields (MEDIUM)
+
+`lease.rs`, `gc.rs`, `cli/singleton.rs`. `epoch + 1` on a lease or GC pointer
+read from the bucket; release builds have no overflow checks, so an object at
+`u64::MAX` wrapped the fencing epoch to 0 on the next takeover. Leases past
+`MAX_EPOCH` (half the range) are now refused on read, the GC bump is checked,
+and status arithmetic on `expires_unix_ms` saturates. `SnapshotStore::get`
+also gained the version check `list` already had.
+
+### Review of the round-one diff
+
+An adversarial re-read of every round-one hunk against the surrounding code
+found no security regression and independently re-derived two of the claims
+(the LEB128 minimality proof behind the varint check; the 35-byte tree-entry
+minimum, byte for byte from the encoder). Three follow-ups were taken:
+
+- The Unix control socket's new capped reader dropped, without a reply, a
+  final request sent without a trailing newline before the peer closed —
+  behaviour the `lines()` reader it replaced did not have. No client in the
+  tree does this; it is now answered like any other request.
+- The usage counter's `AtomicI64::fetch_add` wrapped silently, so two
+  hostile records with `size` near `u64::MAX` — each clamped individually by
+  `size_delta` — could still wrap the total to a plausible wrong value. It now
+  saturates.
+- The API's `fuse_threads` band (1..=1024) was 16× looser than the CLI's own
+  hard cap; both now use `FUSE_THREAD_HARD_MAX` (64).
+
+### 12. Dependencies (MEDIUM)
+
+`cargo audit` (which the first round's research had summarized incorrectly):
+`rustls 0.23.43` was vulnerable to RUSTSEC-2026-0285 (fixed in 0.23.45), and
+`chacha20 0.10.1`, under the E2E AEAD, was yanked. Both bumped in the lockfile.
+
 ## Fuzzing campaign
 
 14 targets over the untrusted decoders, ~44 min of wall time (5–7 min per

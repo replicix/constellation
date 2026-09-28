@@ -116,6 +116,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "store_control_json"
+path = "fuzz_targets/store_control_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "api_request"
 path = "fuzz_targets/api_request.rs"
 test = false

@@ -119,6 +119,13 @@ struct Inner {
     p2p: P2p,
     node_id: u64,
     peers: Mutex<HashMap<u64, Peer>>,
+    /// Every enrolled key (lowercase hex) → its registry node id, including
+    /// records `peers` leaves out: our own, and peers whose address did not
+    /// parse. `peers` is the dial directory; this is the identity directory
+    /// the binding checks in [`handle_stream`] consult, so a peer that is
+    /// on the allowlist but not (yet) dialable is still recognized as
+    /// itself when it dials us.
+    ids: Mutex<HashMap<String, u64>>,
     refresher: Mutex<Option<Refresher>>,
     /// One-shot latch for the shared-node-key misconfiguration warning.
     warned_shared_key: std::sync::atomic::AtomicBool,
@@ -136,6 +143,7 @@ impl Peers {
             p2p,
             node_id,
             peers: Mutex::new(HashMap::new()),
+            ids: Mutex::new(HashMap::new()),
             refresher: Mutex::new(None),
             warned_shared_key: std::sync::atomic::AtomicBool::new(false),
         });
@@ -222,8 +230,10 @@ impl Peers {
         let own_key = inner.p2p.pubkey_hex();
         let mut allowed = Vec::with_capacity(records.len());
         let mut peers = HashMap::new();
+        let mut ids = HashMap::with_capacity(records.len());
         for rec in records {
             allowed.push(rec.pubkey_hex.clone());
+            ids.insert(rec.pubkey_hex.to_ascii_lowercase(), rec.node_id);
             if rec.node_id == inner.node_id {
                 continue; // never dial ourselves
             }
@@ -286,6 +296,7 @@ impl Peers {
             }
         }
         inner.p2p.set_allowed(allowed);
+        *inner.ids.lock().unwrap() = ids;
         *inner.peers.lock().unwrap() = peers;
     }
 
@@ -721,20 +732,7 @@ impl Peers {
     /// Registry node id enrolled under `pubkey_hex`, if any. Used to
     /// refuse gossip that claims to speak for a different node.
     pub fn node_id_for_key(&self, pubkey_hex: &str) -> Option<u64> {
-        let inner = self.inner.as_ref()?;
-        let peers = inner.peers.lock().unwrap();
-        if let Some(p) = peers
-            .values()
-            .find(|p| p.pubkey_hex.eq_ignore_ascii_case(pubkey_hex))
-        {
-            return Some(p.node_id);
-        }
-        drop(peers);
-        inner
-            .p2p
-            .pubkey_hex()
-            .eq_ignore_ascii_case(pubkey_hex)
-            .then_some(inner.node_id)
+        sender_node_id(self.inner.as_ref()?, pubkey_hex)
     }
 
     /// Liveness probe used by continuation epochs. Failure is a missing
@@ -1136,13 +1134,56 @@ async fn handle_conn<S: PeerService>(
 /// payload names a node on whose behalf it claims to act compare against
 /// it, so an enrolled peer cannot speak for another node.
 fn sender_node_id(inner: &Inner, hex: &str) -> Option<u64> {
+    if let Some(id) = inner.ids.lock().unwrap().get(&hex.to_ascii_lowercase()) {
+        return Some(*id);
+    }
+    // Before the first registry read, or for a node whose own record
+    // has not landed yet.
     inner
-        .peers
-        .lock()
-        .unwrap()
-        .values()
-        .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
-        .map(|p| p.node_id)
+        .p2p
+        .pubkey_hex()
+        .eq_ignore_ascii_case(hex)
+        .then_some(inner.node_id)
+}
+
+/// The node a request claims to come from, for every payload that names
+/// one (`requester`, `from`, `holder`, `root`, `owner`, `proposer`,
+/// `node_id`). Every constructor of these fills the field with the
+/// sending node's own id — `Ping`'s is the exception (the pool's probe
+/// sends 0) and so is not listed — so a mismatch with the authenticated
+/// sender is a forgery, whatever the handler would do with it: a
+/// `BackupAppend` from a "holder" that is not the holder, a `LockRecall`
+/// from an "owner" that owns nothing, a `DelegRecall` from a "root".
+/// Checked once in [`handle_stream`], where the sender's identity lives,
+/// rather than handler by handler.
+fn claimed_node_id(payload: &Payload) -> Option<u64> {
+    use Payload::*;
+    Some(match payload {
+        LogSubscribe { requester, .. }
+        | LeaseRequest { requester, .. }
+        | MutateRequest { requester, .. }
+        | ReadIndex { requester, .. }
+        | PromiseRequest { requester, .. }
+        | LockRequest { requester, .. }
+        | LockTest { requester, .. }
+        | ChunkHandoff { requester, .. } => *requester,
+        ChunksDurable { from, .. }
+        | DelegateStream { from, .. }
+        | DelegRenew { from, .. }
+        | DelegBackupAppend { from, .. }
+        | StreamAhead { from, .. }
+        | LockGranted { from, .. }
+        | LockReleased { from, .. }
+        | LockRenew { from, .. }
+        | LockMirror { from, .. } => *from,
+        DelegRecall { root, .. } | DelegSeal { root, .. } => *root,
+        // `BackupAppend::from` is a journal seq; `holder` is the sender.
+        ReadRecall { holder, .. } | BackupAppend { holder, .. } => *holder,
+        LockRecall { owner, .. } => *owner,
+        EpochPropose { proposer, .. } | EpochAbort { proposer, .. } => *proposer,
+        PeerRtts { node_id, .. } => *node_id,
+        _ => return None,
+    })
 }
 
 /// One request/response exchange on its own bidirectional stream.
@@ -1171,6 +1212,20 @@ async fn handle_stream<S: PeerService>(
     if author.as_bytes() != remote_key {
         tracing::warn!(peer = %hex, "dropping frame signed by a different key");
         return Ok(());
+    }
+    // And the node it claims to be must be the node enrolled under that
+    // key: an enrolled peer cannot act on another node's behalf.
+    if let Some(claimed) = claimed_node_id(&payload) {
+        let sender = sender_node_id(inner, hex);
+        if sender != Some(claimed) {
+            tracing::warn!(
+                peer = %hex,
+                claimed,
+                ?sender,
+                "dropping a request that names a node other than its sender"
+            );
+            return Ok(());
+        }
     }
     let kind = match &payload {
         Payload::MutateRequest { .. } => "mutate",
@@ -1429,14 +1484,7 @@ async fn handle_stream<S: PeerService>(
             // Only the proposer itself may abort its proposal: a forged
             // abort would drop a member's promise while the proposer
             // still counts the member's ack.
-            let sender = inner
-                .peers
-                .lock()
-                .unwrap()
-                .values()
-                .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
-                .map(|p| p.node_id);
-            if sender == Some(proposer) {
+            if sender_node_id(inner, hex) == Some(proposer) {
                 service.epoch_aborted(epoch_id, proposer);
             } else {
                 tracing::warn!(peer = %hex, proposer, "dropping an epoch abort not sent by its proposer");
@@ -1482,14 +1530,7 @@ async fn handle_stream<S: PeerService>(
         } => {
             // Fetch from the peer that actually asked, never from a node
             // it names on someone else's behalf.
-            let sender = inner
-                .peers
-                .lock()
-                .unwrap()
-                .values()
-                .find(|p| p.pubkey_hex.eq_ignore_ascii_case(hex))
-                .map(|p| p.node_id);
-            if sender == Some(requester) {
+            if sender_node_id(inner, hex) == Some(requester) {
                 Some(
                     service
                         .chunk_handoff_requested(requester, req_id, hashes)
@@ -2047,6 +2088,63 @@ mod tests {
             service.lease_asks.lock().unwrap().is_empty(),
             "the request must never reach the service"
         );
+        // Nor may the handshake alone leave state behind: an unenrolled
+        // key's connection is not tracked, or anyone who can reach the
+        // endpoint could grow the tracking map one random key at a time.
+        assert_eq!(
+            holder.inner.as_ref().unwrap().p2p.tracked_peers(),
+            0,
+            "an unenrolled key's connection must not be tracked"
+        );
+    }
+
+    /// A request that names a node other than the one enrolled under its
+    /// signing key is dropped before any handler sees it, whatever the
+    /// message; the same peer naming itself gets through.
+    #[tokio::test]
+    async fn a_request_naming_another_node_is_dropped() {
+        let (holder, asker, service) = pair(true).await;
+        let to = holder.node_addr().unwrap();
+        // The asker is node 2. Claiming to be node 3 gets no reply at all.
+        let forged = Payload::LeaseRequest {
+            part: "p0".into(),
+            requester: 3,
+            epoch_applied: None,
+        };
+        assert!(
+            asker.request_raw(to.clone(), &forged).await.is_err(),
+            "a forged request must not be answered"
+        );
+        let own = Payload::LeaseRequest {
+            part: "p0".into(),
+            requester: 2,
+            epoch_applied: None,
+        };
+        assert!(matches!(
+            asker.request_raw(to, &own).await.unwrap(),
+            Payload::LeaseHandoff { released: true, .. }
+        ));
+        assert_eq!(
+            *service.lease_asks.lock().unwrap(),
+            vec![("p0".to_string(), 2)],
+            "only the request naming its real sender reaches the service"
+        );
+    }
+
+    /// A registry record whose address does not parse still enrolls the
+    /// key's node id: the peer is on the allowlist and may dial us, and
+    /// its requests must be recognized as its own, not dropped as forged.
+    #[tokio::test]
+    async fn a_peer_with_an_unparseable_address_still_resolves_to_its_node() {
+        let topic = crate::topic_for(Some(&[5u8; 32]), "fs");
+        let p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let peers = Peers::new(p2p, 1);
+        peers.refresh_registry(vec![(2, "ab".repeat(32), serde_json::json!("not an address"))]);
+        assert_eq!(peers.node_id_for_key(&"AB".repeat(32)), Some(2));
+        assert_eq!(peers.node_id_for_key(&"cd".repeat(32)), None);
+        assert!(peers.snapshot().is_empty(), "not dialable, so not a peer to dial");
     }
 
     /// Serves one fixed chunk, recording how many serves overlapped and

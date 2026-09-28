@@ -113,7 +113,14 @@ impl SnapshotStore {
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        Ok(Some(serde_json::from_slice(&result.bytes().await?)?))
+        let record: SnapshotRecord = serde_json::from_slice(&result.bytes().await?)?;
+        if record.v != SNAPSHOT_RECORD_VERSION {
+            return Err(StoreError::Meta(format!(
+                "snapshot {id} has unsupported version {}",
+                record.v
+            )));
+        }
+        Ok(Some(record))
     }
 
     pub async fn list(&self) -> Result<Vec<SnapshotRecord>, StoreError> {

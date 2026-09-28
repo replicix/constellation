@@ -261,7 +261,13 @@ pub async fn publish_condemned(
                 version: result.meta.version.clone(),
             };
             let current: CondemnedList = serde_json::from_slice(&result.bytes().await?)?;
-            (current.epoch + 1, PutMode::Update(version))
+            // The pointer is plain JSON in the bucket: a corrupt or hostile
+            // epoch at `u64::MAX` must not wrap to 0 (the epoch is what
+            // orders condemned lists) — refuse it instead.
+            let epoch = current.epoch.checked_add(1).ok_or_else(|| {
+                StoreError::Meta("gc/condemned.json: epoch exhausted; the pointer is corrupt".into())
+            })?;
+            (epoch, PutMode::Update(version))
         }
         Err(object_store::Error::NotFound { .. }) => (1, PutMode::Create),
         Err(error) => return Err(error.into()),

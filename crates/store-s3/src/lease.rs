@@ -188,7 +188,10 @@ impl Lease {
         retired.sort_unstable();
         retired.dedup();
         Self {
-            epoch: self.epoch + 1,
+            // Cannot overflow: a lease read from the bucket is refused past
+            // `MAX_EPOCH` (see `LeaseStore::get`), and every epoch in memory
+            // descends from one that was.
+            epoch: self.epoch.saturating_add(1),
             expires_unix_ms: now_ms.min(self.expires_unix_ms),
             released: false,
             wanted_by: Vec::new(),
@@ -273,9 +276,18 @@ impl Lease {
     }
 
     pub fn expires_in_ms(&self, now_ms: i64) -> i64 {
-        self.expires_unix_ms - now_ms
+        // `expires_unix_ms` is whatever the bucket holds; status output
+        // must not panic on an extreme one.
+        self.expires_unix_ms.saturating_sub(now_ms)
     }
 }
+
+/// Largest lease epoch a lease read from the bucket may carry. Epochs
+/// count holder changes, so a real one is nowhere near this; one past it
+/// is corruption or hostile, and accepting it would let the next bump
+/// wrap to a small value that collides with a genuinely old segment's
+/// fencing epoch. Half the range keeps every `+ 1` in the crate exact.
+pub const MAX_EPOCH: u64 = u64::MAX / 2;
 
 /// The version token a swap must match. Thin wrapper so callers never
 /// have to name `object_store` types.
@@ -347,6 +359,12 @@ impl LeaseStore {
         else {
             return Ok(None);
         };
+        if lease.epoch > MAX_EPOCH {
+            return Err(StoreError::Meta(format!(
+                "lease {path}: implausible epoch {}",
+                lease.epoch
+            )));
+        }
         let tag = LeaseTag(UpdateVersion {
             e_tag: meta.e_tag,
             version: meta.version,
@@ -464,6 +482,9 @@ pub async fn live_leases_held_by(
         let Ok(lease) = serde_json::from_slice::<Lease>(&bytes) else {
             continue;
         };
+        if lease.epoch > MAX_EPOCH {
+            continue;
+        }
         if lease.holder == node_id && !lease.is_claimable(now) {
             out.push(lease.partition);
         }
@@ -501,6 +522,37 @@ mod tests {
         assert_eq!(read_tag, tag);
         assert_eq!(faulty.calls(OpKind::Get, "leases"), 2);
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    /// A lease object carrying an epoch no holder change could have
+    /// reached is refused, not bumped past `u64::MAX` by the next takeover.
+    #[tokio::test]
+    async fn an_implausible_lease_epoch_is_refused() {
+        let s = ls(LeaseMode::Cas);
+        let bad = Lease::granted(P, 1, u64::MAX, 1_000);
+        s.store
+            .put(
+                &crate::layout::lease(P),
+                object_store::PutPayload::from(serde_json::to_vec(&bad).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(s.get().await, Err(StoreError::Meta(_))));
+        let fine = Lease::granted(P, 1, MAX_EPOCH, 1_000);
+        s.store
+            .put(
+                &crate::layout::lease(P),
+                object_store::PutPayload::from(serde_json::to_vec(&fine).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(s.get().await.unwrap().unwrap().0.epoch, MAX_EPOCH);
+        assert_eq!(fine.fenced_for_retirement(1, 0).epoch, MAX_EPOCH + 1);
+        assert_eq!(
+            Lease::granted(P, 1, 1, 1).expires_in_ms(i64::MIN),
+            i64::MAX,
+            "status arithmetic saturates on an extreme expiry"
+        );
     }
 
     #[tokio::test]

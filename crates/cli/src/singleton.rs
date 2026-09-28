@@ -79,7 +79,8 @@ impl SingletonLease {
                 (lease, tag)
             }
             Some((previous, tag)) if previous.is_claimable(now) => {
-                let lease = Lease::granted(name, holder, previous.epoch + 1, ttl);
+                // `get` refuses an epoch past `lease::MAX_EPOCH`, so this is exact.
+                let lease = Lease::granted(name, holder, previous.epoch.saturating_add(1), ttl);
                 let tag = leases.try_swap(&lease, &tag).await?;
                 (lease, tag)
             }

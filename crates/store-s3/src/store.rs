@@ -388,6 +388,13 @@ impl ChunkStore {
                 meta.format_version
             )));
         }
+        // `fs create` validated the chunk size it wrote, but what comes
+        // back is whatever is in the bucket now: every read and write path
+        // divides by it (`ChunkLayout`), so a corrupt or hostile `0` would
+        // panic each node the moment it touched a file, and an absurdly
+        // large one drives chunk-sized allocations.
+        constellation_fs_core::validate_chunk_size(meta.chunk_size)
+            .map_err(|e| StoreError::Meta(format!("meta.json: {e}")))?;
         Ok(meta)
     }
 
@@ -1581,6 +1588,30 @@ mod tests {
         assert_eq!(seed.len(), 32);
         assert_ne!(seed, [0u8; 32], "seed must not be all zeroes");
         assert_eq!(a.gossip_seed(), a.gossip_seed(), "stable across calls");
+    }
+
+    /// A `meta.json` whose chunk size no `fs create` could have written is
+    /// refused on load rather than trusted into every `/ chunk_size`.
+    #[tokio::test]
+    async fn meta_json_with_an_invalid_chunk_size_is_refused() {
+        for chunk_size in ["0", "4294967295", "3145728"] {
+            let s = store();
+            let bad = format!(
+                r#"{{"uuid":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","format_version":1,
+                "chunk_size":{chunk_size},"compression":"zstd:3","e2e":false,"created_unix":1}}"#
+            );
+            s.inner()
+                .put(
+                    &object_store::path::Path::from("meta.json"),
+                    PutPayload::from(bad.into_bytes()),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(s.load_fs().await, Err(StoreError::Meta(_))),
+                "chunk_size {chunk_size} must not load"
+            );
+        }
     }
 
     /// A pre-M3.3 `meta.json` has no `gossip_secret`. It must still load

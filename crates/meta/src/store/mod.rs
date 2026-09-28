@@ -261,12 +261,21 @@ impl UsageTracker {
     }
 
     pub fn adjust(&self, d_bytes: i64, d_files: i64) {
-        if d_bytes != 0 {
-            self.bytes.fetch_add(d_bytes, Ordering::Relaxed);
-        }
-        if d_files != 0 {
-            self.files.fetch_add(d_files, Ordering::Relaxed);
-        }
+        // Saturating, not `fetch_add`: atomics wrap silently on overflow
+        // whatever the build profile, and a delta comes from a decoded
+        // record's `size` (clamped to the i64 range by `replay::size_delta`,
+        // but two hostile records still sum past it). A pinned counter
+        // reads as an implausible usage; a wrapped one as a plausible
+        // wrong one.
+        let saturate = |counter: &AtomicI64, delta: i64| {
+            if delta != 0 {
+                let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_add(delta))
+                });
+            }
+        };
+        saturate(&self.bytes, d_bytes);
+        saturate(&self.files, d_files);
     }
 
     pub fn reseat(&self, bytes: u64, files: u64) {
@@ -1615,6 +1624,26 @@ impl Drop for Meta {
     fn drop(&mut self) {
         // Best effort: an orderly close leaves nothing only in OS buffers.
         let _ = self.db.persist(fjall::PersistMode::SyncAll);
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::UsageTracker;
+
+    /// Two deltas that together exceed the i64 range pin the counter at
+    /// the bound instead of wrapping it to a plausible wrong value.
+    #[test]
+    fn usage_adjust_saturates_instead_of_wrapping() {
+        let usage = UsageTracker::new(0, 0);
+        usage.adjust(i64::MAX, 1);
+        usage.adjust(i64::MAX, 1);
+        assert_eq!(usage.load(), (i64::MAX as u64, 2));
+        usage.adjust(i64::MIN, -1);
+        usage.adjust(i64::MIN, -1);
+        assert_eq!(usage.load(), (0, 0), "a negative counter reads as zero");
+        usage.adjust(-1, 0);
+        assert_eq!(usage.load().0, 0);
     }
 }
 

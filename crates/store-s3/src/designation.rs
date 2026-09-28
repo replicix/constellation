@@ -167,6 +167,18 @@ impl DesignationStore {
             if let Ok(Some((d, _))) =
                 crate::control::get_json::<Designation>(self.store.as_ref(), &m.location).await
             {
+                // A claim is only reachable — and releasable — at the key
+                // its path hashes to (`get`/`release`). One stored anywhere
+                // else with a live `path` would count against every overlap
+                // check forever with no way to `online` it: not a claim.
+                if m.location != layout::designation(&path_hash(&d.path)) {
+                    tracing::warn!(
+                        key = %m.location,
+                        path = %d.path,
+                        "ignoring a designation stored at a key that is not its path's"
+                    );
+                    continue;
+                }
                 out.push(d);
             }
         }
@@ -284,6 +296,29 @@ mod tests {
 
     fn ds() -> DesignationStore {
         DesignationStore::new(Arc::new(InMemory::new()), DesignationMode::Cas)
+    }
+
+    /// A designation object stored at a key other than its own path's
+    /// hash is not a claim: it could never be released, so it must not
+    /// block `offline` on that path for good.
+    #[tokio::test]
+    async fn a_designation_at_the_wrong_key_does_not_count() {
+        use object_store::ObjectStoreExt as _;
+        let s = ds();
+        let body = serde_json::json!({"path": "/x", "designee": 1, "created_unix_ms": 0});
+        let payload = object_store::PutPayload::from(serde_json::to_vec(&body).unwrap());
+        // At its own key it is a live claim (proves the body parses).
+        s.store
+            .put(&layout::designation(&path_hash("/x")), payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(s.overlapping("/x").await.unwrap().len(), 1);
+        // The same body at a foreign key is ignored.
+        s.store
+            .put(&layout::designation(&"0".repeat(32)), payload)
+            .await
+            .unwrap();
+        assert_eq!(s.list_all().await.unwrap().len(), 1);
     }
 
     #[test]
