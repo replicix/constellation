@@ -148,6 +148,9 @@ pub struct NodeConfig {
     /// longer has. `None` falls back to the env var / an interactive
     /// prompt (fine in `--foreground`, or when driven by the env var).
     pub passphrase: Option<zeroize::Zeroizing<String>>,
+    /// The local E2E pin `meta.json` is held against (see `e2e_pin`);
+    /// `None` skips the check (tests).
+    pub pin_target: Option<crate::e2e_pin::PinTarget>,
 }
 
 /// Everything needed to mount one view (root, subtree, or snapshot
@@ -309,6 +312,7 @@ impl NodeRuntime {
             log_buffer,
             atime_mode,
             passphrase,
+            pin_target,
         } = cfg;
 
         let fault_forward_delay_ms = fault_forward_reply_delay_ms();
@@ -330,6 +334,12 @@ impl NodeRuntime {
                 None,
             ))
             .context("loading filesystem")?;
+        // `meta.json` is unauthenticated: hold its E2E state against this
+        // machine's pin before trusting `e2e` or the keyring block.
+        let pin = pin_target
+            .as_ref()
+            .map(|target| crate::e2e_pin::check(target, &fsmeta))
+            .transpose()?;
         let e2e_keys = if fsmeta.e2e {
             // Prefer the passphrase collected in the foreground before the
             // fork; fall back to the env var / a prompt (works in
@@ -346,6 +356,9 @@ impl NodeRuntime {
         } else {
             None
         };
+        if let Some(pin) = &pin {
+            pin.confirm(e2e_keys.as_deref())?;
+        }
         let store = Arc::new(match &e2e_keys {
             Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),
             None => ChunkStore::new(backend.clone()),
@@ -2090,6 +2103,7 @@ mod tests {
                 log_buffer: log_buffer::LogBuffer::default(),
                 atime_mode: crate::atime::AtimeMode::Off,
                 passphrase: None,
+                pin_target: None,
             },
             rt.clone(),
         )

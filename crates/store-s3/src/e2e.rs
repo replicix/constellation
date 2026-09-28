@@ -26,7 +26,7 @@ use chacha20poly1305::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::StoreError;
 
@@ -42,9 +42,17 @@ const PURPOSE_ADDRESSING: u8 = 0x01;
 const PURPOSE_GOSSIP: u8 = 0x02;
 const PURPOSE_DEK: u8 = 0x03;
 
-/// OWASP's memory-constrained Argon2id profile: 19 MiB, two iterations,
-/// one lane. Parameters are persisted so stronger future defaults do not
-/// make existing filesystems unreadable.
+/// Defaults for newly wrapped keyrings: 64 MiB, three iterations, one
+/// lane. OWASP's minimum Argon2id profile (19 MiB, t=2) is sized for a
+/// login server hashing many passwords concurrently; here the KEK is
+/// derived once per mount or `fs passwd`, on the client, while
+/// `meta.json` hands every bucket reader an offline guessing target, so
+/// the cost sits well above that minimum, at the memory and time of RFC
+/// 9106's second recommended option (one lane instead of four, so a
+/// small host is not asked for four cores). The parameters used are
+/// persisted in the [`KeyringBlock`] and unwrapping reads them from
+/// there, so changing these defaults never makes an existing filesystem
+/// unreadable; they apply at `fs create` and at the next `fs passwd`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Argon2Params {
     pub m_cost_kib: u32,
@@ -55,8 +63,8 @@ pub struct Argon2Params {
 impl Default for Argon2Params {
     fn default() -> Self {
         Self {
-            m_cost_kib: 19_456,
-            t_cost: 2,
+            m_cost_kib: 65_536,
+            t_cost: 3,
             p_cost: 1,
         }
     }
@@ -89,7 +97,7 @@ pub enum KeyPurpose<'a> {
 /// distinct tags, and a DEK message carries the distinct `PURPOSE_DEK` tag
 /// followed by the name — so no partition name can make a DEK message equal
 /// a fixed-purpose message, and the name→DEK map is injective.
-fn derive_from_master(master: &[u8; KEY_LEN], purpose: KeyPurpose) -> [u8; KEY_LEN] {
+fn derive_from_master(master: &[u8; KEY_LEN], purpose: KeyPurpose) -> Zeroizing<[u8; KEY_LEN]> {
     let mut msg = Vec::with_capacity(KDF_DOMAIN.len() + 1);
     msg.extend_from_slice(KDF_DOMAIN);
     match purpose {
@@ -100,7 +108,7 @@ fn derive_from_master(master: &[u8; KEY_LEN], purpose: KeyPurpose) -> [u8; KEY_L
             msg.extend_from_slice(partition.as_bytes());
         }
     }
-    let out = *blake3::keyed_hash(master, &msg).as_bytes();
+    let out = Zeroizing::new(*blake3::keyed_hash(master, &msg).as_bytes());
     msg.zeroize();
     out
 }
@@ -135,8 +143,8 @@ impl E2eKeys {
     }
 
     fn from_master(master_key: Box<[u8; KEY_LEN]>) -> Self {
-        let addressing_key = Box::new(derive_from_master(&master_key, KeyPurpose::Addressing));
-        let gossip_secret = Box::new(derive_from_master(&master_key, KeyPurpose::Gossip));
+        let addressing_key = Box::new(*derive_from_master(&master_key, KeyPurpose::Addressing));
+        let gossip_secret = Box::new(*derive_from_master(&master_key, KeyPurpose::Gossip));
         let mut keys = Self {
             master_key,
             addressing_key,
@@ -170,13 +178,27 @@ impl E2eKeys {
 
     /// The data-encryption key for `partition`. Derived, never stored, so
     /// it is always available with no keyring read — a partition split
-    /// needs no key coordination.
-    pub fn dek(&self, partition: &str) -> [u8; KEY_LEN] {
+    /// needs no key coordination. The copy is wiped when dropped.
+    pub fn dek(&self, partition: &str) -> Zeroizing<[u8; KEY_LEN]> {
         derive_from_master(&self.master_key, KeyPurpose::Dek(partition))
     }
 
     pub fn hash(&self, plaintext: &[u8]) -> constellation_fs_core::ChunkHash {
         constellation_fs_core::ChunkHash::keyed(self.addressing_key(), plaintext)
+    }
+
+    /// A public fingerprint of this keyring's master key, bound to the
+    /// filesystem `uuid`, for a machine to pin locally (`cli::e2e_pin`).
+    /// It survives `fs passwd` (a rewrap keeps the master) and changes
+    /// with the master — a keyring block spliced in from another
+    /// filesystem unlocks to a different one. A separate `derive_key`
+    /// context, not a `KeyPurpose`, so it can never collide with a key.
+    pub fn pin_fingerprint(&self, uuid: &str) -> String {
+        let mut hasher = blake3::Hasher::new_derive_key("constellation 2026 e2e master pin v1");
+        hasher.update(&(uuid.len() as u64).to_le_bytes());
+        hasher.update(uuid.as_bytes());
+        hasher.update(self.master_key.as_slice());
+        hasher.finalize().to_hex().to_string()
     }
 }
 
@@ -218,9 +240,9 @@ pub struct TreeSealing {
 impl TreeSealing {
     pub fn from_keys(keys: &E2eKeys) -> TreeSealing {
         TreeSealing {
-            nodes: keys.dek("mtree/nodes"),
-            blobs: keys.dek("mtree/blobs"),
-            commits: keys.dek("mtree/commits"),
+            nodes: *keys.dek("mtree/nodes"),
+            blobs: *keys.dek("mtree/blobs"),
+            commits: *keys.dek("mtree/commits"),
         }
     }
 
@@ -257,10 +279,8 @@ pub fn create_keyring_block(passphrase: &str) -> Result<KeyringBlock, StoreError
 /// Unwrap the master key from a `meta.json` keyring block and derive the
 /// live keys. No S3 access — the block is already in the loaded meta.
 pub fn unlock(block: &KeyringBlock, passphrase: &str) -> Result<SharedE2eKeys, StoreError> {
-    let mut master = open_master(block, passphrase)?;
-    let keys = E2eKeys::from_master(Box::new(master));
-    master.zeroize();
-    Ok(Arc::new(keys))
+    let master = open_master(block, passphrase)?;
+    Ok(Arc::new(E2eKeys::from_master(Box::new(*master))))
 }
 
 /// Rewrap the master under a new passphrase, preserving its value. Every
@@ -272,10 +292,8 @@ pub fn rewrap_master(
     old: &str,
     new: &str,
 ) -> Result<KeyringBlock, StoreError> {
-    let mut master = open_master(block, old)?;
-    let out = seal_master(&master, new, Argon2Params::default());
-    master.zeroize();
-    out
+    let master = open_master(block, old)?;
+    seal_master(&master, new, Argon2Params::default())
 }
 
 fn seal_master(
@@ -284,9 +302,8 @@ fn seal_master(
     params: Argon2Params,
 ) -> Result<KeyringBlock, StoreError> {
     let salt: [u8; SALT_LEN] = rand::random();
-    let mut kek = derive_key(passphrase, &salt, params)?;
+    let kek = derive_key(passphrase, &salt, params)?;
     let wrapped = encrypt_envelope(&kek, b"keyring-master", master);
-    kek.zeroize();
     Ok(KeyringBlock {
         argon2_params: params,
         salt: hex(&salt),
@@ -294,21 +311,30 @@ fn seal_master(
     })
 }
 
-fn open_master(block: &KeyringBlock, passphrase: &str) -> Result<[u8; KEY_LEN], StoreError> {
+/// Unwrap with the Argon2 parameters recorded in `block`, never the
+/// current defaults: a keyring sealed under older parameters must keep
+/// opening.
+fn open_master(
+    block: &KeyringBlock,
+    passphrase: &str,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, StoreError> {
     let salt: [u8; SALT_LEN] = unhex(&block.salt)?
         .try_into()
         .map_err(|_| StoreError::CorruptObject("keyring salt has wrong length".into()))?;
-    let mut kek = derive_key(passphrase, &salt, block.argon2_params)?;
-    let opened = decrypt_envelope(&kek, b"keyring-master", &unhex(&block.wrapped_master)?);
-    kek.zeroize();
-    array32(&opened?)
+    let kek = derive_key(passphrase, &salt, block.argon2_params)?;
+    let opened = Zeroizing::new(decrypt_envelope(
+        &kek,
+        b"keyring-master",
+        &unhex(&block.wrapped_master)?,
+    )?);
+    array32(&opened).map(Zeroizing::new)
 }
 
 fn derive_key(
     passphrase: &str,
     salt: &[u8],
     params: Argon2Params,
-) -> Result<[u8; KEY_LEN], StoreError> {
+) -> Result<Zeroizing<[u8; KEY_LEN]>, StoreError> {
     let params = Params::new(
         params.m_cost_kib,
         params.t_cost,
@@ -317,9 +343,9 @@ fn derive_key(
     )
     .map_err(|error| StoreError::Meta(format!("invalid Argon2 parameters: {error}")))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     argon2
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key[..])
         .map_err(|error| StoreError::Meta(format!("Argon2 key derivation failed: {error}")))?;
     Ok(key)
 }
@@ -464,7 +490,7 @@ mod tests {
         assert!(seen.insert(*k.gossip_secret()));
         for name in &names {
             assert!(
-                seen.insert(k.dek(name)),
+                seen.insert(*k.dek(name)),
                 "derived-key collision for partition {name:?}"
             );
         }
@@ -503,6 +529,45 @@ mod tests {
             after.dek("part-created-later"),
             before.dek("part-created-later")
         );
+    }
+
+    /// New keyrings record the current defaults; one sealed under the
+    /// previous (19 MiB, t=2) defaults still opens, because unwrapping
+    /// reads the parameters from the block.
+    #[test]
+    fn keyring_sealed_with_old_params_still_unlocks() {
+        let block = create_keyring_block("pass").unwrap();
+        assert_eq!(
+            block.argon2_params,
+            Argon2Params {
+                m_cost_kib: 65_536,
+                t_cost: 3,
+                p_cost: 1,
+            }
+        );
+
+        let old_params = Argon2Params {
+            m_cost_kib: 19_456,
+            t_cost: 2,
+            p_cost: 1,
+        };
+        let master: [u8; KEY_LEN] = rand::random();
+        let old_block = seal_master(&master, "pass", old_params).unwrap();
+        let json = serde_json::to_vec(&old_block).unwrap();
+        let old_block: KeyringBlock = serde_json::from_slice(&json).unwrap();
+        assert_eq!(old_block.argon2_params, old_params);
+
+        let keys = unlock(&old_block, "pass").unwrap();
+        let expected = E2eKeys::from_master(Box::new(master));
+        assert_eq!(keys.addressing_key(), expected.addressing_key());
+        assert_eq!(keys.dek("p0"), expected.dek("p0"));
+        assert!(unlock(&old_block, "wrong").is_err());
+
+        // A passphrase change moves the keyring to the current defaults.
+        let rewrapped = rewrap_master(&old_block, "pass", "new").unwrap();
+        assert_eq!(rewrapped.argon2_params, Argon2Params::default());
+        let after = unlock(&rewrapped, "new").unwrap();
+        assert_eq!(after.addressing_key(), expected.addressing_key());
     }
 
     #[test]

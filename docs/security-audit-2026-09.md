@@ -232,7 +232,36 @@ minimum, byte for byte from the encoder). Three follow-ups were taken:
 - The API's `fuse_threads` band (1..=1024) was 16× looser than the CLI's own
   hard cap; both now use `FUSE_THREAD_HARD_MAX` (64).
 
-### 12. Dependencies (MEDIUM)
+### 12. E2E encryption: unauthenticated `meta.json` allowed a silent downgrade (HIGH)
+
+`crates/store-s3/src/e2e.rs`, new `crates/cli/src/e2e_pin.rs`. The AEAD
+construction (XChaCha20-Poly1305, random 192-bit nonces, the object path as
+associated data, per-filesystem random master, keyed-BLAKE3 subkeys, keyed
+content addressing) reviewed as sound. But `meta.json` — plain JSON in the
+bucket — alone decided whether a mount was E2E, and E2E exists precisely to
+protect data from whoever controls that bucket. Flipping `"e2e": false` made
+every later mount write plaintext with no prompt and no warning; splicing in
+another filesystem's keyring block (same passphrase reused) would have opened
+to that filesystem's keys.
+
+Fix: a local trust-on-first-use pin per filesystem (`registry.e2e.toml`, next
+to the registry, same lock-then-rename discipline). Before any prompt or key
+derivation, a pinned-E2E filesystem now reporting plaintext is refused; after
+the passphrase opens the keyring, the master key it opened to must match the
+pinned fingerprint, or the keys are never used. The fingerprint is of the
+master key, not the keyring block, so `fs passwd` (a rewrap of the same
+master) passes on every node while a spliced block — which opens to a
+different master — is refused. An operator accepts a genuine change with
+`CONSTELLATION_ACCEPT_E2E_CHANGE=1`, which re-pins. Wired into mount, the
+daemon, `fs create`, `fs passwd`, `gc` and `fsck`.
+
+Also in this area: Argon2id defaults raised from OWASP's memory-constrained
+floor (19 MiB, t=2) to 64 MiB, t=3 — parameters are stored in the keyring
+block, so existing filesystems keep unlocking (tested); per-call DEKs are
+returned zeroizing; the local plaintext chunk cache directory is created
+0700.
+
+### 13. Dependencies (MEDIUM)
 
 `cargo audit` (which the first round's research had summarized incorrectly):
 `rustls 0.23.43` was vulnerable to RUSTSEC-2026-0285 (fixed in 0.23.45), and
@@ -260,6 +289,7 @@ timeout.
 | `store_object` | 25.6M | 140 | clean |
 | `store_inbox_pack` | 1.4M | 235 | clean |
 | `api_request` | 9.9M | 7591 | clean |
+| `store_control_json` (round two) | — | — | clean (meta.json, leases, designations, snapshots, GC pointer, registry, heartbeat, delegation table) |
 | `meta_blobs` | 9.1M | 10382 | clean |
 
 Reproduce: `cd fuzz && cargo +nightly fuzz run <target>`. The store targets pin

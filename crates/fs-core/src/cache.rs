@@ -182,6 +182,26 @@ pub struct PruneReport {
     pub entries: u64,
 }
 
+/// The cache holds decrypted file contents: make its root private to the
+/// owner (0o700), including a root left by an older build with the umask
+/// default. Best-effort — a filesystem without Unix permissions must not
+/// make the cache unusable. This crate has no logger; the only report is
+/// on stderr.
+fn restrict_to_owner(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(root, fs::Permissions::from_mode(0o700)) {
+            eprintln!(
+                "warning: could not restrict cache directory {} to mode 0700: {error}",
+                root.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+}
+
 impl DiskCache {
     /// Open (or create) a cache directory and rebuild accounting from disk.
     pub fn open(root: impl Into<PathBuf>, budget: u64) -> Result<Self, CoreError> {
@@ -223,6 +243,7 @@ impl DiskCache {
     ) -> Result<Self, CoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        restrict_to_owner(&root);
         let spill_dir = root.join(".spill");
         let _ = fs::remove_dir_all(&spill_dir);
         fs::create_dir_all(&spill_dir)?;
@@ -756,6 +777,26 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get(&h).unwrap(), Some(d));
         assert_eq!(c.usage().used, 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_root_is_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = TempDir::new().unwrap();
+
+        // Created by the open.
+        let fresh = dir.path().join("fresh");
+        let _c = DiskCache::open(&fresh, 1024).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+
+        // Left world-readable by an older build: tightened on open.
+        let existing = dir.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        let _k = DiskCache::open_keyed(&existing, 1024, [7; 32]).unwrap();
+        assert_eq!(mode(&existing), 0o700);
     }
 
     #[test]

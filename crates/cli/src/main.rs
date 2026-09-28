@@ -9,6 +9,7 @@ mod daemon_lock;
 mod daemonize;
 mod designation;
 mod doctor;
+mod e2e_pin;
 mod epoch;
 mod existence;
 mod fault;
@@ -761,6 +762,8 @@ async fn preflight_backend(store: &ChunkStore, s3: &str) -> Result<()> {
 
 /// What [`check_fs_before_mount`] learned from `meta.json`.
 struct MountCheck {
+    /// Whether to prompt for a passphrase: `meta.json`'s `e2e`, already
+    /// held against this machine's pin (see [`e2e_pin`]).
     e2e: bool,
     /// The S3 endpoint `meta.json` was read from (`None`: local backend).
     endpoint: Option<String>,
@@ -771,16 +774,23 @@ struct MountCheck {
 /// [`backend::load_fs_explained`] (where the command looked, and whether
 /// it reached the store the name was created on) — and so an interactive
 /// E2E mount knows to prompt for the passphrase before the child loses
-/// the terminal. Runs through a throwaway runtime that is fully dropped
-/// before the caller forks, so no runtime threads leak into the daemon
-/// child.
-fn check_fs_before_mount(s3: &str, registered_endpoint: Option<&str>) -> Result<MountCheck> {
+/// the terminal. A downgrade from, or change of, the E2E state this
+/// machine pinned fails here too, before any prompt. The pin itself is
+/// written by the daemon once the passphrase has opened the keyring. Runs
+/// through a throwaway runtime that is fully dropped before the caller
+/// forks, so no runtime threads leak into the daemon child.
+fn check_fs_before_mount(
+    s3: &str,
+    registered_endpoint: Option<&str>,
+    pin: &e2e_pin::PinTarget,
+) -> Result<MountCheck> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let check = rt.block_on(async {
         let (backend, info) = backend::open_backend_described(s3).await?;
         let meta = backend::load_fs_explained(&backend, &info, registered_endpoint).await?;
+        e2e_pin::check(pin, &meta)?;
         anyhow::Ok(MountCheck {
             e2e: meta.e2e,
             endpoint: info.endpoint().map(str::to_string),
@@ -962,6 +972,7 @@ fn main() -> Result<()> {
                     },
                 )
                 .context("registering the new filesystem")?;
+            e2e_pin::record(&e2e_pin::PinTarget::named(&name, &s3), &meta, None);
             println!("created filesystem {} at {s3}", meta.uuid);
             println!("  name:        {name}");
             println!("  chunk_size:  {chunk_size}");
@@ -1042,6 +1053,8 @@ fn main() -> Result<()> {
                 .context("opening backend")?;
             let store = ChunkStore::new(backend.clone());
             let meta = rt.block_on(store.load_fs())?;
+            let pin = e2e_pin::PinTarget::for_target(&t, &s3);
+            e2e_pin::check(&pin, &meta)?;
             if !meta.e2e {
                 bail!("filesystem is not in E2E mode");
             }
@@ -1052,6 +1065,17 @@ fn main() -> Result<()> {
             )?;
             rt.block_on(store.change_passphrase(&old, &new))
                 .context("changing E2E passphrase")?;
+            // The rewrap kept the master, so the pin's fingerprint stands;
+            // record it anyway once the new passphrase has opened the block
+            // (a `fs create` pin has none yet).
+            let rewrapped = rt.block_on(store.load_fs())?;
+            match rewrapped.unlock(&new) {
+                Ok(keys) => e2e_pin::record(&pin, &rewrapped, Some(&keys)),
+                Err(e) => eprintln!(
+                    "warning: meta.json read back after the change does not open with the new \
+                     passphrase ({e}); the local E2E pin was not updated"
+                ),
+            }
             println!(
                 "passphrase changed; data-encryption keys were not rotated \
                  and mounted nodes need no remount"
@@ -1420,7 +1444,8 @@ fn main() -> Result<()> {
             let t = target::resolve(&target, &reg);
             let s3 = target::s3_url(s3, &t)?;
             let dir = target::state_dir_opt(state_dir, &t);
-            let report = rt.block_on(run_gc_cli(&s3, dir, verify_only))?;
+            let pin = e2e_pin::PinTarget::for_target(&t, &s3);
+            let report = rt.block_on(run_gc_cli(&s3, &pin, dir, verify_only))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
@@ -1435,7 +1460,14 @@ fn main() -> Result<()> {
             let t = target::resolve(&target, &reg);
             let s3 = target::s3_url(s3, &t)?;
             let dir = target::state_dir_opt(state_dir, &t);
-            let report = rt.block_on(run_fsck_cli(&s3, dir, repair, force_release.as_deref()))?;
+            let pin = e2e_pin::PinTarget::for_target(&t, &s3);
+            let report = rt.block_on(run_fsck_cli(
+                &s3,
+                &pin,
+                dir,
+                repair,
+                force_release.as_deref(),
+            ))?;
             let code = report.exit_code();
             println!("{}", serde_json::to_string_pretty(&report)?);
             if code != 0 {
@@ -1771,6 +1803,10 @@ fn cmd_mount(
     };
     let initial_write_mode: writeback::WriteMode =
         node_write_mode.parse().map_err(anyhow::Error::msg)?;
+    let pin_target = match &name {
+        Some(name) => e2e_pin::PinTarget::named(name, &node_s3),
+        None => e2e_pin::PinTarget::unnamed(&node_s3),
+    };
 
     // Read meta.json before the fork (a missing filesystem fails on this
     // terminal, explained), and collect the E2E passphrase in the
@@ -1782,7 +1818,7 @@ fn cmd_mount(
     let mount_passphrase = if daemon_socket_is_live(&state_dir) {
         None
     } else {
-        let check = check_fs_before_mount(&node_s3, registered_endpoint.as_deref())?;
+        let check = check_fs_before_mount(&node_s3, registered_endpoint.as_deref(), &pin_target)?;
         if let (Some(name), Some(endpoint)) = (&name, &check.endpoint) {
             if registered_endpoint.as_deref() != Some(endpoint.as_str()) {
                 remember_endpoint(name, endpoint);
@@ -1814,6 +1850,7 @@ fn cmd_mount(
             log_buffer,
             views,
             mount_passphrase,
+            pin_target,
             None,
         ),
         daemonize::Outcome::Daemon(verdict) => {
@@ -1832,6 +1869,7 @@ fn cmd_mount(
                 log_buffer,
                 views,
                 mount_passphrase,
+                pin_target,
                 Some(verdict),
             );
             // `cmd_mount_body` already reported success/failure through
@@ -1908,6 +1946,7 @@ fn cmd_mount_body(
     log_buffer: log_buffer::LogBuffer,
     views: Vec<ViewSpec>,
     passphrase: Option<Zeroizing<String>>,
+    pin_target: e2e_pin::PinTarget,
     verdict: Option<daemonize::Verdict>,
 ) -> Result<()> {
     let fuse_threads = threads.fuse;
@@ -2090,6 +2129,7 @@ fn cmd_mount_body(
                     log_buffer,
                     atime_mode,
                     passphrase,
+                    pin_target: Some(pin_target),
                 },
                 handle,
             ) {
@@ -2498,18 +2538,21 @@ fn cmd_fs_list(rt: &tokio::runtime::Runtime) -> Result<()> {
 
 async fn run_gc_cli(
     s3: &str,
+    pin: &e2e_pin::PinTarget,
     state_dir: Option<PathBuf>,
     verify_only: bool,
 ) -> Result<gc::GcReport> {
     let backend = backend::open_backend(s3).await?;
     let plain = ChunkStore::new(backend.clone());
     let fsmeta = plain.load_fs().await?;
+    let pin = e2e_pin::check(pin, &fsmeta)?;
     let keys = if fsmeta.e2e {
         let secret = passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
         Some(fsmeta.unlock(&secret)?)
     } else {
         None
     };
+    pin.confirm(keys.as_deref())?;
     let chunks = std::sync::Arc::new(match &keys {
         Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),
         None => plain,
@@ -2556,6 +2599,7 @@ async fn run_gc_cli(
 
 async fn run_fsck_cli(
     s3: &str,
+    pin: &e2e_pin::PinTarget,
     state_dir: Option<PathBuf>,
     repair: bool,
     force_release: Option<&str>,
@@ -2563,12 +2607,14 @@ async fn run_fsck_cli(
     let backend = backend::open_backend(s3).await?;
     let plain = ChunkStore::new(backend.clone());
     let fsmeta = plain.load_fs().await?;
+    let pin = e2e_pin::check(pin, &fsmeta)?;
     let keys = if fsmeta.e2e {
         let secret = passphrase("CONSTELLATION_PASSPHRASE", "Filesystem passphrase: ")?;
         Some(fsmeta.unlock(&secret)?)
     } else {
         None
     };
+    pin.confirm(keys.as_deref())?;
     let chunks = std::sync::Arc::new(match &keys {
         Some(keys) => ChunkStore::new_e2e(backend.clone(), keys.clone()),
         None => plain,
@@ -6430,9 +6476,10 @@ impl constellation_api::StatusSource for DaemonStatus {
         // (already capped at `FUSE_THREAD_HARD_MAX`), so only this API path
         // needs the guard.
         let fuse_threads = match opts.fuse_threads {
-            Some(n) if !(1..=1024).contains(&n) => {
+            Some(n) if !(1..=parallelism::FUSE_THREAD_HARD_MAX).contains(&n) => {
                 return Err(format!(
-                    "fuse_threads must be between 1 and 1024, got {n}"
+                    "fuse_threads must be between 1 and {}, got {n}",
+                    parallelism::FUSE_THREAD_HARD_MAX
                 ));
             }
             Some(n) => n,
@@ -7971,6 +8018,7 @@ mod umount_tests {
                 log_buffer: log_buffer::LogBuffer::default(),
                 atime_mode: atime::AtimeMode::Off,
                 passphrase: None,
+                pin_target: None,
             },
             rt.handle().clone(),
         )
