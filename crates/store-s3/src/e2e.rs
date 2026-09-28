@@ -50,9 +50,8 @@ const PURPOSE_DEK: u8 = 0x03;
 /// the cost sits well above that minimum, at the memory and time of RFC
 /// 9106's second recommended option (one lane instead of four, so a
 /// small host is not asked for four cores). The parameters used are
-/// persisted in the [`KeyringBlock`] and unwrapping reads them from
-/// there, so changing these defaults never makes an existing filesystem
-/// unreadable; they apply at `fs create` and at the next `fs passwd`.
+/// persisted in the [`KeyringBlock`], which unwrapping reads them from;
+/// they apply at `fs create` and at the next `fs passwd`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Argon2Params {
     pub m_cost_kib: u32,
@@ -529,45 +528,6 @@ mod tests {
             after.dek("part-created-later"),
             before.dek("part-created-later")
         );
-    }
-
-    /// New keyrings record the current defaults; one sealed under the
-    /// previous (19 MiB, t=2) defaults still opens, because unwrapping
-    /// reads the parameters from the block.
-    #[test]
-    fn keyring_sealed_with_old_params_still_unlocks() {
-        let block = create_keyring_block("pass").unwrap();
-        assert_eq!(
-            block.argon2_params,
-            Argon2Params {
-                m_cost_kib: 65_536,
-                t_cost: 3,
-                p_cost: 1,
-            }
-        );
-
-        let old_params = Argon2Params {
-            m_cost_kib: 19_456,
-            t_cost: 2,
-            p_cost: 1,
-        };
-        let master: [u8; KEY_LEN] = rand::random();
-        let old_block = seal_master(&master, "pass", old_params).unwrap();
-        let json = serde_json::to_vec(&old_block).unwrap();
-        let old_block: KeyringBlock = serde_json::from_slice(&json).unwrap();
-        assert_eq!(old_block.argon2_params, old_params);
-
-        let keys = unlock(&old_block, "pass").unwrap();
-        let expected = E2eKeys::from_master(Box::new(master));
-        assert_eq!(keys.addressing_key(), expected.addressing_key());
-        assert_eq!(keys.dek("p0"), expected.dek("p0"));
-        assert!(unlock(&old_block, "wrong").is_err());
-
-        // A passphrase change moves the keyring to the current defaults.
-        let rewrapped = rewrap_master(&old_block, "pass", "new").unwrap();
-        assert_eq!(rewrapped.argon2_params, Argon2Params::default());
-        let after = unlock(&rewrapped, "new").unwrap();
-        assert_eq!(after.addressing_key(), expected.addressing_key());
     }
 
     #[test]

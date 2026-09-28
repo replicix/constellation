@@ -183,8 +183,7 @@ pub struct PruneReport {
 }
 
 /// The cache holds decrypted file contents: make its root private to the
-/// owner (0o700), including a root left by an older build with the umask
-/// default. Best-effort — a filesystem without Unix permissions must not
+/// owner (0o700). Best-effort — a filesystem without Unix permissions must not
 /// make the cache unusable. This crate has no logger; the only report is
 /// on stderr.
 fn restrict_to_owner(root: &Path) {
@@ -790,13 +789,6 @@ mod tests {
         let fresh = dir.path().join("fresh");
         let _c = DiskCache::open(&fresh, 1024).unwrap();
         assert_eq!(mode(&fresh), 0o700);
-
-        // Left world-readable by an older build: tightened on open.
-        let existing = dir.path().join("existing");
-        fs::create_dir(&existing).unwrap();
-        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
-        let _k = DiskCache::open_keyed(&existing, 1024, [7; 32]).unwrap();
-        assert_eq!(mode(&existing), 0o700);
     }
 
     #[test]

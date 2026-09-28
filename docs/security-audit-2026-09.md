@@ -256,8 +256,7 @@ different master — is refused. An operator accepts a genuine change with
 daemon, `fs create`, `fs passwd`, `gc` and `fsck`.
 
 Also in this area: Argon2id defaults raised from OWASP's memory-constrained
-floor (19 MiB, t=2) to 64 MiB, t=3 — parameters are stored in the keyring
-block, so existing filesystems keep unlocking (tested); per-call DEKs are
+floor (19 MiB, t=2) to 64 MiB, t=3; per-call DEKs are
 returned zeroizing; the local plaintext chunk cache directory is created
 0700.
 
