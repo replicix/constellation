@@ -128,7 +128,10 @@ async fn guard_rebinding(
     // Browsers attach Origin on cross-site fetches; a same-page UI fetch or
     // a `curl` sends none or a loopback one. A present, non-loopback Origin
     // is the rebinding signal even if the Host somehow passed.
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()) {
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
         if !is_allowed_origin(origin) {
             return (
                 StatusCode::FORBIDDEN,
@@ -623,7 +626,10 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_ip_with_port_is_allowed() {
-        assert_eq!(get_root(&[("host", "127.0.0.1:8080")]).await, StatusCode::OK);
+        assert_eq!(
+            get_root(&[("host", "127.0.0.1:8080")]).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

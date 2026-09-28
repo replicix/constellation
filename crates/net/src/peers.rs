@@ -931,7 +931,10 @@ pub async fn run_gossip<S: PeerService>(
                 // The request carries `rid`/`acked_through`, which mutate
                 // per-requester exactly-once dedup state: an enrolled peer
                 // must not speak for another node's `requester`.
-                if !peers.node_id_for_key(&hex).is_some_and(|id| id == *requester) {
+                if !peers
+                    .node_id_for_key(&hex)
+                    .is_some_and(|id| id == *requester)
+                {
                     tracing::warn!(peer = %hex, requester, "dropping a gossip mutate claiming another node");
                 } else {
                     // Don't head-of-line-block gossip behind one mutate:
@@ -2141,10 +2144,17 @@ mod tests {
             .await
             .unwrap();
         let peers = Peers::new(p2p, 1);
-        peers.refresh_registry(vec![(2, "ab".repeat(32), serde_json::json!("not an address"))]);
+        peers.refresh_registry(vec![(
+            2,
+            "ab".repeat(32),
+            serde_json::json!("not an address"),
+        )]);
         assert_eq!(peers.node_id_for_key(&"AB".repeat(32)), Some(2));
         assert_eq!(peers.node_id_for_key(&"cd".repeat(32)), None);
-        assert!(peers.snapshot().is_empty(), "not dialable, so not a peer to dial");
+        assert!(
+            peers.snapshot().is_empty(),
+            "not dialable, so not a peer to dial"
+        );
     }
 
     /// Serves one fixed chunk, recording how many serves overlapped and

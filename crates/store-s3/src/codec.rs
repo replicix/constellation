@@ -145,7 +145,10 @@ pub fn decompress(
             // object expands to exactly `uncompressed_len`; the exact check
             // afterwards still catches a truncated or padded frame.
             if uncompressed_len > max_decompressed_len() {
-                return Err(ceiling_error("declared decompressed length", uncompressed_len));
+                return Err(ceiling_error(
+                    "declared decompressed length",
+                    uncompressed_len,
+                ));
             }
             let out = decompress_bounded(payload, uncompressed_len)?;
             if out.len() as u64 != uncompressed_len {
@@ -199,8 +202,8 @@ pub fn decompress_to_ceiling(payload: &[u8]) -> Result<Vec<u8>, StoreError> {
 /// Decompress at most `max_out + 1` bytes; the caller checks for the extra one.
 fn read_bounded(payload: &[u8], max_out: u64) -> Result<Vec<u8>, StoreError> {
     use std::io::Read;
-    let mut decoder =
-        zstd::stream::read::Decoder::new(payload).map_err(|e| StoreError::Compression(e.to_string()))?;
+    let mut decoder = zstd::stream::read::Decoder::new(payload)
+        .map_err(|e| StoreError::Compression(e.to_string()))?;
     let mut out = Vec::new();
     decoder
         .by_ref()
@@ -331,7 +334,10 @@ mod tests {
     fn highly_compressible_legitimate_objects_decode() {
         let max_chunk = 64usize << 20;
         let payload = zstd::encode_all(&vec![0u8; max_chunk][..], 3).unwrap();
-        assert!(payload.len() < max_chunk / 1000, "a run of zeros compresses >1000x");
+        assert!(
+            payload.len() < max_chunk / 1000,
+            "a run of zeros compresses >1000x"
+        );
         let out = decompress(Codec::Zstd, &payload, max_chunk as u64).unwrap();
         assert_eq!(out.len(), max_chunk);
 

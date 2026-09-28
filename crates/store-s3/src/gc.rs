@@ -265,7 +265,9 @@ pub async fn publish_condemned(
             // epoch at `u64::MAX` must not wrap to 0 (the epoch is what
             // orders condemned lists) — refuse it instead.
             let epoch = current.epoch.checked_add(1).ok_or_else(|| {
-                StoreError::Meta("gc/condemned.json: epoch exhausted; the pointer is corrupt".into())
+                StoreError::Meta(
+                    "gc/condemned.json: epoch exhausted; the pointer is corrupt".into(),
+                )
             })?;
             (epoch, PutMode::Update(version))
         }

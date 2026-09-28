@@ -83,7 +83,10 @@ impl<W: Write> StreamingDecoder<W> {
         // per-write bound can't be defeated by simply declaring a huge
         // length. See `codec::max_decompressed_len`.
         if expected_len > codec::max_decompressed_len() {
-            return Err(codec::ceiling_error("declared decoded length", expected_len));
+            return Err(codec::ceiling_error(
+                "declared decoded length",
+                expected_len,
+            ));
         }
         let writer = HashWriter {
             inner: out,

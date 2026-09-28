@@ -560,7 +560,10 @@ mod tests {
             .put(&forged, object_store::PutPayload::from(body))
             .await
             .unwrap();
-        assert_eq!(write_eligible_roster(store.clone()).await.unwrap(), vec![id]);
+        assert_eq!(
+            write_eligible_roster(store.clone()).await.unwrap(),
+            vec![id]
+        );
         assert_eq!(list_nodes(store.clone()).await.unwrap().len(), 1);
     }
 

@@ -406,7 +406,9 @@ mod tests {
         assert_ne!(other.pin_fingerprint(&meta.uuid.to_string()), base);
         assert_ne!(keys.pin_fingerprint("another-uuid"), base);
         assert_eq!(
-            E2ePin::observe(S3, &meta, Some(&keys)).master_fingerprint.as_deref(),
+            E2ePin::observe(S3, &meta, Some(&keys))
+                .master_fingerprint
+                .as_deref(),
             Some(base.as_str())
         );
         let mut plain = meta.clone();

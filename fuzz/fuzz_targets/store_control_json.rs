@@ -9,7 +9,9 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     if let Ok(meta) = serde_json::from_slice::<constellation_store_s3::store::FsMeta>(data) {
         let _ = meta.gossip_seed();
-        let _ = meta.compression.parse::<constellation_store_s3::CompressionSetting>();
+        let _ = meta
+            .compression
+            .parse::<constellation_store_s3::CompressionSetting>();
         // What `load_fs` admits must survive every `/ chunk_size` downstream.
         if constellation_fs_core::validate_chunk_size(meta.chunk_size).is_ok() {
             let layout = constellation_fs_core::ChunkLayout::new(meta.chunk_size);
