@@ -2422,6 +2422,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             cluster.locks.trace().join("\n    ")
         ));
     }
+    // Fairness: reported with the counters (`LockCounters::overtaken`);
+    // the fault-free lock configurations assert none.
+    for o in cluster.locks.overtakes().iter().take(3) {
+        eprintln!("  lock fairness: {o}");
+    }
     report.faults = fault_log.lock().unwrap().clone();
     report.simulated_ms = clock.elapsed_ms();
     if let Some(f) = failures.lock().unwrap().first() {

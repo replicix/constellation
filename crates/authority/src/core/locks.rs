@@ -78,6 +78,9 @@ struct LockOp {
     local_wait: bool,
 }
 
+/// How many `LockState::done_reqs` entries are kept.
+const DONE_REQS_KEPT: usize = 64;
+
 /// Owner side: a blocking request waiting for recalls.
 #[derive(Debug)]
 struct Waiter {
@@ -139,9 +142,23 @@ pub(crate) struct LockState {
     relearning: bool,
     /// Flush attempts per inode with a release in flight.
     flushing: BTreeMap<Ino, u32>,
+    /// Node side: requests answered by a push while their RPC was still
+    /// in flight, by that RPC's id → the inode: the RPC's own reply
+    /// (the owner re-affirmed the grant under a *new* id) then installs
+    /// that id instead of being dropped, so this node holds the id the
+    /// owner recalls. Bounded (`DONE_REQS_KEPT`).
+    done_reqs: BTreeMap<OpId, Ino>,
     // ---- owner side ----
     waiters: Vec<Waiter>,
     next_waiter: u64,
+    /// Owner side: the queue position (`Waiter::since`) of the last
+    /// waiter served per `(node, inode)`. A grant that goes unused — the
+    /// push found no op, the reply lapsed on arrival, the requester's
+    /// routing changed — is outwaited, and the node asks again: it then
+    /// re-parks *at its old position*, not behind everyone who asked
+    /// meanwhile (EC2 campaign 8: a committer waiting 16–28 s while the
+    /// other took turn after turn). Kept `4 × ttl`.
+    served: BTreeMap<(NodeId, Ino), Ms>,
     /// Owner side: while waiters are parked, they are re-served on a
     /// tick — a refusal for stale liveness, an unmarked lease or a grace
     /// period has no event of its own that ends it.
@@ -237,9 +254,19 @@ const DIR_FLOORS_CAP: usize = 64;
 /// can only make a later grant carry less than it could.
 const FLOORS_CAP: usize = 4096;
 
+impl Core {
+    /// Owner side: parked waiters right now (tests).
+    #[cfg(test)]
+    pub(crate) fn lock_waiters(&self) -> usize {
+        self.lk.waiters.len()
+    }
+}
+
 impl LockState {
     pub(crate) fn container_sizes(&self) -> Vec<(&'static str, usize)> {
         vec![
+            ("lk_done_reqs", self.done_reqs.len()),
+            ("lk_served", self.served.len()),
             ("lk_ops", self.ops.len()),
             ("lk_waiters", self.waiters.len()),
             ("lk_recalls", self.recalls.len()),
@@ -919,6 +946,18 @@ impl Core {
         self.stats.lock_waiters_parked += 1;
         self.lk.next_waiter += 1;
         let id = self.lk.next_waiter;
+        // A node served before whose grant went unused keeps its place
+        // in the queue (see `LockState::served`); its request never
+        // stopped waiting from its point of view.
+        let keep = 4 * self.lock_ttl_ms();
+        self.lk.served.retain(|_, s| now.since(*s) < keep);
+        let since = match self.lk.served.remove(&(from, ino)) {
+            Some(s) => {
+                self.stats.lock_requeued_in_place += 1;
+                s
+            }
+            None => now,
+        };
         self.lock_arm_waiter_tick(now, out);
         let held_timer = req.map(|_| {
             self.set_timer(
@@ -937,7 +976,7 @@ impl Core {
             recv: now,
             op,
             held_timer,
-            since: now,
+            since,
         });
         if let Some(op) = op {
             if let Some(o) = self.lk.ops.get_mut(&op) {
@@ -1007,9 +1046,12 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let idx: Vec<usize> = (0..self.lk.waiters.len())
+        // In the order they asked (`since`: a re-park keeps the old one),
+        // whatever order they sit in the list.
+        let mut idx: Vec<usize> = (0..self.lk.waiters.len())
             .filter(|i| self.lk.waiters[*i].ino == ino)
             .collect();
+        idx.sort_by_key(|i| (self.lk.waiters[*i].since, self.lk.waiters[*i].id));
         let ttl = self.lock_ttl_ms();
         let margin = self.lock_margin_ms();
         let mut done = Vec::new();
@@ -1039,10 +1081,21 @@ impl Core {
             match self.lock_serve_again(now, base, node, ino, mode, replica, out) {
                 Some(outcome) => {
                     done.push(i);
+                    // A remote waiter's grant may go unused (see
+                    // `LockState::served`); a local op installs its grant
+                    // in this very event.
+                    if op.is_none() && matches!(outcome, LockOutcome::Granted { .. }) {
+                        let since = self.lk.waiters[i].since;
+                        self.lk.served.insert((node, ino), since);
+                    }
                     self.lock_deliver(now, node, ino, req, op, sent, outcome, replica, out);
                 }
                 None => {
                     // Still conflicting (or in grace): stays parked.
+                    // Nobody behind it is served either: a waiter that
+                    // cannot be granted (its holder's recall is out) holds
+                    // the queue, or the ones behind it would overtake it.
+                    break;
                 }
             }
         }
@@ -1172,6 +1225,9 @@ impl Core {
                 }
             }
         }
+        // Released: the grant was used, so its holder's next request is
+        // a new one (no queue position to keep; `LockState::served`).
+        self.lk.served.remove(&(from, ino));
         if replica
             .locks()
             .get(grant)
@@ -1179,6 +1235,20 @@ impl Core {
         {
             self.stats.lock_recalls_released += 1;
             self.lock_grant_done(now, grant, ino, replica, out);
+            return;
+        }
+        // The node released an id this owner has since replaced (a
+        // re-sent request re-affirmed its grant under a new id while the
+        // old one was on its way there): the node holds nothing on the
+        // inode any more, so the grant it still has here is done too.
+        // Left in the table, that grant was outwaited (`ttl + margin`)
+        // before the next waiter was served.
+        if let Some(g) = replica.locks().own_grant(ino, from, now.0) {
+            if g.id.node == grant.node && g.id.seq > grant.seq {
+                self.stats.lock_recalls_released += 1;
+                self.stats.lock_released_superseded += 1;
+                self.lock_grant_done(now, g.id, ino, replica, out);
+            }
         }
     }
 
@@ -1284,6 +1354,8 @@ impl Core {
         mode: LockMode,
         replica: &dyn Replica,
     ) -> LockRenewResult {
+        // Renewed: the grant is in use (`LockState::served`).
+        self.lk.served.remove(&(from, ino));
         let (cap_ms, gen) = match self.lock_route_for(now, ino, replica, true) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
             Route::Node(n) => return LockRenewResult::NotOwner { owner: n },
@@ -1684,6 +1756,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let Some(op) = self.lk.by_req.remove(&req) else {
+            self.lock_late_reply(now, from, req, outcome, replica);
             return;
         };
         if !self.lk.ops.get(&op).is_some_and(|o| o.req == Some(req)) {
@@ -1694,6 +1767,62 @@ impl Core {
             o.req = None;
         }
         self.lock_op_outcome(now, op, from, outcome, replica, out);
+    }
+
+    /// The reply to a request a push already answered: the owner
+    /// re-affirmed the grant under a new id (`lock_try_grant` mints one
+    /// per answer). Installed over the id held here — merged, the local
+    /// locks and the recalled flag kept (`LockTables::install_held`) —
+    /// so the id this node holds is the one the owner will recall and
+    /// expects released. Dropped, the owner's recall found no holder
+    /// here and the grant was outwaited.
+    fn lock_late_reply(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        outcome: LockOutcome,
+        replica: &dyn Replica,
+    ) {
+        let Some(ino) = self.lk.done_reqs.remove(&req) else {
+            return;
+        };
+        let LockOutcome::Granted {
+            id,
+            mode,
+            ttl_ms,
+            position,
+        } = outcome
+        else {
+            return;
+        };
+        let Some(cur) = replica.locks().held(ino) else {
+            return;
+        };
+        if cur.id.node != id.node || cur.id.seq >= id.seq || cur.owner != from {
+            return;
+        }
+        let margin = self.lock_margin_ms();
+        let ttl = ttl_ms as i64;
+        let held = HeldGrant {
+            id,
+            mode,
+            until_ms: now.0 + ttl - margin,
+            renew_at_ms: constellation_meta::locks::renew_point(now.0, ttl, margin),
+            owner: from,
+            recalled: false,
+            position,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since_ms: None,
+        };
+        if matches!(
+            replica.locks().install_held(ino, held),
+            Installed::Ok { .. }
+        ) {
+            self.stats.lock_late_replies_installed += 1;
+        }
     }
 
     /// A grant pushed to a waiter whose request was answered `Waiting`.
@@ -1716,15 +1845,23 @@ impl Core {
             LockOutcome::Granted { mode, .. } => Some(*mode),
             _ => None,
         };
-        let op = self
-            .lk
-            .ops
-            .iter()
-            .filter(|(_, o)| {
-                o.ino == ino && o.owner == from && granted_mode.is_none_or(|m| m.covers(o.mode))
-            })
-            .map(|(op, _)| *op)
-            .next();
+        // By inode and mode; the op asked at `from` first, else any op
+        // for the inode: the owner this op last asked may not be the
+        // owner that serves the queue (a delegation made or recalled
+        // meanwhile, a `NotOwner` redirect in flight). A push for an
+        // inode nobody here waits for is the only one dropped — the
+        // grant is then outwaited by its owner, so dropping one that
+        // *is* wanted costs everyone a window (EC2 campaign 8).
+        let candidates = || {
+            self.lk
+                .ops
+                .iter()
+                .filter(|(_, o)| o.ino == ino && granted_mode.is_none_or(|m| m.covers(o.mode)))
+        };
+        let op = candidates()
+            .find(|(_, o)| o.owner == from)
+            .or_else(|| candidates().next())
+            .map(|(op, _)| *op);
         let Some(op) = op else {
             // No op waits for it: the grant is unknown here; the owner's
             // recall will find no holder and outwait it, or its next
@@ -1732,8 +1869,18 @@ impl Core {
             return;
         };
         if let Some(o) = self.lk.ops.get_mut(&op) {
+            if o.owner != from {
+                self.stats.lock_pushes_from_other_owner += 1;
+                o.owner = from;
+            }
             if let Some(req) = o.req.take() {
                 self.lk.by_req.remove(&req);
+                // Its reply, if the owner answers it too, installs the
+                // id the owner then tracks (`on_lock_reply`).
+                self.lk.done_reqs.insert(req, ino);
+                while self.lk.done_reqs.len() > DONE_REQS_KEPT {
+                    self.lk.done_reqs.pop_first();
+                }
             }
             if sent < o.sent_at {
                 o.sent_at = sent;

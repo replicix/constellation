@@ -165,6 +165,24 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    waiter is dropped. So a node that dies while queued costs the waiters
    behind it at most one `ttl + margin` from its last message, and
    nothing if the lock frees later than that.
+   The queue is served strictly in arrival order: a waiter that cannot
+   be granted yet (its holder's recall is out) holds everyone behind
+   it, a re-send keeps its position, and the holder's own next request
+   — the owner's included — queues behind everyone parked meanwhile. A
+   grant that goes unused (its push found no waiting request, its reply
+   lapsed on arrival, the requester's owner changed) is outwaited, and
+   the node it was for keeps its old position when it asks again
+   (`requeued_in_place`) rather than parking behind everyone who asked
+   since. A push is accepted whichever node it comes from; the reply to
+   a request a push already answered installs the id the owner
+   re-affirmed the grant under; a recall naming a newer id of the same
+   owner than the one held applies to the held grant (which adopts the
+   id); and a release naming an id the owner has since replaced ends
+   the grant there too (`released_superseded`). Each of these gaps
+   otherwise cost every waiter a `ttl + margin` outwait, and let the
+   released node re-lock under its cached grant ahead of them (EC2
+   campaign 8: one committer waiting 16–28 s while the other took turn
+   after turn).
 4. A non-blocking request (`F_SETLK`, `flock -n`) that conflicts gets
    `EAGAIN` at once. The recall still goes out, so a retry succeeds once
    the other node's application unlocks (SQLite's busy loop relies on
@@ -384,8 +402,8 @@ for both roles:
   `recalled`, `recalled_busy`, `released`, `fenced_io`;
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
-  `grace_refusals`, `requests_in_flight`, `waiters`,
-  `recalls_in_flight`.
+  `grace_refusals`, `requeued_in_place`, `released_superseded`,
+  `requests_in_flight`, `waiters`, `recalls_in_flight`.
 
 These counters are not exported to `/metrics` or shown in the web UI.
 

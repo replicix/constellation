@@ -232,6 +232,9 @@ pub struct LockStats {
     pub released: u64,
     /// I/O refused because the grant lapsed.
     pub fenced_io: u64,
+    /// Recalls that named a newer id of the same owner than the held
+    /// one (adopted; see `recall_held`).
+    pub recalled_superseded: u64,
     /// The grant's read wait (`locks::granted`): grants whose floor the
     /// replica had not reached when they arrived (the first read under
     /// the lock waited), the milliseconds those waits took, and the ones
@@ -650,6 +653,27 @@ impl LockTables {
             held.recalled |= old.recalled;
             held.releasing = old.releasing;
             held.idle_since_ms = old.idle_since_ms;
+        } else if let Some(old) = g.held.get(&ino).copied().filter(|o| {
+            o.id.node == held.id.node
+                && o.id.seq < held.id.seq
+                && o.owner == held.owner
+                && held.mode.covers(o.mode)
+        }) {
+            // The same owner re-affirmed the grant under a newer id (a
+            // request of this node it answered after pushing the old
+            // one; an owner never weakens a live grant, so a weaker mode
+            // is a fresh grant after a lapse, replaced below): the local
+            // locks, the recalled flag and the release in flight
+            // continue under the new id — it is the id the owner will
+            // recall and expects released. Installed as a fresh, unused
+            // grant it would sit `first_use` until a local lock came, and
+            // its release would name an id the owner no longer had (the
+            // grant was outwaited then).
+            held.until_ms = old.until_ms.max(held.until_ms);
+            held.recalled |= old.recalled;
+            held.releasing = old.releasing;
+            held.first_use = old.first_use;
+            held.idle_since_ms = old.idle_since_ms;
         }
         let recalled = held.recalled;
         if let Some(old) = g.held.insert(ino, held) {
@@ -690,8 +714,25 @@ impl LockTables {
     /// holds it (`busy`: local locks under it), `None` when it does not.
     pub fn recall_held(&self, ino: u64, id: GrantId) -> Option<bool> {
         let mut g = self.lock();
-        let h = g.held.get_mut(&ino).filter(|h| h.id == id)?;
+        // The owner's newest id supersedes an older one of its own this
+        // node still holds (it re-affirmed the grant under a new id for
+        // a request that crossed the old id's push): the recall is for
+        // this grant, which adopts the id — its release then names the
+        // id the owner has. Unrecalled, the cached grant kept serving
+        // local locks while the owner's waiters sat until it lapsed
+        // (EC2 campaign 8: a turn taken under such a grant while the
+        // other committer's request was parked).
+        let h = g
+            .held
+            .get_mut(&ino)
+            .filter(|h| h.id == id || (h.id.node == id.node && h.id.seq < id.seq))?;
+        let old = h.id;
+        h.id = id;
         h.recalled = true;
+        if old != id {
+            g.tombstone(old);
+            g.stats.recalled_superseded += 1;
+        }
         let busy = g.local.get(&ino).is_some_and(|v| !v.is_empty());
         g.stats.recalled += 1;
         if busy {
@@ -1497,5 +1538,108 @@ mod idle_tests {
         assert_eq!(t.idle_before(11).len(), 1);
         assert!(t.held(7).unwrap().recalled);
         assert!(t.begin_release(7).is_some());
+    }
+}
+
+#[cfg(test)]
+mod supersede_tests {
+    use super::*;
+
+    fn held(seq: u64) -> HeldGrant {
+        HeldGrant {
+            id: GrantId { node: 1, seq },
+            mode: LockMode::Exclusive,
+            until_ms: 5_000,
+            renew_at_ms: 2_500,
+            owner: 1,
+            recalled: false,
+            position: Position::ZERO,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since_ms: None,
+        }
+    }
+
+    fn lock() -> LocalLock {
+        LocalLock {
+            owner: 9,
+            pid: 1,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        }
+    }
+
+    /// EC2 campaign 8: the owner re-affirmed the grant under a new id
+    /// while the old one was on its way here; its recall names the new
+    /// id. The held grant adopts it (and is recalled), so the release
+    /// names the id the owner has — instead of the recall finding
+    /// nothing and the cached grant serving local locks until it lapsed.
+    #[test]
+    fn a_recall_by_a_newer_id_of_the_same_owner_adopts_it() {
+        let t = LockTables::default();
+        assert!(matches!(t.install_held(7, held(4)), Installed::Ok { .. }));
+        assert_eq!(t.local_set(7, lock(), 0), LocalOutcome::Done);
+        // Another owner's id, or an older one of ours: not this grant.
+        assert!(t.recall_held(7, GrantId { node: 2, seq: 9 }).is_none());
+        assert!(t.recall_held(7, GrantId { node: 1, seq: 3 }).is_none());
+        assert!(!t.held(7).unwrap().recalled);
+        assert_eq!(t.recall_held(7, GrantId { node: 1, seq: 6 }), Some(true));
+        let h = t.held(7).unwrap();
+        assert!(h.recalled);
+        assert_eq!(h.id, GrantId { node: 1, seq: 6 });
+        assert_eq!(t.stats().recalled_superseded, 1);
+        // A late install of the old id is refused (released here).
+        assert!(matches!(t.install_held(7, held(4)), Installed::Released));
+        // Under a recalled grant a new owner needs a fresh grant.
+        assert!(matches!(
+            t.local_set(
+                7,
+                LocalLock {
+                    owner: 10,
+                    ..lock()
+                },
+                0
+            ),
+            LocalOutcome::Conflict(_)
+        ));
+        assert!(t.local_unlock(7, 9, 0, u64::MAX, 1));
+        assert_eq!(
+            t.begin_release(7).map(|h| h.id),
+            Some(GrantId { node: 1, seq: 6 })
+        );
+    }
+
+    /// The owner's newer id arriving as a reply (the request a push had
+    /// answered) merges: the local lock continues under it, `first_use`
+    /// and the recalled flag are the held grant's, the old id is dead.
+    #[test]
+    fn a_newer_id_of_the_same_owner_merges_the_local_state() {
+        let t = LockTables::default();
+        assert!(matches!(t.install_held(7, held(4)), Installed::Ok { .. }));
+        assert_eq!(t.local_set(7, lock(), 0), LocalOutcome::Done);
+        assert_eq!(t.recall_held(7, GrantId { node: 1, seq: 4 }), Some(true));
+        let newer = HeldGrant {
+            until_ms: 9_000,
+            ..held(5)
+        };
+        assert!(matches!(
+            t.install_held(7, newer),
+            Installed::Ok { recalled: true }
+        ));
+        let h = t.held(7).unwrap();
+        assert_eq!(h.id, GrantId { node: 1, seq: 5 });
+        assert!(h.recalled && !h.first_use);
+        assert_eq!(h.until_ms, 9_000);
+        assert!(matches!(t.install_held(7, held(4)), Installed::Released));
+        // A different owner's grant on the inode is a fresh one.
+        let other = HeldGrant {
+            id: GrantId { node: 2, seq: 1 },
+            owner: 2,
+            ..held(1)
+        };
+        assert!(matches!(t.install_held(7, other), Installed::Ok { .. }));
+        assert!(t.held(7).unwrap().first_use);
     }
 }

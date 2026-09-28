@@ -1555,6 +1555,13 @@ pub struct LockStatus {
     pub waiters_parked: u64,
     #[serde(default)]
     pub grace_refusals: u64,
+    /// Waiters re-parked at their old queue position after a grant to
+    /// them went unused, and releases that named a grant id this owner
+    /// had replaced (both ended a grant that was otherwise outwaited).
+    #[serde(default)]
+    pub requeued_in_place: u64,
+    #[serde(default)]
+    pub released_superseded: u64,
     /// Right now: requests in flight, parked waiters, recalls in flight.
     #[serde(default)]
     pub requests_in_flight: u64,

@@ -27546,3 +27546,117 @@ the forwards now continuing, the window only delays the first answer.
 
   ² In the three-phase run on main, phase 2 found no live holder after
   phase 1 (the lease expired unclaimed), so it measured nothing new.
+## Fix: lock queue fairness (campaign 8 B-1 follow-up)
+
+Audit of the owner's waiter queue (`authority/core/locks.rs`) and the
+node-side request path (`cli/locks.rs`, `meta/locks.rs`) for FIFO
+violations, after campaign 8's committer waited 16–28 s while the
+releaser re-locked 1.4–5 s after each of its own releases.
+
+### Findings
+
+What held: a request parks at the back and re-sends re-attach in place;
+a conflicting park recalls the holder at once; the owner's own next
+request retries only after its release served the queue; the local
+table refuses a cached grant once it is recalled. What did not:
+
+1. A waiter's grant can go unused: the push found no op (the requester
+   had re-routed — `on_lock_granted_push` matched the op by the owner it
+   last asked, so a push from a new delegate or after a `NotOwner`
+   redirect was dropped), or the reply lapsed on arrival. The owner
+   outwaits the grant (`ttl + margin`), and the node's next request
+   parked at the *back* (its waiter was removed when granted). Every
+   contender then paid a window, and the requester lost its place —
+   the campaign's 5 s dead gaps followed by the other committer's turn.
+2. A re-sent request that crosses the old id's push is answered with a
+   *new* grant id (`lock_try_grant` mints one per answer). The node held
+   the old id: the owner's recall named the new one, `recall_held`
+   found nothing (`note_pending_recall`), the node never released,
+   and its cached grant kept serving local re-locks while the other
+   node's request sat parked — the local re-lock under a still-cached
+   grant bypassing the queue. On release the node named the old id,
+   which the owner no longer had, so that grant was outwaited too.
+3. `lock_serve_waiters` kept trying the waiters behind one it could not
+   grant: a shared waiter behind a parked exclusive one was served
+   first (the holder shared), starving the exclusive one.
+
+### Fix
+
+- Owner: waiters are served in `since` order; a waiter that cannot be
+  granted stops the scan; a served remote waiter's `since` is kept per
+  `(node, inode)` (`LockState::served`, `4 × ttl`, cleared when the
+  grant is used: released or renewed) and a re-park inherits it
+  (`lock_requeued_in_place`); a `LockReleased` naming an id this owner
+  replaced ends the node's live grant (`lock_released_superseded`).
+- Node: a push is matched by inode (the op's owner preferred, else any:
+  `lock_pushes_from_other_owner`); the reply to a request a push
+  answered installs the re-affirmed id over the held one
+  (`done_reqs`, `lock_late_replies_installed`); `LockTables::recall_held`
+  applies a recall naming a newer id of the same owner to the held
+  grant, which adopts the id (`recalled_superseded`);
+  `LockTables::install_held` merges a newer id of the same owner and at
+  least the held mode (a weaker one is a fresh grant after a lapse).
+- `status.locks`: `requeued_in_place`, `released_superseded`.
+
+### Tests
+
+- meta: `a_recall_by_a_newer_id_of_the_same_owner_adopts_it`,
+  `a_newer_id_of_the_same_owner_merges_the_local_state`.
+- core: `waiters_are_served_in_arrival_order_and_a_re_request_queues_behind_them`
+  (two remote requesters plus the releaser's re-request: grants go
+  3, 4, 2), `a_waiter_whose_grant_went_unused_re_parks_at_its_old_position`,
+  `a_release_naming_a_superseded_id_ends_the_grant`,
+  `a_push_from_another_owner_than_the_one_asked_is_accepted`,
+  `the_reply_to_a_request_a_push_answered_installs_the_owners_new_id`.
+- sim: the lock ghost records every wait (`wait_begin`/`wait_end`, a
+  drop guard for abandoned steps) and counts `overtaken`: an
+  acquisition while a client of another node had waited `LOCK_FAIR_MS`
+  (12 s, `2 × (ttl + margin)`) longer. `locks_are_mutually_exclusive`
+  (200 fault-free seeds) asserts 0; the fault configurations report it.
+- Harness: the gitflock fairness line (previous section) and
+  `lock-latency`'s counters (`requeued_in_place` 0 once the memory is
+  cleared on use; an earlier draft that kept it counted 18 and made
+  `lock-holder-killed-contention` outwait a second grant).
+
+### Files
+
+- `crates/authority/src/core/{locks,mod}.rs`, `crates/authority/src/core/tests.rs`
+- `crates/authority/tests/sim/{locks,run}.rs`, `crates/authority/tests/sim.rs`
+- `crates/meta/src/locks.rs`, `crates/api/src/types.rs`, `crates/cli/src/main.rs`
+- `docs/reference/features/cluster-locks.md`
+
+### Results (worktree `constellation-lockfair` on `3fc395c`, prefix `constellation-harness-lockfair`)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) clean.
+- Unit tests: authority lib 138 (27 lock tests), sim 107 (every
+  `locks_*` configuration; `locks_are_mutually_exclusive` with
+  `overtaken == 0` over 200 seeds), meta_repro 3; meta 105; api 5; cli
+  bin 291; harness 14. All pass.
+- Harness (25 ms S3 latency), all pass: flock-cross-node, lock-failover,
+  lock-holder-killed-contention (x3: 1 grant outwaited, the dead
+  holder's; d granted 8–16 ms after the unlock with the dead waiter
+  ahead of it), lock-fence-at-close, lock-holder-partitioned,
+  lock-latency (contended handoff p50 1.9 ms; `requeued_in_place` 0),
+  lock-grant-dead-generation, git-under-flock-b2b (73 turns, 0 double
+  turns, 1 granted ahead of an earlier waiter — a request that asked
+  microseconds earlier and was served next), git-under-flock (54 turns,
+  0 and 0), git-under-flock-faults, git-under-flock-causal (58 turns,
+  0 double turns).
+- The `/home/bra/cvs/constellation-cb847f8` scratch worktree is removed.
+- Rebased onto `62268ff` (the A-1 forward fix; only PROGRESS.md
+  conflicted). On the rebased tree: fmt and clippy clean; authority lib
+  146, sim 107, meta_repro 3, meta 105, api 5, cli bin 291, harness 14
+  pass. `long_locks` at 1000 seeds per configuration (13
+  configurations, 723 s): all pass, mutual exclusion never violated;
+  `overtaken` 0 in every fault-free configuration (`locks`, `-skew`,
+  `-faults`, `-pause`, `-delegated`, `-released-delegated`, `-writes`,
+  `-delegated-writes`, `-released-writes`), 49 under `locks-partition`
+  and 1 each under the two failover configurations (a partitioned or
+  paused waiter is skipped by design). `sweep_config` now takes the
+  lock configurations: `locks-released-delegated` seeds
+  198000–199999 (2000, 8 threads): 0 failures. Lock harness on the
+  rebased build, all pass: flock-cross-node, lock-failover,
+  lock-holder-killed-contention (1 grant outwaited, the dead holder's),
+  lock-fence-at-close, lock-holder-partitioned, lock-latency,
+  lock-grant-dead-generation, git-under-flock-b2b (73 turns, 1 double
+  turn), git-under-flock (51 turns, 0).

@@ -5606,6 +5606,8 @@ impl constellation_api::StatusSource for DaemonStatus {
                     reclaimed: stats.lock_reclaimed,
                     waiters_parked: stats.lock_waiters_parked,
                     grace_refusals: stats.lock_grace_refusals,
+                    requeued_in_place: stats.lock_requeued_in_place,
+                    released_superseded: stats.lock_released_superseded,
                     requests_in_flight: core.lock_requests_in_flight as u64,
                     waiters: core.lock_waiters as u64,
                     recalls_in_flight: core.lock_recalls_in_flight as u64,

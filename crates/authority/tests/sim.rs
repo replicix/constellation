@@ -2485,6 +2485,19 @@ fn sweep_config() {
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
         "flex-crash" => flex_crash_config(),
+        // The lock configurations (`long_locks` runs them in sequence).
+        "locks" => locks_config(),
+        "locks-partition" => locks_partition_config(),
+        "locks-skew" => locks_skew_config(),
+        "locks-failover" => locks_failover_config(),
+        "locks-failover-backup" => locks_failover_backup_config(),
+        "locks-faults" => locks_faults_config(),
+        "locks-pause" => locks_pause_config(),
+        "locks-delegated" => locks_delegated_config(),
+        "locks-released-delegated" => locks_released_delegated_config(),
+        "locks-writes" => with_lock_writes(locks_config(), ""),
+        "locks-delegated-writes" => with_lock_writes(locks_delegated_config(), "d2"),
+        "locks-released-writes" => with_lock_writes(locks_released_delegated_config(), "d2"),
         other => panic!("sweep_config: unknown config {other}"),
     };
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -3785,6 +3798,7 @@ impl M14Totals {
         c.turn_reads += l.turn_reads;
         c.stale_turn_reads += l.stale_turn_reads;
         c.late_unacked_turns += l.late_unacked_turns;
+        c.overtaken += l.overtaken;
         for s in r.stats.values() {
             self.grants += s.lock_grants;
             self.requests += s.lock_requests;
@@ -3836,6 +3850,9 @@ fn locks_are_mutually_exclusive() {
     assert!(t.recalls_released > 100, "recalls never released: {t:?}");
     assert!(t.clients.ios > 1_000, "little I/O under locks: {t:?}");
     assert!(t.clients.local_conflicts > 0, "no local contention: {t:?}");
+    // Fairness (EC2 campaign 8): without faults nobody is granted while
+    // a client of another node has waited a whole grant window longer.
+    assert_eq!(t.clients.overtaken, 0, "a waiter was overtaken: {t:?}");
 }
 
 /// Plan 30 §M14: a partitioned lock holder's grant lapses under its

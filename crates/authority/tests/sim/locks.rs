@@ -95,7 +95,17 @@ pub struct LockCounters {
     pub stale_turn_reads: u64,
     /// Reads that found an unacknowledged older turn landed late.
     pub late_unacked_turns: u64,
+    /// Fairness: acquisitions made while a client on *another* node had
+    /// been waiting for the same lock for more than [`LOCK_FAIR_MS`]
+    /// longer (it asked first, by a whole grant window and more, and was
+    /// overtaken). Faults reorder legitimately (a paused or partitioned
+    /// waiter is skipped); a fault-free run should count none.
+    pub overtaken: u64,
 }
+
+/// See [`LockCounters::overtaken`]: `2 × (ttl + margin)` of the sim's
+/// default lock configuration.
+pub const LOCK_FAIR_MS: u64 = 12_000;
 
 struct InIo {
     node: NodeId,
@@ -136,6 +146,10 @@ struct GhostInner {
         Option<constellation_meta::Rid>,
         String,
     )>,
+    /// Fairness: per inode, the clients waiting for a grant `(node,
+    /// thread, since)`.
+    waiting: BTreeMap<u64, Vec<(NodeId, u64, u64)>>,
+    overtakes: Vec<String>,
 }
 
 /// The mutual-exclusion ghost and the lock clients' counters.
@@ -415,7 +429,56 @@ impl LockGhost {
             for v in g.in_io.values_mut() {
                 v.retain(|e| e.node != node);
             }
+            for v in g.waiting.values_mut() {
+                v.retain(|e| e.0 != node);
+            }
         });
+    }
+
+    /// `thread` on `node` starts waiting for a grant on `ino` (its first
+    /// `NeedGrant`).
+    pub fn wait_begin(&self, ino: u64, node: NodeId, thread: u64, at_ms: u64) {
+        self.with(|g| {
+            let v = g.waiting.entry(ino).or_default();
+            if !v.iter().any(|e| e.0 == node && e.1 == thread) {
+                v.push((node, thread, at_ms));
+            }
+        });
+    }
+
+    /// The wait ended (acquired, or given up): counts an overtake when
+    /// a client of another node has been waiting [`LOCK_FAIR_MS`] longer.
+    pub fn wait_end(&self, ino: u64, node: NodeId, thread: u64, at_ms: u64, acquired: bool) {
+        self.with(|g| {
+            let seed = g.seed;
+            let Some(v) = g.waiting.get_mut(&ino) else {
+                return;
+            };
+            let mine = v
+                .iter()
+                .find(|e| e.0 == node && e.1 == thread)
+                .map(|e| e.2);
+            v.retain(|e| !(e.0 == node && e.1 == thread));
+            let (Some(since), true) = (mine, acquired) else {
+                return;
+            };
+            let overtaken: Vec<String> = v
+                .iter()
+                .filter(|e| e.0 != node && e.2 + LOCK_FAIR_MS < since)
+                .map(|e| format!("node {} t{} (waiting since t={})", e.0, e.1, e.2))
+                .collect();
+            if !overtaken.is_empty() {
+                g.counters.overtaken += 1;
+                g.overtakes.push(format!(
+                    "seed {seed}: ino {ino:#x}: node {node} t{thread} (asked t={since}) acquired at t={at_ms} ahead of {}",
+                    overtaken.join(", ")
+                ));
+            }
+        });
+    }
+
+    pub fn overtakes(&self) -> Vec<String> {
+        self.with(|g| g.overtakes.clone())
     }
 
     /// Nodes with a client inside a critical section now.
@@ -477,6 +540,31 @@ async fn await_control(
                     return Awaited::Late;
                 }
             }
+        }
+    }
+}
+
+/// A wait registered with the fairness ghost; a step that gives up
+/// (died, would block, unavailable, a failure) withdraws it on drop.
+struct WaitGuard {
+    ghost: Arc<LockGhost>,
+    ino: u64,
+    node: NodeId,
+    thread: u64,
+    clock: super::clock::Clock,
+    done: bool,
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.ghost.wait_end(
+                self.ino,
+                self.node,
+                self.thread,
+                self.clock.elapsed_ms(),
+                false,
+            );
         }
     }
 }
@@ -544,6 +632,8 @@ pub async fn client_lock(
         )
     };
     let mut after_grant = false;
+    // The fairness ghost's record of this wait (see `WaitGuard`).
+    let mut wait: Option<WaitGuard> = None;
     // The step got a grant and its session wait completed.
     let mut fresh_grant = false;
     let mut grant_position = constellation_meta::Position::ZERO;
@@ -570,6 +660,17 @@ pub async fn client_lock(
                 tokio::time::sleep(Duration::from_millis(10 + jitter)).await;
             }
             LocalOutcome::NeedGrant(mode) => {
+                if wait.is_none() {
+                    ghost.wait_begin(ino, node, thread, t0);
+                    wait = Some(WaitGuard {
+                        ghost: ghost.clone(),
+                        ino,
+                        node,
+                        thread,
+                        clock,
+                        done: false,
+                    });
+                }
                 if after_grant {
                     // `Granted`, yet the grant does not admit the lock: it
                     // lapsed or was recalled meanwhile — or the core
@@ -675,6 +776,10 @@ pub async fn client_lock(
         }
     }
     let waited = clock.elapsed_ms() - t0;
+    if let Some(mut w) = wait.take() {
+        w.done = true;
+        ghost.wait_end(ino, node, thread, clock.elapsed_ms(), true);
+    }
     ghost.count(|c| {
         c.acquired += 1;
         c.max_wait_ms = c.max_wait_ms.max(waited);
