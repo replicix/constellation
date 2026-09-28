@@ -263,14 +263,16 @@ pub trait Replica {
     /// stream is still in its journal (no applied segment carries it).
     fn delegate_tx_pending(&self, gen: u64, idx: u64) -> bool;
     /// Phase 2b: a delegate's backup persists its transactions; returns
-    /// the highest index held contiguously.
+    /// the highest index through which every transaction is in the log
+    /// as this replica holds it or held here, contiguously above that
+    /// (`Meta::deleg_backup_acked`).
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64;
     fn deleg_backup_tail(&self, gen: u64) -> Vec<DelegateTx>;
     /// Persist (durably) that `gen` is sealed here; `false`: it could
     /// not be, and the seal must not be acknowledged.
     fn deleg_backup_seal(&self, gen: u64) -> bool;
     /// Whether this node holds anything of `gen` as its backup.
-    fn deleg_backup_acked_any(&self, gen: u64) -> bool;
+    fn deleg_backup_holds_any(&self, gen: u64) -> bool;
     fn deleg_backup_sealed(&self, gen: u64) -> bool;
     fn deleg_backup_clear(&self, gen: u64);
     /// The session watermark (what this node's client has observed).
@@ -831,7 +833,8 @@ impl Replica for Meta {
     }
 
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64 {
-        Meta::deleg_backup_append(self, gen, txs).unwrap_or(0)
+        let in_log = Meta::log_stream_idx(self, gen).unwrap_or(0);
+        Meta::deleg_backup_append(self, gen, in_log, txs).unwrap_or(0)
     }
 
     fn deleg_backup_tail(&self, gen: u64) -> Vec<DelegateTx> {
@@ -848,8 +851,8 @@ impl Replica for Meta {
         }
     }
 
-    fn deleg_backup_acked_any(&self, gen: u64) -> bool {
-        Meta::deleg_backup_acked(self, gen).unwrap_or(0) > 0
+    fn deleg_backup_holds_any(&self, gen: u64) -> bool {
+        Meta::deleg_backup_holds_any(self, gen).unwrap_or(false)
     }
 
     fn deleg_backup_sealed(&self, gen: u64) -> bool {

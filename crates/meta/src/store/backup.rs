@@ -303,8 +303,18 @@ impl Meta {
     pub fn backup_clear(&self) -> Result<(), MetaError> {
         *self.backup_tail_floor.lock().unwrap() = None;
         let mut tx = self.db.write_tx();
+        // The holder's tail only: the keys from `DELEG_BACKUP_BASE` up
+        // are the delegates' streams this node backs, which outlive any
+        // holder tenure (long-delegated-backup seed 70232: a node that
+        // stopped being the holder's backup wiped a delegate's rows too;
+        // its acknowledgement fell to 0 for good, the delegate re-sent
+        // and was answered short in a loop, and its client's op waited
+        // for a segment no holder was left to ship).
         let keys: Vec<Vec<u8>> = tx
-            .range(&self.backup_tail, tail_key(0, 0)..)
+            .range(
+                &self.backup_tail,
+                tail_key(0, 0)..tail_key(DELEG_BACKUP_BASE, 0),
+            )
             .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
             .collect::<Result<_, _>>()?;
         for k in keys {
@@ -391,10 +401,11 @@ fn deleg_sealed_key(gen: u64) -> String {
 impl Meta {
     /// A delegate's transactions `txs` of generation `gen`, persisted by
     /// its backup (idempotent: a retransmission rewrites the same keys).
-    /// Returns the highest contiguous index held from 1.
+    /// Returns [`Meta::deleg_backup_acked`] from `in_log`.
     pub fn deleg_backup_append(
         &self,
         gen: u64,
+        in_log: u64,
         txs: &[super::DelegateTx],
     ) -> Result<u64, MetaError> {
         let mut tx = self.db.write_tx();
@@ -404,15 +415,24 @@ impl Meta {
             tx.insert(&self.backup_tail, tail_key(deleg_epoch(gen), t.idx), bytes);
         }
         tx.commit()?;
-        self.deleg_backup_acked(gen)
+        self.deleg_backup_acked(gen, in_log)
     }
 
-    /// The highest index held contiguously from 1 (0: nothing).
-    pub fn deleg_backup_acked(&self, gen: u64) -> Result<u64, MetaError> {
+    /// The highest index through which every transaction of `gen` is
+    /// either in the log as this replica holds it (`in_log`, its
+    /// [`Meta::log_stream_idx`]) or held here, contiguously above it.
+    ///
+    /// Not contiguous from 1: a delegate re-sends only what it has not
+    /// seen in the log (what it retired is gone from its journal), so a
+    /// backup chosen mid-generation, or one that lost rows, could never
+    /// be caught up that way — every answer short, every re-send the same
+    /// suffix, the acknowledgements it gates waiting for a segment.
+    pub fn deleg_backup_acked(&self, gen: u64, in_log: u64) -> Result<u64, MetaError> {
         let r = self.db.read_tx();
         let e = deleg_epoch(gen);
-        let mut acked = 0u64;
-        for guard in r.range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX)) {
+        let mut acked = in_log;
+        let from = in_log.saturating_add(1);
+        for guard in r.range(&self.backup_tail, tail_key(e, from)..=tail_key(e, u64::MAX)) {
             let (k, _) = guard.into_inner()?;
             let (_, idx) = decode_tail_key(&k)?;
             if idx == acked + 1 {
@@ -422,6 +442,20 @@ impl Meta {
             }
         }
         Ok(acked)
+    }
+
+    /// Whether any transaction of `gen` is held here.
+    pub fn deleg_backup_holds_any(&self, gen: u64) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        let e = deleg_epoch(gen);
+        let mut it = r.range(&self.backup_tail, tail_key(e, 0)..=tail_key(e, u64::MAX));
+        match it.next() {
+            Some(guard) => {
+                guard.into_inner()?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Every transaction held of generation `gen`, in index order.
@@ -674,6 +708,68 @@ mod tests {
         assert_eq!(backup.backup_sealed_epoch().unwrap(), 3);
         backup.backup_clear().unwrap();
         assert!(backup.backup_role().unwrap().is_none());
+    }
+
+    fn deleg_tx(idx: u64) -> crate::DelegateTx {
+        crate::DelegateTx {
+            idx,
+            rid: None,
+            records: Vec::new(),
+            deps: Default::default(),
+        }
+    }
+
+    /// long-delegated-backup seed 70232: a node that stops being the
+    /// holder's backup discards the holder's tail, never the delegate
+    /// streams it backs.
+    #[test]
+    fn clearing_the_holder_tail_keeps_a_delegates_backup_rows() {
+        let backup = Meta::open_in_memory().unwrap();
+        backup
+            .backup_append(
+                3,
+                &[BackupTx {
+                    first: 5,
+                    last: 6,
+                    records: Vec::new(),
+                    origin: (0, 0),
+                }],
+            )
+            .unwrap();
+        let txs: Vec<_> = (1..=3).map(deleg_tx).collect();
+        assert_eq!(backup.deleg_backup_append(9, 0, &txs).unwrap(), 3);
+        backup.backup_clear().unwrap();
+        assert!(backup.backup_tail(3).unwrap().is_empty());
+        assert_eq!(backup.deleg_backup_tail(9).unwrap(), txs);
+        assert_eq!(backup.deleg_backup_acked(9, 0).unwrap(), 3);
+        assert!(backup.deleg_backup_holds_any(9).unwrap());
+        assert!(!backup.deleg_backup_holds_any(8).unwrap());
+    }
+
+    /// A delegate re-sends only what it has not seen in the log: a backup
+    /// that holds a suffix acknowledges it from what the log gives it,
+    /// and never skips a gap above that.
+    #[test]
+    fn a_delegate_backup_acknowledges_from_the_log() {
+        let backup = Meta::open_in_memory().unwrap();
+        // Rows 1..=12 are in the log here; only 13 is held.
+        assert_eq!(
+            backup.deleg_backup_append(9, 12, &[deleg_tx(13)]).unwrap(),
+            13
+        );
+        // Behind the log: rows 11 and 12 are neither held nor applied.
+        assert_eq!(backup.deleg_backup_acked(9, 10).unwrap(), 10);
+        // A gap above the log is never skipped.
+        assert_eq!(
+            backup.deleg_backup_append(9, 12, &[deleg_tx(15)]).unwrap(),
+            13
+        );
+        assert_eq!(
+            backup.deleg_backup_append(9, 12, &[deleg_tx(14)]).unwrap(),
+            15
+        );
+        // The log past everything held.
+        assert_eq!(backup.deleg_backup_acked(9, 20).unwrap(), 20);
     }
 }
 

@@ -27161,3 +27161,97 @@ bytes apart in the failure message.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets
   -D warnings` clean; harness lib tests 14 pass. No core change, so no
   sim sweep.
+
+## Fix: long-delegated-backup seed 70232 (gate finding)
+
+The full gate on `5437fa6` found `long-delegated-backup` seed 70232
+failing 3/3: node 3's delegated `Create f0` answered only after 540 s of
+simulated time. Faults: S3 cut for node 2, partition 1<->2, holder 1
+crashed at t=4786 with a restart after 2.7 s.
+
+### Bisect
+
+First failing commit: `cb847f8` (inbox polling: a new requester starts
+warm or cold, a poll is one GET until it hits). That commit only moved
+the schedule. Its inbox change shifted the holder's S3 timing: the
+reconfiguration dropping backup 2 landed at t=4559 instead of t=4533,
+and the next one, to `backups=[3]` (config v4), did not land before
+the crash. On `059c3f7` it landed at t=4774, node 3 took
+over as the listed backup, ended its own delegation and replayed the op.
+On `cb847f8` the crash hit while the config said `backups=[]`. The bug
+underneath was already there: it came with delegate backups
+(phase 2b).
+
+### Root cause
+
+- Node 2 was the backup of delegate 3's generation 9 (rows 1..=12
+  acknowledged). When the holder went silent, node 2 read the lease and
+  found it was no longer listed, so it discarded its holder tail
+  (`Meta::backup_clear`). That clear walked the whole `backup_tail`
+  keyspace from `(0, 0)`. It also deleted the delegate-backup rows,
+  which share that keyspace at epochs from `DELEG_BACKUP_BASE` (1<<48).
+- Node 3 executed `Create f0` as idx 13. The acknowledgement was gated
+  on the backup. Node 2 held only row 13 and computed its ack as the
+  highest index contiguous from 1, so it answered `acked=0`. The
+  delegate re-sent from 1. Its journal holds only the rows it has not
+  yet seen in the log (1..=12 were retired), so the re-send was just
+  row 13 again. The answer stayed 0, the re-send went out at once, and
+  the pair ping-ponged about 22k appends in 540 s. The op stayed parked
+  (`Recalling`). Its other release, the row shipping in a segment,
+  needs a root holding the lease.
+- Why neither takeover completed: node 2 and node 3 each sealed and
+  read the lease, found they were not listed (config v3: `Local`, no
+  backups), and correctly stood down. Why the restarted holder stayed
+  invisible: node 1 was back by t=7532, but the lease is acquired on
+  demand. The only demand in the cluster was node 3's op, stuck in the
+  delegate's ack gate. It never reached the client path (forward, learn
+  holder, acquire). The root refused node 3's stream batches because it
+  did not hold the lease, and a refusal is not demand. Nothing asked
+  for the lease until the sim's settle op at t=543632.
+- Any backup chosen mid-generation had the same problem (after an
+  unreachable one is dropped, `deleg_backup_select` picks a new one):
+  it could never be caught up, and its acks waited for a segment.
+
+### Fix
+
+- `Meta::backup_clear` clears only the holder's tail (keys below
+  `DELEG_BACKUP_BASE`). This was also a durability hole: the wipe took
+  unshipped rows a delegate had already acknowledged on its backup.
+- A delegate backup acknowledges from the log. `deleg_backup_append`
+  and `deleg_backup_acked` take `in_log` (the backup's
+  `log_stream_idx(gen)`: every row of `gen` up to it is in the log as
+  the backup holds it). The ack is `in_log` plus the rows held
+  contiguously above it, so a gap above the log is never skipped. The
+  seal check uses `deleg_backup_holds_any` (any row held) instead of
+  "contiguous from 1 > 0".
+- The delegate paces a short ack it cannot fill. When the first row it
+  still holds is above `acked + 1`, the missing rows are in the log and
+  the backup has not applied that segment yet. The next append then
+  waits for the stream tick (`backup_after`, 4 ticks, and the tick
+  re-arms meanwhile) instead of going out at once. In a 2000-seed
+  `long-delegated-backup` sweep this path fired 43 times; each of those
+  was a hot message loop before.
+
+### Tests
+
+- Seed 70232 is pinned in `regression_long_delegated_backup_seeds`.
+- Meta unit tests: `clearing_the_holder_tail_keeps_a_delegates_backup_rows`
+  and `a_delegate_backup_acknowledges_from_the_log`.
+
+### Files
+
+- `crates/meta/src/store/backup.rs`
+- `crates/authority/src/replica.rs`, `crates/authority/src/core/delegate.rs`
+- `crates/authority/tests/sim.rs`
+- Docs: `delegations.md`
+
+### Results
+
+- Replay of seed 70232: passes. The settle op now runs at t=15370
+  instead of t=543632.
+- `constellation-authority` lib 133, sim 107 (+11 ignored), meta_repro
+  3; `constellation-meta` lib 101 plus its integration tests. All pass.
+  clippy clean for both crates.
+- `sweep_config long-delegated-backup` 70000..80000: 0 failing.
+- `long_backup`, `long_delegated`, `long_random` at 2000 seeds: pass.
+- `sweep_config flex-crash` 0..5000: 0 failing.

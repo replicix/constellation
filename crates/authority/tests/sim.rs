@@ -3321,10 +3321,16 @@ fn regression_long_delegated_seeds() {
 /// - 74035: a paused root, deposed without knowing it, drained a sealed
 ///   delegate backup's marker whose `deps` named its successor's journal
 ///   (where the data was); its replica showed the marker without the
-///   data until the deposition stranded it.
+///   data until the deposition stranded it;
+/// - 70232: a node that stopped being the holder's backup (the holder
+///   crashed with none listed) discarded its holder tail and a
+///   delegate's backup rows with it; the delegate's backup answered
+///   `acked=0` for good (contiguous from 1, and the delegate re-sends
+///   only its unshipped suffix), 22k append round trips followed, and the
+///   delegate's client op waited 540 s for a segment no holder shipped.
 #[test]
 fn regression_long_delegated_backup_seeds() {
-    for seed in [71_251, 71_792, 75_504, 78_172, 77_901, 74_035] {
+    for seed in [71_251, 71_792, 75_504, 78_172, 77_901, 74_035, 70_232] {
         run_m11(
             "long-delegated-backup",
             long_delegated_backup_config(),

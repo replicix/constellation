@@ -189,6 +189,11 @@ pub(crate) struct DelegateState {
     pub backup_inflight: Option<(OpId, u64)>,
     pub backup_sealed: bool,
     pub backup_failures: u32,
+    /// The next append is not before this: the backup answered short of
+    /// rows this delegate has already retired (they are in the log, the
+    /// backup has not applied them yet), so a re-send now would be
+    /// answered the same.
+    pub backup_after: Option<Ms>,
     /// The backup the in-flight renewal named (the root must learn a
     /// newly chosen backup before the next timer).
     pub renew_backup: Option<NodeId>,
@@ -418,6 +423,7 @@ impl Core {
                     backup_inflight: None,
                     backup_sealed: false,
                     backup_failures: 0,
+                    backup_after: None,
                     renew_backup: None,
                     inflight_at: Ms(0),
                     backup_inflight_at: Ms(0),
@@ -955,6 +961,7 @@ impl Core {
                 d.backup = Some(b);
                 d.backup_acked = 0;
                 d.backup_sent_through = 0;
+                d.backup_after = None;
                 chosen.push(d.gen);
                 tracing::info!(
                     node = self.cfg.node_id,
@@ -982,7 +989,7 @@ impl Core {
         for gen in gens {
             let d = self.dl.mine.get(&gen).expect("present");
             let Some(backup) = d.backup else { continue };
-            if d.backup_inflight.is_some() {
+            if d.backup_inflight.is_some() || d.backup_after.is_some_and(|t| now < t) {
                 continue;
             }
             let from = d.backup_sent_through + 1;
@@ -1050,13 +1057,43 @@ impl Core {
         }
         d.backup_failures = 0;
         d.backup_acked = d.backup_acked.max(acked);
+        d.backup_after = None;
+        let mut paced = false;
         if let Some((_, last)) = inflight {
             if acked < last {
                 // Short: resend from what it holds.
                 d.backup_sent_through = acked;
+                // Unless the gap is below what this delegate still holds:
+                // those rows are in the log (retired here), the backup
+                // has not applied that segment yet, and a re-send now
+                // is answered the same — a message loop at the round
+                // trip (long-delegated-backup seed 70232: 22k appends).
+                // Again on the stream tick; the backup catches up on the
+                // log meanwhile.
+                let first = replica
+                    .delegate_txs_from(gen, acked + 1, 1)
+                    .first()
+                    .map(|t| t.idx);
+                if first.is_some_and(|f| f > acked + 1) {
+                    let wait = self.cfg.delegation_stream_tick_ms.max(1) * 4;
+                    let d = self.dl.mine.get_mut(&gen).expect("present");
+                    d.backup_after = Some(now.plus(wait));
+                    paced = true;
+                    tracing::debug!(
+                        node = self.cfg.node_id,
+                        gen,
+                        backup = from,
+                        acked,
+                        first,
+                        "delegate backup behind the log; appending again on the tick"
+                    );
+                }
             } else {
                 d.backup_sent_through = d.backup_sent_through.max(last);
             }
+        }
+        if paced {
+            self.arm_stream_tick(now, out);
         }
         self.complete_ready(now, replica, out);
         self.deleg_backup_stream(now, replica, out);
@@ -1125,7 +1162,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
-        let backing = (self.dl.backing.contains_key(&gen) || replica.deleg_backup_acked_any(gen))
+        let backing = (self.dl.backing.contains_key(&gen) || replica.deleg_backup_holds_any(gen))
             // Persisted (and synced) before it is acknowledged; not
             // persisted: answered unsealed, and the root falls back to
             // its plain reclaim.
@@ -1493,11 +1530,13 @@ impl Core {
             });
         }
         // A lost ack (the transport reports it), a batch that could not
-        // be sent, a generation backing off, or rows held back behind
-        // another generation's acknowledgement: the tick retries.
+        // be sent, a generation (or its backup append) backing off, or
+        // rows held back behind another generation's acknowledgement:
+        // the tick retries.
         if self.dl.mine.values().any(|d| {
             d.inflight.is_some()
                 || d.stream_after.is_some_and(|t| now < t)
+                || d.backup_after.is_some_and(|t| now < t)
                 || (!d.stopped && replica.delegate_idx(d.gen) > d.streamed_through)
         }) {
             self.arm_stream_tick(now, out);

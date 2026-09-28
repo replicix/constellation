@@ -272,6 +272,13 @@ designations create no delegation.
   acknowledged ops by rid through the root.
 - **Delegate crashes, with a backup**: the root has the backup seal,
   drains what it holds, and continues (`delegate-crash`).
+- **The delegate's backup is new or lost rows**: the delegate re-sends
+  only what it has not seen in the log. The backup's acknowledgement
+  covers every row it has from the log (its applied stream index), plus
+  the rows it holds contiguously above that. When the backup is behind
+  the log, its answer is short; the delegate then appends again on the
+  stream tick, not on every answer. A node that stops backing the root
+  discards only the root's tail, never the delegate streams it backs.
 - **Delegate partitioned from the root**: it stops at `sent + ttl −
   margin`, before the root may reclaim; its unstreamed rows are stranded
   and replayed.
