@@ -40,7 +40,7 @@ exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench", "vendor/fj
 version = "1.0.0"
 edition = "2021"
 license = "MPL-2.0"
-repository = "https://github.com/bra-fsn/constellation"
+repository = "https://github.com/replicix/constellation"
 
 [workspace.dependencies]
 constellation-fs-core = { path = "crates/fs-core" }
