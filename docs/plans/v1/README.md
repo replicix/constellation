@@ -54,6 +54,13 @@ Execution protocol:
 | 28 | `done/28-s3-native-metadata-store.md` | done | S3-native metadata: prolly tree + packs + CAS commit chain replace the checkpoint; reachability GC + compaction | 27 |
 | 29 | `done/29-fjall-metadata-engine.md` | done | fjall 3 local engine, partitions removed, key-delta publishing, concurrent ordered forwarding | 28 |
 | 30 | `done/30-write-path-resilience-and-scale-out.md` | done | exactly-once forwarding, speculation log, session consistency + `cto=strict`, layered durability, flexible epochs, delegated sub-sequencers, strict locks | 29 |
+| 31 | `wip/31-core-frontend-backend.md` | wip | core-isation: `constellation-engine` (one storage backend), `constellation-vfs` frontend contract (responder barriers, events, caps, policies), `constellation-platform` host layer, the control protocol, conformance kit + parity test architecture, engine profiles/lifecycle | 30 |
+| 32 | `wip/32-snapshot-policies-and-space.md` | wip | automatic snapshot policies (`every:keep` tiers in an xattr, singleton scheduler, clock-free expiry, holds), ZFS-style per-snapshot USED/WRITTEN/REFER + reclaim dry-run, web UI policy editor/simulator; prerequisite fixes for snapshots at scale | 30 |
+| 33 | `wip/33-control-plane-and-ui.md` | wip | control-plane security (per-user transports, roles, audit, token-auth headless web) + the cross-platform Tauri UI app exposing all management features; optional paired remote management | 31 (coordinates with 32) |
+| 34 | `wip/34-macos-port.md` | wip | macOS port on the core: embedded NFSv4.1 frontend, `platform::macos`, macOS CI lanes in the parity framework, universal signed package | 31 (33 for the UI bundle) |
+| 35 | `wip/35-windows-port.md` | wip | Windows port on the core: WinFsp frontend via own `winfsp-sys` FFI, `platform::windows`, named-pipe control transport, Windows CI lanes | 31 (33 for the UI bundle) |
+| 36 | `wip/36-android-port.md` | wip | Android port on the core: in-app engine (mobile profile), SAF DocumentsProvider + proxy-fd frontend, media mirror folders, Tauri mobile UI, emulator CI | 31, 33 |
+| 37 | `wip/37-kubernetes-csi.md` | wip | Kubernetes CSI driver: engine pod per (filesystem, k8s node) serving PVs as views, FUSE fd passing + session handover for zero-ENOTCONN upgrades, snapshots/clones/expansion, RWX, csi-sanity + kind e2e | 31, 33 (coordinates with 32) |
 
 "Committed in practice": the plan does not technically build on the
 intermediate milestones, but the protocol is strictly sequential, so
