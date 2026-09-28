@@ -8,6 +8,7 @@ pub mod docker;
 pub mod metabench;
 pub mod model;
 pub mod reqlog;
+pub mod results;
 pub mod s3env;
 pub mod scenarios;
 pub mod snapchurn;

@@ -1,0 +1,21 @@
+# Known cross-check failures: `<target> <crate>` per line (crate = cargo
+# package name), `#` starts a comment. Baseline census of plan 31 C0 (base
+# commit 99472fa). Fixed across plan 31 C1-C3; delete a line in the same change
+# that fixes it. Two-way: a listed entry that now passes makes
+# tools/check-cross.sh fail with "STALE" (like the xfstests baseline).
+
+# macOS: libc calls Linux-only (`posix_fadvise`, `POSIX_FADV_DONTNEED` in
+# crates/chaos/src/op.rs).
+aarch64-apple-darwin constellation-chaos
+# macOS: cli's Linux-only code (`libc::gettid`, i16/u16 flag and mode types,
+# fuser/libc call signatures; 35 errors). constellation-harness depends on
+# chaos and is not reached until chaos compiles; expect it to appear here
+# then.
+aarch64-apple-darwin constellation
+
+# Windows: `tokio::net::Unix{Listener,Stream}` in the control API.
+x86_64-pc-windows-gnu constellation-api
+# Windows: `libc::ESTALE` (authority client/holder/inbox).
+x86_64-pc-windows-gnu constellation-authority
+# Windows: `std::os::unix` and `libc::posix_fadvise`.
+x86_64-pc-windows-gnu constellation-chaos

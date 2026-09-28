@@ -42,7 +42,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate dist-linux dist-macos deps FORCE \
-	uploadbench-build uploadbench-sim uploadbench-live
+	uploadbench-build uploadbench-sim uploadbench-live check-cross
 
 .DEFAULT_GOAL := help
 
@@ -150,6 +150,9 @@ perf-regression: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Run local perf-regression 
 		--repetitions 1 \
 		--seed 42 \
 		--corpus-shape
+
+check-cross: ## Type-check darwin (workspace) + windows-gnu (library crates) via zig cc; see tools/check-cross.sh
+	tools/check-cross.sh
 
 perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Check benchmark rates against baseline
 	tests/perf-gate.sh

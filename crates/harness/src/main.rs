@@ -3,7 +3,7 @@
 //! verifies reality against a filesystem model (Jepsen-style oracle).
 //!
 //!   harness list
-//!   harness run [scenario ...] [--seed N]
+//!   harness run [scenario ...] [--seed N] [--shard i/n] [--results-json PATH [--lane NAME]]
 //!
 //! Requires: docker, fusermount3, a release `constellation` binary
 //! (CONSTELLATION_BIN or target/release/constellation).
@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use constellation_harness::bench;
 use constellation_harness::corpus;
 use constellation_harness::metabench;
+use constellation_harness::results::{self, Outcome, RunResults, Shard};
 use constellation_harness::scenarios::{self, SCENARIOS};
 use constellation_harness::snapchurn;
 use constellation_harness::suites;
@@ -41,6 +42,18 @@ enum Command {
         /// Replay without preserving recorded inter-operation timing.
         #[arg(long, requires = "replay")]
         replay_no_sleep: bool,
+        /// Run only shard `i` of `n` (1-based, e.g. `2/4`) of the selected
+        /// scenarios: the scenario at position `idx` (after name filtering)
+        /// belongs to shard `idx % n + 1`.
+        #[arg(long, value_name = "i/n")]
+        shard: Option<String>,
+        /// Write a machine-readable result file (see `results` module docs)
+        /// after the run, also when scenarios failed.
+        #[arg(long, value_name = "PATH")]
+        results_json: Option<std::path::PathBuf>,
+        /// Lane name recorded in the results file (`<os>-<frontend>`).
+        #[arg(long, default_value = results::DEFAULT_LANE)]
+        lane: String,
     },
     /// Census-scale import benchmark (many small files).
     Bench {
@@ -139,7 +152,18 @@ fn main() -> Result<()> {
             seed,
             replay,
             replay_no_sleep,
-        } => run(names, seed, replay, replay_no_sleep),
+            shard,
+            results_json,
+            lane,
+        } => run(RunOpts {
+            names,
+            seed,
+            replay,
+            replay_no_sleep,
+            shard,
+            results_json,
+            lane,
+        }),
         Command::Bench {
             files,
             file_size,
@@ -219,12 +243,27 @@ fn main() -> Result<()> {
     }
 }
 
-fn run(
+struct RunOpts {
     names: Vec<String>,
     seed: u64,
     replay: Option<std::path::PathBuf>,
     replay_no_sleep: bool,
-) -> Result<()> {
+    shard: Option<String>,
+    results_json: Option<std::path::PathBuf>,
+    lane: String,
+}
+
+fn run(opts: RunOpts) -> Result<()> {
+    let RunOpts {
+        names,
+        seed,
+        replay,
+        replay_no_sleep,
+        shard,
+        results_json,
+        lane,
+    } = opts;
+    let shard = shard.as_deref().map(Shard::parse).transpose()?;
     if replay.is_some() && names.as_slice() != ["snapshot-churn"] {
         bail!("--replay is valid only with exactly one scenario: snapshot-churn");
     }
@@ -245,24 +284,53 @@ fn run(
         }
         v
     };
+    let selected = match shard {
+        Some(sh) => {
+            let total = selected.len();
+            let part = sh.partition(selected);
+            eprintln!("=== shard {sh}: {} of {total} scenario(s)", part.len());
+            part
+        }
+        None => selected,
+    };
 
+    let mut report = RunResults::new(&lane, seed, shard);
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
     for s in selected {
         if let Some(missing) = s.requires.iter().find(|b| !suites::have(b)) {
             eprintln!("=== {} SKIPPED ({missing} not installed)", s.name);
+            report.push(
+                s.name,
+                Outcome::Skipped,
+                0.0,
+                Some(format!("{missing} not installed")),
+            );
             skipped.push(s.name);
             continue;
         }
         let t0 = std::time::Instant::now();
         eprintln!("=== {} (seed {seed}) ===", s.name);
         match (s.run)(seed) {
-            Ok(()) => eprintln!("=== {} PASSED in {:.1?}", s.name, t0.elapsed()),
+            Ok(()) => {
+                eprintln!("=== {} PASSED in {:.1?}", s.name, t0.elapsed());
+                report.push(s.name, Outcome::Passed, t0.elapsed().as_secs_f64(), None);
+            }
             Err(e) => {
                 eprintln!("=== {} FAILED in {:.1?}: {e:#}", s.name, t0.elapsed());
+                report.push(
+                    s.name,
+                    Outcome::Failed,
+                    t0.elapsed().as_secs_f64(),
+                    Some(format!("{e:#}")),
+                );
                 failures.push(s.name);
             }
         }
+    }
+    if let Some(path) = &results_json {
+        report.write(path)?;
+        eprintln!("results written to {}", path.display());
     }
     if !failures.is_empty() {
         bail!(

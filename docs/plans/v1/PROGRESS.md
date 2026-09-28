@@ -27667,3 +27667,61 @@ table refuses a cached grant once it is recalled. What did not:
   lock-fence-at-close, lock-holder-partitioned, lock-latency,
   lock-grant-dead-generation, git-under-flock-b2b (73 turns, 1 double
   turn), git-under-flock (51 turns, 0).
+
+## Plan 31 C0 — Baselines and guardrails
+
+Milestone C0 of [plan 31](wip/31-core-frontend-backend.md) (§11): the
+harness gets machine-readable output and sharding, a cross-target
+type-check gate exists with today's failures recorded, and CI runs it.
+Nothing in the product code changes. Base commit: `99472fa`.
+
+| Item | State | Where |
+|---|---|---|
+| `harness run --results-json <path>` (schema 1: `schema`, `lane`, `seed`, `shard`, `started_at`, `scenarios[{name, outcome, seconds, reason}]`), written also when scenarios fail; `--lane` (default `linux-fuse`); stderr output unchanged | done | `crates/harness/src/results.rs` (format documented in the module doc), `crates/harness/src/main.rs` |
+| `harness run --shard i/n` (1-based; deterministic `idx % n == i-1` over the selected list after name filtering; bad syntax rejected up front) | done | `crates/harness/src/results.rs`, `crates/harness/src/main.rs`; 6 unit tests (parsing, exact partition, JSON shape, file round trip) |
+| `tools/zcc`, `tools/zar`: POSIX sh wrappers over `zig cc` / `zig ar` (`zig` on `PATH`, else `python3 -m ziglang`); drop the cc-rs flags zig rejects (`--target=`, `-arch`, `-m*-version-min`) | done | `tools/zcc`, `tools/zar` |
+| `make check-cross` / `tools/check-cross.sh`: `cargo check` of the default workspace for `aarch64-apple-darwin` (`--keep-going`, fuser's `macos-no-mount`) and of each library crate for `x86_64-pc-windows-gnu`; census table; exits nonzero only for an unlisted failure or a stale known-failure entry | done | `tools/check-cross.sh`, `Makefile` |
+| Known-failures file, seeded with the census below (two-way, like the xfstests baseline) | done | `tools/check-cross-known-failures.txt` |
+| CI job `cross-check` (`mlugg/setup-zig@v2`, both rustup targets, `make check-cross`) | done | `.github/workflows/ci.yml` |
+| Docs: `--shard`, `--results-json`, `--lane`, `make check-cross` and the known-failures file | done | `docs/how-to-guides/development/TESTING.md` |
+| Perf baselines: harness `bench`, meta-bench, fio-latency p50/p99, pjdfstest, and `--results-json` of the full matrix | pending — measured in the final gate run of the plan-31 series against base commit `99472fa` (the full suites run once, at the end) | — |
+
+### Cross-check census (base `99472fa`)
+
+`make check-cross`, zig 0.16.0, rustc 1.98. Only `cargo check`: nothing
+is linked.
+
+| Target | Crate | Result | First error |
+|---|---|---|---|
+| `aarch64-apple-darwin` | `constellation-chaos` | FAIL | `cannot find function posix_fadvise in crate libc` (`crates/chaos/src/op.rs:20`) |
+| `aarch64-apple-darwin` | `constellation` (cli) | FAIL | 35 errors: `libc::gettid` missing, i16/u16 and i32 type mismatches, changed fuser/libc call arities |
+| `aarch64-apple-darwin` | everything else in the default workspace | ok | — |
+| `x86_64-pc-windows-gnu` | `constellation-fs-core`, `-meta`, `-mtree`, `-store-s3`, `-net`, `-upload-concurrency`, `-model` | ok | — |
+| `x86_64-pc-windows-gnu` | `constellation-api` | FAIL | `unresolved imports tokio::net::UnixListener, tokio::net::UnixStream` |
+| `x86_64-pc-windows-gnu` | `constellation-authority` | FAIL | `cannot find value ESTALE in crate libc` |
+| `x86_64-pc-windows-gnu` | `constellation-chaos` | FAIL | `cannot find unix in os` |
+
+The plan predicted `api`, `authority` and `chaos` on windows-gnu; the
+census confirms exactly those. Notes:
+
+- On darwin, `constellation-harness` depends on `constellation-chaos`,
+  so it is not reached until chaos compiles; it will likely join the
+  known failures then (it is not a Windows library crate).
+- fuser's default on macOS needs macFUSE through pkg-config, which a
+  cross-check does not have; the darwin check enables its
+  `macos-no-mount` feature. The real macOS build (plan 34) needs macFUSE
+  or that feature as its own decision.
+- The C dependencies (`aws-lc-sys`, `zstd-sys`) compile with
+  `tools/zcc` on both targets, so no cross sysroot is needed.
+
+### Plan 31 C0 exit criteria
+
+- [x] `--results-json` and `--shard` in the harness, with unit tests
+- [x] `tools/zcc`, `tools/zar`, `make check-cross`, and the known-failures
+  file; `make check-cross` exits 0 with the file as seeded and exits
+  nonzero for an unlisted failure and for a stale entry (both exercised)
+- [x] CI job `cross-check`
+- [x] `docs/how-to-guides/development/TESTING.md` updated
+- [ ] Baseline numbers (harness `bench`, meta-bench, fio-latency,
+  pjdfstest, full-matrix `--results-json`) — pending, measured in the
+  final gate run against `99472fa`

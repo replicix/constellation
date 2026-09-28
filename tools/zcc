@@ -1,0 +1,39 @@
+#!/bin/sh
+# zig cc wrapper for cross type-checking (`make check-cross`).
+#
+#   tools/zcc -target aarch64-macos -c foo.c
+#   CC_aarch64_apple_darwin="tools/zcc -target aarch64-macos" cargo check ...
+#
+# cc-rs (build scripts) adds flags `zig cc` rejects or does not need:
+# `--target=<triple>` (clang spelling, e.g. arm64-apple-macosx; zig has its
+# own `-target` spelling, which the caller supplies), Apple's `-arch <x>`,
+# and `-m*-version-min=`. They are dropped here.
+#
+# Uses `zig` on PATH, else the pip `ziglang` package (`python3 -m ziglang`).
+set -eu
+
+if command -v zig >/dev/null 2>&1; then
+    ZIG=zig
+elif python3 -c 'import ziglang' >/dev/null 2>&1; then
+    ZIG="python3 -m ziglang"
+else
+    echo "zcc: need 'zig' on PATH or the python3 'ziglang' package" >&2
+    exit 127
+fi
+
+skip=0
+for a in "$@"; do
+    if [ "$skip" = 1 ]; then
+        skip=0
+        shift
+        continue
+    fi
+    case "$a" in
+    -arch) skip=1 ;;
+    --target=* | -mmacosx-version-min=* | -miphoneos-version-min=*) ;;
+    *) set -- "$@" "$a" ;;
+    esac
+    shift
+done
+# shellcheck disable=SC2086  # $ZIG is intentionally word-split
+exec $ZIG cc "$@"

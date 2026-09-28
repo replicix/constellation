@@ -302,6 +302,37 @@ and — with S3 cut via toxiproxy — reads must keep succeeding at full
 speed while the atime updates are simply lost (atime never blocks a
 read).
 
+### Sharding and machine-readable results (plan 31 C0)
+
+`harness run` takes three flags for CI matrices and for tools that compare
+runs:
+
+- `--shard i/n` (1-based, e.g. `--shard 2/4`) runs only every n-th scenario
+  of the *selected* list: after name filtering, the scenario at position
+  `idx` belongs to shard `idx % n + 1`. The partition is deterministic, so
+  the n shards together run each selected scenario exactly once. Bad syntax
+  (`0/4`, `5/4`, `2`, `a/b`) is rejected before anything starts.
+- `--results-json <path>` writes a JSON file after the run, also when
+  scenarios failed (the exit code is unchanged, and the stderr output is
+  the same as without the flag). Shape (schema 1):
+
+  ```json
+  {"schema": 1, "lane": "linux-fuse", "seed": 42, "shard": "2/4",
+   "started_at": 1790000000,
+   "scenarios": [{"name": "baseline", "outcome": "passed", "seconds": 12.3, "reason": null}]}
+  ```
+
+  `outcome` is `passed`, `failed` or `skipped`; `reason` is the skip reason
+  (`fio not installed`) or the failure error text, `null` for a pass;
+  `shard` is `null` for an unsharded run. The format is documented in
+  `crates/harness/src/results.rs`; `tests/parity.py` (plan 31) reads it.
+- `--lane <name>` sets the `lane` recorded in that file (`<os>-<frontend>`,
+  default `linux-fuse`).
+
+```sh
+harness run --shard 2/4 --lane linux-fuse --results-json results-2.json
+```
+
 ### Chaos CI (`chaos-ci`)
 
 `harness run chaos-ci` mounts **three** clients on one filesystem and
@@ -1574,6 +1605,34 @@ other content after two minutes is a divergence.
 | `sqlite-first-touch-latency` (needs `sqlite3`) | EC2 campaign 6 A-1: every S3 request ≥ 300 ms (`SQLITE_LAT_MS` 150 each way), product defaults; `SQLITE_ROUNDS` (50) rounds of two nodes running `CREATE TABLE IF NOT EXISTS` + `INSERT` on one new database at once, cycling through every pair of three nodes, alternately in a directory the root sequences and one delegated to `b` (the locks granted by a delegate, capped by its delegation). No round may fail (`disk I/O error` was the lock fence: a delegate's short grant lapsed before its renewal, fixed in `a1bed13`; this fails every delegated round on `216ce6c`), and every database holds both rows on every node. `SQLITE_STRACE_DIR=<dir>` records each racer's failed syscalls |
 | `small-file-write-path` | S3 100 ms away each way; the sequencer and a non-owner each close 12 small unique files, under `--write-mode through`, then `back`. Asserted per writer from its counting relay: one chunk PUT per file and no chunk HEAD or `gc/condemned.json` GET in front of it; the sequencer takes the non-owner's durable report instead of checking S3 itself. `through`: close p50 under 1.5 S3 round trips on both; `back`: under half a round trip on both. Every file then reads back right on a third node. `WRITEPATH_LAT_MS` (100), `WRITEPATH_FILES` (12) |
 | `nonowner-back-crash` | S3 1 s away each way; the non-owner that is not the sequencer's backup closes files under `back` (fast), and a reader on the sequencer waits for a chunk still uploading instead of failing. Then more files, and the writer is killed with its uploads in flight: the sequencer awaits them (`status.writeback.remote_chunks_awaited`), no other node sees content S3 cannot serve, and after the remount (the pending uploads go up, reported to every peer) a third node reads every file right and `fsck` finds no dangling reference. `WRITEPATH_CRASH_LAT_MS` (1000), `WRITEPATH_FILES` |
+
+## Cross-target type-check (`make check-cross`)
+
+`make check-cross` (`tools/check-cross.sh`, CI job `cross-check`) runs
+`cargo check` from Linux for two other targets, to keep the code portable
+ahead of the Windows and macOS frontends (plan 31):
+
+- `aarch64-apple-darwin`: the whole default workspace, one check
+  (census name `workspace`).
+- `x86_64-pc-windows-gnu`: each library crate separately (`-p <crate>`;
+  every workspace member except `crates/cli`, `crates/harness` and
+  `bench/*`), so one failing crate does not hide the others.
+
+Build scripts get their C compiler and archiver from `tools/zcc` and
+`tools/zar` (thin wrappers over `zig cc` / `zig ar`; `zig` on `PATH`, or
+`python3 -m ziglang` from the `ziglang` pip package), so no cross
+toolchain or SDK is needed; nothing is linked. Prerequisites: `rustup
+target add aarch64-apple-darwin x86_64-pc-windows-gnu`, and zig.
+
+The script prints a census table (target, crate, ok/FAIL, first error
+line) and keeps the full logs in a temp directory. Failures that exist
+today are listed in `tools/check-cross-known-failures.txt` (`<target>
+<crate>` per line, `#` comments). The list is two-way, like the xfstests
+baseline: the check fails on a failure that is not listed (a regression),
+and on a listed entry that now passes (`STALE: remove from known
+failures`), so fixing a crate means deleting its line in the same change.
+`CHECK_CROSS_TARGETS=x86_64-pc-windows-gnu make check-cross` runs one
+target only.
 
 ## xfstests
 
