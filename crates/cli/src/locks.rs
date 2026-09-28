@@ -182,6 +182,7 @@ impl ClusterLocks {
             LocalOutcome::Conflict(l) => (l.start, l.end.min(OFFSET_MAX), kind(l.write), l.pid),
             LocalOutcome::Done => (0, 0, libc::F_UNLCK, 0),
             LocalOutcome::NeedGrant(mode) => {
+                crate::fuse_watch::stage("lock test (core reply)");
                 let (reply, answer) = tokio::sync::oneshot::channel();
                 if self
                     .tx
@@ -242,21 +243,28 @@ impl ClusterLocks {
         lock: LocalLock,
         sleep: bool,
         reply: fuser::ReplyEmpty,
+        watch: crate::fuse_watch::Watched,
     ) {
-        fn answer(r: Result<(), i32>, reply: fuser::ReplyEmpty) {
+        fn answer(r: Result<(), i32>, reply: fuser::ReplyEmpty, watch: crate::fuse_watch::Watched) {
             match r {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(fuser::Errno::from_i32(e)),
             }
+            drop(watch);
         }
         if !sleep {
-            answer(self.set(ino, lock, false), reply);
+            answer(self.set(ino, lock, false), reply, watch);
             return;
         }
         let this = self.clone();
+        // The request's watchdog entry moves with the reply: the waiter
+        // thread's stages name it (`fuse_watch::adopt`).
         let spawned = std::thread::Builder::new()
             .name("lock-wait".into())
-            .spawn(move || answer(this.set(ino, lock, true), reply));
+            .spawn(move || {
+                watch.adopt();
+                answer(this.set(ino, lock, true), reply, watch)
+            });
         if let Err(error) = spawned {
             // The reply went with the closure; dropping it answers EIO.
             tracing::warn!(%error, ino, "could not start a lock-wait thread");
@@ -285,6 +293,7 @@ impl ClusterLocks {
                         std::thread::sleep(Duration::from_millis(10 * u64::from(rounds.min(20))));
                     }
                     rounds += 1;
+                    crate::fuse_watch::stage("lock grant (core reply)");
                     let (reply, answer) = tokio::sync::oneshot::channel();
                     self.tx
                         .send(SyncRequest::Lock {
@@ -324,9 +333,11 @@ impl ClusterLocks {
     /// file, not only the lock file (EC2 campaign 4 B-1).
     fn granted(&self, ino: Ino, position: &Position) {
         self.meta.session().raise_observed(*position);
+        crate::fuse_watch::stage("session wait after a lock grant");
         let waited = self.meta.session_wait_at(&[ReadKey::Ino(ino)], position);
         tracing::debug!(target: "constellation::locks", ino, ?position, ?waited, "lock granted");
         if let Some(inval) = &self.inval {
+            crate::fuse_watch::stage("kernel invalidation after a lock grant");
             if !inval.invalidate_and_wait(ino, INVAL_WAIT) {
                 tracing::debug!(
                     target: "constellation::locks",

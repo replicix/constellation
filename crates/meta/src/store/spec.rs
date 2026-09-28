@@ -2755,6 +2755,14 @@ impl Meta {
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
         kv_set_tx(&mut tx, &self.local, KV_APPLIED_SEQ, &seq.to_string());
+        crate::store::note_applied_pos_tx(
+            &mut tx,
+            &self.local,
+            crate::session::JournalPos {
+                epoch,
+                jseq: through,
+            },
+        );
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;

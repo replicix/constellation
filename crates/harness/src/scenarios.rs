@@ -46,6 +46,7 @@ mod ovh;
 /// `daemon.lock` still held by a daemon the kernel has killed.
 mod rejoin;
 mod slowseal;
+mod watermark;
 /// The small-file write path: S3 round trips per close, `back` for
 /// non-owners.
 mod writepath;
@@ -574,6 +575,12 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "git-under-flock under kill -9 (holder, committers, whole cluster), SIGSTOP, P2P isolation and S3 cuts",
         requires: &["git"],
         run: gitflock::git_under_flock_faults,
+    },
+    Scenario {
+        name: "lock-grant-dead-generation",
+        desc: "EC2 campaign 7 B-2: a lock grant whose floor names a delegation generation that ended before the grantee's incarnation must not leave every read on that node waiting the whole session budget (the 'hung' git add / cat)",
+        requires: &[],
+        run: watermark::lock_grant_dead_generation,
     },
     Scenario {
         name: "chaos-soak-4",

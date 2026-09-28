@@ -173,19 +173,103 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// `git -C repo args...` with a clean, fixed configuration.
+/// Run `f` on a thread of its own, for at most `limit`: a step that
+/// touches a mount (a git command, a tree walk) must not hang the
+/// scenario for good when a FUSE request goes unanswered (EC2 campaign 7
+/// B-2) — it fails, and the verdict names the node. The thread is left
+/// behind on a timeout (a process stuck in an uninterruptible FUSE wait
+/// cannot be killed anyway; the daemon's unmount at the end releases it).
+fn bounded<T: Send + 'static>(
+    what: &str,
+    limit: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit).map_err(|_| {
+        anyhow::anyhow!("{what} did not finish within {limit:?} (a hung FUSE request?)")
+    })
+}
+
+/// `GIT_FLOCK_GIT_TIMEOUT_S`: how long one git command may take
+/// (default 120 s).
+fn git_timeout() -> Duration {
+    Duration::from_secs(env_u64("GIT_FLOCK_GIT_TIMEOUT_S", 120))
+}
+
+/// `git -C repo args...` with a clean, fixed configuration, bounded by
+/// [`git_timeout`].
 fn git(repo: &Path, home: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["-c", "user.name=gitflock", "-c", "user.email=gitflock@test"])
-        .args(args)
-        .env("HOME", home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .with_context(|| format!("running git {args:?}"))?;
-    Ok(out)
+    let (repo, home) = (repo.to_path_buf(), home.to_path_buf());
+    let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let what = format!("git {args:?} in {}", repo.display());
+    bounded(&what, git_timeout(), move || {
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=gitflock", "-c", "user.email=gitflock@test"])
+            .args(&owned)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+    })?
+    .with_context(|| format!("running git {args:?}"))
+}
+
+/// The FUSE request watchdog's report of a node (`status.fuse_requests`):
+/// `None` when the node does not answer (dead, or restarting).
+fn fuse_requests_of(c: &Client) -> Option<serde_json::Value> {
+    c.control_status().ok().map(|s| s["fuse_requests"].clone())
+}
+
+/// A stalled FUSE request on any of `clients` (a request unanswered past
+/// the daemon's stall threshold, ever since it started), as one line per
+/// node; empty when there is none. A blocking lock wait is not a stall.
+fn fuse_stalls(clients: &[Client]) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in clients {
+        let Some(f) = fuse_requests_of(c) else {
+            continue;
+        };
+        let total = f["stalled_total"].as_u64().unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        let list: Vec<String> = f["stalled_requests"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|r| r["blocking"] != true)
+                    .map(|r| {
+                        format!(
+                            "{} ino {} {}s in {:?} (tid {})",
+                            r["op"].as_str().unwrap_or("?"),
+                            r["ino"],
+                            r["age_s"],
+                            r["stage"].as_str().unwrap_or("?"),
+                            r["tid"]
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(format!(
+            "{}: {total} FUSE request(s) stalled past {}s since the daemon started ({} completed since, {} stalled now){}",
+            c.name,
+            f["stall_threshold_s"],
+            f["stalled_completed"],
+            f["stalled"],
+            if list.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", list.join("; "))
+            }
+        ));
+    }
+    out
 }
 
 fn git_ok(repo: &Path, home: &Path, args: &[&str]) -> Result<String> {
@@ -986,6 +1070,10 @@ struct Fleet<'a> {
     /// Each node's own S3 path (a cut isolates one node from the bucket,
     /// as the soak's iptables rule did).
     s3: Vec<CountingProxy>,
+    /// Stalled FUSE requests seen on any node during the workload
+    /// (`fuse_stalls`): a request unanswered past the daemon's stall
+    /// threshold is a bug whatever the faults (EC2 campaign 7 B-2).
+    stalls: Mutex<Vec<String>>,
 }
 
 impl Fleet<'_> {
@@ -1181,6 +1269,20 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
                 ),
         );
     }
+    // The FUSE request watchdog's threshold (EC2 campaign 7 B-2): a
+    // request unanswered past it fails the scenario at the end. Above
+    // the longest wait the faults legitimately cause — the first write
+    // after a `kill -9` of the whole cluster waits for the dead lease to
+    // expire and a takeover (2 x TTL, ~50 s here); the B-2 hang is for
+    // good. `GIT_FLOCK_ENV` may override it.
+    if !std::env::var("GIT_FLOCK_ENV")
+        .is_ok_and(|e| e.contains("CONSTELLATION_FUSE_REQUEST_STALL_S"))
+    {
+        clients = clients
+            .into_iter()
+            .map(|c| c.with_env("CONSTELLATION_FUSE_REQUEST_STALL_S", "90"))
+            .collect();
+    }
     // `GIT_FLOCK_ENV=K=V,K=V`: extra mount environment for every node.
     if let Ok(extra) = std::env::var("GIT_FLOCK_ENV") {
         for kv in extra.split(',').filter(|s| !s.is_empty()) {
@@ -1211,6 +1313,7 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
         root: root.path(),
         ids,
         s3,
+        stalls: Mutex::new(Vec::new()),
     };
     let result = (|| -> Result<()> {
         let mut done: Vec<RoundResult> = Vec::new();
@@ -1254,6 +1357,22 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
                 last,
                 &label,
             )?;
+            // No FUSE request may have gone unanswered past the daemon's
+            // stall threshold on any node, faults or not (EC2 campaign 7
+            // B-2: a `getattr` and a `read` that hung for good).
+            let mut stalls = fleet.stalls.lock().unwrap().clone();
+            for line in fuse_stalls(&clients) {
+                if !stalls.contains(&line) {
+                    stalls.push(line);
+                }
+            }
+            if !stalls.is_empty() {
+                bail!(
+                    "FUSE requests stalled (unanswered past the stall threshold):\n    {}",
+                    stalls.join("\n    ")
+                );
+            }
+            eprintln!("    {label}: no FUSE request stalled on any node");
         }
         Ok(())
     })();
@@ -1266,6 +1385,13 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
         if std::fs::create_dir_all(&dir).is_ok() {
             for c in &clients {
                 let _ = std::fs::write(dir.join(format!("{}.log", c.name)), c.log_text());
+                // Earlier incarnations too (a `kill -9` started a new
+                // log): the stall a fault phase caused is in one of them.
+                for (i, path) in c.log_files().iter().enumerate() {
+                    if path.extension().is_some_and(|e| e != "log") {
+                        let _ = std::fs::copy(path, dir.join(format!("{}.log.{}", c.name, i + 1)));
+                    }
+                }
                 if let Ok(status) = c.control_status() {
                     let _ = std::fs::write(
                         dir.join(format!("{}.status.json", c.name)),
@@ -1387,6 +1513,13 @@ fn workload(
                     break;
                 }
             }
+            for line in fuse_stalls(clients) {
+                let mut seen = fleet.stalls.lock().unwrap();
+                if !seen.contains(&line) {
+                    eprintln!("    {label}: STALL {line} ({:?})", started.elapsed());
+                    seen.push(line);
+                }
+            }
         } else if restarts_done < restarts_wanted
             && started.elapsed()
                 >= Duration::from_secs(secs * (restarts_done + 1) / (restarts_wanted + 1))
@@ -1430,6 +1563,13 @@ fn workload(
     }
     if let Some(e) = fault_err {
         return Err(e.context("injecting a fault"));
+    }
+    for line in fuse_stalls(clients) {
+        let mut seen = fleet.stalls.lock().unwrap();
+        if !seen.contains(&line) {
+            eprintln!("    {label}: STALL {line}");
+            seen.push(line);
+        }
     }
     let mut acked = Vec::new();
     let mut stale = Vec::new();
@@ -1657,8 +1797,13 @@ fn verify(
                 || {
                     let mut snaps = Vec::new();
                     for (name, c) in &named {
-                        let tree = constellation_chaos::snapshot_tree(&c.mnt.join(repo))
-                            .with_context(|| format!("walking {name}'s {repo}"))?;
+                        let path = c.mnt.join(repo);
+                        let tree = bounded(
+                            &format!("walking {name}'s {repo}"),
+                            git_timeout(),
+                            move || constellation_chaos::snapshot_tree(&path),
+                        )?
+                        .with_context(|| format!("walking {name}'s {repo}"))?;
                         snaps.push((name.to_string(), tree));
                     }
                     let verdict = constellation_chaos::check_convergence(&snaps);
@@ -1705,7 +1850,12 @@ fn verify(
                             ));
                         }
                     }
-                    Err(e) => problems.push(format!("{name} {repo}: {e:#}")),
+                    Err(e) => problems.push(format!(
+                        "{name} {repo}: {e:#}{}",
+                        fuse_requests_of(c)
+                            .map(|f| format!("; the node's FUSE watchdog: {f}"))
+                            .unwrap_or_default()
+                    )),
                 }
             }
             if heads.len() > 1 {

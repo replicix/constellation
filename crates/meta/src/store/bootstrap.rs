@@ -399,6 +399,13 @@ impl Meta {
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {
             tx.insert(&self.local, KV_APPLIED_SEQ.as_bytes().to_vec(), v.to_vec());
         }
+        if let Some(v) = side_snap.get(&side.local, crate::store::KV_APPLIED_POS.as_bytes())? {
+            tx.insert(
+                &self.local,
+                crate::store::KV_APPLIED_POS.as_bytes().to_vec(),
+                v.to_vec(),
+            );
+        }
         tx.insert(
             &self.local,
             KV_USAGE_BYTES.as_bytes().to_vec(),

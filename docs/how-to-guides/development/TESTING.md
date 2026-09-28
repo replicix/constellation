@@ -269,6 +269,25 @@ b2b and causal, 90 s per round), `GIT_FLOCK_NODES` the node count (2–4),
 the sequencer), `GIT_FLOCK_S3_LATENCY_MS` / `GIT_FLOCK_ENV=K=V,...` add S3
 latency and mount environment, and `GIT_FLOCK_RUST_LOG` sets the
 daemons' `RUST_LOG`.
+Every variant polls each node's FUSE request watchdog
+(`status.fuse_requests`, see `CONSTELLATION_FUSE_REQUEST_STALL_S`)
+during the run and fails at the end if any request went unanswered past
+the threshold (90 s there: the first write after a whole-cluster
+`kill -9` legitimately waits for the dead lease to expire; EC2 campaign
+7's B-2 hang was for good); its git commands and tree walks are bounded
+(`GIT_FLOCK_GIT_TIMEOUT_S`, 120 s) so a hung mount fails the scenario
+with the node's watchdog report instead of hanging the harness, and the
+daemons' logs are kept per incarnation (`mount.log.<n>`) on failure.
+
+`lock-grant-dead-generation` (EC2 campaign 7, finding B-2) reproduces
+the hang's mechanism directly: `d1` delegated to `c` and written into
+by `c` and `b`, the turn file locked and released by `b` and `a` (the
+lock's floor now names the generation), the delegation ended, `b`
+remounted, then `b` takes the lock. The grant raises `b`'s session
+watermark to a generation that ended before its incarnation and to the
+root's journal position; 21 lookups on `b` must then be fast, with no
+session timeout. On a build without the fix the lookups take 126 s (69
+timeouts of 2 s).
 
 `atime-eventual` (plan 20) mounts two nodes with `--atime relatime`: a
 cold read on one node must eventually advance `atime` on the holder,

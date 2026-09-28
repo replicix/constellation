@@ -105,6 +105,20 @@ The wait (`Meta::session_wait`) goes like this:
    `CONSTELLATION_SESSION_WAIT_MS` (2 s). On timeout, answer anyway,
    log a warning once per daemon, and count it.
 
+A watermark can name what the replica will never hold: a lock grant's
+floor is the join of every releaser's frontier since the lock was first
+taken, so it keeps naming delegation generations long after they ended,
+and a node that restarted since has no memory of them (EC2 campaign 7
+B-2: every read on such a node paid the whole budget, for the rest of
+the daemon's life, and `git add` looked hung). Two rules keep that
+bounded: before a wait with such a dependency the node consults its
+persisted delegation table, and a generation once delegated and no
+longer live is void; and a watermark still unreached
+`CONSTELLATION_SESSION_WATERMARK_TTL_MS` (10 s) after it was raised is
+dropped to the applied position, with a warning (`status` counts both:
+`session.voided_ended`, `session.abandoned`). The applied journal
+position is kept across restarts for the same reason.
+
 The result is read-your-writes and monotonic reads for every client of
 a node, without any cost when the node is idle.
 
@@ -279,6 +293,7 @@ the margin (6 s at the defaults).
 | `--cto bounded\|strict` | `bounded` | the mode |
 | `CONSTELLATION_CTO` | unset | default for `--cto` |
 | `CONSTELLATION_SESSION_WAIT_MS` | `2000` | session wait bound; `0` disables the wait |
+| `CONSTELLATION_SESSION_WATERMARK_TTL_MS` | `10000` | a session watermark unreached this long is dropped; `0` keeps it for good |
 | `CONSTELLATION_READ_INDEX_BUDGET_MS` | `2000` | how long a strict read waits for the sequencer |
 | `CONSTELLATION_READ_DELEGATIONS` | on | grant read delegations (as sequencer) |
 | `CONSTELLATION_READ_DELEGATION_TTL_MS` | `5000` | read delegation lifetime |

@@ -159,6 +159,12 @@ pub const QUOTA_CREATION_KV_KEY: &str = "quota_creation_bytes";
 pub(crate) const KV_NODE_PREFIX: &str = "node_prefix";
 pub(crate) const KV_NEXT_INO: &str = "next_ino";
 pub(crate) const KV_APPLIED_SEQ: &str = "applied_seq";
+/// The journal position (`epoch:jseq`) the last applied or shipped
+/// segment reached (`SessionState::advance`'s `through`), so a restarted
+/// replica's session knows what it already holds (EC2 campaign 7 B-2: a
+/// lock grant's `pending` part was unreachable for a whole incarnation,
+/// the session's applied position being volatile).
+pub(crate) const KV_APPLIED_POS: &str = "applied_pos";
 pub(crate) const KV_NEXT_JOURNAL_SEQ: &str = "next_journal_seq";
 /// Plan 30 §M3a: the speculation log's row counter (`store::spec`), raw
 /// big-endian bytes like `KV_NEXT_JOURNAL_SEQ`. Never rolled back, so a
@@ -774,6 +780,13 @@ impl Meta {
             .seed_generations(table.max_gen(), &live, &|gen| {
                 meta.log_stream_idx(gen).unwrap_or(0)
             });
+        // The applied journal position is volatile too; what this
+        // replica holds of the log is not. Without this a watermark
+        // naming the holder's journal (a lock grant's floor) stays
+        // unreached until the next segment arrives — for good on an idle
+        // cluster (EC2 campaign 7 B-2).
+        let applied_seq = meta.applied_seq().unwrap_or(0);
+        meta.session.seed_applied(applied_seq, meta.applied_pos());
         Ok(meta)
     }
 
@@ -1248,6 +1261,29 @@ impl Meta {
         Ok(())
     }
 
+    /// The journal position the last applied or shipped segment reached
+    /// (`KV_APPLIED_POS`), if any was recorded.
+    pub fn applied_pos(&self) -> Option<crate::session::JournalPos> {
+        let r = self.db.read_tx();
+        applied_pos_at(&r, &self.local)
+    }
+
+    /// Record `pos` as the applied journal position, if it is past the
+    /// recorded one (the holder's own shipped segment: `ack_journal`).
+    pub fn note_applied_pos(&self, pos: crate::session::JournalPos) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        if applied_pos_at(&tx, &self.local).is_none_or(|cur| cur < pos) {
+            kv_set_tx(
+                &mut tx,
+                &self.local,
+                KV_APPLIED_POS,
+                &format!("{}:{}", pos.epoch, pos.jseq),
+            );
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
     // ---- blob store (local Payload::Spilled bodies) ----
 
     pub(crate) fn hash_blob(bytes: &[u8]) -> constellation_mtree::record::BlobHash {
@@ -1427,6 +1463,34 @@ pub(crate) fn kv_set_tx(
     value: &str,
 ) {
     tx.insert(ks, key.as_bytes().to_vec(), value.as_bytes().to_vec());
+}
+
+pub(crate) fn applied_pos_at(
+    r: &impl Readable,
+    local: &SingleWriterTxKeyspace,
+) -> Option<crate::session::JournalPos> {
+    let raw = kv_get_tx(r, local, KV_APPLIED_POS).ok().flatten()?;
+    let (epoch, jseq) = raw.split_once(':')?;
+    Some(crate::session::JournalPos {
+        epoch: epoch.parse().ok()?,
+        jseq: jseq.parse().ok()?,
+    })
+}
+
+/// `apply_segment_rows`' share of the above, inside its transaction.
+pub(crate) fn note_applied_pos_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    pos: crate::session::JournalPos,
+) {
+    if applied_pos_at(tx, local).is_none_or(|cur| cur < pos) {
+        kv_set_tx(
+            tx,
+            local,
+            KV_APPLIED_POS,
+            &format!("{}:{}", pos.epoch, pos.jseq),
+        );
+    }
 }
 
 fn kv_get_u64(

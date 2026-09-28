@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-fn deleg_of(c: &Client) -> Result<serde_json::Value> {
+pub(super) fn deleg_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["delegation"].clone())
 }
 
@@ -88,7 +88,7 @@ const DELEG_TTL_MS: u64 = 3_000;
 /// `names` nodes on a fresh filesystem with `extra` env on every mount;
 /// node 0 holds the lease, `f` exists everywhere. The first `counting`
 /// nodes reach S3 through a counting proxy each (returned in order).
-fn cluster(
+pub(super) fn cluster(
     scenario: &str,
     names: &[&str],
     extra: &[(&str, &str)],
@@ -194,7 +194,7 @@ fn deny_path(root: &std::path::Path, name: &str) -> std::path::PathBuf {
     root.join(name).join("deny")
 }
 
-fn unmount_all(clients: &mut [Client]) {
+pub(super) fn unmount_all(clients: &mut [Client]) {
     for c in clients.iter_mut().rev() {
         let _ = c.unmount();
     }
@@ -202,7 +202,7 @@ fn unmount_all(clients: &mut [Client]) {
 
 /// A failed scenario's daemon logs, kept under `/tmp/harness-m11-logs/`
 /// (the mounts' temp dir goes with the scenario).
-fn dump_logs_on_failure(scenario: &str, clients: &[Client], result: &Result<()>) {
+pub(super) fn dump_logs_on_failure(scenario: &str, clients: &[Client], result: &Result<()>) {
     // `HARNESS_KEEP_LOGS=1` keeps a passing scenario's logs too.
     if result.is_ok() && std::env::var_os("HARNESS_KEEP_LOGS").is_none() {
         return;
@@ -233,7 +233,7 @@ pub(super) fn delegate(root: &Client, path: &str, node: u64) -> Result<serde_jso
 }
 
 /// `constellation undelegate <path>`.
-fn undelegate(root: &Client, path: &str) -> Result<serde_json::Value> {
+pub(super) fn undelegate(root: &Client, path: &str) -> Result<serde_json::Value> {
     let resp = root.control(&serde_json::json!({"cmd": "undelegate", "path": path}))?;
     anyhow::ensure!(
         resp["resp"] == "ok",
@@ -271,7 +271,7 @@ pub(super) fn wait_installed(delegate: &Client, path: &str, deadline: Duration) 
 }
 
 /// Every node reports every other node's P2P link as connected.
-fn wait_for_connected_peers(clients: &[&Client]) -> Result<()> {
+pub(super) fn wait_for_connected_peers(clients: &[&Client]) -> Result<()> {
     let need = clients.len().saturating_sub(1);
     for c in clients {
         eventually(

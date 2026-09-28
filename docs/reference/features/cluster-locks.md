@@ -192,7 +192,11 @@ the lock, not only the locked file:
 
 The position also becomes the new holder's session watermark, so a read
 of *any* file on that node waits for it (bounded by
-`CONSTELLATION_SESSION_WAIT_MS`), and the kernel's caches of every file
+`CONSTELLATION_SESSION_WAIT_MS`; a part of it the node can never reach —
+a delegation generation that ended before the node's current incarnation
+— is voided from the persisted delegation table, or the watermark is
+dropped after `CONSTELLATION_SESSION_WATERMARK_TTL_MS`; see
+[Close-to-open modes](cto-modes.md)), and the kernel's caches of every file
 another node changed are dropped when the replica changes, including
 on the holder that executed the change for it. Together with the
 flush-before-release in the previous section, this gives lock-protected

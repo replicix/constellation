@@ -60,6 +60,7 @@ impl Filesystem for FuseFs {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let _w = crate::fuse_watch::enter("lookup", parent.0);
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let _inflight = self.inflight.enter(&[parent]);
@@ -105,6 +106,7 @@ impl Filesystem for FuseFs {
             Some(&name),
             &[ReadKey::Dentry(parent, name.to_string())],
         );
+        crate::fuse_watch::stage("meta read");
         match self.meta.lookup(parent, &name) {
             Ok(Some(mut attr)) => {
                 // Same overlay and the same ordering argument as
@@ -130,6 +132,7 @@ impl Filesystem for FuseFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let _w = crate::fuse_watch::enter("getattr", ino.0);
         let ino = ino.0;
         let requested_ino = ino;
         let ino = self.real_ino(ino);
@@ -156,6 +159,7 @@ impl Filesystem for FuseFs {
         // holding a write shard.
         self.session_wait(&[ReadKey::Ino(ino)]);
         let writes = self.writes.lock(ino);
+        crate::fuse_watch::stage("meta read");
         let attr = self
             .meta
             .getattr(ino)
@@ -205,6 +209,7 @@ impl Filesystem for FuseFs {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let _w = crate::fuse_watch::enter("setattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
@@ -256,6 +261,7 @@ impl Filesystem for FuseFs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let _w = crate::fuse_watch::enter("readlink", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
@@ -290,6 +296,7 @@ impl Filesystem for FuseFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _w = crate::fuse_watch::enter("mkdir", parent.0);
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let _inflight = self.inflight.enter(&[parent]);
@@ -337,6 +344,7 @@ impl Filesystem for FuseFs {
         rdev: u32,
         reply: ReplyEntry,
     ) {
+        let _w = crate::fuse_watch::enter("mknod", parent.0);
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let _inflight = self.inflight.enter(&[parent]);
@@ -395,6 +403,7 @@ impl Filesystem for FuseFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let _w = crate::fuse_watch::enter("link", ino.0);
         let ino = ino.0;
         let newparent = newparent.0;
         let ino = self.real_ino(ino);
@@ -426,6 +435,7 @@ impl Filesystem for FuseFs {
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
+        let _w = crate::fuse_watch::enter("create", parent.0);
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let _inflight = self.inflight.enter(&[parent]);
@@ -464,6 +474,7 @@ impl Filesystem for FuseFs {
         target: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        let _w = crate::fuse_watch::enter("symlink", parent.0);
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let _inflight = self.inflight.enter(&[parent]);
@@ -492,6 +503,7 @@ impl Filesystem for FuseFs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _w = crate::fuse_watch::enter("unlink", parent.0);
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let _inflight = self.inflight.enter(&[parent]);
@@ -541,6 +553,7 @@ impl Filesystem for FuseFs {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _w = crate::fuse_watch::enter("rmdir", parent.0);
         let parent = parent.0;
         let parent = self.real_ino(parent);
         let _inflight = self.inflight.enter(&[parent]);
@@ -583,6 +596,7 @@ impl Filesystem for FuseFs {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let _w = crate::fuse_watch::enter("rename", parent.0);
         let parent = parent.0;
         let newparent = newparent.0;
         let parent = self.real_ino(parent);
@@ -699,6 +713,7 @@ impl Filesystem for FuseFs {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let _w = crate::fuse_watch::enter("open", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
@@ -750,6 +765,7 @@ impl Filesystem for FuseFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let _w = crate::fuse_watch::enter("read", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
@@ -782,6 +798,7 @@ impl Filesystem for FuseFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let _w = crate::fuse_watch::enter("write", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
@@ -807,6 +824,7 @@ impl Filesystem for FuseFs {
     }
 
     fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
+        let _w = crate::fuse_watch::enter("flush", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         // Plan 30 §M14: the fence first, while the closing owner's locks
@@ -837,6 +855,7 @@ impl Filesystem for FuseFs {
     }
 
     fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        let _w = crate::fuse_watch::enter("fsync", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         // Plan 30 §M14: nothing written under a lapsed grant is made
@@ -868,6 +887,7 @@ impl Filesystem for FuseFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let _w = crate::fuse_watch::enter("release", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         if ConstellationFs::is_synthetic(ino) {
@@ -934,6 +954,7 @@ impl Filesystem for FuseFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let _w = crate::fuse_watch::enter("readdir", ino.0);
         let ino = ino.0;
         let visible_ino = ino;
         let ino = self.real_ino(ino);
@@ -1030,6 +1051,7 @@ impl Filesystem for FuseFs {
         position: u32,
         reply: ReplyEmpty,
     ) {
+        let _w = crate::fuse_watch::enter("setxattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
@@ -1134,6 +1156,7 @@ impl Filesystem for FuseFs {
         size: u32,
         reply: ReplyXattr,
     ) {
+        let _w = crate::fuse_watch::enter("getxattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
@@ -1186,6 +1209,7 @@ impl Filesystem for FuseFs {
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let _w = crate::fuse_watch::enter("listxattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         if !ConstellationFs::is_synthetic(ino) {
@@ -1226,6 +1250,7 @@ impl Filesystem for FuseFs {
         name: &OsStr,
         reply: ReplyEmpty,
     ) {
+        let _w = crate::fuse_watch::enter("removexattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
@@ -1259,6 +1284,7 @@ impl Filesystem for FuseFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
+        let _w = crate::fuse_watch::enter("statfs", _ino.0);
         // Used space is logical bytes under the mounted view; free space
         // is whole-filesystem headroom under the cap. See `statfs_blocks`.
         // Block size mirrors blksize.
@@ -1293,6 +1319,7 @@ impl Filesystem for FuseFs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        let _w = crate::fuse_watch::enter("fallocate", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
@@ -1320,6 +1347,7 @@ impl Filesystem for FuseFs {
         whence: i32,
         reply: ReplyLseek,
     ) {
+        let _w = crate::fuse_watch::enter("lseek", ino.0);
         let ino = ino.0;
         if offset < 0 {
             reply.error(Errno::from_i32(libc::ENXIO));
@@ -1345,6 +1373,7 @@ impl Filesystem for FuseFs {
         _pid: u32,
         reply: fuser::ReplyLock,
     ) {
+        let _w = crate::fuse_watch::enter("getlk", ino.0);
         let ino = self.real_ino(ino.0);
         let Some(locks) = self.cluster_locks() else {
             reply.error(Errno::from_i32(libc::ENOSYS));
@@ -1378,6 +1407,11 @@ impl Filesystem for FuseFs {
         sleep: bool,
         reply: ReplyEmpty,
     ) {
+        let watch = if sleep {
+            crate::fuse_watch::enter_blocking("setlk", ino.0)
+        } else {
+            crate::fuse_watch::enter("setlk", ino.0)
+        };
         let ino = self.real_ino(ino.0);
         let Some(locks) = self.cluster_locks() else {
             reply.error(Errno::from_i32(libc::ENOSYS));
@@ -1408,7 +1442,7 @@ impl Filesystem for FuseFs {
             start,
             end,
         };
-        locks.lock(ino, lock, sleep, reply);
+        locks.lock(ino, lock, sleep, reply, watch);
     }
 }
 
@@ -1567,7 +1601,10 @@ impl ConstellationFs {
         let dirty = self.cache.dirty_bytes();
         let budget = self.cache.usage().budget;
         match crate::writeback::throttle_delay(dirty, budget) {
-            Ok(delay) if !delay.is_zero() => std::thread::sleep(delay),
+            Ok(delay) if !delay.is_zero() => {
+                crate::fuse_watch::stage("writeback throttle (dirty cache)");
+                std::thread::sleep(delay)
+            }
             Ok(_) => {}
             Err(()) => {
                 // Sealed chunks grow the dirty-cache budget in
@@ -1590,7 +1627,10 @@ impl ConstellationFs {
             self.staging_budget.used(),
             self.staging_budget.budget(),
         ) {
-            Ok(delay) if !delay.is_zero() => std::thread::sleep(delay),
+            Ok(delay) if !delay.is_zero() => {
+                crate::fuse_watch::stage("writeback throttle (staging)");
+                std::thread::sleep(delay)
+            }
             Ok(_) => {}
             Err(()) => {
                 // Staging reservations grow in chunk-sized steps, so a

@@ -319,6 +319,14 @@ impl Client {
         if self.child.is_some() {
             bail!("{} already mounted", self.name);
         }
+        // A previous incarnation's log is kept (`mount.log.<n>`): what a
+        // daemon logged before a `kill -9` is the evidence of what it was
+        // doing (a stalled FUSE request and its backtrace, EC2 campaign 7
+        // B-2). `log_text` stays the current incarnation's.
+        if self.log.metadata().is_ok_and(|m| m.len() > 0) {
+            let n = self.log_files().len();
+            let _ = std::fs::rename(&self.log, self.log.with_extension(format!("log.{n}")));
+        }
         let logf = std::fs::File::create(&self.log)?;
         // Plan 21: `mount` now takes TARGET MOUNTPOINT as two positionals
         // (TARGET is a registry name, "name:/sub", or — as here, since
@@ -701,6 +709,32 @@ impl Client {
     /// The whole mount log (every mount of this client appends to it).
     pub fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// Every incarnation's log, oldest first (`mount.log.1`, ... then
+    /// `mount.log`, the current one).
+    pub fn log_files(&self) -> Vec<PathBuf> {
+        let Some(dir) = self.log.parent() else {
+            return Vec::new();
+        };
+        let mut rotated: Vec<(usize, PathBuf)> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        let n = name.strip_prefix("mount.log.")?.parse::<usize>().ok()?;
+                        Some((n, e.path()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rotated.sort();
+        let mut out: Vec<PathBuf> = rotated.into_iter().map(|(_, p)| p).collect();
+        if self.log.exists() {
+            out.push(self.log.clone());
+        }
+        out
     }
 
     pub fn tail_log_n(&self, n: usize) -> String {

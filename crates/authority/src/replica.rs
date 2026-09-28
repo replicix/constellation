@@ -671,6 +671,11 @@ impl Replica for Meta {
 
     fn ack_journal(&self, seqs: &[u64], at: Seq, pos: Option<JournalPos>) -> Result<(), MetaError> {
         Meta::ack_journal_rows_at(self, seqs, at)?;
+        if let Some(pos) = pos {
+            // Kept across a restart (see `Meta::open`); best effort, the
+            // next segment records it again.
+            let _ = Meta::note_applied_pos(self, pos);
+        }
         self.session().advance(at, pos);
         Ok(())
     }

@@ -14,6 +14,7 @@ mod existence;
 mod fault;
 mod forward;
 mod fsck;
+mod fuse_watch;
 mod fusefs;
 mod gc;
 mod held;
@@ -5367,6 +5368,9 @@ impl constellation_api::StatusSource for DaemonStatus {
                     waits_ms: s.waits_ms.to_vec(),
                     wait_ms_total: s.wait_ms_total,
                     raised: s.raised,
+                    watermark_ttl_ms: self.meta.session().watermark_ttl().as_millis() as u64,
+                    abandoned: s.abandoned,
+                    voided_ended: s.voided_ended,
                 }
             },
             ack: {
@@ -5693,6 +5697,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                     last_parse_error: s.last_parse_error.lock().ok().and_then(|g| g.clone()),
                 }
             },
+            fuse_requests: crate::fuse_watch::snapshot(),
             s3: backend::s3_request_counts(),
         }
     }

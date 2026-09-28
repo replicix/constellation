@@ -548,6 +548,48 @@ fn default_true() -> bool {
     true
 }
 
+/// The FUSE request watchdog (`crate::fuse_watch`, EC2 campaign 7
+/// B-2): requests in flight, and those unanswered past
+/// `CONSTELLATION_FUSE_REQUEST_STALL_S`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FuseRequestsStatus {
+    /// Requests being handled right now.
+    #[serde(default)]
+    pub in_flight: u64,
+    /// Of them, reported as stalled (older than the threshold).
+    #[serde(default)]
+    pub stalled: u64,
+    /// Requests ever reported as stalled since the daemon started.
+    #[serde(default)]
+    pub stalled_total: u64,
+    /// Of those, the ones that did complete eventually.
+    #[serde(default)]
+    pub stalled_completed: u64,
+    /// The oldest request in flight, in seconds (blocking locks aside).
+    #[serde(default)]
+    pub oldest_s: u64,
+    #[serde(default)]
+    pub stall_threshold_s: u64,
+    /// The stalled requests (and blocking lock waits past the
+    /// threshold, marked `blocking`), oldest first.
+    #[serde(default)]
+    pub stalled_requests: Vec<StalledFuseRequest>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StalledFuseRequest {
+    pub op: String,
+    pub ino: u64,
+    pub age_s: u64,
+    /// What the handler last noted it was waiting on.
+    pub stage: String,
+    /// The OS thread handling it.
+    pub tid: u32,
+    /// A blocking lock request: unbounded by design, not a stall.
+    #[serde(default)]
+    pub blocking: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
     pub fs_uuid: String,
@@ -668,6 +710,9 @@ pub struct StatusReport {
     /// every counter zero.
     #[serde(default)]
     pub prune: PruneStatus,
+    /// The FUSE request watchdog (EC2 campaign 7 B-2).
+    #[serde(default)]
+    pub fuse_requests: FuseRequestsStatus,
     /// Object-store requests this daemon has issued since it started
     /// (every filesystem it serves), by kind and by key area.
     #[serde(default)]
@@ -1334,6 +1379,17 @@ pub struct SessionStatus {
     /// not installed here).
     #[serde(default)]
     pub raised: u64,
+    /// `CONSTELLATION_SESSION_WATERMARK_TTL_MS` (0: never dropped).
+    #[serde(default)]
+    pub watermark_ttl_ms: u64,
+    /// Watermarks dropped after staying unreached for the TTL, and
+    /// stream dependencies voided because the delegation table showed
+    /// their generation ended before this incarnation (EC2 campaign 7
+    /// B-2: either one left every read on the node degraded for good).
+    #[serde(default)]
+    pub abandoned: u64,
+    #[serde(default)]
+    pub voided_ended: u64,
 }
 
 /// Plan 30 §M8: `cto=strict` reads, read delegations and recalls.

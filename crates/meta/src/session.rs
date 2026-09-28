@@ -42,6 +42,31 @@
 //! 4. otherwise wait for the applied position to advance, bounded by
 //!    `CONSTELLATION_SESSION_WAIT_MS` (default 2000, 0 disables); on
 //!    timeout answer anyway (degraded, not an error), warn once.
+//!
+//! # A watermark nobody reaches
+//!
+//! `observed` names positions of other nodes' state; two of its parts
+//! can name what this replica will never hold (EC2 campaign 7, finding
+//! B-2: a `git add` and a `cat` that "hung" for good on a node whose
+//! every read was paying the whole budget, 288 timeouts of 292 reads):
+//!
+//! - a delegation stream generation that ended before this incarnation
+//!   started. A lock's floor is the join of every releaser's frontier
+//!   since the lock was first taken, so it keeps naming generations long
+//!   after their `Recall`; a replica that applied the `Recall` while
+//!   running voids the generation (`void_stream`), one that restarted
+//!   since has no memory of it — `voided` and `streams` are volatile —
+//!   and never reaches the grant's position. [`crate::Meta::session_wait_at`]
+//!   consults the persisted delegation table before a wait with such a
+//!   dependency: a generation the table once delegated (at or below its
+//!   `max_gen`) and no longer lists has ended, and is voided;
+//! - anything else (a journal position of a tenure this replica's
+//!   `applied` never covers, a generation the table cannot account for):
+//!   a watermark still unreached `CONSTELLATION_SESSION_WATERMARK_TTL_MS`
+//!   (default 10 s; 0 disables the rule) after it was raised is dropped
+//!   to the applied position, with a warning. The guarantee it carried is
+//!   already gone (every read since answered degraded); keeping it would
+//!   only make every later read wait the budget for nothing.
 
 use crate::mutate::MutateOp;
 use crate::record::LogRecord;
@@ -385,6 +410,14 @@ pub struct SessionStats {
     /// Times `observed` was raised (a reply whose effects were not
     /// installed here).
     pub raised: u64,
+    /// Watermarks dropped after `CONSTELLATION_SESSION_WATERMARK_TTL_MS`
+    /// unreached, and stream dependencies voided because the persisted
+    /// delegation table showed their generation ended (module doc, "A
+    /// watermark nobody reaches").
+    #[serde(default)]
+    pub abandoned: u64,
+    #[serde(default)]
+    pub voided_ended: u64,
     /// Plan 30 §M9: reads on a holder under a `Backup`/`S3` acknowledgement
     /// policy whose wait began because the unshipped journal touched their
     /// keys and was not yet durable (on every backup, or in the log).
@@ -405,6 +438,14 @@ struct Inner {
     applied_seq: u64,
     /// The journal position of the last applied (or shipped) segment.
     applied: Option<JournalPos>,
+    /// The same, as persisted by the previous incarnation (`Meta::open`
+    /// seeds it): what this replica holds, for what a read waits on —
+    /// but not what its clients have seen (`deps`, `frontier`): a fresh
+    /// FUSE session has seen nothing yet, and advertising the seed there
+    /// held a restarted node's first writes at a holder that could not
+    /// reach it (`git-under-flock-faults`, 120 s in doubt after a
+    /// whole-cluster kill).
+    seeded: Option<JournalPos>,
     /// Plan 30 §M9 × §M11: the holder's journal position the pre-S3
     /// stream installed here contiguously from the applied log (backup-
     /// acknowledged rows, in the holder's order). A dependency on the
@@ -414,6 +455,9 @@ struct Inner {
     /// have been rolled back ([`SessionState::clear_streamed`]).
     streamed: Option<JournalPos>,
     observed: Position,
+    /// When `observed` was last raised, while it stays unreached (the
+    /// watermark TTL's clock; see the module doc).
+    observed_since: Option<Instant>,
     /// Speculation installed with a position, until the applied position
     /// dominates it.
     covering: Vec<(KeySet, Position)>,
@@ -488,7 +532,7 @@ impl Inner {
         }
         Position {
             seq: self.applied_seq,
-            pending: self.applied,
+            pending: self.applied.max(self.seeded),
             streams,
         }
     }
@@ -502,7 +546,7 @@ impl Inner {
         };
         !owed
             && self.applied_seq >= target.seq
-            && self.applied.max(self.streamed) >= target.pending
+            && self.applied.max(self.seeded).max(self.streamed) >= target.pending
             && target.streams.iter().all(|(g, i)| {
                 // Plan 30 §M14: a stream with nothing appended yet (a fresh
                 // generation's `(gen, 0)`) is reached by everyone.
@@ -528,6 +572,8 @@ pub struct SessionState {
     inner: Mutex<Inner>,
     cv: Condvar,
     budget_ms: AtomicU64,
+    /// `CONSTELLATION_SESSION_WATERMARK_TTL_MS` (0: never dropped).
+    watermark_ttl_ms: AtomicU64,
     warned: AtomicBool,
     stats: Mutex<SessionStats>,
     /// Plan 30 §M9: this node holds under a `Backup`/`S3` acknowledgement
@@ -550,12 +596,20 @@ fn budget_default() -> u64 {
         .unwrap_or(2000)
 }
 
+fn watermark_ttl_default() -> u64 {
+    std::env::var("CONSTELLATION_SESSION_WATERMARK_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+}
+
 impl Default for SessionState {
     fn default() -> Self {
         SessionState {
             inner: Mutex::new(Inner::default()),
             cv: Condvar::new(),
             budget_ms: AtomicU64::new(budget_default()),
+            watermark_ttl_ms: AtomicU64::new(watermark_ttl_default()),
             warned: AtomicBool::new(false),
             stats: Mutex::new(SessionStats::default()),
             durable_gate: AtomicBool::new(false),
@@ -580,6 +634,88 @@ impl SessionState {
 
     pub fn set_budget_ms(&self, ms: u64) {
         self.budget_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// How long an unreached watermark is kept (module doc, "A watermark
+    /// nobody reaches"); zero: for good.
+    pub fn watermark_ttl(&self) -> Duration {
+        Duration::from_millis(self.watermark_ttl_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn set_watermark_ttl_ms(&self, ms: u64) {
+        self.watermark_ttl_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The generations `observed` depends on that this replica neither
+    /// holds far enough nor knows as void (what a wait would block on).
+    pub fn unreached_streams(&self) -> Vec<u64> {
+        let g = self.inner.lock().unwrap();
+        g.observed
+            .streams
+            .iter()
+            .filter(|(gen, i)| {
+                *i > 0 && !g.voided.contains(gen) && !g.streams.get(gen).is_some_and(|m| *m >= *i)
+            })
+            .map(|(gen, _)| gen)
+            .collect()
+    }
+
+    /// Void every unreached generation `observed` names for which
+    /// `ended` says the generation is over (the persisted delegation
+    /// table once delegated it and no longer lists it): the rule
+    /// `void_stream` applies at a `Recall`, for a replica that applied
+    /// the record in an earlier incarnation. Returns how many.
+    pub fn void_ended(&self, ended: impl Fn(u64) -> bool) -> usize {
+        let gens = self.unreached_streams();
+        let mut n = 0;
+        for gen in gens {
+            if !ended(gen) {
+                continue;
+            }
+            let cut = self.stream_applied(gen);
+            self.void_stream(gen, cut);
+            n += 1;
+        }
+        if n > 0 {
+            self.stats.lock().unwrap().voided_ended += n as u64;
+        }
+        n
+    }
+
+    /// Drop `observed` to the applied position when it has stayed
+    /// unreached for the watermark TTL (module doc). `true` if dropped.
+    fn abandon_stale_watermark(&self) -> bool {
+        let ttl = self.watermark_ttl();
+        if ttl.is_zero() {
+            return false;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let Some(since) = g.observed_since else {
+            return false;
+        };
+        let observed = g.observed;
+        if g.reaches(&observed) {
+            g.observed_since = None;
+            return false;
+        }
+        let age = since.elapsed();
+        if age < ttl {
+            return false;
+        }
+        let applied = g.applied_position();
+        g.observed = applied;
+        g.observed_since = None;
+        drop(g);
+        self.stats.lock().unwrap().abandoned += 1;
+        tracing::warn!(
+            dropped = ?observed,
+            ?applied,
+            ?age,
+            "dropping a session watermark this replica has not reached for the watermark TTL: \
+             every read since has answered degraded, and nothing it names is coming (a \
+             generation or tenure that ended before this incarnation started)"
+        );
+        true
     }
 
     pub fn stats(&self) -> SessionStats {
@@ -850,6 +986,17 @@ impl SessionState {
         }
     }
 
+    /// What the previous incarnation persisted (`Meta::open`): the
+    /// applied log sequence and journal position this replica holds.
+    /// Reached by reads, not advertised by writes (see `Inner::seeded`).
+    pub fn seed_applied(&self, seq: u64, pos: Option<JournalPos>) {
+        let mut g = self.inner.lock().unwrap();
+        g.applied_seq = g.applied_seq.max(seq);
+        if pos > g.seeded {
+            g.seeded = pos;
+        }
+    }
+
     /// The replica applied (or shipped) a segment at `seq` shipped through
     /// `through` (a fenced segment passes `None`: its journal position
     /// took no effect).
@@ -908,6 +1055,7 @@ impl SessionState {
         };
         if next != g.observed {
             g.observed = next;
+            g.observed_since = Some(Instant::now());
             drop(g);
             self.stats.lock().unwrap().raised += 1;
         }
@@ -983,6 +1131,7 @@ impl SessionState {
     pub fn reset(&self) {
         let mut g = self.inner.lock().unwrap();
         g.observed = Position::ZERO;
+        g.observed_since = None;
         g.covering.clear();
     }
 
@@ -1075,6 +1224,11 @@ impl SessionState {
                     ok
                 };
             }
+            // A watermark past its TTL is dropped here, and the check
+            // repeats (the read then waits, if at all, for its own floor).
+            if self.abandon_stale_watermark() {
+                continue;
+            }
             let waited = started.elapsed();
             if waited >= budget {
                 break SessionWait::TimedOut(waited);
@@ -1144,6 +1298,7 @@ impl crate::store::Meta {
     /// [`Self::session_wait`] with a per-read position `floor` on top of
     /// the watermark (plan 30 §M8's strict open).
     pub fn session_wait_at(&self, keys: &[ReadKey], floor: &Position) -> SessionWait {
+        self.void_ended_generations();
         self.session.wait(
             keys,
             floor,
@@ -1177,6 +1332,32 @@ impl crate::store::Meta {
             Some(seq) => seq,
         };
         need > self.session.durable_jseq()
+    }
+
+    /// The module doc's "A watermark nobody reaches": a stream generation
+    /// the watermark depends on that this replica neither holds nor knows
+    /// as void is looked up in the persisted delegation table (one point
+    /// read, only when such a dependency is outstanding — never on the
+    /// fast path): once delegated and no longer live, it has ended, and
+    /// the dependency is void, as a `Recall` applied in this incarnation
+    /// would have made it.
+    fn void_ended_generations(&self) {
+        if self.session.unreached_streams().is_empty() {
+            return;
+        }
+        let table = self.delegation_table();
+        let max_gen = table.max_gen();
+        let voided = self
+            .session
+            .void_ended(|gen| gen <= max_gen && !table.iter().any(|d| d.gen == gen));
+        if voided > 0 {
+            tracing::info!(
+                voided,
+                max_gen,
+                "voided session dependencies on delegation generations that ended before this \
+                 incarnation (the delegation table no longer lists them)"
+            );
+        }
     }
 
     /// [`SessionState::ready`] against this store: whether a read of
@@ -1494,6 +1675,93 @@ mod tests {
             s.wait(&k, &Position::ZERO, || (4, true, false), || false),
             SessionWait::TimedOut(_)
         ));
+    }
+
+    /// EC2 campaign 7 B-2: a lock grant's floor named a delegation
+    /// generation that ended before this incarnation (its `Recall` was
+    /// applied by an earlier one; `voided` is volatile). The persisted
+    /// table says it ended: the dependency is voided and the read goes
+    /// through at once, instead of every read paying the whole budget.
+    #[test]
+    fn a_dependency_on_a_generation_the_table_shows_ended_is_voided() {
+        let s = SessionState::default();
+        s.set_budget_ms(2_000);
+        s.advance(10, jp(3, 7));
+        let mut observed = Position {
+            seq: 10,
+            pending: jp(3, 7),
+            streams: Default::default(),
+        };
+        assert!(observed.streams.raise(5, 1649));
+        assert!(observed.streams.raise(6, 6990));
+        s.raise_observed(observed);
+        assert_eq!(s.unreached_streams(), vec![5, 6]);
+        // Generation 6 is still live in the table: only 5 is voided.
+        assert_eq!(s.void_ended(|gen| gen == 5), 1);
+        assert_eq!(s.unreached_streams(), vec![6]);
+        assert!(!s.reaches(&observed));
+        assert_eq!(s.void_ended(|_| true), 1);
+        assert!(s.unreached_streams().is_empty());
+        let r = s.wait(
+            &[ReadKey::Ino(1)],
+            &Position::ZERO,
+            || (10, false, false),
+            || false,
+        );
+        assert_eq!(r, SessionWait::Fast);
+        assert_eq!(s.stats().voided_ended, 2);
+        assert_eq!(s.stats().timeouts, 0);
+    }
+
+    /// The safety net for everything else: a watermark unreached for
+    /// the TTL is dropped to the applied position, once; the reads that
+    /// timed out before that are counted, the ones after go through.
+    #[test]
+    fn a_watermark_nobody_reaches_is_dropped_after_its_ttl() {
+        let s = SessionState::default();
+        s.set_budget_ms(50);
+        s.set_watermark_ttl_ms(120);
+        s.advance(10, None);
+        s.raise_observed(Position {
+            seq: 10,
+            pending: jp(2, 36),
+            streams: Default::default(),
+        });
+        let read = || {
+            s.wait(
+                &[ReadKey::Ino(1)],
+                &Position::ZERO,
+                || (10, false, false),
+                || false,
+            )
+        };
+        assert!(matches!(read(), SessionWait::TimedOut(_)));
+        assert_eq!(s.stats().abandoned, 0);
+        std::thread::sleep(Duration::from_millis(130));
+        // Past the TTL: dropped at the start of this wait, no timeout.
+        assert_eq!(read(), SessionWait::Fast);
+        assert_eq!(s.stats().abandoned, 1);
+        assert_eq!(s.stats().timeouts, 1);
+        assert_eq!(s.observed(), s.applied());
+        // A watermark that is reached keeps nothing to drop.
+        s.raise_observed(Position {
+            seq: 10,
+            pending: None,
+            streams: Default::default(),
+        });
+        std::thread::sleep(Duration::from_millis(130));
+        assert_eq!(read(), SessionWait::Fast);
+        assert_eq!(s.stats().abandoned, 1);
+        // TTL 0: kept for good (the old behaviour).
+        s.set_watermark_ttl_ms(0);
+        s.raise_observed(Position {
+            seq: 10,
+            pending: jp(2, 40),
+            streams: Default::default(),
+        });
+        std::thread::sleep(Duration::from_millis(130));
+        assert!(matches!(read(), SessionWait::TimedOut(_)));
+        assert_eq!(s.stats().abandoned, 1);
     }
 
     #[test]

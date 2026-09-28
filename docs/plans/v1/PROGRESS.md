@@ -26925,3 +26925,128 @@ delegation counters.
   `marker-order`, `delegated-op-latency`, `delegate-crash`,
   `cross-subtree-rename`, `visibility-after-burst`,
   `visibility-s3-latency`, `p2p-invalidation`.
+## Fix: a FUSE request that never gets answered (campaign 7 B-2)
+
+EC2 campaign 7 finding B-2: after a 30-minute fault phase a committer
+node's `git rev-parse HEAD`, `cat .git/HEAD` and `git add -A` did not
+return (a `GETATTR` in `request_wait_answer`, `waiting` nonzero), while
+`status` was green and other nodes read the same file at once.
+
+### Root cause
+
+Every request on that node was answered, each after the whole session
+budget. The evidence's own `status` shows it: `session.reads 292,
+timeouts 288, wait_ms_total 576000`; the one timeout warning shows
+`observed` naming stream generations 3, 5, 6 and `pending (2, 36)` that
+`applied` (`streams []`, `pending None`) never covers. A cluster lock
+grant raises the session watermark to the lock's floor, which is the
+join of every releaser's frontier since the lock was first taken, so it
+keeps naming delegation generations long after their `Recall`. A replica
+that applies the `Recall` while running voids the generation; one that
+restarted since has no memory of it (`voided`, `streams` and the applied
+journal position are volatile), so the watermark stays unreached for the
+rest of the incarnation and every read waits 2 s: git, walking hundreds
+of paths, looks hung. The committers were exactly the nodes killed and
+remounted by the fault loop.
+
+### Fix
+
+- `meta::session`: before a wait with an unreached stream dependency,
+  the persisted delegation table is consulted (one point read, never on
+  the fast path): a generation at or below its `max_gen` that is no
+  longer live has ended and is voided (`void_ended`). Anything the table
+  cannot account for: a watermark still unreached
+  `CONSTELLATION_SESSION_WATERMARK_TTL_MS` (10 s, 0 keeps it) after it
+  was raised is dropped to the applied position with a warning
+  (`abandon_stale_watermark`). `status.session` counts both
+  (`voided_ended`, `abandoned`, `watermark_ttl_ms`).
+- `meta::store`: the applied journal position is persisted
+  (`applied_pos`, written with `applied_seq` by `apply_segment_rows`
+  and on the holder's own `ack_journal`, copied on a rebuild) and the
+  session is seeded from it at `Meta::open` (`seed_applied`): reached
+  by reads, not advertised by writes (`deps`/`frontier` keep the live
+  `applied`, `None` until a segment applies — a seed advertised there
+  held a restarted node's first writes at a holder for the 120 s
+  in-doubt deadline in one `git-under-flock-faults` run). Rebased onto
+  `2929121`, whose `seed_generations` rebuilds the generation indices
+  and voided set at open: the table lookup here (`void_ended`) then
+  covers what a seed cannot (a generation ending after the open), and
+  the persisted position covers the floor's `pending` part, which the
+  seed does not (without it the regression scenario still waited the
+  TTL: 4 timeouts, then the drop).
+- FUSE request watchdog (`cli/fuse_watch.rs`): every `Filesystem`
+  method registers its request (op, ino, tid, start) and the helpers
+  note the wait they enter (write shard, inode operation lock, session
+  wait, lease acquisition, core replies, chunk fetch stages, flush, lock
+  grant). A monitor logs a request older than
+  `CONSTELLATION_FUSE_REQUEST_STALL_S` (30) at WARN, again per further
+  threshold, and when it completes; blocking lock requests are listed,
+  never counted. `status.fuse_requests` reports in-flight, stalled,
+  totals and the stalled requests with their stage.
+  `CONSTELLATION_FUSE_STALL_BACKTRACE=1` also writes the stalled
+  thread's backtrace to the log (used for the diagnosis here).
+- Audit of reply paths: fuser answers EIO for a dropped reply, so a
+  hang is always a blocked handler; every blocking point on the request
+  path is now staged. Unbounded by design and left so: a blocking lock
+  wait (own thread), a write-through drain while S3 is away.
+
+### Tests
+
+- `meta::session` unit tests for the ended-generation rule and the TTL.
+- Harness `lock-grant-dead-generation`: `d1` delegated to c, written by
+  c and b, the turn file locked and released by b and a, the delegation
+  ended, b remounted, b takes the lock; 21 lookups on b must be fast, no
+  session timeout. On main (`b89c048`): 21 lookups took 126 s, 69
+  timeouts. Fixed: 0.5 ms, 0 timeouts, grant 19 ms (on `2929121` the
+  generation is void from the seed at open and the floor's journal
+  position from the persisted applied position: 0.8 ms, 0 timeouts).
+- `git-under-flock*` now poll every node's watchdog during the run and
+  fail on any stalled request (threshold 90 s there: the first write
+  after a whole-cluster `kill -9` waits ~50 s for the dead lease); git
+  commands and tree walks in the verdict are bounded (`bounded`, 120 s)
+  so a hung mount fails the scenario instead of the harness. Daemon
+  logs rotate per incarnation (`mount.log.<n>`) and are kept on failure.
+
+### Files
+
+- `crates/meta/src/session.rs`, `crates/meta/src/store/{mod,spec,bootstrap}.rs`
+- `crates/authority/src/replica.rs`
+- `crates/cli/src/{fuse_watch,fusefs,fusefs_ops,locks,main}.rs`
+- `crates/api/src/{lib,types}.rs`
+- `crates/harness/src/{client,scenarios}.rs`, `crates/harness/src/scenarios/{watermark,gitflock,m11}.rs`
+- Docs: `cto-modes.md`, `cluster-locks.md`, `configuration.md`
+
+### Results (on `b89c048`, then rebased onto `2929121`; prefix `constellation-harness-hunggetattr`)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) clean.
+- Unit tests: `constellation-meta` 98, `constellation` bin 283,
+  `constellation-authority` lib 133 + sim 105 + meta_repro 3,
+  `constellation-api` 4, harness 16. All pass.
+- pjdfstest (private compose project, own image tag, `--no-cache`):
+  8798 passed, 0 failed, empty baseline.
+- Harness, all pass: `lock-grant-dead-generation` (x4),
+  `session-wait-degrades`, `session-ryw-after-holder-kill`,
+  `flock-cross-node`, `lock-failover`, `lock-holder-killed-contention`,
+  `lock-fence-at-close`, `lock-holder-partitioned`,
+  `git-under-flock-faults` (150 s seed 7 and 400 s seed 1),
+  `git-under-flock-b2b`, `git-under-flock`, `holder-kill-rejoin`,
+  `fuse-inval-storm`, `chaos-ci`.
+- Before the fix, `git-under-flock-faults` at 400 s reproduced the
+  degraded watermark on b (`streams [(1, 30)]` never reached) and on a
+  (`pending` of an older epoch behind a takeover marker), transiently
+  because the nodes kept being killed; on EC2 the fault phase ended and
+  it stuck.
+- After the rebase onto `2929121` (its `seed_generations` plus this
+  change): meta 99, cli 283, api 4 unit tests; clippy clean;
+  `lock-grant-dead-generation` x3 (0.5-0.8 ms for the 21 lookups, 0
+  timeouts), `git-under-flock-faults` 150 s seed 7 and 400 s seed 1,
+  `git-under-flock-causal` seed 7: all pass, no stalled request on any
+  node. One 400 s seed-1 run before the `seeded`/`deps` separation had
+  a 192 s whole-cluster-kill recovery with c's first two ops in doubt
+  for 120 s and its drain check failing; with the seed kept out of
+  `deps` the same run recovers in 78 s and passes (main's build: 73 s).
+- Not reproduced here: the daemon-side 52 s `create` and 120 s `flush`
+  waits after a whole-cluster `kill -9` are the lease's expiry and the
+  core's in-doubt deadline (2 x TTL), bounded by design; the watchdog
+  reports them at the default threshold, which is why the gitflock
+  scenarios use 90 s.

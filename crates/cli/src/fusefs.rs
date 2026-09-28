@@ -215,7 +215,17 @@ impl WriteShards {
     }
 
     fn lock(&self, ino: Ino) -> std::sync::MutexGuard<'_, HashMap<Ino, WriteState>> {
-        self.maps[ino as usize % WRITE_SHARDS].lock().unwrap()
+        let m = &self.maps[ino as usize % WRITE_SHARDS];
+        match m.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::fuse_watch::stage("write shard lock");
+                let guard = m.lock().unwrap();
+                crate::fuse_watch::stage("running");
+                guard
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("{e}"),
+        }
     }
 
     /// The pending size of `ino`'s session: in the map, or detached. Call
@@ -318,7 +328,11 @@ impl InodeOps {
                     *depth += 1;
                     break;
                 }
-                Some(_) => held = cv.wait(held).unwrap(),
+                Some(_) => {
+                    crate::fuse_watch::stage("inode operation lock");
+                    held = cv.wait(held).unwrap();
+                    crate::fuse_watch::stage("running");
+                }
             }
         }
         InodeOpGuard { ops: self, ino }
@@ -1345,7 +1359,10 @@ impl ConstellationFs {
         }
         let tree = self
             .rt
-            .block_on(self.snapshots.list_frozen(&hash))
+            .block_on(async {
+                crate::fuse_watch::stage("snapshot tree load");
+                self.snapshots.list_frozen(&hash).await
+            })
             .map_err(|_| libc::EIO)?;
         let mut cache = self.tree_cache.lock().unwrap();
         if cache.0.len() >= 128 {
@@ -1525,7 +1542,10 @@ impl ConstellationFs {
         };
         let manifest = self
             .rt
-            .block_on(self.snapshots.load_manifest(&manifest_hash))
+            .block_on(async {
+                crate::fuse_watch::stage("snapshot manifest load");
+                self.snapshots.load_manifest(&manifest_hash).await
+            })
             .map_err(|error| {
                 tracing::debug!(%error, ino, "frozen read: manifest load failed");
                 libc::EIO
@@ -1733,6 +1753,7 @@ impl ConstellationFs {
         // one merely busy trading the lease among several waiters.
         let mut last_seen: Option<(u64, u64)> = None;
         let mut no_progress_since = start;
+        crate::fuse_watch::stage("lease acquisition");
         loop {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if h.tx.send(SyncRequest::Acquire { reply: tx }).is_err() {
@@ -1827,7 +1848,9 @@ impl ConstellationFs {
         if self.sync.is_none() {
             return;
         }
+        crate::fuse_watch::stage("session wait");
         let _ = self.meta.session_wait(keys);
+        crate::fuse_watch::stage("running");
     }
 
     /// The attribute and entry TTL the kernel may cache replies for: 1 s,
@@ -1867,8 +1890,10 @@ impl ConstellationFs {
         let Some(h) = &self.sync else {
             return;
         };
+        crate::fuse_watch::stage("session wait");
         if !h.cto_strict {
             let _ = self.meta.session_wait(keys);
+            crate::fuse_watch::stage("running");
             return;
         }
         let deleg = self.meta.read_delegations();
@@ -1906,6 +1931,7 @@ impl ConstellationFs {
             return;
         }
         let started = std::time::Instant::now();
+        crate::fuse_watch::stage("strict read index (core reply)");
         let (reply, answer) = tokio::sync::oneshot::channel();
         let sent =
             h.tx.send(SyncRequest::ReadIndex {
@@ -1920,6 +1946,7 @@ impl ConstellationFs {
         } else {
             None
         };
+        crate::fuse_watch::stage("session wait (strict)");
         match answer {
             Some(constellation_authority::ReadAnswer::Holder) => {
                 deleg.count(|s| s.holder_local += 1);
@@ -1978,10 +2005,12 @@ impl ConstellationFs {
             return;
         }
         let started = std::time::Instant::now();
+        crate::fuse_watch::stage("read-delegation recall (core reply)");
         let (reply, done) = tokio::sync::oneshot::channel();
         if h.tx.send(SyncRequest::Recall { inos, reply }).is_ok() {
             let _ = done.blocking_recv();
         }
+        crate::fuse_watch::stage("running");
         let waited = started.elapsed().as_millis() as u64;
         self.meta.read_delegations().count(|s| {
             s.fuse_writes_recalled += 1;
@@ -2063,6 +2092,7 @@ impl ConstellationFs {
             // node's clients were answered with); `None` (the streams
             // overflow) goes through the core, to the root.
             if let Some(deps) = session.deps().filter(|d| session.reaches(d)) {
+                crate::fuse_watch::stage("delegate execute (meta)");
                 let result = self.meta.delegate_execute(op, Some(rid), gen, deps);
                 // Journaled (or refused): the admission ends here, before
                 // the core can answer a recall with a `through` this op
@@ -2101,6 +2131,7 @@ impl ConstellationFs {
         // harness `chaos-soak-4`). Placement counts these executions
         // too (`note_fast_path`), or the root's share of a directory is
         // invisible to it.
+        crate::fuse_watch::stage("delegation gate");
         let Some(gate) = self.meta.root_fast_path(op) else {
             h.delegates.note_routed();
             return self.submit_to_core(h, op, rid, false);
@@ -2109,6 +2140,7 @@ impl ConstellationFs {
         // atomically with respect to a release's final flush + CAS — see
         // `lease.rs`'s module doc, "The releasing flag".
         if let Some(admitted) = h.lease.admit() {
+            crate::fuse_watch::stage("local execute (meta)");
             let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid));
             // Plan 30 §M9: under a durability gate, the row this op
             // journaled (at or below the tip now) must reach the backups
@@ -2184,6 +2216,7 @@ impl ConstellationFs {
     fn local_ack_durable(&self, h: &SyncHandle, jseq: u64) -> bool {
         let _ = h.tx.send(SyncRequest::Journaled);
         let session = self.meta.session();
+        crate::fuse_watch::stage("durability acknowledgement");
         match session.wait_durable(jseq, DURABLE_WAIT_BUDGET) {
             constellation_meta::DurableWait::Durable(waited) => {
                 session.count_fast_ack(waited);
@@ -2204,6 +2237,7 @@ impl ConstellationFs {
         rid: constellation_meta::Rid,
         in_doubt: bool,
     ) -> Result<(), MutateFail> {
+        crate::fuse_watch::stage("mutation submitted to the core (reply)");
         let (tx, rx) = tokio::sync::oneshot::channel();
         if h.tx
             .send(SyncRequest::Submit {
@@ -2255,6 +2289,7 @@ impl ConstellationFs {
             let _ = h.tx.send(SyncRequest::Nudge);
             return Ok(());
         }
+        crate::fuse_watch::stage("fsync barrier (core reply)");
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if h.tx
             .send(SyncRequest::Barrier {
@@ -2336,8 +2371,11 @@ impl ConstellationFs {
                 self.scan.note_stall(ino);
             }
         }
-        while self.prefetch.is_inflight(hash) {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        if self.prefetch.is_inflight(hash) {
+            crate::fuse_watch::stage("chunk fetch: prefetch in flight");
+            while self.prefetch.is_inflight(hash) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
         }
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
@@ -2346,8 +2384,10 @@ impl ConstellationFs {
             self.prefetch.note_stall(ino);
             self.scan.note_stall(ino);
         }
+        crate::fuse_watch::stage("chunk fetch: forwarded chunk wait");
         self.wait_forwarded_chunk(hash);
         if let Some(coop) = &self.coop {
+            crate::fuse_watch::stage("chunk fetch: coop (peers/S3)");
             return self.rt.block_on(coop.fetch(hash)).map_err(|error| {
                 tracing::warn!(
                     hash = %hash.to_hex(),
@@ -2359,6 +2399,7 @@ impl ConstellationFs {
         }
         let mut data = None;
         let mut last_error = None;
+        crate::fuse_watch::stage("chunk fetch: S3");
         for attempt in 0..3 {
             let fetched = (|| {
                 let mut spill = self
@@ -2483,6 +2524,7 @@ impl ConstellationFs {
         let Some(handle) = &self.sync else {
             return Ok(());
         };
+        crate::fuse_watch::stage("chunk drain (upload, core reply)");
         let (reply, receive) = tokio::sync::oneshot::channel();
         handle
             .tx
@@ -2613,6 +2655,7 @@ impl ConstellationFs {
         let Some(ws) = self.writes.detach(ino) else {
             return Ok(());
         };
+        crate::fuse_watch::stage("flush: compose and commit");
         match self.flush_detached(ino, ws, force_through) {
             Ok(drain) => {
                 self.writes.retire(ino);

@@ -10,8 +10,9 @@ pub mod types;
 pub mod web;
 
 pub use types::{
-    AckStatus, CasProbeStatus, CtoStatus, HeldInodeStatus, HeldStatus, LockStatus, LogStreamStatus,
-    PeerPathsStatus, RemoteChunkStatus, S3RequestStatus, SessionStatus,
+    AckStatus, CasProbeStatus, CtoStatus, FuseRequestsStatus, HeldInodeStatus, HeldStatus,
+    LockStatus, LogStreamStatus, PeerPathsStatus, RemoteChunkStatus, S3RequestStatus,
+    SessionStatus, StalledFuseRequest,
 };
 pub use types::{
     AtimeStatus, CacheEntryStatus, CacheStatus, CoopStatus, DelegationReport, DelegationStatus,
@@ -510,6 +511,7 @@ mod tests {
                 prune: PruneStatus::default(),
                 inbox: InboxStatus::default(),
                 s3: Default::default(),
+                fuse_requests: Default::default(),
             }
         }
 
