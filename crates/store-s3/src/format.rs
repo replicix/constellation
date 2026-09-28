@@ -65,6 +65,16 @@ impl<W: Write> StreamingDecoder<W> {
         }
         let codec = Codec::from_id(u16::from_le_bytes(header[5..7].try_into().unwrap()))?;
         let expected_len = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        // The declared length is attacker-controlled; refuse one past the
+        // decompression ceiling before streaming any bytes, so `write_payload`'s
+        // running bound below can't be defeated by simply declaring a huge
+        // length. See `codec::MAX_DECOMPRESSED_LEN`.
+        if expected_len > codec::MAX_DECOMPRESSED_LEN {
+            return Err(StoreError::CorruptObject(format!(
+                "declared decoded length {expected_len} exceeds the {}-byte ceiling",
+                codec::MAX_DECOMPRESSED_LEN
+            )));
+        }
         let writer = HashWriter {
             inner: out,
             hasher,
@@ -87,6 +97,22 @@ impl<W: Write> StreamingDecoder<W> {
         match &mut self.inner {
             DecoderInner::Raw(writer) => writer.write_all(bytes)?,
             DecoderInner::Zstd(decoder) => decoder.write_all(bytes)?,
+        }
+        // Abort the moment decompression has produced more than the object's
+        // header declared. `finish` also checks the exact length, but only
+        // after the whole payload is consumed — without this a crafted frame
+        // (a few compressed bytes expanding to gigabytes) would stream all of
+        // that into the caller's sink (a cache file on disk) before the
+        // mismatch was noticed.
+        let produced = match &self.inner {
+            DecoderInner::Raw(writer) => writer.bytes,
+            DecoderInner::Zstd(decoder) => decoder.get_ref().bytes,
+        };
+        if produced > self.expected_len {
+            return Err(StoreError::CorruptObject(format!(
+                "decoded length {produced} exceeds header {}",
+                self.expected_len
+            )));
         }
         Ok(())
     }
@@ -233,6 +259,59 @@ mod tests {
             assert_eq!(hash, blake3::hash(&data));
             assert_eq!(out, data);
         }
+    }
+
+    /// A tiny zstd payload that expands far past the ceiling must be
+    /// rejected rather than decompressed in full.
+    #[test]
+    fn decode_object_rejects_a_decompression_bomb() {
+        // ~256 MiB of zeros compresses to a minuscule fraction of itself.
+        let bomb = vec![0u8; (crate::codec::MAX_DECOMPRESSED_LEN as usize) + (1 << 20)];
+        let payload = zstd::encode_all(&bomb[..], 19).unwrap();
+        assert!(
+            payload.len() < bomb.len() / 1000,
+            "bomb payload should be a tiny fraction of its output: {} vs {}",
+            payload.len(),
+            bomb.len()
+        );
+        let mut obj = Vec::new();
+        obj.extend_from_slice(MAGIC);
+        obj.push(VERSION);
+        obj.extend_from_slice(&crate::codec::CODEC_ZSTD.to_le_bytes());
+        obj.push(19i8 as u8);
+        // Honest header: declare the true (over-ceiling) length.
+        obj.extend_from_slice(&(bomb.len() as u64).to_le_bytes());
+        obj.extend_from_slice(&payload);
+        let err = decode_object(&obj).unwrap_err();
+        assert!(
+            matches!(err, StoreError::CorruptObject(_)),
+            "over-ceiling length must be refused, got {err:?}"
+        );
+
+        // Lying header: declare a small length but ship a frame that expands
+        // past it. Must fail as a length mismatch, not decompress unbounded.
+        let mut obj = Vec::new();
+        obj.extend_from_slice(MAGIC);
+        obj.push(VERSION);
+        obj.extend_from_slice(&crate::codec::CODEC_ZSTD.to_le_bytes());
+        obj.push(19i8 as u8);
+        obj.extend_from_slice(&64u64.to_le_bytes()); // claims 64 bytes
+        obj.extend_from_slice(&payload); // really expands to >256 MiB
+        assert!(matches!(
+            decode_object(&obj).unwrap_err(),
+            StoreError::CorruptObject(_)
+        ));
+    }
+
+    #[test]
+    fn streaming_decode_rejects_an_over_ceiling_header() {
+        let mut header = [0u8; HEADER_LEN];
+        header[..4].copy_from_slice(MAGIC);
+        header[4] = VERSION;
+        header[5..7].copy_from_slice(&crate::codec::CODEC_ZSTD.to_le_bytes());
+        header[8..16].copy_from_slice(&(crate::codec::MAX_DECOMPRESSED_LEN + 1).to_le_bytes());
+        let mut out = Vec::new();
+        assert!(StreamingDecoder::new(&header, &mut out, blake3::Hasher::new()).is_err());
     }
 
     #[test]

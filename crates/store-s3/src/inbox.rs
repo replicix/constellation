@@ -126,6 +126,14 @@ pub const MAX_OPS_PER_BATCH: usize = 512;
 /// Soft cap on a batch's encoded size, for the same reason.
 pub const MAX_BATCH_BYTES: usize = 1 << 20;
 
+/// Ceiling on a batch's *decompressed* size when opening one off untrusted
+/// storage. [`MAX_BATCH_BYTES`] is the producer's soft target, which a batch
+/// under load may run over, so this allows generous headroom (16×) while
+/// still refusing a zstd frame that would expand without bound — the batch
+/// body is decompressed under this cap via [`crate::codec::decompress_bounded`]
+/// rather than with an unbounded `zstd::decode_all`.
+const MAX_BATCH_DECOMPRESSED_BYTES: u64 = (MAX_BATCH_BYTES as u64) * 16;
+
 /// `(node, incarnation, seq)`, mirroring `constellation_meta::Rid` field
 /// for field. Repeated here rather than imported because this crate
 /// sits below `meta` in the dependency graph; the `cli` crate converts.
@@ -335,7 +343,7 @@ impl InboxStore {
             )?,
             None => body.to_vec(),
         };
-        Ok(zstd::decode_all(&compressed[..])?)
+        crate::codec::decompress_bounded(&compressed[..], MAX_BATCH_DECOMPRESSED_BYTES)
     }
 
     /// CAS-create `batch` at its key, through [`crate::cas::put_conditional`]
@@ -1081,6 +1089,28 @@ mod tests {
         ));
         assert!(matches!(
             InboxBatch::decode(&bytes[..6]),
+            Err(StoreError::CorruptObject(_))
+        ));
+    }
+
+    /// A crafted batch body whose zstd frame expands past the batch ceiling
+    /// is refused, not decompressed in full.
+    #[test]
+    fn open_refuses_an_oversized_frame() {
+        let bomb = zstd::encode_all(
+            &vec![0u8; (MAX_BATCH_DECOMPRESSED_BYTES as usize) + (1 << 20)][..],
+            19,
+        )
+        .unwrap();
+        assert!(bomb.len() < 1 << 16, "a run of zeros compresses tiny");
+        let key = InboxKey {
+            epoch: 1,
+            node: 5,
+            n: 0,
+        }
+        .path();
+        assert!(matches!(
+            mem().open(&key, &bomb),
             Err(StoreError::CorruptObject(_))
         ));
     }

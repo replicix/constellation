@@ -26,6 +26,14 @@ use std::sync::Arc;
 pub const PARTITION: &str = "p0";
 const ZSTD_LEVEL: i32 = 3;
 
+/// Ceiling on a segment's decompressed size. A shipped segment holds ≤ 4 MiB
+/// of records (DESIGN.md §4) and `net`'s wire path caps the same object at
+/// 64 MiB (`constellation_net::message::MAX_LOG_SEGMENT`), so 64 MiB is the
+/// widest a legitimate segment can be. The body comes off untrusted storage
+/// (or a gossip push), so its zstd frame is decompressed under this cap
+/// rather than unbounded: see [`crate::codec::decompress_bounded`].
+const MAX_SEGMENT_BYTES: u64 = 64 << 20;
+
 fn sealed_key(partition: &str) -> object_store::path::Path {
     object_store::path::Path::from(format!("log/{partition}/sealed"))
 }
@@ -122,7 +130,7 @@ impl LogStore {
             )?,
             None => body.to_vec(),
         };
-        Ok(zstd::decode_all(&compressed[..])?)
+        crate::codec::decompress_bounded(&compressed[..], MAX_SEGMENT_BYTES)
     }
 
     /// CAS-create segment `seq`. `AlreadyExists` when the sequence was
@@ -466,6 +474,19 @@ mod tests {
         let other_keys = Arc::new(crate::e2e::E2eKeys::generate());
         let outsider = LogStore::new_e2e(store.clone(), other_keys);
         assert!(outsider.open_segment(1, &sealed).is_err());
+    }
+
+    /// A crafted segment body whose zstd frame expands past the segment
+    /// ceiling is refused, not decompressed in full.
+    #[test]
+    fn open_segment_refuses_an_oversized_frame() {
+        let bomb = zstd::encode_all(&vec![0u8; (MAX_SEGMENT_BYTES as usize) + (1 << 20)][..], 19)
+            .unwrap();
+        assert!(bomb.len() < 1 << 16, "a run of zeros compresses tiny");
+        assert!(matches!(
+            ls().open_segment(1, &bomb),
+            Err(StoreError::CorruptObject(_))
+        ));
     }
 
     #[tokio::test]

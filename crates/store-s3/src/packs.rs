@@ -84,6 +84,21 @@ use std::sync::Arc;
 
 const ZSTD_LEVEL: i32 = 3;
 
+/// Ceiling on one node's decompressed frame. A node's uncompressed bytes are
+/// bounded at ~120 KiB (§14.1: `MAX_ENTRIES = 256` clips the worst-case leaf,
+/// and `build_packs` notes the same figure), so a frame expanding past this
+/// is a corrupt or hostile pack, not a node. 4 MiB sits far above the
+/// measured worst case yet refuses the decompression bomb an unbounded
+/// `zstd::decode_all` would swallow.
+///
+/// [`PackEntry::len`] records each frame's exact size so a reader could cap
+/// there instead, but `open_frame` is reached through call paths outside this
+/// module ([`crate::compact`] and `node_cache`) that cannot be widened here.
+/// The index is untrusted anyway (a lying `len` could only ever claim up to
+/// this bound), so an absolute ceiling gives the same protection — every
+/// frame that comes out is still hashed and re-parsed by the caller.
+const MAX_NODE_BYTES: u64 = 4 << 20;
+
 pub const PACK_MAGIC: [u8; 4] = *b"CPK1";
 pub const PACK_INDEX_MAGIC: [u8; 4] = *b"CPI1";
 pub const PACK_FORMAT_VERSION: u8 = 1;
@@ -599,7 +614,7 @@ impl PackStore {
             }
             None => frame,
         };
-        zstd::decode_all(frame).map_err(|e| StoreError::Compression(e.to_string()))
+        crate::codec::decompress_bounded(frame, MAX_NODE_BYTES)
     }
 
     /// Override the fill target. For tests that need several packs out
@@ -787,6 +802,21 @@ mod tests {
         encoded[5] = FLAG_SEALED_NODES;
         let err = PackIndex::decode(&encoded).unwrap_err().to_string();
         assert!(err.contains("sealed"), "{err}");
+    }
+
+    /// A crafted frame whose zstd stream expands past the node ceiling is
+    /// refused, not decompressed in full — `open_frame` bounds the output.
+    #[test]
+    fn open_frame_refuses_an_oversized_frame() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let packs = PackStore::new(store);
+        let bomb =
+            zstd::encode_all(&vec![0u8; (MAX_NODE_BYTES as usize) + (1 << 20)][..], 19).unwrap();
+        assert!(bomb.len() < 1 << 16, "a run of zeros compresses tiny");
+        assert!(matches!(
+            packs.open_frame(&NodeHash([0u8; 32]), &bomb),
+            Err(StoreError::CorruptObject(_))
+        ));
     }
 
     #[test]

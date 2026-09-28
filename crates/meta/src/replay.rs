@@ -1000,6 +1000,18 @@ fn apply_rename(
     Ok(Applied::Done)
 }
 
+/// The signed byte-usage delta `new - old` between two sizes, computed
+/// without the overflow an `i64` subtraction can hit. `size` fields come off
+/// decoded log records, so a corrupt or hostile record can carry a value near
+/// `u64::MAX`; casting each to `i64` and subtracting would panic under
+/// `overflow-checks` and wrap silently in release. Widening to `i128` and
+/// clamping to the `i64` range is exact for every legitimate size (all far
+/// below `i64::MAX`) and merely bounds a nonsensical one instead of crashing
+/// the replay.
+fn size_delta(new: u64, old: u64) -> i64 {
+    (new as i128 - old as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_setattr(
     tx: &mut SingleWriterWriteTx,
@@ -1051,7 +1063,7 @@ fn apply_setattr(
         atime::set_atime_tx(tx, &meta.atime, ino, a);
     }
     if size.is_some() && attrs.kind == Kind::File {
-        staged.adjust(attrs.size as i64 - old_size as i64, 0);
+        staged.adjust(size_delta(attrs.size, old_size), 0);
         clip_manifest_to_size_tx(tx, meta, dirty, ino)?;
     }
     Ok(Applied::Done)
@@ -1186,7 +1198,7 @@ fn apply_write_manifest(
         current.as_deref(),
         Some(manifest),
     )?;
-    staged.adjust(size as i64 - old_size as i64, 0);
+    staged.adjust(size_delta(size, old_size), 0);
     Ok(Applied::Done)
 }
 
@@ -1357,11 +1369,38 @@ fn apply_clone(
         }
         let is_file = kind == InodeKind::File;
         match (prior_file, is_file) {
-            (false, true) => staged.adjust(node.size as i64, 1),
-            (true, false) => staged.adjust(-(prior_size as i64), -1),
-            (true, true) => staged.adjust(node.size as i64 - prior_size as i64, 0),
+            // `size_delta` for the same reason as the subtraction sites: a
+            // hostile record can carry `size` near `u64::MAX`, where
+            // `node.size as i64` goes negative and `-(prior_size as i64)`
+            // panics at `i64::MIN` under overflow-checks. Adding a file is
+            // `size_delta(node.size, 0)`; removing one is `size_delta(0, prior_size)`.
+            (false, true) => staged.adjust(size_delta(node.size, 0), 1),
+            (true, false) => staged.adjust(size_delta(0, prior_size), -1),
+            (true, true) => staged.adjust(size_delta(node.size, prior_size), 0),
             (false, false) => {}
         }
     }
     Ok(Applied::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::size_delta;
+
+    #[test]
+    fn size_delta_is_exact_for_real_sizes_and_bounded_for_absurd_ones() {
+        // Ordinary sizes: exact, both directions.
+        assert_eq!(size_delta(0, 0), 0);
+        assert_eq!(size_delta(1_000, 400), 600);
+        assert_eq!(size_delta(400, 1_000), -600);
+
+        // A size near u64::MAX (a corrupt/hostile record) would panic under
+        // `overflow-checks` if cast to i64 and subtracted; here it saturates
+        // to the i64 bounds instead of aborting the replay.
+        assert_eq!(size_delta(u64::MAX, 0), i64::MAX);
+        assert_eq!(size_delta(0, u64::MAX), i64::MIN);
+        assert_eq!(size_delta(u64::MAX, u64::MAX), 0);
+        // The specific pair that would panic as `-(prior as i64)` on i64::MIN.
+        assert_eq!(size_delta(0, 1 << 63), i64::MIN);
+    }
 }
