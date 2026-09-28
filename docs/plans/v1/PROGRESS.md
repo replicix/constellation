@@ -27288,3 +27288,94 @@ runs, and EC2/OVH campaigns 4–8).
   `create` in doubt for 120 s), campaign 8 B-1 (stale-HEAD rate), the
   60 s first failover on a fresh filesystem, round 3's `rename_unlink`
   p99
+
+## Campaign 8 B-1: the "stale local HEAD at turn start" rate
+
+EC2 campaign 8 (`constellation-m14/EC2-CAMPAIGN8-REPORT.md`, B-1)
+reported the b2b committers' `stale_read` rate rising from 2.4 % / 37.5 %
+(campaign 7, `cb847f8`) to 72.7 % / 66.2 % (`5437fa6`) on AWS / OVH, and
+read it as the lock's visibility guarantee failing at turn start.
+
+### What the events are
+
+The worker (`gitflock_b2b_worker.py`) logs `stale_read` when, right
+after `flock`, its `git rev-parse HEAD` differs from the *other*
+committer's marker (`heads/last_head_<other>.txt`). Re-reading every
+event against the commit log of both workers (the commit event is
+written after the marker): in all 507 AWS and 288 OVH events the
+observed `HEAD` **equals the latest commit made by anyone** before the
+read, and the same holds for all 25 / 153 events of campaign 7. The
+node's `HEAD` was current every time; the other node's marker was
+merely older, because the previous turn was the reader's own. The
+metric counts double turns, not stale reads. Its rise has two causes:
+
+- the fault phase: a's `git add -A` failed with exit 128 for every turn
+  from t = 3751 s (458 errors), so b's turns kept comparing against a's
+  last good marker (b: 504 of the 507 AWS events; 459 of them after the
+  first fault);
+- turn hogging in the fault-free phase (45 AWS events, 40–62 min):
+  b took turns 262, 264, 266 ... in a row while a's request waited
+  16–28 s, each time b re-locked 1.4–5 s after its own release (a
+  flush-and-release cycle) and a was served only when b's re-request
+  lost the race. Campaign 7 had the same shape (2.3 % / 32 % of turns
+  followed the same committer's turn; 5.7 % / 16.4 % in campaign 8).
+
+Nothing in the session layer fired: `session.timeouts` stayed 0 on AWS
+(1 on OVH in 30 min), `abandoned` and `voided_ended` 0, `waited` 4 on
+b over the whole fault-free phase. The daemons' own counters and the
+causal reader (0 violations, 0 ref regressions) agree with the
+re-reading: no read under the lock was stale.
+
+### Reproduction attempts
+
+`git-under-flock-b2b` for 900 s with 25 ms S3 latency, main (`5a33beb`)
+against `cb847f8`: 415 and 322 turns, 0 stale turns, 0 double turns on
+either. With `CONSTELLATION_LOCK_TTL_MS=2000`: 66 turns, 0 double
+turns. The hogging did not reproduce locally; the EC2 drivers pass no
+lock knobs (defaults: TTL 5 s, margin 1 s, recall hold 250 ms), and the
+health sampler captured neither `locks` nor `delegation`, so which node
+owned the lock (a's `raised` jumped to 6/s with waits at 15 min, b's
+did not: a placement delegation to b would do that, and would make b
+the lock's owner) is not in the evidence. Left as an open fairness
+observation, with the counters below to settle it next time.
+
+### Changes
+
+- `locks::granted` counts its read wait (`meta::locks::LockStats`
+  `grants_waited`, `grant_wait_ms_total`, `grants_degraded`; in
+  `status.locks`) and logs a degraded grant at WARN with the floor and
+  the applied position: whenever a grant's floor was not reached before
+  the holder's first read, it is now visible.
+- The gitflock scenarios record when each turn asked for the lock and
+  report fairness: acquire wait p50/p90/max, turns that followed the
+  same committer's turn, turns granted ahead of an earlier waiter. The
+  stale-turn check (a `refs/heads/master` or marker behind the last
+  acknowledged commit under the lock) already fails every fault-free
+  variant; unchanged.
+- Docs: `cluster-locks.md` (the counters), `TESTING.md` (the fairness
+  report and what campaign 8's metric measured).
+
+### Files
+
+- `crates/meta/src/locks.rs`, `crates/cli/src/locks.rs`, `crates/cli/src/main.rs`, `crates/api/src/types.rs`
+- `crates/harness/src/scenarios/gitflock.rs`
+- `docs/reference/features/cluster-locks.md`, `docs/how-to-guides/development/TESTING.md`
+
+### Results (worktree `constellation-lockvis` on `5a33beb`, prefix `constellation-harness-lockvis`)
+
+- fmt and clippy (`--workspace --all-targets -D warnings`) clean; unit
+  tests: meta 103, api 5, harness 14, cli bin (below).
+- Harness, all pass: flock-cross-node, lock-failover,
+  lock-holder-killed-contention, lock-fence-at-close,
+  lock-holder-partitioned, lock-grant-dead-generation, git-under-flock
+  (146 turns, 0 double turns, `grants_degraded` 0 everywhere),
+  git-under-flock-faults, git-under-flock-b2b (900 s × 2, 240 s, 180 s).
+
+### For the next EC2 run
+
+Sample `status.locks` (`grants_waited`, `grants_degraded`,
+`waiters_parked`, `grants_made`) and `status.delegation.table` on every
+node alongside `session`; compare the b2b worker's double-turn count
+with the harness's fairness line; and if hogging recurs, capture which
+node owns the turn file's lock (the delegate of its subtree, or the
+lease holder) at that time.

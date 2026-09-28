@@ -299,6 +299,8 @@ fn flock(f: &std::fs::File, op: libc::c_int) -> std::io::Result<()> {
 struct Turn {
     who: String,
     i: u64,
+    /// When the committer asked for the lock (the `flock` call).
+    asked: Instant,
     got: Instant,
     released: Instant,
     /// How long each step of the turn took.
@@ -417,6 +419,7 @@ fn committer(
                 .write(true)
                 .open(mnt.join(&paths.turn))
                 .context("opening the turn file")?;
+            let asked = Instant::now();
             flock(&lf, libc::LOCK_EX).context("flock")?;
             let got = Instant::now();
             let steps = std::cell::RefCell::new(Vec::new());
@@ -504,6 +507,7 @@ fn committer(
             shared.turns.lock().unwrap().push(Turn {
                 who: name.clone(),
                 i,
+                asked,
                 got,
                 released: Instant::now(),
                 steps: steps.take(),
@@ -974,6 +978,33 @@ fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, String, Duration)
             x.got - base,
             x.released - x.got,
             x.steps
+        );
+    }
+    // Fairness (EC2 campaign 8 B-1, which measured this, not staleness:
+    // its "stale local HEAD" fired whenever a committer got two turns in
+    // a row): turns granted to a committer while the other one had asked
+    // for the lock earlier and was still waiting, and the longest wait.
+    let mut jumped = 0usize;
+    let mut consecutive = 0usize;
+    for (k, x) in t.iter().enumerate() {
+        if k > 0 && t[k - 1].who == x.who {
+            consecutive += 1;
+        }
+        if t.iter()
+            .any(|y| y.who != x.who && y.asked < x.asked && y.got > x.got)
+        {
+            jumped += 1;
+        }
+    }
+    let mut waits: Vec<Duration> = t.iter().map(|x| x.got - x.asked).collect();
+    waits.sort();
+    if !waits.is_empty() {
+        eprintln!(
+            "      lock acquire wait: p50 {:?} p90 {:?} max {:?}; {consecutive} of {} turns followed the same committer's turn, {jumped} were granted ahead of an earlier waiter",
+            waits[waits.len() / 2],
+            waits[waits.len() * 9 / 10],
+            waits[waits.len() - 1],
+            t.len()
         );
     }
     let mut durations: Vec<Duration> = t.iter().map(|x| x.released - x.got).collect();

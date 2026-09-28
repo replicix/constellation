@@ -336,6 +336,36 @@ impl ClusterLocks {
         crate::fuse_watch::stage("session wait after a lock grant");
         let waited = self.meta.session_wait_at(&[ReadKey::Ino(ino)], position);
         tracing::debug!(target: "constellation::locks", ino, ?position, ?waited, "lock granted");
+        match waited {
+            constellation_meta::SessionWait::Waited(d) => {
+                self.meta.locks().with_stats(|s| {
+                    s.grants_waited += 1;
+                    s.grant_wait_ms_total += d.as_millis() as u64;
+                });
+            }
+            constellation_meta::SessionWait::TimedOut(d) => {
+                // The guarantee the grant carries — the holder reads what
+                // the previous holders wrote — does not hold for this
+                // turn: the replica has not reached the floor, and the
+                // reads under the lock answer from what it has. Counted
+                // (`locks.grants_degraded`) and said out loud, every time.
+                self.meta.locks().with_stats(|s| {
+                    s.grants_waited += 1;
+                    s.grant_wait_ms_total += d.as_millis() as u64;
+                    s.grants_degraded += 1;
+                });
+                tracing::warn!(
+                    target: "constellation::locks",
+                    ino,
+                    floor = ?position,
+                    applied = ?self.meta.session().applied(),
+                    waited = ?d,
+                    "a lock grant's floor was not reached within the session budget: the reads \
+                     under this grant are degraded (they may not see what the previous holder wrote)"
+                );
+            }
+            _ => {}
+        }
         if let Some(inval) = &self.inval {
             crate::fuse_watch::stage("kernel invalidation after a lock grant");
             if !inval.invalidate_and_wait(ino, INVAL_WAIT) {

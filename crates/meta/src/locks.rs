@@ -232,6 +232,17 @@ pub struct LockStats {
     pub released: u64,
     /// I/O refused because the grant lapsed.
     pub fenced_io: u64,
+    /// The grant's read wait (`locks::granted`): grants whose floor the
+    /// replica had not reached when they arrived (the first read under
+    /// the lock waited), the milliseconds those waits took, and the ones
+    /// that gave up after the session budget — the read under the lock
+    /// was then answered degraded, and the guarantee that the next
+    /// holder reads what the previous one wrote did not hold for it
+    /// (EC2 campaign 8 B-1: the counter that says whether it ever
+    /// happened).
+    pub grants_waited: u64,
+    pub grant_wait_ms_total: u64,
+    pub grants_degraded: u64,
     // ---- sequencer side ----
     pub grants_made: u64,
     pub recalls_sent: u64,

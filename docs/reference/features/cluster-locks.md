@@ -190,6 +190,15 @@ the lock, not only the locked file:
   grant of the file carries it. A grant that was outwaited instead of
   released carries the owner's own position.
 
+`status.locks` says whether that ever failed: `grants_waited` and
+`grant_wait_ms_total` count the grants whose floor the replica had not
+reached on arrival (the first read under the lock waited), and
+`grants_degraded` the ones that gave up after the session budget — the
+reads under such a grant answer from what the replica has, and the
+daemon logs it at WARN with the floor and its applied position. Under
+a fault-free run `grants_degraded` stays 0 (EC2 campaign 8: 0 on AWS,
+1 in 30 minutes on OVH).
+
 The position also becomes the new holder's session watermark, so a read
 of *any* file on that node waits for it (bounded by
 `CONSTELLATION_SESSION_WAIT_MS`; a part of it the node can never reach —

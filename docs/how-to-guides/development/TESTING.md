@@ -269,6 +269,13 @@ b2b and causal, 90 s per round), `GIT_FLOCK_NODES` the node count (2–4),
 the sequencer), `GIT_FLOCK_S3_LATENCY_MS` / `GIT_FLOCK_ENV=K=V,...` add S3
 latency and mount environment, and `GIT_FLOCK_RUST_LOG` sets the
 daemons' `RUST_LOG`.
+Every variant also reports lock fairness from its turn records: the
+acquire wait per decile, the turns that followed the same committer's
+turn, and the turns granted ahead of a committer that had asked earlier
+(EC2 campaign 8's B-1 measured this, not staleness: its "stale local
+HEAD at turn start" compared a committer's `HEAD` with the *other*
+committer's marker, so it fired on every double turn; in all 795 flagged
+turns the `HEAD` read was the latest commit by anyone).
 Every variant polls each node's FUSE request watchdog
 (`status.fuse_requests`, see `CONSTELLATION_FUSE_REQUEST_STALL_S`)
 during the run and fails at the end if any request went unanswered past

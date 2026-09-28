@@ -1521,6 +1521,18 @@ pub struct LockStatus {
     /// I/O refused with `EIO` under a lapsed grant.
     #[serde(default)]
     pub fenced_io: u64,
+    /// Grants whose floor this replica had not reached on arrival (the
+    /// first read under the lock waited), how long those waits took in
+    /// all, and the ones that timed out after the session budget: under
+    /// such a grant the holder's reads were answered degraded, so the
+    /// lock's visibility guarantee did not hold for that turn (logged at
+    /// WARN too).
+    #[serde(default)]
+    pub grants_waited: u64,
+    #[serde(default)]
+    pub grant_wait_ms_total: u64,
+    #[serde(default)]
+    pub grants_degraded: u64,
     // ---- this node as a sequencer ----
     /// Live grants in this node's table.
     #[serde(default)]
