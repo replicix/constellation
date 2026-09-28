@@ -39,7 +39,7 @@ exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench", "vendor/fj
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "MPL-2.0"
 repository = "https://github.com/bra-fsn/constellation"
 
 [workspace.dependencies]

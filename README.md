@@ -120,3 +120,10 @@ bench/
 cargo build --workspace
 cargo test --workspace
 ```
+
+## License
+
+Constellation is released under the [Mozilla Public License 2.0](LICENSE)
+(SPDX: `MPL-2.0`). Modified copies of its source files must be published
+under the same license when distributed; combining it with code under other
+licenses is allowed.
