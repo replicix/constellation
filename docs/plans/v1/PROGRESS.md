@@ -27050,3 +27050,114 @@ remounted by the fault loop.
   core's in-doubt deadline (2 x TTL), bounded by design; the watchdog
   reports them at the default threshold, which is why the gitflock
   scenarios use 90 s.
+
+## Fix: corrupted read after a write-back writer's kill (gate finding)
+
+The full gate on `5437fa6` failed `commit-strips-pending-upload` 4/4
+("content mismatch on f000", once f002): writer A (write-back) is
+`kill -9`'d mid-commit with an upload backlog, a fresh joiner B mounts,
+A remounts to finish its uploads and unmounts cleanly, and B reads one
+of the 48 files wrong. It was reported as silent corruption.
+
+### What the joiner read
+
+The check was instrumented (`describe_mismatch`: length, which written
+file's content the bytes are, first differing offset). Every failure,
+in every run here (9 of 9 on `5437fa6`), was a read of **0 bytes** for
+a 4096-byte file — never another file's content, never a torn or
+altered buffer. `inspect` on B showed the inode with `size 0, manifest
+null`. The log (`authority/examples/dump_log` over the segments):
+
+- seq 1-38: the 48 creates, shipped as they happened;
+- seq 39: the 24 `write_manifest`s of the files whose chunks were in
+  S3 at the kill;
+- seq 40: the epoch marker of A's remount (a takeover of its own
+  still-valid lease, same epoch; B applies it as a 0-record segment);
+- seq 41: A's final drain (`journal_backlog` 40-72), the other 24
+  manifests — f000, f001 or f002 among them depending on the run.
+
+Plan 30 §M7 ships a create at once and defers its manifest until the
+chunks are up; the upload order is not file order, so the first files'
+manifests are as likely to be deferred as the last ones'. B's
+`spool.head_seq` was 39 at the failing read: B served the log's state
+at seq 39, in which those files exist and are empty. A stale, consistent
+position — not corruption.
+
+### Why B was at seq 39
+
+The scenario keeps the harness's shared node key on purpose (S3-only:
+no log stream, no gossip announce reaches B), so B learns of segments
+on its S3 tail poll, whose idle backoff doubles from
+`CONSTELLATION_SYNC_INTERVAL_MS` (500 ms) towards
+`CONSTELLATION_SYNC_IDLE_MAX_MS` (10 s). In the failing run B polled at
+intervals of 0.55, 0.97 and 1.77 s; the next poll was due ~3.5 s after
+the last, ~0.6 s after A's drain completed and the reads began. With
+`CONSTELLATION_SYNC_IDLE_MAX_MS=500` the unchanged scenario passes; a
+run with debug logging (slower) passed with B applying 39-41 some
+50 ms before the reads.
+
+### Bisect
+
+Over `7dfc05b..5437fa6` (a scratch detached worktree, two runs per
+commit, private docker prefix): `059c3f7` passed 2/2, `cb847f8`,
+`b89c048` and `5437fa6` failed — but the verification run of `7dfc05b`
+itself failed the same way ("content mismatch on f000"), and three
+more runs each of `7dfc05b` and `059c3f7` afterwards all failed too
+(under Results). It is not a regression from any commit: the race
+predates `7dfc05b`, and which side of it a run lands on is host timing. `cb847f8` ("mount no longer waits for the
+zombie reaper") removed a reaper-exit wait from every `mount()`, which
+shifted the phase between B's poll schedule and A's drain enough to
+make the failure deterministic on this host; the earlier gate had
+caught the other side of the same coin.
+
+### Chunk integrity audit
+
+Every path that produces file bytes verifies the content hash:
+`Store::get_chunk_timed` and `get_chunk_to_writer` (blake3 over the
+decoded object; `HashMismatch` otherwise), the E2E variant (AEAD, then
+the same check) and a peer-served chunk (`coop::fetch_from` recomputes
+the hash and fails the fetch). The local cache holds only verified
+fetches and this node's own writes. No second bug: a manifest that names
+a chunk cannot be served with wrong bytes.
+
+### Fix
+
+Scenario only; no product change, so no lower-layer regression test
+applies. `commit-strips-pending-upload` now asserts what the design
+promises: right after A's clean unmount every file on B reads as its
+content or as empty (a stale view is a log position, never a third
+thing); then B's `spool.head_seq` reaches the S3 log head (`eventually`,
+60 s, as `holder-publishes-log-prefix` waits); then every file reads
+exactly. `describe_mismatch` tells a stale view, a torn read and wrong
+bytes apart in the failure message.
+
+### Files
+
+- `crates/harness/src/scenarios.rs` (`commit_strips_pending_upload`,
+  `describe_mismatch`)
+- `docs/plans/v1/PROGRESS.md`
+
+### Results (on `5437fa6`; main did not move, no rebase needed; prefixes `constellation-harness-stripcorrupt{,2,-bisect}`)
+
+- Reproduction on `5437fa6` with the old check: 9 of 9 runs failed,
+  every one a 0-byte read (f000, f001 or f002); with debug logging one
+  run passed (B applied seq 39-41 50 ms before the reads);
+  `CONSTELLATION_SYNC_IDLE_MAX_MS=500`: pass.
+- Bisect (`7dfc05b..5437fa6`, two runs per commit): `059c3f7` 2/2
+  pass, `cb847f8` fail, `b89c048` fail; then the baseline itself:
+  `7dfc05b` 0/4 (all "content mismatch on f000") and `059c3f7` 0/3
+  more (f000, f001, f000) after its 2/2 — the old check's outcome is
+  host timing, not a commit.
+- New check: `commit-strips-pending-upload` 13/13 (seeds 42-53 and a
+  final run on the formatted build, 28-34 s each; the stale reads
+  before the tail wait were all empty, never wrong bytes).
+- Neighbours, all pass (seed 42): `unmount-drain`, `writeback-drain`,
+  `writeback-fsync`, `small-file-write-path`, `nonowner-back-crash`,
+  `visibility-after-burst`, `poison-record-isolation`,
+  `unmount-with-held-records`, `fresh-node-bootstrap`, `kill9-remount`,
+  `holder-publishes-log-prefix`, `gc-lifecycle`, `gc-dedup-race`,
+  `backup-takeover-holds-missing-chunks`, `backup-failover`,
+  `epoch-member-dies-with-chunk`, `continuation-epoch`.
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets
+  -D warnings` clean; harness lib tests 14 pass. No core change, so no
+  sim sweep.

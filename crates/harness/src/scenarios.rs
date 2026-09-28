@@ -374,7 +374,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "commit-strips-pending-upload",
-        desc: "a mid-write-back metadata commit must not give a fresh joiner the writer's pending_upload backlog",
+        desc: "a mid-write-back metadata commit must not give a fresh joiner the writer's pending_upload backlog; the joiner's view is a log position (every file its content or empty, never wrong bytes) and exact once it tails the writer's final ship",
         requires: &[],
         run: commit_strips_pending_upload,
     },
@@ -5106,6 +5106,16 @@ fn fresh_node_bootstrap(seed: u64) -> Result<()> {
 /// the same latency also keeps the later files' chunk uploads (which
 /// cannot start before their file is written) pending past the point the
 /// mid-flight commit fires, which is the window the scenario needs.
+///
+/// The joiner runs S3-only (the harness's shared node key), so after
+/// the writer's remount finishes its uploads and unmounts cleanly, the
+/// joiner sees that final ship — the deferred manifests of the files
+/// whose chunks were pending at the kill (plan 30 §M7) — on its next S3
+/// tail poll. Until then every one of those files reads as its shipped
+/// create left it, empty; nothing may ever read as anything but its
+/// content or empty. The content check waits for the joiner's applied
+/// position to reach the log head first (the gate on `5437fa6` read a
+/// 0-byte file there and reported it as corruption).
 fn commit_strips_pending_upload(seed: u64) -> Result<()> {
     let (env, root) = setup("ckpt-pending")?;
     let proxy = env.s3_proxy()?;
@@ -5168,10 +5178,47 @@ fn commit_strips_pending_upload(seed: u64) -> Result<()> {
     })?;
     a.unmount()?;
 
+    // B runs the S3-only slow path here (the harness's shared node key:
+    // no log stream, no gossip hint), so it learns of A's final ship on
+    // its next S3 tail poll — due up to the idle backoff's ceiling after
+    // A's release. That ship carries the manifests of the files whose
+    // chunks were still pending at the kill: plan 30 §M7 ships every
+    // create at once and defers a manifest until its chunks are up, so
+    // until B tails it, such a file is exactly what its shipped create
+    // left it — empty. A stale view is a position of the log, never a
+    // third thing: no file may read as anything but its content or empty.
     for (name, data) in &expected {
         let got =
             std::fs::read(b.mnt.join(name)).with_context(|| format!("reading {name} on joiner"))?;
-        anyhow::ensure!(got == *data, "content mismatch on {name}");
+        anyhow::ensure!(
+            got == *data || got.is_empty(),
+            "before tailing the final ship: {}",
+            describe_mismatch(name, &got, data, &expected)
+        );
+    }
+    eventually(
+        "joiner tails the writer's final ship",
+        Duration::from_secs(60),
+        || {
+            let head = log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?
+                .last()
+                .copied()
+                .unwrap_or(0);
+            let at = b.control_status()?["spool"]["head_seq"]
+                .as_u64()
+                .unwrap_or(0);
+            anyhow::ensure!(at >= head, "joiner applied through {at}, log head {head}");
+            Ok(())
+        },
+    )?;
+    for (name, data) in &expected {
+        let got =
+            std::fs::read(b.mnt.join(name)).with_context(|| format!("reading {name} on joiner"))?;
+        anyhow::ensure!(
+            got == *data,
+            "after tailing the final ship: {}",
+            describe_mismatch(name, &got, data, &expected)
+        );
     }
     std::thread::sleep(Duration::from_secs(2));
     let log2 = b.tail_log_n(200);
@@ -5184,6 +5231,24 @@ fn commit_strips_pending_upload(seed: u64) -> Result<()> {
 
 fn count_commit_objects(endpoint: &str, prefix: &str) -> Result<usize> {
     Ok(raw_objects(endpoint, &format!("{prefix}/commits/"))?.len())
+}
+
+/// What a wrong read looked like: its length, which written file's
+/// content it was (if any), and the first differing offset — the
+/// difference between a stale view, a torn one and wrong bytes.
+fn describe_mismatch(name: &str, got: &[u8], want: &[u8], all: &[(String, Vec<u8>)]) -> String {
+    let looks_like = all
+        .iter()
+        .find(|(_, other)| other.as_slice() == got)
+        .map(|(other, _)| format!("the content of {other}"))
+        .unwrap_or_else(|| "no file's content".to_string());
+    let first_diff = got.iter().zip(want).position(|(a, b)| a != b);
+    format!(
+        "content mismatch on {name}: read {} bytes (expected {}), {looks_like}, first \
+         differing offset {first_diff:?}",
+        got.len(),
+        want.len()
+    )
 }
 
 /// With 60 ms of injected S3 latency and a cold cache, a sequential
