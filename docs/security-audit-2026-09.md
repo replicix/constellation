@@ -56,12 +56,34 @@ to gigabytes, exhausting memory before the check runs. Chunk objects, log
 segments, inbox batches, and pack node frames were all affected; the streaming
 chunk path wrote unbounded bytes into the on-disk cache before `finish` noticed.
 
-Fix: a single `codec::decompress_bounded(payload, max_out)` choke point that
-streams through the decoder capped at `max_out + 1` bytes, rejecting
-over-expansion as it is produced. Each caller passes a domain ceiling
-(`MAX_DECOMPRESSED_LEN` 256 MiB for chunks, 64 MiB segments, 16 MiB inbox
-batches, 4 MiB pack nodes). `StreamingDecoder` refuses an over-ceiling declared
-length up front and aborts mid-stream once output exceeds the header length.
+Fix: every untrusted zstd reader decompresses through a reader capped at
+`max_out + 1` bytes (`codec::decompress_bounded`), so over-expansion is
+rejected as it is produced. The cap bounds the *output size*, never the
+compression ratio, so a legitimate object that compresses extremely well (a
+run of zeros) decodes like any other. What the cap is depends on whether the
+object has a structural size bound:
+
+- **Chunk objects** carry a declared length: output is capped at exactly that
+  length, and the declared length itself must be under a memory-safety
+  ceiling (`codec::max_decompressed_len`, default 1 GiB, env
+  `CONSTELLATION_MAX_DECOMPRESSED_BYTES`).
+- **Log segments and inbox batches** have no length header and no structural
+  bound, so they decompress to that same ceiling (`decompress_to_ceiling`).
+  A first version of this fix capped them at 64 MiB and 16 MiB from design-doc
+  typical sizes; review against the producers showed legitimate objects past
+  both: a subtree clone journals as one `Clone` record that grows with the tree
+  (and a transaction larger than the 4 MiB segment target still ships whole),
+  and a full inbox batch of 512 `SetXattr` ops is ~32 MiB. Refusing a real log
+  segment would stall replay on every replica, so the cap is generous,
+  configurable, and its error names the variable. Likewise a spilled chunk
+  list is one chunk object of 40 bytes per data chunk, which is why the chunk
+  ceiling is not tied to the 64 MiB chunk size.
+- **Pack nodes** are structurally bounded (≤ 256 entries, leaf values above
+  1 KiB spilled to blobs), so they keep a fixed 4 MiB cap.
+
+`StreamingDecoder` (the stream-to-cache-file path) enforces the declared length
+inside its writer, per write, so a bomb delivered in a single network read never
+reaches the cache file; the first version checked only between reads.
 
 ### 3. HTTP API reachable via DNS rebinding (HIGH)
 
@@ -127,25 +149,31 @@ structurally valid), matching the existing `fuse_watch` convention.
 
 ## Fuzzing campaign
 
-14 targets over the untrusted decoders. Two crashes, both fixed above; the rest
-ran to their time budget with no crash, giving good confidence in the decoders
-they cover.
+14 targets over the untrusted decoders, ~44 min of wall time (5–7 min per
+target, `-rss_limit_mb=1024 -malloc_limit_mb=512`). Two distinct bugs, both
+fixed above; the other 12 targets ran their full budgets with no crash, OOM, or
+timeout.
 
-| Target | Result |
-|---|---|
-| `fscore_tree` | **OOM** — finding #1 (fixed) |
-| `net_reconcile_keys` | **crash** — finding #6 overlong varint (fixed) |
-| `net_payload_postcard` | clean (cov ~4459; whole `Payload` enum) |
-| `net_signed_decode` | clean (cov ~861) |
-| `net_reconcile_respond` | clean (cov ~1164) |
-| `net_reconcile_session` | clean (cov ~744) |
-| `net_bloom` | clean (cov ~114) |
-| `fscore_manifest` | clean (cov ~202) |
-| `mtree_node` / `mtree_record` | clean |
-| `store_object` / `store_inbox_pack` | clean |
-| `api_request` / `meta_blobs` | clean |
+| Target | Execs | Features | Result |
+|---|---:|---:|---|
+| `fscore_tree` | — | — | **OOM** from an 8-byte input (`malloc(4.5 GB)`) — finding #1, fixed |
+| `net_reconcile_keys` | — | — | **assertion**: overlong varint round trip — finding #6, fixed |
+| `net_payload_postcard` | 3.6M | 8522 | clean (the whole ~70-variant `Payload` enum) |
+| `net_signed_decode` | 8.0M | 1371 | clean |
+| `net_reconcile_respond` | 1.9M | 3213 | clean |
+| `net_reconcile_session` | 7.1M | 2522 | clean |
+| `net_bloom` | 115.6M | 168 | clean |
+| `fscore_manifest` | 66.4M | 384 | clean |
+| `mtree_node` | 92.2M | 559 | clean |
+| `mtree_record` | 21.1M | 564 | clean |
+| `store_object` | 25.6M | 140 | clean |
+| `store_inbox_pack` | 1.4M | 235 | clean |
+| `api_request` | 9.9M | 7591 | clean |
+| `meta_blobs` | 9.1M | 10382 | clean |
 
-Reproduce: `cd fuzz && cargo +nightly fuzz run <target>`.
+Reproduce: `cd fuzz && cargo +nightly fuzz run <target>`. The store targets pin
+`CONSTELLATION_MAX_DECOMPRESSED_BYTES` to 64 MiB at startup so libFuzzer's
+malloc limit still flags any allocation past the ceiling.
 
 ## Dependency posture
 

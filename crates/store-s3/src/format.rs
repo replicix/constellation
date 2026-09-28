@@ -22,10 +22,23 @@ struct HashWriter<W> {
     inner: W,
     hasher: blake3::Hasher,
     bytes: u64,
+    /// The header's declared length: no byte past it reaches `inner`.
+    limit: u64,
+    overflowed: bool,
 }
 
 impl<W: Write> Write for HashWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Enforced here, per write, rather than by the caller after each
+        // `write_payload`: a bomb's compressed bytes arrive in one network
+        // read, and the zstd decoder expands all of them inside that one call.
+        if self.bytes.saturating_add(buf.len() as u64) > self.limit {
+            self.overflowed = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded output exceeds the header length",
+            ));
+        }
         let written = self.inner.write(buf)?;
         self.hasher.update(&buf[..written]);
         self.bytes += written as u64;
@@ -66,19 +79,18 @@ impl<W: Write> StreamingDecoder<W> {
         let codec = Codec::from_id(u16::from_le_bytes(header[5..7].try_into().unwrap()))?;
         let expected_len = u64::from_le_bytes(header[8..16].try_into().unwrap());
         // The declared length is attacker-controlled; refuse one past the
-        // decompression ceiling before streaming any bytes, so `write_payload`'s
-        // running bound below can't be defeated by simply declaring a huge
-        // length. See `codec::MAX_DECOMPRESSED_LEN`.
-        if expected_len > codec::MAX_DECOMPRESSED_LEN {
-            return Err(StoreError::CorruptObject(format!(
-                "declared decoded length {expected_len} exceeds the {}-byte ceiling",
-                codec::MAX_DECOMPRESSED_LEN
-            )));
+        // decompression ceiling before streaming any bytes, so the writer's
+        // per-write bound can't be defeated by simply declaring a huge
+        // length. See `codec::max_decompressed_len`.
+        if expected_len > codec::max_decompressed_len() {
+            return Err(codec::ceiling_error("declared decoded length", expected_len));
         }
         let writer = HashWriter {
             inner: out,
             hasher,
             bytes: 0,
+            limit: expected_len,
+            overflowed: false,
         };
         let inner = match codec {
             Codec::Raw => DecoderInner::Raw(writer),
@@ -94,27 +106,28 @@ impl<W: Write> StreamingDecoder<W> {
     }
 
     pub fn write_payload(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
-        match &mut self.inner {
-            DecoderInner::Raw(writer) => writer.write_all(bytes)?,
-            DecoderInner::Zstd(decoder) => decoder.write_all(bytes)?,
-        }
-        // Abort the moment decompression has produced more than the object's
-        // header declared. `finish` also checks the exact length, but only
-        // after the whole payload is consumed — without this a crafted frame
-        // (a few compressed bytes expanding to gigabytes) would stream all of
-        // that into the caller's sink (a cache file on disk) before the
-        // mismatch was noticed.
-        let produced = match &self.inner {
-            DecoderInner::Raw(writer) => writer.bytes,
-            DecoderInner::Zstd(decoder) => decoder.get_ref().bytes,
+        let result = match &mut self.inner {
+            DecoderInner::Raw(writer) => writer.write_all(bytes),
+            DecoderInner::Zstd(decoder) => decoder.write_all(bytes),
         };
-        if produced > self.expected_len {
-            return Err(StoreError::CorruptObject(format!(
-                "decoded length {produced} exceeds header {}",
-                self.expected_len
-            )));
-        }
-        Ok(())
+        // `finish` checks the exact length only after the whole payload is
+        // consumed; the writer refuses output past the header as it is
+        // produced, so a crafted frame (a few compressed bytes expanding to
+        // gigabytes) never streams into the caller's sink (a cache file).
+        result.map_err(|error| {
+            let overflowed = match &self.inner {
+                DecoderInner::Raw(writer) => writer.overflowed,
+                DecoderInner::Zstd(decoder) => decoder.get_ref().overflowed,
+            };
+            if overflowed {
+                StoreError::CorruptObject(format!(
+                    "decoded output exceeds header {}",
+                    self.expected_len
+                ))
+            } else {
+                error.into()
+            }
+        })
     }
 
     /// Finish decoding and return `(plaintext bytes, plaintext hash)`.
@@ -261,56 +274,53 @@ mod tests {
         }
     }
 
-    /// A tiny zstd payload that expands far past the ceiling must be
-    /// rejected rather than decompressed in full.
-    #[test]
-    fn decode_object_rejects_a_decompression_bomb() {
-        // ~256 MiB of zeros compresses to a minuscule fraction of itself.
-        let bomb = vec![0u8; (crate::codec::MAX_DECOMPRESSED_LEN as usize) + (1 << 20)];
-        let payload = zstd::encode_all(&bomb[..], 19).unwrap();
-        assert!(
-            payload.len() < bomb.len() / 1000,
-            "bomb payload should be a tiny fraction of its output: {} vs {}",
-            payload.len(),
-            bomb.len()
-        );
+    fn zstd_object(declared_len: u64, payload: &[u8]) -> Vec<u8> {
         let mut obj = Vec::new();
         obj.extend_from_slice(MAGIC);
         obj.push(VERSION);
         obj.extend_from_slice(&crate::codec::CODEC_ZSTD.to_le_bytes());
         obj.push(19i8 as u8);
-        // Honest header: declare the true (over-ceiling) length.
-        obj.extend_from_slice(&(bomb.len() as u64).to_le_bytes());
-        obj.extend_from_slice(&payload);
-        let err = decode_object(&obj).unwrap_err();
-        assert!(
-            matches!(err, StoreError::CorruptObject(_)),
-            "over-ceiling length must be refused, got {err:?}"
-        );
+        obj.extend_from_slice(&declared_len.to_le_bytes());
+        obj.extend_from_slice(payload);
+        obj
+    }
 
-        // Lying header: declare a small length but ship a frame that expands
-        // past it. Must fail as a length mismatch, not decompress unbounded.
-        let mut obj = Vec::new();
-        obj.extend_from_slice(MAGIC);
-        obj.push(VERSION);
-        obj.extend_from_slice(&crate::codec::CODEC_ZSTD.to_le_bytes());
-        obj.push(19i8 as u8);
-        obj.extend_from_slice(&64u64.to_le_bytes()); // claims 64 bytes
-        obj.extend_from_slice(&payload); // really expands to >256 MiB
+    /// A zstd payload that expands far past what its header declares is
+    /// rejected rather than decompressed in full, on both decode paths; a
+    /// header declaring more than the ceiling is refused before any
+    /// decompression at all.
+    #[test]
+    fn a_decompression_bomb_is_rejected() {
+        // 8 MiB of zeros compresses to a minuscule fraction of itself.
+        let bomb = zstd::encode_all(&vec![0u8; 8 << 20][..], 19).unwrap();
+        assert!(bomb.len() < (8 << 20) / 1000, "{} bytes", bomb.len());
+
+        // Lying header: claims 64 bytes, really expands to 8 MiB.
+        let obj = zstd_object(64, &bomb);
         assert!(matches!(
             decode_object(&obj).unwrap_err(),
             StoreError::CorruptObject(_)
         ));
-    }
-
-    #[test]
-    fn streaming_decode_rejects_an_over_ceiling_header() {
-        let mut header = [0u8; HEADER_LEN];
-        header[..4].copy_from_slice(MAGIC);
-        header[4] = VERSION;
-        header[5..7].copy_from_slice(&crate::codec::CODEC_ZSTD.to_le_bytes());
-        header[8..16].copy_from_slice(&(crate::codec::MAX_DECOMPRESSED_LEN + 1).to_le_bytes());
+        let header: [u8; HEADER_LEN] = obj[..HEADER_LEN].try_into().unwrap();
         let mut out = Vec::new();
+        let mut decoder = StreamingDecoder::new(&header, &mut out, blake3::Hasher::new()).unwrap();
+        // The whole bomb arrives in one call, as one network read would.
+        assert!(matches!(
+            decoder.write_payload(&obj[HEADER_LEN..]),
+            Err(StoreError::CorruptObject(_))
+        ));
+        drop(decoder);
+        assert!(out.len() <= 64, "{} bytes reached the sink", out.len());
+
+        // Over-ceiling header: refused up front, naming the knob.
+        let obj = zstd_object(crate::codec::max_decompressed_len() + 1, &bomb);
+        match decode_object(&obj) {
+            Err(StoreError::CorruptObject(msg)) => {
+                assert!(msg.contains(crate::codec::MAX_DECOMPRESSED_ENV), "{msg}")
+            }
+            other => panic!("expected a ceiling error, got {other:?}"),
+        }
+        let header: [u8; HEADER_LEN] = obj[..HEADER_LEN].try_into().unwrap();
         assert!(StreamingDecoder::new(&header, &mut out, blake3::Hasher::new()).is_err());
     }
 

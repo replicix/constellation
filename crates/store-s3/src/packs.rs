@@ -84,12 +84,14 @@ use std::sync::Arc;
 
 const ZSTD_LEVEL: i32 = 3;
 
-/// Ceiling on one node's decompressed frame. A node's uncompressed bytes are
-/// bounded at ~120 KiB (§14.1: `MAX_ENTRIES = 256` clips the worst-case leaf,
-/// and `build_packs` notes the same figure), so a frame expanding past this
-/// is a corrupt or hostile pack, not a node. 4 MiB sits far above the
-/// measured worst case yet refuses the decompression bomb an unbounded
-/// `zstd::decode_all` would swallow.
+/// Ceiling on one node's decompressed frame. Unlike log segments and inbox
+/// batches, a node has a structural size bound: at most
+/// `mtree::node::MAX_ENTRIES` (256) entries, and every leaf value above
+/// `mtree::record::VALUE_SPILL` (1 KiB) is replaced by a blob hash, so even a
+/// leaf of 256 maximal keys and values stays well under 1 MiB (typical nodes
+/// are ~8 KiB; §14.1 measured ~120 KiB worst case). A frame expanding past
+/// 4 MiB is therefore a corrupt or hostile pack, however compressible, and
+/// refusing it cannot reject a real node.
 ///
 /// [`PackEntry::len`] records each frame's exact size so a reader could cap
 /// there instead, but `open_frame` is reached through call paths outside this

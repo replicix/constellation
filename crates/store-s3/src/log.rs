@@ -26,14 +26,6 @@ use std::sync::Arc;
 pub const PARTITION: &str = "p0";
 const ZSTD_LEVEL: i32 = 3;
 
-/// Ceiling on a segment's decompressed size. A shipped segment holds ≤ 4 MiB
-/// of records (DESIGN.md §4) and `net`'s wire path caps the same object at
-/// 64 MiB (`constellation_net::message::MAX_LOG_SEGMENT`), so 64 MiB is the
-/// widest a legitimate segment can be. The body comes off untrusted storage
-/// (or a gossip push), so its zstd frame is decompressed under this cap
-/// rather than unbounded: see [`crate::codec::decompress_bounded`].
-const MAX_SEGMENT_BYTES: u64 = 64 << 20;
-
 fn sealed_key(partition: &str) -> object_store::path::Path {
     object_store::path::Path::from(format!("log/{partition}/sealed"))
 }
@@ -130,7 +122,12 @@ impl LogStore {
             )?,
             None => body.to_vec(),
         };
-        crate::codec::decompress_bounded(&compressed[..], MAX_SEGMENT_BYTES)
+        // Bounded, but not by the shipper's 4 MiB `segment_max_bytes`: a
+        // transaction larger than that ships whole, and a subtree clone is one
+        // record that grows with the tree. `MAX_LOG_SEGMENT` in `net` limits
+        // the *compressed* bytes of a streamed segment, not this output. See
+        // `codec::max_decompressed_len`.
+        crate::codec::decompress_to_ceiling(&compressed[..])
     }
 
     /// CAS-create segment `seq`. `AlreadyExists` when the sequence was
@@ -476,17 +473,17 @@ mod tests {
         assert!(outsider.open_segment(1, &sealed).is_err());
     }
 
-    /// A crafted segment body whose zstd frame expands past the segment
-    /// ceiling is refused, not decompressed in full.
+    /// A legitimate segment past the shipper's usual size — one oversized
+    /// transaction, like a large subtree clone, ships whole — opens in full,
+    /// however well it compresses. (A 64 MiB decompression cap once refused
+    /// it, which would have stalled replay on every replica.)
     #[test]
-    fn open_segment_refuses_an_oversized_frame() {
-        let bomb = zstd::encode_all(&vec![0u8; (MAX_SEGMENT_BYTES as usize) + (1 << 20)][..], 19)
-            .unwrap();
-        assert!(bomb.len() < 1 << 16, "a run of zeros compresses tiny");
-        assert!(matches!(
-            ls().open_segment(1, &bomb),
-            Err(StoreError::CorruptObject(_))
-        ));
+    fn a_segment_larger_than_64_mib_opens() {
+        let s = ls();
+        let payload = vec![0x5au8; (80 << 20) + 3];
+        let sealed = s.seal_segment(1, &payload).unwrap();
+        assert!(sealed.len() < payload.len() / 1000, "compresses >1000x");
+        assert_eq!(s.open_segment(1, &sealed).unwrap().len(), payload.len());
     }
 
     #[tokio::test]
