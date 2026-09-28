@@ -694,6 +694,10 @@ pub struct StatusReport {
     /// the op already happened).
     #[serde(default)]
     pub forward_indoubt_resolved: u64,
+    /// EC2 campaign 8 A-1: this node's own S3 path, and what its ops did
+    /// without it.
+    #[serde(default)]
+    pub own_s3: OwnS3Status,
     /// Plan 30 §M13: the S3 inbox (forwarding without P2P).
     #[serde(default)]
     pub inbox: InboxStatus,
@@ -1558,6 +1562,39 @@ pub struct LockStatus {
     pub waiters: u64,
     #[serde(default)]
     pub recalls_in_flight: u64,
+}
+
+/// EC2 campaign 8 A-1: this node's own S3 path. While it is stalled (no
+/// S3 request of this node completed for `CONSTELLATION_S3_STALL_MS`,
+/// default 6 s) client ops keep forwarding over P2P rather than waiting
+/// on a lease acquisition that needs S3, and one not answered within
+/// `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (default 20 s) fails with `EIO`
+/// (in doubt) — unless the peers report that none of them reaches S3
+/// either (a bucket outage, served by the continuation epoch).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OwnS3Status {
+    pub stalled: bool,
+    /// While stalled: some live peer reaches S3 (`true`), none does
+    /// (`false`), or nobody answered (`null`).
+    #[serde(default)]
+    pub peers_reach_s3: Option<bool>,
+    /// How long the stall has lasted, as far as the core knows.
+    #[serde(default)]
+    pub stalled_for_ms: Option<u64>,
+    /// Forward retries past the ordinary budget, made instead of the
+    /// lease path.
+    #[serde(default)]
+    pub retries: u64,
+    /// Ops on the lease path forwarded again.
+    #[serde(default)]
+    pub forwards: u64,
+    /// Ops that failed at the bound.
+    #[serde(default)]
+    pub deadlines: u64,
+    /// Forwards this node answered `Held` while re-adopting the lease a
+    /// previous incarnation of it left behind.
+    #[serde(default)]
+    pub readopted_for_forward: u64,
 }
 
 /// Plan 30 §M7: the direct log stream.

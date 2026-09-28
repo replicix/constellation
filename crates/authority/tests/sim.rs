@@ -1531,12 +1531,22 @@ fn no_peer_in_budget_is_todays_behaviour() {
     assert_eq!(t.seals, 0, "{t:?}");
     assert_eq!(t.acks_waited, 0, "{t:?}");
     // A reply already on its way when the holder died counts as an
-    // acknowledgement after the crash; the rest wait for the TTL.
+    // acknowledgement after the crash (within a round trip or two: the
+    // RTTs here are 120 ms); the rest wait for the TTL. (Stated per
+    // failover since EC2 campaign 8 A-1's fix: every node now reads the
+    // lease at start, and the shifted schedule gave 3 of the 20 seeds
+    // such an in-flight reply, one more than the "at most 10 % early"
+    // this used to allow.)
     let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
-    let slow = t.failovers.iter().filter(|ms| **ms >= ttl / 2).count();
+    let early: Vec<u64> = t
+        .failovers
+        .iter()
+        .copied()
+        .filter(|ms| *ms >= 250 && *ms < ttl / 2)
+        .collect();
     assert!(
-        slow * 10 >= t.failovers.len() * 9,
-        "failovers happened before the TTL: {}",
+        early.is_empty(),
+        "failovers happened before the TTL: {} (early: {early:?})",
         t.failover_dist()
     );
 }

@@ -429,6 +429,35 @@ Operational rules:
   to a peer that reaches S3 (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`).
   The probe is fresh each time, so a cluster-wide outage is not
   mistaken for a local one.
+- A node whose own S3 path stalls (no S3 request of it completes for
+  `CONSTELLATION_S3_STALL_MS`, 6 s; `status.own_s3.stalled`) keeps its
+  metadata ops on P2P (EC2 campaign 8 A-1). A forward that times out or
+  hears `Busy` is retried to the holder, backing off to at most 1 s,
+  instead of ending in the lease path, whose every step (the lease
+  read, the CAS, the inbox) is an S3 request that would wait out the
+  S3 retry budget (30 s) and fail. An op already waiting on the lease
+  path when the stall is detected is forwarded again. A client op not
+  answered `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (20 s) after it was
+  submitted fails with `EIO` (in doubt; retried by the same rid it is
+  deduplicated), where it used to wait for the 2 × TTL (120 s)
+  deadline. That bound is what a node with neither S3 nor a working
+  P2P path to the holder answers within. It is not applied while
+  the live peers answer (`PingS3`, asked every 5 s during the stall)
+  that none of them reaches S3 either: a bucket outage is the
+  continuation epoch's.
+- A node restarted after a crash with nothing of its own to ship does
+  not reacquire the lease its previous incarnation held. If no backup
+  seals that lease, it stays in force until it expires, and a peer's
+  forward used to be answered `NotHolder`. The requester then took
+  the lease path, which cannot run without S3. Now a forward that
+  reaches a node the lease object still names (unreleased) makes that
+  node re-adopt its own lease (a takeover of it, through the gate). The
+  requester is answered `Held`, through the gate too, and retries
+  meanwhile (`status.own_s3.readopted_for_forward`). Every node reads
+  the lease when it starts, so a restarted one knows before the first
+  forward arrives. A lease this node released (a handoff in flight) or
+  that names another node is never claimed this way, and a re-adoption
+  that does not land is not tried again for a TTL.
 - Writes inside an epoch are acknowledged on the hold owner's disk
   alone (no backups). A write another member forwards to the hold owner
   leaves its chunks on that member.

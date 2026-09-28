@@ -23,6 +23,12 @@ use constellation_fs_core::Ino;
 use constellation_meta::{JournalPos, LogRecord};
 use constellation_store_s3::{Lease, LeaseTag};
 
+/// EC2 campaign 8 A-1: the reason of an acquisition started because a
+/// peer forwarded an op while the lease still names this node (see
+/// `Core::readopt_own_lease_for_forward`). It claims only that lease — its
+/// own, unreleased — and gives up on anything else.
+pub(crate) const READOPT_REASON: &str = "readopt-for-forward";
+
 /// A request for the slot.
 #[derive(Debug, Clone)]
 pub(crate) enum JobReq {
@@ -278,6 +284,28 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // A queued re-adoption (A-1) gives way to an ordinary acquisition
+        // coalescing with it: that one claims whatever is claimable.
+        if let JobReq::Acquire {
+            reason,
+            ask_handoff,
+        } = &req
+        {
+            if *reason != READOPT_REASON {
+                for q in self.queued_jobs.iter_mut() {
+                    if let JobReq::Acquire {
+                        reason: queued,
+                        ask_handoff: queued_ask,
+                    } = q
+                    {
+                        if *queued == READOPT_REASON {
+                            *queued = reason;
+                            *queued_ask = *ask_handoff;
+                        }
+                    }
+                }
+            }
+        }
         let dup = self.queued_jobs.iter().any(|q| {
             matches!(
                 (q, &req),
@@ -297,6 +325,29 @@ impl Core {
         if self.job.is_none() {
             self.start_next_job(now, replica, out);
         }
+    }
+
+    /// An acquisition is in the slot or queued for it.
+    pub(crate) fn acquiring(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|j| j.kind() == JobKind::Acquire)
+            || self
+                .queued_jobs
+                .iter()
+                .any(|q| matches!(q, JobReq::Acquire { .. }))
+    }
+
+    /// A-1: the acquisition in the slot is a re-adoption for a forward
+    /// (`READOPT_REASON`), its takeover gate included.
+    pub(crate) fn readopting(&self) -> bool {
+        matches!(
+            self.job.as_ref().map(|j| &j.what),
+            Some(What::Acquire {
+                reason: READOPT_REASON,
+                ..
+            })
+        )
     }
 
     fn start_next_job(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -2120,6 +2171,29 @@ impl Core {
             self.lease.note_object(now, lease);
         }
         let plan = self.lease.classify(now, &self.cfg, object, self.bk.sealed);
+        if let Some(What::Acquire {
+            reason: READOPT_REASON,
+            ..
+        }) = self.job.as_ref().map(|j| &j.what)
+        {
+            // A-1: only this node's own lease, unreleased, is re-adopted
+            // for a forward; a released one is a handoff in flight, and
+            // anything else is somebody else's to decide.
+            let own = match &plan {
+                Plan::Held => true,
+                Plan::Claim { prev, .. } => prev.holder == self.cfg.node_id && !prev.released,
+                _ => false,
+            };
+            if !own {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?plan,
+                    "re-adoption for a forward: the lease is not ours any more"
+                );
+                self.finish_acquire(now, false, replica, out);
+                return;
+            }
+        }
         match plan {
             Plan::Held => {
                 self.acquire_gate(now, replica, out);
@@ -2462,6 +2536,13 @@ impl Core {
                 acquired,
                 "acquisition finished"
             );
+            if reason == READOPT_REASON && !acquired {
+                // A-1: the lease was not ours to re-adopt after all (or
+                // this node could not claim it): forwards hear `NotHolder`
+                // again for a TTL, so a requester that can reach S3 takes
+                // its own lease path instead of being held on and on.
+                self.readopt_refused_until = now.plus(self.cfg.ttl_ms);
+            }
         }
         if acquired {
             self.nudged = true;

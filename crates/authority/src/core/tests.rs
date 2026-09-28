@@ -7978,3 +7978,367 @@ fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
     assert_eq!(h.core.stats.inbox_tombstones_read, 1);
     assert_eq!(h.core.stats.inbox_executed_ops, 1);
 }
+
+// ---- EC2 campaign 8 A-1: a node whose own S3 is stalled ----
+
+/// Drive `rid`'s forward to the cached holder through its whole retry
+/// budget (every attempt times out), returning the last event's actions.
+fn exhaust_forward_retries(h: &mut Harness, first: &[Action]) -> Vec<Action> {
+    let mut timeout = timers(first, TimerKind::ForwardTimeout)[0];
+    for attempt in 1..=h.core.cfg.forward_retries {
+        h.advance(h.core.cfg.forward_timeout_ms);
+        let out = h.step(Event::Timer { id: timeout });
+        let backoff = timers(&out, TimerKind::ForwardBackoff)[0];
+        h.advance(h.core.cfg.forward_backoff_ms * u64::from(attempt));
+        let out = h.step(Event::Timer { id: backoff });
+        timeout = timers(&out, TimerKind::ForwardTimeout)[0];
+    }
+    h.advance(h.core.cfg.forward_timeout_ms);
+    h.step(Event::Timer { id: timeout })
+}
+
+fn stalled(h: &mut Harness, peers_reach_s3: Option<bool>) -> Vec<Action> {
+    h.step(Event::OwnS3 {
+        stalled: true,
+        peers_reach_s3,
+    })
+}
+
+#[test]
+fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    stalled(&mut h, Some(true));
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let first = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    let out = exhaust_forward_retries(&mut h, &first);
+    // Not the lease path (its lease read would wait on the dead S3 path):
+    // another backoff and another forward of the same rid.
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    assert_ne!(h.core.job(), Some(JobKind::Acquire));
+    let mut backoff = timers(&out, TimerKind::ForwardBackoff)[0];
+    for _ in 0..5 {
+        h.advance(h.core.cfg.s3_less_retry_ms);
+        let out = h.step(Event::Timer { id: backoff });
+        let sent = sends(&out);
+        assert!(
+            matches!(sent.as_slice(), [(2, PeerMsg::MutateRequest { rid: r, .. })] if *r == rid),
+            "{out:?}"
+        );
+        let timeout = timers(&out, TimerKind::ForwardTimeout)[0];
+        h.advance(h.core.cfg.forward_timeout_ms);
+        let out = h.step(Event::Timer { id: timeout });
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        backoff = timers(&out, TimerKind::ForwardBackoff)[0];
+    }
+    // The one that ended the ordinary budget, and five more.
+    assert_eq!(h.core.stats.s3_less_retries, 6);
+    assert_eq!(h.core.stats.lease_path_taken, 0);
+    // The holder answers at last.
+    h.advance(h.core.cfg.s3_less_retry_ms);
+    let out = h.step(Event::Timer { id: backoff });
+    let req = match sends(&out).as_slice() {
+        [(2, PeerMsg::MutateRequest { req, .. })] => *req,
+        other => panic!("{other:?}"),
+    };
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Errno(libc::EEXIST),
+            base: None,
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+        },
+    });
+    assert!(
+        matches!(replies(&out).as_slice(), [(r, ClientReply::Outcome(MutateOutcome::Errno(e)))] if *r == rid && *e == libc::EEXIST),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_stall_forwards_again_an_op_already_waiting_on_the_lease_path() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let first = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    // S3 not yet known stalled: the budget ends in the lease path.
+    let out = exhaust_forward_retries(&mut h, &first);
+    assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
+    assert_eq!(h.core.job(), Some(JobKind::Acquire));
+    // The stall becomes known while the lease read hangs: forwarded again.
+    h.advance(1_000);
+    let out = stalled(&mut h, None);
+    assert!(
+        matches!(sends(&out).as_slice(), [(2, PeerMsg::MutateRequest { rid: r, .. })] if *r == rid),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.s3_less_forwards, 1);
+    assert!(matches!(
+        h.core.clients().next(),
+        Some((_, ClientPhase::Forwarded))
+    ));
+}
+
+#[test]
+fn a_stalled_node_fails_an_unanswered_op_at_the_bound_unless_the_bucket_is_down() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let first = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    exhaust_forward_retries(&mut h, &first);
+    h.advance(h.core.cfg.s3_less_deadline_ms);
+    // Every peer answered that it cannot reach S3 either: a bucket
+    // outage, left to the continuation epoch and the ordinary deadline.
+    let out = stalled(&mut h, Some(false));
+    assert!(replies(&out).is_empty(), "{out:?}");
+    assert_eq!(h.core.stats.s3_less_deadlines, 0);
+    // Only this node lost S3 (or nobody answers): in doubt now, not at
+    // the 2 × TTL deadline.
+    let out = stalled(&mut h, Some(true));
+    assert!(
+        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.s3_less_deadlines, 1);
+    assert_eq!(h.core.clients().count(), 0);
+}
+
+#[test]
+fn a_continuation_epoch_is_not_a_stall() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    h.core.epoch.open = true;
+    h.core.epoch.active = true;
+    stalled(&mut h, None);
+    assert!(!h.core.s3_less());
+}
+
+/// A peer's forward reaching a restarted node that the lease object
+/// still names: the node re-adopts its own lease and the requester is
+/// told to retry, instead of `NotHolder { 0 }` sending it to a lease path
+/// that, with its S3 cut, cannot run (EC2 campaign 8 A-1).
+#[test]
+fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
+    let mut h = Harness::new(1);
+    let own = lease_of(1, 3, h.now.plus(30_000).0);
+    h.core.lease.note_object(h.now, &own);
+    let op = h.create("a");
+    let request = |req: u64| PeerMsg::MutateRequest {
+        req: OpId(req),
+        rid: Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        },
+        op: op.clone(),
+        acked_through: 0,
+        deps: constellation_meta::Position::ZERO,
+    };
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: request(77),
+    });
+    assert!(
+        matches!(
+            sends(&out).as_slice(),
+            [(
+                2,
+                PeerMsg::MutateReply {
+                    req: OpId(77),
+                    outcome: MutateOutcome::Held { .. },
+                    ..
+                }
+            )]
+        ),
+        "{out:?}"
+    );
+    assert_eq!(h.core.job(), Some(JobKind::Acquire));
+    assert_eq!(h.core.stats.readopt_for_forward, 1);
+    let (get, _) = s3_ops(&out)
+        .into_iter()
+        .find(|(_, r)| matches!(r, S3Op::LeaseGet))
+        .expect("the acquisition reads the lease");
+    // A retry meanwhile is held again, with no second acquisition.
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: request(78),
+    });
+    assert!(matches!(
+        sends(&out).as_slice(),
+        [(
+            2,
+            PeerMsg::MutateReply {
+                outcome: MutateOutcome::Held { .. },
+                ..
+            }
+        )]
+    ));
+    assert!(s3_ops(&out)
+        .iter()
+        .all(|(_, r)| !matches!(r, S3Op::LeaseGet)));
+    // Still ours: the re-adoption goes on (a takeover of our own lease:
+    // tail to head first), no longer an idle acquisition.
+    let out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((own, tag())))),
+    });
+    assert_eq!(h.core.job(), Some(JobKind::Acquire), "{out:?}");
+}
+
+#[test]
+fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
+    for theirs in [
+        // Released by this node (a handoff in flight): the claimer's.
+        Lease {
+            released: true,
+            ..lease_of(1, 3, 0)
+        },
+        // Somebody else's by now.
+        lease_of(3, 4, i64::MAX),
+    ] {
+        let mut h = Harness::new(1);
+        h.core
+            .lease
+            .note_object(h.now, &lease_of(1, 3, h.now.plus(30_000).0));
+        let op = h.create("a");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(77),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+            },
+        });
+        let (get, _) = s3_ops(&out)
+            .into_iter()
+            .find(|(_, r)| matches!(r, S3Op::LeaseGet))
+            .expect("the acquisition reads the lease");
+        let out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+        });
+        assert!(
+            s3_ops(&out).iter().all(|(_, r)| !matches!(
+                r,
+                S3Op::LeaseCreate { .. } | S3Op::LeaseSwap { .. } | S3Op::SegmentRun { .. }
+            )),
+            "{theirs:?}: {out:?}"
+        );
+        assert_ne!(h.core.job(), Some(JobKind::Acquire), "{theirs:?}");
+        assert!(h.core.lease.held.is_none());
+        // Not re-tried on every forward: for a TTL the next one hears
+        // `NotHolder`, so a requester that reaches S3 takes the lease path.
+        let op = h.create("b");
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(78),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 2,
+                },
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+            },
+        });
+        assert!(
+            matches!(
+                sends(&out).as_slice(),
+                [(
+                    2,
+                    PeerMsg::MutateReply {
+                        outcome: MutateOutcome::NotHolder { .. },
+                        ..
+                    }
+                )]
+            ),
+            "{theirs:?}: {out:?}"
+        );
+        assert_ne!(h.core.job(), Some(JobKind::Acquire), "{theirs:?}");
+    }
+}
+
+/// A node that released the lease itself (the object read after says so)
+/// answers a stale forward `NotHolder`, never re-adopting.
+#[test]
+fn a_released_lease_is_not_readopted_for_a_forward() {
+    let mut h = Harness::new(1);
+    h.core.lease.note_object(
+        h.now,
+        &Lease {
+            released: true,
+            ..lease_of(1, 3, h.now.plus(30_000).0)
+        },
+    );
+    let op = h.create("a");
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateRequest {
+            req: OpId(77),
+            rid: Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            },
+            op,
+            acked_through: 0,
+            deps: constellation_meta::Position::ZERO,
+        },
+    });
+    assert!(
+        matches!(
+            sends(&out).as_slice(),
+            [(
+                2,
+                PeerMsg::MutateReply {
+                    outcome: MutateOutcome::NotHolder { holder: 0 },
+                    ..
+                }
+            )]
+        ),
+        "{out:?}"
+    );
+    assert_ne!(h.core.job(), Some(JobKind::Acquire));
+}
+
+/// A-1: a node reads the lease when it starts, so a restarted holder
+/// knows the lease still names it before the first forward arrives.
+#[test]
+fn a_node_reads_the_lease_at_start() {
+    let meta = Meta::open_in_memory().unwrap();
+    let mut core = Core::new(Config::defaults(1, 1));
+    let mut out = Vec::new();
+    core.start(Ms(0), &meta, &mut out);
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseGet)),
+        "{out:?}"
+    );
+    assert!(core.job().is_none());
+}

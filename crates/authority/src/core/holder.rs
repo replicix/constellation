@@ -150,7 +150,17 @@ impl Core {
         let mut position = Position::ZERO;
         let mut fresh = None;
         let outcome = if self.lease.fenced() {
-            MutateOutcome::Busy
+            if !self.lease.releasing && req != OpId(0) && self.readopting() {
+                // A-1: the gate of a re-adoption started for a forward;
+                // the requester keeps retrying (a `Busy` would spend its
+                // retries and send it to a lease path it may not have).
+                self.stats.readopt_for_forward += 1;
+                MutateOutcome::Held {
+                    retry_ms: self.cfg.recall_hold_ms.max(50),
+                }
+            } else {
+                MutateOutcome::Busy
+            }
         } else if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
             // Deliberately `ship_epoch`, not `new_mutation_epoch`: the
             // handoff pause closes this node's *own* new writes so a
@@ -267,6 +277,17 @@ impl Core {
             outcome
         } else if self.lease.lost {
             MutateOutcome::Busy
+        } else if req != OpId(0) && self.readopt_own_lease_for_forward(now, replica, out) {
+            // EC2 campaign 8 A-1: the lease names this node — a previous
+            // incarnation's, left behind by a crash — and nobody else will
+            // take it before it expires (a TTL) unless a backup seals it.
+            // `NotHolder { 0 }` sent the requester down its own lease path
+            // (S3, and with its S3 cut, nowhere); this node re-adopts the
+            // lease instead and the requester retries by rid meanwhile.
+            self.stats.readopt_for_forward += 1;
+            MutateOutcome::Held {
+                retry_ms: self.cfg.recall_hold_ms.max(50),
+            }
         } else {
             let holder = self.lease.cached_holder.unwrap_or(0);
             if holder == 0 || holder == self.cfg.node_id {
@@ -323,6 +344,62 @@ impl Core {
                 gen: 0,
             },
         });
+    }
+
+    /// EC2 campaign 8 A-1: a peer forwarded an op to this node, which does
+    /// not hold the lease, while the lease object last read names this
+    /// node, unreleased: a lease a previous incarnation held when it
+    /// died (a restart with nothing of its own to ship does not acquire
+    /// on its own). Re-adopt it — the acquisition claims it only if it
+    /// still names this node, unreleased (`jobs::READOPT_REASON`) — and
+    /// report whether that is under way. Never after this incarnation
+    /// released or handed the lease off (the object says `released`),
+    /// never while deposed, releasing, gated or in a continuation epoch,
+    /// and not for a TTL after a re-adoption that did not land (then the
+    /// requester is answered `NotHolder` and may take the lease itself).
+    fn readopt_own_lease_for_forward(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.cfg.p2p
+            || self.lease.held.is_some()
+            || self.lease.gate.is_some()
+            || self.lease.releasing
+            || self.lease.lost
+            || self.lease.epoch_held()
+            || self.epoch.open
+            || self.retired()
+            || now < self.readopt_refused_until
+        {
+            return false;
+        }
+        let names_us = match &self.lease.last_seen {
+            Some(lease) => lease.holder == self.cfg.node_id && !lease.released,
+            None => self.lease.cached_holder == Some(self.cfg.node_id),
+        };
+        if !names_us {
+            return false;
+        }
+        if self.acquiring() {
+            return true;
+        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            "a peer forwarded an op while the lease still names this node \
+             (a previous incarnation's): re-adopting it"
+        );
+        self.enqueue_job(
+            now,
+            super::jobs::JobReq::Acquire {
+                reason: super::jobs::READOPT_REASON,
+                ask_handoff: false,
+            },
+            replica,
+            out,
+        );
+        self.acquiring()
     }
 
     /// The base a requester needs for this op's reply (see

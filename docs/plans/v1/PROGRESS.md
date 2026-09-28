@@ -27379,3 +27379,170 @@ node alongside `session`; compare the b2b worker's double-turn count
 with the harness's fairness line; and if hogging recurs, capture which
 node owns the turn file's lock (the delegate of its subtree, or the
 lease holder) at that time.
+
+## Fix: a create on an S3-cut node sat in doubt for 120 s (campaign 8 A-1)
+
+Campaign 8 (binary `5437fa6`, OVH), Part A's one-node S3 cut: node b's
+outbound 443 was dropped except to the cluster subnet, and a `create()`
+on b took 120 s and ended in doubt (`EIO`). Its history: four forwards
+to the holder (node 1) timed out in 3.2 s, then `WaitingLease`,
+`AcquireRetry` at 60.5 s, one forward, `WaitingLease` again, and the
+client deadline at 120 s.
+
+### What the cut did and did not touch
+
+- P2P needs nothing on 443. The relay is off by default
+  (`status.p2p.relay: "disabled"`), and the endpoint is built from
+  iroh's `presets::Minimal`, which sets a crypto provider and nothing
+  else: no DNS/pkarr lookup and no n0 relays. Peers come from the S3
+  registry and an in-memory lookup. In the campaign's status b reached
+  all three peers `direct` (RTT 1 ms, relay paths 0) during the cut.
+- The AWS side was a real cut too. `s3.us-west-2.amazonaws.com`
+  resolves to public addresses (52.92.x, 16.15.x) from the hosts. The
+  rule is `! -d 10.108.0.0/16`, so AWS S3 is dropped as well. Checked
+  with curl from inside a cgroup-scoped rule: both OVH and AWS S3 time
+  out, and outside the scope OVH answers. The failure is not specific
+  to OVH. It needs a holder that has just restarted with its lease
+  still in force (below), and on AWS the lease was elsewhere at the
+  cut. With that state rebuilt, AWS fails the same way (120 s, below).
+
+### Root cause
+
+Three things, reproduced on EC2 with this campaign's cut on both
+backends:
+
+1. **The holder had just been `kill -9`ed and restarted** (step 7's
+   last round was 1.5 s before the cut). A restarted node with nothing
+   of its own to ship does not reacquire the lease that its previous
+   incarnation held. When no backup seals that lease, the lease stays
+   in force until it expires. In the campaign b's placement had just
+   migrated the lease to node 1 (`placement_reason: "migrate 2 -> 1"`),
+   most likely before a backup was committed. The node 1 log is gone,
+   so this is inferred. The new incarnation answered every forward
+   `NotHolder { 0 }`: its cached holder was itself, or unknown before
+   its first lease read. Reproduced without any S3 cut: b's create took
+   51 s, and b hit `NotHolder` and a lease wait every time until the TTL
+   ran out.
+2. **b's pooled QUIC connection still led to the dead incarnation**
+   (a restarted node listens on a new port). A forward on it goes
+   unanswered until the pool's probe evicts it: 2 s after an inbound
+   handshake from the new incarnation, 3 s after an unanswered request.
+   That window is longer than the 3.2 s forward budget (four 500 ms
+   timeouts), which covers the first 3.2 s of the history. The eviction
+   was logged on EC2 ("pooled P2P connection is dead ... Unanswered
+   3000"), and the harness shows the same 501 ms timeouts.
+3. **The lease path is all S3.** After the forwards, b went to
+   `WaitingLease`. Its acquisition's lease GET waited out the S3 retry
+   budget (30 s per request): 57 s, then `AcquireRetry`. The forward
+   then reached the new incarnation, heard `NotHolder { 0 }`, and went
+   back to the same wait until the 2 × TTL (120 s) client deadline.
+   Nothing bounded an op on a node that cannot reach S3. So the holder
+   did not refuse the op, b's P2P was up, and the 60 s was one S3
+   retry budget, twice.
+
+### Fix
+
+- **An S3-less node keeps forwarding** (`core::client`). The driver
+  reports the node's own S3 path every second (`Event::OwnS3`). The
+  path is stalled when no S3 request of the node has completed for
+  `CONSTELLATION_S3_STALL_MS` (6 s). While it is stalled:
+  - a forward that times out or hears `Busy` is retried past the
+    budget, with the backoff capped at 1 s, instead of taking the lease
+    path;
+  - an op already on the lease path is forwarded again to the known
+    holder while the link is up;
+  - a client op not answered within
+    `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (20 s) of submission fails
+    in doubt (`EIO`) instead of waiting for 120 s. This does not apply
+    while the peers (`PingS3`, asked every 5 s) all report S3 down: a
+    bucket outage belongs to the continuation epoch.
+  - Continuation epochs are exempt, because their lease path is P2P.
+- **A restarted holder re-adopts its lease for a forward**
+  (`core::holder`, `core::jobs`). When a forward reaches a node that the
+  lease object still names (unreleased) but that node does not hold,
+  the node starts an acquisition (`READOPT_REASON`). That acquisition
+  claims only its own unreleased lease. If the object shows the lease
+  released (a handoff in flight) or held by someone else, it gives up
+  and does not try again for a TTL. The requester is answered `Held`,
+  through the takeover gate as well, so it retries without spending
+  its budget. Every node now reads the lease at start, so a restarted
+  one already knows its situation when the first forward arrives.
+- `status.own_s3`: `stalled`, `peers_reach_s3`, `stalled_for_ms`,
+  `retries`, `forwards`, `deadlines`, `readopted_for_forward`.
+
+Not changed: the pool's probe windows (2 s / 3 s). Shortening them is
+what once cut a live holder's backup appends (`slow-s3-no-seal`). With
+the forwards now continuing, the window only delays the first answer.
+
+### Tests
+
+- Core unit tests:
+  - `a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget`
+  - `a_stall_forwards_again_an_op_already_waiting_on_the_lease_path`
+  - `a_stalled_node_fails_an_unanswered_op_at_the_bound_unless_the_bucket_is_down`
+  - `a_continuation_epoch_is_not_a_stall`
+  - `a_forward_to_a_restarted_holder_readopts_its_own_lease`
+  - `a_readoption_claims_nothing_but_its_own_unreleased_lease`
+  - `a_released_lease_is_not_readopted_for_a_forward`
+  - `a_node_reads_the_lease_at_start`
+- Sim `no_peer_in_budget_is_todays_behaviour`: the "at most 10 % of
+  failovers early" check is now stated per failover (a reply already
+  in flight, under 250 ms, or at least TTL/2). The start-up lease read
+  shifted the schedule, and 3 of 20 seeds had such an in-flight reply
+  (2, 5 and 11 ms). The other failovers are still 4.8–7.1 s.
+- New harness scenario `s3-cut-create-holder-restart`. B's S3 is
+  black-holed and every node runs the product S3 retry budget, with
+  no backups. Its phases:
+  1. A is `kill -9`ed and remounted; B's create completes within 10 s;
+  2. A is frozen for 5 s; B's create completes within 10 s of the thaw;
+  3. B is also denied P2P; its create fails with `EIO` within 35 s.
+  Afterwards everything reads back on every node.
+
+### Files
+
+- `crates/authority/src/event.rs`, `crates/authority/src/core/{mod,client,holder,jobs,tests}.rs`
+- `crates/authority/tests/sim.rs`
+- `crates/cli/src/authority_driver.rs` (`OwnS3Watch`, config),
+  `crates/cli/src/main.rs` (status)
+- `crates/api/src/{types,lib}.rs` (`OwnS3Status`)
+- `crates/harness/src/scenarios/ec2.rs`, `crates/harness/src/scenarios.rs`
+- Docs: `durability-and-failover.md`, `configuration.md`
+
+### Results
+
+- Harness, prefix `constellation-harness-a1fix`, `s3-cut-create-holder-restart`:
+  - main: phase 1's create took 59.3 s (fail);
+  - fix: create 2.8 s, write+close 6.0 s (chunk handoff); frozen
+    holder 5.5 s after a 5 s freeze; isolated `EIO` at 20.3 s (pass).
+- Also passing on the fix: `s3-cut-one-node`, `p2p-same-identity-restart`,
+  `no-peer-in-budget`, `holder-kill-rejoin`,
+  `epoch-peer-reaching-s3-declines`, `session-ryw-after-holder-kill`,
+  `takeover-marker-strands-promptly`, `forwarded-mutations`,
+  `p2p-handover`, `kill9-remount`, `s3-outage`, `inbox-withdraw-hole`,
+  `holder-crash-phantom-new-holder`.
+- `constellation-authority`: lib 141, sim 107 (+11 ignored);
+  `long_random`, `long_backup`, `long_backup_hot`, `long_flex` and
+  `long_delegated` at 300 seeds. `constellation` (cli) 291,
+  `constellation-net` 94, api 13. All pass; clippy is clean.
+- EC2, four hosts, this campaign's cut: `iptables -A OUTPUT -p tcp
+  --dport 443 ! -d 10.108.0.0/16 -j DROP`, scoped to the test
+  cluster's cgroup. `CONSTELLATION_BACKUPS=0`. Prefixes
+  `s3fs/a1fix-<ts>-{aws,ovh}/`.
+
+  | | OVH main | OVH fix | AWS main | AWS fix |
+  |---|---|---|---|---|
+  | holder restarted, then b's create | 120.0 s `EIO` | 1.0 s (close 6.2 s) | 120.0 s `EIO` | 0.25 s (close 6.0 s) |
+  | holder frozen 5 s, b's create | 37 s (45 s with close)¹ | 5.5 s | —² | 5.5 s |
+  | b with neither S3 nor P2P | 120.0 s `EIO` | 20.2 s `EIO` | 120.0 s `EIO` | 20.2 s `EIO` |
+
+  The main binary's history on OVH repeats the campaign's exactly:
+  `Forwarded->1`, `WaitingLease` 1 ms later, `AcquireRetry` at 30 s, a
+  forward, `WaitingLease` again, in doubt at 120 s. With the fix, the
+  phase-1 and phase-2 files read back on a, c and d.
+
+  ¹ A separate run on main: the frozen holder gave the campaign's first
+  3.2 s (four forward timeouts), then `WaitingLease` until
+  `AcquireRetry` at 36.8 s.
+
+  ² In the three-phase run on main, phase 2 found no live holder after
+  phase 1 (the lease expired unclaimed), so it measured nothing new.

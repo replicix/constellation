@@ -73,6 +73,19 @@ pub enum Event {
     /// the holder's inbox poll set, M9's backup liveness). Sent whole,
     /// whenever the driver refreshes it.
     Peers { links: Vec<PeerLink> },
+    /// EC2 campaign 8 A-1: this node's own S3 path, as the driver sees it
+    /// (sent with every `Peers` refresh). `stalled`: no S3 request of this
+    /// node has completed for the driver's stall window
+    /// (`CONSTELLATION_S3_STALL_MS`, default 6 s — longer than the 5 s
+    /// registry poll, so a working path always shows a completion inside
+    /// it). `peers_reach_s3`, asked of the live peers (`PingS3`) while
+    /// stalled: `Some(true)` some peer reaches S3 (the outage is this
+    /// node's own), `Some(false)` peers answered and none does (a bucket
+    /// outage), `None` nobody answered (or not stalled).
+    OwnS3 {
+        stalled: bool,
+        peers_reach_s3: Option<bool>,
+    },
     /// M7: the driver dropped a subscriber of this holder's log stream
     /// (its bounded send buffer overflowed, or its connection went away):
     /// stop streaming to it. The subscriber falls back to S3 and

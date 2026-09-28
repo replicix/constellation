@@ -487,6 +487,8 @@ protocol, message bounds and counters.
 | `CONSTELLATION_S3_MAX_RETRIES` | object_store default | count | override `RetryConfig.max_retries` for `s3://` backends |
 | `CONSTELLATION_S3_RETRY_TIMEOUT_MS` | 30000 | milliseconds | override `RetryConfig.retry_timeout` for `s3://` backends (object_store's own default is 180 s) |
 | `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS` | 6000 | milliseconds, 0 disables | a drain (write-through close, a non-holder's forwarded close, `fsync`) waiting while this node's S3 path makes no progress (no upload and no other S3 request completes) for this long hands its chunks to a peer that can reach S3, which uploads them |
+| `CONSTELLATION_S3_STALL_MS` | 6000 | milliseconds, 0 disables | EC2 campaign 8 A-1: no S3 request of this node completing for this long marks its S3 path stalled (`status.own_s3.stalled`). Metadata ops then keep forwarding to the holder over P2P instead of taking the lease path, which needs S3. See [durability and failover](features/durability-and-failover.md) |
+| `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` | 20000 | milliseconds | while this node's S3 path is stalled (and not every peer reports S3 down), a metadata op not answered this long after submission fails with `EIO` (in doubt) instead of waiting for the 2 × TTL deadline |
 | `CONSTELLATION_CAS_BUSY_RETRIES` | `5` | count | plan 30 M4: how many times a conditional PUT answered `409 Conflict` (another conditional write on the key in flight) is retried as the same attempt, backing off 50 ms doubling to 1 s, before the round reports the store's error. See [write-path hygiene](features/write-path-hygiene.md) |
 
 ### Existence hints

@@ -11,7 +11,7 @@ pub mod web;
 
 pub use types::{
     AckStatus, CasProbeStatus, CtoStatus, FuseRequestsStatus, HeldInodeStatus, HeldStatus,
-    LockStatus, LogStreamStatus, PeerPathsStatus, RemoteChunkStatus, S3RequestStatus,
+    LockStatus, LogStreamStatus, OwnS3Status, PeerPathsStatus, RemoteChunkStatus, S3RequestStatus,
     SessionStatus, StalledFuseRequest,
 };
 pub use types::{
@@ -548,6 +548,7 @@ mod tests {
                 forward_dedup_hits: 0,
                 forward_retries: 0,
                 forward_indoubt_resolved: 0,
+                own_s3: OwnS3Status::default(),
                 placement_reason: None,
                 quota: QuotaStatus::default(),
                 atime: AtimeStatus::default(),

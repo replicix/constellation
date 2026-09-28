@@ -1021,3 +1021,246 @@ pub fn inbox_withdraw_hole(_seed: u64) -> Result<()> {
     }
     result
 }
+
+/// EC2 campaign 8 A-1. Node B's outbound HTTPS is cut the way the
+/// campaign cut it (`iptables -A OUTPUT -p tcp --dport 443 ! -d
+/// <cluster subnet> -j DROP`: all of S3 black-holed, the peers on the
+/// cluster subnet untouched — P2P needs nothing else, no relay and no
+/// discovery server). A `create()` on B then took 120 s and ended in
+/// doubt: its forwards to the holder failed for a few seconds (the
+/// holder had just been `kill -9`ed and restarted: B's pooled connection
+/// led to the dead incarnation, and the new one did not hold the lease
+/// its predecessor left behind), so B took the lease path — whose every
+/// step is an S3 request B cannot make — and its next forward, 57 s
+/// later, heard `NotHolder` from the restarted node and went back to it.
+///
+/// Three nodes (A holds; no backups, so nothing seals A's lease when it
+/// dies — the campaign's lease had just moved to A); every node on the
+/// product's S3 retry budget. Each phase times a `create()` on B while
+/// B's S3 is black-holed:
+///
+/// 1. A is `kill -9`ed and remounted (with nothing of its own to ship);
+///    B's S3 is cut: B's create must complete within [`CREATE_BUDGET`]
+///    (A re-adopts its own lease for B's forward), and the file's
+///    write + close within the S3-cut close budget (the peer upload);
+/// 2. A freezes (SIGSTOP) for longer than B's forward retries last: B's
+///    create must still complete within [`CREATE_BUDGET`] of the thaw
+///    plus the freeze — it keeps forwarding instead of waiting on S3;
+/// 3. B also loses P2P to everyone: nothing can serve its create, which
+///    must fail (`EIO`) within the documented bound
+///    (`CONSTELLATION_S3_LESS_OP_DEADLINE_MS`, 20 s, after the stall is
+///    detected, 6 s) — not after the 120 s in-doubt deadline.
+///
+/// After the heal the phase-1 and phase-2 files read back everywhere.
+pub fn s3_cut_create_holder_restart(_seed: u64) -> Result<()> {
+    const NAME: &str = "s3-cut-create-holder-restart";
+    /// A `create()` on the cut node (A-1's bound; the campaign: 120 s).
+    const CREATE_BUDGET: Duration = Duration::from_secs(10);
+    /// The write + close after it (the chunk handoff to a peer: ~6 s to
+    /// find the S3 path stalled, then the peer's upload).
+    const CLOSE_BUDGET: Duration = Duration::from_secs(20);
+    /// Phase 2's freeze: longer than B's forward retries (~1.5 s).
+    const FREEZE: Duration = Duration::from_secs(5);
+    /// Phase 3: the S3-less bound (20 s) plus slack.
+    const FAIL_BUDGET: Duration = Duration::from_secs(35);
+    let (env, root) = setup(NAME)?;
+    env.s3_proxy()?;
+    let (pa, pb, pc) = (
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+        env.counting_proxy()?,
+    );
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let tune = |c: Client| {
+        let deny = deny_path(&c).display().to_string();
+        c.with_env("CONSTELLATION_BACKUPS", "0")
+            .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
+            .with_env("CONSTELLATION_DELEGATION_PLACEMENT", "off")
+            .with_env("CONSTELLATION_FAULT_P2P_DENY_FILE", &deny)
+    };
+    let mut a = tune(node(root.path(), "a", &pa, &backend)?);
+    let mut b = tune(node(root.path(), "b", &pb, &backend)?);
+    let mut c = tune(node(root.path(), "c", &pc, &backend)?);
+    a.fs_create()?;
+    a.mount()?;
+    b.mount()?;
+    c.mount()?;
+    let mut failures: Vec<String> = Vec::new();
+    let mut paused = false;
+    let result = (|| -> Result<()> {
+        wait_for_p2p(&[&a, &b, &c])?;
+        eventually("A holds the lease", Duration::from_secs(20), || {
+            anyhow::ensure!(lease_of(&a)?["held"] == true, "{}", lease_of(&a)?);
+            Ok(())
+        })?;
+        // B forwards to A (its pooled connection to A is up), and A ships
+        // everything: restarted, A has nothing of its own to ship and so
+        // does not reacquire the lease by itself.
+        std::fs::write(b.mnt.join("warm"), b"warm")?;
+        eventually("A's journal shipped", Duration::from_secs(30), || {
+            let s = a.control_status()?;
+            anyhow::ensure!(s["spool"]["journal_backlog"] == 0, "{}", s["spool"]);
+            Ok(())
+        })?;
+        eventually("warm on C", Duration::from_secs(30), || {
+            anyhow::ensure!(std::fs::read(c.mnt.join("warm"))? == b"warm");
+            Ok(())
+        })?;
+
+        // ---- 1: the holder restarts; B's S3 is cut ----
+        a.kill9()?;
+        a.mount()?;
+        eprintln!("    {NAME}: [restart] A restarted; black-holing B's S3");
+        pb.blackhole();
+        let create = |path: std::path::PathBuf| {
+            timed(move || std::fs::File::create(&path).map(|f| (f, path)))
+        };
+        let (h, _) = create(b.mnt.join("after-restart"));
+        if !wait_done(&h, CREATE_BUDGET) {
+            failures.push(format!(
+                "[restart] create on B still blocked after {CREATE_BUDGET:?} (B's S3 cut, A restarted)"
+            ));
+            std::mem::forget(h);
+            return Ok(());
+        }
+        let (r, took) = h.join().expect("create");
+        eprintln!(
+            "    {NAME}: [restart] create on B: {:?} in {took:?}",
+            r.as_ref().map(|_| ())
+        );
+        let (file, path) = match r {
+            Ok(x) => x,
+            Err(e) => {
+                failures.push(format!("[restart] create on B failed: {e}"));
+                return Ok(());
+            }
+        };
+        let (h, _) = timed(move || {
+            let mut file = file;
+            file.write_all(b"after-restart")?;
+            drop(file);
+            std::io::Result::Ok(path)
+        });
+        if !wait_done(&h, CLOSE_BUDGET) {
+            failures.push(format!(
+                "[restart] write+close on B still blocked after {CLOSE_BUDGET:?}"
+            ));
+            std::mem::forget(h);
+            return Ok(());
+        }
+        let (r, took) = h.join().expect("close");
+        eprintln!(
+            "    {NAME}: [restart] write+close on B: {:?} in {took:?}",
+            r.as_ref().map(|_| ())
+        );
+        if let Err(e) = r {
+            failures.push(format!("[restart] write+close on B failed: {e}"));
+        }
+        let s = b.control_status()?;
+        eprintln!("    {NAME}: [restart] B own_s3 {}", s["own_s3"]);
+        let s = a.control_status()?;
+        eprintln!(
+            "    {NAME}: [restart] A lease {} own_s3 {}",
+            s["lease"], s["own_s3"]
+        );
+
+        // ---- 2: the holder freezes past B's forward retries ----
+        eventually("B knows its S3 is stalled", Duration::from_secs(20), || {
+            let s = b.control_status()?;
+            anyhow::ensure!(s["own_s3"]["stalled"] == true, "{}", s["own_s3"]);
+            Ok(())
+        })?;
+        eventually("A holds the lease again", Duration::from_secs(20), || {
+            anyhow::ensure!(lease_of(&a)?["held"] == true, "{}", lease_of(&a)?);
+            Ok(())
+        })?;
+        a.pause()?;
+        paused = true;
+        let frozen = Instant::now();
+        let (h, _) = create(b.mnt.join("after-freeze"));
+        std::thread::sleep(FREEZE);
+        a.resume()?;
+        paused = false;
+        if !wait_done(&h, CREATE_BUDGET) {
+            failures.push(format!(
+                "[freeze] create on B still blocked {CREATE_BUDGET:?} after A's {FREEZE:?} freeze ended"
+            ));
+            std::mem::forget(h);
+            return Ok(());
+        }
+        let (r, _) = h.join().expect("create");
+        eprintln!(
+            "    {NAME}: [freeze] create on B: {:?} {:?} after A froze for {FREEZE:?}",
+            r.as_ref().map(|_| ()),
+            frozen.elapsed()
+        );
+        match r {
+            Ok((mut file, _)) => {
+                file.write_all(b"after-freeze")?;
+                drop(file);
+            }
+            Err(e) => failures.push(format!("[freeze] create on B failed: {e}")),
+        }
+
+        // ---- 3: B loses P2P too: a bounded failure ----
+        let ids: Vec<u64> = [&a, &c].iter().map(|x| node_id(x)).collect::<Result<_>>()?;
+        std::fs::write(
+            deny_path(&b),
+            ids.iter().map(|i| format!("{i}\n")).collect::<String>(),
+        )?;
+        eprintln!("    {NAME}: [isolated] B denied P2P to {ids:?}");
+        let (h, started) = create(b.mnt.join("isolated"));
+        if !wait_done(&h, FAIL_BUDGET) {
+            failures.push(format!(
+                "[isolated] create on B (no S3, no P2P) still blocked after {FAIL_BUDGET:?}; \
+                 expected EIO within the S3-less bound"
+            ));
+            std::mem::forget(h);
+        } else {
+            let (r, _) = h.join().expect("create");
+            eprintln!(
+                "    {NAME}: [isolated] create on B: {:?} after {:?}",
+                r.as_ref().map(|_| ()),
+                started.elapsed()
+            );
+            if r.is_ok() {
+                failures.push("[isolated] a create on B succeeded with neither S3 nor P2P".into());
+            }
+        }
+        Ok(())
+    })();
+    if paused {
+        let _ = a.resume();
+    }
+    let _ = std::fs::remove_file(deny_path(&b));
+    pb.heal();
+    let check = result.and_then(|()| {
+        for x in [&a, &b, &c] {
+            for (name, want) in [
+                ("after-restart", &b"after-restart"[..]),
+                ("after-freeze", &b"after-freeze"[..]),
+            ] {
+                eventually(
+                    &format!("{name} on {}", x.name),
+                    Duration::from_secs(60),
+                    || {
+                        anyhow::ensure!(std::fs::read(x.mnt.join(name))? == want, "not yet");
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    });
+    if check.is_err() || !failures.is_empty() {
+        eprintln!("    {NAME}: B's log tail:\n{}", b.tail_log_n(80));
+        eprintln!("    {NAME}: A's log tail:\n{}", a.tail_log_n(60));
+    }
+    let unmounted = [c.unmount(), b.unmount(), a.unmount()];
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
+    check?;
+    for u in unmounted {
+        u?;
+    }
+    Ok(())
+}

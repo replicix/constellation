@@ -114,6 +114,19 @@ pub struct Config {
     pub acquire_deadline_ms: u64,
     pub acquire_retry_min_ms: u64,
     pub acquire_retry_max_ms: u64,
+    /// EC2 campaign 8 A-1: while this node's own S3 path is stalled
+    /// (`Event::OwnS3`) and some peer still reaches S3, a client op that
+    /// has not been answered this long after its submission fails
+    /// (`InDoubt`, `EIO` to FUSE) instead of waiting out
+    /// `acquire_deadline_ms`: nothing that needs this node's S3 (a lease
+    /// read, an acquisition, an inbox batch) can complete, and forwarding
+    /// has had this long to reach a holder
+    /// (`CONSTELLATION_S3_LESS_OP_DEADLINE_MS`, default 20 s).
+    pub s3_less_deadline_ms: u64,
+    /// A-1: the longest pause between two forwards of an op while this
+    /// node's S3 is stalled (the forward retries' backoff is capped here
+    /// instead of ending in the lease path).
+    pub s3_less_retry_ms: u64,
     /// How long an acquisition waits for a peer's `LeaseHandoff` before
     /// treating the request as declined (the holder may be flushing, or
     /// dead: a delivered request with no reply is the one failure the
@@ -361,6 +374,8 @@ impl Config {
             acquire_deadline_ms: 2 * ttl_ms,
             acquire_retry_min_ms: 100,
             acquire_retry_max_ms: 2_000,
+            s3_less_deadline_ms: 20_000,
+            s3_less_retry_ms: 1_000,
             handoff_request_timeout_ms: 5_000,
             sync_interval_ms: 500,
             idle_max_ms: 10_000,
@@ -490,6 +505,18 @@ pub struct Stats {
     pub publishes: u64,
     pub in_doubt: u64,
     pub queued_behind_takeover: u64,
+    /// EC2 campaign 8 A-1: forward retries made past `forward_retries`
+    /// because this node's own S3 is stalled (the lease path would wait
+    /// on it).
+    pub s3_less_retries: u64,
+    /// A-1: ops waiting on the lease path that were forwarded again
+    /// because this node's own S3 is stalled.
+    pub s3_less_forwards: u64,
+    /// A-1: client ops answered in doubt at `s3_less_deadline_ms`.
+    pub s3_less_deadlines: u64,
+    /// A-1: forwards answered `Held` while this node re-adopts the live
+    /// lease a previous incarnation of it left behind (a restart).
+    pub readopt_for_forward: u64,
     /// Accepted forwards not installed ahead of the log because the
     /// holder reported a stale base; answered once the log carried them.
     pub awaited_log: u64,
@@ -871,6 +898,22 @@ impl Default for ShipState {
     }
 }
 
+/// EC2 campaign 8 A-1: this node's own S3 path as the driver last
+/// reported it (`Event::OwnS3`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnS3 {
+    /// No S3 request of this node has completed for the driver's stall
+    /// window.
+    pub stalled: bool,
+    /// While stalled: whether a live peer answered that it reaches S3
+    /// (`Some(true)`: the outage is this node's own), that none does
+    /// (`Some(false)`: a bucket outage, the continuation epoch's), or
+    /// nobody answered (`None`).
+    pub peers_reach_s3: Option<bool>,
+    /// When the stall was first reported.
+    pub since: Option<Ms>,
+}
+
 /// The driver's continuation-epoch state as last reported
 /// (`Control::Epoch`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1088,6 +1131,11 @@ pub struct Core {
     last_recovery: Option<String>,
     roster: Vec<NodeId>,
     links: BTreeMap<NodeId, PeerLink>,
+    /// EC2 campaign 8 A-1: this node's own S3 path (`Event::OwnS3`).
+    pub(crate) own_s3: OwnS3,
+    /// A-1: no re-adoption of this node's own lease for a forward before
+    /// this (a failed one backs off for a TTL).
+    pub(crate) readopt_refused_until: Ms,
     /// EC2 finding 2: as the holder, when each other node last had a
     /// mutation executed here over P2P (a forward), and when each last
     /// had one executed through the S3 inbox — which side of a P2P
@@ -1155,6 +1203,8 @@ impl Core {
             last_recovery: None,
             roster: Vec::new(),
             links: BTreeMap::new(),
+            own_s3: OwnS3::default(),
+            readopt_refused_until: Ms(0),
             demand_p2p: BTreeMap::new(),
             demand_inbox: BTreeMap::new(),
             inbox: inbox::InboxState::default(),
@@ -1188,6 +1238,11 @@ impl Core {
 
     pub fn ship(&self) -> &ShipState {
         &self.ship
+    }
+
+    /// EC2 campaign 8 A-1: this node's own S3 path, for `status`.
+    pub fn own_s3(&self) -> OwnS3 {
+        self.own_s3
     }
 
     pub fn epoch_state(&self) -> EpochState {
@@ -1265,6 +1320,14 @@ impl Core {
         self.locks_start(replica);
         self.backup_start(now, replica, out);
         self.promise_start(now, replica, out);
+        // EC2 campaign 8 A-1: learn who holds the lease now, not at the
+        // first forward a peer sends here. A restarted holder whose
+        // previous incarnation's lease is still in force then re-adopts
+        // it for that forward (`readopt_own_lease_for_forward`) instead of
+        // answering `NotHolder { 0 }` because it has not read the lease.
+        if self.cfg.p2p && self.cfg.forwarding {
+            self.issue_s3(crate::action::S3Op::LeaseGet, S3For::RefreshHolder, out);
+        }
     }
 
     /// Handle one event. Every action returned must be carried out by the
@@ -1327,6 +1390,10 @@ impl Core {
                 self.links = links.into_iter().map(|l| (l.node, l)).collect();
                 self.stream_on_peers(now);
             }
+            Event::OwnS3 {
+                stalled,
+                peers_reach_s3,
+            } => self.on_own_s3(now, stalled, peers_reach_s3, replica, &mut out),
             Event::Activity {
                 last_write,
                 acked_seqs,

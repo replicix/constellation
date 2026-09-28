@@ -1130,6 +1130,17 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // EC2 campaign 8 A-1: with this node's own S3 stalled the lease
+        // path waits on S3 requests that cannot complete (30 s each, then
+        // the acquisition retries); while the holder's P2P link is up the
+        // op keeps forwarding instead, the backoff capped, until the
+        // holder answers or `s3_less_deadline_ms` ends it (`on_own_s3`).
+        let keep_forwarding = self.s3_less()
+            && self
+                .lease
+                .cached_holder
+                .filter(|h| *h != self.cfg.node_id)
+                .is_some_and(|h| self.reaches(now, h));
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -1137,10 +1148,14 @@ impl Core {
             Policy::BestEffort => {
                 self.finish_in_doubt(now, rid, replica, out);
             }
-            Policy::Client if c.attempts < self.cfg.forward_retries => {
+            Policy::Client if c.attempts < self.cfg.forward_retries || keep_forwarding => {
                 c.attempts += 1;
                 self.stats.forward_retries += 1;
-                let delay = self.cfg.forward_backoff_ms * u64::from(c.attempts);
+                if c.attempts > self.cfg.forward_retries {
+                    self.stats.s3_less_retries += 1;
+                }
+                let delay = (self.cfg.forward_backoff_ms * u64::from(c.attempts))
+                    .min(self.cfg.s3_less_retry_ms.max(self.cfg.forward_backoff_ms));
                 c.phase = Phase::Backoff;
                 let timer = self.set_timer(now.plus(delay), Timer::ForwardBackoff(rid), out);
                 self.clients.get_mut(&rid).expect("present").timer = Some(timer);
@@ -1200,6 +1215,131 @@ impl Core {
         match cached {
             Some(holder) if self.reaches(now, holder) => self.send_forward(now, rid, holder, out),
             _ => self.route(now, rid, replica, out),
+        }
+    }
+
+    // ---- this node without S3 (EC2 campaign 8 A-1) ----
+
+    /// This node's own S3 path is stalled and no continuation epoch is in
+    /// force: an S3 request it makes (a lease read, an acquisition, an
+    /// inbox batch) will not complete, so its ops must not wait on one.
+    /// (In a continuation epoch authority moves by P2P handoff and the
+    /// lease path needs no S3.)
+    pub(crate) fn s3_less(&self) -> bool {
+        self.own_s3.stalled && !self.epoch.open && !self.epoch.active && !self.lease.epoch_held()
+    }
+
+    /// `Event::OwnS3`, every second. While this node's S3 is stalled:
+    ///
+    /// - an op waiting on the lease path (it entered it before the stall
+    ///   was known, or the holder answered `NotHolder`) is forwarded again
+    ///   to the known holder whenever the P2P link to it is up — the
+    ///   acquisition it waits on needs S3 and would hold it for one S3
+    ///   retry budget (30 s) per attempt;
+    /// - a client op not answered `s3_less_deadline_ms` after its
+    ///   submission fails (`InDoubt`: `EIO`, retryable by rid) instead of
+    ///   waiting out `acquire_deadline_ms` (2 × TTL, 120 s) — unless the
+    ///   peers answered that none of them reaches S3 either (a bucket
+    ///   outage, which the continuation epoch serves).
+    pub(crate) fn on_own_s3(
+        &mut self,
+        now: Ms,
+        stalled: bool,
+        peers_reach_s3: Option<bool>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if stalled != self.own_s3.stalled {
+            if stalled {
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    ?peers_reach_s3,
+                    "this node's S3 path is stalled: ops forward over P2P and do not wait on S3"
+                );
+            } else {
+                tracing::info!(node = self.cfg.node_id, "this node's S3 path answers again");
+            }
+        }
+        self.own_s3 = super::OwnS3 {
+            stalled,
+            peers_reach_s3: if stalled { peers_reach_s3 } else { None },
+            since: if stalled {
+                self.own_s3.since.or(Some(now))
+            } else {
+                None
+            },
+        };
+        if !self.s3_less() || !self.cfg.forwarding {
+            return;
+        }
+        if peers_reach_s3 != Some(false) {
+            let over: Vec<Rid> = self
+                .clients
+                .iter()
+                .filter(|(_, c)| {
+                    c.origin == Origin::Client
+                        && c.policy == Policy::Client
+                        && now.since(c.submitted) >= self.cfg.s3_less_deadline_ms as i64
+                })
+                .map(|(rid, _)| *rid)
+                .collect();
+            for rid in over {
+                if let Some(c) = self.clients.get(&rid) {
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        ?rid,
+                        op = ?c.op,
+                        phase = ?c.phase_kind(),
+                        age_ms = now.since(c.submitted),
+                        "no answer while this node's S3 is stalled: the op fails (in doubt)"
+                    );
+                }
+                self.stats.s3_less_deadlines += 1;
+                self.on_client_deadline(now, rid, replica, out);
+            }
+        }
+        if !self.cfg.p2p {
+            return;
+        }
+        let Some(holder) = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id) else {
+            return;
+        };
+        if !self.reaches(now, holder) {
+            return;
+        }
+        // `route`'s rule: an op of a node with unshipped journal of its
+        // own may depend on records no holder has.
+        if replica.journal_len().unwrap_or(0) > 0 && replica.journal_has_undelegated() {
+            return;
+        }
+        let mut waiting: Vec<(u64, Rid)> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                c.policy == Policy::Client
+                    && matches!(c.phase, Phase::WaitingLease | Phase::AcquireRetry)
+            })
+            .map(|(rid, c)| (c.order, *rid))
+            .collect();
+        waiting.sort_unstable();
+        for (_, rid) in waiting {
+            let Some(c) = self.clients.get_mut(&rid) else {
+                continue;
+            };
+            if !matches!(c.phase, Phase::WaitingLease | Phase::AcquireRetry) {
+                continue;
+            }
+            if let Some(t) = c.timer.take() {
+                self.cancel_timer(t, out);
+            }
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                holder,
+                "S3 stalled: forwarding the op again instead of waiting on the lease path"
+            );
+            self.stats.s3_less_forwards += 1;
+            self.send_forward(now, rid, holder, out);
         }
     }
 

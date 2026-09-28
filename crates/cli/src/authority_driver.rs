@@ -112,6 +112,8 @@ pub struct CoreStatus {
     pub lock_requests_in_flight: usize,
     pub lock_waiters: usize,
     pub lock_recalls_in_flight: usize,
+    /// EC2 campaign 8 A-1.
+    pub own_s3: constellation_authority::core::OwnS3,
 }
 
 /// Short names for the trace line around every core step.
@@ -137,6 +139,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::Roster { .. } => "Roster",
         Event::Slack { .. } => "Slack",
         Event::Peers { .. } => "Peers",
+        Event::OwnS3 { .. } => "OwnS3",
         Event::Activity { .. } => "Activity",
         Event::SubscriberGone { .. } => "SubscriberGone",
         Event::Control { req, .. } => match req {
@@ -437,6 +440,10 @@ pub fn load_config(
     c.p2p = p2p;
     c.forward_timeout_ms = crate::forward::forward_timeout_ms();
     c.acquire_deadline_ms = 2 * ttl_ms;
+    c.s3_less_deadline_ms = env_ms(
+        "CONSTELLATION_S3_LESS_OP_DEADLINE_MS",
+        c.s3_less_deadline_ms,
+    );
     c.sync_interval_ms = interval_ms;
     c.idle_max_ms = idle_max_ms;
     c.publisher = !read_only_member;
@@ -752,10 +759,12 @@ impl Driver {
             }
         }
         // The peer directory and the roster, on a ticker like the
-        // daemon's registry poll.
+        // daemon's registry poll; with them, this node's own S3 path
+        // (EC2 campaign 8 A-1, `Event::OwnS3`).
         {
             let tx = self.event_tx();
             let peers = self.deps.peers.clone();
+            let mut own_s3 = OwnS3Watch::new(self.deps.upload.clone(), peers.clone());
             tokio::spawn(async move {
                 // Plan 30 §M9: when each peer's link came up, for the
                 // backup selection's stability requirement.
@@ -791,6 +800,16 @@ impl Driver {
                             }
                         })
                         .collect();
+                    let (stalled, peers_reach_s3) = own_s3.tick();
+                    if tx
+                        .send(Internal::Event(Event::OwnS3 {
+                            stalled,
+                            peers_reach_s3,
+                        }))
+                        .is_err()
+                    {
+                        return;
+                    }
                     if tx.send(Internal::Event(Event::Peers { links })).is_err() {
                         return;
                     }
@@ -952,6 +971,7 @@ impl Driver {
         status.lock_requests_in_flight = lv.requests_in_flight;
         status.lock_waiters = lv.waiters;
         status.lock_recalls_in_flight = lv.recalls_in_flight;
+        status.own_s3 = self.core.own_s3();
         drop(status);
         self.deps
             .epochs
@@ -3469,6 +3489,87 @@ impl Uploader {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+/// EC2 campaign 8 A-1: how long this node's S3 path may complete nothing
+/// before the core is told it is stalled (`Event::OwnS3`;
+/// `CONSTELLATION_S3_STALL_MS`, default 6000 — longer than the 5 s
+/// registry poll, so a working path always shows a completion inside it;
+/// 0 disables).
+fn s3_stall_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("CONSTELLATION_S3_STALL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6000)
+    })
+}
+
+/// How often, while stalled, the live peers are asked whether they reach
+/// S3 (`PingS3`: one bounded lease GET on each).
+const OWN_S3_ASK_EVERY: Duration = Duration::from_secs(5);
+/// How long an answer to that question may take.
+const OWN_S3_ASK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// EC2 campaign 8 A-1: this node's own S3 path for the core, once a
+/// second. Stalled when no S3 request (and no chunk PUT) of this node
+/// has completed for [`s3_stall_ms`]; while stalled, the live peers are
+/// asked every [`OWN_S3_ASK_EVERY`] whether they reach S3, in the
+/// background (the tick never waits on them).
+struct OwnS3Watch {
+    upload: Arc<crate::UploadRuntime>,
+    peers: constellation_net::Peers,
+    asked: Option<std::time::Instant>,
+    answer: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+impl OwnS3Watch {
+    fn new(upload: Arc<crate::UploadRuntime>, peers: constellation_net::Peers) -> Self {
+        Self {
+            upload,
+            peers,
+            asked: None,
+            answer: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn tick(&mut self) -> (bool, Option<bool>) {
+        let ms = s3_stall_ms();
+        let stalled = ms > 0 && self.upload.uploads_stalled(ms as i64);
+        if !stalled {
+            self.asked = None;
+            *self.answer.lock().unwrap() = None;
+            return (false, None);
+        }
+        if self.asked.is_none_or(|at| at.elapsed() >= OWN_S3_ASK_EVERY) && self.peers.is_enabled() {
+            self.asked = Some(std::time::Instant::now());
+            let (peers, answer) = (self.peers.clone(), self.answer.clone());
+            tokio::spawn(async move {
+                let ids: Vec<u64> = peers.snapshot().iter().map(|p| p.node_id).collect();
+                let answers = futures::future::join_all(ids.into_iter().map(|id| {
+                    let peers = peers.clone();
+                    async move {
+                        tokio::time::timeout(OWN_S3_ASK_TIMEOUT, peers.ping_node_s3(id))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                }))
+                .await;
+                let reach = if answers.contains(&Some(true)) {
+                    Some(true)
+                } else if answers.contains(&Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                };
+                *answer.lock().unwrap() = reach;
+            });
+        }
+        let answer = *self.answer.lock().unwrap();
+        (true, answer)
     }
 }
 

@@ -5693,6 +5693,17 @@ impl constellation_api::StatusSource for DaemonStatus {
             forward_dedup_hits: stats.forward_dedup_hits,
             forward_retries: stats.forward_retries,
             forward_indoubt_resolved: stats.forward_indoubt_resolved,
+            own_s3: constellation_api::OwnS3Status {
+                stalled: core.own_s3.stalled,
+                peers_reach_s3: core.own_s3.peers_reach_s3,
+                stalled_for_ms: core.own_s3.since.map(|since| {
+                    (constellation_store_s3::lease::now_unix_ms() - since.0).max(0) as u64
+                }),
+                retries: stats.s3_less_retries,
+                forwards: stats.s3_less_forwards,
+                deadlines: stats.s3_less_deadlines,
+                readopted_for_forward: stats.readopt_for_forward,
+            },
             inbox: crate::inbox::status(
                 crate::inbox::inbox_enabled(),
                 &stats,

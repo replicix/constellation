@@ -805,6 +805,12 @@ pub const SCENARIOS: &[Scenario] = &[
         run: ec2::s3_cut_one_node,
     },
     Scenario {
+        name: "s3-cut-create-holder-restart",
+        desc: "EC2 campaign 8 A-1: a non-holder's S3 black-holed like the campaign's `--dport 443 ! -d <subnet> DROP` (P2P intact, product S3 retry budget); right after the holder is kill -9ed and restarted, then while the holder freezes past the forward retries, a create on the cut node completes within 10 s (the restarted holder re-adopts its lease for the forward; the cut node keeps forwarding instead of waiting on S3); with P2P cut too the create fails with EIO within the S3-less bound, not the 120 s in-doubt deadline",
+        requires: &[],
+        run: ec2::s3_cut_create_holder_restart,
+    },
+    Scenario {
         name: "p2p-partition-one-node",
         desc: "EC2 finding 2: one of four writing nodes loses P2P to the others (S3 everywhere); its sustained inbox demand must not move the lease off the majority, whose writes keep forwarding at LAN latency; the isolated node's writes complete through the S3 inbox; everything converges after the heal",
         requires: &[],
