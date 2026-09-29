@@ -183,6 +183,13 @@ mod tests {
             kind(host.process.request_backtrace(ThreadRef::unknown())),
             io::ErrorKind::Unsupported
         );
+        for r in [
+            host.process.suspend(1),
+            host.process.resume(1),
+            host.process.kill(1),
+        ] {
+            assert_eq!(kind(r), io::ErrorKind::Unsupported);
+        }
         assert!(!host.process.is_alive(1));
         // Lifecycle events still flow: the manual source is portable.
         assert_eq!(host.lifecycle.subscribe().try_recv(), None);

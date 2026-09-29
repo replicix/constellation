@@ -234,6 +234,18 @@ impl Process for LinuxProcess {
         }
         Ok(())
     }
+
+    fn suspend(&self, pid: u32) -> io::Result<()> {
+        crate::unix::signal_process(pid, libc::SIGSTOP)
+    }
+
+    fn resume(&self, pid: u32) -> io::Result<()> {
+        crate::unix::signal_process(pid, libc::SIGCONT)
+    }
+
+    fn kill(&self, pid: u32) -> io::Result<()> {
+        crate::unix::signal_process(pid, libc::SIGKILL)
+    }
 }
 
 // ------------------------------------------------------------------- fs
@@ -784,5 +796,48 @@ garbage line without the separator
             .unwrap()
             .iter()
             .any(|m| m.mountpoint == target));
+    }
+
+    /// `suspend`/`resume`/`kill` against a real child: `/proc` shows the
+    /// stop and the continue, and the kill is a `SIGKILL` the child's exit
+    /// status reports.
+    #[test]
+    fn a_process_can_be_frozen_thawed_and_killed() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::{Duration, Instant};
+        let process = LinuxProcess;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let state = || {
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            status_field(&status, "State").unwrap().chars().next()
+        };
+        let wait_for = |want: char| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while state() != Some(want) {
+                assert!(Instant::now() < deadline, "never reached state {want}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        process.suspend(pid).unwrap();
+        wait_for('T');
+        process.resume(pid).unwrap();
+        wait_for('S');
+        process.kill(pid).unwrap();
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        // Nothing to signal any more, and pids that name no single process
+        // are refused before the syscall.
+        assert!(process.kill(pid).is_err());
+        assert_eq!(
+            process.suspend(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            process.resume(u32::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

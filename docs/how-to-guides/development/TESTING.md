@@ -396,6 +396,41 @@ ignored `s3_process_backend` test starts each backend, does a PUT/GET
 through the proxy with the daemons' own S3 client, observes a latency toxic,
 a cut and a heal, exercises the signed raw helpers, and checks teardown.
 
+### Scenario capabilities (`Cap`, plan 31 C6)
+
+A scenario that needs something only some frontends have says so:
+`Scenario::caps` (next to `requires`, default `&[]`). `Cap` is
+`constellation_vfs::Cap`, **derived** from the frontend's `FrontendCaps`
+declaration (`FrontendCaps::caps()`; the harness's `caps::caps_of`), never
+kept as a second table: `FuseAbort` is `abortable`, `ClusterLocks` is
+`cluster_locks`, `Xattrs`, `HardLinks`, `Fallocate`, `SeekHole`,
+`SpecialFiles`, `PushInval`/`PushInvalFull`, `PerCloseFlush`,
+`VirtualXattrsListed`, `CaseInsensitive`, `KeepOpenUnlinked`. `harness run`
+skips a scenario whose caps the selected `--frontend` lacks with the reason
+`requires capability <Cap>` (the cap as a whole word, which is what the
+parity file's `cap = "<Cap>"` wildcard entries and `tests/parity.py`'s
+`is_cap_skip` match; a missing tool, `... not installed`, never counts), and
+`harness list` shows `[needs: ...]`. Today's tags are deliberately few: the
+lock scenarios (`ClusterLocks`), `fuse-inval-storm` and
+`git-under-flock-faults` (`FuseAbort`), `xattr-roundtrip` (`Xattrs`),
+`fallocate-sparse` (`Fallocate`, `SeekHole`), the open-orphan scenarios
+(`KeepOpenUnlinked`), `subtree-confinement` (`HardLinks`, `Xattrs`).
+`--without-cap <Cap>` (repeatable) runs as a frontend lacking that
+capability, to exercise the skip path and the parity wildcard without a
+second frontend:
+
+```sh
+target/release/harness run xattr-roundtrip --without-cap Xattrs \
+    --results-json /tmp/r.json      # skipped: "requires capability Xattrs"
+```
+
+`Client` no longer shells out to `fusermount3` or calls `kill(2)`: unmount,
+lazy detach, FUSE abort, `SIGSTOP`/`SIGCONT` (`pause`/`resume`) and the
+`kill -9` of `kill9`/`kill9_within` go through `constellation-platform`
+(`mounts.unmount`/`abort_fuse`, `process.suspend`/`resume`/`kill`), so a
+macOS or Windows lane drives the same scenarios; Linux behaviour is
+unchanged (the platform unmount runs the same `fusermount3 -u` / `-uz`).
+
 ### `harness smoke`
 
 `harness smoke [backend]` is `tests/smoke.sh` ported to Rust (see above):
@@ -1862,6 +1897,101 @@ one `node_id`. It then exercises `umount myfs:/sub` (root view keeps
 serving, daemon stays up) followed by `umount myfs` (last view: the
 daemon runs its clean-shutdown sequence, exits, and removes its own PID
 file).
+
+## The conformance kit, `MockVfs` and property tests (plan 31 C6)
+
+Everything below the frontend is one engine behind one contract, the
+`constellation_vfs::Vfs` trait; these three tools test the contract from both
+sides without a kernel, without S3 and in seconds.
+
+### `vfs::conformance`: the kit
+
+`crates/vfs/src/conformance/` is a suite that drives *any* `Vfs`. Run it
+against the reference filesystem (what the `conformance` CI job runs):
+
+```sh
+cargo test -p constellation-vfs --features conformance
+cargo test -p constellation-vfs --features conformance the_reference_target -- --nocapture   # the per-test report
+CONSTELLATION_CONFORMANCE_RESULTS=/tmp cargo test -p constellation-vfs --features conformance   # + conformance-<lane>.json in the harness results shape
+```
+
+Each run prints a table (`PASS`/`FAIL`/`SKIP` per `group::name` with the
+failure message or the skip reason) and returns a `Report`; the JSON form
+(`Report::to_json`) has the harness's results-file shape (scenario names
+`conformance/<group>::<name>`) so the parity checker extends to it.
+
+- **Tests** are named functions listed in `conformance::TESTS` (name, group,
+  required `Cap`s), each seeded (`RunOptions::seed` mixed with the name) and
+  deterministic in what it does; concurrent tests check invariants or a
+  model, never an interleaving. Groups: `namespace` (create/lookup/mkdir/
+  rmdir/unlink/rename incl. `NOREPLACE`/`EXCHANGE`, hard links, symlinks,
+  special files, name limits, the `EEXIST`/`ENOENT`/`ENOTEMPTY`/`ENOTDIR`/
+  `EISDIR` refusals, an unlinked-open file, a seeded model replay), `io`,
+  `xattr`, `readdir` (cookies, removal between pages, concurrent create),
+  `concurrency`, `deferral` (exactly-once completion, off-thread completion of
+  a blocked lock, a panicking responder, the drop fail-safe), `cancellation`,
+  `invalidation`, `confinement` (plan 31 §6.12: `..` at the view root, inodes
+  outside the subtree `ESTALE`, `.constellation/snapshot` mirrors at the
+  view's own path, `link` with and without `confine_links`, `EXDEV` only when
+  set).
+- **Skips are explicit.** A test whose caps the frontend lacks skips with
+  `requires capability <Cap>`; one that needs something only the fixture can
+  offer (a snapshot hook, a subtree view, a second view with recorded
+  events) skips naming that; the cancellation group skips where a target does
+  not honour `CancelToken` on waits, naming the Linux FUSE gap (fuser 0.18
+  delivers no `FUSE_INTERRUPT`, so a Linux mount never sets a token: plan 31
+  §6.3). `Declared::rename_flags` is the engine's declared gap
+  (`View::rename` ignores `RENAME_NOREPLACE`/`EXCHANGE` today).
+- **Plugging a target in.** Implement `ConformanceTarget` (a factory of fresh
+  `Fixture<V>`s: the `Vfs`, the root inode, the `FrontendCaps`, optional
+  hooks) and call `run_all(&target, None)` or `run(&target, &RunOptions {
+  caps, .. })` for each frontend's `FrontendCaps` (the target builds its
+  `PolicyStack` with `PolicyStack::for_caps`). The reference target
+  (`conformance::reference::RefTarget`) is the worked example;
+  `crates/vfs/src/conformance/ENGINE_TARGET.md` is the engine's instance,
+  ready to drop into `crates/engine/tests/conformance.rs`.
+- **The oracle** is the kit's own small path-based model (`oracle.rs`), not
+  `crates/model`, which is a Stateright model of the authority protocol.
+
+### `MockVfs`
+
+`constellation_vfs::mock::MockVfs` (feature `mock`, implied by
+`conformance`; always built for the crate's own tests) is a `Vfs` that
+**records** every call (op, typed arguments, caller, thread, deadline,
+cancelled-at-call) and every completion (which call, outcome, thread),
+**scripts** replies per op (`on_<op>` queues one, `always_<op>` sticks: a
+fixed result, a closure of the call, "return now, complete from another
+thread after N ms", "drop the responder", "hold it forever"), and has an
+optional **reference mode** (`MockVfs::reference(caps)`): a small correct
+in-memory filesystem (namespace, sparse content, xattrs, byte-range locks
+with blocking waits on a thread of their own, subtree views with
+confinement and `confine_links`, snapshots behind `.constellation`, events to
+other views) that behaves as the given `FrontendCaps` allow. Scripts take
+precedence over it, so one op can be made to fail in a working filesystem.
+
+`crates/frontend-fuse/tests/wire.rs` uses it to test the FUSE adapter
+without a kernel: fuser's `Request`/`Reply*` types cannot be built by hand,
+but `fuser::Session::from_fd` accepts any descriptor, so a `SOCK_DGRAM`
+socket pair carries real FUSE messages between a fake kernel (the test) and
+the whole adapter. That covers the decoding of every op's flags/modes/
+whence/lock types/rename and xattr flags as the `Vfs` sees them, the
+attribute/entry/statfs/dirent/lock encodings and the xattr size-probe
+protocol, the errno of every `Code`, `FUSE_INIT`'s negotiation, and the
+completion paths: inline on the fuser worker, deferred from another thread
+with the event loop free meanwhile, a dropped responder answered `EIO`, and
+a contended `F_SETLKW` answered from the view's wait thread once released.
+What it cannot cover is what the kernel does above the daemon (permission
+checks, the page cache, path walks, `FUSE_INTERRUPT`); the harness scenarios
+and pjdfstest cover the real mount.
+
+### Property tests
+
+`proptest` in `crates/types/tests/properties.rs` (`Code`'s wire, Linux and
+Darwin round trips over arbitrary values, unknown numbers mapping to `Io`,
+the serde form; `Rdev`'s glibc and FUSE packings) and
+`crates/vfs/tests/policy_properties.rs` (`NamePolicy`, `XattrPolicy`'s
+classification and listing filter never leaking a hidden name, `IdentityMap`,
+`PolicyStack::for_caps`, the flag algebra, `ReadData`).
 
 ## Subtree confinement (plan 31 §6.12)
 

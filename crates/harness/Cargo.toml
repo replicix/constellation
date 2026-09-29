@@ -19,6 +19,11 @@ blake3.workspace = true
 clap.workspace = true
 constellation-chaos.workspace = true
 constellation-types.workspace = true
+# `caps`: the harness's `Cap` is the vfs crate's, derived from `FrontendCaps`;
+# `client`: mounts, signals and process facts go through the host services,
+# never a `fusermount3` or `kill(2)` of the harness's own.
+constellation-vfs.workspace = true
+constellation-platform.workspace = true
 # Plan 30 §M4: decode log segments' records (the chaos scenarios' log-level
 # exactly-once check reads every `Completed { rid }` in the bucket).
 constellation-meta.workspace = true

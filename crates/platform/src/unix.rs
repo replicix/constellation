@@ -199,6 +199,21 @@ pub(crate) fn kill_probe(pid: u32) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Deliver `signal` to process `pid`. `pid` 0 and anything above
+/// `pid_t`'s range would name a process group or nothing: refused, since
+/// no caller means them.
+pub(crate) fn signal_process(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("pid {pid}")))?;
+    // SAFETY: kill(2) with a positive pid and a valid signal number.
+    if unsafe { libc::kill(pid, signal) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The label the backtrace handler prints; set once by
 /// [`enable_backtraces`].
 static BACKTRACE_LABEL: OnceLock<&'static str> = OnceLock::new();

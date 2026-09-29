@@ -22,9 +22,13 @@
 //! - [`VfsError`]: a portable [`constellation_types::Code`].
 
 pub mod caps;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod ctx;
 pub mod error;
 pub mod events;
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
 pub mod name;
 pub mod policy;
 pub mod responder;
@@ -32,7 +36,7 @@ pub mod types;
 mod vfs;
 pub mod watch;
 
-pub use caps::{CasePolicy, FrontendCaps, OpenUnlinked, PushInval, XattrSupport};
+pub use caps::{Cap, CasePolicy, FrontendCaps, OpenUnlinked, PushInval, XattrSupport};
 pub use ctx::{Caller, CancelToken, OpCtx, OpId, OpKind, OpKindSet, Principal};
 pub use error::{VfsError, VfsResult};
 pub use events::{FrontendEvents, Invalidation};

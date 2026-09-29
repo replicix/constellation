@@ -155,6 +155,18 @@ impl Process for MacProcess {
         }
         Ok(())
     }
+
+    fn suspend(&self, pid: u32) -> io::Result<()> {
+        crate::unix::signal_process(pid, libc::SIGSTOP)
+    }
+
+    fn resume(&self, pid: u32) -> io::Result<()> {
+        crate::unix::signal_process(pid, libc::SIGCONT)
+    }
+
+    fn kill(&self, pid: u32) -> io::Result<()> {
+        crate::unix::signal_process(pid, libc::SIGKILL)
+    }
 }
 
 // ------------------------------------------------------------------- fs

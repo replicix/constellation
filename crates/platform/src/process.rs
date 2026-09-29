@@ -105,4 +105,23 @@ pub trait Process: Send + Sync {
     /// in the handler allocates, which is fine for a thread parked in a
     /// futex wait, not for one inside the allocator.
     fn request_backtrace(&self, thread: ThreadRef) -> io::Result<()>;
+
+    /// Freeze process `pid` (Unix `SIGSTOP`): it stays alive, with its
+    /// mounts and memory, but runs nothing until [`Process::resume`]. The
+    /// fault-injection harness's "unreachable holder". Hosts that cannot
+    /// signal another process answer [`io::ErrorKind::Unsupported`].
+    fn suspend(&self, _pid: u32) -> io::Result<()> {
+        Err(crate::unsupported("suspending a process"))
+    }
+
+    /// Thaw a process [`Process::suspend`] froze (Unix `SIGCONT`).
+    fn resume(&self, _pid: u32) -> io::Result<()> {
+        Err(crate::unsupported("resuming a process"))
+    }
+
+    /// Kill process `pid` without giving it a chance to clean up (Unix
+    /// `SIGKILL`): a crash, for the harness's kill-and-recover scenarios.
+    fn kill(&self, _pid: u32) -> io::Result<()> {
+        Err(crate::unsupported("killing a process"))
+    }
 }

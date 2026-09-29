@@ -12,3 +12,8 @@ constellation-platform.workspace = true
 fuser.workspace = true
 libc.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `MockVfs` (tests/wire.rs): the adapter driven by a fake kernel over a
+# socket pair, against a recording, scriptable `Vfs`.
+constellation-vfs = { workspace = true, features = ["mock"] }

@@ -16,6 +16,7 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use constellation_harness::bench;
+use constellation_harness::caps;
 use constellation_harness::corpus;
 use constellation_harness::interop;
 use constellation_harness::metabench;
@@ -74,6 +75,13 @@ enum Command {
         /// exists so far.
         #[arg(long, default_value = "fuse")]
         frontend: String,
+        /// Run as a frontend that lacks this capability (repeatable; a
+        /// `Cap` name such as `Xattrs`): the scenarios that need it are
+        /// skipped by name, exactly as on a real frontend without it. A
+        /// way to exercise the capability-skip path (and the parity
+        /// checker's wildcard for it) without a second frontend.
+        #[arg(long = "without-cap", value_name = "CAP")]
+        without_caps: Vec<caps::Cap>,
     },
     /// Port of tests/smoke.sh: create a fs, mount, exercise POSIX ops,
     /// remount and verify persistence. BACKEND is a local directory (the
@@ -206,12 +214,12 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::List => {
             for s in SCENARIOS {
-                println!("{:22} {}", s.name, s.desc);
+                println!("{:22} {}{}", s.name, s.desc, needs(s));
             }
             println!();
             println!("known-bug reproductions (expected to FAIL until fixed):");
             for s in scenarios::KNOWN_BUG_REPROS {
-                println!("{:22} {}", s.name, s.desc);
+                println!("{:22} {}{}", s.name, s.desc, needs(s));
             }
             Ok(())
         }
@@ -225,6 +233,7 @@ fn main() -> Result<()> {
             lane,
             s3_backend,
             frontend,
+            without_caps,
         } => run(RunOpts {
             names,
             seed,
@@ -235,6 +244,7 @@ fn main() -> Result<()> {
             lane,
             s3_backend,
             frontend,
+            without_caps,
         }),
         Command::Smoke { backend } => smoke::run(backend),
         Command::Interop { action } => match action {
@@ -338,6 +348,17 @@ fn main() -> Result<()> {
     }
 }
 
+/// ` [needs: A, B]` for a scenario that needs frontend capabilities, else
+/// nothing.
+fn needs(s: &scenarios::Scenario) -> String {
+    if s.caps.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = s.caps.iter().map(|c| c.name()).collect();
+        format!(" [needs: {}]", names.join(", "))
+    }
+}
+
 struct RunOpts {
     names: Vec<String>,
     seed: u64,
@@ -348,6 +369,7 @@ struct RunOpts {
     lane: Option<String>,
     s3_backend: Option<S3Backend>,
     frontend: String,
+    without_caps: Vec<caps::Cap>,
 }
 
 fn run(opts: RunOpts) -> Result<()> {
@@ -361,8 +383,11 @@ fn run(opts: RunOpts) -> Result<()> {
         lane,
         s3_backend,
         frontend,
+        without_caps,
     } = opts;
     results::check_frontend(&frontend)?;
+    let mut frontend_caps = caps::caps_of(&caps::frontend_caps(&frontend)?);
+    frontend_caps.retain(|c| !without_caps.contains(c));
     // Set once, before any scenario starts an S3Env.
     let backend = s3env::select_backend(s3_backend)?;
     let lane = lane.unwrap_or_else(|| results::default_lane(&frontend, backend));
@@ -402,6 +427,15 @@ fn run(opts: RunOpts) -> Result<()> {
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
     for s in selected {
+        // A capability the frontend lacks is a skip that names it (the
+        // parity checker lets those differ across lanes; a missing tool
+        // it does not).
+        if let Some(reason) = caps::skip_reason(s.caps, &frontend_caps) {
+            eprintln!("=== {} SKIPPED ({reason})", s.name);
+            report.push(s.name, Outcome::Skipped, 0.0, Some(reason));
+            skipped.push(s.name);
+            continue;
+        }
         if let Some(missing) = s.requires.iter().find(|b| !suites::have(b)) {
             eprintln!("=== {} SKIPPED ({missing} not installed)", s.name);
             report.push(

@@ -3,6 +3,7 @@
 //! (SIGKILL, simulating a crash), and remount.
 
 use anyhow::{bail, Context, Result};
+use constellation_platform::mounts::UnmountMode;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -524,10 +525,7 @@ impl Client {
 
     /// Clean unmount (flushes, exits the daemon).
     pub fn unmount(&mut self) -> Result<()> {
-        let _ = Command::new("fusermount3")
-            .args(["-u"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Normal);
         if let Some(mut child) = self.child.take() {
             let deadline = Instant::now() + client_timeout();
             while Instant::now() < deadline {
@@ -552,10 +550,7 @@ impl Client {
     /// Unlike [`Self::unmount`], a daemon that exits non-zero is not an
     /// error here: the caller asserts on the status.
     pub fn unmount_exit(&mut self, within: Duration) -> Result<std::process::ExitStatus> {
-        let _ = Command::new("fusermount3")
-            .args(["-u"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Normal);
         let mut child = self.child.take().context("not mounted")?;
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
@@ -566,10 +561,7 @@ impl Client {
         }
         child.kill().ok();
         let _ = child.wait();
-        let _ = Command::new("fusermount3")
-            .args(["-u", "-z"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Lazy);
         bail!(
             "{} daemon did not exit within {within:?} of the unmount: {}",
             self.name,
@@ -580,13 +572,10 @@ impl Client {
     /// Crash: SIGKILL the daemon, then clean up the dead mountpoint.
     pub fn kill9(&mut self) -> Result<()> {
         let mut child = self.child.take().context("not mounted")?;
-        child.kill().context("SIGKILL")?;
+        kill9(&mut child).context("SIGKILL")?;
         child.wait()?;
         // The kernel keeps a dead FUSE mount around; detach it.
-        let _ = Command::new("fusermount3")
-            .args(["-u", "-z"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Lazy);
         Ok(())
     }
 
@@ -600,7 +589,7 @@ impl Client {
     pub fn kill9_within(&mut self, within: Duration) -> Result<Duration> {
         let mut child = self.child.take().context("not mounted")?;
         let pid = child.id();
-        child.kill().context("SIGKILL")?;
+        kill9(&mut child).context("SIGKILL")?;
         let t = Instant::now();
         let mut exited = false;
         while t.elapsed() < within {
@@ -620,7 +609,7 @@ impl Client {
             // Release it: abort the connection of its mount, which ends
             // the requests its wedged thread waits behind.
             if let Some(n) = fuse_connection_of(&self.mnt) {
-                let _ = std::fs::write(format!("/sys/fs/fuse/connections/{n}/abort"), "1\n");
+                let _ = constellation_platform::native().mounts.abort_fuse(n);
             }
             let t2 = Instant::now();
             while t2.elapsed() < Duration::from_secs(10) && child.try_wait()?.is_none() {
@@ -629,19 +618,7 @@ impl Client {
         }
         // The kernel keeps a dead FUSE mount around; detach it (bounded:
         // a detach of a wedged mount would itself hang).
-        if let Ok(mut fm) = Command::new("fusermount3")
-            .args(["-u", "-z"])
-            .arg(&self.mnt)
-            .spawn()
-        {
-            let t3 = Instant::now();
-            while t3.elapsed() < Duration::from_secs(10) && fm.try_wait()?.is_none() {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if fm.try_wait()?.is_none() {
-                let _ = fm.kill();
-            }
-        }
+        detach_bounded(&self.mnt, Duration::from_secs(10));
         match diagnosis {
             None => Ok(took),
             Some(d) => bail!(
@@ -655,24 +632,20 @@ impl Client {
     /// mount and unshipped journal intact but stops renewing its lease —
     /// the "unreachable holder" case from DESIGN.md §4.
     pub fn pause(&self) -> Result<()> {
-        self.signal(libc::SIGSTOP)
+        let pid = self.pid().context("not mounted")?;
+        constellation_platform::native()
+            .process
+            .suspend(pid)
+            .with_context(|| format!("suspending {pid}"))
     }
 
     /// Thaw a paused daemon (SIGCONT).
     pub fn resume(&self) -> Result<()> {
-        self.signal(libc::SIGCONT)
-    }
-
-    fn signal(&self, sig: i32) -> Result<()> {
-        let child = self.child.as_ref().context("not mounted")?;
-        let pid = child.id() as libc::pid_t;
-        if unsafe { libc::kill(pid, sig) } != 0 {
-            bail!(
-                "kill({pid}, {sig}) failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok(())
+        let pid = self.pid().context("not mounted")?;
+        constellation_platform::native()
+            .process
+            .resume(pid)
+            .with_context(|| format!("resuming {pid}"))
     }
 
     #[allow(dead_code)]
@@ -932,10 +905,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = Command::new("fusermount3")
-                .args(["-u"])
-                .arg(&self.mnt)
-                .status();
+            let _ = unmount(&self.mnt, UnmountMode::Normal);
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -988,32 +958,64 @@ fn zombie_diagnosis(pid: u32) -> String {
     out
 }
 
-/// The FUSE connection number (`/sys/fs/fuse/connections/<n>`) of the
-/// mount at `mountpoint`, from `/proc/self/mountinfo` (a FUSE
-/// superblock's device is `0:<n>`).
+/// The FUSE connection number of the mount at `mountpoint` (Linux:
+/// `/sys/fs/fuse/connections/<n>`), from the host's mount table.
 fn fuse_connection_of(mountpoint: &Path) -> Option<u32> {
-    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let want = mountpoint.to_string_lossy();
-    for line in text.lines() {
-        let (pre, post) = line.split_once(" - ")?;
-        let pre: Vec<&str> = pre.split(' ').collect();
-        if pre.len() < 5 || !post.starts_with("fuse ") || pre[4] != want {
-            continue;
-        }
-        if let Some((_, minor)) = pre[2].split_once(':') {
-            if let Ok(n) = minor.parse() {
-                return Some(n);
-            }
-        }
-    }
-    None
+    constellation_platform::native()
+        .mounts
+        .list()
+        .ok()?
+        .into_iter()
+        .filter(|m| m.mountpoint == mountpoint)
+        .find_map(|m| m.fuse_connection())
 }
 
+/// Unmount `mnt` through the host's mount service (Linux: the setuid
+/// `fusermount3`, as the harness always ran it).
+fn unmount(mnt: &Path, mode: UnmountMode) -> std::io::Result<()> {
+    constellation_platform::native().mounts.unmount(mnt, mode)
+}
+
+/// A lazy detach of `mnt` that gives up after `bound` (a detach of a
+/// wedged mount can itself hang). The helper is a child process, killed at
+/// the bound: a detach left running (or a thread falling through to the
+/// mount service's other fallbacks) could complete later and detach the
+/// *next* mount at the same path.
+fn detach_bounded(mnt: &Path, bound: Duration) {
+    let Ok(mut fm) = Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(mnt)
+        .spawn()
+    else {
+        return;
+    };
+    let t = Instant::now();
+    while t.elapsed() < bound && matches!(fm.try_wait(), Ok(None)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if matches!(fm.try_wait(), Ok(None)) {
+        let _ = fm.kill();
+        let _ = fm.wait();
+    }
+}
+
+/// SIGKILL the daemon, through the host's process service (a daemon that
+/// has already exited is already dead: `Ok`, as `Child::kill` says).
+fn kill9(child: &mut Child) -> std::io::Result<()> {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return Ok(());
+    }
+    constellation_platform::native().process.kill(child.id())
+}
+
+/// Whether `p` is a mountpoint whose filesystem answers, as `mountpoint
+/// -q` has always said: it `stat(2)`s the path first, so a dead FUSE mount
+/// (`ENOTCONN`) is not one, and a mount whose daemon has not answered
+/// `FUSE_INIT` yet is waited for, not reported up early.
 pub(crate) fn is_mountpoint(p: &Path) -> bool {
-    Command::new("mountpoint")
-        .arg("-q")
-        .arg(p)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    std::fs::metadata(p).is_ok()
+        && constellation_platform::native()
+            .mounts
+            .is_mountpoint(p)
+            .unwrap_or(false)
 }

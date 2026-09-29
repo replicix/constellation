@@ -15,3 +15,18 @@ constellation-platform.workspace = true
 bytes.workspace = true
 smallvec = "1.15"
 tracing.workspace = true
+
+[features]
+# `constellation_vfs::mock::MockVfs` for other crates' tests (the frontend
+# adapters', the engine's): a recording, scriptable `Vfs`, optionally backed
+# by a small in-memory reference filesystem. Always built for this crate's
+# own tests.
+mock = []
+# `constellation_vfs::conformance`, the kernel-free conformance kit
+# (plan 31 §8) and its reference target over `MockVfs`. CI runs
+# `cargo test -p constellation-vfs --features conformance`; an engine or
+# frontend crate enables it in its dev-dependencies to instantiate the kit.
+conformance = ["mock"]
+
+[dev-dependencies]
+proptest = "1"

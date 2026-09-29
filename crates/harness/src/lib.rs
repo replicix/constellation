@@ -3,6 +3,7 @@
 //! chaos-ci).
 
 pub mod bench;
+pub mod caps;
 pub mod client;
 pub mod corpus;
 pub mod docker;

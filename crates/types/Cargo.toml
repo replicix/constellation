@@ -15,3 +15,6 @@ serde_json.workspace = true
 # constants; never a runtime dependency (the tables are plain numbers so
 # both can be tested on any host).
 libc.workspace = true
+# Property tests (`tests/properties.rs`): the wire, Linux and Darwin tables and
+# the device-number packings over arbitrary values.
+proptest = "1"
