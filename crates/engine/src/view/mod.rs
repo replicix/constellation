@@ -29,21 +29,96 @@
 //! sessions and per-inode ordering), `io` (read/write/truncate/fallocate/
 //! seek on a session), `flush` (chunk fetch, sealing, the publishing
 //! flush), `create` (`create(2)` on a cluster), `lock_gate` (§M14's
-//! fence), `synthetic` (the `.constellation` tree).
+//! fence), `synthetic` (the `.constellation` tree), `confine` (subtree
+//! confinement), `admission` (per-view QoS), `spec` ([`ViewSpec`]).
+//!
+//! # Confinement (plan 31 §6.12)
+//!
+//! A view is rooted at a subtree (or a snapshot), and nothing above that
+//! root is reachable through it — a guarantee of the view, beneath
+//! `Vfs`, not a convention of its frontends:
+//!
+//! - **`..` at the view's root is the root.** `lookup(root, "..")` answers
+//!   the root itself, as a real filesystem's root does; `..` of any other
+//!   directory is its parent, which the root dominates. (A kernel frontend
+//!   resolves `..` itself and never crosses a mount's root; this is for
+//!   frontends that ask, NFS's `LOOKUPP` among them.)
+//! - **No inode outside the subtree is reachable by handle.** Every inode
+//!   a frontend names (a parent, a target, a file handle's inode) must be
+//!   dominated by the view's root — one of its names lies beneath it —
+//!   or the op answers `Code::Stale` (`ESTALE`: exactly what a handle to
+//!   something the server no longer serves is). A whole-filesystem view
+//!   dominates everything and checks nothing. A confined view answers
+//!   from a per-view cache of the inodes it handed out (every entry of a
+//!   lookup or a create) or already proved inside (`confine::Reach`), and
+//!   walks the replica's parent chain only on a miss — so a stale,
+//!   replayed or forged number costs a few local reads once, and the
+//!   steady state costs one shard lock and a hash probe, no metadata
+//!   read. An inode open through this view stays addressable (an
+//!   unlinked-open file has no name left to walk). A snapshot view hands
+//!   out synthetic inodes only, so any live inode number is refused.
+//!   What the cache does not undo: an inode this view resolved and that
+//!   is then renamed out of the subtree (by another view or node) stays
+//!   addressable by handle, as an open descriptor across a bind mount's
+//!   boundary does on Linux; lookup by name never reaches it again.
+//! - **`.constellation` stays inside.** The synthetic tree under a
+//!   directory lists the snapshots covering *that directory's own path*
+//!   (taken of it or of an ancestor) and mirrors each at the same
+//!   relative path — so a view rooted at `/volumes/pv-1` sees pv-1's
+//!   history only, never a sibling volume's, and never the filesystem
+//!   root's content.
+//!
+//! # Link domains (`ViewSpec::confine_links`)
+//!
+//! Without `confine_links`, `link()` is POSIX (within the view, which the
+//! checks above already bound). With it, every directory of the view
+//! belongs to a *link domain*: its nearest ancestor, itself included,
+//! that is the view's root or carries the root-only marker
+//! [`confine::LINK_DOMAIN_XATTR`] (`trusted.constellation.link_domain`).
+//! Then:
+//!
+//! - `link(ino, new_parent, name)` succeeds only if at least one existing
+//!   name of `ino` is in `new_parent`'s domain; otherwise `EXDEV` (what
+//!   `ln` and `cp -l` already handle). The check reads the replica, not
+//!   the view's cache: an inode reached through a stale handle, or renamed
+//!   out since, has no name inside and is refused.
+//! - `rename()` of a non-directory that has other names (`nlink > 1`)
+//!   into a different domain is `EXDEV` too (`mv` falls back to copy and
+//!   unlink), since it would leave one inode named in two domains.
+//!
+//! So a view rooted at `/volumes/pv-1` refuses to link in anything whose
+//! names all lie outside pv-1; and a maintenance view at `/` over a pool
+//! whose `/volumes/<pv>` directories carry the marker refuses any link
+//! from one volume into another while allowing links within one (and
+//! anywhere outside the marked volumes, which form the root's domain).
+//! Confinement governs the `link()`/`rename()` calls made through the
+//! view; it does not undo links made before it was set, or through a view
+//! without it. The check and the link are two steps: a rename elsewhere
+//! racing them is not excluded (the replica's order decides).
 
+mod admission;
+mod confine;
 mod create;
 mod flush;
 mod io;
 mod lock_gate;
 pub mod ops;
 mod shards;
+mod spec;
 mod synthetic;
 mod write_gate;
 
+pub use confine::LINK_DOMAIN_XATTR;
+pub use spec::{ViewQos, ViewSpec, METRIC_LABELS};
+
+#[cfg(test)]
+mod confine_tests;
 #[cfg(test)]
 mod durable_ack_tests;
 #[cfg(test)]
 mod pending_row_tests;
+#[cfg(test)]
+mod qos_tests;
 #[cfg(test)]
 mod quota_tests;
 #[cfg(test)]
@@ -214,6 +289,8 @@ pub struct FsDependencies {
     /// What the frontend serving this view can do; the view derives its
     /// name/xattr/identity policies from it.
     pub caps: FrontendCaps,
+    /// The engine's host services (staging's hole punching).
+    pub host: constellation_platform::HostServices,
 }
 
 /// One mounted view of the filesystem, behind [`constellation_vfs::Vfs`]
@@ -273,6 +350,18 @@ pub struct View {
     /// The frontend's capabilities, and the policies derived from them.
     caps: FrontendCaps,
     policies: PolicyStack,
+    host: constellation_platform::HostServices,
+    /// Confinement's cache of inodes known inside the view (`confine`).
+    reach: confine::Reach,
+    /// `ViewSpec::confine_links`.
+    confine_links: bool,
+    /// `ViewSpec::qos`, enforced.
+    admission: admission::Admission,
+    /// `ViewSpec::labels`.
+    labels: std::collections::BTreeMap<String, String>,
+    /// The engine's number for this view (`Engine::open_view`; 0 for a
+    /// view built outside an engine).
+    id: u64,
 }
 
 fn staging_code(e: &crate::staging::StagingError) -> Code {
@@ -325,7 +414,44 @@ impl View {
             watch: deps.watch,
             policies: PolicyStack::for_caps(&deps.caps),
             caps: deps.caps,
+            host: deps.host,
+            reach: confine::Reach::new(),
+            confine_links: false,
+            admission: admission::Admission::default(),
+            labels: Default::default(),
+            id: 0,
         }
+    }
+
+    /// The engine's number for this view.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn set_id(&mut self, id: u64) {
+        self.id = id;
+    }
+
+    /// Apply `spec`'s view options (labels, QoS, `confine_links`); the
+    /// root is set by [`Self::set_subtree_root`]/[`Self::set_snapshot_root`].
+    pub fn apply_spec(&mut self, spec: &ViewSpec) {
+        self.confine_links = spec.confine_links;
+        self.admission = admission::Admission::new(&spec.qos, &self.staging_budget);
+        self.labels = spec.labels.clone();
+    }
+
+    /// `ViewSpec::labels`.
+    pub fn labels(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.labels
+    }
+
+    /// The staging budget a new write session reserves against: the
+    /// view's own share when it has a staging limit, else the node's.
+    pub(crate) fn session_staging_budget(&self) -> Arc<StagingBudget> {
+        self.admission
+            .staging()
+            .cloned()
+            .unwrap_or_else(|| self.staging_budget.clone())
     }
 
     /// The name is gone (a local `unlink` just succeeded): reap the
@@ -532,6 +658,7 @@ impl View {
     /// A name's resolution to `attr` (generation 0: inode numbers are
     /// never reused).
     pub(crate) fn entry_out(&self, attr: &FileAttr) -> Entry {
+        self.note_reached(attr.ino);
         Entry {
             attr: self.attr_out(attr),
             generation: 0,

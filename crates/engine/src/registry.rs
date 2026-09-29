@@ -35,6 +35,9 @@ pub struct MountEntry {
     pub clone_name: Option<String>,
     #[serde(default)]
     pub ephemeral: bool,
+    /// `--confine-links` (plan 31 §6.12).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confine_links: bool,
 }
 
 /// One registered filesystem's node-level configuration plus its views.
@@ -424,6 +427,7 @@ mod tests {
                     rw: false,
                     clone_name: None,
                     ephemeral: false,
+                    confine_links: false,
                 }),
                 ..Default::default()
             },

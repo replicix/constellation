@@ -47,6 +47,33 @@ pub async fn open_backend(url: &str) -> Result<Arc<dyn ObjectStore>> {
 
 /// [`open_backend`], plus where it resolved to.
 pub async fn open_backend_described(url: &str) -> Result<(Arc<dyn ObjectStore>, BackendInfo)> {
+    open_backend_described_with(url, None).await
+}
+
+/// [`open_backend_described`] signing with an engine's own credential
+/// source (plan 31 §9.8): `None`, or `CredentialSource::AwsDefaultChain`,
+/// is the AWS SDK's chain as always; `Static`/`Refreshing` sign with
+/// what the source resolves to, re-asked when a credential expires.
+pub async fn open_backend_described_with(
+    url: &str,
+    credentials: Option<&Arc<constellation_platform::CredentialSource>>,
+) -> Result<(Arc<dyn ObjectStore>, BackendInfo)> {
+    let supplied = credentials
+        .filter(|c| {
+            !matches!(
+                ***c,
+                constellation_platform::CredentialSource::AwsDefaultChain
+            )
+        })
+        .map(|c| {
+            let provider: Arc<
+                dyn object_store::CredentialProvider<Credential = object_store::aws::AwsCredential>,
+            > = Arc::new(SourceCredentials {
+                source: c.clone(),
+                cached: tokio::sync::Mutex::new(None),
+            });
+            (provider, "the engine's credential source".to_string())
+        });
     if let Some(rest) = url.strip_prefix("s3://") {
         let (bucket, prefix) = match rest.split_once('/') {
             Some((b, p)) => (b, p.trim_matches('/')),
@@ -55,9 +82,10 @@ pub async fn open_backend_described(url: &str) -> Result<(Arc<dyn ObjectStore>, 
         if bucket.is_empty() {
             bail!("missing bucket in {url:?}");
         }
-        let (builder, resolution) = constellation_store_s3::amazon_s3_builder_resolved(bucket)
-            .await
-            .with_context(|| format!("resolving AWS credentials for {url:?}"))?;
+        let (builder, resolution) =
+            constellation_store_s3::amazon_s3_builder_resolved_with(bucket, supplied)
+                .await
+                .with_context(|| format!("resolving AWS credentials for {url:?}"))?;
         tracing::debug!(url, %resolution, "S3 backend resolved");
         let s3 = constellation_store_s3::configure_s3_client(builder)
             .build()
@@ -86,6 +114,61 @@ pub async fn open_backend_described(url: &str) -> Result<(Arc<dyn ObjectStore>, 
             s3: None,
         };
         Ok((Arc::new(local.with_automatic_cleanup(true)), info))
+    }
+}
+
+/// An engine's `CredentialSource` as object_store's credential provider:
+/// resolved on first use and again once what it gave expires.
+struct SourceCredentials {
+    source: Arc<constellation_platform::CredentialSource>,
+    cached: tokio::sync::Mutex<
+        Option<(
+            Arc<object_store::aws::AwsCredential>,
+            Option<std::time::SystemTime>,
+        )>,
+    >,
+}
+
+impl std::fmt::Debug for SourceCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceCredentials").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::CredentialProvider for SourceCredentials {
+    type Credential = object_store::aws::AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+        let mut cached = self.cached.lock().await;
+        let now = std::time::SystemTime::now();
+        if let Some((credential, expiry)) = cached.as_ref() {
+            // Re-asked two minutes early, as the SDK adapter does.
+            if expiry.is_none_or(|at| now + std::time::Duration::from_secs(120) < at) {
+                return Ok(credential.clone());
+            }
+        }
+        let resolved = self
+            .source
+            .resolve()
+            .map_err(|e| object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(e),
+            })?
+            .ok_or_else(|| object_store::Error::Generic {
+                store: "S3",
+                source: "the credential source defers to the AWS chain".into(),
+            })?;
+        let credential = Arc::new(object_store::aws::AwsCredential {
+            key_id: resolved.access_key_id.clone(),
+            secret_key: String::from_utf8_lossy(resolved.secret_access_key.expose()).into_owned(),
+            token: resolved
+                .session_token
+                .as_ref()
+                .map(|t| String::from_utf8_lossy(t.expose()).into_owned()),
+        });
+        *cached = Some((credential.clone(), resolved.expiry));
+        Ok(credential)
     }
 }
 

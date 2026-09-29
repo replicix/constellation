@@ -33,6 +33,34 @@ macro_rules! checked_name {
     };
 }
 
+/// The replica inode a frontend's `$ino` names, or answer `Stale` and
+/// return: the view's root renumbered, and confinement (`View::enter_ino`).
+macro_rules! enter {
+    ($self:expr, $ino:expr, $r:ident) => {
+        match $self.enter_ino($ino) {
+            Ok(ino) => ino,
+            Err(code) => {
+                $r.done(Err(code.into()));
+                return;
+            }
+        }
+    };
+}
+
+/// Per-view admission (`ViewQos`): held until the op has answered, or
+/// answer `Again`/`Intr` and return.
+macro_rules! admit {
+    ($self:expr, $cx:expr, $r:ident) => {
+        match $self.admission.admit($cx) {
+            Ok(admitted) => admitted,
+            Err(code) => {
+                $r.done(Err(code.into()));
+                return;
+            }
+        }
+    };
+}
+
 /// Write gate (DESIGN.md §5): a mutating op may only proceed while this
 /// node holds the partition lease for `ino`'s partition. Acquisition is
 /// lazy — the first mutation after a mount or an idle release blocks
@@ -68,11 +96,41 @@ fn err<T>(code: Code) -> Result<T, VfsError> {
 const XATTR_VALUE_MAX: usize = 64 * 1024;
 
 impl Vfs for View {
-    fn lookup<R: Responder<Entry>>(&self, _cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
+    fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("lookup", parent);
-        let parent = self.real_ino(parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
+        // `.` and `..` (§6.12): `..` of the view's root is the root, as on
+        // a real filesystem's root, and never the subtree's parent.
+        if (name == "." || name == "..") && !View::is_synthetic(parent) {
+            let target = if name == "." || parent == self.view_root {
+                Ok(Some(parent))
+            } else {
+                self.meta
+                    .parents_of(parent)
+                    .map(|parents| parents.first().copied())
+                    .map_err(|e| e.code())
+            };
+            let attr = match target {
+                Ok(Some(ino)) => self.meta.getattr(ino).and_then(|attr| match attr {
+                    Some(attr) => Ok(Some(attr)),
+                    None => self.meta.scratch_getattr(ino),
+                }),
+                Ok(None) => Ok(None),
+                Err(code) => {
+                    r.done(err(code));
+                    return;
+                }
+            };
+            match attr {
+                Ok(Some(attr)) => r.done(Ok(self.entry_out(&self.visible_attr(attr)))),
+                Ok(None) => r.done(err(Code::NotFound)),
+                Err(e) => r.done(err(e.code())),
+            }
+            return;
+        }
         match self.lookup_synthetic(parent, &name) {
             Ok(Some((_ino, attr))) => {
                 r.done(Ok(self.entry_out(&attr)));
@@ -139,10 +197,11 @@ impl Vfs for View {
         }
     }
 
-    fn getattr<R: Responder<Attr>>(&self, _cx: &OpCtx<'_>, ino: Ino, _fh: Option<Fh>, r: R) {
+    fn getattr<R: Responder<Attr>>(&self, cx: &OpCtx<'_>, ino: Ino, _fh: Option<Fh>, r: R) {
         let _w = self.watch.enter("getattr", ino);
+        let _admitted = admit!(self, cx, r);
         let requested_ino = ino;
-        let ino = self.real_ino(ino);
+        let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
                 r.done(err(Code::Stale));
@@ -196,14 +255,15 @@ impl Vfs for View {
 
     fn setattr<R: Responder<Attr>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _fh: Option<Fh>,
         set: &SetAttr,
         r: R,
     ) {
         let _w = self.watch.enter("setattr", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         let atime_ns = set.atime.map(time_ns);
         let mtime_ns = set.mtime.map(time_ns);
@@ -252,9 +312,10 @@ impl Vfs for View {
         }
     }
 
-    fn readlink<R: Responder<Vec<u8>>>(&self, _cx: &OpCtx<'_>, ino: Ino, r: R) {
+    fn readlink<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
         let _w = self.watch.enter("readlink", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
                 r.done(err(Code::Stale));
@@ -288,7 +349,8 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("mknod", parent);
-        let parent = self.real_ino(parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
         let kind = match mode & S_IFMT {
@@ -349,7 +411,8 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("mkdir", parent);
-        let parent = self.real_ino(parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
         let ino = match self.meta.allocate_ino(parent) {
@@ -392,7 +455,8 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("symlink", parent);
-        let parent = self.real_ino(parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
         let target = String::from_utf8_lossy(target);
@@ -421,17 +485,26 @@ impl Vfs for View {
 
     fn link<R: Responder<Entry>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         new_parent: Ino,
         new_name: &Name,
         r: R,
     ) {
         let _w = self.watch.enter("link", ino);
-        let ino = self.real_ino(ino);
-        let new_parent = self.real_ino(new_parent);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
+        let new_parent = enter!(self, new_parent, r);
         let _inflight = self.inflight.enter(&[ino, new_parent]);
         let name = checked_name!(self, new_name, r);
+        // §6.12 `confine_links`: a second name only within one of the
+        // inode's link domains (the view module doc's "Link domains").
+        if self.confine_links && !View::is_synthetic(ino) && !View::is_synthetic(new_parent) {
+            if let Err(code) = self.link_within_domain(ino, new_parent) {
+                r.done(err(code));
+                return;
+            }
+        }
         let op = constellation_meta::MutateOp::Link {
             ino,
             parent: new_parent,
@@ -447,9 +520,10 @@ impl Vfs for View {
         }
     }
 
-    fn unlink<R: Responder<()>>(&self, _cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
+    fn unlink<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("unlink", parent);
-        let parent = self.real_ino(parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
         let target = self.meta.lookup(parent, &name);
@@ -501,9 +575,10 @@ impl Vfs for View {
         }
     }
 
-    fn rmdir<R: Responder<()>>(&self, _cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
+    fn rmdir<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("rmdir", parent);
-        let parent = self.real_ino(parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
         let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
@@ -541,7 +616,7 @@ impl Vfs for View {
 
     fn rename<R: Responder<()>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         parent: Ino,
         name: &Name,
         new_parent: Ino,
@@ -552,8 +627,9 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("rename", parent);
-        let parent = self.real_ino(parent);
-        let newparent = self.real_ino(new_parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
+        let newparent = enter!(self, new_parent, r);
         let _inflight = self.inflight.enter(&[parent, newparent]);
         // Enforce NAME_MAX on both names, like every other name-taking op;
         // rename previously converted them with `to_string_lossy` directly
@@ -657,6 +733,14 @@ impl Vfs for View {
                 Err(error) => r.done(err(error)),
             };
         }
+        // §6.12 `confine_links`: moving one of several names of a file
+        // into another link domain would leave the inode in two.
+        if self.confine_links && parent != newparent {
+            if let Err(code) = self.rename_within_domains(parent, &name, newparent) {
+                r.done(err(code));
+                return;
+            }
+        }
         let op = constellation_meta::MutateOp::Rename {
             parent,
             name,
@@ -671,14 +755,15 @@ impl Vfs for View {
 
     fn open<R: Responder<Opened>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _flags: OpenFlags,
         _owner: OpenOwner,
         r: R,
     ) {
         let _w = self.watch.enter("open", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
                 r.done(err(Code::Stale));
@@ -725,7 +810,8 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("create", parent);
-        let parent = self.real_ino(parent);
+        let _admitted = admit!(self, cx, r);
+        let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
         let started = std::time::Instant::now();
@@ -745,7 +831,7 @@ impl Vfs for View {
 
     fn read<R: Responder<ReadData>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _fh: Fh,
         off: u64,
@@ -753,7 +839,8 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("read", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         if View::is_synthetic(ino) {
             match self.read_frozen(ino, off, len as u64) {
@@ -774,7 +861,7 @@ impl Vfs for View {
 
     fn write<R: Responder<u32>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _fh: Fh,
         off: u64,
@@ -783,10 +870,19 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("write", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         if View::is_synthetic(ino) {
             r.done(err(Code::ReadOnly));
+            return;
+        }
+        // `ViewQos::max_staging_bytes`: wait for this view's own flushes.
+        if let Err(code) = self
+            .admission
+            .admit_staging(cx, data.as_slice().len() as u64)
+        {
+            r.done(err(code));
             return;
         }
         if self.lock_fenced(ino) {
@@ -806,7 +902,7 @@ impl Vfs for View {
 
     fn flush<R: Responder<()>>(&self, _cx: &OpCtx<'_>, ino: Ino, _fh: Fh, owner: LockOwner, r: R) {
         let _w = self.watch.enter("flush", ino);
-        let ino = self.real_ino(ino);
+        let ino = enter!(self, ino, r);
         // Plan 30 §M14: the fence first, while the closing owner's locks
         // are still there (dropping them would lift it): data written
         // under a lapsed grant is discarded, never published. Then the
@@ -844,7 +940,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("release", ino);
-        let ino = self.real_ino(ino);
+        let ino = enter!(self, ino, r);
         if View::is_synthetic(ino) {
             r.done(Ok(()));
             return;
@@ -901,9 +997,10 @@ impl Vfs for View {
         }
     }
 
-    fn fsync<R: Responder<()>>(&self, _cx: &OpCtx<'_>, ino: Ino, _fh: Fh, level: Durability, r: R) {
+    fn fsync<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, _fh: Fh, level: Durability, r: R) {
         let _w = self.watch.enter("fsync", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         // Plan 30 §M14: nothing written under a lapsed grant is made
         // durable (`lock_publish_gate`).
         let owed = match self.lock_publish_gate(ino) {
@@ -925,7 +1022,7 @@ impl Vfs for View {
 
     fn readdir<R: DirSink + Responder<()>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _fh: Fh,
         cookie: u64,
@@ -933,8 +1030,9 @@ impl Vfs for View {
         mut r: R,
     ) {
         let _w = self.watch.enter("readdir", ino);
+        let _admitted = admit!(self, cx, r);
         let visible_ino = ino;
-        let ino = self.real_ino(ino);
+        let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         if View::is_synthetic(ino) {
             let entries = match self.synthetic_entries(ino) {
@@ -1000,8 +1098,9 @@ impl Vfs for View {
         r.done(Ok(()));
     }
 
-    fn statfs<R: Responder<StatFs>>(&self, _cx: &OpCtx<'_>, ino: Ino, r: R) {
+    fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
         let _w = self.watch.enter("statfs", ino);
+        let _admitted = admit!(self, cx, r);
         // Used space is logical bytes under the mounted view; free space
         // is whole-filesystem headroom under the cap. See `statfs_blocks`.
         // Block size mirrors blksize.
@@ -1028,7 +1127,7 @@ impl Vfs for View {
 
     fn fallocate<R: Responder<()>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _fh: Fh,
         off: u64,
@@ -1037,7 +1136,8 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("fallocate", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         gate!(self, ino, r);
         if self.lock_fenced(ino) {
@@ -1056,7 +1156,7 @@ impl Vfs for View {
 
     fn seek<R: Responder<u64>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _fh: Fh,
         off: u64,
@@ -1064,7 +1164,9 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("lseek", ino);
-        match self.seek_sparse(self.real_ino(ino), off, whence) {
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
+        match self.seek_sparse(ino, off, whence) {
             Ok(position) => r.done(Ok(position as u64)),
             Err(error) => r.done(err(error)),
         }
@@ -1072,7 +1174,8 @@ impl Vfs for View {
 
     fn getxattr<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {
         let _w = self.watch.enter("getxattr", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
             Err(error) => return r.done(err(error)),
@@ -1129,7 +1232,8 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("setxattr", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
             Err(error) => return r.done(err(error)),
@@ -1218,9 +1322,10 @@ impl Vfs for View {
         }
     }
 
-    fn listxattr<R: Responder<Vec<XattrNameBuf>>>(&self, _cx: &OpCtx<'_>, ino: Ino, r: R) {
+    fn listxattr<R: Responder<Vec<XattrNameBuf>>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
         let _w = self.watch.enter("listxattr", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         if !View::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
         }
@@ -1242,7 +1347,8 @@ impl Vfs for View {
 
     fn removexattr<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {
         let _w = self.watch.enter("removexattr", ino);
-        let ino = self.real_ino(ino);
+        let _admitted = admit!(self, cx, r);
+        let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
             Err(error) => return r.done(err(error)),
@@ -1281,7 +1387,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("getlk", ino);
-        let ino = self.real_ino(ino);
+        let ino = enter!(self, ino, r);
         let Some(locks) = self.cluster_locks() else {
             r.done(err(Code::NotImplemented));
             return;
@@ -1337,7 +1443,7 @@ impl Vfs for View {
         } else {
             self.watch.enter("setlk", ino)
         };
-        let ino = self.real_ino(ino);
+        let ino = enter!(self, ino, r);
         let Some(locks) = self.cluster_locks() else {
             r.done(err(Code::NotImplemented));
             return;
@@ -1383,7 +1489,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("setlk", ino);
-        let ino = self.real_ino(ino);
+        let ino = enter!(self, ino, r);
         let Some(locks) = self.cluster_locks() else {
             r.done(err(Code::NotImplemented));
             return;

@@ -176,6 +176,10 @@ pub struct SnapshotManager {
     creator: u64,
     tree: Option<TreeAccess>,
     publish: Option<PublishHook>,
+    /// Whose clone a writable clone is (the engine's process identity):
+    /// the engine's injected host; the process-wide native one for a
+    /// manager built without an engine (one-shot commands, tests).
+    process: Option<Arc<dyn constellation_platform::Process>>,
 }
 
 impl SnapshotManager {
@@ -193,7 +197,14 @@ impl SnapshotManager {
             creator,
             tree: None,
             publish: None,
+            process: None,
         }
+    }
+
+    /// Take the process identity from the engine's `host`.
+    pub fn with_host(mut self, host: &constellation_platform::HostServices) -> Self {
+        self.process = Some(host.process.clone());
+        self
     }
 
     /// Read version-2 snapshots through `access`.
@@ -296,6 +307,10 @@ impl SnapshotManager {
         for row in self.meta.snapshots(None)? {
             let relative = if directory == row.path {
                 Some("")
+            } else if row.path == "/" {
+                // A snapshot of the root covers every directory (the
+                // component check below would look for a second `/`).
+                Some(directory.trim_start_matches('/'))
             } else {
                 directory
                     .strip_prefix(&row.path)
@@ -420,7 +435,10 @@ impl SnapshotManager {
             .find(|row| row.name == name)
             .with_context(|| format!("snapshot {path}@{name} does not exist"))?;
         let root = SnapshotRoot::parse(&row.root_hash)?;
-        let (uid, gid) = constellation_platform::native().process.effective_ids();
+        let (uid, gid) = match &self.process {
+            Some(process) => process.effective_ids(),
+            None => constellation_platform::native().process.effective_ids(),
+        };
         let mut specs = vec![CloneSpec {
             parent_index: None,
             name: String::new(),

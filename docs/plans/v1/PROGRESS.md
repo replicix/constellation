@@ -28011,3 +28011,180 @@ C6's conformance seed).
   output identical to the pre-change binary
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+
+## Plan 31 C4c — `Engine`/`EngineHost`/`ViewSpec`, subtree confinement
+
+The rest of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+bar session handover (C4b): the engine API of §4/§4.1 with the node
+assembly moved behind it, `ViewSpec`/`ViewQos` (§9.10), `EngineProfile`
+as a type (§10; its lifecycle behaviour is C8), credentials in
+`EngineConfig` (§9.8), and subtree confinement as a `View` guarantee
+(§6.12). Linux behaviour of existing mounts is unchanged, apart from the
+fixes listed below.
+
+| Item | State | Where |
+|---|---|---|
+| `EngineConfig` (backend, state dir, cache/staging sizes, `fsync_s3`, `cto_strict`, `locks`, write mode, RO member, atime, `PassphraseSource {Given, Ask, Absent}`, E2E pin target, `credentials: CredentialSource`, published version, runtime handle, startup-phase hook); `EngineConfig::new(backend)` with the daemon's defaults | DONE | `crates/engine/src/node.rs` |
+| `Engine` (one node: identity, replica, caches, the sync task and every background task `NodeRuntime::start` spawned): `Engine::start(EngineConfig, HostServices, EngineProfile) -> Result<Engine>`; `open_view(ViewSpec, FrontendCaps, Arc<dyn FrontendEvents>) -> Result<Arc<View>>` (selector/clone resolution, lock-flush/hold/invalidation registration); `close_view` (unregistration, ephemeral clone removal; reports the last view); `views()`, `invalidate_quota_caches`, `shutdown`/`shutdown_error`/`is_shutting_down`, read accessors for the host's status; `DeferredEvents` (a frontend's events that exist only once it is mounted); `default_state_dir(host, fsmeta)` | DONE | `crates/engine/src/node.rs` |
+| `EngineHost { runtime, budget: Arc<ResourceBudget>, engines }`: `start`, `add_engine(FsId, EngineConfig, HostServices, EngineProfile)`, `remove_engine`, `engine`, `engines`, `allotment_for`; `ResourceBudget { memory_bytes, cache_bytes, staging_bytes }` with `share(n)` (equal split; `unlimited()`); per-engine override = `EngineProfile::{memory,cache}_budget` | DONE | `crates/engine/src/host.rs` |
+| `EngineProfile { memory_budget, cache_budget, p2p: P2pMode, leases: LeaseMode, uploads: UploadMode, background: BackgroundMode }`, `desktop()`/`Default`, `server(memory, cache)` (§10.1). Honoured now: the budgets and `P2pMode::Off`; the rest recorded for C8 | DONE | `crates/engine/src/profile.rs` |
+| `ViewSpec { root, rw_snapshot, clone_name, ephemeral, labels, qos: ViewQos, confine_links }`, `ViewQos { max_inflight_ops, max_staging_bytes }`, `METRIC_LABELS` (`["pv"]`, the bounded-cardinality allowlist; `ViewSpec::metric_labels`); labels on the view (`View::labels`), in `Engine::views` and the "view opened" trace | DONE | `crates/engine/src/view/spec.rs` |
+| `ViewQos` admission: an unlimited view has no admission state (one `Option` branch per op); a limited one an atomic-CAS in-flight gate with a condvar slow path; over the limit an op waits, past its deadline (`OpCtx::deadline`, else `CONSTELLATION_VIEW_ADMISSION_WAIT_MS`, 30 s) answers `Again`, cancelled `Intr`; `flush`/`release`/lock ops/`sync_view` never held back; staging limit = a child `StagingBudget` (counts into the node's, never refuses itself) waited on at write entry | DONE | `crates/engine/src/view/admission.rs`, `crates/engine/src/staging.rs` |
+| P2P bridge, endpoint bring-up and registry refresh (`P2pBridge`, `start_p2p`, `refresh_peers`) out of cli's `main.rs` | DONE | `crates/engine/src/p2p.rs` |
+| Root adoption, the atime flush ticker, slack re-read, vacuum thread, the shutdown drain and stall watchdog, ephemeral-clone removal out of cli's `main.rs`/`node_runtime.rs` | DONE | `crates/engine/src/node.rs` |
+| cli as a thin host: `NodeRuntime::start` builds `HostServices::native()`, an `EngineHost` on the daemon runtime (budget = the node's own numbers, so the one engine gets exactly what it asked for) and adds the one engine (plan 21: one daemon per state dir, N views); `add_mount` = `open_view` + `constellation_frontend_fuse::mount` on its thread; keeps the control socket/web UI (`DaemonStatus`), FUSE sessions and threads, `daemon_lock` mount records, `control.sock`/`daemon.pid`, signals, stale-mount clearing | DONE | `crates/cli/src/node_runtime.rs`, `crates/cli/src/main.rs` |
+| `--confine-links` (`mount` flag; registry `MountEntry.confine_links`, authoritative per command line like `allow_other`; `MountViewOpts.confine_links` over the control socket, `serde(default)`) | DONE | `crates/cli/src/main.rs`, `crates/engine/src/registry.rs`, `crates/api/src/types.rs` |
+| `EngineConfig.credentials`: `AwsDefaultChain` is today's SDK chain; `Static`/`Refreshing` sign S3 requests with what the source resolves to (re-asked on expiry), the SDK still choosing region/endpoint | DONE | `crates/engine/src/backend.rs`, `crates/store-s3/src/aws_auth.rs` |
+| Injected `HostServices` in the engine: P2P key store, root adoption's identity, the E2E pin store (`e2e_pin::check_in`), clone ownership (`SnapshotManager::with_host`), staging's hole punching (`Staging::create(.., fs)`, from the view's `FsDependencies.host`) | DONE | see the list |
+| Subtree confinement (§6.12): `..`/`.` resolution; `View::enter_ino` on every addressed inode (`Stale` outside); `.constellation` confinement; `confine_links` link domains; module doc of `crate::view` states the rules | DONE | `crates/engine/src/view/{confine,ops,mod}.rs` |
+| `link(2)` no longer touches the target's mtime (bug confirmed by a failing unit test first) | DONE | `crates/meta/src/store/{misc,writes}.rs`, `crates/meta/src/replay.rs` |
+| Harness scenario `subtree-confinement` | DONE | `crates/harness/src/scenarios/confinement.rs`, `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+
+**Confinement rules (precisely).**
+
+- `lookup(dir, "..")` of the view's root answers the root (visible ino
+  1); of another directory, its parent; `lookup(dir, ".")` the directory.
+  (A kernel resolves `..` itself and never sends it without export
+  support; this is for frontends that do.)
+- Every inode a frontend addresses (parent, target, handle's inode) goes
+  through `View::enter_ino`: the root renumbered, and in a confined view
+  (subtree or snapshot) refused with `Code::Stale` (`ESTALE`) unless the
+  view's root dominates it (one of its names — any hard link — lies
+  beneath the root). A whole-filesystem view checks nothing. Fast path:
+  a per-view sharded cache (16 `Mutex<HashSet>`, cap
+  `CONSTELLATION_VIEW_REACH_CACHE`, default 262,144, a full shard is
+  cleared) of every inode the view handed out in an entry or proved by a
+  walk; an inode open through the view passes (unlinked-open orphans);
+  a miss walks the replica's `rdentry` parents (`Meta::parents_of`, the
+  scratch namespace included) up to the root, stopping at the first
+  cached ancestor. A snapshot view hands out synthetic inodes only, so a
+  live inode number is always `Stale` there (before, it read the live
+  tree); synthetic numbers are per view already. Measured (debug build,
+  `view::confine_tests::confinement_hot_path_cost`, ignored test): 12 ns
+  per op for a whole-filesystem view, 337 ns for a subtree view on a
+  cached inode (one shard lock + hash probe, no metadata read), ~116 µs
+  for an uncached 9-level walk (local fjall reads; once per inode).
+  Limit, documented: an inode resolved by the view and then renamed out
+  of its subtree elsewhere stays addressable by handle (as an open fd
+  across a Linux bind mount's boundary); lookup never reaches it again.
+- `.constellation/snapshot` under a directory lists the snapshots taken
+  of that directory's path or of an ancestor and mirrors each at the
+  same relative path, so a view of `/volumes/pv-1` sees pv-1's own
+  snapshots and pv-1's part of a `/` snapshot, never pv-2's. Fixed on the
+  way: `SnapshotManager::covering` never matched a snapshot of `/` for a
+  subdirectory (its prefix test looked for a second `/`), so root
+  snapshots were missing from every subdirectory's `.constellation`
+  (plan 09 says "snapshots whose path covers this directory").
+- `confine_links`: every directory's *link domain* is its nearest
+  ancestor (itself included) that is the view's root or carries
+  `trusted.constellation.link_domain` (root-only to set). `link(ino,
+  new_parent)` succeeds only if some existing name of `ino` is in
+  `new_parent`'s domain (read from the replica, not the cache), else
+  `EXDEV`; `rename()` of a non-directory with `nlink > 1` into another
+  domain is `EXDEV` too. So a view of `/volumes/pv-1` refuses to link
+  anything with no name in pv-1 (e.g. a handle moved out); a `/` view
+  with `confine_links` over a pool whose `/volumes/<pv>` are marked
+  refuses links between volumes and allows them within one and in the
+  unmarked rest. The check and the link are two steps (a racing rename
+  elsewhere is not excluded); links made before, or through a view
+  without it, are not undone.
+
+**The link mtime bug: confirmed and fixed.** `link(2)` (and `unlink(2)`
+of one of several names, and a rename over one) bumped the file's mtime
+as well as its ctime: `misc::bump_nlink_tx` set both, and it served the
+file's link-count changes as well as a directory's. POSIX changes only
+the file's ctime (and the directory's mtime and ctime). A unit test
+(`replay::tests::link_and_unlink_change_the_files_ctime_but_not_its_mtime`,
+writer and replaying replica) failed first ("link's reply"), then passed
+after `bump_file_nlink_tx` (ctime only) replaced it on the six
+non-directory sites — `writes.rs` link/unlink/rename-over/publish-over
+and `replay.rs` `apply_link`/`evict_dentry` — identically on both paths,
+so replicas converge. Directory link counts keep `bump_nlink_tx`.
+pjdfstest's `link`/`unlink` tests assert the file's ctime and the
+parent's mtime/ctime change, which still hold (not re-run here).
+
+**What stayed in cli, and why.** `DaemonStatus` and the control socket/
+web UI (`constellation-api`'s `StatusSource`, replaced by the control
+protocol in C5 — moving it now would be rewriting it twice); the FUSE
+session threads, `daemon_lock`'s mount records and takeover, daemonizing,
+`daemon.pid`/`control.sock`, signals (host concerns); the one-shot
+commands (`gc`, `fsck`, `prune`, `repair`, `fs create/import/export`),
+which open a state dir without a running engine (plan 31 §4's `Manager`
+is C5's).
+
+**`constellation_platform::native()` still in the engine**, and why:
+`registry.rs` (the CLI's filesystem registry: `Registry::load*` is called
+by one-shot commands before any engine exists; threading a host through
+every CLI call site belongs with C5's `Manager`); the fallbacks of
+`e2e_pin::check`/`pins_store` and `SnapshotManager` without `with_host`
+(the one-shot commands and tests; the engine uses the injected forms);
+test helpers. `crates/net/src/identity.rs` keeps its own default for the
+same reason (the engine passes its host to `default_key_store`).
+
+**Deviations from the §4.1 sketch.** `EngineHost::engine`/`add_engine`
+return `Arc<Engine>` rather than `&Engine` (a `&` cannot outlive the
+lock of a concurrent map); the map is an `RwLock<BTreeMap>`, not a
+`DashMap` (no new dependency for a handful of entries). `Engine::start`
+takes its runtime from `EngineConfig::runtime` (an `EngineHost` sets its
+own) since the signature has no handle. `ViewSpec` carries the view's
+options; the frontend's mount options (mountpoint, `allow_other`, source
+name, worker threads) stay the frontend's (`MountOptions`). Budget
+shares are fixed when an engine starts (rebalancing a live cache is C8).
+
+Line counts: `crates/cli/src` 9,459 → 6,682 (`main.rs` 5,939 → 4,722,
+`node_runtime.rs` 2,363 → 803); new in the engine: `node.rs` 2,384
+(incl. tests), `p2p.rs` 1,078, `host.rs` 219, `profile.rs` 142,
+`view/{spec,admission,confine}.rs` 515, tests
+`view/{confine,qos}_tests.rs` 739.
+
+Unit tests (`cargo test -p constellation-engine -p constellation-vfs
+-p constellation-frontend-fuse -p constellation`, plus meta): before,
+engine 276 + 1 ignored, cli 20, frontend-fuse 12, meta lib 105; after,
+engine 297 + 2 ignored (+21: 10 confinement, 4 `ViewQos` admission, 2
+`Engine`/`EngineHost` in-process starts on a local backend, 2 host
+partitioning, 1 profile, 1 view spec/labels, 1 child staging budget; the
+new ignored one is the hot-path measurement), cli 20 (its three real-FUSE
+tests now run through `Engine`), frontend-fuse 12, vfs 22, meta lib 106
+(+1, the link-mtime test). `crates/meta/tests/speculation.rs` (not in the list above; meta was
+touched) fails 1-3 of its streamed-transaction tests intermittently when
+run with parallel test threads — on the base commit too, and with this
+change's mtime semantics reverted — and passes with `--test-threads=1`:
+a pre-existing timing sensitivity, not this change.
+
+Manual end-to-end (debug binary, root, local backend, `CONSTELLATION_P2P=off`):
+one daemon, views `/`, `/volumes/pv-1 --confine-links` and `/
+--confine-links` attached from separate CLI calls (`status` lists 3,
+one pid); `ls vol/..` is the host directory (same dev:ino as the parent
+of the mountpoint), `vol/sub/..` the view root; `.constellation/snapshot`
+under the volume shows `own` and `whole` (pv-1's content), not
+`sibling`; links within the volume work, across mounts `EXDEV`, between
+marked volumes through the maintenance view `EXDEV` (a multiply-linked
+`mv` falls back to copy), plain view POSIX; `ln` keeps the file's mtime
+(978307200 before and after) and moves its ctime; write/read/rename/
+`user.*` xattr/`flock`/unlink through the volume view; two views
+unmounted with `fusermount3 -u` (daemon stays), then the last one: clean
+drain, daemon and reaper exit, `daemon.pid`/`control.sock` removed.
+
+Harness: `CONSTELLATION_BIN=target/debug/constellation target/debug/harness
+run subtree-confinement` — `=== subtree-confinement PASSED` /
+`ALL SCENARIOS PASSED` (run twice).
+
+Cross-check (`make check-cross`): exit 0 with the known-failures file
+unchanged; the scenario's Linux-only calls (`setxattr` arity,
+`AT_EMPTY_PATH`) are `cfg(target_os = "linux")` with stubs, so the
+harness's darwin errors stay at its known 8.
+
+### Plan 31 C4c exit criteria
+
+- [x] `EngineConfig`/`Engine::start`/`Engine::open_view`/`EngineHost`/
+  `ResourceBudget`/`ViewSpec`/`ViewQos`/`EngineProfile` exist; cli is a
+  host over them; mount options, env vars, daemon/attach flow and
+  `status` output unchanged
+- [x] Subtree confinement: `..`, handles, `.constellation`,
+  `confine_links` — in-process tests and a kernel-mount harness scenario
+- [x] `link(2)` mtime bug confirmed by a test, fixed on writer and replay
+- [x] `cargo build --workspace`; clippy `-D warnings` clean for every
+  crate this change touches; `cargo fmt` on the touched crates
+- [x] `make check-cross` exits 0
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end

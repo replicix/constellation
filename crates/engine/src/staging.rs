@@ -32,7 +32,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StagingError {
@@ -51,6 +51,13 @@ pub enum StagingError {
 pub struct StagingBudget {
     budget: u64,
     used: Mutex<u64>,
+    /// A view's own count ([`StagingBudget::child`]): every reservation
+    /// is also the node's, which alone refuses (`Full`).
+    parent: Option<Arc<StagingBudget>>,
+    /// Signalled on every release of a child, for a view's staging
+    /// admission ([`StagingBudget::wait_below`]). `None` on the node's
+    /// budget: its releases stay a lock and a subtraction.
+    released: Option<Condvar>,
 }
 
 impl StagingBudget {
@@ -58,11 +65,32 @@ impl StagingBudget {
         Arc::new(Self {
             budget,
             used: Mutex::new(0),
+            parent: None,
+            released: None,
+        })
+    }
+
+    /// One view's share of `parent` (plan 31 §9.10 `ViewQos::
+    /// max_staging_bytes`): it counts what the view's write sessions
+    /// stage, reserving each byte against `parent` too, but never refuses
+    /// on its own — `limit` is enforced before a write starts, as a wait
+    /// ([`Self::wait_below`]), not as `ENOSPC` in the middle of one.
+    pub fn child(parent: &Arc<StagingBudget>, limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            budget: limit,
+            used: Mutex::new(0),
+            parent: Some(parent.clone()),
+            released: Some(Condvar::new()),
         })
     }
 
     pub fn reserve(&self, bytes: u64) -> Result<(), StagingError> {
         if bytes == 0 {
+            return Ok(());
+        }
+        if let Some(parent) = &self.parent {
+            parent.reserve(bytes)?;
+            *self.used.lock().unwrap() += bytes;
             return Ok(());
         }
         let mut used = self.used.lock().unwrap();
@@ -82,6 +110,13 @@ impl StagingBudget {
         }
         let mut used = self.used.lock().unwrap();
         *used = used.saturating_sub(bytes);
+        drop(used);
+        if let Some(parent) = &self.parent {
+            parent.release(bytes);
+        }
+        if let Some(released) = &self.released {
+            released.notify_all();
+        }
     }
 
     pub fn used(&self) -> u64 {
@@ -90,6 +125,28 @@ impl StagingBudget {
 
     pub fn budget(&self) -> u64 {
         self.budget
+    }
+
+    /// Wait until `bytes` more fit under this budget, or nothing is
+    /// staged at all (a single write larger than the whole limit must
+    /// still be able to proceed alone), or `deadline` passes (`false`).
+    /// Only a [`Self::child`] is waited on; the node's budget answers at
+    /// once.
+    pub fn wait_below(&self, bytes: u64, deadline: std::time::Instant) -> bool {
+        let Some(released) = &self.released else {
+            return true;
+        };
+        let mut used = self.used.lock().unwrap();
+        loop {
+            if *used == 0 || used.saturating_add(bytes) <= self.budget {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            used = released.wait_timeout(used, deadline - now).unwrap().0;
+        }
     }
 }
 
@@ -200,6 +257,8 @@ pub struct Staging {
     file: File,
     path: PathBuf,
     budget: Arc<StagingBudget>,
+    /// The host's hole punching (released chunks give their blocks back).
+    fs: Arc<dyn constellation_platform::FsPrimitives>,
     file_len: u64,
     reserved: u64,
     dirty: DirtyRuns,
@@ -215,6 +274,7 @@ impl Staging {
         ino: Ino,
         gen: u64,
         budget: Arc<StagingBudget>,
+        fs: Arc<dyn constellation_platform::FsPrimitives>,
     ) -> Result<Self, StagingError> {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{ino}.{gen}"));
@@ -228,6 +288,7 @@ impl Staging {
             file,
             path,
             budget,
+            fs,
             file_len: 0,
             reserved: 0,
             dirty: DirtyRuns::default(),
@@ -348,9 +409,7 @@ impl Staging {
         if len == 0 {
             return;
         }
-        let _ = constellation_platform::native()
-            .fs
-            .punch_hole(&self.file, start, len);
+        let _ = self.fs.punch_hole(&self.file, start, len);
         let released = len.min(self.reserved);
         self.reserved -= released;
         self.budget.release(released);
@@ -385,9 +444,7 @@ impl Staging {
             .saturating_sub(start)
             .saturating_mul(u64::from(chunk_size));
         // Best-effort, as in `release_chunk`.
-        let _ = constellation_platform::native()
-            .fs
-            .punch_hole(&self.file, offset, len);
+        let _ = self.fs.punch_hole(&self.file, offset, len);
     }
 
     #[allow(dead_code)] // part of the public shape (plan 07); exercised by tests
@@ -450,10 +507,47 @@ mod tests {
         StagingBudget::new(n)
     }
 
+    fn host_fs() -> Arc<dyn constellation_platform::FsPrimitives> {
+        constellation_platform::HostServices::native().fs
+    }
+
+    /// A view's child budget counts its own staging and the node's, never
+    /// refuses by itself, and wakes a staging admission wait on release.
+    #[test]
+    fn a_child_budget_counts_into_its_parent_and_wakes_waiters() {
+        let node = budget(100);
+        let view = StagingBudget::child(&node, 10);
+        view.reserve(8).unwrap();
+        assert_eq!((view.used(), node.used()), (8, 8));
+        // Over the view's limit: counted, not refused (the wait is the
+        // admission's); the node's limit still refuses.
+        view.reserve(8).unwrap();
+        assert_eq!((view.used(), node.used()), (16, 16));
+        assert!(matches!(view.reserve(90), Err(StagingError::Full { .. })));
+        assert_eq!(view.used(), 16, "a refused reservation is not counted");
+        let soon = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        assert!(!view.wait_below(1, soon), "over the limit until released");
+        let waiter = {
+            let view = view.clone();
+            std::thread::spawn(move || {
+                view.wait_below(
+                    4,
+                    std::time::Instant::now() + std::time::Duration::from_secs(10),
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        view.release(12);
+        assert!(waiter.join().unwrap(), "woken by the release");
+        assert_eq!((view.used(), node.used()), (4, 4));
+        // The node's own budget never waits.
+        assert!(node.wait_below(1 << 40, std::time::Instant::now()));
+    }
+
     #[test]
     fn round_trip_across_chunk_boundaries() {
         let dir = TempDir::new().unwrap();
-        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 20)).unwrap();
+        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 20), host_fs()).unwrap();
         let layout = ChunkLayout::new(64);
         // Write spanning two chunks. Staging mirrors real file offsets
         // 1:1, so a write spanning several chunks is one plain pwrite —
@@ -476,7 +570,7 @@ mod tests {
     #[test]
     fn truncate_down_drops_dirty_runs_and_recuts() {
         let dir = TempDir::new().unwrap();
-        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 20)).unwrap();
+        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 20), host_fs()).unwrap();
         let layout = ChunkLayout::new(16);
         s.write_at(0, &[1u8; 40]).unwrap(); // chunks 0,1,2
         for i in 0..layout.chunk_count(40) {
@@ -496,7 +590,7 @@ mod tests {
     #[test]
     fn truncate_up_then_write_past_old_end_leaves_a_hole() {
         let dir = TempDir::new().unwrap();
-        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 20)).unwrap();
+        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 20), host_fs()).unwrap();
         s.write_at(0, &[5u8; 10]).unwrap();
         s.set_len(100).unwrap(); // hole from 10..100
         s.write_at(150, &[6u8; 10]).unwrap(); // extend further; 100..150 also a hole
@@ -513,7 +607,7 @@ mod tests {
     fn budget_reserve_before_accept_leaves_no_partial_state() {
         let dir = TempDir::new().unwrap();
         let b = budget(50);
-        let mut s = Staging::create(dir.path(), 1, 0, b.clone()).unwrap();
+        let mut s = Staging::create(dir.path(), 1, 0, b.clone(), host_fs()).unwrap();
         s.write_at(0, &[1u8; 40]).unwrap();
         assert_eq!(b.used(), 40);
         let err = s.write_at(40, &[2u8; 20]).unwrap_err();
@@ -530,7 +624,7 @@ mod tests {
     #[test]
     fn sequential_append_dirty_runs_stay_flat() {
         let dir = TempDir::new().unwrap();
-        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 30)).unwrap();
+        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 30), host_fs()).unwrap();
         for i in 0..2000u64 {
             s.mark_dirty(i);
         }
@@ -544,7 +638,7 @@ mod tests {
     #[test]
     fn fragmenting_random_writes_bound_run_count() {
         let dir = TempDir::new().unwrap();
-        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 30)).unwrap();
+        let mut s = Staging::create(dir.path(), 1, 0, budget(1 << 30), host_fs()).unwrap();
         // Every other chunk index: maximally fragmenting.
         let n = 500u64;
         for i in 0..n {
@@ -574,7 +668,7 @@ mod tests {
     fn discard_releases_budget_and_deletes_file() {
         let dir = TempDir::new().unwrap();
         let b = budget(1000);
-        let mut s = Staging::create(dir.path(), 9, 1, b.clone()).unwrap();
+        let mut s = Staging::create(dir.path(), 9, 1, b.clone(), host_fs()).unwrap();
         s.write_at(0, &[1u8; 100]).unwrap();
         assert_eq!(b.used(), 100);
         let path = dir.path().join("9.1");
@@ -588,7 +682,7 @@ mod tests {
     fn eager_release_is_once_and_redirty_readmits() {
         let dir = TempDir::new().unwrap();
         let b = budget(128);
-        let mut s = Staging::create(dir.path(), 9, 1, b.clone()).unwrap();
+        let mut s = Staging::create(dir.path(), 9, 1, b.clone(), host_fs()).unwrap();
         s.write_at(0, &[1u8; 64]).unwrap();
         s.mark_dirty(0);
         s.release_chunk(0, 64);

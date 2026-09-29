@@ -1863,6 +1863,26 @@ serving, daemon stays up) followed by `umount myfs` (last view: the
 daemon runs its clean-shutdown sequence, exits, and removes its own PID
 file).
 
+## Subtree confinement (plan 31 §6.12)
+
+`subtree-confinement` has one daemon serve three views of one
+filesystem: the whole tree, a volume view (`/volumes/pv-1
+--confine-links`) and a maintenance view (`/ --confine-links`), the two
+volumes marked as link domains (`trusted.constellation.link_domain`),
+snapshots taken of pv-1, pv-2 and `/`. Through the kernel mounts it
+checks that `..` at the volume view's root is the host directory (nothing
+above the volume listed) and `sub/..` is the view's root; that the
+volume's `.constellation/snapshot` lists its own snapshot and the root's
+(mirrored at pv-1's path), never pv-2's; that `link()` within a volume
+works, across mounts is the kernel's `EXDEV`, and through a handle to a
+file moved out of the volume (`linkat(AT_EMPTY_PATH)`) is the view's
+`EXDEV`; that the maintenance view refuses links (and renames of a
+multiply-linked file) between volumes while the plain whole-tree view
+does not; plus ordinary write/read/rename/xattr/`flock`/unlink through
+the volume view. The in-process cases (forged and stale inode numbers
+answered `ESTALE`, snapshot views, `ViewQos` admission) are
+`constellation-engine`'s `view::confine_tests` and `view::qos_tests`.
+
 ## The authority simulation (plan 30 M5)
 
 `crates/authority` holds the sans-IO authority core and, under

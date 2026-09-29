@@ -96,6 +96,7 @@ fn holder_fs(
             holds: None,
             watch: OpWatch::manual("test-watch", Duration::from_secs(30)),
             caps: FrontendCaps::linux_fuse(false),
+            host: constellation_platform::HostServices::native(),
         },
         constellation_fs_core::DEFAULT_CHUNK_SIZE,
         CompressionSetting::RAW,

@@ -201,8 +201,14 @@ impl View {
                 .map(|a| a.size)
                 .unwrap_or(manifest.file_len);
             let gen = self.staging_gen.next();
-            let staging = Staging::create(&self.staging_dir, ino, gen, self.staging_budget.clone())
-                .map_err(|e| staging_code(&e))?;
+            let staging = Staging::create(
+                &self.staging_dir,
+                ino,
+                gen,
+                self.session_staging_budget(),
+                self.host.fs.clone(),
+            )
+            .map_err(|e| staging_code(&e))?;
             let mut staging = staging;
             if size != manifest.file_len {
                 staging.set_len_sparse(size).map_err(|e| staging_code(&e))?;

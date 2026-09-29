@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Plan 31 §6.12: subtree confinement through the kernel.
+mod confinement;
 mod coop_churn;
 mod ec2;
 /// EC2 campaign 4 B-1/B-2: a git repository committed to by two nodes
@@ -1116,6 +1118,12 @@ pub const SCENARIOS: &[Scenario] = &[
         desc: "plan 30 M13: the holder dies with an unread inbox batch; the next holder's takeover gate drains it before serving, the blocked requester's create returns success (not EIO), and every node sees one inode",
         requires: &[],
         run: inbox_holder_takeover_pending_batch,
+    },
+    Scenario {
+        name: "subtree-confinement",
+        desc: "plan 31 §6.12: one daemon serves the whole tree, a volume view and a maintenance view (both --confine-links, volumes marked as link domains); `..` at the volume root, `.constellation` history, and hard links (in, across mounts, through a handle moved out, between volumes) stay confined through the kernel",
+        requires: &["fusermount3"],
+        run: confinement::subtree_confinement,
     },
 ];
 

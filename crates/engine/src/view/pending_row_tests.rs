@@ -58,6 +58,7 @@ fn env_with(chunk: u32) -> Env {
             holds: None,
             watch: OpWatch::manual("test-watch", Duration::from_secs(30)),
             caps: FrontendCaps::linux_fuse(false),
+            host: constellation_platform::HostServices::native(),
         },
         chunk,
         CompressionSetting::RAW,

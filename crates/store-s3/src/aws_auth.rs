@@ -162,28 +162,56 @@ pub async fn amazon_s3_builder(bucket: &str) -> Result<AmazonS3Builder, StoreErr
 pub async fn amazon_s3_builder_resolved(
     bucket: &str,
 ) -> Result<(AmazonS3Builder, S3Resolution), StoreError> {
-    let sdk = aws_config::defaults(BehaviorVersion::latest()).load().await;
-    let provider = sdk.credentials_provider().ok_or_else(|| {
-        StoreError::AwsCredentials(
-            "credential provider missing from SDK config \
-             (no env keys, profile, SSO, or instance role found)"
-                .into(),
-        )
-    })?;
+    amazon_s3_builder_resolved_with(bucket, None).await
+}
 
-    // Fail fast with a clear message (expired SSO, missing profile, …)
-    // instead of on the first PUT minutes later; the answer seeds the
-    // adapter's cache.
-    let first = provider.provide_credentials().await.map_err(|source| {
-        StoreError::AwsCredentials(format!(
-            "loading via the standard chain \
-             (env, ~/.aws profile/SSO, IMDS, …): {source}"
-        ))
-    })?;
-    let credentials = provider_name(&first);
-    let adapter = SdkCredentialProvider {
-        provider,
-        cache: RwLock::new(Some(CachedCreds::from_sdk(&first))),
+/// Credentials an engine supplies itself (plan 31 §9.8's `Static` and
+/// `Refreshing` sources) instead of the SDK's chain, and how `status`
+/// names them.
+pub type SuppliedCredentials = (
+    Arc<dyn CredentialProvider<Credential = AwsCredential>>,
+    String,
+);
+
+/// [`amazon_s3_builder_resolved`], signing with `supplied` credentials
+/// when given: the SDK's configuration still decides the region and the
+/// endpoint, but its credential chain is not consulted (and need not
+/// find anything).
+pub async fn amazon_s3_builder_resolved_with(
+    bucket: &str,
+    supplied: Option<SuppliedCredentials>,
+) -> Result<(AmazonS3Builder, S3Resolution), StoreError> {
+    let sdk = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    let (provider, credentials): (
+        Arc<dyn CredentialProvider<Credential = AwsCredential>>,
+        Option<String>,
+    ) = match supplied {
+        Some((provider, name)) => (provider, Some(name)),
+        None => {
+            let provider = sdk.credentials_provider().ok_or_else(|| {
+                StoreError::AwsCredentials(
+                    "credential provider missing from SDK config \
+                     (no env keys, profile, SSO, or instance role found)"
+                        .into(),
+                )
+            })?;
+
+            // Fail fast with a clear message (expired SSO, missing
+            // profile, …) instead of on the first PUT minutes later; the
+            // answer seeds the adapter's cache.
+            let first = provider.provide_credentials().await.map_err(|source| {
+                StoreError::AwsCredentials(format!(
+                    "loading via the standard chain \
+                     (env, ~/.aws profile/SSO, IMDS, …): {source}"
+                ))
+            })?;
+            let credentials = provider_name(&first);
+            let adapter = SdkCredentialProvider {
+                provider,
+                cache: RwLock::new(Some(CachedCreds::from_sdk(&first))),
+            };
+            (Arc::new(adapter), credentials)
+        }
     };
 
     let region = sdk
@@ -196,7 +224,7 @@ pub async fn amazon_s3_builder_resolved(
     let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .with_region(region.clone())
-        .with_credentials(Arc::new(adapter));
+        .with_credentials(provider);
 
     // `AmazonS3Builder::from_env` reads `AWS_ENDPOINT` (object_store's own
     // env var) but not `AWS_ENDPOINT_URL` / `AWS_ENDPOINT_URL_S3` (standard

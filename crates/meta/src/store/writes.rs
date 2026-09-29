@@ -660,7 +660,7 @@ impl Meta {
                     delta_files -= 1;
                 }
             } else {
-                misc::bump_nlink_tx(&mut tx, &self.ns, dirty, old.ino, -1, t)?;
+                misc::bump_file_nlink_tx(&mut tx, &self.ns, dirty, old.ino, -1, t)?;
             }
             journal::append_tx(
                 &mut tx,
@@ -878,7 +878,7 @@ fn rename_in_tx(
                 delta.1 -= 1;
             }
         } else {
-            misc::bump_nlink_tx(tx, ns_ks, dirty, existing.ino, -1, t)?;
+            misc::bump_file_nlink_tx(tx, ns_ks, dirty, existing.ino, -1, t)?;
         }
         ns::remove_dentry(tx, ns_ks, dirty, new_parent, new_name, existing.ino)?;
     }
@@ -1265,7 +1265,7 @@ impl MetaStore for Meta {
         let t = now_ns();
         let at = atime::get_atime(&tx, &self.atime, ino)?;
         let rec2 =
-            misc::bump_nlink_tx(&mut tx, &self.ns, dirty, ino, 1, t)?.expect("checked above");
+            misc::bump_file_nlink_tx(&mut tx, &self.ns, dirty, ino, 1, t)?.expect("checked above");
         ns::put_dentry(&mut tx, &self.ns, dirty, parent, name, ino, rec2.attrs)?;
         misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, t)?;
         journal::append_tx(
@@ -1339,7 +1339,7 @@ impl MetaStore for Meta {
                 usage_delta = (-(rec.attrs.size as i64), -1);
             }
         } else {
-            misc::bump_nlink_tx(&mut tx, &self.ns, dirty, ino, -1, t)?;
+            misc::bump_file_nlink_tx(&mut tx, &self.ns, dirty, ino, -1, t)?;
         }
         misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, t)?;
         journal::append_tx(

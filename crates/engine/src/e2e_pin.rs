@@ -180,10 +180,14 @@ const PINS_NAME: &str = "registry.e2e.toml";
 /// store (its config dir, where the registry is too), or beside a
 /// registry `CONSTELLATION_REGISTRY` moved elsewhere.
 pub fn pins_store() -> Result<PinStore> {
+    pins_store_in(constellation_platform::native())
+}
+
+/// [`pins_store`] in `host`'s secret store (an engine's injected host).
+pub fn pins_store_in(host: &constellation_platform::HostServices) -> Result<PinStore> {
     if std::env::var("CONSTELLATION_REGISTRY").is_ok_and(|p| !p.is_empty()) {
         return PinStore::at(&Registry::path()?.with_extension("e2e.toml"));
     }
-    let host = constellation_platform::native();
     // The default store resolves the config dir per use; fail here, as
     // the registry does, when there is none (no `HOME`).
     host.dirs.config_dir().context("locating the config dir")?;
@@ -213,7 +217,16 @@ pub struct PinCheck {
 /// prompt for a passphrase or deriving any key; an error here is the
 /// refusal of a downgrade.
 pub fn check(target: &PinTarget, meta: &FsMeta) -> Result<PinCheck> {
-    match pins_store() {
+    check_in(constellation_platform::native(), target, meta)
+}
+
+/// [`check`] against the pins in `host`'s secret store.
+pub fn check_in(
+    host: &constellation_platform::HostServices,
+    target: &PinTarget,
+    meta: &FsMeta,
+) -> Result<PinCheck> {
+    match pins_store_in(host) {
         Ok(store) => check_at(Some(store), target, meta, accept_change()),
         Err(error) => {
             tracing::warn!(

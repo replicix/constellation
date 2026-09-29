@@ -191,6 +191,9 @@ pub struct MountViewOpts {
     pub clone_name: Option<String>,
     #[serde(default)]
     pub ephemeral: bool,
+    /// Plan 31 §6.12: confine hard links to the view's link domains.
+    #[serde(default)]
+    pub confine_links: bool,
 }
 
 /// One mounted view, as exposed by the control API (`MountList`,

@@ -42,6 +42,8 @@ tracing.workspace = true
 thiserror.workspace = true
 # The object store's trait is an `async_trait` (`backend::CountingStore`).
 async-trait = "0.1"
+# The E2E passphrase an `EngineConfig` carries (`PassphraseSource`).
+zeroize = "1.9.0"
 # `test-util`'s `snapshot::test_manager` keeps its node cache in a temp dir.
 tempfile = { workspace = true, optional = true }
 

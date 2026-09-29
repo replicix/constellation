@@ -31,6 +31,34 @@ impl Meta {
         self.parent_of_at(&r, ino)
     }
 
+    /// Every directory holding a name for `ino` (one for a directory,
+    /// one per hard link otherwise; empty for the root and for an
+    /// unlinked orphan). A node-private scratch entry (`scratch.rs`) has
+    /// its names in the scratch namespace, and they are answered from
+    /// there when the shared one has none. One read snapshot.
+    pub fn parents_of(&self, ino: Ino) -> Result<Vec<Ino>, MetaError> {
+        if ino == ROOT_INO {
+            return Ok(Vec::new());
+        }
+        let r = self.db.read_tx();
+        let range = keys::names_of(ino);
+        for keyspace in [&self.ns, &self.scratch] {
+            let mut parents = Vec::new();
+            for guard in r.range(keyspace, ns::key_range_bounds(&range)) {
+                let (k, _) = guard.into_inner()?;
+                if let keys::Key::RDentry { parent_ino, .. } = keys::Key::parse(&k)? {
+                    if parents.last() != Some(&parent_ino) {
+                        parents.push(parent_ino);
+                    }
+                }
+            }
+            if !parents.is_empty() {
+                return Ok(parents);
+            }
+        }
+        Ok(Vec::new())
+    }
+
     pub(crate) fn parent_of_at(
         &self,
         r: &impl Readable,
