@@ -1,0 +1,17 @@
+[package]
+name = "constellation-vfs"
+description = "The frontend contract (plan 31 §6): the `Vfs` trait every frontend adapter drives, `OpCtx`/`Responder`, frontend events and capabilities, the name/xattr/identity policies, and the request watchdog (`OpWatch`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately small: no engine, no fuser, no libc. Everything here is
+# portable (the Windows library cross-check keeps it that way); the one host
+# service it needs (a caller's supplementary groups, the watchdog's thread
+# naming and backtrace signal) comes through constellation-platform.
+[dependencies]
+constellation-types.workspace = true
+constellation-platform.workspace = true
+bytes.workspace = true
+smallvec = "1.15"
+tracing.workspace = true

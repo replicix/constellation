@@ -8700,7 +8700,7 @@ mod portable_codes {
     /// Node A (the holder) refuses node B's forwarded ops; each refusal
     /// crosses the wire as `Code`'s own discriminant and reaches B's client
     /// as the same `Code`, hence the same Linux errno the FUSE boundary
-    /// answers with (`fusefs::reply_code`). A retry by rid is answered from
+    /// answers with (`constellation_frontend_fuse::reply_code`). A retry by rid is answered from
     /// the journaled refusal (the `completed` row), again the same `Code`;
     /// and the `Refused` record itself carries the portable number.
     #[test]

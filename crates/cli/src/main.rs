@@ -2,21 +2,18 @@
 
 mod daemon_lock;
 mod daemonize;
-mod fuse_watch;
-mod fusefs;
-mod kernel_inval;
 mod node_runtime;
 mod parallelism;
 mod startup;
 
 // Plan 31 C3: the engine modules live in `constellation-engine`; importing
 // them here keeps every `crate::<module>::…` path in this crate as it was.
-use constellation_engine::upload::{remote_chunk_wait, upload_dirty_chunks, UploadRuntime};
+use constellation_engine::upload::{upload_dirty_chunks, UploadRuntime};
 use constellation_engine::{
     atime, authority_driver, backend, coop, cto, designation, doctor, e2e_pin, epoch, existence,
     fault, forward, fsck, gc, held, holds, inbox, lease, leave, locks, log_buffer, mtree_publish,
-    paths, pin, placement, prefetch, prune, registry, reintegrate, scan, shipper, snapshot,
-    staging, sync, target, writeback,
+    paths, pin, placement, prefetch, prune, registry, reintegrate, shipper, snapshot, staging,
+    sync, target, writeback,
 };
 
 use anyhow::{bail, Context, Result};
@@ -4776,7 +4773,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                     last_parse_error: s.last_parse_error.lock().ok().and_then(|g| g.clone()),
                 }
             },
-            fuse_requests: crate::fuse_watch::snapshot(),
+            fuse_requests: fuse_requests_status(&self.node.op_watch().snapshot()),
             s3: backend::s3_request_counts(),
         }
     }
@@ -5332,7 +5329,7 @@ impl constellation_api::StatusSource for DaemonStatus {
             .set_quota(max_bytes)
             .map_err(|e| format!("{e:#}"))?;
         // Node-level cap, but each mounted view caches its own read of it
-        // (fusefs::QUOTA_CACHE_TTL) — invalidate every view, not just
+        // (`View`'s `QUOTA_CACHE_TTL`) — invalidate every view, not just
         // whichever one happened to build this DaemonStatus.
         self.node.invalidate_quota_caches();
         let _ = self.sync_tx.send(sync::SyncRequest::Nudge);
@@ -5741,6 +5738,34 @@ mod parse_byte_size_tests {
     }
 }
 
+/// The request watchdog's view (`constellation_vfs::watch`), as `status`
+/// reports it (`fuse_requests`, unchanged since the FUSE adapter's
+/// `fuse_watch` produced it).
+fn fuse_requests_status(
+    s: &constellation_vfs::watch::WatchSnapshot,
+) -> constellation_api::FuseRequestsStatus {
+    constellation_api::FuseRequestsStatus {
+        in_flight: s.in_flight,
+        stalled: s.stalled,
+        stalled_total: s.stalled_total,
+        stalled_completed: s.stalled_completed,
+        oldest_s: s.oldest_s,
+        stall_threshold_s: s.stall_threshold_s,
+        stalled_requests: s
+            .stalled_ops
+            .iter()
+            .map(|op| constellation_api::StalledFuseRequest {
+                op: op.op.to_string(),
+                ino: op.ino,
+                age_s: op.age_s,
+                stage: op.stage.to_string(),
+                tid: op.tid as u32,
+                blocking: op.blocking,
+            })
+            .collect(),
+    }
+}
+
 /// Regression for plan 29 M3b: `constellation umount myfs:/sub` used to
 /// hang forever on a shared daemon that still had sibling views mounted.
 /// `cmd_umount` unconditionally waited for `control.sock` to disappear,
@@ -5748,7 +5773,7 @@ mod parse_byte_size_tests {
 /// view was the *last* one (`NodeRuntime::shutdown`) — a daemon that keeps
 /// serving another view never deletes it, so the wait never ended even
 /// though the view being unmounted had cleanly detached
-/// (`fusefs::run` logs "FUSE detached" and moves on).
+/// (the view's session thread logs "FUSE detached" and moves on).
 #[cfg(test)]
 mod umount_tests {
     use super::*;

@@ -3,7 +3,7 @@
 //! The mechanism lives in `constellation_authority::core` (ReadIndex,
 //! grants, recalls — see its `readindex` module doc), in
 //! `constellation_meta::readdeleg` (the tables FUSE threads and the core
-//! share) and in `fusefs::View::strict_read` (the open, lookup
+//! share) and in `view::View::strict_read` (the open, lookup
 //! and readdir paths). This module only reads the configuration.
 //!
 //! - `--cto bounded` (default): an open reads the local replica, which
@@ -48,7 +48,7 @@ pub fn read_delegation_ttl_ms() -> u64 {
 }
 
 /// The kernel attribute/entry TTL a *lone* strict sequencer answers with
-/// (`fusefs::View::ttl`): half the lease's drift margin, at
+/// (`view::View::ttl`): half the lease's drift margin, at
 /// most 1 s. While no other node has shown itself, nothing but this
 /// node's own FUSE writes can change what it serves, so the kernel may
 /// cache — strict mode then costs a single node exactly what bounded

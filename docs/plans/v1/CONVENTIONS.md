@@ -33,8 +33,13 @@ before starting any plan. Every plan file assumes you did.
   replica, log records, convergent replay), `api` (control API types +
   unix-socket server), `engine` (every storage algorithm: the authority
   driver and shipper, leases, coop, GC, snapshots, epochs, cluster
-  locks, uploads, prefetch — plan 31 C3), `cli` (the `constellation`
-  binary: CLI, daemon host, FUSE adapter, mount wiring), `net` (P2P — may be
+  locks, uploads, prefetch — plan 31 C3; and the mounted `View`,
+  `engine/src/view/` — C4), `vfs` (the frontend contract: the `Vfs`
+  trait, `OpCtx`/`Responder`, `FrontendEvents`, `FrontendCaps`, the
+  name/xattr/identity policies, the `OpWatch` request watchdog — plan 31
+  C4), `frontend-fuse` (the Linux FUSE frontend over `Vfs`, the only
+  crate depending on `fuser` — C4), `cli` (the `constellation`
+  binary: CLI, daemon host, mount wiring), `net` (P2P — may be
   empty until phase 3), `harness` (fault-injection orchestrator:
   docker floci S3 + toxiproxy, model oracle, seeded workloads).
 
@@ -83,11 +88,13 @@ Every plan ends with ALL of these green, run in this order:
 - Rust 2024 edition, stable toolchain. `fuser` 0.18 with
   `default-features = false`; Linux mounts use host-sized concurrent
   event loops. tokio multithread runtime.
-- FUSE callbacks run on synchronous worker threads: to reach async code use the
-  existing channel patterns (see `SyncHandle` in `cli/src/fusefs.rs`
-  and its `SyncRequest` in `engine/src/sync.rs`: unbounded mpsc +
-  `blocking_recv` oneshot barriers). Never block the
-  tokio runtime with sync waits.
+- `Vfs` ops (FUSE callbacks) run on synchronous frontend worker threads:
+  to reach async code use the existing channel patterns (see `SyncHandle`
+  in `engine/src/view/mod.rs` and its `SyncRequest` in
+  `engine/src/sync.rs`: unbounded mpsc + `blocking_recv` oneshot
+  barriers), or complete the op's `Responder` from another thread when it
+  must wait unboundedly (`ClusterLocks::lock`'s `lock-wait` thread). Never
+  block the tokio runtime with sync waits.
 - Comments explain non-obvious intent and trade-offs, never narrate
   code. Match the existing prose-heavy module-doc style (look at
   `engine/src/shipper.rs` or `store-s3/src/lease.rs`).
@@ -95,7 +102,8 @@ Every plan ends with ALL of these green, run in this order:
   in the binary/harness. Refusals are the portable
   `constellation_types::Code` everywhere (`MetaError::code()`); it
   becomes a Linux errno at the FUSE boundary only (`reply_code()` in
-  `cli/src/fusefs.rs`), and a real syscall's failure becomes a `Code`
+  `crates/frontend-fuse/src/reply.rs`; ops complete with `VfsError`,
+  which wraps a `Code`), and a real syscall's failure becomes a `Code`
   through `Code::from_io_error`. No `libc::E*` outside `crates/types`.
 - New config knobs: env vars named `CONSTELLATION_*` with sane
   defaults; document them where they are read.

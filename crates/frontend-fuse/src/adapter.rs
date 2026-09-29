@@ -1,0 +1,887 @@
+//! `impl fuser::Filesystem for FuseFs<V>`: each callback decoded into an
+//! [`OpCtx`] and a [`Vfs`] call, its reply wrapped as the op's responder.
+//!
+//! No filesystem policy lives here — that is the view's, beneath the
+//! trait. What does: the FUSE protocol. The kernel's flag words (`O_*`,
+//! `FALLOC_FL_*`, `SEEK_*`, `XATTR_*`, `RENAME_*`, `F_*LCK`) become the
+//! contract's decoded types, the kernel's device-number encoding becomes
+//! [`Rdev`], a `SystemTime` becomes nanoseconds, and the `FUSE_INIT`
+//! negotiation (the kernel queue sizing, parallel directory ops, and the
+//! lock capabilities `--locks cluster` needs) happens here.
+//!
+//! Every op answers inline on the calling fuser worker, as it always did,
+//! except a blocking lock, which the view completes from its `lock-wait`
+//! thread (`FrontendCaps::linux_fuse` declares every op deferrable; only
+//! locks defer so far — plan 31 §6.3).
+
+use crate::reply::{
+    AttrReply, BytesReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply, LseekReply,
+    OpenReply, ReadReply, StatfsReply, WriteReply, XattrListReply, XattrReply, F_RDLCK, F_UNLCK,
+    F_WRLCK,
+};
+use crate::reply_code;
+use constellation_types::{Code, Rdev};
+use constellation_vfs::{
+    Caller, Durability, FallocateMode, Fh, FrontendCaps, LockKind, LockOwner, LockRange, LockSpec,
+    Name, OpCtx, OpKind, OpenFlags, OpenOwner, RenameFlags, SeekWhence, SetAttr, SetXattrFlags,
+    TimeSet, Vfs, WriteData, XattrName,
+};
+use fuser::{
+    BsdFileFlags, FileHandle, Filesystem, INodeNo, InitFlags, KernelConfig, ReplyAttr, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyWrite, ReplyXattr, Request,
+    TimeOrNow, WriteFlags,
+};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// What `FUSE_INIT` negotiates besides the capabilities: the kernel's
+/// request queue, sized for the dispatcher's workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelTuning {
+    pub max_background: u16,
+    pub congestion_threshold: u16,
+    /// `FUSE_PARALLEL_DIROPS`: more than one worker.
+    pub parallel_dirops: bool,
+}
+
+impl KernelTuning {
+    /// The tuning for a dispatcher of `workers` threads
+    /// ([`crate::threads`]).
+    pub fn for_workers(workers: usize) -> Self {
+        Self {
+            max_background: crate::threads::max_background(workers),
+            congestion_threshold: crate::threads::congestion_threshold(workers),
+            parallel_dirops: workers > 1,
+        }
+    }
+}
+
+/// The FUSE session's filesystem: a shared [`Vfs`] (the daemon keeps its
+/// own handle to the view, for the lock path's flushes and the hold
+/// writer), the frontend's capabilities, and the `FUSE_INIT` tuning.
+pub struct FuseFs<V: Vfs> {
+    vfs: Arc<V>,
+    caps: FrontendCaps,
+    tuning: KernelTuning,
+}
+
+impl<V: Vfs> FuseFs<V> {
+    pub fn new(vfs: Arc<V>, caps: FrontendCaps, tuning: KernelTuning) -> Self {
+        Self { vfs, caps, tuning }
+    }
+}
+
+/// Who is asking: FUSE sends uid, gid and pid (0 for a request the
+/// kernel makes on its own); the supplementary groups are read from the
+/// host only if a check needs them (`constellation_vfs::Caller`).
+fn caller(req: &Request) -> Caller {
+    let pid = req.pid();
+    Caller::new(req.uid(), req.gid(), (pid != 0).then_some(pid))
+}
+
+fn name(name: &OsStr) -> &Name {
+    Name::new(name.as_bytes())
+}
+
+fn xattr_name(name: &OsStr) -> &XattrName {
+    XattrName::new(name.as_bytes())
+}
+
+/// An open's flag word, decoded. The access mode reads as the kernel's
+/// `O_ACCMODE` check does: read-only, write-only, or anything else as
+/// both.
+pub(crate) fn open_flags(raw: i32) -> OpenFlags {
+    let mut flags = match raw & libc::O_ACCMODE {
+        libc::O_RDONLY => OpenFlags::READ,
+        libc::O_WRONLY => OpenFlags::WRITE,
+        _ => OpenFlags::READ | OpenFlags::WRITE,
+    };
+    for (bit, flag) in [
+        (libc::O_CREAT, OpenFlags::CREATE),
+        (libc::O_EXCL, OpenFlags::EXCL),
+        (libc::O_TRUNC, OpenFlags::TRUNC),
+        (libc::O_APPEND, OpenFlags::APPEND),
+        // `O_SYNC` includes `O_DSYNC`'s bit: either one publishes each
+        // write before it returns.
+        (libc::O_SYNC | libc::O_DSYNC, OpenFlags::SYNC),
+    ] {
+        if raw & bit != 0 {
+            flags |= flag;
+        }
+    }
+    flags
+}
+
+/// `fallocate`'s mode word, decoded; any bit the contract does not name
+/// is kept as `UNSUPPORTED` (the view refuses it where it always did).
+#[cfg(target_os = "linux")]
+pub(crate) fn fallocate_mode(raw: i32) -> FallocateMode {
+    let mut mode = FallocateMode::empty();
+    let mut rest = raw;
+    for (bit, flag) in [
+        (libc::FALLOC_FL_KEEP_SIZE, FallocateMode::KEEP_SIZE),
+        (libc::FALLOC_FL_PUNCH_HOLE, FallocateMode::PUNCH_HOLE),
+        (libc::FALLOC_FL_ZERO_RANGE, FallocateMode::ZERO_RANGE),
+    ] {
+        if raw & bit != 0 {
+            mode |= flag;
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        mode |= FallocateMode::UNSUPPORTED;
+    }
+    mode
+}
+
+/// Without Linux's `FALLOC_FL_*`: only a plain allocation is nameable.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn fallocate_mode(raw: i32) -> FallocateMode {
+    if raw == 0 {
+        FallocateMode::empty()
+    } else {
+        FallocateMode::UNSUPPORTED
+    }
+}
+
+/// `setxattr`'s flag word, decoded (both bits at once, or any other, is
+/// the view's `EINVAL`).
+pub(crate) fn setxattr_flags(raw: i32) -> SetXattrFlags {
+    let mut flags = SetXattrFlags::empty();
+    let mut rest = raw;
+    for (bit, flag) in [
+        (libc::XATTR_CREATE, SetXattrFlags::CREATE),
+        (libc::XATTR_REPLACE, SetXattrFlags::REPLACE),
+    ] {
+        if raw & bit != 0 {
+            flags |= flag;
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        flags |= SetXattrFlags::UNSUPPORTED;
+    }
+    flags
+}
+
+/// `renameat2`'s flags, decoded (the view accepts and ignores them, as
+/// the adapter always did).
+pub(crate) fn rename_flags(raw: u32) -> RenameFlags {
+    let mut flags = RenameFlags::empty();
+    let mut rest = raw;
+    #[cfg(target_os = "linux")]
+    for (bit, flag) in [
+        (libc::RENAME_NOREPLACE, RenameFlags::NOREPLACE),
+        (libc::RENAME_EXCHANGE, RenameFlags::EXCHANGE),
+        (libc::RENAME_WHITEOUT, RenameFlags::WHITEOUT),
+    ] {
+        if raw & bit != 0 {
+            flags |= flag;
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        flags |= RenameFlags::UNSUPPORTED;
+    }
+    flags
+}
+
+/// `lseek`'s whence. The kernel forwards only `SEEK_DATA`/`SEEK_HOLE`
+/// (it answers the rest itself, and refuses a whence past `SEEK_MAX`).
+pub(crate) fn seek_whence(raw: i32) -> Option<SeekWhence> {
+    match raw {
+        libc::SEEK_SET => Some(SeekWhence::Set),
+        libc::SEEK_CUR => Some(SeekWhence::Cur),
+        libc::SEEK_END => Some(SeekWhence::End),
+        libc::SEEK_DATA => Some(SeekWhence::Data),
+        libc::SEEK_HOLE => Some(SeekWhence::Hole),
+        _ => None,
+    }
+}
+
+/// A `setattr` time.
+fn time_set(t: TimeOrNow) -> TimeSet {
+    match t {
+        TimeOrNow::Now => TimeSet::Now,
+        TimeOrNow::SpecificTime(st) => TimeSet::At(
+            st.duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        ),
+    }
+}
+
+fn lock_spec(owner: fuser::LockOwner, start: u64, end: u64, kind: LockKind, pid: u32) -> LockSpec {
+    LockSpec {
+        owner: LockOwner(owner.0),
+        range: LockRange { start, end },
+        kind,
+        pid,
+    }
+}
+
+impl<V: Vfs> Filesystem for FuseFs<V> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        let _ = config.set_max_background(self.tuning.max_background);
+        let _ = config.set_congestion_threshold(self.tuning.congestion_threshold);
+        if self.tuning.parallel_dirops {
+            // Older kernels may not advertise this capability. Multi-reader
+            // dispatch still works; only directory operations remain ordered.
+            let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+        }
+        // Plan 30 §M14: under `--locks cluster` the kernel hands POSIX and
+        // `flock` locks to `getlk`/`setlk`; without the capabilities (and
+        // on a frozen snapshot view, where nothing can be written — the
+        // daemon declares no `cluster_locks` for one) it keeps them
+        // node-local, as it always did.
+        if self.caps.cluster_locks {
+            if let Err(missing) =
+                config.add_capabilities(InitFlags::FUSE_POSIX_LOCKS | InitFlags::FUSE_FLOCK_LOCKS)
+            {
+                tracing::warn!(
+                    ?missing,
+                    "the kernel does not offer FUSE lock forwarding; locks on this mount stay node-local"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEntry) {
+        let caller = caller(req);
+        self.vfs.lookup(
+            &OpCtx::new(OpKind::Lookup, &caller),
+            parent.0,
+            name(n),
+            EntryReply(reply),
+        );
+    }
+
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let caller = caller(req);
+        self.vfs.getattr(
+            &OpCtx::new(OpKind::Getattr, &caller),
+            ino.0,
+            fh.map(|fh| Fh(fh.0)),
+            AttrReply(reply),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let caller = caller(req);
+        let set = SetAttr {
+            mode,
+            uid,
+            gid,
+            size,
+            atime: atime.map(time_set),
+            mtime: mtime.map(time_set),
+        };
+        self.vfs.setattr(
+            &OpCtx::new(OpKind::Setattr, &caller),
+            ino.0,
+            fh.map(|fh| Fh(fh.0)),
+            &set,
+            AttrReply(reply),
+        );
+    }
+
+    fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
+        let caller = caller(req);
+        self.vfs.readlink(
+            &OpCtx::new(OpKind::Readlink, &caller),
+            ino.0,
+            BytesReply(reply),
+        );
+    }
+
+    fn mkdir(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        n: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let caller = caller(req);
+        self.vfs.mkdir(
+            &OpCtx::new(OpKind::Mkdir, &caller),
+            parent.0,
+            name(n),
+            mode,
+            EntryReply(reply),
+        );
+    }
+
+    fn mknod(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        n: &OsStr,
+        mode: u32,
+        _umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let caller = caller(req);
+        // FUSE carries the kernel's 32-bit `new_encode_dev`; the contract
+        // (and the journal) carry the portable pair (plan 31 §7).
+        let rdev: Rdev = constellation_platform::from_linux_fuse_rdev(rdev);
+        self.vfs.mknod(
+            &OpCtx::new(OpKind::Mknod, &caller),
+            parent.0,
+            name(n),
+            mode,
+            rdev,
+            EntryReply(reply),
+        );
+    }
+
+    fn link(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let caller = caller(req);
+        self.vfs.link(
+            &OpCtx::new(OpKind::Link, &caller),
+            ino.0,
+            newparent.0,
+            name(newname),
+            EntryReply(reply),
+        );
+    }
+
+    fn create(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        n: &OsStr,
+        mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        let caller = caller(req);
+        self.vfs.create(
+            &OpCtx::new(OpKind::Create, &caller),
+            parent.0,
+            name(n),
+            mode,
+            open_flags(flags),
+            OpenOwner::NONE,
+            CreateReply(reply),
+        );
+    }
+
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let caller = caller(req);
+        self.vfs.symlink(
+            &OpCtx::new(OpKind::Symlink, &caller),
+            parent.0,
+            name(link_name),
+            target.as_os_str().as_bytes(),
+            EntryReply(reply),
+        );
+    }
+
+    fn unlink(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEmpty) {
+        let caller = caller(req);
+        self.vfs.unlink(
+            &OpCtx::new(OpKind::Unlink, &caller),
+            parent.0,
+            name(n),
+            EmptyReply(reply),
+        );
+    }
+
+    fn rmdir(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEmpty) {
+        let caller = caller(req);
+        self.vfs.rmdir(
+            &OpCtx::new(OpKind::Rmdir, &caller),
+            parent.0,
+            name(n),
+            EmptyReply(reply),
+        );
+    }
+
+    fn rename(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        n: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let caller = caller(req);
+        self.vfs.rename(
+            &OpCtx::new(OpKind::Rename, &caller),
+            parent.0,
+            name(n),
+            newparent.0,
+            name(newname),
+            rename_flags(flags.bits()),
+            EmptyReply(reply),
+        );
+    }
+
+    fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
+        let caller = caller(req);
+        self.vfs.open(
+            &OpCtx::new(OpKind::Open, &caller),
+            ino.0,
+            open_flags(flags.0),
+            OpenOwner::NONE,
+            OpenReply(reply),
+        );
+    }
+
+    fn read(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyData,
+    ) {
+        let caller = caller(req);
+        self.vfs.read(
+            &OpCtx::new(OpKind::Read, &caller),
+            ino.0,
+            Fh(fh.0),
+            offset,
+            size,
+            ReadReply(reply),
+        );
+    }
+
+    fn write(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let caller = caller(req);
+        self.vfs.write(
+            &OpCtx::new(OpKind::Write, &caller),
+            ino.0,
+            Fh(fh.0),
+            offset,
+            WriteData::Borrowed(data),
+            open_flags(flags.0),
+            WriteReply(reply),
+        );
+    }
+
+    fn flush(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let caller = caller(req);
+        self.vfs.flush(
+            &OpCtx::new(OpKind::Flush, &caller),
+            ino.0,
+            Fh(fh.0),
+            LockOwner(lock_owner.0),
+            EmptyReply(reply),
+        );
+    }
+
+    fn fsync(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let caller = caller(req);
+        self.vfs.fsync(
+            &OpCtx::new(OpKind::Fsync, &caller),
+            ino.0,
+            Fh(fh.0),
+            Durability::Configured,
+            EmptyReply(reply),
+        );
+    }
+
+    fn release(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        flags: fuser::OpenFlags,
+        lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let caller = caller(req);
+        self.vfs.release(
+            &OpCtx::new(OpKind::Release, &caller),
+            ino.0,
+            Fh(fh.0),
+            open_flags(flags.0),
+            lock_owner.map(|owner| LockOwner(owner.0)),
+            EmptyReply(reply),
+        );
+    }
+
+    fn readdir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectory,
+    ) {
+        let caller = caller(req);
+        self.vfs.readdir(
+            &OpCtx::new(OpKind::Readdir, &caller),
+            ino.0,
+            Fh(fh.0),
+            offset,
+            false,
+            DirReply(reply),
+        );
+    }
+
+    fn setxattr(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        n: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if position != 0 {
+            // macOS's resource-fork offset; a Linux kernel always sends 0.
+            reply.error(reply_code(Code::Invalid));
+            return;
+        }
+        let caller = caller(req);
+        self.vfs.setxattr(
+            &OpCtx::new(OpKind::Setxattr, &caller),
+            ino.0,
+            xattr_name(n),
+            value,
+            setxattr_flags(flags),
+            EmptyReply(reply),
+        );
+    }
+
+    fn getxattr(&self, req: &Request, ino: INodeNo, n: &OsStr, size: u32, reply: ReplyXattr) {
+        let caller = caller(req);
+        self.vfs.getxattr(
+            &OpCtx::new(OpKind::Getxattr, &caller),
+            ino.0,
+            xattr_name(n),
+            XattrReply { reply, size },
+        );
+    }
+
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let caller = caller(req);
+        self.vfs.listxattr(
+            &OpCtx::new(OpKind::Listxattr, &caller),
+            ino.0,
+            XattrListReply { reply, size },
+        );
+    }
+
+    fn removexattr(&self, req: &Request, ino: INodeNo, n: &OsStr, reply: ReplyEmpty) {
+        let caller = caller(req);
+        self.vfs.removexattr(
+            &OpCtx::new(OpKind::Removexattr, &caller),
+            ino.0,
+            xattr_name(n),
+            EmptyReply(reply),
+        );
+    }
+
+    fn statfs(&self, req: &Request, ino: INodeNo, reply: fuser::ReplyStatfs) {
+        let caller = caller(req);
+        self.vfs.statfs(
+            &OpCtx::new(OpKind::Statfs, &caller),
+            ino.0,
+            StatfsReply(reply),
+        );
+    }
+
+    fn fallocate(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let caller = caller(req);
+        self.vfs.fallocate(
+            &OpCtx::new(OpKind::Fallocate, &caller),
+            ino.0,
+            Fh(fh.0),
+            offset,
+            length,
+            fallocate_mode(mode),
+            EmptyReply(reply),
+        );
+    }
+
+    fn lseek(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        if offset < 0 {
+            reply.error(reply_code(Code::NoDeviceOrAddress));
+            return;
+        }
+        let Some(whence) = seek_whence(whence) else {
+            reply.error(reply_code(Code::Invalid));
+            return;
+        };
+        let caller = caller(req);
+        self.vfs.seek(
+            &OpCtx::new(OpKind::Seek, &caller),
+            ino.0,
+            Fh(fh.0),
+            offset as u64,
+            whence,
+            LseekReply(reply),
+        );
+    }
+
+    /// Plan 30 §M14: `F_GETLK` under `--locks cluster`. Under `--locks
+    /// local` the kernel never asks.
+    fn getlk(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        let caller = caller(req);
+        // A write test asks about any lock; anything else (a read test,
+        // `F_UNLCK`) about write locks only.
+        let kind = if typ == F_WRLCK {
+            LockKind::Write
+        } else {
+            LockKind::Read
+        };
+        self.vfs.lock_test(
+            &OpCtx::new(OpKind::LockTest, &caller),
+            ino.0,
+            Fh(fh.0),
+            lock_spec(lock_owner, start, end, kind, pid),
+            LockReply(reply),
+        );
+    }
+
+    /// Plan 30 §M14: `F_SETLK`/`F_SETLKW`/`flock` under `--locks
+    /// cluster`. Non-blocking requests are answered on this worker; the
+    /// view answers a blocking one (`sleep`) from a thread of its own, so
+    /// a contended lock never pins a FUSE worker. fuser 0.18 delivers no
+    /// interrupts: a blocked wait cannot be cancelled by a signal.
+    fn setlk(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let caller = caller(req);
+        let kind = match typ {
+            F_UNLCK => {
+                self.vfs.lock_release(
+                    &OpCtx::new(OpKind::LockRelease, &caller),
+                    ino.0,
+                    Fh(fh.0),
+                    LockOwner(lock_owner.0),
+                    LockRange { start, end },
+                    EmptyReply(reply),
+                );
+                return;
+            }
+            F_RDLCK => LockKind::Read,
+            F_WRLCK => LockKind::Write,
+            // Not reachable from the kernel, which validates `l_type`
+            // (and builds `flock`'s itself) before asking.
+            _ => {
+                reply.error(reply_code(Code::Invalid));
+                return;
+            }
+        };
+        self.vfs.lock_acquire(
+            &OpCtx::new(OpKind::LockAcquire, &caller),
+            ino.0,
+            Fh(fh.0),
+            lock_spec(lock_owner, start, end, kind, pid),
+            sleep,
+            EmptyReply(reply),
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use constellation_vfs::types::mode;
+
+    #[test]
+    fn open_flags_decode_the_access_mode_as_the_kernel_does() {
+        let rw = OpenFlags::READ | OpenFlags::WRITE;
+        assert_eq!(open_flags(libc::O_RDONLY), OpenFlags::READ);
+        assert_eq!(open_flags(libc::O_WRONLY), OpenFlags::WRITE);
+        assert_eq!(open_flags(libc::O_RDWR), rw);
+        assert_eq!(
+            open_flags(libc::O_ACCMODE),
+            rw,
+            "an invalid mode reads as both"
+        );
+        assert_eq!(
+            open_flags(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC),
+            rw | OpenFlags::CREATE | OpenFlags::EXCL | OpenFlags::TRUNC
+        );
+        for sync in [libc::O_SYNC, libc::O_DSYNC] {
+            assert!(open_flags(libc::O_WRONLY | sync).contains(OpenFlags::SYNC));
+        }
+        assert!(!open_flags(libc::O_WRONLY | libc::O_APPEND).contains(OpenFlags::SYNC));
+        assert!(open_flags(libc::O_WRONLY | libc::O_APPEND).contains(OpenFlags::APPEND));
+    }
+
+    #[test]
+    fn fallocate_setxattr_and_rename_flags_keep_what_they_cannot_name() {
+        assert_eq!(fallocate_mode(0), FallocateMode::empty());
+        assert_eq!(
+            fallocate_mode(libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE),
+            FallocateMode::PUNCH_HOLE | FallocateMode::KEEP_SIZE
+        );
+        assert_eq!(
+            fallocate_mode(libc::FALLOC_FL_ZERO_RANGE),
+            FallocateMode::ZERO_RANGE
+        );
+        assert!(fallocate_mode(libc::FALLOC_FL_COLLAPSE_RANGE).contains(FallocateMode::UNSUPPORTED));
+        assert_eq!(setxattr_flags(0), SetXattrFlags::empty());
+        assert_eq!(setxattr_flags(libc::XATTR_CREATE), SetXattrFlags::CREATE);
+        assert_eq!(setxattr_flags(libc::XATTR_REPLACE), SetXattrFlags::REPLACE);
+        assert!(setxattr_flags(libc::XATTR_CREATE | libc::XATTR_REPLACE)
+            .mode()
+            .is_err());
+        assert!(setxattr_flags(8).contains(SetXattrFlags::UNSUPPORTED));
+        assert!(setxattr_flags(8).mode().is_err());
+        assert_eq!(rename_flags(0), RenameFlags::empty());
+        assert_eq!(rename_flags(libc::RENAME_NOREPLACE), RenameFlags::NOREPLACE);
+        assert!(rename_flags(1 << 20).contains(RenameFlags::UNSUPPORTED));
+    }
+
+    #[test]
+    fn whence_and_lock_types_and_mode_bits_match_the_kernels() {
+        assert_eq!(seek_whence(libc::SEEK_DATA), Some(SeekWhence::Data));
+        assert_eq!(seek_whence(libc::SEEK_HOLE), Some(SeekWhence::Hole));
+        assert_eq!(seek_whence(libc::SEEK_SET), Some(SeekWhence::Set));
+        assert_eq!(seek_whence(99), None);
+        assert_ne!(F_RDLCK, F_WRLCK);
+        assert_ne!(F_WRLCK, F_UNLCK);
+        // The contract's POSIX type bits are the kernel's.
+        assert_eq!(mode::S_IFMT, libc::S_IFMT);
+        assert_eq!(mode::S_IFREG, libc::S_IFREG);
+        assert_eq!(mode::S_IFDIR, libc::S_IFDIR);
+        assert_eq!(mode::S_IFLNK, libc::S_IFLNK);
+        assert_eq!(mode::S_IFIFO, libc::S_IFIFO);
+        assert_eq!(mode::S_IFSOCK, libc::S_IFSOCK);
+        assert_eq!(mode::S_IFBLK, libc::S_IFBLK);
+        assert_eq!(mode::S_IFCHR, libc::S_IFCHR);
+    }
+
+    #[test]
+    fn setattr_times_are_nanoseconds_or_the_engines_now() {
+        assert_eq!(time_set(TimeOrNow::Now), TimeSet::Now);
+        let t = UNIX_EPOCH + std::time::Duration::from_nanos(1_234_567_891);
+        assert_eq!(
+            time_set(TimeOrNow::SpecificTime(t)),
+            TimeSet::At(1_234_567_891)
+        );
+        let before = UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(time_set(TimeOrNow::SpecificTime(before)), TimeSet::At(0));
+    }
+
+    #[test]
+    fn kernel_tuning_scales_with_the_workers() {
+        let one = KernelTuning::for_workers(1);
+        assert_eq!(
+            (
+                one.max_background,
+                one.congestion_threshold,
+                one.parallel_dirops
+            ),
+            (16, 12, false)
+        );
+        let twelve = KernelTuning::for_workers(12);
+        assert_eq!((twelve.max_background, twelve.parallel_dirops), (96, true));
+    }
+}

@@ -1,7 +1,7 @@
 //! Kernel cache invalidation for another node's writes (plan 30 §M7).
 //!
 //! The FUSE mounts answer lookups and attributes with a 1 s TTL
-//! (`fusefs::TTL`), so the kernel keeps serving what it cached — a
+//! (`crate::view::TTL`), so the kernel keeps serving what it cached — a
 //! negative dentry, a file's old size, its old pages — for up to a second
 //! after the replica underneath has applied another node's change. The
 //! `visibility-after-burst` scenario measured exactly that: a marker file
@@ -50,7 +50,7 @@
 //!   send happens with no lock of this module held, so a FUSE worker's
 //!   `InFlightGuard` never queues behind a notification in the kernel.
 //! - **Not issued while a request on the same inode is known to be in
-//!   flight** (`InFlight`, maintained by the FUSE handlers): the
+//!   flight** (`InFlight`, maintained by the views' ops): the
 //!   notification is held back and sent as soon as the last such request
 //!   is answered, so the thread spends almost no time blocked in the
 //!   kernel. What it cannot see is a request the kernel has queued that no
@@ -75,12 +75,30 @@
 //!
 //! A watchdog logs a notification blocked in the kernel longer than
 //! `CONSTELLATION_KERNEL_INVAL_STALL_S` (default 5 s).
+//!
+//! # Engine-side, frontend-agnostic (plan 31 C4)
+//!
+//! This lived in the FUSE adapter (`cli/src/kernel_inval.rs`) until plan
+//! 31 C4. Nothing in it is FUSE-specific except the sink, so the
+//! machinery — the queue, the dedicated `kernel-inval` thread and its
+//! `kernel-inval-watchdog`, the TTL drop, the in-flight hold-back registry
+//! the views' ops maintain, and the bounded [`InodeInvalidator::
+//! invalidate_and_wait`] of the lock path — is the engine's: it maps the
+//! replica's log records (`constellation_meta::LogRecord`) and the views'
+//! root renumbering, both engine concepts, and every frontend inherits the
+//! three rules above instead of re-deriving them. A view's frontend only
+//! supplies the sink: its `constellation_vfs::FrontendEvents`, which this
+//! thread calls with one notification at a time, so the watchdog names
+//! the exact notification stuck in a kernel. (FUSE's is a 1:1 rename of
+//! the `NotifySink` impl on `fuser::Notifier`: `constellation-frontend-
+//! fuse`'s `FuseNotifySink`.) One such thread per node serves every
+//! mounted view, as it always did.
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;
 use constellation_meta::LogRecord;
+use constellation_vfs::{FrontendEvents, Invalidation, NameBuf};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -89,7 +107,7 @@ use std::time::{Duration, Instant};
 /// inode before it is dropped as redundant: one lookup/attribute TTL
 /// (everything the kernel cached before the apply has expired by then)
 /// plus a margin for the apply-to-queue delay.
-pub const DEFER_MAX: Duration = Duration::from_millis(crate::fusefs::TTL.as_millis() as u64 + 500);
+pub const DEFER_MAX: Duration = Duration::from_millis(crate::view::TTL.as_millis() as u64 + 500);
 
 /// The watchdog's period.
 const WATCHDOG_TICK: Duration = Duration::from_secs(1);
@@ -130,28 +148,30 @@ impl std::fmt::Display for Inval {
     }
 }
 
-/// Where a view's notifications go: `fuser::Notifier` in the daemon, a
-/// recorder in tests.
-pub trait NotifySink: Send + 'static {
-    fn inval_entry(&self, parent: Ino, name: &str) -> std::io::Result<()>;
-    /// `data`: drop the cached pages too, not only the attributes.
-    fn inval_inode(&self, ino: Ino, data: bool) -> std::io::Result<()>;
-}
-
-impl NotifySink for fuser::Notifier {
-    fn inval_entry(&self, parent: Ino, name: &str) -> std::io::Result<()> {
-        fuser::Notifier::inval_entry(self, fuser::INodeNo(parent), OsStr::new(name))
-    }
-
-    fn inval_inode(&self, ino: Ino, data: bool) -> std::io::Result<()> {
-        fuser::Notifier::inval_inode(self, fuser::INodeNo(ino), if data { 0 } else { -1 }, 0)
+impl Inval {
+    /// This notification as the frontend of a view rooted at `view_root`
+    /// numbers it (`None`: that view cannot see it).
+    fn for_view(&self, view_root: Ino) -> Option<Invalidation> {
+        Some(match self {
+            Inval::Entry { parent, name } => Invalidation::Entry {
+                parent: in_view(*parent, view_root)?,
+                name: NameBuf::from(name.as_str()),
+            },
+            Inval::Inode { ino, data: false } => Invalidation::Attr {
+                ino: in_view(*ino, view_root)?,
+            },
+            Inval::Inode { ino, data: true } => Invalidation::Data {
+                ino: in_view(*ino, view_root)?,
+                range: None,
+            },
+        })
     }
 }
 
 enum Msg {
     Register {
         id: u64,
-        sink: Box<dyn NotifySink>,
+        sink: Arc<dyn FrontendEvents>,
         view_root: Ino,
     },
     Unregister(u64),
@@ -282,11 +302,12 @@ impl KernelInvalidator {
         Self { shared }
     }
 
-    /// A view mounted with `view_root` as its root directory.
-    pub fn register(&self, id: u64, sink: impl NotifySink, view_root: Ino) {
+    /// A view mounted with `view_root` as its root directory, whose
+    /// frontend's cache `sink` drops.
+    pub fn register(&self, id: u64, sink: Arc<dyn FrontendEvents>, view_root: Ino) {
         self.shared.push(Msg::Register {
             id,
-            sink: Box::new(sink),
+            sink,
             view_root,
         });
     }
@@ -303,7 +324,7 @@ impl KernelInvalidator {
         }
     }
 
-    /// The FUSE handlers' registry of requests in flight.
+    /// The views' registry of ops in flight.
     pub fn inflight(&self) -> InFlight {
         InFlight(Some(self.shared.clone()))
     }
@@ -367,19 +388,7 @@ impl InodeInvalidator {
     }
 }
 
-/// The engine's lock path reaches the kernel through this (plan 31 C3;
-/// C4's `FrontendEvents`).
-impl constellation_engine::events::FrontendEvents for InodeInvalidator {
-    fn invalidate_inode(&self, ino: Ino) {
-        self.invalidate(ino);
-    }
-
-    fn invalidate_inode_and_wait(&self, ino: Ino, timeout: Duration) -> bool {
-        self.invalidate_and_wait(ino, timeout)
-    }
-}
-
-/// The FUSE handlers' registry of requests in flight, by replica inode:
+/// The views' registry of ops in flight, by replica inode:
 /// a notification for an inode with a request in flight is held back
 /// (module doc). Cheap to clone; `disabled` counts nothing.
 #[derive(Clone, Default)]
@@ -515,7 +524,7 @@ fn invalidations(records: &[LogRecord]) -> Vec<Inval> {
     out.into_iter().collect()
 }
 
-/// A replica inode as `view_root`'s view numbers it (`FuseFs::real_ino`'s
+/// A replica inode as `view_root`'s view numbers it (`View::real_ino`'s
 /// inverse), or `None` when the view cannot see it.
 fn in_view(ino: Ino, view_root: Ino) -> Option<Ino> {
     if ino == view_root {
@@ -527,9 +536,10 @@ fn in_view(ino: Ino, view_root: Ino) -> Option<Ino> {
     }
 }
 
-struct View {
+/// One registered view: its frontend's sink, and its root.
+struct ViewSink {
     id: u64,
-    sink: Box<dyn NotifySink>,
+    sink: Arc<dyn FrontendEvents>,
     view_root: Ino,
 }
 
@@ -560,7 +570,7 @@ fn merge(
 }
 
 fn run(shared: Arc<Shared>) {
-    let mut views: Vec<View> = Vec::new();
+    let mut views: Vec<ViewSink> = Vec::new();
     let mut pending: BTreeMap<Inval, Pending> = BTreeMap::new();
     let mut to_send: Vec<Inval> = Vec::new();
     let mut to_drop: Vec<Inval> = Vec::new();
@@ -581,7 +591,7 @@ fn run(shared: Arc<Shared>) {
                             id,
                             sink,
                             view_root,
-                        } => views.push(View {
+                        } => views.push(ViewSink {
                             id,
                             sink,
                             view_root,
@@ -655,20 +665,14 @@ fn run(shared: Arc<Shared>) {
     }
 }
 
-fn send(views: &[View], inval: &Inval) {
+fn send(views: &[ViewSink], inval: &Inval) {
     for view in views {
-        // ENOENT (nothing cached) is the common answer;
-        // every error only means there was nothing to drop.
-        let _ = match inval {
-            Inval::Entry { parent, name } => match in_view(*parent, view.view_root) {
-                Some(p) => view.sink.inval_entry(p, name),
-                None => Ok(()),
-            },
-            Inval::Inode { ino, data } => match in_view(*ino, view.view_root) {
-                Some(i) => view.sink.inval_inode(i, *data),
-                None => Ok(()),
-            },
-        };
+        // One notification per call, in the view's numbering. The sink
+        // ignores failures: ENOENT (nothing cached) is the common answer,
+        // and every error only means there was nothing to drop.
+        if let Some(inv) = inval.for_view(view.view_root) {
+            view.sink.invalidate(std::slice::from_ref(&inv));
+        }
     }
 }
 
@@ -772,30 +776,30 @@ mod tests {
         }
     }
 
-    impl NotifySink for Recorder {
-        fn inval_entry(&self, parent: Ino, name: &str) -> std::io::Result<()> {
-            self.wait_if_blocked();
-            self.got
-                .lock()
-                .unwrap()
-                .push(format!("entry {parent} {name}"));
-            Ok(())
-        }
-
-        fn inval_inode(&self, ino: Ino, data: bool) -> std::io::Result<()> {
-            self.wait_if_blocked();
-            self.got
-                .lock()
-                .unwrap()
-                .push(format!("inode {ino} data={data}"));
-            Ok(())
+    impl FrontendEvents for Recorder {
+        fn invalidate(&self, batch: &[Invalidation]) {
+            for inv in batch {
+                self.wait_if_blocked();
+                let line = match inv {
+                    Invalidation::Entry { parent, name } => {
+                        format!(
+                            "entry {parent} {}",
+                            String::from_utf8_lossy(name.as_bytes())
+                        )
+                    }
+                    Invalidation::Attr { ino } => format!("inode {ino} data=false"),
+                    Invalidation::Data { ino, range: None } => format!("inode {ino} data=true"),
+                    other => panic!("not produced: {other:?}"),
+                };
+                self.got.lock().unwrap().push(line);
+            }
         }
     }
 
     fn started(defer_max: Duration) -> (KernelInvalidator, Recorder) {
         let k = KernelInvalidator::start_with(defer_max);
         let rec = Recorder::default();
-        k.register(1, rec.clone(), ROOT_INO);
+        k.register(1, Arc::new(rec.clone()), ROOT_INO);
         (k, rec)
     }
 
@@ -851,7 +855,7 @@ mod tests {
     fn a_batch_is_sent_to_every_view_in_its_numbering() {
         let (k, rec) = started(DEFER_MAX);
         let sub = Recorder::default();
-        k.register(2, sub.clone(), 42);
+        k.register(2, Arc::new(sub.clone()), 42);
         k.shared.push(Msg::Batch(vec![
             entry(42, "x"),
             Inval::Inode {
@@ -976,7 +980,7 @@ mod tests {
     fn a_notification_blocked_in_the_kernel_blocks_no_request_and_is_visible_to_the_watchdog() {
         let k = KernelInvalidator::start_with(DEFER_MAX);
         let rec = Recorder::blocking();
-        k.register(1, rec.clone(), ROOT_INO);
+        k.register(1, Arc::new(rec.clone()), ROOT_INO);
         k.shared.push(Msg::Batch(vec![entry(7, "a")]));
         let start = Instant::now();
         while k.stalled_for().is_none() && start.elapsed() < Duration::from_secs(5) {

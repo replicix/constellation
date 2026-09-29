@@ -9,8 +9,9 @@
 //!     the metadata shipper/sync task, and (today, single-view only)
 //!     the control socket + web UI.
 //!   - **Per-view** (`NodeRuntime::add_mount`): selector/clone
-//!     resolution, the `FuseFs` instance, and the `fuser::Session` for
-//!     one mountpoint, run on its own dedicated OS thread.
+//!     resolution, the engine's `View`, and its FUSE session
+//!     (`constellation_frontend_fuse::mount`) for one mountpoint, run on
+//!     its own dedicated OS thread.
 //!
 //! Plan 21 step 0 keeps this an *inert* refactor: today only one view is
 //! ever mounted (the CLI's `mount` command calls `add_mount` exactly
@@ -43,9 +44,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::{
-    coop, designation, epoch, forward, fusefs, lease, log_buffer, pin, placement, reintegrate,
-    shipper, snapshot, staging, writeback,
+    coop, designation, epoch, forward, lease, log_buffer, pin, placement, reintegrate, shipper,
+    snapshot, staging, writeback,
 };
+use constellation_engine::kernel_inval;
+use constellation_engine::view::{FsDependencies, QuotaCache, SyncHandle, View};
+use constellation_vfs::OpWatch;
 
 /// Detach a stale FUSE mount left behind by a previous daemon that exited
 /// without unmounting (crash, `kill`, or an orphaned view). Such a
@@ -188,11 +192,11 @@ struct MountHandle {
     subtree: String,
     mountpoint: PathBuf,
     since: Instant,
-    unmounter: Mutex<fuser::SessionUnmounter>,
+    unmounter: Mutex<constellation_frontend_fuse::FuseUnmounter>,
     /// This view's own quota-cap cache, so a live `SetQuota` can
     /// invalidate every mounted view instead of just the one that
     /// happened to build the shared `DaemonStatus`.
-    quota_cache: fusefs::QuotaCache,
+    quota_cache: QuotaCache,
 }
 
 pub struct NodeRuntime {
@@ -279,7 +283,12 @@ pub struct NodeRuntime {
     /// Plan 30 §M7: drops the kernel's cached view of what another node's
     /// writes changed (`kernel_inval`); `None` when
     /// `CONSTELLATION_KERNEL_INVALIDATE=0`.
-    kernel_inval: Option<crate::kernel_inval::KernelInvalidator>,
+    kernel_inval: Option<kernel_inval::KernelInvalidator>,
+    /// The request watchdog every view's ops register with
+    /// (`constellation_vfs::watch`): one per node, as the FUSE adapter's
+    /// process-wide registry was, so `status` keeps counting across views
+    /// coming and going.
+    op_watch: OpWatch,
     shutdown_started: AtomicBool,
     /// Why the node-wide shutdown could not ship everything, when it
     /// could not: the process must then exit non-zero (see
@@ -291,6 +300,12 @@ impl NodeRuntime {
     /// Plan 30 §M8: this node's mounts are `--cto strict`.
     pub fn cto_strict(&self) -> bool {
         self.cto_strict
+    }
+
+    /// The request watchdog every view's ops register with (`status`'s
+    /// `fuse_requests`).
+    pub fn op_watch(&self) -> &OpWatch {
+        &self.op_watch
     }
 
     /// Per-node setup: open the backend/replica/cache, claim or validate
@@ -1269,8 +1284,7 @@ impl NodeRuntime {
                 .context("automatic reintegration after mount")?;
         }
 
-        let kernel_inval =
-            crate::kernel_inval::enabled().then(crate::kernel_inval::KernelInvalidator::start);
+        let kernel_inval = kernel_inval::enabled().then(kernel_inval::KernelInvalidator::start);
         {
             // Every foreign apply feeds the kernel invalidations and the
             // cooperative cache's fresh-chunk hints (who wrote the chunks
@@ -1286,6 +1300,7 @@ impl NodeRuntime {
         }
         let node = Arc::new(NodeRuntime {
             kernel_inval,
+            op_watch: OpWatch::from_env("fuse-watch"),
             node_id,
             incarnation,
             next_rid_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1466,17 +1481,22 @@ impl NodeRuntime {
         };
 
         let departed = self.departed.clone();
-        let mut fs = fusefs::View::new(
-            fusefs::FsDependencies {
+        // What the FUSE frontend declares for this view: it forwards
+        // POSIX/`flock` locks under `--locks cluster`, except on a frozen
+        // snapshot view, where nothing can be written.
+        let frozen_view = selector.is_some() && !rw_snapshot;
+        let caps = constellation_frontend_fuse::caps(self.locks_cluster && !frozen_view);
+        let mut fs = View::new(
+            FsDependencies {
                 inflight: self
                     .kernel_inval
                     .as_ref()
-                    .map_or_else(crate::kernel_inval::InFlight::disabled, |k| k.inflight()),
+                    .map_or_else(kernel_inval::InFlight::disabled, |k| k.inflight()),
                 meta: self.meta.clone(),
                 store: self.store.clone(),
                 cache: self.cache.clone(),
                 rt: self.rt.clone(),
-                sync: Some(fusefs::SyncHandle {
+                sync: Some(SyncHandle {
                     tx: self.sync_tx.clone(),
                     fsync_s3: self.fsync_s3,
                     cto_strict: self.cto_strict,
@@ -1484,10 +1504,7 @@ impl NodeRuntime {
                         Arc::new(crate::locks::ClusterLocks {
                             meta: self.meta.clone(),
                             tx: self.sync_tx.clone(),
-                            inval: self.kernel_inval.as_ref().map(|k| {
-                                Arc::new(k.inodes())
-                                    as Arc<dyn constellation_engine::events::FrontendEvents>
-                            }),
+                            inval: self.kernel_inval.as_ref().map(|k| k.inodes()),
                         })
                     }),
                     lease: self.lease.clone(),
@@ -1510,11 +1527,13 @@ impl NodeRuntime {
                 atime: self.atime.clone(),
                 prune_stats: self.prune_stats.clone(),
                 holds: Some(self.holds.clone()),
+                watch: self.op_watch.clone(),
+                caps: caps.clone(),
             },
             self.fsmeta.chunk_size,
             self.compression,
         );
-        let prefetch_stats = fs.prefetch.stats();
+        let prefetch_stats = fs.prefetch_stats();
         let quota_cache = fs.quota_cache_handle();
         if let Some((path, name)) = &selector {
             if rw_snapshot {
@@ -1588,19 +1607,6 @@ impl NodeRuntime {
         }
 
         let mount_record_name = fs_name.clone();
-        let options = vec![
-            fuser::MountOption::FSName(fs_name),
-            fuser::MountOption::DefaultPermissions,
-        ];
-        let acl = if allow_other {
-            fuser::SessionACL::All
-        } else {
-            fuser::SessionACL::Owner
-        };
-        let mut options = options;
-        if selector.is_some() && !rw_snapshot {
-            options.push(fuser::MountOption::RO);
-        }
         // Self-heal a stale mountpoint left by a previous daemon that
         // exited without unmounting (crash, kill, or an orphaned view
         // attached during shutdown). Such a mountpoint answers stat with
@@ -1609,17 +1615,22 @@ impl NodeRuntime {
         // the remount just works instead of surfacing os error 107.
         clear_stale_mount(&mountpoint);
         tracing::info!(?mountpoint, state_dir = ?self.state_dir, fs = %self.fsmeta.uuid, "mounting");
-        let mut fuse_config = fuser::Config::default();
-        fuse_config.mount_options = options;
-        fuse_config.acl = acl;
-        fuse_config.n_threads = Some(fuse_threads);
-        fuse_config.clone_fd = cfg!(target_os = "linux") && fuse_config.n_threads != Some(1);
-        // Build an explicit Session so `remove_mount`/signals can unmount
-        // from inside this process (via SessionUnmounter). Plain
-        // `fuser::mount` has no hook for that; without it, an external
-        // kill leaves a dead mountpoint that needs `fusermount3 -u`.
+        let mount_options = constellation_frontend_fuse::MountOptions {
+            fs_name,
+            allow_other,
+            read_only: frozen_view,
+            n_threads: fuse_threads,
+            // The kernel queue is sized for the host's worker count (the
+            // node-wide thread plan), whatever this view's own count.
+            tuning: constellation_frontend_fuse::KernelTuning::for_workers(
+                crate::parallelism::thread_plan().fuse,
+            ),
+        };
+        // An explicit session, so `remove_mount`/signals can unmount from
+        // inside this process (its `FuseUnmounter`); without it, an
+        // external kill leaves a dead mountpoint that needs `fusermount3
+        // -u`.
         let view_root = fs.view_root();
-        let frozen_view = selector.is_some() && !rw_snapshot;
         // Plan 30 §M14: shared, so a recalled lock grant's flush reaches
         // this view's write state (`locks::LockFlushers`).
         let fs = Arc::new(fs);
@@ -1627,9 +1638,9 @@ impl NodeRuntime {
             Arc::downgrade(&(fs.clone() as Arc<dyn crate::locks::LockFlush>));
         let open_handles: std::sync::Weak<dyn crate::holds::OpenHandles> =
             Arc::downgrade(&(fs.clone() as Arc<dyn crate::holds::OpenHandles>));
-        let mut session = fuser::Session::new(fusefs::FuseFs(fs), &mountpoint, &fuse_config)
+        let mut session = constellation_frontend_fuse::mount(fs, &mountpoint, &mount_options, caps)
             .context("FUSE mount")?;
-        let unmounter = session.unmount_callable();
+        let unmounter = session.unmounter();
 
         let id = MountId(self.next_mount_id.fetch_add(1, Ordering::Relaxed));
         // So that a takeover after a kill can abort this mount's
@@ -1642,7 +1653,7 @@ impl NodeRuntime {
         self.lock_flushers.register(id.0, flusher);
         self.hold_sources.register(id.0, open_handles);
         if let (Some(k), false) = (&self.kernel_inval, frozen_view) {
-            k.register(id.0, session.notifier(), view_root);
+            k.register(id.0, Arc::new(session.notifier()), view_root);
         }
         let subtree = inner_path.clone();
         self.mounts.lock().unwrap().insert(
@@ -1755,7 +1766,7 @@ impl NodeRuntime {
     /// mounted view serving the stale cap for up to that TTL.
     pub fn invalidate_quota_caches(&self) {
         for handle in self.mounts.lock().unwrap().values() {
-            fusefs::View::invalidate_quota_cache(&handle.quota_cache);
+            View::invalidate_quota_cache(&handle.quota_cache);
         }
     }
 

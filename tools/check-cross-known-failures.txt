@@ -4,13 +4,10 @@
 # that fixes it. Two-way: a listed entry that now passes makes
 # tools/check-cross.sh fail with "STALE" (like the xfstests baseline).
 
-# macOS: cli's Linux-only FUSE-frontend code (i16/u16 lock-type and mode
-# types, `FALLOC_FL_*` fallocate-op flags, fuser/libc call signatures, the
-# `setxattr`/`getxattr` arities in main.rs; 33 errors after plan 31 C2 moved
-# `gettid`/`tgkill`/`fallocate`/`flock` behind constellation-platform, 29
-# after C3 — all in fusefs_ops.rs and main.rs; the extracted
-# constellation-engine compiles for macOS). C4 rebuilds this code as the FUSE
-# frontend.
+# macOS: cli's Linux-only `setxattr`/`getxattr`/`removexattr` arities in
+# main.rs's `xattr` subcommand (4 errors after plan 31 C4a; 33 after C2, 29
+# after C3 — the other 25 were the FUSE adapter's, which C4a rebuilt as
+# constellation-frontend-fuse and which now compiles for macOS).
 aarch64-apple-darwin constellation
 # macOS: the harness's own Linux-only calls (`libc::fallocate`, the
 # `setxattr`/`getxattr` arities in scenarios.rs; 8 errors). Reached since

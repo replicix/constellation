@@ -2,7 +2,7 @@
 //! fast path, the forward with its same-rid retries and one redirect,
 //! M13's inbox when there is no P2P path, the lease path with its in-doubt
 //! resolution, the read-your-refusal wait and the deadline (what
-//! `fusefs::mutate_op_rebasable` + `node_runtime::dispatch_forward` +
+//! `view::View::mutate_op_rebasable` + `node_runtime::dispatch_forward` +
 //! `forward::request_mutate_with` + `inbox::forward_via_inbox` did).
 //!
 //! A stranded op's replay (`recovery::drain_pending_replays`) rides the

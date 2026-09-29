@@ -1,6 +1,6 @@
 [package]
 name = "constellation"
-description = "Constellation CLI, daemon, and FUSE mount (single binary)"
+description = "Constellation CLI and daemon host, with the FUSE frontend (single binary)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 constellation-engine.workspace = true
+constellation-vfs.workspace = true
+constellation-frontend-fuse.workspace = true
 constellation-fs-core.workspace = true
 constellation-types.workspace = true
 constellation-platform.workspace = true
@@ -24,7 +26,6 @@ constellation-net.workspace = true
 constellation-store-s3.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-fuser.workspace = true
 libc.workspace = true
 object_store.workspace = true
 postcard.workspace = true

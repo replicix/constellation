@@ -163,7 +163,7 @@ const MAX_FORWARD_RETRIES: u8 = 3;
 
 /// What a forwarded mutation request resolves to
 /// (`forward.rs::MutateOutcome`, reduced: `Busy` and `NotHolder` are the
-/// same fallback for the caller — see `fusefs.rs`'s `Busy | NotHolder`
+/// same fallback for the caller — see `view/write_gate.rs`'s `Busy | NotHolder`
 /// arm — so this model only has `NotHolder`).
 ///
 /// `Accepted` carries the epoch the answering holder executed (or first
@@ -1721,7 +1721,7 @@ impl Model for AuthorityModel {
                 s.history.push(HistEvt::Invoke(id, op, rid));
                 let held = authority(&s, id, self.protocol);
                 if let Some(epoch) = held {
-                    // Fast path: `fusefs.rs::mutate_op_rebasable`'s
+                    // Fast path: `view::mutate_op_rebasable`'s
                     // `view.open_for_new_mutation()` branch — a
                     // synchronous local `execute_mutate`, no yield point.
                     let base = node_replica(&s, id);

@@ -396,7 +396,7 @@ mod tests {
 
 /// Plan 30 §M11: the delegations this node holds, mirrored from the
 /// core after every event for the FUSE fast path's sibling check
-/// (`fusefs::mutate_op_rebasable_with_rid`): a write whose keys fall
+/// (`view::View::mutate_op_rebasable_with_rid`): a write whose keys fall
 /// under one of them, while its grant is honoured, executes on the FUSE
 /// thread as the delegate (`Meta::delegate_execute`) with no channel
 /// round trip, and the core streams it from the journal.

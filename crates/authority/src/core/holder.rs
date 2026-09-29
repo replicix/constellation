@@ -623,7 +623,7 @@ impl Core {
             // epoch (acknowledged effects re-evaluated and reordered). The
             // requester forwards to this node instead; its file writes'
             // manifests go forwarded too, their chunks uploaded when S3
-            // returns (`fusefs::commit_manifest_forwarded`).
+            // returns (`view::View::commit_manifest_forwarded`).
             // `flex-crash` seed 30702: nor to a requester that has not
             // applied this node's whole log. The successor catches up to
             // `head_seq` from S3 outside an epoch; inside one it cannot,

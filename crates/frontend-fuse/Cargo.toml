@@ -1,0 +1,14 @@
+[package]
+name = "constellation-frontend-fuse"
+description = "The Linux (FreeBSD-ready) FUSE frontend (plan 31 §4): fuser's callbacks translated into `constellation-vfs` ops and their responders back into fuser replies; the only crate that depends on fuser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+constellation-vfs.workspace = true
+constellation-types.workspace = true
+constellation-platform.workspace = true
+fuser.workspace = true
+libc.workspace = true
+tracing.workspace = true

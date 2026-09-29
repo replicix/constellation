@@ -72,7 +72,7 @@
 //!
 //! | Model | Code |
 //! |---|---|
-//! | `ReadLocal` (bounded) | `fusefs_ops.rs` `lookup`/`open`/`readdir` → `View::strict_read`, bounded arm: M6's `session_wait` only |
+//! | `ReadLocal` (bounded) | `engine/src/view/ops.rs` `lookup`/`open`/`readdir` → `View::strict_read`, bounded arm: M6's `session_wait` only |
 //! | `ReadLocal` (strict, the usable holder) | `strict_read` → `LeaseView::reads_locally` |
 //! | `ReadLocal` (strict, no live holder) | `Core::on_read_holder_learned` (lease claimable) → `read_tail` → `JobReq::TailToHead` → `ReadAnswer::Tailed` |
 //! | `ReadUnderDelegation` / `FinishRead` | `strict_read` → `ReadDelegations::valid` → `Meta::session_wait_at(keys, grant position)` |

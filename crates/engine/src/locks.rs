@@ -9,11 +9,13 @@
 //! ([`LockFlushers`]), and the conversions between the core's messages
 //! and their P2P wire form.
 //!
-//! Plan 31 C3: the FUSE reply plumbing (`fuser::ReplyEmpty`/`ReplyLock`,
-//! the `F_RDLCK`/`F_WRLCK`/`F_UNLCK` lock types) is the adapter's
-//! (`cli/src/fusefs_ops.rs`'s `getlk`/`setlk`): [`ClusterLocks::lock`]
-//! completes through a callback, the first of C4's `Responder`s, and
-//! [`ClusterLocks::test`] speaks `write: bool`.
+//! Plan 31: the FUSE reply plumbing (`fuser::ReplyEmpty`/`ReplyLock`,
+//! the `F_RDLCK`/`F_WRLCK`/`F_UNLCK` lock types) is the frontend's
+//! (`constellation-frontend-fuse`); the view's `lock_test`/`lock_acquire`/
+//! `lock_release` ops (`view::ops`) call in here. [`ClusterLocks::lock`]
+//! completes through a callback that completes the op's
+//! `constellation_vfs::Responder`, and [`ClusterLocks::test`] speaks
+//! `write: bool`.
 //!
 //! - `--locks local`: today's behaviour. The FUSE mount does not
 //!   negotiate `FUSE_POSIX_LOCKS`/`FUSE_FLOCK_LOCKS`, so the kernel keeps
@@ -132,9 +134,9 @@ const TRY_ROUNDS: u32 = 4;
 pub struct ClusterLocks {
     pub meta: Arc<Meta>,
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
-    /// The frontend's kernel cache of a file, dropped after a grant
-    /// (`cli/src/kernel_inval.rs`'s `InodeInvalidator`).
-    pub inval: Option<Arc<dyn crate::events::FrontendEvents>>,
+    /// The frontends' kernel caches of a file, dropped after a grant
+    /// (`crate::kernel_inval`); `None` with kernel invalidation off.
+    pub inval: Option<crate::kernel_inval::InodeInvalidator>,
 }
 
 impl ClusterLocks {
@@ -165,7 +167,7 @@ impl ClusterLocks {
     /// queued behind).
     pub fn invalidate(&self, ino: Ino) {
         if let Some(inval) = &self.inval {
-            inval.invalidate_inode(ino);
+            inval.invalidate(ino);
         }
     }
 
@@ -189,7 +191,7 @@ impl ClusterLocks {
             LocalOutcome::Conflict(l) => Some((l.start, l.end.min(OFFSET_MAX), l.write, l.pid)),
             LocalOutcome::Done => None,
             LocalOutcome::NeedGrant(mode) => {
-                crate::op_watch::stage("lock test (core reply)");
+                constellation_vfs::watch::stage("lock test (core reply)");
                 let (reply, answer) = tokio::sync::oneshot::channel();
                 if self
                     .tx
@@ -245,8 +247,8 @@ impl ClusterLocks {
     /// fill it. fuser 0.18 has no `FUSE_INTERRUPT`: such a wait cannot be
     /// cancelled from the application (see the module doc).
     ///
-    /// `done` answers the request (the FUSE adapter's completes its
-    /// `fuser::ReplyEmpty`), on this thread or on the waiter's.
+    /// `done` answers the request (the view's completes the op's
+    /// responder), on this thread or on the waiter's.
     pub fn lock<F>(self: &Arc<Self>, ino: Ino, lock: LocalLock, sleep: bool, done: F)
     where
         F: FnOnce(Result<(), Code>) + Send + 'static,
@@ -257,18 +259,28 @@ impl ClusterLocks {
         }
         let this = self.clone();
         // The request's watchdog entry moves with the reply: the waiter
-        // thread's stages name it (`op_watch::current`/`set_current`).
-        let op = crate::op_watch::current();
+        // thread's stages name it (`constellation_vfs::watch::current`,
+        // `Current::adopt`).
+        let op = constellation_vfs::watch::current();
         let spawned = std::thread::Builder::new()
             .name("lock-wait".into())
             .spawn(move || {
-                crate::op_watch::set_current(op);
+                if let Some(op) = op {
+                    op.adopt();
+                }
                 done(this.set(ino, lock, true))
             });
         if let Err(error) = spawned {
             // The reply went with the closure; dropping it answers EIO.
             tracing::warn!(%error, ino, "could not start a lock-wait thread");
         }
+    }
+
+    /// [`Self::lock`] on the calling thread, blocking or not: for a
+    /// frontend that cannot answer an op from another thread
+    /// (`constellation_vfs::FrontendCaps::deferrable`).
+    pub fn lock_here(&self, ino: Ino, lock: LocalLock, sleep: bool) -> Result<(), Code> {
+        self.set(ino, lock, sleep)
     }
 
     fn set(&self, ino: Ino, lock: LocalLock, sleep: bool) -> Result<(), Code> {
@@ -293,7 +305,7 @@ impl ClusterLocks {
                         std::thread::sleep(Duration::from_millis(10 * u64::from(rounds.min(20))));
                     }
                     rounds += 1;
-                    crate::op_watch::stage("lock grant (core reply)");
+                    constellation_vfs::watch::stage("lock grant (core reply)");
                     let (reply, answer) = tokio::sync::oneshot::channel();
                     self.tx
                         .send(SyncRequest::Lock {
@@ -333,7 +345,7 @@ impl ClusterLocks {
     /// file, not only the lock file (EC2 campaign 4 B-1).
     fn granted(&self, ino: Ino, position: &Position) {
         self.meta.session().raise_observed(*position);
-        crate::op_watch::stage("session wait after a lock grant");
+        constellation_vfs::watch::stage("session wait after a lock grant");
         let waited = self.meta.session_wait_at(&[ReadKey::Ino(ino)], position);
         tracing::debug!(target: "constellation::locks", ino, ?position, ?waited, "lock granted");
         match waited {
@@ -367,8 +379,8 @@ impl ClusterLocks {
             _ => {}
         }
         if let Some(inval) = &self.inval {
-            crate::op_watch::stage("kernel invalidation after a lock grant");
-            if !inval.invalidate_inode_and_wait(ino, INVAL_WAIT) {
+            constellation_vfs::watch::stage("kernel invalidation after a lock grant");
+            if !inval.invalidate_and_wait(ino, INVAL_WAIT) {
                 tracing::debug!(
                     target: "constellation::locks",
                     ino,

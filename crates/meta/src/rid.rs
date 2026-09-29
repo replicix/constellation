@@ -2,7 +2,7 @@
 //! the RIFL design applied to forwarding).
 //!
 //! Every `MutateOp` a FUSE call issues is assigned one `Rid` at the top
-//! of `mutate_op_rebasable` (`crates/cli/src/fusefs.rs`) and keeps it
+//! of `mutate_op_rebasable` (`crates/engine/src/view/write_gate.rs`) and keeps it
 //! across every retry — the same holder, a redirected holder, or the
 //! lease path — so the holder (and, after a takeover, whoever resolves
 //! an in-doubt op against the log) can recognize a retried request and

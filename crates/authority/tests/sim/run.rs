@@ -195,7 +195,7 @@ pub struct SimConfig {
     pub chunk_writes: f64,
     /// M12 round 2: model the daemon's FUSE fast path — a node holding a
     /// usable lease executes its own client ops outside the core
-    /// (`fusefs::mutate_op_rebasable_with_rid`), asking
+    /// (`view::View::mutate_op_rebasable_with_rid`), asking
     /// `Meta::root_fast_path` first (`Checked`), or not at all
     /// (`Unchecked`: the daemon before round 2, which executed names a
     /// range's delegate owned behind its back — `chaos-soak-4`'s double

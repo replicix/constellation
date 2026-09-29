@@ -1027,6 +1027,7 @@ dependencies = [
  "constellation-api",
  "constellation-authority",
  "constellation-engine",
+ "constellation-frontend-fuse",
  "constellation-fs-core",
  "constellation-meta",
  "constellation-mtree",
@@ -1034,7 +1035,7 @@ dependencies = [
  "constellation-platform",
  "constellation-store-s3",
  "constellation-types",
- "fuser",
+ "constellation-vfs",
  "libc",
  "object_store",
  "postcard",
@@ -1150,6 +1151,7 @@ dependencies = [
  "constellation-store-s3",
  "constellation-types",
  "constellation-upload-concurrency",
+ "constellation-vfs",
  "fjall",
  "futures",
  "object_store",
@@ -1160,6 +1162,18 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "constellation-frontend-fuse"
+version = "1.0.0"
+dependencies = [
+ "constellation-platform",
+ "constellation-types",
+ "constellation-vfs",
+ "fuser",
+ "libc",
  "tracing",
 ]
 
@@ -1315,6 +1329,17 @@ name = "constellation-upload-concurrency"
 version = "1.0.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "constellation-vfs"
+version = "1.0.0"
+dependencies = [
+ "bytes",
+ "constellation-platform",
+ "constellation-types",
+ "smallvec",
+ "tracing",
 ]
 
 [[package]]

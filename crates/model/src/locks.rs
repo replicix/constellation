@@ -110,7 +110,7 @@
 //!
 //! | Model | Code |
 //! |---|---|
-//! | `Start(Lock)` local hit | `fusefs_ops.rs` `setlk` → `Meta::locks().try_local` under a live `CacheGrant` |
+//! | `Start(Lock)` local hit | `engine/src/view/ops.rs` `lock_acquire` → `Meta::locks().try_local` under a live `CacheGrant` |
 //! | `SendLock`/`Deliver(LockReq)` | `SyncRequest::Lock` → `Control::Lock` → `PeerMsg::LockRequest` → `Core::on_lock_request` (`core/locks.rs`) |
 //! | recall + park | `on_lock_request` → `recall_needed`-style `LockRecall` + `park_reply(ParkedWhat::LockGrant)` |
 //! | `Deliver(Recall)` / `Released` | `Core::on_lock_recall` → `Action::LockFlush` → `Event::LockFlushed` → `PeerMsg::LockReleased` |

@@ -8,16 +8,18 @@ license.workspace = true
 [features]
 # Test-only constructors (`UploadRuntime::for_test`,
 # `snapshot::test_manager`) for the unit tests of the crates that embed the
-# engine (cli's FUSE adapter tests); enabled from their dev-dependencies.
+# engine; enabled from their dev-dependencies.
 test-util = ["dep:tempfile"]
 
-# No `fuser` (the FUSE frontend stays in crates/cli until plan 31 C4) and no
-# `libc`: after plan 31 C2 every host call goes through
-# constellation-platform, and the last direct use (`F_RDLCK`/`F_WRLCK`/
-# `F_UNLCK` in `locks.rs`) moved to the FUSE adapter in C3.
+# No `fuser` (the FUSE frontend is constellation-frontend-fuse, plan 31 C4:
+# the engine is reached only through constellation-vfs) and no `libc`: after
+# plan 31 C2 every host call goes through constellation-platform, and every
+# Linux flag the view used to decode (`O_*`, `FALLOC_FL_*`, `SEEK_*`,
+# `S_IF*`) arrives decoded as a constellation-vfs type since C4.
 [dependencies]
 constellation-types.workspace = true
 constellation-platform.workspace = true
+constellation-vfs.workspace = true
 constellation-fs-core.workspace = true
 constellation-authority.workspace = true
 constellation-meta.workspace = true

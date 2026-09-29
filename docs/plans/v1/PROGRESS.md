@@ -27946,3 +27946,68 @@ unix-socket server; past that, `staging.rs`'s
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798, perf within 3% of C0) — run once at the end of the
   plan-31 run
+
+## Plan 31 C4a — `constellation-vfs` and `constellation-frontend-fuse`
+
+The core of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.1-§6.8, §11 "C4"): the frontend contract as its own crate, the
+mounted view moved into the engine beneath it, and FUSE rebuilt as a thin
+adapter over it — behaviour-neutrally. Session handover / `vendor/fuser` /
+`daemon --upgrade` (C4b), subtree confinement and the `Engine`/`ViewSpec`
+API (C4c), the conformance kit and `MockVfs` (C6) and op metrics /
+`vfs-bench` (C7) are later steps; nothing here needs reshaping for them
+(the file ops carry the `Fh` a handle table exports, `FrontendCaps` is
+already passed per view, `OpWatch` is an instance a host hands its views).
+
+| Item | State | Where |
+|---|---|---|
+| New crate `constellation-vfs` (deps: types, platform, bytes, smallvec, tracing — no engine, fuser or libc; clean for the Windows library cross-check): `trait Vfs` (30 ops, generic `R: Responder<T>` per op), `OpCtx`/`OpId`/`OpKind`/`OpKindSet`/`Caller`/`Principal`/`CancelToken`, `Responder<T>` + `Blocking<T>`/`BlockingWait`/`FnResponder`/`DirSink`/`CollectDir`, `VfsError(Code)`, the decoded argument/result types (`Attr`, `Entry`, `SetAttr`, `Opened`, `OpenFlags`, `FallocateMode`, `SetXattrFlags`, `RenameFlags`, `SeekWhence`, `Durability`, `LockSpec`/`LockRange`/`LockStatus`, `StatFs`, `ReadData`, `WriteData`, `Name`/`XattrName` + owned bufs) | DONE | `crates/vfs/src/{lib,vfs,ctx,responder,types,name,error}.rs` |
+| `FrontendEvents` + `Invalidation` (§6.5), `FrontendCaps` + `FrontendCaps::linux_fuse(cluster_locks)` (§6.6) | DONE | `crates/vfs/src/{events,caps}.rs` |
+| Policies (§6.7): `NamePolicy` (Linux: lossy UTF-8, `NAME_MAX` 255 — the old `checked_name!`), `XattrPolicy` (Linux: `user.*`, `trusted.*` for uid 0, `user.constellation.{rsize,rcount}` virtual, read-only and *listed*), `IdentityMap::Posix`, `PolicyStack::for_caps` | DONE | `crates/vfs/src/policy.rs` |
+| `OpWatch`/`Watched`/`WatchKey` (§6.8): `fuse_watch` generalised to an instance (monitor thread per instance, `check_stalls`, `snapshot`), the thread-local current op with `stage`/`current`/`Current::adopt`/`Watched::adopt`; env vars (`CONSTELLATION_FUSE_REQUEST_STALL_S`, `CONSTELLATION_FUSE_STALL_BACKTRACE`) and log text unchanged | DONE | `crates/vfs/src/watch.rs` (from `cli/src/fuse_watch.rs`) |
+| C3 seams deleted: `engine::op_watch` (→ `constellation_vfs::watch`), `engine::events::FrontendEvents` (→ `ClusterLocks::inval` is the engine's own `kernel_inval::InodeInvalidator`) | DONE | `crates/engine/src/{lib,locks}.rs` |
+| `View` moved into the engine, split into modules, `impl Vfs for View`; every inline policy step of the old handlers (root renumbering, in-flight registration, name/xattr policy, synthetic `.constellation` and scratch short-circuits, `strict_read`, pending-write overlay, `lock_fenced`/`lock_discard_tainted`, `O_SYNC` flush, the cluster-lock capability check, the virtual xattrs, the watchdog registration) now beneath the trait, in the same order, answering the same `Code`s; `SyncHandle`, `FsDependencies` (+ `watch`, `caps`) with it | DONE | `crates/engine/src/view/{mod,ops,write_gate,shards,io,flush,create,lock_gate,synthetic}.rs` (from `cli/src/fusefs{,_ops}.rs`) |
+| Kernel invalidation machinery engine-side (queue, `kernel-inval` + `kernel-inval-watchdog` threads, TTL drop, `InFlight` hold-back, bounded `invalidate_and_wait`), delivering one notification per `FrontendEvents::invalidate` call; module doc (the zombie/deadlock design note) moved with it | DONE | `crates/engine/src/kernel_inval.rs` (from `cli/src/kernel_inval.rs`) |
+| New crate `constellation-frontend-fuse` (deps: vfs, types, platform, fuser, libc, tracing) — the only `fuser` dependent: `FuseFs<V: Vfs>` (`fuser::Filesystem`), newtype responders over the fuser replies, `reply_code`, flag/`rdev`/time decoding, `FUSE_INIT` negotiation (queue tuning, parallel dirops, `--locks cluster` lock caps), `FuseNotifySink` (the old `NotifySink` impl, renamed), `mount(view, mountpoint, opts, caps) -> FuseSession` (`run`/`unmounter`/`notifier`), `threads` (worker sizing, moved from cli's `parallelism.rs`) | DONE | `crates/frontend-fuse/src/{lib,adapter,reply,notify,session,threads}.rs` |
+| cli: mounts through `constellation_frontend_fuse::mount` on the same dedicated per-mount `session.run()` thread; one node-wide `OpWatch` shared by the views (`status`'s `fuse_requests`); no `fuser`; `fusefs.rs`, `fusefs_ops.rs`, `kernel_inval.rs`, `fuse_watch.rs` gone | DONE | `crates/cli/src/{node_runtime,main,parallelism}.rs`, `crates/cli/Cargo.toml` |
+| `check-cross`: frontend-fuse out of the Windows library list (a platform frontend, like cli); cli's darwin errors 29 → 4 (only main.rs's xattr arities) | DONE | `tools/check-cross.sh`, `tools/check-cross-known-failures.txt` |
+| CONVENTIONS.md paths (`SyncHandle`, `reply_code`, the crate list) | DONE | `docs/plans/v1/CONVENTIONS.md` |
+
+**Deliberate deviations from the §6 sketch (behaviour-preserving).**
+`Caller` resolves supplementary groups lazily, once per op, on the first
+check that needs one (as FUSE always did) instead of eagerly at the edge.
+The file ops take `ino` *and* `fh` (FUSE delivers both; the view has
+always addressed by the inode). `readdir` completes through its responder,
+which is also its `DirSink`, so the reply is sent while the op is still
+registered in-flight (the kernel_inval hold-back rule). Linux *lists* the
+virtual xattrs (`getfattr -d` has always shown them), so
+`linux_fuse().virtual_xattrs_listed = true`; the policy can hide them for
+plan 34. One kernel-invalidation thread per node and one `OpWatch` per
+node, as before, not per view. Only locks defer (§6.3).
+
+Unit tests: before, `cargo test -p constellation-engine -p constellation
+--bins --lib` 290 passed + 1 ignored (291 names); after, engine 276 + 1
+ignored, cli 20, vfs 21, frontend-fuse 12 — 329 passed + 1 ignored. Every
+one of the 291 test names is still present (moved with their code; the
+`reply_code`, watchdog and FUSE-sizing tests to the new crates); 39 are
+new (responder drop fail-safe, `Blocking`, xattr listing policy,
+`linux_fuse` caps, `OpWatch` stall detection and cross-thread adoption,
+flag decoding, and 13 in-process `Vfs` calls against a real `View` —
+C6's conformance seed).
+
+### Plan 31 C4a exit criteria
+
+- [x] `constellation-vfs` exists with the §6 contract; `View` implements
+  it in the engine; FUSE is `constellation-frontend-fuse` over it
+- [x] `fuser` only in `constellation-frontend-fuse`
+- [x] `cargo build --workspace`, `cargo clippy --workspace --all-targets
+  -- -D warnings` clean; `cargo fmt` clean on the touched crates
+- [x] Every pre-existing unit test still runs and passes
+- [x] `make check-cross` exits 0 (vfs clean for Windows; frontend-fuse
+  compiles for macOS)
+- [x] Manual end-to-end check of the debug binary (local backend: write/
+  read/rename/unlink, mkdir/readdir, xattrs, hard link, symlink, FIFO,
+  `flock` and blocking `F_SETLKW` under `--locks cluster`, clean exit) —
+  output identical to the pre-change binary
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end

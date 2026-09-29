@@ -550,7 +550,7 @@ fn default_true() -> bool {
     true
 }
 
-/// The FUSE request watchdog (`crate::fuse_watch`, EC2 campaign 7
+/// The FUSE request watchdog (`constellation_vfs::watch`, EC2 campaign 7
 /// B-2): requests in flight, and those unanswered past
 /// `CONSTELLATION_FUSE_REQUEST_STALL_S`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

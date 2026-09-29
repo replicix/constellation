@@ -149,14 +149,14 @@
 //!
 //! | Model action | Code path it abstracts |
 //! |---|---|
-//! | `ClientInvoke` (node holds) | `crates/cli/src/fusefs.rs::mutate_op_rebasable` (`open_for_new_mutation()` branch → `execute_mutate`) |
-//! | `ClientInvoke` (node forwards) | `crates/cli/src/fusefs.rs::mutate_op_rebasable` (`SyncRequest::Forward` send) + `crates/cli/src/forward.rs::request_mutate_with` |
+//! | `ClientInvoke` (node holds) | `crates/engine/src/view/write_gate.rs::mutate_op_rebasable` (`open_for_new_mutation()` branch → `execute_mutate`) |
+//! | `ClientInvoke` (node forwards) | `crates/engine/src/view/write_gate.rs::mutate_op_rebasable` (`SyncRequest::Forward` send) + `crates/engine/src/forward.rs::request_mutate_with` |
 //! | `DeliverForwardRequest` | `crates/cli/src/node_runtime.rs` `SyncRequest::Mutate` arm → `crates/cli/src/forward.rs::holder_execute` |
 //! | `DeliverForwardReply` (Accepted) | `crates/cli/src/forward.rs::apply_accepted` → `Meta::install_shadow` (a `spec` row of kind `Shadow`; skipped when `completed` already has the rid) |
 //! | `DeliverForwardReply` (replay reply, `Recovery`) | `crates/cli/src/recovery.rs::drain_pending_replays` (accepted → a fresh shadow; refused → `.constellation-conflict/` copy) |
 //! | `ReplayStranded` (`Recovery`) | `crates/cli/src/recovery.rs::drain_pending_replays` (`SyncRequest::Forward` with the stranded rid) |
-//! | `ForwardTimeout` | `crates/cli/src/forward.rs::request_mutate_with`'s `tokio::time::timeout` → `MutateOutcome::Busy` |
-//! | `RetryForward` (`ExactlyOnce` only) | `crates/cli/src/forward.rs::request_mutate_with`'s same-rid retry loop: the same holder if `state.lease` (the model's stand-in for the peer directory's belief) still names it, else the redirected one — plan 30 §M2's "retry the same rid... same holder... then a redirected holder" |
+//! | `ForwardTimeout` | `crates/engine/src/forward.rs::request_mutate_with`'s `tokio::time::timeout` → `MutateOutcome::Busy` |
+//! | `RetryForward` (`ExactlyOnce` only) | `crates/engine/src/forward.rs::request_mutate_with`'s same-rid retry loop: the same holder if `state.lease` (the model's stand-in for the peer directory's belief) still names it, else the redirected one — plan 30 §M2's "retry the same rid... same holder... then a redirected holder" |
 //! | `RequestHandoff` / `DeliverHandoffRequest` / `DeliverHandoffReply` | `crates/cli/src/node_runtime.rs` `SyncRequest::HandOff` arm (`ship.sync_one` + `LeaseKeeper::release`) and the `peers.request_lease` fast-path retry in the `SyncRequest::Acquire` arm |
 //! | `AcquireLease` | `crates/cli/src/lease.rs::LeaseKeeper::classify`/`commit` (`Plan::Create`/`Plan::Claim`, `TailedToHead`) + `crates/cli/src/shipper.rs::acquire_lease_for`/`tail_to_head`; under `Recovery` also the takeover gate (`LeaseKeeper::commit_gated` → `recovery::takeover_gate`: `Meta::strand_below_epoch` + `recovery::replay_locally`) |
 //! | `AcquireLease` (takeover, `Recovery`: epoch marker) | `crates/cli/src/shipper.rs::Shipper::ship_epoch_marker`, called from `shipper::acquire_lease_for` before `recovery::takeover_gate` (modeled inside the same atomic step; see the comment at its call site) |
@@ -170,13 +170,13 @@
 //! | `Restart` | fail-stop-then-rejoin with the durable journal intact (`crates/cli/src/shipper.rs::bootstrap`, minus lease authority) |
 //! | `Pause` / `Resume` | a stopped node whose timers keep running (the shape of `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` in `node_runtime.rs`'s `SyncRequest::Mutate` task, generalized to the whole node) |
 //! | `DropMessage` | WAN loss/reordering of iroh P2P messages (`crates/net`) |
-//! | `ClientInvoke` (node submits through the inbox, `inbox`) | `crates/cli/src/fusefs.rs::mutate_op_rebasable`'s P2P-unavailable branch → `store_s3::inbox::InboxSubmitter::submit` (one CAS-created `inbox/<epoch>/<node>/<n>` batch) |
+//! | `ClientInvoke` (node submits through the inbox, `inbox`) | `crates/engine/src/view/write_gate.rs::mutate_op_rebasable`'s P2P-unavailable branch → `store_s3::inbox::InboxSubmitter::submit` (one CAS-created `inbox/<epoch>/<node>/<n>` batch) |
 //! | `PollInbox` (`inbox`) | the holder's sync round → `store_s3::inbox::InboxPoller::poll` (GET-next with idle backoff) → `forward::holder_execute` per op, outcome journaled (`Completed`/`Refused`), no reply |
 //! | `Tail` (outcome for a pending inbox op, `inbox`) | `Meta::apply_segment` notifying the inbox waiter keyed by rid: `Completed { rid }` → success, `Refused { rid, errno }` → errno; a higher-epoch segment with neither strands the op |
 //! | `ResubmitInbox` (`inbox`) | the stranded requester's re-submission of the same rid under the new epoch (after resolving against its own `completed` first, and deleting its stale batch) |
 //! | `AcquireLease` (drain, `inbox`) | `store_s3::inbox::InboxStore::drain_below` executed inside `shipper::complete_gate`, after the stranded-op replays and before the view opens |
 //! | `GcInbox` (`inbox`) | `store_s3::inbox::InboxPoller::delete` after the outcome's segment shipped, keeping each requester's newest consumed batch (`gc_keep_newest`) |
-//! | `Read` (plan 30 §M6) | the FUSE read paths (`fusefs_ops.rs`: `lookup`, `getattr`, `readdir`, `open`, `readlink`, `getxattr`, `listxattr`); under `Positions` gated by the session wait (phase 2: a `Replica`/core check before the local `MetaStore` read, bounded by `CONSTELLATION_SESSION_WAIT_MS`) |
+//! | `Read` (plan 30 §M6) | the FUSE read paths (`engine/src/view/ops.rs`: `lookup`, `getattr`, `readdir`, `open`, `readlink`, `getxattr`, `listxattr`); under `Positions` gated by the session wait (phase 2: a `Replica`/core check before the local `MetaStore` read, bounded by `CONSTELLATION_SESSION_WAIT_MS`) |
 //! | `DeliverForwardRequest` reply position (`Positions`) | `Core::on_mutate_request` → `PeerMsg::MutateReply { position, base }` (M5's `reply_base` generalized; `positions::reply_position`) |
 //! | `DeliverForwardReply` → `Phase::AwaitingLog` (`Positions`) | `Core::on_mutate_reply`'s stale-base branch → `ClientPhase::AwaitingLog`, answered by `answer_awaiting_log` (`positions::on_tailed`) |
 //!

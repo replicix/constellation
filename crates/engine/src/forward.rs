@@ -66,7 +66,7 @@ impl ForwardState {
     }
 
     /// A rid for a mutation not issued through the FUSE write path's own
-    /// allocator (`fusefs::SyncHandle::next_rid_seq`) — retention
+    /// allocator (`view::SyncHandle::next_rid_seq`) — retention
     /// pruning's forwarded unlinks, conflict-copy steps and best-effort
     /// atime batches.
     ///
