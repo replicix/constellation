@@ -23,8 +23,8 @@ impl ReintegrationState {
         &self,
         stranded: u64,
         conflicts: u64,
-    ) -> constellation_api::ReintegrationStatus {
-        constellation_api::ReintegrationStatus {
+    ) -> constellation_control::proto::types::ReintegrationStatus {
+        constellation_control::proto::types::ReintegrationStatus {
             stranded_records: stranded,
             conflicts_materialized: conflicts,
             in_progress: self.in_progress.load(Ordering::Relaxed),

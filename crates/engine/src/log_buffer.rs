@@ -17,6 +17,8 @@ pub struct LogBuffer(Arc<Mutex<State>>);
 struct State {
     lines: VecDeque<String>,
     partial: Vec<u8>,
+    /// Lines ever completed (the position `since` counts from).
+    total: u64,
 }
 
 impl LogBuffer {
@@ -35,6 +37,38 @@ impl LogBuffer {
             .cloned()
             .collect()
     }
+
+    /// The last `count` lines and the position after them, for a follower
+    /// (`node.logs.tail` with `follow`) to pass to [`LogBuffer::since`].
+    pub fn tail_at(&self, count: usize) -> (u64, Vec<String>) {
+        let state = self.0.lock().unwrap();
+        let lines = state
+            .lines
+            .iter()
+            .rev()
+            .take(count)
+            .rev()
+            .cloned()
+            .collect();
+        (state.total, lines)
+    }
+
+    /// The lines completed after position `seen` (as many as the ring still
+    /// holds), and the new position.
+    pub fn since(&self, seen: u64) -> (u64, Vec<String>) {
+        let state = self.0.lock().unwrap();
+        let new = state
+            .total
+            .saturating_sub(seen)
+            .min(state.lines.len() as u64) as usize;
+        let lines = state
+            .lines
+            .iter()
+            .skip(state.lines.len() - new)
+            .cloned()
+            .collect();
+        (state.total, lines)
+    }
 }
 
 pub struct LogWriter(LogBuffer);
@@ -47,6 +81,7 @@ impl Write for LogWriter {
                 let line = String::from_utf8_lossy(&state.partial).into_owned();
                 state.partial.clear();
                 state.lines.push_back(line);
+                state.total += 1;
                 if state.lines.len() > CAPACITY {
                     state.lines.pop_front();
                 }

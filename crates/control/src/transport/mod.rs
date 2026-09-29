@@ -53,7 +53,9 @@ mod unix;
 
 pub use inprocess::InProcess;
 pub use path::{
-    default_socket_path, ensure_socket_dir, socket_path_for, SocketPathError, SOCKET_SUFFIX,
+    default_socket_path, ensure_socket_dir, forget_socket, instance_for_state_dir, locate_socket,
+    record_socket, socket_path_for, socket_path_for_state_dir, SocketPathError, LOCATOR_FILE,
+    SOCKET_SUFFIX,
 };
 pub use pipe::NamedPipe;
 pub use stream::StreamTransport;

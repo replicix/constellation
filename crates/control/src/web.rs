@@ -1,31 +1,61 @@
-//! Localhost-only HTTP adapter and embedded operator UI.
+//! The localhost HTTP adapter and the embedded operator UI (feature `web`),
+//! speaking the control protocol (plan 31 §9.7: "the existing web adapter
+//! keeps working, still loopback-only, now speaking the control protocol").
 //!
-//! The server intentionally has no authentication because it binds only to
-//! `127.0.0.1`. Remote operation belongs behind an SSH/iroh tunnel; widening
-//! the bind address without adding authentication would expose destructive
-//! control requests.
+//! ## Routes
+//!
+//! | route | what |
+//! |---|---|
+//! | `POST /api` | `{"method": "...", "params": {...}}` → `{"ok": result}` or, with a 4xx/5xx status, `{"error": ControlError}`; a chunked method's body is its bytes, a subscription's an NDJSON stream of events |
+//! | `GET /api/status` | `node.status`'s report itself (what the UI polls) |
+//! | `GET /api/download?path=` | a file's bytes (`browse.stat` + `browse.read`), streamed |
+//! | `GET /metrics` | Prometheus gauges from `node.status` |
+//! | `GET /`, `GET /{*path}` | the embedded UI (`webui/`) |
+//!
+//! Every call goes through [`dispatch_in_process`] /
+//! [`dispatch_stream_in_process`] on the daemon's own [`Router`]: the same
+//! authorization, audit and handlers as a unix-socket call (the C5 parity
+//! test compares the two across the whole method table).
+//!
+//! ## Who the caller is
+//!
+//! There is no authentication yet (plan 33 adds tokens); the only
+//! protections are the loopback bind and the DNS-rebinding guard below, as
+//! before. Every HTTP call therefore runs as [`WEB_PRINCIPAL`]
+//! ([`Principal::InProcess`], admin under every policy): exactly the access
+//! the old adapter gave, and audited like any other mutating call.
+//! One method is refused over HTTP whatever the principal
+//! ([`HTTP_REFUSED`]): `node.handoff`, which executes a binary (or needs a
+//! descriptor HTTP cannot carry) — the old `Upgrade` was socket-only too.
+//!
+//! ## The DNS-rebinding guard
 //!
 //! Binding loopback is not enough on its own: a page the operator visits in
 //! a browser can point a name it controls at `127.0.0.1` (DNS rebinding) and
 //! then issue *same-origin* requests to this API — fsck repair, prune,
-//! `mount_add`, `leave`, every destructive endpoint — with no credential to
-//! steal because there is none. This is the class of CVE-2025-49596. The
+//! `view.mount`, `node.leave`, every destructive method — with no credential
+//! to steal because there is none. This is the class of CVE-2025-49596. The
 //! [`guard_rebinding`] middleware closes it by refusing any request whose
 //! `Host` header (or, when present, `Origin`) does not name the loopback
 //! interface: a rebinding attacker's page still carries its own domain in
 //! those headers, while `curl` and the same-page UI carry a loopback host.
 
-use crate::{dispatch, DownloadSession, Request, Response, StatusSource};
+use crate::authz::Principal;
+use crate::methods::{method_info, NodeStatus, StreamKind};
+use crate::proto::types::{FileStat, StatusReport};
+use crate::proto::{ControlError, ErrorKind};
+use crate::server::{
+    dispatch_in_process, dispatch_stream_in_process, DispatchOptions, Router, StreamItem,
+};
 use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response as HttpResponse},
     routing::{get, post},
-    Json, Router,
+    Json,
 };
-use bytes::Bytes;
-use futures::stream;
+use futures::StreamExt;
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -35,16 +65,24 @@ use std::sync::Arc;
 #[folder = "webui/"]
 struct Assets;
 
+/// Who every HTTP call runs as (see the module docs).
+pub const WEB_PRINCIPAL: Principal = Principal::InProcess;
+
+/// Methods the HTTP adapter refuses whatever the principal.
+pub const HTTP_REFUSED: &[&str] = &["node.handoff"];
+
 #[derive(Clone)]
 struct AppState {
-    source: Arc<dyn StatusSource>,
+    router: Arc<Router>,
+    principal: Principal,
 }
 
-/// Start the optional localhost web endpoint. Port zero disables it.
-pub async fn serve(port: u16, source: Arc<dyn StatusSource>) -> anyhow::Result<SocketAddr> {
+/// Start the localhost web endpoint on `port` (0: any free port) and return
+/// where it listens.
+pub async fn serve(port: u16, router: Arc<Router>) -> std::io::Result<SocketAddr> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let address = listener.local_addr()?;
-    let app = router(source);
+    let app = app(router);
     tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             tracing::warn!(%error, "web UI server stopped");
@@ -53,12 +91,17 @@ pub async fn serve(port: u16, source: Arc<dyn StatusSource>) -> anyhow::Result<S
     Ok(address)
 }
 
-/// Assemble the router, guard included. Split out of [`serve`] (a purely
-/// mechanical refactor — the wiring is unchanged) so tests can drive the
-/// full stack in-process without binding a socket.
-fn router(source: Arc<dyn StatusSource>) -> Router {
-    let state = AppState { source };
-    Router::new()
+/// The whole HTTP application, guard included, for [`serve`] and for tests
+/// that drive it in-process.
+pub fn app(router: Arc<Router>) -> axum::Router {
+    app_as(router, WEB_PRINCIPAL)
+}
+
+/// [`app`] with every call made as `principal` (the parity test's roles;
+/// plan 33's authenticated callers).
+pub fn app_as(router: Arc<Router>, principal: Principal) -> axum::Router {
+    let state = AppState { router, principal };
+    axum::Router::new()
         .route("/api", post(api))
         .route("/api/status", get(status))
         .route("/api/download", get(download))
@@ -143,24 +186,139 @@ async fn guard_rebinding(
     next.run(request).await
 }
 
-async fn api(State(state): State<AppState>, Json(request): Json<Request>) -> Json<Response> {
-    Json(adapt(state.source.as_ref(), request))
+/// `POST /api`'s body.
+#[derive(Debug, Deserialize)]
+pub struct ApiRequest {
+    pub method: String,
+    #[serde(default = "empty_object")]
+    pub params: serde_json::Value,
 }
 
-/// HTTP's transport-independent adapter, exposed for exhaustive parity tests.
-pub fn adapt(source: &dyn StatusSource, request: Request) -> Response {
-    if matches!(request, Request::Upgrade { .. }) {
-        // It executes a binary: the unix socket (the state dir's owner)
-        // only, never the localhost port.
-        return Response::Error {
-            message: "upgrade is refused over HTTP; use the control socket".into(),
+fn empty_object() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+/// The HTTP status an error answers with.
+pub fn status_of(kind: ErrorKind) -> StatusCode {
+    match kind {
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::Denied => StatusCode::FORBIDDEN,
+        ErrorKind::Invalid => StatusCode::BAD_REQUEST,
+        ErrorKind::Unsupported => StatusCode::NOT_IMPLEMENTED,
+        ErrorKind::Conflict => StatusCode::CONFLICT,
+        ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        ErrorKind::Cancelled | ErrorKind::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn error_response(error: ControlError) -> HttpResponse {
+    (
+        status_of(error.kind),
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
+}
+
+/// Refuse what HTTP never carries ([`HTTP_REFUSED`]).
+fn refused_over_http(method: &str) -> Option<ControlError> {
+    HTTP_REFUSED.contains(&method).then(|| {
+        ControlError::denied(format!("{method} is refused over HTTP"))
+            .with_remediation("use the daemon's control socket (`constellation daemon --upgrade`)")
+    })
+}
+
+/// One unary call over HTTP, as the parity test and `POST /api` make it.
+pub async fn call_unary(
+    router: &Router,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ControlError> {
+    if let Some(refusal) = refused_over_http(method) {
+        return Err(refusal);
+    }
+    dispatch_in_process(router, &WEB_PRINCIPAL, method, params).await
+}
+
+async fn api(State(state): State<AppState>, Json(request): Json<ApiRequest>) -> HttpResponse {
+    let ApiRequest { method, params } = request;
+    if let Some(refusal) = refused_over_http(&method) {
+        return error_response(refusal);
+    }
+    let streaming = method_info(&method).map_or(StreamKind::None, |m| m.streaming);
+    if streaming == StreamKind::None {
+        return match dispatch_in_process(&state.router, &state.principal, &method, params).await {
+            Ok(result) => Json(serde_json::json!({ "ok": result })).into_response(),
+            Err(error) => error_response(error),
         };
     }
-    dispatch(source, request)
+    let stream = match dispatch_stream_in_process(
+        &state.router,
+        &state.principal,
+        &method,
+        params,
+        DispatchOptions::default(),
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(error) => return error_response(error),
+    };
+    let (content_type, body) = match streaming {
+        StreamKind::Chunks => (
+            "application/octet-stream",
+            Body::from_stream(stream.filter_map(|item| async move {
+                match item {
+                    Ok(StreamItem::Chunk(bytes)) => Some(Ok(bytes)),
+                    Ok(StreamItem::Event(_)) => None,
+                    Err(e) => Some(Err(std::io::Error::other(e.message))),
+                }
+            })),
+        ),
+        _ => (
+            "application/x-ndjson",
+            Body::from_stream(stream.filter_map(|item| async move {
+                match item {
+                    Ok(StreamItem::Event(blob)) => match blob.decode::<serde_json::Value>() {
+                        Ok(value) => {
+                            let mut line = value.to_string().into_bytes();
+                            line.push(b'\n');
+                            Some(Ok(bytes::Bytes::from(line)))
+                        }
+                        Err(e) => Some(Err(std::io::Error::other(e.message))),
+                    },
+                    Ok(StreamItem::Chunk(_)) => None,
+                    Err(e) => Some(Err(std::io::Error::other(e.message))),
+                }
+            })),
+        ),
+    };
+    let mut response = HttpResponse::new(body);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
-async fn status(State(state): State<AppState>) -> Json<Response> {
-    Json(dispatch(state.source.as_ref(), Request::Status))
+async fn node_status(router: &Router, principal: &Principal) -> Result<StatusReport, ControlError> {
+    let value = dispatch_in_process(
+        router,
+        principal,
+        <NodeStatus as crate::methods::Method>::NAME,
+        serde_json::json!({}),
+    )
+    .await?;
+    serde_json::from_value(value).map_err(|e| ControlError::failed(e.to_string()))
+}
+
+async fn status(State(state): State<AppState>) -> HttpResponse {
+    match node_status(&state.router, &state.principal).await {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error_response(error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,35 +326,64 @@ struct DownloadQuery {
     path: String,
 }
 
+/// `browse.stat` for the size and kind, then `browse.read` streamed as the
+/// body: at most a chunk or two in memory, whatever the file's size.
 async fn download(
     State(state): State<AppState>,
     Query(query): Query<DownloadQuery>,
 ) -> HttpResponse {
-    match state.source.open_download(&query.path) {
-        Ok(session) => streaming_download(session),
-        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    let stat = match dispatch_in_process(
+        &state.router,
+        &state.principal,
+        "browse.stat",
+        serde_json::json!({ "path": query.path }),
+    )
+    .await
+    .and_then(|v| {
+        serde_json::from_value::<FileStat>(v).map_err(|e| ControlError::failed(e.to_string()))
+    }) {
+        Ok(stat) => stat,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.message).into_response(),
+    };
+    if stat.kind != "file" {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{}: not a regular file", stat.path),
+        )
+            .into_response();
     }
-}
-
-fn streaming_download(session: DownloadSession) -> HttpResponse {
-    let DownloadSession {
-        file_name,
-        size,
-        chunks,
-    } = session;
-    let stream = stream::unfold(chunks, |mut chunks| async move {
-        match chunks.recv().await {
-            Some(Ok(buf)) => Some((Ok::<_, std::io::Error>(Bytes::from(buf)), chunks)),
-            Some(Err(message)) => Some((Err(std::io::Error::other(message)), chunks)),
-            None => None,
+    let stream = match dispatch_stream_in_process(
+        &state.router,
+        &state.principal,
+        "browse.read",
+        serde_json::json!({ "path": query.path }),
+        DispatchOptions::default(),
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.message).into_response(),
+    };
+    let body = stream.filter_map(|item| async move {
+        match item {
+            Ok(StreamItem::Chunk(bytes)) => Some(Ok::<_, std::io::Error>(bytes)),
+            Ok(StreamItem::Event(_)) => None,
+            Err(e) => Some(Err(std::io::Error::other(e.message))),
         }
     });
+    let file_name = stat
+        .path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download")
+        .to_string();
     let mut response = HttpResponse::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, size)
+        .header(header::CONTENT_LENGTH, stat.size)
         .header(header::CONTENT_DISPOSITION, content_disposition(&file_name))
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(body))
         .expect("download response is valid");
     // Belt-and-suspenders: keep proxies from buffering the whole body.
     response
@@ -223,8 +410,22 @@ fn content_disposition(file_name: &str) -> HeaderValue {
         .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""))
 }
 
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let status = state.source.status();
+async fn metrics(State(state): State<AppState>) -> HttpResponse {
+    match node_status(&state.router, &state.principal).await {
+        Ok(status) => (
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            render_metrics(&status),
+        )
+            .into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+/// The Prometheus text `/metrics` serves for `status`.
+pub fn render_metrics(status: &StatusReport) -> String {
     let mut output = String::new();
     macro_rules! gauge {
         ($name:literal, $help:literal, $value:expr) => {
@@ -558,13 +759,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         "Prune passes refused because the replica was too stale.",
         status.prune.refused_lag
     );
-    (
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        output,
-    )
+    output
 }
 
 async fn index() -> HttpResponse {
@@ -594,39 +789,48 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt; // for `oneshot`
 
-    /// The rebinding guard rejects before any route handler runs, so the
-    /// allowed cases only reach the static `GET /` handler and never touch
-    /// the source. This stub therefore need not produce a real report.
-    struct NeverAsked;
-    impl StatusSource for NeverAsked {
-        fn status(&self) -> crate::StatusReport {
-            unimplemented!("the DNS-rebinding guard tests never reach a handler that reads status")
-        }
+    /// An empty router: the guard tests never reach a handler that needs one.
+    fn empty() -> Arc<Router> {
+        Arc::new(Router::new())
     }
 
-    /// Plan 31 C4b: `Upgrade` executes a binary, so the localhost HTTP
-    /// port refuses it before any source sees it; the unix socket's
-    /// dispatcher reaches the source.
-    #[test]
-    fn upgrade_is_refused_over_http_only() {
-        struct Upgradable;
-        impl StatusSource for Upgradable {
-            fn status(&self) -> crate::StatusReport {
-                unimplemented!()
-            }
-            fn upgrade(&self, _: Option<&std::path::Path>) -> Result<String, String> {
-                Ok("handing over".into())
-            }
-        }
-        let request = Request::Upgrade { binary: None };
-        match adapt(&Upgradable, request.clone()) {
-            Response::Error { message } => assert!(message.contains("HTTP"), "{message}"),
-            other => panic!("HTTP must refuse an upgrade: {other:?}"),
-        }
-        match crate::dispatch(&Upgradable, request) {
-            Response::Ok { detail } => assert_eq!(detail, "handing over"),
-            other => panic!("the socket reaches the source: {other:?}"),
-        }
+    /// `node.handoff` executes a binary (or needs a descriptor): HTTP refuses
+    /// it before the router sees it, whatever the principal's role.
+    #[tokio::test]
+    async fn handoff_is_refused_over_http_only() {
+        let err = call_unary(&Router::new(), "node.handoff", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Denied);
+        assert!(err.message.contains("HTTP"), "{err}");
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"method":"node.handoff","params":{}}"#))
+            .unwrap();
+        let response = app(empty()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// An unregistered method is `Unsupported` (501) with the error object.
+    #[tokio::test]
+    async fn api_errors_carry_the_control_error() {
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api")
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"method":"pin.list"}"#))
+            .unwrap();
+        let response = app(empty()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["kind"], "unsupported");
     }
 
     /// Drive `GET /` through the full router with the given headers and
@@ -634,7 +838,7 @@ mod tests {
     /// which exists, so an allowed request yields `200 OK` and a rejected
     /// one `403 FORBIDDEN` from the guard.
     async fn get_root(headers: &[(&str, &str)]) -> StatusCode {
-        let app = router(Arc::new(NeverAsked));
+        let app = app(empty());
         let mut builder = HttpRequest::builder().method("GET").uri("/");
         for (name, value) in headers {
             builder = builder.header(*name, *value);

@@ -3487,40 +3487,56 @@ fn web_ui_smoke(_seed: u64) -> Result<()> {
         .call()
         .context("GET /api/status")?
         .into_json()?;
-    anyhow::ensure!(status["resp"] == "status", "bad HTTP status: {status}");
+    anyhow::ensure!(status["fs_uuid"].is_string(), "bad HTTP status: {status}");
     let round_trip: serde_json::Value = serde_json::from_str(&serde_json::to_string(&status)?)?;
     anyhow::ensure!(round_trip == status, "HTTP status serde round-trip changed");
 
-    let request = |body: serde_json::Value| -> Result<serde_json::Value> {
-        Ok(ureq::post(&format!("{base}/api"))
+    // The control protocol over HTTP (plan 31 C5): `{method, params}` in,
+    // `{"ok": result}` out (an error is a 4xx/5xx with `{"error": ...}`).
+    let request = |method: &str, params: serde_json::Value| -> Result<serde_json::Value> {
+        let reply: serde_json::Value = ureq::post(&format!("{base}/api"))
             .timeout(Duration::from_secs(30))
-            .send_json(body)?
-            .into_json()?)
+            .send_json(serde_json::json!({"method": method, "params": params}))
+            .with_context(|| format!("POST /api {method}"))?
+            .into_json()?;
+        anyhow::ensure!(reply.get("ok").is_some(), "{method}: {reply}");
+        Ok(reply["ok"].clone())
     };
-    let directory = request(serde_json::json!({"cmd":"read_dir","path":"/"}))?;
+    let directory = request("browse.readdir", serde_json::json!({"path":"/"}))?;
     anyhow::ensure!(
         directory["entries"]
             .as_array()
             .is_some_and(|entries| entries.iter().any(|e| e["name"] == "through-http")),
         "HTTP ReadDir omitted created directory: {directory}"
     );
-    let created = request(serde_json::json!({
-        "cmd":"snapshot_create",
-        "selector":"/@web-ui-smoke"
-    }))?;
-    anyhow::ensure!(created["resp"] == "ok", "snapshot create failed: {created}");
-    let listed = request(serde_json::json!({"cmd":"list_snapshots","path":null}))?;
+    let created = request(
+        "snapshot.create",
+        serde_json::json!({"selector":"/@web-ui-smoke"}),
+    )?;
+    anyhow::ensure!(
+        created["snapshot"]["name"] == "web-ui-smoke",
+        "snapshot create failed: {created}"
+    );
+    let listed = request("snapshot.list", serde_json::json!({"path":null}))?;
     anyhow::ensure!(
         listed["snapshots"]
             .as_array()
             .is_some_and(|rows| rows.iter().any(|row| row["name"] == "web-ui-smoke")),
         "snapshot not listed through HTTP: {listed}"
     );
-    let deleted = request(serde_json::json!({
-        "cmd":"snapshot_delete",
-        "selector":"/@web-ui-smoke"
-    }))?;
-    anyhow::ensure!(deleted["resp"] == "ok", "snapshot delete failed: {deleted}");
+    request(
+        "snapshot.delete",
+        serde_json::json!({"selector":"/@web-ui-smoke"}),
+    )
+    .context("snapshot delete failed")?;
+    // Unix-socket only: HTTP refuses the in-place upgrade outright.
+    let refused = ureq::post(&format!("{base}/api"))
+        .timeout(Duration::from_secs(10))
+        .send_json(serde_json::json!({"method": "node.handoff", "params": {}}));
+    anyhow::ensure!(
+        matches!(refused, Err(ureq::Error::Status(403, _))),
+        "node.handoff over HTTP must be refused: {refused:?}"
+    );
 
     let metrics = ureq::get(&format!("{base}/metrics"))
         .timeout(Duration::from_secs(10))
@@ -4775,8 +4791,8 @@ fn backup_takeover_held_chunks(name: &str, returns: bool) -> Result<()> {
             c0.kill9()?;
             paused = false;
             for ino in &held_inos {
-                let reply = c1.control(&serde_json::json!({ "cmd": "drop_held", "ino": ino }))?;
-                anyhow::ensure!(reply["resp"] == "ok", "drop-held {ino} failed: {reply}");
+                c1.control("locks.drop_held", serde_json::json!({ "ino": ino }))
+                    .with_context(|| format!("drop-held {ino} failed"))?;
             }
             eventually(
                 "the conflict copies land and the held set drains",
@@ -7636,9 +7652,12 @@ fn diagnose_divergence(scenario: &str, err: &str, clients: &[&Client]) {
                 Err(e) => format!("read error: {e}"),
             };
             let entry = c
-                .control(&serde_json::json!({"cmd": "inspect", "path": format!("/{path}")}))
+                .control(
+                    "browse.inspect",
+                    serde_json::json!({"path": format!("/{path}")}),
+                )
                 .map(|v| {
-                    let e = &v["entry"];
+                    let e = &v;
                     let m = &e["manifest"];
                     format!(
                         "ino {:#x} size {} mtime_ns {} manifest {{len {} digest {} chunks {}}}",
@@ -8062,10 +8081,9 @@ fn disjoint_write_4(seed: u64) -> Result<()> {
 /// *fresh* CLI invocation must attach to the already-running daemon over
 /// its control socket instead of starting a second process. Exercises
 /// the registry, name resolution, daemonization (real backgrounding, not
-/// `--foreground`), multi-view `MountAdd`/`MountRemove`, and the
+/// `--foreground`), multi-view `view.mount`/`view.unmount`, and the
 /// daemon's own clean exit once its last view is detached.
 fn named_shared_daemon(_seed: u64) -> Result<()> {
-    use std::os::unix::net::UnixStream;
     use std::process::Command;
     use std::time::Instant;
 
@@ -8089,15 +8107,13 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
             .unwrap_or(false)
     }
 
-    fn read_status(sock: &std::path::Path) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        let mut stream = UnixStream::connect(sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.write_all(b"{\"cmd\":\"status\"}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        Ok(serde_json::from_str(&line)?)
+    fn read_status(state_dir: &std::path::Path) -> Result<serde_json::Value> {
+        crate::client::control_call_at(
+            state_dir,
+            "node.status",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
     }
 
     fn pid_alive(pid: &str) -> bool {
@@ -8136,7 +8152,6 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
 
     let state_dir = data_home.join("constellation").join("myfs");
     let pid_path = state_dir.join("daemon.pid");
-    let sock_path = state_dir.join("control.sock");
 
     // Runs the scenario body; teardown below always attempts a clean
     // `umount myfs` and, failing that, a direct kill of any leftover
@@ -8208,7 +8223,7 @@ fn named_shared_daemon(_seed: u64) -> Result<()> {
             "a second daemon.pid appeared ({pid1} vs {pid2}); views did not share one process"
         );
 
-        let status = read_status(&sock_path)?;
+        let status = read_status(&state_dir)?;
         anyhow::ensure!(
             status["mounts"].as_array().map(|m| m.len()) == Some(2),
             "daemon should report exactly 2 mounted views: {status}"

@@ -297,6 +297,9 @@ pub struct Engine {
     op_watch: OpWatch,
     views: Mutex<HashMap<u64, OpenView>>,
     next_view_id: AtomicU64,
+    /// Where its S3 credentials come from (plan 31 §9.8): `fs.unlock`
+    /// rotates a static source in place.
+    credentials: Arc<CredentialSource>,
     shutdown_started: AtomicBool,
     /// Why the shutdown could not ship everything, when it could not.
     shutdown_error: Mutex<Option<String>>,
@@ -1342,6 +1345,7 @@ impl Engine {
             }));
         }
         Ok(Engine {
+            credentials,
             host,
             profile,
             allotment,
@@ -2007,6 +2011,11 @@ impl Engine {
     /// The request watchdog every view's ops register with.
     pub fn op_watch(&self) -> &OpWatch {
         &self.op_watch
+    }
+
+    /// The engine's credential source (plan 31 §9.8).
+    pub fn credentials(&self) -> &Arc<CredentialSource> {
+        &self.credentials
     }
 }
 

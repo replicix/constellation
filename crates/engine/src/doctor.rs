@@ -51,11 +51,13 @@ pub fn print_cas_report(report: &CasProbeReport) -> anyhow::Result<()> {
 }
 
 /// The same report, in the control API's shape.
-pub fn api_probes(report: &CasProbeReport) -> Vec<constellation_api::CasProbeStatus> {
+pub fn api_probes(
+    report: &CasProbeReport,
+) -> Vec<constellation_control::proto::types::CasProbeStatus> {
     report
         .probes
         .iter()
-        .map(|p| constellation_api::CasProbeStatus {
+        .map(|p| constellation_control::proto::types::CasProbeStatus {
             name: p.name.clone(),
             observed: p.observed.clone(),
             known: p.known,

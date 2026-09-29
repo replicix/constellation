@@ -1039,8 +1039,8 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
- "constellation-api",
  "constellation-authority",
+ "constellation-control",
  "constellation-engine",
  "constellation-frontend-fuse",
  "constellation-fs-core",
@@ -1051,6 +1051,7 @@ dependencies = [
  "constellation-store-s3",
  "constellation-types",
  "constellation-vfs",
+ "futures",
  "libc",
  "object_store",
  "postcard",
@@ -1062,25 +1063,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
-]
-
-[[package]]
-name = "constellation-api"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "constellation-types",
- "futures",
- "mime_guess",
- "rust-embed",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tower",
- "tracing",
 ]
 
 [[package]]
@@ -1133,13 +1115,16 @@ dependencies = [
 name = "constellation-control"
 version = "1.0.0"
 dependencies = [
+ "axum",
  "blake3",
  "bytes",
  "constellation-platform",
  "constellation-types",
  "futures",
  "libc",
+ "mime_guess",
  "postcard",
+ "rust-embed",
  "schemars",
  "serde",
  "serde_json",
@@ -1148,6 +1133,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tower",
  "tracing",
 ]
 
@@ -1157,8 +1143,11 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "constellation-api",
+ "axum",
+ "blake3",
+ "bytes",
  "constellation-authority",
+ "constellation-control",
  "constellation-fs-core",
  "constellation-meta",
  "constellation-mtree",
@@ -1178,6 +1167,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "zeroize",
 ]
@@ -1219,6 +1209,7 @@ dependencies = [
  "blake3",
  "clap",
  "constellation-chaos",
+ "constellation-control",
  "constellation-meta",
  "constellation-platform",
  "constellation-store-s3",

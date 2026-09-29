@@ -160,7 +160,7 @@ enum Command {
         json: bool,
     },
     /// Test helper for `stale-daemon-lock`: hold `daemon.lock` and a
-    /// `control.sock` listener in STATE_DIR that accepts connections and
+    /// control-socket listener for STATE_DIR (recorded in its `control.path`) that accepts connections and
     /// never answers, until killed (a stand-in for a daemon the kernel has
     /// killed whose last thread is stuck in the kernel).
     #[command(hide = true)]
@@ -505,9 +505,15 @@ fn mute_daemon(state_dir: &std::path::Path) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
-    let sock = state_dir.join("control.sock");
+    // Where a real daemon of this state dir listens, recorded where every
+    // client looks for it (plan 31 C5: `control.path`).
+    let sock = constellation_control::transport::socket_path_for_state_dir(
+        &*constellation_platform::native().dirs,
+        state_dir,
+    )?;
     let _ = std::fs::remove_file(&sock);
     let listener = std::os::unix::net::UnixListener::bind(&sock)?;
+    constellation_control::transport::record_socket(state_dir, &sock)?;
     std::fs::write(state_dir.join("daemon.pid"), std::process::id().to_string())?;
     eprintln!(
         "mute daemon {} holding {}",

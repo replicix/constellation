@@ -210,9 +210,11 @@ define_methods! {
     /// The operation watchdog's registry (plan 31 §6.10).
     NodeOps { name: "node.ops", role: Viewer, mutating: false, stream: None,
         params: OpsParams, result: OpsReport }
-    /// Hand FUSE sessions to another process (plan 31 §6.11). Needs an fd.
+    /// Hand FUSE sessions over (plan 31 §6.11): in place across `exec`
+    /// (C4b's upgrade), or to another process over an attached socket fd.
     NodeHandoff { name: "node.handoff", role: Admin, mutating: true, stream: None,
-        params: HandoffParams, result: HandoffReport, requires_fd: |_| true }
+        params: HandoffParams, result: HandoffReport,
+        requires_fd: |p| matches!(p.target, HandoffTarget::Socket) }
     /// Inject a host lifecycle event (plan 31 §10).
     NodeLifecycle { name: "node.lifecycle", role: Admin, mutating: true, stream: None,
         params: LifecycleParams, result: Ack }
@@ -261,7 +263,7 @@ define_methods! {
     /// Create a snapshot; `hold` pins it against policy pruning. The record
     /// of the new snapshot comes back.
     SnapshotCreate { name: "snapshot.create", role: Operator, mutating: true, stream: None,
-        params: SnapshotCreateParams, result: SnapshotStatus }
+        params: SnapshotCreateParams, result: SnapshotCreated }
     /// (The old `ListSnapshots` alias is gone.)
     SnapshotList { name: "snapshot.list", role: Viewer, mutating: false, stream: None,
         params: SnapshotListParams, result: SnapshotListing }
@@ -601,7 +603,11 @@ mod tests {
         };
         assert!(!ViewMount::requires_fd(&path_mount));
         assert!(ViewMount::requires_fd(&fd_mount));
-        assert!(NodeHandoff::requires_fd(&HandoffParams::default()));
+        assert!(!NodeHandoff::requires_fd(&HandoffParams::default()));
+        assert!(NodeHandoff::requires_fd(&HandoffParams {
+            target: HandoffTarget::Socket,
+            ..HandoffParams::default()
+        }));
         assert!(!NodePing::requires_fd(&Empty {}));
     }
 }

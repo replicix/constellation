@@ -21,7 +21,8 @@ blake3.workspace = true
 constellation-authority.workspace = true
 constellation-meta.workspace = true
 constellation-mtree.workspace = true
-constellation-api = { workspace = true, features = ["web"] }
+constellation-control = { workspace = true, features = ["web"] }
+futures.workspace = true
 constellation-net.workspace = true
 constellation-store-s3.workspace = true
 anyhow.workspace = true

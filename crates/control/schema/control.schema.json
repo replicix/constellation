@@ -2410,7 +2410,7 @@
       "type": "object"
     },
     "HandoffParams": {
-      "description": "`node.handoff` (plan 31 §6.11): drain the FUSE sessions of `views` (all\nwhen empty), export their handle tables and send the session\ndescriptors to the process listening on the socket **attached to this\nrequest** (over fd passing), which then `resume`s them. Requires a\ntransport with fd passing.",
+      "description": "`node.handoff` (plan 31 §6.11). With [`HandoffTarget::Socket`] the\nrequest carries a descriptor and needs a transport with fd passing;\n[`HandoffTarget::Exec`] (the default) does not.",
       "properties": {
         "drain_timeout_ms": {
           "default": null,
@@ -2421,6 +2421,14 @@
             "integer",
             "null"
           ]
+        },
+        "target": {
+          "$ref": "#/$defs/HandoffTarget",
+          "default": {
+            "Exec": {
+              "binary": null
+            }
+          }
         },
         "views": {
           "default": [],
@@ -2435,8 +2443,13 @@
       "type": "object"
     },
     "HandoffReport": {
-      "description": "`node.handoff`'s result.",
+      "description": "`node.handoff`'s result: answered once the sessions are detached; the\nreceiving image then serves them (for `Exec`, `node.status` reports\n`handover.generation` one higher).",
       "properties": {
+        "detail": {
+          "default": "",
+          "description": "A human-readable summary (the old `Upgrade` answer).",
+          "type": "string"
+        },
         "views": {
           "items": {
             "$ref": "#/$defs/HandedOffView"
@@ -2446,6 +2459,72 @@
       },
       "required": [
         "views"
+      ],
+      "type": "object"
+    },
+    "HandoffTarget": {
+      "description": "Where `node.handoff` sends the FUSE sessions (plan 31 §6.11).",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The in-place upgrade of plan 31 C4b (`constellation daemon\n--upgrade`): the daemon `exec`s `binary` (default: the executable it\nwas started from, as it is on disk now) with every session, its\nlock and its control listener inherited, under the same pid. Needs\nno descriptor; every mounted view goes (`views` must be empty) and\nthe handover's own bounded drain applies (`drain_timeout_ms` must be\nabsent).",
+          "properties": {
+            "Exec": {
+              "properties": {
+                "binary": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "Exec"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "Socket",
+          "description": "Drain the sessions of `views` (all when empty), export their handle\ntables and send the session descriptors to the process listening on\nthe unix socket **attached to this request** (fd passing), which\nthen resumes them — plan 37's engine-pod replacement.",
+          "type": "string"
+        }
+      ]
+    },
+    "HandoverStatus": {
+      "description": "Plan 31 C4b: in-place upgrades of this daemon (`node.handoff` with\n[`HandoffTarget::Exec`]).",
+      "properties": {
+        "generation": {
+          "description": "How many handovers this daemon's process has been through (0: the\nimage that started it).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_error": {
+          "default": null,
+          "description": "Why the last attempt did not happen, if it did not.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "upgrading": {
+          "description": "A handover is under way.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "generation",
+        "pid",
+        "upgrading"
       ],
       "type": "object"
     },
@@ -4662,6 +4741,22 @@
       ],
       "type": "object"
     },
+    "SnapshotCreated": {
+      "description": "`snapshot.create`'s result: the new snapshot's record, and the summary\n`constellation snapshot create` prints.",
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/SnapshotStatus"
+        }
+      },
+      "required": [
+        "detail",
+        "snapshot"
+      ],
+      "type": "object"
+    },
     "SnapshotDeleteParams": {
       "description": "`snapshot.delete`.",
       "properties": {
@@ -5317,6 +5412,16 @@
             "stalled_total": 0
           },
           "description": "The FUSE request watchdog (EC2 campaign 7 B-2)."
+        },
+        "handover": {
+          "$ref": "#/$defs/HandoverStatus",
+          "default": {
+            "generation": 0,
+            "last_error": null,
+            "pid": 0,
+            "upgrading": false
+          },
+          "description": "Plan 31 C4b. First, as it was in the retired `crates/api` report:\n`constellation status` prints this struct, field order included."
         },
         "held": {
           "$ref": "#/$defs/HeldStatus",
@@ -6774,7 +6879,7 @@
         "$ref": "#/$defs/SnapshotCreateParams"
       },
       "result": {
-        "$ref": "#/$defs/SnapshotStatus"
+        "$ref": "#/$defs/SnapshotCreated"
       },
       "streaming": "none"
     },

@@ -68,7 +68,8 @@ const ago=ms=>dur(ms,{ago:true});
 const ts=u=>u==null?"—":new Date(u*1000).toISOString().replace("T"," ").replace(/\.\d+Z$/," Z");
 let lastStatus=null, focusId=null;
 
-function parseStatus(r){return r.Status||r.status||(r.resp==="status"?r:r);}
+// GET /api/status answers node.status's report itself.
+function parseStatus(r){return r;}
 function parseHash(){
   const m=location.hash.match(/node[=-]?(\d+)/i)||location.hash.match(/^#(\d+)$/);
   return m?Number(m[1]):null;

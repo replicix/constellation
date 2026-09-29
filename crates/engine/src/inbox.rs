@@ -157,8 +157,8 @@ pub fn status(
     s: &Stats,
     view: &InboxView,
     local_ops: u64,
-) -> constellation_api::InboxStatus {
-    constellation_api::InboxStatus {
+) -> constellation_control::proto::types::InboxStatus {
+    constellation_control::proto::types::InboxStatus {
         enabled,
         submitted_batches: s.inbox_submitted_batches,
         submitted_ops: s.inbox_submitted_ops,

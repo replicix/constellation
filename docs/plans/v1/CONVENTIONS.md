@@ -30,11 +30,14 @@ before starting any plan. Every plan file assumes you did.
 - `docs/how-to-guides/development/TESTING.md` — the test lanes and the fault-injection harness.
 - Crates: `fs-core` (chunking, manifests, disk cache), `store-s3`
   (S3 layout/chunk store/log store/nodes/lease), `meta` (fjall
-  replica, log records, convergent replay), `api` (control API types +
-  unix-socket server), `engine` (every storage algorithm: the authority
+  replica, log records, convergent replay), `control` (the control protocol:
+  framing, the typed method table, authz, audit, transports, client, the
+  `web` HTTP adapter and embedded UI — plan 31 C5; it replaced `api`),
+  `engine` (every storage algorithm: the authority
   driver and shipper, leases, coop, GC, snapshots, epochs, cluster
-  locks, uploads, prefetch — plan 31 C3; and the mounted `View`,
-  `engine/src/view/` — C4), `vfs` (the frontend contract: the `Vfs`
+  locks, uploads, prefetch — plan 31 C3; the mounted `View`,
+  `engine/src/view/` — C4; and the control service binding the
+  protocol's method table, `engine/src/control/` — C5), `vfs` (the frontend contract: the `Vfs`
   trait, `OpCtx`/`Responder`, `FrontendEvents`, `FrontendCaps`, the
   name/xattr/identity policies, the `OpWatch` request watchdog — plan 31
   C4), `frontend-fuse` (the Linux FUSE frontend over `Vfs`, the only

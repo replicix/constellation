@@ -28452,3 +28452,187 @@ with the lock-fence discard); `setattr`/`ftruncate` on an orphan apply to
 its own record without journaling (`Meta::orphan_setattr`). Nothing of an
 unlinked file is ever published. Unit test:
 `view::vfs_tests::an_unlinked_open_file_keeps_working_until_its_last_close`.
+
+## Plan 31 C5 — `constellation-control` replaces `crates/api`
+
+Milestone C5 of [plan 31](wip/31-core-frontend-backend.md) (§9), second
+half (C5b; C5a built `constellation-control` itself): the daemon, the CLI,
+the harness and the web UI speak the control protocol, every method of its
+table is bound to the engine, and `crates/api` — the line-JSON
+`Request`/`Response`, `StatusSource`, `dispatch`, `serve` — is deleted from
+the workspace with no shim (§9.6). Plan 32 is not in this tree, so there
+was nothing of it to port.
+
+| Item | State | Where |
+|---|---|---|
+| `EngineControl` (the engine's control service) + `ControlHost` (what only a host can do: mounts, handoff, detach-all, lifecycle); `control::router`/`register` bind **all 57** methods; the 37 old `StatusSource` bodies moved from the daemon unchanged (`service.rs`), run on blocking threads | DONE | `crates/engine/src/control/{mod,service}.rs` |
+| `ControlVfs`: `browse.stat/read/write/mkdir/rename/delete/xattr` through a `Vfs` view the service opens for itself, as the calling principal (`Caller` from `SO_PEERCRED`; in-process/web: the daemon's own uid) | DONE | `crates/engine/src/control/browse.rs` |
+| `fs.list/create/import/export/passwd/doctor/unlock` (registry + backend); `fs.create` idempotent by `(bucket, prefix)`, differing parameters → `Conflict`/`EEXIST` with the differences in `details`; `fs.unlock` → `CredentialSource::Static` over an `EphemeralSecretStore` (memory only), rotating the running engine's store in place when it names this engine's filesystem and the engine runs from a static source (`Engine::credentials`) | DONE | `crates/engine/src/control/fs.rs`, `crates/engine/src/node.rs` |
+| Streams: `node.logs.tail` (chunks, `follow` via `LogBuffer::since`), `browse.read` (chunks, bounded hand-off), `stats.subscribe` (samples of `/metrics`'s series from `node.status`), `events.subscribe` (a watcher started with the first subscriber publishes `view.mounted/unmounted`, `lease.acquired/lost`, `peer.connected/disconnected`; `events.lagged` for a slow subscriber) | DONE | `crates/engine/src/control/streams.rs`, `crates/engine/src/log_buffer.rs` |
+| Daemon: `DaemonHost` (FUSE mounts incl. `view.mount{PreopenedFd}` → `NodeRuntime::add_mount_fd` → frontend-fuse `MountSource::PreopenedFd`; `node.handoff{Exec}` → C4b's `handover::upgrade`), `daemon_router` (policy + audit), socket bound in the runtime dir and recorded in `control.path`, listener still handed over across `exec` (`UnixSocketListener::{from_std, try_clone_std}`) | DONE | `crates/cli/src/{control,node_runtime,handover}.rs`, `crates/control/src/transport/unix.rs` |
+| CLI: every subcommand that talks to a daemon uses `constellation_control::Client` (typed `call::<M>`), output unchanged (`status` prints the same `StatusReport` JSON, `handover` first as before); `daemon --upgrade` → `node.handoff`; attach, `umount`, `export`, `fs list`, gc/fsck routing, liveness ping (`daemon_lock`) through `control.path` | DONE | `crates/cli/src/main.rs`, `crates/cli/src/daemon_lock.rs` |
+| Harness: `Client::control_call`/`control(method, params)` over the real client; every `control_*` helper kept (`control_status` now returns the report itself); `mute-daemon` binds where a daemon would and records `control.path`; `web-ui-smoke` on the new HTTP shape | DONE | `crates/harness/src/{client,main,scenarios}.rs`, `crates/harness/src/scenarios/{m4,m10,m11,rejoin}.rs` |
+| Web adapter moved to `constellation_control::web` (feature `web`): `POST /api {method, params}`, `GET /api/status`, `/api/download` (streamed), `/metrics`, embedded `webui/` (JS updated to the new shape), DNS-rebinding guard; all through `dispatch_in_process` | DONE | `crates/control/src/web.rs`, `crates/control/webui/` |
+| Protocol types: `StatusReport.handover`/`HandoverStatus`; `HandoffParams.target: HandoffTarget { Exec{binary}, Socket }` (fd only for `Socket`), `HandoffReport.detail`; `SnapshotCreated { detail, snapshot }` for `snapshot.create`; schema re-blessed | DONE | `crates/control/src/proto/types.rs`, `crates/control/src/methods.rs`, `crates/control/schema/control.schema.json` |
+| Socket discovery helpers (`instance_for_state_dir`, `socket_path_for_state_dir`, `record_socket`/`locate_socket`/`forget_socket`, `LOCATOR_FILE`) | DONE | `crates/control/src/transport/path.rs` |
+| The C5 gate: unix-socket ↔ HTTP parity over the whole table against a real engine | DONE | `crates/engine/src/control/parity_tests.rs` |
+| `crates/api` deleted; fuzz target `api_request` → `control_request` (the control envelopes, JSON and postcard); `tools/check-cross-known-failures.txt`: the `constellation-api` line gone, `constellation-control` clean for Windows | DONE | `Cargo.toml`, `fuzz/`, `tools/check-cross-known-failures.txt` |
+
+### The method table
+
+All 57 methods are registered. The 37 old `Request` variants map per §9.2
+(`ListSnapshots` collapsed into `snapshot.list`) and keep their semantics:
+same refusal texts (now a `Failed` `ControlError`'s `message`), same waits.
+
+| Method | State |
+|---|---|
+| `node.ping/status/reintegrate/leave/set_write_mode/doctor`, `node.logs.tail` (chunks; `follow` new) | implemented (old semantics) |
+| `pin.add/remove/list`, `designation.offline/online/list/delegate/undelegate/list_delegations` | implemented (old semantics; `designation.list_delegations` now prints JSON in the CLI — it used to bail "unexpected response") |
+| `prune.run/list`, `gc.run`, `fsck.run`, `snapshot.create/list/delete/refs`, `clone.create` | implemented (old semantics); `snapshot.create{hold}` → `Unsupported` (plan 32) |
+| `browse.readdir/inspect` | implemented (old semantics: the replica, with the manifest summary) |
+| `browse.stat/read/write/mkdir/rename/delete/xattr` | implemented (new, `ControlVfs`) |
+| `locks.force_release/drop_held`, `cache.list/prune`, `quota.set/get` | implemented (old semantics) |
+| `view.mount` (`Path` as before; `PreopenedFd` with the fd over SCM_RIGHTS), `view.unmount`, `view.list` (label filter), `view.stats` | implemented |
+| `node.ops` | implemented; the `view` filter → `Unsupported` (the watchdog does not attribute ops to views before C7) |
+| `node.handoff` | `Exec` implemented (C4b's in-place upgrade, socket only; HTTP refuses); `Socket` → `Unsupported` (plan 37's second-process handover) |
+| `node.lifecycle` | `Unsupported` with a remediation until C8 (no lifecycle profiles to apply events to) |
+| `peers.list`, `stats.subscribe`, `events.subscribe` | implemented |
+| `fs.list/create/import/export/passwd/doctor/unlock` | implemented; `fs.create` with an explicit `endpoint`/`region` → `Unsupported` (resolved from the daemon's environment, as every backend URL is) |
+
+### Socket path design
+
+One daemon per state dir, several per host: the socket is
+`<runtime_dir>/<instance>.sock`, `runtime_dir` = `$XDG_RUNTIME_DIR/constellation`
+(macOS `$TMPDIR`, fallback `/tmp/constellation-<uid>`, created 0700 and
+refused if someone else owns it), `instance` = up to 8 readable characters
+of the state dir's name + `-` + 16 hex digits of BLAKE3 of its canonical
+path (≤ 25 bytes, inside `RUNTIME_NAME_BUDGET`, so the path fits
+`sun_path`'s 104 bytes). Clients never re-derive it — a CLI or harness
+with another environment would compute another runtime dir: the daemon
+writes the path, atomically, into `<state_dir>/control.path` after binding,
+and every client reads it (`locate_socket`). A stale locator (crashed
+daemon) reads as "not running" at connect time, as a stale `control.sock`
+did; a clean exit and a takeover remove socket and locator
+(`forget_socket`). No compat symlink or file at `<state_dir>/control.sock`.
+
+### Authorization and audit defaults
+
+The daemon's owner (effective uid) is admin; the in-process caller is admin;
+everyone else is denied — unknown method names included — unless
+`$CONSTELLATION_CONTROL_POLICY` or `<config dir>/control-allow.toml` grants a
+uid or group a role (`Policy::load`; an unreadable file logs an error and
+falls back to owner-only, never wider). The socket and its directory are
+owner-only (0600/0700), so a grant for another user also needs the
+deployment to widen them. Mutating calls are audited to
+`<state_dir>/control-audit.jsonl` (params digest only; withheld for secret
+params). The web adapter still has no authentication (plan 33 adds it):
+loopback bind + DNS-rebinding guard, every call as `Principal::InProcess`
+(the full access it always had), except `node.handoff`, refused over HTTP.
+
+### The parity test (the C5 gate)
+
+`constellation_engine::control::parity_tests::unix_socket_and_http_dispatch_the_whole_table_identically`:
+a real `Engine` (local backend, P2P off), a fixture host whose "mounts" are
+views opened in the engine, one `EngineControl`. For each role (none,
+viewer, operator, admin) the same router is served on a real unix socket
+(this process's uid granted the role through `SO_PEERCRED`) and through the
+HTTP adapter in-process (`web::app_as`, a principal granted the same role),
+and **every method in `METHODS`** (57 × 4 = 228 pairs, streams included) is
+called through both with parameters chosen so a second identical call
+answers like the first. Asserted: `Denied` exactly below the method's
+minimum role, on both; the same outcome (`Ok`, or the same `ErrorKind` and
+`Code`, with the HTTP status matching the kind); for read-only methods the
+same result (clocks stripped; `node.status` compared on identity and
+shape; streams: `node.logs.tail`/`browse.read` bytes, the first
+`stats.subscribe` sample's series); 30 admin calls must succeed (so real
+results are compared, not only matching refusals); `locks.force_release`
+(state-changing by nature) compared on authorization only; `node.handoff`
+refused over HTTP, never over the socket. The control crate's own
+`the_whole_table_is_role_enforced_identically_over_socket_and_dispatch`
+still covers socket ↔ in-process dispatch.
+
+### Spec note
+
+`docs/explanation/DESIGN.md` §10 still describes the old control plane
+(line-JSON over `<state_dir>/control.sock`, an unauthenticated localhost
+API). It is now the old protocol's description; the control protocol is
+plan 31 §9 and the table above. Not edited, per CONVENTIONS.
+
+### Exit criteria
+
+- [x] `crates/api` deleted from the workspace; no shim, no compat socket
+- [x] all 37 old methods have their control-protocol method, implemented
+- [x] `fs.unlock`, `view.stats`, `node.handoff` (Exec) and fd passing
+      (`view.mount{PreopenedFd}`) work; the rest of the new methods
+      implemented or `Unsupported` as listed
+- [x] unix ↔ HTTP parity test over the full table passes
+- [x] CLI, harness and web UI moved to the new protocol; `status` output
+      unchanged
+- [x] `make check-cross` exits 0 (`constellation-control` clean for Windows)
+- [x] fmt, clippy `-D warnings`, lib tests of control/cli/engine/harness,
+      `tests/smoke.sh`, selected control-heavy harness scenarios (see the
+      report)
+
+### Gate results (C5b)
+
+`cargo build --workspace`, `cargo fmt --all -- --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`: clean. Tests: control 130/130
+(`--features web`), engine `--lib` 302 passed/2 ignored (incl. the parity
+test), harness `--lib` 37/37, cli bins 24/24 (incl. the FUSE-backed
+`two_views_…_pin_is_view_agnostic` and `umount_of_a_non_last_view…`, both
+over the new socket and typed client). `make check-cross`: exit 0
+(`x86_64-pc-windows-gnu constellation-control ok`; the engine's Windows
+failure is `staging.rs` only). `bash tests/smoke.sh`: SMOKE TEST PASSED.
+Harness (debug binary, docker S3): `web-ui-smoke`, `named-shared-daemon`,
+`fsck-while-mounted`, `snapshot-lifecycle`, `clone-workflow`,
+`quota-enforcement`, `prune`, `poison-record-isolation`,
+`stale-daemon-lock`, `session-handover-idle`, `gc-lifecycle`,
+`designation-as-delegation`, `node-leave`, `snapshot-mount`: PASSED.
+`stale-daemon-lock` fails only when `RUST_BACKTRACE=1` is exported to the
+mounts (anyhow then appends a backtrace and the scenario's 15-line log tail
+no longer holds the refusal text; environment, not behaviour).
+`unmount-with-held-records` is intermittent here (2 of 5 runs passed): on
+failure the remount's `create` under the S3 cut waits out the 120 s client
+bound after its lease renewal fails — the authority/data path, not the
+control surface (its control calls, `node.status`/`locks.drop_held`,
+answered in every run); the tree it ran on also carried the concurrent C4
+follow-up's uncommitted meta/authority/view edits. Not a full-matrix run.
+
+**Real-mount check** (debug binary, local file backend, a python-ctypes
+`renameat2` caller): `NOREPLACE` onto an existing name → `EEXIST` (both
+files intact), onto a free name → moved; `EXCHANGE` of two files →
+swapped contents; `EXCHANGE` of `d1/x` (file) with `d2/sub` (directory) →
+swapped, `nlink` d1 3 / d2 2; `EXCHANGE` with a missing name → `ENOENT`;
+`WHITEOUT` → `EINVAL`, and `FUSE_RENAME2` still works afterwards
+(`NOREPLACE` → `EEXIST`, so the kernel did not disable it). A remount on a
+fresh state dir (bootstrapped from the backend) shows the swapped state.
+The unlinked-open-file repro passes every step (`write`, `fsync`,
+`fdatasync`, `ftruncate`, `close`, dup'd `close`).
+
+**Pre-existing flakes seen while testing (not from this change — each
+fails identically with it reverted):** `meta` `tests/completion_ownership`
+and four `tests/speculation` tests (the root directory's mtime/ctime
+differ by a few ns between the replicas compared) fail intermittently
+under CPU load and pass unloaded; `authority` sim
+`a_panicking_node_fails_the_seed_promptly` (a 20 s wall-clock bound)
+failed only while other suites ran alongside.
+
+### Plan 31 C4 follow-ups exit criteria
+
+- [x] `RENAME_NOREPLACE` atomic where the rename commits (local and
+  forwarded); `RENAME_EXCHANGE` implemented in meta + replay + authority
+  path with tests; `WHITEOUT` → `EINVAL`; `Declared::rename_flags: true`
+- [x] `crates/engine/tests/conformance.rs`: 72 passed / 0 failed / 9
+  skipped; nightly `conformance` job runs it
+- [x] Unlinked-open-file bug triaged (pre-existing, not plan 31), fixed,
+  unit-tested, checked on a real mount
+- [x] `cargo build --workspace`; clippy `-D warnings` and `cargo fmt` on
+  meta/authority/vfs/engine/frontend-fuse; `cargo test` of
+  `constellation-engine` (lib 302, conformance), `-meta` lib, `-authority`
+  lib + `meta_repro`, `-vfs --features conformance`, frontend-fuse
+  `wire` (20)
+- [x] Harness `scratch-publish`, `subtree-confinement`,
+  `gc-open-orphan-hold`, `stale-base-rename-divergence`,
+  `cross-subtree-rename`, `fuse-inval-storm`: PASSED (debug binary)
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798) — run by the coordinator at the end

@@ -189,12 +189,12 @@ impl PinManager {
     }
 
     /// Per-pin status for the control API.
-    pub async fn status(&self) -> Vec<constellation_api::PinStatus> {
+    pub async fn status(&self) -> Vec<constellation_control::proto::types::PinStatus> {
         let mut out = Vec::new();
         for (path, ino) in self.meta.pins().unwrap_or_default() {
             let fp = self.footprint(ino).await.unwrap_or_default();
             let cached = fp.chunks.iter().filter(|h| self.cache.contains(h)).count();
-            out.push(constellation_api::PinStatus {
+            out.push(constellation_control::proto::types::PinStatus {
                 path,
                 bytes: fp.bytes,
                 chunks_cached: cached as u64,

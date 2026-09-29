@@ -237,10 +237,10 @@ impl EpochManager {
         f == 0 || self.claim.lock().unwrap().advertised_slack == Some(f)
     }
 
-    pub fn status(&self) -> constellation_api::EpochStatus {
+    pub fn status(&self) -> constellation_control::proto::types::EpochStatus {
         let m = self.machine.lock().unwrap();
         let (active, epoch_id, members) = m.status();
-        constellation_api::EpochStatus {
+        constellation_control::proto::types::EpochStatus {
             active,
             epoch_id,
             members,

@@ -8,6 +8,47 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A control call on the daemon of `state_dir` (see [`Client::control_call`]).
+pub fn control_call_at(
+    state_dir: &Path,
+    method: &str,
+    params: serde_json::Value,
+    within: Duration,
+) -> Result<serde_json::Value> {
+    let sock = constellation_control::transport::locate_socket(state_dir).with_context(|| {
+        format!(
+            "no daemon has recorded a control socket in {}",
+            state_dir.display()
+        )
+    })?;
+    control_runtime().block_on(async {
+        let call = async {
+            let client = constellation_control::Client::connect_unix(&sock).await?;
+            client.call_json(method, params).await
+        };
+        match tokio::time::timeout(within, call).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(anyhow::anyhow!("{method}: {}", e.message)),
+            Err(_) => bail!(
+                "{method}: no answer from {} within {within:?}",
+                sock.display()
+            ),
+        }
+    })
+}
+
+/// The runtime every control call of the (synchronous) harness runs on.
+fn control_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the harness's control runtime")
+    })
+}
+
 /// How long `mount_view` polls for the mountpoint to appear, and `unmount`/
 /// `leave` poll for the daemon to exit, before giving up. Both loops return
 /// as soon as the condition is met, so a generous ceiling costs nothing for
@@ -473,22 +514,14 @@ impl Client {
     /// duplicates that FUSE fd and exec's close-on-exec sends the frozen
     /// daemon a `flush` the child then waits on, uninterruptibly.
     pub fn gc_run_control(&self) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(300)))?;
-        stream.write_all(b"{\"cmd\":\"gc_run\",\"verify_only\":false}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "gc_report",
-            "gc run failed: {resp}; log:\n{}",
-            self.tail_log_n(60)
-        );
-        Ok(resp["report"].clone())
+        let result = self
+            .control_call(
+                "gc.run",
+                serde_json::json!({"verify_only": false}),
+                Duration::from_secs(300),
+            )
+            .map_err(|e| anyhow::anyhow!("gc run failed: {e:#}; log:\n{}", self.tail_log_n(60)))?;
+        Ok(result["report"].clone())
     }
 
     pub fn fsck(&self, repair: bool) -> Result<std::process::Output> {
@@ -734,126 +767,74 @@ impl Client {
         &self.state
     }
 
-    /// Send one raw control-API request (a JSON object) and return the
-    /// response.
-    pub fn control(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-        let mut line = serde_json::to_string(request)?;
-        line.push('\n');
-        stream.write_all(line.as_bytes())?;
-        let mut reply = String::new();
-        BufReader::new(stream).read_line(&mut reply)?;
-        Ok(serde_json::from_str(&reply)?)
+    /// Call one control method (plan 31 C5) on this client's daemon, found
+    /// through its state dir's `control.path`, with raw JSON params; the
+    /// method's result, or the daemon's refusal as the error (its message).
+    pub fn control_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        within: Duration,
+    ) -> Result<serde_json::Value> {
+        control_call_at(&self.state, method, params, within)
     }
 
+    /// [`Self::control_call`] with the default 60 s bound.
+    pub fn control(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        self.control_call(method, params, Duration::from_secs(60))
+    }
+
+    /// `node.status`: the status report.
     pub fn control_status(&self) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.write_all(b"{\"cmd\":\"status\"}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "status",
-            "unexpected control response: {resp}"
-        );
-        Ok(resp)
+        self.control_call(
+            "node.status",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
     }
 
     /// Trigger one prune pass via the control socket (plan 22).
     pub fn prune_run(&self, dry_run: bool) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        let req = format!("{{\"cmd\":\"prune_run\",\"path\":null,\"dry_run\":{dry_run}}}\n");
-        stream.write_all(req.as_bytes())?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "ok",
-            "prune run failed: {resp}; log:\n{}",
-            self.tail_log_n(80)
-        );
-        Ok(resp)
+        self.control_call(
+            "prune.run",
+            serde_json::json!({"path": null, "dry_run": dry_run}),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| anyhow::anyhow!("prune run failed: {e:#}; log:\n{}", self.tail_log_n(80)))
     }
 
     pub fn reintegrate(&self) -> Result<()> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.write_all(b"{\"cmd\":\"reintegrate\"}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "ok",
-            "reintegration failed: {resp}; log:\n{}",
-            self.tail_log_n(80)
-        );
+        self.control_call(
+            "node.reintegrate",
+            serde_json::json!({}),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("reintegration failed: {e:#}; log:\n{}", self.tail_log_n(80))
+        })?;
         Ok(())
     }
 
     pub fn set_write_mode(&self, mode: &str) -> Result<()> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-        writeln!(stream, "{{\"cmd\":\"set_write_mode\",\"mode\":\"{mode}\"}}")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let response: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            response["resp"] == "ok",
-            "write-mode switch failed: {response}"
-        );
+        self.control("node.set_write_mode", serde_json::json!({"mode": mode}))
+            .context("write-mode switch failed")?;
         Ok(())
     }
 
     pub fn set_quota(&self, max_bytes: Option<u64>) -> Result<()> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-        let body = match max_bytes {
-            Some(n) => format!(r#"{{"cmd":"set_quota","max_bytes":{n}}}"#),
-            None => r#"{"cmd":"set_quota","max_bytes":null}"#.to_string(),
-        };
-        writeln!(stream, "{body}")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let response: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(response["resp"] == "ok", "set_quota failed: {response}");
+        self.control("quota.set", serde_json::json!({"max_bytes": max_bytes}))
+            .context("set_quota failed")?;
         Ok(())
     }
 
     pub fn get_quota(&self) -> Result<(Option<u64>, u64)> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.write_all(b"{\"cmd\":\"get_quota\"}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let response: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(response["resp"] == "quota", "get_quota failed: {response}");
-        let max = response["max_bytes"].as_u64();
-        let used = response["used_bytes"].as_u64().unwrap_or(0);
-        Ok((max, used))
+        let q = self
+            .control_call("quota.get", serde_json::json!({}), Duration::from_secs(10))
+            .context("get_quota failed")?;
+        Ok((
+            q["max_bytes"].as_u64(),
+            q["used_bytes"].as_u64().unwrap_or(0),
+        ))
     }
 
     /// Permanently leave the cluster (self), or admin-retire `node_id`.

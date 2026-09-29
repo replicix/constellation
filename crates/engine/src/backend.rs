@@ -320,9 +320,9 @@ pub fn last_s3_completion_ms() -> i64 {
 }
 
 /// The counts so far (`status.s3`).
-pub fn s3_request_counts() -> constellation_api::S3RequestStatus {
+pub fn s3_request_counts() -> constellation_control::proto::types::S3RequestStatus {
     let c = counts();
-    constellation_api::S3RequestStatus {
+    constellation_control::proto::types::S3RequestStatus {
         get: c.get.load(Ordering::Relaxed),
         head: c.head.load(Ordering::Relaxed),
         put: c.put.load(Ordering::Relaxed),

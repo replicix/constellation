@@ -224,24 +224,17 @@ pub(super) fn dump_logs_on_failure(scenario: &str, clients: &[Client], result: &
 /// `constellation delegate <path> --to <node>` through the root's
 /// control socket.
 pub(super) fn delegate(root: &Client, path: &str, node: u64) -> Result<serde_json::Value> {
-    let resp = root.control(&serde_json::json!({"cmd": "delegate", "path": path, "node": node}))?;
-    anyhow::ensure!(
-        resp["resp"] == "ok",
-        "delegating {path} to {node} on {}: {resp}",
-        root.name
-    );
-    Ok(resp)
+    root.control(
+        "designation.delegate",
+        serde_json::json!({"path": path, "node": node}),
+    )
+    .with_context(|| format!("delegating {path} to {node} on {}", root.name))
 }
 
 /// `constellation undelegate <path>`.
 pub(super) fn undelegate(root: &Client, path: &str) -> Result<serde_json::Value> {
-    let resp = root.control(&serde_json::json!({"cmd": "undelegate", "path": path}))?;
-    anyhow::ensure!(
-        resp["resp"] == "ok",
-        "undelegating {path} on {}: {resp}",
-        root.name
-    );
-    Ok(resp)
+    root.control("designation.undelegate", serde_json::json!({"path": path}))
+        .with_context(|| format!("undelegating {path} on {}", root.name))
 }
 
 /// Wait until `delegate` holds a live (not stopped) grant on `dir`, the
@@ -1152,13 +1145,12 @@ pub fn p2p_off_no_delegation(_seed: u64) -> Result<()> {
         let da = deleg_of(a)?;
         print_deleg(NAME, "a", &da);
         anyhow::ensure!(da["enabled"] == false, "delegation on without P2P: {da}");
-        let resp =
-            a.control(&serde_json::json!({"cmd": "delegate", "path": "/d1", "node": b_id}))?;
-        eprintln!("    {NAME}: delegate /d1 -> {b_id} with P2P off: {resp}");
-        anyhow::ensure!(
-            resp["resp"] != "ok",
-            "delegation accepted with P2P off: {resp}"
+        let resp = a.control(
+            "designation.delegate",
+            serde_json::json!({"path": "/d1", "node": b_id}),
         );
+        eprintln!("    {NAME}: delegate /d1 -> {b_id} with P2P off: {resp:?}");
+        anyhow::ensure!(resp.is_err(), "delegation accepted with P2P off: {resp:?}");
         let (names_a, lat_a) = write_files(a, "d1", "a", 20)?;
         eventually("d1 visible on b", Duration::from_secs(30), || {
             anyhow::ensure!(b.mnt.join("d1").is_dir());
@@ -1608,8 +1600,8 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
                 Ok(())
             })?;
         }
-        let resp = b.control(&serde_json::json!({"cmd": "offline", "path": "/site"}))?;
-        anyhow::ensure!(resp["resp"] == "ok", "offline: {resp}");
+        b.control("designation.offline", serde_json::json!({"path": "/site"}))
+            .context("offline")?;
         // The root's designation poll (10 s) syncs the table.
         let t = Instant::now();
         eventually(
@@ -1704,8 +1696,8 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
             all_visible(x, &all, Duration::from_secs(90))?;
         }
         // online: the table entry goes; c's writes through the root.
-        let resp = b.control(&serde_json::json!({"cmd": "online", "path": "/site"}))?;
-        anyhow::ensure!(resp["resp"] == "ok", "online: {resp}");
+        b.control("designation.online", serde_json::json!({"path": "/site"}))
+            .context("online")?;
         eventually(
             "the designation is recalled",
             Duration::from_secs(40),
@@ -1742,15 +1734,16 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
 
 /// `constellation delegate <path> --to <node> --range <idx>/<count>`.
 fn delegate_range(root: &Client, path: &str, node: u64, range: &str) -> Result<serde_json::Value> {
-    let resp = root.control(
-        &serde_json::json!({"cmd": "delegate", "path": path, "node": node, "range": range}),
-    )?;
-    anyhow::ensure!(
-        resp["resp"] == "ok",
-        "delegating range {range} of {path} to {node} on {}: {resp}",
-        root.name
-    );
-    Ok(resp)
+    root.control(
+        "designation.delegate",
+        serde_json::json!({"path": path, "node": node, "range": range}),
+    )
+    .with_context(|| {
+        format!(
+            "delegating range {range} of {path} to {node} on {}",
+            root.name
+        )
+    })
 }
 
 /// Wait until `delegate` holds a live grant on range `range` of `path`.

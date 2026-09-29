@@ -8,9 +8,10 @@
 //! `add_mount` opens a view of it (`Engine::open_view`) and mounts it
 //! through `constellation-frontend-fuse` on a dedicated OS thread. What
 //! stays here is what a host owns: the control socket and web UI (built
-//! lazily, the first time a view is added, since `DaemonStatus` reports
-//! mountpoints), the FUSE sessions and their threads, the mount records
-//! a takeover reads (`daemon_lock`), `control.sock`/`daemon.pid`, and
+//! lazily, the first time a view is added, since the control service
+//! reports the first view's readahead — `crate::control`), the FUSE sessions and their threads, the mount records
+//! a takeover reads (`daemon_lock`), the control socket's locator
+//! (`control.path`)/`daemon.pid`, and
 //! signals.
 //!
 //! `remove_mount` unmounts exactly the requested view (via its
@@ -43,7 +44,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::log_buffer;
-use constellation_vfs::OpWatch;
 
 /// Detach a stale FUSE mount left behind by a previous daemon that exited
 /// without unmounting (crash, `kill`, or an orphaned view). Such a
@@ -119,6 +119,9 @@ pub struct ViewConfig {
     pub ephemeral: bool,
     /// `--confine-links` (plan 31 §6.12).
     pub confine_links: bool,
+    /// Plan 31 §9.10 (`view.mount`): labels and per-view admission limits.
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub qos: constellation_engine::ViewQos,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,6 +139,9 @@ pub struct MountInfo {
     pub subtree: String,
     pub mountpoint: PathBuf,
     pub since: Instant,
+    pub view: Arc<View>,
+    pub qos: constellation_engine::ViewQos,
+    pub confine_links: bool,
 }
 
 pub(crate) struct MountHandle {
@@ -152,6 +158,8 @@ pub(crate) struct MountHandle {
     pub(crate) sink: constellation_frontend_fuse::FuseNotifySink,
     pub(crate) caps: constellation_vfs::FrontendCaps,
     pub(crate) view: Arc<View>,
+    pub(crate) qos: constellation_engine::ViewQos,
+    pub(crate) confine_links: bool,
 }
 
 pub struct NodeRuntime {
@@ -164,7 +172,7 @@ pub struct NodeRuntime {
     web_ui: u16,
     log_buffer: log_buffer::LogBuffer,
     /// Built lazily, the first time a view is added (see module docs).
-    status: Mutex<Option<Arc<crate::DaemonStatus>>>,
+    status: Mutex<Option<Arc<constellation_engine::control::EngineControl>>>,
     pub(crate) mounts: Mutex<HashMap<MountId, MountHandle>>,
     /// Session-thread handles, kept separate from `mounts` so a thread's
     /// own teardown (which removes its `mounts` entry) never races
@@ -184,17 +192,6 @@ impl NodeRuntime {
     /// This daemon's node.
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
-    }
-
-    /// Plan 30 §M8: this node's mounts are `--cto strict`.
-    pub fn cto_strict(&self) -> bool {
-        self.engine.cto_strict()
-    }
-
-    /// The request watchdog every view's ops register with (`status`'s
-    /// `fuse_requests`).
-    pub fn op_watch(&self) -> &OpWatch {
-        self.engine.op_watch()
     }
 
     /// Start the daemon's node: an `EngineHost` on `rt` whose budget is
@@ -296,6 +293,27 @@ impl NodeRuntime {
     /// thread runs until the view is unmounted (via `remove_mount`, an
     /// external `fusermount -u`, or process shutdown).
     pub fn add_mount(self: &Arc<Self>, view: ViewConfig) -> Result<MountId> {
+        self.add_mount_from(view, None)
+    }
+
+    /// [`Self::add_mount`] on a `/dev/fuse` descriptor someone else mounted
+    /// (`view.mount` with `MountSource::PreopenedFd`, plan 31 §6.11): the
+    /// session starts with `FUSE_INIT` on `fd`; the view is known by
+    /// `fd:<n>` in place of a mountpoint.
+    pub fn add_mount_fd(
+        self: &Arc<Self>,
+        mut view: ViewConfig,
+        fd: std::os::fd::OwnedFd,
+    ) -> Result<MountId> {
+        view.mountpoint = PathBuf::from(format!("fd:{}", std::os::fd::AsRawFd::as_raw_fd(&fd)));
+        self.add_mount_from(view, Some(fd))
+    }
+
+    fn add_mount_from(
+        self: &Arc<Self>,
+        view: ViewConfig,
+        preopened: Option<std::os::fd::OwnedFd>,
+    ) -> Result<MountId> {
         // Plan 31 C4b: a view added now would not be handed over (the
         // node is being shut down for the next image): the attaching
         // `mount` retries on this message, and the next image takes it.
@@ -322,6 +340,8 @@ impl NodeRuntime {
             clone_name,
             ephemeral,
             confine_links,
+            labels,
+            qos,
         } = view;
         let spec = ViewSpec {
             root: inner_path.clone(),
@@ -329,7 +349,8 @@ impl NodeRuntime {
             clone_name,
             ephemeral,
             confine_links,
-            ..ViewSpec::default()
+            labels,
+            qos,
         };
         // What the FUSE frontend declares for this view: it forwards
         // POSIX/`flock` locks under `--locks cluster`, except on a frozen
@@ -352,7 +373,9 @@ impl NodeRuntime {
         // `ENOTCONN`; a fresh `Session::new` on it fails with the same
         // "Transport endpoint is not connected". Lazily detach it first so
         // the remount just works instead of surfacing os error 107.
-        clear_stale_mount(&self.host, &mountpoint);
+        if preopened.is_none() {
+            clear_stale_mount(&self.host, &mountpoint);
+        }
         let engine = &self.engine;
         tracing::info!(?mountpoint, state_dir = ?engine.state_dir(), fs = %engine.fsmeta().uuid, "mounting");
         let mount_options = constellation_frontend_fuse::MountOptions {
@@ -370,9 +393,13 @@ impl NodeRuntime {
         // inside this process (its `FuseUnmounter`); without it, an
         // external kill leaves a dead mountpoint that needs `fusermount3
         // -u`.
-        let session = match constellation_frontend_fuse::mount(
+        let source = match preopened {
+            Some(fd) => constellation_frontend_fuse::MountSource::PreopenedFd(fd),
+            None => mount_options.source(&mountpoint),
+        };
+        let session = match constellation_frontend_fuse::mount_source(
             fs.clone(),
-            &mountpoint,
+            source,
             &mount_options,
             caps.clone(),
         ) {
@@ -396,6 +423,8 @@ impl NodeRuntime {
                 fuse_threads,
                 sink,
                 caps,
+                qos,
+                confine_links,
             },
         ))
     }
@@ -417,6 +446,8 @@ impl NodeRuntime {
             fuse_threads,
             sink,
             caps,
+            qos,
+            confine_links,
         } = info;
         let unmounter = session.unmounter();
         let control = session.control();
@@ -443,6 +474,8 @@ impl NodeRuntime {
                 sink,
                 caps,
                 view: fs.clone(),
+                qos,
+                confine_links,
             },
         );
 
@@ -484,60 +517,56 @@ impl NodeRuntime {
             return;
         }
         let e = &self.engine;
-        let status = Arc::new(crate::DaemonStatus {
-            meta: e.meta().clone(),
-            cache: e.cache().clone(),
-            staging_budget: e.staging_budget().clone(),
-            core: e.core_status().clone(),
-            lease: e.lease().clone(),
-            fs_uuid: e.fsmeta().uuid.to_string(),
-            backend: e.backend_url().to_string(),
-            node: self.clone(),
-            node_id: e.node_id(),
-            started: e.started(),
-            peers: e.peers().clone(),
-            pins: e.pins().clone(),
-            designations: e.designations().clone(),
-            epochs: e.epochs().clone(),
-            reintegration: e.reintegration().clone(),
-            sync_tx: e.sync_tx().clone(),
-            store: e.store().inner().clone(),
-            departed: e.departed().clone(),
-            rt: e.runtime().clone(),
-            coop: e.coop().clone(),
-            prefetch_stats: first.prefetch_stats(),
-            write_mode: e.write_mode().clone(),
-            upload: e.upload().clone(),
-            snapshots: e.snapshots().clone(),
-            log_buffer: self.log_buffer.clone(),
-            forward: e.forward().clone(),
-            placement: e.placement().clone(),
-            atime: e.atime().clone(),
-            prune_stats: e.prune_stats().clone(),
-            lease_mode: e.lease_mode(),
-            read_only_member: e.read_only_member(),
-            last_sync_ms: e.last_sync_ms().clone(),
-            state_dir: e.state_dir().to_path_buf(),
-            compression: e.compression(),
+        let host = Arc::new(crate::control::DaemonHost {
+            node: Arc::downgrade(self),
         });
+        let status = constellation_engine::control::EngineControl::new(
+            e.clone(),
+            host,
+            self.log_buffer.clone(),
+            first.prefetch_stats(),
+            env!("CONSTELLATION_VERSION"),
+        );
         *status_guard = Some(status.clone());
         drop(status_guard);
+        let router = Arc::new(crate::control::daemon_router(&status, e.state_dir()));
         let _guard = e.runtime().enter();
-        // Bound here (not by `constellation_api::serve`) so that a handover
+        // Bound here (not by a `serve` that binds for us) so that a handover
         // can pass the very listener on (`crate::handover`): clients that
-        // connect during it wait in the backlog for the next image.
+        // connect during it wait in the backlog for the next image. The
+        // socket lives in the per-user runtime dir; the state dir records
+        // where (`control.path`), for every client that knows only it.
         let served = (|| -> Result<()> {
-            let listener = match self.control_listener.lock().unwrap().take() {
-                Some(listener) => listener,
+            use constellation_control::transport::{
+                locate_socket, record_socket, socket_path_for_state_dir, UnixSocketListener,
+            };
+            let state_dir = e.state_dir();
+            let inherited = self.control_listener.lock().unwrap().take();
+            let listener = match inherited {
+                Some(listener) => {
+                    let path = match locate_socket(state_dir) {
+                        Some(path) => path,
+                        None => socket_path_for_state_dir(&*self.host.dirs, state_dir)?,
+                    };
+                    UnixSocketListener::from_std(listener, &path)
+                        .context("serving the handed-over control socket")?
+                }
                 None => {
-                    let sock = e.state_dir().join(constellation_api::SOCKET_NAME);
-                    let _ = std::fs::remove_file(&sock); // stale socket from a crash
-                    std::os::unix::net::UnixListener::bind(&sock)
-                        .context("binding control socket")?
+                    let path = socket_path_for_state_dir(&*self.host.dirs, state_dir)?;
+                    UnixSocketListener::bind(&path)
+                        .with_context(|| format!("binding control socket {}", path.display()))?
                 }
             };
-            *self.handover.control.lock().unwrap() = Some(listener.try_clone()?);
-            constellation_api::serve_listener(listener, status.clone())
+            *self.handover.control.lock().unwrap() = Some(listener.try_clone_std()?);
+            record_socket(state_dir, listener.path()).context("recording control.path")?;
+            // Held for the daemon's life: dropping the handle does not stop
+            // the server, and the listener's own drop (which would remove
+            // the socket file) never runs before exit or `exec`.
+            std::mem::forget(constellation_control::server::serve_router(
+                listener,
+                router.clone(),
+            ));
+            Ok(())
         })();
         if let Err(err) = served {
             tracing::warn!(error = %format!("{err:#}"), "control API unavailable");
@@ -545,7 +574,7 @@ impl NodeRuntime {
         if self.web_ui != 0 {
             match e
                 .runtime()
-                .block_on(constellation_api::web::serve(self.web_ui, status))
+                .block_on(constellation_control::web::serve(self.web_ui, router))
             {
                 Ok(address) => {
                     tracing::info!(%address, "web UI listening (localhost only)")
@@ -611,18 +640,15 @@ impl NodeRuntime {
                 subtree: handle.subtree.clone(),
                 mountpoint: handle.mountpoint.clone(),
                 since: handle.since,
+                view: handle.view.clone(),
+                qos: handle.qos,
+                confine_links: handle.confine_links,
             })
             .collect()
     }
 
     fn mount_ids(&self) -> Vec<MountId> {
         self.mounts.lock().unwrap().keys().copied().collect()
-    }
-
-    /// Invalidate every mounted view's cached quota cap after a live
-    /// `SetQuota` (`Engine::invalidate_quota_caches`).
-    pub fn invalidate_quota_caches(&self) {
-        self.engine.invalidate_quota_caches();
     }
 
     /// Clean shutdown: the engine's drain (`Engine::shutdown`), then
@@ -642,7 +668,7 @@ impl NodeRuntime {
         // a process that is exiting either way must not leave files
         // behind that make it look like a live daemon is still here.
         let state_dir = self.engine.state_dir();
-        let _ = std::fs::remove_file(state_dir.join(constellation_api::SOCKET_NAME));
+        constellation_control::transport::forget_socket(state_dir);
         let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
         result
     }
@@ -663,6 +689,8 @@ pub(crate) struct SessionInfo {
     pub(crate) fuse_threads: usize,
     pub(crate) sink: constellation_frontend_fuse::FuseNotifySink,
     pub(crate) caps: constellation_vfs::FrontendCaps,
+    pub(crate) qos: constellation_engine::ViewQos,
+    pub(crate) confine_links: bool,
 }
 
 impl std::fmt::Debug for MountId {
@@ -708,6 +736,8 @@ mod tests {
             clone_name: None,
             ephemeral: false,
             confine_links: false,
+            labels: Default::default(),
+            qos: Default::default(),
         }
     }
 
@@ -887,33 +917,22 @@ mod tests {
 
         // View-agnostic control op: pinning "/sub" must not depend on
         // which — or how many — views currently expose it.
-        let sock_a = root
-            .path()
-            .join("state-a")
-            .join(constellation_api::SOCKET_NAME);
-        let pin = rt
-            .block_on(constellation_api::call(
-                &sock_a,
-                &constellation_api::Request::Pin {
+        let state_a = root.path().join("state-a");
+        let pin = rt.block_on(
+            crate::control::call::<constellation_control::methods::PinAdd>(
+                &state_a,
+                constellation_control::proto::types::PathParams {
                     path: "/sub".into(),
                 },
-            ))
-            .unwrap();
-        assert!(
-            matches!(pin, constellation_api::Response::Ok { .. }),
-            "pin failed: {pin:?}"
+            ),
         );
-        let list_pins = |rt: &tokio::runtime::Runtime| -> Vec<constellation_api::PinStatus> {
-            match rt
-                .block_on(constellation_api::call(
-                    &sock_a,
-                    &constellation_api::Request::ListPins,
-                ))
+        assert!(pin.is_ok(), "pin failed: {pin:?}");
+        let list_pins = |rt: &tokio::runtime::Runtime| {
+            rt.block_on(crate::control::call::<
+                constellation_control::methods::PinList,
+            >(&state_a, Default::default()))
                 .unwrap()
-            {
-                constellation_api::Response::Pins { pins } => pins,
-                other => panic!("unexpected response {other:?}"),
-            }
+                .pins
         };
         let pins_before = list_pins(&rt);
         assert!(

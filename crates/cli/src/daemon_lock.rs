@@ -23,7 +23,7 @@
 //! *and* (SIGKILL pending or every remaining thread already past
 //! `exit_mm`) — is taken over:
 //! its `daemon.lock` inode is unlinked (the zombie keeps its lock on the
-//! orphan inode), the stale `control.sock`/`daemon.pid` are removed, and
+//! orphan inode), the stale control socket (and `control.path`)/`daemon.pid` are removed, and
 //! the caller takes a fresh lock. Anything alive (running, sleeping,
 //! stopped by SIGSTOP, or a zombie leader whose other threads could still
 //! run) is never taken over: the mount fails within a bound, naming the
@@ -235,7 +235,7 @@ pub fn holder_for_takeover(state_dir: &Path) -> Holder {
 /// Take `state_dir` over from `pid`, a holder classified as
 /// [`Holder::Wedged`]: under the takeover mutex, re-verify that the lock
 /// is still held by that same wedged process, then unlink its
-/// `daemon.lock` inode and the stale `control.sock`/`daemon.pid`. The
+/// `daemon.lock` inode and the stale control socket (with `control.path`) and `daemon.pid`. The
 /// caller then takes a fresh `daemon.lock` as usual.
 pub fn take_over(state_dir: &Path, pid: u32) -> Result<()> {
     let _mutex = takeover_mutex(state_dir)?;
@@ -254,13 +254,13 @@ pub fn take_over(state_dir: &Path, pid: u32) -> Result<()> {
     // it: `lslocks` then still shows the zombie's lock with a path.
     let _ = std::fs::remove_file(&wedged);
     std::fs::rename(&lock, &wedged).with_context(|| format!("moving {} aside", lock.display()))?;
-    let _ = std::fs::remove_file(state_dir.join(constellation_api::SOCKET_NAME));
+    constellation_control::transport::forget_socket(state_dir);
     let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
     tracing::warn!(
         pid,
         state_dir = %state_dir.display(),
         "took the state dir over from a daemon the kernel has killed but that still held \
-         daemon.lock and control.sock; its lock file is kept as daemon.lock.wedged-{pid}"
+         daemon.lock and its control socket; its lock file is kept as daemon.lock.wedged-{pid}"
     );
     Ok(())
 }
@@ -735,9 +735,10 @@ mod tests {
             std::process::id().to_string(),
         )
         .unwrap();
-        let _listener =
-            std::os::unix::net::UnixListener::bind(dir.path().join(constellation_api::SOCKET_NAME))
-                .unwrap();
+        // The wedged daemon's socket, where its locator says it is.
+        let sock = dir.path().join("wedged.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        constellation_control::transport::record_socket(dir.path(), &sock).unwrap();
         let pid = std::process::id();
         std::env::set_var("CONSTELLATION_FAULT_ASSUME_WEDGED_PID", pid.to_string());
         let outcome = take_over(dir.path(), pid);
@@ -748,7 +749,8 @@ mod tests {
             .path()
             .join(format!("daemon.lock.wedged-{pid}"))
             .exists());
-        assert!(!dir.path().join(constellation_api::SOCKET_NAME).exists());
+        assert!(!sock.exists());
+        assert!(constellation_control::transport::locate_socket(dir.path()).is_none());
         assert!(!dir.path().join("daemon.pid").exists());
         // The fresh lock is free while the old inode stays held.
         let fresh = std::fs::File::create(&lock).unwrap();

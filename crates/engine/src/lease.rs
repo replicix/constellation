@@ -273,10 +273,10 @@ impl LeaseView {
         self.last_write_ms.load(Ordering::Relaxed)
     }
 
-    pub fn status(&self) -> constellation_api::LeaseStatus {
+    pub fn status(&self) -> constellation_control::proto::types::LeaseStatus {
         let now = now_unix_ms();
         let until = self.valid_until_ms.load(Ordering::Relaxed);
-        constellation_api::LeaseStatus {
+        constellation_control::proto::types::LeaseStatus {
             held: until > now,
             holder: self.holder.load(Ordering::Relaxed),
             epoch: self.epoch.load(Ordering::Relaxed),

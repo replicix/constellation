@@ -17,6 +17,7 @@
 //! | [`server`] | [`Router`] of typed handlers, [`serve`], [`dispatch_in_process`] |
 //! | [`client`] | [`Client`]: typed calls, subscriptions, chunked results, cancel, timeouts |
 //! | [`schema`] | JSON Schema generation and its committed copy |
+//! | `web` | (feature `web`) the localhost HTTP adapter and embedded UI, over [`dispatch_in_process`] |
 //!
 //! ## Design in one page
 //!
@@ -36,10 +37,10 @@
 //! - **File descriptors ride on frames**: a flag bit on the frame plus
 //!   `SCM_RIGHTS` on the unix socket, or a direct move in-process.
 //!
-//! What is *not* here: the method implementations (C5b binds them to the
-//! engine), TypeScript generation (plan 33), the named-pipe transport (plan
-//! 35), and any HTTP code (the web adapter stays in the CLI and calls
-//! [`dispatch_in_process`]).
+//! What is *not* here: the method implementations (the engine binds them:
+//! `constellation_engine::control`, with the host's own pieces from the
+//! daemon), TypeScript generation (plan 33) and the named-pipe transport
+//! (plan 35).
 
 pub mod audit;
 pub mod authz;
@@ -50,6 +51,8 @@ pub mod proto;
 pub mod schema;
 pub mod server;
 pub mod transport;
+#[cfg(feature = "web")]
+pub mod web;
 
 pub use audit::{AuditRecord, AuditSink, FileAuditSink, MemoryAuditSink};
 pub use authz::{Policy, Principal, Role};

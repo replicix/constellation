@@ -1130,37 +1130,39 @@ impl Coop {
         }
     }
 
-    pub fn report(&self) -> constellation_api::CoopStatus {
+    pub fn report(&self) -> constellation_control::proto::types::CoopStatus {
         let mut sel = self.selector.lock().unwrap();
         self.sync_probe_rtts(&mut sel);
         let per_source = sel
             .all_stats()
             .into_iter()
-            .map(|(id, s)| constellation_api::SourceStatus {
-                id: id.label(),
-                // Lat/BW stay None until a real transfer — priors must not
-                // look like measurements next to probe RTT.
-                ttfb_ms_ewma: (s.ok_samples > 0).then_some(s.ttfb_ewma_ms),
-                goodput_mbps_ewma: (s.goodput_samples > 0)
-                    .then_some(s.goodput_bps * 8.0 / 1_000_000.0),
-                aggregate_mbps_ewma: (s.ok_samples > 0)
-                    .then_some(s.aggregate_bps_live() * 8.0 / 1_000_000.0),
-                hit_rate: s.hit_rate,
-                miss_rate: s.miss_rate,
-                err_rate: s.err_rate,
-                ok_samples: s.ok_samples,
-                transport_rtt_ms: s.transport_rtt_ms,
-                path: match s.path {
-                    PathKind::Direct => "direct",
-                    PathKind::Relay => "relay",
-                    PathKind::Unknown => "unknown",
-                }
-                .into(),
-            })
+            .map(
+                |(id, s)| constellation_control::proto::types::SourceStatus {
+                    id: id.label(),
+                    // Lat/BW stay None until a real transfer — priors must not
+                    // look like measurements next to probe RTT.
+                    ttfb_ms_ewma: (s.ok_samples > 0).then_some(s.ttfb_ewma_ms),
+                    goodput_mbps_ewma: (s.goodput_samples > 0)
+                        .then_some(s.goodput_bps * 8.0 / 1_000_000.0),
+                    aggregate_mbps_ewma: (s.ok_samples > 0)
+                        .then_some(s.aggregate_bps_live() * 8.0 / 1_000_000.0),
+                    hit_rate: s.hit_rate,
+                    miss_rate: s.miss_rate,
+                    err_rate: s.err_rate,
+                    ok_samples: s.ok_samples,
+                    transport_rtt_ms: s.transport_rtt_ms,
+                    path: match s.path {
+                        PathKind::Direct => "direct",
+                        PathKind::Relay => "relay",
+                        PathKind::Unknown => "unknown",
+                    }
+                    .into(),
+                },
+            )
             .collect();
         drop(sel);
         let (peer_set_entries, peer_set_bytes) = self.peer_set_footprint();
-        constellation_api::CoopStatus {
+        constellation_control::proto::types::CoopStatus {
             peer_hits: self.counters.peer_hits.load(Ordering::Relaxed),
             peer_misses: self.counters.peer_misses.load(Ordering::Relaxed),
             peer_errors: self.counters.peer_errors.load(Ordering::Relaxed),

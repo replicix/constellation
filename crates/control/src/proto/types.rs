@@ -368,8 +368,27 @@ pub struct StalledFuseRequest {
     pub blocking: bool,
 }
 
+/// Plan 31 C4b: in-place upgrades of this daemon (`node.handoff` with
+/// [`HandoffTarget::Exec`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoverStatus {
+    /// How many handovers this daemon's process has been through (0: the
+    /// image that started it).
+    pub generation: u32,
+    pub pid: u32,
+    /// A handover is under way.
+    pub upgrading: bool,
+    /// Why the last attempt did not happen, if it did not.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusReport {
+    /// Plan 31 C4b. First, as it was in the retired `crates/api` report:
+    /// `constellation status` prints this struct, field order included.
+    #[serde(default)]
+    pub handover: HandoverStatus,
     pub fs_uuid: String,
     pub backend: String,
     /// Every view this daemon currently has mounted (plan 21, step 1).
@@ -2108,6 +2127,14 @@ pub struct PruneRootListing {
     pub roots: Vec<PruneRootStatus>,
 }
 
+/// `snapshot.create`'s result: the new snapshot's record, and the summary
+/// `constellation snapshot create` prints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotCreated {
+    pub detail: String,
+    pub snapshot: SnapshotStatus,
+}
+
 /// `snapshot.list`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotListing {
@@ -2171,13 +2198,40 @@ pub struct LifecycleParams {
     pub event: LifecycleEventSpec,
 }
 
-/// `node.handoff` (plan 31 §6.11): drain the FUSE sessions of `views` (all
-/// when empty), export their handle tables and send the session
-/// descriptors to the process listening on the socket **attached to this
-/// request** (over fd passing), which then `resume`s them. Requires a
-/// transport with fd passing.
+/// Where `node.handoff` sends the FUSE sessions (plan 31 §6.11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum HandoffTarget {
+    /// The in-place upgrade of plan 31 C4b (`constellation daemon
+    /// --upgrade`): the daemon `exec`s `binary` (default: the executable it
+    /// was started from, as it is on disk now) with every session, its
+    /// lock and its control listener inherited, under the same pid. Needs
+    /// no descriptor; every mounted view goes (`views` must be empty) and
+    /// the handover's own bounded drain applies (`drain_timeout_ms` must be
+    /// absent).
+    Exec {
+        #[serde(default)]
+        binary: Option<PathBuf>,
+    },
+    /// Drain the sessions of `views` (all when empty), export their handle
+    /// tables and send the session descriptors to the process listening on
+    /// the unix socket **attached to this request** (fd passing), which
+    /// then resumes them — plan 37's engine-pod replacement.
+    Socket,
+}
+
+impl Default for HandoffTarget {
+    fn default() -> Self {
+        HandoffTarget::Exec { binary: None }
+    }
+}
+
+/// `node.handoff` (plan 31 §6.11). With [`HandoffTarget::Socket`] the
+/// request carries a descriptor and needs a transport with fd passing;
+/// [`HandoffTarget::Exec`] (the default) does not.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HandoffParams {
+    #[serde(default)]
+    pub target: HandoffTarget,
     #[serde(default)]
     pub views: Vec<u64>,
     /// How long to wait for in-flight operations to drain.
@@ -2194,9 +2248,14 @@ pub struct HandedOffView {
     pub handles: u64,
 }
 
-/// `node.handoff`'s result.
+/// `node.handoff`'s result: answered once the sessions are detached; the
+/// receiving image then serves them (for `Exec`, `node.status` reports
+/// `handover.generation` one higher).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HandoffReport {
+    /// A human-readable summary (the old `Upgrade` answer).
+    #[serde(default)]
+    pub detail: String,
     pub views: Vec<HandedOffView>,
 }
 

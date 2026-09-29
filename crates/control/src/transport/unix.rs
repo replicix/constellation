@@ -448,6 +448,29 @@ impl UnixSocketListener {
         })
     }
 
+    /// Serve a listener bound elsewhere — one a previous image of the daemon
+    /// bound and handed over across `exec` (plan 31 C4b), so a client that
+    /// connects during the handover waits in the backlog instead of finding
+    /// no daemon. `path` is where it is bound (removed when this drops).
+    pub fn from_std(
+        listener: std::os::unix::net::UnixListener,
+        path: &Path,
+    ) -> io::Result<UnixSocketListener> {
+        listener.set_nonblocking(true)?;
+        Ok(UnixSocketListener {
+            listener: UnixListener::from_std(listener)?,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// A second descriptor for the same listening socket (to hand on across
+    /// an in-place upgrade while this one keeps serving).
+    pub fn try_clone_std(&self) -> io::Result<std::os::unix::net::UnixListener> {
+        use std::os::fd::AsFd;
+        let fd = self.listener.as_fd().try_clone_to_owned()?;
+        Ok(std::os::unix::net::UnixListener::from(fd))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

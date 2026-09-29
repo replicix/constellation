@@ -5,7 +5,7 @@
 use constellation_meta::Meta;
 
 /// `status.held`: what the last ship round held back, per poisoned inode.
-pub fn status(meta: &Meta) -> constellation_api::HeldStatus {
+pub fn status(meta: &Meta) -> constellation_control::proto::types::HeldStatus {
     let summary = meta.held_summary();
     // A poisoned inode with nothing journaled for it (its manifest shipped
     // before the chunk went missing, or was already dropped) still shows,
@@ -25,7 +25,7 @@ pub fn status(meta: &Meta) -> constellation_api::HeldStatus {
         .remote_chunks()
         .unwrap_or_default()
         .into_iter()
-        .map(|r| constellation_api::RemoteChunkStatus {
+        .map(|r| constellation_control::proto::types::RemoteChunkStatus {
             ino: r.ino,
             path: meta.path_of(r.ino).ok(),
             node: r.node,
@@ -33,7 +33,7 @@ pub fn status(meta: &Meta) -> constellation_api::HeldStatus {
             age_s: (now_ms - r.enrolled_ms).max(0) as u64 / 1000,
         })
         .collect();
-    constellation_api::HeldStatus {
+    constellation_control::proto::types::HeldStatus {
         transactions: summary.transactions,
         records: summary.records,
         oldest_seq: summary.oldest_seq,
@@ -42,12 +42,14 @@ pub fn status(meta: &Meta) -> constellation_api::HeldStatus {
         remote,
         inodes: inodes
             .into_iter()
-            .map(|(ino, held)| constellation_api::HeldInodeStatus {
-                ino,
-                path: meta.path_of(ino).ok(),
-                missing_chunks: held.missing.iter().map(|h| h.to_hex()).collect(),
-                seeds: held.seeds,
-            })
+            .map(
+                |(ino, held)| constellation_control::proto::types::HeldInodeStatus {
+                    ino,
+                    path: meta.path_of(ino).ok(),
+                    missing_chunks: held.missing.iter().map(|h| h.to_hex()).collect(),
+                    seeds: held.seeds,
+                },
+            )
             .collect(),
     }
 }

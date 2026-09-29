@@ -4,11 +4,11 @@
 /// `status.p2p.peers[].paths` for one peer.
 pub fn status(
     summary: Option<constellation_net::PathSummary>,
-) -> constellation_api::PeerPathsStatus {
+) -> constellation_control::proto::types::PeerPathsStatus {
     let Some(s) = summary else {
-        return constellation_api::PeerPathsStatus::default();
+        return constellation_control::proto::types::PeerPathsStatus::default();
     };
-    constellation_api::PeerPathsStatus {
+    constellation_control::proto::types::PeerPathsStatus {
         selected: s
             .selected
             .map(|k| k.as_str().to_string())

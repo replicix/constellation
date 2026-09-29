@@ -76,12 +76,12 @@ pub struct PrefetchStats {
 }
 
 impl PrefetchStats {
-    pub fn snapshot(&self) -> constellation_api::PrefetchStatus {
+    pub fn snapshot(&self) -> constellation_control::proto::types::PrefetchStatus {
         let windows = self.windows.lock().unwrap();
         let streams = windows.len() as u64;
         let window_bytes = windows.values().copied().max().unwrap_or(0);
         drop(windows);
-        constellation_api::PrefetchStatus {
+        constellation_control::proto::types::PrefetchStatus {
             inflight: self.inflight.load(Ordering::Relaxed),
             queued: self.queued.load(Ordering::Relaxed),
             streams,

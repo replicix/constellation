@@ -1867,9 +1867,12 @@ async fn fd_methods_on_a_transport_without_fd_passing_fail_promptly() {
         (err.kind, err.code),
         (ErrorKind::Unsupported, Some(Code::NotSupported))
     );
-    // node.handoff always needs an fd.
+    // node.handoff to a socket needs an fd.
     let err = client
-        .call::<NodeHandoff>(HandoffParams::default())
+        .call::<NodeHandoff>(HandoffParams {
+            target: HandoffTarget::Socket,
+            ..HandoffParams::default()
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code, Some(Code::NotSupported));
@@ -2342,9 +2345,6 @@ async fn the_whole_table_is_role_enforced_identically_over_socket_and_dispatch()
             );
             if held < m.min_role {
                 assert_eq!(a.kind, ErrorKind::Denied, "{why}");
-            } else if m.name == "node.handoff" {
-                // Admitted, but it needs an fd and none was attached.
-                assert_eq!(a.kind, ErrorKind::Invalid, "{why}: {a}");
             } else {
                 assert_eq!(
                     (a.kind, a.message.as_str()),

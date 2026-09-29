@@ -26,10 +26,29 @@
 //! safe one; widening is a conscious act.
 //!
 //! The instance name is the per-daemon part (`control` for the default
-//! daemon; C5b decides how additional daemons are named). It is restricted
-//! to `[A-Za-z0-9._-]` so it cannot climb out of the directory.
+//! daemon). It is restricted to `[A-Za-z0-9._-]` so it cannot climb out of
+//! the directory.
+//!
+//! ## One daemon per state dir, found from the state dir
+//!
+//! A host runs one daemon per state dir (plan 21), several at once, so each
+//! needs its own socket: [`instance_for_state_dir`] names it after the state
+//! dir — a readable prefix of its last component and 16 hex digits of the
+//! BLAKE3 of its canonical path (`myfs-3f2a9c1b0d4e5f60.sock`), which fits
+//! the runtime dir's [`RUNTIME_NAME_BUDGET`] by construction.
+//!
+//! Clients never re-derive it. The runtime dir depends on the environment
+//! (`$XDG_RUNTIME_DIR`, `$TMPDIR`), and a CLI or harness run with another
+//! environment than the daemon's would compute another path. Instead the
+//! daemon records the socket's path in its state dir ([`LOCATOR_FILE`],
+//! `control.path`, written atomically once the socket is bound), and
+//! [`locate_socket`] reads it back: the state dir is what every caller
+//! already knows. A locator whose socket nobody listens on (a crashed
+//! daemon) reads as "not running" at connect time, exactly as a stale
+//! `control.sock` used to; [`forget_socket`] removes both on a clean exit
+//! and on a takeover.
 
-use constellation_platform::dirs::{fits_sun_path, Dirs, SUN_PATH_MAX};
+use constellation_platform::dirs::{fits_sun_path, Dirs, RUNTIME_NAME_BUDGET, SUN_PATH_MAX};
 use std::path::{Path, PathBuf};
 
 /// Appended to the instance name.
@@ -87,6 +106,72 @@ pub fn default_socket_path(dirs: &dyn Dirs) -> Result<PathBuf, SocketPathError> 
     let path = socket_path_for(&dir, DEFAULT_INSTANCE)?;
     ensure_socket_dir(&dir)?;
     Ok(path)
+}
+
+/// The file in a state dir naming its daemon's control socket.
+pub const LOCATOR_FILE: &str = "control.path";
+
+/// The socket instance name of the daemon serving `state_dir` (see the
+/// module docs): `<prefix>-<16 hex>`, at most 25 bytes.
+pub fn instance_for_state_dir(state_dir: &Path) -> String {
+    let canonical = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    let hash = blake3::hash(canonical.as_os_str().as_encoded_bytes());
+    let prefix: String = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .take(8)
+        .collect();
+    let prefix = if prefix.is_empty() {
+        "d".into()
+    } else {
+        prefix
+    };
+    let instance = format!("{prefix}-{}", &hash.to_hex()[..16]);
+    debug_assert!(instance.len() + SOCKET_SUFFIX.len() <= RUNTIME_NAME_BUDGET);
+    instance
+}
+
+/// The socket the daemon serving `state_dir` binds:
+/// `<runtime_dir>/<instance_for_state_dir>.sock`, with the directory
+/// created 0700.
+pub fn socket_path_for_state_dir(
+    dirs: &dyn Dirs,
+    state_dir: &Path,
+) -> Result<PathBuf, SocketPathError> {
+    let dir = dirs.runtime_dir().map_err(SocketPathError::RuntimeDir)?;
+    let path = socket_path_for(&dir, &instance_for_state_dir(state_dir))?;
+    ensure_socket_dir(&dir)?;
+    Ok(path)
+}
+
+/// Record `socket` as `state_dir`'s control socket ([`LOCATOR_FILE`]),
+/// atomically: a reader sees the old path or the new one, never half.
+pub fn record_socket(state_dir: &Path, socket: &Path) -> std::io::Result<()> {
+    let tmp = state_dir.join(format!("{LOCATOR_FILE}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, socket.as_os_str().as_encoded_bytes())?;
+    std::fs::rename(&tmp, state_dir.join(LOCATOR_FILE))
+}
+
+/// The control socket recorded in `state_dir`, if any. `None` means no
+/// daemon has served this state dir since the last clean exit.
+pub fn locate_socket(state_dir: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read(state_dir.join(LOCATOR_FILE)).ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let text = text.trim_end_matches('\n');
+    (!text.is_empty()).then(|| PathBuf::from(text))
+}
+
+/// Remove `state_dir`'s recorded socket (the socket file itself, then the
+/// locator). Best effort: a daemon's clean exit, or a takeover of a dead
+/// daemon's state dir.
+pub fn forget_socket(state_dir: &Path) {
+    if let Some(socket) = locate_socket(state_dir) {
+        let _ = std::fs::remove_file(socket);
+    }
+    let _ = std::fs::remove_file(state_dir.join(LOCATOR_FILE));
 }
 
 /// Create `dir` (and missing parents) with mode 0700 and verify it is ours
@@ -218,6 +303,42 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn state_dirs_get_distinct_short_stable_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("my filesystem!");
+        let b = tmp.path().join("other");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let ia = instance_for_state_dir(&a);
+        assert_eq!(ia, instance_for_state_dir(&a), "stable");
+        assert_ne!(ia, instance_for_state_dir(&b), "distinct");
+        assert!(ia.starts_with("myfilesy-"), "{ia}");
+        assert!(ia.len() + SOCKET_SUFFIX.len() <= RUNTIME_NAME_BUDGET);
+        // The same directory through a different spelling is the same daemon.
+        assert_eq!(
+            instance_for_state_dir(&tmp.path().join("other/../other")),
+            instance_for_state_dir(&b)
+        );
+        socket_path_for(Path::new("/r"), &ia).unwrap();
+        let dirs = FixedDirs(tmp.path().to_path_buf());
+        let sock = socket_path_for_state_dir(&dirs, &a).unwrap();
+        assert!(sock.starts_with(tmp.path().join("run/constellation")));
+    }
+
+    #[test]
+    fn the_locator_round_trips_and_is_forgotten() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(locate_socket(tmp.path()), None);
+        let sock = tmp.path().join("s.sock");
+        std::fs::write(&sock, b"").unwrap();
+        record_socket(tmp.path(), &sock).unwrap();
+        assert_eq!(locate_socket(tmp.path()), Some(sock.clone()));
+        forget_socket(tmp.path());
+        assert_eq!(locate_socket(tmp.path()), None);
+        assert!(!sock.exists());
     }
 
     #[cfg(unix)]

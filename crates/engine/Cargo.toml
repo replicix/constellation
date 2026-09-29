@@ -24,8 +24,9 @@ constellation-fs-core.workspace = true
 constellation-authority.workspace = true
 constellation-meta.workspace = true
 constellation-mtree.workspace = true
-# Status report types only (no `web` feature).
-constellation-api.workspace = true
+# The control protocol (plan 31 §9): its report types, and the method
+# table `control` binds the engine to (no `web` feature: HTTP is a host's).
+constellation-control.workspace = true
 constellation-net.workspace = true
 constellation-upload-concurrency.workspace = true
 constellation-store-s3.workspace = true
@@ -38,6 +39,8 @@ serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
 futures.workspace = true
+bytes.workspace = true
+blake3.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 # The object store's trait is an `async_trait` (`backend::CountingStore`).
@@ -48,7 +51,12 @@ zeroize = "1.9.0"
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+tempfile.workspace = true
 # The conformance kit (plan 31 C6), run against the engine by
 # `tests/conformance.rs`.
 constellation-vfs = { workspace = true, features = ["conformance"] }
-tempfile.workspace = true
+# The C5 parity test (`control::parity_tests`): the same router over the
+# unix socket and over the HTTP adapter, driven in-process.
+constellation-control = { workspace = true, features = ["web"] }
+tower = { version = "0.5", features = ["util"] }
+axum = "0.8"

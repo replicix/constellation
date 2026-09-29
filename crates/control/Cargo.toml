@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# The localhost HTTP adapter and embedded operator UI (`web`). Off by
+# default so the library (and its Windows cross-check) carries no HTTP stack.
+web = ["dep:axum", "dep:rust-embed", "dep:mime_guess"]
+
 [dependencies]
 constellation-types.workspace = true
 constellation-platform.workspace = true
@@ -20,6 +26,9 @@ thiserror.workspace = true
 blake3.workspace = true
 toml.workspace = true
 schemars = { version = "1", features = ["derive"] }
+axum = { version = "0.8", optional = true }
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 
 # Peer credentials, SCM_RIGHTS and getgrnam only exist on unix; the Windows
 # build gets the `NamedPipe` stub and no libc at all.
@@ -28,3 +37,5 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# In-process driving of the web adapter (`ServiceExt::oneshot`).
+tower = { version = "0.5", features = ["util"] }

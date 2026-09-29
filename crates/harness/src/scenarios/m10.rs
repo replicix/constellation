@@ -886,9 +886,12 @@ pub fn epoch_member_dies_with_chunk(seed: u64) -> Result<()> {
     } else {
         // C is given up: the operator drops what waits for its chunks.
         for ino in &deferred_inos {
-            let reply =
-                a.control(&serde_json::json!({ "cmd": "drop_held", "ino": ino, "remote": true }))?;
-            anyhow::ensure!(reply["resp"] == "ok", "drop-held --remote failed: {reply}");
+            let reply = a
+                .control(
+                    "locks.drop_held",
+                    serde_json::json!({ "ino": ino, "remote": true }),
+                )
+                .context("drop-held --remote failed")?;
             eprintln!("    {NAME}: {}", reply["detail"]);
         }
         eventually(

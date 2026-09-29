@@ -96,8 +96,9 @@
 //!   cannot be reopened ends its mount (its descriptor closes), as a crash
 //!   would. `add_mount`/`remove_mount` answer [`crate::node_runtime::UPGRADING`]
 //!   meanwhile (an attaching `mount` retries).
-//! - The request is honoured on the unix socket only (it executes a
-//!   binary); the web UI's HTTP adapter refuses it.
+//! - The request (`node.handoff` with `HandoffTarget::Exec`, plan 31 C5)
+//!   is honoured on the unix socket only (it executes a binary); the web
+//!   UI's HTTP adapter refuses it (`constellation_control::web::HTTP_REFUSED`).
 
 use crate::node_runtime::{MountId, NodeRuntime, SessionInfo};
 use anyhow::{bail, Context, Result};
@@ -159,8 +160,8 @@ impl HandoverState {
         self.upgrading.load(Ordering::SeqCst)
     }
 
-    pub fn status(&self) -> constellation_api::HandoverStatus {
-        constellation_api::HandoverStatus {
+    pub fn status(&self) -> constellation_control::proto::types::HandoverStatus {
+        constellation_control::proto::types::HandoverStatus {
             generation: self.generation,
             pid: std::process::id(),
             upgrading: self.in_progress(),
@@ -457,6 +458,8 @@ struct SessionInfoParts {
     fuse_threads: usize,
     sink: constellation_frontend_fuse::FuseNotifySink,
     caps: constellation_vfs::FrontendCaps,
+    qos: constellation_engine::ViewQos,
+    confine_links: bool,
 }
 
 impl SessionInfoParts {
@@ -470,6 +473,8 @@ impl SessionInfoParts {
             fuse_threads: self.fuse_threads,
             sink: self.sink.clone(),
             caps: self.caps.clone(),
+            qos: self.qos,
+            confine_links: self.confine_links,
         }
     }
 
@@ -491,7 +496,7 @@ type Detached = (
     constellation_frontend_fuse::SessionHandoff<Result<ViewHandoff>>,
 );
 
-/// `Request::Upgrade`: steps 1-3 of the module doc here; 4-5 on a thread
+/// `node.handoff` (`HandoffTarget::Exec`): steps 1-3 of the module doc here; 4-5 on a thread
 /// of their own once this answers.
 pub fn upgrade(node: &Arc<NodeRuntime>, binary: Option<&Path>) -> Result<String, String> {
     if !cfg!(target_os = "linux") {
@@ -556,6 +561,8 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
                 fuse_threads: m.fuse_threads,
                 sink: m.sink.clone(),
                 caps: m.caps.clone(),
+                qos: m.qos,
+                confine_links: m.confine_links,
             },
             control: m.control.clone(),
             view: m.view.clone(),
@@ -811,6 +818,7 @@ fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
     let caps = constellation_frontend_fuse::caps(engine.locks_cluster() && !m.read_only);
     let events = constellation_engine::DeferredEvents::new();
     let open: Vec<constellation_vfs::Ino> = m.view.handles.open_inos().collect();
+    let (qos, confine_links) = (m.view.spec.qos, m.view.spec.confine_links);
     let view =
         engine.open_view_resumed(m.view.spec, m.view.handles, caps.clone(), events.clone())?;
     node.ensure_status(&view);
@@ -855,6 +863,8 @@ fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
             fuse_threads: m.fuse_threads,
             sink: sink.clone(),
             caps,
+            qos,
+            confine_links,
         },
     );
     // The gate dropped the engine's invalidations during the handover:

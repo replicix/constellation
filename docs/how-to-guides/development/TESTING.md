@@ -836,11 +836,16 @@ Phase 6b scenarios exercise E2E passphrase mode:
 
 Phase 7 adds `web-ui-smoke`: one mounted daemon enables its localhost web
 listener, then the harness uses ordinary HTTP (no browser automation) to
-exercise `GET /api/status`, `POST /api` with `ReadDir`, snapshot
-create/list/delete, and `GET /metrics`. It also JSON-round-trips the status
+exercise `GET /api/status`, `POST /api` with `browse.readdir` (plan 31 C5:
+the body is the control protocol's `{method, params}`, the answer
+`{"ok": result}`), snapshot create/list/delete, the refusal of `node.handoff`
+over HTTP (403), and `GET /metrics`. It also JSON-round-trips the status
 response and requires spool, cache, and lease gauge names. This checks the
 embedded server and shared control dispatcher while keeping frontend rendering
-out of the fault-injection lane.
+out of the fault-injection lane. The transport parity of the whole method
+table (unix socket vs HTTP, every role) is a unit test instead:
+`constellation_engine::control::parity_tests` (`cargo test -p
+constellation-engine --lib control::`).
 
 Phase 8a adds three destructive-integrity scenarios:
 
@@ -1436,7 +1441,9 @@ relay of its own so requests can be attributed per role):
     distribution and each node's seal/takeover counters.
   - `stale-daemon-lock`: one node; after a clean unmount, `harness
     mute-daemon` (a hidden subcommand) holds `daemon.lock` and a
-    `control.sock` listener that accepts and never answers. A mount
+    control-socket listener (bound where the daemon's would be and
+    recorded in the state dir's `control.path`, plan 31 C5) that accepts
+    and never answers. A mount
     (`CONSTELLATION_CONTROL_TIMEOUT_MS=2000`,
     `CONSTELLATION_ATTACH_TIMEOUT_MS=6000`) must exit within the bound
     naming the live holder's pid and refusing to take over; `status`

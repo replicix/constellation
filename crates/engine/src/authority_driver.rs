@@ -77,7 +77,7 @@ type DelegRenewReply = (u64, Vec<Grant>, u64, constellation_meta::Position);
 pub struct CoreStatus {
     pub stats: Stats,
     pub ship: Option<ShipState>,
-    pub lease: constellation_api::LeaseStatus,
+    pub lease: constellation_control::proto::types::LeaseStatus,
     pub gate_pending: bool,
     pub job: Option<JobKind>,
     pub clients_in_flight: usize,
