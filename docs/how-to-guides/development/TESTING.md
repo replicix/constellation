@@ -8,7 +8,7 @@ dispatch (`.github/workflows/nightly.yml`).
 | Lane | Command | Backend | Needs | Speed |
 |---|---|---|---|---|
 | Unit tests | `cargo test --workspace` | in-memory / tempdir | Rust | seconds |
-| Host smoke | `tests/smoke.sh` | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
+| Host smoke | `tests/smoke.sh` (= `harness smoke`) | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
 | Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~3–6 min |
@@ -54,7 +54,15 @@ Mechanics worth knowing:
 ## The smoke test
 
 `tests/smoke.sh [backend-url]` is the single end-to-end script all
-integration lanes share. It creates a filesystem, runs `doctor`, mounts
+integration lanes share. It is a thin wrapper: the test itself is
+`harness smoke [backend-url]` (`crates/harness/src/smoke.rs`, a step for
+step Rust port of what the script used to be). The wrapper finds the harness
+binary (`CONSTELLATION_HARNESS_BIN`, else the `harness` next to
+`$CONSTELLATION_BIN` (same build: `make smoke`, the suite image), else
+`$CARGO_TARGET_DIR/{debug,release}/harness`, else `harness` on `PATH`, else
+it builds it) and forwards
+its arguments; `CONSTELLATION_BIN` still selects the binary under test
+(default `$CARGO_TARGET_DIR/debug/constellation`). It creates a filesystem, runs `doctor`, mounts
 it over FUSE, and exercises: namespace ops (mkdir/rename/symlink),
 multi-chunk files, partial in-place edits, truncate, append,
 unlink-while-open orphan semantics, unmount/remount persistence, and
@@ -326,12 +334,167 @@ runs:
   (`fio not installed`) or the failure error text, `null` for a pass;
   `shard` is `null` for an unsharded run. The format is documented in
   `crates/harness/src/results.rs`; `tests/parity.py` (plan 31) reads it.
-- `--lane <name>` sets the `lane` recorded in that file (`<os>-<frontend>`,
-  default `linux-fuse`).
+- `--lane <name>` sets the `lane` recorded in that file. Default:
+  `<os>-<frontend>`, plus `-process` under `--s3-backend process`, so a
+  plain run is `linux-fuse` and a native-S3 run is `linux-fuse-process`.
+  An explicit `--lane` always wins.
+- The file also records `s3_backend` (`docker` or `process`) and `frontend`
+  (`fuse`). They are additive; schema stays 1 and readers must not require
+  them.
 
 ```sh
 harness run --shard 2/4 --lane linux-fuse --results-json results-2.json
 ```
+
+### Frontends and S3 backends (plan 31 C6)
+
+Two switches select what a run is measured against; together with the OS
+they name the *lane* that `tests/parity.py` compares.
+
+- `--frontend <name>` is the filesystem frontend the clients mount through.
+  Only `fuse` exists so far; any other value is rejected up front. It is
+  recorded in the results file and forms the lane name.
+- `--s3-backend docker|process` (also `harness bench` and `harness
+  meta-bench`) picks the S3 server, with the same `S3Env` surface for
+  scenarios either way (proxied endpoint for clients, direct endpoint for
+  harness-side checks, the toxiproxy handle, the bucket already created,
+  teardown on drop):
+  - `docker` (default): today's floci 1.7.0-compat + toxiproxy 2.12.0
+    containers on a private docker network.
+  - `process`: a native `versitygw` (posix backend on a temp dir, credentials
+    `test`/`test`) and a native `toxiproxy-server`, both on 127.0.0.1 with
+    free ports. No Docker, so it runs on hosts that lack it (macOS/Windows
+    CI). The temp dir and both processes are removed when the environment is
+    dropped.
+  - The environment variable `CONSTELLATION_HARNESS_S3_BACKEND` is the
+    alternative to the flag (the flag wins).
+  - Binaries: `CONSTELLATION_VERSITYGW_BIN` / `CONSTELLATION_TOXIPROXY_BIN`,
+    else `PATH`, else `~/.local/bin`. A missing one is an error naming the
+    install script.
+  - versitygw rejects anonymous requests, so the harness's own raw bucket
+    reads/writes (`crate::s3auth`) are SigV4-signed under this backend.
+  - The `versitygw` used must enforce `If-None-Match: *` on PutObject (the
+    daemon refuses a backend that does not); the pinned v1.8.0 does (older
+    releases, including the 1.0.14 docker image, silently overwrite).
+
+```sh
+bash tests/ci/install-native-s3.sh                 # into ~/.local/bin
+target/release/harness run basic-rw --s3-backend process --frontend fuse \
+    --results-json results-linux-fuse-process.json
+CONSTELLATION_HARNESS_S3_BACKEND=process target/release/harness run
+cargo test -p constellation-harness --test s3_process_backend -- --ignored
+```
+
+`tests/ci/install-native-s3.sh [DEST]` installs the pinned `versitygw` and
+`toxiproxy-server` (`NATIVE_S3_INSTALL=release|go|auto`). `release` downloads
+the GitHub release archives and verifies pinned sha256 sums; those sums are
+**empty in the script and must be filled in by whoever first runs it with
+network access to the releases** (they were not guessable or verifiable when
+it was written), and `auto` uses `go install` (integrity from the Go module
+proxy/checksum database) for any platform whose sums are still empty. The
+ignored `s3_process_backend` test starts each backend, does a PUT/GET
+through the proxy with the daemons' own S3 client, observes a latency toxic,
+a cut and a heal, exercises the signed raw helpers, and checks teardown.
+
+### `harness smoke`
+
+`harness smoke [backend]` is `tests/smoke.sh` ported to Rust (see above):
+create + `doctor`, refused double create, mount, namespace ops, a 3.5 MiB
+multi-chunk file, partial edit, truncate, append, unlink-while-open,
+rm/rmdir, remount, cold-cache read, `status`. The backend is a directory
+(default: a fresh temp dir) or `s3://bucket/prefix` with `AWS_*` in the
+environment.
+
+### `harness interop write|verify`
+
+The cross-OS interop lane (plan 34's macOS lanes use it): the bucket a fs
+was written into on one OS is mounted and checked on another.
+
+```sh
+harness interop write  --bucket-dir bucket/ [--backend file|process] [--seed 42]
+harness interop verify --bucket-dir bucket/ [--backend file|process]
+```
+
+`write` mounts a **fresh** filesystem and writes a deterministic tree
+derived from the seed: small files around the 4 KiB/1 MiB boundaries, a
+24 MiB multi-chunk file, a 96 MiB sparse file, patched/shrunk/grown files,
+non-ASCII and 255-byte names, nested directories with modes (`0700`, sticky),
+a 200-entry directory, symlinks (relative, dangling, long), hard links (incl.
+one whose original name is unlinked), xattrs (set, replaced, removed, on a
+file and a directory), a FIFO, device nodes with large major/minor numbers
+(only when run as root), renames, operations the fs must refuse
+(`ENOTEMPTY`, `EEXIST`, `ENOENT`, `ENAMETOOLONG`, `ENODATA`, asserted at
+write time), and a snapshot followed by divergence of the live tree. It
+unmounts and leaves the bucket in `--bucket-dir` (which must be empty), with
+`INTEROP.json` (seed, whether devices were written) written last.
+
+`verify` mounts the bucket with a fresh state dir and checks every item:
+content, size, mode, mtime (exact, ns), link counts and inode identity,
+readlink targets, xattrs, `rdev` major/minor, the exact directory listings,
+and both the frozen snapshot view and the live tree. It reports all problems
+before failing. Backends: `file` (default) is the local file backend directly
+in `--bucket-dir` (verify mounts a copy, leaving the artifact untouched);
+`process` runs the fs on versitygw and moves the bucket through the S3 API
+(one file per object, imported by PUTs), never by copying versitygw's data
+directory, whose object metadata lives in xattrs that a cross-OS tar loses.
+
+Known deviation recorded by the lane: `link(2)` sets the target inode's
+mtime to "now" (POSIX: only ctime changes), so the mtime of hard-linked
+`t/hl/a` is not compared until that is fixed.
+
+### Platform parity (`tests/parity.py`)
+
+`tests/parity.py` compares the results files of any number of lanes against
+a reference lane (default `linux-fuse`) and writes a Markdown summary
+(CI appends it to `$GITHUB_STEP_SUMMARY`); exit status 0 = parity holds,
+1 = violations, 2 = unusable input.
+
+```sh
+python3 tests/parity.py --expect tests/platform-parity.toml \
+    [--require-lane linux-fuse --require-lane linux-fuse-process] results/results-*.json
+python3 -m unittest discover -s tests -p 'test_parity.py' -v   # the checker's own tests
+```
+
+Inputs are `--results-json` files (schema 1). Files with the same `lane` are
+shards of one run and are merged by concatenating `scenarios`; the same
+scenario twice in one lane is an error. Rules, for every non-reference lane
+and scenario:
+
+- the outcome must equal the reference's, unless an `[[expect]]` entry covers
+  that (scenario, lane);
+- a scenario present in one lane and absent from the other is a violation
+  (a lost shard must not look like a pass);
+- any `failed`, in any lane including the reference, is a violation, and
+  `failed` can never be expected;
+- every `--require-lane` must have results, so a lane whose job died before
+  writing its results file fails the check instead of dropping out of it
+  (nightly requires every lane it runs).
+
+`tests/platform-parity.toml` holds the expectations. It is seeded empty:
+`linux-fuse-process` differs from `linux-fuse` only in the S3 backend, so any
+difference is a bug to fix or a scenario-specific entry to explain. An entry:
+
+```toml
+[[expect]]
+scenario = "<name>"        # or "*" (capability skips only)
+lanes    = ["macos-nfs"]
+outcome  = "skipped"       # the only outcome that may differ
+cap      = "<Cap>"         # required with scenario = "*"
+reason   = "why this lane legitimately differs"
+```
+
+Entries are two-way, like the xfstests baseline: an entry whose lane or
+scenario is not in the results, whose stated outcome is not what the lane
+reports, or whose lane now equals the reference, fails the check as stale.
+A wildcard covers the skipped scenarios of the listed lanes whose recorded
+skip reason names the `cap` as a whole word, so it cannot also excuse an
+unrelated skip; a missing-tool skip (`<tool> not installed`) is never
+covered by a wildcard. It is stale if it covers none. Optional extras:
+a top-level `reference = "<lane>"` and `[lane."<name>"] reference = "<lane>"`
+give a lane its own reference. `tests/test_parity.py` runs the checker on
+synthetic results sets (all equal passes; a deliberate mismatch fails
+closed; covered skip; stale entry; wildcard without `cap`; `failed`
+expected; shard merging; missing reference lane; ...).
 
 ### Chaos CI (`chaos-ci`)
 
@@ -1882,3 +2045,12 @@ real store with no spawned tasks.
   instead of building via compose.
 - Lint gates are `cargo fmt --all --check` and
   `cargo clippy --workspace --all-targets -- -D warnings`.
+- Nightly (`nightly.yml`) also runs `harness-lanes-linux` (the
+  `linux-fuse-process` lane: `--s3-backend process`, natives installed by
+  `tests/ci/install-native-s3.sh`), `conformance`
+  (`cargo test -p constellation-vfs --features conformance`) and `parity`,
+  which downloads every `harness-*` artifact (each carries its
+  `results-<lane>.json`; the `harness` job's is `results-linux-fuse.json`),
+  runs the checker's unit tests, then `tests/parity.py` and appends its
+  table to the job summary. The harness steps use `set -o pipefail` so the
+  run's exit status survives `tee`.

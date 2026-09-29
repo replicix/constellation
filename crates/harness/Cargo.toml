@@ -23,6 +23,11 @@ constellation-types.workspace = true
 # exactly-once check reads every `Completed { rid }` in the bucket).
 constellation-meta.workspace = true
 fjall = { version = "3.1", package = "fjall" }
+# `s3auth`: SigV4 for the harness's own raw S3 requests against the process
+# backend (versitygw rejects anonymous requests, floci does not). Both are
+# already in Cargo.lock via aws-sigv4/object_store.
+hmac = "0.13"
+sha2 = "0.11"
 libc.workspace = true
 postcard.workspace = true
 rand.workspace = true

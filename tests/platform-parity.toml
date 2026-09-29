@@ -1,0 +1,28 @@
+# Reference lane: linux-fuse. For every scenario, every lane's outcome must
+# equal the reference unless an [[expect]] entry covers that (scenario,
+# lane). Entries that no longer match reality fail the check too (two-way,
+# like the xfstests baseline). Wildcards are allowed only for capability
+# skips.
+#
+# Lane names are "<os>-<frontend>". The checker supports any number of
+# lanes, each compared against the reference lane above.
+#
+# Reserved for later plans (not added here): "macos-nfs" (34), "linux-nfs"
+# (34), "windows-winfsp" (35), "android-saf" (36), "linux-csi" (37, a subset
+# of the harness run through pods per plan 37's parity lane).
+
+# linux-fuse-process differs from linux-fuse only in the S3 backend
+# (versitygw + native toxiproxy instead of floci + dockerised toxiproxy), so
+# it starts with NO expectations: any difference is a backend bug or a
+# harness bug and must be fixed or explained here with a scenario-specific
+# entry (never a wildcard). Entry shape, for reference:
+#
+# [[expect]]
+# scenario = "<name or * (capability skips only)>"
+# lanes = ["<os>-<frontend>", ...]
+# outcome = "skipped"            # "failed" can never be expected
+# cap = "<Cap>"                  # required when scenario = "*"
+# reason = "<why this lane legitimately differs>"
+#
+# (The file is intentionally empty of entries here; a missing `expect` key
+# means "no expectations". Plans 34/35/36 append `[[expect]]` tables.)

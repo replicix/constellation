@@ -66,10 +66,67 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 fio stress-ng
       - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
-      - run: target/release/harness run 2>&1 | tee harness.log
+      # `pipefail`: the run's exit status must survive `tee`.
+      - run: |
+          set -o pipefail
+          target/release/harness run --results-json results-linux-fuse.json 2>&1 | tee harness-linux-fuse.log
+      # The `parity` job downloads every `harness-*` artifact and compares the
+      # lanes' results-<lane>.json files.
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: harness-logs, path: harness.log }
+        with: { name: harness-linux-fuse, path: "*-linux-fuse.*" }
+
+  harness-lanes-linux:
+    needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [linux-fuse-process]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 fio stress-ng
+      - run: bash tests/ci/install-native-s3.sh
+      - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
+      - run: |
+          set -o pipefail
+          target/release/harness run --s3-backend process --frontend fuse \
+            --results-json results-${{ matrix.lane }}.json 2>&1 | tee harness-${{ matrix.lane }}.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "harness-${{ matrix.lane }}", path: "*-${{ matrix.lane }}.*" }
+
+  conformance:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p constellation-vfs --features conformance 2>&1 | tee conformance.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: conformance-logs, path: conformance.log }
+
+  parity:
+    if: always()
+    needs: [harness, harness-lanes-linux, conformance]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The checker's own tests: a deliberate mismatch must fail closed.
+      - run: python3 -m unittest discover -s tests -p 'test_parity.py'
+      - uses: actions/download-artifact@v4
+        with: { path: results, pattern: "harness-*", merge-multiple: true }
+      # Every lane this workflow runs is required: a lane whose job died
+      # before writing its results must fail parity, not drop out of it.
+      - run: |
+          set -o pipefail
+          python3 tests/parity.py --expect tests/platform-parity.toml \
+            --require-lane linux-fuse --require-lane linux-fuse-process \
+            results/results-*.json | tee -a "$GITHUB_STEP_SUMMARY"
 
   xfstests:
     needs: harness
@@ -130,7 +187,7 @@ jobs:
 
   summary:
     if: always()
-    needs: [lint, unit, integration, compliance, harness, xfstests, performance, linux-package, macos]
+    needs: [lint, unit, integration, compliance, harness, harness-lanes-linux, conformance, parity, xfstests, performance, linux-package, macos]
     runs-on: ubuntu-latest
     steps:
       - name: Publish summary

@@ -1009,7 +1009,7 @@ fn fuse_connection_of(mountpoint: &Path) -> Option<u32> {
     None
 }
 
-fn is_mountpoint(p: &Path) -> bool {
+pub(crate) fn is_mountpoint(p: &Path) -> bool {
     Command::new("mountpoint")
         .arg("-q")
         .arg(p)

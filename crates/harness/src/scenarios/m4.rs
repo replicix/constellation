@@ -23,7 +23,7 @@ fn list_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
             url.push_str(&urlencode(t));
         }
         let mut body = String::new();
-        ureq::get(&url)
+        crate::s3auth::get(&url)
             .call()
             .with_context(|| format!("listing {prefix}"))?
             .into_reader()
@@ -81,7 +81,7 @@ fn logged_completions(
             continue;
         };
         let mut compressed = Vec::new();
-        match ureq::get(&raw_key(endpoint, &key)).call() {
+        match crate::s3auth::get(&raw_key(endpoint, &key)).call() {
             Ok(resp) => {
                 resp.into_reader().read_to_end(&mut compressed)?;
             }

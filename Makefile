@@ -103,7 +103,7 @@ clean: ## Remove build artifacts
 	$(CARGO) clean
 	rm -rf $(TARGET_DIR)
 
-smoke: $(RELEASE_BIN) ## Host smoke test (local file backend; needs fuse3)
+smoke: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Host smoke test (local file backend; needs fuse3)
 	tests/smoke.sh
 
 integration: $(RELEASE_BIN) ## Host integration (floci S3 in docker)

@@ -498,18 +498,18 @@ pub fn raw_s3_timing(
     for i in 0..iterations {
         let key = format!("{base}/obj-{i}");
         let t = Instant::now();
-        ureq::put(&key).send_bytes(b"x")?;
+        crate::s3auth::put(&key).send_bytes(b"x")?;
         put_ms.push(t.elapsed().as_secs_f64() * 1000.0);
 
         let cas_key = format!("{base}/cas-{i}");
         let t = Instant::now();
-        ureq::put(&cas_key)
+        crate::s3auth::put(&cas_key)
             .set("If-None-Match", "*")
             .send_bytes(b"x")?;
         cas_ms.push(t.elapsed().as_secs_f64() * 1000.0);
 
         let t = Instant::now();
-        let _ = ureq::get(&key).call()?;
+        let _ = crate::s3auth::get(&key).call()?;
         get_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let p50 = |v: &mut Vec<f64>| {

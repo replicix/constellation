@@ -1298,7 +1298,7 @@ fn assert_replica_clean(client: &Client) -> Result<()> {
 }
 
 fn assert_prefix_empty(endpoint: &str, prefix: &str, what: &str) -> Result<()> {
-    let body = ureq::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
+    let body = crate::s3auth::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
         .call()?
         .into_string()?;
     anyhow::ensure!(!body.contains("<Key>"), "{what} is not empty: {body}");

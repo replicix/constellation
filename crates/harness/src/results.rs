@@ -10,6 +10,8 @@
 //! {
 //!   "schema": 1,
 //!   "lane": "linux-fuse",
+//!   "s3_backend": "docker",
+//!   "frontend": "fuse",
 //!   "seed": 42,
 //!   "shard": "2/4",
 //!   "started_at": 1790000000,
@@ -24,7 +26,15 @@
 //! ```
 //!
 //! - `schema`: integer, bumped only on an incompatible change.
-//! - `lane`: `<os>-<frontend>` lane name (default `linux-fuse`).
+//! - `lane`: lane name. Defaults to `<os>-<frontend>`, with a `-process`
+//!   suffix under `--s3-backend process` (so `linux-fuse` and
+//!   `linux-fuse-process` on Linux); an explicit `--lane` wins.
+//! - `s3_backend` (optional, additive: schema stays 1): the S3 backend the
+//!   run used, `"docker"` (floci + dockerised toxiproxy) or `"process"`
+//!   (versitygw + native toxiproxy). Absent in files written before it was
+//!   added; consumers must not require it.
+//! - `frontend` (optional, additive): the `--frontend` the run mounted
+//!   through (`"fuse"` is the only value so far).
 //! - `seed`: the workload seed of the run.
 //! - `shard`: the `--shard` argument verbatim (`"i/n"`), or `null` when the
 //!   run was not sharded.
@@ -43,8 +53,39 @@ use serde::Serialize;
 /// Current value of the top-level `schema` field.
 pub const SCHEMA: u32 = 1;
 
-/// Lane reported when `--lane` is not given.
+/// Lane reported by [`RunResults::new`] until the caller says otherwise.
 pub const DEFAULT_LANE: &str = "linux-fuse";
+
+/// Frontends `--frontend` accepts. Only the kernel FUSE adapter exists so
+/// far; NFS/WinFsp/SAF land with plans 34-36.
+pub const FRONTENDS: &[&str] = &["fuse"];
+
+/// Validate a `--frontend` value.
+pub fn check_frontend(name: &str) -> Result<()> {
+    if FRONTENDS.contains(&name) {
+        Ok(())
+    } else {
+        bail!(
+            "unsupported --frontend {name:?}: only {} {} supported for now",
+            FRONTENDS
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if FRONTENDS.len() == 1 { "is" } else { "are" }
+        )
+    }
+}
+
+/// The lane name for a run that gave no `--lane`: `<os>-<frontend>`, plus
+/// `-process` when the S3 backend is the native-process one.
+pub fn default_lane(frontend: &str, backend: crate::s3env::S3Backend) -> String {
+    let suffix = match backend {
+        crate::s3env::S3Backend::Docker => "",
+        crate::s3env::S3Backend::Process => "-process",
+    };
+    format!("{}-{frontend}{suffix}", std::env::consts::OS)
+}
 
 /// A parsed `--shard i/n` argument (`index` is 1-based).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +155,10 @@ pub struct ScenarioResult {
 pub struct RunResults {
     pub schema: u32,
     pub lane: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<String>,
     pub seed: u64,
     pub shard: Option<String>,
     pub started_at: u64,
@@ -129,11 +174,20 @@ impl RunResults {
         Self {
             schema: SCHEMA,
             lane: lane.to_string(),
+            s3_backend: None,
+            frontend: None,
             seed,
             shard: shard.map(|s| s.to_string()),
             started_at,
             scenarios: Vec::new(),
         }
+    }
+
+    /// Record the S3 backend and frontend the run used.
+    pub fn with_setup(mut self, backend: crate::s3env::S3Backend, frontend: &str) -> Self {
+        self.s3_backend = Some(backend.to_string());
+        self.frontend = Some(frontend.to_string());
+        self
     }
 
     pub fn push(&mut self, name: &str, outcome: Outcome, seconds: f64, reason: Option<String>) {
@@ -221,6 +275,38 @@ mod tests {
         assert_eq!(s[1]["reason"], "fio not installed");
         assert_eq!(s[2]["outcome"], "failed");
         assert_eq!(s[2]["reason"], "boom");
+    }
+
+    #[test]
+    fn records_backend_and_frontend() {
+        use crate::s3env::S3Backend;
+        let v = serde_json::to_value(
+            RunResults::new("linux-fuse-process", 1, None).with_setup(S3Backend::Process, "fuse"),
+        )
+        .unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["s3_backend"], "process");
+        assert_eq!(v["frontend"], "fuse");
+        // Additive: absent when not recorded.
+        let v = serde_json::to_value(RunResults::new("x", 1, None)).unwrap();
+        assert!(v.get("s3_backend").is_none() && v.get("frontend").is_none());
+    }
+
+    #[test]
+    fn frontend_and_default_lane() {
+        use crate::s3env::S3Backend;
+        check_frontend("fuse").unwrap();
+        let e = check_frontend("nfs").unwrap_err().to_string();
+        assert!(e.contains("only `fuse` is supported"), "{e}");
+        let os = std::env::consts::OS;
+        assert_eq!(
+            default_lane("fuse", S3Backend::Docker),
+            format!("{os}-fuse")
+        );
+        assert_eq!(
+            default_lane("fuse", S3Backend::Process),
+            format!("{os}-fuse-process")
+        );
     }
 
     #[test]

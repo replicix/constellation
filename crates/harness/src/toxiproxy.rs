@@ -22,6 +22,11 @@ impl Toxiproxy {
         }
     }
 
+    /// One readiness probe of the API.
+    pub fn is_ready(&self) -> bool {
+        ureq::get(&format!("{}/version", self.api)).call().is_ok()
+    }
+
     pub fn wait_ready(&self, timeout_s: u64) -> Result<()> {
         for _ in 0..timeout_s * 10 {
             if ureq::get(&format!("{}/version", self.api)).call().is_ok() {

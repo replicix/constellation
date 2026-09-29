@@ -1201,7 +1201,7 @@ fn baseline(seed: u64) -> Result<()> {
 }
 
 fn bucket_objects(endpoint: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
-    let response = ureq::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
+    let response = crate::s3auth::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
         .call()
         .context("listing raw E2E objects")?
         .into_string()?;
@@ -1226,7 +1226,7 @@ fn bucket_objects(endpoint: &str, prefix: &str) -> Result<Vec<(String, Vec<u8>)>
         })
         .map(|key| {
             let mut bytes = Vec::new();
-            ureq::get(&format!("{endpoint}/{BUCKET}/{key}"))
+            crate::s3auth::get(&format!("{endpoint}/{BUCKET}/{key}"))
                 .call()
                 .with_context(|| format!("fetching raw object {key}"))?
                 .into_reader()
@@ -1598,7 +1598,7 @@ fn chunk_key(prefix: &str, data: &[u8]) -> String {
 }
 
 fn raw_exists(endpoint: &str, key: &str) -> bool {
-    ureq::head(&raw_key(endpoint, key)).call().is_ok()
+    crate::s3auth::head(&raw_key(endpoint, key)).call().is_ok()
 }
 
 fn gc_lifecycle(_seed: u64) -> Result<()> {
@@ -1646,7 +1646,7 @@ fn gc_lifecycle(_seed: u64) -> Result<()> {
         std::fs::read(client.mnt.join("tree/live"))? == live,
         "live file changed after GC"
     );
-    let listing = ureq::get(&format!(
+    let listing = crate::s3auth::get(&format!(
         "{}/{BUCKET}?list-type=2&prefix={prefix}/gc/journal/",
         env.direct_endpoint
     ))
@@ -1722,7 +1722,7 @@ fn gc_run_bounded(client: &Client, deadline: Duration) -> Result<std::process::O
 /// Object keys under `prefix` (one LIST page; the scenarios below list a
 /// few dozen keys at most).
 fn raw_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
-    let body = ureq::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
+    let body = crate::s3auth::get(&format!("{endpoint}/{BUCKET}?list-type=2&prefix={prefix}"))
         .call()
         .with_context(|| format!("listing {prefix}"))?
         .into_string()?;
@@ -2116,7 +2116,7 @@ fn fsck_repair(_seed: u64) -> Result<()> {
     client.unmount()?;
 
     let data_key = chunk_key(&prefix, bytes);
-    ureq::delete(&raw_key(&env.direct_endpoint, &data_key)).call()?;
+    crate::s3auth::delete(&raw_key(&env.direct_endpoint, &data_key)).call()?;
     let orphan_hash = blake3::hash(b"orphan-name").to_hex().to_string();
     let orphan_key = format!(
         "{prefix}/chunks/{}/{}/{}",
@@ -2124,9 +2124,9 @@ fn fsck_repair(_seed: u64) -> Result<()> {
         &orphan_hash[2..4],
         orphan_hash
     );
-    ureq::put(&raw_key(&env.direct_endpoint, &orphan_key)).send_bytes(b"orphan-object")?;
+    crate::s3auth::put(&raw_key(&env.direct_endpoint, &orphan_key)).send_bytes(b"orphan-object")?;
     let torn = format!("{prefix}/log/p0/fffffffffffffffe.zst");
-    ureq::put(&raw_key(&env.direct_endpoint, &torn)).send_bytes(b"torn")?;
+    crate::s3auth::put(&raw_key(&env.direct_endpoint, &torn)).send_bytes(b"torn")?;
 
     let detect = client.fsck(false)?;
     anyhow::ensure!(
@@ -2861,7 +2861,7 @@ fn raw_chunk_count(env: &S3Env, prefix: &str) -> Result<usize> {
         env.direct_endpoint, BUCKET, prefix
     );
     let mut body = String::new();
-    ureq::get(&url)
+    crate::s3auth::get(&url)
         .call()
         .context("raw bucket LIST for chunk count")?
         .into_reader()
@@ -8104,7 +8104,7 @@ fn raw_objects(endpoint: &str, prefix: &str) -> Result<Vec<(String, u64)>> {
             url.push_str(&url_encode(t));
         }
         let mut body = String::new();
-        ureq::get(&url)
+        crate::s3auth::get(&url)
             .call()
             .with_context(|| format!("listing {prefix}"))?
             .into_reader()
@@ -9530,7 +9530,7 @@ fn holder_crash_phantom_new_holder(_seed: u64) -> Result<()> {
 fn segment_header(endpoint: &str, prefix: &str, part: &str, seq: u64) -> Result<(u64, u64, u64)> {
     let key = format!("{prefix}/log/{part}/{seq:016x}.zst");
     let mut compressed = Vec::new();
-    ureq::get(&raw_key(endpoint, &key))
+    crate::s3auth::get(&raw_key(endpoint, &key))
         .call()
         .with_context(|| format!("fetching {key}"))?
         .into_reader()
@@ -9563,7 +9563,7 @@ fn commit_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
 /// `store-s3::commits::Commit`).
 fn read_commit(endpoint: &str, key: &str) -> Result<serde_json::Value> {
     let mut body = Vec::new();
-    ureq::get(&raw_key(endpoint, key))
+    crate::s3auth::get(&raw_key(endpoint, key))
         .call()
         .with_context(|| format!("fetching {key}"))?
         .into_reader()
