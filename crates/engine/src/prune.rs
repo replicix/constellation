@@ -142,7 +142,7 @@ pub struct RootReport {
 pub struct PruneDeps {
     pub store: Arc<dyn ObjectStore>,
     pub meta: Arc<Meta>,
-    pub sync_tx: tokio::sync::mpsc::UnboundedSender<crate::fusefs::SyncRequest>,
+    pub sync_tx: tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>,
     /// The core's lease view (the fast path's admission gate).
     pub lease: Arc<crate::lease::LeaseView>,
     pub forward: Arc<crate::forward::ForwardState>,
@@ -728,7 +728,7 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
         if let Some(_owned) = deps.meta.root_fast_path(&op) {
             match constellation_meta::execute_mutate(&deps.meta, &op, Some(rid)) {
                 Ok(_) => {
-                    let _ = deps.sync_tx.send(crate::fusefs::SyncRequest::Nudge);
+                    let _ = deps.sync_tx.send(crate::sync::SyncRequest::Nudge);
                     return UnlinkResult::Done { freed };
                 }
                 Err(_) => return UnlinkResult::SkippedForward,
@@ -743,7 +743,7 @@ async fn unlink_now(deps: &PruneDeps, v: &VictimRef, nlink: u32) -> UnlinkResult
     let (reply, rx) = tokio::sync::oneshot::channel();
     if deps
         .sync_tx
-        .send(crate::fusefs::SyncRequest::Submit {
+        .send(crate::sync::SyncRequest::Submit {
             op,
             rid,
             policy: constellation_authority::Policy::System,

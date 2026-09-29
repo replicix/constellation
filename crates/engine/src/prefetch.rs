@@ -57,7 +57,7 @@ struct Stream {
 }
 
 #[derive(Default)]
-pub(crate) struct PrefetchStats {
+pub struct PrefetchStats {
     inflight: AtomicU64,
     queued: AtomicU64,
     stalls: AtomicU64,
@@ -76,7 +76,7 @@ pub(crate) struct PrefetchStats {
 }
 
 impl PrefetchStats {
-    pub(crate) fn snapshot(&self) -> constellation_api::PrefetchStatus {
+    pub fn snapshot(&self) -> constellation_api::PrefetchStatus {
         let windows = self.windows.lock().unwrap();
         let streams = windows.len() as u64;
         let window_bytes = windows.values().copied().max().unwrap_or(0);
@@ -570,11 +570,11 @@ impl Prefetcher {
         self.scheduler.forget(ino);
     }
 
-    pub(crate) fn stats(&self) -> Arc<PrefetchStats> {
+    pub fn stats(&self) -> Arc<PrefetchStats> {
         self.stats.clone()
     }
 
-    pub(crate) fn enqueue_scan(&self, files: Vec<crate::scan::ScanFile>) {
+    pub fn enqueue_scan(&self, files: Vec<crate::scan::ScanFile>) {
         let mut count = 0u64;
         let mut bytes = 0u64;
         for file in files {

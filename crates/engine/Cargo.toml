@@ -1,0 +1,47 @@
+[package]
+name = "constellation-engine"
+description = "The Constellation engine (plan 31 §3, §4): every storage algorithm behind the frontends — leases and the authority driver, the shipper, coop, GC, snapshots, epochs, cluster locks, prefetch, write-back, E2E, prune, fsck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Test-only constructors (`UploadRuntime::for_test`,
+# `snapshot::test_manager`) for the unit tests of the crates that embed the
+# engine (cli's FUSE adapter tests); enabled from their dev-dependencies.
+test-util = ["dep:tempfile"]
+
+# No `fuser` (the FUSE frontend stays in crates/cli until plan 31 C4) and no
+# `libc`: after plan 31 C2 every host call goes through
+# constellation-platform, and the last direct use (`F_RDLCK`/`F_WRLCK`/
+# `F_UNLCK` in `locks.rs`) moved to the FUSE adapter in C3.
+[dependencies]
+constellation-types.workspace = true
+constellation-platform.workspace = true
+constellation-fs-core.workspace = true
+constellation-authority.workspace = true
+constellation-meta.workspace = true
+constellation-mtree.workspace = true
+# Status report types only (no `web` feature).
+constellation-api.workspace = true
+constellation-net.workspace = true
+constellation-upload-concurrency.workspace = true
+constellation-store-s3.workspace = true
+fjall = { version = "3.1", package = "fjall" }
+anyhow.workspace = true
+object_store.workspace = true
+postcard.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+# The object store's trait is an `async_trait` (`backend::CountingStore`).
+async-trait = "0.1"
+# `test-util`'s `snapshot::test_manager` keeps its node cache in a temp dir.
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

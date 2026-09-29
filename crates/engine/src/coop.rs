@@ -401,7 +401,7 @@ impl Coop {
     }
 
     /// Wire the epoch manager's member list (see `epoch_members`).
-    pub(crate) fn set_epoch_members(&self, members: Arc<Mutex<Vec<u64>>>) {
+    pub fn set_epoch_members(&self, members: Arc<Mutex<Vec<u64>>>) {
         *self.epoch_members.lock().unwrap() = Some(members);
     }
 

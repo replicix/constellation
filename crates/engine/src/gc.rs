@@ -41,7 +41,7 @@ pub enum GcTail {
     /// ask the live sync task — which owns the real `Shipper`, with its
     /// lease and partition state — to tail every partition, through the
     /// same channel pattern every other cross-thread daemon call uses.
-    Daemon(tokio::sync::mpsc::UnboundedSender<crate::fusefs::SyncRequest>),
+    Daemon(tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>),
     /// GC is running standalone (`constellation gc` with no daemon
     /// holding this state dir, or the periodic in-daemon task before a
     /// sync channel exists): attach a throwaway tail-only `Shipper`
@@ -72,7 +72,7 @@ impl GcTail {
         match self {
             GcTail::Daemon(tx) => {
                 let (reply, receive) = tokio::sync::oneshot::channel();
-                tx.send(crate::fusefs::SyncRequest::TailToHead { reply })
+                tx.send(crate::sync::SyncRequest::TailToHead { reply })
                     .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
                 receive
                     .await

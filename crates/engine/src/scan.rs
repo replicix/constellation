@@ -20,7 +20,7 @@ const SCAN_IDLE: Duration = Duration::from_secs(60);
 const MIN_WINDOW: u64 = 16 << 20;
 const MAX_WINDOW: u64 = 256 << 20;
 
-pub(crate) struct ScanFile {
+pub struct ScanFile {
     pub ino: Ino,
     pub hashes: Vec<ChunkHash>,
     pub bytes: u64,
@@ -37,7 +37,7 @@ struct Scan {
     last_hit: Instant,
 }
 
-pub(crate) struct ScanAhead {
+pub struct ScanAhead {
     meta: Arc<Meta>,
     enabled: bool,
     max_window: u64,
@@ -46,7 +46,7 @@ pub(crate) struct ScanAhead {
 }
 
 impl ScanAhead {
-    pub(crate) fn new(meta: Arc<Meta>, cache_budget: u64) -> Self {
+    pub fn new(meta: Arc<Meta>, cache_budget: u64) -> Self {
         let enabled = !std::env::var("CONSTELLATION_SCAN_AHEAD")
             .ok()
             .is_some_and(|value| {
@@ -93,7 +93,7 @@ impl ScanAhead {
         order
     }
 
-    pub(crate) fn note_read(&self, ino: Ino) -> Vec<ScanFile> {
+    pub fn note_read(&self, ino: Ino) -> Vec<ScanFile> {
         if !self.enabled {
             return Vec::new();
         }
@@ -240,7 +240,7 @@ impl ScanAhead {
         files
     }
 
-    pub(crate) fn note_stall(&self, ino: Ino) {
+    pub fn note_stall(&self, ino: Ino) {
         let Some(dir) = self.file_to_dir.lock().unwrap().get(&ino).copied() else {
             return;
         };

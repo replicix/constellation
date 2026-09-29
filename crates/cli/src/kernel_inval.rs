@@ -367,6 +367,18 @@ impl InodeInvalidator {
     }
 }
 
+/// The engine's lock path reaches the kernel through this (plan 31 C3;
+/// C4's `FrontendEvents`).
+impl constellation_engine::events::FrontendEvents for InodeInvalidator {
+    fn invalidate_inode(&self, ino: Ino) {
+        self.invalidate(ino);
+    }
+
+    fn invalidate_inode_and_wait(&self, ino: Ino, timeout: Duration) -> bool {
+        self.invalidate_and_wait(ino, timeout)
+    }
+}
+
 /// The FUSE handlers' registry of requests in flight, by replica inode:
 /// a notification for an inode with a request in flight is held back
 /// (module doc). Cheap to clone; `disabled` counts nothing.

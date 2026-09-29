@@ -15,7 +15,7 @@
 //! conflict directory) is as good as a fresh one.
 
 use crate::forward::ForwardState;
-use crate::fusefs::SyncRequest;
+use crate::sync::SyncRequest;
 use constellation_authority::{ClientReply, Policy};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;

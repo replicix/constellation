@@ -214,7 +214,7 @@ impl LeaseView {
     pub fn admit(&self) -> Option<AdmitGuard<'_>> {
         // Plan 30 §M9: under a durability gate the fast path still
         // executes here; its acknowledgement then waits for the core's
-        // durable watermark (`ConstellationFs::ack_when_durable`).
+        // durable watermark (`View::ack_when_durable`).
         self.inflight.fetch_add(1, Ordering::SeqCst);
         if self.open_for_new_mutation() {
             Some(AdmitGuard(self))

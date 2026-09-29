@@ -43,7 +43,7 @@ pub struct TreeAccess {
 }
 
 impl TreeAccess {
-    pub fn from_reader(reader: crate::mtree_read::ChainReader) -> TreeAccess {
+    pub(crate) fn from_reader(reader: crate::mtree_read::ChainReader) -> TreeAccess {
         TreeAccess {
             nodes: reader.cache,
             config: reader.config,
@@ -589,8 +589,8 @@ fn validate_name(name: &str) -> Result<()> {
 /// bucket, for tests: its publisher drains the journal itself, and its
 /// node cache runs on a leaked runtime of its own so it works under any
 /// caller's runtime flavour and outlives the caller's.
-#[cfg(test)]
-pub(crate) fn test_manager(
+#[cfg(any(test, feature = "test-util"))]
+pub fn test_manager(
     meta: Arc<Meta>,
     chunks: Arc<constellation_store_s3::ChunkStore>,
     chunk_size: u32,

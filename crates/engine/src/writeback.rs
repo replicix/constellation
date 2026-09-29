@@ -78,6 +78,9 @@ impl WriteModeState {
 }
 
 /// Delay before accepting another dirty byte at this occupancy.
+// `Err(())` is "over budget: refuse"; public since plan 31 C3 (the FUSE
+// adapter throttles on it), which is what makes clippy ask for an error type.
+#[allow(clippy::result_unit_err)]
 pub fn throttle_delay(used: u64, budget: u64) -> Result<Duration, ()> {
     if budget == 0 || used >= budget {
         return Err(());

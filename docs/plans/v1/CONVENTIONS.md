@@ -31,8 +31,10 @@ before starting any plan. Every plan file assumes you did.
 - Crates: `fs-core` (chunking, manifests, disk cache), `store-s3`
   (S3 layout/chunk store/log store/nodes/lease), `meta` (fjall
   replica, log records, convergent replay), `api` (control API types +
-  unix-socket server), `cli` (the `constellation` binary: FUSE fs,
-  shipper/syncer, lease keeper, mount wiring), `net` (P2P — may be
+  unix-socket server), `engine` (every storage algorithm: the authority
+  driver and shipper, leases, coop, GC, snapshots, epochs, cluster
+  locks, uploads, prefetch — plan 31 C3), `cli` (the `constellation`
+  binary: CLI, daemon host, FUSE adapter, mount wiring), `net` (P2P — may be
   empty until phase 3), `harness` (fault-injection orchestrator:
   docker floci S3 + toxiproxy, model oracle, seeded workloads).
 
@@ -82,12 +84,13 @@ Every plan ends with ALL of these green, run in this order:
   `default-features = false`; Linux mounts use host-sized concurrent
   event loops. tokio multithread runtime.
 - FUSE callbacks run on synchronous worker threads: to reach async code use the
-  existing channel patterns (see `SyncHandle` in `cli/src/fusefs.rs`:
-  unbounded mpsc + `blocking_recv` oneshot barriers). Never block the
+  existing channel patterns (see `SyncHandle` in `cli/src/fusefs.rs`
+  and its `SyncRequest` in `engine/src/sync.rs`: unbounded mpsc +
+  `blocking_recv` oneshot barriers). Never block the
   tokio runtime with sync waits.
 - Comments explain non-obvious intent and trade-offs, never narrate
   code. Match the existing prose-heavy module-doc style (look at
-  `cli/src/shipper.rs` or `store-s3/src/lease.rs`).
+  `engine/src/shipper.rs` or `store-s3/src/lease.rs`).
 - Errors: `thiserror` enums in library crates, `anyhow` with `context`
   in the binary/harness. Refusals are the portable
   `constellation_types::Code` everywhere (`MetaError::code()`); it
@@ -100,7 +103,7 @@ Every plan ends with ALL of these green, run in this order:
   `object_store::memory::InMemory` for S3-shaped things and
   `Meta::open_in_memory()` for metadata. Cross-node logic gets
   in-process multi-node tests (see the pattern at the bottom of
-  `cli/src/shipper.rs`). System-level behavior gets a harness scenario.
+  `engine/src/shipper.rs`). System-level behavior gets a harness scenario.
 
 ## Harness scenario checklist (when a plan asks for one)
 

@@ -21,7 +21,7 @@ macro_rules! checked_name {
 /// here for one CAS.
 macro_rules! gate {
     ($self:expr, $ino:expr, $reply:expr) => {
-        if ConstellationFs::is_synthetic($ino) {
+        if View::is_synthetic($ino) {
             $reply.error(reply_code(Code::ReadOnly));
             return;
         }
@@ -46,7 +46,7 @@ impl Filesystem for FuseFs {
         // `flock` locks to `getlk`/`setlk`; without the capabilities (and
         // on a frozen snapshot view, where nothing can be written) it
         // keeps them node-local, as it always did.
-        if self.cluster_locks().is_some() && !ConstellationFs::is_synthetic(self.view_root()) {
+        if self.cluster_locks().is_some() && !View::is_synthetic(self.view_root()) {
             if let Err(missing) =
                 config.add_capabilities(InitFlags::FUSE_POSIX_LOCKS | InitFlags::FUSE_FLOCK_LOCKS)
             {
@@ -787,7 +787,7 @@ impl Filesystem for FuseFs {
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             match self.read_frozen(ino, offset, size as u64) {
                 Ok(data) => reply.data(&data),
                 Err(error) => reply.error(reply_code(error)),
@@ -820,7 +820,7 @@ impl Filesystem for FuseFs {
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             reply.error(reply_code(Code::ReadOnly));
             return;
         }
@@ -860,7 +860,7 @@ impl Filesystem for FuseFs {
         // explicit unlock, which then finds nothing.
         let locks = self
             .cluster_locks()
-            .filter(|_| !ConstellationFs::is_synthetic(ino));
+            .filter(|_| !View::is_synthetic(ino));
         let gate = self.lock_publish_gate(ino);
         let idle = locks.map(|l| l.drop_owner(ino, lock_owner.0));
         let r = gate.and_then(|owed| {
@@ -924,7 +924,7 @@ impl Filesystem for FuseFs {
         let _w = crate::fuse_watch::enter("release", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             reply.ok();
             return;
         }
@@ -993,7 +993,7 @@ impl Filesystem for FuseFs {
         let visible_ino = ino;
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             let entries = match self.synthetic_entries(ino) {
                 Ok(entries) => entries,
                 Err(error) => return reply.error(reply_code(error)),
@@ -1096,7 +1096,7 @@ impl Filesystem for FuseFs {
             reply.error(reply_code(Code::Perm));
             return;
         }
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             reply.error(reply_code(Code::ReadOnly));
             return;
         }
@@ -1188,11 +1188,11 @@ impl Filesystem for FuseFs {
             Ok(name) => name,
             Err(error) => return reply.error(reply_code(error)),
         };
-        if !ConstellationFs::is_synthetic(ino) {
+        if !View::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
         }
         let value = if virtual_xattr(&name) {
-            let aggregate = if ConstellationFs::is_synthetic(ino) {
+            let aggregate = if View::is_synthetic(ino) {
                 self.synthetic_recursive_size(ino)
             } else {
                 self.meta.recursive_size(ino).map_err(|error| error.code())
@@ -1208,7 +1208,7 @@ impl Filesystem for FuseFs {
                 Err(error) => return reply.error(reply_code(error)),
             }
         } else {
-            let result = if ConstellationFs::is_synthetic(ino) {
+            let result = if View::is_synthetic(ino) {
                 self.synthetic_xattrs(ino)
                     .map(|attrs| attrs.into_iter().find(|(key, _)| key == &name).map(|x| x.1))
             } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
@@ -1233,10 +1233,10 @@ impl Filesystem for FuseFs {
         let _w = crate::fuse_watch::enter("listxattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
-        if !ConstellationFs::is_synthetic(ino) {
+        if !View::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
         }
-        let names = if ConstellationFs::is_synthetic(ino) {
+        let names = if View::is_synthetic(ino) {
             self.synthetic_xattrs(ino)
                 .map(|attrs| attrs.into_iter().map(|(name, _)| name).collect())
         } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
@@ -1274,7 +1274,7 @@ impl Filesystem for FuseFs {
             reply.error(reply_code(Code::Perm));
             return;
         }
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             reply.error(reply_code(Code::ReadOnly));
             return;
         }
@@ -1389,12 +1389,19 @@ impl Filesystem for FuseFs {
             reply.error(reply_code(Code::NotImplemented));
             return;
         };
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             // Frozen snapshot files take no cluster locks (see `setlk`).
             reply.locked(0, 0, libc::F_UNLCK, 0);
             return;
         }
-        let (start, end, typ, pid) = locks.test(ino, lock_owner.0, start, end, typ);
+        let (start, end, typ, pid) =
+            match locks.test(ino, lock_owner.0, start, end, typ == libc::F_WRLCK) {
+                Some((start, end, write, pid)) => {
+                    let typ = if write { libc::F_WRLCK } else { libc::F_RDLCK };
+                    (start, end, typ, pid)
+                }
+                None => (0, 0, libc::F_UNLCK, 0),
+            };
         reply.locked(start, end, typ, pid);
     }
 
@@ -1436,7 +1443,7 @@ impl Filesystem for FuseFs {
             reply.error(reply_code(Code::Invalid));
             return;
         }
-        if ConstellationFs::is_synthetic(ino) {
+        if View::is_synthetic(ino) {
             // A frozen snapshot file (inside a live view's `.snapshots`)
             // has no sequencer to lease a grant from.
             reply.error(reply_code(Code::NoLock));
@@ -1452,7 +1459,15 @@ impl Filesystem for FuseFs {
             start,
             end,
         };
-        locks.lock(ino, lock, sleep, reply, watch);
+        // Plan 31 C3: the engine answers through this callback, from
+        // this worker or from its `lock-wait` thread (C4's `Responder`).
+        locks.lock(ino, lock, sleep, move |r: Result<(), Code>| {
+            match r {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(reply_code(e)),
+            }
+            drop(watch);
+        });
     }
 }
 
@@ -1487,7 +1502,7 @@ fn reply_xattr(value: Vec<u8>, size: u32, reply: ReplyXattr) {
     }
 }
 
-impl ConstellationFs {
+impl View {
     fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, Code> {
         // Serve pending (unflushed) state when present so read-after-write
         // within an open handle is coherent. The inode's operation lock

@@ -7,8 +7,10 @@
 # macOS: cli's Linux-only FUSE-frontend code (i16/u16 lock-type and mode
 # types, `FALLOC_FL_*` fallocate-op flags, fuser/libc call signatures, the
 # `setxattr`/`getxattr` arities in main.rs; 33 errors after plan 31 C2 moved
-# `gettid`/`tgkill`/`fallocate`/`flock` behind constellation-platform). C4
-# rebuilds this code as the FUSE frontend.
+# `gettid`/`tgkill`/`fallocate`/`flock` behind constellation-platform, 29
+# after C3 — all in fusefs_ops.rs and main.rs; the extracted
+# constellation-engine compiles for macOS). C4 rebuilds this code as the FUSE
+# frontend.
 aarch64-apple-darwin constellation
 # macOS: the harness's own Linux-only calls (`libc::fallocate`, the
 # `setxattr`/`getxattr` arities in scenarios.rs; 8 errors). Reached since
@@ -19,5 +21,11 @@ aarch64-apple-darwin constellation-harness
 
 # Windows: `tokio::net::Unix{Listener,Stream}` in the control API.
 x86_64-pc-windows-gnu constellation-api
+# Windows: the engine (plan 31 C3) depends on constellation-api for its
+# status report types, so it stops at the api's unix-socket server above;
+# past that, `staging.rs` writes staging files with
+# `std::os::unix::fs::FileExt` (`read_at`/`write_at`). Engine code itself has
+# no `libc`/`fuser` since C3.
+x86_64-pc-windows-gnu constellation-engine
 # Windows: `std::os::unix` (permissions, symlinks) in the checker.
 x86_64-pc-windows-gnu constellation-chaos

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/types",
     "crates/platform",
+    "crates/engine",
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
@@ -25,6 +26,7 @@ members = [
 default-members = [
     "crates/types",
     "crates/platform",
+    "crates/engine",
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
@@ -49,6 +51,7 @@ repository = "https://github.com/replicix/constellation"
 [workspace.dependencies]
 constellation-types = { path = "crates/types" }
 constellation-platform = { path = "crates/platform" }
+constellation-engine = { path = "crates/engine" }
 constellation-fs-core = { path = "crates/fs-core" }
 constellation-meta = { path = "crates/meta" }
 constellation-mtree = { path = "crates/mtree" }

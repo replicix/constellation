@@ -230,7 +230,7 @@ pub struct NodeRuntime {
     pending_acks: Arc<std::sync::Mutex<Vec<u64>>>,
     acquire_deadline: Duration,
     write_mode: Arc<writeback::WriteModeState>,
-    sync_tx: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    sync_tx: tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>,
     peers: constellation_net::Peers,
     epochs: Arc<epoch::EpochManager>,
     designations: Arc<designation::DesignationManager>,
@@ -571,7 +571,7 @@ impl NodeRuntime {
         // Sync task channel: FUSE nudges it on close (publication point),
         // blocks on it for fsync in --fsync-mode s3, and asks it to take
         // the lease on the first mutation.
-        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<fusefs::SyncRequest>();
+        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<crate::sync::SyncRequest>();
 
         // A snapshot is a retained metadata root (plan 28), so taking one
         // forces a publish on the sync task, which owns the publisher. A
@@ -590,7 +590,7 @@ impl NodeRuntime {
                     let mut waited = 0u32;
                     loop {
                         let (reply, receive) = tokio::sync::oneshot::channel();
-                        tx.send(fusefs::SyncRequest::Publish { reply })
+                        tx.send(crate::sync::SyncRequest::Publish { reply })
                             .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
                         match receive
                             .await
@@ -949,7 +949,7 @@ impl NodeRuntime {
                 }
             });
         }
-        let _ = sync_tx.send(fusefs::SyncRequest::Roster(initial_roster));
+        let _ = sync_tx.send(crate::sync::SyncRequest::Roster(initial_roster));
         if !read_only_member {
             crate::startup::phase("adopting the root directory owner");
             rt.block_on(crate::adopt_root(&meta, &sync_tx, &forward, node_id))
@@ -1037,7 +1037,7 @@ impl NodeRuntime {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         let scan =
                             crate::refresh_peers(&peers, store_inner.clone(), Some(&epochs)).await;
-                        let _ = sync_tx.send(fusefs::SyncRequest::Roster(epochs.roster()));
+                        let _ = sync_tx.send(crate::sync::SyncRequest::Roster(epochs.roster()));
                         peers.probe_all().await;
                         tick += 1;
                         if tick.is_multiple_of(SLACK_REREAD_TICKS) {
@@ -1068,7 +1068,7 @@ impl NodeRuntime {
                                 );
                                 departed.store(true, Ordering::Relaxed);
                                 let _ = meta.kv_set("left", "1");
-                                let _ = sync_tx.send(fusefs::SyncRequest::Retired);
+                                let _ = sync_tx.send(crate::sync::SyncRequest::Retired);
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -1102,7 +1102,7 @@ impl NodeRuntime {
                         // A requester this holder has not polled yet (a
                         // node that mounted after our last read): the core
                         // polls it at once (plan 30 M13 round 2).
-                        let _ = sync_tx_roster.send(fusefs::SyncRequest::Roster(roster));
+                        let _ = sync_tx_roster.send(crate::sync::SyncRequest::Roster(roster));
                     }
                     match constellation_store_s3::get_node(store_inner.clone(), node_id).await {
                         Ok(None) => {
@@ -1120,7 +1120,7 @@ impl NodeRuntime {
                             );
                             departed.store(true, Ordering::Relaxed);
                             let _ = meta.kv_set("left", "1");
-                            let _ = sync_tx_roster.send(fusefs::SyncRequest::Retired);
+                            let _ = sync_tx_roster.send(crate::sync::SyncRequest::Retired);
                         }
                         _ => {}
                     }
@@ -1142,7 +1142,7 @@ impl NodeRuntime {
                     // Plan 30 §M11 phase 2b: the root keeps the table in
                     // step with the designations (a no-op elsewhere).
                     let entries = designations.delegation_entries();
-                    let _ = deleg_tx.send(fusefs::SyncRequest::SyncDesignations { entries });
+                    let _ = deleg_tx.send(crate::sync::SyncRequest::SyncDesignations { entries });
                 }
             });
         }
@@ -1261,7 +1261,7 @@ impl NodeRuntime {
         if reintegrate_on_mount {
             let (reply, receive) = tokio::sync::oneshot::channel();
             sync_tx
-                .send(fusefs::SyncRequest::Reintegrate(reply))
+                .send(crate::sync::SyncRequest::Reintegrate(reply))
                 .map_err(|_| anyhow::anyhow!("sync task stopped before automatic reintegration"))?;
             rt.block_on(receive)
                 .context("automatic reintegration task stopped")?
@@ -1466,7 +1466,7 @@ impl NodeRuntime {
         };
 
         let departed = self.departed.clone();
-        let mut fs = fusefs::ConstellationFs::new(
+        let mut fs = fusefs::View::new(
             fusefs::FsDependencies {
                 inflight: self
                     .kernel_inval
@@ -1484,7 +1484,10 @@ impl NodeRuntime {
                         Arc::new(crate::locks::ClusterLocks {
                             meta: self.meta.clone(),
                             tx: self.sync_tx.clone(),
-                            inval: self.kernel_inval.as_ref().map(|k| k.inodes()),
+                            inval: self.kernel_inval.as_ref().map(|k| {
+                                Arc::new(k.inodes())
+                                    as Arc<dyn constellation_engine::events::FrontendEvents>
+                            }),
                         })
                     }),
                     lease: self.lease.clone(),
@@ -1746,13 +1749,13 @@ impl NodeRuntime {
 
     /// Invalidate every mounted view's cached quota cap after a live
     /// `SetQuota`. Quota is node-level (one `meta.db`, one cap), but each
-    /// view's `ConstellationFs` keeps its own short-TTL read cache of it
+    /// view's `View` keeps its own short-TTL read cache of it
     /// (`QUOTA_CACHE_TTL`) to avoid a `meta.quota()` round trip on every
     /// statfs/write; a single-view invalidation would leave any other
     /// mounted view serving the stale cap for up to that TTL.
     pub fn invalidate_quota_caches(&self) {
         for handle in self.mounts.lock().unwrap().values() {
-            fusefs::ConstellationFs::invalidate_quota_cache(&handle.quota_cache);
+            fusefs::View::invalidate_quota_cache(&handle.quota_cache);
         }
     }
 
@@ -1879,7 +1882,7 @@ impl NodeRuntime {
             // executes locally from here on), after which the core stops.
             let (reply, receive) = tokio::sync::oneshot::channel();
             self.sync_tx
-                .send(fusefs::SyncRequest::Shutdown { reply })
+                .send(crate::sync::SyncRequest::Shutdown { reply })
                 .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
             receive
                 .await
@@ -1969,7 +1972,7 @@ async fn atime_flush_once(
     atime: &crate::atime::AtimeAccumulator,
     meta: &Arc<Meta>,
     lease: &lease::LeaseView,
-    sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>,
     forward: &forward::ForwardState,
     node_id: u64,
     read_only_member: bool,
@@ -2008,7 +2011,7 @@ async fn atime_flush_once(
         let op = constellation_meta::MutateOp::AtimeBatch { entries: drained };
         let (reply, rx) = tokio::sync::oneshot::channel();
         if sync_tx
-            .send(fusefs::SyncRequest::Submit {
+            .send(crate::sync::SyncRequest::Submit {
                 op,
                 rid: forward.next_system_rid(node_id),
                 policy: constellation_authority::Policy::BestEffort,
@@ -2043,11 +2046,11 @@ const SLACK_REREAD_TICKS: u64 = 12;
 /// (which re-advertises it in its heartbeat) and the epoch coordinator.
 async fn reread_slack(
     store: &Arc<dyn object_store::ObjectStore>,
-    sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>,
 ) {
     match ChunkStore::new(store.clone()).load_fs().await {
         Ok(meta) => {
-            let _ = sync_tx.send(fusefs::SyncRequest::Slack(meta.epoch_slack()));
+            let _ = sync_tx.send(crate::sync::SyncRequest::Slack(meta.epoch_slack()));
         }
         Err(e) => tracing::debug!(error = %e, "re-reading meta.json for epoch_slack failed"),
     }

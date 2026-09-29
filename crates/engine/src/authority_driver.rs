@@ -24,8 +24,8 @@
 //! flag): a write admitted before the flag is either shipped by the
 //! flush or fails the release, never stranded behind it.
 
-use crate::fusefs::{AcquireProgress, HandoffResult, SyncRequest};
 use crate::lease::LeaseView;
+use crate::sync::{AcquireProgress, HandoffResult, SyncRequest};
 use anyhow::{Context, Result};
 use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
@@ -220,7 +220,7 @@ pub struct DriverDeps {
     pub cache: Arc<DiskCache>,
     pub chunk_store: Arc<ChunkStore>,
     pub compression: CompressionSetting,
-    pub upload: Arc<crate::UploadRuntime>,
+    pub upload: Arc<crate::upload::UploadRuntime>,
     pub forward: Arc<crate::forward::ForwardState>,
     pub reintegration: Arc<crate::reintegrate::ReintegrationState>,
     pub state_dir: PathBuf,
@@ -2545,7 +2545,7 @@ impl Driver {
                 // close) says so; the recipient awaits them, and this
                 // node reports them once they are up (`Uploader::run`).
                 let pending =
-                    crate::forwarded_pending_chunks(&self.deps.meta, &self.deps.cache, &op);
+                    crate::upload::forwarded_pending_chunks(&self.deps.meta, &self.deps.cache, &op);
                 self.deps.upload.note_forwarded(&pending, to);
                 // A pass that acked one of them between the two lines
                 // above found no forward to report it to: owe it now.
@@ -3372,7 +3372,8 @@ fn inbox_manifests_pending(
             continue;
         };
         if let MutateOp::SetManifest { ino, .. } = &op {
-            if !crate::forwarded_pending_chunks(&uploader.meta, &uploader.cache, &op).is_empty()
+            if !crate::upload::forwarded_pending_chunks(&uploader.meta, &uploader.cache, &op)
+                .is_empty()
                 && !inos.contains(ino)
             {
                 inos.push(*ino);
@@ -3389,7 +3390,7 @@ struct Uploader {
     meta: Arc<Meta>,
     store: Arc<ChunkStore>,
     compression: CompressionSetting,
-    upload: Arc<crate::UploadRuntime>,
+    upload: Arc<crate::upload::UploadRuntime>,
     /// For the durable reports this pass owes (`meta::store::remote`).
     peers: Option<constellation_net::Peers>,
     node_id: u64,
@@ -3409,8 +3410,8 @@ impl Uploader {
     async fn run_report(
         &self,
         only_ino: Option<constellation_fs_core::Ino>,
-    ) -> Result<crate::UploadReport> {
-        let result = crate::upload_dirty_chunks_report(
+    ) -> Result<crate::upload::UploadReport> {
+        let result = crate::upload::upload_dirty_chunks_report(
             &self.cache,
             &self.meta,
             &self.store,
@@ -3430,13 +3431,14 @@ impl Uploader {
             return;
         };
         let mut reports = self.upload.take_durable_reports();
-        if let Some(all) = reports.remove(&crate::REPORT_TO_ALL) {
+        if let Some(all) = reports.remove(&crate::upload::REPORT_TO_ALL) {
             let known = peers.remote_snapshot();
             if known.is_empty() {
                 // Right after a restart: nobody to tell yet.
-                self.upload.requeue_report(crate::REPORT_TO_ALL, all);
+                self.upload
+                    .requeue_report(crate::upload::REPORT_TO_ALL, all);
             } else {
-                self.upload.report_delivered(crate::REPORT_TO_ALL);
+                self.upload.report_delivered(crate::upload::REPORT_TO_ALL);
                 for peer in known {
                     reports.entry(peer.node_id).or_default().extend(&all);
                 }
@@ -3475,7 +3477,7 @@ impl Uploader {
     /// needs them and the caller sees the journal not shipped.
     async fn run_complete(&self) -> Result<()> {
         let started = std::time::Instant::now();
-        let limit = crate::remote_chunk_wait();
+        let limit = crate::upload::remote_chunk_wait();
         loop {
             let report = self.run_report(None).await?;
             if report.awaiting == 0 || started.elapsed() >= limit {
@@ -3520,14 +3522,14 @@ const OWN_S3_ASK_TIMEOUT: Duration = Duration::from_secs(3);
 /// asked every [`OWN_S3_ASK_EVERY`] whether they reach S3, in the
 /// background (the tick never waits on them).
 struct OwnS3Watch {
-    upload: Arc<crate::UploadRuntime>,
+    upload: Arc<crate::upload::UploadRuntime>,
     peers: constellation_net::Peers,
     asked: Option<std::time::Instant>,
     answer: Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 impl OwnS3Watch {
-    fn new(upload: Arc<crate::UploadRuntime>, peers: constellation_net::Peers) -> Self {
+    fn new(upload: Arc<crate::upload::UploadRuntime>, peers: constellation_net::Peers) -> Self {
         Self {
             upload,
             peers,
@@ -3696,7 +3698,7 @@ struct ChunkHandoff {
     cache: Arc<DiskCache>,
     store: Arc<ChunkStore>,
     compression: CompressionSetting,
-    upload: Arc<crate::UploadRuntime>,
+    upload: Arc<crate::upload::UploadRuntime>,
     peers: constellation_net::Peers,
     view: Arc<LeaseView>,
     /// This node's own sync task: an accepted handoff acks the remote

@@ -27822,3 +27822,127 @@ gone; the rest are FUSE-frontend types for C4).
   `SEEK_HOLE`, secret files `0600`, ephemeral store writes nothing,
   `classify` tests green, lifecycle fan-out
 - [ ] Full gates — run once at the end of the plan-31 run
+
+## Plan 31 C3 — `constellation-engine`
+
+Milestone C3 of [plan 31](wip/31-core-frontend-backend.md) (§4, §5, §11):
+the 40 engine modules leave the `constellation` binary for a library
+crate, `constellation-engine`, behaviour-neutrally: files moved with
+`git mv`, and the only code changes are paths, visibility, and the
+untangling §5 names. `crates/cli` keeps the CLI, the daemon host and the
+FUSE adapter (`fusefs.rs` + `fusefs_ops.rs`, `kernel_inval.rs`,
+`fuse_watch.rs`, `node_runtime.rs`, `daemonize.rs`, `daemon_lock.rs`,
+`parallelism.rs`, `startup.rs`, `main.rs`) until C4.
+
+| Item | State | Where |
+|---|---|---|
+| New crate `constellation-engine` (lib; workspace member, default member, `[workspace.dependencies]`); deps moved from cli (`fjall`, `futures`, `toml`, `serde`, `thiserror`, `async-trait`, `constellation-upload-concurrency`); no `fuser`, and no direct `libc` (the last use, `F_RDLCK`/`F_WRLCK`/`F_UNLCK` in `locks.rs`, moved to the FUSE adapter; every host call already went through `constellation-platform` after C2) | DONE | `crates/engine/Cargo.toml`, `Cargo.toml`, `crates/cli/Cargo.toml` |
+| The 35 clean modules moved as-is (`atime`, `backend`, `coop` + `coop/{exact,fresh}`, `cto`, `designation`, `doctor`, `e2e_pin`, `epoch`, `existence`, `fault`, `forward`, `fsck`, `held`, `holds`, `inbox`, `lease`, `leave`, `log_buffer`, `mtree_gc`, `mtree_publish`, `mtree_read`, `paths`, `pin`, `placement`, `prefetch`, `registry`, `reintegrate`, `scan`, `shipper`, `singleton`, `snapshot`, `sources`, `staging`, `target`, `writeback`) | DONE | `crates/engine/src/` |
+| `SyncRequest`, `AcquireProgress`, `HandoffResult` out of `fusefs.rs` into `engine::sync` — unblocks `authority_driver`, `gc`, `prune`, `recovery` (and `locks`); `SyncHandle` stays with the view until C4 | DONE | `crates/engine/src/sync.rs` |
+| The upload runtime out of cli's `main.rs` into `engine::upload` (`authority_driver` called `remote_chunk_wait`, `forwarded_pending_chunks`, `upload_dirty_chunks_report`): `UploadRuntime`, `HandoffStats`, `InFlightClaim`, `UploadReport`, `upload_dirty_chunks{,_report,_pass}`, `expand_adopted_spills`, the concurrency/report/poll constants, and `pending_upload_tests` (18 tests) with them | DONE | `crates/engine/src/upload.rs` |
+| `locks.rs` split: arbitration/queueing moved; `ClusterLocks::lock(ino, lock, sleep, done: FnOnce(Result<(), Code>) + Send + 'static)` keeps the dedicated `lock-wait` thread and its rationale; the `fuser::ReplyEmpty` completion and `reply_code` stay in `setlk` (the first `Responder`-shaped adapter); `ClusterLocks::test` takes/returns `write: bool` and `getlk` maps it to `F_*` | DONE | `crates/engine/src/locks.rs`, `crates/cli/src/fusefs_ops.rs` |
+| Seam `engine::events::FrontendEvents` (`invalidate_inode`, `invalidate_inode_and_wait`; C4's `FrontendEvents`): `ClusterLocks::inval` is `Option<Arc<dyn FrontendEvents>>`, implemented by cli's `kernel_inval::InodeInvalidator` | DONE | `crates/engine/src/events.rs`, `crates/cli/src/kernel_inval.rs` |
+| Seam `engine::op_watch` (C4's `OpWatch`): the thread-local "request this thread handles" (`OpStage` trait, `set_current`/`current`/`clear_current`/`stage`) moved from `fuse_watch` into the engine; `fuse_watch` registers its `Entry` there, `fuse_watch::stage` delegates, and the engine carries the request across the `lock-wait` hop (replaces `Watched::adopt`) | DONE | `crates/engine/src/op_watch.rs`, `crates/cli/src/fuse_watch.rs` |
+| `ConstellationFs` → `View` in cli (`fusefs.rs`, `fusefs_ops.rs`, `node_runtime.rs`) and in the comments naming it; `FuseFs` stays the adapter newtype | DONE | `crates/cli/src/fusefs{,_ops}.rs` |
+| cli imports the engine modules at its crate root (`use constellation_engine::{atime, …}`), so every `crate::<module>::…` path in cli is unchanged | DONE | `crates/cli/src/main.rs` |
+| Test-only constructors used by cli's tests (`UploadRuntime::for_test`, `snapshot::test_manager`) behind a `test-util` feature cli's dev-dependency enables | DONE | `crates/engine/Cargo.toml` |
+| CONVENTIONS.md paths (`engine/src/shipper.rs`, `SyncRequest` in `engine/src/sync.rs`, the crate list) | DONE | `docs/plans/v1/CONVENTIONS.md` |
+
+**Public API.** The narrowest surface that compiles: a module is `pub`
+only if cli uses it, and an item inside one was promoted to `pub` only
+where cli uses it (`scan::{ScanAhead, ScanFile}` and three methods,
+`prefetch::PrefetchStats` and four methods, `Coop::set_epoch_members`,
+and `upload`'s items listed below); items already `pub` stay `pub`. Two
+went the other way, to `pub(crate)`, because nothing outside needs them
+and clippy's public-API lints then fire (`TreeAccess::from_reader` takes
+the private `mtree_read::ChainReader`; `mtree_publish::Plan::len`, and
+the test-only `AtimeAccumulator::len`); `writeback::throttle_delay` keeps
+its `Result<_, ()>` under an `allow(clippy::result_unit_err)`.
+
+Private modules (engine-internal only): `mtree_gc`, `mtree_read`,
+`recovery`, `singleton`, `sources`. Public modules and why:
+
+| Module | cli uses it for |
+|---|---|
+| `atime` | the node's `AtimeAccumulator`/`AtimeMode`, shared by every view |
+| `authority_driver` | node_runtime spawns the driver (`DriverDeps`, `CoreStatus`, `LockFlushHook`) |
+| `backend` | opening a backend (`open_backend*`, `load_fs_explained`), S3 request counts for `status` |
+| `coop` | the node's `Coop`, shared with the views and `status` |
+| `cto` | `--cto` parsing and the lone-node kernel TTLs |
+| `designation` | node_runtime builds the `DesignationManager` |
+| `doctor` | `constellation doctor`'s CAS probe report |
+| `e2e_pin` | E2E key pins on create/import/mount |
+| `epoch` | node_runtime's `EpochManager` and roster refresh |
+| `events` | the `FrontendEvents` seam cli's `kernel_inval` implements |
+| `existence` | node_runtime builds the existence cache |
+| `fault` | fault-injection knobs read in the FUSE path |
+| `forward` | `ForwardState` (node_runtime, the P2P bridge, `status`) |
+| `fsck` | `constellation fsck` and its in-daemon run |
+| `gc` | `constellation gc` and the in-daemon GC |
+| `held` | `status`'s held inodes and `drop_held` |
+| `holds` | open-orphan holds (`Holds`, `OpenHandles`) for the views |
+| `inbox` | `status`'s inbox report |
+| `lease` | `LeaseView`/`DelegateView`, the FUSE write gate |
+| `leave` | `node leave` |
+| `locks` | `ClusterLocks` behind `getlk`/`setlk`, `LockFlushers`, `--locks` parsing |
+| `log_buffer` | the control API's log tail (`LogBuffer`, `LogWriter`) |
+| `mtree_publish` | node_runtime builds the `TreePublisher` |
+| `op_watch` | the stage seam cli's `fuse_watch` implements |
+| `paths` | `status`'s P2P path summary |
+| `pin` | node_runtime's `PinManager` |
+| `placement` | node_runtime's `Placement` |
+| `prefetch` | the views' `Prefetcher`, `status`'s `PrefetchStats` |
+| `prune` | `constellation prune`, the pruner task, `PruneStats` |
+| `registry` | the filesystem registry (`Registry`, `FsEntry`, `MountEntry`) |
+| `reintegrate` | node_runtime's `ReintegrationState` |
+| `scan` | the views' `ScanAhead` |
+| `shipper` | mount bootstrap (`bootstrap`, `rebuild_if_pruned`, `TAIL_PROBE_IDLE`) |
+| `snapshot` | `SnapshotManager`, frozen snapshot objects in the view |
+| `staging` | write staging (`Staging`, `StagingBudget`, `GenCounter`) |
+| `sync` | `SyncRequest`, sent by the view, the control socket and the P2P bridge |
+| `target` | resolving a mount target to its state dir |
+| `upload` | `UploadRuntime` (node_runtime; `status` reads `gate`, `probe`, `existence`, `handoff`), `upload_dirty_chunks`, `remote_chunk_wait` |
+| `writeback` | `--write-mode` state and the dirty-byte throttle |
+
+Line counts (`find <dir> -name '*.rs' | xargs wc -l | tail -1`):
+`crates/cli/src` 47,178 → 17,488; `crates/engine/src` 29,860 (the
++170 is mostly the new `lib.rs`, the seam modules `events.rs` and
+`op_watch.rs`, and the module docs of `sync.rs` and `upload.rs`).
+
+Unit tests: before, `cargo test -p constellation --bins` 290 passed + 1
+ignored; after, `cargo test -p constellation-engine` 214 passed + 1
+ignored and `cargo test -p constellation --bins` 76 passed. The test
+names are identical (291 both ways, `pending_upload_tests::*` now under
+`upload::`).
+
+Cross-check (`make check-cross`, exit 0): `constellation-engine`
+compiles clean for macOS; cli's darwin errors went from 33 to 29 (all
+in `fusefs_ops.rs`/`main.rs`). The Windows library check of the engine
+FAILs and is recorded as known: the engine depends on
+`constellation-api` for its status report types and stops at the api's
+unix-socket server; past that, `staging.rs`'s
+`std::os::unix::fs::FileExt` is the next Windows blocker.
+
+| Target | Crate | Result |
+|---|---|---|
+| `aarch64-apple-darwin` | everything in the default workspace except the two below (now including `constellation-engine`) | ok |
+| `aarch64-apple-darwin` | `constellation` (cli) | FAIL (known; 29 errors) |
+| `aarch64-apple-darwin` | `constellation-harness` | FAIL (known; 8 errors) |
+| `x86_64-pc-windows-gnu` | `constellation-types`, `-platform`, `-fs-core`, `-meta`, `-mtree`, `-store-s3`, `-net`, `-upload-concurrency`, `-model`, `-authority` | ok |
+| `x86_64-pc-windows-gnu` | `constellation-engine` | FAIL (known, new: via `constellation-api`; then `std::os::unix` in `staging.rs`) |
+| `x86_64-pc-windows-gnu` | `constellation-api`, `constellation-chaos` | FAIL (known) |
+
+### Plan 31 C3 exit criteria
+
+- [x] `constellation-engine` exists as its own crate; `crates/cli` shrinks
+  by the 40-module move (plus the upload runtime and the sync request
+  types)
+- [x] No `fuser` in the engine's dependency tree, no direct `libc`
+- [x] `cargo build --workspace`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo fmt --all --check` clean
+- [x] Every moved unit test runs under `cargo test -p constellation-engine`;
+  engine + cli test sets equal the pre-move cli set
+- [x] `make check-cross` exits 0 with the updated known-failures file
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, perf within 3% of C0) — run once at the end of the
+  plan-31 run

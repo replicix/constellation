@@ -29,10 +29,15 @@
 //! off by default. Naming the thread and delivering the signal are host
 //! services (`constellation_platform`'s `Process::current_thread`/
 //! `enable_backtraces`/`request_backtrace`, plan 31 §6.8).
+//!
+//! Which request the current thread is handling is the engine's
+//! thread-local (`constellation_engine::op_watch`, plan 31 C3): engine
+//! waits name their stage through it, and a wait the engine moves to a
+//! thread of its own (a blocking lock) carries the request along.
 
+use constellation_engine::op_watch::{self, OpStage};
 use constellation_fs_core::Ino;
 use constellation_platform::ThreadRef;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -63,6 +68,12 @@ impl Entry {
     }
 }
 
+impl OpStage for Entry {
+    fn stage(&self, stage: &'static str) {
+        *self.stage.lock().unwrap_or_else(|e| e.into_inner()) = stage;
+    }
+}
+
 struct Registry {
     next: AtomicU64,
     active: Mutex<HashMap<u64, Arc<Entry>>>,
@@ -73,11 +84,6 @@ struct Registry {
 }
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
-
-thread_local! {
-    /// The request the current thread is handling (set by [`enter`]).
-    static CURRENT: RefCell<Option<Arc<Entry>>> = const { RefCell::new(None) };
-}
 
 /// `CONSTELLATION_FUSE_REQUEST_STALL_S`: seconds a request may be in
 /// flight before it is reported (default 30; 0 disables the monitor).
@@ -144,7 +150,8 @@ fn register(op: &'static str, ino: Ino, blocking: bool) -> Watched {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(entry.id, entry.clone());
-    CURRENT.with(|c| *c.borrow_mut() = Some(entry.clone()));
+    // The request the current thread is handling (see the module doc).
+    op_watch::set_current(Some(entry.clone()));
     Watched { entry }
 }
 
@@ -162,19 +169,7 @@ pub fn enter_blocking(op: &'static str, ino: Ino) -> Watched {
 /// Note what the current thread's request is about to wait on. A no-op
 /// on a thread handling no request (the sync task's own flushes).
 pub fn stage(stage: &'static str) {
-    CURRENT.with(|c| {
-        if let Some(entry) = c.borrow().as_ref() {
-            *entry.stage.lock().unwrap_or_else(|e| e.into_inner()) = stage;
-        }
-    });
-}
-
-impl Watched {
-    /// Hand the request to another thread (a blocking lock's waiter):
-    /// that thread's [`stage`] calls then name it.
-    pub fn adopt(&self) {
-        CURRENT.with(|c| *c.borrow_mut() = Some(self.entry.clone()));
-    }
+    op_watch::stage(stage);
 }
 
 impl Drop for Watched {
@@ -184,12 +179,8 @@ impl Drop for Watched {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.entry.id);
-        CURRENT.with(|c| {
-            let mut cur = c.borrow_mut();
-            if cur.as_ref().is_some_and(|e| e.id == self.entry.id) {
-                *cur = None;
-            }
-        });
+        let entry: Arc<dyn OpStage> = self.entry.clone();
+        op_watch::clear_current(&entry);
         if self.entry.stalled.load(Ordering::Relaxed) {
             r.stalled_completed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(

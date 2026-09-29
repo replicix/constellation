@@ -116,7 +116,7 @@
 //! | `Deliver(Recall)` / `Released` | `Core::on_lock_recall` → `Action::LockFlush` → `Event::LockFlushed` → `PeerMsg::LockReleased` |
 //! | `Expire` | `Timer::LockGrantExpiry` |
 //! | `Renew`/`RenewAck`/`Lost` | `Timer::LockRenew` → `PeerMsg::LockRenew` → `LockRenewed { ok }` |
-//! | `Io` fenced | `ConstellationFs::lock_fence(ino)` → `EIO` |
+//! | `Io` fenced | `View::lock_fence(ino)` → `EIO` |
 //! | `Takeover` grace | `note_marker_landed`'s floor, extended to lock grants; reclaims in `on_lock_renew` |
 //! | `Delegate`/`Recall` state | `DelegRenewed { locks }` (every granting renewal: `lock_take_handoff`) and `DelegRecalled { locks }` (`lock_install_returned`) |
 //! | `Handoff` delivered / dropped | `lock_install_moved` (`deleg_mine_until`, `moved_seen`, `install_if_consistent`) |

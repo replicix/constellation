@@ -9,6 +9,12 @@
 //! ([`LockFlushers`]), and the conversions between the core's messages
 //! and their P2P wire form.
 //!
+//! Plan 31 C3: the FUSE reply plumbing (`fuser::ReplyEmpty`/`ReplyLock`,
+//! the `F_RDLCK`/`F_WRLCK`/`F_UNLCK` lock types) is the adapter's
+//! (`cli/src/fusefs_ops.rs`'s `getlk`/`setlk`): [`ClusterLocks::lock`]
+//! completes through a callback, the first of C4's `Responder`s, and
+//! [`ClusterLocks::test`] speaks `write: bool`.
+//!
 //! - `--locks local`: today's behaviour. The FUSE mount does not
 //!   negotiate `FUSE_POSIX_LOCKS`/`FUSE_FLOCK_LOCKS`, so the kernel keeps
 //!   every lock node-local and never asks the daemon. Two nodes can both
@@ -38,7 +44,7 @@
 //! (`EDEADLK`) — two owners waiting on each other wait forever, as they do
 //! with `flock`.
 
-use crate::fusefs::SyncRequest;
+use crate::sync::SyncRequest;
 use anyhow::{bail, Result};
 use constellation_authority::{
     LockAnswer, LockOutcome, LockRenewEntry, LockRenewResult, LockTestAnswer, LockTestOutcome,
@@ -126,7 +132,9 @@ const TRY_ROUNDS: u32 = 4;
 pub struct ClusterLocks {
     pub meta: Arc<Meta>,
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
-    pub inval: Option<crate::kernel_inval::InodeInvalidator>,
+    /// The frontend's kernel cache of a file, dropped after a grant
+    /// (`cli/src/kernel_inval.rs`'s `InodeInvalidator`).
+    pub inval: Option<Arc<dyn crate::events::FrontendEvents>>,
 }
 
 impl ClusterLocks {
@@ -157,46 +165,44 @@ impl ClusterLocks {
     /// queued behind).
     pub fn invalidate(&self, ino: Ino) {
         if let Some(inval) = &self.inval {
-            inval.invalidate(ino);
+            inval.invalidate_inode(ino);
         }
     }
 
-    /// `getlk`: the conflicting lock, as `(start, end, type, pid)`;
-    /// `F_UNLCK` when there is none. `typ == F_UNLCK` asks about any lock
-    /// (a read test). Another node's grant answers as a whole-file lock
-    /// with pid 0.
+    /// `getlk`: the conflicting lock, as `Some((start, end, write,
+    /// pid))`; `None` when there is none. `write: false` asks about any
+    /// lock (a read test, or `F_UNLCK`). Another node's grant answers as a
+    /// whole-file lock with pid 0.
     pub fn test(
         &self,
         ino: Ino,
         owner: u64,
         start: u64,
         end: u64,
-        typ: i32,
-    ) -> (u64, u64, i32, u32) {
-        let write = typ == libc::F_WRLCK;
-        let kind = |w: bool| if w { libc::F_WRLCK } else { libc::F_RDLCK };
+        write: bool,
+    ) -> Option<(u64, u64, bool, u32)> {
         match self
             .meta
             .locks()
             .local_test(ino, owner, write, start, end, now_ms())
         {
-            LocalOutcome::Conflict(l) => (l.start, l.end.min(OFFSET_MAX), kind(l.write), l.pid),
-            LocalOutcome::Done => (0, 0, libc::F_UNLCK, 0),
+            LocalOutcome::Conflict(l) => Some((l.start, l.end.min(OFFSET_MAX), l.write, l.pid)),
+            LocalOutcome::Done => None,
             LocalOutcome::NeedGrant(mode) => {
-                crate::fuse_watch::stage("lock test (core reply)");
+                crate::op_watch::stage("lock test (core reply)");
                 let (reply, answer) = tokio::sync::oneshot::channel();
                 if self
                     .tx
                     .send(SyncRequest::LockTest { ino, mode, reply })
                     .is_err()
                 {
-                    return (0, 0, libc::F_UNLCK, 0);
+                    return None;
                 }
                 match answer.blocking_recv() {
                     Ok(LockTestAnswer::Held { mode, .. }) => {
-                        (0, OFFSET_MAX, kind(mode == LockMode::Exclusive), 0)
+                        Some((0, OFFSET_MAX, mode == LockMode::Exclusive, 0))
                     }
-                    _ => (0, 0, libc::F_UNLCK, 0),
+                    _ => None,
                 }
             }
         }
@@ -238,37 +244,26 @@ impl ClusterLocks {
     /// driver's `Action::LockFlush`), so waiters must never be able to
     /// fill it. fuser 0.18 has no `FUSE_INTERRUPT`: such a wait cannot be
     /// cancelled from the application (see the module doc).
-    pub fn lock(
-        self: &Arc<Self>,
-        ino: Ino,
-        lock: LocalLock,
-        sleep: bool,
-        reply: fuser::ReplyEmpty,
-        watch: crate::fuse_watch::Watched,
-    ) {
-        fn answer(
-            r: Result<(), Code>,
-            reply: fuser::ReplyEmpty,
-            watch: crate::fuse_watch::Watched,
-        ) {
-            match r {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(crate::fusefs::reply_code(e)),
-            }
-            drop(watch);
-        }
+    ///
+    /// `done` answers the request (the FUSE adapter's completes its
+    /// `fuser::ReplyEmpty`), on this thread or on the waiter's.
+    pub fn lock<F>(self: &Arc<Self>, ino: Ino, lock: LocalLock, sleep: bool, done: F)
+    where
+        F: FnOnce(Result<(), Code>) + Send + 'static,
+    {
         if !sleep {
-            answer(self.set(ino, lock, false), reply, watch);
+            done(self.set(ino, lock, false));
             return;
         }
         let this = self.clone();
         // The request's watchdog entry moves with the reply: the waiter
-        // thread's stages name it (`fuse_watch::adopt`).
+        // thread's stages name it (`op_watch::current`/`set_current`).
+        let op = crate::op_watch::current();
         let spawned = std::thread::Builder::new()
             .name("lock-wait".into())
             .spawn(move || {
-                watch.adopt();
-                answer(this.set(ino, lock, true), reply, watch)
+                crate::op_watch::set_current(op);
+                done(this.set(ino, lock, true))
             });
         if let Err(error) = spawned {
             // The reply went with the closure; dropping it answers EIO.
@@ -298,7 +293,7 @@ impl ClusterLocks {
                         std::thread::sleep(Duration::from_millis(10 * u64::from(rounds.min(20))));
                     }
                     rounds += 1;
-                    crate::fuse_watch::stage("lock grant (core reply)");
+                    crate::op_watch::stage("lock grant (core reply)");
                     let (reply, answer) = tokio::sync::oneshot::channel();
                     self.tx
                         .send(SyncRequest::Lock {
@@ -338,7 +333,7 @@ impl ClusterLocks {
     /// file, not only the lock file (EC2 campaign 4 B-1).
     fn granted(&self, ino: Ino, position: &Position) {
         self.meta.session().raise_observed(*position);
-        crate::fuse_watch::stage("session wait after a lock grant");
+        crate::op_watch::stage("session wait after a lock grant");
         let waited = self.meta.session_wait_at(&[ReadKey::Ino(ino)], position);
         tracing::debug!(target: "constellation::locks", ino, ?position, ?waited, "lock granted");
         match waited {
@@ -372,8 +367,8 @@ impl ClusterLocks {
             _ => {}
         }
         if let Some(inval) = &self.inval {
-            crate::fuse_watch::stage("kernel invalidation after a lock grant");
-            if !inval.invalidate_and_wait(ino, INVAL_WAIT) {
+            crate::op_watch::stage("kernel invalidation after a lock grant");
+            if !inval.invalidate_inode_and_wait(ino, INVAL_WAIT) {
                 tracing::debug!(
                     target: "constellation::locks",
                     ino,
