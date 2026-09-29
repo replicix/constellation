@@ -11,6 +11,7 @@ members = [
     "crates/store-s3",
     "crates/net",
     "crates/api",
+    "crates/control",
     "crates/harness",
     "crates/chaos",
     "crates/upload-concurrency",
@@ -34,6 +35,7 @@ default-members = [
     "crates/store-s3",
     "crates/net",
     "crates/api",
+    "crates/control",
     "crates/harness",
     "crates/chaos",
     "crates/upload-concurrency",
@@ -58,6 +60,7 @@ constellation-mtree = { path = "crates/mtree" }
 constellation-store-s3 = { path = "crates/store-s3" }
 constellation-net = { path = "crates/net" }
 constellation-api = { path = "crates/api" }
+constellation-control = { path = "crates/control" }
 constellation-upload-concurrency = { path = "crates/upload-concurrency" }
 constellation-chaos = { path = "crates/chaos" }
 constellation-authority = { path = "crates/authority" }
