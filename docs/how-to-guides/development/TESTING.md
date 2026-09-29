@@ -2013,6 +2013,38 @@ the volume view. The in-process cases (forged and stale inode numbers
 answered `ESTALE`, snapshot views, `ViewQos` admission) are
 `constellation-engine`'s `view::confine_tests` and `view::qos_tests`.
 
+## FUSE session handover (plan 31 §6.11, C4b)
+
+`constellation daemon --upgrade` replaces a running daemon's image while
+its views stay mounted (the sequence is `crates/cli/src/handover.rs`'s
+module doc; the vendored fuser patch is `vendor/fuser/CONSTELLATION-PATCH.md`).
+
+- `session-handover-idle`: one upgrade with nothing in flight. A watcher
+  `stat`s and lists the mountpoint every 5 ms across it (any error or a
+  changed `st_dev` fails the run); descriptors opened before it (a file to
+  read, a file to write, the directory) keep working after it; the model
+  verifies; `status` reports `handover.generation` one higher and the
+  daemon's pid runs the resumed image (`--resume-from` in its cmdline);
+  new work lands, and everything survives a remount.
+- `upgrade-under-load`: three upgrades in a row, 1.5 s apart, under a
+  writer appending 4 KiB records through one descriptor held open
+  (`fsync` every 16), a creator writing and closing new files, and a
+  reader re-reading a 256 KiB file through a held descriptor. Any error
+  from any syscall (`ENOTCONN`/`EIO` included), a mount gap, or a load that
+  made no progress after an upgrade fails it; every record and file is
+  compared with what was written, before and after a remount. It prints
+  each upgrade's duration and the longest single syscall (the stall).
+
+Both need root (the daemon mounts with `mount(2)` itself) and run on the
+debug binary too (`CONSTELLATION_BIN=target/debug/constellation`). The
+in-process pieces are unit tests: `constellation-frontend-fuse`'s
+`session::tests` (a real kernel mount, root only: detach with nothing in
+flight, a detach that waits for an op in flight, a resume that serves the
+requests the kernel queued while nobody read, the lock-wait refusal,
+`NegotiatedInit` round trips) and `constellation-engine`'s
+`view::handoff::tests` (open handles, an unlinked-open orphan and synthetic
+numbers crossing to a second view; the handle table's wire forms).
+
 ## The authority simulation (plan 30 M5)
 
 `crates/authority` holds the sans-IO authority core and, under

@@ -46,7 +46,13 @@ default-members = [
     "crates/model",
     "crates/authority",
 ]
-exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench", "vendor/fjall"]
+exclude = [
+    "bench/dbbench",
+    "bench/prollybench",
+    "bench/enginebench",
+    "vendor/fjall",
+    "vendor/fuser",
+]
 
 [workspace.package]
 version = "1.0.0"
@@ -111,6 +117,8 @@ iroh-gossip = "0.101"
 # linted or tested as a member).
 [patch.crates-io]
 fjall = { path = "vendor/fjall" }
+# Plan 31 C4b: FUSE session handover (vendor/fuser/CONSTELLATION-PATCH.md).
+fuser = { path = "vendor/fuser" }
 
 [profile.release]
 lto = "thin"

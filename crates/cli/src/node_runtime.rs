@@ -22,6 +22,12 @@
 //! externally-triggered unmount (a bare `fusermount -u`, a kernel-forced
 //! unmount, or a crash) behave the same as an explicit `remove_mount`
 //! call.
+//!
+//! Plan 31 C4b adds the in-place upgrade (`crate::handover`, whose module
+//! doc has the sequence): a view's session thread may also end
+//! *detached*, in which case it tears nothing down (the view is handed
+//! over), and [`NodeRuntime::wait_all`] keeps the process alive while a
+//! handover is under way.
 
 use anyhow::{bail, Context, Result};
 use constellation_engine::{
@@ -73,6 +79,10 @@ fn clear_stale_mount(host: &HostServices, mountpoint: &std::path::Path) {
     }
 }
 
+/// What `add_mount`/`remove_mount` answer during an in-place upgrade (the
+/// attaching `mount` matches it to retry).
+pub const UPGRADING: &str = "the daemon is being upgraded in place; retry shortly";
+
 /// Everything needed to start the daemon's node, independent of any
 /// particular mounted view.
 pub struct NodeConfig {
@@ -81,6 +91,17 @@ pub struct NodeConfig {
     pub engine: EngineConfig,
     pub web_ui: u16,
     pub log_buffer: log_buffer::LogBuffer,
+    /// Plan 31 C4b: this image's place in a chain of in-place upgrades
+    /// (`None`: a fresh start), with the control socket the previous
+    /// image bound.
+    pub resumed: Option<Resumed>,
+}
+
+/// What a handed-over image inherits besides its views
+/// (`crate::handover`).
+pub struct Resumed {
+    pub generation: u32,
+    pub control: Option<std::os::unix::net::UnixListener>,
 }
 
 /// Everything needed to mount one view (root, subtree, or snapshot
@@ -117,11 +138,20 @@ pub struct MountInfo {
     pub since: Instant,
 }
 
-struct MountHandle {
-    subtree: String,
-    mountpoint: PathBuf,
+pub(crate) struct MountHandle {
+    pub(crate) subtree: String,
+    pub(crate) mountpoint: PathBuf,
     since: Instant,
     unmounter: Mutex<constellation_frontend_fuse::FuseUnmounter>,
+    /// Plan 31 C4b: what a handover needs of the view and its session.
+    pub(crate) fs_name: String,
+    pub(crate) allow_other: bool,
+    pub(crate) read_only: bool,
+    pub(crate) fuse_threads: usize,
+    pub(crate) control: constellation_frontend_fuse::SessionControl,
+    pub(crate) sink: constellation_frontend_fuse::FuseNotifySink,
+    pub(crate) caps: constellation_vfs::FrontendCaps,
+    pub(crate) view: Arc<View>,
 }
 
 pub struct NodeRuntime {
@@ -135,17 +165,23 @@ pub struct NodeRuntime {
     log_buffer: log_buffer::LogBuffer,
     /// Built lazily, the first time a view is added (see module docs).
     status: Mutex<Option<Arc<crate::DaemonStatus>>>,
-    mounts: Mutex<HashMap<MountId, MountHandle>>,
+    pub(crate) mounts: Mutex<HashMap<MountId, MountHandle>>,
     /// Session-thread handles, kept separate from `mounts` so a thread's
     /// own teardown (which removes its `mounts` entry) never races
     /// `remove_mount`'s attempt to join it.
     threads: Mutex<HashMap<MountId, std::thread::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
+    /// Plan 31 C4b: the handover state (`crate::handover`).
+    pub(crate) handover: crate::handover::HandoverState,
+    /// The node's own settings, as the next image restarts it.
+    pub(crate) handoff_config: crate::handover::NodeHandoff,
+    /// The control socket a previous image bound (served from, instead of
+    /// binding anew, by `ensure_status`).
+    control_listener: Mutex<Option<std::os::unix::net::UnixListener>>,
 }
 
 impl NodeRuntime {
     /// This daemon's node.
-    #[cfg(test)]
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
     }
@@ -170,7 +206,13 @@ impl NodeRuntime {
             mut engine,
             web_ui,
             log_buffer,
+            resumed,
         } = cfg;
+        let handoff_config = crate::handover::NodeHandoff::of(&engine, web_ui);
+        let (generation, control_listener) = match resumed {
+            Some(r) => (r.generation, r.control),
+            None => (0, None),
+        };
         let host = HostServices::native();
         let engines = EngineHost::start(
             rt.clone(),
@@ -194,6 +236,9 @@ impl NodeRuntime {
             mounts: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
             shutdown_started: AtomicBool::new(false),
+            handover: crate::handover::HandoverState::new(generation),
+            handoff_config,
+            control_listener: Mutex::new(control_listener),
         });
 
         // Signals are node-level: unmount every currently-mounted view,
@@ -251,6 +296,12 @@ impl NodeRuntime {
     /// thread runs until the view is unmounted (via `remove_mount`, an
     /// external `fusermount -u`, or process shutdown).
     pub fn add_mount(self: &Arc<Self>, view: ViewConfig) -> Result<MountId> {
+        // Plan 31 C4b: a view added now would not be handed over (the
+        // node is being shut down for the next image): the attaching
+        // `mount` retries on this message, and the next image takes it.
+        if self.handover.in_progress() {
+            bail!("{UPGRADING}");
+        }
         // Refuse to attach a view onto a daemon whose final shutdown has
         // already begun. Once the last view is removed the FUSE thread
         // runs `shutdown()` (drain + ship, then exit); a view added after
@@ -319,43 +370,90 @@ impl NodeRuntime {
         // inside this process (its `FuseUnmounter`); without it, an
         // external kill leaves a dead mountpoint that needs `fusermount3
         // -u`.
-        let mut session =
-            match constellation_frontend_fuse::mount(fs.clone(), &mountpoint, &mount_options, caps)
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    engine.close_view(&fs);
-                    return Err(error).context("FUSE mount");
-                }
-            };
-        let unmounter = session.unmounter();
-        events.set(Arc::new(session.notifier()));
+        let session = match constellation_frontend_fuse::mount(
+            fs.clone(),
+            &mountpoint,
+            &mount_options,
+            caps.clone(),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                engine.close_view(&fs);
+                return Err(error).context("FUSE mount");
+            }
+        };
+        let sink = session.notifier();
+        events.set(Arc::new(sink.clone()));
+        Ok(self.serve_session(
+            session,
+            fs,
+            SessionInfo {
+                subtree: inner_path,
+                mountpoint,
+                fs_name: mount_record_name,
+                allow_other,
+                read_only: frozen_view,
+                fuse_threads,
+                sink,
+                caps,
+            },
+        ))
+    }
 
+    /// Record a mounted session and run it on its own OS thread (see the
+    /// module doc for the thread's teardown).
+    pub(crate) fn serve_session(
+        self: &Arc<Self>,
+        mut session: constellation_frontend_fuse::FuseSession<View>,
+        fs: Arc<View>,
+        info: SessionInfo,
+    ) -> MountId {
+        let SessionInfo {
+            subtree,
+            mountpoint,
+            fs_name,
+            allow_other,
+            read_only,
+            fuse_threads,
+            sink,
+            caps,
+        } = info;
+        let unmounter = session.unmounter();
+        let control = session.control();
         let id = MountId(fs.id());
         // So that a takeover after a kill can abort this mount's
         // connection if it is left wedged (`daemon_lock::abort_stale_mounts`).
-        if let Err(e) = crate::daemon_lock::record_mount(
-            engine.state_dir(),
-            id.0,
-            &mountpoint,
-            &mount_record_name,
-        ) {
+        if let Err(e) =
+            crate::daemon_lock::record_mount(self.engine.state_dir(), id.0, &mountpoint, &fs_name)
+        {
             tracing::warn!(error = %e, "recording the mount in the state dir failed");
         }
         self.mounts.lock().unwrap().insert(
             id,
             MountHandle {
-                subtree: inner_path,
-                mountpoint: mountpoint.clone(),
+                subtree,
+                mountpoint,
                 since: Instant::now(),
                 unmounter: Mutex::new(unmounter),
+                fs_name,
+                allow_other,
+                read_only,
+                fuse_threads,
+                control,
+                sink,
+                caps,
+                view: fs.clone(),
             },
         );
 
         let node = self.clone();
         let thread = std::thread::spawn(move || {
-            if let Err(e) = session.run() {
-                tracing::warn!(error = %e, "FUSE session ended with an error");
+            match session.run() {
+                // Handed over (`crate::handover`): the view, its record
+                // and its mount entry are the handover's to carry on.
+                Ok(constellation_frontend_fuse::SessionExit::Detached) => return,
+                Ok(constellation_frontend_fuse::SessionExit::Unmounted) => {}
+                Err(e) => tracing::warn!(error = %e, "FUSE session ended with an error"),
             }
             crate::daemon_lock::forget_mount(node.engine.state_dir(), id.0);
             tracing::info!("FUSE detached");
@@ -375,13 +473,12 @@ impl NodeRuntime {
             }
         });
         self.threads.lock().unwrap().insert(id, thread);
-
-        Ok(id)
+        id
     }
 
     /// The status object and the control API/web UI, started the first
     /// time a view is added.
-    fn ensure_status(self: &Arc<Self>, first: &Arc<View>) {
+    pub(crate) fn ensure_status(self: &Arc<Self>, first: &Arc<View>) {
         let mut status_guard = self.status.lock().unwrap();
         if status_guard.is_some() {
             return;
@@ -426,8 +523,24 @@ impl NodeRuntime {
         *status_guard = Some(status.clone());
         drop(status_guard);
         let _guard = e.runtime().enter();
-        if let Err(err) = constellation_api::serve(e.state_dir(), status.clone()) {
-            tracing::warn!(error = %err, "control API unavailable");
+        // Bound here (not by `constellation_api::serve`) so that a handover
+        // can pass the very listener on (`crate::handover`): clients that
+        // connect during it wait in the backlog for the next image.
+        let served = (|| -> Result<()> {
+            let listener = match self.control_listener.lock().unwrap().take() {
+                Some(listener) => listener,
+                None => {
+                    let sock = e.state_dir().join(constellation_api::SOCKET_NAME);
+                    let _ = std::fs::remove_file(&sock); // stale socket from a crash
+                    std::os::unix::net::UnixListener::bind(&sock)
+                        .context("binding control socket")?
+                }
+            };
+            *self.handover.control.lock().unwrap() = Some(listener.try_clone()?);
+            constellation_api::serve_listener(listener, status.clone())
+        })();
+        if let Err(err) = served {
+            tracing::warn!(error = %format!("{err:#}"), "control API unavailable");
         }
         if self.web_ui != 0 {
             match e
@@ -446,6 +559,9 @@ impl NodeRuntime {
     /// session thread. Siblings are untouched. If this was the last view,
     /// the thread itself runs `shutdown()` before this call returns.
     pub fn remove_mount(&self, id: MountId) -> Result<()> {
+        if self.handover.in_progress() {
+            bail!("{UPGRADING}");
+        }
         {
             let mounts = self.mounts.lock().unwrap();
             let handle = mounts
@@ -464,18 +580,25 @@ impl NodeRuntime {
         Ok(())
     }
 
-    /// Block the calling thread until the given view's session ends,
-    /// however it ends (an explicit `remove_mount`, an external
-    /// `fusermount -u`, or the kernel force-unmounting it). Used by the
-    /// CLI's `mount` command to preserve "mount blocks until unmounted".
-    pub fn join_mount(&self, id: MountId) -> Result<()> {
-        let thread = self.threads.lock().unwrap().remove(&id);
-        if let Some(thread) = thread {
-            if thread.join().is_err() {
-                tracing::warn!("FUSE session thread panicked");
+    /// Block until every view's session has ended, and no handover is
+    /// under way (one that has to be abandoned serves the views again, on
+    /// new threads). What keeps a daemon's main thread alive.
+    pub fn wait_all(&self) {
+        loop {
+            let threads: Vec<_> = self.threads.lock().unwrap().drain().collect();
+            if threads.is_empty() {
+                if self.handover.in_progress() {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                return;
+            }
+            for (_, thread) in threads {
+                if thread.join().is_err() {
+                    tracing::warn!("FUSE session thread panicked");
+                }
             }
         }
-        Ok(())
     }
 
     pub fn mounts(&self) -> Vec<MountInfo> {
@@ -530,6 +653,18 @@ impl NodeRuntime {
     }
 }
 
+/// A session's mount-level settings ([`NodeRuntime::serve_session`]).
+pub(crate) struct SessionInfo {
+    pub(crate) subtree: String,
+    pub(crate) mountpoint: PathBuf,
+    pub(crate) fs_name: String,
+    pub(crate) allow_other: bool,
+    pub(crate) read_only: bool,
+    pub(crate) fuse_threads: usize,
+    pub(crate) sink: constellation_frontend_fuse::FuseNotifySink,
+    pub(crate) caps: constellation_vfs::FrontendCaps,
+}
+
 impl std::fmt::Debug for MountId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -555,6 +690,7 @@ mod tests {
                 engine,
                 web_ui: 0,
                 log_buffer: log_buffer::LogBuffer::default(),
+                resumed: None,
             },
             rt.clone(),
         )

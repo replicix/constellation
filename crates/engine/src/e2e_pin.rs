@@ -115,8 +115,9 @@ pub fn compare_master(pinned: Option<&E2ePin>, observed: &E2ePin) -> Verdict {
     }
 }
 
-/// Which pin a command reads and writes.
-#[derive(Debug, Clone)]
+/// Which pin a command reads and writes. Serializable: a daemon's
+/// in-place upgrade hands it to the next image.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PinTarget {
     key: String,
     s3: String,

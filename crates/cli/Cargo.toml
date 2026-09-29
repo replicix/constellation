@@ -29,6 +29,7 @@ clap.workspace = true
 libc.workspace = true
 object_store.workspace = true
 postcard.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

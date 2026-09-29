@@ -149,6 +149,13 @@ async fn api(State(state): State<AppState>, Json(request): Json<Request>) -> Jso
 
 /// HTTP's transport-independent adapter, exposed for exhaustive parity tests.
 pub fn adapt(source: &dyn StatusSource, request: Request) -> Response {
+    if matches!(request, Request::Upgrade { .. }) {
+        // It executes a binary: the unix socket (the state dir's owner)
+        // only, never the localhost port.
+        return Response::Error {
+            message: "upgrade is refused over HTTP; use the control socket".into(),
+        };
+    }
     dispatch(source, request)
 }
 
@@ -594,6 +601,31 @@ mod tests {
     impl StatusSource for NeverAsked {
         fn status(&self) -> crate::StatusReport {
             unimplemented!("the DNS-rebinding guard tests never reach a handler that reads status")
+        }
+    }
+
+    /// Plan 31 C4b: `Upgrade` executes a binary, so the localhost HTTP
+    /// port refuses it before any source sees it; the unix socket's
+    /// dispatcher reaches the source.
+    #[test]
+    fn upgrade_is_refused_over_http_only() {
+        struct Upgradable;
+        impl StatusSource for Upgradable {
+            fn status(&self) -> crate::StatusReport {
+                unimplemented!()
+            }
+            fn upgrade(&self, _: Option<&std::path::Path>) -> Result<String, String> {
+                Ok("handing over".into())
+            }
+        }
+        let request = Request::Upgrade { binary: None };
+        match adapt(&Upgradable, request.clone()) {
+            Response::Error { message } => assert!(message.contains("HTTP"), "{message}"),
+            other => panic!("HTTP must refuse an upgrade: {other:?}"),
+        }
+        match crate::dispatch(&Upgradable, request) {
+            Response::Ok { detail } => assert_eq!(detail, "handing over"),
+            other => panic!("the socket reaches the source: {other:?}"),
         }
     }
 

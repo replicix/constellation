@@ -65,11 +65,91 @@ pub struct FuseFs<V: Vfs> {
     vfs: Arc<V>,
     caps: FrontendCaps,
     tuning: KernelTuning,
+    /// Requests answered from another thread and not answered yet (plan
+    /// 31 §6.11: a handover drains them, or refuses).
+    deferred: Arc<Deferred>,
 }
 
 impl<V: Vfs> FuseFs<V> {
     pub fn new(vfs: Arc<V>, caps: FrontendCaps, tuning: KernelTuning) -> Self {
-        Self { vfs, caps, tuning }
+        Self {
+            vfs,
+            caps,
+            tuning,
+            deferred: Arc::default(),
+        }
+    }
+
+    pub(crate) fn deferred(&self) -> &Arc<Deferred> {
+        &self.deferred
+    }
+}
+
+/// The count of requests whose reply may come from another thread after
+/// the fuser worker that read them moved on — today exactly the blocking
+/// lock waits (`FUSE_SETLKW`/`flock`): every other op answers inline, on
+/// the worker, before it reads again, so stopping the workers drains
+/// those by itself. A detach needs this count at zero: a reply must be
+/// written on the descriptor its request was read from, by a process
+/// that still serves it.
+#[derive(Default)]
+pub(crate) struct Deferred(std::sync::atomic::AtomicUsize);
+
+impl Deferred {
+    pub(crate) fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn track<R>(self: &Arc<Self>, reply: R) -> Tracked<R> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Tracked {
+            reply: Some(reply),
+            deferred: self.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Deferred {
+    pub(crate) fn track_raw(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn untrack_raw(&self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn track_for_test<R: constellation_vfs::Responder<()>>(
+    deferred: &Arc<Deferred>,
+    reply: R,
+) -> impl constellation_vfs::Responder<()> {
+    deferred.track(reply)
+}
+
+/// A responder counted in [`Deferred`] until it has answered (or was
+/// dropped, which answers `EIO`).
+struct Tracked<R> {
+    reply: Option<R>,
+    deferred: Arc<Deferred>,
+}
+
+impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for Tracked<R> {
+    fn done(mut self, result: constellation_vfs::VfsResult<T>) {
+        if let Some(reply) = self.reply.take() {
+            reply.done(result);
+        }
+    }
+}
+
+impl<R> Drop for Tracked<R> {
+    fn drop(&mut self) {
+        // The reply (if `done` never ran) answers from its own drop first.
+        drop(self.reply.take());
+        self.deferred
+            .0
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -776,14 +856,17 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 return;
             }
         };
-        self.vfs.lock_acquire(
-            &OpCtx::new(OpKind::LockAcquire, &caller),
-            ino.0,
-            Fh(fh.0),
-            lock_spec(lock_owner, start, end, kind, pid),
-            sleep,
-            EmptyReply(reply),
-        );
+        let cx = OpCtx::new(OpKind::LockAcquire, &caller);
+        let spec = lock_spec(lock_owner, start, end, kind, pid);
+        if sleep {
+            // May answer from the view's `lock-wait` thread: counted.
+            let reply = self.deferred.track(EmptyReply(reply));
+            self.vfs
+                .lock_acquire(&cx, ino.0, Fh(fh.0), spec, true, reply);
+        } else {
+            self.vfs
+                .lock_acquire(&cx, ino.0, Fh(fh.0), spec, false, EmptyReply(reply));
+        }
     }
 }
 

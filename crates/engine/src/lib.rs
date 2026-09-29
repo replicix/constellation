@@ -73,4 +73,4 @@ pub use node::{
     default_state_dir, DeferredEvents, Engine, EngineConfig, PassphraseSource, PhaseHook, ViewInfo,
 };
 pub use profile::{BackgroundMode, EngineProfile, LeaseMode, P2pMode, UploadMode};
-pub use view::{View, ViewQos, ViewSpec};
+pub use view::{HandleTableSnapshot, View, ViewHandoff, ViewQos, ViewSpec};

@@ -21,7 +21,9 @@
 //! documented at each read); an [`EngineConfig`] field overrides one only
 //! where it says so.
 
-use crate::view::{FsDependencies, QuotaCache, SyncHandle, View, ViewSpec};
+use crate::view::{
+    FsDependencies, HandleTableSnapshot, QuotaCache, SyncHandle, View, ViewHandoff, ViewSpec,
+};
 use crate::{
     coop, designation, epoch, forward, kernel_inval, lease, pin, placement, reintegrate, shipper,
     snapshot, staging, writeback,
@@ -173,6 +175,8 @@ pub struct ViewInfo {
 
 struct OpenView {
     info: ViewInfo,
+    /// The spec it resolved to (`Engine::export_view`).
+    resolved: ViewSpec,
     quota_cache: QuotaCache,
     /// A `--rw --ephemeral` clone, removed when the view closes.
     ephemeral_clone: Option<String>,
@@ -1407,6 +1411,50 @@ impl Engine {
         caps: FrontendCaps,
         events: Arc<dyn FrontendEvents>,
     ) -> Result<Arc<View>> {
+        self.open_view_with(spec, caps, events, None)
+    }
+
+    /// Reopen a view handed over from another process (plan 31 §6.11): a
+    /// [`ViewHandoff`]'s spec (already resolved: no clone is made) with its
+    /// handle table imported before the view serves anything. Everything
+    /// else is [`Self::open_view`]'s.
+    pub fn open_view_resumed(
+        &self,
+        spec: ViewSpec,
+        handles: HandleTableSnapshot,
+        caps: FrontendCaps,
+        events: Arc<dyn FrontendEvents>,
+    ) -> Result<Arc<View>> {
+        if spec.rw_snapshot {
+            bail!("a handed-over view spec is resolved: it names no snapshot to clone");
+        }
+        self.open_view_with(spec, caps, events, Some(handles))
+    }
+
+    /// What reopens `view` in the next process ([`Self::open_view_resumed`]):
+    /// its resolved spec and its handle table. Take it once nothing
+    /// reaches the view any more (its frontend detached).
+    pub fn export_view(&self, view: &View) -> Result<ViewHandoff> {
+        let spec = self
+            .views
+            .lock()
+            .unwrap()
+            .get(&view.id())
+            .map(|v| v.resolved.clone())
+            .with_context(|| format!("view {} is not open", view.id()))?;
+        Ok(ViewHandoff {
+            spec,
+            handles: view.export_handles(),
+        })
+    }
+
+    fn open_view_with(
+        &self,
+        spec: ViewSpec,
+        caps: FrontendCaps,
+        events: Arc<dyn FrontendEvents>,
+        resumed: Option<HandleTableSnapshot>,
+    ) -> Result<Arc<View>> {
         if self.shutdown_started.load(Ordering::SeqCst) {
             bail!("engine is shutting down; retry once it has exited");
         }
@@ -1418,7 +1466,9 @@ impl Engine {
         if spec.rw_snapshot && selector.is_none() {
             bail!("--rw is only valid when mounting <path>@<snapshot>");
         }
-        let mut ephemeral_clone = None;
+        // A handed-over `ephemeral` spec names the temporary clone itself.
+        let mut ephemeral_clone = (resumed.is_some() && spec.ephemeral && selector.is_none())
+            .then(|| snapshot::normalize_path(&spec.root));
         let mounted_path = if let Some((source_path, snapshot_name)) = &selector {
             if spec.rw_snapshot {
                 let destination = if spec.ephemeral {
@@ -1509,6 +1559,11 @@ impl Engine {
             self.fsmeta.chunk_size,
             self.compression,
         );
+        if let Some(handles) = &resumed {
+            // Before the root: a snapshot root's synthetic key then finds
+            // the number the kernel knows it by.
+            view.import_handles(handles);
+        }
         let rooted = match &selector {
             Some((path, name)) if !spec.rw_snapshot => view.set_snapshot_root(path, name),
             _ => view.set_subtree_root(&mounted_path),
@@ -1518,6 +1573,19 @@ impl Engine {
             return Err(error);
         }
         view.apply_spec(&spec);
+        // What this view is, resolved: reopening it (a handover) must not
+        // clone again.
+        let resolved = if spec.rw_snapshot || ephemeral_clone.is_some() {
+            ViewSpec {
+                root: mounted_path.clone(),
+                rw_snapshot: false,
+                clone_name: None,
+                ephemeral: ephemeral_clone.is_some(),
+                ..spec.clone()
+            }
+        } else {
+            spec.clone()
+        };
         let id = self.next_view_id.fetch_add(1, Ordering::Relaxed);
         view.set_id(id);
         let view = Arc::new(view);
@@ -1545,6 +1613,7 @@ impl Engine {
         self.views.lock().unwrap().insert(
             id,
             OpenView {
+                resolved,
                 info: ViewInfo {
                     id,
                     root: spec.root.clone(),
@@ -1578,6 +1647,21 @@ impl Engine {
             self.remove_ephemeral(entry.ephemeral_clone.as_deref());
         }
         now_empty
+    }
+
+    /// A view whose frontend was handed over to another process (plan 31
+    /// §6.11): stop delivering to it and forget it, but leave its
+    /// ephemeral clone (the next process serves it) and its open-orphan
+    /// claims (the next process's hold writer takes them over; a
+    /// withdrawal now would let another node reap an orphan an
+    /// application still has open).
+    pub fn close_view_for_handover(&self, view: &View) {
+        let id = view.id();
+        if let Some(k) = &self.kernel_inval {
+            k.unregister(id);
+        }
+        self.lock_flushers.unregister(id);
+        self.views.lock().unwrap().remove(&id);
     }
 
     fn remove_ephemeral(&self, path: Option<&str>) {
@@ -1633,10 +1717,29 @@ impl Engine {
     /// behind (typically the lease release losing a race, which costs
     /// peers at most a TTL) is only a warning.
     pub fn shutdown(&self) -> Result<()> {
+        self.shutdown_inner(true)
+    }
+
+    /// [`Self::shutdown`] before a session handover (plan 31 §6.11): the
+    /// same drain, publish and lease release — the next process restarts
+    /// on this state dir exactly as a remount would — except that the
+    /// open-orphan claim is left in place for the next process's hold
+    /// writer (applications still hold those files open, across the
+    /// handover). The replica is synced to disk last: the process may
+    /// `exec` rather than exit, and nothing is dropped then.
+    pub fn shutdown_for_handover(&self) -> Result<()> {
+        let result = self.shutdown_inner(false);
+        if let Err(error) = self.meta.sync() {
+            tracing::warn!(%error, "syncing the replica before the handover failed");
+        }
+        result
+    }
+
+    fn shutdown_inner(&self, withdraw_holds: bool) -> Result<()> {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let result = match self.drain_for_shutdown() {
+        let result = match self.drain_for_shutdown(withdraw_holds) {
             Ok(()) => Ok(()),
             Err(error) => match self.unshipped_summary() {
                 None => {
@@ -1688,7 +1791,7 @@ impl Engine {
         Some(left)
     }
 
-    fn drain_for_shutdown(&self) -> Result<()> {
+    fn drain_for_shutdown(&self, withdraw_holds: bool) -> Result<()> {
         // Clean unmount: ship the journal tail, publish a metadata commit,
         // then release the lease so a peer does not have to wait out the
         // TTL. Skip when we already flushed and retired via `leave` — the
@@ -1780,8 +1883,11 @@ impl Engine {
         });
         flush.context("final log flush")?;
         // No view is left to hold an orphan open: withdraw the claim now
-        // rather than let its TTL run out.
-        self.rt.block_on(self.holds.withdraw());
+        // rather than let its TTL run out (unless a handover carries the
+        // views on).
+        if withdraw_holds {
+            self.rt.block_on(self.holds.withdraw());
+        }
         tracing::info!("clean unmount drain complete");
         Ok(())
     }

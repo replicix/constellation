@@ -20,9 +20,13 @@ pub mod threads;
 
 pub use adapter::{FuseFs, KernelTuning};
 pub use constellation_vfs::FrontendCaps;
+pub use fuser::NegotiatedInit;
 pub use notify::FuseNotifySink;
 pub use reply::reply_code;
-pub use session::{mount, FuseSession, FuseUnmounter, MountOptions};
+pub use session::{
+    mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, MountOptions,
+    MountSource, SessionControl, SessionExit, SessionHandoff,
+};
 
 /// The capabilities this frontend declares: [`FrontendCaps::linux_fuse`]
 /// (`cluster_locks`: the mount forwards POSIX/`flock` locks to the view).

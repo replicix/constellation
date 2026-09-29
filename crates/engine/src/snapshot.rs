@@ -144,6 +144,23 @@ pub struct FrozenObject {
     pub ino: Ino,
 }
 
+/// As `(root hex, ino)`: a session handover carries the synthetic nodes
+/// that name frozen objects (`view::handoff`).
+impl serde::Serialize for FrozenObject {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&(self.root.to_hex(), self.ino), s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FrozenObject {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let (root, ino): (String, Ino) = serde::Deserialize::deserialize(d)?;
+        let root = NodeHash::from_hex(&root)
+            .ok_or_else(|| serde::de::Error::custom("a frozen object's root is not a node hash"))?;
+        Ok(FrozenObject { root, ino })
+    }
+}
+
 /// One child of a frozen directory.
 #[derive(Clone, Debug)]
 pub struct FrozenEntry {

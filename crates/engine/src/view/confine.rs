@@ -48,6 +48,15 @@ impl Reach {
         self.shard(ino).lock().unwrap().contains(&ino)
     }
 
+    /// Every inode cached (a session handover carries them, `handoff`).
+    pub(crate) fn all(&self) -> Vec<Ino> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            out.extend(shard.lock().unwrap().iter().copied());
+        }
+        out
+    }
+
     pub(crate) fn mark(&self, ino: Ino) {
         let mut shard = self.shard(ino).lock().unwrap();
         if shard.len() >= self.per_shard && !shard.contains(&ino) {

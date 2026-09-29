@@ -23,6 +23,8 @@ mod ec2;
 /// EC2 campaign 4 B-1/B-2: a git repository committed to by two nodes
 /// taking turns under `flock`.
 mod gitflock;
+/// Plan 31 C4b: FUSE session handover (`daemon --upgrade`).
+mod handover;
 /// EC2 campaign 6 B-1: FUSE reverse invalidations under sustained
 /// directory mutation from every node, with the holder `kill -9`ed.
 mod inval_storm;
@@ -1306,6 +1308,24 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &["fusermount3"],
         caps: &[Cap::HardLinks, Cap::Xattrs],
         run: confinement::subtree_confinement,
+    },
+    Scenario {
+        name: "session-handover-idle",
+        desc: "plan 31 C4b: `daemon --upgrade` with no op in flight; the mount never \
+               disappears (same st_dev, no error), held descriptors keep working, \
+               contents intact, the resumed image serves",
+        requires: &[],
+        caps: &[],
+        run: handover::session_handover_idle,
+    },
+    Scenario {
+        name: "upgrade-under-load",
+        desc: "plan 31 C4b: three `daemon --upgrade`s in a row under a writer, a \
+               creator and a reader with descriptors held open; zero errors \
+               (no ENOTCONN/EIO), every write lands (verified after a remount)",
+        requires: &[],
+        caps: &[],
+        run: handover::upgrade_under_load,
     },
 ];
 

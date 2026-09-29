@@ -9,6 +9,7 @@ pub mod types;
 #[cfg(feature = "web")]
 pub mod web;
 
+pub use types::HandoverStatus;
 pub use types::{
     AckStatus, CasProbeStatus, CtoStatus, FuseRequestsStatus, HeldInodeStatus, HeldStatus,
     LockStatus, LogStreamStatus, OwnS3Status, PeerPathsStatus, RemoteChunkStatus, S3RequestStatus,
@@ -223,6 +224,12 @@ pub trait StatusSource: Send + Sync + 'static {
     fn mount_list(&self) -> Vec<MountInfo> {
         Vec::new()
     }
+
+    /// Plan 31 C4b: hand the daemon's views over to `binary`
+    /// ([`Request::Upgrade`]).
+    fn upgrade(&self, _binary: Option<&Path>) -> std::result::Result<String, String> {
+        Err("in-place upgrade is not supported by this daemon".into())
+    }
 }
 
 /// The single request dispatcher shared by unix sockets and HTTP. Keeping
@@ -326,6 +333,7 @@ pub fn dispatch(source: &dyn StatusSource, request: Request) -> Response {
             mounts: source.mount_list(),
         },
         Request::DropHeld { ino, remote } => result(source.drop_held(ino, remote)),
+        Request::Upgrade { binary } => result(source.upgrade(binary.as_deref())),
     }
 }
 
@@ -335,6 +343,27 @@ pub fn serve(state_dir: &Path, source: Arc<dyn StatusSource>) -> Result<PathBuf>
     let sock = state_dir.join(SOCKET_NAME);
     let _ = std::fs::remove_file(&sock); // stale socket from a crash
     let listener = UnixListener::bind(&sock).context("binding control socket")?;
+    serve_on(listener, source);
+    Ok(sock)
+}
+
+/// [`serve`] on a listener already bound — plan 31 C4b: one a previous
+/// image of this daemon bound and handed over across `exec`, so a client
+/// connecting during the handover waits in the backlog instead of finding
+/// no daemon.
+pub fn serve_listener(
+    listener: std::os::unix::net::UnixListener,
+    source: Arc<dyn StatusSource>,
+) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .context("the handed-over control socket")?;
+    let listener = UnixListener::from_std(listener).context("the handed-over control socket")?;
+    serve_on(listener, source);
+    Ok(())
+}
+
+fn serve_on(listener: UnixListener, source: Arc<dyn StatusSource>) {
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -348,7 +377,6 @@ pub fn serve(state_dir: &Path, source: Arc<dyn StatusSource>) -> Result<PathBuf>
             });
         }
     });
-    Ok(sock)
 }
 
 /// Ceiling on the bytes we will buffer for one control-socket request
@@ -492,6 +520,7 @@ mod tests {
         fn status(&self) -> StatusReport {
             StatusReport {
                 delegation: Default::default(),
+                handover: Default::default(),
                 fs_uuid: "test-uuid".into(),
                 backend: "s3://bucket/prefix".into(),
                 mounts: vec![MountInfo {

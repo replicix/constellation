@@ -16,7 +16,8 @@ pub const METRIC_LABELS: &[&str] = &["pv"];
 /// the source name, worker threads) are the frontend's, not the view's:
 /// they travel beside the spec, to the frontend (`constellation-
 /// frontend-fuse`'s `MountOptions`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Serializable: a session handover carries it to the next process.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ViewSpec {
     /// The subtree root (`/`, `/data`) or a snapshot selector
     /// (`/data@nightly`), as `mount`'s TARGET spells it.
@@ -43,7 +44,7 @@ pub struct ViewSpec {
 /// every view was before them. Over a limit an op waits; past its
 /// deadline (the op's own, else `CONSTELLATION_VIEW_ADMISSION_WAIT_MS`,
 /// default 30 s) it completes with `Code::Again`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ViewQos {
     /// Ops of this view in flight at once. `flush`, `release`, the lock
     /// ops and `sync_view` are never held back: they end work others

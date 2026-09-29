@@ -173,6 +173,18 @@ pub enum Request {
         #[serde(default)]
         remote: bool,
     },
+    /// Plan 31 C4b: `constellation daemon --upgrade` — hand every mounted
+    /// view over to `binary` (default: the executable this daemon was
+    /// started from, as it is on disk now) without unmounting anything
+    /// (`cli/src/handover.rs`). Answered once the views are detached (or
+    /// with the reason nothing was); the new image then serves under the
+    /// same pid with `StatusReport::handover.generation` one higher.
+    /// Plan 31 C5 ports this to `node.handoff`. Unix socket only: the
+    /// HTTP adapter refuses it (it executes a binary).
+    Upgrade {
+        #[serde(default)]
+        binary: Option<std::path::PathBuf>,
+    },
 }
 
 /// Per-view mount options, mirroring today's `mount` CLI flags that are
@@ -595,8 +607,25 @@ pub struct StalledFuseRequest {
     pub blocking: bool,
 }
 
+/// Plan 31 C4b: in-place upgrades of this daemon (`Request::Upgrade`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandoverStatus {
+    /// How many handovers this daemon's process has been through (0: the
+    /// image that started it).
+    pub generation: u32,
+    pub pid: u32,
+    /// A handover is under way.
+    pub upgrading: bool,
+    /// Why the last attempt did not happen, if it did not.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
+    /// Plan 31 C4b.
+    #[serde(default)]
+    pub handover: HandoverStatus,
     pub fs_uuid: String,
     pub backend: String,
     /// Every view this daemon currently has mounted (plan 21, step 1).

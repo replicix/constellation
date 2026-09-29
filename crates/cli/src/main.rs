@@ -2,6 +2,7 @@
 
 mod daemon_lock;
 mod daemonize;
+mod handover;
 mod node_runtime;
 mod parallelism;
 mod startup;
@@ -160,6 +161,35 @@ enum Command {
         target: String,
         #[arg(long)]
         s3: Option<String>,
+    },
+    /// The running daemon of a filesystem. `--upgrade` replaces its binary
+    /// in place while every view stays mounted (plan 31 C4b): the daemon
+    /// detaches its FUSE sessions (queued requests wait in the kernel),
+    /// shuts its node down cleanly, and `exec`s the new binary, which
+    /// resumes the same connections under the same pid — no unmount, no
+    /// `ENOTCONN` for a process with a file open on the mount. Refused
+    /// (nothing changes) while a cluster lock is held or waited for.
+    Daemon {
+        /// A registered name, or (with `--state-dir`) anything.
+        target: Option<String>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Upgrade the running daemon in place.
+        #[arg(long)]
+        upgrade: bool,
+        /// The binary to upgrade to (default: the path the daemon was
+        /// started from, as it is on disk now).
+        #[arg(long, requires = "upgrade")]
+        binary: Option<PathBuf>,
+        /// How long to wait for the new image to serve.
+        #[arg(long, default_value_t = 300)]
+        timeout_s: u64,
+        /// (internal) Print this binary's handover version.
+        #[arg(long, hide = true)]
+        handover_abi: bool,
+        /// (internal) Resume a handed-over daemon from this memfd.
+        #[arg(long, hide = true)]
+        resume_from: Option<i32>,
     },
     /// (internal) The daemon's zombie reaper: watches the daemon that
     /// spawned it and, once the kernel has killed it but a thread wedged
@@ -872,6 +902,23 @@ fn main() -> Result<()> {
         );
     }
 
+    // Plan 31 C4b: the new image of an upgraded daemon (builds its own
+    // runtime, like `mount`), and the preflight's probe.
+    if let Command::Daemon {
+        resume_from,
+        handover_abi,
+        ..
+    } = &cli.command
+    {
+        if *handover_abi {
+            println!("{}", handover::handover_abi());
+            return Ok(());
+        }
+        if let Some(fd) = *resume_from {
+            return handover::resume_main(fd, threads, log_buffer);
+        }
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads.tokio)
         .max_blocking_threads(threads.blocking)
@@ -1061,6 +1108,28 @@ fn main() -> Result<()> {
             command: FsCommand::List,
         } => cmd_fs_list(&rt),
         Command::ZombieReaper { parent, state_dir } => daemon_lock::reaper_main(parent, &state_dir),
+        Command::Daemon {
+            target,
+            state_dir,
+            upgrade,
+            binary,
+            timeout_s,
+            ..
+        } => {
+            if !upgrade {
+                bail!("nothing to do: `constellation daemon --upgrade <TARGET>`");
+            }
+            let dir = match (target, state_dir) {
+                (Some(target), state_dir) => resolve_target(&target, state_dir)?.1,
+                (None, Some(dir)) => dir,
+                (None, None) => bail!("TARGET (a registered filesystem name) or --state-dir"),
+            };
+            rt.block_on(cmd_daemon_upgrade(
+                &dir,
+                binary,
+                std::time::Duration::from_secs(timeout_s),
+            ))
+        }
         Command::Doctor { target, s3 } => {
             let reg = registry::Registry::load()?;
             let t = target::resolve(&target, &reg);
@@ -1895,6 +1964,8 @@ fn take_state_dir_lock(state_dir: &Path) -> Result<LockOutcome> {
             // rest of this process's life (released automatically on
             // exit, by the kernel closing every fd) rather than dropping
             // here.
+            // Plan 31 C4b: an in-place upgrade hands this very lock on.
+            handover::set_lock_fd(std::os::fd::AsRawFd::as_raw_fd(guard.file()));
             std::mem::forget(guard);
             let _ = std::fs::remove_file(state_dir.join(constellation_api::SOCKET_NAME));
             let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
@@ -2034,6 +2105,20 @@ fn cmd_mount_body(
                         }
                         return Ok(());
                     }
+                    AttachOutcome::DaemonUpgrading => {
+                        // Views already attached stay; `MountAdd` of one
+                        // already mounted is refused below the next time,
+                        // so retry only while the deadline allows.
+                        if attach_started.elapsed() >= attach_deadline {
+                            return fail(
+                                verdict,
+                                "the daemon was being upgraded for the whole attach timeout"
+                                    .to_string(),
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
                     AttachOutcome::DaemonShuttingDown => {
                         eprintln!(
                             "existing daemon for this mount is shutting down (draining); \
@@ -2088,7 +2173,10 @@ fn cmd_mount_body(
             // And should this daemon end the same way, its reaper does
             // the abort within seconds instead of at the next mount.
             match daemon_lock::spawn_reaper(state_dir) {
-                Ok(pid) => tracing::info!(reaper_pid = pid, "zombie reaper started"),
+                Ok(pid) => {
+                    handover::set_reaper_pid(pid);
+                    tracing::info!(reaper_pid = pid, "zombie reaper started")
+                }
                 Err(e) => tracing::warn!(error = %e, "the zombie reaper could not be started"),
             }
             startup::phase("starting the node runtime");
@@ -2123,6 +2211,7 @@ fn cmd_mount_body(
                     },
                     web_ui,
                     log_buffer,
+                    resumed: None,
                 },
                 handle,
             ) {
@@ -2174,10 +2263,10 @@ fn cmd_mount_body(
             }
             // Block on every view; the process exits once the last one's
             // thread has completed its own teardown (see
-            // `NodeRuntime::add_mount`'s thread body).
-            for (id, _) in added {
-                node.join_mount(id)?;
-            }
+            // `NodeRuntime::add_mount`'s thread body) — and not while an
+            // in-place upgrade is handing the views over.
+            drop(added);
+            node.wait_all();
             let failed = node.shutdown_error();
             drop(node);
             // Never wait indefinitely for a blocking task a failed drain
@@ -2201,6 +2290,9 @@ enum AttachOutcome {
     /// lock/become-daemon flow rather than orphaning a mount on a dying
     /// process.
     DaemonShuttingDown,
+    /// Plan 31 C4b: the daemon is handing its views over to a new image
+    /// (`daemon --upgrade`); the same daemon answers again shortly.
+    DaemonUpgrading,
 }
 
 /// Attach every view through the running daemon's control socket. Each
@@ -2231,6 +2323,11 @@ async fn attach_views(
             constellation_api::Response::Ok { .. } => {}
             constellation_api::Response::Error { message } if message.contains("shutting down") => {
                 return Ok(AttachOutcome::DaemonShuttingDown);
+            }
+            constellation_api::Response::Error { message }
+                if message.contains(node_runtime::UPGRADING) =>
+            {
+                return Ok(AttachOutcome::DaemonUpgrading);
             }
             constellation_api::Response::Error { message } => {
                 bail!("{}: {message}", view.mountpoint.display())
@@ -3143,6 +3240,7 @@ impl constellation_api::StatusSource for DaemonStatus {
                 Some("1")
             );
         constellation_api::StatusReport {
+            handover: self.node.handover.status(),
             fs_uuid: self.fs_uuid.clone(),
             backend: self.backend.clone(),
             mounts: self.api_mounts(),
@@ -4350,6 +4448,81 @@ impl constellation_api::StatusSource for DaemonStatus {
     fn mount_list(&self) -> Vec<constellation_api::MountInfo> {
         self.api_mounts()
     }
+
+    fn upgrade(&self, binary: Option<&std::path::Path>) -> std::result::Result<String, String> {
+        // Detaching drains each session (a bounded wait): not on a bare
+        // tokio worker.
+        tokio::task::block_in_place(|| handover::upgrade(&self.node, binary))
+    }
+}
+
+/// `constellation daemon --upgrade`: ask the daemon to hand its views
+/// over (`handover`), then wait until the new image answers `status`
+/// with a higher generation.
+async fn cmd_daemon_upgrade(
+    state_dir: &Path,
+    binary: Option<PathBuf>,
+    within: std::time::Duration,
+) -> Result<()> {
+    let sock = state_dir.join(constellation_api::SOCKET_NAME);
+    let status = |timeout| {
+        let sock = sock.clone();
+        async move {
+            match constellation_api::call_bounded(
+                &sock,
+                &constellation_api::Request::Status,
+                timeout,
+            )
+            .await?
+            {
+                constellation_api::Response::Status(s) => Ok(*s),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+    };
+    let before = status(daemon_lock::control_timeout())
+        .await
+        .context("no daemon answers for this state dir")?;
+    let binary = binary
+        .map(|b| std::fs::canonicalize(&b).with_context(|| format!("{}", b.display())))
+        .transpose()?;
+    match constellation_api::call_bounded(
+        &sock,
+        &constellation_api::Request::Upgrade { binary },
+        within,
+    )
+    .await?
+    {
+        constellation_api::Response::Ok { detail } => println!("{detail}"),
+        constellation_api::Response::Error { message } => bail!("upgrade refused: {message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() > within {
+            bail!("the upgraded daemon did not report serving within {within:?}");
+        }
+        // The new image answers once it serves; during the handover the
+        // connection waits in the listener's backlog.
+        if let Ok(now) = status(std::time::Duration::from_secs(5)).await {
+            if now.handover.generation > before.handover.generation && !now.handover.upgrading {
+                println!(
+                    "upgraded: pid {} generation {} version {} serving {} view(s)",
+                    now.handover.pid,
+                    now.handover.generation,
+                    now.version,
+                    now.mounts.len()
+                );
+                return Ok(());
+            }
+            if !now.handover.upgrading {
+                if let Some(error) = now.handover.last_error {
+                    bail!("the upgrade failed: {error}");
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 fn normalize_control_path(path: &str) -> String {
@@ -4609,6 +4782,7 @@ mod umount_tests {
                 },
                 web_ui: 0,
                 log_buffer: log_buffer::LogBuffer::default(),
+                resumed: None,
             },
             rt.handle().clone(),
         )

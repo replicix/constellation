@@ -100,6 +100,7 @@ mod admission;
 mod confine;
 mod create;
 mod flush;
+mod handoff;
 mod io;
 mod lock_gate;
 pub mod ops;
@@ -109,6 +110,7 @@ mod synthetic;
 mod write_gate;
 
 pub use confine::LINK_DOMAIN_XATTR;
+pub use handoff::{HandleTableSnapshot, ViewHandoff};
 pub use spec::{ViewQos, ViewSpec, METRIC_LABELS};
 
 #[cfg(test)]

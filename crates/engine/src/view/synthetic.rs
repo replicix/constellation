@@ -5,7 +5,9 @@ use super::*;
 
 pub(super) const SYNTHETIC_INO_BIT: u64 = 1 << 63;
 
-#[derive(Debug, Clone)]
+/// Serializable: a session handover carries a view's synthetic numbering
+/// to the next process (`view::handoff`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SyntheticNode {
     Constellation {
         path: String,

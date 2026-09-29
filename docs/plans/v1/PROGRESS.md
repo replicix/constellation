@@ -28188,3 +28188,160 @@ harness's darwin errors stay at its known 8.
 - [x] `make check-cross` exits 0
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+
+## Plan 31 C4b — FUSE session handover
+
+The last part of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.11): a FUSE session handed from one process image to the next without
+the kernel ever seeing an unmount, and `constellation daemon --upgrade` on
+plain Linux built on it. The gate — a real kernel mount surviving a daemon
+replacement under a live writer with zero `ENOTCONN`/`EIO` — passes.
+
+| Item | State | Where |
+|---|---|---|
+| `vendor/fuser`: fuser 0.18.0 vendored (checksum `b82b6597…aecfd`, tag `v0.18.0`), `[patch.crates-io]` + workspace `exclude`, like `vendor/fjall`; patches `negotiated-init` (`NegotiatedInit`, `Session::negotiated_init`), `from-fd-resumed` (`Session::from_fd_resumed`, no handshake), `detach` (`Session::detacher`/`SessionDetacher`, `run_detachable` → `SessionEnd::{Ended, Detached(DetachedSession { filesystem, fd, init })}`, `Mount::disarm`, non-blocking + `poll` reads with a wake pipe), build hygiene; one `git diff` patch file | DONE | `vendor/fuser/`, `vendor/fuser/CONSTELLATION-PATCH.md`, `vendor/fuser/patches/0001-constellation-session-handover.patch` |
+| `tools/vendor-fuser.sh <version>` / `--from <dir>` / `--check`: pristine crate + `git apply` of every patch, all-or-nothing, loud on a conflict (verified: `--check` reproduces `vendor/fuser` byte for byte from crates.io and from the registry copy; a drifted `session.rs` fails) | DONE | `tools/vendor-fuser.sh` |
+| `MountSource::{Path(PathBuf, MountOpts), PreopenedFd(OwnedFd)}`, `mount_source`; `Path` as root mounts with `platform::linux::fuse_mount_fd` and handshakes on the fd (fusermount3-free; the daemon's root mounts now take this path), else fuser/`fusermount3` | DONE | `crates/frontend-fuse/src/session.rs` |
+| `SessionControl::detach(export) -> SessionHandoff<S> { fuse: FuseHandoff { fuse_fd, init, mountpoint }, view: S }` (refuse on lock waits → close the notification gate while serving → stop reading → re-check → `sync_view` → hand out; any failure resumes in place); `FuseSession::resume(FuseHandoff, view, opts, caps, sink)`; `SessionExit::{Unmounted, Detached}`; unmount by path for sessions fuser does not own | DONE | `crates/frontend-fuse/src/session.rs` |
+| Deferred-reply accounting (`Deferred`, `Tracked`: blocking `setlk`), gated `FuseNotifySink` (`NotifyGate`) | DONE | `crates/frontend-fuse/src/{adapter,notify}.rs` |
+| `HandleTableSnapshot` (open handles per inode, the synthetic `.constellation` numbering, a confined view's reach cache; serde), `View::export_handles`, `View::handover_blockers`, `ViewHandoff { spec, handles }`; `Engine::export_view` (the resolved spec: a clone's path, `ephemeral` kept), `Engine::open_view_resumed(spec, handles, caps, events)`, `close_view_for_handover`, `shutdown_for_handover`; serde on `ViewSpec`/`ViewQos`/`SyntheticNode`/`FrozenObject`/`PinTarget` | DONE | `crates/engine/src/view/handoff.rs`, `crates/engine/src/node.rs` |
+| `constellation daemon --upgrade [TARGET] [--state-dir] [--binary] [--timeout-s]`; `Request::Upgrade { binary }` (unix socket only; HTTP refuses), `StatusReport.handover { generation, pid, upgrading, last_error }`; hidden `daemon --handover-abi`/`--resume-from <fd>`; the control listener, `daemon.lock` and reaper handed on; `mount` attaching during an upgrade retries | DONE | `crates/cli/src/handover.rs`, `crates/cli/src/{main,node_runtime}.rs`, `crates/api/src/{lib,types,web}.rs` |
+| Harness `session-handover-idle`, `upgrade-under-load` | DONE | `crates/harness/src/scenarios/handover.rs`, `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+
+**Shape: `exec` in place.** The daemon `exec`s the new binary with the
+FUSE descriptors inherited instead of passing them to a second process
+over `SCM_RIGHTS`. Pid, `daemon.lock` (an `flock` on an inherited open
+file, never released), `daemon.pid`, the zombie reaper watching the pid,
+the supervisor and the harness's `Client` all stay valid, so no `mount`
+can take the lock in a gap and `abort_stale_mounts` the connections that
+are merely changing hands; the control socket's listener is inherited
+too, so `status`/`mount` during the gap wait in its backlog. A second
+process would have to share the lock's open file (then `/proc/locks`
+names a dead pid, which the takeover logic reads) and loses the
+supervisor's pid. "New daemon serves" is therefore checked as the next
+generation in `status` and `--resume-from` in the pid's cmdline.
+
+**The sequence** (`crates/cli/src/handover.rs`'s module doc):
+
+1. Preflight, nothing changed yet: no handover under way; the new binary
+   runs and speaks this handover version (`daemon --handover-abi`); an E2E
+   filesystem's passphrase is in the environment; no cluster lock held
+   and no blocking lock wait in flight (`View::handover_blockers`,
+   `SessionControl::deferred_replies`).
+2. Detach every session: close its notification gate while it still
+   serves and wait for writes under way; stop the fuser workers before
+   their next read (requests queue in the kernel from here); re-check lock
+   waits; `sync_view` (every pending write published); export the view's
+   spec and handle table. Any failure resumes the already-detached
+   sessions in place on the same descriptors and refuses the upgrade.
+3. Answer the request ("handing N view(s) over"); the rest runs on its
+   own thread.
+4. Durability barrier: views closed for the handover (ephemeral clones and
+   orphan claims left for the next image), then the node's clean shutdown
+   — dirty chunks uploaded, journal shipped, commit published, lease
+   released — and the replica synced to disk (`exec` drops nothing).
+5. `exec` `constellation daemon --resume-from <memfd>` (JSON
+   `DaemonHandoff`: node settings incl. the live write mode, per view its
+   mount settings, fd, `NegotiatedInit`, `ViewHandoff`; the lock, listener
+   and a descriptor of the current executable). An `exec` failure `exec`s
+   the current executable instead (the rollback is itself a handover).
+6. New image: every inherited descriptor back to close-on-exec; the node
+   starts on the same state dir like any restart (incarnation bump, lease
+   re-acquired on demand) — failing that, roll back to the previous binary
+   once; old mount records dropped; each view reopened with its handles
+   and its session resumed without `FUSE_INIT` (the queued requests are
+   served now); open files' pages invalidated once; control API served
+   from the inherited listener; `status` shows the next generation.
+
+**Queued, in-flight, `FORGET`, locks.** Requests the kernel queues while
+nobody reads (anything after step 2 began, `FORGET`s and `INTERRUPT`s
+included) wait in the connection's input queue and are read by the next
+image. A request already read is always answered before the workers stop
+(every op but a lock wait answers inline on its worker; the stop flag is
+checked only before a read). A reply must be written on the descriptor its
+request was read from while that descriptor is served (a closing `/dev/fuse`
+descriptor ends the requests on its processing list with `ECONNABORTED`):
+hence the refusal on lock waits, re-checked after the stop. Lookup counts
+need nothing: inode numbers are the replica's and the view keeps no
+lookup table; the only per-view numbering (synthetic inodes) crosses in
+`HandleTableSnapshot`. Blocking `F_SETLKW`: refused rather than drained —
+fuser 0.18 cannot interrupt it and it may wait forever; a granted cluster
+lock is refused too (it lives in the node's memory and its grant); under
+`--locks local` the kernel holds the locks and they cross by themselves.
+
+**fuser patch choice.** A dedicated `from_fd_resumed` constructor rather
+than folding `INIT` into the dispatch loop behind an `initialized` flag:
+fuser 0.18's loop already answers a stray `INIT` with `EIO` and reads no
+per-connection init state, so the flag would guard nothing; the constructor
+leaves every ordinary mount's handshake untouched. Stopping a worker parked
+in `read(2)` needs a wake-up the kernel does not offer, so an armed session
+reads non-blocking and `poll`s the device with a wake pipe (under load the
+first `read` succeeds and no `poll` is made); sessions not armed keep
+upstream's blocking loop.
+
+**Found on the way, not fixed (pre-existing).** On a real mount, `fsync`
+and `close` of a file written, unlinked and still open fail with `ENOENT`
+(no upgrade involved; queued as a separate task). A handover refuses while
+such a file has pending writes (its `sync_view` fails the same way), and
+the session resumes in place.
+
+Scenario results (`CONSTELLATION_BIN=target/debug/constellation
+target/debug/harness run [--seed N] session-handover-idle
+upgrade-under-load`, root, docker floci S3, debug build):
+
+| Run | `session-handover-idle` | `upgrade-under-load` (3 upgrades) |
+|---|---|---|
+| seed 42 | PASSED, upgrade 322 ms | PASSED, upgrades 488/683/1046 ms, longest syscall 1026 ms, 2752 records + 483 files + 3591 reads, 0 errors |
+| seed 1 | PASSED, 348 ms | PASSED, 389/651/847 ms, longest syscall 810 ms, 2624 + 439 + 3403, 0 errors |
+| seed 2 | PASSED, 369 ms | PASSED, 476/645/951 ms, longest syscall 940 ms, 2591 + 445 + 3469, 0 errors |
+| seed 3 | PASSED, 319 ms | PASSED, 519/611/781 ms, longest syscall 756 ms, 2672 + 452 + 3433, 0 errors |
+| seed 42 (final binary) | PASSED, 304 ms | PASSED, 441/606/924 ms, longest syscall 908 ms, 2736 + 435 + 3472, 0 errors |
+
+Manual checks (debug binary, root unless noted, local backend): 5
+upgrades in a row with no descriptor or thread growth (21 fds, ~30
+threads, ~250 ms each); two views (`/` and `/sub` attached by a second
+`mount`) upgraded three times, mount records rewritten under the new view
+ids, both unmounted with a clean drain and exit; as `nobody` through
+`fusermount3` (fuser owns the mount; after the detach the unmount goes by
+path through `fusermount3 -u`): two upgrades, then a clean unmount; a held
+`fcntl` lock under `--locks cluster` refuses the upgrade naming the inode,
+and after the unlock it succeeds.
+
+Unit tests (new): frontend-fuse 12 → 17 (`session::tests`, a real kernel
+mount as root: detach with nothing in flight, a detach waiting for an op
+in flight, a resume serving requests queued while nobody read, the
+lock-wait refusal and the deferred counter, `NegotiatedInit` JSON/postcard
+round trips and `check_resumable`); engine 297 → 299 + 2 ignored
+(`view::handoff::tests`: handles, an unlinked-open orphan and synthetic
+numbers crossing to a second view, both wire forms); cli 20 → 24 (the
+handoff through a memfd, a foreign handoff version refused, close-on-exec
+toggling, the ABI probe); api 13 → 14 (HTTP refuses `Upgrade`, the
+socket's dispatcher reaches the source). frontend-fuse's `tests/wire.rs`
+(20) passes on the patched fuser.
+
+Deviations from the §6.11 sketch: `SessionHandoff` is generic in the
+view's state (`SessionHandoff<S> { fuse: FuseHandoff { fuse_fd, init,
+mountpoint }, view: S }`, the daemon's `S` = `ViewHandoff { spec, handles
+}`) because the frontend cannot name engine types (§3's layering);
+`detach` is on a `SessionControl` handle (the session itself runs on its
+own thread) and takes an `export` callback run once the view is quiescent;
+`resume` takes the frontend's mount options and optionally a sink to
+reuse. The control request is `Request::Upgrade` on today's API socket;
+C5 ports it to `node.handoff`. There is no `Cap` for session handover in
+the harness's capability list yet (the scenarios declare none): a
+non-FUSE frontend lane will need one.
+
+### Plan 31 C4b exit criteria
+
+- [x] `vendor/fuser` with a named, documented, re-appliable patch set
+  (`from_fd_resumed`, detach, negotiated init)
+- [x] `MountSource`, `FuseSession::detach`/`resume`, `View::export_handles`,
+  `Engine::open_view_resumed`
+- [x] `constellation daemon --upgrade` on plain Linux, sequence documented
+- [x] `session-handover-idle` and `upgrade-under-load` pass (5/5 each)
+  against a real kernel mount: zero `ENOTCONN`/`EIO`
+- [x] `cargo build --workspace`; `cargo clippy --workspace --all-targets
+  -- -D warnings` clean; `cargo fmt` on the touched crates
+- [x] `make check-cross` exits 0 (known failures unchanged)
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
