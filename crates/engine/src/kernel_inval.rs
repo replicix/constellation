@@ -494,6 +494,13 @@ fn invalidations(records: &[LogRecord]) -> Vec<Inval> {
                 new_parent,
                 new_name,
                 ..
+            }
+            | LogRecord::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
             } => {
                 entry(&mut out, *parent, name);
                 entry(&mut out, *new_parent, new_name);

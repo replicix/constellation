@@ -192,7 +192,7 @@ impl Vfs for View {
                 drop(writes);
                 r.done(Ok(self.entry_out(&attr)))
             }
-            Ok(None) => r.done(err(Code::NotFound)),
+            Ok(None) => r.done(err(self.beneath_non_dir(Code::NotFound, &[parent]))),
             Err(e) => r.done(err(e.code())),
         }
     }
@@ -275,6 +275,31 @@ impl Vfs for View {
             self.atime.purge(ino);
         }
         if let Some(new_size) = set.size {
+            // truncate(2): `EISDIR` for a directory, `EINVAL` for anything
+            // else that is not a regular file (the kernel checks this
+            // above a FUSE mount; a frontend that does not must get it
+            // here, not a size written into a directory's record).
+            let kind = match self.meta.getattr(ino) {
+                Ok(Some(attr)) => Some(attr.kind),
+                Ok(None) => self
+                    .meta
+                    .scratch_getattr(ino)
+                    .ok()
+                    .flatten()
+                    .map(|attr| attr.kind),
+                Err(_) => None,
+            };
+            match kind {
+                Some(InodeKind::Dir) => {
+                    r.done(err(Code::IsDir));
+                    return;
+                }
+                Some(InodeKind::File) | None => {}
+                Some(_) => {
+                    r.done(err(Code::Invalid));
+                    return;
+                }
+            }
             // Plan 30 §M14: a truncation is a write (fenced under a
             // lapsed lock grant).
             if self.lock_fenced(ino) {
@@ -287,25 +312,41 @@ impl Vfs for View {
                 return;
             }
         }
-        let result = self
-            .mutate_op(
+        let result = match self.mutate_op(
+            ino,
+            constellation_meta::MutateOp::Setattr {
                 ino,
-                constellation_meta::MutateOp::Setattr {
-                    ino,
-                    mode: set.mode,
-                    uid: set.uid,
-                    gid: set.gid,
-                    size: set.size,
-                    atime_ns,
-                    mtime_ns,
-                },
-            )
-            .and_then(|()| {
-                self.meta
-                    .getattr(ino)
-                    .map_err(|error| error.code())?
-                    .ok_or(Code::NotFound)
-            });
+                mode: set.mode,
+                uid: set.uid,
+                gid: set.gid,
+                size: set.size,
+                atime_ns,
+                mtime_ns,
+            },
+        ) {
+            // `fchmod`/`ftruncate`/... on a descriptor of an unlinked
+            // file: nothing to publish, the orphan's own record changes.
+            Err(Code::NotFound) if self.unlinked(ino) => self
+                .meta
+                .orphan_setattr(
+                    ino, set.mode, set.uid, set.gid, set.size, atime_ns, mtime_ns,
+                )
+                .map_err(|error| error.code())
+                .and_then(|attr| attr.ok_or(Code::NotFound))
+                .map(|mut attr| {
+                    let writes = self.writes.lock(ino);
+                    if let Some(len) = self.writes.pending_len(&writes, ino) {
+                        attr.size = len;
+                    }
+                    attr
+                }),
+            Err(error) => Err(error),
+            Ok(()) => self
+                .meta
+                .getattr(ino)
+                .map_err(|error| error.code())
+                .and_then(|attr| attr.ok_or(Code::NotFound)),
+        };
         match result {
             Ok(attr) => r.done(Ok(self.attr_out(&attr))),
             Err(error) => r.done(err(error)),
@@ -571,7 +612,7 @@ impl Vfs for View {
                 }
                 r.done(Ok(()))
             }
-            Err(e) => r.done(err(e)),
+            Err(e) => r.done(err(self.beneath_non_dir(e, &[parent]))),
         }
     }
 
@@ -610,7 +651,7 @@ impl Vfs for View {
         };
         match result {
             Ok(()) => r.done(Ok(())),
-            Err(e) => r.done(err(e)),
+            Err(e) => r.done(err(self.beneath_non_dir(e, &[parent]))),
         }
     }
 
@@ -621,13 +662,24 @@ impl Vfs for View {
         name: &Name,
         new_parent: Ino,
         new_name: &Name,
-        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are accepted and not acted
-        // on, as they never were (the FUSE adapter ignored its flags).
-        _flags: RenameFlags,
+        flags: RenameFlags,
         r: R,
     ) {
         let _w = self.watch.enter("rename", parent);
         let _admitted = admit!(self, cx, r);
+        // renameat2(2): `EINVAL` for a flag the filesystem does not
+        // support (`RENAME_WHITEOUT`, anything unknown) and for
+        // `NOREPLACE|EXCHANGE` together — never `ENOSYS`/`EOPNOTSUPP`,
+        // which would make the Linux kernel stop sending `FUSE_RENAME2`
+        // (and so the flags it does support) for the rest of the mount.
+        let noreplace = flags.contains(RenameFlags::NOREPLACE);
+        let exchange = flags.contains(RenameFlags::EXCHANGE);
+        if flags.intersects(RenameFlags::WHITEOUT | RenameFlags::UNSUPPORTED)
+            || (noreplace && exchange)
+        {
+            r.done(err(Code::Invalid));
+            return;
+        }
         let parent = enter!(self, parent, r);
         let newparent = enter!(self, new_parent, r);
         let _inflight = self.inflight.enter(&[parent, newparent]);
@@ -649,7 +701,31 @@ impl Vfs for View {
                 .ok()
                 .flatten()
                 .is_some();
+        if exchange && (src_scratch || dst_scratch) {
+            // The node-local scratch area keeps its own namespace; a swap
+            // there (or across its boundary) is not implemented.
+            r.done(err(Code::Invalid));
+            return;
+        }
         if src_scratch && dst_scratch {
+            if noreplace {
+                // The scratch area is node-local: its entries change only
+                // through this node's own ops, and a kernel frontend holds
+                // both directories' `i_rwsem` for the length of a rename,
+                // so no other node can race this check (the scratch
+                // namespace has no sequencer to decide it).
+                match self.meta.scratch_lookup(newparent, &newname) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        r.done(err(Code::Exists));
+                        return;
+                    }
+                    Err(error) => {
+                        r.done(err(error.code()));
+                        return;
+                    }
+                }
+            }
             return match self.meta.scratch_rename(parent, &name, newparent, &newname) {
                 Ok(()) => r.done(Ok(())),
                 Err(error) => r.done(err(error.code())),
@@ -724,6 +800,7 @@ impl Vfs for View {
                 manifest,
                 size: attr.size,
                 xattrs,
+                noreplace,
             };
             return match self.mutate_op(newparent, op) {
                 Ok(()) => match self.meta.scratch_unlink(parent, &name) {
@@ -734,22 +811,42 @@ impl Vfs for View {
             };
         }
         // §6.12 `confine_links`: moving one of several names of a file
-        // into another link domain would leave the inode in two.
+        // into another link domain would leave the inode in two (an
+        // exchange moves both entries, each the other way).
         if self.confine_links && parent != newparent {
-            if let Err(code) = self.rename_within_domains(parent, &name, newparent) {
+            let crossing = self
+                .rename_within_domains(parent, &name, newparent)
+                .and_then(|()| {
+                    if exchange {
+                        self.rename_within_domains(newparent, &newname, parent)
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(code) = crossing {
                 r.done(err(code));
                 return;
             }
         }
-        let op = constellation_meta::MutateOp::Rename {
-            parent,
-            name,
-            new_parent: newparent,
-            new_name: newname,
+        let op = if exchange {
+            constellation_meta::MutateOp::Exchange {
+                parent,
+                name,
+                new_parent: newparent,
+                new_name: newname,
+            }
+        } else {
+            constellation_meta::MutateOp::Rename {
+                parent,
+                name,
+                new_parent: newparent,
+                new_name: newname,
+                noreplace,
+            }
         };
         match self.mutate_op(parent, op) {
             Ok(()) => r.done(Ok(())),
-            Err(e) => r.done(err(e)),
+            Err(e) => r.done(err(self.beneath_non_dir(e, &[parent, newparent]))),
         }
     }
 
@@ -757,7 +854,7 @@ impl Vfs for View {
         &self,
         cx: &OpCtx<'_>,
         ino: Ino,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _owner: OpenOwner,
         r: R,
     ) {
@@ -767,6 +864,10 @@ impl Vfs for View {
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
                 r.done(err(Code::Stale));
+            } else if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC) {
+                // A snapshot mirror is frozen: `EROFS`, as a read-only
+                // mount answers an open for writing.
+                r.done(err(Code::ReadOnly));
             } else if matches!(
                 node,
                 SyntheticNode::Frozen {
@@ -833,7 +934,7 @@ impl Vfs for View {
         &self,
         cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh: Fh,
         off: u64,
         len: u32,
         r: R,
@@ -841,6 +942,12 @@ impl Vfs for View {
         let _w = self.watch.enter("read", ino);
         let _admitted = admit!(self, cx, r);
         let ino = enter!(self, ino, r);
+        // §6.12: a handle addresses only the inode it was opened on (the
+        // view hands out `Fh(ino)`); anything else was never given out.
+        if fh != Fh(ino) {
+            r.done(err(Code::BadFd));
+            return;
+        }
         let _inflight = self.inflight.enter(&[ino]);
         if View::is_synthetic(ino) {
             match self.read_frozen(ino, off, len as u64) {
@@ -979,8 +1086,11 @@ impl Vfs for View {
                 None => false,
             }
         };
-        // Orphan reap on last close (unlink-while-open, DESIGN.md §3).
-        if last {
+        // Orphan reap on last close (unlink-while-open, DESIGN.md §3),
+        // with the write session a flush kept for the descriptors
+        // (`flush_inode`: an unlinked file publishes nothing).
+        if last && self.unlinked(ino) {
+            self.drop_writes(ino);
             if let Ok(Some(attr)) = self.meta.getattr(ino) {
                 if attr.nlink == 0 {
                     let _ = self.meta.reap_orphan(ino);
@@ -1075,25 +1185,33 @@ impl Vfs for View {
             Ok(e) => e,
             Err(e) => return r.done(err(e.code())),
         };
-        // Stable cursor: "." = 1, ".." = 2, children from 3.
-        let mut idx = cookie;
-        loop {
-            let next = idx + 1;
-            let full = match idx {
-                0 => r.add(visible_ino, next, FileKind::Dir, b"."),
-                1 => r.add(visible_ino, next, FileKind::Dir, b".."),
-                _ => {
-                    let child = match entries.get((idx - 2) as usize) {
-                        Some(c) => c,
-                        None => break,
-                    };
-                    r.add(child.ino, next, kind_out(child.kind), child.name.as_bytes())
-                }
-            };
-            if full {
+        // Cookies: "." answers 1, ".." 2, and each child its name's
+        // `dir_cookie` — so a listing resumes after the *name* it stopped
+        // at, not at a position that an unlink or a create in between
+        // (here, or replayed from another node) shifts: a positional
+        // cookie repeated or skipped entries that were there throughout.
+        // Children are listed in cookie order.
+        let mut children: Vec<(u64, &constellation_meta::DirEntry)> = entries
+            .iter()
+            .map(|entry| (dir_cookie(entry.name.as_bytes()), entry))
+            .collect();
+        children.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        if cookie == 0 && r.add(visible_ino, 1, FileKind::Dir, b".") {
+            return r.done(Ok(()));
+        }
+        if cookie <= 1 && r.add(visible_ino, 2, FileKind::Dir, b"..") {
+            return r.done(Ok(()));
+        }
+        let from = children.partition_point(|(c, _)| *c <= cookie);
+        for (next, child) in &children[from..] {
+            if r.add(
+                child.ino,
+                *next,
+                kind_out(child.kind),
+                child.name.as_bytes(),
+            ) {
                 break;
             }
-            idx = next;
         }
         r.done(Ok(()));
     }
@@ -1101,6 +1219,8 @@ impl Vfs for View {
     fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
         let _w = self.watch.enter("statfs", ino);
         let _admitted = admit!(self, cx, r);
+        // §6.12: an inode outside the view answers `Stale` here too.
+        let _ino = enter!(self, ino, r);
         // Used space is logical bytes under the mounted view; free space
         // is whole-filesystem headroom under the cap. See `statfs_blocks`.
         // Block size mirrors blksize.
@@ -1137,6 +1257,11 @@ impl Vfs for View {
     ) {
         let _w = self.watch.enter("fallocate", ino);
         let _admitted = admit!(self, cx, r);
+        // Plan 31 §6.2: absent from a frontend that does not declare it.
+        if !self.caps.fallocate {
+            r.done(err(Code::NotSupported));
+            return;
+        }
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         gate!(self, ino, r);
@@ -1165,6 +1290,12 @@ impl Vfs for View {
     ) {
         let _w = self.watch.enter("lseek", ino);
         let _admitted = admit!(self, cx, r);
+        // Plan 31 §6.2: `SEEK_DATA`/`SEEK_HOLE` are absent from a frontend
+        // that does not declare them.
+        if !self.caps.seek_hole {
+            r.done(err(Code::NotSupported));
+            return;
+        }
         let ino = enter!(self, ino, r);
         match self.seek_sparse(ino, off, whence) {
             Ok(position) => r.done(Ok(position as u64)),
@@ -1388,7 +1519,7 @@ impl Vfs for View {
     ) {
         let _w = self.watch.enter("getlk", ino);
         let ino = enter!(self, ino, r);
-        let Some(locks) = self.cluster_locks() else {
+        let Some(locks) = self.vfs_cluster_locks() else {
             r.done(err(Code::NotImplemented));
             return;
         };
@@ -1444,7 +1575,7 @@ impl Vfs for View {
             self.watch.enter("setlk", ino)
         };
         let ino = enter!(self, ino, r);
-        let Some(locks) = self.cluster_locks() else {
+        let Some(locks) = self.vfs_cluster_locks() else {
             r.done(err(Code::NotImplemented));
             return;
         };
@@ -1490,7 +1621,7 @@ impl Vfs for View {
     ) {
         let _w = self.watch.enter("setlk", ino);
         let ino = enter!(self, ino, r);
-        let Some(locks) = self.cluster_locks() else {
+        let Some(locks) = self.vfs_cluster_locks() else {
             r.done(err(Code::NotImplemented));
             return;
         };
@@ -1509,5 +1640,46 @@ impl Vfs for View {
             }
         }
         r.done(self.sync_barrier(self.view_root).map_err(VfsError::from));
+    }
+}
+
+/// A child's `readdir` cookie: a 64-bit FNV-1a of its name, kept clear of
+/// the `.`/`..` cookies (1, 2) and below `i64::MAX` (fuser's offsets are
+/// signed). Two names of one directory sharing a cookie (odds ~n²/2⁶³)
+/// are both listed in one page but a listing that stops between them
+/// resumes after both.
+pub(super) fn dir_cookie(name: &[u8]) -> u64 {
+    let hash = name.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (hash >> 2) + 3
+}
+
+impl View {
+    /// The cluster locks the `lock_*` ops serve: none unless this view's
+    /// frontend declared `cluster_locks` (plan 31 §6.2: "only called if
+    /// caps.cluster_locks") — a frontend that keeps locks node-local is
+    /// answered `NotImplemented`, as the contract says, even on an engine
+    /// that forwards them for its other views.
+    fn vfs_cluster_locks(&self) -> Option<&Arc<crate::locks::ClusterLocks>> {
+        self.cluster_locks().filter(|_| self.caps.cluster_locks)
+    }
+
+    /// POSIX `ENOTDIR`: a name looked up, removed or moved beneath
+    /// something that is not a directory. The replica answers "no such
+    /// entry" for a non-directory parent; a kernel frontend never asks
+    /// (its path walk stops first), anything else must see `NotDir`.
+    fn beneath_non_dir(&self, code: Code, parents: &[Ino]) -> Code {
+        if code != Code::NotFound {
+            return code;
+        }
+        let non_dir = parents.iter().any(|parent| {
+            matches!(self.meta.getattr(*parent), Ok(Some(attr)) if attr.kind != InodeKind::Dir)
+        });
+        if non_dir {
+            Code::NotDir
+        } else {
+            code
+        }
     }
 }

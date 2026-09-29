@@ -289,6 +289,20 @@ pub(super) fn rename_noreplace(env: &Env<'_>) -> TestResult {
     );
     assert_eq!(must("lookup c", c.lookup(root, "c")).attr.ino, a.attr.ino);
     refused("lookup a", c.lookup(root, "a"), Code::NotFound);
+    // renameat2(2): a flag the filesystem does not support is `EINVAL`
+    // (never `ENOSYS`/`EOPNOTSUPP`: the Linux kernel would stop sending
+    // `FUSE_RENAME2`, and with it the flags that are supported).
+    refused(
+        "WHITEOUT",
+        c.rename_flags(root, "c", root, "w", RenameFlags::WHITEOUT),
+        Code::Invalid,
+    );
+    refused(
+        "an unknown flag",
+        c.rename_flags(root, "c", root, "w", RenameFlags::UNSUPPORTED),
+        Code::Invalid,
+    );
+    assert_eq!(must("lookup c", c.lookup(root, "c")).attr.ino, a.attr.ino);
     Ok(())
 }
 
@@ -339,6 +353,69 @@ pub(super) fn rename_exchange(env: &Env<'_>) -> TestResult {
         ),
         Code::Invalid,
     );
+    Ok(())
+}
+
+/// `RENAME_EXCHANGE` across two directories, of a directory and a file:
+/// both names stay, each names the other inode, the directory's `..` link
+/// moves with it (each parent's `nlink` follows its subdirectories), and a
+/// directory cannot be exchanged with its own descendant (`EINVAL`).
+pub(super) fn rename_exchange_across_directories(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    if !fx.declared.rename_flags {
+        skip!("the target does not honour RENAME_EXCHANGE (declared rename-flags gap)");
+    }
+    let c = fx.client();
+    let root = c.root();
+    let p1 = must("mkdir p1", c.mkdir(root, "p1")).attr.ino;
+    let p2 = must("mkdir p2", c.mkdir(root, "p2")).attr.ino;
+    let s = must("mkdir p1/s", c.mkdir(p1, "s")).attr.ino;
+    let inside = must("put p1/s/inside", c.put(s, "inside", b"in")).attr.ino;
+    let f = must("put p2/f", c.put(p2, "f", b"F")).attr.ino;
+    assert_eq!(must("getattr p1", c.getattr(p1)).nlink, 3);
+    assert_eq!(must("getattr p2", c.getattr(p2)).nlink, 2);
+    must(
+        "EXCHANGE p1/s p2/f",
+        c.rename_flags(p1, "s", p2, "f", RenameFlags::EXCHANGE),
+    );
+    let at_f = must("lookup p2/f", c.lookup(p2, "f")).attr;
+    assert_eq!((at_f.ino, at_f.kind), (s, FileKind::Dir), "p2/f");
+    let at_s = must("lookup p1/s", c.lookup(p1, "s")).attr;
+    assert_eq!((at_s.ino, at_s.kind), (f, FileKind::File), "p1/s");
+    assert_eq!(must("slurp p1/s", c.slurp(f)), b"F");
+    assert_eq!(
+        must("lookup p2/f/inside", c.lookup(s, "inside")).attr.ino,
+        inside
+    );
+    assert_eq!(
+        must("getattr p1", c.getattr(p1)).nlink,
+        2,
+        "p1 lost a subdirectory"
+    );
+    assert_eq!(must("getattr p2", c.getattr(p2)).nlink, 3, "p2 gained one");
+    // Two directories across parents: the counts do not move.
+    let t = must("mkdir p1/t", c.mkdir(p1, "t")).attr.ino;
+    must(
+        "EXCHANGE p1/t p2/f",
+        c.rename_flags(p1, "t", p2, "f", RenameFlags::EXCHANGE),
+    );
+    assert_eq!(must("lookup p1/t", c.lookup(p1, "t")).attr.ino, s);
+    assert_eq!(must("lookup p2/f", c.lookup(p2, "f")).attr.ino, t);
+    assert_eq!(must("getattr p1", c.getattr(p1)).nlink, 3);
+    assert_eq!(must("getattr p2", c.getattr(p2)).nlink, 3);
+    // A directory and its own descendant, either way round.
+    let deep = must("mkdir p1/t/deep", c.mkdir(s, "deep")).attr.ino;
+    refused(
+        "EXCHANGE p1/t with p1/t/deep",
+        c.rename_flags(p1, "t", s, "deep", RenameFlags::EXCHANGE),
+        Code::Invalid,
+    );
+    refused(
+        "EXCHANGE p1/t/deep with p1/t",
+        c.rename_flags(s, "deep", p1, "t", RenameFlags::EXCHANGE),
+        Code::Invalid,
+    );
+    assert_eq!(must("lookup p1/t/deep", c.lookup(s, "deep")).attr.ino, deep);
     Ok(())
 }
 

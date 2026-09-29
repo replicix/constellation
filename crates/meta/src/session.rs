@@ -327,6 +327,13 @@ impl KeySet {
                 name,
                 new_parent,
                 new_name,
+                ..
+            }
+            | MutateOp::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
             } => {
                 k.dentry(*parent, name);
                 k.dentry(*new_parent, new_name);

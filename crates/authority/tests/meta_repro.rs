@@ -44,6 +44,7 @@ fn rename(a: &str, b: &str) -> MutateOp {
         name: a.into(),
         new_parent: ROOT_INO,
         new_name: b.into(),
+        noreplace: false,
     }
 }
 
@@ -194,4 +195,58 @@ fn a_hint_installed_on_a_stale_base_converges() {
     }
     assert!(!requester.has_outstanding_speculation());
     assert_eq!(listing(&requester), listing_at(&segments, 19));
+}
+
+/// `renameat2` flags on the forwarded path (plan 31 C4 follow-up): the
+/// holder decides `RENAME_NOREPLACE` in its own transaction (a requester
+/// whose replica has not seen the target yet is still refused), and a
+/// forwarded `RENAME_EXCHANGE` installed as the requester's shadow, then
+/// tailed, converges with a plain replay of the holder's log.
+#[test]
+fn forwarded_rename_flags_are_decided_by_the_holder_and_converge() {
+    let holder = fresh(1);
+    holder.set_holder_epoch(1);
+    let n2 = fresh(2);
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut run = |rid: Rid, op: MutateOp| {
+        let records = execute_mutate(&holder, &op, Some(rid)).unwrap();
+        segments.push((segments.len() as u64 + 1, rid, op, records));
+    };
+    run(rid(1, 1), create(&n2, "a"));
+    run(rid(1, 2), create(&n2, "b"));
+    run(
+        rid(2, 1),
+        MutateOp::Exchange {
+            parent: ROOT_INO,
+            name: "a".into(),
+            new_parent: ROOT_INO,
+            new_name: "b".into(),
+        },
+    );
+    let requester = fresh(2);
+    apply(&requester, &segments, 1);
+    // The requester has not tailed `b`'s create: a NOREPLACE rename onto
+    // it looks free here, and the holder refuses it.
+    let noreplace = MutateOp::Rename {
+        parent: ROOT_INO,
+        name: "a".into(),
+        new_parent: ROOT_INO,
+        new_name: "b".into(),
+        noreplace: true,
+    };
+    assert!(requester.lookup(ROOT_INO, "b").unwrap().is_none());
+    let refused = execute_mutate(&holder, &noreplace, Some(rid(2, 2))).unwrap_err();
+    assert_eq!(refused.code(), constellation_types::Code::Exists);
+    apply(&requester, &segments, 2);
+    let (_, rid3, op3, records3) = &segments[2];
+    assert!(matches!(records3[0], LogRecord::Exchange { .. }));
+    assert!(Replica::install_shadow(&requester, *rid3, 1, 0, op3, records3).unwrap());
+    apply(&requester, &segments, 3);
+    assert!(!requester.has_outstanding_speculation());
+    assert_eq!(listing(&requester), listing_at(&segments, 3));
+    assert_eq!(listing(&requester), listing(&holder));
+    let a = holder.lookup(ROOT_INO, "a").unwrap().unwrap();
+    let b = holder.lookup(ROOT_INO, "b").unwrap().unwrap();
+    assert_eq!(requester.lookup(ROOT_INO, "a").unwrap().unwrap().ino, a.ino);
+    assert_eq!(requester.lookup(ROOT_INO, "b").unwrap().unwrap().ino, b.ino);
 }

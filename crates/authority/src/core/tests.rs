@@ -2766,6 +2766,7 @@ mod cto {
                 name: "src".into(),
                 new_parent: ROOT_INO,
                 new_name: "f".into(),
+                noreplace: false,
             },
         );
         assert!(

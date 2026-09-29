@@ -124,7 +124,7 @@ impl View {
             return Err(Code::Io);
         }
         self.truncate(ino, size)?;
-        self.mutate_op(
+        match self.mutate_op(
             ino,
             constellation_meta::MutateOp::Setattr {
                 ino,
@@ -135,7 +135,15 @@ impl View {
                 atime_ns: None,
                 mtime_ns: None,
             },
-        )
+        ) {
+            // An unlinked-but-open file (see `View::setattr`).
+            Err(Code::NotFound) if self.unlinked(ino) => self
+                .meta
+                .orphan_setattr(ino, None, None, None, Some(size), None, None)
+                .map(|_| ())
+                .map_err(|error| error.code()),
+            other => other,
+        }
     }
 
     /// The open half of [`Self::create_or_open`]: `Ok(None)` when `name`

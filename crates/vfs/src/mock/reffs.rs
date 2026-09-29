@@ -1159,8 +1159,10 @@ impl RefView {
             let new = self.check_name(new_name)?;
             let sdir = self.enter_real(st, parent)?;
             let ddir = self.enter_real(st, new_parent)?;
+            // renameat2(2): `EINVAL` for a flag the filesystem does not
+            // support (never `ENOSYS`/`EOPNOTSUPP`).
             if flags.contains(RenameFlags::UNSUPPORTED) || flags.contains(RenameFlags::WHITEOUT) {
-                return Err(Code::NotSupported.into());
+                return Err(Code::Invalid.into());
             }
             let noreplace = flags.contains(RenameFlags::NOREPLACE);
             let exchange = flags.contains(RenameFlags::EXCHANGE);

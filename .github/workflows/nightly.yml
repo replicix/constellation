@@ -106,6 +106,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p constellation-vfs --features conformance 2>&1 | tee conformance.log
+      - run: |
+          set -o pipefail
+          cargo test -p constellation-engine --test conformance -- --nocapture 2>&1 | tee -a conformance.log
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: conformance-logs, path: conformance.log }

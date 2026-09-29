@@ -213,6 +213,7 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
             &[9, 9, 9],
             3,
             &[],
+            false,
         )
         .unwrap();
     });

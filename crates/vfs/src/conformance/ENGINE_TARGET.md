@@ -1,5 +1,12 @@
 # The engine as a conformance target (ready to drop in)
 
+> **Wired.** The instance lives at `crates/engine/tests/conformance.rs`
+> (plan 31 C4 follow-ups), adapted to the `Engine::start`/`open_view` API
+> (one engine per test on a local file backend, `--locks cluster`) and
+> declaring `rename_flags: true`; results and the engine fixes it drove are
+> in `docs/plans/v1/PROGRESS.md`, "Plan 31 C4 follow-ups". The text below
+> is the original hand-off, kept for its reasoning.
+
 Plan 31 C6 asks for the conformance kit to run against the real engine as
 well as the reference filesystem. `constellation-engine` was being
 restructured while this was written (the `Engine`/`EngineHost`/`ViewSpec`

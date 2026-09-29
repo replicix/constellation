@@ -370,6 +370,17 @@ impl View {
         let Some(ws) = self.writes.detach(ino) else {
             return Ok(());
         };
+        // Written, then unlinked while still open (here or on another
+        // node): there is no name to publish the content under, and the
+        // sequencer would refuse the manifest (`NotFound`). POSIX has the
+        // descriptor's `write`/`fsync`/`close` succeed, and its reads see
+        // the data: keep the session attached — this node's reads overlay
+        // it — until the last close drops it with the inode
+        // (`View::release`, [`Self::drop_writes`]).
+        if self.unlinked(ino) {
+            self.writes.reattach(ino, ws);
+            return Ok(());
+        }
         constellation_vfs::watch::stage("flush: compose and commit");
         match self.flush_detached(ino, ws, force_through) {
             Ok(drain) => {
@@ -384,6 +395,11 @@ impl View {
                 ws: Some(ws),
             }) => {
                 self.writes.reattach(ino, *ws);
+                // Unlinked by another node between the check above and
+                // the sequencer's answer: as above.
+                if errno == Code::NotFound && self.unlinked(ino) {
+                    return Ok(());
+                }
                 Err(errno)
             }
             Err(FlushFail { errno, ws: None }) => {
@@ -391,6 +407,42 @@ impl View {
                 Err(errno)
             }
         }
+    }
+
+    /// Whether `ino` (a shared-namespace inode, not a scratch one) has no
+    /// name left on this replica: an orphan record (`nlink == 0`, kept
+    /// for its open descriptors), or gone from the replica altogether.
+    pub(super) fn unlinked(&self, ino: Ino) -> bool {
+        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            return false;
+        }
+        match self.meta.getattr(ino) {
+            Ok(Some(attr)) => attr.nlink == 0,
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Drop `ino`'s unpublished write session: its staged bytes, and the
+    /// pending-upload claims of the chunks it sealed. `true` if there was
+    /// one. For content that must never be published (a lapsed lock
+    /// grant's, an unlinked file's at its last close).
+    pub(super) fn drop_writes(&self, ino: Ino) -> bool {
+        // After any flush of the file in flight (it holds the session
+        // detached from its shard).
+        let _op = self.inode_ops.lock(ino);
+        let ws = self.writes.lock(ino).remove(&ino);
+        let Some(mut ws) = ws else {
+            return false;
+        };
+        let enrolled: Vec<u64> = ws.enrolled.iter().copied().collect();
+        for idx in enrolled {
+            if let Err(error) = self.unseal(&mut ws, ino, idx) {
+                tracing::warn!(ino, idx, %error, "withdrawing a dropped chunk's upload claim failed");
+            }
+        }
+        ws.staging.discard();
+        true
     }
 
     /// [`Self::flush_inode`]'s body, on a detached session: `Ok(true)`

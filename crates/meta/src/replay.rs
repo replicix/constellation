@@ -86,6 +86,13 @@ impl TouchSet {
                 new_parent,
                 new_name,
                 ..
+            }
+            | LogRecord::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
             } => {
                 self.dentries.insert((*parent, name.clone()));
                 self.dentries.insert((*new_parent, new_name.clone()));
@@ -157,6 +164,13 @@ impl TouchSet {
                 name,
                 new_parent,
                 new_name,
+                ..
+            }
+            | MutateOp::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
             } => {
                 dentry(*parent, name);
                 dentry(*new_parent, new_name);
@@ -203,6 +217,13 @@ impl TouchSet {
                 }
             }
             MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            }
+            | MutateOp::Exchange {
                 parent,
                 name,
                 new_parent,
@@ -521,6 +542,30 @@ fn apply_one(
             new_name,
             *time_ns,
         ),
+        LogRecord::Exchange {
+            parent,
+            name,
+            new_parent,
+            new_name,
+            time_ns,
+        } => {
+            match crate::store::writes::exchange_in_tx(
+                tx,
+                &meta.ns,
+                dirty,
+                *parent,
+                name,
+                *new_parent,
+                new_name,
+                *time_ns,
+                false,
+            )? {
+                crate::store::writes::Exchanged::Missing => {
+                    Ok(Applied::Skipped("exchange entry missing"))
+                }
+                _ => Ok(Applied::Done),
+            }
+        }
         LogRecord::Setattr {
             ino,
             mode,

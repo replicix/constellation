@@ -571,3 +571,139 @@ fn every_op_is_watched_until_its_responder_answered() {
     assert_eq!(*seen.lock().unwrap(), Some((true, 1)));
     assert_eq!(watch.snapshot().in_flight, 0);
 }
+
+impl Client {
+    fn rename_flags(
+        &self,
+        parent: Ino,
+        name: &str,
+        new_parent: Ino,
+        new_name: &str,
+        flags: RenameFlags,
+    ) -> VfsResult<()> {
+        Blocking::run(|r| {
+            self.view.rename(
+                &self.cx(OpKind::Rename),
+                parent,
+                Name::new(name),
+                new_parent,
+                Name::new(new_name),
+                flags,
+                r,
+            )
+        })
+    }
+
+    fn fsync(&self, ino: Ino, fh: Fh) -> VfsResult<()> {
+        Blocking::run(|r| {
+            self.view.fsync(
+                &self.cx(OpKind::Fsync),
+                ino,
+                fh,
+                constellation_vfs::Durability::Configured,
+                r,
+            )
+        })
+    }
+
+    fn put(&self, parent: Ino, name: &str, data: &[u8]) -> Ino {
+        let (e, o) = self.create(parent, name).unwrap();
+        self.write(e.attr.ino, o.fh, 0, data).unwrap();
+        self.close(e.attr.ino, o.fh).unwrap();
+        e.attr.ino
+    }
+}
+
+/// renameat2 flags through `View::rename` (plan 31 C4 follow-up): before,
+/// the view ignored them, so `RENAME_EXCHANGE` replaced — unlinked — the
+/// target instead of swapping, and `RENAME_NOREPLACE` was only the
+/// kernel's dcache check.
+#[test]
+fn rename_honours_noreplace_and_exchange_and_refuses_whiteout() {
+    let c = client();
+    let a = c.put(ROOT_INO, "a", b"A");
+    let b = c.put(ROOT_INO, "b", b"B");
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    assert_eq!(
+        code(c.rename_flags(ROOT_INO, "a", ROOT_INO, "b", RenameFlags::NOREPLACE)),
+        Code::Exists
+    );
+    assert_eq!(c.lookup(ROOT_INO, "b").unwrap().attr.ino, b);
+    c.rename_flags(ROOT_INO, "a", d, "a", RenameFlags::NOREPLACE)
+        .unwrap();
+    assert_eq!(c.lookup(d, "a").unwrap().attr.ino, a);
+    // EXCHANGE across directories: both files survive, swapped.
+    c.rename_flags(d, "a", ROOT_INO, "b", RenameFlags::EXCHANGE)
+        .unwrap();
+    assert_eq!(c.lookup(d, "a").unwrap().attr.ino, b);
+    assert_eq!(c.lookup(ROOT_INO, "b").unwrap().attr.ino, a);
+    let o = Blocking::run(|r| {
+        c.view
+            .open(&c.cx(OpKind::Open), a, OpenFlags::READ, OpenOwner::NONE, r)
+    })
+    .unwrap();
+    assert_eq!(c.read(a, o.fh, 0, 8).unwrap(), b"A");
+    assert_eq!(
+        code(c.rename_flags(ROOT_INO, "b", d, "zz", RenameFlags::EXCHANGE)),
+        Code::NotFound
+    );
+    for flags in [
+        RenameFlags::WHITEOUT,
+        RenameFlags::UNSUPPORTED,
+        RenameFlags::NOREPLACE | RenameFlags::EXCHANGE,
+    ] {
+        assert_eq!(
+            code(c.rename_flags(ROOT_INO, "b", d, "a", flags)),
+            Code::Invalid,
+            "{flags:?}"
+        );
+    }
+    assert_eq!(c.lookup(d, "a").unwrap().attr.ino, b);
+}
+
+/// POSIX: a file written, unlinked and still open keeps working through
+/// its descriptor — `write`, `fsync`, `ftruncate`, `fchmod`, reads, and
+/// the closing `flush`/`release` all succeed. Before, the flush committed
+/// the manifest of an inode with no name and every one of them answered
+/// `ENOENT` (on a real mount: `fsync`/`close` of such a file failed).
+#[test]
+fn an_unlinked_open_file_keeps_working_until_its_last_close() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"hello world").unwrap();
+    c.unlink(ROOT_INO, "f").unwrap();
+    assert_eq!(code(c.lookup(ROOT_INO, "f")), Code::NotFound);
+    c.write(ino, o.fh, 0, b"HELLO").unwrap();
+    c.fsync(ino, o.fh).unwrap();
+    assert_eq!(c.read(ino, o.fh, 0, 64).unwrap(), b"HELLO world");
+    let attr = Blocking::run(|r| {
+        c.view.setattr(
+            &c.cx(OpKind::Setattr),
+            ino,
+            Some(o.fh),
+            &SetAttr {
+                size: Some(8),
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!((attr.size, attr.mode & 0o7777, attr.nlink), (8, 0o600, 0));
+    assert_eq!(c.read(ino, o.fh, 0, 64).unwrap(), b"HELLO wo");
+    // A second descriptor's close (`flush` only), then more writes.
+    Blocking::run(|r| {
+        c.view
+            .flush(&c.cx(OpKind::Flush), ino, o.fh, LockOwner(9), r)
+    })
+    .unwrap();
+    c.write(ino, o.fh, 8, b"!").unwrap();
+    assert_eq!(c.getattr(ino).unwrap().size, 9);
+    // The last close succeeds, drops the session and reaps the orphan.
+    c.close(ino, o.fh).unwrap();
+    assert!(c.view.writes.pending_inos().is_empty());
+    assert!(c.view.meta.getattr(ino).unwrap().is_none(), "reaped");
+    assert!(c.view.meta.orphans().unwrap().is_empty());
+}

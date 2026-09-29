@@ -1061,6 +1061,7 @@ fn a_hint_is_not_installed_over_live_speculation_on_its_keys() {
         name: "f0".into(),
         new_parent: ROOT_INO,
         new_name: "f1".into(),
+        noreplace: false,
     };
     assert!(meta
         .install_shadow(rid(51), 1, &op, &[rename, completed(rid(51))])

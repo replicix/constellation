@@ -72,6 +72,13 @@ pub enum MutateOp {
         name: String,
         new_parent: Ino,
         new_name: String,
+        /// `renameat2(RENAME_NOREPLACE)`: refuse with `Exists` if
+        /// `new_parent/new_name` exists. Checked where the rename commits
+        /// (this node's own transaction, or the holder's for a forwarded
+        /// op), never against a requester's possibly stale replica or a
+        /// kernel's dcache, so two nodes racing to claim one name cannot
+        /// both win. Journals as a plain `Rename` (the target was absent).
+        noreplace: bool,
     },
     Setattr {
         ino: Ino,
@@ -123,6 +130,10 @@ pub enum MutateOp {
         manifest: Vec<u8>,
         size: u64,
         xattrs: Vec<(String, Vec<u8>)>,
+        /// `renameat2(RENAME_NOREPLACE)` of the scratch file: refuse
+        /// with `Exists` if `parent/name` exists (see
+        /// [`MutateOp::Rename::noreplace`]).
+        noreplace: bool,
     },
     /// Plan 30 §M3b: re-apply already-decided records through the replay
     /// path and journal them — how a deposed holder's stranded
@@ -133,6 +144,16 @@ pub enum MutateOp {
     /// result is whatever the log order makes of them.
     Records {
         records: Vec<LogRecord>,
+    },
+    /// `renameat2(RENAME_EXCHANGE)`: atomically swap the inodes
+    /// `parent/name` and `new_parent/new_name` name (both must exist; any
+    /// kinds; across directories too). Journals one
+    /// [`LogRecord::Exchange`].
+    Exchange {
+        parent: Ino,
+        name: String,
+        new_parent: Ino,
+        new_name: String,
     },
 }
 
@@ -317,8 +338,26 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
             name,
             new_parent,
             new_name,
+            noreplace: false,
         } => {
             meta.rename(*parent, name, *new_parent, new_name)?;
+        }
+        MutateOp::Rename {
+            parent,
+            name,
+            new_parent,
+            new_name,
+            noreplace: true,
+        } => {
+            meta.rename_noreplace(*parent, name, *new_parent, new_name)?;
+        }
+        MutateOp::Exchange {
+            parent,
+            name,
+            new_parent,
+            new_name,
+        } => {
+            meta.exchange(*parent, name, *new_parent, new_name)?;
         }
         MutateOp::Setattr {
             ino,
@@ -366,9 +405,11 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
             manifest,
             size,
             xattrs,
+            noreplace,
         } => {
             meta.publish_file(
                 *parent, name, *ino, *mode, *uid, *gid, *mtime_ns, manifest, *size, xattrs,
+                *noreplace,
             )?;
         }
         MutateOp::Records { records } => {
@@ -398,6 +439,238 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
 mod tests {
     use super::*;
     use constellation_fs_core::types::ROOT_INO;
+
+    fn rename_op(p: Ino, n: &str, np: Ino, nn: &str, noreplace: bool) -> MutateOp {
+        MutateOp::Rename {
+            parent: p,
+            name: n.into(),
+            new_parent: np,
+            new_name: nn.into(),
+            noreplace,
+        }
+    }
+
+    fn exchange_op(p: Ino, n: &str, np: Ino, nn: &str) -> MutateOp {
+        MutateOp::Exchange {
+            parent: p,
+            name: n.into(),
+            new_parent: np,
+            new_name: nn.into(),
+        }
+    }
+
+    fn ino_at(m: &Meta, p: Ino, n: &str) -> Option<Ino> {
+        m.lookup(p, n).unwrap().map(|a| a.ino)
+    }
+
+    /// A tailing replica of `m`: every record `m` journaled so far,
+    /// applied through replay.
+    fn replica_of(m: &Meta) -> Meta {
+        let r = Meta::open_in_memory().unwrap();
+        let records: Vec<LogRecord> = m
+            .peek_journal_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        r.apply_records(&records).unwrap();
+        r
+    }
+
+    #[test]
+    fn rename_noreplace_refuses_an_existing_target_and_journals_a_plain_rename() {
+        let m = Meta::open_in_memory().unwrap();
+        let a = m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let b = m.create(ROOT_INO, "b", 0o644, 0, 0).unwrap();
+        let before = m.journal_len().unwrap();
+        let refused = execute(&m, &rename_op(ROOT_INO, "a", ROOT_INO, "b", true), None);
+        assert_eq!(refused.unwrap_err().code(), Code::Exists);
+        // Nothing moved, nothing was unlinked, nothing journaled.
+        assert_eq!(ino_at(&m, ROOT_INO, "a"), Some(a.ino));
+        assert_eq!(ino_at(&m, ROOT_INO, "b"), Some(b.ino));
+        assert_eq!(m.journal_len().unwrap(), before);
+        // Even onto the source's own name (Linux: `EEXIST` first).
+        let own = execute(&m, &rename_op(ROOT_INO, "a", ROOT_INO, "a", true), None);
+        assert_eq!(own.unwrap_err().code(), Code::Exists);
+        // A free name: an ordinary rename.
+        let records = execute(&m, &rename_op(ROOT_INO, "a", ROOT_INO, "c", true), None).unwrap();
+        assert!(matches!(records.as_slice(), [LogRecord::Rename { .. }]));
+        assert_eq!(ino_at(&m, ROOT_INO, "c"), Some(a.ino));
+        assert_eq!(ino_at(&m, ROOT_INO, "a"), None);
+        // The op crosses the wire with its flag.
+        let op = rename_op(ROOT_INO, "c", ROOT_INO, "b", true);
+        assert_eq!(
+            MutateOp::from_postcard(&op.to_postcard().unwrap()).unwrap(),
+            op
+        );
+    }
+
+    #[test]
+    fn exchange_swaps_two_files_across_directories_and_replays_identically() {
+        let m = Meta::open_in_memory().unwrap();
+        let d = m.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let a = m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let b = m.create(d.ino, "b", 0o644, 0, 0).unwrap();
+        let root_before = m.getattr(ROOT_INO).unwrap().unwrap();
+        let d_before = m.getattr(d.ino).unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let records = execute(&m, &exchange_op(ROOT_INO, "a", d.ino, "b"), None).unwrap();
+        assert!(matches!(records.as_slice(), [LogRecord::Exchange { .. }]));
+        assert_eq!(ino_at(&m, ROOT_INO, "a"), Some(b.ino));
+        assert_eq!(ino_at(&m, d.ino, "b"), Some(a.ino));
+        // Both inodes keep their link count and get a ctime; both parents
+        // an mtime and ctime; no directory link moved.
+        for (ino, was) in [(a.ino, &a), (b.ino, &b)] {
+            let now = m.getattr(ino).unwrap().unwrap();
+            assert_eq!(now.nlink, 1);
+            assert!(now.ctime_ns > was.ctime_ns, "ctime of {ino:#x}");
+            assert_eq!(now.mtime_ns, was.mtime_ns, "mtime of {ino:#x}");
+        }
+        for (ino, was) in [(ROOT_INO, &root_before), (d.ino, &d_before)] {
+            let now = m.getattr(ino).unwrap().unwrap();
+            assert_eq!(now.nlink, was.nlink);
+            assert!(now.mtime_ns > was.mtime_ns && now.ctime_ns > was.ctime_ns);
+        }
+        // The dentry copies of the attributes follow the swap.
+        assert_eq!(
+            m.lookup(ROOT_INO, "a").unwrap().unwrap(),
+            m.getattr(b.ino).unwrap().unwrap()
+        );
+        let r = replica_of(&m);
+        for (p, n) in [(ROOT_INO, "a"), (d.ino, "b"), (ROOT_INO, "d")] {
+            assert_eq!(
+                r.lookup(p, n).unwrap(),
+                m.lookup(p, n).unwrap(),
+                "replica {p:#x}/{n}"
+            );
+        }
+        assert_eq!(r.getattr(d.ino).unwrap(), m.getattr(d.ino).unwrap());
+    }
+
+    #[test]
+    fn exchange_of_a_directory_and_a_file_across_parents_moves_the_dotdot_link() {
+        let m = Meta::open_in_memory().unwrap();
+        let p1 = m.mkdir(ROOT_INO, "p1", 0o755, 0, 0).unwrap();
+        let p2 = m.mkdir(ROOT_INO, "p2", 0o755, 0, 0).unwrap();
+        let s = m.mkdir(p1.ino, "s", 0o755, 0, 0).unwrap();
+        m.create(s.ino, "inside", 0o644, 0, 0).unwrap();
+        let f = m.create(p2.ino, "f", 0o644, 0, 0).unwrap();
+        assert_eq!(m.getattr(p1.ino).unwrap().unwrap().nlink, 3);
+        assert_eq!(m.getattr(p2.ino).unwrap().unwrap().nlink, 2);
+        execute(&m, &exchange_op(p1.ino, "s", p2.ino, "f"), None).unwrap();
+        let at_f = m.lookup(p2.ino, "f").unwrap().unwrap();
+        assert_eq!((at_f.ino, at_f.kind), (s.ino, InodeKind::Dir));
+        assert_eq!(ino_at(&m, p1.ino, "s"), Some(f.ino));
+        assert_eq!(m.getattr(p1.ino).unwrap().unwrap().nlink, 2);
+        assert_eq!(m.getattr(p2.ino).unwrap().unwrap().nlink, 3);
+        // The directory kept its content, and its `..` is its new parent:
+        // it can no longer be moved beneath p2 but can beneath p1.
+        assert_eq!(m.readdir(s.ino).unwrap().len(), 1);
+        let loop_ = execute(&m, &rename_op(p2.ino, "f", s.ino, "x", false), None);
+        assert_eq!(loop_.unwrap_err().code(), Code::Invalid);
+        // Two directories across parents: counts unchanged.
+        let t = m.mkdir(p1.ino, "t", 0o755, 0, 0).unwrap();
+        execute(&m, &exchange_op(p1.ino, "t", p2.ino, "f"), None).unwrap();
+        assert_eq!(ino_at(&m, p1.ino, "t"), Some(s.ino));
+        assert_eq!(ino_at(&m, p2.ino, "f"), Some(t.ino));
+        assert_eq!(m.getattr(p1.ino).unwrap().unwrap().nlink, 3);
+        assert_eq!(m.getattr(p2.ino).unwrap().unwrap().nlink, 3);
+        let r = replica_of(&m);
+        for ino in [p1.ino, p2.ino, s.ino, t.ino, f.ino] {
+            assert_eq!(
+                r.getattr(ino).unwrap().map(|a| (a.nlink, a.kind)),
+                m.getattr(ino).unwrap().map(|a| (a.nlink, a.kind)),
+                "replica {ino:#x}"
+            );
+        }
+        assert_eq!(ino_at(&r, p1.ino, "t"), Some(s.ino));
+        assert_eq!(ino_at(&r, p1.ino, "s"), Some(f.ino));
+        assert_eq!(ino_at(&r, p2.ino, "f"), Some(t.ino));
+    }
+
+    #[test]
+    fn exchange_refusals_and_no_ops() {
+        let m = Meta::open_in_memory().unwrap();
+        let d = m.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let sub = m.mkdir(d.ino, "sub", 0o755, 0, 0).unwrap();
+        let a = m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        m.link(a.ino, ROOT_INO, "a2").unwrap();
+        let before = m.journal_len().unwrap();
+        let missing = execute(&m, &exchange_op(ROOT_INO, "a", ROOT_INO, "zz"), None);
+        assert_eq!(missing.unwrap_err().code(), Code::NotFound);
+        let missing = execute(&m, &exchange_op(ROOT_INO, "zz", ROOT_INO, "a"), None);
+        assert_eq!(missing.unwrap_err().code(), Code::NotFound);
+        // A directory swapped with its own descendant (either way round).
+        let beneath = execute(&m, &exchange_op(ROOT_INO, "d", d.ino, "sub"), None);
+        assert_eq!(beneath.unwrap_err().code(), Code::Invalid);
+        let beneath = execute(&m, &exchange_op(d.ino, "sub", ROOT_INO, "d"), None);
+        assert_eq!(beneath.unwrap_err().code(), Code::Invalid);
+        // One name, or two names of one inode: nothing to do.
+        assert!(
+            execute(&m, &exchange_op(ROOT_INO, "a", ROOT_INO, "a"), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            execute(&m, &exchange_op(ROOT_INO, "a", ROOT_INO, "a2"), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(m.journal_len().unwrap(), before);
+        assert_eq!(ino_at(&m, d.ino, "sub"), Some(sub.ino));
+        let op = exchange_op(ROOT_INO, "a", d.ino, "sub");
+        assert_eq!(
+            MutateOp::from_postcard(&op.to_postcard().unwrap()).unwrap(),
+            op
+        );
+    }
+
+    #[test]
+    fn publish_noreplace_refuses_another_inode_and_accepts_its_own_retry() {
+        let m = Meta::open_in_memory().unwrap();
+        let taken = m.create(ROOT_INO, "taken", 0o644, 0, 0).unwrap();
+        let publish = |name: &str, ino: Ino| MutateOp::Publish {
+            ino,
+            parent: ROOT_INO,
+            name: name.into(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime_ns: 1,
+            manifest: b"M".to_vec(),
+            size: 1,
+            xattrs: Vec::new(),
+            noreplace: true,
+        };
+        let ino = (1 << 40) | 7;
+        let refused = execute(&m, &publish("taken", ino), None).unwrap_err();
+        assert_eq!(refused.code(), Code::Exists);
+        assert_eq!(ino_at(&m, ROOT_INO, "taken"), Some(taken.ino));
+        assert!(m.getattr(ino).unwrap().is_none());
+        assert!(!execute(&m, &publish("free", ino), None).unwrap().is_empty());
+        assert!(execute(&m, &publish("free", ino), None).unwrap().is_empty());
+        assert_eq!(ino_at(&m, ROOT_INO, "free"), Some(ino));
+    }
+
+    #[test]
+    fn exchange_replay_skips_when_an_entry_is_gone() {
+        let m = Meta::open_in_memory().unwrap();
+        m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let skipped = m
+            .apply_foreign(
+                &[LogRecord::Exchange {
+                    parent: ROOT_INO,
+                    name: "a".into(),
+                    new_parent: ROOT_INO,
+                    new_name: "gone".into(),
+                    time_ns: 1,
+                }],
+                &crate::replay::TouchSet::default(),
+            )
+            .unwrap();
+        assert_eq!(skipped, 1);
+        assert!(m.lookup(ROOT_INO, "a").unwrap().is_some());
+    }
 
     #[test]
     fn atime_batch_applies_locally_queues_for_ship_and_journals_nothing() {
@@ -476,6 +749,7 @@ mod tests {
             manifest: b"MANIFEST".to_vec(),
             size: 42,
             xattrs: vec![("user.passsage.meta".into(), b"blob".to_vec())],
+            noreplace: false,
         };
         let bytes = op.to_postcard().unwrap();
         assert_eq!(MutateOp::from_postcard(&bytes).unwrap(), op);
@@ -547,6 +821,7 @@ mod tests {
             manifest: b"MANIFEST".to_vec(),
             size: 42,
             xattrs: vec![("user.passsage.meta".into(), b"blob".to_vec())],
+            noreplace: false,
         };
         let records = execute(&m, &op, Some(r)).unwrap();
         assert_eq!(records.len(), 4, "3 op records + one Completed");

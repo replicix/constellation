@@ -122,9 +122,9 @@ pub trait ConformanceTarget: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declared {
     /// `rename` honours `RENAME_NOREPLACE` and `RENAME_EXCHANGE`. Default
-    /// `true`, the contract. The engine's `View` accepts and ignores them
-    /// today (see its `rename`), so its target declares `false` and the two
-    /// rename-flag tests skip, naming `rename-flags`, until it does.
+    /// `true`, the contract (the engine's `View` honours both since the
+    /// plan 31 C4 follow-ups); a target that does not declares `false` and
+    /// the rename-flag tests skip, naming `rename-flags`.
     pub rename_flags: bool,
     /// A `CancelToken` set on a waiting op makes it complete `Code::Intr`
     /// (see the module doc: never true for a Linux FUSE *mount*, which no
@@ -602,6 +602,7 @@ tests! {
         rename_refusals [],
         rename_noreplace [],
         rename_exchange [],
+        rename_exchange_across_directories [],
         hard_links_count_names [HardLinks],
         hard_link_refusals [HardLinks],
         symlink_and_readlink [],

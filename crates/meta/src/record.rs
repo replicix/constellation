@@ -248,6 +248,24 @@ pub enum LogRecord {
     /// for a TTL takeover, whose predecessor's unshipped work is lost,
     /// but not here: that work comes back). Touches nothing.
     TailFollows { prev_epoch: u64 },
+    /// `renameat2(RENAME_EXCHANGE)`: the entries `parent/name` and
+    /// `new_parent/new_name` swap the inodes they name, atomically — both
+    /// must exist, either may be a directory, and nothing is unlinked.
+    /// Name-based like `Rename` (the holder validated it: both entries
+    /// present, neither directory moved beneath itself), so a replica
+    /// swaps whatever the two names hold at its log position; replay skips
+    /// it if either is gone (a conflict the log order already decided).
+    /// Applying it swaps the two dentries (and their `0x04` reverse
+    /// entries), moves a directory's `..` link between the parents when
+    /// the kinds differ across directories, touches both parents' mtime
+    /// and ctime and both inodes' ctime, all with `max` merges.
+    Exchange {
+        parent: Ino,
+        name: String,
+        new_parent: Ino,
+        new_name: String,
+        time_ns: i64,
+    },
 }
 
 impl LogRecord {
@@ -262,6 +280,7 @@ impl LogRecord {
             LogRecord::Unlink { time_ns, .. } => Some(*time_ns),
             LogRecord::Rmdir { time_ns, .. } => Some(*time_ns),
             LogRecord::Rename { time_ns, .. } => Some(*time_ns),
+            LogRecord::Exchange { time_ns, .. } => Some(*time_ns),
             LogRecord::Setattr { time_ns, .. } => Some(*time_ns),
             LogRecord::WriteManifest { time_ns, .. } => Some(*time_ns),
             LogRecord::SetXattr { time_ns, .. } => Some(*time_ns),

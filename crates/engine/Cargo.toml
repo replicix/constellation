@@ -48,4 +48,7 @@ zeroize = "1.9.0"
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The conformance kit (plan 31 C6), run against the engine by
+# `tests/conformance.rs`.
+constellation-vfs = { workspace = true, features = ["conformance"] }
 tempfile.workspace = true

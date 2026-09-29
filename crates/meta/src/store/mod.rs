@@ -102,7 +102,7 @@ pub mod remote;
 mod scratch;
 pub(crate) mod snapshot;
 pub mod spec;
-mod writes;
+pub(crate) mod writes;
 
 pub use bootstrap::BootstrapIndexBuilder;
 pub use local::{DelegateTx, LogPrefixView, PublishBasis};

@@ -28345,3 +28345,110 @@ non-FUSE frontend lane will need one.
 - [x] `make check-cross` exits 0 (known failures unchanged)
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+
+## Plan 31 C4 follow-ups
+
+Three follow-ups to milestone C4 of
+[plan 31](wip/31-core-frontend-backend.md): `renameat2` flags, the
+conformance kit (§8) run against the real engine, and a bug report about
+unlinked open files.
+
+| Item | State | Where |
+|---|---|---|
+| `RENAME_NOREPLACE`: `MutateOp::Rename { noreplace }` (and `MutateOp::Publish { noreplace }` for a scratch file's publish), decided inside the committing transaction — `rename_in_tx` / `publish_file` on this node, or on the holder for a forwarded op — so a stale kernel dcache or a lagging replica cannot let two nodes both claim a name; `EEXIST` even onto the source's own name (Linux checks it before its same-inode no-op); journals as a plain `Rename` | DONE | `crates/meta/src/{mutate.rs,store/writes.rs}`, `crates/engine/src/view/ops.rs` |
+| `RENAME_EXCHANGE`: `MutateOp::Exchange` → `Meta::exchange` → one `LogRecord::Exchange`; `exchange_in_tx` shared by the local op and replay: both dentries and their `0x04` reverse entries swapped, a directory's `..` link moved when a directory and a non-directory trade places across parents (two directories: counts unchanged), both parents' mtime/ctime and both inodes' ctime touched (`max` merges, replay-order free), `EINVAL` for a directory swapped beneath itself (either way round), a no-op for one name or two names of one inode; replay skips it if either entry is gone. In the touch/key sets (`TouchSet::from_records/from_op/from_op_in`, `KeySet::from_op`), read-delegation recalls, kernel invalidation, recovery | DONE | `crates/meta/src/{record.rs,mutate.rs,replay.rs,session.rs,readdeleg.rs,store/writes.rs}`, `crates/engine/src/{kernel_inval.rs,recovery.rs}` |
+| `View::rename`: `WHITEOUT`, an unknown bit, or `NOREPLACE|EXCHANGE` → `EINVAL` (renameat2(2); never `ENOSYS`/`EOPNOTSUPP`, which would make the kernel stop sending `FUSE_RENAME2`); `EXCHANGE` touching the node-local scratch area → `EINVAL`; `confine_links` checks both directions of an exchange. The reference filesystem answers `EINVAL` for `WHITEOUT` too (was `NotSupported`) | DONE | `crates/engine/src/view/ops.rs`, `crates/vfs/src/mock/reffs.rs` |
+| Engine conformance target: `Engine::start` on a local file backend per test (P2P listen, `--locks cluster`), views via `Engine::open_view`; hooks `snapshot`, `subtree_view` (with `confine_links`); declares `rename_flags: true`, `cancellable_waits: false`; the nightly `conformance` job runs it | DONE | `crates/engine/tests/conformance.rs`, `crates/engine/Cargo.toml`, `.github/workflows/nightly.yml` |
+| Kit: `namespace::rename_exchange_across_directories` (a directory and a file swapped across parents, `nlink`s, two directories, beneath-itself refusals); `rename_noreplace` asserts `WHITEOUT`/unknown bits → `Invalid` | DONE | `crates/vfs/src/conformance/{mod.rs,namespace.rs}` |
+| Engine bugs the kit found (below), fixed engine-side | DONE | `crates/engine/src/view/ops.rs`, `crates/meta/src/store/writes.rs` |
+| Unlinked-but-open files: `write`/`fsync`/`ftruncate`/`fchmod`/`close` succeed | DONE | `crates/engine/src/view/{flush.rs,ops.rs,create.rs,lock_gate.rs}`, `crates/meta/src/store/writes.rs` |
+
+### Engine conformance results
+
+`cargo test -p constellation-engine --test conformance` (caps
+`linux_fuse(true)`, seed `0x5eed`), before and after the fixes below:
+
+| Group | First run pass / fail / skip | Now pass / fail / skip |
+|---|---|---|
+| namespace | 15 / 4 / 0 | 19 / 0 / 0 |
+| io | 13 / 3 / 0 | 16 / 0 / 0 |
+| xattr | 7 / 0 / 0 | 7 / 0 / 0 |
+| readdir | 4 / 2 / 0 | 6 / 0 / 0 |
+| concurrency | 6 / 2 / 0 | 8 / 0 / 0 |
+| deferral | 4 / 2 / 0 | 6 / 0 / 0 |
+| cancellation | 0 / 0 / 4 | 0 / 0 / 4 |
+| invalidation | 0 / 0 / 5 | 0 / 0 / 5 |
+| confinement | 7 / 3 / 0 | 10 / 0 / 0 |
+| **total** | **56 / 16 / 9** | **72 / 0 / 9** |
+
+The skips name their reason: `cancellation` — the engine declares
+`cancellable_waits: false` (`ClusterLocks::lock` does not consult
+`OpCtx::cancel`; a Linux FUSE mount never has a token set, §6.3);
+`invalidation` — no `second_view`/`events` hook: a second view of one
+engine gets no invalidations for the first's mutations (only a *remote*
+node's replayed records produce them), and a second engine cannot share
+a file backend (no `If-Match`: single writer). A two-engine fixture over
+an S3-shaped store with P2P is the way to run that group.
+
+What failed on the first run and how it was fixed (every one engine-side;
+no kit assertion was loosened):
+
+- `hard_link_refusals`: **`link` onto an existing name overwrote it** —
+  `Meta::link` put the new dentry over the old one, so the other inode
+  lost a name without its `nlink` or reverse entry following (metadata
+  corruption; on one node the kernel's negative-dentry check hides it,
+  across nodes it does not). Now `EEXIST` inside the transaction.
+- `readdir::removal_between_pages_never_repeats_or_loses`,
+  `readdir::stable_under_concurrent_create`,
+  `concurrency::creates_in_one_directory_are_all_visible`: readdir cookies
+  were positions, so an unlink or a create between two `readdir` calls
+  repeated or skipped entries that were there throughout. A child's cookie
+  is now a hash of its name (`dir_cookie`: FNV-1a, clear of `.`/`..`'s 1
+  and 2, below `i64::MAX`), children are listed in cookie order, and a
+  listing resumes after the cookie it stopped at.
+- `unlink_and_its_refusals`, `lookup_refusals`, `model_replay_sequential`,
+  `model_replay_concurrent`: a name beneath a non-directory answered
+  `ENOENT`; now `ENOTDIR` (`View::beneath_non_dir`, on the error path of
+  lookup/unlink/rmdir/rename only).
+- `truncate_shrinks_and_growth_reads_zeros`: `setattr(size)` on a
+  directory succeeded; now `EISDIR` (`EINVAL` for other non-regular files).
+- `fallocate_absent_is_not_supported`, `seek_absent_is_not_supported`:
+  the view ignored `FrontendCaps::{fallocate, seek_hole}`; now
+  `NotSupported` when the frontend does not declare them (§6.2).
+- `deferral::a_blocked_lock_completes_from_another_thread`,
+  `non_deferrable_waits_park_the_calling_thread`: the fixture's engine ran
+  without cluster locks (a test-setup issue: fixed by `--locks cluster`,
+  which needs P2P); then `locks_are_refused_without_the_capability`: the
+  `lock_*` ops now answer `NotImplemented` unless the view's frontend
+  declared `cluster_locks` (`View::vfs_cluster_locks`), whatever the
+  engine forwards for its other views.
+- `confinement::inodes_outside_the_subtree_are_refused`: `statfs` on an
+  inode outside the view answered; now `Stale` like every other op.
+- `confinement::forged_inodes_and_handles_are_refused`: a `read` through a
+  handle nobody was given was served; the view hands out `Fh(ino)`, and a
+  read through anything else is now `EBADF`.
+- `confinement::snapshot_mirrors_are_read_only`: opening a snapshot
+  mirror's file for writing succeeded; now `EROFS`.
+
+`PUNCH_HOLE|KEEP_SIZE` (listed in `ENGINE_TARGET.md` as a likely failure)
+passed on the first run.
+
+### Unlinked open files (bug report triage)
+
+"On a real mount, `fsync`/`close` of a file that was written, unlinked and
+is still open fails with `ENOENT`": reproduced on a real FUSE mount (local
+file backend) — `fsync`, `fdatasync`, `ftruncate`, `close` (both the
+`flush` of a dup'd descriptor and the last `release`) all `ENOENT`, while
+`write`/`pread`/`fstat` worked. **Not a plan-31 regression**: the base
+commit `99472fa`, built separately, fails step for step identically.
+Cause: the flush composed and committed the manifest of an inode with no
+name left, which the sequencer refuses (`NotFound`); the failed close
+also leaked the write session. Fixed (POSIX requires these to succeed):
+`flush_inode` keeps an unlinked inode's write session attached (this
+node's reads overlay it) and succeeds, also when the unlink happened on
+another node between its check and the sequencer's answer; the last
+`release` drops the session with the orphan (`View::drop_writes`, shared
+with the lock-fence discard); `setattr`/`ftruncate` on an orphan apply to
+its own record without journaling (`Meta::orphan_setattr`). Nothing of an
+unlinked file is ever published. Unit test:
+`view::vfs_tests::an_unlinked_open_file_keeps_working_until_its_last_close`.

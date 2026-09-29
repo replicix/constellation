@@ -772,6 +772,7 @@ fn mutate_op(meta: &Meta, op: &NsOp) -> MutateOp {
                 name,
                 new_parent,
                 new_name,
+                noreplace: false,
             }
         }
         NsOp::Put(_) => unreachable!("Put is a projection-only op"),

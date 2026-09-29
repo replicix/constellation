@@ -57,21 +57,11 @@ impl View {
     /// chunks and their pending-upload claims) and the kernel's pages of
     /// the file, which hold the same bytes. `true` if there were any.
     pub(super) fn discard_lock_writes(&self, ino: Ino) -> bool {
-        // After any flush of the file in flight (it holds the session
-        // detached from its shard): what it publishes was its to publish,
-        // as when the flush held the shard throughout.
-        let _op = self.inode_ops.lock(ino);
-        let ws = self.writes.lock(ino).remove(&ino);
-        let Some(mut ws) = ws else {
+        // After any flush of the file in flight: what it publishes was its
+        // to publish, as when the flush held the shard throughout.
+        if !self.drop_writes(ino) {
             return false;
-        };
-        let enrolled: Vec<u64> = ws.enrolled.iter().copied().collect();
-        for idx in enrolled {
-            if let Err(error) = self.unseal(&mut ws, ino, idx) {
-                tracing::warn!(target: "constellation::locks", ino, idx, %error, "withdrawing a discarded chunk's upload claim failed");
-            }
         }
-        ws.staging.discard();
         tracing::warn!(
             target: "constellation::locks",
             ino,

@@ -122,6 +122,7 @@ fn conflict_copy(meta: &Meta, op: &MutateOp) -> Option<ConflictCopy> {
         MutateOp::Unlink { .. }
         | MutateOp::Rmdir { .. }
         | MutateOp::Rename { .. }
+        | MutateOp::Exchange { .. }
         | MutateOp::SetXattr { .. }
         | MutateOp::RemoveXattr { .. }
         | MutateOp::AtimeBatch { .. }
@@ -310,6 +311,7 @@ mod tests {
             name: "a".into(),
             new_parent: ROOT_INO,
             new_name: "b".into(),
+            noreplace: false,
         };
         assert!(
             materialize_remote(&meta, &sync_tx, &forward, 2, &rename, &refusal)
