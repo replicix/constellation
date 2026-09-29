@@ -1,5 +1,6 @@
 //! Core filesystem types shared across crates.
 
+use constellation_types::Rdev;
 use serde::{Deserialize, Serialize};
 
 /// Inode number. 1 is the filesystem root (FUSE convention).
@@ -73,9 +74,11 @@ pub struct FileAttr {
     pub mtime_ns: i64,
     /// Change (attribute) time, nanoseconds since the unix epoch.
     pub ctime_ns: i64,
-    /// Device number for block/char device nodes, 0 otherwise.
+    /// Device number for block/char device nodes, `(0, 0)` otherwise. The
+    /// portable pair (plan 31 §7); a frontend packs it into its OS's
+    /// encoding at its own boundary.
     #[serde(default)]
-    pub rdev: u64,
+    pub rdev: Rdev,
 }
 
 impl FileAttr {
@@ -91,7 +94,7 @@ impl FileAttr {
             atime_ns: now_ns,
             mtime_ns: now_ns,
             ctime_ns: now_ns,
-            rdev: 0,
+            rdev: Rdev::default(),
         }
     }
 
@@ -107,7 +110,7 @@ impl FileAttr {
             atime_ns: now_ns,
             mtime_ns: now_ns,
             ctime_ns: now_ns,
-            rdev: 0,
+            rdev: Rdev::default(),
         }
     }
 
@@ -123,7 +126,7 @@ impl FileAttr {
             atime_ns: now_ns,
             mtime_ns: now_ns,
             ctime_ns: now_ns,
-            rdev: 0,
+            rdev: Rdev::default(),
         }
     }
 
@@ -134,7 +137,7 @@ impl FileAttr {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: Rdev,
         now_ns: i64,
     ) -> Self {
         debug_assert!(kind.is_special());

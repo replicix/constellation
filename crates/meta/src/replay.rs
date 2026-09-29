@@ -16,6 +16,7 @@ use crate::store::{atime, misc, ns, reclaim_ino_counter, Meta};
 use constellation_fs_core::{Ino, InodeKind};
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, DentryRecord, Kind};
+use constellation_types::Rdev;
 use fjall::SingleWriterWriteTx;
 use std::collections::BTreeSet;
 
@@ -396,7 +397,7 @@ fn apply_one(
             *mode,
             *uid,
             *gid,
-            0,
+            Rdev::default(),
             2,
             0,
             None,
@@ -422,7 +423,7 @@ fn apply_one(
             *mode,
             *uid,
             *gid,
-            0,
+            Rdev::default(),
             1,
             0,
             None,
@@ -448,7 +449,7 @@ fn apply_one(
             0o777,
             *uid,
             *gid,
-            0,
+            Rdev::default(),
             1,
             target.len() as u64,
             Some(target.clone()),
@@ -640,12 +641,12 @@ fn apply_one(
         // durable-only rule as `Completed` (an inbox op is never installed
         // speculatively, so `!durable` cannot happen for it in practice).
         LogRecord::Refused { .. } if !durable => Ok(Applied::Done),
-        LogRecord::Refused { rid, errno } => {
+        LogRecord::Refused { rid, code } => {
             let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
             tx.insert(
                 &meta.completed,
                 rid.to_key(),
-                crate::store::Meta::encode_refused_row(0, now_ms, *errno),
+                crate::store::Meta::encode_refused_row(0, now_ms, *code),
             );
             Ok(Applied::Done)
         }
@@ -733,7 +734,7 @@ fn insert_node(
     mode: u32,
     uid: u32,
     gid: u32,
-    rdev: u64,
+    rdev: Rdev,
     nlink: u32,
     size: u64,
     target: Option<String>,

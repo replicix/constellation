@@ -9,6 +9,7 @@ use crate::record::LogRecord;
 use crate::store::Meta;
 use crate::{MetaStore, SetXattrMode};
 use constellation_fs_core::{Ino, InodeKind};
+use constellation_types::{Code, Rdev};
 use serde::{Deserialize, Serialize};
 
 /// One mutation a requester asks the lease holder to execute.
@@ -51,7 +52,7 @@ pub enum MutateOp {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: Rdev,
     },
     Link {
         ino: Ino,
@@ -152,7 +153,10 @@ pub enum MutateOutcome {
         epoch: u64,
         records: Vec<LogRecord>,
     },
-    Errno(i32),
+    /// A definitive refusal. Plan 31 §7: the portable [`Code`], which
+    /// crosses the P2P wire as its own number; a frontend converts it to
+    /// its kernel's errno when it answers.
+    Errno(Code),
     NotHolder {
         holder: u64,
     },

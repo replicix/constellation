@@ -1049,7 +1049,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
         from: 2,
         msg: PeerMsg::MutateReply {
             req: *req,
-            outcome: MutateOutcome::Errno(libc::EINVAL),
+            outcome: MutateOutcome::Errno(Code::Invalid),
             base: Some(0),
             position: constellation_meta::Position::ZERO,
             gen: 0,
@@ -1318,7 +1318,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
         from: 2,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Errno(libc::EIO),
+            outcome: MutateOutcome::Errno(Code::Io),
             base: Some(0),
             position: constellation_meta::Position::ZERO,
             gen: 0,
@@ -1400,7 +1400,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
         from: 2,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Errno(libc::EIO),
+            outcome: MutateOutcome::Errno(Code::Io),
             base: Some(0),
             position: constellation_meta::Position::ZERO,
             gen: 0,
@@ -1529,7 +1529,7 @@ fn a_refusal_raises_observed_until_the_segment_lands() {
     let out = forward_through(&mut holder, &mut requester, rid, op);
     assert!(matches!(
         replies(&out)[0].1,
-        ClientReply::Outcome(MutateOutcome::Exists { .. } | MutateOutcome::Errno(libc::EEXIST))
+        ClientReply::Outcome(MutateOutcome::Exists { .. } | MutateOutcome::Errno(Code::Exists))
     ));
     assert_eq!(requester.meta.session().stats().raised, 1);
     let observed = requester.meta.session().observed();
@@ -3379,7 +3379,7 @@ mod refusal_outcomes {
     /// the same rid (a lost reply, a replay by rid, an inbox drain)
     /// answers ENOENT again instead of unlinking the new file.
     #[test]
-    fn a_refused_forward_is_journaled_and_a_retry_dedups_to_the_same_errno() {
+    fn a_refused_forward_is_journaled_and_a_retry_dedups_to_the_same_code() {
         let mut h = Harness::new(1);
         h.hold(1, None);
         let unlink = MutateOp::Unlink {
@@ -3387,7 +3387,7 @@ mod refusal_outcomes {
             name: "f".into(),
         };
         let out = forward(&mut h, 2, 1, 1, unlink.clone());
-        assert_eq!(outcome_of(&out, 1), MutateOutcome::Errno(libc::ENOENT));
+        assert_eq!(outcome_of(&out, 1), MutateOutcome::Errno(Code::NotFound));
         assert_eq!(h.core.stats.refusals_journaled, 1);
         assert!(
             matches!(
@@ -3397,7 +3397,7 @@ mod refusal_outcomes {
                     seq: 1,
                 }),
                 Ok(Some(constellation_meta::CompletedOutcome::Refused {
-                    errno: libc::ENOENT
+                    code: Code::NotFound
                 }))
             ),
             "the refusal is a completion"
@@ -3411,7 +3411,7 @@ mod refusal_outcomes {
         ));
         // The same rid again: the recorded outcome, not a fresh unlink.
         let out = forward(&mut h, 2, 3, 1, unlink);
-        assert_eq!(outcome_of(&out, 3), MutateOutcome::Errno(libc::ENOENT));
+        assert_eq!(outcome_of(&out, 3), MutateOutcome::Errno(Code::NotFound));
         assert_eq!(h.core.stats.forward_dedup_hits, 1);
         assert!(
             h.meta.lookup(ROOT_INO, "f").unwrap().is_some(),
@@ -8302,14 +8302,14 @@ fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
         from: 2,
         msg: PeerMsg::MutateReply {
             req,
-            outcome: MutateOutcome::Errno(libc::EEXIST),
+            outcome: MutateOutcome::Errno(Code::Exists),
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 0,
         },
     });
     assert!(
-        matches!(replies(&out).as_slice(), [(r, ClientReply::Outcome(MutateOutcome::Errno(e)))] if *r == rid && *e == libc::EEXIST),
+        matches!(replies(&out).as_slice(), [(r, ClientReply::Outcome(MutateOutcome::Errno(e)))] if *r == rid && *e == Code::Exists),
         "{out:?}"
     );
 }
@@ -8593,4 +8593,198 @@ fn a_node_reads_the_lease_at_start() {
         "{out:?}"
     );
     assert!(core.job().is_none());
+}
+
+/// Plan 31 C1: a holder's refusal is a portable [`Code`] on the wire and in
+/// the journal. Two in-process nodes (real cores over real `Meta`s, like
+/// [`pair`]), with every reply between them carried by the daemon's real
+/// transport encoding rather than handed over as a Rust value, so what the
+/// requester reads is only what the bytes say.
+mod portable_codes {
+    use super::*;
+    use constellation_meta::{JournalPos, Position};
+    use constellation_net::{Payload, Signed};
+    use constellation_types::Code;
+
+    /// One hop of the P2P transport for the holder's reply: packed the way
+    /// the daemon packs it (`main.rs`'s `mutate_requested`: the outcome as
+    /// postcard inside `Payload::MutateReply`), signed and framed as the
+    /// endpoint sends it, then verified and unpacked the way the
+    /// requester's forward task does (`authority_driver.rs`). Returns the
+    /// decoded message and the outcome's wire bytes.
+    fn over_the_wire(msg: &PeerMsg) -> (PeerMsg, Vec<u8>) {
+        let PeerMsg::MutateReply {
+            req,
+            outcome,
+            base,
+            position,
+            gen,
+        } = msg
+        else {
+            panic!("not a mutate reply: {msg:?}")
+        };
+        let payload = Payload::MutateReply {
+            req_id: req.0,
+            outcome: outcome.to_postcard().unwrap(),
+            base: *base,
+            position_seq: position.seq,
+            position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
+            position_streams: position.streams_wire(),
+            gen: *gen,
+        };
+        let key = iroh::SecretKey::from_bytes(&[7; 32]);
+        let frame = Signed::new(&key, &payload).unwrap().encode().unwrap();
+        let (_, received) = Signed::decode(&frame[4..]).unwrap().verify().unwrap();
+        let Payload::MutateReply {
+            req_id,
+            outcome,
+            base,
+            position_seq,
+            position_pending,
+            position_streams,
+            gen,
+        } = received
+        else {
+            panic!("the frame decoded to another payload")
+        };
+        let decoded = PeerMsg::MutateReply {
+            req: OpId(req_id),
+            outcome: MutateOutcome::from_postcard(&outcome).unwrap(),
+            base,
+            position: Position {
+                seq: position_seq,
+                pending: position_pending.map(|(epoch, jseq)| JournalPos { epoch, jseq }),
+                streams: Default::default(),
+            }
+            .with_streams_wire(&position_streams),
+            gen,
+        };
+        (decoded, outcome)
+    }
+
+    /// Forward `op` from the requester to the holder and carry the reply
+    /// back over the wire: the requester's client answer, and the
+    /// outcome's wire bytes.
+    fn forward_over_the_wire(
+        holder: &mut Harness,
+        requester: &mut Harness,
+        rid: Rid,
+        op: MutateOp,
+    ) -> (ClientReply, Vec<u8>) {
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+        });
+        let sent = sends(&out);
+        let [(1, request)] = sent.as_slice() else {
+            panic!("expected one forward to node 1: {sent:?}")
+        };
+        let answer = holder.step(Event::Peer {
+            from: 2,
+            msg: (*request).clone(),
+        });
+        let (reply, bytes) = over_the_wire(sends(&answer)[0].1);
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: reply,
+        });
+        let r = replies(&out);
+        let [(r_rid, reply)] = r.as_slice() else {
+            panic!("expected one client reply: {out:?}")
+        };
+        assert_eq!(*r_rid, rid);
+        ((*reply).clone(), bytes)
+    }
+
+    /// Node A (the holder) refuses node B's forwarded ops; each refusal
+    /// crosses the wire as `Code`'s own discriminant and reaches B's client
+    /// as the same `Code`, hence the same Linux errno the FUSE boundary
+    /// answers with (`fusefs::reply_code`). A retry by rid is answered from
+    /// the journaled refusal (the `completed` row), again the same `Code`;
+    /// and the `Refused` record itself carries the portable number.
+    #[test]
+    fn a_holders_refusal_crosses_the_wire_as_the_same_code() {
+        let (mut holder, mut requester) = pair();
+        let d = holder.meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        holder.meta.create(d.ino, "f", 0o644, 0, 0).unwrap();
+        holder.meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap();
+        let cases = [
+            // The golden case: ENOTEMPTY is 39 on Linux, 66 on Darwin,
+            // and 3 on the wire.
+            (
+                MutateOp::Rmdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                },
+                Code::NotEmpty,
+                39,
+            ),
+            (
+                MutateOp::Unlink {
+                    parent: ROOT_INO,
+                    name: "missing".into(),
+                },
+                Code::NotFound,
+                2,
+            ),
+            (
+                MutateOp::Rmdir {
+                    parent: ROOT_INO,
+                    name: "file".into(),
+                },
+                Code::NotDir,
+                20,
+            ),
+        ];
+        for (seq, (op, code, linux)) in cases.into_iter().enumerate() {
+            let rid = requester.rid(seq as u64 + 1);
+            let (reply, bytes) =
+                forward_over_the_wire(&mut holder, &mut requester, rid, op.clone());
+            // `MutateOutcome::Errno` is variant 1; its payload is the
+            // code's wire number, never the Linux errno.
+            assert_eq!(bytes, vec![1, code.to_wire() as u8], "{code:?}");
+            assert_ne!(
+                code.to_wire() as i32,
+                linux,
+                "{code:?}: a wire number that is also its errno proves nothing"
+            );
+            let ClientReply::Outcome(MutateOutcome::Errno(got)) = reply else {
+                panic!("{code:?}: expected a refusal, got {reply:?}")
+            };
+            assert_eq!(got, code);
+            assert_eq!(got.to_linux_errno(), linux, "{code:?}");
+            // The holder journaled the refusal as an outcome with the
+            // portable number, and a retry by rid is answered from it.
+            assert_eq!(holder.meta.refused_code(rid).unwrap(), Some(code));
+            let (retry, retry_bytes) = forward_over_the_wire(&mut holder, &mut requester, rid, op);
+            assert_eq!(retry_bytes, bytes, "{code:?}: the retry's answer");
+            assert_eq!(retry, ClientReply::Outcome(MutateOutcome::Errno(code)));
+        }
+        assert_eq!(Code::NotEmpty.to_darwin_errno(), 66);
+        // The journaled `Refused` records: postcard carries the wire
+        // number, and a replica tailing them (on any OS) reads back the
+        // same codes.
+        let refused: Vec<LogRecord> = holder
+            .meta
+            .peek_journal_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .filter(|r| matches!(r, LogRecord::Refused { .. }))
+            .collect();
+        assert_eq!(refused.len(), 3, "{refused:?}");
+        let follower = Meta::open_in_memory().unwrap();
+        for record in &refused {
+            let LogRecord::Refused { rid, code } = record else {
+                unreachable!()
+            };
+            let bytes = record.to_postcard().unwrap();
+            assert_eq!(bytes.last(), Some(&(code.to_wire() as u8)), "{record:?}");
+            let decoded = LogRecord::from_postcard(&bytes).unwrap();
+            assert_eq!(&decoded, record);
+            follower.apply_records_journaled(&[decoded]).unwrap();
+            assert_eq!(follower.refused_code(*rid).unwrap(), Some(*code));
+        }
+    }
 }

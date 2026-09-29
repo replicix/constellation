@@ -15,7 +15,5 @@ aarch64-apple-darwin constellation
 
 # Windows: `tokio::net::Unix{Listener,Stream}` in the control API.
 x86_64-pc-windows-gnu constellation-api
-# Windows: `libc::ESTALE` (authority client/holder/inbox).
-x86_64-pc-windows-gnu constellation-authority
 # Windows: `std::os::unix` and `libc::posix_fadvise`.
 x86_64-pc-windows-gnu constellation-chaos

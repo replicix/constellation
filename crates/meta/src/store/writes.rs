@@ -210,7 +210,7 @@ impl Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -267,7 +267,7 @@ impl Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -326,7 +326,7 @@ impl Meta {
             size: target.len() as u64,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -371,7 +371,7 @@ impl Meta {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: constellation_types::Rdev,
     ) -> Result<FileAttr, MetaError> {
         if !kind.is_special() {
             return Err(MetaError::Invalid("mknod kind".into()));
@@ -687,7 +687,7 @@ impl Meta {
             size,
             mtime_ns,
             ctime_ns,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         ns::put_dentry(&mut tx, &self.ns, dirty, parent, name, ino, attrs)?;
         misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, ctime_ns)?;
@@ -1036,7 +1036,7 @@ impl MetaStore for Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -1093,7 +1093,7 @@ impl MetaStore for Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -1152,7 +1152,7 @@ impl MetaStore for Meta {
             size: target.len() as u64,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -1195,7 +1195,7 @@ impl MetaStore for Meta {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: constellation_types::Rdev,
     ) -> Result<FileAttr, MetaError> {
         if !kind.is_special() {
             return Err(MetaError::Invalid("mknod kind".into()));

@@ -89,8 +89,11 @@ Every plan ends with ALL of these green, run in this order:
   code. Match the existing prose-heavy module-doc style (look at
   `cli/src/shipper.rs` or `store-s3/src/lease.rs`).
 - Errors: `thiserror` enums in library crates, `anyhow` with `context`
-  in the binary/harness. Map errors to errnos at the FUSE boundary
-  only (`errno()` in `cli/src/fusefs.rs`).
+  in the binary/harness. Refusals are the portable
+  `constellation_types::Code` everywhere (`MetaError::code()`); it
+  becomes a Linux errno at the FUSE boundary only (`reply_code()` in
+  `cli/src/fusefs.rs`), and a real syscall's failure becomes a `Code`
+  through `Code::from_io_error`. No `libc::E*` outside `crates/types`.
 - New config knobs: env vars named `CONSTELLATION_*` with sane
   defaults; document them where they are read.
 - Tests: unit tests co-located (`#[cfg(test)] mod tests`), using

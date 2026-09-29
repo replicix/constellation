@@ -1,0 +1,17 @@
+[package]
+name = "constellation-types"
+description = "Portable vocabulary shared by every layer (plan 31 §4, §7): the `Code` errno with its own wire encoding, and the portable `(major, minor)` device number"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true
+serde_json.workspace = true
+# Cross-checks the numeric Linux/Darwin tables against the host's libc
+# constants; never a runtime dependency (the tables are plain numbers so
+# both can be tested on any host).
+libc.workspace = true

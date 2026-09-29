@@ -723,7 +723,7 @@ impl Driver {
             Err(constellation_meta::MetaError::Conflict) => {
                 MutateOutcome::Conflict { manifest: None }
             }
-            Err(e) => MutateOutcome::Errno(constellation_authority::core::meta_errno(&e)),
+            Err(e) => MutateOutcome::Errno(e.code()),
         };
         drop(admission);
         self.shared

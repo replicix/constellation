@@ -68,10 +68,11 @@ use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_meta::Rid;
 use constellation_store_s3::inbox::InboxKey;
+use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::AckView;
-pub use client::{meta_errno, ClientPhase};
+pub use client::ClientPhase;
 pub use delegate::{DelegKind, DelegView, RecallPhase};
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
@@ -2113,7 +2114,7 @@ impl Core {
         if state.frozen && !before.frozen {
             // A frozen epoch refuses writes (EROFS): every op waiting for
             // the lease hears it now rather than at its deadline.
-            self.refuse_waiting_for_lease(now, libc::EROFS, replica, out);
+            self.refuse_waiting_for_lease(now, Code::ReadOnly, replica, out);
         }
     }
 

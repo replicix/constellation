@@ -129,7 +129,8 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
         m.symlink(dir, "s", "t", 0, 0).unwrap()
     });
     assert_captured(&meta, "mknod", |m| {
-        m.mknod(dir, "n", InodeKind::Fifo, 0o600, 0, 0, 0).unwrap()
+        m.mknod(dir, "n", InodeKind::Fifo, 0o600, 0, 0, Default::default())
+            .unwrap()
     });
     assert_captured(&meta, "link", |m| m.link(f1, dir, "l2").unwrap());
     assert_captured(&meta, "unlink (last link)", |m| {

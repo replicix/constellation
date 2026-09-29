@@ -95,8 +95,16 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
     });
 
     step!(meta, "mknod", {
-        meta.mknod(dir_ino, "n1", InodeKind::Fifo, 0o600, 0, 0, 0)
-            .unwrap();
+        meta.mknod(
+            dir_ino,
+            "n1",
+            InodeKind::Fifo,
+            0o600,
+            0,
+            0,
+            Default::default(),
+        )
+        .unwrap();
     });
 
     let other = meta.mkdir(ROOT_INO, "other", 0o755, 0, 0).unwrap().ino;

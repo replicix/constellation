@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+constellation-types.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 

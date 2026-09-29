@@ -1,6 +1,7 @@
 //! Filesystem operations and the single place that touches the mount.
 
 use anyhow::{Context, Result};
+use constellation_types::Code;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -134,20 +135,27 @@ impl Complete {
     }
 }
 
+/// The checkers' name for a raw OS errno: the portable [`Code`]'s POSIX
+/// name for the errnos they reason about, `OTHER` for everything else —
+/// including 0 (a non-OS error) and numbers `Code` has no variant for,
+/// which must not pass for a real `EIO`.
 fn errno_name(errno: i32) -> &'static str {
-    match errno {
-        libc::EEXIST => "EEXIST",
-        libc::ENOENT => "ENOENT",
-        libc::EISDIR => "EISDIR",
-        libc::ENOTDIR => "ENOTDIR",
-        libc::ENOTEMPTY => "ENOTEMPTY",
-        libc::ESTALE => "ESTALE",
-        libc::EACCES => "EACCES",
-        libc::EPERM => "EPERM",
-        libc::EBUSY => "EBUSY",
-        libc::EINVAL => "EINVAL",
-        libc::EIO => "EIO",
-        libc::ENOSPC => "ENOSPC",
+    let Some(code) = Code::try_from_native(errno) else {
+        return "OTHER";
+    };
+    match code {
+        Code::Exists
+        | Code::NotFound
+        | Code::IsDir
+        | Code::NotDir
+        | Code::NotEmpty
+        | Code::Stale
+        | Code::Access
+        | Code::Perm
+        | Code::Busy
+        | Code::Invalid
+        | Code::Io
+        | Code::NoSpace => code.posix_name(),
         _ => "OTHER",
     }
 }
@@ -424,6 +432,6 @@ mod tests {
         assert_eq!(execute_op(dir.path(), &op).unwrap().outcome, Outcome::Ok);
         let c = execute_op(dir.path(), &op).unwrap();
         assert_eq!(c.outcome, Outcome::Fail);
-        assert_eq!(c.errno, Some(libc::EEXIST));
+        assert_eq!(c.errno.map(Code::from_native), Some(Code::Exists));
     }
 }

@@ -21,6 +21,7 @@ use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, Sp
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
 use constellation_meta::{Meta, MetaError, MetaStore, ReadKey};
 use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
+use constellation_types::Code;
 use fuser::{
     BsdFileFlags, Errno, FileHandle, FileType, Filesystem, INodeNo, InitFlags, KernelConfig,
     LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -289,7 +290,7 @@ impl WriteShards {
 /// (`None`: it is gone — the failure happened before anything could be
 /// retried from it, as it always was).
 struct FlushFail {
-    errno: i32,
+    errno: Code,
     ws: Option<Box<WriteState>>,
 }
 
@@ -928,36 +929,24 @@ pub struct ConstellationFs {
     holds: Option<Arc<crate::holds::Holds>>,
 }
 
-fn staging_errno(e: &crate::staging::StagingError) -> i32 {
+fn staging_code(e: &crate::staging::StagingError) -> Code {
     match e {
-        crate::staging::StagingError::Full { .. } => libc::ENOSPC,
-        crate::staging::StagingError::Io(_) => libc::EIO,
+        crate::staging::StagingError::Full { .. } => Code::NoSpace,
+        crate::staging::StagingError::Io(_) => Code::Io,
     }
 }
 
-fn errno(e: &MetaError) -> i32 {
-    match e {
-        MetaError::NoEnt(_) | MetaError::NoEntry => libc::ENOENT,
-        MetaError::Exists => libc::EEXIST,
-        MetaError::NotDir => libc::ENOTDIR,
-        MetaError::IsDir => libc::EISDIR,
-        MetaError::NotEmpty => libc::ENOTEMPTY,
-        MetaError::NoData => libc::ENODATA,
-        MetaError::Invalid(_) => libc::EINVAL,
-        MetaError::Conflict => libc::EAGAIN,
-        MetaError::Fjall(_)
-        | MetaError::Io(_)
-        | MetaError::Record(_)
-        | MetaError::Key(_)
-        | MetaError::Json(_)
-        | MetaError::Postcard(_) => libc::EIO,
-    }
+/// The Linux FUSE boundary (plan 31 §7): the one place a portable [`Code`]
+/// becomes the kernel's errno number. Everything below the reply carries
+/// `Code`; nothing here ever holds a raw errno.
+pub(crate) fn reply_code(code: Code) -> Errno {
+    Errno::from_i32(code.to_linux_errno())
 }
 
 /// Why a mutation did not commit. Separate from a bare errno so that an
 /// optimistic-concurrency rejection can carry the state to rebase onto.
 pub(crate) enum MutateFail {
-    Errno(i32),
+    Errno(Code),
     /// The base this update was composed on is no longer current.
     /// `manifest` is the holder's image when it came back over the wire;
     /// `None` means rebase from the local replica, which is
@@ -970,7 +959,7 @@ pub(crate) enum MutateFail {
 fn mutate_fail(e: MetaError) -> MutateFail {
     match e {
         MetaError::Conflict => MutateFail::Conflict { manifest: None },
-        other => MutateFail::Errno(errno(&other)),
+        other => MutateFail::Errno(other.code()),
     }
 }
 
@@ -1011,7 +1000,9 @@ fn to_fuse_attr(a: &FileAttr) -> fuser::FileAttr {
         nlink: a.nlink,
         uid: a.uid,
         gid: a.gid,
-        rdev: a.rdev as u32,
+        // The kernel's 32-bit `new_encode_dev`, the inverse of what
+        // `mknod` unpacked (`fusefs_ops.rs`).
+        rdev: constellation_types::rdev::to_linux_fuse_rdev(a.rdev),
         blksize: 131072,
         flags: 0,
     }
@@ -1155,7 +1146,7 @@ impl ConstellationFs {
     /// whose `file_len` still trails after a sparse `ftruncate` and would
     /// charge the same bytes twice. Not additive across writes on the same
     /// handle: `new_file_len` is the whole intended length.
-    pub(crate) fn quota_check(&self, ino: Ino, new_file_len: u64) -> Result<(), i32> {
+    pub(crate) fn quota_check(&self, ino: Ino, new_file_len: u64) -> Result<(), Code> {
         let Some(cap) = self.cached_quota() else {
             return Ok(());
         };
@@ -1170,7 +1161,7 @@ impl ConstellationFs {
             .unwrap_or(0);
         let pending_growth = new_file_len.saturating_sub(committed);
         if used.saturating_add(pending_growth) > cap {
-            return Err(libc::ENOSPC);
+            return Err(Code::NoSpace);
         }
         Ok(())
     }
@@ -1292,14 +1283,14 @@ impl ConstellationFs {
             atime_ns: mtime_ns,
             mtime_ns,
             ctime_ns: mtime_ns,
-            rdev: 0,
+            rdev: Default::default(),
         }
     }
 
-    pub(crate) fn synthetic_xattrs(&self, ino: Ino) -> Result<Vec<(String, Vec<u8>)>, i32> {
-        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+    pub(crate) fn synthetic_xattrs(&self, ino: Ino) -> Result<Vec<(String, Vec<u8>)>, Code> {
+        let node = self.synthetic_node(ino).ok_or(Code::Stale)?;
         if !self.synthetic_active(&node) {
-            return Err(libc::ESTALE);
+            return Err(Code::Stale);
         }
         match node {
             SyntheticNode::Frozen {
@@ -1313,15 +1304,15 @@ impl ConstellationFs {
         }
     }
 
-    pub(crate) fn synthetic_recursive_size(&self, ino: Ino) -> Result<(u64, u64), i32> {
-        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+    pub(crate) fn synthetic_recursive_size(&self, ino: Ino) -> Result<(u64, u64), Code> {
+        let node = self.synthetic_node(ino).ok_or(Code::Stale)?;
         if !self.synthetic_active(&node) {
-            return Err(libc::ESTALE);
+            return Err(Code::Stale);
         }
         self.synthetic_node_recursive_size(&node)
     }
 
-    fn synthetic_node_recursive_size(&self, node: &SyntheticNode) -> Result<(u64, u64), i32> {
+    fn synthetic_node_recursive_size(&self, node: &SyntheticNode) -> Result<(u64, u64), Code> {
         match node {
             SyntheticNode::Frozen {
                 kind: InodeKind::File,
@@ -1369,7 +1360,7 @@ impl ConstellationFs {
     pub(crate) fn snapshot_tree(
         &self,
         hash: crate::snapshot::FrozenObject,
-    ) -> Result<crate::snapshot::FrozenDir, i32> {
+    ) -> Result<crate::snapshot::FrozenDir, Code> {
         {
             let cache = self.tree_cache.lock().unwrap();
             if let Some(tree) = cache.0.get(&hash) {
@@ -1382,7 +1373,7 @@ impl ConstellationFs {
                 crate::fuse_watch::stage("snapshot tree load");
                 self.snapshots.list_frozen(&hash).await
             })
-            .map_err(|_| libc::EIO)?;
+            .map_err(|_| Code::Io)?;
         let mut cache = self.tree_cache.lock().unwrap();
         if cache.0.len() >= 128 {
             if let Some(oldest) = cache.1.pop_front() {
@@ -1398,7 +1389,7 @@ impl ConstellationFs {
         &self,
         parent: Ino,
         name: &str,
-    ) -> Result<Option<(Ino, FileAttr)>, i32> {
+    ) -> Result<Option<(Ino, FileAttr)>, Code> {
         let node = if !Self::is_synthetic(parent) {
             if name != ".constellation" {
                 return Ok(None);
@@ -1406,17 +1397,17 @@ impl ConstellationFs {
             let attr = self
                 .meta
                 .getattr(parent)
-                .map_err(|error| errno(&error))?
-                .ok_or(libc::ENOENT)?;
+                .map_err(|error| error.code())?
+                .ok_or(Code::NotFound)?;
             if attr.kind != InodeKind::Dir {
                 return Ok(None);
             }
-            let path = self.meta.path_of(parent).map_err(|_| libc::EIO)?;
+            let path = self.meta.path_of(parent).map_err(|_| Code::Io)?;
             SyntheticNode::Constellation { path }
         } else {
-            let parent_node = self.synthetic_node(parent).ok_or(libc::ESTALE)?;
+            let parent_node = self.synthetic_node(parent).ok_or(Code::Stale)?;
             if !self.synthetic_active(&parent_node) {
-                return Err(libc::ESTALE);
+                return Err(Code::Stale);
             }
             match parent_node {
                 SyntheticNode::Constellation { path } if name == "snapshot" => {
@@ -1426,10 +1417,10 @@ impl ConstellationFs {
                     let (row, root) = self
                         .rt
                         .block_on(self.snapshots.covering(&path))
-                        .map_err(|_| libc::EIO)?
+                        .map_err(|_| Code::Io)?
                         .into_iter()
                         .find(|(row, _)| row.name == name)
-                        .ok_or(libc::ENOENT)?;
+                        .ok_or(Code::NotFound)?;
                     SyntheticNode::Frozen {
                         snapshot_id: row.id,
                         kind: InodeKind::Dir,
@@ -1475,10 +1466,13 @@ impl ConstellationFs {
         Ok(Some((ino, self.synthetic_attr(ino, &node))))
     }
 
-    pub(crate) fn synthetic_entries(&self, ino: Ino) -> Result<Vec<(Ino, InodeKind, String)>, i32> {
-        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+    pub(crate) fn synthetic_entries(
+        &self,
+        ino: Ino,
+    ) -> Result<Vec<(Ino, InodeKind, String)>, Code> {
+        let node = self.synthetic_node(ino).ok_or(Code::Stale)?;
         if !self.synthetic_active(&node) {
-            return Err(libc::ESTALE);
+            return Err(Code::Stale);
         }
         let children: Vec<(String, SyntheticNode)> = match node {
             SyntheticNode::Constellation { path } => {
@@ -1487,7 +1481,7 @@ impl ConstellationFs {
             SyntheticNode::SnapshotDirectory { path } => self
                 .rt
                 .block_on(self.snapshots.covering(&path))
-                .map_err(|_| libc::EIO)?
+                .map_err(|_| Code::Io)?
                 .into_iter()
                 .map(|(row, root)| {
                     Ok((
@@ -1506,7 +1500,7 @@ impl ConstellationFs {
                         },
                     ))
                 })
-                .collect::<Result<_, i32>>()?,
+                .collect::<Result<_, Code>>()?,
             SyntheticNode::Frozen {
                 snapshot_id,
                 kind: InodeKind::Dir,
@@ -1534,7 +1528,7 @@ impl ConstellationFs {
                     )
                 })
                 .collect(),
-            _ => return Err(libc::ENOTDIR),
+            _ => return Err(Code::NotDir),
         };
         Ok(children
             .into_iter()
@@ -1546,10 +1540,10 @@ impl ConstellationFs {
             .collect())
     }
 
-    pub(crate) fn read_frozen(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, i32> {
-        let node = self.synthetic_node(ino).ok_or(libc::ESTALE)?;
+    pub(crate) fn read_frozen(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, Code> {
+        let node = self.synthetic_node(ino).ok_or(Code::Stale)?;
         if !self.synthetic_active(&node) {
-            return Err(libc::ESTALE);
+            return Err(Code::Stale);
         }
         let SyntheticNode::Frozen {
             kind: InodeKind::File,
@@ -1557,7 +1551,7 @@ impl ConstellationFs {
             ..
         } = node
         else {
-            return Err(libc::EISDIR);
+            return Err(Code::IsDir);
         };
         let manifest = self
             .rt
@@ -1567,7 +1561,7 @@ impl ConstellationFs {
             })
             .map_err(|error| {
                 tracing::debug!(%error, ino, "frozen read: manifest load failed");
-                libc::EIO
+                Code::Io
             })?;
         let hashes = self.chunk_list(&manifest)?;
         tracing::debug!(
@@ -1584,18 +1578,18 @@ impl ConstellationFs {
         for slice in manifest.layout.slices(offset, len) {
             let chunk = self
                 .read_committed_chunk(ino, &hashes, slice.index)
-                .inspect_err(|errno| {
+                .inspect_err(|code| {
                     tracing::debug!(
                         ino,
                         index = slice.index,
-                        errno,
+                        %code,
                         "frozen read: chunk read failed"
                     )
                 })?;
             let start = slice.offset as usize;
             let end = (slice.offset + slice.len) as usize;
             if chunk.len() < end {
-                return Err(libc::EIO);
+                return Err(Code::Io);
             }
             out.extend_from_slice(&chunk[start..end]);
         }
@@ -1637,7 +1631,7 @@ impl ConstellationFs {
     /// told (a new lock, a recalled grant's flush); the caller reports
     /// `EIO` after its own flush. One or two relaxed loads when this node
     /// holds no grant, lock or taint.
-    pub(crate) fn lock_publish_gate(&self, ino: Ino) -> Result<bool, i32> {
+    pub(crate) fn lock_publish_gate(&self, ino: Ino) -> Result<bool, Code> {
         let Some(l) = self.cluster_locks() else {
             return Ok(false);
         };
@@ -1647,7 +1641,7 @@ impl ConstellationFs {
         if let Some(fenced) = l.take_discard(ino) {
             let dirty = self.discard_lock_writes(ino);
             if fenced || dirty {
-                return Err(libc::EIO);
+                return Err(Code::Io);
             }
         }
         Ok(l.take_owed(ino))
@@ -1681,7 +1675,7 @@ impl ConstellationFs {
         let enrolled: Vec<u64> = ws.enrolled.iter().copied().collect();
         for idx in enrolled {
             if let Err(error) = self.unseal(&mut ws, ino, idx) {
-                tracing::warn!(target: "constellation::locks", ino, idx, error, "withdrawing a discarded chunk's upload claim failed");
+                tracing::warn!(target: "constellation::locks", ino, idx, %error, "withdrawing a discarded chunk's upload claim failed");
             }
         }
         ws.staging.discard();
@@ -1702,19 +1696,19 @@ impl ConstellationFs {
     /// sync task, and only the first mutation after an idle release
     /// pays a CAS round trip.
     #[allow(dead_code)]
-    pub(crate) fn require_lease(&self) -> Result<(), i32> {
+    pub(crate) fn require_lease(&self) -> Result<(), Code> {
         self.require_lease_for(constellation_fs_core::types::ROOT_INO)
     }
 
-    pub(crate) fn require_lease_for(&self, _ino: Ino) -> Result<(), i32> {
+    pub(crate) fn require_lease_for(&self, _ino: Ino) -> Result<(), Code> {
         let Some(h) = &self.sync else { return Ok(()) };
         if h.read_only_member {
-            return Err(libc::EROFS);
+            return Err(Code::ReadOnly);
         }
         if let Some(departed) = &h.departed {
             if departed.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::error!("refusing mutation: this node has left the cluster");
-                return Err(libc::EIO);
+                return Err(Code::Io);
             }
         }
         if let Some(frozen) = &h.epoch_frozen {
@@ -1722,7 +1716,7 @@ impl ConstellationFs {
                 tracing::error!(
                     "refusing mutation: continuation epoch frozen (lost a member) or carrying no lease"
                 );
-                return Err(libc::EROFS);
+                return Err(Code::ReadOnly);
             }
         }
         // Offline designation (DESIGN.md §5.2): since plan 30 §M11 phase
@@ -1749,7 +1743,7 @@ impl ConstellationFs {
                 part,
                 "refusing mutation: this node lost the partition lease"
             );
-            return Err(libc::EIO);
+            return Err(Code::Io);
         }
         let start = std::time::Instant::now();
         // Each retry is a classify GET (and, the first time round, a CAS
@@ -1776,7 +1770,7 @@ impl ConstellationFs {
         loop {
             let (tx, rx) = tokio::sync::oneshot::channel();
             if h.tx.send(SyncRequest::Acquire { reply: tx }).is_err() {
-                return Err(libc::EIO);
+                return Err(Code::Io);
             }
             match rx.blocking_recv() {
                 Ok(Ok(progress)) if progress.acquired => {
@@ -1792,9 +1786,9 @@ impl ConstellationFs {
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "lease acquisition failed");
-                    return Err(libc::EIO);
+                    return Err(Code::Io);
                 }
-                Err(_) => return Err(libc::EIO),
+                Err(_) => return Err(Code::Io),
             }
             if no_progress_since.elapsed() >= h.acquire_deadline {
                 tracing::error!(
@@ -1804,7 +1798,7 @@ impl ConstellationFs {
                     "another node holds the partition lease with no progress; \
                      failing the write with EIO"
                 );
-                return Err(libc::EIO);
+                return Err(Code::Io);
             }
             // Jittered, not a plain `sleep(backoff)` (plan 29 M3c): every
             // blocked FUSE thread runs the exact same deterministic
@@ -1830,13 +1824,13 @@ impl ConstellationFs {
         &self,
         part_hint_ino: Ino,
         op: constellation_meta::MutateOp,
-    ) -> Result<(), i32> {
+    ) -> Result<(), Code> {
         self.mutate_op_rebasable(part_hint_ino, op)
             .map_err(|failure| match failure {
                 MutateFail::Errno(e) => e,
                 // Callers that cannot rebase surface the conflict as a
                 // retryable error rather than losing the update.
-                MutateFail::Conflict { .. } => libc::EAGAIN,
+                MutateFail::Conflict { .. } => Code::Again,
             })
     }
 
@@ -2043,7 +2037,7 @@ impl ConstellationFs {
         op: constellation_meta::MutateOp,
     ) -> Result<(), MutateFail> {
         if Self::is_synthetic(part_hint_ino) {
-            return Err(MutateFail::Errno(libc::EROFS));
+            return Err(MutateFail::Errno(Code::ReadOnly));
         }
         let Some(h) = &self.sync else {
             return constellation_meta::execute_mutate(&self.meta, &op, None)
@@ -2082,19 +2076,19 @@ impl ConstellationFs {
         rid: constellation_meta::Rid,
     ) -> Result<(), MutateFail> {
         if h.read_only_member {
-            return Err(MutateFail::Errno(libc::EROFS));
+            return Err(MutateFail::Errno(Code::ReadOnly));
         }
         if h.departed
             .as_ref()
             .is_some_and(|departed| departed.load(std::sync::atomic::Ordering::Relaxed))
         {
-            return Err(MutateFail::Errno(libc::EIO));
+            return Err(MutateFail::Errno(Code::Io));
         }
         if h.epoch_frozen
             .as_ref()
             .is_some_and(|frozen| frozen.load(std::sync::atomic::Ordering::Relaxed))
         {
-            return Err(MutateFail::Errno(libc::EROFS));
+            return Err(MutateFail::Errno(Code::ReadOnly));
         }
         // Plan 30 §M11: the delegate's own writes run here at local speed
         // (the sequencer's fast path, under a grant instead of the
@@ -2191,7 +2185,7 @@ impl ConstellationFs {
         }
         drop(gate);
         if h.lease.is_lost() {
-            return Err(MutateFail::Errno(libc::EIO));
+            return Err(MutateFail::Errno(Code::Io));
         }
         // Plan 30 M5: everything else — forwarding with its same-rid
         // retries, the inbox when there is no P2P path, the lease path
@@ -2268,41 +2262,41 @@ impl ConstellationFs {
             })
             .is_err()
         {
-            return Err(MutateFail::Errno(libc::EIO));
+            return Err(MutateFail::Errno(Code::Io));
         }
         match rx.blocking_recv() {
             Ok(constellation_authority::ClientReply::Outcome(outcome)) => match outcome {
                 constellation_meta::MutateOutcome::Accepted { .. } => Ok(()),
                 // Never a client outcome: the core retries it.
-                constellation_meta::MutateOutcome::Held { .. } => Err(MutateFail::Errno(libc::EIO)),
+                constellation_meta::MutateOutcome::Held { .. } => Err(MutateFail::Errno(Code::Io)),
                 constellation_meta::MutateOutcome::Errno(e) => Err(MutateFail::Errno(e)),
                 // The name exists on the holder; the core installed the
                 // entry it sent with the refusal, so the caller's next
                 // lookup resolves here too.
                 constellation_meta::MutateOutcome::Exists { .. } => {
-                    Err(MutateFail::Errno(libc::EEXIST))
+                    Err(MutateFail::Errno(Code::Exists))
                 }
                 constellation_meta::MutateOutcome::Conflict { manifest } => {
                     Err(MutateFail::Conflict { manifest })
                 }
                 constellation_meta::MutateOutcome::Busy
                 | constellation_meta::MutateOutcome::NotHolder { .. } => {
-                    Err(MutateFail::Errno(libc::EIO))
+                    Err(MutateFail::Errno(Code::Io))
                 }
             },
             // Neither executed here nor answered by a holder within the
             // deadline: `EIO`, and the op stays retryable.
-            Ok(constellation_authority::ClientReply::InDoubt) => Err(MutateFail::Errno(libc::EIO)),
-            Err(_) => Err(MutateFail::Errno(libc::EIO)),
+            Ok(constellation_authority::ClientReply::InDoubt) => Err(MutateFail::Errno(Code::Io)),
+            Err(_) => Err(MutateFail::Errno(Code::Io)),
         }
     }
 
     /// fsync() barrier. In `--fsync-mode s3`, block until the journal
     /// (up to now) is durable in the shared log; otherwise just nudge.
-    pub(crate) fn sync_barrier(&self, ino: Ino) -> Result<(), i32> {
+    pub(crate) fn sync_barrier(&self, ino: Ino) -> Result<(), Code> {
         // Local durability first, in every mode: the metadata engine
         // commits to OS buffers, so fsync(2) must force them to disk.
-        self.meta.sync().map_err(|e| errno(&e))?;
+        self.meta.sync().map_err(|e| e.code())?;
         let Some(h) = &self.sync else { return Ok(()) };
         if !h.fsync_s3 {
             let _ = h.tx.send(SyncRequest::Nudge);
@@ -2317,37 +2311,37 @@ impl ConstellationFs {
             })
             .is_err()
         {
-            return Err(libc::EIO);
+            return Err(Code::Io);
         }
         match reply_rx.blocking_recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "fsync barrier: sync failed");
-                Err(libc::EIO)
+                Err(Code::Io)
             }
-            Err(_) => Err(libc::EIO),
+            Err(_) => Err(Code::Io),
         }
     }
 
-    fn load_manifest(&self, ino: Ino) -> Result<Manifest, i32> {
+    fn load_manifest(&self, ino: Ino) -> Result<Manifest, Code> {
         match self.meta.manifest(ino) {
-            Ok(Some(bytes)) => Manifest::decode(&bytes).map_err(|_| libc::EIO),
+            Ok(Some(bytes)) => Manifest::decode(&bytes).map_err(|_| Code::Io),
             Ok(None) => match self.meta.scratch_manifest(ino) {
-                Ok(Some(bytes)) => Manifest::decode(&bytes).map_err(|_| libc::EIO),
+                Ok(Some(bytes)) => Manifest::decode(&bytes).map_err(|_| Code::Io),
                 Ok(None) => Ok(Manifest::empty(self.chunk_size)),
-                Err(e) => Err(errno(&e)),
+                Err(e) => Err(e.code()),
             },
-            Err(e) => Err(errno(&e)),
+            Err(e) => Err(e.code()),
         }
     }
 
     /// Resolve the sparse data-chunk map (following manifest spill).
-    fn chunk_list(&self, m: &Manifest) -> Result<SparseChunks, i32> {
+    fn chunk_list(&self, m: &Manifest) -> Result<SparseChunks, Code> {
         match &m.chunks {
             ChunkInfo::Inline(v) => Ok(v.clone()),
             ChunkInfo::Spilled(h) => {
                 let blob = self.fetch_chunk(h)?;
-                decode_chunk_list(&blob).map_err(|_| libc::EIO)
+                decode_chunk_list(&blob).map_err(|_| Code::Io)
             }
         }
     }
@@ -2355,7 +2349,7 @@ impl ConstellationFs {
     /// Get one chunk: cache first, then object store (inserted clean).
     /// An in-flight prefetch for the same chunk is awaited rather than
     /// duplicated.
-    fn fetch_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, i32> {
+    fn fetch_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, Code> {
         self.fetch_chunk_for_inode(None, hash)
     }
 
@@ -2380,7 +2374,7 @@ impl ConstellationFs {
         );
     }
 
-    fn fetch_chunk_for_inode(&self, ino: Option<Ino>, hash: &ChunkHash) -> Result<Vec<u8>, i32> {
+    fn fetch_chunk_for_inode(&self, ino: Option<Ino>, hash: &ChunkHash) -> Result<Vec<u8>, Code> {
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
         }
@@ -2413,7 +2407,7 @@ impl ConstellationFs {
                     error = %error,
                     "coop fetch failed"
                 );
-                libc::EIO
+                Code::Io
             });
         }
         let mut data = None;
@@ -2468,7 +2462,7 @@ impl ConstellationFs {
                 error = last_error.as_deref().unwrap_or("unknown"),
                 "direct S3 chunk fetch failed after retries"
             );
-            libc::EIO
+            Code::Io
         })?;
         Ok(data)
     }
@@ -2482,7 +2476,7 @@ impl ConstellationFs {
         hashes: &SparseChunks,
         idx: u64,
         len: u32,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<Vec<u8>, Code> {
         let mut data = match hashes.get(&idx) {
             Some(h) => self.fetch_chunk(h)?,
             None => Vec::new(),
@@ -2499,7 +2493,7 @@ impl ConstellationFs {
         writes: &'a mut HashMap<Ino, WriteState>,
         ino: Ino,
         manifest: &Manifest,
-    ) -> Result<&'a mut WriteState, i32> {
+    ) -> Result<&'a mut WriteState, Code> {
         if let std::collections::hash_map::Entry::Vacant(e) = writes.entry(ino) {
             // The inode's size is authoritative: a committed
             // `setattr(size)` (a truncate on this or another node whose
@@ -2515,12 +2509,10 @@ impl ConstellationFs {
                 .unwrap_or(manifest.file_len);
             let gen = self.staging_gen.next();
             let staging = Staging::create(&self.staging_dir, ino, gen, self.staging_budget.clone())
-                .map_err(|e| staging_errno(&e))?;
+                .map_err(|e| staging_code(&e))?;
             let mut staging = staging;
             if size != manifest.file_len {
-                staging
-                    .set_len_sparse(size)
-                    .map_err(|e| staging_errno(&e))?;
+                staging.set_len_sparse(size).map_err(|e| staging_code(&e))?;
             }
             e.insert(WriteState {
                 staging,
@@ -2539,7 +2531,7 @@ impl ConstellationFs {
         Ok(writes.get_mut(&ino).unwrap())
     }
 
-    fn drain_inode(&self, ino: Ino) -> Result<(), i32> {
+    fn drain_inode(&self, ino: Ino) -> Result<(), Code> {
         let Some(handle) = &self.sync else {
             return Ok(());
         };
@@ -2548,14 +2540,14 @@ impl ConstellationFs {
         handle
             .tx
             .send(SyncRequest::DrainInode { ino, reply })
-            .map_err(|_| libc::EIO)?;
+            .map_err(|_| Code::Io)?;
         match receive.blocking_recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 tracing::warn!(%error, ino, "write-through upload failed");
-                Err(libc::EIO)
+                Err(Code::Io)
             }
-            Err(_) => Err(libc::EIO),
+            Err(_) => Err(Code::Io),
         }
     }
 
@@ -2564,7 +2556,7 @@ impl ConstellationFs {
     /// read prefetcher's signal: it directly proves a sequential
     /// writer has crossed the boundary. A later write into a sealed
     /// chunk re-admits and re-dirties that chunk.
-    fn seal_crossed_chunks(&self, ino: Ino, ws: &mut WriteState) -> Result<(), i32> {
+    fn seal_crossed_chunks(&self, ino: Ino, ws: &mut WriteState) -> Result<(), Code> {
         let complete = ws.high_water / u64::from(self.chunk_size);
         let mut sealed_any = false;
         for idx in 0..complete {
@@ -2575,7 +2567,7 @@ impl ConstellationFs {
             data.resize(self.chunk_size as usize, 0);
             ws.staging
                 .read_at(idx * u64::from(self.chunk_size), &mut data)
-                .map_err(|error| staging_errno(&error))?;
+                .map_err(|error| staging_code(&error))?;
             let hash = self.store.hash(&data);
             if data.iter().all(|byte| *byte == 0) {
                 ws.staging.release_chunk(idx, self.chunk_size);
@@ -2590,14 +2582,14 @@ impl ConstellationFs {
                 && !self
                     .meta
                     .upload_pending_for_hash(&hash)
-                    .map_err(|error| errno(&error))?;
+                    .map_err(|error| error.code())?;
             if !known_durable {
                 self.cache
                     .insert(&hash, &data, ChunkState::Dirty)
-                    .map_err(|_| libc::ENOSPC)?;
+                    .map_err(|_| Code::NoSpace)?;
                 self.meta
                     .add_pending_upload(&hash, ino)
-                    .map_err(|error| errno(&error))?;
+                    .map_err(|error| error.code())?;
                 ws.enrolled.insert(idx);
             }
             ws.staging.release_chunk(idx, self.chunk_size);
@@ -2618,13 +2610,13 @@ impl ConstellationFs {
     /// content — another index with identical bytes, an earlier manifest
     /// of this inode not yet uploaded — are untouched, so that content
     /// still uploads (`Meta::cancel_pending_upload`).
-    fn unseal(&self, ws: &mut WriteState, ino: Ino, idx: u64) -> Result<Option<ChunkHash>, i32> {
+    fn unseal(&self, ws: &mut WriteState, ino: Ino, idx: u64) -> Result<Option<ChunkHash>, Code> {
         let hash = ws.sealed.remove(&idx);
         if let Some(hash) = &hash {
             if ws.enrolled.remove(&idx) {
                 self.meta
                     .cancel_pending_upload(hash, ino)
-                    .map_err(|error| errno(&error))?;
+                    .map_err(|error| error.code())?;
             }
         }
         Ok(hash)
@@ -2633,7 +2625,7 @@ impl ConstellationFs {
     /// Insert content as Dirty unless the local durable-set rung proves
     /// S3 already has it. Returns whether this inode must enrol a
     /// pending row.
-    fn cache_for_upload(&self, hash: &ChunkHash, data: &[u8]) -> Result<bool, i32> {
+    fn cache_for_upload(&self, hash: &ChunkHash, data: &[u8]) -> Result<bool, Code> {
         let known_durable = self
             .cache
             .state_of(hash)
@@ -2641,13 +2633,13 @@ impl ConstellationFs {
             && !self
                 .meta
                 .upload_pending_for_hash(hash)
-                .map_err(|error| errno(&error))?;
+                .map_err(|error| error.code())?;
         if known_durable {
             return Ok(false);
         }
         self.cache
             .insert(hash, data, ChunkState::Dirty)
-            .map_err(|_| libc::ENOSPC)?;
+            .map_err(|_| Code::NoSpace)?;
         Ok(true)
     }
 
@@ -2664,7 +2656,7 @@ impl ConstellationFs {
     /// before publishing this manifest, so a transient reset on a
     /// healed S3 connection does not become application-visible EIO in
     /// local-fsync mode.
-    fn flush_inode(&self, ino: Ino, force_through: bool) -> Result<(), i32> {
+    fn flush_inode(&self, ino: Ino, force_through: bool) -> Result<(), Code> {
         // The inode's operation lock, not its shard lock, is what keeps
         // per-inode request order across the publication: the session is
         // detached from its shard (its size stays visible to `getattr`
@@ -2723,11 +2715,11 @@ impl ConstellationFs {
             for hash in &dirty_hashes {
                 self.meta
                     .add_pending_upload(hash, ino)
-                    .map_err(|e| dropped(errno(&e)))?;
+                    .map_err(|e| dropped(e.code()))?;
             }
             self.meta
                 .scratch_set_manifest(ino, &manifest_bytes, ws.file_len)
-                .map_err(|e| dropped(errno(&e)))?;
+                .map_err(|e| dropped(e.code()))?;
             ws.staging.discard();
             return Ok(force_through);
         }
@@ -2756,7 +2748,7 @@ impl ConstellationFs {
         ws: &WriteState,
         base: &Manifest,
         file_len: u64,
-    ) -> Result<(Vec<u8>, Vec<ChunkHash>), i32> {
+    ) -> Result<(Vec<u8>, Vec<ChunkHash>), Code> {
         let cs = u64::from(self.chunk_size);
         // A manifest's content is valid only below its `file_len`
         // (`replay::clip_manifest`). A clipped *spilled* manifest keeps
@@ -2790,7 +2782,7 @@ impl ConstellationFs {
             if self
                 .meta
                 .upload_pending_for_hash(hash)
-                .map_err(|error| errno(&error))?
+                .map_err(|error| error.code())?
             {
                 dirty_hashes.push(*hash);
             }
@@ -2838,7 +2830,7 @@ impl ConstellationFs {
                 let mut buf = vec![0u8; len];
                 ws.staging
                     .read_at(start, &mut buf)
-                    .map_err(|e| staging_errno(&e))?;
+                    .map_err(|e| staging_code(&e))?;
                 let rel = (start - chunk_start) as usize;
                 data[rel..rel + len].copy_from_slice(&buf);
             }
@@ -3038,7 +3030,7 @@ impl ConstellationFs {
         base: Manifest,
         manifest_bytes: Vec<u8>,
         dirty_hashes: Vec<ChunkHash>,
-    ) -> Result<(), i32> {
+    ) -> Result<(), Code> {
         self.commit_manifest_with_rebase(
             ino,
             ws,
@@ -3118,7 +3110,7 @@ impl ConstellationFs {
         manifest_bytes: Vec<u8>,
         dirty_hashes: Vec<ChunkHash>,
         defer_upload: bool,
-    ) -> Result<(), i32> {
+    ) -> Result<(), Code> {
         self.commit_manifest_with_rebase(
             ino,
             ws,
@@ -3210,7 +3202,7 @@ impl ConstellationFs {
         mut manifest_bytes: Vec<u8>,
         mut dirty_hashes: Vec<ChunkHash>,
         mut attempt_commit: impl FnMut(&Manifest, &[u8], u64, &[ChunkHash]) -> Result<(), MutateFail>,
-    ) -> Result<(), i32> {
+    ) -> Result<(), Code> {
         // A flush that shortened the file relative to its own base is a
         // truncate, and must not be silently re-extended by a peer's
         // length. Any other flush adopts the longer of the two so a
@@ -3226,7 +3218,7 @@ impl ConstellationFs {
             // `None` means whichever node executed the mutation was us,
             // so our own replica already holds the authoritative image.
             base = match current {
-                Some(bytes) => Manifest::decode(&bytes).map_err(|_| libc::EIO)?,
+                Some(bytes) => Manifest::decode(&bytes).map_err(|_| Code::Io)?,
                 None => self.load_manifest(ino)?,
             };
             file_len = if truncates {
@@ -3253,7 +3245,7 @@ impl ConstellationFs {
             attempts = MANIFEST_COMMIT_ATTEMPTS,
             "manifest commit kept losing its base; giving up"
         );
-        Err(libc::EAGAIN)
+        Err(Code::Again)
     }
 }
 
@@ -3285,8 +3277,8 @@ impl crate::locks::LockFlush for ConstellationFs {
             .flush_inode(ino, true)
             .and_then(|()| self.drain_inode(ino))
             .and_then(|()| self.sync_barrier(ino));
-        if let Err(errno) = r {
-            tracing::warn!(target: "constellation::locks", ino, errno, "flush before a lock release failed");
+        if let Err(code) = r {
+            tracing::warn!(target: "constellation::locks", ino, %code, "flush before a lock release failed");
         }
         r.is_ok()
     }
@@ -3389,18 +3381,18 @@ impl ConstellationFs {
         mode: u32,
         flags: i32,
         caller: &Caller,
-    ) -> Result<(FileAttr, bool), i32> {
+    ) -> Result<(FileAttr, bool), Code> {
         let excl = flags & libc::O_EXCL != 0;
         let scratch = self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some();
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let ino = self.meta.allocate_ino(parent).map_err(|e| errno(&e))?;
+            let ino = self.meta.allocate_ino(parent).map_err(|e| e.code())?;
             let created = if scratch {
                 self.meta
                     .scratch_create(parent, name, ino, mode, caller.uid, caller.gid)
-                    .map_err(|e| errno(&e))
+                    .map_err(|e| e.code())
             } else {
                 self.mutate_op(
                     parent,
@@ -3416,13 +3408,13 @@ impl ConstellationFs {
                 .and_then(|()| {
                     self.meta
                         .getattr(ino)
-                        .map_err(|e| errno(&e))?
-                        .ok_or(libc::EIO)
+                        .map_err(|e| e.code())?
+                        .ok_or(Code::Io)
                 })
             };
             match created {
                 Ok(attr) => return Ok((attr, true)),
-                Err(libc::EEXIST) if !excl => {
+                Err(Code::Exists) if !excl => {
                     if let Some(attr) = self.open_existing(parent, name, flags, caller, scratch)? {
                         tracing::debug!(
                             parent,
@@ -3434,7 +3426,7 @@ impl ConstellationFs {
                         return Ok((attr, false));
                     }
                     if attempt >= CREATE_OR_OPEN_ATTEMPTS {
-                        return Err(libc::EEXIST);
+                        return Err(Code::Exists);
                     }
                 }
                 Err(e) => return Err(e),
@@ -3444,11 +3436,11 @@ impl ConstellationFs {
 
     /// `setattr(size)` alone — what `ftruncate` and an `O_TRUNC` open
     /// send (`setattr` with only a size does exactly this).
-    fn setattr_size(&self, ino: Ino, size: u64) -> Result<(), i32> {
+    fn setattr_size(&self, ino: Ino, size: u64) -> Result<(), Code> {
         // Plan 30 §M14: a truncation is a write (fenced under a lapsed
         // lock grant).
         if self.lock_fenced(ino) {
-            return Err(libc::EIO);
+            return Err(Code::Io);
         }
         self.truncate(ino, size)?;
         self.mutate_op(
@@ -3474,11 +3466,11 @@ impl ConstellationFs {
         flags: i32,
         caller: &Caller,
         scratch: bool,
-    ) -> Result<Option<FileAttr>, i32> {
+    ) -> Result<Option<FileAttr>, Code> {
         let found = if scratch {
             self.meta
                 .scratch_lookup(parent, name)
-                .map_err(|e| errno(&e))?
+                .map_err(|e| e.code())?
         } else {
             // The lookup's read wait (and under `--cto strict` its
             // freshness): the refusal raised this node's read floor to
@@ -3489,18 +3481,18 @@ impl ConstellationFs {
                 Some(name),
                 &[ReadKey::Dentry(parent, name.to_string())],
             );
-            self.meta.lookup(parent, name).map_err(|e| errno(&e))?
+            self.meta.lookup(parent, name).map_err(|e| e.code())?
         };
         let Some(attr) = found else {
             return Ok(None);
         };
         match attr.kind {
             InodeKind::File => {}
-            InodeKind::Dir => return Err(libc::EISDIR),
-            _ => return Err(libc::ESTALE),
+            InodeKind::Dir => return Err(Code::IsDir),
+            _ => return Err(Code::Stale),
         }
         if !caller.may_open(&attr, flags) {
-            return Err(libc::EACCES);
+            return Err(Code::Access);
         }
         let ino = attr.ino;
         if !scratch {
@@ -3514,9 +3506,9 @@ impl ConstellationFs {
         // The current attributes, a pending write's size included (as a
         // lookup reports them).
         let writes = self.writes.lock(ino);
-        let current = match self.meta.getattr(ino).map_err(|e| errno(&e))? {
+        let current = match self.meta.getattr(ino).map_err(|e| e.code())? {
             Some(attr) => Some(attr),
-            None => self.meta.scratch_getattr(ino).map_err(|e| errno(&e))?,
+            None => self.meta.scratch_getattr(ino).map_err(|e| e.code())?,
         };
         let Some(mut attr) = current else {
             return Ok(None);
@@ -3543,6 +3535,58 @@ impl std::ops::Deref for FuseFs {
 }
 
 include!("fusefs_ops.rs");
+
+#[cfg(test)]
+mod reply_code_tests {
+    use super::{reply_code, Code, Errno};
+
+    /// The FUSE boundary answers every errno the adapter produced before
+    /// plan 31 with exactly the same number: each code the workspace uses
+    /// against `fuser`'s own (libc-derived) constant.
+    #[test]
+    fn every_code_the_adapter_uses_leaves_as_its_linux_errno() {
+        let expect = [
+            (Code::NotFound, Errno::ENOENT),
+            (Code::Exists, Errno::EEXIST),
+            (Code::NotEmpty, Errno::ENOTEMPTY),
+            (Code::Stale, Errno::ESTALE),
+            (Code::NoData, Errno::ENODATA),
+            (Code::NoData, Errno::NO_XATTR),
+            (Code::NameTooLong, Errno::ENAMETOOLONG),
+            (Code::NoLock, Errno::ENOLCK),
+            (Code::NotSupported, Errno::EOPNOTSUPP),
+            (Code::NotSupported, Errno::ENOTSUP),
+            (Code::Again, Errno::EAGAIN),
+            (Code::Again, Errno::EWOULDBLOCK),
+            (Code::Intr, Errno::EINTR),
+            (Code::TimedOut, Errno::ETIMEDOUT),
+            (Code::Io, Errno::EIO),
+            (Code::NotDir, Errno::ENOTDIR),
+            (Code::IsDir, Errno::EISDIR),
+            (Code::Invalid, Errno::EINVAL),
+            (Code::ReadOnly, Errno::EROFS),
+            (Code::NoSpace, Errno::ENOSPC),
+            (Code::Access, Errno::EACCES),
+            (Code::Perm, Errno::EPERM),
+            (Code::CrossDevice, Errno::EXDEV),
+            (Code::NoDeviceOrAddress, Errno::ENXIO),
+            (Code::Range, Errno::ERANGE),
+            (Code::NotImplemented, Errno::ENOSYS),
+            (Code::FileTooBig, Errno::EFBIG),
+            (Code::NotConnected, Errno::ENOTCONN),
+            (Code::Busy, Errno::EBUSY),
+            (Code::TooBig, Errno::E2BIG),
+        ];
+        for (code, errno) in expect {
+            assert_eq!(reply_code(code), errno, "{code:?}");
+        }
+        // And no code leaves as something `fuser` would coerce (a
+        // non-positive number becomes EIO there).
+        for &code in Code::ALL {
+            assert_eq!(reply_code(code).code(), code.to_linux_errno(), "{code:?}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod jitter_tests {
@@ -3670,7 +3714,7 @@ mod create_or_open_tests {
         assert_eq!(
             fs.create_or_open(ROOT_INO, "db", 0o100644, libc::O_RDWR | libc::O_EXCL, &ME)
                 .unwrap_err(),
-            libc::EEXIST
+            Code::Exists
         );
         // Nothing else was created under the name.
         assert_eq!(meta.lookup(ROOT_INO, "db").unwrap().unwrap().ino, won.ino);
@@ -3705,16 +3749,24 @@ mod create_or_open_tests {
         let (meta, fs, _dir) = fs();
         meta.mkdir(ROOT_INO, "d", 0o755, 1000, 1000).unwrap();
         meta.symlink(ROOT_INO, "l", "target", 1000, 1000).unwrap();
-        meta.mknod(ROOT_INO, "p", InodeKind::Fifo, 0o644, 1000, 1000, 0)
-            .unwrap();
+        meta.mknod(
+            ROOT_INO,
+            "p",
+            InodeKind::Fifo,
+            0o644,
+            1000,
+            1000,
+            Default::default(),
+        )
+        .unwrap();
         let open = |name: &str| {
             fs.create_or_open(ROOT_INO, name, 0o100644, libc::O_RDWR, &ME)
                 .unwrap_err()
         };
-        assert_eq!(open("d"), libc::EISDIR);
+        assert_eq!(open("d"), Code::IsDir);
         // The kernel walks again (`LOOKUP_REVAL`) and follows or opens it.
-        assert_eq!(open("l"), libc::ESTALE);
-        assert_eq!(open("p"), libc::ESTALE);
+        assert_eq!(open("l"), Code::Stale);
+        assert_eq!(open("p"), Code::Stale);
     }
 
     #[test]
@@ -3733,15 +3785,15 @@ mod create_or_open_tests {
             gid: 3000,
             pid: 0,
         };
-        assert_eq!(open("mine", libc::O_RDONLY, &stranger), Err(libc::EACCES));
+        assert_eq!(open("mine", libc::O_RDONLY, &stranger), Err(Code::Access));
         assert_eq!(open("group-r", libc::O_RDONLY, &ME), Ok(false));
-        assert_eq!(open("group-r", libc::O_RDWR, &ME), Err(libc::EACCES));
+        assert_eq!(open("group-r", libc::O_RDWR, &ME), Err(Code::Access));
         assert_eq!(open("other-r", libc::O_RDONLY, &ME), Ok(false));
-        assert_eq!(open("other-r", libc::O_WRONLY, &ME), Err(libc::EACCES));
+        assert_eq!(open("other-r", libc::O_WRONLY, &ME), Err(Code::Access));
         // O_TRUNC needs write permission even on a read-only open.
         assert_eq!(
             open("other-r", libc::O_RDONLY | libc::O_TRUNC, &ME),
-            Err(libc::EACCES)
+            Err(Code::Access)
         );
         let root = Caller {
             uid: 0,
@@ -3876,7 +3928,7 @@ mod quota_tests {
         ConstellationFs::invalidate_quota_cache(&fs.quota_cache);
         assert!(fs.quota_check(f.ino, 90).is_ok());
         assert!(fs.quota_check(f.ino, 100).is_ok());
-        assert_eq!(fs.quota_check(f.ino, 101).unwrap_err(), libc::ENOSPC);
+        assert_eq!(fs.quota_check(f.ino, 101).unwrap_err(), Code::NoSpace);
         // Shrinking never grows past the cap: pending growth is zero once
         // the intended length is at or below the committed size.
         assert!(fs.quota_check(f.ino, 10).is_ok());
@@ -3901,7 +3953,7 @@ mod quota_tests {
         assert!(fs.quota_check(f.ino, 60).is_ok());
         // Growing to 100 fits exactly; 101 does not.
         assert!(fs.quota_check(f.ino, 100).is_ok());
-        assert_eq!(fs.quota_check(f.ino, 101).unwrap_err(), libc::ENOSPC);
+        assert_eq!(fs.quota_check(f.ino, 101).unwrap_err(), Code::NoSpace);
     }
 
     #[test]

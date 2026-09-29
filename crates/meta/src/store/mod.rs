@@ -506,7 +506,7 @@ pub struct Meta {
     /// ino-prefix range to draw blocks from.
     pub(crate) ino_alloc: SingleWriterTxKeyspace,
     /// Plan 30 §M2: `Rid::to_key() -> position(8 BE) ++
-    /// recorded_at_ms(8 BE)`, plus `ROW_TAG_REFUSED ++ errno(4 BE)` for a
+    /// recorded_at_ms(8 BE)`, plus `ROW_TAG_REFUSED ++ code(2 BE)` for a
     /// refused rid (`encode_completed_row`, `encode_refused_row`); position
     /// 0 means the outcome came from the log. Node-local
     /// and replicated-but-unpublished, like `spec`/`pins`/`epochs` —
@@ -812,7 +812,7 @@ impl Meta {
                 size: 0,
                 mtime_ns: t,
                 ctime_ns: t,
-                rdev: 0,
+                rdev: constellation_types::Rdev::default(),
             };
             // Genesis (plan 29 M2): a brand-new filesystem has no commit
             // to bootstrap from, so the root inode's own creation has to
@@ -1095,7 +1095,7 @@ impl Meta {
     ///
     /// Plan 30 §M13: an *executed* rid only. A rid the log refused
     /// (`LogRecord::Refused`, inbox path) has a `completed` row too but
-    /// answers `None` here and `Some(errno)` from [`Self::refused_errno`];
+    /// answers `None` here and `Some(code)` from [`Self::refused_code`];
     /// every dedup site asks both (`Self::completed_outcome`).
     pub fn completed_position(&self, rid: crate::rid::Rid) -> Result<Option<u64>, MetaError> {
         Ok(match self.completed_outcome(rid)? {
@@ -1119,12 +1119,17 @@ impl Meta {
 
     /// Plan 30 §M13: a `completed` row for a rid the log *refused*:
     /// the executed row's 16 bytes (so retention reads the same
-    /// `recorded_at`), then an outcome tag `1` and the errno. An executed
+    /// `recorded_at`), then an outcome tag `1` and the refusal's portable
+    /// [`constellation_types::Code`] wire number (plan 31 §7). An executed
     /// row is exactly 16 bytes; anything longer with tag `1` is a refusal.
-    pub(crate) fn encode_refused_row(position: u64, recorded_at_ms: i64, errno: i32) -> Vec<u8> {
+    pub(crate) fn encode_refused_row(
+        position: u64,
+        recorded_at_ms: i64,
+        code: constellation_types::Code,
+    ) -> Vec<u8> {
         let mut v = Self::encode_completed_row(position, recorded_at_ms);
         v.push(inbox::ROW_TAG_REFUSED);
-        v.extend_from_slice(&errno.to_be_bytes());
+        v.extend_from_slice(&code.to_wire().to_be_bytes());
         v
     }
 

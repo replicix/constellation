@@ -300,7 +300,7 @@ mod tests {
             atime_ns: atime,
             mtime_ns: mtime,
             ctime_ns: ctime,
-            rdev: 0,
+            rdev: Default::default(),
         }
     }
 

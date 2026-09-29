@@ -12,6 +12,7 @@
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::{ChunkHash, ChunkInfo, ChunkLayout, Ino, Manifest};
 use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, PublishBasis, TouchSet};
+use constellation_types::Code;
 use std::collections::BTreeMap;
 
 fn manifest_naming(hash: ChunkHash, len: u64) -> Vec<u8> {
@@ -287,7 +288,7 @@ fn drop_held_turns_the_seed_into_a_conflict_copy_and_replays_the_rest() {
     // requester's shadow of it rolls back on it).
     let recs = records(&batch(&s.meta));
     assert!(
-        matches!(recs.as_slice(), [LogRecord::Refused { rid, errno: 5 }] if *rid == seed.rid),
+        matches!(recs.as_slice(), [LogRecord::Refused { rid, code: Code::Io }] if *rid == seed.rid),
         "{recs:?}"
     );
     assert!(
@@ -371,7 +372,7 @@ fn drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk() {
     // shadow of it is rolled back by it, and a retry by rid is refused.
     let recs = records(&batch(&meta));
     assert!(
-        matches!(recs.as_slice(), [LogRecord::Refused { rid, errno: 5 }] if *rid == queued[0].rid),
+        matches!(recs.as_slice(), [LogRecord::Refused { rid, code: Code::Io }] if *rid == queued[0].rid),
         "{recs:?}"
     );
     assert!(meta.drop_held_remote(file, 1).is_err(), "nothing left");
@@ -402,7 +403,7 @@ fn a_refusal_that_observed_a_deferred_transactions_keys_is_deferred_with_it() {
     // under that name: it looked at the file's inode.
     meta.journal_refusal(
         rid(1),
-        17,
+        Code::Exists,
         Some(&MutateOp::Link {
             ino: file,
             parent: ROOT_INO,
@@ -413,7 +414,7 @@ fn a_refusal_that_observed_a_deferred_transactions_keys_is_deferred_with_it() {
     // Refused on a name nothing deferred touched.
     meta.journal_refusal(
         rid(2),
-        2,
+        Code::NotFound,
         Some(&MutateOp::Unlink {
             parent: ROOT_INO,
             name: "missing".into(),

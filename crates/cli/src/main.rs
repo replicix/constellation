@@ -54,6 +54,7 @@ use clap::{Parser, Subcommand};
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::Meta;
 use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
+use constellation_types::Code;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -1918,7 +1919,7 @@ fn take_state_dir_lock(state_dir: &Path) -> Result<LockOutcome> {
         Ok(LockOutcome::BecomeDaemon)
     } else {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if Code::from_io_error(&err) == Code::Again {
             Ok(LockOutcome::Attach)
         } else {
             Err(err).context("locking daemon.lock")
@@ -3922,8 +3923,8 @@ fn xattr_get(path: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {
     let size = unsafe { libc::getxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         let err = std::io::Error::last_os_error();
-        return match err.raw_os_error() {
-            Some(libc::ENODATA) => Ok(None),
+        return match Code::from_io_error(&err) {
+            Code::NoData => Ok(None),
             _ => Err(err.into()),
         };
     }

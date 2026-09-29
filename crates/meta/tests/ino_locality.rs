@@ -183,7 +183,7 @@ fn measure_directory_local_setattr_amplification_old_vs_new_allocator() {
             size: 0,
             mtime_ns,
             ctime_ns: mtime_ns,
-            rdev: 0,
+            rdev: Default::default(),
         };
         InodeRecord::new(attrs).encode()
     }

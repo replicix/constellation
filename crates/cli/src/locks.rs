@@ -47,6 +47,7 @@ use constellation_fs_core::Ino;
 use constellation_meta::locks::{Grant, GrantId, LocalLock, LocalOutcome, LockMode};
 use constellation_meta::{JournalPos, Meta, Position, ReadKey};
 use constellation_net::{LockOutcomeWire, LockRenewResultWire, LockRenewWire, LockTestOutcomeWire};
+use constellation_types::Code;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -245,10 +246,14 @@ impl ClusterLocks {
         reply: fuser::ReplyEmpty,
         watch: crate::fuse_watch::Watched,
     ) {
-        fn answer(r: Result<(), i32>, reply: fuser::ReplyEmpty, watch: crate::fuse_watch::Watched) {
+        fn answer(
+            r: Result<(), Code>,
+            reply: fuser::ReplyEmpty,
+            watch: crate::fuse_watch::Watched,
+        ) {
             match r {
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(fuser::Errno::from_i32(e)),
+                Err(e) => reply.error(crate::fusefs::reply_code(e)),
             }
             drop(watch);
         }
@@ -271,20 +276,20 @@ impl ClusterLocks {
         }
     }
 
-    fn set(&self, ino: Ino, lock: LocalLock, sleep: bool) -> Result<(), i32> {
+    fn set(&self, ino: Ino, lock: LocalLock, sleep: bool) -> Result<(), Code> {
         let mut rounds = 0u32;
         loop {
             match self.meta.locks().local_set(ino, lock, now_ms()) {
                 LocalOutcome::Done => return Ok(()),
                 LocalOutcome::Conflict(_) => {
                     if !sleep {
-                        return Err(libc::EAGAIN);
+                        return Err(Code::Again);
                     }
                     std::thread::sleep(LOCAL_POLL);
                 }
                 LocalOutcome::NeedGrant(mode) => {
                     if !sleep && rounds >= TRY_ROUNDS {
-                        return Err(libc::EAGAIN);
+                        return Err(Code::Again);
                     }
                     if rounds >= 2 {
                         // A grant that keeps being overtaken by recalls:
@@ -302,18 +307,18 @@ impl ClusterLocks {
                             blocking: sleep,
                             reply,
                         })
-                        .map_err(|_| libc::EIO)?;
-                    match answer.blocking_recv().map_err(|_| libc::EIO)? {
+                        .map_err(|_| Code::Io)?;
+                    match answer.blocking_recv().map_err(|_| Code::Io)? {
                         LockAnswer::Granted { position } => self.granted(ino, &position),
                         LockAnswer::WouldBlock => {
                             if !sleep {
-                                return Err(libc::EAGAIN);
+                                return Err(Code::Again);
                             }
                             // The owner parks blocking requests, so this
                             // is a race with a recall; ask again shortly.
                             std::thread::sleep(LOCAL_POLL);
                         }
-                        LockAnswer::Unavailable => return Err(libc::ENOLCK),
+                        LockAnswer::Unavailable => return Err(Code::NoLock),
                     }
                 }
             }

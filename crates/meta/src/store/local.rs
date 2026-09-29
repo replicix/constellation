@@ -454,12 +454,12 @@ impl Meta {
         // A delegate's refusal (see `delegate_refusal`) is a `Refused`
         // row of its own: journaled here the same way, under the
         // stream's origin.
-        if let [LogRecord::Refused { rid: r, errno }] = records {
+        if let [LogRecord::Refused { rid: r, code }] = records {
             if self.completed_position(*r)?.is_some() {
                 return Ok(false);
             }
             let _d = journal::PendingDelegate::set(gen, Some(idx), deps);
-            self.journal_refusal(*r, *errno, None)?;
+            self.journal_refusal(*r, *code, None)?;
             self.note_log_idx(gen, idx)?;
             return Ok(true);
         }
@@ -502,16 +502,16 @@ impl Meta {
     /// Plan 30 §M11: a delegate's refusal of `rid` (plan 30 §M9's
     /// journaled `Refused` row), as the next transaction of stream
     /// `gen` — the root appends it like any other, so a retry by rid
-    /// anywhere finds the same errno. Returns the stream index.
+    /// anywhere finds the same code. Returns the stream index.
     pub fn delegate_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: constellation_types::Code,
         gen: u64,
         deps: crate::session::Position,
     ) -> Result<u64, MetaError> {
         let _d = journal::PendingDelegate::set(gen, None, deps);
-        self.journal_refusal(rid, errno, None)?;
+        self.journal_refusal(rid, code, None)?;
         self.delegate_idx(gen)
     }
 
@@ -872,7 +872,7 @@ impl Meta {
             // transaction's own rows, in order.
             for rec in records {
                 match rec {
-                    LogRecord::Refused { rid, errno } => {
+                    LogRecord::Refused { rid, code } => {
                         let seq = journal::append_tx(
                             &mut tx,
                             &self.journal_ks,
@@ -884,7 +884,7 @@ impl Meta {
                         tx.insert(
                             &self.completed,
                             rid.to_key(),
-                            Meta::encode_refused_row(seq, now_ms, *errno),
+                            Meta::encode_refused_row(seq, now_ms, *code),
                         );
                     }
                     LogRecord::InboxAck { .. } => {

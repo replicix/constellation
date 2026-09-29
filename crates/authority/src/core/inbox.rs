@@ -39,6 +39,7 @@ use constellation_meta::{InboxAck, MetaError, MutateOp, Rid};
 use constellation_store_s3::inbox::{
     gc_keep_newest, InboxBatch, InboxKey, InboxOp, InboxRid, PollBackoff, MAX_OPS_PER_BATCH,
 };
+use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
 /// PUT attempts per batch before the waiters are told the inbox is
@@ -1521,14 +1522,9 @@ impl Core {
                             );
                             return Err(Halt::Recall);
                         }
-                        super::delegate::RecallPlan::Refuse(errno) => {
+                        super::delegate::RecallPlan::Refuse(code) => {
                             // Phase 2b: a designation is involved.
-                            replica.journal_inbox_refusal(
-                                rid,
-                                errno,
-                                ack,
-                                decoded.as_ref().ok(),
-                            )?;
+                            replica.journal_inbox_refusal(rid, code, ack, decoded.as_ref().ok())?;
                             self.stats.inbox_refused_ops += 1;
                             continue;
                         }
@@ -1559,12 +1555,11 @@ impl Core {
                 Err(MetaError::Conflict) => {
                     // A stale manifest base: `ESTALE` on the log, and the
                     // requester rebases from its own replica.
-                    replica.journal_inbox_refusal(rid, libc::ESTALE, ack, decoded.as_ref().ok())?;
+                    replica.journal_inbox_refusal(rid, Code::Stale, ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }
                 Err(error) => {
-                    let errno = super::client::meta_errno(&error);
-                    replica.journal_inbox_refusal(rid, errno, ack, decoded.as_ref().ok())?;
+                    replica.journal_inbox_refusal(rid, error.code(), ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }
             }

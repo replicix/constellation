@@ -872,7 +872,7 @@ impl AuthorityModel {
             return;
         }
         // Plan 30 §M13 (D1): `recovery::replay_locally` answers a rid a
-        // holder refused through its inbox from `refused_errno` — an
+        // holder refused through its inbox from `refused_code` — an
         // outcome, not a re-evaluation; a deposed holder's replay then
         // ends as a conflict copy, as a refused P2P replay would.
         if self.inbox && crate::inbox::rid_refused(s, id, rid, self.inbox_record_refusals).is_some()
@@ -1809,7 +1809,7 @@ impl Model for AuthorityModel {
                 };
                 // Plan 30 §M13 (D1): a rid a holder refused through its
                 // inbox is an outcome in the log, and `holder_execute`
-                // answers it from `refused_errno` right after its
+                // answers it from `refused_code` right after its
                 // `completed_position` check — also for a deposed
                 // holder's replay of that rid, which then lands as a
                 // conflict copy rather than a second decision (model

@@ -1032,6 +1032,7 @@ dependencies = [
  "constellation-mtree",
  "constellation-net",
  "constellation-store-s3",
+ "constellation-types",
  "constellation-upload-concurrency",
  "fjall",
  "fuser",
@@ -1058,6 +1059,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "constellation-types",
  "futures",
  "mime_guess",
  "rust-embed",
@@ -1080,9 +1082,11 @@ dependencies = [
  "constellation-fs-core",
  "constellation-meta",
  "constellation-mtree",
+ "constellation-net",
  "constellation-store-s3",
+ "constellation-types",
  "futures",
- "libc",
+ "iroh",
  "object_store",
  "postcard",
  "rand 0.9.5",
@@ -1102,6 +1106,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "constellation-types",
  "libc",
  "rand 0.9.5",
  "serde",
@@ -1118,6 +1123,7 @@ version = "1.0.0"
 dependencies = [
  "blake3",
  "bytes",
+ "constellation-types",
  "region",
  "serde",
  "tempfile",
@@ -1135,6 +1141,7 @@ dependencies = [
  "constellation-chaos",
  "constellation-meta",
  "constellation-store-s3",
+ "constellation-types",
  "fjall",
  "libc",
  "object_store",
@@ -1157,6 +1164,7 @@ dependencies = [
  "blake3",
  "constellation-fs-core",
  "constellation-mtree",
+ "constellation-types",
  "fjall",
  "log",
  "postcard",
@@ -1179,6 +1187,7 @@ name = "constellation-mtree"
 version = "1.0.0"
 dependencies = [
  "blake3",
+ "constellation-types",
  "rand 0.9.5",
  "thiserror 2.0.20",
 ]
@@ -1231,6 +1240,16 @@ dependencies = [
  "uuid",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "constellation-types"
+version = "1.0.0"
+dependencies = [
+ "libc",
+ "postcard",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

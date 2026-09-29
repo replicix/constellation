@@ -16,6 +16,7 @@ use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
     execute_mutate, LogRecord, Meta, MetaStore, MutateOp, PublishBasis, Rid, TouchSet,
 };
+use constellation_types::Code;
 
 const HOLDER: u64 = 7;
 
@@ -295,7 +296,7 @@ fn a_hint_whose_refusal_was_streamed_first_is_not_installed() {
     let seg1 = [create("f2", a, t0 + 10), create("f3", b, t0 + 11)];
     let refused = LogRecord::Refused {
         rid: requester,
-        errno: 17,
+        code: Code::Exists,
     };
     let rename = LogRecord::Rename {
         parent: ROOT_INO,
@@ -1003,7 +1004,7 @@ fn an_adopted_tails_refusal_and_inbox_ack_are_journaled() {
     meta.apply_adopted_records(
         &[LogRecord::Refused {
             rid: refused,
-            errno: 17,
+            code: Code::Exists,
         }],
         None,
     )
@@ -1028,12 +1029,12 @@ fn an_adopted_tails_refusal_and_inbox_ack_are_journaled() {
     );
     assert!(rows.contains(&LogRecord::Refused {
         rid: refused,
-        errno: 17
+        code: Code::Exists
     }));
     assert!(rows.contains(&ack));
     assert!(matches!(
         meta.completed_outcome(refused).unwrap(),
-        Some(constellation_meta::CompletedOutcome::Refused { errno: 17 })
+        Some(constellation_meta::CompletedOutcome::Refused { code: Code::Exists })
     ));
 }
 
@@ -1515,7 +1516,15 @@ fn a_refused_rid_in_the_log_rolls_its_shadow_back_without_a_replay() {
         .install_shadow(r, 1, &create_op("b", ino(91)), &records)
         .unwrap());
     assert!(MetaStore::lookup(&meta, ROOT_INO, "b").unwrap().is_some());
-    apply(&meta, 2, 1, &[LogRecord::Refused { rid: r, errno: 5 }]);
+    apply(
+        &meta,
+        2,
+        1,
+        &[LogRecord::Refused {
+            rid: r,
+            code: Code::Io,
+        }],
+    );
     assert!(
         MetaStore::lookup(&meta, ROOT_INO, "b").unwrap().is_none(),
         "the shadow's effect was kept although the log refused its rid"

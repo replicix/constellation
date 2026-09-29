@@ -28,6 +28,7 @@
 //! takeover is of a process the kernel has already killed.
 
 use anyhow::{bail, Context, Result};
+use constellation_types::Code;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -336,7 +337,7 @@ fn takeover_mutex(state_dir: &Path) -> Result<std::fs::File> {
             return Ok(file);
         }
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        if Code::from_io_error(&err) != Code::Again {
             return Err(err).context("locking the takeover mutex");
         }
         if Instant::now() >= deadline {

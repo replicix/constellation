@@ -45,6 +45,7 @@ use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{
     ChunkStore, CompressionSetting, LeaseMode, LeaseStore, LogStore, StoreError,
 };
+use constellation_types::Code;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1166,7 +1167,7 @@ impl Driver {
                     Ok(op) => op,
                     Err(_) => {
                         let _ = reply.send((
-                            MutateOutcome::Errno(libc::EINVAL),
+                            MutateOutcome::Errno(Code::Invalid),
                             None,
                             Position::ZERO,
                             0,
@@ -1192,7 +1193,7 @@ impl Driver {
                         {
                             tracing::warn!(%error, ino, "could not await a forwarded manifest's chunks");
                             let _ = reply.send((
-                                MutateOutcome::Errno(libc::EIO),
+                                MutateOutcome::Errno(Code::Io),
                                 None,
                                 Position::ZERO,
                                 0,
@@ -2568,7 +2569,7 @@ impl Driver {
                             from: to,
                             msg: PeerMsg::MutateReply {
                                 req,
-                                outcome: MutateOutcome::Errno(libc::EINVAL),
+                                outcome: MutateOutcome::Errno(Code::Invalid),
                                 base: None,
                                 position: Position::ZERO,
                                 gen: 0,

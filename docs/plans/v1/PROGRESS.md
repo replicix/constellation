@@ -27725,3 +27725,33 @@ census confirms exactly those. Notes:
 - [ ] Baseline numbers (harness `bench`, meta-bench, fio-latency,
   pjdfstest, full-matrix `--results-json`) — pending, measured in the
   final gate run against `99472fa`
+
+## Plan 31 C1 — `constellation-types`: portable `Code` errno and `Rdev`
+
+| Item | State | Where |
+|---|---|---|
+| `Code`: `#[repr(u16)]`, fixed wire discriminants (63 variants), one `codes!` table for wire/POSIX name/Linux/Darwin | DONE | `crates/types/src/errno.rs` |
+| Linux and Darwin `Code ↔ i32` tables, `to_native`/`from_native`, `from_io_error`, exact `try_from_*`/`from_os_error` for test clients | DONE | `crates/types/src/errno.rs` |
+| `Rdev { major, minor }`; glibc `makedev` and FUSE `new_encode_dev` conversions | DONE | `crates/types/src/rdev.rs` |
+| `MutateOutcome::Errno(Code)`, `LogRecord::Refused { rid, code }`, refused-row encoding carries the wire number | DONE | `crates/meta/src/{mutate,record}.rs`, `crates/meta/src/store/*` |
+| `MetaError::code()` — the one meta→`Code` mapping (replaces cli `errno()` and authority `meta_errno`) | DONE | `crates/meta/src/error.rs` |
+| authority refusal/`ESTALE` sites carry `Code`; `libc` dropped from authority | DONE | `crates/authority/src/**` |
+| FUSE boundary: `reply_code(Code) -> fuser::Errno`, the only Linux conversion in the adapter | DONE | `crates/cli/src/fusefs.rs` |
+| rdev portable on the wire, in the journal and in the mtree inode record (same 49-byte layout) | DONE | `crates/{fs-core,meta,mtree,api}` |
+| harness/chaos compare `Code`, not `libc::E*` | DONE | `crates/harness/src/scenarios*`, `crates/chaos/src/{op,elle}.rs` |
+
+Wire-format break (plan 31 §2): pre-plan-31 buckets and state dirs are not
+migrated. `grep -rn 'libc::E[A-Z]' crates/` now hits only the libc
+cross-check tests inside `crates/types/src/errno.rs`. The Windows
+library-crate cross-check of `constellation-authority` now passes (removed
+from `tools/check-cross-known-failures.txt`).
+
+### Plan 31 C1 exit criteria
+
+- [x] Round-trip test per table entry (wire, Linux, Darwin), serde postcard/JSON
+- [x] Golden test: `Code::NotEmpty` → wire 3 → Linux 39 / Darwin 66
+- [x] In-process two-node test (`authority` `core::tests::portable_codes`):
+  refusals cross the signed postcard P2P envelope as `Code` wire numbers
+- [x] FUSE parity test: every `Code` the adapter produces equals fuser's `Errno::E*`
+- [x] Zero `libc::E*` outside the conversion module
+- [ ] Full gates — run once at the end of the plan-31 run

@@ -300,7 +300,9 @@ pub struct InspectStatus {
     pub atime_ns: i64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
-    pub rdev: u64,
+    /// Plan 31 §7: the portable `(major, minor)` pair, never an OS's
+    /// packed `dev_t`.
+    pub rdev: constellation_types::Rdev,
     #[serde(default)]
     pub manifest: Option<ManifestStatus>,
 }

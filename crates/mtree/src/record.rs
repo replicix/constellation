@@ -72,6 +72,7 @@
 
 use crate::keys::Key;
 use crate::node::Agg;
+use constellation_types::Rdev;
 
 /// A whole xattr set at or below this many encoded bytes lives in the
 /// inode record; above it, every name moves to its own `0x03` key
@@ -197,11 +198,14 @@ pub struct Attrs {
     pub size: u64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
-    /// Device number for block and char devices, 0 otherwise.
-    pub rdev: u64,
+    /// Device number for block and char devices, `(0, 0)` otherwise.
+    /// Portable `(major, minor)` (plan 31 §7), encoded as two
+    /// little-endian `u32`s in the 8 bytes the field always had.
+    pub rdev: Rdev,
 }
 
-/// kind(1) + mode/uid/gid/nlink(4×4) + size/mtime/ctime/rdev(4×8).
+/// kind(1) + mode/uid/gid/nlink(4×4) + size/mtime/ctime(3×8) +
+/// rdev major/minor(2×4).
 ///
 /// Pinned by `the_attr_encoding_is_pinned`, which is the guard on the
 /// atime rule: adding a tenth field moves this number and fails the
@@ -218,7 +222,8 @@ impl Attrs {
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&self.mtime_ns.to_le_bytes());
         out.extend_from_slice(&self.ctime_ns.to_le_bytes());
-        out.extend_from_slice(&self.rdev.to_le_bytes());
+        out.extend_from_slice(&self.rdev.major.to_le_bytes());
+        out.extend_from_slice(&self.rdev.minor.to_le_bytes());
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -244,7 +249,7 @@ impl Attrs {
                 size: i64at(17) as u64,
                 mtime_ns: i64at(25),
                 ctime_ns: i64at(33),
-                rdev: i64at(41) as u64,
+                rdev: Rdev::new(u32at(41), u32at(45)),
             },
             &buf[ATTRS_LEN..],
         ))
@@ -823,7 +828,7 @@ mod tests {
             size: 1 << 33,
             mtime_ns: -5,
             ctime_ns: 1_700_000_000_000_000_000,
-            rdev: 0,
+            rdev: Rdev::default(),
         }
     }
 
@@ -842,11 +847,17 @@ mod tests {
             size: 0,
             mtime_ns: 0,
             ctime_ns: 0,
-            rdev: 0,
+            rdev: Rdev::new(0x0a0b_0c0d, 0x1112_1314),
         }
         .encode();
         assert_eq!(encoded.len(), ATTRS_LEN);
         assert_eq!(&encoded[0..5], &[0x02, 0x04, 0x03, 0x02, 0x01]);
+        // Plan 31 §7: rdev is the portable pair, major then minor, each
+        // little-endian, in the 8 bytes that held Linux `makedev` before.
+        assert_eq!(
+            &encoded[41..49],
+            &[0x0d, 0x0c, 0x0b, 0x0a, 0x14, 0x13, 0x12, 0x11]
+        );
         assert_eq!(DENTRY_LEN, 57);
     }
 
@@ -858,7 +869,7 @@ mod tests {
                 mtime_ns: -1_234_567_890,
                 ctime_ns: i64::MIN,
                 size: u64::MAX,
-                rdev: u64::MAX,
+                rdev: Rdev::new(u32::MAX, 0x0102_0304),
                 ..attrs()
             };
             assert_eq!(Attrs::decode(&a.encode()).unwrap(), a);

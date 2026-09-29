@@ -20,6 +20,7 @@ use crate::client::Client;
 use crate::reqlog::CountingProxy;
 use crate::s3env::BUCKET;
 use anyhow::{Context, Result};
+use constellation_types::Code;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1673,17 +1674,16 @@ pub fn designation_as_delegation(_seed: u64) -> Result<()> {
         )?;
         let (names_cut, lat_cut) = write_files(b, "site", "cut", 10)?;
         let refused = match std::fs::write(c.mnt.join("site/c-during-cut"), b"x") {
-            Err(e) => e.raw_os_error(),
+            Err(e) => Code::from_os_error(&e),
             Ok(()) => None,
         };
         eprintln!(
-            "    {NAME}: b isolated: its writes {}; c's write under /site -> {:?} (EROFS {})",
+            "    {NAME}: b isolated: its writes {}; c's write under /site -> {:?} (want EROFS)",
             dist(lat_cut),
             refused,
-            libc::EROFS
         );
         anyhow::ensure!(
-            refused == Some(libc::EROFS),
+            refused == Some(Code::ReadOnly),
             "c's write under the isolated designation: {refused:?}"
         );
         let da = deleg_of(a)?;

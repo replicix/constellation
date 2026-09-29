@@ -10,6 +10,7 @@ default = []
 web = ["dep:axum", "dep:rust-embed", "dep:mime_guess", "dep:futures", "dep:bytes"]
 
 [dependencies]
+constellation-types.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

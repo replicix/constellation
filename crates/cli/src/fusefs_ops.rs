@@ -8,7 +8,7 @@ macro_rules! checked_name {
     ($name:expr, $reply:expr) => {{
         let n = $name.to_string_lossy();
         if n.as_bytes().len() > NAME_MAX {
-            $reply.error(Errno::from_i32(libc::ENAMETOOLONG));
+            $reply.error(reply_code(Code::NameTooLong));
             return;
         }
         n
@@ -22,11 +22,11 @@ macro_rules! checked_name {
 macro_rules! gate {
     ($self:expr, $ino:expr, $reply:expr) => {
         if ConstellationFs::is_synthetic($ino) {
-            $reply.error(Errno::from_i32(libc::EROFS));
+            $reply.error(reply_code(Code::ReadOnly));
             return;
         }
         if let Err(e) = $self.require_lease_for($ino) {
-            $reply.error(Errno::from_i32(e));
+            $reply.error(reply_code(e));
             return;
         }
     };
@@ -72,7 +72,7 @@ impl Filesystem for FuseFs {
             }
             Ok(None) => {}
             Err(error) => {
-                reply.error(Errno::from_i32(error));
+                reply.error(reply_code(error));
                 return;
             }
         }
@@ -93,7 +93,7 @@ impl Filesystem for FuseFs {
             }
             Ok(_) => {}
             Err(e) => {
-                reply.error(Errno::from_i32(errno(&e)));
+                reply.error(reply_code(e.code()));
                 return;
             }
         }
@@ -126,8 +126,8 @@ impl Filesystem for FuseFs {
                 drop(writes);
                 reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0))
             }
-            Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Ok(None) => reply.error(reply_code(Code::NotFound)),
+            Err(e) => reply.error(reply_code(e.code())),
         }
     }
 
@@ -138,7 +138,7 @@ impl Filesystem for FuseFs {
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                reply.error(Errno::from_i32(libc::ESTALE));
+                reply.error(reply_code(Code::Stale));
             } else {
                 let attr = self.visible_attr(self.synthetic_attr(ino, &node));
                 reply.attr(self.ttl(), &to_fuse_attr(&attr));
@@ -160,16 +160,13 @@ impl Filesystem for FuseFs {
         self.session_wait(&[ReadKey::Ino(ino)]);
         let writes = self.writes.lock(ino);
         crate::fuse_watch::stage("meta read");
-        let attr = self
-            .meta
-            .getattr(ino)
-            .and_then(|attr| {
-                if attr.is_some() {
-                    Ok(attr)
-                } else {
-                    self.meta.scratch_getattr(ino)
-                }
-            });
+        let attr = self.meta.getattr(ino).and_then(|attr| {
+            if attr.is_some() {
+                Ok(attr)
+            } else {
+                self.meta.scratch_getattr(ino)
+            }
+        });
         match attr {
             Ok(Some(mut attr)) => {
                 // Pending writes shadow the committed size (a session
@@ -185,8 +182,8 @@ impl Filesystem for FuseFs {
                 };
                 reply.attr(self.ttl(), &to_fuse_attr(&attr))
             }
-            Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Ok(None) => reply.error(reply_code(Code::NotFound)),
+            Err(e) => reply.error(reply_code(e.code())),
         }
     }
 
@@ -226,12 +223,12 @@ impl Filesystem for FuseFs {
             // Plan 30 §M14: a truncation is a write (fenced under a
             // lapsed lock grant).
             if self.lock_fenced(ino) {
-                reply.error(Errno::from_i32(libc::EIO));
+                reply.error(reply_code(Code::Io));
                 return;
             }
             self.lock_discard_tainted(ino);
             if let Err(error) = self.truncate(ino, new_size) {
-                reply.error(Errno::from_i32(error));
+                reply.error(reply_code(error));
                 return;
             }
         }
@@ -251,12 +248,12 @@ impl Filesystem for FuseFs {
             .and_then(|()| {
                 self.meta
                     .getattr(ino)
-                    .map_err(|error| errno(&error))?
-                    .ok_or(libc::ENOENT)
+                    .map_err(|error| error.code())?
+                    .ok_or(Code::NotFound)
             });
         match result {
             Ok(attr) => reply.attr(self.ttl(), &to_fuse_attr(&attr)),
-            Err(error) => reply.error(Errno::from_i32(error)),
+            Err(error) => reply.error(reply_code(error)),
         }
     }
 
@@ -266,7 +263,7 @@ impl Filesystem for FuseFs {
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                reply.error(Errno::from_i32(libc::ESTALE));
+                reply.error(reply_code(Code::Stale));
             } else if let SyntheticNode::Frozen {
                 kind: InodeKind::Symlink,
                 target: Some(target),
@@ -275,15 +272,15 @@ impl Filesystem for FuseFs {
             {
                 reply.data(target.as_bytes());
             } else {
-                reply.error(Errno::from_i32(libc::EINVAL));
+                reply.error(reply_code(Code::Invalid));
             }
             return;
         }
         self.session_wait(&[ReadKey::Ino(ino)]);
         match self.meta.readlink(ino) {
             Ok(Some(target)) => reply.data(target.as_bytes()),
-            Ok(None) => reply.error(Errno::from_i32(libc::EINVAL)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Ok(None) => reply.error(reply_code(Code::Invalid)),
+            Err(e) => reply.error(reply_code(e.code())),
         }
     }
 
@@ -303,7 +300,7 @@ impl Filesystem for FuseFs {
         let name = checked_name!(name, reply);
         let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
-            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => return reply.error(reply_code(e.code())),
         };
         if self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some()
@@ -313,7 +310,7 @@ impl Filesystem for FuseFs {
                 .scratch_mkdir(parent, &name, ino, mode, req.uid(), req.gid())
             {
                 Ok(attr) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
-                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+                Err(e) => reply.error(reply_code(e.code())),
             };
         }
         let op = constellation_meta::MutateOp::Mkdir {
@@ -326,11 +323,13 @@ impl Filesystem for FuseFs {
         };
         match self.mutate_op(parent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
-                Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
-                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+                Ok(Some(attr)) => {
+                    reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0))
+                }
+                Ok(None) => reply.error(reply_code(Code::Io)),
+                Err(e) => reply.error(reply_code(e.code())),
             },
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -356,13 +355,13 @@ impl Filesystem for FuseFs {
             libc::S_IFBLK => InodeKind::BlockDev,
             libc::S_IFCHR => InodeKind::CharDev,
             _ => {
-                reply.error(Errno::from_i32(libc::EINVAL));
+                reply.error(reply_code(Code::Invalid));
                 return;
             }
         };
         let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
-            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => return reply.error(reply_code(e.code())),
         };
         let op = if kind == InodeKind::File {
             constellation_meta::MutateOp::Create {
@@ -382,16 +381,20 @@ impl Filesystem for FuseFs {
                 mode: mode & 0o7777,
                 uid: req.uid(),
                 gid: req.gid(),
-                rdev: rdev as u64,
+                // FUSE carries the kernel's 32-bit `new_encode_dev`; the
+                // journal carries the portable pair (plan 31 §7).
+                rdev: constellation_types::rdev::from_linux_fuse_rdev(rdev),
             }
         };
         match self.mutate_op(parent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
-                Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
-                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+                Ok(Some(attr)) => {
+                    reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0))
+                }
+                Ok(None) => reply.error(reply_code(Code::Io)),
+                Err(e) => reply.error(reply_code(e.code())),
             },
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -417,11 +420,13 @@ impl Filesystem for FuseFs {
         };
         match self.mutate_op(newparent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
-                Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
-                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+                Ok(Some(attr)) => {
+                    reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0))
+                }
+                Ok(None) => reply.error(reply_code(Code::NotFound)),
+                Err(e) => reply.error(reply_code(e.code())),
             },
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -462,7 +467,7 @@ impl Filesystem for FuseFs {
                     fuser::FopenFlags::empty(),
                 )
             }
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -482,7 +487,7 @@ impl Filesystem for FuseFs {
         let target = target.to_string_lossy();
         let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
-            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => return reply.error(reply_code(e.code())),
         };
         let op = constellation_meta::MutateOp::Symlink {
             parent,
@@ -494,11 +499,13 @@ impl Filesystem for FuseFs {
         };
         match self.mutate_op(parent, op) {
             Ok(()) => match self.meta.getattr(ino) {
-                Ok(Some(attr)) => reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0)),
-                Ok(None) => reply.error(Errno::from_i32(libc::EIO)),
-                Err(e) => reply.error(Errno::from_i32(errno(&e))),
+                Ok(Some(attr)) => {
+                    reply.entry(self.ttl(), &to_fuse_attr(&attr), fuser::Generation(0))
+                }
+                Ok(None) => reply.error(reply_code(Code::Io)),
+                Err(e) => reply.error(reply_code(e.code())),
             },
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -511,7 +518,12 @@ impl Filesystem for FuseFs {
         let target = self.meta.lookup(parent, &name);
         let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some())
-            && self.meta.scratch_lookup(parent, &name).ok().flatten().is_some()
+            && self
+                .meta
+                .scratch_lookup(parent, &name)
+                .ok()
+                .flatten()
+                .is_some()
         {
             match self.meta.scratch_lookup(parent, &name) {
                 Ok(Some(attr))
@@ -522,14 +534,14 @@ impl Filesystem for FuseFs {
                             .unwrap_or_default()
                             .is_empty() =>
                 {
-                    Err(libc::ENOTEMPTY)
+                    Err(Code::NotEmpty)
                 }
                 Ok(Some(_)) => self
                     .meta
                     .scratch_unlink(parent, &name)
-                    .map_err(|e| errno(&e)),
-                Ok(None) => Err(libc::ENOENT),
-                Err(e) => Err(errno(&e)),
+                    .map_err(|e| e.code()),
+                Ok(None) => Err(Code::NotFound),
+                Err(e) => Err(e.code()),
             }
         } else {
             self.mutate_op(
@@ -548,7 +560,7 @@ impl Filesystem for FuseFs {
                 }
                 reply.ok()
             }
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -560,16 +572,21 @@ impl Filesystem for FuseFs {
         let name = checked_name!(name, reply);
         let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some())
-            && self.meta.scratch_lookup(parent, &name).ok().flatten().is_some()
+            && self
+                .meta
+                .scratch_lookup(parent, &name)
+                .ok()
+                .flatten()
+                .is_some()
         {
             match self.meta.scratch_lookup(parent, &name) {
-                Ok(Some(attr)) if attr.kind == InodeKind::Dir => Err(libc::EISDIR),
+                Ok(Some(attr)) if attr.kind == InodeKind::Dir => Err(Code::IsDir),
                 Ok(Some(_)) => self
                     .meta
                     .scratch_unlink(parent, &name)
-                    .map_err(|e| errno(&e)),
-                Ok(None) => Err(libc::ENOENT),
-                Err(e) => Err(errno(&e)),
+                    .map_err(|e| e.code()),
+                Ok(None) => Err(Code::NotFound),
+                Err(e) => Err(e.code()),
             }
         } else {
             self.mutate_op(
@@ -582,7 +599,7 @@ impl Filesystem for FuseFs {
         };
         match result {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -621,38 +638,35 @@ impl Filesystem for FuseFs {
                 .flatten()
                 .is_some();
         if src_scratch && dst_scratch {
-            return match self
-                .meta
-                .scratch_rename(parent, &name, newparent, &newname)
-            {
+            return match self.meta.scratch_rename(parent, &name, newparent, &newname) {
                 Ok(()) => reply.ok(),
-                Err(error) => reply.error(Errno::from_i32(errno(&error))),
+                Err(error) => reply.error(reply_code(error.code())),
             };
         }
         if dst_scratch {
-            reply.error(Errno::from_i32(libc::EXDEV));
+            reply.error(reply_code(Code::CrossDevice));
             return;
         }
         if src_scratch {
             let attr = match self.meta.scratch_lookup(parent, &name) {
                 Ok(Some(attr)) => attr,
                 Ok(None) => {
-                    reply.error(Errno::from_i32(libc::ENOENT));
+                    reply.error(reply_code(Code::NotFound));
                     return;
                 }
                 Err(error) => {
-                    reply.error(Errno::from_i32(errno(&error)));
+                    reply.error(reply_code(error.code()));
                     return;
                 }
             };
             if attr.kind != InodeKind::File {
-                reply.error(Errno::from_i32(libc::EXDEV));
+                reply.error(reply_code(Code::CrossDevice));
                 return;
             }
             // Plan 30 §M14: publishing the file is a publication point.
             match self.lock_publish_gate(attr.ino) {
                 Err(error) => {
-                    reply.error(Errno::from_i32(error));
+                    reply.error(reply_code(error));
                     return;
                 }
                 Ok(true) => {
@@ -665,25 +679,25 @@ impl Filesystem for FuseFs {
                 Ok(false) => {}
             }
             if let Err(error) = self.flush_inode(attr.ino, true) {
-                reply.error(Errno::from_i32(error));
+                reply.error(reply_code(error));
                 return;
             }
             if let Err(error) = self.drain_inode(attr.ino) {
-                reply.error(Errno::from_i32(error));
+                reply.error(reply_code(error));
                 return;
             }
             let manifest = match self.meta.scratch_manifest(attr.ino) {
                 Ok(Some(manifest)) => manifest,
                 Ok(None) => Manifest::empty(self.chunk_size).encode(),
                 Err(error) => {
-                    reply.error(Errno::from_i32(errno(&error)));
+                    reply.error(reply_code(error.code()));
                     return;
                 }
             };
             let xattrs = match self.meta.scratch_xattrs(attr.ino) {
                 Ok(xattrs) => xattrs,
                 Err(error) => {
-                    reply.error(Errno::from_i32(errno(&error)));
+                    reply.error(reply_code(error.code()));
                     return;
                 }
             };
@@ -702,9 +716,9 @@ impl Filesystem for FuseFs {
             return match self.mutate_op(newparent, op) {
                 Ok(()) => match self.meta.scratch_unlink(parent, &name) {
                     Ok(()) => reply.ok(),
-                    Err(error) => reply.error(Errno::from_i32(errno(&error))),
+                    Err(error) => reply.error(reply_code(error.code())),
                 },
-                Err(error) => reply.error(Errno::from_i32(error)),
+                Err(error) => reply.error(reply_code(error)),
             };
         }
         let op = constellation_meta::MutateOp::Rename {
@@ -715,7 +729,7 @@ impl Filesystem for FuseFs {
         };
         match self.mutate_op(parent, op) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -725,7 +739,7 @@ impl Filesystem for FuseFs {
         let ino = self.real_ino(ino);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                reply.error(Errno::from_i32(libc::ESTALE));
+                reply.error(reply_code(Code::Stale));
             } else if matches!(
                 node,
                 SyntheticNode::Frozen {
@@ -735,29 +749,26 @@ impl Filesystem for FuseFs {
             ) {
                 reply.opened(FileHandle(ino), fuser::FopenFlags::empty());
             } else {
-                reply.error(Errno::from_i32(libc::EISDIR));
+                reply.error(reply_code(Code::IsDir));
             }
             return;
         }
         // Plan 30 §M8: under `--cto strict`, the close-to-open point.
         self.strict_read(ino, false, None, &[ReadKey::Ino(ino)]);
-        let attr = self
-            .meta
-            .getattr(ino)
-            .and_then(|attr| {
-                if attr.is_some() {
-                    Ok(attr)
-                } else {
-                    self.meta.scratch_getattr(ino)
-                }
-            });
+        let attr = self.meta.getattr(ino).and_then(|attr| {
+            if attr.is_some() {
+                Ok(attr)
+            } else {
+                self.meta.scratch_getattr(ino)
+            }
+        });
         match attr {
             Ok(Some(_)) => {
                 *self.opens.lock().unwrap().entry(ino).or_insert(0) += 1;
                 reply.opened(FileHandle(ino), fuser::FopenFlags::empty())
             }
-            Ok(None) => reply.error(Errno::from_i32(libc::ENOENT)),
-            Err(e) => reply.error(Errno::from_i32(errno(&e))),
+            Ok(None) => reply.error(reply_code(Code::NotFound)),
+            Err(e) => reply.error(reply_code(e.code())),
         }
     }
 
@@ -779,17 +790,17 @@ impl Filesystem for FuseFs {
         if ConstellationFs::is_synthetic(ino) {
             match self.read_frozen(ino, offset, size as u64) {
                 Ok(data) => reply.data(&data),
-                Err(error) => reply.error(Errno::from_i32(error)),
+                Err(error) => reply.error(reply_code(error)),
             }
             return;
         }
         if self.lock_fenced(ino) {
-            reply.error(Errno::from_i32(libc::EIO));
+            reply.error(reply_code(Code::Io));
             return;
         }
         match self.do_read(ino, offset, size as u64) {
             Ok(data) => reply.data(&data),
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -810,11 +821,11 @@ impl Filesystem for FuseFs {
         let ino = self.real_ino(ino);
         let _inflight = self.inflight.enter(&[ino]);
         if ConstellationFs::is_synthetic(ino) {
-            reply.error(Errno::from_i32(libc::EROFS));
+            reply.error(reply_code(Code::ReadOnly));
             return;
         }
         if self.lock_fenced(ino) {
-            reply.error(Errno::from_i32(libc::EIO));
+            reply.error(reply_code(Code::Io));
             return;
         }
         self.lock_discard_tainted(ino);
@@ -822,15 +833,22 @@ impl Filesystem for FuseFs {
             Ok(n) if flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0 => {
                 match self.flush_inode(ino, true) {
                     Ok(()) => reply.written(n),
-                    Err(error) => reply.error(Errno::from_i32(error)),
+                    Err(error) => reply.error(reply_code(error)),
                 }
             }
             Ok(n) => reply.written(n),
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
-    fn flush(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         let _w = crate::fuse_watch::enter("flush", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
@@ -840,13 +858,15 @@ impl Filesystem for FuseFs {
         // close drops the process's POSIX locks on the file (any
         // descriptor's close, as POSIX says); the kernel also sends an
         // explicit unlock, which then finds nothing.
-        let locks = self.cluster_locks().filter(|_| !ConstellationFs::is_synthetic(ino));
+        let locks = self
+            .cluster_locks()
+            .filter(|_| !ConstellationFs::is_synthetic(ino));
         let gate = self.lock_publish_gate(ino);
         let idle = locks.map(|l| l.drop_owner(ino, lock_owner.0));
         let r = gate.and_then(|owed| {
             self.flush_inode(ino, false)?;
             if owed {
-                return Err(libc::EIO);
+                return Err(Code::Io);
             }
             Ok(())
         });
@@ -857,11 +877,18 @@ impl Filesystem for FuseFs {
         }
         match r {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
-    fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         let _w = crate::fuse_watch::enter("fsync", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
@@ -870,17 +897,17 @@ impl Filesystem for FuseFs {
         let owed = match self.lock_publish_gate(ino) {
             Ok(owed) => owed,
             Err(e) => {
-                reply.error(Errno::from_i32(e));
+                reply.error(reply_code(e));
                 return;
             }
         };
         match self.flush_inode(ino, true) {
             Ok(()) => match self.sync_barrier(ino) {
-                Ok(()) if owed => reply.error(Errno::from_i32(libc::EIO)),
+                Ok(()) if owed => reply.error(reply_code(Code::Io)),
                 Ok(()) => reply.ok(),
-                Err(e) => reply.error(Errno::from_i32(e)),
+                Err(e) => reply.error(reply_code(e)),
             },
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -913,7 +940,7 @@ impl Filesystem for FuseFs {
         let flush_result = gate.and_then(|owed| {
             self.flush_inode(ino, flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0)?;
             if owed {
-                return Err(libc::EIO);
+                return Err(Code::Io);
             }
             Ok(())
         });
@@ -949,7 +976,7 @@ impl Filesystem for FuseFs {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(e) => reply.error(Errno::from_i32(e)),
+            Err(e) => reply.error(reply_code(e)),
         }
     }
 
@@ -969,7 +996,7 @@ impl Filesystem for FuseFs {
         if ConstellationFs::is_synthetic(ino) {
             let entries = match self.synthetic_entries(ino) {
                 Ok(entries) => entries,
-                Err(error) => return reply.error(Errno::from_i32(error)),
+                Err(error) => return reply.error(reply_code(error)),
             };
             let mut idx = offset;
             loop {
@@ -1014,7 +1041,7 @@ impl Filesystem for FuseFs {
             self.meta.readdir(ino)
         } {
             Ok(e) => e,
-            Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+            Err(e) => return reply.error(reply_code(e.code())),
         };
         // Stable cursor: "." = 1, ".." = 2, children from 3.
         let mut idx = offset;
@@ -1063,29 +1090,29 @@ impl Filesystem for FuseFs {
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
             Ok(name) => name,
-            Err(error) => return reply.error(Errno::from_i32(error)),
+            Err(error) => return reply.error(reply_code(error)),
         };
         if virtual_xattr(&name) {
-            reply.error(Errno::from_i32(libc::EPERM));
+            reply.error(reply_code(Code::Perm));
             return;
         }
         if ConstellationFs::is_synthetic(ino) {
-            reply.error(Errno::from_i32(libc::EROFS));
+            reply.error(reply_code(Code::ReadOnly));
             return;
         }
         if value.len() > 64 * 1024 {
-            reply.error(Errno::from_i32(libc::E2BIG));
+            reply.error(reply_code(Code::TooBig));
             return;
         }
         if position != 0 {
-            reply.error(Errno::from_i32(libc::EINVAL));
+            reply.error(reply_code(Code::Invalid));
             return;
         }
         let mode = match flags {
             0 => constellation_meta::SetXattrMode::Set,
             libc::XATTR_CREATE => constellation_meta::SetXattrMode::Create,
             libc::XATTR_REPLACE => constellation_meta::SetXattrMode::Replace,
-            _ => return reply.error(Errno::from_i32(libc::EINVAL)),
+            _ => return reply.error(reply_code(Code::Invalid)),
         };
         let wire_mode = match mode {
             constellation_meta::SetXattrMode::Create => 1,
@@ -1100,9 +1127,9 @@ impl Filesystem for FuseFs {
             // Only directories may carry a policy.
             match self.meta.getattr(ino) {
                 Ok(Some(attr)) if attr.kind == InodeKind::Dir => {}
-                Ok(Some(_)) => return reply.error(Errno::from_i32(libc::EINVAL)),
-                Ok(None) => return reply.error(Errno::from_i32(libc::ENOENT)),
-                Err(e) => return reply.error(Errno::from_i32(errno(&e))),
+                Ok(Some(_)) => return reply.error(reply_code(Code::Invalid)),
+                Ok(None) => return reply.error(reply_code(Code::NotFound)),
+                Err(e) => return reply.error(reply_code(e.code())),
             }
             let expr = String::from_utf8_lossy(value);
             match constellation_meta::prune::Policy::parse(&expr) {
@@ -1111,20 +1138,18 @@ impl Filesystem for FuseFs {
                     // mount with atime off. This consults the mount (not
                     // the policy bytes), so it never affects the pruner's
                     // pure re-parse — only whether the write is accepted.
-                    if policy.needs_atime()
-                        && self.atime.mode() == crate::atime::AtimeMode::Off
-                    {
+                    if policy.needs_atime() && self.atime.mode() == crate::atime::AtimeMode::Off {
                         self.prune_stats.record_parse_error(
                             &expr,
                             0,
                             "policy needs atime; mount with --atime relatime",
                         );
-                        return reply.error(Errno::from_i32(libc::EINVAL));
+                        return reply.error(reply_code(Code::Invalid));
                     }
                 }
                 Err(e) => {
                     self.prune_stats.record_parse_error(&expr, e.offset, &e.msg);
-                    return reply.error(Errno::from_i32(libc::EINVAL));
+                    return reply.error(reply_code(Code::Invalid));
                 }
             }
         }
@@ -1135,7 +1160,7 @@ impl Filesystem for FuseFs {
         if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
             return match self.meta.scratch_set_xattr(ino, &name, value, mode) {
                 Ok(()) => reply.ok(),
-                Err(error) => reply.error(Errno::from_i32(errno(&error))),
+                Err(error) => reply.error(reply_code(error.code())),
             };
         }
         match self.mutate_op(
@@ -1151,24 +1176,17 @@ impl Filesystem for FuseFs {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(error) => reply.error(Errno::from_i32(error)),
+            Err(error) => reply.error(reply_code(error)),
         }
     }
 
-    fn getxattr(
-        &self,
-        req: &Request,
-        ino: INodeNo,
-        name: &OsStr,
-        size: u32,
-        reply: ReplyXattr,
-    ) {
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let _w = crate::fuse_watch::enter("getxattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
             Ok(name) => name,
-            Err(error) => return reply.error(Errno::from_i32(error)),
+            Err(error) => return reply.error(reply_code(error)),
         };
         if !ConstellationFs::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
@@ -1177,7 +1195,7 @@ impl Filesystem for FuseFs {
             let aggregate = if ConstellationFs::is_synthetic(ino) {
                 self.synthetic_recursive_size(ino)
             } else {
-                self.meta.recursive_size(ino).map_err(|error| errno(&error))
+                self.meta.recursive_size(ino).map_err(|error| error.code())
             };
             match aggregate {
                 Ok((rsize, rcount)) => {
@@ -1187,29 +1205,25 @@ impl Filesystem for FuseFs {
                         rcount.to_string().into_bytes()
                     }
                 }
-                Err(error) => return reply.error(Errno::from_i32(error)),
+                Err(error) => return reply.error(reply_code(error)),
             }
         } else {
             let result = if ConstellationFs::is_synthetic(ino) {
-                self.synthetic_xattrs(ino).map(|attrs| {
-                    attrs
-                        .into_iter()
-                        .find(|(key, _)| key == &name)
-                        .map(|x| x.1)
-                })
+                self.synthetic_xattrs(ino)
+                    .map(|attrs| attrs.into_iter().find(|(key, _)| key == &name).map(|x| x.1))
             } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
                 self.meta
                     .scratch_get_xattr(ino, &name)
-                    .map_err(|error| errno(&error))
+                    .map_err(|error| error.code())
             } else {
                 self.meta
                     .get_xattr(ino, &name)
-                    .map_err(|error| errno(&error))
+                    .map_err(|error| error.code())
             };
             match result {
                 Ok(Some(value)) => value,
-                Ok(None) => return reply.error(Errno::from_i32(libc::ENODATA)),
-                Err(error) => return reply.error(Errno::from_i32(error)),
+                Ok(None) => return reply.error(reply_code(Code::NoData)),
+                Err(error) => return reply.error(reply_code(error)),
             }
         };
         reply_xattr(value, size, reply);
@@ -1228,15 +1242,13 @@ impl Filesystem for FuseFs {
         } else if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
             self.meta
                 .scratch_list_xattrs(ino)
-                .map_err(|error| errno(&error))
+                .map_err(|error| error.code())
         } else {
-            self.meta
-                .list_xattrs(ino)
-                .map_err(|error| errno(&error))
+            self.meta.list_xattrs(ino).map_err(|error| error.code())
         };
         let mut names: Vec<String> = match names {
             Ok(names) => names,
-            Err(error) => return reply.error(Errno::from_i32(error)),
+            Err(error) => return reply.error(reply_code(error)),
         };
         names.push(RSIZE_XATTR.to_string());
         names.push(RCOUNT_XATTR.to_string());
@@ -1250,43 +1262,34 @@ impl Filesystem for FuseFs {
         reply_xattr(encoded, size, reply);
     }
 
-    fn removexattr(
-        &self,
-        req: &Request,
-        ino: INodeNo,
-        name: &OsStr,
-        reply: ReplyEmpty,
-    ) {
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let _w = crate::fuse_watch::enter("removexattr", ino.0);
         let ino = ino.0;
         let ino = self.real_ino(ino);
         let name = match checked_xattr_name(req, name) {
             Ok(name) => name,
-            Err(error) => return reply.error(Errno::from_i32(error)),
+            Err(error) => return reply.error(reply_code(error)),
         };
         if virtual_xattr(&name) {
-            reply.error(Errno::from_i32(libc::EPERM));
+            reply.error(reply_code(Code::Perm));
             return;
         }
         if ConstellationFs::is_synthetic(ino) {
-            reply.error(Errno::from_i32(libc::EROFS));
+            reply.error(reply_code(Code::ReadOnly));
             return;
         }
         if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
             return match self.meta.scratch_remove_xattr(ino, &name) {
                 Ok(()) => reply.ok(),
-                Err(error) => reply.error(Errno::from_i32(errno(&error))),
+                Err(error) => reply.error(reply_code(error.code())),
             };
         }
-        match self.mutate_op(
-            ino,
-            constellation_meta::MutateOp::RemoveXattr { ino, name },
-        ) {
+        match self.mutate_op(ino, constellation_meta::MutateOp::RemoveXattr { ino, name }) {
             Ok(()) => {
                 self.nudge_sync();
                 reply.ok()
             }
-            Err(error) => reply.error(Errno::from_i32(error)),
+            Err(error) => reply.error(reply_code(error)),
         }
     }
 
@@ -1332,16 +1335,16 @@ impl Filesystem for FuseFs {
         let _inflight = self.inflight.enter(&[ino]);
         gate!(self, ino, reply);
         if self.lock_fenced(ino) {
-            reply.error(Errno::from_i32(libc::EIO));
+            reply.error(reply_code(Code::Io));
             return;
         }
         if length == 0 {
-            reply.error(Errno::from_i32(libc::EINVAL));
+            reply.error(reply_code(Code::Invalid));
             return;
         }
         match self.do_fallocate(ino, offset, length, mode) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(Errno::from_i32(error)),
+            Err(error) => reply.error(reply_code(error)),
         }
     }
 
@@ -1357,12 +1360,12 @@ impl Filesystem for FuseFs {
         let _w = crate::fuse_watch::enter("lseek", ino.0);
         let ino = ino.0;
         if offset < 0 {
-            reply.error(Errno::from_i32(libc::ENXIO));
+            reply.error(reply_code(Code::NoDeviceOrAddress));
             return;
         }
         match self.seek_sparse(self.real_ino(ino), offset as u64, whence) {
             Ok(position) => reply.offset(position),
-            Err(error) => reply.error(Errno::from_i32(error)),
+            Err(error) => reply.error(reply_code(error)),
         }
     }
 
@@ -1383,7 +1386,7 @@ impl Filesystem for FuseFs {
         let _w = crate::fuse_watch::enter("getlk", ino.0);
         let ino = self.real_ino(ino.0);
         let Some(locks) = self.cluster_locks() else {
-            reply.error(Errno::from_i32(libc::ENOSYS));
+            reply.error(reply_code(Code::NotImplemented));
             return;
         };
         if ConstellationFs::is_synthetic(ino) {
@@ -1421,7 +1424,7 @@ impl Filesystem for FuseFs {
         };
         let ino = self.real_ino(ino.0);
         let Some(locks) = self.cluster_locks() else {
-            reply.error(Errno::from_i32(libc::ENOSYS));
+            reply.error(reply_code(Code::NotImplemented));
             return;
         };
         if typ == libc::F_UNLCK {
@@ -1430,13 +1433,13 @@ impl Filesystem for FuseFs {
             return;
         }
         if typ != libc::F_RDLCK && typ != libc::F_WRLCK {
-            reply.error(Errno::from_i32(libc::EINVAL));
+            reply.error(reply_code(Code::Invalid));
             return;
         }
         if ConstellationFs::is_synthetic(ino) {
             // A frozen snapshot file (inside a live view's `.snapshots`)
             // has no sequencer to lease a grant from.
-            reply.error(Errno::from_i32(libc::ENOLCK));
+            reply.error(reply_code(Code::NoLock));
             return;
         }
         // Data written under an earlier grant that ended without its
@@ -1453,12 +1456,12 @@ impl Filesystem for FuseFs {
     }
 }
 
-fn checked_xattr_name(req: &Request, name: &OsStr) -> Result<String, i32> {
+fn checked_xattr_name(req: &Request, name: &OsStr) -> Result<String, Code> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > 255 {
-        return Err(libc::ERANGE);
+        return Err(Code::Range);
     }
-    let name = std::str::from_utf8(bytes).map_err(|_| libc::EINVAL)?;
+    let name = std::str::from_utf8(bytes).map_err(|_| Code::Invalid)?;
     if name.starts_with("user.") {
         return Ok(name.to_string());
     }
@@ -1468,24 +1471,24 @@ fn checked_xattr_name(req: &Request, name: &OsStr) -> Result<String, i32> {
         return if req.uid() == 0 {
             Ok(name.to_string())
         } else {
-            Err(libc::EPERM)
+            Err(Code::Perm)
         };
     }
-    Err(libc::ENOTSUP)
+    Err(Code::NotSupported)
 }
 
 fn reply_xattr(value: Vec<u8>, size: u32, reply: ReplyXattr) {
     if size == 0 {
         reply.size(value.len() as u32);
     } else if (size as usize) < value.len() {
-        reply.error(Errno::from_i32(libc::ERANGE));
+        reply.error(reply_code(Code::Range));
     } else {
         reply.data(&value);
     }
 }
 
 impl ConstellationFs {
-    fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, i32> {
+    fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, Code> {
         // Serve pending (unflushed) state when present so read-after-write
         // within an open handle is coherent. The inode's operation lock
         // orders the read against writes and flushes of the same file for
@@ -1507,9 +1510,9 @@ impl ConstellationFs {
         ws: Option<&WriteState>,
         offset: u64,
         size: u64,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<Vec<u8>, Code> {
         let manifest = self.load_manifest(ino)?;
-        let attr = self.meta.getattr(ino).map_err(|e| errno(&e))?;
+        let attr = self.meta.getattr(ino).map_err(|e| e.code())?;
         let committed_len = attr.as_ref().map(|a| a.size).unwrap_or(manifest.file_len);
         let file_len = ws.as_ref().map(|w| w.file_len).unwrap_or(committed_len);
         if offset >= file_len {
@@ -1532,7 +1535,8 @@ impl ConstellationFs {
             self.prefetch.enqueue_scan(files);
         }
         // Kick sequential readahead for upcoming committed chunks.
-        self.prefetch.on_read(ino, offset, len, self.chunk_size, &hashes);
+        self.prefetch
+            .on_read(ino, offset, len, self.chunk_size, &hashes);
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let mut out = Vec::with_capacity(len as usize);
         for slice in layout.slices(offset, len) {
@@ -1541,13 +1545,13 @@ impl ConstellationFs {
                 Some(w) if w.sealed.contains_key(&slice.index) => self
                     .cache
                     .get(w.sealed.get(&slice.index).unwrap())
-                    .map_err(|_| libc::EIO)?
-                    .ok_or(libc::EIO)?,
+                    .map_err(|_| Code::Io)?
+                    .ok_or(Code::Io)?,
                 Some(w) if w.staging.is_dirty(slice.index) => {
                     let mut buf = vec![0u8; full_len as usize];
                     w.staging
                         .read_at(slice.index * self.chunk_size as u64, &mut buf)
-                        .map_err(|e| staging_errno(&e))?;
+                        .map_err(|e| staging_code(&e))?;
                     buf
                 }
                 // Punched whole by this session: zeros.
@@ -1556,7 +1560,11 @@ impl ConstellationFs {
                     // Untouched by this session: the base's bytes, dead
                     // past a truncation (`WriteState::floor`).
                     let mut chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
-                    w.clip_base(&mut chunk, slice.index * self.chunk_size as u64, manifest.file_len);
+                    w.clip_base(
+                        &mut chunk,
+                        slice.index * self.chunk_size as u64,
+                        manifest.file_len,
+                    );
                     chunk
                 }
                 None => {
@@ -1594,14 +1602,14 @@ impl ConstellationFs {
         ino: Ino,
         hashes: &constellation_fs_core::manifest::SparseChunks,
         idx: u64,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<Vec<u8>, Code> {
         match hashes.get(&idx) {
             Some(h) => self.fetch_chunk_for_inode(Some(ino), h),
             None => Ok(Vec::new()),
         }
     }
 
-    fn do_write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, i32> {
+    fn do_write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, Code> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -1627,7 +1635,7 @@ impl ConstellationFs {
                 // arrived without observable throttling") rather than
                 // consistently either way.
                 std::thread::sleep(Duration::from_millis(100));
-                return Err(libc::ENOSPC);
+                return Err(Code::NoSpace);
             }
         }
         match crate::writeback::throttle_delay(
@@ -1644,7 +1652,7 @@ impl ConstellationFs {
                 // tiny budget can cross the soft-pressure band in one
                 // write. Preserve observable backpressure before ENOSPC.
                 std::thread::sleep(Duration::from_millis(100));
-                return Err(libc::ENOSPC);
+                return Err(Code::NoSpace);
             }
         }
         let _op = self.inode_ops.lock(ino);
@@ -1657,12 +1665,14 @@ impl ConstellationFs {
         // otherwise overflow and panic here while holding the write-shard
         // lock (poisoning it — see WriteShards::lock). Refuse with EFBIG,
         // as `do_fallocate` already does for the same overflow.
-        let write_end = offset.checked_add(data.len() as u64).ok_or(libc::EFBIG)?;
+        let write_end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(Code::FileTooBig)?;
         let new_file_len = ws.file_len.max(write_end);
         self.quota_check(ino, new_file_len)?;
         ws.staging
             .set_len_sparse(new_file_len)
-            .map_err(|e| staging_errno(&e))?;
+            .map_err(|e| staging_code(&e))?;
         let mut consumed = 0usize;
         for slice in layout.slices(offset, data.len() as u64) {
             let full_len = layout.chunk_len(new_file_len, slice.index);
@@ -1676,7 +1686,7 @@ impl ConstellationFs {
             ws.holes.clear(slice.index);
             ws.staging
                 .prepare_chunk(slice.index, self.chunk_size)
-                .map_err(|e| staging_errno(&e))?;
+                .map_err(|e| staging_code(&e))?;
             // A partial (not-whole-chunk) write into a chunk this open
             // handle has not touched yet must first seed the untouched
             // bytes from the committed content — otherwise they would
@@ -1685,7 +1695,11 @@ impl ConstellationFs {
             if !is_whole_chunk && !ws.staging.is_dirty(slice.index) {
                 let seed = match sealed {
                     Some(hash) => {
-                        let mut data = self.cache.get(&hash).map_err(|_| libc::EIO)?.ok_or(libc::EIO)?;
+                        let mut data = self
+                            .cache
+                            .get(&hash)
+                            .map_err(|_| Code::Io)?
+                            .ok_or(Code::Io)?;
                         data.resize(full_len as usize, 0);
                         data
                     }
@@ -1699,16 +1713,13 @@ impl ConstellationFs {
                 };
                 ws.staging
                     .write_at(chunk_start, &seed)
-                    .map_err(|e| staging_errno(&e))?;
+                    .map_err(|e| staging_code(&e))?;
             }
             let write_start = chunk_start + u64::from(slice.offset);
             let write_end = write_start + u64::from(slice.len);
             ws.staging
-                .write_at(
-                    write_start,
-                    &data[consumed..consumed + slice.len as usize],
-                )
-                .map_err(|e| staging_errno(&e))?;
+                .write_at(write_start, &data[consumed..consumed + slice.len as usize])
+                .map_err(|e| staging_code(&e))?;
             ws.staging.mark_dirty(slice.index);
             ws.written.push((write_start, write_end));
             consumed += slice.len as usize;
@@ -1721,7 +1732,7 @@ impl ConstellationFs {
         Ok(data.len() as u32)
     }
 
-    fn truncate(&self, ino: Ino, new_size: u64) -> Result<(), i32> {
+    fn truncate(&self, ino: Ino, new_size: u64) -> Result<(), Code> {
         let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
         let mut writes = self.writes.lock(ino);
@@ -1734,7 +1745,7 @@ impl ConstellationFs {
         ino: Ino,
         new_size: u64,
         manifest: &Manifest,
-    ) -> Result<(), i32> {
+    ) -> Result<(), Code> {
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
         let cs = u64::from(self.chunk_size);
         let ws = self.write_state(writes, ino, manifest)?;
@@ -1750,7 +1761,12 @@ impl ConstellationFs {
             let old_chunks = layout.chunk_count(ws.file_len);
             // Sealed chunks: wholly past the point, dropped; the one the
             // point falls inside goes back to staging, to be cut below.
-            let sealed: Vec<u64> = ws.sealed.keys().copied().filter(|i| *i * cs < ws.file_len).collect();
+            let sealed: Vec<u64> = ws
+                .sealed
+                .keys()
+                .copied()
+                .filter(|i| *i * cs < ws.file_len)
+                .collect();
             for idx in sealed {
                 if idx * cs >= new_size {
                     self.unseal(ws, ino, idx)?;
@@ -1759,14 +1775,14 @@ impl ConstellationFs {
                     let data = self
                         .cache
                         .get(&hash)
-                        .map_err(|_| libc::EIO)?
-                        .ok_or(libc::EIO)?;
+                        .map_err(|_| Code::Io)?
+                        .ok_or(Code::Io)?;
                     ws.staging
                         .prepare_chunk(idx, self.chunk_size)
-                        .map_err(|e| staging_errno(&e))?;
+                        .map_err(|e| staging_code(&e))?;
                     ws.staging
                         .write_at(idx * cs, &data)
-                        .map_err(|e| staging_errno(&e))?;
+                        .map_err(|e| staging_code(&e))?;
                     // (Its written ranges are already recorded; the rest
                     // of it was seeded from the base, which the
                     // composition re-reads, clipped.)
@@ -1785,31 +1801,36 @@ impl ConstellationFs {
         }
         ws.staging
             .set_len_sparse(new_size)
-            .map_err(|e| staging_errno(&e))?;
+            .map_err(|e| staging_code(&e))?;
         ws.file_len = new_size;
         Ok(())
     }
 
-    fn do_fallocate(&self, ino: Ino, offset: u64, length: u64, mode: i32) -> Result<(), i32> {
+    fn do_fallocate(&self, ino: Ino, offset: u64, length: u64, mode: i32) -> Result<(), Code> {
         let keep_size = mode & libc::FALLOC_FL_KEEP_SIZE != 0;
         let punch = mode & libc::FALLOC_FL_PUNCH_HOLE != 0;
         let zero = mode & libc::FALLOC_FL_ZERO_RANGE != 0;
-        let supported = libc::FALLOC_FL_KEEP_SIZE
-            | libc::FALLOC_FL_PUNCH_HOLE
-            | libc::FALLOC_FL_ZERO_RANGE;
+        let supported =
+            libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE;
         if mode & !supported != 0 || (punch && !keep_size) || (punch && zero) {
-            return Err(libc::EOPNOTSUPP);
+            return Err(Code::NotSupported);
         }
-        let end = offset.checked_add(length).ok_or(libc::EFBIG)?;
+        let end = offset.checked_add(length).ok_or(Code::FileTooBig)?;
         // Held across the truncate and the boundary writes below (the
         // lock is re-entrant on this thread).
         let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
-        let old_size = self.writes.lock(ino)
+        let old_size = self
+            .writes
+            .lock(ino)
             .get(&ino)
             .map(|state| state.file_len)
             .unwrap_or(manifest.file_len);
-        let new_size = if keep_size { old_size } else { old_size.max(end) };
+        let new_size = if keep_size {
+            old_size
+        } else {
+            old_size.max(end)
+        };
         // Gate growth before any staging mutation: the zero-range branch
         // below extends the file itself and never reaches `truncate`.
         if new_size > old_size {
@@ -1835,7 +1856,7 @@ impl ConstellationFs {
             if new_size > ws.file_len {
                 ws.staging
                     .set_len_sparse(new_size)
-                    .map_err(|error| staging_errno(&error))?;
+                    .map_err(|error| staging_code(&error))?;
                 ws.file_len = new_size;
             }
             if full_start < full_end {
@@ -1863,7 +1884,11 @@ impl ConstellationFs {
         }
         let first_boundary_end = effective_end.min(full_start * chunk_size);
         if offset < first_boundary_end {
-            self.do_write(ino, offset, &vec![0; (first_boundary_end - offset) as usize])?;
+            self.do_write(
+                ino,
+                offset,
+                &vec![0; (first_boundary_end - offset) as usize],
+            )?;
         }
         let last_boundary_start = offset.max(full_end * chunk_size);
         if last_boundary_start < effective_end {
@@ -1876,7 +1901,7 @@ impl ConstellationFs {
         Ok(())
     }
 
-    fn seek_sparse(&self, ino: Ino, offset: u64, whence: i32) -> Result<i64, i32> {
+    fn seek_sparse(&self, ino: Ino, offset: u64, whence: i32) -> Result<i64, Code> {
         let _op = self.inode_ops.lock(ino);
         let manifest = self.load_manifest(ino)?;
         let mut chunks = self.chunk_list(&manifest)?;
@@ -1894,7 +1919,7 @@ impl ConstellationFs {
             manifest.file_len
         };
         if offset >= file_len {
-            return Err(libc::ENXIO);
+            return Err(Code::NoDeviceOrAddress);
         }
         let chunk_size = u64::from(self.chunk_size);
         let start_index = offset / chunk_size;
@@ -1908,7 +1933,7 @@ impl ConstellationFs {
                     .next()
                     .map(|(&index, _)| (index * chunk_size) as i64)
                     .filter(|position| *position < file_len as i64)
-                    .ok_or(libc::ENXIO)
+                    .ok_or(Code::NoDeviceOrAddress)
             }
             libc::SEEK_HOLE => {
                 if !chunks.contains_key(&start_index) {
@@ -1920,7 +1945,7 @@ impl ConstellationFs {
                 }
                 Ok((index * chunk_size).min(file_len) as i64)
             }
-            _ => Err(libc::EINVAL),
+            _ => Err(Code::Invalid),
         }
     }
 }

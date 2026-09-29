@@ -80,9 +80,12 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
                         new_name,
                         ..
                     } => format!("Rename({parent:#x}/{name}->{new_parent:#x}/{new_name})"),
-                    LogRecord::Refused { rid, errno } => format!(
-                        "Refused({},{},{};{errno})",
-                        rid.node, rid.incarnation, rid.seq
+                    LogRecord::Refused { rid, code } => format!(
+                        "Refused({},{},{};{})",
+                        rid.node,
+                        rid.incarnation,
+                        rid.seq,
+                        code.posix_name()
                     ),
                     LogRecord::Recall { gen, .. } => format!("Recall(g{gen})"),
                     other => format!("{other:?}")

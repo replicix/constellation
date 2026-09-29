@@ -2739,14 +2739,14 @@ impl Meta {
             for rec in records {
                 let (rid, refused) = match rec {
                     LogRecord::Completed { rid } => (*rid, None),
-                    LogRecord::Refused { rid, errno } => (*rid, Some(*errno)),
+                    LogRecord::Refused { rid, code } => (*rid, Some(*code)),
                     _ => continue,
                 };
                 if tx.get(&self.completed, rid.to_key())?.is_some() {
                     continue;
                 }
                 let row = match refused {
-                    Some(errno) => Meta::encode_refused_row(0, now_ms, errno),
+                    Some(code) => Meta::encode_refused_row(0, now_ms, code),
                     None => Meta::encode_completed_row(0, now_ms),
                 };
                 tx.insert(&self.completed, rid.to_key(), row);

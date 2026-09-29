@@ -288,7 +288,7 @@ impl Meta {
                 size: spec.size,
                 mtime_ns: spec.mtime_ns,
                 ctime_ns: spec.mtime_ns,
-                rdev: 0,
+                rdev: constellation_types::Rdev::default(),
             };
             let xattrs: Vec<(Vec<u8>, Vec<u8>)> = spec
                 .xattrs
@@ -336,7 +336,7 @@ impl Meta {
                 gid: spec.gid,
                 size: spec.size,
                 mtime_ns: spec.mtime_ns,
-                rdev: 0,
+                rdev: constellation_types::Rdev::default(),
                 target: spec.target.clone(),
                 manifest: spec.manifest.clone(),
                 xattrs: spec.xattrs.clone(),

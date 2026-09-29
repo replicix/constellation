@@ -35,6 +35,7 @@ use anyhow::{bail, Context, Result};
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::Meta;
 use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
+use constellation_types::Code;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,7 +57,7 @@ fn clear_stale_mount(mountpoint: &std::path::Path) {
     match std::fs::metadata(mountpoint) {
         // A live FUSE mount or an ordinary directory stats fine — leave it.
         Ok(_) => return,
-        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {}
+        Err(e) if Code::from_io_error(&e) == Code::NotConnected => {}
         // Anything else (NotFound, permission, …) is not ours to fix here.
         Err(_) => return,
     }

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 constellation-fs-core.workspace = true
 constellation-mtree.workspace = true
+constellation-types.workspace = true
 fjall = { version = "3.1", package = "fjall" }
 blake3.workspace = true
 serde.workspace = true

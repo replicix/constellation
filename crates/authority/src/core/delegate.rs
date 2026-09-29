@@ -61,6 +61,7 @@ use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
 use constellation_meta::{LogRecord, MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet};
+use constellation_types::Code;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Parked-wait ids for generations (above every read-delegation grant
@@ -624,13 +625,13 @@ impl Core {
     fn record_delegate_refusal(
         &mut self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         gen: u64,
         deps: Position,
         replica: &dyn Replica,
     ) {
-        if let Err(error) = replica.delegate_refusal(rid, errno, gen, deps) {
-            tracing::warn!(node = self.me(), ?rid, errno, %error, "could not journal a delegate refusal");
+        if let Err(error) = replica.delegate_refusal(rid, code, gen, deps) {
+            tracing::warn!(node = self.me(), ?rid, %code, %error, "could not journal a delegate refusal");
             return;
         }
         self.stats.refusals_journaled += 1;
@@ -819,8 +820,8 @@ impl Core {
                     epoch,
                     records: Vec::new(),
                 },
-                constellation_meta::CompletedOutcome::Refused { errno } => {
-                    MutateOutcome::Errno(errno)
+                constellation_meta::CompletedOutcome::Refused { code } => {
+                    MutateOutcome::Errno(code)
                 }
             }
         } else {
@@ -841,11 +842,11 @@ impl Core {
                     MutateOp::SetManifest { ino, .. } => MutateOutcome::Conflict {
                         manifest: replica.manifest(*ino),
                     },
-                    _ => MutateOutcome::Errno(libc::EAGAIN),
+                    _ => MutateOutcome::Errno(Code::Again),
                 },
                 Err(MetaError::Exists) => {
-                    let errno = libc::EEXIST;
-                    self.record_delegate_refusal(rid, errno, gen, deps, replica);
+                    let code = Code::Exists;
+                    self.record_delegate_refusal(rid, code, gen, deps, replica);
                     exec_idx = Some(replica.delegate_idx(gen));
                     match super::client::named_child(op) {
                         Some((parent, name)) => match replica.entry_as_record(parent, name) {
@@ -853,16 +854,16 @@ impl Core {
                                 records: vec![record],
                                 epoch,
                             },
-                            None => MutateOutcome::Errno(errno),
+                            None => MutateOutcome::Errno(code),
                         },
-                        None => MutateOutcome::Errno(errno),
+                        None => MutateOutcome::Errno(code),
                     }
                 }
                 Err(e) => {
-                    let errno = super::client::meta_errno(&e);
-                    self.record_delegate_refusal(rid, errno, gen, deps, replica);
+                    let code = e.code();
+                    self.record_delegate_refusal(rid, code, gen, deps, replica);
                     exec_idx = Some(replica.delegate_idx(gen));
-                    MutateOutcome::Errno(errno)
+                    MutateOutcome::Errno(code)
                 }
             }
         };
@@ -2099,7 +2100,11 @@ impl Core {
                 cross,
                 "refusing an op under an unreachable designation (plans 03-05)"
             );
-            return RecallPlan::Refuse(if cross { libc::EXDEV } else { libc::EROFS });
+            return RecallPlan::Refuse(if cross {
+                Code::CrossDevice
+            } else {
+                Code::ReadOnly
+            });
         }
         let mut waiting = BTreeSet::new();
         for gen in involved {
@@ -3037,8 +3042,8 @@ pub(crate) enum RecallPlan {
     None,
     /// Wait for these recalls (`wait_id`s).
     Wait(BTreeSet<u64>),
-    /// Refuse with this errno (a designation is involved).
-    Refuse(i32),
+    /// Refuse with this code (a designation is involved).
+    Refuse(Code),
 }
 
 /// Whether `dir` is `ancestor` or under it.

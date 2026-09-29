@@ -581,6 +581,7 @@ pub fn check_cycles(history: &History) -> Result<(), CheckFailure> {
 mod tests {
     use super::*;
     use crate::op::hash_bytes;
+    use constellation_types::Code;
 
     fn ok() -> Complete {
         Complete {
@@ -606,9 +607,9 @@ mod tests {
         Complete {
             outcome: Outcome::Fail,
             errno: Some(if name == "ENOENT" {
-                libc::ENOENT
+                Code::NotFound.to_native()
             } else {
-                libc::EEXIST
+                Code::Exists.to_native()
             }),
             errno_name: Some(name.to_string()),
             ..ok()

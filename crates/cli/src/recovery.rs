@@ -21,6 +21,7 @@ use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;
 use constellation_meta::reintegrate::{conflict_dentry_name, CONFLICT_DIR};
 use constellation_meta::{Meta, MetaStore, MutateOp, MutateOutcome, Refusal, Rid};
+use constellation_types::Code;
 
 /// Send `op` down the ordinary submit path (holder-local execution, or a
 /// forward to the holder) and wait for the outcome. `None` if the sync
@@ -192,7 +193,7 @@ pub(crate) async fn materialize_remote(
         match submit(sync_tx, op, forward.next_system_rid(node_id)).await {
             Some(MutateOutcome::Accepted { .. })
             | Some(MutateOutcome::Exists { .. })
-            | Some(MutateOutcome::Errno(libc::EEXIST)) => true,
+            | Some(MutateOutcome::Errno(Code::Exists)) => true,
             Some(other) => {
                 // The caller logs (with backoff) when a copy keeps failing.
                 tracing::debug!(?other, "conflict copy step not accepted yet");
@@ -270,9 +271,7 @@ mod tests {
                     if let SyncRequest::Submit { op, rid, reply, .. } = req {
                         let outcome = match execute_mutate(&meta, &op, Some(rid)) {
                             Ok(records) => MutateOutcome::Accepted { epoch: 1, records },
-                            Err(e) => {
-                                MutateOutcome::Errno(constellation_authority::core::meta_errno(&e))
-                            }
+                            Err(e) => MutateOutcome::Errno(e.code()),
                         };
                         let _ = reply.send(ClientReply::Outcome(outcome));
                     }

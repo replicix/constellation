@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/types",
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
@@ -21,6 +22,7 @@ members = [
 # `constellation-upload-concurrency` crate) but only builds when asked
 # for explicitly (`-p uploadbench`, `--workspace`, or `cd` + `cargo run`).
 default-members = [
+    "crates/types",
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
@@ -43,6 +45,7 @@ license = "MPL-2.0"
 repository = "https://github.com/replicix/constellation"
 
 [workspace.dependencies]
+constellation-types = { path = "crates/types" }
 constellation-fs-core = { path = "crates/fs-core" }
 constellation-meta = { path = "crates/meta" }
 constellation-mtree = { path = "crates/mtree" }

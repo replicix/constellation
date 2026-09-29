@@ -9,6 +9,7 @@ use crate::s3env::{S3Env, BUCKET};
 use crate::suites;
 use crate::workload::Workload;
 use anyhow::{bail, Context, Result};
+use constellation_types::Code;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2281,7 +2282,7 @@ fn snapshot_mount(_seed: u64) -> Result<()> {
     );
     let error = std::fs::write(frozen.mnt.join("data"), b"no").unwrap_err();
     anyhow::ensure!(
-        error.raw_os_error() == Some(libc::EROFS),
+        Code::from_os_error(&error) == Some(Code::ReadOnly),
         "snapshot mutation returned {error}, expected EROFS"
     );
     frozen.unmount()?;
@@ -2582,7 +2583,7 @@ fn quota_enforcement(_seed: u64) -> Result<()> {
     let big = vec![b'Q'; 128 * 1024];
     let err = std::fs::write(&path, &big).expect_err("write past quota must fail");
     anyhow::ensure!(
-        err.raw_os_error() == Some(libc::ENOSPC),
+        Code::from_os_error(&err) == Some(Code::NoSpace),
         "expected ENOSPC, got {err}"
     );
 
@@ -3858,7 +3859,7 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
         let error = std::fs::create_dir(c0.mnt.join("shared/refused"))
             .expect_err("frozen epoch must refuse writes");
         anyhow::ensure!(
-            error.raw_os_error() == Some(libc::EROFS),
+            Code::from_os_error(&error) == Some(Code::ReadOnly),
             "expected EROFS, got {error}"
         );
         Ok(())
@@ -6632,7 +6633,7 @@ fn xattr_roundtrip(_seed: u64) -> Result<()> {
         "xattr removal visible",
         Duration::from_secs(20),
         || match get_xattr(&b.mnt.join("tree/file"), "user.foo") {
-            Err(error) if error.raw_os_error() == Some(libc::ENODATA) => Ok(()),
+            Err(error) if Code::from_os_error(&error) == Some(Code::NoData) => Ok(()),
             Ok(_) => anyhow::bail!("removed xattr still visible"),
             Err(error) => Err(error.into()),
         },
@@ -7092,7 +7093,7 @@ fn writeback_backpressure(seed: u64) -> Result<()> {
         use std::io::Write;
         let block = pattern(seed.wrapping_add(i), 1024 * 1024);
         if let Err(error) = file.write_all(&block) {
-            saw_enospc = error.raw_os_error() == Some(libc::ENOSPC);
+            saw_enospc = Code::from_os_error(&error) == Some(Code::NoSpace);
             break;
         }
     }
@@ -9643,7 +9644,7 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
         // executes locally and is refused. Nothing of its own ships.
         match std::fs::remove_dir(b.mnt.join("full")) {
             Ok(()) => bail!("B's rmdir of the non-empty `full` succeeded"),
-            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {}
+            Err(e) if Code::from_os_error(&e) == Some(Code::NotEmpty) => {}
             Err(e) => bail!("B's rmdir of the non-empty `full` returned {e}, expected ENOTEMPTY"),
         }
         let took_over = Instant::now();
