@@ -34,11 +34,7 @@ fn warn_after() -> Duration {
 }
 
 fn threads() -> Option<u64> {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("Threads:"))
-        .and_then(|v| v.trim().parse().ok())
+    constellation_platform::native().process.thread_count()
 }
 
 /// Enter `phase`, logging the previous one's duration. The first call

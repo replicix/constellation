@@ -4,16 +4,20 @@
 # that fixes it. Two-way: a listed entry that now passes makes
 # tools/check-cross.sh fail with "STALE" (like the xfstests baseline).
 
-# macOS: libc calls Linux-only (`posix_fadvise`, `POSIX_FADV_DONTNEED` in
-# crates/chaos/src/op.rs).
-aarch64-apple-darwin constellation-chaos
-# macOS: cli's Linux-only code (`libc::gettid`, i16/u16 flag and mode types,
-# fuser/libc call signatures; 35 errors). constellation-harness depends on
-# chaos and is not reached until chaos compiles; expect it to appear here
-# then.
+# macOS: cli's Linux-only FUSE-frontend code (i16/u16 lock-type and mode
+# types, `FALLOC_FL_*` fallocate-op flags, fuser/libc call signatures, the
+# `setxattr`/`getxattr` arities in main.rs; 33 errors after plan 31 C2 moved
+# `gettid`/`tgkill`/`fallocate`/`flock` behind constellation-platform). C4
+# rebuilds this code as the FUSE frontend.
 aarch64-apple-darwin constellation
+# macOS: the harness's own Linux-only calls (`libc::fallocate`, the
+# `setxattr`/`getxattr` arities in scenarios.rs; 8 errors). Reached since
+# plan 31 C2 made constellation-chaos compile for macOS (its
+# `posix_fadvise` went behind constellation-platform); C6 moves the
+# harness's host calls behind the platform crate.
+aarch64-apple-darwin constellation-harness
 
 # Windows: `tokio::net::Unix{Listener,Stream}` in the control API.
 x86_64-pc-windows-gnu constellation-api
-# Windows: `std::os::unix` and `libc::posix_fadvise`.
+# Windows: `std::os::unix` (permissions, symlinks) in the checker.
 x86_64-pc-windows-gnu constellation-chaos

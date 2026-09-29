@@ -27,13 +27,18 @@
 //!
 //! The pins live in their own file next to `registry.toml` (the registry
 //! rewrites its rows from its own schema, so it cannot carry them), with
-//! the same lock-then-rename discipline.
+//! the same lock-then-rename discipline. That file is a secret of the
+//! host's `SecretStore` (`constellation_platform`): the file store puts it
+//! at `<config dir>/registry.e2e.toml`, `0600`, and a host without a disk
+//! for secrets (plan 37's engine pods) keeps it in memory instead.
 
 use anyhow::{bail, Context, Result};
+use constellation_platform::{FileSecretStore, SecretStore};
 use constellation_store_s3::{E2eKeys, FsMeta};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::registry::Registry;
 use crate::target::Target;
@@ -139,9 +144,53 @@ impl PinTarget {
     }
 }
 
-/// `registry.toml`'s sibling `registry.e2e.toml`.
-pub fn pins_path() -> Result<PathBuf> {
-    Ok(Registry::path()?.with_extension("e2e.toml"))
+/// Where the pins are kept: one secret holding every pin as TOML.
+#[derive(Clone)]
+pub struct PinStore {
+    store: Arc<dyn SecretStore>,
+    name: String,
+}
+
+impl std::fmt::Debug for PinStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+impl PinStore {
+    /// The pins file at `path`, in a file store of its own.
+    pub fn at(path: &Path) -> Result<PinStore> {
+        let (store, name) = FileSecretStore::for_path(path)
+            .with_context(|| format!("locating the E2E pins at {}", path.display()))?;
+        Ok(PinStore {
+            store: Arc::new(store),
+            name,
+        })
+    }
+
+    fn describe(&self) -> String {
+        self.store.describe(&self.name)
+    }
+}
+
+/// The pins file name: `registry.toml`'s sibling `registry.e2e.toml`.
+const PINS_NAME: &str = "registry.e2e.toml";
+
+/// `registry.toml`'s sibling `registry.e2e.toml`: in the host's secret
+/// store (its config dir, where the registry is too), or beside a
+/// registry `CONSTELLATION_REGISTRY` moved elsewhere.
+pub fn pins_store() -> Result<PinStore> {
+    if std::env::var("CONSTELLATION_REGISTRY").is_ok_and(|p| !p.is_empty()) {
+        return PinStore::at(&Registry::path()?.with_extension("e2e.toml"));
+    }
+    let host = constellation_platform::native();
+    // The default store resolves the config dir per use; fail here, as
+    // the registry does, when there is none (no `HOME`).
+    host.dirs.config_dir().context("locating the config dir")?;
+    Ok(PinStore {
+        store: host.secrets.clone(),
+        name: PINS_NAME.to_string(),
+    })
 }
 
 fn accept_change() -> bool {
@@ -152,7 +201,7 @@ fn accept_change() -> bool {
 /// passphrase has opened the keyring (or at once for plaintext).
 #[derive(Debug)]
 pub struct PinCheck {
-    path: Option<PathBuf>,
+    store: Option<PinStore>,
     target: PinTarget,
     pinned: Option<E2ePin>,
     observed: E2ePin,
@@ -164,8 +213,8 @@ pub struct PinCheck {
 /// prompt for a passphrase or deriving any key; an error here is the
 /// refusal of a downgrade.
 pub fn check(target: &PinTarget, meta: &FsMeta) -> Result<PinCheck> {
-    match pins_path() {
-        Ok(path) => check_at(Some(path), target, meta, accept_change()),
+    match pins_store() {
+        Ok(store) => check_at(Some(store), target, meta, accept_change()),
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -177,18 +226,18 @@ pub fn check(target: &PinTarget, meta: &FsMeta) -> Result<PinCheck> {
 }
 
 fn check_at(
-    path: Option<PathBuf>,
+    store: Option<PinStore>,
     target: &PinTarget,
     meta: &FsMeta,
     accept: bool,
 ) -> Result<PinCheck> {
     let observed = E2ePin::observe(&target.s3, meta, None);
-    let pinned = match &path {
-        Some(path) => read(path)?.remove(&target.key),
+    let pinned = match &store {
+        Some(store) => read(store)?.remove(&target.key),
         None => None,
     };
     let check = PinCheck {
-        path,
+        store,
         target: target.clone(),
         pinned,
         observed,
@@ -212,13 +261,15 @@ fn short(fingerprint: Option<&str>) -> &str {
 impl PinCheck {
     fn refuse_or_warn(&self, what: String) -> Result<()> {
         if !self.accept {
-            let path = self.path.as_deref().unwrap_or(Path::new("?"));
+            let path = self
+                .store
+                .as_ref()
+                .map_or_else(|| "?".to_string(), PinStore::describe);
             bail!(
                 "{what}. meta.json is not authenticated, so whoever controls the storage may \
                  have tampered with it; refusing to continue. If the change is yours (the \
                  filesystem was recreated at this URL), rerun with {ACCEPT_ENV}=1 to accept it \
-                 and re-pin (pins: {})",
-                path.display()
+                 and re-pin (pins: {path})"
             );
         }
         tracing::warn!("{what}; accepted by {ACCEPT_ENV}=1, re-pinning");
@@ -264,8 +315,8 @@ impl PinCheck {
             Verdict::Upgrade | Verdict::Downgrade | Verdict::MasterChanged => true,
         };
         if changed {
-            if let Some(path) = &self.path {
-                if let Err(error) = write(path, &self.target.key, &observed) {
+            if let Some(store) = &self.store {
+                if let Err(error) = write(store, &self.target.key, &observed) {
                     tracing::warn!(key = %self.target.key, %error, "recording the E2E pin failed");
                 }
             }
@@ -279,52 +330,52 @@ impl PinCheck {
 /// just rewrapped and reopened it. Best-effort.
 pub fn record(target: &PinTarget, meta: &FsMeta, keys: Option<&E2eKeys>) {
     let pin = E2ePin::observe(&target.s3, meta, keys);
-    let saved = pins_path().and_then(|path| write(&path, &target.key, &pin));
+    let saved = pins_store().and_then(|store| write(&store, &target.key, &pin));
     if let Err(error) = saved {
         tracing::warn!(key = %target.key, %error, "recording the E2E pin failed");
     }
 }
 
-fn read(path: &Path) -> Result<BTreeMap<String, E2ePin>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+fn parse(bytes: &[u8]) -> std::result::Result<BTreeMap<String, E2ePin>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    toml::from_str(text).map_err(|e| e.to_string())
+}
+
+fn read(store: &PinStore) -> Result<BTreeMap<String, E2ePin>> {
+    match store
+        .store
+        .get(&store.name)
+        .with_context(|| format!("reading {}", store.describe()))?
+    {
+        Some(secret) => parse(secret.expose())
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("parsing {}", store.describe())),
+        None => Ok(BTreeMap::new()),
     }
 }
 
-/// Read-modify-write under an exclusive lock, then write-then-rename, as
-/// the registry does.
-fn write(path: &Path, key: &str, pin: &E2ePin) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path.with_extension("toml.lock"))
-        .context("opening E2E pin lock file")?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: `lock_file` owns this open fd for the duration of the
-        // call; `flock` does not touch memory.
-        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error()).context("locking E2E pin file");
-        }
-    }
-    let mut pins = read(path)?;
-    pins.insert(key.to_string(), pin.clone());
-    let text = toml::to_string_pretty(&pins).context("serializing E2E pins")?;
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming into place: {}", path.display()))?;
-    drop(lock_file);
-    Ok(())
+/// Read-modify-write under the store's exclusive lock (`<name>.lock`),
+/// then write-then-rename, as the registry does.
+fn write(store: &PinStore, key: &str, pin: &E2ePin) -> Result<()> {
+    let describe = store.describe();
+    store
+        .store
+        .update(&store.name, &mut |old| {
+            let mut pins = match old {
+                Some(bytes) => parse(bytes).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("parsing {describe}: {e}"),
+                    )
+                })?,
+                None => BTreeMap::new(),
+            };
+            pins.insert(key.to_string(), pin.clone());
+            let text = toml::to_string_pretty(&pins)
+                .map_err(|e| std::io::Error::other(format!("serializing E2E pins: {e}")))?;
+            Ok(Some(text.into_bytes()))
+        })
+        .with_context(|| format!("writing {describe}"))
 }
 
 #[cfg(test)]
@@ -353,8 +404,8 @@ mod tests {
         }
     }
 
-    fn pins_file(dir: &Path) -> PathBuf {
-        dir.join("registry.e2e.toml")
+    fn pins_file(dir: &Path) -> PinStore {
+        PinStore::at(&dir.join("registry.e2e.toml")).unwrap()
     }
 
     #[test]
@@ -542,5 +593,49 @@ mod tests {
         let pins = read(&path).unwrap();
         assert_eq!(pins["a"], pin(true, Some("aa")));
         assert_eq!(pins[S3], pin(false, None));
+        // The file store keeps the pre-plan-31 layout: the pins file and
+        // its writer lock beside it, no temp file left, and the pins
+        // owner-only now that they are a secret store's.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["registry.e2e.toml", "registry.e2e.toml.lock"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("registry.e2e.toml"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// Pins held by an in-memory secret store (plan 37's engine pods)
+    /// work the same and write nothing.
+    #[test]
+    fn pins_work_in_a_memory_store() {
+        let store = PinStore {
+            store: Arc::new(constellation_platform::EphemeralSecretStore::new()),
+            name: PINS_NAME.to_string(),
+        };
+        let target = PinTarget::named("myfs", S3);
+        let (meta, keys) = e2e_meta("pw");
+        check_at(Some(store.clone()), &target, &meta, false)
+            .unwrap()
+            .confirm(Some(&keys))
+            .unwrap();
+        assert_eq!(
+            read(&store).unwrap()["myfs"],
+            E2ePin::observe(S3, &meta, Some(&keys))
+        );
+        let mut stripped = meta.clone();
+        stripped.e2e = false;
+        stripped.keyring = None;
+        let err = check_at(Some(store), &target, &stripped, false).unwrap_err();
+        assert!(format!("{err:#}").contains("(in memory)"), "{err:#}");
     }
 }

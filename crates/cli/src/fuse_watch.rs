@@ -26,9 +26,12 @@
 //! With `CONSTELLATION_FUSE_STALL_BACKTRACE=1` the monitor also asks the
 //! stalled thread for its backtrace (a `SIGUSR2`, handled by capturing
 //! one and writing it to stderr): a diagnostic for a build with symbols,
-//! off by default.
+//! off by default. Naming the thread and delivering the signal are host
+//! services (`constellation_platform`'s `Process::current_thread`/
+//! `enable_backtraces`/`request_backtrace`, plan 31 §6.8).
 
 use constellation_fs_core::Ino;
+use constellation_platform::ThreadRef;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,7 +43,7 @@ pub struct Entry {
     id: u64,
     op: &'static str,
     ino: Ino,
-    tid: u32,
+    thread: ThreadRef,
     started: Instant,
     blocking: bool,
     stage: Mutex<&'static str>,
@@ -93,7 +96,12 @@ fn registry() -> &'static Registry {
         let backtraces = std::env::var("CONSTELLATION_FUSE_STALL_BACKTRACE")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         if backtraces {
-            install_backtrace_handler();
+            if let Err(error) = constellation_platform::native()
+                .process
+                .enable_backtraces("fuse-watch")
+            {
+                tracing::warn!(%error, "stalled-request backtraces are unavailable");
+            }
         }
         if !threshold.is_zero() {
             let spawned = std::thread::Builder::new()
@@ -119,18 +127,13 @@ pub struct Watched {
     entry: Arc<Entry>,
 }
 
-fn gettid() -> u32 {
-    // SAFETY: gettid(2) takes no arguments and cannot fail.
-    unsafe { libc::gettid() as u32 }
-}
-
 fn register(op: &'static str, ino: Ino, blocking: bool) -> Watched {
     let r = registry();
     let entry = Arc::new(Entry {
         id: r.next.fetch_add(1, Ordering::Relaxed),
         op,
         ino,
-        tid: gettid(),
+        thread: constellation_platform::native().process.current_thread(),
         started: Instant::now(),
         blocking,
         stage: Mutex::new("running"),
@@ -192,7 +195,7 @@ impl Drop for Watched {
             tracing::warn!(
                 op = self.entry.op,
                 ino = self.entry.ino,
-                tid = self.entry.tid,
+                tid = self.entry.thread.tid,
                 took = ?self.entry.age(),
                 last_stage = self.entry.stage(),
                 "a stalled FUSE request completed"
@@ -219,7 +222,7 @@ pub fn snapshot() -> constellation_api::FuseRequestsStatus {
             ino: e.ino,
             age_s: e.age().as_secs(),
             stage: e.stage().to_string(),
-            tid: e.tid,
+            tid: e.thread.tid as u32,
             blocking: e.blocking,
         })
         .collect();
@@ -268,7 +271,7 @@ fn monitor() {
                 tracing::info!(
                     op = e.op,
                     ino = e.ino,
-                    tid = e.tid,
+                    tid = e.thread.tid,
                     ?age,
                     stage = e.stage(),
                     "a blocking FUSE request is still waiting (by design: another owner holds the file)"
@@ -282,59 +285,33 @@ fn monitor() {
             tracing::warn!(
                 op = e.op,
                 ino = e.ino,
-                tid = e.tid,
+                tid = e.thread.tid,
                 ?age,
                 stage = e.stage(),
                 first,
                 "a FUSE request is stalled: unanswered past the stall threshold"
             );
             if first && r.backtraces {
-                request_backtrace(e.tid);
+                request_backtrace(e.thread);
             }
         }
     }
 }
 
-/// `CONSTELLATION_FUSE_STALL_BACKTRACE=1`: the handler writes the
-/// signalled thread's backtrace to stderr (the daemon log). Not
-/// async-signal-safe in the strict sense (the capture allocates); a
-/// diagnostic for a stalled thread, which sits in a futex wait, never
-/// inside the allocator.
-fn install_backtrace_handler() {
-    extern "C" fn on_sigusr2(_: libc::c_int) {
-        let bt = std::backtrace::Backtrace::force_capture();
-        let text = format!(
-            "\n=== fuse-watch: backtrace of stalled thread tid={} ===\n{bt}\n=== end ===\n",
-            gettid()
+/// `CONSTELLATION_FUSE_STALL_BACKTRACE=1`: the platform's handler
+/// writes the signalled thread's backtrace to stderr (the daemon log),
+/// between `=== fuse-watch: backtrace of stalled thread tid=<tid> ===` and
+/// `=== end ===`.
+fn request_backtrace(thread: ThreadRef) {
+    if constellation_platform::native()
+        .process
+        .request_backtrace(thread)
+        .is_err()
+    {
+        tracing::warn!(
+            tid = thread.tid,
+            "could not signal the stalled thread for a backtrace"
         );
-        // SAFETY: write(2) on stderr with a valid buffer.
-        unsafe {
-            libc::write(2, text.as_ptr() as *const libc::c_void, text.len());
-        }
-    }
-    // SAFETY: installing a handler for SIGUSR2, which nothing else in
-    // the daemon uses.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = (on_sigusr2 as extern "C" fn(libc::c_int)) as *const () as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGUSR2, &sa, std::ptr::null_mut());
-    }
-}
-
-fn request_backtrace(tid: u32) {
-    // SAFETY: tgkill(2) with this process's pid and one of its thread ids.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_tgkill,
-            libc::getpid(),
-            tid as libc::pid_t,
-            libc::SIGUSR2,
-        )
-    };
-    if rc != 0 {
-        tracing::warn!(tid, "could not signal the stalled thread for a backtrace");
     }
 }
 

@@ -664,8 +664,7 @@ fn ensure_allow_other_supported(enabled: bool) -> Result<()> {
     if !enabled {
         return Ok(());
     }
-    // SAFETY: geteuid is always safe and never fails.
-    if unsafe { libc::geteuid() } == 0 {
+    if constellation_platform::native().process.effective_ids().0 == 0 {
         return Ok(());
     }
     let enabled_in_conf = std::fs::read_to_string("/etc/fuse.conf")
@@ -1898,32 +1897,25 @@ enum LockOutcome {
 fn take_state_dir_lock(state_dir: &Path) -> Result<LockOutcome> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(state_dir.join("daemon.lock"))
-        .context("opening daemon.lock")?;
-    use std::os::fd::AsRawFd;
-    let fd = lock_file.as_raw_fd();
-    // SAFETY: `fd` is a valid, open fd owned by `lock_file` for the
-    // duration of this call.
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        // We hold it now. Leak the `File` so the lock survives for the
-        // rest of this process's life (released automatically on exit,
-        // by the kernel closing every fd) rather than dropping here.
-        std::mem::forget(lock_file);
-        let _ = std::fs::remove_file(state_dir.join(constellation_api::SOCKET_NAME));
-        let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
-        Ok(LockOutcome::BecomeDaemon)
-    } else {
-        let err = std::io::Error::last_os_error();
-        if Code::from_io_error(&err) == Code::Again {
-            Ok(LockOutcome::Attach)
-        } else {
-            Err(err).context("locking daemon.lock")
+    let lock_file =
+        constellation_platform::lock::open_lock_file(&state_dir.join(daemon_lock::LOCK_NAME))
+            .context("opening daemon.lock")?;
+    match constellation_platform::native()
+        .file_lock
+        .try_lock(lock_file)
+        .context("locking daemon.lock")?
+    {
+        Some(guard) => {
+            // We hold it now. Leak the guard so the lock survives for the
+            // rest of this process's life (released automatically on
+            // exit, by the kernel closing every fd) rather than dropping
+            // here.
+            std::mem::forget(guard);
+            let _ = std::fs::remove_file(state_dir.join(constellation_api::SOCKET_NAME));
+            let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
+            Ok(LockOutcome::BecomeDaemon)
         }
+        None => Ok(LockOutcome::Attach),
     }
 }
 
@@ -2428,10 +2420,12 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
                 if lock_path.exists() && !force {
                     let probe = std::fs::OpenOptions::new().write(true).open(&lock_path);
                     if let Ok(f) = probe {
-                        use std::os::fd::AsRawFd;
-                        let held = unsafe {
-                            libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0
-                        };
+                        // Anything but getting the lock (and releasing it
+                        // again as the guard drops) counts as held.
+                        let held = !matches!(
+                            constellation_platform::native().file_lock.try_lock(f),
+                            Ok(Some(_))
+                        );
                         if held {
                             bail!(
                                 "daemon.lock for {name:?} is held by a live process (starting up \
@@ -3660,17 +3654,19 @@ async fn start_p2p(
         tracing::info!("P2P disabled by CONSTELLATION_P2P; using the S3 path only");
         return constellation_net::Peers::disabled();
     }
-    let key_path = constellation_net::identity::default_key_path();
-    let (key, generated) = match constellation_net::load_or_create(&key_path) {
+    let (keys, key_name) =
+        constellation_net::identity::default_key_store(constellation_platform::native());
+    let key_path = keys.describe(&key_name);
+    let (key, generated) = match constellation_net::identity::load_or_create_in(&*keys, &key_name) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, path = %key_path.display(),
+            tracing::warn!(error = %e, path = %key_path,
                 "no usable node key; running without the P2P fast path");
             return constellation_net::Peers::disabled();
         }
     };
     if generated {
-        tracing::info!(path = %key_path.display(), "generated a host node key");
+        tracing::info!(path = %key_path, "generated a host node key");
     }
     // E2E filesystems seed the topic from the keyring (never on S3 in the
     // clear); non-E2E uses `meta.json`. A pre-secret filesystem with no
@@ -5011,7 +5007,7 @@ async fn adopt_root(
     forward: &std::sync::Arc<forward::ForwardState>,
     node_id: u64,
 ) -> Result<()> {
-    let euid = unsafe { libc::geteuid() };
+    let (euid, _) = constellation_platform::native().process.effective_ids();
     if euid == 0 {
         return Ok(());
     }
@@ -5067,8 +5063,7 @@ async fn adopt_root_once(
     forward: &forward::ForwardState,
     node_id: u64,
 ) -> Result<bool> {
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
+    let (euid, egid) = constellation_platform::native().process.effective_ids();
     // Another node may already have done it; make sure we have its log.
     // A tail that fails (S3 unreachable) is not fatal: the replica we
     // have decides, and a later attempt tails again.
@@ -6558,16 +6553,14 @@ fn normalize_control_path(path: &str) -> String {
     }
 }
 
+/// `<data dir>/<uuid>` (the host's `Dirs::state_dir`); without a `HOME`,
+/// relative to the working directory, as ever.
 fn default_state_dir(meta: &FsMeta) -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default();
-            home.join(".local/share")
-        });
-    base.join("constellation").join(meta.uuid.to_string())
+    let uuid = meta.uuid.to_string();
+    constellation_platform::native()
+        .dirs
+        .state_dir(&uuid)
+        .unwrap_or_else(|_| PathBuf::from(".local/share/constellation").join(uuid))
 }
 
 /// Parse a human-readable byte size for CLI flags (`10G`, `512MiB`, bare

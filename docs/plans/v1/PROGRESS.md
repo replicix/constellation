@@ -27755,3 +27755,70 @@ from `tools/check-cross-known-failures.txt`).
 - [x] FUSE parity test: every `Code` the adapter produces equals fuser's `Errno::E*`
 - [x] Zero `libc::E*` outside the conversion module
 - [ ] Full gates — run once at the end of the plan-31 run
+
+## Plan 31 C2 — `constellation-platform`
+
+Milestone C2 of [plan 31](wip/31-core-frontend-backend.md) (§3, §4, §11):
+every host service the product crates use goes through one injectable
+bundle, `HostServices`, with Linux and macOS implementations and
+compile-only stubs for Windows, Android, iOS and FreeBSD.
+
+| Item | State | Where |
+|---|---|---|
+| New crate `constellation-platform` (workspace member, default member, `[workspace.dependencies]`); deps `constellation-types`, `zeroize`, and `libc` for `cfg(unix)` only | DONE | `crates/platform/Cargo.toml`, `Cargo.toml` |
+| `HostServices { dirs, process, daemon, file_lock, fs, secrets, lifecycle, mounts }`: `Clone` bundle of `Arc<dyn Trait>` (injection swaps one service — an in-memory secret store, a manual lifecycle — without a generic parameter through `Engine`/`View`); `HostServices::native()` per `cfg(target_os)`; `platform::native()` the process-wide set for code with nothing injected yet (the pre-C3 seam: C3 replaces those calls with the engine's bundle) | DONE | `crates/platform/src/lib.rs` |
+| `Dirs`: config/data/state/runtime dirs, XDG-style on Linux and macOS (plan 34 decision 7); `runtime_dir` keeps 32 bytes of the 104-byte `sun_path` for a socket name, else `/tmp/constellation-<uid>` | DONE | `crates/platform/src/dirs.rs`, `unix.rs` |
+| `Process`: hostname, pid liveness, `/proc` facts for the `daemon.lock` takeover (`ProcessFacts`; `classify` stays pure in cli), supplementary groups, effective ids, thread count, memory budget (meminfo ∧ cgroup), thread refs + backtrace signal (`tgkill` on Linux, `pthread_kill` on macOS; plan 31 §6.8) | DONE | `crates/platform/src/process.rs`, `linux.rs`, `macos.rs`, `unix.rs` |
+| `Daemon`: `unsafe fn detach(log)` — fork, `setsid`, stdio to the log, close-on-exec status pipe; the verdict protocol stays in cli | DONE | `crates/platform/src/daemon.rs`, `unix.rs`; `crates/cli/src/daemonize.rs` |
+| `FileLock`: `lock`/`try_lock` (`Ok(None)` = would block, `Code::Again`) returning a `LockGuard`, `holder_pid` (`/proc/locks`) | DONE | `crates/platform/src/lock.rs`, `unix.rs`, `linux.rs` |
+| `FsPrimitives`: `punch_hole`, `preallocate`, `full_fsync` (`F_FULLFSYNC` on macOS), `drop_cache` (`POSIX_FADV_DONTNEED`) | DONE | `crates/platform/src/fs.rs`, `linux.rs`, `macos.rs` |
+| `SecretStore` + `FileSecretStore` (`0600`, temp-then-rename, `<name>.lock` for read-modify-write; same file names as before) + `EphemeralSecretStore` (memory only, zeroized); `Credential`, `CredentialSource { AwsDefaultChain, Static, Refreshing }` (defined and tested, not wired — no `EngineConfig` before C3) | DONE | `crates/platform/src/secrets.rs` |
+| `LifecycleSource`, `LifecycleEvent { Foreground, Background, Suspending{deadline}, Resumed, NetworkChanged{reachable, metered}, LowPower }`, `ManualLifecycle` (per-subscriber queues) — engine behaviour is C8 | DONE | `crates/platform/src/lifecycle.rs` |
+| `MountTable`: list (`/proc/self/mountinfo`, `getmntinfo`), `is_mountpoint`, `unmount(Normal/Lazy/Force)` (`fusermount3 -u[z]` → `fusermount`, `umount2` for root), `fuse_waiting`/`abort_fuse` (`/sys/fs/fuse/connections/<n>`) | DONE | `crates/platform/src/mounts.rs`, `linux.rs`, `macos.rs` |
+| `platform::linux::fuse_mount_fd(target, &MountOpts) -> OwnedFd` (direct `mount(2)`, `fd=,rootmode=,user_id=,group_id=` + `allow_other`/`default_permissions`/`max_read`, `MS_NOSUID|MS_NODEV`[`|MS_RDONLY`]) and `fuse_unmount(target, lazy)`; unused by the daemon until C4 | DONE | `crates/platform/src/linux.rs` |
+| rdev conversions re-exported (`platform::{to,from}_linux_rdev`, `{to,from}_linux_fuse_rdev`); the FUSE adapter uses them | DONE | `crates/platform/src/lib.rs`; `crates/cli/src/fusefs{,_ops}.rs` |
+| Stubs `windows`, `android`, `ios`, `freebsd` (everything `Unsupported`; lifecycle is the portable `ManualLifecycle`); `cargo check -p constellation-platform --tests` clean for all four targets plus darwin | DONE | `crates/platform/src/{unsupported,windows,android,ios,freebsd}.rs` |
+| Call sites moved: `daemon_lock.rs` (`/proc/locks`, `/proc/<pid>/status`+`task/`, `/proc/<pid>` liveness, `/proc/self/mountinfo`, `/sys/fs/fuse`, takeover `flock`), `daemonize.rs` (fork/setsid/dup2/pipe), `main.rs` (`daemon.lock` and export-probe `flock`, `geteuid`/`getegid`, default state dir, node key), `registry.rs` (`flock`, XDG dirs), `e2e_pin.rs` (pins through `SecretStore::update`), `staging.rs` (`fallocate` punch), `fusefs.rs` (`/proc/<pid>/status` groups), `fuse_watch.rs` (`gettid`, SIGUSR2 handler, `tgkill`), `node_runtime.rs` (`fusermount3 -uz`), `parallelism.rs` (`/proc/meminfo`, cgroup), `startup.rs` (`/proc/self/status`), `snapshot.rs` (`geteuid`/`getegid`); `store-s3/nodes.rs` (`/proc/sys/kernel/hostname`); `net/identity.rs` (`node.key` through `SecretStore`, XDG); `chaos/op.rs` (`posix_fadvise`) | DONE | see the list |
+| Left in place: FUSE-protocol constants in the adapter (`O_*`, `F_RDLCK`…, `FALLOC_FL_*` op modes, `SEEK_*`, `S_IF*`, `XATTR_*` — C4's frontend), `main.rs`'s client-side `setxattr`/`getxattr`/`removexattr` helpers, fuser's own `SessionUnmounter`, and the harness's `fusermount3`/`SIGSTOP`/`fallocate` (C6) | — | — |
+
+Behaviour on Linux is unchanged apart from three deliberate details: an
+`XDG_*` variable that is set but empty now counts as unset (XDG spec; it
+used to make paths relative to the working directory), the E2E pins file
+is now `0600` like `node.key`, and a secret is `fsync`ed before its
+rename. `MountTable::unmount` also falls back to `umount2` when running
+as root without `fusermount3`/`fusermount` installed.
+
+Cross-check (`make check-cross`, exit 0): `constellation-platform` is clean
+for the Windows library check. `constellation-chaos` now compiles for
+darwin (its `posix_fadvise` moved behind `FsPrimitives::drop_cache`), which
+exposes `constellation-harness` to the darwin check for the first time: 8
+errors of its own (`libc::fallocate`, `setxattr` arities; C6 moves them).
+The known-failures file was updated two-way (`aarch64-apple-darwin
+constellation-chaos` removed, `aarch64-apple-darwin constellation-harness`
+added). cli's darwin errors went from 35 to 33 (`gettid`, `SYS_tgkill`
+gone; the rest are FUSE-frontend types for C4).
+
+| Target | Crate | Result |
+|---|---|---|
+| `aarch64-apple-darwin` | everything in the default workspace except the two below (now including `constellation-platform` and `constellation-chaos`) | ok |
+| `aarch64-apple-darwin` | `constellation` (cli) | FAIL (known; 33 errors) |
+| `aarch64-apple-darwin` | `constellation-harness` | FAIL (known, newly reached; 8 errors) |
+| `x86_64-pc-windows-gnu` | `constellation-types`, `-platform`, `-fs-core`, `-meta`, `-mtree`, `-store-s3`, `-net`, `-upload-concurrency`, `-model`, `-authority` | ok |
+| `x86_64-pc-windows-gnu` | `constellation-api`, `constellation-chaos` | FAIL (known) |
+
+### Plan 31 C2 exit criteria
+
+- [x] `constellation-platform` compiles for Linux, macOS (full) and
+  windows/android/ios/freebsd (stubs)
+- [x] `make check-cross` shows it clean for the Windows library check (and
+  exits 0 with the updated known-failures file)
+- [x] Every `/proc`, `fusermount3`, fork, `flock`, hostname, `fallocate`,
+  `posix_fadvise`, `/sys/fs/fuse`, `gettid`/`tgkill` use in `crates/cli`
+  and `crates/store-s3` goes through the platform crate
+- [x] `SecretStore` (file-backed) holds `node.key` and the E2E pins;
+  `EphemeralSecretStore` and `CredentialSource` exist with tests
+- [x] `fuse_mount_fd` mounts without fusermount3 (root-only test ran here)
+- [x] Unit tests: lock contention between two opens, punch hole seen by
+  `SEEK_HOLE`, secret files `0600`, ephemeral store writes nothing,
+  `classify` tests green, lifecycle fan-out
+- [ ] Full gates — run once at the end of the plan-31 run

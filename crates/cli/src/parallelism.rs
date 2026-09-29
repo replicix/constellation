@@ -102,32 +102,11 @@ fn env_override(name: &str, hard_max: usize) -> Option<usize> {
         .map(|value| value.min(hard_max))
 }
 
-#[cfg(target_os = "linux")]
+/// Host RAM, capped by the cgroup's memory limit when there is one (the
+/// host's `Process::memory_budget`: `/proc/meminfo` and
+/// `/sys/fs/cgroup` on Linux).
 fn host_memory_bytes() -> Option<u64> {
-    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let host_kib = contents
-        .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    let host = host_kib.checked_mul(1024)?;
-    let cgroup = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .into_iter()
-    .filter_map(|path| std::fs::read_to_string(path).ok())
-    .filter_map(|value| value.trim().parse::<u64>().ok())
-    .filter(|value| *value < u64::MAX / 2)
-    .min();
-    Some(cgroup.map_or(host, |limit| limit.min(host)))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn host_memory_bytes() -> Option<u64> {
-    None
+    constellation_platform::native().process.memory_budget()
 }
 
 #[cfg(test)]

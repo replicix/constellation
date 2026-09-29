@@ -1002,7 +1002,7 @@ fn to_fuse_attr(a: &FileAttr) -> fuser::FileAttr {
         gid: a.gid,
         // The kernel's 32-bit `new_encode_dev`, the inverse of what
         // `mknod` unpacked (`fusefs_ops.rs`).
-        rdev: constellation_types::rdev::to_linux_fuse_rdev(a.rdev),
+        rdev: constellation_platform::to_linux_fuse_rdev(a.rdev),
         blksize: 131072,
         flags: 0,
     }
@@ -3289,7 +3289,9 @@ impl crate::locks::LockFlush for ConstellationFs {
 pub(crate) struct Caller {
     pub uid: u32,
     pub gid: u32,
-    /// For the supplementary groups (`/proc/<pid>/status`); 0: none.
+    /// For the supplementary groups (the host's
+    /// `Process::supplementary_groups`: `/proc/<pid>/status` on Linux);
+    /// 0: none.
     pub pid: u32,
 }
 
@@ -3301,19 +3303,10 @@ impl Caller {
         if self.pid == 0 {
             return false;
         }
-        std::fs::read_to_string(format!("/proc/{}/status", self.pid))
-            .ok()
-            .and_then(|status| {
-                status
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Groups:").map(str::to_string))
-            })
-            .is_some_and(|groups| {
-                groups
-                    .split_whitespace()
-                    .filter_map(|g| g.parse::<u32>().ok())
-                    .any(|g| g == gid)
-            })
+        constellation_platform::native()
+            .process
+            .supplementary_groups(self.pid)
+            .is_ok_and(|groups| groups.contains(&gid))
     }
 
     /// The kernel's `may_open` for an existing regular file opened with

@@ -330,9 +330,10 @@ impl Staging {
 
     /// A sealed chunk no longer needs staging residency. Keep the
     /// sparse file's logical offsets stable, but punch the range out
-    /// and release its budget. Linux filesystems that do not support
-    /// hole punching still get the logical budget release; the bytes
-    /// are already durable in the chunk cache before this is called.
+    /// and release its budget. Filesystems (and hosts) that do not
+    /// support hole punching still get the logical budget release; the
+    /// bytes are already durable in the chunk cache before this is
+    /// called, so a failed punch is ignored.
     pub fn release_chunk(&mut self, idx: u64, chunk_size: u32) {
         if !self.dirty.contains(idx) {
             return;
@@ -347,15 +348,9 @@ impl Staging {
         if len == 0 {
             return;
         }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            libc::fallocate(
-                std::os::fd::AsRawFd::as_raw_fd(&self.file),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                start as libc::off_t,
-                len as libc::off_t,
-            );
-        }
+        let _ = constellation_platform::native()
+            .fs
+            .punch_hole(&self.file, start, len);
         let released = len.min(self.reserved);
         self.reserved -= released;
         self.budget.release(released);
@@ -385,19 +380,14 @@ impl Staging {
             self.release_chunk(index, chunk_size);
         }
         self.dirty.clear_range(start, end);
-        #[cfg(target_os = "linux")]
-        unsafe {
-            let offset = start.saturating_mul(u64::from(chunk_size));
-            let len = end
-                .saturating_sub(start)
-                .saturating_mul(u64::from(chunk_size));
-            libc::fallocate(
-                std::os::fd::AsRawFd::as_raw_fd(&self.file),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                offset as libc::off_t,
-                len as libc::off_t,
-            );
-        }
+        let offset = start.saturating_mul(u64::from(chunk_size));
+        let len = end
+            .saturating_sub(start)
+            .saturating_mul(u64::from(chunk_size));
+        // Best-effort, as in `release_chunk`.
+        let _ = constellation_platform::native()
+            .fs
+            .punch_hole(&self.file, offset, len);
     }
 
     #[allow(dead_code)] // part of the public shape (plan 07); exercised by tests

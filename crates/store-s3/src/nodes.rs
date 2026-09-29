@@ -503,9 +503,12 @@ pub async fn publish_ro(
     Ok(())
 }
 
+/// This host's name for the node record (`uname -n`, from the host's
+/// `Process::hostname`), or `unknown`.
 fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
+    constellation_platform::native()
+        .process
+        .hostname()
         .unwrap_or_else(|_| "unknown".into())
 }
 

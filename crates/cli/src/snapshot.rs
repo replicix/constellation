@@ -420,6 +420,7 @@ impl SnapshotManager {
             .find(|row| row.name == name)
             .with_context(|| format!("snapshot {path}@{name} does not exist"))?;
         let root = SnapshotRoot::parse(&row.root_hash)?;
+        let (uid, gid) = constellation_platform::native().process.effective_ids();
         let mut specs = vec![CloneSpec {
             parent_index: None,
             name: String::new(),
@@ -429,8 +430,8 @@ impl SnapshotManager {
             // Make the ordinary writable clone belong to the daemon's mount
             // user; hard-coding root makes root-level clone entries
             // undeletable on an unprivileged mount.
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid,
+            gid,
             size: 0,
             mtime_ns: row.created_unix_ms * 1_000_000,
             target: None,
@@ -742,7 +743,10 @@ mod tests {
             .unwrap();
         let clone_root = meta.resolve_path("/copy").unwrap().unwrap();
         let clone_attr = meta.getattr(clone_root).unwrap().unwrap();
-        assert_eq!(clone_attr.uid, unsafe { libc::geteuid() });
+        assert_eq!(
+            clone_attr.uid,
+            constellation_platform::native().process.effective_ids().0
+        );
         assert_eq!(
             meta.get_xattr(clone_root, "user.directory").unwrap(),
             Some(b"root".to_vec())

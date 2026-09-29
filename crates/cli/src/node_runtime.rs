@@ -65,23 +65,20 @@ fn clear_stale_mount(mountpoint: &std::path::Path) {
         ?mountpoint,
         "detaching stale FUSE mount from a previous daemon before remounting"
     );
-    // `fusermount3 -uz` (lazy) is the portable way to drop a dead FUSE
-    // mount from userspace; fall back to `fusermount` for older systems.
-    for bin in ["fusermount3", "fusermount"] {
-        let status = std::process::Command::new(bin)
-            .args(["-uz", &mountpoint.to_string_lossy()])
-            .status();
-        if let Ok(s) = status {
-            if s.success() {
-                return;
-            }
-        }
+    // A lazy unmount (`fusermount3 -uz` on Linux, falling back to
+    // `fusermount` for older systems) is the portable way to drop a dead
+    // FUSE mount from userspace.
+    if let Err(error) = constellation_platform::native()
+        .mounts
+        .unmount(mountpoint, constellation_platform::UnmountMode::Lazy)
+    {
+        tracing::warn!(
+            ?mountpoint,
+            %error,
+            "could not detach stale mount automatically; \
+             run `fusermount3 -uz <mountpoint>` if the remount fails"
+        );
     }
-    tracing::warn!(
-        ?mountpoint,
-        "could not detach stale mount automatically; \
-         run `fusermount3 -uz <mountpoint>` if the remount fails"
-    );
 }
 
 /// Env: `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS`, milliseconds

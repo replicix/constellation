@@ -102,7 +102,7 @@ pub struct Registry {
     /// `merge_and_save`/`remove` need) is atomic across processes. Plain
     /// `load` does not take it — a read-only glance (`fs list`, `status`
     /// name resolution) does not need to serialize against writers.
-    _lock: Option<std::fs::File>,
+    _lock: Option<constellation_platform::LockGuard>,
 }
 
 impl Registry {
@@ -115,13 +115,11 @@ impl Registry {
                 return Ok(PathBuf::from(p));
             }
         }
-        let base = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            PathBuf::from(xdg)
-        } else {
-            let home = std::env::var("HOME").context("HOME is not set")?;
-            PathBuf::from(home).join(".config")
-        };
-        Ok(base.join("constellation").join("registry.toml"))
+        let config = constellation_platform::native()
+            .dirs
+            .config_dir()
+            .context("locating the config dir")?;
+        Ok(config.join("registry.toml"))
     }
 
     /// Read-only load: no cross-process lock, safe for concurrent
@@ -161,28 +159,18 @@ impl Registry {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path.with_extension("toml.lock"))
-            .context("opening registry lock file")?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let fd = lock_file.as_raw_fd();
-            // SAFETY: `fd` is a valid, open fd owned by `lock_file` for
-            // the duration of this call; `flock` does not touch memory.
-            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error()).context("locking registry file");
-            }
-        }
+        let lock_file =
+            constellation_platform::lock::open_lock_file(&path.with_extension("toml.lock"))
+                .context("opening registry lock file")?;
+        let lock = constellation_platform::native()
+            .file_lock
+            .lock(lock_file)
+            .context("locking registry file")?;
         let entries = Self::read(&path)?;
         Ok(Self {
             path,
             entries,
-            _lock: Some(lock_file),
+            _lock: Some(lock),
         })
     }
 
@@ -281,15 +269,12 @@ impl Registry {
 }
 
 /// `$XDG_DATA_HOME/constellation/<name>`, falling back to
-/// `~/.local/share/constellation/<name>`.
+/// `~/.local/share/constellation/<name>` (the host's `Dirs::state_dir`).
 pub fn default_named_state_dir(name: &str) -> Result<PathBuf> {
-    let base = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg)
-    } else {
-        let home = std::env::var("HOME").context("HOME is not set")?;
-        PathBuf::from(home).join(".local").join("share")
-    };
-    Ok(base.join("constellation").join(name))
+    constellation_platform::native()
+        .dirs
+        .state_dir(name)
+        .context("locating the data dir")
 }
 
 #[cfg(test)]

@@ -383,7 +383,7 @@ impl Filesystem for FuseFs {
                 gid: req.gid(),
                 // FUSE carries the kernel's 32-bit `new_encode_dev`; the
                 // journal carries the portable pair (plan 31 §7).
-                rdev: constellation_types::rdev::from_linux_fuse_rdev(rdev),
+                rdev: constellation_platform::from_linux_fuse_rdev(rdev),
             }
         };
         match self.mutate_op(parent, op) {

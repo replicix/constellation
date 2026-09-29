@@ -1031,6 +1031,7 @@ dependencies = [
  "constellation-meta",
  "constellation-mtree",
  "constellation-net",
+ "constellation-platform",
  "constellation-store-s3",
  "constellation-types",
  "constellation-upload-concurrency",
@@ -1106,8 +1107,8 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "constellation-platform",
  "constellation-types",
- "libc",
  "rand 0.9.5",
  "serde",
  "serde_json",
@@ -1198,6 +1199,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "constellation-platform",
  "futures-lite",
  "iroh",
  "iroh-gossip",
@@ -1208,6 +1210,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "constellation-platform"
+version = "1.0.0"
+dependencies = [
+ "constellation-types",
+ "libc",
+ "tempfile",
+ "zeroize",
 ]
 
 [[package]]
@@ -1224,6 +1236,7 @@ dependencies = [
  "chacha20poly1305",
  "constellation-fs-core",
  "constellation-mtree",
+ "constellation-platform",
  "futures",
  "memmap2",
  "object_store",

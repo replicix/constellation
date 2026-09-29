@@ -5,7 +5,6 @@ use constellation_types::Code;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -16,9 +15,8 @@ use std::time::Instant;
 /// today, which makes this redundant but keeps the checker independent
 /// of that choice. Best-effort; filesystems may refuse the advice.
 fn drop_cached_pages(f: &File) {
-    let fd = f.as_raw_fd();
-    // SAFETY: fd is a live open file; POSIX_FADV_DONTNEED is advisory.
-    let _ = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+    // `POSIX_FADV_DONTNEED` on Linux; advisory, and unsupported elsewhere.
+    let _ = constellation_platform::native().fs.drop_cache(f, 0, 0);
 }
 
 /// A single FS operation issued by the coordinator.
