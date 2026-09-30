@@ -18,10 +18,13 @@ Depends on **plan 31 (`31-core-frontend-backend.md`)**, specifically:
   transports, roles, audit) plus its CSI seam: `Transport::send_fd`
   (SCM_RIGHTS over `UnixSocket`; `InProcess` passes the fd directly;
   `NamedPipe` does not support it and is irrelevant here — Linux only), the
-  control methods this plan drives (`fs.unlock`, `view.mount`, `view.unmount`,
-  `view.list{labels}`, `view.stats`, `quota.set`, `quota.get`,
-  `snapshot.create{hold}`, `snapshot.delete`, `clone.create`, `node.leave`,
-  `node.handoff`), `EphemeralSecretStore` and per-engine `CredentialSource`.
+  control methods this plan drives (`fs.create`, `fs.unlock`, `view.mount`,
+  `view.unmount`, `view.list{labels}`, `view.stats`, `quota.set`,
+  `quota.get`, `snapshot.create{hold}`, `snapshot.delete`, `clone.create`,
+  `node.leave`, `node.handoff`, and plan 31's `browse.*` methods
+  (`browse.mkdir`, `browse.rename`, `browse.readdir`, `browse.delete`,
+  `browse.xattr`) that the volume-pool design (§2.3, §4) uses), and
+  `EphemeralSecretStore` and per-engine `CredentialSource`.
 - **C8** (`EngineProfile`, in particular the `Server` preset for dense
   multi-PV hosts) and `EngineHost` (one process hosting N `Engine`s sharing a
   `ResourceBudget`) — the engine pod is an `EngineHost` with N = 1.
@@ -35,8 +38,11 @@ None of this exists in `crates/cli` today (VERIFIED against `a945b05`: no
 `crates/csi`, no `fuse_mount_fd`, no `SessionHandoff`, no `EngineHost`) —
 plan 31 is being written in parallel to carry these seams, and this plan's
 milestones assume that target shape, not today's monolith. Every fixed name
-above is quoted verbatim from the shared design brief; this plan does not
-rename any of them.
+above is quoted verbatim from the shared design brief, except `fs.create`
+and the `browse.*` family, which this plan's later volume-pool revision
+(§2.3) introduces as new, explicitly-flagged additions plan 31's session
+needs to pick up — this plan does not rename or relitigate any of the
+brief's own original fixed names.
 
 Also depends on **plan 33 (`33-control-plane-and-ui.md`), U1 only**: roles
 (`viewer < operator < admin`), the `control-acl.toml` allowlist format, and
@@ -89,34 +95,197 @@ existing Constellation capability (RWX, snapshots, quotas, P2P cache) into
 something a `StorageClass` and a `PersistentVolumeClaim` can reach, which is
 the on-ramp most platform teams actually use to adopt a new storage system.
 
-The one genuinely hard new problem this plan introduces is **FUSE-in-Kubernetes
-churn**: a kernel FUSE mount is pinned to the process that opened
-`/dev/fuse`. Every existing FUSE-backed CSI driver either (a) runs the FUSE
-process inside the *node plugin* container, which means a driver
-upgrade/crash/OOM kills every mount on that node (`ENOTCONN`, "Transport
-endpoint is not connected", surfaced to every pod using the filesystem), or
-(b) accepts that cost as a known limitation. Constellation's engine already
-separates cleanly from its FUSE adapter (plan 31 C4's `Vfs` contract) and
-already treats FUSE session lifetime as something the engine, not the
-frontend, should own (`kernel_inval.rs`'s notifier thread, the responder
-completion pool) — so this plan can do better: put the FUSE-holding process
-in its own long-lived pod, decoupled from the CSI node plugin's own
-lifecycle, and go one step further with **session handover** so that even
-*that* pod's own upgrades don't interrupt writers. This mirrors precedent
-(§14(d)) from two production FUSE CSI drivers that independently arrived at
-"FUSE process in its own pod, fd handed over the unix socket" — Mountpoint
-for Amazon S3 CSI driver v2 and the JuiceFS CSI driver's mount-pod mode —
-and pushes one step further than both by making the *handover itself*
-lossless for open file handles, not just for the mount point.
+The second problem this plan has to solve, distinct from the FUSE-churn
+problem below, is **who owns a Constellation filesystem's lifecycle**. A
+naive mapping — one Constellation filesystem per `PersistentVolume` — makes
+every CSI driver operation trivial (`CreateVolume` = `fs.create`,
+`DeleteVolume` = drop the filesystem) but pushes real costs onto the
+*user*: a cluster provisioning hundreds of small PVs would need hundreds of
+Constellation filesystems, each with its own idle-tailer S3 polling cost
+(plan 26's finding — see §2.3), its own cache with nothing shared across
+PVs that are obviously related (the same team's scratch volumes), and no
+way to get a cheap CoW clone between two PVs, because Constellation's
+clones and snapshots are subtree-granular *within one filesystem* (plan 09
+§Step 4; `crates/api/src/types.rs`'s `SnapshotCreate{selector}`/
+`Clone{selector, destination}` both take a subtree selector, not a
+cross-filesystem one) — chunks live under one filesystem's own bucket
+prefix, so a clone can't cheaply reference another filesystem's chunks.
+This plan's answer is **volume pools** (§2.3): a `StorageClass` names only a
+`bucket` (and an optional `prefix`), the driver owns everything under it —
+creating the shared pool filesystem idempotently, carving out one subtree
+per PV, tracking ownership in xattrs instead of a side database, and
+trashing-then-purging deleted volumes asynchronously — so a user requesting
+storage never has to pre-create or name a Constellation filesystem by hand.
+Tenants that need per-volume isolation (their own E2E key, their own
+failure domain) opt into `layout: dedicated` instead, at the cost this
+plan's pool design exists specifically to avoid paying by default.
 
-## 2. Decision: where does the FUSE session live?
+The third, and hardest, new problem this plan introduces is
+**FUSE-in-Kubernetes churn**: a kernel FUSE mount is pinned to the process
+that opened `/dev/fuse`. Every existing FUSE-backed CSI driver either (a)
+runs the FUSE process inside the *node plugin* container, which means a
+driver upgrade/crash/OOM kills every mount on that node (`ENOTCONN`,
+"Transport endpoint is not connected", surfaced to every pod using the
+filesystem), or (b) accepts that cost as a known limitation. Constellation's
+engine already separates cleanly from its FUSE adapter (plan 31 C4's `Vfs`
+contract) and already treats FUSE session lifetime as something the engine,
+not the frontend, should own (`kernel_inval.rs`'s notifier thread, the
+responder completion pool) — so this plan can do better: put the
+FUSE-holding process in its own long-lived pod, decoupled from the CSI node
+plugin's own lifecycle, adopt the same drain discipline every production
+FUSE CSI driver already relies on (§2.2, always on, regardless of what
+follows), and go one step further with **session handover** on top of it so
+that even a *planned* engine-pod replacement doesn't interrupt writers. This
+mirrors precedent (Sources table, the Mountpoint-for-Amazon-S3 and JuiceFS
+CSI driver rows) from two production FUSE CSI drivers that independently
+arrived at "FUSE process in its own pod, fd handed over the unix socket" —
+Mountpoint for Amazon S3 CSI driver v2 and the JuiceFS CSI driver's
+mount-pod mode — and pushes one step further than both by making the
+*handover itself* lossless for open file handles, not just for the mount
+point. §2.2 below is now VERIFIED against Mountpoint's own code (not just
+its docs) that no such handover exists anywhere in that ecosystem — this is
+genuinely new ground, and K0 (§15) treats it accordingly.
+
+## 2. Decisions: FUSE session placement and volume pooling
+
+### 2.1 Where does the FUSE session live?
 
 | Option | Node-plugin crash blast radius | Engine-pod upgrade blast radius | Shares engine/cache across PVs of one fs | Extra moving parts | Verdict |
 |---|---|---|---|---|---|
 | **FUSE in the node plugin container itself** (classic pattern: most first-generation FUSE CSI drivers, e.g. early Mountpoint-S3 CSI v1, most `goofys`/`s3fs` sidecar drivers) | Every mount on the node dies (`ENOTCONN`) on every node-plugin restart, including routine driver upgrades and `livenessprobe`-triggered restarts | n/a (same process) | No — one process per node total, no per-fs isolation, one noisy-neighbour PV can starve every other PV's cache | Fewest — single privileged DaemonSet pod | **Rejected.** Kubernetes restarts DaemonSet pods routinely (upgrades, node pressure, `livenessprobe`); making every restart a filesystem outage for every pod on the node is not acceptable for what is supposed to be Constellation's *strongest* multi-writer story. |
 | **One engine (and FUSE session) per PV** | A crash only affects that PV's pods | An upgrade of one PV's engine doesn't affect others, but N PVs on a node means N processes, N caches, N sets of leases/P2P listeners for what might be the *same* filesystem | No — defeats the purpose of a shared working-set cache across PVs of one filesystem on one node | Most — the pod count scales with PV count, not node count or filesystem count | **Rejected.** Constellation's value is the shared cache and lease/coop machinery; splitting it per PV means two pods on the same node mounting the same filesystem's two different subtrees can't share a cache page, can't share a lease, and pay S3/P2P costs twice. It also multiplies `EngineProfile` memory/cache budgets by PV count instead of by filesystem count. |
-| **One engine pod per (Constellation filesystem, k8s node), FUSE fd handed off from the node plugin** — **chosen** | A crash affects only PVs of that one filesystem on that one node; other filesystems and other nodes are unaffected | An upgrade of one engine pod affects only that filesystem's PVs on that node, and with session handover (§9) not even that, for in-flight I/O | Yes — `View`s for every PV of that filesystem on that node share one `Engine`'s cache, leases and P2P endpoint | Moderate — pod count scales with distinct (filesystem, node) pairs actually in use, which is the natural unit of resource sharing | **Chosen.** Matches the natural sharing boundary (one filesystem = one working set, one lease namespace, one P2P identity per node) while keeping blast radius at exactly that boundary, and lets the *unprivileged* engine pod do all the engine work while only the *privileged* node plugin ever calls `mount(2)`. |
-| **Kernel NFS re-export**: a Constellation-owned NFS server (plan 34's `frontend-nfs`, in-cluster) fronting the engine, mounted by kubelet via the built-in Linux NFS client, no FUSE in the picture at all | A server pod restart is a normal NFSv4.1 reconnect (grace period), not `ENOTCONN` — genuinely more resilient to restarts than raw FUSE | Same resilience story as the crash case — NFSv4.1 clients recover across a server restart within the grace period | Yes, same sharing boundary as the chosen option if scoped per filesystem | Fewer new primitives *in Kubernetes* (no fd passing, no session handover, no privileged node plugin beyond the kernel NFS client's own mount call) but a large new one *in Constellation* — plan 34's NFSv4.1 server has to exist and be hardened first | **Rejected for this plan, recorded as the honest runner-up.** It trades this plan's hardest problem (FUSE session handover) for a dependency this plan cannot assume: plan 34's NFS frontend, built and hardened for a *desktop* macOS client, would need to become a multi-tenant, quota-enforcing, label-aware server fronting arbitrary numbers of Kubernetes-mounted filesystems — materially more surface than "expose one already-open FUSE fd to a sibling pod." It also reintroduces exactly the network round-trip on every read that FUSE-local-then-S3-cold-then-P2P avoids: an in-cluster NFS re-export sits *between* the pod and the engine's cache, whereas the FUSE-fd-in-engine-pod design puts the engine's cache in the same failure/latency domain as the FUSE mount, one hop closer to the workload. If K0's fd-passing/handover spike turns out to be infeasible even after the pre-agreed fallbacks (§13's K0 gate), this is the documented plan B, not a stopgap improvised under pressure. |
+| **One engine pod per (Constellation filesystem, k8s node), FUSE fd handed off from the node plugin** — **chosen** | A crash affects only PVs of that one filesystem on that one node; other filesystems and other nodes are unaffected | An upgrade of one engine pod affects only that filesystem's PVs on that node, and with session handover (§8) not even that, for in-flight I/O | Yes — `View`s for every PV of that filesystem on that node share one `Engine`'s cache, leases and P2P endpoint | Moderate — pod count scales with distinct (filesystem, node) pairs actually in use, which is the natural unit of resource sharing | **Chosen.** Matches the natural sharing boundary (one filesystem = one working set, one lease namespace, one P2P identity per node) while keeping blast radius at exactly that boundary, and lets the *unprivileged* engine pod do all the engine work while only the *privileged* node plugin ever calls `mount(2)`. |
+| **Kernel NFS re-export**: a Constellation-owned NFS server (plan 34's `frontend-nfs`, in-cluster) fronting the engine, mounted by kubelet via the built-in Linux NFS client, no FUSE in the picture at all | A server pod restart is a normal NFSv4.1 reconnect (grace period), not `ENOTCONN` — genuinely more resilient to restarts than raw FUSE | Same resilience story as the crash case — NFSv4.1 clients recover across a server restart within the grace period | Yes, same sharing boundary as the chosen option if scoped per filesystem | Fewer new primitives *in Kubernetes* (no fd passing, no session handover, no privileged node plugin beyond the kernel NFS client's own mount call) but a large new one *in Constellation* — plan 34's NFSv4.1 server has to exist and be hardened first | **Rejected for this plan, recorded as the honest runner-up.** It trades this plan's hardest problem (FUSE session handover) for a dependency this plan cannot assume: plan 34's NFS frontend, built and hardened for a *desktop* macOS client, would need to become a multi-tenant, quota-enforcing, label-aware server fronting arbitrary numbers of Kubernetes-mounted filesystems — materially more surface than "expose one already-open FUSE fd to a sibling pod." It also reintroduces exactly the network round-trip on every read that FUSE-local-then-S3-cold-then-P2P avoids: an in-cluster NFS re-export sits *between* the pod and the engine's cache, whereas the FUSE-fd-in-engine-pod design puts the engine's cache in the same failure/latency domain as the FUSE mount, one hop closer to the workload. If K0's fd-passing/handover spike turns out to be infeasible even after the pre-agreed fallbacks (§15's K0 gate), this is the documented plan B, not a stopgap improvised under pressure. |
+
+### 2.2 Compared with Mountpoint for Amazon S3's CSI driver
+
+This session re-read Mountpoint's own source (`mountpoint-s3`
+`e144a7bb84948045f0d7cde77060afaa7ed91b53` and `mountpoint-s3-csi-driver`
+`b450b22beae8bddc0d3c09551655b2b7d323e29b`, both `main`, 2026-09-28 — see the
+Sources table) rather than relying on its docs alone. Three findings change
+this plan from "argued by analogy" to "checked against code":
+
+- **Positioning.** Mountpoint is deliberately, explicitly **not** a POSIX
+  filesystem (VERIFIED, `mountpoint-s3/doc/SEMANTICS.md`): sequential
+  single-writer whole-file writes only, no in-place edits, rename supported
+  only on S3 Express One Zone, no locks, no hard/symlinks, and consistency
+  that degrades from close-to-open (no cache) to a metadata TTL (with
+  caching enabled) rather than staying strict. Constellation's full POSIX
+  surface, leases and advisory locks, coop cache, offline epochs and
+  snapshot/clone model are a *materially larger scope* than Mountpoint ever
+  attempts — worth stating plainly in this plan's own docs (§"Semantic
+  notes") rather than only implying it, so a reader who knows Mountpoint
+  does not undersell what RWX means here.
+- **fd-passing mechanics: identical, and now VERIFIED against code, not
+  just docs.** `mountpoint-s3-csi-driver`'s CSI Node component
+  (`pkg/driver/node/mounter/pod_mounter.go`) opens `/dev/fuse` itself, calls
+  `mount(2)` on a node-local source path, sends the fd to the Mountpoint Pod
+  over a Unix socket via `SCM_RIGHTS`
+  (`pkg/mountpoint/mountoptions/mount_options.go`:
+  `syscall.UnixRights`/`WriteMsgUnix`), then **closes its own copy of the
+  fd** so exactly one process owns it from that point on
+  (`pod_mounter.go`'s `defer pm.closeFUSEDevFD(...)`), commit
+  `b450b22beae8bddc0d3c09551655b2b7d323e29b`. This is line-for-line the same
+  sequence as `fuse_mount_fd`/`Transport::send_fd` and settled decision 5's
+  staging/bind-mount split — strong, working, production-hardened precedent
+  for this plan's design, not a novel invention on that front. This plan
+  adopts the same "close the parent's copy immediately after the
+  `SCM_RIGHTS` send" discipline explicitly, at every relay step (§8 step 4
+  included), for the same reason Mountpoint needs it: unambiguous fd
+  ownership.
+- **Pod sharing is narrower than this plan's, and for a reason that doesn't
+  apply to Constellation.** Mountpoint shares a Mountpoint Pod only across
+  workload pods mounting the *same volume ID*
+  (VERIFIED, `pkg/api/v2/mountpoints3podattachment_types.go`'s
+  `MountpointS3PodAttachmentSpec{NodeName, VolumeID}`,
+  `docs/MOUNTPOINT_POD_SHARING.md`) — it has no cross-PV shared cache,
+  lease or P2P concept to make coarser sharing valuable, so there was never
+  a "share across every PV of one bucket" option on the table for
+  Mountpoint to reject. This plan's per-(pool, node) engine-pod sharing
+  (§2.1, and §2.3 below for pool vs. dedicated) is *justified by* the
+  working-set cache, coop cache and lease/roster machinery Mountpoint
+  simply does not have — the comparison is real, not a difference Mountpoint
+  merely declined to make.
+- **Session handover has no precedent anywhere in this ecosystem — VERIFIED
+  by reading the only two `fuser`-fork constructors that exist, not by their
+  absence from the docs.** `mountpoint-s3-fuser`'s own fork moved `INIT`
+  handling into the ordinary per-request dispatch loop instead of a
+  blocking pre-loop (`request.rs:124-161`), but its `Session::from_fd`
+  still sets `initialized: AtomicBool::new(false)` (`session.rs:132`) and is
+  **only ever called against a freshly `mount(2)`-ed connection** — every
+  call site in the CSI driver follows a brand-new mount in the same code
+  path (`pod_mounter.go`'s `mountS3AtSource`), never against a live
+  connection inherited from a dead sibling process. Mountpoint CSI v2's own
+  `RestartPolicy: OnFailure` Pod spec means a Mountpoint Pod crash or
+  restart is accepted as a genuine `ENOTCONN` outage
+  (`docs/TROUBLESHOOTING.md` documents this as a trade-off, not a bug),
+  recovered only by redoing the entire open+mount(2)+`SCM_RIGHTS` cycle
+  against a fresh kernel connection. **This means plan 37's
+  `FuseSession::detach()`/`resume()` + `node.handoff` protocol (§8) has no
+  working reference implementation in Mountpoint, JuiceFS, or anywhere else
+  surfaced by this research — it is first-of-its-kind, not an adaptation of
+  an existing technique.** K0 is this plan's single highest-risk item for
+  exactly that reason, and is proven first, before K1-K7 assume it works.
+- **Adopt Mountpoint's drain discipline as this plan's always-on baseline,
+  independent of whatever K0 finds.** Mountpoint's only mitigation for the
+  *planned* replacement case — since it has no handover — is: the
+  Mountpoint Pod ignores `SIGTERM` while it is serving mounts, carries a
+  10-minute `terminationGracePeriodSeconds`, and the driver documents
+  draining workload pods before the Mountpoint Pod is force-killed
+  (`docs/TROUBLESHOOTING.md`, `pkg/podmounter/mppod/creator.go`'s
+  `TerminationGracePeriodSeconds = 600`). This plan adopts exactly that
+  baseline for engine pods (§8's Drain subsection, §8's failure handling),
+  *unconditionally* — not as a K0-failure fallback, but as the safety net
+  every engine pod always has, the same way Mountpoint always has it: an
+  engine-pod crash (OOM, panic — not a graceful `node.handoff`) is `ENOTCONN`
+  until the node plugin notices and remounts, triggered by
+  `requiresRepublish: true` (settled decision 12, revised from this plan's
+  earlier `false` — see there for why). Session handover (§8, gated on K0)
+  is the *upgrade path layered on top* of that baseline for the planned
+  case, not a replacement for it — if K0 fails, this plan still ships with
+  exactly Mountpoint's own safety net, never with nothing.
+
+### 2.3 Volume-to-filesystem mapping: pool vs. dedicated vs. filesystem-per-PV
+
+This is a separate decision from §2.1 (which process holds the FUSE
+session): §2.1 fixes *where the engine runs*; this decision fixes *what
+Constellation filesystem a PV's subtree lives in*, which is what the
+`StorageClass` actually configures (`layout` parameter, §"StorageClass
+parameters"). Facts this rests on, verified in the repo and restated from
+the coordinator brief:
+
+- Constellation's snapshots and clones are **subtree-granular and
+  copy-on-write inside one filesystem only** (plan 09 §Step 4; `crates/api/
+  src/types.rs:93-110`'s `SnapshotCreate{selector}`/`Clone{selector,
+  destination}` both take a same-filesystem subtree selector). Chunks live
+  under one filesystem's own bucket prefix, so a clone cannot cheaply
+  reference another filesystem's chunks — a cross-filesystem clone is a
+  full data copy, not a metadata-only operation.
+- Each filesystem pays its own idle-metadata-polling cost per node (plan
+  26's finding: per-node idle metadata polling is the dominant steady-state
+  S3 cost) — one tailer per filesystem per node, regardless of how many PVs
+  that filesystem holds.
+- A shared filesystem shares its working-set cache, coop-cache fan-out and
+  content-addressed chunk store across every PV inside it — a second PV
+  that happens to hold duplicate data (the same base image seeded into two
+  scratch volumes, say) dedups for free; two PVs in two different
+  filesystems never share a chunk.
+
+| Option | CoW snapshots/clones | Idle tailer cost | Shared cache/dedup | Isolation | Verdict |
+|---|---|---|---|---|---|
+| **Pool** (`layout: pool`, **default**): one shared Constellation filesystem per `StorageClass`, auto-created from just `bucket`/`prefix`; every PV is a subtree `/volumes/<pv-name>` inside it | Free and cheap between any two PVs of the same pool (same-filesystem subtree clone) | One tailer per (pool [shard], node) — shared across every PV of that pool on that node | Yes — one cache, one lease namespace, one dedup domain per pool | Weaker: one E2E key, one metadata commit chain, one GC domain for the whole pool; the engine pod can reach every PV in the pool, not just the caller's own (§"Credentials and security" states this trust model explicitly) | **Chosen as the default.** Matches "user supplies only a bucket" (§1): no out-of-band filesystem creation, and the common case (many related PVs — a team's namespace, a CI system's ephemeral scratch volumes) gets free clones and a shared cache for free. |
+| **Dedicated** (`layout: dedicated`): one Constellation filesystem per PV, at `prefix/<pv-name>/` | Only against another dedicated volume's *own* snapshots — a clone from one dedicated PV's snapshot into a new dedicated PV is a full copy (server-side `CopyObject` of chunks + metadata import) or unsupported (this plan: unsupported at K0-K7, a documented later milestone) | One tailer per PV per node — the worst case, paid deliberately | No — by design; that is the isolation this option buys | Strongest available from this driver: independent E2E key, independent failure domain, independent GC; a compromised or buggy tenant's engine pod never has a live connection to another tenant's data | **Kept, opt-in.** For tenants whose compliance or blast-radius requirements outweigh the pool's efficiency — a `StorageClass` per tenant, `layout: dedicated`, same driver, no separate code path for "isolated mode" beyond this one parameter. |
+| **Filesystem-per-PV as the *only* option** (no pooling at all — the naive default a first cut of this driver would ship, and in effect what this plan's own earlier draft did by requiring a StorageClass to name one pre-existing Constellation filesystem and mapping every PV to a subtree of it, with no xattr-based ownership or trash) | Same as dedicated — no cross-PV sharing exists to clone from | Same as dedicated — paid by every user, not just tenants who need it | None, ever | Same as dedicated, whether or not any given tenant wants it | **Rejected as the only mode.** Forcing every deployment to pay dedicated's idle-tailer and no-shared-cache cost, and to hand-manage or explicitly name a Constellation filesystem before provisioning anything, directly contradicts §1's "user supplies only a bucket" goal for the overwhelmingly common case where PVs in one `StorageClass` *are* related enough to share a filesystem safely. Dedicated survives as an explicit, opt-in `layout` for the minority that needs it instead. |
+
+**Shards.** Within `layout: pool`, `shards: N` (default 1) hashes PVs by
+name onto `N` pool filesystems at `prefix/shard-<k>/`, to lift the
+per-pool metadata throughput ceiling that the shared CAS commit chain
+otherwise imposes as PV count grows on one filesystem. Clones and restores
+stay within the source's shard (§"Settled decisions"). K0 (§15) measures
+one pool filesystem's metadata-throughput ceiling under many PVs across
+many nodes specifically to give operators concrete sharding guidance
+("shard once you exceed N PVs per pool" or similar), rather than this plan
+guessing a number up front.
 
 ## 3. Settled decisions — do not relitigate
 
@@ -143,7 +312,11 @@ lossless for open file handles, not just for the mount point.
    against a node-local *global staging path*
    `/var/lib/kubelet/plugins/csi.constellation.dev/staging/<pv-name>/globalmount`
    (naming convention shared with `csi-driver-nfs`'s
-   `globalmount` staging layout — precedent §14(h)). `NodePublishVolume` is
+   `globalmount` staging layout — Sources table, `csi-driver-nfs` row).
+   `<pv-name>` here is `req.volume_id`'s CSI-visible name (`pvc-<uid>`), not
+   the pool-internal path (settled decision 7) — kubelet's staging-path
+   convention is keyed by the volume it thinks it's staging, independent of
+   which pool or shard that volume actually routes to. `NodePublishVolume` is
    then a plain kernel bind mount (`MS_BIND`, read-only for `ROX`) from the
    staging path to the pod's own `target_path`, with **no new FUSE session
    per pod**. This is the mechanism that lets N pods on one node share one
@@ -165,25 +338,71 @@ lossless for open file handles, not just for the mount point.
    filesystem size a kernel fs driver needs to grow; `ControllerExpandVolume`
    alone (a `quota.set` call) is sufficient, `node_expansion_required:
    false` in the `ControllerExpandVolumeResponse`.
-7. **PV = View, subtree = `/<pv-name>` at the StorageClass's filesystem
-   root.** `CreateVolume`'s `req.Name` (the deterministic name
-   `external-provisioner` derives from the PVC, `pvc-<uid>`) is used
-   verbatim as both the subtree directory name and the CSI `volume_id` — no
-   separate ID mapping table, which also makes every controller RPC trivially
-   idempotent on `req.Name`/`volume_id` (§"CSI RPC mapping" column 3).
+7. **PV = View. Volume identity is self-describing, and the controller is
+   stateless.** `volume_id = <pool-fs-uuid>/<path-within-pool>` (e.g.
+   `4f9c…/volumes/pvc-1a2b`, or `4f9c…/shard-2/volumes/pvc-…` under
+   sharding, or `<fs-uuid>/` — the whole filesystem root — for `layout:
+   dedicated`). Encoding the pool's filesystem uuid *and* the subtree path
+   into `volume_id` means `NodeStageVolume` (and every other Node/Controller
+   RPC) can find the right engine pod and the right subtree from
+   `req.volume_id` alone, with no separate ID-mapping table or database
+   anywhere in this driver:
+   - **`layout: pool` (default).** `CreateVolume`'s `req.Name`
+     (`pvc-<uid>`, `external-provisioner`'s deterministic name) becomes the
+     subtree `/volumes/<req.Name>/` inside the pool filesystem named by the
+     `StorageClass`'s `bucket`/`prefix` (and `shard-<k>/` if `shards > 1`,
+     chosen by hashing `req.Name`). **Volume records are xattrs on the
+     volume directory**: `user.constellation.csi.{pv,pvc,namespace,
+     capacity,source,created}` — no CRD, no sidecar database. `CreateVolume`
+     is idempotent by comparing an existing directory's xattrs against the
+     request: a match returns `OK`, a mismatch (same name, different
+     `capacity`/`source`/owner) returns `ALREADY_EXISTS`. Deleted volumes
+     move to `/.trash/<pv-name>-<deleted-ts>/` rather than being deleted
+     synchronously (§"Deletion and purge"). Static provisioning names any
+     existing path inside the pool directly as the `volumeHandle`. Because
+     every fact `ListVolumes`, idempotency checks and GC need (ownership,
+     capacity, trash state) lives in the filesystem itself as directory
+     entries and xattrs, **the controller holds no volume state of its
+     own** — a controller replica can restart, fail over, or run as either
+     of its 2 leader-elected replicas, and every RPC re-derives its answer
+     by reading the pool, not a cache.
+   - **`layout: dedicated`.** `req.Name` names an entire Constellation
+     filesystem at `prefix/<req.Name>/` instead of a subtree of a shared
+     one; `volume_id` is just that filesystem's uuid (no
+     `/path-within-pool` suffix — the "subtree" is the filesystem root).
+     `DeleteVolume` drops the whole filesystem (a batch-delete job, not a
+     trash rename — there is no shared pool to protect from a mistaken
+     trash-purge sweep, so immediate deletion is safe and simpler here).
+   - Both layouts make every controller RPC idempotent on `req.name`
+     (create) or `req.volume_id` (everything else) — §"CSI RPC mapping"
+     column 3 — the same property the plan's earlier "use `req.Name`
+     verbatim" design had, just re-derived from richer, self-describing
+     identifiers instead of a bare name.
 8. **Snapshots and clones use plan 32's holds; this plan does not implement
-   its own snapshot storage.** `CreateSnapshot` = `snapshot.create{hold:
-   "csi:<VolumeSnapshotContent uid>"}`; a volume created `FromSnapshot` or
-   `FromVolume` (PVC clone) = `clone.create`. See §"Snapshots and clones".
+   its own snapshot storage.** `CreateSnapshot` = `snapshot.create{selector:
+   /volumes/<pv-name> (pool) or / (dedicated), hold: "csi:<VolumeSnapshotContent
+   uid>"}`; a volume created `FromSnapshot` or `FromVolume` (PVC clone) =
+   `clone.create{selector: <source subtree>, destination: /volumes/<new-pv-name>}`
+   — always resolved against the *source volume's own pool and shard*, never
+   an arbitrary target. **A cross-pool (or cross-shard) clone/restore is
+   refused by default**, `INVALID_ARGUMENT` with a message naming the
+   source and requested destination pools, because Constellation's clones
+   are subtree-COW *within one filesystem* (§2.3) — routing a clone
+   request across pools would silently fall back to a full data copy with
+   none of the guarantees (instant, metadata-only) a Kubernetes user
+   reasonably expects from "clone this PVC." A future explicit full-copy
+   mode across pools is a documented, not-yet-built option, never the
+   default. See §"CSI RPC mapping" for the full per-RPC treatment.
 9. **Credentials arrive per-request, never baked into the engine-pod image
    or a long-lived Kubernetes `Secret` mount the engine pod reads for
    itself.** `StorageClass`/`VolumeSnapshotClass` reference a k8s `Secret`
    by the standard `csi.storage.k8s.io/*-secret-name`/`-namespace`
-   parameters; the CSI sidecars resolve it and hand it to
-   `constellation-csi` as request bytes; `constellation-csi` forwards it to
-   the engine pod as `fs.unlock`/`view.mount` params, held only in that
-   engine pod's `EphemeralSecretStore` (memory-only, VERIFIED named in the
-   design brief's required plan-31 seam list).
+   parameters (one set of credentials per pool, since a pool is exactly the
+   unit a `StorageClass` already scopes — §2.3); the CSI sidecars resolve it
+   and hand it to `constellation-csi` as request bytes; `constellation-csi`
+   forwards it to the engine pod as `fs.unlock`/`view.mount` params, held
+   only in that engine pod's `EphemeralSecretStore` (memory-only, VERIFIED
+   named in the design brief's required plan-31 seam list).
 10. **The node plugin is the only privileged component.** It alone calls
     `fuse_mount_fd`/`mount(2)`/bind-mount; engine pods run unprivileged,
     holding only an inherited fd and a hostPath control socket — see
@@ -194,12 +413,26 @@ lossless for open file handles, not just for the mount point.
     `view.mount`'s subtree walk on first publish — see
     §"Semantic notes" for why `None` (the safer default for network
     filesystems with no local chown story) was considered and rejected here.
-12. **`podInfoOnMount: true`, `requiresRepublish: false`.** The driver wants
-    `csi.storage.k8s.io/pod.name`/`.namespace`/`.uid`/`.serviceAccount.name`
-    in `NodePublishVolume`'s `volume_context` purely for the `view.mount`
-    labels (§"Observability") — it does not need periodic republish, since
-    engine-pod session handover (§9) is how mount state survives churn, not
-    republish-driven remounting.
+12. **`podInfoOnMount: true`, `requiresRepublish: true`.** (Revised from an
+    earlier draft's `false` — see §2.2's Mountpoint-drain-baseline finding.)
+    The driver wants `csi.storage.k8s.io/pod.name`/`.namespace`/`.uid`/
+    `.serviceAccount.name` in `NodePublishVolume`'s `volume_context` for the
+    `view.mount` labels (§"Observability"), and it *also* needs kubelet to
+    periodically re-call `NodePublishVolume` so that an engine-pod **crash**
+    (OOM, panic — as opposed to a graceful, node-plugin-orchestrated
+    `node.handoff`) is recoverable without a human: on each republish, the
+    node plugin checks whether the staging mount's FUSE connection is still
+    alive; if it is, republish is a no-op; if the engine pod died and took
+    the fd with it (`ENOTCONN`), republish is the node plugin's cue to
+    restage against a freshly created engine pod and re-bind-mount. Session
+    handover (§8) makes a *planned* engine-pod replacement invisible to
+    writers and does not depend on this republish cycle at all — but a
+    crash is not a planned replacement, has no fd to hand off (the crashed
+    process was the fd's sole owner, per §2.2's fd-ownership discipline),
+    and needs exactly the always-on republish-driven remount baseline every
+    other FUSE CSI driver in this space already relies on (§2.2). Static
+    `false` would leave a crashed engine pod's PVs stuck `ENOTCONN` forever
+    with no recovery signal.
 13. **`seLinuxMount: false` at K0–K6, revisited at K7.** SELinux
     per-volume mount context (`-o context=`) is a FUSE mount option
     (`fuse_mount_fd`'s `opts`) applied once at `NodeStageVolume` time for
@@ -230,6 +463,89 @@ lossless for open file handles, not just for the mount point.
     not full cache coherence.** See §"Semantic notes" — this is stated
     up front because it is the one place Kubernetes users most often assume
     NFS-like or stronger semantics without being told otherwise.
+16. **The isolation boundary, and the trust model, is the `StorageClass`
+    (one pool).** A pool shares one E2E key, one metadata commit chain and
+    one GC domain (§2.3); within a pool, a subtree `View` confines each
+    PV's mount, but the *engine pod itself* can reach the whole pool
+    filesystem — it is not sandboxed per-PV. Tenants that need one PV's
+    engine pod to be unable to even theoretically reach another tenant's
+    data must use different `StorageClass`es (different pools, different
+    credentials, different engine pods), not rely on within-pool subtree
+    confinement as a security boundary. This is stated as an explicit,
+    settled trust model rather than left implicit, because it is the one
+    fact about pooling most likely to surprise a security-conscious
+    operator who assumes "PV" already means "isolation boundary." Plan 31's
+    subtree-confinement `View` guarantee (no `..`-above-root, no
+    cross-subtree symlink/hardlink escape) still holds and is what makes a
+    *buggy* client's own I/O safe — it is not what makes the pool's trust
+    model per-tenant.
+17. **Static provisioning names any existing path inside a pool.** A `PV`
+    whose `volumeHandle` is `<pool-fs-uuid>/<any-existing-path>` (not
+    necessarily under `/volumes/`, e.g. `<uuid>/datasets/imagenet` for a
+    pre-seeded dataset a human copied in out-of-band) is mountable via the
+    normal `NodeStageVolume`/`NodePublishVolume` path with no `CreateVolume`
+    call at all (the standard CSI static-provisioning shape — no
+    dynamic-provisioning annotation, no `storageClassName` required to
+    match a real class). The read-only access mode (`ROX`) is fully
+    supported for this case. `DeleteVolume` is never called for a
+    statically-provisioned PV (`reclaimPolicy: Retain` is the only sane
+    choice for one) and this driver does not special-case that — it is
+    ordinary CSI/Kubernetes behavior.
+18. **Humans may mount a pool directly, outside Kubernetes, with the
+    ordinary CLI.** `constellation mount <pool-name>:/volumes/pvc-… <dir>`
+    (or any other subtree) works exactly as it does for any other
+    Constellation filesystem — this is a deliberate feature (inspection,
+    seeding a static-provisioning dataset, exporting a PV's contents for a
+    one-off job), not an oversight to close off. Safety rules, documented
+    in the Helm chart's README and the how-to guide (K7): quotas set via
+    `quota.set` still apply to a human's writes under `/volumes/<pv>/`
+    exactly as they would to the CSI-mounted pod's; a human **deleting**
+    content directly under `/volumes/<pv>/` (rather than through
+    `DeleteVolume`) is not prevented (Constellation has no in-band way to
+    tell "an admin's `rm -rf` under a subtree" from "an application's own
+    delete"), but is *detected*: the periodic `view.list`/health-check
+    reconciliation the node plugin already runs (§"Engine-pod lifecycle")
+    notices a volume directory whose xattrs are gone or whose tree no
+    longer matches what `view.mount` last observed, and surfaces it as an
+    abnormal `VolumeCondition` (§"Semantic notes") rather than silently
+    serving a now-empty mount as if nothing happened.
+19. **`DeleteVolume` is a trash rename; purge is asynchronous, and it is a
+    controller-side worker, not a Constellation `singleton`-elected task.**
+    `DeleteVolume` renames `/volumes/<pv>/` to `/.trash/<pv>-<deleted-ts>/`
+    (one metadata op — the quota is released immediately, and `DeleteVolume`
+    itself returns as soon as the rename lands, matching the CSI spec's
+    expectation that delete completes promptly). A background worker inside
+    the leader-elected controller `Deployment` (settled decision 3's
+    existing `external-provisioner`/`external-resizer`/`external-snapshotter`
+    lease, which `constellation-csi` itself also holds while leading, per
+    §"Deletion and purge") walks each known pool's `/.trash/` periodically
+    and deletes trashed subtrees for real, rate-limited so one huge deleted
+    volume cannot starve other pools' purges. **Why controller-side, not
+    Constellation's own `singleton`/`SingletonLease` mechanism** (the
+    pattern plan 32's `_prune`/`_snapsched` use, one lease-elected leader
+    per filesystem re-elected continuously across every daemon replica for
+    that filesystem): (a) `/volumes/`/`/.trash/` is a CSI-layer convention,
+    not a core Constellation concept — teaching the engine's own
+    lease-elected maintenance jobs about it would mean `constellation-engine`
+    growing CSI-specific knowledge, which settled decision 1 already rules
+    out (`crates/csi` never links against the engine; the engine does not
+    link against CSI concepts either, symmetrically); (b) the controller
+    already has a proven, continuous leader-election mechanism for exactly
+    this class of "exactly one of N replicas does the work" job (settled
+    decision 3) — introducing Constellation's `SingletonLease` as a *second*
+    leadership primitive for the same shape of problem is duplication, not
+    a genuine need; (c) engine pods are ephemeral per (pool shard, node)
+    and subject to idle-GC (§"Engine-pod lifecycle") — a purge task
+    living inside one would stop running the moment the last PV on that
+    node unmounts, exactly when a pool with no currently-mounted PVs still
+    needs its trash purged; the controller is the one component in this
+    design meant to run continuously regardless of mount activity. Purge
+    itself is just ordinary control-protocol calls (list `/.trash/`, delete
+    each stale entry) against whichever engine pod is reachable for that
+    pool — nothing about the operation needs to run *inside* the engine
+    process the way `_prune`'s direct meta-store manipulation does. See
+    §"Deletion and purge" for the full flow, including how the controller
+    reaches an engine pod for a pool with no node-side mounts at all.
 
 ## 4. Architecture
 
@@ -258,7 +574,8 @@ lossless for open file handles, not just for the mount point.
         └────────────────────────┼──────────────────────────────────────┘
                                   │ constellation-control (UnixSocket,
                                   │ per-node hostPath, one per engine pod)
-                                  │ fs.registry.*, quota.*, snapshot.*, clone.*
+                                  │ fs.create, quota.*, snapshot.*, clone.*,
+                                  │ view.list (trash walk, for purge)
                                   ▼
    ┌──────────────────────────────────────────────────────────────────────┐
    │ Node N — DaemonSet pod (privileged)          Engine pods (unprivileged)│
@@ -297,39 +614,60 @@ Components:
     side where no engine pod is expected to be up yet).
   - **Controller service**: implements `CreateVolume`, `DeleteVolume`,
     `ControllerGetCapabilities`, `ControllerExpandVolume`, `CreateSnapshot`,
-    `DeleteSnapshot`, `ListSnapshots`, `ValidateVolumeCapabilities`. Talks to
-    *any* reachable engine pod for the target filesystem (controller RPCs
-    are node-independent registry/quota/snapshot operations — they don't
-    need the specific node's engine pod, just *an* engine pod, or a small
-    always-on "registry" control connection; see §"Engine-pod lifecycle" for
-    how the controller reaches one without requiring a PV to already be
-    mounted anywhere).
+    `DeleteSnapshot`, `ListSnapshots`, `ValidateVolumeCapabilities`, plus the
+    background **purge worker** (settled decision 19, §"Deletion and
+    purge"). Talks to *any* reachable engine pod for the target pool —
+    controller RPCs are node-independent registry/quota/snapshot/purge
+    operations, they don't need a specific node's engine pod. Since a
+    controller RPC (including purge) can arrive for a pool with no PV
+    mounted on any node yet, the controller itself ensures exactly one
+    lightweight **controller-owned engine pod** per (pool, shard) exists
+    whenever that pool has any volume at all — see §"Engine-pod lifecycle"
+    for its exact shape; it is the same `constellation-engine-<pool>-<node>`
+    binary/image, just not `nodeName`-pinned (named
+    `constellation-engine-<pool>-controller` instead) and never GC'd by the
+    node plugin's idle-mount TTL.
   - **Node service**: implements `NodeGetCapabilities`, `NodeGetInfo`,
     `NodeStageVolume`, `NodeUnstageVolume`, `NodePublishVolume`,
     `NodeUnpublishVolume`, `NodeGetVolumeStats`, `NodeExpandVolume` (no-op,
     settled decision 6). Owns the privileged `fuse_mount_fd` call and the
     engine-pod lifecycle for its own node (§"Engine-pod lifecycle").
-- **Engine pods**, one per (Constellation filesystem, k8s node) actually in
-  use, named `constellation-engine-<fs>-<node>`, running the `constellation`
-  binary in daemon mode as an `EngineHost` with exactly one `Engine`. Hosts
-  every `View` (= PV) of that filesystem mounted on that node, sharing the
-  `Engine`'s meta store, cache, lease/P2P identity and `ResourceBudget`.
-  Unprivileged: no `mount(2)`, no `CAP_SYS_ADMIN`; it only ever receives
-  already-open fds over its control socket and serves them with
-  `MountSource::PreopenedFd`.
+- **Engine pods.** For `layout: pool`, one per (pool filesystem [or
+  pool-shard], k8s node) actually in use, named
+  `constellation-engine-<pool>[-shard-<k>]-<node>`, hosting every `View`
+  (= PV subtree) of that pool mounted on that node — sharing one `Engine`'s
+  meta store, cache, lease/P2P identity and `ResourceBudget` across every PV
+  of the pool on that node, which is the whole point of pooling (§2.3). For
+  `layout: dedicated`, one per (`StorageClass`, k8s node), hosting N
+  `Engine`s via plan 31's `EngineHost` (one per dedicated PV mounted on that
+  node, sharing only the pod's runtime/cache *budget*, not a filesystem).
+  Either way it's the `constellation` binary in daemon mode. Unprivileged:
+  no `mount(2)`, no `CAP_SYS_ADMIN`; it only ever receives already-open fds
+  over its control socket and serves them with `MountSource::PreopenedFd`.
 - **hostPath layout** (per node, see §"Engine-pod lifecycle" for the full
   tree) carries the fd-passing unix sockets and engine-pod control sockets;
   it is how the privileged node plugin and the unprivileged engine pods
   rendezvous without a network hop.
 
-Control-protocol methods this plan drives, all from the plan-31 §9.2 table
-(cited by name, not renumbered here):
+Control-protocol methods this plan drives. Most are from the plan-31 §9.2
+table (cited by name, not renumbered here); the `browse.*` family is a
+**new addition this plan needs from plan 31**, beyond the fixed-name list
+in this plan's own header — the pool design (§2.3) needs ordinary
+directory-level manipulation (create a subdirectory, get/set xattrs,
+rename, recursive delete, list children) scoped to the engine's own
+filesystem, distinct from `View`-level FUSE serving, and no such seam was
+in plan 31's original scope because pooling postdates it. Recorded here for
+plan 31's session to pick up, the same way §"What plans 32 and 33 provide
+for this plan" records this plan's needs from those plans:
 
 | Method | Called by | When |
 |---|---|---|
-| `fs.registry.list`/`fs.registry.create` | controller | `CreateVolume` on first use of a filesystem (imports/creates the registry entry if the StorageClass names one that doesn't exist yet, gated by an explicit StorageClass parameter — see §"StorageClass parameters") |
+| `fs.create{bucket, prefix, params}` | controller | `CreateVolume` on first use of a pool or a dedicated PV — idempotent on `bucket`+`prefix` (settled decision 19's brief; matching params → existing fs uuid, conflicting params → error). Unconditional: there is no `autoCreateFilesystem` opt-out — "user supplies only a bucket" (§1) means the driver always owns creation. |
+| `browse.mkdir`/`browse.xattr{set}`/`browse.xattr{get}` | controller | `CreateVolume`: `mkdir /volumes/<pv>` (pool) then set the `user.constellation.csi.*` xattrs (settled decision 7); idempotency checks read them back |
+| `browse.rename` | controller | `DeleteVolume`: `/volumes/<pv>` → `/.trash/<pv>-<ts>` (settled decision 19) |
+| `browse.readdir`/`browse.delete{recursive}` | controller (purge worker) | §"Deletion and purge": list `/.trash/`, delete each stale entry |
 | `fs.unlock` | node plugin → engine pod | `NodeStageVolume`, supplying S3 + E2E credentials before the first `view.mount` on a freshly (re)started engine pod |
-| `view.mount` | node plugin → engine pod | `NodeStageVolume`, with `source: PreopenedFd`, subtree `/<pv-name>`, `labels: {pv, pvc, namespace}` |
+| `view.mount` | node plugin → engine pod | `NodeStageVolume`, with `source: PreopenedFd`, subtree `/volumes/<pv-name>` (pool) or `/` (dedicated), `labels: {pv, pvc, namespace, pool, shard}` |
 | `view.unmount` | node plugin → engine pod | `NodeUnstageVolume` |
 | `view.list{labels}` | controller (health/GC), node plugin (idempotency checks) | periodic reconciliation, `NodeStageVolume` retries |
 | `view.stats` | node plugin | `NodeGetVolumeStats` |
@@ -337,7 +675,7 @@ Control-protocol methods this plan drives, all from the plan-31 §9.2 table
 | `quota.get` | controller | `NodeGetVolumeStats` capacity fields, `ValidateVolumeCapabilities` |
 | `snapshot.create{hold}` | controller | `CreateSnapshot` |
 | `snapshot.delete` | controller | `DeleteSnapshot` (releases the hold first) |
-| `clone.create` | controller | `CreateVolume` with a `VolumeContentSource` |
+| `clone.create` | controller | `CreateVolume` with a `VolumeContentSource`, same pool/shard only (settled decision 8) |
 | `node.leave` | node plugin (preStop hook, or triggered by the controller on node drain) | node/engine-pod graceful removal |
 | `node.handoff` | node plugin, orchestrating an engine-pod replacement | §"FUSE session handover protocol" |
 
@@ -352,19 +690,20 @@ PreopenedFd}` possible across the node-plugin/engine-pod process boundary.
 | `Identity.GetPluginInfo` | static | n/a | n/a |
 | `Identity.GetPluginCapabilities` | static (`CONTROLLER_SERVICE`; no `VOLUME_ACCESSIBILITY_CONSTRAINTS`) | n/a | n/a |
 | `Identity.Probe` | control-protocol `node.ping` against a reachable engine pod (controller), or local health (node) | n/a | any failure → `NOT_READY`-shaped `false` in `ProbeResponse.ready`, never an RPC error |
-| `Controller.CreateVolume` | `fs.registry.create` (if StorageClass says to auto-create; §"StorageClass parameters") once, then `quota.set{subtree:/<name>, bytes: req.capacity_range.required_bytes}` — the subtree itself is created implicitly by the first `quota.set`/`view.mount`, matching Constellation's existing "a View's root need not pre-exist" behavior | `req.name` (`pvc-<uid>`, provisioner-supplied, stable across retries) | `Code::Exists` with different params → `ALREADY_EXISTS`; quota exceeding the filesystem's own hard cap → `RESOURCE_EXHAUSTED`; unknown filesystem name → `NOT_FOUND`; bad StorageClass parameters → `INVALID_ARGUMENT`; concurrent create for the same name already in flight → `ABORTED` (in-process per-`req.name` mutex, §"Concurrency guard" below) |
-| `Controller.DeleteVolume` | `quota.set{subtree:/<name>, bytes: 0}` then subtree delete (a `browse.delete` equivalent scoped to the engine's own registry-owned root — no kernel mount involved) | `req.volume_id` | already gone → `OK` (CSI requires delete to be idempotent-safe on a missing volume, VERIFIED spec.md `DeleteVolume`: "This operation MUST be idempotent... MUST return `OK`... if the volume does not exist"); in-flight `snapshot.create` referencing it → `FAILED_PRECONDITION` |
-| `Controller.ControllerExpandVolume` | `quota.set{subtree:/<name>, bytes: req.capacity_range.required_bytes}` | `req.volume_id` (quota.set is naturally idempotent — setting the same value twice is a no-op) | new size below `used_bytes` → `OUT_OF_RANGE` (VERIFIED spec.md: `ControllerExpandVolume` "grow only", shrink unsupported) |
-| `Controller.CreateSnapshot` | `snapshot.create{hold: "csi:<content-uid>", selector: subtree /<source-volume-id>}` | `req.name` | source volume busy with an incompatible op → `ABORTED`; a snapshot already exists under a *different* hold for the same `req.name` → `ALREADY_EXISTS` |
+| `Controller.CreateVolume` | **Pool:** `fs.create{bucket, prefix[, shard-<k>]}` (idempotent, always run — no auto-create opt-out) to get the pool fs uuid, then `browse.mkdir{/volumes/<name>}` + `browse.xattr{set}{pv,pvc,namespace,capacity,source,created}` + `quota.set{subtree:/volumes/<name>, bytes: req.capacity_range.required_bytes}`. **Dedicated:** `fs.create{bucket, prefix/<name>}` then `quota.set{subtree:/, bytes:...}` on the new filesystem's root. | `req.name` (`pvc-<uid>`, provisioner-supplied, stable across retries) | An existing `/volumes/<name>` (or dedicated fs) with **matching** xattrs/params → `OK`; **mismatched** xattrs (different `capacity`/`source`/owner for the same name — settled decision 7) → `ALREADY_EXISTS`; quota exceeding the pool's own hard cap → `RESOURCE_EXHAUSTED`; bad StorageClass parameters (unknown `layout`, missing `bucket`) → `INVALID_ARGUMENT`; concurrent create for the same name already in flight → `ABORTED` (in-process per-`req.name` mutex, §"Concurrency guard" below) |
+| `Controller.DeleteVolume` | **Pool:** `quota.set{subtree:/volumes/<name>, bytes: 0}` then `browse.rename{/volumes/<name> → /.trash/<name>-<ts>}` — a single metadata op, the actual purge is async (settled decision 19, §"Deletion and purge"). **Dedicated:** drop the whole filesystem (a batch-delete job, no trash — settled decision 7). | `req.volume_id` | already gone (no such subtree/fs, or already in `/.trash/`) → `OK` (CSI requires delete to be idempotent-safe on a missing volume, VERIFIED spec.md `DeleteVolume`: "This operation MUST be idempotent... MUST return `OK`... if the volume does not exist"); in-flight `snapshot.create` referencing it → `FAILED_PRECONDITION` |
+| `Controller.ControllerExpandVolume` | `quota.set{subtree:/volumes/<name> (pool) or / (dedicated), bytes: req.capacity_range.required_bytes}` | `req.volume_id` (quota.set is naturally idempotent — setting the same value twice is a no-op) | new size below `used_bytes` → `OUT_OF_RANGE` (VERIFIED spec.md: `ControllerExpandVolume` "grow only", shrink unsupported) |
+| `Controller.CreateSnapshot` | `snapshot.create{hold: "csi:<content-uid>", selector: /volumes/<source-name> (pool) or / (dedicated)}` | `req.name` | source volume busy with an incompatible op → `ABORTED`; a snapshot already exists under a *different* hold for the same `req.name` → `ALREADY_EXISTS` |
 | `Controller.DeleteSnapshot` | release the `csi:<content-uid>` hold, then `snapshot.delete` if no other hold remains | `req.snapshot_id` | missing → `OK` (same idempotency rule as `DeleteVolume`) |
 | `Controller.ListSnapshots` | `snapshot.list` filtered to holds prefixed `csi:` | n/a (read-only) | pagination token mismatch → `ABORTED` per spec's `starting_token` contract |
 | `Controller.ValidateVolumeCapabilities` | `quota.get` (existence check) plus a static compatibility check against settled decision 14's advertised modes | `req.volume_id` | volume missing → `NOT_FOUND` |
 | `Controller.ControllerGetCapabilities` | static | n/a | n/a |
-| `Node.NodeStageVolume` | ensure the (fs, node) engine pod exists and is `Ready` (§"Engine-pod lifecycle"); `fs.unlock` if this is the pod's first volume; `fuse_mount_fd(globalmount_path, opts)`; `Transport::send_fd` the resulting `OwnedFd` to the engine pod; `view.mount{source: PreopenedFd, subtree: /<pv-name>, labels}` | `req.volume_id` + `req.staging_target_path` (re-staging the same path when already staged is a no-op, VERIFIED spec.md `NodeStageVolume` idempotency clause) | engine pod unreachable after the timeout → `DEADLINE_EXCEEDED`; wrong fs credentials → `PERMISSION_DENIED`; already staged at a *different* path → `ALREADY_EXISTS` |
+| `Controller.CreateVolume` (`req.volume_content_source` set — clone/restore) | parse both `volume_id`s' pool-fs-uuid; **same pool and shard** → `clone.create{selector: source subtree, destination: /volumes/<new-name>}` (metadata-only COW, §2.3); **different pool or shard** → refused by default (settled decision 8) | `req.name` | cross-pool or cross-shard source → `INVALID_ARGUMENT` naming both pools/shards; source volume/snapshot missing → `NOT_FOUND` |
+| `Node.NodeStageVolume` | parse `req.volume_id` for the pool-fs-uuid (and shard); ensure the (pool[/shard], node) engine pod exists and is `Ready` (§"Engine-pod lifecycle"); `fs.unlock` if this is the pod's first volume; `fuse_mount_fd(globalmount_path, opts)`; `Transport::send_fd` the resulting `OwnedFd` to the engine pod; `view.mount{source: PreopenedFd, subtree: /volumes/<pv-name> (pool) or / (dedicated), labels}` | `req.volume_id` + `req.staging_target_path` (re-staging the same path when already staged is a no-op, VERIFIED spec.md `NodeStageVolume` idempotency clause) | engine pod unreachable after the timeout → `DEADLINE_EXCEEDED`; wrong fs credentials → `PERMISSION_DENIED`; already staged at a *different* path → `ALREADY_EXISTS`; `volume_id` doesn't parse to a known pool-fs-uuid → `NOT_FOUND` |
 | `Node.NodeUnstageVolume` | `view.unmount`; if this was the engine pod's last `View`, mark it idle (GC'd after a grace period, §"Engine-pod lifecycle") | `req.volume_id` | not staged → `OK` (idempotent) |
-| `Node.NodePublishVolume` | bind mount (`MS_BIND`[`|MS_RDONLY` for ROX]) from the staging path to `req.target_path` | `req.volume_id` + `req.target_path` | staging path missing (staged elsewhere/never) → `FAILED_PRECONDITION`; already published at this exact path → `OK` |
+| `Node.NodePublishVolume` | on every call (not just first publish — `requiresRepublish: true`, settled decision 12): if the staging mount is alive, bind mount (`MS_BIND`, plus `MS_RDONLY` for ROX) from the staging path to `req.target_path` (a no-op if already bound); if the staging mount is `ENOTCONN` (engine pod crashed, §2.2), restage first (fresh engine pod, `fuse_mount_fd`, `view.mount`) then bind mount | `req.volume_id` + `req.target_path` | staging path missing (staged elsewhere/never, and restage also fails) → `FAILED_PRECONDITION`; already published and healthy at this exact path → `OK` |
 | `Node.NodeUnpublishVolume` | unmount the bind mount at `req.target_path` | `req.volume_id` + `req.target_path` | not mounted there → `OK` |
-| `Node.NodeGetVolumeStats` | `view.stats` (statfs-shaped: `rsize`/`rcount`, plus `quota.get` for capacity) | n/a (read-only) | volume path not a mount → `NOT_FOUND` |
+| `Node.NodeGetVolumeStats` | `view.stats` (statfs-shaped: `rsize`/`rcount`, plus `quota.get` for capacity); also checks the pool subtree's xattrs are still present and consistent with what `view.mount` last recorded | n/a (read-only) | volume path not a mount → `NOT_FOUND`; subtree deleted/mismatched xattrs behind the driver's back (settled decision 18) → `OK` with `volume_condition: {abnormal: true, message: "..."}` set (§"Semantic notes"), never an RPC error — `NodeGetVolumeStats` reports condition, it does not enforce it |
 | `Node.NodeExpandVolume` | no-op, returns success (settled decision 6) | n/a | n/a |
 | `Node.NodeGetCapabilities` | static (`STAGE_UNSTAGE_VOLUME`, `GET_VOLUME_STATS`; not `EXPAND_VOLUME`) | n/a | n/a |
 | `Node.NodeGetInfo` | static (`node_id` = the k8s node name; no `accessible_topology`, `max_volumes_per_node` from an `EngineProfile`-derived cap, default unset/unlimited) | n/a | n/a |
@@ -385,32 +724,50 @@ error").
 
 ## 6. StorageClass / VolumeSnapshotClass parameters and secrets
 
+Every `StorageClass` this driver provisions from defines exactly one pool
+or one dedicated-layout configuration (§2.3) — `filesystem: <name>` and
+`autoCreateFilesystem` from earlier drafts of this plan are gone; there is
+no opt-out from driver-owned creation, matching §1's "user supplies only a
+bucket."
+
 ```yaml-k8s
+# Example 1: a pool StorageClass (the common case) — un-sharded.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: constellation-rwx
 provisioner: csi.constellation.dev
 parameters:
-  # Which Constellation filesystem (registry name) this class provisions
-  # PVs into. Required.
-  filesystem: "team-shared"
-  # If "true", CreateVolume calls fs.registry.create for `filesystem` on
-  # first use instead of failing NOT_FOUND. Defaults to "false" — most
-  # clusters want the filesystem created once, deliberately, out of band
-  # (`constellation fs create`), not implicitly from a StorageClass.
-  autoCreateFilesystem: "false"
+  # S3 bucket the pool lives in. Required.
+  bucket: "constellation-csi-pool"
+  # Key prefix within the bucket. Defaults to
+  # "constellation-csi/<storageclass-name>" if omitted — shown explicit
+  # here for clarity.
+  prefix: "constellation-csi/constellation-rwx"
+  # endpoint/region are optional, for non-default S3-compatible endpoints.
+  # endpoint: "https://s3.us-west-2.amazonaws.com"
+  # region: "us-west-2"
+  # "pool" (default) or "dedicated" — see §2.3.
+  layout: "pool"
+  # Number of pool filesystems PVs are hashed across. Default 1 (no
+  # sharding). See §2.3's "Shards" and K0's metadata-throughput guidance.
+  shards: "1"
+  # Filesystem-creation defaults applied by fs.create on first use.
+  chunkSize: "4MiB"
+  e2e: "true"
+  writeMode: "strict"
   # EngineProfile preset used when constellation-csi brings up a new
-  # engine pod for this filesystem. "server" (plan 31 C8's dense
-  # multi-PV preset) is the default and the only supported value at K0-K6;
-  # a future per-StorageClass override is deferred (Risks).
+  # engine pod for this pool. "server" (plan 31 C8's dense multi-PV
+  # preset) is the default and the only supported value at K0-K6; a
+  # future per-StorageClass override is deferred (Risks).
   engineProfile: "server"
   # csi.storage.k8s.io/*-secret-name / -namespace are the standard CSI
   # secret-reference parameters (VERIFIED external-provisioner/
   # external-resizer honor this exact key convention): resolved by the
   # sidecars, delivered to constellation-csi as request bytes, forwarded
-  # to the engine pod's EphemeralSecretStore. Never written to a
-  # ConfigMap, never logged.
+  # to the engine pod's EphemeralSecretStore. One secret per pool, since a
+  # pool is exactly the unit a StorageClass already scopes credentials to
+  # (settled decision 9). Never written to a ConfigMap, never logged.
   csi.storage.k8s.io/provisioner-secret-name: "constellation-s3-creds"
   csi.storage.k8s.io/provisioner-secret-namespace: "constellation-system"
   csi.storage.k8s.io/node-stage-secret-name: "constellation-s3-creds"
@@ -421,6 +778,50 @@ reclaimPolicy: Delete
 allowVolumeExpansion: true
 volumeBindingMode: Immediate
 mountOptions: []
+---
+# Example 2: a sharded pool — many small PVs (e.g. a CI system's ephemeral
+# scratch volumes), spread across 4 pool filesystems to stay under the
+# per-pool metadata throughput ceiling K0 measures (§2.3).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: constellation-ci-scratch
+provisioner: csi.constellation.dev
+parameters:
+  bucket: "constellation-csi-pool"
+  prefix: "constellation-csi/constellation-ci-scratch"
+  layout: "pool"
+  shards: "4"
+  e2e: "false"
+  engineProfile: "server"
+  csi.storage.k8s.io/provisioner-secret-name: "constellation-s3-creds"
+  csi.storage.k8s.io/provisioner-secret-namespace: "constellation-system"
+  csi.storage.k8s.io/node-stage-secret-name: "constellation-s3-creds"
+  csi.storage.k8s.io/node-stage-secret-namespace: "constellation-system"
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+---
+# Example 3: dedicated layout — one tenant per StorageClass, one
+# Constellation filesystem per PV, its own E2E key and credentials.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: constellation-tenant-a-isolated
+provisioner: csi.constellation.dev
+parameters:
+  bucket: "constellation-csi-tenant-a"
+  prefix: "constellation-csi/isolated"
+  layout: "dedicated"
+  e2e: "true"
+  engineProfile: "server"
+  csi.storage.k8s.io/provisioner-secret-name: "tenant-a-s3-creds"
+  csi.storage.k8s.io/provisioner-secret-namespace: "tenant-a"
+  csi.storage.k8s.io/node-stage-secret-name: "tenant-a-s3-creds"
+  csi.storage.k8s.io/node-stage-secret-namespace: "tenant-a"
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
 ---
 apiVersion: v1
 kind: Secret
@@ -435,7 +836,8 @@ stringData:
   # account — see "Credentials and security").
   aws_access_key_id: "..."
   aws_secret_access_key: "..."
-  # Constellation E2E passphrase, if the filesystem is E2E-encrypted.
+  # Constellation E2E passphrase, if the pool/dedicated filesystem is
+  # E2E-encrypted.
   e2e_passphrase: "..."
 ---
 apiVersion: snapshot.storage.k8s.io/v1
@@ -457,7 +859,35 @@ credential chain resolves it with no secret ever transiting
 `constellation-csi` at all — the strictly preferred production path,
 documented as such in the Helm chart's README.
 
+**Static provisioning example** (settled decision 17) needs no
+`StorageClass` parameters read by `CreateVolume` at all — the pool's fs
+uuid and path are already baked into the `volumeHandle`:
+
+```yaml-k8s
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: imagenet-dataset
+spec:
+  capacity:
+    storage: 500Gi
+  accessModes: ["ReadOnlyMany"]
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: csi.constellation.dev
+    volumeHandle: "4f9c1e2a-.../datasets/imagenet"
+    readOnly: true
+    nodeStageSecretRef:
+      name: constellation-s3-creds
+      namespace: constellation-system
+```
+
 ## 7. Engine-pod lifecycle
+
+Naming and identity below use `<pool>` for `<bucket>/<prefix>[/shard-<k>]`
+under `layout: pool`, and `<sc>` (the `StorageClass` name) under `layout:
+dedicated` — both are shortened to `<unit>` where the text applies to
+either.
 
 **hostPath layout, per node** (root `/var/lib/constellation-csi/`, created
 by the node plugin's `DaemonSet` with a `hostPath` volume of type
@@ -465,94 +895,211 @@ by the node plugin's `DaemonSet` with a `hostPath` volume of type
 
 ```
 /var/lib/constellation-csi/
-├── node-identity/<fs>/                # Constellation node key + roster
-│                                       # state for this (fs, node) pair —
-│                                       # survives engine-pod restarts,
-│                                       # deleted only by node.leave's
-│                                       # cleanup or explicit node removal.
-├── sockets/<fs>/
+├── node-identity/<unit>/               # Constellation node key + roster
+│                                       # state for this (pool|sc, node)
+│                                       # pair — survives engine-pod
+│                                       # restarts, deleted only by
+│                                       # node.leave's cleanup or explicit
+│                                       # node removal.
+├── sockets/<unit>/
 │   ├── fd-handoff.sock                # node plugin ↔ engine pod, fd passing
 │   └── control.sock                   # engine pod's constellation-control
 │                                       # UnixSocket server (operator role
 │                                       # for the node plugin's uid; see
 │                                       # "Credentials and security")
 └── staging/<pv-name>/globalmount/     # NodeStageVolume mountpoints (bind
-                                        # source for every pod's publish)
+                                        # source for every pod's publish,
+                                        # keyed by CSI volume_id's PV name,
+                                        # not by pool-internal path)
 ```
 
-**Creation.** `NodeStageVolume` for the first PV of a filesystem on a node:
-the node plugin checks for a `Ready` `constellation-engine-<fs>-<node>` pod
-via the Kubernetes API (list by label `constellation.dev/fs=<fs>,
-constellation.dev/node=<node>`); if absent, it creates one — a bare `Pod`
+**Creation.** `NodeStageVolume` for the first PV of a pool (or dedicated
+`StorageClass`) on a node: the node plugin checks for a `Ready`
+`constellation-engine-<unit>-<node>` pod via the Kubernetes API (list by
+label `constellation.dev/pool=<pool>` or `constellation.dev/sc=<sc>`, plus
+`constellation.dev/node=<node>`); if absent, it creates one — a bare `Pod`
 object (not a `Deployment`/`StatefulSet`: its identity is entirely
-determined by (fs, node) and it is never rescheduled, only replaced in place
-by the node plugin itself, which already has to orchestrate replacement for
-session handover, §9) with:
+determined by (pool|sc, node) and it is never rescheduled, only replaced in
+place by the node plugin itself, which already has to orchestrate
+replacement for session handover, §8) with:
 
 - `nodeName: <node>` (no scheduler round-trip — the node plugin already
   knows exactly which node it's on);
-- `hostPath` mounts for `node-identity/<fs>/` and `sockets/<fs>/` (`Bidirectional`
-  mount propagation is **not** needed here — only the node plugin's own
-  `mount(2)` calls need propagation *out* to the host and kubelet's view;
-  the engine pod never calls `mount(2)` at all, settled decision 10);
+- `hostPath` mounts for `node-identity/<unit>/` and `sockets/<unit>/`
+  (`Bidirectional` mount propagation is **not** needed here — only the node
+  plugin's own `mount(2)` calls need propagation *out* to the host and
+  kubelet's view; the engine pod never calls `mount(2)` at all, settled
+  decision 10);
 - `securityContext: { runAsNonRoot: true, allowPrivilegeEscalation: false,
   capabilities: { drop: ["ALL"] }, seccompProfile: { type: RuntimeDefault }
   }` — no privileges beyond opening a unix socket and receiving an
   already-open fd over it, which needs none;
+- **`restartPolicy: OnFailure`, ignores `SIGTERM` while any `View` is
+  mounted, `terminationGracePeriodSeconds: 600`** (§2.2's Mountpoint-drain
+  baseline, adopted verbatim as this plan's always-on default, not a
+  fallback): a clean exit (the engine's own signal handler, once it has
+  actually completed a `node.leave`/`node.handoff{Commit}` and has zero
+  `View`s left) never restarts the pod; a crash (OOM, panic — non-zero
+  exit, or a `SIGKILL` after the grace period expires) does restart the
+  *container*, but the new container process is a new fd owner starting
+  from nothing — the kernel FUSE connection the old process held is gone
+  (§2.2), which is exactly the `ENOTCONN` `requiresRepublish: true`
+  (settled decision 12) exists to recover from. This means an engine-pod
+  crash is client-visible as an I/O error until the next
+  `NodePublishVolume` republish, bounded by kubelet's own reconciler sync
+  period — never worse than Mountpoint's own crash story, and better than
+  it whenever a graceful `node.handoff` (§8) is what actually happens
+  instead;
 - resource `requests`/`limits` from the StorageClass's `engineProfile`
   parameter, translated into the container's memory limit plus the
   `EngineProfile.memory_budget`/`cache_budget` fields passed as daemon flags
   — the container limit is set slightly above the engine's own budget so
   the engine's internal admission control (plan 31 §6.3's backpressure
-  barrier) is what sheds load, not the OOM killer;
+  barrier) is what sheds load, not the OOM killer (deliberately stricter
+  than Mountpoint's own opt-in-only resource limits, §2.2);
 - an `emptyDir` (`medium: Memory`, sized from `cache_budget`) for the
   engine's local cache, so cache eviction on pod replacement is free and
   the node's real disk isn't consumed by cache that a restart discards
   anyway (durable state — the meta store, staging writes not yet
-  acknowledged to S3 — lives under `node-identity/<fs>/`, on the real
+  acknowledged to S3 — lives under `node-identity/<unit>/`, on the real
   hostPath, and survives).
 
-**Readiness.** The pod's own `constellation` daemon exposes a startup/liveness
-probe hitting its control socket's `node.ping`; the node plugin polls
-Kubernetes `Pod.status.phase == Running` plus that probe before proceeding
-with `fs.unlock`/`view.mount`.
+**Controller-owned engine pod (pool layout only).** A controller RPC
+(`CreateVolume`, `CreateSnapshot`, the purge worker, §"Deletion and
+purge") can arrive for a pool with no PV mounted on any node — there is no
+node-side engine pod to talk to yet, and none may ever exist if every PV of
+that pool happens to live on nodes that later drain. The controller
+therefore ensures exactly one `constellation-engine-<pool>-controller` pod
+exists per (pool, shard) with at least one volume, created and reconciled
+by the controller `Deployment` itself rather than the node plugin: same
+image, same unprivileged `securityContext`, same drain discipline, but
+**not** `nodeName`-pinned (the scheduler picks a node) and **exempt from
+the node plugin's idle-mount TTL** — it is reaped only when the pool itself
+has zero volumes left (checked by the purge worker after a purge sweep
+leaves `/.trash/` and `/volumes/` both empty). It never receives a
+`view.mount`; it exists solely so `fs.create`/`browse.*`/`quota.*`/
+`snapshot.*`/the purge worker's `browse.readdir`/`browse.delete` always have
+somewhere to go. `layout: dedicated` has no equivalent — a dedicated
+`StorageClass` with zero currently-mounted PVs simply has nothing for the
+controller to do (no shared pool state, no trash to purge across volumes),
+so no controller-owned pod is needed there.
 
-**Ownership and GC.** Each engine pod carries an `ownerReference` to the
-node plugin's own `DaemonSet` Pod (so it cannot outlive the node plugin
-generation that created it — a stale engine pod from a deleted node plugin
-gets garbage-collected by Kubernetes itself) plus a `constellation.dev/
-last-view-count` annotation the node plugin updates on every
-`view.mount`/`view.unmount`. A background reconcile loop in the node plugin
-(polling every 30s) deletes any engine pod whose `view.list` returns zero
-views and whose `last-view-count` has been zero for longer than a
-`--engine-pod-idle-ttl` flag (default 10 minutes — long enough to absorb a
-PVC being briefly unmounted/remounted across a pod restart without
-thrashing engine pods, short enough not to waste memory on genuinely
-abandoned filesystems).
+**Readiness.** The pod's own `constellation` daemon exposes a startup/liveness
+probe hitting its control socket's `node.ping`; the node plugin (or the
+controller, for its own controller-owned pod) polls Kubernetes
+`Pod.status.phase == Running` plus that probe before proceeding with
+`fs.unlock`/`view.mount` or any `browse.*`/purge call.
+
+**Ownership and GC.** Each node-owned engine pod carries an
+`ownerReference` to the node plugin's own `DaemonSet` Pod (so it cannot
+outlive the node plugin generation that created it — a stale engine pod
+from a deleted node plugin gets garbage-collected by Kubernetes itself)
+plus a `constellation.dev/last-view-count` annotation the node plugin
+updates on every `view.mount`/`view.unmount`. A background reconcile loop
+in the node plugin (polling every 30s) deletes any engine pod whose
+`view.list` returns zero views and whose `last-view-count` has been zero
+for longer than a `--engine-pod-idle-ttl` flag (default 10 minutes — long
+enough to absorb a PVC being briefly unmounted/remounted across a pod
+restart without thrashing engine pods, short enough not to waste memory on
+genuinely abandoned pools/filesystems). The controller-owned pod above is
+explicitly outside this loop — its lifecycle is the controller's, not the
+node plugin's.
 
 **Node identity.** Constellation's per-node roster identity (the node key,
 whatever `authority`/`registry` state a live node needs to rejoin its peer
-group) is keyed by (filesystem, k8s node), not by pod — it lives on the
-`node-identity/<fs>/` hostPath directory precisely so that replacing the
+group) is keyed by (pool|sc, k8s node), not by pod — it lives on the
+`node-identity/<unit>/` hostPath directory precisely so that replacing the
 engine pod (upgrade, crash, OOM) does **not** look like a node leaving and
 rejoining the cluster's roster; it is the same Constellation node
-re-attaching, which is what makes §9's session handover meaningful (a
+re-attaching, which is what makes §8's session handover meaningful (a
 `node.handoff` between two engine-pod *processes* sharing one node identity,
 not two different Constellation nodes).
 
 **Drain.** The node plugin registers a `preStop` hook (and separately,
 watches for `Node.Unschedulable`/`kubectl drain` via a `PodDisruptionBudget`-aware
-controller loop) that, before a node is fully drained, calls control
-`node.leave{force: false}` for every engine pod on that node — releasing
-leases cleanly and removing the node from the filesystem's roster instead of
-leaving a ghost entry that `docs/plans/v1`'s existing roster-fairness work
-(commit `27941de`, "the lock queue is served in arrival order") would
-otherwise have to time out. Autoscaled node churn (cluster-autoscaler scaling
-a node pool down) goes through the same drain path — this is explicitly
-flagged as a correctness requirement, not an optimization: an autoscaler that
-kills nodes without a drain hook would bloat the roster with dead entries on
-every scale-down, exactly the failure mode the design brief calls out
-("Autoscaled churn must not bloat the roster").
+controller loop) that, before a node is fully drained, **first waits for
+workload pods using that node's engine pods to terminate** (the same
+ordering Mountpoint's own drain guidance recommends, §2.2), then calls
+control `node.leave{force: false}` for every engine pod on that node —
+releasing leases cleanly and removing the node from the pool/filesystem's
+roster instead of leaving a ghost entry that `docs/plans/v1`'s existing
+roster-fairness work (commit `27941de`, "the lock queue is served in
+arrival order") would otherwise have to time out. Only once `node.leave`
+completes (or the 600s grace period from the engine pod's own
+`terminationGracePeriodSeconds` above expires, whichever is first) is the
+engine pod itself allowed to terminate. Autoscaled node churn
+(cluster-autoscaler scaling a node pool down) goes through the same drain
+path — this is explicitly flagged as a correctness requirement, not an
+optimization: an autoscaler that kills nodes without a drain hook would
+bloat the roster with dead entries on every scale-down, exactly the failure
+mode the design brief calls out ("Autoscaled churn must not bloat the
+roster").
+
+## Deletion and purge
+
+Settled decision 19 fixes *who* runs the purge worker (the controller, not
+a Constellation `singleton`); this records the full flow.
+
+**Trash.** `DeleteVolume` (pool layout) never does a synchronous, unbounded
+directory walk — it renames `/volumes/<pv>/` to `/.trash/<pv>-<deleted-ts>/`
+under the pool root (one metadata op) and releases the PV's quota
+immediately (`quota.set{..., bytes: 0}` before the rename, so the freed
+space is reflected right away even though the bytes themselves aren't
+physically gone yet). `DeleteVolume` returns as soon as the rename lands.
+This is deliberately the same latency profile regardless of whether the
+volume held one file or ten million — the CSI spec's "delete completes
+promptly" expectation is met by construction, not by racing a large delete
+against a gRPC deadline.
+
+**Purge worker.** A background task inside whichever `constellation-csi`
+controller replica currently holds the leader-election lease (settled
+decisions 3 and 19) runs on a fixed interval (`--purge-interval`, default 5
+minutes) per known pool:
+
+1. `browse.readdir{/.trash/}` against that pool's engine pod (the node-owned
+   one if any node has a PV of this pool mounted, else the controller-owned
+   one, §"Engine-pod lifecycle").
+2. For each entry older than a small grace window (`--purge-grace`, default
+   1 minute — just enough to avoid racing a `DeleteVolume` retry that
+   re-renders the same trashed path, not a "cooling off" period a human is
+   meant to use to recover a deleted PV; that is explicitly not a feature
+   this driver offers, since CSI's own `DeleteVolume` contract gives no
+   place to expose an undo window to Kubernetes), `browse.delete{path,
+   recursive: true}`.
+3. Rate-limited (`--purge-max-concurrent-deletes`, default 4 per pool) so
+   one enormous trashed volume's recursive delete cannot starve every other
+   pool's purge — each pool's queue is independent, and a slow purge of one
+   pool never blocks another's.
+4. After a successful `browse.delete`, the trash entry is gone; the
+   underlying chunk objects are **not** necessarily gone yet — Constellation's
+   existing GC (mark-and-sweep over every filesystem's live tree, unrelated
+   to this plan) reclaims any chunk no longer referenced by any surviving
+   tree, snapshot, or other trash entry on its own schedule, exactly as it
+   already does for ordinary `snapshot delete`/`clone` deletion. This plan
+   adds no new GC mechanism — trash purge's whole job is to make
+   `/.trash/` entries disappear from the metadata namespace so `browse.readdir`
+   eventually returns empty and the pool "looks deleted" to a human browsing
+   it, not to reclaim S3 bytes directly.
+
+**Failure handling.** Every step is safe to retry from scratch:
+`browse.readdir`/`browse.delete` failures (engine pod unreachable, transient
+S3 error) simply leave the entry in `/.trash/` for the next tick — nothing
+about a half-completed recursive delete corrupts state, because a partially
+deleted subtree is still a valid (smaller) subtree for the next
+`browse.delete{recursive: true}` call to finish. A controller failover
+mid-purge is likewise safe: the new leader's next tick re-lists `/.trash/`
+and resumes: there is no purge-specific state anywhere outside the pool's
+own `/.trash/` directory listing, consistent with settled decision 7's
+"the controller is stateless" design.
+
+**Cost of huge volumes.** A single PV holding millions of small files pays
+a real, possibly-slow recursive metadata delete — §"Risks" records this
+explicitly as a known cost, mitigated by the rate limit above (it degrades
+other pools' purge latency, not their correctness) but not eliminated; a
+future incremental/resumable purge (checkpointing progress within one
+trashed subtree rather than treating `browse.delete` as atomic) is a
+documented, not-yet-built refinement if K6's testing shows this matters in
+practice.
 
 ## 8. FUSE session handover protocol
 
@@ -566,7 +1113,7 @@ and relies on the plan-31 C4 seam `FuseSession::detach()`/`resume()`.
 version being rolled out (Helm upgrade bumps the engine-pod `Deployment`-equivalent
 pod template — since engine pods are hand-managed `Pod`s, not a
 `Deployment`, the node plugin itself watches a `ConfigMap`-sourced desired
-image tag and performs the rollout, one (fs, node) pod at a time), or an
+image tag and performs the rollout, one (pool|sc, node) pod at a time), or an
 explicit `node.handoff` request from an operator (plan 33 UI/CLI) moving an
 engine pod for maintenance.
 
@@ -602,10 +1149,10 @@ duplicate of that fd changes:
    the handover, it just travels with it.
 3. **Snapshot.** The old engine calls `View::export_handles() ->
    HandleTableSnapshot` for every `View` being handed off (every PV of this
-   (fs, node) pair — a whole-pod handoff, not per-PV, since they share one
+   (pool|sc, node) pair — a whole-pod handoff, not per-PV, since they share one
    FUSE fd... **wait, they do not**: settled decision 5 already established
    each PV gets its *own* `fuse_mount_fd` call at `NodeStageVolume` time, so
-   each `View` has its own FUSE session and its own fd. §9's handover is
+   each `View` has its own FUSE session and its own fd. §8's handover is
    therefore performed **once per `View`**, batched into a single
    `node.handoff` control call carrying a list, so the new engine pod comes
    up with every PV resumed together rather than one-by-one with a
@@ -627,7 +1174,15 @@ duplicate of that fd changes:
    every PV (it opened it originally), so it is the natural relay, not a
    third leg through some other channel. `handles`, `view` and `init`
    travel as ordinary control-protocol JSON/postcard payload alongside the
-   fd-bearing frame.
+   fd-bearing frame. Following the same discipline VERIFIED in Mountpoint's
+   own fd relay (§2.2: `pod_mounter.go`'s `defer
+   pm.closeFUSEDevFD(fuseDeviceFD)`), each hop closes its own copy of the
+   fd immediately after the `SCM_RIGHTS` send succeeds — the old engine
+   pod's copy is closed once the node plugin has received it (during the
+   Quiesce/Snapshot steps), and the node plugin's own relay copy is closed
+   once the new engine pod has acknowledged receipt, so fd ownership is
+   unambiguous (exactly one process holds a live copy) at every point in
+   the handover, not just at the start and end.
 5. **Resume.** The new engine pod calls `Engine::open_view_resumed(spec,
    handles, ...)` to rebuild its in-memory `View` with the exact same open
    handle table (so a client's already-open file descriptors, whose
@@ -686,24 +1241,25 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   the successfully-resumed `View`s stay on the new pod, the failed one(s)
   fall back to `Abort` on the *old* pod for just that `View` (both pods
   briefly coexist, each owning a disjoint subset of `View`s for the same
-  (fs, node) — allowed, since PV≠fd sharing already means each `View` is
+  (pool|sc, node) — allowed, since PV≠fd sharing already means each `View` is
   independent) and the failure is surfaced as a `node.handoff` partial-result
   response the node plugin logs and alerts on, never silently swallowed.
 - Step 5 fails for *every* `View`, or the vendored resume patch itself is
   unavailable/broken in a given build → the **pre-agreed fallback from the
-  design brief** applies, and is a first-class, documented mode, not an
-  emergency patch: *"keep the old engine pod alive until PVs republish via
-  requiresRepublish."* Concretely: `requiresRepublish: true` becomes a
-  per-engine-pod runtime toggle (not the static CSIDriver-wide `false` from
-  settled decision 12) the node plugin flips on for a filesystem whose
-  handover keeps failing, causing kubelet to periodically re-call
-  `NodePublishVolume`, which the node plugin uses as its cue to retry the
-  bind-mount against a freshly staged new engine pod the *old-fashioned*
+  design brief** applies, and — unlike an earlier draft of this plan, where
+  it needed its own runtime toggle — it is now simply *the baseline this
+  plan already always runs* (§2.2, settled decision 12's `requiresRepublish:
+  true`): the old pod stays alive and keeps serving until kubelet's next
+  `NodePublishVolume` republish notices the mount is stale and the node
+  plugin restages against a freshly created engine pod the *old-fashioned*
   way (full unmount/remount, accepting the `ENOTCONN` window Kubernetes
-  users of every other FUSE CSI driver already live with) — strictly worse
-  than a lossless handover, but never worse than the pre-plan-37 status quo,
-  and it means a K0 finding of "handover is infeasible on some kernel/fuser
-  combination" degrades this plan's value, it does not block shipping it.
+  users of every other FUSE CSI driver already live with). No special-cased
+  "flip on republish for this one filesystem" logic is needed, because that
+  path is never off in the first place. This is strictly worse than a
+  lossless handover, but never worse than the pre-plan-37 status quo, and it
+  means a K0 finding of "handover is infeasible on some kernel/fuser
+  combination" degrades this plan's value, it does not block shipping it —
+  the driver ships with exactly Mountpoint's own safety net at minimum.
 - **Timeouts.** `node.handoff` as a whole is bounded by
   `--handoff-total-timeout` (default 30s, covering steps 1-6); exceeding it
   triggers the same `Abort` path as an explicit failure — a hung handoff
@@ -718,7 +1274,7 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   33 U1's `params_digest` convention). An engine-pod restart or replacement
   means a fresh, empty store; `fs.unlock` is re-issued by the node plugin on
   every `NodeStageVolume` against a freshly-created pod, and again as part
-  of §9's `node.handoff` `Prepare` phase against the *new* pod before any
+  of §8's `node.handoff` `Prepare` phase against the *new* pod before any
   `View` resumes (a resumed `View` still needs its filesystem unlocked to
   serve reads that miss cache).
 - **`CredentialSource`** selection (StorageClass parameter
@@ -758,8 +1314,10 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   §"Control-protocol methods" — none of them are roster/security-admin
   operations reserved to `admin` (allowlist edits, audit-log reads). Every
   engine pod's `control.sock` carries this exact grant; the controller's own
-  connections (for `fs.registry.*`, `snapshot.*`, `quota.*` against whichever
-  engine pod it reaches) use the *same* service-principal identity —
+  connections (for `fs.create`, `browse.*`, `snapshot.*`, `quota.*` against
+  whichever engine pod it reaches, including the purge worker and any
+  controller-owned engine pod, §"Engine-pod lifecycle") use the *same*
+  service-principal identity —
   `constellation-csi` the controller binary and `constellation-csi` the node
   binary are, deliberately, one authorization identity, since splitting them
   would only add configuration surface without a real isolation boundary
@@ -786,7 +1344,8 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   it wouldn't.
 - **Which pods are privileged, summarized**: node plugin — yes
   (`CAP_SYS_ADMIN` via `privileged: true`, `Bidirectional` mount
-  propagation). Controller — no. Engine pods — no. This 1-privileged-role
+  propagation). Controller — no. Engine pods, node-owned and
+  controller-owned alike — no. This 1-privileged-role
   design is the direct payoff of settled decision 10 and the reason the
   fd-passing architecture exists at all: it is strictly fewer privileged
   processes than "FUSE in the node plugin" (still one) but with a *much*
@@ -797,7 +1356,8 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
 
 - **View labels.** Every `view.mount` call sets `ViewSpec.labels =
   {"pv": req.volume_id, "pvc": <from volume_context, podInfoOnMount>,
-  "namespace": <from volume_context>}` (settled decision 12's reason for
+  "namespace": <from volume_context>, "pool": <bucket/prefix, pool layout
+  only>, "shard": <k, if shards > 1>}` (settled decision 12's reason for
   wanting `podInfoOnMount` — `pvc`/`namespace` aren't otherwise visible to
   the node plugin from the CSI request alone in every code path, only
   `pod.*` fields are guaranteed present; `pvc`/`namespace` come from
@@ -805,16 +1365,24 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   `csi.storage.k8s.io/pvc/name` and `.../pvc/namespace` into
   `volume_context` when `--extra-create-metadata` is set on the
   provisioner sidecar — this plan's Helm chart sets that flag by default).
+  `pool`/`shard` are derived from `req.volume_id`'s own uuid (settled
+  decision 7), not from a separate lookup, so they're always available even
+  before `podInfoOnMount` resolves the rest.
 - **Metrics.** `constellation_vfs_ops_total{frontend="fuse",op,outcome}` and
   `constellation_vfs_op_seconds{frontend="fuse",op}` (plan 31 §6.10) carry
-  the bounded label allowlist `{view, pv}` — never raw `pvc`/`namespace` on
-  the high-cardinality per-op histograms, to keep Prometheus cardinality
-  bounded by PV count, not by (PV × pod × namespace) count; `pvc`/`namespace`
-  remain queryable via `view.list{labels}` for a control-plane-level join
-  (plan 33's UI does exactly this for its screen 3). Engine-pod-level
-  metrics (`EngineHost` resource-budget gauges, fd-handoff duration
-  histogram from §9's step 6 measurement) are additionally labeled
-  `{fs, node}`.
+  the bounded label allowlist `{view, pv, pool, shard}` — never raw
+  `pvc`/`namespace` on the high-cardinality per-op histograms, to keep
+  Prometheus cardinality bounded by PV count (times shard count, still
+  small), not by (PV × pod × namespace) count; `pvc`/`namespace` remain
+  queryable via `view.list{labels}` for a control-plane-level join (plan
+  33's UI does exactly this for its screen 3, extended to also show pool →
+  shard → PV, §"What plans 32 and 33 provide for this plan"). Engine-pod-level metrics (`EngineHost`
+  resource-budget gauges, fd-handoff duration histogram from §8's step 6
+  measurement) are additionally labeled `{pool, shard, node}` (pool layout)
+  or `{sc, node}` (dedicated). The purge worker exposes
+  `constellation_csi_purge_{pending,deleted,failed}_total{pool,shard}` and
+  `constellation_csi_purge_duration_seconds{pool,shard}` (§"Deletion and
+  purge") so an operator can see trash backlog per pool directly.
 - **Events on PVCs.** `constellation-csi` emits Kubernetes `Event`s on the
   `PersistentVolumeClaim` object (via the standard `client-go`
   `EventRecorder`, the same mechanism `external-provisioner` already uses
@@ -822,7 +1390,7 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   ready/replaced (handover), quota near/at limit (a `quota.get` threshold
   check on `NodeGetVolumeStats`, mirroring plan 33's own "quota thresholds"
   notification but surfaced where a Kubernetes operator actually looks —
-  `kubectl describe pvc`), and session-handover fallback engaged (§9's
+  `kubectl describe pvc`), and session-handover fallback engaged (§8's
   degraded-mode path) so a cluster operator sees *why* a PV briefly behaved
   like a classic FUSE CSI driver instead of silently degrading.
 - **Audit.** Every mutating control call `constellation-csi` makes is
@@ -856,17 +1424,35 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   local hostPath volume.
 - **Quotas vs. capacity.** `req.capacity_range` (`CreateVolume`) and
   `NodeGetVolumeStats`'s `available`/`capacity` fields both map to
-  Constellation's `quota.set`/`quota.get` — a *soft* accounting limit the
-  engine enforces at write time (`ENOSPC` once the quota is hit), not a
-  pre-allocated block range the way an EBS volume's size is. This means
-  `GetCapacity` (the optional Controller RPC reporting *available raw
-  storage* for the whole backing pool) is meaningless for an S3-backed
-  filesystem in the way it is for a fixed-size block pool — this plan does
-  not implement it (not advertised in `ControllerGetCapabilities`), which is
-  a correct, deliberate omission, not an oversight: S3's advertised
-  capacity is not a number Constellation should be putting in front of the
-  Kubernetes scheduler's capacity-aware provisioning logic (`storageCapacity`
-  in `CSIDriver` is likewise left unset/`false`).
+  Constellation's `quota.set{subtree:/volumes/<pv> (pool) or / (dedicated)}`/
+  `quota.get` — a *soft* accounting limit the engine enforces at write time
+  (`ENOSPC` once the quota is hit), not a pre-allocated block range the way
+  an EBS volume's size is. Under `layout: pool`, each PV's quota is a
+  per-subtree cap independent of every other PV's quota in the same
+  pool — pooling shares the *filesystem* and its cache, it does not share
+  or cap the *sum* of PVs' quotas against the pool's own total (there is no
+  pool-level quota in this plan; a future StorageClass-wide pool quota is a
+  documented, not-yet-built option). This means `GetCapacity` (the optional
+  Controller RPC reporting *available raw storage* for the whole backing S3
+  bucket) is meaningless for an S3-backed filesystem in the way it is for a
+  fixed-size block pool — this plan does not implement it (not advertised
+  in `ControllerGetCapabilities`), which is a correct, deliberate omission,
+  not an oversight: S3's advertised capacity is not a number Constellation
+  should be putting in front of the Kubernetes scheduler's capacity-aware
+  provisioning logic (`storageCapacity` in `CSIDriver` is likewise left
+  unset/`false`).
+- **`VolumeCondition` (health).** `NodeGetVolumeStats` sets
+  `volume_condition: {abnormal: true, message}` (VERIFIED spec.md: an
+  optional field on `NodeGetVolumeStatsResponse`, distinct from the RPC's
+  own success/error) when the pool subtree backing a PV no longer matches
+  what `view.mount` last recorded — its xattrs are gone, or its directory
+  has been removed entirely — which happens only when a human bypasses
+  `DeleteVolume` and edits the pool directly (settled decision 18's
+  explicitly-permitted-but-detected case). This is a health signal, not an
+  enforcement mechanism: Constellation does not lock humans out of a pool
+  they're allowed to mount, it surfaces that something outside Kubernetes
+  changed the volume so `kubectl describe pvc`/monitoring notices before an
+  application does.
 - **RWX consistency = `cto`.** Constellation's close-to-open semantics
   (plan 30's `cto=strict`, plan 31 §6.3's "flush is the close-to-open
   publish fence") is exactly what RWX PVs get: a write is guaranteed visible
@@ -960,6 +1546,41 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   - Quota expand: `ControllerExpandVolume` while the PV is actively mounted
     and written to, verifying no interruption.
   - Secret rotation: `Refreshing(callback)` credential swap with no remount.
+  - **Many PVs in one pool, across nodes**: create N PVs (e.g. 50) against
+    one pool `StorageClass`, spread across both kind workers, verify all
+    are independently readable/writable, one engine pod per (pool, node)
+    exists (not N), and per-PV quotas are enforced independently of each
+    other (§"Semantic notes").
+  - **Clone/restore within a pool, and refusal across pools**: clone a PVC
+    into a new PV in the *same* pool (metadata-only, verified fast — no
+    `RESIZE`-shaped data copy observed) and restore a `VolumeSnapshot` into
+    a new PV in the same pool; then attempt a clone/restore whose source and
+    destination `StorageClass`es name *different* pools and assert
+    `INVALID_ARGUMENT` (settled decision 8).
+  - **Trash purge under load**: delete several PVs of varying size (including
+    one large, many-small-file volume) while other PVs in the same pool are
+    actively written to; verify `/.trash/` entries disappear within a few
+    purge intervals, purge never blocks unrelated I/O on the pool's other
+    PVs, and GC subsequently reclaims the now-unreferenced chunks
+    (§"Deletion and purge").
+  - **Static provisioning**: a `PersistentVolume` naming an existing
+    out-of-band path (`<pool-uuid>/datasets/...`) mounts read-only with no
+    `CreateVolume` call, and (settled decision 18) a human `rm -rf` under a
+    dynamically-provisioned PV's `/volumes/<pv>/` is surfaced as an abnormal
+    `VolumeCondition` on the next `NodeGetVolumeStats`.
+  - **Human CLI mount alongside CSI**: `constellation mount
+    <pool>:/volumes/<pv> <dir>` from outside the cluster, concurrently with
+    the same PV mounted by a workload pod — both see each other's writes
+    under `cto` semantics, and the human's quota usage counts against the
+    same `quota.get` the CSI-mounted pod would see.
+  - **Shard routing**: a sharded pool (`shards: 4`) with many PVs; verify
+    each PV's `volume_id` routes consistently to the same shard across
+    repeated `NodeStageVolume` calls, and that a clone stays within its
+    source's shard (settled decision 7/8).
+  - K0 (§15) additionally measures one (unsharded) pool filesystem's
+    metadata-operation throughput ceiling under this same "many PVs across
+    nodes" scenario, scaled up until it degrades, to produce concrete
+    sharding guidance (§2.3) rather than a guessed default.
 - **Parity lane `linux-csi`.** A subset of the conformance-kit harness run
   through pods instead of local processes, in plan 31's `tests/parity.py`
   framework. Since `linux-csi` genuinely differs in shape from every other
@@ -997,6 +1618,12 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   "cluster_locks"`), never a bare unscoped `scenario = "*"`.
 
 ## 13. CI
+
+No new CI job is needed for the pool scenarios added to §"Testing" — they
+are ordinary `crates/harness` `k8s-scenario`s, and `kind-e2e`'s existing
+`harness k8s-scenario --all` step already runs every registered scenario,
+pool ones included, once they exist. The four jobs below are otherwise
+unchanged by volume pooling.
 
 ```yaml
   csi-unit:
@@ -1071,7 +1698,7 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
 These four jobs join `nightly.yml` (the FUSE/kind requirements and CSI
 sidecar downloads make them too slow for the PR-lane budget plan 31 §12 sets
 — `csi-unit` is the one exception, cheap enough for `ci.yml`).
-`upgrade-under-load` is the direct CI expression of §9's headline guarantee
+`upgrade-under-load` is the direct CI expression of §8's headline guarantee
 and is treated as a release gate, not an informational job (§"Definition of
 done").
 
@@ -1102,10 +1729,13 @@ done").
     `livenessprobe:v2.20.0`.
   - `values.yaml` exposing: image tags/repos, `engineProfile` defaults,
     `engine-pod-idle-ttl`, `handoff-drain-timeout`/`handoff-total-timeout`,
-    resource requests/limits for every container, and the PodSecurity
-    posture note from §"Credentials and security" spelled out in a
-    chart-level `NOTES.txt` warning about the node-plugin namespace's
-    `privileged` requirement.
+    `purge-interval`/`purge-grace`/`purge-max-concurrent-deletes`
+    (§"Deletion and purge"), resource requests/limits for every container,
+    and the PodSecurity posture note from §"Credentials and security"
+    spelled out in a chart-level `NOTES.txt` warning about the node-plugin
+    namespace's `privileged` requirement, plus a documented note on the
+    pool trust model (settled decision 16): different tenants need
+    different `StorageClass`es, not just different PVCs.
   - `CSIDriver` object templated from settled decisions 2/4/11/12/13.
   - A `templates/tests/` Helm test hook running a minimal PVC
     create/mount/write/delete round trip, for `helm test` post-install
@@ -1119,23 +1749,36 @@ because the fuser session-resume patch is unproven until built, K5 because
 "zero `ENOTCONN` under load" is a hard real-time property, not a
 best-effort one.
 
-### K0 — Spike: fd-passing mount + session handover prototype (timebox: 5 days)
+### K0 — Spike: fd-passing mount + session handover prototype, and pool metadata-throughput ceiling (timebox: 7 days; Track B runs in parallel)
 
-**What to build.** A throwaway example outside the product, exercising the
-full chain end to end without any Kubernetes involved yet:
-`crates/frontend-fuse/examples/handover_probe.rs` (or an equivalent
-temporary binary): mount via `fuse_mount_fd` at a scratch path, pass the fd
-to a second process over a unix socket (`SCM_RIGHTS`), have the second
-process wrap it and serve a trivial in-memory tree, then — the actual
-spike — hand it off to a *third* process using the vendored
+**What to build (Track A — handover).** A throwaway example outside the
+product, exercising the full chain end to end without any Kubernetes
+involved yet: `crates/frontend-fuse/examples/handover_probe.rs` (or an
+equivalent temporary binary): mount via `fuse_mount_fd` at a scratch path,
+pass the fd to a second process over a unix socket (`SCM_RIGHTS`), have the
+second process wrap it and serve a trivial in-memory tree, then — the
+actual spike — hand it off to a *third* process using the vendored
 `FuseSession::resume` patch, with a `dd`/`fio` write loop running against
 the mountpoint throughout, asserting zero I/O errors observed by the writer
 across the handoff.
 
+**What to build (Track B — pool metadata throughput, independent of Track
+A and of any CSI/Kubernetes plumbing).** A `crates/harness`-driven
+micro-benchmark against a real `constellation` daemon and one Constellation
+filesystem: many concurrent clients doing the exact metadata-op sequence
+`CreateVolume` performs (`mkdir` + `setxattr` × 6 + `quota.set`) at
+increasing subtree counts/concurrency, measuring ops/sec and p99 latency
+until the shared metadata commit chain (§2.3) visibly degrades. This
+answers a concrete, standing question this plan's pool design otherwise
+leaves as a guess: "how many PVs can one unsharded pool hold before an
+operator should set `shards > 1`?" It needs no CSI code, no Kubernetes, and
+no fd/FUSE machinery — it can run in parallel with Track A within the same
+7-day timebox.
+
 **Questions:**
 
 1. Does the `fuser` `Session::from_fd` handshake failure mode predicted in
-   §9's step 5 (EIO reply to a real request, then a hard error) actually
+   §8's step 5 (EIO reply to a real request, then a hard error) actually
    reproduce when a second process opens an already-initialized fd and
    calls the existing `from_fd`? (Expected: yes — confirm before building
    the patch, so the patch is validated against a reproduced failure, not
@@ -1146,9 +1789,9 @@ across the handoff.
    session with no re-`INIT`?
 3. What is the actual wall-clock cost of the fd-passing round trip
    (`SCM_RIGHTS` send + receive + `Session` reconstruction), measured, not
-   estimated — this is the number §9's "under 2 seconds" target is checked
+   estimated — this is the number §8's "under 2 seconds" target is checked
    against.
-4. Do in-flight requests genuinely survive the pause (step 1-2 of §9) with
+4. Do in-flight requests genuinely survive the pause (step 1-2 of §8) with
    the kernel queueing them, or does the kernel's own bounded queue depth
    (VERIFIED to exist, but its exact size/behavior under a paused reader
    is a K0 measurement, not assumed) cause client-visible blocking or
@@ -1159,6 +1802,13 @@ across the handoff.
    successfully call `fuse_mount_fd` against it? (Confirms the §"Testing"
    REPORTED claims with a real run, per this plan's VERIFIED/REPORTED
    discipline.)
+6. **(Track B)** At what subtree count/concurrency does one unsharded pool
+   filesystem's metadata-op throughput start visibly degrading (latency
+   knee, not just a soft slope), and does the degradation curve look like
+   it is dominated by the shared commit chain (§2.3) specifically, rather
+   than some unrelated bottleneck (e.g. the benchmark client itself)? The
+   answer becomes the sharding guidance published in the how-to guide (K7)
+   and the Helm chart's `NOTES.txt` (e.g. "shard past N PVs per pool").
 
 **Pre-agreed consequences** (from the design brief, restated precisely):
 
@@ -1170,10 +1820,10 @@ across the handoff.
   beyond `INIT` that this session's `session.rs` reading didn't surface):
   fall back to the brief's pre-agreed degraded mode — document
   restart-with-remount, accept the `ENOTCONN` window, **or** keep the old
-  engine pod alive until PVs republish via `requiresRepublish` (§9's
+  engine pod alive until PVs republish via `requiresRepublish` (§8's
   "Failure handling" section already specifies this as a *runtime* fallback
   for individual failed handoffs; if K0 shows it is the *only* available
-  mode, it becomes the default and only mode, and §9's protocol steps 1-3
+  mode, it becomes the default and only mode, and §8's protocol steps 1-3
   and 5 are removed from the plan rather than shipped unused, with §2's
   decision table's verdict on the chosen option revisited honestly in a
   follow-up note rather than silently kept).
@@ -1188,8 +1838,13 @@ across the handoff.
   honestly, and a plan built on an unproven handover mechanism should not
   proceed past the spike.
 
-**Gate:** the questions above answered and recorded in §"K0 results", with
-the consequence taken for each explicitly stated.
+**Gate:** questions 1-5 (Track A) and question 6 (Track B) answered and
+recorded in §"K0 results", with the consequence taken for each explicitly
+stated. Track B has no pass/fail consequence the way Track A does — it
+produces a number (or a curve), not a go/no-go — but it is still gated
+here, not deferred to K7, because the sharding guidance it produces is
+needed before K2's `StorageClass` parameter defaults and the how-to guide
+can honestly recommend a `shards` value.
 
 ### K1 — `crates/csi` skeleton, Identity service, driver registration
 
@@ -1204,27 +1859,43 @@ the consequence taken for each explicitly stated.
 
 ### K2 — Controller service: volumes and expansion
 
-- `CreateVolume`, `DeleteVolume`, `ControllerExpandVolume`,
+- `CreateVolume` (pool: `fs.create` + `browse.mkdir`/`setxattr` + xattr-based
+  idempotency, settled decision 7; dedicated: `fs.create` per PV),
+  `DeleteVolume` (pool: `browse.rename` to trash, settled decision 19;
+  dedicated: batch filesystem delete), `ControllerExpandVolume`,
   `ControllerGetCapabilities`, `ValidateVolumeCapabilities` against
-  `fs.registry.*`/`quota.*`.
+  `fs.create`/`browse.*`/`quota.*`. `StorageClass` parameters
+  `bucket`/`prefix`/`layout`/`shards` parsed and validated (§"StorageClass
+  parameters") — `filesystem`/`autoCreateFilesystem` from earlier drafts do
+  not exist in this milestone or any later one.
 - `external-provisioner` + `external-resizer` sidecars wired into the Helm
-  chart; a `StorageClass` provisions a bound `PersistentVolume` end to end
-  (no mounting yet — `NodeStageVolume` still stubbed).
+  chart; a pool `StorageClass` provisions a bound `PersistentVolume` end to
+  end (no mounting yet — `NodeStageVolume` still stubbed). Dedicated layout
+  can land in this milestone or be deferred to K3 if `fs.create`-per-PV
+  needs more plan-31 support than pool's shared-fs path — the executing
+  session records which in `PROGRESS.md`.
 - **Gate:** CONVENTIONS gates; `csi-sanity`'s Controller test group passes
-  (against the in-memory backend, per §"Testing"); `kubectl apply` a
-  `StorageClass`+`PVC` reaches `Bound`.
+  (against the in-memory backend, per §"Testing"); `kubectl apply` a pool
+  `StorageClass`+`PVC` reaches `Bound`; a second `PVC` against the same
+  pool `StorageClass` reaches `Bound` against the *same* underlying
+  Constellation filesystem (verified via `fs.create`'s idempotent uuid).
 
 ### K3 — Node service: stage, publish, mount, RWX
 
 - `NodeStageVolume`/`NodeUnstageVolume` (real `fuse_mount_fd` +
-  `view.mount{PreopenedFd}`, on-demand engine-pod creation per
-  §"Engine-pod lifecycle", minus GC/drain), `NodePublishVolume`/
-  `NodeUnpublishVolume` (bind mount), `NodeGetVolumeStats`.
+  `view.mount{PreopenedFd}` against `req.volume_id`'s parsed pool-fs-uuid
+  [+shard], on-demand engine-pod creation per §"Engine-pod lifecycle",
+  minus GC/drain), `NodePublishVolume`/`NodeUnpublishVolume` (bind mount,
+  `requiresRepublish: true` wired per settled decision 12),
+  `NodeGetVolumeStats` (including the `VolumeCondition` check, §"Semantic
+  notes"). Dedicated layout, if deferred from K2, lands here.
 - `kind-e2e` CI job stood up (§"CI"), including the `extraMounts` +
   privileged node-plugin config validated in K0.
 - **Gate:** CONVENTIONS gates; `csi-sanity`'s Node test group passes against
   a real kind cluster (not the in-memory K1/K2 backend); a pod mounts a PV
-  and reads/writes through it; the RWX-across-nodes `k8s-scenario` passes.
+  and reads/writes through it; the RWX-across-nodes `k8s-scenario` passes;
+  the "many PVs in one pool, across nodes" `k8s-scenario` passes with
+  exactly one engine pod per (pool, node) observed, not one per PV.
 
 ### K4 — Snapshots and clones
 
@@ -1234,11 +1905,15 @@ the consequence taken for each explicitly stated.
   after plan 32 is committed, with no ad hoc hold-naming scheme in the
   meantime).
   `CreateVolume`-from-`VolumeContentSource` (clone/restore) against
-  `clone.create`.
+  `clone.create`, routed to the source's own pool and shard, with
+  cross-pool/cross-shard requests refused `INVALID_ARGUMENT` (settled
+  decision 8).
   `external-snapshotter` sidecar + `snapshot-controller`/CRDs added to the
   chart's prerequisites.
 - **Gate:** CONVENTIONS gates; the snapshot→clone→mount `k8s-scenario`
-  passes; `ListSnapshots` pagination matches `csi-sanity`'s expectations.
+  passes; the "clone/restore within a pool, and refusal across pools"
+  `k8s-scenario` passes both halves; `ListSnapshots` pagination matches
+  `csi-sanity`'s expectations.
 
 ### K5 — FUSE session handover in production
 
@@ -1254,17 +1929,22 @@ the consequence taken for each explicitly stated.
   runs (flake-proofing this specific claim, since it is this plan's
   headline guarantee and a one-in-twenty failure rate would be a real
   regression hiding behind a green checkmark); the handoff wall-clock stays
-  under the §9 "under 2 seconds" target at p99.
+  under the §8 "under 2 seconds" target at p99.
 
-### K6 — Credentials, security, drain, GC
+### K6 — Credentials, security, drain, purge, GC
 
 - `EphemeralSecretStore` wiring for all three `CredentialSource` variants,
   secret-rotation scenario, the `control-acl.toml` service-principal grant,
   PodSecurity posture finalized, engine-pod idle-GC and node-drain
-  (`node.leave`) implemented per §"Engine-pod lifecycle".
+  (`node.leave`) implemented per §"Engine-pod lifecycle", **the controller
+  purge worker and controller-owned engine pod implemented per settled
+  decision 19 and §"Deletion and purge"** (rate limiting, `/.trash/`
+  listing, GC interaction).
 - **Gate:** CONVENTIONS gates; the secret-rotation and node-drain
-  `k8s-scenario`s pass; a `kube-bench`-style PodSecurity check confirms
-  the node-plugin/engine-pod privilege split matches
+  `k8s-scenario`s pass; the "trash purge under load" `k8s-scenario`
+  (§"Testing") passes, including the large-many-small-files trashed volume
+  case; a `kube-bench`-style PodSecurity check confirms the
+  node-plugin/engine-pod/controller-owned-engine-pod privilege split matches
   §"Credentials and security" exactly (no accidental privilege
   broadening).
 
@@ -1277,10 +1957,14 @@ the consequence taken for each explicitly stated.
   rule — recorded here as a dependency, not assumed already done); Helm
   chart finalized with `helm test`; container images published; the
   `seLinuxMount` question from settled decision 13 revisited with a
-  concrete recommendation.
+  concrete recommendation; **the static-provisioning and human-CLI-mount
+  `k8s-scenario`s pass; the shard-routing `k8s-scenario` passes; the how-to
+  guide publishes concrete sharding guidance derived from K0 Track B's
+  measurement** (§2.3, §"K0 results").
 - **Gate:** every CI job in §"CI" green; the full `k8s-scenario` suite
   green; `PROGRESS.md`/`TESTING.md` updated; the how-to guide for deploying
-  Constellation as a Kubernetes CSI driver exists.
+  Constellation as a Kubernetes CSI driver exists, and covers pool vs.
+  dedicated layout selection and static provisioning.
 
 ## 16. What plans 32 and 33 provide for this plan
 
@@ -1303,8 +1987,14 @@ contract this plan relies on.
   give the CSI plugin the `operator` role. Audit entries record
   `principal.kind = "service"` and the PV name.
 - **Plan 33 UI.** Screen 3 shows CSI-provisioned views and filters on the
-  `pv`/`pvc`/`namespace` labels. Screen 5 marks `csi:`-held snapshots as
-  externally owned; deleting one needs admin and an explicit override.
+  `pv`/`pvc`/`namespace`/`pool`/`shard` labels — extended, per the
+  coordinator brief's "Plan 33 addition," to show the pool hierarchy
+  (`StorageClass` → pool filesystem → shards → volumes) with per-volume
+  capacity vs. used, snapshots, and trash/purge status, with admin actions
+  limited to safe ones (inspect, purge-now of trash); volume
+  creation/deletion stays with Kubernetes, never done from this UI. Screen
+  5 marks `csi:`-held snapshots as externally owned; deleting one needs
+  admin and an explicit override.
 
 ## 17. Risks
 
@@ -1349,6 +2039,39 @@ contract this plan relies on.
   rather than the CSI spec's own alpha marking, which lags Kubernetes'
   adoption; if a future CSI spec revision changes this enum's shape,
   K7-or-later revisits it, but this is not expected to be a practical risk.
+- **Pool blast radius (§2.3, settled decision 16).** Pooling's whole value
+  proposition — one shared cache, one shared commit chain — is also its
+  risk concentration: a bug that corrupts one pool's metadata, or an
+  engine-pod incident that exhausts the pool's shared `ResourceBudget`,
+  affects every PV in that pool at once, not just one PVC's worth of blast
+  radius the way `layout: dedicated` or a pure filesystem-per-PV design
+  would contain it. This is a deliberate, stated trade-off (§2.3's
+  isolation column), not an oversight — the mitigation is organizational
+  (use `dedicated` or a separate pool per real isolation boundary, settled
+  decision 16), not a technical one this plan can add without undoing
+  pooling's benefits. Documented prominently in the Helm chart's README,
+  not just here.
+- **The shared commit chain is a real throughput ceiling, not just a
+  theoretical one (§2.3's "Shards").** Unlike a dedicated or
+  filesystem-per-PV layout, a pool's metadata operations for *every* PV
+  serialize against the same commit chain; K0's Track B measurement (§15)
+  quantifies this, but the number itself is a risk until measured — if it
+  turns out to be lower than expected for realistic multi-tenant workloads,
+  the default `shards: 1` might need a higher default, or the how-to guide
+  might need to recommend sharding much more aggressively than this plan
+  currently assumes. Tracked as a K0 finding to revisit, not a fixed
+  number baked into this plan ahead of measurement.
+- **Purge cost of huge volumes (§"Deletion and purge").** A deleted PV
+  holding millions of small files makes its `browse.delete{recursive:
+  true}` a genuinely slow metadata operation; the purge worker's rate
+  limit contains the *blast radius* (other pools' purges aren't starved)
+  but does not make the delete itself fast. A pool whose users routinely
+  create and delete huge volumes may see `/.trash/` backlogs and delayed
+  chunk reclamation as a result — surfaced via the
+  `constellation_csi_purge_pending_total` metric (§"Observability") so an
+  operator sees it building up rather than discovering it as "space isn't
+  coming back." An incremental/resumable purge (§"Deletion and purge") is
+  the documented follow-up if this proves common in practice.
 
 ## 18. Definition of done
 
@@ -1370,14 +2093,24 @@ The CONVENTIONS gates, PLUS:
    `constellation-frontend-fuse`'s own behavior, so nothing here should ever
    move that baseline.
 6. **Docs updated**: `PROGRESS.md` gets a plan-37 section with the K0
-   results matrix; `TESTING.md` covers the `linux-csi` lane, `csi-sanity`
-   invocation and the `k8s-scenario` harness mode; a how-to guide for
-   deploying the Helm chart exists; the Plan 32/33 change requests
-   (§"Plan 32 and 33 changes needed") are filed as tracked follow-ups, not
-   silently left implicit.
-7. **Report**: per-job CI pass/fail tallies, the K0 results matrix, the K5
-   handoff-duration p50/p99 and the 20-run `ENOTCONN` tally, and the parity
-   summary.
+   results matrix (both tracks); `TESTING.md` covers the `linux-csi` lane,
+   `csi-sanity` invocation and the `k8s-scenario` harness mode; a how-to
+   guide for deploying the Helm chart exists and covers pool vs. dedicated
+   layout selection, sharding guidance (from K0 Track B), static
+   provisioning and the human-CLI-mount safety rules (settled decision 18);
+   the plan-31 `browse.*` addition and the plan 32/33 needs this plan
+   records (§"What plans 32 and 33 provide for this plan") are filed as
+   tracked follow-ups for those plans' own sessions, not silently left
+   implicit.
+7. **Pool scenarios pass**: many-PVs-in-one-pool, clone/restore
+   within-pool and cross-pool refusal, trash-purge-under-load, static
+   provisioning, human-CLI-mount-alongside-CSI, and shard-routing
+   `k8s-scenario`s all green (§"Testing") — not just the pre-pooling
+   scenario set.
+8. **Report**: per-job CI pass/fail tallies, the K0 results matrix
+   (handover Track A *and* metadata-throughput Track B), the K5
+   handoff-duration p50/p99 and the 20-run `ENOTCONN` tally, the pool
+   scenario results, and the parity summary.
 
 ## K0 results
 
@@ -1396,10 +2129,15 @@ The CONVENTIONS gates, PLUS:
 | `gh api repos/kubernetes-csi/{external-provisioner,external-resizer,external-snapshotter,node-driver-registrar,livenessprobe,csi-test}/releases/latest` | 2026-09-28: `v6.3.0`, `v2.3.0`, `v8.6.0`, `v2.18.0`, `v2.20.0`, `v5.6.0` | Helm chart sidecar image pins |
 | `kubernetes-csi/csi-test` README (WebFetch) + `cmd/csi-sanity/main.go` (WebFetch, raw) | `master`, 2026-09-28 | confirms `csi-sanity` is a standalone binary, not just a Go test package; its flag set (`csi.endpoint`, `csi.mountdir`, `csi.stagingdir`, `csi.secrets`, etc.) |
 | `kubernetes.io/docs/concepts/storage/volume-pvc-datasource/` (WebFetch) | as of 2026-09-28 | PVC-cloning `dataSource` mechanics and constraints; `ReadWriteOncePod` naming |
-| `awslabs/mountpoint-s3-csi-driver`, `docs/ARCHITECTURE.md` + `docs/MOUNTPOINT_POD_SHARING.md` (WebFetch, raw) | `main`, 2026-09-28 | precedent (d): per-volume "Mountpoint Pod," `MountpointS3PodAttachment` CRD, the exact fd-handoff sequence (open `/dev/fuse` → `mount(2)` → send fd + mount options over a unix socket) this plan's `NodeStageVolume` design mirrors; confirms sharing is scoped per (PV, node), a deliberate point of comparison against this plan's per-(fs, node) sharing choice |
-| JuiceFS CSI driver smooth-upgrade blog posts (WebSearch, REPORTED — not fetched from primary source docs directly) | as surfaced 2026-09-28 | precedent (d): FUSE fd passed from Mount Pod to CSI Node over a unix domain socket during "pod recreate" smooth upgrade; Mount Pod sharing across multiple PVs of one filesystem on one node (`FS_SHARE_MOUNT`) — the closer precedent for this plan's per-(fs, node) engine-pod sharing than Mountpoint-S3's per-PV pods |
+| `github.com/awslabs/mountpoint-s3-csi-driver`, `git clone --depth 1` (local, VERIFIED read in full for the cited files, upgraded from an earlier WebFetch-only citation) | commit `b450b22beae8bddc0d3c09551655b2b7d323e29b`, `main`, 2026-09-21, cloned 2026-09-28 into `/tmp/mountpoint-research/mountpoint-s3-csi-driver` | `docs/ARCHITECTURE.md` + `docs/MOUNTPOINT_POD_SHARING.md`: per-(PV, node) "Mountpoint Pod," `MountpointS3PodAttachment` CRD (`pkg/api/v2/mountpoints3podattachment_types.go`'s `{NodeName, VolumeID}` keying) — confirms sharing is scoped per (PV, node), narrower than this plan's per-(pool, node) choice, for a reason (no shared cache to justify coarser sharing, §2.2) rather than a difference Mountpoint merely declined to make; `pkg/driver/node/mounter/pod_mounter.go` + `pkg/mountpoint/mountoptions/mount_options.go`: the exact fd-handoff sequence (open `/dev/fuse` → `mount(2)` → `SCM_RIGHTS` send → close parent's fd copy) this plan's `NodeStageVolume`/`Transport::send_fd` mirrors line-for-line; `mountpoint-s3-fuser/src/session.rs`+`request.rs` (via this driver's vendored fork dependency): `Session::from_fd`'s `initialized: AtomicBool::new(false)` and its exclusive use against freshly-`mount(2)`-ed connections — the basis for §2.2's "no handover precedent exists" finding; `docs/TROUBLESHOOTING.md` + `pkg/podmounter/mppod/creator.go`: `RestartPolicy: OnFailure`, `TerminationGracePeriodSeconds = 600`, SIGTERM-ignoring drain discipline adopted as this plan's always-on baseline (§2.2, §7) |
+| `github.com/awslabs/mountpoint-s3`, `git clone --depth 1` (local, VERIFIED) | commit `e144a7bb84948045f0d7cde77060afaa7ed91b53`, `main`, 2026-09-28, cloned into `/tmp/mountpoint-research/mountpoint-s3` | `doc/SEMANTICS.md`: Mountpoint's explicit not-POSIX positioning (§2.2, §"Semantic notes"); `examples/fuse-fd-mount-point/mounthelper.go`: standalone `fd=`/`mount(2)`/`/dev/fd/N` reference confirming `fuse_mount_fd`'s contract independently of the CSI driver |
+| This session's own research report, `scratchpad/mountpoint-research.md` (Read in full) | produced this session from the two clones above | consolidated VERIFIED/REPORTED findings and the full source list (§7 of that report) this table's Mountpoint rows summarize; also the source for plan 31's C7/vendored-fuser recommendations this plan cross-references |
+| JuiceFS CSI driver smooth-upgrade blog posts (WebSearch, REPORTED — not re-verified against source this session) | as surfaced 2026-09-28 | precedent: FUSE fd passed from Mount Pod to CSI Node over a unix domain socket during "pod recreate" smooth upgrade; Mount Pod sharing across multiple PVs of one filesystem on one node (`FS_SHARE_MOUNT`) — the closer precedent for this plan's per-(pool, node) engine-pod sharing than Mountpoint-S3's per-PV pods, still REPORTED, unlike the now-VERIFIED Mountpoint rows above |
 | `kubernetes-sigs/kind` issue #2540 (`gh api`, body + comments) | as of 2026-09-28 | VERIFIED: kind auto-mounts `/dev/fuse` only for rootless docker, not rootful (GitHub-hosted runners' default) — the basis for this plan's explicit `extraMounts` requirement |
 | WebSearch results on `/dev/fuse` + Kubernetes device-cgroup behavior (`skypilot-org/skypilot#4108`, `meta-pytorch/monarch#4917`, `pfnet-research/meta-fuse-csi-plugin`) | REPORTED, as surfaced 2026-09-28 | confirms the privileged-pod + device-visible-in-node-container two-layer requirement; `meta-fuse-csi-plugin` is independent precedent for "a privileged CSI-adjacent pod does the mount, hands it to an unprivileged FUSE implementation" matching this plan's node-plugin/engine-pod split |
 | WebSearch on `csi-driver-nfs` staging architecture | REPORTED, as surfaced 2026-09-28 | confirms the `NodeStageVolume`-global-mount / `NodePublishVolume`-bind-mount split (settled decision 5) is the standard shared-filesystem CSI pattern, not a novel Constellation invention |
 | this tree, `docs/plans/v1/CONVENTIONS.md`, `wip/31-core-frontend-backend.md`, `wip/33-control-plane-and-ui.md`, `wip/35-windows-port.md` (Read, in full or by section) | as of this session, plan 31/33 still in progress in parallel | fixed names, the §9.2 control-method table, the `control-acl.toml` grant format, plan style (options tables, settled-decisions numbering, milestone gate shape, Sources-table format) |
+| `docs/plans/v1/done/09-p6a-snapshots-clones.md` (Read, in full) | committed plan | subtree-granular, copy-on-write snapshots/clones (Step 4) — the factual basis for §2.3's "CoW only within one filesystem" and the cross-pool-clone refusal (settled decision 8) |
+| `docs/plans/v1/wip/32-snapshot-policies-and-space.md` (Read, relevant sections) | plan 32, in progress in parallel, not edited by this plan | `held_by` owner-namespace field (§0.4) this plan's `CreateSnapshot`/`DeleteSnapshot` set/release; the `_prune`/`_snapsched` `SingletonLease` pattern (§3.2) settled decision 19 explicitly chose *not* to reuse for the purge worker, and why |
+| `scratchpad/csi-pool-brief.md` (Read, in full — coordinator's settled volume-pool design) | this session's shared brief, settled, not relitigated | the pool/dedicated layout split, xattr volume records, trash + async purge, shard routing, isolation boundary, and the Mountpoint-lessons summary this plan's §2.2/§2.3/§"Deletion and purge" work in full |
 | CSI addendum / core-design-brief scratchpad files (Read) | this session's shared brief | every fixed name and architectural decision this plan is required to use verbatim |

@@ -1234,7 +1234,9 @@ protocol itself is deleted, not shimmed — §2).
 (registry list/create/import/export/passwd/doctor — `Manager`'s API,
 currently CLI-only, not reachable over the control API at all), `view.*`
 beyond mount/unmount/list stays as-is, `browse.stat/read/write/mkdir/rename/delete`
-(the rest of `ControlVfs`'s surface — today's `ReadDir`/`Inspect` only
+(`browse.delete{recursive}` removes a whole tree server-side, streaming
+progress events and resumable after a crash — plan 37's trash purge uses
+it; the rest of `ControlVfs`'s surface — today's `ReadDir`/`Inspect` only
 cover listing and metadata, not mutation, over the control API),
 `browse.xattr` (get/set/list/remove xattrs through `ControlVfs`, the
 control-API-only xattr path plans 34/35/36 route scratch/prune/EA
