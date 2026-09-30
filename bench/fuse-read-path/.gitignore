@@ -1,0 +1,6 @@
+third_party/
+build/
+data/
+results/*
+!results/full.jsonl
+!results/summary-tables.md
