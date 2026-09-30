@@ -230,7 +230,7 @@ option's evidence and §7 turns it into milestones in that order.
 | 1 | `splice(2)` fd→pipe→`/dev/fuse` | **REJECT** | seq1 4,808 vs `copy` 6,704 MiB/s (−28%) with `SPLICE_F_MOVE` (= `copy` without it); seq8 −10%; rand128k-aio 2,829 vs 4,321 (−35%); CPU/GiB unchanged (0.13 vs 0.14). libfuse never splices replies < 8 KiB (every 4 KiB read falls back to `writev`: 3.6M fallbacks in a `rand4k-1j-dio` cell, 13.9M in a `rand4k-8j-dio` cell — one per read). `SPLICE_F_MOVE` steals the chunk file's page-cache pages into the FUSE inode (backing residency 100→75% seq, 100→0% smallfiles): a MOVE read would evict Constellation's own disk cache. Cold: libfuse's non-blocking fd→pipe splice returns short on uncached pages and falls back to copy (4.8k–25.6k fallbacks per cold `seq8` cell). Only measured win: O_DIRECT seq1 10,266 vs 6,954 (+48%), which io_uring matches/betters anyway (§2, row 5). |
 | 2 | `mmap` + `vmsplice(2)` | **REJECT** | Indistinguishable from `copy` in every cell (seq1 6,639 vs 6,704; seq8 22,568 vs 22,756; rand4k-1j-dio 124k vs 122k IOPS). `fs/fuse/dev.c` always copies user pages regardless of flags ("Can't control lifetime of pipe buffers" — VERIFIED against `fs/fuse/dev.c` on `torvalds/master`); `SPLICE_F_GIFT` is accepted but nothing is stolen (residency stays 100%). Plus file-backed RSS equals the whole working set (1,041–8,209 MiB in these cells, vs `copy`'s 8–15 MiB). |
 | 3 | `mmap` alone (reply from a mapping, the portable zero-copy option) | **not adopted** | ≈ `copy` on sequential; rand4k-1j-dio 191k vs 122k IOPS (+57%, but a fault-around artifact of `read_ahead_kb`, not a design win — README "Caveats"); smallfiles +14%; loses to `memcache` on small files (1,631 vs 3,200 MiB/s). Serves bytes the kernel re-reads from disk **unverified** after any eviction of the underlying page — the memcache's admit-once-verify model, kept below, does not have that gap. |
-| 4 | `memcache` (`main`'s in-memory verified tier, already merged) | **keep, unchanged design** | seq1-dio 14,372 vs 6,954 (2.1×), smallfiles 3,200 vs 1,430 (2.2×), rand4k-1j-dio 175k vs 122k IOPS; but ≈ `copy` on buffered sequential (6,759 vs 6,704), rand128k-aio **−32%** (2,942, worse than `copy`'s 4,321; the bench did not isolate why — the cell was pre-loaded, so it is not miss cost — and Z0's fio gate re-measures this shape on Constellation's own memcache before anything is concluded from it); cold sequential costs **2–3× the daemon CPU** of plain `copy` (0.64 vs 0.24 s/GiB: a cold miss loads and hashes the whole chunk before serving any of it). RSS is the resident working set (capped 128 MiB desktop / 16 MiB mobile in Constellation, 8 GiB in the bench's own default). |
+| 4 | `memcache` (`main`'s in-memory verified tier, already merged) | **keep, unchanged design** | seq1-dio 14,372 vs 6,954 (2.1×), smallfiles 3,200 vs 1,430 (2.2×), rand4k-1j-dio 175k vs 122k IOPS; but ≈ `copy` on buffered sequential (6,759 vs 6,704), rand128k-aio **−32%** (2,942, worse than `copy`'s 4,321; the bench did not isolate why — the cell was pre-loaded, so it is not miss cost — and Z0b's fio gate re-measures this shape on Constellation's own memcache before anything is concluded from it); cold sequential costs **2–3× the daemon CPU** of plain `copy` (0.64 vs 0.24 s/GiB: a cold miss loads and hashes the whole chunk before serving any of it). RSS is the resident working set (capped 128 MiB desktop / 16 MiB mobile in Constellation, 8 GiB in the bench's own default). |
 | 5 | FUSE-over-io_uring transport (kernel ≥ 6.14) | **ADOPT — the primary result** | rand4k-8j-dio 1,510.1k vs 464.5k IOPS (3.25×) at 0.78 vs 3.71 CPU s/GiB (4.7× less), p99 8.8 vs 36.1 µs; rand4k-1j-dio 280.5k vs 121.8k (2.3×), p99 3.8 vs 10.1 µs; buffered rand4k-8j same IOPS (kernel page cache serves it either way) but daemon CPU 0.63 vs 3.14 s/GiB (5× less); smallfiles 2,170 vs 1,430 (+52%); seq1-dio 10,503 vs 6,954 (+51%); rand128k-aio equal (4,321 vs 4,321). **Regression**: single-stream buffered sequential seq1 5,007 vs 6,704 (−25%), seq8 17,770 vs 22,756 (−22%) — one CPU's ring serves that CPU's readahead, where `/dev/fuse` spreads it over the worker pool; CPU/GiB still −43% (seq1 0.08 vs 0.14) and −24% (seq8 0.19 vs 0.25). Cold: same throughput as `copy`, CPU/GiB −29% (seq1 cold: 0.17 vs 0.24). RSS +~130 MiB of ring payload buffers on this 16-CPU bench host (queues × depth × max_write); Constellation's existing `/dev/fuse` path already spends 16 MiB per worker (`crate::threads::FUSE_BUFFER_BYTES`, VERIFIED `crates/frontend-fuse/src/threads.rs:10`) — §4 works out the comparison at Constellation's worker count, not the kernel's per-CPU count the bench measured at. `uring-bufpool` (7.3's kernel-managed pool) is within noise of plain `uring` everywhere measured. |
 | 6 | io_uring zero-copy (kernel ≥ 7.3, `READ_FIXED` from the chunk file into the request's registered pages) | **ADOPT as the second step, behind the transport** | seq1 6,360 MiB/s (= `copy` −5%) at 0.044 CPU s/GiB (3.1× less than `copy`'s 0.139, 2.7× less than `memcache`'s 0.121); seq8 23,883 (+5%) at 0.11 (2.2× less); seq1-dio 18,534 (2.7× `copy`, 1.3× `memcache`) at 0.05; rand128k-aio 4,971 (+15%) at 0.07; smallfiles 2,844 (2× `copy`); rand4k-dio ≈ the plain transport (0-copy is already CPU-bound on request overhead at 4 KiB, not on the copy). Cold CPU/GiB halves versus `copy` (0.12 vs 0.24). Fixes the transport's buffered-sequential regression (seq1 6,360 vs the plain transport's 5,007). Needs `CAP_SYS_ADMIN`, kernel buffer pools, and the daemon reading chunk files **directly** — no memcache copy on that path (§3(d), trust-model note below). Userspace side is a draft: `joannekoong/libfuse`'s `zero_copy_v7` branch, **REPORTED** unmerged as of this research (3 bugs the bench itself found and documents: queue-depth zeroed by CLI option order, an `invalid commit_id=0` abort at unmount, the zero-copy flag not handed back on `READ` — README "Caveats"); the Skory/fuser fork explicitly defers zero-copy. |
 | 7 | FUSE passthrough (kernel ≥ 6.9, whole backing file per open) | **ADOPT for single-chunk read-only opens** | seq1 30,797 (4.6×), seq8 85,333 (3.7×), rand128k-aio 24,381 (5.6×), smallfiles 6,564 (4.6×), **0 daemon CPU, 5 MiB RSS**. O_DIRECT reads on a passthrough fd go to the physical disk even when warm (`disk_read_mib` shows it in the raw results) — correct O_DIRECT semantics, but a behaviour change from today's path, which always serves O_DIRECT from the verified cache. `fuser` 0.18 already implements it (`ReplyOpen::opened_passthrough`, `KernelConfig::max_stack_depth`, VERIFIED `vendor/fuser/src/lib.rs:223-268`, `vendor/fuser/src/session.rs:185,771-772`). Eligible only when a file's data is exactly one cached chunk file (file size ≤ chunk size, i.e. every single-chunk file — the modal case for source trees and small config/data files); needs `CAP_SYS_ADMIN`; the daemon never sees these reads, so atime bump, the scan-ahead offset-0 trigger, and read metrics must move to `open()` (§3(c)). |
@@ -677,14 +677,18 @@ connection is not a mount source... checked against Mountpoint's fork, and
 found to need independent design"), and this plan inherits the same
 discipline rather than assuming the answer.
 
-**Milestone Z0 (§7) spikes it** — concretely: detach a ring-transport
-session mid-load (the same `upgrade-under-load` harness shape plan 31 C4
-already gates, VERIFIED `docs/plans/v1/wip/31-core-frontend-backend.md`
-§6.11 "Harness/test implications"), and in the resuming process attempt
-`Session::from_fd_resumed` with `KernelConfig::io_uring = true` against the
-handed-over fd; observe whether queue registration succeeds, fails cleanly
-(a `FUSE_IO_URING_CMD_REGISTER` `EINVAL`/`ENOTCONN` the resuming process can
-catch and fall back from), or corrupts the connection.
+**Milestone Z0a (§7) spikes it**, at the protocol level rather than in
+Constellation — nothing in the tree speaks FUSE-over-io_uring until Z1
+vendors it, and the question is about the *kernel*, not about our code:
+does a FUSE connection whose ring entries belonged to a now-exited
+io_uring instance (a) survive at all, (b) still deliver requests over
+`/dev/fuse` to whoever holds the fd, and (c) accept fresh
+`FUSE_IO_URING_CMD_REGISTER`s from a new process? Z0a's milestone entry
+below is the full brief. Its three possible outcomes map directly onto the
+policy below: (c) works → `Auto` everywhere; (a)+(b) but not (c) → `Auto`,
+with a handover downgrading the resumed session to `/dev/fuse`; not even
+(a) → `DevFuse` for every handover-capable session, and `daemon --upgrade`
+must refuse to detach a ring session.
 
 **The fallback policy, regardless of what the spike finds**: a new
 `transport: TransportPolicy` field (`Auto | DevFuse`) on
@@ -696,13 +700,13 @@ type). `Auto` (the default for a plain, non-handover-capable daemon mount)
 lets §2.4's ladder run as designed. **A session opened with handover in
 mind — plan 37's CSI engine pods, and `constellation daemon --upgrade`'s own
 target mount — defaults to `DevFuse`** (pin to the `/dev/fuse` transport,
-skip the ring entirely) **until Z0's spike proves re-registration works**;
+skip the ring entirely) **until Z0a's spike proves re-registration works**;
 once it does, the default for handover-capable sessions flips to `Auto` in
-the same milestone that proved it, not speculatively here. This is the one
-place in this plan where the design is genuinely conditional on an
-UNVERIFIED fact rather than settled: everywhere else in §3, Z0 is a
-baseline-and-re-verify milestone; here it is a decision gate that changes
-what Z1 onward defaults to for handover-capable mounts specifically (plain,
+the milestone that lands the transport (Z2), citing Z0a's result. This is
+the one place in this plan where the design is genuinely conditional on an
+UNVERIFIED fact rather than settled: Z0a exists only to answer it, and its
+answer changes what Z1 onward defaults to for handover-capable mounts
+specifically (plain,
 non-CSI, non-upgrade mounts are unaffected either way — they were never
 going to be handed over, so `Auto` costs them nothing).
 
@@ -870,8 +874,8 @@ and this plan's new fio-based gate, §6).
   `/sys/fs/fuse/connections/<id>/abort` while rings are armed (the existing
   `abortable: true` FrontendCaps flag and its harness use, VERIFIED plan 31
   §6.6, extended to the ring transport); detach/handover under load with
-  the ring transport active (§3(e)'s Z0 spike, promoted to a standing
-  scenario once it passes). **Passthrough-specific**: eviction attempted
+  the ring transport active (§3(e)'s Z0a spike, promoted to a standing
+  scenario once Z2 has a ring transport to run it against). **Passthrough-specific**: eviction attempted
   while a chunk is passthrough-open (assert the pin-while-open guard, §3(c),
   holds — the chunk is not evicted, and the guard's refcount is exactly the
   open-fd count); a remote write landing a new manifest while a passthrough
@@ -905,29 +909,134 @@ Each milestone ends in a gate; all of CONVENTIONS.md's standing gates
 CONVENTIONS.md's "Definition of done" — only the milestone-specific
 additions are listed below.
 
-- **Z0 — Baselines and the handover spike.** The fio-based CPU-s/GiB + RSS
-  gate (§6) is built and run against `main`'s current
-  `/dev/fuse`-only path, establishing Constellation's own baseline numbers
-  (not the bench's) for later milestones to compare against. The transport
-  matrix lane's skeleton is added (currently only exercising `dev-fuse`,
-  since nothing else exists yet). §3(e)'s handover spike runs: detach a
-  session, attempt `Session::from_fd_resumed` with
-  `KernelConfig::io_uring = true` on the resumed fd, and record whether
-  ring re-registration on an
-  already-`INIT`'d connection succeeds, fails cleanly, or corrupts the
-  connection — **this result fixes Z1's `TransportPolicy` default for
-  handover-capable sessions** (§3(e)). Also here, independent of any
-  transport: §2.3's two verify-once changes (direct memcache admission of
-  fetched bytes; the `verified` bit on `Entry` and `get_disk` honouring it
-  under `admit`), with the `--cache-verify` flag itself, so the fio gate
-  records the baseline before and after them and every later milestone
-  compares against the cheaper read path, not the double-hash one.
-  **Gate**: the existing fs-core `cache`/`memcache` and engine
-  `view::memcache_tests` suites extended with: a fetched chunk is resident
-  in memory without a second disk read; a startup-scanned file is hashed
-  on first read and a corrupt one is dropped; a verified entry is not
-  re-hashed under `admit` and is under `always`; memory ⊆ disk still holds
-  under concurrent fetch/remove/prune.
+- **Z0a — The handover spike (first; independent; touches no
+  Constellation code).** A self-contained experiment that answers §3(e)'s
+  question on real kernels and records the answer. It is written so that a
+  session with no other context can execute it.
+
+  *The question.* Process A serves a FUSE connection over io_uring.
+  Constellation's handover (`FuseSession::detach` → `SessionHandoff` →
+  `Session::from_fd_resumed` in the next process image, VERIFIED
+  `crates/frontend-fuse/src/session.rs`, `vendor/fuser/CONSTELLATION-PATCH.md`)
+  passes the `/dev/fuse` fd to process B and A exits — taking its io_uring
+  instance, and therefore the ring entries the kernel had registered
+  against it, with it. Three things are unknown: **(a)** does the
+  connection survive the loss of its ring entries, or does the kernel
+  abort it (`ENOTCONN` to every client)? **(b)** if it survives, do
+  requests flow to plain `read(2)`/`write(2)` on `/dev/fuse` again, so B
+  can serve without rings? **(c)** can B register fresh queues/entries
+  (`IORING_OP_URING_CMD` with `FUSE_IO_URING_CMD_REGISTER`) on that
+  already-`INIT`'d connection, and if the command returns 0, do requests
+  actually arrive on B's ring afterwards?
+
+  *Why not use Constellation or libfuse as-is.* Nothing in the tree speaks
+  the ring protocol (Z1 vendors it), and stock libfuse cannot resume a
+  handed-over connection: `fuse_session_process_buf_internal` rejects any
+  first request that is not `FUSE_INIT`, and it is `_do_init` that calls
+  `fuse_uring_start(se)`. Two routes; pick one, keep the other as the
+  fallback if the first stalls:
+  1. **libfuse, patched** (preferred; least code). `bench/fuse-read-path`
+     already builds libfuse master from source (`build.sh`, `third_party/`)
+     and has a working ring-mode filesystem (`src/chunkfs.c`, `--mode
+     uring`, `-o io_uring`). Add a `--resume-fd N --init <max_write>,<max_pages>,<flags>`
+     mode: `fuse_session_mount(se, "/dev/fd/N")` (libfuse accepts an
+     already-open descriptor as the mountpoint), then a small patch to
+     `lib/fuse_lowlevel.c` that marks the session initialised (`se->got_init`,
+     the `se->conn.*` fields the INIT reply would have set, taken from the
+     command line) and calls `fuse_uring_start(se)` directly, so the
+     first request seen may be an ordinary one. Add a `--handover` mode to
+     A: after N ring-served reads, fork B with the `/dev/fuse` fd
+     inherited (equivalent to `SCM_RIGHTS` for the kernel's purposes),
+     tear down A's rings (`fuse_uring` teardown → `io_uring_queue_exit`)
+     and exit; B resumes.
+  2. **Raw uapi in C with liburing** (fallback; clearest observations):
+     `mount(2)` with `fd=`/`rootmode=`/`user_id=`/`group_id=`, read
+     `FUSE_INIT`, reply with `FUSE_OVER_IO_URING` set, register
+     `nr_cpus × depth` entries per the kernel's own
+     `Documentation/filesystems/fuse-io-uring.rst` and `include/uapi/linux/fuse.h`
+     of the running kernel (`fuse_uring_cmd_req`, `fuse_uring_ent_in_out`,
+     the header/payload iovec layout — copy the mechanics from libfuse
+     master's `lib/fuse_uring.c`, which is the reference implementation),
+     serve a one-file read-only filesystem (`GETATTR`/`LOOKUP`/`OPEN`/
+     `READ`/`RELEASE`/`READDIR`, `ENOSYS` for the rest), then the same
+     fork-and-exit handover.
+
+  *Read the kernel first, then test.* Before running anything, read
+  `fs/fuse/dev_uring.c` for each kernel tested — `fuse_uring_register`,
+  `fuse_uring_create` (the ring is per `fuse_conn`, `fc->ring`),
+  `fuse_uring_stop_queues`, `fuse_uring_destruct`, `fuse_uring_cancel`
+  (what `IO_URING_F_CANCEL` on io_uring exit does to the queues), and
+  whatever decides between the ring and the classic `fiq` queue when a
+  request is queued (`fuse_uring_ready`/`fc->io_uring` flags) — and write
+  down a prediction for (a), (b), (c) with function names and line numbers
+  for that version. The report records prediction and observation side by
+  side; a mismatch is the most valuable finding the spike can produce.
+
+  *Variants to run* (each: mount, start a client loop reading the probe
+  file with `dd … iflag=direct bs=1M` under `timeout`, confirm via A's
+  counters that reads are arriving over the ring and not `/dev/fuse`,
+  trigger the handover, keep the client loop running through it):
+  1. A tears down its ring and exits; B does **nothing** but `read(2)` on
+     `/dev/fuse` and answer with `write(2)` — measures (a) and (b).
+  2. As 1, then B registers fresh entries — measures (c); record every
+     command's return value (0 / `-EINVAL` / `-EALREADY` / `-EBUSY` /
+     `-ENOTCONN` / hang) and, on 0, whether the next client reads land on
+     B's ring or still on `/dev/fuse`.
+  3. B registers **before** A tears down (overlap): does the kernel accept
+     two registrants, refuse the second, or replace the first?
+  4. A exits **without** tearing down explicitly (process death only) — the
+     crash/`kill -9` shape plan 31 C4b's harness already exercises for
+     `/dev/fuse`.
+  For each: the client loop's outcome (data correct / short / `EIO` /
+  `ENOTCONN` / hung until timeout), `dmesg` lines from `fuse`, and
+  `/sys/fs/fuse/connections/<id>/{waiting,congestion_threshold}` before
+  and after.
+
+  *Kernels.* At least two: a **7.3-rc** (the Fedora Rawhide cloud AMI the
+  read-path bench used, kernel `7.3.0-0.rc4`; 7.3's `ADD_QUEUE` decoupled
+  ring creation from entry registration — "fuse: decouple fuse_ring
+  creation from ent registration" in the 7.3 pull — so the answer may
+  differ from 6.14's) and a **6.14–6.18** kernel (a Fedora 43 cloud AMI,
+  same owner `125523088429`, or Ubuntu 26.04's 7.0 as a middle point).
+  Launch them the way `bench/fuse-read-path/RUNBOOK.md` describes (same
+  profile, private subnet, security group, key and tags), `enable_uring=Y`
+  on both, everything run as root.
+
+  *Deliverables.* `bench/fuse-uring-handover/` with the spike program (or
+  the chunkfs extension plus the libfuse patch as a `.patch` file), a
+  `run.sh` that executes the four variants and captures the observables,
+  a `RUNBOOK.md`, and a `RESULTS.md` holding: the kernel-source reading per
+  version (function names, line numbers, the prediction); a table variant
+  × kernel → (a)/(b)/(c) outcomes with return codes and `dmesg`; and the
+  **decision** it implies for `TransportPolicy` (§3(e)): (c) works →
+  `Auto` for handover-capable sessions; (a)+(b) only → `Auto` with the
+  resumed session downgraded to `/dev/fuse` and the downgrade logged and
+  visible in `node.status`; not even (a) → `DevFuse` for handover-capable
+  sessions and `daemon --upgrade` refusing to detach a ring session. The
+  coordinator copies that decision into §3(e) and `PROGRESS.md`.
+  **Gate**: `RESULTS.md` covers ≥ 2 kernels with all four variants, every
+  cell has a recorded outcome (a hang past the timeout is an outcome), and
+  the decision paragraph names which of the three policies applies.
+  Timebox: if neither route yields a working ring-mode A within a day of
+  effort, stop and report what blocked it rather than approximating.
+- **Z0b — Baselines and verify-once (independent of Z0a; before Z1).**
+  The fio-based CPU-s/GiB + RSS gate (§6) is built and run against
+  `main`'s current `/dev/fuse`-only path, establishing Constellation's own
+  baseline numbers (not the bench's) for later milestones to compare
+  against. The transport matrix lane's skeleton is added (currently only
+  exercising `dev-fuse`, since nothing else exists yet). §2.3's two
+  verify-once changes land (direct memcache admission of fetched bytes;
+  the `verified` bit on `Entry` and `get_disk` honouring it under
+  `admit`), with the `--cache-verify` flag itself, so the fio gate records
+  the baseline before and after them and every later milestone compares
+  against the cheaper read path, not the double-hash one. **Gate**: the
+  existing fs-core `cache`/`memcache` and engine `view::memcache_tests`
+  suites extended with: a fetched chunk is resident in memory without a
+  second disk read; a startup-scanned file is hashed on first read and a
+  corrupt one is dropped; a verified entry is not re-hashed under `admit`
+  and is under `always`; memory ⊆ disk still holds under concurrent
+  fetch/remove/prune; the fio gate's cold-sequential daemon CPU s/GiB is
+  recorded before and after.
 - **Z1 — Vendored ring transport behind the feature, off by default.**
   `patches/0002-io-uring-transport.patch` lands (§3(a)), gated by the
   `io-uring` cargo feature; every REPORTED Skory-fork claim §3(a) depends on
@@ -941,7 +1050,7 @@ additions are listed below.
 - **Z2 — Adapter integration, on by default where the kernel offers it.**
   §3(b)'s `ReadReply`/`WriteData`/metrics changes land; `TransportPolicy::Auto`
   becomes the default for non-handover-capable mounts (plain desktop/server
-  daemons); handover-capable mounts (CSI, `daemon --upgrade`) follow Z0's
+  daemons); handover-capable mounts (CSI, `daemon --upgrade`) follow Z0a's
   spike result. `node.status`/metrics/docs updated per §5.
 - **Z3 — Passthrough for single-chunk read-only opens.** §3(c)'s
   eligibility rule, the `Opened`/`View::open` extension, the pin-while-open
@@ -955,7 +1064,7 @@ additions are listed below.
   wired to disable both this and Z3's passthrough.
 - **Z5 — Close-out.** `docs/plans/v1/PROGRESS.md` gets this plan's
   milestone write-up with Constellation's own measured numbers (the fio
-  gate's Z0 baseline next to Z1/Z3/Z4's results, per transport); `README.md`/
+  gate's Z0b baseline next to Z1/Z3/Z4's results, per transport); `README.md`/
   `docs/how-to-guides/development/TESTING.md`/`docs/reference/configuration.md`
   (the new knobs, §4) updated; a decision record explicitly reconciling
   this plan's §2.1 row 1 verdict with C7b's own "REJECT splice" (§2's
@@ -1044,7 +1153,7 @@ up exactly that set, not a promise of all four.
   disabled rather than partially engaged, exactly as §2.3 specifies.
 - **Handover.** §3(e)'s UNVERIFIED re-registration question is the one
   place this plan's design is conditional rather than settled. Mitigation:
-  Z0 resolves it before Z1 ships anything depending on the answer, and the
+  Z0a resolves it before Z1 ships anything depending on the answer, and the
   `DevFuse`-by-default-for-handover-capable-sessions fallback (§3(e)) means
   a negative spike result costs plan 37 and `daemon --upgrade` nothing they
   don't already have today — they simply never adopt the ring transport for
@@ -1059,38 +1168,41 @@ binary, never for a kernel feature this plan is responsible for degrading
 out of gracefully — pjdfstest 8798/8798, `PROGRESS.md`/`TESTING.md`
 updated), plus, per milestone (cumulative):
 
-1. **Z0**: the fio-based CPU-s/GiB + RSS gate exists and runs against
+1. **Z0a**: `bench/fuse-uring-handover/RESULTS.md` exists with the
+   kernel-source reading, the four variants' outcomes on at least two
+   kernels (a hang past the timeout counts as an outcome), and the
+   `TransportPolicy` decision for handover-capable sessions (any of the
+   three outcomes is valid — §3(e) only requires the answer, not a
+   particular answer); §3(e) and `PROGRESS.md` carry that decision.
+2. **Z0b**: the fio-based CPU-s/GiB + RSS gate exists and runs against
    `main`'s `/dev/fuse`-only baseline; the transport matrix lane's
-   skeleton exists; the handover spike ran and its result is recorded
-   (success or failure, both are a valid outcome — §3(e) only requires the
-   answer, not a particular answer) and fixes Z1's `TransportPolicy`
-   default for handover-capable sessions; §2.3's verify-once changes and
-   `--cache-verify` land with their tests, and the fio gate records
-   cold-sequential daemon CPU s/GiB before and after them.
-2. **Z1**: `patches/0002-io-uring-transport.patch` exists, hunks marked
+   skeleton exists; §2.3's verify-once changes and `--cache-verify` land
+   with their tests, and the fio gate records cold-sequential daemon CPU
+   s/GiB before and after them.
+3. **Z1**: `patches/0002-io-uring-transport.patch` exists, hunks marked
    `CONSTELLATION PATCH (io-uring)`, re-applies cleanly via
    `tools/vendor-fuser.sh`; every REPORTED claim §3(a) depends on is
    re-verified by the stated rubric and the vendor-vs-rewrite decision is
    recorded; the `io-uring` feature builds, off by default; harness +
    pjdfstest 8798/8798 green on both transports when explicitly selected
    via `CONSTELLATION_FUSE_TRANSPORT`.
-3. **Z2**: `ReadReply`/`WriteData`/metrics/`node.status` changes land per
+4. **Z2**: `ReadReply`/`WriteData`/metrics/`node.status` changes land per
    §3(b)/§5; `TransportPolicy::Auto` is the default for non-handover-capable
    mounts; the transport matrix lane runs both legs in CI on a 6.14+
    kernel; every downgrade path (§2.4) is covered by a fault-injection
    scenario (§6) and confirmed to log once and appear in `node.status`.
-4. **Z3**: passthrough eligibility (§3(c)), the `Opened`/`View::open`
+5. **Z3**: passthrough eligibility (§3(c)), the `Opened`/`View::open`
    extension, the pin-while-open `DiskCache` guard, and the scan-ahead/
    atime move all land; the passthrough-specific fault-injection scenarios
    (§6: eviction-while-open, remote-write-invalidation, O_DIRECT behaviour)
    pass; this works independent of the `io-uring` feature being enabled.
-5. **Z4**: zero-copy wiring lands behind kernel 7.3 detection and
+6. **Z4**: zero-copy wiring lands behind kernel 7.3 detection and
    `CAP_SYS_ADMIN`; the chunk-spanning-read fallback to the memcache path is
    asserted by a scenario that constructs exactly that case; the 7.3 CI
    lane runs where available and SKIPs loudly elsewhere; `--cache-verify
    always` is confirmed (by a test, not just by design) to disable both
    zero-copy and passthrough.
-6. **Z5**: `docs/plans/v1/PROGRESS.md` carries this plan's milestone
+7. **Z5**: `docs/plans/v1/PROGRESS.md` carries this plan's milestone
    write-up with Constellation's own measured numbers per transport (not
    the bench's, cited as the reference); `README.md`/`TESTING.md`/
    `docs/reference/configuration.md` document every new knob
@@ -1098,7 +1210,7 @@ updated), plus, per milestone (cumulative):
    `CONSTELLATION_FUSE_URING_QUEUE_DEPTH`); the C7b-reconciliation decision
    record is written; this plan moves from `wip/` to `done/` per
    `docs/plans/v1/README.md`'s "Execution protocol."
-7. **Report**: each milestone's report includes the harness summary line,
+8. **Report**: each milestone's report includes the harness summary line,
    the pjdfstest tally, the fio-gate's CPU-s/GiB and RSS numbers next to
    the prior milestone's, and (from Z1 on) which transport legs of the
    matrix lane ran and passed.
