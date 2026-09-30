@@ -1720,6 +1720,30 @@ pub struct CacheStatus {
     pub staging_bytes: u64,
     #[serde(default)]
     pub staging_budget_bytes: u64,
+    /// The chunk memory cache: verified chunk contents kept in RAM so a
+    /// cached read neither re-reads nor re-hashes the disk copy
+    /// (`CONSTELLATION_CHUNK_MEMCACHE_BYTES`). Budget `0`: off.
+    #[serde(default)]
+    pub memory_budget_bytes: u64,
+    #[serde(default)]
+    pub memory_used_bytes: u64,
+    /// Chunks resident in the memory cache.
+    #[serde(default)]
+    pub memory_chunks: u64,
+    /// Of `memory_used_bytes`, the protected (reused) segment.
+    #[serde(default)]
+    pub memory_protected_bytes: u64,
+    /// Chunk reads served from memory.
+    #[serde(default)]
+    pub memory_hits: u64,
+    /// Chunk reads that loaded and verified the disk copy.
+    #[serde(default)]
+    pub memory_misses: u64,
+    /// Reads that waited for a concurrent load of the same chunk.
+    #[serde(default)]
+    pub memory_coalesced: u64,
+    #[serde(default)]
+    pub memory_evictions: u64,
 }
 
 // ---------------------------------------------------------------------------

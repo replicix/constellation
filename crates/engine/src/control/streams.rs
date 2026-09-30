@@ -197,6 +197,16 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
         });
     c("vfs_ops_total", ops);
     c("vfs_ops_refused_total", refused);
+    c("cache_memory_hits_total", status.cache.memory_hits);
+    c("cache_memory_misses_total", status.cache.memory_misses);
+    c(
+        "cache_memory_coalesced_total",
+        status.cache.memory_coalesced,
+    );
+    c(
+        "cache_memory_evictions_total",
+        status.cache.memory_evictions,
+    );
     let mut g = |name: &str, v: f64| {
         gauges.insert(format!("constellation_{name}"), v);
     };
@@ -206,6 +216,19 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
     g("cache_budget_bytes", status.cache.budget_bytes as f64);
     g("cache_chunks", status.cache.chunks as f64);
     g("cache_pinned_bytes", status.cache.pinned_bytes as f64);
+    g(
+        "cache_memory_budget_bytes",
+        status.cache.memory_budget_bytes as f64,
+    );
+    g(
+        "cache_memory_used_bytes",
+        status.cache.memory_used_bytes as f64,
+    );
+    g("cache_memory_chunks", status.cache.memory_chunks as f64);
+    g(
+        "cache_memory_protected_bytes",
+        status.cache.memory_protected_bytes as f64,
+    );
     g("lease_held", u8::from(status.lease.held) as f64);
     g("lease_epoch", status.lease.epoch as f64);
     g("writeback_dirty_bytes", status.writeback.dirty_bytes as f64);

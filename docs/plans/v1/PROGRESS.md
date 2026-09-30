@@ -28985,3 +28985,148 @@ so only back-to-back pairs are compared.) `make perf-gate`'s vfs stage:
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798; `writeback-backpressure` fails on the base too) —
   coordinator
+
+## Chunk memory cache (follow-up to plan 31 C7b)
+
+Follow-up to C7b's candidate (b) finding: every FUSE read of a disk-cached
+chunk went through `DiskCache::get`, which `fs::read`s the **whole** chunk
+file and BLAKE3-verifies it on every call. A 128 KiB kernel read of a 4 MiB
+chunk therefore re-read and re-hashed 4 MiB (32 times per chunk for a
+sequential read). This adds a bounded in-memory tier of **verified** chunk
+contents, served to reads as shared `Bytes` slices. Host: this container,
+4 vCPU, 15 GiB, release builds, floci S3 behind toxiproxy (no toxics),
+`--cache-size 2GiB`, 4 FUSE workers.
+
+### Design
+
+| Decision | Choice | Why |
+|---|---|---|
+| Where | `crates/fs-core/src/memcache.rs` (`MemCache`), owned by `DiskCache` (`with_memory_cache(bytes)`; `get_shared(&hash) -> Option<Bytes>`) | The memory tier's correctness depends on the disk entry's lifecycle. Every path that drops a disk entry (`remove`, `forget` after an out-of-band delete, corrupt-on-read, `commit_spill`'s eviction victims, `prune_to`) drops the memory copy **under the same state-lock hold**. A load is admitted only if its disk entry still exists, checked under that lock. So memory ⊆ disk at all times, and memory accounting never outlives the disk entry. Lock order: state → policy → shard |
+| What is cached | Only bytes that just passed the disk cache's hash check (`get_disk` verifies, then `load_shared` admits). Writes (`insert`, `commit_spill`) and non-read `get()`s (upload, peer serving, pins, write seeding) never admit; `get()` still *serves* a resident copy (a copy-out, cheaper than a disk read + hash) | Never serve unverified bytes; don't let upload or peer traffic crowd reads out |
+| Read path | `View::do_read` now returns `ReadData` (`SmallVec<[Bytes; 4]>`), built from `chunk.slice(..)` of the shared chunk, plus static zero pages for holes/EOF/truncated-away base bytes. Clipping is a `valid` length (`valid_below`), not an in-place zero-fill, so shared bytes are never edited. Staged (unflushed) chunks read only the requested range (was: the whole chunk). `fetch_chunk*` return `Bytes`; callers that edit (write seeding, flush recomposition) take a `Vec::from` copy | Zero-copy up to the frontend (the FUSE reply borrows a single segment) |
+| Eviction | **2Q (Johnson & Shasha) with a correlated-reference filter.** Probation FIFO (target 1/4 of the budget) + protected CLOCK (a hit sets a reference bit, the hand gives a second chance) + a ghost list of recently evicted hashes (keys only, 1/2 budget of bytes). Promotion happens on an *uncorrelated* re-reference while in probation (≥ budget/8 bytes admitted since the entry was admitted), or on re-admission of a ghost. The victim comes from probation while probation is over its target, else from protected | A sequential reader touches a chunk 8–1024 times in a burst (one hit per kernel read). Frequency-based policies (S3-FIFO, TinyLFU) and LRU promotion read that burst as reuse, so one large `cat` would flush the hot set. The filter ignores the burst: a scan streams through probation and the ghost list, while a hot random set is promoted by either path. Pure LRU loses the hot set to any scan larger than the budget. Unit tests show both sides: a 16×-budget bursty scan leaves a promoted hot set fully resident, and without demonstrated reuse the same scan evicts it and promotes nothing |
+| Concurrency | 16 hash-sharded `RwLock<HashMap>` for lookups. A hit takes one shard read lock and touches only atomics (reference/reuse bits, a per-shard hit counter), never the policy mutex. Admissions/removals (at most one per disk load) serialise on the policy mutex. Stale queue items (entries removed out of band) are skipped and compacted once they outnumber live ones | FUSE workers + the completion pool hit in parallel without a global lock |
+| Single-flight | `get_shared` registers a per-hash flight on a miss. Concurrent readers of the same chunk wait for that one load (`memory_coalesced`) and share its result. A failed/panicking leader marks the flight failed, and waiters load for themselves. A load that finished between a reader's miss and its registration is caught by a re-check | 16 concurrent first reads of a 4 MiB chunk: one disk read + hash (unit test) |
+| Disk LRU interplay | `plan_eviction`/`prune_to` order memory-resident clean chunks after all others (`clean_by_recency`) | A memory hit no longer bumps the disk `atime`. Without this, the disk LRU would evict (and so drop from memory, and refetch from S3) exactly the hottest chunks |
+| E2E | Unchanged model. Chunks are decrypted once when fetched (`get_chunk_to_writer_e2e`); the disk cache holds decompressed **plaintext** under keyed (addressing-key BLAKE3) identities, 0700. There is no per-read decrypt to save. The memory tier holds the same plaintext the disk cache already holds, verified with the keyed hash, and writes nothing to disk (tested: the cache dir holds exactly the chunk files after reads). Trade-off: up to the budget of plaintext stays resident in process memory for longer than a transient read buffer; it is not `mlock`ed, so it can be swapped, like any read buffer. `CONSTELLATION_CHUNK_MEMCACHE_BYTES=0` turns it off | No new class of exposure; the residency window grows by at most the budget |
+| Budget | `EngineProfile::chunk_memcache_default(memory)`: 1/64 of the engine's memory share (`profile.memory_budget` or the `EngineHost` allotment, i.e. already partitioned per engine), capped at **128 MiB**, or **16 MiB** for `BackgroundMode::OnDemand` (the mobile profile). An explicit `server` memory budget gets 1/8 of it. Always ≤ the disk cache budget (memory holds a subset of disk). Chunks larger than 1/4 of the budget are not admitted. Override: `CONSTELLATION_CHUNK_MEMCACHE_BYTES` (bytes, `0` = off). Logged at start (`chunk memory cache bytes=…`) | Modest by default: the disk cache already has every chunk, and memory only needs the chunks being read now plus a hot set |
+| Observability | `node.status` `cache.memory_{budget_bytes,used_bytes,chunks,protected_bytes,hits,misses,coalesced,evictions}` (schema regenerated); `/metrics` `constellation_cache_memory_{budget_bytes,used_bytes,chunks,protected_bytes}` and `…_{hits,misses,coalesced,evictions}_total`; `stats.subscribe` samples carry them too | Follows the existing `constellation_cache_*` gauges |
+
+### Measurements (release, before = `f4d1ae8`, after = this change; back to back)
+
+Cached (disk-cache-resident) reads, kernel page cache dropped before each rep.
+Script: `mc.sh` (C7b's `warm.sh` method: a file written, read twice,
+then `cat` timed). Random reads: fio `randread`, 4 KiB, `psync`, 4 jobs,
+`fadvise_hint=1` (no kernel readahead), 16 MiB per job. Default memory
+budget = 128 MiB (1/64 of 15 GiB, capped).
+
+**Sequential, MiB/s (3 reps)**
+
+| chunk | file | before | after |
+|---|---|---|---|
+| 4 MiB | 256 MiB (> memory budget) | 72.6 / 76.6 / 74.0 | **403 / 407 / 381** |
+| 1 MiB | 256 MiB | 216 / 218 / 230 | **311 / 356 / 366** |
+| 4 MiB | 64 MiB (fits) | 90 / 80 / 77 | **872 / 1420 / 958** |
+| 1 MiB | 64 MiB | 151 / 159 / 173 | **1343 / 1575 / 1801** |
+| 4 MiB, knob `=0` (off) | 256 MiB | — | 94 / 96 / 96 |
+| 4 MiB, knob 512 MiB | 256 MiB | — | 1521 / 1499 / 1481 |
+
+**Random 4 KiB, IOPS (mean latency), 2 reps**
+
+| chunk | file | before | after |
+|---|---|---|---|
+| 4 MiB | 256 MiB | 369 / 352 (10.8 / 11.3 ms) | 653 / 640 (6.1 / 6.2 ms); rerun 730 / 745 |
+| 1 MiB | 256 MiB | 1623 / 1501 (2.4 / 2.7 ms) | 2233 / 2353 (1.8 / 1.7 ms) |
+| 4 MiB | 64 MiB | 541 / 511 (7.4 / 7.8 ms) | **51361 / 52345 (75 / 74 µs)** |
+| 1 MiB | 64 MiB | 2125 / 1953 (1.9 / 2.0 ms) | **44043 / 42336 (89 / 92 µs)** |
+| 4 MiB, knob `=0` | 256 MiB | — | 419 / 388 |
+| 4 MiB, knob 512 MiB | 256 MiB | — | 40355 / 39196 (96 / 99 µs) |
+
+Reading the numbers:
+- **Sequential.** A file larger than the budget now costs one load + hash per
+  chunk per pass instead of one per kernel read: 5.3× at 4 MiB chunks, and 4
+  MiB chunks now read faster than 1 MiB. A resident file reads at page-cache-like
+  speed (10–13×).
+- **Random.** A random working set larger than the budget is still bounded by
+  the per-miss full-chunk load: +1.5–2×, from the hits on the resident part.
+  A resident set gives ~100× (75–90 µs mean, vs 2–8 ms).
+- **Knob off.** Matches before (C7b measured ~100 MiB/s on the 4 MiB case; the
+  `Bytes` read path costs nothing).
+- **Live counters.** A 64 MiB file (16 chunks + its spilled chunk list) read
+  twice gave `memory_misses` 17, `memory_hits` 1007, `memory_evictions` 0.
+
+**`vfs-bench`** (release, `make vfs-bench` / `PERF_GATE_VFS_BENCH_ONLY=1
+tests/perf-gate.sh`): View `read` 4 KiB is **18 allocs/op, 1857 B/op**,
+direct 3.8–4.0 µs. C7b recorded 21 allocs, 10.1 KB and 11.7 µs; that is not a
+back-to-back pair, and absolute times drift between sessions. The remaining
+allocations are metadata. Overheads 92–214 ns, all < 1 µs. **VFS-BENCH GATE
+PASSED**. The `view/read` ceiling in `tests/perf-baseline.json` is lowered
+from **21 to 18**; the others are unchanged.
+
+### Tests
+
+- fs-core `memcache` (10): shared bytes on a hit (same pointer), budget never
+  exceeded under churn, oversize/empty/zero-budget not admitted, removal,
+  probation FIFO, **bursty 16×-budget scan leaves a promoted hot set resident**,
+  no promotion without uncorrelated reuse, ghost re-admission promotes, stale
+  queue compaction, concurrent hits/admissions/removals keep exact accounting.
+- fs-core `cache` (9 new):
+  - served from memory without re-reading (the disk file is corrupted after
+    admission and the read still hits);
+  - **corrupt disk copy neither served nor cached** (same length, one bit off);
+  - keyed/E2E cache verifies with the keyed hash before admitting;
+  - remove / prune / out-of-band delete / disk eviction each drop the memory
+    copy;
+  - disk eviction spares memory-resident chunks;
+  - a plain `get` miss is not admitted;
+  - tier off = unchanged;
+  - **16 concurrent first reads → exactly one load** (20 rounds of 4 MiB
+    chunks);
+  - memory ⊆ disk under concurrent read/remove/prune/evicting inserts.
+- engine `view::memcache_tests` (7):
+  - 128 KiB sequential reads load each chunk once and the rest hit, as
+    zero-copy slices, plus a cross-chunk/EOF read; plain and **E2E**
+    (keyed cache + encrypted store); the cache dir holds only the chunk
+    files;
+  - corrupt disk copy → refetched from the store (decrypted for E2E), never
+    served; plain and E2E;
+  - `evict_cached` (the conformance kit's hook) and prune drop memory; plain
+    and E2E;
+  - a truncation's clipped read never touches the shared chunk (a twin file
+    with the same chunk still reads it whole, from memory).
+- `pending_row_tests` (every truncate/extend/fallocate shape) runs with the
+  memory tier on.
+- `profile` default/knob test.
+- `control::ops` test: `node.status` cache section, `/metrics` lines,
+  `stats.subscribe` sample.
+- Results:
+  - `cargo test -p constellation-fs-core` 58 passed.
+  - `-p constellation-engine --lib` 330 passed, 2 ignored.
+  - `--test conformance` passed.
+  - `-p constellation-control` 121 passed (schema re-blessed).
+  - frontend-fuse `--lib` 18, `--test wire` 20.
+  - `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D
+    warnings`, `cargo fmt --all` clean.
+  - `make check-cross` exit 0 (only the known failures).
+
+### Harness (release binary, `--seed 7`)
+
+`CONSTELLATION_BIN=target/release/constellation`, `RUST_BACKTRACE` unset,
+docker S3. **All passed:**
+- reads and prefetch: `cold-cache`, `readahead`, `readahead-adaptive`,
+  `prefetch-fairness`, `scan-ahead`, `coop-cache-hit`, `fio-latency`,
+  `prefetch-abandon`, `prefetch-abandon-e2e`;
+- E2E: `e2e-basic`, `e2e-two-nodes`, `e2e-spilled-manifest`,
+  `e2e-decode-priority`, `distant-bigfile-stable-e2e`;
+- eviction and churn: `coop-exact-churn` (small caches evicting while peers
+  read), `gc-lifecycle`, `gc-dedup-race`, `gc-open-orphan-hold`;
+- `s3-outage` (cached reads while S3 is cut), `truncate-never-resurrects`;
+- `poison-record-isolation` (its injected chunk loss goes through
+  `DiskCache::remove`, which drops the memory copy);
+- `dedup-write-storm`.
+
+The RSS-bounded ones also pass, with the memory tier clamped to the small
+`--cache-size`: `big-file-write` (peak RSS 126 MiB, 64 MiB cache, 300 MiB
+file), `writeback-bigfile` (138 MiB, 32 MiB cache), `fallocate-sparse` (93 MiB).
+Not run here: the full workspace suite, the harness matrix and pjdfstest,
+which are the gate run's.

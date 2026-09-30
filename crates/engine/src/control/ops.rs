@@ -535,4 +535,58 @@ mod tests {
         assert!(sample.counters["constellation_vfs_ops_total"] >= 5);
         assert!(sample.counters["constellation_vfs_ops_refused_total"] >= 2);
     }
+
+    /// The chunk memory cache reports in `node.status`'s cache section,
+    /// on `/metrics`, and in `stats.subscribe`'s samples.
+    #[test]
+    fn the_chunk_memory_cache_is_reported() {
+        use constellation_fs_core::cache::ChunkState;
+        use constellation_fs_core::ChunkHash;
+        let f = fixture(&[&[]]);
+        let data = vec![0x5a; 64 * 1024];
+        let hash = ChunkHash::of(&data);
+        f.svc.cache.insert(&hash, &data, ChunkState::Clean).unwrap();
+        for _ in 0..3 {
+            let got = f.svc.cache.get_shared(&hash).unwrap().unwrap();
+            assert_eq!(got.len(), data.len());
+        }
+        let cache = f.svc.status().cache;
+        // The engine's 16 MiB disk cache bounds the default budget.
+        assert_eq!(cache.memory_budget_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            (cache.memory_hits, cache.memory_misses, cache.memory_chunks),
+            (2, 1, 1)
+        );
+        assert_eq!(cache.memory_used_bytes, 64 * 1024);
+
+        let app = web::app(Arc::new(router(&f.svc)));
+        let body = f.rt.block_on(async {
+            let request = axum::http::Request::builder()
+                .uri("/metrics")
+                .header("host", "127.0.0.1")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        });
+        for line in [
+            "constellation_cache_memory_budget_bytes 16777216",
+            "constellation_cache_memory_used_bytes 65536",
+            "constellation_cache_memory_chunks 1",
+            "constellation_cache_memory_hits_total 2",
+            "constellation_cache_memory_misses_total 1",
+            "constellation_cache_memory_evictions_total 0",
+        ] {
+            assert!(body.lines().any(|l| l == line), "{line}\n{body}");
+        }
+        let sample = streams::sample_of(&f.svc.status());
+        assert_eq!(sample.counters["constellation_cache_memory_hits_total"], 2);
+        assert_eq!(
+            sample.gauges["constellation_cache_memory_used_bytes"],
+            65536.0
+        );
+    }
 }

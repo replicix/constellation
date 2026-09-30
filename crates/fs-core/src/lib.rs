@@ -1,5 +1,6 @@
 //! VFS core: inode/dentry model, chunking (fixed-size, blake3 plaintext
-//! identity), manifests with spill, LRU chunk cache accounting.
+//! identity), manifests with spill, LRU chunk cache accounting and its
+//! in-memory tier of verified chunk contents.
 //!
 //! See docs/explanation/DESIGN.md §3 (data plane), §6 (consistency), §7 (caching).
 
@@ -7,6 +8,7 @@ pub mod cache;
 pub mod chunk;
 pub mod error;
 pub mod manifest;
+pub mod memcache;
 pub mod tree;
 pub mod types;
 

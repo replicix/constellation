@@ -26,7 +26,13 @@ fn env() -> Env {
 fn env_with(chunk: u32) -> Env {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let dir = TempDir::new().unwrap();
-    let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
+    // With the memory tier on: every truncate/clip shape below then also
+    // checks that reads never edit (or serve stale) shared chunk bytes.
+    let cache = Arc::new(
+        DiskCache::open(dir.path().join("cache"), 1 << 30)
+            .unwrap()
+            .with_memory_cache(64 << 20),
+    );
     let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
     let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
         meta.clone(),
@@ -93,7 +99,10 @@ fn chunk(fill: u8) -> Vec<u8> {
 const SMALL: u32 = 16;
 
 fn read_all(e: &Env, ino: Ino) -> Vec<u8> {
-    e.fs.do_read(ino, 0, 1 << 20).unwrap()
+    e.fs.do_read(ino, 0, 1 << 20)
+        .unwrap()
+        .contiguous()
+        .into_owned()
 }
 
 /// The FUSE `setattr(size)` path: the session's truncate plus the

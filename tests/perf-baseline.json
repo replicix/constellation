@@ -22,7 +22,7 @@
       "observer/getattr": 0,
       "view/getattr": 4,
       "view/lookup": 11,
-      "view/read": 21
+      "view/read": 18
     }
   }
 }

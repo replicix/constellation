@@ -73,6 +73,7 @@ impl EngineControl {
         );
         let gate_pending = self.lease.gate_pending();
         let usage = self.cache.usage();
+        let memory = self.cache.memory_stats().unwrap_or_default();
         let p0_lease = self.lease.status();
         let designations = self.list_designations();
         let mut epoch = self.epochs.status();
@@ -184,6 +185,14 @@ impl EngineControl {
                 pinned_bytes: usage.pinned,
                 staging_bytes: self.staging_budget.used(),
                 staging_budget_bytes: self.staging_budget.budget(),
+                memory_budget_bytes: memory.budget_bytes,
+                memory_used_bytes: memory.used_bytes,
+                memory_chunks: memory.entries,
+                memory_protected_bytes: memory.protected_bytes,
+                memory_hits: memory.hits,
+                memory_misses: memory.misses,
+                memory_coalesced: memory.coalesced,
+                memory_evictions: memory.evictions,
             },
             lease: p0_lease,
             p2p,

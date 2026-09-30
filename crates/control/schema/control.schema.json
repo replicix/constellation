@@ -471,6 +471,60 @@
           "minimum": 0,
           "type": "integer"
         },
+        "memory_budget_bytes": {
+          "default": 0,
+          "description": "The chunk memory cache: verified chunk contents kept in RAM so a\ncached read neither re-reads nor re-hashes the disk copy\n(`CONSTELLATION_CHUNK_MEMCACHE_BYTES`). Budget `0`: off.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_chunks": {
+          "default": 0,
+          "description": "Chunks resident in the memory cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_coalesced": {
+          "default": 0,
+          "description": "Reads that waited for a concurrent load of the same chunk.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_evictions": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_hits": {
+          "default": 0,
+          "description": "Chunk reads served from memory.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_misses": {
+          "default": 0,
+          "description": "Chunk reads that loaded and verified the disk copy.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_protected_bytes": {
+          "default": 0,
+          "description": "Of `memory_used_bytes`, the protected (reused) segment.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_used_bytes": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "pinned_bytes": {
           "default": 0,
           "description": "Bytes protected from eviction by local pins.",

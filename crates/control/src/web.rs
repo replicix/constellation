@@ -600,6 +600,46 @@ pub fn render_metrics(status: &StatusReport) -> String {
         status.cache.pinned_bytes
     );
     gauge!(
+        "constellation_cache_memory_budget_bytes",
+        "Chunk memory cache budget (0: off).",
+        status.cache.memory_budget_bytes
+    );
+    gauge!(
+        "constellation_cache_memory_used_bytes",
+        "Verified chunk bytes resident in the chunk memory cache.",
+        status.cache.memory_used_bytes
+    );
+    gauge!(
+        "constellation_cache_memory_chunks",
+        "Chunks resident in the chunk memory cache.",
+        status.cache.memory_chunks
+    );
+    gauge!(
+        "constellation_cache_memory_protected_bytes",
+        "Chunk memory cache bytes in the protected (reused) segment.",
+        status.cache.memory_protected_bytes
+    );
+    gauge!(
+        "constellation_cache_memory_hits_total",
+        "Chunk reads served from the chunk memory cache.",
+        status.cache.memory_hits
+    );
+    gauge!(
+        "constellation_cache_memory_misses_total",
+        "Chunk reads that loaded and verified the disk cache copy.",
+        status.cache.memory_misses
+    );
+    gauge!(
+        "constellation_cache_memory_coalesced_total",
+        "Chunk reads that waited for a concurrent load of the same chunk.",
+        status.cache.memory_coalesced
+    );
+    gauge!(
+        "constellation_cache_memory_evictions_total",
+        "Chunks evicted from the chunk memory cache.",
+        status.cache.memory_evictions
+    );
+    gauge!(
         "constellation_coop_peer_hits_total",
         "Cooperative cache peer hits.",
         status.coop.peer_hits

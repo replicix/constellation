@@ -548,12 +548,25 @@ impl Engine {
             .min(allotment.staging_bytes);
         let staging_budget = staging::StagingBudget::new(staging_budget_bytes);
 
-        let cache = Arc::new(match &e2e_keys {
-            Some(keys) => {
-                DiskCache::open_keyed(state_dir.join("cache"), cache_size, *keys.addressing_key())?
+        // Verified chunk contents in memory (`fs-core::memcache`), sized
+        // from this engine's memory share (`EngineProfile::chunk_memcache`).
+        let chunk_memcache = crate::profile::chunk_memcache_bytes(
+            &profile,
+            profile.memory_budget.unwrap_or(allotment.memory_bytes),
+            cache_size,
+        );
+        tracing::info!(bytes = chunk_memcache, "chunk memory cache");
+        let cache = Arc::new(
+            match &e2e_keys {
+                Some(keys) => DiskCache::open_keyed(
+                    state_dir.join("cache"),
+                    cache_size,
+                    *keys.addressing_key(),
+                )?,
+                None => DiskCache::open(state_dir.join("cache"), cache_size)?,
             }
-            None => DiskCache::open(state_dir.join("cache"), cache_size)?,
-        });
+            .with_memory_cache(chunk_memcache),
+        );
         let compression: CompressionSetting = fsmeta
             .compression
             .parse()

@@ -22,6 +22,34 @@
 //! `CONSTELLATION_PROFILE` and its per-field overrides pick a profile for
 //! the daemon ([`EngineProfile::from_env`]).
 
+/// Env `CONSTELLATION_CHUNK_MEMCACHE_BYTES`: the chunk memory cache's
+/// byte budget, overriding [`EngineProfile::chunk_memcache_default`];
+/// `0` turns it off.
+pub const CHUNK_MEMCACHE_ENV: &str = "CONSTELLATION_CHUNK_MEMCACHE_BYTES";
+
+/// The chunk memory cache budget an engine runs with: the env override
+/// or the profile's default for `memory`, never more than the disk
+/// cache's `disk_budget` (memory holds a subset of the disk's chunks).
+pub fn chunk_memcache_bytes(profile: &EngineProfile, memory: u64, disk_budget: u64) -> u64 {
+    chunk_memcache_bytes_from(
+        std::env::var(CHUNK_MEMCACHE_ENV).ok().as_deref(),
+        profile,
+        memory,
+        disk_budget,
+    )
+}
+
+fn chunk_memcache_bytes_from(
+    var: Option<&str>,
+    profile: &EngineProfile,
+    memory: u64,
+    disk_budget: u64,
+) -> u64 {
+    var.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| profile.chunk_memcache_default(memory))
+        .min(disk_budget)
+}
+
 /// Whether the engine runs the P2P fast path, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum P2pMode {
@@ -119,6 +147,29 @@ impl EngineProfile {
             uploads: UploadMode::UnmeteredOnly,
             background: BackgroundMode::OnDemand,
         }
+    }
+
+    /// Default byte budget of the chunk memory cache
+    /// (`constellation_fs_core::memcache`) for an engine that may use
+    /// `memory` bytes (its host share, or this profile's explicit
+    /// `memory_budget`). Modest on purpose: the disk cache already holds
+    /// every chunk, and the memory tier only has to hold the chunks being
+    /// read right now plus a hot set.
+    ///
+    /// * explicit `memory_budget` (the `Server` preset): an eighth of it;
+    /// * otherwise 1/64 of the share, capped at 128 MiB (a desktop), or at
+    ///   16 MiB with `BackgroundMode::OnDemand` (a phone: its host
+    ///   suspends it and memory is tight).
+    pub fn chunk_memcache_default(&self, memory: u64) -> u64 {
+        const MIB: u64 = 1024 * 1024;
+        if self.memory_budget.is_some() {
+            return memory / 8;
+        }
+        let cap = match self.background {
+            BackgroundMode::OnDemand => 16 * MIB,
+            BackgroundMode::Continuous => 128 * MIB,
+        };
+        (memory / 64).min(cap)
     }
 
     /// Whether this profile starts the P2P fast path.
@@ -339,5 +390,39 @@ mod tests {
         for mode in [P2pMode::Listen, P2pMode::DialOnly, P2pMode::Off] {
             assert_eq!(mode.as_str().parse::<P2pMode>(), Ok(mode));
         }
+    }
+
+    #[test]
+    fn the_chunk_memcache_default_is_modest_and_the_knob_overrides_it() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        let desktop = EngineProfile::desktop();
+        // 1/64 of the share, capped at 128 MiB; a phone at 16 MiB.
+        assert_eq!(desktop.chunk_memcache_default(4 * GIB), 64 * MIB);
+        assert_eq!(desktop.chunk_memcache_default(64 * GIB), 128 * MIB);
+        assert_eq!(desktop.chunk_memcache_default(u64::MAX), 128 * MIB);
+        assert_eq!(
+            EngineProfile::mobile().chunk_memcache_default(6 * GIB),
+            16 * MIB
+        );
+        assert_eq!(
+            EngineProfile::mobile().chunk_memcache_default(512 * MIB),
+            8 * MIB
+        );
+        // An explicit memory budget: an eighth of it.
+        let server = EngineProfile::server(8 * GIB, 100 * GIB);
+        assert_eq!(server.chunk_memcache_default(8 * GIB), GIB);
+        // The knob wins (0: off); never more than the disk cache.
+        let pick = |var, disk| chunk_memcache_bytes_from(var, &desktop, 16 * GIB, disk);
+        assert_eq!(pick(None, 100 * GIB), 128 * MIB);
+        assert_eq!(pick(Some("0"), 100 * GIB), 0);
+        assert_eq!(pick(Some("536870912"), 100 * GIB), 512 * MIB);
+        assert_eq!(pick(Some("536870912"), 64 * MIB), 64 * MIB);
+        assert_eq!(pick(None, 16 * MIB), 16 * MIB);
+        assert_eq!(
+            pick(Some("lots"), 100 * GIB),
+            128 * MIB,
+            "unparsable: the default"
+        );
     }
 }

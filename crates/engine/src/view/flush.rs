@@ -35,10 +35,11 @@ impl View {
         }
     }
 
-    /// Get one chunk: cache first, then object store (inserted clean).
-    /// An in-flight prefetch for the same chunk is awaited rather than
-    /// duplicated.
-    pub(super) fn fetch_chunk(&self, hash: &ChunkHash) -> Result<Vec<u8>, Code> {
+    /// Get one chunk: cache first (memory, then the verified disk copy),
+    /// then object store (inserted clean). An in-flight prefetch for the
+    /// same chunk is awaited rather than duplicated. Shared bytes: a
+    /// caller that edits them takes its own copy (`Vec::from`).
+    pub(super) fn fetch_chunk(&self, hash: &ChunkHash) -> Result<Bytes, Code> {
         self.fetch_chunk_for_inode(None, hash)
     }
 
@@ -67,8 +68,8 @@ impl View {
         &self,
         ino: Option<Ino>,
         hash: &ChunkHash,
-    ) -> Result<Vec<u8>, Code> {
-        if let Ok(Some(data)) = self.cache.get(hash) {
+    ) -> Result<Bytes, Code> {
+        if let Ok(Some(data)) = self.cache.get_shared(hash) {
             return Ok(data);
         }
         // Everything past here may wait (a prefetch in flight, a
@@ -89,7 +90,7 @@ impl View {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
-        if let Ok(Some(data)) = self.cache.get(hash) {
+        if let Ok(Some(data)) = self.cache.get_shared(hash) {
             return Ok(data);
         }
         if let Some(ino) = ino {
@@ -100,14 +101,18 @@ impl View {
         self.wait_forwarded_chunk(hash);
         if let Some(coop) = &self.coop {
             constellation_vfs::watch::stage("chunk fetch: coop (peers/S3)");
-            return self.rt.block_on(coop.fetch(hash)).map_err(|error| {
-                tracing::warn!(
-                    hash = %hash.to_hex(),
-                    error = %error,
-                    "coop fetch failed"
-                );
-                Code::Io
-            });
+            return self
+                .rt
+                .block_on(coop.fetch(hash))
+                .map(Bytes::from)
+                .map_err(|error| {
+                    tracing::warn!(
+                        hash = %hash.to_hex(),
+                        error = %error,
+                        "coop fetch failed"
+                    );
+                    Code::Io
+                });
         }
         let mut data = None;
         let mut last_error = None;
@@ -163,7 +168,7 @@ impl View {
             );
             Code::Io
         })?;
-        Ok(data)
+        Ok(Bytes::from(data))
     }
 
     /// Full content of committed chunk `idx`, zero-padded to `len`
@@ -177,7 +182,7 @@ impl View {
         len: u32,
     ) -> Result<Vec<u8>, Code> {
         let mut data = match hashes.get(&idx) {
-            Some(h) => self.fetch_chunk(h)?,
+            Some(h) => Vec::from(self.fetch_chunk(h)?),
             None => Vec::new(),
         };
         data.resize(len as usize, 0);
@@ -575,7 +580,7 @@ impl View {
             let covered = covers(&ws.written, chunk_start, chunk_end);
             let mut data = match old_hashes.get(&idx) {
                 Some(hash) if !covered && !ws.zeroed.contains(idx) => {
-                    let mut fetched = self.fetch_chunk(hash)?;
+                    let mut fetched = Vec::from(self.fetch_chunk(hash)?);
                     fetched.resize(expect_len, 0);
                     ws.clip_base(&mut fetched, chunk_start, base.file_len);
                     fetched
@@ -626,7 +631,7 @@ impl View {
                     let expect_len = layout.chunk_len(file_len, idx) as usize;
                     let old_len = base.layout.chunk_len(base.file_len.max(1), idx) as usize;
                     if old_len != expect_len || Some(idx) == straddle {
-                        let mut data = self.fetch_chunk(h)?;
+                        let mut data = Vec::from(self.fetch_chunk(h)?);
                         data.resize(expect_len, 0);
                         ws.clip_base(&mut data, idx * cs, base.file_len);
                         if data.iter().all(|byte| *byte == 0) {

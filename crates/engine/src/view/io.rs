@@ -110,8 +110,25 @@ pub(super) fn defer_cold_reads() -> bool {
     })
 }
 
+/// How many of `chunk`'s bytes (the chunk at `chunk_start`) lie below
+/// `floor`: the rest is dead (read as zeros). [`clip_at`]'s cut, without
+/// writing to shared bytes.
+fn valid_below(floor: u64, chunk_start: u64, chunk: &[u8]) -> usize {
+    floor.saturating_sub(chunk_start).min(chunk.len() as u64) as usize
+}
+
+/// Zeros, from a static page rather than an allocation.
+fn push_zeros(out: &mut ReadData, mut n: usize) {
+    static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+    while n > 0 {
+        let k = n.min(ZEROS.len());
+        out.push(Bytes::from_static(&ZEROS[..k]));
+        n -= k;
+    }
+}
+
 impl View {
-    pub(super) fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, Code> {
+    pub(super) fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<ReadData, Code> {
         // Serve pending (unflushed) state when present so read-after-write
         // within an open handle is coherent. The inode's operation lock
         // orders the read against writes and flushes of the same file for
@@ -167,19 +184,23 @@ impl View {
         Ok(dropped)
     }
 
+    /// The bytes of `[offset, offset + size)`, as shared slices of the
+    /// chunks they come from (the memory cache's verified copies, when
+    /// resident: no copy, no disk read, no hash) plus zeros for holes,
+    /// EOF padding and truncated-away base bytes.
     pub(super) fn do_read_detached(
         &self,
         ino: Ino,
         ws: Option<&WriteState>,
         offset: u64,
         size: u64,
-    ) -> Result<Vec<u8>, Code> {
+    ) -> Result<ReadData, Code> {
         let manifest = self.load_manifest(ino)?;
         let attr = self.meta.getattr(ino).map_err(|e| e.code())?;
         let committed_len = attr.as_ref().map(|a| a.size).unwrap_or(manifest.file_len);
         let file_len = ws.as_ref().map(|w| w.file_len).unwrap_or(committed_len);
         if offset >= file_len {
-            return Ok(Vec::new());
+            return Ok(ReadData::default());
         }
         // Read-time atime (plan 20): best-effort, policy-gated, and a
         // no-op unless the operator opted in. Records into a separate
@@ -201,61 +222,57 @@ impl View {
         self.prefetch
             .on_read(ino, offset, len, self.chunk_size, &hashes);
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
-        let mut out = Vec::with_capacity(len as usize);
+        let mut out = ReadData::default();
         for slice in layout.slices(offset, len) {
-            let full_len = layout.chunk_len(file_len, slice.index);
-            let chunk: Vec<u8> = match &ws {
-                Some(w) if w.sealed.contains_key(&slice.index) => self
-                    .cache
-                    .get(w.sealed.get(&slice.index).unwrap())
-                    .map_err(|_| Code::Io)?
-                    .ok_or(Code::Io)?,
+            let chunk_start = slice.index * self.chunk_size as u64;
+            let start = slice.offset as usize;
+            let end = (slice.offset + slice.len) as usize;
+            // The chunk's bytes and how many of them are valid: past
+            // `valid` (a short chunk, a hole, a truncation point) it reads
+            // as zeros. Nothing here copies a shared chunk.
+            let (chunk, valid): (Bytes, usize) = match &ws {
+                Some(w) if w.sealed.contains_key(&slice.index) => {
+                    let chunk = self
+                        .cache
+                        .get_shared(w.sealed.get(&slice.index).unwrap())
+                        .map_err(|_| Code::Io)?
+                        .ok_or(Code::Io)?;
+                    let valid = chunk.len();
+                    (chunk, valid)
+                }
                 Some(w) if w.staging.is_dirty(slice.index) => {
-                    let mut buf = vec![0u8; full_len as usize];
+                    // Staged bytes: just the range asked for.
+                    let mut buf = vec![0u8; end - start];
                     w.staging
-                        .read_at(slice.index * self.chunk_size as u64, &mut buf)
+                        .read_at(chunk_start + start as u64, &mut buf)
                         .map_err(|e| staging_code(&e))?;
-                    buf
+                    out.push(Bytes::from(buf));
+                    continue;
                 }
                 // Punched whole by this session: zeros.
-                Some(w) if w.zeroed.contains(slice.index) => Vec::new(),
+                Some(w) if w.zeroed.contains(slice.index) => (Bytes::new(), 0),
                 Some(w) => {
                     // Untouched by this session: the base's bytes, dead
                     // past a truncation (`WriteState::floor`).
-                    let mut chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
-                    w.clip_base(
-                        &mut chunk,
-                        slice.index * self.chunk_size as u64,
-                        manifest.file_len,
-                    );
-                    chunk
+                    let chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
+                    let valid = valid_below(w.base_floor(manifest.file_len), chunk_start, &chunk);
+                    (chunk, valid)
                 }
                 None => {
                     // No session: the committed manifest, valid only
                     // below its `file_len` (a truncate lowered it; the
                     // chunk straddling it keeps dead bytes past it, and
                     // the inode's size may have grown past it since).
-                    let mut chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
-                    clip_at(
-                        Some(manifest.file_len),
-                        &mut chunk,
-                        slice.index * self.chunk_size as u64,
-                    );
-                    chunk
+                    let chunk = self.read_committed_chunk(ino, &hashes, slice.index)?;
+                    let valid = valid_below(manifest.file_len, chunk_start, &chunk);
+                    (chunk, valid)
                 }
             };
-            let start = slice.offset as usize;
-            let end = (slice.offset + slice.len) as usize;
-            if chunk.len() >= end {
-                out.extend_from_slice(&chunk[start..end]);
-            } else {
-                // Short chunk (hole/EOF): zero-fill the gap.
-                let have = chunk.len().saturating_sub(start.min(chunk.len()));
-                if have > 0 {
-                    out.extend_from_slice(&chunk[start..start + have]);
-                }
-                out.resize(out.len() + (end - start - have), 0);
+            let have = valid.min(end).saturating_sub(start);
+            if have > 0 {
+                out.push(chunk.slice(start..start + have));
             }
+            push_zeros(&mut out, end - start - have);
         }
         Ok(out)
     }
@@ -265,10 +282,10 @@ impl View {
         ino: Ino,
         hashes: &constellation_fs_core::manifest::SparseChunks,
         idx: u64,
-    ) -> Result<Vec<u8>, Code> {
+    ) -> Result<Bytes, Code> {
         match hashes.get(&idx) {
             Some(h) => self.fetch_chunk_for_inode(Some(ino), h),
-            None => Ok(Vec::new()),
+            None => Ok(Bytes::new()),
         }
     }
 

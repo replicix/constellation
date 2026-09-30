@@ -118,6 +118,8 @@ mod confine_tests;
 #[cfg(test)]
 mod durable_ack_tests;
 #[cfg(test)]
+mod memcache_tests;
+#[cfg(test)]
 mod pending_row_tests;
 #[cfg(test)]
 mod qos_tests;
@@ -135,6 +137,7 @@ pub(crate) use synthetic::SyntheticNode;
 use crate::staging::{GenCounter, Staging, StagingBudget};
 use crate::sync::SyncRequest;
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use constellation_fs_core::cache::{ChunkState, DiskCache};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
@@ -143,7 +146,7 @@ use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, Caller, Durability, Entry, FallocateMode, FileKind, FrontendCaps, OpWatch, OpenFlags,
-    PolicyStack, SeekWhence,
+    PolicyStack, ReadData, SeekWhence,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};

@@ -970,14 +970,14 @@ impl Vfs for View {
         // A cold read defers to the completion pool (`io`'s module doc).
         let Some(view) = self.read_deferral() else {
             match self.do_read(ino, off, len as u64) {
-                Ok(data) => r.done(Ok(ReadData::from_vec(data))),
+                Ok(data) => r.done(Ok(data)),
                 Err(e) => r.done(err(e)),
             }
             return;
         };
         if let Some(result) = super::io::cold_probe::inline(|| self.do_read(ino, off, len as u64)) {
             match result {
-                Ok(data) => r.done(Ok(ReadData::from_vec(data))),
+                Ok(data) => r.done(Ok(data)),
                 Err(e) => r.done(err(e)),
             }
             return;
@@ -991,7 +991,7 @@ impl Vfs for View {
             watch.adopt();
             let result = view.do_read(ino, off, len as u64);
             match result {
-                Ok(data) => r.done(Ok(ReadData::from_vec(data))),
+                Ok(data) => r.done(Ok(data)),
                 Err(e) => r.done(err(e)),
             }
             drop(inflight);
