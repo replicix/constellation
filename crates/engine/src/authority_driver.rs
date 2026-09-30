@@ -115,6 +115,8 @@ pub struct CoreStatus {
     pub lock_recalls_in_flight: usize,
     /// EC2 campaign 8 A-1.
     pub own_s3: constellation_authority::core::OwnS3,
+    /// Plan 31 C8: forward-only and suspended, as the core applies them.
+    pub authority: constellation_authority::core::AuthorityMode,
 }
 
 /// Short names for the trace line around every core step.
@@ -337,7 +339,7 @@ impl BulkPass {
         *running = Some(done_rx.clone());
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let result = upload.run(None).await.map_err(|e| format!("{e:#}"));
+            let result = upload.run_background().await.map_err(|e| format!("{e:#}"));
             let _ = done_tx.send(Some(result));
             if started.elapsed() >= budget {
                 // A round already moved on without this pass: ship what
@@ -973,6 +975,7 @@ impl Driver {
         status.lock_waiters = lv.waiters;
         status.lock_recalls_in_flight = lv.recalls_in_flight;
         status.own_s3 = self.core.own_s3();
+        status.authority = self.core.authority_mode();
         drop(status);
         self.deps
             .epochs
@@ -1634,6 +1637,18 @@ impl Driver {
             SyncRequest::Shutdown { reply } => {
                 control(Control::Shutdown, ControlReply::Done(reply))
             }
+            SyncRequest::Authority {
+                forward_only,
+                suspended,
+                reply,
+            } => control(
+                Control::Authority {
+                    forward_only,
+                    suspended,
+                },
+                ControlReply::Done(reply),
+            ),
+            SyncRequest::Flush { reply } => control(Control::Flush, ControlReply::Done(reply)),
         }
     }
 
@@ -3401,6 +3416,22 @@ impl Uploader {
         self.run_report(only_ino).await.map(|_| ())
     }
 
+    /// The round's opportunistic pass, which the upload hold (plan 31 C8,
+    /// `UploadMode::UnmeteredOnly`) keeps from taking new chunks.
+    async fn run_background(&self) -> Result<()> {
+        let result = crate::upload::upload_dirty_chunks_background(
+            &self.cache,
+            &self.meta,
+            &self.store,
+            self.compression,
+            &self.upload,
+        )
+        .await;
+        let reporter = self.clone();
+        tokio::spawn(async move { reporter.send_durable_reports().await });
+        result.map(|_| ())
+    }
+
     /// One pass, then the reports it owes: every node this node forwarded
     /// a manifest to while some of its chunks were still pending here
     /// learns which of them are up now, so it can let the manifest go.
@@ -3682,7 +3713,12 @@ async fn forwarded_handoff_watch(handoff: ChunkHandoff) {
     }
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if handoff.upload.has_forwarded() && handoff.upload.uploads_stalled(after_ms as i64) {
+        // Plan 31 C8: a held upload is not a stalled one — handing the
+        // chunks to a peer would send them over the metered network.
+        if handoff.upload.has_forwarded()
+            && !handoff.upload.hold.is_held()
+            && handoff.upload.uploads_stalled(after_ms as i64)
+        {
             handoff.hand_off_forwarded().await;
         }
     }
@@ -4058,6 +4094,27 @@ impl Standalone {
     /// unmount's final flush).
     pub async fn shutdown(&mut self) -> Result<()> {
         self.control(Control::Shutdown).await.map(|_| ())
+    }
+
+    /// Plan 31 C8: forward-only / suspended (`Control::Authority`).
+    pub async fn set_authority(&mut self, forward_only: bool, suspended: bool) -> Result<()> {
+        self.control(Control::Authority {
+            forward_only,
+            suspended,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Ship everything, publish, release the lease — and keep running
+    /// (`Control::Flush`: a suspension's, or `leave`'s).
+    pub async fn flush_release(&mut self) -> Result<()> {
+        self.control(Control::Flush).await.map(|_| ())
+    }
+
+    /// The core, for tests that look at its lease state.
+    pub fn core(&self) -> &Core {
+        &self.core
     }
 
     /// Take the lease if it is free.

@@ -17,7 +17,7 @@ use constellation_vfs::types::mode::{S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG,
 use constellation_vfs::{
     DirSink, Fh, LockKind, LockOwner, LockRange, LockSpec, LockStatus, Name, OpCtx, OpKind,
     OpenOwner, Opened, ReadData, RenameFlags, Responder, SetAttr, SetXattrFlags, SetXattrMode,
-    StatFs, TimeSet, Vfs, VfsError, WatchKey, WriteData, XattrName, XattrNameBuf,
+    StatFs, TimeSet, Vfs, VfsError, ViewIdentity, WatchKey, WriteData, XattrName, XattrNameBuf,
 };
 
 /// The stored form of a name, or answer `NameTooLong` and return.
@@ -96,6 +96,13 @@ fn err<T>(code: Code) -> Result<T, VfsError> {
 const XATTR_VALUE_MAX: usize = 64 * 1024;
 
 impl Vfs for View {
+    fn identity(&self) -> ViewIdentity {
+        ViewIdentity {
+            id: self.id,
+            metric_view: super::spec::metric_view_label(&self.labels),
+        }
+    }
+
     fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("lookup", parent);
         let _admitted = admit!(self, cx, r);

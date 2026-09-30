@@ -215,9 +215,10 @@ define_methods! {
     NodeHandoff { name: "node.handoff", role: Admin, mutating: true, stream: None,
         params: HandoffParams, result: HandoffReport,
         requires_fd: |p| matches!(p.target, HandoffTarget::Socket) }
-    /// Inject a host lifecycle event (plan 31 §10).
+    /// Inject a host lifecycle event (plan 31 §10, C8): the engine applies
+    /// it (a `Suspending` runs its whole sequence) before this answers.
     NodeLifecycle { name: "node.lifecycle", role: Admin, mutating: true, stream: None,
-        params: LifecycleParams, result: Ack }
+        params: LifecycleParams, result: LifecycleReport }
 
     // ---- pin ------------------------------------------------------------
     /// Fully cache a subtree and keep it current.

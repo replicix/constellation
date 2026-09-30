@@ -30,3 +30,4 @@ conformance = ["mock"]
 
 [dev-dependencies]
 proptest = "1"
+tracing-subscriber = { workspace = true, features = ["registry"] }

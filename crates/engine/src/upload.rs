@@ -61,8 +61,56 @@ const PRIORITY_DRAIN_CHUNKS: u64 = 4;
 /// (`crates/upload-concurrency`) so `bench/uploadbench` can drive the
 /// exact production algorithm against a synthetic or live S3 target,
 /// rather than a reimplementation that could drift from what ships here.
+/// Plan 31 C8, `UploadMode::UnmeteredOnly`: while the host's network is
+/// metered, the *opportunistic* uploads hold — the sync round's background
+/// pass takes no new chunk, and a `back` close's forwarded chunks are not
+/// handed to a peer. Every chunk stays exactly where write-back leaves it
+/// (a `pending_upload` row and the cached bytes, both durable locally), and
+/// the ship plan defers just the manifests that name one (plan 30 §M7's
+/// deferral, the same as a burst still uploading). What is *not* held: an
+/// explicit durability request — `fsync`/`O_SYNC`/`--fsync-mode s3`'s
+/// inode drain, a barrier, a snapshot's forced publish, a lease handoff's,
+/// an unmount's or a suspension's final flush — each needs its chunks in
+/// S3 to answer at all, and waiting out a metered network there would hold
+/// the authority core's one job slot (and the lease renewals behind it).
+#[derive(Debug, Default)]
+pub struct UploadHold {
+    held: std::sync::atomic::AtomicBool,
+    /// Deferrals because of the hold: a background pass skipped with
+    /// chunks pending, or a chunk a running pass left behind.
+    deferred: std::sync::atomic::AtomicU64,
+    /// Times the hold was put on.
+    engaged: std::sync::atomic::AtomicU64,
+}
+
+impl UploadHold {
+    pub fn set(&self, held: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.held.swap(held, Relaxed) && held {
+            self.engaged.fetch_add(1, Relaxed);
+        }
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `(deferrals, times engaged)`.
+    pub fn counters(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.deferred.load(Relaxed), self.engaged.load(Relaxed))
+    }
+
+    fn note_deferred(&self) {
+        self.deferred
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct UploadRuntime {
     pub gate: ConcurrencyGate,
+    /// Plan 31 C8: `UploadMode::UnmeteredOnly`'s hold.
+    pub hold: UploadHold,
     controller: Option<std::sync::Mutex<AdaptiveConcurrency>>,
     max_concurrency: usize,
     create_if_absent: bool,
@@ -286,6 +334,7 @@ impl UploadRuntime {
             inherited: Default::default(),
             last_put_ms: std::sync::atomic::AtomicI64::new(0),
             handoff: HandoffStats::default(),
+            hold: UploadHold::default(),
         }
     }
 
@@ -556,6 +605,7 @@ impl UploadRuntime {
             inherited: Default::default(),
             last_put_ms: std::sync::atomic::AtomicI64::new(0),
             handoff: HandoffStats::default(),
+            hold: UploadHold::default(),
         }
     }
 }
@@ -616,9 +666,31 @@ pub(crate) async fn upload_dirty_chunks_report(
         upload,
         only_ino,
         only_part,
+        false,
         0,
     )
     .await
+}
+
+/// The sync round's opportunistic pass: [`upload_dirty_chunks_report`],
+/// except that it takes no new chunk while the upload hold is on
+/// ([`UploadHold`]).
+pub(crate) async fn upload_dirty_chunks_background(
+    cache: &DiskCache,
+    meta: &Meta,
+    store: &ChunkStore,
+    compression: CompressionSetting,
+    upload: &UploadRuntime,
+) -> Result<UploadReport> {
+    if upload.hold.is_held() {
+        let pending = meta.pending_upload_count().unwrap_or(0);
+        if pending > 0 {
+            upload.hold.note_deferred();
+            tracing::debug!(pending, "chunk uploads held (metered network)");
+        }
+        return Ok(UploadReport::default());
+    }
+    upload_dirty_chunks_pass(cache, meta, store, compression, upload, None, None, true, 0).await
 }
 
 /// Plan 30 §M9 × §M4: enroll the chunk lists of adopted spilled
@@ -658,7 +730,8 @@ async fn expand_adopted_spills(cache: &DiskCache, meta: &Meta, store: &ChunkStor
 }
 
 /// One pass of [`upload_dirty_chunks_report`]: `depth` counts the passes
-/// a row another drain had claimed sent this one back for.
+/// a row another drain had claimed sent this one back for. `background`:
+/// the upload hold stops it taking new chunks mid-pass.
 #[allow(clippy::too_many_arguments)]
 async fn upload_dirty_chunks_pass(
     cache: &DiskCache,
@@ -668,6 +741,7 @@ async fn upload_dirty_chunks_pass(
     upload: &UploadRuntime,
     only_ino: Option<constellation_fs_core::Ino>,
     only_part: Option<&str>,
+    background: bool,
     depth: u8,
 ) -> Result<UploadReport> {
     use futures::StreamExt;
@@ -747,6 +821,11 @@ async fn upload_dirty_chunks_pass(
             } else {
                 upload.permit().await
             };
+            if background && upload.hold.is_held() {
+                // The network turned metered mid-pass: leave the row.
+                upload.hold.note_deferred();
+                return Ok(None);
+            }
             if fault::lose_chunk(&hash) {
                 tracing::warn!(%hash, "fault injection: dropping a pending chunk from the cache");
                 let _ = cache.remove(&hash);
@@ -949,6 +1028,7 @@ async fn upload_dirty_chunks_pass(
             upload,
             only_ino,
             only_part,
+            background,
             depth + 1,
         ))
         .await;

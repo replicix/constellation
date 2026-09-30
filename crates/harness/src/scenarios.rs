@@ -28,6 +28,8 @@ mod handover;
 /// EC2 campaign 6 B-1: FUSE reverse invalidations under sustained
 /// directory mutation from every node, with the holder `kill -9`ed.
 mod inval_storm;
+/// Plan 31 C8: the engine's host lifecycle (suspend, resume, metered).
+mod lifecycle;
 /// Plan 30 §M10: flexible-quorum continuation epochs.
 mod m10;
 /// Plan 30 §M11: delegated sub-sequencers, one log.
@@ -1326,6 +1328,27 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: handover::upgrade_under_load,
+    },
+    Scenario {
+        name: "lifecycle-suspend-mid-write",
+        desc: "plan 31 C8: a writer on the lease holder records every fsync'd file; the holder is suspended (node.lifecycle, 15 s deadline) mid-stream: every view published, journal shipped, lease released, P2P quiet, all within the deadline; another node takes the writes over and every node reads every acknowledged file byte-exact; the holder resumes and the writer goes on: no acknowledged write lost",
+        requires: &[],
+        caps: &[],
+        run: lifecycle::lifecycle_suspend_mid_write,
+    },
+    Scenario {
+        name: "lifecycle-resume-rejoin",
+        desc: "plan 31 C8: a suspended lease holder's lease moves to another node, which writes, renames and deletes while it sleeps (its local reads still served); resumed, it catches up, rejoins P2P and writes again",
+        requires: &[],
+        caps: &[],
+        run: lifecycle::lifecycle_resume_rejoin,
+    },
+    Scenario {
+        name: "lifecycle-metered-uploads",
+        desc: "plan 31 C8: an unmetered-only node on a metered network (NetworkChanged) uploads no chunk for plain closes (S3 chunk PUT counter still, pending queue grows, the peer sees none of the content), an fsync still uploads at once; unmetered again, everything drains to both nodes intact",
+        requires: &[],
+        caps: &[],
+        run: lifecycle::lifecycle_metered_uploads,
     },
 ];
 

@@ -41,6 +41,7 @@ pub mod inbox;
 pub mod kernel_inval;
 pub mod lease;
 pub mod leave;
+pub mod lifecycle;
 pub mod locks;
 pub mod log_buffer;
 mod mtree_gc;

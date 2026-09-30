@@ -2000,6 +2000,34 @@ the serde form; `Rdev`'s glibc and FUSE packings) and
 classification and listing filter never leaking a hidden name, `IdentityMap`,
 `PolicyStack::for_caps`, the flag algebra, `ReadData`).
 
+## Op metrics, tracing and `vfs-bench` (plan 31 C7a)
+
+Every frontend op is counted when its responder completes
+(`constellation_vfs::metrics`): `constellation_vfs_ops_total{frontend,view,op,outcome}`
+(counter; `outcome` is `ok` or the `Code` name) and
+`constellation_vfs_op_seconds{frontend,view,op}` (histogram, 10 us to 60 s),
+served by `GET /metrics` on the web adapter. `view` is present only for a
+view labelled with an allowlisted key (`METRIC_LABELS`, today `pv`); the rest of
+a view's labels never become series. `stats.subscribe` samples carry the totals
+`constellation_vfs_ops_total` and `constellation_vfs_ops_refused_total`. Each op
+also gets an `OpId` and a `vfs.op` tracing span at debug level:
+`RUST_LOG=constellation_vfs::observe=debug`.
+
+`node.ops` (control) lists the request watchdog's in-flight and stalled ops per
+view, with the view's labels; `view` and `min_age_s` filter it.
+
+Tests: `cargo test -p constellation-engine --lib control::ops` (the `/metrics`
+scrape after real `View` ops, `node.ops` over the control protocol) and
+`cargo test -p constellation-vfs --lib` (`metrics`, `observe`, `watch`).
+
+`make vfs-bench` (`cargo bench -p constellation-engine --bench vfs_bench`,
+release build) times the frontend-side path around an op (op id, span,
+`OpCtx`, metrics-recording responder) against a bare `OpCtx` + responder, for
+`getattr`/`lookup`/`read`, on no backend, `MockVfs` and a real `View`, counting
+heap allocations per op with a thread-local counting allocator. It exits 1 if
+the dispatch overhead reaches 1 us/op or the path allocates more than the bare
+one (plan 31 section 6.9). Last recorded numbers are in `PROGRESS.md`.
+
 ## Subtree confinement (plan 31 §6.12)
 
 `subtree-confinement` has one daemon serve three views of one
@@ -2051,6 +2079,45 @@ requests the kernel queued while nobody read, the lock-wait refusal,
 `NegotiatedInit` round trips) and `constellation-engine`'s
 `view::handoff::tests` (open handles, an unlinked-open orphan and synthetic
 numbers crossing to a second view; the handle table's wire forms).
+
+## Engine profiles and host lifecycle (plan 31 C8)
+
+The harness drives the engine's lifecycle through `node.lifecycle` (the
+Linux/macOS manual source; `constellation lifecycle <target> <event>` from
+a shell), in `crates/harness/src/scenarios/lifecycle.rs`:
+
+- `lifecycle-suspend-mid-write`: three nodes; a writer on the lease holder
+  writes, `fsync`s and closes files, recording each acknowledged one (name,
+  length, blake3); the holder is suspended (15 s deadline) mid-stream. The
+  suspend report must say every view synced, flushed, lease released,
+  journal and pending uploads 0, within the deadline; the status must show
+  suspended, forward-only, background paused, no inbound, no gossip.
+  Another node writes (taking the lease) while the writer's ops keep
+  arriving on the suspended node and forward (none may fail); every
+  acknowledged file reads byte-exact on every node, the suspended node
+  still serves local reads; it resumes, the writer goes on, and all files
+  from all phases are intact everywhere with zero conflicts.
+- `lifecycle-resume-rejoin`: a suspended holder's lease moves to another
+  node, which writes, renames and deletes; the suspended node still reads
+  locally; resumed, it catches up (the renamed/deleted names gone), rejoins
+  P2P and writes again, visible everywhere.
+- `lifecycle-metered-uploads`: two nodes, the holder with
+  `CONSTELLATION_PROFILE_UPLOADS=unmetered-only`; after
+  `NetworkChanged{metered: true}`, eight plain closes upload no chunk (the
+  status `s3.by_area` `PUT chunks` counter stands still, `writeback.
+  pending_uploads` ≥ 8, the peer sees none of the content), an `fsync`'d
+  file still uploads at once and reaches the peer; `metered: false` drains
+  the queue and every file is intact on both nodes.
+
+The profile knobs (`CONSTELLATION_PROFILE`, `CONSTELLATION_PROFILE_{P2P,
+LEASES,UPLOADS,BACKGROUND}`) are read by the daemon at start; the
+in-process unit tests are `constellation-engine`'s `lifecycle::tests`
+(one engine: suspend/resume state machine, background modes, upload
+hold) and `lifecycle::authority_tests` (standalone cores on one bucket:
+forward-only never registers for a live lease, a suspended node takes
+nothing, a suspension flush hands every acknowledged op to the next
+holder), `constellation-authority`'s `core::mode` and `core::lease`
+tests, and `constellation-net`'s `quiesce_and_dial_only_gate_connections`.
 
 ## The authority simulation (plan 30 M5)
 

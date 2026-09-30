@@ -15,9 +15,11 @@
 //!
 //! What only a host can do comes through [`ControlHost`]: the kernel mounts
 //! (`view.mount`/`view.unmount` and the mount list every status carries),
-//! the session handover (`node.handoff`), detaching every view after a
-//! self-`leave`, and host lifecycle events. The daemon implements it over
-//! its FUSE sessions; a test implements it with bare [`View`]s.
+//! the session handover (`node.handoff`), and detaching every view after
+//! a self-`leave`. The daemon implements it over its FUSE sessions; a test
+//! implements it with bare [`View`]s. (Host lifecycle events are the
+//! engine's own: `node.lifecycle` pushes into the host services' manual
+//! lifecycle source, which the engine subscribes to — [`lifecycle`].)
 //!
 //! ## The 37 old methods keep their semantics
 //!
@@ -38,11 +40,13 @@
 //! - `stats.subscribe` (periodic samples of `/metrics`'s gauges) and
 //!   `events.subscribe` (view, lease and peer transitions, observed by a
 //!   watcher started with the first subscriber).
-//! - `node.lifecycle` answers `Unsupported` until plan 31 C8 gives the
-//!   engine lifecycle profiles to apply the events to.
+//! - `node.lifecycle` (plan 31 C8): a host lifecycle event, applied by the
+//!   engine before the answer ([`lifecycle`]).
 
 mod browse;
 mod fs;
+mod lifecycle;
+mod ops;
 mod service;
 mod streams;
 
@@ -59,9 +63,8 @@ use constellation_control::proto::types as api;
 use constellation_control::proto::types::{
     Ack, CacheEntryListing, CachePruneResult, DelegationListing, DesignationListing,
     DirectoryListing, FileStat, FsckReport, GcReport, HandoffParams, HandoffReport, HandoverStatus,
-    LifecycleParams, OpsReport, PeerListing, PinListing, Pong, PruneRootListing, QuotaStatus,
-    RefHashes, SnapshotCreated, SnapshotListing, ViewInfo, ViewListing, ViewMountParams,
-    ViewStatsReport,
+    PeerListing, PinListing, Pong, PruneRootListing, QuotaStatus, RefHashes, SnapshotCreated,
+    SnapshotListing, ViewInfo, ViewListing, ViewMountParams, ViewStatsReport,
 };
 use constellation_control::proto::{ControlError, JsonValue};
 use constellation_control::{CallCtx, Principal, Router};
@@ -117,19 +120,6 @@ pub trait ControlHost: Send + Sync + 'static {
         params: &HandoffParams,
         fd: Option<OwnedFd>,
     ) -> Result<HandoffReport, ControlError>;
-
-    /// `node.lifecycle`: not before plan 31 C8.
-    fn lifecycle(&self, _params: &LifecycleParams) -> Result<Ack, ControlError> {
-        Err(lifecycle_unsupported())
-    }
-}
-
-/// `node.lifecycle`'s answer until plan 31 C8.
-pub fn lifecycle_unsupported() -> ControlError {
-    ControlError::unsupported(
-        "host lifecycle events are not applied yet (the engine's lifecycle profiles are plan 31 C8)",
-    )
-    .with_remediation("nothing to do on a desktop or server host; the daemon runs as `server`")
 }
 
 /// The engine's control service. See the module docs.
@@ -426,29 +416,9 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     unary::<NodeSetWriteMode>(r, svc, |s, _, p| ack(s.set_write_mode(&p.mode)));
     streams::register_logs_tail(r, svc);
     unary::<NodeDoctor>(r, svc, |s, _, _| s.doctor().map_err(failed));
-    unary::<NodeOps>(r, svc, |s, _, p| {
-        if p.view.is_some() {
-            return Err(ControlError::unsupported(
-                "the op watchdog does not attribute operations to views yet (plan 31 C7)",
-            )
-            .with_remediation("omit `view`"));
-        }
-        let snap = s.engine.op_watch().snapshot();
-        let min = p.min_age_s.unwrap_or(0);
-        let status = fuse_requests_status(&snap);
-        Ok(OpsReport {
-            in_flight: status.in_flight,
-            stalled: status.stalled,
-            oldest_s: status.oldest_s,
-            ops: status
-                .stalled_requests
-                .into_iter()
-                .filter(|op| op.age_s >= min)
-                .collect(),
-        })
-    });
+    unary::<NodeOps>(r, svc, |s, _, p| s.node_ops(&p));
     unary::<NodeHandoff>(r, svc, |s, call, p| s.host.handoff(&p, call.fd));
-    unary::<NodeLifecycle>(r, svc, |s, _, p| s.host.lifecycle(&p));
+    unary::<NodeLifecycle>(r, svc, |s, _, p| s.lifecycle(&p));
 
     // ---- pin / designation ----
     unary::<PinAdd>(r, svc, |s, _, p| ack(s.pin(&p.path)));

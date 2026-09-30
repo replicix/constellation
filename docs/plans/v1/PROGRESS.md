@@ -28636,3 +28636,202 @@ failed only while other suites ran alongside.
   `cross-subtree-rename`, `fuse-inval-storm`: PASSED (debug binary)
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798) — run by the coordinator at the end
+
+## Plan 31 C7a — op metrics, tracing, `node.ops`, `vfs-bench`
+
+First half of milestone C7 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.9, §6.10, §9.10): the unified op metrics, a span and id for every op,
+`node.ops` attributed to views, and the `vfs-bench` gate. (The deferral of
+cold reads/lease waits and the Mountpoint-derived candidates of C7 are not in
+this part.)
+
+| Item | State | Where |
+|---|---|---|
+| `constellation_vfs_ops_total{frontend,view,op,outcome}` (counter) and `constellation_vfs_op_seconds{frontend,view,op}` (histogram, 21 bounds 10 µs–60 s + `+Inf`), recorded once per op when its `Responder` completes (`Timed<R>`: also on a deferred completion's thread; dropped unanswered counts as `Io`; never twice). `outcome` = `ok` or `Code::name()` (new const fn), ≤ 80 slots. Zero heap allocation and no lookup per op: pre-registered atomics indexed by (`OpKind`, outcome slot) and bucket, three relaxed `fetch_add`s; frontend name and `view` label fixed per session. Series shared per (frontend, view label) through a weak registry so a scrape never steps backwards when one of two sessions ends | DONE | `crates/vfs/src/metrics.rs`, `crates/types/src/errno.rs` |
+| `view` label only from `METRIC_LABELS` (`pv`): `Vfs::identity() -> ViewIdentity{id, metric_view}` (`View` computes it with `metric_view_label`); `namespace`/`pvc` etc. never reach a series (asserted in the scrape test) | DONE | `crates/vfs/src/{vfs,observe}.rs`, `crates/engine/src/view/{spec,ops}.rs` |
+| Tracing: `Observer::begin` gives every op an `OpId` and a `vfs.op` **debug** span (`op, ino, op_id, frontend, view_id, view`), `ObservedOp::enter` around the engine call, so engine events nest under it; the FUSE adapter uses it in all 28 op callbacks (`lock_acquire` included). Disabled span = level check, fields not evaluated, no allocation; debug (not info) so an `fmt` subscriber at `info` never formats 6 fields per request. There were no S3/P2P spans to nest (only events) — none added | DONE | `crates/vfs/src/observe.rs`, `crates/frontend-fuse/src/adapter.rs` |
+| `/metrics` renders `StatusReport.vfs_ops` (new, `VfsOpsStatus`) as a real `counter`/`histogram` (cumulative buckets, `_sum` s, `_count`, escaped label values); `stats.subscribe` samples carry `constellation_vfs_ops_total` / `_refused_total` (labelled series would make the sample's key set unstable) | DONE | `crates/control/src/{web.rs,proto/types.rs}`, `crates/engine/src/control/{ops,service,streams}.rs`; schema re-blessed |
+| `node.ops`: the `view` filter (was Unsupported) works. `OpWatch::for_view` tags each view's handle (id + labels) on a shared registry; `OpWatch::ops()` lists every in-flight op. `OpsReport` = totals + `ops: Vec<OpEntry>` (oldest first, `stalled`, `blocking`, `view`; ≤ 1000, `truncated`) + `views: Vec<ViewOps>` (every open view with its labels, idle ones too); `min_age_s` filters; unknown view → `NotFound`. `OpsReport.ops` changed from `StalledFuseRequest` to `OpEntry` and now lists all in-flight ops, not only stalled ones (no consumers existed) | DONE | `crates/vfs/src/watch.rs`, `crates/engine/src/control/{mod,ops}.rs` |
+| DoD test: `/metrics` scraped in-process (web adapter over a real engine) after 3 `getattr` + 2 refused `lookup` through the `Observer`: exact series/labels/counts, cumulative buckets, no non-allowlisted label; `node.ops` per view/labels/filters/over the router; stalled/capped accounting on synthetic entries | DONE | `crates/engine/src/control/ops.rs` (3 tests), `crates/vfs/src/{metrics,observe,watch}.rs`, `web::tests` |
+| `vfs-bench` (criterion 0.5, `default-features = false`; `harness = false`): direct (`OpCtx::new` + bare responder) vs observed (`Observer` path) for `getattr`/`lookup`/`read` on no backend, `MockVfs` reference fs and a real `View` (local file backend, P2P off); alternating rounds, median of per-round differences; per-thread counting `#[global_allocator]`; exits 1 past 1 µs, or on any allocation with no backend / more than 0.5 extra allocations per op over a backend (whose own count may wobble). `make vfs-bench` | DONE | `crates/engine/benches/vfs_bench.rs`, `crates/engine/Cargo.toml`, `Makefile` |
+
+**`vfs-bench` numbers** (release, this container, 4 vCPU, no tracing subscriber;
+`make vfs-bench`, exit 0). Target §6.9: overhead < 1000 ns/op, no extra
+allocation per inline op.
+
+| backend | op | direct ns | observed ns | overhead ns | allocs/op direct → observed |
+|---|---|---|---|---|---|
+| observer only | getattr | 8.5 | 129.7 | +121 | 0 → 0 |
+| MockVfs | getattr | 528 | 670 | +141 | 4 → 4 |
+| MockVfs | lookup | 618 | 760 | +140 | 8 → 8 |
+| MockVfs | read 4 KiB | 669 | 809 | +152 | 5 → 5 |
+| View | getattr | 1797 | 1914 | +151 | 4 → 4 |
+| View | lookup | 3223 | 3350 | +158 | 11 → 11 |
+| View | read 4 KiB | 8648 | 8947 | +111 | 60 → 60 |
+
+The path around an op costs ~110–160 ns (10x under the target) and adds **zero**
+allocations (0.000/op with no backend). Runs vary ±30 ns; an earlier run
+of the same code read +109…+177 ns. The absolute allocations are the
+backends' own: the mock records calls; the real `View` allocates 4 (`getattr`),
+11 (`lookup`), 60 (`read`, 10.7 KB) per op — so §6.9's "no per-op heap
+allocation for inline replies" holds for the dispatch path but not yet for the
+`View`'s read/lookup work; recorded as a C7 follow-up (the criterion groups
+`vfs_dispatch/view/*` are the baseline).
+
+**Verification (this part).** fmt clean; clippy `-D warnings --all-targets` on
+types/vfs/frontend-fuse/control/engine clean; `cargo build --workspace`; tests:
+vfs `--lib` 53, frontend-fuse `--lib` 17 and `--test wire` 20, engine `--lib`
+317 passed/2 ignored (incl. parity), control `--features web` 131;
+`make check-cross` exit 0; `make vfs-bench` exit 0.
+
+**Gates pending** (coordinator): `cargo test --workspace`, smoke/integration,
+harness matrix, pjdfstest 8798/8798, the remaining C7 items (deferral of cold
+reads, Mountpoint-derived candidates), and adding `vfs-bench` to the CI perf
+lane. Not done here: instrumenting `ControlVfs` (browse ops). (Ops the FUSE
+adapter refuses before a `Vfs` call — bad `lseek`/`setxattr`/`setlk` args — are
+begun and answered through the observed responder, so they are counted too.)
+
+### Plan 31 C7a exit criteria
+
+- [x] `constellation_vfs_ops_total` / `constellation_vfs_op_seconds` emitted and scraped by a test, `view` only from the allowlist
+- [x] Every op has an `OpId` and a `vfs.op` span, allocation-free when disabled
+- [x] `node.ops` `view` filter, with labels; covered by tests
+- [x] `vfs-bench` recorded, within the §6.9 dispatch target
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator
+
+
+## Plan 31 C8 — engine profiles and lifecycle
+
+Milestone C8 of [plan 31](wip/31-core-frontend-backend.md) (§10, §10.1,
+§11 "C8", §15 item 9): `EngineProfile`'s modes take effect, the engine
+applies its host's `LifecycleSource` events, `node.lifecycle` injects them on
+Linux/macOS, and three harness scenarios exercise suspend/resume/metered
+uploads against real daemons.
+
+### Profile semantics as implemented
+
+| Field | Value | Effect |
+|---|---|---|
+| `p2p` | `Listen` | as before |
+| | `DialOnly` | same endpoint; every **inbound** connection (any ALPN) is refused right after its handshake (`InboundWatch::after_handshake`, close code `0x4e41`); outbound dials (forwards, chunk fetches, the log-stream subscription, gossip's own links) work, and replies come back on the connection this node opened. The registry record still carries key + address (peers build their allowlists from it). iroh 1.1 has no listen-less endpoint, so this is the hook-based refusal |
+| | `Off` | as before (no endpoint) |
+| `leases` | `Hold` | as before |
+| | `ForwardOnly` | the authority core's `AuthorityMode::forward_only` (`crates/authority/src/core/mode.rs`): never takes the lease *from a live holder* — no P2P handoff request, no `wanted_by` registration, no placement offer claimed, no inbox escalation, no re-adoption of an old tenure — routing always forwards first (even with `CONSTELLATION_FORWARD=off`), and a lease it did take (nobody held one: refusing would leave the cluster without a sequencer and fail the phone's writes) is given back once idle for the dwell (`LeaseState::release_when_idle`) instead of waiting to be asked. Reuses the existing forward/inbox/lease paths: no new routing code |
+| `uploads` | `Always` | as before |
+| | `UnmeteredOnly` | while the last `NetworkChanged` said metered (`UploadHold`): the round's background upload pass takes no new chunk (skipped, or stopped mid-pass), plain closes are write-back (`WriteModeState::effective`), forwarded chunks are not handed to a peer; data stays in `pending_upload` + cache (locally durable), and plan 30 §M7's ship deferral holds back only the manifests that name a held chunk. **Explicit durability requests are never held**: `fsync`/`O_SYNC`/`--fsync-mode s3` drains, barriers, a snapshot's forced publish, handoff/unmount/suspend flushes (waiting there would park the core's single job slot and its lease renewals). Under `ack=s3` an acknowledgement still waits for the log exactly as before (its record is deferred until the chunk is up) |
+| `background` | `Continuous` | background work pauses only while suspended |
+| | `OnDemand` | also pauses while `Background` or `LowPower` (until `Foreground`/`Resumed`) |
+
+"Background work" (`BackgroundGate`, checked at the top of each tick): bucket
+GC, completed-rid prune, retention pruner, coop digest publishing, pin
+refreshes, placement RTT gossip/offers, registry/roster and designation
+polls, atime flushes, the replica vacuum. Never paused: the authority core
+(renewal, tailing, shipping, forwarding), the open-orphan hold writer,
+demand-driven readahead.
+
+`EngineProfile::server(mem, cache)` = desktop modes with explicit budgets
+(§10.1, unchanged); new `EngineProfile::mobile()` (DialOnly, ForwardOnly,
+UnmeteredOnly, OnDemand; plan 36 A1 tunes budgets). The daemon keeps
+`desktop()`; `CONSTELLATION_PROFILE=desktop|server|mobile` and
+`CONSTELLATION_PROFILE_{P2P,LEASES,UPLOADS,BACKGROUND}` override it
+(`EngineProfile::from_env`; an unknown value fails the mount).
+
+### Lifecycle events (`crates/engine/src/lifecycle.rs`)
+
+The engine subscribes to `HostServices.lifecycle` at start; an
+`engine-lifecycle` thread applies events in order.
+
+**`Suspending{deadline}`**: (1) background pauses; (2) every open view's
+`sync_view` in parallel (before authority narrows, so a publish can still take
+the lease the ordinary way); (3) core `Control::Authority{suspended}` — no
+acquisition at all except a sealed backup's takeover and a continuation
+epoch's flush re-claim (the two that preserve acknowledged work); (4)
+`Control::Flush` (leave's): every pending chunk up, journal shipped, commit
+published if holder, lease released via the ordinary release CAS; (5) P2P
+quiesce: inbound refused, gossip's dials refused, every connection closed
+with a close frame (the node's own requests may still dial: an op that
+arrives while suspended forwards like any non-holder's). Each step is bounded
+by what is left of the deadline; unfinished steps keep running and the
+`SuspendReport` says so (`within_deadline`, `views_synced`, `flushed`,
+`flush_error`, `lease_released`, `journal_backlog`, `pending_uploads`,
+`p2p_connections_closed`).
+
+**`Resumed`**: P2P admits connections again (inbound only under `Listen`),
+`Endpoint::network_change()`, re-dial every peer, gossip rejoin; core
+authority restored (leases re-acquired lazily by the next op that needs
+one, as a restarted node); background resumes; an immediate sync round.
+**`NetworkChanged`**: upload hold per `UploadMode`; iroh `network_change()`
+when reachable (plan 36 settled decision 20). **`LowPower`**: as
+`Background` for `OnDemand`. **`Foreground`/`Background`**: per
+`BackgroundMode`.
+
+`node.status` gains `lifecycle` (`LifecycleStatus`: profile, state,
+low_power, network, in-force forward_only/suspended/uploads_held/
+upload_deferrals/background_paused/p2p admission, events, last
+suspend/resume reports). `node.lifecycle` (admin) pushes into the host's
+`ManualLifecycle` (`LifecycleSource::manual()`, new) and answers
+`LifecycleReport{event, applied, status}` once applied (was `Ack` +
+Unsupported; `ControlHost::lifecycle` removed). CLI:
+`constellation lifecycle <target> foreground|background|low-power|suspending
+[--deadline-ms N]|resumed|network [--reachable B --metered B]`.
+
+**Lease/ack safety.** Nothing here acknowledges anything; acks are given by
+the unchanged ack-policy code. Everything acknowledged before the suspension
+is in the fjall journal (synced by step 2) and, once the flush finishes, in
+the log. The lease is only ever let go through the core's ordinary release
+CAS after its journal shipped (a released lease: the next holder takes over
+at once, no TTL, no epoch ambiguity), or not at all: a flush that misses the
+deadline leaves the tenure as a frozen node's — renewed until it cannot be,
+then taken over by TTL, the unshipped journal stranded and replayed by rid
+on return (the deposition path every kill -9 scenario covers). While
+suspended the node is a non-holder that will not become one; it keeps its
+backup and promise duties for others (they are how *other* nodes keep acked
+work).
+
+### Items
+
+| Item | State | Where |
+|---|---|---|
+| `AuthorityMode` (forward-only, suspended), `Control::Authority`, `Config::forward_only`, acquisition gate, no-`wanted_by`, idle release | DONE | `crates/authority/src/core/{mode,jobs,client,holder,inbox,lease,mod}.rs`, `event.rs` |
+| DialOnly / quiesce / gossip gate / `close_all` / `network_change` | DONE | `crates/net/src/{endpoint,peers}.rs` |
+| `UploadHold`, background pass, write-back under hold | DONE | `crates/engine/src/{upload,writeback,authority_driver}.rs` |
+| `BackgroundGate` on every ticker | DONE | `crates/engine/src/{node,coop,pin}.rs` |
+| Lifecycle runtime, reports, status | DONE | `crates/engine/src/lifecycle.rs` |
+| Profile semantics, `mobile()`, `from_env` | DONE | `crates/engine/src/profile.rs`, `crates/cli/src/node_runtime.rs` |
+| `node.lifecycle` end-to-end, `LifecycleReport`, `LifecycleStatus`, schema re-blessed | DONE | `crates/control/src/{methods.rs,proto/types.rs}`, `crates/engine/src/control/{lifecycle,mod,service}.rs`, `crates/platform/src/lifecycle.rs` |
+| CLI `constellation lifecycle` | DONE | `crates/cli/src/main.rs` |
+| Harness `lifecycle-suspend-mid-write`, `lifecycle-resume-rejoin`, `lifecycle-metered-uploads` | DONE | `crates/harness/src/scenarios/lifecycle.rs` |
+
+### Scenario results (debug binary, docker floci S3)
+
+| Scenario | Runs | Passed | Notes |
+|---|---|---|---|
+| `lifecycle-suspend-mid-write` | 3 (final code; 3 more on an earlier build) | 3 | suspend 36–164 ms of a 15 s deadline, 18–24 acks in phase 1, 0 failed ops, 44–51 files intact on 3 nodes |
+| `lifecycle-resume-rejoin` | 3 | 3 | caught up 0.39–0.46 s after resume |
+| `lifecycle-metered-uploads` | 3 | 3 | chunk PUTs 1 → 1 while metered (8 pending, 21–27 deferrals), → 10 after |
+
+Found and fixed on the way: the first version of the quiesce also refused the
+node's own outbound dials, so its ops went through the S3 inbox — and a holder
+that still believed the node P2P-connected never polled it, so one op in two
+runs ended `EIO` at the 2×TTL deadline. Own requests now dial out (gossip's
+stay refused); the scenario asserts zero failed ops across the suspension.
+
+Regression (debug, `--seed 7`, `HOLDER_KILL_ROUNDS=3`): `lease-handover`,
+`lease-fencing`, `p2p-handover`, `forwarded-mutations`,
+`sticky-lease-handoff-over-s3`, `holder-kill-rejoin`,
+`p2p-same-identity-restart` — all PASSED.
+
+**Deferred.** Rebalancing a live engine's cache share when an `EngineHost`
+adds/removes engines (`host.rs`'s module doc names it "C8's lifecycle work";
+not in this milestone's brief — shares stay fixed at start). A real OS
+suspension on a phone also freezes the process holding a backup role; the
+holder reconfigures a silent backup out on its own schedule (existing M9
+path), which this manual-source milestone cannot exercise.
+
+### Plan 31 C8 exit criteria
+
+- [x] `EngineProfile` modes take effect; `server()` per §10.1; `mobile()` preset
+- [x] Suspend/resume semantics (§10), within a deadline, reported
+- [x] `node.lifecycle` works end-to-end against a real daemon (harness)
+- [x] Lifecycle scenarios pass on Linux (3 × 3)
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator

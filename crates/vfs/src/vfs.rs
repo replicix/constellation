@@ -2,6 +2,7 @@
 
 use crate::ctx::OpCtx;
 use crate::name::{Name, XattrName, XattrNameBuf};
+use crate::observe::ViewIdentity;
 use crate::responder::{DirSink, Responder};
 use crate::types::{
     Attr, Durability, Entry, FallocateMode, Fh, Ino, LockOwner, LockRange, LockSpec, LockStatus,
@@ -38,6 +39,13 @@ use constellation_types::Rdev;
 /// always has, and the handle is carried for the handle table a session
 /// handover exports (plan 31 §6.11).
 pub trait Vfs: Send + Sync + 'static {
+    /// Who this view is, for the frontend's metrics and tracing spans
+    /// ([`crate::Observer`]): its number and its allowlisted metric
+    /// label. Anonymous by default (a mock, a test double).
+    fn identity(&self) -> ViewIdentity {
+        ViewIdentity::default()
+    }
+
     /// Resolve `name` in `parent`.
     fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R);
 

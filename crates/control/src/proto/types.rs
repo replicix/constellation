@@ -514,10 +514,52 @@ pub struct StatusReport {
     /// The FUSE request watchdog (EC2 campaign 7 B-2).
     #[serde(default)]
     pub fuse_requests: FuseRequestsStatus,
+    /// Plan 31 C8: the engine profile and the host's lifecycle.
+    #[serde(default)]
+    pub lifecycle: LifecycleStatus,
     /// Object-store requests this daemon has issued since it started
     /// (every filesystem it serves), by kind and by key area.
     #[serde(default)]
     pub s3: S3RequestStatus,
+    /// The unified op metrics (plan 31 §6.10) `/metrics` exports as
+    /// `constellation_vfs_ops_total` and `constellation_vfs_op_seconds`.
+    #[serde(default)]
+    pub vfs_ops: VfsOpsStatus,
+}
+
+/// Every frontend op counted so far, per (frontend, view, op): the numbers
+/// behind `constellation_vfs_ops_total{frontend,view,op,outcome}` and the
+/// `constellation_vfs_op_seconds{frontend,view,op}` histogram. Only series
+/// with something counted are present; `view` is the allowlisted metric
+/// label of a view (plan 31 §9.10), never its full label map.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct VfsOpsStatus {
+    /// The histogram's bucket upper bounds, seconds, ascending; each
+    /// series' last bucket is `+Inf`.
+    #[serde(default)]
+    pub bucket_bounds_s: Vec<f64>,
+    #[serde(default)]
+    pub series: Vec<VfsOpSeries>,
+}
+
+/// One (frontend, view, op) of [`VfsOpsStatus`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct VfsOpSeries {
+    pub frontend: String,
+    /// The view's allowlisted metric label; absent for a view with none.
+    #[serde(default)]
+    pub view: Option<String>,
+    pub op: String,
+    /// Ops per outcome: `ok`, or a `Code` name (`NotFound`, ...).
+    #[serde(default)]
+    pub outcomes: BTreeMap<String, u64>,
+    /// Ops per latency bucket (not cumulative): one more than
+    /// `bucket_bounds_s`, the last being `+Inf`.
+    #[serde(default)]
+    pub buckets: Vec<u64>,
+    /// The latencies' sum, nanoseconds.
+    #[serde(default)]
+    pub sum_ns: u64,
 }
 
 /// Object-store requests by kind (one per call the daemon makes; a
@@ -2165,18 +2207,71 @@ pub struct OpsParams {
     /// Only operations at least this old.
     #[serde(default)]
     pub min_age_s: Option<u64>,
-    /// Only this view's operations.
+    /// Only this view's operations (by id, as `view.list` shows it).
     #[serde(default)]
     pub view: Option<u64>,
 }
 
-/// `node.ops`'s result.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+/// `node.ops`'s result: the operations in flight (at least `min_age_s`
+/// old, of `view` if named), oldest first, and the same per view.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpsReport {
+    /// Operations in flight (after the filters).
+    pub in_flight: u64,
+    /// Of them, reported as stalled (older than `stall_threshold_s`).
+    pub stalled: u64,
+    /// The age of the oldest non-blocking one.
+    pub oldest_s: u64,
+    #[serde(default)]
+    pub stall_threshold_s: u64,
+    /// The operations, oldest first, at most `OPS_LIST_MAX` of them
+    /// (`truncated` says whether there were more).
+    pub ops: Vec<OpEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+    /// Per view (by id), with its labels; operations of no view are under
+    /// `view: null`. Counts cover all matching operations, not only the
+    /// listed ones.
+    #[serde(default)]
+    pub views: Vec<ViewOps>,
+}
+
+/// The most operations `node.ops` lists (the counts are never capped).
+pub const OPS_LIST_MAX: usize = 1000;
+
+/// One operation in flight, as `node.ops` lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpEntry {
+    pub op: String,
+    /// The inode it is about (0: a view-wide operation).
+    pub ino: u64,
+    pub age_s: u64,
+    /// What the handler last noted it was waiting on.
+    pub stage: String,
+    /// The OS thread handling it.
+    pub tid: u32,
+    /// A blocking lock request: unbounded by design, not a stall.
+    #[serde(default)]
+    pub blocking: bool,
+    /// The watchdog has reported it as stalled.
+    #[serde(default)]
+    pub stalled: bool,
+    /// The view (by id) it belongs to.
+    #[serde(default)]
+    pub view: Option<u64>,
+}
+
+/// One view's share of `node.ops`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ViewOps {
+    #[serde(default)]
+    pub view: Option<u64>,
+    /// The view's full label map (`view.list`'s).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
     pub in_flight: u64,
     pub stalled: u64,
     pub oldest_s: u64,
-    pub ops: Vec<StalledFuseRequest>,
 }
 
 /// The host lifecycle events of plan 31 §10, as a wire type
@@ -2196,6 +2291,114 @@ pub enum LifecycleEventSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LifecycleParams {
     pub event: LifecycleEventSpec,
+}
+
+/// Plan 31 C8: the engine's lifecycle, as `node.status` reports it and
+/// `node.lifecycle` answers: the profile it runs, what the host last said,
+/// and what is in force because of both.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LifecycleStatus {
+    /// The engine profile's modes: `p2p` (`listen`/`dial-only`/`off`),
+    /// `leases` (`hold`/`forward-only`), `uploads`
+    /// (`always`/`unmetered-only`), `background`
+    /// (`continuous`/`on-demand`).
+    #[serde(default)]
+    pub profile: BTreeMap<String, String>,
+    /// `foreground`, `background`, `suspending` or `suspended`.
+    #[serde(default)]
+    pub state: String,
+    /// The host asked for reduced background work (until the next
+    /// `Foreground` or `Resumed`).
+    #[serde(default)]
+    pub low_power: bool,
+    /// The last `NetworkChanged` (reachable and unmetered until one says
+    /// otherwise).
+    #[serde(default)]
+    pub network_reachable: bool,
+    #[serde(default)]
+    pub network_metered: bool,
+    /// In force: the authority core never takes the lease from a live
+    /// holder (the profile's `forward-only`, or a suspension).
+    #[serde(default)]
+    pub forward_only: bool,
+    /// In force: the core takes no lease at all (a suspension).
+    #[serde(default)]
+    pub suspended: bool,
+    /// In force: opportunistic chunk uploads hold (`unmetered-only` on a
+    /// metered network), and how often the hold deferred one.
+    #[serde(default)]
+    pub uploads_held: bool,
+    #[serde(default)]
+    pub upload_deferrals: u64,
+    /// In force: GC, prune, digests, pin refreshes, registry and
+    /// designation polls are paused.
+    #[serde(default)]
+    pub background_paused: bool,
+    /// The P2P endpoint admits inbound connections / takes part in
+    /// gossip (both false without P2P; a suspension refuses both, and
+    /// only this node's own requests dial out).
+    #[serde(default)]
+    pub p2p_accepts_inbound: bool,
+    #[serde(default)]
+    pub p2p_gossip: bool,
+    /// Lifecycle events applied since the engine started, and the last.
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub last_event: Option<String>,
+    #[serde(default)]
+    pub last_suspend: Option<SuspendReport>,
+    #[serde(default)]
+    pub last_resume: Option<ResumeReport>,
+}
+
+/// What a `Suspending` achieved by its deadline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SuspendReport {
+    pub deadline_ms: u64,
+    pub elapsed_ms: u64,
+    /// Every step finished before the deadline.
+    pub within_deadline: bool,
+    /// Views open, and published by their `sync_view` barrier; one line
+    /// per view that failed or did not finish in time.
+    pub views: u64,
+    pub views_synced: u64,
+    #[serde(default)]
+    pub view_errors: Vec<String>,
+    /// The flush — every pending chunk up, the journal shipped, the lease
+    /// released — finished; why not, when it did not.
+    pub flushed: bool,
+    #[serde(default)]
+    pub flush_error: Option<String>,
+    /// This node held no lease once the steps ran.
+    pub lease_released: bool,
+    /// What is left for after the resume (0 and 0 after a clean flush).
+    pub journal_backlog: u64,
+    pub pending_uploads: u64,
+    /// P2P connections closed by the quiesce.
+    pub p2p_connections_closed: u64,
+}
+
+/// What a `Resumed` did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResumeReport {
+    pub elapsed_ms: u64,
+    /// The engine was suspended (a `Resumed` without one changes nothing).
+    pub was_suspended: bool,
+    /// The P2P endpoint admits connections again and re-dialed its peers.
+    pub p2p_resumed: bool,
+}
+
+/// `node.lifecycle`'s answer: the event, applied, and the lifecycle it
+/// left (with the suspension's or resumption's own report).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LifecycleReport {
+    pub event: LifecycleEventSpec,
+    /// The engine applied it before this answer (false: still applying
+    /// well past a suspension's deadline). Lifecycle events are the
+    /// host's, so an `EngineHost` delivers each to all its engines.
+    pub applied: bool,
+    pub status: LifecycleStatus,
 }
 
 /// Where `node.handoff` sends the FUSE sessions (plan 31 §6.11).

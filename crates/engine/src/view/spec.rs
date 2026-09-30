@@ -10,6 +10,18 @@ use std::collections::BTreeMap;
 /// high-cardinality values cannot create unbounded Prometheus series.
 pub const METRIC_LABELS: &[&str] = &["pv"];
 
+/// The `view` dimension of a metric (and of an op's tracing span) for a
+/// view labelled `labels`: the values of the [`METRIC_LABELS`] it carries,
+/// in allowlist order, joined by `,` (for the one allowlisted key today,
+/// `pv`, exactly the volume's name); `None` when it carries none.
+pub fn metric_view_label(labels: &BTreeMap<String, String>) -> Option<String> {
+    let values: Vec<&str> = METRIC_LABELS
+        .iter()
+        .filter_map(|key| labels.get(*key).map(String::as_str))
+        .collect();
+    (!values.is_empty()).then(|| values.join(","))
+}
+
 /// One view of the engine's filesystem.
 ///
 /// The frontend's own mount options (a FUSE mountpoint, `allow_other`,
@@ -71,6 +83,11 @@ impl ViewSpec {
         self.root.contains('@') && !self.rw_snapshot
     }
 
+    /// This view's `view` metric label (see [`metric_view_label`]).
+    pub fn metric_view(&self) -> Option<String> {
+        metric_view_label(&self.labels)
+    }
+
     /// The labels a metric may carry (see [`METRIC_LABELS`]).
     pub fn metric_labels(&self) -> BTreeMap<&str, &str> {
         self.labels
@@ -96,6 +113,15 @@ mod tests {
             [("pv", "pv-1")]
         );
         assert_eq!(spec.labels.len(), 3, "the full map stays on the view");
+        assert_eq!(spec.metric_view().as_deref(), Some("pv-1"));
+        assert_eq!(ViewSpec::new("/").metric_view(), None);
+        let mut unlisted = ViewSpec::new("/");
+        unlisted.labels.insert("namespace".into(), "team-a".into());
+        assert_eq!(
+            unlisted.metric_view(),
+            None,
+            "no allowlisted label, no dimension"
+        );
         assert!(!spec.is_frozen());
         assert!(ViewSpec::new("/a@snap").is_frozen());
         let rw = ViewSpec {

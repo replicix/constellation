@@ -40,6 +40,13 @@
 //! each view its own). Each has its own monitor thread, which ends when
 //! the last handle to the registry is dropped.
 //!
+//! **Which view an op belongs to.** A view is handed a tagged handle to
+//! the shared registry ([`OpWatch::for_view`]): the registry is still one,
+//! but each op registered through the handle names its view's id, and the
+//! view's labels come with the tag. `node.ops` filters and groups by it
+//! ([`OpWatch::ops`]); ops registered through an untagged handle belong to
+//! no view.
+//!
 //! **Which op the current thread is handling** is a thread-local here:
 //! engine waits name their stage through [`stage`] without knowing the
 //! registry, and a wait the engine moves to a thread of its own (a
@@ -51,7 +58,7 @@
 use crate::types::Ino;
 use constellation_platform::ThreadRef;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -81,9 +88,18 @@ impl From<Ino> for WatchKey {
     }
 }
 
+/// Which view the ops of a tagged [`OpWatch`] handle belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewTag {
+    pub id: u64,
+    /// The view's full label map (`ViewSpec::labels`).
+    pub labels: BTreeMap<String, String>,
+}
+
 /// One op in flight.
 struct Entry {
     id: u64,
+    view: Option<Arc<ViewTag>>,
     op: &'static str,
     key: WatchKey,
     thread: ThreadRef,
@@ -143,6 +159,7 @@ pub fn backtraces_from_env() -> bool {
 #[derive(Clone)]
 pub struct OpWatch {
     inner: Arc<Registry>,
+    view: Option<Arc<ViewTag>>,
 }
 
 impl OpWatch {
@@ -187,6 +204,7 @@ impl OpWatch {
 
     fn with_registry(label: &'static str, threshold: Duration, backtraces: bool) -> Self {
         Self {
+            view: None,
             inner: Arc::new(Registry {
                 label,
                 next: AtomicU64::new(1),
@@ -199,6 +217,16 @@ impl OpWatch {
         }
     }
 
+    /// A handle to this registry whose ops belong to view `id` (with
+    /// `labels`): what a view registers its ops through. Replaces any tag
+    /// this handle had; the registry, counters and monitor stay shared.
+    pub fn for_view(&self, id: u64, labels: BTreeMap<String, String>) -> OpWatch {
+        OpWatch {
+            inner: self.inner.clone(),
+            view: Some(Arc::new(ViewTag { id, labels })),
+        }
+    }
+
     /// The label this watchdog was created with.
     pub fn label(&self) -> &'static str {
         self.inner.label
@@ -208,6 +236,7 @@ impl OpWatch {
         let r = &self.inner;
         let entry = Arc::new(Entry {
             id: r.next.fetch_add(1, Ordering::Relaxed),
+            view: self.view.clone(),
             op,
             key,
             thread: constellation_platform::native().process.current_thread(),
@@ -246,6 +275,41 @@ impl OpWatch {
         check(&self.inner);
     }
 
+    /// Every op in flight right now, oldest first (`node.ops`).
+    pub fn ops(&self) -> Vec<InFlightOp> {
+        // Copied out first, as `snapshot` does: every op's `enter` and
+        // drop takes this lock, so it is not held across the per-entry
+        // stage locks.
+        let active: Vec<Arc<Entry>> = self
+            .inner
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut ops: Vec<InFlightOp> = active
+            .iter()
+            .map(|e| InFlightOp {
+                op: e.op,
+                ino: e.key.ino(),
+                age: e.age(),
+                stage: e.stage(),
+                tid: e.thread.tid,
+                blocking: e.blocking,
+                stalled: e.stalled.load(Ordering::Relaxed),
+                view: e.view.clone(),
+            })
+            .collect();
+        ops.sort_by_key(|o| std::cmp::Reverse(o.age));
+        ops
+    }
+
+    /// The stall threshold this registry reports at.
+    pub fn threshold(&self) -> Duration {
+        self.inner.threshold
+    }
+
     /// The watchdog's view, for `status`.
     pub fn snapshot(&self) -> WatchSnapshot {
         let r = &self.inner;
@@ -266,6 +330,7 @@ impl OpWatch {
                 stage: e.stage(),
                 tid: e.thread.tid,
                 blocking: e.blocking,
+                view: e.view.as_ref().map(|v| v.id),
             })
             .collect();
         stalled_ops.sort_by_key(|r| std::cmp::Reverse(r.age_s));
@@ -320,6 +385,24 @@ pub struct StalledOp {
     pub tid: u64,
     /// A blocking lock request: unbounded by design, not a stall.
     pub blocking: bool,
+    /// The view (by id) the op belongs to, when its handle was tagged.
+    pub view: Option<u64>,
+}
+
+/// One op in flight, as [`OpWatch::ops`] lists it.
+#[derive(Debug, Clone)]
+pub struct InFlightOp {
+    pub op: &'static str,
+    pub ino: Ino,
+    pub age: Duration,
+    /// What the op last noted it was waiting on.
+    pub stage: &'static str,
+    pub tid: u64,
+    /// A blocking lock request: unbounded by design, not a stall.
+    pub blocking: bool,
+    /// The monitor has reported it as stalled.
+    pub stalled: bool,
+    pub view: Option<Arc<ViewTag>>,
 }
 
 /// A registered op; dropping it deregisters (drop it after the op's
@@ -590,5 +673,24 @@ mod tests {
         });
         assert_eq!(other.join().unwrap(), "session wait after a lock grant");
         assert_eq!(watch.snapshot().in_flight, 0);
+    }
+    #[test]
+    fn ops_are_attributed_to_the_view_whose_handle_registered_them() {
+        let watch = OpWatch::manual("test-watch", Duration::from_secs(30));
+        let labels: BTreeMap<String, String> = [("pv".to_string(), "pv-1".to_string())].into();
+        let one = watch.for_view(1, labels.clone());
+        let two = watch.for_view(2, BTreeMap::new());
+        let _a = one.enter("read", 5);
+        let _b = two.enter("lookup", 1);
+        let _c = watch.enter("getattr", 9);
+        // One registry: every handle sees every op.
+        assert_eq!(watch.snapshot().in_flight, 3);
+        let ops = two.ops();
+        assert_eq!(ops.len(), 3);
+        let of = |name: &str| ops.iter().find(|o| o.op == name).unwrap();
+        assert_eq!(of("read").view.as_deref(), Some(&ViewTag { id: 1, labels }));
+        assert_eq!(of("lookup").view.as_ref().map(|v| v.id), Some(2));
+        assert_eq!(of("getattr").view, None, "an untagged handle: no view");
+        assert!(ops.iter().all(|o| !o.stalled && !o.blocking));
     }
 }

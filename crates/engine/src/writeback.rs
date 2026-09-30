@@ -49,11 +49,28 @@ impl FromStr for WriteMode {
     }
 }
 
-pub struct WriteModeState(AtomicU8);
+/// The mount's write mode, and plan 31 C8's upload hold
+/// (`UploadMode::UnmeteredOnly` on a metered network), which makes every
+/// close that did not ask for durability behave as `back`: the close
+/// journals locally and leaves its chunks to the (held) background pass,
+/// instead of waiting for an upload the hold would never start.
+pub struct WriteModeState(AtomicU8, std::sync::atomic::AtomicBool);
 
 impl WriteModeState {
     pub fn new(mode: WriteMode) -> Self {
-        Self(AtomicU8::new(mode as u8))
+        Self(
+            AtomicU8::new(mode as u8),
+            std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    /// Plan 31 C8: uploads are held (see the type's docs).
+    pub fn set_upload_hold(&self, held: bool) {
+        self.1.store(held, Ordering::Relaxed);
+    }
+
+    pub fn upload_hold(&self) -> bool {
+        self.1.load(Ordering::Relaxed)
     }
 
     pub fn get(&self) -> WriteMode {
@@ -71,6 +88,8 @@ impl WriteModeState {
     pub fn effective(&self, explicit_sync: bool, open_sync: bool, fsync_s3: bool) -> WriteMode {
         if explicit_sync || open_sync || fsync_s3 {
             WriteMode::Through
+        } else if self.upload_hold() {
+            WriteMode::Back
         } else {
             self.get()
         }
@@ -154,6 +173,19 @@ mod tests {
         assert_eq!(state.effective(false, true, false), WriteMode::Through);
         assert_eq!(state.effective(false, false, true), WriteMode::Through);
         state.set(WriteMode::Through);
+        assert_eq!(state.effective(false, false, false), WriteMode::Through);
+    }
+
+    #[test]
+    fn the_upload_hold_makes_plain_closes_write_back_but_never_a_sync() {
+        let state = WriteModeState::new(WriteMode::Through);
+        state.set_upload_hold(true);
+        assert_eq!(state.effective(false, false, false), WriteMode::Back);
+        assert_eq!(state.effective(true, false, false), WriteMode::Through);
+        assert_eq!(state.effective(false, true, false), WriteMode::Through);
+        assert_eq!(state.effective(false, false, true), WriteMode::Through);
+        assert_eq!(state.get(), WriteMode::Through, "the configured mode stays");
+        state.set_upload_hold(false);
         assert_eq!(state.effective(false, false, false), WriteMode::Through);
     }
 

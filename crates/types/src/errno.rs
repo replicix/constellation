@@ -91,6 +91,14 @@ macro_rules! codes {
                 }
             }
 
+            /// The variant's own name (`"NotEmpty"`): a bounded, stable
+            /// spelling for metric labels and logs.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Code::$name => stringify!($name),)*
+                }
+            }
+
             /// The POSIX symbolic name (`"ENOTEMPTY"`), for diagnostics.
             pub const fn posix_name(self) -> &'static str {
                 match self {

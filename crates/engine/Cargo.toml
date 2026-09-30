@@ -60,3 +60,11 @@ constellation-vfs = { workspace = true, features = ["conformance"] }
 constellation-control = { workspace = true, features = ["web"] }
 tower = { version = "0.5", features = ["util"] }
 axum = "0.8"
+# `benches/vfs_bench.rs` (plan 31 C7): the VFS dispatch overhead and the
+# per-op allocation count. No plotting or parallel-analysis features: this
+# only measures.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "vfs_bench"
+harness = false

@@ -579,7 +579,9 @@ impl EngineControl {
                 }
             },
             fuse_requests: fuse_requests_status(&self.engine.op_watch().snapshot()),
+            lifecycle: self.engine.lifecycle().status(),
             s3: backend::s3_request_counts(),
+            vfs_ops: super::ops::vfs_ops_status(),
         }
     }
 

@@ -865,7 +865,8 @@ impl Core {
     /// escalated the tick that asks is armed.
     pub(crate) fn escalated(&mut self, now: Ms) -> bool {
         self.evaluate_escalation(now);
-        self.inbox.escalated_since.is_some()
+        // Plan 31 C8: a forward-only node never asks for the lease.
+        self.inbox.escalated_since.is_some() && !self.mode.forwards()
     }
 
     /// Arm the escalator's tick (from wherever an escalation can begin).

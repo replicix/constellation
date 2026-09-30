@@ -663,7 +663,9 @@ impl Core {
         let Some(policy) = self.clients.get(&rid).map(|c| c.policy) else {
             return;
         };
-        if !self.cfg.forwarding {
+        // Plan 31 C8: a forward-only node forwards whatever
+        // `CONSTELLATION_FORWARD` says.
+        if !self.cfg.forwarding && !self.mode.forwards() {
             self.lease_path(now, rid, replica, out);
             return;
         }
@@ -1493,7 +1495,7 @@ impl Core {
         }
         // Before re-asking S3, one more look at forwarding: the holder may
         // simply have changed (the lease read told us who).
-        if self.cfg.forwarding {
+        if self.cfg.forwarding || self.mode.forwards() {
             if let Some(holder) = self.lease.cached_holder {
                 if holder != self.cfg.node_id && self.reaches(now, holder) {
                     let c = self.clients.get_mut(&rid).expect("present");

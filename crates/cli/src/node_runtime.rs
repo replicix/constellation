@@ -222,7 +222,12 @@ impl NodeRuntime {
         if engine.on_phase.is_none() {
             engine.on_phase = Some(Arc::new(crate::startup::phase));
         }
-        let engine = engines.add_engine(fs_id, engine, host.clone(), EngineProfile::desktop())?;
+        // Plan 31 C8: the daemon is a desktop/server host; the environment
+        // may pick another profile (`EngineProfile::from_env`:
+        // `CONSTELLATION_PROFILE` and its per-mode overrides).
+        let profile =
+            EngineProfile::from_env(EngineProfile::desktop()).map_err(anyhow::Error::msg)?;
+        let engine = engines.add_engine(fs_id, engine, host.clone(), profile)?;
         let node = Arc::new(NodeRuntime {
             host,
             engines,

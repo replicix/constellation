@@ -184,6 +184,19 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
         "fuse_requests_stalled_total",
         status.fuse_requests.stalled_total,
     );
+    // The op metrics by name are labelled series (`/metrics`); a sample
+    // carries their stable totals.
+    let (ops, refused) = status
+        .vfs_ops
+        .series
+        .iter()
+        .fold((0, 0), |(all, bad), series| {
+            let total: u64 = series.outcomes.values().sum();
+            let ok = series.outcomes.get("ok").copied().unwrap_or(0);
+            (all + total, bad + total - ok)
+        });
+    c("vfs_ops_total", ops);
+    c("vfs_ops_refused_total", refused);
     let mut g = |name: &str, v: f64| {
         gauges.insert(format!("constellation_{name}"), v);
     };

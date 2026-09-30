@@ -303,6 +303,8 @@ pub struct Engine {
     shutdown_started: AtomicBool,
     /// Why the shutdown could not ship everything, when it could not.
     shutdown_error: Mutex<Option<String>>,
+    /// Plan 31 C8: the host's lifecycle events, applied.
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
 }
 
 impl Engine {
@@ -430,7 +432,10 @@ impl Engine {
             rt.block_on(shipper::rebuild_if_pruned(&meta, &log, &state_dir))
                 .context("checking the replica against the retained log")?;
         }
-        spawn_vacuum(&meta);
+        // Plan 31 C8: the node's background work pauses as the profile and
+        // the host's lifecycle say (`crate::lifecycle`).
+        let background = crate::lifecycle::BackgroundGate::new();
+        spawn_vacuum(&meta, &background);
         if matches!(meta.kv_get("left")?.as_deref(), Some("1")) {
             bail!(
                 "this state directory has permanently left the cluster \
@@ -681,6 +686,9 @@ impl Engine {
             tracing::info!("P2P off by the engine profile; using the S3 path only");
             constellation_net::Peers::disabled()
         };
+        // Plan 31 C8: a dial-only endpoint refuses inbound connections
+        // from before it serves any.
+        peers.set_dial_only(profile.p2p == crate::P2pMode::DialOnly);
         phase(
             &on_phase,
             "configuring the node (roster, designations, lease)",
@@ -695,12 +703,14 @@ impl Engine {
             let meta = meta.clone();
             let gc_peers = peers.clone();
             let gc_sync_tx = sync_tx.clone();
+            let background = background.clone();
             rt.spawn(async move {
                 let mut timer =
                     tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
                 timer.tick().await;
                 loop {
                     timer.tick().await;
+                    background.wait_active().await;
                     let tail = crate::gc::GcTail::Daemon(gc_sync_tx.clone());
                     if let Err(error) = crate::gc::run(
                         object_store.clone(),
@@ -732,12 +742,14 @@ impl Engine {
         let _completed_prune_task = {
             let meta = meta.clone();
             let prune_interval = (retention_s / 4).clamp(30, 3600);
+            let background = background.clone();
             rt.spawn(async move {
                 let mut timer =
                     tokio::time::interval(std::time::Duration::from_secs(prune_interval));
                 timer.tick().await;
                 loop {
                     timer.tick().await;
+                    background.wait_active().await;
                     let now_ms = constellation_store_s3::lease::now_unix_ms();
                     match meta.prune_completed(now_ms, retention_s as i64 * 1000) {
                         Ok(0) => {}
@@ -800,6 +812,7 @@ impl Engine {
             fsmeta.chunk_size,
         );
         coop.set_epoch_members(epochs.members_open.clone());
+        coop.set_background(background.clone());
         let upload = Arc::new(crate::upload::UploadRuntime::new(
             caps.create_if_absent,
             Some(coop.clone()),
@@ -867,6 +880,8 @@ impl Engine {
             }
         }
         core_config.strict_mounts = cto_strict;
+        // Plan 31 C8: `LeaseMode::ForwardOnly` from the first op on.
+        core_config.forward_only = profile.leases == crate::LeaseMode::ForwardOnly;
         // Plan 30 §M14: cluster locks need a P2P path to the sequencer.
         let locks_cluster = crate::locks::cluster_effective(locks, peers.is_enabled())?;
         core_config.locks = locks_cluster;
@@ -934,6 +949,7 @@ impl Engine {
             cache.clone(),
             Some(coop.clone()),
         ));
+        pins.set_background(background.clone());
         let reintegration = Arc::new(reintegrate::ReintegrationState::default());
         // Only a persisted deposition is known to be a stranded branch.
         // Ordinary crash-recovery journals must retain their existing
@@ -1091,10 +1107,12 @@ impl Engine {
                     meta.clone(),
                     sync_tx.clone(),
                 );
+                let background = background.clone();
                 rt.spawn(async move {
                     let mut tick: u64 = 0;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        background.wait_active().await;
                         let scan =
                             crate::p2p::refresh_peers(&peers, store_inner.clone(), Some(&epochs))
                                 .await;
@@ -1149,10 +1167,12 @@ impl Engine {
                 meta.clone(),
             );
             let sync_tx_roster = sync_tx.clone();
+            let background = background.clone();
             rt.spawn(async move {
                 let mut tick: u64 = 0;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    background.wait_active().await;
                     tick += 1;
                     if tick.is_multiple_of(SLACK_REREAD_TICKS) {
                         reread_slack(&store_inner, &sync_tx_roster).await;
@@ -1196,9 +1216,11 @@ impl Engine {
         {
             let designations = designations.clone();
             let deleg_tx = sync_tx.clone();
+            let background = background.clone();
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    background.wait_active().await;
                     designations.refresh().await;
                     // Plan 30 §M11 phase 2b: the root keeps the table in
                     // step with the designations (a no-op elsewhere).
@@ -1210,9 +1232,11 @@ impl Engine {
         if peers.is_enabled() {
             let (placement, peers, lease_view) =
                 (placement.clone(), peers.clone(), lease_view.clone());
+            let background = background.clone();
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    background.wait_active().await;
                     let status = lease_view.status();
                     if !(status.held && status.holder == node_id) || lease_view.is_lost() {
                         continue;
@@ -1247,10 +1271,12 @@ impl Engine {
                 sync_tx.clone(),
                 stop.clone(),
             );
+            let background = background.clone();
             rt.spawn(async move {
                 let period = crate::atime::flush_interval();
                 loop {
                     tokio::time::sleep(period).await;
+                    background.wait_active().await;
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -1283,11 +1309,13 @@ impl Engine {
             let sync_tx = sync_tx.clone();
             let prune_stats = prune_stats.clone();
             let last_sync_ms = last_sync_ms.clone();
+            let background = background.clone();
             rt.spawn(async move {
                 let mut timer = tokio::time::interval(crate::prune::interval());
                 timer.tick().await;
                 loop {
                     timer.tick().await;
+                    background.wait_active().await;
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -1344,7 +1372,37 @@ impl Engine {
                 coop.note_foreign_records(records);
             }));
         }
+        // Plan 31 C8: the host's lifecycle, applied from now on.
+        let lifecycle = crate::lifecycle::Lifecycle::new(
+            profile.clone(),
+            crate::lifecycle::LifecycleDeps {
+                sync_tx: sync_tx.clone(),
+                peers: peers.clone(),
+                upload: upload.clone(),
+                write_mode: write_mode.clone(),
+                meta: meta.clone(),
+                lease: lease_view.clone(),
+                core_status: core_status.clone(),
+                background,
+                rt: rt.clone(),
+            },
+        );
+        if profile.leases == crate::LeaseMode::ForwardOnly
+            || profile.p2p == crate::P2pMode::DialOnly
+            || profile.uploads == crate::UploadMode::UnmeteredOnly
+            || profile.background == crate::BackgroundMode::OnDemand
+        {
+            tracing::info!(
+                p2p = profile.p2p.as_str(),
+                leases = profile.leases.as_str(),
+                uploads = profile.uploads.as_str(),
+                background = profile.background.as_str(),
+                "engine profile"
+            );
+        }
+        lifecycle.spawn(&*host.lifecycle, stop.clone());
         Ok(Engine {
+            lifecycle,
             credentials,
             host,
             profile,
@@ -1614,6 +1672,7 @@ impl Engine {
         if let (Some(k), false) = (&self.kernel_inval, frozen) {
             k.register(id, events, view.view_root());
         }
+        self.lifecycle.register_view(id, Arc::downgrade(&view));
         self.views.lock().unwrap().insert(
             id,
             OpenView {
@@ -1641,6 +1700,7 @@ impl Engine {
         }
         self.lock_flushers.unregister(id);
         self.hold_sources.unregister(id);
+        self.lifecycle.unregister_view(id);
         self.holds.nudge();
         let (entry, now_empty) = {
             let mut views = self.views.lock().unwrap();
@@ -1665,6 +1725,7 @@ impl Engine {
             k.unregister(id);
         }
         self.lock_flushers.unregister(id);
+        self.lifecycle.unregister_view(id);
         self.views.lock().unwrap().remove(&id);
     }
 
@@ -2017,6 +2078,11 @@ impl Engine {
     pub fn credentials(&self) -> &Arc<CredentialSource> {
         &self.credentials
     }
+
+    /// Plan 31 C8: the host's lifecycle, as this engine applies it.
+    pub fn lifecycle(&self) -> &Arc<crate::lifecycle::Lifecycle> {
+        &self.lifecycle
+    }
 }
 
 /// How long an unmount's drain may go without shrinking the journal or
@@ -2137,8 +2203,9 @@ async fn reread_slack(
 /// Keep the churn keyspaces' tombstones bounded (`Meta::vacuum_churn`):
 /// checked every 10 s, on a thread of its own (a compaction blocks), for
 /// as long as the replica is open.
-fn spawn_vacuum(meta: &Arc<Meta>) {
+fn spawn_vacuum(meta: &Arc<Meta>, background: &Arc<crate::lifecycle::BackgroundGate>) {
     let weak = Arc::downgrade(meta);
+    let background = background.clone();
     let spawned = std::thread::Builder::new()
         .name("meta-vacuum".into())
         .spawn(move || loop {
@@ -2146,6 +2213,9 @@ fn spawn_vacuum(meta: &Arc<Meta>) {
             let Some(meta) = weak.upgrade() else {
                 return;
             };
+            if background.is_paused() {
+                continue;
+            }
             match meta.vacuum_churn() {
                 Ok(done) if !done.is_empty() => {
                     tracing::debug!(keyspaces = ?done, "vacuumed churn keyspaces")

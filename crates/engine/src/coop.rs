@@ -255,6 +255,9 @@ pub struct Coop {
     /// Who wrote the chunks of the manifests recently applied from
     /// other nodes ([`fresh`]).
     fresh: Mutex<fresh::FreshHints>,
+    /// Plan 31 C8: the digest publishers skip their ticks while the
+    /// node's background work is paused.
+    background: std::sync::OnceLock<Arc<crate::lifecycle::BackgroundGate>>,
 }
 
 /// [`Coop::offer`]'s claim: the chunks stay servable until it drops.
@@ -363,6 +366,7 @@ impl Coop {
             offered: Mutex::new(HashMap::new()),
             epoch_members: Mutex::new(None),
             fresh: Mutex::new(fresh::FreshHints::default()),
+            background: std::sync::OnceLock::new(),
         })
     }
 
@@ -403,6 +407,16 @@ impl Coop {
     /// Wire the epoch manager's member list (see `epoch_members`).
     pub fn set_epoch_members(&self, members: Arc<Mutex<Vec<u64>>>) {
         *self.epoch_members.lock().unwrap() = Some(members);
+    }
+
+    /// Plan 31 C8: pause the digest publishers with the node's other
+    /// background work.
+    pub fn set_background(&self, gate: Arc<crate::lifecycle::BackgroundGate>) {
+        let _ = self.background.set(gate);
+    }
+
+    fn background_paused(&self) -> bool {
+        self.background.get().is_some_and(|g| g.is_paused())
     }
 
     /// The other members of this node's open continuation epoch.
@@ -1276,6 +1290,9 @@ impl Coop {
         let mut last_summary: Option<Instant> = None;
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
+            if self.background_paused() {
+                continue;
+            }
             let started = Instant::now();
             let (_, absorbed) = self.drain_digest_events(true);
             self.note_digest_cpu(started);
@@ -1318,6 +1335,9 @@ impl Coop {
         let mut tracker = DigestTracker::default();
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
+            if self.background_paused() {
+                continue;
+            }
             let started = Instant::now();
             let (batch, _) = self.drain_digest_events(false);
             tracker.apply(batch);

@@ -315,6 +315,28 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Plan 31 C8: deliver a host lifecycle event to a running mount's
+    /// engine (`node.lifecycle`) and print what it did — how a desktop or
+    /// the harness exercises what a phone's OS drives: `foreground`,
+    /// `background`, `low-power`, `suspending --deadline-ms N` (every view
+    /// published, the journal shipped, the lease released, P2P quiet),
+    /// `resumed`, `network --reachable B --metered B`.
+    Lifecycle {
+        target: String,
+        /// foreground, background, low-power, suspending, resumed, network.
+        event: String,
+        /// `suspending`: how long until the host suspends the process.
+        #[arg(long, default_value_t = 10_000)]
+        deadline_ms: u64,
+        /// `network`: whether the network is reachable.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        reachable: bool,
+        /// `network`: whether it is metered.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        metered: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Get or set the cluster-wide logical size cap.
     Quota {
         #[command(subcommand)]
@@ -1312,6 +1334,33 @@ fn main() -> Result<()> {
                 },
                 print_ack,
             )
+        }
+        Command::Lifecycle {
+            target,
+            event,
+            deadline_ms,
+            reachable,
+            metered,
+            state_dir,
+        } => {
+            let event = match event.as_str() {
+                "foreground" => api::LifecycleEventSpec::Foreground,
+                "background" => api::LifecycleEventSpec::Background,
+                "low-power" => api::LifecycleEventSpec::LowPower,
+                "suspending" | "suspend" => api::LifecycleEventSpec::Suspending {
+                    deadline_in_ms: deadline_ms,
+                },
+                "resumed" | "resume" => api::LifecycleEventSpec::Resumed,
+                "network" => api::LifecycleEventSpec::NetworkChanged { reachable, metered },
+                other => bail!(
+                    "unknown lifecycle event {other:?}: expected foreground, background, \
+                     low-power, suspending, resumed or network"
+                ),
+            };
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            ctl::<cm::NodeLifecycle>(&rt, &dir, api::LifecycleParams { event }, |report| {
+                print_json(&report)
+            })
         }
         Command::Quota { command } => match command {
             QuotaCommand::Get { target, state_dir } => {

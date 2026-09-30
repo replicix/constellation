@@ -111,7 +111,7 @@ mod write_gate;
 
 pub use confine::LINK_DOMAIN_XATTR;
 pub use handoff::{HandleTableSnapshot, ViewHandoff};
-pub use spec::{ViewQos, ViewSpec, METRIC_LABELS};
+pub use spec::{metric_view_label, ViewQos, ViewSpec, METRIC_LABELS};
 
 #[cfg(test)]
 mod confine_tests;
@@ -432,6 +432,13 @@ impl View {
 
     pub(crate) fn set_id(&mut self, id: u64) {
         self.id = id;
+        self.tag_watch();
+    }
+
+    /// Register this view's ops with the watchdog under its id and
+    /// labels (`node.ops` attributes and filters by them).
+    fn tag_watch(&mut self) {
+        self.watch = self.watch.for_view(self.id, self.labels.clone());
     }
 
     /// Apply `spec`'s view options (labels, QoS, `confine_links`); the
@@ -440,6 +447,7 @@ impl View {
         self.confine_links = spec.confine_links;
         self.admission = admission::Admission::new(&spec.qos, &self.staging_budget);
         self.labels = spec.labels.clone();
+        self.tag_watch();
     }
 
     /// `ViewSpec::labels`.

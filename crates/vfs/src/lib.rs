@@ -19,6 +19,9 @@
 //!   [`PolicyStack`]): how frontend names/xattrs/principals become the
 //!   engine's, applied beneath the trait so no frontend repeats them.
 //! - [`OpWatch`]: the stalled-op watchdog every op registers with.
+//! - [`Observer`], [`metrics`]: an op id, a `vfs.op` span and the op
+//!   count/latency metrics (`constellation_vfs_ops_total`,
+//!   `constellation_vfs_op_seconds`), recorded when the responder completes.
 //! - [`VfsError`]: a portable [`constellation_types::Code`].
 
 pub mod caps;
@@ -27,9 +30,11 @@ pub mod conformance;
 pub mod ctx;
 pub mod error;
 pub mod events;
+pub mod metrics;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 pub mod name;
+pub mod observe;
 pub mod policy;
 pub mod responder;
 pub mod types;
@@ -40,7 +45,9 @@ pub use caps::{Cap, CasePolicy, FrontendCaps, OpenUnlinked, PushInval, XattrSupp
 pub use ctx::{Caller, CancelToken, OpCtx, OpId, OpKind, OpKindSet, Principal};
 pub use error::{VfsError, VfsResult};
 pub use events::{FrontendEvents, Invalidation};
+pub use metrics::{OpMetrics, OpSeries, Timed};
 pub use name::{Name, NameBuf, XattrName, XattrNameBuf};
+pub use observe::{ObservedOp, Observer, ViewIdentity};
 pub use policy::{IdentityMap, NamePolicy, PolicyStack, XattrPolicy, NAME_MAX};
 pub use responder::{
     Blocking, BlockingWait, CollectDir, DirEntry, DirSink, FnResponder, Responder,

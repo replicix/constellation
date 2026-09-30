@@ -372,6 +372,7 @@ impl Core {
             || self.lease.epoch_held()
             || self.epoch.open
             || self.retired()
+            || self.mode.forwards()
             || now < self.readopt_refused_until
         {
             return false;

@@ -259,6 +259,11 @@ pub enum Control {
     /// designee)`; the root delegates the new ones (designated) and
     /// recalls the released ones. Answered `Done` at once.
     SyncDesignations { entries: Vec<(Ino, NodeId)> },
+    /// Plan 31 C8: how this node may take authority from now on — the
+    /// engine profile's `LeaseMode::ForwardOnly` (`forward_only`), and a
+    /// host suspension (`suspended`, from `Suspending` until `Resumed`).
+    /// Answered `Done` at once; see [`crate::AuthorityMode`].
+    Authority { forward_only: bool, suspended: bool },
 }
 
 /// Plan 30 §M10: the lease a continuation epoch carries, exactly as the

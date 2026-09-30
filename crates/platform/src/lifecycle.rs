@@ -7,7 +7,8 @@
 //! the `node.lifecycle` control method in C8, so the harness can exercise
 //! the engine's suspend/resume path on Linux ahead of any mobile port. What
 //! the engine does on each event (sync every view, release leases,
-//! quiesce P2P on `Suspending`) is C8's; this module only delivers them.
+//! quiesce P2P on `Suspending`) is `constellation_engine::lifecycle`'s;
+//! this module only delivers them.
 
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -60,6 +61,14 @@ pub trait LifecycleSource: Send + Sync {
     /// a queue per subscriber: a slow consumer never blocks the source or
     /// another subscriber.
     fn subscribe(&self) -> Subscription;
+
+    /// The source as a [`ManualLifecycle`], when events are pushed into it
+    /// rather than read from the OS: what `node.lifecycle` injects into.
+    /// `None` for a real OS source (plan 36's Android one), whose events
+    /// only the OS decides.
+    fn manual(&self) -> Option<&ManualLifecycle> {
+        None
+    }
 }
 
 /// A [`LifecycleSource`] whose events are whatever [`ManualLifecycle::push`]
@@ -91,6 +100,10 @@ impl LifecycleSource for ManualLifecycle {
             .unwrap_or_else(|p| p.into_inner())
             .push(tx);
         Subscription { rx }
+    }
+
+    fn manual(&self) -> Option<&ManualLifecycle> {
+        Some(self)
     }
 }
 
@@ -125,6 +138,16 @@ mod tests {
             // The event pushed before subscribing is not replayed.
             assert_eq!(sub.try_recv(), None);
         }
+    }
+
+    #[test]
+    fn a_manual_source_is_reachable_through_the_trait() {
+        let source: std::sync::Arc<dyn LifecycleSource> =
+            std::sync::Arc::new(ManualLifecycle::new());
+        let sub = source.subscribe();
+        let manual = source.manual().expect("a manual source");
+        assert_eq!(manual.push(LifecycleEvent::Foreground), 1);
+        assert_eq!(sub.try_recv(), Some(LifecycleEvent::Foreground));
     }
 
     #[test]

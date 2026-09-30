@@ -3050,6 +3050,131 @@
       ],
       "type": "object"
     },
+    "LifecycleReport": {
+      "description": "`node.lifecycle`'s answer: the event, applied, and the lifecycle it\nleft (with the suspension's or resumption's own report).",
+      "properties": {
+        "applied": {
+          "description": "The engine applied it before this answer (false: still applying\nwell past a suspension's deadline). Lifecycle events are the\nhost's, so an `EngineHost` delivers each to all its engines.",
+          "type": "boolean"
+        },
+        "event": {
+          "$ref": "#/$defs/LifecycleEventSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/LifecycleStatus"
+        }
+      },
+      "required": [
+        "event",
+        "applied",
+        "status"
+      ],
+      "type": "object"
+    },
+    "LifecycleStatus": {
+      "description": "Plan 31 C8: the engine's lifecycle, as `node.status` reports it and\n`node.lifecycle` answers: the profile it runs, what the host last said,\nand what is in force because of both.",
+      "properties": {
+        "background_paused": {
+          "default": false,
+          "description": "In force: GC, prune, digests, pin refreshes, registry and\ndesignation polls are paused.",
+          "type": "boolean"
+        },
+        "events": {
+          "default": 0,
+          "description": "Lifecycle events applied since the engine started, and the last.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "forward_only": {
+          "default": false,
+          "description": "In force: the authority core never takes the lease from a live\nholder (the profile's `forward-only`, or a suspension).",
+          "type": "boolean"
+        },
+        "last_event": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_resume": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResumeReport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "last_suspend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SuspendReport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "low_power": {
+          "default": false,
+          "description": "The host asked for reduced background work (until the next\n`Foreground` or `Resumed`).",
+          "type": "boolean"
+        },
+        "network_metered": {
+          "default": false,
+          "type": "boolean"
+        },
+        "network_reachable": {
+          "default": false,
+          "description": "The last `NetworkChanged` (reachable and unmetered until one says\notherwise).",
+          "type": "boolean"
+        },
+        "p2p_accepts_inbound": {
+          "default": false,
+          "description": "The P2P endpoint admits inbound connections / takes part in\ngossip (both false without P2P; a suspension refuses both, and\nonly this node's own requests dial out).",
+          "type": "boolean"
+        },
+        "p2p_gossip": {
+          "default": false,
+          "type": "boolean"
+        },
+        "profile": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "The engine profile's modes: `p2p` (`listen`/`dial-only`/`off`),\n`leases` (`hold`/`forward-only`), `uploads`\n(`always`/`unmetered-only`), `background`\n(`continuous`/`on-demand`).",
+          "type": "object"
+        },
+        "state": {
+          "default": "",
+          "description": "`foreground`, `background`, `suspending` or `suspended`.",
+          "type": "string"
+        },
+        "suspended": {
+          "default": false,
+          "description": "In force: the core takes no lease at all (a suspension).",
+          "type": "boolean"
+        },
+        "upload_deferrals": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "uploads_held": {
+          "default": false,
+          "description": "In force: opportunistic chunk uploads hold (`unmetered-only` on a\nmetered network), and how often the hold deferred one.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "LockStatus": {
       "description": "Plan 30 §M14: `--locks cluster` — lock grants leased from the\nowning sequencer.",
       "properties": {
@@ -3596,6 +3721,63 @@
       ],
       "type": "object"
     },
+    "OpEntry": {
+      "description": "One operation in flight, as `node.ops` lists it.",
+      "properties": {
+        "age_s": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "blocking": {
+          "default": false,
+          "description": "A blocking lock request: unbounded by design, not a stall.",
+          "type": "boolean"
+        },
+        "ino": {
+          "description": "The inode it is about (0: a view-wide operation).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "op": {
+          "type": "string"
+        },
+        "stage": {
+          "description": "What the handler last noted it was waiting on.",
+          "type": "string"
+        },
+        "stalled": {
+          "default": false,
+          "description": "The watchdog has reported it as stalled.",
+          "type": "boolean"
+        },
+        "tid": {
+          "description": "The OS thread handling it.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "view": {
+          "default": null,
+          "description": "The view (by id) it belongs to.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op",
+        "ino",
+        "age_s",
+        "stage",
+        "tid"
+      ],
+      "type": "object"
+    },
     "OpsParams": {
       "description": "`node.ops` (plan 31 §6.10): the operation watchdog's registry.",
       "properties": {
@@ -3611,7 +3793,7 @@
         },
         "view": {
           "default": null,
-          "description": "Only this view's operations.",
+          "description": "Only this view's operations (by id, as `view.list` shows it).",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -3623,28 +3805,50 @@
       "type": "object"
     },
     "OpsReport": {
-      "description": "`node.ops`'s result.",
+      "description": "`node.ops`'s result: the operations in flight (at least `min_age_s`\nold, of `view` if named), oldest first, and the same per view.",
       "properties": {
         "in_flight": {
+          "description": "Operations in flight (after the filters).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "oldest_s": {
+          "description": "The age of the oldest non-blocking one.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "ops": {
+          "description": "The operations, oldest first, at most `OPS_LIST_MAX` of them\n(`truncated` says whether there were more).",
           "items": {
-            "$ref": "#/$defs/StalledFuseRequest"
+            "$ref": "#/$defs/OpEntry"
           },
           "type": "array"
         },
-        "stalled": {
+        "stall_threshold_s": {
+          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "stalled": {
+          "description": "Of them, reported as stalled (older than `stall_threshold_s`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "default": false,
+          "type": "boolean"
+        },
+        "views": {
+          "default": [],
+          "description": "Per view (by id), with its labels; operations of no view are under\n`view: null`. Counts cover all matching operations, not only the\nlisted ones.",
+          "items": {
+            "$ref": "#/$defs/ViewOps"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -4479,6 +4683,30 @@
       "required": [
         "from",
         "to"
+      ],
+      "type": "object"
+    },
+    "ResumeReport": {
+      "description": "What a `Resumed` did.",
+      "properties": {
+        "elapsed_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p2p_resumed": {
+          "description": "The P2P endpoint admits connections again and re-dialed its peers.",
+          "type": "boolean"
+        },
+        "was_suspended": {
+          "description": "The engine was suspended (a `Resumed` without one changes nothing).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "elapsed_ms",
+        "was_suspended",
+        "p2p_resumed"
       ],
       "type": "object"
     },
@@ -5485,6 +5713,28 @@
           },
           "description": "Write authority for the one metadata stream (`p0`)."
         },
+        "lifecycle": {
+          "$ref": "#/$defs/LifecycleStatus",
+          "default": {
+            "background_paused": false,
+            "events": 0,
+            "forward_only": false,
+            "last_event": null,
+            "last_resume": null,
+            "last_suspend": null,
+            "low_power": false,
+            "network_metered": false,
+            "network_reachable": false,
+            "p2p_accepts_inbound": false,
+            "p2p_gossip": false,
+            "profile": {},
+            "state": "",
+            "suspended": false,
+            "upload_deferrals": 0,
+            "uploads_held": false
+          },
+          "description": "Plan 31 C8: the engine profile and the host's lifecycle."
+        },
         "locks": {
           "$ref": "#/$defs/LockStatus",
           "default": {
@@ -5726,6 +5976,14 @@
           "description": "Running binary version (`git describe` / package version).",
           "type": "string"
         },
+        "vfs_ops": {
+          "$ref": "#/$defs/VfsOpsStatus",
+          "default": {
+            "bucket_bounds_s": [],
+            "series": []
+          },
+          "description": "The unified op metrics (plan 31 §6.10) `/metrics` exports as\n`constellation_vfs_ops_total` and `constellation_vfs_op_seconds`."
+        },
         "writeback": {
           "$ref": "#/$defs/WritebackStatus",
           "default": {
@@ -5780,6 +6038,88 @@
       ],
       "type": "object"
     },
+    "SuspendReport": {
+      "description": "What a `Suspending` achieved by its deadline.",
+      "properties": {
+        "deadline_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "elapsed_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "flush_error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flushed": {
+          "description": "The flush — every pending chunk up, the journal shipped, the lease\nreleased — finished; why not, when it did not.",
+          "type": "boolean"
+        },
+        "journal_backlog": {
+          "description": "What is left for after the resume (0 and 0 after a clean flush).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lease_released": {
+          "description": "This node held no lease once the steps ran.",
+          "type": "boolean"
+        },
+        "p2p_connections_closed": {
+          "description": "P2P connections closed by the quiesce.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pending_uploads": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "view_errors": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "views": {
+          "description": "Views open, and published by their `sync_view` barrier; one line\nper view that failed or did not finish in time.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "views_synced": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "within_deadline": {
+          "description": "Every step finished before the deadline.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "deadline_ms",
+        "elapsed_ms",
+        "within_deadline",
+        "views",
+        "views_synced",
+        "flushed",
+        "lease_released",
+        "journal_backlog",
+        "pending_uploads",
+        "p2p_connections_closed"
+      ],
+      "type": "object"
+    },
     "UnlockCredentials": {
       "description": "Runtime credentials for `fs.unlock` (plan 31 §9.8). Every field is a\n[`Secret`]; the daemon holds them in memory only.",
       "properties": {
@@ -5826,6 +6166,79 @@
             }
           ],
           "default": null
+        }
+      },
+      "type": "object"
+    },
+    "VfsOpSeries": {
+      "description": "One (frontend, view, op) of [`VfsOpsStatus`].",
+      "properties": {
+        "buckets": {
+          "default": [],
+          "description": "Ops per latency bucket (not cumulative): one more than\n`bucket_bounds_s`, the last being `+Inf`.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "frontend": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string"
+        },
+        "outcomes": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Ops per outcome: `ok`, or a `Code` name (`NotFound`, ...).",
+          "type": "object"
+        },
+        "sum_ns": {
+          "default": 0,
+          "description": "The latencies' sum, nanoseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "view": {
+          "default": null,
+          "description": "The view's allowlisted metric label; absent for a view with none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "frontend",
+        "op"
+      ],
+      "type": "object"
+    },
+    "VfsOpsStatus": {
+      "description": "Every frontend op counted so far, per (frontend, view, op): the numbers\nbehind `constellation_vfs_ops_total{frontend,view,op,outcome}` and the\n`constellation_vfs_op_seconds{frontend,view,op}` histogram. Only series\nwith something counted are present; `view` is the allowlisted metric\nlabel of a view (plan 31 §9.10), never its full label map.",
+      "properties": {
+        "bucket_bounds_s": {
+          "default": [],
+          "description": "The histogram's bucket upper bounds, seconds, ascending; each\nseries' last bucket is `+Inf`.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "series": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/VfsOpSeries"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -5938,6 +6351,49 @@
       "required": [
         "subtree",
         "source"
+      ],
+      "type": "object"
+    },
+    "ViewOps": {
+      "description": "One view's share of `node.ops`.",
+      "properties": {
+        "in_flight": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "The view's full label map (`view.list`'s).",
+          "type": "object"
+        },
+        "oldest_s": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stalled": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "view": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "in_flight",
+        "stalled",
+        "oldest_s"
       ],
       "type": "object"
     },
@@ -6714,7 +7170,7 @@
         "$ref": "#/$defs/LifecycleParams"
       },
       "result": {
-        "$ref": "#/$defs/Ack"
+        "$ref": "#/$defs/LifecycleReport"
       },
       "streaming": "none"
     },

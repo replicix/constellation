@@ -42,6 +42,9 @@ pub struct PinManager {
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
     coop: Option<Arc<crate::coop::Coop>>,
+    /// Plan 31 C8: refreshes skip while background work is paused (the
+    /// next round after it resumes refreshes).
+    background: std::sync::OnceLock<Arc<crate::lifecycle::BackgroundGate>>,
 }
 
 impl PinManager {
@@ -56,7 +59,13 @@ impl PinManager {
             store,
             cache,
             coop,
+            background: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Plan 31 C8: pause refreshes with the node's other background work.
+    pub fn set_background(&self, gate: Arc<crate::lifecycle::BackgroundGate>) {
+        let _ = self.background.set(gate);
     }
 
     /// The chunk store this node reads/writes through — reused by the
@@ -208,6 +217,9 @@ impl PinManager {
     /// so a peer's write under a pinned path becomes locally resident
     /// without waiting for someone to read it.
     pub async fn refresh_all(&self) {
+        if self.background.get().is_some_and(|g| g.is_paused()) {
+            return;
+        }
         for (path, ino) in self.meta.pins().unwrap_or_default() {
             match self.footprint(ino).await {
                 Ok(fp) => {

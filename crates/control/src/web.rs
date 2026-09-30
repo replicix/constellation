@@ -9,7 +9,7 @@
 //! | `POST /api` | `{"method": "...", "params": {...}}` → `{"ok": result}` or, with a 4xx/5xx status, `{"error": ControlError}`; a chunked method's body is its bytes, a subscription's an NDJSON stream of events |
 //! | `GET /api/status` | `node.status`'s report itself (what the UI polls) |
 //! | `GET /api/download?path=` | a file's bytes (`browse.stat` + `browse.read`), streamed |
-//! | `GET /metrics` | Prometheus gauges from `node.status` |
+//! | `GET /metrics` | Prometheus gauges from `node.status`, and its `vfs_ops` as the `constellation_vfs_ops_total` counter and `constellation_vfs_op_seconds` histogram |
 //! | `GET /`, `GET /{*path}` | the embedded UI (`webui/`) |
 //!
 //! Every call goes through [`dispatch_in_process`] /
@@ -42,7 +42,7 @@
 
 use crate::authz::Principal;
 use crate::methods::{method_info, NodeStatus, StreamKind};
-use crate::proto::types::{FileStat, StatusReport};
+use crate::proto::types::{FileStat, StatusReport, VfsOpSeries, VfsOpsStatus};
 use crate::proto::{ControlError, ErrorKind};
 use crate::server::{
     dispatch_in_process, dispatch_stream_in_process, DispatchOptions, Router, StreamItem,
@@ -759,7 +759,87 @@ pub fn render_metrics(status: &StatusReport) -> String {
         "Prune passes refused because the replica was too stale.",
         status.prune.refused_lag
     );
+    render_vfs_ops(&mut output, &status.vfs_ops);
     output
+}
+
+/// A Prometheus label value: backslash, quote and newline escaped.
+fn label_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The unified op metrics (plan 31 §6.10) as a counter and a histogram:
+/// `constellation_vfs_ops_total{frontend,view,op,outcome}` and
+/// `constellation_vfs_op_seconds{frontend,view,op}`. `view` (the
+/// allowlisted metric label of a view, plan 31 §9.10) is left out for a
+/// view that has none.
+fn render_vfs_ops(output: &mut String, ops: &VfsOpsStatus) {
+    use std::fmt::Write;
+    output.push_str(
+        "# HELP constellation_vfs_ops_total Frontend operations completed, by outcome (ok or the error code's name).\n\
+         # TYPE constellation_vfs_ops_total counter\n",
+    );
+    let labels = |s: &VfsOpSeries| {
+        let mut l = format!("frontend=\"{}\"", label_value(&s.frontend));
+        if let Some(view) = &s.view {
+            let _ = write!(l, ",view=\"{}\"", label_value(view));
+        }
+        let _ = write!(l, ",op=\"{}\"", label_value(&s.op));
+        l
+    };
+    for series in &ops.series {
+        let l = labels(series);
+        for (outcome, n) in &series.outcomes {
+            let _ = writeln!(
+                output,
+                "constellation_vfs_ops_total{{{l},outcome=\"{}\"}} {n}",
+                label_value(outcome)
+            );
+        }
+    }
+    output.push_str(
+        "# HELP constellation_vfs_op_seconds Frontend operation latency, from the request's arrival to its completion.\n\
+         # TYPE constellation_vfs_op_seconds histogram\n",
+    );
+    for series in &ops.series {
+        let l = labels(series);
+        let mut cumulative = 0u64;
+        for (i, n) in series.buckets.iter().enumerate() {
+            cumulative += n;
+            match ops.bucket_bounds_s.get(i) {
+                Some(bound) => {
+                    let _ = writeln!(
+                        output,
+                        "constellation_vfs_op_seconds_bucket{{{l},le=\"{bound}\"}} {cumulative}"
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        output,
+                        "constellation_vfs_op_seconds_bucket{{{l},le=\"+Inf\"}} {cumulative}"
+                    );
+                }
+            }
+        }
+        let _ = writeln!(
+            output,
+            "constellation_vfs_op_seconds_sum{{{l}}} {}",
+            series.sum_ns as f64 / 1e9
+        );
+        let _ = writeln!(
+            output,
+            "constellation_vfs_op_seconds_count{{{l}}} {cumulative}"
+        );
+    }
 }
 
 async fn index() -> HttpResponse {
@@ -892,5 +972,45 @@ mod tests {
             get_root(&[("host", "localhost"), ("origin", "http://localhost:8080")]).await,
             StatusCode::OK
         );
+    }
+    #[test]
+    fn vfs_op_metrics_render_as_a_counter_and_a_cumulative_histogram() {
+        let ops = VfsOpsStatus {
+            bucket_bounds_s: vec![0.00001, 0.5],
+            series: vec![
+                VfsOpSeries {
+                    frontend: "fuse".into(),
+                    view: Some("pv-\"1\"".into()),
+                    op: "getattr".into(),
+                    outcomes: [("NotFound".to_string(), 1), ("ok".to_string(), 2)].into(),
+                    buckets: vec![1, 1, 1],
+                    sum_ns: 1_500_000_000,
+                },
+                VfsOpSeries {
+                    frontend: "fuse".into(),
+                    view: None,
+                    op: "read".into(),
+                    outcomes: [("ok".to_string(), 1)].into(),
+                    buckets: vec![1, 0, 0],
+                    sum_ns: 5_000,
+                },
+            ],
+        };
+        let mut out = String::new();
+        render_vfs_ops(&mut out, &ops);
+        for line in [
+            "# TYPE constellation_vfs_ops_total counter",
+            "constellation_vfs_ops_total{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",outcome=\"ok\"} 2",
+            "constellation_vfs_ops_total{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",outcome=\"NotFound\"} 1",
+            "constellation_vfs_ops_total{frontend=\"fuse\",op=\"read\",outcome=\"ok\"} 1",
+            "# TYPE constellation_vfs_op_seconds histogram",
+            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",op=\"read\",le=\"0.00001\"} 1",
+            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",le=\"0.5\"} 2",
+            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",le=\"+Inf\"} 3",
+            "constellation_vfs_op_seconds_sum{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\"} 1.5",
+            "constellation_vfs_op_seconds_count{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\"} 3",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+        }
     }
 }

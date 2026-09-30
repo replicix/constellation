@@ -400,4 +400,18 @@ pub enum SyncRequest {
     Shutdown {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Plan 31 C8: how this node may take write authority from now on
+    /// (`constellation_authority::AuthorityMode`: the profile's
+    /// `LeaseMode::ForwardOnly`, and a host suspension).
+    Authority {
+        forward_only: bool,
+        suspended: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Plan 31 C8: a suspension's flush — every pending chunk up, the
+    /// journal shipped, a commit published if the holder, the lease
+    /// released — without stopping (`Control::Flush`, as `leave` uses).
+    Flush {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
