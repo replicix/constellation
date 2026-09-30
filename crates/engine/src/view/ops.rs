@@ -967,10 +967,37 @@ impl Vfs for View {
             r.done(err(Code::Io));
             return;
         }
-        match self.do_read(ino, off, len as u64) {
-            Ok(data) => r.done(Ok(ReadData::from_vec(data))),
-            Err(e) => r.done(err(e)),
+        // A cold read defers to the completion pool (`io`'s module doc).
+        let Some(view) = self.read_deferral() else {
+            match self.do_read(ino, off, len as u64) {
+                Ok(data) => r.done(Ok(ReadData::from_vec(data))),
+                Err(e) => r.done(err(e)),
+            }
+            return;
+        };
+        if let Some(result) = super::io::cold_probe::inline(|| self.do_read(ino, off, len as u64)) {
+            match result {
+                Ok(data) => r.done(Ok(ReadData::from_vec(data))),
+                Err(e) => r.done(err(e)),
+            }
+            return;
         }
+        // The op's registrations travel with it and end with its answer:
+        // the watchdog entry (named on the pool thread's stages), the
+        // kernel-invalidation hold-back, the view's admission slot.
+        let admitted = _admitted.defer();
+        let (watch, inflight) = (_w, _inflight);
+        crate::completion::CompletionPool::global().submit(move || {
+            watch.adopt();
+            let result = view.do_read(ino, off, len as u64);
+            match result {
+                Ok(data) => r.done(Ok(ReadData::from_vec(data))),
+                Err(e) => r.done(err(e)),
+            }
+            drop(inflight);
+            view.admission.leave_deferred(admitted);
+            drop(watch);
+        });
     }
 
     fn write<R: Responder<u32>>(

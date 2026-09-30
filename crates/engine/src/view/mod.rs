@@ -364,6 +364,11 @@ pub struct View {
     /// The engine's number for this view (`Engine::open_view`; 0 for a
     /// view built outside an engine).
     id: u64,
+    /// This view's own `Arc`, once an engine opened it ([`View::bind`]):
+    /// what a deferred op (a cold read, `io`'s `defer_cold_read`) carries to
+    /// the completion pool. Unset (a view built outside an engine, in unit
+    /// tests), nothing defers.
+    this: std::sync::OnceLock<std::sync::Weak<View>>,
 }
 
 fn staging_code(e: &crate::staging::StagingError) -> Code {
@@ -422,7 +427,15 @@ impl View {
             admission: admission::Admission::default(),
             labels: Default::default(),
             id: 0,
+            this: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Let this view's ops defer to the engine's completion pool
+    /// (`crate::completion`): they need the view's `Arc` to outlive the
+    /// frontend thread that called them. `Engine::open_view` calls it.
+    pub(crate) fn bind(self: &Arc<Self>) {
+        let _ = self.this.set(Arc::downgrade(self));
     }
 
     /// The engine's number for this view.

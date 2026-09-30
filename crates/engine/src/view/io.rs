@@ -1,7 +1,114 @@
 //! A write session's data path: read, write, truncate, `fallocate`,
 //! `SEEK_DATA`/`SEEK_HOLE`.
+//!
+//! # Cold reads defer (plan 31 §6.3, C7b)
+//!
+//! A read is first tried on the frontend's thread with [`cold_probe`]
+//! armed: served entirely from local state (the disk cache, the write
+//! session) it completes there, exactly as before. The moment it would
+//! have to *wait* for a chunk — a prefetch in flight, a forwarded chunk,
+//! a peer or S3 — the fetch refuses instead, the attempt unwinds (its
+//! inode lock released, its session reattached), and the whole read runs
+//! again on the engine's completion pool (`crate::completion`), which
+//! answers the responder. The frontend thread is free at once. What the
+//! inline attempt did before it stopped is idempotent (readahead's stream
+//! cursor, the atime bump), so the second run repeats it harmlessly.
+//!
+//! Only a frontend that can answer from another thread
+//! (`FrontendCaps::deferrable` holds `Read`) defers; for any other, and
+//! with `CONSTELLATION_DEFER_COLD_READS=0`, the read waits on the calling
+//! thread as it always did. The two runs are separate critical sections
+//! of the inode's op lock: a write that arrives in between is ordered
+//! before the read, which is a valid order for two requests the kernel had
+//! in flight at once (a single thread's next request waits for this one's
+//! answer).
 
 use super::*;
+
+/// See the module doc.
+pub(super) mod cold_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// A read is being tried inline, with deferral allowed.
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        /// ... and it reached a fetch that would wait.
+        static TRIPPED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Run `read` with fetches that would wait refused. `None`: it tripped
+    /// (defer it); `Some`: it completed from local state.
+    pub(in crate::view) fn inline<T>(read: impl FnOnce() -> T) -> Option<T> {
+        /// Disarms even if `read` panics (the thread serves other ops).
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                ARMED.with(|a| a.set(false));
+            }
+        }
+        ARMED.with(|a| a.set(true));
+        TRIPPED.with(|t| t.set(false));
+        let out = {
+            let _disarm = Disarm;
+            read()
+        };
+        if TRIPPED.with(|t| t.replace(false)) {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    /// At a fetch that would wait: refuse (and remember it) if a read is
+    /// being tried inline on this thread.
+    pub(in crate::view) fn refuse() -> bool {
+        if ARMED.with(Cell::get) {
+            TRIPPED.with(|t| t.set(true));
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The share of the chunk cache that dirty (not yet uploaded) chunks may
+/// take before writers are throttled and then refused: all of it, less
+/// `CONSTELLATION_CACHE_READ_RESERVE_PCT` percent (default 0, clamped to
+/// 90) kept for clean chunks — reads and readahead.
+///
+/// Plan 31 C7b measured the case this is for (Mountpoint's reserved
+/// prunable share): with a 128 MiB cache, 1 MiB chunks and uploads capped
+/// at 4 MB/s, a writer holds the cache at its dirty limit and a
+/// concurrent cold sequential reader falls from ~110 MiB/s to ~12 MiB/s —
+/// every prefetched and demand-fetched chunk finds no room and is fetched
+/// again for the next 128 KiB kernel read (with a 2 GiB cache the same
+/// writer costs the reader ~2x, not ~9x). A reserve lets the reader keep
+/// its chunks, at the price of throttling writers earlier; it is off by
+/// default because it moves where a small cache refuses writes
+/// (`ENOSPC` backpressure), which existing deployments tune against.
+pub(super) fn dirty_budget(budget: u64) -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let pct = *PCT.get_or_init(|| {
+        std::env::var("CONSTELLATION_CACHE_READ_RESERVE_PCT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(90)
+    });
+    budget - budget / 100 * pct
+}
+
+/// `CONSTELLATION_DEFER_COLD_READS` (default on): `0`/`false`/`off` keeps
+/// every read on the frontend's thread.
+pub(super) fn defer_cold_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("CONSTELLATION_DEFER_COLD_READS").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
 
 impl View {
     pub(super) fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, Code> {
@@ -18,6 +125,46 @@ impl View {
             self.writes.reattach(ino, ws);
         }
         result
+    }
+
+    /// This view's `Arc`, when a read may defer to the completion pool:
+    /// the frontend allows it, the view was opened by an engine, and
+    /// deferral is not turned off.
+    pub(super) fn read_deferral(&self) -> Option<Arc<View>> {
+        if !self
+            .caps
+            .deferrable
+            .contains(constellation_vfs::OpKind::Read)
+            || !defer_cold_reads()
+        {
+            return None;
+        }
+        self.this.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Drop `ino`'s committed chunks from the local disk cache, once they
+    /// are durable in the store, so the next read of them is cold (the
+    /// conformance kit's `evict` hook, and tests). Returns how many were
+    /// dropped. Chunks not yet uploaded are left alone and counted as an
+    /// error: evicting them would lose data.
+    pub fn evict_cached(&self, ino: Ino) -> Result<usize, String> {
+        let ino = self.real_ino(ino);
+        self.drain_inode(ino)
+            .map_err(|code| format!("draining {ino}: {code:?}"))?;
+        let manifest = self.load_manifest(ino).map_err(|c| format!("{c:?}"))?;
+        let hashes = self.chunk_list(&manifest).map_err(|c| format!("{c:?}"))?;
+        let mut dropped = 0;
+        for hash in hashes.values() {
+            match self.cache.state_of(hash) {
+                Some(ChunkState::Clean) => {
+                    self.cache.remove(hash).map_err(|e| e.to_string())?;
+                    dropped += 1;
+                }
+                None | Some(ChunkState::Pinned) => {}
+                Some(state) => return Err(format!("chunk {} is {state:?}", hash.to_hex())),
+            }
+        }
+        Ok(dropped)
     }
 
     pub(super) fn do_read_detached(
@@ -130,7 +277,7 @@ impl View {
             return Ok(0);
         }
         let dirty = self.cache.dirty_bytes();
-        let budget = self.cache.usage().budget;
+        let budget = dirty_budget(self.cache.usage().budget);
         match crate::writeback::throttle_delay(dirty, budget) {
             Ok(delay) if !delay.is_zero() => {
                 constellation_vfs::watch::stage("writeback throttle (dirty cache)");

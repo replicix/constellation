@@ -106,6 +106,17 @@ pub(crate) struct Admission {
 /// An admitted op: leaves the gate when dropped (after the op answered).
 pub(crate) struct Admitted<'a>(Option<&'a Gate>);
 
+impl Admitted<'_> {
+    /// The op defers (plan 31 §6.3): it stays admitted past this guard's
+    /// scope, until whoever completes it calls [`Admission::leave_deferred`]
+    /// with what this returned (whether a slot is held).
+    pub(crate) fn defer(self) -> bool {
+        let held = self.0.is_some();
+        std::mem::forget(self);
+        held
+    }
+}
+
 impl Drop for Admitted<'_> {
     fn drop(&mut self) {
         if let Some(gate) = self.0 {
@@ -175,6 +186,14 @@ impl Admission {
         };
         gate.waiters.fetch_sub(1, Ordering::SeqCst);
         result
+    }
+
+    /// A deferred op ([`Admitted::defer`]) has completed: give its slot
+    /// back if it held one.
+    pub(crate) fn leave_deferred(&self, held: bool) {
+        if let (true, Some(gate)) = (held, &self.gate) {
+            gate.leave();
+        }
     }
 
     /// Before a write of `bytes`: wait while the view's staged bytes

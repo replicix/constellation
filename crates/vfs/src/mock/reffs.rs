@@ -426,6 +426,10 @@ pub struct RefFs {
     next_view: Mutex<u64>,
     caps: FrontendCaps,
     policies: PolicyStack,
+    /// Inodes whose next read is *cold* (the conformance kit's `evict`
+    /// hook): it waits for a stand-in backing store (see
+    /// [`RefView::cold_read`]).
+    cold: Mutex<HashSet<Ino>>,
 }
 
 impl RefFs {
@@ -455,6 +459,7 @@ impl RefFs {
             next_view: Mutex::new(1),
             caps,
             policies,
+            cold: Mutex::new(HashSet::new()),
         })
     }
 
@@ -793,6 +798,52 @@ impl RefView {
         };
         self.fs.publish(self.id, changes);
         result
+    }
+
+    /// Make `ino`'s next read cold ([`RefFs::cold`]).
+    pub fn evict(&self, ino: Ino) -> VfsResult<()> {
+        let real = self.read_only(|st| Ok(self.enter_real(st, ino)?))?;
+        self.fs.cold.lock().unwrap().insert(real);
+        Ok(())
+    }
+
+    /// Whether this read of `ino` is cold; asking warms it (a cold read
+    /// fills the cache it missed).
+    pub fn take_cold(&self, ino: Ino) -> bool {
+        let Ok(real) = self.read_only(|st| Ok(self.enter_real(st, ino)?)) else {
+            return false;
+        };
+        self.fs.cold.lock().unwrap().remove(&real)
+    }
+
+    /// A cold read: it waits for the backing store (a short sleep here),
+    /// on a thread of its own when the frontend allows `read` to defer
+    /// ([`FrontendCaps::deferrable`]), else on the calling thread — what the
+    /// engine's `View` does with a chunk in no local cache.
+    pub fn cold_read<R: Responder<ReadData>>(
+        self: &Arc<Self>,
+        ino: Ino,
+        fh: Fh,
+        off: u64,
+        len: u32,
+        r: R,
+    ) {
+        const STORE: Duration = Duration::from_millis(20);
+        if !self.fs.caps.deferrable.contains(OpKind::Read) {
+            std::thread::sleep(STORE);
+            r.done(self.read(ino, fh, off, len));
+            return;
+        }
+        let view = self.clone();
+        let spawn = std::thread::Builder::new()
+            .name("ref-cold-read".into())
+            .spawn(move || {
+                std::thread::sleep(STORE);
+                r.done(view.read(ino, fh, off, len));
+            });
+        // A thread that could not start drops `r` with the closure: the
+        // responder's own drop fail-safe answers.
+        let _ = spawn;
     }
 
     fn read_only<T>(&self, f: impl FnOnce(&State) -> VfsResult<T>) -> VfsResult<T> {

@@ -120,6 +120,15 @@ jobs:
             echo "baseline_exists=false" >> "$GITHUB_ENV"
           fi
 
+      # Plan 31 C7: in-process VFS dispatch overhead (< 1 us/op) and per-op
+      # allocation ceilings (tests/perf-baseline.json "vfs_bench"). No
+      # docker; fails the job on a regression past the section 6.9 targets.
+      - name: VFS dispatch gate (vfs-bench)
+        if: env.CACHE_RUST_BUILD != 'true'
+        run: |
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" \
+            PERF_GATE_VFS_BENCH_ONLY=1 tests/perf-gate.sh
+
       - name: Build HEAD binaries
         if: env.CACHE_RUST_BUILD != 'true'
         run: |

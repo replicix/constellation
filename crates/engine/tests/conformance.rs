@@ -110,6 +110,22 @@ fn absolute(path: &str) -> String {
     format!("/{}", path.trim_start_matches('/'))
 }
 
+/// The fixture's view, for a hook (a weak reference: the fixture owns it).
+fn view_of(fx: &Fixture<View>) -> WeakView {
+    WeakView(Arc::downgrade(&fx.vfs))
+}
+
+struct WeakView(std::sync::Weak<View>);
+
+impl WeakView {
+    fn evict_cached(&self, ino: u64) -> Result<usize, String> {
+        self.0
+            .upgrade()
+            .ok_or_else(|| "the view is gone".to_string())?
+            .evict_cached(ino)
+    }
+}
+
 struct EngineTarget;
 
 impl ConformanceTarget for EngineTarget {
@@ -121,7 +137,11 @@ impl ConformanceTarget for EngineTarget {
         let mut fx = Fixture::new(view, caps.clone());
         fx.declared = declared();
         let (n1, n2, c2) = (node.clone(), node.clone(), caps.clone());
+        let evicting = view_of(&fx);
         fx.hooks = Hooks {
+            // Cold reads (the deferral group): the file's chunks leave
+            // the local cache once they are up in the backend.
+            evict: Some(Arc::new(move |ino| evicting.evict_cached(ino).map(|_| ()))),
             snapshot: Some(Arc::new(move |path: &str, name: &str| {
                 let engine = n1.engine();
                 engine

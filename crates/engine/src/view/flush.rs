@@ -71,6 +71,12 @@ impl View {
         if let Ok(Some(data)) = self.cache.get(hash) {
             return Ok(data);
         }
+        // Everything past here may wait (a prefetch in flight, a
+        // forwarded chunk, a peer, S3): a read tried inline with deferral
+        // allowed stops here and goes to the completion pool instead.
+        if super::io::cold_probe::refuse() {
+            return Err(Code::Again);
+        }
         if self.prefetch.claim_for_demand(hash) {
             if let Some(ino) = ino {
                 self.prefetch.note_stall(ino);

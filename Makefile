@@ -157,7 +157,7 @@ check-cross: ## Type-check darwin (workspace) + windows-gnu (library crates) via
 vfs-bench: ## VFS dispatch overhead (<1us/op) and per-op allocations, in-process, no kernel (plan 31 C7); exits 1 past the targets
 	cargo bench -p constellation-engine --bench vfs_bench
 
-perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Check benchmark rates against baseline
+perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## vfs-bench (§6.9 dispatch + allocation ceilings), then benchmark rates against baseline
 	tests/perf-gate.sh
 
 uploadbench-build: ## Build the adaptive-upload-concurrency benchmark

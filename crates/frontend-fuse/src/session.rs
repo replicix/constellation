@@ -33,8 +33,11 @@
 //!    kernel queues from now on stay queued, for the next server.
 //! 4. On the session's own thread, once every worker has returned:
 //!    **re-check** the deferred replies (a lock wait may have begun between
-//!    1 and 3), then **publish every pending write** (`Vfs::sync_view`, the
-//!    whole-view barrier). Either failing aborts the detach: the session
+//!    1 and 3), **drain the deferred reads** (a cold read the engine answers
+//!    from its completion pool: bounded, so waited for — up to
+//!    `CONSTELLATION_HANDOVER_READ_DRAIN_MS` — rather than refused), then
+//!    **publish every pending write** (`Vfs::sync_view`, the whole-view
+//!    barrier). Either failing aborts the detach: the session
 //!    resumes serving the same descriptor, in place, and the caller gets
 //!    the reason.
 //! 5. The caller receives the descriptor (a duplicate: same open file,
@@ -167,6 +170,30 @@ fn notify_wait() -> Duration {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5_000),
     )
+}
+
+/// How long a detach waits for the reads the engine is still answering
+/// from its completion pool (`CONSTELLATION_HANDOVER_READ_DRAIN_MS`,
+/// default 30 s): each is a bounded fetch.
+fn read_drain_wait() -> Duration {
+    Duration::from_millis(
+        std::env::var("CONSTELLATION_HANDOVER_READ_DRAIN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000),
+    )
+}
+
+/// Wait, up to `within`, for every deferred read to be answered.
+fn drain_reads(deferred: &Deferred, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while deferred.bounded() > 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    true
 }
 
 type DetachReply = mpsc::SyncSender<Result<(OwnedFd, NegotiatedInit), DetachError>>;
@@ -439,6 +466,15 @@ impl<V: Vfs> FuseSession<V> {
                     format!(
                         "{} blocking lock wait(s) began while the session stopped",
                         shared.deferred.count()
+                    ),
+                ))
+            } else if !drain_reads(&shared.deferred, read_drain_wait()) {
+                Err(refused(
+                    Code::Busy,
+                    format!(
+                        "{} deferred read(s) still unanswered after {:?}",
+                        shared.deferred.bounded(),
+                        read_drain_wait()
                     ),
                 ))
             } else {
@@ -838,5 +874,29 @@ mod tests {
         let mut big = init;
         big.max_write = 64 << 20;
         assert!(big.check_resumable().is_err());
+    }
+
+    #[test]
+    fn a_detach_drains_deferred_reads_and_gives_up_past_its_wait() {
+        let deferred = Arc::new(Deferred::default());
+        assert!(drain_reads(&deferred, Duration::ZERO), "nothing to drain");
+        deferred.track_bounded_raw();
+        deferred.track_bounded_raw();
+        assert_eq!((deferred.count(), deferred.bounded()), (0, 2));
+        // Unanswered past the wait: the detach gives up (and resumes).
+        let started = std::time::Instant::now();
+        assert!(!drain_reads(&deferred, Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        // Answered meanwhile (from the engine's pool): drained.
+        let answering = deferred.clone();
+        let pool = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            answering.untrack_bounded_raw();
+            std::thread::sleep(Duration::from_millis(30));
+            answering.untrack_bounded_raw();
+        });
+        assert!(drain_reads(&deferred, Duration::from_secs(10)));
+        assert_eq!(deferred.bounded(), 0);
+        pool.join().unwrap();
     }
 }

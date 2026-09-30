@@ -19,12 +19,23 @@ impl ChunkHash {
         Self(*blake3::keyed_hash(key, data).as_bytes())
     }
 
+    /// Lowercase hex, 64 characters. One allocation (it was 33: a
+    /// `format!` per byte), on every cache lookup's path (plan 31 C7b).
     pub fn to_hex(&self) -> String {
-        let mut s = String::with_capacity(64);
-        for b in self.0 {
-            s.push_str(&format!("{b:02x}"));
+        let hex = self.hex_ascii();
+        // `hex_ascii` writes only ASCII hex digits.
+        String::from_utf8(hex.to_vec()).expect("ascii")
+    }
+
+    /// Lowercase hex into a stack buffer: no allocation.
+    pub fn hex_ascii(&self) -> [u8; 64] {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 64];
+        for (i, b) in self.0.iter().enumerate() {
+            out[2 * i] = DIGITS[usize::from(b >> 4)];
+            out[2 * i + 1] = DIGITS[usize::from(b & 0x0f)];
         }
-        s
+        out
     }
 
     pub fn from_hex(s: &str) -> Option<Self> {
@@ -43,13 +54,19 @@ impl ChunkHash {
 
 impl fmt::Debug for ChunkHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ChunkHash({})", &self.to_hex()[..12])
+        let hex = self.hex_ascii();
+        write!(
+            f,
+            "ChunkHash({})",
+            std::str::from_utf8(&hex[..12]).expect("ascii")
+        )
     }
 }
 
 impl fmt::Display for ChunkHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
+        let hex = self.hex_ascii();
+        f.write_str(std::str::from_utf8(&hex).expect("ascii"))
     }
 }
 
@@ -120,6 +137,22 @@ mod tests {
         assert_eq!(ChunkHash::from_hex(&h.to_hex()), Some(h));
         assert_eq!(h.to_hex().len(), 64);
         assert!(ChunkHash::from_hex("zz").is_none());
+    }
+
+    #[test]
+    fn hex_is_the_per_byte_lowercase_encoding() {
+        // Object names and cache paths are this text: it must not change.
+        for h in [
+            ChunkHash([0; 32]),
+            ChunkHash([0xff; 32]),
+            ChunkHash::of(b"hello"),
+            ChunkHash(std::array::from_fn(|i| (i * 37) as u8)),
+        ] {
+            let expected: String = h.0.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(h.to_hex(), expected);
+            assert_eq!(h.to_string(), expected);
+            assert_eq!(format!("{h:?}"), format!("ChunkHash({})", &expected[..12]));
+        }
     }
 
     #[test]

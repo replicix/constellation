@@ -17,8 +17,10 @@
 //!
 //! Every op answers inline on the calling fuser worker, as it always did,
 //! except a blocking lock, which the view completes from its `lock-wait`
-//! thread (`FrontendCaps::linux_fuse` declares every op deferrable; only
-//! locks defer so far — plan 31 §6.3).
+//! thread, and a cold read (a chunk in no local cache), which the engine
+//! completes from its completion pool (`FrontendCaps::linux_fuse` declares
+//! every op deferrable; locks and cold reads defer so far — plan 31 §6.3,
+//! C7b). Both are counted ([`Deferred`]) for a session handover.
 
 use crate::reply::{
     AttrReply, BytesReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply, LseekReply,
@@ -98,26 +100,60 @@ impl<V: Vfs> FuseFs<V> {
     }
 }
 
-/// The count of requests whose reply may come from another thread after
-/// the fuser worker that read them moved on — today exactly the blocking
-/// lock waits (`FUSE_SETLKW`/`flock`): every other op answers inline, on
-/// the worker, before it reads again, so stopping the workers drains
-/// those by itself. A detach needs this count at zero: a reply must be
-/// written on the descriptor its request was read from, by a process
-/// that still serves it.
+/// The requests whose reply may come from another thread after the fuser
+/// worker that read them moved on, in two counts:
+///
+/// - **blocking**: the blocking lock waits (`FUSE_SETLKW`/`flock`), which
+///   may wait forever. A detach refuses while any is in flight: a reply
+///   must be written on the descriptor its request was read from, by a
+///   process that still serves it.
+/// - **bounded**: reads, which the engine may answer from its completion
+///   pool when they are cold (plan 31 C7b). Their waits end on their own
+///   (a fetch succeeds or fails), so a detach drains them instead of
+///   refusing.
+///
+/// Every other op answers inline, on the worker, before it reads again, so
+/// stopping the workers drains those by itself.
 #[derive(Default)]
-pub(crate) struct Deferred(std::sync::atomic::AtomicUsize);
+pub(crate) struct Deferred {
+    blocking: std::sync::atomic::AtomicUsize,
+    bounded: std::sync::atomic::AtomicUsize,
+}
 
 impl Deferred {
+    /// Blocking lock waits in flight.
     pub(crate) fn count(&self) -> usize {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+        self.blocking.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Reads that may still be answered from the engine's pool.
+    pub(crate) fn bounded(&self) -> usize {
+        self.bounded.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn counter(&self, bounded: bool) -> &std::sync::atomic::AtomicUsize {
+        if bounded {
+            &self.bounded
+        } else {
+            &self.blocking
+        }
     }
 
     fn track<R>(self: &Arc<Self>, reply: R) -> Tracked<R> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.track_as(reply, false)
+    }
+
+    fn track_bounded<R>(self: &Arc<Self>, reply: R) -> Tracked<R> {
+        self.track_as(reply, true)
+    }
+
+    fn track_as<R>(self: &Arc<Self>, reply: R, bounded: bool) -> Tracked<R> {
+        self.counter(bounded)
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Tracked {
             reply: Some(reply),
             deferred: self.clone(),
+            bounded,
         }
     }
 }
@@ -125,11 +161,23 @@ impl Deferred {
 #[cfg(test)]
 impl Deferred {
     pub(crate) fn track_raw(&self) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.blocking
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn untrack_raw(&self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.blocking
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn track_bounded_raw(&self) {
+        self.bounded
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn untrack_bounded_raw(&self) {
+        self.bounded
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -146,6 +194,7 @@ pub(crate) fn track_for_test<R: constellation_vfs::Responder<()>>(
 struct Tracked<R> {
     reply: Option<R>,
     deferred: Arc<Deferred>,
+    bounded: bool,
 }
 
 impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for Tracked<R> {
@@ -161,7 +210,7 @@ impl<R> Drop for Tracked<R> {
         // The reply (if `done` never ran) answers from its own drop first.
         drop(self.reply.take());
         self.deferred
-            .0
+            .counter(self.bounded)
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -605,7 +654,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             Fh(fh.0),
             offset,
             size,
-            op.responder(ReadReply(reply)),
+            // A cold read may be answered from the engine's completion
+            // pool: counted until it is, for a detach to drain.
+            op.responder(self.deferred.track_bounded(ReadReply(reply))),
         );
     }
 

@@ -294,9 +294,17 @@ impl DiskCache {
         Ok(())
     }
 
+    /// `<root>/ab/cd/abcd…`, built in one allocation (a lookup's path is
+    /// on every cached read).
     fn path_for(&self, hash: &ChunkHash) -> PathBuf {
-        let hex = hash.to_hex();
-        self.root.join(&hex[0..2]).join(&hex[2..4]).join(hex)
+        let hex = hash.hex_ascii();
+        let hex = std::str::from_utf8(&hex).expect("ascii");
+        let mut path = PathBuf::with_capacity(self.root.as_os_str().len() + 72);
+        path.push(&self.root);
+        path.push(&hex[0..2]);
+        path.push(&hex[2..4]);
+        path.push(hex);
+        path
     }
 
     fn hash(&self, data: &[u8]) -> ChunkHash {
@@ -776,6 +784,19 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get(&h).unwrap(), Some(d));
         assert_eq!(c.usage().used, 100);
+    }
+
+    #[test]
+    fn a_chunk_lives_at_its_two_level_hex_path() {
+        // The on-disk layout survives restarts (and upgrades): unchanged.
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let (h, d) = chunk(9, 10);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        let hex = h.to_hex();
+        let expected = dir.path().join(&hex[0..2]).join(&hex[2..4]).join(&hex);
+        assert_eq!(c.path_for(&h), expected);
+        assert_eq!(std::fs::read(expected).unwrap(), d);
     }
 
     #[cfg(unix)]

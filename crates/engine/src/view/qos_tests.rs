@@ -5,8 +5,8 @@
 use super::*;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_vfs::{
-    Blocking, Fh, FnResponder, LockOwner, Name, OpCtx, OpKind, OpenOwner, Opened, Vfs, VfsResult,
-    WriteData,
+    Blocking, Fh, FnResponder, LockOwner, Name, OpCtx, OpKind, OpenFlags, OpenOwner, Opened,
+    ReadData, Vfs, VfsResult, WriteData,
 };
 use std::sync::mpsc;
 
@@ -211,4 +211,114 @@ fn an_unlimited_view_has_no_admission_state() {
     let _a = v.admission.admit(&OpCtx::new(OpKind::Getattr, &c)).unwrap();
     let _b = v.admission.admit(&OpCtx::new(OpKind::Getattr, &c)).unwrap();
     getattr_by(&v, Some(Duration::ZERO)).unwrap();
+}
+
+/// Plan 31 C7b: a cold read defers to the completion pool — the call
+/// returns before it is answered, the answer comes from a pool thread —
+/// and it keeps its admission slot until then; a warm read answers inline.
+#[test]
+fn a_deferred_cold_read_answers_off_the_caller_and_holds_its_slot() {
+    let (v, _dir) = limited(ViewQos {
+        max_inflight_ops: Some(1),
+        max_staging_bytes: None,
+    });
+    v.bind();
+    let c = caller();
+    let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+    let (entry, opened) = Blocking::run(|r| {
+        v.create(
+            &OpCtx::new(OpKind::Create, &c),
+            ROOT_INO,
+            Name::new(b"f"),
+            0o644,
+            rw,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    let ino = entry.attr.ino;
+    let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    Blocking::run(|r| {
+        v.write(
+            &OpCtx::new(OpKind::Write, &c),
+            ino,
+            opened.fh,
+            0,
+            WriteData::Borrowed(&content),
+            rw,
+            r,
+        )
+    })
+    .unwrap();
+    Blocking::run(|r| {
+        v.flush(
+            &OpCtx::new(OpKind::Flush, &c),
+            ino,
+            opened.fh,
+            LockOwner(1),
+            r,
+        )
+    })
+    .unwrap();
+    // No sync task here: upload by hand, then drop the clean chunk.
+    v.rt.block_on(crate::upload::upload_dirty_chunks(
+        &v.cache,
+        &v.meta,
+        &v.store,
+        CompressionSetting::RAW,
+        &crate::upload::UploadRuntime::for_test(true),
+        None,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(v.evict_cached(ino).unwrap(), 1, "one chunk left the cache");
+
+    let me = std::thread::current().id();
+    let (entered, is_in) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let len = content.len() as u32;
+    v.read(
+        &OpCtx::new(OpKind::Read, &c),
+        ino,
+        opened.fh,
+        0,
+        len,
+        FnResponder::new(move |got: VfsResult<ReadData>| {
+            entered
+                .send((
+                    got.map(|d| d.contiguous().into_owned()),
+                    std::thread::current().id(),
+                ))
+                .unwrap();
+            released.recv().unwrap();
+        }),
+    );
+    // The call returned; the answer arrives from elsewhere.
+    let (got, on) = is_in.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(got.unwrap(), content);
+    assert_ne!(on, me, "the cold read was answered on the calling thread");
+    // Until the answer is through, the view's one slot is the read's.
+    assert_eq!(
+        getattr_by(&v, Some(Duration::from_millis(100)))
+            .unwrap_err()
+            .code(),
+        Code::Again
+    );
+    release.send(()).unwrap();
+    getattr_by(&v, Some(Duration::from_secs(10))).unwrap();
+    // Warm now: answered inline, on this thread, before the call returns.
+    let (tx, rx) = mpsc::channel();
+    v.read(
+        &OpCtx::new(OpKind::Read, &c),
+        ino,
+        opened.fh,
+        0,
+        len,
+        FnResponder::new(move |got: VfsResult<ReadData>| {
+            tx.send((got.unwrap().len(), std::thread::current().id()))
+                .unwrap();
+        }),
+    );
+    assert_eq!(rx.try_recv().unwrap(), (content.len(), me));
 }

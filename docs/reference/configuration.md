@@ -464,6 +464,7 @@ protocol, message bounds and counters.
 |---|---:|---|---|
 | `CONSTELLATION_PREFETCH_MIN_BYTES` | `8388608` | bytes, positive | initial adaptive sequential-read window |
 | `CONSTELLATION_PREFETCH_MAX_BYTES` | `2147483648` | bytes, positive | window ceiling, additionally capped at one quarter of cache budget |
+| `CONSTELLATION_CACHE_READ_RESERVE_PCT` | `0` | percent, `0..90` | share of the chunk cache that dirty (not yet uploaded) chunks may not take: writers are throttled, then refused (`ENOSPC`), that much earlier, so reads and readahead keep room under a write burst. Plan 31 C7b: 128 MiB cache, uploads capped at 4 MB/s, a writer running — a cold sequential reader gets 12–13 MiB/s at `0`, 19–23 at `25`, 66 at `50` (110–124 alone). Off by default: it moves where a small cache pushes back on writers |
 | `CONSTELLATION_PREFETCH_CONCURRENCY` | unset | requests; `0` is treated as `1` | pin background-fetch concurrency instead of adapting it |
 | `CONSTELLATION_PREFETCH_MAX_CONCURRENCY` | `128` | requests, `1..512` | adaptive background-fetch ceiling |
 | `CONSTELLATION_SCAN_AHEAD` | `on` | boolean | ordered directory-walk readahead |
@@ -598,6 +599,9 @@ xattr and evaluated by a singleton background pruner. See
 | `CONSTELLATION_FUSE_THREADS` | host heuristic (Linux), else `1` | threads, `1..64` | FUSE dispatcher threads |
 | `CONSTELLATION_TOKIO_THREADS` | `min(CPUs, 32)` | threads, `1..32` | multi-thread Tokio worker count |
 | `CONSTELLATION_BLOCKING_THREADS` | `clamp(4×CPUs, 4..256)` | threads | Tokio blocking-pool ceiling |
+| `CONSTELLATION_COMPLETION_THREADS` | `64` | threads, `1..1024` | the engine's completion pool (one per process): threads that finish a deferred op — today a *cold* read, whose chunk is in no local cache — so the FUSE worker that took the request is free at once. Started on demand, exit after 30 s idle; past the bound, deferred reads queue (plan 31 C7b) |
+| `CONSTELLATION_DEFER_COLD_READS` | on | `0`/`false`/`off` disable | whether a cold read defers to the completion pool (on) or waits on the FUSE worker as before plan 31 C7b (off; a diagnostic switch — with 4 workers and 16 concurrent cold reads behind 200 ms of S3 latency, a cached `open`+`read` then waits up to ~1.3 s for a worker) |
+| `CONSTELLATION_HANDOVER_READ_DRAIN_MS` | `30000` | milliseconds | how long a FUSE session handover (`daemon --upgrade`) waits for deferred reads still being answered before it gives up and keeps serving in place |
 
 ### Filesystem stats and quota
 

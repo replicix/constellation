@@ -56,7 +56,14 @@ impl ConformanceTarget for RefTarget {
             subtree_view: Some(subtree),
             second_view: Some(second),
             events: Some(events),
-            settle: Some(Arc::new(move || mock.settle())),
+            settle: Some({
+                let mock = mock.clone();
+                Arc::new(move || mock.settle())
+            }),
+            // An evicted file's next read is cold (`RefView::cold_read`).
+            evict: Some(Arc::new(move |ino| {
+                mock.evict(ino).map_err(|c| c.to_string())
+            })),
         };
         fixture
     }

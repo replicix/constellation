@@ -143,6 +143,9 @@ impl Default for Declared {
 
 type SnapshotHook = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
 
+/// [`Hooks::evict`].
+pub type EvictHook = Arc<dyn Fn(Ino) -> Result<(), String> + Send + Sync>;
+
 /// The optional abilities of a fixture beyond its one view. A target that
 /// cannot offer one leaves it `None`, and the tests that need it skip
 /// naming it.
@@ -164,6 +167,11 @@ pub struct Hooks<V: Vfs> {
     pub events: Option<Arc<RecordingEvents>>,
     /// Wait until every event queued so far reached [`Hooks::events`].
     pub settle: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// `evict(ino)`: drop the file's data from every local cache, so that
+    /// the next read of it must wait for the backing store (a *cold*
+    /// read, which the deferral group checks is answered off the calling
+    /// thread when the frontend allows it).
+    pub evict: Option<EvictHook>,
 }
 
 impl<V: Vfs> Default for Hooks<V> {
@@ -174,6 +182,7 @@ impl<V: Vfs> Default for Hooks<V> {
             second_view: None,
             events: None,
             settle: None,
+            evict: None,
         }
     }
 }
@@ -233,6 +242,7 @@ impl<V: Vfs> Fixture<V> {
                 second,
                 events: hooks.events,
                 settle: hooks.settle,
+                evict: hooks.evict,
             },
             _keepalive: keepalive,
         }
@@ -248,6 +258,7 @@ struct FxHooks {
     second: Option<Arc<dyn Fn() -> Result<Fx, String> + Send + Sync>>,
     events: Option<Arc<RecordingEvents>>,
     settle: Option<Arc<dyn Fn() + Send + Sync>>,
+    evict: Option<EvictHook>,
 }
 
 /// A [`Fixture`], erased over the target's `Vfs` type: what a test sees.
@@ -364,6 +375,14 @@ impl Fx {
             Some(events) => Ok(events),
             None => skip!("target delivers no frontend events to this fixture"),
         }
+    }
+
+    /// Make `ino`'s next read cold ([`Hooks::evict`]).
+    pub fn evict(&self, ino: Ino) -> Result<(), TestErr> {
+        let Some(hook) = &self.hooks.evict else {
+            skip!("target offers no evict hook (cold reads)");
+        };
+        hook(ino).map_err(|e| TestErr::Fail(format!("evict({ino}): {e}")))
     }
 
     pub fn settle(&self) {
@@ -655,6 +674,8 @@ tests! {
         every_op_completes_exactly_once [],
         a_blocked_lock_completes_from_another_thread [ClusterLocks],
         non_deferrable_waits_park_the_calling_thread [],
+        a_cold_read_completes_from_another_thread [],
+        a_non_deferrable_cold_read_parks_the_calling_thread [],
         locks_are_refused_without_the_capability [],
         a_panicking_responder_leaves_the_target_usable [],
         the_provided_responders_fail_safe [];

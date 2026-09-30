@@ -1651,6 +1651,7 @@ impl Engine {
         let id = self.next_view_id.fetch_add(1, Ordering::Relaxed);
         view.set_id(id);
         let view = Arc::new(view);
+        view.bind();
         tracing::info!(
             view = id,
             root = %spec.root,

@@ -28835,3 +28835,153 @@ path), which this manual-source milestone cannot exercise.
 - [x] `node.lifecycle` works end-to-end against a real daemon (harness)
 - [x] Lifecycle scenarios pass on Linux (3 × 3)
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator
+
+## Plan 31 C7b — deferral and performance candidates
+
+Second half of milestone C7 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.3, §6.4, §6.9, §11 "C7"): the cold-read deferral the measurements
+justified, the five Mountpoint-derived candidates measured and decided, and
+`vfs-bench` in the gated perf suite. Host: this container, 4 vCPU (so 4 FUSE
+workers by the fixed `2*ceil_sqrt(cpus)` rule), 15 GiB, release builds,
+floci S3 behind toxiproxy (latency toxics apply to both directions). The
+bench scripts are ad hoc (a mount per run, a Python/`dd` client). Each
+number is one run unless a range is given.
+
+### Items
+
+| Item | State | Where |
+|---|---|---|
+| Engine completion pool: bounded (`CONSTELLATION_COMPLETION_THREADS`, default 64), one per process, threads started on demand and gone after 30 s idle, queue past the bound, a panicking job keeps its thread, falls back to the caller if no thread can start; never the tokio blocking pool (the `lock-wait` rationale) | DONE | `crates/engine/src/completion.rs` (3 unit tests) |
+| Cold reads defer: the read is tried inline with a thread-local probe armed; the first fetch that would wait (prefetch in flight, forwarded chunk, peer, S3) refuses instead, the attempt unwinds, and the whole read reruns on the pool, which answers the responder. Only when `FrontendCaps::deferrable` holds `Read` (else waits on the caller as before); `CONSTELLATION_DEFER_COLD_READS=0` is a kill switch. The op's watchdog entry, kernel-invalidation hold-back and admission slot travel with it (`Admitted::defer` / `Admission::leave_deferred`). `View::bind` gives an engine-opened view its own `Weak` | DONE | `crates/engine/src/view/{io,ops,flush,admission,mod}.rs`, `crates/engine/src/node.rs` |
+| FUSE adapter: reads are counted as *bounded* deferred replies (`Deferred` now has `blocking` = lock waits, which a detach still refuses, and `bounded` = reads, which a detach drains for up to `CONSTELLATION_HANDOVER_READ_DRAIN_MS`, default 30 s, before `sync_view`) | DONE | `crates/frontend-fuse/src/{adapter,session}.rs` (+1 unit test) |
+| Conformance: `Hooks::evict` (make a file's next read cold); `deferral::a_cold_read_completes_from_another_thread`, `deferral::a_non_deferrable_cold_read_parks_the_calling_thread`. The engine target evicts clean chunks (`View::evict_cached`, after `drain_inode`); the reference fs models a cold read (`RefView::cold_read`: a 20 ms "store" wait, off-thread when deferrable). Checked to fail with deferral switched off | DONE | `crates/vfs/src/conformance/{mod,deferral,reference}.rs`, `crates/vfs/src/mock/{mod,reffs}.rs`, `crates/engine/tests/conformance.rs` |
+| View unit test: a deferred cold read answers off the caller and keeps the view's admission slot until answered; a warm read answers inline | DONE | `crates/engine/src/view/qos_tests.rs` |
+| Read-path allocations: `ChunkHash::to_hex` made one allocation (was 33: a `format!` per byte), new `hex_ascii` (none), `Display`/`Debug` allocation-free, `DiskCache::path_for` one allocation (was ~7). Output and on-disk layout unchanged (2 new tests) | DONE | `crates/fs-core/src/{chunk,cache}.rs` |
+| `CONSTELLATION_CACHE_READ_RESERVE_PCT` (default 0 = unchanged): the dirty-chunk share of the cache stops that many percent short of the budget | DONE (knob, default off) | `crates/engine/src/view/io.rs` (`dirty_budget`) |
+| `vfs-bench` in the perf gate: `VFS_BENCH_JSON`, `VFS_BENCH_REPORT_ONLY`; `tests/perf-gate.sh` runs it first and fails on a §6.9 miss or on per-op allocations over `tests/perf-baseline.json`'s `vfs_bench.max_allocs_per_op` (+0.5 slack): `view/read` 21, `view/lookup` 11, `view/getattr` 4, `observer/getattr` 0. Runs in `make perf-gate` (nightly `performance` job) and as its own step in the `perf-regression` PR workflow (`PERF_GATE_VFS_BENCH_ONLY=1`) | DONE | `crates/engine/benches/vfs_bench.rs`, `tests/perf-gate.sh`, `tests/perf-baseline.json`, `.github/workflows/perf-regression.yml`, `Makefile` |
+| Docs: knobs, tests, gate | DONE | `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md` |
+
+### Deferral: inventory, measurement, decision
+
+Every place a frontend worker parks on the engine (`crates/engine/src/view/**`
+plus `locks.rs`), after C7b:
+
+| Site | Waits for | Bound | Status |
+|---|---|---|---|
+| `flush.rs` `fetch_chunk_for_inode`: `rt.block_on(coop.fetch)` / `get_chunk_to_writer`, the prefetch-in-flight poll, `wait_forwarded_chunk` | a chunk from a peer or S3 | S3/peer RTT + transfer | **deferred** (cold reads, C7b) |
+| `locks.rs` `ClusterLocks::lock` | a lock grant | unbounded | deferred since C4 (`lock-wait` thread per wait); `locks.rs:203,318` are that thread's and `lock_here`'s waits |
+| `write_gate.rs:130` `require_lease_for` | the lease (`SyncRequest::Acquire`) | up to 2×TTL without progress | not converted, see below |
+| `write_gate.rs:604` `submit_to_core` | the core's commit of a mutation (local, forwarded over P2P, or the S3 inbox) | P2P RTT, or S3 RTTs / in-doubt 120 s when S3 is cut | not converted |
+| `write_gate.rs:291` `strict_read` | `cto=strict`'s read index | one core round | not converted (opt-in mode) |
+| `write_gate.rs:361` `recall_after_local_inos` | cluster-lock recalls | core round | not converted |
+| `write_gate.rs:665` `sync_barrier_at` (`fsync`) | durability at the requested level | S3 PUT/CAS | not converted (a durability barrier: the caller asked to wait) |
+| `flush.rs:249` `drain_inode` | a write-through close's chunk upload | S3 PUT | not converted (same) |
+| `synthetic.rs` `block_on(snapshots…)` | frozen snapshot tree loads | S3 GET | not converted (snapshot browsing) |
+| `admission.rs`, `StagingBudget::wait_below`, `do_write`'s throttle sleeps | view QoS / backpressure | deadline (30 s default) | not converted: backpressure is meant to hold the writer |
+
+**Measurement (cold reads)**: one node, 4 FUSE workers, 1 MiB chunks, 200 ms S3
+latency. N readers each `cat` a different cold 2 MiB file while a prober
+`open`s + `pread`s 4 KiB + `close`s a file already in the cache, every 5 ms,
+until the readers finish. Two bursts per mount, fresh files each. Probe max /
+cold-burst wall time:
+
+| Build | N=16 (run 1, burst 1 / 2) | N=16 (run 2) | N=64 (burst 1 / 2) |
+|---|---|---|---|
+| before (fixed 4 workers) | 1293 ms / 1285 ms; 1.76 s / 1.76 s | 879 / 1260 ms; 1.70 / 1.75 s | **6281 / 5081 ms; 7.0 / 5.9 s** |
+| before, `CONSTELLATION_FUSE_THREADS=32` (control) | 4.3 / 6.9 ms; 0.57 / 0.55 s | — | — |
+| **after (deferred)** | 16.5 / 16.4 ms; 0.55 / 0.52 s | 10.8 / 16.5 ms; 0.55 / 0.53 s | **519 / 425 ms; 1.24 / 1.06 s** |
+
+The 32-worker control proves the stall is worker exhaustion. In the
+before-runs, the cold readers were also serialised four at a time.
+Deferral fixes both: the probe's worst case drops by 80x (N=16) and
+12x (N=64), and the cold burst finishes 3.3x (N=16) and 5.6x (N=64) sooner.
+**Decision: ADOPT, default on.** The measurement demonstrates starvation, and
+the change is confined: the fast path is unchanged except for arming a
+thread-local; the slow path reruns the read. At N=64 the remaining ~0.5 s
+probe tail is the kernel's own queue (64 readers' async readahead fills
+`max_background` = 32) and the pool bound.
+
+**Lease waits: not converted.** On one node, 16 concurrent `create`s under
+200 ms S3 latency, just after an idle lease release
+(`CONSTELLATION_LEASE_IDLE_RELEASE_MS=2000`), finished in 10 ms, and the
+probe saw nothing. A mutation is acknowledged locally and the lease is
+taken behind it, so no worker parks on S3. Across nodes a mutation forwards
+over P2P, bounded by a LAN RTT. What remains is the S3-cut case. The
+pre-existing harness failure `writeback-backpressure` is exactly that case: the
+first `create` after S3 is cut waits in `submit_to_core` for 120 s, then
+`EIO`. It fails identically on the pre-C7b binary at `70b7a5e` (see below),
+so it is a correctness bug, not a starvation one. Deferring
+mutations also interacts with the kernel's `i_rwsem` and per-inode ordering.
+It is left for when a multi-node, S3-degraded measurement justifies it
+(harness: `sticky-lease-handoff-over-s3`, `forwarded-mutations` with P2P cut).
+
+### Mountpoint-derived candidates
+
+| Candidate | Measurement setup | Result | Decision | Rationale |
+|---|---|---|---|---|
+| (a) On-demand growing FUSE worker pool | 1024 cached 4 KiB files; 20 bursts of 64 client threads × 8 `open`+`pread`+`fstat`+`close`, 200 ms idle between bursts; `CONSTELLATION_FUSE_THREADS` = 1/4/16/64; daemon threads and RSS idle and after the bursts. Two runs | Idle cost per worker: **1 thread, ~120 KiB RSS** (46.6 MB at 4 → 54.3 MB at 64; fuser's 16 MiB request buffer is `calloc`'d, so it is resident only once touched). Burst wall p50 / max: 1w 144/209 ms; **4w 130–138/171–419 ms**; 16w 159–177/236–266 ms; 64w 305–313/413–421 ms | **REJECT** | Growth would only ever *add* workers under a burst, and more workers are slower for these CPU-bound ops on 4 CPUs (64 workers: 2.3x the burst time). Workers are too cheap for idle memory to matter. The case growth was meant for, blocking ops holding workers, is now fixed by deferral, independent of worker count |
+| (b) Userspace buffer pool vs `splice(2)` | `vfs-bench` per-op allocation counter. A temporary backtrace-capturing allocator attributed the View's 4 KiB read allocations by source line | Top sources: `ChunkHash::to_hex` 33/op (a `format!` per byte, on every cache lookup's path), `DiskCache::path_for` ~7, replica reads (getattr, manifest decode, `ScanAhead`'s `parent_of` at offset 0) ~15. After the fix, same host back to back: **60 → 21 allocs/op, 10.8 → 10.1 KB/op, View read 15.4 → 11.7 µs direct (-24%)**, dispatch overhead still < 1 µs. `splice` is not used, and zero-copy holds without it (`ReadData` is `Bytes` segments) | **ADOPT** (hex/path fix); **REJECT** `splice`; pool: keep `Bytes` | The remaining allocations are metadata decoding, not cheap to remove. Finding recorded for a follow-up: every FUSE read of a cached chunk loads and BLAKE3-verifies the *whole* chunk from the disk cache. A disk-cache-resident 256 MiB sequential read, kernel page cache dropped, runs at **~100 MiB/s at 4 MiB chunks vs 215–246 MiB/s at 1 MiB** (32 vs 8 full-chunk loads per chunk at 128 KiB readahead). A small in-memory cache of verified hot chunks (Mountpoint's buffer pool, in effect) is the fix. It is not cheap (memory budget, `Bytes` through the clip paths), so it is not done here |
+| (c) Prefetch first request sized to absorb kernel readahead (1 MiB + 128 KiB) | Cold 64 MiB file per rep, fresh-cache mount, 50 ms S3 latency, 128 KiB reads (the kernel's readahead unit); time to first byte, to 1.125 MiB, to 8 MiB, total. 3 reps per chunk size | 1 MiB chunks: TTFB 247–298 ms, **+10–38 ms to 1.125 MiB**, 96–105 MiB/s. 4 MiB chunks: TTFB 319–339 ms, **+17–29 ms to 1.125 MiB**, 44–50 MiB/s | **REJECT** | Kernel readahead is already absorbed. The first demand miss fetches a whole chunk (≥ 1 MiB), and at offset 0 readahead schedules the next ones at once. The first 1.125 MiB arrives within one round trip of the first byte, never two. A smaller-than-chunk first request is impossible anyway: a chunk is content-addressed and verified whole (hash, E2E), so no byte can be served before the whole chunk arrives |
+| (d) Memory limiter with a reserved read share | `--cache-size 128MiB`, 1 MiB chunks, 20 ms latency, uploads capped at 4 MB/s (upstream bandwidth toxic). A cold 64 MiB sequential read alone, then 8 s into a 384 MiB `dd` writer. Control: the same with a 2 GiB cache. Then `CONSTELLATION_CACHE_READ_RESERVE_PCT` 0/25/50 | Alone 106–124 MiB/s. With the writer: 2 GiB cache **54 MiB/s** (link/CPU contention); 128 MiB cache **11.5–13.3 MiB/s** (dirty chunks hold the cache, so fetched and prefetched chunks find no room and are refetched per 128 KiB read). Reserve 25%: 19.4–22.9; **reserve 50%: 66.5 MiB/s** | **ADOPT behind a knob, default unchanged (0)** | Write-starves-read is real under today's fully dynamic split: only `do_write` limits dirty bytes, at 100% of the budget. A reserve fixes it (50% gives back more than the large-cache control). The knob is not on by default: it moves where a small cache throttles and refuses writers (`ENOSPC` backpressure, which `writeback-backpressure` and deployments tune against), and the write side was not measured under it here. Flipping the default (e.g. 25–50%) needs the full harness matrix |
+| (e) S3 part size 8 MiB vs 4 MiB chunk (reference only) | 512 MiB random `dd … conv=fsync` into a write-through mount (`--cache-size 4GiB`), `fs create --chunk-size` 4 MiB vs 8 MiB, 0 and 20 ms latency, 2–3 reps | Rep 1 is a warm-up in every configuration (46–63 MiB/s). Warm reps, 0 ms: 4 MiB **108, 114, 113**; 8 MiB **142, 147, 110** MiB/s. 20 ms: 4 MiB 122, 8 MiB 109 | **REJECT** (keep 4 MiB default) | No consistent win: the ranges overlap and invert at 20 ms. The chunk size is the content-addressing unit (a format decision, §7), and 8 MiB is already available per filesystem (`fs create --chunk-size`). Concurrency tuning (`upload-concurrency`) is the lever for write throughput. Per (b), bigger chunks also cost cached sequential reads, and per (c) they cost TTFB (+70–90 ms at 50 ms latency) |
+
+### `vfs-bench` (release, `make vfs-bench` / the gate's stage, this host)
+
+Back to back on one host, before (fs-core fix reverted) → after:
+
+| backend | op | direct ns | overhead ns | allocs/op |
+|---|---|---|---|---|
+| observer | getattr | 7.6 → 7.6 | +124 → +124 | 0 → 0 |
+| MockVfs | read 4 KiB | 953 → 975 | +142 → +141 | 5 → 5 |
+| View | getattr | 1993 → 2002 | +201 → +108 | 4 → 4 |
+| View | lookup | 3529 → 3586 | +157 → +164 | 11 → 11 |
+| View | read 4 KiB | **15424 → 11694** | +101 → +408 (run to run: −106…+408) | **60 → 21** |
+
+(Absolute times on this host drift ±40% between sessions — a run earlier in
+the day read MockVfs rows 40% slower than C7a's table with identical code —
+so only back-to-back pairs are compared.) `make perf-gate`'s vfs stage:
+**VFS-BENCH GATE PASSED** (every overhead < 1 µs, every ceiling met).
+
+### Verification (this part)
+
+- `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings`
+  clean; `cargo build --workspace`.
+- Tests: fs-core `--lib` 39; vfs `--features conformance` 53 + 11 (+1
+  ignored); frontend-fuse `--lib` 18, `--test wire` 20; engine `--lib` 321
+  passed / 2 ignored; engine `--test conformance` passed (deferral group 8/8,
+  incl. the two new tests).
+- Harness (release, `--seed 7`): `cold-cache`, `readahead`,
+  `readahead-adaptive`, `prefetch-fairness`, `scan-ahead`, `s3-retry`,
+  `fio-latency`, `fio-blips`, `coop-cache-hit`, `lock-latency`,
+  `flock-cross-node`, `session-handover-idle` — all PASSED.
+  **`writeback-backpressure` FAILED** (`EIO` after 122 s), identically on the
+  pre-C7b binary (`70b7a5e`): a pre-existing failure (see "Lease waits"
+  above). Not caused by C7b; for the coordinator.
+- `tests/perf-gate.sh`, harness-bench stage: the committed floors in
+  `tests/perf-baseline.json` do not fit this host. The pre-C7b binary misses 7
+  of 8 metrics and the C7b binary 7 of 8 (e.g. warm random-read IOPS
+  336k / 439k vs a 1.15M floor: kernel page cache speed, untouched by C7b).
+  Back to back, C7b vs before: cold small-file read 14797 vs 12587 files/s,
+  sequential cold read 272 vs 254 MiB/s, metadata walk 56.6k vs 39.8k/s,
+  import 125 vs 135 files/s, write-back import 195 vs 229 files/s (the write
+  path is unchanged at the default knob; this metric is noisy run to run).
+  The floors are for the CI runner; the nightly job is the judge.
+
+### Plan 31 C7 exit criteria
+
+- [x] Unified op metrics/tracing (§6.10); `constellation_vfs_ops_total` /
+  `_op_seconds` scraped by a test (C7a)
+- [x] `OpWatch` over control: `node.ops` with the `view` filter (C7a)
+- [x] `vfs-bench` in the perf gate (`tests/perf-gate.sh`, `make perf-gate`,
+  nightly `performance`, PR `perf-regression`), numbers recorded and within
+  the §6.9 target
+- [x] Deferral of cold reads via `Responder`, where the measurement justified
+  it (worker starvation demonstrated and removed); lease waits measured and
+  deliberately not converted
+- [x] Each Mountpoint-derived candidate has a recorded benchmark result and an
+  explicit decision: (a) REJECT, (b) ADOPT hex/path fix + REJECT splice,
+  (c) REJECT, (d) ADOPT behind `CONSTELLATION_CACHE_READ_RESERVE_PCT` (default
+  off), (e) REJECT
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798; `writeback-backpressure` fails on the base too) —
+  coordinator

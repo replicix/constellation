@@ -523,6 +523,15 @@ impl MockVfs {
     }
 
     /// Another mock over the same filesystem: a view of `path`.
+    /// Make `ino`'s next read cold, as the conformance kit's `evict` hook
+    /// asks (a reference mock only).
+    pub fn evict(&self, ino: Ino) -> Result<(), Code> {
+        match &self.inner.view {
+            Some(view) => view.evict(ino).map_err(|e| e.code()),
+            None => Err(Code::NotImplemented),
+        }
+    }
+
     pub fn view_of(&self, path: &str, confine_links: bool) -> Result<MockVfs, Code> {
         let fs = self.ref_fs().ok_or(Code::NotSupported)?;
         Self::over(fs, path, confine_links)
@@ -948,6 +957,25 @@ impl Vfs for MockVfs {
         r: R,
     ) {
         let call = self.record(cx, Args::Read { ino, fh, off, len });
+        let scripted = {
+            let slot = self.inner.scripts.read.lock().unwrap();
+            !slot.once.is_empty() || slot.sticky.is_some()
+        };
+        // An evicted file's first read is cold (`RefView::cold_read`).
+        if let Some(view) = self
+            .inner
+            .view
+            .as_ref()
+            .filter(|v| !scripted && v.take_cold(ino))
+        {
+            let r = Tap {
+                r,
+                inner: Arc::downgrade(&self.inner),
+                call,
+            };
+            view.cold_read(ino, fh, off, len, r);
+            return;
+        }
         self.run(call, |s| &s.read, r, |v| v.read(ino, fh, off, len));
     }
 

@@ -22,6 +22,7 @@
 pub mod atime;
 pub mod authority_driver;
 pub mod backend;
+pub mod completion;
 pub mod control;
 pub mod coop;
 pub mod cto;

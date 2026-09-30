@@ -40,7 +40,10 @@
 //! # Gating
 //!
 //! `cargo bench -p constellation-engine --bench vfs_bench` (`make
-//! vfs-bench`) prints the table, then runs the criterion groups, and
+//! vfs-bench`) prints the table, then runs the criterion groups
+//! (skipped with `VFS_BENCH_REPORT_ONLY=1`; `VFS_BENCH_JSON=<path>` also
+//! writes the table as JSON, which `tests/perf-gate.sh` checks against the
+//! allocation ceilings in `tests/perf-baseline.json`), and
 //! **exits non-zero** if any scenario's dispatch overhead is 1 µs or more
 //! or the observed path allocates more per op than the direct one (at all
 //! with no backend; by more than half an allocation per op over one, whose
@@ -499,8 +502,8 @@ fn scenarios() -> (Vec<Scenario>, Node) {
 const OVERHEAD_LIMIT_NS: f64 = 1000.0;
 
 /// Print the direct/observed table; whether every scenario is within the
-/// §6.9 targets.
-fn report(all: &[Scenario], smoke: bool) -> bool {
+/// §6.9 targets. Every row is also returned, for `VFS_BENCH_JSON`.
+fn report(all: &[Scenario], smoke: bool) -> (bool, Vec<String>) {
     println!(
         "\n{:<9} {:<8} {:>12} {:>12} {:>12}   {:>17}   {:>17}",
         "backend",
@@ -512,6 +515,7 @@ fn report(all: &[Scenario], smoke: bool) -> bool {
         "observed alloc/op"
     );
     let mut ok = true;
+    let mut rows = Vec::new();
     for s in all {
         let iters = if smoke {
             1
@@ -533,6 +537,16 @@ fn report(all: &[Scenario], smoke: bool) -> bool {
             m.observed_allocs.0,
             m.observed_allocs.1
         );
+        rows.push(format!(
+            "{{\"backend\":\"{}\",\"op\":\"{}\",\"direct_ns\":{:.1},\"observed_ns\":{:.1},\"overhead_ns\":{:.1},\"direct_allocs\":{:.3},\"observed_allocs\":{:.3}}}",
+            s.backend,
+            s.op,
+            m.direct_ns,
+            m.observed_ns,
+            m.overhead_ns,
+            m.direct_allocs.0,
+            m.observed_allocs.0
+        ));
         let (overhead, dallocs, oallocs) = (m.overhead_ns, m.direct_allocs.0, m.observed_allocs.0);
         if smoke {
             continue;
@@ -557,7 +571,7 @@ fn report(all: &[Scenario], smoke: bool) -> bool {
     println!(
         "\ntargets (plan 31 §6.9): overhead < {OVERHEAD_LIMIT_NS:.0} ns/op; no extra allocation per inline op.\n"
     );
-    ok
+    (ok, rows)
 }
 
 fn criterion_groups(c: &mut Criterion, all: &[Scenario]) {
@@ -584,10 +598,21 @@ fn main() {
     // `cargo bench` passes `--bench`; `cargo test --benches` does not.
     let measuring = std::env::args().any(|a| a == "--bench");
     let (all, _node) = scenarios();
-    let ok = report(&all, !measuring);
-    let mut c = Criterion::default().configure_from_args().without_plots();
-    criterion_groups(&mut c, &all);
-    c.final_summary();
+    let (ok, rows) = report(&all, !measuring);
+    if let Ok(path) = std::env::var("VFS_BENCH_JSON") {
+        let json = format!(
+            "{{\"schema\":1,\"ok\":{ok},\"overhead_limit_ns\":{OVERHEAD_LIMIT_NS},\"rows\":[{}]}}\n",
+            rows.join(",")
+        );
+        std::fs::write(&path, json).expect("write VFS_BENCH_JSON");
+    }
+    // The perf gate needs the table only; the criterion groups are for a
+    // human comparing runs (`target/criterion`).
+    if std::env::var_os("VFS_BENCH_REPORT_ONLY").is_none() {
+        let mut c = Criterion::default().configure_from_args().without_plots();
+        criterion_groups(&mut c, &all);
+        c.final_summary();
+    }
     if measuring && !ok {
         std::process::exit(1);
     }

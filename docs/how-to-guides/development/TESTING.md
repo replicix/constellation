@@ -1746,9 +1746,14 @@ harness) for an otherwise identical encryption-overhead comparison.
 
 JSON output contains import, durable import, metadata-walk, cold small-file
 read, cold sequential large-file MiB/s, and warm 4 KiB random-read IOPS.
-`tests/perf-gate.sh` runs the committed workload from
-`tests/perf-baseline.json` and fails when any rate falls more than the
-baseline's 20% tolerance. It compares the median of three runs so scheduler
+`tests/perf-gate.sh` first runs `vfs-bench` (below) and fails on a miss of
+plan 31 §6.9's dispatch targets or on a backend's per-op allocations above
+the ceilings in `tests/perf-baseline.json`'s `vfs_bench` section
+(`PERF_GATE_SKIP_VFS_BENCH=1` skips this stage; `PERF_GATE_VFS_BENCH_ONLY=1`
+runs only it, as the `perf-regression` PR workflow does). It then runs the
+committed workload from `tests/perf-baseline.json` and fails when any rate
+falls more than the baseline's 20% tolerance (the harness bench needs
+`rsync` on the host). It compares the median of three runs so scheduler
 noise in the sub-second metadata and warm-cache probes does not create a
 spurious regression.
 
@@ -2026,7 +2031,21 @@ release build) times the frontend-side path around an op (op id, span,
 `getattr`/`lookup`/`read`, on no backend, `MockVfs` and a real `View`, counting
 heap allocations per op with a thread-local counting allocator. It exits 1 if
 the dispatch overhead reaches 1 us/op or the path allocates more than the bare
-one (plan 31 section 6.9). Last recorded numbers are in `PROGRESS.md`.
+one (plan 31 section 6.9). `VFS_BENCH_JSON=<path>` also writes the table as
+JSON and `VFS_BENCH_REPORT_ONLY=1` skips the criterion groups (both used by
+`tests/perf-gate.sh`, which is `make perf-gate` and the nightly
+`performance` job). Last recorded numbers are in `PROGRESS.md`.
+
+**Cold-read deferral (plan 31 C7b).** A read whose chunk is in no local cache
+is answered from the engine's completion pool (`crates/engine/src/completion.rs`),
+not on the FUSE worker. Tests: the conformance kit's
+`deferral::a_cold_read_completes_from_another_thread` and
+`deferral::a_non_deferrable_cold_read_parks_the_calling_thread` (through the
+fixture's `evict` hook: the engine drops the file's clean chunks,
+`View::evict_cached`; the reference fs models a cold read), the engine unit
+test `view::qos_tests::a_deferred_cold_read_answers_off_the_caller_and_holds_its_slot`,
+`completion::tests`, and the FUSE session's
+`a_detach_drains_deferred_reads_and_gives_up_past_its_wait`.
 
 ## Subtree confinement (plan 31 §6.12)
 

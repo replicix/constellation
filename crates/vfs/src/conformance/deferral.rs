@@ -493,6 +493,102 @@ pub(super) fn non_deferrable_waits_park_the_calling_thread(env: &Env<'_>) -> Tes
     Ok(())
 }
 
+/// A file of `len` bytes (a seeded pattern) put and closed, then made
+/// cold (the fixture's `evict` hook); its inode and content.
+fn cold_file(fx: &super::Fx, len: usize, seed: u64) -> Result<(u64, Vec<u8>), super::TestErr> {
+    let c = fx.client();
+    let content: Vec<u8> = (0..len)
+        .map(|i| ((i as u64).wrapping_mul(31).wrapping_add(seed) % 251) as u8)
+        .collect();
+    let f = must("put f", c.put(c.root(), "cold", &content));
+    fx.evict(f.attr.ino)?;
+    Ok((f.attr.ino, content))
+}
+
+pub(super) fn a_cold_read_completes_from_another_thread(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    if !fx.caps.deferrable.contains(OpKind::Read) {
+        super::skip!("this frontend does not allow read to defer (FrontendCaps::deferrable)");
+    }
+    let (ino, content) = cold_file(&fx, 300 * 1024, env.seed())?;
+    let c = fx.client();
+    let vfs = c.dyn_vfs().clone();
+    let o = must("open", c.open(ino, OpenFlags::READ));
+    let caller = Caller::with_groups(1000, 1000, &[]);
+    let me = std::thread::current().id();
+    let len = content.len() as u32;
+    // Cold: the wait for the store is not on this thread.
+    let cold = once(|d| vfs.read(&OpCtx::new(OpKind::Read, &caller), ino, o.fh, 0, len, d));
+    if cold.completions != 1 {
+        fail!("the cold read completed {} times", cold.completions);
+    }
+    let data = must("cold read", cold.result.expect("completed"));
+    if data.contiguous().as_ref() != content.as_slice() {
+        fail!("the cold read returned other bytes");
+    }
+    if cold.completed_on == Some(me) {
+        fail!("a cold read was answered on the calling thread, which waited for the store");
+    }
+    // Warm now (the cold read cached it): answered inline, as before.
+    let warm = once(|d| vfs.read(&OpCtx::new(OpKind::Read, &caller), ino, o.fh, 0, len, d));
+    let data = must("warm read", warm.result.expect("completed"));
+    if data.contiguous().as_ref() != content.as_slice() {
+        fail!("the warm read returned other bytes");
+    }
+    if !warm.before_return || warm.completed_on != Some(me) {
+        fail!("a warm read was deferred: only a read that waits may be");
+    }
+    must("close", c.close(ino, o.fh));
+    Ok(())
+}
+
+pub(super) fn a_non_deferrable_cold_read_parks_the_calling_thread(env: &Env<'_>) -> TestResult {
+    let mut caps = env.caps().clone();
+    let mut without_read = OpKindSet::EMPTY;
+    for k in OpKind::ALL {
+        if *k != OpKind::Read && caps.deferrable.contains(*k) {
+            without_read = without_read.with(*k);
+        }
+    }
+    caps.deferrable = without_read;
+    let fx = env.fresh_with(&caps);
+    let (ino, content) = cold_file(&fx, 300 * 1024, env.seed())?;
+    let c = fx.client();
+    let vfs = c.dyn_vfs().clone();
+    let o = must("open", c.open(ino, OpenFlags::READ));
+    let caller = Caller::with_groups(1000, 1000, &[]);
+    let me = std::thread::current().id();
+    let s = once(|d| {
+        vfs.read(
+            &OpCtx::new(OpKind::Read, &caller),
+            ino,
+            o.fh,
+            0,
+            content.len() as u32,
+            d,
+        )
+    });
+    let data = must("cold read", s.result.expect("completed"));
+    if data.contiguous().as_ref() != content.as_slice() {
+        fail!("the cold read returned other bytes");
+    }
+    if s.completions != 1 || !s.before_return || s.completed_on != Some(me) {
+        fail!(
+            "a cold read on a frontend that cannot take a deferred answer completed {} time(s), \
+             {} the call returned, on {} thread",
+            s.completions,
+            if s.before_return { "before" } else { "after" },
+            if s.completed_on == Some(me) {
+                "the calling"
+            } else {
+                "another"
+            }
+        );
+    }
+    must("close", c.close(ino, o.fh));
+    Ok(())
+}
+
 pub(super) fn locks_are_refused_without_the_capability(env: &Env<'_>) -> TestResult {
     let mut caps = env.caps().clone();
     caps.cluster_locks = false;

@@ -15,5 +15,14 @@
     "cold_read_files_per_sec": 16339.74,
     "sequential_cold_read_mib_per_sec": 421.10,
     "warm_random_read_iops": 1441848.89
+  },
+  "vfs_bench": {
+    "alloc_slack": 0.5,
+    "max_allocs_per_op": {
+      "observer/getattr": 0,
+      "view/getattr": 4,
+      "view/lookup": 11,
+      "view/read": 21
+    }
   }
 }
