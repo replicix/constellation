@@ -2,5 +2,6 @@ third_party/
 build/
 data/
 results/*
+RUNBOOK.md
 !results/full.jsonl
 !results/summary-tables.md

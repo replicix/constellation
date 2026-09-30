@@ -1,0 +1,4 @@
+build/
+RUNBOOK.md
+# raw per-run directories (client logs, stats, dmesg); regenerate with run.sh
+results/*/v*-r*/

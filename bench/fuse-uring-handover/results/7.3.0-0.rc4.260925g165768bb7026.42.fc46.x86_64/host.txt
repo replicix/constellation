@@ -1,0 +1,6 @@
+kernel=7.3.0-0.rc4.260925g165768bb7026.42.fc46.x86_64
+os=Fedora Linux 46 (Cloud Edition Prerelease)
+cpus=8 possible=0-7
+enable_uring=Y
+liburing=/usr/lib64/liburing.so.2
+date=2026-09-30T20:14:40Z

@@ -51,8 +51,10 @@ paragraph).
     (VERIFIED `vendor/fuser/CONSTELLATION-PATCH.md`,
     `crates/frontend-fuse/src/session.rs`). This plan's ring transport must
     compose with that handover, not bypass it — §3(e) below is exactly that
-    seam, and it is the one place this plan found an open, UNVERIFIED
-    question rather than a settled design.
+    seam. It was the one place this plan found an open, UNVERIFIED question
+    rather than a settled design. Milestone Z0a answered it on 2026-09-30
+    (`bench/fuse-uring-handover/RESULTS.md`): a ring session **cannot** be
+    handed over losslessly, so handover-capable sessions stay on `/dev/fuse`.
   - **C7b**'s cold-read deferral (`crates/engine/src/view/io.rs`'s
     `cold_probe`, VERIFIED, module doc + `do_read_detached` at
     `crates/engine/src/view/io.rs:191`) and its "REJECT splice" finding
@@ -72,8 +74,10 @@ paragraph).
 CSI engine pod's session handover (plan 37's K0/K5) and this plan's ring
 transport both touch `FuseSession`/`fuser::Session`; §3(e)'s fallback policy
 (`transport: Auto | DevFuse` on a per-mount basis) is written so a
-handover-capable session (plan 37's pods) can default out of the ring
-transport without this plan and plan 37 fighting over the same knob. Plan 37
+handover-capable session (plan 37's pods) stays out of the ring transport
+without this plan and plan 37 fighting over the same knob. Z0a settled that
+it must stay out: a ring session cannot be handed over losslessly, so plan
+37's pods are `DevFuse` for good (§3(e)). Plan 37
 also runs inside a container, where seccomp profiles commonly block
 `io_uring` entirely (§8, Risks) — this plan's runtime detection is what
 keeps that combination safe rather than a silent crash.
@@ -452,10 +456,11 @@ byte-for-byte today's vendored fuser:
   protocol versions, agreed `InitFlags`, `max_readahead`, `max_write`,
   `max_background`, `congestion_threshold`, `time_gran_ns`, `max_pages`,
   `max_stack_depth`); this plan adds a `transport: Transport` field
-  (`DevFuse | Uring | UringZeroCopy`) so `check_resumable()` (the existing
-  handover gate, same file) can refuse resuming a ring-transport session on
-  a build without the `io-uring` feature, or on a kernel that no longer
-  offers it — exactly the check §3(e) needs and nothing more.
+  (`DevFuse | Uring | UringZeroCopy`) so the handover gates (the existing
+  `check_resumable()`, same file, and `FuseSession::detach`) can refuse any
+  session whose transport is not `DevFuse`. Z0a showed that a ring session
+  can be neither handed over losslessly nor downgraded to `/dev/fuse`
+  (§3(e)), so this is exactly the check §3(e) needs and nothing more.
 - `clone_fd` is ignored when the ring transport is active (REPORTED Skory:
   a ring session doesn't need the `FUSE_DEV_IOC_CLONE` per-worker
   descriptor trick `channel.rs`'s existing `clone_fd` does, VERIFIED
@@ -658,57 +663,91 @@ about the memcache's design, eviction policy, or budget changes; this plan
 only adds a second, parallel way to answer a read that bypasses it when the
 operator has opted into the `admit` trust model and the request qualifies.
 
-### 3(e) Session handover: the open question
+### 3(e) Session handover: resolved by Z0a — handover-capable sessions stay on `/dev/fuse`
 
 Plan 31 §6.11 built FUSE session handover (`FuseSession::detach`/`resume`,
 the vendored `from_fd_resumed`) for two consumers: `constellation daemon
 --upgrade` on plain Linux, and plan 37's CSI engine-pod replacement. Both
-assume a `/dev/fuse` connection the kernel keeps queuing requests on across
-the handover gap. **Whether a *new process* can register fresh io_uring
-queues on an already-`FUSE_INIT`'d connection after the *old* process's
-rings (and the io_uring instance that owned them — an io_uring context is
-process-local kernel state, unlike the `/dev/fuse` fd itself) are gone is
-UNVERIFIED** — nothing in the 6.14/7.3 kernel documentation or the
-Skory/fuser research addresses resumption, because the fork was built
-against ordinary long-lived mounts, not Constellation's handover primitive;
-this is exactly the shape of gap plan 31 §6.11 itself found and solved for
-`Session::from_fd`'s `handshake()` ("a handed-over, already initialised
-connection is not a mount source... checked against Mountpoint's fork, and
-found to need independent design"), and this plan inherits the same
-discipline rather than assuming the answer.
+rely on two properties of the `/dev/fuse` transport. First, `detach` *stops
+reading `/dev/fuse` and drains in-flight ops* before the fd changes hands.
+Second, everything that arrives in the gap waits in the kernel's queue until
+the next process's first `read(2)`. The question was whether a *new
+process* can take over a connection whose io_uring queues belonged to the
+old process's io_uring instance, which is process-local and dies with it.
 
-**Milestone Z0a (§7) spikes it**, at the protocol level rather than in
-Constellation — nothing in the tree speaks FUSE-over-io_uring until Z1
-vendors it, and the question is about the *kernel*, not about our code:
-does a FUSE connection whose ring entries belonged to a now-exited
-io_uring instance (a) survive at all, (b) still deliver requests over
-`/dev/fuse` to whoever holds the fd, and (c) accept fresh
-`FUSE_IO_URING_CMD_REGISTER`s from a new process? Z0a's milestone entry
-below is the full brief. Its three possible outcomes map directly onto the
-policy below: (c) works → `Auto` everywhere; (a)+(b) but not (c) → `Auto`,
-with a handover downgrading the resumed session to `/dev/fuse`; not even
-(a) → `DevFuse` for every handover-capable session, and `daemon --upgrade`
-must refuse to detach a ring session.
+**Z0a answered it** (VERIFIED: `bench/fuse-uring-handover/RESULTS.md`, a
+raw-uapi C server, 4 variants × 5 repeats with two continuous verified
+readers, on 6.17.0 (Ubuntu 25.10), 7.0.0 (Ubuntu 26.04) and
+7.3.0-rc4 (Fedora Rawhide), 60 runs, identical behaviour on all three, and
+predicted from `fs/fuse/dev_uring.c` of each version before running):
 
-**The fallback policy, regardless of what the spike finds**: a new
-`transport: TransportPolicy` field (`Auto | DevFuse`) on
-`MountOptions` (VERIFIED the existing `MountOptions` struct,
-`crates/frontend-fuse/src/session.rs`, already carrying `fs_name`,
+- **(a) The connection survives.** It is aborted only when the last
+  `/dev/fuse` file reference goes (`fuse_dev_release`), and the new process
+  holds one. io_uring teardown (explicit or by process death) only runs
+  `fuse_uring_cancel` on the old process's *available* entries. No
+  `ENOTCONN`, no `dmesg` line, in 60/60 runs.
+- **(b) Requests never return to `/dev/fuse`.** Once every queue has had an
+  entry, `fuse_uring_do_register` switches `fiq->ops` to the ring, and
+  nothing switches it back. After the handover, B's `/dev/fuse` reader got 0
+  requests in 60/60 runs. Without ring entries, every request waits in its
+  per-CPU queue. **A resumed ring session can therefore not be downgraded to
+  `/dev/fuse`.** The plan's "(a)+(b) → `Auto` with the resumed session
+  downgraded" outcome is impossible.
+- **(c) Re-registration works mechanically but not losslessly.** B's
+  `FUSE_IO_URING_CMD_REGISTER`s on the already-initialised connection are
+  accepted (720/720), and B then serves new requests correctly. Two defects
+  make it a different thing from the `/dev/fuse` handover:
+  1. **In-flight loss.** Every request that sat in one of the old process's
+     ring entries when its io_uring went away is orphaned. There is no
+     commit-without-fetch or unregister command, so a server cannot stop
+     taking requests except by destroying its io_uring. Re-armed entries
+     go to the head of the available list, so the old process takes most
+     requests while it lives, even with B's entries registered. The new
+     process cannot complete an orphaned request either: commit reads the
+     reply through the entry's registered user pointer, which points into
+     the old address space. Its caller blocks in `request_wait_answer`,
+     **unkillable** (D after `SIGTERM`), until the connection is aborted
+     through fusectl. This hit 30/30 in-flight reads per kernel when B
+     registered after A was gone, and 12/30 over all kernels when B
+     registered first (overlap).
+  2. **Gap stall.** A request queued while no entry was available is not
+     dispatched by a REGISTER. It moves only when a later request on the
+     same per-CPU queue completes a commit. It finished 3.74–3.78 s after
+     B's REGISTER, at the moment an unrelated request touched that CPU's
+     queue (30/30 runs). On a quiet mount it waits indefinitely.
+
+  B also has to register on every possible CPU's queue, with payloads sized
+  from the negotiated INIT. On 7.3 a single failed REGISTER disables the
+  ring for the connection (`fch->io_uring = 0`) while the ring stays
+  "ready", which leaves the mount unservable (source reading). Zero-copy
+  and bufpool queues (Z4) are worse still: their pool is bound to the
+  registering process's address, and `ADD_QUEUE`/`ADD_BUFPOOL` refuse an
+  existing queue (source reading, not run).
+
+**The policy, settled.** A new `transport: TransportPolicy` field
+(`Auto | DevFuse`) on `MountOptions` (VERIFIED the existing `MountOptions`
+struct, `crates/frontend-fuse/src/session.rs`, already carrying `fs_name`,
 `allow_other`, `read_only`, `n_threads`, `tuning: KernelTuning` — this is a
 sibling field on the same "how a view is mounted" struct, not a new config
 type). `Auto` (the default for a plain, non-handover-capable daemon mount)
 lets §2.4's ladder run as designed. **A session opened with handover in
 mind — plan 37's CSI engine pods, and `constellation daemon --upgrade`'s own
-target mount — defaults to `DevFuse`** (pin to the `/dev/fuse` transport,
-skip the ring entirely) **until Z0a's spike proves re-registration works**;
-once it does, the default for handover-capable sessions flips to `Auto` in
-the milestone that lands the transport (Z2), citing Z0a's result. This is
-the one place in this plan where the design is genuinely conditional on an
-UNVERIFIED fact rather than settled: Z0a exists only to answer it, and its
-answer changes what Z1 onward defaults to for handover-capable mounts
-specifically (plain,
-non-CSI, non-upgrade mounts are unaffected either way — they were never
-going to be handed over, so `Auto` costs them nothing).
+target mount — is `DevFuse`, permanently** (on every kernel through
+7.3-rc5; this is no longer "until the spike proves otherwise"). The transport
+is fixed when the mount starts, because a connection whose ring became ready
+can never serve over `/dev/fuse` again. It follows that **`FuseSession::detach`
+(and so `node.handoff` / `daemon --upgrade`) refuses a session whose
+negotiated transport is not `DevFuse`**, with an error that names the
+transport. Tearing the mount down and remounting is the only upgrade path
+for such a session. Plain mounts were never going to be handed over, so
+`Auto` costs them nothing.
+
+Revisit only if upstream FUSE gains both (i) a way for a server to stop
+taking requests on its entries without losing the connection (a
+commit-without-fetch or unregister-entry command, or a "quiesce ring" that
+returns requests to the `fiq` queue), and (ii) dispatch of already-queued
+requests when an entry is registered. Z0a's `bench/fuse-uring-handover/run.sh`
+is the test to re-run.
 
 ## 4. Threading, memory and CPU budgets
 
@@ -873,9 +912,11 @@ and this plan's new fio-based gate, §6).
   mapping (assert fallback, not a crash); abort via
   `/sys/fs/fuse/connections/<id>/abort` while rings are armed (the existing
   `abortable: true` FrontendCaps flag and its harness use, VERIFIED plan 31
-  §6.6, extended to the ring transport); detach/handover under load with
-  the ring transport active (§3(e)'s Z0a spike, promoted to a standing
-  scenario once Z2 has a ring transport to run it against). **Passthrough-specific**: eviction attempted
+  §6.6, extended to the ring transport); `detach` of a session running
+  the ring transport is **refused** with a clear error, and the mount keeps
+  serving (§3(e): Z0a showed that a ring handover orphans in-flight
+  requests), promoted to a standing scenario once Z2 has a ring transport to
+  run it against. **Passthrough-specific**: eviction attempted
   while a chunk is passthrough-open (assert the pin-while-open guard, §3(c),
   holds — the chunk is not evicted, and the guard's refcount is exactly the
   open-fd count); a remote write landing a new manifest while a passthrough
@@ -1019,6 +1060,19 @@ additions are listed below.
   the decision paragraph names which of the three policies applies.
   Timebox: if neither route yields a working ring-mode A within a day of
   effort, stop and report what blocked it rather than approximating.
+
+  **Done 2026-09-30** (route 2, `bench/fuse-uring-handover/`, results in its
+  `RESULTS.md` and `results/summary-tables.md`). Three kernels (6.17.0,
+  7.0.0, 7.3.0-rc4), all four variants, 5 repeats each, every cell with an
+  outcome. (a) yes, (b) **no**, (c) yes but lossy: in-flight requests are
+  orphaned (unkillable until a fusectl abort), and requests queued in the
+  gap wait for unrelated traffic on their queue. The prediction matched the
+  observation everywhere except one detail: 7.3's `-ECANCELED` path for
+  cancelled dispatches never triggered, and every loss was a hang.
+  **Decision:** handover-capable sessions are `DevFuse`, permanently, and
+  `detach` refuses a ring session (§3(e)). None of the three pre-listed
+  outcomes applied as written. (b)'s "no" rules out the downgrade option,
+  and (c)'s loss rules out `Auto`.
 - **Z0b — Baselines and verify-once (independent of Z0a; before Z1).**
   The fio-based CPU-s/GiB + RSS gate (§6) is built and run against
   `main`'s current `/dev/fuse`-only path, establishing Constellation's own
@@ -1046,12 +1100,14 @@ additions are listed below.
   matrix lane's `auto` leg exists, but `TransportPolicy` still defaults
   every mount to `DevFuse` at this milestone (nothing yet defaults *on*
   except in the lane's explicit test legs) — harness + pjdfstest green on
-  both transports when explicitly selected.
+  both transports when explicitly selected. `NegotiatedInit.transport` and
+  the `detach`/`check_resumable()` refusal of non-`DevFuse` sessions (§3(a),
+  §3(e)) land here, with the transport, not later.
 - **Z2 — Adapter integration, on by default where the kernel offers it.**
   §3(b)'s `ReadReply`/`WriteData`/metrics changes land; `TransportPolicy::Auto`
   becomes the default for non-handover-capable mounts (plain desktop/server
-  daemons); handover-capable mounts (CSI, `daemon --upgrade`) follow Z0a's
-  spike result. `node.status`/metrics/docs updated per §5.
+  daemons); handover-capable mounts (CSI, `daemon --upgrade`) stay
+  `DevFuse` (Z0a, §3(e)). `node.status`/metrics/docs updated per §5.
 - **Z3 — Passthrough for single-chunk read-only opens.** §3(c)'s
   eligibility rule, the `Opened`/`View::open` extension, the pin-while-open
   `DiskCache` guard, and the scan-ahead/atime move to `open()` land,
@@ -1151,13 +1207,16 @@ up exactly that set, not a promise of all four.
   silent omission — it is `EngineProfile`/CLI-flag explicit, logged, and
   `always` remains one flag away with zero-copy/passthrough cleanly
   disabled rather than partially engaged, exactly as §2.3 specifies.
-- **Handover.** §3(e)'s UNVERIFIED re-registration question is the one
-  place this plan's design is conditional rather than settled. Mitigation:
-  Z0a resolves it before Z1 ships anything depending on the answer, and the
-  `DevFuse`-by-default-for-handover-capable-sessions fallback (§3(e)) means
-  a negative spike result costs plan 37 and `daemon --upgrade` nothing they
-  don't already have today — they simply never adopt the ring transport for
-  those specific sessions, and every other mount is unaffected.
+- **Handover (resolved by Z0a).** A ring session cannot be handed over
+  losslessly or downgraded to `/dev/fuse` (§3(e)). Handover-capable sessions
+  are therefore `DevFuse` for good. That costs plan 37 and `daemon --upgrade`
+  nothing they have today, but they never get the ring's CPU savings (§1).
+  The remaining risk is a *misconfigured* session: a mount started with
+  `Auto` that someone later tries to hand over. Mitigation: `detach` refuses
+  any non-`DevFuse` session (§3(e)). Without that refusal, a handover under
+  load would leave callers unkillable until a fusectl abort. The refusal
+  therefore lands with the transport (Z1), and it is a standing harness
+  scenario (§6).
 
 ## 9. Definition of done
 
@@ -1168,12 +1227,14 @@ binary, never for a kernel feature this plan is responsible for degrading
 out of gracefully — pjdfstest 8798/8798, `PROGRESS.md`/`TESTING.md`
 updated), plus, per milestone (cumulative):
 
-1. **Z0a**: `bench/fuse-uring-handover/RESULTS.md` exists with the
+1. **Z0a** (**done** 2026-09-30): `bench/fuse-uring-handover/RESULTS.md` exists with the
    kernel-source reading, the four variants' outcomes on at least two
    kernels (a hang past the timeout counts as an outcome), and the
    `TransportPolicy` decision for handover-capable sessions (any of the
    three outcomes is valid — §3(e) only requires the answer, not a
    particular answer); §3(e) and `PROGRESS.md` carry that decision.
+   Result: three kernels, 60 runs; decision `DevFuse` for handover-capable
+   sessions plus `detach` refusing ring sessions (§3(e)).
 2. **Z0b**: the fio-based CPU-s/GiB + RSS gate exists and runs against
    `main`'s `/dev/fuse`-only baseline; the transport matrix lane's
    skeleton exists; §2.3's verify-once changes and `--cache-verify` land
@@ -1234,5 +1295,7 @@ updated), plus, per milestone (cumulative):
 | `docs/plans/v1/wip/37-kubernetes-csi.md` (lines 1–120) | Style template, VERIFIED/REPORTED convention, the K0 re-verification precedent §3(a)/§7 follow | VERIFIED (this repo, `main`) |
 | `docs/plans/v1/wip/31-core-frontend-backend.md` §6.2, §6.4, §6.6, §6.9, §6.11, §11 (C4, C7), §14, §15 | The `Vfs`/`Responder`/`FrontendCaps`/threading contract this plan builds on (§3), the session-handover design and risk (§3(e)), the perf-target and DoD style (§4, §9) | VERIFIED (this repo, `main`) |
 | kernel.org, `fs/fuse/dev.c` (`torvalds/master`), the 6.14 FUSE-io_uring kernel doc, the 7.3 FUSE pull request | §2.1 rows 1–2's splice/vmsplice mechanism, §2.4's kernel version gates, §3(a)/§3(d)'s transport/zero-copy mechanism | VERIFIED (per the research notes' own primary-source citations) |
+| `bench/fuse-uring-handover/RESULTS.md`, `results/summary-tables.md`, `results/*/summary.jsonl` (this repo) | §3(e)'s handover findings and decision, §6's refusal scenario, §7 Z0a's result, §8's handover risk | VERIFIED (Z0a's own run, 2026-09-30, three kernels) |
+| `fs/fuse/dev_uring.c`, `dev.c` at `gregkh/linux` `v6.17.13`, `v7.0.14` and `torvalds/linux@165768bb7026` (= `v7.3-rc5` for `dev_uring.c`): `fuse_dev_release`, `fuse_uring_cancel`, `fuse_uring_do_register`, `fuse_uring_register`, `fuse_uring_cmd`, `fuse_uring_queue_fuse_req`, `fuse_uring_ent_avail`, `fuse_uring_next_fuse_req`, `fuse_uring_commit`, `fuse_uring_send_in_task`, 7.3's `fuse_uring_add_queue`/`add_bufpool` | §3(e)'s mechanisms (why (a)/(b)/(c) come out as they do), with line numbers per version in RESULTS.md | VERIFIED (read before the run, predictions confirmed by it) |
 | `github.com/Skory/fuser` (PRs #1–#8, design gist) | §3(a)'s vendoring design | REPORTED — re-verified at Z1 (§7) |
 | `joannekoong/libfuse` `zero_copy_v7` branch | §2.1 row 6, §3(d)'s zero-copy userspace state and known bugs | REPORTED — re-verified at Z4 (§7) |

@@ -29130,3 +29130,33 @@ The RSS-bounded ones also pass, with the memory tier clamped to the small
 file), `writeback-bigfile` (138 MiB, 32 MiB cache), `fallocate-sparse` (93 MiB).
 Not run here: the full workspace suite, the harness matrix and pjdfstest,
 which are the gate run's.
+
+## Plan 38 Z0a — FUSE-over-io_uring session handover spike
+
+Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) §3(e) left one
+question open: can a FUSE session that uses the io_uring transport go through
+plan 31 §6.11's handover (`/dev/fuse` fd passed to a freshly exec'd process,
+the old one exits and takes its io_uring instance with it)? The answer decides
+`TransportPolicy` for handover-capable sessions. Nothing in Constellation
+changed. The spike is `bench/fuse-uring-handover/`, a raw-uapi C server with
+liburing, so no libfuse. Findings: `bench/fuse-uring-handover/RESULTS.md`.
+
+Setup: 4 variants (A tears down, B only reads `/dev/fuse`; as before, then B
+registers; B registers first; A `SIGKILL`ed with its ring live) × 5 repeats,
+two continuous verified readers each. Run on three kernels: 6.17.0 (Ubuntu
+25.10), 7.0.0 (Ubuntu 26.04) and 7.3.0-rc4 (Fedora Rawhide), EC2 c7a.2xlarge.
+Predictions were made from each version's `fs/fuse/dev_uring.c` before running.
+
+| question | result (identical on all three kernels, 60 runs) |
+|---|---|
+| (a) connection survives A's ring going away | yes: 60/60, no `ENOTCONN`, no `dmesg` |
+| (b) requests fall back to `/dev/fuse` | **no**: 0 requests. `fiq->ops` stays on the ring for good, and without entries requests wait in their per-CPU queue |
+| (c) B can register fresh entries | yes, 720/720 accepted, and B serves new requests correctly. **But** every request in flight in A's entries is orphaned (102/120 client reads; the caller is unkillable until a fusectl abort), and requests queued in the gap are not dispatched by REGISTER (they finished 3.74–3.78 s after it, only when unrelated traffic hit the same queue) |
+
+**Decision:** handover-capable sessions (plan 37's CSI pods, the `daemon
+--upgrade` target mount) use `TransportPolicy::DevFuse`, permanently. A ring
+session cannot be handed over losslessly, and it cannot be downgraded to
+`/dev/fuse` either. `FuseSession::detach` (so `node.handoff`) refuses any
+session whose negotiated transport is not `DevFuse`; that refusal lands with
+the transport in Z1. Plain mounts keep `Auto`. Revisit only if upstream adds
+both a way to quiesce a server's ring entries and dispatch-on-register.
