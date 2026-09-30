@@ -201,19 +201,46 @@ mod tests {
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel();
+        // Every job holds until the gate opens, and the gate opens only once
+        // all twelve submits have returned. A submit that parked its caller
+        // until a job finished would stall here for the gate's full
+        // timeout, which the elapsed check below catches without depending
+        // on how loaded the machine is.
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let started = Instant::now();
         for i in 0..12 {
-            let (running, peak, tx) = (running.clone(), peak.clone(), tx.clone());
+            let (running, peak, tx, gate) =
+                (running.clone(), peak.clone(), tx.clone(), gate.clone());
             pool.submit(move || {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(30));
+                let (open, cv) = &*gate;
+                let guard = open.lock().unwrap();
+                let _ = cv
+                    .wait_timeout_while(guard, Duration::from_secs(10), |open| !*open)
+                    .unwrap();
                 running.fetch_sub(1, Ordering::SeqCst);
                 tx.send((i, std::thread::current().id())).unwrap();
             });
         }
-        // Submitting parked nobody: twelve 30 ms jobs were queued at once.
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // Submitting parked nobody: all twelve jobs were queued before any
+        // could finish.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The pool fills up to its bound while the gate is shut: three jobs
+        // are held at once before any is let go.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while running.load(Ordering::SeqCst) < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the pool never reached its bound"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let (open, cv) = &*gate;
+            *open.lock().unwrap() = true;
+            cv.notify_all();
+        }
         let mut seen = Vec::new();
         for _ in 0..12 {
             let (i, thread) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
