@@ -3,9 +3,51 @@
 //! (SIGKILL, simulating a crash), and remount.
 
 use anyhow::{bail, Context, Result};
+use constellation_platform::mounts::UnmountMode;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// A control call on the daemon of `state_dir` (see [`Client::control_call`]).
+pub fn control_call_at(
+    state_dir: &Path,
+    method: &str,
+    params: serde_json::Value,
+    within: Duration,
+) -> Result<serde_json::Value> {
+    let sock = constellation_control::transport::locate_socket(state_dir).with_context(|| {
+        format!(
+            "no daemon has recorded a control socket in {}",
+            state_dir.display()
+        )
+    })?;
+    control_runtime().block_on(async {
+        let call = async {
+            let client = constellation_control::Client::connect_unix(&sock).await?;
+            client.call_json(method, params).await
+        };
+        match tokio::time::timeout(within, call).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(anyhow::anyhow!("{method}: {}", e.message)),
+            Err(_) => bail!(
+                "{method}: no answer from {} within {within:?}",
+                sock.display()
+            ),
+        }
+    })
+}
+
+/// The runtime every control call of the (synchronous) harness runs on.
+fn control_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the harness's control runtime")
+    })
+}
 
 /// How long `mount_view` polls for the mountpoint to appear, and `unmount`/
 /// `leave` poll for the daemon to exit, before giving up. Both loops return
@@ -472,22 +514,14 @@ impl Client {
     /// duplicates that FUSE fd and exec's close-on-exec sends the frozen
     /// daemon a `flush` the child then waits on, uninterruptibly.
     pub fn gc_run_control(&self) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(300)))?;
-        stream.write_all(b"{\"cmd\":\"gc_run\",\"verify_only\":false}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "gc_report",
-            "gc run failed: {resp}; log:\n{}",
-            self.tail_log_n(60)
-        );
-        Ok(resp["report"].clone())
+        let result = self
+            .control_call(
+                "gc.run",
+                serde_json::json!({"verify_only": false}),
+                Duration::from_secs(300),
+            )
+            .map_err(|e| anyhow::anyhow!("gc run failed: {e:#}; log:\n{}", self.tail_log_n(60)))?;
+        Ok(result["report"].clone())
     }
 
     pub fn fsck(&self, repair: bool) -> Result<std::process::Output> {
@@ -524,10 +558,7 @@ impl Client {
 
     /// Clean unmount (flushes, exits the daemon).
     pub fn unmount(&mut self) -> Result<()> {
-        let _ = Command::new("fusermount3")
-            .args(["-u"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Normal);
         if let Some(mut child) = self.child.take() {
             let deadline = Instant::now() + client_timeout();
             while Instant::now() < deadline {
@@ -552,10 +583,7 @@ impl Client {
     /// Unlike [`Self::unmount`], a daemon that exits non-zero is not an
     /// error here: the caller asserts on the status.
     pub fn unmount_exit(&mut self, within: Duration) -> Result<std::process::ExitStatus> {
-        let _ = Command::new("fusermount3")
-            .args(["-u"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Normal);
         let mut child = self.child.take().context("not mounted")?;
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
@@ -566,10 +594,7 @@ impl Client {
         }
         child.kill().ok();
         let _ = child.wait();
-        let _ = Command::new("fusermount3")
-            .args(["-u", "-z"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Lazy);
         bail!(
             "{} daemon did not exit within {within:?} of the unmount: {}",
             self.name,
@@ -580,13 +605,10 @@ impl Client {
     /// Crash: SIGKILL the daemon, then clean up the dead mountpoint.
     pub fn kill9(&mut self) -> Result<()> {
         let mut child = self.child.take().context("not mounted")?;
-        child.kill().context("SIGKILL")?;
+        kill9(&mut child).context("SIGKILL")?;
         child.wait()?;
         // The kernel keeps a dead FUSE mount around; detach it.
-        let _ = Command::new("fusermount3")
-            .args(["-u", "-z"])
-            .arg(&self.mnt)
-            .status();
+        let _ = unmount(&self.mnt, UnmountMode::Lazy);
         Ok(())
     }
 
@@ -600,7 +622,7 @@ impl Client {
     pub fn kill9_within(&mut self, within: Duration) -> Result<Duration> {
         let mut child = self.child.take().context("not mounted")?;
         let pid = child.id();
-        child.kill().context("SIGKILL")?;
+        kill9(&mut child).context("SIGKILL")?;
         let t = Instant::now();
         let mut exited = false;
         while t.elapsed() < within {
@@ -620,7 +642,7 @@ impl Client {
             // Release it: abort the connection of its mount, which ends
             // the requests its wedged thread waits behind.
             if let Some(n) = fuse_connection_of(&self.mnt) {
-                let _ = std::fs::write(format!("/sys/fs/fuse/connections/{n}/abort"), "1\n");
+                let _ = constellation_platform::native().mounts.abort_fuse(n);
             }
             let t2 = Instant::now();
             while t2.elapsed() < Duration::from_secs(10) && child.try_wait()?.is_none() {
@@ -629,19 +651,7 @@ impl Client {
         }
         // The kernel keeps a dead FUSE mount around; detach it (bounded:
         // a detach of a wedged mount would itself hang).
-        if let Ok(mut fm) = Command::new("fusermount3")
-            .args(["-u", "-z"])
-            .arg(&self.mnt)
-            .spawn()
-        {
-            let t3 = Instant::now();
-            while t3.elapsed() < Duration::from_secs(10) && fm.try_wait()?.is_none() {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if fm.try_wait()?.is_none() {
-                let _ = fm.kill();
-            }
-        }
+        detach_bounded(&self.mnt, Duration::from_secs(10));
         match diagnosis {
             None => Ok(took),
             Some(d) => bail!(
@@ -655,24 +665,20 @@ impl Client {
     /// mount and unshipped journal intact but stops renewing its lease —
     /// the "unreachable holder" case from DESIGN.md §4.
     pub fn pause(&self) -> Result<()> {
-        self.signal(libc::SIGSTOP)
+        let pid = self.pid().context("not mounted")?;
+        constellation_platform::native()
+            .process
+            .suspend(pid)
+            .with_context(|| format!("suspending {pid}"))
     }
 
     /// Thaw a paused daemon (SIGCONT).
     pub fn resume(&self) -> Result<()> {
-        self.signal(libc::SIGCONT)
-    }
-
-    fn signal(&self, sig: i32) -> Result<()> {
-        let child = self.child.as_ref().context("not mounted")?;
-        let pid = child.id() as libc::pid_t;
-        if unsafe { libc::kill(pid, sig) } != 0 {
-            bail!(
-                "kill({pid}, {sig}) failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok(())
+        let pid = self.pid().context("not mounted")?;
+        constellation_platform::native()
+            .process
+            .resume(pid)
+            .with_context(|| format!("resuming {pid}"))
     }
 
     #[allow(dead_code)]
@@ -761,126 +767,74 @@ impl Client {
         &self.state
     }
 
-    /// Send one raw control-API request (a JSON object) and return the
-    /// response.
-    pub fn control(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-        let mut line = serde_json::to_string(request)?;
-        line.push('\n');
-        stream.write_all(line.as_bytes())?;
-        let mut reply = String::new();
-        BufReader::new(stream).read_line(&mut reply)?;
-        Ok(serde_json::from_str(&reply)?)
+    /// Call one control method (plan 31 C5) on this client's daemon, found
+    /// through its state dir's `control.path`, with raw JSON params; the
+    /// method's result, or the daemon's refusal as the error (its message).
+    pub fn control_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        within: Duration,
+    ) -> Result<serde_json::Value> {
+        control_call_at(&self.state, method, params, within)
     }
 
+    /// [`Self::control_call`] with the default 60 s bound.
+    pub fn control(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        self.control_call(method, params, Duration::from_secs(60))
+    }
+
+    /// `node.status`: the status report.
     pub fn control_status(&self) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.write_all(b"{\"cmd\":\"status\"}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "status",
-            "unexpected control response: {resp}"
-        );
-        Ok(resp)
+        self.control_call(
+            "node.status",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
     }
 
     /// Trigger one prune pass via the control socket (plan 22).
     pub fn prune_run(&self, dry_run: bool) -> Result<serde_json::Value> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        let req = format!("{{\"cmd\":\"prune_run\",\"path\":null,\"dry_run\":{dry_run}}}\n");
-        stream.write_all(req.as_bytes())?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "ok",
-            "prune run failed: {resp}; log:\n{}",
-            self.tail_log_n(80)
-        );
-        Ok(resp)
+        self.control_call(
+            "prune.run",
+            serde_json::json!({"path": null, "dry_run": dry_run}),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| anyhow::anyhow!("prune run failed: {e:#}; log:\n{}", self.tail_log_n(80)))
     }
 
     pub fn reintegrate(&self) -> Result<()> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::time::Duration;
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)
-            .with_context(|| format!("connecting to {}", sock.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.write_all(b"{\"cmd\":\"reintegrate\"}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let resp: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            resp["resp"] == "ok",
-            "reintegration failed: {resp}; log:\n{}",
-            self.tail_log_n(80)
-        );
+        self.control_call(
+            "node.reintegrate",
+            serde_json::json!({}),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("reintegration failed: {e:#}; log:\n{}", self.tail_log_n(80))
+        })?;
         Ok(())
     }
 
     pub fn set_write_mode(&self, mode: &str) -> Result<()> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-        writeln!(stream, "{{\"cmd\":\"set_write_mode\",\"mode\":\"{mode}\"}}")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let response: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(
-            response["resp"] == "ok",
-            "write-mode switch failed: {response}"
-        );
+        self.control("node.set_write_mode", serde_json::json!({"mode": mode}))
+            .context("write-mode switch failed")?;
         Ok(())
     }
 
     pub fn set_quota(&self, max_bytes: Option<u64>) -> Result<()> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
-        stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-        let body = match max_bytes {
-            Some(n) => format!(r#"{{"cmd":"set_quota","max_bytes":{n}}}"#),
-            None => r#"{"cmd":"set_quota","max_bytes":null}"#.to_string(),
-        };
-        writeln!(stream, "{body}")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let response: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(response["resp"] == "ok", "set_quota failed: {response}");
+        self.control("quota.set", serde_json::json!({"max_bytes": max_bytes}))
+            .context("set_quota failed")?;
         Ok(())
     }
 
     pub fn get_quota(&self) -> Result<(Option<u64>, u64)> {
-        use std::io::{BufRead, BufReader, Write};
-        let sock = self.state.join("control.sock");
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.write_all(b"{\"cmd\":\"get_quota\"}\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
-        let response: serde_json::Value = serde_json::from_str(&line)?;
-        anyhow::ensure!(response["resp"] == "quota", "get_quota failed: {response}");
-        let max = response["max_bytes"].as_u64();
-        let used = response["used_bytes"].as_u64().unwrap_or(0);
-        Ok((max, used))
+        let q = self
+            .control_call("quota.get", serde_json::json!({}), Duration::from_secs(10))
+            .context("get_quota failed")?;
+        Ok((
+            q["max_bytes"].as_u64(),
+            q["used_bytes"].as_u64().unwrap_or(0),
+        ))
     }
 
     /// Permanently leave the cluster (self), or admin-retire `node_id`.
@@ -932,10 +886,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = Command::new("fusermount3")
-                .args(["-u"])
-                .arg(&self.mnt)
-                .status();
+            let _ = unmount(&self.mnt, UnmountMode::Normal);
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -988,32 +939,64 @@ fn zombie_diagnosis(pid: u32) -> String {
     out
 }
 
-/// The FUSE connection number (`/sys/fs/fuse/connections/<n>`) of the
-/// mount at `mountpoint`, from `/proc/self/mountinfo` (a FUSE
-/// superblock's device is `0:<n>`).
+/// The FUSE connection number of the mount at `mountpoint` (Linux:
+/// `/sys/fs/fuse/connections/<n>`), from the host's mount table.
 fn fuse_connection_of(mountpoint: &Path) -> Option<u32> {
-    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let want = mountpoint.to_string_lossy();
-    for line in text.lines() {
-        let (pre, post) = line.split_once(" - ")?;
-        let pre: Vec<&str> = pre.split(' ').collect();
-        if pre.len() < 5 || !post.starts_with("fuse ") || pre[4] != want {
-            continue;
-        }
-        if let Some((_, minor)) = pre[2].split_once(':') {
-            if let Ok(n) = minor.parse() {
-                return Some(n);
-            }
-        }
-    }
-    None
+    constellation_platform::native()
+        .mounts
+        .list()
+        .ok()?
+        .into_iter()
+        .filter(|m| m.mountpoint == mountpoint)
+        .find_map(|m| m.fuse_connection())
 }
 
-fn is_mountpoint(p: &Path) -> bool {
-    Command::new("mountpoint")
-        .arg("-q")
-        .arg(p)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Unmount `mnt` through the host's mount service (Linux: the setuid
+/// `fusermount3`, as the harness always ran it).
+fn unmount(mnt: &Path, mode: UnmountMode) -> std::io::Result<()> {
+    constellation_platform::native().mounts.unmount(mnt, mode)
+}
+
+/// A lazy detach of `mnt` that gives up after `bound` (a detach of a
+/// wedged mount can itself hang). The helper is a child process, killed at
+/// the bound: a detach left running (or a thread falling through to the
+/// mount service's other fallbacks) could complete later and detach the
+/// *next* mount at the same path.
+fn detach_bounded(mnt: &Path, bound: Duration) {
+    let Ok(mut fm) = Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(mnt)
+        .spawn()
+    else {
+        return;
+    };
+    let t = Instant::now();
+    while t.elapsed() < bound && matches!(fm.try_wait(), Ok(None)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if matches!(fm.try_wait(), Ok(None)) {
+        let _ = fm.kill();
+        let _ = fm.wait();
+    }
+}
+
+/// SIGKILL the daemon, through the host's process service (a daemon that
+/// has already exited is already dead: `Ok`, as `Child::kill` says).
+fn kill9(child: &mut Child) -> std::io::Result<()> {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return Ok(());
+    }
+    constellation_platform::native().process.kill(child.id())
+}
+
+/// Whether `p` is a mountpoint whose filesystem answers, as `mountpoint
+/// -q` has always said: it `stat(2)`s the path first, so a dead FUSE mount
+/// (`ENOTCONN`) is not one, and a mount whose daemon has not answered
+/// `FUSE_INIT` yet is waited for, not reported up early.
+pub(crate) fn is_mountpoint(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok()
+        && constellation_platform::native()
+            .mounts
+            .is_mountpoint(p)
+            .unwrap_or(false)
 }

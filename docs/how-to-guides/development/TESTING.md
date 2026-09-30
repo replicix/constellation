@@ -8,7 +8,7 @@ dispatch (`.github/workflows/nightly.yml`).
 | Lane | Command | Backend | Needs | Speed |
 |---|---|---|---|---|
 | Unit tests | `cargo test --workspace` | in-memory / tempdir | Rust | seconds |
-| Host smoke | `tests/smoke.sh` | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
+| Host smoke | `tests/smoke.sh` (= `harness smoke`) | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
 | Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~3–6 min |
@@ -54,7 +54,15 @@ Mechanics worth knowing:
 ## The smoke test
 
 `tests/smoke.sh [backend-url]` is the single end-to-end script all
-integration lanes share. It creates a filesystem, runs `doctor`, mounts
+integration lanes share. It is a thin wrapper: the test itself is
+`harness smoke [backend-url]` (`crates/harness/src/smoke.rs`, a step for
+step Rust port of what the script used to be). The wrapper finds the harness
+binary (`CONSTELLATION_HARNESS_BIN`, else the `harness` next to
+`$CONSTELLATION_BIN` (same build: `make smoke`, the suite image), else
+`$CARGO_TARGET_DIR/{debug,release}/harness`, else `harness` on `PATH`, else
+it builds it) and forwards
+its arguments; `CONSTELLATION_BIN` still selects the binary under test
+(default `$CARGO_TARGET_DIR/debug/constellation`). It creates a filesystem, runs `doctor`, mounts
 it over FUSE, and exercises: namespace ops (mkdir/rename/symlink),
 multi-chunk files, partial in-place edits, truncate, append,
 unlink-while-open orphan semantics, unmount/remount persistence, and
@@ -301,6 +309,227 @@ cold read on one node must eventually advance `atime` on the holder,
 and — with S3 cut via toxiproxy — reads must keep succeeding at full
 speed while the atime updates are simply lost (atime never blocks a
 read).
+
+### Sharding and machine-readable results (plan 31 C0)
+
+`harness run` takes three flags for CI matrices and for tools that compare
+runs:
+
+- `--shard i/n` (1-based, e.g. `--shard 2/4`) runs only every n-th scenario
+  of the *selected* list: after name filtering, the scenario at position
+  `idx` belongs to shard `idx % n + 1`. The partition is deterministic, so
+  the n shards together run each selected scenario exactly once. Bad syntax
+  (`0/4`, `5/4`, `2`, `a/b`) is rejected before anything starts.
+- `--results-json <path>` writes a JSON file after the run, also when
+  scenarios failed (the exit code is unchanged, and the stderr output is
+  the same as without the flag). Shape (schema 1):
+
+  ```json
+  {"schema": 1, "lane": "linux-fuse", "seed": 42, "shard": "2/4",
+   "started_at": 1790000000,
+   "scenarios": [{"name": "baseline", "outcome": "passed", "seconds": 12.3, "reason": null}]}
+  ```
+
+  `outcome` is `passed`, `failed` or `skipped`; `reason` is the skip reason
+  (`fio not installed`) or the failure error text, `null` for a pass;
+  `shard` is `null` for an unsharded run. The format is documented in
+  `crates/harness/src/results.rs`; `tests/parity.py` (plan 31) reads it.
+- `--lane <name>` sets the `lane` recorded in that file. Default:
+  `<os>-<frontend>`, plus `-process` under `--s3-backend process`, so a
+  plain run is `linux-fuse` and a native-S3 run is `linux-fuse-process`.
+  An explicit `--lane` always wins.
+- The file also records `s3_backend` (`docker` or `process`) and `frontend`
+  (`fuse`). They are additive; schema stays 1 and readers must not require
+  them.
+
+```sh
+harness run --shard 2/4 --lane linux-fuse --results-json results-2.json
+```
+
+### Frontends and S3 backends (plan 31 C6)
+
+Two switches select what a run is measured against; together with the OS
+they name the *lane* that `tests/parity.py` compares.
+
+- `--frontend <name>` is the filesystem frontend the clients mount through.
+  Only `fuse` exists so far; any other value is rejected up front. It is
+  recorded in the results file and forms the lane name.
+- `--s3-backend docker|process` (also `harness bench` and `harness
+  meta-bench`) picks the S3 server, with the same `S3Env` surface for
+  scenarios either way (proxied endpoint for clients, direct endpoint for
+  harness-side checks, the toxiproxy handle, the bucket already created,
+  teardown on drop):
+  - `docker` (default): today's floci 1.7.0-compat + toxiproxy 2.12.0
+    containers on a private docker network.
+  - `process`: a native `versitygw` (posix backend on a temp dir, credentials
+    `test`/`test`) and a native `toxiproxy-server`, both on 127.0.0.1 with
+    free ports. No Docker, so it runs on hosts that lack it (macOS/Windows
+    CI). The temp dir and both processes are removed when the environment is
+    dropped.
+  - The environment variable `CONSTELLATION_HARNESS_S3_BACKEND` is the
+    alternative to the flag (the flag wins).
+  - Binaries: `CONSTELLATION_VERSITYGW_BIN` / `CONSTELLATION_TOXIPROXY_BIN`,
+    else `PATH`, else `~/.local/bin`. A missing one is an error naming the
+    install script.
+  - versitygw rejects anonymous requests, so the harness's own raw bucket
+    reads/writes (`crate::s3auth`) are SigV4-signed under this backend.
+  - The `versitygw` used must enforce `If-None-Match: *` on PutObject (the
+    daemon refuses a backend that does not); the pinned v1.8.0 does (older
+    releases, including the 1.0.14 docker image, silently overwrite).
+
+```sh
+bash tests/ci/install-native-s3.sh                 # into ~/.local/bin
+target/release/harness run basic-rw --s3-backend process --frontend fuse \
+    --results-json results-linux-fuse-process.json
+CONSTELLATION_HARNESS_S3_BACKEND=process target/release/harness run
+cargo test -p constellation-harness --test s3_process_backend -- --ignored
+```
+
+`tests/ci/install-native-s3.sh [DEST]` installs the pinned `versitygw` and
+`toxiproxy-server` (`NATIVE_S3_INSTALL=release|go|auto`). `release` downloads
+the GitHub release archives and verifies pinned sha256 sums; those sums are
+**empty in the script and must be filled in by whoever first runs it with
+network access to the releases** (they were not guessable or verifiable when
+it was written), and `auto` uses `go install` (integrity from the Go module
+proxy/checksum database) for any platform whose sums are still empty. The
+ignored `s3_process_backend` test starts each backend, does a PUT/GET
+through the proxy with the daemons' own S3 client, observes a latency toxic,
+a cut and a heal, exercises the signed raw helpers, and checks teardown.
+
+### Scenario capabilities (`Cap`, plan 31 C6)
+
+A scenario that needs something only some frontends have says so:
+`Scenario::caps` (next to `requires`, default `&[]`). `Cap` is
+`constellation_vfs::Cap`, **derived** from the frontend's `FrontendCaps`
+declaration (`FrontendCaps::caps()`; the harness's `caps::caps_of`), never
+kept as a second table: `FuseAbort` is `abortable`, `ClusterLocks` is
+`cluster_locks`, `Xattrs`, `HardLinks`, `Fallocate`, `SeekHole`,
+`SpecialFiles`, `PushInval`/`PushInvalFull`, `PerCloseFlush`,
+`VirtualXattrsListed`, `CaseInsensitive`, `KeepOpenUnlinked`. `harness run`
+skips a scenario whose caps the selected `--frontend` lacks with the reason
+`requires capability <Cap>` (the cap as a whole word, which is what the
+parity file's `cap = "<Cap>"` wildcard entries and `tests/parity.py`'s
+`is_cap_skip` match; a missing tool, `... not installed`, never counts), and
+`harness list` shows `[needs: ...]`. Today's tags are deliberately few: the
+lock scenarios (`ClusterLocks`), `fuse-inval-storm` and
+`git-under-flock-faults` (`FuseAbort`), `xattr-roundtrip` (`Xattrs`),
+`fallocate-sparse` (`Fallocate`, `SeekHole`), the open-orphan scenarios
+(`KeepOpenUnlinked`), `subtree-confinement` (`HardLinks`, `Xattrs`).
+`--without-cap <Cap>` (repeatable) runs as a frontend lacking that
+capability, to exercise the skip path and the parity wildcard without a
+second frontend:
+
+```sh
+target/release/harness run xattr-roundtrip --without-cap Xattrs \
+    --results-json /tmp/r.json      # skipped: "requires capability Xattrs"
+```
+
+`Client` no longer shells out to `fusermount3` or calls `kill(2)`: unmount,
+lazy detach, FUSE abort, `SIGSTOP`/`SIGCONT` (`pause`/`resume`) and the
+`kill -9` of `kill9`/`kill9_within` go through `constellation-platform`
+(`mounts.unmount`/`abort_fuse`, `process.suspend`/`resume`/`kill`), so a
+macOS or Windows lane drives the same scenarios; Linux behaviour is
+unchanged (the platform unmount runs the same `fusermount3 -u` / `-uz`).
+
+### `harness smoke`
+
+`harness smoke [backend]` is `tests/smoke.sh` ported to Rust (see above):
+create + `doctor`, refused double create, mount, namespace ops, a 3.5 MiB
+multi-chunk file, partial edit, truncate, append, unlink-while-open,
+rm/rmdir, remount, cold-cache read, `status`. The backend is a directory
+(default: a fresh temp dir) or `s3://bucket/prefix` with `AWS_*` in the
+environment.
+
+### `harness interop write|verify`
+
+The cross-OS interop lane (plan 34's macOS lanes use it): the bucket a fs
+was written into on one OS is mounted and checked on another.
+
+```sh
+harness interop write  --bucket-dir bucket/ [--backend file|process] [--seed 42]
+harness interop verify --bucket-dir bucket/ [--backend file|process]
+```
+
+`write` mounts a **fresh** filesystem and writes a deterministic tree
+derived from the seed: small files around the 4 KiB/1 MiB boundaries, a
+24 MiB multi-chunk file, a 96 MiB sparse file, patched/shrunk/grown files,
+non-ASCII and 255-byte names, nested directories with modes (`0700`, sticky),
+a 200-entry directory, symlinks (relative, dangling, long), hard links (incl.
+one whose original name is unlinked), xattrs (set, replaced, removed, on a
+file and a directory), a FIFO, device nodes with large major/minor numbers
+(only when run as root), renames, operations the fs must refuse
+(`ENOTEMPTY`, `EEXIST`, `ENOENT`, `ENAMETOOLONG`, `ENODATA`, asserted at
+write time), and a snapshot followed by divergence of the live tree. It
+unmounts and leaves the bucket in `--bucket-dir` (which must be empty), with
+`INTEROP.json` (seed, whether devices were written) written last.
+
+`verify` mounts the bucket with a fresh state dir and checks every item:
+content, size, mode, mtime (exact, ns), link counts and inode identity,
+readlink targets, xattrs, `rdev` major/minor, the exact directory listings,
+and both the frozen snapshot view and the live tree. It reports all problems
+before failing. Backends: `file` (default) is the local file backend directly
+in `--bucket-dir` (verify mounts a copy, leaving the artifact untouched);
+`process` runs the fs on versitygw and moves the bucket through the S3 API
+(one file per object, imported by PUTs), never by copying versitygw's data
+directory, whose object metadata lives in xattrs that a cross-OS tar loses.
+
+Known deviation recorded by the lane: `link(2)` sets the target inode's
+mtime to "now" (POSIX: only ctime changes), so the mtime of hard-linked
+`t/hl/a` is not compared until that is fixed.
+
+### Platform parity (`tests/parity.py`)
+
+`tests/parity.py` compares the results files of any number of lanes against
+a reference lane (default `linux-fuse`) and writes a Markdown summary
+(CI appends it to `$GITHUB_STEP_SUMMARY`); exit status 0 = parity holds,
+1 = violations, 2 = unusable input.
+
+```sh
+python3 tests/parity.py --expect tests/platform-parity.toml \
+    [--require-lane linux-fuse --require-lane linux-fuse-process] results/results-*.json
+python3 -m unittest discover -s tests -p 'test_parity.py' -v   # the checker's own tests
+```
+
+Inputs are `--results-json` files (schema 1). Files with the same `lane` are
+shards of one run and are merged by concatenating `scenarios`; the same
+scenario twice in one lane is an error. Rules, for every non-reference lane
+and scenario:
+
+- the outcome must equal the reference's, unless an `[[expect]]` entry covers
+  that (scenario, lane);
+- a scenario present in one lane and absent from the other is a violation
+  (a lost shard must not look like a pass);
+- any `failed`, in any lane including the reference, is a violation, and
+  `failed` can never be expected;
+- every `--require-lane` must have results, so a lane whose job died before
+  writing its results file fails the check instead of dropping out of it
+  (nightly requires every lane it runs).
+
+`tests/platform-parity.toml` holds the expectations. It is seeded empty:
+`linux-fuse-process` differs from `linux-fuse` only in the S3 backend, so any
+difference is a bug to fix or a scenario-specific entry to explain. An entry:
+
+```toml
+[[expect]]
+scenario = "<name>"        # or "*" (capability skips only)
+lanes    = ["macos-nfs"]
+outcome  = "skipped"       # the only outcome that may differ
+cap      = "<Cap>"         # required with scenario = "*"
+reason   = "why this lane legitimately differs"
+```
+
+Entries are two-way, like the xfstests baseline: an entry whose lane or
+scenario is not in the results, whose stated outcome is not what the lane
+reports, or whose lane now equals the reference, fails the check as stale.
+A wildcard covers the skipped scenarios of the listed lanes whose recorded
+skip reason names the `cap` as a whole word, so it cannot also excuse an
+unrelated skip; a missing-tool skip (`<tool> not installed`) is never
+covered by a wildcard. It is stale if it covers none. Optional extras:
+a top-level `reference = "<lane>"` and `[lane."<name>"] reference = "<lane>"`
+give a lane its own reference. `tests/test_parity.py` runs the checker on
+synthetic results sets (all equal passes; a deliberate mismatch fails
+closed; covered skip; stale entry; wildcard without `cap`; `failed`
+expected; shard merging; missing reference lane; ...).
 
 ### Chaos CI (`chaos-ci`)
 
@@ -607,11 +836,16 @@ Phase 6b scenarios exercise E2E passphrase mode:
 
 Phase 7 adds `web-ui-smoke`: one mounted daemon enables its localhost web
 listener, then the harness uses ordinary HTTP (no browser automation) to
-exercise `GET /api/status`, `POST /api` with `ReadDir`, snapshot
-create/list/delete, and `GET /metrics`. It also JSON-round-trips the status
+exercise `GET /api/status`, `POST /api` with `browse.readdir` (plan 31 C5:
+the body is the control protocol's `{method, params}`, the answer
+`{"ok": result}`), snapshot create/list/delete, the refusal of `node.handoff`
+over HTTP (403), and `GET /metrics`. It also JSON-round-trips the status
 response and requires spool, cache, and lease gauge names. This checks the
 embedded server and shared control dispatcher while keeping frontend rendering
-out of the fault-injection lane.
+out of the fault-injection lane. The transport parity of the whole method
+table (unix socket vs HTTP, every role) is a unit test instead:
+`constellation_engine::control::parity_tests` (`cargo test -p
+constellation-engine --lib control::`).
 
 Phase 8a adds three destructive-integrity scenarios:
 
@@ -1207,7 +1441,9 @@ relay of its own so requests can be attributed per role):
     distribution and each node's seal/takeover counters.
   - `stale-daemon-lock`: one node; after a clean unmount, `harness
     mute-daemon` (a hidden subcommand) holds `daemon.lock` and a
-    `control.sock` listener that accepts and never answers. A mount
+    control-socket listener (bound where the daemon's would be and
+    recorded in the state dir's `control.path`, plan 31 C5) that accepts
+    and never answers. A mount
     (`CONSTELLATION_CONTROL_TIMEOUT_MS=2000`,
     `CONSTELLATION_ATTACH_TIMEOUT_MS=6000`) must exit within the bound
     naming the live holder's pid and refusing to take over; `status`
@@ -1510,9 +1746,14 @@ harness) for an otherwise identical encryption-overhead comparison.
 
 JSON output contains import, durable import, metadata-walk, cold small-file
 read, cold sequential large-file MiB/s, and warm 4 KiB random-read IOPS.
-`tests/perf-gate.sh` runs the committed workload from
-`tests/perf-baseline.json` and fails when any rate falls more than the
-baseline's 20% tolerance. It compares the median of three runs so scheduler
+`tests/perf-gate.sh` first runs `vfs-bench` (below) and fails on a miss of
+plan 31 §6.9's dispatch targets or on a backend's per-op allocations above
+the ceilings in `tests/perf-baseline.json`'s `vfs_bench` section
+(`PERF_GATE_SKIP_VFS_BENCH=1` skips this stage; `PERF_GATE_VFS_BENCH_ONLY=1`
+runs only it, as the `perf-regression` PR workflow does). It then runs the
+committed workload from `tests/perf-baseline.json` and fails when any rate
+falls more than the baseline's 20% tolerance (the harness bench needs
+`rsync` on the host). It compares the median of three runs so scheduler
 noise in the sub-second metadata and warm-cache probes does not create a
 spurious regression.
 
@@ -1574,6 +1815,34 @@ other content after two minutes is a divergence.
 | `sqlite-first-touch-latency` (needs `sqlite3`) | EC2 campaign 6 A-1: every S3 request ≥ 300 ms (`SQLITE_LAT_MS` 150 each way), product defaults; `SQLITE_ROUNDS` (50) rounds of two nodes running `CREATE TABLE IF NOT EXISTS` + `INSERT` on one new database at once, cycling through every pair of three nodes, alternately in a directory the root sequences and one delegated to `b` (the locks granted by a delegate, capped by its delegation). No round may fail (`disk I/O error` was the lock fence: a delegate's short grant lapsed before its renewal, fixed in `a1bed13`; this fails every delegated round on `216ce6c`), and every database holds both rows on every node. `SQLITE_STRACE_DIR=<dir>` records each racer's failed syscalls |
 | `small-file-write-path` | S3 100 ms away each way; the sequencer and a non-owner each close 12 small unique files, under `--write-mode through`, then `back`. Asserted per writer from its counting relay: one chunk PUT per file and no chunk HEAD or `gc/condemned.json` GET in front of it; the sequencer takes the non-owner's durable report instead of checking S3 itself. `through`: close p50 under 1.5 S3 round trips on both; `back`: under half a round trip on both. Every file then reads back right on a third node. `WRITEPATH_LAT_MS` (100), `WRITEPATH_FILES` (12) |
 | `nonowner-back-crash` | S3 1 s away each way; the non-owner that is not the sequencer's backup closes files under `back` (fast), and a reader on the sequencer waits for a chunk still uploading instead of failing. Then more files, and the writer is killed with its uploads in flight: the sequencer awaits them (`status.writeback.remote_chunks_awaited`), no other node sees content S3 cannot serve, and after the remount (the pending uploads go up, reported to every peer) a third node reads every file right and `fsck` finds no dangling reference. `WRITEPATH_CRASH_LAT_MS` (1000), `WRITEPATH_FILES` |
+
+## Cross-target type-check (`make check-cross`)
+
+`make check-cross` (`tools/check-cross.sh`, CI job `cross-check`) runs
+`cargo check` from Linux for two other targets, to keep the code portable
+ahead of the Windows and macOS frontends (plan 31):
+
+- `aarch64-apple-darwin`: the whole default workspace, one check
+  (census name `workspace`).
+- `x86_64-pc-windows-gnu`: each library crate separately (`-p <crate>`;
+  every workspace member except `crates/cli`, `crates/harness` and
+  `bench/*`), so one failing crate does not hide the others.
+
+Build scripts get their C compiler and archiver from `tools/zcc` and
+`tools/zar` (thin wrappers over `zig cc` / `zig ar`; `zig` on `PATH`, or
+`python3 -m ziglang` from the `ziglang` pip package), so no cross
+toolchain or SDK is needed; nothing is linked. Prerequisites: `rustup
+target add aarch64-apple-darwin x86_64-pc-windows-gnu`, and zig.
+
+The script prints a census table (target, crate, ok/FAIL, first error
+line) and keeps the full logs in a temp directory. Failures that exist
+today are listed in `tools/check-cross-known-failures.txt` (`<target>
+<crate>` per line, `#` comments). The list is two-way, like the xfstests
+baseline: the check fails on a failure that is not listed (a regression),
+and on a listed entry that now passes (`STALE: remove from known
+failures`), so fixing a crate means deleting its line in the same change.
+`CHECK_CROSS_TARGETS=x86_64-pc-windows-gnu make check-cross` runs one
+target only.
 
 ## xfstests
 
@@ -1640,6 +1909,234 @@ one `node_id`. It then exercises `umount myfs:/sub` (root view keeps
 serving, daemon stays up) followed by `umount myfs` (last view: the
 daemon runs its clean-shutdown sequence, exits, and removes its own PID
 file).
+
+## The conformance kit, `MockVfs` and property tests (plan 31 C6)
+
+Everything below the frontend is one engine behind one contract, the
+`constellation_vfs::Vfs` trait; these three tools test the contract from both
+sides without a kernel, without S3 and in seconds.
+
+### `vfs::conformance`: the kit
+
+`crates/vfs/src/conformance/` is a suite that drives *any* `Vfs`. Run it
+against the reference filesystem (what the `conformance` CI job runs):
+
+```sh
+cargo test -p constellation-vfs --features conformance
+cargo test -p constellation-vfs --features conformance the_reference_target -- --nocapture   # the per-test report
+CONSTELLATION_CONFORMANCE_RESULTS=/tmp cargo test -p constellation-vfs --features conformance   # + conformance-<lane>.json in the harness results shape
+```
+
+Each run prints a table (`PASS`/`FAIL`/`SKIP` per `group::name` with the
+failure message or the skip reason) and returns a `Report`; the JSON form
+(`Report::to_json`) has the harness's results-file shape (scenario names
+`conformance/<group>::<name>`) so the parity checker extends to it.
+
+- **Tests** are named functions listed in `conformance::TESTS` (name, group,
+  required `Cap`s), each seeded (`RunOptions::seed` mixed with the name) and
+  deterministic in what it does; concurrent tests check invariants or a
+  model, never an interleaving. Groups: `namespace` (create/lookup/mkdir/
+  rmdir/unlink/rename incl. `NOREPLACE`/`EXCHANGE`, hard links, symlinks,
+  special files, name limits, the `EEXIST`/`ENOENT`/`ENOTEMPTY`/`ENOTDIR`/
+  `EISDIR` refusals, an unlinked-open file, a seeded model replay), `io`,
+  `xattr`, `readdir` (cookies, removal between pages, concurrent create),
+  `concurrency`, `deferral` (exactly-once completion, off-thread completion of
+  a blocked lock, a panicking responder, the drop fail-safe), `cancellation`,
+  `invalidation`, `confinement` (plan 31 §6.12: `..` at the view root, inodes
+  outside the subtree `ESTALE`, `.constellation/snapshot` mirrors at the
+  view's own path, `link` with and without `confine_links`, `EXDEV` only when
+  set).
+- **Skips are explicit.** A test whose caps the frontend lacks skips with
+  `requires capability <Cap>`; one that needs something only the fixture can
+  offer (a snapshot hook, a subtree view, a second view with recorded
+  events) skips naming that; the cancellation group skips where a target does
+  not honour `CancelToken` on waits, naming the Linux FUSE gap (fuser 0.18
+  delivers no `FUSE_INTERRUPT`, so a Linux mount never sets a token: plan 31
+  §6.3). `Declared::rename_flags` is the engine's declared gap
+  (`View::rename` ignores `RENAME_NOREPLACE`/`EXCHANGE` today).
+- **Plugging a target in.** Implement `ConformanceTarget` (a factory of fresh
+  `Fixture<V>`s: the `Vfs`, the root inode, the `FrontendCaps`, optional
+  hooks) and call `run_all(&target, None)` or `run(&target, &RunOptions {
+  caps, .. })` for each frontend's `FrontendCaps` (the target builds its
+  `PolicyStack` with `PolicyStack::for_caps`). The reference target
+  (`conformance::reference::RefTarget`) is the worked example;
+  `crates/vfs/src/conformance/ENGINE_TARGET.md` is the engine's instance,
+  ready to drop into `crates/engine/tests/conformance.rs`.
+- **The oracle** is the kit's own small path-based model (`oracle.rs`), not
+  `crates/model`, which is a Stateright model of the authority protocol.
+
+### `MockVfs`
+
+`constellation_vfs::mock::MockVfs` (feature `mock`, implied by
+`conformance`; always built for the crate's own tests) is a `Vfs` that
+**records** every call (op, typed arguments, caller, thread, deadline,
+cancelled-at-call) and every completion (which call, outcome, thread),
+**scripts** replies per op (`on_<op>` queues one, `always_<op>` sticks: a
+fixed result, a closure of the call, "return now, complete from another
+thread after N ms", "drop the responder", "hold it forever"), and has an
+optional **reference mode** (`MockVfs::reference(caps)`): a small correct
+in-memory filesystem (namespace, sparse content, xattrs, byte-range locks
+with blocking waits on a thread of their own, subtree views with
+confinement and `confine_links`, snapshots behind `.constellation`, events to
+other views) that behaves as the given `FrontendCaps` allow. Scripts take
+precedence over it, so one op can be made to fail in a working filesystem.
+
+`crates/frontend-fuse/tests/wire.rs` uses it to test the FUSE adapter
+without a kernel: fuser's `Request`/`Reply*` types cannot be built by hand,
+but `fuser::Session::from_fd` accepts any descriptor, so a `SOCK_DGRAM`
+socket pair carries real FUSE messages between a fake kernel (the test) and
+the whole adapter. That covers the decoding of every op's flags/modes/
+whence/lock types/rename and xattr flags as the `Vfs` sees them, the
+attribute/entry/statfs/dirent/lock encodings and the xattr size-probe
+protocol, the errno of every `Code`, `FUSE_INIT`'s negotiation, and the
+completion paths: inline on the fuser worker, deferred from another thread
+with the event loop free meanwhile, a dropped responder answered `EIO`, and
+a contended `F_SETLKW` answered from the view's wait thread once released.
+What it cannot cover is what the kernel does above the daemon (permission
+checks, the page cache, path walks, `FUSE_INTERRUPT`); the harness scenarios
+and pjdfstest cover the real mount.
+
+### Property tests
+
+`proptest` in `crates/types/tests/properties.rs` (`Code`'s wire, Linux and
+Darwin round trips over arbitrary values, unknown numbers mapping to `Io`,
+the serde form; `Rdev`'s glibc and FUSE packings) and
+`crates/vfs/tests/policy_properties.rs` (`NamePolicy`, `XattrPolicy`'s
+classification and listing filter never leaking a hidden name, `IdentityMap`,
+`PolicyStack::for_caps`, the flag algebra, `ReadData`).
+
+## Op metrics, tracing and `vfs-bench` (plan 31 C7a)
+
+Every frontend op is counted when its responder completes
+(`constellation_vfs::metrics`): `constellation_vfs_ops_total{frontend,view,op,outcome}`
+(counter; `outcome` is `ok` or the `Code` name) and
+`constellation_vfs_op_seconds{frontend,view,op}` (histogram, 10 us to 60 s),
+served by `GET /metrics` on the web adapter. `view` is present only for a
+view labelled with an allowlisted key (`METRIC_LABELS`, today `pv`); the rest of
+a view's labels never become series. `stats.subscribe` samples carry the totals
+`constellation_vfs_ops_total` and `constellation_vfs_ops_refused_total`. Each op
+also gets an `OpId` and a `vfs.op` tracing span at debug level:
+`RUST_LOG=constellation_vfs::observe=debug`.
+
+`node.ops` (control) lists the request watchdog's in-flight and stalled ops per
+view, with the view's labels; `view` and `min_age_s` filter it.
+
+Tests: `cargo test -p constellation-engine --lib control::ops` (the `/metrics`
+scrape after real `View` ops, `node.ops` over the control protocol) and
+`cargo test -p constellation-vfs --lib` (`metrics`, `observe`, `watch`).
+
+`make vfs-bench` (`cargo bench -p constellation-engine --bench vfs_bench`,
+release build) times the frontend-side path around an op (op id, span,
+`OpCtx`, metrics-recording responder) against a bare `OpCtx` + responder, for
+`getattr`/`lookup`/`read`, on no backend, `MockVfs` and a real `View`, counting
+heap allocations per op with a thread-local counting allocator. It exits 1 if
+the dispatch overhead reaches 1 us/op or the path allocates more than the bare
+one (plan 31 section 6.9). `VFS_BENCH_JSON=<path>` also writes the table as
+JSON and `VFS_BENCH_REPORT_ONLY=1` skips the criterion groups (both used by
+`tests/perf-gate.sh`, which is `make perf-gate` and the nightly
+`performance` job). Last recorded numbers are in `PROGRESS.md`.
+
+**Cold-read deferral (plan 31 C7b).** A read whose chunk is in no local cache
+is answered from the engine's completion pool (`crates/engine/src/completion.rs`),
+not on the FUSE worker. Tests: the conformance kit's
+`deferral::a_cold_read_completes_from_another_thread` and
+`deferral::a_non_deferrable_cold_read_parks_the_calling_thread` (through the
+fixture's `evict` hook: the engine drops the file's clean chunks,
+`View::evict_cached`; the reference fs models a cold read), the engine unit
+test `view::qos_tests::a_deferred_cold_read_answers_off_the_caller_and_holds_its_slot`,
+`completion::tests`, and the FUSE session's
+`a_detach_drains_deferred_reads_and_gives_up_past_its_wait`.
+
+## Subtree confinement (plan 31 §6.12)
+
+`subtree-confinement` has one daemon serve three views of one
+filesystem: the whole tree, a volume view (`/volumes/pv-1
+--confine-links`) and a maintenance view (`/ --confine-links`), the two
+volumes marked as link domains (`trusted.constellation.link_domain`),
+snapshots taken of pv-1, pv-2 and `/`. Through the kernel mounts it
+checks that `..` at the volume view's root is the host directory (nothing
+above the volume listed) and `sub/..` is the view's root; that the
+volume's `.constellation/snapshot` lists its own snapshot and the root's
+(mirrored at pv-1's path), never pv-2's; that `link()` within a volume
+works, across mounts is the kernel's `EXDEV`, and through a handle to a
+file moved out of the volume (`linkat(AT_EMPTY_PATH)`) is the view's
+`EXDEV`; that the maintenance view refuses links (and renames of a
+multiply-linked file) between volumes while the plain whole-tree view
+does not; plus ordinary write/read/rename/xattr/`flock`/unlink through
+the volume view. The in-process cases (forged and stale inode numbers
+answered `ESTALE`, snapshot views, `ViewQos` admission) are
+`constellation-engine`'s `view::confine_tests` and `view::qos_tests`.
+
+## FUSE session handover (plan 31 §6.11, C4b)
+
+`constellation daemon --upgrade` replaces a running daemon's image while
+its views stay mounted (the sequence is `crates/cli/src/handover.rs`'s
+module doc; the vendored fuser patch is `vendor/fuser/CONSTELLATION-PATCH.md`).
+
+- `session-handover-idle`: one upgrade with nothing in flight. A watcher
+  `stat`s and lists the mountpoint every 5 ms across it (any error or a
+  changed `st_dev` fails the run); descriptors opened before it (a file to
+  read, a file to write, the directory) keep working after it; the model
+  verifies; `status` reports `handover.generation` one higher and the
+  daemon's pid runs the resumed image (`--resume-from` in its cmdline);
+  new work lands, and everything survives a remount.
+- `upgrade-under-load`: three upgrades in a row, 1.5 s apart, under a
+  writer appending 4 KiB records through one descriptor held open
+  (`fsync` every 16), a creator writing and closing new files, and a
+  reader re-reading a 256 KiB file through a held descriptor. Any error
+  from any syscall (`ENOTCONN`/`EIO` included), a mount gap, or a load that
+  made no progress after an upgrade fails it; every record and file is
+  compared with what was written, before and after a remount. It prints
+  each upgrade's duration and the longest single syscall (the stall).
+
+Both need root (the daemon mounts with `mount(2)` itself) and run on the
+debug binary too (`CONSTELLATION_BIN=target/debug/constellation`). The
+in-process pieces are unit tests: `constellation-frontend-fuse`'s
+`session::tests` (a real kernel mount, root only: detach with nothing in
+flight, a detach that waits for an op in flight, a resume that serves the
+requests the kernel queued while nobody read, the lock-wait refusal,
+`NegotiatedInit` round trips) and `constellation-engine`'s
+`view::handoff::tests` (open handles, an unlinked-open orphan and synthetic
+numbers crossing to a second view; the handle table's wire forms).
+
+## Engine profiles and host lifecycle (plan 31 C8)
+
+The harness drives the engine's lifecycle through `node.lifecycle` (the
+Linux/macOS manual source; `constellation lifecycle <target> <event>` from
+a shell), in `crates/harness/src/scenarios/lifecycle.rs`:
+
+- `lifecycle-suspend-mid-write`: three nodes; a writer on the lease holder
+  writes, `fsync`s and closes files, recording each acknowledged one (name,
+  length, blake3); the holder is suspended (15 s deadline) mid-stream. The
+  suspend report must say every view synced, flushed, lease released,
+  journal and pending uploads 0, within the deadline; the status must show
+  suspended, forward-only, background paused, no inbound, no gossip.
+  Another node writes (taking the lease) while the writer's ops keep
+  arriving on the suspended node and forward (none may fail); every
+  acknowledged file reads byte-exact on every node, the suspended node
+  still serves local reads; it resumes, the writer goes on, and all files
+  from all phases are intact everywhere with zero conflicts.
+- `lifecycle-resume-rejoin`: a suspended holder's lease moves to another
+  node, which writes, renames and deletes; the suspended node still reads
+  locally; resumed, it catches up (the renamed/deleted names gone), rejoins
+  P2P and writes again, visible everywhere.
+- `lifecycle-metered-uploads`: two nodes, the holder with
+  `CONSTELLATION_PROFILE_UPLOADS=unmetered-only`; after
+  `NetworkChanged{metered: true}`, eight plain closes upload no chunk (the
+  status `s3.by_area` `PUT chunks` counter stands still, `writeback.
+  pending_uploads` ≥ 8, the peer sees none of the content), an `fsync`'d
+  file still uploads at once and reaches the peer; `metered: false` drains
+  the queue and every file is intact on both nodes.
+
+The profile knobs (`CONSTELLATION_PROFILE`, `CONSTELLATION_PROFILE_{P2P,
+LEASES,UPLOADS,BACKGROUND}`) are read by the daemon at start; the
+in-process unit tests are `constellation-engine`'s `lifecycle::tests`
+(one engine: suspend/resume state machine, background modes, upload
+hold) and `lifecycle::authority_tests` (standalone cores on one bucket:
+forward-only never registers for a live lease, a suspended node takes
+nothing, a suspension flush hands every acknowledged op to the next
+holder), `constellation-authority`'s `core::mode` and `core::lease`
+tests, and `constellation-net`'s `quiesce_and_dial_only_gate_connections`.
 
 ## The authority simulation (plan 30 M5)
 
@@ -1823,3 +2320,12 @@ real store with no spawned tasks.
   instead of building via compose.
 - Lint gates are `cargo fmt --all --check` and
   `cargo clippy --workspace --all-targets -- -D warnings`.
+- Nightly (`nightly.yml`) also runs `harness-lanes-linux` (the
+  `linux-fuse-process` lane: `--s3-backend process`, natives installed by
+  `tests/ci/install-native-s3.sh`), `conformance`
+  (`cargo test -p constellation-vfs --features conformance`) and `parity`,
+  which downloads every `harness-*` artifact (each carries its
+  `results-<lane>.json`; the `harness` job's is `results-linux-fuse.json`),
+  runs the checker's unit tests, then `tests/parity.py` and appends its
+  table to the job summary. The harness steps use `set -o pipefail` so the
+  run's exit status survives `tee`.

@@ -111,10 +111,10 @@ use std::sync::atomic::Ordering;
 
 const POISON_PREFIX: &[u8] = b"poisoned/";
 
-/// The errno a dropped op's `Refused` record carries (`EIO`): the write
+/// The code a dropped op's `Refused` record carries (`EIO`): the write
 /// was acknowledged and then lost with its chunk; its conflict copy is
 /// the artifact.
-const DROPPED_ERRNO: i32 = 5;
+const DROPPED_CODE: constellation_types::Code = constellation_types::Code::Io;
 
 /// Plan 30 §M9 × §M4: a spilled manifest adopted from a predecessor's
 /// backup tail whose chunk list is not expanded into pending rows yet:
@@ -843,13 +843,13 @@ impl Meta {
                     &self.completed,
                     &LogRecord::Refused {
                         rid: *rid,
-                        errno: DROPPED_ERRNO,
+                        code: DROPPED_CODE,
                     },
                 )?;
                 tx.insert(
                     &self.completed,
                     rid.to_key(),
-                    Meta::encode_refused_row(position, now_ms, DROPPED_ERRNO),
+                    Meta::encode_refused_row(position, now_ms, DROPPED_CODE),
                 );
             }
             self.finish_local(&mut tx, local)?;

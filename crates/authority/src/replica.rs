@@ -20,6 +20,7 @@ use constellation_meta::{
     JournalPos, KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position, ReadDelegations,
     Rid, Stranded, StrandedOp, TouchSet,
 };
+use constellation_types::Code;
 
 /// What applying a foreign segment did (`Meta::apply_segment`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,7 +45,7 @@ pub trait Replica {
     /// (or journaled) its completion.
     fn completed_position(&self, rid: Rid) -> Result<Option<Seq>, MetaError>;
     /// M13: what the log says about `rid` — executed, or refused with an
-    /// errno (an inbox refusal is an outcome too).
+    /// code (an inbox refusal is an outcome too).
     fn completed_outcome(&self, rid: Rid) -> Result<Option<CompletedOutcome>, MetaError>;
     /// The entry behind an `EEXIST` refusal (`MutateOutcome::Exists`).
     fn entry_as_record(&self, parent: Ino, name: &str) -> Option<LogRecord>;
@@ -78,20 +79,20 @@ pub trait Replica {
         op: &MutateOp,
         rid: Rid,
     ) -> Result<Vec<LogRecord>, MetaError>;
-    /// Journal a refusal (`Refused { rid, errno }`) with its position.
+    /// Journal a refusal (`Refused { rid, code }`) with its position.
     fn journal_inbox_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         ack: InboxAck,
         op: Option<&MutateOp>,
     ) -> Result<(), MetaError>;
     /// Plan 30 §M9: journal a forwarded op's definitive refusal by rid
     /// (`Meta::journal_refusal`), so every later execution of the rid
-    /// dedups to the same errno.
+    /// dedups to the same code.
     /// `op`: the refused op, whose observed keys keep the refusal behind
     /// a deferred transaction they depend on (`JournalTx::observed`).
-    fn journal_refusal(&self, rid: Rid, errno: i32, op: Option<&MutateOp>)
+    fn journal_refusal(&self, rid: Rid, code: Code, op: Option<&MutateOp>)
         -> Result<(), MetaError>;
     /// The journal seq the next row lands at, and the highest shipped.
     fn journal_next_seq(&self) -> Result<u64, MetaError>;
@@ -228,7 +229,7 @@ pub trait Replica {
     fn delegate_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         gen: u64,
         deps: Position,
     ) -> Result<(), MetaError>;
@@ -534,20 +535,20 @@ impl Replica for Meta {
     fn journal_inbox_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         ack: InboxAck,
         op: Option<&MutateOp>,
     ) -> Result<(), MetaError> {
-        Meta::journal_inbox_refusal(self, rid, errno, ack, op)
+        Meta::journal_inbox_refusal(self, rid, code, ack, op)
     }
 
     fn journal_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         op: Option<&MutateOp>,
     ) -> Result<(), MetaError> {
-        Meta::journal_refusal(self, rid, errno, op)
+        Meta::journal_refusal(self, rid, code, op)
     }
 
     fn journal_next_seq(&self) -> Result<u64, MetaError> {
@@ -791,11 +792,11 @@ impl Replica for Meta {
     fn delegate_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         gen: u64,
         deps: Position,
     ) -> Result<(), MetaError> {
-        let idx = Meta::delegate_refusal(self, rid, errno, gen, deps)?;
+        let idx = Meta::delegate_refusal(self, rid, code, gen, deps)?;
         self.session().note_stream(gen, idx);
         Ok(())
     }

@@ -79,7 +79,7 @@ impl Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         ns::put_inode(
             &mut tx,

@@ -18,10 +18,24 @@ anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
 constellation-chaos.workspace = true
+constellation-types.workspace = true
+# `caps`: the harness's `Cap` is the vfs crate's, derived from `FrontendCaps`;
+# `client`: mounts, signals and process facts go through the host services,
+# never a `fusermount3` or `kill(2)` of the harness's own.
+constellation-vfs.workspace = true
+constellation-platform.workspace = true
 # Plan 30 §M4: decode log segments' records (the chaos scenarios' log-level
 # exactly-once check reads every `Completed { rid }` in the bucket).
 constellation-meta.workspace = true
+# Plan 31 C5: the daemons' control protocol (client, socket discovery).
+constellation-control.workspace = true
+tokio.workspace = true
 fjall = { version = "3.1", package = "fjall" }
+# `s3auth`: SigV4 for the harness's own raw S3 requests against the process
+# backend (versitygw rejects anonymous requests, floci does not). Both are
+# already in Cargo.lock via aws-sigv4/object_store.
+hmac = "0.13"
+sha2 = "0.11"
 libc.workspace = true
 postcard.workspace = true
 rand.workspace = true
@@ -38,4 +52,3 @@ zstd.workspace = true
 # relay, across a cut and a heal.
 constellation-store-s3.workspace = true
 object_store.workspace = true
-tokio.workspace = true

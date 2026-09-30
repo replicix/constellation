@@ -14,6 +14,7 @@ use constellation_authority::{ClientReply, Config, NodeId, Stats};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::ChunkHash;
 use constellation_meta::{Meta, MutateOp, MutateOutcome, Rid};
+use constellation_types::Code;
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{Rng, SeedableRng};
@@ -194,7 +195,7 @@ pub struct SimConfig {
     pub chunk_writes: f64,
     /// M12 round 2: model the daemon's FUSE fast path — a node holding a
     /// usable lease executes its own client ops outside the core
-    /// (`fusefs::mutate_op_rebasable_with_rid`), asking
+    /// (`view::View::mutate_op_rebasable_with_rid`), asking
     /// `Meta::root_fast_path` first (`Checked`), or not at all
     /// (`Unchecked`: the daemon before round 2, which executed names a
     /// range's delegate owned behind its back — `chaos-soak-4`'s double
@@ -717,9 +718,9 @@ fn ns_ret(outcome: &MutateOutcome) -> Result<NsRet, String> {
     match outcome {
         MutateOutcome::Accepted { .. } => Ok(NsRet::Ok),
         MutateOutcome::Exists { .. } => Ok(NsRet::Eexist),
-        MutateOutcome::Errno(e) if *e == libc::EEXIST => Ok(NsRet::Eexist),
-        MutateOutcome::Errno(e) if *e == libc::ENOENT => Ok(NsRet::Enoent),
-        MutateOutcome::Errno(e) if *e == libc::EROFS || *e == libc::EXDEV => Ok(NsRet::Erofs),
+        MutateOutcome::Errno(Code::Exists) => Ok(NsRet::Eexist),
+        MutateOutcome::Errno(Code::NotFound) => Ok(NsRet::Enoent),
+        MutateOutcome::Errno(Code::ReadOnly | Code::CrossDevice) => Ok(NsRet::Erofs),
         other => Err(format!("unexpected client outcome {other:?}")),
     }
 }
@@ -771,6 +772,7 @@ fn mutate_op(meta: &Meta, op: &NsOp) -> MutateOp {
                 name,
                 new_parent,
                 new_name,
+                noreplace: false,
             }
         }
         NsOp::Put(_) => unreachable!("Put is a projection-only op"),
@@ -1032,7 +1034,7 @@ async fn client_thread(
                 // Plan 30 §M10: a frozen continuation epoch refuses writes
                 // with `EROFS` before executing them; the FUSE caller
                 // retries (here: the same rid, like an in-doubt answer).
-                Ok(ClientReply::Outcome(MutateOutcome::Errno(e))) if e == libc::EROFS => {
+                Ok(ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))) => {
                     attempts += 1;
                     if attempts > MAX_RESUBMITS {
                         abandoned.lock().unwrap().insert(rid);
@@ -2817,7 +2819,7 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
                     ok = true;
                     break;
                 }
-                Ok(ClientReply::Outcome(MutateOutcome::Errno(e))) if e == libc::EEXIST => {
+                Ok(ClientReply::Outcome(MutateOutcome::Errno(Code::Exists))) => {
                     ok = true;
                     break;
                 }

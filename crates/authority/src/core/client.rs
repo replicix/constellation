@@ -2,7 +2,7 @@
 //! fast path, the forward with its same-rid retries and one redirect,
 //! M13's inbox when there is no P2P path, the lease path with its in-doubt
 //! resolution, the read-your-refusal wait and the deadline (what
-//! `fusefs::mutate_op_rebasable` + `node_runtime::dispatch_forward` +
+//! `view::View::mutate_op_rebasable` + `node_runtime::dispatch_forward` +
 //! `forward::request_mutate_with` + `inbox::forward_via_inbox` did).
 //!
 //! A stranded op's replay (`recovery::drain_pending_replays`) rides the
@@ -20,6 +20,7 @@ use constellation_meta::delegation::Ownership;
 use constellation_meta::{
     CompletedOutcome, KeySet, MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet,
 };
+use constellation_types::Code;
 use std::collections::BTreeSet;
 
 /// How many `InDoubt` rids the core remembers for their resubmission.
@@ -246,22 +247,6 @@ impl AckTracker {
     }
 }
 
-/// `forward::meta_errno`.
-pub fn meta_errno(e: &MetaError) -> i32 {
-    use MetaError::*;
-    match e {
-        NoEnt(_) | NoEntry => libc::ENOENT,
-        Exists => libc::EEXIST,
-        NotDir => libc::ENOTDIR,
-        IsDir => libc::EISDIR,
-        NotEmpty => libc::ENOTEMPTY,
-        NoData => libc::ENODATA,
-        Invalid(_) => libc::EINVAL,
-        Conflict => libc::EAGAIN,
-        Fjall(_) | Io(_) | Record(_) | Key(_) | Json(_) | Postcard(_) => libc::EIO,
-    }
-}
-
 /// `forward::conflict_keys`: the keys `op` reads or writes, for the
 /// ordering gate (plan 30 §M12: [`super::holder::keys_of_op_in`], with
 /// an unlink's target exclusive too — a name that does not resolve
@@ -301,10 +286,10 @@ pub(crate) fn completed_as_outcome(
             epoch,
             records: Vec::new(),
         }),
-        CompletedOutcome::Refused { errno } if errno == libc::ESTALE => {
+        CompletedOutcome::Refused { code: Code::Stale } => {
             Some(MutateOutcome::Conflict { manifest: None })
         }
-        CompletedOutcome::Refused { errno } => Some(MutateOutcome::Errno(errno)),
+        CompletedOutcome::Refused { code } => Some(MutateOutcome::Errno(code)),
     }
 }
 
@@ -678,7 +663,9 @@ impl Core {
         let Some(policy) = self.clients.get(&rid).map(|c| c.policy) else {
             return;
         };
-        if !self.cfg.forwarding {
+        // Plan 31 C8: a forward-only node forwards whatever
+        // `CONSTELLATION_FORWARD` says.
+        if !self.cfg.forwarding && !self.mode.forwards() {
             self.lease_path(now, rid, replica, out);
             return;
         }
@@ -979,7 +966,7 @@ impl Core {
                     }
                     Err(error) => {
                         tracing::warn!(%error, node = self.cfg.node_id, ?rid, "failed to install shadow");
-                        self.finish(now, rid, MutateOutcome::Errno(libc::EIO), replica, out);
+                        self.finish(now, rid, MutateOutcome::Errno(Code::Io), replica, out);
                     }
                 }
             }
@@ -1433,12 +1420,12 @@ impl Core {
         }
     }
 
-    /// Answer every op on the lease path with `errno` (a frozen
+    /// Answer every op on the lease path with `code` (a frozen
     /// continuation epoch).
     pub(crate) fn refuse_waiting_for_lease(
         &mut self,
         now: Ms,
-        errno: i32,
+        code: Code,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1463,7 +1450,7 @@ impl Core {
                 .get(&rid)
                 .is_some_and(|c| c.forwarded || c.attempts > 0);
             if !sent {
-                self.finish(now, rid, MutateOutcome::Errno(errno), replica, out);
+                self.finish(now, rid, MutateOutcome::Errno(code), replica, out);
                 continue;
             }
             if let Some(outcome) = self.settled_outcome(rid, replica) {
@@ -1508,7 +1495,7 @@ impl Core {
         }
         // Before re-asking S3, one more look at forwarding: the holder may
         // simply have changed (the lease read told us who).
-        if self.cfg.forwarding {
+        if self.cfg.forwarding || self.mode.forwards() {
             if let Some(holder) = self.lease.cached_holder {
                 if holder != self.cfg.node_id && self.reaches(now, holder) {
                     let c = self.clients.get_mut(&rid).expect("present");
@@ -1603,7 +1590,7 @@ impl Core {
         else {
             // Already finished by a nested pass (see `release_gated`);
             // the outcome goes to `finish`, which drops it.
-            return MutateOutcome::Errno(libc::EIO);
+            return MutateOutcome::Errno(Code::Io);
         };
         // Plan 30 §M11: as the root, recall the write delegations the
         // op's keys fall under first, and wait for its `deps`; `finish`
@@ -1623,8 +1610,8 @@ impl Core {
                 match self.deleg_recall_plan(now, &keys, replica, out) {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
-                    super::delegate::RecallPlan::Refuse(errno) => {
-                        return MutateOutcome::Errno(errno);
+                    super::delegate::RecallPlan::Refuse(code) => {
+                        return MutateOutcome::Errno(code);
                     }
                 }
             };
@@ -1675,9 +1662,9 @@ impl Core {
                 // could answer a refusal from its stale replica at once
                 // (long-acks3 seed 50277: EEXIST for a name a newer
                 // holder had already renamed away).
-                let errno = meta_errno(&error);
-                self.record_refusal(rid, errno, Some(&op), replica);
-                (MutateOutcome::Errno(errno), None)
+                let code = error.code();
+                self.record_refusal(rid, code, Some(&op), replica);
+                (MutateOutcome::Errno(code), None)
             }
         };
         // Plan 30 §M9: accepted or refused, the reply observed the

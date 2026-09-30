@@ -24,6 +24,7 @@ use super::m9::{c_deny_path, cluster, node_id};
 use super::{eventually, lease_of};
 use crate::client::Client;
 use anyhow::{Context, Result};
+use constellation_types::Code;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -158,7 +159,9 @@ fn race(
                 let won: Vec<_> = results.iter().filter(|(_, r)| r.is_ok()).collect();
                 let other: Vec<_> = results
                     .iter()
-                    .filter(|(_, r)| matches!(r, Err(e) if *e != libc::EEXIST))
+                    .filter(|(_, r)| {
+                        matches!(r, Err(e) if Code::try_from_native(*e) != Some(Code::Exists))
+                    })
                     .collect();
                 anyhow::ensure!(
                     won.len() == 1 && other.is_empty(),

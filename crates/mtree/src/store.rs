@@ -8,7 +8,7 @@
 //! of that belongs in the data structure, and the tree gets easier to
 //! test and impossible to make accidentally order-dependent if it
 //! cannot do I/O at all. Callers that need async bridge it the way the
-//! rest of the repo does (`SyncHandle` in `cli::fusefs`), on their side
+//! rest of the repo does (`SyncHandle` in `engine::view`), on their side
 //! of this trait.
 //!
 //! The hash is computed by the [`crate::Tree`], not by the store,

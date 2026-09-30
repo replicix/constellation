@@ -635,6 +635,72 @@ impl Peers {
         while set.join_next().await.is_some() {}
     }
 
+    /// Plan 31 C8, `P2pMode::DialOnly`: refuse every inbound connection
+    /// (`dial_only`), or accept them again. Outbound dials — forwards,
+    /// chunk fetches, the log-stream subscription, gossip's own links —
+    /// are unaffected: a QUIC connection this node dialed carries the
+    /// replies both ways. The registry record still carries this node's
+    /// key and address, because a peer's allowlist is built from it (a
+    /// peer's dial to us is refused right after its handshake, so it
+    /// learns at once that we are not reachable that way).
+    pub fn set_dial_only(&self, dial_only: bool) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.p2p.set_accept_inbound(!dial_only);
+        }
+    }
+
+    /// Plan 31 C8: a host suspension. Refuse every inbound connection and
+    /// gossip's outbound dials, and close every open connection with a
+    /// close frame, so each peer's pooled requests to this node fail now
+    /// instead of at their timeouts and its gossip drops the neighbor.
+    /// This node's own requests may still dial out: an op that arrives
+    /// while suspended forwards to the holder like any non-holder's (a
+    /// peer's reply travels back on the connection this node opened).
+    /// Returns the connections closed.
+    pub async fn quiesce(&self) -> usize {
+        let Some(inner) = self.inner.as_ref() else {
+            return 0;
+        };
+        inner.p2p.set_accept_inbound(false);
+        inner.p2p.set_gossip(false);
+        inner.p2p.close_all("suspended").await
+    }
+
+    /// Plan 31 C8: undo [`Self::quiesce`] (inbound stays refused when
+    /// `dial_only`), tell iroh the network may have changed while this
+    /// node was away, then re-dial every peer and re-form the gossip
+    /// neighborhood, as a restarted node would.
+    pub async fn unquiesce(&self, dial_only: bool) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        inner.p2p.set_gossip(true);
+        inner.p2p.set_accept_inbound(!dial_only);
+        inner.p2p.network_change().await;
+        self.probe_all().await;
+        for peer in self.remote_snapshot() {
+            if let Err(error) = inner.p2p.rejoin(peer.addr.id).await {
+                tracing::debug!(%error, node = peer.node_id, "gossip rejoin after a resume failed");
+            }
+        }
+    }
+
+    /// Plan 36 settled decision 20: the host's network changed (Android
+    /// reports it only to Java code); iroh re-probes its paths.
+    pub async fn network_change(&self) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.p2p.network_change().await;
+        }
+    }
+
+    /// `(accepts inbound, gossips)`; `(false, false)` when disabled.
+    pub fn admission(&self) -> (bool, bool) {
+        self.inner
+            .as_ref()
+            .map(|i| (i.p2p.accepts_inbound(), i.p2p.gossips()))
+            .unwrap_or((false, false))
+    }
+
     /// Send an arbitrary payload directly to a known peer address and
     /// wait for its reply, with the same RTT bound as
     /// [`Peers::request_lease`]. For requests that are not one of the
@@ -1816,6 +1882,27 @@ mod tests {
         let svc = service.clone();
         tokio::spawn(async move { serving.serve(svc).await });
         (holder, asker, service)
+    }
+
+    /// Plan 31 C8: a quiesced endpoint closes what it has and admits
+    /// nothing either way; dial-only refuses only inbound connections;
+    /// unquiesced, it serves again.
+    #[tokio::test]
+    async fn quiesce_and_dial_only_gate_connections() {
+        let (holder, asker, _service) = pair(false).await;
+        assert!(asker.ping_node(1).await, "served before");
+        assert!(holder.quiesce().await >= 1, "the asker's connection closed");
+        assert_eq!(holder.admission(), (false, false));
+        assert!(!asker.ping_node(1).await, "inbound refused while quiesced");
+        holder.unquiesce(true).await;
+        assert_eq!(holder.admission(), (false, true), "dial-only, gossiping");
+        assert!(
+            !asker.ping_node(1).await,
+            "inbound still refused (dial-only)"
+        );
+        holder.set_dial_only(false);
+        assert_eq!(holder.admission(), (true, true));
+        assert!(asker.ping_node(1).await, "served again");
     }
 
     /// Plan 30 §M7: a log stream over real QUIC: frames arrive in order,

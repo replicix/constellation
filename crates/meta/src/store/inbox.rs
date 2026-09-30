@@ -3,11 +3,11 @@
 //! An inbox-submitted op has no reply, so its outcome rides the log and
 //! lands here on every replica that tails it:
 //!
-//! - **Refusals are outcomes.** `LogRecord::Refused { rid, errno }` writes
+//! - **Refusals are outcomes.** `LogRecord::Refused { rid, code }` writes
 //!   a `completed` row tagged refused ([`ROW_TAG_REFUSED`]). From then on
 //!   every dedup site — the holder's own executor, a successor's takeover
 //!   drain, the requester's in-doubt resolution on the lease path —
-//!   answers that rid with the errno instead of re-evaluating the op.
+//!   answers that rid with the code instead of re-evaluating the op.
 //!   This is the one place the inbox path departs from plan 30 §M2's
 //!   "refusals are not recorded": there, only the requester ever retried,
 //!   and a requester that holds a refusal never retries it; here the
@@ -38,6 +38,7 @@ use crate::record::LogRecord;
 use crate::rid::Rid;
 use crate::store::journal::{self, PendingInboxAck, PendingInboxAckGuard};
 use crate::store::{kv_get_tx, kv_set_tx, Meta};
+use constellation_types::Code;
 use fjall::{Readable, SingleWriterWriteTx};
 
 /// The armed state of [`Meta::pending_inbox_ack`]; dropping it disarms.
@@ -78,11 +79,11 @@ impl InboxAck {
 
 /// What the log says about a rid: it executed at `position` (this
 /// replica's journal seq for the holder's own row, `0` when tailed), or
-/// it was refused with `errno`.
+/// it was refused with `code`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletedOutcome {
     Executed { position: u64 },
-    Refused { errno: i32 },
+    Refused { code: Code },
 }
 
 fn decode_outcome(v: &[u8]) -> Result<CompletedOutcome, MetaError> {
@@ -93,12 +94,14 @@ fn decode_outcome(v: &[u8]) -> Result<CompletedOutcome, MetaError> {
     );
     match v.get(16) {
         Some(&ROW_TAG_REFUSED) => {
-            let errno = i32::from_be_bytes(
-                v.get(17..21)
+            let wire = u16::from_be_bytes(
+                v.get(17..19)
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(|| MetaError::Invalid("refused completed row".into()))?,
             );
-            Ok(CompletedOutcome::Refused { errno })
+            Ok(CompletedOutcome::Refused {
+                code: Code::from_wire(wire),
+            })
         }
         _ => Ok(CompletedOutcome::Executed { position }),
     }
@@ -152,10 +155,10 @@ impl Meta {
         }
     }
 
-    /// The errno the log refused `rid` with, if it did.
-    pub fn refused_errno(&self, rid: Rid) -> Result<Option<i32>, MetaError> {
+    /// The code the log refused `rid` with, if it did.
+    pub fn refused_code(&self, rid: Rid) -> Result<Option<Code>, MetaError> {
         Ok(match self.completed_outcome(rid)? {
-            Some(CompletedOutcome::Refused { errno }) => Some(errno),
+            Some(CompletedOutcome::Refused { code }) => Some(code),
             _ => None,
         })
     }
@@ -181,7 +184,7 @@ impl Meta {
         InboxAckArmed(PendingInboxAck::set(ack))
     }
 
-    /// The holder refused an inbox op: journal `Refused { rid, errno }`
+    /// The holder refused an inbox op: journal `Refused { rid, code }`
     /// and the position's `InboxAck` as one transaction with no
     /// namespace writes, write the refused `completed` row, and count it
     /// as this tenure's journaled work (`begin_local`/`finish_local`),
@@ -189,21 +192,21 @@ impl Meta {
     pub fn journal_inbox_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         ack: InboxAck,
         op: Option<&crate::mutate::MutateOp>,
     ) -> Result<(), MetaError> {
         let _pending = PendingInboxAck::set(ack);
-        self.journal_refusal(rid, errno, op)
+        self.journal_refusal(rid, code, op)
     }
 
     /// Plan 30 §M9: the holder refused a *forwarded* op by rid: the same
-    /// `Refused { rid, errno }` row and `completed` entry, without an
+    /// `Refused { rid, code }` row and `completed` entry, without an
     /// `InboxAck`. A refusal is an outcome: whoever executes this rid
     /// again — the requester's retry, the deposed holder's replay by
     /// rid, an inbox batch drained later — finds it in `completed` (here
     /// at once, everywhere once the row ships) and answers the same
-    /// errno instead of re-evaluating the op against a state that may
+    /// code instead of re-evaluating the op against a state that may
     /// have changed (the long-backup seeds 50064 and 50126: a refused
     /// unlink / create executed a second time and succeeded, after its
     /// client had been told ENOENT / EEXIST).
@@ -216,7 +219,7 @@ impl Meta {
     pub fn journal_refusal(
         &self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         op: Option<&crate::mutate::MutateOp>,
     ) -> Result<(), MetaError> {
         let _observed = op.map(|op| journal::PendingObserved::set(observed_keys(op)));
@@ -227,13 +230,13 @@ impl Meta {
             &self.journal_ks,
             &self.local,
             &self.completed,
-            &LogRecord::Refused { rid, errno },
+            &LogRecord::Refused { rid, code },
         )?;
         let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
         tx.insert(
             &self.completed,
             rid.to_key(),
-            Meta::encode_refused_row(position, now_ms, errno),
+            Meta::encode_refused_row(position, now_ms, code),
         );
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
@@ -353,10 +356,8 @@ mod tests {
     use crate::MetaStore;
     use constellation_fs_core::types::ROOT_INO;
 
-    /// `meta` does not depend on `libc`; these are the Linux values the
-    /// `cli` crate maps to.
-    const EEXIST: i32 = 17;
-    const ENOENT: i32 = 2;
+    const EEXIST: Code = Code::Exists;
+    const ENOENT: Code = Code::NotFound;
 
     fn rid(seq: u64) -> Rid {
         Rid {
@@ -416,7 +417,7 @@ mod tests {
             Some(CompletedOutcome::Executed { position }) if position > 0
         ));
         assert!(m.completed_position(rid(1)).unwrap().is_some());
-        assert_eq!(m.refused_errno(rid(1)).unwrap(), None);
+        assert_eq!(m.refused_code(rid(1)).unwrap(), None);
         assert_eq!(m.inbox_ack(3, 7).unwrap(), Some(ack(4, 2)));
         assert!(ack(4, 2).covers(4, 2) && ack(4, 2).covers(3, 9) && !ack(4, 2).covers(4, 3));
     }
@@ -445,18 +446,18 @@ mod tests {
         let m = Meta::open_in_memory().unwrap();
         m.journal_inbox_refusal(rid(5), EEXIST, ack(1, 0), None)
             .unwrap();
-        assert_eq!(m.refused_errno(rid(5)).unwrap(), Some(EEXIST));
+        assert_eq!(m.refused_code(rid(5)).unwrap(), Some(EEXIST));
         assert_eq!(m.completed_position(rid(5)).unwrap(), None);
         assert_eq!(m.inbox_ack(3, 7).unwrap(), Some(ack(1, 0)));
         let rows = m.peek_journal_after(0).unwrap();
         assert!(
-            matches!(rows[0].1, LogRecord::Refused { rid: r, errno } if r == rid(5) && errno == EEXIST)
+            matches!(rows[0].1, LogRecord::Refused { rid: r, code } if r == rid(5) && code == EEXIST)
         );
         assert!(matches!(rows[1].1, LogRecord::InboxAck { n: 1, i: 0, .. }));
         // Retention treats it like any other row (same first 16 bytes).
         let now = constellation_fs_core::types::now_ns() / 1_000_000;
         assert_eq!(m.prune_completed(now + 10, 1).unwrap(), 1);
-        assert_eq!(m.refused_errno(rid(5)).unwrap(), None);
+        assert_eq!(m.refused_code(rid(5)).unwrap(), None);
     }
 
     #[test]
@@ -481,12 +482,12 @@ mod tests {
         let records = vec![
             LogRecord::Refused {
                 rid: rid(8),
-                errno: ENOENT,
+                code: ENOENT,
             },
             ack(6, 1).record(),
         ];
         follower.apply_records_journaled(&records).unwrap();
-        assert_eq!(follower.refused_errno(rid(8)).unwrap(), Some(ENOENT));
+        assert_eq!(follower.refused_code(rid(8)).unwrap(), Some(ENOENT));
         assert_eq!(follower.completed_position(rid(8)).unwrap(), None);
         assert_eq!(follower.inbox_ack(3, 7).unwrap(), Some(ack(6, 1)));
     }

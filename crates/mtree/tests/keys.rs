@@ -24,6 +24,8 @@
 
 use std::collections::BTreeMap;
 
+use constellation_types::Rdev;
+
 use constellation_mtree::keys::{self, Field, Key, KeyError, Subsystem, RESERVED_RANGES};
 use constellation_mtree::record::{
     self, Attrs, BlobHash, DentryRecord, InodeRecord, Kind, Payload, RDENTRY_VALUE, VALUE_SPILL,
@@ -55,7 +57,7 @@ fn attrs(kind: Kind, size: u64, mtime_ns: i64) -> Attrs {
         size,
         mtime_ns,
         ctime_ns: mtime_ns,
-        rdev: 0,
+        rdev: Rdev::default(),
     }
 }
 
@@ -502,7 +504,7 @@ fn no_mutable_field_is_in_the_tree() {
         size: 0x1122_3344_5566_7788,
         mtime_ns: 0x0102_0304_0506_0708,
         ctime_ns: 0x1918_1716_1514_1312,
-        rdev: 0x2122_2324_2526_2728,
+        rdev: Rdev::new(0x2122_2324, 0x2526_2728),
     };
     let quiet = Attrs {
         kind: Kind::File,
@@ -513,7 +515,7 @@ fn no_mutable_field_is_in_the_tree() {
         size: 0,
         mtime_ns: 1,
         ctime_ns: 2,
-        rdev: 0,
+        rdev: Rdev::default(),
     };
     let patterns: Vec<Vec<u8>> = vec![
         loud.mode.to_be_bytes().to_vec(),
@@ -526,7 +528,8 @@ fn no_mutable_field_is_in_the_tree() {
         loud.mtime_ns.to_be_bytes().to_vec(),
         loud.mtime_ns.to_le_bytes().to_vec(),
         loud.ctime_ns.to_be_bytes().to_vec(),
-        loud.rdev.to_be_bytes().to_vec(),
+        loud.rdev.major.to_be_bytes().to_vec(),
+        loud.rdev.minor.to_be_bytes().to_vec(),
     ];
     let xattrs = vec![(b"user.a".to_vec(), vec![0x5a; 16])];
     let manifest = vec![0x77; 64];

@@ -30,9 +30,19 @@ before starting any plan. Every plan file assumes you did.
 - `docs/how-to-guides/development/TESTING.md` — the test lanes and the fault-injection harness.
 - Crates: `fs-core` (chunking, manifests, disk cache), `store-s3`
   (S3 layout/chunk store/log store/nodes/lease), `meta` (fjall
-  replica, log records, convergent replay), `api` (control API types +
-  unix-socket server), `cli` (the `constellation` binary: FUSE fs,
-  shipper/syncer, lease keeper, mount wiring), `net` (P2P — may be
+  replica, log records, convergent replay), `control` (the control protocol:
+  framing, the typed method table, authz, audit, transports, client, the
+  `web` HTTP adapter and embedded UI — plan 31 C5; it replaced `api`),
+  `engine` (every storage algorithm: the authority
+  driver and shipper, leases, coop, GC, snapshots, epochs, cluster
+  locks, uploads, prefetch — plan 31 C3; the mounted `View`,
+  `engine/src/view/` — C4; and the control service binding the
+  protocol's method table, `engine/src/control/` — C5), `vfs` (the frontend contract: the `Vfs`
+  trait, `OpCtx`/`Responder`, `FrontendEvents`, `FrontendCaps`, the
+  name/xattr/identity policies, the `OpWatch` request watchdog — plan 31
+  C4), `frontend-fuse` (the Linux FUSE frontend over `Vfs`, the only
+  crate depending on `fuser` — C4), `cli` (the `constellation`
+  binary: CLI, daemon host, mount wiring), `net` (P2P — may be
   empty until phase 3), `harness` (fault-injection orchestrator:
   docker floci S3 + toxiproxy, model oracle, seeded workloads).
 
@@ -81,23 +91,30 @@ Every plan ends with ALL of these green, run in this order:
 - Rust 2024 edition, stable toolchain. `fuser` 0.18 with
   `default-features = false`; Linux mounts use host-sized concurrent
   event loops. tokio multithread runtime.
-- FUSE callbacks run on synchronous worker threads: to reach async code use the
-  existing channel patterns (see `SyncHandle` in `cli/src/fusefs.rs`:
-  unbounded mpsc + `blocking_recv` oneshot barriers). Never block the
-  tokio runtime with sync waits.
+- `Vfs` ops (FUSE callbacks) run on synchronous frontend worker threads:
+  to reach async code use the existing channel patterns (see `SyncHandle`
+  in `engine/src/view/mod.rs` and its `SyncRequest` in
+  `engine/src/sync.rs`: unbounded mpsc + `blocking_recv` oneshot
+  barriers), or complete the op's `Responder` from another thread when it
+  must wait unboundedly (`ClusterLocks::lock`'s `lock-wait` thread). Never
+  block the tokio runtime with sync waits.
 - Comments explain non-obvious intent and trade-offs, never narrate
   code. Match the existing prose-heavy module-doc style (look at
-  `cli/src/shipper.rs` or `store-s3/src/lease.rs`).
+  `engine/src/shipper.rs` or `store-s3/src/lease.rs`).
 - Errors: `thiserror` enums in library crates, `anyhow` with `context`
-  in the binary/harness. Map errors to errnos at the FUSE boundary
-  only (`errno()` in `cli/src/fusefs.rs`).
+  in the binary/harness. Refusals are the portable
+  `constellation_types::Code` everywhere (`MetaError::code()`); it
+  becomes a Linux errno at the FUSE boundary only (`reply_code()` in
+  `crates/frontend-fuse/src/reply.rs`; ops complete with `VfsError`,
+  which wraps a `Code`), and a real syscall's failure becomes a `Code`
+  through `Code::from_io_error`. No `libc::E*` outside `crates/types`.
 - New config knobs: env vars named `CONSTELLATION_*` with sane
   defaults; document them where they are read.
 - Tests: unit tests co-located (`#[cfg(test)] mod tests`), using
   `object_store::memory::InMemory` for S3-shaped things and
   `Meta::open_in_memory()` for metadata. Cross-node logic gets
   in-process multi-node tests (see the pattern at the bottom of
-  `cli/src/shipper.rs`). System-level behavior gets a harness scenario.
+  `engine/src/shipper.rs`). System-level behavior gets a harness scenario.
 
 ## Harness scenario checklist (when a plan asks for one)
 

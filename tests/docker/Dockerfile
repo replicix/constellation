@@ -90,6 +90,8 @@ ENTRYPOINT ["bash", "/usr/local/lib/constellation/xfstests.sh"]
 # Kept last so it stays the default build target.
 FROM runtime-base AS suite
 COPY --from=build /constellation /usr/local/bin/constellation
+# smoke.sh is a wrapper around `harness smoke`.
+COPY --from=build /harness /usr/local/bin/harness
 COPY --from=pjdfstest /opt/pjdfstest/pjdfstest /opt/pjdfstest/pjdfstest
 COPY --from=pjdfstest /opt/pjdfstest/tests /opt/pjdfstest/tests
 COPY tests/lib.sh tests/smoke.sh tests/compliance.sh tests/stress.sh \

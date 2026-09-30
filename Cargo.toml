@@ -1,13 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/types",
+    "crates/platform",
+    "crates/vfs",
+    "crates/engine",
+    "crates/frontend-fuse",
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
     "crates/mtree",
     "crates/store-s3",
     "crates/net",
-    "crates/api",
+    "crates/control",
     "crates/harness",
     "crates/chaos",
     "crates/upload-concurrency",
@@ -21,20 +26,31 @@ members = [
 # `constellation-upload-concurrency` crate) but only builds when asked
 # for explicitly (`-p uploadbench`, `--workspace`, or `cd` + `cargo run`).
 default-members = [
+    "crates/types",
+    "crates/platform",
+    "crates/vfs",
+    "crates/engine",
+    "crates/frontend-fuse",
     "crates/cli",
     "crates/fs-core",
     "crates/meta",
     "crates/mtree",
     "crates/store-s3",
     "crates/net",
-    "crates/api",
+    "crates/control",
     "crates/harness",
     "crates/chaos",
     "crates/upload-concurrency",
     "crates/model",
     "crates/authority",
 ]
-exclude = ["bench/dbbench", "bench/prollybench", "bench/enginebench", "vendor/fjall"]
+exclude = [
+    "bench/dbbench",
+    "bench/prollybench",
+    "bench/enginebench",
+    "vendor/fjall",
+    "vendor/fuser",
+]
 
 [workspace.package]
 version = "1.0.0"
@@ -43,12 +59,17 @@ license = "MPL-2.0"
 repository = "https://github.com/replicix/constellation"
 
 [workspace.dependencies]
+constellation-types = { path = "crates/types" }
+constellation-platform = { path = "crates/platform" }
+constellation-vfs = { path = "crates/vfs" }
+constellation-engine = { path = "crates/engine" }
+constellation-frontend-fuse = { path = "crates/frontend-fuse" }
 constellation-fs-core = { path = "crates/fs-core" }
 constellation-meta = { path = "crates/meta" }
 constellation-mtree = { path = "crates/mtree" }
 constellation-store-s3 = { path = "crates/store-s3" }
 constellation-net = { path = "crates/net" }
-constellation-api = { path = "crates/api" }
+constellation-control = { path = "crates/control" }
 constellation-upload-concurrency = { path = "crates/upload-concurrency" }
 constellation-chaos = { path = "crates/chaos" }
 constellation-authority = { path = "crates/authority" }
@@ -93,6 +114,8 @@ iroh-gossip = "0.101"
 # linted or tested as a member).
 [patch.crates-io]
 fjall = { path = "vendor/fjall" }
+# Plan 31 C4b: FUSE session handover (vendor/fuser/CONSTELLATION-PATCH.md).
+fuser = { path = "vendor/fuser" }
 
 [profile.release]
 lto = "thin"

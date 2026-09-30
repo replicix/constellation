@@ -4,6 +4,7 @@
 
 use crate::rid::Rid;
 use constellation_fs_core::Ino;
+use constellation_types::{Code, Rdev};
 use serde::{Deserialize, Serialize};
 
 /// One eagerly materialized clone inode.  Inode numbers are allocated by
@@ -20,7 +21,7 @@ pub struct CloneNode {
     pub gid: u32,
     pub size: u64,
     pub mtime_ns: i64,
-    pub rdev: u64,
+    pub rdev: Rdev,
     pub target: Option<String>,
     pub manifest: Option<Vec<u8>>,
     #[serde(default)]
@@ -70,7 +71,7 @@ pub enum LogRecord {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: Rdev,
         time_ns: i64,
     },
     Link {
@@ -181,10 +182,10 @@ pub enum LogRecord {
     /// mid-rollout mismatch is out of scope, not a live concern.
     Completed { rid: Rid },
     /// Plan 30 §M13: the holder refused the inbox-submitted op `rid` with
-    /// `errno`. An inbox op has no reply to carry its refusal, so it rides
-    /// the log like a completion; applying it inserts `rid -> refused(errno)`
+    /// `code`. An inbox op has no reply to carry its refusal, so it rides
+    /// the log like a completion; applying it inserts `rid -> refused(code)`
     /// into `completed`, and every dedup site answers the rid with that
-    /// errno from then on — a refusal is an outcome, never re-evaluated
+    /// code from then on — a refusal is an outcome, never re-evaluated
     /// (see `docs/reference/features/forwarded-mutations.md`, "The inbox").
     /// Touches no inode/dentry (see `TouchSet::add`). The inbox path is
     /// where it started; plan 30 §M9 made every definitive refusal an
@@ -192,7 +193,11 @@ pub enum LogRecord {
     /// delegate (`core::delegate::record_delegate_refusal`) journal one
     /// for a P2P-forwarded op too, alongside the reply that carries it —
     /// a retry by rid after a takeover finds the outcome in the log.
-    Refused { rid: Rid, errno: i32 },
+    ///
+    /// Plan 31 §7: `code` is the portable [`Code`], serialized as its own
+    /// wire number (never an OS errno), so a refusal journaled on one OS
+    /// means the same error when a replica on another tails it.
+    Refused { rid: Rid, code: Code },
     /// Plan 30 §M13: position `(n, i)` of requester `node`'s inbox batch
     /// under `epoch` has an outcome (executed, refused or deduplicated)
     /// in this transaction. Every replica keeps the highest such position
@@ -243,6 +248,24 @@ pub enum LogRecord {
     /// for a TTL takeover, whose predecessor's unshipped work is lost,
     /// but not here: that work comes back). Touches nothing.
     TailFollows { prev_epoch: u64 },
+    /// `renameat2(RENAME_EXCHANGE)`: the entries `parent/name` and
+    /// `new_parent/new_name` swap the inodes they name, atomically — both
+    /// must exist, either may be a directory, and nothing is unlinked.
+    /// Name-based like `Rename` (the holder validated it: both entries
+    /// present, neither directory moved beneath itself), so a replica
+    /// swaps whatever the two names hold at its log position; replay skips
+    /// it if either is gone (a conflict the log order already decided).
+    /// Applying it swaps the two dentries (and their `0x04` reverse
+    /// entries), moves a directory's `..` link between the parents when
+    /// the kinds differ across directories, touches both parents' mtime
+    /// and ctime and both inodes' ctime, all with `max` merges.
+    Exchange {
+        parent: Ino,
+        name: String,
+        new_parent: Ino,
+        new_name: String,
+        time_ns: i64,
+    },
 }
 
 impl LogRecord {
@@ -257,6 +280,7 @@ impl LogRecord {
             LogRecord::Unlink { time_ns, .. } => Some(*time_ns),
             LogRecord::Rmdir { time_ns, .. } => Some(*time_ns),
             LogRecord::Rename { time_ns, .. } => Some(*time_ns),
+            LogRecord::Exchange { time_ns, .. } => Some(*time_ns),
             LogRecord::Setattr { time_ns, .. } => Some(*time_ns),
             LogRecord::WriteManifest { time_ns, .. } => Some(*time_ns),
             LogRecord::SetXattr { time_ns, .. } => Some(*time_ns),

@@ -9,14 +9,18 @@ license.workspace = true
 constellation-fs-core.workspace = true
 constellation-meta.workspace = true
 constellation-store-s3.workspace = true
+constellation-types.workspace = true
 anyhow.workspace = true
-libc.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Plan 31 C1's two-node test carries a holder's reply through the real P2P
+# envelope (`core::tests::portable_codes`).
+constellation-net.workspace = true
+iroh.workspace = true
 # The simulation (tests/sim.rs) only: real stores over a simulated bucket
 # and bus, seeded workloads, Stateright's linearizability checker used as
 # a library. None of this reaches the product build.

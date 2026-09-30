@@ -1,0 +1,24 @@
+[package]
+name = "constellation-frontend-fuse"
+description = "The Linux (FreeBSD-ready) FUSE frontend (plan 31 §4): fuser's callbacks translated into `constellation-vfs` ops and their responders back into fuser replies; the only crate that depends on fuser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+constellation-vfs.workspace = true
+constellation-types.workspace = true
+constellation-platform.workspace = true
+# `serializable`: `NegotiatedInit` crosses processes in a session handover.
+fuser = { workspace = true, features = ["serializable"] }
+libc.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `MockVfs` (tests/wire.rs): the adapter driven by a fake kernel over a
+# socket pair, against a recording, scriptable `Vfs`.
+constellation-vfs = { workspace = true, features = ["mock"] }
+# The handover tests (`session.rs`): a mountpoint, the wire round trips.
+tempfile.workspace = true
+serde_json.workspace = true
+postcard.workspace = true

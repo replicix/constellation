@@ -27667,3 +27667,1466 @@ table refuses a cached grant once it is recalled. What did not:
   lock-fence-at-close, lock-holder-partitioned, lock-latency,
   lock-grant-dead-generation, git-under-flock-b2b (73 turns, 1 double
   turn), git-under-flock (51 turns, 0).
+
+## Plan 31 C0 — Baselines and guardrails
+
+Milestone C0 of [plan 31](wip/31-core-frontend-backend.md) (§11): the
+harness gets machine-readable output and sharding, a cross-target
+type-check gate exists with today's failures recorded, and CI runs it.
+Nothing in the product code changes. Base commit: `99472fa`.
+
+| Item | State | Where |
+|---|---|---|
+| `harness run --results-json <path>` (schema 1: `schema`, `lane`, `seed`, `shard`, `started_at`, `scenarios[{name, outcome, seconds, reason}]`), written also when scenarios fail; `--lane` (default `linux-fuse`); stderr output unchanged | done | `crates/harness/src/results.rs` (format documented in the module doc), `crates/harness/src/main.rs` |
+| `harness run --shard i/n` (1-based; deterministic `idx % n == i-1` over the selected list after name filtering; bad syntax rejected up front) | done | `crates/harness/src/results.rs`, `crates/harness/src/main.rs`; 6 unit tests (parsing, exact partition, JSON shape, file round trip) |
+| `tools/zcc`, `tools/zar`: POSIX sh wrappers over `zig cc` / `zig ar` (`zig` on `PATH`, else `python3 -m ziglang`); drop the cc-rs flags zig rejects (`--target=`, `-arch`, `-m*-version-min`) | done | `tools/zcc`, `tools/zar` |
+| `make check-cross` / `tools/check-cross.sh`: `cargo check` of the default workspace for `aarch64-apple-darwin` (`--keep-going`, fuser's `macos-no-mount`) and of each library crate for `x86_64-pc-windows-gnu`; census table; exits nonzero only for an unlisted failure or a stale known-failure entry | done | `tools/check-cross.sh`, `Makefile` |
+| Known-failures file, seeded with the census below (two-way, like the xfstests baseline) | done | `tools/check-cross-known-failures.txt` |
+| CI job `cross-check` (`mlugg/setup-zig@v2`, both rustup targets, `make check-cross`) | done | `.github/workflows/ci.yml` |
+| Docs: `--shard`, `--results-json`, `--lane`, `make check-cross` and the known-failures file | done | `docs/how-to-guides/development/TESTING.md` |
+| Perf baselines: harness `bench`, meta-bench, fio-latency p50/p99, pjdfstest, and `--results-json` of the full matrix | pending — measured in the final gate run of the plan-31 series against base commit `99472fa` (the full suites run once, at the end) | — |
+
+### Cross-check census (base `99472fa`)
+
+`make check-cross`, zig 0.16.0, rustc 1.98. Only `cargo check`: nothing
+is linked.
+
+| Target | Crate | Result | First error |
+|---|---|---|---|
+| `aarch64-apple-darwin` | `constellation-chaos` | FAIL | `cannot find function posix_fadvise in crate libc` (`crates/chaos/src/op.rs:20`) |
+| `aarch64-apple-darwin` | `constellation` (cli) | FAIL | 35 errors: `libc::gettid` missing, i16/u16 and i32 type mismatches, changed fuser/libc call arities |
+| `aarch64-apple-darwin` | everything else in the default workspace | ok | — |
+| `x86_64-pc-windows-gnu` | `constellation-fs-core`, `-meta`, `-mtree`, `-store-s3`, `-net`, `-upload-concurrency`, `-model` | ok | — |
+| `x86_64-pc-windows-gnu` | `constellation-api` | FAIL | `unresolved imports tokio::net::UnixListener, tokio::net::UnixStream` |
+| `x86_64-pc-windows-gnu` | `constellation-authority` | FAIL | `cannot find value ESTALE in crate libc` |
+| `x86_64-pc-windows-gnu` | `constellation-chaos` | FAIL | `cannot find unix in os` |
+
+The plan predicted `api`, `authority` and `chaos` on windows-gnu; the
+census confirms exactly those. Notes:
+
+- On darwin, `constellation-harness` depends on `constellation-chaos`,
+  so it is not reached until chaos compiles; it will likely join the
+  known failures then (it is not a Windows library crate).
+- fuser's default on macOS needs macFUSE through pkg-config, which a
+  cross-check does not have; the darwin check enables its
+  `macos-no-mount` feature. The real macOS build (plan 34) needs macFUSE
+  or that feature as its own decision.
+- The C dependencies (`aws-lc-sys`, `zstd-sys`) compile with
+  `tools/zcc` on both targets, so no cross sysroot is needed.
+
+### Plan 31 C0 exit criteria
+
+- [x] `--results-json` and `--shard` in the harness, with unit tests
+- [x] `tools/zcc`, `tools/zar`, `make check-cross`, and the known-failures
+  file; `make check-cross` exits 0 with the file as seeded and exits
+  nonzero for an unlisted failure and for a stale entry (both exercised)
+- [x] CI job `cross-check`
+- [x] `docs/how-to-guides/development/TESTING.md` updated
+- [ ] Baseline numbers (harness `bench`, meta-bench, fio-latency,
+  pjdfstest, full-matrix `--results-json`) — pending, measured in the
+  final gate run against `99472fa`
+
+## Plan 31 C1 — `constellation-types`: portable `Code` errno and `Rdev`
+
+| Item | State | Where |
+|---|---|---|
+| `Code`: `#[repr(u16)]`, fixed wire discriminants (63 variants), one `codes!` table for wire/POSIX name/Linux/Darwin | DONE | `crates/types/src/errno.rs` |
+| Linux and Darwin `Code ↔ i32` tables, `to_native`/`from_native`, `from_io_error`, exact `try_from_*`/`from_os_error` for test clients | DONE | `crates/types/src/errno.rs` |
+| `Rdev { major, minor }`; glibc `makedev` and FUSE `new_encode_dev` conversions | DONE | `crates/types/src/rdev.rs` |
+| `MutateOutcome::Errno(Code)`, `LogRecord::Refused { rid, code }`, refused-row encoding carries the wire number | DONE | `crates/meta/src/{mutate,record}.rs`, `crates/meta/src/store/*` |
+| `MetaError::code()` — the one meta→`Code` mapping (replaces cli `errno()` and authority `meta_errno`) | DONE | `crates/meta/src/error.rs` |
+| authority refusal/`ESTALE` sites carry `Code`; `libc` dropped from authority | DONE | `crates/authority/src/**` |
+| FUSE boundary: `reply_code(Code) -> fuser::Errno`, the only Linux conversion in the adapter | DONE | `crates/cli/src/fusefs.rs` |
+| rdev portable on the wire, in the journal and in the mtree inode record (same 49-byte layout) | DONE | `crates/{fs-core,meta,mtree,api}` |
+| harness/chaos compare `Code`, not `libc::E*` | DONE | `crates/harness/src/scenarios*`, `crates/chaos/src/{op,elle}.rs` |
+
+Wire-format break (plan 31 §2): pre-plan-31 buckets and state dirs are not
+migrated. `grep -rn 'libc::E[A-Z]' crates/` now hits only the libc
+cross-check tests inside `crates/types/src/errno.rs`. The Windows
+library-crate cross-check of `constellation-authority` now passes (removed
+from `tools/check-cross-known-failures.txt`).
+
+### Plan 31 C1 exit criteria
+
+- [x] Round-trip test per table entry (wire, Linux, Darwin), serde postcard/JSON
+- [x] Golden test: `Code::NotEmpty` → wire 3 → Linux 39 / Darwin 66
+- [x] In-process two-node test (`authority` `core::tests::portable_codes`):
+  refusals cross the signed postcard P2P envelope as `Code` wire numbers
+- [x] FUSE parity test: every `Code` the adapter produces equals fuser's `Errno::E*`
+- [x] Zero `libc::E*` outside the conversion module
+- [ ] Full gates — run once at the end of the plan-31 run
+
+## Plan 31 C2 — `constellation-platform`
+
+Milestone C2 of [plan 31](wip/31-core-frontend-backend.md) (§3, §4, §11):
+every host service the product crates use goes through one injectable
+bundle, `HostServices`, with Linux and macOS implementations and
+compile-only stubs for Windows, Android, iOS and FreeBSD.
+
+| Item | State | Where |
+|---|---|---|
+| New crate `constellation-platform` (workspace member, default member, `[workspace.dependencies]`); deps `constellation-types`, `zeroize`, and `libc` for `cfg(unix)` only | DONE | `crates/platform/Cargo.toml`, `Cargo.toml` |
+| `HostServices { dirs, process, daemon, file_lock, fs, secrets, lifecycle, mounts }`: `Clone` bundle of `Arc<dyn Trait>` (injection swaps one service — an in-memory secret store, a manual lifecycle — without a generic parameter through `Engine`/`View`); `HostServices::native()` per `cfg(target_os)`; `platform::native()` the process-wide set for code with nothing injected yet (the pre-C3 seam: C3 replaces those calls with the engine's bundle) | DONE | `crates/platform/src/lib.rs` |
+| `Dirs`: config/data/state/runtime dirs, XDG-style on Linux and macOS (plan 34 decision 7); `runtime_dir` keeps 32 bytes of the 104-byte `sun_path` for a socket name, else `/tmp/constellation-<uid>` | DONE | `crates/platform/src/dirs.rs`, `unix.rs` |
+| `Process`: hostname, pid liveness, `/proc` facts for the `daemon.lock` takeover (`ProcessFacts`; `classify` stays pure in cli), supplementary groups, effective ids, thread count, memory budget (meminfo ∧ cgroup), thread refs + backtrace signal (`tgkill` on Linux, `pthread_kill` on macOS; plan 31 §6.8) | DONE | `crates/platform/src/process.rs`, `linux.rs`, `macos.rs`, `unix.rs` |
+| `Daemon`: `unsafe fn detach(log)` — fork, `setsid`, stdio to the log, close-on-exec status pipe; the verdict protocol stays in cli | DONE | `crates/platform/src/daemon.rs`, `unix.rs`; `crates/cli/src/daemonize.rs` |
+| `FileLock`: `lock`/`try_lock` (`Ok(None)` = would block, `Code::Again`) returning a `LockGuard`, `holder_pid` (`/proc/locks`) | DONE | `crates/platform/src/lock.rs`, `unix.rs`, `linux.rs` |
+| `FsPrimitives`: `punch_hole`, `preallocate`, `full_fsync` (`F_FULLFSYNC` on macOS), `drop_cache` (`POSIX_FADV_DONTNEED`) | DONE | `crates/platform/src/fs.rs`, `linux.rs`, `macos.rs` |
+| `SecretStore` + `FileSecretStore` (`0600`, temp-then-rename, `<name>.lock` for read-modify-write; same file names as before) + `EphemeralSecretStore` (memory only, zeroized); `Credential`, `CredentialSource { AwsDefaultChain, Static, Refreshing }` (defined and tested, not wired — no `EngineConfig` before C3) | DONE | `crates/platform/src/secrets.rs` |
+| `LifecycleSource`, `LifecycleEvent { Foreground, Background, Suspending{deadline}, Resumed, NetworkChanged{reachable, metered}, LowPower }`, `ManualLifecycle` (per-subscriber queues) — engine behaviour is C8 | DONE | `crates/platform/src/lifecycle.rs` |
+| `MountTable`: list (`/proc/self/mountinfo`, `getmntinfo`), `is_mountpoint`, `unmount(Normal/Lazy/Force)` (`fusermount3 -u[z]` → `fusermount`, `umount2` for root), `fuse_waiting`/`abort_fuse` (`/sys/fs/fuse/connections/<n>`) | DONE | `crates/platform/src/mounts.rs`, `linux.rs`, `macos.rs` |
+| `platform::linux::fuse_mount_fd(target, &MountOpts) -> OwnedFd` (direct `mount(2)`, `fd=,rootmode=,user_id=,group_id=` + `allow_other`/`default_permissions`/`max_read`, `MS_NOSUID|MS_NODEV`[`|MS_RDONLY`]) and `fuse_unmount(target, lazy)`; unused by the daemon until C4 | DONE | `crates/platform/src/linux.rs` |
+| rdev conversions re-exported (`platform::{to,from}_linux_rdev`, `{to,from}_linux_fuse_rdev`); the FUSE adapter uses them | DONE | `crates/platform/src/lib.rs`; `crates/cli/src/fusefs{,_ops}.rs` |
+| Stubs `windows`, `android`, `ios`, `freebsd` (everything `Unsupported`; lifecycle is the portable `ManualLifecycle`); `cargo check -p constellation-platform --tests` clean for all four targets plus darwin | DONE | `crates/platform/src/{unsupported,windows,android,ios,freebsd}.rs` |
+| Call sites moved: `daemon_lock.rs` (`/proc/locks`, `/proc/<pid>/status`+`task/`, `/proc/<pid>` liveness, `/proc/self/mountinfo`, `/sys/fs/fuse`, takeover `flock`), `daemonize.rs` (fork/setsid/dup2/pipe), `main.rs` (`daemon.lock` and export-probe `flock`, `geteuid`/`getegid`, default state dir, node key), `registry.rs` (`flock`, XDG dirs), `e2e_pin.rs` (pins through `SecretStore::update`), `staging.rs` (`fallocate` punch), `fusefs.rs` (`/proc/<pid>/status` groups), `fuse_watch.rs` (`gettid`, SIGUSR2 handler, `tgkill`), `node_runtime.rs` (`fusermount3 -uz`), `parallelism.rs` (`/proc/meminfo`, cgroup), `startup.rs` (`/proc/self/status`), `snapshot.rs` (`geteuid`/`getegid`); `store-s3/nodes.rs` (`/proc/sys/kernel/hostname`); `net/identity.rs` (`node.key` through `SecretStore`, XDG); `chaos/op.rs` (`posix_fadvise`) | DONE | see the list |
+| Left in place: FUSE-protocol constants in the adapter (`O_*`, `F_RDLCK`…, `FALLOC_FL_*` op modes, `SEEK_*`, `S_IF*`, `XATTR_*` — C4's frontend), `main.rs`'s client-side `setxattr`/`getxattr`/`removexattr` helpers, fuser's own `SessionUnmounter`, and the harness's `fusermount3`/`SIGSTOP`/`fallocate` (C6) | — | — |
+
+Behaviour on Linux is unchanged apart from three deliberate details: an
+`XDG_*` variable that is set but empty now counts as unset (XDG spec; it
+used to make paths relative to the working directory), the E2E pins file
+is now `0600` like `node.key`, and a secret is `fsync`ed before its
+rename. `MountTable::unmount` also falls back to `umount2` when running
+as root without `fusermount3`/`fusermount` installed.
+
+Cross-check (`make check-cross`, exit 0): `constellation-platform` is clean
+for the Windows library check. `constellation-chaos` now compiles for
+darwin (its `posix_fadvise` moved behind `FsPrimitives::drop_cache`), which
+exposes `constellation-harness` to the darwin check for the first time: 8
+errors of its own (`libc::fallocate`, `setxattr` arities; C6 moves them).
+The known-failures file was updated two-way (`aarch64-apple-darwin
+constellation-chaos` removed, `aarch64-apple-darwin constellation-harness`
+added). cli's darwin errors went from 35 to 33 (`gettid`, `SYS_tgkill`
+gone; the rest are FUSE-frontend types for C4).
+
+| Target | Crate | Result |
+|---|---|---|
+| `aarch64-apple-darwin` | everything in the default workspace except the two below (now including `constellation-platform` and `constellation-chaos`) | ok |
+| `aarch64-apple-darwin` | `constellation` (cli) | FAIL (known; 33 errors) |
+| `aarch64-apple-darwin` | `constellation-harness` | FAIL (known, newly reached; 8 errors) |
+| `x86_64-pc-windows-gnu` | `constellation-types`, `-platform`, `-fs-core`, `-meta`, `-mtree`, `-store-s3`, `-net`, `-upload-concurrency`, `-model`, `-authority` | ok |
+| `x86_64-pc-windows-gnu` | `constellation-api`, `constellation-chaos` | FAIL (known) |
+
+### Plan 31 C2 exit criteria
+
+- [x] `constellation-platform` compiles for Linux, macOS (full) and
+  windows/android/ios/freebsd (stubs)
+- [x] `make check-cross` shows it clean for the Windows library check (and
+  exits 0 with the updated known-failures file)
+- [x] Every `/proc`, `fusermount3`, fork, `flock`, hostname, `fallocate`,
+  `posix_fadvise`, `/sys/fs/fuse`, `gettid`/`tgkill` use in `crates/cli`
+  and `crates/store-s3` goes through the platform crate
+- [x] `SecretStore` (file-backed) holds `node.key` and the E2E pins;
+  `EphemeralSecretStore` and `CredentialSource` exist with tests
+- [x] `fuse_mount_fd` mounts without fusermount3 (root-only test ran here)
+- [x] Unit tests: lock contention between two opens, punch hole seen by
+  `SEEK_HOLE`, secret files `0600`, ephemeral store writes nothing,
+  `classify` tests green, lifecycle fan-out
+- [ ] Full gates — run once at the end of the plan-31 run
+
+## Plan 31 C3 — `constellation-engine`
+
+Milestone C3 of [plan 31](wip/31-core-frontend-backend.md) (§4, §5, §11):
+the 40 engine modules leave the `constellation` binary for a library
+crate, `constellation-engine`, behaviour-neutrally: files moved with
+`git mv`, and the only code changes are paths, visibility, and the
+untangling §5 names. `crates/cli` keeps the CLI, the daemon host and the
+FUSE adapter (`fusefs.rs` + `fusefs_ops.rs`, `kernel_inval.rs`,
+`fuse_watch.rs`, `node_runtime.rs`, `daemonize.rs`, `daemon_lock.rs`,
+`parallelism.rs`, `startup.rs`, `main.rs`) until C4.
+
+| Item | State | Where |
+|---|---|---|
+| New crate `constellation-engine` (lib; workspace member, default member, `[workspace.dependencies]`); deps moved from cli (`fjall`, `futures`, `toml`, `serde`, `thiserror`, `async-trait`, `constellation-upload-concurrency`); no `fuser`, and no direct `libc` (the last use, `F_RDLCK`/`F_WRLCK`/`F_UNLCK` in `locks.rs`, moved to the FUSE adapter; every host call already went through `constellation-platform` after C2) | DONE | `crates/engine/Cargo.toml`, `Cargo.toml`, `crates/cli/Cargo.toml` |
+| The 35 clean modules moved as-is (`atime`, `backend`, `coop` + `coop/{exact,fresh}`, `cto`, `designation`, `doctor`, `e2e_pin`, `epoch`, `existence`, `fault`, `forward`, `fsck`, `held`, `holds`, `inbox`, `lease`, `leave`, `log_buffer`, `mtree_gc`, `mtree_publish`, `mtree_read`, `paths`, `pin`, `placement`, `prefetch`, `registry`, `reintegrate`, `scan`, `shipper`, `singleton`, `snapshot`, `sources`, `staging`, `target`, `writeback`) | DONE | `crates/engine/src/` |
+| `SyncRequest`, `AcquireProgress`, `HandoffResult` out of `fusefs.rs` into `engine::sync` — unblocks `authority_driver`, `gc`, `prune`, `recovery` (and `locks`); `SyncHandle` stays with the view until C4 | DONE | `crates/engine/src/sync.rs` |
+| The upload runtime out of cli's `main.rs` into `engine::upload` (`authority_driver` called `remote_chunk_wait`, `forwarded_pending_chunks`, `upload_dirty_chunks_report`): `UploadRuntime`, `HandoffStats`, `InFlightClaim`, `UploadReport`, `upload_dirty_chunks{,_report,_pass}`, `expand_adopted_spills`, the concurrency/report/poll constants, and `pending_upload_tests` (18 tests) with them | DONE | `crates/engine/src/upload.rs` |
+| `locks.rs` split: arbitration/queueing moved; `ClusterLocks::lock(ino, lock, sleep, done: FnOnce(Result<(), Code>) + Send + 'static)` keeps the dedicated `lock-wait` thread and its rationale; the `fuser::ReplyEmpty` completion and `reply_code` stay in `setlk` (the first `Responder`-shaped adapter); `ClusterLocks::test` takes/returns `write: bool` and `getlk` maps it to `F_*` | DONE | `crates/engine/src/locks.rs`, `crates/cli/src/fusefs_ops.rs` |
+| Seam `engine::events::FrontendEvents` (`invalidate_inode`, `invalidate_inode_and_wait`; C4's `FrontendEvents`): `ClusterLocks::inval` is `Option<Arc<dyn FrontendEvents>>`, implemented by cli's `kernel_inval::InodeInvalidator` | DONE | `crates/engine/src/events.rs`, `crates/cli/src/kernel_inval.rs` |
+| Seam `engine::op_watch` (C4's `OpWatch`): the thread-local "request this thread handles" (`OpStage` trait, `set_current`/`current`/`clear_current`/`stage`) moved from `fuse_watch` into the engine; `fuse_watch` registers its `Entry` there, `fuse_watch::stage` delegates, and the engine carries the request across the `lock-wait` hop (replaces `Watched::adopt`) | DONE | `crates/engine/src/op_watch.rs`, `crates/cli/src/fuse_watch.rs` |
+| `ConstellationFs` → `View` in cli (`fusefs.rs`, `fusefs_ops.rs`, `node_runtime.rs`) and in the comments naming it; `FuseFs` stays the adapter newtype | DONE | `crates/cli/src/fusefs{,_ops}.rs` |
+| cli imports the engine modules at its crate root (`use constellation_engine::{atime, …}`), so every `crate::<module>::…` path in cli is unchanged | DONE | `crates/cli/src/main.rs` |
+| Test-only constructors used by cli's tests (`UploadRuntime::for_test`, `snapshot::test_manager`) behind a `test-util` feature cli's dev-dependency enables | DONE | `crates/engine/Cargo.toml` |
+| CONVENTIONS.md paths (`engine/src/shipper.rs`, `SyncRequest` in `engine/src/sync.rs`, the crate list) | DONE | `docs/plans/v1/CONVENTIONS.md` |
+
+**Public API.** The narrowest surface that compiles: a module is `pub`
+only if cli uses it, and an item inside one was promoted to `pub` only
+where cli uses it (`scan::{ScanAhead, ScanFile}` and three methods,
+`prefetch::PrefetchStats` and four methods, `Coop::set_epoch_members`,
+and `upload`'s items listed below); items already `pub` stay `pub`. Two
+went the other way, to `pub(crate)`, because nothing outside needs them
+and clippy's public-API lints then fire (`TreeAccess::from_reader` takes
+the private `mtree_read::ChainReader`; `mtree_publish::Plan::len`, and
+the test-only `AtimeAccumulator::len`); `writeback::throttle_delay` keeps
+its `Result<_, ()>` under an `allow(clippy::result_unit_err)`.
+
+Private modules (engine-internal only): `mtree_gc`, `mtree_read`,
+`recovery`, `singleton`, `sources`. Public modules and why:
+
+| Module | cli uses it for |
+|---|---|
+| `atime` | the node's `AtimeAccumulator`/`AtimeMode`, shared by every view |
+| `authority_driver` | node_runtime spawns the driver (`DriverDeps`, `CoreStatus`, `LockFlushHook`) |
+| `backend` | opening a backend (`open_backend*`, `load_fs_explained`), S3 request counts for `status` |
+| `coop` | the node's `Coop`, shared with the views and `status` |
+| `cto` | `--cto` parsing and the lone-node kernel TTLs |
+| `designation` | node_runtime builds the `DesignationManager` |
+| `doctor` | `constellation doctor`'s CAS probe report |
+| `e2e_pin` | E2E key pins on create/import/mount |
+| `epoch` | node_runtime's `EpochManager` and roster refresh |
+| `events` | the `FrontendEvents` seam cli's `kernel_inval` implements |
+| `existence` | node_runtime builds the existence cache |
+| `fault` | fault-injection knobs read in the FUSE path |
+| `forward` | `ForwardState` (node_runtime, the P2P bridge, `status`) |
+| `fsck` | `constellation fsck` and its in-daemon run |
+| `gc` | `constellation gc` and the in-daemon GC |
+| `held` | `status`'s held inodes and `drop_held` |
+| `holds` | open-orphan holds (`Holds`, `OpenHandles`) for the views |
+| `inbox` | `status`'s inbox report |
+| `lease` | `LeaseView`/`DelegateView`, the FUSE write gate |
+| `leave` | `node leave` |
+| `locks` | `ClusterLocks` behind `getlk`/`setlk`, `LockFlushers`, `--locks` parsing |
+| `log_buffer` | the control API's log tail (`LogBuffer`, `LogWriter`) |
+| `mtree_publish` | node_runtime builds the `TreePublisher` |
+| `op_watch` | the stage seam cli's `fuse_watch` implements |
+| `paths` | `status`'s P2P path summary |
+| `pin` | node_runtime's `PinManager` |
+| `placement` | node_runtime's `Placement` |
+| `prefetch` | the views' `Prefetcher`, `status`'s `PrefetchStats` |
+| `prune` | `constellation prune`, the pruner task, `PruneStats` |
+| `registry` | the filesystem registry (`Registry`, `FsEntry`, `MountEntry`) |
+| `reintegrate` | node_runtime's `ReintegrationState` |
+| `scan` | the views' `ScanAhead` |
+| `shipper` | mount bootstrap (`bootstrap`, `rebuild_if_pruned`, `TAIL_PROBE_IDLE`) |
+| `snapshot` | `SnapshotManager`, frozen snapshot objects in the view |
+| `staging` | write staging (`Staging`, `StagingBudget`, `GenCounter`) |
+| `sync` | `SyncRequest`, sent by the view, the control socket and the P2P bridge |
+| `target` | resolving a mount target to its state dir |
+| `upload` | `UploadRuntime` (node_runtime; `status` reads `gate`, `probe`, `existence`, `handoff`), `upload_dirty_chunks`, `remote_chunk_wait` |
+| `writeback` | `--write-mode` state and the dirty-byte throttle |
+
+Line counts (`find <dir> -name '*.rs' | xargs wc -l | tail -1`):
+`crates/cli/src` 47,178 → 17,488; `crates/engine/src` 29,860 (the
++170 is mostly the new `lib.rs`, the seam modules `events.rs` and
+`op_watch.rs`, and the module docs of `sync.rs` and `upload.rs`).
+
+Unit tests: before, `cargo test -p constellation --bins` 290 passed + 1
+ignored; after, `cargo test -p constellation-engine` 214 passed + 1
+ignored and `cargo test -p constellation --bins` 76 passed. The test
+names are identical (291 both ways, `pending_upload_tests::*` now under
+`upload::`).
+
+Cross-check (`make check-cross`, exit 0): `constellation-engine`
+compiles clean for macOS; cli's darwin errors went from 33 to 29 (all
+in `fusefs_ops.rs`/`main.rs`). The Windows library check of the engine
+FAILs and is recorded as known: the engine depends on
+`constellation-api` for its status report types and stops at the api's
+unix-socket server; past that, `staging.rs`'s
+`std::os::unix::fs::FileExt` is the next Windows blocker.
+
+| Target | Crate | Result |
+|---|---|---|
+| `aarch64-apple-darwin` | everything in the default workspace except the two below (now including `constellation-engine`) | ok |
+| `aarch64-apple-darwin` | `constellation` (cli) | FAIL (known; 29 errors) |
+| `aarch64-apple-darwin` | `constellation-harness` | FAIL (known; 8 errors) |
+| `x86_64-pc-windows-gnu` | `constellation-types`, `-platform`, `-fs-core`, `-meta`, `-mtree`, `-store-s3`, `-net`, `-upload-concurrency`, `-model`, `-authority` | ok |
+| `x86_64-pc-windows-gnu` | `constellation-engine` | FAIL (known, new: via `constellation-api`; then `std::os::unix` in `staging.rs`) |
+| `x86_64-pc-windows-gnu` | `constellation-api`, `constellation-chaos` | FAIL (known) |
+
+### Plan 31 C3 exit criteria
+
+- [x] `constellation-engine` exists as its own crate; `crates/cli` shrinks
+  by the 40-module move (plus the upload runtime and the sync request
+  types)
+- [x] No `fuser` in the engine's dependency tree, no direct `libc`
+- [x] `cargo build --workspace`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo fmt --all --check` clean
+- [x] Every moved unit test runs under `cargo test -p constellation-engine`;
+  engine + cli test sets equal the pre-move cli set
+- [x] `make check-cross` exits 0 with the updated known-failures file
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, perf within 3% of C0) — run once at the end of the
+  plan-31 run
+
+## Plan 31 C4a — `constellation-vfs` and `constellation-frontend-fuse`
+
+The core of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.1-§6.8, §11 "C4"): the frontend contract as its own crate, the
+mounted view moved into the engine beneath it, and FUSE rebuilt as a thin
+adapter over it — behaviour-neutrally. Session handover / `vendor/fuser` /
+`daemon --upgrade` (C4b), subtree confinement and the `Engine`/`ViewSpec`
+API (C4c), the conformance kit and `MockVfs` (C6) and op metrics /
+`vfs-bench` (C7) are later steps; nothing here needs reshaping for them
+(the file ops carry the `Fh` a handle table exports, `FrontendCaps` is
+already passed per view, `OpWatch` is an instance a host hands its views).
+
+| Item | State | Where |
+|---|---|---|
+| New crate `constellation-vfs` (deps: types, platform, bytes, smallvec, tracing — no engine, fuser or libc; clean for the Windows library cross-check): `trait Vfs` (30 ops, generic `R: Responder<T>` per op), `OpCtx`/`OpId`/`OpKind`/`OpKindSet`/`Caller`/`Principal`/`CancelToken`, `Responder<T>` + `Blocking<T>`/`BlockingWait`/`FnResponder`/`DirSink`/`CollectDir`, `VfsError(Code)`, the decoded argument/result types (`Attr`, `Entry`, `SetAttr`, `Opened`, `OpenFlags`, `FallocateMode`, `SetXattrFlags`, `RenameFlags`, `SeekWhence`, `Durability`, `LockSpec`/`LockRange`/`LockStatus`, `StatFs`, `ReadData`, `WriteData`, `Name`/`XattrName` + owned bufs) | DONE | `crates/vfs/src/{lib,vfs,ctx,responder,types,name,error}.rs` |
+| `FrontendEvents` + `Invalidation` (§6.5), `FrontendCaps` + `FrontendCaps::linux_fuse(cluster_locks)` (§6.6) | DONE | `crates/vfs/src/{events,caps}.rs` |
+| Policies (§6.7): `NamePolicy` (Linux: lossy UTF-8, `NAME_MAX` 255 — the old `checked_name!`), `XattrPolicy` (Linux: `user.*`, `trusted.*` for uid 0, `user.constellation.{rsize,rcount}` virtual, read-only and *listed*), `IdentityMap::Posix`, `PolicyStack::for_caps` | DONE | `crates/vfs/src/policy.rs` |
+| `OpWatch`/`Watched`/`WatchKey` (§6.8): `fuse_watch` generalised to an instance (monitor thread per instance, `check_stalls`, `snapshot`), the thread-local current op with `stage`/`current`/`Current::adopt`/`Watched::adopt`; env vars (`CONSTELLATION_FUSE_REQUEST_STALL_S`, `CONSTELLATION_FUSE_STALL_BACKTRACE`) and log text unchanged | DONE | `crates/vfs/src/watch.rs` (from `cli/src/fuse_watch.rs`) |
+| C3 seams deleted: `engine::op_watch` (→ `constellation_vfs::watch`), `engine::events::FrontendEvents` (→ `ClusterLocks::inval` is the engine's own `kernel_inval::InodeInvalidator`) | DONE | `crates/engine/src/{lib,locks}.rs` |
+| `View` moved into the engine, split into modules, `impl Vfs for View`; every inline policy step of the old handlers (root renumbering, in-flight registration, name/xattr policy, synthetic `.constellation` and scratch short-circuits, `strict_read`, pending-write overlay, `lock_fenced`/`lock_discard_tainted`, `O_SYNC` flush, the cluster-lock capability check, the virtual xattrs, the watchdog registration) now beneath the trait, in the same order, answering the same `Code`s; `SyncHandle`, `FsDependencies` (+ `watch`, `caps`) with it | DONE | `crates/engine/src/view/{mod,ops,write_gate,shards,io,flush,create,lock_gate,synthetic}.rs` (from `cli/src/fusefs{,_ops}.rs`) |
+| Kernel invalidation machinery engine-side (queue, `kernel-inval` + `kernel-inval-watchdog` threads, TTL drop, `InFlight` hold-back, bounded `invalidate_and_wait`), delivering one notification per `FrontendEvents::invalidate` call; module doc (the zombie/deadlock design note) moved with it | DONE | `crates/engine/src/kernel_inval.rs` (from `cli/src/kernel_inval.rs`) |
+| New crate `constellation-frontend-fuse` (deps: vfs, types, platform, fuser, libc, tracing) — the only `fuser` dependent: `FuseFs<V: Vfs>` (`fuser::Filesystem`), newtype responders over the fuser replies, `reply_code`, flag/`rdev`/time decoding, `FUSE_INIT` negotiation (queue tuning, parallel dirops, `--locks cluster` lock caps), `FuseNotifySink` (the old `NotifySink` impl, renamed), `mount(view, mountpoint, opts, caps) -> FuseSession` (`run`/`unmounter`/`notifier`), `threads` (worker sizing, moved from cli's `parallelism.rs`) | DONE | `crates/frontend-fuse/src/{lib,adapter,reply,notify,session,threads}.rs` |
+| cli: mounts through `constellation_frontend_fuse::mount` on the same dedicated per-mount `session.run()` thread; one node-wide `OpWatch` shared by the views (`status`'s `fuse_requests`); no `fuser`; `fusefs.rs`, `fusefs_ops.rs`, `kernel_inval.rs`, `fuse_watch.rs` gone | DONE | `crates/cli/src/{node_runtime,main,parallelism}.rs`, `crates/cli/Cargo.toml` |
+| `check-cross`: frontend-fuse out of the Windows library list (a platform frontend, like cli); cli's darwin errors 29 → 4 (only main.rs's xattr arities) | DONE | `tools/check-cross.sh`, `tools/check-cross-known-failures.txt` |
+| CONVENTIONS.md paths (`SyncHandle`, `reply_code`, the crate list) | DONE | `docs/plans/v1/CONVENTIONS.md` |
+
+**Deliberate deviations from the §6 sketch (behaviour-preserving).**
+`Caller` resolves supplementary groups lazily, once per op, on the first
+check that needs one (as FUSE always did) instead of eagerly at the edge.
+The file ops take `ino` *and* `fh` (FUSE delivers both; the view has
+always addressed by the inode). `readdir` completes through its responder,
+which is also its `DirSink`, so the reply is sent while the op is still
+registered in-flight (the kernel_inval hold-back rule). Linux *lists* the
+virtual xattrs (`getfattr -d` has always shown them), so
+`linux_fuse().virtual_xattrs_listed = true`; the policy can hide them for
+plan 34. One kernel-invalidation thread per node and one `OpWatch` per
+node, as before, not per view. Only locks defer (§6.3).
+
+Unit tests: before, `cargo test -p constellation-engine -p constellation
+--bins --lib` 290 passed + 1 ignored (291 names); after, engine 276 + 1
+ignored, cli 20, vfs 21, frontend-fuse 12 — 329 passed + 1 ignored. Every
+one of the 291 test names is still present (moved with their code; the
+`reply_code`, watchdog and FUSE-sizing tests to the new crates); 39 are
+new (responder drop fail-safe, `Blocking`, xattr listing policy,
+`linux_fuse` caps, `OpWatch` stall detection and cross-thread adoption,
+flag decoding, and 13 in-process `Vfs` calls against a real `View` —
+C6's conformance seed).
+
+### Plan 31 C4a exit criteria
+
+- [x] `constellation-vfs` exists with the §6 contract; `View` implements
+  it in the engine; FUSE is `constellation-frontend-fuse` over it
+- [x] `fuser` only in `constellation-frontend-fuse`
+- [x] `cargo build --workspace`, `cargo clippy --workspace --all-targets
+  -- -D warnings` clean; `cargo fmt` clean on the touched crates
+- [x] Every pre-existing unit test still runs and passes
+- [x] `make check-cross` exits 0 (vfs clean for Windows; frontend-fuse
+  compiles for macOS)
+- [x] Manual end-to-end check of the debug binary (local backend: write/
+  read/rename/unlink, mkdir/readdir, xattrs, hard link, symlink, FIFO,
+  `flock` and blocking `F_SETLKW` under `--locks cluster`, clean exit) —
+  output identical to the pre-change binary
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+
+## Plan 31 C4c — `Engine`/`EngineHost`/`ViewSpec`, subtree confinement
+
+The rest of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+bar session handover (C4b): the engine API of §4/§4.1 with the node
+assembly moved behind it, `ViewSpec`/`ViewQos` (§9.10), `EngineProfile`
+as a type (§10; its lifecycle behaviour is C8), credentials in
+`EngineConfig` (§9.8), and subtree confinement as a `View` guarantee
+(§6.12). Linux behaviour of existing mounts is unchanged, apart from the
+fixes listed below.
+
+| Item | State | Where |
+|---|---|---|
+| `EngineConfig` (backend, state dir, cache/staging sizes, `fsync_s3`, `cto_strict`, `locks`, write mode, RO member, atime, `PassphraseSource {Given, Ask, Absent}`, E2E pin target, `credentials: CredentialSource`, published version, runtime handle, startup-phase hook); `EngineConfig::new(backend)` with the daemon's defaults | DONE | `crates/engine/src/node.rs` |
+| `Engine` (one node: identity, replica, caches, the sync task and every background task `NodeRuntime::start` spawned): `Engine::start(EngineConfig, HostServices, EngineProfile) -> Result<Engine>`; `open_view(ViewSpec, FrontendCaps, Arc<dyn FrontendEvents>) -> Result<Arc<View>>` (selector/clone resolution, lock-flush/hold/invalidation registration); `close_view` (unregistration, ephemeral clone removal; reports the last view); `views()`, `invalidate_quota_caches`, `shutdown`/`shutdown_error`/`is_shutting_down`, read accessors for the host's status; `DeferredEvents` (a frontend's events that exist only once it is mounted); `default_state_dir(host, fsmeta)` | DONE | `crates/engine/src/node.rs` |
+| `EngineHost { runtime, budget: Arc<ResourceBudget>, engines }`: `start`, `add_engine(FsId, EngineConfig, HostServices, EngineProfile)`, `remove_engine`, `engine`, `engines`, `allotment_for`; `ResourceBudget { memory_bytes, cache_bytes, staging_bytes }` with `share(n)` (equal split; `unlimited()`); per-engine override = `EngineProfile::{memory,cache}_budget` | DONE | `crates/engine/src/host.rs` |
+| `EngineProfile { memory_budget, cache_budget, p2p: P2pMode, leases: LeaseMode, uploads: UploadMode, background: BackgroundMode }`, `desktop()`/`Default`, `server(memory, cache)` (§10.1). Honoured now: the budgets and `P2pMode::Off`; the rest recorded for C8 | DONE | `crates/engine/src/profile.rs` |
+| `ViewSpec { root, rw_snapshot, clone_name, ephemeral, labels, qos: ViewQos, confine_links }`, `ViewQos { max_inflight_ops, max_staging_bytes }`, `METRIC_LABELS` (`["pv"]`, the bounded-cardinality allowlist; `ViewSpec::metric_labels`); labels on the view (`View::labels`), in `Engine::views` and the "view opened" trace | DONE | `crates/engine/src/view/spec.rs` |
+| `ViewQos` admission: an unlimited view has no admission state (one `Option` branch per op); a limited one an atomic-CAS in-flight gate with a condvar slow path; over the limit an op waits, past its deadline (`OpCtx::deadline`, else `CONSTELLATION_VIEW_ADMISSION_WAIT_MS`, 30 s) answers `Again`, cancelled `Intr`; `flush`/`release`/lock ops/`sync_view` never held back; staging limit = a child `StagingBudget` (counts into the node's, never refuses itself) waited on at write entry | DONE | `crates/engine/src/view/admission.rs`, `crates/engine/src/staging.rs` |
+| P2P bridge, endpoint bring-up and registry refresh (`P2pBridge`, `start_p2p`, `refresh_peers`) out of cli's `main.rs` | DONE | `crates/engine/src/p2p.rs` |
+| Root adoption, the atime flush ticker, slack re-read, vacuum thread, the shutdown drain and stall watchdog, ephemeral-clone removal out of cli's `main.rs`/`node_runtime.rs` | DONE | `crates/engine/src/node.rs` |
+| cli as a thin host: `NodeRuntime::start` builds `HostServices::native()`, an `EngineHost` on the daemon runtime (budget = the node's own numbers, so the one engine gets exactly what it asked for) and adds the one engine (plan 21: one daemon per state dir, N views); `add_mount` = `open_view` + `constellation_frontend_fuse::mount` on its thread; keeps the control socket/web UI (`DaemonStatus`), FUSE sessions and threads, `daemon_lock` mount records, `control.sock`/`daemon.pid`, signals, stale-mount clearing | DONE | `crates/cli/src/node_runtime.rs`, `crates/cli/src/main.rs` |
+| `--confine-links` (`mount` flag; registry `MountEntry.confine_links`, authoritative per command line like `allow_other`; `MountViewOpts.confine_links` over the control socket, `serde(default)`) | DONE | `crates/cli/src/main.rs`, `crates/engine/src/registry.rs`, `crates/api/src/types.rs` |
+| `EngineConfig.credentials`: `AwsDefaultChain` is today's SDK chain; `Static`/`Refreshing` sign S3 requests with what the source resolves to (re-asked on expiry), the SDK still choosing region/endpoint | DONE | `crates/engine/src/backend.rs`, `crates/store-s3/src/aws_auth.rs` |
+| Injected `HostServices` in the engine: P2P key store, root adoption's identity, the E2E pin store (`e2e_pin::check_in`), clone ownership (`SnapshotManager::with_host`), staging's hole punching (`Staging::create(.., fs)`, from the view's `FsDependencies.host`) | DONE | see the list |
+| Subtree confinement (§6.12): `..`/`.` resolution; `View::enter_ino` on every addressed inode (`Stale` outside); `.constellation` confinement; `confine_links` link domains; module doc of `crate::view` states the rules | DONE | `crates/engine/src/view/{confine,ops,mod}.rs` |
+| `link(2)` no longer touches the target's mtime (bug confirmed by a failing unit test first) | DONE | `crates/meta/src/store/{misc,writes}.rs`, `crates/meta/src/replay.rs` |
+| Harness scenario `subtree-confinement` | DONE | `crates/harness/src/scenarios/confinement.rs`, `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+
+**Confinement rules (precisely).**
+
+- `lookup(dir, "..")` of the view's root answers the root (visible ino
+  1); of another directory, its parent; `lookup(dir, ".")` the directory.
+  (A kernel resolves `..` itself and never sends it without export
+  support; this is for frontends that do.)
+- Every inode a frontend addresses (parent, target, handle's inode) goes
+  through `View::enter_ino`: the root renumbered, and in a confined view
+  (subtree or snapshot) refused with `Code::Stale` (`ESTALE`) unless the
+  view's root dominates it (one of its names — any hard link — lies
+  beneath the root). A whole-filesystem view checks nothing. Fast path:
+  a per-view sharded cache (16 `Mutex<HashSet>`, cap
+  `CONSTELLATION_VIEW_REACH_CACHE`, default 262,144, a full shard is
+  cleared) of every inode the view handed out in an entry or proved by a
+  walk; an inode open through the view passes (unlinked-open orphans);
+  a miss walks the replica's `rdentry` parents (`Meta::parents_of`, the
+  scratch namespace included) up to the root, stopping at the first
+  cached ancestor. A snapshot view hands out synthetic inodes only, so a
+  live inode number is always `Stale` there (before, it read the live
+  tree); synthetic numbers are per view already. Measured (debug build,
+  `view::confine_tests::confinement_hot_path_cost`, ignored test): 12 ns
+  per op for a whole-filesystem view, 337 ns for a subtree view on a
+  cached inode (one shard lock + hash probe, no metadata read), ~116 µs
+  for an uncached 9-level walk (local fjall reads; once per inode).
+  Limit, documented: an inode resolved by the view and then renamed out
+  of its subtree elsewhere stays addressable by handle (as an open fd
+  across a Linux bind mount's boundary); lookup never reaches it again.
+- `.constellation/snapshot` under a directory lists the snapshots taken
+  of that directory's path or of an ancestor and mirrors each at the
+  same relative path, so a view of `/volumes/pv-1` sees pv-1's own
+  snapshots and pv-1's part of a `/` snapshot, never pv-2's. Fixed on the
+  way: `SnapshotManager::covering` never matched a snapshot of `/` for a
+  subdirectory (its prefix test looked for a second `/`), so root
+  snapshots were missing from every subdirectory's `.constellation`
+  (plan 09 says "snapshots whose path covers this directory").
+- `confine_links`: every directory's *link domain* is its nearest
+  ancestor (itself included) that is the view's root or carries
+  `trusted.constellation.link_domain` (root-only to set). `link(ino,
+  new_parent)` succeeds only if some existing name of `ino` is in
+  `new_parent`'s domain (read from the replica, not the cache), else
+  `EXDEV`; `rename()` of a non-directory with `nlink > 1` into another
+  domain is `EXDEV` too. So a view of `/volumes/pv-1` refuses to link
+  anything with no name in pv-1 (e.g. a handle moved out); a `/` view
+  with `confine_links` over a pool whose `/volumes/<pv>` are marked
+  refuses links between volumes and allows them within one and in the
+  unmarked rest. The check and the link are two steps (a racing rename
+  elsewhere is not excluded); links made before, or through a view
+  without it, are not undone.
+
+**The link mtime bug: confirmed and fixed.** `link(2)` (and `unlink(2)`
+of one of several names, and a rename over one) bumped the file's mtime
+as well as its ctime: `misc::bump_nlink_tx` set both, and it served the
+file's link-count changes as well as a directory's. POSIX changes only
+the file's ctime (and the directory's mtime and ctime). A unit test
+(`replay::tests::link_and_unlink_change_the_files_ctime_but_not_its_mtime`,
+writer and replaying replica) failed first ("link's reply"), then passed
+after `bump_file_nlink_tx` (ctime only) replaced it on the six
+non-directory sites — `writes.rs` link/unlink/rename-over/publish-over
+and `replay.rs` `apply_link`/`evict_dentry` — identically on both paths,
+so replicas converge. Directory link counts keep `bump_nlink_tx`.
+pjdfstest's `link`/`unlink` tests assert the file's ctime and the
+parent's mtime/ctime change, which still hold (not re-run here).
+
+**What stayed in cli, and why.** `DaemonStatus` and the control socket/
+web UI (`constellation-api`'s `StatusSource`, replaced by the control
+protocol in C5 — moving it now would be rewriting it twice); the FUSE
+session threads, `daemon_lock`'s mount records and takeover, daemonizing,
+`daemon.pid`/`control.sock`, signals (host concerns); the one-shot
+commands (`gc`, `fsck`, `prune`, `repair`, `fs create/import/export`),
+which open a state dir without a running engine (plan 31 §4's `Manager`
+is C5's).
+
+**`constellation_platform::native()` still in the engine**, and why:
+`registry.rs` (the CLI's filesystem registry: `Registry::load*` is called
+by one-shot commands before any engine exists; threading a host through
+every CLI call site belongs with C5's `Manager`); the fallbacks of
+`e2e_pin::check`/`pins_store` and `SnapshotManager` without `with_host`
+(the one-shot commands and tests; the engine uses the injected forms);
+test helpers. `crates/net/src/identity.rs` keeps its own default for the
+same reason (the engine passes its host to `default_key_store`).
+
+**Deviations from the §4.1 sketch.** `EngineHost::engine`/`add_engine`
+return `Arc<Engine>` rather than `&Engine` (a `&` cannot outlive the
+lock of a concurrent map); the map is an `RwLock<BTreeMap>`, not a
+`DashMap` (no new dependency for a handful of entries). `Engine::start`
+takes its runtime from `EngineConfig::runtime` (an `EngineHost` sets its
+own) since the signature has no handle. `ViewSpec` carries the view's
+options; the frontend's mount options (mountpoint, `allow_other`, source
+name, worker threads) stay the frontend's (`MountOptions`). Budget
+shares are fixed when an engine starts (rebalancing a live cache is C8).
+
+Line counts: `crates/cli/src` 9,459 → 6,682 (`main.rs` 5,939 → 4,722,
+`node_runtime.rs` 2,363 → 803); new in the engine: `node.rs` 2,384
+(incl. tests), `p2p.rs` 1,078, `host.rs` 219, `profile.rs` 142,
+`view/{spec,admission,confine}.rs` 515, tests
+`view/{confine,qos}_tests.rs` 739.
+
+Unit tests (`cargo test -p constellation-engine -p constellation-vfs
+-p constellation-frontend-fuse -p constellation`, plus meta): before,
+engine 276 + 1 ignored, cli 20, frontend-fuse 12, meta lib 105; after,
+engine 297 + 2 ignored (+21: 10 confinement, 4 `ViewQos` admission, 2
+`Engine`/`EngineHost` in-process starts on a local backend, 2 host
+partitioning, 1 profile, 1 view spec/labels, 1 child staging budget; the
+new ignored one is the hot-path measurement), cli 20 (its three real-FUSE
+tests now run through `Engine`), frontend-fuse 12, vfs 22, meta lib 106
+(+1, the link-mtime test). `crates/meta/tests/speculation.rs` (not in the list above; meta was
+touched) fails 1-3 of its streamed-transaction tests intermittently when
+run with parallel test threads — on the base commit too, and with this
+change's mtime semantics reverted — and passes with `--test-threads=1`:
+a pre-existing timing sensitivity, not this change.
+
+Manual end-to-end (debug binary, root, local backend, `CONSTELLATION_P2P=off`):
+one daemon, views `/`, `/volumes/pv-1 --confine-links` and `/
+--confine-links` attached from separate CLI calls (`status` lists 3,
+one pid); `ls vol/..` is the host directory (same dev:ino as the parent
+of the mountpoint), `vol/sub/..` the view root; `.constellation/snapshot`
+under the volume shows `own` and `whole` (pv-1's content), not
+`sibling`; links within the volume work, across mounts `EXDEV`, between
+marked volumes through the maintenance view `EXDEV` (a multiply-linked
+`mv` falls back to copy), plain view POSIX; `ln` keeps the file's mtime
+(978307200 before and after) and moves its ctime; write/read/rename/
+`user.*` xattr/`flock`/unlink through the volume view; two views
+unmounted with `fusermount3 -u` (daemon stays), then the last one: clean
+drain, daemon and reaper exit, `daemon.pid`/`control.sock` removed.
+
+Harness: `CONSTELLATION_BIN=target/debug/constellation target/debug/harness
+run subtree-confinement` — `=== subtree-confinement PASSED` /
+`ALL SCENARIOS PASSED` (run twice).
+
+Cross-check (`make check-cross`): exit 0 with the known-failures file
+unchanged; the scenario's Linux-only calls (`setxattr` arity,
+`AT_EMPTY_PATH`) are `cfg(target_os = "linux")` with stubs, so the
+harness's darwin errors stay at its known 8.
+
+### Plan 31 C4c exit criteria
+
+- [x] `EngineConfig`/`Engine::start`/`Engine::open_view`/`EngineHost`/
+  `ResourceBudget`/`ViewSpec`/`ViewQos`/`EngineProfile` exist; cli is a
+  host over them; mount options, env vars, daemon/attach flow and
+  `status` output unchanged
+- [x] Subtree confinement: `..`, handles, `.constellation`,
+  `confine_links` — in-process tests and a kernel-mount harness scenario
+- [x] `link(2)` mtime bug confirmed by a test, fixed on writer and replay
+- [x] `cargo build --workspace`; clippy `-D warnings` clean for every
+  crate this change touches; `cargo fmt` on the touched crates
+- [x] `make check-cross` exits 0
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+
+## Plan 31 C4b — FUSE session handover
+
+The last part of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.11): a FUSE session handed from one process image to the next without
+the kernel ever seeing an unmount, and `constellation daemon --upgrade` on
+plain Linux built on it. The gate — a real kernel mount surviving a daemon
+replacement under a live writer with zero `ENOTCONN`/`EIO` — passes.
+
+| Item | State | Where |
+|---|---|---|
+| `vendor/fuser`: fuser 0.18.0 vendored (checksum `b82b6597…aecfd`, tag `v0.18.0`), `[patch.crates-io]` + workspace `exclude`, like `vendor/fjall`; patches `negotiated-init` (`NegotiatedInit`, `Session::negotiated_init`), `from-fd-resumed` (`Session::from_fd_resumed`, no handshake), `detach` (`Session::detacher`/`SessionDetacher`, `run_detachable` → `SessionEnd::{Ended, Detached(DetachedSession { filesystem, fd, init })}`, `Mount::disarm`, non-blocking + `poll` reads with a wake pipe), build hygiene; one `git diff` patch file | DONE | `vendor/fuser/`, `vendor/fuser/CONSTELLATION-PATCH.md`, `vendor/fuser/patches/0001-constellation-session-handover.patch` |
+| `tools/vendor-fuser.sh <version>` / `--from <dir>` / `--check`: pristine crate + `git apply` of every patch, all-or-nothing, loud on a conflict (verified: `--check` reproduces `vendor/fuser` byte for byte from crates.io and from the registry copy; a drifted `session.rs` fails) | DONE | `tools/vendor-fuser.sh` |
+| `MountSource::{Path(PathBuf, MountOpts), PreopenedFd(OwnedFd)}`, `mount_source`; `Path` as root mounts with `platform::linux::fuse_mount_fd` and handshakes on the fd (fusermount3-free; the daemon's root mounts now take this path), else fuser/`fusermount3` | DONE | `crates/frontend-fuse/src/session.rs` |
+| `SessionControl::detach(export) -> SessionHandoff<S> { fuse: FuseHandoff { fuse_fd, init, mountpoint }, view: S }` (refuse on lock waits → close the notification gate while serving → stop reading → re-check → `sync_view` → hand out; any failure resumes in place); `FuseSession::resume(FuseHandoff, view, opts, caps, sink)`; `SessionExit::{Unmounted, Detached}`; unmount by path for sessions fuser does not own | DONE | `crates/frontend-fuse/src/session.rs` |
+| Deferred-reply accounting (`Deferred`, `Tracked`: blocking `setlk`), gated `FuseNotifySink` (`NotifyGate`) | DONE | `crates/frontend-fuse/src/{adapter,notify}.rs` |
+| `HandleTableSnapshot` (open handles per inode, the synthetic `.constellation` numbering, a confined view's reach cache; serde), `View::export_handles`, `View::handover_blockers`, `ViewHandoff { spec, handles }`; `Engine::export_view` (the resolved spec: a clone's path, `ephemeral` kept), `Engine::open_view_resumed(spec, handles, caps, events)`, `close_view_for_handover`, `shutdown_for_handover`; serde on `ViewSpec`/`ViewQos`/`SyntheticNode`/`FrozenObject`/`PinTarget` | DONE | `crates/engine/src/view/handoff.rs`, `crates/engine/src/node.rs` |
+| `constellation daemon --upgrade [TARGET] [--state-dir] [--binary] [--timeout-s]`; `Request::Upgrade { binary }` (unix socket only; HTTP refuses), `StatusReport.handover { generation, pid, upgrading, last_error }`; hidden `daemon --handover-abi`/`--resume-from <fd>`; the control listener, `daemon.lock` and reaper handed on; `mount` attaching during an upgrade retries | DONE | `crates/cli/src/handover.rs`, `crates/cli/src/{main,node_runtime}.rs`, `crates/api/src/{lib,types,web}.rs` |
+| Harness `session-handover-idle`, `upgrade-under-load` | DONE | `crates/harness/src/scenarios/handover.rs`, `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+
+**Shape: `exec` in place.** The daemon `exec`s the new binary with the
+FUSE descriptors inherited instead of passing them to a second process
+over `SCM_RIGHTS`. Pid, `daemon.lock` (an `flock` on an inherited open
+file, never released), `daemon.pid`, the zombie reaper watching the pid,
+the supervisor and the harness's `Client` all stay valid, so no `mount`
+can take the lock in a gap and `abort_stale_mounts` the connections that
+are merely changing hands; the control socket's listener is inherited
+too, so `status`/`mount` during the gap wait in its backlog. A second
+process would have to share the lock's open file (then `/proc/locks`
+names a dead pid, which the takeover logic reads) and loses the
+supervisor's pid. "New daemon serves" is therefore checked as the next
+generation in `status` and `--resume-from` in the pid's cmdline.
+
+**The sequence** (`crates/cli/src/handover.rs`'s module doc):
+
+1. Preflight, nothing changed yet: no handover under way; the new binary
+   runs and speaks this handover version (`daemon --handover-abi`); an E2E
+   filesystem's passphrase is in the environment; no cluster lock held
+   and no blocking lock wait in flight (`View::handover_blockers`,
+   `SessionControl::deferred_replies`).
+2. Detach every session: close its notification gate while it still
+   serves and wait for writes under way; stop the fuser workers before
+   their next read (requests queue in the kernel from here); re-check lock
+   waits; `sync_view` (every pending write published); export the view's
+   spec and handle table. Any failure resumes the already-detached
+   sessions in place on the same descriptors and refuses the upgrade.
+3. Answer the request ("handing N view(s) over"); the rest runs on its
+   own thread.
+4. Durability barrier: views closed for the handover (ephemeral clones and
+   orphan claims left for the next image), then the node's clean shutdown
+   — dirty chunks uploaded, journal shipped, commit published, lease
+   released — and the replica synced to disk (`exec` drops nothing).
+5. `exec` `constellation daemon --resume-from <memfd>` (JSON
+   `DaemonHandoff`: node settings incl. the live write mode, per view its
+   mount settings, fd, `NegotiatedInit`, `ViewHandoff`; the lock, listener
+   and a descriptor of the current executable). An `exec` failure `exec`s
+   the current executable instead (the rollback is itself a handover).
+6. New image: every inherited descriptor back to close-on-exec; the node
+   starts on the same state dir like any restart (incarnation bump, lease
+   re-acquired on demand) — failing that, roll back to the previous binary
+   once; old mount records dropped; each view reopened with its handles
+   and its session resumed without `FUSE_INIT` (the queued requests are
+   served now); open files' pages invalidated once; control API served
+   from the inherited listener; `status` shows the next generation.
+
+**Queued, in-flight, `FORGET`, locks.** Requests the kernel queues while
+nobody reads (anything after step 2 began, `FORGET`s and `INTERRUPT`s
+included) wait in the connection's input queue and are read by the next
+image. A request already read is always answered before the workers stop
+(every op but a lock wait answers inline on its worker; the stop flag is
+checked only before a read). A reply must be written on the descriptor its
+request was read from while that descriptor is served (a closing `/dev/fuse`
+descriptor ends the requests on its processing list with `ECONNABORTED`):
+hence the refusal on lock waits, re-checked after the stop. Lookup counts
+need nothing: inode numbers are the replica's and the view keeps no
+lookup table; the only per-view numbering (synthetic inodes) crosses in
+`HandleTableSnapshot`. Blocking `F_SETLKW`: refused rather than drained —
+fuser 0.18 cannot interrupt it and it may wait forever; a granted cluster
+lock is refused too (it lives in the node's memory and its grant); under
+`--locks local` the kernel holds the locks and they cross by themselves.
+
+**fuser patch choice.** A dedicated `from_fd_resumed` constructor rather
+than folding `INIT` into the dispatch loop behind an `initialized` flag:
+fuser 0.18's loop already answers a stray `INIT` with `EIO` and reads no
+per-connection init state, so the flag would guard nothing; the constructor
+leaves every ordinary mount's handshake untouched. Stopping a worker parked
+in `read(2)` needs a wake-up the kernel does not offer, so an armed session
+reads non-blocking and `poll`s the device with a wake pipe (under load the
+first `read` succeeds and no `poll` is made); sessions not armed keep
+upstream's blocking loop.
+
+**Found on the way, not fixed (pre-existing).** On a real mount, `fsync`
+and `close` of a file written, unlinked and still open fail with `ENOENT`
+(no upgrade involved; queued as a separate task). A handover refuses while
+such a file has pending writes (its `sync_view` fails the same way), and
+the session resumes in place.
+
+Scenario results (`CONSTELLATION_BIN=target/debug/constellation
+target/debug/harness run [--seed N] session-handover-idle
+upgrade-under-load`, root, docker floci S3, debug build):
+
+| Run | `session-handover-idle` | `upgrade-under-load` (3 upgrades) |
+|---|---|---|
+| seed 42 | PASSED, upgrade 322 ms | PASSED, upgrades 488/683/1046 ms, longest syscall 1026 ms, 2752 records + 483 files + 3591 reads, 0 errors |
+| seed 1 | PASSED, 348 ms | PASSED, 389/651/847 ms, longest syscall 810 ms, 2624 + 439 + 3403, 0 errors |
+| seed 2 | PASSED, 369 ms | PASSED, 476/645/951 ms, longest syscall 940 ms, 2591 + 445 + 3469, 0 errors |
+| seed 3 | PASSED, 319 ms | PASSED, 519/611/781 ms, longest syscall 756 ms, 2672 + 452 + 3433, 0 errors |
+| seed 42 (final binary) | PASSED, 304 ms | PASSED, 441/606/924 ms, longest syscall 908 ms, 2736 + 435 + 3472, 0 errors |
+
+Manual checks (debug binary, root unless noted, local backend): 5
+upgrades in a row with no descriptor or thread growth (21 fds, ~30
+threads, ~250 ms each); two views (`/` and `/sub` attached by a second
+`mount`) upgraded three times, mount records rewritten under the new view
+ids, both unmounted with a clean drain and exit; as `nobody` through
+`fusermount3` (fuser owns the mount; after the detach the unmount goes by
+path through `fusermount3 -u`): two upgrades, then a clean unmount; a held
+`fcntl` lock under `--locks cluster` refuses the upgrade naming the inode,
+and after the unlock it succeeds.
+
+Unit tests (new): frontend-fuse 12 → 17 (`session::tests`, a real kernel
+mount as root: detach with nothing in flight, a detach waiting for an op
+in flight, a resume serving requests queued while nobody read, the
+lock-wait refusal and the deferred counter, `NegotiatedInit` JSON/postcard
+round trips and `check_resumable`); engine 297 → 299 + 2 ignored
+(`view::handoff::tests`: handles, an unlinked-open orphan and synthetic
+numbers crossing to a second view, both wire forms); cli 20 → 24 (the
+handoff through a memfd, a foreign handoff version refused, close-on-exec
+toggling, the ABI probe); api 13 → 14 (HTTP refuses `Upgrade`, the
+socket's dispatcher reaches the source). frontend-fuse's `tests/wire.rs`
+(20) passes on the patched fuser.
+
+Deviations from the §6.11 sketch: `SessionHandoff` is generic in the
+view's state (`SessionHandoff<S> { fuse: FuseHandoff { fuse_fd, init,
+mountpoint }, view: S }`, the daemon's `S` = `ViewHandoff { spec, handles
+}`) because the frontend cannot name engine types (§3's layering);
+`detach` is on a `SessionControl` handle (the session itself runs on its
+own thread) and takes an `export` callback run once the view is quiescent;
+`resume` takes the frontend's mount options and optionally a sink to
+reuse. The control request is `Request::Upgrade` on today's API socket;
+C5 ports it to `node.handoff`. There is no `Cap` for session handover in
+the harness's capability list yet (the scenarios declare none): a
+non-FUSE frontend lane will need one.
+
+### Plan 31 C4b exit criteria
+
+- [x] `vendor/fuser` with a named, documented, re-appliable patch set
+  (`from_fd_resumed`, detach, negotiated init)
+- [x] `MountSource`, `FuseSession::detach`/`resume`, `View::export_handles`,
+  `Engine::open_view_resumed`
+- [x] `constellation daemon --upgrade` on plain Linux, sequence documented
+- [x] `session-handover-idle` and `upgrade-under-load` pass (5/5 each)
+  against a real kernel mount: zero `ENOTCONN`/`EIO`
+- [x] `cargo build --workspace`; `cargo clippy --workspace --all-targets
+  -- -D warnings` clean; `cargo fmt` on the touched crates
+- [x] `make check-cross` exits 0 (known failures unchanged)
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+
+## Plan 31 C4 follow-ups
+
+Three follow-ups to milestone C4 of
+[plan 31](wip/31-core-frontend-backend.md): `renameat2` flags, the
+conformance kit (§8) run against the real engine, and a bug report about
+unlinked open files.
+
+| Item | State | Where |
+|---|---|---|
+| `RENAME_NOREPLACE`: `MutateOp::Rename { noreplace }` (and `MutateOp::Publish { noreplace }` for a scratch file's publish), decided inside the committing transaction — `rename_in_tx` / `publish_file` on this node, or on the holder for a forwarded op — so a stale kernel dcache or a lagging replica cannot let two nodes both claim a name; `EEXIST` even onto the source's own name (Linux checks it before its same-inode no-op); journals as a plain `Rename` | DONE | `crates/meta/src/{mutate.rs,store/writes.rs}`, `crates/engine/src/view/ops.rs` |
+| `RENAME_EXCHANGE`: `MutateOp::Exchange` → `Meta::exchange` → one `LogRecord::Exchange`; `exchange_in_tx` shared by the local op and replay: both dentries and their `0x04` reverse entries swapped, a directory's `..` link moved when a directory and a non-directory trade places across parents (two directories: counts unchanged), both parents' mtime/ctime and both inodes' ctime touched (`max` merges, replay-order free), `EINVAL` for a directory swapped beneath itself (either way round), a no-op for one name or two names of one inode; replay skips it if either entry is gone. In the touch/key sets (`TouchSet::from_records/from_op/from_op_in`, `KeySet::from_op`), read-delegation recalls, kernel invalidation, recovery | DONE | `crates/meta/src/{record.rs,mutate.rs,replay.rs,session.rs,readdeleg.rs,store/writes.rs}`, `crates/engine/src/{kernel_inval.rs,recovery.rs}` |
+| `View::rename`: `WHITEOUT`, an unknown bit, or `NOREPLACE|EXCHANGE` → `EINVAL` (renameat2(2); never `ENOSYS`/`EOPNOTSUPP`, which would make the kernel stop sending `FUSE_RENAME2`); `EXCHANGE` touching the node-local scratch area → `EINVAL`; `confine_links` checks both directions of an exchange. The reference filesystem answers `EINVAL` for `WHITEOUT` too (was `NotSupported`) | DONE | `crates/engine/src/view/ops.rs`, `crates/vfs/src/mock/reffs.rs` |
+| Engine conformance target: `Engine::start` on a local file backend per test (P2P listen, `--locks cluster`), views via `Engine::open_view`; hooks `snapshot`, `subtree_view` (with `confine_links`); declares `rename_flags: true`, `cancellable_waits: false`; the nightly `conformance` job runs it | DONE | `crates/engine/tests/conformance.rs`, `crates/engine/Cargo.toml`, `.github/workflows/nightly.yml` |
+| Kit: `namespace::rename_exchange_across_directories` (a directory and a file swapped across parents, `nlink`s, two directories, beneath-itself refusals); `rename_noreplace` asserts `WHITEOUT`/unknown bits → `Invalid` | DONE | `crates/vfs/src/conformance/{mod.rs,namespace.rs}` |
+| Engine bugs the kit found (below), fixed engine-side | DONE | `crates/engine/src/view/ops.rs`, `crates/meta/src/store/writes.rs` |
+| Unlinked-but-open files: `write`/`fsync`/`ftruncate`/`fchmod`/`close` succeed | DONE | `crates/engine/src/view/{flush.rs,ops.rs,create.rs,lock_gate.rs}`, `crates/meta/src/store/writes.rs` |
+
+### Engine conformance results
+
+`cargo test -p constellation-engine --test conformance` (caps
+`linux_fuse(true)`, seed `0x5eed`), before and after the fixes below:
+
+| Group | First run pass / fail / skip | Now pass / fail / skip |
+|---|---|---|
+| namespace | 15 / 4 / 0 | 19 / 0 / 0 |
+| io | 13 / 3 / 0 | 16 / 0 / 0 |
+| xattr | 7 / 0 / 0 | 7 / 0 / 0 |
+| readdir | 4 / 2 / 0 | 6 / 0 / 0 |
+| concurrency | 6 / 2 / 0 | 8 / 0 / 0 |
+| deferral | 4 / 2 / 0 | 6 / 0 / 0 |
+| cancellation | 0 / 0 / 4 | 0 / 0 / 4 |
+| invalidation | 0 / 0 / 5 | 0 / 0 / 5 |
+| confinement | 7 / 3 / 0 | 10 / 0 / 0 |
+| **total** | **56 / 16 / 9** | **72 / 0 / 9** |
+
+The skips name their reason: `cancellation` — the engine declares
+`cancellable_waits: false` (`ClusterLocks::lock` does not consult
+`OpCtx::cancel`; a Linux FUSE mount never has a token set, §6.3);
+`invalidation` — no `second_view`/`events` hook: a second view of one
+engine gets no invalidations for the first's mutations (only a *remote*
+node's replayed records produce them), and a second engine cannot share
+a file backend (no `If-Match`: single writer). A two-engine fixture over
+an S3-shaped store with P2P is the way to run that group.
+
+What failed on the first run and how it was fixed (every one engine-side;
+no kit assertion was loosened):
+
+- `hard_link_refusals`: **`link` onto an existing name overwrote it** —
+  `Meta::link` put the new dentry over the old one, so the other inode
+  lost a name without its `nlink` or reverse entry following (metadata
+  corruption; on one node the kernel's negative-dentry check hides it,
+  across nodes it does not). Now `EEXIST` inside the transaction.
+- `readdir::removal_between_pages_never_repeats_or_loses`,
+  `readdir::stable_under_concurrent_create`,
+  `concurrency::creates_in_one_directory_are_all_visible`: readdir cookies
+  were positions, so an unlink or a create between two `readdir` calls
+  repeated or skipped entries that were there throughout. A child's cookie
+  is now a hash of its name (`dir_cookie`: FNV-1a, clear of `.`/`..`'s 1
+  and 2, below `i64::MAX`), children are listed in cookie order, and a
+  listing resumes after the cookie it stopped at.
+- `unlink_and_its_refusals`, `lookup_refusals`, `model_replay_sequential`,
+  `model_replay_concurrent`: a name beneath a non-directory answered
+  `ENOENT`; now `ENOTDIR` (`View::beneath_non_dir`, on the error path of
+  lookup/unlink/rmdir/rename only).
+- `truncate_shrinks_and_growth_reads_zeros`: `setattr(size)` on a
+  directory succeeded; now `EISDIR` (`EINVAL` for other non-regular files).
+- `fallocate_absent_is_not_supported`, `seek_absent_is_not_supported`:
+  the view ignored `FrontendCaps::{fallocate, seek_hole}`; now
+  `NotSupported` when the frontend does not declare them (§6.2).
+- `deferral::a_blocked_lock_completes_from_another_thread`,
+  `non_deferrable_waits_park_the_calling_thread`: the fixture's engine ran
+  without cluster locks (a test-setup issue: fixed by `--locks cluster`,
+  which needs P2P); then `locks_are_refused_without_the_capability`: the
+  `lock_*` ops now answer `NotImplemented` unless the view's frontend
+  declared `cluster_locks` (`View::vfs_cluster_locks`), whatever the
+  engine forwards for its other views.
+- `confinement::inodes_outside_the_subtree_are_refused`: `statfs` on an
+  inode outside the view answered; now `Stale` like every other op.
+- `confinement::forged_inodes_and_handles_are_refused`: a `read` through a
+  handle nobody was given was served; the view hands out `Fh(ino)`, and a
+  read through anything else is now `EBADF`.
+- `confinement::snapshot_mirrors_are_read_only`: opening a snapshot
+  mirror's file for writing succeeded; now `EROFS`.
+
+`PUNCH_HOLE|KEEP_SIZE` (listed in `ENGINE_TARGET.md` as a likely failure)
+passed on the first run.
+
+### Unlinked open files (bug report triage)
+
+"On a real mount, `fsync`/`close` of a file that was written, unlinked and
+is still open fails with `ENOENT`": reproduced on a real FUSE mount (local
+file backend) — `fsync`, `fdatasync`, `ftruncate`, `close` (both the
+`flush` of a dup'd descriptor and the last `release`) all `ENOENT`, while
+`write`/`pread`/`fstat` worked. **Not a plan-31 regression**: the base
+commit `99472fa`, built separately, fails step for step identically.
+Cause: the flush composed and committed the manifest of an inode with no
+name left, which the sequencer refuses (`NotFound`); the failed close
+also leaked the write session. Fixed (POSIX requires these to succeed):
+`flush_inode` keeps an unlinked inode's write session attached (this
+node's reads overlay it) and succeeds, also when the unlink happened on
+another node between its check and the sequencer's answer; the last
+`release` drops the session with the orphan (`View::drop_writes`, shared
+with the lock-fence discard); `setattr`/`ftruncate` on an orphan apply to
+its own record without journaling (`Meta::orphan_setattr`). Nothing of an
+unlinked file is ever published. Unit test:
+`view::vfs_tests::an_unlinked_open_file_keeps_working_until_its_last_close`.
+
+## Plan 31 C5 — `constellation-control` replaces `crates/api`
+
+Milestone C5 of [plan 31](wip/31-core-frontend-backend.md) (§9), second
+half (C5b; C5a built `constellation-control` itself): the daemon, the CLI,
+the harness and the web UI speak the control protocol, every method of its
+table is bound to the engine, and `crates/api` — the line-JSON
+`Request`/`Response`, `StatusSource`, `dispatch`, `serve` — is deleted from
+the workspace with no shim (§9.6). Plan 32 is not in this tree, so there
+was nothing of it to port.
+
+| Item | State | Where |
+|---|---|---|
+| `EngineControl` (the engine's control service) + `ControlHost` (what only a host can do: mounts, handoff, detach-all, lifecycle); `control::router`/`register` bind **all 57** methods; the 37 old `StatusSource` bodies moved from the daemon unchanged (`service.rs`), run on blocking threads | DONE | `crates/engine/src/control/{mod,service}.rs` |
+| `ControlVfs`: `browse.stat/read/write/mkdir/rename/delete/xattr` through a `Vfs` view the service opens for itself, as the calling principal (`Caller` from `SO_PEERCRED`; in-process/web: the daemon's own uid) | DONE | `crates/engine/src/control/browse.rs` |
+| `fs.list/create/import/export/passwd/doctor/unlock` (registry + backend); `fs.create` idempotent by `(bucket, prefix)`, differing parameters → `Conflict`/`EEXIST` with the differences in `details`; `fs.unlock` → `CredentialSource::Static` over an `EphemeralSecretStore` (memory only), rotating the running engine's store in place when it names this engine's filesystem and the engine runs from a static source (`Engine::credentials`) | DONE | `crates/engine/src/control/fs.rs`, `crates/engine/src/node.rs` |
+| Streams: `node.logs.tail` (chunks, `follow` via `LogBuffer::since`), `browse.read` (chunks, bounded hand-off), `stats.subscribe` (samples of `/metrics`'s series from `node.status`), `events.subscribe` (a watcher started with the first subscriber publishes `view.mounted/unmounted`, `lease.acquired/lost`, `peer.connected/disconnected`; `events.lagged` for a slow subscriber) | DONE | `crates/engine/src/control/streams.rs`, `crates/engine/src/log_buffer.rs` |
+| Daemon: `DaemonHost` (FUSE mounts incl. `view.mount{PreopenedFd}` → `NodeRuntime::add_mount_fd` → frontend-fuse `MountSource::PreopenedFd`; `node.handoff{Exec}` → C4b's `handover::upgrade`), `daemon_router` (policy + audit), socket bound in the runtime dir and recorded in `control.path`, listener still handed over across `exec` (`UnixSocketListener::{from_std, try_clone_std}`) | DONE | `crates/cli/src/{control,node_runtime,handover}.rs`, `crates/control/src/transport/unix.rs` |
+| CLI: every subcommand that talks to a daemon uses `constellation_control::Client` (typed `call::<M>`), output unchanged (`status` prints the same `StatusReport` JSON, `handover` first as before); `daemon --upgrade` → `node.handoff`; attach, `umount`, `export`, `fs list`, gc/fsck routing, liveness ping (`daemon_lock`) through `control.path` | DONE | `crates/cli/src/main.rs`, `crates/cli/src/daemon_lock.rs` |
+| Harness: `Client::control_call`/`control(method, params)` over the real client; every `control_*` helper kept (`control_status` now returns the report itself); `mute-daemon` binds where a daemon would and records `control.path`; `web-ui-smoke` on the new HTTP shape | DONE | `crates/harness/src/{client,main,scenarios}.rs`, `crates/harness/src/scenarios/{m4,m10,m11,rejoin}.rs` |
+| Web adapter moved to `constellation_control::web` (feature `web`): `POST /api {method, params}`, `GET /api/status`, `/api/download` (streamed), `/metrics`, embedded `webui/` (JS updated to the new shape), DNS-rebinding guard; all through `dispatch_in_process` | DONE | `crates/control/src/web.rs`, `crates/control/webui/` |
+| Protocol types: `StatusReport.handover`/`HandoverStatus`; `HandoffParams.target: HandoffTarget { Exec{binary}, Socket }` (fd only for `Socket`), `HandoffReport.detail`; `SnapshotCreated { detail, snapshot }` for `snapshot.create`; schema re-blessed | DONE | `crates/control/src/proto/types.rs`, `crates/control/src/methods.rs`, `crates/control/schema/control.schema.json` |
+| Socket discovery helpers (`instance_for_state_dir`, `socket_path_for_state_dir`, `record_socket`/`locate_socket`/`forget_socket`, `LOCATOR_FILE`) | DONE | `crates/control/src/transport/path.rs` |
+| The C5 gate: unix-socket ↔ HTTP parity over the whole table against a real engine | DONE | `crates/engine/src/control/parity_tests.rs` |
+| `crates/api` deleted; fuzz target `api_request` → `control_request` (the control envelopes, JSON and postcard); `tools/check-cross-known-failures.txt`: the `constellation-api` line gone, `constellation-control` clean for Windows | DONE | `Cargo.toml`, `fuzz/`, `tools/check-cross-known-failures.txt` |
+
+### The method table
+
+All 57 methods are registered. The 37 old `Request` variants map per §9.2
+(`ListSnapshots` collapsed into `snapshot.list`) and keep their semantics:
+same refusal texts (now a `Failed` `ControlError`'s `message`), same waits.
+
+| Method | State |
+|---|---|
+| `node.ping/status/reintegrate/leave/set_write_mode/doctor`, `node.logs.tail` (chunks; `follow` new) | implemented (old semantics) |
+| `pin.add/remove/list`, `designation.offline/online/list/delegate/undelegate/list_delegations` | implemented (old semantics; `designation.list_delegations` now prints JSON in the CLI — it used to bail "unexpected response") |
+| `prune.run/list`, `gc.run`, `fsck.run`, `snapshot.create/list/delete/refs`, `clone.create` | implemented (old semantics); `snapshot.create{hold}` → `Unsupported` (plan 32) |
+| `browse.readdir/inspect` | implemented (old semantics: the replica, with the manifest summary) |
+| `browse.stat/read/write/mkdir/rename/delete/xattr` | implemented (new, `ControlVfs`) |
+| `locks.force_release/drop_held`, `cache.list/prune`, `quota.set/get` | implemented (old semantics) |
+| `view.mount` (`Path` as before; `PreopenedFd` with the fd over SCM_RIGHTS), `view.unmount`, `view.list` (label filter), `view.stats` | implemented |
+| `node.ops` | implemented; the `view` filter → `Unsupported` (the watchdog does not attribute ops to views before C7) |
+| `node.handoff` | `Exec` implemented (C4b's in-place upgrade, socket only; HTTP refuses); `Socket` → `Unsupported` (plan 37's second-process handover) |
+| `node.lifecycle` | `Unsupported` with a remediation until C8 (no lifecycle profiles to apply events to) |
+| `peers.list`, `stats.subscribe`, `events.subscribe` | implemented |
+| `fs.list/create/import/export/passwd/doctor/unlock` | implemented; `fs.create` with an explicit `endpoint`/`region` → `Unsupported` (resolved from the daemon's environment, as every backend URL is) |
+
+### Socket path design
+
+One daemon per state dir, several per host: the socket is
+`<runtime_dir>/<instance>.sock`, `runtime_dir` = `$XDG_RUNTIME_DIR/constellation`
+(macOS `$TMPDIR`, fallback `/tmp/constellation-<uid>`, created 0700 and
+refused if someone else owns it), `instance` = up to 8 readable characters
+of the state dir's name + `-` + 16 hex digits of BLAKE3 of its canonical
+path (≤ 25 bytes, inside `RUNTIME_NAME_BUDGET`, so the path fits
+`sun_path`'s 104 bytes). Clients never re-derive it — a CLI or harness
+with another environment would compute another runtime dir: the daemon
+writes the path, atomically, into `<state_dir>/control.path` after binding,
+and every client reads it (`locate_socket`). A stale locator (crashed
+daemon) reads as "not running" at connect time, as a stale `control.sock`
+did; a clean exit and a takeover remove socket and locator
+(`forget_socket`). No compat symlink or file at `<state_dir>/control.sock`.
+
+### Authorization and audit defaults
+
+The daemon's owner (effective uid) is admin; the in-process caller is admin;
+everyone else is denied — unknown method names included — unless
+`$CONSTELLATION_CONTROL_POLICY` or `<config dir>/control-allow.toml` grants a
+uid or group a role (`Policy::load`; an unreadable file logs an error and
+falls back to owner-only, never wider). The socket and its directory are
+owner-only (0600/0700), so a grant for another user also needs the
+deployment to widen them. Mutating calls are audited to
+`<state_dir>/control-audit.jsonl` (params digest only; withheld for secret
+params). The web adapter still has no authentication (plan 33 adds it):
+loopback bind + DNS-rebinding guard, every call as `Principal::InProcess`
+(the full access it always had), except `node.handoff`, refused over HTTP.
+
+### The parity test (the C5 gate)
+
+`constellation_engine::control::parity_tests::unix_socket_and_http_dispatch_the_whole_table_identically`:
+a real `Engine` (local backend, P2P off), a fixture host whose "mounts" are
+views opened in the engine, one `EngineControl`. For each role (none,
+viewer, operator, admin) the same router is served on a real unix socket
+(this process's uid granted the role through `SO_PEERCRED`) and through the
+HTTP adapter in-process (`web::app_as`, a principal granted the same role),
+and **every method in `METHODS`** (57 × 4 = 228 pairs, streams included) is
+called through both with parameters chosen so a second identical call
+answers like the first. Asserted: `Denied` exactly below the method's
+minimum role, on both; the same outcome (`Ok`, or the same `ErrorKind` and
+`Code`, with the HTTP status matching the kind); for read-only methods the
+same result (clocks stripped; `node.status` compared on identity and
+shape; streams: `node.logs.tail`/`browse.read` bytes, the first
+`stats.subscribe` sample's series); 30 admin calls must succeed (so real
+results are compared, not only matching refusals); `locks.force_release`
+(state-changing by nature) compared on authorization only; `node.handoff`
+refused over HTTP, never over the socket. The control crate's own
+`the_whole_table_is_role_enforced_identically_over_socket_and_dispatch`
+still covers socket ↔ in-process dispatch.
+
+### Spec note
+
+`docs/explanation/DESIGN.md` §10 still describes the old control plane
+(line-JSON over `<state_dir>/control.sock`, an unauthenticated localhost
+API). It is now the old protocol's description; the control protocol is
+plan 31 §9 and the table above. Not edited, per CONVENTIONS.
+
+### Exit criteria
+
+- [x] `crates/api` deleted from the workspace; no shim, no compat socket
+- [x] all 37 old methods have their control-protocol method, implemented
+- [x] `fs.unlock`, `view.stats`, `node.handoff` (Exec) and fd passing
+      (`view.mount{PreopenedFd}`) work; the rest of the new methods
+      implemented or `Unsupported` as listed
+- [x] unix ↔ HTTP parity test over the full table passes
+- [x] CLI, harness and web UI moved to the new protocol; `status` output
+      unchanged
+- [x] `make check-cross` exits 0 (`constellation-control` clean for Windows)
+- [x] fmt, clippy `-D warnings`, lib tests of control/cli/engine/harness,
+      `tests/smoke.sh`, selected control-heavy harness scenarios (see the
+      report)
+
+### Gate results (C5b)
+
+`cargo build --workspace`, `cargo fmt --all -- --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`: clean. Tests: control 130/130
+(`--features web`), engine `--lib` 302 passed/2 ignored (incl. the parity
+test), harness `--lib` 37/37, cli bins 24/24 (incl. the FUSE-backed
+`two_views_…_pin_is_view_agnostic` and `umount_of_a_non_last_view…`, both
+over the new socket and typed client). `make check-cross`: exit 0
+(`x86_64-pc-windows-gnu constellation-control ok`; the engine's Windows
+failure is `staging.rs` only). `bash tests/smoke.sh`: SMOKE TEST PASSED.
+Harness (debug binary, docker S3): `web-ui-smoke`, `named-shared-daemon`,
+`fsck-while-mounted`, `snapshot-lifecycle`, `clone-workflow`,
+`quota-enforcement`, `prune`, `poison-record-isolation`,
+`stale-daemon-lock`, `session-handover-idle`, `gc-lifecycle`,
+`designation-as-delegation`, `node-leave`, `snapshot-mount`: PASSED.
+`stale-daemon-lock` fails only when `RUST_BACKTRACE=1` is exported to the
+mounts (anyhow then appends a backtrace and the scenario's 15-line log tail
+no longer holds the refusal text; environment, not behaviour).
+`unmount-with-held-records` is intermittent here (2 of 5 runs passed): on
+failure the remount's `create` under the S3 cut waits out the 120 s client
+bound after its lease renewal fails — the authority/data path, not the
+control surface (its control calls, `node.status`/`locks.drop_held`,
+answered in every run); the tree it ran on also carried the concurrent C4
+follow-up's uncommitted meta/authority/view edits. Not a full-matrix run.
+
+**Real-mount check** (debug binary, local file backend, a python-ctypes
+`renameat2` caller): `NOREPLACE` onto an existing name → `EEXIST` (both
+files intact), onto a free name → moved; `EXCHANGE` of two files →
+swapped contents; `EXCHANGE` of `d1/x` (file) with `d2/sub` (directory) →
+swapped, `nlink` d1 3 / d2 2; `EXCHANGE` with a missing name → `ENOENT`;
+`WHITEOUT` → `EINVAL`, and `FUSE_RENAME2` still works afterwards
+(`NOREPLACE` → `EEXIST`, so the kernel did not disable it). A remount on a
+fresh state dir (bootstrapped from the backend) shows the swapped state.
+The unlinked-open-file repro passes every step (`write`, `fsync`,
+`fdatasync`, `ftruncate`, `close`, dup'd `close`).
+
+**Pre-existing flakes seen while testing (not from this change — each
+fails identically with it reverted):** `meta` `tests/completion_ownership`
+and four `tests/speculation` tests (the root directory's mtime/ctime
+differ by a few ns between the replicas compared) fail intermittently
+under CPU load and pass unloaded; `authority` sim
+`a_panicking_node_fails_the_seed_promptly` (a 20 s wall-clock bound)
+failed only while other suites ran alongside.
+
+### Plan 31 C4 follow-ups exit criteria
+
+- [x] `RENAME_NOREPLACE` atomic where the rename commits (local and
+  forwarded); `RENAME_EXCHANGE` implemented in meta + replay + authority
+  path with tests; `WHITEOUT` → `EINVAL`; `Declared::rename_flags: true`
+- [x] `crates/engine/tests/conformance.rs`: 72 passed / 0 failed / 9
+  skipped; nightly `conformance` job runs it
+- [x] Unlinked-open-file bug triaged (pre-existing, not plan 31), fixed,
+  unit-tested, checked on a real mount
+- [x] `cargo build --workspace`; clippy `-D warnings` and `cargo fmt` on
+  meta/authority/vfs/engine/frontend-fuse; `cargo test` of
+  `constellation-engine` (lib 302, conformance), `-meta` lib, `-authority`
+  lib + `meta_repro`, `-vfs --features conformance`, frontend-fuse
+  `wire` (20)
+- [x] Harness `scratch-publish`, `subtree-confinement`,
+  `gc-open-orphan-hold`, `stale-base-rename-divergence`,
+  `cross-subtree-rename`, `fuse-inval-storm`: PASSED (debug binary)
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798) — run by the coordinator at the end
+
+## Plan 31 C7a — op metrics, tracing, `node.ops`, `vfs-bench`
+
+First half of milestone C7 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.9, §6.10, §9.10): the unified op metrics, a span and id for every op,
+`node.ops` attributed to views, and the `vfs-bench` gate. (The deferral of
+cold reads/lease waits and the Mountpoint-derived candidates of C7 are not in
+this part.)
+
+| Item | State | Where |
+|---|---|---|
+| `constellation_vfs_ops_total{frontend,view,op,outcome}` (counter) and `constellation_vfs_op_seconds{frontend,view,op}` (histogram, 21 bounds 10 µs–60 s + `+Inf`), recorded once per op when its `Responder` completes (`Timed<R>`: also on a deferred completion's thread; dropped unanswered counts as `Io`; never twice). `outcome` = `ok` or `Code::name()` (new const fn), ≤ 80 slots. Zero heap allocation and no lookup per op: pre-registered atomics indexed by (`OpKind`, outcome slot) and bucket, three relaxed `fetch_add`s; frontend name and `view` label fixed per session. Series shared per (frontend, view label) through a weak registry so a scrape never steps backwards when one of two sessions ends | DONE | `crates/vfs/src/metrics.rs`, `crates/types/src/errno.rs` |
+| `view` label only from `METRIC_LABELS` (`pv`): `Vfs::identity() -> ViewIdentity{id, metric_view}` (`View` computes it with `metric_view_label`); `namespace`/`pvc` etc. never reach a series (asserted in the scrape test) | DONE | `crates/vfs/src/{vfs,observe}.rs`, `crates/engine/src/view/{spec,ops}.rs` |
+| Tracing: `Observer::begin` gives every op an `OpId` and a `vfs.op` **debug** span (`op, ino, op_id, frontend, view_id, view`), `ObservedOp::enter` around the engine call, so engine events nest under it; the FUSE adapter uses it in all 28 op callbacks (`lock_acquire` included). Disabled span = level check, fields not evaluated, no allocation; debug (not info) so an `fmt` subscriber at `info` never formats 6 fields per request. There were no S3/P2P spans to nest (only events) — none added | DONE | `crates/vfs/src/observe.rs`, `crates/frontend-fuse/src/adapter.rs` |
+| `/metrics` renders `StatusReport.vfs_ops` (new, `VfsOpsStatus`) as a real `counter`/`histogram` (cumulative buckets, `_sum` s, `_count`, escaped label values); `stats.subscribe` samples carry `constellation_vfs_ops_total` / `_refused_total` (labelled series would make the sample's key set unstable) | DONE | `crates/control/src/{web.rs,proto/types.rs}`, `crates/engine/src/control/{ops,service,streams}.rs`; schema re-blessed |
+| `node.ops`: the `view` filter (was Unsupported) works. `OpWatch::for_view` tags each view's handle (id + labels) on a shared registry; `OpWatch::ops()` lists every in-flight op. `OpsReport` = totals + `ops: Vec<OpEntry>` (oldest first, `stalled`, `blocking`, `view`; ≤ 1000, `truncated`) + `views: Vec<ViewOps>` (every open view with its labels, idle ones too); `min_age_s` filters; unknown view → `NotFound`. `OpsReport.ops` changed from `StalledFuseRequest` to `OpEntry` and now lists all in-flight ops, not only stalled ones (no consumers existed) | DONE | `crates/vfs/src/watch.rs`, `crates/engine/src/control/{mod,ops}.rs` |
+| DoD test: `/metrics` scraped in-process (web adapter over a real engine) after 3 `getattr` + 2 refused `lookup` through the `Observer`: exact series/labels/counts, cumulative buckets, no non-allowlisted label; `node.ops` per view/labels/filters/over the router; stalled/capped accounting on synthetic entries | DONE | `crates/engine/src/control/ops.rs` (3 tests), `crates/vfs/src/{metrics,observe,watch}.rs`, `web::tests` |
+| `vfs-bench` (criterion 0.5, `default-features = false`; `harness = false`): direct (`OpCtx::new` + bare responder) vs observed (`Observer` path) for `getattr`/`lookup`/`read` on no backend, `MockVfs` reference fs and a real `View` (local file backend, P2P off); alternating rounds, median of per-round differences; per-thread counting `#[global_allocator]`; exits 1 past 1 µs, or on any allocation with no backend / more than 0.5 extra allocations per op over a backend (whose own count may wobble). `make vfs-bench` | DONE | `crates/engine/benches/vfs_bench.rs`, `crates/engine/Cargo.toml`, `Makefile` |
+
+**`vfs-bench` numbers** (release, this container, 4 vCPU, no tracing subscriber;
+`make vfs-bench`, exit 0). Target §6.9: overhead < 1000 ns/op, no extra
+allocation per inline op.
+
+| backend | op | direct ns | observed ns | overhead ns | allocs/op direct → observed |
+|---|---|---|---|---|---|
+| observer only | getattr | 8.5 | 129.7 | +121 | 0 → 0 |
+| MockVfs | getattr | 528 | 670 | +141 | 4 → 4 |
+| MockVfs | lookup | 618 | 760 | +140 | 8 → 8 |
+| MockVfs | read 4 KiB | 669 | 809 | +152 | 5 → 5 |
+| View | getattr | 1797 | 1914 | +151 | 4 → 4 |
+| View | lookup | 3223 | 3350 | +158 | 11 → 11 |
+| View | read 4 KiB | 8648 | 8947 | +111 | 60 → 60 |
+
+The path around an op costs ~110–160 ns (10x under the target) and adds **zero**
+allocations (0.000/op with no backend). Runs vary ±30 ns; an earlier run
+of the same code read +109…+177 ns. The absolute allocations are the
+backends' own: the mock records calls; the real `View` allocates 4 (`getattr`),
+11 (`lookup`), 60 (`read`, 10.7 KB) per op — so §6.9's "no per-op heap
+allocation for inline replies" holds for the dispatch path but not yet for the
+`View`'s read/lookup work; recorded as a C7 follow-up (the criterion groups
+`vfs_dispatch/view/*` are the baseline).
+
+**Verification (this part).** fmt clean; clippy `-D warnings --all-targets` on
+types/vfs/frontend-fuse/control/engine clean; `cargo build --workspace`; tests:
+vfs `--lib` 53, frontend-fuse `--lib` 17 and `--test wire` 20, engine `--lib`
+317 passed/2 ignored (incl. parity), control `--features web` 131;
+`make check-cross` exit 0; `make vfs-bench` exit 0.
+
+**Gates pending** (coordinator): `cargo test --workspace`, smoke/integration,
+harness matrix, pjdfstest 8798/8798, the remaining C7 items (deferral of cold
+reads, Mountpoint-derived candidates), and adding `vfs-bench` to the CI perf
+lane. Not done here: instrumenting `ControlVfs` (browse ops). (Ops the FUSE
+adapter refuses before a `Vfs` call — bad `lseek`/`setxattr`/`setlk` args — are
+begun and answered through the observed responder, so they are counted too.)
+
+### Plan 31 C7a exit criteria
+
+- [x] `constellation_vfs_ops_total` / `constellation_vfs_op_seconds` emitted and scraped by a test, `view` only from the allowlist
+- [x] Every op has an `OpId` and a `vfs.op` span, allocation-free when disabled
+- [x] `node.ops` `view` filter, with labels; covered by tests
+- [x] `vfs-bench` recorded, within the §6.9 dispatch target
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator
+
+
+## Plan 31 C8 — engine profiles and lifecycle
+
+Milestone C8 of [plan 31](wip/31-core-frontend-backend.md) (§10, §10.1,
+§11 "C8", §15 item 9): `EngineProfile`'s modes take effect, the engine
+applies its host's `LifecycleSource` events, `node.lifecycle` injects them on
+Linux/macOS, and three harness scenarios exercise suspend/resume/metered
+uploads against real daemons.
+
+### Profile semantics as implemented
+
+| Field | Value | Effect |
+|---|---|---|
+| `p2p` | `Listen` | as before |
+| | `DialOnly` | same endpoint; every **inbound** connection (any ALPN) is refused right after its handshake (`InboundWatch::after_handshake`, close code `0x4e41`); outbound dials (forwards, chunk fetches, the log-stream subscription, gossip's own links) work, and replies come back on the connection this node opened. The registry record still carries key + address (peers build their allowlists from it). iroh 1.1 has no listen-less endpoint, so this is the hook-based refusal |
+| | `Off` | as before (no endpoint) |
+| `leases` | `Hold` | as before |
+| | `ForwardOnly` | the authority core's `AuthorityMode::forward_only` (`crates/authority/src/core/mode.rs`): never takes the lease *from a live holder* — no P2P handoff request, no `wanted_by` registration, no placement offer claimed, no inbox escalation, no re-adoption of an old tenure — routing always forwards first (even with `CONSTELLATION_FORWARD=off`), and a lease it did take (nobody held one: refusing would leave the cluster without a sequencer and fail the phone's writes) is given back once idle for the dwell (`LeaseState::release_when_idle`) instead of waiting to be asked. Reuses the existing forward/inbox/lease paths: no new routing code |
+| `uploads` | `Always` | as before |
+| | `UnmeteredOnly` | while the last `NetworkChanged` said metered (`UploadHold`): the round's background upload pass takes no new chunk (skipped, or stopped mid-pass), plain closes are write-back (`WriteModeState::effective`), forwarded chunks are not handed to a peer; data stays in `pending_upload` + cache (locally durable), and plan 30 §M7's ship deferral holds back only the manifests that name a held chunk. **Explicit durability requests are never held**: `fsync`/`O_SYNC`/`--fsync-mode s3` drains, barriers, a snapshot's forced publish, handoff/unmount/suspend flushes (waiting there would park the core's single job slot and its lease renewals). Under `ack=s3` an acknowledgement still waits for the log exactly as before (its record is deferred until the chunk is up) |
+| `background` | `Continuous` | background work pauses only while suspended |
+| | `OnDemand` | also pauses while `Background` or `LowPower` (until `Foreground`/`Resumed`) |
+
+"Background work" (`BackgroundGate`, checked at the top of each tick): bucket
+GC, completed-rid prune, retention pruner, coop digest publishing, pin
+refreshes, placement RTT gossip/offers, registry/roster and designation
+polls, atime flushes, the replica vacuum. Never paused: the authority core
+(renewal, tailing, shipping, forwarding), the open-orphan hold writer,
+demand-driven readahead.
+
+`EngineProfile::server(mem, cache)` = desktop modes with explicit budgets
+(§10.1, unchanged); new `EngineProfile::mobile()` (DialOnly, ForwardOnly,
+UnmeteredOnly, OnDemand; plan 36 A1 tunes budgets). The daemon keeps
+`desktop()`; `CONSTELLATION_PROFILE=desktop|server|mobile` and
+`CONSTELLATION_PROFILE_{P2P,LEASES,UPLOADS,BACKGROUND}` override it
+(`EngineProfile::from_env`; an unknown value fails the mount).
+
+### Lifecycle events (`crates/engine/src/lifecycle.rs`)
+
+The engine subscribes to `HostServices.lifecycle` at start; an
+`engine-lifecycle` thread applies events in order.
+
+**`Suspending{deadline}`**: (1) background pauses; (2) every open view's
+`sync_view` in parallel (before authority narrows, so a publish can still take
+the lease the ordinary way); (3) core `Control::Authority{suspended}` — no
+acquisition at all except a sealed backup's takeover and a continuation
+epoch's flush re-claim (the two that preserve acknowledged work); (4)
+`Control::Flush` (leave's): every pending chunk up, journal shipped, commit
+published if holder, lease released via the ordinary release CAS; (5) P2P
+quiesce: inbound refused, gossip's dials refused, every connection closed
+with a close frame (the node's own requests may still dial: an op that
+arrives while suspended forwards like any non-holder's). Each step is bounded
+by what is left of the deadline; unfinished steps keep running and the
+`SuspendReport` says so (`within_deadline`, `views_synced`, `flushed`,
+`flush_error`, `lease_released`, `journal_backlog`, `pending_uploads`,
+`p2p_connections_closed`).
+
+**`Resumed`**: P2P admits connections again (inbound only under `Listen`),
+`Endpoint::network_change()`, re-dial every peer, gossip rejoin; core
+authority restored (leases re-acquired lazily by the next op that needs
+one, as a restarted node); background resumes; an immediate sync round.
+**`NetworkChanged`**: upload hold per `UploadMode`; iroh `network_change()`
+when reachable (plan 36 settled decision 20). **`LowPower`**: as
+`Background` for `OnDemand`. **`Foreground`/`Background`**: per
+`BackgroundMode`.
+
+`node.status` gains `lifecycle` (`LifecycleStatus`: profile, state,
+low_power, network, in-force forward_only/suspended/uploads_held/
+upload_deferrals/background_paused/p2p admission, events, last
+suspend/resume reports). `node.lifecycle` (admin) pushes into the host's
+`ManualLifecycle` (`LifecycleSource::manual()`, new) and answers
+`LifecycleReport{event, applied, status}` once applied (was `Ack` +
+Unsupported; `ControlHost::lifecycle` removed). CLI:
+`constellation lifecycle <target> foreground|background|low-power|suspending
+[--deadline-ms N]|resumed|network [--reachable B --metered B]`.
+
+**Lease/ack safety.** Nothing here acknowledges anything; acks are given by
+the unchanged ack-policy code. Everything acknowledged before the suspension
+is in the fjall journal (synced by step 2) and, once the flush finishes, in
+the log. The lease is only ever let go through the core's ordinary release
+CAS after its journal shipped (a released lease: the next holder takes over
+at once, no TTL, no epoch ambiguity), or not at all: a flush that misses the
+deadline leaves the tenure as a frozen node's — renewed until it cannot be,
+then taken over by TTL, the unshipped journal stranded and replayed by rid
+on return (the deposition path every kill -9 scenario covers). While
+suspended the node is a non-holder that will not become one; it keeps its
+backup and promise duties for others (they are how *other* nodes keep acked
+work).
+
+### Items
+
+| Item | State | Where |
+|---|---|---|
+| `AuthorityMode` (forward-only, suspended), `Control::Authority`, `Config::forward_only`, acquisition gate, no-`wanted_by`, idle release | DONE | `crates/authority/src/core/{mode,jobs,client,holder,inbox,lease,mod}.rs`, `event.rs` |
+| DialOnly / quiesce / gossip gate / `close_all` / `network_change` | DONE | `crates/net/src/{endpoint,peers}.rs` |
+| `UploadHold`, background pass, write-back under hold | DONE | `crates/engine/src/{upload,writeback,authority_driver}.rs` |
+| `BackgroundGate` on every ticker | DONE | `crates/engine/src/{node,coop,pin}.rs` |
+| Lifecycle runtime, reports, status | DONE | `crates/engine/src/lifecycle.rs` |
+| Profile semantics, `mobile()`, `from_env` | DONE | `crates/engine/src/profile.rs`, `crates/cli/src/node_runtime.rs` |
+| `node.lifecycle` end-to-end, `LifecycleReport`, `LifecycleStatus`, schema re-blessed | DONE | `crates/control/src/{methods.rs,proto/types.rs}`, `crates/engine/src/control/{lifecycle,mod,service}.rs`, `crates/platform/src/lifecycle.rs` |
+| CLI `constellation lifecycle` | DONE | `crates/cli/src/main.rs` |
+| Harness `lifecycle-suspend-mid-write`, `lifecycle-resume-rejoin`, `lifecycle-metered-uploads` | DONE | `crates/harness/src/scenarios/lifecycle.rs` |
+
+### Scenario results (debug binary, docker floci S3)
+
+| Scenario | Runs | Passed | Notes |
+|---|---|---|---|
+| `lifecycle-suspend-mid-write` | 3 (final code; 3 more on an earlier build) | 3 | suspend 36–164 ms of a 15 s deadline, 18–24 acks in phase 1, 0 failed ops, 44–51 files intact on 3 nodes |
+| `lifecycle-resume-rejoin` | 3 | 3 | caught up 0.39–0.46 s after resume |
+| `lifecycle-metered-uploads` | 3 | 3 | chunk PUTs 1 → 1 while metered (8 pending, 21–27 deferrals), → 10 after |
+
+Found and fixed on the way: the first version of the quiesce also refused the
+node's own outbound dials, so its ops went through the S3 inbox — and a holder
+that still believed the node P2P-connected never polled it, so one op in two
+runs ended `EIO` at the 2×TTL deadline. Own requests now dial out (gossip's
+stay refused); the scenario asserts zero failed ops across the suspension.
+
+Regression (debug, `--seed 7`, `HOLDER_KILL_ROUNDS=3`): `lease-handover`,
+`lease-fencing`, `p2p-handover`, `forwarded-mutations`,
+`sticky-lease-handoff-over-s3`, `holder-kill-rejoin`,
+`p2p-same-identity-restart` — all PASSED.
+
+**Deferred.** Rebalancing a live engine's cache share when an `EngineHost`
+adds/removes engines (`host.rs`'s module doc names it "C8's lifecycle work";
+not in this milestone's brief — shares stay fixed at start). A real OS
+suspension on a phone also freezes the process holding a backup role; the
+holder reconfigures a silent backup out on its own schedule (existing M9
+path), which this manual-source milestone cannot exercise.
+
+### Plan 31 C8 exit criteria
+
+- [x] `EngineProfile` modes take effect; `server()` per §10.1; `mobile()` preset
+- [x] Suspend/resume semantics (§10), within a deadline, reported
+- [x] `node.lifecycle` works end-to-end against a real daemon (harness)
+- [x] Lifecycle scenarios pass on Linux (3 × 3)
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator
+
+## Plan 31 C7b — deferral and performance candidates
+
+Second half of milestone C7 of [plan 31](wip/31-core-frontend-backend.md)
+(§6.3, §6.4, §6.9, §11 "C7"): the cold-read deferral the measurements
+justified, the five Mountpoint-derived candidates measured and decided, and
+`vfs-bench` in the gated perf suite. Host: this container, 4 vCPU (so 4 FUSE
+workers by the fixed `2*ceil_sqrt(cpus)` rule), 15 GiB, release builds,
+floci S3 behind toxiproxy (latency toxics apply to both directions). The
+bench scripts are ad hoc (a mount per run, a Python/`dd` client). Each
+number is one run unless a range is given.
+
+### Items
+
+| Item | State | Where |
+|---|---|---|
+| Engine completion pool: bounded (`CONSTELLATION_COMPLETION_THREADS`, default 64), one per process, threads started on demand and gone after 30 s idle, queue past the bound, a panicking job keeps its thread, falls back to the caller if no thread can start; never the tokio blocking pool (the `lock-wait` rationale) | DONE | `crates/engine/src/completion.rs` (3 unit tests) |
+| Cold reads defer: the read is tried inline with a thread-local probe armed; the first fetch that would wait (prefetch in flight, forwarded chunk, peer, S3) refuses instead, the attempt unwinds, and the whole read reruns on the pool, which answers the responder. Only when `FrontendCaps::deferrable` holds `Read` (else waits on the caller as before); `CONSTELLATION_DEFER_COLD_READS=0` is a kill switch. The op's watchdog entry, kernel-invalidation hold-back and admission slot travel with it (`Admitted::defer` / `Admission::leave_deferred`). `View::bind` gives an engine-opened view its own `Weak` | DONE | `crates/engine/src/view/{io,ops,flush,admission,mod}.rs`, `crates/engine/src/node.rs` |
+| FUSE adapter: reads are counted as *bounded* deferred replies (`Deferred` now has `blocking` = lock waits, which a detach still refuses, and `bounded` = reads, which a detach drains for up to `CONSTELLATION_HANDOVER_READ_DRAIN_MS`, default 30 s, before `sync_view`) | DONE | `crates/frontend-fuse/src/{adapter,session}.rs` (+1 unit test) |
+| Conformance: `Hooks::evict` (make a file's next read cold); `deferral::a_cold_read_completes_from_another_thread`, `deferral::a_non_deferrable_cold_read_parks_the_calling_thread`. The engine target evicts clean chunks (`View::evict_cached`, after `drain_inode`); the reference fs models a cold read (`RefView::cold_read`: a 20 ms "store" wait, off-thread when deferrable). Checked to fail with deferral switched off | DONE | `crates/vfs/src/conformance/{mod,deferral,reference}.rs`, `crates/vfs/src/mock/{mod,reffs}.rs`, `crates/engine/tests/conformance.rs` |
+| View unit test: a deferred cold read answers off the caller and keeps the view's admission slot until answered; a warm read answers inline | DONE | `crates/engine/src/view/qos_tests.rs` |
+| Read-path allocations: `ChunkHash::to_hex` made one allocation (was 33: a `format!` per byte), new `hex_ascii` (none), `Display`/`Debug` allocation-free, `DiskCache::path_for` one allocation (was ~7). Output and on-disk layout unchanged (2 new tests) | DONE | `crates/fs-core/src/{chunk,cache}.rs` |
+| `CONSTELLATION_CACHE_READ_RESERVE_PCT` (default 0 = unchanged): the dirty-chunk share of the cache stops that many percent short of the budget | DONE (knob, default off) | `crates/engine/src/view/io.rs` (`dirty_budget`) |
+| `vfs-bench` in the perf gate: `VFS_BENCH_JSON`, `VFS_BENCH_REPORT_ONLY`; `tests/perf-gate.sh` runs it first and fails on a §6.9 miss or on per-op allocations over `tests/perf-baseline.json`'s `vfs_bench.max_allocs_per_op` (+0.5 slack): `view/read` 21, `view/lookup` 11, `view/getattr` 4, `observer/getattr` 0. Runs in `make perf-gate` (nightly `performance` job) and as its own step in the `perf-regression` PR workflow (`PERF_GATE_VFS_BENCH_ONLY=1`) | DONE | `crates/engine/benches/vfs_bench.rs`, `tests/perf-gate.sh`, `tests/perf-baseline.json`, `.github/workflows/perf-regression.yml`, `Makefile` |
+| Docs: knobs, tests, gate | DONE | `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md` |
+
+### Deferral: inventory, measurement, decision
+
+Every place a frontend worker parks on the engine (`crates/engine/src/view/**`
+plus `locks.rs`), after C7b:
+
+| Site | Waits for | Bound | Status |
+|---|---|---|---|
+| `flush.rs` `fetch_chunk_for_inode`: `rt.block_on(coop.fetch)` / `get_chunk_to_writer`, the prefetch-in-flight poll, `wait_forwarded_chunk` | a chunk from a peer or S3 | S3/peer RTT + transfer | **deferred** (cold reads, C7b) |
+| `locks.rs` `ClusterLocks::lock` | a lock grant | unbounded | deferred since C4 (`lock-wait` thread per wait); `locks.rs:203,318` are that thread's and `lock_here`'s waits |
+| `write_gate.rs:130` `require_lease_for` | the lease (`SyncRequest::Acquire`) | up to 2×TTL without progress | not converted, see below |
+| `write_gate.rs:604` `submit_to_core` | the core's commit of a mutation (local, forwarded over P2P, or the S3 inbox) | P2P RTT, or S3 RTTs / in-doubt 120 s when S3 is cut | not converted |
+| `write_gate.rs:291` `strict_read` | `cto=strict`'s read index | one core round | not converted (opt-in mode) |
+| `write_gate.rs:361` `recall_after_local_inos` | cluster-lock recalls | core round | not converted |
+| `write_gate.rs:665` `sync_barrier_at` (`fsync`) | durability at the requested level | S3 PUT/CAS | not converted (a durability barrier: the caller asked to wait) |
+| `flush.rs:249` `drain_inode` | a write-through close's chunk upload | S3 PUT | not converted (same) |
+| `synthetic.rs` `block_on(snapshots…)` | frozen snapshot tree loads | S3 GET | not converted (snapshot browsing) |
+| `admission.rs`, `StagingBudget::wait_below`, `do_write`'s throttle sleeps | view QoS / backpressure | deadline (30 s default) | not converted: backpressure is meant to hold the writer |
+
+**Measurement (cold reads)**: one node, 4 FUSE workers, 1 MiB chunks, 200 ms S3
+latency. N readers each `cat` a different cold 2 MiB file while a prober
+`open`s + `pread`s 4 KiB + `close`s a file already in the cache, every 5 ms,
+until the readers finish. Two bursts per mount, fresh files each. Probe max /
+cold-burst wall time:
+
+| Build | N=16 (run 1, burst 1 / 2) | N=16 (run 2) | N=64 (burst 1 / 2) |
+|---|---|---|---|
+| before (fixed 4 workers) | 1293 ms / 1285 ms; 1.76 s / 1.76 s | 879 / 1260 ms; 1.70 / 1.75 s | **6281 / 5081 ms; 7.0 / 5.9 s** |
+| before, `CONSTELLATION_FUSE_THREADS=32` (control) | 4.3 / 6.9 ms; 0.57 / 0.55 s | — | — |
+| **after (deferred)** | 16.5 / 16.4 ms; 0.55 / 0.52 s | 10.8 / 16.5 ms; 0.55 / 0.53 s | **519 / 425 ms; 1.24 / 1.06 s** |
+
+The 32-worker control proves the stall is worker exhaustion. In the
+before-runs, the cold readers were also serialised four at a time.
+Deferral fixes both: the probe's worst case drops by 80x (N=16) and
+12x (N=64), and the cold burst finishes 3.3x (N=16) and 5.6x (N=64) sooner.
+**Decision: ADOPT, default on.** The measurement demonstrates starvation, and
+the change is confined: the fast path is unchanged except for arming a
+thread-local; the slow path reruns the read. At N=64 the remaining ~0.5 s
+probe tail is the kernel's own queue (64 readers' async readahead fills
+`max_background` = 32) and the pool bound.
+
+**Lease waits: not converted.** On one node, 16 concurrent `create`s under
+200 ms S3 latency, just after an idle lease release
+(`CONSTELLATION_LEASE_IDLE_RELEASE_MS=2000`), finished in 10 ms, and the
+probe saw nothing. A mutation is acknowledged locally and the lease is
+taken behind it, so no worker parks on S3. Across nodes a mutation forwards
+over P2P, bounded by a LAN RTT. What remains is the S3-cut case. The
+pre-existing harness failure `writeback-backpressure` is exactly that case: the
+first `create` after S3 is cut waits in `submit_to_core` for 120 s, then
+`EIO`. It fails identically on the pre-C7b binary at `70b7a5e` (see below),
+so it is a correctness bug, not a starvation one. Deferring
+mutations also interacts with the kernel's `i_rwsem` and per-inode ordering.
+It is left for when a multi-node, S3-degraded measurement justifies it
+(harness: `sticky-lease-handoff-over-s3`, `forwarded-mutations` with P2P cut).
+
+### Mountpoint-derived candidates
+
+| Candidate | Measurement setup | Result | Decision | Rationale |
+|---|---|---|---|---|
+| (a) On-demand growing FUSE worker pool | 1024 cached 4 KiB files; 20 bursts of 64 client threads × 8 `open`+`pread`+`fstat`+`close`, 200 ms idle between bursts; `CONSTELLATION_FUSE_THREADS` = 1/4/16/64; daemon threads and RSS idle and after the bursts. Two runs | Idle cost per worker: **1 thread, ~120 KiB RSS** (46.6 MB at 4 → 54.3 MB at 64; fuser's 16 MiB request buffer is `calloc`'d, so it is resident only once touched). Burst wall p50 / max: 1w 144/209 ms; **4w 130–138/171–419 ms**; 16w 159–177/236–266 ms; 64w 305–313/413–421 ms | **REJECT** | Growth would only ever *add* workers under a burst, and more workers are slower for these CPU-bound ops on 4 CPUs (64 workers: 2.3x the burst time). Workers are too cheap for idle memory to matter. The case growth was meant for, blocking ops holding workers, is now fixed by deferral, independent of worker count |
+| (b) Userspace buffer pool vs `splice(2)` | `vfs-bench` per-op allocation counter. A temporary backtrace-capturing allocator attributed the View's 4 KiB read allocations by source line | Top sources: `ChunkHash::to_hex` 33/op (a `format!` per byte, on every cache lookup's path), `DiskCache::path_for` ~7, replica reads (getattr, manifest decode, `ScanAhead`'s `parent_of` at offset 0) ~15. After the fix, same host back to back: **60 → 21 allocs/op, 10.8 → 10.1 KB/op, View read 15.4 → 11.7 µs direct (-24%)**, dispatch overhead still < 1 µs. `splice` is not used, and zero-copy holds without it (`ReadData` is `Bytes` segments) | **ADOPT** (hex/path fix); **REJECT** `splice`; pool: keep `Bytes` | The remaining allocations are metadata decoding, not cheap to remove. Finding recorded for a follow-up: every FUSE read of a cached chunk loads and BLAKE3-verifies the *whole* chunk from the disk cache. A disk-cache-resident 256 MiB sequential read, kernel page cache dropped, runs at **~100 MiB/s at 4 MiB chunks vs 215–246 MiB/s at 1 MiB** (32 vs 8 full-chunk loads per chunk at 128 KiB readahead). A small in-memory cache of verified hot chunks (Mountpoint's buffer pool, in effect) is the fix. It is not cheap (memory budget, `Bytes` through the clip paths), so it is not done here |
+| (c) Prefetch first request sized to absorb kernel readahead (1 MiB + 128 KiB) | Cold 64 MiB file per rep, fresh-cache mount, 50 ms S3 latency, 128 KiB reads (the kernel's readahead unit); time to first byte, to 1.125 MiB, to 8 MiB, total. 3 reps per chunk size | 1 MiB chunks: TTFB 247–298 ms, **+10–38 ms to 1.125 MiB**, 96–105 MiB/s. 4 MiB chunks: TTFB 319–339 ms, **+17–29 ms to 1.125 MiB**, 44–50 MiB/s | **REJECT** | Kernel readahead is already absorbed. The first demand miss fetches a whole chunk (≥ 1 MiB), and at offset 0 readahead schedules the next ones at once. The first 1.125 MiB arrives within one round trip of the first byte, never two. A smaller-than-chunk first request is impossible anyway: a chunk is content-addressed and verified whole (hash, E2E), so no byte can be served before the whole chunk arrives |
+| (d) Memory limiter with a reserved read share | `--cache-size 128MiB`, 1 MiB chunks, 20 ms latency, uploads capped at 4 MB/s (upstream bandwidth toxic). A cold 64 MiB sequential read alone, then 8 s into a 384 MiB `dd` writer. Control: the same with a 2 GiB cache. Then `CONSTELLATION_CACHE_READ_RESERVE_PCT` 0/25/50 | Alone 106–124 MiB/s. With the writer: 2 GiB cache **54 MiB/s** (link/CPU contention); 128 MiB cache **11.5–13.3 MiB/s** (dirty chunks hold the cache, so fetched and prefetched chunks find no room and are refetched per 128 KiB read). Reserve 25%: 19.4–22.9; **reserve 50%: 66.5 MiB/s** | **ADOPT behind a knob, default unchanged (0)** | Write-starves-read is real under today's fully dynamic split: only `do_write` limits dirty bytes, at 100% of the budget. A reserve fixes it (50% gives back more than the large-cache control). The knob is not on by default: it moves where a small cache throttles and refuses writers (`ENOSPC` backpressure, which `writeback-backpressure` and deployments tune against), and the write side was not measured under it here. Flipping the default (e.g. 25–50%) needs the full harness matrix |
+| (e) S3 part size 8 MiB vs 4 MiB chunk (reference only) | 512 MiB random `dd … conv=fsync` into a write-through mount (`--cache-size 4GiB`), `fs create --chunk-size` 4 MiB vs 8 MiB, 0 and 20 ms latency, 2–3 reps | Rep 1 is a warm-up in every configuration (46–63 MiB/s). Warm reps, 0 ms: 4 MiB **108, 114, 113**; 8 MiB **142, 147, 110** MiB/s. 20 ms: 4 MiB 122, 8 MiB 109 | **REJECT** (keep 4 MiB default) | No consistent win: the ranges overlap and invert at 20 ms. The chunk size is the content-addressing unit (a format decision, §7), and 8 MiB is already available per filesystem (`fs create --chunk-size`). Concurrency tuning (`upload-concurrency`) is the lever for write throughput. Per (b), bigger chunks also cost cached sequential reads, and per (c) they cost TTFB (+70–90 ms at 50 ms latency) |
+
+### `vfs-bench` (release, `make vfs-bench` / the gate's stage, this host)
+
+Back to back on one host, before (fs-core fix reverted) → after:
+
+| backend | op | direct ns | overhead ns | allocs/op |
+|---|---|---|---|---|
+| observer | getattr | 7.6 → 7.6 | +124 → +124 | 0 → 0 |
+| MockVfs | read 4 KiB | 953 → 975 | +142 → +141 | 5 → 5 |
+| View | getattr | 1993 → 2002 | +201 → +108 | 4 → 4 |
+| View | lookup | 3529 → 3586 | +157 → +164 | 11 → 11 |
+| View | read 4 KiB | **15424 → 11694** | +101 → +408 (run to run: −106…+408) | **60 → 21** |
+
+(Absolute times on this host drift ±40% between sessions — a run earlier in
+the day read MockVfs rows 40% slower than C7a's table with identical code —
+so only back-to-back pairs are compared.) `make perf-gate`'s vfs stage:
+**VFS-BENCH GATE PASSED** (every overhead < 1 µs, every ceiling met).
+
+### Verification (this part)
+
+- `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings`
+  clean; `cargo build --workspace`.
+- Tests: fs-core `--lib` 39; vfs `--features conformance` 53 + 11 (+1
+  ignored); frontend-fuse `--lib` 18, `--test wire` 20; engine `--lib` 321
+  passed / 2 ignored; engine `--test conformance` passed (deferral group 8/8,
+  incl. the two new tests).
+- Harness (release, `--seed 7`): `cold-cache`, `readahead`,
+  `readahead-adaptive`, `prefetch-fairness`, `scan-ahead`, `s3-retry`,
+  `fio-latency`, `fio-blips`, `coop-cache-hit`, `lock-latency`,
+  `flock-cross-node`, `session-handover-idle` — all PASSED.
+  **`writeback-backpressure` FAILED** (`EIO` after 122 s), identically on the
+  pre-C7b binary (`70b7a5e`): a pre-existing failure (see "Lease waits"
+  above). Not caused by C7b; for the coordinator.
+- `tests/perf-gate.sh`, harness-bench stage: the committed floors in
+  `tests/perf-baseline.json` do not fit this host. The pre-C7b binary misses 7
+  of 8 metrics and the C7b binary 7 of 8 (e.g. warm random-read IOPS
+  336k / 439k vs a 1.15M floor: kernel page cache speed, untouched by C7b).
+  Back to back, C7b vs before: cold small-file read 14797 vs 12587 files/s,
+  sequential cold read 272 vs 254 MiB/s, metadata walk 56.6k vs 39.8k/s,
+  import 125 vs 135 files/s, write-back import 195 vs 229 files/s (the write
+  path is unchanged at the default knob; this metric is noisy run to run).
+  The floors are for the CI runner; the nightly job is the judge.
+
+### Plan 31 C7 exit criteria
+
+- [x] Unified op metrics/tracing (§6.10); `constellation_vfs_ops_total` /
+  `_op_seconds` scraped by a test (C7a)
+- [x] `OpWatch` over control: `node.ops` with the `view` filter (C7a)
+- [x] `vfs-bench` in the perf gate (`tests/perf-gate.sh`, `make perf-gate`,
+  nightly `performance`, PR `perf-regression`), numbers recorded and within
+  the §6.9 target
+- [x] Deferral of cold reads via `Responder`, where the measurement justified
+  it (worker starvation demonstrated and removed); lease waits measured and
+  deliberately not converted
+- [x] Each Mountpoint-derived candidate has a recorded benchmark result and an
+  explicit decision: (a) REJECT, (b) ADOPT hex/path fix + REJECT splice,
+  (c) REJECT, (d) ADOPT behind `CONSTELLATION_CACHE_READ_RESERVE_PCT` (default
+  off), (e) REJECT
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798; `writeback-backpressure` fails on the base too) —
+  coordinator
+
+## Chunk memory cache (follow-up to plan 31 C7b)
+
+Follow-up to C7b's candidate (b) finding: every FUSE read of a disk-cached
+chunk went through `DiskCache::get`, which `fs::read`s the **whole** chunk
+file and BLAKE3-verifies it on every call. A 128 KiB kernel read of a 4 MiB
+chunk therefore re-read and re-hashed 4 MiB (32 times per chunk for a
+sequential read). This adds a bounded in-memory tier of **verified** chunk
+contents, served to reads as shared `Bytes` slices. Host: this container,
+4 vCPU, 15 GiB, release builds, floci S3 behind toxiproxy (no toxics),
+`--cache-size 2GiB`, 4 FUSE workers.
+
+### Design
+
+| Decision | Choice | Why |
+|---|---|---|
+| Where | `crates/fs-core/src/memcache.rs` (`MemCache`), owned by `DiskCache` (`with_memory_cache(bytes)`; `get_shared(&hash) -> Option<Bytes>`) | The memory tier's correctness depends on the disk entry's lifecycle. Every path that drops a disk entry (`remove`, `forget` after an out-of-band delete, corrupt-on-read, `commit_spill`'s eviction victims, `prune_to`) drops the memory copy **under the same state-lock hold**. A load is admitted only if its disk entry still exists, checked under that lock. So memory ⊆ disk at all times, and memory accounting never outlives the disk entry. Lock order: state → policy → shard |
+| What is cached | Only bytes that just passed the disk cache's hash check (`get_disk` verifies, then `load_shared` admits). Writes (`insert`, `commit_spill`) and non-read `get()`s (upload, peer serving, pins, write seeding) never admit; `get()` still *serves* a resident copy (a copy-out, cheaper than a disk read + hash) | Never serve unverified bytes; don't let upload or peer traffic crowd reads out |
+| Read path | `View::do_read` now returns `ReadData` (`SmallVec<[Bytes; 4]>`), built from `chunk.slice(..)` of the shared chunk, plus static zero pages for holes/EOF/truncated-away base bytes. Clipping is a `valid` length (`valid_below`), not an in-place zero-fill, so shared bytes are never edited. Staged (unflushed) chunks read only the requested range (was: the whole chunk). `fetch_chunk*` return `Bytes`; callers that edit (write seeding, flush recomposition) take a `Vec::from` copy | Zero-copy up to the frontend (the FUSE reply borrows a single segment) |
+| Eviction | **2Q (Johnson & Shasha) with a correlated-reference filter.** Probation FIFO (target 1/4 of the budget) + protected CLOCK (a hit sets a reference bit, the hand gives a second chance) + a ghost list of recently evicted hashes (keys only, 1/2 budget of bytes). Promotion happens on an *uncorrelated* re-reference while in probation (≥ budget/8 bytes admitted since the entry was admitted), or on re-admission of a ghost. The victim comes from probation while probation is over its target, else from protected | A sequential reader touches a chunk 8–1024 times in a burst (one hit per kernel read). Frequency-based policies (S3-FIFO, TinyLFU) and LRU promotion read that burst as reuse, so one large `cat` would flush the hot set. The filter ignores the burst: a scan streams through probation and the ghost list, while a hot random set is promoted by either path. Pure LRU loses the hot set to any scan larger than the budget. Unit tests show both sides: a 16×-budget bursty scan leaves a promoted hot set fully resident, and without demonstrated reuse the same scan evicts it and promotes nothing |
+| Concurrency | 16 hash-sharded `RwLock<HashMap>` for lookups. A hit takes one shard read lock and touches only atomics (reference/reuse bits, a per-shard hit counter), never the policy mutex. Admissions/removals (at most one per disk load) serialise on the policy mutex. Stale queue items (entries removed out of band) are skipped and compacted once they outnumber live ones | FUSE workers + the completion pool hit in parallel without a global lock |
+| Single-flight | `get_shared` registers a per-hash flight on a miss. Concurrent readers of the same chunk wait for that one load (`memory_coalesced`) and share its result. A failed/panicking leader marks the flight failed, and waiters load for themselves. A load that finished between a reader's miss and its registration is caught by a re-check | 16 concurrent first reads of a 4 MiB chunk: one disk read + hash (unit test) |
+| Disk LRU interplay | `plan_eviction`/`prune_to` order memory-resident clean chunks after all others (`clean_by_recency`) | A memory hit no longer bumps the disk `atime`. Without this, the disk LRU would evict (and so drop from memory, and refetch from S3) exactly the hottest chunks |
+| E2E | Unchanged model. Chunks are decrypted once when fetched (`get_chunk_to_writer_e2e`); the disk cache holds decompressed **plaintext** under keyed (addressing-key BLAKE3) identities, 0700. There is no per-read decrypt to save. The memory tier holds the same plaintext the disk cache already holds, verified with the keyed hash, and writes nothing to disk (tested: the cache dir holds exactly the chunk files after reads). Trade-off: up to the budget of plaintext stays resident in process memory for longer than a transient read buffer; it is not `mlock`ed, so it can be swapped, like any read buffer. `CONSTELLATION_CHUNK_MEMCACHE_BYTES=0` turns it off | No new class of exposure; the residency window grows by at most the budget |
+| Budget | `EngineProfile::chunk_memcache_default(memory)`: 1/64 of the engine's memory share (`profile.memory_budget` or the `EngineHost` allotment, i.e. already partitioned per engine), capped at **128 MiB**, or **16 MiB** for `BackgroundMode::OnDemand` (the mobile profile). An explicit `server` memory budget gets 1/8 of it. Always ≤ the disk cache budget (memory holds a subset of disk). Chunks larger than 1/4 of the budget are not admitted. Override: `CONSTELLATION_CHUNK_MEMCACHE_BYTES` (bytes, `0` = off). Logged at start (`chunk memory cache bytes=…`) | Modest by default: the disk cache already has every chunk, and memory only needs the chunks being read now plus a hot set |
+| Observability | `node.status` `cache.memory_{budget_bytes,used_bytes,chunks,protected_bytes,hits,misses,coalesced,evictions}` (schema regenerated); `/metrics` `constellation_cache_memory_{budget_bytes,used_bytes,chunks,protected_bytes}` and `…_{hits,misses,coalesced,evictions}_total`; `stats.subscribe` samples carry them too | Follows the existing `constellation_cache_*` gauges |
+
+### Measurements (release, before = `f4d1ae8`, after = this change; back to back)
+
+Cached (disk-cache-resident) reads, kernel page cache dropped before each rep.
+Script: `mc.sh` (C7b's `warm.sh` method: a file written, read twice,
+then `cat` timed). Random reads: fio `randread`, 4 KiB, `psync`, 4 jobs,
+`fadvise_hint=1` (no kernel readahead), 16 MiB per job. Default memory
+budget = 128 MiB (1/64 of 15 GiB, capped).
+
+**Sequential, MiB/s (3 reps)**
+
+| chunk | file | before | after |
+|---|---|---|---|
+| 4 MiB | 256 MiB (> memory budget) | 72.6 / 76.6 / 74.0 | **403 / 407 / 381** |
+| 1 MiB | 256 MiB | 216 / 218 / 230 | **311 / 356 / 366** |
+| 4 MiB | 64 MiB (fits) | 90 / 80 / 77 | **872 / 1420 / 958** |
+| 1 MiB | 64 MiB | 151 / 159 / 173 | **1343 / 1575 / 1801** |
+| 4 MiB, knob `=0` (off) | 256 MiB | — | 94 / 96 / 96 |
+| 4 MiB, knob 512 MiB | 256 MiB | — | 1521 / 1499 / 1481 |
+
+**Random 4 KiB, IOPS (mean latency), 2 reps**
+
+| chunk | file | before | after |
+|---|---|---|---|
+| 4 MiB | 256 MiB | 369 / 352 (10.8 / 11.3 ms) | 653 / 640 (6.1 / 6.2 ms); rerun 730 / 745 |
+| 1 MiB | 256 MiB | 1623 / 1501 (2.4 / 2.7 ms) | 2233 / 2353 (1.8 / 1.7 ms) |
+| 4 MiB | 64 MiB | 541 / 511 (7.4 / 7.8 ms) | **51361 / 52345 (75 / 74 µs)** |
+| 1 MiB | 64 MiB | 2125 / 1953 (1.9 / 2.0 ms) | **44043 / 42336 (89 / 92 µs)** |
+| 4 MiB, knob `=0` | 256 MiB | — | 419 / 388 |
+| 4 MiB, knob 512 MiB | 256 MiB | — | 40355 / 39196 (96 / 99 µs) |
+
+Reading the numbers:
+- **Sequential.** A file larger than the budget now costs one load + hash per
+  chunk per pass instead of one per kernel read: 5.3× at 4 MiB chunks, and 4
+  MiB chunks now read faster than 1 MiB. A resident file reads at page-cache-like
+  speed (10–13×).
+- **Random.** A random working set larger than the budget is still bounded by
+  the per-miss full-chunk load: +1.5–2×, from the hits on the resident part.
+  A resident set gives ~100× (75–90 µs mean, vs 2–8 ms).
+- **Knob off.** Matches before (C7b measured ~100 MiB/s on the 4 MiB case; the
+  `Bytes` read path costs nothing).
+- **Live counters.** A 64 MiB file (16 chunks + its spilled chunk list) read
+  twice gave `memory_misses` 17, `memory_hits` 1007, `memory_evictions` 0.
+
+**`vfs-bench`** (release, `make vfs-bench` / `PERF_GATE_VFS_BENCH_ONLY=1
+tests/perf-gate.sh`): View `read` 4 KiB is **18 allocs/op, 1857 B/op**,
+direct 3.8–4.0 µs. C7b recorded 21 allocs, 10.1 KB and 11.7 µs; that is not a
+back-to-back pair, and absolute times drift between sessions. The remaining
+allocations are metadata. Overheads 92–214 ns, all < 1 µs. **VFS-BENCH GATE
+PASSED**. The `view/read` ceiling in `tests/perf-baseline.json` is lowered
+from **21 to 18**; the others are unchanged.
+
+### Tests
+
+- fs-core `memcache` (10): shared bytes on a hit (same pointer), budget never
+  exceeded under churn, oversize/empty/zero-budget not admitted, removal,
+  probation FIFO, **bursty 16×-budget scan leaves a promoted hot set resident**,
+  no promotion without uncorrelated reuse, ghost re-admission promotes, stale
+  queue compaction, concurrent hits/admissions/removals keep exact accounting.
+- fs-core `cache` (9 new):
+  - served from memory without re-reading (the disk file is corrupted after
+    admission and the read still hits);
+  - **corrupt disk copy neither served nor cached** (same length, one bit off);
+  - keyed/E2E cache verifies with the keyed hash before admitting;
+  - remove / prune / out-of-band delete / disk eviction each drop the memory
+    copy;
+  - disk eviction spares memory-resident chunks;
+  - a plain `get` miss is not admitted;
+  - tier off = unchanged;
+  - **16 concurrent first reads → exactly one load** (20 rounds of 4 MiB
+    chunks);
+  - memory ⊆ disk under concurrent read/remove/prune/evicting inserts.
+- engine `view::memcache_tests` (7):
+  - 128 KiB sequential reads load each chunk once and the rest hit, as
+    zero-copy slices, plus a cross-chunk/EOF read; plain and **E2E**
+    (keyed cache + encrypted store); the cache dir holds only the chunk
+    files;
+  - corrupt disk copy → refetched from the store (decrypted for E2E), never
+    served; plain and E2E;
+  - `evict_cached` (the conformance kit's hook) and prune drop memory; plain
+    and E2E;
+  - a truncation's clipped read never touches the shared chunk (a twin file
+    with the same chunk still reads it whole, from memory).
+- `pending_row_tests` (every truncate/extend/fallocate shape) runs with the
+  memory tier on.
+- `profile` default/knob test.
+- `control::ops` test: `node.status` cache section, `/metrics` lines,
+  `stats.subscribe` sample.
+- Results:
+  - `cargo test -p constellation-fs-core` 58 passed.
+  - `-p constellation-engine --lib` 330 passed, 2 ignored.
+  - `--test conformance` passed.
+  - `-p constellation-control` 121 passed (schema re-blessed).
+  - frontend-fuse `--lib` 18, `--test wire` 20.
+  - `cargo build --workspace`, `cargo clippy --workspace --all-targets -- -D
+    warnings`, `cargo fmt --all` clean.
+  - `make check-cross` exit 0 (only the known failures).
+
+### Harness (release binary, `--seed 7`)
+
+`CONSTELLATION_BIN=target/release/constellation`, `RUST_BACKTRACE` unset,
+docker S3. **All passed:**
+- reads and prefetch: `cold-cache`, `readahead`, `readahead-adaptive`,
+  `prefetch-fairness`, `scan-ahead`, `coop-cache-hit`, `fio-latency`,
+  `prefetch-abandon`, `prefetch-abandon-e2e`;
+- E2E: `e2e-basic`, `e2e-two-nodes`, `e2e-spilled-manifest`,
+  `e2e-decode-priority`, `distant-bigfile-stable-e2e`;
+- eviction and churn: `coop-exact-churn` (small caches evicting while peers
+  read), `gc-lifecycle`, `gc-dedup-race`, `gc-open-orphan-hold`;
+- `s3-outage` (cached reads while S3 is cut), `truncate-never-resurrects`;
+- `poison-record-isolation` (its injected chunk loss goes through
+  `DiskCache::remove`, which drops the memory copy);
+- `dedup-write-storm`.
+
+The RSS-bounded ones also pass, with the memory tier clamped to the small
+`--cache-size`: `big-file-write` (peak RSS 126 MiB, 64 MiB cache, 300 MiB
+file), `writeback-bigfile` (138 MiB, 32 MiB cache), `fallocate-sparse` (93 MiB).
+Not run here: the full workspace suite, the harness matrix and pjdfstest,
+which are the gate run's.

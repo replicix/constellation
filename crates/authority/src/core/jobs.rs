@@ -2046,6 +2046,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // Plan 31 C8 (`mode.rs`): a forward-only or suspended node closes
+        // some of the ways into holding the lease.
+        let admitted = self.mode.admit_acquire(reason, ask_handoff);
+        let ask_handoff = admitted.unwrap_or(false);
         self.job = Some(Job {
             what: What::Acquire {
                 reason,
@@ -2059,6 +2063,16 @@ impl Core {
         });
         if self.retired() {
             // Plan 30 §M10: admin `leave --node-id` retired this node.
+            self.finish_acquire(now, false, replica, out);
+            return;
+        }
+        if admitted.is_none() {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                reason,
+                suspended = self.mode.suspended,
+                "acquisition refused by the authority mode"
+            );
             self.finish_acquire(now, false, replica, out);
             return;
         }
@@ -2247,7 +2261,11 @@ impl Core {
                         ..
                     }
                 );
-                if !offered && !prev.wanted_by.contains(&self.cfg.node_id) {
+                // Plan 31 C8: a forward-only node never asks a live
+                // holder for the lease — a registration would make it
+                // hand over (`wants_handoff`).
+                if !offered && !self.mode.forwards() && !prev.wanted_by.contains(&self.cfg.node_id)
+                {
                     self.issue_s3(
                         S3Op::LeaseSwap {
                             lease: prev.wanting(self.cfg.node_id),

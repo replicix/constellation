@@ -31,8 +31,10 @@ pub(crate) fn touch_times_tx(
     Ok(())
 }
 
-/// `nlink += delta` (saturating at 0) plus a timestamp touch, in one
-/// re-encode of the `0x01` record.
+/// A *directory's* `nlink += delta` (saturating at 0) plus an mtime and
+/// ctime touch, in one re-encode of the `0x01` record: a directory's
+/// link count changes when a subdirectory (`..`) comes or goes, which is
+/// a change of its content.
 pub(crate) fn bump_nlink_tx(
     tx: &mut SingleWriterWriteTx,
     ns_ks: &SingleWriterTxKeyspace,
@@ -41,13 +43,43 @@ pub(crate) fn bump_nlink_tx(
     delta: i64,
     t: i64,
 ) -> Result<Option<InodeRecord>, MetaError> {
+    bump_nlink_touching(tx, ns_ks, dirty, ino, delta, t, true)
+}
+
+/// A name added to or removed from a *non-directory* (`link`, `unlink`
+/// or a rename over one of several names): `nlink += delta` and a ctime
+/// touch only. POSIX: a link count change is a status change; the file's
+/// data, and so its mtime, did not change (the directory gaining or
+/// losing the name gets both, through [`touch_times_tx`]).
+pub(crate) fn bump_file_nlink_tx(
+    tx: &mut SingleWriterWriteTx,
+    ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
+    ino: Ino,
+    delta: i64,
+    t: i64,
+) -> Result<Option<InodeRecord>, MetaError> {
+    bump_nlink_touching(tx, ns_ks, dirty, ino, delta, t, false)
+}
+
+fn bump_nlink_touching(
+    tx: &mut SingleWriterWriteTx,
+    ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
+    ino: Ino,
+    delta: i64,
+    t: i64,
+    mtime: bool,
+) -> Result<Option<InodeRecord>, MetaError> {
     let Some(mut rec) = ns::get_inode_record(tx, ns_ks, ino)? else {
         return Ok(None);
     };
     // Plan 30 §M12: an additive delta and a `max` time merge, both
     // commutative across the replay order.
     rec.attrs.nlink = (rec.attrs.nlink as i64 + delta).max(0) as u32;
-    rec.attrs.mtime_ns = rec.attrs.mtime_ns.max(t);
+    if mtime {
+        rec.attrs.mtime_ns = rec.attrs.mtime_ns.max(t);
+    }
     rec.attrs.ctime_ns = rec.attrs.ctime_ns.max(t);
     ns::put_inode_record(tx, ns_ks, dirty, ino, &rec)?;
     Ok(Some(rec))

@@ -1,0 +1,20 @@
+[package]
+name = "constellation-platform"
+description = "Host services behind one injectable bundle (plan 31 §3, §4): dirs, process facts, daemonizing, file locks, filesystem primitives, secrets, lifecycle events and the mount table, per OS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+constellation-types.workspace = true
+# Secrets (node key, E2E pins, S3 credentials) are wiped from memory when
+# dropped; portable, so the Windows library cross-check stays clean.
+zeroize = "1.9.0"
+
+# Only unix builds make raw system calls; the Windows/other stubs are pure
+# std, so `libc` must not be an unconditional dependency.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

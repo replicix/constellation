@@ -318,6 +318,33 @@ impl Pool {
         list.push(conn.weak_handle());
     }
 
+    /// Plan 31 C8: close every pooled and tracked connection.
+    async fn close_all(&self, why: &'static str) -> usize {
+        let slots: Vec<ConnectionSlot> =
+            self.connections.lock().unwrap().values().cloned().collect();
+        let mut closed = 0usize;
+        for slot in slots {
+            if let Some(conn) = slot.lock().await.take() {
+                if conn.close_reason().is_none() {
+                    conn.close(iroh::endpoint::VarInt::from_u32(0), why.as_bytes());
+                    closed += 1;
+                }
+            }
+        }
+        let tracked = std::mem::take(&mut *self.tracked.lock().unwrap());
+        for conn in tracked
+            .into_values()
+            .flatten()
+            .filter_map(|weak| weak.upgrade())
+        {
+            if conn.close_reason().is_none() {
+                conn.close(iroh::endpoint::VarInt::from_u32(0), why.as_bytes());
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     /// Drop `stable`'s connection from the pool (if it is still the one
     /// pooled for `id`) and close it, so requests still waiting on it
     /// fail now instead of at their own timeouts; then close every other
@@ -365,19 +392,69 @@ impl Pool {
 /// a peer that enrolled since the last registry read is admitted by the
 /// handler's refresh as before, and its restart, if any, is caught by
 /// the registry path (`Peers::refresh_registry` → `suspect_restart`).
+///
+/// Plan 31 C8: it is also where [`Admission`] is enforced — an inbound
+/// connection is refused right after its handshake while this endpoint is
+/// dial-only or quiesced, and an outbound one before any packet is sent
+/// while quiesced — so the refusal covers every ALPN (our requests and
+/// gossip's) with no change to either protocol.
 #[derive(Debug)]
 struct InboundWatch {
     pool: Weak<Pool>,
     allow: Weak<Mutex<Allowlist>>,
+    admission: Arc<Admission>,
 }
 
+/// Plan 31 C8: which connections this endpoint admits (`P2pMode::DialOnly`
+/// refuses inbound ones; a host suspension refuses inbound ones and every
+/// outbound dial but this node's own requests — gossip's). Plain atomics:
+/// read once per handshake.
+#[derive(Debug, Default)]
+struct Admission {
+    refuse_inbound: std::sync::atomic::AtomicBool,
+    refuse_gossip: std::sync::atomic::AtomicBool,
+}
+
+/// The QUIC close code an inbound connection is refused with while this
+/// endpoint does not accept (dial-only, or quiesced for a suspension).
+const NOT_ACCEPTING: u32 = 0x4e41; // "NA"
+
 impl iroh::endpoint::EndpointHooks for InboundWatch {
+    fn before_connect<'a>(
+        &'a self,
+        _remote_addr: &'a EndpointAddr,
+        alpn: &'a [u8],
+    ) -> impl std::future::Future<Output = iroh::endpoint::BeforeConnectOutcome> + Send + 'a {
+        let refuse = alpn != ALPN
+            && self
+                .admission
+                .refuse_gossip
+                .load(std::sync::atomic::Ordering::Relaxed);
+        std::future::ready(if refuse {
+            iroh::endpoint::BeforeConnectOutcome::Reject
+        } else {
+            iroh::endpoint::BeforeConnectOutcome::Accept
+        })
+    }
+
     fn after_handshake<'a>(
         &'a self,
         conn: &'a iroh::endpoint::Connection,
     ) -> impl std::future::Future<Output = iroh::endpoint::AfterHandshakeOutcome> + Send + 'a {
+        let inbound = conn.side() == iroh::endpoint::Side::Server;
+        if inbound
+            && self
+                .admission
+                .refuse_inbound
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let refused = iroh::endpoint::AfterHandshakeOutcome::Reject {
+                error_code: iroh::endpoint::VarInt::from_u32(NOT_ACCEPTING),
+                reason: b"not accepting connections (dial-only or suspended)".to_vec(),
+            };
+            return std::future::ready(refused);
+        }
         if let Some(pool) = self.pool.upgrade() {
-            let inbound = conn.side() == iroh::endpoint::Side::Server;
             // `contains`, not `check`: the handler's own `check` must be
             // the one that arms the miss-refresh cooldown.
             let known = !inbound
@@ -394,7 +471,7 @@ impl iroh::endpoint::EndpointHooks for InboundWatch {
                 }
             }
         }
-        async { iroh::endpoint::AfterHandshakeOutcome::accept() }
+        std::future::ready(iroh::endpoint::AfterHandshakeOutcome::accept())
     }
 }
 
@@ -924,6 +1001,8 @@ pub struct P2p {
     pool: Arc<Pool>,
     /// Active relay policy label (`disabled` / `default` / URL…).
     relay: String,
+    /// Plan 31 C8: dial-only and quiesced ([`InboundWatch`]).
+    admission: Arc<Admission>,
 }
 
 /// Derive the gossip topic. Prefers the `gossip_secret` from
@@ -955,6 +1034,7 @@ impl P2p {
         let allow = Arc::new(Mutex::new(Allowlist::new()));
         let relay_mode = relay.to_iroh()?;
         let relay_label = relay.label();
+        let admission = Arc::new(Admission::default());
         let endpoint = Endpoint::builder(presets::Minimal)
             // Registry remains the peer directory (DESIGN.md §8). Relays
             // are optional connectivity help when direct addrs cannot
@@ -966,6 +1046,7 @@ impl P2p {
             .hooks(InboundWatch {
                 pool: Arc::downgrade(&pool),
                 allow: Arc::downgrade(&allow),
+                admission: admission.clone(),
             })
             .bind()
             .await
@@ -983,7 +1064,59 @@ impl P2p {
             sender: Arc::new(tokio::sync::Mutex::new(None)),
             pool,
             relay: relay_label,
+            admission,
         })
+    }
+
+    /// Plan 31 C8: refuse (or accept again) every inbound connection, of
+    /// any ALPN, right after its handshake — `P2pMode::DialOnly`, and a
+    /// suspension. Connections already open are not touched (see
+    /// [`Self::close_all`]).
+    pub fn set_accept_inbound(&self, accept: bool) {
+        self.admission
+            .refuse_inbound
+            .store(!accept, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Plan 31 C8: refuse (or allow again) every outbound dial except
+    /// this node's own requests (our ALPN) — gossip's re-dials, while
+    /// suspended: the node leaves the mesh, but an op that still arrives
+    /// can forward to the holder directly.
+    pub fn set_gossip(&self, allow: bool) {
+        self.admission
+            .refuse_gossip
+            .store(!allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether inbound connections are admitted.
+    pub fn accepts_inbound(&self) -> bool {
+        !self
+            .admission
+            .refuse_inbound
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether gossip may dial out.
+    pub fn gossips(&self) -> bool {
+        !self
+            .admission
+            .refuse_gossip
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Plan 31 C8: close every connection this endpoint has, either side,
+    /// any ALPN, with a close frame, so each peer learns at once rather
+    /// than at its idle timeout (a peer's pooled request fails now and
+    /// its routing moves on). Returns how many were open.
+    pub async fn close_all(&self, why: &'static str) -> usize {
+        self.pool.close_all(why).await
+    }
+
+    /// Plan 31 C8 / plan 36 settled decision 20: the host says the
+    /// network changed (an interface, a route, Wi-Fi to cellular); iroh
+    /// re-probes its paths now instead of when it next notices.
+    pub async fn network_change(&self) {
+        self.endpoint.network_change().await;
     }
 
     /// Teach iroh how to reach a peer learned from the registry.

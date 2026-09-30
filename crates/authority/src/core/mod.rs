@@ -54,6 +54,7 @@ mod inbox;
 mod jobs;
 mod lease;
 mod locks;
+mod mode;
 mod placement;
 mod promise;
 mod readindex;
@@ -68,10 +69,11 @@ use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_meta::Rid;
 use constellation_store_s3::inbox::InboxKey;
+use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::AckView;
-pub use client::{meta_errno, ClientPhase};
+pub use client::ClientPhase;
 pub use delegate::{DelegKind, DelegView, RecallPhase};
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
@@ -82,6 +84,7 @@ pub use inbox::InboxView;
 pub use jobs::JobKind;
 pub use lease::{backup_claim_grace_ms, LeaseState, PendingGate, Plan};
 pub use locks::LockView;
+pub use mode::AuthorityMode;
 pub use promise::{lease_may_carry, resolve_epoch_claims, EpochClaimView};
 pub use readindex::ReadView;
 pub use stream::StreamView;
@@ -106,6 +109,10 @@ pub struct Config {
     pub handoff_pause_ms: u64,
     /// `CONSTELLATION_FORWARD`.
     pub forwarding: bool,
+    /// Plan 31 C8: the engine profile's `LeaseMode::ForwardOnly` — the
+    /// initial [`AuthorityMode::forward_only`] (`Control::Authority`
+    /// changes it at run time).
+    pub forward_only: bool,
     /// P2P enabled (a handoff can be asked for over the network).
     pub p2p: bool,
     pub forward_timeout_ms: u64,
@@ -367,6 +374,7 @@ impl Config {
             wanted_grace_ms: 5_000,
             handoff_pause_ms: 2_000,
             forwarding: true,
+            forward_only: false,
             p2p: true,
             forward_timeout_ms: 500,
             forward_retries: 3,
@@ -1167,6 +1175,8 @@ pub struct Core {
     pl: placement::PlacementState,
     /// Plan 30 §M14.
     pub(crate) lk: locks::LockState,
+    /// Plan 31 C8: forward-only and suspended (`mode.rs`).
+    pub(crate) mode: AuthorityMode,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
     last_now: Ms,
     stopped: bool,
@@ -1176,7 +1186,11 @@ pub struct Core {
 impl Core {
     pub fn new(cfg: Config) -> Self {
         Self {
-            lease: LeaseState::default(),
+            lease: {
+                let mut lease = LeaseState::default();
+                lease.release_when_idle = cfg.forward_only;
+                lease
+            },
             ship: ShipState::default(),
             next_op: 1,
             next_timer: 1,
@@ -1225,6 +1239,10 @@ impl Core {
             dl: delegate::DelegationState::default(),
             pl: placement::PlacementState::default(),
             lk: locks::LockState::default(),
+            mode: AuthorityMode {
+                forward_only: cfg.forward_only,
+                suspended: false,
+            },
             last_now: Ms(0),
             stopped: false,
             stats: Stats::default(),
@@ -1238,6 +1256,11 @@ impl Core {
 
     pub fn node_id(&self) -> NodeId {
         self.cfg.node_id
+    }
+
+    /// Plan 31 C8: forward-only and suspended, for `status`.
+    pub fn authority_mode(&self) -> AuthorityMode {
+        self.mode
     }
 
     /// The lease this node believes it holds, for `status`.
@@ -1975,6 +1998,43 @@ impl Core {
                     result: Ok(ControlOk::Done),
                 });
             }
+            Control::Authority {
+                forward_only,
+                suspended,
+            } => {
+                self.set_authority_mode(
+                    now,
+                    AuthorityMode {
+                        forward_only,
+                        suspended,
+                    },
+                    out,
+                );
+                out.push(Action::ControlDone {
+                    op,
+                    result: Ok(ControlOk::Done),
+                });
+            }
+        }
+    }
+
+    /// Plan 31 C8 (`mode.rs`): a forward-only holder gives the lease back
+    /// once idle (the round's release check, `LeaseState::wants_handoff`);
+    /// a round soon lets it do so without waiting for the next poll.
+    fn set_authority_mode(&mut self, now: Ms, mode: AuthorityMode, out: &mut Vec<Action>) {
+        if mode == self.mode {
+            return;
+        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            forward_only = mode.forward_only,
+            suspended = mode.suspended,
+            "authority mode"
+        );
+        self.mode = mode;
+        self.lease.release_when_idle = mode.forwards();
+        if mode.forwards() && self.lease.held.is_some() {
+            self.nudge(now, out);
         }
     }
 
@@ -2113,7 +2173,7 @@ impl Core {
         if state.frozen && !before.frozen {
             // A frozen epoch refuses writes (EROFS): every op waiting for
             // the lease hears it now rather than at its deadline.
-            self.refuse_waiting_for_lease(now, libc::EROFS, replica, out);
+            self.refuse_waiting_for_lease(now, Code::ReadOnly, replica, out);
         }
     }
 

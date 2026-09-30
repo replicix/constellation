@@ -74,3 +74,18 @@ jobs:
 
       - name: Run all fault-injection scenarios
         run: cargo run --release -q -p constellation-harness -- run
+
+  cross-check:
+    name: Darwin + Windows-library type-check from Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-pc-windows-gnu
+      # rust-toolchain.toml pins the channel; make sure the pinned toolchain
+      # (not only `stable`) has the cross targets.
+      - run: rustup target add aarch64-apple-darwin x86_64-pc-windows-gnu
+      - uses: mlugg/setup-zig@v2
+      - uses: Swatinem/rust-cache@v2
+      - run: make check-cross

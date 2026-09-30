@@ -129,7 +129,8 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
         m.symlink(dir, "s", "t", 0, 0).unwrap()
     });
     assert_captured(&meta, "mknod", |m| {
-        m.mknod(dir, "n", InodeKind::Fifo, 0o600, 0, 0, 0).unwrap()
+        m.mknod(dir, "n", InodeKind::Fifo, 0o600, 0, 0, Default::default())
+            .unwrap()
     });
     assert_captured(&meta, "link", |m| m.link(f1, dir, "l2").unwrap());
     assert_captured(&meta, "unlink (last link)", |m| {
@@ -206,7 +207,7 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
     });
     assert_captured(&meta, "publish_file", |m| {
         let ino = m.allocate_ino(ROOT_INO).unwrap();
-        m.publish_file(ROOT_INO, "pub", ino, 0o644, 0, 0, 1, &[9], 1, &[])
+        m.publish_file(ROOT_INO, "pub", ino, 0o644, 0, 0, 1, &[9], 1, &[], false)
             .unwrap()
     });
     assert_captured(&meta, "execute_mutate with a rid", |m| {
@@ -519,6 +520,7 @@ fn a_cut_never_splits_a_transaction() {
             manifest: b"M".to_vec(),
             size: 1,
             xattrs: vec![("user.x".into(), b"y".to_vec())],
+            noreplace: false,
         },
         Some(rid(2)),
     )

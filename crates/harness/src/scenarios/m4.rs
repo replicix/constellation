@@ -23,7 +23,7 @@ fn list_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
             url.push_str(&urlencode(t));
         }
         let mut body = String::new();
-        ureq::get(&url)
+        crate::s3auth::get(&url)
             .call()
             .with_context(|| format!("listing {prefix}"))?
             .into_reader()
@@ -81,7 +81,7 @@ fn logged_completions(
             continue;
         };
         let mut compressed = Vec::new();
-        match ureq::get(&raw_key(endpoint, &key)).call() {
+        match crate::s3auth::get(&raw_key(endpoint, &key)).call() {
             Ok(resp) => {
                 resp.into_reader().read_to_end(&mut compressed)?;
             }
@@ -506,8 +506,9 @@ pub(super) fn poison_record_isolation(seed: u64) -> Result<()> {
     on_d?;
 
     // Drop it.
-    let reply = a.control(&serde_json::json!({ "cmd": "drop_held", "ino": ino }))?;
-    anyhow::ensure!(reply["resp"] == "ok", "drop-held failed: {reply}");
+    let reply = a
+        .control("locks.drop_held", serde_json::json!({ "ino": ino }))
+        .context("drop-held failed")?;
     eprintln!("    poison-record-isolation: {}", reply["detail"]);
     eventually(
         "the chmod replays and reaches B",
@@ -687,8 +688,8 @@ pub(super) fn unmount_with_held_records(seed: u64) -> Result<()> {
         std::fs::read(a.mnt.join("offline"))? == offline,
         "the write made while S3 was down survived the stalled unmount"
     );
-    let reply = a.control(&serde_json::json!({ "cmd": "drop_held", "ino": ino }))?;
-    anyhow::ensure!(reply["resp"] == "ok", "drop-held failed: {reply}");
+    a.control("locks.drop_held", serde_json::json!({ "ino": ino }))
+        .context("drop-held failed")?;
     eventually("A's journal drains", Duration::from_secs(60), || {
         journal_drained(&a)
     })?;

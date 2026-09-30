@@ -183,7 +183,8 @@ checks:
 
 An executed rid is never executed again. A definitive refusal
 (`Errno`, `Exists`) is an outcome too: since plan 30 M9 the sequencer
-journals it as `Refused { rid, errno }`, which ships like `Completed`
+journals it as `Refused { rid, code }` (the portable `Code`, carried as
+its own wire number rather than an OS errno), which ships like `Completed`
 and enters `completed` on every replica, so a second execution of the
 rid (a retry after a lost reply, a deposed holder's replay, an inbox
 drain) answers the same errno instead of re-evaluating the op. A
@@ -627,7 +628,7 @@ batch before the overwrite deduplicates the copies.
    it).
 3. **Outcomes ride the log.** An executed op ships its records,
    `Completed { rid }` and an `InboxAck` (its batch position); a refused
-   one ships `Refused { rid, errno }` plus the ack. The requester, which
+   one ships `Refused { rid, code }` plus the ack. The requester, which
    tails the log anyway, returns to the FUSE caller when the outcome is
    applied — success once its own records are in the replica
    (read-your-write holds), or the errno. A stale manifest base comes

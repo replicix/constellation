@@ -287,7 +287,7 @@ timeout.
 | `mtree_record` | 21.1M | 564 | clean |
 | `store_object` | 25.6M | 140 | clean |
 | `store_inbox_pack` | 1.4M | 235 | clean |
-| `api_request` | 9.9M | 7591 | clean |
+| `api_request` (now `control_request`, plan 31 C5) | 9.9M | 7591 | clean |
 | `store_control_json` (round two) | 4.2M | 14454 | clean (meta.json, leases, designations, snapshots, GC pointer, registry, heartbeat, delegation table) |
 | `meta_blobs` | 9.1M | 10382 | clean |
 

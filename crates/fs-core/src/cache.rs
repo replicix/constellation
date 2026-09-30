@@ -5,15 +5,26 @@
 //! hex byte pairs), written temp-name + atomic rename. Accounting is in
 //! memory and rebuilt by a directory scan at startup; every read verifies
 //! the blake3 hash and drops corrupt files (they are refetched upstream).
+//!
+//! Optionally ([`DiskCache::with_memory_cache`]) verified contents are
+//! also kept in memory ([`crate::memcache`]): [`DiskCache::get_shared`]
+//! serves a resident chunk without touching the disk or re-hashing, and
+//! loads a missing one once however many readers ask for it at the same
+//! time. Memory entries are a subset of the disk entries at all times:
+//! every path that drops a disk entry drops its memory copy under the
+//! same state-lock hold, and a load is admitted only if its disk entry is
+//! still there.
 
 use crate::chunk::ChunkHash;
 use crate::error::CoreError;
+use crate::memcache::{MemCache, MemCacheStats};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,12 +166,61 @@ impl State {
     }
 }
 
+/// One in-progress load of a chunk into memory, which concurrent readers
+/// of the same chunk wait for instead of loading it again.
+#[derive(Default)]
+struct Flight {
+    outcome: Mutex<Option<FlightOutcome>>,
+    done: Condvar,
+}
+
+#[derive(Clone)]
+enum FlightOutcome {
+    /// The verified bytes, or `None`: absent (or corrupt, and dropped).
+    Loaded(Option<Bytes>),
+    /// The load failed (an I/O error, a panic): load it yourself.
+    Failed,
+}
+
+impl Flight {
+    fn wait(&self) -> FlightOutcome {
+        let mut outcome = self.outcome.lock().unwrap();
+        loop {
+            if let Some(outcome) = &*outcome {
+                return outcome.clone();
+            }
+            outcome = self.done.wait(outcome).unwrap();
+        }
+    }
+}
+
+/// The loading reader's registration: ends the flight (as failed, if
+/// the load did not report an outcome — an error or a panic) when dropped.
+struct FlightLead<'a> {
+    flights: &'a Mutex<HashMap<ChunkHash, Arc<Flight>>>,
+    hash: ChunkHash,
+    flight: Arc<Flight>,
+    outcome: Option<FlightOutcome>,
+}
+
+impl Drop for FlightLead<'_> {
+    fn drop(&mut self) {
+        self.flights.lock().unwrap().remove(&self.hash);
+        *self.flight.outcome.lock().unwrap() =
+            Some(self.outcome.take().unwrap_or(FlightOutcome::Failed));
+        self.flight.done.notify_all();
+    }
+}
+
 /// Disk-backed chunk cache with budget accounting.
 pub struct DiskCache {
     root: PathBuf,
     budget: u64,
     addressing_key: Option<Box<[u8; 32]>>,
     state: Mutex<State>,
+    /// Verified contents in memory (see the module doc); `None`: off.
+    memory: Option<MemCache>,
+    flights: Mutex<HashMap<ChunkHash, Arc<Flight>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,9 +311,37 @@ impl DiskCache {
             budget,
             addressing_key,
             state: Mutex::new(State::new(digest_limit.max(1))),
+            memory: None,
+            flights: Mutex::new(HashMap::new()),
         };
         cache.rescan()?;
         Ok(cache)
+    }
+
+    /// Keep up to `budget` bytes of verified chunk contents in memory
+    /// ([`crate::memcache`]); `0` leaves the memory tier off (every read
+    /// loads and verifies the disk copy, as without it).
+    pub fn with_memory_cache(mut self, budget: u64) -> Self {
+        self.memory = (budget > 0).then(|| MemCache::new(budget));
+        self
+    }
+
+    /// The memory tier's counters, if it is on.
+    pub fn memory_stats(&self) -> Option<MemCacheStats> {
+        self.memory.as_ref().map(MemCache::stats)
+    }
+
+    /// Whether `hash` is resident in the memory tier (tests, diagnostics).
+    pub fn memory_contains(&self, hash: &ChunkHash) -> bool {
+        self.memory.as_ref().is_some_and(|m| m.contains(hash))
+    }
+
+    /// Drop `hash`'s memory copy (its disk entry is going). Called under
+    /// the state lock; the bytes go to `dropped`, freed after it.
+    fn drop_memory(&self, hash: &ChunkHash, dropped: &mut Vec<Bytes>) {
+        if let Some(bytes) = self.memory.as_ref().and_then(|m| m.remove(hash)) {
+            dropped.push(bytes);
+        }
     }
 
     fn rescan(&self) -> Result<(), CoreError> {
@@ -294,9 +382,17 @@ impl DiskCache {
         Ok(())
     }
 
+    /// `<root>/ab/cd/abcd…`, built in one allocation (a lookup's path is
+    /// on every cached read).
     fn path_for(&self, hash: &ChunkHash) -> PathBuf {
-        let hex = hash.to_hex();
-        self.root.join(&hex[0..2]).join(&hex[2..4]).join(hex)
+        let hex = hash.hex_ascii();
+        let hex = std::str::from_utf8(&hex).expect("ascii");
+        let mut path = PathBuf::with_capacity(self.root.as_os_str().len() + 72);
+        path.push(&self.root);
+        path.push(&hex[0..2]);
+        path.push(&hex[2..4]);
+        path.push(hex);
+        path
     }
 
     fn hash(&self, data: &[u8]) -> ChunkHash {
@@ -359,7 +455,96 @@ impl DiskCache {
 
     /// Read a chunk, bumping its LRU position. Verifies the hash; corrupt
     /// files are removed and reported as absent (caller refetches).
+    ///
+    /// A copy of the memory tier's verified bytes when resident; a miss
+    /// is not admitted (this is the path of uploads, peer serving and
+    /// pins, which would only crowd reads out of memory: reads use
+    /// [`Self::get_shared`]).
     pub fn get(&self, hash: &ChunkHash) -> Result<Option<Vec<u8>>, CoreError> {
+        if let Some(bytes) = self.memory.as_ref().and_then(|m| m.get(hash)) {
+            return Ok(Some(bytes.to_vec()));
+        }
+        self.get_disk(hash)
+    }
+
+    /// Read a chunk for a file read: shared, verified bytes. A resident
+    /// copy is served from memory (no disk read, no hash); otherwise the
+    /// disk copy is loaded and verified once — concurrent readers of the
+    /// same chunk wait for that one load — and admitted to memory. Absent
+    /// or corrupt (dropped) chunks are `None`, exactly like [`Self::get`].
+    pub fn get_shared(&self, hash: &ChunkHash) -> Result<Option<Bytes>, CoreError> {
+        let Some(memory) = &self.memory else {
+            return Ok(self.get_disk(hash)?.map(Bytes::from));
+        };
+        if let Some(bytes) = memory.get(hash) {
+            return Ok(Some(bytes));
+        }
+        if !self.contains(hash) {
+            // Cold: nothing to load or wait for.
+            return Ok(None);
+        }
+        let flight = {
+            let mut flights = self.flights.lock().unwrap();
+            match flights.get(hash) {
+                Some(flight) => Err(flight.clone()),
+                None => {
+                    let flight = Arc::new(Flight::default());
+                    flights.insert(*hash, flight.clone());
+                    Ok(flight)
+                }
+            }
+        };
+        let flight = match flight {
+            Ok(flight) => flight,
+            Err(leader) => {
+                memory.note_coalesced();
+                return match leader.wait() {
+                    FlightOutcome::Loaded(bytes) => Ok(bytes),
+                    FlightOutcome::Failed => self.load_shared(memory, hash),
+                };
+            }
+        };
+        let mut lead = FlightLead {
+            flights: &self.flights,
+            hash: *hash,
+            flight,
+            outcome: None,
+        };
+        // A load that finished between the miss above and this flight's
+        // registration has admitted the chunk already.
+        if let Some(bytes) = memory.get(hash) {
+            lead.outcome = Some(FlightOutcome::Loaded(Some(bytes.clone())));
+            return Ok(Some(bytes));
+        }
+        let loaded = self.load_shared(memory, hash)?;
+        lead.outcome = Some(FlightOutcome::Loaded(loaded.clone()));
+        Ok(loaded)
+    }
+
+    /// Load and verify the disk copy, and admit it to memory if its disk
+    /// entry is still there (checked under the state lock, which every
+    /// removal holds while it drops the memory copy: an entry removed
+    /// meanwhile is not resurrected in memory).
+    fn load_shared(&self, memory: &MemCache, hash: &ChunkHash) -> Result<Option<Bytes>, CoreError> {
+        let Some(data) = self.get_disk(hash)? else {
+            return Ok(None);
+        };
+        memory.note_miss();
+        let bytes = Bytes::from(data);
+        let evicted = {
+            let st = self.state.lock().unwrap();
+            if st.entries.contains_key(hash) {
+                memory.insert(*hash, bytes.clone())
+            } else {
+                Vec::new()
+            }
+        };
+        drop(evicted);
+        Ok(Some(bytes))
+    }
+
+    /// [`Self::get`] from the disk copy only.
+    fn get_disk(&self, hash: &ChunkHash) -> Result<Option<Vec<u8>>, CoreError> {
         {
             let mut st = self.state.lock().unwrap();
             if !st.entries.contains_key(hash) {
@@ -440,6 +625,7 @@ impl DiskCache {
         fs::create_dir_all(path.parent().unwrap())?;
         drop(spill.file.take());
 
+        let mut dropped = Vec::new();
         let victims = {
             let mut st = self.state.lock().unwrap();
             if let Some((old, now)) = st.entries.get_mut(hash).map(|entry| {
@@ -450,9 +636,10 @@ impl DiskCache {
                 st.note(*hash, Some(old), Some(now));
                 return Ok(());
             }
-            let victims = plan_eviction(&mut st, size, self.budget)?;
+            let victims = plan_eviction(&mut st, size, self.budget, self.memory.as_ref())?;
             for (victim, _) in &victims {
                 st.note(*victim, Some(ChunkState::Clean), None);
+                self.drop_memory(victim, &mut dropped);
             }
             st.used += size;
             st.clock += 1;
@@ -524,13 +711,15 @@ impl DiskCache {
         true
     }
 
-    /// Remove a chunk from cache and disk.
+    /// Remove a chunk from cache and disk (and memory).
     pub fn remove(&self, hash: &ChunkHash) -> Result<(), CoreError> {
+        let mut dropped = Vec::new();
         let mut st = self.state.lock().unwrap();
         if let Some(e) = st.entries.remove(hash) {
             st.used -= e.size;
             st.note(*hash, Some(e.state), None);
         }
+        self.drop_memory(hash, &mut dropped);
         match fs::remove_file(self.path_for(hash)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -562,17 +751,12 @@ impl DiskCache {
     /// left. Digest remove events are recorded for cooperative-cache
     /// republish.
     pub fn prune_to(&self, target_used: u64) -> Result<PruneReport, CoreError> {
+        let mut dropped = Vec::new();
         let (victims, report) = {
             let mut st = self.state.lock().unwrap();
             let before = st.used;
             let need = st.used.saturating_sub(target_used);
-            let mut clean: Vec<(ChunkHash, u64, u64)> = st
-                .entries
-                .iter()
-                .filter(|(_, e)| e.state == ChunkState::Clean)
-                .map(|(h, e)| (*h, e.size, e.atime))
-                .collect();
-            clean.sort_by_key(|(_, _, atime)| *atime);
+            let clean = clean_by_recency(&st, self.memory.as_ref());
             let mut freed = 0u64;
             let mut victims = Vec::new();
             for (h, sz, _) in clean {
@@ -586,6 +770,7 @@ impl DiskCache {
                 st.entries.remove(h);
                 st.used -= sz;
                 st.note(*h, Some(ChunkState::Clean), None);
+                self.drop_memory(h, &mut dropped);
             }
             let pinned: u64 = st
                 .entries
@@ -614,11 +799,13 @@ impl DiskCache {
     }
 
     fn forget(&self, hash: &ChunkHash) {
+        let mut dropped = Vec::new();
         let mut st = self.state.lock().unwrap();
         if let Some(e) = st.entries.remove(hash) {
             st.used -= e.size;
             st.note(*hash, Some(e.state), None);
         }
+        self.drop_memory(hash, &mut dropped);
     }
 
     /// Read a chunk only if it is clean or pinned. Dirty (unpublished)
@@ -694,23 +881,37 @@ fn merge_state(old: ChunkState, new: ChunkState) -> ChunkState {
     }
 }
 
+/// Clean entries, least recently used first. A chunk resident in the
+/// memory tier counts as more recent than any that is not: its reads are
+/// served from memory and so never bump its disk `atime`, and it is by
+/// construction among the most recently read (the memory budget is a
+/// small fraction of the disk's).
+fn clean_by_recency(st: &State, memory: Option<&MemCache>) -> Vec<(ChunkHash, u64, u64)> {
+    let mut clean: Vec<(ChunkHash, u64, u64, bool)> = st
+        .entries
+        .iter()
+        .filter(|(_, e)| e.state == ChunkState::Clean)
+        .map(|(h, e)| (*h, e.size, e.atime, memory.is_some_and(|m| m.contains(h))))
+        .collect();
+    clean.sort_by_key(|(_, _, atime, resident)| (*resident, *atime));
+    clean
+        .into_iter()
+        .map(|(h, size, atime, _)| (h, size, atime))
+        .collect()
+}
+
 /// Pick clean LRU victims to fit `size`; error if impossible.
 fn plan_eviction(
     st: &mut State,
     size: u64,
     budget: u64,
+    memory: Option<&MemCache>,
 ) -> Result<Vec<(ChunkHash, u64)>, CoreError> {
     if st.used + size <= budget {
         return Ok(Vec::new());
     }
     let need = st.used + size - budget;
-    let mut clean: Vec<(ChunkHash, u64, u64)> = st
-        .entries
-        .iter()
-        .filter(|(_, e)| e.state == ChunkState::Clean)
-        .map(|(h, e)| (*h, e.size, e.atime))
-        .collect();
-    clean.sort_by_key(|(_, _, atime)| *atime);
+    let clean = clean_by_recency(st, memory);
     let mut freed = 0u64;
     let mut victims = Vec::new();
     for (h, sz, _) in clean {
@@ -761,6 +962,7 @@ fn read_files(path: &Path) -> Result<Vec<PathBuf>, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn chunk(i: u8, len: usize) -> (ChunkHash, Vec<u8>) {
@@ -776,6 +978,19 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get(&h).unwrap(), Some(d));
         assert_eq!(c.usage().used, 100);
+    }
+
+    #[test]
+    fn a_chunk_lives_at_its_two_level_hex_path() {
+        // The on-disk layout survives restarts (and upgrades): unchanged.
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let (h, d) = chunk(9, 10);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        let hex = h.to_hex();
+        let expected = dir.path().join(&hex[0..2]).join(&hex[2..4]).join(&hex);
+        assert_eq!(c.path_for(&h), expected);
+        assert_eq!(std::fs::read(expected).unwrap(), d);
     }
 
     #[cfg(unix)]
@@ -1095,6 +1310,275 @@ mod tests {
             assert_eq!(c.state_of(&hash), Some(ChunkState::Dirty), "round {round}");
         }
         assert_eq!(c.dirty_chunks().len(), rounds as usize);
+    }
+
+    // ---- the memory tier (`with_memory_cache`, `get_shared`) ----
+
+    fn file_of(dir: &TempDir, h: &ChunkHash) -> PathBuf {
+        let hex = h.to_hex();
+        dir.path().join(&hex[0..2]).join(&hex[2..4]).join(&hex)
+    }
+
+    #[test]
+    fn a_resident_chunk_is_served_without_rereading_the_disk() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let (h, d) = chunk(1, 4096);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert!(!c.memory_contains(&h), "a write is not admitted");
+        let first = c.get_shared(&h).unwrap().unwrap();
+        assert_eq!(first, d);
+        assert!(c.memory_contains(&h));
+        // Were the disk copy re-read (and re-verified), this would now be
+        // a corrupt chunk: dropped, and the read a miss.
+        fs::write(file_of(&dir, &h), b"garbage").unwrap();
+        let second = c.get_shared(&h).unwrap().unwrap();
+        assert_eq!(second.as_ptr(), first.as_ptr(), "the same shared copy");
+        assert_eq!(
+            c.get(&h).unwrap(),
+            Some(d),
+            "`get` copies out of memory too"
+        );
+        let stats = c.memory_stats().unwrap();
+        assert_eq!((stats.misses, stats.hits, stats.entries), (1, 2, 1));
+    }
+
+    #[test]
+    fn a_corrupt_disk_copy_is_neither_served_nor_cached() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let (h, d) = chunk(2, 4096);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        let mut bad = d.clone();
+        bad[100] ^= 1; // same length, one bit off
+        fs::write(file_of(&dir, &h), &bad).unwrap();
+        assert_eq!(c.get_shared(&h).unwrap(), None);
+        assert!(!c.memory_contains(&h), "unverified bytes were cached");
+        assert!(!c.contains(&h), "the corrupt disk entry is dropped");
+        assert_eq!(c.memory_stats().unwrap().used_bytes, 0);
+        // Refetched and inserted again: served, and cached, normally.
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        assert!(c.memory_contains(&h));
+    }
+
+    #[test]
+    fn a_keyed_e2e_cache_verifies_before_admitting() {
+        let dir = TempDir::new().unwrap();
+        let key = [7u8; 32];
+        let c = DiskCache::open_keyed(dir.path(), 1 << 20, key)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let d = vec![3u8; 4096];
+        let h = ChunkHash::keyed(&key, &d);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        assert!(c.memory_contains(&h));
+        // A second keyed chunk whose file is swapped for bytes that match
+        // only the *plain* hash: the keyed check refuses it.
+        let d2 = vec![4u8; 4096];
+        let h2 = ChunkHash::keyed(&key, &d2);
+        c.insert(&h2, &d2, ChunkState::Clean).unwrap();
+        fs::write(file_of(&dir, &h2), &d).unwrap();
+        assert_eq!(c.get_shared(&h2).unwrap(), None);
+        assert!(!c.memory_contains(&h2));
+    }
+
+    #[test]
+    fn dropping_the_disk_entry_drops_the_memory_copy() {
+        let dir = TempDir::new().unwrap();
+        // Disk room for three 100-byte chunks.
+        let c = DiskCache::open(dir.path(), 300)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let load = |i: u8| {
+            let (h, d) = chunk(i, 100);
+            c.insert(&h, &d, ChunkState::Clean).unwrap();
+            c.get_shared(&h).unwrap().unwrap();
+            assert!(c.memory_contains(&h));
+            h
+        };
+        // remove
+        let h = load(1);
+        c.remove(&h).unwrap();
+        assert!(!c.memory_contains(&h));
+        // prune
+        let h = load(2);
+        c.prune_to(0).unwrap();
+        assert!(!c.memory_contains(&h));
+        // removed behind the cache's back, then noticed by a disk read
+        let h = load(3);
+        fs::remove_file(file_of(&dir, &h)).unwrap();
+        drop(c.memory.as_ref().unwrap().remove(&h)); // force the disk path
+        assert_eq!(c.get_shared(&h).unwrap(), None);
+        assert!(!c.contains(&h) && !c.memory_contains(&h));
+        // disk eviction: fill the disk budget with resident chunks, then
+        // one more; the victim leaves memory with its disk entry
+        let hs: Vec<_> = (10..13).map(load).collect();
+        let (h4, d4) = chunk(20, 100);
+        c.insert(&h4, &d4, ChunkState::Clean).unwrap();
+        for h in &hs {
+            assert_eq!(c.contains(h), c.memory_contains(h), "{h:?}");
+        }
+        assert_eq!(hs.iter().filter(|h| c.contains(h)).count(), 2);
+        assert_eq!(c.memory_stats().unwrap().entries, 2);
+    }
+
+    #[test]
+    fn disk_eviction_spares_memory_resident_chunks() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 250)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let (h1, d1) = chunk(1, 100);
+        let (h2, d2) = chunk(2, 100);
+        c.insert(&h1, &d1, ChunkState::Clean).unwrap();
+        c.insert(&h2, &d2, ChunkState::Clean).unwrap();
+        c.get_shared(&h1).unwrap(); // resident in memory
+        c.get(&h2).unwrap(); // a disk read: h2's atime is now the newest
+        for _ in 0..3 {
+            c.get_shared(&h1).unwrap(); // memory hits: no disk atime bump
+        }
+        let (h3, d3) = chunk(3, 100);
+        c.insert(&h3, &d3, ChunkState::Clean).unwrap();
+        assert!(
+            c.contains(&h1),
+            "the hot, memory-resident chunk was evicted"
+        );
+        assert!(!c.contains(&h2));
+    }
+
+    #[test]
+    fn a_plain_get_miss_is_not_admitted() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let (h, d) = chunk(1, 4096);
+        c.insert(&h, &d, ChunkState::Dirty).unwrap();
+        assert_eq!(c.get(&h).unwrap(), Some(d.clone()));
+        assert!(!c.memory_contains(&h));
+        // A read (here: a writer reading its own sealed chunk) admits.
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        assert!(c.memory_contains(&h));
+    }
+
+    #[test]
+    fn with_the_memory_tier_off_reads_are_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(0);
+        let (h, d) = chunk(1, 4096);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        assert!(c.memory_stats().is_none());
+        assert!(!c.memory_contains(&h));
+        let (absent, _) = chunk(2, 10);
+        assert_eq!(c.get_shared(&absent).unwrap(), None);
+    }
+
+    /// Concurrent first reads of one chunk load and verify it once.
+    #[test]
+    fn concurrent_first_reads_load_once() {
+        let dir = TempDir::new().unwrap();
+        let c = Arc::new(
+            DiskCache::open(dir.path(), 64 << 20)
+                .unwrap()
+                .with_memory_cache(64 << 20),
+        );
+        let threads = 16;
+        for round in 0..20u8 {
+            let (h, d) = chunk(round, 4 << 20);
+            c.insert(&h, &d, ChunkState::Clean).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(threads));
+            let before = c.memory_stats().unwrap();
+            let readers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (c, barrier) = (c.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        c.get_shared(&h).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            for r in readers {
+                assert_eq!(r.join().unwrap().len(), d.len());
+            }
+            let after = c.memory_stats().unwrap();
+            assert_eq!(after.misses - before.misses, 1, "round {round}: one load");
+            assert_eq!(
+                (after.hits - before.hits) + (after.coalesced - before.coalesced),
+                threads as u64 - 1,
+                "round {round}: every other reader hit or waited"
+            );
+        }
+    }
+
+    /// Memory entries are always a subset of the disk entries, under
+    /// concurrent reads, removals, prunes and evicting inserts.
+    #[test]
+    fn memory_never_outlives_the_disk_entry() {
+        let dir = TempDir::new().unwrap();
+        let c = Arc::new(
+            DiskCache::open(dir.path(), 40 * 256)
+                .unwrap()
+                .with_memory_cache(16 * 256),
+        );
+        let data = |i: u32| {
+            let mut d = format!("chunk {i} ").into_bytes();
+            d.resize(256, b'z');
+            d
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers: Vec<_> = (0..6u32)
+            .map(|t| {
+                let (c, stop) = (c.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut i = t;
+                    while !stop.load(Ordering::Relaxed) {
+                        let d = data(i % 97);
+                        let h = ChunkHash::of(&d);
+                        match i % 7 {
+                            0 => c.remove(&h).unwrap(),
+                            1 if t == 0 => {
+                                c.prune_to(20 * 256).unwrap();
+                            }
+                            1..=3 => {
+                                let _ = c.insert(&h, &d, ChunkState::Clean);
+                            }
+                            _ => {
+                                if let Some(got) = c.get_shared(&h).unwrap() {
+                                    assert_eq!(got, d);
+                                }
+                            }
+                        }
+                        i = i.wrapping_add(13);
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        let stats = c.memory_stats().unwrap();
+        assert!(stats.hits > 0 && stats.misses > 0, "{stats:?}");
+        assert!(stats.used_bytes <= stats.budget_bytes);
+        let mut resident = 0;
+        for i in 0..97 {
+            let h = ChunkHash::of(&data(i));
+            if c.memory_contains(&h) {
+                resident += 1;
+                assert!(c.contains(&h), "chunk {i} is in memory but not on disk");
+            }
+        }
+        assert_eq!(resident, stats.entries);
     }
 
     /// Eviction drops the victim's entry under the lock but used to unlink

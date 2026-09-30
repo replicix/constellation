@@ -486,6 +486,13 @@ impl crate::store::Meta {
                 name,
                 new_parent,
                 new_name,
+                ..
+            }
+            | MutateOp::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
             } => {
                 child(*parent, name);
                 child(*new_parent, new_name);

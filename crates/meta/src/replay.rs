@@ -16,6 +16,7 @@ use crate::store::{atime, misc, ns, reclaim_ino_counter, Meta};
 use constellation_fs_core::{Ino, InodeKind};
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, DentryRecord, Kind};
+use constellation_types::Rdev;
 use fjall::SingleWriterWriteTx;
 use std::collections::BTreeSet;
 
@@ -80,6 +81,13 @@ impl TouchSet {
                 self.shared.insert(*parent);
             }
             LogRecord::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            }
+            | LogRecord::Exchange {
                 parent,
                 name,
                 new_parent,
@@ -156,6 +164,13 @@ impl TouchSet {
                 name,
                 new_parent,
                 new_name,
+                ..
+            }
+            | MutateOp::Exchange {
+                parent,
+                name,
+                new_parent,
+                new_name,
             } => {
                 dentry(*parent, name);
                 dentry(*new_parent, new_name);
@@ -202,6 +217,13 @@ impl TouchSet {
                 }
             }
             MutateOp::Rename {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                ..
+            }
+            | MutateOp::Exchange {
                 parent,
                 name,
                 new_parent,
@@ -396,7 +418,7 @@ fn apply_one(
             *mode,
             *uid,
             *gid,
-            0,
+            Rdev::default(),
             2,
             0,
             None,
@@ -422,7 +444,7 @@ fn apply_one(
             *mode,
             *uid,
             *gid,
-            0,
+            Rdev::default(),
             1,
             0,
             None,
@@ -448,7 +470,7 @@ fn apply_one(
             0o777,
             *uid,
             *gid,
-            0,
+            Rdev::default(),
             1,
             target.len() as u64,
             Some(target.clone()),
@@ -520,6 +542,30 @@ fn apply_one(
             new_name,
             *time_ns,
         ),
+        LogRecord::Exchange {
+            parent,
+            name,
+            new_parent,
+            new_name,
+            time_ns,
+        } => {
+            match crate::store::writes::exchange_in_tx(
+                tx,
+                &meta.ns,
+                dirty,
+                *parent,
+                name,
+                *new_parent,
+                new_name,
+                *time_ns,
+                false,
+            )? {
+                crate::store::writes::Exchanged::Missing => {
+                    Ok(Applied::Skipped("exchange entry missing"))
+                }
+                _ => Ok(Applied::Done),
+            }
+        }
         LogRecord::Setattr {
             ino,
             mode,
@@ -640,12 +686,12 @@ fn apply_one(
         // durable-only rule as `Completed` (an inbox op is never installed
         // speculatively, so `!durable` cannot happen for it in practice).
         LogRecord::Refused { .. } if !durable => Ok(Applied::Done),
-        LogRecord::Refused { rid, errno } => {
+        LogRecord::Refused { rid, code } => {
             let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
             tx.insert(
                 &meta.completed,
                 rid.to_key(),
-                crate::store::Meta::encode_refused_row(0, now_ms, *errno),
+                crate::store::Meta::encode_refused_row(0, now_ms, *code),
             );
             Ok(Applied::Done)
         }
@@ -733,7 +779,7 @@ fn insert_node(
     mode: u32,
     uid: u32,
     gid: u32,
-    rdev: u64,
+    rdev: Rdev,
     nlink: u32,
     size: u64,
     target: Option<String>,
@@ -860,7 +906,7 @@ fn evict_dentry(
             );
             ns::ns_remove(tx, &meta.ns, dirty, keys::inode(ino))?;
         } else {
-            misc::bump_nlink_tx(tx, &meta.ns, dirty, ino, -1, t)?;
+            misc::bump_file_nlink_tx(tx, &meta.ns, dirty, ino, -1, t)?;
         }
     }
     Ok(Applied::Done)
@@ -889,7 +935,7 @@ fn apply_link(
             skip => return Ok(skip),
         }
     }
-    let rec = misc::bump_nlink_tx(tx, &meta.ns, dirty, ino, 1, t)?.expect("checked above");
+    let rec = misc::bump_file_nlink_tx(tx, &meta.ns, dirty, ino, 1, t)?.expect("checked above");
     ns::put_dentry(tx, &meta.ns, dirty, parent, name, ino, rec.attrs)?;
     misc::touch_times_tx(tx, &meta.ns, dirty, parent, t)?;
     Ok(Applied::Done)
@@ -1386,6 +1432,86 @@ fn apply_clone(
 #[cfg(test)]
 mod tests {
     use super::size_delta;
+    use crate::store::Meta;
+    use crate::MetaStore;
+    use constellation_fs_core::types::ROOT_INO;
+
+    /// POSIX `link(2)`/`unlink(2)`: a new or removed name changes the
+    /// file's *ctime* only (its status: `nlink`), never its mtime — the
+    /// content did not change. The directory gaining or losing the name
+    /// changes both. Checked on the writer and on a replica replaying the
+    /// writer's records (the two paths must agree, or replicas diverge).
+    #[test]
+    fn link_and_unlink_change_the_files_ctime_but_not_its_mtime() {
+        const OLD_MTIME: i64 = 1_000_000_000;
+        let writer = Meta::open_in_memory().unwrap();
+        writer.set_node_prefix(1).unwrap();
+        let dir = writer.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        let f = writer.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        writer
+            .setattr(f.ino, None, None, None, None, None, Some(OLD_MTIME))
+            .unwrap();
+        let before = writer.getattr(f.ino).unwrap().unwrap();
+        let dir_before = writer.getattr(dir.ino).unwrap().unwrap();
+        assert_eq!(before.mtime_ns, OLD_MTIME);
+
+        let linked = writer.link(f.ino, dir.ino, "g").unwrap();
+        let after_link = writer.getattr(f.ino).unwrap().unwrap();
+        assert_eq!(after_link.nlink, 2);
+        assert_eq!(linked.mtime_ns, OLD_MTIME, "link's reply");
+        assert_eq!(after_link.mtime_ns, OLD_MTIME, "link must not touch mtime");
+        assert!(after_link.ctime_ns > before.ctime_ns, "link changes ctime");
+        let dir_after = writer.getattr(dir.ino).unwrap().unwrap();
+        assert!(
+            dir_after.mtime_ns > dir_before.mtime_ns,
+            "new parent's mtime"
+        );
+        assert!(
+            dir_after.ctime_ns > dir_before.ctime_ns,
+            "new parent's ctime"
+        );
+
+        writer.unlink(dir.ino, "g").unwrap();
+        let after_unlink = writer.getattr(f.ino).unwrap().unwrap();
+        assert_eq!(after_unlink.nlink, 1);
+        assert_eq!(
+            after_unlink.mtime_ns, OLD_MTIME,
+            "unlink must not touch mtime"
+        );
+        assert!(
+            after_unlink.ctime_ns > after_link.ctime_ns,
+            "unlink changes ctime"
+        );
+
+        // A second name removed by a rename over it: same rule.
+        writer.link(f.ino, dir.ino, "h").unwrap();
+        let other = writer.create(ROOT_INO, "other", 0o644, 0, 0).unwrap();
+        writer.rename(ROOT_INO, "other", dir.ino, "h").unwrap();
+        let after_rename = writer.getattr(f.ino).unwrap().unwrap();
+        assert_eq!(after_rename.nlink, 1);
+        assert_eq!(
+            after_rename.mtime_ns, OLD_MTIME,
+            "rename-over must not touch mtime"
+        );
+        assert!(writer.getattr(other.ino).unwrap().is_some());
+
+        // The replica applies the same records to the same attributes.
+        let records: Vec<_> = writer
+            .take_journal(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect();
+        let replica = Meta::open_in_memory().unwrap();
+        replica.apply_records(&records).unwrap();
+        let mirrored = replica.getattr(f.ino).unwrap().unwrap();
+        let written = writer.getattr(f.ino).unwrap().unwrap();
+        assert_eq!(mirrored.mtime_ns, OLD_MTIME);
+        assert_eq!(
+            (mirrored.nlink, mirrored.ctime_ns),
+            (written.nlink, written.ctime_ns)
+        );
+    }
 
     #[test]
     fn size_delta_is_exact_for_real_sizes_and_bounded_for_absurd_ones() {

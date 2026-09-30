@@ -117,6 +117,9 @@ pub struct LeaseState {
     /// predecessor (backup-crash-slow seed 603631: re-adopted as a plain
     /// own-lease claim, the tenure skipped the sealed backup's tail).
     pub ambiguous_claim: Option<(Epoch, Lease)>,
+    /// Plan 31 C8: a forward-only (or suspended) node gives the lease back
+    /// once idle, whether or not anyone asked for it (`wants_handoff`).
+    pub release_when_idle: bool,
 }
 
 impl LeaseState {
@@ -246,13 +249,21 @@ impl LeaseState {
 
     /// `LeaseKeeper::wants_handoff`: dwell and wanted timers alone justify
     /// handing the lease back.
+    ///
+    /// Plan 31 C8: a forward-only node needs nobody to ask — it hands the
+    /// lease back once it has held it for the dwell and written nothing
+    /// for as long (`release_when_idle`).
     pub fn wants_handoff(&self, now: Ms, cfg: &Config) -> bool {
-        self.epoch_hold.is_none()
-            && self.held.is_some()
-            && !self.wanted.is_empty()
-            && self
-                .held_since
-                .is_some_and(|since| now.since(since) >= cfg.dwell_ms as i64)
+        let dwelt = self
+            .held_since
+            .is_some_and(|since| now.since(since) >= cfg.dwell_ms as i64);
+        if self.epoch_hold.is_some() || self.held.is_none() || !dwelt {
+            return false;
+        }
+        if self.release_when_idle && now.since(self.last_write) >= cfg.dwell_ms as i64 {
+            return true;
+        }
+        !self.wanted.is_empty()
             && (now.since(self.last_write) >= cfg.idle_release_ms as i64
                 || self
                     .wanted_since
@@ -675,6 +686,31 @@ mod tests {
         // Past the margin: unusable.
         let near_expiry = Ms(st.held.as_ref().unwrap().0.expires_unix_ms - 500);
         assert_eq!(st.ship_epoch(near_expiry, &cfg), None);
+    }
+
+    #[test]
+    fn a_forward_only_holder_releases_once_idle_unasked() {
+        let mut cfg = cfg();
+        cfg.dwell_ms = 1_000;
+        cfg.idle_release_ms = 30_000;
+        let t0 = Ms(1_000_000);
+        let mut st = LeaseState {
+            release_when_idle: true,
+            ..LeaseState::default()
+        };
+        let lease = st.granted_lease(t0, &cfg, None);
+        st.adopt(t0, lease, tag(), None);
+        assert!(!st.wants_handoff(t0.plus(900), &cfg), "dwell not met");
+        st.touch(t0.plus(800));
+        assert!(!st.wants_handoff(t0.plus(1_500), &cfg), "written just now");
+        assert!(st.wants_handoff(t0.plus(1_900), &cfg), "idle for the dwell");
+        assert!(!st.idle_release_due(t0.plus(1_900), &cfg, 1, 0), "backlog");
+        assert!(st.idle_release_due(t0.plus(1_900), &cfg, 0, 0));
+        st.release_when_idle = false;
+        assert!(
+            !st.wants_handoff(t0.plus(9_000), &cfg),
+            "hold: nobody asked"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use super::{eventually, lease_of, setup, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::s3env::BUCKET;
 use anyhow::{bail, Context, Result};
+use constellation_types::Code;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
@@ -43,16 +44,16 @@ fn open_rw(path: &Path) -> Result<File> {
         .with_context(|| format!("opening {}", path.display()))
 }
 
-/// `flock(2)`; `Err(errno)` on failure.
-fn flock(f: &File, op: libc::c_int) -> std::result::Result<(), i32> {
+/// `flock(2)`; `Err(code)` on failure.
+fn flock(f: &File, op: libc::c_int) -> std::result::Result<(), Code> {
     if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        Err(Code::from_io_error(&std::io::Error::last_os_error()))
     }
 }
 
-fn flock_timed(f: &File, op: libc::c_int) -> (std::result::Result<(), i32>, Duration) {
+fn flock_timed(f: &File, op: libc::c_int) -> (std::result::Result<(), Code>, Duration) {
     let t = Instant::now();
     let r = flock(f, op);
     (r, t.elapsed())
@@ -65,7 +66,7 @@ fn fcntl_lock(
     typ: i16,
     start: i64,
     len: i64,
-) -> std::result::Result<(), i32> {
+) -> std::result::Result<(), Code> {
     let mut l: libc::flock = unsafe { std::mem::zeroed() };
     l.l_type = typ;
     l.l_whence = libc::SEEK_SET as i16;
@@ -74,7 +75,7 @@ fn fcntl_lock(
     if unsafe { libc::fcntl(f.as_raw_fd(), cmd, &l) } == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        Err(Code::from_io_error(&std::io::Error::last_os_error()))
     }
 }
 
@@ -135,10 +136,7 @@ fn hold_flock(path: PathBuf, op: libc::c_int, deadline: Duration) -> Result<Held
             }
         };
         let (r, took) = flock_timed(&f, op);
-        let _ = tx.send(
-            r.map(|_| took)
-                .map_err(|e| anyhow::anyhow!("flock errno {e}")),
-        );
+        let _ = tx.send(r.map(|_| took).map_err(|e| anyhow::anyhow!("flock {e}")));
         while !rel.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -186,7 +184,7 @@ fn flock_cross_node_cluster() -> Result<()> {
         let fb_file = open_rw(&fb)?;
         let (r, took) = flock_timed(&fb_file, libc::LOCK_EX | libc::LOCK_NB);
         anyhow::ensure!(
-            r == Err(libc::EWOULDBLOCK),
+            r == Err(Code::Again),
             "B's LOCK_EX|LOCK_NB while A holds: {r:?} (took {took:?})"
         );
         eprintln!("    {NAME}: B's non-blocking LOCK_EX refused (EWOULDBLOCK) in {took:?}");
@@ -196,7 +194,7 @@ fn flock_cross_node_cluster() -> Result<()> {
             move || -> Result<Duration> {
                 let f = open_rw(&fb)?;
                 let (r, took) = flock_timed(&f, libc::LOCK_EX);
-                r.map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                r.map_err(|e| anyhow::anyhow!("{e}"))?;
                 // Hold it a moment so A can observe the exclusion.
                 std::thread::sleep(Duration::from_millis(300));
                 let _ = flock(&f, libc::LOCK_UN);
@@ -229,10 +227,7 @@ fn flock_cross_node_cluster() -> Result<()> {
         // An exclusive request from A now conflicts with B's shared grant.
         let f2 = open_rw(&fa)?;
         let (r, _) = flock_timed(&f2, libc::LOCK_EX | libc::LOCK_NB);
-        anyhow::ensure!(
-            r == Err(libc::EWOULDBLOCK),
-            "A's upgrade with B shared: {r:?}"
-        );
+        anyhow::ensure!(r == Err(Code::Again), "A's upgrade with B shared: {r:?}");
         sb.release();
         sa.release();
 
@@ -244,11 +239,11 @@ fn flock_cross_node_cluster() -> Result<()> {
         let fa2 = open_rw(&fa)?;
         // Blocking: B's release of its shared grant may still be in flight.
         fcntl_lock(&fa2, libc::F_SETLKW, libc::F_WRLCK as i16, 0, 100)
-            .map_err(|e| anyhow::anyhow!("A F_SETLK: errno {e}"))?;
+            .map_err(|e| anyhow::anyhow!("A F_SETLK: {e}"))?;
         let fb2 = open_rw(&fb)?;
         let r = fcntl_lock(&fb2, libc::F_SETLK, libc::F_WRLCK as i16, 50, 10);
         anyhow::ensure!(
-            r == Err(libc::EAGAIN) || r == Err(libc::EACCES),
+            r == Err(Code::Again) || r == Err(Code::Access),
             "B's overlapping F_SETLK: {r:?}"
         );
         let t = fcntl_getlk(&fb2, libc::F_WRLCK as i16, 50, 10)?;
@@ -262,9 +257,9 @@ fn flock_cross_node_cluster() -> Result<()> {
         write_at(&mut wa, 0, b"under-lock-A")?;
         wa.sync_all()?;
         fcntl_lock(&fa2, libc::F_SETLK, libc::F_UNLCK as i16, 0, 100)
-            .map_err(|e| anyhow::anyhow!("A F_UNLCK: errno {e}"))?;
+            .map_err(|e| anyhow::anyhow!("A F_UNLCK: {e}"))?;
         fcntl_lock(&fb2, libc::F_SETLKW, libc::F_WRLCK as i16, 0, 100)
-            .map_err(|e| anyhow::anyhow!("B F_SETLKW: errno {e}"))?;
+            .map_err(|e| anyhow::anyhow!("B F_SETLKW: {e}"))?;
         let mut rb = open_rw(&fb)?;
         let got = read_at(&mut rb, 0, 12)?;
         anyhow::ensure!(
@@ -299,7 +294,7 @@ fn flock_cross_node_local() -> Result<()> {
     let result = (|| -> Result<()> {
         let fa = open_rw(&clients[0].mnt.join("f"))?;
         let fb = open_rw(&clients[1].mnt.join("f"))?;
-        flock(&fa, libc::LOCK_EX | libc::LOCK_NB).map_err(|e| anyhow::anyhow!("errno {e}"))?;
+        flock(&fa, libc::LOCK_EX | libc::LOCK_NB).map_err(|e| anyhow::anyhow!("{e}"))?;
         let r = flock(&fb, libc::LOCK_EX | libc::LOCK_NB);
         anyhow::ensure!(
             r.is_ok(),
@@ -473,7 +468,7 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
             let granted_at = granted_at.clone();
             move || -> Result<()> {
                 let f = open_rw(&fc)?;
-                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("{e}"))?;
                 *granted_at.lock().unwrap() = Some(Instant::now());
                 std::thread::sleep(Duration::from_millis(500));
                 let _ = flock(&f, libc::LOCK_UN);
@@ -486,7 +481,7 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
         while Instant::now() < deadline {
             match write_at(&mut wb, 0, b"B2") {
                 Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                Err(e) if Code::from_os_error(&e) == Some(Code::Io) => {
                     first_eio.get_or_insert(Instant::now());
                 }
                 Err(e) => bail!("B's write under its lock: {e}"),
@@ -576,7 +571,7 @@ fn counter_worker(path: PathBuf, n: u64, hold: Option<Hold>) -> CounterRun {
     };
     for i in 0..n {
         if let Err(e) = flock(&f, libc::LOCK_EX) {
-            run.error = Some(format!("flock: errno {e}"));
+            run.error = Some(format!("flock: {e}"));
             return run;
         }
         if let Some((at, tx, rx)) = &hold {
@@ -599,7 +594,7 @@ fn counter_worker(path: PathBuf, n: u64, hold: Option<Hold>) -> CounterRun {
         run.done += 1;
         run.times.push(Instant::now());
         if let Err(e) = flock(&f, libc::LOCK_UN) {
-            run.error = Some(format!("unlock: errno {e}"));
+            run.error = Some(format!("unlock: {e}"));
             return run;
         }
     }
@@ -766,7 +761,7 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
         let spawn_waiter = |p: PathBuf| {
             std::thread::spawn(move || -> Result<Instant> {
                 let f = open_rw(&p)?;
-                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let at = Instant::now();
                 let _ = flock(&f, libc::LOCK_UN);
                 Ok(at)
@@ -861,7 +856,7 @@ pub fn lock_fence_at_close(_seed: u64) -> Result<()> {
                     },
                 )?;
             }
-            let lock = |f: &File, blocking: bool| -> std::result::Result<(), i32> {
+            let lock = |f: &File, blocking: bool| -> std::result::Result<(), Code> {
                 if posix {
                     let cmd = if blocking {
                         libc::F_SETLKW
@@ -874,7 +869,7 @@ pub fn lock_fence_at_close(_seed: u64) -> Result<()> {
                 }
             };
             let mut wb = open_rw(&b.mnt.join(file))?;
-            lock(&wb, true).map_err(|e| anyhow::anyhow!("B's lock: errno {e}"))?;
+            lock(&wb, true).map_err(|e| anyhow::anyhow!("B's lock: {e}"))?;
             write_at(&mut wb, 0, OLD).context("B's write under its lock")?;
             // Cut B from the owner (A), both directions: its renewals
             // fail and its grant lapses.
@@ -890,7 +885,7 @@ pub fn lock_fence_at_close(_seed: u64) -> Result<()> {
             // C takes the lock (after the owner outwaited B's grant) and
             // writes the new content through.
             let fc = open_rw(&c.mnt.join(file))?;
-            lock(&fc, true).map_err(|e| anyhow::anyhow!("C's lock: errno {e}"))?;
+            lock(&fc, true).map_err(|e| anyhow::anyhow!("C's lock: {e}"))?;
             let granted = cut.elapsed();
             {
                 use std::os::unix::fs::FileExt;
@@ -906,24 +901,24 @@ pub fn lock_fence_at_close(_seed: u64) -> Result<()> {
             // B's I/O under the lapsed grant is fenced.
             let fenced = write_at(&mut wb, 0, OLD);
             anyhow::ensure!(
-                fenced.as_ref().err().and_then(|e| e.raw_os_error()) == Some(libc::EIO),
+                fenced.as_ref().err().and_then(Code::from_os_error) == Some(Code::Io),
                 "{variant}: B's write after its grant lapsed: {fenced:?}"
             );
             // Heal; B's application closes (or unlocks, then closes).
             let _ = std::fs::remove_file(super::m9::c_deny_path(root.path(), &a.name));
             let _ = std::fs::remove_file(super::m9::c_deny_path(root.path(), &b.name));
             if !posix {
-                flock(&wb, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("B's unlock: errno {e}"))?;
+                flock(&wb, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("B's unlock: {e}"))?;
             }
             let fd = std::os::unix::io::IntoRawFd::into_raw_fd(wb);
             let rc = unsafe { libc::close(fd) };
-            let errno = std::io::Error::last_os_error().raw_os_error();
+            let code = Code::from_os_error(&std::io::Error::last_os_error());
             eprintln!(
-                "    {NAME}: {variant}: C granted {granted:?} after the cut; B's close returned {rc} (errno {errno:?})"
+                "    {NAME}: {variant}: C granted {granted:?} after the cut; B's close returned {rc} ({code:?})"
             );
             anyhow::ensure!(
-                rc == -1 && errno == Some(libc::EIO),
-                "{variant}: B's close of data written under a lapsed grant returned {rc} (errno {errno:?}), expected EIO"
+                rc == -1 && code == Some(Code::Io),
+                "{variant}: B's close of data written under a lapsed grant returned {rc} ({code:?}), expected EIO"
             );
             for n in [a, b, c] {
                 eventually(
@@ -1018,7 +1013,7 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
         write_at(&mut wb, 0, b"before")?;
         let fc = open_rw(&clients[other_idx].mnt.join("f"))?;
         anyhow::ensure!(
-            flock(&fc, libc::LOCK_EX | libc::LOCK_NB) == Err(libc::EWOULDBLOCK),
+            flock(&fc, libc::LOCK_EX | libc::LOCK_NB) == Err(Code::Again),
             "the contender got the lock while the locker holds it"
         );
         clients[holder].kill9()?;
@@ -1036,15 +1031,15 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
         while Instant::now() < until {
             match write_at(&mut wb, 0, b"during") {
                 Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(libc::EIO) => eios += 1,
+                Err(e) if Code::from_os_error(&e) == Some(Code::Io) => eios += 1,
                 Err(e) => bail!("locker's write: {e}"),
             }
             match flock(&fc, libc::LOCK_EX | libc::LOCK_NB) {
-                Err(e) if e == libc::EWOULDBLOCK => refused += 1,
+                Err(Code::Again) => refused += 1,
                 Ok(()) => {
                     bail!("the contender got the lock while the locker holds it (after failover)")
                 }
-                Err(e) => bail!("contender flock: errno {e}"),
+                Err(e) => bail!("contender flock: {e}"),
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1057,7 +1052,7 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
         );
         held.release();
         let (r, took) = flock_timed(&fc, libc::LOCK_EX);
-        r.map_err(|e| anyhow::anyhow!("contender after unlock: errno {e}"))?;
+        r.map_err(|e| anyhow::anyhow!("contender after unlock: {e}"))?;
         eprintln!("    {NAME}: contender granted {took:?} after the locker's unlock");
         let _ = flock(&fc, libc::LOCK_UN);
         print_locks(NAME, &clients[backup_idx]);
@@ -1118,7 +1113,7 @@ fn lock_latency_lan() -> Result<()> {
         for i in 0..20 {
             let f = open_rw(&b.mnt.join(format!("l{i}")))?;
             let (r, took) = flock_timed(&f, libc::LOCK_EX);
-            r.map_err(|e| anyhow::anyhow!("errno {e}"))?;
+            r.map_err(|e| anyhow::anyhow!("{e}"))?;
             first.push(took);
             let _ = flock(&f, libc::LOCK_UN);
         }
@@ -1130,7 +1125,7 @@ fn lock_latency_lan() -> Result<()> {
         let mut relock = Vec::new();
         for _ in 0..N {
             let (r, took) = flock_timed(&f, libc::LOCK_EX);
-            r.map_err(|e| anyhow::anyhow!("errno {e}"))?;
+            r.map_err(|e| anyhow::anyhow!("{e}"))?;
             relock.push(took);
             let _ = flock(&f, libc::LOCK_UN);
         }
@@ -1142,7 +1137,7 @@ fn lock_latency_lan() -> Result<()> {
         for _ in 0..N {
             let t = Instant::now();
             fcntl_lock(&f, libc::F_SETLK, libc::F_WRLCK as i16, 0, 0)
-                .map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             fcntl_lock(&f, libc::F_SETLK, libc::F_UNLCK as i16, 0, 0).ok();
             fc.push(t.elapsed());
         }
@@ -1151,7 +1146,7 @@ fn lock_latency_lan() -> Result<()> {
         let mut holder = Vec::new();
         for _ in 0..N {
             let (r, took) = flock_timed(&fa, libc::LOCK_EX);
-            r.map_err(|e| anyhow::anyhow!("errno {e}"))?;
+            r.map_err(|e| anyhow::anyhow!("{e}"))?;
             holder.push(took);
             let _ = flock(&fa, libc::LOCK_UN);
         }
@@ -1165,7 +1160,7 @@ fn lock_latency_lan() -> Result<()> {
                 move || -> Result<Duration> {
                     let f = open_rw(&p)?;
                     let (r, took) = flock_timed(&f, libc::LOCK_EX);
-                    r.map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                    r.map_err(|e| anyhow::anyhow!("{e}"))?;
                     let _ = flock(&f, libc::LOCK_UN);
                     Ok(took)
                 }
@@ -1213,7 +1208,7 @@ fn lock_latency_lone() -> Result<()> {
             let mut v = Vec::new();
             for _ in 0..1000 {
                 let (r, took) = flock_timed(&f, libc::LOCK_EX);
-                r.map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                r.map_err(|e| anyhow::anyhow!("{e}"))?;
                 v.push(took);
                 let _ = flock(&f, libc::LOCK_UN);
             }
@@ -1221,14 +1216,14 @@ fn lock_latency_lone() -> Result<()> {
             for _ in 0..1000 {
                 let t = Instant::now();
                 fcntl_lock(&f, libc::F_SETLK, libc::F_WRLCK as i16, 0, 0)
-                    .map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 fcntl_lock(&f, libc::F_SETLK, libc::F_UNLCK as i16, 0, 0).ok();
                 fc.push(t.elapsed());
             }
             // Writes on a locked file: the fence check's cost.
             let mut w = Vec::new();
             fcntl_lock(&f, libc::F_SETLK, libc::F_WRLCK as i16, 0, 0)
-                .map_err(|e| anyhow::anyhow!("errno {e}"))?;
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let mut wf = open_rw(&p)?;
             for i in 0..1000u64 {
                 let t = Instant::now();

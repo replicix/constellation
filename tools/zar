@@ -1,0 +1,10 @@
+#!/bin/sh
+# zig ar wrapper (see tools/zcc): `zig` on PATH, else `python3 -m ziglang`.
+set -eu
+if command -v zig >/dev/null 2>&1; then
+    exec zig ar "$@"
+elif python3 -c 'import ziglang' >/dev/null 2>&1; then
+    exec python3 -m ziglang ar "$@"
+fi
+echo "zar: need 'zig' on PATH or the python3 'ziglang' package" >&2
+exit 127

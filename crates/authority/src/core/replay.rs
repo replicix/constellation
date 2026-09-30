@@ -2,13 +2,14 @@
 //! local replay the takeover gate runs (`recovery::replay_locally`), and
 //! the conflict-copy retries of refused replays (plan 30 §M4 round 2).
 
-use super::client::{completed_as_outcome, meta_errno, Origin};
+use super::client::{completed_as_outcome, Origin};
 use super::Core;
 use crate::action::Action;
 use crate::event::Policy;
 use crate::ids::Ms;
 use crate::replica::Replica;
 use constellation_meta::{MutateOp, MutateOutcome, Rid, StrandedOp};
+use constellation_types::Code;
 use std::collections::BTreeMap;
 
 /// First and largest pause between attempts at a refused replay's
@@ -67,8 +68,8 @@ fn copy_backoff_ms(attempts: u32) -> u64 {
 
 /// `recovery::refusal_is_satisfied`: removing a name that is already gone
 /// is what the op wanted.
-fn refusal_is_satisfied(op: &MutateOp, errno: i32) -> bool {
-    matches!(op, MutateOp::Unlink { .. } | MutateOp::Rmdir { .. }) && errno == libc::ENOENT
+fn refusal_is_satisfied(op: &MutateOp, code: Code) -> bool {
+    matches!(op, MutateOp::Unlink { .. } | MutateOp::Rmdir { .. }) && code == Code::NotFound
 }
 
 /// Whether `op` is a size-only `setattr` (the FUSE truncate path) with a
@@ -153,15 +154,15 @@ impl Core {
                     // holder that journals refusals) before this node saw
                     // it: an outcome, not a re-evaluation. An unacked
                     // entry's refusal is its client's answer.
-                    MutateOutcome::Errno(errno)
-                        if head.foreign || refusal_is_satisfied(&head.op, errno) =>
+                    MutateOutcome::Errno(code)
+                        if head.foreign || refusal_is_satisfied(&head.op, code) =>
                     {
                         self.note_unacked_refused(head);
                         self.stats.stranded_replayed += 1;
                         let _ = replica.forget_replay(head.queue_seq);
                     }
-                    MutateOutcome::Errno(errno) => {
-                        let reason = format!("refused with errno {errno} (inbox)");
+                    MutateOutcome::Errno(code) => {
+                        let reason = format!("refused with {code} (inbox)");
                         self.refuse_replay(now, head, reason, replica, out);
                     }
                     MutateOutcome::Conflict { .. } => {
@@ -418,13 +419,13 @@ impl Core {
             | Some(MutateOutcome::Busy)
             | Some(MutateOutcome::NotHolder { .. })
             | Some(MutateOutcome::Held { .. }) => return,
-            Some(MutateOutcome::Errno(errno)) if refusal_is_satisfied(&queued.op, errno) => {
+            Some(MutateOutcome::Errno(code)) if refusal_is_satisfied(&queued.op, code) => {
                 self.stats.stranded_replayed += 1;
                 let _ = replica.forget_replay(queue_seq);
                 self.replay.stuck_since = None;
                 return;
             }
-            Some(MutateOutcome::Errno(errno)) => format!("refused with errno {errno}"),
+            Some(MutateOutcome::Errno(code)) => format!("refused with {code}"),
             Some(MutateOutcome::Exists { .. }) => "the name now exists".to_string(),
             Some(MutateOutcome::Conflict { .. }) => "stale manifest base".to_string(),
         };
@@ -514,15 +515,15 @@ impl Core {
                 MutateOutcome::Accepted { .. } => {
                     replica.forget_replay(queued.queue_seq)?;
                 }
-                MutateOutcome::Errno(errno)
-                    if queued.foreign || refusal_is_satisfied(&queued.op, errno) =>
+                MutateOutcome::Errno(code)
+                    if queued.foreign || refusal_is_satisfied(&queued.op, code) =>
                 {
                     self.note_unacked_refused(queued);
                     self.stats.stranded_replayed += 1;
                     replica.forget_replay(queued.queue_seq)?;
                 }
-                MutateOutcome::Errno(errno) => {
-                    let reason = format!("refused with errno {errno} (inbox)");
+                MutateOutcome::Errno(code) => {
+                    let reason = format!("refused with {code} (inbox)");
                     self.refuse_replay(now, queued, reason, replica, out);
                 }
                 _ => {
@@ -539,8 +540,7 @@ impl Core {
                 replica.forget_replay(queued.queue_seq)?;
             }
             Err(error) => {
-                let errno = meta_errno(&error);
-                if queued.foreign || refusal_is_satisfied(&queued.op, errno) {
+                if queued.foreign || refusal_is_satisfied(&queued.op, error.code()) {
                     self.note_unacked_refused(queued);
                     self.stats.stranded_replayed += 1;
                     replica.forget_replay(queued.queue_seq)?;

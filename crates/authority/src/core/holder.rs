@@ -3,7 +3,7 @@
 //! holder_execute` did), a peer's `LeaseRequest` (`SyncRequest::HandOff`),
 //! and a pushed segment (`SyncRequest::ApplyPushed`).
 
-use super::client::{meta_errno, named_child};
+use super::client::named_child;
 use super::{Core, S3For};
 use crate::action::{Action, S3Op};
 use crate::event::PeerMsg;
@@ -11,6 +11,7 @@ use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::{MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet};
+use constellation_types::Code;
 
 /// The keys `op` reads or writes, before it runs (a refusal touches
 /// nothing but is evaluated against them), as the replica's unshipped
@@ -208,13 +209,13 @@ impl Core {
                 let wait = match self.deleg_recall_plan(now, &keys, replica, out) {
                     super::delegate::RecallPlan::None => Default::default(),
                     super::delegate::RecallPlan::Wait(w) => w,
-                    super::delegate::RecallPlan::Refuse(errno) => {
+                    super::delegate::RecallPlan::Refuse(code) => {
                         if req != OpId(0) {
                             out.push(Action::Send {
                                 to: from,
                                 msg: PeerMsg::MutateReply {
                                     req,
-                                    outcome: MutateOutcome::Errno(errno),
+                                    outcome: MutateOutcome::Errno(code),
                                     base: None,
                                     position: Position::ZERO,
                                     gen: 0,
@@ -371,6 +372,7 @@ impl Core {
             || self.lease.epoch_held()
             || self.epoch.open
             || self.retired()
+            || self.mode.forwards()
             || now < self.readopt_refused_until
         {
             return false;
@@ -464,13 +466,13 @@ impl Core {
                     None,
                 );
             }
-            Some(constellation_meta::CompletedOutcome::Refused { errno }) => {
+            Some(constellation_meta::CompletedOutcome::Refused { code }) => {
                 self.stats.forward_dedup_hits += 1;
                 return (
-                    if errno == libc::ESTALE {
+                    if code == Code::Stale {
                         MutateOutcome::Conflict { manifest: None }
                     } else {
-                        MutateOutcome::Errno(errno)
+                        MutateOutcome::Errno(code)
                     },
                     None,
                 );
@@ -500,35 +502,35 @@ impl Core {
                 MutateOp::SetManifest { ino, .. } => MutateOutcome::Conflict {
                     manifest: replica.manifest(*ino),
                 },
-                _ => MutateOutcome::Errno(libc::EAGAIN),
+                _ => MutateOutcome::Errno(Code::Again),
             },
             Err(MetaError::Exists) => {
-                self.record_refusal(rid, libc::EEXIST, Some(op), replica);
+                self.record_refusal(rid, Code::Exists, Some(op), replica);
                 match named_child(op) {
                     Some((parent, name)) => match replica.entry_as_record(parent, name) {
                         Some(record) => MutateOutcome::Exists {
                             records: vec![record],
                             epoch,
                         },
-                        None => MutateOutcome::Errno(libc::EEXIST),
+                        None => MutateOutcome::Errno(Code::Exists),
                     },
-                    None => MutateOutcome::Errno(libc::EEXIST),
+                    None => MutateOutcome::Errno(Code::Exists),
                 }
             }
             Err(e) => {
-                let errno = meta_errno(&e);
-                self.record_refusal(rid, errno, Some(op), replica);
-                MutateOutcome::Errno(errno)
+                let code = e.code();
+                self.record_refusal(rid, code, Some(op), replica);
+                MutateOutcome::Errno(code)
             }
         };
         (outcome, None)
     }
 
     /// Plan 30 §M9: a definitive refusal of an op executed by rid is an
-    /// outcome, journaled as `Refused { rid, errno }` so that any second
+    /// outcome, journaled as `Refused { rid, code }` so that any second
     /// execution of the rid — the requester's retry after a `Busy` or a
     /// lost reply, the deposed holder's replay by rid, an inbox batch
-    /// drained later — dedups to the same errno rather than re-evaluating
+    /// drained later — dedups to the same code rather than re-evaluating
     /// the op against a state that may have changed meanwhile. (A
     /// transient refusal — `Conflict`/`EAGAIN`, a stale manifest base —
     /// is not an outcome: the requester rebases and retries.) The row is
@@ -541,12 +543,12 @@ impl Core {
     pub(crate) fn record_refusal(
         &mut self,
         rid: Rid,
-        errno: i32,
+        code: Code,
         op: Option<&MutateOp>,
         replica: &dyn Replica,
     ) {
-        if let Err(error) = replica.journal_refusal(rid, errno, op) {
-            tracing::warn!(node = self.cfg.node_id, ?rid, errno, %error, "could not journal a refusal");
+        if let Err(error) = replica.journal_refusal(rid, code, op) {
+            tracing::warn!(node = self.cfg.node_id, ?rid, %code, %error, "could not journal a refusal");
             return;
         }
         self.stats.refusals_journaled += 1;
@@ -622,7 +624,7 @@ impl Core {
             // epoch (acknowledged effects re-evaluated and reordered). The
             // requester forwards to this node instead; its file writes'
             // manifests go forwarded too, their chunks uploaded when S3
-            // returns (`fusefs::commit_manifest_forwarded`).
+            // returns (`view::View::commit_manifest_forwarded`).
             // `flex-crash` seed 30702: nor to a requester that has not
             // applied this node's whole log. The successor catches up to
             // `head_seq` from S3 outside an epoch; inside one it cannot,

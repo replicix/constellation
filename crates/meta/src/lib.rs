@@ -170,7 +170,7 @@ pub trait MetaStore: Send + Sync {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: constellation_types::Rdev,
     ) -> Result<FileAttr, MetaError>;
     /// Hard link `ino` at `parent/name` (files and special nodes only).
     fn link(&self, ino: Ino, parent: Ino, name: &str) -> Result<FileAttr, MetaError>;

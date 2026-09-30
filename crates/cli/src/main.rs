@@ -1,59 +1,27 @@
 //! Constellation entry point: CLI, daemon, and FUSE mount in one binary.
 
-mod atime;
-mod authority_driver;
-mod backend;
-mod coop;
-mod cto;
+mod control;
 mod daemon_lock;
 mod daemonize;
-mod designation;
-mod doctor;
-mod e2e_pin;
-mod epoch;
-mod existence;
-mod fault;
-mod forward;
-mod fsck;
-mod fuse_watch;
-mod fusefs;
-mod gc;
-mod held;
-mod holds;
-mod inbox;
-mod kernel_inval;
-mod lease;
-mod leave;
-mod locks;
-mod log_buffer;
-mod mtree_gc;
-mod mtree_publish;
-mod mtree_read;
+mod handover;
 mod node_runtime;
 mod parallelism;
-mod paths;
-mod pin;
-mod placement;
-mod prefetch;
-mod prune;
-mod recovery;
-mod registry;
-mod reintegrate;
-mod scan;
-mod shipper;
-mod singleton;
-mod snapshot;
-mod sources;
-mod staging;
 mod startup;
-mod target;
-mod writeback;
+
+// Plan 31 C3: the engine modules live in `constellation-engine`; importing
+// them here keeps every `crate::<module>::…` path in this crate as it was.
+use constellation_engine::{
+    atime, authority_driver, backend, cto, designation, doctor, e2e_pin, fsck, gc, lease, leave,
+    locks, log_buffer, registry, shipper, target, writeback,
+};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use constellation_fs_core::cache::DiskCache;
+use constellation_control::methods as cm;
+use constellation_control::proto::types as api;
 use constellation_meta::Meta;
 use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
+use constellation_types::Code;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -149,6 +117,13 @@ enum Command {
         /// Create a temporary clone and remove it on clean unmount.
         #[arg(long, requires = "rw", conflicts_with = "clone_name")]
         ephemeral: bool,
+        /// Confine hard links to the view (plan 31 §6.12): `link()` of a
+        /// file none of whose names lies in the destination's link domain
+        /// (the view's root, or the nearest directory marked
+        /// `trusted.constellation.link_domain`) fails with EXDEV, as does
+        /// moving one of several names of a file across domains.
+        #[arg(long)]
+        confine_links: bool,
         /// Serve the embedded control UI on localhost. Zero disables it.
         /// Bare `--web-ui` listens on 8080; `--web-ui <port>` picks a port.
         #[arg(
@@ -186,6 +161,35 @@ enum Command {
         target: String,
         #[arg(long)]
         s3: Option<String>,
+    },
+    /// The running daemon of a filesystem. `--upgrade` replaces its binary
+    /// in place while every view stays mounted (plan 31 C4b): the daemon
+    /// detaches its FUSE sessions (queued requests wait in the kernel),
+    /// shuts its node down cleanly, and `exec`s the new binary, which
+    /// resumes the same connections under the same pid — no unmount, no
+    /// `ENOTCONN` for a process with a file open on the mount. Refused
+    /// (nothing changes) while a cluster lock is held or waited for.
+    Daemon {
+        /// A registered name, or (with `--state-dir`) anything.
+        target: Option<String>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Upgrade the running daemon in place.
+        #[arg(long)]
+        upgrade: bool,
+        /// The binary to upgrade to (default: the path the daemon was
+        /// started from, as it is on disk now).
+        #[arg(long, requires = "upgrade")]
+        binary: Option<PathBuf>,
+        /// How long to wait for the new image to serve.
+        #[arg(long, default_value_t = 300)]
+        timeout_s: u64,
+        /// (internal) Print this binary's handover version.
+        #[arg(long, hide = true)]
+        handover_abi: bool,
+        /// (internal) Resume a handed-over daemon from this memfd.
+        #[arg(long, hide = true)]
+        resume_from: Option<i32>,
     },
     /// (internal) The daemon's zombie reaper: watches the daemon that
     /// spawned it and, once the kernel has killed it but a thread wedged
@@ -308,6 +312,28 @@ enum Command {
     WriteMode {
         target: String,
         mode: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Plan 31 C8: deliver a host lifecycle event to a running mount's
+    /// engine (`node.lifecycle`) and print what it did — how a desktop or
+    /// the harness exercises what a phone's OS drives: `foreground`,
+    /// `background`, `low-power`, `suspending --deadline-ms N` (every view
+    /// published, the journal shipped, the lease released, P2P quiet),
+    /// `resumed`, `network --reachable B --metered B`.
+    Lifecycle {
+        target: String,
+        /// foreground, background, low-power, suspending, resumed, network.
+        event: String,
+        /// `suspending`: how long until the host suspends the process.
+        #[arg(long, default_value_t = 10_000)]
+        deadline_ms: u64,
+        /// `network`: whether the network is reachable.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        reachable: bool,
+        /// `network`: whether it is metered.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        metered: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -663,8 +689,7 @@ fn ensure_allow_other_supported(enabled: bool) -> Result<()> {
     if !enabled {
         return Ok(());
     }
-    // SAFETY: geteuid is always safe and never fails.
-    if unsafe { libc::geteuid() } == 0 {
+    if constellation_platform::native().process.effective_ids().0 == 0 {
         return Ok(());
     }
     let enabled_in_conf = std::fs::read_to_string("/etc/fuse.conf")
@@ -691,8 +716,7 @@ fn ensure_allow_other_supported(enabled: bool) -> Result<()> {
 /// way out, and accepts connections it will never answer). Runs through
 /// a throwaway runtime that is fully dropped before the caller forks.
 fn daemon_socket_is_live(state_dir: &Path) -> bool {
-    let sock = state_dir.join(constellation_api::SOCKET_NAME);
-    if !sock.exists() {
+    if constellation_control::transport::locate_socket(state_dir).is_none() {
         return false;
     }
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -701,16 +725,13 @@ fn daemon_socket_is_live(state_dir: &Path) -> bool {
     else {
         return false;
     };
-    let live = rt.block_on(constellation_api::ping(
-        &sock,
-        daemon_lock::control_timeout(),
-    ));
+    let live = rt.block_on(control::ping(state_dir, daemon_lock::control_timeout()));
     drop(rt);
     match live {
         Ok(live) => live,
         Err(e) => {
             tracing::warn!(
-                sock = %sock.display(),
+                state_dir = %state_dir.display(),
                 error = %e,
                 "a daemon holds this state dir's control socket but does not answer; \
                  not attaching to it"
@@ -868,6 +889,7 @@ fn main() -> Result<()> {
         rw,
         clone_name,
         ephemeral,
+        confine_links,
         web_ui,
     } = cli.command
     {
@@ -891,10 +913,28 @@ fn main() -> Result<()> {
                 rw,
                 clone_name,
                 ephemeral,
+                confine_links,
                 web_ui,
             },
             log_buffer,
         );
+    }
+
+    // Plan 31 C4b: the new image of an upgraded daemon (builds its own
+    // runtime, like `mount`), and the preflight's probe.
+    if let Command::Daemon {
+        resume_from,
+        handover_abi,
+        ..
+    } = &cli.command
+    {
+        if *handover_abi {
+            println!("{}", handover::handover_abi());
+            return Ok(());
+        }
+        if let Some(fd) = *resume_from {
+            return handover::resume_main(fd, threads, log_buffer);
+        }
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1086,6 +1126,28 @@ fn main() -> Result<()> {
             command: FsCommand::List,
         } => cmd_fs_list(&rt),
         Command::ZombieReaper { parent, state_dir } => daemon_lock::reaper_main(parent, &state_dir),
+        Command::Daemon {
+            target,
+            state_dir,
+            upgrade,
+            binary,
+            timeout_s,
+            ..
+        } => {
+            if !upgrade {
+                bail!("nothing to do: `constellation daemon --upgrade <TARGET>`");
+            }
+            let dir = match (target, state_dir) {
+                (Some(target), state_dir) => resolve_target(&target, state_dir)?.1,
+                (None, Some(dir)) => dir,
+                (None, None) => bail!("TARGET (a registered filesystem name) or --state-dir"),
+            };
+            rt.block_on(cmd_daemon_upgrade(
+                &dir,
+                binary,
+                std::time::Duration::from_secs(timeout_s),
+            ))
+        }
         Command::Doctor { target, s3 } => {
             let reg = registry::Registry::load()?;
             let t = target::resolve(&target, &reg);
@@ -1149,38 +1211,30 @@ fn main() -> Result<()> {
             let target =
                 target.context("TARGET (a registered filesystem name) or --s3 is required")?;
             let (_, dir) = resolve_target(&target, state_dir)?;
-            let sock = dir.join(constellation_api::SOCKET_NAME);
             // Bounded: a daemon the kernel has killed but that still holds
             // its listener (campaign 6 B-1) must not park `status` forever.
-            let resp = rt.block_on(constellation_api::call_bounded(
-                &sock,
-                &constellation_api::Request::Status,
+            let s = rt.block_on(control::call_bounded::<cm::NodeStatus>(
+                &dir,
+                Default::default(),
                 daemon_lock::control_timeout(),
             ))?;
-            match resp {
-                constellation_api::Response::Status(s) => {
-                    println!("{}", serde_json::to_string_pretty(&s)?)
-                }
-                other => bail!("unexpected response: {other:?}"),
-            }
-            Ok(())
+            print_json(&s)
         }
         Command::Pin { target, state_dir } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
-            rt.block_on(control_call(&dir, constellation_api::Request::Pin { path }))
+            ctl::<cm::PinAdd>(&rt, &dir, api::PathParams { path }, print_ack)
         }
         Command::Unpin { target, state_dir } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::Unpin { path },
-            ))
+            ctl::<cm::PinRemove>(&rt, &dir, api::PathParams { path }, print_ack)
         }
         Command::Pins { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(&dir, constellation_api::Request::ListPins))
+            ctl::<cm::PinList>(&rt, &dir, Default::default(), |l| {
+                print_list(&l.pins, "no pinned subtrees")
+            })
         }
         Command::Offline {
             target,
@@ -1189,28 +1243,26 @@ fn main() -> Result<()> {
         } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
-            rt.block_on(control_call(
+            ctl::<cm::DesignationOffline>(
+                &rt,
                 &dir,
-                constellation_api::Request::Offline {
+                api::OfflineParams {
                     path,
                     read_only: ro,
                 },
-            ))
+                print_ack,
+            )
         }
         Command::Online { target, state_dir } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::Online { path },
-            ))
+            ctl::<cm::DesignationOnline>(&rt, &dir, api::PathParams { path }, print_ack)
         }
         Command::Designations { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::ListDesignations,
-            ))
+            ctl::<cm::DesignationList>(&rt, &dir, Default::default(), |l| {
+                print_list(&l.designations, "no active designations")
+            })
         }
         Command::Delegate {
             target,
@@ -1220,33 +1272,31 @@ fn main() -> Result<()> {
         } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
-            rt.block_on(control_call(
+            ctl::<cm::DesignationDelegate>(
+                &rt,
                 &dir,
-                constellation_api::Request::Delegate {
+                api::DelegateParams {
                     path,
                     node: to,
                     range,
                 },
-            ))
+                print_ack,
+            )
         }
         Command::Undelegate { target, state_dir } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::Undelegate { path },
-            ))
+            ctl::<cm::DesignationUndelegate>(&rt, &dir, api::PathParams { path }, print_ack)
         }
         Command::Delegations { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::ListDelegations,
-            ))
+            ctl::<cm::DesignationListDelegations>(&rt, &dir, Default::default(), |l| {
+                print_json(&l.delegations)
+            })
         }
         Command::Reintegrate { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(&dir, constellation_api::Request::Reintegrate))
+            ctl::<cm::NodeReintegrate>(&rt, &dir, Default::default(), print_ack)
         }
         Command::Repair {
             command:
@@ -1258,10 +1308,7 @@ fn main() -> Result<()> {
                 },
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::DropHeld { ino, remote },
-            ))
+            ctl::<cm::LocksDropHeld>(&rt, &dir, api::DropHeldParams { ino, remote }, print_ack)
         }
         Command::Leave {
             target,
@@ -1270,10 +1317,7 @@ fn main() -> Result<()> {
             force,
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::Leave { node_id, force },
-            ))
+            ctl::<cm::NodeLeave>(&rt, &dir, api::LeaveParams { node_id, force }, print_ack)
         }
         Command::WriteMode {
             target,
@@ -1282,17 +1326,46 @@ fn main() -> Result<()> {
         } => {
             let mode: writeback::WriteMode = mode.parse().map_err(anyhow::Error::msg)?;
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
+            ctl::<cm::NodeSetWriteMode>(
+                &rt,
                 &dir,
-                constellation_api::Request::SetWriteMode {
+                api::SetWriteModeParams {
                     mode: mode.as_str().into(),
                 },
-            ))
+                print_ack,
+            )
+        }
+        Command::Lifecycle {
+            target,
+            event,
+            deadline_ms,
+            reachable,
+            metered,
+            state_dir,
+        } => {
+            let event = match event.as_str() {
+                "foreground" => api::LifecycleEventSpec::Foreground,
+                "background" => api::LifecycleEventSpec::Background,
+                "low-power" => api::LifecycleEventSpec::LowPower,
+                "suspending" | "suspend" => api::LifecycleEventSpec::Suspending {
+                    deadline_in_ms: deadline_ms,
+                },
+                "resumed" | "resume" => api::LifecycleEventSpec::Resumed,
+                "network" => api::LifecycleEventSpec::NetworkChanged { reachable, metered },
+                other => bail!(
+                    "unknown lifecycle event {other:?}: expected foreground, background, \
+                     low-power, suspending, resumed or network"
+                ),
+            };
+            let (_, dir) = resolve_target(&target, state_dir)?;
+            ctl::<cm::NodeLifecycle>(&rt, &dir, api::LifecycleParams { event }, |report| {
+                print_json(&report)
+            })
         }
         Command::Quota { command } => match command {
             QuotaCommand::Get { target, state_dir } => {
                 let (_, dir) = resolve_target(&target, state_dir)?;
-                rt.block_on(control_call(&dir, constellation_api::Request::GetQuota))
+                ctl::<cm::QuotaGet>(&rt, &dir, Default::default(), print_quota)
             }
             QuotaCommand::Set {
                 target,
@@ -1301,29 +1374,29 @@ fn main() -> Result<()> {
             } => {
                 let max_bytes = parse_quota_arg(&size)?;
                 let (_, dir) = resolve_target(&target, state_dir)?;
-                rt.block_on(control_call(
-                    &dir,
-                    constellation_api::Request::SetQuota { max_bytes },
-                ))
+                ctl::<cm::QuotaSet>(&rt, &dir, api::SetQuotaParams { max_bytes }, |_| {
+                    match max_bytes {
+                        Some(cap) => println!("quota set to {cap} bytes"),
+                        None => println!("quota cleared (unlimited)"),
+                    }
+                    Ok(())
+                })
             }
         },
         Command::Prune { command } => run_prune_command(&rt, command),
         Command::Inspect { target, state_dir } => {
             let (t, dir) = resolve_target(&target, state_dir)?;
             let path = target::effective_path(&t);
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::Inspect { path },
-            ))
+            ctl::<cm::BrowseInspect>(&rt, &dir, api::PathParams { path }, |e| print_json(&e))
         }
         Command::Cache { command } => match command {
             CacheCommand::Ls { target, state_dir } => {
                 let (_, dir) = resolve_target(&target, state_dir)?;
-                rt.block_on(control_call(&dir, constellation_api::Request::CacheList))
+                ctl::<cm::CacheList>(&rt, &dir, Default::default(), |l| print_json(&l.entries))
             }
             CacheCommand::Stat { target, state_dir } => {
                 let (_, dir) = resolve_target(&target, state_dir)?;
-                rt.block_on(control_call(&dir, constellation_api::Request::Status))
+                ctl::<cm::NodeStatus>(&rt, &dir, Default::default(), |s| print_json(&s))
             }
             CacheCommand::Prune {
                 target,
@@ -1331,10 +1404,10 @@ fn main() -> Result<()> {
                 target_bytes,
             } => {
                 let (_, dir) = resolve_target(&target, state_dir)?;
-                rt.block_on(control_call(
-                    &dir,
-                    constellation_api::Request::CachePrune { target_bytes },
-                ))
+                ctl::<cm::CachePrune>(&rt, &dir, api::CachePruneParams { target_bytes }, |r| {
+                    println!("{}", r.detail);
+                    Ok(())
+                })
             }
         },
         Command::Log {
@@ -1346,10 +1419,23 @@ fn main() -> Result<()> {
                 },
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::LogTail { lines },
-            ))
+            rt.block_on(async {
+                use std::io::Write;
+                let client = control::connect(&dir).await?;
+                let mut chunks = client
+                    .call_chunks::<cm::NodeLogsTail>(api::LogTailParams {
+                        lines,
+                        follow: false,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+                let mut out = std::io::stdout().lock();
+                while let Some(chunk) = futures::StreamExt::next(&mut chunks).await {
+                    out.write_all(&chunk.map_err(|e| anyhow::anyhow!("{}", e.message))?)?;
+                }
+                out.flush()?;
+                Ok(())
+            })
         }
         Command::Snapshot { command } => match command {
             SnapshotCommand::Create { target, state_dir } => {
@@ -1361,10 +1447,18 @@ fn main() -> Result<()> {
                     }
                     target::Target::Raw(raw) => raw.clone(),
                 };
-                rt.block_on(control_call(
+                ctl::<cm::SnapshotCreate>(
+                    &rt,
                     &dir,
-                    constellation_api::Request::SnapshotCreate { selector },
-                ))
+                    api::SnapshotCreateParams {
+                        selector,
+                        hold: None,
+                    },
+                    |c| {
+                        println!("{}", c.detail);
+                        Ok(())
+                    },
+                )
             }
             SnapshotCommand::Ls { target, state_dir } => {
                 let (t, dir) = resolve_target(&target, state_dir)?;
@@ -1372,10 +1466,9 @@ fn main() -> Result<()> {
                     target::Target::Named { path, .. } => path.clone(),
                     target::Target::Raw(raw) => Some(raw.clone()),
                 };
-                rt.block_on(control_call(
-                    &dir,
-                    constellation_api::Request::SnapshotList { path },
-                ))
+                ctl::<cm::SnapshotList>(&rt, &dir, api::SnapshotListParams { path }, |l| {
+                    print_json(&l.snapshots)
+                })
             }
             SnapshotCommand::Delete { target, state_dir } => {
                 let (t, dir) = resolve_target(&target, state_dir)?;
@@ -1386,10 +1479,12 @@ fn main() -> Result<()> {
                     }
                     target::Target::Raw(raw) => raw.clone(),
                 };
-                rt.block_on(control_call(
+                ctl::<cm::SnapshotDelete>(
+                    &rt,
                     &dir,
-                    constellation_api::Request::SnapshotDelete { selector },
-                ))
+                    api::SnapshotDeleteParams { selector },
+                    print_ack,
+                )
             }
         },
         Command::Clone {
@@ -1405,13 +1500,15 @@ fn main() -> Result<()> {
                 }
                 target::Target::Raw(raw) => raw.clone(),
             };
-            rt.block_on(control_call(
+            ctl::<cm::CloneCreate>(
+                &rt,
                 &dir,
-                constellation_api::Request::Clone {
+                api::CloneParams {
                     selector,
                     destination,
                 },
-            ))
+                print_ack,
+            )
         }
         Command::Debug {
             command:
@@ -1422,10 +1519,12 @@ fn main() -> Result<()> {
                 },
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::SnapRefs { id },
-            ))
+            ctl::<cm::SnapshotRefs>(&rt, &dir, api::SnapRefsParams { id }, |r| {
+                for hash in r.hashes {
+                    println!("{hash}");
+                }
+                Ok(())
+            })
         }
         Command::Gc { command } => {
             let (target, s3, state_dir, verify_only) = match command {
@@ -1507,6 +1606,7 @@ struct MountArgs {
     rw: bool,
     clone_name: Option<String>,
     ephemeral: bool,
+    confine_links: bool,
     web_ui: Option<u16>,
 }
 
@@ -1520,6 +1620,7 @@ struct ViewSpec {
     rw: bool,
     clone_name: Option<String>,
     ephemeral: bool,
+    confine_links: bool,
 }
 
 impl ViewSpec {
@@ -1536,6 +1637,7 @@ impl ViewSpec {
             rw: e.rw,
             clone_name: e.clone_name.clone(),
             ephemeral: e.ephemeral,
+            confine_links: e.confine_links,
         }
     }
 
@@ -1559,17 +1661,31 @@ impl ViewSpec {
             rw_snapshot: self.rw,
             clone_name: self.clone_name.clone(),
             ephemeral: self.ephemeral,
+            confine_links: self.confine_links,
+            labels: Default::default(),
+            qos: Default::default(),
         }
     }
 
-    fn mount_opts(&self) -> constellation_api::MountViewOpts {
-        constellation_api::MountViewOpts {
-            allow_other: self.allow_other,
-            fs_name: Some(self.fs_name.clone()),
-            fuse_threads: None,
-            rw: self.rw,
-            clone_name: self.clone_name.clone(),
-            ephemeral: self.ephemeral,
+    /// `view.mount`'s parameters for attaching this view to a running
+    /// daemon.
+    fn mount_params(&self) -> api::ViewMountParams {
+        api::ViewMountParams {
+            subtree: self.inner_path(),
+            source: api::MountSource::Path {
+                mountpoint: self.mountpoint.clone(),
+                opts: api::MountViewOpts {
+                    allow_other: self.allow_other,
+                    fs_name: Some(self.fs_name.clone()),
+                    fuse_threads: None,
+                    rw: self.rw,
+                    clone_name: self.clone_name.clone(),
+                    ephemeral: self.ephemeral,
+                },
+            },
+            labels: Default::default(),
+            qos: Default::default(),
+            confine_links: self.confine_links,
         }
     }
 }
@@ -1602,6 +1718,7 @@ fn cmd_mount(
         rw,
         clone_name,
         ephemeral,
+        confine_links,
         web_ui,
     } = args;
     let cto_strict = crate::cto::strict_from(cto.as_deref())?;
@@ -1699,6 +1816,9 @@ fn cmd_mount(
                         .clone()
                         .or_else(|| stored.and_then(|m| m.clone_name.clone())),
                     ephemeral: ephemeral || stored.is_some_and(|m| m.ephemeral),
+                    // Like `allow_other`: an access policy this command
+                    // line states (a bare `mount NAME` keeps it as stored).
+                    confine_links,
                 }
             });
             if let Some(view) = &mount_override {
@@ -1776,6 +1896,7 @@ fn cmd_mount(
                 rw,
                 clone_name,
                 ephemeral,
+                confine_links,
             };
             (
                 None,
@@ -1897,32 +2018,27 @@ enum LockOutcome {
 fn take_state_dir_lock(state_dir: &Path) -> Result<LockOutcome> {
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(state_dir.join("daemon.lock"))
-        .context("opening daemon.lock")?;
-    use std::os::fd::AsRawFd;
-    let fd = lock_file.as_raw_fd();
-    // SAFETY: `fd` is a valid, open fd owned by `lock_file` for the
-    // duration of this call.
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        // We hold it now. Leak the `File` so the lock survives for the
-        // rest of this process's life (released automatically on exit,
-        // by the kernel closing every fd) rather than dropping here.
-        std::mem::forget(lock_file);
-        let _ = std::fs::remove_file(state_dir.join(constellation_api::SOCKET_NAME));
-        let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
-        Ok(LockOutcome::BecomeDaemon)
-    } else {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(LockOutcome::Attach)
-        } else {
-            Err(err).context("locking daemon.lock")
+    let lock_file =
+        constellation_platform::lock::open_lock_file(&state_dir.join(daemon_lock::LOCK_NAME))
+            .context("opening daemon.lock")?;
+    match constellation_platform::native()
+        .file_lock
+        .try_lock(lock_file)
+        .context("locking daemon.lock")?
+    {
+        Some(guard) => {
+            // We hold it now. Leak the guard so the lock survives for the
+            // rest of this process's life (released automatically on
+            // exit, by the kernel closing every fd) rather than dropping
+            // here.
+            // Plan 31 C4b: an in-place upgrade hands this very lock on.
+            handover::set_lock_fd(std::os::fd::AsRawFd::as_raw_fd(guard.file()));
+            std::mem::forget(guard);
+            constellation_control::transport::forget_socket(state_dir);
+            let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
+            Ok(LockOutcome::BecomeDaemon)
         }
+        None => Ok(LockOutcome::Attach),
     }
 }
 
@@ -1958,7 +2074,6 @@ fn cmd_mount_body(
         .max_blocking_threads(threads.blocking)
         .enable_all()
         .build()?;
-    let sock = state_dir.join(constellation_api::SOCKET_NAME);
     // A daemon that is draining before exit still holds `daemon.lock` and
     // still serves `control.sock`, so we would otherwise `Attach` and add
     // a view onto a process about to exit (which orphans the mount). If
@@ -1989,10 +2104,7 @@ fn cmd_mount_body(
         match take_state_dir_lock(state_dir)? {
             LockOutcome::Attach => {
                 startup::phase("probing the daemon that holds daemon.lock");
-                let probe = rt.block_on(constellation_api::ping(
-                    &sock,
-                    daemon_lock::control_timeout(),
-                ));
+                let probe = rt.block_on(control::ping(state_dir, daemon_lock::control_timeout()));
                 match probe {
                     Ok(true) => {}
                     other => {
@@ -2045,7 +2157,7 @@ fn cmd_mount_body(
                 }
                 startup::phase("attaching views to the running daemon");
                 let remaining = attach_deadline.saturating_sub(attach_started.elapsed());
-                match rt.block_on(attach_views(&sock, &views, remaining))? {
+                match rt.block_on(attach_views(state_dir, &views, remaining))? {
                     AttachOutcome::Attached => {
                         for view in &views {
                             println!("mounted {} at {}", view.subtree, view.mountpoint.display());
@@ -2055,6 +2167,20 @@ fn cmd_mount_body(
                             v.success_attached()?;
                         }
                         return Ok(());
+                    }
+                    AttachOutcome::DaemonUpgrading => {
+                        // Views already attached stay; `MountAdd` of one
+                        // already mounted is refused below the next time,
+                        // so retry only while the deadline allows.
+                        if attach_started.elapsed() >= attach_deadline {
+                            return fail(
+                                verdict,
+                                "the daemon was being upgraded for the whole attach timeout"
+                                    .to_string(),
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
                     }
                     AttachOutcome::DaemonShuttingDown => {
                         eprintln!(
@@ -2066,10 +2192,12 @@ fn cmd_mount_body(
                         // surfaces an error rather than spinning forever.
                         let deadline =
                             std::time::Instant::now() + std::time::Duration::from_secs(600);
-                        while sock.exists() && std::time::Instant::now() < deadline {
+                        while control::socket_exists(state_dir)
+                            && std::time::Instant::now() < deadline
+                        {
                             std::thread::sleep(std::time::Duration::from_millis(200));
                         }
-                        if sock.exists() {
+                        if control::socket_exists(state_dir) {
                             return fail(
                                 verdict,
                                 "existing daemon is still shutting down after 600s; \
@@ -2110,26 +2238,45 @@ fn cmd_mount_body(
             // And should this daemon end the same way, its reaper does
             // the abort within seconds instead of at the next mount.
             match daemon_lock::spawn_reaper(state_dir) {
-                Ok(pid) => tracing::info!(reaper_pid = pid, "zombie reaper started"),
+                Ok(pid) => {
+                    handover::set_reaper_pid(pid);
+                    tracing::info!(reaper_pid = pid, "zombie reaper started")
+                }
                 Err(e) => tracing::warn!(error = %e, "the zombie reaper could not be started"),
             }
             startup::phase("starting the node runtime");
             let handle = rt.handle().clone();
             let node = match node_runtime::NodeRuntime::start(
                 node_runtime::NodeConfig {
-                    s3,
-                    state_dir: Some(state_dir.to_path_buf()),
-                    cache_size,
-                    fsync_s3,
-                    cto_strict,
-                    locks,
-                    initial_write_mode,
-                    read_only_member,
+                    fs_id: constellation_engine::FsId::new(state_dir.display().to_string()),
+                    engine: constellation_engine::EngineConfig {
+                        state_dir: Some(state_dir.to_path_buf()),
+                        cache_size,
+                        fsync_s3,
+                        cto_strict,
+                        locks,
+                        initial_write_mode,
+                        read_only_member,
+                        atime_mode,
+                        // Collected in the foreground before the fork, or
+                        // (in `--foreground`) the env var / a prompt, only
+                        // if the filesystem turns out to be encrypted.
+                        passphrase: match passphrase {
+                            Some(secret) => constellation_engine::PassphraseSource::Given(secret),
+                            None => constellation_engine::PassphraseSource::Ask(Box::new(|| {
+                                crate::passphrase(
+                                    "CONSTELLATION_PASSPHRASE",
+                                    "Filesystem passphrase: ",
+                                )
+                            })),
+                        },
+                        pin_target: Some(pin_target),
+                        version: env!("CONSTELLATION_VERSION").to_string(),
+                        ..constellation_engine::EngineConfig::new(s3)
+                    },
                     web_ui,
                     log_buffer,
-                    atime_mode,
-                    passphrase,
-                    pin_target: Some(pin_target),
+                    resumed: None,
                 },
                 handle,
             ) {
@@ -2181,10 +2328,10 @@ fn cmd_mount_body(
             }
             // Block on every view; the process exits once the last one's
             // thread has completed its own teardown (see
-            // `NodeRuntime::add_mount`'s thread body).
-            for (id, _) in added {
-                node.join_mount(id)?;
-            }
+            // `NodeRuntime::add_mount`'s thread body) — and not while an
+            // in-place upgrade is handing the views over.
+            drop(added);
+            node.wait_all();
             let failed = node.shutdown_error();
             drop(node);
             // Never wait indefinitely for a blocking task a failed drain
@@ -2208,13 +2355,16 @@ enum AttachOutcome {
     /// lock/become-daemon flow rather than orphaning a mount on a dying
     /// process.
     DaemonShuttingDown,
+    /// Plan 31 C4b: the daemon is handing its views over to a new image
+    /// (`daemon --upgrade`); the same daemon answers again shortly.
+    DaemonUpgrading,
 }
 
 /// Attach every view through the running daemon's control socket. Each
 /// `MountAdd` is bounded by what is left of `within` (campaign 6 B-1: a
 /// listener nobody serves must not park this process forever).
 async fn attach_views(
-    sock: &Path,
+    state_dir: &Path,
     views: &[ViewSpec],
     within: std::time::Duration,
 ) -> Result<AttachOutcome> {
@@ -2223,26 +2373,19 @@ async fn attach_views(
         let remaining = within
             .saturating_sub(started.elapsed())
             .max(std::time::Duration::from_secs(1));
-        let resp = constellation_api::call_bounded(
-            sock,
-            &constellation_api::Request::MountAdd {
-                subtree: view.inner_path(),
-                mountpoint: view.mountpoint.clone(),
-                opts: view.mount_opts(),
-            },
-            remaining,
-        )
-        .await
-        .with_context(|| format!("attaching {}", view.mountpoint.display()))?;
+        let resp =
+            control::try_call::<cm::ViewMount>(state_dir, view.mount_params(), Some(remaining))
+                .await
+                .with_context(|| format!("attaching {}", view.mountpoint.display()))?;
         match resp {
-            constellation_api::Response::Ok { .. } => {}
-            constellation_api::Response::Error { message } if message.contains("shutting down") => {
+            Ok(_) => {}
+            Err(e) if e.message.contains("shutting down") => {
                 return Ok(AttachOutcome::DaemonShuttingDown);
             }
-            constellation_api::Response::Error { message } => {
-                bail!("{}: {message}", view.mountpoint.display())
+            Err(e) if e.message.contains(node_runtime::UPGRADING) => {
+                return Ok(AttachOutcome::DaemonUpgrading);
             }
-            other => bail!("unexpected response: {other:?}"),
+            Err(e) => bail!("{}: {}", view.mountpoint.display(), e.message),
         }
     }
     Ok(AttachOutcome::Attached)
@@ -2256,76 +2399,62 @@ async fn cmd_umount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
     let reg = registry::Registry::load()?;
     let resolved = target::resolve(&target, &reg);
     let dir = target::state_dir(state_dir, &resolved)?;
-    let sock = dir.join(constellation_api::SOCKET_NAME);
+    let list = || async {
+        control::call::<cm::ViewList>(&dir, Default::default())
+            .await
+            .map(|l| l.views)
+    };
     let mountpoints: Vec<PathBuf> = match &resolved {
         target::Target::Named {
             path: Some(subtree),
             ..
         } => {
-            let resp =
-                constellation_api::call(&sock, &constellation_api::Request::MountList).await?;
-            let mounts = match resp {
-                constellation_api::Response::Mounts { mounts } => mounts,
-                other => bail!("unexpected response: {other:?}"),
-            };
             let want = subtree.as_str();
-            mounts
+            list()
+                .await?
                 .into_iter()
                 .filter(|m| m.subtree == want)
                 .map(|m| PathBuf::from(m.mountpoint))
                 .collect()
         }
-        _ => {
-            let resp =
-                constellation_api::call(&sock, &constellation_api::Request::MountList).await?;
-            match resp {
-                constellation_api::Response::Mounts { mounts } => mounts
-                    .into_iter()
-                    .map(|m| PathBuf::from(m.mountpoint))
-                    .collect(),
-                other => bail!("unexpected response: {other:?}"),
-            }
-        }
+        _ => list()
+            .await?
+            .into_iter()
+            .map(|m| PathBuf::from(m.mountpoint))
+            .collect(),
     };
     if mountpoints.is_empty() {
         bail!("no matching mounted view for {target:?}");
     }
     for mountpoint in &mountpoints {
-        let resp = constellation_api::call(
-            &sock,
-            &constellation_api::Request::MountRemove {
+        let ack = control::call::<cm::ViewUnmount>(
+            &dir,
+            api::ViewUnmountParams {
                 mountpoint: mountpoint.clone(),
             },
         )
         .await?;
-        match resp {
-            constellation_api::Response::Ok { detail } => println!("{detail}"),
-            constellation_api::Response::Error { message } => bail!("{message}"),
-            other => bail!("unexpected response: {other:?}"),
-        }
+        println!("{}", ack.detail);
     }
     // Removing a view does not by itself mean the daemon is going away: it
-    // only runs its clean-shutdown sequence (and deletes `control.sock`)
-    // once its *last* view is gone (`NodeRuntime::remove_mount`). A
+    // only runs its clean-shutdown sequence (and removes its socket) once
+    // its *last* view is gone (`NodeRuntime::remove_mount`). A
     // `NAME:/sub` umount that leaves sibling views mounted must not wait on
     // the socket at all — it would never disappear while the daemon keeps
     // serving them, which is how `umount myfs:/sub` used to hang forever
     // even though the daemon's own log showed the view cleanly detached
     // ("FUSE detached") and moved on. Ask the daemon (if still reachable)
     // whether any view is left before deciding to wait for it to exit.
-    let other_views_remain = matches!(
-        constellation_api::call(&sock, &constellation_api::Request::MountList).await,
-        Ok(constellation_api::Response::Mounts { mounts }) if !mounts.is_empty()
-    );
+    let other_views_remain = matches!(list().await, Ok(views) if !views.is_empty());
     // Wait for the daemon to actually exit if this removed its last view.
-    // The daemon deletes `control.sock` only at the very end of its clean
+    // The daemon removes its socket only at the very end of its clean
     // shutdown (drain uploads + ship journal), so the socket's presence is
     // the honest "still shutting down" signal. Rather than a fixed 10s cap
     // — which silently returned "done" while a large drain was still in
     // flight, tempting a remount that orphaned a mount — poll the live
     // status and report drain progress until the socket is gone.
-    if !other_views_remain && sock.exists() {
-        wait_for_daemon_exit(&sock).await;
+    if !other_views_remain && control::socket_exists(&dir) {
+        wait_for_daemon_exit(&dir).await;
     }
     Ok(())
 }
@@ -2336,15 +2465,16 @@ async fn cmd_umount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
 /// — a daemon that never finishes draining will keep this waiting, which
 /// is the honest state; the user can Ctrl-C to stop watching (the drain
 /// continues in the daemon regardless).
-async fn wait_for_daemon_exit(sock: &Path) {
+async fn wait_for_daemon_exit(state_dir: &Path) {
     let mut last_report = std::time::Instant::now();
     let started = last_report;
-    while sock.exists() {
+    while control::socket_exists(state_dir) {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if last_report.elapsed() >= std::time::Duration::from_secs(2) && sock.exists() {
+        if last_report.elapsed() >= std::time::Duration::from_secs(2)
+            && control::socket_exists(state_dir)
+        {
             last_report = std::time::Instant::now();
-            if let Ok(constellation_api::Response::Status(report)) =
-                constellation_api::call(sock, &constellation_api::Request::Status).await
+            if let Ok(report) = control::call::<cm::NodeStatus>(state_dir, Default::default()).await
             {
                 let pending = report.writeback.pending_uploads;
                 let backlog = report.spool.journal_backlog;
@@ -2372,7 +2502,7 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
         .cloned()
         .with_context(|| format!("{name:?} is not a registered filesystem"))?;
     let db_path = entry.state_dir.join("meta.db");
-    let sock = entry.state_dir.join(constellation_api::SOCKET_NAME);
+    let dir = entry.state_dir.clone();
     // A running daemon holds `fjall`'s single-process lock on `meta.db`
     // (unlike the old SQLite/WAL engine, which tolerated this direct
     // open concurrently), so check aliveness first: if it answers at
@@ -2380,8 +2510,8 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
     // store directly here would otherwise fail with `Locked` and be
     // swallowed by `.ok()`, silently skipping the self-leave below.
     let daemon_alive = matches!(
-        constellation_api::call(&sock, &constellation_api::Request::Ping).await,
-        Ok(constellation_api::Response::Pong)
+        control::ping(&dir, daemon_lock::control_timeout()).await,
+        Ok(true)
     );
     let node_id_claimed = daemon_alive
         || (db_path.exists() && {
@@ -2391,32 +2521,33 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
                 .is_some()
         });
     if node_id_claimed {
-        match constellation_api::call(
-            &sock,
-            &constellation_api::Request::Leave {
+        match control::try_call::<cm::NodeLeave>(
+            &dir,
+            api::LeaveParams {
                 node_id: None,
                 force,
             },
+            None,
         )
         .await
         {
-            Ok(constellation_api::Response::Ok { detail }) => {
-                println!("{detail}");
+            Ok(Ok(ack)) => {
+                println!("{}", ack.detail);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while sock.exists() && std::time::Instant::now() < deadline {
+                while control::socket_exists(&dir) && std::time::Instant::now() < deadline {
                     if force {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
-            Ok(constellation_api::Response::Error { message }) => {
+            Ok(Err(e)) => {
+                let message = e.message;
                 if !force {
                     bail!("leave failed: {message}");
                 }
                 eprintln!("leave failed (continuing: --force): {message}");
             }
-            Ok(other) => bail!("unexpected response: {other:?}"),
             Err(_) => {
                 // Daemon unreachable: it left ungracefully or was never
                 // cleanly stopped. Refuse a live-but-wedged daemon
@@ -2427,10 +2558,12 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
                 if lock_path.exists() && !force {
                     let probe = std::fs::OpenOptions::new().write(true).open(&lock_path);
                     if let Ok(f) = probe {
-                        use std::os::fd::AsRawFd;
-                        let held = unsafe {
-                            libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0
-                        };
+                        // Anything but getting the lock (and releasing it
+                        // again as the guard drops) counts as held.
+                        let held = !matches!(
+                            constellation_platform::native().file_lock.try_lock(f),
+                            Ok(Some(_))
+                        );
                         if held {
                             bail!(
                                 "daemon.lock for {name:?} is held by a live process (starting up \
@@ -2490,17 +2623,12 @@ fn cmd_fs_list(rt: &tokio::runtime::Runtime) -> Result<()> {
         "NAME", "S3", "STATE-DIR", "SUBTREE", "MOUNTPOINT"
     );
     for (name, entry) in reg.iter() {
-        let sock = entry.state_dir.join(constellation_api::SOCKET_NAME);
-        let live: Vec<constellation_api::MountInfo> = rt
-            .block_on(constellation_api::call(
-                &sock,
-                &constellation_api::Request::MountList,
+        let live: Vec<api::ViewInfo> = rt
+            .block_on(control::call::<cm::ViewList>(
+                &entry.state_dir,
+                Default::default(),
             ))
-            .ok()
-            .and_then(|resp| match resp {
-                constellation_api::Response::Mounts { mounts } => Some(mounts),
-                _ => None,
-            })
+            .map(|l| l.views)
             .unwrap_or_default();
         if entry.mounts.is_empty() {
             println!(
@@ -2570,15 +2698,9 @@ async fn run_gc_cli(
     // over the control socket instead of racing it for the lock; a
     // failed/absent connection means nothing is mounted here, so fall
     // through to opening the store directly exactly as before.
-    let sock = dir.join(constellation_api::SOCKET_NAME);
-    match constellation_api::call(&sock, &constellation_api::Request::GcRun { verify_only }).await {
-        Ok(constellation_api::Response::GcReport { report }) => {
-            return Ok(serde_json::from_value(report)?);
-        }
-        Ok(constellation_api::Response::Error { message }) => {
-            bail!("gc failed in the running daemon: {message}");
-        }
-        Ok(other) => bail!("unexpected response from running daemon: {other:?}"),
+    match control::try_call::<cm::GcRun>(&dir, api::GcRunParams { verify_only }, None).await {
+        Ok(Ok(report)) => return Ok(serde_json::from_value(report.report.0)?),
+        Ok(Err(e)) => bail!("gc failed in the running daemon: {}", e.message),
         Err(_) => {}
     }
 
@@ -2632,23 +2754,18 @@ async fn run_fsck_cli(
     // over the control socket when one is up for this state dir; a
     // failed/absent connection means nothing is mounted here, so fall
     // through to opening the store directly exactly as before.
-    let sock = dir.join(constellation_api::SOCKET_NAME);
-    match constellation_api::call(
-        &sock,
-        &constellation_api::Request::FsckRun {
+    match control::try_call::<cm::FsckRun>(
+        &dir,
+        api::FsckRunParams {
             repair,
             force_release: force_release.map(str::to_string),
         },
+        None,
     )
     .await
     {
-        Ok(constellation_api::Response::FsckReport { report }) => {
-            return Ok(serde_json::from_value(report)?);
-        }
-        Ok(constellation_api::Response::Error { message }) => {
-            bail!("fsck failed in the running daemon: {message}");
-        }
-        Ok(other) => bail!("unexpected response from running daemon: {other:?}"),
+        Ok(Ok(report)) => return Ok(serde_json::from_value(report.report.0)?),
+        Ok(Err(e)) => bail!("fsck failed in the running daemon: {}", e.message),
         Err(_) => {}
     }
 
@@ -2681,1101 +2798,6 @@ async fn run_fsck_cli(
     .await
 }
 
-fn remove_live_subtree(meta: &Meta, path: &str) -> Result<()> {
-    let ino = meta
-        .resolve_path(path)?
-        .with_context(|| format!("clone path {path} disappeared"))?;
-    fn clear(meta: &Meta, ino: u64) -> Result<()> {
-        for entry in constellation_meta::MetaStore::readdir(meta, ino)? {
-            if entry.kind == constellation_fs_core::InodeKind::Dir {
-                clear(meta, entry.ino)?;
-                constellation_meta::MetaStore::rmdir(meta, ino, &entry.name)?;
-            } else {
-                constellation_meta::MetaStore::unlink(meta, ino, &entry.name)?;
-            }
-        }
-        Ok(())
-    }
-    clear(meta, ino)?;
-    let parent = meta
-        .parent_of(ino)?
-        .context("ephemeral clone cannot be the filesystem root")?;
-    let name = path
-        .rsplit('/')
-        .find(|part| !part.is_empty())
-        .context("ephemeral clone has no basename")?;
-    constellation_meta::MetaStore::rmdir(meta, parent, name)?;
-    Ok(())
-}
-
-/// Bridges the P2P layer to the daemon's sync task.
-///
-/// Both directions are latency-only. A `SegmentPublished` hint just
-/// nudges the syncer, which would have polled anyway; a `LeaseRequest`
-/// asks the sync task to flush and release, and S3's CAS remains the
-/// authority for who actually holds the lease.
-/// How long an epoch proposal's member-side S3 probe may take: a member
-/// whose probe has not succeeded by then is treated as cut from S3 (and
-/// may join, today's behaviour). Well inside the proposer's wait for the
-/// answer (`epoch::PROPOSE_REQUEST_TIMEOUT`, 2 s), so a probe that hangs
-/// in a real outage never turns the ack into a timeout — which would stop
-/// the epoch from forming in exactly the outage it is for.
-const EPOCH_MEMBER_S3_PROBE: std::time::Duration = std::time::Duration::from_millis(300);
-
-struct P2pBridge {
-    node_id: u64,
-    nudge: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
-    epochs: std::sync::Arc<epoch::EpochManager>,
-    /// The bucket, for an epoch proposal's member-side S3 probe.
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
-    coop: std::sync::Arc<crate::coop::Coop>,
-    placement: std::sync::Arc<placement::Placement>,
-}
-
-impl P2pBridge {
-    /// Plan 30 §M10's member-side S3 probe: one lease GET, bounded by
-    /// [`EPOCH_MEMBER_S3_PROBE`]. A member whose own rounds are failing at
-    /// S3 is in the outage and answers at once (a probe would only delay
-    /// an epoch's formation, eating into the carried lease's window).
-    async fn probe_s3(&self) -> bool {
-        !self.epochs.s3_failing() && {
-            let leases = constellation_store_s3::LeaseStore::new(
-                self.store.clone(),
-                constellation_store_s3::log::PARTITION,
-                constellation_store_s3::LeaseMode::Cas,
-            );
-            matches!(
-                tokio::time::timeout(EPOCH_MEMBER_S3_PROBE, leases.get()).await,
-                Ok(Ok(_))
-            )
-        }
-    }
-}
-
-impl constellation_net::PeerService for P2pBridge {
-    /// EC2 follow-up 3c, as fixed for `epoch-member-lost`: a would-be
-    /// proposer asks (`PingS3`), and this member probes S3 now — the same
-    /// bounded lease GET a proposal's member rule uses — rather than
-    /// trusting a last-answer time: a follower on the holder's log stream
-    /// may not have made an S3 request for seconds, and in a real bucket
-    /// outage its stale "yes" delayed the epoch past the holder's usable
-    /// lease (it formed carrying nothing, and every write failed).
-    fn s3_probe(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
-        Box::pin(self.probe_s3())
-    }
-
-    fn segment_published(&self, part: &str, seq: u64, epoch: u64) {
-        tracing::debug!(part, seq, epoch, "peer published a segment");
-        // The core decides: a node following the holder's log stream has
-        // it (or will) and ignores the hint; any other node tails now.
-        let _ = self
-            .nudge
-            .send(fusefs::SyncRequest::SegmentHint { seq, epoch });
-    }
-
-    fn log_subscribe(
-        &self,
-        requester: u64,
-        req_id: u64,
-        from: u64,
-    ) -> Option<tokio::sync::mpsc::Receiver<constellation_net::LogEvent>> {
-        // The driver queues into `sink` (bounded in frames and in bytes)
-        // and never waits; this relay hands frames to the stream writer
-        // one at a time, so `queued_bytes` counts exactly what is waiting
-        // for the subscriber.
-        let (sink, mut queue) = tokio::sync::mpsc::channel(authority_driver::log_stream_queue());
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(1);
-        let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        self.nudge
-            .send(fusefs::SyncRequest::LogSubscribe {
-                requester,
-                req: req_id,
-                from,
-                sink,
-                queued_bytes: queued_bytes.clone(),
-            })
-            .ok()?;
-        tokio::spawn(async move {
-            while let Some(event) = queue.recv().await {
-                if let constellation_net::LogEvent::Frame {
-                    segment: Some((_, bytes)),
-                    ..
-                } = &event
-                {
-                    queued_bytes
-                        .fetch_sub(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                if writer_tx.send(event).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Some(writer_rx)
-    }
-
-    fn lease_requested(
-        &self,
-        part: String,
-        requester: u64,
-        epoch_applied: Option<u64>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let declined = constellation_net::Payload::LeaseHandoff {
-                part: part.clone(),
-                epoch: 0,
-                released: false,
-                etag: None,
-                head_seq: None,
-            };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::HandOff {
-                    requester,
-                    epoch_applied,
-                    reply: tx,
-                })
-                .is_err()
-            {
-                return declined;
-            }
-            match rx.await {
-                Ok(Some(handed)) => {
-                    tracing::info!(
-                        part,
-                        requester,
-                        epoch = handed.epoch,
-                        "handed the lease to a peer"
-                    );
-                    constellation_net::Payload::LeaseHandoff {
-                        part,
-                        epoch: handed.epoch,
-                        released: true,
-                        etag: handed.etag,
-                        head_seq: handed.head_seq,
-                    }
-                }
-                // Not ours, flush failed, or the task went away: the
-                // requester falls back to the S3 path, which is always
-                // correct — it just costs the TTL wait.
-                _ => declined,
-            }
-        })
-    }
-
-    fn deleg_backup_append_requested(
-        &self,
-        from: u64,
-        req_id: u64,
-        gen: u64,
-        txs: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let sealed = constellation_net::Payload::DelegBackupAck {
-                req_id,
-                gen,
-                acked: 0,
-                sealed: true,
-            };
-            let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs) else {
-                return sealed;
-            };
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerDelegBackupAppend {
-                    from,
-                    gen,
-                    txs,
-                    reply,
-                })
-                .is_err()
-            {
-                return sealed;
-            }
-            match receive.await {
-                Ok((acked, is_sealed)) => constellation_net::Payload::DelegBackupAck {
-                    req_id,
-                    gen,
-                    acked,
-                    sealed: is_sealed,
-                },
-                Err(_) => sealed,
-            }
-        })
-    }
-
-    fn deleg_seal_requested(
-        &self,
-        root: u64,
-        req_id: u64,
-        gen: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let none = constellation_net::Payload::DelegSealed {
-                req_id,
-                gen,
-                sealed: false,
-                txs: Vec::new(),
-            };
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerDelegSeal { root, gen, reply })
-                .is_err()
-            {
-                return none;
-            }
-            match receive.await {
-                Ok((sealed, txs)) => constellation_net::Payload::DelegSealed {
-                    req_id,
-                    gen,
-                    sealed,
-                    txs: postcard::to_allocvec(&txs).unwrap_or_default(),
-                },
-                Err(_) => none,
-            }
-        })
-    }
-
-    fn epoch_proposed(
-        &self,
-        epoch_id: String,
-        members: Vec<u64>,
-        base: Vec<(String, u64)>,
-        proposer: u64,
-        epoch_slack: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            // Plan 30 §M10 (the member rule, see `handle_propose_checked`):
-            // probe S3 now — one lease GET, bounded — rather than trust a
-            // last-success time that a follower on the holder's log stream
-            // may not have refreshed for seconds.
-            // A member whose own rounds are failing at S3 is in the
-            // outage: it joins at once (a probe would only delay the
-            // formation, eating into the carried lease's usable window).
-            let reaches_s3 = self.probe_s3().await;
-            self.epochs.handle_propose_checked(
-                epoch_id,
-                members,
-                base,
-                proposer,
-                epoch_slack,
-                reaches_s3,
-            )
-        })
-    }
-
-    fn epoch_aborted(&self, epoch_id: String, proposer: u64) {
-        if self.epochs.handle_abort(&epoch_id, proposer) {
-            let _ = self.nudge.send(fusefs::SyncRequest::EpochChanged);
-        }
-    }
-
-    fn epoch_activated(&self, activation: constellation_net::EpochActivation) {
-        self.epochs.handle_activate(activation);
-        let _ = self.nudge.send(fusefs::SyncRequest::EpochChanged);
-        let _ = self.nudge.send(fusefs::SyncRequest::Nudge);
-    }
-
-    fn promise_requested(
-        &self,
-        requester: u64,
-        req_id: u64,
-        expires_unix_ms: i64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let refuse = constellation_net::Payload::PromiseReply {
-                req_id,
-                until: None,
-                epoch_slack: 0,
-            };
-            if crate::fault::p2p_denied(requester) {
-                // Fault injection: the link is cut; no answer.
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                return refuse;
-            }
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerPromiseRequest {
-                    requester,
-                    expires_unix_ms,
-                    reply,
-                })
-                .is_err()
-            {
-                return refuse;
-            }
-            match receive.await {
-                Ok((until, epoch_slack)) => constellation_net::Payload::PromiseReply {
-                    req_id,
-                    until,
-                    epoch_slack,
-                },
-                Err(_) => refuse,
-            }
-        })
-    }
-
-    fn cache_digest(&self, digest: constellation_net::DigestSnapshot) {
-        self.coop.apply_digest(digest);
-    }
-
-    fn cache_digest_delta(&self, delta: constellation_net::DigestDelta) {
-        self.coop.apply_delta(delta);
-    }
-
-    fn cache_summary(&self, node_id: u64, summary: constellation_net::reconcile::Summary) {
-        self.coop.apply_summary(node_id, summary);
-    }
-
-    fn cache_set_delta(&self, node_id: u64, delta: constellation_net::reconcile::Delta) {
-        self.coop.apply_set_delta(node_id, delta);
-    }
-
-    fn reconcile_requested(
-        &self,
-        queries: Vec<constellation_net::reconcile::Query>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move { self.coop.reconcile_reply(queries).await })
-    }
-
-    fn serve_chunk(
-        &self,
-        hash: [u8; 32],
-        from_hex: String,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Vec<u8>, constellation_net::ChunkDecline>>
-                + Send
-                + '_,
-        >,
-    > {
-        Box::pin(async move { self.coop.serve_chunk(hash, &from_hex).await })
-    }
-
-    fn node_id(&self) -> u64 {
-        self.node_id
-    }
-
-    fn chunks_durable(
-        &self,
-        from: u64,
-        hashes: Vec<[u8; 32]>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
-            let (reply, done) = tokio::sync::oneshot::channel();
-            let hashes = hashes
-                .into_iter()
-                .map(constellation_fs_core::ChunkHash)
-                .collect();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::ChunksDurable {
-                    from,
-                    hashes,
-                    reply,
-                })
-                .is_ok()
-            {
-                let _ = done.await;
-            }
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn mutate_requested(
-        &self,
-        part: String,
-        requester: u64,
-        req_id: u64,
-        _epoch_seen: u64,
-        op: Vec<u8>,
-        rid: (u64, u32, u64),
-        acked_through: u64,
-        deps: Vec<u8>,
-        pending: Vec<[u8; 32]>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let _ = part;
-            let pending = pending
-                .into_iter()
-                .map(constellation_fs_core::ChunkHash)
-                .collect();
-            let rid = constellation_meta::Rid {
-                node: rid.0,
-                incarnation: rid.1,
-                seq: rid.2,
-            };
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let started = std::time::Instant::now();
-            tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate request queued");
-            let (outcome, base, position, gen) = if self
-                .nudge
-                .send(fusefs::SyncRequest::Mutate {
-                    requester,
-                    op,
-                    rid,
-                    acked_through,
-                    deps,
-                    pending,
-                    reply,
-                })
-                .is_ok()
-            {
-                receive.await.unwrap_or((
-                    constellation_meta::MutateOutcome::Busy,
-                    None,
-                    constellation_meta::Position::ZERO,
-                    0,
-                ))
-            } else {
-                (
-                    constellation_meta::MutateOutcome::Busy,
-                    None,
-                    constellation_meta::Position::ZERO,
-                    0,
-                )
-            };
-            tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate reply taken");
-            tracing::trace!(
-                requester,
-                service_us = started.elapsed().as_micros() as u64,
-                "forwarded mutate served"
-            );
-            constellation_net::Payload::MutateReply {
-                req_id,
-                outcome: outcome.to_postcard().unwrap_or_default(),
-                base,
-                position_seq: position.seq,
-                position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
-                position_streams: position.streams_wire(),
-                gen,
-            }
-        })
-    }
-
-    fn delegate_stream_requested(
-        &self,
-        from: u64,
-        req_id: u64,
-        gen: u64,
-        txs: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let refuse = constellation_net::Payload::DelegateStreamAck {
-                req_id,
-                gen,
-                through: 0,
-                refused: true,
-            };
-            let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs) else {
-                return refuse;
-            };
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerDelegateStream {
-                    from,
-                    gen,
-                    txs,
-                    reply,
-                })
-                .is_err()
-            {
-                return refuse;
-            }
-            match receive.await {
-                Ok((through, refused)) => constellation_net::Payload::DelegateStreamAck {
-                    req_id,
-                    gen,
-                    through,
-                    refused,
-                },
-                Err(_) => refuse,
-            }
-        })
-    }
-
-    fn deleg_renew_requested(
-        &self,
-        from: u64,
-        req_id: u64,
-        gen: u64,
-        backup: u64,
-        stream_head: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let (ttl_ms, locks, lock_grace_ms, lock_floor) = if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerDelegRenew {
-                    from,
-                    gen,
-                    backup,
-                    stream_head,
-                    reply,
-                })
-                .is_ok()
-            {
-                receive.await.unwrap_or_default()
-            } else {
-                Default::default()
-            };
-            constellation_net::Payload::DelegRenewed {
-                req_id,
-                gen,
-                ttl_ms,
-                locks: crate::locks::grants_wire(&locks),
-                lock_grace_ms,
-                lock_floor: crate::locks::floor_wire(&lock_floor),
-            }
-        })
-    }
-
-    fn deleg_recall_requested(
-        &self,
-        root: u64,
-        req_id: u64,
-        dir: u64,
-        gen: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let (through, locks) = if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerDelegRecall {
-                    root,
-                    dir,
-                    gen,
-                    reply,
-                })
-                .is_ok()
-            {
-                receive.await.unwrap_or_default()
-            } else {
-                Default::default()
-            };
-            constellation_net::Payload::DelegRecalled {
-                req_id,
-                gen,
-                through,
-                locks: crate::locks::grants_wire(&locks.grants),
-                lock_floor: crate::locks::floor_wire(&locks.floor),
-            }
-        })
-    }
-
-    fn chunk_handoff_requested(
-        &self,
-        requester: u64,
-        req_id: u64,
-        hashes: Vec<[u8; 32]>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let sent = self
-                .nudge
-                .send(fusefs::SyncRequest::AcceptHandoff {
-                    requester,
-                    hashes: hashes
-                        .into_iter()
-                        .map(constellation_fs_core::ChunkHash)
-                        .collect(),
-                    reply,
-                })
-                .is_ok();
-            let uploaded = sent && receive.await.unwrap_or(false);
-            constellation_net::Payload::ChunkHandoffReply { req_id, uploaded }
-        })
-    }
-
-    fn read_index_requested(
-        &self,
-        requester: u64,
-        req_id: u64,
-        ino: u64,
-        dir: bool,
-        name: Option<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let sent = self
-                .nudge
-                .send(fusefs::SyncRequest::PeerReadIndex {
-                    requester,
-                    ino,
-                    dir,
-                    name,
-                    reply,
-                })
-                .is_ok();
-            let outcome = if sent {
-                receive
-                    .await
-                    .unwrap_or(constellation_authority::ReadIndexOutcome::Busy)
-            } else {
-                constellation_authority::ReadIndexOutcome::Busy
-            };
-            use constellation_authority::ReadIndexOutcome as O;
-            let (status, holder, position, grant) = match outcome {
-                O::Ok { position, grant } => {
-                    (0, 0, position, grant.map(|g| (g.id, g.ttl_ms, g.epoch)))
-                }
-                O::NotHolder { holder } => (1, holder, constellation_meta::Position::ZERO, None),
-                O::Busy => (2, 0, constellation_meta::Position::ZERO, None),
-            };
-            constellation_net::Payload::ReadIndexReply {
-                req_id,
-                status,
-                holder,
-                position_seq: position.seq,
-                position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
-                grant,
-                position_streams: position.streams_wire(),
-            }
-        })
-    }
-
-    fn backup_append_requested(
-        &self,
-        holder: u64,
-        req_id: u64,
-        epoch: u64,
-        config_version: u64,
-        from: u64,
-        txs: Vec<u8>,
-        through: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            // `sealed` is the safe refusal: the holder never counts this
-            // node again until a reconfiguration (a node that cannot
-            // persist the append must not be credited).
-            let refuse = constellation_net::Payload::BackupAck {
-                req_id,
-                epoch,
-                acked: 0,
-                sealed: true,
-            };
-            if crate::fault::p2p_denied(holder) {
-                // Fault injection: the link is cut; no answer.
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                return refuse;
-            }
-            let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::BackupTx>>(&txs) else {
-                return refuse;
-            };
-            tracing::trace!(target: "constellation::fwd", from, "append queued");
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerBackupAppend {
-                    holder,
-                    epoch,
-                    config_version,
-                    from,
-                    txs,
-                    through,
-                    reply,
-                })
-                .is_err()
-            {
-                return refuse;
-            }
-            let out = match receive.await {
-                Ok((acked, sealed)) => constellation_net::Payload::BackupAck {
-                    req_id,
-                    epoch,
-                    acked,
-                    sealed,
-                },
-                Err(_) => refuse,
-            };
-            tracing::trace!(target: "constellation::fwd", from, "append reply taken");
-            out
-        })
-    }
-
-    fn stream_ahead(&self, from: u64, epoch: u64, base: u64, txs: Vec<u8>) {
-        if crate::fault::p2p_denied(from) {
-            return;
-        }
-        let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::BackupTx>>(&txs) else {
-            return;
-        };
-        let _ = self.nudge.send(fusefs::SyncRequest::PeerStreamAhead {
-            from,
-            epoch,
-            base,
-            txs,
-        });
-    }
-
-    fn lock_requested(
-        &self,
-        requester: u64,
-        req_id: u64,
-        ino: u64,
-        exclusive: bool,
-        blocking: bool,
-        sent: i64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let outcome = if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerLockRequest {
-                    requester,
-                    ino,
-                    mode: crate::locks::mode_of(exclusive),
-                    blocking,
-                    sent,
-                    reply,
-                })
-                .is_ok()
-            {
-                receive
-                    .await
-                    .unwrap_or(constellation_authority::LockOutcome::Busy)
-            } else {
-                constellation_authority::LockOutcome::Busy
-            };
-            constellation_net::Payload::LockReply {
-                req_id,
-                outcome: crate::locks::outcome_wire(&outcome),
-            }
-        })
-    }
-
-    fn lock_recall_requested(
-        &self,
-        owner: u64,
-        req_id: u64,
-        ino: u64,
-        grant: (u64, u64),
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let sent = self
-                .nudge
-                .send(fusefs::SyncRequest::PeerLockRecall {
-                    owner,
-                    ino,
-                    grant: crate::locks::grant_of(grant),
-                    reply,
-                })
-                .is_ok();
-            // A dropped reply (daemon shutting down) acks nothing: the
-            // owner outwaits the grant.
-            if sent && receive.await.is_ok() {
-                return constellation_net::Payload::LockRecalled { req_id };
-            }
-            constellation_net::Payload::LockRecalled { req_id: 0 }
-        })
-    }
-
-    fn lock_renew_requested(
-        &self,
-        from: u64,
-        req_id: u64,
-        entries: Vec<constellation_net::LockRenewWire>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let sent = self
-                .nudge
-                .send(fusefs::SyncRequest::PeerLockRenew {
-                    from,
-                    entries: crate::locks::renew_entries_of(entries),
-                    reply,
-                })
-                .is_ok();
-            let results = if sent { receive.await.ok() } else { None };
-            match results {
-                Some(results) => constellation_net::Payload::LockRenewed {
-                    req_id,
-                    results: crate::locks::renew_results_wire(&results),
-                },
-                // Unanswered: a reply for no request, which the renewer
-                // treats as a failed renewal and retries.
-                None => constellation_net::Payload::LockRenewed {
-                    req_id: 0,
-                    results: Vec::new(),
-                },
-            }
-        })
-    }
-
-    fn lock_test_requested(
-        &self,
-        requester: u64,
-        req_id: u64,
-        ino: u64,
-        exclusive: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let outcome = if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerLockTest {
-                    requester,
-                    ino,
-                    mode: crate::locks::mode_of(exclusive),
-                    reply,
-                })
-                .is_ok()
-            {
-                receive
-                    .await
-                    .unwrap_or(constellation_authority::LockTestOutcome::NotOwner { owner: 0 })
-            } else {
-                constellation_authority::LockTestOutcome::NotOwner { owner: 0 }
-            };
-            constellation_net::Payload::LockTestReply {
-                req_id,
-                outcome: crate::locks::test_outcome_wire(outcome),
-            }
-        })
-    }
-
-    fn lock_granted(
-        &self,
-        from: u64,
-        ino: u64,
-        sent: i64,
-        outcome: constellation_net::LockOutcomeWire,
-    ) {
-        if crate::fault::p2p_denied(from) {
-            return;
-        }
-        let _ = self.nudge.send(fusefs::SyncRequest::PeerLockGranted {
-            from,
-            ino,
-            sent,
-            outcome: crate::locks::outcome_of(outcome),
-        });
-    }
-
-    fn lock_released(&self, from: u64, ino: u64, grant: (u64, u64), position: &[u8]) {
-        if crate::fault::p2p_denied(from) {
-            return;
-        }
-        let _ = self.nudge.send(fusefs::SyncRequest::PeerLockReleased {
-            from,
-            ino,
-            grant: crate::locks::grant_of(grant),
-            position: constellation_meta::Position::from_postcard(position),
-        });
-    }
-
-    fn lock_mirror(&self, from: u64, ver: u64, grants: Vec<u8>, floor: Vec<u8>) {
-        if crate::fault::p2p_denied(from) {
-            return;
-        }
-        let _ = self.nudge.send(fusefs::SyncRequest::PeerLockMirror {
-            from,
-            ver,
-            grants: crate::locks::grants_of(&grants),
-            floor: crate::locks::floor_of(&floor),
-        });
-    }
-
-    fn read_recall_requested(
-        &self,
-        holder: u64,
-        req_id: u64,
-        ino: u64,
-        grant: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(fusefs::SyncRequest::PeerRecall {
-                    holder,
-                    ino,
-                    grant,
-                    reply,
-                })
-                .is_ok()
-            {
-                // Acked only once the delegation is no longer honoured;
-                // a dropped reply (daemon shutting down) acks nothing.
-                if receive.await.is_err() {
-                    return constellation_net::Payload::ReadRecalled { req_id: 0 };
-                }
-                return constellation_net::Payload::ReadRecalled { req_id };
-            }
-            constellation_net::Payload::ReadRecalled { req_id: 0 }
-        })
-    }
-
-    fn lease_offered(&self, _part: String, epoch: u64) {
-        // Only while this node writes: see `Placement::writing_now`.
-        if !self.placement.writing_now() {
-            tracing::debug!(epoch, "declining a lease offer: not writing now");
-            return;
-        }
-        let _ = self.nudge.send(fusefs::SyncRequest::ClaimOffer { epoch });
-    }
-
-    fn peer_rtts(&self, node_id: u64, rtts: Vec<(u64, u16)>) {
-        self.placement.note_peer_rtts(node_id, rtts);
-    }
-}
-
-/// Start the P2P fast path, or return a disabled handle.
-///
-/// Everything here is best-effort by design (plan 02 / DESIGN.md §8): a
-/// missing node key, an unbindable endpoint, or an unreachable gossip
-/// topic all degrade to the S3 polling path rather than failing the
-/// mount. `CONSTELLATION_P2P=off` skips it entirely.
-async fn start_p2p(
-    fsmeta: &constellation_store_s3::FsMeta,
-    e2e_keys: Option<&constellation_store_s3::SharedE2eKeys>,
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
-    node_id: u64,
-) -> constellation_net::Peers {
-    if !constellation_net::enabled() {
-        tracing::info!("P2P disabled by CONSTELLATION_P2P; using the S3 path only");
-        return constellation_net::Peers::disabled();
-    }
-    let key_path = constellation_net::identity::default_key_path();
-    let (key, generated) = match constellation_net::load_or_create(&key_path) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, path = %key_path.display(),
-                "no usable node key; running without the P2P fast path");
-            return constellation_net::Peers::disabled();
-        }
-    };
-    if generated {
-        tracing::info!(path = %key_path.display(), "generated a host node key");
-    }
-    // E2E filesystems seed the topic from the keyring (never on S3 in the
-    // clear); non-E2E uses `meta.json`. A pre-secret filesystem with no
-    // seed at all falls back to the UUID.
-    let e2e_seed = e2e_keys.map(|keys| *keys.gossip_secret());
-    let seed = e2e_seed.or_else(|| fsmeta.gossip_seed());
-    let topic = constellation_net::topic_for(seed.as_ref(), &fsmeta.uuid.to_string());
-    if seed.is_none() {
-        tracing::info!(
-            "filesystem predates gossip_secret; deriving the topic from its UUID \
-             (weaker: the UUID is not a secret)"
-        );
-    }
-    let p2p = match constellation_net::P2p::spawn(key, topic).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not bind the P2P endpoint; using the S3 path only");
-            return constellation_net::Peers::disabled();
-        }
-    };
-    let relay = p2p.relay_label().to_string();
-    let addr = p2p.addr();
-    let pubkey = p2p.pubkey_hex();
-    let peers = constellation_net::Peers::new(p2p, node_id);
-    // Publish how peers reach us, then learn about them.
-    match serde_json::to_value(&addr) {
-        Ok(addr_json) => {
-            if let Err(e) = constellation_store_s3::publish_p2p(
-                store.clone(),
-                node_id,
-                &pubkey,
-                addr_json,
-                env!("CONSTELLATION_VERSION"),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "could not publish our P2P address; peers cannot dial us");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "could not serialize our P2P address"),
-    }
-    let _ = refresh_peers(&peers, store, None).await;
-    tracing::info!(
-        node_id,
-        peers = peers.snapshot().len(),
-        %relay,
-        "P2P fast path ready"
-    );
-    peers
-}
-
-/// Re-read the registry into the peer directory and allowlist.
-async fn refresh_peers(
-    peers: &constellation_net::Peers,
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
-    epochs: Option<&epoch::EpochManager>,
-) -> Option<constellation_store_s3::RegistryScan> {
-    if !peers.is_enabled() {
-        return None;
-    }
-    // One LIST of the registry serves both reads (EC2 finding R2-2: they
-    // used to list and read every record separately, every 5 s). The
-    // peer directory is tolerant of unreadable records (a peer we cannot
-    // dial only loses its fast path); the epoch roster is not, so it
-    // takes the scan's fail-closed view (`crate::epoch::apply_roster`).
-    let scan = constellation_store_s3::registry_scan(store.as_ref()).await;
-    if let Some(epochs) = epochs {
-        crate::epoch::apply_roster(
-            epochs,
-            match &scan {
-                Ok(scan) => scan.roster(),
-                Err(e) => Err(constellation_store_s3::StoreError::Registry(format!(
-                    "registry unreachable: {e}"
-                ))),
-            },
-            scan.is_err(),
-        );
-    }
-    let scan = scan.ok();
-    match scan.as_ref().map(|scan| scan.live()).ok_or(()) {
-        Ok(nodes) => {
-            let records: Vec<constellation_net::PeerEnrollment> = nodes
-                .into_iter()
-                .filter_map(|n| {
-                    Some(constellation_net::PeerEnrollment {
-                        node_id: n.node_id,
-                        pubkey_hex: n.pubkey?,
-                        addr_json: n.p2p_addr?,
-                        hostname: n.hostname,
-                        version: n.version.unwrap_or_default(),
-                        created_unix: n.created_unix,
-                        p2p_updated_unix: n.p2p_updated_unix,
-                        ro: n.ro,
-                    })
-                })
-                .collect();
-            peers.refresh_registry(records);
-        }
-        Err(()) => {
-            tracing::debug!("registry refresh failed; keeping the cached peer set")
-        }
-    }
-    scan
-}
-
-/// Send one control-API request to a running mount and print the answer.
 ///
 /// A daemon-side refusal (over budget, no such path) comes back as
 /// `Response::Error` and must exit non-zero: `pin` failing silently would
@@ -3857,7 +2879,9 @@ fn run_prune_command(rt: &tokio::runtime::Runtime, command: PruneCommand) -> Res
         }
         PruneCommand::Ls { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(&dir, constellation_api::Request::PruneList))
+            ctl::<cm::PruneList>(rt, &dir, Default::default(), |l| {
+                print_list(&l.roots, "no prune policies")
+            })
         }
         PruneCommand::Run {
             target,
@@ -3866,30 +2890,16 @@ fn run_prune_command(rt: &tokio::runtime::Runtime, command: PruneCommand) -> Res
             dry_run,
         } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(control_call(
-                &dir,
-                constellation_api::Request::PruneRun { path, dry_run },
-            ))
+            ctl::<cm::PruneRun>(rt, &dir, api::PruneRunParams { path, dry_run }, print_ack)
         }
         PruneCommand::Status { target, state_dir } => {
             let (_, dir) = resolve_target(&target, state_dir)?;
-            rt.block_on(async {
-                let sock = dir.join(constellation_api::SOCKET_NAME);
-                match constellation_api::call_bounded(
-                    &sock,
-                    &constellation_api::Request::Status,
-                    daemon_lock::control_timeout(),
-                )
-                .await?
-                {
-                    constellation_api::Response::Status(report) => {
-                        println!("{}", serde_json::to_string_pretty(&report.prune)?);
-                        Ok(())
-                    }
-                    constellation_api::Response::Error { message } => bail!(message),
-                    other => bail!("unexpected response: {other:?}"),
-                }
-            })
+            let report = rt.block_on(control::call_bounded::<cm::NodeStatus>(
+                &dir,
+                Default::default(),
+                daemon_lock::control_timeout(),
+            ))?;
+            print_json(&report.prune)
         }
     }
 }
@@ -3922,8 +2932,8 @@ fn xattr_get(path: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {
     let size = unsafe { libc::getxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         let err = std::io::Error::last_os_error();
-        return match err.raw_os_error() {
-            Some(libc::ENODATA) => Ok(None),
+        return match Code::from_io_error(&err) {
+            Code::NoData => Ok(None),
             _ => Err(err.into()),
         };
     }
@@ -3955,2618 +2965,106 @@ fn xattr_remove(path: &std::path::Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn control_call(state_dir: &std::path::Path, req: constellation_api::Request) -> Result<()> {
-    let sock = state_dir.join(constellation_api::SOCKET_NAME);
-    match constellation_api::call(&sock, &req).await? {
-        constellation_api::Response::Ok { detail } => {
-            println!("{detail}");
-            Ok(())
-        }
-        constellation_api::Response::Pins { pins } => {
-            if pins.is_empty() {
-                println!("no pinned subtrees");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&pins)?);
-            }
-            Ok(())
-        }
-        constellation_api::Response::Designations { designations } => {
-            if designations.is_empty() {
-                println!("no active designations");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&designations)?);
-            }
-            Ok(())
-        }
-        constellation_api::Response::Snapshots { snapshots } => {
-            println!("{}", serde_json::to_string_pretty(&snapshots)?);
-            Ok(())
-        }
-        constellation_api::Response::Refs { hashes } => {
-            for hash in hashes {
-                println!("{hash}");
-            }
-            Ok(())
-        }
-        constellation_api::Response::Status(status) => {
-            println!("{}", serde_json::to_string_pretty(&status)?);
-            Ok(())
-        }
-        constellation_api::Response::Inspection { entry } => {
-            println!("{}", serde_json::to_string_pretty(&entry)?);
-            Ok(())
-        }
-        constellation_api::Response::CacheEntries { entries } => {
-            println!("{}", serde_json::to_string_pretty(&entries)?);
-            Ok(())
-        }
-        constellation_api::Response::Logs { lines } => {
-            for line in lines {
-                println!("{line}");
-            }
-            Ok(())
-        }
-        constellation_api::Response::Quota {
-            max_bytes,
-            used_bytes,
-        } => {
-            match max_bytes {
-                Some(cap) => println!("quota: {used_bytes} / {cap} bytes used"),
-                None => println!("quota: {used_bytes} bytes used (unlimited)"),
-            }
-            Ok(())
-        }
-        constellation_api::Response::PruneRoots { roots } => {
-            if roots.is_empty() {
-                println!("no prune policies");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&roots)?);
-            }
-            Ok(())
-        }
-        constellation_api::Response::Error { message } => bail!("{message}"),
-        other => bail!("unexpected response: {other:?}"),
-    }
-}
-
-/// Drain `Meta::pending_uploads()` — the durable not-yet-uploaded
-/// set (plan 07 step 1) — rather than `DiskCache::dirty_chunks()`,
-/// which cannot survive a crash (`DiskCache::rescan` legitimately marks
-/// everything `Clean`; only the meta journal's transaction-coupled
-/// table knows what still owes S3 a PUT).
-///
-/// A pending row whose chunk is missing from the local cache is
-/// unrecoverable content (a torn-disk case, impossible on a clean crash
-/// given the write ordering `flush_inode` uses): log loudly, leave the
-/// row, and refuse rather than silently drop it — returning an error
-/// here already makes every caller treat the round as failed and skip
-/// shipping (see `run_managed_sync_round`'s existing epoch-propose-on-
-/// failure path), which is exactly the "journal must wait" behavior.
-use constellation_upload_concurrency::{AdaptiveConcurrency, ConcurrencyGate, ConcurrencyPermit};
-
-/// Ceiling for the adaptive search and for a user-pinned override alike.
-/// Bounds both real S3 concurrency and (via [`ConcurrencyGate`]) worst-case
-/// pending-upload memory: at most this many chunk buffers are ever held
-/// at once regardless of how many rows `pending_upload` has queued.
-const UPLOAD_CONCURRENCY_HARD_MAX: usize = 128;
-/// Plan 30 §M7: upload slots above the adaptive target that small inode
-/// drains may use, and what counts as small. Without them an `fsync` of a
-/// one-chunk marker file written during a write-back burst waited for
-/// most of the burst's upload backlog (2.5 s of a 3.4 s pass on floci):
-/// the pass queues up to the hard maximum of uploads on the gate, and a
-/// release wakes every waiter at once.
-const PRIORITY_UPLOAD_RESERVE: usize = 4;
-const PRIORITY_DRAIN_CHUNKS: u64 = 4;
-
-/// See docs/explanation/DESIGN.md §5b step 2 / `docs/plans/v1/done/08-p5b-streaming-writeback.md`.
-/// A durable pending-upload queue in SQLite is drained by a bounded pool;
-/// the pool costs two things once it exists (dedup-probe RTT and the
-/// create-vs-overwrite decision), both handled by `put_mode` below.
-///
-/// Concurrency itself is adaptive by default
-/// (`constellation_upload_concurrency::AdaptiveConcurrency`): a single
-/// upload's latency is dominated by RTT to the bucket region, so a
-/// client far from the bucket but sitting on a fat pipe (e.g. a home
-/// connection in the EU against a `us-west-2` bucket) needs a lot more
-/// parallelism than one on a thin or nearby link to fill that
-/// bandwidth-delay product, and a fixed pool size tuned for one path is
-/// wrong for the other. `CONSTELLATION_UPLOAD_CONCURRENCY` still pins a
-/// fixed value for anyone who wants to opt out of the search entirely.
-///
-/// The policy and gate live in their own crate
-/// (`crates/upload-concurrency`) so `bench/uploadbench` can drive the
-/// exact production algorithm against a synthetic or live S3 target,
-/// rather than a reimplementation that could drift from what ships here.
-struct UploadRuntime {
-    gate: ConcurrencyGate,
-    controller: Option<std::sync::Mutex<AdaptiveConcurrency>>,
-    max_concurrency: usize,
-    create_if_absent: bool,
-    probe: std::sync::Mutex<writeback::ProbePolicy>,
-    decisions: std::sync::atomic::AtomicU64,
-    coop: Option<std::sync::Arc<crate::coop::Coop>>,
-    existence: std::sync::Arc<crate::existence::Existence>,
-    /// Chunks a drain is uploading right now. A sync round's drain and a
-    /// flush's `drain_inode` overlap freely; without this, both read the
-    /// same pending row and both PUT it (plan 30 §M11's
-    /// `delegated-subtrees` measured 1.3–1.7 chunk PUTs per file). The
-    /// second drain leaves the row to the first and waits for its ack.
-    in_flight: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
-    /// Chunks smaller than this skip `Probe` (see [`Self::put_mode`]).
-    probe_min_bytes: u64,
-    /// Chunks this node named in a forwarded manifest while they were
-    /// still pending here (a `back` close), and the nodes it forwarded to:
-    /// each is told once the chunk is up (`meta::store::remote`).
-    forwarded: std::sync::Mutex<
-        std::collections::HashMap<
-            constellation_fs_core::ChunkHash,
-            std::collections::BTreeSet<u64>,
-        >,
-    >,
-    /// Reports owed, per node: forwarded chunks now durable.
-    durable_reports:
-        std::sync::Mutex<std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>>>,
-    /// Since when reports to a node have not been delivered (see
-    /// [`Self::requeue_report`]).
-    report_attempts: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
-    /// When this node next checks S3 itself for a chunk another node
-    /// forwarded as pending (the fallback when its report never comes),
-    /// and the current backoff.
-    remote_polls: std::sync::Mutex<
-        std::collections::HashMap<
-            constellation_fs_core::ChunkHash,
-            (std::time::Instant, std::time::Duration),
-        >,
-    >,
-    /// Chunks another node reported durable recently, kept for a minute:
-    /// its report can overtake the forward that names them (the report
-    /// and the forward travel on different streams), and a forward whose
-    /// chunks were already reported must not await them.
-    reported: std::sync::Mutex<
-        std::collections::HashMap<constellation_fs_core::ChunkHash, std::time::Instant>,
-    >,
-    /// Pending chunks this node found at mount: a crash may have lost
-    /// whom it forwarded them to (`forwarded` is in memory), so once up
-    /// they are reported to every peer — a node that awaits one acks it,
-    /// the rest ignore the report.
-    inherited: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
-    /// EC2 finding 1: when a chunk PUT (or existence probe) last
-    /// completed on this node, unix ms — how a drain that is taking long
-    /// tells a slow upload (progress) from an unreachable S3 (none), and
-    /// only the latter hands its chunks to a peer.
-    last_put_ms: std::sync::atomic::AtomicI64,
-    /// EC2 finding 1: chunk handoffs (`authority_driver::ChunkHandoff`).
-    handoff: HandoffStats,
-}
-
-/// The `durable_reports` key of a report owed to every peer.
-const REPORT_TO_ALL: u64 = 0;
-
-/// How long an undelivered durable report is retried.
-const REPORT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long a durable report is remembered for a forward it overtook.
-const REPORTED_KEEP: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// First S3 check of a chunk another node forwarded as pending, if its
-/// report has not come by then; the checks back off to [`REMOTE_POLL_MAX`].
-const REMOTE_POLL_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
-const REMOTE_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(16);
-
-/// `CONSTELLATION_REMOTE_CHUNK_WAIT_S` (default 60): how long a pass that
-/// must leave nothing pending (a barrier, a forced publish, an unmount's
-/// final flush) — and a reader that needs the bytes — waits for chunks
-/// another node forwarded as pending before giving up on them.
-pub(crate) fn remote_chunk_wait() -> std::time::Duration {
-    std::time::Duration::from_secs(
-        std::env::var("CONSTELLATION_REMOTE_CHUNK_WAIT_S")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60),
-    )
-}
-
-/// The chunks a forwarded `SetManifest` names that are still pending here
-/// (`meta::store::remote`): empty for any other op, and for a close that
-/// uploaded first (`--write-mode through`). A spilled manifest's chunk
-/// list comes from the local cache, where this node's flush put it.
-pub(crate) fn forwarded_pending_chunks(
-    meta: &Meta,
-    cache: &DiskCache,
-    op: &constellation_meta::MutateOp,
-) -> Vec<constellation_fs_core::ChunkHash> {
-    let constellation_meta::MutateOp::SetManifest { ino, manifest, .. } = op else {
-        return Vec::new();
-    };
-    let mut named = std::collections::BTreeSet::new();
-    let spilled = match constellation_fs_core::Manifest::decode(manifest).map(|m| m.chunks) {
-        Ok(constellation_fs_core::ChunkInfo::Inline(chunks)) => {
-            named.extend(chunks.into_values());
-            None
-        }
-        Ok(constellation_fs_core::ChunkInfo::Spilled(blob)) => Some(blob),
-        // Undecodable: whatever is pending for the inode (below).
-        Err(_) => Some(constellation_fs_core::ChunkHash([0; 32])),
-    };
-    if let Some(blob) = spilled {
-        named.insert(blob);
-        if let Ok(Some(bytes)) = cache.get(&blob) {
-            if let Ok(list) = constellation_fs_core::manifest::decode_chunk_list(&bytes) {
-                named.extend(list.into_values());
-            }
-        }
-        // The list may not be readable here (the blob uploaded and
-        // evicted): every chunk still pending for the inode counts too.
-        // Rare (files past the inline limit) and a local scan.
-        if let Ok(rows) = meta.pending_uploads() {
-            named.extend(rows.into_iter().filter(|(_, i)| i == ino).map(|(h, _)| h));
-        }
-    }
-    named
-        .into_iter()
-        .filter(|hash| meta.upload_pending_for_hash(hash).unwrap_or(true))
-        .collect()
-}
-
-/// `CONSTELLATION_PROBE_MIN_BYTES` (default 256 KiB; `0` lets every
-/// chunk probe): the size below which an upload always uses a
-/// conditional create instead of a HEAD-first probe. 256 KiB is about
-/// 2 ms at 1 Gbit/s — less than any S3 round trip it saves.
-fn probe_min_bytes() -> u64 {
-    std::env::var("CONSTELLATION_PROBE_MIN_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(256 * 1024)
-}
-
-/// EC2 finding 1: this node's chunk handoffs, for `status`.
-#[derive(Default)]
-struct HandoffStats {
-    sent: std::sync::atomic::AtomicU64,
-    ok: std::sync::atomic::AtomicU64,
-    chunks: std::sync::atomic::AtomicU64,
-    accepted: std::sync::atomic::AtomicU64,
-    /// When a drain last needed a handoff (unix ms): while recent, and
-    /// uploads still make no progress, the next drain hands off at once.
-    last_needed_ms: std::sync::atomic::AtomicI64,
-    /// A round's handoff of forwarded chunks is in flight.
-    round_busy: std::sync::atomic::AtomicBool,
-}
-
-/// Releases a drain's claim on its chunks when it ends, however it ends.
-struct InFlightClaim<'a> {
-    upload: &'a UploadRuntime,
-    hashes: Vec<constellation_fs_core::ChunkHash>,
-}
-
-impl Drop for InFlightClaim<'_> {
-    fn drop(&mut self) {
-        let mut in_flight = self.upload.in_flight.lock().unwrap();
-        for hash in &self.hashes {
-            in_flight.remove(hash);
-        }
-    }
-}
-
-impl UploadRuntime {
-    fn new(
-        create_if_absent: bool,
-        coop: Option<std::sync::Arc<crate::coop::Coop>>,
-        existence: std::sync::Arc<crate::existence::Existence>,
-    ) -> Self {
-        let max = std::env::var("CONSTELLATION_UPLOAD_MAX_CONCURRENCY")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(UPLOAD_CONCURRENCY_HARD_MAX)
-            .clamp(1, UPLOAD_CONCURRENCY_HARD_MAX);
-        let fixed = std::env::var("CONSTELLATION_UPLOAD_CONCURRENCY")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(|n| n.clamp(1, max));
-        let (initial, controller) = match fixed {
-            Some(n) => (n, None),
-            // Start conservatively (like TCP slow start) and let the
-            // controller climb; an aggressive initial guess on a
-            // constrained link just causes early retries/backoff.
-            None => (
-                4.min(max),
-                Some(std::sync::Mutex::new(AdaptiveConcurrency::new(
-                    4.min(max),
-                    1,
-                    max,
-                ))),
-            ),
-        };
-        debug_assert!(
-            controller
-                .as_ref()
-                .is_none_or(|c| c.lock().unwrap().current() == initial),
-            "gate and controller must start in agreement"
-        );
-        Self {
-            gate: ConcurrencyGate::new(initial),
-            controller,
-            max_concurrency: max,
-            create_if_absent,
-            probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
-            decisions: std::sync::atomic::AtomicU64::new(0),
-            coop,
-            existence,
-            in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            probe_min_bytes: probe_min_bytes(),
-            forwarded: Default::default(),
-            durable_reports: Default::default(),
-            report_attempts: Default::default(),
-            remote_polls: Default::default(),
-            reported: Default::default(),
-            inherited: Default::default(),
-            last_put_ms: std::sync::atomic::AtomicI64::new(0),
-            handoff: HandoffStats::default(),
-        }
-    }
-
-    /// EC2 finding 1: whether this node's S3 path has made no progress for
-    /// `for_ms`: no chunk PUT and no S3 request of any kind has succeeded
-    /// (`backend::last_s3_completion_ms`) in that long.
-    pub(crate) fn uploads_stalled(&self, for_ms: i64) -> bool {
-        let last = self
-            .last_put_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(backend::last_s3_completion_ms());
-        constellation_store_s3::lease::now_unix_ms() - last >= for_ms
-    }
-
-    /// `hashes` went out in a manifest forwarded to `to` while still
-    /// pending here.
-    pub(crate) fn note_forwarded(&self, hashes: &[constellation_fs_core::ChunkHash], to: u64) {
-        if hashes.is_empty() {
-            return;
-        }
-        let mut forwarded = self.forwarded.lock().unwrap();
-        for hash in hashes {
-            forwarded.entry(*hash).or_default().insert(to);
-        }
-    }
-
-    /// Another node reported `hashes` durable.
-    pub(crate) fn note_reported(&self, hashes: &[constellation_fs_core::ChunkHash]) {
-        let now = std::time::Instant::now();
-        let mut reported = self.reported.lock().unwrap();
-        reported.retain(|_, at| now.duration_since(*at) < REPORTED_KEEP);
-        for hash in hashes {
-            reported.insert(*hash, now);
-        }
-    }
-
-    /// `hashes` without the ones another node reported durable recently.
-    pub(crate) fn not_reported(
-        &self,
-        hashes: Vec<constellation_fs_core::ChunkHash>,
-    ) -> Vec<constellation_fs_core::ChunkHash> {
-        let reported = self.reported.lock().unwrap();
-        if reported.is_empty() {
-            return hashes;
-        }
-        hashes
-            .into_iter()
-            .filter(|hash| !reported.contains_key(hash))
-            .collect()
-    }
-
-    /// The pending chunks found at mount (see `inherited`).
-    pub(crate) fn inherit(
-        &self,
-        hashes: impl IntoIterator<Item = constellation_fs_core::ChunkHash>,
-    ) {
-        self.inherited.lock().unwrap().extend(hashes);
-    }
-
-    /// Whether any chunk forwarded as pending is still owed a report.
-    pub(crate) fn has_forwarded(&self) -> bool {
-        !self.forwarded.lock().unwrap().is_empty()
-    }
-
-    /// Chunks forwarded as pending that are still pending here, with the
-    /// nodes they were forwarded to (EC2 finding 1: what a round hands to
-    /// a peer when this node's S3 path is down).
-    pub(crate) fn forwarded_pending(&self) -> Vec<(constellation_fs_core::ChunkHash, Vec<u64>)> {
-        self.forwarded
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(h, nodes)| (*h, nodes.iter().copied().collect()))
-            .collect()
-    }
-
-    /// `hash` is up: owe its report to every node it was forwarded to
-    /// (to every peer, for one found pending at mount).
-    pub(crate) fn note_up(&self, hash: &constellation_fs_core::ChunkHash) {
-        let nodes = self.forwarded.lock().unwrap().remove(hash);
-        let inherited = self.inherited.lock().unwrap().remove(hash);
-        let mut reports = self.durable_reports.lock().unwrap();
-        if inherited {
-            reports.entry(REPORT_TO_ALL).or_default().push(*hash);
-        }
-        for node in nodes.into_iter().flatten() {
-            reports.entry(node).or_default().push(*hash);
-        }
-    }
-
-    /// A report that could not go out (its node unreachable, or no peer
-    /// known yet right after a restart): owed again at the next pass, for
-    /// up to [`REPORT_RETRY`] of failures in a row; past that the
-    /// recipient's own S3 check covers it.
-    pub(crate) fn requeue_report(&self, node: u64, hashes: Vec<constellation_fs_core::ChunkHash>) {
-        let mut attempts = self.report_attempts.lock().unwrap();
-        let since = *attempts.entry(node).or_insert_with(std::time::Instant::now);
-        if since.elapsed() > REPORT_RETRY {
-            attempts.remove(&node);
-            return;
-        }
-        self.durable_reports
-            .lock()
-            .unwrap()
-            .entry(node)
-            .or_default()
-            .extend(hashes);
-    }
-
-    pub(crate) fn report_delivered(&self, node: u64) {
-        self.report_attempts.lock().unwrap().remove(&node);
-    }
-
-    /// The reports owed, per node (taken: see [`Self::requeue_report`]).
-    pub(crate) fn take_durable_reports(
-        &self,
-    ) -> std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>> {
-        std::mem::take(&mut *self.durable_reports.lock().unwrap())
-    }
-
-    /// Whether this node should check S3 now for `hash`, which another
-    /// node forwarded as pending; schedules the next check if so.
-    fn remote_poll_due(&self, hash: &constellation_fs_core::ChunkHash) -> bool {
-        let now = std::time::Instant::now();
-        let mut polls = self.remote_polls.lock().unwrap();
-        match polls.get_mut(hash) {
-            None => {
-                polls.insert(*hash, (now + REMOTE_POLL_FIRST, REMOTE_POLL_FIRST));
-                false
-            }
-            Some((next, delay)) if now >= *next => {
-                *delay = (*delay * 2).min(REMOTE_POLL_MAX);
-                *next = now + *delay;
-                true
-            }
-            Some(_) => false,
-        }
-    }
-
-    pub(crate) fn forget_remote_poll(&self, hash: &constellation_fs_core::ChunkHash) {
-        self.remote_polls.lock().unwrap().remove(hash);
-    }
-
-    /// Hard ceiling on real concurrency and thus on worst-case pending-
-    /// upload memory: at most this many chunk buffers are held at once,
-    /// however many rows `pending_upload` has queued.
-    fn max_concurrency(&self) -> usize {
-        self.max_concurrency
-    }
-
-    async fn permit(&self) -> ConcurrencyPermit<'_> {
-        self.gate.acquire().await
-    }
-
-    /// Plan 30 §M7: a permit for a small inode drain (an `fsync` or a
-    /// write-through close of a small file) that must not wait behind the
-    /// round's bulk upload pass — see `ConcurrencyGate::acquire_priority`.
-    async fn permit_priority(&self) -> ConcurrencyPermit<'_> {
-        self.gate.acquire_priority(PRIORITY_UPLOAD_RESERVE).await
-    }
-
-    fn record_success(&self, bytes: u64, latency: std::time::Duration, now: std::time::Instant) {
-        let Some(controller) = &self.controller else {
-            return;
-        };
-        let new_target = controller.lock().unwrap().on_success(now, bytes, latency);
-        if new_target != self.gate.target() {
-            tracing::debug!(
-                concurrency = new_target,
-                previous = self.gate.target(),
-                "adaptive upload concurrency adjusted"
-            );
-            self.gate.set_target(new_target);
-        }
-    }
-
-    fn record_error(&self, now: std::time::Instant) {
-        let Some(controller) = &self.controller else {
-            return;
-        };
-        let new_target = controller.lock().unwrap().on_error(now);
-        let previous = self.gate.target();
-        if new_target != previous {
-            tracing::debug!(
-                concurrency = new_target,
-                previous,
-                "upload failed; backing off adaptive concurrency"
-            );
-            self.gate.set_target(new_target);
-        } else {
-            tracing::debug!(
-                concurrency = new_target,
-                "upload failure coalesced with current congestion episode"
-            );
-        }
-    }
-
-    /// The dedup-ladder rung for a chunk of `len` bytes.
-    ///
-    /// A small chunk probes only on a positive hint (a peer's digest or
-    /// this node's existence cache says the bytes are already there): the
-    /// adaptive policy's guess alone does not make it. `Probe` spends a
-    /// HEAD to save sending the body on a hit, and a miss then costs a
-    /// second serialized round trip (HEAD, then PUT). Below
-    /// [`probe_min_bytes`] the body is cheaper than that round trip, so a
-    /// conditional create (one round trip, hit or miss) is never slower —
-    /// the OVH run's non-owner paid HEAD + PUT on every small file once
-    /// its ladder had switched to `Probe`.
-    fn put_mode(
-        &self,
-        hash: &constellation_fs_core::ChunkHash,
-        len: usize,
-    ) -> constellation_store_s3::ChunkPutMode {
-        let small = self.create_if_absent && (len as u64) < self.probe_min_bytes;
-        if self.existence.peer_hints_enabled()
-            && self
-                .coop
-                .as_ref()
-                .is_some_and(|coop| coop.peer_digest_contains(hash))
-        {
-            self.existence.note_peer_hint();
-            return constellation_store_s3::ChunkPutMode::Probe;
-        }
-        if self.existence.contains(hash) {
-            return constellation_store_s3::ChunkPutMode::Probe;
-        }
-        if small {
-            return constellation_store_s3::ChunkPutMode::Create;
-        }
-        let n = self
-            .decisions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.probe.lock().unwrap().enabled() || n.is_multiple_of(16) {
-            constellation_store_s3::ChunkPutMode::Probe
-        } else if self.create_if_absent {
-            constellation_store_s3::ChunkPutMode::Create
-        } else {
-            constellation_store_s3::ChunkPutMode::Overwrite
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(create_if_absent: bool) -> Self {
-        Self::new(
-            create_if_absent,
-            None,
-            crate::existence::Existence::new(1024, false, None),
-        )
-    }
-
-    /// Test helper: pin a fixed concurrency (no adaptive controller),
-    /// bypassing environment variables so tests are hermetic.
-    #[cfg(test)]
-    fn for_test_fixed(create_if_absent: bool, concurrency: usize) -> Self {
-        Self {
-            gate: ConcurrencyGate::new(concurrency),
-            controller: None,
-            max_concurrency: concurrency.max(1),
-            create_if_absent,
-            probe: std::sync::Mutex::new(writeback::ProbePolicy::default()),
-            decisions: std::sync::atomic::AtomicU64::new(0),
-            coop: None,
-            existence: crate::existence::Existence::new(1024, false, None),
-            in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            probe_min_bytes: probe_min_bytes(),
-            forwarded: Default::default(),
-            durable_reports: Default::default(),
-            report_attempts: Default::default(),
-            remote_polls: Default::default(),
-            reported: Default::default(),
-            inherited: Default::default(),
-            last_put_ms: std::sync::atomic::AtomicI64::new(0),
-            handoff: HandoffStats::default(),
-        }
-    }
-}
-
-/// Plan 30 §M4: [`upload_dirty_chunks_report`] for a caller that needs
-/// every pending chunk durable — an inode drain before a replay or an
-/// `fsync`, a handoff's or an unmount's final flush — so an unrecoverable
-/// chunk is still an error here.
-async fn upload_dirty_chunks(
-    cache: &DiskCache,
-    meta: &Meta,
-    store: &ChunkStore,
-    compression: CompressionSetting,
-    upload: &UploadRuntime,
-    only_ino: Option<constellation_fs_core::Ino>,
-    only_part: Option<&str>,
+/// Run one control call against the daemon of `dir` and print its answer
+/// the way the CLI always has (plan 31 C5 kept every command's output).
+fn ctl<M: constellation_control::Method>(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    params: M::Params,
+    print: impl FnOnce(M::Result) -> Result<()>,
 ) -> Result<()> {
-    let report =
-        upload_dirty_chunks_report(cache, meta, store, compression, upload, only_ino, only_part)
-            .await?;
-    if let Some((hash, _)) = report.missing.first() {
-        bail!("pending upload chunk {hash} missing from local cache");
-    }
+    print(rt.block_on(control::call::<M>(dir, params))?)
+}
+
+fn print_ack(ack: api::Ack) -> Result<()> {
+    println!("{}", ack.detail);
     Ok(())
 }
 
-/// What one upload pass found it cannot upload.
-#[derive(Debug, Default)]
-struct UploadReport {
-    /// Pending `(chunk, ino)` rows whose chunk is gone from the local
-    /// cache: unrecoverable content (plan 30 §M4).
-    missing: Vec<(constellation_fs_core::ChunkHash, constellation_fs_core::Ino)>,
-    /// Chunks another node forwarded as pending that are not in S3 yet
-    /// (`meta::store::remote`): not lost, only not up yet.
-    awaiting: u64,
-}
-
-/// Upload every pending chunk (or one inode's). A chunk missing from the
-/// local cache is no longer an error (plan 30 §M4 item 2): it is reported,
-/// and recorded in `Meta::note_unrecoverable_chunks`, so the ship plan
-/// holds back just the records that need it and everything else ships.
-/// Any other failure (S3 unreachable, a PUT that keeps failing) is still
-/// an error for the round.
-pub(crate) async fn upload_dirty_chunks_report(
-    cache: &DiskCache,
-    meta: &Meta,
-    store: &ChunkStore,
-    compression: CompressionSetting,
-    upload: &UploadRuntime,
-    only_ino: Option<constellation_fs_core::Ino>,
-    only_part: Option<&str>,
-) -> Result<UploadReport> {
-    upload_dirty_chunks_pass(
-        cache,
-        meta,
-        store,
-        compression,
-        upload,
-        only_ino,
-        only_part,
-        0,
-    )
-    .await
-}
-
-/// Plan 30 §M9 × §M4: enroll the chunk lists of adopted spilled
-/// manifests (`Meta::adopted_spills`) as pending uploads, from the list
-/// blob in the local cache or in S3. A blob that is in neither stays a
-/// pending row of its own (this pass then records it unrecoverable, which
-/// holds the manifest), and its mark keeps the manifest deferred until a
-/// later pass can read it.
-async fn expand_adopted_spills(cache: &DiskCache, meta: &Meta, store: &ChunkStore) -> Result<()> {
-    for (ino, blob) in meta.adopted_spills()? {
-        let bytes = match cache.get(&blob)? {
-            Some(bytes) => bytes,
-            None => match store.get_chunk(&blob).await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::debug!(%error, ino, %blob, "adopted chunk list not readable yet");
-                    continue;
-                }
-            },
-        };
-        let chunks: Vec<constellation_fs_core::ChunkHash> =
-            match constellation_fs_core::manifest::decode_chunk_list(&bytes) {
-                Ok(list) => list.into_values().collect(),
-                Err(error) => {
-                    tracing::warn!(%error, ino, %blob, "adopted chunk list undecodable; left held");
-                    continue;
-                }
-            };
-        tracing::info!(
-            ino,
-            chunks = chunks.len(),
-            "enrolled an adopted manifest's chunk list for its durability check"
-        );
-        meta.expand_adopted_spill(ino, &blob, &chunks)?;
-    }
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
-/// One pass of [`upload_dirty_chunks_report`]: `depth` counts the passes
-/// a row another drain had claimed sent this one back for.
-#[allow(clippy::too_many_arguments)]
-async fn upload_dirty_chunks_pass(
-    cache: &DiskCache,
-    meta: &Meta,
-    store: &ChunkStore,
-    compression: CompressionSetting,
-    upload: &UploadRuntime,
-    only_ino: Option<constellation_fs_core::Ino>,
-    only_part: Option<&str>,
-    depth: u8,
-) -> Result<UploadReport> {
-    use futures::StreamExt;
-    if only_ino.is_none() {
-        expand_adopted_spills(cache, meta, store).await?;
-    }
-    let mut grouped: std::collections::HashMap<
-        constellation_fs_core::ChunkHash,
-        Vec<constellation_fs_core::Ino>,
-    > = std::collections::HashMap::new();
-    for (hash, ino) in meta.pending_uploads()? {
-        if only_ino.is_some_and(|wanted| ino != wanted) {
-            continue;
-        }
-        if let Some(wanted) = only_part {
-            if wanted != "p0" {
-                continue;
-            }
-        }
-        grouped.entry(hash).or_default().push(ino);
-    }
-    // Rows another drain is uploading right now are its; this one waits
-    // for their acks below instead of uploading them again.
-    let mut deferred: Vec<constellation_fs_core::ChunkHash> = Vec::new();
-    {
-        let mut in_flight = upload.in_flight.lock().unwrap();
-        grouped.retain(|hash, _| {
-            if in_flight.contains(hash) {
-                deferred.push(*hash);
-                false
-            } else {
-                in_flight.insert(*hash);
-                true
-            }
-        });
-    }
-    let _claim = InFlightClaim {
-        upload,
-        hashes: grouped.keys().copied().collect(),
-    };
-    let total = grouped.len() as u64;
-    let priority = only_ino.is_some() && total <= PRIORITY_DRAIN_CHUNKS;
-    if total > 0 {
-        tracing::debug!(
-            pending_chunks = total,
-            concurrency = upload.gate.target(),
-            max_concurrency = upload.max_concurrency(),
-            "uploading pending chunks"
-        );
-    }
-    // Materialize at most the configured maximum number of upload
-    // futures. Each one reads bytes only after winning the adaptive gate,
-    // so both future state and chunk buffers stay independent of a backlog
-    // that may contain tens of thousands of rows.
-    //
-    // Missing-cache rows (torn disk, or a poisoned inherited backlog that
-    // self-heal missed) must still fail the round so the journal does not
-    // ship — but logging ERROR once per hash per round produced multi-GB
-    // logs (plan 25). Count them and emit a single summary below.
-    let missing_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let missing_sample = std::sync::Arc::new(std::sync::Mutex::new(
-        None::<constellation_fs_core::ChunkHash>,
-    ));
-    let missing_rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
-        constellation_fs_core::ChunkHash,
-        constellation_fs_core::Ino,
-    )>::new()));
-    let awaiting = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let in_flight = futures::stream::iter(grouped.into_iter().map(|(hash, inos)| {
-        let missing_count = missing_count.clone();
-        let missing_sample = missing_sample.clone();
-        let missing_rows = missing_rows.clone();
-        let awaiting = awaiting.clone();
-        async move {
-            let _permit = if priority {
-                upload.permit_priority().await
-            } else {
-                upload.permit().await
-            };
-            if fault::lose_chunk(&hash) {
-                tracing::warn!(%hash, "fault injection: dropping a pending chunk from the cache");
-                let _ = cache.remove(&hash);
-            }
-            let Some(data) = cache.get(&hash)? else {
-                // Another node forwarded a manifest naming this chunk while
-                // it was still uploading there (`meta::store::remote`): it
-                // reports it once it is up. Until then it is awaited, not
-                // lost; S3 is checked here only now and then, in case the
-                // report never comes.
-                let remote = inos
-                    .iter()
-                    .any(|ino| meta.remote_chunk(&hash, *ino).ok().flatten().is_some());
-                if remote {
-                    if upload.remote_poll_due(&hash) && store.chunk_durable(&hash).await? {
-                        tracing::debug!(%hash, "a forwarded chunk is in S3; acknowledged");
-                        return Ok(Some((
-                            hash,
-                            inos,
-                            constellation_store_s3::ChunkPutMode::Create,
-                            true,
-                        )));
-                    }
-                    awaiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(None);
-                }
-                // Not in the cache is not the same as lost: the content
-                // may already be durable in the bucket. The common way
-                // there: a same-content writer on this node uploaded it
-                // and the chunk was demoted to clean (and then evicted)
-                // before this row's writer had enrolled it — demotion
-                // checks for pending rows, and this one did not exist
-                // yet. Content addressing makes that upload this row's
-                // too, exactly as a `Probe` HEAD hit would: acknowledge
-                // it instead of holding the writer's records back.
-                if store.chunk_durable(&hash).await? {
-                    tracing::info!(
-                        %hash,
-                        "pending chunk not in the local cache but durable in S3; acknowledged"
-                    );
-                    return Ok(Some((
-                        hash,
-                        inos,
-                        constellation_store_s3::ChunkPutMode::Create,
-                        true,
-                    )));
-                }
-                missing_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                {
-                    let mut sample = missing_sample.lock().unwrap();
-                    if sample.is_none() {
-                        *sample = Some(hash);
-                    }
-                }
-                missing_rows
-                    .lock()
-                    .unwrap()
-                    .extend(inos.iter().map(|ino| (hash, *ino)));
-                return Ok(None);
-            };
-            let bytes = data.len() as u64;
-            let mode = upload.put_mode(&hash, data.len());
-            let mut last = None;
-            let started = std::time::Instant::now();
-            for attempt in 0..3 {
-                match store.put_chunk_mode(&hash, &data, compression, mode).await {
-                    Ok(result) => {
-                        upload.last_put_ms.store(
-                            constellation_store_s3::lease::now_unix_ms(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        let now = std::time::Instant::now();
-                        // A Probe hit only performed HEAD; counting the
-                        // chunk's logical bytes as uploaded would report
-                        // impossible goodput and drive concurrency upward
-                        // during deduplicated workloads.
-                        if !result.existed {
-                            upload.record_success(bytes, now.duration_since(started), now);
-                        }
-                        return Ok(Some((hash, inos, mode, result.existed)));
-                    }
-                    Err(error) => last = Some(error),
-                }
-                if attempt < 2 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-            upload.record_error(std::time::Instant::now());
-            Err(anyhow::anyhow!("upload {hash} failed: {}", last.unwrap()))
-        }
-    }))
-    .buffer_unordered(upload.max_concurrency());
-    futures::pin_mut!(in_flight);
-    let mut first_error = None;
-    let mut completed = 0u64;
-    let mut last_progress = std::time::Instant::now();
-    let progress_interval = std::env::var("CONSTELLATION_UPLOAD_PROGRESS_INTERVAL_S")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
-    while let Some(result) = in_flight.next().await {
-        match result {
-            Ok(None) => {}
-            Ok(Some((hash, inos, mode, existed))) => {
-                upload.existence.insert(&hash);
-                if mode == constellation_store_s3::ChunkPutMode::Probe {
-                    upload.probe.lock().unwrap().record(existed);
-                }
-                for ino in inos {
-                    meta.ack_upload(&hash, ino)?;
-                }
-                upload.note_up(&hash);
-                upload.forget_remote_poll(&hash);
-                if !meta.upload_pending_for_hash(&hash)? {
-                    cache.set_state(&hash, constellation_fs_core::cache::ChunkState::Clean);
-                }
-            }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        completed += 1;
-        // Rows only awaited (another node's upload) are not progress:
-        // a pass of nothing but those would log this every round.
-        let awaited_only =
-            completed == total && awaiting.load(std::sync::atomic::Ordering::Relaxed) >= total;
-        if total > 0
-            && !awaited_only
-            && (completed == total || last_progress.elapsed() >= progress_interval)
-        {
-            tracing::info!(
-                completed,
-                total,
-                concurrency = upload.gate.target(),
-                "pending chunk upload progress"
-            );
-            last_progress = std::time::Instant::now();
-        }
-    }
-    let missing = missing_count.load(std::sync::atomic::Ordering::Relaxed);
-    let missing_rows = std::mem::take(&mut *missing_rows.lock().unwrap());
-    if missing > 0 {
-        let sample = *missing_sample.lock().unwrap();
-        tracing::warn!(
-            missing_pending_chunks = missing,
-            sample_hash = ?sample,
-            "pending upload chunks missing from local cache (unrecoverable content); \
-             leaving the pending rows and holding back only the records that need them"
-        );
-    }
-    // A full pass sees every pending row, so its list replaces the
-    // recorded set (a chunk that turned up again stops poisoning); a
-    // limited pass only adds to it.
-    meta.note_unrecoverable_chunks(&missing_rows, only_ino.is_none())?;
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    if total > 0 {
-        tracing::debug!(uploaded = total, "pending chunk upload complete");
-    }
-    // The chunks another drain claimed: this pass is complete only once
-    // they are acked too (a write-through flush must not name a hash S3
-    // lacks). A claim that ends with the row still pending (the other
-    // drain failed, or found the chunk missing) leaves the row to this
-    // pass: it goes round again and claims it itself, so a missing
-    // chunk is reported here (M4's held records) and a transient error
-    // there is retried here, never turned into this caller's error.
-    let mut unclaimed_pending = false;
-    for hash in deferred {
-        let started = std::time::Instant::now();
-        loop {
-            if !meta.upload_pending_for_hash(&hash)? {
-                break;
-            }
-            let claimed = upload.in_flight.lock().unwrap().contains(&hash);
-            if !claimed {
-                unclaimed_pending = true;
-                break;
-            }
-            if started.elapsed() > std::time::Duration::from_secs(120) {
-                anyhow::bail!("upload {hash} still in flight elsewhere after 120 s");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-    }
-    if unclaimed_pending {
-        if depth >= 3 {
-            anyhow::bail!("pending uploads left behind by concurrent drains after 4 passes");
-        }
-        drop(_claim);
-        return Box::pin(upload_dirty_chunks_pass(
-            cache,
-            meta,
-            store,
-            compression,
-            upload,
-            only_ino,
-            only_part,
-            depth + 1,
-        ))
-        .await;
-    }
-    Ok(UploadReport {
-        missing: missing_rows,
-        awaiting: awaiting.load(std::sync::atomic::Ordering::Relaxed),
-    })
-}
-
-/// Drive either the ordinary S3 authority path or a continuation epoch.
-/// An S3 failure may activate an epoch, but the failing round remains an
-/// error for spool observability. While active, a successful tail probe
-/// means S3 returned: upload dirty chunks first, close the promise, then
-/// resume ordinary CAS-serialized shipping.
-/// The continuation-epoch machinery (`constellation_net::EpochPromise`)
-/// still speaks in per-partition vectors; with plan 29 M0a's single
-/// stream that is always a one-entry map keyed by `p0`.
-/// Give the root directory to the mounting user on a freshly created
-/// filesystem. Skipped entirely unless the root is still 0:0, so this
-/// costs nothing (and needs no lease) on every subsequent mount; when it
-/// does apply, it takes the lease like any other mutation (through the
-/// authority core).
-///
-/// EC2 finding R2-4: one attempt is not enough. A `Policy::System` op
-/// gives up the moment its acquisition does not open the view, and a
-/// fresh acquisition routinely waits a moment behind its takeover gate —
-/// under `--cto strict`, when two nodes mount together, the kernel-cache
-/// drain the first sight of the other node arms (plan 30 §M8) keeps the
-/// gate shut for a second. Both nodes then answered "deferred" (the
-/// holder's own attempt refused by its gate, the other's forward refused
-/// by the holder's), nobody retried, and the root stayed genesis' `root:
-/// root 0755` — unwritable by the mounting user and, without
-/// `allow_other`, by root too. So: retry until the root has an owner
-/// (this node's attempt or anyone else's, seen by tailing), for a short
-/// while before the mount appears and then in the background.
-async fn adopt_root(
-    meta: &std::sync::Arc<Meta>,
-    sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
-    forward: &std::sync::Arc<forward::ForwardState>,
-    node_id: u64,
-) -> Result<()> {
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
-        return Ok(());
-    }
-    /// How long the mount waits for the root to have an owner before it
-    /// appears anyway (and keeps adopting in the background).
-    const BEFORE_MOUNT: std::time::Duration = std::time::Duration::from_secs(10);
-    const RETRY: std::time::Duration = std::time::Duration::from_millis(250);
-    let started = std::time::Instant::now();
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        if adopt_root_once(meta, sync_tx, forward, node_id).await? {
-            if attempts > 1 {
-                tracing::info!(attempts, "root directory owner adopted");
-            }
-            return Ok(());
-        }
-        if started.elapsed() >= BEFORE_MOUNT {
-            break;
-        }
-        tokio::time::sleep(RETRY).await;
-    }
-    tracing::warn!(
-        attempts,
-        "root directory still has no owner; mounting anyway and adopting it in the background"
-    );
-    let (meta, sync_tx, forward) = (meta.clone(), sync_tx.clone(), forward.clone());
-    tokio::spawn(async move {
-        let mut wait = std::time::Duration::from_secs(1);
-        loop {
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(std::time::Duration::from_secs(60));
-            match adopt_root_once(&meta, &sync_tx, &forward, node_id).await {
-                Ok(true) => {
-                    tracing::info!("root directory owner adopted");
-                    return;
-                }
-                Ok(false) => {}
-                // The sync task is gone: the mount is shutting down.
-                Err(_) => return,
-            }
-        }
-    });
-    Ok(())
-}
-
-/// One adoption attempt: `Ok(true)` once the root has an owner (it
-/// already had one, or this attempt gave it one), `Ok(false)` when the
-/// attempt was deferred (the lease is held elsewhere or not open yet).
-async fn adopt_root_once(
-    meta: &std::sync::Arc<Meta>,
-    sync_tx: &tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
-    forward: &forward::ForwardState,
-    node_id: u64,
-) -> Result<bool> {
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-    // Another node may already have done it; make sure we have its log.
-    // A tail that fails (S3 unreachable) is not fatal: the replica we
-    // have decides, and a later attempt tails again.
-    let (reply, rx) = tokio::sync::oneshot::channel();
-    sync_tx
-        .send(fusefs::SyncRequest::TailToHead { reply })
-        .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
-    match rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::debug!(%error, "root adoption: tail failed"),
-        Err(_) => anyhow::bail!("sync task stopped"),
-    }
-    let root =
-        constellation_meta::MetaStore::getattr(&**meta, constellation_fs_core::types::ROOT_INO)?;
-    tracing::debug!(
-        uid = root.as_ref().map(|a| a.uid),
-        gid = root.as_ref().map(|a| a.gid),
-        applied = meta.applied_seq().unwrap_or(0),
-        "root adoption check"
-    );
-    if !matches!(root, Some(a) if a.uid == 0) {
-        return Ok(true);
-    }
-    let op = constellation_meta::MutateOp::Setattr {
-        ino: constellation_fs_core::types::ROOT_INO,
-        mode: None,
-        uid: Some(euid),
-        gid: Some(egid),
-        size: None,
-        atime_ns: None,
-        mtime_ns: None,
-    };
-    let (reply, rx) = tokio::sync::oneshot::channel();
-    sync_tx
-        .send(fusefs::SyncRequest::Submit {
-            op,
-            rid: forward.next_system_rid(node_id),
-            policy: constellation_authority::Policy::System,
-            in_doubt: false,
-            reply,
-        })
-        .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
-    match rx.await {
-        Ok(constellation_authority::ClientReply::Outcome(
-            constellation_meta::MutateOutcome::Accepted { .. },
-        )) => Ok(true),
-        Err(_) => anyhow::bail!("sync task stopped"),
-        // Another node holds authority (it adopts the root itself, or a
-        // later attempt here reaches it), or this node's own fresh
-        // acquisition has not opened its view yet (a takeover gate).
-        other => {
-            tracing::info!(reply = ?other, "root adoption deferred; retrying");
-            Ok(false)
-        }
-    }
-}
-
-/// Format dial addresses for status/UI output.
-fn peer_addr_strings(addr: &constellation_net::EndpointAddr) -> Vec<String> {
-    addr.addrs.iter().map(|a| a.to_string()).collect()
-}
-
-/// Live daemon state exposed over the control socket.
-struct DaemonStatus {
-    meta: std::sync::Arc<Meta>,
-    cache: std::sync::Arc<DiskCache>,
-    staging_budget: std::sync::Arc<staging::StagingBudget>,
-    /// The authority core's observable state (`authority_driver`).
-    core: std::sync::Arc<std::sync::Mutex<authority_driver::CoreStatus>>,
-    lease: std::sync::Arc<lease::LeaseView>,
-    fs_uuid: String,
-    backend: String,
-    /// Back-reference for the mount-management verbs (`MountAdd`,
-    /// `MountRemove`, `MountList`) and multi-view `status`/`leave`
-    /// (plan 21, step 1).
-    node: std::sync::Arc<node_runtime::NodeRuntime>,
-    node_id: u64,
-    started: std::time::Instant,
-    peers: constellation_net::Peers,
-    pins: std::sync::Arc<pin::PinManager>,
-    designations: std::sync::Arc<designation::DesignationManager>,
-    epochs: std::sync::Arc<epoch::EpochManager>,
-    reintegration: std::sync::Arc<reintegrate::ReintegrationState>,
-    sync_tx: tokio::sync::mpsc::UnboundedSender<fusefs::SyncRequest>,
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
-    departed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Handle for the blocking control-API calls that need to await.
-    rt: tokio::runtime::Handle,
-    coop: std::sync::Arc<crate::coop::Coop>,
-    prefetch_stats: std::sync::Arc<crate::prefetch::PrefetchStats>,
-    write_mode: std::sync::Arc<writeback::WriteModeState>,
-    upload: std::sync::Arc<UploadRuntime>,
-    snapshots: std::sync::Arc<snapshot::SnapshotManager>,
-    log_buffer: log_buffer::LogBuffer,
-    forward: std::sync::Arc<forward::ForwardState>,
-    placement: std::sync::Arc<placement::Placement>,
-    atime: std::sync::Arc<crate::atime::AtimeAccumulator>,
-    prune_stats: std::sync::Arc<crate::prune::PruneStats>,
-    lease_mode: constellation_store_s3::LeaseMode,
-    read_only_member: bool,
-    last_sync_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Plan 29 M3a: lets `fsck` (and any future offline-tool verb) run
-    /// in-process over the control socket instead of racing the mount
-    /// for `fjall`'s single-process lock.
-    state_dir: PathBuf,
-    compression: CompressionSetting,
-}
-
-impl DaemonStatus {
-    /// `NodeRuntime::mounts()` translated to the control API's wire shape.
-    fn api_mounts(&self) -> Vec<constellation_api::MountInfo> {
-        self.node
-            .mounts()
-            .into_iter()
-            .map(|m| constellation_api::MountInfo {
-                id: m.id.as_u64(),
-                subtree: m.subtree,
-                mountpoint: m.mountpoint.display().to_string(),
-                mounted_ms_ago: m.since.elapsed().as_millis() as u64,
-            })
-            .collect()
-    }
-
-    /// Snapshot/clone control requests are metadata mutations too: acquire
-    /// the subtree partition and force its pending data + journal through
-    /// before observing or publishing an immutable root.
-    fn snapshot_barrier(&self, path: &str) -> std::result::Result<(), String> {
-        let ino = self
-            .meta
-            .resolve_path(path)
-            .map_err(|error| error.to_string())?
-            .unwrap_or(constellation_fs_core::types::ROOT_INO);
-        let part = "p0".to_string();
-        let _ = part;
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        self.sync_tx
-            .send(fusefs::SyncRequest::Acquire { reply })
-            .map_err(|_| "sync task is not running".to_string())?;
-        let progress = tokio::task::block_in_place(|| self.rt.block_on(receive))
-            .map_err(|_| "lease acquisition stopped".to_string())??;
-        if !progress.acquired {
-            return Err("subtree write lease is held by another node".into());
-        }
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        self.sync_tx
-            .send(fusefs::SyncRequest::Barrier { ino, reply })
-            .map_err(|_| "sync task is not running".to_string())?;
-        tokio::task::block_in_place(|| self.rt.block_on(receive))
-            .map_err(|_| "snapshot barrier stopped".to_string())?
-    }
-
-    /// Assemble the pruner's dependency bundle from the daemon's shared
-    /// handles (plan 22). `replica_lag` is derived from the sync task's
-    /// heartbeat.
-    fn prune_deps(&self) -> crate::prune::PruneDeps {
-        use std::sync::atomic::Ordering;
-        let lag = std::time::Duration::from_millis(
-            crate::prune::now_unix_ms().saturating_sub(self.last_sync_ms.load(Ordering::Relaxed)),
-        );
-        crate::prune::PruneDeps {
-            store: self.store.clone(),
-            meta: self.meta.clone(),
-            sync_tx: self.sync_tx.clone(),
-            lease: self.lease.clone(),
-            forward: self.forward.clone(),
-            node_id: self.node_id,
-            lease_mode: self.lease_mode,
-            read_only_member: self.read_only_member,
-            departed: self.departed.clone(),
-            epoch_frozen: Some(self.epochs.writes_refused.clone()),
-            stats: self.prune_stats.clone(),
-            replica_lag: lag,
-        }
-    }
-}
-
-impl constellation_api::StatusSource for DaemonStatus {
-    fn status(&self) -> constellation_api::StatusReport {
-        let core = self.core.lock().unwrap().clone();
-        let stats = core.stats;
-        let speculation = (
-            stats.speculation_rolled_back,
-            stats.stranded_replayed,
-            stats.replay_conflicts,
-        );
-        let gate_pending = self.lease.gate_pending();
-        let usage = self.cache.usage();
-        let p0_lease = self.lease.status();
-        let designations = self.list_designations();
-        let mut epoch = self.epochs.status();
-        epoch.promise_puts = stats.promise_puts;
-        epoch.promise_requests_answered = stats.promise_requests_answered;
-        epoch.promise_requests_refused = stats.promise_requests_refused;
-        epoch.promise_checks = stats.promise_checks;
-        epoch.takeovers_refused_promises = stats.takeovers_refused_promises;
-        epoch.promise_flush_exempt = stats.promise_flush_exempt;
-        epoch.stale_claims = stats.epoch_stale_claims;
-        epoch.streamed_ahead = stats.epoch_streamed_ahead;
-        epoch.streamed_installed = stats.epoch_streamed_installed;
-        epoch.forwards_streamed = stats.epoch_forwards_streamed;
-        epoch.handoffs_behind = stats.epoch_handoffs_behind;
-        let coop = self.coop.report();
-        let s3_coop = coop.per_source.iter().find(|s| s.id == "s3").cloned();
-        let peer_snap = self.peers.snapshot();
-        let mut peers: Vec<constellation_api::PeerStatus> = Vec::with_capacity(1 + peer_snap.len());
-        // S3 is always first so operators can compare the durable path
-        // against peer lat/BW/hit% in the same table.
-        peers.push(constellation_api::PeerStatus {
-            node_id: 0,
-            connected: true,
-            hostname: Some("S3".into()),
-            coop: s3_coop,
-            s3: true,
-            path: String::new(),
-            ..Default::default()
-        });
-        peers.extend(peer_snap.into_iter().map(|p| {
-            let addrs = peer_addr_strings(&p.addr);
-            let designations: Vec<String> = designations
-                .iter()
-                .filter(|d| d.designee == p.node_id)
-                .map(|d| d.path.clone())
-                .collect();
-            let coop = coop
-                .per_source
-                .iter()
-                .find(|s| s.id == format!("peer-{}", p.node_id))
-                .cloned();
-            let path = match p.path {
-                constellation_net::PathKind::Unknown => coop
-                    .as_ref()
-                    .map(|c| c.path.clone())
-                    .filter(|s| !s.is_empty() && s != "unknown")
-                    .unwrap_or_else(|| "unknown".into()),
-                other => other.as_str().into(),
-            };
-            constellation_api::PeerStatus {
-                node_id: p.node_id,
-                connected: p.connected,
-                rtt_ms: p.rtt_ms,
-                last_seen_ms: p.last_seen.map(|t| t.elapsed().as_millis() as u64),
-                hostname: (!p.hostname.is_empty()).then_some(p.hostname.clone()),
-                version: (!p.version.is_empty()).then_some(p.version.clone()),
-                pubkey: Some(p.pubkey_hex.clone()),
-                endpoint_id: Some(p.addr.id.to_string()),
-                addrs,
-                created_unix: (p.created_unix > 0).then_some(p.created_unix),
-                p2p_updated_unix: p.p2p_updated_unix,
-                ro: p.ro,
-                epoch_member: epoch.members.contains(&p.node_id),
-                designations,
-                coop,
-                s3: false,
-                path,
-                paths: paths::status(self.peers.path_summary(p.node_id)),
-            }
-        }));
-        let p2p = constellation_api::P2pStatus {
-            enabled: self.peers.is_enabled(),
-            node_addr: self
-                .peers
-                .node_addr()
-                .and_then(|a| serde_json::to_string(&a).ok()),
-            relay: self.peers.relay_label(),
-            peers,
-        };
-        let enrolled = !self.departed.load(std::sync::atomic::Ordering::Relaxed)
-            && !matches!(
-                self.meta.kv_get("left").ok().flatten().as_deref(),
-                Some("1")
-            );
-        constellation_api::StatusReport {
-            fs_uuid: self.fs_uuid.clone(),
-            backend: self.backend.clone(),
-            mounts: self.api_mounts(),
-            node_id: self.node_id,
-            version: env!("CONSTELLATION_VERSION").to_string(),
-            enrolled,
-            uptime_s: self.started.elapsed().as_secs(),
-            spool: constellation_api::SpoolStatus {
-                journal_backlog: constellation_meta::MetaStore::journal_len(&*self.meta)
-                    .unwrap_or(0),
-                head_seq: core.ship.as_ref().map(|s| s.head_seq).unwrap_or(0),
-                conflicts: stats.conflicts,
-                last_ship_error: core.last_error.clone(),
-                ship_rounds_completed: stats.rounds_completed,
-                // Plan 30 M5: a round is never cancelled by a request any
-                // more (requests are events the round interleaves with).
-                ship_rounds_cancelled: 0,
-            },
-            cache: constellation_api::CacheStatus {
-                used_bytes: usage.used,
-                budget_bytes: usage.budget,
-                chunks: usage.entries as u64,
-                pinned_bytes: usage.pinned,
-                staging_bytes: self.staging_budget.used(),
-                staging_budget_bytes: self.staging_budget.budget(),
-            },
-            lease: p0_lease,
-            p2p,
-            pins: self.list_pins(),
-            designations,
-            epoch,
-            reintegration: self.reintegration.snapshot(
-                if matches!(
-                    self.meta.kv_get("lease_lost").ok().flatten().as_deref(),
-                    Some("1")
-                ) {
-                    self.meta.unmarked_journal_len().unwrap_or(0)
-                } else {
-                    0
-                },
-                speculation.2,
-            ),
-            speculation: {
-                let counts = self.meta.speculation_counts().unwrap_or_default();
-                constellation_api::SpeculationStatus {
-                    outstanding: counts.outstanding,
-                    pending_replay: counts.pending_replay,
-                    rolled_back: speculation.0,
-                    stranded_replayed: speculation.1,
-                    replay_conflicts: speculation.2,
-                    local: counts.local,
-                    local_rolled_back: stats.local_rolled_back,
-                    depositions: stats.depositions,
-                    epoch_markers: stats.epoch_markers,
-                    gate_pending,
-                    copies_pending: core.copies.0,
-                    copies_stalled: core.copies.1,
-                }
-            },
-            held: held::status(&self.meta),
-            session: {
-                let s = self.meta.session().stats();
-                constellation_api::SessionStatus {
-                    budget_ms: self.meta.session().budget().as_millis() as u64,
-                    reads: s.reads,
-                    fast: s.fast,
-                    covered: s.covered,
-                    waited: s.waited,
-                    timeouts: s.timeouts,
-                    degraded_held: s.degraded_held,
-                    replay_blocked: s.replay_blocked,
-                    waits_ms: s.waits_ms.to_vec(),
-                    wait_ms_total: s.wait_ms_total,
-                    raised: s.raised,
-                    watermark_ttl_ms: self.meta.session().watermark_ttl().as_millis() as u64,
-                    abandoned: s.abandoned,
-                    voided_ended: s.voided_ended,
-                }
-            },
-            ack: {
-                let a = &core.ack;
-                let s = self.meta.session().stats();
-                constellation_api::AckStatus {
-                    ack_s3: core.ack_s3,
-                    policy: a.policy.to_string(),
-                    backups: a.backups.clone(),
-                    candidate: a.candidate,
-                    config_version: a.config_version,
-                    durable: a.durable,
-                    parked_acks: a.parked_acks as u64,
-                    gated: self.lease.ack_gated(),
-                    backing_holder: a.backing_holder,
-                    backing_epoch: a.backing_epoch,
-                    backing_acked: a.backing_acked,
-                    sealed_epoch: a.sealed_epoch,
-                    backups_added: stats.backups_added,
-                    backups_removed: stats.backups_removed,
-                    reconfig_cas: stats.reconfig_cas,
-                    backup_appends: stats.backup_appends,
-                    backup_acks: stats.backup_acks,
-                    backup_ack_timeouts: stats.backup_ack_timeouts,
-                    acks_waited: stats.acks_waited,
-                    ack_wait_ms_total: stats.ack_wait_ms_total,
-                    acks_aborted: stats.acks_aborted,
-                    streamed_ahead: stats.streamed_ahead,
-                    streamed_installed: stats.streamed_installed,
-                    streamed_dropped: stats.streamed_dropped,
-                    awaited_log: stats.awaited_log,
-                    awaited_log_streamed: stats.awaited_log_streamed,
-                    awaited_log_streamed_deleg: stats.awaited_log_streamed_deleg,
-                    backup_persisted: stats.backup_persisted,
-                    seals: stats.seals,
-                    backup_takeovers: stats.backup_takeovers,
-                    backup_tail_applied: stats.backup_tail_applied,
-                    s3_fast_takeovers: stats.s3_fast_takeovers,
-                    ack_floor_waits: stats.ack_floor_waits,
-                    stale_liveness_refusals: stats.stale_liveness_refusals,
-                    epoch_carry_refused: stats.epoch_carry_refused,
-                    refusals_journaled: stats.refusals_journaled,
-                    unacked_replays_refused: stats.unacked_replays_refused,
-                    reads_durability_blocked: s.durability_blocked,
-                }
-            },
-            delegation: {
-                let v = &core.delegation;
-                constellation_api::DelegationReport {
-                    enabled: core.delegation_enabled,
-                    table: self
-                        .meta
-                        .delegation_table()
-                        .iter()
-                        .map(|d| constellation_api::DelegationStatus {
-                            dir: d.dir,
-                            path: self.meta.path_of(d.dir).unwrap_or_default(),
-                            node: d.node,
-                            gen: d.gen,
-                            designated: d.designated,
-                            range: d.range.label(),
-                        })
-                        .collect(),
-                    mine: v.mine.clone(),
-                    gens: v.gens.clone(),
-                    executed: stats.deleg_executed,
-                    fast_path_executed: core.delegation_fast_path_executed,
-                    fast_path_routed: core.delegation_fast_path_routed,
-                    forwarded_to_delegate: stats.deleg_forwarded,
-                    deps_waits: stats.deleg_deps_waits,
-                    parked_expired: stats.deleg_parked_expired,
-                    not_owner: stats.deleg_not_owner,
-                    installed: stats.deleg_installed,
-                    streamed_txs: stats.deleg_streamed_txs,
-                    stream_refused: stats.deleg_stream_refused,
-                    renewals: stats.deleg_renewals,
-                    renewals_refused: stats.deleg_renewals_refused,
-                    recalls_received: stats.deleg_recalls_received,
-                    delegated: stats.deleg_delegated,
-                    appended_txs: stats.deleg_appended_txs,
-                    stream_refusals: stats.deleg_stream_refusals,
-                    deps_unsatisfied_at_append: stats.deleg_deps_unsatisfied_at_append,
-                    cross_subtree: stats.deleg_cross_subtree,
-                    recalls_sent: stats.deleg_recalls_sent,
-                    recalls_drained: stats.deleg_recalls_drained,
-                    recalls_expired: stats.deleg_recalls_expired,
-                    reclaimed: stats.deleg_reclaimed,
-                    ended: stats.deleg_ended,
-                    deps_overflow_to_root: stats.deps_overflow_to_root,
-                    exec_parked: stats.deleg_exec_parked,
-                    stranded: stats.local_rolled_back,
-                    kinds: v.kinds.clone(),
-                    backups: v.backups.clone(),
-                    placement: core.placement_top.clone(),
-                    inherited: stats.deleg_inherited,
-                    refused_designated: stats.deleg_refused_designated,
-                    designated: stats.deleg_designated,
-                    redelegated: stats.deleg_redelegated,
-                    seals_sent: stats.deleg_seals_sent,
-                    sealed_drained: stats.deleg_sealed_drained,
-                    restreams: stats.deleg_restreams,
-                    backup_appends: stats.deleg_backup_appends,
-                    backup_acks: stats.deleg_backup_acks,
-                    acks_parked: stats.deleg_acks_parked,
-                    backup_persisted: stats.deleg_backup_persisted,
-                    backup_seals: stats.deleg_backup_seals,
-                    place_evaluations: stats.place_evaluations,
-                    place_delegated: stats.place_delegated,
-                    place_recalled: stats.place_recalled,
-                    place_skipped_cooldown: stats.place_skipped_cooldown,
-                    place_skipped_unreachable: stats.place_skipped_unreachable,
-                    place_splits: stats.place_splits,
-                    place_range_recalls: stats.place_range_recalls,
-                    read_index_served: stats.deleg_read_index_served,
-                    read_grants: stats.deleg_read_grants,
-                }
-            },
-            cto: {
-                let d = self.meta.read_delegations();
-                let c = d.stats();
-                constellation_api::CtoStatus {
-                    strict: self.node.cto_strict(),
-                    grants_enabled: core.read_delegations,
-                    strict_reads: c.strict_reads,
-                    holder_local: c.holder_local,
-                    delegation_local: c.delegation_local,
-                    read_index: c.read_index,
-                    s3_tail: c.s3_tail,
-                    degraded: c.degraded,
-                    read_index_ms_total: c.read_index_ms_total,
-                    read_index_ms: c.read_index_ms.to_vec(),
-                    renewals: c.renewals,
-                    delegations_installed: c.delegations_installed,
-                    delegations_raced: c.delegations_raced,
-                    delegations_held: d.held_count() as u64,
-                    recalled: c.recalled,
-                    read_index_served: stats.read_index_served,
-                    read_index_refused: stats.read_index_refused,
-                    grants: c.grants,
-                    live_grants: d.live_grants(),
-                    recalls_sent: stats.recalls_sent,
-                    recalls_acked: stats.recalls_acked,
-                    recalls_expired: stats.recalls_expired,
-                    recall_waits: stats.recall_waits,
-                    recall_wait_ms_total: stats.recall_wait_ms_total,
-                    held_replies: stats.held_replies,
-                    held_retries: stats.held_retries,
-                    fuse_writes_recalled: c.fuse_writes_recalled,
-                    fuse_recall_wait_ms_total: c.fuse_recall_wait_ms_total,
-                    parked_acks: core.read.parked_acks as u64,
-                    recalls_in_flight: core.read.recalls_in_flight as u64,
-                }
-            },
-            locks: {
-                let t = self.meta.locks();
-                let l = t.stats();
-                constellation_api::LockStatus {
-                    mode: if core.locks_cluster {
-                        "cluster"
-                    } else {
-                        "local"
-                    }
-                    .to_string(),
-                    grants_held: t.held_count() as u64,
-                    requests: stats.lock_requests,
-                    local_hits: l.local_hits,
-                    local_conflicts: l.local_conflicts,
-                    granted: l.granted,
-                    would_block: stats.lock_would_block,
-                    unavailable: stats.lock_unavailable,
-                    grant_ms_total: stats.lock_grant_ms_total,
-                    grant_ms: stats.lock_grant_ms.to_vec(),
-                    renewals: stats.lock_renewals,
-                    lost: stats.lock_lost,
-                    recalled: l.recalled,
-                    recalled_busy: l.recalled_busy,
-                    released: stats.lock_released,
-                    fenced_io: l.fenced_io,
-                    grants_waited: l.grants_waited,
-                    grant_wait_ms_total: l.grant_wait_ms_total,
-                    grants_degraded: l.grants_degraded,
-                    grants_table: t.grants_len() as u64,
-                    grants_made: stats.lock_grants,
-                    recalls_sent: stats.lock_recalls_sent,
-                    recalls_released: stats.lock_recalls_released,
-                    recalls_expired: stats.lock_recalls_expired,
-                    reclaimed: stats.lock_reclaimed,
-                    waiters_parked: stats.lock_waiters_parked,
-                    grace_refusals: stats.lock_grace_refusals,
-                    requeued_in_place: stats.lock_requeued_in_place,
-                    released_superseded: stats.lock_released_superseded,
-                    requests_in_flight: core.lock_requests_in_flight as u64,
-                    waiters: core.lock_waiters as u64,
-                    recalls_in_flight: core.lock_recalls_in_flight as u64,
-                }
-            },
-            coop,
-            prefetch: self.prefetch_stats.snapshot(),
-            writeback: {
-                let remote = self.meta.remote_chunks().unwrap_or_default();
-                let probe = self.upload.probe.lock().unwrap();
-                let existence = self.upload.existence.report();
-                constellation_api::WritebackStatus {
-                    mode: self.write_mode.get().as_str().into(),
-                    dirty_bytes: self
-                        .cache
-                        .dirty_bytes()
-                        .saturating_add(self.staging_budget.used()),
-                    pending_uploads: self.meta.pending_upload_count().unwrap_or(0),
-                    upload_concurrency: self.upload.gate.target() as u32,
-                    remote_probe_enabled: probe.enabled(),
-                    remote_probe_hit_rate: probe.hit_rate(),
-                    existence_bloom_hits: existence.bloom_hits,
-                    existence_chunk_ref_hits: existence.chunk_ref_hits,
-                    existence_misses: existence.misses,
-                    existence_peer_hints: existence.peer_hints,
-                    remote_chunks_awaited: remote.len() as u64,
-                    remote_chunks_oldest_s: remote
-                        .iter()
-                        .map(|r| r.enrolled_ms)
-                        .min()
-                        .map(|oldest| {
-                            (constellation_store_s3::lease::now_unix_ms() - oldest).max(0) as u64
-                                / 1000
-                        })
-                        .unwrap_or(0),
-                    handoffs_sent: self
-                        .upload
-                        .handoff
-                        .sent
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    handoffs_ok: self
-                        .upload
-                        .handoff
-                        .ok
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    handoff_chunks: self
-                        .upload
-                        .handoff
-                        .chunks
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    handoff_chunks_accepted: self
-                        .upload
-                        .handoff
-                        .accepted
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                }
-            },
-            forwarded_ok: self.forward.ok.load(std::sync::atomic::Ordering::Relaxed),
-            forwarded_err: self.forward.err.load(std::sync::atomic::Ordering::Relaxed),
-            forward_p50_ms: self.forward.p50_ms(),
-            log_stream: {
-                let v = core.stream;
-                constellation_api::LogStreamStatus {
-                    enabled: core.stream_enabled,
-                    upstream: v.upstream,
-                    live: v.live,
-                    buffered: v.buffered,
-                    applied: stats.stream_applied,
-                    tail_skips: stats.stream_tail_skips,
-                    subscribes: stats.stream_subscribes,
-                    refused: stats.stream_refused,
-                    ended: stats.stream_ended,
-                    gaps: stats.stream_gaps,
-                    lost: stats.stream_lost,
-                    timeouts: stats.stream_timeouts,
-                    overflows: stats.stream_overflows,
-                    duplicates: stats.stream_duplicates,
-                    serving: v.serving,
-                    served: stats.stream_served,
-                    declined: stats.stream_declined,
-                    frames_sent: stats.stream_frames_sent,
-                    subscribers_dropped: stats.stream_subscribers_dropped,
-                }
-            },
-            forward_dedup_hits: stats.forward_dedup_hits,
-            forward_retries: stats.forward_retries,
-            forward_indoubt_resolved: stats.forward_indoubt_resolved,
-            own_s3: constellation_api::OwnS3Status {
-                stalled: core.own_s3.stalled,
-                peers_reach_s3: core.own_s3.peers_reach_s3,
-                stalled_for_ms: core.own_s3.since.map(|since| {
-                    (constellation_store_s3::lease::now_unix_ms() - since.0).max(0) as u64
-                }),
-                retries: stats.s3_less_retries,
-                forwards: stats.s3_less_forwards,
-                deadlines: stats.s3_less_deadlines,
-                readopted_for_forward: stats.readopt_for_forward,
-            },
-            inbox: crate::inbox::status(
-                crate::inbox::inbox_enabled(),
-                &stats,
-                &core.inbox,
-                self.lease.touches(),
-            ),
-            placement_reason: self.placement.last_reason.lock().unwrap().clone(),
-            atime: {
-                use std::sync::atomic::Ordering::Relaxed;
-                let s = &self.atime.stats;
-                constellation_api::AtimeStatus {
-                    mode: self.atime.mode().as_str().to_string(),
-                    queued: s.queued.load(Relaxed),
-                    coalesced: s.coalesced.load(Relaxed),
-                    applied: s.applied.load(Relaxed),
-                    dropped_cap: s.dropped_cap.load(Relaxed),
-                    forward_ok: s.forward_ok.load(Relaxed),
-                    forward_err: s.forward_err.load(Relaxed),
-                    local_only: s.local_only.load(Relaxed),
-                    skew_clamped: s.skew_clamped.load(Relaxed),
-                }
-            },
-            quota: {
-                use constellation_meta::MetaStore;
-                constellation_api::QuotaStatus {
-                    max_bytes: self.meta.quota().ok().flatten(),
-                    used_bytes: self.meta.usage().0,
-                }
-            },
-            prune: {
-                use std::sync::atomic::Ordering::Relaxed;
-                let s = &self.prune_stats;
-                constellation_api::PruneStatus {
-                    runs: s.runs.load(Relaxed),
-                    roots: s.roots.load(Relaxed),
-                    armed_roots: s.armed_roots.load(Relaxed),
-                    unparseable_roots: s.unparseable_roots.load(Relaxed),
-                    inert_roots: s.inert_roots.load(Relaxed),
-                    entries_examined: s.entries_examined.load(Relaxed),
-                    selected: s.selected.load(Relaxed),
-                    deleted: s.deleted.load(Relaxed),
-                    bytes_deleted: s.bytes_deleted.load(Relaxed),
-                    bytes_freed: s.bytes_freed.load(Relaxed),
-                    skipped_reverify: s.skipped_reverify.load(Relaxed),
-                    skipped_forward_err: s.skipped_forward_err.load(Relaxed),
-                    skipped_hardlink: s.skipped_hardlink.load(Relaxed),
-                    skipped_repartition: s.skipped_repartition.load(Relaxed),
-                    leases_acquired: s.leases_acquired.load(Relaxed),
-                    refused_lag: s.refused_lag.load(Relaxed),
-                    last_run_unix_ms: s.last_run_unix_ms.load(Relaxed),
-                    last_parse_error: s.last_parse_error.lock().ok().and_then(|g| g.clone()),
-                }
-            },
-            fuse_requests: crate::fuse_watch::snapshot(),
-            s3: backend::s3_request_counts(),
-        }
-    }
-
-    fn pin(&self, path: &str) -> std::result::Result<String, String> {
-        let pins = self.pins.clone();
-        let path = path.to_string();
-        // The API handler runs on the runtime already, so block_in_place
-        // keeps the fetch off the async executor without a nested runtime.
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(async move { pins.pin(&path).await })
-                .map_err(|e| format!("{e:#}"))
-        })
-    }
-
-    fn unpin(&self, path: &str) -> std::result::Result<String, String> {
-        let pins = self.pins.clone();
-        let path = path.to_string();
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(async move { pins.unpin(&path).await })
-                .map_err(|e| format!("{e:#}"))
-        })
-    }
-
-    fn list_pins(&self) -> Vec<constellation_api::PinStatus> {
-        let pins = self.pins.clone();
-        tokio::task::block_in_place(|| self.rt.block_on(async move { pins.status().await }))
-    }
-
-    fn offline(&self, path: &str, read_only: bool) -> std::result::Result<String, String> {
-        let designations = self.designations.clone();
-        let path = path.to_string();
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(async move { designations.offline(&path, read_only).await })
-                .map_err(|e| format!("{e:#}"))
-        })
-    }
-
-    fn online(&self, path: &str) -> std::result::Result<String, String> {
-        let designations = self.designations.clone();
-        let path = path.to_string();
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(async move { designations.online(&path).await })
-                .map_err(|e| format!("{e:#}"))
-        })
-    }
-
-    fn list_designations(&self) -> Vec<constellation_api::DesignationStatus> {
-        self.designations
-            .snapshot()
-            .into_iter()
-            .map(|d| constellation_api::DesignationStatus {
-                path: d.path,
-                designee: d.designee,
-                read_only: d.read_only,
-            })
-            .collect()
-    }
-
-    fn delegate(
-        &self,
-        path: &str,
-        node: u64,
-        range: Option<&str>,
-    ) -> std::result::Result<String, String> {
-        let dir = self
-            .meta
-            .resolve_path(path)
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or_else(|| format!("no such directory: {path}"))?;
-        // Plan 30 §M12: `"<idx>/<count>"`, `count` a power of two.
-        let range = match range.map(str::trim).filter(|r| !r.is_empty()) {
-            None => (0u8, 0u32),
-            Some(r) => {
-                let (i, k) = r
-                    .split_once('/')
-                    .ok_or_else(|| format!("range {r}: expected <idx>/<count>"))?;
-                let idx: u32 = i.parse().map_err(|_| format!("range {r}: bad index"))?;
-                let count: u32 = k.parse().map_err(|_| format!("range {r}: bad count"))?;
-                if !count.is_power_of_two() || count > 16 || idx >= count {
-                    return Err(format!(
-                        "range {r}: count must be 2, 4, 8 or 16 and idx below it"
-                    ));
-                }
-                (count.trailing_zeros() as u8, idx)
-            }
-        };
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        self.sync_tx
-            .send(fusefs::SyncRequest::Delegate {
-                dir,
-                node,
-                range,
-                reply,
-            })
-            .map_err(|_| "sync task is not running".to_string())?;
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(receive)
-                .map_err(|_| "sync task stopped".to_string())?
-        })
-    }
-
-    fn undelegate(&self, path: &str) -> std::result::Result<String, String> {
-        let dir = self
-            .meta
-            .resolve_path(path)
-            .map_err(|e| format!("{e:#}"))?
-            .ok_or_else(|| format!("no such directory: {path}"))?;
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        self.sync_tx
-            .send(fusefs::SyncRequest::Undelegate { dir, reply })
-            .map_err(|_| "sync task is not running".to_string())?;
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(receive)
-                .map_err(|_| "sync task stopped".to_string())?
-        })
-    }
-
-    fn list_delegations(&self) -> Vec<constellation_api::DelegationStatus> {
-        self.meta
-            .delegation_table()
-            .iter()
-            .map(|d| constellation_api::DelegationStatus {
-                dir: d.dir,
-                path: self.meta.path_of(d.dir).unwrap_or_default(),
-                node: d.node,
-                gen: d.gen,
-                designated: d.designated,
-                range: d.range.label(),
-            })
-            .collect()
-    }
-
-    fn reintegrate(&self) -> std::result::Result<String, String> {
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        self.sync_tx
-            .send(fusefs::SyncRequest::Reintegrate(reply))
-            .map_err(|_| "sync task is not running".to_string())?;
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(receive)
-                .map_err(|_| "reintegration task stopped".to_string())?
-        })
-    }
-
-    fn leave(&self, node_id: Option<u64>, force: bool) -> std::result::Result<String, String> {
-        match node_id {
-            Some(target) => {
-                let store = self.store.clone();
-                let designations = self.designations.clone();
-                let self_id = self.node_id;
-                tokio::task::block_in_place(|| {
-                    self.rt.block_on(async move {
-                        leave::admin_leave(store, &designations, self_id, target, force)
-                            .await
-                            .map(|_| format!("retired node {target} in the registry"))
-                            .map_err(|e| e.to_string())
-                    })
-                })
-            }
-            None => {
-                leave::refuse_open_epoch(&self.epochs).map_err(|e| e.to_string())?;
-                let (reply, receive) = tokio::sync::oneshot::channel();
-                self.sync_tx
-                    .send(fusefs::SyncRequest::Leave { force, reply })
-                    .map_err(|_| "sync task is not running".to_string())?;
-                let detail = tokio::task::block_in_place(|| {
-                    self.rt
-                        .block_on(receive)
-                        .map_err(|_| "leave task stopped".to_string())?
-                })?;
-                self.departed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                // Unmount after the response is on the wire: the control
-                // handler writes the Ok then this returns, then we detach
-                // every view (plan 21, step 1 — `leave` is node-level, not
-                // scoped to whichever view happened to answer the call).
-                let node = self.node.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    for id in node.mounts().into_iter().map(|m| m.id) {
-                        if let Err(e) = node.remove_mount(id) {
-                            tracing::warn!(error = %e, "leave: detaching a view failed");
-                        }
-                    }
-                });
-                Ok(detail)
-            }
-        }
-    }
-
-    fn set_write_mode(&self, mode: &str) -> std::result::Result<String, String> {
-        let requested: writeback::WriteMode = mode.parse().map_err(str::to_string)?;
-        if self.write_mode.get() == requested {
-            return Ok(format!("write mode already {}", requested.as_str()));
-        }
-        if requested == writeback::WriteMode::Through {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            self.sync_tx
-                .send(fusefs::SyncRequest::DrainInode { ino: 0, reply })
-                .map_err(|_| "sync task is not running".to_string())?;
-            tokio::task::block_in_place(|| {
-                self.rt
-                    .block_on(receive)
-                    .map_err(|_| "upload drain stopped".to_string())?
-            })?;
-        }
-        self.write_mode.set(requested);
-        Ok(format!("write mode set to {}", requested.as_str()))
-    }
-
-    fn snapshot_create(&self, selector: &str) -> std::result::Result<String, String> {
-        let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
-        self.snapshot_barrier(&path)?;
-        let snapshots = self.snapshots.clone();
-        let result =
-            tokio::task::block_in_place(|| self.rt.block_on(snapshots.create(&path, &name)))
-                .map_err(|error| format!("{error:#}"))?;
-        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
-        Ok(result)
-    }
-
-    fn snapshot_list(
-        &self,
-        path: Option<&str>,
-    ) -> std::result::Result<Vec<constellation_api::SnapshotStatus>, String> {
-        self.snapshots
-            .list(path)
-            .map_err(|error| format!("{error:#}"))
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| constellation_api::SnapshotStatus {
-                        id: row.id,
-                        path: row.path,
-                        name: row.name,
-                        root_hash: row.root_hash,
-                        created_unix_ms: row.created_unix_ms,
-                    })
-                    .collect()
-            })
-    }
-
-    fn snapshot_delete(&self, selector: &str) -> std::result::Result<String, String> {
-        let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
-        self.snapshot_barrier(&path)?;
-        let snapshots = self.snapshots.clone();
-        let result =
-            tokio::task::block_in_place(|| self.rt.block_on(snapshots.delete(&path, &name)))
-                .map_err(|error| format!("{error:#}"))?;
-        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
-        Ok(result)
-    }
-
-    fn clone_snapshot(
-        &self,
-        selector: &str,
-        destination: &str,
-    ) -> std::result::Result<String, String> {
-        let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
-        self.snapshot_barrier(&path)?;
-        let snapshots = self.snapshots.clone();
-        let destination = destination.to_string();
-        let result = tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(snapshots.clone_to(&path, &name, &destination))
-        })
-        .map_err(|error| format!("{error:#}"))?;
-        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
-        Ok(result)
-    }
-
-    fn snap_refs(&self, id: &str) -> std::result::Result<Vec<String>, String> {
-        let snapshots = self.snapshots.clone();
-        let id = id.to_string();
-        tokio::task::block_in_place(|| self.rt.block_on(snapshots.refs(&id)))
-            .map_err(|error| format!("{error:#}"))
-    }
-
-    fn read_dir(
-        &self,
-        path: &str,
-    ) -> std::result::Result<Vec<constellation_api::DirectoryEntry>, String> {
-        use constellation_meta::MetaStore;
-        let normalized = normalize_control_path(path);
-        let ino = self
-            .meta
-            .resolve_path(&normalized)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("{normalized}: not found"))?;
-        let entries = self.meta.readdir(ino).map_err(|error| error.to_string())?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| constellation_api::DirectoryEntry {
-                path: if normalized == "/" {
-                    format!("/{}", entry.name)
-                } else {
-                    format!("{normalized}/{}", entry.name)
-                },
-                name: entry.name,
-                ino: entry.ino,
-                kind: format!("{:?}", entry.kind).to_lowercase(),
-            })
-            .collect())
-    }
-
-    fn inspect(&self, path: &str) -> std::result::Result<constellation_api::InspectStatus, String> {
-        use constellation_meta::MetaStore;
-        let normalized = normalize_control_path(path);
-        let ino = self
-            .meta
-            .resolve_path(&normalized)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("{normalized}: not found"))?;
-        let attr = self
-            .meta
-            .getattr(ino)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("{normalized}: stale inode"))?;
-        let manifest = self
-            .meta
-            .manifest(ino)
-            .map_err(|error| error.to_string())?
-            .map(|bytes| {
-                constellation_fs_core::manifest::Manifest::decode(&bytes)
-                    .map(|manifest| {
-                        use constellation_fs_core::manifest::ChunkInfo;
-                        let chunks = match &manifest.chunks {
-                            ChunkInfo::Inline(map) => map
-                                .iter()
-                                .take(8)
-                                .map(|(index, hash)| format!("{index}:{}", hash.to_hex()))
-                                .collect(),
-                            ChunkInfo::Spilled(hash) => vec![format!("spilled:{}", hash.to_hex())],
-                        };
-                        constellation_api::ManifestStatus {
-                            chunk_size: manifest.layout.chunk_size,
-                            chunk_count: manifest.layout.chunk_count(manifest.file_len),
-                            spilled: manifest.is_spilled(),
-                            file_len: manifest.file_len,
-                            digest: blake3::hash(&bytes).to_hex().to_string(),
-                            chunks,
-                        }
-                    })
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?;
-        Ok(constellation_api::InspectStatus {
-            path: normalized,
-            ino: attr.ino,
-            kind: format!("{:?}", attr.kind).to_lowercase(),
-            size: attr.size,
-            mode: attr.mode,
-            uid: attr.uid,
-            gid: attr.gid,
-            nlink: attr.nlink,
-            atime_ns: attr.atime_ns,
-            mtime_ns: attr.mtime_ns,
-            ctime_ns: attr.ctime_ns,
-            rdev: attr.rdev,
-            manifest,
-        })
-    }
-
-    fn open_download(
-        &self,
-        path: &str,
-    ) -> std::result::Result<constellation_api::DownloadSession, String> {
-        use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
-        use constellation_fs_core::InodeKind;
-        use constellation_meta::MetaStore;
-
-        let normalized = normalize_control_path(path);
-        let ino = self
-            .meta
-            .resolve_path(&normalized)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("{normalized}: not found"))?;
-        let attr = self
-            .meta
-            .getattr(ino)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("{normalized}: stale inode"))?;
-        if attr.kind != InodeKind::File {
-            return Err(format!("{normalized}: not a regular file"));
-        }
-        let file_name = normalized
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("download")
-            .to_string();
-        let size = attr.size;
-        let manifest_bytes = self.meta.manifest(ino).map_err(|error| error.to_string())?;
-        let manifest = match manifest_bytes {
-            Some(bytes) => Manifest::decode(&bytes).map_err(|error| error.to_string())?,
-            None => Manifest::empty(constellation_fs_core::DEFAULT_CHUNK_SIZE),
-        };
-        if manifest.file_len != size && size > 0 {
-            // Prefer the inode size as the wire length; still stream from the
-            // manifest's chunk map so a stale size cannot OOM the client.
-            tracing::debug!(
-                path = %normalized,
-                inode_size = size,
-                manifest_len = manifest.file_len,
-                "download size mismatch; using inode size"
-            );
-        }
-
-        let coop = self.coop.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(2);
-        self.rt.spawn(async move {
-            if size == 0 {
-                return;
-            }
-            let hashes = match &manifest.chunks {
-                ChunkInfo::Inline(map) => map.clone(),
-                ChunkInfo::Spilled(hash) => match coop.fetch(hash).await {
-                    Ok(blob) => match decode_chunk_list(&blob) {
-                        Ok(map) => map,
-                        Err(error) => {
-                            let _ = tx.send(Err(error.to_string())).await;
-                            return;
-                        }
-                    },
-                    Err(error) => {
-                        let _ = tx
-                            .send(Err(format!("fetching spilled chunk list: {error:#}")))
-                            .await;
-                        return;
-                    }
-                },
-            };
-            let layout = manifest.layout;
-            let file_len = size;
-            let count = layout.chunk_count(file_len);
-            for index in 0..count {
-                let want = layout.chunk_len(file_len, index) as usize;
-                let mut data = match hashes.get(&index) {
-                    Some(hash) => match coop.fetch(hash).await {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            let _ = tx
-                                .send(Err(format!("fetching chunk {index}: {error:#}")))
-                                .await;
-                            return;
-                        }
-                    },
-                    None => Vec::new(),
-                };
-                data.resize(want, 0);
-                if tx.send(Ok(data)).await.is_err() {
-                    return;
-                }
-            }
-        });
-        Ok(constellation_api::DownloadSession {
-            file_name,
-            size,
-            chunks: rx,
-        })
-    }
-
-    fn force_release(&self, part: &str) -> std::result::Result<String, String> {
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        // A cooperative release asked for by the operator: the core's
-        // handoff job, addressed as if this node itself asked.
-        self.sync_tx
-            .send(fusefs::SyncRequest::HandOff {
-                requester: self.node_id,
-                // The S3 handoff job (declined inside an active epoch).
-                epoch_applied: None,
-                reply,
-            })
-            .map_err(|_| "sync task is not running".to_string())?;
-        let handed = tokio::task::block_in_place(|| self.rt.block_on(receive))
-            .map_err(|_| "lease release task stopped".to_string())?;
-        match handed {
-            Some(handed) => Ok(format!(
-                "voluntarily released {part} at epoch {}; this was cooperative, not fencing",
-                handed.epoch
-            )),
-            None => Err(format!(
-                "{part} was not held locally or could not be flushed; no fencing was attempted"
-            )),
-        }
-    }
-
-    fn log_tail(&self, lines: usize) -> Vec<String> {
-        self.log_buffer.tail(lines)
-    }
-
-    fn drop_held(&self, ino: u64, remote: bool) -> std::result::Result<String, String> {
-        held::drop_held(&self.meta, ino, remote)
-    }
-
-    fn doctor(&self) -> std::result::Result<constellation_api::DoctorStatus, String> {
-        let store = ChunkStore::new(self.store.clone());
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async {
-                let caps = store.probe_conditional_writes().await?;
-                let report = constellation_store_s3::probe_cas_semantics(store.inner()).await?;
-                Ok::<_, constellation_store_s3::StoreError>((caps, report))
-            })
-        })
-        .map(|(caps, report)| constellation_api::DoctorStatus {
-            create_if_absent: caps.create_if_absent,
-            etag_cas: caps.etag_cas,
-            cas_probes: doctor::api_probes(&report),
-            versioning: report.versioning.as_str().to_string(),
-        })
-        .map_err(|error| error.to_string())
-    }
-
-    fn cache_list(&self) -> Vec<constellation_api::CacheEntryStatus> {
-        self.cache
-            .entries()
-            .into_iter()
-            .map(|(hash, size, state)| constellation_api::CacheEntryStatus {
-                hash: hash.to_hex(),
-                size,
-                state: format!("{state:?}").to_lowercase(),
-            })
-            .collect()
-    }
-
-    fn cache_prune(&self, target_bytes: u64) -> std::result::Result<String, String> {
-        let report = self
-            .cache
-            .prune_to(target_bytes)
-            .map_err(|e| e.to_string())?;
-        Ok(format!(
-            "pruned {} chunks ({} bytes); {} bytes remain \
-             ({} pinned, {} dirty, {} entries)",
-            report.freed_chunks,
-            report.freed_bytes,
-            report.used_bytes,
-            report.pinned_bytes,
-            report.dirty_bytes,
-            report.entries
-        ))
-    }
-
-    fn set_quota(&self, max_bytes: Option<u64>) -> std::result::Result<String, String> {
-        use constellation_meta::MetaStore;
-        self.snapshot_barrier("/")?;
-        self.meta
-            .set_quota(max_bytes)
-            .map_err(|e| format!("{e:#}"))?;
-        // Node-level cap, but each mounted view caches its own read of it
-        // (fusefs::QUOTA_CACHE_TTL) — invalidate every view, not just
-        // whichever one happened to build this DaemonStatus.
-        self.node.invalidate_quota_caches();
-        let _ = self.sync_tx.send(fusefs::SyncRequest::Nudge);
-        Ok(match max_bytes {
-            Some(cap) => format!("quota set to {cap} bytes"),
-            None => "quota cleared (unlimited)".into(),
-        })
-    }
-
-    fn get_quota(&self) -> std::result::Result<(Option<u64>, u64), String> {
-        use constellation_meta::MetaStore;
-        let max = self.meta.quota().map_err(|e| format!("{e:#}"))?;
-        let (used, _) = self.meta.usage();
-        Ok((max, used))
-    }
-
-    fn prune_run(&self, path: Option<&str>, dry_run: bool) -> std::result::Result<String, String> {
-        // Restrict to the marked root governing `path`, if one was given.
-        let only = match path {
-            Some(p) => {
-                let ino = self
-                    .meta
-                    .resolve_path(p)
-                    .map_err(|e| format!("{e:#}"))?
-                    .ok_or_else(|| format!("no such path: {p}"))?;
-                match self
-                    .meta
-                    .effective_prune_policy(ino)
-                    .map_err(|e| format!("{e:#}"))?
-                {
-                    Some((root, _)) => Some(vec![root]),
-                    None => return Err(format!("no prune policy governs {p}")),
-                }
-            }
-            None => None,
-        };
-        let deps = self.prune_deps();
-        let report = tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(async { crate::prune::run(&deps, only, dry_run).await })
-        })
-        .map_err(|e| format!("{e:#}"))?;
-        if let Some(why) = report.refused {
-            return Err(format!("prune refused: {why}"));
-        }
-        let (mut sel, mut del) = (0u64, 0u64);
-        for r in &report.roots {
-            sel += r.selected;
-            del += r.deleted;
-        }
-        Ok(format!(
-            "prune {}: {} roots, {} selected, {} deleted",
-            if report.dry_run { "dry-run" } else { "run" },
-            report.roots.len(),
-            sel,
-            del
-        ))
-    }
-
-    fn prune_ls(&self) -> std::result::Result<Vec<constellation_api::PruneRootStatus>, String> {
-        let roots = self.meta.prune_roots().map_err(|e| format!("{e:#}"))?;
-        let mut out = Vec::new();
-        for (ino, expr) in roots {
-            let path = self.meta.path_of(ino).unwrap_or_else(|_| "?".into());
-            match constellation_meta::prune::Policy::parse(&expr) {
-                Ok(policy) => {
-                    let note = if let Some((
-                        constellation_meta::prune::Watermark::Percent(_),
-                        _,
-                        constellation_meta::prune::Of::Fs,
-                    )) = policy.lru_watermarks()
-                    {
-                        use constellation_meta::MetaStore;
-                        if self.meta.quota().ok().flatten().unwrap_or(0) == 0 {
-                            Some("inert: lru percentage needs a quota".to_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    out.push(constellation_api::PruneRootStatus {
-                        path,
-                        policy: policy.to_string(),
-                        armed: policy.armed,
-                        valid: !policy.off,
-                        note,
-                    });
-                }
-                Err(e) => out.push(constellation_api::PruneRootStatus {
-                    path,
-                    policy: expr,
-                    armed: false,
-                    valid: false,
-                    note: Some(format!("unparseable: {}", e.msg)),
-                }),
-            }
-        }
-        Ok(out)
-    }
-
-    fn gc_run(&self, verify_only: bool) -> std::result::Result<serde_json::Value, String> {
-        let store = self.store.clone();
-        let chunks = self.pins.chunks();
-        let meta = self.meta.clone();
-        let lease_mode = self.lease_mode;
-        let peers = self.peers.clone();
-        let tail = gc::GcTail::Daemon(self.sync_tx.clone());
-        let report = tokio::task::block_in_place(|| {
-            self.rt.block_on(gc::run(
-                store,
-                chunks,
-                meta,
-                lease_mode,
-                verify_only,
-                Some(&peers),
-                &tail,
-            ))
-        })
-        .map_err(|e| format!("{e:#}"))?;
-        serde_json::to_value(&report).map_err(|e| format!("{e:#}"))
-    }
-
-    fn fsck_run(
-        &self,
-        repair: bool,
-        force_release: Option<&str>,
-    ) -> std::result::Result<serde_json::Value, String> {
-        let store = self.store.clone();
-        let chunks = self.pins.chunks();
-        let meta = self.meta.clone();
-        let lease_mode = self.lease_mode;
-        let state_dir = self.state_dir.clone();
-        let compression = self.compression;
-        let force_release = force_release.map(str::to_string);
-        let report = tokio::task::block_in_place(|| {
-            self.rt.block_on(async move {
-                let logs = match chunks.e2e_keys() {
-                    Some(keys) => {
-                        constellation_store_s3::LogStore::new_e2e(store.clone(), keys.clone())
-                    }
-                    None => constellation_store_s3::LogStore::new(store.clone()),
-                };
-                fsck::run(
-                    store,
-                    chunks,
-                    &logs,
-                    meta,
-                    Some(&state_dir),
-                    compression,
-                    lease_mode,
-                    repair,
-                    force_release.as_deref(),
-                )
-                .await
-            })
-        })
-        .map_err(|e| format!("{e:#}"))?;
-        serde_json::to_value(&report).map_err(|e| format!("{e:#}"))
-    }
-
-    fn mount_add(
-        &self,
-        subtree: &str,
-        mountpoint: &std::path::Path,
-        opts: &constellation_api::MountViewOpts,
-    ) -> std::result::Result<String, String> {
-        // `fuse_threads` arrives straight from an unauthenticated API caller
-        // and flows into fuser's `n_threads`, one OS thread each: an
-        // unbounded value is a thread-spawn DoS. Reject anything outside a
-        // sane band rather than clamp, so the caller learns the request was
-        // wrong instead of silently getting a different mount. The
-        // CLI-driven mount path derives its count from `thread_plan()`
-        // (already capped at `FUSE_THREAD_HARD_MAX`), so only this API path
-        // needs the guard.
-        let fuse_threads = match opts.fuse_threads {
-            Some(n) if !(1..=parallelism::FUSE_THREAD_HARD_MAX).contains(&n) => {
-                return Err(format!(
-                    "fuse_threads must be between 1 and {}, got {n}",
-                    parallelism::FUSE_THREAD_HARD_MAX
-                ));
-            }
-            Some(n) => n,
-            None => parallelism::thread_plan().fuse,
-        };
-        let id = self
-            .node
-            .add_mount(node_runtime::ViewConfig {
-                inner_path: subtree.to_string(),
-                mountpoint: mountpoint.to_path_buf(),
-                allow_other: opts.allow_other,
-                fs_name: opts
-                    .fs_name
-                    .clone()
-                    .unwrap_or_else(|| "constellation".to_string()),
-                fuse_threads,
-                rw_snapshot: opts.rw,
-                clone_name: opts.clone_name.clone(),
-                ephemeral: opts.ephemeral,
-            })
-            .map_err(|e| format!("{e:#}"))?;
-        Ok(format!(
-            "mounted view {} at {}",
-            id.as_u64(),
-            mountpoint.display()
-        ))
-    }
-
-    fn mount_remove(&self, mountpoint: &std::path::Path) -> std::result::Result<String, String> {
-        let id = self
-            .node
-            .mounts()
-            .into_iter()
-            .find(|m| m.mountpoint == mountpoint)
-            .map(|m| m.id)
-            .ok_or_else(|| format!("no view mounted at {}", mountpoint.display()))?;
-        // `remove_mount` calls `fusermount3 -u` and then joins the FUSE
-        // session's OS thread, which can legitimately take a while
-        // (draining in-flight requests). `dispatch` runs this on a tokio
-        // worker with no `.await` in between, so without `block_in_place`
-        // that worker — and every other task scheduled on it — would
-        // stall for however long the unmount takes, same class of bug as
-        // `reintegrate`/`gc_run`/`fsck_run` below already guard against.
-        tokio::task::block_in_place(|| self.node.remove_mount(id)).map_err(|e| format!("{e:#}"))?;
-        Ok(format!("unmounted {}", mountpoint.display()))
-    }
-
-    fn mount_list(&self) -> Vec<constellation_api::MountInfo> {
-        self.api_mounts()
-    }
-}
-
-fn normalize_control_path(path: &str) -> String {
-    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    if parts.is_empty() {
-        "/".into()
+/// A listing, or `empty` when there is nothing in it.
+fn print_list<T: serde::Serialize>(rows: &[T], empty: &str) -> Result<()> {
+    if rows.is_empty() {
+        println!("{empty}");
+        Ok(())
     } else {
-        format!("/{}", parts.join("/"))
+        print_json(&rows)
     }
 }
 
+fn print_quota(q: api::QuotaStatus) -> Result<()> {
+    match q.max_bytes {
+        Some(cap) => println!("quota: {} / {cap} bytes used", q.used_bytes),
+        None => println!("quota: {} bytes used (unlimited)", q.used_bytes),
+    }
+    Ok(())
+}
+
+/// `constellation daemon --upgrade`: ask the daemon to hand its views
+/// over (`handover`), then wait until the new image answers `status`
+/// with a higher generation.
+async fn cmd_daemon_upgrade(
+    state_dir: &Path,
+    binary: Option<PathBuf>,
+    within: std::time::Duration,
+) -> Result<()> {
+    let status =
+        |timeout| control::call_bounded::<cm::NodeStatus>(state_dir, Default::default(), timeout);
+    let before = status(daemon_lock::control_timeout())
+        .await
+        .context("no daemon answers for this state dir")?;
+    let binary = binary
+        .map(|b| std::fs::canonicalize(&b).with_context(|| format!("{}", b.display())))
+        .transpose()?;
+    match control::try_call::<cm::NodeHandoff>(
+        state_dir,
+        api::HandoffParams {
+            target: api::HandoffTarget::Exec { binary },
+            ..Default::default()
+        },
+        Some(within),
+    )
+    .await?
+    {
+        Ok(report) => println!("{}", report.detail),
+        Err(e) => bail!("upgrade refused: {}", e.message),
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() > within {
+            bail!("the upgraded daemon did not report serving within {within:?}");
+        }
+        // The new image answers once it serves; during the handover the
+        // connection waits in the listener's backlog.
+        if let Ok(now) = status(std::time::Duration::from_secs(5)).await {
+            if now.handover.generation > before.handover.generation && !now.handover.upgrading {
+                println!(
+                    "upgraded: pid {} generation {} version {} serving {} view(s)",
+                    now.handover.pid,
+                    now.handover.generation,
+                    now.version,
+                    now.mounts.len()
+                );
+                return Ok(());
+            }
+            if !now.handover.upgrading {
+                if let Some(error) = now.handover.last_error {
+                    bail!("the upgrade failed: {error}");
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// `<data dir>/<uuid>` (`constellation_engine::default_state_dir`, for
+/// the one-shot commands that open a state dir without an engine).
 fn default_state_dir(meta: &FsMeta) -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default();
-            home.join(".local/share")
-        });
-    base.join("constellation").join(meta.uuid.to_string())
+    constellation_engine::default_state_dir(constellation_platform::native(), meta)
 }
 
 /// Parse a human-readable byte size for CLI flags (`10G`, `512MiB`, bare
@@ -6726,1253 +3224,6 @@ mod parse_byte_size_tests {
     }
 }
 
-/// Plan 07's `pending_upload`-driven regression tests for
-/// `upload_dirty_chunks`: the durable not-yet-uploaded set must survive
-/// a crash even though `DiskCache::rescan` legitimately reports every
-/// rediscovered chunk `Clean` (prerequisite 1), and a failed drain must
-/// leave the pending row rather than silently dropping it (the "journal
-/// must wait" state that backs prerequisite 2's unmount gate).
-#[cfg(test)]
-mod pending_upload_tests {
-    use super::*;
-    use constellation_fs_core::cache::ChunkState;
-    use constellation_fs_core::ChunkHash;
-    use constellation_meta::MetaStore;
-    use object_store::memory::InMemory;
-    use object_store::path::Path as ObjPath;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    };
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    /// Wraps an in-memory backend and can be told to fail every `put`,
-    /// simulating a cut S3 path without needing toxiproxy for a unit
-    /// test.
-    #[derive(Debug)]
-    struct FailingStore {
-        inner: InMemory,
-        fail_puts: AtomicBool,
-        delay_puts: AtomicBool,
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
-        puts: AtomicUsize,
-        heads: AtomicUsize,
-    }
-
-    impl FailingStore {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                inner: InMemory::new(),
-                fail_puts: AtomicBool::new(false),
-                delay_puts: AtomicBool::new(false),
-                in_flight: AtomicUsize::new(0),
-                max_in_flight: AtomicUsize::new(0),
-                puts: AtomicUsize::new(0),
-                heads: AtomicUsize::new(0),
-            })
-        }
-
-        fn set_fail_puts(&self, fail: bool) {
-            self.fail_puts.store(fail, Ordering::SeqCst);
-        }
-
-        fn set_delay_puts(&self, delay: bool) {
-            self.delay_puts.store(delay, Ordering::SeqCst);
-        }
-    }
-
-    impl std::fmt::Display for FailingStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "FailingStore({})", self.inner)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for FailingStore {
-        async fn put_opts(
-            &self,
-            location: &ObjPath,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            self.puts.fetch_add(1, Ordering::SeqCst);
-            let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_in_flight.fetch_max(active, Ordering::SeqCst);
-            if self.delay_puts.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            if self.fail_puts.load(Ordering::SeqCst) {
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                return Err(object_store::Error::Generic {
-                    store: "FailingStore",
-                    source: "S3 path is cut (test injection)".into(),
-                });
-            }
-            let result = self.inner.put_opts(location, payload, opts).await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            result
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &ObjPath,
-            opts: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &ObjPath,
-            options: GetOptions,
-        ) -> object_store::Result<GetResult> {
-            if options.head {
-                self.heads.fetch_add(1, Ordering::SeqCst);
-            }
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&ObjPath>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&ObjPath>,
-        ) -> object_store::Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &ObjPath,
-            to: &ObjPath,
-            options: CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    struct Fixture {
-        meta: Meta,
-        cache: Arc<DiskCache>,
-        cache_dir: PathBuf,
-        store: Arc<ChunkStore>,
-        failing: Arc<FailingStore>,
-        _cache_tmp: tempfile::TempDir,
-    }
-
-    impl Fixture {
-        /// Reopen the cache from the same directory: `DiskCache::open`
-        /// rebuilds accounting purely from what is on disk, the same
-        /// path a real remount after `kill -9` takes.
-        fn reopen_cache_simulating_crash(&mut self) {
-            self.cache = Arc::new(DiskCache::open(&self.cache_dir, 64 * 1024 * 1024).unwrap());
-        }
-    }
-
-    fn fixture() -> Fixture {
-        let failing = FailingStore::new();
-        let cache_tmp = tempfile::tempdir().unwrap();
-        let cache_dir = cache_tmp.path().to_path_buf();
-        Fixture {
-            meta: Meta::open_in_memory().unwrap(),
-            cache: Arc::new(DiskCache::open(&cache_dir, 64 * 1024 * 1024).unwrap()),
-            cache_dir,
-            store: Arc::new(ChunkStore::new(failing.clone() as Arc<dyn ObjectStore>)),
-            failing,
-            _cache_tmp: cache_tmp,
-        }
-    }
-
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-
-    /// Regression test for prerequisite 1: after a "crash",
-    /// `DiskCache::rescan` reports the chunk `Clean` (it cannot tell
-    /// uploaded from un-uploaded content from a directory listing
-    /// alone), but the durable `pending_upload` row must still drive the
-    /// drain to completion.
-    #[test]
-    fn drain_finds_pending_row_even_though_cache_reports_clean_after_rescan() {
-        let mut f = fixture();
-        let file = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
-            .unwrap();
-        let data = b"post-crash content".to_vec();
-        let hash = ChunkHash::of(&data);
-        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
-        f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
-            .unwrap();
-
-        // Simulate the crash: reopening the cache rebuilds accounting
-        // purely from disk and legitimately reports Clean (see
-        // `cache::tests::rescan_rebuilds_accounting`).
-        f.reopen_cache_simulating_crash();
-        assert_eq!(f.cache.state_of(&hash), Some(ChunkState::Clean));
-        assert_eq!(f.meta.pending_uploads().unwrap(), vec![(hash, file.ino)]);
-
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ))
-        .unwrap();
-
-        assert!(
-            f.meta.pending_uploads().unwrap().is_empty(),
-            "drain must ack the pending row once the chunk is uploaded"
-        );
-        let uploaded = rt().block_on(f.store.get_chunk(&hash)).unwrap();
-        assert_eq!(uploaded, data);
-    }
-
-    /// Regression test for prerequisite 2's failure mode: while S3 is
-    /// unreachable, the drain must refuse (not silently drop the
-    /// pending row), which is exactly the signal the clean-unmount path
-    /// uses to call `set_skip_ship(true)` rather than shipping a
-    /// manifest for content that never reached S3.
-    #[test]
-    fn failed_drain_leaves_the_pending_row_for_the_next_attempt() {
-        let f = fixture();
-        let file = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
-            .unwrap();
-        let data = b"never uploaded".to_vec();
-        let hash = ChunkHash::of(&data);
-        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
-        f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
-            .unwrap();
-
-        f.failing.set_fail_puts(true);
-        let err = rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ));
-        assert!(err.is_err(), "drain must fail while S3 is unreachable");
-        assert_eq!(
-            f.meta.pending_uploads().unwrap(),
-            vec![(hash, file.ino)],
-            "a failed drain must not ack the row it could not upload"
-        );
-
-        // Heal, retry: the very next attempt must succeed and ack.
-        f.failing.set_fail_puts(false);
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ))
-        .unwrap();
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-    }
-
-    /// Plan 29 M6's characterization test, flipped by plan 30 §M4 item 2
-    /// (see `bench/remote/RESULTS.md` anomaly #2): a pending row whose chunk
-    /// is gone from the local cache used to fail the *entire* round, and so
-    /// block every other inode's manifest from ever shipping, forever. Now
-    /// the upload pass reports it instead of failing, records it as
-    /// unrecoverable, and the ship plan holds back only that inode's
-    /// manifest (and whatever depends on it): **other inodes still
-    /// publish**, including ones written after the broken one.
-    #[test]
-    fn one_missing_chunk_holds_back_only_its_own_records() {
-        let f = fixture();
-        // Holder capture on (this node holds the lease), so every
-        // transaction has a key set and the isolation is exact.
-        f.meta.set_holder_epoch(1);
-        let healthy_file = f
-            .meta
-            .create(
-                constellation_fs_core::types::ROOT_INO,
-                "healthy",
-                0o644,
-                0,
-                0,
-            )
-            .unwrap();
-        let healthy_data = b"perfectly fine content".to_vec();
-        let healthy_hash = ChunkHash::of(&healthy_data);
-        f.cache
-            .insert(&healthy_hash, &healthy_data, ChunkState::Dirty)
-            .unwrap();
-        f.meta
-            .set_manifest_dirty(
-                healthy_file.ino,
-                None,
-                b"M",
-                healthy_data.len() as u64,
-                &[healthy_hash],
-            )
-            .unwrap();
-
-        // "broken": a pending_upload row with nothing behind it in the
-        // cache -- the observed field condition, reproduced directly
-        // rather than via whatever race produces it in practice.
-        let broken_file = f
-            .meta
-            .create(
-                constellation_fs_core::types::ROOT_INO,
-                "broken",
-                0o644,
-                0,
-                0,
-            )
-            .unwrap();
-        let broken_hash = ChunkHash::of(b"bytes that are gone");
-        f.meta
-            .set_manifest_dirty(broken_file.ino, None, b"M2", 4, &[broken_hash])
-            .unwrap();
-        assert!(
-            f.cache.get(&broken_hash).unwrap().is_none(),
-            "the broken hash must not be in the cache"
-        );
-        // Written after the broken one, touching none of its keys.
-        let later_file = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "later", 0o644, 0, 0)
-            .unwrap();
-
-        let report = rt()
-            .block_on(upload_dirty_chunks_report(
-                &f.cache,
-                &f.meta,
-                &f.store,
-                CompressionSetting::RAW,
-                &UploadRuntime::for_test(true),
-                None,
-                None,
-            ))
-            .expect("a missing chunk no longer fails the round");
-        assert_eq!(report.missing, vec![(broken_hash, broken_file.ino)]);
-        assert_eq!(
-            f.meta.unrecoverable_chunks().unwrap(),
-            vec![(broken_hash, broken_file.ino)]
-        );
-        // The healthy chunk uploaded and acked; only the broken row stays.
-        assert_eq!(
-            f.meta.pending_uploads().unwrap(),
-            vec![(broken_hash, broken_file.ino)]
-        );
-        let uploaded = rt().block_on(f.store.get_chunk(&healthy_hash)).unwrap();
-        assert_eq!(uploaded, healthy_data);
-        // A caller that needs everything durable (an fsync, an unmount's
-        // final flush) still gets the error.
-        assert!(rt()
-            .block_on(upload_dirty_chunks(
-                &f.cache,
-                &f.meta,
-                &f.store,
-                CompressionSetting::RAW,
-                &UploadRuntime::for_test(true),
-                None,
-                None,
-            ))
-            .is_err());
-
-        // The ship plan: everything but the broken manifest ships — the
-        // healthy file, the broken file's own create (it names no chunk),
-        // and the later file.
-        let batch: Vec<(u64, constellation_meta::LogRecord)> = f
-            .meta
-            .take_journal_grouped(10_000)
-            .unwrap()
-            .into_iter()
-            .flat_map(|(_, batch)| batch)
-            .collect();
-        let manifests: Vec<u64> = batch
-            .iter()
-            .filter_map(|(_, rec)| match rec {
-                constellation_meta::LogRecord::WriteManifest { ino, .. } => Some(*ino),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(manifests, vec![healthy_file.ino]);
-        let creates: Vec<String> = batch
-            .iter()
-            .filter_map(|(_, rec)| match rec {
-                constellation_meta::LogRecord::Create { name, .. } => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(creates, vec!["healthy", "broken", "later"]);
-        let held = f.meta.held_summary();
-        assert_eq!(held.transactions, 1, "{held:?}");
-        assert_eq!(held.inodes[&broken_file.ino].missing, vec![broken_hash]);
-        assert!(later_file.ino != broken_file.ino);
-
-        // Ship what was planned: the held manifest is still journaled,
-        // still outstanding speculation, and still held next round.
-        let seqs: Vec<u64> = batch.iter().map(|(seq, _)| *seq).collect();
-        f.meta.ack_journal_rows_at(&seqs, 1).unwrap();
-        let rest: Vec<(u64, constellation_meta::LogRecord)> =
-            constellation_meta::MetaStore::take_journal(&f.meta, usize::MAX).unwrap();
-        assert!(rest.iter().any(|(_, rec)| matches!(
-            rec,
-            constellation_meta::LogRecord::WriteManifest { ino, .. } if *ino == broken_file.ino
-        )));
-        assert!(f.meta.take_journal_grouped(10_000).unwrap().is_empty());
-        assert_eq!(f.meta.speculation_counts().unwrap().local, 1);
-    }
-
-    /// Plan 30 §M9 × §M4: a successor adopts, from its predecessor's
-    /// backup tail, a manifest naming one chunk the predecessor uploaded
-    /// and one it never did (a write-back close acknowledged before its
-    /// upload). The adopted manifest never ships while a chunk it names is
-    /// missing from the bucket: it is deferred until the upload pass has
-    /// looked, then held (M4 status) — and it ships once the missing chunk
-    /// turns up (the predecessor back, uploading). The same for a spilled
-    /// manifest, whose list is read from its blob.
-    fn adopted_manifest_ships_only_once_its_chunks_are_durable(spilled: bool) {
-        use constellation_fs_core::{manifest::encode_chunk_list, Manifest};
-        let f = fixture();
-        f.meta.set_holder_epoch(2);
-        let file = f
-            .meta
-            .create(
-                constellation_fs_core::types::ROOT_INO,
-                "adopted",
-                0o644,
-                0,
-                0,
-            )
-            .unwrap();
-        let shipped: Vec<u64> = constellation_meta::MetaStore::take_journal(&f.meta, usize::MAX)
-            .unwrap()
-            .into_iter()
-            .map(|(s, _)| s)
-            .collect();
-        f.meta.ack_journal_rows_at(&shipped, 1).unwrap();
-
-        let uploaded = b"uploaded by the predecessor".to_vec();
-        let lost = b"only on the predecessor's disk".to_vec();
-        let (up_hash, lost_hash) = (ChunkHash::of(&uploaded), ChunkHash::of(&lost));
-        rt().block_on(
-            f.store
-                .put_chunk(&up_hash, &uploaded, CompressionSetting::RAW),
-        )
-        .unwrap();
-        let chunks: constellation_fs_core::manifest::SparseChunks =
-            [(0u64, up_hash), (1u64, lost_hash)].into_iter().collect();
-        let (manifest, blob) = if spilled {
-            let blob = encode_chunk_list(&chunks);
-            let blob_hash = ChunkHash::of(&blob);
-            rt().block_on(
-                f.store
-                    .put_chunk(&blob_hash, &blob, CompressionSetting::RAW),
-            )
-            .unwrap();
-            let (m, spill) = Manifest::from_sparse_chunks(4096, 8192, chunks, 0, ChunkHash::of);
-            assert!(spill.is_some());
-            (m, Some(blob_hash))
-        } else {
-            (
-                Manifest::from_sparse_chunks(4096, 8192, chunks, 8, ChunkHash::of).0,
-                None,
-            )
-        };
-        let rid = constellation_meta::Rid {
-            node: 1,
-            incarnation: 1,
-            seq: 7,
-        };
-        f.meta
-            .apply_adopted_records(
-                &[
-                    constellation_meta::LogRecord::WriteManifest {
-                        ino: file.ino,
-                        base_manifest: None,
-                        manifest: manifest.encode(),
-                        size: 8192,
-                        time_ns: 1,
-                    },
-                    constellation_meta::LogRecord::Completed { rid },
-                ],
-                Some(rid),
-            )
-            .unwrap();
-        let manifests_shipped = |f: &Fixture| -> Vec<u64> {
-            f.meta
-                .take_journal_grouped(10_000)
-                .unwrap()
-                .into_iter()
-                .flat_map(|(_, batch)| batch)
-                .filter_map(|(_, rec)| match rec {
-                    constellation_meta::LogRecord::WriteManifest { ino, .. } => Some(ino),
-                    _ => None,
-                })
-                .collect()
-        };
-        // Enrolled: deferred before any upload pass has looked.
-        assert!(!f.meta.pending_uploads().unwrap().is_empty());
-        assert!(manifests_shipped(&f).is_empty(), "shipped before any check");
-        if spilled {
-            assert_eq!(
-                f.meta.adopted_spills().unwrap(),
-                vec![(file.ino, blob.unwrap())]
-            );
-        }
-
-        // The upload pass: the uploaded chunk (and the blob) are
-        // acknowledged from S3; the other is recorded unrecoverable.
-        let report = rt()
-            .block_on(upload_dirty_chunks_report(
-                &f.cache,
-                &f.meta,
-                &f.store,
-                CompressionSetting::RAW,
-                &UploadRuntime::for_test(true),
-                None,
-                None,
-            ))
-            .unwrap();
-        assert_eq!(report.missing, vec![(lost_hash, file.ino)]);
-        assert!(
-            f.meta.adopted_spills().unwrap().is_empty(),
-            "the list was expanded"
-        );
-        assert_eq!(
-            f.meta.pending_uploads().unwrap(),
-            vec![(lost_hash, file.ino)]
-        );
-        assert!(
-            manifests_shipped(&f).is_empty(),
-            "a dangling manifest shipped"
-        );
-        let held = f.meta.held_summary();
-        assert_eq!(held.transactions, 1, "{held:?}");
-        assert_eq!(held.inodes[&file.ino].missing, vec![lost_hash]);
-        // Held work is `Local` speculation: never published.
-        assert_eq!(f.meta.speculation_counts().unwrap().local, 1);
-
-        // The predecessor is back and uploads: the next pass finds the
-        // chunk in S3, and the manifest ships.
-        rt().block_on(
-            f.store
-                .put_chunk(&lost_hash, &lost, CompressionSetting::RAW),
-        )
-        .unwrap();
-        let report = rt()
-            .block_on(upload_dirty_chunks_report(
-                &f.cache,
-                &f.meta,
-                &f.store,
-                CompressionSetting::RAW,
-                &UploadRuntime::for_test(true),
-                None,
-                None,
-            ))
-            .unwrap();
-        assert!(report.missing.is_empty());
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-        assert_eq!(manifests_shipped(&f), vec![file.ino]);
-    }
-
-    #[test]
-    fn an_adopted_manifest_ships_only_once_its_chunks_are_durable() {
-        adopted_manifest_ships_only_once_its_chunks_are_durable(false);
-    }
-
-    #[test]
-    fn an_adopted_spilled_manifest_ships_only_once_its_chunks_are_durable() {
-        adopted_manifest_ships_only_once_its_chunks_are_durable(true);
-    }
-
-    /// Two failovers inside one upload window: B adopts A's manifest (its
-    /// chunk only on A), then B is deposed before shipping it; the
-    /// stranded adopted transaction is replayed by rid through the next
-    /// holder C as a `Records` op. C must enroll its chunks for the
-    /// durability check as B did — before, `Records` executed without
-    /// enrolling anything and C shipped a manifest naming a missing chunk.
-    #[test]
-    fn a_stranded_adopted_manifest_replayed_elsewhere_is_still_held() {
-        use constellation_fs_core::Manifest;
-        let b = fixture();
-        let c = fixture();
-        b.meta.set_holder_epoch(2);
-        let file = b
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
-            .unwrap();
-        let on_c = c
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
-            .unwrap();
-        assert_eq!(file.ino, on_c.ino, "the same file on both replicas");
-        let lost = ChunkHash::of(b"only on A");
-        let chunks: constellation_fs_core::manifest::SparseChunks =
-            [(0u64, lost)].into_iter().collect();
-        let manifest = Manifest::from_sparse_chunks(4096, 9, chunks, 8, ChunkHash::of).0;
-        let rid = constellation_meta::Rid {
-            node: 1,
-            incarnation: 1,
-            seq: 3,
-        };
-        b.meta
-            .apply_adopted_records(
-                &[
-                    constellation_meta::LogRecord::WriteManifest {
-                        ino: file.ino,
-                        base_manifest: None,
-                        manifest: manifest.encode(),
-                        size: 9,
-                        time_ns: 1,
-                    },
-                    constellation_meta::LogRecord::Completed { rid },
-                ],
-                Some(rid),
-            )
-            .unwrap();
-        // B is deposed (C's epoch 3): the adopted transaction strands.
-        b.meta.set_holder_epoch(0);
-        b.meta.strand_below_epoch(3).unwrap();
-        let queue = b.meta.pending_replays().unwrap();
-        let queued = queue.iter().find(|q| q.rid == rid).expect("queued by rid");
-        assert!(matches!(
-            queued.op,
-            constellation_meta::MutateOp::Records { .. }
-        ));
-
-        // C executes the replay as holder.
-        c.meta.set_holder_epoch(3);
-        constellation_meta::execute_mutate(&c.meta, &queued.op, Some(rid)).unwrap();
-        assert_eq!(c.meta.pending_uploads().unwrap(), vec![(lost, file.ino)]);
-        rt().block_on(upload_dirty_chunks_report(
-            &c.cache,
-            &c.meta,
-            &c.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ))
-        .unwrap();
-        let shipped: Vec<constellation_meta::LogRecord> = c
-            .meta
-            .take_journal_grouped(10_000)
-            .unwrap()
-            .into_iter()
-            .flat_map(|(_, batch)| batch)
-            .map(|(_, rec)| rec)
-            .collect();
-        assert!(
-            !shipped
-                .iter()
-                .any(|r| matches!(r, constellation_meta::LogRecord::WriteManifest { .. })),
-            "C shipped a manifest naming a chunk the bucket lacks: {shipped:?}"
-        );
-        assert!(c.meta.held_summary().inodes.contains_key(&file.ino));
-    }
-
-    /// The other way out: the predecessor never comes back, and the
-    /// operator drops the held manifest (`repair drop-held`): it becomes a
-    /// refused replay (a conflict copy with the lost chunk as a hole).
-    #[test]
-    fn an_adopted_manifest_with_a_lost_chunk_can_be_dropped() {
-        use constellation_fs_core::Manifest;
-        let f = fixture();
-        f.meta.set_holder_epoch(2);
-        let file = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "lost", 0o644, 0, 0)
-            .unwrap();
-        let lost_hash = ChunkHash::of(b"gone with the predecessor");
-        let chunks: constellation_fs_core::manifest::SparseChunks =
-            [(0u64, lost_hash)].into_iter().collect();
-        let manifest = Manifest::from_sparse_chunks(4096, 25, chunks, 8, ChunkHash::of).0;
-        f.meta
-            .apply_adopted_records(
-                &[constellation_meta::LogRecord::WriteManifest {
-                    ino: file.ino,
-                    base_manifest: None,
-                    manifest: manifest.encode(),
-                    size: 25,
-                    time_ns: 1,
-                }],
-                None,
-            )
-            .unwrap();
-        rt().block_on(upload_dirty_chunks_report(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ))
-        .unwrap();
-        // (The summary is the last ship plan's; the create ships.)
-        assert!(f
-            .meta
-            .take_journal_grouped(10_000)
-            .unwrap()
-            .into_iter()
-            .flat_map(|(_, b)| b)
-            .all(|(_, rec)| !matches!(rec, constellation_meta::LogRecord::WriteManifest { .. })));
-        assert!(f.meta.held_summary().inodes.contains_key(&file.ino));
-        let dropped = f.meta.drop_held(file.ino, 1).unwrap();
-        assert_eq!(dropped.dropped, 1, "{dropped:?}");
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-        let queue = f.meta.pending_replays().unwrap();
-        assert_eq!(queue.len(), 1);
-        assert!(queue[0].refused.is_some(), "a conflict copy is queued");
-        assert!(f
-            .meta
-            .take_journal_grouped(10_000)
-            .unwrap()
-            .into_iter()
-            .flat_map(|(_, b)| b)
-            .all(|(_, rec)| !matches!(rec, constellation_meta::LogRecord::WriteManifest { .. })));
-    }
-
-    #[test]
-    fn upload_pool_honours_its_bound() {
-        let f = fixture();
-        f.failing.set_delay_puts(true);
-        for i in 0..12u8 {
-            let file = f
-                .meta
-                .create(
-                    constellation_fs_core::types::ROOT_INO,
-                    &format!("f-{i}"),
-                    0o644,
-                    0,
-                    0,
-                )
-                .unwrap();
-            let data = vec![i; 4096];
-            let hash = ChunkHash::of(&data);
-            f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
-            f.meta
-                .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
-                .unwrap();
-        }
-        let upload = UploadRuntime::for_test_fixed(true, 3);
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            None,
-            None,
-        ))
-        .unwrap();
-        assert!(f.failing.max_in_flight.load(Ordering::SeqCst) <= 3);
-        assert!(
-            f.failing.max_in_flight.load(Ordering::SeqCst) >= 2,
-            "the test must observe actual parallelism"
-        );
-    }
-
-    fn queue(f: &Fixture, name: &str, data: &[u8]) -> ChunkHash {
-        let file = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, name, 0o644, 0, 0)
-            .unwrap();
-        let hash = ChunkHash::of(data);
-        f.cache.insert(&hash, data, ChunkState::Dirty).unwrap();
-        f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
-            .unwrap();
-        hash
-    }
-
-    /// A hinted hash confirms with a HEAD and skips the PUT entirely; an
-    /// unhinted one keeps the adaptive fallback, because no hint source can
-    /// prove absence any more (plan 26 step 8 deleted the LIST seed that
-    /// could). Neither decision costs a LIST.
-    #[test]
-    fn hinted_hash_probes_and_unhinted_hash_keeps_the_adaptive_fallback() {
-        let f = fixture();
-        let known_data = b"already in S3";
-        let known = ChunkHash::of(known_data);
-        rt().block_on(f.store.put_chunk_mode(
-            &known,
-            known_data,
-            CompressionSetting::RAW,
-            constellation_store_s3::ChunkPutMode::Create,
-        ))
-        .unwrap();
-        f.failing.puts.store(0, Ordering::SeqCst);
-        f.failing.heads.store(0, Ordering::SeqCst);
-
-        queue(&f, "known", known_data);
-        queue(&f, "new", b"not in S3");
-        let existence = crate::existence::Existence::new(1024, true, None);
-        existence.insert(&known);
-        let mut upload = UploadRuntime::new(true, None, existence);
-        upload.probe_min_bytes = 0;
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            None,
-            None,
-        ))
-        .unwrap();
-
-        assert_eq!(
-            f.failing.heads.load(Ordering::SeqCst),
-            2,
-            "the hint confirms with a HEAD; the unhinted chunk probes too"
-        );
-        assert_eq!(
-            f.failing.puts.load(Ordering::SeqCst),
-            1,
-            "only the chunk that is genuinely absent is uploaded"
-        );
-        assert_eq!(upload.existence.report().bloom_hits, 1);
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-    }
-
-    #[test]
-    fn bloom_false_positive_still_calls_store_before_ack() {
-        let f = fixture();
-        let data = b"forced false positive";
-        let hash = queue(&f, "false-positive", data);
-        let existence = crate::existence::Existence::new(1024, true, None);
-        existence.insert(&hash);
-        let mut upload = UploadRuntime::new(true, None, existence);
-        upload.probe_min_bytes = 0;
-
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            None,
-            None,
-        ))
-        .unwrap();
-        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
-        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-    }
-
-    #[test]
-    fn peer_hit_selects_probe_but_peer_miss_retains_adaptive_head() {
-        let f = fixture();
-        let hinted = ChunkHash::of(b"hinted");
-        let bloom = constellation_net::Bloom::from_hashes(&[hinted.0]);
-        let coop = crate::coop::Coop::new_for_upload_test(f.cache.clone(), f.store.clone());
-        coop.apply_digest(constellation_net::DigestSnapshot {
-            node_id: 2,
-            generation: 1,
-            bits: bloom.bits,
-            nbits: bloom.nbits,
-            k: bloom.k,
-            n: bloom.n,
-            bucket: 0,
-            buckets: 1,
-        });
-        let existence = crate::existence::Existence::new(1024, true, None);
-        let mut upload = UploadRuntime::new(true, Some(coop), existence);
-        upload.probe_min_bytes = 0;
-        assert_eq!(
-            upload.put_mode(&hinted, 1 << 20),
-            constellation_store_s3::ChunkPutMode::Probe
-        );
-        assert_eq!(upload.existence.report().peer_hints, 1);
-        assert_eq!(
-            upload.put_mode(&ChunkHash::of(b"peer miss"), 1 << 20),
-            constellation_store_s3::ChunkPutMode::Probe,
-            "an unhinted hash must keep the adaptive probe"
-        );
-    }
-
-    #[test]
-    fn condemned_hash_overwrites_even_when_existence_bloom_claims_present() {
-        let f = fixture();
-        let data = b"condemned existence hit";
-        let hash = queue(&f, "condemned", data);
-        rt().block_on(constellation_store_s3::publish_condemned(
-            f.store.inner(),
-            vec![hash.to_hex()],
-            1,
-        ))
-        .unwrap();
-        f.failing.puts.store(0, Ordering::SeqCst);
-        f.failing.heads.store(0, Ordering::SeqCst);
-        let existence = crate::existence::Existence::new(1024, true, None);
-        existence.insert(&hash);
-        let mut upload = UploadRuntime::new(true, None, existence);
-        upload.probe_min_bytes = 0;
-
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            None,
-            None,
-        ))
-        .unwrap();
-        // The hinted HEAD comes first now (`CondemnedView`: the pointer is
-        // read only once the object is there); the chunk is not in S3,
-        // so the probe's miss uploads it.
-        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
-        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-
-        // In S3 and condemned: the HEAD finds it, the pointer (read after
-        // it) lists it, and the bytes go up again.
-        let file = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "again", 0o644, 0, 0)
-            .unwrap();
-        f.cache.insert(&hash, data, ChunkState::Dirty).unwrap();
-        f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
-            .unwrap();
-        f.failing.puts.store(0, Ordering::SeqCst);
-        f.failing.heads.store(0, Ordering::SeqCst);
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            None,
-            None,
-        ))
-        .unwrap();
-        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            f.failing.puts.load(Ordering::SeqCst),
-            1,
-            "a condemned hit is re-uploaded"
-        );
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-    }
-
-    /// The sequencer's side of a non-owner's `back` close: a chunk the
-    /// forward named as pending is in neither its cache nor S3. The pass
-    /// awaits it — not "missing" (no poison, no held records), not an
-    /// error even for a strict drain — and checks S3 itself only once the
-    /// first backoff is over; found there, the row is acked.
-    #[test]
-    fn a_chunk_forwarded_as_pending_is_awaited_not_lost() {
-        let f = fixture();
-        let file = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "fwd", 0o644, 0, 0)
-            .unwrap();
-        let data = b"uploading on the forwarder";
-        let hash = ChunkHash::of(data);
-        f.meta.enroll_remote_chunks(file.ino, &[hash], 2).unwrap();
-        let upload = UploadRuntime::for_test(true);
-        let pass = |upload: &UploadRuntime| {
-            rt().block_on(upload_dirty_chunks_report(
-                &f.cache,
-                &f.meta,
-                &f.store,
-                CompressionSetting::RAW,
-                upload,
-                None,
-                None,
-            ))
-            .unwrap()
-        };
-        let report = pass(&upload);
-        assert!(report.missing.is_empty());
-        assert_eq!(report.awaiting, 1);
-        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 0, "no S3 check yet");
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            Some(file.ino),
-            None,
-        ))
-        .expect("an awaited chunk is not a lost one");
-        assert!(
-            f.meta.unrecoverable_chunks().unwrap().is_empty(),
-            "nothing poisoned"
-        );
-        // The forwarder's upload lands; its report was lost; the backoff
-        // runs out and this node finds the chunk itself.
-        rt().block_on(f.store.put_chunk(&hash, data, CompressionSetting::RAW))
-            .unwrap();
-        upload
-            .remote_polls
-            .lock()
-            .unwrap()
-            .insert(hash, (std::time::Instant::now(), REMOTE_POLL_FIRST));
-        let report = pass(&upload);
-        assert_eq!(report.awaiting, 0);
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-        assert!(!f.meta.awaits_remote_chunk(&hash).unwrap());
-    }
-
-    /// The forwarder's side: once its pass puts a chunk it forwarded as
-    /// pending up, it owes the node it forwarded to a report — and only
-    /// for those chunks.
-    #[test]
-    fn a_chunk_forwarded_as_pending_is_reported_once_up() {
-        let f = fixture();
-        let forwarded = queue(&f, "forwarded", b"forwarded while pending");
-        let other = queue(&f, "other", b"never forwarded");
-        let upload = UploadRuntime::for_test(true);
-        upload.note_forwarded(&[forwarded], 9);
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            None,
-            None,
-        ))
-        .unwrap();
-        let reports = upload.take_durable_reports();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[&9], vec![forwarded]);
-        assert!(!reports[&9].contains(&other));
-        assert!(upload.take_durable_reports().is_empty(), "sent once");
-    }
-
-    /// What a forward says is still pending: the chunks its manifest names
-    /// that have a pending row here, nothing for any other op.
-    #[test]
-    fn a_forward_names_only_the_chunks_still_pending() {
-        let f = fixture();
-        let pending = queue(&f, "p", b"pending here");
-        let durable = ChunkHash::of(b"already up");
-        let manifest = |hashes: &[ChunkHash]| {
-            constellation_fs_core::Manifest::from_sparse_chunks(
-                4096,
-                4096 * hashes.len() as u64,
-                hashes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, h)| (i as u64, *h))
-                    .collect(),
-                8,
-                ChunkHash::of,
-            )
-            .0
-            .encode()
-        };
-        let op = constellation_meta::MutateOp::SetManifest {
-            ino: 5,
-            base_manifest: None,
-            manifest: manifest(&[durable, pending]),
-            size: 8192,
-        };
-        assert_eq!(
-            forwarded_pending_chunks(&f.meta, &f.cache, &op),
-            vec![pending]
-        );
-        let other = constellation_meta::MutateOp::Unlink {
-            parent: constellation_fs_core::types::ROOT_INO,
-            name: "p".into(),
-        };
-        assert!(forwarded_pending_chunks(&f.meta, &f.cache, &other).is_empty());
-    }
-
-    /// The OVH run's finding 3: a small chunk does not probe on the
-    /// ladder's guess — a HEAD-first probe of a unique small file is two
-    /// serialized round trips where a conditional create is one. A
-    /// positive hint (the bytes were seen up) still probes: a HEAD is
-    /// cheaper than re-sending them.
-    #[test]
-    fn a_small_chunk_creates_instead_of_probing() {
-        let f = fixture();
-        let data = b"a small file's only chunk";
-        let hash = queue(&f, "small", data);
-        let existence = crate::existence::Existence::new(1024, true, None);
-        let hinted = ChunkHash::of(b"seen up before");
-        existence.insert(&hinted);
-        let upload = UploadRuntime::new(true, None, existence);
-        assert_eq!(
-            upload.put_mode(&hinted, 16),
-            constellation_store_s3::ChunkPutMode::Probe,
-            "a hinted small chunk probes"
-        );
-        assert!(
-            upload.probe.lock().unwrap().enabled(),
-            "the ladder leans to Probe"
-        );
-        assert_eq!(
-            upload.put_mode(&hash, data.len()),
-            constellation_store_s3::ChunkPutMode::Create
-        );
-        assert_eq!(
-            upload.put_mode(&hash, 4 << 20),
-            constellation_store_s3::ChunkPutMode::Probe,
-            "a large chunk still follows the ladder"
-        );
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &upload,
-            None,
-            None,
-        ))
-        .unwrap();
-        assert_eq!(f.failing.heads.load(Ordering::SeqCst), 0);
-        assert_eq!(f.failing.puts.load(Ordering::SeqCst), 1);
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-    }
-
-    /// The clean-demotion race, as a deterministic interleaving. Writer 1
-    /// and writer 2 store the same content on one node. Writer 2's
-    /// `cache_for_upload` merges into writer 1's dirty entry, but writer
-    /// 2 has not enrolled its pending row yet (that happens at its
-    /// manifest commit) when writer 1's upload round finishes: the round
-    /// sees no pending row for the hash and demotes the chunk to clean,
-    /// and cache pressure evicts it. Writer 2 then enrols. Its chunk is
-    /// gone from the cache but durable in S3 (writer 1 uploaded the very
-    /// same bytes), so its round must acknowledge it rather than report it
-    /// lost and hold writer 2's records back.
-    #[test]
-    fn a_writer_enrolled_after_demotion_and_eviction_is_acknowledged_not_held() {
-        let f = fixture();
-        let data = b"same bytes, two writers".to_vec();
-        let hash = ChunkHash::of(&data);
-        let root = constellation_fs_core::types::ROOT_INO;
-        let w1 = f.meta.create(root, "w1", 0o644, 0, 0).unwrap();
-        let w2 = f.meta.create(root, "w2", 0o644, 0, 0).unwrap();
-        // Writer 1 caches and commits.
-        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
-        f.meta
-            .set_manifest_dirty(w1.ino, None, b"M1", data.len() as u64, &[hash])
-            .unwrap();
-        // Writer 2's cache_for_upload: a merge into the dirty entry.
-        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
-        // Writer 1's round uploads and, seeing no pending row, demotes.
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ))
-        .unwrap();
-        assert_eq!(f.cache.state_of(&hash), Some(ChunkState::Clean));
-        // Cache pressure evicts the clean chunk; then writer 2 enrols.
-        f.cache.prune_to(0).unwrap();
-        assert!(!f.cache.contains(&hash));
-        f.meta
-            .set_manifest_dirty(w2.ino, None, b"M2", data.len() as u64, &[hash])
-            .unwrap();
-
-        let report = rt()
-            .block_on(upload_dirty_chunks_report(
-                &f.cache,
-                &f.meta,
-                &f.store,
-                CompressionSetting::RAW,
-                &UploadRuntime::for_test(true),
-                None,
-                None,
-            ))
-            .unwrap();
-        assert!(
-            report.missing.is_empty(),
-            "held although durable: {:?}",
-            report.missing
-        );
-        assert!(f.meta.pending_uploads().unwrap().is_empty());
-        assert!(f.meta.unrecoverable_chunks().unwrap().is_empty());
-        assert_eq!(rt().block_on(f.store.get_chunk(&hash)).unwrap(), data);
-    }
-
-    /// The acknowledgement above trusts S3 exactly as far as a dedup
-    /// does: a chunk bucket GC has condemned may be deleted at any moment,
-    /// so a pending row whose chunk is gone from the cache and condemned
-    /// in the bucket is still reported lost (and its records held), never
-    /// acknowledged.
-    #[test]
-    fn a_cache_missing_chunk_condemned_in_s3_is_still_reported_lost() {
-        let f = fixture();
-        let data = b"condemned and evicted".to_vec();
-        let hash = queue(&f, "condemned-evicted", &data);
-        rt().block_on(upload_dirty_chunks(
-            &f.cache,
-            &f.meta,
-            &f.store,
-            CompressionSetting::RAW,
-            &UploadRuntime::for_test(true),
-            None,
-            None,
-        ))
-        .unwrap();
-        rt().block_on(constellation_store_s3::publish_condemned(
-            f.store.inner(),
-            vec![hash.to_hex()],
-            1,
-        ))
-        .unwrap();
-        f.cache.prune_to(0).unwrap();
-        let late = f
-            .meta
-            .create(constellation_fs_core::types::ROOT_INO, "late", 0o644, 0, 0)
-            .unwrap();
-        f.meta
-            .set_manifest_dirty(late.ino, None, b"M", data.len() as u64, &[hash])
-            .unwrap();
-        let report = rt()
-            .block_on(upload_dirty_chunks_report(
-                &f.cache,
-                &f.meta,
-                &f.store,
-                CompressionSetting::RAW,
-                &UploadRuntime::for_test(true),
-                None,
-                None,
-            ))
-            .unwrap();
-        assert_eq!(report.missing, vec![(hash, late.ino)]);
-        assert_eq!(f.meta.pending_uploads().unwrap(), vec![(hash, late.ino)]);
-    }
-}
-
 /// Regression for plan 29 M3b: `constellation umount myfs:/sub` used to
 /// hang forever on a shared daemon that still had sibling views mounted.
 /// `cmd_umount` unconditionally waited for `control.sock` to disappear,
@@ -7980,7 +3231,7 @@ mod pending_upload_tests {
 /// view was the *last* one (`NodeRuntime::shutdown`) — a daemon that keeps
 /// serving another view never deletes it, so the wait never ended even
 /// though the view being unmounted had cleanly detached
-/// (`fusefs::run` logs "FUSE detached" and moves on).
+/// (the view's session thread logs "FUSE detached" and moves on).
 #[cfg(test)]
 mod umount_tests {
     use super::*;
@@ -8022,19 +3273,15 @@ mod umount_tests {
 
         let node = node_runtime::NodeRuntime::start(
             node_runtime::NodeConfig {
-                s3: backend.clone(),
-                state_dir: Some(state_dir.clone()),
-                cache_size: 16 * 1024 * 1024,
-                fsync_s3: false,
-                cto_strict: false,
-                locks: None,
-                initial_write_mode: writeback::WriteMode::Through,
-                read_only_member: false,
+                fs_id: constellation_engine::FsId::new("myfs"),
+                engine: constellation_engine::EngineConfig {
+                    state_dir: Some(state_dir.clone()),
+                    cache_size: 16 * 1024 * 1024,
+                    ..constellation_engine::EngineConfig::new(backend.clone())
+                },
                 web_ui: 0,
                 log_buffer: log_buffer::LogBuffer::default(),
-                atime_mode: atime::AtimeMode::Off,
-                passphrase: None,
-                pin_target: None,
+                resumed: None,
             },
             rt.handle().clone(),
         )
@@ -8048,6 +3295,9 @@ mod umount_tests {
             rw_snapshot: false,
             clone_name: None,
             ephemeral: false,
+            confine_links: false,
+            labels: Default::default(),
+            qos: Default::default(),
         })
         .expect("mount root");
         std::fs::create_dir(root_mnt.join("sub")).expect("mkdir sub via root view");
@@ -8060,6 +3310,9 @@ mod umount_tests {
             rw_snapshot: false,
             clone_name: None,
             ephemeral: false,
+            confine_links: false,
+            labels: Default::default(),
+            qos: Default::default(),
         })
         .expect("mount sub");
 
@@ -8082,15 +3335,17 @@ mod umount_tests {
         .unwrap();
         drop(reg);
 
-        let sock = state_dir.join(constellation_api::SOCKET_NAME);
-        let before = rt
-            .block_on(constellation_api::call(
-                &sock,
-                &constellation_api::Request::MountList,
+        let list = |rt: &tokio::runtime::Runtime| {
+            rt.block_on(control::call::<cm::ViewList>(
+                &state_dir,
+                Default::default(),
             ))
-            .unwrap();
-        assert!(
-            matches!(&before, constellation_api::Response::Mounts { mounts } if mounts.len() == 2),
+            .map(|l| l.views)
+        };
+        let before = list(&rt).unwrap();
+        assert_eq!(
+            before.len(),
+            2,
             "expected both views mounted before umount: {before:?}"
         );
 
@@ -8117,23 +3372,13 @@ mod umount_tests {
 
         // The daemon must still be up, still serving the root view, and no
         // longer serving `/sub`.
-        let after = rt
-            .block_on(constellation_api::call(
-                &sock,
-                &constellation_api::Request::MountList,
-            ))
-            .expect("daemon should still be reachable (root view still mounted)");
-        match after {
-            constellation_api::Response::Mounts { mounts } => {
-                assert_eq!(
-                    mounts.len(),
-                    1,
-                    "expected exactly the root view left: {mounts:?}"
-                );
-                assert_eq!(mounts[0].subtree, "/");
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        let mounts = list(&rt).expect("daemon should still be reachable (root view still mounted)");
+        assert_eq!(
+            mounts.len(),
+            1,
+            "expected exactly the root view left: {mounts:?}"
+        );
+        assert_eq!(mounts[0].subtree, "/");
         assert!(
             std::fs::metadata(root_mnt.join("sub")).is_ok(),
             "root view must still be serving reads after the sub view was unmounted"

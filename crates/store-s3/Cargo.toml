@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 constellation-fs-core.workspace = true
 constellation-mtree.workspace = true
+constellation-platform.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true

@@ -684,7 +684,7 @@ impl Driver {
     /// A client op of a node whose lease is open for a new mutation, and
     /// which holds no delegation and is not acknowledgement-gated,
     /// executes here, outside the core, exactly as
-    /// `fusefs::mutate_op_rebasable_with_rid` does: admitted by
+    /// `view::View::mutate_op_rebasable_with_rid` does: admitted by
     /// `Meta::root_fast_path` (`Checked`) or blindly (`Unchecked`), then
     /// `execute_mutate`, the acknowledgement fed to the core as
     /// `Event::Activity` and the keys to the placement. `None`: not a
@@ -723,7 +723,7 @@ impl Driver {
             Err(constellation_meta::MetaError::Conflict) => {
                 MutateOutcome::Conflict { manifest: None }
             }
-            Err(e) => MutateOutcome::Errno(constellation_authority::core::meta_errno(&e)),
+            Err(e) => MutateOutcome::Errno(e.code()),
         };
         drop(admission);
         self.shared

@@ -12,6 +12,7 @@ use super::{
 use crate::client::Client;
 use crate::s3env::BUCKET;
 use anyhow::{bail, Context, Result};
+use constellation_types::Code;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -124,7 +125,7 @@ pub fn session_exists_observed(_seed: u64) -> Result<()> {
             "B already sees A's held write of `g`: A shipped while held"
         );
         match create_new(&b.mnt, "f") {
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(e) if Code::from_os_error(&e) == Some(Code::Exists) => {}
             Err(e) => bail!("B's create of `f` returned {e}, expected EEXIST"),
             Ok(()) => bail!("B's create of `f` succeeded although A has it"),
         }
@@ -638,7 +639,7 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
         hold_sync(tmp.path(), &hold)?;
         std::fs::write(a.mnt.join("g"), b"gee")?;
         match create_new(&b.mnt, "g") {
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(e) if Code::from_os_error(&e) == Some(Code::Exists) => {}
             other => bail!("B's create of `g` returned {other:?}, expected EEXIST"),
         }
         // Names never looked up before (the kernel's 1 s entry cache would

@@ -210,7 +210,7 @@ impl Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -267,7 +267,7 @@ impl Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -326,7 +326,7 @@ impl Meta {
             size: target.len() as u64,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -371,7 +371,7 @@ impl Meta {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: constellation_types::Rdev,
     ) -> Result<FileAttr, MetaError> {
         if !kind.is_special() {
             return Err(MetaError::Invalid("mknod kind".into()));
@@ -591,7 +591,9 @@ impl Meta {
     }
 
     /// Atomic scratch → shared publish: creates `parent/name`, commits
-    /// its manifest and xattrs, in one transaction.
+    /// its manifest and xattrs, in one transaction. `noreplace`
+    /// (`renameat2(RENAME_NOREPLACE)`): refuse with `Exists` if another
+    /// inode holds `parent/name`, decided inside that transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn publish_file(
         &self,
@@ -605,6 +607,7 @@ impl Meta {
         manifest: &[u8],
         size: u64,
         xattrs: &[(String, Vec<u8>)],
+        noreplace: bool,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
@@ -613,6 +616,14 @@ impl Meta {
         let mut delta_bytes: i64 = 0;
         let mut delta_files: i64 = 0;
         if let Some(old) = ns::get_dentry_record(&tx, &self.ns, parent, name)? {
+            if noreplace {
+                // This very publish, already executed (a retry): done.
+                return if old.ino == ino {
+                    Ok(())
+                } else {
+                    Err(MetaError::Exists)
+                };
+            }
             let Some(old_rec) = ns::get_inode_record(&tx, &self.ns, old.ino)? else {
                 return Err(MetaError::NoEnt(old.ino));
             };
@@ -660,7 +671,7 @@ impl Meta {
                     delta_files -= 1;
                 }
             } else {
-                misc::bump_nlink_tx(&mut tx, &self.ns, dirty, old.ino, -1, t)?;
+                misc::bump_file_nlink_tx(&mut tx, &self.ns, dirty, old.ino, -1, t)?;
             }
             journal::append_tx(
                 &mut tx,
@@ -687,7 +698,7 @@ impl Meta {
             size,
             mtime_ns,
             ctime_ns,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         ns::put_dentry(&mut tx, &self.ns, dirty, parent, name, ino, attrs)?;
         misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, ctime_ns)?;
@@ -787,6 +798,7 @@ fn rename_in_tx(
     name: &str,
     new_parent: Ino,
     new_name: &str,
+    noreplace: bool,
 ) -> Result<Option<(Ino, i64, i64, i64)>, MetaError> {
     let Some(src) = ns::get_dentry_record(tx, ns_ks, parent, name)? else {
         return Err(MetaError::NoEntry);
@@ -797,25 +809,21 @@ fn rename_in_tx(
     };
     ns::require_dir(tx, ns_ks, new_parent)?;
 
-    if src_rec.attrs.kind == Kind::Dir {
-        let mut cursor = new_parent;
-        loop {
-            if cursor == ino {
-                return Err(MetaError::Invalid("rename into own subtree".into()));
-            }
-            if cursor == ROOT_INO {
-                break;
-            }
-            match ns::parent_of(tx, ns_ks, cursor)? {
-                Some(p) => cursor = p,
-                None => break,
-            }
-        }
+    if src_rec.attrs.kind == Kind::Dir && is_within(tx, ns_ks, new_parent, ino)? {
+        return Err(MetaError::Invalid("rename into own subtree".into()));
     }
 
     let t = now_ns();
     let mut delta = (0i64, 0i64);
     if let Some(existing) = ns::get_dentry_record(tx, ns_ks, new_parent, new_name)? {
+        // `RENAME_NOREPLACE`: any entry at the target refuses, even the
+        // source's own other name or the source itself (Linux answers
+        // `EEXIST` before its same-inode no-op). Decided here, inside the
+        // committing transaction, so it is atomic against every other
+        // mutation this replica (the sequencer, for a forwarded op) runs.
+        if noreplace {
+            return Err(MetaError::Exists);
+        }
         if existing.ino == ino {
             return Ok(None);
         }
@@ -878,7 +886,7 @@ fn rename_in_tx(
                 delta.1 -= 1;
             }
         } else {
-            misc::bump_nlink_tx(tx, ns_ks, dirty, existing.ino, -1, t)?;
+            misc::bump_file_nlink_tx(tx, ns_ks, dirty, existing.ino, -1, t)?;
         }
         ns::remove_dentry(tx, ns_ks, dirty, new_parent, new_name, existing.ino)?;
     }
@@ -912,6 +920,307 @@ fn rename_in_tx(
     misc::touch_times_tx(tx, ns_ks, dirty, parent, t)?;
     misc::touch_times_tx(tx, ns_ks, dirty, new_parent, t)?;
     Ok(Some((ino, t, delta.0, delta.1)))
+}
+
+/// Whether directory `dir` is `ancestor` or lies beneath it (the walk up
+/// `0x04` reverse entries that keeps a directory from moving into its own
+/// subtree).
+fn is_within(
+    tx: &SingleWriterWriteTx,
+    ns_ks: &SingleWriterTxKeyspace,
+    dir: Ino,
+    ancestor: Ino,
+) -> Result<bool, MetaError> {
+    let mut cursor = dir;
+    loop {
+        if cursor == ancestor {
+            return Ok(true);
+        }
+        if cursor == ROOT_INO {
+            return Ok(false);
+        }
+        match ns::parent_of(tx, ns_ks, cursor)? {
+            Some(p) => cursor = p,
+            None => return Ok(false),
+        }
+    }
+}
+
+// ----------------------------------------------------------- exchange
+
+/// What [`exchange_in_tx`] did.
+pub(crate) enum Exchanged {
+    /// The two names were swapped: `(src_ino, dst_ino)`.
+    Swapped(Ino, Ino),
+    /// One name, or two names of one inode: nothing to do (Linux's
+    /// `vfs_rename` returns 0 for `source == target`).
+    Same,
+    /// A name or a parent is gone. Only reported with `validate: false`
+    /// (replay skips); the local op refuses instead.
+    Missing,
+}
+
+/// The body of `renameat2(RENAME_EXCHANGE)`, shared by the local op
+/// (`validate: true`: a missing entry is `NoEntry`, a directory swapped
+/// beneath itself `Invalid`) and replay (`validate: false`: the holder
+/// already decided, so a replica swaps what the names hold and reports a
+/// missing one for the caller to skip).
+///
+/// Swaps the two dentries and their reverse entries; when a directory and
+/// a non-directory trade places across two parents, the directory's `..`
+/// link moves with it (`nlink` -1 on the parent it left, +1 on the one it
+/// entered; two directories swapped across parents leave both counts
+/// unchanged). Both parents get an mtime/ctime touch and both inodes a
+/// ctime touch (the kernel's `d_exchange` leaves them with new names, a
+/// status change), all as `max` merges so the replay order commutes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exchange_in_tx(
+    tx: &mut SingleWriterWriteTx,
+    ns_ks: &SingleWriterTxKeyspace,
+    dirty: ns::Dirty,
+    parent: Ino,
+    name: &str,
+    new_parent: Ino,
+    new_name: &str,
+    t: i64,
+    validate: bool,
+) -> Result<Exchanged, MetaError> {
+    let missing = |e: MetaError| {
+        if validate {
+            Err(e)
+        } else {
+            Ok(Exchanged::Missing)
+        }
+    };
+    if validate {
+        ns::require_dir(tx, ns_ks, parent)?;
+        ns::require_dir(tx, ns_ks, new_parent)?;
+    } else if ns::get_inode_record(tx, ns_ks, parent)?.is_none()
+        || ns::get_inode_record(tx, ns_ks, new_parent)?.is_none()
+    {
+        return Ok(Exchanged::Missing);
+    }
+    let Some(src) = ns::get_dentry_record(tx, ns_ks, parent, name)? else {
+        return missing(MetaError::NoEntry);
+    };
+    let Some(dst) = ns::get_dentry_record(tx, ns_ks, new_parent, new_name)? else {
+        return missing(MetaError::NoEntry);
+    };
+    if (parent == new_parent && name == new_name) || src.ino == dst.ino {
+        return Ok(Exchanged::Same);
+    }
+    let Some(src_rec) = ns::get_inode_record(tx, ns_ks, src.ino)? else {
+        return missing(MetaError::NoEnt(src.ino));
+    };
+    let Some(dst_rec) = ns::get_inode_record(tx, ns_ks, dst.ino)? else {
+        return missing(MetaError::NoEnt(dst.ino));
+    };
+    let src_dir = src_rec.attrs.kind == Kind::Dir;
+    let dst_dir = dst_rec.attrs.kind == Kind::Dir;
+    // Neither directory may land beneath itself (Linux: `EINVAL` when one
+    // entry is an ancestor of the other).
+    if validate
+        && ((src_dir && is_within(tx, ns_ks, new_parent, src.ino)?)
+            || (dst_dir && is_within(tx, ns_ks, parent, dst.ino)?))
+    {
+        return Err(MetaError::Invalid("exchange into own subtree".into()));
+    }
+    ns::remove_dentry(tx, ns_ks, dirty, parent, name, src.ino)?;
+    ns::remove_dentry(tx, ns_ks, dirty, new_parent, new_name, dst.ino)?;
+    ns::put_dentry(tx, ns_ks, dirty, parent, name, dst.ino, dst_rec.attrs)?;
+    ns::put_dentry(
+        tx,
+        ns_ks,
+        dirty,
+        new_parent,
+        new_name,
+        src.ino,
+        src_rec.attrs,
+    )?;
+    if parent != new_parent && src_dir != dst_dir {
+        let (left, entered) = if src_dir {
+            (parent, new_parent)
+        } else {
+            (new_parent, parent)
+        };
+        misc::bump_nlink_tx(tx, ns_ks, dirty, left, -1, t)?;
+        misc::bump_nlink_tx(tx, ns_ks, dirty, entered, 1, t)?;
+    }
+    misc::touch_times_tx(tx, ns_ks, dirty, parent, t)?;
+    misc::touch_times_tx(tx, ns_ks, dirty, new_parent, t)?;
+    // A zero `nlink` delta is a ctime-only touch (and rewrites every
+    // dentry copy of the attributes, the two just swapped included).
+    misc::bump_file_nlink_tx(tx, ns_ks, dirty, src.ino, 0, t)?;
+    misc::bump_file_nlink_tx(tx, ns_ks, dirty, dst.ino, 0, t)?;
+    Ok(Exchanged::Swapped(src.ino, dst.ino))
+}
+
+impl Meta {
+    /// `renameat2(RENAME_NOREPLACE)`: [`MetaStore::rename`], refusing
+    /// with [`MetaError::Exists`] when the target name exists — decided
+    /// in the same transaction that commits the rename.
+    pub fn rename_noreplace(
+        &self,
+        parent: Ino,
+        name: &str,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<(), MetaError> {
+        self.rename_impl(parent, name, new_parent, new_name, true)
+    }
+
+    fn rename_impl(
+        &self,
+        parent: Ino,
+        name: &str,
+        new_parent: Ino,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
+        // M16: the entry a rename replaces, read in its own transaction
+        // (for the read-delegation recall, `readdeleg::note_victim`).
+        let replaced = ns::get_dentry_record(&tx, &self.ns, new_parent, new_name)?.map(|d| d.ino);
+        let result = rename_in_tx(
+            &mut tx,
+            &self.ns,
+            dirty,
+            &self.atime,
+            &self.orphans,
+            &self.xattr_by_name,
+            &self.chunk_ref,
+            &self.chunk_ref_by_ino,
+            &self.blobs,
+            parent,
+            name,
+            new_parent,
+            new_name,
+            noreplace,
+        )?;
+        if let Some((_ino, t, db, df)) = result {
+            journal::append_tx(
+                &mut tx,
+                &self.journal_ks,
+                &self.local,
+                &self.completed,
+                &LogRecord::Rename {
+                    parent,
+                    name: name.to_string(),
+                    new_parent,
+                    new_name: new_name.to_string(),
+                    time_ns: t,
+                },
+            )?;
+            crate::store::adjust_usage_tx(&mut tx, &self.local, db, df)?;
+        }
+        self.finish_local(&mut tx, local)?;
+        tx.commit()?;
+        if let Some((moved, _, db, df)) = result {
+            crate::readdeleg::note_victim(moved);
+            if let Some(r) = replaced.filter(|r| *r != moved) {
+                crate::readdeleg::note_victim(r);
+            }
+            self.usage_tracker().adjust(db, df);
+        }
+        Ok(())
+    }
+
+    /// `setattr` on an unlinked-but-open inode (its record lives in
+    /// `orphans`, DESIGN.md §3): applied to that record only, journaling
+    /// nothing — the inode has no name, so no other replica can reach it
+    /// and nothing may ship. POSIX lets `fchmod`/`fchown`/`ftruncate`/
+    /// `futimens` on a descriptor of an unlinked file succeed; what the
+    /// descriptor's `fstat` reports afterwards is this record (plus a
+    /// pending write session's size, which the caller overlays). `None`
+    /// when `ino` is not an orphan here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn orphan_setattr(
+        &self,
+        ino: Ino,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime_ns: Option<i64>,
+        mtime_ns: Option<i64>,
+    ) -> Result<Option<FileAttr>, MetaError> {
+        let mut tx = self.db.write_tx();
+        if ns::get_inode_record(&tx, &self.ns, ino)?.is_some() {
+            return Ok(None);
+        }
+        let Some(v) = tx.get(&self.orphans, ino.to_be_bytes())? else {
+            return Ok(None);
+        };
+        let mut rec = InodeRecord::decode(&v)?;
+        let t = now_ns();
+        if let Some(m) = mode {
+            rec.attrs.mode = mask_mode(m);
+        }
+        if let Some(u) = uid {
+            rec.attrs.uid = u;
+        }
+        if let Some(g) = gid {
+            rec.attrs.gid = g;
+        }
+        if let Some(s) = size {
+            rec.attrs.size = s;
+            rec.attrs.mtime_ns = t;
+        }
+        if let Some(m) = mtime_ns {
+            rec.attrs.mtime_ns = m;
+        }
+        rec.attrs.ctime_ns = t;
+        tx.insert(&self.orphans, ino.to_be_bytes().to_vec(), rec.encode());
+        if let Some(a) = atime_ns {
+            atime::set_atime_tx(&mut tx, &self.atime, ino, a);
+        }
+        let at = atime::get_atime(&tx, &self.atime, ino)?;
+        tx.commit()?;
+        Ok(Some(ns::attrs_to_fileattr(ino, &rec.attrs, at)))
+    }
+
+    /// `renameat2(RENAME_EXCHANGE)`: atomically swap the inodes
+    /// `parent/name` and `new_parent/new_name` name (see
+    /// [`exchange_in_tx`]), journaling one [`LogRecord::Exchange`].
+    pub fn exchange(
+        &self,
+        parent: Ino,
+        name: &str,
+        new_parent: Ino,
+        new_name: &str,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let local = self.begin_local(&tx)?;
+        let dirty = local.dirty(self);
+        let t = now_ns();
+        let swapped = exchange_in_tx(
+            &mut tx, &self.ns, dirty, parent, name, new_parent, new_name, t, true,
+        )?;
+        if let Exchanged::Swapped(..) = swapped {
+            journal::append_tx(
+                &mut tx,
+                &self.journal_ks,
+                &self.local,
+                &self.completed,
+                &LogRecord::Exchange {
+                    parent,
+                    name: name.to_string(),
+                    new_parent,
+                    new_name: new_name.to_string(),
+                    time_ns: t,
+                },
+            )?;
+        }
+        self.finish_local(&mut tx, local)?;
+        tx.commit()?;
+        if let Exchanged::Swapped(a, b) = swapped {
+            crate::readdeleg::note_victim(a);
+            crate::readdeleg::note_victim(b);
+        }
+        Ok(())
+    }
 }
 
 // ----------------------------------------------------------- MetaStore
@@ -1036,7 +1345,7 @@ impl MetaStore for Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -1093,7 +1402,7 @@ impl MetaStore for Meta {
             size: 0,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -1152,7 +1461,7 @@ impl MetaStore for Meta {
             size: target.len() as u64,
             mtime_ns: t,
             ctime_ns: t,
-            rdev: 0,
+            rdev: constellation_types::Rdev::default(),
         };
         insert_new_node(
             &mut tx,
@@ -1195,7 +1504,7 @@ impl MetaStore for Meta {
         mode: u32,
         uid: u32,
         gid: u32,
-        rdev: u64,
+        rdev: constellation_types::Rdev,
     ) -> Result<FileAttr, MetaError> {
         if !kind.is_special() {
             return Err(MetaError::Invalid("mknod kind".into()));
@@ -1262,10 +1571,18 @@ impl MetaStore for Meta {
         if rec.attrs.kind == Kind::Dir {
             return Err(MetaError::IsDir);
         }
+        // link(2): `EEXIST` for a taken name. Before, the new dentry
+        // silently overwrote it — the other inode lost a name without its
+        // link count or reverse entry following (the conformance kit's
+        // `hard_link_refusals`; a kernel's own negative-dentry check hides
+        // it on one node, not across nodes).
+        if ns::child_ino(&tx, &self.ns, parent, name)?.is_some() {
+            return Err(MetaError::Exists);
+        }
         let t = now_ns();
         let at = atime::get_atime(&tx, &self.atime, ino)?;
         let rec2 =
-            misc::bump_nlink_tx(&mut tx, &self.ns, dirty, ino, 1, t)?.expect("checked above");
+            misc::bump_file_nlink_tx(&mut tx, &self.ns, dirty, ino, 1, t)?.expect("checked above");
         ns::put_dentry(&mut tx, &self.ns, dirty, parent, name, ino, rec2.attrs)?;
         misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, t)?;
         journal::append_tx(
@@ -1339,7 +1656,7 @@ impl MetaStore for Meta {
                 usage_delta = (-(rec.attrs.size as i64), -1);
             }
         } else {
-            misc::bump_nlink_tx(&mut tx, &self.ns, dirty, ino, -1, t)?;
+            misc::bump_file_nlink_tx(&mut tx, &self.ns, dirty, ino, -1, t)?;
         }
         misc::touch_times_tx(&mut tx, &self.ns, dirty, parent, t)?;
         journal::append_tx(
@@ -1413,53 +1730,7 @@ impl MetaStore for Meta {
         new_parent: Ino,
         new_name: &str,
     ) -> Result<(), MetaError> {
-        let mut tx = self.db.write_tx();
-        let local = self.begin_local(&tx)?;
-        let dirty = local.dirty(self);
-        // M16: the entry a rename replaces, read in its own transaction
-        // (for the read-delegation recall, `readdeleg::note_victim`).
-        let replaced = ns::get_dentry_record(&tx, &self.ns, new_parent, new_name)?.map(|d| d.ino);
-        let result = rename_in_tx(
-            &mut tx,
-            &self.ns,
-            dirty,
-            &self.atime,
-            &self.orphans,
-            &self.xattr_by_name,
-            &self.chunk_ref,
-            &self.chunk_ref_by_ino,
-            &self.blobs,
-            parent,
-            name,
-            new_parent,
-            new_name,
-        )?;
-        if let Some((_ino, t, db, df)) = result {
-            journal::append_tx(
-                &mut tx,
-                &self.journal_ks,
-                &self.local,
-                &self.completed,
-                &LogRecord::Rename {
-                    parent,
-                    name: name.to_string(),
-                    new_parent,
-                    new_name: new_name.to_string(),
-                    time_ns: t,
-                },
-            )?;
-            crate::store::adjust_usage_tx(&mut tx, &self.local, db, df)?;
-        }
-        self.finish_local(&mut tx, local)?;
-        tx.commit()?;
-        if let Some((moved, _, db, df)) = result {
-            crate::readdeleg::note_victim(moved);
-            if let Some(r) = replaced.filter(|r| *r != moved) {
-                crate::readdeleg::note_victim(r);
-            }
-            self.usage_tracker().adjust(db, df);
-        }
-        Ok(())
+        self.rename_impl(parent, name, new_parent, new_name, false)
     }
 
     fn setattr(

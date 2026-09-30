@@ -19,7 +19,7 @@ constellation-fs-core = { path = "../crates/fs-core" }
 constellation-mtree = { path = "../crates/mtree" }
 constellation-store-s3 = { path = "../crates/store-s3" }
 constellation-meta = { path = "../crates/meta" }
-constellation-api = { path = "../crates/api" }
+constellation-control = { path = "../crates/control" }
 
 [patch.crates-io]
 fjall = { path = "../vendor/fjall" }
@@ -123,8 +123,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "api_request"
-path = "fuzz_targets/api_request.rs"
+name = "control_request"
+path = "fuzz_targets/control_request.rs"
 test = false
 doc = false
 bench = false

@@ -3,17 +3,27 @@
 //! verifies reality against a filesystem model (Jepsen-style oracle).
 //!
 //!   harness list
-//!   harness run [scenario ...] [--seed N]
+//!   harness run [scenario ...] [--seed N] [--shard i/n] [--results-json PATH [--lane NAME]]
+//!               [--s3-backend docker|process] [--frontend fuse]
+//!   harness smoke [BACKEND]
+//!   harness interop write|verify --bucket-dir DIR
 //!
-//! Requires: docker, fusermount3, a release `constellation` binary
-//! (CONSTELLATION_BIN or target/release/constellation).
+//! Requires: fusermount3, a release `constellation` binary
+//! (CONSTELLATION_BIN or target/release/constellation), and for the default
+//! `--s3-backend docker` docker; `--s3-backend process` needs native
+//! versitygw + toxiproxy-server instead (tests/ci/install-native-s3.sh).
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use constellation_harness::bench;
+use constellation_harness::caps;
 use constellation_harness::corpus;
+use constellation_harness::interop;
 use constellation_harness::metabench;
+use constellation_harness::results::{self, Outcome, RunResults, Shard};
+use constellation_harness::s3env::{self, S3Backend};
 use constellation_harness::scenarios::{self, SCENARIOS};
+use constellation_harness::smoke;
 use constellation_harness::snapchurn;
 use constellation_harness::suites;
 
@@ -41,9 +51,59 @@ enum Command {
         /// Replay without preserving recorded inter-operation timing.
         #[arg(long, requires = "replay")]
         replay_no_sleep: bool,
+        /// Run only shard `i` of `n` (1-based, e.g. `2/4`) of the selected
+        /// scenarios: the scenario at position `idx` (after name filtering)
+        /// belongs to shard `idx % n + 1`.
+        #[arg(long, value_name = "i/n")]
+        shard: Option<String>,
+        /// Write a machine-readable result file (see `results` module docs)
+        /// after the run, also when scenarios failed.
+        #[arg(long, value_name = "PATH")]
+        results_json: Option<std::path::PathBuf>,
+        /// Lane name recorded in the results file. Default:
+        /// `<os>-<frontend>`, plus `-process` under `--s3-backend process`
+        /// (e.g. `linux-fuse`, `linux-fuse-process`).
+        #[arg(long)]
+        lane: Option<String>,
+        /// S3 server the scenarios run against: `docker` (floci + toxiproxy
+        /// containers, the default) or `process` (native versitygw +
+        /// toxiproxy-server; see tests/ci/install-native-s3.sh). Falls back
+        /// to $CONSTELLATION_HARNESS_S3_BACKEND.
+        #[arg(long, value_enum)]
+        s3_backend: Option<S3Backend>,
+        /// Filesystem frontend the clients mount through. Only `fuse`
+        /// exists so far.
+        #[arg(long, default_value = "fuse")]
+        frontend: String,
+        /// Run as a frontend that lacks this capability (repeatable; a
+        /// `Cap` name such as `Xattrs`): the scenarios that need it are
+        /// skipped by name, exactly as on a real frontend without it. A
+        /// way to exercise the capability-skip path (and the parity
+        /// checker's wildcard for it) without a second frontend.
+        #[arg(long = "without-cap", value_name = "CAP")]
+        without_caps: Vec<caps::Cap>,
+    },
+    /// Port of tests/smoke.sh: create a fs, mount, exercise POSIX ops,
+    /// remount and verify persistence. BACKEND is a local directory (the
+    /// default: a temp dir) or s3://bucket/prefix with AWS_* in the
+    /// environment. Uses $CONSTELLATION_BIN (default
+    /// $CARGO_TARGET_DIR/debug/constellation).
+    Smoke {
+        /// Backend: a directory or an s3:// URL.
+        backend: Option<String>,
+    },
+    /// Cross-OS interop: `write` a deterministic seeded tree into a fresh
+    /// bucket directory, `verify` a bucket directory (possibly written on
+    /// another OS) by mounting it and checking every item.
+    Interop {
+        #[command(subcommand)]
+        action: InteropAction,
     },
     /// Census-scale import benchmark (many small files).
     Bench {
+        /// S3 backend (see `run --s3-backend`).
+        #[arg(long, value_enum)]
+        s3_backend: Option<S3Backend>,
         /// Number of files to import.
         #[arg(long, default_value_t = 20_000)]
         files: u64,
@@ -91,13 +151,16 @@ enum Command {
     /// matrix (creates lease-serialization vs forwarding vs S3 CAS
     /// measurements). Prints one JSON report per configuration.
     MetaBench {
+        /// S3 backend (see `run --s3-backend`).
+        #[arg(long, value_enum)]
+        s3_backend: Option<S3Backend>,
         /// Emit each report as a JSON object on stdout (one per line),
         /// in addition to the human-readable summary on stderr.
         #[arg(long)]
         json: bool,
     },
     /// Test helper for `stale-daemon-lock`: hold `daemon.lock` and a
-    /// `control.sock` listener in STATE_DIR that accepts connections and
+    /// control-socket listener for STATE_DIR (recorded in its `control.path`) that accepts connections and
     /// never answers, until killed (a stand-in for a daemon the kernel has
     /// killed whose last thread is stuck in the kernel).
     #[command(hide = true)]
@@ -116,6 +179,32 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum InteropAction {
+    /// Mount a fresh fs, write the seeded tree, unmount, leave the bucket
+    /// in --bucket-dir (which must be empty or absent).
+    Write {
+        /// Where the bucket ends up (the CI artifact).
+        #[arg(long)]
+        bucket_dir: std::path::PathBuf,
+        /// `file` (local file backend, the default) or `process` (versitygw,
+        /// exported through the S3 API).
+        #[arg(long, value_enum, default_value = "file")]
+        backend: interop::Backend,
+        /// Seed of the tree (recorded in the bucket; `verify` reads it).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+    },
+    /// Mount the bucket in --bucket-dir with a fresh state dir and check
+    /// every item of the tree.
+    Verify {
+        #[arg(long)]
+        bucket_dir: std::path::PathBuf,
+        #[arg(long, value_enum, default_value = "file")]
+        backend: interop::Backend,
+    },
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -125,12 +214,12 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::List => {
             for s in SCENARIOS {
-                println!("{:22} {}", s.name, s.desc);
+                println!("{:22} {}{}", s.name, s.desc, needs(s));
             }
             println!();
             println!("known-bug reproductions (expected to FAIL until fixed):");
             for s in scenarios::KNOWN_BUG_REPROS {
-                println!("{:22} {}", s.name, s.desc);
+                println!("{:22} {}{}", s.name, s.desc, needs(s));
             }
             Ok(())
         }
@@ -139,8 +228,46 @@ fn main() -> Result<()> {
             seed,
             replay,
             replay_no_sleep,
-        } => run(names, seed, replay, replay_no_sleep),
+            shard,
+            results_json,
+            lane,
+            s3_backend,
+            frontend,
+            without_caps,
+        } => run(RunOpts {
+            names,
+            seed,
+            replay,
+            replay_no_sleep,
+            shard,
+            results_json,
+            lane,
+            s3_backend,
+            frontend,
+            without_caps,
+        }),
+        Command::Smoke { backend } => smoke::run(backend),
+        Command::Interop { action } => match action {
+            InteropAction::Write {
+                bucket_dir,
+                backend,
+                seed,
+            } => interop::write_cmd(&interop::Opts {
+                bucket_dir,
+                backend,
+                seed,
+            }),
+            InteropAction::Verify {
+                bucket_dir,
+                backend,
+            } => interop::verify_cmd(&interop::Opts {
+                bucket_dir,
+                backend,
+                seed: 0, // read from the bucket's INTEROP.json
+            }),
+        },
         Command::Bench {
+            s3_backend,
             files,
             file_size,
             fanout,
@@ -156,6 +283,7 @@ fn main() -> Result<()> {
             label,
             json,
         } => {
+            s3env::select_backend(s3_backend)?;
             let cfg = bench::BenchConfig {
                 files,
                 file_size,
@@ -179,7 +307,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::MetaBench { json } => {
+        Command::MetaBench { s3_backend, json } => {
+            s3env::select_backend(s3_backend)?;
             let (reports, raw) = metabench::run_matrix()?;
             if json {
                 for r in &reports {
@@ -219,12 +348,51 @@ fn main() -> Result<()> {
     }
 }
 
-fn run(
+/// ` [needs: A, B]` for a scenario that needs frontend capabilities, else
+/// nothing.
+fn needs(s: &scenarios::Scenario) -> String {
+    if s.caps.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = s.caps.iter().map(|c| c.name()).collect();
+        format!(" [needs: {}]", names.join(", "))
+    }
+}
+
+struct RunOpts {
     names: Vec<String>,
     seed: u64,
     replay: Option<std::path::PathBuf>,
     replay_no_sleep: bool,
-) -> Result<()> {
+    shard: Option<String>,
+    results_json: Option<std::path::PathBuf>,
+    lane: Option<String>,
+    s3_backend: Option<S3Backend>,
+    frontend: String,
+    without_caps: Vec<caps::Cap>,
+}
+
+fn run(opts: RunOpts) -> Result<()> {
+    let RunOpts {
+        names,
+        seed,
+        replay,
+        replay_no_sleep,
+        shard,
+        results_json,
+        lane,
+        s3_backend,
+        frontend,
+        without_caps,
+    } = opts;
+    results::check_frontend(&frontend)?;
+    let mut frontend_caps = caps::caps_of(&caps::frontend_caps(&frontend)?);
+    frontend_caps.retain(|c| !without_caps.contains(c));
+    // Set once, before any scenario starts an S3Env.
+    let backend = s3env::select_backend(s3_backend)?;
+    let lane = lane.unwrap_or_else(|| results::default_lane(&frontend, backend));
+    eprintln!("=== lane {lane} (S3 backend: {backend}, frontend: {frontend})");
+    let shard = shard.as_deref().map(Shard::parse).transpose()?;
     if replay.is_some() && names.as_slice() != ["snapshot-churn"] {
         bail!("--replay is valid only with exactly one scenario: snapshot-churn");
     }
@@ -245,24 +413,62 @@ fn run(
         }
         v
     };
+    let selected = match shard {
+        Some(sh) => {
+            let total = selected.len();
+            let part = sh.partition(selected);
+            eprintln!("=== shard {sh}: {} of {total} scenario(s)", part.len());
+            part
+        }
+        None => selected,
+    };
 
+    let mut report = RunResults::new(&lane, seed, shard).with_setup(backend, &frontend);
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
     for s in selected {
+        // A capability the frontend lacks is a skip that names it (the
+        // parity checker lets those differ across lanes; a missing tool
+        // it does not).
+        if let Some(reason) = caps::skip_reason(s.caps, &frontend_caps) {
+            eprintln!("=== {} SKIPPED ({reason})", s.name);
+            report.push(s.name, Outcome::Skipped, 0.0, Some(reason));
+            skipped.push(s.name);
+            continue;
+        }
         if let Some(missing) = s.requires.iter().find(|b| !suites::have(b)) {
             eprintln!("=== {} SKIPPED ({missing} not installed)", s.name);
+            report.push(
+                s.name,
+                Outcome::Skipped,
+                0.0,
+                Some(format!("{missing} not installed")),
+            );
             skipped.push(s.name);
             continue;
         }
         let t0 = std::time::Instant::now();
         eprintln!("=== {} (seed {seed}) ===", s.name);
         match (s.run)(seed) {
-            Ok(()) => eprintln!("=== {} PASSED in {:.1?}", s.name, t0.elapsed()),
+            Ok(()) => {
+                eprintln!("=== {} PASSED in {:.1?}", s.name, t0.elapsed());
+                report.push(s.name, Outcome::Passed, t0.elapsed().as_secs_f64(), None);
+            }
             Err(e) => {
                 eprintln!("=== {} FAILED in {:.1?}: {e:#}", s.name, t0.elapsed());
+                report.push(
+                    s.name,
+                    Outcome::Failed,
+                    t0.elapsed().as_secs_f64(),
+                    Some(format!("{e:#}")),
+                );
                 failures.push(s.name);
             }
         }
+    }
+    if let Some(path) = &results_json {
+        report.write(path)?;
+        eprintln!("results written to {}", path.display());
     }
     if !failures.is_empty() {
         bail!(
@@ -299,9 +505,15 @@ fn mute_daemon(state_dir: &std::path::Path) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
-    let sock = state_dir.join("control.sock");
+    // Where a real daemon of this state dir listens, recorded where every
+    // client looks for it (plan 31 C5: `control.path`).
+    let sock = constellation_control::transport::socket_path_for_state_dir(
+        &*constellation_platform::native().dirs,
+        state_dir,
+    )?;
     let _ = std::fs::remove_file(&sock);
     let listener = std::os::unix::net::UnixListener::bind(&sock)?;
+    constellation_control::transport::record_socket(state_dir, &sock)?;
     std::fs::write(state_dir.join("daemon.pid"), std::process::id().to_string())?;
     eprintln!(
         "mute daemon {} holding {}",

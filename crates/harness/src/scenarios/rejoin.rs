@@ -259,13 +259,13 @@ fn spawn_mute_daemon(
         .stderr(std::process::Stdio::from(logf))
         .spawn()
         .context("spawning the mute daemon")?;
-    let sock = state_dir.join("control.sock");
     let pid = state_dir.join("daemon.pid");
     eventually(
         "mute daemon holds the state dir",
         Duration::from_secs(10),
         || {
-            anyhow::ensure!(sock.exists() && pid.exists(), "not yet");
+            let sock = constellation_control::transport::locate_socket(state_dir);
+            anyhow::ensure!(sock.is_some_and(|s| s.exists()) && pid.exists(), "not yet");
             Ok(())
         },
     )?;

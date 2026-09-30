@@ -4,7 +4,10 @@
 //! (0600), **per host and not per state dir**: the key identifies the
 //! machine that peers dial, while a node id identifies one mount's
 //! state dir. `constellation host init` creates it; a mount generates
-//! one when it is missing and logs that it did.
+//! one when it is missing and logs that it did. It is a secret of the
+//! host's `SecretStore` (`constellation_platform`): the file store keeps
+//! it at that path, and a host without a disk for secrets (plan 37's
+//! engine pods) can hold it in memory instead.
 //!
 //! The key is iroh's `SecretKey`, so the public half is directly the
 //! endpoint id peers dial. Trust flows from the bucket, not from the
@@ -13,74 +16,90 @@
 //! IAM stays the trust root.
 
 use anyhow::{Context, Result};
+use constellation_platform::{FileSecretStore, HostServices, SecretStore};
 use iroh::{PublicKey, SecretKey};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// The key's name in the host's secret store.
+pub const KEY_NAME: &str = "node.key";
 
 /// Hex-encoded public key, as stored in the node registry.
 pub type PubKeyHex = String;
 
-/// Default key location, overridable with `CONSTELLATION_NODE_KEY`.
-pub fn default_key_path() -> PathBuf {
+/// Where the key lives: `CONSTELLATION_NODE_KEY` (a whole path) when
+/// set, else [`KEY_NAME`] in `host`'s secret store (the config dir:
+/// `$XDG_CONFIG_HOME/constellation/node.key`, else
+/// `~/.config/constellation/node.key`), else — no `HOME` — under
+/// `/etc/constellation`. Returns the store and the key's name in it.
+pub fn default_key_store(host: &HostServices) -> (Arc<dyn SecretStore>, String) {
     if let Some(p) = std::env::var_os("CONSTELLATION_NODE_KEY") {
-        return PathBuf::from(p);
+        if let Ok((store, name)) = FileSecretStore::for_path(Path::new(&p)) {
+            return (Arc::new(store), name);
+        }
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("/etc"));
-    base.join("constellation").join("node.key")
+    if host.dirs.config_dir().is_ok() {
+        return (host.secrets.clone(), KEY_NAME.to_string());
+    }
+    (
+        Arc::new(FileSecretStore::new("/etc/constellation")),
+        KEY_NAME.to_string(),
+    )
 }
 
-/// Load the host node key, generating it if absent. Returns
-/// `(key, generated)` so the caller can log a first-time creation.
+/// Default key location, overridable with `CONSTELLATION_NODE_KEY`, when
+/// the host keeps secrets as files (see [`default_key_store`]).
+pub fn default_key_path(host: &HostServices) -> PathBuf {
+    let (store, name) = default_key_store(host);
+    PathBuf::from(store.describe(&name))
+}
+
+/// Load the host node key from the file at `path`, generating it if
+/// absent. Returns `(key, generated)` so the caller can log a first-time
+/// creation.
 pub fn load_or_create(path: &Path) -> Result<(SecretKey, bool)> {
-    if let Some(key) = load(path)? {
+    let (store, name) = FileSecretStore::for_path(path)
+        .with_context(|| format!("locating the node key at {}", path.display()))?;
+    load_or_create_in(&store, &name)
+}
+
+/// Load the node key `name` from `store`, generating (and storing) it if
+/// absent.
+pub fn load_or_create_in(store: &dyn SecretStore, name: &str) -> Result<(SecretKey, bool)> {
+    if let Some(key) = load_in(store, name)? {
         return Ok((key, false));
     }
     let key = SecretKey::generate();
-    write_key(path, &key)?;
+    // The store writes then renames, owner-only from creation, so the
+    // key is never briefly world-readable at its final name.
+    let hex = constellation_platform::Secret::new(hex32(&key.to_bytes()).into_bytes());
+    store
+        .put(name, hex.expose())
+        .with_context(|| format!("writing {}", store.describe(name)))?;
     Ok((key, true))
 }
 
-/// Load the key if it exists. A malformed key is an error, not a
-/// silent regeneration: overwriting it would change this host's
-/// identity and drop it out of every registry allowlist.
+/// Load the key from the file at `path` if it exists.
 pub fn load(path: &Path) -> Result<Option<SecretKey>> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    let (store, name) = FileSecretStore::for_path(path)
+        .with_context(|| format!("locating the node key at {}", path.display()))?;
+    load_in(&store, &name)
+}
+
+/// Load the key `name` from `store` if it exists. A malformed key is an
+/// error, not a silent regeneration: overwriting it would change this
+/// host's identity and drop it out of every registry allowlist.
+pub fn load_in(store: &dyn SecretStore, name: &str) -> Result<Option<SecretKey>> {
+    let Some(raw) = store
+        .get(name)
+        .with_context(|| format!("reading {}", store.describe(name)))?
+    else {
+        return Ok(None);
     };
-    let bytes = decode_hex32(raw.trim())
-        .with_context(|| format!("{} is not a 32-byte hex node key", path.display()))?;
+    let text = raw.expose_str().unwrap_or("");
+    let bytes = decode_hex32(text.trim())
+        .with_context(|| format!("{} is not a 32-byte hex node key", store.describe(name)))?;
     Ok(Some(SecretKey::from_bytes(&bytes)))
-}
-
-fn write_key(path: &Path, key: &SecretKey) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    // Write-then-rename with the mode set before the rename, so the key
-    // is never briefly world-readable at its final name.
-    let tmp = path.with_extension("key.tmp");
-    std::fs::write(&tmp, hex32(&key.to_bytes()))
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    set_owner_only(&tmp)?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 600 {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 pub fn hex32(bytes: &[u8; 32]) -> String {
@@ -163,6 +182,30 @@ mod tests {
         std::fs::write(&path, "not-a-key").unwrap();
         assert!(load(&path).is_err());
         assert!(load_or_create(&path).is_err());
+    }
+
+    /// A host whose secrets live in memory keeps its key there: nothing
+    /// is written anywhere.
+    #[test]
+    fn a_memory_store_holds_the_key() {
+        let store = constellation_platform::EphemeralSecretStore::new();
+        let (a, generated) = load_or_create_in(&store, KEY_NAME).unwrap();
+        assert!(generated);
+        let (b, generated) = load_or_create_in(&store, KEY_NAME).unwrap();
+        assert!(!generated);
+        assert_eq!(a.public(), b.public());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn the_default_location_honours_the_override() {
+        let host = constellation_platform::native();
+        // Only this test sets it, and it only reads it back through
+        // `default_key_path` (the one reader in this crate's tests).
+        std::env::set_var("CONSTELLATION_NODE_KEY", "/some/where/host.key");
+        let path = default_key_path(host);
+        std::env::remove_var("CONSTELLATION_NODE_KEY");
+        assert_eq!(path, PathBuf::from("/some/where/host.key"));
     }
 
     #[test]

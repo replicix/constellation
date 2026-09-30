@@ -42,7 +42,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate dist-linux dist-macos deps FORCE \
-	uploadbench-build uploadbench-sim uploadbench-live
+	uploadbench-build uploadbench-sim uploadbench-live check-cross vfs-bench
 
 .DEFAULT_GOAL := help
 
@@ -103,7 +103,7 @@ clean: ## Remove build artifacts
 	$(CARGO) clean
 	rm -rf $(TARGET_DIR)
 
-smoke: $(RELEASE_BIN) ## Host smoke test (local file backend; needs fuse3)
+smoke: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Host smoke test (local file backend; needs fuse3)
 	tests/smoke.sh
 
 integration: $(RELEASE_BIN) ## Host integration (floci S3 in docker)
@@ -151,7 +151,13 @@ perf-regression: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Run local perf-regression 
 		--seed 42 \
 		--corpus-shape
 
-perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Check benchmark rates against baseline
+check-cross: ## Type-check darwin (workspace) + windows-gnu (library crates) via zig cc; see tools/check-cross.sh
+	tools/check-cross.sh
+
+vfs-bench: ## VFS dispatch overhead (<1us/op) and per-op allocations, in-process, no kernel (plan 31 C7); exits 1 past the targets
+	cargo bench -p constellation-engine --bench vfs_bench
+
+perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## vfs-bench (§6.9 dispatch + allocation ceilings), then benchmark rates against baseline
 	tests/perf-gate.sh
 
 uploadbench-build: ## Build the adaptive-upload-concurrency benchmark
