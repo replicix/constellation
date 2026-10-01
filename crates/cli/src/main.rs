@@ -108,6 +108,15 @@ enum Command {
         /// overridable by CONSTELLATION_ATIME.
         #[arg(long)]
         atime: Option<String>,
+        /// When a disk-cache read re-hashes the chunk file it read (plan
+        /// 38 §2.3): "admit" (the default) verifies a chunk once — while
+        /// it streams in from S3 or a peer, or on the first read of a
+        /// file a restart found on disk — and trusts the local copy
+        /// afterwards; "always" re-hashes every disk read, catching local
+        /// corruption after admission at the cost of a blake3 pass per
+        /// read. CONSTELLATION_CACHE_VERIFY supplies the default.
+        #[arg(long)]
+        cache_verify: Option<String>,
         /// Mount a snapshot selector through an automatically created clone.
         #[arg(long)]
         rw: bool,
@@ -886,6 +895,7 @@ fn main() -> Result<()> {
         write_mode,
         read_only_member,
         atime,
+        cache_verify,
         rw,
         clone_name,
         ephemeral,
@@ -910,6 +920,7 @@ fn main() -> Result<()> {
                 write_mode,
                 read_only_member,
                 atime,
+                cache_verify,
                 rw,
                 clone_name,
                 ephemeral,
@@ -1603,6 +1614,7 @@ struct MountArgs {
     write_mode: Option<String>,
     read_only_member: bool,
     atime: Option<String>,
+    cache_verify: Option<String>,
     rw: bool,
     clone_name: Option<String>,
     ephemeral: bool,
@@ -1715,6 +1727,7 @@ fn cmd_mount(
         write_mode,
         read_only_member,
         atime,
+        cache_verify,
         rw,
         clone_name,
         ephemeral,
@@ -1722,6 +1735,33 @@ fn cmd_mount(
         web_ui,
     } = args;
     let cto_strict = crate::cto::strict_from(cto.as_deref())?;
+    // Plan 38 §2.3. Refused here, before the fork, so a typo reaches this
+    // terminal rather than dying as "daemon exited before reporting
+    // status" — as `--cto`, `--locks` and `--atime` below also do. The env
+    // override is the deliberate exception (`profile::cache_verify` warns
+    // and falls through): a stale shell profile must not brick a mount.
+    let cache_verify = match cache_verify.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            constellation_fs_core::cache::CacheVerify::parse(raw).ok_or_else(|| {
+                anyhow::anyhow!("invalid --cache-verify {raw:?} (expected admit or always)")
+            })?,
+        ),
+    };
+    // The env override is accepted-but-ignored on a bad value, so say so
+    // here too: the daemon's `tracing::warn!` only reaches whoever reads
+    // the mount log, and the operator typing `alwyas` to harden a suspect
+    // host is standing right here.
+    if let Ok(raw) = std::env::var(constellation_engine::CACHE_VERIFY_ENV) {
+        let raw = raw.trim();
+        if !raw.is_empty() && constellation_fs_core::cache::CacheVerify::parse(raw).is_none() {
+            eprintln!(
+                "warning: ignoring {}={raw:?} (expected admit or always); the mount uses {}",
+                constellation_engine::CACHE_VERIFY_ENV,
+                cache_verify.unwrap_or_default()
+            );
+        }
+    }
     // Plan 30 §M14: refuse an explicit `--locks cluster` with P2P turned
     // off here, before forking (the daemon re-checks against the endpoint
     // it actually started).
@@ -1967,6 +2007,7 @@ fn cmd_mount(
             initial_write_mode,
             read_only_member,
             atime_mode,
+            cache_verify,
             web_ui.unwrap_or(0),
             log_buffer,
             views,
@@ -1986,6 +2027,7 @@ fn cmd_mount(
                 initial_write_mode,
                 read_only_member,
                 atime_mode,
+                cache_verify,
                 web_ui.unwrap_or(0),
                 log_buffer,
                 views,
@@ -2058,6 +2100,7 @@ fn cmd_mount_body(
     initial_write_mode: writeback::WriteMode,
     read_only_member: bool,
     atime_mode: crate::atime::AtimeMode,
+    cache_verify: Option<constellation_fs_core::cache::CacheVerify>,
     web_ui: u16,
     log_buffer: log_buffer::LogBuffer,
     views: Vec<ViewSpec>,
@@ -2258,6 +2301,7 @@ fn cmd_mount_body(
                         initial_write_mode,
                         read_only_member,
                         atime_mode,
+                        cache_verify,
                         // Collected in the foreground before the fork, or
                         // (in `--foreground`) the env var / a prompt, only
                         // if the filesystem turns out to be encrypted.

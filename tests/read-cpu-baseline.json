@@ -1,0 +1,52 @@
+{
+  "config": {
+    "chunk_mib": 4,
+    "memcache_bytes": 1073741824,
+    "rand_mib": 256,
+    "rand_seconds": 15,
+    "repeats": 3,
+    "seq_mib": 512,
+    "small_files": 4096
+  },
+  "cpu_abs_slack": 0.05,
+  "cpu_tolerance": 3.0,
+  "host": {
+    "kernel": "7.0.0-31-generic",
+    "note": "host-specific; re-bless with READ_CPU_BLESS=1 on a different machine",
+    "nproc": 32
+  },
+  "lanes": {
+    "cold-seq-1m": {
+      "bw_mib_s": 966.0,
+      "cpu_s_per_gib": 3.5,
+      "memcache_misses": 127,
+      "rss_hwm_mib": 808.2
+    },
+    "rand-4k-dio": {
+      "bw_mib_s": 750.7,
+      "cpu_s_per_gib": 7.15,
+      "memcache_misses": 0,
+      "rss_hwm_mib": 994.5
+    },
+    "smallfiles": {
+      "bw_mib_s": 147.1,
+      "cpu_s_per_gib": 13.48,
+      "memcache_misses": 10,
+      "rss_hwm_mib": 345.4
+    },
+    "warm-disk-seq-1m": {
+      "bw_mib_s": 1132.7,
+      "cpu_s_per_gib": 0.98,
+      "memcache_misses": 129,
+      "rss_hwm_mib": 595.2
+    },
+    "warm-mem-seq-1m": {
+      "bw_mib_s": 4654.5,
+      "cpu_s_per_gib": 0.22,
+      "memcache_misses": 0,
+      "rss_hwm_mib": 595.5
+    }
+  },
+  "rss_abs_slack_mib": 64.0,
+  "rss_tolerance": 0.5
+}

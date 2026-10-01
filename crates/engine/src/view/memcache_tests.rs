@@ -3,8 +3,14 @@
 //! a corrupt disk copy is never served (nor cached) and is refetched; a
 //! removed disk entry takes its memory copy with it; E2E (keyed cache,
 //! decrypt on fetch) behaves the same.
+//!
+//! Plus plan 38 §2.3's verify-once model: a fetch admits the bytes it
+//! already holds instead of letting the first read load them back, and
+//! `--cache-verify` decides whether a disk read re-hashes a chunk file
+//! this process has already hashed (`always`) or trusts it (`admit`).
 
 use super::*;
+use constellation_fs_core::cache::CacheVerify;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_store_s3::{create_keyring_block, unlock};
 use object_store::memory::InMemory;
@@ -22,6 +28,10 @@ struct Env {
 }
 
 fn env(e2e: bool) -> Env {
+    env_verify(e2e, CacheVerify::Admit)
+}
+
+fn env_verify(e2e: bool, verify: CacheVerify) -> Env {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let dir = TempDir::new().unwrap();
     let backend = Arc::new(InMemory::new());
@@ -35,7 +45,7 @@ fn env(e2e: bool) -> Env {
         let cache = DiskCache::open(dir.path().join("cache"), 1 << 30);
         (ChunkStore::new(backend), cache.unwrap())
     };
-    let cache = Arc::new(cache.with_memory_cache(64 << 20));
+    let cache = Arc::new(cache.with_memory_cache(64 << 20).with_verify(verify));
     let store = Arc::new(store);
     let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
         meta.clone(),
@@ -194,7 +204,13 @@ fn cached_sequential_reads_load_each_chunk_once_e2e() {
 }
 
 fn a_corrupt_disk_copy_is_refetched_and_never_served(e2e: bool) {
-    let e = env(e2e);
+    // `--cache-verify always`: this process wrote these chunks, so under
+    // the default `admit` their files are trusted and not re-hashed — the
+    // documented trust-model change, asserted for itself in
+    // `admit_serves_a_chunk_this_process_verified_without_rehashing`
+    // below. What this test is about is the refetch when a re-hash does
+    // catch corruption.
+    let e = env_verify(e2e, CacheVerify::Always);
     let (ino, data, hashes) = file(&e);
     // Same length, one byte off: only the hash check can tell.
     let path = chunk_file(&e, &hashes[1]);
@@ -227,6 +243,101 @@ fn a_corrupt_disk_copy_is_refetched_and_never_served_plain() {
 #[test]
 fn a_corrupt_disk_copy_is_refetched_and_never_served_e2e() {
     a_corrupt_disk_copy_is_refetched_and_never_served(true);
+}
+
+// ---- plan 38 §2.3: verify-once ----
+
+/// A store fetch hands its verified bytes to the memory tier itself: the
+/// first read of a cold chunk is answered from RAM, and nothing reads the
+/// chunk file back (nor hashes it a second time).
+fn a_fetched_chunk_is_resident_without_a_second_disk_read(e2e: bool) {
+    let e = env(e2e);
+    let (ino, data, hashes) = file(&e);
+    // Drop every local copy, disk and memory: the next read must fetch.
+    for h in &hashes {
+        e.cache.remove(h).unwrap();
+        assert!(!e.cache.contains(h));
+    }
+    let before = e.cache.memory_stats().unwrap();
+    let got = read(&e, ino, 0, data.len() as u64);
+    assert_eq!(&*got.contiguous(), &data[..], "the fetched bytes");
+    let after = e.cache.memory_stats().unwrap();
+    assert!(
+        hashes.iter().all(|h| e.cache.memory_contains(h)),
+        "the fetch did not admit what it already held"
+    );
+    assert_eq!(after.admissions - before.admissions, 3, "one per chunk");
+    assert_eq!(
+        after.misses, before.misses,
+        "a chunk was loaded back off disk after being fetched"
+    );
+    // And each entry is marked as hashed by this process, so no later
+    // read of it re-hashes either.
+    assert!(hashes.iter().all(|h| e.cache.is_verified(h) == Some(true)));
+    // Every byte of the file still reads back correctly from memory.
+    let whole = read(&e, ino, 0, data.len() as u64);
+    assert_eq!(&*whole.contiguous(), &data[..]);
+    assert_eq!(
+        e.cache.memory_stats().unwrap().misses,
+        before.misses,
+        "the second pass touched the disk"
+    );
+}
+
+#[test]
+fn a_fetched_chunk_is_resident_without_a_second_disk_read_plain() {
+    a_fetched_chunk_is_resident_without_a_second_disk_read(false);
+}
+
+#[test]
+fn a_fetched_chunk_is_resident_without_a_second_disk_read_e2e() {
+    a_fetched_chunk_is_resident_without_a_second_disk_read(true);
+}
+
+/// The `admit` half of `--cache-verify`: a chunk file this process hashed
+/// is trusted afterwards. Corrupting it behind the daemon's back is
+/// therefore *not* caught on the next read — the trade plan 38 §2.3 makes
+/// explicit, and the reason `always` exists.
+#[test]
+fn admit_serves_a_chunk_this_process_verified_without_rehashing() {
+    // `file` leaves its chunks on disk and nothing in the memory tier, so
+    // the read below is a disk read — the one `--cache-verify` decides
+    // about.
+    let rot = |e: &Env, h: &ChunkHash| {
+        let path = chunk_file(e, h);
+        let mut bad = std::fs::read(&path).unwrap();
+        bad[1000] ^= 0xff;
+        std::fs::write(&path, &bad).unwrap();
+        bad
+    };
+    let e = env(false);
+    let (ino, _, hashes) = file(&e);
+    assert_eq!(e.cache.is_verified(&hashes[1]), Some(true));
+    let bad = rot(&e, &hashes[1]);
+    let got = read(&e, ino, u64::from(CHUNK), 4096);
+    assert_eq!(
+        got.contiguous()[1000],
+        bad[1000],
+        "under `admit` the trusted disk copy is served as it is"
+    );
+    assert!(e.cache.contains(&hashes[1]), "the entry was dropped");
+
+    // The same thing under `always`: caught, dropped, and refetched from
+    // the store, which is the mode an operator picks when the local disk
+    // is not trusted.
+    let e = env_verify(false, CacheVerify::Always);
+    let (ino, data, hashes) = file(&e);
+    rot(&e, &hashes[1]);
+    let got = read(&e, ino, u64::from(CHUNK), 4096);
+    assert_eq!(
+        &*got.contiguous(),
+        &data[CHUNK as usize..CHUNK as usize + 4096]
+    );
+    assert_eq!(
+        std::fs::read(chunk_file(&e, &hashes[1])).unwrap()[1000],
+        data[CHUNK as usize + 1000],
+        "the refetched file"
+    );
 }
 
 fn evicting_a_chunk_drops_its_memory_copy(e2e: bool) {

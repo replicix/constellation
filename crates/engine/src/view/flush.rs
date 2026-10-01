@@ -104,7 +104,15 @@ impl View {
             return self
                 .rt
                 .block_on(coop.fetch(hash))
-                .map(Bytes::from)
+                .map(|data| {
+                    // Verified in flight (a peer fetch hashes as it
+                    // decodes, an S3 spill before it is committed): the
+                    // memory tier can have them without a disk read
+                    // (plan 38 §2.3).
+                    let data = Bytes::from(data);
+                    self.cache.admit_verified(hash, data.clone());
+                    data
+                })
                 .map_err(|error| {
                     tracing::warn!(
                         hash = %hash.to_hex(),
@@ -146,6 +154,12 @@ impl View {
                     .read_to_end(&mut bytes)
                     .map_err(|e| format!("spill read_to_end: {e}"))?;
                 let _ = self.cache.commit_spill(hash, spill, ChunkState::Clean);
+                // Hashed in flight by `get_chunk_to_writer` on their way
+                // into the spill: the first read of this chunk is a
+                // memory hit rather than a whole-file read and a second
+                // hash (plan 38 §2.3).
+                let bytes = Bytes::from(bytes);
+                self.cache.admit_verified(hash, bytes.clone());
                 Ok::<_, String>(bytes)
             })();
             match fetched {
@@ -168,7 +182,7 @@ impl View {
             );
             Code::Io
         })?;
-        Ok(Bytes::from(data))
+        Ok(data)
     }
 
     /// Full content of committed chunk `idx`, zero-padded to `len`

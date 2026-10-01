@@ -22,6 +22,42 @@
 //! `CONSTELLATION_PROFILE` and its per-field overrides pick a profile for
 //! the daemon ([`EngineProfile::from_env`]).
 
+use constellation_fs_core::cache::CacheVerify;
+
+/// Env `CONSTELLATION_CACHE_VERIFY`: overrides `--cache-verify`
+/// ([`cache_verify`]).
+pub const CACHE_VERIFY_ENV: &str = "CONSTELLATION_CACHE_VERIFY";
+
+/// When a disk-cache read re-hashes the file it read (plan 38 §2.3):
+/// `CONSTELLATION_CACHE_VERIFY`, else the `--cache-verify` flag, else
+/// [`CacheVerify::Admit`].
+///
+/// The env override wins, matching `CONSTELLATION_ATIME`/`CONSTELLATION_CTO`,
+/// so an operator can put a suspect host into `always` without editing
+/// the registry row its mount flags come from. An unparseable value
+/// falls through to the next source rather than failing the mount — a
+/// stale `CONSTELLATION_CACHE_VERIFY` in a shell profile would otherwise
+/// brick every mount from it — but it is *warned about*, because the
+/// fall-through is in the less careful direction: someone typing
+/// `always` to harden a suspect host must not silently stay on `admit`.
+pub fn cache_verify(flag: Option<CacheVerify>) -> CacheVerify {
+    cache_verify_from(std::env::var(CACHE_VERIFY_ENV).ok().as_deref(), flag)
+}
+
+fn cache_verify_from(var: Option<&str>, flag: Option<CacheVerify>) -> CacheVerify {
+    let parsed = var.and_then(CacheVerify::parse);
+    if parsed.is_none() {
+        if let Some(raw) = var.map(str::trim).filter(|raw| !raw.is_empty()) {
+            tracing::warn!(
+                value = raw,
+                env = CACHE_VERIFY_ENV,
+                "ignoring an unparseable cache verification mode (expected admit or always)"
+            );
+        }
+    }
+    parsed.or(flag).unwrap_or_default()
+}
+
 /// Env `CONSTELLATION_CHUNK_MEMCACHE_BYTES`: the chunk memory cache's
 /// byte budget, overriding [`EngineProfile::chunk_memcache_default`];
 /// `0` turns it off.
@@ -424,5 +460,19 @@ mod tests {
             128 * MIB,
             "unparsable: the default"
         );
+    }
+
+    #[test]
+    fn cache_verify_env_overrides_the_flag() {
+        use CacheVerify::*;
+        assert_eq!(cache_verify_from(None, None), Admit);
+        assert_eq!(cache_verify_from(None, Some(Always)), Always);
+        assert_eq!(cache_verify_from(Some("always"), None), Always);
+        // The env wins over the mount flag, as `CONSTELLATION_ATIME` does.
+        assert_eq!(cache_verify_from(Some("admit"), Some(Always)), Admit);
+        assert_eq!(cache_verify_from(Some(" ALWAYS "), Some(Admit)), Always);
+        // Unparseable: fall through rather than refuse to serve.
+        assert_eq!(cache_verify_from(Some("maybe"), Some(Always)), Always);
+        assert_eq!(cache_verify_from(Some("maybe"), None), Admit);
     }
 }

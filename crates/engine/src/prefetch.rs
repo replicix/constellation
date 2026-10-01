@@ -317,6 +317,12 @@ impl Scheduler {
                                 .get_chunk_to_writer(&hash, &mut spill)
                                 .await?
                         };
+                        // Like `coop`'s S3 arm: the decoded bytes went
+                        // into the spill file, so there is nothing in
+                        // hand to admit to the memory tier (plan 38
+                        // §2.3) — the entry this leaves is `verified`,
+                        // and the demand read that follows loads it once
+                        // without a second hash.
                         if let Err(error) =
                             scheduler
                                 .cache

@@ -189,6 +189,11 @@ pub struct NodeHandoff {
     write_mode: String,
     read_only_member: bool,
     atime: String,
+    /// `"admit"`/`"always"`, or absent in an older image's handoff (the
+    /// resumed node then falls back to `CONSTELLATION_CACHE_VERIFY` and
+    /// the default, as a fresh mount would).
+    #[serde(default)]
+    cache_verify: Option<String>,
     pin_target: Option<constellation_engine::e2e_pin::PinTarget>,
     web_ui: u16,
 }
@@ -206,6 +211,7 @@ impl NodeHandoff {
             write_mode: cfg.initial_write_mode.as_str().to_string(),
             read_only_member: cfg.read_only_member,
             atime: cfg.atime_mode.as_str().to_string(),
+            cache_verify: cfg.cache_verify.map(|v| v.as_str().to_string()),
             pin_target: cfg.pin_target.clone(),
             web_ui,
         }
@@ -223,6 +229,13 @@ impl NodeHandoff {
         cfg.read_only_member = self.read_only_member;
         cfg.atime_mode = constellation_engine::atime::AtimeMode::parse(&self.atime)
             .context("the handoff's atime mode")?;
+        cfg.cache_verify = match &self.cache_verify {
+            Some(raw) => Some(
+                constellation_fs_core::cache::CacheVerify::parse(raw)
+                    .context("the handoff's cache-verify mode")?,
+            ),
+            None => None,
+        };
         cfg.pin_target = self.pin_target.clone();
         // No terminal: an E2E filesystem's passphrase comes from the
         // environment (the preflight made sure it is there).

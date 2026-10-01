@@ -3,14 +3,26 @@
 //!
 //! Chunks are stored decompressed at `<root>/<aa>/<bb>/<hex>` (first two
 //! hex byte pairs), written temp-name + atomic rename. Accounting is in
-//! memory and rebuilt by a directory scan at startup; every read verifies
-//! the blake3 hash and drops corrupt files (they are refetched upstream).
+//! memory and rebuilt by a directory scan at startup; a read that cannot
+//! trust the file's bytes verifies the blake3 hash and drops corrupt
+//! files (they are refetched upstream).
+//!
+//! What "cannot trust" means is [`CacheVerify`] (`--cache-verify`, plan
+//! 38 §2.3). Every chunk is hashed exactly once before it is ever
+//! admitted — while it streams in from the store or a peer — so under
+//! the default [`CacheVerify::Admit`] a disk read re-hashes only entries
+//! this process has not hashed itself, i.e. the files a restart's
+//! directory scan found. [`CacheVerify::Always`] re-hashes every disk
+//! read instead, which is what this cache did before the knob existed.
 //!
 //! Optionally ([`DiskCache::with_memory_cache`]) verified contents are
 //! also kept in memory ([`crate::memcache`]): [`DiskCache::get_shared`]
 //! serves a resident chunk without touching the disk or re-hashing, and
 //! loads a missing one once however many readers ask for it at the same
-//! time. Memory entries are a subset of the disk entries at all times:
+//! time. A fetch that still holds the bytes it just committed admits
+//! them itself ([`DiskCache::admit_verified`]) instead of making the
+//! first read load them back. Memory entries are a subset of the disk
+//! entries at all times:
 //! every path that drops a disk entry drops its memory copy under the
 //! same state-lock hold, and a load is admitted only if its disk entry is
 //! still there.
@@ -43,6 +55,65 @@ struct Entry {
     state: ChunkState,
     /// Logical LRU clock value of the last access.
     atime: u64,
+    /// This process hashed these bytes: either it fetched them (the
+    /// store/peer fetch hashes in flight and [`DiskCache::commit_spill`]
+    /// publishes them) or a [`DiskCache::get_disk`] verified them here.
+    /// Clear for a file the startup scan found on disk, which nobody in
+    /// this process has checked. Under [`CacheVerify::Admit`] a verified
+    /// entry's disk reads skip the blake3 pass (plan 38 §2.3); free in
+    /// space, since the `bool` lands in the padding next to the one-byte
+    /// `ChunkState`.
+    verified: bool,
+}
+
+/// When a disk read re-verifies the chunk file it just read
+/// (`--cache-verify`, `CONSTELLATION_CACHE_VERIFY`; plan 38 §2.3).
+///
+/// A chunk is always hashed **once**, while it streams in from the store
+/// or a peer, before it is ever admitted; this only decides whether the
+/// *local disk copy* is hashed again on every read afterwards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheVerify {
+    /// Verify once per file this process has not hashed yet — the
+    /// in-flight hash covers a fetched chunk, and the first read of a
+    /// file a restart found on disk covers that one. Later reads of a
+    /// verified entry skip the hash.
+    #[default]
+    Admit,
+    /// Hash every disk read, as before this knob existed. The `verified`
+    /// bit is ignored; local corruption after admission is caught on the
+    /// next read rather than on the next restart. Plan 38 also makes
+    /// this mode disable zero-copy and passthrough, which by
+    /// construction let the kernel serve the chunk file without the
+    /// daemon seeing the bytes (Z3/Z4 wire that up).
+    Always,
+}
+
+impl CacheVerify {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheVerify::Admit => "admit",
+            CacheVerify::Always => "always",
+        }
+    }
+
+    /// Exactly the two names the CLI help, `docs/reference/configuration.md`
+    /// and plan 38 §2.3 give, case- and whitespace-insensitive like
+    /// `--cto`/`--locks`: an alias nobody documents is a value that works
+    /// on one host and fails on the next.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "admit" => Some(CacheVerify::Admit),
+            "always" => Some(CacheVerify::Always),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CacheVerify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug)]
@@ -221,6 +292,7 @@ pub struct DiskCache {
     /// Verified contents in memory (see the module doc); `None`: off.
     memory: Option<MemCache>,
     flights: Mutex<HashMap<ChunkHash, Arc<Flight>>>,
+    verify: CacheVerify,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +385,7 @@ impl DiskCache {
             state: Mutex::new(State::new(digest_limit.max(1))),
             memory: None,
             flights: Mutex::new(HashMap::new()),
+            verify: CacheVerify::default(),
         };
         cache.rescan()?;
         Ok(cache)
@@ -324,6 +397,33 @@ impl DiskCache {
     pub fn with_memory_cache(mut self, budget: u64) -> Self {
         self.memory = (budget > 0).then(|| MemCache::new(budget));
         self
+    }
+
+    /// When a disk read re-hashes the file it read ([`CacheVerify`]).
+    /// The default is [`CacheVerify::Admit`].
+    pub fn with_verify(mut self, verify: CacheVerify) -> Self {
+        self.verify = verify;
+        self
+    }
+
+    /// The mode [`Self::with_verify`] set (`node.status`, diagnostics).
+    pub fn verify_mode(&self) -> CacheVerify {
+        self.verify
+    }
+
+    /// Whether `hash`'s disk entry has been hashed by this process
+    /// (tests, diagnostics). `None`: no such entry.
+    ///
+    /// Public only because `engine`'s tests assert on it across the crate
+    /// boundary; nothing in the running system reads the bit directly.
+    #[doc(hidden)]
+    pub fn is_verified(&self, hash: &ChunkHash) -> Option<bool> {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(hash)
+            .map(|e| e.verified)
     }
 
     /// The memory tier's counters, if it is on.
@@ -373,6 +473,9 @@ impl DiskCache {
                             size,
                             state: ChunkState::Clean,
                             atime,
+                            // Found on disk: nobody in this process has
+                            // hashed it, so the first read still does.
+                            verified: false,
                         },
                     );
                     st.note(hash, None, Some(ChunkState::Clean));
@@ -543,17 +646,104 @@ impl DiskCache {
         Ok(Some(bytes))
     }
 
+    /// Admit bytes this process has already verified — the `Bytes` a
+    /// store or peer fetch holds after [`Self::commit_spill`], hashed in
+    /// flight on their way into the spill file — to the memory tier.
+    ///
+    /// The point is the I/O it does *not* do: without this the first
+    /// read of a just-fetched chunk goes through [`Self::load_shared`],
+    /// which reads the whole file back and hashes it a second time (plan
+    /// 38 §2.3, change 1). Only admitted if the disk entry is still
+    /// there, checked under the state lock exactly as `load_shared`
+    /// does, so a chunk removed between the fetch and here is not
+    /// resurrected in memory.
+    ///
+    /// A no-op with the memory tier off, and (like every admission)
+    /// for a chunk too large for the budget or already resident. Debug
+    /// builds assert the bytes really are `hash`'s.
+    pub fn admit_verified(&self, hash: &ChunkHash, bytes: Bytes) {
+        debug_assert_eq!(&self.hash(&bytes), hash);
+        let Some(memory) = &self.memory else {
+            return;
+        };
+        let evicted = {
+            let st = self.state.lock().unwrap();
+            if st.entries.contains_key(hash) {
+                memory.insert(*hash, bytes)
+            } else {
+                Vec::new()
+            }
+        };
+        drop(evicted);
+    }
+
+    /// Read a chunk whose bytes are about to leave this node for shared
+    /// storage, hashing it even where [`CacheVerify::Admit`] would trust
+    /// the entry.
+    ///
+    /// `admit`'s trade (plan 38 §2.3) is that local corruption after
+    /// admission reaches a *reader*, who finds the hash wrong and
+    /// refetches: what is in the bucket is still right. Publishing those
+    /// bytes is a different class of damage — `chunk/<H>` would hold
+    /// content that is not `H`, every node's in-flight check would refuse
+    /// it from then on, and `ChunkPutMode::Create`'s "already exists is a
+    /// dedup hit" means a node holding the correct bytes never overwrites
+    /// it. So the uploader pays one blake3 pass — next to a zstd encode
+    /// and an S3 PUT, which it is not measurable against — and a corrupt
+    /// local copy is dropped here instead, putting the row back on the
+    /// "not in the cache" path it took before this knob existed.
+    ///
+    /// A resident memory copy is used but hashed too: under `admit` it may
+    /// itself have come from a disk read that skipped the hash
+    /// ([`Self::load_shared`]), so trusting it would leave the same hole.
+    pub fn get_verified(&self, hash: &ChunkHash) -> Result<Option<Vec<u8>>, CoreError> {
+        if let Some(bytes) = self.memory.as_ref().and_then(|m| m.get(hash)) {
+            if &self.hash(&bytes) == hash {
+                return Ok(Some(bytes.to_vec()));
+            }
+            // Rotted in memory (or admitted from a disk copy that had
+            // already rotted): drop it under the state lock, as every
+            // other memory removal does, and fall through to the disk
+            // copy — which the forced read below hashes as well, so a
+            // corrupt file is dropped and reported absent.
+            let dropped = {
+                let _st = self.state.lock().unwrap();
+                self.memory.as_ref().and_then(|m| m.remove(hash))
+            };
+            drop(dropped);
+        }
+        self.read_disk(hash, true)
+    }
+
     /// [`Self::get`] from the disk copy only.
+    ///
+    /// The blake3 pass is skipped for an entry this process has already
+    /// hashed, unless [`CacheVerify::Always`] is in force (plan 38 §2.3,
+    /// change 2); an unverified one — a file the startup scan found — is
+    /// hashed here and marked, so a restart costs one hash per file and
+    /// not one per read.
     fn get_disk(&self, hash: &ChunkHash) -> Result<Option<Vec<u8>>, CoreError> {
-        {
+        self.read_disk(hash, false)
+    }
+
+    /// [`Self::get_disk`], with `force_verify` for the callers that must
+    /// not trust the `verified` bit ([`Self::get_verified`]).
+    fn read_disk(
+        &self,
+        hash: &ChunkHash,
+        force_verify: bool,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let verified = {
             let mut st = self.state.lock().unwrap();
             if !st.entries.contains_key(hash) {
                 return Ok(None);
             }
             st.clock += 1;
             let clock = st.clock;
-            st.entries.get_mut(hash).unwrap().atime = clock;
-        }
+            let entry = st.entries.get_mut(hash).unwrap();
+            entry.atime = clock;
+            entry.verified
+        };
         let path = self.path_for(hash);
         let data = loop {
             match fs::read(&path) {
@@ -581,10 +771,18 @@ impl DiskCache {
                 Err(e) => return Err(e.into()),
             }
         };
-        if &self.hash(&data) != hash {
-            // Corrupt local copy: drop it, let the caller refetch.
-            self.remove(hash)?;
-            return Ok(None);
+        if force_verify || self.verify == CacheVerify::Always || !verified {
+            if &self.hash(&data) != hash {
+                // Corrupt local copy: drop it, let the caller refetch.
+                self.remove(hash)?;
+                return Ok(None);
+            }
+            // Hashed here: later reads under `Admit` need not. Only if
+            // the entry is still the one this read saw — an eviction and
+            // re-insert in between has already marked its own.
+            if let Some(entry) = self.state.lock().unwrap().entries.get_mut(hash) {
+                entry.verified = true;
+            }
         }
         Ok(Some(data))
     }
@@ -644,7 +842,17 @@ impl DiskCache {
             st.used += size;
             st.clock += 1;
             let atime = st.clock;
-            st.entries.insert(*hash, Entry { size, state, atime });
+            st.entries.insert(
+                *hash,
+                Entry {
+                    size,
+                    state,
+                    atime,
+                    // The caller hashed these bytes (the fetch does it in
+                    // flight, `insert` against the data it was handed).
+                    verified: true,
+                },
+            );
             st.note(*hash, None, Some(state));
             if let Err(error) = fs::rename(&spill.path, &path) {
                 if let Some(entry) = st.entries.remove(hash) {
@@ -1154,7 +1362,14 @@ mod tests {
     #[test]
     fn corrupt_chunk_dropped_on_read() {
         let dir = TempDir::new().unwrap();
-        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        // `always`: this chunk was inserted by this process, so under
+        // the default `admit` its file is trusted and not re-hashed
+        // (plan 38 §2.3 — `a_startup_scanned_entry_is_hashed_on_its_first_read_only`
+        // and `always_rehashes_every_disk_read` cover that split). What
+        // is asserted here is the drop-on-corruption itself.
+        let c = DiskCache::open(dir.path(), 1024)
+            .unwrap()
+            .with_verify(CacheVerify::Always);
         let (h, d) = chunk(9, 32);
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         // Corrupt the file behind the cache's back.
@@ -1348,9 +1563,13 @@ mod tests {
     #[test]
     fn a_corrupt_disk_copy_is_neither_served_nor_cached() {
         let dir = TempDir::new().unwrap();
+        // `always`, so the check runs on a chunk this process inserted;
+        // the second half below is the same assertion in the shape the
+        // default `admit` mode still hashes — a file a restart found.
         let c = DiskCache::open(dir.path(), 1 << 20)
             .unwrap()
-            .with_memory_cache(1 << 20);
+            .with_memory_cache(1 << 20)
+            .with_verify(CacheVerify::Always);
         let (h, d) = chunk(2, 4096);
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         let mut bad = d.clone();
@@ -1364,15 +1583,29 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
         assert!(c.memory_contains(&h));
+        drop(c);
+
+        // Under `admit`: the startup scan's entries are unverified, so a
+        // corrupt file found on disk is still caught on its first read.
+        fs::write(file_of(&dir, &h), &bad).unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        assert_eq!(c.get_shared(&h).unwrap(), None);
+        assert!(!c.memory_contains(&h), "unverified bytes were cached");
+        assert!(!c.contains(&h), "the corrupt disk entry is dropped");
     }
 
     #[test]
     fn a_keyed_e2e_cache_verifies_before_admitting() {
         let dir = TempDir::new().unwrap();
         let key = [7u8; 32];
+        // `always`: the point here is the keyed hasher, so the check has
+        // to run on chunks this process inserted (plan 38 §2.3).
         let c = DiskCache::open_keyed(dir.path(), 1 << 20, key)
             .unwrap()
-            .with_memory_cache(1 << 20);
+            .with_memory_cache(1 << 20)
+            .with_verify(CacheVerify::Always);
         let d = vec![3u8; 4096];
         let h = ChunkHash::keyed(&key, &d);
         c.insert(&h, &d, ChunkState::Clean).unwrap();
@@ -1520,7 +1753,9 @@ mod tests {
     }
 
     /// Memory entries are always a subset of the disk entries, under
-    /// concurrent reads, removals, prunes and evicting inserts.
+    /// concurrent reads, removals, prunes, evicting inserts and direct
+    /// admissions of fetched bytes (plan 38 §2.3's new writer into the
+    /// memory tier: it must respect the invariant `load_shared` does).
     #[test]
     fn memory_never_outlives_the_disk_entry() {
         let dir = TempDir::new().unwrap();
@@ -1551,6 +1786,13 @@ mod tests {
                             1..=3 => {
                                 let _ = c.insert(&h, &d, ChunkState::Clean);
                             }
+                            4 => {
+                                // The fetch path's shape: commit, then
+                                // hand the bytes it still holds to the
+                                // memory tier.
+                                let _ = c.insert(&h, &d, ChunkState::Clean);
+                                c.admit_verified(&h, Bytes::from(d.clone()));
+                            }
                             _ => {
                                 if let Some(got) = c.get_shared(&h).unwrap() {
                                     assert_eq!(got, d);
@@ -1579,6 +1821,182 @@ mod tests {
             }
         }
         assert_eq!(resident, stats.entries);
+    }
+
+    // ---- verify-once (`CacheVerify`, `admit_verified`; plan 38 §2.3) ----
+
+    /// Bytes a fetch already holds go to the memory tier without the
+    /// whole-file read (and second hash) `load_shared` would do.
+    #[test]
+    fn fetched_bytes_are_admitted_without_reading_the_file_back() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let (h, d) = chunk(1, 4096);
+        let mut spill = c.begin_spill().unwrap();
+        spill.write_all(&d).unwrap();
+        c.commit_spill(&h, spill, ChunkState::Clean).unwrap();
+        c.admit_verified(&h, Bytes::from(d.clone()));
+        assert!(c.memory_contains(&h));
+        // Nothing was loaded from disk: no miss was counted, and the
+        // read below is a hit on the admitted copy — which a file
+        // clobbered afterwards proves, since a disk read would have
+        // dropped this chunk as corrupt.
+        assert_eq!(c.memory_stats().unwrap().misses, 0);
+        fs::write(file_of(&dir, &h), b"garbage").unwrap();
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        let stats = c.memory_stats().unwrap();
+        assert_eq!((stats.misses, stats.hits, stats.admissions), (0, 1, 1));
+    }
+
+    /// A chunk whose disk entry went while the fetch was in flight is not
+    /// resurrected in memory (`load_shared`'s invariant, same check).
+    #[test]
+    fn admitting_a_removed_chunk_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let (h, d) = chunk(2, 4096);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        c.remove(&h).unwrap();
+        c.admit_verified(&h, Bytes::from(d));
+        assert!(!c.memory_contains(&h));
+        assert_eq!(c.memory_stats().unwrap().entries, 0);
+    }
+
+    /// `commit_spill` marks what this process hashed; the startup scan
+    /// does not. Under `admit` that is exactly the difference between a
+    /// disk read that hashes and one that does not.
+    #[test]
+    fn a_startup_scanned_entry_is_hashed_on_its_first_read_only() {
+        let dir = TempDir::new().unwrap();
+        let (good, gd) = chunk(3, 4096);
+        let (bad, bd) = chunk(4, 4096);
+        {
+            let c = DiskCache::open(dir.path(), 1 << 20).unwrap();
+            c.insert(&good, &gd, ChunkState::Clean).unwrap();
+            c.insert(&bad, &bd, ChunkState::Clean).unwrap();
+            assert_eq!(c.is_verified(&good), Some(true));
+        }
+        // Corrupt one of the two files behind the cache's back, then
+        // restart: the scan trusts neither.
+        let mut rot = bd.clone();
+        rot[7] ^= 0x80;
+        fs::write(file_of(&dir, &bad), &rot).unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(0);
+        assert_eq!(c.is_verified(&good), Some(false));
+        assert_eq!(c.is_verified(&bad), Some(false));
+        // The corrupt one is hashed, refused and dropped.
+        assert_eq!(c.get(&bad).unwrap(), None);
+        assert!(!c.contains(&bad));
+        // The good one is hashed once, served, and marked.
+        assert_eq!(c.get(&good).unwrap(), Some(gd.clone()));
+        assert_eq!(c.is_verified(&good), Some(true));
+        // Marked means not hashed again: rot it now and the next read
+        // hands the bytes over as they are (the trust model of §2.3 —
+        // `always` below is the mode that keeps checking).
+        let mut rot = gd.clone();
+        rot[9] ^= 0x80;
+        fs::write(file_of(&dir, &good), &rot).unwrap();
+        assert_eq!(c.get(&good).unwrap(), Some(rot));
+        assert!(c.contains(&good));
+    }
+
+    #[test]
+    fn always_rehashes_every_disk_read() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(0)
+            .with_verify(CacheVerify::Always);
+        assert_eq!(c.verify_mode(), CacheVerify::Always);
+        let (h, d) = chunk(5, 4096);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        // Verified by this process, and re-hashed all the same: the
+        // clobbered file is caught and dropped.
+        assert_eq!(c.is_verified(&h), Some(true));
+        assert_eq!(c.get(&h).unwrap(), Some(d.clone()));
+        let mut rot = d.clone();
+        rot[11] ^= 0x80;
+        fs::write(file_of(&dir, &h), &rot).unwrap();
+        assert_eq!(c.get(&h).unwrap(), None);
+        assert!(!c.contains(&h));
+        // And the same cache under `admit` (the default) would not have.
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(0);
+        assert_eq!(c.verify_mode(), CacheVerify::Admit);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        fs::write(file_of(&dir, &h), &rot).unwrap();
+        assert_eq!(c.get(&h).unwrap(), Some(rot));
+    }
+
+    /// `get_verified` is the read for bytes that are about to be
+    /// published: it hashes under `admit` too, where the entry's
+    /// `verified` bit would otherwise skip the pass — both for the disk
+    /// copy and for a memory-resident one (which, under `admit`, may have
+    /// been admitted from a disk read that itself skipped the hash).
+    #[test]
+    fn get_verified_hashes_even_what_admit_trusts() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        assert_eq!(c.verify_mode(), CacheVerify::Admit);
+        let (h, d) = chunk(7, 4096);
+        c.insert(&h, &d, ChunkState::Dirty).unwrap();
+        assert_eq!(c.is_verified(&h), Some(true));
+        assert_eq!(c.get_verified(&h).unwrap(), Some(d.clone()));
+
+        // Rot the file. A plain `get` trusts it (§2.3's trade for
+        // readers); `get_verified` drops it and reports it absent, which
+        // is the "not in the cache" path the uploader took before `admit`.
+        let mut rot = d.clone();
+        rot[17] ^= 0x80;
+        fs::write(file_of(&dir, &h), &rot).unwrap();
+        assert_eq!(c.get_verified(&h).unwrap(), None);
+        assert!(!c.contains(&h));
+
+        // Same, with the bytes resident in the memory tier: a read admits
+        // them, the file rots underneath, and the memory copy still holds
+        // the truth — so this one is served, not dropped.
+        c.insert(&h, &d, ChunkState::Dirty).unwrap();
+        assert_eq!(c.get_shared(&h).unwrap(), Some(Bytes::from(d.clone())));
+        assert!(c.memory_contains(&h));
+        fs::write(file_of(&dir, &h), &rot).unwrap();
+        assert_eq!(c.get_verified(&h).unwrap(), Some(d.clone()));
+        assert!(c.contains(&h));
+
+        // And a memory copy that does not match is dropped, falling
+        // through to the (also rotted) disk copy: absent.
+        let (h2, d2) = chunk(8, 4096);
+        c.insert(&h2, &d2, ChunkState::Dirty).unwrap();
+        let mut rot2 = d2.clone();
+        rot2[3] ^= 0x80;
+        fs::write(file_of(&dir, &h2), &rot2).unwrap();
+        // Admit the rotted bytes to memory the way `admit` allows: the
+        // entry is `verified`, so this disk read skips the hash.
+        assert_eq!(c.get_shared(&h2).unwrap(), Some(Bytes::from(rot2)));
+        assert!(c.memory_contains(&h2));
+        assert_eq!(c.get_verified(&h2).unwrap(), None);
+        assert!(!c.contains(&h2));
+        assert!(!c.memory_contains(&h2));
+    }
+
+    #[test]
+    fn verify_modes_parse() {
+        assert_eq!(CacheVerify::parse("admit"), Some(CacheVerify::Admit));
+        assert_eq!(CacheVerify::parse(" Always "), Some(CacheVerify::Always));
+        assert_eq!(CacheVerify::parse("sometimes"), None);
+        // Only the two documented names, no convenience aliases.
+        assert_eq!(CacheVerify::parse("once"), None);
+        assert_eq!(CacheVerify::parse("every"), None);
+        assert_eq!(CacheVerify::default().as_str(), "admit");
+        assert_eq!(CacheVerify::Always.to_string(), "always");
     }
 
     /// Eviction drops the victim's entry under the lock but used to unlink

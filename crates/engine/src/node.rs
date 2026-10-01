@@ -29,7 +29,7 @@ use crate::{
     snapshot, staging, writeback,
 };
 use anyhow::{bail, Context, Result};
-use constellation_fs_core::cache::DiskCache;
+use constellation_fs_core::cache::{CacheVerify, DiskCache};
 use constellation_meta::Meta;
 use constellation_platform::{CredentialSource, HostServices};
 use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta};
@@ -77,6 +77,10 @@ pub struct EngineConfig {
     /// Staging bytes; `None`: `CONSTELLATION_STAGING_BUDGET`, else a
     /// quarter of the cache.
     pub staging_budget: Option<u64>,
+    /// `--cache-verify admit|always` (plan 38 §2.3): whether a disk-cache
+    /// read re-hashes the file it read. `None`:
+    /// `CONSTELLATION_CACHE_VERIFY`, else `admit`.
+    pub cache_verify: Option<CacheVerify>,
     /// `--fsync-mode s3`.
     pub fsync_s3: bool,
     /// `--cto strict`.
@@ -112,6 +116,7 @@ impl EngineConfig {
             state_dir: None,
             cache_size: 10 * 1024 * 1024 * 1024,
             staging_budget: None,
+            cache_verify: None,
             fsync_s3: false,
             cto_strict: false,
             locks: None,
@@ -330,6 +335,7 @@ impl Engine {
             state_dir,
             cache_size,
             staging_budget,
+            cache_verify,
             fsync_s3,
             cto_strict,
             locks,
@@ -556,6 +562,11 @@ impl Engine {
             cache_size,
         );
         tracing::info!(bytes = chunk_memcache, "chunk memory cache");
+        // Plan 38 §2.3: `admit` trusts a chunk file this process hashed
+        // (in flight on the fetch, or on the first read of a file the
+        // startup scan found); `always` re-hashes every disk read.
+        let cache_verify = crate::profile::cache_verify(cache_verify);
+        tracing::info!(mode = cache_verify.as_str(), "disk cache verification");
         let cache = Arc::new(
             match &e2e_keys {
                 Some(keys) => DiskCache::open_keyed(
@@ -565,7 +576,8 @@ impl Engine {
                 )?,
                 None => DiskCache::open(state_dir.join("cache"), cache_size)?,
             }
-            .with_memory_cache(chunk_memcache),
+            .with_memory_cache(chunk_memcache)
+            .with_verify(cache_verify),
         );
         let compression: CompressionSetting = fsmeta
             .compression

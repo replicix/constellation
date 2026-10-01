@@ -466,6 +466,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "cache_verify": {
+          "default": "",
+          "description": "When a disk-cache read re-hashes the chunk file it read\n(`--cache-verify`, `CONSTELLATION_CACHE_VERIFY`; plan 38 §2.3):\n`\"admit\"` verifies a chunk once — in flight on the fetch, or on\nthe first read of a file a restart found on disk — and trusts it\nafterwards; `\"always\"` re-hashes every disk read. Empty when it\ncame from a daemon older than the knob — which behaved as\n`\"always\"`, but says so by the absence, not by the value.",
+          "type": "string"
+        },
         "chunks": {
           "format": "uint64",
           "minimum": 0,

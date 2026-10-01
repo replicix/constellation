@@ -222,7 +222,7 @@ pub(crate) fn forwarded_pending_chunks(
     };
     if let Some(blob) = spilled {
         named.insert(blob);
-        if let Ok(Some(bytes)) = cache.get(&blob) {
+        if let Ok(Some(bytes)) = cache.get_verified(&blob) {
             if let Ok(list) = constellation_fs_core::manifest::decode_chunk_list(&bytes) {
                 named.extend(list.into_values());
             }
@@ -701,7 +701,10 @@ pub(crate) async fn upload_dirty_chunks_background(
 /// later pass can read it.
 async fn expand_adopted_spills(cache: &DiskCache, meta: &Meta, store: &ChunkStore) -> Result<()> {
     for (ino, blob) in meta.adopted_spills()? {
-        let bytes = match cache.get(&blob)? {
+        // Verified: the chunk hashes read out of this list become pending
+        // upload rows, and a silently rotted list blob would enroll
+        // garbage hashes (plan 38 §2.3 — see `DiskCache::get_verified`).
+        let bytes = match cache.get_verified(&blob)? {
             Some(bytes) => bytes,
             None => match store.get_chunk(&blob).await {
                 Ok(bytes) => bytes,
@@ -830,7 +833,13 @@ async fn upload_dirty_chunks_pass(
                 tracing::warn!(%hash, "fault injection: dropping a pending chunk from the cache");
                 let _ = cache.remove(&hash);
             }
-            let Some(data) = cache.get(&hash)? else {
+            // `get_verified`, not `get`: these bytes are about to become
+            // `chunk/<hash>` in the bucket, so the local copy is hashed even
+            // under `--cache-verify admit` (plan 38 §2.3 trusts the local
+            // copy for *readers*, who refetch; a wrong-content object is
+            // permanent and poisons the chunk for every node). A corrupt
+            // copy is dropped and the row takes the path below.
+            let Some(data) = cache.get_verified(&hash)? else {
                 // Another node forwarded a manifest naming this chunk while
                 // it was still uploading there (`meta::store::remote`): it
                 // reports it once it is up. Until then it is awaited, not
@@ -1048,7 +1057,7 @@ async fn upload_dirty_chunks_pass(
 #[cfg(test)]
 mod pending_upload_tests {
     use super::*;
-    use constellation_fs_core::cache::ChunkState;
+    use constellation_fs_core::cache::{CacheVerify, ChunkState};
     use constellation_fs_core::ChunkHash;
     use constellation_meta::MetaStore;
     use object_store::memory::InMemory;
@@ -1318,6 +1327,68 @@ mod pending_upload_tests {
     /// (see `bench/remote/RESULTS.md` anomaly #2): a pending row whose chunk
     /// is gone from the local cache used to fail the *entire* round, and so
     /// block every other inode's manifest from ever shipping, forever. Now
+    /// Plan 38 §2.3 lets `--cache-verify admit` (the default) trust the
+    /// local copy of a chunk this process hashed, which is a trade made
+    /// for *readers*: a reader that gets rotted bytes refuses them and
+    /// refetches, and the bucket still holds the truth. The uploader must
+    /// not make that trade — a `chunk/<H>` whose content is not `H` is
+    /// permanent (`ChunkPutMode::Create` treats `AlreadyExists` as a dedup
+    /// hit, so the node holding the correct bytes never overwrites it) and
+    /// poisons the chunk for every node. So the upload read hashes
+    /// regardless (`DiskCache::get_verified`) and a rotted chunk takes the
+    /// "missing" path instead of being published.
+    #[test]
+    fn a_locally_rotted_dirty_chunk_is_never_published() {
+        let f = fixture();
+        f.meta.set_holder_epoch(1);
+        let file = f
+            .meta
+            .create(
+                constellation_fs_core::types::ROOT_INO,
+                "rotted",
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        let data = b"content that a bad sector will eat".to_vec();
+        let hash = ChunkHash::of(&data);
+        f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
+        f.meta
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+            .unwrap();
+        // Default mode: this process wrote the chunk, so its entry is
+        // `verified` and a plain read would hand the bytes over unchecked.
+        assert_eq!(f.cache.verify_mode(), CacheVerify::Admit);
+        let hex = hash.to_hex();
+        let path = f
+            .cache_dir
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(hex.clone());
+        let mut rot = data.clone();
+        rot[3] ^= 0x80;
+        std::fs::write(&path, &rot).unwrap();
+
+        let report = rt()
+            .block_on(upload_dirty_chunks_report(
+                &f.cache,
+                &f.meta,
+                &f.store,
+                CompressionSetting::RAW,
+                &UploadRuntime::for_test(true),
+                None,
+                None,
+            ))
+            .expect("a rotted chunk is reported, not an error");
+        assert_eq!(report.missing, vec![(hash, file.ino)]);
+        // Nothing under the chunk's name in the bucket at all — not an
+        // object that merely fails `get_chunk`'s own hash check — and the
+        // corrupt local copy is gone (a refetch, or fsck, repairs it).
+        assert!(!rt().block_on(f.store.chunk_durable(&hash)).unwrap());
+        assert!(!f.cache.contains(&hash));
+    }
+
     /// the upload pass reports it instead of failing, records it as
     /// unrecoverable, and the ship plan holds back only that inode's
     /// manifest (and whatever depends on it): **other inodes still

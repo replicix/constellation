@@ -29160,3 +29160,233 @@ session cannot be handed over losslessly, and it cannot be downgraded to
 session whose negotiated transport is not `DevFuse`; that refusal lands with
 the transport in Z1. Plain mounts keep `Auto`. Revisit only if upstream adds
 both a way to quiesce a server's ring entries and dispatch-on-register.
+
+## Plan 38 Z0b — Verify-once reads, `--cache-verify`, and the read-path cost gate
+
+Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) §2.3's two
+verify-once changes, the `--cache-verify` knob that names the trust model they
+imply, the fio-based CPU-s/GiB + RSS gate of §6 that later milestones compare
+against, and the transport matrix lane's skeleton. No transport work: Z1
+vendors the ring.
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| Direct memcache admission of fetched bytes | done | `DiskCache::admit_verified` (`crates/fs-core/src/cache.rs`): admits bytes the caller already hashed, under the state lock with `load_shared`'s own "the disk entry still exists" check, so a chunk removed between fetch and admission is not resurrected in memory. Called by `View::fetch_chunk_for_inode`'s direct-S3 branch right after `commit_spill`, by its coop branch on what `Coop::fetch` returns, and by `Coop::settle`'s peer-`Data` arm for prefetches (a demand fetch's caller admits the `Vec` it is handed, so nothing is copied on either path) |
+| `verified: bool` on the disk cache's `Entry` | done | `cache.rs`: `true` at the `commit_spill` creation site (the fetch hashed these bytes in flight, `insert` hashed what it was handed), `false` at the startup-scan site. Fits the existing alignment padding next to the one-byte `ChunkState` |
+| `get_disk` honours it | done | `cache.rs`: under `CacheVerify::Admit` the blake3 pass is skipped for a verified entry and run (then the entry marked) for an unverified one; under `Always` every disk read hashes, as before the knob existed |
+| `--cache-verify {admit,always}` | done, default `admit` | `CacheVerify` + `DiskCache::with_verify`/`verify_mode` (`fs-core::cache`); `EngineConfig::cache_verify` and `profile::cache_verify` (env wins over the flag, as `CONSTELLATION_ATIME` does); `--cache-verify` on `mount` (refused before the fork on a bad value, as `--cto`/`--locks`/`--atime` are, so a typo reaches the terminal instead of dying as "daemon exited before reporting status"); an unparseable `CONSTELLATION_CACHE_VERIFY` falls through to the flag/default rather than bricking every mount from a stale shell profile, but is not silent about it — `mount` prints `warning: ignoring CONSTELLATION_CACHE_VERIFY=… ; the mount uses <mode>` before it forks (the operator typing `alwyas` to harden a suspect host is standing right there) and `profile::cache_verify` `tracing::warn!`s it in the daemon — because that fall-through is in the less careful direction; carried through `daemon --upgrade` (`cli::handover::NodeHandoff`, `#[serde(default)]` so an older image's handoff still resumes) |
+| The publish path keeps verifying | done | `DiskCache::get_verified` (`cache.rs`) hashes regardless of the `verified` bit and of the mode; `engine::upload` uses it for the chunk it is about to PUT and for the two list-blob reads. `admit`'s trade is made for *readers*, who refuse wrong bytes and refetch while the bucket still holds the truth — a `chunk/<H>` whose content is not `H` is permanent (`ChunkPutMode::Create` treats `AlreadyExists` as a dedup hit, so the node holding the correct bytes never overwrites it) and poisons the chunk cluster-wide. One blake3 pass next to a zstd encode and an S3 PUT; a rotted copy is dropped and the row takes the existing "not in the cache" path |
+| `node.status` | done | `CacheStatus::cache_verify` (`crates/control/src/proto/types.rs`), filled in `engine::control::service`, schema re-blessed with `CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`. Not added to `/metrics`: the existing `constellation_cache_*` family is numeric gauges and a mode is a label — plan 38 §5 puts the labelled `transport` rows in Z2, and `cache_verify` belongs with them |
+| Tests | done | `fs-core::cache`: `fetched_bytes_are_admitted_without_reading_the_file_back`, `admitting_a_removed_chunk_is_a_no_op`, `a_startup_scanned_entry_is_hashed_on_its_first_read_only`, `always_rehashes_every_disk_read`, `verify_modes_parse`; `memory_never_outlives_the_disk_entry` gained a direct-admission worker. `engine::view::memcache_tests`: `a_fetched_chunk_is_resident_without_a_second_disk_read_{plain,e2e}`, `admit_serves_a_chunk_this_process_verified_without_rehashing`. `engine::profile`: `cache_verify_env_overrides_the_flag`. Added for the publish path: `fs-core::cache::get_verified_hashes_even_what_admit_trusts` (disk copy and memory copy, both directions) and `engine::upload::a_locally_rotted_dirty_chunk_is_never_published` (which fails without `get_verified` — it trips `put_chunk_mode`'s `debug_assert_eq!`, i.e. in release it would publish the wrong content) |
+| fio CPU-s/GiB + RSS gate | done | `tests/read-cpu-gate.sh`, `make read-cpu-gate`, baseline `tests/read-cpu-baseline.json`, documented in TESTING.md. Five lanes (`cold-seq-1m`, `warm-disk-seq-1m`, `warm-mem-seq-1m`, `rand-4k-dio`, `smallfiles`) shaped like `bench/fuse-read-path`'s, local file backend, unprivileged (no `drop_caches`: "cold" is a fresh mount over an emptied cache directory). One JSON line per lane per repeat with bandwidth, IOPS, clat p50/p99, daemon utime+stime, CPU-s/GiB, RSS, `VmHWM`, and the daemon's memcache hit/miss deltas. Linux-only (it samples `/proc/<pid>/{stat,status,clear_refs}`) and SKIPs on another OS as it does without fio. A `READ_CPU_LANES` subset measures what the full run measures: a warm lane selected without the lane that fills the tier it reads from gets an unmeasured warm-up pass first (`warmup_seq`). In the nightly `performance` job it **records** rather than gates (see below) |
+| Transport matrix lane | skeleton | `tests/transport-matrix.sh`, `make transport-matrix`, `TRANSPORTS` variable. Runs the read-path scenarios once per transport under `CONSTELLATION_FUSE_TRANSPORT`; `dev-fuse` is the only leg, `auto`/`uring`/`uring-zc` SKIP loudly until Z1. Until Z1 the env var is a name the lane sets and nothing in the daemon reads — recorded per leg so the legs are distinguishable once they differ. Deliberately not a CI lane yet: with one leg it would re-run scenarios the nightly fault-injection lane already runs, under an env var nothing reads. Z1's `auto` leg is the reason to spend the time |
+
+### Three fetch paths, two of which have the bytes
+
+`admit_verified` is only called where the bytes are already in hand, because
+the alternative is the disk read §2.3 exists to remove:
+
+- **Demand fetch, direct S3** (`view::flush`): holds the `Vec` it read out of
+  the spill. Admits.
+- **Demand fetch over coop** (`view::flush` → `Coop::fetch`): gets a `Vec`
+  back. Admits.
+- **Peer fetch, `FetchResult::Data`** (`coop::settle`): holds the decoded
+  bytes. Admits (for a prefetch; a demand fetch's bytes are admitted by the
+  caller above, and `MemCache::insert` is a no-op for a resident chunk).
+- **S3 fetch over coop, `FetchResult::Spilled`** (`coop::settle`) and
+  **`prefetch.rs`'s own S3 fetch**: the decoder wrote straight into the spill
+  file and nothing holds the bytes. **Not admitted** — reading the file back
+  to admit it would cost exactly the I/O this removes. What they do get is the
+  `verified` entry `commit_spill` leaves, so the demand read that follows loads
+  the chunk once *without* a second hash.
+
+That last point matters for reading the numbers below: on a **sequential**
+read the prefetcher is the thing that fetches, so cold sequential reads gain
+only the skipped hash, not a skipped disk read (the gate's `memcache_misses`
+column shows 127 misses for a 512 MiB / 4 MiB-chunk cold pass both before and
+after). Direct admission shows up where the demand path does the fetching —
+`smallfiles` (4096 one-chunk files, one read each) is the lane for it.
+
+### The gate's numbers, before and after (this host)
+
+32 vCPU, 64 GiB, kernel 7.0.0-31-generic, local file backend, release builds,
+4 MiB chunks, 1 GiB chunk memcache, fio 3.43. "before" is `adf80a6`'s binary
+built and kept aside, "after" is this working tree; **interleaved**
+(before, after, before, after, …) over three rounds so host drift hits both
+legs, medians below. Full lines: the gate's own JSONL.
+
+| lane | CPU-s/GiB before → after | MiB/s before → after | peak RSS MiB before → after |
+|---|---|---|---|
+| `cold-seq-1m` | 3.62 → 3.78 | 883 → 877 | 793 → 793 |
+| `warm-disk-seq-1m` | 0.94 → 1.14 | 1164 → 964 | 579 → 582 |
+| `warm-mem-seq-1m` | 0.26 → 0.26 | 3765 → 3531 | 580 → 582 |
+| `rand-4k-dio` | 7.02 → 7.18 | 606 → 639 | 972 → 976 |
+| `smallfiles` | **29.76 → 23.04** | **51 → 92** | 73 → 335 |
+
+Reading them honestly:
+
+- **`smallfiles` is the lane the change is visible in**, and both directions of
+  the trade show: −23% daemon CPU per GiB and +79% bandwidth, paid for with
+  +262 MiB of peak RSS — which is exactly the 4096 × 64 KiB of fetched chunks
+  that now stay resident instead of being dropped and re-read. Bounded by
+  `CONSTELLATION_CHUNK_MEMCACHE_BYTES` as any memcache residency is.
+- **The sequential and random lanes are flat within noise.** They are
+  prefetcher-served, so the expected saving there is one blake3 pass per chunk
+  (~10% of the lane's daemon CPU by arithmetic: 128 chunks × 4 MiB at a few
+  GB/s against 1.8 s of daemon CPU), and this host's round-to-round spread on a
+  single repeat is 2× or worse — `cold-seq-1m` alone ranged 3.0–6.9 CPU-s/GiB
+  across rounds. **A 10% effect is not resolvable here.** Said plainly rather
+  than rounded into a claim: the mechanism is asserted by the unit and engine
+  tests (a fetched chunk is resident with `misses` unchanged and one admission
+  per chunk; a verified entry is not re-hashed under `admit` and is under
+  `always`), not by these CPU numbers.
+- **`warm-disk-seq-1m` is expected to be flat by design**, not by accident: it
+  is a fresh mount, so its entries came from the startup scan, are unverified,
+  and are hashed once on their first read in both modes. That is §2.3's
+  "re-hashes exactly the files a restart found on disk."
+
+The committed baseline (`tests/read-cpu-baseline.json`, with the shape it was
+taken at recorded in it) is a three-repeat run of this tree on an otherwise
+idle host, which is the daemon's real cost rather than a contended one:
+
+| lane | CPU-s/GiB | peak RSS MiB | MiB/s | memcache misses |
+|---|---|---|---|---|
+| `cold-seq-1m` | 3.50 | 808.2 | 966.0 | 127 |
+| `warm-disk-seq-1m` | 0.98 | 595.2 | 1132.7 | 129 |
+| `warm-mem-seq-1m` | 0.22 | 595.5 | 4654.5 | 0 |
+| `rand-4k-dio` | 7.15 | 994.5 | 750.7 | 0 |
+| `smallfiles` | 13.48 | 345.4 | 147.1 | 10 |
+
+Tolerances are deliberately coarse — 4× on CPU per GiB, 1.5× on peak RSS, plus
+a small absolute slack — and were chosen by checking them: replaying the gate's
+comparison against two *loaded*-host runs of the same tree passes with room
+(`smallfiles` 38.56 and 32.24 against a 53.97 limit, the widest cell), so the
+gate does not false-fail on a busy machine. **Peak RSS is the reliable half of
+this gate and CPU per GiB the noisy one** — across every run here RSS moved by
+under 5% while CPU per GiB moved by up to 2.9×. The regressions this gate is
+for (every read hashing again, every fetch reloaded from disk, a ring buffer
+pool leaked per mount) are multiples, not margins.
+`bench/fuse-read-path/RESULTS.md` is the reference these floors were chosen
+against, never a target to hold: it measured a minimal libfuse filesystem.
+
+The tolerances live in the baseline file (`cpu_tolerance: 3.0`, i.e. a limit of
+`base × 4 + slack`); the code default matches it, so a host with no baseline
+yet gets the documented 4× rather than a tighter one.
+
+**In CI the lane records, it does not gate.** The nightly `performance` job
+runs it with a baseline path of its own that does not exist, so the script
+creates it from that run and passes, and the numbers plus that baseline go to
+the `performance-logs` artifact. The committed baseline belongs to one
+developer host; a shared runner's CPU per GiB is neither comparable to it nor
+stable enough to gate on. What the nightly run buys is that the lane cannot
+rot unnoticed — a mount that stops coming up, a renamed status field, fio
+arguments that stop parsing. Z1 establishes a runner baseline and turns the
+comparison on.
+
+### The trust-model change, stated
+
+Under the default `admit`, a chunk file this process hashed is trusted for the
+rest of the process's life. Local corruption *after* admission — a bad sector,
+a `btrfs`/`ZFS` scrub miss underneath, or (outside the plan's threat model) a
+writer into the cache directory — reaches a reader instead of being caught on
+the next read. That is the trust every local filesystem already has for its own
+page cache, and it is the precondition for Z3's passthrough and Z4's zero-copy,
+which let the kernel serve a chunk file without the daemon seeing the bytes at
+all. `--cache-verify always` keeps the old guarantee and will disable both.
+
+**The trade is for readers only.** Plan 38 §2.3 argues it as "a bit flip on
+the local disk would reach a reader", and a reader is recoverable: it hashes
+what it got, refuses it and refetches, and what is in the bucket is still
+right. Publishing those bytes is not the same class of damage, and §2.3 does
+not analyse it — so the uploader does not make the trade. `chunk/<H>` holding
+content that is not `H` is permanent: every node's in-flight check refuses it
+from then on, and because `ChunkPutMode::Create` treats `AlreadyExists` as a
+dedup hit, a node holding the correct bytes never overwrites it, so the chunk
+is dead cluster-wide. The window is real under `--write-mode back`, where a
+`Dirty` cache file can sit for a long time between `insert` and its upload
+pass. `DiskCache::get_verified` therefore hashes regardless of the bit and of
+the mode, and `engine::upload` uses it for the chunk it PUTs and for the two
+list-blob reads whose contents become pending-upload rows; a rotted copy is
+dropped there and the row takes the "not in the cache" path it took before
+this knob existed. `store-s3`'s `put_chunk_mode` only `debug_assert_eq!`s the
+hash, so this is the only place in release where that check happens.
+Peer serving (`get_servable`) deliberately keeps the reader trade: the peer
+hashes what it receives before admitting it, so a rotted copy costs it a
+refetch from S3 and nothing more.
+Two existing tests asserted the old behaviour on chunks this process had
+written; they now run under `always`, with their assertions unchanged, and the
+`admit` side is asserted for itself
+(`admit_serves_a_chunk_this_process_verified_without_rehashing`,
+`a_startup_scanned_entry_is_hashed_on_its_first_read_only`).
+
+### Exit criteria (plan 38 §9 item 2)
+
+- [x] The fio-based CPU-s/GiB + RSS gate exists and runs against the
+      `/dev/fuse`-only path — `tests/read-cpu-gate.sh`, `make read-cpu-gate`,
+      baseline committed, five lanes, unprivileged, SKIPs loudly without fio.
+- [x] The transport matrix lane's skeleton exists —
+      `tests/transport-matrix.sh`, `make transport-matrix`, one `dev-fuse` leg,
+      `auto` skipping until Z1.
+- [x] §2.3's verify-once changes and `--cache-verify` land with their tests —
+      direct admission on every fetch path that has the bytes, the `verified`
+      bit, `get_disk` honouring it, the flag/env/`node.status`, and the gate
+      list's four test cases.
+- [x] The gate records cold-sequential daemon CPU-s/GiB before and after —
+      above; with the finding that on this host the sequential lanes' change is
+      below the noise floor and `smallfiles` is where it shows.
+- [x] `admit` does not weaken what this node publishes — `DiskCache::get_verified`
+      on the upload reads, with a test that fails without it.
+
+### Gates run
+
+`cargo fmt --all` (no diff), `cargo clippy --workspace --all-targets -- -D
+warnings` clean, `cargo test --workspace` zero failures, `bash tests/smoke.sh`
+PASSED. The integration lane ran as `bash tests/smoke.sh s3://constellation-ci/<prefix>`
+against the floci container already up on this host (another worktree's compose
+project owns port 4566; `tests/integration.sh`'s own `docker compose up` cannot
+bind it, and tearing down another session's container was not an option) —
+SMOKE TEST PASSED, conditional-write probe including `If-Match` ok.
+`target/release/harness run cold-cache readahead coop-cache-hit
+coop-exact-churn e2e-basic e2e-two-nodes poison-record-isolation s3-outage
+truncate-never-resurrects fio-latency --seed 42`: **ALL SCENARIOS PASSED**
+(10/10). Not run here (a separate gate run's): the full harness matrix and
+pjdfstest.
+
+### Review round 2 (post-review fixes)
+
+The review of this chunk found one must-fix and four should-fix items; all five
+are addressed above. The substantive one is the publish path: `admit` was
+letting a locally rotted *dirty* chunk be PUT under its (now wrong) hash, which
+`DiskCache::get_verified` now prevents — see "The trust-model change, stated".
+The rest: the env override warns instead of being silent (`mount`'s stderr and
+the daemon log), `READ_CPU_LANES` subsets warm up what they need instead of
+silently measuring a cold read as a warm one, the gate's coded CPU tolerance
+matches the documented 4×, and the nightly `performance` job runs the lane in
+recording mode. Also: `CacheVerify::parse` lost the undocumented `once`/`every`
+aliases, `is_verified` is `#[doc(hidden)]`, and the gate SKIPs on a non-Linux
+host rather than failing on `/proc`.
+
+Gates re-run on the fixed tree, all from this worktree with `CARGO_TARGET_DIR`
+unset:
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` | exit 0 — **1781 passed, 0 failed** (1779 before + the two new publish-path tests) |
+| `cargo build --workspace` / `--release --workspace` | exit 0 |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| integration (floci body, port 4566 still owned by another compose project) | SMOKE TEST PASSED against `s3://constellation-ci/fix-…` |
+| `target/release/harness run cold-cache readahead coop-cache-hit coop-exact-churn e2e-basic e2e-two-nodes poison-record-isolation s3-outage truncate-never-resurrects fio-latency --seed 42` | ALL SCENARIOS PASSED (10/10) |
+| `make read-cpu-gate` | **READ-CPU GATE PASSED** — medians on a host loaded by two other agent sessions: cold-seq 5.56 (limit 14.05), warm-disk 1.72 (3.97), warm-mem 0.30 (0.93), rand-4k 6.67 (28.65), smallfiles 18.56 (53.97); peak RSS within 1% of the baseline on every lane; `memcache_misses` 127/129/0/0/10, unchanged |
+| `TRANSPORTS="dev-fuse auto" tests/transport-matrix.sh` | dev-fuse leg ALL SCENARIOS PASSED, `auto` SKIP, TRANSPORT MATRIX PASSED |
+| knob check | `CONSTELLATION_CACHE_VERIFY=alwyas --cache-verify always` → `warning: ignoring CONSTELLATION_CACHE_VERIFY="alwyas" (expected admit or always); the mount uses always` on `mount`'s stderr, `WARN constellation_engine::profile: ignoring an unparseable cache verification mode value="alwyas"` in the daemon log, `node.status` `cache.cache_verify = "always"`. `--cache-verify {bogus,once,every}` all refused pre-fork |
+
+Evidence for the lane-subset fix, same host and size (`READ_CPU_REPEATS=1
+READ_CPU_SEQ_MIB=256`): `warm-disk-seq-1m` **alone** now measures 1.80
+cpu-s/GiB at 709 MiB/s, against 1.68 at 738 MiB/s for the same lane inside a
+`cold-seq-1m warm-disk-seq-1m` run — within the run-to-run spread, where before
+the fix the same subset measured 3.04 at 298 MiB/s (a cold read wearing the
+warm lane's name, and blessable as such).

@@ -947,7 +947,21 @@ impl Coop {
                 }
                 let bytes = data.len() as u64;
                 let _ = self.cache.insert(requested, &data, ChunkState::Clean);
-                let demand_data = read_back.then_some(data);
+                // These bytes were hashed as they arrived
+                // (`fetch_from_peer`), so the memory tier may have them
+                // without a disk read (plan 38 §2.3). A demand fetch's
+                // caller admits the `Vec` it is handed here rather than
+                // a copy of it (`view::flush`'s `fetch_chunk_for_inode`);
+                // a prefetch has no caller to hand them to, and warming
+                // the read that follows is the whole point, so admit
+                // them here instead of dropping them.
+                let demand_data = if read_back {
+                    Some(data)
+                } else {
+                    self.cache
+                        .admit_verified(requested, bytes::Bytes::from(data));
+                    None
+                };
                 Some(Fetched {
                     data: demand_data,
                     bytes,
@@ -966,6 +980,14 @@ impl Coop {
                 self.cache
                     .commit_spill(requested, spill, ChunkState::Clean)
                     .ok()?;
+                // Nothing to admit to the memory tier here: the bytes
+                // went straight from the decoder into the spill file and
+                // are not in hand, and reading them back only to admit
+                // them would cost exactly the I/O plan 38 §2.3 avoids.
+                // The entry `commit_spill` left is `verified`, so the
+                // read below (and the demand read after a prefetch)
+                // skips the second hash, and `fetch_chunk_for_inode`
+                // admits what it is handed.
                 let data = if read_back {
                     self.cache.get(requested).ok().flatten()
                 } else {

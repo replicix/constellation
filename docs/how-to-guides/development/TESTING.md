@@ -1,9 +1,9 @@
 # Testing
 
-Constellation has seven test lanes, from fastest to most realistic. The
+Constellation has eight test lanes, from fastest to most realistic. The
 fast lanes run on every PR (`.github/workflows/ci.yml`); the full matrix,
-xfstests, performance gate, audit, and macOS build run nightly and on manual
-dispatch (`.github/workflows/nightly.yml`).
+xfstests, performance gate, read-path cost gate, audit, and macOS build run
+nightly and on manual dispatch (`.github/workflows/nightly.yml`).
 
 | Lane | Command | Backend | Needs | Speed |
 |---|---|---|---|---|
@@ -14,6 +14,7 @@ dispatch (`.github/workflows/nightly.yml`).
 | Fault injection | `cargo run -p constellation-harness -- run` | floci S3 via toxiproxy | Rust, fuse3, docker | ~3–6 min |
 | xfstests | `make xfstests` | floci S3, separate test/scratch prefixes | docker | long |
 | Performance | `make perf-gate` | local floci S3 | Rust, fuse3, docker | minutes |
+| Read-path cost | `make read-cpu-gate` | local directory | Linux, Rust, fuse3, fio | ~5 min |
 
 The fault-injection lane includes **`chaos-ci`**: same-path conflict races
 across three local mounts of one filesystem (create/mkdir/unlink/rename
@@ -1756,6 +1757,95 @@ falls more than the baseline's 20% tolerance (the harness bench needs
 `rsync` on the host). It compares the median of three runs so scheduler
 noise in the sub-second metadata and warm-cache probes does not create a
 spurious regression.
+
+## Read-path cost gate: `make read-cpu-gate` (plan 38 §6)
+
+`tests/read-cpu-gate.sh` measures what the **daemon spends** to serve
+reads, not how fast it serves them: **CPU seconds per GiB** and **peak
+RSS**, sampled from `/proc/<pid>/stat` (utime + stime) and
+`/proc/<pid>/status` (`VmHWM`, reset per lane via `clear_refs` where the
+kernel allows it) around each fio window. `make perf-gate` covers rates;
+this covers cost, because plan 38's changes (verify-once, io_uring,
+zero-copy, passthrough) are about serving the same bytes for less CPU and
+less RAM.
+
+It needs **fio**, **Linux** and **no root**: a missing fio SKIPs loudly and
+exits 0, as CONVENTIONS.md allows for the fio lanes, and so does another
+OS (the sampling is `/proc/<pid>/stat`, `/proc/<pid>/status` and
+`clear_refs`). There is no `drop_caches` here — "cold" is a fresh mount
+whose disk cache directory was emptied (the startup scan rebuilds the empty
+accounting), which is also the only shape that exercises the fetch path.
+
+| Lane | What it isolates |
+|---|---|
+| `cold-seq-1m` | buffered 1 MiB sequential read of a 512 MiB file over an **empty disk cache**: the fetch path (S3 GET, decode, spill, commit, admission) |
+| `warm-disk-seq-1m` | the same read on a fresh mount over a **full disk cache**: `get_disk`, with an empty memory tier and no cached FUSE pages — the lane the verify-once change (plan 38 §2.3) shows up in |
+| `warm-mem-seq-1m` | the same file again with **O_DIRECT**, so every read reaches the daemon and is served from the chunk memory cache |
+| `rand-4k-dio` | 4 KiB random reads, O_DIRECT, 8 jobs, 15 s — the per-request cost, closest to plan 38's `rand4k-8j-dio` cell |
+| `smallfiles` | 4096 × 64 KiB files read sequentially over an empty disk cache: the per-open cost |
+
+One JSON line per lane per repeat goes to `$READ_CPU_OUT` (bandwidth,
+IOPS, clat p50/p99, daemon CPU, CPU-s/GiB, RSS, peak RSS, wall time, and
+the `CONSTELLATION_FUSE_TRANSPORT` the lane ran under). The median of
+`READ_CPU_REPEATS` (3) is compared with `tests/read-cpu-baseline.json`
+and fails only on a **large** regression — 4× the baseline's CPU per GiB,
+1.5× its peak RSS, plus a small absolute slack. The spread is the reason:
+the committed baseline was taken on an otherwise idle 32-CPU host, and
+the same tree on the same host under another build's load measured 2.9×
+the baseline's CPU per GiB on `smallfiles` and 1.5× on
+`warm-disk-seq-1m`, while peak RSS over the same runs moved by under 5%.
+**Peak RSS is the reliable half of this gate and CPU per GiB the noisy
+one.** The regressions it is for — every read hashing again, every fetch
+reloaded from disk, a buffer pool leaked per mount — are multiples, not
+margins. The numbers are
+host-specific: `READ_CPU_BLESS=1 tests/read-cpu-gate.sh` rewrites the
+baseline (the first run on a machine with no baseline file does it
+automatically). `bench/fuse-read-path/RESULTS.md` is the **reference** the
+floors were chosen against, never a target to hold — it measured a
+minimal libfuse filesystem, not Constellation.
+
+`READ_CPU_LANES` picks a subset, and a subset measures what the full run
+measures: a warm lane selected without the lane that fills the tier it
+reads from gets an unmeasured warm-up pass first, so
+`READ_CPU_LANES="warm-disk-seq-1m"` is still a warm number (and still a
+blessable one).
+
+**In CI the lane records, it does not gate.** The nightly `performance`
+job runs it with a baseline path of its own that does not exist, so the
+script creates it from that run and passes; the numbers and the baseline go
+to the `performance-logs` artifact. The reason is that the committed
+`tests/read-cpu-baseline.json` belongs to one developer host and a shared
+runner's CPU per GiB is neither comparable to it nor stable enough to gate
+on — what the nightly run buys is that the lane cannot rot unnoticed.
+Gating against the committed baseline is operator-run on a stable host
+until plan 38's Z1 establishes a runner baseline.
+
+## FUSE transport matrix (plan 38 §6)
+
+`tests/transport-matrix.sh` (`make transport-matrix`) runs the read-path
+harness scenarios once per FUSE transport, so a transport-specific
+regression fails one leg instead of everything:
+
+```bash
+TRANSPORTS="dev-fuse" tests/transport-matrix.sh        # today's only leg
+SCENARIOS="cold-cache readahead" tests/transport-matrix.sh
+READ_CPU_GATE=1 tests/transport-matrix.sh              # + the cost gate per leg
+```
+
+Each leg exports `CONSTELLATION_FUSE_TRANSPORT` and writes
+`target/transport-matrix/<transport>.json`. Only **`dev-fuse`** — the
+`/dev/fuse` `writev` path Constellation has always used — exists today;
+`auto`/`uring`/`uring-zc` SKIP loudly until plan 38's Z1 vendors the
+io_uring transport, at which point `TRANSPORTS="dev-fuse auto"` is the CI
+invocation and the script needs no change. Until Z1 the env var is a name
+this lane sets and nothing in the daemon reads — it is recorded in each
+leg's results so the legs are distinguishable once they differ.
+
+It is **not** a CI lane yet, deliberately: with one leg it runs scenarios
+the nightly fault-injection lane already runs, under an env var nothing
+reads. Z1 adds the `auto` leg and with it the reason to spend the CI time;
+until then it is run by hand (`make transport-matrix`) when touching the
+read path.
 
 ## Cross-node `flock`/`fcntl` (plan 30 M14)
 

@@ -1744,6 +1744,15 @@ pub struct CacheStatus {
     pub memory_coalesced: u64,
     #[serde(default)]
     pub memory_evictions: u64,
+    /// When a disk-cache read re-hashes the chunk file it read
+    /// (`--cache-verify`, `CONSTELLATION_CACHE_VERIFY`; plan 38 §2.3):
+    /// `"admit"` verifies a chunk once — in flight on the fetch, or on
+    /// the first read of a file a restart found on disk — and trusts it
+    /// afterwards; `"always"` re-hashes every disk read. Empty when it
+    /// came from a daemon older than the knob — which behaved as
+    /// `"always"`, but says so by the absence, not by the value.
+    #[serde(default)]
+    pub cache_verify: String,
 }
 
 // ---------------------------------------------------------------------------

@@ -149,12 +149,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: sudo apt-get update && sudo apt-get install -y fuse3 fio jq
       - run: cargo build --release -p constellation -p constellation-harness
       - run: make perf-gate 2>&1 | tee performance.log
+      # Plan 38 §6's read-path cost gate. Recording, not gating: the
+      # committed baseline is host-specific (an idle 32-CPU host) and a
+      # shared runner's CPU per GiB is neither comparable to it nor stable
+      # enough to gate on, so the lane runs against a baseline of its own
+      # that does not exist yet — the script then creates it from this run
+      # and passes. What it catches nightly is the lane rotting (a mount
+      # that no longer comes up, a status field renamed, fio arguments that
+      # stopped parsing) and the numbers themselves, in the artifact. Z1
+      # establishes a runner baseline and turns the comparison on.
+      - run: |
+          READ_CPU_BASELINE=read-cpu-ci-baseline.json \
+          READ_CPU_OUT=read-cpu.jsonl \
+          READ_CPU_REPEATS=1 READ_CPU_SEQ_MIB=256 READ_CPU_RAND_MIB=128 \
+          READ_CPU_SMALL_FILES=1024 READ_CPU_RAND_SECONDS=10 \
+            make read-cpu-gate 2>&1 | tee read-cpu.log
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: performance-logs, path: performance.log }
+        with:
+          name: performance-logs
+          path: |
+            performance.log
+            read-cpu.log
+            read-cpu.jsonl
+            read-cpu-ci-baseline.json
 
   linux-package:
     needs: performance

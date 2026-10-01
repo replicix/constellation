@@ -29,6 +29,8 @@ export CARGO_TERM_COLOR ?= always
 COMPOSE_SUITES ?=
 HARNESS_SCENARIOS ?=
 HARNESS_SEED ?= 42
+# FUSE transports the matrix lane runs (plan 38 §6). `auto` joins at Z1.
+TRANSPORTS ?= dev-fuse
 BENCH_FILES ?= 20000
 UPLOADBENCH_LIVE_CONTROLLERS ?= aimd,pid
 UPLOADBENCH_LIVE_DURATION ?= 60
@@ -41,7 +43,8 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration compose compose-down harness harness-docker \
-	harness-list bench perf-regression xfstests perf-gate dist-linux dist-macos deps FORCE \
+	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
+	dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live check-cross vfs-bench
 
 .DEFAULT_GOAL := help
@@ -54,6 +57,7 @@ help: ## Show this help
 	@echo "  COMPOSE_SUITES=\"...\"   suites for compose (default: all)"
 	@echo "  HARNESS_SCENARIOS=\"..\" scenario names (default: all)"
 	@echo "  HARNESS_SEED=$(HARNESS_SEED)         harness workload seed"
+	@echo "  TRANSPORTS=\"$(TRANSPORTS)\"  FUSE transports for transport-matrix"
 	@echo "  BENCH_FILES=$(BENCH_FILES)       files for harness bench"
 	@echo "  BUCKET=<local.mk>       s3://bucket/prefix for uploadbench-live (see local.mk.example)"
 	@echo "  UPLOADBENCH_LIVE_CONTROLLERS=$(UPLOADBENCH_LIVE_CONTROLLERS)"
@@ -159,6 +163,12 @@ vfs-bench: ## VFS dispatch overhead (<1us/op) and per-op allocations, in-process
 
 perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## vfs-bench (§6.9 dispatch + allocation ceilings), then benchmark rates against baseline
 	tests/perf-gate.sh
+
+read-cpu-gate: $(RELEASE_BIN) ## Daemon CPU-s/GiB + peak RSS on a real mount, fio-driven (plan 38 §6); needs fio, no root
+	tests/read-cpu-gate.sh
+
+transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Read-path scenarios once per FUSE transport (plan 38 §6; only `dev-fuse` exists yet)
+	TRANSPORTS="$(TRANSPORTS)" tests/transport-matrix.sh
 
 uploadbench-build: ## Build the adaptive-upload-concurrency benchmark
 	$(CARGO) build -p uploadbench --release

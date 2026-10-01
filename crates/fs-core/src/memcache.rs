@@ -12,8 +12,11 @@
 //!
 //! # What an entry is
 //!
-//! Content-addressed bytes that passed the disk cache's hash check, so an
-//! entry never goes stale. It is still dropped whenever the disk entry
+//! Content-addressed bytes the disk cache vouches for: either they passed
+//! its hash check on the disk read that admitted them, or they are the
+//! bytes a fetch had in hand and hashed in flight
+//! ([`crate::cache::DiskCache::admit_verified`], plan 38 §2.3). Either
+//! way an entry never goes stale. It is still dropped whenever the disk entry
 //! goes (removed, evicted, pruned, found corrupt, forgotten): memory
 //! entries are always a subset of the disk cache's entries, and the
 //! owner ([`crate::cache::DiskCache`]) keeps that invariant under its

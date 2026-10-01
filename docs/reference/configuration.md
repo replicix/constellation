@@ -59,11 +59,19 @@ because they combine with it. See [Durability and failover](features/durability-
 |---|---|---|---|---|---|
 | `--cto` | `bounded` | `bounded`, `strict` | `CONSTELLATION_CTO` | no | close-to-open mode (plan 30 M8). `strict`: an open, lookup or listing sees every close another node completed before it began |
 | `--locks` | `cluster` with P2P, `local` without | `local`, `cluster` | `CONSTELLATION_LOCKS` | no | `flock`/`fcntl` scope (plan 30 M14). An explicit `cluster` with P2P off fails the mount |
+| `--cache-verify` | `admit` | `admit`, `always` | `CONSTELLATION_CACHE_VERIFY` | no | when a disk-cache read re-hashes the chunk file it read (plan 38 §2.3). Every chunk is blake3-verified exactly once regardless — **while it streams in** from S3 or a peer, before it is ever admitted. `admit`: the local copy is trusted afterwards; a file a restart's directory scan found is still hashed on its first read (and then trusted). `always`: every disk read hashes again, so local corruption after admission (a bad sector, a scrub miss, a writer into the cache directory) is caught on the next read instead of at the next restart, at one blake3 pass per read. Echoed in `node.status` as `cache.cache_verify`; an unparseable `CONSTELLATION_CACHE_VERIFY` is warned about and ignored (see below the table), while an unparseable `--cache-verify` fails the mount before the daemon forks. Plan 38's later milestones also make `always` disable FUSE zero-copy and passthrough, which by construction let the kernel serve a chunk file without the daemon seeing the bytes |
 | `--fsync-mode` | `local` | `local`, `s3` | none | yes | what `fsync()` waits for. `local`: the node's metadata store is forced to disk. `s3`: also the file's chunks and the journal up to the call are in the bucket. `s3` also forces `--write-mode through` |
 | `--write-mode` | `through` | `through`, `back` | none | yes | chunk close policy. `through`: `close()` returns once the file's chunks are in S3 and its manifest is committed at the sequencer (one S3 round trip for a small file). `back`: `close()` returns once the chunks are queued durably on this node's disk and the manifest is committed at the sequencer (no S3 round trip, on the sequencer and on any other node); the bytes live only on this node until the upload drains. `fsync`, `O_SYNC`, `O_DSYNC`, `--fsync-mode s3` and a cluster lock's release always act as `through`. `constellation write-mode TARGET MODE` changes it on a running mount (switching to `through` drains the queue). Use `back` for bulk imports (untar, rsync, `cp -r`) and switch back afterwards; see [When to use `--write-mode back`](features/durability-and-failover.md#when-to-use---write-mode-back) |
 
-Values are case-insensitive for `--cto` and `--locks`; any
-other value fails the mount. The flags that are not persisted apply to
+Values are case-insensitive for `--cto`, `--locks` and `--cache-verify`; any
+other value fails the mount. The one exception is
+`CONSTELLATION_CACHE_VERIFY`: an unparseable value there is **warned about
+and ignored** (the flag, or the default, applies), so a stale value in a
+shell profile cannot brick every mount started from it — `mount` prints the
+warning and the mode it is using, the daemon logs it, and
+`node.status`'s `cache.cache_verify` reports the mode that took effect.
+
+The flags that are not persisted apply to
 the mount command that carries them: a later bare `mount NAME` uses the
 environment or the default again.
 

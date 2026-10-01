@@ -193,6 +193,7 @@ impl EngineControl {
                 memory_misses: memory.misses,
                 memory_coalesced: memory.coalesced,
                 memory_evictions: memory.evictions,
+                cache_verify: self.cache.verify_mode().as_str().to_string(),
             },
             lease: p0_lease,
             p2p,
