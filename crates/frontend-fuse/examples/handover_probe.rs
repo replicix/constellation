@@ -308,7 +308,7 @@ impl Vfs for ProbeVfs {
         // `fh == ino`: no per-process handle state, so whoever serves the
         // connection next answers a handle the previous server gave out.
         r.done(match self.index(ino) {
-            Some(_) => Ok(Opened { fh: Fh(ino) }),
+            Some(_) => Ok(Opened::new(Fh(ino))),
             None => Err(VfsError::new(Code::NotFound)),
         });
     }
@@ -713,6 +713,8 @@ fn options(fs_name: &str, threads: usize) -> MountOptions {
         read_only: false,
         n_threads: threads,
         tuning: KernelTuning::for_workers(threads),
+        // The probe exercises the /dev/fuse handover: a ring session is never handed over.
+        io_uring: false,
     }
 }
 
