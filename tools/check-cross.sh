@@ -49,16 +49,19 @@ zig_target() {
     esac
 }
 
-# Library crates: workspace members minus cli, harness, frontend-fuse and
-# bench/*. constellation-frontend-fuse is the Linux (FreeBSD-ready) FUSE
+# Library crates: workspace members minus cli, harness, frontend-fuse, csi
+# and bench/*. constellation-frontend-fuse is the Linux (FreeBSD-ready) FUSE
 # frontend, a platform frontend like cli's binary: FUSE does not exist on
 # Windows (plan 35's frontend is WinFsp), so it is not a Windows library
 # crate. It is still type-checked for macOS by the darwin workspace row.
+# constellation-csi (plan 37) is a Kubernetes-only driver binary, not a
+# default workspace member (so the darwin row's plain `cargo check`, which
+# only reaches default-members, already skips it) and excluded here too.
 lib_crates() {
     sed -n '/^members *= *\[/,/^\]/p' Cargo.toml | grep -o '"[^"]*"' | tr -d '"' |
         while read -r dir; do
             case "$dir" in
-            crates/cli | crates/harness | crates/frontend-fuse | bench/*) continue ;;
+            crates/cli | crates/harness | crates/frontend-fuse | crates/csi | bench/*) continue ;;
             esac
             sed -n 's/^name *= *"\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1
         done

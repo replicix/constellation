@@ -15,6 +15,7 @@ TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),target)
 RELEASE_BIN := $(TARGET_DIR)/release/constellation
 RELEASE_HARNESS := $(TARGET_DIR)/release/harness
 RELEASE_CHAOS := $(TARGET_DIR)/release/chaos
+RELEASE_CSI := $(TARGET_DIR)/release/constellation-csi
 DEBUG_BIN := $(TARGET_DIR)/debug/constellation
 DEBUG_HARNESS := $(TARGET_DIR)/debug/harness
 DEBUG_CHAOS := $(TARGET_DIR)/debug/chaos
@@ -42,7 +43,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 -include local.mk
 
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
-	check ci clean smoke integration compose compose-down harness harness-docker \
+	check ci clean smoke integration csi-sanity compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
 	dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live check-cross vfs-bench
@@ -81,6 +82,12 @@ $(RELEASE_BIN) $(RELEASE_HARNESS) $(RELEASE_CHAOS) &: FORCE
 $(DEBUG_BIN) $(DEBUG_HARNESS) $(DEBUG_CHAOS) &: FORCE
 	$(CARGO) build -p constellation -p constellation-harness -p constellation-chaos
 
+# constellation-csi (plan 37) is not a default workspace member (it is
+# Kubernetes/Linux-only — see Cargo.toml), so it needs its own `-p` build
+# rather than riding along with build-release's `&:` group above.
+$(RELEASE_CSI): FORCE
+	$(CARGO) build --release -p constellation-csi
+
 FORCE: ;
 
 test: test-unit ## Alias for unit tests
@@ -112,6 +119,9 @@ smoke: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Host smoke test (local file backend;
 
 integration: $(RELEASE_BIN) ## Host integration (floci S3 in docker)
 	tests/integration.sh
+
+csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity group against constellation-csi (plan 37 K1; needs CSI_SANITY_BIN or csi-sanity on PATH)
+	CONSTELLATION_CSI_BIN=$(abspath $(RELEASE_CSI)) tests/csi/sanity.sh
 
 compose: ## Containerized FUSE suites (floci S3; needs docker)
 	@if [ -n "$(COMPOSE_SUITES)" ]; then \

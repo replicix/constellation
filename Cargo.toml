@@ -18,6 +18,7 @@ members = [
     "crates/upload-concurrency",
     "crates/model",
     "crates/authority",
+    "crates/csi",
     "bench/uploadbench",
 ]
 # Bare `cargo build`/`cargo test` at the root only touch the product
@@ -25,6 +26,9 @@ members = [
 # still a full member (shares the lockfile, reuses the real
 # `constellation-upload-concurrency` crate) but only builds when asked
 # for explicitly (`-p uploadbench`, `--workspace`, or `cd` + `cargo run`).
+# `crates/csi` (plan 37): a Kubernetes-only driver binary, not part of
+# every other platform's build; same opt-in-only treatment, also excluded
+# from `tools/check-cross.sh`'s darwin/windows rows.
 default-members = [
     "crates/types",
     "crates/platform",
