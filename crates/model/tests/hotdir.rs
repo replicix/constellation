@@ -7,7 +7,15 @@ use constellation_model::hotdir::{Action, HotDirModel, Kind, State, SAW_ALL_APPL
 use stateright::{Checker, HasDiscoveries, Model};
 use std::time::{Duration, Instant};
 
-const CAP: (usize, Duration) = (5_000_000, Duration::from_secs(55));
+/// `assert_clean` asserts the search finished *and* took less than
+/// `CAP.1`; that wall-clock assertion, not the checker's timeout, is
+/// what a loaded host trips (at the previous 55 s, `delegation`'s
+/// largest configuration, `drift-with-margin` at 4.70M states, already
+/// took 31-35 s unloaded, so a host at load ~50 crossed it on a search
+/// that had in fact completed). The bound is set far above any real
+/// host's time for `CAP.0` states; exhaustiveness itself is enforced by
+/// `is_done()` + `state_count() < CAP.0`.
+const CAP: (usize, Duration) = (5_000_000, Duration::from_secs(600));
 
 const ALWAYS: &[&str] = &[
     "converged",

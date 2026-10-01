@@ -395,6 +395,7 @@ mod tests {
         let view = Arc::new(Opens(Mutex::new(vec![open.ino])));
         let sources = Arc::new(HoldSources::default());
         sources.register(1, Arc::downgrade(&view) as Weak<dyn OpenHandles>);
+        const TTL: Duration = Duration::from_millis(150);
         let holds = Holds::new(
             store.clone(),
             chunks,
@@ -403,7 +404,7 @@ mod tests {
             sources,
             HoldConfig {
                 refresh: Duration::from_millis(50),
-                ttl: Duration::from_millis(150),
+                ttl: TTL,
             },
         );
 
@@ -419,7 +420,9 @@ mod tests {
         meta.unlink(ROOT_INO, "open").unwrap();
         meta.unlink(ROOT_INO, "closed").unwrap();
         assert_eq!(meta.orphans().unwrap().len(), 2);
+        let before = constellation_store_s3::lease::now_unix_ms();
         holds.refresh_once().await.unwrap();
+        let after = constellation_store_s3::lease::now_unix_ms();
         let body: HoldBody = serde_json::from_slice(
             &store
                 .get(&layout::hold(7))
@@ -433,17 +436,30 @@ mod tests {
         assert_eq!(body.node, 7);
         assert_eq!(body.inodes, vec![open.ino]);
         assert_eq!(body.chunks, vec![hash.to_hex()]);
-        assert!(body.expires_unix_ms > constellation_store_s3::lease::now_unix_ms());
+        // The pass stamps its own clock plus the configured TTL, so the
+        // expiry is bracketed by the clock either side of the pass. Read
+        // that way rather than as "still in the future now": getting the
+        // object back and parsing it can take longer than a 150 ms TTL on
+        // a loaded host, which failed the old `> now_unix_ms()` form
+        // without the stamp being any different.
+        assert!(
+            (before + TTL.as_millis() as i64..=after + TTL.as_millis() as i64)
+                .contains(&body.expires_unix_ms),
+            "{} not stamped {:?} ahead of [{before}, {after}]",
+            body.expires_unix_ms,
+            TTL
+        );
         assert_eq!(
             meta.orphans().unwrap(),
             vec![open.ino],
             "the orphan nobody has open is reaped"
         );
-        // The chunk GC's reader sees the claim.
-        let roots =
-            crate::gc::hold_roots(store.clone(), constellation_store_s3::lease::now_unix_ms())
-                .await
-                .unwrap();
+        // The chunk GC's reader sees the claim while it is live — asked
+        // at the last millisecond it covers, so the answer does not
+        // depend on how long this test took to get here either.
+        let roots = crate::gc::hold_roots(store.clone(), body.expires_unix_ms - 1)
+            .await
+            .unwrap();
         assert!(roots.contains(&hash));
         // ... and not once it has expired.
         let roots = crate::gc::hold_roots(store.clone(), body.expires_unix_ms)

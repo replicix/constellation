@@ -244,8 +244,17 @@ impl MutateOutcome {
 }
 
 /// Execute `op` against the holder's authoritative replica and return
-/// the journal records that were appended (including a trailing
-/// `LogRecord::Completed { rid }` when `rid` is given — plan 30 §M2).
+/// every journal record appended since the call started — the op's own,
+/// with `LogRecord::Completed { rid }` directly behind the first of them
+/// when `rid` is given (plan 30 §M2), *plus* anything another thread
+/// journaled against the same `Meta` in the meantime. The window is
+/// `peek_journal_after(journal_tip())` (`execute_inner`), not a read of
+/// the op's transaction, so a concurrent writer's rows can bracket the
+/// op's pair on either side and the completion is not necessarily the
+/// last element. Its *adjacency* to the op's own first record is the
+/// guarantee (the pair gets consecutive seqs inside one
+/// `SingleWriterWriteTx`); that is what readers attribute a transaction
+/// by — see `engine::coop::fresh::written_chunks`.
 /// The caller is responsible for checking lease ownership first.
 ///
 /// `rid` should be `Some` for every FUSE-issued mutation (local fast

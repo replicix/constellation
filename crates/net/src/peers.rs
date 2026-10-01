@@ -2392,14 +2392,36 @@ mod tests {
         let asker = chunk_pair(service).await;
         let inner = asker.inner.as_ref().unwrap();
         let peer = inner.peers.lock().unwrap().get(&1).unwrap().addr.id;
-        assert!(asker.ping_node(1).await);
+        // Not `ping_node`: that bounds the round trip by production's
+        // `REQUEST_TIMEOUT` (500 ms), and both pings here have to pay for
+        // a full QUIC handshake inside it — the first to dial at all, the
+        // second to redial after the close. On a loaded host that
+        // handshake alone can outrun 500 ms, which reads here as "the
+        // request after a close failed" when nothing about the pool went
+        // wrong. What this test is about is *which connection* the pool
+        // hands out, so the bound is the same generous one the reconcile
+        // test uses, and the identity checks below carry the claim.
+        assert!(ping_within(&asker, Duration::from_secs(20)).await);
         let first = inner.p2p.pooled_connection_id(peer).await.unwrap();
         inner.p2p.close_pooled_connection(peer).await;
         assert!(
-            asker.ping_node(1).await,
+            ping_within(&asker, Duration::from_secs(20)).await,
             "the first request after a close must redial, not fail"
         );
         assert_ne!(Some(first), inner.p2p.pooled_connection_id(peer).await);
+    }
+
+    /// [`Peers::ping_node`] with a caller-chosen bound, so a test can say
+    /// "it answered" without also asserting production's 500 ms
+    /// `REQUEST_TIMEOUT` on a host that may not make it.
+    async fn ping_within(asker: &Peers, timeout: Duration) -> bool {
+        let node_id = asker.inner.as_ref().unwrap().node_id;
+        matches!(
+            asker
+                .request_to_node_timeout(1, &Payload::Ping { node_id }, timeout)
+                .await,
+            Ok(Payload::Pong { .. })
+        )
     }
 
     /// Plan 30 §M13's "slow is not gone": requests to a peer that is

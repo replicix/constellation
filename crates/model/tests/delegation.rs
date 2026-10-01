@@ -19,7 +19,15 @@ use constellation_model::delegation::{
 use stateright::{Checker, HasDiscoveries, Model};
 use std::time::{Duration, Instant};
 
-const CAP: (usize, Duration) = (5_000_000, Duration::from_secs(55));
+/// `assert_clean` asserts the search finished *and* took less than
+/// `CAP.1`; that wall-clock assertion, not the checker's timeout, is
+/// what a loaded host trips (at the previous 55 s, the largest
+/// configuration here, `drift-with-margin` at 4.70M states, already
+/// took 31-35 s unloaded, so a host at load ~50 crossed it on a search
+/// that had in fact completed). The bound is set far above any real
+/// host's time for `CAP.0` states; exhaustiveness itself is enforced by
+/// `is_done()` + `state_count() < CAP.0`.
+const CAP: (usize, Duration) = (5_000_000, Duration::from_secs(600));
 /// The `#[ignore]`d run's budget: bounded, reported as "clean in the
 /// explored region" (M8's deep test does the same).
 const BIG_CAP: (usize, Duration) = (20_000_000, Duration::from_secs(900));

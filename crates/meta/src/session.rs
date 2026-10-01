@@ -1773,28 +1773,74 @@ mod tests {
 
     #[test]
     fn a_waiter_is_released_by_advance() {
+        // Generous, because it is only this test's patience: the
+        // assertions below never consume it (see the handshake).
+        const BUDGET: Duration = Duration::from_secs(10);
         let s = std::sync::Arc::new(SessionState::default());
-        s.set_budget_ms(2_000);
+        s.set_budget_ms(BUDGET.as_secs() * 1_000);
+        // Never drop the watermark: that takes abandonment — the wait
+        // loop's third way out — off the table, so the returned variant
+        // alone says what released the waiter.
+        s.set_watermark_ttl_ms(0);
         s.raise_observed(Position {
             seq: 2,
             pending: None,
             streams: Default::default(),
         });
+        // `wait` calls `refresh` once per pass round the loop, so the
+        // count is this test's window into the loop: `refresh` runs,
+        // the check fails, the thread sleeps on the condvar (setting
+        // `slept`), and only then does `refresh` run again. Seeing the
+        // second call therefore means the waiter is genuinely parked
+        // and any later success must come back as `Waited`, not `Fast`.
+        // A plain sleep here instead raced: on a loaded host the main
+        // thread's `advance` could land before the spawned thread's
+        // first `refresh`, the first check then passed outright and the
+        // wait returned `Fast` without ever having waited (2 of 200
+        // runs at host load ~30).
+        let passes = std::sync::Arc::new(AtomicU64::new(0));
         let s2 = s.clone();
+        let p2 = passes.clone();
         let t = std::thread::spawn(move || {
             s2.wait(
                 &[ReadKey::Ino(1)],
                 &Position::ZERO,
-                || (s2.applied().seq, false, false),
+                || {
+                    p2.fetch_add(1, Ordering::Release);
+                    (s2.applied().seq, false, false)
+                },
                 || false,
             )
         });
-        std::thread::sleep(Duration::from_millis(30));
+        let deadline = Instant::now() + BUDGET;
+        while passes.load(Ordering::Acquire) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the waiter never parked: {} refresh passes",
+                passes.load(Ordering::Acquire)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         s.advance(2, None);
         let r = t.join().unwrap();
-        assert!(
-            matches!(r, SessionWait::Waited(d) if d < Duration::from_millis(1_000)),
-            "{r:?}"
+        // `check` can only pass once `applied_seq` reaches the observed
+        // seq 2 (nothing covers the key: `covering` is empty), and only
+        // `advance` raises it — so `Waited` *is* "released by the
+        // advance". `TimedOut` would mean the advance never released it,
+        // and `Fast`/`Covered` that the waiter never parked, both of
+        // which the handshake and this assertion separate cleanly
+        // without any wall-clock bound: the old `Waited(d) if d <
+        // 1_000ms` form read a loaded host's scheduling delay as a
+        // failure (seen once at host load ~50) while adding nothing —
+        // the loop re-checks every 20 ms regardless of the notification,
+        // so no duration this test could assert distinguishes being
+        // woken by `advance` from polling just after it.
+        assert!(matches!(r, SessionWait::Waited(_)), "{r:?}");
+        let st = s.stats();
+        assert_eq!(
+            (st.waited, st.timeouts, st.abandoned),
+            (1, 0, 0),
+            "released by something other than the advance: {st:?}"
         );
     }
 

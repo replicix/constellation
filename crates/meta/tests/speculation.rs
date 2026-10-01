@@ -20,6 +20,20 @@ use constellation_types::Code;
 
 const HOLDER: u64 = 7;
 
+/// How far above `now_ns()` a test's record stamps sit, so that they are
+/// above the root inode's creation time on *every* replica a test opens,
+/// whenever it happens to open it. Parent times merge by `max` (plan 30
+/// §M12) and the root's creation stamp is part of the `ns` bytes two
+/// replicas get compared on, so a margin has to beat the wall-clock gap
+/// between the first and the last `Meta::open_in_memory()` in the test —
+/// on a loaded host too. At the previous 1 s,
+/// `a_hint_whose_refusal_was_streamed_first_is_not_installed` opened its
+/// second replica 1.199 s after its first, that replica's root kept its
+/// own (now later) creation stamp instead of the rename's, and the
+/// comparison reported a convergence failure although both routes had
+/// applied exactly the same records (1 run in 40 at host load ~50).
+const STAMP_MARGIN_NS: i64 = 3_600_000_000_000;
+
 fn rid(seq: u64) -> Rid {
     Rid {
         node: 2,
@@ -153,7 +167,7 @@ fn stranding_rolls_back_a_shadow_under_a_foreign_segment_touching_the_same_paren
     // Plan 30 §M12: a parent's times merge by `max`, so the stamps must
     // be above the root directory's own (its creation, the wall clock)
     // for the two stores to end byte-identical.
-    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
     let seg1 = vec![create("other", ino(2), t0 + 20)];
     let seg2 = vec![chmod(ino(2), 0o600, t0 + 30)];
 
@@ -292,7 +306,7 @@ fn a_hint_whose_refusal_was_streamed_first_is_not_installed() {
     };
     // (Stamps above the root's own creation time: parent times merge by
     // `max`, plan 30 §M12.)
-    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
     let seg1 = [create("f2", a, t0 + 10), create("f3", b, t0 + 11)];
     let refused = LogRecord::Refused {
         rid: requester,
@@ -1096,7 +1110,7 @@ fn a_streamed_transaction_goes_under_a_shadow_whose_reply_overtook_it() {
         incarnation: 1,
         seq: 1,
     };
-    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
     let seg1 = [create("wf", a, t0)];
     let theirs = [chmod(a, 0o600, t0 + 1), completed(other)];
     let ours = [chmod(a, 0o640, t0 + 2), completed(mine)];
@@ -1296,7 +1310,7 @@ fn a_root_appending_a_delegates_git_object_keeps_the_object() {
 #[test]
 fn a_streamed_manifest_held_back_by_its_chunk_stays_speculation_until_it_ships() {
     let (f, g) = (ino(70), ino(71));
-    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
     let seg1 = [create("f", f, t0), create("g", g, t0 + 1)];
     let r_manifest = Rid {
         node: 3,
@@ -1391,7 +1405,7 @@ fn a_streamed_manifest_held_back_by_its_chunk_stays_speculation_until_it_ships()
 #[test]
 fn a_streamed_transaction_the_tenure_ships_past_is_rolled_back() {
     let (f, g) = (ino(72), ino(73));
-    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
     let seg1 = [create("f", f, t0), create("g", g, t0 + 1)];
     let rid = |node: u64| Rid {
         node,
@@ -1470,7 +1484,7 @@ fn a_streamed_transaction_the_tenure_ships_past_is_rolled_back() {
 #[test]
 fn a_streamed_transaction_installed_twice_is_installed_once() {
     let (f2, f3) = (ino(80), ino(81));
-    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
     let meta = Meta::open_in_memory().unwrap();
     apply(&meta, 1, 1, &[create("f2", f2, t0)]);
     let rename = [
@@ -1509,7 +1523,7 @@ fn a_streamed_transaction_installed_twice_is_installed_once() {
 #[test]
 fn a_refused_rid_in_the_log_rolls_its_shadow_back_without_a_replay() {
     let meta = Meta::open_in_memory().unwrap();
-    let t0 = constellation_fs_core::types::now_ns() + 1_000_000_000;
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
     apply(&meta, 1, 1, &[create("a", ino(90), t0)]);
     let r = rid(31);
     let records = [create("b", ino(91), t0 + 1), completed(r)];
