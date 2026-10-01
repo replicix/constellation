@@ -882,7 +882,7 @@ impl Vfs for View {
                     ..
                 }
             ) {
-                r.done(Ok(Opened { fh: Fh(ino) }));
+                r.done(Ok(Opened::new(Fh(ino))));
             } else {
                 r.done(err(Code::IsDir));
             }
@@ -898,9 +898,17 @@ impl Vfs for View {
             }
         });
         match attr {
-            Ok(Some(_)) => {
+            Ok(Some(attr)) => {
                 *self.opens.lock().unwrap().entry(ino).or_insert(0) += 1;
-                r.done(Ok(Opened { fh: Fh(ino) }))
+                // Plan 38 §3(c): a read-only open of a one-chunk file
+                // whose chunk is cached and verified is answered with the
+                // chunk file itself, and the pin that keeps it where the
+                // handle expects it is dropped in `release`.
+                let backing = self.passthrough_backing(ino, flags, &attr);
+                r.done(Ok(Opened {
+                    fh: Fh(ino),
+                    backing,
+                }))
             }
             Ok(None) => r.done(err(Code::NotFound)),
             Err(e) => r.done(err(e.code())),
@@ -931,7 +939,7 @@ impl Vfs for View {
         match result {
             Ok((attr, _created)) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
-                r.done(Ok((self.entry_out(&attr), Opened { fh: Fh(attr.ino) })))
+                r.done(Ok((self.entry_out(&attr), Opened::new(Fh(attr.ino)))))
             }
             Err(e) => r.done(err(e)),
         }
@@ -1105,21 +1113,27 @@ impl Vfs for View {
         if let (Some(l), true) = (locks, idle) {
             l.idle(ino);
         }
-        let last = {
+        let (last, still_open) = {
             let mut opens = self.opens.lock().unwrap();
             match opens.get_mut(&ino) {
                 Some(n) => {
                     *n = n.saturating_sub(1);
                     let last = *n == 0;
+                    let still_open = *n;
                     if last {
                         opens.remove(&ino);
                         self.prefetch.forget(ino);
                     }
-                    last
+                    (last, still_open)
                 }
-                None => false,
+                None => (false, 0),
             }
         };
+        // The chunk file this handle was opened on, if it got one, and the
+        // disk cache's pin on it (plan 38 §3(c)). `release` does not name
+        // which handle closed, so what is dropped is whatever the inode
+        // holds beyond the handles still open on it.
+        self.drop_passthrough(ino, still_open);
         // Orphan reap on last close (unlink-while-open, DESIGN.md §3),
         // with the write session a flush kept for the descriptors
         // (`flush_inode`: an unlinked file publishes nothing).

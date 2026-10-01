@@ -24,6 +24,19 @@
 //! - **`reached`**: a confined view's cache of inodes known inside it,
 //!   so an inode it handed out and that was since renamed out of the
 //!   subtree stays addressable by handle exactly as before.
+//!
+//! What does *not* cross yet, and must: a passthrough open's backing
+//! chunk (`passthrough.rs`, plan 38 §3(c)). The pin and the descriptor
+//! are this process's, so `close_view_for_handover` drops them — harmless
+//! while no frontend consumes `Opened::backing`
+//! (`FrontendCaps::passthrough` is false everywhere until plan 38 Z3b),
+//! because the resumed view's reads come back to the daemon. Once a
+//! backing id is registered with a kernel, the kernel keeps serving a
+//! handed-over descriptor from the old process's chunk file while the
+//! resumed view holds no pin on it — an evictable chunk under a live
+//! backing. Z3b therefore adds the per-inode chunk hashes
+//! (`View::passthrough_hashes`) to [`HandleTableSnapshot`] and re-pins
+//! and reopens them in [`View::import_handles`].
 
 use super::*;
 use serde::{Deserialize, Serialize};

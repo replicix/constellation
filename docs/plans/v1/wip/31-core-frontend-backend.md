@@ -728,6 +728,11 @@ pub struct FrontendCaps {
     pub abortable: bool,                 // a kernel/driver-level forced-unmount hook exists
                                           // (Linux FUSE: /sys/fs/fuse/connections abort; the
                                           // harness derives Cap::FuseAbort from this field)
+    pub passthrough: bool,               // the frontend reads a handle's data straight from a
+                                          // backing file the engine hands it (Opened::backing,
+                                          // plan 38 §3(c)); false everywhere until plan 38 Z3b
+                                          // wires Linux FUSE's FOPEN_PASSTHROUGH reply, and the
+                                          // engine offers none to a frontend that would drop it
 }
 ```
 

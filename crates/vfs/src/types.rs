@@ -14,6 +14,7 @@ use constellation_types::{Code, Rdev};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// An inode number, in the numbering the view shows its frontend (the
@@ -108,10 +109,62 @@ pub struct SetAttr {
 }
 
 /// An `open`/`create`'s answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
     pub fh: Fh,
+    /// The chunk file this open may be served from directly, when the
+    /// engine found the whole file to be one cached, verified chunk
+    /// (plan 38 §3(c)). `None` — always, for every frontend but Linux
+    /// FUSE, and for most opens even there — means "answer this handle's
+    /// reads the ordinary way", which is what every frontend that does
+    /// not know about [`PassthroughChunk`] does by simply dropping it.
+    pub backing: Option<PassthroughChunk>,
 }
+
+impl Opened {
+    /// A handle answered the ordinary way (no backing file).
+    pub fn new(fh: Fh) -> Self {
+        Self { fh, backing: None }
+    }
+}
+
+/// The one chunk file a passthrough-eligible open is allowed to be read
+/// from directly (plan 38 §3(c)): the whole of the file's committed
+/// content is this chunk, it is resident in the local disk cache, and
+/// this process has verified it.
+///
+/// `fd` is that file, opened read-only by the engine — handed over open
+/// so the frontend needs no second `open(2)` and cannot be given a path
+/// that was unlinked in between. It is a [`std::fs::File`] rather than a
+/// `std::os::fd::OwnedFd` because this crate stays portable (`std::os::fd`
+/// does not exist on Windows, where `constellation-vfs` still
+/// type-checks — `tools/check-cross-known-failures.txt`); on Unix `&File`
+/// is exactly the `impl AsFd` a FUSE frontend hands to `fuser`'s
+/// `open_backing`. It is shared ([`Arc`]) because the engine keeps the
+/// same open file description alive next to the disk-cache pin that keeps
+/// the chunk from being evicted, for as long as the handle lives.
+#[derive(Debug, Clone)]
+pub struct PassthroughChunk {
+    pub fd: Arc<std::fs::File>,
+    /// The chunk file's length, which is the file's whole committed length.
+    pub len: u64,
+    /// The chunk's content hash (`constellation_fs_core::ChunkHash`'s
+    /// bytes), carried for diagnostics and for the frontend's own
+    /// per-backing bookkeeping.
+    pub hash: [u8; 32],
+}
+
+/// Two backings are the same backing when they are the same open file
+/// description for the same chunk. `std::fs::File` has no equality of its
+/// own, and comparing descriptor numbers would call a reopened file equal
+/// to the one it replaced.
+impl PartialEq for PassthroughChunk {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.fd, &other.fd) && self.len == other.len && self.hash == other.hash
+    }
+}
+
+impl Eq for PassthroughChunk {}
 
 /// The frontend's identity for an opener (NFSv4's open-owner). FUSE has
 /// none ([`OpenOwner::NONE`]).

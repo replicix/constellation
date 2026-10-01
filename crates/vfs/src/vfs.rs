@@ -113,6 +113,12 @@ pub trait Vfs: Send + Sync + 'static {
         r: R,
     );
 
+    /// Open an existing inode.
+    ///
+    /// The answer may carry a backing file ([`Opened::backing`]) the
+    /// frontend's kernel is allowed to read this handle's data from
+    /// directly; a frontend that cannot do that ignores it. It is decided
+    /// once, here, and lives until this handle's [`Vfs::release`].
     fn open<R: Responder<Opened>>(
         &self,
         cx: &OpCtx<'_>,
@@ -166,7 +172,8 @@ pub trait Vfs: Send + Sync + 'static {
     /// plan 30 `cto=strict`), per `close(2)`; drops `owner`'s locks.
     fn flush<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, owner: LockOwner, r: R);
 
-    /// The last close of a handle (`owner`: its `flock` owner).
+    /// The last close of a handle (`owner`: its `flock` owner). Ends the
+    /// lifetime of whatever [`Opened::backing`] the open handed out.
     #[allow(clippy::too_many_arguments)]
     fn release<R: Responder<()>>(
         &self,

@@ -17,6 +17,9 @@ pub enum CoreError {
     #[error("cache budget exhausted: need {needed} bytes, {available} available")]
     CacheFull { needed: u64, available: u64 },
 
+    #[error("chunk {0} is not in the local cache")]
+    NotCached(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

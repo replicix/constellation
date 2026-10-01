@@ -1721,6 +1721,10 @@ impl Engine {
     /// closed. Returns whether it was the last open view. Idempotent.
     pub fn close_view(&self, view: &View) -> bool {
         let id = view.id();
+        // No `release` will arrive for whatever this frontend had open,
+        // so the passthrough handles' pins go now rather than whenever
+        // the last `Arc<View>` happens to die (plan 38 §3(c)).
+        view.drop_all_passthrough();
         if let Some(k) = &self.kernel_inval {
             k.unregister(id);
         }
@@ -1747,6 +1751,10 @@ impl Engine {
     /// application still has open).
     pub fn close_view_for_handover(&self, view: &View) {
         let id = view.id();
+        // As `close_view`: the descriptors and the pins are this
+        // process's, and `import_handles` has nothing to rebuild them
+        // from — the resumed view's own opens do that.
+        view.drop_all_passthrough();
         if let Some(k) = &self.kernel_inval {
             k.unregister(id);
         }

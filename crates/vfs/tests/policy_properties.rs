@@ -30,13 +30,13 @@ fn any_caps() -> impl Strategy<Value = FrontendCaps> {
             any::<bool>(),
             0..2usize,
         ),
-        (any::<u32>(), 0..3usize, any::<bool>()),
+        (any::<u32>(), 0..3usize, any::<bool>(), any::<bool>()),
     )
         .prop_map(
             |(
                 (push, flush, locks, xattrs, virt),
                 (links, fallocate, seek, special, case),
-                (max_io, unlinked, abortable),
+                (max_io, unlinked, abortable, passthrough),
             )| {
                 FrontendCaps {
                     push_inval: [PushInval::None, PushInval::Attr, PushInval::Full][push],
@@ -61,6 +61,7 @@ fn any_caps() -> impl Strategy<Value = FrontendCaps> {
                         OpenUnlinked::DeleteOnClose,
                     ][unlinked],
                     abortable,
+                    passthrough,
                 }
             },
         )

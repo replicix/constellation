@@ -1371,9 +1371,7 @@ impl RefView {
                 }
                 // A frozen file is read through a handle of its own: the
                 // synthetic inode has no live node to count opens on.
-                Ok(Opened {
-                    fh: self.alloc_handle(st, ino),
-                })
+                Ok(Opened::new(self.alloc_handle(st, ino)))
             }
             Target::Real(real) => {
                 if st.node(real)?.is_dir() {
@@ -1382,9 +1380,7 @@ impl RefView {
                 if flags.contains(OpenFlags::TRUNC) && flags.contains(OpenFlags::WRITE) {
                     self.truncate_open(st, changes, real);
                 }
-                Ok(Opened {
-                    fh: self.alloc_handle(st, real),
-                })
+                Ok(Opened::new(self.alloc_handle(st, real)))
             }
         })
     }
@@ -1440,7 +1436,7 @@ impl RefView {
                 }
             };
             let fh = self.alloc_handle(st, ino);
-            Ok((self.entry_of(st, ino), Opened { fh }))
+            Ok((self.entry_of(st, ino), Opened::new(fh)))
         })
     }
 

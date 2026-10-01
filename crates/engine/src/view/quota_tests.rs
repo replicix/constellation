@@ -16,13 +16,30 @@ fn ship_all(meta: &Meta, segment: u64) {
 }
 
 pub(super) fn test_fs(meta: Arc<Meta>) -> (View, TempDir) {
+    let (fs, dir, _cache) = test_fs_with(meta, DEFAULT_CHUNK_SIZE, |root| {
+        DiskCache::open(root, 1 << 30).unwrap()
+    });
+    (fs, dir)
+}
+
+/// [`test_fs`], with the chunk size and the disk cache under the caller's
+/// control — `open_cache` is handed the cache root before anything opens
+/// it, so a test can seed chunk files there and have the rescan find them
+/// — and that cache handed back. The passthrough tests need all three.
+pub(super) fn test_fs_with(
+    meta: Arc<Meta>,
+    chunk_size: u32,
+    open_cache: impl FnOnce(&std::path::Path) -> DiskCache,
+) -> (View, TempDir, Arc<DiskCache>) {
     let dir = TempDir::new().unwrap();
-    let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 1 << 30).unwrap());
+    let cache_root = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_root).unwrap();
+    let cache = Arc::new(open_cache(&cache_root));
     let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
     let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
         meta.clone(),
         store.clone(),
-        DEFAULT_CHUNK_SIZE,
+        chunk_size,
         1,
     ));
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -35,7 +52,7 @@ pub(super) fn test_fs(meta: Arc<Meta>) -> (View, TempDir) {
         FsDependencies {
             meta,
             store,
-            cache,
+            cache: cache.clone(),
             rt: handle,
             sync: None,
             coop: None,
@@ -53,11 +70,11 @@ pub(super) fn test_fs(meta: Arc<Meta>) -> (View, TempDir) {
             caps: FrontendCaps::linux_fuse(false),
             host: constellation_platform::HostServices::native(),
         },
-        DEFAULT_CHUNK_SIZE,
+        chunk_size,
         CompressionSetting::RAW,
     );
     std::mem::forget(rt);
-    (fs, dir)
+    (fs, dir, cache)
 }
 
 /// A second view of the same node has the inode open: `unlink`'s

@@ -840,6 +840,7 @@ mod tests {
             deferrable: OpKindSet::EMPTY,
             open_unlinked: OpenUnlinked::SillyRename,
             abortable: false,
+            passthrough: false,
         }
     }
 

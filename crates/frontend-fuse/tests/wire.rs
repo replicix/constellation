@@ -683,11 +683,8 @@ fn rename_carries_its_flags_decoded() {
 #[test]
 fn open_and_create_decode_the_flag_word() {
     let (mut k, mock) = plain();
-    mock.always_open(Script::ok(Opened { fh: Fh(77) }));
-    mock.always_create(Script::ok((
-        entry(50, FileKind::File),
-        Opened { fh: Fh(78) },
-    )));
+    mock.always_open(Script::ok(Opened::new(Fh(77))));
+    mock.always_create(Script::ok((entry(50, FileKind::File), Opened::new(Fh(78)))));
     let r = k.call(
         op::OPEN,
         50,

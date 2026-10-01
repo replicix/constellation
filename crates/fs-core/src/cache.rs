@@ -1,6 +1,14 @@
 //! Local disk chunk cache: LRU over clean chunks, pinned/dirty never
 //! evicted, reserve-before-accept ENOSPC discipline (DESIGN.md §7, §9).
 //!
+//! A clean chunk is also un-evictable while somebody holds its *file*
+//! open ([`DiskCache::pin_open`], plan 38 §3(c)): an in-memory
+//! open-refcount, not a [`ChunkState`], since it is a function of the
+//! descriptors that exist right now and nothing a restart should carry.
+//! It is the eviction paths it binds — explicit removal
+//! ([`DiskCache::remove`]) ignores it exactly as it ignores
+//! `Pinned`/`Dirty`.
+//!
 //! Chunks are stored decompressed at `<root>/<aa>/<bb>/<hex>` (first two
 //! hex byte pairs), written temp-name + atomic rename. Accounting is in
 //! memory and rebuilt by a directory scan at startup; a read that cannot
@@ -119,6 +127,14 @@ impl std::fmt::Display for CacheVerify {
 #[derive(Debug)]
 struct State {
     entries: HashMap<ChunkHash, Entry>,
+    /// Chunks whose file someone currently holds open, and how many
+    /// holders ([`DiskCache::pin_open`]). Never persisted: a crash drops
+    /// every open file descriptor with the process. Kept beside
+    /// `entries` rather than as a third [`ChunkState`] because the two
+    /// lifetimes are different things — a `Pinned` entry is an operator
+    /// decision that survives restarts, this is "the kernel has a
+    /// backing fd on it right now" (plan 38 §3(c)).
+    open_pins: HashMap<ChunkHash, u32>,
     used: u64,
     clock: u64,
     digest: DigestLog,
@@ -210,6 +226,7 @@ impl State {
     fn new(digest_limit: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            open_pins: HashMap::new(),
             used: 0,
             clock: 0,
             digest: DigestLog::default(),
@@ -301,6 +318,64 @@ pub struct CacheUsage {
     pub budget: u64,
     pub entries: usize,
     pub pinned: u64,
+}
+
+/// What [`DiskCache::resident`] knows about a cached chunk, for a caller
+/// deciding whether it may hand the chunk *file* to someone else to read
+/// instead of serving the bytes itself (plan 38 §3(c)'s passthrough
+/// eligibility rule, which the engine owns: this is only the facts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resident {
+    /// The chunk file's length on disk, as the accounting has it.
+    pub len: u64,
+    pub state: ChunkState,
+    /// This process hashed these bytes (the `verified` bit, plan 38
+    /// §2.3). A caller that lets someone else read the file without the
+    /// daemon seeing the bytes must refuse an unverified entry: nobody
+    /// here has checked the copy a restart's directory scan found.
+    pub verified: bool,
+}
+
+/// A chunk file held open by someone outside the cache: while this guard
+/// lives, eviction never chooses `hash` — exactly as it never chooses a
+/// `Pinned` or `Dirty` entry (plan 38 §3(c)'s "pin while open").
+///
+/// Dropping it releases the pin, so the chunk becomes evictable again the
+/// instant the last holder goes away; nothing about it is persisted,
+/// because a crash drops every open descriptor anyway. It holds an
+/// [`Arc`] of its cache, so a pin outliving the rest of the engine's
+/// references cannot leave a dangling count.
+pub struct OpenPin {
+    cache: Arc<DiskCache>,
+    hash: ChunkHash,
+}
+
+impl OpenPin {
+    pub fn hash(&self) -> ChunkHash {
+        self.hash
+    }
+}
+
+impl std::fmt::Debug for OpenPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenPin")
+            .field("hash", &self.hash.to_hex())
+            .finish()
+    }
+}
+
+impl Drop for OpenPin {
+    fn drop(&mut self) {
+        let mut st = self.cache.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let std::collections::hash_map::Entry::Occupied(mut slot) = st.open_pins.entry(self.hash)
+        {
+            if *slot.get() <= 1 {
+                slot.remove();
+            } else {
+                *slot.get_mut() -= 1;
+            }
+        }
+    }
 }
 
 /// Result of [`DiskCache::prune_to`].
@@ -554,6 +629,66 @@ impl DiskCache {
             .entries
             .get(hash)
             .map(|e| e.state)
+    }
+
+    /// [`Resident`] facts about `hash`'s disk entry; `None`: not resident.
+    pub fn resident(&self, hash: &ChunkHash) -> Option<Resident> {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(hash)
+            .map(|e| Resident {
+                len: e.size,
+                state: e.state,
+                verified: e.verified,
+            })
+    }
+
+    /// Where `hash`'s chunk file is, so a caller that was granted an
+    /// [`OpenPin`] can open it. Take the pin *first*: a pinned entry is
+    /// never evicted, so the path cannot be unlinked between the two
+    /// (the other order races with a prune).
+    pub fn chunk_path(&self, hash: &ChunkHash) -> PathBuf {
+        self.path_for(hash)
+    }
+
+    /// Hold `hash`'s chunk file against eviction for as long as the
+    /// returned [`OpenPin`] lives (plan 38 §3(c)).
+    ///
+    /// `CoreError::NotCached` if the chunk is not resident — there is
+    /// nothing to hand out, and the caller falls back to serving the
+    /// bytes itself. The pin counts holders, so concurrent opens of the
+    /// same chunk each take their own and the last one to drop releases
+    /// it. Bumps the LRU position, because a passthrough open *is* a read
+    /// of the whole chunk that the cache will never see again: without
+    /// this the chunk would look untouched since before it was opened and
+    /// be the first victim the moment the last handle closed.
+    pub fn pin_open(self: &Arc<Self>, hash: &ChunkHash) -> Result<OpenPin, CoreError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.entries.contains_key(hash) {
+            return Err(CoreError::NotCached(hash.to_hex()));
+        }
+        st.clock += 1;
+        let clock = st.clock;
+        st.entries.get_mut(hash).unwrap().atime = clock;
+        *st.open_pins.entry(*hash).or_insert(0) += 1;
+        drop(st);
+        Ok(OpenPin {
+            cache: Arc::clone(self),
+            hash: *hash,
+        })
+    }
+
+    /// How many [`OpenPin`]s `hash` currently has (tests, diagnostics).
+    pub fn open_pin_count(&self, hash: &ChunkHash) -> u32 {
+        self.state
+            .lock()
+            .unwrap()
+            .open_pins
+            .get(hash)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Read a chunk, bumping its LRU position. Verifies the hash; corrupt
@@ -920,6 +1055,13 @@ impl DiskCache {
     }
 
     /// Remove a chunk from cache and disk (and memory).
+    ///
+    /// Unconditional: `Pinned`, `Dirty` and open-pinned
+    /// ([`Self::pin_open`]) entries go too. This is the caller saying
+    /// "this chunk must not be here" (a corrupt copy, the conformance
+    /// kit's `evict` hook), not eviction choosing a victim — the
+    /// non-evictable states are only about the latter. A holder's open
+    /// descriptor keeps reading the unlinked file, as any open file does.
     pub fn remove(&self, hash: &ChunkHash) -> Result<(), CoreError> {
         let mut dropped = Vec::new();
         let mut st = self.state.lock().unwrap();
@@ -1094,11 +1236,18 @@ fn merge_state(old: ChunkState, new: ChunkState) -> ChunkState {
 /// served from memory and so never bump its disk `atime`, and it is by
 /// construction among the most recently read (the memory budget is a
 /// small fraction of the disk's).
+///
+/// A chunk whose file someone holds open ([`DiskCache::pin_open`]) is not
+/// a candidate at all, exactly as a `Pinned` or `Dirty` one is not: this
+/// is the one filter every eviction path shares ([`DiskCache::prune_to`]
+/// and [`plan_eviction`] both select through it), so "pin while open"
+/// (plan 38 §3(c)) is enforced in one place and the cache's `used`
+/// accounting keeps covering every byte that is still on disk.
 fn clean_by_recency(st: &State, memory: Option<&MemCache>) -> Vec<(ChunkHash, u64, u64)> {
     let mut clean: Vec<(ChunkHash, u64, u64, bool)> = st
         .entries
         .iter()
-        .filter(|(_, e)| e.state == ChunkState::Clean)
+        .filter(|(h, e)| e.state == ChunkState::Clean && !st.open_pins.contains_key(*h))
         .map(|(h, e)| (*h, e.size, e.atime, memory.is_some_and(|m| m.contains(h))))
         .collect();
     clean.sort_by_key(|(_, _, atime, resident)| (*resident, *atime));
@@ -1793,6 +1942,20 @@ mod tests {
                                 let _ = c.insert(&h, &d, ChunkState::Clean);
                                 c.admit_verified(&h, Bytes::from(d.clone()));
                             }
+                            5 => {
+                                // A passthrough open's shape (plan 38
+                                // §3(c)): pin, read through the pin,
+                                // release. The pin only ever makes a
+                                // chunk *less* evictable, so the memory
+                                // subset invariant must still hold with
+                                // pins coming and going under the prunes.
+                                if let Ok(pin) = c.pin_open(&h) {
+                                    if let Some(got) = c.get_shared(&h).unwrap() {
+                                        assert_eq!(got, d);
+                                    }
+                                    drop(pin);
+                                }
+                            }
                             _ => {
                                 if let Some(got) = c.get_shared(&h).unwrap() {
                                     assert_eq!(got, d);
@@ -1821,6 +1984,115 @@ mod tests {
             }
         }
         assert_eq!(resident, stats.entries);
+    }
+
+    // ---- pin while open (`pin_open`; plan 38 §3(c)) ----
+
+    /// A chunk whose file someone holds open is not an eviction
+    /// candidate, by either path that picks victims — and is one again
+    /// the instant the guard drops.
+    #[test]
+    fn an_open_pinned_chunk_is_not_evicted_until_its_guard_drops() {
+        let dir = TempDir::new().unwrap();
+        let c = Arc::new(DiskCache::open(dir.path(), 250).unwrap());
+        let (h1, d1) = chunk(1, 100);
+        let (h2, d2) = chunk(2, 100);
+        c.insert(&h1, &d1, ChunkState::Clean).unwrap();
+        c.insert(&h2, &d2, ChunkState::Clean).unwrap();
+        let pin = c.pin_open(&h1).unwrap();
+
+        // `prune_to`: everything clean and unpinned goes, the pinned one
+        // stays, and `used` still accounts for its bytes (which are still
+        // on the disk — the point of pinning instead of unlinking under
+        // the holder).
+        let report = c.prune_to(0).unwrap();
+        assert_eq!((report.freed_chunks, report.freed_bytes), (1, 100));
+        assert!(c.contains(&h1) && !c.contains(&h2));
+        assert_eq!(c.usage().used, 100);
+        assert!(file_of(&dir, &h1).exists());
+
+        // `plan_eviction`: an insert that needs the room cannot take it,
+        // and fails whole rather than evicting the pinned chunk — exactly
+        // what a `Pinned`/`Dirty` entry does (`pinned_and_dirty_not_evicted`).
+        let (h3, d3) = chunk(3, 200);
+        let err = c.insert(&h3, &d3, ChunkState::Clean).unwrap_err();
+        assert!(matches!(err, CoreError::CacheFull { .. }));
+        assert!(c.contains(&h1) && !c.contains(&h3));
+
+        // The last holder closes: evictable again, by both paths.
+        drop(pin);
+        assert_eq!(c.open_pin_count(&h1), 0);
+        c.insert(&h3, &d3, ChunkState::Clean).unwrap();
+        assert!(!c.contains(&h1), "h1 should have made room for h3");
+        assert!(!file_of(&dir, &h1).exists());
+    }
+
+    /// The count is the number of concurrent holders, and reaches zero
+    /// only when the last one goes.
+    #[test]
+    fn open_pins_count_their_holders() {
+        let dir = TempDir::new().unwrap();
+        let c = Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap());
+        let (h, d) = chunk(1, 4096);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert_eq!(c.open_pin_count(&h), 0);
+        let a = c.pin_open(&h).unwrap();
+        let b = c.pin_open(&h).unwrap();
+        assert_eq!(c.open_pin_count(&h), 2);
+        assert_eq!(a.hash(), h);
+        drop(a);
+        assert_eq!(c.open_pin_count(&h), 1);
+        // Still held: a prune leaves it alone.
+        c.prune_to(0).unwrap();
+        assert!(c.contains(&h));
+        drop(b);
+        assert_eq!(c.open_pin_count(&h), 0);
+        c.prune_to(0).unwrap();
+        assert!(!c.contains(&h));
+    }
+
+    /// Nothing to hand out: the caller (plan 38 §3(c)'s `View::open`)
+    /// falls back to serving the reads itself.
+    #[test]
+    fn pinning_a_chunk_that_is_not_cached_fails() {
+        let dir = TempDir::new().unwrap();
+        let c = Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap());
+        let (h, _) = chunk(7, 4096);
+        assert!(matches!(
+            c.pin_open(&h),
+            Err(CoreError::NotCached(hex)) if hex == h.to_hex()
+        ));
+        assert_eq!(c.open_pin_count(&h), 0);
+        // And a pin taken, then dropped, leaves no entry behind in the
+        // table either (a leaked count would make the chunk immortal).
+        let (h2, d2) = chunk(8, 4096);
+        c.insert(&h2, &d2, ChunkState::Clean).unwrap();
+        drop(c.pin_open(&h2).unwrap());
+        assert_eq!(c.open_pin_count(&h2), 0);
+    }
+
+    /// A pin names a chunk the caller is about to open by path, so
+    /// `chunk_path` must be where the bytes are, and the entry's
+    /// [`Resident`] facts must describe that file.
+    #[test]
+    fn a_pinned_chunks_path_and_resident_facts_describe_its_file() {
+        let dir = TempDir::new().unwrap();
+        let c = Arc::new(DiskCache::open(dir.path(), 1 << 20).unwrap());
+        let (h, d) = chunk(4, 4096);
+        assert_eq!(c.resident(&h), None);
+        c.insert(&h, &d, ChunkState::Dirty).unwrap();
+        let _pin = c.pin_open(&h).unwrap();
+        assert_eq!(
+            c.resident(&h),
+            Some(Resident {
+                len: 4096,
+                state: ChunkState::Dirty,
+                // `insert` hashed what it was handed (plan 38 §2.3).
+                verified: true,
+            })
+        );
+        assert_eq!(c.chunk_path(&h), file_of(&dir, &h));
+        assert_eq!(fs::read(c.chunk_path(&h)).unwrap(), d);
     }
 
     // ---- verify-once (`CacheVerify`, `admit_verified`; plan 38 §2.3) ----

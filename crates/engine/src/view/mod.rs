@@ -104,6 +104,7 @@ mod handoff;
 mod io;
 mod lock_gate;
 pub mod ops;
+mod passthrough;
 mod shards;
 mod spec;
 mod synthetic;
@@ -120,6 +121,8 @@ mod durable_ack_tests;
 #[cfg(test)]
 mod memcache_tests;
 #[cfg(test)]
+mod passthrough_tests;
+#[cfg(test)]
 mod pending_row_tests;
 #[cfg(test)]
 mod qos_tests;
@@ -128,6 +131,7 @@ mod quota_tests;
 #[cfg(test)]
 mod vfs_tests;
 
+use passthrough::PassthroughHandle;
 use shards::*;
 use synthetic::*;
 use write_gate::*;
@@ -138,7 +142,7 @@ use crate::staging::{GenCounter, Staging, StagingBudget};
 use crate::sync::SyncRequest;
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use constellation_fs_core::cache::{ChunkState, DiskCache};
+use constellation_fs_core::cache::{CacheVerify, ChunkState, DiskCache, OpenPin};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
 use constellation_fs_core::{ChunkHash, FileAttr, Ino, InodeKind, INLINE_CHUNKS_MAX};
 use constellation_meta::{Meta, MetaError, MetaStore, ReadKey};
@@ -146,7 +150,7 @@ use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, Caller, Durability, Entry, FallocateMode, FileKind, FrontendCaps, OpWatch, OpenFlags,
-    PolicyStack, ReadData, SeekWhence,
+    PassthroughChunk, PolicyStack, ReadData, SeekWhence,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
@@ -311,6 +315,12 @@ pub struct View {
     inode_ops: InodeOps,
     /// Open handle counts per inode, for orphan reaping on last close.
     opens: Mutex<HashMap<Ino, u32>>,
+    /// What each passthrough open holds until its `release`
+    /// ([`PassthroughHandle`]), per inode. Keyed by inode and not by
+    /// handle because a view's handle *is* its inode (`open` answers
+    /// `Fh(ino)`, §6.12), so several concurrent passthrough opens of one
+    /// file are several entries in one vector.
+    passthrough: Mutex<HashMap<Ino, Vec<PassthroughHandle>>>,
     /// Sequential readahead.
     pub(crate) prefetch: crate::prefetch::Prefetcher,
     /// Cross-file readahead for ordered directory walks.
@@ -399,6 +409,7 @@ impl View {
             writes: WriteShards::new(),
             inode_ops: InodeOps::new(),
             opens: Mutex::new(HashMap::new()),
+            passthrough: Mutex::new(HashMap::new()),
             prefetch,
             scan,
             coop: deps.coop,

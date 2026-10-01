@@ -367,11 +367,8 @@ pub(super) fn a_blocked_lock_completes_from_another_thread(env: &Env<'_>) -> Tes
     let mut waiters: Vec<_> = (2..=6u64)
         .map(|owner| {
             let o = must("open", c.open_rw(ino));
-            (
-                owner,
-                o,
-                c.lock_wait_async(ino, o.fh, lock(owner), None, None),
-            )
+            let wait = c.lock_wait_async(ino, o.fh, lock(owner), None, None);
+            (owner, o, wait)
         })
         .collect();
     assert!(

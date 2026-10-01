@@ -76,6 +76,15 @@ pub struct FrontendCaps {
     /// A forced-abort hook exists (Linux FUSE:
     /// `/sys/fs/fuse/connections/<n>/abort`; the harness's `FuseAbort`).
     pub abortable: bool,
+    /// The frontend can read a handle's data straight from a backing file
+    /// the engine hands it ([`crate::Opened::backing`], plan 38 §3(c)).
+    /// `false` — every frontend, until one demonstrably consumes it —
+    /// means the engine never offers one, so it never opens a chunk file
+    /// or holds it un-evictable for a reader that would ignore it. Linux
+    /// FUSE sets it once its adapter wires `FOPEN_PASSTHROUGH` (plan 38
+    /// Z3b); there is no [`Cap`] for it yet because nothing gates a test
+    /// or a scenario on it (as for `max_io` and `deferrable`).
+    pub passthrough: bool,
 }
 
 impl FrontendCaps {
@@ -105,6 +114,10 @@ impl FrontendCaps {
             deferrable: OpKindSet::ALL,
             open_unlinked: OpenUnlinked::Keep,
             abortable: true,
+            // Plan 38 Z3b wires the adapter's `FOPEN_PASSTHROUGH` reply
+            // and flips this where the kernel negotiates it; until then
+            // the adapter would drop a backing file it was handed.
+            passthrough: false,
         }
     }
 }
@@ -287,6 +300,10 @@ mod tests {
             assert_eq!(caps.case, CasePolicy::Sensitive);
             assert_eq!(caps.open_unlinked, OpenUnlinked::Keep);
             assert!(caps.abortable);
+            assert!(
+                !caps.passthrough,
+                "the adapter ignores Opened::backing until plan 38 Z3b"
+            );
             assert_eq!(caps.max_io, 16 << 20);
             for &kind in OpKind::ALL {
                 assert!(caps.deferrable.contains(kind), "{kind:?}");
