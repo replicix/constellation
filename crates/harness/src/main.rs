@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use constellation_harness::bench;
 use constellation_harness::caps;
 use constellation_harness::corpus;
+use constellation_harness::csi_meta_ladder;
 use constellation_harness::interop;
 use constellation_harness::metabench;
 use constellation_harness::results::{self, Outcome, RunResults, Shard};
@@ -156,6 +157,21 @@ enum Command {
         s3_backend: Option<S3Backend>,
         /// Emit each report as a JSON object on stdout (one per line),
         /// in addition to the human-readable summary on stderr.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plan 37 K0 Track B: `Controller.CreateVolume`'s metadata-op
+    /// sequence (`browse.mkdir` + 6x `browse.xattr{set}` + `quota.set`)
+    /// against one unsharded pool filesystem's control socket, at rising
+    /// concurrency and cumulative subtree count, plus a `node.ping`
+    /// control-overhead ladder on the same grid. Prints one JSON report
+    /// per data point.
+    CsiMetaLadder {
+        /// S3 backend (see `run --s3-backend`).
+        #[arg(long, value_enum)]
+        s3_backend: Option<S3Backend>,
+        /// Emit each report as a JSON object on stdout (one per line), in
+        /// addition to the human-readable summary on stderr.
         #[arg(long)]
         json: bool,
     },
@@ -341,6 +357,23 @@ fn main() -> Result<()> {
                     r.latency_ms, r.put_p50_ms, r.cas_create_p50_ms, r.get_p50_ms
                 );
             }
+            Ok(())
+        }
+        Command::CsiMetaLadder { s3_backend, json } => {
+            s3env::select_backend(s3_backend)?;
+            let results = csi_meta_ladder::run_all()?;
+            if json {
+                for r in &results.createvolume {
+                    println!("{}", serde_json::to_string(r)?);
+                }
+                for r in &results.ping {
+                    println!("{}", serde_json::to_string(r)?);
+                }
+                for r in &csi_meta_ladder::summarize(&results.createvolume) {
+                    println!("{}", serde_json::to_string(r)?);
+                }
+            }
+            csi_meta_ladder::print_summary(&results);
             Ok(())
         }
         Command::CorpusSnapshot { src, out, seed } => corpus::snapshot_cmd(src, out, seed),

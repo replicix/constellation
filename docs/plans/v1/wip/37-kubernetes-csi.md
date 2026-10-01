@@ -2141,12 +2141,12 @@ ran in a three-node `kind` v0.33.0 cluster. The artifacts:
 | Runners, full write-up, raw JSON | `bench/fuse-handover-probe/` (`README.md`, `RESULTS.md`, `run.sh`, `stage-volume.sh`, `results/`) |
 | The kind cluster config, as verified | `tests/csi/kind-config.yaml` |
 
-**Track B (question 6) is not in this table — it is 37-k0b's, and runs
-independently.** Its row is left for that session to fill:
+**Track B (question 6) ran 2026-10-01, independently of Track A, on the
+same host.**
 
 | # | Prediction | Observation | Consequence taken |
 |---|---|---|---|
-| **6** (Track B) | *(pool metadata-throughput ceiling — 37-k0b)* | *(to be filled by 37-k0b)* | *(to be filled by 37-k0b)* |
+| **6** (Track B) | A latency *knee* in the `CreateVolume` metadata-op sequence as concurrency/subtree count rise, dominated by the shared commit chain. | **Both a knee and, on top of it, a failure-rate cliff — and both are dominated by one traced call (`quota.set`'s existing full-tree durability barrier), not by the commit chain generally.** The knee: successful-sequence p99 at 10,000 subtrees rises super-linearly through the c=16…64 region — 22.3 ms at c=16 → **89.0 ms at c=32** (4.0× for a 2× concurrency step) → 171.1 ms at c=64 → **635.9 ms at c=256** — i.e. hundreds of milliseconds, not tens, so `CreateVolume`'s gRPC deadline must be sized against that. The cliff: in the same region most calls stop completing at all, failing with `journal not shipped: no lease` (a control RPC failure, not added latency). Error rate over 10,000 sequences per level, run 2 (the full grid in one command): c=1 **0%**, c=4 **0.02%**, c=8 **0.20%**, c=16 **0.41%**, c=32 **9.61%**, c=64 **71.7%**, c=256 **94.5%** — but the magnitude is host-dependent, not a property of the code: across four runs c=8 ranges 0.16-**12.6%** and c=64 ranges 51.6-91.4%, tracking host load (recorded per step). Failures are *cheap*: a failing `quota.set` returns in 20.4 ms p50 / 47.3 ms p99 at c=64. `node.ping` on the same grid runs at 56.6k-348k ops/s with p99 from 0.08 ms (c=1) to 2.6 ms (c=256), ruling out the control socket/dispatch path and the single-connection client shape. Traced to the code: every `CreateVolume` ends in `quota.set`, which calls `EngineControl::set_quota` → `self.snapshot_barrier("/")` (`crates/engine/src/control/service.rs:1082`) → a `Control::Barrier` round-waiter (`crates/authority/src/core/mod.rs:1864-1869`) that fails with this exact message if the node's *whole* journal backlog isn't zero by the end of that sync round (`crates/authority/src/core/jobs.rs:1999-2005`) — and the grid records `lease_held: true`/`lease_lost: false` on every step, so no lease was ever actually lost. `browse.mkdir`/`browse.xattr` never call a barrier (`crates/engine/src/control/browse.rs`); `failures_by_op` is `{quota: n}` on every failing step, with zero mkdir/xattr failures in 110,000 sequences. | **The guidance is a mechanism, not a safe number, and it is a concurrency bound rather than a PV-count bound.** No PV-count threshold exists (c=1 is clean at every pool size, including at the heaviest host load measured) and **no safe concurrency above 1 could be measured** — the per-call failure probability is the probability that the node's journal backlog reaches zero inside the round its `quota.set` waits on, which depends on host throughput as much as on concurrency. So **K2 must make `CreateVolume` tolerate this (retry the trailing `quota.set`, cheap at ~10-60 ms per failed call; map an exhausted retry to a retryable status) instead of relying on a documented concurrency cap**; sharding still buys throughput (~1.2-1.4k successful seq/s per pool) but does not raise the per-pool failure threshold. As a pre-K2 stopgap, keep in-flight `CreateVolume`s per unsharded pool in the single digits and still expect a fraction of a percent to fail. §"K0 Track B — pool metadata-throughput ceiling" below has the full tables, the four measurement caveats (including that the `quota.set` measured is today's filesystem-wide `{max_bytes}` RPC, not §5's subtree-scoped shape — K2 must re-measure when that exists), the attribution and the K2/K6 gap. |
 
 ### Track A
 
@@ -2157,6 +2157,223 @@ independently.** Its row is left for that session to fill:
 | **3** | Under 2 s for the fd-passing round trip (§8 step 6's target). | **Three orders of magnitude under it at the median, two at the worst handoff.** Over 40 back-to-back handoffs: round trip (detach request → descriptor in hand → `SCM_RIGHTS` to the next process → it is serving) **p50 0.82 ms, p90 1.16 ms, max 21.5 ms** — at n = 40 the p99 *is* the maximum, so it is reported as one. The `SCM_RIGHTS`-send-plus-reconstruction leg alone is p50 0.19 ms / max 0.32 ms, and the detach leg (which contains §8 step 2's drain and `Vfs::sync_view`) p50 0.62 ms / max 21.2 ms. First client op after the resume: p50 0.006 ms, max 109 ms. At 80 concurrent client threads: round trip p50 1.29 ms, p90 2.01 ms, max 12.3 ms. One handoff of the 40 is the entire tail (that one: detach 21.2 ms, first op 109 ms, longest client syscall in the window 239 ms); the other 39 are ≤ 1.4 ms round trip. The host carried an unrelated load average of 20-55 across 32 CPUs, which the probe cannot separate from a handoff cost. | §8's 2 s target stands with enormous headroom even at the measured maximum, so **K5's timing budget is dominated by step 2's drain (data-dependent) and by pod scheduling, not by the transfer**. K5 gates the end-to-end `node.handoff` p99, not this leg, and sets it against the maximum rather than the median — a loaded node's tail is tens of milliseconds, not sub-millisecond. Note the probe pre-starts the next server before the clock, as a new engine pod would already be running; a cold pod start is a Kubernetes cost K5 measures separately. |
 | **4** | The kernel queues in-flight and new requests while nobody reads; bounded queue depth might make callers block, which is why step 2's drain has a timeout. The open question was whether it blocks or **errors** at realistic depth. | **Blocking only — never an error, at any depth or pause length tested.** With nobody reading `/dev/fuse` for 0.5 / 2 / 5 / 10 s, the writer's longest `pwrite` *and* the reader's longest `pread` were the pause + 1.3-2.4 ms (12 clients) or + 1.7-5.4 ms (80 clients), and the error count was **0** every time. `waiting` went 6-13 at 12 clients; at 80 clients it reached **80** — every client outstanding at once, above `congestion_threshold` (48) and above `max_background` (64), which bound *background* requests (readahead, writeback) and not the synchronous ones these clients issue — and still nothing failed: congestion throttles, it does not error. Both directions wait out the pause and are answered after the resume (the readers are `O_DIRECT`, so every one of their `pread`s had to cross the paused connection). | **K5's protocol timing does not have to change.** A 10 s stall is twice §8's default `--handoff-drain-timeout` (5 s) and a third of `--handoff-total-timeout` (30 s), and it is invisible to a caller except as latency, so the drain timeout stays a *liveness* bound rather than a correctness one. K5 should still keep the total timeout: a stall is only harmless while it ends. |
 | **5** | `extraMounts` puts `/dev/fuse` in the kind node (REPORTED, `kubernetes-sigs/kind#2540`), and the pod additionally needs `privileged: true` (REPORTED, two independent projects). | **The pod half is VERIFIED and is in fact stronger than stated; the node half is VERIFIED differently than stated.** A privileged pod on an `extraMounts` worker ran the whole chain (5 handoffs + a 1 s pause, 176 k writer ops, 92 k reader ops, 0 errors, 0 mismatches). An unprivileged pod cannot: with no device it gets `ENOENT`; with the device bind-mounted in by `hostPath` it gets **`EPERM` on `open("/dev/fuse")`**; with `hostPath` **and `SYS_ADMIN`** it *still* gets `EPERM` (the capability was genuinely in force — that pod could mount `fusectl`, the plain one could not). So bind-mounting the device in is not a substitute for `privileged: true`. The correction: on this host the `extraMounts` were **not** what made `/dev/fuse` available — kind runs node containers `--privileged`, runc populates a privileged container's `/dev` with every host device, and the control-plane node (deliberately left without `extraMounts` in the committed config, as a control group) had a working `/dev/fuse` too. | `tests/csi/kind-config.yaml` is committed with the `extraMounts` kept: they are harmless, they make the device present deterministically instead of as a side effect of runc's privileged-container behaviour, and they remain the documented pattern for rootless and restricted runtimes. The node-plugin `DaemonSet` keeps `securityContext.privileged: true` — K0 shows there is no weaker configuration that works. **A GitHub-hosted `ubuntu-latest` runner could not be tested from here**, so §15's pre-agreed fallback is taken as written: **`kind-e2e` and `upgrade-under-load` run on a self-hosted runner with FUSE support until a hosted runner is verified**, while `csi-unit` and `csi-sanity` stay on hosted runners (K3b's CI job, §13). `results/k0-question5-kind.txt` predates the probe's reader fix and the cluster is deleted, so it was not re-run: what question 5 asks — is the device there, and can a pod use it — does not depend on how the probe's readers reach the filesystem, and its in-pod handoff legs (round trip p50 0.53 ms) agree with the host runs. |
+
+### Track B — pool metadata-throughput ceiling (37-k0b, 2026-10-01)
+
+**Setup.** `crates/harness/src/csi_meta_ladder.rs` (`harness csi-meta-ladder`):
+one `constellation` daemon, one pool filesystem, docker floci + toxiproxy,
+every op through the control socket (`browse.mkdir`/`browse.xattr`/
+`quota.set` — never through the FUSE mount; `EngineControl::browser()` opens
+its own internal view, so no filesystem op in this grid crosses the kernel).
+Concurrency ladder 1, 4, 8, 16, 32, 64, 256 — all seven are in
+`CONCURRENCY_LADDER`, so one plain `harness csi-meta-ladder` reproduces every
+row below without env knobs. At each concurrency level one pool filesystem
+grows from 0 to 10,000 subtrees through checkpoints 100/1,000/5,000/10,000,
+measured per checkpoint. Raw JSON + logs: `bench/csi-metadata/results/` (see
+its `README.md` for the re-run commands and knobs).
+
+Four caveats that bound how far these numbers travel, all of them recorded
+per step in the JSON:
+
+1. **The `quota.set` measured is not §5's.** The control protocol has no
+   subtree-scoped quota: `SetQuotaParams` is `{max_bytes}`, a filesystem-wide
+   cap, and §5's `quota.set{subtree, bytes}` does not exist yet. This grid
+   measures the RPC that exists today. It matters for reading the result
+   below, because the whole failure mode *is* that RPC's unconditional
+   whole-filesystem barrier: **a future subtree-scoped `quota.set` that
+   barriers only its own subtree (or not at all) may not have this failure
+   mode at all**, and K2 should re-measure once that RPC exists rather than
+   assume the cliff carries over.
+2. **Host load is part of every number here.** This host is shared with other
+   agents' builds; its 1-minute load average moved between 29 and 143 across
+   the runs, and *within* run 2 it fell from 143 to 37 while the ladder
+   climbed. `loadavg_1min_before`/`_after` and `host_cpus` are therefore
+   recorded on every step, and no row is comparable with another run's row
+   without them.
+3. **The 100-subtree checkpoint is not a comparable data point** at the high
+   levels: at c≥64 it completes in 0.06-0.15 s, far shorter than one sync
+   round, so whether it shows 0% or tens of percent of errors is close to a
+   coin flip on where the round boundary fell (run 2 c=64 → 25%, run 3 c=64 →
+   0%, run 2 c=256 → 55%). Read it as a warm-up, not as "small pools are
+   safe".
+4. **A FUSE mount is live throughout**, because `Client::mount` is the
+   harness's only way to start a daemon. No *measured* op goes through it,
+   but `quota.set`'s `invalidate_quota_caches()` does touch a real view, so
+   this is not a mount-free configuration — just one where the mount carries
+   no traffic.
+
+**There are two results, and they sit on top of each other: a super-linear
+p99 knee *and* a failure-rate cliff, in the same concurrency region.** Run 2,
+the whole grid in one command (`run2-grid-full.jsonl`; the "seq/s" columns are
+`sum(volumes)/sum(wall_s)` over the level's four checkpoints, computed by
+`csi_meta_ladder::summarize` so this table and the tool cannot disagree; the
+`@10k` columns are the 5,000→10,000 checkpoint):
+
+| Conc | Errors / 10,000 | Attempted seq/s | Successful seq/s | seq p50 @10k (ms) | seq p99 @10k (ms) | Failed `quota.set` p50 / p99 (ms) | Daemon CPU @10k | load1 @10k |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0 (0.00%) | 154.3 | 154.3 | 5.18 | 12.48 | — | 76.7% | 64.2 |
+| 4 | 2 (0.02%) | 656.7 | 656.5 | 5.75 | 10.59 | 15.49 / 15.49 | 126.8% | 52.8 |
+| 8 | 20 (0.20%) | 908.4 | 906.6 | 8.78 | 21.36 | 17.17 / 145.46 | 168.1% | 46.4 |
+| 16 | 41 (0.41%) | 1183.1 | 1178.2 | 13.74 | 22.33 | 5.04 / 8.51 | 193.4% | 41.2 |
+| 32 | 961 (9.61%) | 1422.9 | 1286.1 | 23.53 | 88.97 | 8.55 / 16.48 | 208.6% | 37.2 |
+| 64 | 7171 (71.71%) | 1061.3 | 300.2 | 60.81 | 171.11 | 20.43 / 47.26 | 157.6% | 37.4 |
+| 256 | 9451 (94.51%) | 1146.1 | 62.9 | 302.03 | 635.94 | 57.46 / 160.06 | 161.2% | 38.2 |
+
+**The knee (what question 6 asked for).** Successful-sequence p99 at the
+10,000-subtree checkpoint goes 22.33 ms at c=16 → **88.97 ms at c=32** (4.0×
+for a 2× concurrency step) → 171.11 ms at c=64 → **635.94 ms at c=256**; p50
+follows (13.74 → 23.53 → 60.81 → 302.03 ms). That is the super-linear rise
+the question predicted, it is in the **hundreds of milliseconds**, not the
+tens, and it lands in the same c=16…64 region as the failure cliff. The
+earlier run 1 put the same break one step higher (p99 27.74 ms at c=32 →
+534.30 ms at c=64, 19× for a 2× step); run 3 with its lower host load shows
+the mildest version (30.39 ms at c=16 → 31.02 ms at c=64, with 86% of
+sequences failing). So the knee's *location* moves with host load between
+c=16 and c=64, but a knee is always there, and **K2/K7 must size
+`CreateVolume`'s gRPC deadline against hundreds of ms, not tens**.
+
+Two things to know before using those percentiles. First, they are
+**survivorship-biased**: `sequence_p50/p99` cover only the sequences that
+completed, which at c=64 is 28% of them and at c=256 is 5.5%. Second, the
+sequences that failed are now timed too (`failed_op_*`, `failed_sequence_*`),
+and they are *cheaper* than the successful ones at high concurrency — a
+failing `quota.set` returns in 20.4 ms p50 / 47.3 ms p99 at c=64 (57.5 /
+160.1 ms at c=256), and the whole failed sequence in 57.0 ms p50 at c=64
+against 60.8 ms for a successful one. **A failure is fast, so retrying just
+`quota.set` is cheap** — the number K2 needs for the gap below.
+
+**Neither the control socket nor the client is the limit.** The `node.ping`
+ladder runs on the same grid, over the same single shared connection and the
+same task-per-concurrency-slot shape the `CreateVolume` grid uses, at the same
+total op count (80,000 calls per level): **56.6k-348k ops/s** across all runs,
+with zero errors, and p99 rising from **0.08 ms at c=1 to 2.55 ms at c=256**
+(run 1's worst was 4.67 ms at c=256 — *not* sub-millisecond at the top of the
+ladder, as an earlier version of this section said, but still two orders of
+magnitude of headroom). Against the 1.2-1.4k sequences/s the `CreateVolume`
+grid peaks at — 9.5-11.4k individual RPCs/s — the socket's framing, dispatch
+and `spawn_blocking` handoff (`unary()` in `crates/engine/src/control/mod.rs`) are
+nowhere near saturated, and neither is the harness's one-connection client.
+Question 6's "is it the client?" check is therefore answered no.
+
+**The failure rate is not a property of the code alone — it is a property of
+the host.** Every run of this ladder, newest first, with the load average the
+level ran under (`—` = level not run; run 1 predates the per-step load field):
+
+| Conc | Run 2 (full grid) | Run 3 (subset) | Run 1 (first pass) | Run 1 reruns | Reviewer's rerun |
+|---|---|---|---|---|---|
+| load1 during the level | 143 → 37 | 35 → 29 | not recorded | not recorded | ~76 |
+| 1 | 0.00% | — | 0% | — | — |
+| 4 | 0.02% | 0.19% | 0.22% | — | — |
+| 8 | 0.20% | 0.28% | 0.16% | — | **12.6%** |
+| 16 | 0.41% | 0.88% | 1.11% | 0.20% | — |
+| 32 | 9.61% | — | 7.94% | — | — |
+| 64 | 71.71% | 86.00% | 91.38% | 57.66% | 51.6% |
+| 256 | 94.51% | — | 87.57% | — | — |
+
+Read across a row, not down a column: c=8 is 0.16-0.28% on three runs of this
+host and **12.6%** on a fourth at load ~76, and c=64 ranges 51.6-91.4%. The
+one robust ordering is that the rate grows steeply with concurrency even when
+host load is moving the *other* way — in run 2, c=1 was measured at load
+64-143 and still returned zero errors, while c=32-256 ran at load 37-41 and
+failed 9.6-94.5%. **Concurrency is the driver; host throughput sets where the
+cliff falls.** There is no concurrency level above 1 that was clean on every
+host measured.
+
+**Attribution — traced to the exact call, not inferred from the shape of the
+curve.** Every `CreateVolume` sequence ends in `quota.set`. The handler,
+`EngineControl::set_quota` (`crates/engine/src/control/service.rs:1080-1095`),
+unconditionally calls `self.snapshot_barrier("/")` *before* writing the new
+quota (line 1082) — a full-filesystem durability barrier originally meant for
+snapshot/clone correctness (`snapshot_barrier`'s own doc: "force its pending
+data + journal through before observing or publishing an immutable root", same
+file, lines 37-39). `snapshot_barrier` sends `SyncRequest::Acquire` then
+`SyncRequest::Barrier{ino: root}`, which the authority core registers as a
+`Control::Barrier` round-waiter (`crates/authority/src/core/mod.rs:1864-1869`).
+A round-waiter is resolved at the end of the *next* sync round; if the node's
+**whole** journal backlog (not scoped to "/" despite the `ino` parameter —
+`replica.journal_len()`, `crates/authority/src/core/jobs.rs:1963`) is still
+nonzero at that point, every non-`PublishNow`/`Reintegrate` waiter in that
+round — including this `Barrier` — is failed with the literal string
+`"journal not shipped: no lease"` (`jobs.rs:1999-2005`), regardless of whether
+a lease was ever lost. Three recorded artifacts back this up rather than
+inference:
+
+- `failures_by_op` is `{"quota": n}` on **every** step of both new runs that
+  recorded a failure at all (and `{}` on the rest): zero `mkdir` and zero
+  `xattr` failures across the two runs' 110,000 sequences — matching
+  `crates/engine/src/control/browse.rs`, where `mkdir`/`xattr` call straight
+  into `View::mkdir`/`xattr` with no barrier.
+- `lease_held_before`/`lease_held_after` are `true` and `lease_lost_after` is
+  `false` on every step of both runs, so the message's "no lease" is
+  demonstrably not what happened — this is one uncontested node throughout.
+- `journal_backlog_after` is nonzero on most high-concurrency steps (up to 45
+  at c=256) while being 0 on the c=1 steps, which is the mechanism's own
+  signature: concurrent `mkdir`/`xattr` traffic keeps the backlog from
+  reaching zero inside the round a concurrent `quota.set` is waiting on.
+
+There is no automatic retry — the control RPC fails back to the caller once.
+
+**Pool size (PV count) is not the error-rate driver.** Within one concurrency
+level, the error *rate* does not consistently climb with the subtree count:
+run 2's c=16 goes 0% → 1.78% → 0.62% → 0% across its four checkpoints, c=4
+goes 0 → 0 → 0 → 0.04%, c=32 rises (0 → 4.78% → 3.82% → 15.30%) and c=256 is
+flat-high (55% → 93.9% → 96.5% → 93.8%); run 3's c=4 *declines*
+(0 → 0.44% → 0.22% → 0.12%) and its c=64 is non-monotone
+(0 → 82.1% → 72.1% → 99.6%). Averaged over runs there is no monotone PV-count
+trend, and the earlier version of this section wrongly read c=64's raw error
+*counts* (0 → 862 → 3496 → 4780) as a climb when the four checkpoints attempt
+100/900/4,000/5,000 sequences — i.e. flat in rate. What *does* grow with pool
+size is latency, mildly and linearly: at c=8, successful-sequence p50 goes
+6.79 → 7.08 → 7.77 → 8.78 ms across the checkpoints, and at c=16,
+9.98 → 10.42 → 11.96 → 13.74 ms. This only strengthens the conclusion below:
+the bound is on concurrency, not on how many PVs the pool already holds.
+
+**Consequence taken — the guidance is a mechanism, not a safe number.** The
+question §2.3 asks ("how many PVs can one unsharded pool hold before an
+operator should set `shards > 1`?") has no PV-count answer: a pool grown one
+PV at a time was clean through all 10,000 PVs measured, at the heaviest host
+load of the run and with nothing in the mechanism that would make 50,000
+different, while a pool fielding 64 simultaneous `CreateVolume` calls fails
+most of them at any PV count, including at 100. Nor can it be
+answered with a *safe concurrency*, because the failure probability per
+`CreateVolume` is the probability that the node's journal backlog fails to
+reach zero within the sync round its trailing `quota.set` is waiting on — a
+function of total concurrent metadata load **and** of how fast the host drains
+the journal. On this host that put the first failures at c=4 (2 in
+10,000) and majority failure between c=32 and c=64; on the same host at a
+higher load, c=8 alone was at 12.6%. Therefore:
+
+> **Sharding does not fix this and a concurrency cap cannot be published as
+> safe. K2 must make `CreateVolume` tolerate the failure — retry the trailing
+> `quota.set` (a failing call returns in ~10-60 ms, so retries are cheap) and
+> map an exhausted retry to a retryable gRPC status — rather than rely on an
+> operator keeping concurrency under a documented number.** Operators who want
+> a stopgap before K2 ships the retry should keep in-flight `CreateVolume`s per
+> unsharded pool in the **single digits** and still expect a fraction of a
+> percent to fail; the only level that was clean on every host measured is
+> **1**. Sharding (§6's example 2) remains the right tool for *throughput* —
+> successful-sequence rate per pool plateaus around 1.2-1.4k seq/s, so N shards
+> buy roughly N× that — but it does not raise the per-pool failure threshold,
+> because each shard's `quota.set` barriers its own filesystem on the same node.
+
+**Gap for K2/K6 (recorded, not fixed here — out of this session's scope,
+same as plan 37's own rule for Track A's gaps below).** `CreateVolume`'s
+error-mapping table (§5) has no entry for this failure: it is transient and
+partial (the subtree and all six xattrs are already committed by the time it
+happens; only the trailing `quota.set` barrier failed), so it should map to
+something retryable (`ABORTED` or equivalent) rather than whatever
+`Unavailable`/raw-passthrough mapping a naive implementation would give it,
+and — per the guidance above — K2 should retry just the `quota.set` step
+rather than failing the whole `CreateVolume`. When the subtree-scoped
+`quota.set{subtree, bytes}` of §5 is built, K2 should re-run this ladder: if
+the new RPC barriers only its own subtree, the cliff measured here may not
+exist in the shape CSI actually calls. Separately: `set_quota`'s unconditional
+whole-filesystem `snapshot_barrier("/")` is pre-existing engine behavior
+(plans 22/31/32), not something plan 37 introduces, and it will produce the
+same failure for *any* concurrent-write workload that calls `quota.set` while
+mutations are in flight, CSI or not — worth flagging to whoever owns
+`quota.set` past K2, though this session makes no engine change (per its
+brief: "no changes to the engine's metadata path").
 
 ### Gaps K0 found, for K5 and K3a (recorded, not fixed here)
 

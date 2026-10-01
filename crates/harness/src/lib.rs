@@ -6,6 +6,7 @@ pub mod bench;
 pub mod caps;
 pub mod client;
 pub mod corpus;
+pub mod csi_meta_ladder;
 pub mod docker;
 pub mod interop;
 pub mod metabench;

@@ -29604,8 +29604,8 @@ that has to answer questions 1-5 before K1-K7 are built on §8's session
 handover. Nothing in the product changed — two throwaway probes and a kind
 config. Full write-up and raw data: `bench/fuse-handover-probe/RESULTS.md`; the
 answer matrix with the consequence taken per question is the plan's own "K0
-results" section. (Track B, question 6, is 37-k0b's and runs independently; its
-row in that table is a placeholder.)
+results" section. (Track B, question 6, is 37-k0b's, ran independently, and is
+recorded in its own section below.)
 
 | Item | State | Where |
 |---|---|---|
@@ -29960,3 +29960,112 @@ but `RawPolicy` is `deny_unknown_fields` and rejects both. The file format
 is plan 31 §9.5's, which never had them, and `docs/reference/configuration.md`
 documents it correctly; whoever implements the rest of plan 33's file
 (`[audit]`, `version`) has to add them.
+
+## Plan 37 K0 Track B — pool `CreateVolume` metadata-throughput ceiling
+
+Milestone K0 of [plan 37](wip/37-kubernetes-csi.md) (§15), Track B: question
+6, run independently of Track A on the same host (2026-10-01). New harness
+driver only — no CSI code, no Kubernetes, no engine change. Full write-up,
+tables, measurement caveats and attribution: the plan's own "K0 results" →
+"Track B" section; raw JSON + re-run instructions:
+`bench/csi-metadata/results/`.
+
+| Item | State | Where |
+|---|---|---|
+| `harness csi-meta-ladder`: the exact `CreateVolume` metadata-op sequence (`browse.mkdir` + 6× `browse.xattr{set}` + `quota.set`) through the control socket (never FUSE — `EngineControl::browser()` opens its own view) against one unsharded pool, at concurrency 1/4/8/16/32/64/256 (all committed in `CONCURRENCY_LADDER`, no env knob needed) and cumulative subtree count 100/1,000/5,000/10,000; per-step ops/s, p50/p99/p999 per op kind **for successes and for failures separately**, failure counts per op kind, daemon CPU, S3 request tally (`CountingProxy`), `spool.journal_backlog`/`ship_rounds_completed` deltas, `lease.held`/`lease.lost`, and `/proc/loadavg` at both ends of every step | DONE | `crates/harness/src/csi_meta_ladder.rs` |
+| `node.ping` control-overhead ladder on the same grid and the same single-connection client shape, proving neither the socket nor the client is the bottleneck | DONE | same file, `run_ping_concurrency` |
+| End-of-run summary table (one row per concurrency level) and `ConcurrencySummary` JSON, so the published table's "seq/s" columns are computed by the tool (`sum(volumes)/sum(wall_s)`) rather than by hand | DONE | same file, `summarize`/`print_summary` |
+| Raw JSON + logs (two runs with the final driver, three with the first version) and a `README.md` with the exact re-run commands | DONE | `bench/csi-metadata/results/` |
+| "K0 results" → "Track B" section: both results (p99 knee *and* failure cliff), the cross-run host-dependence table, the four measurement caveats, the attribution traced to source, the guidance, the K2/K6 gap | DONE | `docs/plans/v1/wip/37-kubernetes-csi.md` |
+
+**The answer: a super-linear p99 knee *and*, on top of it, a failure-rate
+cliff, both in the c=16…64 region.** The knee — what question 6 predicted —
+is in successful-sequence p99 at 10,000 subtrees: 22.3 ms at c=16 → **89.0 ms
+at c=32** (4.0× for a 2× concurrency step) → 171.1 ms at c=64 → **635.9 ms at
+c=256**. Hundreds of milliseconds, so K2/K7 must size `CreateVolume`'s gRPC
+deadline accordingly. The cliff is the fraction of calls that stop completing
+at all, failing with the control error `"journal not shipped: no lease"`:
+run 2 (full grid, one command) c=1 **0%**, c=4 **0.02%**, c=8 **0.20%**,
+c=16 **0.41%**, c=32 **9.61%**, c=64 **71.7%**, c=256 **94.5%**.
+
+**That magnitude is host-dependent and must not be read as a safe
+threshold.** Across four runs of the same binary on the same box, c=8 ranges
+0.16% → **12.6%** and c=64 ranges 51.6% → 91.4%, tracking the 1-minute load
+average (which is why the driver now records it per step). Concurrency is
+still clearly the driver, not host load: in run 2, c=1 was measured at load
+64-143 and returned zero errors while c=32-256 ran at load 37-41 and failed
+9.6-94.5%. Within a concurrency level the subtree count does **not** move the
+error rate consistently (c=16: 0 → 1.78% → 0.62% → 0%; c=4 declines on one
+run; the first run's apparent climb was raw *counts* over checkpoints that
+attempt 100/900/4,000/5,000 sequences, i.e. flat in rate) — what pool size
+adds is a mild linear latency growth (c=8: 6.8 → 7.1 → 7.8 → 8.8 ms p50).
+
+Traced to source, not inferred: every `CreateVolume` ends in `quota.set`,
+whose handler (`EngineControl::set_quota`, `crates/engine/src/control/
+service.rs:1080-1095`) unconditionally calls `self.snapshot_barrier("/")` — a
+pre-existing, full-filesystem durability barrier built for snapshot/clone
+correctness — which registers a `Control::Barrier` round-waiter
+(`crates/authority/src/core/mod.rs:1864-1869`) that fails with exactly this
+message, worded for lease loss, whenever the **whole node's** journal backlog
+isn't zero at the end of that sync round
+(`crates/authority/src/core/jobs.rs:1999-2005`). Three recorded artifacts
+rather than inference: `failures_by_op` is `{quota: n}` on every failing step of both
+new runs (zero `mkdir`, zero `xattr` failures in the two runs' 110,000 sequences, matching
+`browse.rs`, which has no barrier call); `lease_held` is `true` and
+`lease_lost` `false` on every step, so no lease was ever actually lost (one
+uncontested node throughout); and `journal_backlog_after` is nonzero on the
+high-concurrency steps (up to 45 at c=256) while being 0 at c=1. Failures are
+*cheap*, which the driver now measures: a failing `quota.set` returns in
+20.4 ms p50 / 47.3 ms p99 at c=64, and a failed sequence (57.0 ms p50) is
+faster than a successful one (60.8 ms).
+
+**Consequence — the guidance is a mechanism, not a number.** There is no
+PV-count threshold (c=1 was clean through all 10,000 PVs measured, at the
+heaviest host load of the run) and **no safe concurrency above 1 could be measured**: the
+per-call failure probability is the probability that the node's journal
+backlog reaches zero inside the round its trailing `quota.set` waits on, a
+function of host throughput as much as of concurrency. So **K2 must make
+`CreateVolume` tolerate the failure — retry the trailing `quota.set` and map
+an exhausted retry to a retryable status — rather than rely on an operator
+honouring a documented concurrency cap.** Sharding (§6 example 2) still buys
+throughput (~1.2-1.4k successful sequences/s per pool, so N shards ≈ N× that)
+but does not raise the per-pool failure threshold, since each shard's
+`quota.set` barriers its own filesystem on the same node. Pre-K2 stopgap for
+operators: keep in-flight `CreateVolume`s per unsharded pool in the single
+digits and still expect a fraction of a percent to fail.
+
+**Caveat K2 must carry (also in the plan's Track B section):** the
+`quota.set` measured here is today's filesystem-wide `SetQuotaParams
+{max_bytes}`, not §5's subtree-scoped `quota.set{subtree, bytes}`, which does
+not exist yet. The entire failure mode is that RPC's whole-filesystem
+barrier, so a subtree-scoped quota that barriers only its own subtree may not
+have this failure mode at all — re-run this ladder when that RPC lands.
+
+**Gap for K2/K6 (recorded, not fixed here — out of this session's scope):**
+`CreateVolume`'s error-mapping table has no entry for this failure, which is
+transient and partial (the subtree and its xattrs are already committed; only
+the trailing `quota.set` barrier failed) — it should map to something
+retryable. `set_quota`'s unconditional whole-filesystem barrier predates plan
+37 (plans 22/31/32) and affects any concurrent-write workload that calls
+`quota.set`, not only CSI; flagged for whoever owns that method past K2, with
+no engine change made here.
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `target/release/harness run e2e-basic create-storm-s3-only` | PASSED |
+| `target/release/harness csi-meta-ladder --json` (full 7-level grid; plus a 4-level reproducibility run) | raw results in `bench/csi-metadata/results/` |
+
+One gate-run note, not caused by this work: `e2e-basic` failed on its first
+attempt of the pair with "E2E filesystem published no metadata tree" and
+passed on two subsequent runs (alone and paired). The assertion
+(`crates/harness/src/scenarios.rs:1496-1499`) requires `/packs/` *and*
+`/commits/` objects in the bucket right after `unmount`, which is timing-
+sensitive on a host at load 50-140; nothing in this change touches the
+scenario, the engine or the publish path (the diff is the new harness driver,
+its CLI arm, docs and results).

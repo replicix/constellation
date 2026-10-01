@@ -1,0 +1,102 @@
+csi-meta-ladder createvolume c=4   cumulative=     0->100    in    0.1s:   822.4 vol/s seq p50=   4.94ms p99=    5.98ms cpu= 98.7% s3_reqs=90 backlog Some(2)->Some(4) load Some(35.47)->Some(35.47) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=4   cumulative=   100->1000   in    1.5s:   607.9 vol/s seq p50=   5.87ms p99=   37.04ms cpu=110.8% s3_reqs=1241 backlog Some(0)->Some(1) load Some(35.47)->Some(34.23) errors=4 (quota=4) failed-op p50=   2.76ms p99=    4.54ms
+  csi-meta-ladder error: idx 769 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 770 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 767 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 768 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=4   cumulative=  1000->5000   in    7.0s:   572.5 vol/s seq p50=   6.39ms p99=   20.07ms cpu=120.8% s3_reqs=5703 backlog Some(0)->Some(3) load Some(34.23)->Some(34.21) errors=9 (quota=9) failed-op p50=   3.94ms p99=    8.43ms
+  csi-meta-ladder error: idx 1699 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4318 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4315 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4496 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4579 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1697 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4316 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4317 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=4   cumulative=  5000->10000  in    8.9s:   563.0 vol/s seq p50=   6.45ms p99=   18.30ms cpu=123.3% s3_reqs=7311 backlog Some(0)->Some(4) load Some(34.21)->Some(32.34) errors=6 (quota=6) failed-op p50=   9.04ms p99=   10.33ms
+  csi-meta-ladder error: idx 5338 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5339 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5337 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 9375 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5340 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 8159 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=8   cumulative=     0->100    in    0.1s:  1205.7 vol/s seq p50=   6.47ms p99=    7.31ms cpu=132.6% s3_reqs=69 backlog Some(2)->Some(4) load Some(32.34)->Some(32.34) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=   100->1000   in    0.8s:  1085.0 vol/s seq p50=   6.98ms p99=   10.05ms cpu=139.8% s3_reqs=801 backlog Some(0)->Some(4) load Some(32.34)->Some(32.34) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=  1000->5000   in    4.5s:   881.3 vol/s seq p50=   8.56ms p99=   22.92ms cpu=155.3% s3_reqs=3722 backlog Some(0)->Some(7) load Some(32.34)->Some(31.51) errors=25 (quota=25) failed-op p50=   4.45ms p99=    6.20ms
+  csi-meta-ladder error: idx 4185 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4194 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4205 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4188 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4195 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4204 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4187 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 4197 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=8   cumulative=  5000->10000  in    6.2s:   808.5 vol/s seq p50=   9.18ms p99=   19.18ms cpu=164.5% s3_reqs=4694 backlog Some(0)->Some(3) load Some(31.51)->Some(30.67) errors=3 (quota=3) failed-op p50=   8.18ms p99=   14.09ms
+  csi-meta-ladder error: idx 7950 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7959 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7967 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=16  cumulative=     0->100    in    0.1s:  1445.8 vol/s seq p50=  10.35ms p99=   12.75ms cpu=159.0% s3_reqs=45 backlog Some(2)->Some(4) load Some(30.67)->Some(30.67) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=16  cumulative=   100->1000   in    0.7s:  1265.2 vol/s seq p50=  11.74ms p99=   43.49ms cpu=165.9% s3_reqs=523 backlog Some(0)->Some(0) load Some(30.67)->Some(29.9) errors=1 (quota=1) failed-op p50=   8.47ms p99=    8.47ms
+  csi-meta-ladder error: idx 193 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=16  cumulative=  1000->5000   in    3.4s:  1174.8 vol/s seq p50=  13.13ms p99=   16.89ms cpu=180.0% s3_reqs=2309 backlog Some(0)->Some(8) load Some(29.9)->Some(29.9) errors=62 (quota=62) failed-op p50=   6.10ms p99=   29.58ms
+  csi-meta-ladder error: idx 1867 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1884 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 3250 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 3268 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1866 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1883 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 2105 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 3249 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=16  cumulative=  5000->10000  in    5.3s:   949.3 vol/s seq p50=  15.16ms p99=   30.39ms cpu=176.6% s3_reqs=2843 backlog Some(0)->Some(16) load Some(29.9)->Some(29.66) errors=25 (quota=25) failed-op p50=   7.16ms p99=   17.15ms
+  csi-meta-ladder error: idx 7260 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7274 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7269 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7268 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 9379 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7271 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7265 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 7277 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=64  cumulative=     0->100    in    0.1s:   673.0 vol/s seq p50=  40.95ms p99=  109.55ms cpu= 80.8% s3_reqs=34 backlog Some(2)->Some(0) load Some(29.66)->Some(29.66) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=   100->1000   in    0.6s:  1562.8 vol/s seq p50=  37.26ms p99=   44.67ms cpu=201.4% s3_reqs=232 backlog Some(0)->Some(33) load Some(29.66)->Some(29.66) errors=739 (quota=739) failed-op p50=   9.42ms p99=   26.29ms
+  csi-meta-ladder error: idx 100 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 171 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 347 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 501 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 549 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 612 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 675 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 735 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=64  cumulative=  1000->5000   in    2.6s:  1521.7 vol/s seq p50=  47.60ms p99=   53.80ms cpu=242.7% s3_reqs=1103 backlog Some(0)->Some(30) load Some(29.66)->Some(29.05) errors=2882 (quota=2882) failed-op p50=  11.66ms p99=   44.72ms
+  csi-meta-ladder error: idx 1000 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1072 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1142 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1199 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1488 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1615 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 1842 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 2192 quota: journal not shipped: no lease
+csi-meta-ladder createvolume c=64  cumulative=  5000->10000  in    3.3s:  1501.4 vol/s seq p50=  30.34ms p99=   31.02ms cpu=250.4% s3_reqs=1284 backlog Some(0)->Some(19) load Some(29.05)->Some(29.45) errors=4979 (quota=4979) failed-op p50=  13.89ms p99=   38.32ms
+  csi-meta-ladder error: idx 5000 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5073 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5149 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5196 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5269 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5331 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5397 quota: journal not shipped: no lease
+  csi-meta-ladder error: idx 5452 quota: journal not shipped: no lease
+csi-meta-ladder node.ping   c=4    80000 pings in    0.6s:  131506.5 ops/s p50= 0.029ms p99=  0.052ms errors=0
+csi-meta-ladder node.ping   c=8    80000 pings in    0.3s:  237920.6 ops/s p50= 0.032ms p99=  0.065ms errors=0
+csi-meta-ladder node.ping   c=16   80000 pings in    0.3s:  294856.1 ops/s p50= 0.052ms p99=  0.100ms errors=0
+csi-meta-ladder node.ping   c=64   80000 pings in    0.2s:  324545.2 ops/s p50= 0.193ms p99=  0.389ms errors=0
+
+=== csi-meta-ladder summary (per concurrency level, aggregated over checkpoints) ===
+ conc attempted  errors     err%   att_seq/s    ok_seq/s  seq_p50ms  seq_p99ms   failop_p50   failop_p99     cpu%   load1
+    4     10000      19    0.19%      572.43      571.34       6.45      18.30         9.04        10.33    123.3   32.34
+    8     10000      28    0.28%      859.45      857.04       9.18      19.18         8.18        14.09    164.5   30.67
+   16     10000      88    0.88%     1057.96     1048.65      15.16      30.39         7.16        17.15    176.6   29.66
+   64     10000    8600   86.00%     1496.27      209.48      30.34      31.02        13.89        38.32    250.4   29.45
+--- node.ping (control-plane overhead, same grid) ---
+    4     80000 pings     131506.5 ops/s p50=  0.029ms p99=  0.052ms p999=   0.186ms errors=0
+    8     80000 pings     237920.6 ops/s p50=  0.032ms p99=  0.065ms p999=   0.182ms errors=0
+   16     80000 pings     294856.1 ops/s p50=  0.052ms p99=  0.100ms p999=   0.501ms errors=0
+   64     80000 pings     324545.2 ops/s p50=  0.193ms p99=  0.389ms p999=   1.124ms errors=0

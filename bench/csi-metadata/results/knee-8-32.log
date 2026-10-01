@@ -1,0 +1,49 @@
+csi-meta-ladder createvolume c=8   cumulative=     0->100    in    0.1s:  1125.1 vol/s seq p50=   6.83ms p99=    8.13ms cpu=135.0% s3_reqs=70 backlog 2->4 errors=0
+csi-meta-ladder createvolume c=8   cumulative=   100->1000   in    0.8s:  1098.5 vol/s seq p50=   6.26ms p99=   35.30ms cpu=145.2% s3_reqs=748 backlog 0->0 errors=0
+csi-meta-ladder createvolume c=8   cumulative=  1000->5000   in    3.9s:  1020.5 vol/s seq p50=   7.63ms p99=   14.48ms cpu=158.7% s3_reqs=3641 backlog 0->1 errors=7
+  csi-meta-ladder error: idx 4477: journal not shipped: no lease
+  csi-meta-ladder error: idx 4472: journal not shipped: no lease
+  csi-meta-ladder error: idx 4475: journal not shipped: no lease
+  csi-meta-ladder error: idx 4474: journal not shipped: no lease
+  csi-meta-ladder error: idx 4478: journal not shipped: no lease
+  csi-meta-ladder error: idx 4473: journal not shipped: no lease
+  csi-meta-ladder error: idx 4479: journal not shipped: no lease
+csi-meta-ladder createvolume c=8   cumulative=  5000->10000  in    5.6s:   898.9 vol/s seq p50=   8.65ms p99=   18.08ms cpu=174.2% s3_reqs=4513 backlog 0->8 errors=9
+  csi-meta-ladder error: idx 5831: journal not shipped: no lease
+  csi-meta-ladder error: idx 9633: journal not shipped: no lease
+  csi-meta-ladder error: idx 9636: journal not shipped: no lease
+  csi-meta-ladder error: idx 9638: journal not shipped: no lease
+  csi-meta-ladder error: idx 9632: journal not shipped: no lease
+  csi-meta-ladder error: idx 9634: journal not shipped: no lease
+  csi-meta-ladder error: idx 9635: journal not shipped: no lease
+  csi-meta-ladder error: idx 9637: journal not shipped: no lease
+csi-meta-ladder createvolume c=32  cumulative=     0->100    in    0.1s:  1699.4 vol/s seq p50=  17.91ms p99=   18.98ms cpu=169.9% s3_reqs=29 backlog 2->4 errors=0
+csi-meta-ladder createvolume c=32  cumulative=   100->1000   in    0.5s:  1787.0 vol/s seq p50=  17.96ms p99=   20.77ms cpu=198.6% s3_reqs=355 backlog 4->28 errors=72
+  csi-meta-ladder error: idx 550: journal not shipped: no lease
+  csi-meta-ladder error: idx 571: journal not shipped: no lease
+  csi-meta-ladder error: idx 548: journal not shipped: no lease
+  csi-meta-ladder error: idx 567: journal not shipped: no lease
+  csi-meta-ladder error: idx 553: journal not shipped: no lease
+  csi-meta-ladder error: idx 559: journal not shipped: no lease
+  csi-meta-ladder error: idx 563: journal not shipped: no lease
+  csi-meta-ladder error: idx 556: journal not shipped: no lease
+csi-meta-ladder createvolume c=32  cumulative=  1000->5000   in    2.6s:  1564.6 vol/s seq p50=  20.23ms p99=   54.96ms cpu=205.7% s3_reqs=1535 backlog 0->23 errors=649
+  csi-meta-ladder error: idx 1803: journal not shipped: no lease
+  csi-meta-ladder error: idx 1824: journal not shipped: no lease
+  csi-meta-ladder error: idx 2639: journal not shipped: no lease
+  csi-meta-ladder error: idx 2641: journal not shipped: no lease
+  csi-meta-ladder error: idx 2651: journal not shipped: no lease
+  csi-meta-ladder error: idx 2643: journal not shipped: no lease
+  csi-meta-ladder error: idx 2654: journal not shipped: no lease
+  csi-meta-ladder error: idx 2635: journal not shipped: no lease
+csi-meta-ladder createvolume c=32  cumulative=  5000->10000  in    3.4s:  1485.7 vol/s seq p50=  21.14ms p99=   27.74ms cpu=213.3% s3_reqs=1796 backlog 0->3 errors=73
+  csi-meta-ladder error: idx 6607: journal not shipped: no lease
+  csi-meta-ladder error: idx 6625: journal not shipped: no lease
+  csi-meta-ladder error: idx 6626: journal not shipped: no lease
+  csi-meta-ladder error: idx 6606: journal not shipped: no lease
+  csi-meta-ladder error: idx 6602: journal not shipped: no lease
+  csi-meta-ladder error: idx 6603: journal not shipped: no lease
+  csi-meta-ladder error: idx 7516: journal not shipped: no lease
+  csi-meta-ladder error: idx 7526: journal not shipped: no lease
+csi-meta-ladder node.ping   c=8    80000 pings in    0.4s:  194263.8 ops/s p50= 0.032ms p99=  0.251ms errors=0
+csi-meta-ladder node.ping   c=32   80000 pings in    0.2s:  330221.8 ops/s p50= 0.095ms p99=  0.163ms errors=0
