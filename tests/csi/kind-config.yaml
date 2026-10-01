@@ -1,0 +1,49 @@
+# A kind cluster that can run Constellation's CSI node plugin: plan 37
+# §12's `extraMounts` config, as verified by K0 Track A (question 5).
+#
+# Two layers are needed, and they are independent (K0 confirmed both on a
+# real cluster, see the plan's "K0 results"):
+#
+# 1. `/dev/fuse` must exist *inside the node container*. §12 says
+#    `extraMounts` is what puts it there; K0 measured something weaker.
+#    kind runs every node container `--privileged`, runc populates a
+#    privileged container's `/dev` with the host's devices, and the
+#    control-plane node below — which has no `extraMounts` at all — had a
+#    working `/dev/fuse` and ran a FUSE mount from a privileged pod. So
+#    these `extraMounts` are not load-bearing on a rootful docker host.
+#    They stay because they make the device present deterministically
+#    instead of as a side effect of privileged-container behaviour, and
+#    because they are what rootless and restricted runtimes need. Do not
+#    read a `/dev/fuse` failure as "add more `extraMounts`", and do not
+#    drop `privileged: true` from a pod believing the bind-mount replaces
+#    it — K0 measured that it does not (layer 2).
+# 2. The pod that calls `mount(2)` must be `privileged: true`. The device
+#    being visible in the node is not enough: K0 measured `EPERM` on
+#    `open("/dev/fuse")` from an unprivileged pod with the device
+#    bind-mounted in, with and without `SYS_ADMIN` — the container's
+#    device cgroup denies it.
+#
+# The control-plane node is deliberately left without `extraMounts`: it
+# runs no workload, and K0 used it as the control group that told layer 1's
+# two possible causes apart.
+#
+# Two workers (not one) so RWX-across-nodes scenarios are meaningful.
+#
+# `image:` — kind's default node image for its own version works
+# everywhere except hosts whose docker data root is ZFS-backed, where
+# kubelet's cAdvisor cannot start; pin it per host rather than here if
+# that is not your situation (K0's run needed
+# `--image kindest/node:v1.37.0-zfs`, so this file as committed is
+# verified only modulo that flag).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    extraMounts:
+      - hostPath: /dev/fuse
+        containerPath: /dev/fuse
+  - role: worker
+    extraMounts:
+      - hostPath: /dev/fuse
+        containerPath: /dev/fuse

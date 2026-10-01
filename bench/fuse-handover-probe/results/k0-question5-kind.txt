@@ -1,0 +1,386 @@
+# kind + /dev/fuse (plan 37 K0 question 5), 2026-10-01
+
+## kind version / nodes
+kind v0.33.0 go1.26.7 linux/amd64
+NAME                        STATUS   ROLES           AGE     VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION             CONTAINER-RUNTIME
+kind-37-k0a-control-plane   Ready    control-plane   3m37s   v1.37.0   172.20.0.3    <none>        Debian GNU/Linux 13 (trixie)   7.0.0-31-generic (amd64)   containerd://2.3.4
+kind-37-k0a-worker          Ready    <none>          3m27s   v1.37.0   172.20.0.4    <none>        Debian GNU/Linux 13 (trixie)   7.0.0-31-generic (amd64)   containerd://2.3.4
+kind-37-k0a-worker2         Ready    <none>          3m27s   v1.37.0   172.20.0.2    <none>        Debian GNU/Linux 13 (trixie)   7.0.0-31-generic (amd64)   containerd://2.3.4
+
+## /dev/fuse in each node container
+### kind-37-k0a-control-plane
+crw-rw-rw- 1 root root 10, 229 Oct  1 09:06 /dev/fuse
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+### kind-37-k0a-worker
+crw-rw-rw- 1 root root 10, 229 Sep 30 11:24 /dev/fuse
+udev /dev/fuse devtmpfs rw,nosuid,relatime,size=30031332k,nr_inodes=7507833,mode=755,inode64 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+### kind-37-k0a-worker2
+crw-rw-rw- 1 root root 10, 229 Sep 30 11:24 /dev/fuse
+udev /dev/fuse devtmpfs rw,nosuid,relatime,size=30031332k,nr_inodes=7507833,mode=755,inode64 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+
+## pods
+NAME                            READY   STATUS      RESTARTS   AGE     IP           NODE                        NOMINATED NODE   READINESS GATES
+fuse-privileged                 0/1     Completed   0          2m12s   10.244.1.2   kind-37-k0a-worker          <none>           <none>
+fuse-privileged-no-extramount   0/1     Completed   0          2m12s   10.244.0.5   kind-37-k0a-control-plane   <none>           <none>
+fuse-unpriv-devmount            0/1     Completed   0          56s     10.244.2.4   kind-37-k0a-worker2         <none>           <none>
+fuse-unpriv-devmount-sysadmin   0/1     Completed   0          56s     10.244.2.5   kind-37-k0a-worker2         <none>           <none>
+fuse-unpriv-plain               0/1     Completed   0          56s     10.244.2.3   kind-37-k0a-worker2         <none>           <none>
+fuse-unprivileged               0/1     Error       0          2m12s   10.244.2.2   kind-37-k0a-worker2         <none>           <none>
+
+### fuse-privileged
+        "pids": [
+          30,
+          40
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 0.145563,
+        "resume_ms": 0.175719,
+        "roundtrip_ms": 0.527149,
+        "waiting": [
+          3,
+          3,
+          0
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 3.498904
+      },
+      {
+        "detach_ms": 0.363635,
+        "first_op": null,
+        "first_op_ms": 0.0051270000000000005,
+        "init_matches": true,
+        "nth": 2,
+        "pause_ms": 0,
+        "pids": [
+          40,
+          50
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 0.142947,
+        "resume_ms": 0.149839,
+        "roundtrip_ms": 0.513474,
+        "waiting": [
+          3,
+          3,
+          3
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 0.996035
+      },
+      {
+        "detach_ms": 0.28457299999999996,
+        "first_op": null,
+        "first_op_ms": 0.00404,
+        "init_matches": true,
+        "nth": 3,
+        "pause_ms": 0,
+        "pids": [
+          50,
+          60
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 0.16589,
+        "resume_ms": 0.141613,
+        "roundtrip_ms": 0.42618599999999995,
+        "waiting": [
+          3,
+          3,
+          4
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 0.877254
+      },
+      {
+        "detach_ms": 0.379847,
+        "first_op": null,
+        "first_op_ms": 0.378391,
+        "init_matches": true,
+        "nth": 4,
+        "pause_ms": 0,
+        "pids": [
+          60,
+          70
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 0.131125,
+        "resume_ms": 0.155971,
+        "roundtrip_ms": 0.535818,
+        "waiting": [
+          4,
+          4,
+          3
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 0.997271
+      },
+      {
+        "detach_ms": 0.44311,
+        "first_op": null,
+        "first_op_ms": 0.298635,
+        "init_matches": true,
+        "nth": 5,
+        "pause_ms": 1000,
+        "pids": [
+          70,
+          80
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 0.333821,
+        "resume_ms": 0.27972,
+        "roundtrip_ms": 0.7228300000000001,
+        "waiting": [
+          3,
+          4,
+          3
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 1001.365345
+      }
+    ],
+    "negotiated_init": {
+      "congestion_threshold": 48,
+      "flags": 1078198305,
+      "kernel_flags": 6594720956411,
+      "kernel_major": 7,
+      "kernel_minor": 45,
+      "max_background": 64,
+      "max_pages": 4096,
+      "max_readahead": 131072,
+      "max_stack_depth": 0,
+      "max_write": 16777216,
+      "proto_major": 7,
+      "proto_minor": 40,
+      "time_gran_ns": 1
+    },
+    "post_resume_checks": [
+      {
+        "check": "getattr",
+        "detail": "size 8388608",
+        "ok": true
+      },
+      {
+        "check": "read",
+        "detail": "0 byte(s) differ at 4194304",
+        "ok": true
+      },
+      {
+        "check": "write-through-a-new-handle",
+        "detail": "read back true",
+        "ok": true
+      },
+      {
+        "check": "readdir",
+        "detail": "5 entries",
+        "ok": true
+      }
+    ],
+    "queue": {
+      "congestion_threshold": 48,
+      "connection": 490,
+      "max_background": 64
+    },
+    "reader": {
+      "bytes": 6005850112,
+      "errors": 0,
+      "first_error": null,
+      "mismatches": 0,
+      "ops": 91642
+    },
+    "resume_ms": {
+      "p50": 0.155971,
+      "p99": 0.19430599999999998
+    },
+    "roundtrip_ms": {
+      "max": 1.1440320000000002,
+      "n": 5,
+      "p50": 0.527149,
+      "p90": 1.1440320000000002,
+      "p99": 1.1440320000000002
+    },
+    "writer": {
+      "bytes": 11534729216,
+      "errors": 0,
+      "first_error": null,
+      "mismatches": 0,
+      "ops": 176006
+    }
+  },
+  "fuse_threads": 8,
+  "kernel": "7.0.0-31-generic",
+  "probe": "plan 37 K0 Track A",
+  "readers": 2,
+  "writers": 4
+}
+
+### fuse-privileged-no-extramount
+{
+  "chain": {
+    "handoffs": [
+      {
+        "detach_ms": 0.923032,
+        "first_op": null,
+        "first_op_ms": 0.252835,
+        "init_matches": true,
+        "nth": 0,
+        "pause_ms": 0,
+        "pids": [
+          14,
+          27
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 1.175103,
+        "resume_ms": 0.183663,
+        "roundtrip_ms": 1.106695,
+        "waiting": [
+          2,
+          2,
+          2
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 1.479248
+      },
+      {
+        "detach_ms": 0.384272,
+        "first_op": null,
+        "first_op_ms": 0.314243,
+        "init_matches": true,
+        "nth": 1,
+        "pause_ms": 0,
+        "pids": [
+          27,
+          37
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 0.125937,
+        "resume_ms": 0.159716,
+        "roundtrip_ms": 0.543988,
+        "waiting": [
+          1,
+          1,
+          2
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 0.853051
+      },
+      {
+        "detach_ms": 0.43830600000000003,
+        "first_op": null,
+        "first_op_ms": 0.006902999999999999,
+        "init_matches": true,
+        "nth": 2,
+        "pause_ms": 0,
+        "pids": [
+          37,
+          47
+        ],
+        "reader_errors": 0,
+        "reader_longest_ms": 0.137197,
+        "resume_ms": 0.207393,
+        "roundtrip_ms": 0.645699,
+        "waiting": [
+          2,
+          2,
+          2
+        ],
+        "writer_errors": 0,
+        "writer_longest_ms": 1.061381
+      }
+    ],
+    "negotiated_init": {
+      "congestion_threshold": 48,
+      "flags": 1078198305,
+      "kernel_flags": 6594720956411,
+      "kernel_major": 7,
+      "kernel_minor": 45,
+      "max_background": 64,
+      "max_pages": 4096,
+      "max_readahead": 131072,
+      "max_stack_depth": 0,
+      "max_write": 16777216,
+      "proto_major": 7,
+      "proto_minor": 40,
+      "time_gran_ns": 1
+    },
+    "post_resume_checks": [
+      {
+        "check": "getattr",
+        "detail": "size 4194304",
+        "ok": true
+      },
+      {
+        "check": "read",
+        "detail": "0 byte(s) differ at 2097152",
+        "ok": true
+      },
+      {
+        "check": "write-through-a-new-handle",
+        "detail": "read back true",
+        "ok": true
+      },
+      {
+        "check": "readdir",
+        "detail": "3 entries",
+        "ok": true
+      }
+    ],
+    "queue": {
+      "congestion_threshold": 48,
+      "connection": 491,
+      "max_background": 64
+    },
+    "reader": {
+      "bytes": 732954624,
+      "errors": 0,
+      "first_error": null,
+      "mismatches": 0,
+      "ops": 11184
+    },
+    "resume_ms": {
+      "p50": 0.183663,
+      "p99": 0.207393
+    },
+    "roundtrip_ms": {
+      "max": 1.106695,
+      "n": 3,
+      "p50": 0.645699,
+      "p90": 1.106695,
+      "p99": 1.106695
+    },
+    "writer": {
+      "bytes": 3045982208,
+      "errors": 0,
+      "first_error": null,
+      "mismatches": 0,
+      "ops": 46478
+    }
+  },
+  "fuse_threads": 8,
+  "kernel": "7.0.0-31-generic",
+  "probe": "plan 37 K0 Track A",
+  "readers": 1,
+  "writers": 2
+}
+
+### fuse-unprivileged
+note: /sys/fs/fuse/connections is not readable here (Operation not permitted (os error 1))
+Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+
+### fuse-unpriv-plain
+ls: cannot access '/dev/fuse': No such file or directory
+uid=0(root) gid=0(root) groups=0(root)
+note: /sys/fs/fuse/connections is not readable here (Operation not permitted (os error 1))
+Error: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+exit=1
+
+### fuse-unpriv-devmount
+crw-rw-rw- 1 root root 10, 229 Sep 30 11:24 /dev/fuse
+note: /sys/fs/fuse/connections is not readable here (Operation not permitted (os error 1))
+Error: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+exit=1
+
+### fuse-unpriv-devmount-sysadmin
+crw-rw-rw- 1 root root 10, 229 Sep 30 11:24 /dev/fuse
+Error: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+exit=1

@@ -1,0 +1,25 @@
+[2m2026-10-01T09:24:01.461142Z[0m [32m INFO[0m [2mconstellation[0m[2m:[0m selected host-aware thread plan [3mcpus[0m[2m=[0m32 [3mfuse_threads[0m[2m=[0m12 [3mtokio_threads[0m[2m=[0m32 [3mblocking_threads[0m[2m=[0m128
+  write object (PUT) ..................... ok
+  read object (GET) ...................... ok
+  list objects (LIST) .................... ok
+  create-if-absent (If-None-Match) ....... ok
+  etag CAS (If-Match) .................... unavailable: not supported by this S3 backend (server returned 501 Not Implemented)
+  delete object (DELETE) ................. ok
+created filesystem ca701edf-e0d6-4204-82df-1732e336e226 at file:///tmp/k0a-stage/s3
+  name:        k0a
+  chunk_size:  4194304
+  compression: zstd:3
+  e2e:         false
+== daemon up, its own view at /tmp/k0a-stage/mnt-a
+mounted /tmp/k0a-stage/mnt-b with mount(2); handing the fd over
+view 2 attached: subtree /, known as fd:35
+wrote and read back 48 bytes, 1 entries in the root, size 48
+view.unmount: timeout: view.unmount did not finish within 10s
+unmounted /tmp/k0a-stage/mnt-b by path
+views left: ["/tmp/k0a-stage/mnt-a"]
+== daemon log (tail)
+[2m2026-10-01T09:24:01.699451Z[0m [32m INFO[0m [2mconstellation_engine::upload[0m[2m:[0m pending chunk upload progress [3mcompleted[0m[2m=[0m1 [3mtotal[0m[2m=[0m1 [3mconcurrency[0m[2m=[0m4
+[2m2026-10-01T09:24:01.703785Z[0m [33m WARN[0m [2mconstellation::node_runtime[0m[2m:[0m unmount request failed (already unmounted?) [3merror[0m[2m=[0mthe mountpoint of a preopened FUSE session is unknown
+[2m2026-10-01T09:24:02.660688Z[0m [32m INFO[0m [2mconstellation_authority::core::client[0m[2m:[0m this node's S3 path answers again [3mnode[0m[2m=[0m1
+[2m2026-10-01T09:24:08.668123Z[0m [33m WARN[0m [2mconstellation_authority::core::client[0m[2m:[0m this node's S3 path is stalled: ops forward over P2P and do not wait on S3 [3mnode[0m[2m=[0m1 [3mpeers_reach_s3[0m[2m=[0mNone
+[2m2026-10-01T09:24:11.709112Z[0m [32m INFO[0m [2mconstellation::node_runtime[0m[2m:[0m FUSE detached

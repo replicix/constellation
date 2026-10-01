@@ -29596,3 +29596,100 @@ the DST/calendar cases), Step 3.1's xattr gate and root discovery, the
 scheduler, expiry, the CLI, space accounting, the UI, and Step 8's budget
 *behaviour* (`budget=` is parsed and stored; nothing reads it). No clock,
 environment or locale access exists anywhere in `parse` or `Display`.
+
+## Plan 37 K0 Track A — fd passing and FUSE session handover
+
+Milestone K0 of [plan 37](wip/37-kubernetes-csi.md) (§15), Track A: the spike
+that has to answer questions 1-5 before K1-K7 are built on §8's session
+handover. Nothing in the product changed — two throwaway probes and a kind
+config. Full write-up and raw data: `bench/fuse-handover-probe/RESULTS.md`; the
+answer matrix with the consequence taken per question is the plan's own "K0
+results" section. (Track B, question 6, is 37-k0b's and runs independently; its
+row in that table is a placeholder.)
+
+| Item | State | Where |
+|---|---|---|
+| `handover_probe`: A `fuse_mount_fd`s and passes the descriptor by `SCM_RIGHTS` → B serves it (`MountSource::PreopenedFd`) → `SessionControl::detach` → `SCM_RIGHTS` → C `FuseSession::resume`s it, repeated down a chain of processes, with writers, readers and fio on the mountpoint throughout; `ProbeVfs` (a flat passthrough to a scratch directory, `fh == ino`) so any process can serve the connection and the data is continuous across a handoff. Writers `pwrite` an offset-keyed pattern into their own files and readers `O_DIRECT`-`pread` *those* files and verify it, so a reader's bytes are a writer's bytes and no read is answered from the page cache; the run *asserts* §15's zero I/O errors (an error, a mismatch, a failed post-resume check or a non-zero fio status exits non-zero) | DONE | `crates/frontend-fuse/examples/handover_probe.rs` |
+| `stage_volume_probe`: the same first hop with the product in the path — `fuse_mount_fd` here, `view.mount{source: PreopenedFd}` to a running `constellation` daemon over its control socket, I/O through the mount, `view.list` | DONE | `crates/cli/examples/stage_volume_probe.rs` |
+| Runners (`run.sh [--deep] --in-container`, `stage-volume.sh --in-container`: root and `/dev/fuse` in a privileged container, since nobody has root on the host — `--deep` is the recorded 80-client run), README, RESULTS, raw JSON | DONE | `bench/fuse-handover-probe/` |
+| The kind cluster config as verified (control-plane without `extraMounts` as the control group, two workers with `/dev/fuse`), no node image pinned | DONE | `tests/csi/kind-config.yaml` |
+| "K0 results" written: prediction vs observation vs consequence for questions 1-5, plus the four gaps for K5/K3a | DONE | `docs/plans/v1/wip/37-kubernetes-csi.md` |
+
+**The answers.** (1) Stock `Session::from_fd` on an already-initialised
+connection reproduces §8's prediction exactly: `InvalidData`, "Received non-init
+FUSE operation during handshake", after answering the client's real `statfs`
+with **`EIO`** (1.3 ms after the descriptor reached it). (2) The vendored resume
+path serves everything, and no re-`INIT` is by construction —
+`from_fd_resumed` never calls `handshake()`; 44 handoffs through 45 processes
+with the resumed session reporting the detaching one's `NegotiatedInit` every
+time, 5.0 M writer ops / 329 GB and 1.2 M reader ops / 79 GB (every reader op
+answered over the handed-over connection, `O_DIRECT`), **0 errors, 0 byte
+mismatches**, fio `error: 0`, all asserted by the probe. (3) Round trip p50
+**0.82 ms**, p90 1.16 ms, max **21.5 ms** over 40 handoffs (p50 1.29 ms / max
+12.3 ms at 80 concurrent clients) against §8's 2 s target; at n = 40 the p99 is
+the max, and one handoff of the 40 is the whole tail on a host at load average
+20-55. (4) With nobody reading `/dev/fuse` for 0.5/2/5/10 s writers *and*
+readers block for the pause + 1.3-5.4 ms and **never error**, including with
+`waiting` at **80** — above `congestion_threshold` (48) and above
+`max_background` (64), which bound background requests, not these synchronous
+ones. (5) A `privileged: true` pod on a kind worker runs the whole chain; an
+unprivileged one cannot even with the device bind-mounted in **and** `SYS_ADMIN`
+(`EPERM` on `open("/dev/fuse")`) — and the `extraMounts` turned out not to be
+what puts `/dev/fuse` in a node container at all (kind runs them
+`--privileged`), which §12 and `tests/csi/kind-config.yaml` now say.
+
+**Consequences, per §15's pre-agreed list:** handover works as designed →
+**proceed to K1-K7 as planned**; the degraded mode is not taken. Question 4's
+result means K5's protocol timing does not have to change (a 10 s stall is
+invisible to callers except as latency). Question 5 could not be run on a
+GitHub-hosted runner from here, so the pre-agreed fallback stands as written:
+**`kind-e2e`/`upgrade-under-load` on a self-hosted runner with FUSE until a
+hosted runner is verified**, `csi-unit`/`csi-sanity` on hosted runners (K3b).
+
+**Two things K0 found that were not predicted.**
+
+- `SessionControl::detach` hands back a descriptor that is still `O_NONBLOCK`
+  (an armed session sets it on the open file description, which travels through
+  `SCM_RIGHTS`), and `fuser`'s `receive_retrying` retries `EAGAIN` immediately.
+  So stock `from_fd` on a *quiesced* handover descriptor does not fail — it
+  never returns, burning 4983 ms of CPU in a 5000 ms window (99.6 % of a core).
+  Measured, not inferred: clearing `O_NONBLOCK` first and changing nothing else
+  leaves the same non-return at 0.0025 % of a core, an ordinary blocking `read`.
+  `FuseSession::resume` is unaffected.
+- **`view.unmount` never answers for a view attached with
+  `MountSource::PreopenedFd`** — the shape `NodeUnstageVolume` needs.
+  `SessionControl::unmount` refuses ("the mountpoint of a preopened FUSE session
+  is unknown": nothing calls `FuseSession::set_mountpoint` on that path),
+  `NodeRuntime::remove_mount` only logs the refusal and then blocks in
+  `thread.join()` on a session nothing has ended. Unmounting by path from
+  outside releases it. Pre-existing, not caused by this work; recorded for K3a.
+
+**Not exercised here, by design or because it does not exist yet:**
+`node.handoff{target: Socket}` (the daemon answers `Unsupported`, "plan 37's" —
+K5 builds it), §8's `Prepare`/`Commit`/`Abort` phases (`HandoffParams` has no
+`phase` field — K5), and the engine's `HandleTableSnapshot` crossing a handover,
+which `upgrade-under-load` already covers against a real engine.
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset; re-run after the review fixes):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets --examples -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0 — **1781 passed, 0 failed**, 38 ignored (68 suites) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `target/release/harness run session-handover-idle upgrade-under-load e2e-basic` | ALL SCENARIOS PASSED — handover 232 ms; upgrades 258/242/569 ms, 16267 ops, longest syscall 342 ms, 10240 records + 2109 files + 3277 reads |
+| `bench/fuse-handover-probe/run.sh --in-container` / `--deep --in-container` | both exit 0 — the probe's own zero-I/O-error assertion holds on 44 + 14 handoffs |
+| `kind create/delete cluster --name kind-37-k0a` | created from `tests/csi/kind-config.yaml` (`--image kindest/node:v1.37.0-zfs`, this host's docker data root is ZFS-backed), six pods run, **cluster deleted** (not re-run for the review fixes: no probe change affects what question 5 asks) |
+
+Two notes on the gate runs, neither caused by this work:
+
+- An earlier `cargo test --workspace` failed three `constellation-model`
+  `delegation` properties on *"expected exhaustive exploration within budget"* —
+  a 55 s wall-clock cap, on a host at load average 40-65 (other agent sessions
+  plus this one's containers); `is_done` was true and no property was violated,
+  state counts were a fifth of the cap. The runs above are clean.
+- The harness needed `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-h37k0a`:
+  another session on this box held the shared `constellation-harness` docker
+  prefix lock, and the harness's own message prescribes a private prefix for
+  exactly that case. Containers and network were torn down afterwards.

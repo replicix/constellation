@@ -1525,6 +1525,21 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   device visible *inside the kind node container*, it does not grant a pod
   scheduled onto that node the capability to use it — the two are
   independent layers, confirmed by the same research thread).
+
+  **K0 corrected the first layer** (§"K0 results" row 5, measured on a real
+  cluster): the `extraMounts` are *not* what makes `/dev/fuse` appear in a
+  rootful host's kind node. kind runs every node container `--privileged`,
+  runc populates such a container's `/dev` from the host, and the
+  control-plane node — which the committed config leaves without
+  `extraMounts` — had a working `/dev/fuse` and served a FUSE mount from a
+  privileged pod. `kubernetes-sigs/kind#2540`'s "we do not need fuse at all
+  in rootful operation" is about kind's *own* explicit mount, not about
+  what a privileged node container ends up with. `tests/csi/kind-config.yaml`
+  keeps the `extraMounts` for determinism and for rootless/restricted
+  runtimes, not because the device would otherwise be missing. The second
+  layer is VERIFIED and stronger than stated above: with the device
+  bind-mounted in *and* `SYS_ADMIN` granted, an unprivileged pod still gets
+  `EPERM` from `open("/dev/fuse")`; `privileged: true` is what works.
 - **Constellation-specific scenarios** (new `crates/harness` scenarios,
   driven against the kind cluster rather than the harness's own
   `Client`/toxiproxy S3 setup — a genuinely new harness mode, `harness
@@ -2114,7 +2129,60 @@ The CONVENTIONS gates, PLUS:
 
 ## K0 results
 
-*(filled in by the executing model)*
+Track A (this section) was run on 2026-10-01 against kernel `7.0.0-31-generic`
+(Ubuntu 24.04). Nobody has root on the host, so the probes ran as root in a
+`--privileged --device /dev/fuse` container on that same kernel, and question 5
+ran in a three-node `kind` v0.33.0 cluster. The artifacts:
+
+| what | where |
+|---|---|
+| The handover probe (A → B → C, `SCM_RIGHTS`, `detach`/`resume`, writer + reader + fio throughout) | `crates/frontend-fuse/examples/handover_probe.rs` |
+| The `NodeStageVolume` probe (`fuse_mount_fd` here, `view.mount{PreopenedFd}` to a real daemon) | `crates/cli/examples/stage_volume_probe.rs` |
+| Runners, full write-up, raw JSON | `bench/fuse-handover-probe/` (`README.md`, `RESULTS.md`, `run.sh`, `stage-volume.sh`, `results/`) |
+| The kind cluster config, as verified | `tests/csi/kind-config.yaml` |
+
+**Track B (question 6) is not in this table — it is 37-k0b's, and runs
+independently.** Its row is left for that session to fill:
+
+| # | Prediction | Observation | Consequence taken |
+|---|---|---|---|
+| **6** (Track B) | *(pool metadata-throughput ceiling — 37-k0b)* | *(to be filled by 37-k0b)* | *(to be filled by 37-k0b)* |
+
+### Track A
+
+| # | Prediction (§8/§12/§15) | Observation | Consequence taken |
+|---|---|---|---|
+| **1** | Stock `Session::from_fd` on an already-initialised connection replies `EIO` to a real request and then fails hard. | **Reproduced exactly.** With a client's `statfs` waiting in the kernel queue (`waiting` = 1), `from_fd` returned `InvalidData`, *"Received non-init FUSE operation during handshake"*, and the client's syscall came back **`EIO`** (errno 5), 1.3 ms after the descriptor reached the second process. Also found, not predicted: with *nothing* waiting, `from_fd` does not return **at all** and burns 4983 ms of CPU in a 5000 ms window (**99.6 % of a core**). The cause is measured, not inferred: clearing `O_NONBLOCK` on the handover descriptor and changing nothing else leaves the same non-return at **0.0025 %** of a core — an ordinary blocking `read`. `SessionControl::detach` hands back a descriptor that is still `O_NONBLOCK` (an armed session sets it on the open file description, which travels through `SCM_RIGHTS`), and `fuser`'s `receive_retrying` retries `EAGAIN` immediately. | The patch is validated against a reproduced failure, as the question asked: `FuseSession::resume`/`from_fd_resumed` exists for exactly this and is unaffected (it skips the handshake, and an armed session `poll`s before reading). **For K5:** the production path must never reach stock `from_fd` with a handover descriptor; a misuse is a spinning core, not an error, so K5's resume path gets an explicit guard rather than relying on the error. |
+| **2** | The vendored resume patch serves ordinary read/write/getattr with no re-`INIT`. | **Yes.** 44 handoffs in one chain, through 45 distinct server processes, with writers and readers never stopping: every `FuseSession::resume` returned `Ok`, and the **resumed session's own** `negotiated_init()` — read back out of the session, not echoed from the request that carried it — equalled the detaching session's on all 44 handoffs. *No re-`INIT`* is by construction: `Session::from_fd_resumed` (`vendor/fuser/src/session.rs:406`) stores the carried `NegotiatedInit` and never calls `handshake()`, so there is no path on which a `FUSE_INIT` could be written; what the run adds is that the connection then **works** — after the last resume, `getattr`, a 4 KiB `O_DIRECT` `pread` of a writer's file (0 bytes differ from the pattern written before the handoffs), a write through a **freshly opened** handle and `readdir` were all correct. Over the whole run: 5.0 M writer ops / 329 GB and 1.2 M reader ops / 79 GB with **0 errors and 0 byte mismatches**, every reader operation answered by a server process over the handed-over connection (the readers are `O_DIRECT`, so no read was served from the page cache), and fio (`randrw`, 64k, 2 jobs, 60 s, spanning ~40 handoffs) exited 0 with `error: 0`. The probe *asserts* this: an error, a mismatch, a failed post-resume check or a non-zero fio status exits non-zero. | **Handover works as designed → proceed to K1-K7 as planned**, per §15's first pre-agreed consequence. `vendor/fuser`'s patch set stays a plan-31 C4 deliverable; nothing in §8 steps 1-5 needs redesigning. |
+| **3** | Under 2 s for the fd-passing round trip (§8 step 6's target). | **Three orders of magnitude under it at the median, two at the worst handoff.** Over 40 back-to-back handoffs: round trip (detach request → descriptor in hand → `SCM_RIGHTS` to the next process → it is serving) **p50 0.82 ms, p90 1.16 ms, max 21.5 ms** — at n = 40 the p99 *is* the maximum, so it is reported as one. The `SCM_RIGHTS`-send-plus-reconstruction leg alone is p50 0.19 ms / max 0.32 ms, and the detach leg (which contains §8 step 2's drain and `Vfs::sync_view`) p50 0.62 ms / max 21.2 ms. First client op after the resume: p50 0.006 ms, max 109 ms. At 80 concurrent client threads: round trip p50 1.29 ms, p90 2.01 ms, max 12.3 ms. One handoff of the 40 is the entire tail (that one: detach 21.2 ms, first op 109 ms, longest client syscall in the window 239 ms); the other 39 are ≤ 1.4 ms round trip. The host carried an unrelated load average of 20-55 across 32 CPUs, which the probe cannot separate from a handoff cost. | §8's 2 s target stands with enormous headroom even at the measured maximum, so **K5's timing budget is dominated by step 2's drain (data-dependent) and by pod scheduling, not by the transfer**. K5 gates the end-to-end `node.handoff` p99, not this leg, and sets it against the maximum rather than the median — a loaded node's tail is tens of milliseconds, not sub-millisecond. Note the probe pre-starts the next server before the clock, as a new engine pod would already be running; a cold pod start is a Kubernetes cost K5 measures separately. |
+| **4** | The kernel queues in-flight and new requests while nobody reads; bounded queue depth might make callers block, which is why step 2's drain has a timeout. The open question was whether it blocks or **errors** at realistic depth. | **Blocking only — never an error, at any depth or pause length tested.** With nobody reading `/dev/fuse` for 0.5 / 2 / 5 / 10 s, the writer's longest `pwrite` *and* the reader's longest `pread` were the pause + 1.3-2.4 ms (12 clients) or + 1.7-5.4 ms (80 clients), and the error count was **0** every time. `waiting` went 6-13 at 12 clients; at 80 clients it reached **80** — every client outstanding at once, above `congestion_threshold` (48) and above `max_background` (64), which bound *background* requests (readahead, writeback) and not the synchronous ones these clients issue — and still nothing failed: congestion throttles, it does not error. Both directions wait out the pause and are answered after the resume (the readers are `O_DIRECT`, so every one of their `pread`s had to cross the paused connection). | **K5's protocol timing does not have to change.** A 10 s stall is twice §8's default `--handoff-drain-timeout` (5 s) and a third of `--handoff-total-timeout` (30 s), and it is invisible to a caller except as latency, so the drain timeout stays a *liveness* bound rather than a correctness one. K5 should still keep the total timeout: a stall is only harmless while it ends. |
+| **5** | `extraMounts` puts `/dev/fuse` in the kind node (REPORTED, `kubernetes-sigs/kind#2540`), and the pod additionally needs `privileged: true` (REPORTED, two independent projects). | **The pod half is VERIFIED and is in fact stronger than stated; the node half is VERIFIED differently than stated.** A privileged pod on an `extraMounts` worker ran the whole chain (5 handoffs + a 1 s pause, 176 k writer ops, 92 k reader ops, 0 errors, 0 mismatches). An unprivileged pod cannot: with no device it gets `ENOENT`; with the device bind-mounted in by `hostPath` it gets **`EPERM` on `open("/dev/fuse")`**; with `hostPath` **and `SYS_ADMIN`** it *still* gets `EPERM` (the capability was genuinely in force — that pod could mount `fusectl`, the plain one could not). So bind-mounting the device in is not a substitute for `privileged: true`. The correction: on this host the `extraMounts` were **not** what made `/dev/fuse` available — kind runs node containers `--privileged`, runc populates a privileged container's `/dev` with every host device, and the control-plane node (deliberately left without `extraMounts` in the committed config, as a control group) had a working `/dev/fuse` too. | `tests/csi/kind-config.yaml` is committed with the `extraMounts` kept: they are harmless, they make the device present deterministically instead of as a side effect of runc's privileged-container behaviour, and they remain the documented pattern for rootless and restricted runtimes. The node-plugin `DaemonSet` keeps `securityContext.privileged: true` — K0 shows there is no weaker configuration that works. **A GitHub-hosted `ubuntu-latest` runner could not be tested from here**, so §15's pre-agreed fallback is taken as written: **`kind-e2e` and `upgrade-under-load` run on a self-hosted runner with FUSE support until a hosted runner is verified**, while `csi-unit` and `csi-sanity` stay on hosted runners (K3b's CI job, §13). `results/k0-question5-kind.txt` predates the probe's reader fix and the cluster is deleted, so it was not re-run: what question 5 asks — is the device there, and can a pod use it — does not depend on how the probe's readers reach the filesystem, and its in-pod handoff legs (round trip p50 0.53 ms) agree with the host runs. |
+
+### Gaps K0 found, for K5 and K3a (recorded, not fixed here)
+
+1. **`node.handoff{target: Socket}` does not exist.** The daemon answers
+   `Unsupported` — *"handing sessions to another process over a socket is plan 37's"*
+   (`crates/cli/src/control.rs`). §8's protocol is therefore unexercised as a
+   *protocol*: K0 drives `SessionControl::detach`/`FuseSession::resume` directly over
+   its own `SCM_RIGHTS` socket. **K5 builds it.**
+2. **§8's phases have no representation in the protocol.** `HandoffParams` carries
+   `{target, views, drain_timeout_ms}` and no `phase`; `Prepare`, `Commit` and `Abort`
+   (§8 steps 1, 6 and the rollback paths) exist only in prose. **K5 adds them**, or
+   §8 is rewritten to the shape `Socket` actually needs.
+3. **`view.unmount` hangs for a view attached with `MountSource::PreopenedFd`** — the
+   shape `NodeUnstageVolume` needs. `NodeRuntime::remove_mount` asks the session to
+   unmount, `SessionControl::unmount` refuses ("the mountpoint of a preopened FUSE
+   session is unknown": nothing calls `FuseSession::set_mountpoint` on that path), the
+   refusal is only logged, and `remove_mount` then blocks in `thread.join()` on a
+   session nothing has ended. The view is removed only once somebody unmounts the
+   kernel mount by path. **K3a** either carries the mountpoint in `ViewMountParams` for
+   a preopened fd, or makes `view.unmount` end the session without unmounting; either
+   way the call must answer. (The node plugin unmounting by path is the right division
+   of labour regardless — it made the mount.)
+4. **A detached descriptor is left `O_NONBLOCK`** (question 1). Harmless for
+   `FuseSession::resume`, a livelock for anything else that reads it. **K5** restores
+   the blocking mode in the resume path, or `SessionControl::detach` does before
+   handing the descriptor out.
 
 ## Sources checked out for this plan
 
