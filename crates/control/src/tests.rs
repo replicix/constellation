@@ -1716,7 +1716,7 @@ async fn only_mutating_calls_are_audited_with_a_digest_and_never_the_params() {
     assert_eq!(records[1].outcome, AuditOutcome::Err(ErrorKind::NotFound));
     assert_eq!(records[2].outcome, AuditOutcome::Err(ErrorKind::Denied));
     assert_eq!(records[2].role, Some(Role::Operator));
-    assert!(records[0].principal.contains("uid=1000"));
+    assert!(records[0].principal.to_string().contains("uid=1000"));
     assert!(records.iter().all(|r| r.ts_unix_ms > 1_600_000_000_000));
     // Never the raw params, anywhere in what would be written.
     for r in &records {
@@ -1760,6 +1760,106 @@ async fn the_file_sink_records_a_socket_call_as_one_json_line() {
     assert_eq!(record.encoding, Encoding::Postcard);
     assert!(record.params_digest.starts_with("blake3:"));
     assert!(!text.contains("\"/z\""));
+}
+
+/// The only production-reachable path for a `kind = "service"` grant
+/// (plan 33 U1): a real listener, a real peer-cred principal, the policy
+/// told the path it actually bound. Covers what a hand-built `Policy` in the
+/// `authz` unit tests cannot — that the bound path is plumbed through at all
+/// (an unwired `with_bound_socket` makes every service grant inert), that
+/// the two canonicalisations meet in the middle when the allowlist names the
+/// socket through a symlinked parent (plan 37's hostPath shape), and that
+/// the audit line a reader gets names the service.
+#[tokio::test]
+async fn a_service_grant_over_a_real_socket_grants_the_role_and_names_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    // The allowlist names the socket through a symlinked parent; the daemon
+    // binds — and canonicalises — the real one.
+    let real = dir.path().join("sockets");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    let configured = dir.path().join("link").join("control.sock");
+    let path = real.join("control.sock");
+    let elsewhere = dir.path().join("elsewhere.sock");
+
+    let allowlist = format!(
+        "[[grant]]\nkind = \"service\"\nprincipal = \"uid:{}\"\nsocket = {:?}\nrole = \"operator\"\nlabel = \"csi-node-plugin\"\n",
+        me(),
+        configured.display().to_string(),
+    );
+
+    // Matching: bound where the grant says, so pin.add (operator, mutating)
+    // is allowed and audited as the service.
+    let probes = Probes::default();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let listener = UnixSocketListener::bind(&path).unwrap();
+    let bound = std::fs::canonicalize(listener.path()).unwrap();
+    assert_eq!(bound, std::fs::canonicalize(&path).unwrap());
+    let policy = Policy::from_toml(&allowlist, None, &crate::authz::SystemGroups)
+        .unwrap()
+        .with_bound_socket(bound);
+    // The grant's configured path canonicalised at load time, through the
+    // symlink, to the very path the daemon bound.
+    assert_eq!(
+        policy.grants()[0].subject,
+        Subject::Service {
+            uid: me(),
+            socket: std::fs::canonicalize(&path).unwrap(),
+            label: "csi-node-plugin".into(),
+        }
+    );
+    let handle = serve(listener, test_router(&probes), policy, audit.clone());
+    let client = Client::connect_unix(&path).await.unwrap();
+    let welcome_roles = client.welcome().roles.clone();
+    client
+        .call::<PinAdd>(PathParams { path: "/p".into() })
+        .await
+        .unwrap();
+    assert_eq!(welcome_roles, Role::Operator.implied());
+    let records = audit.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].role, Some(Role::Operator));
+    assert_eq!(
+        serde_json::to_value(&records[0].principal).unwrap(),
+        json!({
+            "kind": "service",
+            "uid": me(),
+            "socket": std::fs::canonicalize(&path).unwrap().display().to_string(),
+            "label": "csi-node-plugin",
+        })
+    );
+    drop(client);
+    handle.shutdown().await;
+
+    // Same uid, same allowlist, a daemon bound somewhere else: no match, so
+    // not even a read is allowed. And a policy never told its bound path
+    // (binding failed) fails closed the same way.
+    for bound in [
+        Some(
+            std::fs::canonicalize(dir.path())
+                .unwrap()
+                .join("other.sock"),
+        ),
+        None,
+    ] {
+        let probes = Probes::default();
+        let listener = UnixSocketListener::bind(&elsewhere).unwrap();
+        let mut policy = Policy::from_toml(&allowlist, None, &crate::authz::SystemGroups).unwrap();
+        if let Some(bound) = bound.clone() {
+            policy = policy.with_bound_socket(bound);
+        }
+        let handle = serve(listener, test_router(&probes), policy, null_audit());
+        let client = Client::connect_unix(&elsewhere).await.unwrap();
+        assert!(client.welcome().roles.is_empty(), "{bound:?}");
+        let err = client
+            .call::<PinAdd>(PathParams { path: "/p".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Denied, "{bound:?}");
+        drop(client);
+        handle.shutdown().await;
+        std::fs::remove_file(&elsewhere).ok();
+    }
 }
 
 // ---------------------------------------------------------------------------

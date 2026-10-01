@@ -50,10 +50,10 @@
 //! does not hold a task forever.
 
 use crate::audit::{
-    now_unix_ms, params_digest, AuditOutcome, AuditRecord, AuditSink, NullAuditSink,
-    WITHHELD_DIGEST,
+    now_unix_ms, params_digest, AuditOutcome, AuditPrincipal, AuditRecord, AuditSink,
+    NullAuditSink, WITHHELD_DIGEST,
 };
-use crate::authz::{no_role, Policy, Principal, Role};
+use crate::authz::{no_role, Policy, Principal, Resolution, Role};
 use crate::fd::OwnedFd;
 use crate::methods::{method_info, Method, MethodInfo, StreamKind};
 use crate::proto::{
@@ -426,16 +426,41 @@ impl Router {
         let known = entry
             .map(|e| e.info)
             .or_else(|| method_info(&inv.method).copied());
-        let role = self.policy.role_of(&inv.principal);
+        let resolution = self.policy.resolve(&inv.principal);
+        let role = resolution.as_ref().map(|r| r.role);
         let ticket = match known {
-            Some(info) if info.mutating => AuditTicket::open(
-                self.audit.clone(),
-                &inv.principal,
-                role,
-                &info,
-                inv.encoding,
-                &inv.params,
-            ),
+            Some(info) if info.mutating => {
+                // Which row resolved the role, for every mutating call
+                // (plan 33): lets `doctor`/`status` answer "why am I only a
+                // viewer" without guesswork, and tells a service grant
+                // apart from a same-uid human grant. This is the *resolved*
+                // role, not the outcome — the check against the method's
+                // minimum role is below and may still deny.
+                match &resolution {
+                    Some(r) => tracing::debug!(
+                        principal = %inv.principal,
+                        method = info.name,
+                        role = %r.role,
+                        min_role = %info.min_role,
+                        matched = %r.matched,
+                        service_label = r.service.as_ref().map(|s| s.label.as_str()),
+                        "resolved the role of a mutating call"
+                    ),
+                    None => tracing::debug!(
+                        principal = %inv.principal,
+                        method = info.name,
+                        "no allowlist row matches this principal; the mutating call is denied"
+                    ),
+                }
+                AuditTicket::open(
+                    self.audit.clone(),
+                    &inv.principal,
+                    resolution.as_ref(),
+                    &info,
+                    inv.encoding,
+                    &inv.params,
+                )
+            }
             _ => AuditTicket::none(),
         };
         let reject = |ticket: AuditTicket, err: ControlError| {
@@ -457,7 +482,10 @@ impl Router {
             };
             return reject(ticket, err);
         };
-        if let Err(err) = self.policy.authorize(&inv.principal, &entry.info) {
+        if let Err(err) = self
+            .policy
+            .authorize_role(&inv.principal, &entry.info, Some(role))
+        {
             return reject(ticket, err);
         }
         if inv.params.encoding() != inv.encoding {
@@ -522,7 +550,7 @@ pub(crate) struct AuditTicket {
 
 struct TicketInner {
     sink: Arc<dyn AuditSink>,
-    principal: String,
+    principal: AuditPrincipal,
     role: Option<Role>,
     method: &'static str,
     encoding: Encoding,
@@ -537,7 +565,7 @@ impl AuditTicket {
     fn open(
         sink: Arc<dyn AuditSink>,
         principal: &Principal,
-        role: Option<Role>,
+        resolution: Option<&Resolution>,
         info: &MethodInfo,
         encoding: Encoding,
         params: &Blob,
@@ -550,8 +578,8 @@ impl AuditTicket {
         AuditTicket {
             inner: Some(TicketInner {
                 sink,
-                principal: principal.to_string(),
-                role,
+                principal: AuditPrincipal::new(principal, resolution),
+                role: resolution.map(|r| r.role),
                 method: info.name,
                 encoding,
                 digest,

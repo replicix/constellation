@@ -31,6 +31,17 @@
 //!   record names the encoding.
 //! - **The outcome, not the message.** `ok`, or `err` with the
 //!   [`ErrorKind`]; error messages can echo user data.
+//! - **A `kind = "service"` grant (plan 33 U1) widens the `principal`
+//!   field** from its usual `Display` string to a small JSON object —
+//!   `{"kind":"service","uid":0,"socket":"…","label":"csi-node-plugin"}` —
+//!   so an operator reading the trail can tell "the CSI driver did this"
+//!   apart from "a human at that same uid typed this at a terminal" without
+//!   cross-referencing the allowlist. Plan 33 asks this of *every* entry a
+//!   service grant matched, so it does not depend on whether that grant is
+//!   also the row that set the role (a broader group row, or the daemon
+//!   owner's hardcoded admin, may outrank it — the row that set the role is
+//!   in the `debug` line [`crate::server`] emits for the same call). Every
+//!   other principal's entry is unchanged (see [`AuditPrincipal`]).
 //!
 //! ## Trade-offs
 //!
@@ -43,12 +54,70 @@
 //! outage. Deployments that need fail-closed auditing implement
 //! [`AuditSink`] themselves and can panic or abort from `record`.
 
-use crate::authz::Role;
+use crate::authz::{Principal, Resolution, Role};
 use crate::proto::{Blob, Encoding, ErrorKind};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
+
+/// A `kind = "service"` grant's audit shape (see the module docs): always
+/// has `kind: "service"`, so a reader can tell it apart from the plain
+/// `Display` string every other principal gets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceAuditPrincipal {
+    pub kind: ServiceKindTag,
+    pub uid: u32,
+    pub socket: String,
+    pub label: String,
+}
+
+/// The literal string `"service"`, serialized as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceKindTag {
+    #[serde(rename = "service")]
+    Service,
+}
+
+/// `AuditRecord::principal`: the peer's `Display` string, unless a
+/// `kind = "service"` grant matched the caller, in which case the service's
+/// identity (plan 33 U1) — whether or not that grant is also what set the
+/// call's role (see [`Resolution::service`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuditPrincipal {
+    Service(ServiceAuditPrincipal),
+    Other(String),
+}
+
+impl AuditPrincipal {
+    /// Build the field for one call: `principal`'s `Display` form, replaced
+    /// by the service's identity whenever `resolution` carries one.
+    pub fn new(principal: &Principal, resolution: Option<&Resolution>) -> AuditPrincipal {
+        match resolution.and_then(|r| r.service.as_ref()) {
+            Some(svc) => AuditPrincipal::Service(ServiceAuditPrincipal {
+                kind: ServiceKindTag::Service,
+                uid: svc.uid,
+                socket: svc.socket.display().to_string(),
+                label: svc.label.clone(),
+            }),
+            None => AuditPrincipal::Other(principal.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for AuditPrincipal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditPrincipal::Other(s) => f.write_str(s),
+            AuditPrincipal::Service(svc) => write!(
+                f,
+                "service:uid={},socket={},label={}",
+                svc.uid, svc.socket, svc.label
+            ),
+        }
+    }
+}
 
 /// How a mutating call ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,8 +131,9 @@ pub enum AuditOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub ts_unix_ms: u64,
-    /// `Principal`'s display form.
-    pub principal: String,
+    /// `Principal`'s display form, or a service's identity (see
+    /// [`AuditPrincipal`]).
+    pub principal: AuditPrincipal,
     /// The principal's role, `None` when it had none (a denied stranger).
     pub role: Option<Role>,
     pub method: String,
@@ -191,7 +261,7 @@ mod tests {
     fn record(method: &str) -> AuditRecord {
         AuditRecord {
             ts_unix_ms: 1,
-            principal: "unix:uid=1".into(),
+            principal: AuditPrincipal::Other("unix:uid=1".into()),
             role: Some(Role::Admin),
             method: method.into(),
             encoding: Encoding::Json,
@@ -261,5 +331,71 @@ mod tests {
             a,
             params_digest(&Blob::Json(serde_json::json!({"x": 2, "y": "secret"})))
         );
+    }
+
+    #[test]
+    fn a_service_match_widens_principal_to_an_object_other_entries_stay_a_string() {
+        use crate::authz::ServiceMatch;
+
+        let human = AuditPrincipal::new(
+            &Principal::Unix {
+                uid: 1000,
+                gids: vec![1000],
+                pid: Some(1),
+            },
+            None,
+        );
+        let human_json = serde_json::to_value(&human).unwrap();
+        assert_eq!(
+            human_json,
+            serde_json::json!("unix:uid=1000,gids=[1000],pid=1")
+        );
+
+        let resolution = Resolution {
+            role: Role::Operator,
+            matched: crate::authz::MatchedBy::Grant {
+                index: 1,
+                subject: crate::authz::Subject::Service {
+                    uid: 0,
+                    socket: "/var/lib/constellation-csi/pv-1/control.sock".into(),
+                    label: "csi-node-plugin".into(),
+                },
+            },
+            service: Some(ServiceMatch {
+                uid: 0,
+                socket: "/var/lib/constellation-csi/pv-1/control.sock".into(),
+                label: "csi-node-plugin".into(),
+            }),
+        };
+        let svc = AuditPrincipal::new(
+            &Principal::Unix {
+                uid: 0,
+                gids: vec![0],
+                pid: Some(1),
+            },
+            Some(&resolution),
+        );
+        let svc_json = serde_json::to_value(&svc).unwrap();
+        assert_eq!(
+            svc_json,
+            serde_json::json!({
+                "kind": "service",
+                "uid": 0,
+                "socket": "/var/lib/constellation-csi/pv-1/control.sock",
+                "label": "csi-node-plugin",
+            })
+        );
+
+        // Round-trips through the exact file-sink format a reader sees.
+        let line = serde_json::to_string(&record_with_principal(svc.clone())).unwrap();
+        let back: AuditRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.principal, svc);
+    }
+
+    fn record_with_principal(principal: AuditPrincipal) -> AuditRecord {
+        AuditRecord {
+            principal,
+            ..record("fs.unlock")
+        }
     }
 }

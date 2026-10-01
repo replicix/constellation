@@ -29693,3 +29693,270 @@ Two notes on the gate runs, neither caused by this work:
   another session on this box held the shared `constellation-harness` docker
   prefix lock, and the harness's own message prescribes a private prefix for
   exactly that case. Containers and network were torn down afterwards.
+
+## Plan 33 U1 — service principals (subset)
+
+The "Service principals" slice of [plan 33](wip/33-control-plane-and-ui.md)'s
+security model, a prerequisite for plan 37 K6 (the CSI node plugin's control
+connection). Scope: only `kind = "service"` grants in the control allowlist
+and their audit shape — no UI, no headless web mode, no remote management,
+no change to roles, method minimum roles, or the `uid`/`group`/`device`/`sid`
+grant kinds, which plan 31 §9.5 already shipped.
+
+| Item | State | Where |
+|---|---|---|
+| `Subject::Service { uid, socket, label }`: a grant row matched by *both* the peer's uid and the daemon's own bound listening socket, never anything the client sends | DONE | `crates/control/src/authz.rs` |
+| TOML shape: `kind = "service"`, `principal = "uid:<n>"`, `socket = "<path>"`, `role`, `label`; exactly one subject key per entry (`uid`/`group`/`device`/`sid`/`kind = "service"`), so a `service` row that also sets `uid`/`group` is a load error | DONE | `crates/control/src/authz.rs` (`Policy::from_toml`) |
+| `Policy::resolve` (role_of plus a `ServiceMatch{uid,socket,label}` whenever a `kind = "service"` grant matched, and a `MatchedBy` naming the row that produced the role); `role_of` kept as a thin wrapper so every existing call site is unaffected | DONE | `crates/control/src/authz.rs` |
+| `Policy::with_bound_socket`: records the daemon's own canonical listening-socket path for service-grant matching; wired into the one production daemon socket (see Decisions) | DONE | `crates/control/src/authz.rs`, `crates/cli/src/control.rs` (`daemon_router`), `crates/cli/src/node_runtime.rs` (`ensure_status`) |
+| `Policy::to_toml` (parse → format → parse round trip, incl. a service row) | DONE | `crates/control/src/authz.rs` |
+| `AuditPrincipal`: `Other(String)` (unchanged `Display` form) or `Service{kind:"service",uid,socket,label}` when a service grant produced the call's role; `AuditRecord.principal` retyped from `String` to this | DONE | `crates/control/src/audit.rs` |
+| The "which row granted it" debug line for every mutating call: principal, method, the resolved role, the method's minimum role, the matched row (`MatchedBy`: `grant #<n> (<the row as the file spells it>)`, the owner rule, or an in-process caller) and the service label when a service grant matched | DONE | `crates/control/src/server.rs` (`Router::start`) |
+| Docs: allowlist section (new — none existed before this), service-kind TOML example from plan 33, `CONSTELLATION_CONTROL_POLICY` | DONE | `docs/reference/configuration.md` |
+
+### Decisions
+
+- **Exact TOML shape**: plan 33's prose example (`principal = "uid:0"`,
+  `socket = "<exact path>"`) and plan 37's (`uid = 0`, `socket_glob = "<glob>"`)
+  disagree; the coordinator brief resolved this explicitly in favor of plan
+  33's shape (named `principal`/`socket`, exact path, no glob), which is what
+  is implemented. `kind` is a new tagged field used *only* for `service`
+  rows — the other four subject kinds keep their untagged, infer-from-field
+  style unchanged, so no existing allowlist needs rewriting.
+- **Canonicalization**: the grant's `socket` is canonicalized once at
+  `Policy::from_toml` time (`std::fs::canonicalize`); if that fails (the pod
+  has not created the socket yet, `ENOENT`) the path is kept exactly as
+  written and logged at `debug`, never an error — a missing socket must not
+  break the whole allowlist. Any *other* canonicalization failure (an
+  unreadable parent directory, a symlink loop, a name too long) also keeps
+  the literal path but logs at `warn`: that path exists and will simply fail
+  to match a bound path that resolved differently, which is a
+  misconfiguration worth saying out loud rather than describing as "not
+  created yet". The daemon's own bound path is *not* canonicalized inside
+  `Policy` — `Policy::with_bound_socket` trusts whatever `PathBuf` it is
+  given, on the premise that whoever just bound the socket canonicalizes it
+  then (canonicalization cannot fail for a path that was just successfully
+  bound). This keeps matching a pure, deterministic path comparison with no
+  I/O in the hot `resolve`/`authorize` path.
+- **Wired into the one production control socket.** `NodeRuntime::ensure_status`
+  previously built the router (and thus the `Policy`) *before* binding the
+  daemon's control socket, so `with_bound_socket` had nothing to attach to —
+  a `kind = "service"` grant in a real `control-allow.toml`
+  (`$CONSTELLATION_CONTROL_POLICY`) would silently
+  never match. Reordered so the socket is resolved and bound first; its path
+  is canonicalized (the socket now exists, so this cannot fail the way a
+  config-file path can) and threaded into `cli::control::daemon_router`,
+  which calls `Policy::with_bound_socket` before the router is built. A bind
+  failure still degrades the same way as before (a warning, no control API)
+  and simply yields `bound_socket = None`, so no service grant can ever
+  match a daemon that isn't listening. No in-tree code declares a
+  `kind = "service"` grant yet (plan 37's CSI node plugin does not exist in
+  this tree); wiring a real multi-socket per-engine-pod daemon deployment is
+  plan 37 K6's job, but the one-socket-per-daemon case this plan covers is
+  fully live.
+- **`Policy::to_toml` returns `Result`** rather than `expect`-ing: it is a
+  `pub` API, and a panic inside a formatter that only the round-trip test
+  calls today would be a poor surprise for the `doctor`-style dump it
+  exists for.
+- **`Policy::authorize_role`**: the dispatch path resolved the principal's
+  role for the audit ticket and then had `authorize` walk the grant list a
+  second time for the same answer. `authorize_role` takes the already
+  resolved role; `authorize` keeps its old signature and behaviour for every
+  other caller.
+- **Audit shape**: `AuditRecord.principal` changes type from `String` to a new
+  `AuditPrincipal` enum (`#[serde(untagged)]`) so a service-matched call's
+  line carries a genuine JSON object (`{"kind":"service","uid":0,"socket":"…","label":"…"}`)
+  while every other principal still serializes exactly as before (the bare
+  `Display` string, e.g. `"unix:uid=1000,gids=[1000],pid=4242"`) — existing
+  audit-log readers/tests that only ever saw a string are unaffected.
+- **Highest-role-wins, and attribution tracked separately**: when a service
+  grant and a non-service grant (e.g. a `group` row, or the hardcoded owner
+  rule) both match a principal, the existing highest-role-wins rule decides
+  the *role*, unchanged. The *service attribution* is tracked independently:
+  `Resolution.service` is set whenever a `kind = "service"` grant matched,
+  even if another row granted a higher role, because plan 33 requires
+  **every** audit entry a service grant matched to carry
+  `principal.kind = "service"`. A first pass dropped the attribution unless
+  the service row strictly produced the winning role; that made the audit
+  trail depend on file order (a same-role `uid` row listed first silently
+  erased it) and lost it entirely whenever the daemon's owner uid equalled
+  the service uid — plan 37's own example is `principal = "uid:0"`. Since
+  the match predicate is (peer uid, this daemon's bound socket) and nothing
+  else, "a human at that uid" and "the service at that uid" are
+  indistinguishable at the transport; attribution is the allowlist author's
+  statement that this uid on this socket *is* that service, so the role some
+  other row happens to carry cannot refute it. Which row actually set the
+  role is reported separately, in `Resolution.matched` and the debug line.
+  Among several matching service grants the highest-role one wins the
+  attribution.
+- **Fuzz test**: `constellation-control` has no `proptest` dependency and no
+  existing fuzz test of its own to match; used the same deterministic
+  pseudo-random pattern already established in
+  `crates/meta/src/prune/policy.rs` (`fuzz_never_panics`) rather than adding
+  a new dependency for one test. A first pass drew from an alphabet of
+  TOML-ish characters, which only ever exercised the tokeniser — of 20,000
+  inputs none produced a single `[[grant]]` row, so none reached `kind`,
+  the `"uid:<n>"` parser or `canonicalize_grant_socket`. It now grows
+  whole rows out of the structural fragments of a real allowlist (per-kind
+  key sets, each key's valid value plus its near-misses, keys dropped,
+  byte soup spliced in) and asserts a floor on how often it reaches grant
+  validation (currently 4,894 of 20,000 inputs parse with at least one
+  grant, 720 with a service grant), so a later edit cannot quietly make the
+  fuzzer vacuous again. Each parsed policy is also resolved against
+  (with and without a bound socket) and re-serialized, so `resolve` and
+  `to_toml` are in the fuzzed surface, not just the parser.
+
+### Tests (`crates/control/src/authz.rs`, `audit.rs`)
+
+- `service_grant_matches_only_the_right_uid_and_socket`, `missing_socket_at_load_time_is_kept_literal_not_an_error`,
+  `highest_role_wins_between_a_group_grant_and_a_service_grant`,
+  `service_attribution_survives_a_tie_the_owner_rule_and_file_order`,
+  `the_highest_role_service_grant_wins_the_attribution`,
+  `the_matched_row_is_named_for_every_kind_of_match`,
+  `a_symlinked_socket_path_still_matches_the_daemons_bound_path`,
+  `service_grant_rejects_a_second_subject_key_and_stray_fields`,
+  `allowlist_parse_format_parse_round_trip_including_a_service_row`,
+  `fuzz_allowlist_parse_never_panics` (20,000 iterations).
+- `audit::tests::a_service_match_widens_principal_to_an_object_other_entries_stay_a_string`:
+  the exact JSON shapes for both a service-matched and an ordinary call, plus
+  a round trip through `serde_json` matching the file sink's own format.
+- `tests::a_service_grant_over_a_real_socket_grants_the_role_and_names_the_service`:
+  the production-shaped path — a real `UnixSocketListener`, real peer
+  credentials, the allowlist naming the socket through a symlinked parent
+  (plan 37's hostPath shape) while the daemon binds the real one. Asserts
+  the granted role, the `{"kind":"service",…}` audit line, and that the same
+  allowlist denies when the daemon bound a different path or was never told
+  its bound path at all. Verified to fail if `with_bound_socket` is unwired,
+  which is the one bug this slice actually hit.
+- `cli::control::tests::the_bound_socket_reaches_the_loaded_allowlist`: the
+  daemon's own policy wiring (`load_policy`, the half of `daemon_router`
+  that does not need an engine) — allowlist file on disk plus a bound
+  socket in, a matching service grant out; `None` bound socket and a
+  daemon bound elsewhere both fail closed; a malformed allowlist yields
+  owner-only-admin with no grants at all.
+
+### Wiring the bound socket into the one production daemon
+
+A first pass left `Policy::with_bound_socket` unwired (`cli::control::daemon_router`
+built the `Policy` before `node_runtime.rs` bound the daemon's control
+socket), which would have made every `kind = "service"` grant inert on a
+real daemon. Fixed by reordering `NodeRuntime::ensure_status`: the control
+socket is now resolved and bound (or the handed-over listener adopted)
+*before* `daemon_router` is called, its path canonicalized, and the result
+threaded through `daemon_router(service, state_dir, bound_socket)` into
+`Policy::with_bound_socket`. A bind failure still degrades exactly as
+before (a `tracing::warn!`, no control API) and simply yields
+`bound_socket = None`. This moved `e.runtime().enter()` earlier too, since
+`UnixSocketListener::bind`/`from_std` register with Tokio's reactor — the
+first version of this change panicked two `constellation` unit tests
+(`umount_tests::...`, `node_runtime::tests::two_views_of_one_node...`) with
+"there is no reactor running" until the guard was moved up with it.
+
+### Gate results
+
+Re-run in full after the review fixes below (same host, shared with several
+other agents' builds — load average 25–125 throughout).
+
+- `cargo fmt --all --check`: clean. `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean. `cargo doc -p constellation-control --no-deps`:
+  no warnings (the new intra-doc links resolve).
+- `cargo test --workspace --no-fail-fast`: 67 `test result: ok` blocks and
+  **one** failure, `constellation-net`
+  `peers::tests::a_closed_pooled_connection_is_not_reused_by_a_request`
+  (a QUIC `ping_node` assertion). `constellation-net` is untouched by this
+  change; the whole crate passes standalone (97 + 3 tests, 4.4 s) and the
+  test passes on three repeats. An earlier full run on the same tree failed
+  instead on `constellation-meta --test speculation` (also untouched, also
+  green standalone: 19 passed in 7.8 s) with everything else green — i.e.
+  each run loses a different wall-clock-sensitive test in a crate this diff
+  does not touch, and never the same one twice. The suite has never gone
+  green in a single pass on this host under this load; every crate this
+  change touches is green in both runs, including all new tests
+  (`constellation` cli 25 passed, `constellation-control` 144 passed).
+- `bash tests/smoke.sh` (`CONSTELLATION_BIN`/`CONSTELLATION_HARNESS_BIN` set
+  to the `--release` build): `SMOKE TEST PASSED`.
+- `bash tests/integration.sh`: run literally this time, with
+  `COMPOSE_PROJECT_NAME=constellation` so compose would reconcile with the
+  floci container already published on port 4566 rather than try to bind a
+  second one. `SMOKE TEST PASSED` / `INTEGRATION TEST PASSED`. Side effect
+  worth knowing: compose *recreated* that container (same image and
+  identical compose file, but it had been created from a different working
+  directory), so the long-running `constellation-floci-1` other agents share
+  was restarted. It came back healthy on the same port within seconds and
+  the project label now points at this worktree.
+- `target/release/harness run e2e-basic web-ui-smoke fsck-while-mounted
+  stale-daemon-lock` and `... session-handover-idle upgrade-under-load
+  named-shared-daemon`: `ALL SCENARIOS PASSED` for both (the second set is
+  the only coverage of the inherited-listener `from_std` branch the
+  `ensure_status` reorder touches). No scenario named `control-acl` exists
+  (`harness list`, 184 scenarios, has no authz/allowlist scenario), so
+  `e2e-basic` plus the control-socket/daemon-lifecycle scenarios stand in
+  for it. Needed `CONSTELLATION_HARNESS_DOCKER_PREFIX=ch-33u1`, because
+  another agent held the default `constellation-harness` docker prefix; the
+  harness tore its own containers and network down afterwards.
+- `harness run subtree-confinement`: not re-run — it needs CAP_SYS_ADMIN for
+  the `trusted.*` xattr namespace and fails unprivileged, as the reviewer
+  also found. pjdfstest and the full `harness run` matrix: not run (outside
+  this chunk's gate list, host saturated).
+
+### Review fixes (second pass)
+
+The chunk was reviewed with verdict *fix*; all three **Must fix** items and
+all four **Should fix** items were addressed, plus every nit.
+
+1. *Service attribution dropped unless the service row strictly won the
+   role.* Fixed: `Resolution.service` is now tracked independently of the
+   role maximisation (see the "Highest-role-wins" decision above), so a
+   same-role `uid` row listed first, or an owner uid that equals the service
+   uid, no longer erases the attribution. `Resolution` grew `matched`, so
+   "which row set the role" is still reported — it just no longer doubles as
+   the attribution. New test:
+   `service_attribution_survives_a_tie_the_owner_rule_and_file_order`.
+2. *The debug line did not name the matched row.* Fixed: `MatchedBy`
+   (`Owner`, `InProcess`, `Grant { index, subject }`, with a `Display` that
+   spells the row the way the file does) is in `Resolution` and in the
+   line, next to the resolved role and the method's `min_role`. Test:
+   `the_matched_row_is_named_for_every_kind_of_match`.
+3. *`configuration.md` claimed a parse error keeps the previous policy.*
+   Fixed: it now says the daemon falls back to owner-only-admin and that
+   there is no reload path yet (the SIGHUP behaviour belongs to whichever
+   chunk implements it). Asserted in
+   `cli::control::tests::the_bound_socket_reaches_the_loaded_allowlist`.
+4. *Every canonicalisation failure reported as "does not exist yet".* Fixed:
+   `debug!` only for `ErrorKind::NotFound`, `warn!` with the real error
+   otherwise (EACCES on a hostPath dir, ELOOP, ENAMETOOLONG).
+5. *"mutating call granted" logged before the authorization check.* Fixed:
+   the line now says it is the *resolved* role for a mutating call and
+   carries the method's minimum role, so a `viewer` about to be denied does
+   not read as a grant; a principal with no matching row gets its own line
+   saying the call is denied.
+6. *The fuzz test reached none of this chunk's code.* Fixed: structurally
+   seeded generator plus an in-test floor on how often it produces a parsed
+   grant (see the Fuzz test decision above).
+7. *No test covered the production-reachable path.* Fixed: a `Router` test
+   over a real `UnixSocketListener` with real peer credentials, and a
+   `cli::control` test over the real allowlist-file + bound-socket wiring
+   (see the Tests section above). The first was verified to fail when
+   `Policy::with_bound_socket` is stubbed out.
+
+Nits: the canonicalise failure in `node_runtime.rs` is logged at `warn`
+instead of silently swallowed; `authorize_role` stops the dispatch path
+walking the grant list twice; the `unknown grant kind` message reads as a
+sentence; this section says `control-allow.toml` (the implemented name), not
+`control-acl.toml`; `configuration.md` says `principal`/`socket`/`label` are
+mandatory on a service row; `Policy::to_toml` returns `Result` instead of
+`expect`-ing.
+
+One review observation left as-is, with evidence: the reviewer's "flag
+forward" that plan 37 K6 will want one grant covering
+`/var/lib/constellation-csi/sockets/*/control.sock` is correct and
+unaddressed — the brief chose plan 33's exact-path shape over plan 37's
+`socket_glob`, so a glob (or one row per engine pod) is plan 37 K6's
+decision, not a defect here.
+
+Also noticed while re-running the gates, out of scope for this chunk: plan
+33's sketch of the allowlist file has `version = 1` and an `[owner]` table,
+but `RawPolicy` is `deny_unknown_fields` and rejects both. The file format
+is plan 31 §9.5's, which never had them, and `docs/reference/configuration.md`
+documents it correctly; whoever implements the rest of plan 33's file
+(`[audit]`, `version`) has to add them.

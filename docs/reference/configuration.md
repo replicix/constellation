@@ -38,6 +38,7 @@ AWS credentials follow the ordinary AWS SDK chain (`AWS_REGION`,
   - [Filesystem stats and quota](#filesystem-stats-and-quota)
   - [Named filesystems and daemonization](#named-filesystems-and-daemonization)
   - [Control UI](#control-ui)
+  - [Control allowlist (plan 31 §9.5 / plan 33 U1)](#control-allowlist-plan-31-95--plan-33-u1)
   - [Fault injection (testing only)](#fault-injection-testing-only)
 - [Boolean values](#boolean-values)
 - [Build-time](#build-time)
@@ -665,6 +666,85 @@ operator has cleared.
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_WEB_UI_PORT` | `0` (disabled) | TCP port | localhost control UI; bare `--web-ui` listens on `8080` |
+
+### Control allowlist (plan 31 §9.5 / plan 33 U1)
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_CONTROL_POLICY` | `<config dir>/control-allow.toml` | path | the control-protocol allowlist (below); a missing file means only the daemon's own uid may connect, as `admin` |
+
+The daemon's own uid is always `admin` and is not expressible in the file (a
+truncated or malformed allowlist can only narrow access, never widen it past
+the owner); the file is otherwise a pure allowlist — absence of a matching
+`[[grant]]` denies even `viewer`. A parse error is loud (logged at `error`)
+and never falls open: the daemon runs with the owner-only policy — its own
+uid as `admin`, every other principal denied, including a `kind = "service"`
+grant below. The file is read once at startup; there is no reload yet (a
+`SIGHUP` reload that keeps the previously loaded grants on a parse error is
+plan 33's, not this subset's), so a typo takes effect on the next restart
+and takes every non-owner grant with it.
+
+```toml
+[[grant]]
+group = "constellation-ops"      # a group name, or a numeric gid
+role = "operator"
+
+[[grant]]
+uid = 1001
+role = "viewer"
+
+[[grant]]
+device = "ed25519:AbC…"          # a remote device key (plan 33's pairing flow)
+role = "viewer"
+
+[[grant]]
+sid = "S-1-5-21-…"               # a Windows SID (plan 35)
+role = "admin"
+```
+
+Exactly one subject key per entry (`uid`, `group`, `device`, `sid`, or
+`kind = "service"` below); `role` is mandatory on every entry. Group *names*
+are resolved to gids when the file is loaded; an unresolvable name is a load
+error. A principal's role is the highest of every entry that matches it,
+regardless of file order.
+
+**Service principals** (plan 33 U1, for plan 37's CSI node plugin): a
+`kind = "service"` grant additionally narrows a `unix` grant to one listening
+socket, for an automated caller that shares a uid — often `0` — with
+unrelated processes on the host:
+
+```toml
+[[grant]]
+kind = "service"
+principal = "uid:0"
+socket = "/var/lib/constellation-csi/sockets/pv-1/control.sock"
+role = "operator"
+label = "csi-node-plugin"
+```
+
+`principal`, `socket` and `label` are all mandatory on a `service` entry
+(and are rejected on any other kind). It matches only when the caller's peer
+uid equals the one in `principal` **and** the connection arrived on the
+daemon's own listening socket at exactly that canonical path (never a path
+the client claims). A `socket` that does not exist yet when the allowlist
+loads is accepted — the pod may create it after the grant is written — and
+logged at `debug`, not an error; a `socket` that exists but cannot be
+resolved (an unreadable parent directory, a symlink loop) is logged at
+`warn`, because the unresolved path will not match a daemon whose own bound
+path canonicalised differently.
+
+Audit entries (below) from a matched service grant carry
+`"principal":{"kind":"service","uid":0,"socket":"…","label":"csi-node-plugin"}`
+instead of the usual `"unix:uid=…"` string, so the trail distinguishes an
+automated driver from a human operator at the same uid. This holds whenever
+the service grant matched, even if a broader row (or the owner rule) granted
+the caller a higher role — the row that actually set the role is in the
+daemon's `debug` log of every mutating call, alongside the resolved role and
+the method's minimum.
+
+The audit log of mutating calls (`control-audit.jsonl` in the daemon's state
+dir) is one JSON line per call; see the `constellation_control::audit` module
+docs for its exact fields.
 
 ### Fault injection (testing only)
 

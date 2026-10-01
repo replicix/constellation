@@ -50,24 +50,48 @@ pub const AUDIT_FILE: &str = "control-audit.jsonl";
 
 /// The daemon's router: every method of the engine's service, the owner +
 /// allowlist policy, the state dir's audit log.
-pub fn daemon_router(service: &Arc<EngineControl>, state_dir: &Path) -> Router {
+///
+/// `bound_socket` is this daemon's own listening control socket,
+/// canonicalised by the caller (it just bound it, so canonicalisation
+/// cannot fail the way a config-file path can) — `None` when binding the
+/// socket itself failed, in which case no `kind = "service"` grant (plan 33
+/// U1) can ever match since nobody is listening anyway.
+pub fn daemon_router(
+    service: &Arc<EngineControl>,
+    state_dir: &Path,
+    bound_socket: Option<PathBuf>,
+) -> Router {
     let (owner, _) = constellation_platform::native().process.effective_ids();
-    let policy = match policy_path() {
-        Some(path) => Policy::load(&path, Some(owner)).unwrap_or_else(|e| {
-            // A broken authorization file must be loud, and must not widen
-            // anything: the owner keeps admin, nobody else gets in.
-            tracing::error!(path = %path.display(), error = %e,
-                "the control allowlist is unreadable; only the daemon's owner may connect");
-            Policy::owner_only(owner)
-        }),
-        None => Policy::owner_only(owner),
-    };
+    let policy = load_policy(policy_path().as_deref(), owner, bound_socket);
     let mut router = constellation_engine::control::router(service).with_policy(policy);
     match constellation_control::FileAuditSink::open(&state_dir.join(AUDIT_FILE)) {
         Ok(sink) => router = router.with_audit(Arc::new(sink)),
         Err(e) => tracing::warn!(error = %e, "control audit log unavailable"),
     }
     router
+}
+
+/// The policy half of [`daemon_router`], separated so a test can drive the
+/// allowlist file and the bound socket without an engine: load `path`, fall
+/// back to owner-only on any error, and tell the result which socket this
+/// daemon actually bound (plan 33 U1).
+fn load_policy(path: Option<&Path>, owner: u32, bound_socket: Option<PathBuf>) -> Policy {
+    let mut policy = match path {
+        Some(path) => Policy::load(path, Some(owner)).unwrap_or_else(|e| {
+            // A broken authorization file must be loud, and must not widen
+            // anything: the owner keeps admin, nobody else gets in. There
+            // is no reload yet, so this is also what a restart with a
+            // broken file gives — not the previously loaded grants.
+            tracing::error!(path = %path.display(), error = %e,
+                "the control allowlist is unreadable; only the daemon's owner may connect");
+            Policy::owner_only(owner)
+        }),
+        None => Policy::owner_only(owner),
+    };
+    if let Some(bound_socket) = bound_socket {
+        policy = policy.with_bound_socket(bound_socket);
+    }
+    policy
 }
 
 /// [`ControlHost`] over this daemon's [`NodeRuntime`].
@@ -362,4 +386,68 @@ pub async fn try_call<M: Method>(
 /// and the locator, only at the very end of a clean shutdown).
 pub fn socket_exists(state_dir: &Path) -> bool {
     locate_socket(state_dir).is_some_and(|sock| sock.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use constellation_control::authz::{Principal, Role};
+
+    fn unix(uid: u32) -> Principal {
+        Principal::Unix {
+            uid,
+            gids: vec![uid],
+            pid: Some(1),
+        }
+    }
+
+    /// The daemon's own policy wiring (plan 33 U1): the bound socket a
+    /// `kind = "service"` grant needs reaches the policy, and the grant is
+    /// inert without it. `daemon_router` adds only the engine's method
+    /// table and the audit sink on top of this.
+    #[test]
+    fn the_bound_socket_reaches_the_loaded_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        std::fs::write(&sock, b"").unwrap();
+        let allowlist = dir.path().join("control-allow.toml");
+        std::fs::write(
+            &allowlist,
+            format!(
+                "[[grant]]\nkind = \"service\"\nprincipal = \"uid:4242\"\nsocket = {:?}\nrole = \"operator\"\nlabel = \"csi-node-plugin\"\n",
+                sock.display().to_string()
+            ),
+        )
+        .unwrap();
+        let bound = std::fs::canonicalize(&sock).unwrap();
+
+        let p = load_policy(Some(&allowlist), 1000, Some(bound.clone()));
+        let resolved = p.resolve(&unix(4242)).expect("the service grant matches");
+        assert_eq!(resolved.role, Role::Operator);
+        assert_eq!(
+            resolved.service.map(|s| s.label),
+            Some("csi-node-plugin".to_string())
+        );
+
+        // No bound socket (binding failed): fails closed, owner still admin.
+        let p = load_policy(Some(&allowlist), 1000, None);
+        assert_eq!(p.role_of(&unix(4242)), None);
+        assert_eq!(p.role_of(&unix(1000)), Some(Role::Admin));
+
+        // A daemon bound elsewhere: no match.
+        let p = load_policy(Some(&allowlist), 1000, Some(dir.path().join("other.sock")));
+        assert_eq!(p.role_of(&unix(4242)), None);
+
+        // A broken allowlist is owner-only-admin, not the previous grants
+        // (there is no reload path) and not fail-open.
+        std::fs::write(&allowlist, "[[grant]]\nuid = \"not-a-number\"\n").unwrap();
+        let p = load_policy(Some(&allowlist), 1000, Some(bound));
+        assert_eq!(p.role_of(&unix(4242)), None);
+        assert_eq!(p.role_of(&unix(1000)), Some(Role::Admin));
+        assert!(p.grants().is_empty());
+
+        // No allowlist configured at all: same owner-only policy.
+        let p = load_policy(None, 1000, None);
+        assert_eq!(p.role_of(&unix(1000)), Some(Role::Admin));
+    }
 }

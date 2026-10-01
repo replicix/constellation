@@ -528,6 +528,54 @@ impl NodeRuntime {
             return;
         }
         let e = &self.engine;
+        // Bound here (not by a `serve` that binds for us) so that a handover
+        // can pass the very listener on (`crate::handover`): clients that
+        // connect during it wait in the backlog for the next image. The
+        // socket lives in the per-user runtime dir; the state dir records
+        // where (`control.path`), for every client that knows only it.
+        //
+        // Resolved and bound *before* the router is built, so the router's
+        // policy can be told this daemon's own canonical socket path
+        // (plan 33 U1's `kind = "service"` grants match against it, never
+        // anything a client claims — see `Policy::with_bound_socket`).
+        // `UnixSocketListener::bind`/`from_std` register with Tokio's
+        // reactor, so this needs the engine's runtime entered first — the
+        // same guard the actual `serve_router` call below has always needed.
+        let _guard = e.runtime().enter();
+        let bind_result = (|| -> Result<constellation_control::transport::UnixSocketListener> {
+            use constellation_control::transport::{
+                locate_socket, socket_path_for_state_dir, UnixSocketListener,
+            };
+            let state_dir = e.state_dir();
+            let inherited = self.control_listener.lock().unwrap().take();
+            match inherited {
+                Some(listener) => {
+                    let path = match locate_socket(state_dir) {
+                        Some(path) => path,
+                        None => socket_path_for_state_dir(&*self.host.dirs, state_dir)?,
+                    };
+                    UnixSocketListener::from_std(listener, &path)
+                        .context("serving the handed-over control socket")
+                }
+                None => {
+                    let path = socket_path_for_state_dir(&*self.host.dirs, state_dir)?;
+                    UnixSocketListener::bind(&path)
+                        .with_context(|| format!("binding control socket {}", path.display()))
+                }
+            }
+        })();
+        let bound_socket = bind_result.as_ref().ok().map(|listener| {
+            let path = listener.path();
+            std::fs::canonicalize(path).unwrap_or_else(|error| {
+                // We just bound it, so this should not happen; if it does,
+                // the literal path is still the best thing to match a
+                // `kind = "service"` grant against, but say so — the grant
+                // may now fail to match a canonicalised path.
+                tracing::warn!(path = %path.display(), %error,
+                    "cannot canonicalise the control socket just bound");
+                path.to_path_buf()
+            })
+        });
         let host = Arc::new(crate::control::DaemonHost {
             node: Arc::downgrade(self),
         });
@@ -540,34 +588,15 @@ impl NodeRuntime {
         );
         *status_guard = Some(status.clone());
         drop(status_guard);
-        let router = Arc::new(crate::control::daemon_router(&status, e.state_dir()));
-        let _guard = e.runtime().enter();
-        // Bound here (not by a `serve` that binds for us) so that a handover
-        // can pass the very listener on (`crate::handover`): clients that
-        // connect during it wait in the backlog for the next image. The
-        // socket lives in the per-user runtime dir; the state dir records
-        // where (`control.path`), for every client that knows only it.
+        let router = Arc::new(crate::control::daemon_router(
+            &status,
+            e.state_dir(),
+            bound_socket,
+        ));
         let served = (|| -> Result<()> {
-            use constellation_control::transport::{
-                locate_socket, record_socket, socket_path_for_state_dir, UnixSocketListener,
-            };
+            use constellation_control::transport::record_socket;
+            let listener = bind_result?;
             let state_dir = e.state_dir();
-            let inherited = self.control_listener.lock().unwrap().take();
-            let listener = match inherited {
-                Some(listener) => {
-                    let path = match locate_socket(state_dir) {
-                        Some(path) => path,
-                        None => socket_path_for_state_dir(&*self.host.dirs, state_dir)?,
-                    };
-                    UnixSocketListener::from_std(listener, &path)
-                        .context("serving the handed-over control socket")?
-                }
-                None => {
-                    let path = socket_path_for_state_dir(&*self.host.dirs, state_dir)?;
-                    UnixSocketListener::bind(&path)
-                        .with_context(|| format!("binding control socket {}", path.display()))?
-                }
-            };
             *self.handover.control.lock().unwrap() = Some(listener.try_clone_std()?);
             record_socket(state_dir, listener.path()).context("recording control.path")?;
             // Held for the daemon's life: dropping the handle does not stop
