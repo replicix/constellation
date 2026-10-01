@@ -69,7 +69,12 @@ for patch in "$@"; do
 done
 
 if [ "$check" = 1 ]; then
-  if diff -r -q -x patches -x CONSTELLATION-PATCH.md "$staged" "$vendor" >&2; then
+  # Cargo.lock and target/ appear when fuser's own suite is run in place
+  # (`cargo test --manifest-path vendor/fuser/Cargo.toml`, the gate the
+  # patch series is re-verified by); they are gitignored build artifacts,
+  # not part of the vendored tree.
+  if diff -r -q -x patches -x CONSTELLATION-PATCH.md -x Cargo.lock -x target \
+       "$staged" "$vendor" >&2; then
     echo "ok: the patch set reproduces vendor/fuser exactly" >&2
   else
     echo "error: vendor/fuser differs from pristine + patches (regenerate the patch)" >&2

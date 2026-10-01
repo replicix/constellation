@@ -20,27 +20,32 @@
 //! [`SessionControl::detach`] hands a serving session's connection out
 //! without the kernel ever seeing an unmount:
 //!
-//! 1. **Refuse early** while a request waits for a deferred reply (a
+//! 1. **Refuse outright** a session whose transport is not
+//!    [`Transport::DevFuse`] (plan 38 §3(e)): a connection whose ring
+//!    queues became ready can never be served over `/dev/fuse` again, so
+//!    there is nothing to hand over. This comes before everything below —
+//!    nothing is quiesced, and the session goes on serving.
+//! 2. **Refuse early** while a request waits for a deferred reply (a
 //!    blocking lock wait: its reply must be written on the descriptor it
 //!    was read from, by a process that still serves it; fuser 0.18 cannot
 //!    interrupt the wait).
-//! 2. **Close the notification gate** (`notify`'s module doc) while the
+//! 3. **Close the notification gate** (`notify`'s module doc) while the
 //!    session still serves, and wait — bounded — for the notification
 //!    writes under way. From here the engine's invalidations are dropped.
-//! 3. **Stop reading** (the vendored fuser's `SessionDetacher`): each
+//! 4. **Stop reading** (the vendored fuser's `SessionDetacher`): each
 //!    worker finishes the request it is dispatching — every op but a lock
 //!    wait answers inline — and returns before its next read. Requests the
 //!    kernel queues from now on stay queued, for the next server.
-//! 4. On the session's own thread, once every worker has returned:
+//! 5. On the session's own thread, once every worker has returned:
 //!    **re-check** the deferred replies (a lock wait may have begun between
-//!    1 and 3), **drain the deferred reads** (a cold read the engine answers
+//!    2 and 4), **drain the deferred reads** (a cold read the engine answers
 //!    from its completion pool: bounded, so waited for — up to
 //!    `CONSTELLATION_HANDOVER_READ_DRAIN_MS` — rather than refused), then
 //!    **publish every pending write** (`Vfs::sync_view`, the whole-view
 //!    barrier). Either failing aborts the detach: the session
 //!    resumes serving the same descriptor, in place, and the caller gets
 //!    the reason.
-//! 5. The caller receives the descriptor (a duplicate: same open file,
+//! 6. The caller receives the descriptor (a duplicate: same open file,
 //!    same connection) and the `FUSE_INIT` it agreed, and exports the
 //!    view's state; the session thread returns [`SessionExit::Detached`]
 //!    without unmounting or destroying anything.
@@ -53,7 +58,7 @@ use crate::adapter::{Deferred, FuseFs, KernelTuning};
 use crate::notify::{FuseNotifySink, NotifyGate};
 use constellation_types::Code;
 use constellation_vfs::{Blocking, Caller, FrontendCaps, OpCtx, OpKind, Vfs};
-use fuser::NegotiatedInit;
+use fuser::{NegotiatedInit, Transport};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -73,6 +78,23 @@ pub struct MountOptions {
     pub n_threads: usize,
     /// The kernel request queue `FUSE_INIT` negotiates.
     pub tuning: KernelTuning,
+    /// Ask the kernel to serve this mount over FUSE-over-io_uring
+    /// ([`fuser::Transport::Uring`]) instead of `/dev/fuse` reads and
+    /// `writev`s (plan 38 §2.4's ladder, step 2).
+    ///
+    /// Only a request: the transport is **runtime-negotiated**, never a
+    /// build-time choice. It is granted when this build carries the
+    /// `io-uring` feature, the kernel is 6.14+ with `fuse.enable_uring=Y`,
+    /// and `io_uring_setup(2)` and the ring reservation both succeed;
+    /// every refusal is logged once and the mount serves over `/dev/fuse`
+    /// (see [`FuseSession::transport`]).
+    ///
+    /// A mount that asks for the ring **cannot be handed over**
+    /// ([`SessionControl::detach`] refuses it, plan 38 §3(e)/Z0a), so
+    /// `constellation daemon --upgrade`'s and the CSI engine pod's mounts
+    /// must leave this `false`. Every mount Constellation makes today
+    /// does: the user-facing transport policy is plan 38 Z1b's.
+    pub io_uring: bool,
 }
 
 impl MountOptions {
@@ -93,8 +115,46 @@ impl MountOptions {
         };
         config.n_threads = Some(self.n_threads.max(1));
         config.clone_fd = cfg!(target_os = "linux") && config.n_threads != Some(1);
+        // One ring per worker thread, the kernel's per-CPU queues
+        // partitioned across them (plan 38 §3(a)/§4): fuser sizes the set
+        // from `n_threads`, not from the CPU count the kernel would
+        // otherwise give a ring each. `clone_fd` is ignored when the ring
+        // is active -- the ring's own per-worker queues are what it
+        // exists for -- and fuser logs that once.
+        if self.io_uring || uring_forced() {
+            if cfg!(feature = "io-uring") {
+                config.io_uring = true;
+            } else {
+                // A ladder that degrades: asking for a transport this
+                // build cannot speak is a downgrade, not a mount failure
+                // (fuser's own `Config::io_uring` would refuse the mount).
+                tracing::warn!(
+                    "io_uring requested but this build has no io-uring feature; using /dev/fuse"
+                );
+            }
+        }
         config
     }
+}
+
+/// Plan 38 Z1a's test hook: `CONSTELLATION_FUSE_URING=1` asks every mount
+/// this process makes for the ring transport, so the smoke and harness
+/// lanes can run a whole daemon on it without a user-facing knob existing
+/// yet. Z1b replaces it with `CONSTELLATION_FUSE_TRANSPORT`
+/// (`auto | dev-fuse`) and a `TransportPolicy` on `MountOptions`; nothing
+/// production reads this, and unset -- its only state in production --
+/// leaves every mount on `/dev/fuse`.
+///
+/// It is a blunt instrument on purpose: it turns the ring on for *every*
+/// mount, including the handover-capable ones, so setting it while running
+/// `cargo test` or the `session-handover-idle`/`upgrade-under-load`
+/// scenarios makes those fail by design -- a ring session refuses to be
+/// handed over. Set it for the ring-on smoke and harness legs only.
+fn uring_forced() -> bool {
+    matches!(
+        std::env::var("CONSTELLATION_FUSE_URING").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
 }
 
 /// Where a session's connection comes from (see the module doc).
@@ -116,6 +176,19 @@ pub struct FuseHandoff {
     pub init: NegotiatedInit,
     /// Where it is mounted, when known (for unmounting it later).
     pub mountpoint: Option<PathBuf>,
+}
+
+impl FuseHandoff {
+    /// The transport the connection is served over. Always
+    /// [`Transport::DevFuse`]: [`SessionControl::detach`] refuses to
+    /// produce a handoff for any other, and
+    /// [`NegotiatedInit::check_resumable`] -- which
+    /// [`FuseSession::resume`] runs -- refuses to serve one (plan 38
+    /// §3(e)). So a resumed session is `DevFuse` by construction, in
+    /// builds with and without the `io-uring` feature alike.
+    pub fn transport(&self) -> Transport {
+        self.init.transport
+    }
 }
 
 /// Everything the next server of a session needs (plan 31 §6.11's
@@ -206,6 +279,12 @@ struct Pending {
 
 /// State shared by a session, its thread and its [`SessionControl`]s.
 struct Shared {
+    /// The transport `FUSE_INIT` settled on, fixed for the life of the
+    /// connection. Only a `DevFuse` session can be handed over, so this is
+    /// what [`SessionControl::detach`] refuses by (plan 38 §3(e)).
+    transport: Transport,
+    /// `None` for a session that was never armed, which is every session
+    /// whose `transport` is not `DevFuse`.
     detacher: Mutex<Option<fuser::SessionDetacher>>,
     /// fuser's unmounter while fuser owns the mount (`Path`, not root);
     /// after a detach, or for a mount made here or elsewhere, the mount is
@@ -343,14 +422,28 @@ impl<V: Vfs> FuseSession<V> {
         mountpoint: Option<PathBuf>,
         fuser_unmounter: Option<fuser::SessionUnmounter>,
     ) -> std::io::Result<Self> {
-        let detacher = session.detacher()?;
+        // A ring session is not detachable: the kernel can neither hand
+        // its queues to another process nor route its requests back to
+        // `/dev/fuse` (plan 38 §3(e), Z0a). fuser refuses to arm one, so
+        // ask it only for the transport that can be.
+        let transport = session.transport();
+        let detacher = if transport.is_dev_fuse() {
+            Some(session.detacher()?)
+        } else {
+            tracing::info!(
+                transport = transport.name(),
+                "FUSE session is not handover-capable: this transport cannot be detached"
+            );
+            None
+        };
         let gate = NotifyGate::new(session.notifier());
         Ok(Self {
             session,
             vfs,
             config,
             shared: Arc::new(Shared {
-                detacher: Mutex::new(Some(detacher)),
+                transport,
+                detacher: Mutex::new(detacher),
                 fuser_unmounter: Mutex::new(fuser_unmounter),
                 mountpoint: Mutex::new(mountpoint),
                 gate,
@@ -375,7 +468,14 @@ impl<V: Vfs> FuseSession<V> {
         caps: FrontendCaps,
         sink: Option<&FuseNotifySink>,
     ) -> std::io::Result<FuseSession<V>> {
-        let config = opts.config();
+        let mut config = opts.config();
+        // A resumed connection is `/dev/fuse` -- `check_resumable` refuses
+        // anything else -- and there is no handshake here to create rings
+        // in, so asking for the ring would be silently ignored. Clear it
+        // rather than carry a request nothing can honor (this is what
+        // makes Z1a's `CONSTELLATION_FUSE_URING` hook safe to leave set
+        // across a `daemon --upgrade`).
+        config.io_uring = false;
         let fs = FuseFs::new(view.clone(), caps, opts.tuning);
         let deferred = fs.deferred().clone();
         let session = fuser::Session::from_fd_resumed(
@@ -399,6 +499,15 @@ impl<V: Vfs> FuseSession<V> {
     /// What this session's `FUSE_INIT` agreed.
     pub fn negotiated_init(&self) -> Option<NegotiatedInit> {
         self.session.negotiated_init()
+    }
+
+    /// The transport this session serves its connection over: what
+    /// [`MountOptions::io_uring`] asked for if the kernel, the build and
+    /// the process's capabilities all granted it, and
+    /// [`Transport::DevFuse`] otherwise (the reason was logged once, by
+    /// fuser, during the handshake). Fixed for the life of the connection.
+    pub fn transport(&self) -> Transport {
+        self.shared.transport
     }
 
     /// The handle that unmounts or detaches this session from any thread.
@@ -552,6 +661,24 @@ impl SessionControl {
     /// session) and its result travels with the connection. On any
     /// refusal the session keeps serving and nothing was exported.
     pub fn detach<S>(&self, export: impl FnOnce() -> S) -> Result<SessionHandoff<S>, DetachError> {
+        // First, before anything is quiesced: a session served over a ring
+        // can never be handed over. Its entries belong to this process's
+        // io_uring instance and die with it; the kernel does not route the
+        // connection's requests back to `/dev/fuse`, and re-registering
+        // from the next process loses every request that sat in an old
+        // entry -- leaving its caller unkillable until a fusectl abort
+        // (plan 38 §3(e), measured by Z0a). Tearing the mount down and
+        // remounting is the only upgrade path for such a session.
+        if !self.shared.transport.is_dev_fuse() {
+            return Err(refused(
+                Code::NotSupported,
+                format!(
+                    "this session is served over the {} transport, which cannot be handed over \
+                     (only dev_fuse can); unmount and remount instead",
+                    self.shared.transport
+                ),
+            ));
+        }
         let _one = self.shared.detaching.lock().unwrap();
         let deferred = self.shared.deferred.count();
         if deferred > 0 {
@@ -644,7 +771,46 @@ mod tests {
             read_only: false,
             n_threads: 2,
             tuning: KernelTuning::for_workers(2),
+            io_uring: false,
         }
+    }
+
+    /// Plan 38 Z1a. `io_uring: true`, and `allow_other` off so the mount
+    /// goes through `fusermount3` where the tests run unprivileged. Two
+    /// workers, so the ring set is two rings sharing the kernel's per-CPU
+    /// queues round-robin (§3(a): one ring per worker, not per CPU).
+    fn uring_options() -> MountOptions {
+        MountOptions {
+            fs_name: "constellation-uring-test".into(),
+            allow_other: false,
+            read_only: false,
+            n_threads: 2,
+            tuning: KernelTuning::for_workers(2),
+            io_uring: true,
+        }
+    }
+
+    /// The transport this host can actually grant, probed the way the
+    /// session probes it (`fuser::uring_unavailable`): the feature has to
+    /// be built in, `fuse.enable_uring` has to be `Y` (kernel 6.14+) *and*
+    /// `io_uring_setup(2)` has to be permitted here -- a seccomp policy
+    /// that denies it (plan 38 §8, and plan 37's CSI pods) leaves
+    /// `enable_uring=Y` saying nothing. Anything short of all three is a
+    /// downgrade the session must take silently, which is exactly the
+    /// ladder's step 2->3 (plan 38 §2.4).
+    fn transport_this_host_grants() -> Transport {
+        #[cfg(feature = "io-uring")]
+        {
+            match fuser::uring_unavailable() {
+                None => Transport::Uring,
+                Some(why) => {
+                    eprintln!("this host cannot grant the ring: {why}");
+                    Transport::DevFuse
+                }
+            }
+        }
+        #[cfg(not(feature = "io-uring"))]
+        Transport::DevFuse
     }
 
     fn caps() -> FrontendCaps {
@@ -856,6 +1022,7 @@ mod tests {
             time_gran_ns: 1,
             max_pages: 256,
             max_stack_depth: 0,
+            transport: Transport::DevFuse,
         };
         let json = serde_json::to_string(&init).unwrap();
         assert_eq!(serde_json::from_str::<NegotiatedInit>(&json).unwrap(), init);
@@ -874,6 +1041,39 @@ mod tests {
         let mut big = init;
         big.max_write = 64 << 20;
         assert!(big.check_resumable().is_err());
+        // Plan 38 §3(e): a ring connection is not resumable at all, in
+        // every build -- the refusal is not behind the `io-uring` feature,
+        // because a build without it must refuse a handoff a build with it
+        // produced rather than read `/dev/fuse` and hang.
+        for transport in [Transport::Uring, Transport::UringZeroCopy] {
+            let mut ring = init;
+            ring.transport = transport;
+            let err = ring
+                .check_resumable()
+                .expect_err("a ring connection is not resumable");
+            assert!(
+                err.to_string().contains(transport.name()),
+                "the refusal names the transport: {err}"
+            );
+            assert!(err.to_string().contains("cannot be handed over"), "{err}");
+        }
+    }
+
+    /// Plan 38 Z1a. `daemon --upgrade` detaches every session *before* the
+    /// new image parses the handoff, so a handoff a pre-Z1a binary wrote --
+    /// which has no `transport` field at all -- must still parse, or the
+    /// upgrade loses every mount with no rollback. The literal below is
+    /// what a `main` binary's `MountHandoff.init` serializes to.
+    #[test]
+    fn a_pre_z1a_handoff_parses_as_dev_fuse() {
+        let old = r#"{"kernel_major":7,"kernel_minor":41,"proto_major":7,"proto_minor":40,
+            "kernel_flags":5033163263,"flags":1108347323,"max_readahead":131072,
+            "max_write":1048576,"max_background":96,"congestion_threshold":72,
+            "time_gran_ns":1,"max_pages":256,"max_stack_depth":0}"#;
+        let init: NegotiatedInit = serde_json::from_str(old).expect("a pre-Z1a handoff parses");
+        // Nothing before this patch could negotiate anything but /dev/fuse.
+        assert_eq!(init.transport, Transport::DevFuse);
+        init.check_resumable().expect("and it resumes");
     }
 
     #[test]
@@ -898,5 +1098,115 @@ mod tests {
         assert!(drain_reads(&deferred, Duration::from_secs(10)));
         assert_eq!(deferred.bounded(), 0);
         pool.join().unwrap();
+    }
+
+    /// Plan 38 Z1a: a mount that asks for the ring gets whatever the
+    /// running kernel and this build actually offer, and serves either
+    /// way. On the dev host (`fuse.enable_uring=N`) that is the ladder's
+    /// fallback to `/dev/fuse` -- the whole point of the runtime
+    /// negotiation; on `RING_BOX` with the feature it is the ring.
+    #[test]
+    fn a_mount_that_asks_for_the_ring_serves_on_whatever_it_gets() {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping: needs /dev/fuse");
+            return;
+        }
+        let vfs = MockVfs::reference(caps());
+        let dir = tempfile::tempdir().unwrap();
+        let session = match mount(Arc::new(vfs.clone()), dir.path(), &uring_options(), caps()) {
+            Ok(session) => session,
+            Err(e) => {
+                eprintln!("skipping: cannot mount here ({e})");
+                return;
+            }
+        };
+        let expected = transport_this_host_grants();
+        eprintln!(
+            "mounted with io_uring: true; this host grants {expected}, the session reports {}",
+            session.transport()
+        );
+        assert_eq!(session.transport(), expected);
+        assert_eq!(
+            session.negotiated_init().expect("negotiated").transport,
+            expected,
+            "the negotiated record and the session agree"
+        );
+        let handover_capable = session.transport().is_dev_fuse();
+        let (control, thread) = serve(session);
+
+        // It serves: a `statfs` and a `readdir` through the mount, and --
+        // where this process owns the mount's root, which it does not when
+        // the tests run unprivileged against `MockVfs::reference`'s
+        // root-owned tree -- a write and a read back.
+        vfs.on_statfs(Script::ok(statfs()));
+        assert_eq!(statvfs(dir.path()).unwrap(), 1000);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let file = dir.path().join("f");
+        if std::fs::write(&file, b"over the ring or not").is_ok() {
+            assert_eq!(std::fs::read(&file).unwrap(), b"over the ring or not");
+        } else {
+            eprintln!("not writing: this process does not own the mock root");
+        }
+
+        // A ring session refuses the handover, and refuses it *first*:
+        // before the notification gate closes or anything else is
+        // quiesced, so it is still serving afterwards (plan 38 §3(e); the
+        // `/dev/fuse` case is the three detach tests above).
+        if !handover_capable {
+            let err = control
+                .detach(|| ())
+                .expect_err("a ring session cannot be handed over");
+            assert_eq!(err.code, Code::NotSupported);
+            assert!(err.reason.contains(expected.name()), "{err}");
+            assert!(err.reason.contains("cannot be handed over"), "{err}");
+            vfs.on_statfs(Script::ok(statfs()));
+            assert_eq!(statvfs(dir.path()).unwrap(), 1000);
+        }
+        end(control, thread);
+    }
+
+    /// Plan 38 §3(e): whatever a handoff claims, `resume` refuses to serve
+    /// a connection that is not `/dev/fuse`.
+    #[test]
+    fn resume_refuses_a_ring_handoff() {
+        if !Path::new("/dev/fuse").exists() {
+            eprintln!("skipping: needs /dev/fuse");
+            return;
+        }
+        let vfs = MockVfs::reference(caps());
+        let dir = tempfile::tempdir().unwrap();
+        // `allow_other` off (what `uring_options` differs in, besides the
+        // fs name), so `fusermount3` mounts this where tests run unprivileged
+        // and without `user_allow_other`: the refusal is then a gate on an
+        // ordinary host too, not only on a box that can grant the ring.
+        let opts = MountOptions {
+            io_uring: false,
+            ..uring_options()
+        };
+        let session = match mount(Arc::new(vfs.clone()), dir.path(), &opts, caps()) {
+            Ok(session) => session,
+            Err(e) => {
+                eprintln!("skipping: cannot mount here ({e})");
+                return;
+            }
+        };
+        let (control, thread) = serve(session);
+        let handoff = control.detach(|| ()).expect("detach");
+        assert_eq!(thread.join().unwrap().unwrap(), SessionExit::Detached);
+        let mut fuse = handoff.fuse;
+        assert_eq!(fuse.transport(), Transport::DevFuse);
+        // Claim the ring on an ordinary connection: `resume` must refuse
+        // it rather than serve a transport it cannot have registered.
+        fuse.init.transport = Transport::Uring;
+        let mountpoint = fuse.mountpoint.clone();
+        let err = match FuseSession::resume(fuse, Arc::new(vfs.clone()), &opts, caps(), None) {
+            Err(err) => err,
+            Ok(_) => panic!("a ring handoff is not resumable"),
+        };
+        assert!(err.to_string().contains("uring"), "{err}");
+        // Nothing serves the mount now; take it out of the mount table.
+        if let Some(path) = mountpoint {
+            let _ = unmount_path(&path, true);
+        }
     }
 }

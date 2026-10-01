@@ -15,7 +15,6 @@ use crate::Filesystem;
 use crate::PollNotifier;
 use crate::RenameFlags;
 use crate::Request;
-use crate::channel::ChannelSender;
 use crate::forget_one::ForgetOne;
 use crate::ll;
 use crate::ll::Errno;
@@ -32,24 +31,34 @@ use crate::session::SessionEventLoop;
 /// Request data structure
 #[derive(Debug)]
 pub(crate) struct RequestWithSender<'a> {
-    /// Channel sender for sending the reply
-    ch: ChannelSender,
+    // CONSTELLATION PATCH (io-uring): the reply prototype, not a channel
+    // sender: a request fetched from a ring is answered through its entry.
+    /// Prototype cloned into every reply object created for this request
+    sender: ReplySender,
     /// Parsed request
     pub(crate) request: ll::AnyRequest<'a>,
 }
 
 impl<'a> RequestWithSender<'a> {
     /// Create a new request from the given data
-    pub(crate) fn new(ch: ChannelSender, data: &'a [u8]) -> Option<RequestWithSender<'a>> {
-        let request = match ll::AnyRequest::try_from(data) {
-            Ok(request) => request,
+    pub(crate) fn new(sender: ReplySender, data: &'a [u8]) -> Option<RequestWithSender<'a>> {
+        match ll::AnyRequest::try_from(data) {
+            Ok(request) => Some(Self::from_request(sender, request)),
             Err(err) => {
                 error!("{err}");
-                return None;
+                None
             }
-        };
+        }
+    }
 
-        Some(Self { ch, request })
+    /// CONSTELLATION PATCH (io-uring): the ring transport parses the
+    /// request itself (one unparsable request leaves the ring usable,
+    /// unlike a `/dev/fuse` stream) and hands the parse in here.
+    pub(crate) fn from_request(
+        sender: ReplySender,
+        request: ll::AnyRequest<'a>,
+    ) -> RequestWithSender<'a> {
+        Self { sender, request }
     }
 
     /// Dispatch request to the given filesystem.
@@ -302,11 +311,7 @@ impl<'a> RequestWithSender<'a> {
                     self.request.nodeid(),
                     x.file_handle(),
                     x.offset(),
-                    ReplyDirectory::new(
-                        self.request.unique(),
-                        ReplySender::Channel(self.ch.clone()),
-                        x.size() as usize,
-                    ),
+                    ReplyDirectory::new(self.request.unique(), self.sender(), x.size() as usize),
                 );
             }
             ll::Operation::ReleaseDir(x) => {
@@ -479,7 +484,7 @@ impl<'a> RequestWithSender<'a> {
                     x.offset(),
                     ReplyDirectoryPlus::new(
                         self.request.unique(),
-                        ReplySender::Channel(self.ch.clone()),
+                        self.sender(),
                         x.size() as usize,
                     ),
                 );
@@ -552,7 +557,15 @@ impl<'a> RequestWithSender<'a> {
     /// Create a reply object for this request that can be passed to the filesystem
     /// implementation and makes sure that a request is replied exactly once
     pub(crate) fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique(), ReplySender::Channel(self.ch.clone()))
+        Reply::new(self.request.unique(), self.sender())
+    }
+
+    /// CONSTELLATION PATCH (io-uring): every reply object obtains its
+    /// sender here, so this is where the transport learns that a reply is
+    /// coming (the ring answers an unreplied request itself).
+    fn sender(&self) -> ReplySender {
+        self.sender.reply_created();
+        self.sender.clone()
     }
 
     /// Returns a Request reference for this request

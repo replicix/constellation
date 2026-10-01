@@ -500,6 +500,15 @@ impl SessionInfoParts {
             tuning: constellation_frontend_fuse::KernelTuning::for_workers(
                 crate::parallelism::thread_plan().fuse,
             ),
+            // Handover-capable by construction: these options only ever
+            // resume a detached session (`resume_in_place`), and a resumed
+            // connection is `/dev/fuse` -- a ring session cannot be handed
+            // over at all (plan 38 §3(e)). Asking here would change
+            // nothing in any case: `MountOptions::config` ORs Z1a's
+            // `CONSTELLATION_FUSE_URING` hook in, and `FuseSession::resume`
+            // clears `config.io_uring` for exactly this reason. Z1b's
+            // `TransportPolicy` is what pins the choice properly.
+            io_uring: false,
         }
     }
 }
@@ -843,6 +852,9 @@ fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
         tuning: constellation_frontend_fuse::KernelTuning::for_workers(
             crate::parallelism::thread_plan().fuse,
         ),
+        // A resumed connection is `/dev/fuse` by construction
+        // (`FuseHandoff::transport`, plan 38 §3(e)).
+        io_uring: false,
     };
     let session = match FuseSession::resume(
         FuseHandoff {

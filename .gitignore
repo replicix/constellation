@@ -5,6 +5,9 @@
 /bench/prollybench/target
 /bench/enginebench/target
 /bench/.cargo-home
+# fuser's own test suite, run in place (vendor/fuser/CONSTELLATION-PATCH.md)
+/vendor/fuser/Cargo.lock
+/vendor/fuser/target
 /.scratch
 mount.sh
 umount.sh

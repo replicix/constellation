@@ -46,6 +46,18 @@ experimental = [
     "async-trait",
     "tokio",
 ]
+# CONSTELLATION PATCH (io-uring): the FUSE-over-io_uring transport (Linux
+# 6.14+). Off by default: without it the crate is upstream 0.18.0 plus the
+# session-handover patch and nothing else. `io-uring` itself is a
+# `cfg(target_os = "linux")`-only dependency below, so enabling the feature
+# on another target builds the crate without the transport, which
+# `Session::new` then refuses at runtime.
+io-uring = [
+    "dep:io-uring",
+    "nix/mman",
+    "nix/event",
+    "nix/feature",
+]
 libfuse = []
 libfuse2 = ["libfuse"]
 libfuse3 = ["libfuse"]
@@ -120,6 +132,21 @@ optional = true
 [dependencies.zerocopy]
 version = "0.8"
 features = ["derive"]
+
+# CONSTELLATION PATCH (io-uring): the io-uring crate does not build on
+# macOS, which `--all-features` reaches.
+[target.'cfg(target_os = "linux")'.dependencies.io-uring]
+version = "0.7.14"
+optional = true
+
+# CONSTELLATION PATCH (io-uring): the one dev-dependency the crate's own
+# `#[cfg(test)]` code needs (`src/mnt/mod.rs`). Patch 0001 dropped every
+# dev-dependency with the unvendored examples; restoring this one makes
+# `cargo test` inside this directory run fuser's own suite, which is the
+# gate both patch series are re-verified by on every upstream upgrade
+# (vendor/fuser/CONSTELLATION-PATCH.md, "io-uring": the rubric).
+[dev-dependencies.tempfile]
+version = "3.10.1"
 
 [build-dependencies.pkg-config]
 version = "0.3.14"

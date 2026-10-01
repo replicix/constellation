@@ -393,6 +393,12 @@ impl NodeRuntime {
             tuning: constellation_frontend_fuse::KernelTuning::for_workers(
                 crate::parallelism::thread_plan().fuse,
             ),
+            // Plan 38 Z1a leaves every production mount on `/dev/fuse`;
+            // the transport policy that may ask for the ring is Z1b's.
+            // Z1a's `CONSTELLATION_FUSE_URING` test hook still reaches
+            // this mount (`MountOptions::config` ORs it in), which is how
+            // the smoke and harness lanes exercise the ring transport.
+            io_uring: false,
         };
         // An explicit session, so `remove_mount`/signals can unmount from
         // inside this process (its `FuseUnmounter`); without it, an

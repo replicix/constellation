@@ -20,7 +20,7 @@ pub mod threads;
 
 pub use adapter::{FuseFs, KernelTuning};
 pub use constellation_vfs::FrontendCaps;
-pub use fuser::NegotiatedInit;
+pub use fuser::{NegotiatedInit, Transport};
 pub use notify::FuseNotifySink;
 pub use reply::reply_code;
 pub use session::{

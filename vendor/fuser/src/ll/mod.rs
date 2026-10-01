@@ -16,6 +16,8 @@ pub(crate) use reply::ResponseData;
 pub(crate) use reply::ResponseEmpty;
 pub(crate) use reply::ResponseErrno;
 pub(crate) use reply::ResponseIoctl;
+// CONSTELLATION PATCH (io-uring)
+pub(crate) use reply::ResponseSegments;
 pub(crate) use reply::ResponseSlice;
 pub(crate) use reply::ResponseStruct;
 pub(crate) use request::AnyRequest;

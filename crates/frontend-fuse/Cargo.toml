@@ -14,6 +14,13 @@ fuser = { workspace = true, features = ["serializable"] }
 libc.workspace = true
 tracing.workspace = true
 
+[features]
+# Plan 38 Z1a: forwards to the vendored fuser's FUSE-over-io_uring
+# transport. Off by default -- and even with it on, no mount asks for the
+# ring unless `MountOptions::io_uring` (or Z1a's `CONSTELLATION_FUSE_URING`
+# test hook) says so, so the workspace default stays `/dev/fuse`.
+io-uring = ["fuser/io-uring"]
+
 [dev-dependencies]
 # `MockVfs` (tests/wire.rs): the adapter driven by a fake kernel over a
 # socket pair, against a recording, scriptable `Vfs`.

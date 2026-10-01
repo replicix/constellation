@@ -47,6 +47,13 @@ impl Channel {
         }
     }
 
+    /// CONSTELLATION PATCH (io-uring): the `/dev/fuse` descriptor every
+    /// ring SQE names, and the one the passthrough ioctls go through.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub(crate) fn device(&self) -> Arc<DevFuse> {
+        self.0.clone()
+    }
+
     /// CONSTELLATION PATCH (detach): make reads on this descriptor return
     /// `EAGAIN` when no request is pending (an armed session polls first).
     pub(crate) fn set_nonblocking(&self) -> io::Result<()> {

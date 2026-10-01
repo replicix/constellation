@@ -84,6 +84,8 @@ use crate::session::MAX_WRITE_SIZE;
 pub use crate::session::Session;
 pub use crate::session::SessionACL;
 pub use crate::session::SessionUnmounter;
+// CONSTELLATION PATCH (io-uring).
+pub use crate::session::Transport;
 
 mod access_flags;
 mod bsd_file_flags;
@@ -106,6 +108,15 @@ mod request;
 mod request_param;
 mod session;
 mod time;
+// CONSTELLATION PATCH (io-uring): the FUSE-over-io_uring transport, behind
+// the `io-uring` feature and Linux only. Without the feature nothing it
+// declares exists and the crate builds exactly as upstream's.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+mod uring;
+// CONSTELLATION PATCH (io-uring): the host probe, so that a caller's tests can
+// tell a legitimate fallback from a broken one without repeating the checks.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub use crate::uring::uring_unavailable;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]
@@ -345,12 +356,27 @@ impl KernelConfig {
     /// # Errors
     /// When the argument includes capabilities not supported by the kernel, returns the bits of the capabilities not supported.
     pub fn add_capabilities(&mut self, capabilities_to_add: InitFlags) -> Result<(), InitFlags> {
+        // CONSTELLATION PATCH (io-uring): echoing FUSE_OVER_IO_URING tells
+        // the kernel to route every request to ring queues, so a mount whose
+        // filesystem asked for the bit without the session having registered
+        // any is unservable. Only the session may request it, through
+        // `enable_io_uring`, and only once its rings exist.
+        if capabilities_to_add.contains(InitFlags::FUSE_OVER_IO_URING) {
+            return Err(InitFlags::FUSE_OVER_IO_URING);
+        }
         if !self.capabilities.contains(capabilities_to_add) {
             let unsupported = capabilities_to_add & !self.capabilities;
             return Err(unsupported);
         }
         self.requested |= capabilities_to_add;
         Ok(())
+    }
+
+    /// CONSTELLATION PATCH (io-uring): requests `FUSE_OVER_IO_URING`, which
+    /// `add_capabilities` refuses; see there.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub(crate) fn enable_io_uring(&mut self) {
+        self.requested |= InitFlags::FUSE_OVER_IO_URING;
     }
 
     /// Set the maximum number of pending background requests. Such as readahead requests.

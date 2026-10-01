@@ -61,6 +61,17 @@ impl Response for ResponseSlice<'_> {
     }
 }
 
+// CONSTELLATION PATCH (io-uring): a read reply whose payload is already
+// several borrowed segments (the FUSE adapter's `ReadData`), written to
+// `/dev/fuse` as one `writev(2)` without joining them into a buffer first.
+pub(crate) struct ResponseSegments<'a, 'b>(pub(crate) &'b [IoSlice<'a>]);
+
+impl<'a> Response for ResponseSegments<'a, '_> {
+    fn payload(&self) -> &[IoSlice<'a>] {
+        self.0
+    }
+}
+
 pub(crate) struct ResponseEmpty;
 
 impl Response for ResponseEmpty {
