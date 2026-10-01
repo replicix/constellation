@@ -15,6 +15,16 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Plan 32 §0.4 added everything after `tree`, all `#[serde(default)]`:
+/// the change is additive, so [`SNAPSHOT_RECORD_VERSION`] stays 2 and a
+/// record written before it still reads.
+///
+/// Every field here is immutable once written, which is why `held`/`held_by`
+/// are *not* among them (plan 32 §0.4: "they live only in the row"). A hold
+/// is taken and released through the metadata log, which no bucket object
+/// participates in; a copy here would be a write-only field that still said
+/// `held: true` long after the hold was released, and §0.3's orphan
+/// reconciliation would read it as truth.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub v: u32,
@@ -24,6 +34,16 @@ pub struct SnapshotRecord {
     pub creator: u64,
     /// The directory inside a published metadata tree.
     pub tree: SnapshotTreeRoot,
+    /// 0 manual, 1 policy-created.
+    #[serde(default)]
+    pub origin: u8,
+    /// The directory inode carrying the owning policy; 0 for none.
+    #[serde(default)]
+    pub policy_ino: u64,
+    /// The subtree's logical size at creation (REFER), when it was
+    /// available.
+    #[serde(default)]
+    pub refer_bytes: Option<u64>,
 }
 
 /// Where a snapshot lives: directory `ino` under the metadata
@@ -56,7 +76,24 @@ impl SnapshotRecord {
             created_unix_ms: now_unix_ms(),
             creator,
             tree,
+            origin: 0,
+            policy_ino: 0,
+            refer_bytes: None,
         }
+    }
+
+    /// Plan 32 §0.4's trailing fields, for a creator that has them. The
+    /// hold is deliberately absent — see the type's doc.
+    pub fn with_extensions(
+        mut self,
+        origin: u8,
+        policy_ino: u64,
+        refer_bytes: Option<u64>,
+    ) -> Self {
+        self.origin = origin;
+        self.policy_ino = policy_ino;
+        self.refer_bytes = refer_bytes;
+        self
     }
 
     pub fn id(&self) -> String {

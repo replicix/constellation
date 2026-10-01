@@ -266,6 +266,39 @@ pub enum LogRecord {
         new_name: String,
         time_ns: i64,
     },
+    /// Plan 32 §0.4: `SnapCreate` plus the row's optional trailing fields
+    /// (origin, owning policy, creator, REFER at creation). Writers emit
+    /// this; replay still accepts [`LogRecord::SnapCreate`], which a
+    /// journal or a log segment written before this change carries.
+    ///
+    /// The hold is *not* here: a snapshot created held journals this and
+    /// a [`LogRecord::SnapHold`] in the same transaction, so hold state
+    /// has exactly one record shape however it was set.
+    ///
+    /// Appended at the end of the enum, as the postcard ordering comment
+    /// on this type requires.
+    SnapCreate2 {
+        id: String,
+        path: String,
+        name: String,
+        root_hash: String,
+        created_unix_ms: i64,
+        origin: u8,
+        policy_ino: u64,
+        creator: u64,
+        refer_bytes: Option<u64>,
+    },
+    /// Plan 32 §0.4: the snapshot's retention hold was set or released.
+    /// `by` is the owner namespace (`user:`/`csi:`; `policy:` reserved),
+    /// `None` for a plain hold and always `None` on a release (an unheld
+    /// snapshot has no owner). Replay rewrites the row's `held`/`held_by`
+    /// fields and touches nothing else; a record for a snapshot that no
+    /// longer has a row is a no-op (the delete won the log order).
+    SnapHold {
+        id: String,
+        held: bool,
+        by: Option<String>,
+    },
 }
 
 impl LogRecord {

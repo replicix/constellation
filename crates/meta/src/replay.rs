@@ -17,7 +17,7 @@ use constellation_fs_core::{Ino, InodeKind};
 use constellation_mtree::keys;
 use constellation_mtree::record::{self, Attrs, DentryRecord, Kind};
 use constellation_types::Rdev;
-use fjall::SingleWriterWriteTx;
+use fjall::{Readable, SingleWriterWriteTx};
 use std::collections::BTreeSet;
 
 /// Which dentries/inos a batch of records touches, used to suppress a
@@ -106,6 +106,8 @@ impl TouchSet {
                 self.inos.insert(*ino);
             }
             LogRecord::SnapCreate { .. }
+            | LogRecord::SnapCreate2 { .. }
+            | LogRecord::SnapHold { .. }
             | LogRecord::SnapDelete { .. }
             | LogRecord::SetQuota { .. }
             | LogRecord::Atime { .. }
@@ -606,14 +608,68 @@ fn apply_one(
                 &meta.ns,
                 dirty,
                 keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
+                crate::store::snapshot_record(&crate::SnapshotRow::new(
+                    id.clone(),
+                    path.clone(),
+                    name.clone(),
+                    root_hash.clone(),
+                    *created_unix_ms,
+                )),
+            )?;
+            Ok(Applied::Done)
+        }
+        LogRecord::SnapCreate2 {
+            id,
+            path,
+            name,
+            root_hash,
+            created_unix_ms,
+            origin,
+            policy_ino,
+            creator,
+            refer_bytes,
+        } => {
+            ns::ns_insert(
+                tx,
+                &meta.ns,
+                dirty,
+                keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
                 crate::store::snapshot_record(&crate::SnapshotRow {
                     id: id.clone(),
                     path: path.clone(),
                     name: name.clone(),
                     root_hash: root_hash.clone(),
                     created_unix_ms: *created_unix_ms,
+                    origin: *origin,
+                    policy_ino: *policy_ino,
+                    creator: *creator,
+                    refer_bytes: *refer_bytes,
+                    // The hold, if any, rides in its own record.
+                    held: false,
+                    held_by: None,
                 }),
             )?;
+            Ok(Applied::Done)
+        }
+        LogRecord::SnapHold { id, held, by } => {
+            let key = keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes());
+            // A hold for a snapshot that is already gone is a no-op: the
+            // delete is ahead of us in the log and wins.
+            if let Some(value) = tx.get(&meta.ns, &key)? {
+                let mut row = crate::store::parse_snapshot_record(id, &value)?;
+                row.held = *held;
+                row.held_by = match *held {
+                    true => by.clone().filter(|by| !by.is_empty()),
+                    false => None,
+                };
+                ns::ns_insert(
+                    tx,
+                    &meta.ns,
+                    dirty,
+                    key,
+                    crate::store::snapshot_record(&row),
+                )?;
+            }
             Ok(Applied::Done)
         }
         LogRecord::SnapDelete { id, .. } => {

@@ -199,6 +199,27 @@ pub struct SnapshotManager {
     process: Option<Arc<dyn constellation_platform::Process>>,
 }
 
+/// Plan 32 §0.4: what a creator sets beyond `path@name`. The default is
+/// today's snapshot: manual, owned by no policy, not held.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotOptions {
+    /// 0 manual, 1 policy-created (plan 32's scheduler writes 1).
+    pub origin: u8,
+    /// The directory inode carrying the owning policy; 0 for none.
+    pub policy_ino: u64,
+    /// Take it already held, so it is never briefly unheld.
+    pub held: bool,
+    /// The hold's owner namespace (`user:<name>`, `csi:<uid>`).
+    pub held_by: Option<String>,
+}
+
+impl SnapshotOptions {
+    /// The owner, normalized: an empty string is no owner.
+    pub fn owner(&self) -> Option<&str> {
+        self.held_by.as_deref().filter(|by| !by.is_empty())
+    }
+}
+
 impl SnapshotManager {
     pub fn new(
         meta: Arc<Meta>,
@@ -244,7 +265,25 @@ impl SnapshotManager {
     }
 
     pub async fn create(&self, path: &str, name: &str) -> Result<String> {
+        self.create_with(path, name, &SnapshotOptions::default())
+            .await
+            .map(|(detail, _)| detail)
+    }
+
+    /// Take a snapshot, with plan 32 §0.4's extensions: where it came
+    /// from, which policy owns it, and whether it is born held (plan 37's
+    /// `snapshot.create{hold}`). Returns the summary line and the row as
+    /// recorded, so a caller need not look it up again.
+    pub async fn create_with(
+        &self,
+        path: &str,
+        name: &str,
+        options: &SnapshotOptions,
+    ) -> Result<(String, SnapshotRow)> {
         validate_name(name)?;
+        if let Some(by) = options.owner() {
+            validate_owner(by)?;
+        }
         let path = normalize_path(path);
         let ino = self
             .meta
@@ -279,6 +318,18 @@ impl SnapshotManager {
             );
         }
         let snapshot = SnapshotRoot { seq, root, ino };
+        // REFER (plan 32 §6.1, plan 37 §16's `size_bytes`): the local
+        // replica's DFS over the live subtree, taken once, here. It is a
+        // replica-local read (never an S3 walk); if it fails — the
+        // directory went away under us — the snapshot is still worth
+        // taking, with no size.
+        let refer_bytes = match self.meta.recursive_size(ino) {
+            Ok((bytes, _files)) => Some(bytes),
+            Err(error) => {
+                tracing::debug!(%path, name, %error, "snapshot: no REFER for this snapshot");
+                None
+            }
+        };
         let record = SnapshotRecord::new(
             &path,
             name,
@@ -288,25 +339,83 @@ impl SnapshotManager {
                 root: root.to_hex(),
                 ino,
             },
-        );
+        )
+        // The hold is not part of the bucket object (plan 32 §0.4: it
+        // lives only in the row, where releasing it can be recorded).
+        .with_extensions(options.origin, options.policy_ino, refer_bytes);
         match self.records.create(&record).await {
             Ok(()) => {}
             Err(StoreError::AlreadyExists) => bail!("snapshot {path}@{name} already exists"),
             Err(error) => return Err(error.into()),
         }
-        self.meta.record_snapshot(&SnapshotRow {
+        let row = SnapshotRow {
             id: record.id(),
             path,
             name: name.to_string(),
             root_hash: snapshot.encode(),
             created_unix_ms: record.created_unix_ms,
-        })?;
-        Ok(format!(
-            "created snapshot {}@{} ({}, metadata commit {seq})",
+            origin: options.origin,
+            policy_ino: options.policy_ino,
+            held: options.held,
+            creator: self.creator,
+            held_by: options.owner().map(str::to_string),
+            refer_bytes,
+        };
+        self.meta.record_snapshot(&row)?;
+        let detail = format!(
+            "created snapshot {}@{} ({}, metadata commit {seq}){}",
             record.path,
             record.name,
-            record.id()
-        ))
+            record.id(),
+            match (row.held, row.owner()) {
+                (true, Some(by)) => format!(", held by {by}"),
+                (true, None) => ", held".to_string(),
+                (false, _) => String::new(),
+            }
+        );
+        Ok((detail, row))
+    }
+
+    /// Plan 32 §0.4: set or release `target`'s retention hold. `target` is
+    /// a snapshot id or a `path@name` selector.
+    ///
+    /// Ownership is by metadata (plan 32 L6): a hold recorded under an
+    /// owner may only be released by that same owner, and may not be
+    /// silently taken over by another. `force` overrides both — the
+    /// control layer restricts who may ask for it. The comparison itself
+    /// is [`Meta::set_snapshot_hold`]'s, made inside the transaction that
+    /// writes the result; checking it here against a separate read would
+    /// let two concurrent holders both pass.
+    pub async fn hold(
+        &self,
+        target: &str,
+        held: bool,
+        by: Option<&str>,
+        force: bool,
+    ) -> Result<(String, SnapshotRow)> {
+        let by = by.filter(|by| !by.is_empty());
+        if let Some(by) = by {
+            validate_owner(by)?;
+        }
+        let id = snapshot_id_of(target)?;
+        let row = self
+            .meta
+            .set_snapshot_hold(&id, held, by, force)?
+            .with_context(|| format!("no such snapshot: {target}"))?;
+        let detail = match (held, row.owner()) {
+            (true, Some(by)) => format!("held snapshot {}@{} for {by}", row.path, row.name),
+            (true, None) => format!("held snapshot {}@{}", row.path, row.name),
+            (false, _) => format!("released snapshot {}@{}", row.path, row.name),
+        };
+        Ok((detail, row))
+    }
+
+    /// The row for a snapshot id or a `path@name` selector.
+    pub fn row(&self, target: &str) -> Result<SnapshotRow> {
+        let id = snapshot_id_of(target)?;
+        self.meta
+            .snapshot_by_id(&id)?
+            .with_context(|| format!("no such snapshot: {target}"))
     }
 
     pub fn list(&self, path: Option<&str>) -> Result<Vec<SnapshotRow>> {
@@ -434,8 +543,24 @@ impl SnapshotManager {
         }
     }
 
-    pub async fn delete(&self, path: &str, name: &str) -> Result<String> {
+    pub async fn delete(&self, path: &str, name: &str, force: bool) -> Result<String> {
         let path = normalize_path(path);
+        // A held snapshot is never deleted out from under its owner
+        // (plan 32 Step 5, plan 37's CSI driver): release it first.
+        if !force {
+            let id = constellation_store_s3::snapshot_id(&path, name);
+            if let Some(row) = self.meta.snapshot_by_id(&id)? {
+                if row.held {
+                    bail!(
+                        "snapshot {path}@{name} is held{}; release it first (`snapshot release`) or pass --force",
+                        match row.owner() {
+                            Some(by) => format!(" by {by}"),
+                            None => String::new(),
+                        }
+                    );
+                }
+            }
+        }
         if !self.meta.delete_snapshot(&path, name)? {
             bail!("snapshot {path}@{name} does not exist");
         }
@@ -608,9 +733,39 @@ pub fn split_selector(selector: &str) -> Result<(String, String)> {
     Ok((normalize_path(path), name.to_string()))
 }
 
+/// The snapshot id a control caller named: a `path@name` selector hashed
+/// the way creation hashed it, or an id passed through verbatim (plan 37's
+/// `DeleteSnapshot` has only the id).
+pub fn snapshot_id_of(target: &str) -> Result<String> {
+    match target.contains('@') {
+        true => {
+            let (path, name) = split_selector(target)?;
+            Ok(constellation_store_s3::snapshot_id(&path, &name))
+        }
+        false => Ok(target.to_string()),
+    }
+}
+
 pub fn normalize_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     format!("/{}", parts.join("/"))
+}
+
+/// Plan 32 §0.4: the owner namespaces a hold may be recorded under.
+/// `policy:` is reserved for plan 32's own scheduler and refused here;
+/// an unprefixed value is refused so a typo never becomes a namespace.
+/// An empty owner is not an owner at all — callers filter it out before
+/// asking.
+pub fn validate_owner(by: &str) -> Result<()> {
+    let (namespace, rest) = by.split_once(':').with_context(|| {
+        format!("hold owner {by:?} needs a namespace: `user:<name>` or `csi:<id>`")
+    })?;
+    match namespace {
+        "user" | "csi" if !rest.is_empty() => Ok(()),
+        "user" | "csi" => bail!("hold owner {by:?} has an empty {namespace} name"),
+        "policy" => bail!("the `policy:` hold namespace is reserved for snapshot policies"),
+        other => bail!("unknown hold owner namespace {other:?}: use `user:` or `csi:`"),
+    }
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -717,6 +872,187 @@ mod tests {
         assert!(SnapshotRoot::parse(&ChunkHash::of(b"tree blob").to_hex()).is_err());
         assert!(SnapshotRoot::parse("mtree:1:zz:3").is_err());
         assert!(SnapshotRoot::parse("mtree:1:2").is_err());
+    }
+
+    #[test]
+    fn hold_owners_need_a_known_namespace() {
+        validate_owner("user:attila").unwrap();
+        validate_owner("csi:0f3a-content-uid").unwrap();
+        // Reserved for plan 32's own scheduler, so nobody squats it.
+        assert!(validate_owner("policy:7").is_err());
+        // A typo must not become a namespace of its own.
+        assert!(validate_owner("attila").is_err());
+        assert!(validate_owner("users:attila").is_err());
+        assert!(validate_owner("user:").is_err());
+    }
+
+    /// Plan 32 §0.4 end to end over a real manager: a snapshot taken held
+    /// records its owner, only that owner may release it, and until it is
+    /// released nothing deletes it — while GC keeps protecting its chunks,
+    /// which is the property a hold exists to guarantee.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_snapshot_keeps_its_owner_its_chunks_and_its_life() {
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        let dir = meta.mkdir(1, "vol", 0o755, 1, 1).unwrap();
+        let file = meta.create(dir.ino, "data", 0o644, 1, 1).unwrap();
+        let manifest = Manifest::from_chunks(
+            DEFAULT_CHUNK_SIZE,
+            9,
+            vec![ChunkHash::of(b"held-chunk")],
+            constellation_fs_core::INLINE_CHUNKS_MAX,
+            ChunkHash::of,
+        )
+        .0
+        .encode();
+        meta.set_manifest(file.ino, &manifest, 9).unwrap();
+        let chunks = Arc::new(constellation_store_s3::ChunkStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let (manager, _nodes) = test_manager(meta.clone(), chunks.clone(), DEFAULT_CHUNK_SIZE);
+        ship_all(&meta, 1);
+
+        // Plan 37's `CreateSnapshot`: created held, owned by the
+        // VolumeSnapshotContent uid, with REFER filled in.
+        let options = SnapshotOptions {
+            held: true,
+            held_by: Some("csi:content-uid".into()),
+            ..Default::default()
+        };
+        let (detail, row) = manager
+            .create_with("/vol", "pvc-1", &options)
+            .await
+            .unwrap();
+        assert!(detail.contains("held by csi:content-uid"), "{detail}");
+        assert!(row.held);
+        assert_eq!(row.owner(), Some("csi:content-uid"));
+        assert_eq!(row.creator, 1);
+        assert_eq!(row.origin, 0, "a CSI snapshot is manual, never a policy's");
+        // REFER is the subtree's logical size at creation, from the
+        // replica's own DFS — the one file's 9 bytes.
+        assert_eq!(row.refer_bytes, Some(9));
+        // …and the same numbers came back through the listing.
+        let listed = manager.list(Some("/vol")).unwrap().remove(0);
+        assert_eq!(listed, row);
+
+        // An unrelated `snapshot delete` cannot take it out from under the
+        // driver, and the refusal names the owner.
+        let refused = manager
+            .delete("/vol", "pvc-1", false)
+            .await
+            .expect_err("a held snapshot was deleted");
+        let refused = format!("{refused:#}");
+        assert!(refused.contains("csi:content-uid"), "{refused}");
+        assert!(manager.list(Some("/vol")).unwrap().len() == 1);
+
+        // Nor can another owner release or steal the hold.
+        for by in [None, Some("user:attila")] {
+            let refused = manager
+                .hold("/vol@pvc-1", false, by, false)
+                .await
+                .expect_err("a foreign owner released the hold");
+            assert!(
+                format!("{refused:#}").contains("csi:content-uid"),
+                "{refused:#}"
+            );
+        }
+        assert!(manager.row("/vol@pvc-1").unwrap().held);
+
+        // The hold is what protects it, and GC still sees its chunks: the
+        // only pruning path a snapshot has today is an explicit delete, and
+        // that is exactly what the hold refuses.
+        let root = SnapshotRoot::parse(&row.root_hash).unwrap();
+        let refs = snapshot_chunk_refs(&chunks, manager.tree().unwrap(), &root)
+            .await
+            .unwrap();
+        assert!(refs.contains(&ChunkHash::of(b"held-chunk")));
+
+        // Its own owner releases it — by snapshot id, as plan 37's
+        // `DeleteSnapshot` does — and then it deletes.
+        let (detail, released) = manager
+            .hold(&row.id, false, Some("csi:content-uid"), false)
+            .await
+            .unwrap();
+        assert!(
+            detail.starts_with("released snapshot /vol@pvc-1"),
+            "{detail}"
+        );
+        assert!(!released.held);
+        assert_eq!(released.owner(), None);
+        manager.delete("/vol", "pvc-1", false).await.unwrap();
+        assert!(manager.list(Some("/vol")).unwrap().is_empty());
+    }
+
+    /// `--force` is the admin's override of both rules (the control layer
+    /// is what restricts it to admins), and a plain hold — no `--by`, the
+    /// pre-plan-32 behavior — is released by a plain release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_overrides_the_owner_and_a_plain_hold_needs_no_owner() {
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        meta.mkdir(1, "vol", 0o755, 1, 1).unwrap();
+        let chunks = Arc::new(constellation_store_s3::ChunkStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let (manager, _nodes) = test_manager(meta.clone(), chunks.clone(), DEFAULT_CHUNK_SIZE);
+        ship_all(&meta, 1);
+        manager.create("/vol", "plain").await.unwrap();
+        // The first snapshot's own row is journaled: a publish refuses
+        // while anything is unshipped, so ship it before the next one.
+        ship_all(&meta, 2);
+        manager.create("/vol", "owned").await.unwrap();
+
+        // A hold with no owner: held, releasable by anyone allowed to call.
+        let (_, row) = manager.hold("/vol@plain", true, None, false).await.unwrap();
+        assert!(row.held);
+        assert_eq!(row.owner(), None);
+        let (_, row) = manager
+            .hold("/vol@plain", false, None, false)
+            .await
+            .unwrap();
+        assert!(!row.held);
+
+        // A hold with an owner cannot be taken over…
+        manager
+            .hold("/vol@owned", true, Some("user:attila"), false)
+            .await
+            .unwrap();
+        assert!(manager
+            .hold("/vol@owned", true, Some("csi:x"), false)
+            .await
+            .is_err());
+        // …unless forced, which both re-owns it and, forced again,
+        // releases it.
+        let (_, row) = manager
+            .hold("/vol@owned", true, Some("csi:x"), true)
+            .await
+            .unwrap();
+        assert_eq!(row.owner(), Some("csi:x"));
+        let (_, row) = manager.hold("/vol@owned", false, None, true).await.unwrap();
+        assert!(!row.held);
+        // A forced delete does not even ask about the hold.
+        manager
+            .hold("/vol@owned", true, Some("user:attila"), false)
+            .await
+            .unwrap();
+        manager.delete("/vol", "owned", true).await.unwrap();
+        assert!(manager
+            .list(Some("/vol"))
+            .unwrap()
+            .iter()
+            .all(|r| r.name != "owned"));
+
+        // A namespace-less or reserved owner is refused before anything is
+        // written.
+        assert!(manager
+            .hold("/vol@plain", true, Some("attila"), false)
+            .await
+            .is_err());
+        assert!(manager
+            .hold("/vol@plain", true, Some("policy:1"), false)
+            .await
+            .is_err());
+        assert!(!manager.row("/vol@plain").unwrap().held);
+        // A snapshot that does not exist is a refusal, not a silent no-op.
+        assert!(manager.hold("/vol@nope", true, None, false).await.is_err());
     }
 
     /// A snapshot is a retained tree root: later writes to the source and

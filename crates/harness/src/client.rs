@@ -460,6 +460,9 @@ impl Client {
                 "snapshot",
                 "ls",
                 "/",
+                // Plan 32 §0.4 made the default a table; `--json` is the
+                // shape this parses.
+                "--json",
                 "--state-dir",
                 self.state.to_str().unwrap(),
             ])

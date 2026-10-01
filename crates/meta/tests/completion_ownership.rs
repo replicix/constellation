@@ -15,13 +15,13 @@ fn completion_marker_never_attaches_to_a_concurrent_writer() {
         let meta = meta.clone();
         std::thread::spawn(move || {
             for i in 0..OPS {
-                meta.record_snapshot(&SnapshotRow {
-                    id: format!("s{i}"),
-                    path: "/".into(),
-                    name: format!("s{i}"),
-                    root_hash: "00".into(),
-                    created_unix_ms: 0,
-                })
+                meta.record_snapshot(&SnapshotRow::new(
+                    format!("s{i}"),
+                    "/",
+                    format!("s{i}"),
+                    "00",
+                    0,
+                ))
                 .unwrap();
             }
         })

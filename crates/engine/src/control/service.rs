@@ -10,6 +10,29 @@ use crate::{backend, doctor, fsck, gc, held, leave, paths, snapshot, sync, write
 use constellation_control::proto::types as api;
 use constellation_store_s3::ChunkStore;
 
+/// A replicated snapshot row as the control protocol reports it. Plan 32
+/// §0.4's `origin` is a small integer in the row and a word on the wire,
+/// so a reader never has to know that 1 means "a policy's own".
+pub(crate) fn snapshot_status(row: constellation_meta::SnapshotRow) -> api::SnapshotStatus {
+    api::SnapshotStatus {
+        id: row.id,
+        path: row.path,
+        name: row.name,
+        root_hash: row.root_hash,
+        created_unix_ms: row.created_unix_ms,
+        origin: match row.origin {
+            0 => "manual".to_string(),
+            1 => "auto".to_string(),
+            other => format!("unknown({other})"),
+        },
+        policy_ino: row.policy_ino,
+        held: row.held,
+        held_by: row.held_by.filter(|by| !by.is_empty()),
+        creator: row.creator,
+        refer_bytes: row.refer_bytes,
+    }
+}
+
 impl EngineControl {
     /// Snapshot/clone control requests are metadata mutations too: acquire
     /// the subtree partition and force its pending data + journal through
@@ -812,15 +835,52 @@ impl EngineControl {
         Ok(format!("write mode set to {}", requested.as_str()))
     }
 
-    pub(crate) fn snapshot_create(&self, selector: &str) -> std::result::Result<String, String> {
+    pub(crate) fn snapshot_create(
+        &self,
+        selector: &str,
+        options: &snapshot::SnapshotOptions,
+    ) -> std::result::Result<(String, api::SnapshotStatus), String> {
         let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
         self.snapshot_barrier(&path)?;
         let snapshots = self.snapshots.clone();
-        let result =
-            tokio::task::block_in_place(|| self.rt.block_on(snapshots.create(&path, &name)))
-                .map_err(|error| format!("{error:#}"))?;
+        let (detail, row) = tokio::task::block_in_place(|| {
+            self.rt
+                .block_on(snapshots.create_with(&path, &name, options))
+        })
+        .map_err(|error| format!("{error:#}"))?;
         let _ = self.sync_tx.send(sync::SyncRequest::Nudge);
-        Ok(result)
+        Ok((detail, snapshot_status(row)))
+    }
+
+    /// Plan 32 §0.4: set or release a retention hold. `target` is a
+    /// snapshot id or a `path@name` selector.
+    ///
+    /// A hold is a journaled metadata mutation like create and delete, and
+    /// it is only worth anything if it reaches the whole cluster: a hold
+    /// written on a node that may not write the subtree would be invisible
+    /// to the holder, whose `snapshot.delete` (and plan 32 Step 4's
+    /// expiry) reads `held` from its own replica. So resolve the row for
+    /// its path, then take the same barrier `snapshot_delete` takes — it
+    /// is what refuses a read-only member and a peer-held lease.
+    pub(crate) fn snapshot_hold(
+        &self,
+        target: &str,
+        held: bool,
+        by: Option<&str>,
+        force: bool,
+    ) -> std::result::Result<(String, api::SnapshotStatus), String> {
+        let row = self
+            .snapshots
+            .row(target)
+            .map_err(|error| format!("{error:#}"))?;
+        self.snapshot_barrier(&row.path)?;
+        let snapshots = self.snapshots.clone();
+        let (detail, row) = tokio::task::block_in_place(|| {
+            self.rt.block_on(snapshots.hold(target, held, by, force))
+        })
+        .map_err(|error| format!("{error:#}"))?;
+        let _ = self.sync_tx.send(sync::SyncRequest::Nudge);
+        Ok((detail, snapshot_status(row)))
     }
 
     pub(crate) fn snapshot_list(
@@ -830,25 +890,19 @@ impl EngineControl {
         self.snapshots
             .list(path)
             .map_err(|error| format!("{error:#}"))
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| api::SnapshotStatus {
-                        id: row.id,
-                        path: row.path,
-                        name: row.name,
-                        root_hash: row.root_hash,
-                        created_unix_ms: row.created_unix_ms,
-                    })
-                    .collect()
-            })
+            .map(|rows| rows.into_iter().map(snapshot_status).collect())
     }
 
-    pub(crate) fn snapshot_delete(&self, selector: &str) -> std::result::Result<String, String> {
+    pub(crate) fn snapshot_delete(
+        &self,
+        selector: &str,
+        force: bool,
+    ) -> std::result::Result<String, String> {
         let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
         self.snapshot_barrier(&path)?;
         let snapshots = self.snapshots.clone();
         let result =
-            tokio::task::block_in_place(|| self.rt.block_on(snapshots.delete(&path, &name)))
+            tokio::task::block_in_place(|| self.rt.block_on(snapshots.delete(&path, &name, force)))
                 .map_err(|error| format!("{error:#}"))?;
         let _ = self.sync_tx.send(sync::SyncRequest::Nudge);
         Ok(result)
@@ -1197,5 +1251,42 @@ impl EngineControl {
         })
         .map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(&report).map_err(|e| format!("{e:#}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_status;
+    use constellation_meta::SnapshotRow;
+
+    /// Plan 32 §0.4 on the wire: `snapshot.list` reports the hold, its
+    /// owner, the origin as a word, and REFER — and an empty owner is no
+    /// owner, never an empty string a UI would print.
+    #[test]
+    fn a_row_becomes_the_status_the_protocol_documents() {
+        let mut row = SnapshotRow::new("id", "/vol", "pvc-1", "mtree:1:ab:9", 42);
+        row.held = true;
+        row.held_by = Some("csi:content-uid".into());
+        row.creator = 7;
+        row.refer_bytes = Some(4096);
+        let status = snapshot_status(row.clone());
+        assert_eq!(status.origin, "manual");
+        assert!(status.held);
+        assert_eq!(status.held_by.as_deref(), Some("csi:content-uid"));
+        assert_eq!(status.creator, 7);
+        assert_eq!(status.refer_bytes, Some(4096));
+
+        row.origin = 1;
+        row.policy_ino = 4096;
+        row.held_by = Some(String::new());
+        let status = snapshot_status(row.clone());
+        assert_eq!(status.origin, "auto");
+        assert_eq!(status.policy_ino, 4096);
+        assert_eq!(status.held_by, None);
+
+        // An origin from a future plan 32 step still reports as itself
+        // rather than being silently read as "manual".
+        row.origin = 9;
+        assert_eq!(snapshot_status(row).origin, "unknown(9)");
     }
 }

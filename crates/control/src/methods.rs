@@ -22,7 +22,7 @@
 //!
 //! Because [`METHODS`], [`visit_all`] and the `impl Method` blocks come out of
 //! the same macro invocation, "a method exists but is missing from the table"
-//! cannot happen; the tests instead pin the *contents* (57 methods, no
+//! cannot happen; the tests instead pin the *contents* (58 methods, no
 //! duplicates, every one of the 37 old `Request` variants maps to exactly
 //! one).
 //!
@@ -38,7 +38,7 @@
 //! | class | role | methods |
 //! |---|---|---|
 //! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
-//! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
+//! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
 //! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
 //! `fsck.run` is admin although a dry run only reads: one method, one role,
@@ -270,6 +270,11 @@ define_methods! {
         params: SnapshotListParams, result: SnapshotListing }
     SnapshotDelete { name: "snapshot.delete", role: Admin, mutating: true, stream: None,
         params: SnapshotDeleteParams, result: Ack }
+    /// Set or release a snapshot's retention hold (plan 32 §0.4). Operator,
+    /// like `snapshot.create`: taking a hold protects, it does not destroy.
+    /// `force` (overriding another owner's hold) needs admin.
+    SnapshotHold { name: "snapshot.hold", role: Operator, mutating: true, stream: None,
+        params: SnapshotHoldParams, result: SnapshotHeld }
     SnapshotRefs { name: "snapshot.refs", role: Viewer, mutating: false, stream: None,
         params: SnapRefsParams, result: RefHashes }
     /// Clone a snapshot to a destination path.
@@ -464,7 +469,11 @@ mod tests {
         );
         let unique: HashSet<_> = METHODS.iter().map(|m| m.name).collect();
         assert_eq!(unique.len(), METHODS.len(), "duplicate method names");
-        assert_eq!(METHODS.len(), 57, "36 old methods + 21 new ones");
+        assert_eq!(
+            METHODS.len(),
+            58,
+            "36 old methods + 21 new ones + snapshot.hold"
+        );
         for m in METHODS {
             assert!(
                 m.name.split('.').all(|seg| !seg.is_empty()

@@ -145,6 +145,10 @@ pub struct CacheEntryStatus {
     pub state: String,
 }
 
+/// One snapshot, as `snapshot.list`/`snapshot.create`/`snapshot.hold`
+/// report it. Everything after `created_unix_ms` is plan 32 §0.4's row
+/// extension; a snapshot taken before it reports the defaults (`manual`,
+/// not held, no owner, no size).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotStatus {
     pub id: String,
@@ -152,6 +156,28 @@ pub struct SnapshotStatus {
     pub name: String,
     pub root_hash: String,
     pub created_unix_ms: i64,
+    /// `manual` or `auto` (a snapshot policy's own).
+    #[serde(default)]
+    pub origin: String,
+    /// The directory inode carrying the owning policy; 0 for none.
+    #[serde(default)]
+    pub policy_ino: u64,
+    /// A retention hold: `snapshot.delete` refuses it without `force`,
+    /// and plan 32's expiry never considers it.
+    #[serde(default)]
+    pub held: bool,
+    /// Who owns the hold: `user:<name>`, `csi:<VolumeSnapshotContent
+    /// uid>`; absent for a plain hold with no recorded owner.
+    #[serde(default)]
+    pub held_by: Option<String>,
+    /// The node that took it; 0 = unknown.
+    #[serde(default)]
+    pub creator: u64,
+    /// REFER: the subtree's logical size when the snapshot was taken —
+    /// what restoring it needs (plan 37's CSI `size_bytes`). Absent when
+    /// it was not available at creation.
+    #[serde(default)]
+    pub refer_bytes: Option<u64>,
 }
 
 /// One offline designation, as exposed by the control API.
@@ -1868,13 +1894,157 @@ pub struct FsckReport {
     pub report: JsonValue,
 }
 
-/// `snapshot.create`. `hold` (plans 32/37): a retention hold name that keeps
-/// the snapshot out of policy pruning until released.
+/// `snapshot.create`'s `hold` (plans 32/37), which has two spellings
+/// because two plans wrote it down differently and both must work:
+///
+/// - `"hold": true` — take it held, with `held_by` naming the owner (or
+///   nobody). The spelling the CLI's `--hold [--by ...]` sends.
+/// - `"hold": "csi:<content-uid>"` — hold it, owned by that string. Plan
+///   31 L1208 and plan 37 §5's `Controller.CreateSnapshot` row spell the
+///   driver's call exactly this way, so it deserializes verbatim.
+///
+/// Hand-written codecs rather than a serde enum representation: the only
+/// one that produces a bare `true`/`"owner"` is the tagless one, and
+/// postcard — not self-describing — cannot read it back at all (see
+/// `no_postcard_hostile_serde_attributes`). So the self-describing
+/// encoding gets both spellings and a positional one carries the resolved
+/// `(held, owner)` pair, which is lossless either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hold {
+    /// Whether a hold was asked for at all.
+    pub held: bool,
+    /// The owner, when the `"hold": "<owner>"` spelling named one.
+    pub owner: Option<String>,
+}
+
+impl Hold {
+    /// `"hold": true|false`.
+    pub fn flag(held: bool) -> Hold {
+        Hold { held, owner: None }
+    }
+
+    /// `"hold": "<owner>"` — plan 37's shorthand.
+    pub fn owned_by(owner: impl Into<String>) -> Hold {
+        Hold {
+            held: true,
+            owner: Some(owner.into()),
+        }
+    }
+}
+
+impl Serialize for Hold {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match (&self.owner, serializer.is_human_readable()) {
+            (Some(owner), true) => serializer.serialize_str(owner),
+            (None, true) => serializer.serialize_bool(self.held),
+            (_, false) => {
+                use serde::ser::SerializeTuple;
+                let mut tuple = serializer.serialize_tuple(2)?;
+                tuple.serialize_element(&self.held)?;
+                tuple.serialize_element(&self.owner)?;
+                tuple.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Hold {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Hold, D::Error> {
+        struct Either;
+        impl serde::de::Visitor<'_> for Either {
+            type Value = Hold;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a boolean, or the hold owner as a string")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, held: bool) -> Result<Hold, E> {
+                Ok(Hold::flag(held))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, owner: &str) -> Result<Hold, E> {
+                // An empty string is "no owner named", not an owner whose
+                // name is empty — same normalization as `held_by`.
+                Ok(match owner.is_empty() {
+                    true => Hold::flag(true),
+                    false => Hold::owned_by(owner),
+                })
+            }
+        }
+        if deserializer.is_human_readable() {
+            return deserializer.deserialize_any(Either);
+        }
+        let (held, owner) = <(bool, Option<String>)>::deserialize(deserializer)?;
+        Ok(Hold { held, owner })
+    }
+}
+
+impl JsonSchema for Hold {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Hold".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "anyOf": [
+                {"type": "boolean"},
+                {"type": "string"}
+            ],
+            "description": "true/false, or the hold owner as a string (`csi:<uid>`), which implies a hold"
+        })
+    }
+}
+
+/// `snapshot.create`. `hold` (plans 32/37) takes the snapshot already
+/// held, so it is never briefly exposed to pruning; `held_by` records who
+/// owns that hold (`user:<name>`, `csi:<VolumeSnapshotContent uid>`;
+/// `policy:` is reserved and refused). A `held_by` on its own implies
+/// `hold`, so plan 37's driver can say only who it is.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotCreateParams {
     pub selector: String,
     #[serde(default)]
-    pub hold: Option<String>,
+    pub hold: Hold,
+    #[serde(default)]
+    pub held_by: Option<String>,
+}
+
+impl SnapshotCreateParams {
+    /// The two spellings resolved into `(held, owner)`. Naming an owner at
+    /// all asks for the hold, so plan 37's driver can pass `held_by` alone
+    /// or `hold: "csi:<uid>"` alone. Both spellings naming *different*
+    /// owners is a client bug, not something to pick a winner for.
+    pub fn hold_request(&self) -> Result<(bool, Option<&str>), String> {
+        let explicit = self.held_by.as_deref().filter(|by| !by.is_empty());
+        let shorthand = self.hold.owner.as_deref().filter(|by| !by.is_empty());
+        let owner = match (explicit, shorthand) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(format!(
+                    "hold names the owner {b:?} but held_by names {a:?}; pass one of them"
+                ))
+            }
+            (Some(by), _) | (None, Some(by)) => Some(by),
+            (None, None) => None,
+        };
+        Ok((self.hold.held || owner.is_some(), owner))
+    }
+}
+
+/// `snapshot.hold`: set (`held: true`) or release (`held: false`) a
+/// snapshot's retention hold.
+///
+/// `id` is a snapshot id (`snapshot.list`'s `id`) or a `path@name`
+/// selector. `by` is the owner namespace: releasing a hold recorded under
+/// an owner requires naming that same owner, and taking over another
+/// owner's hold is refused — `force` (admin only) overrides both.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotHoldParams {
+    pub id: String,
+    pub held: bool,
+    #[serde(default)]
+    pub by: Option<String>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `snapshot.list`.
@@ -1884,10 +2054,13 @@ pub struct SnapshotListParams {
     pub path: Option<String>,
 }
 
-/// `snapshot.delete`.
+/// `snapshot.delete`. A held snapshot is refused (the message names the
+/// owner) unless `force`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotDeleteParams {
     pub selector: String,
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `clone.create`.
@@ -2214,6 +2387,14 @@ pub struct SnapshotCreated {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotListing {
     pub snapshots: Vec<SnapshotStatus>,
+}
+
+/// `snapshot.hold`'s result: the summary line, and the snapshot as it now
+/// stands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotHeld {
+    pub detail: String,
+    pub snapshot: SnapshotStatus,
 }
 
 /// `snapshot.refs`.
@@ -2811,6 +2992,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Plan 31 L1208 and plan 37 §5 spell `snapshot.create`'s hold as the
+    /// owner string; the CLI spells it as a flag plus `held_by`. Both
+    /// decode, resolve to the same `(held, owner)`, and survive postcard.
+    #[test]
+    fn both_spellings_of_hold_decode_to_the_same_request() {
+        let shorthand: SnapshotCreateParams = serde_json::from_value(serde_json::json!({
+            "selector": "/vol@pvc-1", "hold": "csi:content-uid"
+        }))
+        .unwrap();
+        assert_eq!(
+            shorthand.hold_request().unwrap(),
+            (true, Some("csi:content-uid"))
+        );
+        let spelled_out: SnapshotCreateParams = serde_json::from_value(serde_json::json!({
+            "selector": "/vol@pvc-1", "hold": true, "held_by": "csi:content-uid"
+        }))
+        .unwrap();
+        assert_eq!(
+            spelled_out.hold_request().unwrap(),
+            shorthand.hold_request().unwrap()
+        );
+        // `held_by` alone is still a hold, and so is nothing at all not.
+        let owner_only: SnapshotCreateParams = serde_json::from_value(serde_json::json!({
+            "selector": "/vol@pvc-1", "held_by": "user:attila"
+        }))
+        .unwrap();
+        assert_eq!(
+            owner_only.hold_request().unwrap(),
+            (true, Some("user:attila"))
+        );
+        let plain: SnapshotCreateParams =
+            serde_json::from_value(serde_json::json!({"selector": "/vol@pvc-1"})).unwrap();
+        assert_eq!(plain.hold_request().unwrap(), (false, None));
+        let flag: SnapshotCreateParams =
+            serde_json::from_value(serde_json::json!({"selector": "/v@s", "hold": true})).unwrap();
+        assert_eq!(flag.hold_request().unwrap(), (true, None));
+        // Two owners that disagree is a client bug, not a coin flip.
+        let conflict: SnapshotCreateParams = serde_json::from_value(serde_json::json!({
+            "selector": "/v@s", "hold": "csi:a", "held_by": "user:b"
+        }))
+        .unwrap();
+        assert!(conflict.hold_request().is_err());
+        // The JSON spelling is what plan 37 documents, and the positional
+        // encoding carries the same pair losslessly.
+        assert_eq!(
+            serde_json::to_value(&shorthand).unwrap()["hold"],
+            serde_json::json!("csi:content-uid")
+        );
+        assert_eq!(
+            serde_json::to_value(&flag).unwrap()["hold"],
+            serde_json::json!(true)
+        );
+        round_trip(&shorthand);
+        round_trip(&spelled_out);
+        round_trip(&plain);
     }
 
     #[test]

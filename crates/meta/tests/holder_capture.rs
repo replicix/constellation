@@ -110,14 +110,8 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
         meta.set_xattr(f1, &format!("user.k{i}"), b"vvvvvvvv", SetXattrMode::Set)
             .unwrap();
     }
-    meta.record_snapshot(&SnapshotRow {
-        id: "snap0".into(),
-        path: "/".into(),
-        name: "s0".into(),
-        root_hash: "abc".into(),
-        created_unix_ms: 0,
-    })
-    .unwrap();
+    meta.record_snapshot(&SnapshotRow::new("snap0", "/", "s0", "abc", 0))
+        .unwrap();
 
     assert_captured(&meta, "mkdir", |m| {
         m.mkdir(dir, "sub", 0o755, 0, 0).unwrap()
@@ -168,14 +162,15 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
         m.remove_xattr(f1, "user.k3").unwrap()
     });
     assert_captured(&meta, "record_snapshot", |m| {
-        m.record_snapshot(&SnapshotRow {
-            id: "snap1".into(),
-            path: "/".into(),
-            name: "s1".into(),
-            root_hash: "def".into(),
-            created_unix_ms: 1,
-        })
-        .unwrap()
+        m.record_snapshot(&SnapshotRow::new("snap1", "/", "s1", "def", 1))
+            .unwrap()
+    });
+    // Plan 32 §0.4: a hold is a journaled `ns` write like any other, so a
+    // stranded one must roll back to exactly the unheld row.
+    assert_captured(&meta, "set_snapshot_hold", |m| {
+        m.set_snapshot_hold("snap0", true, Some("csi:content-uid"), false)
+            .unwrap()
+            .expect("the row seeded above")
     });
     assert_captured(&meta, "delete_snapshot", |m| {
         m.delete_snapshot("/", "s0").unwrap()
@@ -550,13 +545,7 @@ fn a_stranded_snapshot_row_replays_as_records() {
     deposed.set_node_prefix(3).unwrap();
     deposed.set_holder_epoch(1);
     deposed
-        .record_snapshot(&SnapshotRow {
-            id: "s".into(),
-            path: "/".into(),
-            name: "snap".into(),
-            root_hash: "h".into(),
-            created_unix_ms: 7,
-        })
+        .record_snapshot(&SnapshotRow::new("s", "/", "snap", "h", 7))
         .unwrap();
     let stranded = deposed.strand_below_epoch(2).unwrap();
     assert_eq!(stranded.locals, 1);
@@ -569,7 +558,7 @@ fn a_stranded_snapshot_row_replays_as_records() {
     );
     assert!(
         matches!(&queued[0].op, MutateOp::Records { records }
-            if matches!(records.as_slice(), [LogRecord::SnapCreate { id, .. }] if id == "s")),
+            if matches!(records.as_slice(), [LogRecord::SnapCreate2 { id, .. }] if id == "s")),
         "{:?}",
         queued[0].op
     );

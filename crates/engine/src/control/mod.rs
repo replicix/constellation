@@ -9,7 +9,7 @@
 //! embedding host calls it in-process through the same [`Router`]. It lives
 //! in the engine, not in the CLI, because every host of an engine (the
 //! desktop daemon today; plan 37's CSI engine pod, plan 36's Android
-//! service) needs the same 57 methods with the same semantics, and
+//! service) needs the same 58 methods with the same semantics, and
 //! everything they touch — the metadata replica, the sync task, the
 //! snapshot manager, the registry, the op watchdog — is the engine's.
 //!
@@ -64,7 +64,7 @@ use constellation_control::proto::types::{
     Ack, CacheEntryListing, CachePruneResult, DelegationListing, DesignationListing,
     DirectoryListing, FileStat, FsckReport, GcReport, HandoffParams, HandoffReport, HandoverStatus,
     PeerListing, PinListing, Pong, PruneRootListing, QuotaStatus, RefHashes, SnapshotCreated,
-    SnapshotListing, ViewInfo, ViewListing, ViewMountParams, ViewStatsReport,
+    SnapshotHeld, SnapshotListing, ViewInfo, ViewListing, ViewMountParams, ViewStatsReport,
 };
 use constellation_control::proto::{ControlError, JsonValue};
 use constellation_control::{CallCtx, Principal, Router};
@@ -376,6 +376,10 @@ pub(crate) async fn blocking<T: Send + 'static>(
 /// What a blocking handler receives besides its params.
 pub(crate) struct Call {
     principal: Principal,
+    /// The role that admitted the caller: a handler whose *arguments*
+    /// need more than the method's minimum role checks it itself
+    /// (`snapshot.hold`'s `force`).
+    role: constellation_control::authz::Role,
     fd: Option<OwnedFd>,
 }
 
@@ -389,6 +393,7 @@ fn unary<M: Method>(router: &mut Router, svc: &Arc<EngineControl>, body: Body<M>
         let svc = svc.clone();
         let call = Call {
             principal: ctx.principal.clone(),
+            role: ctx.role,
             fd: ctx.take_fd(),
         };
         async move { blocking(move || body(&svc, call, params)).await }
@@ -471,22 +476,20 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
 
     // ---- snapshot / clone ----
     unary::<SnapshotCreate>(r, svc, |s, _, p| {
-        if p.hold.is_some() {
-            return Err(ControlError::unsupported(
-                "snapshot holds arrive with snapshot policies (plan 32)",
-            )
-            .with_remediation("omit `hold`"));
+        // Plan 32 §0.4 / plan 37 §5: `hold: true` with `held_by`, and the
+        // shorthand `hold: "csi:<uid>"`, mean the same thing; naming an
+        // owner at all is asking for a hold.
+        let (held, held_by) = p.hold_request().map_err(ControlError::invalid)?;
+        if let Some(by) = held_by {
+            crate::snapshot::validate_owner(by)
+                .map_err(|e| ControlError::invalid(format!("{e:#}")))?;
         }
-        let detail = s.snapshot_create(&p.selector).map_err(failed)?;
-        let (path, name) = crate::snapshot::split_selector(&p.selector)
-            .map_err(|e| ControlError::invalid(e.to_string()))?;
-        let path = normalize_control_path(&path);
-        let snapshot = s
-            .snapshot_list(Some(&path))
-            .map_err(failed)?
-            .into_iter()
-            .find(|row| row.name == name)
-            .unwrap_or_default();
+        let options = crate::snapshot::SnapshotOptions {
+            held,
+            held_by: held_by.map(str::to_string),
+            ..Default::default()
+        };
+        let (detail, snapshot) = s.snapshot_create(&p.selector, &options).map_err(failed)?;
         Ok(SnapshotCreated { detail, snapshot })
     });
     unary::<SnapshotList>(r, svc, |s, _, p| {
@@ -494,7 +497,29 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
             .map(|snapshots| SnapshotListing { snapshots })
             .map_err(failed)
     });
-    unary::<SnapshotDelete>(r, svc, |s, _, p| ack(s.snapshot_delete(&p.selector)));
+    unary::<SnapshotDelete>(r, svc, |s, _, p| {
+        ack(s.snapshot_delete(&p.selector, p.force))
+    });
+    unary::<SnapshotHold>(r, svc, |s, c, p| {
+        // Overriding another owner's hold is a destructive act on someone
+        // else's state: operator may hold and release its own, only admin
+        // may force.
+        if p.force && c.role < constellation_control::authz::Role::Admin {
+            return Err(ControlError::denied(
+                "forcing a hold past its recorded owner needs the admin role",
+            )
+            .with_remediation("release it as its owner (`--by`), or ask an admin"));
+        }
+        let by = p.by.as_deref().filter(|by| !by.is_empty());
+        if let Some(by) = by {
+            crate::snapshot::validate_owner(by)
+                .map_err(|e| ControlError::invalid(format!("{e:#}")))?;
+        }
+        let (detail, snapshot) = s
+            .snapshot_hold(&p.id, p.held, by, p.force)
+            .map_err(failed)?;
+        Ok(SnapshotHeld { detail, snapshot })
+    });
     unary::<SnapshotRefs>(r, svc, |s, _, p| {
         s.snap_refs(&p.id)
             .map(|hashes| RefHashes { hashes })

@@ -106,7 +106,7 @@ pub(crate) mod writes;
 
 pub use bootstrap::BootstrapIndexBuilder;
 pub use local::{DelegateTx, LogPrefixView, PublishBasis};
-pub use snapshot::{quota_record, snapshot_record};
+pub use snapshot::{parse_snapshot_record, quota_record, snapshot_record};
 
 use crate::error::MetaError;
 use constellation_fs_core::types::{now_ns, ROOT_INO};

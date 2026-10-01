@@ -29390,3 +29390,120 @@ cpu-s/GiB at 709 MiB/s, against 1.68 at 738 MiB/s for the same lane inside a
 `cold-seq-1m warm-disk-seq-1m` run — within the run-to-run spread, where before
 the fix the same subset measured 3.04 at 298 MiB/s (a cold read wearing the
 warm lane's name, and blessable as such).
+
+## Plan 32 Step 0.4 (holds) — the plan-37 prerequisite subset
+
+**This is a subset of [plan 32](wip/32-snapshot-policies-and-space.md), not
+the plan.** Only §0.4 (snapshot row and record extensions) plus the hold
+surface plan 37 milestone K4 consumes is built here, so that K4 (CSI
+`CreateSnapshot`/`DeleteSnapshot`/`ListSnapshots`, §16 of
+[plan 37](wip/37-kubernetes-csi.md)) has no ad hoc hold-naming scheme to
+invent. A later session implements the rest of plan 32 — the policy
+language (Step 1), retention (Step 2), the scheduler (Step 3), expiry
+(Step 4), the rest of the CLI (Step 5), space accounting (Step 6) and the
+UI (Step 7) — **on top of this, unchanged**. Steps 0.1 (create at the
+holder), 0.2 (GC by diff), 0.3 (orphan reconciliation) and 0.5 (rename-safe
+listing) are *not* done and are still that session's.
+
+| Item | State | Where |
+|---|---|---|
+| Row value gains optional trailing fields `origin: u8`, `policy_ino: u64`, `held: u8`, `creator: u64`, `held_by: Option<String>`, `refer_bytes: Option<u64>`; `parse_snapshot_record` accepts **4 or more** fields (absent = manual / 0 / not held / unknown creator / no owner / no size); encoding always writes the whole tuple, so row → bytes stays a pure function | DONE | `crates/meta/src/store/snapshot.rs`, `crates/meta/src/lib.rs` (`SnapshotRow`, `SnapshotRow::new`, `owner()`) |
+| `LogRecord::SnapCreate2 { id, path, name, root_hash, created_unix_ms, origin, policy_ino, creator, refer_bytes }` and `LogRecord::SnapHold { id, held, by }`, **appended at the end** of the enum (postcard ordering); writers emit `SnapCreate2`; replay handles both create variants; a `SnapHold` for a row that is gone is a no-op | DONE | `crates/meta/src/record.rs`, `crates/meta/src/replay.rs` |
+| `Meta::record_snapshot` journals `SnapCreate2` + (when born held) `SnapHold` in **one transaction**; `Meta::set_snapshot_hold` (row + `SnapHold`), `Meta::snapshot_by_id` (no scan) | DONE | `crates/meta/src/store/snapshot.rs` |
+| `SnapshotRecord` (bucket JSON) gains `origin`, `policy_ino`, `refer_bytes`, all `#[serde(default)]` and all immutable; `SNAPSHOT_RECORD_VERSION` stays **2** (additive). `held`/`held_by` are deliberately **not** here — §0.4: they live only in the row | DONE | `crates/store-s3/src/snapshot.rs` |
+| `SnapshotManager::create_with(path, name, SnapshotOptions)` (origin / policy_ino / hold / owner), `hold(target, held, by, force)`, `delete(path, name, force)`, `row(target)` (id **or** `path@name`); `validate_owner` (`user:`/`csi:` only, `policy:` reserved) | DONE | `crates/engine/src/snapshot.rs` |
+| `refer_bytes` = `Meta::recursive_size(ino).0` at creation (the replica-local DFS from plan 29 M3c; never an S3 walk), `None` on error | DONE | `crates/engine/src/snapshot.rs` |
+| Control: `snapshot.create{hold, held_by}` (no longer `Unsupported`; `hold` is a flag **or** the owner string, `held_by` alone implies a hold; namespace validated), new **`snapshot.hold { id, held, by, force }`** (operator; `force` needs admin), `snapshot.delete{force}` refusing a held snapshot with the owner in the message, `snapshot.list` exposing `origin`/`held`/`held_by`/`creator`/`refer_bytes`, `SnapshotCreated`/`SnapshotHeld` returning the whole record | DONE | `crates/control/src/{methods,proto/types}.rs`, `crates/engine/src/control/{mod,service}.rs` |
+| `snapshot.hold` takes the same write-authority barrier as `snapshot.create`/`snapshot.delete` (`EngineControl::snapshot_barrier`: `SyncRequest::Acquire` + the subtree barrier), so a hold is never recorded only locally on a node that may not write the subtree | DONE | `crates/engine/src/control/service.rs` |
+| Method table 57 → **58**; schema re-blessed the repo's way (`CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`) | DONE | `crates/control/schema/control.schema.json` |
+| CLI `snapshot create --hold [--by …]`, `snapshot hold <sel\|id> [--by …] [--force]`, `snapshot release <sel\|id> [--by …] [--force]`, `snapshot delete --force`, `snapshot ls` as a table with a `HELD` column carrying the owner (`--json` keeps the old machine shape; the harness's `snapshot_count` passes it) | DONE | `crates/cli/src/main.rs`, `crates/harness/src/client.rs` |
+| Tests: codec round trips (4-field rows, partially extended rows, full rows, empty-owner normalization); replay of **both** create variants and of a `SnapHold` for a vanished row; writer/follower byte-identical rows; owner matching and `force` over a real manager; a held snapshot survives the only pruning path a snapshot has today (explicit delete) while GC still protects its chunks; `force` needs admin, checked across all four roles on both transports; both spellings of `snapshot.create{hold}` decode to the same request (unit + over the socket); `set_snapshot_hold` added to the two `every_…_api` invariant tests (`dirty.rs`, `holder_capture.rs`); the owner rule is refused inside the transaction, writing neither row nor journal; row → `SnapshotStatus` mapping | DONE | `crates/meta/src/store/snapshot.rs`, `crates/meta/tests/{snapshot_holds,dirty,holder_capture}.rs`, `crates/engine/src/snapshot.rs`, `crates/engine/src/control/{parity_tests,service}.rs`, `crates/control/src/proto/types.rs` |
+
+### Decisions taken here (the plan left them open)
+
+- **`snapshot.create`'s `hold` accepts both spellings two plans wrote
+  down.** It was `Option<String>` and always refused (`Unsupported`, plan
+  31 C5). Plan 32 §0.4 and plan 37 §16 want a boolean hold plus an owner
+  namespace, so `held_by: Option<String>` carries the owner — but plan 31
+  L1208 and plan 37 §5's `Controller.CreateSnapshot` row spell the driver's
+  call `snapshot.create{hold: "csi:<content-uid>", selector: …}`
+  *verbatim*, and that payload must not become a decoding error. So `hold`
+  is a `Hold`: `true`/`false` (the flag the CLI's `--hold` sends) **or**
+  the owner string, which means "held, owned by this". `held_by` alone also
+  implies the hold; both spellings naming *different* owners is refused
+  rather than silently resolved. `SnapshotCreateParams::hold_request()` is
+  the one place that resolves them, so no handler can disagree.
+  `Hold`'s codecs are hand-written against `is_human_readable()` (the
+  `ByteBuf`/`JsonValue` pattern in `crates/control/src/proto/blob.rs`):
+  the serde representation that produces a bare `true`/`"owner"` is the
+  tagless one, and postcard — not self-describing — cannot read it back at
+  all, which `no_postcard_hostile_serde_attributes` exists to prevent. JSON
+  gets the two spellings; the positional encoding carries the resolved
+  `(held, owner)` pair losslessly.
+- **Owner matching is exact, and `None` ≠ `Some("csi:…")`.** Releasing —
+  or re-holding — a snapshot whose recorded owner differs from the `--by`
+  given is refused, and the refusal names the owner. A plain hold (no
+  owner) is released by a plain release, which is exactly today's
+  behavior. `force` overrides, and `force` is admin-only (checked on the
+  argument, since the method itself is operator, like `snapshot.create`).
+  The comparison lives **inside** `Meta::set_snapshot_hold`'s write
+  transaction, which already re-parses the row there. Anywhere above it is
+  a TOCTOU: two concurrent `snapshot.hold --by` calls on the same unheld
+  snapshot, each checking against its own read transaction, would both pass
+  and the loser would be told it owns a hold it does not. That puts one
+  policy rule in the replica layer on purpose — atomicity is only
+  available there.
+- **A hold needs the same write authority as a create or a delete.**
+  `snapshot.hold` goes through `EngineControl::snapshot_barrier` like
+  `snapshot.create`, `snapshot.delete` and `clone.create`: it is the only
+  thing that establishes "this node may write this subtree" (it refuses
+  with `subtree write lease is held by another node`). A hold recorded only
+  in a non-holder's replica is worse than no hold — the holder's
+  `snapshot.delete` reads `held` from *its* replica and proceeds, and plan
+  32 Step 4's expiry will too, destroying exactly the snapshot plan 37's
+  driver believes is pinned. The row is resolved first (the barrier needs
+  its path), so "no such snapshot" still beats the lease refusal.
+- **Releasing forgets the owner.** An unheld snapshot has no hold, so it
+  has no owner: `held_by` clears with `held`. Who released it is the audit
+  log's business; the row is state, not history.
+- **The owner namespace is validated** (`user:<name>`, `csi:<id>`;
+  `policy:` refused as reserved; anything unprefixed refused). Plan 32
+  Step 5 says `--by` is "otherwise unvalidated"; the stricter rule is what
+  the brief for this chunk asked for, and it keeps `policy:` free for the
+  scheduler. Plan 33's service principals remain what decides *who* may
+  call these methods.
+- **The hold is not in the bucket object at all.** §0.4's last bullet says
+  `held`/`held_by` "live only in the row", and that is what is built: a
+  hold is taken and released through the metadata log, which no bucket
+  object participates in, so a copy in `snaps/<id>.json` would be a
+  write-only field still claiming `held: true` long after the release (and
+  keeping it current would need a CAS read-modify-write on every hold).
+  §0.3's orphan reconciliation would read that stale copy as truth.
+  `origin`, `policy_ino` and `refer_bytes` *are* in the object: they are
+  immutable once written.
+- **`refer_bytes` comes from `Meta::recursive_size`,** the plan 29 M3c
+  local-replica DFS (≈16 ms per 100k files warm, ≈300 ms for a 1M-file
+  root), called once at creation. There is no maintained per-directory
+  recursive-size counter in the tree; the plan's "existing counter" is
+  that DFS. It is a replica read, never an S3 walk. On error: `None`.
+- **`origin` is a `u8` in the row and a word on the wire** (`manual`,
+  `auto`, `unknown(n)` for a value a future step introduces), so a reader
+  of `snapshot.list` never has to know that 1 means "a policy's own".
+- **`snapshot ls` prints the full owner** (`held: csi:<uid>`), not just
+  its namespace as plan 32 Step 5's mock-up does; Step 5's table (USED /
+  WRITTEN / REFER / KEPT BY / EXPIRES, `-o`, `-s`, `-p`) is that session's
+  and replaces this one wholesale. `--json` is the shape scripts parse.
+
+### Spec contradiction recorded (CONVENTIONS rule 5)
+
+`docs/explanation/DESIGN.md` §1335's CLI command list enumerates the
+`snapshot` subcommands and does not mention `snapshot hold` / `snapshot
+release`, which plan 32 Step 5 specifies and this chunk implements. DESIGN.md
+is the spec and is not edited (rule 5); the list is simply behind the plan.
+
+### Not done here (deliberately, per the brief)
+
+Plan 32 §0.1–0.3 and §0.5, Steps 1–7: no policy language, no scheduler, no
+expiry, no GC change, no space accounting beyond the single `refer_bytes`
+field, no UI. `snapshot hold` takes one selector, not the `<sel>...` list
+(and no `a%b` ranges) — that arrives with Step 5's selector work.

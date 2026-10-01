@@ -159,14 +159,17 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
     });
 
     step!(meta, "record_snapshot", {
-        meta.record_snapshot(&SnapshotRow {
-            id: "snap1".into(),
-            path: "/".into(),
-            name: "s".into(),
-            root_hash: "abc".into(),
-            created_unix_ms: 0,
-        })
-        .unwrap();
+        meta.record_snapshot(&SnapshotRow::new("snap1", "/", "s", "abc", 0))
+            .unwrap();
+    });
+
+    // Plan 32 §0.4's hold rewrites the snapshot row in place, which is the
+    // easiest kind of `ns` write to forget to dirty: the key already
+    // existed, so nothing about it looks new.
+    step!(meta, "set_snapshot_hold", {
+        meta.set_snapshot_hold("snap1", true, Some("user:attila"), false)
+            .unwrap()
+            .expect("the row this test just recorded");
     });
 
     step!(meta, "delete_snapshot", {

@@ -80,13 +80,63 @@ pub struct TreeInode {
     pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A snapshot as the replica holds it (`0x30 | Snapshot | id`).
+///
+/// Plan 32 §0.4: everything after `created_unix_ms` is an *optional
+/// trailing field* of the row value — a row written before this change
+/// decodes with them at their defaults (manual, no policy, not held,
+/// unknown creator, no owner, no size).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnapshotRow {
     pub id: String,
     pub path: String,
     pub name: String,
     pub root_hash: String,
     pub created_unix_ms: i64,
+    /// 0 manual, 1 a policy's own (plan 32's scheduler; nothing writes 1
+    /// yet). Ownership is metadata, never a name pattern (plan 32 L6).
+    pub origin: u8,
+    /// The directory inode carrying the policy that owns this snapshot;
+    /// 0 when none does.
+    pub policy_ino: u64,
+    /// A retention hold: a held snapshot is never deleted automatically
+    /// and `snapshot.delete` refuses it without `force`.
+    pub held: bool,
+    /// The node id that took it; 0 = unknown (a pre-plan-32 row).
+    pub creator: u64,
+    /// The hold's owner namespace: `None`/empty = a plain hold with no
+    /// recorded owner, `user:<name>` an operator's, `csi:<uid>` plan 37's
+    /// CSI driver's, `policy:<id>` reserved. Display and ownership
+    /// metadata only: protection keys on `held` alone.
+    pub held_by: Option<String>,
+    /// The subtree's logical size at creation (REFER, plan 32 §6.1 and
+    /// plan 37 §16's `size_bytes`). `None` when it was not available.
+    pub refer_bytes: Option<u64>,
+}
+
+impl SnapshotRow {
+    /// A manual, unheld snapshot — the pre-plan-32 shape.
+    pub fn new(
+        id: impl Into<String>,
+        path: impl Into<String>,
+        name: impl Into<String>,
+        root_hash: impl Into<String>,
+        created_unix_ms: i64,
+    ) -> SnapshotRow {
+        SnapshotRow {
+            id: id.into(),
+            path: path.into(),
+            name: name.into(),
+            root_hash: root_hash.into(),
+            created_unix_ms,
+            ..SnapshotRow::default()
+        }
+    }
+
+    /// The hold's owner, normalized: an empty string is no owner.
+    pub fn owner(&self) -> Option<&str> {
+        self.held_by.as_deref().filter(|by| !by.is_empty())
+    }
 }
 
 /// Parent-before-child description consumed by eager clone materialization.

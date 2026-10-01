@@ -323,13 +323,13 @@ mod tests {
         a.meta.link(f.ino, 1, "hard").unwrap();
         a.meta.write_quota(Some(1 << 40)).unwrap();
         a.meta
-            .record_snapshot(&SnapshotRow {
-                id: "snap-1".into(),
-                path: "/d".into(),
-                name: "one".into(),
-                root_hash: "ab".repeat(32),
-                created_unix_ms: 42,
-            })
+            .record_snapshot(&SnapshotRow::new(
+                "snap-1",
+                "/d",
+                "one",
+                "ab".repeat(32),
+                42,
+            ))
             .unwrap();
         a.sync().await;
         a.driver.publish().await.unwrap();

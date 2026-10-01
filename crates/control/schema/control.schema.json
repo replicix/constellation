@@ -2699,6 +2699,17 @@
       ],
       "type": "object"
     },
+    "Hold": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "true/false, or the hold owner as a string (`csi:<uid>`), which implies a hold"
+    },
     "InboxStatus": {
       "description": "Plan 30 §M13: the S3 inbox — a non-holder's forwarded mutations\nwhen it has no P2P path to the holder, and the holder's polling of\nthem. Requester-side counters (`submitted_*`, `resubmitted_ops`,\n`unavailable`, `pending_ops`, `next_n`) and holder-side ones\n(`executed_ops`, `refused_ops`, `deduped_ops`, `drained_*`, `polls`,\n`poll_hits`, `gc_deleted`, `tracked_requesters`) are both reported by\nevery node; whichever role it plays moves.",
       "properties": {
@@ -5010,14 +5021,18 @@
       "type": "object"
     },
     "SnapshotCreateParams": {
-      "description": "`snapshot.create`. `hold` (plans 32/37): a retention hold name that keeps\nthe snapshot out of policy pruning until released.",
+      "description": "`snapshot.create`. `hold` (plans 32/37) takes the snapshot already\nheld, so it is never briefly exposed to pruning; `held_by` records who\nowns that hold (`user:<name>`, `csi:<VolumeSnapshotContent uid>`;\n`policy:` is reserved and refused). A `held_by` on its own implies\n`hold`, so plan 37's driver can say only who it is.",
       "properties": {
-        "hold": {
+        "held_by": {
           "default": null,
           "type": [
             "string",
             "null"
           ]
+        },
+        "hold": {
+          "$ref": "#/$defs/Hold",
+          "default": false
         },
         "selector": {
           "type": "string"
@@ -5045,14 +5060,61 @@
       "type": "object"
     },
     "SnapshotDeleteParams": {
-      "description": "`snapshot.delete`.",
+      "description": "`snapshot.delete`. A held snapshot is refused (the message names the\nowner) unless `force`.",
       "properties": {
+        "force": {
+          "default": false,
+          "type": "boolean"
+        },
         "selector": {
           "type": "string"
         }
       },
       "required": [
         "selector"
+      ],
+      "type": "object"
+    },
+    "SnapshotHeld": {
+      "description": "`snapshot.hold`'s result: the summary line, and the snapshot as it now\nstands.",
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/SnapshotStatus"
+        }
+      },
+      "required": [
+        "detail",
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "SnapshotHoldParams": {
+      "description": "`snapshot.hold`: set (`held: true`) or release (`held: false`) a\nsnapshot's retention hold.\n\n`id` is a snapshot id (`snapshot.list`'s `id`) or a `path@name`\nselector. `by` is the owner namespace: releasing a hold recorded under\nan owner requires naming that same owner, and taking over another\nowner's hold is refused — `force` (admin only) overrides both.",
+      "properties": {
+        "by": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "force": {
+          "default": false,
+          "type": "boolean"
+        },
+        "held": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "held"
       ],
       "type": "object"
     },
@@ -5085,10 +5147,31 @@
       "type": "object"
     },
     "SnapshotStatus": {
+      "description": "One snapshot, as `snapshot.list`/`snapshot.create`/`snapshot.hold`\nreport it. Everything after `created_unix_ms` is plan 32 §0.4's row\nextension; a snapshot taken before it reports the defaults (`manual`,\nnot held, no owner, no size).",
       "properties": {
         "created_unix_ms": {
           "format": "int64",
           "type": "integer"
+        },
+        "creator": {
+          "default": 0,
+          "description": "The node that took it; 0 = unknown.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "held": {
+          "default": false,
+          "description": "A retention hold: `snapshot.delete` refuses it without `force`,\nand plan 32's expiry never considers it.",
+          "type": "boolean"
+        },
+        "held_by": {
+          "default": null,
+          "description": "Who owns the hold: `user:<name>`, `csi:<VolumeSnapshotContent\nuid>`; absent for a plain hold with no recorded owner.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "id": {
           "type": "string"
@@ -5096,8 +5179,30 @@
         "name": {
           "type": "string"
         },
+        "origin": {
+          "default": "",
+          "description": "`manual` or `auto` (a snapshot policy's own).",
+          "type": "string"
+        },
         "path": {
           "type": "string"
+        },
+        "policy_ino": {
+          "default": 0,
+          "description": "The directory inode carrying the owning policy; 0 for none.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refer_bytes": {
+          "default": null,
+          "description": "REFER: the subtree's logical size when the snapshot was taken —\nwhat restoring it needs (plan 37's CSI `size_bytes`). Absent when\nit was not available at creation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "root_hash": {
           "type": "string"
@@ -7406,6 +7511,17 @@
       },
       "result": {
         "$ref": "#/$defs/Ack"
+      },
+      "streaming": "none"
+    },
+    "snapshot.hold": {
+      "min_role": "operator",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/SnapshotHoldParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapshotHeld"
       },
       "streaming": "none"
     },

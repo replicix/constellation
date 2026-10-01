@@ -178,6 +178,7 @@ fn params_for(name: &str, root_view: u64, backend_dir: &str) -> Value {
         "snapshot.list" => json!({}),
         "snapshot.delete" => json!({"selector": "/@no-such-snapshot"}),
         "snapshot.refs" => json!({"id": "no-such-id"}),
+        "snapshot.hold" => json!({"id": "/@no-such-snapshot", "held": true}),
         "clone.create" => json!({"selector": "/@no-such-snapshot", "destination": "/c"}),
         "browse.readdir" | "browse.inspect" | "browse.stat" => json!({"path": "/"}),
         "browse.read" => json!({"path": "/f"}),
@@ -586,6 +587,51 @@ fn unix_socket_and_http_dispatch_the_whole_table_identically() {
             }
             compared += 1;
         }
+        // Plan 32 §0.4: `snapshot.hold` is an operator method, but its
+        // `force` — overriding the hold's recorded owner — is an admin
+        // one, and the check is on the argument, not the method. Both
+        // transports go through the same handler, so both must agree.
+        let hold = method_info("snapshot.hold").unwrap();
+        let forced_params = json!({"id": "/@no-such-snapshot", "held": false, "force": true});
+        let forced_unix = rt.block_on(over_socket(&client, hold, forced_params.clone()));
+        let forced_http = rt.block_on(over_http(&app, hold, forced_params));
+        for (how, forced) in [("socket", &forced_unix), ("HTTP", &forced_http)] {
+            match role {
+                Some(Role::Admin) => assert!(
+                    !matches!(forced, Outcome::Err(ErrorKind::Denied, _)),
+                    "admin may force a hold over {how}: {forced:?}"
+                ),
+                _ => assert!(
+                    matches!(forced, Outcome::Err(ErrorKind::Denied, _)),
+                    "only admin may force a hold, not {role:?}, over {how}: {forced:?}"
+                ),
+            }
+        }
+        assert_eq!(forced_unix, forced_http, "forced hold as {role:?}");
+
+        // Plan 37 §5 spells the CSI driver's call `snapshot.create{hold:
+        // "csi:<content-uid>"}` — a string where the CLI sends a boolean.
+        // Both spellings must reach the handler and be refused for the same
+        // reason (no such path), never as a decoding error.
+        let create = method_info("snapshot.create").unwrap();
+        let shorthand = rt.block_on(over_socket(
+            &client,
+            create,
+            json!({"selector": "/no-such-dir@s", "hold": "csi:content-uid"}),
+        ));
+        let spelled_out = rt.block_on(over_socket(
+            &client,
+            create,
+            json!({"selector": "/no-such-dir@s", "hold": true, "held_by": "csi:content-uid"}),
+        ));
+        assert_eq!(
+            shorthand, spelled_out,
+            "both spellings of `hold` as {role:?}: {shorthand:?}"
+        );
+        assert!(
+            !matches!(&shorthand, Outcome::Err(ErrorKind::Invalid, _)),
+            "`hold` as a string must decode, not be an invalid request: {shorthand:?}"
+        );
     }
     assert_eq!(compared, 4 * METHODS.len());
     assert!(method_info("node.handoff").is_some());
