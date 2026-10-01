@@ -13,6 +13,9 @@ fjall = { version = "3.1", package = "fjall" }
 # Snapshot-schedule policies (plan 32 Step 1): `tz=` names are validated
 # against jiff's bundled tzdb so the parse is pure and musl-static safe.
 jiff.workspace = true
+# Retention verdicts carry a handful of reasons each (plan 32 Step 2);
+# the common case is one or two and never reaches the heap.
+smallvec = "1.15"
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true

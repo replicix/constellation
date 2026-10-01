@@ -50,6 +50,11 @@
 //!   (`5m:6m 1mo:1y`: did `6m` mean six minutes, or six months?). Write
 //!   `6mo`, or the explicit `6min`.
 //!
+//! A bare-`m` keep shorter than its own bucket (`1d:6m`, the commonest
+//! way to *mean* "daily, keep six months") is refused by the
+//! `keep >= every` rule instead, which names both readings as well — no
+//! reading of `1d:6m` is both legal and what the writer asked for.
+//!
 //! The canonical form always prints a minute keep as `6min`, so printed
 //! policies never contain the ambiguous spelling and always re-parse.
 
@@ -353,11 +358,16 @@ impl SnapPolicy {
     /// figure smaller — the midnight snapshot is the representative of
     /// the 5m, 1h and 1d buckets at once, and is counted three times
     /// here. `policy check` prints this next to a simulated figure.
+    ///
+    /// `None` also for a zero-width interval, which only a value
+    /// hand-built outside [`SnapPolicy::parse`] can have (the parser
+    /// refuses `0m`): a cadence of zero takes infinitely many
+    /// snapshots, so there is no bound to print.
     pub fn steady_state_bound(&self) -> Option<u64> {
         let mut sum = 0u64;
         for t in &self.tiers {
             let keep = t.keep.nominal_duration()?;
-            sum = sum.saturating_add(keep / t.every.nominal_duration());
+            sum = sum.saturating_add(keep.checked_div(t.every.nominal_duration())?);
         }
         Some(sum.max(u64::from(self.last)))
     }
@@ -512,6 +522,7 @@ impl SnapPolicy {
                 parsed.push(ParsedTier {
                     tier: Tier { every, keep },
                     keep_off,
+                    bare_minute: bare_m,
                 });
                 continue;
             }
@@ -564,18 +575,30 @@ impl SnapPolicy {
             ));
         }
 
-        // `keep >= every`, calendar-aware.
+        // `keep >= every`, calendar-aware. A bare-`m` keep gets the
+        // both-readings text here too: `1d:6m` is the commonest way to
+        // *mean* "daily, keep six months", and it reaches this refusal
+        // (six minutes is shorter than a day) rather than the
+        // ambiguity one above, which only fires beside a monthly tier.
         if let Some(bad) = parsed
             .iter()
             .find(|p| !keep_covers_every(p.tier.every, p.tier.keep))
         {
-            return Err(PolicyError::at(
-                bad.keep_off,
-                format!(
-                    "keep `{}` is shorter than one `{}` bucket, so the tier would keep nothing",
-                    bad.tier.keep, bad.tier.every
-                ),
-            ));
+            let mut msg = format!(
+                "keep `{}` is shorter than one `{}` bucket, so the tier would keep nothing",
+                bad.tier.keep, bad.tier.every
+            );
+            if bad.bare_minute {
+                if let Keep::Minutes(n) = bad.tier.keep {
+                    msg = format!(
+                        "keep `{n}m` is shorter than one `{}` bucket, so the tier would keep \
+                         nothing — and `{n}m` is ambiguous: write `{n}mo` for {n} months, or \
+                         `{n}min` for {n} minutes",
+                        bad.tier.every
+                    );
+                }
+            }
+            return Err(PolicyError::at(bad.keep_off, msg));
         }
 
         let mut tiers: Vec<Tier> = parsed.iter().map(|p| p.tier).collect();
@@ -675,6 +698,10 @@ impl fmt::Display for SnapPolicy {
 struct ParsedTier {
     tier: Tier,
     keep_off: usize,
+    /// The keep was written with the ambiguous bare `m` unit, which
+    /// both the minute-versus-month refusal and the `keep >= every`
+    /// refusal name both readings of.
+    bare_minute: bool,
 }
 
 struct Clause<'a> {
@@ -1232,6 +1259,67 @@ mod tests {
     fn rejects_keep_shorter_than_every() {
         let e = at("1h:30m", 3, "30m");
         assert!(e.msg.contains("shorter than one `1h`"), "{}", e.msg);
+    }
+
+    /// `1d:6m` is how an operator writes "daily, keep six months". It is
+    /// not caught by the ambiguity rule (there is no monthly tier), so
+    /// the `keep >= every` refusal has to name both readings itself.
+    #[test]
+    fn keep_shorter_than_every_names_both_readings_for_a_bare_minute_keep() {
+        for (src, off, tok, n) in [
+            ("1d:6m", 3, "6m", "6"),
+            ("1w:6m", 3, "6m", "6"),
+            ("12h:600m", 4, "600m", "600"),
+        ] {
+            let e = at(src, off, tok);
+            assert!(e.msg.contains("shorter than one"), "{src}: {}", e.msg);
+            assert!(
+                e.msg.contains(&format!("`{n}mo` for {n} months")),
+                "{src}: {}",
+                e.msg
+            );
+            assert!(
+                e.msg.contains(&format!("`{n}min` for {n} minutes")),
+                "{src}: {}",
+                e.msg
+            );
+        }
+        // The explicit spellings are not ambiguous and keep the plain
+        // message: `6min` really is shorter than a day, `6mo` is not.
+        let e = err("1d:6min");
+        assert!(e.msg.contains("shorter than one `1d`"), "{}", e.msg);
+        assert!(!e.msg.contains("ambiguous"), "{}", e.msg);
+        assert_eq!(p("1d:6mo").to_string(), "1d:6mo");
+    }
+
+    /// `steady_state_bound` divides by the interval's nominal length. A
+    /// hand-built zero interval (the parser refuses `0m`) used to panic.
+    #[test]
+    fn steady_state_bound_survives_a_hand_built_zero_interval() {
+        let mut policy = p("1d:7d");
+        policy.tiers = vec![Tier {
+            every: Interval::Minutes(0),
+            keep: Keep::Days(1),
+        }];
+        assert_eq!(policy.steady_state_bound(), None);
+        // A zero interval after a well-formed tier, with a finite keep,
+        // so the division (not `*`'s early `None`) is what refuses it.
+        policy.tiers = vec![
+            Tier {
+                every: Interval::Day,
+                keep: Keep::Days(7),
+            },
+            Tier {
+                every: Interval::Seconds(0),
+                keep: Keep::Hours(1),
+            },
+        ];
+        assert_eq!(policy.steady_state_bound(), None);
+        policy.tiers.truncate(1);
+        assert_eq!(policy.steady_state_bound(), Some(7));
+        // The parser itself can never build one.
+        assert!(SnapPolicy::parse("0m:1h").is_err());
+        assert!(SnapPolicy::parse("0s:1h").is_err());
     }
 
     #[test]

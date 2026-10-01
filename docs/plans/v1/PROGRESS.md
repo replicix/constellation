@@ -30069,3 +30069,177 @@ passed on two subsequent runs (alone and paired). The assertion
 sensitive on a host at load 50-140; nothing in this change touches the
 scenario, the engine or the publish path (the diff is the new harness driver,
 its CLI arm, docs and results).
+
+## Plan 32 M1b (retention)
+
+**Step 2 of [plan 32](wip/32-snapshot-policies-and-space.md) only: retention as
+a pure function.** Where a bucket starts, which snapshots a policy keeps, why,
+when the next one is due, and what the schedule does next — with no I/O, no
+clock read and no environment anywhere (`now_ms` is a parameter of the two
+functions that need one, and neither can cause a deletion). M1a's parser
+(`snapsched::policy`) is unchanged except for the two should-fixes its review
+asked for. Nothing calls this yet: no xattr gate, no scheduler, no expiry, no
+CLI, no control method, no UI.
+
+`crates/meta/src/snapsched/retention.rs` is **the only implementation of the
+rule**. Step 4's expiry, Step 5's `policy check` / `policy set` delta and Step
+7.4's timeline must call `evaluate`/`simulate`; the plan's "the UI must never
+reimplement retention in JavaScript" is the same requirement stated for the
+other direction.
+
+| Item | State | Where |
+|---|---|---|
+| `calendar::bucket_start(interval, t_unix_ms, &TimeZone, day_start, week_start) -> i64` and `next_bucket_start(…)`: sub-hour intervals align on the **absolute clock**, 1h and coarser **in the timezone** (hour buckets at local `HH:00`, day/week/month/year at `day_start`, ISO weeks by default). Monotone, total, and a floor: `bucket_start(next_bucket_start(t)) == next_bucket_start(t)` and `bucket_start(next − 1) == bucket_start(t)` in every zone | DONE | `crates/meta/src/snapsched/calendar.rs` |
+| `calendar::subtract_keep(t, keep, every, tz) -> Option<i64>` (and `add_keep`, for the forecast): exact durations for `min`/`h`, and for `d`/`w` on a sub-hour or hourly tier; **calendar days in `tz`** for `d`/`w` on a `1d`-or-coarser tier; **calendar months in `tz`** for `mo`/`y` with end-of-month clamping; `None` = `*`. The tier's `every` is a parameter the brief's signature did not have, because the unit's meaning depends on it. Plus `time_zone(name)`/`policy_time_zone(policy)` (bundled tzdb only) and `policy_bucket_start`/`policy_next_bucket_start` for the scheduler's "current bucket" | DONE | `crates/meta/src/snapsched/calendar.rs` |
+| `SnapFacts { id, created_unix_ms, origin, policy_ino, held, held_by }` with `SnapFacts::from_row(&SnapshotRow)` and `is_candidate(policy_ino)`; `Origin::{Manual, Auto, Unknown(u8)}` over the row's `u8` | DONE | `crates/meta/src/snapsched/retention.rs` |
+| `evaluate(policy, policy_ino, snaps) -> Vec<Verdict>` — one verdict per input, same order. Candidates = `origin=auto` ∧ `policy_ino` ∧ `!held`; non-candidates always `keep: true` with `Reason::Held(held_by)` (whatever the owner: plain, `user:…`, `csi:…`) or `Reason::NotCandidate`, never counted and never able to shift a representative. Then the rule once: anchor = newest candidate, representative = oldest candidate of each bucket, kept if among the newest `last` or a representative with `bucket_start > bucket_start_I(anchor) − K` (strict; `*` always) | DONE | `crates/meta/src/snapsched/retention.rs` |
+| `Verdict { keep, reasons: SmallVec<[Reason; 4]>, expires_at }`, `Reason::{Tier(Interval), Last(u32), Held(Option<String>), Grace, NotCandidate}`; `reasons` lists **every** keeping tier, finest first, `Last` after them, and is empty exactly when `keep` is false. `Verdict::tiers()` for `KEPT BY` | DONE | `crates/meta/src/snapsched/retention.rs` |
+| `grace_intersection(old, new)` (Step 4.3: expire only what both expire; kept-by-grace carries `Reason::Grace` in front of the old policy's reasons and the old policy's forecast) and `grace_first_seen(new)` (a root seen for the first time expires nothing) | DONE | `crates/meta/src/snapsched/retention.rs` |
+| `due(policy, policy_ino, snaps, now_ms) -> bool` (Step 3.3): no auto snapshot of this root — **candidate or held** — inside the current finest bucket. `paused` is never due; catch-up, never backfill | DONE | `crates/meta/src/snapsched/retention.rs` |
+| `simulate(policy, policy_ino, existing, now_ms, horizon_ms) -> Timeline`: one expiry pass at `now`, then a synthetic snapshot at the first instant of each finest bucket (at `now` for the current bucket, if uncovered), evaluating after each. `Timeline`/`TimelineSnap`/`CountPoint` are `serde::Serialize` with the field names documented in their rustdoc tables (`snapshots`, `counts`, `created`, `expired`, `final_count`, `steady_state_bound`, `truncated`, `cadence`, …); capped at `MAX_SYNTHETIC` (10 000) creations, which sets `truncated` | DONE | `crates/meta/src/snapsched/retention.rs` |
+| Tests, calendar: Europe/Budapest both transitions (**23** and **25** hourly buckets, **one** daily each), `day-start=02:00` in the gap and in the fold, Asia/Kolkata `+05:30` and Pacific/Chatham `+12:45` hourly alignment and which sub-hour tiers nest, Australia/Lord_Howe's 30-minute shift, 29 February, month ends and `1mo` buckets on the 31st, ISO weeks across a year boundary (and `week-start=sun`), the `5m:1d`-is-288-buckets identity, `1d:7d`/`1w:1w` keeps as calendar days across Budapest's spring-forward, `day-start=03:00` in Chatham's unaligned gap (local 04:00), a tiling sweep over 6 zones × 8 intervals × 2 `day-start`s, and `i64::MIN`/`i64::MAX` totality | DONE | `crates/meta/src/snapsched/calendar.rs` (`mod tests`, 16 tests) |
+| Tests, retention: `5m:1d` keeps exactly 288 buckets including the anchor's; union reasons finest-first; the `last=n` floor; `*` tiers keep forever with no forecast; held (plain, `user:`, `csi:`), manual and other-`policy_ino` snapshots untouched and representative-neutral; a hold cannot move the anchor; an unknown `tz` keeps everything; grace both ways; `due` (including held coverage, paused and catch-up); the `expires_at` forecast for tiers, for the `last` floor (and its O(n + last) step count at `last=1000000` over 5000 candidates) and across month-end clamping; `simulate` over the examples table asserting the **peak** of the count series ≤ the bound, from mid-June and from 20 March across Budapest's spring-forward (plus `1d:7d`/`1w:4w` in Budapest, which the exact-duration keeps pushed to 8/5), its hand-computed steady state, covered buckets, a future-dated existing snapshot, truncation; the serialized field names | DONE | `crates/meta/src/snapsched/retention.rs` (`mod tests`, 22 hand tests) |
+| Tests, properties (proptest, 192 cases each): idempotent (flags **and** reasons), adding newer never revives, deleting a non-representative outside the `last` floor changes nothing, outage-safe, nesting (the daily representative is the day's first hourly and first 5-minute one) | DONE | `crates/meta/src/snapsched/retention.rs` |
+| Tests, differential: a second implementation in the test module that materializes every bucket of every tier with `jiff` directly and marks representatives bucket by bucket (no helper shared with `snapsched::calendar`), over random policies and histories whose gaps are multiples of each tier's own width and whose timezone is paired with its own 2026 DST transitions. 192 cases in the normal lane, `#[ignore]`d `differential_sweep_many_cases` at 20 000 (36–47 s in debug) | DONE | `crates/meta/src/snapsched/retention.rs` |
+| M1a review should-fix 1: a bare-`m` keep refused by `keep >= every` now names both readings (`1d:6m` → "write `6mo` for 6 months, or `6min` for 6 minutes"), not only one refused beside a monthly tier. `ParsedTier` carries the flag | DONE | `crates/meta/src/snapsched/policy.rs` |
+| M1a review should-fix 2: `steady_state_bound()` no longer divides by zero on a hand-built zero `Interval` — `checked_div`, so the bound is `None` | DONE | `crates/meta/src/snapsched/policy.rs` |
+
+### Decisions taken here (the plan left them open)
+
+- **Sub-hour buckets align on the absolute clock; 1h and coarser in the
+  timezone.** The plan asks for hourly buckets aligned in local time, so in a
+  zone whose offset is not a whole hour the two grids are offset from each
+  other: in `Asia/Kolkata` (+05:30) an hour bucket starts at absolute `HH:30`
+  and a 20m bucket at absolute `HH:00`/`:20`/`:40`, so 20m does **not** tile
+  the hour there (30m, 15m, 10m, 5m do). In `Pacific/Chatham` (+12:45) it is
+  5m and 15m that nest and 10m/20m/30m that do not. The rule is stated once in
+  the module docs: a sub-hour `n` tiles the hourly grid exactly when the zone's
+  offset-past-the-hour is a multiple of `n`. This is documented rather than
+  refused at parse time, because refusing it would make a policy's validity
+  depend on its zone's *current* offset, which the tzdb may change.
+- **A bucket is identified by its label, and an hour's label includes the
+  offset it happened at.** That is what makes Budapest's 25-hour day hold 25
+  hourly buckets (local 02:00 twice, as two buckets) and its 23-hour day 23,
+  while both hold exactly *one* daily bucket — a calendar date happens once. A
+  day/week/month/year boundary therefore resolves with jiff's *compatible*
+  disambiguation (the earlier instant of a fold), and an hour boundary
+  enumerates both halves of the fold.
+- **A `day_start` inside a DST gap resolves by compatible disambiguation**:
+  it moves forward by the gap's length. For a whole-hour `day_start` in a
+  one-hour gap that is the first instant after the gap, as the plan says
+  (`day-start=02:00` on 2026-03-29 in Budapest starts the day at local 03:00;
+  the day before it is 23 hours long and is still one day). It is **not** "the
+  first instant ≥ it" when the gap is not aligned to the hour:
+  `Pacific/Chatham`, `day-start=03:00` on 2026-09-27 (gap 02:45 → 03:45)
+  starts the day at local 04:00 +13:45, fifteen minutes after the gap closes.
+  The boundary is still one instant per date, so buckets tile and that date
+  has one daily bucket; the semantics were kept and documented (M1b review
+  should-fix 3, coordinator's decision), and
+  `day_start_in_an_unaligned_gap_moves_forward_by_the_gap` pins it.
+- **A `d` or `w` keep is an exact duration on a sub-day tier and calendar
+  days on a `1d`-or-coarser one; `mo`/`y` are always calendar arithmetic.**
+  The plan states both "`5m:1d` keeps exactly 288 buckets" — which needs
+  24 × 3600 s, since a 23-hour calendar day would keep 276 — and the examples
+  table's "`1d:7d` … ≤ 7". The first implementation made every `d`/`w` an
+  exact duration, which broke the second: after spring-forward the edge
+  `bucket_start(anchor) − 7 × 24 h` falls one hour *inside* the eighth-newest
+  local day, so `1d:7d; tz=Europe/Budapest` held **8** daily snapshots for
+  the 7 days after the transition (and `1w:4w` held 5 for 4 weeks) — over the
+  bound `steady_state_bound()` documents (M1b review should-fix 1). Each
+  window now holds a whole number of its own tier's buckets on every day:
+  288 five-minute and 24 hourly buckets per `d`, 7 daily ones per `7d`, DST
+  or not. Months and years use the calendar with end-of-month clamping ("one
+  month before 31 March" is 28 or 29 February).
+- **`evaluate` ignores `paused`.** `paused` is a gate on *acting*, and the
+  plan's own structure puts it there: the scheduler walks only "armed
+  (non-`paused`, parseable)" roots (Step 3.2), and `due` returns false for a
+  paused policy. Keeping it out of the rule is what lets the policy editor's
+  simulator answer "what would this expression keep" while the root is paused;
+  `Timeline.paused` carries the flag so a UI can say nothing will actually
+  happen. **M4 must check `policy.paused` before expiring.** Recorded here
+  because it is the one place where the pure function is not the whole
+  safety story.
+- **An unevaluable policy keeps everything.** A `SnapPolicy` whose `tz` is not
+  in the bundled tzdb (impossible through `parse`, which validates and
+  canonicalizes, but reachable for a hand-built value) makes `evaluate` return
+  `keep: true, [NotCandidate]` for every snapshot and `simulate` create
+  nothing. Step 4.2's posture for an unparseable policy is that its snapshots
+  are orphaned and kept; a silent fallback to UTC would instead delete by the
+  wrong calendar.
+- **`due` takes `policy_ino`.** The plan writes `due(policy, snaps, now_ms)`,
+  but "no auto snapshot **of this root** in the current bucket" cannot be
+  answered without the root, and making the caller pre-filter would put a copy
+  of the candidate rule in the scheduler. Same argument as `evaluate`'s own
+  `policy_ino`.
+- **`expires_at` is the latest of the keeping reasons' forecasts.** Per tier:
+  the first `I`-bucket whose window edge has reached this snapshot's bucket
+  (walked forward a bounded number of buckets, because calendar months are not
+  exactly invertible). For the `last` floor: the start of the n-th finest
+  bucket after the anchor's, since on schedule each bucket brings one arrival.
+  Those starts are walked **once per decision** (at most `min(last, 4096)`
+  calendar steps, extrapolated on the nominal cadence beyond), so the floor's
+  forecasts cost O(n + last), not O(n × last): the first version walked per
+  snapshot, and `1h:7d; last=1000000` over 5000 candidates took 14.5 s per
+  `evaluate` in release (M1b review must-fix 1;
+  `last_forecast_costs_one_walk_not_one_per_snapshot` counts the steps).
+  `None` means "no forecast" — either a `*` tier keeps it forever or it has
+  already expired, and `keep` says which. It is display only; nothing in the
+  rule reads it.
+- **Ties on `created_unix_ms` break on the snapshot id.** Two snapshots of the
+  same millisecond would otherwise make "the oldest in the bucket" depend on
+  the order the replica happened to return rows in, and the verdicts must be
+  identical on every node.
+- **The plan's monotonicity property needs one qualifier.** "Deleting any
+  non-representative never revives an expired one" is false as written when
+  the victim is inside the `last` floor: with `last=3` and `s1 < s2 < s3 <
+  s4`, deleting `s3` pulls `s1` into the newest three and revives it. What is
+  true, and what is tested, is the two statements that matter: deleting a
+  candidate that is **no tier's representative and outside the `last` floor**
+  changes no other verdict at all, and evaluating over the survivors of
+  `evaluate` expires nothing (idempotence), which is the property an
+  interrupted expiry pass relies on.
+- **`simulate(horizon_ms)` is a duration forward from `now_ms`**, matching the
+  plan's `snap_policy_simulate {horizon_ms}`; `Timeline.horizon_unix_ms` is the
+  absolute end. Synthetic creations are capped at `MAX_SYNTHETIC` = 10 000
+  (a 30-day horizon on a 5m cadence is 8640 and fits; the same horizon on a
+  test-only `10s` cadence does not, and `truncated` says so rather than the
+  node spending minutes on a UI keystroke).
+- **`Reason` serializes as a uniform four-key map** (`kind`, `every`, `last`,
+  `held_by`, the irrelevant ones null) instead of a serde-tagged enum: the
+  control protocol has a postcard transport, which is not self-describing, so
+  internally-tagged enums and `skip_serializing_if` are both unusable there
+  (`no_postcard_hostile_serde_attributes` exists to catch exactly that).
+  `Verdict`'s forecast is named `expires_unix_ms` on the wire, the name the
+  rest of the protocol uses for an absolute time.
+- **The simulation caches bucket starts per (snapshot, tier)** and re-decides
+  with integer comparisons only, so a 10 000-step horizon over a few hundred
+  survivors stays in the tens of milliseconds. `keep_mask` (the per-step
+  decision) allocates nothing per candidate; `decide` (reasons and forecasts)
+  runs once at the end.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0, 0 failed (23 m 40 s; `constellation-model` alone is 13 m of it). Re-run on the final tree package by package — all 18 packages, 1903 passed, 0 failed |
+| `cargo test -p constellation-meta` | 0 failed, **26 s** total, lib tests 1.3 s (the plan's "under ~60 s" budget) |
+| `cargo test -p constellation-meta --lib snapsched::retention::tests::differential_sweep -- --ignored` | ok, 36 s (20 000 cases) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+
+The suite was mutation-checked: a non-strict window comparison, a
+newest-in-bucket representative, an off-by-one `last`, nominal instead of
+calendar month arithmetic, an ignored `week-start`, a collapsed fold hour and a
+missing label-window widening each fail at least one test (the fold and
+`week-start` mutations fail the differential property as well as a calendar
+unit test).
+
+### Not done here (deliberately, per the brief)
+
+Step 3.1's xattr gate and root discovery, Step 3.2–3.4's scheduler, creation
+and skip-empty, Step 4's expiry/grace *driver* (the pure helpers are here; the
+`state.json` bookkeeping that decides whether a root is inside its grace
+window is M4's), Step 5's CLI, Step 6's accounting, Step 7's UI and control
+methods, Step 8's budget. Nothing here is wired to a caller, so the default
+posture is still inert.
