@@ -3,13 +3,15 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use constellation_csi::controller::ControllerService;
+use constellation_csi::control_client::{Engines, InMemoryEngines};
+use constellation_csi::controller::{ControllerConfig, ControllerService};
 use constellation_csi::identity::IdentityService;
 use constellation_csi::node::NodeService;
 use constellation_csi::proto::csi::v1::controller_server::ControllerServer;
 use constellation_csi::proto::csi::v1::identity_server::IdentityServer;
 use constellation_csi::proto::csi::v1::node_server::NodeServer;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
@@ -41,6 +43,12 @@ struct Cli {
     #[arg(long)]
     #[allow(dead_code)]
     control_socket_root: Option<PathBuf>,
+    /// Back the Controller service with an in-process, in-memory engine
+    /// fake instead of engine pods: volumes live only as long as this
+    /// process. For `csi-sanity` (`tests/csi/sanity.sh`) and local testing
+    /// only — never for a real cluster. With `--controller` only.
+    #[arg(long, requires = "controller")]
+    in_memory_backend: bool,
 }
 
 fn main() -> Result<()> {
@@ -83,8 +91,19 @@ async fn run(cli: Cli) -> Result<()> {
 
     if cli.controller {
         tracing::info!(endpoint = %path.display(), "constellation-csi starting (controller)");
+        let config = ControllerConfig::from_env().map_err(anyhow::Error::msg)?;
+        let engines: Option<Arc<dyn Engines>> = if cli.in_memory_backend {
+            tracing::warn!(
+                "--in-memory-backend: volumes are in-process fakes and vanish with this process"
+            );
+            Some(Arc::new(InMemoryEngines::default()))
+        } else {
+            // Controller-owned engine pods are 37-k2b's: until then every
+            // volume RPC answers UNAVAILABLE.
+            None
+        };
         let identity = IdentityServer::new(IdentityService::controller(None));
-        let controller = ControllerServer::new(ControllerService::new(None));
+        let controller = ControllerServer::new(ControllerService::new(engines, config));
         Server::builder()
             .add_service(identity)
             .add_service(controller)

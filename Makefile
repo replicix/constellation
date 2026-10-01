@@ -120,7 +120,7 @@ smoke: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Host smoke test (local file backend;
 integration: $(RELEASE_BIN) ## Host integration (floci S3 in docker)
 	tests/integration.sh
 
-csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity group against constellation-csi (plan 37 K1; needs CSI_SANITY_BIN or csi-sanity on PATH)
+csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity + Controller groups against constellation-csi on its in-memory backend (plan 37 K1+K2; needs CSI_SANITY_BIN or csi-sanity on PATH)
 	CONSTELLATION_CSI_BIN=$(abspath $(RELEASE_CSI)) tests/csi/sanity.sh
 
 compose: ## Containerized FUSE suites (floci S3; needs docker)

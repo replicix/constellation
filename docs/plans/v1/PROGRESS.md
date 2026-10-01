@@ -30243,3 +30243,52 @@ and skip-empty, Step 4's expiry/grace *driver* (the pure helpers are here; the
 window is M4's), Step 5's CLI, Step 6's accounting, Step 7's UI and control
 methods, Step 8's budget. Nothing here is wired to a caller, so the default
 posture is still inert.
+
+## Plan 37 K2a — `quota.set` barrier: csi-meta-ladder before/after
+
+This covers only the before/after measurement the coordinator asked 37-k2a to
+record. The K2 milestone entry itself is 37-k2b's.
+
+**Change measured.** `EngineControl::set_quota`
+(`crates/engine/src/control/service.rs`) no longer runs
+`snapshot_barrier("/")`. It takes the write lease (`acquire_write_lease`,
+split out of `snapshot_barrier`) and writes the journaled quota value. We
+dropped the barrier instead of scoping it to the quota's subtree because
+scoping would not help: the authority's `Control::Barrier` round-waiter
+checks the node's *whole* journal backlog whatever `ino` it is given. The
+barrier is also not needed for correctness. A snapshot (plan 32) drains
+because it publishes an immutable root that must contain every pending
+write. A quota (plan 30's view-local enforcement, `View::quota_check`)
+observes and publishes nothing, and the drain *before* the write never made
+the quota record durable any sooner. The controller also retries `quota.set`
+on `Failed`/`Unavailable`/`Timeout` with bounded, jittered backoff (8
+attempts, 25 ms doubling to 1 s; an exhausted retry → `ABORTED`). As a
+secondary measure it caps in-flight `CreateVolume`s per pool at 4
+(`CONSTELLATION_CSI_POOL_CREATE_CONCURRENCY`).
+
+**Shape measured.** This is still K0b's node-wide `SetQuotaParams{max_bytes}`,
+not §5's `quota.set{subtree, bytes}`. The engine has no subtree quota yet,
+and the CSI `ControlClient` trait carries `SubtreeQuotaParams`, which 37-k2b's
+real client must map to `{max_bytes}` only for `subtree: "/"`. The engine
+handler measured here is the same one a subtree quota would reach.
+
+`target/release/harness csi-meta-ladder` (CONSTELLATION_HARNESS_DOCKER_PREFIX
+set; 10,000 sequences per level; raw output in
+`bench/csi-metadata/results/k2a-{before,after}-grid.*` and
+`k2a-after-repro-8-64.*`):
+
+| conc | before err% | after err% | after repro err% | before ok seq/s | after ok seq/s | before seq p99 ms | after seq p99 ms |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.00 | 0.00 | | 97.6 | 606.3 | 18.0 | 4.0 |
+| 4 | 4.05 | 0.00 | | 237.7 | 675.4 | 76.3 | 47.2 |
+| 8 | 12.14 | 0.00 | 0.00 | 266.0 | 399.5 | 60.5 | 63.8 |
+| 16 | 12.32 | 0.00 | | 486.7 | 677.1 | 66.5 | 58.6 |
+| 32 | 16.36 | 0.00 | | 647.0 | 986.3 | 84.5 | 88.8 |
+| 64 | 25.98 | 0.00 | 0.00 | 814.2 | 1351.3 | 100.4 | 105.2 |
+| 256 | 42.11 | 0.00 | | 746.1 | 1554.4 | 297.4 | 325.3 |
+
+Host load was high and varied during these runs: load1 was 44-75 in the
+"before" run and 20-59 in the "after" runs. The before/after throughput
+ratios are therefore indicative only. The error rates are not: after the
+change, all 90,000 sequences in the main grid and the reproducibility run
+succeeded.

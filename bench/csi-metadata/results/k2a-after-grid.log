@@ -1,0 +1,53 @@
+csi-meta-ladder createvolume c=1   cumulative=     0->100    in    0.1s:   904.2 vol/s seq p50=   0.97ms p99=    2.61ms cpu= 63.3% s3_reqs=157 backlog Some(2)->Some(0) load Some(21.39)->Some(21.39) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=1   cumulative=   100->1000   in    1.0s:   877.7 vol/s seq p50=   0.98ms p99=    3.86ms cpu= 69.2% s3_reqs=1866 backlog Some(0)->Some(16) load Some(21.39)->Some(21.44) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=1   cumulative=  1000->5000   in    8.9s:   447.2 vol/s seq p50=   1.42ms p99=   10.61ms cpu= 59.6% s3_reqs=8813 backlog Some(0)->Some(0) load Some(21.44)->Some(20.93) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=1   cumulative=  5000->10000  in    6.4s:   779.9 vol/s seq p50=   1.04ms p99=    4.01ms cpu= 93.0% s3_reqs=10491 backlog Some(0)->Some(114) load Some(20.93)->Some(19.64) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=4   cumulative=     0->100    in    0.0s:  2811.0 vol/s seq p50=   1.22ms p99=    2.13ms cpu=168.7% s3_reqs=35 backlog Some(2)->Some(36) load Some(19.64)->Some(19.64) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=4   cumulative=   100->1000   in    0.4s:  2440.9 vol/s seq p50=   1.46ms p99=    4.63ms cpu=138.3% s3_reqs=462 backlog Some(36)->Some(27) load Some(19.64)->Some(19.64) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=4   cumulative=  1000->5000   in    2.3s:  1710.1 vol/s seq p50=   1.84ms p99=   14.91ms cpu=125.7% s3_reqs=2465 backlog Some(0)->Some(9) load Some(19.64)->Some(19.64) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=4   cumulative=  5000->10000  in   12.1s:   414.5 vol/s seq p50=   6.25ms p99=   47.15ms cpu= 51.8% s3_reqs=5016 backlog Some(0)->Some(0) load Some(19.64)->Some(25.77) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=     0->100    in    0.5s:   184.6 vol/s seq p50=  24.43ms p99=  120.13ms cpu= 11.1% s3_reqs=75 backlog Some(2)->Some(0) load Some(25.77)->Some(25.77) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=   100->1000   in    2.4s:   379.2 vol/s seq p50=  16.33ms p99=   69.05ms cpu= 25.3% s3_reqs=632 backlog Some(0)->Some(200) load Some(25.77)->Some(25.77) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=  1000->5000   in   10.1s:   397.4 vol/s seq p50=  16.27ms p99=   68.75ms cpu= 34.8% s3_reqs=2943 backlog Some(0)->Some(0) load Some(25.77)->Some(37.19) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=  5000->10000  in   12.1s:   414.8 vol/s seq p50=  15.70ms p99=   63.75ms cpu= 41.6% s3_reqs=3754 backlog Some(0)->Some(0) load Some(37.19)->Some(46.92) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=16  cumulative=     0->100    in    0.2s:   645.3 vol/s seq p50=  21.48ms p99=   48.32ms cpu= 32.3% s3_reqs=35 backlog Some(2)->Some(0) load Some(46.92)->Some(46.92) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=16  cumulative=   100->1000   in    1.0s:   910.1 vol/s seq p50=  15.54ms p99=   46.79ms cpu= 47.5% s3_reqs=332 backlog Some(0)->Some(187) load Some(46.92)->Some(46.92) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=16  cumulative=  1000->5000   in    6.2s:   641.3 vol/s seq p50=  21.05ms p99=   80.15ms cpu= 43.6% s3_reqs=1627 backlog Some(0)->Some(660) load Some(46.92)->Some(47.25) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=16  cumulative=  5000->10000  in    7.4s:   676.8 vol/s seq p50=  21.35ms p99=   58.62ms cpu= 55.6% s3_reqs=2160 backlog Some(0)->Some(59) load Some(47.25)->Some(49.5) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=32  cumulative=     0->100    in    0.1s:   961.0 vol/s seq p50=  33.94ms p99=   54.42ms cpu= 48.1% s3_reqs=16 backlog Some(2)->Some(0) load Some(49.5)->Some(49.5) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=32  cumulative=   100->1000   in    0.8s:  1163.0 vol/s seq p50=  24.08ms p99=   57.27ms cpu= 59.4% s3_reqs=169 backlog Some(0)->Some(0) load Some(49.5)->Some(49.5) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=32  cumulative=  1000->5000   in    3.9s:  1033.7 vol/s seq p50=  28.78ms p99=   66.58ms cpu= 67.7% s3_reqs=1033 backlog Some(0)->Some(0) load Some(49.5)->Some(50.98) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=32  cumulative=  5000->10000  in    5.4s:   927.4 vol/s seq p50=  31.02ms p99=   88.78ms cpu= 72.3% s3_reqs=1192 backlog Some(0)->Some(0) load Some(50.98)->Some(52.58) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=     0->100    in    0.1s:  1596.9 vol/s seq p50=  32.43ms p99=   59.26ms cpu= 79.8% s3_reqs=17 backlog Some(2)->Some(0) load Some(52.58)->Some(52.58) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=   100->1000   in    0.7s:  1331.2 vol/s seq p50=  45.11ms p99=   95.96ms cpu= 68.0% s3_reqs=127 backlog Some(0)->Some(0) load Some(52.58)->Some(52.58) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=  1000->5000   in    2.8s:  1437.0 vol/s seq p50=  40.63ms p99=   96.12ms cpu= 80.5% s3_reqs=562 backlog Some(0)->Some(0) load Some(52.58)->Some(57.02) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=  5000->10000  in    3.9s:  1289.3 vol/s seq p50=  46.18ms p99=  105.24ms cpu= 87.4% s3_reqs=634 backlog Some(0)->Some(318) load Some(57.02)->Some(59.02) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=256 cumulative=     0->100    in    0.1s:  1280.6 vol/s seq p50=  66.94ms p99=   77.69ms cpu= 64.0% s3_reqs=13 backlog Some(2)->Some(0) load Some(59.02)->Some(59.02) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=256 cumulative=   100->1000   in    0.5s:  1682.3 vol/s seq p50= 134.41ms p99=  270.78ms cpu= 78.5% s3_reqs=63 backlog Some(0)->Some(2367) load Some(59.02)->Some(59.02) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=256 cumulative=  1000->5000   in    2.5s:  1631.6 vol/s seq p50= 146.69ms p99=  269.84ms cpu= 86.5% s3_reqs=342 backlog Some(2367)->Some(1117) load Some(59.02)->Some(59.02) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=256 cumulative=  5000->10000  in    3.4s:  1484.3 vol/s seq p50= 164.10ms p99=  325.28ms cpu= 81.9% s3_reqs=462 backlog Some(0)->Some(0) load Some(59.02)->Some(56.93) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder node.ping   c=1    80000 pings in    0.9s:   90492.4 ops/s p50= 0.007ms p99=  0.015ms errors=0
+csi-meta-ladder node.ping   c=4    80000 pings in    0.9s:   84433.1 ops/s p50= 0.027ms p99=  0.143ms errors=0
+csi-meta-ladder node.ping   c=8    80000 pings in    0.8s:   94444.2 ops/s p50= 0.041ms p99=  1.571ms errors=0
+csi-meta-ladder node.ping   c=16   80000 pings in    0.6s:  127229.8 ops/s p50= 0.074ms p99=  2.726ms errors=0
+csi-meta-ladder node.ping   c=32   80000 pings in    0.7s:  116075.7 ops/s p50= 0.120ms p99=  3.193ms errors=0
+csi-meta-ladder node.ping   c=64   80000 pings in    0.7s:  122393.7 ops/s p50= 0.206ms p99=  5.734ms errors=0
+csi-meta-ladder node.ping   c=256  80000 pings in    0.4s:  179013.4 ops/s p50= 0.830ms p99=  5.729ms errors=0
+
+=== csi-meta-ladder summary (per concurrency level, aggregated over checkpoints) ===
+ conc attempted  errors     err%   att_seq/s    ok_seq/s  seq_p50ms  seq_p99ms   failop_p50   failop_p99     cpu%   load1
+    1     10000       0    0.00%      606.34      606.34       1.04       4.01         0.00         0.00     93.0   19.64
+    4     10000       0    0.00%      675.35      675.35       6.25      47.15         0.00         0.00     51.8   25.77
+    8     10000       0    0.00%      399.46      399.46      15.70      63.75         0.00         0.00     41.6   46.92
+   16     10000       0    0.00%      677.08      677.08      21.35      58.62         0.00         0.00     55.6   49.50
+   32     10000       0    0.00%      986.28      986.28      31.02      88.78         0.00         0.00     72.3   52.58
+   64     10000       0    0.00%     1351.31     1351.31      46.18     105.24         0.00         0.00     87.4   59.02
+  256     10000       0    0.00%     1554.40     1554.40     164.10     325.28         0.00         0.00     81.9   56.93
+--- node.ping (control-plane overhead, same grid) ---
+    1     80000 pings      90492.4 ops/s p50=  0.007ms p99=  0.015ms p999=   1.261ms errors=0
+    4     80000 pings      84433.1 ops/s p50=  0.027ms p99=  0.143ms p999=   2.937ms errors=0
+    8     80000 pings      94444.2 ops/s p50=  0.041ms p99=  1.571ms p999=   5.830ms errors=0
+   16     80000 pings     127229.8 ops/s p50=  0.074ms p99=  2.726ms p999=   3.118ms errors=0
+   32     80000 pings     116075.7 ops/s p50=  0.120ms p99=  3.193ms p999=   6.124ms errors=0
+   64     80000 pings     122393.7 ops/s p50=  0.206ms p99=  5.734ms p999=   7.918ms errors=0
+  256     80000 pings     179013.4 ops/s p50=  0.830ms p99=  5.729ms p999=   6.608ms errors=0

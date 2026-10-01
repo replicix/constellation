@@ -1,0 +1,18 @@
+csi-meta-ladder createvolume c=8   cumulative=     0->100    in    0.2s:   631.0 vol/s seq p50=  11.27ms p99=   28.24ms cpu= 44.2% s3_reqs=59 backlog Some(2)->Some(0) load Some(52.53)->Some(52.53) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=   100->1000   in    1.2s:   780.6 vol/s seq p50=   9.26ms p99=   29.38ms cpu= 40.8% s3_reqs=511 backlog Some(0)->Some(36) load Some(52.53)->Some(52.53) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=  1000->5000   in    6.0s:   671.9 vol/s seq p50=  11.08ms p99=   28.59ms cpu= 51.6% s3_reqs=2659 backlog Some(36)->Some(0) load Some(52.53)->Some(49.73) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=8   cumulative=  5000->10000  in    8.8s:   566.0 vol/s seq p50=  12.95ms p99=   36.27ms cpu= 51.4% s3_reqs=3486 backlog Some(0)->Some(0) load Some(49.73)->Some(47.59) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=     0->100    in    0.1s:   690.1 vol/s seq p50=  72.24ms p99=  111.62ms cpu= 41.4% s3_reqs=18 backlog Some(2)->Some(7) load Some(48.42)->Some(48.42) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=   100->1000   in    0.8s:  1143.9 vol/s seq p50=  52.66ms p99=  102.74ms cpu= 61.0% s3_reqs=119 backlog Some(0)->Some(6) load Some(48.42)->Some(48.42) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=  1000->5000   in    3.2s:  1248.1 vol/s seq p50=  45.95ms p99=  139.62ms cpu= 72.7% s3_reqs=563 backlog Some(0)->Some(0) load Some(48.42)->Some(48.42) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder createvolume c=64  cumulative=  5000->10000  in    4.1s:  1214.2 vol/s seq p50=  47.29ms p99=  137.01ms cpu= 83.8% s3_reqs=686 backlog Some(0)->Some(0) load Some(48.42)->Some(49.75) errors=0 () failed-op p50=   0.00ms p99=    0.00ms
+csi-meta-ladder node.ping   c=8    80000 pings in    0.9s:   93755.2 ops/s p50= 0.041ms p99=  2.422ms errors=0
+csi-meta-ladder node.ping   c=64   80000 pings in    0.7s:  115001.5 ops/s p50= 0.207ms p99=  5.887ms errors=0
+
+=== csi-meta-ladder summary (per concurrency level, aggregated over checkpoints) ===
+ conc attempted  errors     err%   att_seq/s    ok_seq/s  seq_p50ms  seq_p99ms   failop_p50   failop_p99     cpu%   load1
+    8     10000       0    0.00%      621.19      621.19      12.95      36.27         0.00         0.00     51.4   47.59
+   64     10000       0    0.00%     1211.43     1211.43      47.29     137.01         0.00         0.00     83.8   49.75
+--- node.ping (control-plane overhead, same grid) ---
+    8     80000 pings      93755.2 ops/s p50=  0.041ms p99=  2.422ms p999=   4.544ms errors=0
+   64     80000 pings     115001.5 ops/s p50=  0.207ms p99=  5.887ms p999=   9.174ms errors=0

@@ -43,8 +43,21 @@ impl EngineControl {
             .resolve_path(path)
             .map_err(|error| error.to_string())?
             .unwrap_or(constellation_fs_core::types::ROOT_INO);
-        let part = "p0".to_string();
-        let _ = part;
+        self.acquire_write_lease()?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.sync_tx
+            .send(sync::SyncRequest::Barrier { ino, reply })
+            .map_err(|_| "sync task is not running".to_string())?;
+        tokio::task::block_in_place(|| self.rt.block_on(receive))
+            .map_err(|_| "snapshot barrier stopped".to_string())?
+    }
+
+    /// Take the write lease for a control-plane metadata mutation that is
+    /// journaled like any other (`quota.set`), without
+    /// [`Self::snapshot_barrier`]'s drain: holding the lease is what makes
+    /// the local journal record shippable, and nothing is observed or
+    /// published that pending writes would need to be part of.
+    pub(crate) fn acquire_write_lease(&self) -> std::result::Result<(), String> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
             .send(sync::SyncRequest::Acquire { reply })
@@ -54,12 +67,7 @@ impl EngineControl {
         if !progress.acquired {
             return Err("subtree write lease is held by another node".into());
         }
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        self.sync_tx
-            .send(sync::SyncRequest::Barrier { ino, reply })
-            .map_err(|_| "sync task is not running".to_string())?;
-        tokio::task::block_in_place(|| self.rt.block_on(receive))
-            .map_err(|_| "snapshot barrier stopped".to_string())?
+        Ok(())
     }
 
     /// Assemble the pruner's dependency bundle from the daemon's shared
@@ -1079,7 +1087,21 @@ impl EngineControl {
 
     pub(crate) fn set_quota(&self, max_bytes: Option<u64>) -> std::result::Result<String, String> {
         use constellation_meta::MetaStore;
-        self.snapshot_barrier("/")?;
+        // The lease, not a barrier. This used to run `snapshot_barrier("/")`
+        // first, which waits for the node's *whole* journal backlog to
+        // reach zero within one sync round and fails the call ("journal not
+        // shipped: no lease") whenever concurrent writes keep it nonzero —
+        // plan 37 K0 Track B measured that as most `quota.set`s failing at
+        // 64 concurrent CSI `CreateVolume`s. A snapshot needs that drain
+        // because it publishes an immutable root that must contain every
+        // pending write (plan 32); a quota observes and publishes nothing:
+        // it writes one journaled value, enforced locally and best-effort
+        // (`View::quota_check`), and replicates when the record ships —
+        // the drain *before* the write never made the quota itself durable
+        // any sooner. Scoping the barrier to a subtree would not have
+        // helped either: the round-waiter checks the whole journal
+        // whatever `ino` it is given.
+        self.acquire_write_lease()?;
         self.meta
             .set_quota(max_bytes)
             .map_err(|e| format!("{e:#}"))?;

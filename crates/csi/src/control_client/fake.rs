@@ -4,27 +4,33 @@
 //! §12: "a throwaway local `EngineProfile` ... so the sanity suite never
 //! touches real S3").
 
-use super::ControlClient;
+use super::{ControlClient, Engines, SubtreeQuotaParams};
 use async_trait::async_trait;
 use constellation_control::proto::types::{
     Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsUnlockParams, HandoffParams,
-    HandoffReport, LeaveParams, MkdirParams, Pong, QuotaStatus, RenameParams, SetQuotaParams,
-    SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams,
-    SnapshotListParams, SnapshotListing, SnapshotStatus, ViewInfo, ViewMountParams,
-    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrOp, XattrParams, XattrResult,
+    HandoffReport, LeaveParams, MkdirParams, Pong, QuotaStatus, RenameParams, SnapshotCreateParams,
+    SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams, SnapshotListParams,
+    SnapshotListing, SnapshotStatus, ViewInfo, ViewMountParams, ViewStatsParams, ViewStatsReport,
+    ViewUnmountParams, XattrOp, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// One directory entry: just its extended attributes. There is no file
-/// content in this fake — the CSI driver only ever creates/renames/xattrs
-/// directories (`/volumes/<pv>`, `/.trash/<pv>-<ts>`), never writes file
-/// data through the control protocol.
+/// One directory entry: its extended attributes and its own subtree quota
+/// (plan 37 §5's `quota.set{subtree}`; the root's is the filesystem-wide
+/// cap). There is no file content in this fake — the CSI driver only ever
+/// creates/renames/xattrs directories (`/volumes/<pv>`, `/.trash/<pv>-<ts>`),
+/// never writes file data through the control protocol — so `used_bytes`
+/// is whatever a test planted with [`InMemoryControl::set_used_bytes`].
+/// Keeping the quota on the entry makes it travel with a rename or clone,
+/// as a real per-directory quota would.
 #[derive(Default, Clone)]
 struct DirEntry {
     xattrs: BTreeMap<String, Vec<u8>>,
+    quota: Option<u64>,
+    used_bytes: u64,
 }
 
 #[derive(Default)]
@@ -39,13 +45,21 @@ struct Mounted {
     mountpoint: String,
 }
 
+/// The filesystem registry `fs.create` writes: shared by every
+/// [`InMemoryControl`] an [`InMemoryEngines`] hands out, the way every
+/// engine pod reads one registry, so a uuid minted through one client is
+/// known to all of them.
+#[derive(Default)]
+struct Registry {
+    /// `(bucket, prefix)` -> the filesystem uuid `fs.create` minted for it.
+    filesystems: BTreeMap<(String, String), String>,
+    next_fs_uuid: u64,
+}
+
 struct State {
     /// Normalized path ("/", "/volumes/pvc-1") -> entry. The root always
     /// exists.
     tree: BTreeMap<String, DirEntry>,
-    /// `(bucket, prefix)` -> the filesystem uuid `fs.create` minted for it.
-    filesystems: BTreeMap<(String, String), String>,
-    quota: QuotaStatus,
     snapshots: Vec<SnapshotStatus>,
     views: BTreeMap<u64, Mounted>,
 }
@@ -54,43 +68,108 @@ struct State {
 /// shapes (idempotent `fs.create`, xattr-carried volume records, trash-style
 /// renames, held snapshots) without a daemon, S3, or the engine. Not
 /// durable, not concurrent-safe beyond its own `Mutex` (which is fine: a
-/// single-process fake).
+/// single-process fake). One instance is one filesystem's tree; the
+/// registry behind `fs.create` may be shared ([`InMemoryEngines`]).
 pub struct InMemoryControl {
     state: Mutex<State>,
+    registry: Arc<Mutex<Registry>>,
     next_view_id: AtomicU64,
-    next_fs_uuid: AtomicU64,
+    next_snapshot_id: AtomicU64,
     /// A kill switch for `node_ping`, so callers (the Identity `Probe` RPC's
     /// unit tests, in particular) can exercise "the engine pod is dead"
     /// without a second `ControlClient` impl. Every other method stays
     /// healthy when this is set: only `node.ping` models a pod that stopped
     /// answering.
     unreachable: std::sync::atomic::AtomicBool,
+    /// How many of the next `quota_set` calls fail the way the real one does
+    /// under concurrent metadata load (plan 37 "K0 results" Track B: the
+    /// whole-journal round-waiter's `journal not shipped: no lease`).
+    quota_set_failures: AtomicU32,
+    /// Every `quota_set` call, failed or not.
+    quota_set_calls: AtomicU64,
 }
 
 impl Default for InMemoryControl {
     fn default() -> InMemoryControl {
+        InMemoryControl::with_registry(Arc::default())
+    }
+}
+
+impl InMemoryControl {
+    fn with_registry(registry: Arc<Mutex<Registry>>) -> InMemoryControl {
         let mut tree = BTreeMap::new();
         tree.insert("/".to_string(), DirEntry::default());
         InMemoryControl {
             state: Mutex::new(State {
                 tree,
-                filesystems: BTreeMap::new(),
-                quota: QuotaStatus::default(),
                 snapshots: Vec::new(),
                 views: BTreeMap::new(),
             }),
+            registry,
             next_view_id: AtomicU64::new(1),
-            next_fs_uuid: AtomicU64::new(1),
+            next_snapshot_id: AtomicU64::new(1),
             unreachable: std::sync::atomic::AtomicBool::new(false),
+            quota_set_failures: AtomicU32::new(0),
+            quota_set_calls: AtomicU64::new(0),
         }
     }
-}
 
-impl InMemoryControl {
     /// From the next `node_ping` on, answer as if the engine pod were
     /// unreachable instead of healthy.
     pub fn mark_unreachable(&self) {
         self.unreachable.store(true, Ordering::SeqCst);
+    }
+
+    /// Fail the next `n` `quota_set` calls with the engine's transient
+    /// barrier error (`ErrorKind::Failed`, "journal not shipped: no lease").
+    pub fn fail_next_quota_sets(&self, n: u32) {
+        self.quota_set_failures.store(n, Ordering::SeqCst);
+    }
+
+    /// How many times `quota_set` has been called, failures included.
+    pub fn quota_set_calls(&self) -> u64 {
+        self.quota_set_calls.load(Ordering::SeqCst)
+    }
+
+    /// Plant `bytes` of usage on `path` (this fake stores no file data), so
+    /// a test can drive the "shrink below what is used" paths.
+    pub fn set_used_bytes(&self, path: &str, bytes: u64) {
+        let path = normalize(path);
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.tree.get_mut(&path) {
+            entry.used_bytes = bytes;
+        }
+    }
+
+    /// Whether `path` exists in this filesystem's tree.
+    pub fn exists(&self, path: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .tree
+            .contains_key(&normalize(path))
+    }
+
+    /// Every path directly under `dir`.
+    pub fn children(&self, dir: &str) -> Vec<String> {
+        let dir = normalize(dir);
+        let state = self.state.lock().unwrap();
+        state
+            .tree
+            .keys()
+            .filter(|p| p.as_str() != dir && parent_of(p).as_deref() == Some(dir.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `uuid` names a filesystem `fs.create` has registered.
+    fn knows_filesystem(&self, uuid: &str) -> bool {
+        self.registry
+            .lock()
+            .unwrap()
+            .filesystems
+            .values()
+            .any(|u| u == uuid)
     }
 }
 
@@ -151,17 +230,17 @@ impl InMemoryControl {
 #[async_trait]
 impl ControlClient for InMemoryControl {
     async fn fs_create(&self, params: FsCreateParams) -> Result<FsCreated, ControlError> {
-        let mut state = self.state.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap();
         let key = (params.bucket.clone(), params.prefix.clone());
-        if let Some(uuid) = state.filesystems.get(&key) {
+        if let Some(uuid) = registry.filesystems.get(&key) {
             return Ok(FsCreated {
                 uuid: uuid.clone(),
                 created: false,
             });
         }
-        let n = self.next_fs_uuid.fetch_add(1, Ordering::SeqCst);
-        let uuid = format!("fake-fs-{n:08x}");
-        state.filesystems.insert(key, uuid.clone());
+        registry.next_fs_uuid += 1;
+        let uuid = format!("fake-fs-{:08x}", registry.next_fs_uuid);
+        registry.filesystems.insert(key, uuid.clone());
         Ok(FsCreated {
             uuid,
             created: true,
@@ -190,6 +269,11 @@ impl ControlClient for InMemoryControl {
                 built.push_str(part);
                 state.tree.entry(built.clone()).or_default();
             }
+        }
+        // Like the engine's `browse.mkdir`: an existing directory is fine
+        // with `parents` (`mkdir -p`), `EEXIST` without.
+        if state.tree.contains_key(&path) && !params.parents {
+            return Err(ControlError::from(constellation_types::Code::Exists));
         }
         state.tree.entry(path.clone()).or_default();
         Ok(FileStat {
@@ -239,6 +323,18 @@ impl ControlClient for InMemoryControl {
         if !state.tree.contains_key(&from) {
             return Err(ControlError::not_found(format!("{from} does not exist")));
         }
+        // `rename(2)` never creates the destination's parent.
+        let to_parent = parent_of(&to).unwrap_or_else(|| "/".to_string());
+        if !state.tree.contains_key(&to_parent) {
+            return Err(ControlError::not_found(format!(
+                "{to_parent} does not exist"
+            )));
+        }
+        if to == from || to.starts_with(&format!("{from}/")) {
+            return Err(ControlError::invalid(format!(
+                "cannot move {from} under itself ({to})"
+            )));
+        }
         if state.tree.contains_key(&to) && !params.overwrite {
             return Err(ControlError::from(constellation_types::Code::Exists));
         }
@@ -255,14 +351,42 @@ impl ControlClient for InMemoryControl {
         Ok(Ack::new(format!("{from} -> {to}")))
     }
 
-    async fn quota_get(&self) -> Result<QuotaStatus, ControlError> {
-        Ok(self.state.lock().unwrap().quota.clone())
+    async fn quota_get(&self, subtree: &str) -> Result<QuotaStatus, ControlError> {
+        let path = normalize(subtree);
+        let state = self.state.lock().unwrap();
+        let entry = state
+            .tree
+            .get(&path)
+            .ok_or_else(|| ControlError::not_found(format!("{path} does not exist")))?;
+        let used_bytes = InMemoryControl::subtree_of(&state.tree, &path)
+            .iter()
+            .map(|p| state.tree[p].used_bytes)
+            .sum();
+        Ok(QuotaStatus {
+            max_bytes: entry.quota,
+            used_bytes,
+        })
     }
 
-    async fn quota_set(&self, params: SetQuotaParams) -> Result<QuotaStatus, ControlError> {
-        let mut state = self.state.lock().unwrap();
-        state.quota.max_bytes = params.max_bytes;
-        Ok(state.quota.clone())
+    async fn quota_set(&self, params: SubtreeQuotaParams) -> Result<QuotaStatus, ControlError> {
+        self.quota_set_calls.fetch_add(1, Ordering::SeqCst);
+        let injected = self
+            .quota_set_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if injected {
+            return Err(ControlError::failed("journal not shipped: no lease"));
+        }
+        let path = normalize(&params.subtree);
+        {
+            let mut state = self.state.lock().unwrap();
+            let entry = state
+                .tree
+                .get_mut(&path)
+                .ok_or_else(|| ControlError::not_found(format!("{path} does not exist")))?;
+            entry.quota = params.max_bytes;
+        }
+        self.quota_get(&path).await
     }
 
     async fn snapshot_create(
@@ -270,7 +394,10 @@ impl ControlClient for InMemoryControl {
         params: SnapshotCreateParams,
     ) -> Result<SnapshotCreated, ControlError> {
         let (held, owner) = params.hold_request().map_err(ControlError::invalid)?;
-        let id = format!("snap-{}", self.next_fs_uuid.fetch_add(1, Ordering::SeqCst));
+        let id = format!(
+            "snap-{}",
+            self.next_snapshot_id.fetch_add(1, Ordering::SeqCst)
+        );
         let snapshot = SnapshotStatus {
             id: id.clone(),
             path: params.selector.clone(),
@@ -414,19 +541,20 @@ impl ControlClient for InMemoryControl {
         if !state.views.contains_key(&id) {
             return Err(ControlError::not_found(format!("no view {id}")));
         }
+        let root = &state.tree["/"];
+        let used: u64 = state.tree.values().map(|e| e.used_bytes).sum();
         Ok(ViewStatsReport {
             id,
             block_size: 4096,
-            total_bytes: state.quota.max_bytes.unwrap_or(u64::MAX),
-            used_bytes: state.quota.used_bytes,
-            available_bytes: state
+            total_bytes: root.quota.unwrap_or(u64::MAX),
+            used_bytes: used,
+            available_bytes: root
                 .quota
-                .max_bytes
-                .map(|m| m.saturating_sub(state.quota.used_bytes))
+                .map(|m| m.saturating_sub(used))
                 .unwrap_or(u64::MAX),
             inodes_total: u64::MAX,
             inodes_used: state.tree.len() as u64,
-            rsize: state.quota.used_bytes,
+            rsize: used,
             rcount: state.tree.len() as u64,
         })
     }
@@ -455,6 +583,57 @@ impl ControlClient for InMemoryControl {
 
     async fn node_leave(&self, _params: LeaveParams) -> Result<Ack, ControlError> {
         Ok(Ack::new("left"))
+    }
+}
+
+/// An [`Engines`] over [`InMemoryControl`]s: one shared filesystem
+/// registry, and one independent tree per registered filesystem — the shape
+/// of N pool (or shard) filesystems each behind its own engine pod. Backs
+/// the controller's unit tests and `constellation-csi --in-memory-backend`
+/// (what `tests/csi/sanity.sh` runs `csi-sanity` against).
+#[derive(Default)]
+pub struct InMemoryEngines {
+    registry: Arc<InMemoryControl>,
+    filesystems: Mutex<BTreeMap<String, Arc<InMemoryControl>>>,
+}
+
+impl InMemoryEngines {
+    /// The concrete client for `uuid`, if one has been handed out — for
+    /// tests that inject faults or inspect a pool's tree.
+    pub fn filesystem_client(&self, uuid: &str) -> Option<Arc<InMemoryControl>> {
+        self.filesystems.lock().unwrap().get(uuid).cloned()
+    }
+
+    /// The registry client, for tests.
+    pub fn registry_client(&self) -> Arc<InMemoryControl> {
+        self.registry.clone()
+    }
+}
+
+#[async_trait]
+impl Engines for InMemoryEngines {
+    async fn registry(&self) -> Result<Arc<dyn ControlClient>, ControlError> {
+        Ok(self.registry.clone())
+    }
+
+    async fn filesystem(&self, fs_uuid: &str) -> Result<Arc<dyn ControlClient>, ControlError> {
+        if !self.registry.knows_filesystem(fs_uuid) {
+            return Err(ControlError::not_found(format!(
+                "no filesystem {fs_uuid} is registered"
+            )));
+        }
+        let client = self
+            .filesystems
+            .lock()
+            .unwrap()
+            .entry(fs_uuid.to_string())
+            .or_insert_with(|| {
+                Arc::new(InMemoryControl::with_registry(
+                    self.registry.registry.clone(),
+                ))
+            })
+            .clone();
+        Ok(client)
     }
 }
 
@@ -548,6 +727,23 @@ mod tests {
             .unwrap();
         assert_eq!(got.value.unwrap().0.as_ref(), b"pv1");
 
+        // `rename(2)` does not create the destination's parent.
+        let no_parent = c
+            .browse_rename(RenameParams {
+                from: "/volumes/pv1".into(),
+                to: "/.trash/pv1-1".into(),
+                overwrite: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(no_parent.kind, ErrorKind::NotFound);
+        c.browse_mkdir(MkdirParams {
+            path: "/.trash".into(),
+            mode: None,
+            parents: false,
+        })
+        .await
+        .unwrap();
         c.browse_rename(RenameParams {
             from: "/volumes/pv1".into(),
             to: "/.trash/pv1-1".into(),
@@ -580,15 +776,79 @@ mod tests {
     #[tokio::test]
     async fn quota_set_then_get() {
         let c = InMemoryControl::default();
-        assert_eq!(c.quota_get().await.unwrap().max_bytes, None);
+        assert_eq!(c.quota_get("/").await.unwrap().max_bytes, None);
         let status = c
-            .quota_set(SetQuotaParams {
+            .quota_set(SubtreeQuotaParams {
+                subtree: "/".into(),
                 max_bytes: Some(1024),
             })
             .await
             .unwrap();
         assert_eq!(status.max_bytes, Some(1024));
-        assert_eq!(c.quota_get().await.unwrap().max_bytes, Some(1024));
+        assert_eq!(c.quota_get("/").await.unwrap().max_bytes, Some(1024));
+    }
+
+    /// Subtree quotas are per directory, travel with a rename, and a
+    /// missing subtree is `NotFound` for both get and set.
+    #[tokio::test]
+    async fn subtree_quota_follows_its_directory() {
+        let c = InMemoryControl::default();
+        for p in ["/volumes/pv1", "/.trash"] {
+            c.browse_mkdir(MkdirParams {
+                path: p.into(),
+                mode: None,
+                parents: true,
+            })
+            .await
+            .unwrap();
+        }
+        c.quota_set(SubtreeQuotaParams {
+            subtree: "/volumes/pv1".into(),
+            max_bytes: Some(10),
+        })
+        .await
+        .unwrap();
+        c.set_used_bytes("/volumes/pv1", 7);
+        let got = c.quota_get("/volumes/pv1").await.unwrap();
+        assert_eq!((got.max_bytes, got.used_bytes), (Some(10), 7));
+        assert_eq!(c.quota_get("/").await.unwrap().max_bytes, None);
+        assert_eq!(c.quota_get("/").await.unwrap().used_bytes, 7);
+
+        c.browse_rename(RenameParams {
+            from: "/volumes/pv1".into(),
+            to: "/.trash/pv1-1".into(),
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+        let moved = c.quota_get("/.trash/pv1-1").await.unwrap();
+        assert_eq!(moved.max_bytes, Some(10));
+        let gone = c.quota_get("/volumes/pv1").await.unwrap_err();
+        assert_eq!(gone.kind, ErrorKind::NotFound);
+        let gone = c
+            .quota_set(SubtreeQuotaParams {
+                subtree: "/volumes/pv1".into(),
+                max_bytes: Some(1),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(gone.kind, ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn injected_quota_set_failures_are_transient() {
+        let c = InMemoryControl::default();
+        c.fail_next_quota_sets(2);
+        let set = || {
+            c.quota_set(SubtreeQuotaParams {
+                subtree: "/".into(),
+                max_bytes: Some(1),
+            })
+        };
+        assert_eq!(set().await.unwrap_err().kind, ErrorKind::Failed);
+        assert_eq!(set().await.unwrap_err().kind, ErrorKind::Failed);
+        set().await.unwrap();
+        assert_eq!(c.quota_set_calls(), 3);
     }
 
     #[tokio::test]
@@ -855,6 +1115,58 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Unavailable);
         // Everything else still works: the kill switch models a dead
         // engine pod, not a broken fake.
-        c.quota_get().await.unwrap();
+        c.quota_get("/").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn engines_share_one_registry_and_keep_trees_apart() {
+        let engines = InMemoryEngines::default();
+        let registry = engines.registry().await.unwrap();
+        let a = registry
+            .fs_create(FsCreateParams {
+                bucket: "b".into(),
+                prefix: "a".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let b = registry
+            .fs_create(FsCreateParams {
+                bucket: "b".into(),
+                prefix: "b".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let fs_a = engines.filesystem(&a.uuid).await.unwrap();
+        // The same (bucket, prefix) through a per-filesystem client: the
+        // registry is shared, so the uuid is the same.
+        let again = fs_a
+            .fs_create(FsCreateParams {
+                bucket: "b".into(),
+                prefix: "a".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(again.uuid, a.uuid);
+        fs_a.browse_mkdir(MkdirParams {
+            path: "/volumes".into(),
+            mode: None,
+            parents: false,
+        })
+        .await
+        .unwrap();
+        assert!(engines
+            .filesystem_client(&a.uuid)
+            .unwrap()
+            .exists("/volumes"));
+        let fs_b = engines.filesystem(&b.uuid).await.unwrap();
+        assert_eq!(
+            fs_b.quota_get("/volumes").await.unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        let unknown = engines.filesystem("nope").await.err().unwrap();
+        assert_eq!(unknown.kind, ErrorKind::NotFound);
     }
 }

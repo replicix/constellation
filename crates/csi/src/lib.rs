@@ -6,4 +6,6 @@ pub mod control_client;
 pub mod controller;
 pub mod identity;
 pub mod node;
+pub mod params;
 pub mod proto;
+pub mod volume_id;
