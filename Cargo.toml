@@ -102,6 +102,14 @@ tempfile = "3"
 rand = "0.9"
 memmap2 = "0.9"
 
+# Plan 32 (snapshot policies): the IANA tzdb, for calendar-aligned
+# snapshot buckets in an operator-chosen zone. Default features are off
+# on purpose: the policy language must be *pure*, so whether `tz=Foo` is
+# a valid name may not depend on the host's /usr/share/zoneinfo, and a
+# static musl build carries no system zoneinfo at all. `tzdb-bundle-always`
+# compiles the database in.
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+
 # P2P fast path (M3.3): QUIC endpoint keyed by node pubkey plus a gossip
 # topic for push invalidation and lease handoff.
 iroh = "1"

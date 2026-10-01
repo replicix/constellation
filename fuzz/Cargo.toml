@@ -135,3 +135,10 @@ path = "fuzz_targets/meta_blobs.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "meta_snap_policy"
+path = "fuzz_targets/meta_snap_policy.rs"
+test = false
+doc = false
+bench = false

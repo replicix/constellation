@@ -6,6 +6,7 @@ pub mod error;
 pub mod hlc;
 pub mod locks;
 pub mod mutate;
+pub mod policy_lex;
 pub mod prune;
 pub mod readdeleg;
 pub mod record;
@@ -13,6 +14,7 @@ pub mod reintegrate;
 pub mod replay;
 pub mod rid;
 pub mod session;
+pub mod snapsched;
 pub mod store;
 
 pub use error::MetaError;
@@ -30,6 +32,7 @@ pub use session::{
     DurableWait, JournalPos, KeySet, Position, ReadKey, SessionStats, SessionWait, Streams,
     STREAMS_CAP,
 };
+pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
 pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};

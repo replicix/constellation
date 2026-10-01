@@ -29507,3 +29507,92 @@ Plan 32 §0.1–0.3 and §0.5, Steps 1–7: no policy language, no scheduler, no
 expiry, no GC change, no space accounting beyond the single `refer_bytes`
 field, no UI. `snapshot hold` takes one selector, not the `<sel>...` list
 (and no `a%b` ranges) — that arrives with Step 5's selector work.
+
+## Plan 32 M1a (policy language)
+
+**Step 1 of [plan 32](wip/32-snapshot-policies-and-space.md) only: the
+language.** The types, the hand-written parser and the canonical printer
+for `user.constellation.snapshots`, plus the shared lexer the prune parser
+now also uses. Nothing runs: no retention (`evaluate` is Step 2 / chunk
+`32-m1b`), no simulation, no xattr gate, no CLI, no scheduler. The public
+types here are deliberately the ones Step 2 needs to align a bucket in a
+timezone, and `Interval`/`Keep` are the only calendar vocabulary it should
+need. Step 0.4 (holds) landed earlier and is untouched.
+
+| Item | State | Where |
+|---|---|---|
+| `policy_lex`: the offset-carrying `PolicyError` (with `render`'s caret), plan 22's `parse_duration`, `parse_size`, `parse_int`, `fmt_duration`, `fmt_size`, `leading_ws`, `is_ident`, moved out of the prune parser so both xattr languages share one implementation. `prune::PolicyError` re-exports it, so `constellation_meta::PolicyError` and every prune caller are unchanged | DONE | `crates/meta/src/policy_lex.rs`, `crates/meta/src/prune/policy.rs` |
+| `Interval` — the calendar-dividing set only: `Seconds(n)` (n divides 60, n ≥ 10; test-only), `Minutes(n)` (n divides 60), `Hours(n)` (n divides 24), `Day`, `Week`, `Month`, `Year`. `Ord` is finest-first; `nominal_duration()` (month = 30 d, year = 365 d) is for bounds and ordering, never for alignment. `60s`/`60m`/`24h` **normalize** to `1m`/`1h`/`1d`, which is what makes "no duplicate intervals" airtight | DONE | `crates/meta/src/snapsched/policy.rs` |
+| `Keep` — `Minutes`/`Hours`/`Days`/`Weeks`/`Months`/`Years`/`Forever`. Months and years stay symbolic (Step 2 subtracts them with calendar arithmetic); the written unit is preserved, so the plan's `1h:7d` prints as `1h:7d` and not `1h:1w` | DONE | `crates/meta/src/snapsched/policy.rs` |
+| `Tier { every, keep }`, `WeekStart`, `SnapPolicy { tiers, tz, day_start, week_start, last, skip_empty, budget, paused }` with the settings table's defaults (`UTC`, `00:00`, `mon`, `1`, `yes`, none, false) | DONE | `crates/meta/src/snapsched/policy.rs` |
+| `SnapPolicy::parse` — `policy := clause ((";" \| WS) clause)*`, `clause := tier \| key "=" value \| "paused"`; every refusal at a byte offset: no tier, duplicate interval, `keep < every` (calendar-aware), an interval outside the dividing set (with the "does not divide an hour; use a divisor of 60" message), `1M` and an ambiguous bare-`m` keep, `day-start` off the hourly grid, `last=0`, an unknown `tz`, unknown settings, duplicate settings, `budget=0` | DONE | `crates/meta/src/snapsched/policy.rs` |
+| `tz=` validated against **jiff 0.2's bundled tzdb** (`default-features = false`, `features = ["std", "tzdb-bundle-always"]`, via `TimeZoneDatabase::bundled()`), never the host's zoneinfo, and canonicalized to the tzdb's spelling (`tz=europe/budapest` → `Europe/Budapest`). `Etc/Unknown` refused | DONE | `Cargo.toml`, `crates/meta/Cargo.toml`, `crates/meta/src/snapsched/policy.rs` |
+| `Display` = canonical form: tiers finest first, then `tz`, `day-start`, `week-start`, `last`, `skip-empty`, `budget`, `paused` in the settings-table order, defaults omitted — `5m:1d 1h:7d 1d:30d 1mo:1y; tz=Europe/Budapest` | DONE | `crates/meta/src/snapsched/policy.rs` |
+| Helpers for `32-m1b`/`32-m2a`: `finest()`, `coarsest()`, `has_subminute()`, `steady_state_bound()` (Σ `keep/every`, floored at `last`, `None` with a `*` tier), `Interval::is_calendar_aligned()`, `SNAPSHOT_POLICY_XATTR = "user.constellation.snapshots"` next to `PRUNE_XATTR` (constant only, no gate) | DONE | `crates/meta/src/snapsched/mod.rs`, `crates/meta/src/lib.rs` |
+| Tests: every Step 1 example parses **and prints byte-identically**; the examples table's steady-state bounds (31 / 186 / 510 / unbounded / 7); the Step 11 rejection list each with its asserted byte offset; separator, normalization, ordering, tz-canonicalization, calendar `keep ≥ every` and `day-start` cases; proptest `parse(p.to_string()) == p` over generated policies and `parse(s).map(to_string)` idempotent over generated policy-ish strings; a deterministic 20 000-case byte-soup totality test | DONE | `crates/meta/src/snapsched/policy.rs` (`mod tests`), `crates/meta/src/policy_lex.rs` |
+| Fuzz target `meta_snap_policy`: `parse` never panics, and on `Ok` the canonical form re-parses to the same policy and prints the same bytes | DONE (compiles; `cargo fuzz` is not installed on this host) | `fuzz/fuzz_targets/meta_snap_policy.rs`, `fuzz/Cargo.toml` |
+
+### Decisions taken here (the plan left them open)
+
+- **`keep ≥ every` is compared by group, not by seconds.** Both sides
+  fixed-length (`s m h d w`) → exact nominal seconds, so `1d:1d` and
+  `1d:24h` pass. Both calendar (`mo y`) → month counts, so `1mo:1y` passes
+  and `1y:1mo` does not. A calendar *keep* against a fixed `every` → a
+  month is at least 28 days, longer than the coarsest fixed interval
+  (`1w`), so `1d:1mo` passes. A fixed *keep* against a calendar `every` →
+  the keep must cover the **longest** such bucket, so `1mo:30d` is refused
+  (March has 31 days) and `1mo:31d`, `1mo:5w` pass; likewise `1y:365d` is
+  refused and `1y:366d` passes. A single nominal comparison could not do
+  this: 30-day months would accept `1mo:30d`, and min/max bounds would
+  reject `1d:1d` (a DST-long day is 25 h).
+- **`day-start` must always be a whole hour**, and when the policy has an
+  `Hours(n)` tier the hour must be a multiple of `n`. With no hourly tier
+  nothing finer than a day is aligned in the timezone, so any whole hour is
+  accepted (the plan's "any `HH:MM` on a whole hour"). Sub-hour tiers do
+  not constrain it — their buckets align to the hour, not to the day. So
+  `1h:1d; day-start=02:30` is refused on the whole-hour rule and
+  `6h:7d 1d:30d; day-start=02:00` on the multiple-of-`6h` rule.
+- **Minute-versus-month has one escape hatch, `min`.** `1M` is always
+  refused with both readings named. A bare-`m` *keep* is refused when the
+  policy also has a `1mo`-or-coarser tier (`5m:6m 1mo:1y`), because that is
+  exactly where "six months" is the likely intent — but then there has to
+  be a way to say "six minutes", so `6min` is accepted everywhere and a
+  minute keep **always prints as `6min`**. Canonical text therefore never
+  contains the ambiguous spelling, and always re-parses. (`min` is accepted
+  for intervals too, where it is unambiguous, and prints back as `m`.)
+- **Keep windows have no `s` unit** (`1h:30s` is refused with a message
+  naming the units). Sub-minute *intervals* exist for the harness; a
+  sub-minute retention window would keep nothing. The harness's
+  `10s:1m 1m:4m` parses and canonicalizes to `10s:1min 1m:4min`.
+- **A keep preserves the unit it was written in.** `fmt_duration`'s
+  largest-exact-unit rule would print `7d` as `1w`, contradicting the
+  plan's own canonical example `5m:1d 1h:7d 1d:30d 1mo:1y`. Tier intervals
+  *are* normalized (`60m` → `1h`), because there the coarser spelling is
+  the same bucket.
+- **`tz` is canonicalized, not stored verbatim.** jiff's lookup is
+  case-insensitive, so `tz=europe/budapest` would otherwise be a second,
+  distinct policy value with identical behaviour. Storing
+  `TimeZone::iana_name()` makes the canonical form stable and keeps
+  `tz=utc` collapsing into the omitted default. `Etc/Unknown` resolves in
+  the tzdb but has no IANA name, and is refused as a schedule timezone.
+- **`steady_state_bound()` is floored at `last`,** not just the Σ of the
+  plan's formula: `1d:7d; last=100` really retains 100. Every figure in the
+  plan's examples table is unchanged by the floor.
+- **Clause separators collapse.** Runs of `;` and whitespace are one
+  separator, so the canonical form's `"; "` is legal input and a trailing
+  `;` is not an empty clause (unlike the prune parser, which splits on `;`
+  only and can therefore call an empty piece an error). An expression with
+  no clauses at all is `empty policy` at offset 0.
+- **`paused` prints last**, after the settings, since the table does not
+  place it. `paused` alone is still "policy has no tier".
+- **jiff is a workspace dependency** with default features off, so no
+  crate can accidentally pull in `tz-system`/`tzdb-zoneinfo` and make a
+  `tz=` name's validity depend on the host.
+
+### Not done here (deliberately, per the brief)
+
+Step 2 (`retention::evaluate`, `simulate`, the naive differential test and
+the DST/calendar cases), Step 3.1's xattr gate and root discovery, the
+scheduler, expiry, the CLI, space accounting, the UI, and Step 8's budget
+*behaviour* (`budget=` is parsed and stored; nothing reads it). No clock,
+environment or locale access exists anywhere in `parse` or `Display`.

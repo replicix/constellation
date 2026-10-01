@@ -24,36 +24,14 @@
 use std::fmt;
 use std::time::Duration;
 
-/// A parse/validation failure carrying the byte offset into the source
-/// expression, so the CLI can render a caret under the offending token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyError {
-    pub offset: usize,
-    pub msg: String,
-}
+use crate::policy_lex::{
+    fmt_duration, fmt_size, is_ident, leading_ws, parse_duration, parse_int, parse_size,
+};
 
-impl PolicyError {
-    fn at(offset: usize, msg: impl Into<String>) -> Self {
-        Self {
-            offset,
-            msg: msg.into(),
-        }
-    }
-
-    /// Two-line rendering: the expression, then a caret under `offset`.
-    pub fn render(&self, src: &str) -> String {
-        let caret = self.offset.min(src.len());
-        format!("{src}\n{}^ {}", " ".repeat(caret), self.msg)
-    }
-}
-
-impl fmt::Display for PolicyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "at byte {}: {}", self.offset, self.msg)
-    }
-}
-
-impl std::error::Error for PolicyError {}
+/// Re-exported so `prune::PolicyError` keeps naming the one offset-carrying
+/// policy error ([`crate::policy_lex::PolicyError`]), now shared with plan
+/// 32's snapshot-schedule parser.
+pub use crate::policy_lex::PolicyError;
 
 /// A watermark for `lru`: an absolute size (bytes) or a percentage.
 /// "Of what" is settled elsewhere: a size is bytes of the marked
@@ -619,71 +597,6 @@ fn parse_watermark(s: &str, off: usize) -> Result<Watermark, PolicyError> {
     }
 }
 
-fn parse_duration(s: &str, off: usize) -> Result<Duration, PolicyError> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(PolicyError::at(off, "expected a duration"));
-    }
-    let bytes = s.as_bytes();
-    let last = bytes[bytes.len() - 1];
-    let mult: u64 = match last {
-        b's' => 1,
-        b'm' => 60,
-        b'h' => 3600,
-        b'd' => 86_400,
-        b'w' => 604_800,
-        b'y' => 31_536_000,
-        b'0'..=b'9' => {
-            return Err(PolicyError::at(
-                off,
-                format!("duration `{s}` has no unit (use s/m/h/d/w/y)"),
-            ))
-        }
-        _ => {
-            return Err(PolicyError::at(
-                off,
-                format!("unknown duration unit in `{s}`"),
-            ))
-        }
-    };
-    let num: u64 = s[..s.len() - 1]
-        .parse()
-        .map_err(|_| PolicyError::at(off, format!("invalid duration `{s}`")))?;
-    Ok(Duration::from_secs(num.saturating_mul(mult)))
-}
-
-fn parse_size(s: &str, off: usize) -> Result<u64, PolicyError> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(PolicyError::at(off, "expected a size"));
-    }
-    let bytes = s.as_bytes();
-    let last = bytes[bytes.len() - 1];
-    let (mult, digits): (u64, &str) = match last {
-        b'K' => (1024, &s[..s.len() - 1]),
-        b'M' => (1024 * 1024, &s[..s.len() - 1]),
-        b'G' => (1024 * 1024 * 1024, &s[..s.len() - 1]),
-        b'T' => (1024 * 1024 * 1024 * 1024, &s[..s.len() - 1]),
-        b'0'..=b'9' => (1, s),
-        _ => {
-            return Err(PolicyError::at(
-                off,
-                format!("unknown size unit in `{s}` (use K/M/G/T)"),
-            ))
-        }
-    };
-    let num: u64 = digits
-        .parse()
-        .map_err(|_| PolicyError::at(off, format!("invalid size `{s}`")))?;
-    Ok(num.saturating_mul(mult))
-}
-
-fn parse_int(s: &str, off: usize) -> Result<u64, PolicyError> {
-    s.trim()
-        .parse()
-        .map_err(|_| PolicyError::at(off, format!("expected an integer, got `{s}`")))
-}
-
 fn parse_rate(s: &str, off: usize) -> Result<u32, PolicyError> {
     // `rate=<n>/s`; the `/s` suffix is optional but canonical.
     let s = s.trim();
@@ -796,54 +709,6 @@ fn unquoted_find(s: &str, c: char) -> Option<usize> {
         }
     }
     None
-}
-
-fn leading_ws(s: &str) -> usize {
-    s.len() - s.trim_start().len()
-}
-
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-// --- canonical value formatting ---
-
-/// Largest exact duration unit.
-fn fmt_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    for (unit, sym) in [
-        (31_536_000u64, 'y'),
-        (604_800, 'w'),
-        (86_400, 'd'),
-        (3_600, 'h'),
-        (60, 'm'),
-        (1, 's'),
-    ] {
-        if secs >= unit && secs.is_multiple_of(unit) {
-            return format!("{}{}", secs / unit, sym);
-        }
-    }
-    format!("{secs}s")
-}
-
-/// Largest exact binary size unit.
-fn fmt_size(b: u64) -> String {
-    for (unit, sym) in [
-        (1024u64 * 1024 * 1024 * 1024, 'T'),
-        (1024 * 1024 * 1024, 'G'),
-        (1024 * 1024, 'M'),
-        (1024, 'K'),
-    ] {
-        if b >= unit && b.is_multiple_of(unit) {
-            return format!("{}{}", b / unit, sym);
-        }
-    }
-    b.to_string()
 }
 
 #[cfg(test)]

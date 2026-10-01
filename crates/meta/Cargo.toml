@@ -10,6 +10,9 @@ constellation-fs-core.workspace = true
 constellation-mtree.workspace = true
 constellation-types.workspace = true
 fjall = { version = "3.1", package = "fjall" }
+# Snapshot-schedule policies (plan 32 Step 1): `tz=` names are validated
+# against jiff's bundled tzdb so the parse is pure and musl-static safe.
+jiff.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,3 +26,6 @@ tempfile.workspace = true
 # `fjall_drop_deadlock` installs a `log` logger to widen fjall's shutdown
 # race window (the version fjall itself already pulls in).
 log = "0.4"
+# Property tests for the two xattr policy languages: the canonical form
+# round-trips, and printing is idempotent (snapsched::policy).
+proptest = "1"
