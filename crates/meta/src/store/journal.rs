@@ -467,6 +467,30 @@ pub(crate) fn max_seq(
     }
 }
 
+/// Whether any row at or below journal seq `upto` is still in the
+/// journal — unshipped, or held back (plan 30 §M4). A barrier waits for
+/// this to turn false: the rows journaled before it, not the whole
+/// journal, which a busy writer never empties. One seek above the acked
+/// watermark (see [`acked_watermark`]).
+pub(crate) fn any_through(
+    r: &impl Readable,
+    journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
+    upto: u64,
+) -> Result<bool, MetaError> {
+    let from = acked_watermark(r, local)?.saturating_add(1);
+    if from > upto {
+        return Ok(false);
+    }
+    match r.range(journal, seq_key(from)..=seq_key(upto)).next() {
+        Some(guard) => {
+            guard.key()?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Rows still in the journal: proportional to the backlog (see
 /// [`acked_watermark`]).
 pub(crate) fn len(

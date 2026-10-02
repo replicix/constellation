@@ -675,15 +675,23 @@ impl SnapshotBatcher {
                 _ => None,
             });
         }
-        // 1. What `Barrier` drains, once per distinct create path.
+        // 1. What `Barrier` drains, once per distinct create path: every
+        // row journaled before it was admitted, whatever is journaled
+        // since (a busy holder's journal never empties).
         for &ino in &drains {
             self.drain(ino).await?;
         }
-        // 2. One publish for every create in the batch.
+        // 2. One publish for every create in the batch: a commit at or
+        // past the log position the drains reached, so it holds every
+        // write acknowledged before this batch ran.
         let commit = if drains.is_empty() {
             None
         } else {
-            Some(self.snapshots.publish_commit().await?)
+            let applied = self
+                .meta
+                .applied_seq()
+                .context("reading the applied log position")?;
+            Some(self.snapshots.publish_commit_through(applied).await?)
         };
         self.wait_admissible().await?;
         // 3. The items, in order.
@@ -790,11 +798,11 @@ impl SnapshotBatcher {
         }
     }
 
-    /// `Barrier` for `ino`. A round answers "not shipped" when the
-    /// journal is not empty at its end — on a holder whose own clients
-    /// keep writing, rows that arrived during the round. What a snapshot
-    /// needs shipped is what was journaled before it asked, so a busy
-    /// holder retries (bounded) while it still holds.
+    /// `Barrier` for `ino`: it answers once every journal row admitted
+    /// before it has shipped (`jobs::BarrierWait`), however much was
+    /// journaled since. A failure (rows held back, a round cut short
+    /// three times over, a lease not yet usable) is retried, bounded,
+    /// while this node still holds.
     async fn drain(&self, ino: Ino) -> Result<()> {
         let mut attempt = 0;
         loop {
@@ -1333,7 +1341,7 @@ pub(crate) mod tests {
             Some(publisher),
         )));
         let hook_driver = driver.clone();
-        let hook: crate::snapshot::PublishHook = Arc::new(move || {
+        let hook: crate::snapshot::PublishHook = Arc::new(move |through| {
             let driver = hook_driver.clone();
             Box::pin(async move {
                 // As the daemon's hook (its budget is 10 s too): a write
@@ -1341,7 +1349,11 @@ pub(crate) mod tests {
                 // not failed.
                 let mut tries = 0;
                 loop {
-                    match driver.lock().await.publish_commit().await {
+                    let published = match through {
+                        None => driver.lock().await.publish_commit().await,
+                        Some(applied) => driver.lock().await.publish_through(applied).await,
+                    };
+                    match published {
                         Err(error)
                             if (format!("{error:#}")
                                 .contains(crate::mtree_publish::SPECULATION_OUTSTANDING)
@@ -1580,13 +1592,9 @@ pub(crate) mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     k += 1;
                     // Each step is journaled and shipped under B's
-                    // driver, so it never lands between the round and
-                    // the publish of a snapshot B is taking. A write that
-                    // does land there makes `publish_now` refuse (unshipped
-                    // work), and a holder writing faster than one
-                    // round + publish starves its snapshots: pre-existing,
-                    // recorded in PROGRESS ("Plan 32 M0a") for the
-                    // scheduler.
+                    // driver. (A holder whose journal never empties is
+                    // `the_holder_snapshots_while_its_own_journal_never_
+                    // empties`: fix snap-drain-busy.)
                     {
                         let mut driver = driver.lock().await;
                         write_step(&meta, data, counter, k);
@@ -1647,6 +1655,75 @@ pub(crate) mod tests {
         a.tail().await;
         assert_eq!(a.rows(), b.rows());
         assert_eq!(a.rows().len(), 10);
+    }
+
+    /// Fix (snap-drain-busy): the holder snapshots while its own writer
+    /// journals every millisecond and never ships between steps, so its
+    /// journal is never empty. The drain ships what was journaled before
+    /// the batch, the publish is a commit covering that position, and the
+    /// snapshot is a prefix of the writes holding at least every step
+    /// acknowledged before it ran. Before the fix the drain waited for an
+    /// empty journal and `publish_now` refused any unshipped row
+    /// (`SPECULATION_OUTSTANDING`), so this starved until the retry
+    /// budgets ran out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_holder_snapshots_while_its_own_journal_never_empties() {
+        let (_store, _a, b, data, counter) = holder_b().await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (meta, stop, written) = (b.meta.clone(), stop.clone(), written.clone());
+            tokio::spawn(async move {
+                let mut k = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    k += 1;
+                    write_step(&meta, data, counter, k);
+                    written.store(k, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+        let mut prefixes = Vec::new();
+        for i in 0..5u64 {
+            while written.load(Ordering::Relaxed) < (i + 1) * 5 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let acknowledged = written.load(Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let report = b
+                .batcher
+                .run(
+                    b.batcher.next_rid(),
+                    vec![create("/data", &format!("s{i}"), 2)],
+                )
+                .await
+                .unwrap();
+            let took = started.elapsed();
+            assert_eq!(report.route, Route::Local);
+            let row = created(&report.results[0]);
+            let m = frozen_prefix(&b.snapshots, &row).await;
+            let after = written.load(Ordering::Relaxed);
+            assert!(
+                m >= acknowledged,
+                "snapshot {i} misses acknowledged writes: {m} < {acknowledged}"
+            );
+            assert!(m <= after, "snapshot {i} holds writes never made");
+            assert!(
+                took < Duration::from_secs(5),
+                "snapshot {i} took {took:?} on a busy holder"
+            );
+            prefixes.push(m);
+        }
+        assert!(
+            constellation_meta::MetaStore::journal_len(&*b.meta).unwrap() > 0,
+            "the writer's journal never emptied"
+        );
+        stop.store(true, Ordering::Relaxed);
+        writer.await.unwrap();
+        assert!(
+            prefixes.windows(2).all(|w| w[0] <= w[1]),
+            "prefixes went backwards: {prefixes:?}"
+        );
     }
 
     /// Deletes and holds from a non-holder execute at the holder too: the

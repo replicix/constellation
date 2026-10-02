@@ -689,7 +689,7 @@ impl Engine {
             snapshots_base
         } else {
             let tx = sync_tx.clone();
-            snapshots_base.with_publisher(Arc::new(move || {
+            snapshots_base.with_publisher(Arc::new(move |through| {
                 let tx = tx.clone();
                 Box::pin(async move {
                     // Plan 30 §M3a: a replica with forwarded ops the log
@@ -699,7 +699,7 @@ impl Engine {
                     let mut waited = 0u32;
                     loop {
                         let (reply, receive) = tokio::sync::oneshot::channel();
-                        tx.send(crate::sync::SyncRequest::Publish { reply })
+                        tx.send(crate::sync::SyncRequest::Publish { through, reply })
                             .map_err(|_| anyhow::anyhow!("sync task is not running"))?;
                         match receive
                             .await

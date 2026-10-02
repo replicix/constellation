@@ -97,6 +97,9 @@ pub trait Replica {
     /// The journal seq the next row lands at, and the highest shipped.
     fn journal_next_seq(&self) -> Result<u64, MetaError>;
     fn journal_acked_seq(&self) -> Result<u64, MetaError>;
+    /// Whether a row at or below journal seq `upto` is still in the
+    /// journal (unshipped or held back): `Control::Barrier`'s test.
+    fn journal_unshipped_through(&self, upto: u64) -> Result<bool, MetaError>;
 
     // ---- speculation (requester side) ----
 
@@ -563,6 +566,10 @@ impl Replica for Meta {
 
     fn journal_acked_seq(&self) -> Result<u64, MetaError> {
         Meta::journal_acked_seq(self)
+    }
+
+    fn journal_unshipped_through(&self, upto: u64) -> Result<bool, MetaError> {
+        Meta::journal_unshipped_through(self, upto)
     }
 
     fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError> {

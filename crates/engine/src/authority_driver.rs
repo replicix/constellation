@@ -1041,8 +1041,26 @@ impl Driver {
                 self.report_epoch(false);
                 None
             }
-            SyncRequest::Publish { reply } => {
-                control(Control::PublishNow, ControlReply::Publish(reply))
+            SyncRequest::Publish {
+                through: None,
+                reply,
+            } => control(Control::PublishNow, ControlReply::Publish(reply)),
+            SyncRequest::Publish {
+                through: Some(applied),
+                reply,
+            } => {
+                // A snapshot whose barrier already shipped what it needs:
+                // no round, no wait for an empty journal.
+                let Some(publisher) = self.deps.publisher.clone() else {
+                    let _ = reply.send(Err("this mount has no metadata tree publisher".into()));
+                    return None;
+                };
+                let epoch = self.core.ship().last_ship_epoch;
+                tokio::spawn(async move {
+                    let r = publisher.lock().await.publish_through(epoch, applied).await;
+                    let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                });
+                None
             }
             SyncRequest::Barrier { ino, reply } => {
                 // Upload the inode's chunks first; the round ships the
@@ -4226,6 +4244,21 @@ impl Standalone {
             .as_mut()
             .context("this standalone driver has no tree publisher")?
             .publish_now(epoch)
+            .await
+    }
+
+    /// A commit covering applied log position `applied`, with no ship
+    /// first (`SyncRequest::Publish { through: Some(applied) }` in the
+    /// daemon: a snapshot whose barrier already drained).
+    pub async fn publish_through(
+        &mut self,
+        applied: u64,
+    ) -> Result<(u64, constellation_mtree::NodeHash)> {
+        let epoch = self.core.ship().last_ship_epoch;
+        self.publisher
+            .as_mut()
+            .context("this standalone driver has no tree publisher")?
+            .publish_through(epoch, applied)
             .await
     }
 

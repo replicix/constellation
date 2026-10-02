@@ -61,6 +61,8 @@ mod rejoin;
 mod slowseal;
 /// Plan 32 §11: the reclaim estimate against what GC deletes.
 mod snapacct;
+/// Fix snap-drain-busy: snapshots of a busy holder under S3 latency.
+mod snapbusy;
 /// Plan 32 M3: automatic snapshot creation (`snapsched-*`).
 mod snapsched;
 /// Plan 38 §6/§3(e): the transport a mount negotiates, and whether a
@@ -408,6 +410,17 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: snapshot_lifecycle,
+    },
+    Scenario {
+        name: "snapshot-busy-latency",
+        desc: "fix snap-drain-busy: +25 ms per S3 request each way and a writer rewriting a \
+               file on the lease holder every 5 ms; snapshots on the holder and forwarded \
+               from a second node, and a clone on the holder, each finish within a few round \
+               trips of an idle snapshot, hold every write acknowledged before them and none \
+               after, and the lease never moves",
+        requires: &[],
+        caps: &[],
+        run: snapbusy::snapshot_busy_latency,
     },
     Scenario {
         name: "clone-workflow",
@@ -2725,7 +2738,13 @@ fn snapshot_lifecycle(_seed: u64) -> Result<()> {
             let mut k = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 k += 1;
-                std::fs::write(mnt.join("project/counter"), k.to_string())?;
+                // Write-then-rename, so every point in time holds a
+                // number. An in-place rewrite's truncate is a state of its
+                // own (an empty counter) that a snapshot may freeze; only
+                // the old empty-journal barrier (fix snap-drain-busy) kept
+                // snapshots between whole steps.
+                std::fs::write(mnt.join("project/.next"), k.to_string())?;
+                std::fs::rename(mnt.join("project/.next"), mnt.join("project/counter"))?;
                 std::thread::sleep(Duration::from_millis(5));
             }
             Ok(k)

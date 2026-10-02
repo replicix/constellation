@@ -34906,3 +34906,197 @@ came back within 45 s. `csi-pod-rw` passed on that reused cluster and left
 | `git-under-flock-rounds` ×10 (seeds 42, 2–10) | 10/10 PASSED, 30/30 rounds with **0 overlapping**, longest turn ≤ 11.3 s, no lapse |
 | `lock-failover` with (a) on the unreachable branch only / (a) complete / (a) and (b) | 2 of 3 / 2 of 3 passed (`ENOLCK`) / **10 of 10** + 1 in the gate batch (29–51 s each) |
 | `flock-cross-node`, `lock-holder-partitioned` (B fenced 2.0 s after the cut, C granted 4.0 s after; `owners_fenced` 1, `owner_fenced_ops` 41), `lock-fence-at-close`, `lock-holder-killed-contention`, `lock-latency`, `stale-daemon-lock`, `sqlite-two-nodes`, `lease-handover`, `git-under-flock`, `git-under-flock-gc`, `git-under-flock-faults` (default TTL), `lock-grant-dead-generation` | all PASSED ×1 |
+
+## Fix: a snapshot on a busy holder waits for an empty journal (`snap-drain-busy`)
+
+The main-gate run found this on real S3 (memory: snapshot barrier vs busy
+writer). The root-lease holder's own writer rewrote a file every 5 ms.
+`snapshot create` on that holder then took 9–45 s, or failed with
+`snapshot barrier … journal not shipped: no lease` (on the node holding the
+lease). Forwarded from another node, it failed with the 30 s forward
+timeout. `harness snapshot-lifecycle` was 0/8 on AWS and OVH and passed on
+floci. Plan 32 M0a (`64121e7`) moved snapshot batches to the holder, whose
+own clients keep its journal busy. The barrier semantics come from plan 30
+M5 (`617499b`).
+
+### Mechanism
+
+Two places each needed an **empty** journal, where the snapshot only needs
+**its own position** shipped:
+
+- **The drain.** `Control::Barrier` was a round waiter. It was answered
+  when a sync round ended, and only if the whole backlog was 0
+  (`finish_round`, "journal not shipped: no lease" otherwise). A round
+  ships until the journal is empty. Under a writer faster than one segment
+  PUT (any real S3 latency), that never happens, so the round never ended.
+  `snapshot_batch::drain` retried it up to `DRAIN_ATTEMPTS` (40) times.
+- **The publish.** `TreePublisher::publish_now` refused whenever any
+  journal row was unshipped (`SPECULATION_OUTSTANDING`). It did so even
+  though a holder's commit is the log prefix at its `applied` position,
+  with unshipped work at its before-images (plan 30 §M3b). So even after a
+  drain, a write landing before the publish restarted the 100 × 100 ms
+  retry loop.
+
+### Fix
+
+- **Barrier = "my position shipped".** The core takes the barrier's
+  position when it is admitted: `upto = journal_tip`, which covers every
+  write acknowledged before the caller asked (`jobs::BarrierWait`). The
+  barrier is answered as soon as no journal row at or below `upto` is
+  left (`Meta::journal_unshipped_through`, one seek above the acked
+  watermark). That check runs after every segment lands, mid-round, and
+  again at round end.
+- **Deposition (review round).** A deposition empties the journal without
+  shipping it: the recovery round strands the unshipped rows and queues
+  them for replay by rid. The first version's `!lease.lost` guard did not
+  cover that, because the strand clears `lost` before the round answers
+  its barriers. The old `backlog == 0` rule had the same hole: an `fsync`
+  in `--fsync-mode s3` retried across a deposition could return before
+  its write reached the new holder. Three guards now close it:
+  - `on_control` refuses a `Barrier` at once while `lease.lost`
+    (`journal not shipped: this node was deposed and is recovering …`,
+    transient; the caller retries).
+  - `deposed()`, and `Reintegrate`'s `force_lost`, fail every waiting
+    barrier (`fail_barriers`) before anything is stranded.
+  - `barrier_shipped` also requires this node's own replays to have
+    settled (`own_replays_unsettled`, which `hold_for_lost_deps`
+    already uses). A barrier asked after the recovery round would
+    otherwise see an empty journal while the stranded rows are only
+    queued. The first two guards alone leave that gap: the core test
+    below fails with `Some(Ok(Done))` when only this check is removed.
+  A settled replay is the new holder's op, durable under its
+  acknowledgement policy like any forwarded write.
+- **Round end, unsatisfied.** A failed round fails the barrier with its
+  error. Otherwise:
+  - A node that cannot ship gets a message naming why: `journal not
+    shipped through position N: this node does not hold the write lease`
+    (or deposed, or its lease is not usable yet).
+  - A shipping holder carries the barrier to the next round, up to
+    `BARRIER_ROUNDS` (3) whole rounds. Each of those rounds opens with a
+    complete upload pass. A barrier admitted mid-round may have missed
+    one, and a queued job can cut a round short.
+  - After that it fails with `… after 3 sync rounds (held back behind a
+    chunk that cannot be uploaded)`.
+  `round_waiters` now holds only `PublishNow` and `Reintegrate`.
+- **Publish covering a position.** `TreePublisher::publish_through(epoch,
+  applied)` returns a commit whose `applied` covers `applied`. With
+  nothing dirty, it returns the last commit, which reflects the replica
+  whole. It does not wait for an empty journal. `SyncRequest::Publish`
+  gains `through: Option<u64>`. With `Some`, the driver publishes
+  directly, with no round. `PublishHook` takes the same `Option`, and
+  `SnapshotManager::publish_commit_through` passes it.
+  `SnapshotBatcher::execute_now` drains, reads `Meta::applied_seq`, and
+  publishes through it.
+- **Consistency, unchanged in what it promises.** Every write acknowledged
+  before the batch is journaled at or below `upto`. It has shipped once
+  the barrier answers, so it is at or below the replica's applied
+  position, and in any commit covering it. Nothing still unshipped is in
+  the commit (log-prefix substitution). Nothing acknowledged after
+  `snapshot create` returns can be in it, because the commit is fixed
+  before the row is written. Rows that ship between the barrier and the
+  commit are writes concurrent with the snapshot. They are in or out
+  whole, because the cut is a log position and never splits a
+  transaction. Requester speculation still defers the publish. With
+  holder capture off (the performance-gate fallback), `publish_basis_at`
+  still defers until the journal is empty. That is unchanged, and the
+  fallback is not a default.
+- **Other `Barrier` users.**
+  - `fsync`/`fsyncdir` under `--fsync-mode s3` (`write_gate::sync_barrier_at`)
+    and `clone.create`'s `acquire_namespace_barrier` get the same rule
+    with no change of their own. On a busy holder they now wait for their
+    own rows, not for an idle moment.
+  - The scheduler (`snapsched`) goes through snapshot batches.
+  - `set_quota` was already off the barrier; its comment is updated.
+  - GC, expiry and prune never used `Barrier`.
+  - `Standalone::sync` (tools and tests) is a barrier at the tip, as
+    before.
+- **A test's bug.** `snapshot-lifecycle`'s writer rewrote `counter` in
+  place. A snapshot cut between the `O_TRUNC` open and the close freezes
+  an empty file, which is a real point in time. Only the empty-journal
+  barrier kept snapshots between whole steps. On AWS the scenario then
+  failed `busy1 … cannot parse integer from empty string`. The writer now
+  writes `.next` and renames it over `counter`, so every frozen value is
+  still checked to be a number in the prefix.
+
+| Item | State | Where |
+|---|---|---|
+| `BarrierWait` (position at admission, answered on the landing segment, `BARRIER_ROUNDS` bound, accurate refusals) | done | `crates/authority/src/core/jobs.rs`, `core/mod.rs` |
+| `journal::any_through` / `Meta::journal_unshipped_through` / `Replica::journal_unshipped_through` | done | `crates/meta/src/store/journal.rs`, `store/inbox.rs`, `crates/authority/src/replica.rs` |
+| `TreePublisher::publish_through`; `SyncRequest::Publish { through }`; `PublishHook(Option<u64>)`; `publish_commit_through`; `Standalone::publish_through` | done | `crates/engine/src/mtree_publish.rs`, `sync.rs`, `authority_driver.rs`, `snapshot.rs`, `node.rs` |
+| Snapshot batch: drain → applied position → publish through it | done | `crates/engine/src/snapshot_batch.rs` |
+| Core tests: busy holder (a row journaled during every PUT) answers within ≤ 2 PUTs, journal still non-empty; held-back row fails after bounded rounds with the "held back" text; a non-holder says it does not hold | done | `crates/authority/src/core/tests.rs` |
+| Deposition guards (refuse while lost, fail waiting barriers at deposition, wait for own replays) and core test `a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand` (fails without the fix: the waiting barrier is not failed; with only the replay check removed: `Done` before the replay) | done | `crates/authority/src/core/jobs.rs`, `core/mod.rs`, `core/client.rs`, `core/tests.rs` |
+| Engine test: the holder snapshots 5× while its own journal never empties (journaled every 1 ms, never shipped between steps); each holds every acknowledged step, < 5 s | done | `snapshot_batch.rs` `the_holder_snapshots_while_its_own_journal_never_empties` |
+| Harness `snapshot-busy-latency` (+25 ms each way, 5 ms writer on the holder; holder, forwarded and clone, bound 3× idle + 40 RTT, prefix/acknowledged checks, lease never moves) | done | `crates/harness/src/scenarios/snapbusy.rs`, TESTING.md |
+| `snapshot-lifecycle` writer: write-then-rename (test bug above) | done | `crates/harness/src/scenarios.rs` |
+| Classifier rows for the new refusal texts (transient) | done | `crates/store-s3/src/classify.rs` |
+
+### Before / after
+
+| Run | Before (pre-fix binary, `0d0291d`) | After |
+|---|---|---|
+| core test `a_barrier_on_a_busy_holder_answers_once_its_own_position_ships` | never answered (1938 segment PUTs) | answered after ≤ 2 PUTs |
+| engine test `the_holder_snapshots_while_its_own_journal_never_empties` (publish path reverted alone) | did not finish within 10 min | 0.5 s for the whole test |
+| `harness snapshot-busy-latency` (floci + 25 ms) | FAILED: holder0 took **60.2 s** (froze counter 1000; 8 acknowledged before it) | PASSED: idle 0.52 s, holder 0.66–0.84 s, forwarded 0.81–1.10 s, clone 0.15 s (bound 3.57 s) |
+| repro script (2 nodes, floci behind a 25 ms/direction relay, in-place 5 ms writer on the holder) | local1 **52.7 s rc=1** `journal not shipped: no lease`; local2/3 2.4 s, 8.2 s; fwd 4.7 / 1.3 / 6.0 s | two runs: local 0.7 / 1.0 / 0.7 s, fwd 0.8–1.1 s, all rc=0 |
+| `snapshot-busy-latency` on AWS us-west-2 | FAILED: holder0 **91.9 s** | PASSED: idle 0.25 s, busy 0.33–0.53 s, clone 0.09 s |
+| `snapshot-busy-latency` on OVH Milan | — | PASSED: idle 2.27 s, holder 2.2–2.6 s, forwarded 2.9–4.4 s, clone 0.83 s (bound 8.8 s) |
+| `snapshot-lifecycle` on AWS / OVH | 0/8 (main gate) | PASSED / PASSED |
+
+The repro's "after the writer stopped" snapshot took 9.4 s once (1.0 s in
+the other run, 1.1 s before the fix). In that window the publish itself
+took 7.5 s. A pure-CPU core step on the *other* node took 2.6 s, and the
+host's load average was 18–25 from other agents' builds. That is a host
+stall, not this path.
+
+The table above shows the first real-S3 run of each scenario. Repeated
+runs, every one on its own `sdb-<label>-<ts>` sub-prefix, purged to 0
+objects afterwards:
+
+- **AWS us-west-2.** `snapshot-busy-latency` passed 3/3 (busy snapshots
+  0.23–0.53 s against an idle 0.24–0.26 s). `snapshot-lifecycle` passed
+  5/5, in 10–22 s, and once in 117.9 s. That slow run's logs were not
+  kept. In a kept 22 s run the mounts lived 9 s, and the rest was the
+  harness's docker setup.
+- **OVH Milan.** `snapshot-busy-latency` passed 3/3 (busy 2.2–4.4 s
+  against an idle 2.1–2.3 s, bound 8.3–8.8 s). `snapshot-lifecycle`
+  passed 3/3 (52–54 s).
+
+The scenarios were driven by a patched `/var/tmp` copy of
+`crates/harness`: `Client::new` rewrites the bucket to `$SDB_REAL_S3_URL`,
+and `Client::cmd` skips floci's `AWS_*` when that is set. The
+`constellation` binary is unpatched. On real S3 the latency toxic is a
+no-op, and the bound calibrates on the idle snapshot.
+
+### Gates (2026-10-02, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --exclude constellation-model` | exit 0: 2147 passed, 0 failed, 34 ignored (73 test binaries) |
+| `cargo test -p constellation-model --release` | exit 0, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `tests/integration.sh` equivalent: `tests/smoke.sh` against the shared floci on 4566 (another agent's; reused, not restarted), prefix `test/sdb-integ-<ts>`, purged | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `harness run` on every scenario named `*snap*`/`*quota*`/`*gc*`/`*clone*` (12), the 6 whose description mentions them, and 7 fsync scenarios (the other `Barrier` user), prefix `sdbgate` | 23 PASSED, 2 SKIPPED (need root). The 12: quota-enforcement, gc-lifecycle, snapacct, gc-dedup-race, gc-open-orphan-hold, snapshot-lifecycle, snapshot-busy-latency, clone-workflow, snapshot-mount, snapshot-churn, git-under-flock-gc, mtree-gc-plateau. The 6: log-retention-gap-{follower,open-orphan,taker}, staging-crash, and the 2 skipped. The 7: fsync-hard-outage, fsync-soft-timeout, fsync-interrupt, fsyncdir-barrier, writeback-fsync, visibility-after-burst, lifecycle-suspend-mid-write |
+| the 2 skipped, as root (`sudo env -u XDG_RUNTIME_DIR …`): passthrough-default-by-mount-mode, passthrough-on-every-transport | PASSED, PASSED |
+| Real S3, both targets | see above |
+
+Review round (deposition guards and nits, rebased on `b458669`):
+fmt and clippy `-D warnings` clean; `cargo test -p constellation-authority
+-p constellation-engine -p constellation-harness -p constellation-store-s3`
+0 failed; `tests/smoke.sh` passed; release build exit 0; `harness run`
+(prefix `sdbfix`) snapshot-busy-latency (busy 0.65–1.11 s, bound 3.57 s),
+snapshot-lifecycle, clone-workflow, fsync-hard-outage, fsync-interrupt,
+writeback-fsync, fio-blips, lease-handover, backup-failover,
+root-failover-with-delegates: 10 PASSED.
+
+### Not done here
+
+- The full harness matrix and the pjdfstest compliance lane were not
+  run. The brief's gate list names the scenario subset above, and this
+  chunk touches no POSIX op path.
+- The `Barrier`'s `ino` still scopes only the driver's chunk upload.
+  The journal part is "everything journaled before me", not "this
+  subtree's rows". Scoping it would need per-row subtree membership, and
+  nothing has asked for that since rows ship in order anyway.

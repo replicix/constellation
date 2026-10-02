@@ -9532,3 +9532,327 @@ fn a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate() {
         "the barrier asked the delegate for something: {to_delegate:?}"
     );
 }
+
+/// Drive `h` (S3 answered at once, timers fired in order, uploads done)
+/// until `op` is answered or `steps` events have run; `during_put` runs
+/// before each segment PUT is answered — the writer of the busy-holder
+/// tests. Returns the answer and how many segment PUTs it took.
+fn drive_until_answered(
+    h: &mut Harness,
+    first: Vec<Action>,
+    op: OpId,
+    steps: usize,
+    mut during_put: impl FnMut(&mut Harness),
+) -> (Option<Result<ControlOk, String>>, usize) {
+    let mut queue: std::collections::VecDeque<Event> = Default::default();
+    let mut puts = 0;
+    let absorb = |out: &[Action],
+                  queue: &mut std::collections::VecDeque<Event>|
+     -> Option<Result<ControlOk, String>> {
+        let mut done = None;
+        for action in out {
+            match action {
+                Action::ControlDone {
+                    op: answered,
+                    result,
+                } if *answered == op => done = Some(result.clone()),
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::Poll,
+                    ..
+                } => queue.push_back(Event::Timer { id: *id }),
+                Action::UploadDirtyChunks { op, .. } => queue.push_back(Event::UploadsDone {
+                    op: *op,
+                    result: UploadResult::Done { held: 0 },
+                }),
+                Action::Publish { op, .. } | Action::FollowHead { op } => {
+                    queue.push_back(Event::PublishDone { op: *op, ok: true })
+                }
+                Action::S3 { op, req } => {
+                    let result = match req {
+                        S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                        S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                        S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                        S3Op::HeartbeatRead => S3Result::Heartbeats(Ok(Vec::new())),
+                        S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                        S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                        _ => continue,
+                    };
+                    queue.push_back(Event::S3 { op: *op, result });
+                }
+                _ => {}
+            }
+        }
+        done
+    };
+    if let Some(done) = absorb(&first, &mut queue) {
+        return (Some(done), puts);
+    }
+    for _ in 0..steps {
+        let Some(event) = queue.pop_front() else {
+            break;
+        };
+        if let Event::S3 {
+            result: S3Result::SegmentPut(Ok(())),
+            ..
+        } = &event
+        {
+            puts += 1;
+            during_put(h);
+        }
+        let out = h.step(event);
+        if let Some(done) = absorb(&out, &mut queue) {
+            return (Some(done), puts);
+        }
+    }
+    (None, puts)
+}
+
+/// Fix (snap-drain-busy): a `Barrier` on a holder whose own client keeps
+/// writing — a row journaled during every segment PUT, so the journal is
+/// never empty — answers as soon as the segment carrying every row
+/// journaled before it lands. It used to wait for a round to end with an
+/// empty journal: under this writer the round ships for ever, and the
+/// barrier (a snapshot's drain, an `fsync` in `--fsync-mode s3`) never
+/// answered — or, when a round did end, failed "journal not shipped: no
+/// lease" on the very node holding the lease.
+#[test]
+fn a_barrier_on_a_busy_holder_answers_once_its_own_position_ships() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    submit_create(&mut h, 1, "acknowledged-before");
+    let before = Replica::journal_tip(&h.meta);
+    let barrier = OpId(1 << 50);
+    let first = h.step(Event::Control {
+        op: barrier,
+        req: Control::Barrier { ino: None },
+    });
+    let mut next = 2;
+    let (done, puts) = drive_until_answered(&mut h, first, barrier, 2_000, |h| {
+        submit_create(h, next, &format!("w{next}"));
+        next += 1;
+    });
+    assert_eq!(done, Some(Ok(ControlOk::Done)), "after {puts} segment PUTs");
+    assert!(
+        puts <= 2,
+        "the barrier waited {puts} segment PUTs for one row journaled before it"
+    );
+    assert!(
+        !h.meta.journal_unshipped_through(before).unwrap(),
+        "everything journaled before the barrier shipped"
+    );
+    assert!(
+        Replica::journal_len(&h.meta).unwrap() > 0,
+        "and the writer's later rows are still unshipped: the journal never emptied"
+    );
+}
+
+/// The other side of the position rule: rows that cannot ship (a
+/// manifest held back on a chunk only an absent node has) fail the
+/// barrier after a bounded number of rounds, with a message that says
+/// so — not "no lease" from the holder.
+#[test]
+fn a_barrier_behind_a_held_back_row_fails_after_bounded_rounds() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    submit_create(&mut h, 1, "f");
+    let ino = h.meta.child_ino(ROOT_INO, "f").unwrap().unwrap();
+    let away = constellation_fs_core::ChunkHash::of(b"only node 2 has it");
+    h.meta.enroll_remote_chunks(ino, &[away], 2).unwrap();
+    let manifest = constellation_fs_core::Manifest {
+        layout: constellation_fs_core::ChunkLayout::new(4096),
+        file_len: 7,
+        chunks: constellation_fs_core::ChunkInfo::Inline(std::collections::BTreeMap::from([(
+            0u64, away,
+        )])),
+    }
+    .encode();
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(2),
+        op: MutateOp::SetManifest {
+            ino,
+            base_manifest: None,
+            manifest,
+            size: 7,
+        },
+    });
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+    let barrier = OpId(1 << 50);
+    let first = h.step(Event::Control {
+        op: barrier,
+        req: Control::Barrier { ino: None },
+    });
+    let (done, _) = drive_until_answered(&mut h, first, barrier, 2_000, |_| {});
+    let Some(Err(error)) = done else {
+        panic!("the barrier did not fail: {done:?}");
+    };
+    assert!(
+        error.contains("held back") && !error.contains("no lease"),
+        "{error}"
+    );
+    assert!(h.core.barriers.is_empty(), "nothing left waiting");
+}
+
+/// A barrier on a node that does not hold the lease and has rows to ship
+/// says that, instead of the old "no lease" text that the busy holder
+/// also got.
+#[test]
+fn a_barrier_on_a_non_holder_with_a_journal_says_it_does_not_hold() {
+    let mut h = Harness::new(1);
+    // Journal a row directly, as an S3-only node does before it acquires.
+    h.meta
+        .create(ROOT_INO, "x", 0o644, 0, 0)
+        .expect("journal a row locally");
+    assert!(Replica::journal_len(&h.meta).unwrap() > 0);
+    let barrier = OpId(1 << 50);
+    let first = h.step(Event::Control {
+        op: barrier,
+        req: Control::Barrier { ino: None },
+    });
+    let (done, _) = drive_until_answered(&mut h, first, barrier, 200, |_| {});
+    let Some(Err(error)) = done else {
+        panic!("the barrier did not fail: {done:?}");
+    };
+    assert!(error.contains("does not hold the write lease"), "{error}");
+}
+
+/// Fix snap-drain-busy, review: a deposition empties the journal without
+/// shipping it (the recovery round strands the unshipped rows and queues
+/// them for replay by rid), so "nothing at or below my position left in
+/// the journal" must not answer a barrier around one. A barrier waiting
+/// as the node is deposed fails at once; one asked while deposed is
+/// refused; one asked after the recovery round stranded the rows waits
+/// until the replay has settled — it used to answer `Done` there, an
+/// `fsync` in `--fsync-mode s3` returning before its write reached the
+/// new holder.
+#[test]
+fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(1),
+        op: h.create("a"),
+    });
+    assert!(matches!(
+        replies(&out)[0].1,
+        ClientReply::Outcome(MutateOutcome::Accepted { .. })
+    ));
+    let answer = |out: &[Action], op: OpId| {
+        out.iter().find_map(|a| match a {
+            Action::ControlDone { op: o, result } if *o == op => Some(result.clone()),
+            _ => None,
+        })
+    };
+    // A barrier waits for the acknowledged create to ship.
+    let waiting = OpId(1 << 50);
+    let out = h.step(Event::Control {
+        op: waiting,
+        req: Control::Barrier { ino: None },
+    });
+    assert_eq!(answer(&out, waiting), None);
+    // The round renews past half-TTL and loses the CAS to a takeover.
+    h.advance(6_000);
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let out = h.step(Event::Timer { id: poll });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap();
+    let out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    let (renew, req) = s3_ops(&out)[0];
+    assert!(matches!(req, S3Op::LeaseSwap { .. }));
+    let out = h.step(Event::S3 {
+        op: renew,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let (reread, req) = s3_ops(&out)[0];
+    assert!(matches!(req, S3Op::LeaseGet));
+    let theirs = Lease {
+        v: 1,
+        partition: "p0".into(),
+        holder: 2,
+        epoch: 2,
+        expires_unix_ms: h.now.plus(10_000).0,
+        released: false,
+        wanted_by: Vec::new(),
+        backups: Vec::new(),
+        config_version: 2,
+        ack_policy: constellation_store_s3::AckPolicy::Local,
+        granted_delegations: false,
+        retired: Vec::new(),
+    };
+    let deposed = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((theirs, tag())))),
+    });
+    assert!(h.core.lease().lost);
+    let Some(Err(error)) = answer(&deposed, waiting) else {
+        panic!("the waiting barrier was not failed at the deposition");
+    };
+    assert!(error.contains("deposed"), "{error}");
+    assert!(h.core.barriers.is_empty());
+    // Asked while deposed: refused at once, not queued behind the strand.
+    let while_lost = OpId((1 << 50) + 1);
+    let out = h.step(Event::Control {
+        op: while_lost,
+        req: Control::Barrier { ino: None },
+    });
+    let Some(Err(error)) = answer(&out, while_lost) else {
+        panic!("a barrier asked while deposed was not refused");
+    };
+    assert!(error.contains("deposed and is recovering"), "{error}");
+    assert!(h.core.barriers.is_empty());
+    // The recovery round strands the create: out of the journal, queued
+    // for replay to node 2, not in the log.
+    let (tail, req) = s3_ops(&deposed)[0];
+    assert!(matches!(req, S3Op::SegmentRun { .. }));
+    let out = h.step(Event::S3 {
+        op: tail,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let out = at_head(&mut h, out);
+    assert!(!h.core.lease().lost);
+    assert_eq!(Replica::journal_len(&h.meta).unwrap(), 0);
+    let queue = h.meta.pending_replays().unwrap();
+    assert_eq!(queue.len(), 1);
+    // Asked now (the fsync's retry): the journal is empty, but the
+    // acknowledged create is only queued for replay, so no `Done`.
+    let after = OpId((1 << 50) + 2);
+    let mut first = out;
+    first.extend(h.step(Event::Control {
+        op: after,
+        req: Control::Barrier { ino: None },
+    }));
+    let (done, _) = drive_until_answered(&mut h, first, after, 200, |_| {});
+    assert!(
+        !matches!(done, Some(Ok(_))),
+        "the barrier answered before the stranded create was replayed: {done:?}"
+    );
+    if let Some(Err(error)) = &done {
+        assert!(error.contains("replayed"), "{error}");
+    }
+    // The replay settles (the new holder acknowledged it): a barrier
+    // answers again.
+    h.meta.forget_replay(queue[0].queue_seq).unwrap();
+    h.core.replay.in_flight = None;
+    let settled = OpId((1 << 50) + 3);
+    let first = h.step(Event::Control {
+        op: settled,
+        req: Control::Barrier { ino: None },
+    });
+    let (done, _) = drive_until_answered(&mut h, first, settled, 200, |_| {});
+    assert_eq!(done, Some(Ok(ControlOk::Done)));
+}

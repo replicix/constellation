@@ -1425,20 +1425,20 @@ impl EngineControl {
     pub(crate) fn set_quota(&self, max_bytes: Option<u64>) -> std::result::Result<String, String> {
         use constellation_meta::MetaStore;
         // The lease, not a barrier. This used to run `snapshot_barrier("/")`
-        // (since renamed `acquire_namespace_barrier`) first, which waits
-        // for the node's *whole* journal backlog to reach zero within one
-        // sync round and fails the call ("journal not
-        // shipped: no lease") whenever concurrent writes keep it nonzero —
+        // (since renamed `acquire_namespace_barrier`) first, which then
+        // waited for the node's *whole* journal backlog to reach zero
+        // within one sync round and failed the call ("journal not
+        // shipped: no lease") whenever concurrent writes kept it nonzero —
         // plan 37 K0 Track B measured that as most `quota.set`s failing at
-        // 64 concurrent CSI `CreateVolume`s. A snapshot needs that drain
-        // because it publishes an immutable root that must contain every
-        // pending write (plan 32); a quota observes and publishes nothing:
-        // it writes one journaled value, enforced locally and best-effort
-        // (`View::quota_check`), and replicates when the record ships —
-        // the drain *before* the write never made the quota itself durable
-        // any sooner. Scoping the barrier to a subtree would not have
-        // helped either: the round-waiter checks the whole journal
-        // whatever `ino` it is given.
+        // 64 concurrent CSI `CreateVolume`s. (A barrier now waits only for
+        // the rows journaled before it — fix snap-drain-busy — but a quota
+        // still has no use for one.) A snapshot needs that drain because
+        // it publishes an immutable root that must contain every write
+        // acknowledged before it (plan 32); a quota observes and publishes
+        // nothing: it writes one journaled value, enforced locally and
+        // best-effort (`View::quota_check`), and replicates when the
+        // record ships — the drain *before* the write never made the
+        // quota itself durable any sooner.
         self.acquire_write_lease()?;
         self.meta
             .set_quota(max_bytes)

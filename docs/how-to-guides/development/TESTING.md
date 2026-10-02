@@ -902,6 +902,20 @@ roots:
   `release` by glob, and a final multi-selector delete that leaves both
   nodes with no snapshots. The lease's holder and epoch are checked
   again after this phase.
+- `snapshot-busy-latency` (fix snap-drain-busy) is the regression test for
+  snapshots of a busy holder on slow S3. Toxiproxy adds 25 ms to each
+  direction of every S3 request, and the lease holder `c0` replaces
+  `project/counter` (write, then rename over it) every 5 ms. The scenario
+  times an idle snapshot first. It then takes three snapshots on the
+  holder, three forwarded from `c1`, and a `clone` on the holder (the
+  namespace barrier). Each one must finish within 3× the idle time plus 40
+  injected round trips (2 s). Each snapshot's frozen counter must be at
+  least the last write acknowledged before it was asked for, and at most
+  one past the last write acknowledged when it returned. The clone must
+  match its snapshot, and the lease must not move. Before the fix, the
+  first holder snapshot took 60 s. A barrier then waited for an empty
+  journal, and the publish refused while any row was unshipped. A busy
+  holder never has an empty journal at that latency.
 - `snapacct` (plan 32 §11, M5d) is the end-to-end proof that the reclaim
   estimate is the truth. Two nodes (`a` with `CONSTELLATION_SNAPACCT=on`,
   `b` with `auto`, so each builds its own index — incrementally and from

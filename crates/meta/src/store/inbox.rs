@@ -296,6 +296,14 @@ impl Meta {
         journal::acked_watermark(&r, &self.local)
     }
 
+    /// Whether a journal row at or below `upto` is still unshipped
+    /// (`Barrier`'s test: everything journaled before it has shipped once
+    /// this is false, however much was journaled since).
+    pub fn journal_unshipped_through(&self, upto: u64) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        journal::any_through(&r, &self.journal_ks, &self.local, upto)
+    }
+
     /// Plan 30 §M13 (coordinator decision): drop `recent` entries whose
     /// execution has shipped at or below journal seq `upto`. Once
     /// shipped, a rid is in `completed`, which every dedup site already

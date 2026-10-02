@@ -29,6 +29,47 @@ use constellation_store_s3::{Lease, LeaseTag};
 /// own, unreleased — and gives up on anything else.
 pub(crate) const READOPT_REASON: &str = "readopt-for-forward";
 
+/// How many whole sync rounds (each opening with a complete upload pass)
+/// a `Control::Barrier` may see end with its rows still unshipped before
+/// it fails. Its rows ship within one such round unless they cannot
+/// (held back behind a chunk that cannot be uploaded, plan 30 §M4) or a
+/// queued job cut the round short; the caller retries a failure. The
+/// bound counts rounds that *end*: under a writer that never lets the
+/// round end, a barrier behind a held-back row never reaches it and waits
+/// for its caller's own timeout instead.
+const BARRIER_ROUNDS: u32 = 3;
+
+/// A `Control::Barrier` waiting for this node's journal to ship through
+/// `upto`, the journal's tip when it was admitted.
+///
+/// Fix (snap-drain-busy): a barrier used to be answered at the end of a
+/// round, and only if the *whole* journal was empty then. A holder whose
+/// own clients keep writing never has an empty journal once S3 adds a
+/// few tens of milliseconds per request — a round ships until the journal
+/// runs dry, which it then never does — so a snapshot's drain on a busy
+/// holder took 10–45 s or failed ("journal not shipped: no lease", while
+/// holding the lease). What a barrier promises is narrower: everything
+/// journaled before it asked is in the log. So it waits for exactly
+/// that, and is answered as soon as the segment that carries its last
+/// row lands, mid-round, whatever was journaled since.
+#[derive(Debug)]
+pub(crate) struct BarrierWait {
+    op: OpId,
+    upto: u64,
+    /// Rounds begun since it was admitted.
+    rounds: u32,
+}
+
+impl BarrierWait {
+    pub(crate) fn new(op: OpId, upto: u64) -> BarrierWait {
+        BarrierWait {
+            op,
+            upto,
+            rounds: 0,
+        }
+    }
+}
+
 /// A request for the slot.
 #[derive(Debug, Clone)]
 pub(crate) enum JobReq {
@@ -1046,6 +1087,9 @@ impl Core {
         // Plan 30 §M9: these rows are durable in the log (`ack=s3`'s
         // acknowledgements, and a backup's, wait for exactly this).
         self.note_shipped(seqs, through);
+        if !seqs.is_empty() {
+            self.answer_shipped_barriers(replica, out);
+        }
         tracing::debug!(
             target: "constellation_authority::stream",
             node = self.cfg.node_id,
@@ -1286,6 +1330,7 @@ impl Core {
         replica.set_holder_epoch(0);
         let _ = replica.persist_lost(true);
         self.inbox.holder = None;
+        self.fail_barriers(out);
         self.ack_abort_parked(now, replica, out);
         self.deleg_on_lease_gone(now, replica, out);
     }
@@ -1436,6 +1481,9 @@ impl Core {
 
     fn begin_round(&mut self, poll_triggered: bool, out: &mut Vec<Action>) {
         self.nudged = false;
+        for barrier in &mut self.barriers {
+            barrier.rounds += 1;
+        }
         tracing::trace!(node = self.cfg.node_id, poll_triggered, "round begins");
         self.job = Some(Job {
             what: What::Round {
@@ -1484,7 +1532,9 @@ impl Core {
             op,
             ino: None,
             round: true,
-            complete: !self.round_waiters.is_empty() || self.publish_forced,
+            complete: !self.round_waiters.is_empty()
+                || !self.barriers.is_empty()
+                || self.publish_forced,
         });
     }
 
@@ -2010,17 +2060,12 @@ impl Core {
                         || "not deposed: nothing to recover".into(),
                     )))
                 }
-                (None, _) => {
-                    if backlog == 0 {
-                        Ok(ControlOk::Done)
-                    } else {
-                        Err("journal not shipped: no lease".into())
-                    }
-                }
+                (None, req) => Err(format!("{req:?} is not answered by a sync round")),
             };
             out.push(Action::ControlDone { op, result });
         }
-        if !self.round_waiters.is_empty() {
+        self.finish_barriers(now, failed.as_deref(), replica, out);
+        if !self.round_waiters.is_empty() || !self.barriers.is_empty() {
             self.nudged = true;
         }
         out.push(Action::RoundDone { failed });
@@ -2033,6 +2078,128 @@ impl Core {
         self.nudged = false;
         self.inbox_holder_tick(now, replica, out);
         self.start_next_job(now, replica, out);
+    }
+
+    /// Whether `barrier`'s rows are all in the log: none at or below its
+    /// position is left in the journal, and none left it because a
+    /// deposition stranded it.
+    ///
+    /// A deposition takes rows out of the journal without shipping them
+    /// (`recover_deposed` strands them and queues them for replay by rid
+    /// to the new holder), so an emptied journal proves nothing while
+    /// this node is deposed or still has replays to run. Three guards
+    /// cover it: a barrier is refused while `lease.lost` (`on_control`),
+    /// every waiting barrier fails as the node is deposed
+    /// ([`Self::fail_barriers`]) — before the recovery round strands
+    /// anything — and a barrier admitted after the recovery waits here
+    /// until this node's own replays have settled (the replayed op is
+    /// then the new holder's, durable under its acknowledgement policy
+    /// like any forwarded write).
+    fn barrier_shipped(&self, barrier: &BarrierWait, replica: &dyn Replica) -> bool {
+        !self.lease.lost
+            && !replica
+                .journal_unshipped_through(barrier.upto)
+                .unwrap_or(true)
+            && !self.own_replays_unsettled(replica)
+    }
+
+    /// The refusal of a barrier on a deposed node: transient, the caller
+    /// retries once the recovery round has run.
+    pub(crate) fn barrier_refused_deposed() -> String {
+        "journal not shipped: this node was deposed and is recovering \
+         (its unshipped rows are replayed to the new holder)"
+            .into()
+    }
+
+    /// This node was deposed: fail every waiting barrier now, before the
+    /// recovery round strands its rows (which would empty the journal
+    /// without shipping them — [`Self::barrier_shipped`]).
+    pub(crate) fn fail_barriers(&mut self, out: &mut Vec<Action>) {
+        for barrier in std::mem::take(&mut self.barriers) {
+            out.push(Action::ControlDone {
+                op: barrier.op,
+                result: Err(Self::barrier_refused_deposed()),
+            });
+        }
+    }
+
+    /// A segment landed: answer every barrier whose rows have now all
+    /// shipped, without waiting for the round to end (a busy holder's
+    /// round ships for as long as its clients write).
+    fn answer_shipped_barriers(&mut self, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.barriers.is_empty() {
+            return;
+        }
+        let barriers = std::mem::take(&mut self.barriers);
+        for barrier in barriers {
+            if self.barrier_shipped(&barrier, replica) {
+                out.push(Action::ControlDone {
+                    op: barrier.op,
+                    result: Ok(ControlOk::Done),
+                });
+            } else {
+                self.barriers.push(barrier);
+            }
+        }
+    }
+
+    /// A round ended: answer each barrier it settles. A barrier still
+    /// short of its position waits for the next round while this node can
+    /// ship and it has not yet seen [`BARRIER_ROUNDS`] whole rounds (one
+    /// admitted mid-round may have missed that round's complete upload
+    /// pass, or a queued job cut the round short).
+    fn finish_barriers(
+        &mut self,
+        now: Ms,
+        failed: Option<&str>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.barriers.is_empty() {
+            return;
+        }
+        let can_ship = self.lease.journal_ship_epoch(now, &self.cfg).is_some();
+        let barriers = std::mem::take(&mut self.barriers);
+        for barrier in barriers {
+            let result = if self.barrier_shipped(&barrier, replica) {
+                Ok(ControlOk::Done)
+            } else if let Some(error) = failed {
+                Err(error.to_string())
+            } else if !can_ship {
+                Err(format!(
+                    "journal not shipped through position {}: {}",
+                    barrier.upto,
+                    if self.lease.lost {
+                        "this node was deposed and is recovering"
+                    } else if self.own_replays_unsettled(replica) {
+                        "this node's stranded ops are still being replayed to the holder"
+                    } else if self.lease.held.is_some() {
+                        "this node's write lease is not usable yet (a takeover gate or an expiry)"
+                    } else {
+                        "this node does not hold the write lease"
+                    }
+                ))
+            } else if barrier.rounds < BARRIER_ROUNDS {
+                self.barriers.push(barrier);
+                continue;
+            } else if self.own_replays_unsettled(replica) {
+                Err(format!(
+                    "journal not shipped through position {} after {} sync rounds: \
+                     this node's stranded ops are still being replayed",
+                    barrier.upto, barrier.rounds
+                ))
+            } else {
+                Err(format!(
+                    "journal not shipped through position {} after {} sync rounds \
+                     (held back behind a chunk that cannot be uploaded)",
+                    barrier.upto, barrier.rounds
+                ))
+            };
+            out.push(Action::ControlDone {
+                op: barrier.op,
+                result,
+            });
+        }
     }
 
     // ---- acquire ----

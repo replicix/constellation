@@ -598,7 +598,7 @@ impl Core {
     /// streamed op, not one held while its generation lives — the
     /// delegate re-streams it in order — and not one whose rid is already
     /// in flight as a client op).
-    fn own_replays_unsettled(&self, replica: &dyn Replica) -> bool {
+    pub(super) fn own_replays_unsettled(&self, replica: &dyn Replica) -> bool {
         if self.replay.in_flight.is_some() {
             return true;
         }

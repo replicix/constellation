@@ -28,10 +28,15 @@ use futures::future::BoxFuture;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Force a metadata publish and return the commit that now reflects this
-/// node's state: `(seq, root)`. In the daemon it runs a sync round and a
-/// publish on the sync task; tests hand in a publisher directly.
-pub type PublishHook = Arc<dyn Fn() -> BoxFuture<'static, Result<(u64, NodeHash)>> + Send + Sync>;
+/// Force a metadata publish and return a commit `(seq, root)`. With
+/// `None`, the commit that now reflects this node's state: in the daemon
+/// a sync round ships everything, then the sync task publishes. With
+/// `Some(applied)`, a commit covering applied log position `applied` (a
+/// snapshot whose barrier already shipped what it needs:
+/// `TreePublisher::publish_through`), with no wait for the journal to
+/// empty. Tests hand in a publisher directly.
+pub type PublishHook =
+    Arc<dyn Fn(Option<u64>) -> BoxFuture<'static, Result<(u64, NodeHash)>> + Send + Sync>;
 
 /// How to read the metadata tree: the node cache, the tree config (the
 /// hasher is part of it), and the blob store for spilled values.
@@ -357,7 +362,18 @@ impl SnapshotManager {
             .publish
             .as_ref()
             .context("this mount cannot publish a metadata commit, so it cannot take snapshots")?;
-        publish().await
+        publish(None).await
+    }
+
+    /// A metadata commit `(seq, root)` covering applied log position
+    /// `applied`: what a snapshot retains once its barrier has shipped
+    /// everything journaled before it (see [`PublishHook`]).
+    pub async fn publish_commit_through(&self, applied: u64) -> Result<(u64, NodeHash)> {
+        let publish = self
+            .publish
+            .as_ref()
+            .context("this mount cannot publish a metadata commit, so it cannot take snapshots")?;
+        publish(Some(applied)).await
     }
 
     /// Write `path@name`'s bucket object for directory `ino` of `commit`
@@ -1169,12 +1185,18 @@ pub fn test_manager(
             handle.clone(),
         ),
     ));
-    let hook: PublishHook = Arc::new(move || {
+    let hook: PublishHook = Arc::new(move |through| {
         let publisher = publisher.clone();
         let handle = handle.clone();
         Box::pin(async move {
             handle
-                .spawn(async move { publisher.lock().await.publish_now(1).await })
+                .spawn(async move {
+                    let mut publisher = publisher.lock().await;
+                    match through {
+                        None => publisher.publish_now(1).await,
+                        Some(applied) => publisher.publish_through(1, applied).await,
+                    }
+                })
                 .await?
         })
     });

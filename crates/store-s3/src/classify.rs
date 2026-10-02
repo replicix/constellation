@@ -558,6 +558,35 @@ mod tests {
     fn messages_known_only_as_text() {
         for (text, want) in [
             ("journal not shipped: no lease", ErrorClass::Transient),
+            // `Control::Barrier`'s refusals since fix snap-drain-busy.
+            (
+                "journal not shipped through position 412: this node does not hold the write lease",
+                ErrorClass::Transient,
+            ),
+            (
+                "journal not shipped through position 412 after 3 sync rounds \
+                 (held back behind a chunk that cannot be uploaded)",
+                ErrorClass::Transient,
+            ),
+            (
+                "journal not shipped through position 412: this node's write lease is not \
+                 usable yet (a takeover gate or an expiry)",
+                ErrorClass::Transient,
+            ),
+            (
+                "journal not shipped through position 412: this node was deposed and is recovering",
+                ErrorClass::Transient,
+            ),
+            (
+                "journal not shipped: this node was deposed and is recovering \
+                 (its unshipped rows are replayed to the new holder)",
+                ErrorClass::Transient,
+            ),
+            (
+                "journal not shipped through position 412: this node's stranded ops are still \
+                 being replayed to the holder",
+                ErrorClass::Transient,
+            ),
             (
                 "pending upload chunk ab12 missing from local cache",
                 ErrorClass::Permanent,

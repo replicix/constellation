@@ -117,12 +117,18 @@ pub enum SyncRequest {
     EpochChanged,
     /// Ship everything this node can, then publish a plan 28 metadata
     /// commit and reply with `(seq, root)` — the tree a snapshot taken
-    /// now retains.
+    /// now retains. With `through: Some(applied)`, ship nothing first:
+    /// publish a commit covering applied log position `applied` (a
+    /// snapshot whose `Barrier` already shipped every row admitted
+    /// before it; `TreePublisher::publish_through`).
     Publish {
+        through: Option<u64>,
         reply: tokio::sync::oneshot::Sender<Result<(u64, constellation_mtree::NodeHash), String>>,
     },
-    /// Upload `ino`'s chunks, run a sync round and report its outcome
-    /// (fsync barrier).
+    /// Upload `ino`'s chunks, then wait until every journal row admitted
+    /// before this request has shipped (fsync, snapshot and clone
+    /// barrier; `jobs::BarrierWait` in the core) — not for an empty
+    /// journal, which a busy holder never has.
     Barrier {
         ino: Ino,
         reply: tokio::sync::oneshot::Sender<Result<(), SyncFailure>>,

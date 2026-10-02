@@ -495,6 +495,64 @@ impl TreePublisher {
         Ok((state.seq, state.root))
     }
 
+    /// The commit a snapshot retains once its barrier has shipped every
+    /// journal row admitted before it: one whose `applied` position
+    /// covers `applied` (this replica's applied log position after that
+    /// drain), or — nothing dirty — the last one, which reflects the
+    /// replica whole.
+    ///
+    /// Fix (snap-drain-busy): unlike [`Self::publish_now`] this does not
+    /// wait for an empty journal. A commit is the log prefix at its
+    /// `applied` (plan 30 §M3b: this holder's unshipped work is published
+    /// at its before-images), so one at or past `applied` holds everything
+    /// the barrier shipped — every write acknowledged before the snapshot
+    /// asked — and nothing still unshipped; a holder whose clients keep
+    /// writing never has an empty journal, and waiting for one stalled a
+    /// snapshot for as long as they wrote. Rows that shipped between the
+    /// barrier and this commit are in it too: writes concurrent with the
+    /// snapshot, in or out whole (the cut is a log position, which never
+    /// splits a transaction). Requester speculation still defers it, and
+    /// so does an uncaptured holder journal (`Meta::publish_basis_at`).
+    pub async fn publish_through(&mut self, epoch: u64, applied: u64) -> Result<(u64, NodeHash)> {
+        if self.meta.has_dirty() && self.meta.has_outstanding_speculation() {
+            anyhow::bail!("{SPECULATION_OUTSTANDING}");
+        }
+        for _ in 0..PUBLISH_NOW_ATTEMPTS {
+            if let Some(commit) = self.publish(epoch).await? {
+                if vector_covers(commit.applied, applied) {
+                    let root = commit
+                        .root(SHARD0)
+                        .with_context(|| format!("commit {} names no shard 0 root", commit.seq))?;
+                    return Ok((commit.seq, root));
+                }
+                // Not reached in practice: a commit planned after the
+                // drain has `applied` at or past the drain's. Publish
+                // again rather than hand back a commit that misses it.
+                tracing::debug!(
+                    seq = commit.seq,
+                    want = applied,
+                    "publish_through: the commit does not cover the drain's position; publishing again"
+                );
+                continue;
+            }
+            if let Some(state) = self
+                .state
+                .as_ref()
+                .filter(|s| vector_covers(s.applied, applied) || !self.meta.has_dirty())
+            {
+                return Ok((state.seq, state.root));
+            }
+        }
+        if self.state.is_none() && !self.meta.has_dirty() {
+            anyhow::bail!("nothing has been published on this mount yet");
+        }
+        anyhow::bail!(
+            "{PUBLISH_DEFERRED} (no commit covers applied log position {applied} yet: \
+             this replica is behind the chain head, or a concurrent commit overlaps its batch); \
+             retry shortly"
+        )
+    }
+
     async fn publish_batch(&mut self, epoch: u64) -> Result<Outcome> {
         // Adopt whatever the chain's head is before planning. A commit
         // from another writer is the normal reason our parent moved,

@@ -1122,9 +1122,12 @@ pub struct Core {
     /// A nudge arrived while a round was in flight: run another right
     /// after it (`nudged` in the sync loop).
     nudged: bool,
-    /// A client's control request waiting for a round (`Barrier`,
-    /// `PublishNow`, `Reintegrate`): answered when the round completes.
+    /// A client's control request waiting for a round (`PublishNow`,
+    /// `Reintegrate`): answered when the round completes.
     round_waiters: Vec<(OpId, Control)>,
+    /// `Control::Barrier`s waiting for the journal to ship through the
+    /// position each was admitted at (`jobs::BarrierWait`).
+    barriers: Vec<jobs::BarrierWait>,
     /// `Control::Acquire`/`ClaimOffer` requests answered when the
     /// acquisition in the slot finishes.
     acquire_waiters: Vec<(OpId, Control)>,
@@ -1213,6 +1216,7 @@ impl Core {
             idle_rounds: 0,
             nudged: false,
             round_waiters: Vec::new(),
+            barriers: Vec::new(),
             acquire_waiters: Vec::new(),
             acked: client::AckTracker::default(),
             replay: replay::ReplayState::default(),
@@ -1294,6 +1298,7 @@ impl Core {
             ("by_req", self.by_req.len()),
             ("queued_jobs", self.queued_jobs.len()),
             ("round_waiters", self.round_waiters.len()),
+            ("barriers", self.barriers.len()),
             ("acquire_waiters", self.acquire_waiters.len()),
             ("links", self.links.len()),
             ("inbox_pending", self.inbox.pending.len()),
@@ -1864,16 +1869,32 @@ impl Core {
                     result: Ok(ControlOk::Done),
                 });
             }
-            Control::Barrier { .. } | Control::PublishNow => {
-                if matches!(req, Control::PublishNow) {
-                    self.publish_forced = true;
-                }
+            Control::Barrier { .. } if self.lease.lost => {
+                // Deposed: the recovery round is about to strand the
+                // unshipped rows, emptying the journal without shipping
+                // them, so no position taken now could be honoured.
+                out.push(Action::ControlDone {
+                    op,
+                    result: Err(Self::barrier_refused_deposed()),
+                });
+            }
+            Control::Barrier { .. } => {
+                // Its position is taken here, as it is admitted: every row
+                // journaled before it — every write acknowledged before
+                // the caller asked — is at or below the journal's tip.
+                let upto = replica.journal_tip();
+                self.barriers.push(jobs::BarrierWait::new(op, upto));
+                self.nudge(now, out);
+            }
+            Control::PublishNow => {
+                self.publish_forced = true;
                 self.round_waiters.push((op, req));
                 self.nudge(now, out);
             }
             Control::Reintegrate => {
                 if replica.lost_persisted() && !self.lease.lost {
                     self.lease.force_lost();
+                    self.fail_barriers(out);
                     self.deleg_on_lease_gone(now, replica, out);
                 }
                 if !self.lease.lost {
