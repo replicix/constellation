@@ -31101,3 +31101,78 @@ release heavy model and measurement ok; smoke passed.
 | `bash tests/integration.sh` | port 4566 held by another agent's floci (`boxgates-floci-1`), so the script's body was run against it with its AWS_* settings (`bash tests/smoke.sh s3://constellation-ci/run-m0c-…`): SMOKE TEST PASSED |
 | `cargo build --release --workspace` | exit 0 |
 | `target/release/harness run …` (snapshot-mount snapshot-lifecycle clone-workflow / gc-lifecycle gc-dedup-race gc-open-orphan-hold fsck-repair / snapshot-churn e2e-basic e2e-two-nodes, three invocations) | ALL SCENARIOS PASSED (10/10) |
+
+## Fix: load-sensitive flakes, round 2 (`fix-flakes-2`)
+
+Follow-up to `f0871f4`. Two tests still failed now and then on the shared
+16-vCPU host while other agents were building. Neither failure was a
+test reading state too early. Both were product races that load made
+visible.
+
+### Fix: two standalone rebuilds in one process shared a side replica
+
+`shipper::tests::a_rebuild_keeps_the_orphans_a_view_has_open` and
+`…a_replica_the_log_was_pruned_past_rebuilds_and_never_appends_below_the_head`
+failed with `replicas differ`. The pruned-past test's B came out of its
+rebuild with the *other* test's namespace: `missing` was `d1`…`d7`, and
+`extra` was a root with the other test's link count. At the same moment
+the orphan test's rebuild errored. `Standalone::step` put the
+side replica at `$TMP/constellation-standalone-rebuild-<pid>-<op>`. Every
+core numbers its ops from the same start, so two drivers in one process
+reached `Action::RebuildReplica` with the same op id. Each then
+`remove_dir_all`ed the other's directory or bootstrapped into it, and
+`replace_ns_from_rebuilt` swapped in whatever was there. The failure
+only appears when two rebuilds overlap in time. The two tests alone,
+`--test-threads=2`: 1/40 before the fix. Alone or pinned to one CPU:
+never. `Standalone` is not test-only: the daemon-less gc tail
+(`GcTail::Standalone`) runs it.
+
+The scratch directory now carries a process-wide counter, using the
+same idiom as `gc::ScratchDir` and `mtree_gc::ScratchDir`
+(`standalone_rebuild_dir`). `fsck`'s `.fsck-nodes-<pid>` scratch cache
+was named the same way, and two concurrent in-daemon `fsck` control
+calls would have removed it under each other, so it gets the same
+counter. Regression test:
+`authority_driver::tests::standalone_rebuilds_never_share_a_side_replica`.
+
+### Fix: an unmount during a cadence publish could leave no commit
+
+`e2e-basic` sometimes failed with "E2E filesystem published no
+metadata tree". The scenario expects `/packs/` and `/commits/` right
+after a clean unmount. The unmount's `Control::Shutdown` flush published
+only if `self.publishing.is_none()`. A publish that was still running
+(the segment-count cadence fires at 32 segments, which this workload
+reaches) made the flush skip its own publish, release the lease, and
+stop. The daemon then exited. The publish was a `tokio::spawn`ed task,
+so it was dropped mid-upload. Under load that publish takes longer, and
+the unmount is more likely to land inside it. The same skip also lost
+everything shipped after the running publish began, even when that
+publish did finish.
+
+A `Flush` job (unmount, suspension, `leave`; handoffs never publish)
+that would publish now waits for a running publish
+(`Phase::FlushPublish` on the in-flight op), then re-checks
+`has_dirty()` and publishes the rest itself before it releases.
+Regression test:
+`core::tests::a_shutdown_waits_for_an_in_flight_publish_and_publishes_after_it`.
+Before the fix it fails because the release `LeaseSwap` is issued while
+the publish is still running.
+
+### Files
+
+- `crates/engine/src/authority_driver.rs` (`standalone_rebuild_dir`, test)
+- `crates/engine/src/fsck.rs` (scratch name)
+- `crates/authority/src/core/jobs.rs` (`flush_continue`)
+- `crates/authority/src/core/tests.rs` (regression test)
+
+### Results (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, prefix `ff2`, host load 30–65)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` / clippy `-D warnings` | clean |
+| `cargo test` per crate (whole workspace) | 0 failed |
+| the two shipper tests together, `--test-threads=2` | 0/100 failed (before: 1/40); pinned `taskset -c 0` 0/20 |
+| each shipper test alone | 20× pass, 5× pass under `taskset -c 0` |
+| the two regression tests | 20× pass, 5× pass under `taskset -c 0` |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `harness run e2e-basic` | 10/10 PASSED; 5/5 more under `taskset -c 0` (`/dev/fuse`; the ring transport needs the non-default `io-uring` build feature, and the fix is in the transport-independent core) |

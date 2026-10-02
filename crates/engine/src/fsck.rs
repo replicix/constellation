@@ -252,10 +252,18 @@ async fn check_metadata_tree(
     state_dir: Option<&std::path::Path>,
     issues: &mut Vec<FsckIssue>,
 ) -> Result<()> {
+    // Unique per check, not just per process: the daemon serves fsck
+    // control calls concurrently, and two checks sharing a scratch cache
+    // would remove it under each other.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let scratch = state_dir
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir)
-        .join(format!(".fsck-nodes-{}", std::process::id()));
+        .join(format!(
+            ".fsck-nodes-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
     let _ = std::fs::remove_dir_all(&scratch);
     let result = check_metadata_tree_in(logs, meta, &scratch, issues).await;
     let _ = std::fs::remove_dir_all(&scratch);

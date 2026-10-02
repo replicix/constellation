@@ -2699,12 +2699,20 @@ impl Core {
                     ..
                 }) = self.job.as_mut()
                 {
-                    if !*published
-                        && self.cfg.publisher
-                        && holder.is_some()
-                        && replica.has_dirty()
-                        && self.publishing.is_none()
+                    if !*published && self.cfg.publisher && holder.is_some() && replica.has_dirty()
                     {
+                        // A cadence publish still in flight is waited for,
+                        // not counted as this flush's: it covers the
+                        // replica as of its start, not what shipped since,
+                        // and an unmount's stop ends the process — the
+                        // daemon's publish task with it — once the release
+                        // lands. (Before: the flush released at once, and
+                        // a clean unmount under load could leave no commit
+                        // at all.) Its `PublishDone` re-enters here.
+                        if let Some(in_flight) = self.publishing {
+                            self.set_phase(Phase::FlushPublish { op: in_flight }, Some(in_flight));
+                            return;
+                        }
                         *published = true;
                         let op = self.op_id();
                         self.publishing = Some(op);

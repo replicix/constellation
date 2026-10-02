@@ -3988,6 +3988,22 @@ pub(crate) async fn rebuild_replica(
 // (in-daemon GC's standalone tail, the gc tests).
 // ---------------------------------------------------------------------
 
+/// The temp dir a standalone rebuild's side replica lives in, unique per
+/// call in this process. The op id alone is not: every core counts its
+/// ops from the same start, so two drivers in one process (the gc tool's
+/// tail beside another, or two tests) reach a rebuild with the same id —
+/// and one's `remove_dir_all` deleted, or its bootstrap wrote into, the
+/// other's side replica, which then swapped in the wrong namespace.
+fn standalone_rebuild_dir(op: OpId) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "constellation-standalone-rebuild-{}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        op.0
+    ))
+}
+
 pub struct Standalone {
     core: Core,
     meta: Arc<Meta>,
@@ -4205,11 +4221,7 @@ impl Standalone {
         } else if let Some(op) = self.pending_rebuild.pop_front() {
             // A real rebuild (the retention-gap tests need one): the side
             // replica lives in a private temp dir.
-            let dir = std::env::temp_dir().join(format!(
-                "constellation-standalone-rebuild-{}-{}",
-                std::process::id(),
-                op.0
-            ));
+            let dir = standalone_rebuild_dir(op);
             let _ = std::fs::create_dir_all(&dir);
             let holds = self.holds.clone();
             let keep = || {
@@ -4339,6 +4351,20 @@ impl Standalone {
 #[cfg(test)]
 mod tests {
     use super::parse_u64_zero_ok;
+
+    /// Two standalone drivers in one process whose cores reach a rebuild
+    /// with the same op id get separate side replicas (before: both used
+    /// `…-rebuild-<pid>-<op>`, and the shipper's two retention-gap tests,
+    /// run side by side, swapped each other's namespace in).
+    #[test]
+    fn standalone_rebuilds_never_share_a_side_replica() {
+        use constellation_authority::OpId;
+        let op = OpId(7);
+        let a = super::standalone_rebuild_dir(op);
+        let b = super::standalone_rebuild_dir(op);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(std::env::temp_dir().as_path()));
+    }
 
     /// The placement's share and rate knobs take `0` as a value (it turns
     /// splitting, the share floor or the rate floor off); unset or

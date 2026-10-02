@@ -1149,6 +1149,121 @@ fn a_nudge_during_an_in_flight_publish_ships_the_journal_at_once() {
     });
 }
 
+/// An unmount's flush that finds a cadence publish still in flight waits
+/// for it and then publishes what shipped since, before it releases and
+/// stops (`e2e-basic` under load: the flush skipped its publish because
+/// one was running, released, and the process exit dropped the running
+/// publish — a clean unmount that left no commit).
+#[test]
+fn a_shutdown_waits_for_an_in_flight_publish_and_publishes_after_it() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(1),
+        op: h.create("a"),
+    });
+    assert!(!replies(&out).is_empty());
+    let out = h.step(Event::Control {
+        op: OpId(900),
+        req: Control::PublishNow,
+    });
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let out = h.step(Event::Timer { id: poll });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the round uploads first");
+    let out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    let (put, _) = s3_ops(&out)[0];
+    let out = h.step(Event::S3 {
+        op: put,
+        result: S3Result::SegmentPut(Ok(())),
+    });
+    let publish = out
+        .iter()
+        .find_map(|a| match a {
+            Action::Publish { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the forced publish is issued");
+
+    // `b` lands after that publish started; then the unmount.
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: h.rid(2),
+        op: h.create("b"),
+    });
+    assert!(!replies(&out).is_empty());
+    let shutdown = OpId(901);
+    let out = h.step(Event::Control {
+        op: shutdown,
+        req: Control::Shutdown,
+    });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the flush uploads first");
+    let out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    let (put, req) = s3_ops(&out)[0];
+    assert!(matches!(req, S3Op::SegmentPut { .. }), "{req:?}");
+    let out = h.step(Event::S3 {
+        op: put,
+        result: S3Result::SegmentPut(Ok(())),
+    });
+    assert!(
+        s3_ops(&out).is_empty()
+            && !out
+                .iter()
+                .any(|a| matches!(a, Action::Publish { .. } | Action::ControlDone { .. })),
+        "nothing released, published or answered while a publish runs: {out:?}"
+    );
+    assert!(!h.core.stopped());
+
+    // The running publish ends; the flush publishes `b`'s state itself,
+    // and only then releases.
+    let out = h.step(Event::PublishDone {
+        op: publish,
+        ok: true,
+    });
+    let own = out
+        .iter()
+        .find_map(|a| match a {
+            Action::Publish { op, .. } => Some(*op),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the flush publishes after the running one: {out:?}"));
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    let out = h.step(Event::PublishDone { op: own, ok: true });
+    let (release, req) = s3_ops(&out)[0];
+    assert!(
+        matches!(req, S3Op::LeaseSwap { lease, .. } if lease.released),
+        "{req:?}"
+    );
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    assert!(
+        out.iter()
+            .any(|a| matches!(a, Action::ControlDone { op, result: Ok(_) } if *op == shutdown)),
+        "{out:?}"
+    );
+    assert!(h.core.stopped());
+}
+
 /// Plan 30 M5 round 3: the reply base is the last *shipped* position that
 /// touched the op's keys (or the window floor), not the head. Under a
 /// forward burst every requester trails the head by a segment, and a
