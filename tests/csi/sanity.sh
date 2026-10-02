@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# csi-sanity against constellation-csi's Identity and Controller services
-# (plan 37 K1 + K2 gates): starts the controller role on one temp unix
-# socket, backed by its in-process engine fake (--in-memory-backend, so the
-# suite never touches S3 — plan 37 §12), and the node role on another, and
-# runs csi-sanity's Identity and Controller spec groups. csi-sanity cleans
-# up every Controller-test volume through the Node service too, which is
-# why the node role runs at all; its staging/publishing RPCs are
-# UNIMPLEMENTED until K3, so the Node group is not run yet — K3's sanity.sh
-# drops the focus.
+# csi-sanity against constellation-csi's Identity, Controller and Node
+# services (plan 37 K1 + K2 + K3 gates), all on their in-process fakes so
+# the suite never touches S3 or mount(2) (plan 37 §12): the controller role
+# on one temp unix socket (--in-memory-backend: an in-memory engine), the
+# node role on another (--in-memory-backend: in-memory engine pods, and
+# mounts that are recorded rather than made — the directories are real).
+# The two processes share no engine, so the node's fake takes every volume
+# the controller's names to exist. The same Node group against the real
+# node plugin, real FUSE mounts and real engine pods is
+# tests/csi/sanity-kind.sh.
 #
 # Usage: tests/csi/sanity.sh
 #
@@ -85,7 +86,8 @@ echo "== starting constellation-csi --controller on $sock"
 RUST_LOG="${RUST_LOG:-info}" "$bin" --controller --in-memory-backend --endpoint "unix://$sock" >"$log" 2>&1 &
 pid=$!
 echo "== starting constellation-csi --node on $node_sock"
-RUST_LOG="${RUST_LOG:-info}" "$bin" --node --node-id csi-sanity --endpoint "unix://$node_sock" >"$node_log" 2>&1 &
+RUST_LOG="${RUST_LOG:-info}" "$bin" --node --node-id csi-sanity --in-memory-backend \
+    --host-root "$work/host" --endpoint "unix://$node_sock" >"$node_log" 2>&1 &
 node_pid=$!
 wait_for_socket "$sock" "$pid" "$log"
 wait_for_socket "$node_sock" "$node_pid" "$node_log"
@@ -96,11 +98,11 @@ status=0
 echo "== csi-sanity --ginkgo.focus=Identity (controller role)"
 "$sanity" --csi.endpoint="unix://$sock" --ginkgo.focus='Identity' --ginkgo.fail-on-empty \
     || status=$?
-echo "== csi-sanity --ginkgo.focus='Identity|Controller' (node + controller roles)"
+echo "== csi-sanity --ginkgo.focus='Identity|Controller|Node' (node + controller roles)"
 "$sanity" --csi.endpoint="unix://$node_sock" --csi.controllerendpoint="unix://$sock" \
     --csi.testvolumeparameters="$params" \
     --csi.mountdir="$work/mount" --csi.stagingdir="$work/staging" \
-    --ginkgo.focus='Identity|Controller' --ginkgo.fail-on-empty ${CSI_SANITY_ARGS:-} || status=$?
+    --ginkgo.focus='Identity|Controller|Node' --ginkgo.fail-on-empty ${CSI_SANITY_ARGS:-} || status=$?
 if [ "$status" -ne 0 ]; then
     echo "== constellation-csi --controller log (tail)" >&2
     tail -n 50 "$log" >&2

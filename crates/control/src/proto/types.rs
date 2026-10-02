@@ -2743,7 +2743,22 @@ pub enum MountSource {
     /// or a previous process) that arrives **attached to this request**
     /// over fd passing. On a transport that cannot pass descriptors the
     /// call fails `NotSupported` immediately.
-    PreopenedFd,
+    PreopenedFd {
+        /// Where the sender mounted it, as the sender sees it (plan 37's
+        /// staging path): the name `view.list`/`view.stats`/`view.unmount`
+        /// know the view by. It may not exist in this process's mount
+        /// namespace, and this daemon never unmounts it — `view.unmount`
+        /// ends the session and closes the connection, and whoever made
+        /// the mount unmounts it. `None`: the view is known as `fd:<n>`.
+        #[serde(default)]
+        mountpoint: Option<PathBuf>,
+        /// How the session serves it: `allow_other` (fuser admits every
+        /// uid, which a mount other processes use needs), `fs_name`,
+        /// `fuse_threads`, and the view options. The kernel's half of the
+        /// mount options was fixed by whoever called `mount(2)`.
+        #[serde(default)]
+        opts: MountViewOpts,
+    },
 }
 
 /// `view.mount`.
@@ -3770,7 +3785,13 @@ mod tests {
         });
         round_trip(&ViewMountParams {
             subtree: "/".into(),
-            source: MountSource::PreopenedFd,
+            source: MountSource::PreopenedFd {
+                mountpoint: Some("/var/lib/kubelet/plugins/x/globalmount".into()),
+                opts: MountViewOpts {
+                    allow_other: true,
+                    ..Default::default()
+                },
+            },
             labels: Default::default(),
             qos: Default::default(),
             confine_links: false,
@@ -3926,7 +3947,7 @@ mod tests {
     #[test]
     fn json_defaults_let_short_requests_through() {
         let p: ViewMountParams = serde_json::from_value(serde_json::json!({
-            "subtree": "/", "source": "PreopenedFd"
+            "subtree": "/", "source": {"PreopenedFd": {}}
         }))
         .unwrap();
         assert!(!p.confine_links && p.labels.is_empty());

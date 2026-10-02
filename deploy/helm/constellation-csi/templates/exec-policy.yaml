@@ -8,21 +8,32 @@ node-plugin pod, patch its image, or create a privileged pod. RBAC cannot
 scope a verb to a name pattern or a label, so this
 ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1, Kubernetes
 >= 1.30) narrows every pod operation that ServiceAccount makes to
-controller-owned engine pods (`constellation-engine-*-controller`), and
-every pod it creates to the shape crates/csi/src/engine_pods.rs builds:
-this chart's image, no host namespaces, no privileged container, no
-privilege escalation, no added capability but the init container's CHOWN,
-non-root, and hostPaths only under <hostRoot>/{node-identity,sockets}/
-<unit>-controller. A pod update may change metadata (the fs-uuid label),
-never the spec.
+controller-owned engine pods (`constellation-engine-<unit>-controller`),
+and every pod it creates to exactly the shape
+crates/csi/src/engine_pods.rs builds, as the node plugin's half below
+does: this chart's image, one engine container running `constellation
+serve` (probes only `constellation control-relay`), the one init
+container's `chown`, uid 65532, no host namespace, no runtime class, no
+service-account token and the engine ServiceAccount
+(`constellation-csi-engine`, which holds no permission), no lifecycle
+hook, no environment from Secrets but the pool's credentials
+(`<pod>-credentials`), and only the unit's volumes:
+<hostRoot>/{node-identity,sockets}/<unit>-controller and a scratch
+emptyDir, each at its own path. A pod update may change metadata (the
+fs-uuid label), never the spec.
 
-Admission sees only the exec request's pod *name*, not the pod; the name
-pattern holds because creating a pod under that name is itself held to
-the engine-pod shape above.
+The only subresource it may touch is `exec`, the control relay
+(engine_pods.rs `ExecRelay`), and admission sees that request's
+PodExecOptions (a second policy, below): the command must be the
+relay's own (or its `--ping`) in the `engine` container. Admission sees only the exec's pod *name*,
+not the pod; the name pattern holds because creating a pod under that
+name is itself held to the engine-pod shape above.
 */}}
 {{- if .Values.controller.podAccessPolicy }}
 {{- $sa := printf "system:serviceaccount:%s:constellation-csi-controller" .Release.Namespace }}
 {{- $root := trimSuffix "/" .Values.hostRoot }}
+{{- $bin := "/usr/local/bin/constellation" }}
+{{- $sock := "/run/constellation-csi/control.sock" }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -41,17 +52,41 @@ spec:
     - name: controller-service-account
       expression: request.userInfo.username == {{ $sa | quote }}
   variables:
+    - name: subresource
+      expression: request.?subResource.orValue('')
     - name: target
       expression: >-
-        request.operation == 'CREATE' && request.?subResource.orValue('') == ''
+        request.operation == 'CREATE' && variables.subresource == ''
           ? object.metadata.name : request.name
     - name: creating
-      expression: request.operation == 'CREATE' && request.?subResource.orValue('') == ''
+      expression: request.operation == 'CREATE' && variables.subresource == ''
+    - name: unit
+      # `<unit>-controller`: the name after `constellation-engine-`, which
+      # the first validation pins.
+      expression: >-
+        variables.target.startsWith('constellation-engine-')
+          ? variables.target.substring(21) : ''
     - name: allContainers
+      # The conditional is what makes the two container lists one type for `+`.
       expression: >-
         object.spec.containers
           + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+    - name: execOk
+      # A probe's exec command, if any, is `constellation control-relay …`.
+      expression: >-
+        [object.spec.containers[0].?startupProbe, object.spec.containers[0].?readinessProbe,
+         object.spec.containers[0].?livenessProbe].all(p,
+          !p.hasValue() || !has(p.value().exec)
+          || (size(p.value().exec.command) >= 2
+              && p.value().exec.command[0] == {{ $bin | quote }}
+              && p.value().exec.command[1] == 'control-relay'))
   validations:
+    - expression: >-
+        variables.subresource == 'exec'
+          || (variables.subresource == '' && request.operation != 'CONNECT')
+      messageExpression: >-
+        'the CSI controller touches no pod subresource but exec, not '
+        + variables.subresource
     - expression: variables.target.matches('^constellation-engine-[a-z0-9-]+-controller$')
       messageExpression: >-
         'the CSI controller may only touch its own engine pods
@@ -68,32 +103,64 @@ spec:
           && !object.spec.?hostPID.orValue(false)
           && !object.spec.?hostIPC.orValue(false)
           && !has(object.spec.ephemeralContainers)
-          && object.spec.?securityContext.?runAsNonRoot.orValue(false))
-      message: an engine pod uses no host namespace and runs as non-root
+          && !has(object.spec.runtimeClassName)
+          && object.spec.?automountServiceAccountToken.orValue(true) == false
+          && object.spec.?serviceAccountName.orValue('') == 'constellation-csi-engine'
+          && object.spec.?serviceAccount.orValue('constellation-csi-engine') == 'constellation-csi-engine'
+          && object.spec.?securityContext.?runAsNonRoot.orValue(false)
+          && object.spec.?securityContext.?runAsUser.orValue(0) == 65532)
+      message: >-
+        an engine pod uses no host namespace, no runtime class and no
+        service-account token, runs as the constellation-csi-engine
+        ServiceAccount and as uid 65532
     - expression: >-
         !variables.creating || variables.allContainers.all(c,
           c.image == {{ include "csi.image" . | quote }}
           && !c.?securityContext.?privileged.orValue(false)
           && c.?securityContext.?allowPrivilegeEscalation.orValue(true) == false
-          && c.?securityContext.?capabilities.?add.orValue([]).all(a, a == 'CHOWN'))
+          && c.?securityContext.?capabilities.?add.orValue([]).all(a, a == 'CHOWN')
+          && !has(c.lifecycle) && !has(c.envFrom)
+          && c.?env.orValue([]).all(e, !has(e.valueFrom)
+               || e.valueFrom.?secretKeyRef.?name.orValue('')
+                  == variables.target + '-credentials')
+          && c.?volumeMounts.orValue([]).all(m,
+               !has(m.subPath) && !has(m.subPathExpr)
+               && m.?mountPropagation.orValue('None') == 'None'
+               && ((m.name == 'node-identity' && m.mountPath == '/var/lib/constellation/state')
+                   || (m.name == 'sockets' && m.mountPath == '/run/constellation-csi')
+                   || (m.name == 'scratch' && m.mountPath == '/tmp'))))
       message: >-
         engine pod containers run this chart's image, unprivileged, without
-        privilege escalation, adding no capability but CHOWN
+        privilege escalation or lifecycle hooks, adding no capability but
+        CHOWN, reading only the pool's credentials Secret, and mount only
+        the unit's volumes at their own paths
     - expression: >-
-        !variables.creating || object.spec.containers.all(c,
-          c.?securityContext.?runAsUser.orValue(1) != 0
-          && !c.?securityContext.?capabilities.?add.hasValue())
-      message: an engine container is never root and adds no capability
+        !variables.creating || (
+          size(object.spec.containers) == 1
+          && object.spec.containers.all(c,
+               c.?command.orValue([]) == [{{ $bin | quote }}]
+               && size(c.?args.orValue([])) > 0 && c.args[0] == 'serve'
+               && c.?securityContext.?runAsUser.orValue(65532) == 65532
+               && !c.?securityContext.?capabilities.?add.hasValue())
+          && variables.execOk)
+      message: >-
+        an engine pod has one container, running `constellation serve` as
+        uid 65532 with no added capability, its probes `constellation control-relay`
+    - expression: >-
+        !variables.creating || object.spec.?initContainers.orValue([]).all(c,
+          c.?command.orValue([]) == ['chown', '65532:65532', '/var/lib/constellation/state', '/run/constellation-csi']
+          && !has(c.args))
+      message: an engine pod's init container only chowns its state and sockets directories
     - expression: >-
         !variables.creating || object.spec.?volumes.orValue([]).all(v,
-          !has(v.hostPath)
-          || v.hostPath.path.matches({{ printf "^%s/(node-identity|sockets)/[a-z0-9-]+-controller$" (regexQuoteMeta $root) | quote }}))
+          (v.name == 'scratch' && has(v.emptyDir))
+          || (v.name in ['node-identity', 'sockets'] && has(v.hostPath)
+              && v.hostPath.path == {{ $root | quote }} + '/' + v.name + '/' + variables.unit))
       message: >-
-        an engine pod's hostPaths are its own
-        <hostRoot>/{node-identity,sockets}/<unit>-controller directories
+        an engine pod's volumes are its own <hostRoot>/{node-identity,
+        sockets}/<unit>-controller directories and a scratch emptyDir
     - expression: >-
-        request.operation != 'UPDATE' || request.?subResource.orValue('') != ''
-          || object.spec == oldObject.spec
+        request.operation != 'UPDATE' || object.spec == oldObject.spec
       message: the CSI controller may relabel its engine pods, never change their spec
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -103,6 +170,235 @@ metadata:
   labels: {{- include "csi.labels" . | nindent 4 }}
 spec:
   policyName: constellation-csi-controller-pods.{{ .Release.Namespace }}
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+---
+# The exec's command, in a policy of its own: matched on `pods/exec` only,
+# `object` is the request's PodExecOptions (a policy matching `pods` too
+# types `object` as a Pod, and `command` would not type-check).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: constellation-csi-controller-pods-exec.{{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [CONNECT]
+        resources: ["pods/exec"]
+  matchConditions:
+    - name: controller-service-account
+      expression: request.userInfo.username == {{ $sa | quote }}
+  validations:
+    - expression: >-
+        object.?container.orValue('') == 'engine'
+          && !object.?tty.orValue(false)
+          && object.?command.orValue([]) in [
+               [{{ $bin | quote }}, 'control-relay', '--socket', {{ $sock | quote }}],
+               [{{ $bin | quote }}, 'control-relay', '--ping', '--socket', {{ $sock | quote }}]]
+      message: >-
+        the CSI controller only execs the control relay
+        (`constellation control-relay [--ping] --socket …`) in an engine container
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: constellation-csi-controller-pods-exec.{{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+spec:
+  policyName: constellation-csi-controller-pods-exec.{{ .Release.Namespace }}
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+{{- end }}
+{{- /*
+Plan 37 §9, the node plugin's half (37-k3a). Its ServiceAccount creates,
+patches and deletes this node's engine pods, from a privileged pod whose
+token is therefore the one worth stealing: unrestricted, `pods` create in
+this privileged namespace is root on every node, and `pods` delete takes
+every mount in the cluster down. This policy holds every pod operation of
+that ServiceAccount to node-owned engine pods (`constellation-engine-*`,
+never a controller's `-controller` one) on the requester's own node —
+CREATE by the new pod's nodeName, UPDATE and DELETE by the existing pod's
+(bound tokens carry `authentication.kubernetes.io/node-name`; a token
+without it is refused) — and no subresource at all (exec, attach,
+eviction, status). A created pod is exactly the shape
+crates/csi/src/engine_pods.rs builds: this chart's image, one engine
+container running `constellation serve` (probes only `constellation
+control-relay`), the one init container's `chown`, uid 65532, no host
+namespace, no runtime class, no service-account token (and the
+token-less `constellation-csi-engine` ServiceAccount), no environment
+from Secrets but the pool's credentials, and the volumes of one unit
+(`constellation.dev/unit`) only: <hostRoot>/{node-identity,sockets,policy}/
+<unit> and a scratch emptyDir, each at its own path, the policy one
+read-only and never in the root init container.
+*/}}
+{{- if .Values.node.podAccessPolicy }}
+{{- $sa := printf "system:serviceaccount:%s:constellation-csi-node" .Release.Namespace }}
+{{- $root := trimSuffix "/" .Values.hostRoot }}
+{{- $bin := "/usr/local/bin/constellation" }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: constellation-csi-node-pods.{{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [CREATE, UPDATE, DELETE, CONNECT]
+        resources: ["pods", "pods/*"]
+  matchConditions:
+    - name: node-service-account
+      expression: request.userInfo.username == {{ $sa | quote }}
+  variables:
+    - name: target
+      expression: >-
+        request.operation == 'CREATE' && request.?subResource.orValue('') == ''
+          ? object.metadata.name : request.name
+    - name: creating
+      expression: request.operation == 'CREATE' && request.?subResource.orValue('') == ''
+    - name: requesterNode
+      expression: >-
+        request.userInfo.?extra[?'authentication.kubernetes.io/node-name'].orValue([])
+    - name: podNode
+      expression: >-
+        variables.creating
+          ? object.spec.?nodeName.orValue('')
+          : (oldObject == null ? '' : oldObject.spec.?nodeName.orValue(''))
+    - name: unit
+      expression: >-
+        object.metadata.?labels[?'constellation.dev/unit'].orValue('')
+    - name: allContainers
+      # As the controller's half: the conditional is what makes the two
+      # container lists one type for `+`.
+      expression: >-
+        object.spec.containers
+          + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+    - name: execOk
+      # A probe's exec command, if any, is `constellation control-relay …`.
+      expression: >-
+        [object.spec.containers[0].?startupProbe, object.spec.containers[0].?readinessProbe,
+         object.spec.containers[0].?livenessProbe].all(p,
+          !p.hasValue() || !has(p.value().exec)
+          || (size(p.value().exec.command) >= 2
+              && p.value().exec.command[0] == {{ $bin | quote }}
+              && p.value().exec.command[1] == 'control-relay'))
+  validations:
+    - expression: request.operation != 'CONNECT' && request.?subResource.orValue('') == ''
+      message: the CSI node plugin never execs, attaches, evicts or touches a pod subresource
+    - expression: >-
+        variables.target.matches('^constellation-engine-[a-z0-9.-]+$')
+          && !variables.target.endsWith('-controller')
+      messageExpression: >-
+        'the CSI node plugin may only touch its own engine pods
+        (constellation-engine-<unit>-<node>), not ' + variables.target
+    - expression: >-
+        size(variables.requesterNode) == 1 && variables.podNode == variables.requesterNode[0]
+      messageExpression: >-
+        'a node plugin may only create, change or delete engine pods on its own node ('
+        + (size(variables.requesterNode) == 1 ? variables.requesterNode[0]
+           : 'its token names no node') + '), not on ' + variables.podNode
+    - expression: >-
+        !variables.creating || (
+          has(object.metadata.labels)
+          && object.metadata.labels[?'app.kubernetes.io/component'].orValue('') == 'engine'
+          && object.metadata.labels[?'constellation.dev/owner'].orValue('') == 'node'
+          && variables.unit.matches('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+          && !variables.unit.endsWith('-controller')
+          && variables.target.startsWith('constellation-engine-' + variables.unit + '-'))
+      message: >-
+        an engine pod carries the engine/node labels and is named after its
+        unit (constellation.dev/unit)
+    - expression: >-
+        !variables.creating || (
+          !object.spec.?hostNetwork.orValue(false)
+          && !object.spec.?hostPID.orValue(false)
+          && !object.spec.?hostIPC.orValue(false)
+          && !has(object.spec.ephemeralContainers)
+          && !has(object.spec.runtimeClassName)
+          && object.spec.?automountServiceAccountToken.orValue(true) == false
+          && object.spec.?serviceAccountName.orValue('') == 'constellation-csi-engine'
+          && object.spec.?serviceAccount.orValue('constellation-csi-engine') == 'constellation-csi-engine'
+          && object.spec.?securityContext.?runAsNonRoot.orValue(false)
+          && object.spec.?securityContext.?runAsUser.orValue(0) == 65532)
+      message: >-
+        an engine pod uses no host namespace, no runtime class and no
+        service-account token, runs as the constellation-csi-engine
+        ServiceAccount and as uid 65532
+    - expression: >-
+        !variables.creating || variables.allContainers.all(c,
+          c.image == {{ include "csi.image" . | quote }}
+          && !c.?securityContext.?privileged.orValue(false)
+          && c.?securityContext.?allowPrivilegeEscalation.orValue(true) == false
+          && c.?securityContext.?capabilities.?add.orValue([]).all(a, a == 'CHOWN')
+          && !has(c.lifecycle) && !has(c.envFrom)
+          && c.?env.orValue([]).all(e, !has(e.valueFrom)
+               || e.valueFrom.?secretKeyRef.?name.orValue('')
+                  == 'constellation-engine-' + variables.unit + '-controller-credentials')
+          && c.?volumeMounts.orValue([]).all(m,
+               !has(m.subPath) && !has(m.subPathExpr)
+               && m.?mountPropagation.orValue('None') == 'None'
+               && ((m.name == 'node-identity' && m.mountPath == '/var/lib/constellation/state')
+                   || (m.name == 'sockets' && m.mountPath == '/run/constellation-csi')
+                   || (m.name == 'scratch' && m.mountPath == '/tmp')
+                   || (m.name == 'policy' && m.mountPath == '/etc/constellation-csi/policy'
+                       && m.?readOnly.orValue(false)))))
+      message: >-
+        engine pod containers run this chart's image, unprivileged, without
+        privilege escalation or lifecycle hooks, adding no capability but
+        CHOWN, reading only the pool's credentials Secret, and mount only
+        the unit's volumes at their own paths (the policy read-only)
+    - expression: >-
+        !variables.creating || (
+          size(object.spec.containers) == 1
+          && object.spec.containers.all(c,
+               c.?command.orValue([]) == [{{ $bin | quote }}]
+               && size(c.?args.orValue([])) > 0 && c.args[0] == 'serve'
+               && c.?securityContext.?runAsUser.orValue(65532) == 65532
+               && !c.?securityContext.?capabilities.?add.hasValue())
+          && variables.execOk)
+      message: >-
+        an engine pod has one container, running `constellation serve` as
+        uid 65532 with no added capability, its probes `constellation control-relay`
+    - expression: >-
+        !variables.creating || object.spec.?initContainers.orValue([]).all(c,
+          c.?command.orValue([]) == ['chown', '65532:65532', '/var/lib/constellation/state', '/run/constellation-csi']
+          && !has(c.args)
+          && c.?volumeMounts.orValue([]).all(m, m.name != 'policy'))
+      message: >-
+        an engine pod's init container only chowns its state and sockets
+        directories, and never sees the policy directory
+    - expression: >-
+        !variables.creating || object.spec.?volumes.orValue([]).all(v,
+          (v.name == 'scratch' && has(v.emptyDir))
+          || (v.name in ['node-identity', 'sockets', 'policy'] && has(v.hostPath)
+              && v.hostPath.path == {{ $root | quote }} + '/' + v.name + '/' + variables.unit))
+      message: >-
+        an engine pod's volumes are its unit's <hostRoot>/{node-identity,
+        sockets,policy}/<unit> directories and a scratch emptyDir
+    - expression: >-
+        request.operation != 'UPDATE' || object.spec == oldObject.spec
+      message: the CSI node plugin may annotate its engine pods, never change their spec
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: constellation-csi-node-pods.{{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+spec:
+  policyName: constellation-csi-node-pods.{{ .Release.Namespace }}
   validationActions: [Deny]
   matchResources:
     namespaceSelector:

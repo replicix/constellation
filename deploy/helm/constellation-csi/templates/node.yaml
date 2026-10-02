@@ -1,7 +1,11 @@
 # Node DaemonSet (plan 37 §4, §9): the only privileged workload. It calls
 # mount(2) for the FUSE staging mount, so the kubelet directories carry
-# Bidirectional propagation back out to the host. Runs as uid 0: the
-# control-acl service grant matches uid 0 + the control socket path.
+# Bidirectional propagation back out to the host. It starts this node's
+# engine pods (constellation-engine-<unit>-<node>, §7) and reaches them
+# through their hostPath control sockets under hostRoot; it runs as uid 0,
+# which the service grant it writes into each pod's root-owned
+# <hostRoot>/policy/<unit>/ admits (crates/csi/src/engine_pods.rs,
+# NodeEnginePods). It holds no permission on Secrets.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -41,11 +45,20 @@ spec:
             - --node
             - --node-id=$(NODE_NAME)
             - --endpoint=unix:///csi/csi.sock
-            - --control-socket-root={{ .Values.controlSocketRoot }}
+            - --host-root={{ .Values.hostRoot }}
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
             - {name: RUST_LOG, value: {{ .Values.logLevel | quote }}}
+            - name: CONSTELLATION_CSI_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: CONSTELLATION_CSI_ENGINE_IMAGE, value: {{ include "csi.image" . | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_PULL_POLICY, value: {{ .Values.image.pullPolicy | quote }}}
+            - {name: CONSTELLATION_CSI_OWNER_DAEMONSET, value: constellation-csi-node}
+            - {name: CONSTELLATION_CSI_ENGINE_SERVICE_ACCOUNT, value: constellation-csi-engine}
+            - {name: CONSTELLATION_CSI_ENGINE_RESOURCES, value: {{ .Values.engineProfile.resources | toJson | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_LOG_LEVEL, value: {{ .Values.engineProfile.logLevel | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ .Values.engineProfile.readyTimeout | quote }}}
           securityContext:
             privileged: true
             runAsUser: 0

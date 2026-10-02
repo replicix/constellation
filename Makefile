@@ -140,7 +140,7 @@ csi-image: ## Build the constellation-csi image (static musl; one image for cont
 		--build-arg JOBS="$${CARGO_BUILD_JOBS:-}" \
 		-t $(CSI_IMAGE) .
 
-csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity + Controller groups against constellation-csi on its in-memory backend (plan 37 K1+K2; needs CSI_SANITY_BIN or csi-sanity on PATH)
+csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity + Controller + Node groups against constellation-csi on its in-memory backends (plan 37 K1-K3; needs CSI_SANITY_BIN or csi-sanity on PATH)
 	CONSTELLATION_CSI_BIN=$(abspath $(RELEASE_CSI)) tests/csi/sanity.sh
 
 compose: ## Containerized FUSE suites (floci S3; needs docker)

@@ -2662,11 +2662,52 @@ real store with no spawned tasks.
 
 ## Kubernetes CSI driver (plan 37)
 
-- `make csi-sanity`: csi-sanity's Identity and Controller groups against
-  `constellation-csi --controller --in-memory-backend` (no S3, no cluster).
+- `make csi-sanity`: csi-sanity's Identity, Controller and Node groups
+  against `constellation-csi --controller --in-memory-backend` and `--node
+  --in-memory-backend` (no S3, no cluster, no `mount(2)`: the node's fake
+  engine pods take every volume to exist and its mounts are recorded, not
+  made).
+- `crates/csi/src/node/tests.rs`: the Node service's state machine (stage,
+  publish, an engine-pod crash and the republish restage, a plugin restart
+  from its on-disk records, a lost record adopting the served view, stats,
+  `NodeGetVolumeHealth` on a volume edited behind the driver's back) over
+  `FakeMounter` and `InMemoryNodeEngines`.
 - `crates/cli/tests/serve.rs`: `constellation serve` (the headless engine-pod
   daemon) on the local file backend, driven through `control-relay`'s stdio
-  the way the CSI controller drives an engine pod over its exec relay.
+  the way the CSI controller drives an engine pod over its exec relay; and,
+  as root (skipped loudly otherwise), the `NodeStageVolume` shape against
+  it — `fuse_mount_fd`, `view.mount{PreopenedFd}` naming the staging path,
+  `SIGTERM` deferred while the view is served, `view.unmount` answering
+  (K0's gap 3) and the daemon then exiting. Run it with `sudo` on a dev
+  host: `sudo target/debug/deps/serve-<hash> --test-threads=1`. The
+  frontend's own root test of ending a preopened session is
+  `session::tests::unmounting_a_preopened_session_ends_it_without_unmounting`.
+- `tests/csi/sanity-kind.sh`: csi-sanity's Node group (`CSI_SANITY_FOCUS`)
+  against the real node plugin on kind — real FUSE staging mounts, real
+  node-owned engine pods, a private floci. csi-sanity runs inside a worker's
+  node container, against the plugin's hostPath socket and a controller
+  replica's emptyDir socket on the same worker (through a short symlink:
+  the emptyDir path is longer than a socket address may be). Builds the
+  image unless `CSI_SKIP_BUILD=1`; deletes the cluster unless `CSI_KEEP=1`.
+- `tests/csi/k3-smoke.sh`: the K3 gate on kind. A pool `StorageClass` with
+  provisioner and node-stage secrets; non-root pods (`fsGroup`) write and
+  read through a PV, across two nodes (RWX); a second PV of the pool on the
+  same node still gives one engine pod per (pool, node); the engine pod is
+  killed and kubelet's republish (`requiresRepublish`) restages onto its
+  next incarnation; deleting the pods leaves no FUSE mount and the engine
+  pods annotated idle. It also checks plan 37 §9's node half:
+  - the node ServiceAccount cannot read Secrets;
+  - the node pod-access policy type-checks;
+  - a real bound token of worker 2's plugin cannot delete or annotate
+    worker 1's engine pod, exec into one, or create an engine-shaped pod
+    that runs `sh`, runs on worker 1, runs as root, has a lifecycle hook or
+    mounts another host directory (each against a positive control);
+  - the engine cannot make the plugin write through a symlink it planted
+    (the victim file stays untouched).
+
+  Same knobs as `sanity-kind.sh`. Reusing a kept
+  cluster with a new floci leaves engine state from the old filesystem in
+  `<hostRoot>`: run each lane on a fresh cluster.
 - `tests/csi/k2-smoke.sh`: the K2 gate on kind. Builds the image (`make
   csi-image`; `K2_SKIP_BUILD=1` reuses `CSI_IMAGE`), brings up the cluster
   and the chart (`tests/csi/kind-up.sh`), runs a private floci on the `kind`

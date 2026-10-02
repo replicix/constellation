@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::log_buffer;
 
@@ -104,7 +104,11 @@ pub struct NodeConfig {
     /// the node plugin can reach).
     pub control_socket: Option<PathBuf>,
     /// Keep serving with no view mounted (`constellation serve`): the last
-    /// view going away no longer shuts the node down; a signal does.
+    /// view going away no longer shuts the node down; a signal does. A
+    /// first `SIGTERM` waits until no view is left (plan 37 §7: an engine
+    /// pod ignores `SIGTERM` while it serves a view, so kubelet's grace
+    /// period, not the signal, bounds a pod deletion its node plugin did
+    /// not drain); `SIGINT` and a second `SIGTERM` drain at once.
     pub persistent: bool,
 }
 
@@ -213,6 +217,9 @@ pub struct NodeRuntime {
     control_socket: Option<PathBuf>,
     /// [`NodeConfig::persistent`].
     persistent: bool,
+    /// A persistent node got a signal while it served views: it shuts
+    /// down when the last of them goes ([`NodeConfig::persistent`]).
+    stop_when_empty: AtomicBool,
     /// Set once [`Self::shutdown`] has finished ([`Self::wait_stopped`]).
     stopped: (Mutex<bool>, std::sync::Condvar),
     /// The view a headless node serves its control API from
@@ -279,6 +286,7 @@ impl NodeRuntime {
             control_listener: Mutex::new(control_listener),
             control_socket,
             persistent,
+            stop_when_empty: AtomicBool::new(false),
             stopped: (Mutex::new(false), std::sync::Condvar::new()),
             headless_view: Mutex::new(None),
         });
@@ -302,9 +310,44 @@ impl NodeRuntime {
                         tracing::warn!("failed to install SIGTERM handler");
                         return;
                     };
-                    tokio::select! {
-                        _ = sigint.recv() => tracing::info!("SIGINT received; unmounting FUSE"),
-                        _ = sigterm.recv() => tracing::info!("SIGTERM received; unmounting FUSE"),
+                    // Plan 37 §7: only SIGTERM is deferred, and only on a
+                    // persistent node serving views — they are served for
+                    // somebody else (a CSI node plugin's staging mounts),
+                    // go when it unmounts them, and the node with the last
+                    // one. SIGINT (an interactive Ctrl-C) drains at once,
+                    // and so does a second SIGTERM: unmount, flush, exit.
+                    let mut deferred = false;
+                    loop {
+                        let term = tokio::select! {
+                            _ = sigint.recv() => {
+                                tracing::info!("SIGINT received; unmounting FUSE");
+                                false
+                            }
+                            _ = sigterm.recv() => {
+                                tracing::info!("SIGTERM received; unmounting FUSE");
+                                true
+                            }
+                        };
+                        if !term || !node.persistent || deferred {
+                            break;
+                        }
+                        // Checked again after the flag is set, so a last
+                        // view leaving in between is not missed (its
+                        // thread reads the flag after removing it).
+                        if node.mounts.lock().unwrap().is_empty() {
+                            break;
+                        }
+                        node.stop_when_empty.store(true, Ordering::SeqCst);
+                        let views = node.mounts.lock().unwrap().len();
+                        if views == 0 {
+                            break;
+                        }
+                        deferred = true;
+                        tracing::warn!(
+                            views,
+                            "SIGTERM received while views are mounted: staying up until the last \
+                             one is unmounted, then exiting (a second SIGTERM drains now)"
+                        );
                     }
                     let drain = node.clone();
                     std::thread::spawn(move || {
@@ -348,14 +391,35 @@ impl NodeRuntime {
 
     /// [`Self::add_mount`] on a `/dev/fuse` descriptor someone else mounted
     /// (`view.mount` with `MountSource::PreopenedFd`, plan 31 §6.11): the
-    /// session starts with `FUSE_INIT` on `fd`; the view is known by
-    /// `fd:<n>` in place of a mountpoint.
+    /// session starts with `FUSE_INIT` on `fd`. The view is known by
+    /// `mounted_at` — where the sender says it mounted it (plan 37's
+    /// staging path, which need not exist in this mount namespace) — or
+    /// else by `fd:<n>`. This process never unmounts it: removing the view
+    /// ends the session and closes the connection
+    /// (`SessionControl::unmount` on a foreign mount), and the sender
+    /// unmounts its mount.
     pub fn add_mount_fd(
         self: &Arc<Self>,
         mut view: ViewConfig,
         fd: std::os::fd::OwnedFd,
+        mounted_at: Option<PathBuf>,
     ) -> Result<MountId> {
-        view.mountpoint = PathBuf::from(format!("fd:{}", std::os::fd::AsRawFd::as_raw_fd(&fd)));
+        let name = match mounted_at {
+            Some(path) => path,
+            None => PathBuf::from(format!("fd:{}", std::os::fd::AsRawFd::as_raw_fd(&fd))),
+        };
+        // The name is what `view.unmount` finds the view by: two views
+        // answering to one name would make it unmount the wrong one.
+        if self
+            .mounts
+            .lock()
+            .unwrap()
+            .values()
+            .any(|m| m.mountpoint == name)
+        {
+            bail!("a view is already mounted at {}", name.display());
+        }
+        view.mountpoint = name;
         self.add_mount_from(view, Some(fd))
     }
 
@@ -595,6 +659,17 @@ impl NodeRuntime {
                 // `shutdown` logs its own failure (and records it for the
                 // process's exit status).
                 let _ = node.shutdown();
+            } else if now_empty && node.stop_when_empty.load(Ordering::SeqCst) {
+                // The deferred signal (`NodeConfig::persistent`). The view
+                // went through `view.unmount`, which joins this thread
+                // before it answers: shutting down here would end the
+                // process before that answer is written, so the drain runs
+                // on its own thread, a moment later.
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(500));
+                    tracing::info!("the last view is gone; exiting on the earlier signal");
+                    let _ = node.shutdown();
+                });
             }
         });
         self.threads.lock().unwrap().insert(id, thread);

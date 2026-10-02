@@ -419,7 +419,7 @@ define_methods! {
     /// rides on the request.
     ViewMount { name: "view.mount", role: Admin, mutating: true, stream: None,
         params: ViewMountParams, result: ViewInfo,
-        requires_fd: |p| matches!(p.source, MountSource::PreopenedFd) }
+        requires_fd: |p| matches!(p.source, MountSource::PreopenedFd { .. }) }
     ViewUnmount { name: "view.unmount", role: Admin, mutating: true, stream: None,
         params: ViewUnmountParams, result: Ack }
     /// Mounted views, optionally filtered by labels.
@@ -720,7 +720,10 @@ mod tests {
             confine_links: false,
         };
         let fd_mount = ViewMountParams {
-            source: MountSource::PreopenedFd,
+            source: MountSource::PreopenedFd {
+                mountpoint: None,
+                opts: Default::default(),
+            },
             ..path_mount.clone()
         };
         assert!(!ViewMount::requires_fd(&path_mount));

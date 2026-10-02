@@ -3,6 +3,14 @@
 # No cluster-wide Secret read: the sidecars and kubelet resolve
 # `*-secret-name` and pass the bytes in the request.
 #
+# The node plugin additionally (37-k3a): `pods` patch (its engine pods'
+# view-count annotations, §7) and `daemonsets` get on its own DaemonSet
+# (the engine pods' owner). No Secret permission at all: its engine pods
+# reference the pool's credentials Secret the controller writes (kubelet
+# resolves a pod's own secretKeyRefs through the node authorizer), and the
+# node-stage secret reaches a running engine through fs.unlock. It never
+# execs: it reaches its engine pods through their hostPath sockets.
+#
 # The controller additionally (37-k2b, crates/csi/src/engine_pods.rs):
 # - `pods` patch: labels a controller-owned engine pod with the filesystem
 #   uuid it serves, which is how DeleteVolume/ControllerExpandVolume find it;
@@ -22,8 +30,10 @@
 # `pods/exec` + `pods` create in this (PodSecurity `privileged`) namespace
 # would make this ServiceAccount root-equivalent on every node (exec into
 # the privileged node-plugin pods, or create a privileged pod). The
-# ValidatingAdmissionPolicy in templates/exec-policy.yaml narrows both to
-# controller-owned engine pods; see plan 37 §9.
+# ValidatingAdmissionPolicies in templates/exec-policy.yaml narrow both to
+# controller-owned engine pods of exactly the engine shape, and exec to the
+# control relay's command; see plan 37 §9. Engine pods run as the
+# `constellation-csi-engine` ServiceAccount, which nothing here binds.
 {{- range $role := list "controller" "node" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -35,15 +45,21 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list, watch, create, delete{{ if eq $role "controller" }}, patch{{ end }}]
+    verbs: [get, list, watch, create, delete, patch]
+  {{- if eq $role "node" }}
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    resourceNames: [constellation-csi-node]
+    verbs: [get]
+  {{- end }}
   {{- if eq $role "controller" }}
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, patch]
   - apiGroups: [""]
     resources: [pods/exec]
     # `get`: the exec stream is a WebSocket upgrade of a GET request.
     verbs: [create, get]
-  - apiGroups: [""]
-    resources: [secrets]
-    verbs: [get, create, patch]
   - apiGroups: [apps]
     resources: [deployments]
     resourceNames: [constellation-csi-controller]

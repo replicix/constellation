@@ -33023,3 +33023,48 @@ answers only — no retention or accounting arithmetic in the page.
 | `cargo build --release --workspace` | exit 0 |
 | `bash tests/webui-headless.sh` / `make webui-check` (`CHROME_BIN` = Chromium 124.0.6367.78 Alpine Linux from `zenika/alpine-chrome` in docker, host network: the host has no Chrome) | PASS (14 DOM checks, no JS error, screenshot written) |
 | `target/release/harness run web-ui-smoke web-fleet` | ALL SCENARIOS PASSED (2/2) |
+
+## Plan 37 K3a — Node service: stage, publish, stats (review fix round)
+
+Chunk 37-k3a of [plan 37](wip/37-kubernetes-csi.md) (§15 K3, part 1), after
+its review. The full K3 entry is 37-k3b's to write; this section records
+what the fix round changed and decided.
+
+| Item | State | Where |
+|---|---|---|
+| **Must-fix 1, the symlink privilege escalation.** The node plugin (root) used to write the engine's control grant into `sockets/<unit>/`, a directory the unprivileged engine owns. An engine could plant a symlink there and make the plugin overwrite any host file. The grant now lives in `<hostRoot>/policy/<unit>/`, which is root-owned and mounted read-only into the engine pod at `/etc/constellation-csi/policy`. The writer (`write_private_file`): opens every directory with `openat(O_NOFOLLOW\|O_DIRECTORY)`; refuses a directory not owned by its own uid or one that group/other can write; writes a fresh `O_CREAT\|O_EXCL\|O_NOFOLLOW` temporary; fsyncs; `renameat`s within the same directory descriptor; fsyncs the directory. Tests: a unit test with planted symlinks, a symlinked directory and a 0777 directory; the k3-smoke replay of the reviewer's exploit (the victim file stays untouched, the grant is rewritten root-owned) | DONE | `crates/csi/src/engine_pods.rs`, `tests/csi/k3-smoke.sh` |
+| **Must-fix 2.** `HANDOVER_VERSION` 2 → 3 (`MountHandoff::foreign`); 4 after the rebase onto plan 39, which took 3. No `serde(default)`: the `--handover-abi` preflight refuses a mixed upgrade. Test `a_handoff_from_before_foreign_mounts_is_refused` | DONE | `crates/cli/src/handover.rs` |
+| Should-fix 1: the node ServiceAccount has **no** Secret permission (`kubectl auth can-i get/create/patch secrets --as=<node SA>` → `no` on kind). Node engine pods reference the pool's Secret, which only the controller writes; the node-stage secret reaches the running pod through `fs.unlock` | DONE | `templates/rbac.yaml`, `engine_pods.rs` (`EngineRole::secret_name`) |
+| Should-fix 2: the node pod-access policy. (a) CREATE/UPDATE/DELETE are pinned to the token's `authentication.kubernetes.io/node-name`, and a token without one is refused. No subresource is allowed. (b) A created pod is held to the exact engine shape: one container running `constellation serve`, probes only `control-relay`, the init container only `chown`, uid 65532, no lifecycle/envFrom/runtime class/service-account token, `secretKeyRef` only to the pool's Secret, and only the unit's volumes (new label `constellation.dev/unit`) at their own paths, with the policy read-only. (c) k3-smoke negatives use a real bound token of worker 2's plugin, with positive controls | DONE | `templates/exec-policy.yaml`, `tests/csi/k3-smoke.sh` |
+| Should-fix 3: only `SIGTERM` is deferred while views are served. `SIGINT` and a second `SIGTERM` drain now. Root test `sigint_and_a_second_sigterm_are_not_deferred` | DONE | `crates/cli/src/node_runtime.rs`, `crates/cli/tests/serve.rs` |
+| Should-fix 4: `layout: dedicated` CreateVolume works (`fs.create` at `<prefix>/<pv>`, record on `/`, `quota.set{/}`, prefix in the volume context). Expand works. DeleteVolume answers `FAILED_PRECONDITION` until K6b's purge. The lost-pod rebuild knows dedicated PVs. On the node: one engine pod per *filesystem* per node, recorded in plan §15 K3 as a deviation from §4 | DONE (delete: K6b) | `crates/csi/src/controller.rs`, plan 37 |
+| Plan notes: settled decision 12's running-container limitation (and K5 as its fix); §9 `admin` not `operator` (`view.mount` is Admin-only) and the policy directory; RBAC as built; credentials for static-only pools | DONE | plan 37 §3.12, §9, §15 K3/K5 |
+| Nits: a read-write publish onto a read-only bind (or the reverse) → `ALREADY_EXISTS` (mount state carries the per-mount `ro`); `constellation-engine-<unit>-<node>` capped at 253 bytes with a stable BLAKE3 suffix; `fs.unlock` dedup per pod uid **and** engine container id (a container restart counts) | DONE | `crates/csi/src/node/`, `engine_pods.rs` |
+| Nit: the 500 ms wait before a deferred-SIGTERM exit (so the `view.unmount` reply is written first). Not replaced: an explicit signal needs the control server to report a flushed reply. It is benign: a lost reply makes kubelet retry the unstage, which then finds the pod gone and drops the record | OPEN | `node_runtime.rs` |
+
+| Rebase onto main (plan 39): `crates/cli/src/handover.rs` keeps both chunks' handoff fields (39's `handles`/`errors`, this chunk's `foreign`); `HANDOVER_VERSION` = 4, no serde defaults | DONE | `crates/cli/src/handover.rs` |
+| Coordinator should-fix: the controller's pod-access policy mirrors the node half. A created engine pod has exactly the engine shape: the chart image, `command` `[constellation]` + `serve …`, probes only `control-relay`, the init container only `chown`, uid 65532, `automountServiceAccountToken: false`, `serviceAccountName` `constellation-csi-engine`, no `envFrom`/lifecycle/runtime class, `secretKeyRef` only to `<pod>-credentials`, and volumes only the unit's two hostPaths plus scratch. The only subresource allowed is `exec`. `exec`'s command is pinned to the relay by a second policy on `pods/exec` CONNECT, which sees `PodExecOptions`. New ServiceAccount `constellation-csi-engine`: no binding, no token, and both roles' engine pods use it (`CONSTELLATION_CSI_ENGINE_SERVICE_ACCOUNT`). The node policy pins it too. k2-smoke: the type check is clean, the clone of the real engine pod is admitted, and 10 negatives with the controller SA are denied by the policy. k3-smoke: the node negatives gain token, ServiceAccount and `envFrom` cases, and both controller policies' type checks are asserted | DONE | `templates/{exec-policy,serviceaccounts,controller,node,rbac}.yaml`, `tests/csi/k{2,3}-smoke.sh`, plan 37 §9 |
+
+**Wire change, no compatibility:** `MountSource::PreopenedFd` went from the
+bare string `"PreopenedFd"` to the struct
+`{"PreopenedFd": {"mountpoint": …, "opts": {…}}}`. The old form is rejected,
+and no serde alias is added.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p <each package>` | 2092 passed, 0 failed, 41 ignored (csi 79) |
+| root-only, `sudo`: `crates/cli/tests/serve.rs` (3), frontend-fuse `session::tests` (13) | all passed |
+| `bash tests/smoke.sh`; integration.sh's body against a private floci on port 14566 (4566 held by another agent) | SMOKE TEST PASSED, both |
+| `make csi-sanity` | Identity 3 passed; Identity\|Controller\|Node 43 passed, 0 failed |
+| `helm lint --strict deploy/helm/constellation-csi` | 0 failed. The policies type-check on the cluster (`status.typeChecking` empty) |
+| fresh `kind-37-k3a`, `tests/csi/k3-smoke.sh` (image `constellation-csi:k3a-fix1`, musl fast path) | k3-smoke PASSED, all new negatives denied, positive controls admitted |
+| fresh `kind-37-k3a`, `tests/csi/sanity-kind.sh` | 24 Passed, 0 Failed, 1 Pending, 78 Skipped |
+| `target/release/harness run e2e-basic session-handover-idle` | ALL SCENARIOS PASSED |
+| *after the rebase and the controller-policy fix:* `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p constellation-csi -p constellation` | all pass, 0 failed |
+| `helm lint --strict deploy/helm/constellation-csi`; `make csi-sanity` | 0 failed; Identity 3 passed, Identity\|Controller\|Node 43 passed |
+| fresh `kind-37-k3a`, `tests/csi/k2-smoke.sh` (image `constellation-csi:k3a-fix2`, musl fast path) | k2-smoke PASSED, policies type-check, 1 positive control admitted, 12 controller-SA negatives denied |
+| fresh `kind-37-k3a`, `tests/csi/k3-smoke.sh` (same image) | k3-smoke PASSED, 12 node-SA negatives denied |

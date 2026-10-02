@@ -14,12 +14,13 @@
 
 use crate::params::ClassParams;
 use async_trait::async_trait;
+use constellation_control::fd::OwnedFd;
 use constellation_control::proto::types::{
-    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsUnlockParams, HandoffParams,
-    HandoffReport, LeaveParams, MkdirParams, Pong, QuotaStatus, RenameParams, SnapshotCreateParams,
-    SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams, SnapshotListParams,
-    SnapshotListing, ViewInfo, ViewMountParams, ViewStatsParams, ViewStatsReport,
-    ViewUnmountParams, XattrParams, XattrResult,
+    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsListing, FsUnlockParams,
+    HandoffParams, HandoffReport, LeaveParams, MkdirParams, Pong, QuotaStatus, RenameParams,
+    SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams,
+    SnapshotListParams, SnapshotListing, ViewInfo, ViewListParams, ViewListing, ViewMountParams,
+    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use std::collections::BTreeMap;
@@ -51,6 +52,10 @@ pub struct SubtreeQuotaParams {
 pub trait ControlClient: Send + Sync {
     async fn fs_create(&self, params: FsCreateParams) -> Result<FsCreated, ControlError>;
     async fn fs_unlock(&self, params: FsUnlockParams) -> Result<Ack, ControlError>;
+    /// `fs.list`: an engine pod's registry is empty, so its one unnamed
+    /// entry is the filesystem it serves (how the node plugin checks that
+    /// a pod serves the filesystem a `volume_id` names).
+    async fn fs_list(&self) -> Result<FsListing, ControlError>;
 
     async fn browse_mkdir(&self, params: MkdirParams) -> Result<FileStat, ControlError>;
     async fn browse_xattr(&self, params: XattrParams) -> Result<XattrResult, ControlError>;
@@ -91,6 +96,18 @@ pub trait ControlClient: Send + Sync {
     async fn clone_create(&self, params: CloneParams) -> Result<Ack, ControlError>;
 
     async fn view_mount(&self, params: ViewMountParams) -> Result<ViewInfo, ControlError>;
+    /// `view.mount{PreopenedFd}` with the `/dev/fuse` descriptor `fd`
+    /// attached (`SCM_RIGHTS`): the node plugin's `NodeStageVolume`. The
+    /// descriptor is consumed — closed here once sent, whatever the
+    /// answer — so the engine pod ends up its only holder. `NotSupported`
+    /// on a connection that cannot pass descriptors (the controller's
+    /// exec relay).
+    async fn view_mount_fd(
+        &self,
+        params: ViewMountParams,
+        fd: OwnedFd,
+    ) -> Result<ViewInfo, ControlError>;
+    async fn view_list(&self, params: ViewListParams) -> Result<ViewListing, ControlError>;
     async fn view_unmount(&self, params: ViewUnmountParams) -> Result<Ack, ControlError>;
     async fn view_stats(&self, params: ViewStatsParams) -> Result<ViewStatsReport, ControlError>;
 

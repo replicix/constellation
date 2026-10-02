@@ -418,6 +418,11 @@ pub struct FuseHandoff {
     pub init: NegotiatedInit,
     /// Where it is mounted, when known (for unmounting it later).
     pub mountpoint: Option<PathBuf>,
+    /// Somebody else made the mount (a [`MountSource::PreopenedFd`]
+    /// session, and every session resumed from one): `mountpoint` is only
+    /// its name, possibly in another mount namespace, and ending the
+    /// session closes the connection instead of unmounting by path.
+    pub foreign: bool,
 }
 
 impl FuseHandoff {
@@ -536,6 +541,13 @@ struct Shared {
     /// unmounted by path.
     fuser_unmounter: Mutex<Option<fuser::SessionUnmounter>>,
     mountpoint: Mutex<Option<PathBuf>>,
+    /// Somebody else made the mount ([`FuseHandoff::foreign`]): never
+    /// unmounted by path from here.
+    foreign: bool,
+    /// [`SessionControl::unmount`] asked a session it cannot unmount to
+    /// end: the next detach the session thread sees closes the
+    /// connection instead of handing it out or resuming it.
+    ending: std::sync::atomic::AtomicBool,
     gate: Arc<NotifyGate>,
     deferred: Arc<Deferred>,
     /// The detach waiting for the session thread's answer, and whether
@@ -599,8 +611,11 @@ pub fn mount_source<V: Vfs>(
             let observer = fs.observer_slot();
             let mut config = config;
             config.io_uring = false;
+            share_fd_without_a_device(&mut config);
             let session = fuser::Session::from_fd(fs, fd, config.acl, config.clone())?;
-            FuseSession::new(session, deferred, observer, opts, view, config, None, None)
+            FuseSession::new(
+                session, deferred, observer, opts, view, config, None, true, None,
+            )
         }
         MountSource::Path(mountpoint, kernel) => {
             match mount_path(
@@ -647,6 +662,30 @@ fn registration_refused(_: &std::io::Error) -> bool {
     false
 }
 
+/// A session on a descriptor somebody else opened may run where
+/// `/dev/fuse` cannot be opened — plan 37's unprivileged engine pod has no
+/// device at all — and `clone_fd` (one cloned descriptor per worker, which
+/// fuser makes by opening `/dev/fuse` and `FUSE_DEV_IOC_CLONE`) would then
+/// fail the session as it starts. Its workers share the one descriptor
+/// instead, which is what fuser does on every other platform.
+fn share_fd_without_a_device(config: &mut fuser::Config) {
+    if !config.clone_fd {
+        return;
+    }
+    let openable = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .is_ok();
+    if !openable {
+        tracing::info!(
+            "/dev/fuse cannot be opened here: this session's workers share the handed-in \
+             descriptor instead of cloning one each"
+        );
+        config.clone_fd = false;
+    }
+}
+
 /// One attempt at mounting `view` at `mountpoint` with `config`.
 fn mount_path<V: Vfs>(
     view: &Arc<V>,
@@ -677,6 +716,7 @@ fn mount_path<V: Vfs>(
             view.clone(),
             config,
             Some(mountpoint.to_path_buf()),
+            false,
             None,
         );
     }
@@ -702,6 +742,7 @@ fn mount_path<V: Vfs>(
         view.clone(),
         config,
         Some(mountpoint.to_path_buf()),
+        false,
         Some(unmounter),
     )
 }
@@ -747,6 +788,7 @@ impl<V: Vfs> FuseSession<V> {
         vfs: Arc<V>,
         config: fuser::Config,
         mountpoint: Option<PathBuf>,
+        foreign: bool,
         fuser_unmounter: Option<fuser::SessionUnmounter>,
     ) -> std::io::Result<Self> {
         // A ring session is not detachable: the kernel can neither hand
@@ -786,6 +828,8 @@ impl<V: Vfs> FuseSession<V> {
                 detacher: Mutex::new(detacher),
                 fuser_unmounter: Mutex::new(fuser_unmounter),
                 mountpoint: Mutex::new(mountpoint),
+                foreign,
+                ending: std::sync::atomic::AtomicBool::new(false),
                 gate,
                 deferred,
                 pending: Mutex::new(Pending::default()),
@@ -822,6 +866,7 @@ impl<V: Vfs> FuseSession<V> {
             "a resumed session's options must be handover-capable"
         );
         config.io_uring = false;
+        share_fd_without_a_device(&mut config);
         let fs = FuseFs::new(view.clone(), caps, opts.tuning);
         let deferred = fs.deferred().clone();
         let observer = fs.observer_slot();
@@ -840,6 +885,7 @@ impl<V: Vfs> FuseSession<V> {
             view,
             config,
             handoff.mountpoint,
+            handoff.foreign,
             None,
         )?;
         if let Some(sink) = sink {
@@ -931,6 +977,9 @@ impl<V: Vfs> FuseSession<V> {
             // path whatever happens.
             shared.fuser_unmounter.lock().unwrap().take();
             let reply = shared.pending.lock().unwrap().reply.take();
+            if shared.ending.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(end_detached(detached, &shared, &*vfs, reply));
+            }
             let verdict = if shared.deferred.count() > 0 {
                 Err(refused(
                     Code::Busy,
@@ -981,6 +1030,44 @@ impl<V: Vfs> FuseSession<V> {
     }
 }
 
+/// [`SessionControl::end`]'s second half, on the session thread: the
+/// stopped session's deferred reads drained (bounded) and the view's
+/// pending writes published, both best effort — nothing is resumed from
+/// here, so a failure is logged, not refused — then the connection
+/// closed. A detach that was waiting is told the session ended.
+fn end_detached<V: Vfs>(
+    detached: fuser::DetachedSession<FuseFs<V>>,
+    shared: &Shared,
+    vfs: &V,
+    reply: Option<DetachReply>,
+) -> SessionExit {
+    if let Some(reply) = reply {
+        let _ = reply.send(Err(refused(
+            Code::NotConnected,
+            "the session was ended during the detach",
+        )));
+    }
+    if !drain_reads(&shared.deferred, read_drain_wait()) {
+        tracing::warn!(
+            reads = shared.deferred.bounded(),
+            "ending the session with deferred reads unanswered"
+        );
+    }
+    if let Err(e) = sync_view(vfs) {
+        tracing::warn!(reason = %e, "ending the session: publishing pending writes failed");
+    }
+    // Every descriptor of the connection goes: the notifier's (the
+    // gate's), then the session's own. The last one closing is what
+    // aborts the connection in the kernel.
+    shared.gate.retire(notify_wait());
+    let fuser::DetachedSession { filesystem, fd, .. } = detached;
+    drop(fd);
+    drop(filesystem);
+    let mountpoint = shared.mountpoint.lock().unwrap().clone();
+    tracing::info!(?mountpoint, "FUSE session ended; its connection is closed");
+    SessionExit::Unmounted
+}
+
 /// The whole-view barrier a detach ends with: every pending write of the
 /// view published (`Vfs::sync_view`).
 fn sync_view<V: Vfs>(vfs: &V) -> Result<(), DetachError> {
@@ -998,16 +1085,64 @@ pub struct SessionControl {
 impl SessionControl {
     /// Unmount (the session's thread then returns
     /// [`SessionExit::Unmounted`]).
+    ///
+    /// A mount this process made is unmounted. One somebody else made (a
+    /// [`MountSource::PreopenedFd`] session: plan 37's CSI node plugin
+    /// mounts in its own mount namespace, which this unprivileged process
+    /// can neither see nor unmount in) is **ended** instead ([`Self::end`]):
+    /// the session stops, publishes the view's pending writes and closes
+    /// the connection; the kernel then answers the mount `ENOTCONN` until
+    /// its maker unmounts it. Either way the session thread returns, so a
+    /// caller that joins it (the daemon's `view.unmount`) never waits for
+    /// an unmount nobody will do.
     pub fn unmount(&self) -> std::io::Result<()> {
         if let Some(unmounter) = self.shared.fuser_unmounter.lock().unwrap().as_mut() {
             return unmounter.unmount();
         }
         let path = self.shared.mountpoint.lock().unwrap().clone();
         match path {
-            Some(path) => unmount_path(&path, false),
+            Some(path) if !self.shared.foreign => unmount_path(&path, false),
+            _ => self.end(),
+        }
+    }
+
+    /// Whether somebody else made this session's mount
+    /// ([`FuseHandoff::foreign`]), so it is ended rather than unmounted.
+    pub fn is_foreign(&self) -> bool {
+        self.shared.foreign
+    }
+
+    /// End the session without unmounting: stop reading (the detach's
+    /// step 4), let the in-flight requests finish, drain the deferred
+    /// reads (bounded) and publish the view's pending writes, then close
+    /// the connection. Requests still queued in the kernel fail when the
+    /// last descriptor closes (`ECONNABORTED`), so this is for a mount
+    /// nobody uses any more — plan 37's `NodeUnstageVolume`, which kubelet
+    /// sends only once every pod publishing the volume is gone.
+    ///
+    /// Returns once the session has been asked to stop; its thread returns
+    /// [`SessionExit::Unmounted`] when it has. A lock wait still deferred
+    /// keeps its reply channel, and with it the connection, open until it
+    /// is answered — unmounting the mount (its maker's job) ends that too.
+    pub fn end(&self) -> std::io::Result<()> {
+        if self.shared.pending.lock().unwrap().ended {
+            return Ok(());
+        }
+        self.shared
+            .ending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match self.shared.detacher.lock().unwrap().as_ref() {
+            Some(detacher) => {
+                detacher.detach();
+                Ok(())
+            }
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "the mountpoint of a preopened FUSE session is unknown",
+                format!(
+                    "a {} session somebody else mounted can be neither unmounted nor ended \
+                     from here",
+                    self.shared.transport
+                ),
             )),
         }
     }
@@ -1096,6 +1231,7 @@ impl SessionControl {
                 fuse_fd,
                 init,
                 mountpoint,
+                foreign: self.shared.foreign,
             },
             view: export(),
         })
@@ -1427,6 +1563,64 @@ mod tests {
         std::fs::write(m.dir.path().join("g"), b"after").unwrap();
         assert_eq!(std::fs::read(m.dir.path().join("g")).unwrap(), b"after");
         end(control, thread);
+    }
+
+    /// Plan 37's K0 gap 3: a session on a descriptor somebody else mounted
+    /// (the CSI node plugin's staging mount, served by an engine pod that
+    /// cannot see or unmount it) is *ended* by `unmount` — its thread
+    /// returns and the connection closes — instead of being refused,
+    /// which left the daemon's `view.unmount` joined forever on a thread
+    /// nothing would end. The mount itself stays until its maker unmounts
+    /// it, answering `ENOTCONN` meanwhile.
+    #[test]
+    fn unmounting_a_preopened_session_ends_it_without_unmounting() {
+        let vfs = MockVfs::reference(caps());
+        if !kernel_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = constellation_platform::MountOpts::new("constellation-preopened-test");
+        kernel.allow_other = true;
+        let fd = match mount_fd(dir.path(), &kernel) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: mount(2) refused here ({e})");
+                return;
+            }
+            Err(e) => panic!("mount: {e}"),
+        };
+        let session = mount_source(
+            Arc::new(vfs.clone()),
+            MountSource::PreopenedFd(fd),
+            &options(),
+            caps(),
+        )
+        .expect("serving the preopened descriptor");
+        let (control, thread) = serve(session);
+        assert!(control.is_foreign());
+        std::fs::write(dir.path().join("f"), b"served").unwrap();
+        assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), b"served");
+
+        control.unmount().expect("a foreign session is ended");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(thread.join());
+        });
+        let exit = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the session thread must return once ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit, SessionExit::Unmounted);
+        // Still mounted (this process never unmounted it), but served by
+        // nobody: the connection was closed.
+        let listed = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(listed.contains("constellation-preopened-test"));
+        let err = std::fs::metadata(dir.path().join("f")).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN), "{err}");
+        // Ending an ended session is a no-op; the maker's unmount works.
+        control.unmount().expect("a second end");
+        unmount_path(dir.path(), false).expect("the maker unmounts");
     }
 
     #[test]

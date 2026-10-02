@@ -5,12 +5,14 @@
 //! `GetPluginInfo` through a tonic client").
 
 use constellation_csi::identity::{IdentityService, DRIVER_NAME};
-use constellation_csi::node::NodeService;
+use constellation_csi::node::state::StateStore;
+use constellation_csi::node::{FakeMounter, NodeService};
 use constellation_csi::proto::csi::v1::identity_client::IdentityClient;
 use constellation_csi::proto::csi::v1::identity_server::IdentityServer;
 use constellation_csi::proto::csi::v1::node_server::NodeServer;
 use constellation_csi::proto::csi::v1::{GetPluginInfoRequest, ProbeRequest};
 use hyper_util::rt::TokioIo;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_stream::wrappers::UnixListenerStream;
@@ -30,6 +32,8 @@ async fn get_plugin_info_and_probe_over_a_real_unix_socket() {
             .add_service(NodeServer::new(NodeService::new(
                 "test-node".to_string(),
                 None,
+                Arc::new(FakeMounter::default()),
+                StateStore::in_memory(),
             )))
             .serve_with_incoming(incoming),
     );

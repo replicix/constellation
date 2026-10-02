@@ -801,6 +801,7 @@ fn serve_main(args: &Args) -> Result<(), Fail> {
                     fuse_fd: fd,
                     init: carried,
                     mountpoint: msg["mountpoint"].as_str().map(PathBuf::from),
+                    foreign: false,
                 };
                 match FuseSession::resume(handoff, vfs, &opts, caps(false), None) {
                     Ok(session) => {

@@ -17,6 +17,10 @@ path = "src/main.rs"
 [dependencies]
 constellation-control.workspace = true
 constellation-types.workspace = true
+# `fuse_mount_fd`, the node plugin's staging mount (plan 37 K3).
+constellation-platform.workspace = true
+libc.workspace = true
+serde.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

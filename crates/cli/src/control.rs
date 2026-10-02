@@ -171,9 +171,13 @@ impl ControlHost for DaemonHost {
 
     fn mount(&self, p: &ViewMountParams, fd: Option<OwnedFd>) -> Result<ViewInfo, ControlError> {
         let node = self.node()?;
-        let (mountpoint, opts) = match &p.source {
-            MountSource::Path { mountpoint, opts } => (Some(mountpoint.clone()), opts.clone()),
-            MountSource::PreopenedFd => (None, Default::default()),
+        let (mountpoint, opts, preopened_at) = match &p.source {
+            MountSource::Path { mountpoint, opts } => {
+                (Some(mountpoint.clone()), opts.clone(), None)
+            }
+            MountSource::PreopenedFd { mountpoint, opts } => {
+                (None, opts.clone(), mountpoint.clone())
+            }
         };
         // `fuse_threads` arrives straight from an API caller and flows into
         // fuser's `n_threads`, one OS thread each: an unbounded value is a
@@ -213,7 +217,7 @@ impl ControlHost for DaemonHost {
         };
         let id = match (mountpoint, fd) {
             (Some(_), _) => node.add_mount(config),
-            (None, Some(fd)) => node.add_mount_fd(config, fd),
+            (None, Some(fd)) => node.add_mount_fd(config, fd, preopened_at),
             (None, None) => {
                 return Err(ControlError::invalid(
                     "view.mount with PreopenedFd needs a file descriptor attached",

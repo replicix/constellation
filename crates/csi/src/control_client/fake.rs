@@ -6,11 +6,13 @@
 
 use super::{ControlClient, Engines, PoolRef, SubtreeQuotaParams};
 use async_trait::async_trait;
+use constellation_control::fd::OwnedFd;
 use constellation_control::proto::types::{
-    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsUnlockParams, HandoffParams,
-    HandoffReport, LeaveParams, MkdirParams, Pong, QuotaStatus, RenameParams, SnapshotCreateParams,
-    SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams, SnapshotListParams,
-    SnapshotListing, SnapshotStatus, ViewInfo, ViewMountParams, ViewStatsParams, ViewStatsReport,
+    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsInfo, FsListing, FsUnlockParams,
+    HandoffParams, HandoffReport, LeaveParams, MkdirParams, MountSource, Pong, QuotaStatus,
+    RenameParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld,
+    SnapshotHoldParams, SnapshotListParams, SnapshotListing, SnapshotStatus, ViewInfo,
+    ViewListParams, ViewListing, ViewMountParams, ViewStatsParams, ViewStatsReport,
     ViewUnmountParams, XattrOp, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
@@ -35,14 +37,12 @@ struct DirEntry {
 
 #[derive(Default)]
 struct Mounted {
-    /// Synthetic: real `PreopenedFd` views carry no mountpoint in
-    /// `ViewMountParams` (K0 gap 3, `docs/plans/v1/wip/37-kubernetes-csi.md`
-    /// "Gaps K0 found"), so this fake mints one at mount time and returns it
-    /// in `ViewInfo.mountpoint` so `view_unmount` has something real to key
-    /// on — a real engine pod's own matching is the open gap K3a inherits,
-    /// not something this fake should silently paper over by matching on
-    /// the wrong field.
+    /// What the view is known by, as the daemon names it: the `Path`
+    /// mountpoint, a `PreopenedFd` view's sender-given mountpoint, or a
+    /// minted `fd:<id>` for one sent without a name.
     mountpoint: String,
+    subtree: String,
+    labels: BTreeMap<String, String>,
 }
 
 /// The filesystem registry `fs.create` writes: shared by every
@@ -87,6 +87,17 @@ pub struct InMemoryControl {
     quota_set_failures: AtomicU32,
     /// Every `quota_set` call, failed or not.
     quota_set_calls: AtomicU64,
+    /// The filesystem this engine serves, as `fs.list` reports it (its
+    /// unnamed entry); `None`: it reports none.
+    own_uuid: Mutex<Option<String>>,
+    /// Stand in for a filesystem whose volumes somebody else created:
+    /// `browse.xattr` on a missing path creates it first (the node
+    /// plugin's in-memory backend, whose controller is another process).
+    any_path: std::sync::atomic::AtomicBool,
+    /// How many descriptors `view.mount{PreopenedFd}` received.
+    fds_received: AtomicU64,
+    /// How many `fs.unlock` calls arrived.
+    unlocks: AtomicU64,
     /// Every subtree usage walk: a `quota_get` of anything but `/` (the
     /// real engine's `recursive_size`, O(entries)).
     usage_walks: AtomicU64,
@@ -115,7 +126,66 @@ impl InMemoryControl {
             quota_set_failures: AtomicU32::new(0),
             quota_set_calls: AtomicU64::new(0),
             usage_walks: AtomicU64::new(0),
+            own_uuid: Mutex::new(None),
+            any_path: std::sync::atomic::AtomicBool::new(false),
+            fds_received: AtomicU64::new(0),
+            unlocks: AtomicU64::new(0),
         }
+    }
+
+    /// An engine serving filesystem `uuid` (what `fs.list` reports).
+    pub fn serving(uuid: &str) -> InMemoryControl {
+        let c = InMemoryControl::default();
+        *c.own_uuid.lock().unwrap() = Some(uuid.to_string());
+        c
+    }
+
+    /// From now on, `browse.xattr` on a missing path creates it (see the
+    /// field).
+    pub fn accept_any_path(&self) {
+        self.any_path.store(true, Ordering::SeqCst);
+    }
+
+    /// Create `path` and its ancestors (a test planting a volume).
+    pub fn plant_dir(&self, path: &str) {
+        let path = normalize(path);
+        let mut state = self.state.lock().unwrap();
+        let mut built = String::new();
+        for part in path.trim_matches('/').split('/').filter(|p| !p.is_empty()) {
+            built.push('/');
+            built.push_str(part);
+            state.tree.entry(built.clone()).or_default();
+        }
+    }
+
+    /// Remove `path` and everything under it (a human's `rm -rf`).
+    pub fn remove_tree(&self, path: &str) {
+        let path = normalize(path);
+        let mut state = self.state.lock().unwrap();
+        for p in InMemoryControl::subtree_of(&state.tree, &path) {
+            state.tree.remove(&p);
+        }
+    }
+
+    /// The mountpoints of the views mounted now.
+    pub fn view_mountpoints(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state.views.values().map(|v| v.mountpoint.clone()).collect()
+    }
+
+    /// Every view goes, as when the engine process serving them dies.
+    pub fn drop_views(&self) {
+        self.state.lock().unwrap().views.clear();
+    }
+
+    /// How many `fs.unlock` calls arrived.
+    pub fn unlocks(&self) -> u64 {
+        self.unlocks.load(Ordering::SeqCst)
+    }
+
+    /// How many descriptors `view.mount{PreopenedFd}` has received.
+    pub fn fds_received(&self) -> u64 {
+        self.fds_received.load(Ordering::SeqCst)
     }
 
     /// From the next `node_ping` on, answer as if the engine pod were
@@ -258,7 +328,34 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn fs_unlock(&self, _params: FsUnlockParams) -> Result<Ack, ControlError> {
+        self.unlocks.fetch_add(1, Ordering::SeqCst);
         Ok(Ack::new("unlocked"))
+    }
+
+    async fn fs_list(&self) -> Result<FsListing, ControlError> {
+        let mut filesystems: Vec<FsInfo> = self
+            .registry
+            .lock()
+            .unwrap()
+            .filesystems
+            .iter()
+            .map(|((bucket, prefix), uuid)| FsInfo {
+                uuid: uuid.clone(),
+                name: Some(format!("{bucket}/{prefix}")),
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                ..Default::default()
+            })
+            .collect();
+        if let Some(uuid) = self.own_uuid.lock().unwrap().clone() {
+            filesystems.push(FsInfo {
+                uuid,
+                name: None,
+                unlocked: true,
+                ..Default::default()
+            });
+        }
+        Ok(FsListing { filesystems })
     }
 
     async fn browse_mkdir(&self, params: MkdirParams) -> Result<FileStat, ControlError> {
@@ -295,6 +392,9 @@ impl ControlClient for InMemoryControl {
 
     async fn browse_xattr(&self, params: XattrParams) -> Result<XattrResult, ControlError> {
         let path = normalize(&params.path);
+        if self.any_path.load(Ordering::SeqCst) {
+            self.plant_dir(&path);
+        }
         let mut state = self.state.lock().unwrap();
         let entry = state
             .tree
@@ -527,11 +627,33 @@ impl ControlClient for InMemoryControl {
 
     async fn view_mount(&self, params: ViewMountParams) -> Result<ViewInfo, ControlError> {
         let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
-        let mountpoint = format!("/fake-mounts/{id}");
-        self.state.lock().unwrap().views.insert(
+        let mountpoint = match &params.source {
+            MountSource::Path { mountpoint, .. } => mountpoint.display().to_string(),
+            MountSource::PreopenedFd {
+                mountpoint: Some(mountpoint),
+                ..
+            } => mountpoint.display().to_string(),
+            MountSource::PreopenedFd {
+                mountpoint: None, ..
+            } => format!("fd:{id}"),
+        };
+        let mut state = self.state.lock().unwrap();
+        // Like the daemon: one view per name.
+        if state.views.values().any(|v| v.mountpoint == mountpoint) {
+            return Err(ControlError::failed(format!(
+                "a view is already mounted at {mountpoint}"
+            )));
+        }
+        let subtree = normalize(&params.subtree);
+        if !state.tree.contains_key(&subtree) {
+            return Err(ControlError::not_found(format!("{subtree} does not exist")));
+        }
+        state.views.insert(
             id,
             Mounted {
                 mountpoint: mountpoint.clone(),
+                subtree,
+                labels: params.labels.clone(),
             },
         );
         Ok(ViewInfo {
@@ -543,6 +665,43 @@ impl ControlClient for InMemoryControl {
             qos: params.qos,
             confine_links: params.confine_links,
         })
+    }
+
+    async fn view_mount_fd(
+        &self,
+        params: ViewMountParams,
+        fd: OwnedFd,
+    ) -> Result<ViewInfo, ControlError> {
+        if !matches!(params.source, MountSource::PreopenedFd { .. }) {
+            return Err(ControlError::invalid(
+                "a descriptor goes with a PreopenedFd source only",
+            ));
+        }
+        self.fds_received.fetch_add(1, Ordering::SeqCst);
+        drop(fd);
+        self.view_mount(params).await
+    }
+
+    async fn view_list(&self, params: ViewListParams) -> Result<ViewListing, ControlError> {
+        let state = self.state.lock().unwrap();
+        let views = state
+            .views
+            .iter()
+            .filter(|(_, v)| {
+                params
+                    .labels
+                    .iter()
+                    .all(|(k, val)| v.labels.get(k) == Some(val))
+            })
+            .map(|(id, v)| ViewInfo {
+                id: *id,
+                subtree: v.subtree.clone(),
+                mountpoint: v.mountpoint.clone(),
+                labels: v.labels.clone(),
+                ..Default::default()
+            })
+            .collect();
+        Ok(ViewListing { views })
     }
 
     async fn view_unmount(&self, params: ViewUnmountParams) -> Result<Ack, ControlError> {
@@ -564,17 +723,21 @@ impl ControlClient for InMemoryControl {
 
     async fn view_stats(&self, params: ViewStatsParams) -> Result<ViewStatsReport, ControlError> {
         let state = self.state.lock().unwrap();
-        let id = params
-            .id
-            .or_else(|| state.views.keys().next().copied())
-            .ok_or_else(|| ControlError::not_found("no mounted view"))?;
-        if !state.views.contains_key(&id) {
-            return Err(ControlError::not_found(format!("no view {id}")));
-        }
+        let named = params.mountpoint.as_ref().map(|m| m.display().to_string());
+        let (id, view) = state
+            .views
+            .iter()
+            .find(|(id, v)| match (&params.id, &named) {
+                (Some(want), _) => *id == want,
+                (None, Some(m)) => &v.mountpoint == m,
+                (None, None) => true,
+            })
+            .ok_or_else(|| ControlError::not_found("no such view"))?;
+        let under = InMemoryControl::subtree_of(&state.tree, &view.subtree);
+        let used: u64 = under.iter().map(|p| state.tree[p].used_bytes).sum();
         let root = &state.tree["/"];
-        let used: u64 = state.tree.values().map(|e| e.used_bytes).sum();
         Ok(ViewStatsReport {
-            id,
+            id: *id,
             block_size: 4096,
             total_bytes: root.quota.unwrap_or(u64::MAX),
             used_bytes: used,
@@ -582,10 +745,10 @@ impl ControlClient for InMemoryControl {
                 .quota
                 .map(|m| m.saturating_sub(used))
                 .unwrap_or(u64::MAX),
-            inodes_total: u64::MAX,
+            inodes_total: 1 << 32,
             inodes_used: state.tree.len() as u64,
             rsize: used,
-            rcount: state.tree.len() as u64,
+            rcount: under.len() as u64,
         })
     }
 
@@ -1084,17 +1247,31 @@ mod tests {
     #[tokio::test]
     async fn view_mount_unmount_and_stats() {
         let c = InMemoryControl::default();
-        let view = c
-            .view_mount(ViewMountParams {
-                subtree: "/volumes/pv1".into(),
-                source: constellation_control::proto::types::MountSource::PreopenedFd,
-                labels: Default::default(),
-                qos: Default::default(),
-                confine_links: false,
-            })
-            .await
-            .unwrap();
+        let params = ViewMountParams {
+            subtree: "/volumes/pv1".into(),
+            source: MountSource::PreopenedFd {
+                mountpoint: Some("/staging/pv1".into()),
+                opts: Default::default(),
+            },
+            labels: Default::default(),
+            qos: Default::default(),
+            confine_links: false,
+        };
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        let missing = c.view_mount_fd(params.clone(), fd).await.unwrap_err();
+        assert_eq!(missing.kind, ErrorKind::NotFound, "no such subtree yet");
+        c.plant_dir("/volumes/pv1");
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        let view = c.view_mount_fd(params.clone(), fd).await.unwrap();
         assert_eq!(view.subtree, "/volumes/pv1");
+        assert_eq!(
+            view.mountpoint, "/staging/pv1",
+            "known by the sender's name"
+        );
+        assert_eq!(c.fds_received(), 2);
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        let twice = c.view_mount_fd(params, fd).await.unwrap_err();
+        assert_eq!(twice.kind, ErrorKind::Failed, "one view per name");
 
         let stats = c
             .view_stats(ViewStatsParams {

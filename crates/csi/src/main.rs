@@ -5,9 +5,13 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use constellation_csi::control_client::{Engines, InMemoryEngines};
 use constellation_csi::controller::{ControllerConfig, ControllerService};
+use constellation_csi::engine_pods::NodeEnginePods;
 use constellation_csi::engine_pods::{EnginePodConfig, EnginePodManager};
 use constellation_csi::identity::IdentityService;
-use constellation_csi::node::NodeService;
+use constellation_csi::node::state::StateStore;
+use constellation_csi::node::{
+    FakeMounter, InMemoryNodeEngines, LinuxMounter, Mounter, NodeEngines, NodeService,
+};
 use constellation_csi::proto::csi::v1::controller_server::ControllerServer;
 use constellation_csi::proto::csi::v1::identity_server::IdentityServer;
 use constellation_csi::proto::csi::v1::node_server::NodeServer;
@@ -37,18 +41,18 @@ struct Cli {
     /// This node's name (`NodeGetInfo.node_id`); required with `--node`.
     #[arg(long)]
     node_id: Option<String>,
-    /// hostPath root for engine-pod control sockets — the fd-passing
-    /// rendezvous between this (privileged) node plugin and the
-    /// unprivileged engine pods it starts (plan 37 §"hostPath layout").
-    /// Recorded for K3's `NodeStageVolume`; unused until then.
+    /// With `--node`: the node-local hostPath root of plan 37 §7's layout
+    /// (`node-identity/<unit>/`, `sockets/<unit>/`), where this privileged
+    /// plugin and the unprivileged engine pods it starts meet, and where
+    /// the plugin keeps its staged-volume records (`volumes/`).
+    #[arg(long, default_value = "/var/lib/constellation-csi")]
+    host_root: PathBuf,
+    /// Back the service with in-process fakes instead of engine pods (and,
+    /// with `--node`, instead of real mounts: the directories are made, the
+    /// mounts only recorded): volumes live only as long as this process.
+    /// For `csi-sanity` (`tests/csi/sanity.sh`) and local testing only —
+    /// never for a real cluster.
     #[arg(long)]
-    #[allow(dead_code)]
-    control_socket_root: Option<PathBuf>,
-    /// Back the Controller service with an in-process, in-memory engine
-    /// fake instead of engine pods: volumes live only as long as this
-    /// process. For `csi-sanity` (`tests/csi/sanity.sh`) and local testing
-    /// only — never for a real cluster. With `--controller` only.
-    #[arg(long, requires = "controller")]
     in_memory_backend: bool,
 }
 
@@ -130,8 +134,47 @@ async fn run(cli: Cli) -> Result<()> {
     } else {
         let node_id = cli.node_id.expect("checked in main()");
         tracing::info!(endpoint = %path.display(), node_id, "constellation-csi starting (node)");
+        let state = StateStore::open(&cli.host_root.join("volumes"))
+            .with_context(|| format!("opening {}/volumes", cli.host_root.display()))?;
+        let (engines, mounter): (Option<Arc<dyn NodeEngines>>, Arc<dyn Mounter>) =
+            if cli.in_memory_backend {
+                tracing::warn!(
+                    "--in-memory-backend: engine pods are in-process fakes and mounts are only \
+                     recorded"
+                );
+                (
+                    Some(Arc::new(InMemoryNodeEngines::accepting_any_path(&node_id))),
+                    Arc::new(FakeMounter::default()),
+                )
+            } else if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+                // In a cluster: this node's own engine pods (plan 37 §7).
+                let mut config = EnginePodConfig::from_env().map_err(anyhow::Error::msg)?;
+                config.host_root = cli.host_root.display().to_string();
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let client = kube::Client::try_default()
+                    .await
+                    .context("connecting to the Kubernetes API")?;
+                tracing::info!(
+                    namespace = %config.namespace,
+                    image = %config.image,
+                    host_root = %config.host_root,
+                    "engine pods: node-owned, reached through their hostPath sockets"
+                );
+                (
+                    Some(Arc::new(
+                        NodeEnginePods::new(client, config, node_id.clone()).await,
+                    )),
+                    Arc::new(LinuxMounter),
+                )
+            } else {
+                tracing::warn!(
+                    "not running in a Kubernetes cluster and no --in-memory-backend: staging \
+                     answers UNAVAILABLE"
+                );
+                (None, Arc::new(LinuxMounter))
+            };
         let identity = IdentityServer::new(IdentityService::node());
-        let node = NodeServer::new(NodeService::new(node_id, None));
+        let node = NodeServer::new(NodeService::new(node_id, engines, mounter, state));
         Server::builder()
             .add_service(identity)
             .add_service(node)

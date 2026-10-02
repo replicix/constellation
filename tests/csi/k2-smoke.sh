@@ -16,8 +16,13 @@
 #   5. `kubectl patch` grows PVC a → the PV, the PVC and the subtree quota
 #      follow;
 #   6. the controller ServiceAccount's pod access is held to its engine
-#      pods by the chart's ValidatingAdmissionPolicy: exec into the engine
-#      pod is allowed, exec into a node-plugin pod and a privileged pod are
+#      pods by the chart's ValidatingAdmissionPolicy (which type-checks):
+#      exec of the relay into the engine pod is allowed, exec of anything
+#      else and into a node-plugin pod is denied; the engine pod's own
+#      shape is admitted (server dry run), a privileged pod and engine
+#      pods running `sh`, with a service-account token, under another
+#      ServiceAccount, with `envFrom`, another Secret, a projected token,
+#      another hostPath, an `sh` init container or a lifecycle hook are
 #      denied;
 #   7. a lost engine pod the controller has no spec for (controller pods
 #      restarted, then the engine pod deleted) is rebuilt from the PV and
@@ -200,6 +205,59 @@ fi
 grep -q 'constellation-csi-controller-pods' <<<"$out" \
     || { echo "pod refused, but not by the policy: $out"; exit 1; }
 echo "   privileged engine-named pod: denied by the policy"
+vap="constellation-csi-controller-pods.$ns"
+warn=$(k get validatingadmissionpolicy "$vap" -o jsonpath='{.status.typeChecking.expressionWarnings}')
+[ -z "$warn" ] || { echo "the controller pod-access policy does not type-check: $warn"; exit 1; }
+refused() { # refused WHAT OUT: OUT is this policy's denial
+    grep -q 'constellation-csi-controller-pods' <<<"$2" \
+        || { echo "$1 failed, but not by the policy: $2"; exit 1; }
+    echo "   denied: $1"
+}
+denied() { # denied WHAT CMD...: the call must fail with this policy's denial
+    local what="$1" out
+    shift
+    if out=$("$@" 2>&1); then echo "allowed, but must not be: $what"; exit 1; fi
+    refused "$what" "$out"
+}
+denied "exec into $pod running sh" \
+    k "${as_ctl[@]}" -n "$ns" exec "$pod" -c engine -- sh -c id
+# The real engine pod's shape, as a new pod of another unit (the policy ties
+# the name, the hostPaths and the credentials Secret to one unit).
+unit=${pod#constellation-engine-}
+unit=${unit%-controller}
+clone() { # clone JQ: $pod's spec as a new pod, edited by JQ
+    k -n "$ns" get pod "$pod" -o json | jq "del(.status, .metadata.uid, .metadata.resourceVersion,
+        .metadata.creationTimestamp, .metadata.managedFields, .metadata.ownerReferences) | $1" \
+        | sed "s/$unit-controller/$unit-x-controller/g"
+}
+clone . | k "${as_ctl[@]}" -n "$ns" create --dry-run=server -f - >/dev/null \
+    || { echo "the controller SA may not create its engine pod's exact shape"; exit 1; }
+echo "   admitted: the engine pod's own shape"
+denied_create() { # denied_create WHAT JQ: the clone, edited by JQ, is refused
+    local out
+    if out=$(clone "$2" | k "${as_ctl[@]}" -n "$ns" create --dry-run=server -f - 2>&1); then
+        echo "allowed, but must not be: $1"
+        exit 1
+    fi
+    refused "$1" "$out"
+}
+denied_create "an engine-shaped pod running sh" '.spec.containers[0].command = ["sh", "-c", "id"]'
+denied_create "an engine pod with automountServiceAccountToken: true" \
+    '.spec.automountServiceAccountToken = true'
+denied_create "an engine pod under another ServiceAccount" \
+    'del(.spec.serviceAccount) | .spec.serviceAccountName = "constellation-csi-controller"'
+denied_create "an engine pod with envFrom" \
+    '.spec.containers[0].envFrom = [{secretRef: {name: "constellation-s3-creds"}}]'
+denied_create "an engine pod reading another Secret" \
+    '.spec.containers[0].env += [{name: "X", valueFrom: {secretKeyRef: {name: "constellation-s3-creds", key: "aws_access_key_id"}}}]'
+denied_create "an engine pod with a projected token volume" \
+    '.spec.volumes += [{name: "tok", projected: {sources: [{serviceAccountToken: {path: "t"}}]}}]'
+denied_create "an engine pod mounting another host directory" \
+    '(.spec.volumes[] | select(.name == "sockets") | .hostPath.path) = "/var/lib/kubelet"'
+denied_create "an engine pod whose init container runs sh" \
+    '.spec.initContainers[0].command = ["sh", "-c", "id"]'
+denied_create "an engine pod with a lifecycle hook" \
+    '.spec.containers[0].lifecycle = {postStart: {exec: {command: ["sh", "-c", "id"]}}}'
 
 echo "== a lost engine pod is rebuilt from its PV and StorageClass"
 k -n "$ns" delete pods -l app.kubernetes.io/component=controller --wait=true >/dev/null

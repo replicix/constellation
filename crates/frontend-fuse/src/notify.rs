@@ -95,6 +95,15 @@ impl NotifyGate {
         true
     }
 
+    /// Close the gate for good, after waiting up to `within` for the
+    /// writes under way, and drop the notifier: an ended session's
+    /// connection must close, and the notifier's channel is one of the
+    /// descriptors holding it open.
+    pub(crate) fn retire(&self, within: Duration) {
+        let _ = self.close_and_wait(within);
+        self.state.lock().unwrap().notifier = None;
+    }
+
     /// Open the gate again, writing through `notifier` from now on when
     /// one is given (a resumed session's channel).
     pub(crate) fn reopen(&self, notifier: Option<Notifier>) {

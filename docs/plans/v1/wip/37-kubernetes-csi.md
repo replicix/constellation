@@ -433,6 +433,17 @@ guessing a number up front.
     other FUSE CSI driver in this space already relies on (§2.2). Static
     `false` would leave a crashed engine pod's PVs stuck `ENOTCONN` forever
     with no recovery signal.
+    *Limitation (37-k3a, measured on kind):* the restage repairs the
+    staging mount and the bind *at the target path*. A container that was
+    already running when the engine crashed keeps its own mount of the
+    target. That mount was propagated into the container's mount namespace
+    when it started, so it stays a dead `ENOTCONN` mount until that
+    container restarts. A new mount at the target reaches only containers
+    started after it. So "recoverable without a human" holds for the volume
+    and for new pods, not for running ones: their liveness probes or
+    restart policy must do it. K5's handover removes the limitation for
+    planned replacements, because the connection never dies there. A crash
+    still has it.
 13. **`seLinuxMount: false` at K0–K6, revisited at K7.** SELinux
     per-volume mount context (`-o context=`) is a FUSE mount option
     (`fuse_mount_fd`'s `opts`) applied once at `NodeStageVolume` time for
@@ -1310,7 +1321,16 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   label = "constellation-csi node plugin"
   ```
 
-  `operator` (not `admin`) is sufficient for every method in
+  *(37-k3a correction: the role is `admin`, not `operator`. `view.mount` and
+  `view.unmount` are `Admin`-only in the method table
+  (`crates/control/src/methods.rs`), so `operator` cannot stage a volume.
+  The grant is also narrower than the glob above. Each node-owned engine
+  pod gets its own one-socket grant for uid 0, which the node plugin writes
+  into `<hostRoot>/policy/<unit>/control-allow.toml`. That directory is
+  root-owned and mounted read-only into the pod. The grant is never written
+  into `sockets/<unit>/`, which the unprivileged engine owns: a privileged
+  writer there could be steered through a symlink the engine planted.)*
+  The original reasoning: `operator` would be sufficient for every method in
   §"Control-protocol methods" — none of them are roster/security-admin
   operations reserved to `admin` (allowlist edits, audit-log reads). Every
   engine pod's `control.sock` carries this exact grant; the controller's own
@@ -1332,6 +1352,16 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   (get, for the `pv`/`pvc`/`namespace` labels in §"Observability"), and
   `secrets` (get, scoped by the standard CSI secret-reference convention, not
   a blanket cluster-wide secrets read).
+  *As built (37-k2b, 37-k3a):* only the **controller** ServiceAccount has
+  `secrets` get/create/patch, in the driver namespace. It writes the pool's
+  credentials Secret that engine pods reference. The **node** ServiceAccount
+  has no Secret permission. That is checked on kind with
+  `kubectl auth can-i get secrets --as=<node SA>` → `no`. A ValidatingAdmissionPolicy
+  holds the node ServiceAccount's pod access to engine pods on the
+  requester's own node: CREATE, UPDATE and DELETE are checked against the
+  token's `authentication.kubernetes.io/node-name`, and no subresource is
+  allowed. Created pods are held to exactly the shape the plugin builds
+  (`deploy/helm/constellation-csi/templates/exec-policy.yaml`).
 - **PodSecurity.** The node plugin's namespace runs at PodSecurity
   `privileged` (it must — `fuse_mount_fd`, bind mounts and `Bidirectional`
   mount propagation are all denied under `restricted`/`baseline`); engine
@@ -1364,7 +1394,25 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   container, no privilege escalation, no added capability but the init
   container's `CHOWN`, a non-root engine container, hostPaths only under
   `<hostRoot>/{node-identity,sockets}/<unit>-controller`), and every update
-  to metadata only. Verified on kind by `tests/csi/k2-smoke.sh`. With the
+  to metadata only. Verified on kind by `tests/csi/k2-smoke.sh`.
+  *Tightened in 37-k3a's review:* the controller's half now mirrors the
+  node's. A created pod has exactly the engine shape: one container
+  running `constellation serve`, probes only `control-relay`, the init
+  container only `chown`, uid 65532, no runtime class, lifecycle hook or
+  `envFrom`, `automountServiceAccountToken: false`, `secretKeyRef` only to
+  the pool's Secret (`<pod>-credentials`), and volumes only the unit's two
+  hostPaths and the scratch emptyDir, at their own paths. Engine pods of
+  both roles run as the chart's `constellation-csi-engine` ServiceAccount,
+  which has no RoleBinding and mounts no token; both policies admit only
+  that name. The only subresource is `exec`. A second policy,
+  `constellation-csi-controller-pods-exec`, matches `pods/exec` CONNECT,
+  where admission's `object` is the request's `PodExecOptions`. It pins the
+  command to the relay's own (`constellation control-relay [--ping]
+  --socket <sock>`) in the `engine` container with no tty. This has to be a
+  separate policy: one that also matches `pods` types `object` as a Pod,
+  and `command` then fails the type check. k2-smoke and k3-smoke assert
+  `status.typeChecking` has no warnings and run the negatives (`sh`, a
+  token, another ServiceAccount, `envFrom`, …) with a positive control. With the
   policy off (clusters < 1.30) the ServiceAccount must be treated as
   node-root. Moving engine pods to their own `restricted`-capable namespace
   would remove the init container's need for `privileged` too; that is
@@ -1931,6 +1979,35 @@ can honestly recommend a `shards` value.
   `requiresRepublish: true` wired per settled decision 12),
   `NodeGetVolumeStats` (including the `VolumeCondition` check, §"Semantic
   notes"). Dedicated layout, if deferred from K2, lands here.
+- **37-k3a notes (deviations and limitations).**
+  - *Dedicated layout:* the controller side landed. `CreateVolume` runs
+    `fs.create` at `<class prefix>/<pv>` through that filesystem's own
+    controller-owned engine pod, writes the record on its root and a
+    filesystem-wide cap with `quota.set{/}`, and puts the prefix in the
+    volume context. `ControllerExpandVolume` works. `DeleteVolume` of a
+    dedicated volume answers `FAILED_PRECONDITION` until K6b's purge
+    primitive exists.
+  - *One engine pod per filesystem, per node:* the node side brings up one
+    engine pod per **filesystem** per node. For a dedicated class that
+    means one per PV per node, not §4's one per (StorageClass, node). An
+    engine daemon serves exactly one filesystem (`serve --s3 <one
+    location>`, and a view names no filesystem), so sharing a pod across a
+    class's filesystems needs a multi-filesystem engine. That is a plan 31
+    change, not a CSI one. Recorded here for K7, where it either lands or
+    §4 is amended.
+  - *Credentials:* the node ServiceAccount has no permission on Secrets
+    (§9, 37-k3a review). A node-owned engine pod references the pool's
+    credentials Secret, which only the controller writes, on
+    `CreateVolume`. kubelet resolves the reference through the node
+    authorizer. The node-stage secret reaches the running daemon through
+    `fs.unlock`.
+    - An engine opens S3 at start, so "start locked and wait for
+      `fs.unlock`" would need a daemon that serves the control socket
+      before it has a filesystem. That is a restructuring of
+      `constellation serve` beyond this chunk.
+    - A pool that only static PVs use has no such Secret. Its node pods
+      run on ambient credentials (IRSA, Pod Identity) or not at all. K6a
+      revisits this.
 - `kind-e2e` CI job stood up (§"CI"), including the `extraMounts` +
   privileged node-plugin config validated in K0.
 - **Gate:** CONVENTIONS gates; `csi-sanity`'s Node test group passes against
@@ -1959,6 +2036,11 @@ can honestly recommend a `shards` value.
 
 ### K5 — FUSE session handover in production
 
+- *(From 37-k3a, settled decision 12's limitation.)* A container that was
+  running when its engine pod crashed keeps a dead (`ENOTCONN`) mount until
+  it restarts. The republish restage reaches only new mounts. K5's handover
+  is what removes this for every planned replacement, and the
+  `engine-pod-handoff-under-load` gate below is where that is shown.
 - §"FUSE session handover protocol" implemented against real engine pods
   (not K0's throwaway probe): `node.handoff` control method, the node
   plugin's rollout orchestration for engine-pod image upgrades, full
@@ -2435,7 +2517,15 @@ K2").
    kernel mount by path. **K3a** either carries the mountpoint in `ViewMountParams` for
    a preopened fd, or makes `view.unmount` end the session without unmounting; either
    way the call must answer. (The node plugin unmounting by path is the right division
-   of labour regardless — it made the mount.)
+   of labour regardless — it made the mount.) **Closed by 37-k3a, both ways:**
+   `MountSource::PreopenedFd{mountpoint, opts}` names the view by the sender's
+   mountpoint (and carries `allow_other`, which a mount other uids use needs), and
+   `SessionControl::unmount` on a mount this process did not make *ends* the session —
+   stops reading, publishes pending writes, closes every descriptor of the connection —
+   instead of refusing; the node plugin unmounts the staging path itself. Tests:
+   `crates/frontend-fuse` `unmounting_a_preopened_session_ends_it_without_unmounting`,
+   `crates/cli/tests/serve.rs` `a_preopened_view_is_unmounted_by_its_name_without_hanging`
+   (both root-only).
 4. **A detached descriptor is left `O_NONBLOCK`** (question 1). Harmless for
    `FuseSession::resume`, a livelock for anything else that reads it. **K5** restores
    the blocking mode in the resume path, or `SessionControl::detach` does before

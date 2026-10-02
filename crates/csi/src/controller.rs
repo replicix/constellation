@@ -28,6 +28,15 @@
 //! else's (a human's `mkdir` + copy), and `ALREADY_EXISTS` says so rather
 //! than handing its contents to a new PV.
 //!
+//! **`layout: dedicated`** (§2.3) is the same record on a filesystem of
+//! its own: `CreateVolume` makes `<class prefix>/<name>` with `fs.create`
+//! through that filesystem's own controller-owned engine pod, writes the
+//! record on its root and the quota as its filesystem-wide cap
+//! (`quota.set{/}`), and puts the filesystem's prefix in the volume
+//! context. `DeleteVolume` of one is `FAILED_PRECONDITION` until plan 37
+//! K6b's purge primitive exists: dropping a whole filesystem is not a
+//! rename into `/.trash`.
+//!
 //! **`DeleteVolume` checks existence first** (`browse.xattr list` →
 //! `NotFound` → `OK`), before releasing the quota: a retried delete of a
 //! volume already in `/.trash` must succeed whatever error kind the engine
@@ -89,9 +98,9 @@ use tonic::{Request, Response, Status};
 
 /// The volume record's xattr namespace (settled decision 7).
 pub const XATTR_PREFIX: &str = "user.constellation.csi.";
-const X_PV: &str = "user.constellation.csi.pv";
-const X_PVC: &str = "user.constellation.csi.pvc";
-const X_NAMESPACE: &str = "user.constellation.csi.namespace";
+pub(crate) const X_PV: &str = "user.constellation.csi.pv";
+pub(crate) const X_PVC: &str = "user.constellation.csi.pvc";
+pub(crate) const X_NAMESPACE: &str = "user.constellation.csi.namespace";
 const X_CAPACITY: &str = "user.constellation.csi.capacity";
 const X_SOURCE: &str = "user.constellation.csi.source";
 /// Written last: the record's commit mark (module docs).
@@ -170,15 +179,15 @@ impl ControllerConfig {
 /// operation in flight, released when the [`VolumeLock`] drops — including
 /// when tonic drops the RPC's future because its caller went away.
 #[derive(Default)]
-struct VolumeLocks(Mutex<HashSet<String>>);
+pub(crate) struct VolumeLocks(Mutex<HashSet<String>>);
 
-struct VolumeLock<'a> {
+pub(crate) struct VolumeLock<'a> {
     locks: &'a VolumeLocks,
     key: String,
 }
 
 impl VolumeLocks {
-    fn try_lock(&self, key: String) -> Result<VolumeLock<'_>, Status> {
+    pub(crate) fn try_lock(&self, key: String) -> Result<VolumeLock<'_>, Status> {
         if !self.0.lock().unwrap().insert(key.clone()) {
             return Err(Status::aborted(format!(
                 "an operation with the given Volume ID {key} is already in progress"
@@ -314,7 +323,6 @@ impl ControllerService {
             name: name.to_string(),
         };
         let subtree = id.subtree();
-        let source = String::new();
 
         fs.browse_mkdir(MkdirParams {
             path: VOLUMES_DIR.to_string(),
@@ -339,11 +347,102 @@ impl ControllerService {
             Err(e) => return Err(status("browse.mkdir", e)),
         };
 
+        self.commit_volume(
+            fs.as_ref(),
+            &id,
+            req,
+            capacity,
+            existing,
+            fresh,
+            &req.parameters,
+        )
+        .await
+    }
+
+    /// `layout: dedicated` (§2.3): the volume is a whole filesystem of its
+    /// own at `<class prefix>/<name>`, created through its own
+    /// controller-owned engine pod (`fs.create`, idempotent by location),
+    /// its record on the root and its quota the filesystem-wide cap
+    /// (`quota.set{/}`). The volume context names that filesystem's
+    /// prefix, so `NodeStageVolume` brings up an engine pod for it.
+    async fn create_dedicated_volume(
+        &self,
+        engines: &Arc<dyn Engines>,
+        class: &ClassParams,
+        req: &CreateVolumeRequest,
+        capacity: u64,
+    ) -> Result<Volume, Status> {
+        let prefix = class.dedicated_prefix(&req.name);
+        let gate = self.pool_gate(&class.bucket, &prefix);
+        let _permit = gate
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::internal("create gate closed"))?;
+        let own = ClassParams {
+            prefix: prefix.clone(),
+            ..class.clone()
+        };
+        let fs_ref = PoolRef {
+            class: own.clone(),
+            shard: 0,
+            secrets: req
+                .secrets
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        let registry = engines
+            .pool(&fs_ref)
+            .await
+            .map_err(|e| status("reaching the volume's engine", e))?;
+        let created = registry
+            .fs_create(own.fs_create(prefix.clone()))
+            .await
+            .map_err(|e| match e.kind {
+                ErrorKind::Conflict | ErrorKind::Invalid => Status::invalid_argument(format!(
+                    "the StorageClass parameters do not match the existing filesystem at \
+                     s3://{}/{prefix}: {}",
+                    class.bucket, e.message
+                )),
+                _ => status("fs.create", e),
+            })?;
+        let fs = engines
+            .filesystem(&created.uuid)
+            .await
+            .map_err(|e| status("reaching the volume's engine", e))?;
+        let id = VolumeId::Dedicated {
+            fs_uuid: created.uuid.clone(),
+        };
+        let existing = read_record(fs.as_ref(), &id.subtree()).await?;
+        let mut context = req.parameters.clone();
+        context.insert("prefix".into(), prefix);
+        self.commit_volume(fs.as_ref(), &id, req, capacity, existing, false, &context)
+            .await
+    }
+
+    /// The common tail of both layouts' `CreateVolume` (module docs): the
+    /// volume's directory (`id.subtree()`) exists in `fs` and carries
+    /// `existing` as its record (`fresh`: this call just made it). Adopt,
+    /// compare or complete the record, then the quota, then the mark.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_volume(
+        &self,
+        fs: &dyn ControlClient,
+        id: &VolumeId,
+        req: &CreateVolumeRequest,
+        capacity: u64,
+        existing: BTreeMap<String, String>,
+        fresh: bool,
+        context: &HashMap<String, String>,
+    ) -> Result<Volume, Status> {
+        let name = req.name.as_str();
+        let subtree = id.subtree();
+        let source = String::new();
+        let fs_uuid = id.fs_uuid();
         match existing.get(X_PV) {
             Some(pv) if pv != name => {
                 return Err(Status::already_exists(format!(
-                    "{subtree} in pool {} belongs to volume {pv:?}, not {name:?}",
-                    pool.uuid
+                    "{subtree} in filesystem {fs_uuid} belongs to volume {pv:?}, not {name:?}"
                 )));
             }
             Some(_) => {}
@@ -358,9 +457,9 @@ impl ControllerService {
                     .used_bytes;
                 if used > 0 {
                     return Err(Status::already_exists(format!(
-                        "{subtree} in pool {} already exists, holds {used} bytes and carries no \
-                         volume record: not adopting a directory this driver did not create",
-                        pool.uuid
+                        "{subtree} in filesystem {fs_uuid} already exists, holds {used} bytes \
+                         and carries no volume record: not adopting a directory this driver \
+                         did not create"
                     )));
                 }
             }
@@ -384,7 +483,7 @@ impl ControllerService {
                      requested range"
                 )));
             }
-            return Ok(volume(&id, stored));
+            return Ok(volume(id, stored, context));
         }
 
         // A new directory, or an earlier attempt that never reached its
@@ -402,14 +501,14 @@ impl ControllerService {
             (X_SOURCE, source),
         ];
         for (key, value) in record {
-            set_xattr(fs.as_ref(), &subtree, key, &value).await?;
+            set_xattr(fs, &subtree, key, &value).await?;
         }
-        self.set_quota(fs.as_ref(), &subtree, quota_of(capacity))
+        self.set_quota(fs, &subtree, quota_of(capacity))
             .await
             .map_err(|e| quota_status(&subtree, e))?;
-        set_xattr(fs.as_ref(), &subtree, X_CREATED, &unix_ms().to_string()).await?;
-        tracing::info!(volume_id = %id, capacity, "created pool volume");
-        Ok(volume(&id, capacity))
+        set_xattr(fs, &subtree, X_CREATED, &unix_ms().to_string()).await?;
+        tracing::info!(volume_id = %id, capacity, "created volume");
+        Ok(volume(id, capacity, context))
     }
 }
 
@@ -445,11 +544,11 @@ fn quota_of(capacity: u64) -> Option<u64> {
     (capacity > 0).then_some(capacity)
 }
 
-fn volume(id: &VolumeId, capacity: u64) -> Volume {
+fn volume(id: &VolumeId, capacity: u64, parameters: &HashMap<String, String>) -> Volume {
     Volume {
         capacity_bytes: i64::try_from(capacity).unwrap_or(i64::MAX),
         volume_id: id.to_string(),
-        volume_context: HashMap::new(),
+        volume_context: crate::params::volume_context(parameters),
         content_source: None,
         accessible_topology: Vec::new(),
     }
@@ -516,7 +615,7 @@ fn check_capabilities(caps: &[VolumeCapability]) -> Result<(), String> {
 /// `ControlError` → gRPC status for a failed step `what`. Callers map the
 /// kinds that mean something specific at their step (a `Conflict` from
 /// `fs.create`, a `NotFound` that means "already deleted") themselves.
-fn status(what: &str, e: ControlError) -> Status {
+pub(crate) fn status(what: &str, e: ControlError) -> Status {
     let message = format!("{what}: {}", e.message);
     if e.code == Some(Code::NoSpace) {
         return Status::resource_exhausted(message);
@@ -569,7 +668,7 @@ async fn set_xattr(
 /// The `user.constellation.csi.*` xattrs on `path`. Lists first and only
 /// reads names that exist: the engine reports a missing attribute as
 /// `NotFound` (`ENODATA`), indistinguishable from a missing path.
-async fn read_record(
+pub(crate) async fn read_record(
     fs: &dyn ControlClient,
     path: &str,
 ) -> Result<BTreeMap<String, String>, Status> {
@@ -624,17 +723,18 @@ impl ControllerRpc for ControllerService {
             ));
         }
         let class = ClassParams::parse(&req.parameters).map_err(Status::invalid_argument)?;
-        if class.layout == Layout::Dedicated {
-            return Err(Status::unimplemented(
-                "layout \"dedicated\" is deferred to plan 37 K3: its DeleteVolume drops the \
-                 whole filesystem, and the control protocol has no filesystem-delete method yet",
-            ));
-        }
         let engines = self.engines()?;
         let _lock = self.locks.try_lock(req.name.clone())?;
-        let volume = self
-            .create_pool_volume(engines, &class, &req, capacity)
-            .await?;
+        let volume = match class.layout {
+            Layout::Pool => {
+                self.create_pool_volume(engines, &class, &req, capacity)
+                    .await?
+            }
+            Layout::Dedicated => {
+                self.create_dedicated_volume(engines, &class, &req, capacity)
+                    .await?
+            }
+        };
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(volume),
         }))
@@ -666,11 +766,14 @@ impl ControllerRpc for ControllerService {
                      persistentVolumeReclaimPolicy: Retain (plan 37 settled decision 17)",
                 ))
             }
-            VolumeId::Dedicated { .. } => {
-                return Err(Status::unimplemented(
-                    "deleting a dedicated-layout volume needs a filesystem-delete control \
-                     method (deferred to plan 37 K3)",
-                ))
+            VolumeId::Dedicated { fs_uuid } => {
+                return Err(Status::failed_precondition(format!(
+                    "volume {} is a whole filesystem ({fs_uuid}, layout \"dedicated\"), and \
+                     deleting one needs the purge primitive of plan 37 K6b, which does not exist \
+                     yet: retain it (persistentVolumeReclaimPolicy: Retain), or remove the \
+                     filesystem's bucket prefix by hand once its PV is gone",
+                    req.volume_id
+                )))
             }
         };
         let _lock = self.locks.try_lock(lock_key(&id, &req.volume_id))?;

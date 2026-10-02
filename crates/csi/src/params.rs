@@ -208,6 +208,26 @@ impl ClassParams {
     }
 }
 
+/// The `volume_context` a provisioned volume carries (plan 37 K3): its
+/// class's own parameters, so `NodeStageVolume` brings up the engine pod
+/// of the right pool filesystem from the request alone (the id names the
+/// filesystem by uuid, not where it lives). The sidecars' own
+/// `csi.storage.k8s.io/*` keys are dropped: they name secrets and the PVC,
+/// and a volume's context must not carry either. A statically provisioned
+/// PV spells the same keys in its `volumeAttributes` (and `shard`, for a
+/// sharded pool).
+pub fn volume_context(parameters: &HashMap<String, String>) -> HashMap<String, String> {
+    parameters
+        .iter()
+        .filter(|(k, _)| !k.starts_with("csi.storage.k8s.io/"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// A statically provisioned volume's shard (`volumeAttributes.shard`);
+/// the one context key that is not a class parameter.
+pub const SHARD_KEY: &str = "shard";
+
 fn join(prefix: &str, leaf: &str) -> String {
     if prefix.is_empty() {
         leaf.to_string()

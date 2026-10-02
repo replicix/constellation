@@ -3991,9 +3991,39 @@
           "type": "object"
         },
         {
-          "const": "PreopenedFd",
+          "additionalProperties": false,
           "description": "An already-mounted `/dev/fuse` descriptor (from the CSI node plugin\nor a previous process) that arrives **attached to this request**\nover fd passing. On a transport that cannot pass descriptors the\ncall fails `NotSupported` immediately.",
-          "type": "string"
+          "properties": {
+            "PreopenedFd": {
+              "properties": {
+                "mountpoint": {
+                  "default": null,
+                  "description": "Where the sender mounted it, as the sender sees it (plan 37's\nstaging path): the name `view.list`/`view.stats`/`view.unmount`\nknow the view by. It may not exist in this process's mount\nnamespace, and this daemon never unmounts it — `view.unmount`\nends the session and closes the connection, and whoever made\nthe mount unmounts it. `None`: the view is known as `fd:<n>`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "opts": {
+                  "$ref": "#/$defs/MountViewOpts",
+                  "default": {
+                    "allow_other": false,
+                    "clone_name": null,
+                    "ephemeral": false,
+                    "fs_name": null,
+                    "fuse_threads": null,
+                    "rw": false
+                  },
+                  "description": "How the session serves it: `allow_other` (fuser admits every\nuid, which a mount other processes use needs), `fs_name`,\n`fuse_threads`, and the view options. The kernel's half of the\nmount options was fixed by whoever called `mount(2)`."
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "PreopenedFd"
+          ],
+          "type": "object"
         }
       ]
     },

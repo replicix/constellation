@@ -19,17 +19,19 @@
 
 use super::{ControlClient, SubtreeQuotaParams};
 use async_trait::async_trait;
+use constellation_control::fd::OwnedFd;
 use constellation_control::methods::{
-    BrowseMkdir, BrowseRename, BrowseXattr, CloneCreate, FsCreate, FsUnlock, Method, NodeHandoff,
-    NodeLeave, NodePing, QuotaGet, QuotaSet, SnapshotCreate, SnapshotDelete, SnapshotHold,
-    SnapshotList, ViewMount, ViewStats, ViewUnmount,
+    BrowseMkdir, BrowseRename, BrowseXattr, CloneCreate, FsCreate, FsList, FsUnlock, Method,
+    NodeHandoff, NodeLeave, NodePing, QuotaGet, QuotaSet, SnapshotCreate, SnapshotDelete,
+    SnapshotHold, SnapshotList, ViewList, ViewMount, ViewStats, ViewUnmount,
 };
 use constellation_control::proto::types::{
-    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsUnlockParams, HandoffParams,
-    HandoffReport, LeaveParams, MkdirParams, Pong, QuotaGetParams, QuotaStatus, RenameParams,
-    SetQuotaParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld,
-    SnapshotHoldParams, SnapshotListParams, SnapshotListing, ViewInfo, ViewMountParams,
-    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrParams, XattrResult,
+    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsListing, FsUnlockParams,
+    HandoffParams, HandoffReport, LeaveParams, MkdirParams, Pong, QuotaGetParams, QuotaStatus,
+    RenameParams, SetQuotaParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams,
+    SnapshotHeld, SnapshotHoldParams, SnapshotListParams, SnapshotListing, ViewInfo,
+    ViewListParams, ViewListing, ViewMountParams, ViewStatsParams, ViewStatsReport,
+    ViewUnmountParams, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use constellation_control::Client;
@@ -78,6 +80,22 @@ impl SocketControlClient {
     async fn call<M: Method>(&self, params: M::Params) -> Result<M::Result, ControlError> {
         self.client.call_bounded::<M>(params, self.timeout).await
     }
+
+    /// [`Self::call`] with `fd` attached, under the same bound.
+    async fn call_fd<M: Method>(
+        &self,
+        params: M::Params,
+        fd: OwnedFd,
+    ) -> Result<M::Result, ControlError> {
+        match tokio::time::timeout(self.timeout, self.client.call_with_fd::<M>(params, fd)).await {
+            Ok(result) => result,
+            Err(_) => Err(ControlError::new(
+                constellation_control::proto::ErrorKind::Timeout,
+                format!("{} did not finish within {:?}", M::NAME, self.timeout),
+            )
+            .with_code(constellation_types::Code::TimedOut)),
+        }
+    }
 }
 
 /// `"/"` (and `""`) is the filesystem-wide cap; anything else a subtree.
@@ -94,6 +112,10 @@ impl ControlClient for SocketControlClient {
 
     async fn fs_unlock(&self, params: FsUnlockParams) -> Result<Ack, ControlError> {
         self.call::<FsUnlock>(params).await
+    }
+
+    async fn fs_list(&self) -> Result<FsListing, ControlError> {
+        self.call::<FsList>(Default::default()).await
     }
 
     async fn browse_mkdir(&self, params: MkdirParams) -> Result<FileStat, ControlError> {
@@ -163,10 +185,22 @@ impl ControlClient for SocketControlClient {
         self.call::<CloneCreate>(params).await
     }
 
-    /// Without a descriptor: `PreopenedFd` mounts are K3's, over
-    /// `call_with_fd` on a unix socket.
+    /// Without a descriptor: a `PreopenedFd` mount goes through
+    /// [`Self::view_mount_fd`].
     async fn view_mount(&self, params: ViewMountParams) -> Result<ViewInfo, ControlError> {
         self.call::<ViewMount>(params).await
+    }
+
+    async fn view_mount_fd(
+        &self,
+        params: ViewMountParams,
+        fd: OwnedFd,
+    ) -> Result<ViewInfo, ControlError> {
+        self.call_fd::<ViewMount>(params, fd).await
+    }
+
+    async fn view_list(&self, params: ViewListParams) -> Result<ViewListing, ControlError> {
+        self.call::<ViewList>(params).await
     }
 
     async fn view_unmount(&self, params: ViewUnmountParams) -> Result<Ack, ControlError> {

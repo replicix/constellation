@@ -191,7 +191,7 @@ fn test_router(p: &Probes) -> Router {
     // fd passing.
     r.register::<ViewMount, _, _>(|mut ctx, params: ViewMountParams| async move {
         match params.source {
-            MountSource::PreopenedFd => {
+            MountSource::PreopenedFd { .. } => {
                 let fd = ctx.take_fd().expect("router guarantees an fd");
                 let mut file = std::fs::File::from(fd);
                 file.seek(SeekFrom::Start(0)).unwrap();
@@ -1880,7 +1880,10 @@ fn tempfile_with(text: &str) -> std::fs::File {
 fn preopened_mount() -> ViewMountParams {
     ViewMountParams {
         subtree: "/".into(),
-        source: MountSource::PreopenedFd,
+        source: MountSource::PreopenedFd {
+            mountpoint: None,
+            opts: Default::default(),
+        },
         labels: Default::default(),
         qos: Default::default(),
         confine_links: true,
@@ -1961,7 +1964,7 @@ async fn fd_methods_on_a_transport_without_fd_passing_fail_promptly() {
         within,
         client.call_json(
             "view.mount",
-            json!({"subtree": "/", "source": "PreopenedFd"}),
+            json!({"subtree": "/", "source": {"PreopenedFd": {}}}),
         ),
     )
     .await
@@ -1991,7 +1994,7 @@ async fn a_raw_request_without_its_fd_gets_invalid_on_an_fd_capable_transport() 
         .client
         .call_json(
             "view.mount",
-            json!({"subtree": "/", "source": "PreopenedFd"}),
+            json!({"subtree": "/", "source": {"PreopenedFd": {}}}),
         )
         .await
         .unwrap_err();
@@ -2098,7 +2101,7 @@ async fn dispatch_in_process_takes_the_same_path_as_a_socket_call() {
         &router,
         &admin,
         "view.mount",
-        json!({"subtree": "/", "source": "PreopenedFd"}),
+        json!({"subtree": "/", "source": {"PreopenedFd": {}}}),
         DispatchOptions {
             cancel: None,
             fd: Some(file.as_fd().try_clone_to_owned().unwrap()),

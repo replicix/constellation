@@ -33,25 +33,26 @@ sidecars:
 # off it). Non-default distributions (k0s, microk8s, ...) override this.
 kubeletDir: /var/lib/kubelet
 
-# hostPath root of the node-local layout (plan 37 §7): node-identity/,
-# sockets/<unit>/{fd-handoff,control}.sock.
+# hostPath root of the node-local layout (plan 37 §7): node-identity/<unit>/
+# (an engine pod's meta store), sockets/<unit>/ (its control socket),
+# policy/<unit>/ (the node plugin's grant on that socket: root-owned,
+# read-only in the pod), volumes/ (the node plugin's staged-volume records).
 hostRoot: /var/lib/constellation-csi
-# Where engine pods' control sockets live; the control-acl service grant's
-# socket_glob must match <controlSocketRoot>/*/control.sock.
-controlSocketRoot: /var/lib/constellation-csi/sockets
 
 # Engine pods (plan 37 §7). The controller starts one controller-owned
-# engine pod per pool filesystem (K2); the node plugin starts node-owned
-# ones from K3 on. `resources` applies to both; the rest is the node
-# plugin's (K3/K5).
+# engine pod per pool filesystem (K2); the node plugin starts one per pool
+# filesystem per node with a staged volume of it (K3). `resources`,
+# `readyTimeout` and `logLevel` apply to both; idleTtl (37-k6b) and the
+# handoff timeouts (K5) are not read yet.
 engineProfile:
   idleTtl: 10m
   handoffDrainTimeout: 30s
   handoffTotalTimeout: 120s
-  # How long a controller RPC waits for a pool's engine pod to become
-  # ready (image pull, first start), in seconds. Keep it below
-  # sidecars.timeout, so the RPC fails with the pod's waiting reason
-  # (ErrImagePull, ...) before the sidecar's own deadline cuts it off.
+  # How long a controller RPC (or NodeStageVolume) waits for a pool's
+  # engine pod to become ready (image pull, first start), in seconds. Keep
+  # it below sidecars.timeout (and kubelet's 2 min staging timeout), so the
+  # RPC fails with the pod's waiting reason (ErrImagePull, ...) before the
+  # caller's own deadline cuts it off.
   readyTimeout: 100
   logLevel: info
   resources:
@@ -116,6 +117,12 @@ controller:
   livenessPort: 9808
 
 node:
+  # The node plugin's half of the pod-access policy (templates/exec-policy.yaml):
+  # its ServiceAccount may create, annotate and delete only engine pods on
+  # its own node, shaped exactly as the plugin builds them. Kubernetes >= 1.30,
+  # with bound service-account tokens that carry the node name (beta and on by
+  # default from 1.30, GA in 1.32); a token without one is refused.
+  podAccessPolicy: true
   resources:
     csi: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 512Mi}}
     sidecar: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 128Mi}}

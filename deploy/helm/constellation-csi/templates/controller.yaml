@@ -61,6 +61,7 @@ spec:
             - {name: CONSTELLATION_CSI_ENGINE_PULL_POLICY, value: {{ .Values.image.pullPolicy | quote }}}
             - {name: CONSTELLATION_CSI_HOST_ROOT, value: {{ .Values.hostRoot | quote }}}
             - {name: CONSTELLATION_CSI_OWNER_DEPLOYMENT, value: constellation-csi-controller}
+            - {name: CONSTELLATION_CSI_ENGINE_SERVICE_ACCOUNT, value: constellation-csi-engine}
             - {name: CONSTELLATION_CSI_ENGINE_RESOURCES, value: {{ .Values.engineProfile.resources | toJson | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_LOG_LEVEL, value: {{ .Values.engineProfile.logLevel | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ .Values.engineProfile.readyTimeout | quote }}}

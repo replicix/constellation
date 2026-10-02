@@ -120,8 +120,9 @@ use std::time::{Duration, Instant};
 /// file handles are its own per-open numbers (`handles`), and the node's
 /// discard error events cross (`errors`): a version-2 image could neither
 /// parse this handoff nor serve the handles the kernel holds, so the ABI
-/// probe refuses the mix up front.
-pub const HANDOVER_VERSION: u32 = 3;
+/// probe refuses the mix up front. 4 — plan 37 K3a, a mount carries
+/// `foreign` (made by someone else, `view.mount{PreopenedFd}`).
+pub const HANDOVER_VERSION: u32 = 4;
 
 /// `daemon.lock`'s descriptor (held for the process's life; handed on).
 static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
@@ -323,6 +324,10 @@ pub struct MountHandoff {
     fuse_threads: usize,
     fuse_fd: RawFd,
     init: NegotiatedInit,
+    /// Somebody else made the mount (`view.mount{PreopenedFd}`): the next
+    /// image ends the session rather than unmounting `mountpoint`, which
+    /// is only its name (`FuseHandoff::foreign`).
+    foreign: bool,
     view: ViewHandoff,
 }
 
@@ -773,6 +778,7 @@ fn hand_over(node: Arc<NodeRuntime>, binary: PathBuf, detached: Vec<Detached>) {
             allow_other: t.info.allow_other,
             read_only: t.info.read_only,
             fuse_threads: t.info.fuse_threads,
+            foreign: handoff.fuse.foreign,
             fuse_fd: handoff.fuse.fuse_fd.into_raw_fd(),
             init: handoff.fuse.init,
             view,
@@ -964,6 +970,7 @@ fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
             fuse_fd,
             init: m.init,
             mountpoint: Some(m.mountpoint.clone()),
+            foreign: m.foreign,
         },
         view.clone(),
         &options,
@@ -1096,6 +1103,17 @@ mod tests {
         sent.version = HANDOVER_VERSION + 1;
         let fd = write_handoff(&sent).unwrap();
         assert!(read_handoff(fd).is_err());
+    }
+
+    #[test]
+    fn a_handoff_from_before_foreign_mounts_is_refused() {
+        // Version 2 had no `MountHandoff::foreign`: no default fills it in,
+        // the version (and so `--handover-abi`'s preflight) refuses it.
+        let mut sent = handoff();
+        sent.version = 2;
+        let fd = write_handoff(&sent).unwrap();
+        assert!(read_handoff(fd).is_err());
+        assert_ne!(HANDOVER_VERSION, 2);
     }
 
     #[test]

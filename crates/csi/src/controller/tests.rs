@@ -114,6 +114,19 @@ async fn create_writes_the_record_and_the_quota() {
         panic!("{id:?}")
     };
     assert_eq!((*shard, name.as_str()), (0, "pvc-1"));
+    // The context locates the pool for NodeStageVolume (K3): the class's
+    // own keys, none of the sidecars'.
+    assert_eq!(
+        v.volume_context,
+        class(&[("bucket", "b"), ("prefix", "pool")]),
+        "{:?}",
+        v.volume_context
+    );
+    let again = f.create(create_req("pvc-1", GIB)).await.unwrap();
+    assert_eq!(
+        again.volume_context, v.volume_context,
+        "idempotent, context too"
+    );
 
     // The pool is the class's (bucket, prefix) filesystem.
     let pool = f
@@ -341,15 +354,82 @@ async fn bad_requests_are_invalid_argument() {
     }
 }
 
+fn dedicated_req(name: &str, required: i64) -> CreateVolumeRequest {
+    let mut r = create_req(name, required);
+    r.parameters.insert("layout".into(), "dedicated".into());
+    r
+}
+
+/// Should-fix 4 of the 37-k3a review: `layout: dedicated` creates a whole
+/// filesystem per volume (§2.3); deleting one waits for K6b's purge.
+#[tokio::test]
+async fn a_dedicated_volume_is_a_filesystem_of_its_own() {
+    let f = fixture();
+    let v = f.create(dedicated_req("pvc-d", GIB)).await.unwrap();
+    let id = VolumeId::parse(&v.volume_id).unwrap();
+    assert!(matches!(id, VolumeId::Dedicated { .. }), "{id:?}");
+    assert_eq!(id.subtree(), "/");
+    // The context locates the volume's own filesystem for the node.
+    assert_eq!(
+        v.volume_context,
+        class(&[
+            ("bucket", "b"),
+            ("prefix", "pool/pvc-d"),
+            ("layout", "dedicated")
+        ])
+    );
+    let own = f
+        .engines
+        .registry_client()
+        .fs_create(FsCreateParams {
+            bucket: "b".into(),
+            prefix: "pool/pvc-d".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!own.created);
+    assert_eq!(own.uuid, id.fs_uuid());
+    let fs = f.fs_of(&v.volume_id).await;
+    let rec = record(&fs, "/").await;
+    assert_eq!(rec[X_PV], "pvc-d");
+    assert_eq!(rec[X_PVC], "data");
+    assert!(rec.contains_key(X_CREATED));
+    assert_eq!(fs.quota_get("/").await.unwrap().max_bytes, Some(GIB as u64));
+
+    // Idempotent; an incompatible repeat is refused.
+    let again = f.create(dedicated_req("pvc-d", GIB)).await.unwrap();
+    assert_eq!(again.volume_id, v.volume_id);
+    assert_eq!(again.volume_context, v.volume_context);
+    assert_eq!(
+        f.create(dedicated_req("pvc-d", 4 * GIB))
+            .await
+            .unwrap_err()
+            .code(),
+        GrpcCode::AlreadyExists
+    );
+    // Another volume, another filesystem.
+    let other = f.create(dedicated_req("pvc-e", 0)).await.unwrap();
+    assert_ne!(
+        VolumeId::parse(&other.volume_id).unwrap().fs_uuid(),
+        id.fs_uuid()
+    );
+    // Expansion is the filesystem-wide cap.
+    assert_eq!(f.expand(&v.volume_id, 2 * GIB).await.unwrap(), 2 * GIB);
+    assert_eq!(
+        fs.quota_get("/").await.unwrap().max_bytes,
+        Some(2 * GIB as u64)
+    );
+    // No purge primitive yet: refused, clearly, and nothing is touched.
+    let e = f.delete(&v.volume_id).await.unwrap_err();
+    assert_eq!(e.code(), GrpcCode::FailedPrecondition, "{e}");
+    assert!(e.message().contains("K6b"), "{e}");
+    assert_eq!(record(&fs, "/").await[X_PV], "pvc-d");
+}
+
 #[tokio::test]
 async fn deferred_shapes_are_unimplemented() {
     let f = fixture();
-    let mut r = create_req("pvc", GIB);
-    r.parameters.insert("layout".into(), "dedicated".into());
-    assert_eq!(
-        f.create(r).await.unwrap_err().code(),
-        GrpcCode::Unimplemented
-    );
     let mut r = create_req("pvc", GIB);
     r.volume_content_source = Some(VolumeContentSource { r#type: None });
     assert_eq!(

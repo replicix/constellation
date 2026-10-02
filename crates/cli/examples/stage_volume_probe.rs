@@ -26,7 +26,9 @@
 
 use anyhow::{bail, Context, Result};
 use constellation_control::methods as cm;
-use constellation_control::proto::types::{MountSource, ViewMountParams, ViewUnmountParams};
+use constellation_control::proto::types::{
+    MountSource, MountViewOpts, ViewMountParams, ViewUnmountParams,
+};
 use constellation_control::transport::locate_socket;
 use constellation_control::Client;
 use std::path::{Path, PathBuf};
@@ -66,7 +68,13 @@ async fn main() -> Result<()> {
         .call_with_fd::<cm::ViewMount>(
             ViewMountParams {
                 subtree: subtree.clone(),
-                source: MountSource::PreopenedFd,
+                source: MountSource::PreopenedFd {
+                    mountpoint: Some(mountpoint.clone()),
+                    opts: MountViewOpts {
+                        allow_other: true,
+                        ..Default::default()
+                    },
+                },
                 labels: [("pv".to_string(), "k0a-probe".to_string())].into(),
                 qos: Default::default(),
                 confine_links: false,
@@ -84,11 +92,10 @@ async fn main() -> Result<()> {
     // ordinary file I/O on it.
     let outcome = exercise(&mountpoint);
 
-    // Detaching it again is where today's product stops short (K0 found
-    // this; it is recorded as a gap for K3a/K5, not fixed here): a view
-    // attached from a descriptor has no mountpoint the daemon knows, so
-    // `SessionControl::unmount` refuses and `view.unmount` never answers
-    // — it waits for a session thread that nothing has ended.
+    // Detaching it again (K0's gap 3, closed by 37-K3a): the daemon knows
+    // the view by the mountpoint sent with it, and `view.unmount` ends the
+    // session — publishing pending writes, closing the connection — since
+    // it did not make the mount and does not unmount it.
     let detached = client
         .call_bounded::<cm::ViewUnmount>(
             ViewUnmountParams {
@@ -101,8 +108,7 @@ async fn main() -> Result<()> {
         Ok(_) => println!("view.unmount: ok"),
         Err(e) => println!("view.unmount: {e}"),
     }
-    // The node plugin's own half: it made the mount, so it can unmount it
-    // by path, which is what ends the daemon's session.
+    // The node plugin's own half: it made the mount, so it unmounts it.
     unmount(&mountpoint).context("umount2 of the staged mountpoint")?;
     println!("unmounted {} by path", mountpoint.display());
     outcome?;
