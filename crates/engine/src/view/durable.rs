@@ -52,6 +52,12 @@ impl Handles {
         self.open.lock().unwrap().get(&fh.0).map(|h| h.ino)
     }
 
+    /// How many descriptions of `ino` are open.
+    pub(super) fn count(&self, ino: Ino) -> u32 {
+        let open = self.open.lock().unwrap();
+        open.values().filter(|h| h.ino == ino).count() as u32
+    }
+
     pub(super) fn close(&self, fh: Fh) {
         self.open.lock().unwrap().remove(&fh.0);
     }

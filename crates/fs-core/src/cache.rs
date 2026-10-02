@@ -506,8 +506,13 @@ impl DiskCache {
         self.memory.as_ref().map(MemCache::stats)
     }
 
-    /// Whether `hash` is resident in the memory tier (tests, diagnostics).
-    pub fn memory_contains(&self, hash: &ChunkHash) -> bool {
+    /// Whether `hash` is resident in the memory tier: a peek, which moves
+    /// nothing — no hit or miss is counted and the entry is neither
+    /// promoted nor made more recent, so asking cannot change what the
+    /// tier keeps. Passthrough asks it at every open (plan 38 Z3c: a chunk
+    /// held here is served faster by the daemon than by the kernel reading
+    /// the chunk file), and tests and diagnostics use it too.
+    pub fn in_memory(&self, hash: &ChunkHash) -> bool {
         self.memory.as_ref().is_some_and(|m| m.contains(hash))
     }
 
@@ -1737,10 +1742,10 @@ mod tests {
             .with_memory_cache(1 << 20);
         let (h, d) = chunk(1, 4096);
         c.insert(&h, &d, ChunkState::Clean).unwrap();
-        assert!(!c.memory_contains(&h), "a write is not admitted");
+        assert!(!c.in_memory(&h), "a write is not admitted");
         let first = c.get_shared(&h).unwrap().unwrap();
         assert_eq!(first, d);
-        assert!(c.memory_contains(&h));
+        assert!(c.in_memory(&h));
         // Were the disk copy re-read (and re-verified), this would now be
         // a corrupt chunk: dropped, and the read a miss.
         fs::write(file_of(&dir, &h), b"garbage").unwrap();
@@ -1771,13 +1776,13 @@ mod tests {
         bad[100] ^= 1; // same length, one bit off
         fs::write(file_of(&dir, &h), &bad).unwrap();
         assert_eq!(c.get_shared(&h).unwrap(), None);
-        assert!(!c.memory_contains(&h), "unverified bytes were cached");
+        assert!(!c.in_memory(&h), "unverified bytes were cached");
         assert!(!c.contains(&h), "the corrupt disk entry is dropped");
         assert_eq!(c.memory_stats().unwrap().used_bytes, 0);
         // Refetched and inserted again: served, and cached, normally.
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
-        assert!(c.memory_contains(&h));
+        assert!(c.in_memory(&h));
         drop(c);
 
         // Under `admit`: the startup scan's entries are unverified, so a
@@ -1787,7 +1792,7 @@ mod tests {
             .unwrap()
             .with_memory_cache(1 << 20);
         assert_eq!(c.get_shared(&h).unwrap(), None);
-        assert!(!c.memory_contains(&h), "unverified bytes were cached");
+        assert!(!c.in_memory(&h), "unverified bytes were cached");
         assert!(!c.contains(&h), "the corrupt disk entry is dropped");
     }
 
@@ -1805,7 +1810,7 @@ mod tests {
         let h = ChunkHash::keyed(&key, &d);
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
-        assert!(c.memory_contains(&h));
+        assert!(c.in_memory(&h));
         // A second keyed chunk whose file is swapped for bytes that match
         // only the *plain* hash: the keyed check refuses it.
         let d2 = vec![4u8; 4096];
@@ -1813,7 +1818,7 @@ mod tests {
         c.insert(&h2, &d2, ChunkState::Clean).unwrap();
         fs::write(file_of(&dir, &h2), &d).unwrap();
         assert_eq!(c.get_shared(&h2).unwrap(), None);
-        assert!(!c.memory_contains(&h2));
+        assert!(!c.in_memory(&h2));
     }
 
     #[test]
@@ -1827,30 +1832,30 @@ mod tests {
             let (h, d) = chunk(i, 100);
             c.insert(&h, &d, ChunkState::Clean).unwrap();
             c.get_shared(&h).unwrap().unwrap();
-            assert!(c.memory_contains(&h));
+            assert!(c.in_memory(&h));
             h
         };
         // remove
         let h = load(1);
         c.remove(&h).unwrap();
-        assert!(!c.memory_contains(&h));
+        assert!(!c.in_memory(&h));
         // prune
         let h = load(2);
         c.prune_to(0).unwrap();
-        assert!(!c.memory_contains(&h));
+        assert!(!c.in_memory(&h));
         // removed behind the cache's back, then noticed by a disk read
         let h = load(3);
         fs::remove_file(file_of(&dir, &h)).unwrap();
         drop(c.memory.as_ref().unwrap().remove(&h)); // force the disk path
         assert_eq!(c.get_shared(&h).unwrap(), None);
-        assert!(!c.contains(&h) && !c.memory_contains(&h));
+        assert!(!c.contains(&h) && !c.in_memory(&h));
         // disk eviction: fill the disk budget with resident chunks, then
         // one more; the victim leaves memory with its disk entry
         let hs: Vec<_> = (10..13).map(load).collect();
         let (h4, d4) = chunk(20, 100);
         c.insert(&h4, &d4, ChunkState::Clean).unwrap();
         for h in &hs {
-            assert_eq!(c.contains(h), c.memory_contains(h), "{h:?}");
+            assert_eq!(c.contains(h), c.in_memory(h), "{h:?}");
         }
         assert_eq!(hs.iter().filter(|h| c.contains(h)).count(), 2);
         assert_eq!(c.memory_stats().unwrap().entries, 2);
@@ -1889,10 +1894,10 @@ mod tests {
         let (h, d) = chunk(1, 4096);
         c.insert(&h, &d, ChunkState::Dirty).unwrap();
         assert_eq!(c.get(&h).unwrap(), Some(d.clone()));
-        assert!(!c.memory_contains(&h));
+        assert!(!c.in_memory(&h));
         // A read (here: a writer reading its own sealed chunk) admits.
         assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
-        assert!(c.memory_contains(&h));
+        assert!(c.in_memory(&h));
     }
 
     #[test]
@@ -1905,7 +1910,7 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
         assert!(c.memory_stats().is_none());
-        assert!(!c.memory_contains(&h));
+        assert!(!c.in_memory(&h));
         let (absent, _) = chunk(2, 10);
         assert_eq!(c.get_shared(&absent).unwrap(), None);
     }
@@ -2024,7 +2029,7 @@ mod tests {
         let mut resident = 0;
         for i in 0..97 {
             let h = ChunkHash::of(&data(i));
-            if c.memory_contains(&h) {
+            if c.in_memory(&h) {
                 resident += 1;
                 assert!(c.contains(&h), "chunk {i} is in memory but not on disk");
             }
@@ -2156,7 +2161,7 @@ mod tests {
         spill.write_all(&d).unwrap();
         c.commit_spill(&h, spill, ChunkState::Clean).unwrap();
         c.admit_verified(&h, Bytes::from(d.clone()));
-        assert!(c.memory_contains(&h));
+        assert!(c.in_memory(&h));
         // Nothing was loaded from disk: no miss was counted, and the
         // read below is a hit on the admitted copy — which a file
         // clobbered afterwards proves, since a disk read would have
@@ -2166,6 +2171,48 @@ mod tests {
         assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
         let stats = c.memory_stats().unwrap();
         assert_eq!((stats.misses, stats.hits, stats.admissions), (0, 1, 1));
+    }
+
+    /// `in_memory` is a peek: asking any number of times counts no hit
+    /// or miss and promotes nothing, where one read does both.
+    #[test]
+    fn in_memory_moves_no_counter_and_no_entry() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1 << 20)
+            .unwrap()
+            .with_memory_cache(1 << 20);
+        let (h, d) = chunk(5, 4096);
+        let (absent, _) = chunk(6, 4096);
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert!(!c.in_memory(&h));
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        let before = c.memory_stats().unwrap();
+        assert_eq!((before.hits, before.misses), (0, 1));
+        assert_eq!(before.protected_bytes, 0, "admitted on probation");
+        for _ in 0..3 {
+            assert!(c.in_memory(&h));
+            assert!(!c.in_memory(&absent));
+        }
+        let after = c.memory_stats().unwrap();
+        assert_eq!(
+            (
+                after.hits,
+                after.misses,
+                after.protected_bytes,
+                after.promotions
+            ),
+            (before.hits, before.misses, 0, before.promotions)
+        );
+        // A read, by contrast, is a hit (that it marks the entry
+        // referenced and `in_memory` does not is `memcache`'s test).
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        assert_eq!(c.memory_stats().unwrap().hits, 1);
+        // With the tier off nothing is in memory.
+        let off = TempDir::new().unwrap();
+        let c = DiskCache::open(off.path(), 1 << 20).unwrap();
+        c.insert(&h, &d, ChunkState::Clean).unwrap();
+        assert_eq!(c.get_shared(&h).unwrap().as_deref(), Some(&d[..]));
+        assert!(!c.in_memory(&h));
     }
 
     /// A chunk whose disk entry went while the fetch was in flight is not
@@ -2180,7 +2227,7 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         c.remove(&h).unwrap();
         c.admit_verified(&h, Bytes::from(d));
-        assert!(!c.memory_contains(&h));
+        assert!(!c.in_memory(&h));
         assert_eq!(c.memory_stats().unwrap().entries, 0);
     }
 
@@ -2284,7 +2331,7 @@ mod tests {
         // the truth — so this one is served, not dropped.
         c.insert(&h, &d, ChunkState::Dirty).unwrap();
         assert_eq!(c.get_shared(&h).unwrap(), Some(Bytes::from(d.clone())));
-        assert!(c.memory_contains(&h));
+        assert!(c.in_memory(&h));
         fs::write(file_of(&dir, &h), &rot).unwrap();
         assert_eq!(c.get_verified(&h).unwrap(), Some(d.clone()));
         assert!(c.contains(&h));
@@ -2299,10 +2346,10 @@ mod tests {
         // Admit the rotted bytes to memory the way `admit` allows: the
         // entry is `verified`, so this disk read skips the hash.
         assert_eq!(c.get_shared(&h2).unwrap(), Some(Bytes::from(rot2)));
-        assert!(c.memory_contains(&h2));
+        assert!(c.in_memory(&h2));
         assert_eq!(c.get_verified(&h2).unwrap(), None);
         assert!(!c.contains(&h2));
-        assert!(!c.memory_contains(&h2));
+        assert!(!c.in_memory(&h2));
     }
 
     #[test]

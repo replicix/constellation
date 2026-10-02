@@ -150,8 +150,9 @@ knob, `CONSTELLATION_FUSE_PASSTHROUGH`, and what it changes. Zero-copy reads
 
 On Linux 6.9+ (built with `CONFIG_FUSE_PASSTHROUGH`), a daemon holding
 `CAP_SYS_ADMIN` answers a **read-only open of a file whose whole content is
-one chunk already verified in the local disk cache** by handing the kernel
-the chunk file itself (plan 38 §3(c), Z3): the kernel then serves every read
+one chunk already verified in the local disk cache** (and not held in the
+daemon's chunk memory tier, below) by handing the kernel the chunk file
+itself (plan 38 §3(c), Z3): the kernel then serves every read
 of that descriptor from the chunk file, and the daemon never sees them.
 
 **By default only read-only mounts use it** (a snapshot view, which the
@@ -168,11 +169,28 @@ user namespace's (`EPERM`), or a cache directory on a stacked filesystem
 such as overlayfs (`ELOOP`), turns it off for the mount with reason
 `backing_open`.
 
-> **Today a read-only mount negotiates passthrough but serves no file by
-> it.** The only read-only mounts are snapshot views, whose files are
-> served as frozen snapshot nodes that the eligibility rule above does not
-> cover yet (it applies to the live tree). Until it does, passthrough
-> serves files only on writable mounts that opted in.
+**A chunk the daemon's memory tier holds is never handed over**
+(`CONSTELLATION_CHUNK_MEMCACHE_BYTES`): a memory hit is served faster by the
+daemon than by the kernel reading the chunk file, which after the page
+cache drops means a disk read. Passthrough is taken only for verified
+chunks that are on disk but not in memory — in practice chunks the memory
+tier has evicted (a working set larger than the tier), or every chunk with
+the tier off. Since a file's first read admits its chunk to memory, a
+small, hot set of files is read the ordinary way.
+
+A snapshot view's files qualify under the same rule (plan 38 Z3c): a
+snapshot file of at most one chunk, whose chunk is verified in the disk
+cache and not held in memory, is served by passthrough, and an open of it
+for writing is `EROFS` as always. The first open of such a file after a
+daemon start is ordinary when its chunk was found on disk rather than
+fetched (that read verifies it). Files under `<dir>/.constellation/snapshot/`
+on a writable mount qualify too, when that mount opted in. Measured on a
+snapshot view (4096 files of 64 KiB, 4 MiB chunks, medians, PROGRESS "Plan
+38 Z3c"): with a 1 GiB memory tier nothing is served by passthrough, and
+the default is at parity with `CONSTELLATION_FUSE_PASSTHROUGH=0` (page cache
+warm 2.16 s vs 2.29 s, after `drop_caches` 2.19 s vs 2.35 s); with the tier
+off every open is passthrough, and the default is at parity or faster (warm
+2.14 s vs 2.25 s, after `drop_caches` 7.34 s vs 7.83 s).
 
 | Knob | Default | Meaning |
 |---|---|---|
@@ -661,7 +679,7 @@ protocol, message bounds and counters.
 | `CONSTELLATION_PREFETCH_MIN_BYTES` | `8388608` | bytes, positive | initial adaptive sequential-read window |
 | `CONSTELLATION_PREFETCH_MAX_BYTES` | `2147483648` | bytes, positive | window ceiling, additionally capped at one quarter of cache budget |
 | `CONSTELLATION_CACHE_READ_RESERVE_PCT` | `0` | percent, `0..90` | share of the chunk cache that dirty (not yet uploaded) chunks may not take: writers are throttled, then refused (`ENOSPC`), that much earlier, so reads and readahead keep room under a write burst. Plan 31 C7b: 128 MiB cache, uploads capped at 4 MB/s, a writer running — a cold sequential reader gets 12–13 MiB/s at `0`, 19–23 at `25`, 66 at `50` (110–124 alone). Off by default: it moves where a small cache pushes back on writers |
-| `CONSTELLATION_CHUNK_MEMCACHE_BYTES` | 1/64 of the engine's memory share, at most 128 MiB (16 MiB with the `mobile` profile's on-demand background; an eighth of an explicit `server` memory budget), never more than `--cache-size` | bytes; `0` disables | chunk memory cache: verified chunk contents kept in RAM so a cached read is served as a shared slice, without re-reading and re-hashing the whole chunk from the disk cache (the first read of a chunk verifies it once and admits it; concurrent first reads load it once). Scan-resistant 2Q eviction (a large sequential read does not flush the hot set). Entries go when their disk-cache entry goes (eviction, prune, corruption). E2E: holds the plaintext the disk cache already holds, in process memory (not locked, so swappable like any read buffer). Counters: `node.status` `cache.memory_*`, `/metrics` `constellation_cache_memory_*`. Measured (see PROGRESS "Chunk memory cache"): a disk-cached 256 MiB sequential read, 4 MiB chunks, goes from ~75 to ~400 MiB/s at the default 128 MiB (~1.5 GiB/s once the file fits); cached random 4 KiB reads of a resident file from ~500 to ~50k IOPS |
+| `CONSTELLATION_CHUNK_MEMCACHE_BYTES` | 1/64 of the engine's memory share, at most 128 MiB (16 MiB with the `mobile` profile's on-demand background; an eighth of an explicit `server` memory budget), never more than `--cache-size` | bytes; `0` disables | chunk memory cache: verified chunk contents kept in RAM so a cached read is served as a shared slice, without re-reading and re-hashing the whole chunk from the disk cache (the first read of a chunk verifies it once and admits it; concurrent first reads load it once). Scan-resistant 2Q eviction (a large sequential read does not flush the hot set). Entries go when their disk-cache entry goes (eviction, prune, corruption). A chunk held here is never handed to the kernel by FUSE passthrough (the memory hit is faster; see "FUSE passthrough"). E2E: holds the plaintext the disk cache already holds, in process memory (not locked, so swappable like any read buffer). Counters: `node.status` `cache.memory_*`, `/metrics` `constellation_cache_memory_*`. Measured (see PROGRESS "Chunk memory cache"): a disk-cached 256 MiB sequential read, 4 MiB chunks, goes from ~75 to ~400 MiB/s at the default 128 MiB (~1.5 GiB/s once the file fits); cached random 4 KiB reads of a resident file from ~500 to ~50k IOPS |
 | `CONSTELLATION_PREFETCH_CONCURRENCY` | unset | requests; `0` is treated as `1` | pin background-fetch concurrency instead of adapting it |
 | `CONSTELLATION_PREFETCH_MAX_CONCURRENCY` | `128` | requests, `1..512` | adaptive background-fetch ceiling |
 | `CONSTELLATION_SCAN_AHEAD` | `on` | boolean | ordered directory-walk readahead |
@@ -839,6 +857,7 @@ to walk its own root instead, and that aggregate is cached:
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
+| `CONSTELLATION_SNAPSHOT_MANIFEST_CACHE` | `8192` | entries | per mounted view: snapshot files' manifests kept in memory (least recently used evicted), shared by the reads of a snapshot file and the passthrough check at its open, so a snapshot file's manifest is loaded from the snapshot's tree once rather than at every read. Snapshot manifests are immutable, so nothing is ever invalidated; an entry is a few hundred bytes (a longer chunk list is a separate blob, not cached here). `0` disables |
 | `CONSTELLATION_STATFS_TTL_S` | `5` | seconds | cache TTL for a *scoped* mount's `statfs`/`df` used-space aggregate; `0` disables caching. Ignored by a whole-filesystem mount, which needs no cache |
 
 Free space is deliberately *not* scoped to the view: it reports what a

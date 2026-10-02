@@ -73,10 +73,18 @@ fn check_root(root: &Path) -> Result<()> {
 
 fn client(env: &S3Env, root: &Path, name: &str, backend: &str) -> Result<Client> {
     // The mounts must ask for passthrough whatever the harness's own
-    // environment says.
-    Client::new(root, name, &env.endpoint, backend)
-        .map(|c| c.with_env("CONSTELLATION_FUSE_PASSTHROUGH", "1"))
+    // environment says. And no memory tier: a chunk held there is never
+    // offered (plan 38 Z3c — the daemon's memory hit beats the kernel's
+    // read of the chunk file), and these scenarios' reads would put their
+    // chunks there; `default_by_mount_mode` shows that refusal end to end.
+    Client::new(root, name, &env.endpoint, backend).map(|c| {
+        c.with_env("CONSTELLATION_FUSE_PASSTHROUGH", "1")
+            .with_env(NO_MEMORY_TIER.0, NO_MEMORY_TIER.1)
+    })
 }
+
+/// The daemon's chunk memory tier off.
+const NO_MEMORY_TIER: (&str, &str) = ("CONSTELLATION_CHUNK_MEMCACHE_BYTES", "0");
 
 /// The one mount's `fuse.mounts[].passthrough` section.
 fn passthrough(c: &Client) -> Result<serde_json::Value> {
@@ -653,19 +661,38 @@ pub fn disabled_by_verify_always(seed: u64) -> Result<()> {
     })
 }
 
+/// The memory tier's `(hits, misses)` (`cache.memory_*`): every read the
+/// daemon serves from a chunk moves one of them.
+fn memcache(c: &Client) -> Result<(u64, u64)> {
+    let status = c.control_status()?;
+    let cache = &status["cache"];
+    Ok((
+        cache["memory_hits"]
+            .as_u64()
+            .context("no cache.memory_hits")?,
+        cache["memory_misses"]
+            .as_u64()
+            .context("no cache.memory_misses")?,
+    ))
+}
+
 /// Review 38-z3b must-fix 1: without the opt-in only a read-only mount
 /// asks for passthrough. A writable mount reports `writable_mount`, holds
 /// no backing and so no `ETXTBSY` (a read-write open beside a reader is
 /// ordinary); a mount of a snapshot of the same file — mounted `ro`, where
-/// `open(O_RDWR)` is `EROFS` before FUSE — negotiates passthrough.
+/// `open(O_RDWR)` is `EROFS` before FUSE — negotiates passthrough and
+/// (plan 38 Z3c) serves the frozen file by it.
 ///
-/// What the read-only mount does *not* show yet is a passthrough open: a
-/// snapshot view serves its files as synthetic frozen nodes, which
-/// `View::open` answers without consulting the passthrough eligibility
-/// rule (plan 38 Z3a's, which covers the live tree only). So the scenario
-/// asserts the negotiation, the bytes and `EROFS`, and leaves the count
-/// alone; extending eligibility to frozen files is an engine change
-/// (PROGRESS.md, plan 38 Z3, "Open").
+/// The snapshot mount is a new daemon on the same state dir, so the
+/// file's chunk is on disk but not yet verified by this process: the
+/// first open is an ordinary one, whose read hashes it (plan 38 §2.3).
+/// With the daemon's memory tier on (the default) that read also admits
+/// the chunk to memory, and a chunk held there is never offered (Z3c's
+/// review: the memory hit beats the kernel reading the chunk file), so
+/// the next open is ordinary too. With the tier off (a second snapshot
+/// mount), the next open is passthrough — counted, pinned, byte-exact,
+/// and with no read reaching the daemon (neither its `read` series nor
+/// its memory counters move). The pin goes at the close.
 pub fn default_by_mount_mode(seed: u64) -> Result<()> {
     let (env, root) = setup("pt-default")?;
     check_root(root.path())?;
@@ -697,6 +724,40 @@ pub fn default_by_mount_mode(seed: u64) -> Result<()> {
         c.snapshot_create("/@pt-ro")?;
         Ok(())
     })?;
+    // The memory tier on: the verifying read puts the chunk in memory,
+    // and the open after it is not passthrough.
+    c.mount_view(Some("/@pt-ro"), &[])?;
+    with_clients(std::slice::from_mut(&mut c), |cs| {
+        let c = &cs[0];
+        require_enabled(c)?;
+        let path = c.mnt.join("frozen");
+        let first = std::fs::File::open(&path)?;
+        ensure!(
+            pread_all(&first, LEN)? == data,
+            "the snapshot reads other bytes"
+        );
+        drop(first);
+        ensure!(
+            memcache(c)?.1 >= 1,
+            "the verifying read did not go through the memory tier: {:?}",
+            memcache(c)?
+        );
+        let again = std::fs::File::open(&path)?;
+        ensure!(
+            pread_all(&again, LEN)? == data,
+            "the snapshot reads other bytes"
+        );
+        expect_counts(c, (0, 0), "a snapshot file whose chunk is in memory")?;
+        ensure!(
+            passthrough(c)?["opens_total"].as_u64() == Some(0),
+            "a memory-resident chunk was served by passthrough: {}",
+            passthrough(c)?
+        );
+        drop(again);
+        Ok(())
+    })?;
+
+    c.set_env(NO_MEMORY_TIER.0, NO_MEMORY_TIER.1);
     c.mount_view(Some("/@pt-ro"), &[])?;
     with_clients(std::slice::from_mut(&mut c), |cs| {
         let c = &cs[0];
@@ -707,19 +768,48 @@ pub fn default_by_mount_mode(seed: u64) -> Result<()> {
             "a read-only mount without the opt-in: {p}"
         );
         let path = c.mnt.join("frozen");
-        let f = std::fs::File::open(&path)?;
+        // Unverified in this process: served by the daemon, which hashes it.
+        let first = std::fs::File::open(&path)?;
         ensure!(
-            pread_all(&f, LEN)? == data,
+            pread_all(&first, LEN)? == data,
             "the snapshot reads other bytes"
         );
-        drop(f);
+        drop(first);
+        expect_counts(c, (0, 0), "the first open of an unverified chunk")?;
+
+        let reads = daemon_reads(c)?;
+        let mem = memcache(c)?;
+        let held = std::fs::File::open(&path)?;
+        expect_counts(c, (1, 1), "a snapshot file served by passthrough")?;
+        ensure!(
+            pread_all(&held, LEN)? == data,
+            "the passthrough handle reads other bytes"
+        );
+        ensure!(
+            passthrough(c)?["opens_total"].as_u64() >= Some(1),
+            "opens_total did not move: {}",
+            passthrough(c)?
+        );
+        ensure!(
+            daemon_reads(c)? == reads,
+            "a passthrough read of a snapshot file reached the daemon"
+        );
+        let mem_after = memcache(c)?;
+        ensure!(
+            mem_after.1 == mem.1,
+            "memcache misses moved on a passthrough read: {mem:?} -> {mem_after:?}"
+        );
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
         {
-            Err(e) if e.raw_os_error() == Some(libc::EROFS) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EROFS) => {}
             other => bail!("a read-write open on the read-only mount: {other:?}, want EROFS"),
         }
+        expect_counts(c, (1, 1), "the refused write open changed nothing")?;
+        drop(held);
+        expect_counts(c, (0, 0), "the pin released at the close")?;
+        Ok(())
     })
 }

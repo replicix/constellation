@@ -49,6 +49,31 @@
 //! §3(c), and the FUSE adapter's module doc for what the kernel lets a
 //! later open of such an inode be).
 //!
+//! # Frozen snapshot files (plan 38 Z3c)
+//!
+//! A snapshot view's files are synthetic `Frozen` nodes, which `open`
+//! answers before the live rule could run; they get their own entry,
+//! [`View::frozen_passthrough_backing`], with the live rule's shape and
+//! residency checks and its pin, and without the write-intent ones an
+//! immutable file cannot need. Their pins are trimmed at `release` from
+//! the handle table rather than from `opens` ([`View::release_frozen`]).
+//! Their manifests come from the view's cache of frozen manifests
+//! (`frozen_manifests`), which `read_frozen` shares: a snapshot manifest is
+//! immutable, so the open's load is the reads' too.
+//!
+//! # Not for a chunk the memory tier holds
+//!
+//! Passthrough only wins where the daemon would have gone to the disk
+//! cache anyway. A chunk held in the memory tier is a memory hit for the
+//! daemon, and the kernel reading the chunk file instead is slower: after
+//! `drop_caches` it reads the disk, and with the page cache warm it is
+//! no faster (plan 38 Z3c's measurement, in PROGRESS). So
+//! [`View::pin_backing`] — the residency check both rules share — refuses
+//! a chunk that is in memory ([`DiskCache::in_memory`], a peek that moves
+//! nothing). Since the first verifying read of a chunk admits it to
+//! memory, passthrough engages for chunks the memory tier has evicted, or
+//! with the tier off.
+//!
 //! # Scan-ahead and atime move to the open
 //!
 //! `do_read_detached` fires cross-file scan-ahead at offset 0 and the
@@ -116,26 +141,7 @@ impl View {
         flags: OpenFlags,
         attr: &FileAttr,
     ) -> Option<PassthroughChunk> {
-        // Nobody to hand it to: a frontend that does not consume
-        // `Opened::backing` would drop it, leaving the engine holding an
-        // open descriptor and an un-evictable chunk for a reader that
-        // never existed — and a cache whose budget filled with such
-        // chunks refuses inserts (`CacheFull`) on the *write* path. Only
-        // a frontend that declares it gets offered one (plan 31 §6.6's
-        // `FrontendCaps`; Linux FUSE declares it in plan 38 Z3b, with the
-        // `FOPEN_PASSTHROUGH` reply that consumes it).
-        if !self
-            .passthrough_on
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return None;
-        }
-        // `--cache-verify always` promises that every byte served is
-        // hashed on the read that serves it. A backing file is read by
-        // the kernel, with the daemon never seeing the bytes, so the two
-        // cannot both hold: under `Always` passthrough is never offered
-        // (plan 38 §2.3).
-        if self.cache.verify_mode() != CacheVerify::Admit {
+        if !self.passthrough_offered() {
             return None;
         }
         // Any write intent at all: the handle would have to be able to
@@ -187,13 +193,160 @@ impl View {
             return None;
         }
         let hash = *chunks.get(&0)?;
+        let fd = self.pin_backing(ino, hash, attr.size)?;
+        // The read-path hooks this handle's reads will never reach (see
+        // the module doc). Observable change: an eligible open bumps
+        // atime even if the application never reads a byte, where before
+        // this plan only a read did. Plan 38 §3(c) sanctions it — for a
+        // one-chunk file "it was opened for reading" is the same event as
+        // "offset 0 was read" — and `relatime`'s own granularity (a day)
+        // makes the difference unobservable in all but a test.
+        let files = self.scan.note_read(ino);
+        self.prefetch.enqueue_scan(files);
+        self.atime
+            .on_read(attr, constellation_fs_core::types::now_ns());
+        Some(PassthroughChunk {
+            fd,
+            len: attr.size,
+            hash: hash.0,
+        })
+    }
+
+    /// The two refusals that hold for every open on the view, whatever
+    /// the file: no frontend to hand a backing file to, or
+    /// `--cache-verify always`.
+    fn passthrough_offered(&self) -> bool {
+        // Nobody to hand it to: a frontend that does not consume
+        // `Opened::backing` would drop it, leaving the engine holding an
+        // open descriptor and an un-evictable chunk for a reader that
+        // never existed — and a cache whose budget filled with such
+        // chunks refuses inserts (`CacheFull`) on the *write* path. Only
+        // a frontend that declares it gets offered one (plan 31 §6.6's
+        // `FrontendCaps`; Linux FUSE declares it in plan 38 Z3b, with the
+        // `FOPEN_PASSTHROUGH` reply that consumes it).
+        //
+        // `--cache-verify always` promises that every byte served is
+        // hashed on the read that serves it. A backing file is read by
+        // the kernel, with the daemon never seeing the bytes, so the two
+        // cannot both hold: under `Always` passthrough is never offered
+        // (plan 38 §2.3).
+        self.passthrough_on
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.cache.verify_mode() == CacheVerify::Admit
+    }
+
+    /// The frozen-snapshot counterpart of [`Self::passthrough_backing`]
+    /// (plan 38 Z3c): the file `ino` of a snapshot (`node`, a
+    /// [`SyntheticNode::Frozen`]) may be read from its chunk file directly.
+    /// On `Some`, a [`PassthroughHandle`] is registered for `ino`, and
+    /// [`Self::release_frozen`] drops it.
+    ///
+    /// The rule is the live one with what immutability makes moot left
+    /// out: a snapshot's file has no write session, no writer and no
+    /// pending truncate, and its open for writing is `EROFS` before this
+    /// runs. What remains is the shape (one inline chunk holding exactly
+    /// `size` bytes) and the residency (cached **and verified**), checked
+    /// the same way and pinned the same way, because what keeps the bytes
+    /// under a backing descriptor is the disk cache either way.
+    ///
+    /// Neither read-path hook fires: a frozen read feeds neither the
+    /// scan-ahead (whose directory walk is the live tree's) nor atime (a
+    /// snapshot has none to move), so a passthrough open has nothing to
+    /// make up for.
+    pub(super) fn frozen_passthrough_backing(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        node: &SyntheticNode,
+    ) -> Option<PassthroughChunk> {
+        if !self.passthrough_offered() {
+            return None;
+        }
+        if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC | OpenFlags::APPEND) {
+            return None;
+        }
+        let SyntheticNode::Frozen {
+            kind: InodeKind::File,
+            size,
+            object: Some(object),
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let size = *size;
+        // Before the manifest load: a file larger than a chunk is never
+        // eligible, and its open should not pay for finding that out.
+        if size == 0 || size > u64::from(self.chunk_size) {
+            return None;
+        }
+        // A frozen manifest is not in the replica's tables: it is read
+        // from the snapshot's tree, through the view's cache of them,
+        // which `read_frozen` shares — an open that is not passthrough
+        // leaves its manifest there for the reads that follow, so no
+        // frozen file loads it twice (`frozen_manifests`).
+        let manifest = self
+            .frozen_manifest(object, "snapshot manifest load (passthrough)")
+            .inspect_err(|error| {
+                tracing::debug!(ino, %error, "frozen passthrough: manifest load failed");
+            })
+            .ok()?;
+        if size > u64::from(manifest.layout.chunk_size) || manifest.file_len != size {
+            return None;
+        }
+        let ChunkInfo::Inline(chunks) = &manifest.chunks else {
+            return None;
+        };
+        if chunks.len() != 1 {
+            return None;
+        }
+        let hash = *chunks.get(&0)?;
+        let fd = self.pin_backing(ino, hash, size)?;
+        Some(PassthroughChunk {
+            fd,
+            len: size,
+            hash: hash.0,
+        })
+    }
+
+    /// A handle of the frozen file `ino` was released (the handle table no
+    /// longer lists it): trim its passthrough pins to the handles of it
+    /// still open. A synthetic inode is not counted in `opens` — that
+    /// table names live inodes to the open-orphan hold writer — so the
+    /// count comes from the handle table, which a handover carries too.
+    pub(super) fn release_frozen(&self, ino: Ino) {
+        if !self.passthrough.lock().unwrap().contains_key(&ino) {
+            return;
+        }
+        self.drop_passthrough(ino, self.handles.count(ino));
+    }
+
+    /// Pin `hash` (the whole of `ino`'s `size` bytes), open its chunk file
+    /// and register the pair as one of `ino`'s passthrough handles; `None`,
+    /// with nothing held, if the chunk is held in the memory tier, or is
+    /// not resident and verified at exactly that length.
+    fn pin_backing(&self, ino: Ino, hash: ChunkHash, size: u64) -> Option<Arc<std::fs::File>> {
+        // Held in the memory tier: the daemon serves it from RAM, and the
+        // kernel would read the chunk file — from its page cache if it is
+        // there, from the disk if it is not. Measured on a snapshot view
+        // (PROGRESS, plan 38 Z3c), 4096 small files after `drop_caches`:
+        // passthrough took ~3x the wall time and ~1.8x the daemon CPU of
+        // the memory hits it replaced, and was no faster with the page
+        // cache warm; with the chunk not in memory (tier off or evicted)
+        // it was at parity or better. So a chunk the memory tier holds is
+        // never offered — a peek, which moves neither the tier's counters
+        // nor its recency. Not re-checked while the handle lives: a chunk
+        // admitted later leaves an open passthrough handle where it is.
+        if self.cache.in_memory(&hash) {
+            return None;
+        }
         let resident = self.cache.resident(&hash)?;
         // Not verified: a chunk file this process found on disk at
         // startup and has not hashed. Handing it to the kernel would
         // serve bytes nobody checked, so it is not offered — the first
         // ordinary read hashes it and marks it (plan 38 §2.3), and the
         // next open of the file qualifies.
-        if !resident.verified || resident.len != attr.size {
+        if !resident.verified || resident.len != size {
             return None;
         }
         // The pin before the open, never the other way round: a pinned
@@ -216,7 +369,7 @@ impl View {
         };
         // The accounting said this length; the file itself has the last
         // word, because the kernel will read it without asking again.
-        if fd.metadata().map(|m| m.len()).ok() != Some(attr.size) {
+        if fd.metadata().map(|m| m.len()).ok() != Some(size) {
             tracing::warn!(
                 ino,
                 hash = %hash.to_hex(),
@@ -234,22 +387,7 @@ impl View {
                 _pin: pin,
                 _fd: Some(Arc::clone(&fd)),
             });
-        // The read-path hooks this handle's reads will never reach (see
-        // the module doc). Observable change: an eligible open bumps
-        // atime even if the application never reads a byte, where before
-        // this plan only a read did. Plan 38 §3(c) sanctions it — for a
-        // one-chunk file "it was opened for reading" is the same event as
-        // "offset 0 was read" — and `relatime`'s own granularity (a day)
-        // makes the difference unobservable in all but a test.
-        let files = self.scan.note_read(ino);
-        self.prefetch.enqueue_scan(files);
-        self.atime
-            .on_read(attr, constellation_fs_core::types::now_ns());
-        Some(PassthroughChunk {
-            fd,
-            len: attr.size,
-            hash: hash.0,
-        })
+        Some(fd)
     }
 
     /// An `open`/`create` of `ino` with `flags` was answered: count it if

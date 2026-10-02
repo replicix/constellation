@@ -540,6 +540,29 @@ mod tests {
         hash
     }
 
+    /// `contains` is a peek: no hit, and neither the CLOCK reference bit
+    /// nor the reuse mark that a `get` sets (what keeps an entry and
+    /// promotes it), so asking cannot keep a chunk in memory.
+    #[test]
+    fn contains_touches_nothing() {
+        let c = MemCache::new(64 * KIB);
+        let hash = admit(&c, 1, 4 * KIB);
+        let marks = |c: &MemCache| {
+            let map = c.shard(&hash).map.read().unwrap();
+            let slot = map.get(&hash).unwrap();
+            (slot.referenced.load(Relaxed), slot.reused.load(Relaxed))
+        };
+        let before = marks(&c);
+        for _ in 0..3 {
+            assert!(c.contains(&hash));
+        }
+        assert_eq!(marks(&c), before);
+        assert_eq!(c.stats().hits, 0);
+        c.get(&hash).unwrap();
+        assert!(marks(&c).0, "a read marks the entry referenced");
+        assert_eq!(c.stats().hits, 1);
+    }
+
     #[test]
     fn a_hit_shares_the_admitted_bytes() {
         let c = MemCache::new(64 * KIB);

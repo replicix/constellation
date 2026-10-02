@@ -882,7 +882,12 @@ impl Vfs for View {
                     ..
                 }
             ) {
-                r.done(Ok(Opened::new(self.open_handle(ino))));
+                // The handle first: `release_frozen` trims the pins to the
+                // handles the table still lists, so a pin must never exist
+                // without its handle there (plan 38 Z3c).
+                let fh = self.open_handle(ino);
+                let backing = self.frozen_passthrough_backing(ino, flags, &node);
+                r.done(Ok(Opened { fh, backing }));
             } else {
                 r.done(err(Code::IsDir));
             }
@@ -1124,6 +1129,10 @@ impl Vfs for View {
         let _w = self.watch.enter("release", ino);
         let ino = enter!(self, ino, r);
         if View::is_synthetic(ino) {
+            // Out of the handle table first, so the count the pins are
+            // trimmed to is of the handles still open.
+            drop(_closed);
+            self.release_frozen(ino);
             r.done(Ok(()));
             return;
         }

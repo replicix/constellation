@@ -2088,7 +2088,10 @@ open of a single-chunk, cached, verified file with the chunk file itself
 (`FOPEN_PASSTHROUGH`); the kernel serves its reads. By default only a
 read-only mount (a snapshot view) asks for it; a writable mount needs
 `CONSTELLATION_FUSE_PASSTHROUGH=1`, which every scenario below but
-`passthrough-default-by-mount-mode` sets on its clients. Unprivileged runs never
+`passthrough-default-by-mount-mode` sets on its clients, together with
+`CONSTELLATION_CHUNK_MEMCACHE_BYTES=0`: a chunk held in the daemon's memory
+tier is never handed to the kernel (plan 38 Z3c), and the scenarios' own
+reads would put their chunks there. Unprivileged runs never
 get it (`node.status` `fuse.mounts[].passthrough.unavailable_reason =
 no_cap_sys_admin`), so most lanes test the ordinary path and the
 passthrough scenarios need root:
@@ -2101,7 +2104,7 @@ passthrough scenarios need root:
 | `passthrough-odirect` | an `O_DIRECT` read of a passthrough-open file fetches every byte from the cache's block device although the page cache is warm (`/proc/thread-self/io` `read_bytes`), and neither it nor a buffered read reaches the daemon. Its work dir is under `CONSTELLATION_HARNESS_DISK_DIR` (default `/var/tmp`), which must not be tmpfs |
 | `passthrough-handover` | a passthrough handle held across `daemon --upgrade`: the new image counts it and holds its pin (a prune keeps the chunk), a new open of the file shares the handed-over backing id, the close releases both |
 | `passthrough-disabled-by-verify-always` | `--cache-verify always`: `enabled = false`, reason `cache_verify_always`, no pin, every read reaches the daemon — privileged or not (it requires nothing) |
-| `passthrough-default-by-mount-mode` | without the opt-in: a writable mount reports reason `writable_mount`, holds no passthrough handle and serves a read-write open beside a reader; a read-only mount of a snapshot of the same file negotiates passthrough (no reason), reads the bytes and answers a read-write open `EROFS` (it counts no passthrough open: snapshot files are not eligible yet, see plan 38 §3(c)) |
+| `passthrough-default-by-mount-mode` | without the opt-in: a writable mount reports reason `writable_mount`, holds no passthrough handle and serves a read-write open beside a reader; a read-only mount of a snapshot of the same file negotiates passthrough (no reason); with the daemon's memory tier on (the default) the verifying first read admits the chunk to memory and the next open is **not** passthrough (a chunk held in memory never is, plan 38 Z3c), and on a second snapshot mount with `CONSTELLATION_CHUNK_MEMCACHE_BYTES=0` it serves the frozen file by passthrough: the first open after the new daemon's start is ordinary (its read verifies the chunk the daemon found on disk), the next is counted and pinned (`(opens, open_pins) = (1, 1)`, `opens_total` ≥ 1), reads byte-exact with neither the `read` series nor `cache.memory_misses` moving, a read-write open beside it is `EROFS` and leaves the counts alone, and the close releases the pin |
 
 All but `passthrough-disabled-by-verify-always` `require` `CAP_SYS_ADMIN` and `linux>=6.9` — `requires`
 entries that name a host capability rather than a binary

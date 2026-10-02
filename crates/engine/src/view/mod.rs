@@ -103,6 +103,7 @@ mod create;
 mod durable;
 pub use durable::Handle as OpenHandle;
 mod flush;
+mod frozen_manifests;
 mod handoff;
 mod io;
 mod lock_gate;
@@ -379,6 +380,9 @@ pub struct View {
         HashMap<crate::snapshot::FrozenObject, crate::snapshot::FrozenDir>,
         VecDeque<crate::snapshot::FrozenObject>,
     )>,
+    /// Snapshot files' manifests, shared by `read_frozen` and the
+    /// passthrough check at `open` ([`frozen_manifests`]).
+    frozen_manifests: frozen_manifests::FrozenManifests,
     view_root: Ino,
     /// Cached effective quota (`None` = unlimited), refreshed at most
     /// every [`QUOTA_CACHE_TTL`]. Shared with the control plane so a live
@@ -493,6 +497,9 @@ impl View {
                 next: SYNTHETIC_INO_BIT,
             }),
             tree_cache: Mutex::new((HashMap::new(), VecDeque::new())),
+            frozen_manifests: frozen_manifests::FrozenManifests::new(
+                frozen_manifests::entries_from_env(),
+            ),
             view_root: constellation_fs_core::types::ROOT_INO,
             quota_cache: Arc::new(Mutex::new(None)),
             subtree_quota_cache: Arc::new(Mutex::new(None)),

@@ -40,9 +40,10 @@
 //! ([`PassthroughPolicy::ReadOnlyMounts`]); a writable mount gets it only
 //! when the operator opts in (`CONSTELLATION_FUSE_PASSTHROUGH=1`,
 //! [`PassthroughPolicy::On`]) and accepts that caveat (plan 38 §3(c)).
-//! (Today's read-only mounts are snapshot views, whose frozen files the
-//! engine does not offer as backing files yet, so the default negotiates
-//! passthrough there without serving anything by it.)
+//! (Today's read-only mounts are snapshot views; the engine offers their
+//! frozen one-chunk files as backing files since plan 38 Z3c — like a
+//! live file's, only when the chunk is verified on disk and not held in
+//! the daemon's memory tier, whose hit beats the kernel's read.)
 //!
 //! # The kernel's per-inode rule, which the engine cannot see
 //!

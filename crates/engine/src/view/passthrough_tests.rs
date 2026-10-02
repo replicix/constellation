@@ -52,16 +52,29 @@ fn env_with(verify: CacheVerify, seed: impl FnOnce(&std::path::Path)) -> Env {
 /// `FUSE_INIT` and says so through `Vfs::frontend_negotiated`, and the
 /// engine offers nothing to a frontend that would drop it, so every test
 /// here says so explicitly, the same way.
+///
+/// No memory tier: a chunk held there is never offered (plan 38 Z3c,
+/// [`a_chunk_held_in_memory_is_not_offered`]), and every read in these
+/// tests would put it there. [`env_with_memory`] has one.
 fn fs_with(
     meta: Arc<Meta>,
     verify: CacheVerify,
+    seed: impl FnOnce(&std::path::Path),
+) -> (View, TempDir, Arc<DiskCache>) {
+    fs_with_memory(meta, verify, 0, seed)
+}
+
+fn fs_with_memory(
+    meta: Arc<Meta>,
+    verify: CacheVerify,
+    memory: u64,
     seed: impl FnOnce(&std::path::Path),
 ) -> (View, TempDir, Arc<DiskCache>) {
     let (mut fs, dir, cache) = super::quota_tests::test_fs_with(meta, CHUNK, |root| {
         seed(root);
         DiskCache::open(root, 1 << 30)
             .unwrap()
-            .with_memory_cache(16 << 20)
+            .with_memory_cache(memory)
             .with_verify(verify)
     });
     fs.caps.passthrough = true;
@@ -69,6 +82,26 @@ fn fs_with(
     fs.frontend_negotiated(&caps);
     (fs, dir, cache)
 }
+
+/// A view whose memory tier is [`MEMORY`] bytes, so it admits a chunk of
+/// at most a quarter of that (`MemCache::admits`): a file of up to
+/// [`IN_MEMORY`] bytes goes to memory on its first read, one of
+/// [`NOT_IN_MEMORY`] never does.
+fn env_with_memory() -> Env {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let (fs, dir, cache) = fs_with_memory(meta.clone(), CacheVerify::Admit, MEMORY, |_| {});
+    Env {
+        fs,
+        cache,
+        meta,
+        caller: Caller::new(1000, 1000, None),
+        _dir: dir,
+    }
+}
+
+const MEMORY: u64 = 256 << 10;
+const IN_MEMORY: usize = 4096;
+const NOT_IN_MEMORY: usize = 100 << 10;
 
 impl Env {
     fn cx(&self, kind: OpKind) -> OpCtx<'_> {
@@ -194,6 +227,59 @@ fn an_eligible_read_only_open_is_answered_with_the_chunk_file() {
     // The caller's own clone of the descriptor still reads: dropping the
     // pin is not closing the file.
     assert_eq!(through_fd(backing), data);
+}
+
+/// Plan 38 Z3c: a chunk the memory tier holds is a memory hit for the
+/// daemon, which the kernel reading the chunk file would only be slower
+/// than, so it is not offered — while a verified chunk only on disk (one
+/// the tier does not hold) is, in the same view. Asking moves none of the
+/// tier's counters.
+#[test]
+fn a_chunk_held_in_memory_is_not_offered() {
+    let e = env_with_memory();
+    let (hot, hot_data) = file(&e, "hot", IN_MEMORY, 30);
+    let (disk, disk_data) = file(&e, "disk", NOT_IN_MEMORY, 31);
+    let hot_hash = e.chunks(hot)[0];
+    let disk_hash = e.chunks(disk)[0];
+
+    // Written, so verified on disk; a write does not admit to memory, and
+    // until a read does the chunk is offered.
+    assert!(!e.cache.in_memory(&hot_hash));
+    let opened = e.open_ro(hot);
+    assert!(opened.backing.is_some(), "verified, on disk, not in memory");
+    e.release(hot);
+
+    // The first read admits the small chunk and not the large one.
+    assert_eq!(e.read(hot, 0, IN_MEMORY as u32), hot_data);
+    assert_eq!(e.read(disk, 0, NOT_IN_MEMORY as u32), disk_data);
+    assert!(e.cache.in_memory(&hot_hash));
+    assert!(!e.cache.in_memory(&disk_hash));
+    assert_eq!(e.cache.resident(&disk_hash).map(|r| r.verified), Some(true));
+
+    let stats = e.cache.memory_stats().unwrap();
+    assert!(
+        e.open_ro(hot).backing.is_none(),
+        "a memory-resident chunk was handed to the kernel"
+    );
+    assert_eq!(e.cache.open_pin_count(&hot_hash), 0);
+    assert_eq!(e.fs.passthrough_handles(hot), 0);
+    let after = e.cache.memory_stats().unwrap();
+    assert_eq!(
+        (after.hits, after.misses),
+        (stats.hits, stats.misses),
+        "the refusal moved the memory tier's counters"
+    );
+    // Its reads are memory hits, as before passthrough.
+    assert_eq!(e.read(hot, 0, IN_MEMORY as u32), hot_data);
+    assert_eq!(e.cache.memory_stats().unwrap().hits, after.hits + 1);
+    e.release(hot);
+
+    let opened = e.open_ro(disk);
+    let backing = opened.backing.as_ref().expect("verified and only on disk");
+    assert_eq!(through_fd(backing), disk_data);
+    assert_eq!(e.cache.open_pin_count(&disk_hash), 1);
+    e.release(disk);
+    assert_eq!(e.cache.open_pin_count(&disk_hash), 0);
 }
 
 /// A frontend that does not declare it consumes `Opened::backing` is
@@ -820,4 +906,368 @@ fn create_never_offers_a_backing_file() {
         )
     })
     .expect("flush");
+}
+
+// --- Plan 38 Z3c: frozen snapshot files ---------------------------------
+
+/// A snapshot of `/vol` holding one file per `(name, len)`, written,
+/// flushed and demoted to clean as [`file`] leaves them; the snapshot's
+/// tree is published through a manager that shares the view's chunk
+/// store. Returns the frozen inode of each file, as
+/// `/vol/.constellation/snapshot/snap/<name>` looks it up, with its bytes.
+fn frozen_files(e: &mut Env, files: &[(&str, usize)]) -> (Vec<(Ino, Vec<u8>)>, TempDir) {
+    let vol = e.meta.mkdir(ROOT_INO, "vol", 0o755, 0, 0).unwrap();
+    let mut live = Vec::new();
+    for (i, (name, len)) in files.iter().enumerate() {
+        let data = bytes(*len, 40 + i as u8);
+        let f = e.meta.create(vol.ino, name, 0o644, 0, 0).unwrap();
+        if !data.is_empty() {
+            e.fs.do_write(f.ino, 0, &data).unwrap();
+            e.fs.flush_inode(f.ino, false).unwrap();
+            for h in e.chunks(f.ino) {
+                e.cache.set_state(&h, ChunkState::Clean);
+            }
+        }
+        live.push((*name, data));
+    }
+    let (manager, nodes) = crate::snapshot::test_manager(e.meta.clone(), e.fs.store.clone(), CHUNK);
+    let rows = e.meta.take_journal(usize::MAX).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    e.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(manager.create("/vol", "snap"))
+        .unwrap();
+    e.fs.snapshots = Arc::new(manager);
+    let mut dir = vol.ino;
+    for name in [".constellation", "snapshot", "snap"] {
+        dir = e.fs.lookup_synthetic(dir, name).unwrap().unwrap().0;
+    }
+    let frozen = live
+        .into_iter()
+        .map(|(name, data)| {
+            let (ino, attr) = e.fs.lookup_synthetic(dir, name).unwrap().unwrap();
+            assert!(View::is_synthetic(ino));
+            assert_eq!(attr.size, data.len() as u64);
+            (ino, data)
+        })
+        .collect();
+    (frozen, nodes)
+}
+
+impl Env {
+    /// `release` of exactly `fh` (a frozen file's pins are trimmed to the
+    /// handles the table still lists, so the test hands back the real one).
+    fn release_fh(&self, ino: Ino, fh: Fh) {
+        Blocking::run(|r| {
+            self.fs
+                .release(&self.cx(OpKind::Release), ino, fh, OpenFlags::READ, None, r)
+        })
+        .expect("release");
+    }
+
+    fn read_fh(&self, ino: Ino, fh: Fh, off: u64, len: u32) -> Vec<u8> {
+        Blocking::run(|r| self.fs.read(&self.cx(OpKind::Read), ino, fh, off, len, r))
+            .expect("read")
+            .contiguous()
+            .into_owned()
+    }
+}
+
+/// The snapshot view's whole point under the read-only default: a frozen
+/// one-chunk file whose chunk is cached and verified is answered with the
+/// chunk file, pinned until the handle's release; an open for writing is
+/// still `EROFS`.
+#[test]
+fn a_frozen_one_chunk_file_is_answered_with_the_chunk_file() {
+    let mut e = env();
+    let (frozen, _nodes) = frozen_files(&mut e, &[("one", 4096)]);
+    let (ino, data) = frozen[0].clone();
+    let vol = e.meta.lookup(ROOT_INO, "vol").unwrap().unwrap().ino;
+    let hash = e.chunks(e.meta.lookup(vol, "one").unwrap().unwrap().ino)[0];
+
+    let opened = e.open_ro(ino);
+    let backing = opened.backing.as_ref().expect("backing chunk file");
+    assert_eq!(backing.len, data.len() as u64);
+    assert_eq!(backing.hash, hash.0);
+    assert_eq!(through_fd(backing), data);
+    assert_eq!(e.cache.open_pin_count(&hash), 1);
+    assert_eq!(e.fs.passthrough_handles(ino), 1);
+    // The handle still reads through the daemon (a frontend that is not
+    // FUSE, or a kernel that falls back), and the same bytes.
+    assert_eq!(e.read_fh(ino, opened.fh, 0, 8192), data);
+    // A synthetic inode never joins `opens` (the hold writer's table).
+    assert!(!e.fs.opens.lock().unwrap().contains_key(&ino));
+
+    for flags in [
+        OpenFlags::WRITE,
+        OpenFlags::READ | OpenFlags::WRITE,
+        OpenFlags::READ | OpenFlags::TRUNC,
+    ] {
+        let refused = Blocking::run(|r| {
+            e.fs.open(&e.cx(OpKind::Open), ino, flags, OpenOwner::NONE, r)
+        });
+        assert_eq!(
+            refused.err().map(|e| e.code()),
+            Some(Code::ReadOnly),
+            "{flags:?}"
+        );
+    }
+    assert_eq!(
+        e.cache.open_pin_count(&hash),
+        1,
+        "a refused open pins nothing"
+    );
+
+    e.release_fh(ino, opened.fh);
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
+    assert_eq!(e.fs.passthrough_handles(ino), 0);
+    e.cache.prune_to(0).unwrap();
+    assert!(!e.cache.contains(&hash), "evictable once the handle closed");
+}
+
+/// Two handles of a frozen file pin it twice; the first release leaves
+/// the other's pin, the second takes it — counted from the handle table,
+/// since a synthetic inode is not in `opens`.
+#[test]
+fn a_frozen_files_pins_follow_its_open_handles() {
+    let mut e = env();
+    let (frozen, _nodes) = frozen_files(&mut e, &[("two", 1000)]);
+    let (ino, _) = frozen[0].clone();
+    let a = e.open_ro(ino);
+    let b = e.open_ro(ino);
+    let hash = ChunkHash(a.backing.as_ref().unwrap().hash);
+    assert_eq!(e.cache.open_pin_count(&hash), 2);
+    e.release_fh(ino, a.fh);
+    assert_eq!(e.cache.open_pin_count(&hash), 1);
+    e.cache.prune_to(0).unwrap();
+    assert!(e.cache.contains(&hash), "evicted under a live handle");
+    e.release_fh(ino, b.fh);
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
+}
+
+/// What the live rule refuses for its shape or residency, the frozen one
+/// refuses too: more than one chunk, nothing to hand over, a chunk that is
+/// not cached, and a frontend that cannot consume a backing file.
+#[test]
+fn ineligible_frozen_files_are_served_by_reads() {
+    let mut e = env();
+    let big = CHUNK as usize + 10;
+    let (frozen, _nodes) = frozen_files(
+        &mut e,
+        &[("big", big), ("empty", 0), ("cold", 300), ("small", 300)],
+    );
+    let opened = e.open_ro(frozen[0].0);
+    assert!(opened.backing.is_none(), "multi-chunk");
+    assert_eq!(
+        e.read_fh(frozen[0].0, opened.fh, 0, big as u32),
+        frozen[0].1
+    );
+    assert!(e.open_ro(frozen[1].0).backing.is_none(), "empty");
+
+    let vol = e.meta.lookup(ROOT_INO, "vol").unwrap().unwrap().ino;
+    let cold = e.meta.lookup(vol, "cold").unwrap().unwrap().ino;
+    let cold_hash = e.chunks(cold)[0];
+    // Out of the disk cache (the in-memory store keeps a copy only of
+    // what was uploaded, which nothing here did — so it is not read).
+    e.cache.remove(&cold_hash).unwrap();
+    assert!(e.open_ro(frozen[2].0).backing.is_none(), "not resident");
+
+    e.fs.set_passthrough_on(false);
+    assert!(e.open_ro(frozen[3].0).backing.is_none(), "frontend");
+    e.fs.set_passthrough_on(true);
+    assert!(e.open_ro(frozen[3].0).backing.is_some());
+}
+
+/// The memory-tier refusal holds for a frozen file too (it lives in the
+/// residency check both rules share): a snapshot file whose chunk is in
+/// memory is served by reads, one whose verified chunk is only on disk is
+/// offered.
+#[test]
+fn a_frozen_file_held_in_memory_is_not_offered() {
+    let mut e = env_with_memory();
+    let (frozen, _nodes) = frozen_files(&mut e, &[("hot", IN_MEMORY), ("disk", NOT_IN_MEMORY)]);
+    let (hot, hot_data) = frozen[0].clone();
+    let (disk, disk_data) = frozen[1].clone();
+
+    // Not in memory yet: offered. Its handle's read still reaches the
+    // daemon here (no kernel), which admits the chunk to memory.
+    let first = e.open_ro(hot);
+    let hash = ChunkHash(first.backing.as_ref().expect("not in memory yet").hash);
+    assert_eq!(e.read_fh(hot, first.fh, 0, IN_MEMORY as u32 * 2), hot_data);
+    e.release_fh(hot, first.fh);
+    assert!(e.cache.in_memory(&hash));
+    let opened = e.open_ro(hot);
+    assert!(opened.backing.is_none(), "a memory-resident frozen chunk");
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
+    assert_eq!(e.read_fh(hot, opened.fh, 0, IN_MEMORY as u32 * 2), hot_data);
+    e.release_fh(hot, opened.fh);
+
+    let opened = e.open_ro(disk);
+    assert_eq!(
+        through_fd(opened.backing.as_ref().expect("verified, only on disk")),
+        disk_data
+    );
+    e.release_fh(disk, opened.fh);
+}
+
+/// A frozen chunk that is resident but unverified (found by a restart's
+/// rescan, hashed by nobody in this process) is not offered; the first
+/// read hashes it, and the open after that is passthrough.
+#[test]
+fn an_unverified_frozen_chunk_is_hashed_by_a_read_before_it_is_offered() {
+    let mut first = env();
+    let (frozen, nodes) = frozen_files(&mut first, &[("scanned", 4096)]);
+    let data = frozen[0].1.clone();
+    let vol = first.meta.lookup(ROOT_INO, "vol").unwrap().unwrap().ino;
+    let hash = first.chunks(first.meta.lookup(vol, "scanned").unwrap().unwrap().ino)[0];
+    let seeded = first.cache.chunk_path(&hash);
+
+    // A second view over a copy of the cache directory, sharing the
+    // metadata, the store and the snapshot manager: its rescan finds the
+    // chunk unverified.
+    let hex = hash.to_hex();
+    let (mut fs, dir, cache) = fs_with(first.meta.clone(), CacheVerify::Admit, |root| {
+        let dest = root.join(&hex[0..2]).join(&hex[2..4]).join(&hex);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(&seeded, &dest).unwrap();
+    });
+    fs.store = first.fs.store.clone();
+    fs.snapshots = first.fs.snapshots.clone();
+    let e = Env {
+        fs,
+        cache,
+        meta: first.meta.clone(),
+        caller: Caller::new(1000, 1000, None),
+        _dir: dir,
+    };
+    let _nodes = nodes;
+    // The same frozen file, interned in this view.
+    let mut snap = vol;
+    for name in [".constellation", "snapshot", "snap"] {
+        snap = e.fs.lookup_synthetic(snap, name).unwrap().unwrap().0;
+    }
+    let (ino2, attr) = e.fs.lookup_synthetic(snap, "scanned").unwrap().unwrap();
+    assert!(View::is_synthetic(ino2) && attr.size == data.len() as u64);
+    assert_eq!(e.cache.resident(&hash).map(|r| r.verified), Some(false));
+
+    let opened = e.open_ro(ino2);
+    assert!(
+        opened.backing.is_none(),
+        "an unhashed frozen chunk was handed out"
+    );
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
+    assert_eq!(e.read_fh(ino2, opened.fh, 0, 8192), data);
+    e.release_fh(ino2, opened.fh);
+    assert_eq!(e.cache.resident(&hash).map(|r| r.verified), Some(true));
+
+    let opened = e.open_ro(ino2);
+    assert_eq!(
+        through_fd(opened.backing.as_ref().expect("now verified")),
+        data
+    );
+    e.release_fh(ino2, opened.fh);
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
+}
+
+/// A read-only open with `O_APPEND` of a frozen file gets no backing file
+/// (append is write intent, which a backing file cannot carry), and is
+/// served by reads; the plain read-only open beside it still is offered.
+#[test]
+fn a_read_only_append_open_of_a_frozen_file_is_not_offered() {
+    let mut e = env();
+    let (frozen, _nodes) = frozen_files(&mut e, &[("appended", 4096)]);
+    let (ino, data) = frozen[0].clone();
+    let opened = e.open(ino, OpenFlags::READ | OpenFlags::APPEND);
+    assert!(opened.backing.is_none());
+    assert_eq!(e.fs.passthrough_handles(ino), 0);
+    assert_eq!(e.read_fh(ino, opened.fh, 0, 8192), data);
+    let plain = e.open_ro(ino);
+    assert!(plain.backing.is_some());
+    e.release_fh(ino, opened.fh);
+    assert_eq!(
+        e.fs.passthrough_handles(ino),
+        1,
+        "the plain handle's pin stays"
+    );
+    e.release_fh(ino, plain.fh);
+    assert_eq!(e.fs.passthrough_handles(ino), 0);
+}
+
+/// A frozen file's manifest is loaded once: the passthrough check at
+/// `open` and every `read` after it share the view's cache, whether the
+/// open was passthrough or not.
+#[test]
+fn a_frozen_manifest_is_loaded_once_for_the_open_and_its_reads() {
+    let mut e = env();
+    let big = CHUNK as usize + 10;
+    let (frozen, _nodes) = frozen_files(&mut e, &[("one", 4096), ("big", big)]);
+    let (one, data) = frozen[0].clone();
+    let (two, big_data) = frozen[1].clone();
+    let (entries0, _, misses0) = e.fs.frozen_manifests.stats();
+
+    let opened = e.open_ro(one);
+    assert!(opened.backing.is_some());
+    for _ in 0..3 {
+        assert_eq!(e.read_fh(one, opened.fh, 0, 8192), data);
+    }
+    e.release_fh(one, opened.fh);
+    let reopened = e.open_ro(one);
+    e.release_fh(one, reopened.fh);
+    let (entries, hits, misses) = e.fs.frozen_manifests.stats();
+    assert_eq!(misses, misses0 + 1, "loaded once");
+    assert_eq!(entries, entries0 + 1);
+    assert!(hits >= 4, "three reads and a reopen: {hits}");
+
+    // A file passthrough refuses on its size never loads it at open; its
+    // reads load it once.
+    let opened = e.open_ro(two);
+    assert!(opened.backing.is_none());
+    assert_eq!(e.fs.frozen_manifests.stats().2, misses);
+    assert_eq!(e.read_fh(two, opened.fh, 0, big as u32), big_data);
+    assert_eq!(e.read_fh(two, opened.fh, 0, 10), big_data[..10]);
+    assert_eq!(e.fs.frozen_manifests.stats().2, misses + 1);
+    e.release_fh(two, opened.fh);
+}
+
+#[test]
+fn cache_verify_always_never_offers_a_frozen_file() {
+    let mut e = env_with(CacheVerify::Always, |_| {});
+    let (frozen, _nodes) = frozen_files(&mut e, &[("one", 4096)]);
+    let (ino, data) = frozen[0].clone();
+    let opened = e.open_ro(ino);
+    assert!(opened.backing.is_none());
+    assert_eq!(e.read_fh(ino, opened.fh, 0, 8192), data);
+}
+
+/// A frozen passthrough handle crosses a handover like a live one: the
+/// new image re-pins its chunk, and its release there (the handle table
+/// crossed too) lets it go.
+#[test]
+fn a_frozen_passthrough_handle_crosses_a_handover() {
+    let mut e = env();
+    let (frozen, _nodes) = frozen_files(&mut e, &[("kept", 4096)]);
+    let (ino, _) = frozen[0].clone();
+    let opened = e.open_ro(ino);
+    let hash = ChunkHash(opened.backing.as_ref().unwrap().hash);
+    let snapshot = e.fs.export_handles();
+    assert_eq!(snapshot.passthrough, vec![(ino, vec![hash.0])]);
+
+    let next = super::quota_tests::test_fs_on(
+        e.meta.clone(),
+        CHUNK,
+        e.cache.clone(),
+        e._dir.path().join("staging-next"),
+    );
+    next.import_handles(&snapshot);
+    drop(std::mem::replace(&mut e.fs, next));
+    assert_eq!(
+        e.cache.open_pin_count(&hash),
+        1,
+        "re-pinned by the new image"
+    );
+    e.release_fh(ino, opened.fh);
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
 }

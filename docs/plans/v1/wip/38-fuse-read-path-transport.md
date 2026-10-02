@@ -699,12 +699,54 @@ of ~25 % CPU-s/GiB on the cold small-file lane only, the decision is:
   documented opt-in carrying the `ETXTBSY` caveat and the list above
   (`docs/reference/configuration.md`, "FUSE passthrough").
 
-*Gap found while testing the decision:* the only read-only mounts are
-frozen snapshot views, and `View::open` answers their files (synthetic
-`Frozen` nodes) before the eligibility rule runs, so a read-only mount
-negotiates passthrough (`enabled: true`) but is never offered a backing
-file. Until eligibility covers frozen files (an engine change, outside
-Z3b), the default serves nothing by passthrough and only the opt-in does.
+*Frozen files (Z3c).* The only read-only mounts are frozen snapshot views,
+whose files `View::open` answers as synthetic `Frozen` nodes, so Z3b's
+default negotiated passthrough there (`enabled: true`) without serving a
+file by it. Z3c extends eligibility to them
+(`View::frozen_passthrough_backing`): the same shape and residency rule —
+one inline chunk holding exactly the file's `size` bytes, resident and
+verified in the disk cache, `--cache-verify admit`, a frontend that
+consumes backing files — and the same pin-while-open guard. What
+immutability makes moot is left out: a snapshot file has no write session,
+no writer and no pending truncate, and its open for writing is `EROFS`
+before the rule runs. The frozen manifest comes from a per-view cache of
+snapshot manifests (`frozen_manifests`, bounded by
+`CONSTELLATION_SNAPSHOT_MANIFEST_CACHE`, default 8192 entries, LRU; never
+invalidated, because a snapshot manifest is immutable) that `read_frozen`
+shares, so the open's load is the reads' too — before Z3c every read of a
+frozen file loaded it again — and it is looked up at open only for a file
+no larger than a chunk. Neither read-path hook moves to the open, because
+a frozen read fires neither (snapshots have no atime, and scan-ahead walks
+the live tree). A synthetic inode is not counted in `opens` (that table
+names live inodes to the open-orphan hold writer), so its `release` trims
+the pins to the handles of it the plan-39 handle table still lists, which
+a handover carries too. The same rule serves a frozen file reached through
+`<dir>/.constellation/snapshot/<name>/` on a writable mount that opted in.
+A *live* view mounted read-only would need no change — its opens take the
+live rule, which does not depend on the mount — but no product path makes
+one today (`MountOptions::read_only` is set only for a frozen view; a CSI
+read-only volume is a read-only *bind* of a writable FUSE mount).
+
+*Not for a chunk held in memory (Z3c review).* Measured on a snapshot view
+(4096 × 64 KiB files, 4 MiB chunks, a 1 GiB memory tier), Z3c as first
+written served every open by passthrough once the chunks were verified,
+and after `drop_caches` that took ~3× the wall time and ~1.8× the daemon
+CPU of the memory hits it replaced (7.7 s against 2.4 s), with no gain on a
+warm page cache; with the memory tier off it was at parity or better. The
+default must not regress, so the residency check both rules share
+(`pin_backing`) refuses a chunk the memory tier holds
+(`DiskCache::in_memory`, a peek that moves neither the tier's counters nor
+its recency). Passthrough is therefore taken only for verified chunks on
+disk and not in memory: those the memory tier has evicted, or all of them
+with the tier off. The cost: the verifying first read admits a chunk to
+memory, so a small, hot set of files is rarely served by passthrough; it
+engages where the daemon would read the disk cache anyway, which is where
+Z3b measured its win (an empty memory tier). With it, the default is at
+parity with `CONSTELLATION_FUSE_PASSTHROUGH=0` or better on every row
+(medians, PROGRESS "Plan 38 Z3c"): memory tier on, nothing is passthrough,
+page cache warm 2.16 s vs 2.29 s and after `drop_caches` 2.19 s vs 2.35 s;
+tier off, every open is passthrough, warm 2.14 s vs 2.25 s and after
+`drop_caches` 7.34 s vs 7.83 s.
 
 The `ETXTBSY` refusal is made at the open's *reply*, after the view
 answered (the view's handle is released again), so the view's own

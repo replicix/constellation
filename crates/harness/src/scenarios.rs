@@ -1476,8 +1476,11 @@ pub const SCENARIOS: &[Scenario] = &[
         name: "passthrough-default-by-mount-mode",
         desc: "plan 38 §3(c)/Z3b: without CONSTELLATION_FUSE_PASSTHROUGH a writable mount \
                does not ask (reason writable_mount; a read-write open beside a reader is \
-               ordinary), while a read-only mount of a snapshot of the same file negotiates it \
-               and answers a read-write open EROFS",
+               ordinary), while a read-only mount of a snapshot of the same file negotiates it; \
+               with the memory tier on the chunk its first read admits is not handed over, and \
+               with the tier off the frozen file is served by passthrough (counted, pinned, \
+               byte-exact, no daemon read) once its chunk is verified, a read-write open is \
+               EROFS and the close releases the pin",
         requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
         caps: &[],
         run: passthrough::default_by_mount_mode,

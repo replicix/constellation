@@ -33373,3 +33373,153 @@ index, `backup-takeover-drops-held-chunks`, `node-leave`,
 in its environment, so the back-close `fsync` check on AWS us-west-2 and OVH
 Milan was not repeated; the figures above the review round are the first
 round's.
+
+- ~~**The read-only default serves nothing yet.**~~ Closed by Z3c (below):
+  frozen snapshot files are eligible, so a snapshot view serves its
+  one-chunk files by passthrough under the default.
+
+## Plan 38 Z3c — frozen snapshot files are passthrough-eligible
+
+Z3b turned passthrough on by default only for read-only mounts, and the
+only read-only mounts are snapshot views, whose files `View::open` answered
+as synthetic `Frozen` nodes before Z3a's eligibility rule ran: the default
+negotiated passthrough and served nothing by it. Z3c makes frozen files
+eligible under the live rule. After the review fix round, passthrough —
+live or frozen — is taken only for verified chunks that are **not held in
+the daemon's memory tier** (a memory hit beats the kernel reading the chunk
+file), so the read-only default serves a snapshot view's one-chunk files by
+passthrough where the daemon would otherwise read its disk cache: chunks the
+memory tier evicted, or all of them with the tier off.
+
+### What landed
+
+| Item | Where |
+|---|---|
+| Frozen eligibility | `View::frozen_passthrough_backing` (`crates/engine/src/view/passthrough.rs`), called from `open`'s synthetic branch after the `EROFS` refusal: frontend negotiated it and `--cache-verify admit` (shared with the live rule as `passthrough_offered`), no write intent, a regular non-empty file no larger than a chunk (checked from the node's `size` *before* loading anything), its frozen manifest (from the view's frozen-manifest cache, shared with `read_frozen`; fix round) one inline chunk with `file_len == size`, that chunk resident **and verified** at exactly `size` bytes. The write-session / `writers` / truncate checks are dropped: a snapshot file cannot have any |
+| Same pin | the live rule's tail is now `View::pin_backing` (not-in-memory check — fix round —, resident+verified check, pin before open, length check, registration), used by both rules |
+| Release | a synthetic inode is not counted in `opens` (that table is what the open-orphan hold writer publishes, and synthetic numbers are not live inodes), so `release` of a frozen handle first takes it out of the plan-39 handle table and then trims the inode's pins to the handles of it the table still lists (`View::release_frozen`, `Handles::count`). The handle table already crosses a handover, so a handed-over frozen passthrough handle releases correctly in the new image; no format change |
+| Hooks | neither scan-ahead nor atime moves to a frozen open: a frozen read fires neither |
+| `.constellation/snapshot/…` on a live mount | the same rule applies (it is the same node type); on a writable mount it only matters with the opt-in |
+| Docs | plan 38 §3(c) ("Frozen files (Z3c)"), `docs/reference/configuration.md` "FUSE passthrough", `TESTING.md` scenario table, the FUSE adapter's module doc |
+
+### Decisions
+
+- **Live read-only mounts.** No product path makes one: `MountOptions::read_only`
+  is set only for a frozen view (`node_runtime.rs`: `read_only = spec.is_frozen()`),
+  and a CSI read-only volume is a read-only *bind* of a writable FUSE
+  mount, so its session never asks. Were one made, its opens would take the
+  live rule, which has no input for the mount mode; the existing Z3a/Z3b
+  tests already cover that rule, so no new test was added for a path that
+  cannot be reached.
+- **The pin count for frozen handles comes from the handle table**, not
+  from adding synthetic inodes to `opens` (which would leak them into
+  `OpenHandles::open_inos` and the orphan hold records).
+- **The first open after a daemon start is ordinary** when the chunk was
+  found on disk rather than fetched (unverified until read, plan 38 §2.3),
+  exactly as for live files. The harness scenario asserts that sequence.
+- **`O_APPEND` without write access** stays refused, matching the live rule.
+
+### Gates, first round (2026-10-02, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings`; same with `--features constellation-frontend-fuse/io-uring` | clean, clean |
+| `cargo test -p constellation-engine -p constellation-frontend-fuse -p constellation` | all passed (engine 494 + 7 ignored, incl. 5 new `passthrough_tests` for frozen files) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| root, prefix `z3c-root`: `harness run` the 7 `passthrough-*` scenarios + `snapshot-mount` | all PASSED (`passthrough-default-by-mount-mode` now asserts a snapshot-view passthrough open: counts `(1, 1)`, `opens_total` ≥ 1, byte-exact, no daemon read and no memcache miss, `EROFS` beside it, pin released at close) |
+| root, prefix `z3c-root`: `harness run upgrade-under-load` | PASSED |
+| ad hoc smallfiles on a snapshot view (4096 × 64 KiB, 4 MiB chunks, fio as `read-cpu-gate.sh`'s lane, second pass measured; root) | default: `opens_total` 4096, memcache hits 0 / misses 0; `CONSTELLATION_FUSE_PASSTHROUGH=0`: 0 opens, 4096 memcache hits. Page cache warm: 1.37 s / 2.52 CPU-s vs 1.49 s / 2.19 CPU-s, and 8.8 s vs 9.7 s on a busier round, i.e. parity within this host's noise. After `drop_caches` passthrough is slower (6.4–7.2 s vs 2.4 s), because the kernel then reads every chunk file from disk while the daemon serves the same files from its 1 GiB memory tier |
+
+### Review fix round
+
+The review (verdict *fix*) reproduced the first round's own smallfiles
+numbers: after `drop_caches` the new default took ~3× the wall time and
+~1.8× the daemon CPU of `CONSTELLATION_FUSE_PASSTHROUGH=0`, because every
+open went to passthrough and the kernel read each chunk file from disk
+where the daemon had served a memory hit. A default must not regress.
+
+| Finding | Resolution |
+|---|---|
+| Must fix 1: cold-page-cache regression | option (a). `DiskCache::in_memory(&hash)` (`crates/fs-core/src/cache.rs`; was the test-only `memory_contains`, renamed and documented as a peek) moves no hit/miss counter and neither the CLOCK reference bit nor the reuse mark (`MemCache::contains`). `View::pin_backing` refuses a chunk it reports, so the live writable-mount opt-in is covered too. Not re-checked while a handle lives (a chunk admitted later leaves an open passthrough handle alone) |
+| Should fix 1: manifest loaded at open and again per read | `view/frozen_manifests.rs`: a per-view LRU of frozen manifests keyed by `FrozenObject` (snapshot tree root + inode — the frozen file's identity; immutable, so never invalidated), bounded by `CONSTELLATION_SNAPSHOT_MANIFEST_CACHE` (entries, default 8192, `0` off; an entry is a few hundred bytes since a manifest inlines at most 8 chunk hashes). `View::frozen_manifest` is the one loader, shared by `frozen_passthrough_backing` and `read_frozen`, so no frozen file loads its manifest twice and every read after the first hits (before Z3c each read loaded it) |
+| Should fix 2: docs claimed more than delivered | configuration.md "FUSE passthrough" (the memory-tier rule, the measured table, the new knob; the memcache row says it), plan 38 §3(c) ("Not for a chunk held in memory (Z3c review)"), `passthrough.rs` module doc |
+| Nit: resident-but-unverified frozen chunk | `an_unverified_frozen_chunk_is_hashed_by_a_read_before_it_is_offered` |
+| Nit: read-only `O_APPEND` frozen open | `a_read_only_append_open_of_a_frozen_file_is_not_offered` |
+| Nits: `Handles::count` O(open handles); a refused `release` keeps its pin until the next release/teardown | left as is — the reviewer called both fine (bounded, never early) |
+
+Tests: fs-core `in_memory_moves_no_counter_and_no_entry`,
+`memcache::contains_touches_nothing`; engine
+`a_chunk_held_in_memory_is_not_offered` (live: offered before any read,
+refused once a read admitted it — with the tier's counters unmoved by the
+refusal —, a verified chunk too large for the tier offered in the same
+view), `a_frozen_file_held_in_memory_is_not_offered`,
+`a_frozen_manifest_is_loaded_once_for_the_open_and_its_reads`, the two nits,
+and `frozen_manifests::tests` (hit/miss, LRU bound, zero bound, env
+parsing). `passthrough_tests`' views now run without a memory tier (their
+reads would otherwise put every chunk there); `env_with_memory` has one.
+Harness: the six live `passthrough-*` scenarios run their daemons with
+`CONSTELLATION_CHUNK_MEMCACHE_BYTES=0` for the same reason;
+`passthrough-default-by-mount-mode` mounts the snapshot twice — memory tier
+on (the default: the verifying read goes through the tier, the next open
+is **not** passthrough, `opens_total` 0), then off (the next open is
+passthrough, with the first round's assertions).
+
+#### No-regression evidence
+
+The reviewer's ad-hoc bench (`/tmp/z3crev/bench.sh`: a snapshot view of
+4096 × 64 KiB files, 4 MiB chunks, `--cache-size 4G`, the read-cpu gate's
+smallfiles fio arguments, root, btrfs `/var/tmp`), run as an interleaved
+A/B: per rep, one mount with passthrough on (default) and one with
+`CONSTELLATION_FUSE_PASSTHROUGH=0`, each doing pass 1 (verifying), passes
+2–3 (page cache warm) and passes 4–5 (each after `drop_caches`). The host
+ran at load 20–50 from other work, and whichever mode ran first in a rep
+paid for it (swapping the order flipped the pass-1 gap), so the memory-on
+rows combine 4 reps on-first and 3 off-first; the memory-off rows are 3
+reps on-first (the order that disadvantages passthrough). Medians, wall s /
+daemon CPU s:
+
+| Row | Passthrough on (default) | `=0` | Passthrough opens per pass (on) |
+|---|---|---|---|
+| memory tier 1 GiB, pass 1 (verify) | 6.49 / 4.10 | 6.74 / 3.89 | 0 |
+| memory tier 1 GiB, page cache warm (pass 2 / 3) | 2.16 / 2.97, 2.32 / 3.80 | 2.29 / 3.50, 2.37 / 4.21 | 0 |
+| memory tier 1 GiB, after `drop_caches` (pass 4 / 5) | 2.19 / 4.26, 2.37 / 4.55 | 2.35 / 4.42, 2.34 / 4.34 | 0 |
+| memory tier off, pass 1 (verify) | 6.92 / 4.36 | 6.25 / 3.74 | 0 |
+| memory tier off, page cache warm (pass 2 / 3) | 2.14 / 2.76, 2.15 / 3.25 | 2.25 / 4.18, 2.37 / 4.65 | 4096 |
+| memory tier off, after `drop_caches` (pass 4 / 5) | 7.34 / 5.70, 7.68 / 5.86 | 7.83 / 6.10, 7.99 / 6.27 | 4096 |
+
+Every required row (page cache warm and after `drop_caches`, tier on and
+off) has passthrough on ≤ off, or within 1 % wall / 5 % CPU (memory on,
+pass 5) against a per-sample spread of ±30 % CPU on this host. The review's
+regression row (memory on, after `drop_caches`: 7.7 s vs 2.4 s) is gone —
+2.19 s vs 2.35 s, 0 passthrough opens. The memory-off pass-1 gap is the
+on-first order (with off first the memory-on pass 1 was 6.48 / 3.76 vs
+7.27 / 4.65). The reviewer's sequential script (one mount per mode, on
+first) is what showed the order effect: its first runs had the on mount
+worse on every pass, 0 passthrough opens included (memory on: warm 8.5 s vs
+2.4 s, at load ~35), while the same script with off first had on ≤ off; one
+memory-off run hit a load spike on its on mount (pass 1 17.5 s vs 8.7 s).
+Hence the interleaved A/B above. With the tier on the two modes' request
+counts per pass (`vfs_ops`) are identical (open/read/flush/release 4096
+each), and a `perf record` of passes 3–5 at 2048 files put them at parity
+(1.46–1.59 vs 1.53–1.62 CPU-s). Raw outputs: `/tmp/z3cfix/`.
+
+### Gates, fix round (2026-10-02, `CARGO_TARGET_DIR` unset)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings`; same with `--features io-uring` | clean, clean |
+| `cargo test -p constellation-engine -p constellation-frontend-fuse -p constellation -p constellation-fs-core` | all passed (engine 503 + 7 ignored; fs-core 71) |
+| `cargo build --workspace` + `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| root (`sudo env …`, not `sudo -E`), prefix `z3cfix-root`, release build: the 7 `passthrough-*` scenarios | all PASSED |
+| same: `snapshot-mount`, `upgrade-under-load` | PASSED, PASSED |
+
+### Open
+
+- ~~A passthrough open loads the frozen manifest, and `read_frozen` loads
+  it again on every read.~~ Closed in the fix round (`frozen_manifests`).
+- Passthrough now engages only for chunks outside the memory tier, so a
+  small hot snapshot set is served from memory and never by passthrough;
+  its daemon CPU is the ordinary path's. A CPU win for that shape would
+  need passthrough to beat a memory hit, which it did not on this host.

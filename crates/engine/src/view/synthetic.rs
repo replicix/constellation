@@ -367,6 +367,25 @@ impl View {
             .collect())
     }
 
+    /// The manifest of the frozen file `object`: from the view's cache
+    /// ([`frozen_manifests`]), or loaded from the snapshot's tree (under
+    /// the watchdog stage `stage`) and kept there.
+    pub(super) fn frozen_manifest(
+        &self,
+        object: &crate::snapshot::FrozenObject,
+        stage: &'static str,
+    ) -> anyhow::Result<Arc<Manifest>> {
+        if let Some(manifest) = self.frozen_manifests.get(object) {
+            return Ok(manifest);
+        }
+        let manifest = Arc::new(self.rt.block_on(async {
+            constellation_vfs::watch::stage(stage);
+            self.snapshots.load_manifest(object).await
+        })?);
+        self.frozen_manifests.insert(*object, Arc::clone(&manifest));
+        Ok(manifest)
+    }
+
     pub(crate) fn read_frozen(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, Code> {
         let node = self.synthetic_node(ino).ok_or(Code::Stale)?;
         if !self.synthetic_active(&node) {
@@ -381,11 +400,7 @@ impl View {
             return Err(Code::IsDir);
         };
         let manifest = self
-            .rt
-            .block_on(async {
-                constellation_vfs::watch::stage("snapshot manifest load");
-                self.snapshots.load_manifest(&manifest_hash).await
-            })
+            .frozen_manifest(&manifest_hash, "snapshot manifest load")
             .map_err(|error| {
                 tracing::debug!(%error, ino, "frozen read: manifest load failed");
                 Code::Io

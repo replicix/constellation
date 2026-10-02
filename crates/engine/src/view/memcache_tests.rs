@@ -120,7 +120,7 @@ fn file(e: &Env) -> (Ino, Vec<u8>, Vec<ChunkHash>) {
         e.cache.set_state(h, ChunkState::Clean);
     }
     // Nothing is in memory yet: writes are not admitted.
-    assert!(hashes.iter().all(|h| !e.cache.memory_contains(h)));
+    assert!(hashes.iter().all(|h| !e.cache.in_memory(h)));
     (f.ino, data, hashes)
 }
 
@@ -163,7 +163,7 @@ fn cached_sequential_reads_load_each_chunk_once(e2e: bool) {
         reads - 3,
         "every other read from memory"
     );
-    assert!(hashes.iter().all(|h| e.cache.memory_contains(h)));
+    assert!(hashes.iter().all(|h| e.cache.in_memory(h)));
 
     // Zero-copy: two reads in one chunk are slices of one shared copy.
     let a = read(&e, ino, 0, 4096);
@@ -231,7 +231,7 @@ fn a_corrupt_disk_copy_is_refetched_and_never_served(e2e: bool) {
         data[CHUNK as usize + 1000]
     );
     let _ = read(&e, ino, u64::from(CHUNK), 4096);
-    assert!(e.cache.memory_contains(&hashes[1]));
+    assert!(e.cache.in_memory(&hashes[1]));
     let whole = read(&e, ino, 0, data.len() as u64);
     assert_eq!(&*whole.contiguous(), &data[..]);
 }
@@ -264,7 +264,7 @@ fn a_fetched_chunk_is_resident_without_a_second_disk_read(e2e: bool) {
     assert_eq!(&*got.contiguous(), &data[..], "the fetched bytes");
     let after = e.cache.memory_stats().unwrap();
     assert!(
-        hashes.iter().all(|h| e.cache.memory_contains(h)),
+        hashes.iter().all(|h| e.cache.in_memory(h)),
         "the fetch did not admit what it already held"
     );
     assert_eq!(after.admissions - before.admissions, 3, "one per chunk");
@@ -345,18 +345,18 @@ fn evicting_a_chunk_drops_its_memory_copy(e2e: bool) {
     let e = env(e2e);
     let (ino, data, hashes) = file(&e);
     let _ = read(&e, ino, 0, data.len() as u64);
-    assert!(hashes.iter().all(|h| e.cache.memory_contains(h)));
+    assert!(hashes.iter().all(|h| e.cache.in_memory(h)));
     // The conformance kit's `evict` hook: the next read must be cold.
     assert_eq!(e.fs.evict_cached(ino).unwrap(), 3);
-    assert!(hashes.iter().all(|h| !e.cache.memory_contains(h)));
+    assert!(hashes.iter().all(|h| !e.cache.in_memory(h)));
     assert_eq!(e.cache.memory_stats().unwrap().used_bytes, 0);
     let back = read(&e, ino, 0, data.len() as u64);
     assert_eq!(&*back.contiguous(), &data[..]);
     // A prune the same.
     let _ = read(&e, ino, 0, data.len() as u64);
-    assert!(hashes.iter().any(|h| e.cache.memory_contains(h)));
+    assert!(hashes.iter().any(|h| e.cache.in_memory(h)));
     e.cache.prune_to(0).unwrap();
-    assert!(hashes.iter().all(|h| !e.cache.memory_contains(h)));
+    assert!(hashes.iter().all(|h| !e.cache.in_memory(h)));
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn a_clipped_read_does_not_touch_the_shared_chunk() {
     assert_eq!(&got[..1000], &data[..1000]);
     assert!(got[1000..].iter().all(|b| *b == 0));
     // The twin (same chunk 0) still reads its full content, from memory.
-    assert!(e.cache.memory_contains(&hashes[0]));
+    assert!(e.cache.in_memory(&hashes[0]));
     let twin_back = read(&e, twin.ino, 0, 5000);
     assert_eq!(&*twin_back.contiguous(), &data[..5000]);
 }
