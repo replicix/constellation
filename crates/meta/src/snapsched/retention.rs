@@ -334,6 +334,32 @@ pub fn due(policy: &SnapPolicy, policy_ino: u64, snaps: &[SnapFacts], now_ms: i6
     })
 }
 
+/// Step 3.3's name for the snapshot a policy takes at `now_ms`: `auto-`
+/// and the UTC start of the current finest bucket in basic ISO-8601
+/// (`auto-20260928T1405Z`; `auto-20260928T140510Z` for a sub-minute
+/// tier). The same name [`simulate`] gives its synthetic snapshots.
+///
+/// The name is the bucket, never the creation instant: two leaders (one
+/// retrying after the other's failover) asking for the same bucket ask
+/// for the same name, and the `snaps/` create-if-absent lets only one of
+/// them create it. `None` exactly when [`due`] could never be true: no
+/// tier, or a timezone outside the bundled tzdb.
+pub fn auto_name(policy: &SnapPolicy, now_ms: i64) -> Option<String> {
+    let finest = policy.finest()?;
+    let tz = policy_time_zone(policy)?;
+    let rule = Rule { policy, tz };
+    Some(synthetic_name(rule.bucket(finest, now_ms), finest))
+}
+
+/// The current finest bucket at `now_ms`, `[start, end)` in Unix ms:
+/// the window [`due`] looks for a snapshot in. `None` as for
+/// [`auto_name`].
+pub fn current_bucket(policy: &SnapPolicy, now_ms: i64) -> Option<(i64, i64)> {
+    let finest = policy.finest()?;
+    let tz = policy_time_zone(policy)?;
+    Some(Rule { policy, tz }.bucket_bounds(finest, now_ms))
+}
+
 // --- simulation ------------------------------------------------------
 
 /// The number of synthetic snapshots [`simulate`] will create before it
@@ -1336,6 +1362,35 @@ mod tests {
         assert!(due(&p, INO, &stale, T0));
         let caught_up = vec![auto(T0 - 400 * DAY), auto(T0 + 17 * MIN)];
         assert!(!due(&p, INO, &caught_up, T0 + 30 * MIN));
+    }
+
+    /// Step 3.3's names: the UTC start of the finest bucket, minutes or
+    /// (sub-minute tiers) seconds, the same for every instant inside the
+    /// bucket; and the bucket is the window `due` looks in.
+    #[test]
+    fn the_auto_name_is_the_finest_bucket_in_utc() {
+        // 2026-09-28T14:07:31.250Z
+        let t = 1_790_604_451_250;
+        let p = policy("5m:1d 1h:7d");
+        assert_eq!(auto_name(&p, t).as_deref(), Some("auto-20260928T1405Z"));
+        assert_eq!(auto_name(&p, t + 2 * MIN), auto_name(&p, t));
+        assert_eq!(
+            auto_name(&p, t + 3 * MIN).as_deref(),
+            Some("auto-20260928T1410Z")
+        );
+        let s = policy("10s:1m 1m:4m");
+        assert_eq!(auto_name(&s, t).as_deref(), Some("auto-20260928T140730Z"));
+        // An hourly tier in Budapest (+02:00 in September) still names
+        // the bucket in UTC.
+        let b = policy("1h:1d; tz=Europe/Budapest");
+        assert_eq!(auto_name(&b, t).as_deref(), Some("auto-20260928T1400Z"));
+        let (from, to) = current_bucket(&p, t).unwrap();
+        assert_eq!(
+            (from, to),
+            (t - 2 * MIN - 31_250, t - 2 * MIN - 31_250 + 5 * MIN)
+        );
+        assert!(due(&p, INO, &[auto(from - 1)], t));
+        assert!(!due(&p, INO, &[auto(from)], t));
     }
 
     /// `day-start=02:00` in Budapest, on the day 02:00 does not exist:

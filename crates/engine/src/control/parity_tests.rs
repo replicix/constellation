@@ -143,6 +143,8 @@ const MUST_SUCCEED: &[&str] = &[
     "snapshot.policy.set",
     "snapshot.resolve",
     "snapshot.delete_many",
+    "snapshot.sched.status",
+    "snapshot.sched.run",
     "browse.readdir",
     "browse.inspect",
     "browse.stat",
@@ -208,6 +210,10 @@ fn params_for(name: &str, root_view: u64, backend_dir: &str) -> Value {
         "snapshot.policy.set" => json!({"path": "/", "expr": "1d:7d 1h:1d"}),
         "snapshot.policy.remove" => json!({"path": "/no-such-dir"}),
         "snapshot.policy.pause" => json!({"path": "/no-such-dir", "paused": true}),
+        // A dry run: it takes no lease and creates nothing, so the second
+        // call finds what the first did.
+        "snapshot.sched.status" => json!({}),
+        "snapshot.sched.run" => json!({"dry_run": true}),
         "browse.readdir" | "browse.inspect" | "browse.stat" => json!({"path": "/"}),
         "browse.read" => json!({"path": "/f"}),
         "browse.write" => {
@@ -295,6 +301,21 @@ fn stable(method: &str, value: Value) -> Value {
                    "cadence": value["cadence"], "created": value["created"],
                    "steady_state_bound": value["steady_state_bound"],
                    "truncated": value["truncated"]})
+        }
+        // The scheduler's counters move with every call (`ticks`), and
+        // its clock decides the bucket: compare what the replica says.
+        "snapshot.sched.status" => {
+            json!({"node_id": value["node_id"], "enabled": value["enabled"],
+                   "roots": value["roots"].as_array().map(|roots| roots.iter()
+                       .map(|r| json!({"ino": r["ino"], "path": r["path"], "expr": r["expr"],
+                                       "canonical": r["canonical"], "paused": r["paused"]}))
+                       .collect::<Vec<_>>())})
+        }
+        "snapshot.sched.run" => {
+            json!({"dry_run": value["dry_run"], "refused": value["refused"],
+                   "roots": value["roots"].as_array().map(|roots| roots.iter()
+                       .map(|r| json!({"ino": r["ino"], "path": r["path"], "outcome": r["outcome"]}))
+                       .collect::<Vec<_>>())})
         }
         // How far the simulation got is measured from the daemon's
         // clock, which a non-aligned `now` shifts by the call's delay.

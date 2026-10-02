@@ -16,8 +16,12 @@
 //!   other. Never a direct `Meta` write: on a non-holder that would fork
 //!   the replica.
 //!
-//! Nothing here creates or deletes a snapshot; the scheduler (M3) and
-//! expiry (M4) do. `set` therefore only *previews* what a policy would
+//! - `sched.status` and `sched.run` expose the scheduler (M3,
+//!   `crate::snapsched`): its counters and per-root state, and one tick on
+//!   demand.
+//!
+//! Nothing here creates or deletes a snapshot itself; the scheduler (M3,
+//! through `sched.run` or its ticker) and expiry (M4) do. `set` therefore only *previews* what a policy would
 //! expire, and guards it server-side: an expiring change is written only
 //! when the caller confirms the exact count it was shown
 //! (`confirm_expiring`, Step 7.3), so a stale client cannot confirm a
@@ -55,7 +59,8 @@
 use super::{unary, ControlVfs, EngineControl};
 use constellation_control::methods::{
     SnapshotPolicyCheck, SnapshotPolicyList, SnapshotPolicyPause, SnapshotPolicyRemove,
-    SnapshotPolicySet, SnapshotPolicyShow, SnapshotPolicySimulate,
+    SnapshotPolicySet, SnapshotPolicyShow, SnapshotPolicySimulate, SnapshotSchedRun,
+    SnapshotSchedStatus,
 };
 use constellation_control::proto::types::{
     PolicyErrorInfo, SnapPolicyAgainst, SnapPolicyCheckParams, SnapPolicyCheckResult,
@@ -93,6 +98,18 @@ pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     unary::<SnapshotPolicyPause>(r, svc, |s, c, p| {
         let writer = Writer::new(s.browser(&c.principal)?);
         policy_pause(&s.meta, &writer, &p)
+    });
+    // The scheduler (M3): its state, and one tick on demand. A tick
+    // never fails as a call: refusals and batch errors are in the result.
+    unary::<SnapshotSchedStatus>(r, svc, |s, _, _| {
+        s.engine
+            .snapsched()
+            .report()
+            .map_err(|e| ControlError::failed(format!("{e:#}")))
+    });
+    unary::<SnapshotSchedRun>(r, svc, |s, _, p| {
+        let run = crate::snapsched::Run::Manual { dry_run: p.dry_run };
+        Ok(s.rt.block_on(s.engine.snapsched().tick(run)))
     });
 }
 

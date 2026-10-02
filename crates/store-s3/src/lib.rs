@@ -32,6 +32,7 @@ pub mod probe;
 pub(crate) mod run;
 #[cfg(test)]
 pub(crate) mod scripted_http;
+pub mod snapsched;
 pub mod snapshot;
 pub mod store;
 

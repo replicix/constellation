@@ -31065,10 +31065,10 @@ are unchanged.
 
 | Item | State | Where |
 |---|---|---|
-| `subtree_unchanged(tree, prev, root, ino, budget, &mut Membership) -> Emptiness::{Unchanged, Changed}`: equal roots → `Unchanged`; `prev.ino != ino` (root replaced) → `Changed`; otherwise no key of the diff maps into the subtree in either root: `0x01 ino` / `0x03 ino\|name` → `ino` in the subtree; `0x02 parent\|name` / `0x04 ino\|parent\|name` → `parent` in the subtree (or the directory itself); `0x30` subsystem rows never count. Any error (unreadable root, bad key, a membership walk snapwalk cannot vouch for) → `Changed` + `debug` log | DONE | `crates/engine/src/snapshot_batch.rs` |
+| `subtree_unchanged(tree, prev, root, ino, budget, &mut Membership) -> Emptiness::{Unchanged, Changed { reason }}` (`ChangeReason::{KeyMapped, Budget, ReplacedRoot, Error(String)}`, added by M3a so tests can tell a real change from an error): equal roots → `Unchanged`; `prev.ino != ino` (root replaced) → `Changed { ReplacedRoot }`; otherwise no key of the diff maps into the subtree in either root: `0x01 ino` / `0x03 ino\|xattr` → `ino` in the subtree; `0x02 parent\|name` / `0x04 ino\|parent\|name` → `parent` in the subtree (or the directory itself); `0x30` subsystem rows never count (a mapped key → `Changed { KeyMapped }`). Any error (unreadable root, bad key, a membership walk snapwalk cannot vouch for) → `Changed { Error(..) }` + `debug` log | DONE | `crates/engine/src/snapshot_batch.rs` |
 | Membership is snapwalk's free `in_subtree` with its `(root, dir)`-keyed `Membership` cache, shared by a batch's items; no second ancestor walk. Only API change in snapwalk: `TreeAccess::tree()` is `pub(crate)` | DONE | `crates/engine/src/snapwalk.rs` |
 | atime-only changes: plan 20 keeps atime out of the tree (`InodeRecord` has no atime field; its width test pins that), so a read's atime bump is not a diff key at all and needs no filter. An explicit `utimensat` moves ctime and counts | DONE (by construction; tested) | `snapshot_batch.rs` doc of `subtree_unchanged` |
-| Budget: `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` (default 100 000) diff keys, read once per batch; one key past it → `Changed`. `Tree::diff_each` (a visitor that can stop early; `diff` is built on it) so a busy diff is never materialized | DONE | `snapshot_batch.rs` `empty_check_keys`, `crates/mtree/src/tree.rs`, `docs/reference/configuration.md` |
+| Budget: `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` (default 100 000) diff keys — every key of the diff, subsystem rows included — read once per batch; one key past it → `Changed { Budget }`. `Tree::diff_each` (a visitor that can stop early; `diff` is built on it) so a busy diff is never materialized | DONE | `snapshot_batch.rs` `empty_check_keys`, `crates/mtree/src/tree.rs`, `docs/reference/configuration.md` |
 | Executor: the check runs on a blocking thread per create with a `skip_if_unchanged_since`; `Skipped` writes neither `snaps/` nor a row | DONE | `SnapshotBatcher::emptiness` |
 | Tests (single in-process holder, real `Meta`, driver, publisher and tree): idle → skipped (twice, then a write → created); one-byte write, mkdir, create and write two levels down → created; atime-only (plan 20 apply + queue, atime visibly moved) → skipped; changes outside only (`/`, `/a`, an xattr on `/a`; tree root asserted moved) → skipped; nested sibling `/a/c` → skipped; rename file in/out, directory in/out, hardlink in → created; xattr, chmod of a file, chmod of the root → created; budget 3 / 0 → `Changed` where the unbounded check says `Unchanged`; replaced root dir → created, then skipped against the new one; `diff_each` == `diff` and stops when asked | DONE | `snapshot_batch::tests::{an_idle_subtree_is_skipped, a_one_byte_write_under_the_root_is_taken, an_atime_only_change_is_skipped, a_change_outside_the_subtree_only_is_skipped, a_change_in_a_sibling_subtree_is_skipped, a_rename_into_or_out_of_the_subtree_is_taken, an_xattr_or_chmod_under_the_root_is_taken, a_diff_past_the_budget_counts_as_changed, a_replaced_root_directory_is_taken}`, `crates/mtree/tests/properties.rs::diff_each_is_diff_and_stops_when_asked` |
 | Not done (other chunks): the scheduler passing the field (32-m3a), the multi-node skip-empty test of Step 11 (with the scheduler) | — | — |
@@ -32330,3 +32330,189 @@ DESIGN.md §2. Gates (`CARGO_TARGET_DIR` unset):
 | `cargo build --release --workspace` | exit 0 |
 | `harness run gc-lifecycle gc-dedup-race snapshot-lifecycle snapshot-churn` / `idle-cluster-is-quiet idle-cost e2e-two-nodes` (`CONSTELLATION_HARNESS_DOCKER_PREFIX=m5bfix`) | 4/4 and 3/3 passed, `idle-cost` first try |
 | same GC/snapshot subset + `e2e-two-nodes` with `CONSTELLATION_SNAPACCT=on CONSTELLATION_SNAPACCT_REFRESH_S=2` | 5/5 passed |
+
+## Plan 32 M3a (scheduler)
+
+Steps 3.2–3.3 of [plan 32](wip/32-snapshot-policies-and-space.md) (chunk
+`32-m3a`): policies now **create** snapshots. A sticky `_snapsched`
+singleton on one node creates every due root's snapshot through the
+holder-side `SnapshotBatch` (M0a), so creation never moves the root lease.
+Nothing is deleted (expiry is M4); the skip-empty check itself is `32-m3b`'s,
+this chunk passes `skip_if_unchanged_since`. The `sched` CLI verbs and the
+harness scenarios are `32-m3c`.
+
+| Item | State | Where |
+|---|---|---|
+| `Scheduler` + `SchedDeps` + `SchedConfig`: a task on every daemon (`Scheduler::spawn`, next to the pruner's ticker; waits on the background gate; resigns at `stop`), ticking every `CONSTELLATION_SNAPSCHED_TICK_MS` (10 000); `CONSTELLATION_SNAPSCHED` (on; `0`/`false`/`off` = never lead), `_MAX_LAG_S` (300), `_MAX_PER_ROOT` (5000), documented where read and in `configuration.md` | DONE | `crates/engine/src/snapsched.rs`, `crates/engine/src/node.rs`, `docs/reference/configuration.md` |
+| Inert by default: a tick reads `Meta::snapshot_policy_roots()` (local) first, and with no root makes **no S3 request** — not even a lease GET; a leader whose last policy is removed releases its lease once, then is silent | DONE | `Scheduler::tick` step 1; test `with_no_policy_roots_a_tick_makes_no_request` (a request-counting store) |
+| Refusal gates, the pruner's: departed, epoch `writes_refused` (frozen, or offline with no lease), read-only member → `refused_state`; `now − last_sync_ms > MAX_LAG` → `refused_lag`. A refused tick creates nothing and does **not** renew (a leader that stays refused lets the lease lapse to a healthy node), and reports `leader = false` from then on; a later healthy tick renews the lease if nobody took it | DONE | `Scheduler::refusal` |
+| Sticky leadership: `_snapsched` `SingletonLease` (its own, not `_prune`) kept across ticks; renewed at the start of every tick **and** immediately before every batch; `Fenced` ends leadership and the tick before any batch; a non-leader's acquire that finds it held (new typed `singleton::HeldElsewhere`), or loses the create/swap race for it (`StoreError::CasConflict`), returns quietly — not an error, no `last_error`; `leader` stat. TTL = `CONSTELLATION_LEASE_TTL_MS`, at least three ticks. `Engine::drain_for_shutdown` resigns (releases) so a successor need not wait the TTL | DONE | `Scheduler::lead`, `crates/engine/src/singleton.rs` |
+| Due roots: parse (unparseable → `unparseable_roots`, skipped, fail closed), not `paused`, directory still there (`Meta::ancestry`; gone → skipped), under the cap (≥ `MAX_PER_ROOT` live auto rows of `policy_ino`, held included → `capped_roots` + per-root error + `last_error` naming the root ino, set by the leading tick), `retention::due` on the leader's clock. At most one snapshot per root per tick (catch-up, not backfill). Gauges `roots`/`paused_roots`/`unparseable_roots`/`capped_roots`/`orphaned_snapshots` as of the last tick | DONE | `plan_roots` |
+| Names: `retention::auto_name` (new, pure, in meta) = `auto-` + UTC basic ISO-8601 of the finest bucket's start, seconds form for `s` tiers — the same `synthetic_name` the simulator already used; `retention::current_bucket` (new) for status | DONE | `crates/meta/src/snapsched/retention.rs` (`the_auto_name_is_the_finest_bucket_in_utc`) |
+| One `SnapshotBatch` per tick for every due root: `origin = auto`, `policy_ino`, `creator` = this node, `skip_if_unchanged_since` = newest auto row's root when `skip-empty=yes`. `Created` → `created`, `last_create_unix_ms`; `Skipped` → `skipped_empty`; `AlreadyExists` → success; refused item → `create_failed` + `last_error` + the root's error; a whole-batch error → `create_failed += due roots`, nothing created, next tick retries. A bucket settled without a visible new row is remembered per root in memory (pruned to the current roots): created / already exists → for the rest of the bucket; **skipped → only while the leader's replica stays at the position read at the start of that tick** (`Meta::applied_seq`, `Meta::journal_next_seq`: two local reads), so a write later in the same bucket is asked about again and taken, while an idle root still costs the holder one check per bucket | DONE | `Scheduler::tick`, `Settled`, `replica_position` |
+| Holder-side identity check: a create with `policy_ino != 0` whose path the holder resolves to another inode is `Refused` ("…not the policy root…", counted `create_failed`, retried next tick) before any drain or object write. The leader resolved the path from its replica; after `mv /a /a.old; mkdir /a` that replica may still put X at `/a` | DONE | `SnapshotBatcher::execute_now`; test `a_replaced_root_is_refused_until_the_leader_sees_the_rename` |
+| Audit: one `snapsched/journal/<ts:016x>-<uuid>.json` per tick that created a snapshot or failed one (a tick of only skips / already-exists writes none, so an idle 10 s skip-empty root is not ~8640 objects a day), create-if-absent like `gc/journal/`: `{ts, node, roots: [{root_ino, path, policy (canonical), created: [{id,name,created_unix_ms}], skipped: [{name,reason}], failed: [{name,reason}], deleted: []}]}` | DONE | `crates/store-s3/src/snapsched.rs` (new) |
+| Control `snapshot.sched.status {}` (Viewer) → `SnapSchedReport {node_id, enabled, tick_ms, max_per_root, stats, roots: [{ino, path, expr, canonical, paused, due, next_due_unix_ms, bucket_name, auto_snapshots, last_created_unix_ms, capped, error}]}`; `snapshot.sched.run {dry_run}` (Admin, mutating) → `SnapSchedRunResult {dry_run, leader, refused, error, roots: [{ino, path, name, outcome, id, error}]}` (`would_create` / `created` / `skipped_empty` / `already_exists` / `failed`). Table 65 → 67, stub router + sample params, role table, schema re-blessed, parity rows (dry run; `stable` compares what the replica decides, not counters or the clock's bucket) | DONE | `crates/control/src/{methods,proto/types,tests}.rs`, `crates/control/schema/control.schema.json`, `crates/engine/src/control/{snapsched,parity_tests}.rs` |
+| Carried from the M3b review: `Emptiness::Changed { reason: ChangeReason::{KeyMapped, Budget, ReplacedRoot, Error(String)} }`; the "taken" tests now assert `KeyMapped` (and `ReplacedRoot`, `Budget`) before the create, so an erroring check can no longer pass them; the M3b row's `0x03 ino\|name` → `ino\|xattr`; the budget row says every diff key counts | DONE | `crates/engine/src/snapshot_batch.rs`, `docs/reference/configuration.md`, the M3b section above |
+| Tests (in-process multi-node over `snapshot_batch`'s real-driver fixture, now `pub(crate)`; a test clock moved one 10 s bucket at a time) | DONE | `snapsched::tests::{the_scheduler_on_a_snapshots_bs_writes_without_moving_the_lease, one_leader_and_a_takeover_never_doubles_a_bucket, downtime_gets_one_catch_up_snapshot_not_a_burst, paused_unparseable_and_disabled_create_nothing, refused_ticks_create_nothing_and_count, a_root_at_the_cap_creates_nothing, an_idle_root_is_skipped_and_a_change_is_taken, a_replaced_root_is_refused_until_the_leader_sees_the_rename, a_covered_bucket_submits_no_batch_after_a_takeover, losing_the_lease_race_is_not_an_error, a_dry_run_takes_nothing, with_no_policy_roots_a_tick_makes_no_request}`; `a_covered_bucket_…` is the one where `retention::due` itself answers "covered" (the leader's clock inside the bucket the holder stamped), so a wrong `policy_ino`/origin filter in `plan_roots` fails it, `store_s3::snapsched::tests::entries_round_trip_and_list_in_time_order` |
+| Step 4.4: inode reuse within a filesystem | ANSWERED: no reuse (below) | — |
+
+### Decisions taken here
+
+- **The name is the bucket by the leader's clock; `created_unix_ms` is the
+  holder's.** A holder running late may stamp the previous bucket; the
+  leader then still sees its bucket uncovered, asks again under the same
+  name, gets `AlreadyExists`, and settles it. Cosmetic and bounded to one
+  bucket (plan §3.3 already calls the late-execution case cosmetic).
+- **"The root's current path"** is what the leader's replica resolves the
+  policy inode to *now* (`Meta::ancestry`), not the path of its older
+  snapshots: after `mv /a /b` the next snapshot is `/b@auto-…`, with the
+  same `policy_ino`, so retention and rename-safe listing (§0.5) see one
+  stream. A consequence: the `snaps/` id is `blake3(path@name)`, so the name
+  CAS de-duplicates per path — a rename *inside* a bucket, racing a
+  failover, could give that one bucket a snapshot under each path (both
+  of the right directory: cosmetic). The holder resolves the path again
+  (`prepare_create`) and, for a policy's create, **refuses it unless the
+  path still names `policy_ino`**: after `mv /a /a.old; mkdir /a` seen by
+  the holder but not yet by the leader's replica, snapshotting the new
+  `/a` would put a foreign tree into X's stream, cover X's bucket in
+  `retention::due` (so `/a.old` would miss it), and — once M4 expires —
+  anchor X's retention on a snapshot that is not X's. (An earlier draft
+  of this note called that "one extra snapshot"; it is not, identity is
+  `policy_ino`.) The refused item is retried next tick, by which time the
+  leader's replica resolves X to `/a.old`. A root whose directory is gone
+  is skipped (orphaned, Step 4.4).
+- **The cap is `>=`:** "a root at the cap creates nothing" — with cap *N*
+  the scheduler never makes the (*N*+1)-th. Held auto snapshots count (they
+  are live rows of the stream). A capped root is a gauge, a per-root
+  error in `status`, and `last_error` (with the root ino) — the brief's
+  rule, and what `node.status` / UI-banner consumers see.
+- **A refused tick does not renew the lease**, so a leader that is lagging
+  or frozen hands over to a healthy node within one TTL, instead of holding
+  the cluster's scheduler hostage.
+- **Settled-bucket memory** (in memory, per root, cleared on any
+  leadership change, pruned to the current roots) keeps an idle
+  `skip-empty` root from costing one holder drain + publish per tick. A
+  skipped bucket stays settled only while the leader's replica has not
+  moved (applied seq, own journal seq — read at the start of the tick
+  that asked); once it moves, the next tick asks again, so a write at
+  01:00 into a `1d` bucket skipped at 00:00 is snapshotted at 01:00, not
+  the next day, as the plan's per-tick evaluation intends. The check is
+  two local reads, but the position is cluster-wide: while *anything* is
+  being written, an idle skip-empty root is re-asked every tick (one
+  holder drain + publish + bounded diff per tick, the plan's original
+  per-tick cost); only an idle cluster gets the once-per-bucket saving,
+  which is the case `idle-cost` measures. Right after a creation the
+  holder's next publish ships that row, which moves the position once:
+  at most one extra check, then quiet.
+- **`dry_run` takes no lease and writes nothing**, not even the audit; it
+  runs the gates and reports `would_create` from this node's replica.
+  `run` without `dry_run` on a node another one leads is a `refused` result
+  (not an error), naming the held lease.
+- **Batch errors count `create_failed` once per due root**, since each is a
+  snapshot that was not taken; the next tick retries with a fresh rid (the
+  names make a half-applied retry harmless).
+- **"Offline `ReadOnly`"** (plan §3.2's gate list) is the epoch manager's
+  `writes_refused` since plan 30 §M11 (a designation is a delegation; there
+  is no separate offline read-only flag) — the same flag the pruner reads.
+
+### Step 4.4 answer: inode numbers are never reused within a filesystem
+
+`policy_ino` stays a bare `u64`; no `(ino, generation)` is needed. Read
+from `crates/meta/src/store/mod.rs`, `crates/store-s3/src/nodes.rs`,
+`crates/engine/src/node.rs`:
+
+1. **Disjoint prefixes.** An ino is `node_prefix << 40 | counter`
+   (`INO_PREFIX_SHIFT`), and the prefix is the node id. Node ids come from
+   `claim_node_id`: `max(every id in nodes/, retired tombstones included) + 1`,
+   CAS-created. `node.leave` writes a tombstone (`retired: true`), never a
+   delete, so an id — and with it an ino prefix — is never handed to a
+   second state dir; a remount of a retired id is refused at start
+   (`Engine::start`: "node N is retired").
+2. **A monotone counter per prefix.** `alloc_ino_tx` draws from a
+   per-directory block (`INO_BLOCK_SIZE` 1024) reserved from `next_ino`,
+   which only ever increases (the block bump in the same transaction as
+   the create; `reclaim_ino_counter`, on every replayed create of this
+   node's prefix, only raises it). No path frees a number back:
+   `unlink`/`rmdir` never touch `next_ino` or `ino_alloc`. The 40-bit
+   counter errors on exhaustion instead of wrapping.
+3. **The counter survives every rebuild of the same state dir.** It lives
+   in the replica's `local` keyspace with the node id: a pruned-past
+   rebuild (`replace_ns_from_rebuilt`) replaces the namespace and keeps
+   `local` (`next_ino`, `ino_alloc`); `set_node_prefix` resets the counter
+   to 1 only when the prefix *changes*, i.e. a fresh state dir — which has
+   claimed a fresh node id. A lost state dir loses its `node_id` key with
+   it, so its replacement claims a new id, never the old prefix.
+4. **Rejoin** is therefore either the same state dir (same id, same
+   monotone counter) or a fresh one (new id, new prefix).
+
+The only ways to reuse an ino are outside the model: copying a live state
+dir to a second host (two writers of one id — the registry invariant
+`claim_node_id` exists to prevent) or restoring an old backup of a state
+dir over a newer one (rolling `next_ino` back). Both already break far
+more than `policy_ino` (log segment origin, rids).
+
+### Not done here (other chunks)
+
+- Expiry, grace state, `snapsched/state.json` (M4); the diff-based empty
+  check is `32-m3b`'s (done); the `snapshot sched` CLI and the
+  `snapsched`/`snapsched-s3-outage` harness scenarios (`32-m3c`); `/metrics`
+  export (M8).
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`, then `cargo test -p constellation-control` | schema re-blessed (67 methods); 135 passed |
+| `cargo test --workspace --no-fail-fast` | exit 0: **2071 passed, 0 failed**, 42 ignored (81 binaries). A first run without `--no-fail-fast` stopped on `harness::s3_cut_heal::a_cut_in_the_middle_of_a_burst_heals_at_once` (`up.served >= served + BURST`), a test of the harness's counting proxy that nothing here touches; 8/8 alone and green in the full rerun — a pre-existing flake |
+| `cargo test -p constellation-engine --lib snapsched::tests` ×12 | 12/12 green |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `bash tests/integration.sh` | port 4566 held by another agent's floci (`z2arev-floci-1`), so the script's body was run against it with its `AWS_*` settings (`tests/smoke.sh s3://constellation-ci/run-m3a-…`): `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | exit 0 |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX=m3a target/release/harness run …` (three invocations: idle-cluster-is-quiet idle-cost prune web-ui-smoke / snapshot-lifecycle snapshot-churn gc-lifecycle e2e-basic e2e-two-nodes / lease-handover forwarded-mutations) | all 11 `PASSED` (`ALL SCENARIOS PASSED` ×3) |
+| Live daemon (local backend, `CONSTELLATION_SNAPSCHED_TICK_MS=1000`, `10s:1m 1m:4m; skip-empty=no` set by `setxattr` on `/proj`) | `auto-…081700Z`, `…081710Z`, `…081720Z`: one per bucket, three `snapsched/journal/` objects, `leases/_snapsched.json`; after `removexattr` no new snapshot, the three kept, the lease `released: true` |
+
+### Review fix round
+
+- Must-fix 1 (snapshot recorded under the wrong policy root): the holder
+  refuses a `policy_ino` create whose path resolves to another inode;
+  test `a_replaced_root_is_refused_until_the_leader_sees_the_rename`
+  (fails without the check).
+- Tests where `retention::due` answers "covered" and a takeover leader
+  submits nothing (`a_covered_bucket_submits_no_batch_after_a_takeover`);
+  a skipped bucket is re-asked once the leader's replica moves (a write
+  later in the same bucket is taken); a capped root sets `last_error`;
+  losing the `_snapsched` create/swap race (`CasConflict`) is not an
+  error (`losing_the_lease_race_is_not_an_error`, fails without the
+  mapping); `leader` is false once a refused tick stops renewing;
+  `settled` pruned to current roots.
+- **Deviation from plan §4.1 item 4 ("one object per run"):** the audit
+  object is written only by a tick that created a snapshot or failed one.
+  A tick whose answers were all "unchanged" / "already exists" changed
+  nothing, and writing it would cost an idle 10 s skip-empty root an
+  object per bucket. Its skipped list still appears in any object that
+  is written.
+
+| Command (fix round) | Result |
+|---|---|
+| `cargo fmt --all -- --check` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --no-fail-fast` | exit 0: 2095 passed, 0 failed, 42 ignored |
+| `cargo test -p constellation-engine --lib snapsched::tests` ×5 | 20/20 each time (~4.4 s) |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `bash tests/integration.sh` (unmodified; 4566 was this worktree's floci) | `INTEGRATION TEST PASSED` |
+| `cargo build --release --workspace` | exit 0 |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX=m3afix target/release/harness run` (the 11 scenarios, in three invocations) | all `PASSED` (idle-cluster-is-quiet 62 s, idle-cost 168 s) |
+
+### Exit criteria (M3a)
+
+- [x] Sticky `_snapsched` leadership, renewed every tick and before every batch; `Fenced` ends it before a batch.
+- [x] Inert without policies: no S3 request, no lease object (tested with a counting store).
+- [x] Refusal gates count `refused_lag` / `refused_state` and create nothing.
+- [x] Due roots: catch-up not backfill, bucket names, current path, `skip_if_unchanged_since`, the cap.
+- [x] One batch per tick; `AlreadyExists` is success; no bucket gets two snapshots across a failover.
+- [x] Audit object per tick; `snapshot.sched.status` / `snapshot.sched.run`; schema and parity.
+- [x] Step 4.4 answered: no inode reuse.
+- [x] Nothing deletes a snapshot.

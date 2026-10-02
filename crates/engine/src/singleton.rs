@@ -22,7 +22,7 @@
 //! is unconditional and exclusion is assumed, as everywhere else in that
 //! mode.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore, LeaseTag, StoreError};
 use object_store::ObjectStore;
 use std::sync::Arc;
@@ -34,6 +34,18 @@ use std::time::Duration;
 #[error("{name} singleton lease was taken by another holder; this round is fenced")]
 pub struct Fenced {
     pub name: &'static str,
+}
+
+/// [`SingletonLease::acquire`] found a live holder: not a failure of the
+/// store, just someone else's turn. Callers that keep trying every tick
+/// (the snapshot scheduler) tell it from a real error with
+/// `downcast_ref`.
+#[derive(Debug, thiserror::Error)]
+#[error("{name} singleton lease is held by {holder} for another {expires_in_ms} ms")]
+pub struct HeldElsewhere {
+    pub name: &'static str,
+    pub holder: u64,
+    pub expires_in_ms: i64,
 }
 
 /// A held singleton lease. Drop-safe only via [`Self::release`]; a leak
@@ -85,11 +97,12 @@ impl SingletonLease {
                 (lease, tag)
             }
             Some((previous, _)) => {
-                bail!(
-                    "{name} singleton lease is held by {} for another {} ms",
-                    previous.holder,
-                    previous.expires_in_ms(now)
-                )
+                return Err(HeldElsewhere {
+                    name,
+                    holder: previous.holder,
+                    expires_in_ms: previous.expires_in_ms(now),
+                }
+                .into())
             }
         };
         Ok(Self {

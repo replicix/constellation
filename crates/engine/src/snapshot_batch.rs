@@ -39,6 +39,10 @@
 //! otherwise it CAS-creates the `snaps/` object and journals the row; a
 //! delete removes the row, then the object; a hold writes its row. A
 //! drain or publish failure fails the whole batch before any item ran.
+//! A create carrying a `policy_ino` (a policy's snapshot) is refused
+//! before any of that when its path resolves here to another directory:
+//! the requester resolved it from a replica that has not seen the root
+//! renamed or replaced, and the policy's stream is its inode's.
 //!
 //! **Exactly once.** A batch's rid is allocated once
 //! ([`crate::forward::ForwardState::next_system_rid`]) and kept across
@@ -127,13 +131,42 @@ pub fn empty_check_keys() -> usize {
 }
 
 /// [`subtree_unchanged`]'s answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Emptiness {
     /// Nothing under the directory changed: the previous snapshot *is*
     /// this state, and the create is skipped.
     Unchanged,
-    /// Something did, or the check could not tell.
-    Changed,
+    /// Something did, or the check could not tell — and which, so a
+    /// caller (and a test) can tell a real change from a check that gave
+    /// up. Every reason takes the snapshot.
+    Changed { reason: ChangeReason },
+}
+
+/// Why [`subtree_unchanged`] answered [`Emptiness::Changed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeReason {
+    /// A key of the diff maps into the subtree: a real change.
+    KeyMapped,
+    /// The diff is longer than the budget
+    /// (`CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS`); nothing was found
+    /// under the subtree before the check stopped reading.
+    Budget,
+    /// The previous snapshot is of another directory inode: the policy
+    /// root was replaced by a new directory at the same path.
+    ReplacedRoot,
+    /// The check failed (an unreadable root, a malformed key, a
+    /// membership walk snapwalk cannot vouch for, no tree to read).
+    Error(String),
+}
+
+impl Emptiness {
+    fn changed(reason: ChangeReason) -> Emptiness {
+        Emptiness::Changed { reason }
+    }
+
+    fn failed(error: impl std::fmt::Display) -> Emptiness {
+        Emptiness::changed(ChangeReason::Error(error.to_string()))
+    }
 }
 
 /// Plan 32 Step 3.4's empty check: whether directory `ino` is unchanged
@@ -164,12 +197,14 @@ pub enum Emptiness {
 /// key at all and needs no filtering here. An explicit `utimensat` is a
 /// different thing: it moves ctime, which is in the record, and counts.
 ///
-/// At most `budget` diff keys are examined; one more means `Changed`.
-/// `prev.ino != ino` (the policy root was replaced by a new directory
-/// at the same path) is `Changed`. So is every error — an unreadable
-/// root, a malformed key, a membership walk snapwalk cannot vouch for —
-/// logged at `debug`: a wrong `Unchanged` loses a snapshot, a wrong
-/// `Changed` only takes one more.
+/// At most `budget` diff keys are examined — every key of the diff
+/// counts, subsystem rows included; one more means `Changed` with
+/// [`ChangeReason::Budget`]. `prev.ino != ino` (the policy root was
+/// replaced by a new directory at the same path) is
+/// [`ChangeReason::ReplacedRoot`]. Every error — an unreadable root, a
+/// malformed key, a membership walk snapwalk cannot vouch for — is
+/// [`ChangeReason::Error`], logged at `debug`: a wrong `Unchanged` loses
+/// a snapshot, a wrong `Changed` only takes one more.
 pub fn subtree_unchanged<S: NodeStore>(
     tree: &Tree<S>,
     prev: &SnapshotRoot,
@@ -184,13 +219,13 @@ pub fn subtree_unchanged<S: NodeStore>(
             ino,
             "skip-empty: the directory was replaced since the previous snapshot"
         );
-        return Emptiness::Changed;
+        return Emptiness::changed(ChangeReason::ReplacedRoot);
     }
     if prev.root == root {
         return Emptiness::Unchanged;
     }
     match diff_touches(tree, &prev.root, &root, ino, budget, membership) {
-        Ok(Some(examined)) => {
+        Ok(Touch::Untouched(examined)) => {
             tracing::debug!(
                 ino,
                 examined,
@@ -198,21 +233,33 @@ pub fn subtree_unchanged<S: NodeStore>(
             );
             Emptiness::Unchanged
         }
-        Ok(None) => Emptiness::Changed,
+        Ok(Touch::Mapped) => Emptiness::changed(ChangeReason::KeyMapped),
+        Ok(Touch::OverBudget) => Emptiness::changed(ChangeReason::Budget),
         Err(error) => {
+            let error = format!("{error:#}");
             tracing::debug!(
                 ino,
                 prev = prev.seq,
-                error = %format!("{error:#}"),
+                %error,
                 "skip-empty: the check failed; treating the directory as changed"
             );
-            Emptiness::Changed
+            Emptiness::failed(error)
         }
     }
 }
 
-/// `Some(keys examined)` when no key of the diff maps into the subtree
-/// of `dir`; `None` as soon as one does or the budget runs out.
+/// What [`diff_touches`] found.
+enum Touch {
+    /// No key of the diff maps into the subtree; this many were read.
+    Untouched(usize),
+    /// One does.
+    Mapped,
+    /// The budget ran out before either was known.
+    OverBudget,
+}
+
+/// Whether a key of the diff maps into the subtree of `dir`, stopping at
+/// the first that does or when the budget runs out.
 fn diff_touches<S: NodeStore>(
     tree: &Tree<S>,
     old: &NodeHash,
@@ -220,8 +267,9 @@ fn diff_touches<S: NodeStore>(
     dir: Ino,
     budget: usize,
     membership: &mut Membership,
-) -> Result<Option<usize>> {
+) -> Result<Touch> {
     let mut examined = 0usize;
+    let mut over_budget = false;
     let mut failed = None;
     let member = |of: Ino, membership: &mut Membership| -> Result<bool> {
         Ok(snapwalk::in_subtree(tree, old, of, dir, membership)?
@@ -236,6 +284,7 @@ fn diff_touches<S: NodeStore>(
                 "skip-empty: the diff exceeds CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS; \
                  treating the directory as changed"
             );
+            over_budget = true;
             return false;
         }
         let touches = Key::parse(key)
@@ -258,7 +307,13 @@ fn diff_touches<S: NodeStore>(
     if let Some(error) = failed {
         return Err(error.context("mapping a diff key into the subtree"));
     }
-    Ok(finished.then_some(examined))
+    Ok(if finished {
+        Touch::Untouched(examined)
+    } else if over_budget {
+        Touch::OverBudget
+    } else {
+        Touch::Mapped
+    })
 }
 
 pub fn row_to_wire(row: &SnapshotRow) -> SnapshotRowWire {
@@ -599,6 +654,17 @@ impl SnapshotBatcher {
                         held_by: held_by.clone(),
                     };
                     Some(match self.snapshots.prepare_create(path, name, &options) {
+                        // A policy's snapshot is of its root directory,
+                        // by inode: a path the requester's replica
+                        // resolved before a `mv root root.old; mkdir
+                        // root` names another directory here, and taking
+                        // it would put a foreign tree in the policy's
+                        // stream (plan 32: identity is `policy_ino`).
+                        // Refused; the requester re-resolves next tick.
+                        Ok((path, ino)) if *policy_ino != 0 && ino != *policy_ino => Err(format!(
+                            "{path} is directory {ino} here, not the policy root \
+                             {policy_ino} (renamed or replaced); not taken"
+                        )),
                         Ok((path, ino)) => {
                             drains.insert(ino);
                             Ok((path, ino, options))
@@ -691,8 +757,9 @@ impl SnapshotBatcher {
         let access = match self.snapshots.tree() {
             Ok(access) => access.clone(),
             Err(error) => {
-                tracing::debug!(ino, error = %format!("{error:#}"), "skip-empty: no tree to diff; treating the directory as changed");
-                return Emptiness::Changed;
+                let error = format!("{error:#}");
+                tracing::debug!(ino, %error, "skip-empty: no tree to diff; treating the directory as changed");
+                return Emptiness::failed(error);
             }
         };
         let (budget, membership) = (empty.budget, empty.membership.clone());
@@ -712,12 +779,13 @@ impl SnapshotBatcher {
         match checked {
             Ok(Ok(emptiness)) => emptiness,
             Ok(Err(error)) => {
-                tracing::debug!(ino, error = %format!("{error:#}"), "skip-empty: opening the tree failed; treating the directory as changed");
-                Emptiness::Changed
+                let error = format!("{error:#}");
+                tracing::debug!(ino, %error, "skip-empty: opening the tree failed; treating the directory as changed");
+                Emptiness::failed(error)
             }
             Err(error) => {
                 tracing::debug!(ino, error = %error, "skip-empty: the check's task failed; treating the directory as changed");
-                Emptiness::Changed
+                Emptiness::failed(error)
             }
         }
     }
@@ -780,11 +848,12 @@ impl SnapshotBatcher {
     ) -> ItemResult {
         if let Some(prev) = skip_if_unchanged_since {
             match SnapshotRoot::parse(prev) {
-                Ok(prev) => {
-                    if self.emptiness(prev, commit.1, ino, empty).await == Emptiness::Unchanged {
-                        return ItemResult::Skipped;
+                Ok(prev) => match self.emptiness(prev, commit.1, ino, empty).await {
+                    Emptiness::Unchanged => return ItemResult::Skipped,
+                    Emptiness::Changed { reason } => {
+                        tracing::debug!(%path, name, ?reason, "skip-empty: taking the snapshot");
                     }
-                }
+                },
                 Err(error) => {
                     return ItemResult::Refused {
                         reason: format!("skip_if_unchanged_since: {error:#}"),
@@ -1057,7 +1126,7 @@ impl BatchHost for EngineBatchHost {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! In-process multi-node tests: each node is the real authority core
     //! over a real `Meta` (`Standalone`, IO inline) on one shared
     //! in-memory bucket, with a real tree publisher; the "peer path" is a
@@ -1077,24 +1146,24 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Weak;
 
-    type Driver = Arc<tokio::sync::Mutex<Standalone>>;
+    pub(crate) type Driver = Arc<tokio::sync::Mutex<Standalone>>;
 
     /// Who can reach whom: node id → its executor.
     #[derive(Default)]
-    struct Net {
+    pub(crate) struct Net {
         nodes: Mutex<HashMap<u64, Weak<SnapshotBatcher>>>,
     }
 
-    struct TestHost {
-        driver: Driver,
-        view: Arc<LeaseView>,
+    pub(crate) struct TestHost {
+        pub(crate) driver: Driver,
+        pub(crate) view: Arc<LeaseView>,
         leases: LeaseStore,
         net: Arc<Net>,
-        unreachable: Mutex<HashSet<u64>>,
+        pub(crate) unreachable: Mutex<HashSet<u64>>,
         /// Forwards whose reply is lost after the holder executed them.
         lose_replies: AtomicU64,
-        forwards: AtomicU64,
-        acquires: AtomicU64,
+        pub(crate) forwards: AtomicU64,
+        pub(crate) acquires: AtomicU64,
         /// P2P is on (`BatchHost::peer_path`).
         p2p: AtomicBool,
         /// `drain_own` fails.
@@ -1221,17 +1290,17 @@ mod tests {
         fn nudge(&self) {}
     }
 
-    struct Node {
-        id: u64,
-        meta: Arc<Meta>,
-        driver: Driver,
-        snapshots: Arc<SnapshotManager>,
-        batcher: Arc<SnapshotBatcher>,
-        host: Arc<TestHost>,
+    pub(crate) struct Node {
+        pub(crate) id: u64,
+        pub(crate) meta: Arc<Meta>,
+        pub(crate) driver: Driver,
+        pub(crate) snapshots: Arc<SnapshotManager>,
+        pub(crate) batcher: Arc<SnapshotBatcher>,
+        pub(crate) host: Arc<TestHost>,
         _cache: tempfile::TempDir,
     }
 
-    fn node(store: &Arc<InMemory>, net: &Arc<Net>, id: u64) -> Node {
+    pub(crate) fn node(store: &Arc<InMemory>, net: &Arc<Net>, id: u64) -> Node {
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         meta.set_node_prefix(id).unwrap();
         let backend = store.clone() as Arc<dyn ObjectStore>;
@@ -1340,29 +1409,29 @@ mod tests {
     }
 
     impl Node {
-        async fn acquire(&self) {
+        pub(crate) async fn acquire(&self) {
             let mut driver = self.driver.lock().await;
             assert!(driver.acquire().await.unwrap(), "node {} acquires", self.id);
             driver.mirror(&self.host.view);
         }
 
-        async fn sync(&self) {
+        pub(crate) async fn sync(&self) {
             let mut driver = self.driver.lock().await;
             driver.sync().await.unwrap();
             driver.mirror(&self.host.view);
         }
 
-        async fn tail(&self) {
+        pub(crate) async fn tail(&self) {
             self.driver.lock().await.tail_to_head().await.unwrap();
         }
 
-        fn rows(&self) -> Vec<SnapshotRow> {
+        pub(crate) fn rows(&self) -> Vec<SnapshotRow> {
             self.meta.snapshots(None).unwrap()
         }
     }
 
     /// `(holder, epoch)` of the root lease as the bucket has it.
-    async fn lease_of(store: &Arc<InMemory>) -> (u64, u64) {
+    pub(crate) async fn lease_of(store: &Arc<InMemory>) -> (u64, u64) {
         let (lease, _) = LeaseStore::new(
             store.clone() as Arc<dyn ObjectStore>,
             constellation_store_s3::log::PARTITION,
@@ -1375,7 +1444,7 @@ mod tests {
         (lease.holder, lease.epoch)
     }
 
-    async fn snaps_objects(store: &Arc<InMemory>) -> usize {
+    pub(crate) async fn snaps_objects(store: &Arc<InMemory>) -> usize {
         use futures::TryStreamExt;
         let prefix = object_store::path::Path::from("snaps");
         store
@@ -1421,7 +1490,7 @@ mod tests {
 
     /// The writer's sequence on `/data`: entry `w{k}` then the counter
     /// file's `user.counter = k`, for k = 1, 2, …
-    fn write_step(meta: &Meta, data: Ino, counter: Ino, k: u64) {
+    pub(crate) fn write_step(meta: &Meta, data: Ino, counter: Ino, k: u64) {
         meta.create(data, &format!("w{k:06}"), 0o644, 0, 0).unwrap();
         meta.set_xattr(
             counter,
@@ -1468,7 +1537,7 @@ mod tests {
     }
 
     /// Two nodes: B holds the root lease with `/data` and its counter.
-    async fn holder_b() -> (Arc<InMemory>, Node, Node, Ino, Ino) {
+    pub(crate) async fn holder_b() -> (Arc<InMemory>, Node, Node, Ino, Ino) {
         let store = Arc::new(InMemory::new());
         let net = Arc::new(Net::default());
         let a = node(&store, &net, 1);
@@ -2073,6 +2142,20 @@ mod tests {
             assert_eq!(snaps_objects(&self.store).await, objects + 1, "{what}");
         }
 
+        /// The diff check says a key maps into `/a/b` — a real change,
+        /// not a check that gave up — and the next create is taken.
+        async fn expect_mapped(&mut self, what: &str) {
+            let root = self.publish().await;
+            assert_eq!(
+                self.check(root, usize::MAX).await,
+                Emptiness::Changed {
+                    reason: ChangeReason::KeyMapped
+                },
+                "{what}"
+            );
+            self.expect_created(what).await;
+        }
+
         /// The next create must be skipped, writing nothing.
         async fn expect_skipped(&mut self, what: &str) {
             let rows = self.node.rows().len();
@@ -2122,9 +2205,13 @@ mod tests {
 
         /// [`subtree_unchanged`] of `/a/b` from `prev` to `root`.
         async fn check(&self, root: NodeHash, budget: usize) -> Emptiness {
+            self.check_ino(self.b, root, budget).await
+        }
+
+        /// [`subtree_unchanged`] of directory `b` from `prev` to `root`.
+        async fn check_ino(&self, b: Ino, root: NodeHash, budget: usize) -> Emptiness {
             let prev = SnapshotRoot::parse(&self.prev).unwrap();
             let access = self.node.snapshots.tree().unwrap().clone();
-            let b = self.b;
             tokio::task::spawn_blocking(move || {
                 let tree = access.tree().unwrap();
                 subtree_unchanged(&tree, &prev, root, b, budget, &mut Membership::default())
@@ -2150,14 +2237,14 @@ mod tests {
     async fn a_one_byte_write_under_the_root_is_taken() {
         let mut fx = Skip::new().await;
         fx.write(fx.f, 1, "one byte");
-        fx.expect_created("one-byte write").await;
+        fx.expect_mapped("one-byte write").await;
         // Deeper: a file in a new subdirectory of the root.
         let deep = fx.node.meta.mkdir(fx.b, "deep", 0o755, 0, 0).unwrap().ino;
-        fx.expect_created("mkdir under the root").await;
+        fx.expect_mapped("mkdir under the root").await;
         let h = fx.node.meta.create(deep, "h", 0o644, 0, 0).unwrap().ino;
-        fx.expect_created("create two levels down").await;
+        fx.expect_mapped("create two levels down").await;
         fx.write(h, 1, "deep byte");
-        fx.expect_created("a write two levels down").await;
+        fx.expect_mapped("a write two levels down").await;
     }
 
     /// A read with atime on bumps atime through plan 20's path (applied
@@ -2208,20 +2295,20 @@ mod tests {
     async fn a_rename_into_or_out_of_the_subtree_is_taken() {
         let mut fx = Skip::new().await;
         fx.node.meta.rename(fx.c, "g", fx.b, "g").unwrap();
-        fx.expect_created("rename into").await;
+        fx.expect_mapped("rename into").await;
         fx.node.meta.rename(fx.b, "f", fx.c, "f").unwrap();
-        fx.expect_created("rename out").await;
+        fx.expect_mapped("rename out").await;
         // A whole directory moving in, then out.
         let d = fx.node.meta.mkdir(fx.c, "d", 0o755, 0, 0).unwrap().ino;
         fx.node.meta.create(d, "inner", 0o644, 0, 0).unwrap();
         fx.expect_skipped("built outside").await;
         fx.node.meta.rename(fx.c, "d", fx.b, "d").unwrap();
-        fx.expect_created("directory moved in").await;
+        fx.expect_mapped("directory moved in").await;
         fx.node.meta.rename(fx.b, "d", fx.c, "d").unwrap();
-        fx.expect_created("directory moved out").await;
+        fx.expect_mapped("directory moved out").await;
         // A hard link from outside landing inside.
         fx.node.meta.link(fx.f, fx.b, "f-again").unwrap();
-        fx.expect_created("hard link into").await;
+        fx.expect_mapped("hard link into").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2236,18 +2323,18 @@ mod tests {
                 constellation_meta::SetXattrMode::Set,
             )
             .unwrap();
-        fx.expect_created("xattr").await;
+        fx.expect_mapped("xattr").await;
         fx.node
             .meta
             .setattr(fx.f, Some(0o600), None, None, None, None, None)
             .unwrap();
-        fx.expect_created("chmod of a file").await;
+        fx.expect_mapped("chmod of a file").await;
         // The root directory itself is in its subtree.
         fx.node
             .meta
             .setattr(fx.b, Some(0o700), None, None, None, None, None)
             .unwrap();
-        fx.expect_created("chmod of the root").await;
+        fx.expect_mapped("chmod of the root").await;
     }
 
     /// Past the budget the check stops reading and says "changed", even
@@ -2263,8 +2350,11 @@ mod tests {
         }
         let root = fx.publish().await;
         assert_eq!(fx.check(root, 100_000).await, Emptiness::Unchanged);
-        assert_eq!(fx.check(root, 3).await, Emptiness::Changed);
-        assert_eq!(fx.check(root, 0).await, Emptiness::Changed);
+        let over = Emptiness::Changed {
+            reason: ChangeReason::Budget,
+        };
+        assert_eq!(fx.check(root, 3).await, over);
+        assert_eq!(fx.check(root, 0).await, over);
         // A root equal to `prev` needs no diff, whatever the budget.
         let prev = SnapshotRoot::parse(&fx.prev).unwrap().root;
         assert_eq!(fx.check(prev, 0).await, Emptiness::Unchanged);
@@ -2280,6 +2370,13 @@ mod tests {
         fx.node.meta.rmdir(fx.a, "b").unwrap();
         let b = fx.node.meta.mkdir(fx.a, "b", 0o755, 0, 0).unwrap().ino;
         assert_ne!(b, fx.b);
+        let root = fx.publish().await;
+        assert_eq!(
+            fx.check_ino(b, root, usize::MAX).await,
+            Emptiness::Changed {
+                reason: ChangeReason::ReplacedRoot
+            }
+        );
         fx.expect_created("replaced root").await;
         let row = SnapshotRoot::parse(&fx.prev).unwrap();
         assert_eq!(row.ino, b);

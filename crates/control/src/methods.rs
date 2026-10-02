@@ -22,7 +22,7 @@
 //!
 //! Because [`METHODS`], [`visit_all`] and the `impl Method` blocks come out of
 //! the same macro invocation, "a method exists but is missing from the table"
-//! cannot happen; the tests instead pin the *contents* (67 methods, no
+//! cannot happen; the tests instead pin the *contents* (69 methods, no
 //! duplicates, every one of the 37 old `Request` variants maps to exactly
 //! one).
 //!
@@ -37,9 +37,9 @@
 //!
 //! | class | role | methods |
 //! |---|---|---|
-//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs/resolve`, `snapshot.policy.check/simulate/list/show`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
+//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs/resolve`, `snapshot.policy.check/simulate/list/show`, `snapshot.sched.status`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
 //! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
-//! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete/delete_many`, `snapshot.policy.set/remove/pause`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
+//! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete/delete_many`, `snapshot.policy.set/remove/pause`, `snapshot.sched.run`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
 //! `fsck.run` is admin although a dry run only reads: one method, one role,
 //! and the same method repairs and force-releases. `browse.xattr` is
@@ -335,6 +335,18 @@ define_methods! {
     /// the retention rule itself does not change.
     SnapshotPolicyPause { name: "snapshot.policy.pause", role: Admin, mutating: true, stream: None,
         params: SnapPolicyPauseParams, result: SnapPolicyRoot }
+    /// This node's snapshot scheduler (plan 32 Step 3.2): its counters,
+    /// whether it leads, and every policy root as its replica sees it —
+    /// due or not, when next, the last creation, the cap, the error.
+    /// Reads the replica only.
+    SnapshotSchedStatus { name: "snapshot.sched.status", role: Viewer, mutating: false, stream: None,
+        params: Empty, result: SnapSchedReport }
+    /// Run one scheduler tick now on this node: take the `_snapsched`
+    /// lease if it is free and create what is due (never deletes).
+    /// `dry_run` takes nothing and creates nothing; it reports what a
+    /// tick would create.
+    SnapshotSchedRun { name: "snapshot.sched.run", role: Admin, mutating: true, stream: None,
+        params: SnapSchedRunParams, result: SnapSchedRunResult }
     /// Clone a snapshot to a destination path.
     CloneCreate { name: "clone.create", role: Operator, mutating: true, stream: None,
         params: CloneParams, result: Ack }
@@ -533,10 +545,11 @@ mod tests {
         assert_eq!(unique.len(), METHODS.len(), "duplicate method names");
         assert_eq!(
             METHODS.len(),
-            67,
+            69,
             "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate \
              + snapshot.policy.list/show/set/remove/pause \
-             + snapshot.resolve/delete_many"
+             + snapshot.resolve/delete_many \
+             + snapshot.sched.status/run"
         );
         for m in METHODS {
             assert!(
@@ -620,6 +633,7 @@ mod tests {
             "snapshot.policy.list",
             "snapshot.policy.show",
             "snapshot.resolve",
+            "snapshot.sched.status",
         ] {
             assert_eq!(role(n), Role::Viewer, "{n}");
             assert!(!method_info(n).unwrap().mutating, "{n}");
@@ -650,6 +664,7 @@ mod tests {
             "snapshot.policy.remove",
             "snapshot.policy.pause",
             "snapshot.delete_many",
+            "snapshot.sched.run",
         ] {
             assert_eq!(role(n), Role::Admin, "{n}");
             assert!(method_info(n).unwrap().mutating, "{n}");

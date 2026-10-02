@@ -5837,6 +5837,222 @@
       ],
       "type": "object"
     },
+    "SnapSchedReport": {
+      "description": "`snapshot.sched.status`: this node's scheduler (plan 32 Step 3.2) —\nits counters, its knobs, and every policy root as this node's replica\nsees it now.",
+      "properties": {
+        "enabled": {
+          "description": "`CONSTELLATION_SNAPSCHED`: whether this node may lead at all.",
+          "type": "boolean"
+        },
+        "max_per_root": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "node_id": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "roots": {
+          "description": "Ascending by inode.",
+          "items": {
+            "$ref": "#/$defs/SnapSchedRootState"
+          },
+          "type": "array"
+        },
+        "stats": {
+          "$ref": "#/$defs/SnapSchedStatus"
+        },
+        "tick_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "node_id",
+        "enabled",
+        "tick_ms",
+        "max_per_root",
+        "stats",
+        "roots"
+      ],
+      "type": "object"
+    },
+    "SnapSchedRootState": {
+      "description": "One policy root in `snapshot.sched.status`.\n\n`due`: no auto snapshot of the root (held or not) was created inside\nthe current finest bucket, and the root is armed (parseable, not\npaused, under the cap, its directory still there). `next_due_unix_ms`\nis when it is (or became) due: the start of the current bucket when it\nis due now, the start of the next one otherwise; absent when it never\nwill be (paused, unparseable, gone). `error` is why the root is not\narmed, or the last creation failure the scheduler saw for it on this\nnode.",
+      "properties": {
+        "auto_snapshots": {
+          "description": "Live auto snapshots of this root (held ones included).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bucket_name": {
+          "default": null,
+          "description": "The name the current bucket's snapshot has (or would have).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "canonical": {
+          "default": null,
+          "description": "`None` when the policy does not parse.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "capped": {
+          "type": "boolean"
+        },
+        "due": {
+          "type": "boolean"
+        },
+        "error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expr": {
+          "description": "The xattr as stored.",
+          "type": "string"
+        },
+        "ino": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_created_unix_ms": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "next_due_unix_ms": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "default": null,
+          "description": "`None` when the directory is gone.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paused": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ino",
+        "expr",
+        "paused",
+        "due",
+        "auto_snapshots",
+        "capped"
+      ],
+      "type": "object"
+    },
+    "SnapSchedRunParams": {
+      "description": "`snapshot.sched.run`: run one scheduler tick now, on this node.\nWithout `dry_run` it takes the `_snapsched` lease if it is free (a\ntick on a node another one leads is refused, with the reason) and\ncreates what is due; `dry_run` takes nothing and creates nothing, and\nreports what a tick would create from this node's replica.",
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "SnapSchedRunResult": {
+      "description": "What one `snapshot.sched.run` tick did. `refused`: why it did nothing\nat all (a refusal gate, another leader, the scheduler disabled here).\n`error`: the batch failed as a whole (the holder unreachable, S3\ndown); nothing was created and the next tick retries.",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "leader": {
+          "type": "boolean"
+        },
+        "refused": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "roots": {
+          "description": "The roots the tick asked a snapshot of, ascending by inode.",
+          "items": {
+            "$ref": "#/$defs/SnapSchedRunRoot"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dry_run",
+        "leader",
+        "roots"
+      ],
+      "type": "object"
+    },
+    "SnapSchedRunRoot": {
+      "description": "One due root in a `snapshot.sched.run` result. `outcome` is\n`would_create` (dry run), `created`, `skipped_empty` (nothing under\nthe root changed since its newest snapshot), `already_exists` (the\nbucket's name was taken already — by an earlier leader, typically;\nsuccess), or `failed` (with `error`).",
+      "properties": {
+        "error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ino": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ino",
+        "path",
+        "name",
+        "outcome"
+      ],
+      "type": "object"
+    },
     "SnapSchedStatus": {
       "description": "Snapshot-schedule counters (plan 32 Step 9), surfaced in\n`constellation status`, on the web UI, and in `/metrics`.\n\n`unparseable_roots`, `capped_roots` or `refused_*` above zero mean\nsnapshots are silently not being taken; `create_failed` climbing while\n`expired` stays at zero is the healthy outage signature (expiry\nanchors on the newest snapshot, so an outage freezes it).",
       "properties": {
@@ -8984,6 +9200,28 @@
       },
       "result": {
         "$ref": "#/$defs/SnapshotListing"
+      },
+      "streaming": "none"
+    },
+    "snapshot.sched.run": {
+      "min_role": "admin",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/SnapSchedRunParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapSchedRunResult"
+      },
+      "streaming": "none"
+    },
+    "snapshot.sched.status": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapSchedReport"
       },
       "streaming": "none"
     },

@@ -254,6 +254,9 @@ pub struct Engine {
     /// Plan 32 Step 0.1: every snapshot row write, routed to the
     /// root-lease holder.
     snapshot_batches: Arc<crate::snapshot_batch::SnapshotBatcher>,
+    /// Plan 32 Steps 3.2–3.3: the snapshot scheduler (its ticker runs on
+    /// every node; one leads).
+    snapsched: Arc<crate::snapsched::Scheduler>,
     staging_dir: PathBuf,
     staging_budget: Arc<staging::StagingBudget>,
     lease_mode: constellation_store_s3::LeaseMode,
@@ -1368,6 +1371,24 @@ impl Engine {
                 }
             });
         }
+        // Snapshot scheduler ticker (plan 32 Steps 3.2–3.3). Without a
+        // `user.constellation.snapshots` policy anywhere a tick reads the
+        // local replica's xattr index and stops: no S3 request at all.
+        let snapsched = crate::snapsched::Scheduler::new(crate::snapsched::SchedDeps {
+            node_id,
+            store: store.inner().clone(),
+            meta: meta.clone(),
+            batches: snapshot_batches.clone(),
+            lease_mode,
+            read_only_member,
+            departed: departed.clone(),
+            epoch_frozen: Some(epochs.writes_refused.clone()),
+            last_sync_ms: last_sync_ms.clone(),
+            stats: snapsched_stats.clone(),
+            config: crate::snapsched::SchedConfig::from_env(),
+            clock: crate::snapsched::wall_clock(),
+        });
+        snapsched.spawn(&rt, stop.clone(), Some(background.clone()));
         // Retention pruner ticker (plan 22, Step 4). The default has no
         // marked roots, so a run walks nothing and is cheap; it only does
         // work once an operator sets a `user.constellation.prune` policy.
@@ -1496,6 +1517,7 @@ impl Engine {
             compression,
             snapshots,
             snapshot_batches,
+            snapsched,
             staging_dir,
             staging_budget,
             lease_mode,
@@ -2043,6 +2065,9 @@ impl Engine {
         if withdraw_holds {
             self.rt.block_on(self.holds.withdraw());
         }
+        // Hand the scheduler's lease back rather than let a successor wait
+        // out its TTL (a no-op, and no request, on a node not leading).
+        self.rt.block_on(self.snapsched.resign());
         tracing::info!("clean unmount drain complete");
         Ok(())
     }
@@ -2140,6 +2165,11 @@ impl Engine {
     }
     pub fn prune_stats(&self) -> &Arc<crate::prune::PruneStats> {
         &self.prune_stats
+    }
+    /// Plan 32's snapshot scheduler: `snapshot.sched.status` and
+    /// `snapshot.sched.run`.
+    pub fn snapsched(&self) -> &Arc<crate::snapsched::Scheduler> {
+        &self.snapsched
     }
     pub fn snapsched_stats(&self) -> &Arc<crate::snapsched::SnapSchedStats> {
         &self.snapsched_stats

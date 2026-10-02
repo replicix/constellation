@@ -29,8 +29,8 @@ pub mod retention;
 pub use calendar::{add_keep, bucket_start, next_bucket_start, subtract_keep};
 pub use policy::{Interval, Keep, SnapPolicy, Tier, WeekStart};
 pub use retention::{
-    due, evaluate, grace_first_seen, grace_intersection, simulate, simulate_capped, Origin, Reason,
-    SimLimits, SnapFacts, Timeline, Verdict,
+    auto_name, current_bucket, due, evaluate, grace_first_seen, grace_intersection, simulate,
+    simulate_capped, Origin, Reason, SimLimits, SnapFacts, Timeline, Verdict,
 };
 
 /// The xattr that binds a snapshot schedule to a directory. Set it, and

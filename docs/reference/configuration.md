@@ -205,7 +205,7 @@ quarter of the lease TTL and logs an error.
 | `CONSTELLATION_FORWARD_TIMEOUT_MS` | `500` | milliseconds | forwarded mutation request |
 | `CONSTELLATION_FORWARD` | `on` | boolean | requester-side mutation forwarding; `off` makes non-holder writes acquire the lease instead |
 | `CONSTELLATION_SNAPSHOT_FORWARD_TIMEOUT_MS` | `30000` | milliseconds | a snapshot batch (create, delete, hold) forwarded to the root-lease holder, which drains, ships and publishes before it answers; on timeout the caller gets an error and nothing moves the lease (see [Forwarded mutations](features/forwarded-mutations.md#snapshot-batches)) |
-| `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` | `100000` | diff keys | skip-empty (plan 32 §3.4): how many keys of the tree diff between a create's `skip_if_unchanged_since` root and the holder's fresh commit are examined for one under the snapshot's directory; past it the directory counts as changed and the snapshot is taken. `0` takes every snapshot whose tree root moved |
+| `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` | `100000` | diff keys | skip-empty (plan 32 §3.4): how many keys of the tree diff between a create's `skip_if_unchanged_since` root and the holder's fresh commit are examined for one under the snapshot's directory; past it the directory counts as changed and the snapshot is taken. The budget counts **every** diff key, subsystem rows (snapshot rows, holds, other `0x30` keys) included, not only the ones that could map under the directory. `0` takes every snapshot whose tree root moved |
 | `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement of the root lease (see [Lease placement](features/lease-placement.md)) |
 | `CONSTELLATION_LEASE_DWELL_MS` | `5000` | milliseconds; `0` means the default | a lease handed over cannot be handed back before this (it stops two competing writers ping-ponging it) |
 | `CONSTELLATION_LEASE_WANTED_GRACE_MS` | `5000` | milliseconds; `0` means the default | a requester registered in `wanted_by` is answered within this, busy holder or not |
@@ -680,6 +680,27 @@ xattr and evaluated by a singleton background pruner. See
 | `CONSTELLATION_PRUNE_GRACE_S` | `86400` | seconds | quiet period after a marked directory's ctime changes |
 | `CONSTELLATION_PRUNE_MAX_LAG_S` | `300` | seconds | replica-staleness refusal threshold |
 | `CONSTELLATION_PRUNE_SCAN_BUDGET_MS` | `5000` | milliseconds | per-run walk budget before the cursor is saved |
+
+### Snapshot schedules
+
+Snapshot policies are stored per directory in the
+`user.constellation.snapshots` xattr (plan 32). Every node runs a
+scheduler ticker; one of them leads, through the `_snapsched` singleton
+lease, and creates the due snapshots at the root-lease holder (creation
+never moves the write lease). With no policy anywhere a tick makes no S3
+request at all. The scheduler only creates; it never deletes a snapshot.
+`CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` (skip-empty) is in the
+snapshot table above.
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_SNAPSCHED` | on | `0`, `false`, `off` disable it | whether this node may lead the scheduler; a disabled node still executes batches as the root-lease holder and still answers `snapshot.sched.status` |
+| `CONSTELLATION_SNAPSCHED_TICK_MS` | `10000` | milliseconds | scheduler tick on every node; a due snapshot is taken within one tick of its bucket's start |
+| `CONSTELLATION_SNAPSCHED_MAX_LAG_S` | `300` | seconds | a tick refuses (`refused_lag`) when the replica trails the log tail by more than this |
+| `CONSTELLATION_SNAPSCHED_MAX_PER_ROOT` | `5000` | snapshots | a policy root with this many live auto snapshots (held ones included) gets no more: `capped_roots`, `last_error` naming the root, and an error in `snapshot.sched.status` |
+
+The `_snapsched` lease's TTL is `CONSTELLATION_LEASE_TTL_MS` (default
+60 s), raised to at least three ticks.
 
 ### FUSE and runtime threads
 

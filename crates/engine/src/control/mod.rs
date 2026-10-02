@@ -9,7 +9,7 @@
 //! embedding host calls it in-process through the same [`Router`]. It lives
 //! in the engine, not in the CLI, because every host of an engine (the
 //! desktop daemon today; plan 37's CSI engine pod, plan 36's Android
-//! service) needs the same 67 methods with the same semantics, and
+//! service) needs the same 69 methods with the same semantics, and
 //! everything they touch — the metadata replica, the sync task, the
 //! snapshot manager, the registry, the op watchdog — is the engine's.
 //!

@@ -2439,6 +2439,102 @@ pub struct SnapPolicyPauseParams {
     pub paused: bool,
 }
 
+/// `snapshot.sched.status`: this node's scheduler (plan 32 Step 3.2) —
+/// its counters, its knobs, and every policy root as this node's replica
+/// sees it now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapSchedReport {
+    pub node_id: u64,
+    /// `CONSTELLATION_SNAPSCHED`: whether this node may lead at all.
+    pub enabled: bool,
+    pub tick_ms: u64,
+    pub max_per_root: u64,
+    pub stats: SnapSchedStatus,
+    /// Ascending by inode.
+    pub roots: Vec<SnapSchedRootState>,
+}
+
+/// One policy root in `snapshot.sched.status`.
+///
+/// `due`: no auto snapshot of the root (held or not) was created inside
+/// the current finest bucket, and the root is armed (parseable, not
+/// paused, under the cap, its directory still there). `next_due_unix_ms`
+/// is when it is (or became) due: the start of the current bucket when it
+/// is due now, the start of the next one otherwise; absent when it never
+/// will be (paused, unparseable, gone). `error` is why the root is not
+/// armed, or the last creation failure the scheduler saw for it on this
+/// node.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapSchedRootState {
+    pub ino: u64,
+    /// `None` when the directory is gone.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The xattr as stored.
+    pub expr: String,
+    /// `None` when the policy does not parse.
+    #[serde(default)]
+    pub canonical: Option<String>,
+    pub paused: bool,
+    pub due: bool,
+    #[serde(default)]
+    pub next_due_unix_ms: Option<i64>,
+    /// The name the current bucket's snapshot has (or would have).
+    #[serde(default)]
+    pub bucket_name: Option<String>,
+    /// Live auto snapshots of this root (held ones included).
+    pub auto_snapshots: u64,
+    #[serde(default)]
+    pub last_created_unix_ms: Option<i64>,
+    pub capped: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `snapshot.sched.run`: run one scheduler tick now, on this node.
+/// Without `dry_run` it takes the `_snapsched` lease if it is free (a
+/// tick on a node another one leads is refused, with the reason) and
+/// creates what is due; `dry_run` takes nothing and creates nothing, and
+/// reports what a tick would create from this node's replica.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapSchedRunParams {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// What one `snapshot.sched.run` tick did. `refused`: why it did nothing
+/// at all (a refusal gate, another leader, the scheduler disabled here).
+/// `error`: the batch failed as a whole (the holder unreachable, S3
+/// down); nothing was created and the next tick retries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapSchedRunResult {
+    pub dry_run: bool,
+    pub leader: bool,
+    #[serde(default)]
+    pub refused: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The roots the tick asked a snapshot of, ascending by inode.
+    pub roots: Vec<SnapSchedRunRoot>,
+}
+
+/// One due root in a `snapshot.sched.run` result. `outcome` is
+/// `would_create` (dry run), `created`, `skipped_empty` (nothing under
+/// the root changed since its newest snapshot), `already_exists` (the
+/// bucket's name was taken already — by an earlier leader, typically;
+/// success), or `failed` (with `error`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapSchedRunRoot {
+    pub ino: u64,
+    pub path: String,
+    pub name: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// `snapshot.refs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapRefsParams {
