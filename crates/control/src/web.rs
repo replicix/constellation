@@ -1152,6 +1152,51 @@ mod tests {
             StatusCode::OK
         );
     }
+
+    /// Every page of the embedded UI is served as HTML, and the dashboard
+    /// links the snapshots page (plan 32 Step 7).
+    #[tokio::test]
+    async fn embedded_pages_are_served_as_html() {
+        for page in ["/", "/peers.html", "/snapshots.html"] {
+            let request = HttpRequest::builder()
+                .method("GET")
+                .uri(page)
+                .header("host", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap();
+            let response = app(empty()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+            let content_type = response.headers()[header::CONTENT_TYPE].to_str().unwrap();
+            assert!(
+                content_type.starts_with("text/html"),
+                "{page}: {content_type}"
+            );
+        }
+        let index = String::from_utf8(Assets::get("index.html").unwrap().data.to_vec()).unwrap();
+        assert!(index.contains("href=\"/snapshots.html\""));
+        let snapshots =
+            String::from_utf8(Assets::get("snapshots.html").unwrap().data.to_vec()).unwrap();
+        // The page is self-contained: no external script, style or font.
+        for external in [
+            "src=\"http",
+            "href=\"http",
+            "url(http",
+            "url(\"http",
+            "url('http",
+            "src=\"//",
+            "href=\"//",
+            "fetch(\"http",
+            "fetch('http",
+            "fetch(`http",
+            "@import",
+        ] {
+            assert!(
+                !snapshots.contains(external),
+                "external resource: {external}"
+            );
+        }
+    }
+
     #[test]
     fn vfs_op_metrics_render_as_a_counter_and_a_cumulative_histogram() {
         let ops = VfsOpsStatus {

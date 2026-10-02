@@ -32951,3 +32951,75 @@ described above.
 | `cargo build --release --workspace --bins` | exit 0 |
 | `CONSTELLATION_BIN=target/release/constellation bash tests/smoke.sh` | `SMOKE TEST PASSED` |
 | harness, `CONSTELLATION_HARNESS_DOCKER_PREFIX=p2pchurnfx` | `forwarded-mutations`, `lease-handover`, `e2e-two-nodes`, `s3-cut-one-node` PASSED; `lock-grant-dead-generation` 3/3 and `git-under-flock-b2b` 3/3 PASSED; `p2p-invalidation`, `p2p-handover`, `p2p-partition-tolerance`, `p2p-same-identity-restart`, `epoch-peer-reaching-s3-declines`, `existence-peer-hint`, `p2p-partition-one-node`, `idle-cost-link-flap`, `no-peer-in-budget`, `p2p-off-no-delegation`, `inbox-create-storm-p2p-off`, `inbox-sporadic-write-p2p-off` all PASSED |
+
+## Plan 32 M6a (snapshots page)
+
+Plan 32 Steps 7.1, 7.2 and 7.5 as `crates/control/webui/snapshots.html`
+(plan 31 C5 moved the UI from `crates/api` to `crates/control`): vanilla JS,
+no build step, the existing dark theme, hand-drawn SVG. It renders API
+answers only — no retention or accounting arithmetic in the page.
+
+| Item | State | Where |
+|---|---|---|
+| **7.1** space overview: stacked bar (live, shared live+snapshots, snapshot-only shared, unique Σ USED, awaiting GC — hatched), legend with exact bytes and chunk counts, snapshots total, `≈` physical estimate, the "USED values do not sum" note; a segment (or legend entry) click sorts the table by the matching column (unique → USED desc), again to clear; `building (n%)` / `off` states, never zeros | DONE | `crates/control/webui/snapshots.html` (`renderSpace`), `snapshot.space` |
+| **7.2** policy-root cards: path, canonical expression (monospace), next snapshot / last created / last error (`snapshot.sched.status`), paused · capped · orphaned · unparseable · due badges, auto count + steady-state bound (`snapshot.policy.check` on the canonical form), USED Σ (`snapshot.space {path}`.unique), Edit / Pause·Resume / Remove / Remove + expire (both confirm; expire passes `confirm_expiring`) | DONE | `renderRoots`, `snapshot.policy.{list,pause,remove}` |
+| "Add policy"/"Edit" open the editor dialog with a `browse.readdir` directory picker; `#policyEditorBody` (`data-m6b`) is the marked mount point for 7.3/7.4 | DONE (shell; editor is M6b) | `<dialog id="policyEditor">` |
+| **7.5** snapshot table: the CLI's columns, sortable headers (`aria-sort`), USED/WRITTEN inline bars scaled to the shown maximum, KEPT BY chips (tiers, `last=`, grace, expire from `snapshot.policy.show` verdicts; the hold by owner namespace), EXPIRES relative with the absolute time on hover, pin toggle (`snapshot.hold`; a `user:` hold is released naming its owner), "externally held" chip + disabled toggle for a non-`user:` `held_by` | DONE | `renderTable`, `keptChips`, `toggleHold` |
+| Filters (origin auto/manual/orphaned, policy root, name search); multi-select with shift-click ranges; held rows not selectable; live footer from `snapshot.reclaim` (stale answers dropped; Delete disabled until the figure for the current set is in); "Delete selected" confirms with the same figure and calls `snapshot.delete_many`, listing refusals | DONE | `pickRow`, `selectionChanged`, `deleteSelected` |
+| Written over time: SVG bar chart of per-snapshot WRITTEN along the chosen chain (by path, chain order), hover/focus tooltips, a table toggle; clicking a name picks its chain | DONE | `renderWritten` |
+| Footer `as of commit N (age)`, building indicator in size cells; JS-error marker (`data-js-error` on window errors, unhandled rejections, `console.error`) | DONE | `renderAsOf`, `jsError` |
+| `index.html`: nav links to Peers/Snapshots; the snapshot panel is a summary card (count, auto, held, total snapshot space from `snapshot.space`, policy roots, link) keeping the create input | DONE | `crates/control/webui/index.html` |
+| Route test: `/`, `/peers.html`, `/snapshots.html` served as `text/html`; the dashboard links the page; no external resource | DONE | `crates/control/src/web.rs` `embedded_pages_are_served_as_html` |
+| Headless check `tests/webui-headless.sh` (+ `make webui-check`): local-backend daemon with `--web-ui`, `/proj` with a policy and two manual snapshots (one `--by csi:test`), `--dump-dom` assertions (2 rows, externally-held chip + disabled pin, bar segments, legend, note, policy card, chart, footer, no JS error) and a `--screenshot`; SKIP (exit 0) without Chrome; `CHROME_BIN` overrides | DONE | `tests/webui-headless.sh`, `Makefile` |
+
+### Decisions
+
+- **KEPT BY / EXPIRES come from `snapshot.policy.show`'s verdicts** (one call
+  per policy root): `snapshot.list` carries no `kept_by`/`expires_unix_ms`
+  (the brief assumed it did). A snapshot no policy root covers shows only its
+  hold, and EXPIRES `never` (manual/held) or `—`.
+- **"This policy's USED total"** is `snapshot.space {path}`.unique (Σ USED
+  of the snapshots at or under the root, the daemon's figure), labelled as
+  such; the page never sums rows.
+- **The space bar draws the five API quantities to scale side by side**;
+  `live` is the apparent size of the live tree and overlaps "shared live +
+  snapshots", which the note says (no subtraction in JS, the two are not
+  even in the same unit). Tiny segments get a 4 px sliver so they stay
+  clickable. Colors: the dataviz reference palette's dark categorical slots
+  1–5 in fixed order (validated against `#111831`: all checks pass), with
+  the legend, in-bar labels and a hatch on "awaiting GC" so color is never
+  the only signal.
+- **Written-over-time x axis is ordinal** (one band per snapshot, chain
+  order), not time-scaled: a chain mixes 5-minute and monthly snapshots and
+  every bar must stay hoverable. y is linear from 0 to the chain maximum.
+- **A chain is the snapshots of one path** (`SnapshotStatus` has no root
+  inode; listings are rename-safe, so the current path stands in for it).
+- **Remove + expire** confirms with the root's `auto_snapshots` and passes
+  it as `confirm_expiring`: `snapshot.policy.remove` has no dry run to
+  preview with, and today the daemon refuses `expire` (M4) — the page shows
+  that refusal verbatim.
+- Refresh every 15 s (2 s while the index builds); the selection survives a
+  refresh, minus rows that vanished or became held.
+
+### API gaps (reported, not added)
+
+- `snapshot.list` rows lack `kept_by`/`expires_unix_ms` (worked around via
+  `snapshot.policy.show`, one call per root).
+- `snapshot.policy.remove` has no `dry_run`, so `--expire`'s count cannot be
+  previewed exactly (held auto snapshots are counted in `auto_snapshots`).
+- `snapshot.policy.list` does not carry the steady-state bound (one
+  `snapshot.policy.check` per root).
+- `snapshot.space` lacks a live-only (unshared) figure, so the bar draws
+  `live_logical` next to `shared_with_live`.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m6a`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff (`--check` exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --no-fail-fast` | exit 0: 2130 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `bash tests/webui-headless.sh` / `make webui-check` (`CHROME_BIN` = Chromium 124.0.6367.78 Alpine Linux from `zenika/alpine-chrome` in docker, host network: the host has no Chrome) | PASS (14 DOM checks, no JS error, screenshot written) |
+| `target/release/harness run web-ui-smoke web-fleet` | ALL SCENARIOS PASSED (2/2) |

@@ -23,13 +23,13 @@ a{color:#8eb7ff;text-decoration:none}a:hover{text-decoration:underline}
 .dot.off{background:#5a657f}
 </style>
 </head>
-<body><header><h1>Constellation control plane</h1><span id="health">connecting…</span></header>
+<body><header><h1>Constellation control plane</h1><span><a href="/peers.html">Peers</a> · <a href="/snapshots.html">Snapshots</a> · <span id="health">connecting…</span></span></header>
 <main>
 <section><h2>Dashboard</h2><div id="dashboard"></div></section>
 <section class="span2 clickable" onclick="if(!event.target.closest('a'))location.href='/peers.html'" title="Open peer details"><h2>Peers</h2><div id="peers"></div></section>
 <section><h2>Leases / partitions</h2><div id="leases"></div></section>
 <section class="wide"><h2>Files</h2><input id="path" value="/" aria-label="path"><button onclick="browse()">Browse</button><div id="files"></div></section>
-<section><h2>Snapshots</h2><input id="snap" placeholder="/path@name"><button onclick="snapCreate()">Create</button><div id="snapshots"></div></section>
+<section class="clickable" onclick="if(!event.target.closest('a,button,input'))location.href='/snapshots.html'" title="Open the snapshots page"><h2>Snapshots</h2><div id="snapshots" class="muted">loading…</div><p><input id="snap" placeholder="/path@name" aria-label="new snapshot selector"><button onclick="snapCreate()">Create</button></p><a href="/snapshots.html">Space, policies and the snapshot table →</a></section>
 <section><h2>Ops</h2><button onclick="doctor()">Doctor</button><button onclick="logs()">Refresh logs</button><pre id="ops"></pre></section>
 </main>
 <script>
@@ -167,9 +167,18 @@ async function inspectPath(p){
  files.innerHTML="<pre>"+esc(JSON.stringify(e,null,2))+"</pre><p>"+dl+"<button onclick='browse()'>Back to listing</button></p>";
 }
 async function releasePart(part){ops.textContent=JSON.stringify(await call("locks.force_release",{part}),null,2);}
-async function loadSnaps(){let r=await call("snapshot.list",{path:null});snapshots.innerHTML=((r.ok||{}).snapshots||[]).map(s=>`${esc(s.path)}@${esc(s.name)} <button onclick="snapDelete('${esc(s.path+"@"+s.name)}')">Delete</button>`).join("<br>")||'<span class="muted">none</span>';}
+// The summary only: count, total snapshot space (snapshot.space, never a
+// sum of rows) and the policy roots; snapshots.html has the rest.
+async function loadSnaps(){
+ const [l,sp,pl]=await Promise.all([call("snapshot.list",{path:null}),call("snapshot.space",{}),call("snapshot.policy.list",{})]);
+ if(l.error){snapshots.textContent=l.error.message;return}
+ const rows=(l.ok||{}).snapshots||[], roots=(pl.ok||{}).roots||[];
+ const held=rows.filter(s=>s.held).length, auto=rows.filter(s=>s.origin==="auto").length;
+ const total=sp.error?(/SNAPACCT=off/.test(sp.error.message||"")?"accounting off":esc(sp.error.message))
+  :sp.ok.building?`building (${sp.ok.building_pct|0}%)`:`<b>${bytes(sp.ok.snapshots_total.bytes)}</b>`;
+ snapshots.innerHTML=`<b>${rows.length}</b> snapshots · ${auto} auto · ${held} held<br>snapshot space ${total} <span class="muted">(after GC)</span><br>${roots.length} policy root${roots.length===1?"":"s"}${roots.length?": "+roots.slice(0,4).map(r=>esc(r.path||"ino "+r.ino)+(r.paused?" (paused)":"")+(r.orphaned?" (orphaned)":"")).join(", ")+(roots.length>4?", …":""):""}`;
+}
 async function snapCreate(){ops.textContent=JSON.stringify(await call("snapshot.create",{selector:snap.value}),null,2);loadSnaps();}
-async function snapDelete(selector){ops.textContent=JSON.stringify(await call("snapshot.delete",{selector}),null,2);loadSnaps();}
 async function doctor(){ops.textContent=JSON.stringify(await call("node.doctor"),null,2);}
 async function logs(){let r=await call("node.logs.tail",{lines:100});ops.textContent=r.error?r.error.message:r.ok;}
 refresh();loadSnaps();setInterval(refresh,2000);

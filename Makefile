@@ -50,7 +50,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 -include local.mk
 
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
-	check ci clean smoke integration csi-sanity csi-image compose compose-down harness harness-docker \
+	check ci clean smoke integration webui-check csi-sanity csi-image compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
 	harness-transport-matrix build-uring compliance-uring \
 	dist-linux dist-macos deps FORCE \
@@ -128,6 +128,9 @@ smoke: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Host smoke test (local file backend;
 
 integration: $(RELEASE_BIN) ## Host integration (floci S3 in docker)
 	tests/integration.sh
+
+webui-check: $(RELEASE_BIN) ## Headless-Chrome check of the web UI's snapshots page (needs fuse3; SKIPs without google-chrome, or set CHROME_BIN)
+	CONSTELLATION_BIN=$(RELEASE_BIN) tests/webui-headless.sh
 
 CSI_IMAGE ?= constellation-csi:dev
 

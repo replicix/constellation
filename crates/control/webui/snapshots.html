@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Constellation · Snapshots</title>
+<!--
+  Plan 32 Step 7 (7.1 space overview, 7.2 policy roots, 7.5 snapshot table and
+  "written over time"). Vanilla JS, no build step, hand-drawn SVG, the dark
+  theme of index.html/peers.html. The page holds no retention or accounting
+  logic: every number and verdict is an API answer rendered as is —
+  snapshot.space for the bar, snapshot.reclaim for a selection, the
+  policy.show verdicts for KEPT BY/EXPIRES. Plan 33's SPA ports this screen
+  later (its Screen 5).
+-->
+<style>
+:root{color-scheme:dark;font:14px system-ui;background:#0b1020;color:#dbe4ff;
+ --s-live:#3987e5;--s-shlive:#d95926;--s-shsnap:#199e70;--s-unique:#c98500;--s-gc:#d55181}
+*{box-sizing:border-box}
+body{margin:0}
+header{padding:18px 24px;border-bottom:1px solid #26304d;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+main{max-width:1400px;margin:auto;padding:20px;display:grid;gap:16px;grid-template-columns:minmax(0,1fr)}
+a{color:#8eb7ff;text-decoration:none}a:hover{text-decoration:underline}
+h1{margin:0;font-size:20px}h2{margin:0 0 12px;color:#8eb7ff;font-size:16px}h3{margin:0;font-size:14px}
+.card{background:#111831;border:1px solid #26304d;border-radius:10px;padding:16px;min-width:0}
+.head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.head h2{margin:0}
+button,input,select{background:#182344;color:inherit;border:1px solid #3c4c78;border-radius:5px;padding:6px 8px;margin:2px;font:inherit}
+button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}
+button.danger{border-color:#6b2f3a;background:#32141a}
+:focus-visible{outline:2px solid #8eb7ff;outline-offset:2px}
+.ok{color:#72e6a3}.bad{color:#ff8f9c}.warn{color:#ffd27a}.muted{color:#8e9abb}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;border:1px solid #3c4c78;font-size:12px;white-space:nowrap;margin:1px 2px 1px 0}
+.pill.ok{border-color:#2f6b4d;background:#143226}.pill.bad{border-color:#6b2f3a;background:#32141a}
+.pill.warn{border-color:#6b5a2f;background:#2e2814}.pill.ext{border-color:#7a5bd0;background:#221a3d;border-style:dashed}
+/* Space overview */
+#spaceBar{width:100%;height:44px;display:block}
+.barbox{position:relative}.seglbl{position:absolute;top:13px;margin-left:8px;color:#0b1020;font-weight:600;font-size:13px;pointer-events:none}
+#spaceBar .seg{cursor:pointer}#spaceBar .seg:focus-visible{outline:none}
+#spaceBar .seg:focus-visible rect,#spaceBar .seg.active rect{stroke:#dbe4ff;stroke-width:2}
+.legend{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:4px 16px;margin-top:10px}
+.legend button{display:flex;gap:8px;align-items:baseline;text-align:left;background:none;border:1px solid transparent;width:100%;margin:0;padding:4px 6px}
+.legend button[aria-pressed="true"]{border-color:#8eb7ff}
+.legend .sw{flex:none;width:12px;height:12px;border-radius:3px;align-self:center}
+.legend .lbl{flex:1}.legend .val{font-variant-numeric:tabular-nums;white-space:nowrap}
+.note{margin-top:8px;font-size:12.5px}
+.building{display:inline-flex;align-items:center;gap:6px}
+.building::before{content:"";width:28px;height:6px;border-radius:3px;background:repeating-linear-gradient(-45deg,#3c4c78 0 4px,#8eb7ff 4px 8px);background-size:11px 11px;animation:slide 1s linear infinite}
+@keyframes slide{to{background-position:11px 0}}
+@media (prefers-reduced-motion:reduce){.building::before{animation:none}}
+/* Policy roots */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.root{background:#0e1530;border:1px solid #26304d;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.root .expr{background:#0b1020;border:1px solid #26304d;border-radius:5px;padding:4px 8px;overflow-x:auto;white-space:nowrap}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:2px 8px;font-size:13px}.kv>:nth-child(odd){color:#8e9abb}
+/* Table */
+.filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:5px 8px;text-align:left;border-bottom:1px solid #1b243d;font-size:13px;vertical-align:middle}
+th{color:#8e9abb;font-weight:500;border-bottom-color:#3c4c78;white-space:nowrap}
+button.chainpick{background:none;border:0;padding:0;margin:0;text-align:left;color:inherit;font:inherit;cursor:pointer}
+th button.sort{background:none;border:0;padding:0;margin:0;color:inherit;font-weight:500}
+th[aria-sort="ascending"] button.sort::after{content:" ▲"}th[aria-sort="descending"] button.sort::after{content:" ▼"}
+td.num,th.num{text-align:right}
+td.name{word-break:break-all;min-width:200px}
+tr.sel td{background:#16224a}
+.sz{display:flex;flex-direction:column;align-items:flex-end;gap:2px;min-width:84px}
+.bar{height:4px;border-radius:2px;background:#1b243d;width:80px;overflow:hidden}
+.bar>span{display:block;height:100%;border-radius:2px}
+.bar.used>span{background:var(--s-unique)}.bar.written>span{background:var(--s-live)}
+.pin{min-width:72px}
+.pin[aria-pressed="true"]{border-color:#8eb7ff}
+.tfoot{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+/* Written over time */
+#writtenChart{width:100%;height:220px;display:block}
+#writtenChart rect.b{fill:var(--s-live)}#writtenChart g.mk:hover rect.b,#writtenChart g.mk:focus rect.b{fill:#86b6ef}
+#writtenChart text{fill:#8e9abb;font-size:11px}
+#writtenChart line{stroke:#26304d}
+#tip{position:fixed;pointer-events:none;background:#182344;border:1px solid #3c4c78;border-radius:6px;padding:6px 8px;font-size:12px;display:none;z-index:10;max-width:340px}
+dialog{background:#111831;color:inherit;border:1px solid #3c4c78;border-radius:10px;padding:16px;width:min(760px,94vw)}
+dialog::backdrop{background:#0008}
+.picker{max-height:260px;overflow:auto;border:1px solid #26304d;border-radius:6px;margin:8px 0}
+.picker button{display:block;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid #1b243d;margin:0;border-radius:0}
+#msg:empty{display:none}
+#msg{white-space:pre-wrap}
+@media (max-width:700px){main{padding:10px}.kv{grid-template-columns:100px 1fr}td.name{min-width:140px}}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Snapshots</h1>
+    <div class="muted">Space, policies and every snapshot on this filesystem</div>
+  </div>
+  <div><a href="/">← Dashboard</a> · <a href="/peers.html">Peers</a> · <span id="health">connecting…</span></div>
+</header>
+<main>
+  <div id="msg" class="card bad" role="alert"></div>
+
+  <section class="card" aria-labelledby="spaceTitle">
+    <div class="head"><h2 id="spaceTitle">Space overview</h2><span id="spaceAsOf" class="muted"></span></div>
+    <div id="space"><span class="muted">loading…</span></div>
+  </section>
+
+  <section class="card" aria-labelledby="rootsTitle">
+    <div class="head"><h2 id="rootsTitle">Policy roots</h2><button type="button" onclick="openEditor(null)">+ Add policy</button></div>
+    <div id="roots" class="cards"><span class="muted">loading…</span></div>
+  </section>
+
+  <section class="card" aria-labelledby="tableTitle">
+    <div class="head"><h2 id="tableTitle">Snapshots <span id="count" class="muted"></span></h2>
+      <span><input id="newSnap" placeholder="/path@name" aria-label="new snapshot selector"><button type="button" onclick="createSnap()">Create</button></span></div>
+    <div class="filters">
+      <label>origin <select id="fOrigin" onchange="renderTable()">
+        <option value="">all</option><option value="auto">auto</option><option value="manual">manual</option><option value="orphaned">orphaned</option></select></label>
+      <label>policy root <select id="fRoot" onchange="rootHint();renderTable()"><option value="">all</option></select></label>
+      <input id="fName" type="search" placeholder="search names" aria-label="search snapshot names" oninput="renderTable()">
+      <span id="fRootHint" class="muted"></span>
+      <span id="fSpace" class="muted"></span>
+    </div>
+    <div class="tablewrap"><table id="snapTable"></table></div>
+    <div class="tfoot">
+      <span id="selFoot" aria-live="polite" class="muted">nothing selected</span>
+      <span><button type="button" onclick="clearSelection()">Clear selection</button><button type="button" id="delBtn" class="danger" disabled onclick="deleteSelected()">Delete selected</button></span>
+    </div>
+    <div id="asOf" class="muted note"></div>
+  </section>
+
+  <section class="card" aria-labelledby="writtenTitle">
+    <div class="head"><h2 id="writtenTitle">Written over time</h2>
+      <span><label>chain <select id="chain" onchange="renderWritten()"></select></label>
+      <button type="button" id="writtenToggle" aria-pressed="false" onclick="toggleWrittenTable()">Show as table</button></span></div>
+    <div id="written"></div>
+    <div class="muted note">WRITTEN is what each snapshot added over the previous one of its chain, so the bars add up along the chain and show <em>when</em> the churn happened.</div>
+  </section>
+</main>
+
+<!-- Plan 32 M6b: the policy editor (7.3) and the retention timeline (7.4)
+     mount inside #policyEditorBody. This chunk ships the dialog shell and
+     the directory picker "Add policy" needs. -->
+<dialog id="policyEditor" aria-labelledby="editorTitle">
+  <div class="head"><h2 id="editorTitle">Policy</h2><button type="button" onclick="policyEditor.close()" aria-label="close">✕</button></div>
+  <div class="kv"><span>directory</span><span id="editorPath" class="mono">—</span></div>
+  <div id="editorPicker"></div>
+  <div id="policyEditorBody" data-m6b="policy-editor"><p class="muted">The policy editor and retention timeline are not built yet (plan 32 M6b). Until then use <code>constellation snapshot policy set &lt;path&gt; '&lt;expr&gt;'</code>.</p></div>
+</dialog>
+
+<div id="tip" role="tooltip"></div>
+
+<script>
+// A JS error anywhere on the page leaves a marker the headless check
+// (tests/webui-headless.sh) greps for, besides showing it to the operator.
+function jsError(text){
+ const m=document.createElement("div");
+ m.className="js-error";m.dataset.jsError="1";m.hidden=true;m.textContent=String(text);
+ document.body.appendChild(m);
+ const box=document.getElementById("msg");if(box)box.textContent="page error: "+text;
+}
+window.addEventListener("error",e=>jsError(e.message||e));
+window.addEventListener("unhandledrejection",e=>jsError((e.reason&&e.reason.message)||e.reason));
+{const ce=console.error.bind(console);console.error=(...a)=>{jsError(a.map(String).join(" "));ce(...a);};}
+
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const call=async(method,params={})=>{const r=await fetch("/api",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({method,params})});return (r.headers.get("content-type")||"").includes("json")?r.json():{ok:await r.text()};};
+function trimFrac(s){return s.includes(".")?s.replace(/0+$/,"").replace(/\.$/,""):s;}
+function bytes(n){
+ n=Number(n); if(!Number.isFinite(n)||n<0)n=0;
+ const u=["B","KiB","MiB","GiB","TiB","PiB"];
+ let v=n,i=0;
+ while(v>=1024 && i<u.length-1){v/=1024;i++}
+ if(i===0)return Math.round(v)+" B";
+ const d=v>=100?0:v>=10?1:2;
+ return trimFrac(v.toFixed(d))+" "+u[i];
+}
+const exact=n=>Number(n).toLocaleString("en-US")+" bytes";
+/** A span in the coarsest two units: "6d 23h", "3m 12s". */
+function span(ms){
+ let s=Math.max(0,Math.round(Math.abs(ms)/1000));
+ const parts=[[86400,"d"],[3600,"h"],[60,"m"],[1,"s"]].map(([k,u])=>{const v=Math.floor(s/k);s-=v*k;return[v,u]});
+ const i=parts.findIndex(([v])=>v>0);
+ if(i<0)return"0s";
+ return parts.slice(i,i+2).filter(([v])=>v>0).map(([v,u])=>v+u).join(" ");
+}
+const rel=unixMs=>{const d=unixMs-Date.now();return d>=0?"in "+span(d):span(d)+" ago";};
+const utc=unixMs=>new Date(unixMs).toISOString().slice(0,16).replace("T"," ");
+const full=unixMs=>{const d=new Date(unixMs);return d.toISOString().replace("T"," ").replace(/\.\d+Z$/," UTC")+" · "+d.toLocaleString();};
+const errText=e=>e?(e.message||e.kind||JSON.stringify(e)):"";
+function showMsg(text){document.getElementById("msg").textContent=text||"";}
+const ns=by=>String(by||"").split(":")[0];
+/** A hold the page may toggle: none, a plain one, or an operator's
+ *  `user:` one. Anything else (`csi:…`, plan 37) is externally owned. */
+const externallyHeld=s=>s.held&&!!s.held_by&&!String(s.held_by).startsWith("user:");
+
+// ---- state -------------------------------------------------------------
+let snaps=[];            // snapshot.list rows (sizes: true)
+let policyRoots=[];      // snapshot.policy.list roots
+let sched=null;          // snapshot.sched.status
+let verdicts=new Map();  // snapshot id -> SnapVerdict (snapshot.policy.show)
+let rootExtra=new Map(); // ino -> {steady, used, usedErr}
+let space=null, spaceErr=null;
+let sort={col:"created",dir:-1};
+let segFilter=null;      // the space-bar segment last clicked
+const selected=new Set();
+let lastClicked=null;    // for shift-click ranges, by id
+let showWrittenTable=false;
+let loading=false;
+
+// ---- 7.1 space overview ---------------------------------------------------
+const SEGMENTS=[
+ {key:"live",label:"live data",color:"var(--s-live)",help:"apparent size of the live tree (it includes the part shared with snapshots)",value:sp=>sp.live_logical,chunks:()=>null,click:{col:"refer",dir:-1}},
+ {key:"shlive",label:"shared live + snapshots",color:"var(--s-shlive)",help:"in a snapshot and in the live tree: costs nothing extra",value:sp=>sp.shared_with_live.bytes,chunks:sp=>sp.shared_with_live.chunks,click:{col:"refer",dir:-1}},
+ {key:"shsnap",label:"shared by snapshots only",color:"var(--s-shsnap)",help:"not live, held by two or more snapshots: in nobody's USED",value:sp=>sp.shared_snapshots_only.bytes,chunks:sp=>sp.shared_snapshots_only.chunks,click:{col:"written",dir:-1}},
+ {key:"unique",label:"unique to one snapshot (Σ USED)",color:"var(--s-unique)",help:"chunks exactly one snapshot holds",value:sp=>sp.unique.bytes,chunks:sp=>sp.unique.chunks,click:{col:"used",dir:-1}},
+ {key:"gc",label:"awaiting GC",color:"var(--s-gc)",hatch:true,help:"freed by snapshot deletion, not yet collected",value:sp=>sp.awaiting_gc.bytes,chunks:sp=>sp.awaiting_gc.chunks,click:null}
+];
+function renderSpace(){
+ const el=document.getElementById("space"), asOf=document.getElementById("spaceAsOf");
+ if(spaceErr){
+  const off=/SNAPACCT=off/.test(spaceErr.message||"")||spaceErr.kind==="unsupported";
+  el.innerHTML=off
+   ?'<span class="pill">off</span> <span class="muted">space accounting is off on this node (<code>CONSTELLATION_SNAPACCT=off</code>)</span>'
+   :`<span class="bad">${esc(errText(spaceErr))}</span>`;
+  asOf.textContent="";return;
+ }
+ if(!space){el.innerHTML='<span class="muted">loading…</span>';return;}
+ if(space.building){
+  el.innerHTML=`<span class="building">building (${space.building_pct|0}%)</span> <span class="muted">the accounting index is catching up with the snapshots; no number is shown until it matches</span>`;
+  asOf.textContent="";return;
+ }
+ const vals=SEGMENTS.map(s=>Math.max(0,Number(s.value(space))||0));
+ const total=vals.reduce((a,b)=>a+b,0);
+ // Drawn to scale against each other; a segment too small to see still
+ // gets a 4 px sliver so it stays clickable, and the legend has the bytes.
+ const W=1000,H=44,GAP=2;
+ const visible=vals.filter(v=>v>0).length;
+ // Slivers widen tiny segments, so the big ones give that room back.
+ const minW=4, room=W-GAP*Math.max(0,visible-1);
+ const slack=vals.reduce((a,v)=>a+(v&&total&&v/total*room<minW?minW-v/total*room:0),0);
+ const scale=total?(room-slack)/room:1;
+ let x=0;
+ const labels=[];
+ const segs=SEGMENTS.map((s,i)=>{
+  if(!vals[i])return"";
+  const raw=total?vals[i]/total*room:0;
+  const w=raw<minW?minW:raw*scale;
+  const g=`<g class="seg${segFilter===s.key?" active":""}" tabindex="0" role="button" aria-label="${esc(s.label)}: ${esc(bytes(vals[i]))}" data-seg="${s.key}">
+    <title>${esc(s.label)}: ${esc(bytes(vals[i]))} (${esc(exact(vals[i]))})</title>
+    <rect x="${x.toFixed(1)}" y="2" width="${Math.max(1,w-0).toFixed(1)}" height="${H-4}" rx="4" fill="${s.color}"/>
+    ${s.hatch?`<rect x="${x.toFixed(1)}" y="2" width="${w.toFixed(1)}" height="${H-4}" rx="4" fill="url(#hatch)"/>`:""}
+  </g>`;
+  // Labels are HTML over the bar: the SVG stretches to the card's width
+  // (preserveAspectRatio="none"), which would distort SVG text.
+  if(w>140)labels.push(`<span class="seglbl" style="left:${(x/W*100).toFixed(2)}%" aria-hidden="true">${esc(bytes(vals[i]))}</span>`);
+  x+=w+GAP;return g;
+ }).join("");
+ const svg=`<svg id="spaceBar" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="group" aria-label="space breakdown">
+   <defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="2" height="6" fill="#0b1020" opacity=".55"/></pattern></defs>
+   ${total?segs:`<rect x="0" y="2" width="${W}" height="${H-4}" rx="4" fill="#1b243d"/>`}</svg>`;
+ const barBox=`<div class="barbox">${svg}${labels.join("")}</div>`;
+ const legend=SEGMENTS.map((s,i)=>`<button type="button" data-seg="${s.key}" aria-pressed="${segFilter===s.key}" title="${esc(s.help)}${s.click?` — click to ${s.key==="unique"?"sort the table by USED":"sort the table"}`:" — no snapshot row owns these chunks, so there is nothing to sort or filter"}">
+   <span class="sw" style="background:${s.color}${s.hatch?";background-image:repeating-linear-gradient(45deg,#0b102088 0 2px,transparent 2px 6px)":""}"></span>
+   <span class="lbl">${esc(s.label)}</span>
+   <span class="val" title="${esc(exact(vals[i]))}${s.chunks(space)!=null?" in "+s.chunks(space)+" chunks":""}">${esc(bytes(vals[i]))}</span></button>`).join("");
+ const phys=space.physical_estimate!=null
+  ?` · snapshots ≈ ${esc(bytes(space.physical_estimate))} stored (×${Number(space.physical_ratio).toFixed(2)} from the last GC census, an estimate)`:"";
+ el.innerHTML=`${barBox}<div class="legend">${legend}</div>
+  <div class="note"><b>snapshots, total</b> <span title="${esc(exact(space.snapshots_total.bytes))}">${esc(bytes(space.snapshots_total.bytes))}</span> <span class="muted">— deleting every snapshot returns this (after GC)${phys}</span></div>
+  <div class="note muted">Per-snapshot USED values do not sum to the total: chunks two or more snapshots share are in nobody's USED. Segments are drawn to scale; the bar is not one total (live data is an apparent size). Awaiting GC waits for the GC horizon (${esc(span(space.gc_horizon_ms))}).</div>`;
+ asOf.textContent=`as of commit ${space.as_of_seq}${space.as_of_ms?" ("+rel(space.as_of_ms)+")":""}`;
+ el.querySelectorAll("[data-seg]").forEach(n=>{
+  n.addEventListener("click",()=>segClick(n.dataset.seg));
+  n.addEventListener("keydown",e=>{if((e.key==="Enter"||e.key===" ")&&n.tagName!=="BUTTON"){e.preventDefault();segClick(n.dataset.seg);}});
+ });
+}
+/** A segment sorts the table by the column that segment is made of; the
+ *  same segment again clears it. */
+function segClick(key){
+ const s=SEGMENTS.find(x=>x.key===key);
+ if(!s.click)return;
+ if(segFilter===key){segFilter=null;sort={col:"created",dir:-1};}
+ else{segFilter=key;sort={...s.click};}
+ document.getElementById("fSpace").textContent=segFilter?`sorted for “${s.label}”`:"";
+ renderSpace();renderTable();
+ if(segFilter)document.getElementById("snapTable").scrollIntoView({behavior:"smooth",block:"nearest"});
+}
+
+// ---- 7.2 policy roots -----------------------------------------------------
+function schedFor(ino){return ((sched&&sched.roots)||[]).find(r=>r.ino===ino);}
+function renderRoots(){
+ const el=document.getElementById("roots");
+ if(!policyRoots.length){el.innerHTML='<span class="muted">No policy roots. “Add policy” binds a schedule to a directory.</span>';return;}
+ el.innerHTML=policyRoots.map(r=>{
+  const st=schedFor(r.ino)||{};
+  const ex=rootExtra.get(r.ino)||{};
+  const badges=[
+   r.paused?'<span class="pill warn">⏸ paused</span>':"",
+   st.capped?'<span class="pill bad">capped</span>':"",
+   r.orphaned?'<span class="pill warn">orphaned</span>':"",
+   r.error?'<span class="pill bad">unparseable</span>':"",
+   st.due&&!r.paused?'<span class="pill ok">due</span>':"",
+  ].join("");
+  const path=r.path?`<span class="mono">${esc(r.path)}</span>`:`<span class="muted">directory gone (ino ${r.ino})</span>`;
+  const expr=r.canonical!=null
+   ?`<div class="expr mono" title="canonical form: what the CLI takes">${esc(r.canonical)}</div>`
+   :r.expr?`<div class="expr mono">${esc(r.expr)}</div><div class="bad">at byte ${r.error?r.error.offset:"?"}: ${esc(r.error?r.error.message:"does not parse")}</div>`
+   :'<div class="muted">no policy (removed); its auto snapshots are kept</div>';
+  const next=st.next_due_unix_ms!=null?`<span title="${esc(full(st.next_due_unix_ms))}">${st.due?"due now":esc(rel(st.next_due_unix_ms))}</span>`:'<span class="muted">never (not armed)</span>';
+  const last=st.last_created_unix_ms!=null?`<span title="${esc(full(st.last_created_unix_ms))}">${esc(rel(st.last_created_unix_ms))}</span>`:'<span class="muted">—</span>';
+  const used=ex.usedBuilding?`<span class="building">building (${ex.usedBuilding}%)</span>`
+   :ex.used!=null?`<span title="${esc(exact(ex.used))}">${esc(bytes(ex.used))}</span> <span class="muted">(snapshots at or under this path)</span>`
+   :'<span class="muted">—</span>';
+  const p=JSON.stringify(r.path||"");
+  const actions=r.path?`<div>
+    <button type="button" onclick='openEditor(${esc(p)})'>Edit</button>
+    ${r.canonical!=null?`<button type="button" onclick='pausePolicy(${esc(p)},${!r.paused})'>${r.paused?"Resume":"Pause"}</button>`:""}
+    ${r.expr?`<button type="button" class="danger" onclick='removePolicy(${r.ino},false)'>Remove</button>
+    <button type="button" class="danger" onclick='removePolicy(${r.ino},true)' title="remove the policy and delete its auto snapshots">Remove + expire…</button>`:""}
+   </div>`:"";
+  return `<article class="root" data-ino="${r.ino}">
+   <div class="head" style="margin:0"><h3>${path}</h3><span>${badges}</span></div>
+   ${expr}
+   <div class="kv">
+    <span>next snapshot</span><span>${next}</span>
+    <span>last created</span><span>${last}</span>
+    ${st.error?`<span>last error</span><span class="bad">${esc(st.error)}</span>`:""}
+    <span>auto snapshots</span><span>${r.auto_snapshots}${ex.steady!=null?` <span class="muted">· steady state ≤ ${ex.steady}</span>`:""}</span>
+    <span>USED Σ</span><span>${used}</span>
+   </div>${actions}</article>`;
+ }).join("");
+}
+async function pausePolicy(path,paused){
+ const r=await call("snapshot.policy.pause",{path,paused});
+ showMsg(r.error?`${paused?"pause":"resume"} ${path}: ${errText(r.error)}`:"");
+ load();
+}
+async function removePolicy(ino,expire){
+ const r0=policyRoots.find(r=>r.ino===ino);if(!r0||!r0.path)return;
+ const path=r0.path;
+ if(!expire){
+  if(!confirm(`Remove the snapshot policy of ${path}?\n\nNo snapshot is deleted: its ${r0.auto_snapshots} auto snapshots are kept, as orphaned.`))return;
+  const r=await call("snapshot.policy.remove",{path});
+  showMsg(r.error?`remove ${path}: ${errText(r.error)}`:"");load();return;
+ }
+ // The count the daemon checks `confirm_expiring` against is the root's
+ // auto-snapshot count as policy.list reported it (held ones are never
+ // expired, whatever the count says).
+ const n=r0.auto_snapshots;
+ if(!confirm(`Remove the snapshot policy of ${path} AND delete its ${n} auto snapshots?\n\nHeld snapshots are kept. This cannot be undone.`))return;
+ const r=await call("snapshot.policy.remove",{path,expire:true,confirm_expiring:n});
+ showMsg(r.error?`remove --expire ${path}: ${errText(r.error)}`:"");load();
+}
+
+// ---- policy editor shell (M6b fills it) -------------------------------------
+async function openEditor(path){
+ const dlg=document.getElementById("policyEditor");
+ document.getElementById("editorTitle").textContent=path?"Edit policy":"Add policy";
+ document.getElementById("editorPath").textContent=path||"/";
+ dlg.dataset.path=path||"/";
+ const picker=document.getElementById("editorPicker");
+ picker.innerHTML="";
+ if(!dlg.open)dlg.showModal();
+ if(!path)pickDir("/");
+}
+async function pickDir(dir){
+ const dlg=document.getElementById("policyEditor");
+ dlg.dataset.path=dir;
+ document.getElementById("editorPath").textContent=dir;
+ const picker=document.getElementById("editorPicker");
+ const r=await call("browse.readdir",{path:dir});
+ if(r.error){picker.innerHTML=`<p class="bad">${esc(errText(r.error))}</p>`;return;}
+ const up=dir!=="/"?[`<button type="button" data-dir="${esc(dir.replace(/\/[^/]+\/?$/,"")||"/")}">.. (up)</button>`]:[];
+ const dirs=(r.ok.entries||[]).filter(e=>e.kind==="dir"&&!e.name.startsWith(".constellation"))
+  .map(e=>`<button type="button" data-dir="${esc(e.path)}">📁 ${esc(e.name)}</button>`);
+ picker.innerHTML=`<div class="muted">choose the directory the policy applies to</div><div class="picker" role="listbox" aria-label="directories">${up.concat(dirs).join("")||'<span class="muted">no subdirectories</span>'}</div>`;
+ picker.querySelectorAll("[data-dir]").forEach(b=>b.addEventListener("click",()=>pickDir(b.dataset.dir)));
+}
+
+// ---- 7.5 snapshot table ---------------------------------------------------
+const orphanedInos=()=>new Set(policyRoots.filter(r=>r.orphaned).map(r=>r.ino));
+const COLS=[
+ {key:"name",label:"NAME",cmp:(a,b)=>(a.path+"@"+a.name).localeCompare(b.path+"@"+b.name)},
+ {key:"created",label:"CREATED (UTC)",cmp:(a,b)=>a.created_unix_ms-b.created_unix_ms||(a.seq||0)-(b.seq||0)},
+ {key:"origin",label:"ORIGIN",cmp:(a,b)=>a.origin.localeCompare(b.origin)},
+ {key:"used",label:"USED",num:true,cmp:(a,b)=>(a.used??-1)-(b.used??-1)},
+ {key:"written",label:"WRITTEN",num:true,cmp:(a,b)=>(a.written??-1)-(b.written??-1)},
+ {key:"refer",label:"REFER",num:true,cmp:(a,b)=>(a.refer??a.refer_bytes??-1)-(b.refer??b.refer_bytes??-1)},
+ {key:"kept",label:"KEPT BY",cmp:(a,b)=>keptText(a).localeCompare(keptText(b))},
+ {key:"expires",label:"EXPIRES",cmp:(a,b)=>expiresKey(a)-expiresKey(b)},
+];
+function keptChips(s){
+ const out=[];
+ const v=verdicts.get(s.id);
+ if(v){
+  if(!v.keep)out.push('<span class="pill bad" title="the policy would expire this snapshot">✕ expire</span>');
+  const tiers=v.reasons.filter(r=>r.kind==="tier").map(r=>r.every);
+  if(tiers.length)out.push(`<span class="pill" title="kept by the tiers ${esc(tiers.join(", "))}">${esc(tiers.join("·"))}</span>`);
+  for(const r of v.reasons){
+   if(r.kind==="last")out.push(`<span class="pill">last=${esc(r.last??1)}</span>`);
+   else if(r.kind==="grace")out.push('<span class="pill warn" title="inside the grace window after a policy change">grace</span>');
+  }
+ }
+ if(s.held){
+  if(externallyHeld(s))out.push(`<span class="pill ext" title="held by ${esc(s.held_by)}: owned outside this page">⚑ externally held · ${esc(ns(s.held_by))}</span>`);
+  else out.push(`<span class="pill ok" title="${esc(s.held_by?"held by "+s.held_by:"held (no owner recorded)")}">⚑ held${s.held_by?": "+esc(ns(s.held_by)):""}</span>`);
+ }
+ return out.join("")||'<span class="muted">—</span>';
+}
+function keptText(s){const v=verdicts.get(s.id);return (s.held?"held ":"")+(v?v.reasons.map(r=>r.every||r.kind).join(" "):"");}
+function expiresKey(s){
+ const v=verdicts.get(s.id);
+ if(v&&v.expires_unix_ms!=null)return v.expires_unix_ms;
+ if(v&&!v.keep)return 0;
+ return Number.MAX_SAFE_INTEGER;
+}
+function expiresCell(s){
+ const v=verdicts.get(s.id);
+ if(s.held)return'<span class="muted">never (held)</span>';
+ if(v&&!v.keep)return'<span class="bad">expiring</span>';
+ if(v&&v.expires_unix_ms!=null)return`<span title="${esc(full(v.expires_unix_ms))}">${esc(rel(v.expires_unix_ms))}</span>`;
+ if(s.origin==="manual")return'<span class="muted">never</span>';
+ if(v)return'<span class="muted">never</span>';
+ return'<span class="muted">—</span>';
+}
+/** USED/WRITTEN/REFER: the number with a bar against the table maximum;
+ *  `building (n%)` while the index builds; `—` with accounting off. Never
+ *  a zero that is not the answer. */
+function sizeCell(s,key,max){
+ const v=s[key];
+ if(v!=null&&s.size_state==="ok"){
+  const bar=key==="refer"?"":`<span class="bar ${key}" aria-hidden="true"><span style="width:${max?Math.max(v?2:0,v/max*100).toFixed(1):0}%"></span></span>`;
+  return`<div class="sz"><span title="${esc(exact(v))}">${esc(bytes(v))}</span>${bar}</div>`;
+ }
+ if(s.size_state==="building")return`<span class="building" title="the accounting index is being built">building (${s.building_pct|0}%)</span>`;
+ if(key==="refer"&&s.refer_bytes!=null)return`<span title="measured when the snapshot was taken (not deduplicated)">≈${esc(bytes(s.refer_bytes))}</span>`;
+ return`<span class="muted" title="${s.size_state==="off"?"space accounting is off":"no size yet"}">—</span>`;
+}
+function filtered(){
+ const o=document.getElementById("fOrigin").value, root=document.getElementById("fRoot").value;
+ const q=document.getElementById("fName").value.trim().toLowerCase();
+ const orph=orphanedInos();
+ let rows=snaps.filter(s=>{
+  if(o==="orphaned"){if(!(s.origin==="auto"&&orph.has(s.policy_ino)))return false;}
+  else if(o&&s.origin!==o)return false;
+  if(root&&String(s.policy_ino)!==root)return false;
+  if(q&&!(s.path+"@"+s.name).toLowerCase().includes(q))return false;
+  return true;
+ });
+ const c=COLS.find(c=>c.key===sort.col)||COLS[1];
+ rows.sort((a,b)=>c.cmp(a,b)*sort.dir||a.id.localeCompare(b.id));
+ return rows;
+}
+let shown=[];
+function renderTable(){
+ shown=filtered();
+ const max=k=>Math.max(0,...shown.map(s=>s.size_state==="ok"?(s[k]||0):0));
+ const mu=max("used"), mw=max("written");
+ const head=`<thead><tr><th scope="col"><input type="checkbox" id="selAll" aria-label="select every deletable row shown"></th>${COLS.map(c=>`<th scope="col" class="${c.num?"num":""}" aria-sort="${sort.col===c.key?(sort.dir>0?"ascending":"descending"):"none"}"><button type="button" class="sort" data-col="${c.key}">${c.label}</button></th>`).join("")}<th scope="col">hold</th></tr></thead>`;
+ const body=shown.map((s,i)=>{
+  const ext=externallyHeld(s);
+  const sel=selected.has(s.id);
+  const box=s.held
+   ?`<input type="checkbox" disabled aria-label="held: release it before deleting" title="held snapshots cannot be selected for delete; release the hold first">`
+   :`<input type="checkbox" class="pick" data-i="${i}" ${sel?"checked":""} aria-label="select ${esc(s.path+"@"+s.name)}">`;
+  const pin=ext
+   ?`<button type="button" class="pin" disabled aria-pressed="true" title="held by ${esc(s.held_by)}: an external system (e.g. the CSI driver) owns this hold; releasing it here would fight it">⚑ external</button>`
+   :`<button type="button" class="pin" data-hold="${i}" aria-pressed="${s.held}" title="${s.held?"release the hold":"hold: keep this snapshot from deletion and expiry"}">${s.held?"⚑ held":"⚐ hold"}</button>`;
+  return `<tr class="${sel?"sel":""}" data-id="${esc(s.id)}">
+   <td>${box}</td>
+   <td class="name"><button type="button" class="chainpick" data-chain="${esc(s.path)}" title="show this chain in “Written over time”" >${esc(s.path)}<span class="muted">@</span>${esc(s.name)}</button></td>
+   <td title="${esc(full(s.created_unix_ms))}">${esc(utc(s.created_unix_ms))}</td>
+   <td>${esc(s.origin||"manual")}</td>
+   <td class="num">${sizeCell(s,"used",mu)}</td>
+   <td class="num">${sizeCell(s,"written",mw)}</td>
+   <td class="num">${sizeCell(s,"refer",0)}</td>
+   <td>${keptChips(s)}</td>
+   <td>${expiresCell(s)}</td>
+   <td>${pin}</td></tr>`;
+ }).join("");
+ const t=document.getElementById("snapTable");
+ t.innerHTML=head+`<tbody>${body||`<tr><td colspan="${COLS.length+2}" class="muted">${snaps.length?"no snapshot matches the filters":"no snapshots"}</td></tr>`}</tbody>`;
+ document.getElementById("count").textContent=`(${shown.length}${shown.length!==snaps.length?" of "+snaps.length:""})`;
+ t.querySelectorAll("button[data-col]").forEach(b=>b.addEventListener("click",()=>{
+  const k=b.dataset.col;
+  sort=sort.col===k?{col:k,dir:-sort.dir}:{col:k,dir:COLS.find(c=>c.key===k).num?-1:1};
+  segFilter=null;document.getElementById("fSpace").textContent="";renderSpace();renderTable();
+ }));
+ t.querySelectorAll("input.pick").forEach(b=>b.addEventListener("click",e=>pickRow(Number(b.dataset.i),e.shiftKey,b.checked)));
+ t.querySelectorAll("button[data-hold]").forEach(b=>b.addEventListener("click",()=>toggleHold(shown[Number(b.dataset.hold)])));
+ t.querySelectorAll("button.chainpick").forEach(b=>b.addEventListener("click",()=>{document.getElementById("chain").value=b.dataset.chain;renderWritten();}));
+ const all=document.getElementById("selAll");
+ const deletable=shown.filter(s=>!s.held);
+ all.checked=deletable.length>0&&deletable.every(s=>selected.has(s.id));
+ all.addEventListener("click",()=>{deletable.forEach(s=>all.checked?selected.add(s.id):selected.delete(s.id));renderTable();selectionChanged();});
+ renderAsOf();
+}
+/** A click picks one row; shift-click picks the range from the last click
+ *  in the order shown, setting every deletable row in it to the clicked
+ *  box's state. */
+function pickRow(i,shift,checked){
+ const s=shown[i];
+ const from=shift&&lastClicked!=null?shown.findIndex(x=>x.id===lastClicked):-1;
+ const range=from>=0?shown.slice(Math.min(from,i),Math.max(from,i)+1):[s];
+ range.filter(x=>!x.held).forEach(x=>checked?selected.add(x.id):selected.delete(x.id));
+ lastClicked=s.id;
+ renderTable();selectionChanged();
+}
+function clearSelection(){selected.clear();lastClicked=null;renderTable();selectionChanged();}
+let reclaimSeq=0, reclaimed=null, reclaimTimer=null;
+/** The footer's reclaim figure is snapshot.reclaim's answer for exactly
+ *  this set; Delete stays disabled until that answer is in, so the confirm
+ *  never quotes a stale figure. */
+function selectionChanged(){
+ const foot=document.getElementById("selFoot"), del=document.getElementById("delBtn");
+ reclaimed=null;del.disabled=true;
+ const ids=[...selected];
+ if(!ids.length){foot.textContent="nothing selected";return;}
+ foot.innerHTML=`${ids.length} selected · <span class="building">would reclaim …</span>`;
+ clearTimeout(reclaimTimer);
+ const seq=++reclaimSeq;
+ reclaimTimer=setTimeout(async()=>{
+  let r;
+  try{r=await call("snapshot.reclaim",{selectors:ids});}catch(e){r={error:{message:String(e&&e.message||e)}};}
+  if(seq!==reclaimSeq)return;
+  if(r.error){foot.innerHTML=`${ids.length} selected · <span class="muted">reclaim unknown: ${esc(errText(r.error))}</span>`;reclaimed={text:"an unknown amount (reclaim estimate unavailable)"};}
+  else if(r.ok.building){foot.innerHTML=`${ids.length} selected · <span class="building">reclaim estimate building (${r.ok.building_pct|0}%)</span>`;reclaimed={text:"an amount not known yet (the accounting index is building)"};
+   setTimeout(()=>{if(seq===reclaimSeq)selectionChanged();},2000);}
+  else{reclaimed={text:`≈ ${bytes(r.ok.bytes)} in ${r.ok.chunks} chunks (after GC)`};
+   foot.innerHTML=`${ids.length} selected · would reclaim <b title="${esc(exact(r.ok.bytes))} · as of commit ${r.ok.as_of_seq}">≈ ${esc(bytes(r.ok.bytes))}</b> (after GC)`;}
+  del.disabled=false;
+ },150);
+}
+async function deleteSelected(){
+ const ids=[...selected];
+ if(!ids.length||!reclaimed)return;
+ const names=snaps.filter(s=>selected.has(s.id)).map(s=>s.path+"@"+s.name);
+ if(!confirm(`Delete ${ids.length} snapshot${ids.length>1?"s":""}?\n\n${names.slice(0,12).join("\n")}${names.length>12?"\n… and "+(names.length-12)+" more":""}\n\nWould reclaim ${reclaimed.text}. This cannot be undone.`))return;
+ const r=await call("snapshot.delete_many",{selectors:ids});
+ if(r.error)showMsg("delete: "+errText(r.error));
+ else{
+  const ref=r.ok.refused||[];
+  showMsg(ref.length?`deleted ${r.ok.deleted.length}; refused ${ref.length}:\n`+ref.map(x=>`${x.id}: ${x.reason}`).join("\n"):"");
+ }
+ selected.clear();lastClicked=null;selectionChanged();load();
+}
+async function toggleHold(s){
+ if(!s||externallyHeld(s))return;
+ // Releasing an owned `user:` hold names that owner, as the daemon asks.
+ const p=s.held?{id:s.id,held:false,by:s.held_by||null}:{id:s.id,held:true};
+ const r=await call("snapshot.hold",p);
+ showMsg(r.error?`hold ${s.path}@${s.name}: ${errText(r.error)}`:"");
+ if(!s.held)selected.delete(s.id);
+ load();selectionChanged();
+}
+async function createSnap(){
+ const sel=document.getElementById("newSnap").value.trim();if(!sel)return;
+ const r=await call("snapshot.create",{selector:sel});
+ showMsg(r.error?`create ${sel}: ${errText(r.error)}`:"");
+ if(!r.error)document.getElementById("newSnap").value="";
+ load();
+}
+function renderAsOf(){
+ const s=snaps.find(x=>x.as_of_seq!=null);
+ const b=snaps.find(x=>x.size_state==="building");
+ const off=snaps.length&&snaps.every(x=>x.size_state==="off");
+ document.getElementById("asOf").innerHTML=
+  b?`<span class="building">sizes building (${b.building_pct|0}%)</span> · logical bytes, pre-compression`
+  :off?"space accounting is off: USED/WRITTEN show —, REFER the size measured at creation (≈)"
+  :s?`USED/WRITTEN/REFER as of commit ${s.as_of_seq}${s.as_of_ms?` (${esc(rel(s.as_of_ms))})`:""} · logical bytes, pre-compression · USED values do not sum`:"";
+}
+
+// ---- written over time ------------------------------------------------------
+function chains(){const m=new Map();for(const s of snaps){if(!m.has(s.path))m.set(s.path,[]);m.get(s.path).push(s);}return m;}
+function renderChainSelect(){
+ const sel=document.getElementById("chain"), cur=sel.value;
+ const m=chains();
+ const paths=[...m.keys()].sort((a,b)=>m.get(b).length-m.get(a).length||a.localeCompare(b));
+ sel.innerHTML=paths.map(p=>`<option value="${esc(p)}">${esc(p)} (${m.get(p).length})</option>`).join("");
+ if(paths.includes(cur))sel.value=cur;
+}
+function toggleWrittenTable(){
+ showWrittenTable=!showWrittenTable;
+ const b=document.getElementById("writtenToggle");
+ b.setAttribute("aria-pressed",String(showWrittenTable));b.textContent=showWrittenTable?"Show as chart":"Show as table";
+ renderWritten();
+}
+function renderWritten(){
+ const el=document.getElementById("written");
+ const path=document.getElementById("chain").value;
+ const rows=(chains().get(path)||[]).slice().sort((a,b)=>(a.seq??0)-(b.seq??0)||a.created_unix_ms-b.created_unix_ms);
+ if(!rows.length){el.innerHTML='<span class="muted">no snapshots</span>';return;}
+ const b=rows.find(s=>s.size_state==="building");
+ if(b){el.innerHTML=`<span class="building">building (${b.building_pct|0}%)</span>`;return;}
+ if(rows.every(s=>s.size_state==="off")){el.innerHTML='<span class="pill">off</span> <span class="muted">space accounting is off</span>';return;}
+ if(showWrittenTable){
+  el.innerHTML=`<div class="tablewrap"><table><thead><tr><th scope="col">snapshot</th><th scope="col">created (UTC)</th><th scope="col" class="num">WRITTEN</th></tr></thead><tbody>${rows.map(s=>`<tr><td>${esc(s.name)}</td><td>${esc(utc(s.created_unix_ms))}</td><td class="num" title="${s.written!=null?esc(exact(s.written)):""}">${s.written!=null?esc(bytes(s.written)):"—"}</td></tr>`).join("")}</tbody></table></div>`;
+  return;
+ }
+ // Linear y from 0 to the chain's largest WRITTEN, one equal-width band
+ // per snapshot in chain order (not time-scaled: a chain mixes 5-minute
+ // and monthly snapshots, and every snapshot should stay hoverable).
+ const W=1000,H=220,L=64,R=8,T=10,B=34;
+ const max=Math.max(1,...rows.map(s=>s.written||0));
+ const band=(W-L-R)/rows.length, bw=Math.max(1,Math.min(48,band-2));
+ const y=v=>T+(H-T-B)*(1-v/max);
+ const ticks=[0,.5,1].map(f=>`<line x1="${L}" x2="${W-R}" y1="${y(max*f).toFixed(1)}" y2="${y(max*f).toFixed(1)}"/><text x="${L-6}" y="${(y(max*f)+4).toFixed(1)}" text-anchor="end">${esc(bytes(max*f))}</text>`).join("");
+ const every=Math.ceil(rows.length/8);
+ const bars=rows.map((s,i)=>{
+  const v=s.written||0, x=L+i*band+(band-bw)/2, top=y(v), h=Math.max(v?2:0,H-B-top);
+  const lbl=i%every===0?`<text x="${(x+bw/2).toFixed(1)}" y="${H-B+14}" text-anchor="middle">${esc(utc(s.created_unix_ms).slice(5,16))}</text>`:"";
+  return `<g class="mk" tabindex="0" data-i="${i}" aria-label="${esc(s.name)}: ${esc(bytes(v))} written"><rect x="${(L+i*band).toFixed(1)}" y="${T}" width="${band.toFixed(1)}" height="${H-B-T}" fill="transparent"/><rect class="b" x="${x.toFixed(1)}" y="${(H-B-h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(4,bw/2)}"/>${lbl}</g>`;
+ }).join("");
+ el.innerHTML=`<svg id="writtenChart" viewBox="0 0 ${W} ${H}" role="img" aria-label="WRITTEN per snapshot of ${esc(path)}">${ticks}<line x1="${L}" x2="${W-R}" y1="${H-B}" y2="${H-B}" style="stroke:#3c4c78"/>${bars}</svg>`;
+ const tip=document.getElementById("tip");
+ el.querySelectorAll("g.mk").forEach(g=>{
+  const s=rows[Number(g.dataset.i)];
+  const show=e=>{
+   tip.innerHTML=`<b>${esc(s.path)}@${esc(s.name)}</b><br>created ${esc(full(s.created_unix_ms))}<br>WRITTEN ${s.written!=null?esc(bytes(s.written)):"—"} · USED ${s.used!=null?esc(bytes(s.used)):"—"} · REFER ${s.refer!=null?esc(bytes(s.refer)):"—"}`;
+   const r=e&&e.clientX!=null?{x:e.clientX,y:e.clientY}:(()=>{const b=g.getBoundingClientRect();return{x:b.left+b.width/2,y:b.top};})();
+   tip.style.display="block";
+   tip.style.left=Math.min(window.innerWidth-tip.offsetWidth-8,r.x+12)+"px";
+   tip.style.top=Math.max(8,r.y-tip.offsetHeight-8)+"px";
+  };
+  g.addEventListener("mousemove",show);g.addEventListener("focus",()=>show(null));
+  g.addEventListener("mouseleave",()=>tip.style.display="none");g.addEventListener("blur",()=>tip.style.display="none");
+ });
+}
+
+// ---- loading ----------------------------------------------------------------
+async function loadRootExtras(){
+ // Per root: the steady-state bound (snapshot.policy.check on its canonical
+ // expression), USED Σ (snapshot.space on its path: `unique`), and the
+ // verdicts behind KEPT BY / EXPIRES (snapshot.policy.show).
+ const nextVerdicts=new Map(), nextExtra=new Map();
+ await Promise.all(policyRoots.map(async r=>{
+  const ex={};
+  const jobs=[];
+  if(r.canonical!=null)jobs.push(call("snapshot.policy.check",{expr:r.canonical}).then(c=>{if(c.ok&&c.ok.steady_state_bound!=null)ex.steady=c.ok.steady_state_bound;}));
+  if(r.path){
+   jobs.push(call("snapshot.space",{path:r.path}).then(c=>{if(c.ok){if(c.ok.building)ex.usedBuilding=c.ok.building_pct||0;else ex.used=c.ok.unique.bytes;}}));
+   jobs.push(call("snapshot.policy.show",{path:r.path}).then(c=>{for(const v of ((c.ok||{}).verdicts||{}).verdicts||[])if(v.policy_ino===r.ino||!nextVerdicts.has(v.id))nextVerdicts.set(v.id,v);}));
+  }
+  await Promise.all(jobs);
+  nextExtra.set(r.ino,ex);
+ }));
+ verdicts=nextVerdicts;rootExtra=nextExtra;
+}
+function rootHint(){
+ document.getElementById("fRootHint").textContent=document.getElementById("fRoot").value?"only auto snapshots belong to a policy root's stream; manual snapshots under that path are not part of it and are not listed":"";
+}
+function renderRootFilter(){
+ const sel=document.getElementById("fRoot"), cur=sel.value;
+ sel.innerHTML='<option value="">all</option>'+policyRoots.map(r=>`<option value="${r.ino}">${esc(r.path||"ino "+r.ino)}${r.orphaned?" (orphaned)":""}</option>`).join("");
+ if([...sel.options].some(o=>o.value===cur))sel.value=cur;
+ rootHint();
+}
+let timer=null, reloadPending=false;
+const LOAD_FAIL="refresh failed: ";
+async function load(){
+ if(loading){reloadPending=true;return;}
+ loading=true;
+ try{
+  const [list,sp,pl,st]=await Promise.all([
+   call("snapshot.list",{path:null,sizes:true}),
+   call("snapshot.space",{}),
+   call("snapshot.policy.list",{}),
+   call("snapshot.sched.status",{}),
+  ]);
+  if(list.error){showMsg("snapshot.list: "+errText(list.error));}
+  else{
+   snaps=list.ok.snapshots||[];
+   if(document.getElementById("msg").textContent.startsWith(LOAD_FAIL)||document.getElementById("msg").textContent.startsWith("snapshot.list: "))showMsg("");
+  }
+  space=sp.ok||null;spaceErr=sp.error||null;
+  policyRoots=pl.ok?pl.ok.roots||[]:[];
+  sched=st.ok||null;
+  await loadRootExtras();
+  const before=selected.size;
+  for(const id of [...selected])if(!snaps.some(s=>s.id===id&&!s.held))selected.delete(id);
+  renderSpace();renderRoots();renderRootFilter();renderTable();renderChainSelect();renderWritten();
+  if(selected.size!==before)selectionChanged();
+ }catch(e){
+  showMsg(LOAD_FAIL+(e&&e.message?e.message:e));
+ }finally{
+  loading=false;
+  const building=(space&&space.building)||snaps.some(s=>s.size_state==="building");
+  clearTimeout(timer);
+  if(reloadPending){reloadPending=false;load();}
+  else timer=setTimeout(load,building?2000:15000);
+ }
+}
+async function health(){
+ try{const s=await(await fetch("/api/status")).json();document.getElementById("health").innerHTML='<span class="ok">● healthy</span> · '+esc(s.fs_uuid);}
+ catch(e){document.getElementById("health").innerHTML='<span class="bad">○ disconnected</span>';}
+}
+health();setInterval(health,5000);
+load();
+</script>
+</body>
+</html>
