@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use constellation_csi::control_client::{Engines, InMemoryEngines};
 use constellation_csi::controller::{ControllerConfig, ControllerService};
+use constellation_csi::engine_pods::{EnginePodConfig, EnginePodManager};
 use constellation_csi::identity::IdentityService;
 use constellation_csi::node::NodeService;
 use constellation_csi::proto::csi::v1::controller_server::ControllerServer;
@@ -97,9 +98,26 @@ async fn run(cli: Cli) -> Result<()> {
                 "--in-memory-backend: volumes are in-process fakes and vanish with this process"
             );
             Some(Arc::new(InMemoryEngines::default()))
+        } else if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+            // In a cluster: controller-owned engine pods (plan 37 §7).
+            let config = EnginePodConfig::from_env().map_err(anyhow::Error::msg)?;
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let client = kube::Client::try_default()
+                .await
+                .context("connecting to the Kubernetes API")?;
+            tracing::info!(
+                namespace = %config.namespace,
+                image = %config.image,
+                "engine pods: controller-owned, reached by exec relay"
+            );
+            Some(Arc::new(EnginePodManager::new(client, config).await))
         } else {
-            // Controller-owned engine pods are 37-k2b's: until then every
-            // volume RPC answers UNAVAILABLE.
+            // Outside a cluster there is nowhere to start engine pods:
+            // every volume RPC answers UNAVAILABLE.
+            tracing::warn!(
+                "not running in a Kubernetes cluster and no --in-memory-backend: volume RPCs \
+                 are UNAVAILABLE"
+            );
             None
         };
         let identity = IdentityServer::new(IdentityService::controller(None));

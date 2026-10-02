@@ -1342,6 +1342,33 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   alongside individually-hardened engine-pod specs) rather than pretending a
   `restricted` label plus an exempted node-plugin `Pod` gives real isolation
   it wouldn't.
+  *Recorded in 37-k2b's review:* the controller-owned engine pod also has a
+  one-shot init container that runs as **uid 0 with only `CAP_CHOWN`** (no
+  privilege escalation, `RuntimeDefault` seccomp) to hand the
+  kubelet-created, root-owned `DirectoryOrCreate` hostPaths to the engine's
+  uid 65532 — admitted only because the namespace is `privileged`; the
+  engine container itself stays non-root with no capabilities.
+- **The controller ServiceAccount is root-equivalent unless admission holds
+  it (37-k2b).** K2 grants it `pods` create/patch/delete and `pods/exec`
+  create/get in the driver namespace — the engine-pod lifecycle and the
+  exec relay that is the controller's only channel to an engine pod's
+  control socket (PROGRESS "Plan 37 K2"). In a PodSecurity-`privileged`
+  namespace that is root on every node: exec into a privileged node-plugin
+  pod, patch its image, or create a privileged pod. RBAC cannot scope a
+  verb to a name or a label, so the chart ships a ValidatingAdmissionPolicy
+  (`templates/exec-policy.yaml`, Kubernetes ≥ 1.30,
+  `controller.podAccessPolicy`, on by default) that holds every pod
+  operation of that ServiceAccount — create, update, delete, exec — to pods
+  named `constellation-engine-*-controller`, every pod it creates to the
+  engine-pod shape (the chart's image, no host namespaces, no privileged
+  container, no privilege escalation, no added capability but the init
+  container's `CHOWN`, a non-root engine container, hostPaths only under
+  `<hostRoot>/{node-identity,sockets}/<unit>-controller`), and every update
+  to metadata only. Verified on kind by `tests/csi/k2-smoke.sh`. With the
+  policy off (clusters < 1.30) the ServiceAccount must be treated as
+  node-root. Moving engine pods to their own `restricted`-capable namespace
+  would remove the init container's need for `privileged` too; that is
+  K6a's to weigh.
 - **Which pods are privileged, summarized**: node plugin — yes
   (`CAP_SYS_ADMIN` via `privileged: true`, `Bidirectional` mount
   propagation). Controller — no. Engine pods, node-owned and
@@ -2380,6 +2407,13 @@ same failure for *any* concurrent-write workload that calls `quota.set` while
 mutations are in flight, CSI or not — worth flagging to whoever owns
 `quota.set` past K2, though this session makes no engine change (per its
 brief: "no changes to the engine's metadata path").
+
+**K2 re-run (37-k2b review, subtree shape).** With `quota.set{subtree}`
+built (a journaled xattr on the volume's directory, no barrier) the ladder
+was re-run at c=64 over 10,000 sequences: **0 errors**, 1377 seq/s, p50
+43 ms, p99 103 ms. The cliff does not exist in the shape CSI calls. The
+controller keeps its bounded `quota.set` retry anyway (PROGRESS "Plan 37
+K2").
 
 ### Gaps K0 found, for K5 and K3a (recorded, not fixed here)
 

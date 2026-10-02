@@ -4818,6 +4818,23 @@
       },
       "type": "object"
     },
+    "QuotaGetParams": {
+      "description": "`quota.get`: the filesystem-wide cap and usage, or (with `subtree`) one\ndirectory subtree's cap and the logical bytes under it — `NotFound`\nwhen no such directory exists.\n\nA subtree's `used_bytes` is a walk of every entry under it (O(entries));\n`cap_only` skips the walk and reports `used_bytes: 0`, for callers that\nonly need the cap or the directory's existence. The filesystem-wide\nusage is a maintained counter and always reported.",
+      "properties": {
+        "cap_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "subtree": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "QuotaStatus": {
       "properties": {
         "max_bytes": {
@@ -5183,13 +5200,20 @@
       "type": "object"
     },
     "SetQuotaParams": {
-      "description": "`quota.set`. `None` clears the cap (unlimited).",
+      "description": "`quota.set`. `None` clears the cap (unlimited).\n\nWithout `subtree` the cap is the filesystem-wide logical byte cap. With\none (an absolute path naming a directory, plan 37's\n`quota.set{subtree, bytes}`) it caps that directory's subtree instead:\nthe bytes under it, enforced by every view mounted at it. `\"/\"` is the\nfilesystem-wide cap, spelled out.\n\nA subtree `quota.set` returns the new cap with `used_bytes: 0`: the\nbytes under a subtree cost a walk of all of it, which a cap change\n(`DeleteVolume`'s release, an expansion) must not pay; `quota.get`\nreports them.",
       "properties": {
         "max_bytes": {
           "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "subtree": {
+          "default": null,
+          "type": [
+            "string",
             "null"
           ]
         }
@@ -8542,7 +8566,7 @@
       "min_role": "viewer",
       "mutating": false,
       "params": {
-        "$ref": "#/$defs/Empty"
+        "$ref": "#/$defs/QuotaGetParams"
       },
       "result": {
         "$ref": "#/$defs/QuotaStatus"

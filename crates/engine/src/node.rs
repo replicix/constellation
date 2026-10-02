@@ -183,6 +183,8 @@ struct OpenView {
     /// The spec it resolved to (`Engine::export_view`).
     resolved: ViewSpec,
     quota_cache: QuotaCache,
+    /// The view's cached subtree cap (`View::cached_subtree_quota`).
+    subtree_quota_cache: QuotaCache,
     /// A `--rw --ephemeral` clone, removed when the view closes.
     ephemeral_clone: Option<String>,
 }
@@ -1741,6 +1743,7 @@ impl Engine {
                     since: Instant::now(),
                 },
                 quota_cache: view.quota_cache_handle(),
+                subtree_quota_cache: view.subtree_quota_cache_handle(),
                 ephemeral_clone,
             },
         );
@@ -1822,6 +1825,7 @@ impl Engine {
     pub fn invalidate_quota_caches(&self) {
         for view in self.views.lock().unwrap().values() {
             View::invalidate_quota_cache(&view.quota_cache);
+            View::invalidate_quota_cache(&view.subtree_quota_cache);
         }
     }
 

@@ -1,0 +1,17 @@
+{{- /* Plan 37 §6: StorageClasses listed in .Values.storageClasses. */}}
+{{- range .Values.storageClasses }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .name }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+provisioner: {{ $.Values.driverName }}
+parameters: {{- toYaml .parameters | nindent 2 }}
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
+allowVolumeExpansion: {{ if hasKey . "allowVolumeExpansion" }}{{ .allowVolumeExpansion }}{{ else }}true{{ end }}
+volumeBindingMode: {{ .volumeBindingMode | default "Immediate" }}
+{{- with .mountOptions }}
+mountOptions: {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

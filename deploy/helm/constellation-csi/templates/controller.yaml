@@ -1,6 +1,8 @@
-# Controller Deployment (plan 37 §4). Unprivileged. provisioner / resizer /
-# snapshotter are placeholders until 37-k2b (sidecars.*.enabled); each takes
-# leader election so replicas: 2 is active/standby.
+# Controller Deployment (plan 37 §4). Unprivileged. The provisioner and
+# resizer sidecars drive the Controller service (K2); the snapshotter is
+# K4's (sidecars.*.enabled). Each takes leader election, so replicas: 2 is
+# active/standby. The controller starts and reaches the controller-owned
+# engine pods (§7) through the Kubernetes API (templates/rbac.yaml).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,6 +55,15 @@ spec:
             - --endpoint=unix:///csi/csi.sock
           env:
             - {name: RUST_LOG, value: {{ .Values.logLevel | quote }}}
+            - name: CONSTELLATION_CSI_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: CONSTELLATION_CSI_ENGINE_IMAGE, value: {{ include "csi.image" . | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_PULL_POLICY, value: {{ .Values.image.pullPolicy | quote }}}
+            - {name: CONSTELLATION_CSI_HOST_ROOT, value: {{ .Values.hostRoot | quote }}}
+            - {name: CONSTELLATION_CSI_OWNER_DEPLOYMENT, value: constellation-csi-controller}
+            - {name: CONSTELLATION_CSI_ENGINE_RESOURCES, value: {{ .Values.engineProfile.resources | toJson | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_LOG_LEVEL, value: {{ .Values.engineProfile.logLevel | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ .Values.engineProfile.readyTimeout | quote }}}
           securityContext: &unpriv
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
@@ -88,6 +99,12 @@ spec:
             - --leader-election-lease-duration={{ $.Values.controller.leaderElection.leaseDuration }}
             - --leader-election-renew-deadline={{ $.Values.controller.leaderElection.renewDeadline }}
             - --leader-election-retry-period={{ $.Values.controller.leaderElection.retryPeriod }}
+            - --timeout={{ $.Values.sidecars.timeout }}
+            {{- if eq $name "csi-provisioner" }}
+            # csi.storage.k8s.io/pvc/{name,namespace} in CreateVolume
+            # parameters: the volume record's pvc/namespace xattrs.
+            - --extra-create-metadata
+            {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}

@@ -556,7 +556,7 @@ async fn a_slow_call_does_not_block_a_fast_one_on_the_same_connection() {
         let rig = rig(via, Encoding::Json).await;
         let slow = {
             let client = rig.client.clone();
-            tokio::spawn(async move { client.call::<QuotaGet>(Empty {}).await })
+            tokio::spawn(async move { client.call::<QuotaGet>(Default::default()).await })
         };
         // Give the slow request time to be in flight, then do many fast ones.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -708,7 +708,7 @@ async fn the_daemon_going_away_fails_outstanding_and_new_calls() {
     let probes = Probes::default();
     let server = start_unix(test_router(&probes), owner_policy(), null_audit());
     let client = Client::connect_unix(&server.path).await.unwrap();
-    let pending = client.start::<QuotaGet>(Empty {}).await.unwrap();
+    let pending = client.start::<QuotaGet>(Default::default()).await.unwrap();
     server.handle.shutdown().await;
     let err = tokio::time::timeout(Duration::from_secs(5), pending)
         .await
@@ -728,8 +728,8 @@ async fn too_many_calls_in_flight_is_unavailable_not_unbounded() {
         ..Default::default()
     });
     let client = Client::in_process(router).await.unwrap();
-    let a = client.start::<QuotaGet>(Empty {}).await.unwrap();
-    let b = client.start::<QuotaGet>(Empty {}).await.unwrap();
+    let a = client.start::<QuotaGet>(Default::default()).await.unwrap();
+    let b = client.start::<QuotaGet>(Default::default()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(30)).await;
     let err = client.call::<NodePing>(Empty {}).await.unwrap_err();
     assert_eq!(err.kind, ErrorKind::Unavailable);
@@ -884,10 +884,14 @@ async fn cancel_racing_completion_yields_exactly_one_response_per_call() {
     // And every slot was released: exactly 4 slow calls fit again, the
     // fifth is turned away.
     for (id, method) in (N + 1..=N + 5).zip(["quota.get"; 4].into_iter().chain(["node.ping"])) {
+        let params = match method {
+            "quota.get" => Blob::encode(enc, &QuotaGetParams::default()),
+            _ => Blob::encode(enc, &Empty {}),
+        };
         let r = Request {
             id,
             method: method.into(),
-            params: Blob::encode(enc, &Empty {}).unwrap(),
+            params: params.unwrap(),
         };
         client_end
             .send_frame(Frame::new(FrameKind::Request, enc.to_bytes(&r).unwrap()))
@@ -1050,7 +1054,7 @@ async fn a_dead_connection_fails_every_call_even_behind_a_full_stream() {
             })
             .await
             .unwrap();
-        let unary = client.start::<QuotaGet>(Empty {}).await.unwrap();
+        let unary = client.start::<QuotaGet>(Default::default()).await.unwrap();
         let read_id = chunks.id();
         for _ in 0..2 {
             daemon.recv_frame().await.unwrap().unwrap();

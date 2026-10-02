@@ -2409,9 +2409,38 @@ pub struct CachePruneResult {
 }
 
 /// `quota.set`. `None` clears the cap (unlimited).
+///
+/// Without `subtree` the cap is the filesystem-wide logical byte cap. With
+/// one (an absolute path naming a directory, plan 37's
+/// `quota.set{subtree, bytes}`) it caps that directory's subtree instead:
+/// the bytes under it, enforced by every view mounted at it. `"/"` is the
+/// filesystem-wide cap, spelled out.
+///
+/// A subtree `quota.set` returns the new cap with `used_bytes: 0`: the
+/// bytes under a subtree cost a walk of all of it, which a cap change
+/// (`DeleteVolume`'s release, an expansion) must not pay; `quota.get`
+/// reports them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SetQuotaParams {
     pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub subtree: Option<String>,
+}
+
+/// `quota.get`: the filesystem-wide cap and usage, or (with `subtree`) one
+/// directory subtree's cap and the logical bytes under it — `NotFound`
+/// when no such directory exists.
+///
+/// A subtree's `used_bytes` is a walk of every entry under it (O(entries));
+/// `cap_only` skips the walk and reports `used_bytes: 0`, for callers that
+/// only need the cap or the directory's existence. The filesystem-wide
+/// usage is a maintained counter and always reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct QuotaGetParams {
+    #[serde(default)]
+    pub subtree: Option<String>,
+    #[serde(default)]
+    pub cap_only: bool,
 }
 
 /// Per-view QoS (plan 31 §9.10). Over-limit ops defer and, past their

@@ -31537,3 +31537,358 @@ check between evaluation and write
 - [x] `SnapSchedStats` / `node.status.snapsched` with every Step 9 field.
 - [x] `snapshot.policy.{list,show,set,remove,pause}` with the `confirm_expiring` guard; schema blessed; parity rows.
 - [x] Nothing creates or deletes a snapshot; no retention math outside `meta::snapsched`.
+
+## Plan 37 K2 — Controller service: volumes and expansion
+
+Milestone K2 of [plan 37](wip/37-kubernetes-csi.md) (§15), chunks 37-k2a
+(the Controller service against the `ControlClient` seam, the `quota.set`
+barrier fix) and 37-k2b (controller-owned engine pods, the real control
+client, per-subtree quotas, the chart's provisioner/resizer, the kind gate).
+A pool `StorageClass` provisions, expands and deletes `PersistentVolume`s on
+kind against one Constellation filesystem; nothing mounts yet (K3).
+
+| Item | State | Where |
+|---|---|---|
+| `CreateVolume` (pool: `fs.create` + `browse.mkdir`/xattr record + `quota.set`, `created` commit mark, retried `quota.set`, per-pool create bound), `DeleteVolume` (pool: quota release + `browse.rename` to `/.trash`), `ControllerExpandVolume` (grow only), `ValidateVolumeCapabilities`, `ControllerGetCapabilities`; `StorageClass` parameters parsed and validated; `volume_id` codec (37-k2a) | DONE | `crates/csi/src/{controller,params,volume_id}.rs` |
+| `quota.set` drops its whole-journal barrier (37-k2a, measured) | DONE | `crates/engine/src/control/service.rs`, "Plan 37 K2a" above |
+| **Per-subtree quotas in the engine**: `quota.set{subtree}`/`quota.get{subtree[, cap_only]}`; the cap is a journaled internal xattr `constellation.quota` on the directory (replicates, moves with a rename, unnameable and unlisted through FUSE/`browse.xattr`); a view mounted at the directory enforces it (`quota_check` → `subtree_admit`: last walk + a running per-inode delta) and reports it as its `statfs` size; `quota.set{subtree}` and `quota.get{cap_only}` never walk the subtree; `constellation quota get/set --subtree` | DONE | `crates/engine/src/view/subtree_quota.rs`, `crates/engine/src/control/mod.rs`, `crates/control/src/proto/types.rs` |
+| `constellation serve`: a headless node (no FUSE mount, control socket at an explicit path, keeps running with no view, `--create` makes the filesystem if missing); hidden `constellation control-relay [--ping]` (stdio ↔ control socket; `--ping` is the readiness probe) | DONE | `crates/cli/src/serve.rs`, `crates/cli/src/node_runtime.rs`, `crates/cli/tests/serve.rs` |
+| `SocketControlClient`: the real `ControlClient` over any control transport (unix socket for K3, the exec relay for the controller); every call bounded; `quota.*` maps `"/"` to the filesystem-wide cap and every other path to that subtree's own cap | DONE | `crates/csi/src/control_client/socket.rs` |
+| `EnginePodManager` (kube-rs): one controller-owned engine pod per (pool, shard), `constellation-engine-<pool>[-shard-<k>]-controller`, unprivileged, not `nodeName`-pinned, hostPath state/socket under `node-identity/`/`sockets/<unit>-controller/`, readiness from the daemon's own `node.ping` probe, exponential backoff, terminated pods replaced, ownerReference to the controller Deployment, labels `component=engine`/`pool`/`shard`/`owner=controller`/`fs-uuid` | DONE | `crates/csi/src/engine_pods.rs` |
+| Chart: `external-provisioner` v6.3.0 (`--extra-create-metadata`) and `external-resizer` v2.2.1 enabled, `--timeout=120s`; controller env for engine pods; RBAC for engine pods (`pods` patch, `pods/exec`, namespace `secrets`, the Deployment, `persistentvolumes` list + `storageclasses` get for the lost-pod rebuild); `storageClasses` values + template; a ValidatingAdmissionPolicy holding the controller ServiceAccount's pod access to its engine pods (`controller.podAccessPolicy`) | DONE | `deploy/helm/constellation-csi/` |
+| A lost engine pod the controller has no spec for is rebuilt from a PV naming its filesystem and that PV's `StorageClass` (37-k2b review) | DONE | `crates/csi/src/engine_pods.rs` (`rebuild_pool`, `pool_from_pv`) |
+| `tests/csi/k2-smoke.sh`: the K2 kind gate | DONE | `tests/csi/k2-smoke.sh` |
+| Layout `dedicated` | DEFERRED (K3) | `CreateVolume` answers `UNIMPLEMENTED`: its `DeleteVolume` drops the whole filesystem and the control protocol has no filesystem delete |
+| Engine-pod GC/drain, purge worker | DEFERRED (37-k6b) | per the brief |
+| Live credential rotation, `fs.unlock` per request | DEFERRED (37-k6a) | see "Credentials" below |
+
+### Decisions taken here (the plan left them open)
+
+- **Controller → engine-pod reachability: a Kubernetes exec relay.** §7 makes
+  the controller-owned pod scheduler-placed, so its hostPath socket is on
+  some other node, and the control protocol has no network transport (the
+  unix socket's peer credentials *are* its authentication). Rather than add
+  an authenticated TCP listener (a new attack surface on the pod network) or
+  a Service, the controller execs `constellation control-relay --socket …`
+  in the engine container and speaks the control protocol over the exec
+  stream (`StreamTransport` over the exec stdio). Authorization is
+  Kubernetes RBAC: `pods/exec` `create`+`get` (a WebSocket exec is a GET
+  upgrade — `create` alone is a 403) in the driver namespace, granted only
+  to the controller ServiceAccount. The daemon sees a local peer of its own
+  uid (owner → admin). One relay per pod is kept and multiplexes every call;
+  a dead one is re-dialled. K3's node plugin dials the hostPath socket
+  directly (the only transport carrying `view.mount`'s descriptor).
+- **The engine pod creates its filesystem.** A daemon cannot start on a
+  filesystem that does not exist, and `fs.create` needs a daemon, so the
+  pod runs `serve --create` with the class's creation parameters; the
+  controller's own `fs.create{bucket, prefix, params}` through the pod then
+  returns the uuid (`created: false`) or a conflict when the class's
+  parameters disagree with the existing filesystem (`INVALID_ARGUMENT`).
+  The pod name is derived from the pool's S3 location (slug + 40 bits of
+  BLAKE3 over endpoint, bucket and pool prefix), so every replica finds the
+  same pod; the uuid it serves is learned once over `fs.list` and written
+  to the pod's `constellation.dev/fs-uuid` label, which is how
+  `DeleteVolume`/`ControllerExpandVolume` (knowing only the uuid) find it.
+  No pod for a uuid is `UNAVAILABLE` (retryable), never "already gone".
+  A pod deleted behind the controller's back is recreated from the spec the
+  controller last created it from, or — when this process never had it (a
+  controller restart, a `helm uninstall` + reinstall whose owner GC took
+  the pods and their Secrets) — rebuilt from the cluster: a
+  `PersistentVolume` of this driver whose handle names the uuid, its
+  `StorageClass`'s parameters, the shard from the handle, and the class's
+  provisioner secret (templates resolved from the PV's `claimRef`; readable
+  only in the driver namespace, else the pool's surviving credentials
+  Secret is reused, else `UNAVAILABLE` saying which secret). The rebuilt
+  pod has the same name (so the same hostPaths) and must serve that uuid.
+  The pool label is one value per pool (§7): BLAKE3 over endpoint, bucket
+  and the *class* prefix, with `-shard-<k>` telling shards apart in the pod
+  name and `constellation.dev/shard` in the labels.
+- **Pod-access policy (37-k2b review).** `pods/exec` + `pods`
+  create/patch in the PodSecurity-`privileged` driver namespace make the
+  controller ServiceAccount root-equivalent on every node (exec into a
+  node-plugin pod, patch its image, create a privileged pod). The chart's
+  `templates/exec-policy.yaml` (ValidatingAdmissionPolicy, Kubernetes ≥
+  1.30, on by default) holds every pod operation of that ServiceAccount to
+  `constellation-engine-*-controller` pods, creations to the engine-pod
+  shape and updates to metadata; k2-smoke checks that exec into a
+  node-plugin pod and a privileged engine-named pod are denied *by the
+  policy*. Recorded in plan §9, with the uid-0 `CAP_CHOWN` init container.
+  Without the policy (clusters < 1.30) the ServiceAccount is node-root.
+- **Credentials.** An engine pod opens S3 at start, before any
+  control call could hand it credentials, so §9's per-request `fs.unlock`
+  cannot start it. `CreateVolume`'s `req.secrets` (the class's provisioner
+  secret, resolved by external-provisioner) are written to one `Secret` per
+  pool in the driver namespace (`constellation-engine-<unit>-controller-credentials`,
+  only the known keys `aws_access_key_id`, `aws_secret_access_key`,
+  `aws_session_token`, `e2e_passphrase`), read by the pod as `secretKeyRef`
+  environment variables — never in the pod spec, never logged (`PoolRef`'s
+  `Debug` prints key names only). That needs `secrets` get/create/patch **in
+  the driver namespace only** (K1 granted none); a class without a secret
+  leaves the pod on the SDK default chain. Endpoint/region come from the
+  class as `AWS_ENDPOINT`/`AWS_REGION`, so `fs.create` through the pod drops
+  them (the daemon refuses an `fs.create` naming them). A changed secret
+  reaches a running pod only at its next start; live rotation is 37-k6a's.
+  **The provisioner secret must live in the driver namespace**:
+  external-provisioner resolves `provisioner-secret-*` with the controller
+  ServiceAccount, which reads Secrets only there, so a class naming
+  `tenant-a` or `${pvc.namespace}` (plan §6 Example 3) fails `CreateVolume`
+  with `forbidden`. Documented in `values.yaml`; not widened here (plan
+  §9's scoped rule is 37-k6a's).
+- **Per-subtree quota, added to the engine here** (carried item 2): the
+  real client sends `subtree: None` only for `"/"`; a pool volume's cap is
+  its own directory's. Enforcement binds views mounted *at* the capped
+  directory (the CSI shape); writes through an ancestor's view are not
+  charged (a parent walk per write, which nothing mounts).
+  **No RPC walks a volume** (37-k2b review, plan §"Deletion and purge"): a
+  subtree's bytes are a walk of every entry (`MetaStore::recursive_size`;
+  the reviewer measured ~0.45 µs per entry warm, 88-135 ms for 200k files,
+  so seconds for ten million and more from disk). `quota.set{subtree}`
+  returns `used_bytes: 0` without walking; `quota.get{cap_only}` returns the
+  cap alone; `DeleteVolume` checks existence with `browse.xattr list`;
+  `ControllerExpandVolume` and `ValidateVolumeCapabilities` use
+  `quota.get{cap_only}`. The walk remains on `quota.get` (`NodeGetVolumeStats`,
+  K3), on `CreateVolume`'s adoption check of a record-less directory, and on
+  an expansion that puts the first cap on an uncapped volume.
+  Test: `no_rpc_walks_a_capped_volume` (the fake counts subtree walks: zero
+  across create, expand, validate, delete and a retried delete).
+  **Admission: walk + running delta** (37-k2b review). The first version
+  compared growth against the view's cached `statfs` walk (TTL 5 s), so N
+  new cap-sized files inside one TTL were all admitted (overshoot ≈
+  throughput × 5 s) and every cache refresh walked on a write. Now each
+  capped view keeps the bytes of its last walk plus the growth it admitted
+  since, per inode (highest admitted length over the inode's size when
+  first seen), so the overshoot is bounded by writes in flight across a
+  walk plus growth through *other* views/nodes since it — not by TTL. The
+  walk is off the common write path: once on the view's first capped
+  write, then only when a write would cross the cap and the walk is older
+  than `statfs_ttl` (or the delta was dropped past 4096 inodes, which
+  over-counts, never under). That re-walk is also how deletions are
+  credited back. The quota stays soft (plan line 1428): best-effort,
+  local, not a cluster-wide reservation. Tests:
+  `two_files_in_one_ttl_cannot_both_fill_the_cap`,
+  `growth_of_one_file_is_charged_once`,
+  `deletions_are_credited_by_the_rewalk_near_the_cap`,
+  `a_dropped_delta_overcounts_and_rewalks`.
+- **Ladder re-run with the subtree shape** (the reviewer's run, plan "K0
+  results"): `harness csi-meta-ladder` at c=64, 10,000 sequences: **0
+  errors**, 1377 seq/s, p50 43 ms, p99 103 ms — the K0 cliff does not exist
+  in the shape CSI calls. **`set_quota`'s bounded retry stays**: the cliff
+  was the filesystem-wide barrier, now gone, but `quota.set{subtree}` is
+  still a journaled mutation that can fail `Failed`/`Unavailable` on a
+  lease change or a relay hiccup, it is idempotent, and the retry costs
+  nothing when the first call succeeds.
+- **`DeleteVolume` existence check first** (carried item 1): `browse.xattr
+  list` (O(1); `quota.get` until the review) → `NotFound` → `OK` before
+  `quota.set`, so a retried delete of a trashed
+  volume no longer depends on how the engine reports `quota.set` on a
+  missing subtree (the real engine now says `NotFound`; the old filesystem-
+  wide path said `Failed`, which the retry loop would have burned to
+  `ABORTED`). The `ControlClient` docs state the contract. Test:
+  `a_retried_delete_does_not_depend_on_quota_set` (zero `quota.set` calls
+  with `Failed` injected), and `crates/cli/tests/serve.rs` asserts the real
+  daemon's `NotFound`.
+- **`volume_id` length** (carried item 3): names are capped at CSI's
+  128-byte general limit (was 234). The pool header adds 54-55 bytes, so a
+  name over ~73 bytes mints an id over 128 bytes (183 at most). Accepted and
+  documented on `MAX_NAME_LEN`: refusing would fail csi-sanity's
+  maximum-length test, Kubernetes stores `volumeHandle` without that bound,
+  and external-provisioner's `pvc-<uuid>` names give 95-byte ids.
+- **A `/volumes/<name>` directory with no `pv` xattr** (carried item 4) is
+  adopted only when it holds no data (`quota.get` used bytes = 0: an
+  attempt that died between `mkdir` and its first xattr); one holding data
+  is `ALREADY_EXISTS` — a human's directory is never handed to a PV.
+- **Dedicated layout deferred to K3** (carried item 4): the control
+  protocol has no filesystem delete, so `DeleteVolume` could not honour
+  settled decision 7.
+- **hostPath ownership.** kubelet creates `DirectoryOrCreate` dirs
+  root-owned; a one-shot init container (uid 0, only `CAP_CHOWN`) hands them
+  to uid 65532. The engine container itself is `runAsNonRoot`, no
+  capabilities, `RuntimeDefault` seccomp, read-only root (scratch emptyDir at
+  `/tmp`). The chunk cache lives under the state dir for now, not §7's
+  memory-backed emptyDir (K3, with the profile-derived budgets).
+- **Sidecar pins.** `csi-resizer:v2.3.0` (the plan's pin, the latest git
+  release) has **no published image** on registry.k8s.io (latest: v2.2.1);
+  the chart pins v2.2.1, whose upstream `rbac.yaml` is identical to
+  v2.3.0's. The provisioner's (v6.3.0) and resizer's rules were re-diffed
+  against upstream at the pinned tags: unchanged from K1's transcription.
+  The engine-pod ready timeout defaults to 100 s (chart
+  `engineProfile.readyTimeout`), under the sidecars' 120 s `--timeout`, so
+  a pod that never becomes ready fails the RPC with its waiting reason
+  (`ErrImagePull`, …) instead of the sidecar's bare deadline.
+- **rustls provider.** A workspace-wide build unifies `aws-lc-rs` and `ring`
+  into rustls, and kube builds its TLS config from the process default, so
+  the controller installs `ring` explicitly.
+
+### Gates
+
+Run in this worktree (`CARGO_TARGET_DIR` unset, `ulimit -n` 65536), on a host
+shared with other agents (load average ~35 on 16 vCPUs during the harness).
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets
+  -- -D warnings` clean.
+- `cargo test --workspace`: green, run package by package to fit the tool's
+  10-minute limit — 1989 passed, 0 failed (`constellation-control` counted
+  with its `web` feature, as the workspace build compiles it). The first
+  whole-workspace run caught one test of mine: a raw postcard `quota.get`
+  request built with `Empty` params, which no longer decodes now that
+  `quota.get` takes `QuotaGetParams`; the test now encodes the method's own
+  params (the same shape every earlier params addition, e.g.
+  `confine_links`, already had: the CLI and daemon are one binary, the
+  protocol makes no cross-version postcard promise).
+- `bash tests/smoke.sh`: `SMOKE TEST PASSED`.
+- `bash tests/integration.sh`: **the repo's floci cannot start on this host**
+  — SELinux denies the bind-mounted `tests/docker/floci-init.sh`
+  (`/bin/sh: init.sh: Permission denied`, the hook exits 126 and floci shuts
+  down) — the box-gates chunk's issue, not fixed here. The script's body
+  (its exact `AWS_*` settings, `tests/smoke.sh s3://constellation-ci/<run>`)
+  ran against a private `floci/floci:1.7.0-compat` on 127.0.0.1:45661 with
+  the bucket made by `aws s3 mb` inside it: `SMOKE TEST PASSED`.
+- `target/release/harness run` (full matrix, `--shard i/24`,
+  `CONSTELLATION_HARNESS_DOCKER_PREFIX=k2b`): **179 passed, 3 failed**, none
+  attributable to this change:
+  - `subtree-confinement` needs CAP_SYS_ADMIN for `trusted.*` (known, see
+    plan 33 U1 above); as root (`sudo env CONSTELLATION_HARNESS_DOCKER_PREFIX=k2broot
+    PATH="$PATH" target/release/harness run subtree-confinement`): `PASSED`.
+  - `ack-s3-failover` and `git-under-flock-causal` fail the same way on
+    this branch's **base** (94b96f8, built from `git archive HEAD` with its
+    own target dir): `ack-s3-failover` A/B interleaved, base 3 of 6 failed,
+    branch 6 of 8 failed, always "B does not hold a newer epoch …
+    holder 3" — B and C both watch the frozen holder and C wins the
+    log-slot CAS (`watch_s3_holder` is a race by design; the scenario
+    assumes B). `git-under-flock-causal` ("reader c: N publications visible
+    before an object they depend on"): base failed too (11 publications).
+    Both are load-dependent on this host and are recorded, not fixed.
+- `docker compose --profile test run --rm compliance`: fails here at the
+  same floci SELinux denial (`dependency failed to start: container
+  k2b-floci-1 exited (0)`). Run with a throwaway override outside the repo
+  (`/tmp/k2b-compose-selinux.yml`: `security_opt: [label=disable]` on
+  `floci` and `compliance`) and a private image built from this tree
+  (`SMOKE_IMAGE=constellation-smoke:k2b`): `== results: 8798 passed, 0
+  failed` / `COMPLIANCE TEST PASSED (baseline: 0 known failures)`.
+- `make csi-sanity` (Identity + Controller, in-memory backend):
+  `Ran 3 of 103 Specs … SUCCESS! -- 3 Passed | 0 Failed | 1 Pending | 99
+  Skipped` and `Ran 21 of 103 Specs … SUCCESS! -- 21 Passed | 0 Failed | 1
+  Pending | 81 Skipped`.
+- `helm lint --strict deploy/helm/constellation-csi`: `1 chart(s) linted, 0
+  chart(s) failed` (INFO: icon).
+- `tests/csi/k2-smoke.sh` on kind: see "Gates — review-fix round" below
+  (the first round's quoted run came from an image built before the last
+  `engine_pods.rs` edit, so it is replaced by the fresh run there).
+  The uuid in both volume handles is what `fs.create` answered through the
+  engine pod; it equals the pod's label (learned over `fs.list`) and the
+  pool's `meta.json` read from S3 inside the pod. Also checked by hand on
+  the cluster: deleting the engine pod and then expanding a PVC recreates
+  the pod (expansion done in 3 s), and the volume quotas survive it.
+- First debugging runs on kind found and fixed: `csi-resizer:v2.3.0` not
+  published (pinned v2.2.1), and a 403 on the exec upgrade until the Role
+  granted `get` on `pods/exec`.
+
+### Gates — review-fix round (37-k2b review)
+
+Rebased onto main (38-Z1b FUSE transport policy, 32-M0c handover v-bump):
+the three conflicted files (`crates/cli/src/{handover,main,node_runtime}.rs`)
+keep main's `fuse_transport` and add this chunk's `control_socket` /
+`persistent`; `serve` passes the default transport (it mounts nothing).
+Same host (load 25-45), `CARGO_TARGET_DIR` unset, `ulimit -n 65536`.
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test`, package by package (the tool's 10-minute limit): engine
+  421 + 1, constellation (cli) 26 + `tests/serve.rs` 1, csi 56 + 1,
+  control 135, authority 153 + 4 + 107 (sim, 478 s), meta 279, store-s3
+  222, net 101, frontend-fuse 44, harness 51, chaos 37, types 26, platform
+  35, vfs 57, fs-core 68, mtree 71, upload-concurrency 11, uploadbench 4 —
+  0 failed.
+- `bash tests/smoke.sh`: `SMOKE TEST PASSED`.
+- `tests/integration.sh`: port 4566 was held by another agent's floci
+  (`z2arev-floci-1`), so its body ran against the repo's compose floci
+  under a private project with the port remapped (`docker compose -p
+  k2bfix -f docker-compose.yml -f <ports: 127.0.0.1:45667>`; the repo's
+  `label:disable` and init hook as-is) with the script's exact `AWS_*`
+  settings: `SMOKE TEST PASSED`.
+- `make csi-sanity`: Identity `3 Passed | 0 Failed`, Controller `21 Passed
+  | 0 Failed`.
+- `helm lint --strict deploy/helm/constellation-csi`: `1 chart(s) linted,
+  0 chart(s) failed`.
+- `CONSTELLATION_HARNESS_DOCKER_PREFIX=k2bfix target/release/harness run
+  quota-enforcement`: `PASSED`. No full matrix this round (coordinator).
+- Image: `docker build` of `constellation-csi.Dockerfile` did not finish in
+  30 minutes on this host (BuildKit, cold private cache), so the same
+  build ran as `docker run rust:1-bookworm` (musl-tools, `cargo build
+  --release --target x86_64-unknown-linux-musl -p constellation -p
+  constellation-csi`, the Dockerfile's steps) and the binaries were copied
+  into the Dockerfile's runtime stage (`constellation-csi:k2b-fix`).
+- `KIND_CLUSTER=37-k2b CSI_IMAGE=constellation-csi:k2b-fix K2_SKIP_BUILD=1
+  tests/csi/k2-smoke.sh` (kindest/node v1.37.0; cluster created by
+  `tests/csi/kind-up.sh` just before; cluster and S3 container deleted on
+  exit), from the final tree:
+
+  ```
+  == pool StorageClass, credentials, two PVCs
+     pvc/k2-a Bound (pvc-cb6c586a-71f7-4276-904c-f13036c30a82)
+     pvc/k2-b Bound (pvc-afd22e18-9d94-4498-9bde-5c79d7479d2a)
+     volumeHandles: v1/pool/0/6b86b3a0-9857-433c-b1f9-83a144c74ab9/volumes/pvc-cb6c586a-…, v1/pool/0/6b86b3a0-9857-433c-b1f9-83a144c74ab9/volumes/pvc-afd22e18-…
+  == exactly one controller-owned engine pod
+     constellation-engine-k2-pool-343355362c-controller on 37-k2b-worker2, fs-uuid label 6b86b3a0-9857-433c-b1f9-83a144c74ab9
+     meta.json uuid at s3://k2-smoke/constellation-csi/k2-pool: 6b86b3a0-9857-433c-b1f9-83a144c74ab9
+     /volumes/pvc-cb6c586a-…: quota: 0 / 1073741824 bytes used
+     /volumes/pvc-afd22e18-…: quota: 0 / 2147483648 bytes used
+  == expand pvc a to 3Gi
+     pv 3Gi, pvc 3Gi
+     /volumes/pvc-cb6c586a-…: quota: 0 / 3221225472 bytes used
+  == the controller ServiceAccount reaches only its engine pods
+     exec into pod/constellation-csi-node-7rmw9: denied by the policy
+     privileged engine-named pod: denied by the policy
+  == a lost engine pod is rebuilt from its PV and StorageClass
+     /volumes/pvc-cb6c586a-…: quota: 0 / 4294967296 bytes used
+     constellation-engine-k2-pool-343355362c-controller rebuilt (same name, same filesystem) and pvc a expanded to 4Gi
+  == delete pvc b
+     pv pvc-afd22e18-… deleted; /volumes/pvc-afd22e18-… moved to /.trash
+  == k2-smoke PASSED: 2 PVCs Bound on filesystem 6b86b3a0-9857-433c-b1f9-83a144c74ab9 via constellation-engine-k2-pool-343355362c-controller; expansion, pod-access policy, lost-pod rebuild and delete OK
+  ```
+
+  In an earlier run of this round the restarted controller's log showed
+  `rebuilding a lost engine pod's spec from its PersistentVolume` and
+  `created engine pod`, so the rebuild ran rather than an in-memory spec.
+  That earlier run's first attempt found a policy bug (`request.subResource`
+  is absent, not `""`, on a plain pod create, so every engine-pod creation
+  was denied); the template now reads it optionally.
+
+### Exit criteria (plan 37 §15 K2)
+
+- [x] `CreateVolume` (pool) / `DeleteVolume` / `ControllerExpandVolume` /
+  `ControllerGetCapabilities` / `ValidateVolumeCapabilities` against
+  `fs.create`/`browse.*`/`quota.*`; `bucket`/`prefix`/`layout`/`shards`
+  parsed and validated
+- [x] external-provisioner + external-resizer wired into the chart
+- [x] csi-sanity Controller group passes (in-memory backend)
+- [x] a pool `StorageClass` + PVC reaches `Bound` on kind; a second PVC
+  reaches `Bound` on the same Constellation filesystem (same `fs.create`
+  uuid), with exactly one controller-owned engine pod
+- [x] expansion through `kubectl patch` resizes the volume's quota
+- [x] dedicated layout: deferred to K3, recorded
+- [x] fmt, clippy, workspace tests, smoke, csi-sanity, helm lint, k2-smoke;
+  cluster deleted
+- [~] integration, compliance: green only with the S3 container started
+  outside the repo's compose (SELinux, box-gates); harness: 179/182, the
+  three failures pre-existing (root-only, and two load races that fail on
+  the base too). Review-fix round: integration's body green on a private
+  compose project (4566 taken); compliance and the full harness matrix not
+  re-run (coordinator's gate list); `quota-enforcement` green
+- [x] review fixes: no RPC walks a volume; subtree admission bounded by
+  in-flight writes; lost engine pods rebuilt from PV + StorageClass; the
+  controller ServiceAccount's pod access held to its engine pods by
+  admission policy; the ladder re-run recorded
+
+### Not done here (deliberately)
+
+- Node RPCs, node-owned engine pods (K3); snapshots/clones (K4); engine-pod
+  GC/drain, the purge worker (37-k6b); per-request `fs.unlock` and live
+  rotation (37-k6a); §7's memory-backed cache emptyDir and profile-derived
+  budgets (K3).
+- The class's `writeMode` is not passed to the controller-owned pod's
+  `serve` (a view property; the pod mounts no view) and `fs.create` ignores
+  it; node-owned pods get it at `view.mount` from K3 on.
+- A rescheduled controller-owned pod starts with a fresh state dir and
+  joins as a new Constellation node, leaving the old node in the roster
+  until 37-k6b's drain/GC handles departures.

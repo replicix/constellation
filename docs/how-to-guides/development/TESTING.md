@@ -2565,6 +2565,37 @@ standalone tail, the shipper's bootstrap/replay tests) use
 `authority_driver::Standalone`: the same `Core`, stepped inline over a
 real store with no spawned tasks.
 
+## Kubernetes CSI driver (plan 37)
+
+- `make csi-sanity`: csi-sanity's Identity and Controller groups against
+  `constellation-csi --controller --in-memory-backend` (no S3, no cluster).
+- `crates/cli/tests/serve.rs`: `constellation serve` (the headless engine-pod
+  daemon) on the local file backend, driven through `control-relay`'s stdio
+  the way the CSI controller drives an engine pod over its exec relay.
+- `tests/csi/k2-smoke.sh`: the K2 gate on kind. Builds the image (`make
+  csi-image`; `K2_SKIP_BUILD=1` reuses `CSI_IMAGE`), brings up the cluster
+  and the chart (`tests/csi/kind-up.sh`), runs a private floci on the `kind`
+  docker network, provisions two PVCs from one pool `StorageClass`, checks
+  they share one filesystem and one controller-owned engine pod, expands
+  one, checks the chart's pod-access policy (the controller ServiceAccount
+  may exec into its engine pod, not into a node-plugin pod, and may not
+  create a privileged pod), restarts the controller and deletes the engine
+  pod so the next expansion must rebuild it from the PV and its
+  `StorageClass`, and deletes the other PVC. Deletes the cluster and the S3
+  container on exit unless `K2_KEEP=1`. One kind cluster per host: set
+  `KIND_CLUSTER`. Needs Kubernetes ≥ 1.30 (ValidatingAdmissionPolicy).
+- Subtree quotas (`crates/engine/src/view/subtree_quota.rs`) are soft, like
+  the filesystem-wide cap: a view mounted at a capped directory admits
+  growth against its last walk of the subtree plus the growth it admitted
+  since. What a test can observe past the cap is bounded by writes in
+  flight across a walk and by growth through *other* views or nodes since
+  the last walk — not by throughput × `CONSTELLATION_STATFS_TTL_S`. Freed
+  space returns only when a write near the cap re-walks (at most once per
+  `statfs_ttl`), so a test that deletes and immediately refills a full
+  volume must set `CONSTELLATION_STATFS_TTL_S=0` or wait the TTL out. A
+  subtree walk costs about 0.45 µs per entry warm; no CSI controller RPC
+  pays it on a capped volume.
+
 ## CI notes
 
 - The `integration` job builds the runner image via buildx with

@@ -45,11 +45,10 @@ pub const CONCURRENCY_LADDER: &[usize] = &[1, 4, 8, 16, 32, 64, 256];
 pub const CHECKPOINTS: &[u64] = &[100, 1_000, 5_000, 10_000];
 
 /// `quota.set`'s `max_bytes` value used for every `CreateVolume` call
-/// (10 GiB, a plausible PVC size). The control protocol has no
-/// subtree-scoped quota yet (`SetQuotaParams` is `{max_bytes}` only, a
-/// cluster-wide cap) — §5 of the plan describes `quota.set{subtree, bytes}`
-/// as the eventual CSI-facing shape, but K0 measures the RPC that exists
-/// today. Recorded as a gap, not fixed here (K2 is where CSI code lands).
+/// (10 GiB, a plausible PVC size), set on the volume's own subtree — §5's
+/// `quota.set{subtree, bytes}`, the shape the CSI controller sends since
+/// plan 37 K2 (K0 and K2a measured the filesystem-wide `{max_bytes}` RPC,
+/// the only one that existed then).
 const VOLUME_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Checkpoints scaled down under `CONSTELLATION_CSI_LADDER_QUICK=1`, for
@@ -391,6 +390,7 @@ async fn create_volume_once(control: &ControlClient, idx: u64) -> (SeqLatencies,
     match control
         .call::<QuotaSet>(SetQuotaParams {
             max_bytes: Some(VOLUME_CAPACITY_BYTES),
+            subtree: Some(path.clone()),
         })
         .await
     {

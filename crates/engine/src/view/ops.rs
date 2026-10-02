@@ -1270,14 +1270,16 @@ impl Vfs for View {
         // §6.12: an inode outside the view answers `Stale` here too.
         let _ino = enter!(self, ino, r);
         // Used space is logical bytes under the mounted view; free space
-        // is whole-filesystem headroom under the cap. See `statfs_blocks`.
+        // is whole-filesystem headroom under the cap, bounded by the view
+        // root's own subtree cap. See `statfs_blocks_capped`.
         // Block size mirrors blksize.
         let bsize: u32 = BLOCK_SIZE;
         let (used_bytes, file_count) = self.view_usage();
-        let (total_blocks, bfree) = statfs_blocks(
+        let (total_blocks, bfree) = statfs_blocks_capped(
             used_bytes,
             self.meta.usage().0,
             self.cached_quota(),
+            self.cached_subtree_quota(),
             bsize as u64,
         );
         let ffree = (u64::MAX / 2).saturating_sub(file_count);
@@ -1545,7 +1547,10 @@ impl Vfs for View {
             self.meta.list_xattrs(ino).map_err(|error| error.code())
         };
         match names {
-            Ok(names) => r.done(Ok(self.policies.xattrs.listing(names))),
+            Ok(mut names) => {
+                names.retain(|n| !is_internal_xattr(n));
+                r.done(Ok(self.policies.xattrs.listing(names)))
+            }
             Err(error) => r.done(err(error)),
         }
     }

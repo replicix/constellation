@@ -367,11 +367,12 @@ define_methods! {
         params: Empty, result: CacheEntryListing }
     CachePrune { name: "cache.prune", role: Operator, mutating: true, stream: None,
         params: CachePruneParams, result: CachePruneResult }
-    /// Set (or clear) the cluster-wide byte cap; returns the new state.
+    /// Set (or clear) the cluster-wide byte cap, or one directory
+    /// subtree's (`subtree`); returns the new state.
     QuotaSet { name: "quota.set", role: Admin, mutating: true, stream: None,
         params: SetQuotaParams, result: QuotaStatus }
     QuotaGet { name: "quota.get", role: Viewer, mutating: false, stream: None,
-        params: Empty, result: QuotaStatus }
+        params: QuotaGetParams, result: QuotaStatus }
 
     // ---- view -----------------------------------------------------------
     /// Attach a view. With `MountSource::PreopenedFd` the `/dev/fuse` fd

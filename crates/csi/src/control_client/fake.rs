@@ -4,7 +4,7 @@
 //! §12: "a throwaway local `EngineProfile` ... so the sanity suite never
 //! touches real S3").
 
-use super::{ControlClient, Engines, SubtreeQuotaParams};
+use super::{ControlClient, Engines, PoolRef, SubtreeQuotaParams};
 use async_trait::async_trait;
 use constellation_control::proto::types::{
     Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsUnlockParams, HandoffParams,
@@ -87,6 +87,9 @@ pub struct InMemoryControl {
     quota_set_failures: AtomicU32,
     /// Every `quota_set` call, failed or not.
     quota_set_calls: AtomicU64,
+    /// Every subtree usage walk: a `quota_get` of anything but `/` (the
+    /// real engine's `recursive_size`, O(entries)).
+    usage_walks: AtomicU64,
 }
 
 impl Default for InMemoryControl {
@@ -111,6 +114,7 @@ impl InMemoryControl {
             unreachable: std::sync::atomic::AtomicBool::new(false),
             quota_set_failures: AtomicU32::new(0),
             quota_set_calls: AtomicU64::new(0),
+            usage_walks: AtomicU64::new(0),
         }
     }
 
@@ -124,6 +128,12 @@ impl InMemoryControl {
     /// barrier error (`ErrorKind::Failed`, "journal not shipped: no lease").
     pub fn fail_next_quota_sets(&self, n: u32) {
         self.quota_set_failures.store(n, Ordering::SeqCst);
+    }
+
+    /// How many subtree usage walks callers have asked for (`quota_get`
+    /// on a subtree), the cost the real engine pays per entry.
+    pub fn usage_walks(&self) -> u64 {
+        self.usage_walks.load(Ordering::SeqCst)
     }
 
     /// How many times `quota_set` has been called, failures included.
@@ -358,6 +368,9 @@ impl ControlClient for InMemoryControl {
             .tree
             .get(&path)
             .ok_or_else(|| ControlError::not_found(format!("{path} does not exist")))?;
+        if path != "/" {
+            self.usage_walks.fetch_add(1, Ordering::SeqCst);
+        }
         let used_bytes = InMemoryControl::subtree_of(&state.tree, &path)
             .iter()
             .map(|p| state.tree[p].used_bytes)
@@ -386,7 +399,24 @@ impl ControlClient for InMemoryControl {
                 .ok_or_else(|| ControlError::not_found(format!("{path} does not exist")))?;
             entry.quota = params.max_bytes;
         }
-        self.quota_get(&path).await
+        if path == "/" {
+            return self.quota_get(&path).await;
+        }
+        // Like the engine: a subtree's cap change does not walk it.
+        Ok(QuotaStatus {
+            max_bytes: params.max_bytes,
+            used_bytes: 0,
+        })
+    }
+
+    async fn quota_cap(&self, subtree: &str) -> Result<Option<u64>, ControlError> {
+        let path = normalize(subtree);
+        let state = self.state.lock().unwrap();
+        state
+            .tree
+            .get(&path)
+            .map(|entry| entry.quota)
+            .ok_or_else(|| ControlError::not_found(format!("{path} does not exist")))
     }
 
     async fn snapshot_create(
@@ -612,7 +642,9 @@ impl InMemoryEngines {
 
 #[async_trait]
 impl Engines for InMemoryEngines {
-    async fn registry(&self) -> Result<Arc<dyn ControlClient>, ControlError> {
+    /// The shared registry client: the fake has no per-pool engine, and
+    /// `fs.create` through it registers the pool.
+    async fn pool(&self, _pool: &PoolRef) -> Result<Arc<dyn ControlClient>, ControlError> {
         Ok(self.registry.clone())
     }
 
@@ -1121,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn engines_share_one_registry_and_keep_trees_apart() {
         let engines = InMemoryEngines::default();
-        let registry = engines.registry().await.unwrap();
+        let registry = engines.registry_client();
         let a = registry
             .fs_create(FsCreateParams {
                 bucket: "b".into(),

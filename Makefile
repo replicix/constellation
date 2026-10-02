@@ -134,6 +134,7 @@ CSI_IMAGE ?= constellation-csi:dev
 csi-image: ## Build the constellation-csi image (static musl; one image for controller + node + engine pods)
 	docker build -f deploy/docker/constellation-csi.Dockerfile \
 		--build-arg CONSTELLATION_GIT_DESCRIBE="$$(git describe --tags --always --dirty 2>/dev/null)" \
+		--build-arg JOBS="$${CARGO_BUILD_JOBS:-}" \
 		-t $(CSI_IMAGE) .
 
 csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity + Controller groups against constellation-csi on its in-memory backend (plan 37 K1+K2; needs CSI_SANITY_BIN or csi-sanity on PATH)

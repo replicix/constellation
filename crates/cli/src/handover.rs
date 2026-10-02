@@ -866,6 +866,10 @@ pub fn resume_main(
                 control,
             }),
             fuse_transport,
+            // `daemon --upgrade` hands over FUSE-serving daemons; a
+            // headless `serve` node is replaced by restarting its pod.
+            control_socket: None,
+            persistent: false,
         },
         rt.handle().clone(),
     ) {

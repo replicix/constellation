@@ -1,9 +1,29 @@
 # Plan 37 §9. Engine-pod lifecycle: pods, namespace-scoped (never
 # cluster-wide pod creation). PV/PVC read for the observability labels.
-# No Secret read: under the CSI secret-reference convention the sidecars and
-# kubelet resolve `*-secret-name` and pass the bytes in the request, and no
-# K1 code reads a Secret. K6's `Refreshing` credentials watch revisits this,
-# scoped to that need, never as a blanket cluster-wide read.
+# No cluster-wide Secret read: the sidecars and kubelet resolve
+# `*-secret-name` and pass the bytes in the request.
+#
+# The controller additionally (37-k2b, crates/csi/src/engine_pods.rs):
+# - `pods` patch: labels a controller-owned engine pod with the filesystem
+#   uuid it serves, which is how DeleteVolume/ControllerExpandVolume find it;
+# - `pods/exec` create/get: the controller reaches an engine pod's control
+#   socket through an exec relay, and this grant *is* that channel's
+#   authorization (no network listener exists);
+# - `secrets` get/create/patch, in this namespace only: an engine pod opens
+#   S3 at start, so the request's provisioner-secret bytes are written to
+#   one Secret per pool here and read by the pod as `secretKeyRef`s;
+# - `deployments` get: the controller Deployment's uid, for the engine
+#   pods' ownerReferences;
+# - `persistentvolumes` list and `storageclasses` get (cluster-wide): a
+#   DeleteVolume/ControllerExpandVolume whose engine pod is gone and whose
+#   spec this process never saw (a reinstall, a restart) rebuilds the pod
+#   from a PV naming the filesystem and that PV's StorageClass.
+#
+# `pods/exec` + `pods` create in this (PodSecurity `privileged`) namespace
+# would make this ServiceAccount root-equivalent on every node (exec into
+# the privileged node-plugin pods, or create a privileged pod). The
+# ValidatingAdmissionPolicy in templates/exec-policy.yaml narrows both to
+# controller-owned engine pods; see plan 37 §9.
 {{- range $role := list "controller" "node" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -15,7 +35,20 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list, watch, create, delete]
+    verbs: [get, list, watch, create, delete{{ if eq $role "controller" }}, patch{{ end }}]
+  {{- if eq $role "controller" }}
+  - apiGroups: [""]
+    resources: [pods/exec]
+    # `get`: the exec stream is a WebSocket upgrade of a GET request.
+    verbs: [create, get]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, patch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [constellation-csi-controller]
+    verbs: [get]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -36,6 +69,14 @@ rules:
   - apiGroups: [""]
     resources: [persistentvolumes, persistentvolumeclaims]
     verbs: [get]
+  {{- if eq $role "controller" }}
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [list]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

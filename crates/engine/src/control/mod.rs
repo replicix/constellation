@@ -308,32 +308,97 @@ impl EngineControl {
     /// A `ControlVfs` over the service's own whole-filesystem view, as
     /// `principal`.
     fn browser(&self, principal: &Principal) -> Result<ControlVfs, ControlError> {
-        let view = {
-            let mut slot = self.browse.lock().unwrap();
-            match &*slot {
-                Some(view) => view.clone(),
-                None => {
-                    let caps = constellation_vfs::FrontendCaps {
-                        // Nothing caches on the far side of a control call.
-                        push_inval: constellation_vfs::PushInval::None,
-                        cluster_locks: false,
-                        max_io: 1024 * 1024,
-                        ..constellation_vfs::FrontendCaps::linux_fuse(false)
-                    };
-                    let view = self
-                        .engine
-                        .open_view(
-                            crate::ViewSpec::new("/"),
-                            caps,
-                            crate::DeferredEvents::new(),
-                        )
-                        .map_err(|e| ControlError::unavailable(format!("{e:#}")))?;
-                    *slot = Some(view.clone());
-                    view
-                }
-            }
+        Ok(ControlVfs::new(
+            self.browse_view()?,
+            self.caller_of(principal),
+        ))
+    }
+
+    /// The service's own whole-filesystem view, opened on first use.
+    fn browse_view(&self) -> Result<Arc<View>, ControlError> {
+        let mut slot = self.browse.lock().unwrap();
+        if let Some(view) = &*slot {
+            return Ok(view.clone());
+        }
+        let caps = constellation_vfs::FrontendCaps {
+            // Nothing caches on the far side of a control call.
+            push_inval: constellation_vfs::PushInval::None,
+            cluster_locks: false,
+            max_io: 1024 * 1024,
+            ..constellation_vfs::FrontendCaps::linux_fuse(false)
         };
-        Ok(ControlVfs::new(view, self.caller_of(principal)))
+        let view = self
+            .engine
+            .open_view(
+                crate::ViewSpec::new("/"),
+                caps,
+                crate::DeferredEvents::new(),
+            )
+            .map_err(|e| ControlError::unavailable(format!("{e:#}")))?;
+        *slot = Some(view.clone());
+        Ok(view)
+    }
+
+    /// `quota.set{subtree}` (plan 37 §5): the cap on one directory's
+    /// subtree, stored on the directory (`View::set_subtree_quota`). `"/"`
+    /// (or no subtree at all) is the filesystem-wide cap.
+    pub(crate) fn set_subtree_quota(
+        &self,
+        subtree: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<QuotaStatus, ControlError> {
+        let view = self.browse_view()?;
+        let ino = self.subtree_ino(subtree)?;
+        view.set_subtree_quota(ino, max_bytes).map_err(|code| {
+            ControlError::from(code).with_details(serde_json::json!({ "path": subtree }))
+        })?;
+        // Every view mounted at this directory caches its cap.
+        self.engine.invalidate_quota_caches();
+        // No usage walk: a cap change costs the same on an empty volume
+        // and on one holding ten million files (`SetQuotaParams`).
+        Ok(QuotaStatus {
+            max_bytes,
+            used_bytes: 0,
+        })
+    }
+
+    /// `quota.get{subtree}`: the stored cap and, unless `cap_only`, the
+    /// logical bytes under it — a walk of the whole subtree
+    /// (`MetaStore::recursive_size`), so O(entries).
+    pub(crate) fn subtree_quota_status(
+        &self,
+        subtree: &str,
+        cap_only: bool,
+    ) -> Result<QuotaStatus, ControlError> {
+        let view = self.browse_view()?;
+        let ino = self.subtree_ino(subtree)?;
+        let max_bytes = view.subtree_quota(ino).map_err(ControlError::from)?;
+        let used_bytes = if cap_only {
+            0
+        } else {
+            self.meta
+                .recursive_size(ino)
+                .map_err(|e| ControlError::from(e.code()))?
+                .0
+        };
+        Ok(QuotaStatus {
+            max_bytes,
+            used_bytes,
+        })
+    }
+
+    /// A subtree path → its directory inode; `NotFound` when absent.
+    fn subtree_ino(
+        &self,
+        subtree: &str,
+    ) -> Result<constellation_fs_core::types::Ino, ControlError> {
+        let path = crate::snapshot::normalize_path(subtree);
+        let ino = self
+            .meta
+            .resolve_path(&path)
+            .map_err(|e| ControlError::from(e.code()))?
+            .ok_or_else(|| ControlError::not_found(format!("no such directory: {path}")))?;
+        Ok(ino)
     }
 
     /// The `Caller` a control principal acts as: a unix peer as itself;
@@ -417,6 +482,12 @@ pub fn fuse_requests_status(
 /// message is that string.
 fn failed(message: String) -> ControlError {
     ControlError::failed(message)
+}
+
+/// `quota.*`'s `subtree`: `None` (and `"/"`) is the filesystem-wide cap,
+/// anything else names a directory's own.
+fn whole_fs_or(subtree: Option<&str>) -> Option<&str> {
+    subtree.filter(|s| !s.trim_matches('/').is_empty())
 }
 
 /// Run `f` on a blocking thread (the moved bodies park on the runtime).
@@ -654,6 +725,9 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
         })
     });
     unary::<QuotaSet>(r, svc, |s, _, p| {
+        if let Some(subtree) = whole_fs_or(p.subtree.as_deref()) {
+            return s.set_subtree_quota(subtree, p.max_bytes);
+        }
         s.set_quota(p.max_bytes).map_err(failed)?;
         let (max_bytes, used_bytes) = s.get_quota().map_err(failed)?;
         Ok(QuotaStatus {
@@ -661,7 +735,10 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
             used_bytes,
         })
     });
-    unary::<QuotaGet>(r, svc, |s, _, _| {
+    unary::<QuotaGet>(r, svc, |s, _, p| {
+        if let Some(subtree) = whole_fs_or(p.subtree.as_deref()) {
+            return s.subtree_quota_status(subtree, p.cap_only);
+        }
         let (max_bytes, used_bytes) = s.get_quota().map_err(failed)?;
         Ok(QuotaStatus {
             max_bytes,

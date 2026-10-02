@@ -99,6 +99,13 @@ pub struct NodeConfig {
     /// (`None`: a fresh start), with the control socket the previous
     /// image bound.
     pub resumed: Option<Resumed>,
+    /// Bind the control socket here instead of the per-user runtime dir
+    /// (`constellation serve`: plan 37's engine pods put it on a hostPath
+    /// the node plugin can reach).
+    pub control_socket: Option<PathBuf>,
+    /// Keep serving with no view mounted (`constellation serve`): the last
+    /// view going away no longer shuts the node down; a signal does.
+    pub persistent: bool,
 }
 
 /// What a handed-over image inherits besides its views
@@ -202,6 +209,15 @@ pub struct NodeRuntime {
     /// The control socket a previous image bound (served from, instead of
     /// binding anew, by `ensure_status`).
     control_listener: Mutex<Option<std::os::unix::net::UnixListener>>,
+    /// [`NodeConfig::control_socket`].
+    control_socket: Option<PathBuf>,
+    /// [`NodeConfig::persistent`].
+    persistent: bool,
+    /// Set once [`Self::shutdown`] has finished ([`Self::wait_stopped`]).
+    stopped: (Mutex<bool>, std::sync::Condvar),
+    /// The view a headless node serves its control API from
+    /// ([`Self::serve_headless`]); never FUSE-mounted.
+    headless_view: Mutex<Option<Arc<View>>>,
 }
 
 impl NodeRuntime {
@@ -221,6 +237,8 @@ impl NodeRuntime {
             log_buffer,
             resumed,
             fuse_transport,
+            control_socket,
+            persistent,
         } = cfg;
         let handoff_config = crate::handover::NodeHandoff::of(&engine, web_ui, fuse_transport);
         let (generation, control_listener) = match resumed {
@@ -259,6 +277,10 @@ impl NodeRuntime {
             handoff_config,
             fuse_transport,
             control_listener: Mutex::new(control_listener),
+            control_socket,
+            persistent,
+            stopped: (Mutex::new(false), std::sync::Condvar::new()),
+            headless_view: Mutex::new(None),
         });
 
         // Signals are node-level: unmount every currently-mounted view,
@@ -290,6 +312,11 @@ impl NodeRuntime {
                             if let Err(e) = drain.remove_mount(id) {
                                 tracing::warn!(error = %e, "signal-triggered unmount failed");
                             }
+                        }
+                        // A persistent node outlives its last view, so the
+                        // signal itself is what ends it.
+                        if drain.persistent {
+                            let _ = drain.shutdown();
                         }
                     });
                     // A second signal during the post-unmount drain aborts immediately
@@ -564,7 +591,7 @@ impl NodeRuntime {
                 mounts.remove(&id);
                 mounts.is_empty()
             };
-            if now_empty {
+            if now_empty && !node.persistent {
                 // `shutdown` logs its own failure (and records it for the
                 // process's exit status).
                 let _ = node.shutdown();
@@ -612,7 +639,10 @@ impl NodeRuntime {
                         .context("serving the handed-over control socket")
                 }
                 None => {
-                    let path = socket_path_for_state_dir(&*self.host.dirs, state_dir)?;
+                    let path = match &self.control_socket {
+                        Some(path) => path.clone(),
+                        None => socket_path_for_state_dir(&*self.host.dirs, state_dir)?,
+                    };
                     UnixSocketListener::bind(&path)
                         .with_context(|| format!("binding control socket {}", path.display()))
                 }
@@ -758,6 +788,9 @@ impl NodeRuntime {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        if let Some(view) = self.headless_view.lock().unwrap().take() {
+            self.engine.close_view(&view);
+        }
         let result = self.engine.shutdown();
         // Best-effort, and unconditional even if the drain above failed:
         // a process that is exiting either way must not leave files
@@ -765,7 +798,40 @@ impl NodeRuntime {
         let state_dir = self.engine.state_dir();
         constellation_control::transport::forget_socket(state_dir);
         let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
+        let (stopped, cv) = &self.stopped;
+        *stopped.lock().unwrap() = true;
+        cv.notify_all();
         result
+    }
+
+    /// A node with no FUSE view at all (`constellation serve`): open an
+    /// unmounted view of the root for the control service to report from,
+    /// and start the control API. Fails when the control socket could not
+    /// be bound — a headless node is reachable through nothing else.
+    pub fn serve_headless(self: &Arc<Self>) -> Result<()> {
+        let caps = constellation_vfs::FrontendCaps {
+            push_inval: constellation_vfs::PushInval::None,
+            cluster_locks: false,
+            ..constellation_frontend_fuse::caps(false)
+        };
+        let view = self
+            .engine
+            .open_view(ViewSpec::new("/"), caps, DeferredEvents::new())?;
+        self.ensure_status(&view);
+        *self.headless_view.lock().unwrap() = Some(view);
+        if self.handover.control.lock().unwrap().is_none() {
+            bail!("the control API could not be started (see the log above)");
+        }
+        Ok(())
+    }
+
+    /// Block until [`Self::shutdown`] has finished.
+    pub fn wait_stopped(&self) {
+        let (stopped, cv) = &self.stopped;
+        let mut done = stopped.lock().unwrap();
+        while !*done {
+            done = cv.wait(done).unwrap();
+        }
     }
 
     /// Why the node-wide shutdown left something unshipped, if it did.
@@ -815,6 +881,8 @@ mod tests {
                 log_buffer: log_buffer::LogBuffer::default(),
                 resumed: None,
                 fuse_transport: Default::default(),
+                control_socket: None,
+                persistent: false,
             },
             rt.clone(),
         )

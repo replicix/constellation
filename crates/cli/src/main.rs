@@ -6,6 +6,7 @@ mod daemonize;
 mod handover;
 mod node_runtime;
 mod parallelism;
+mod serve;
 mod startup;
 
 // Plan 31 C3: the engine modules live in `constellation-engine`; importing
@@ -227,6 +228,53 @@ enum Command {
         /// (internal) Resume a handed-over daemon from this memfd.
         #[arg(long, hide = true)]
         resume_from: Option<i32>,
+    },
+    /// Serve a filesystem's control API with no FUSE mount of its own: a
+    /// Kubernetes engine pod (plan 37). Views arrive later over the
+    /// control socket (`view.mount` with a preopened descriptor); the
+    /// node keeps running with none until SIGTERM/SIGINT.
+    Serve {
+        /// Backend: s3://bucket/prefix, file:///path, or absolute path.
+        #[arg(long)]
+        s3: String,
+        /// Local state directory (metadata DB + chunk cache).
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Where to bind the control socket.
+        #[arg(long)]
+        control_socket: PathBuf,
+        /// Create the filesystem at `--s3` first if there is none there
+        /// (with the creation flags below; an existing one is served as
+        /// it is).
+        #[arg(long)]
+        create: bool,
+        /// With `--create`: chunk size in bytes (power of two, 1-64 MiB).
+        #[arg(long, default_value_t = constellation_fs_core::DEFAULT_CHUNK_SIZE)]
+        chunk_size: u32,
+        /// With `--create`: root compression (raw, zstd, zstd:LEVEL).
+        #[arg(long, default_value = "zstd:3")]
+        compression: String,
+        /// With `--create`: an E2E filesystem; the passphrase comes from
+        /// CONSTELLATION_PASSPHRASE.
+        #[arg(long)]
+        e2e: bool,
+        /// Chunk cache budget (e.g. 1G). Default 1 GiB.
+        #[arg(long, value_parser = parse_byte_size)]
+        cache_size: Option<u64>,
+        /// Chunk close policy: "through" (default) or "back".
+        #[arg(long)]
+        write_mode: Option<String>,
+    },
+    /// (internal) Relay stdin/stdout to a control socket, so a caller with
+    /// only an exec stream into this host (the CSI controller, plan 37)
+    /// speaks the control protocol; `--ping` sends one `node.ping` and
+    /// exits 0 when it is answered (an engine pod's readiness probe).
+    #[command(hide = true)]
+    ControlRelay {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        ping: bool,
     },
     /// (internal) The daemon's zombie reaper: watches the daemon that
     /// spawned it and, once the kernel has killed it but a thread wedged
@@ -597,6 +645,10 @@ enum QuotaCommand {
         target: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// A directory (absolute path inside the filesystem) whose own
+        /// subtree cap and usage to show, instead of the filesystem's.
+        #[arg(long)]
+        subtree: Option<String>,
     },
     /// Set the cap (`10G`, `unlimited`, or `0` to clear).
     Set {
@@ -605,6 +657,11 @@ enum QuotaCommand {
         size: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Cap one directory's subtree (absolute path inside the
+        /// filesystem) instead of the whole filesystem. Enforced for
+        /// views mounted at that directory.
+        #[arg(long)]
+        subtree: Option<String>,
     },
 }
 
@@ -1037,6 +1094,36 @@ fn main() -> Result<()> {
                 ephemeral,
                 confine_links,
                 web_ui,
+            },
+            log_buffer,
+        );
+    }
+
+    // Like `mount`, `serve` builds its own runtime.
+    if let Command::Serve {
+        s3,
+        state_dir,
+        control_socket,
+        create,
+        chunk_size,
+        compression,
+        e2e,
+        cache_size,
+        write_mode,
+    } = cli.command
+    {
+        return serve::cmd_serve(
+            threads,
+            serve::ServeArgs {
+                s3,
+                state_dir,
+                control_socket,
+                create,
+                chunk_size,
+                compression,
+                e2e,
+                cache_size,
+                write_mode,
             },
             log_buffer,
         );
@@ -1485,18 +1572,32 @@ fn main() -> Result<()> {
             })
         }
         Command::Quota { command } => match command {
-            QuotaCommand::Get { target, state_dir } => {
+            QuotaCommand::Get {
+                target,
+                state_dir,
+                subtree,
+            } => {
                 let (_, dir) = resolve_target(&target, state_dir)?;
-                ctl::<cm::QuotaGet>(&rt, &dir, Default::default(), print_quota)
+                ctl::<cm::QuotaGet>(
+                    &rt,
+                    &dir,
+                    api::QuotaGetParams {
+                        subtree,
+                        cap_only: false,
+                    },
+                    print_quota,
+                )
             }
             QuotaCommand::Set {
                 target,
                 size,
                 state_dir,
+                subtree,
             } => {
                 let max_bytes = parse_quota_arg(&size)?;
                 let (_, dir) = resolve_target(&target, state_dir)?;
-                ctl::<cm::QuotaSet>(&rt, &dir, api::SetQuotaParams { max_bytes }, |_| {
+                let params = api::SetQuotaParams { max_bytes, subtree };
+                ctl::<cm::QuotaSet>(&rt, &dir, params, |_| {
                     match max_bytes {
                         Some(cap) => println!("quota set to {cap} bytes"),
                         None => println!("quota cleared (unlimited)"),
@@ -1749,6 +1850,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::ControlRelay { socket, ping } => rt.block_on(serve::control_relay(&socket, ping)),
+        Command::Serve { .. } => unreachable!("Command::Serve is handled earlier in main()"),
         Command::Mount { .. } => unreachable!(
             "Command::Mount is handled earlier in main(), before the shared runtime is built"
         ),
@@ -2525,6 +2628,8 @@ fn cmd_mount_body(
                     log_buffer,
                     resumed: None,
                     fuse_transport,
+                    control_socket: None,
+                    persistent: false,
                 },
                 handle,
             ) {
@@ -3780,6 +3885,8 @@ mod umount_tests {
                 log_buffer: log_buffer::LogBuffer::default(),
                 resumed: None,
                 fuse_transport: Default::default(),
+                control_socket: None,
+                persistent: false,
             },
             rt.handle().clone(),
         )

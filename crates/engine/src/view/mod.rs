@@ -132,11 +132,15 @@ mod qos_tests;
 mod quota_tests;
 #[cfg(test)]
 mod staging_code_tests;
+mod subtree_quota;
 #[cfg(test)]
 mod vfs_tests;
 
 use passthrough::PassthroughHandle;
 use shards::*;
+pub(crate) use subtree_quota::is_internal_xattr;
+pub use subtree_quota::SUBTREE_QUOTA_XATTR;
+use subtree_quota::{statfs_blocks_capped, SubtreeUsage};
 use synthetic::*;
 use write_gate::*;
 
@@ -352,6 +356,13 @@ pub struct View {
     /// every [`QUOTA_CACHE_TTL`]. Shared with the control plane so a live
     /// `SetQuota` can invalidate without waiting for the TTL.
     quota_cache: QuotaCache,
+    /// Cached cap on this view's own root directory (`subtree_quota`),
+    /// refreshed like `quota_cache` and invalidated with it.
+    subtree_quota_cache: QuotaCache,
+    /// The bytes under this view's root as subtree-cap admission sees
+    /// them: a walk plus a running delta of growth admitted since
+    /// (`SubtreeUsage`).
+    subtree_usage: Mutex<SubtreeUsage>,
     /// Cached `(bytes, files)` for a *scoped* mount's [`Self::statfs`],
     /// refreshed at most every [`Self::statfs_ttl`]. `None` means never
     /// populated. Unused by a whole-filesystem mount, which reads the
@@ -453,6 +464,8 @@ impl View {
             tree_cache: Mutex::new((HashMap::new(), VecDeque::new())),
             view_root: constellation_fs_core::types::ROOT_INO,
             quota_cache: Arc::new(Mutex::new(None)),
+            subtree_quota_cache: Arc::new(Mutex::new(None)),
+            subtree_usage: Mutex::new(SubtreeUsage::default()),
             usage_cache: Mutex::new(None),
             statfs_ttl: statfs_ttl_from_env(),
             atime: deps.atime,
@@ -602,11 +615,18 @@ impl View {
     /// whose `file_len` still trails after a sparse `ftruncate` and would
     /// charge the same bytes twice. Not additive across writes on the same
     /// handle: `new_file_len` is the whole intended length.
+    ///
+    /// A view mounted at a directory with its own subtree cap
+    /// (`subtree_quota`) is checked against that too, with the bytes under
+    /// its root as the usage: a walk taken at most once per
+    /// [`Self::statfs_ttl`] and only near the cap, plus the growth this
+    /// view admitted since (`subtree_admit`).
     pub(crate) fn quota_check(&self, ino: Ino, new_file_len: u64) -> Result<(), Code> {
-        let Some(cap) = self.cached_quota() else {
+        let fs_cap = self.cached_quota();
+        let subtree_cap = self.cached_subtree_quota();
+        if fs_cap.is_none() && subtree_cap.is_none() {
             return Ok(());
-        };
-        let (used, _) = self.meta.usage();
+        }
         // Only paid for when a cap is actually configured.
         let committed = self
             .meta
@@ -616,8 +636,14 @@ impl View {
             .map(|attr| attr.size)
             .unwrap_or(0);
         let pending_growth = new_file_len.saturating_sub(committed);
-        if used.saturating_add(pending_growth) > cap {
-            return Err(Code::NoSpace);
+        if let Some(cap) = fs_cap {
+            let (used, _) = self.meta.usage();
+            if used.saturating_add(pending_growth) > cap {
+                return Err(Code::NoSpace);
+            }
+        }
+        if let Some(cap) = subtree_cap {
+            self.subtree_admit(ino, committed, new_file_len, cap)?;
         }
         Ok(())
     }
@@ -634,6 +660,8 @@ impl View {
         }
         self.view_root = ino;
         *self.usage_cache.lock().unwrap() = None;
+        Self::invalidate_quota_cache(&self.subtree_quota_cache);
+        *self.subtree_usage.lock().unwrap() = SubtreeUsage::default();
         Ok(())
     }
 

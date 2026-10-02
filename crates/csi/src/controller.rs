@@ -22,7 +22,27 @@
 //! directory without it is an earlier attempt that died part-way — most
 //! often at `quota.set`, see below — and is completed in place with the
 //! current request's values. A directory whose `pv` names a different
-//! volume is never adopted.
+//! volume is never adopted, and neither is one with no `pv` at all that
+//! already holds data: an attempt that died before its first xattr left an
+//! empty directory, so a non-empty one without a record is somebody
+//! else's (a human's `mkdir` + copy), and `ALREADY_EXISTS` says so rather
+//! than handing its contents to a new PV.
+//!
+//! **`DeleteVolume` checks existence first** (`browse.xattr list` →
+//! `NotFound` → `OK`), before releasing the quota: a retried delete of a
+//! volume already in `/.trash` must succeed whatever error kind the engine
+//! gives a `quota.set` on a missing subtree — a `Failed` would read as
+//! transient, be retried eight times and end `ABORTED`, leaving the PV
+//! stuck deleting.
+//!
+//! **No RPC walks a volume** (plan 37 §"Deletion and purge": the same
+//! latency for one file or ten million). The bytes under a subtree cost a
+//! walk of every entry (`quota.get`, about 0.45 µs per entry warm), so
+//! existence checks use an xattr list or `quota.get{cap_only}`, and
+//! `quota.set{subtree}` returns no usage. Only `CreateVolume`'s adoption
+//! check on a directory with no record (somebody else's?) and an
+//! expansion that puts the first cap on an uncapped volume ask for the
+//! bytes.
 //!
 //! **`quota.set` fails transiently, so it is retried** (plan 37 "K0 results"
 //! Track B). Under concurrent metadata load the engine's `quota.set` used to
@@ -47,7 +67,7 @@
 //! `volume_id` for the rest), so a delete can never interleave with a
 //! still-running create of the same volume.
 
-use crate::control_client::{ControlClient, Engines, SubtreeQuotaParams};
+use crate::control_client::{ControlClient, Engines, PoolRef, SubtreeQuotaParams};
 use crate::params::{ClassParams, Layout, PVC_NAMESPACE_KEY, PVC_NAME_KEY};
 use crate::proto::csi::v1::controller_server::Controller as ControllerRpc;
 use crate::proto::csi::v1::controller_service_capability::rpc::Type as RpcType;
@@ -175,8 +195,9 @@ impl Drop for VolumeLock<'_> {
 }
 
 pub struct ControllerService {
-    /// `None` until an engine backend is configured (37-k2b wires the real
-    /// one); every volume RPC is then `UNAVAILABLE`.
+    /// `None` when no engine backend is configured (outside a cluster,
+    /// without `--in-memory-backend`); every volume RPC is then
+    /// `UNAVAILABLE`.
     engines: Option<Arc<dyn Engines>>,
     config: ControllerConfig,
     locks: VolumeLocks,
@@ -197,8 +218,8 @@ impl ControllerService {
     fn engines(&self) -> Result<&Arc<dyn Engines>, Status> {
         self.engines.as_ref().ok_or_else(|| {
             Status::unavailable(
-                "no engine backend is configured for the controller (controller-owned engine \
-                 pods are plan 37 K2's second half, 37-k2b)",
+                "no engine backend is configured for the controller (not running in a \
+                 Kubernetes cluster, and no --in-memory-backend)",
             )
         })
     }
@@ -259,10 +280,19 @@ impl ControllerService {
             .await
             .map_err(|_| Status::internal("pool create gate closed"))?;
 
+        let pool_ref = PoolRef {
+            class: class.clone(),
+            shard,
+            secrets: req
+                .secrets
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
         let registry = engines
-            .registry()
+            .pool(&pool_ref)
             .await
-            .map_err(|e| status("fs.create", e))?;
+            .map_err(|e| status("reaching the pool's engine", e))?;
         let pool = registry
             .fs_create(class.fs_create(prefix.clone()))
             .await
@@ -294,7 +324,7 @@ impl ControllerService {
         .await
         .map_err(|e| status("browse.mkdir /volumes", e))?;
 
-        let existing = match fs
+        let (existing, fresh) = match fs
             .browse_mkdir(MkdirParams {
                 path: subtree.clone(),
                 mode: Some(0o755),
@@ -302,17 +332,37 @@ impl ControllerService {
             })
             .await
         {
-            Ok(_) => BTreeMap::new(),
-            Err(e) if e.kind == ErrorKind::Conflict => read_record(fs.as_ref(), &subtree).await?,
+            Ok(_) => (BTreeMap::new(), true),
+            Err(e) if e.kind == ErrorKind::Conflict => {
+                (read_record(fs.as_ref(), &subtree).await?, false)
+            }
             Err(e) => return Err(status("browse.mkdir", e)),
         };
 
-        if let Some(pv) = existing.get(X_PV) {
-            if pv != name {
+        match existing.get(X_PV) {
+            Some(pv) if pv != name => {
                 return Err(Status::already_exists(format!(
                     "{subtree} in pool {} belongs to volume {pv:?}, not {name:?}",
                     pool.uuid
                 )));
+            }
+            Some(_) => {}
+            // A fresh directory has no record either; only one that was
+            // already there needs the "holds no data" check (module docs).
+            None if !existing.is_empty() || fresh => {}
+            None => {
+                let used = fs
+                    .quota_get(&subtree)
+                    .await
+                    .map_err(|e| status(&format!("quota.get {subtree}"), e))?
+                    .used_bytes;
+                if used > 0 {
+                    return Err(Status::already_exists(format!(
+                        "{subtree} in pool {} already exists, holds {used} bytes and carries no \
+                         volume record: not adopting a directory this driver did not create",
+                        pool.uuid
+                    )));
+                }
             }
         }
         if existing.contains_key(X_CREATED) {
@@ -631,7 +681,24 @@ impl ControllerRpc for ControllerService {
             }
             Err(e) => return Err(status("reaching the pool's engine", e)),
         };
-        // Release the quota first (§"Deletion and purge"), then trash.
+        // Gone already (trashed by an earlier attempt, or never made):
+        // decided here, not by how `quota.set` fails, and in O(1) — never
+        // a walk of the volume (module docs).
+        match fs
+            .browse_xattr(XattrParams {
+                path: subtree.clone(),
+                op: XattrOp::List,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if e.kind == ErrorKind::NotFound => {
+                return Ok(Response::new(DeleteVolumeResponse {}))
+            }
+            Err(e) => return Err(status(&format!("browse.xattr list {subtree}"), e)),
+        }
+        // Release the quota first (§"Deletion and purge"), then trash. A
+        // `NotFound` now is a concurrent delete outside this process.
         match self.set_quota(fs.as_ref(), &subtree, Some(0)).await {
             Ok(_) => {}
             Err(e) if e.kind == ErrorKind::NotFound => {
@@ -690,19 +757,29 @@ impl ControllerRpc for ControllerService {
             .filesystem(id.fs_uuid())
             .await
             .map_err(|e| status("reaching the volume's engine", e))?;
+        // The cap alone: raising a cap never walks the volume (module
+        // docs) — above the old cap is above what the cap admitted.
         let current = fs
-            .quota_get(&subtree)
+            .quota_cap(&subtree)
             .await
             .map_err(|e| status(&format!("quota.get {subtree}"), e))?;
-        if wanted > 0 && wanted < current.used_bytes {
-            return Err(Status::out_of_range(format!(
-                "{wanted} bytes is below the {} bytes already used",
-                current.used_bytes
-            )));
+        // Only capping a volume that had none can land below its contents,
+        // and only that (rare) case pays for the walk.
+        if current.is_none() && wanted > 0 {
+            let used = fs
+                .quota_get(&subtree)
+                .await
+                .map_err(|e| status(&format!("quota.get {subtree}"), e))?
+                .used_bytes;
+            if wanted < used {
+                return Err(Status::out_of_range(format!(
+                    "{wanted} bytes is below the {used} bytes already used"
+                )));
+            }
         }
         // Grow only: a request at or below the current cap is already
         // satisfied (and `0`, "no particular size", leaves it alone).
-        let capacity = match current.max_bytes {
+        let capacity = match current {
             Some(cap) if cap >= wanted => cap,
             None if wanted == 0 => 0,
             _ => {
@@ -739,7 +816,7 @@ impl ControllerRpc for ControllerService {
             .filesystem(id.fs_uuid())
             .await
             .map_err(|e| status("reaching the volume's engine", e))?;
-        fs.quota_get(&id.subtree())
+        fs.quota_cap(&id.subtree())
             .await
             .map_err(|e| status(&format!("quota.get {}", id.subtree()), e))?;
         let response = match check_capabilities(&req.volume_capabilities) {

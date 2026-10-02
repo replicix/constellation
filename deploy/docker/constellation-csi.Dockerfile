@@ -19,9 +19,11 @@ COPY . .
 RUN rustup target add x86_64-unknown-linux-musl
 ARG CONSTELLATION_GIT_DESCRIBE
 ENV CONSTELLATION_GIT_DESCRIBE=$CONSTELLATION_GIT_DESCRIBE
+# Parallel jobs for the build (empty: cargo's default, all cores).
+ARG JOBS=
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target x86_64-unknown-linux-musl \
+    cargo build --release --target x86_64-unknown-linux-musl ${JOBS:+-j $JOBS} \
         -p constellation -p constellation-csi \
     && cp target/x86_64-unknown-linux-musl/release/constellation \
           target/x86_64-unknown-linux-musl/release/constellation-csi /

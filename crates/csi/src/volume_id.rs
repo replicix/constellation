@@ -74,10 +74,23 @@ fn valid_uuid(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// The longest `CreateVolume` name accepted: CSI's general 128-byte string
+/// limit, which is also what csi-sanity's maximum-length test sends.
+///
+/// The `volume_id` minted from it is longer: the pool header
+/// (`v1/pool/<shard>/<36-byte uuid>/volumes/`) adds 54-55 bytes, so a name
+/// over ~73 bytes yields an id over CSI's 128-byte general limit (183 bytes
+/// at most). That is a recorded trade-off, not an oversight: refusing such
+/// names would fail csi-sanity's maximum-length test, Kubernetes stores
+/// `volumeHandle` without a 128-byte bound, and external-provisioner's own
+/// names (`pvc-<uuid>`, 40 bytes) give 95-byte ids. A CO that enforces 128
+/// bytes on ids must keep names to 73 bytes.
+pub const MAX_NAME_LEN: usize = 128;
+
 /// A volume name is one path component: `CreateVolume`'s `req.name`
 /// becomes `/volumes/<name>` and `/.trash/<name>-<ts>`, so it must not be
-/// empty, `.`/`..`, contain `/` or NUL, or be too long to leave room for
-/// the trash suffix inside a 255-byte name.
+/// empty, `.`/`..`, contain `/` or NUL, or exceed [`MAX_NAME_LEN`] (which
+/// also leaves room for the trash suffix inside a 255-byte name).
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("name is empty".into());
@@ -88,9 +101,11 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name.contains('/') || name.contains('\0') {
         return Err(format!("name {name:?} contains '/' or NUL"));
     }
-    // `-<unix ms>` is at most 21 bytes.
-    if name.len() > 255 - 21 {
-        return Err(format!("name is {} bytes, the limit is 234", name.len()));
+    if name.len() > MAX_NAME_LEN {
+        return Err(format!(
+            "name is {} bytes, the limit is {MAX_NAME_LEN}",
+            name.len()
+        ));
     }
     Ok(())
 }
@@ -307,6 +322,6 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "a\0b"] {
             assert!(validate_name(bad).is_err(), "{bad:?}");
         }
-        assert!(validate_name(&"x".repeat(235)).is_err());
+        assert!(validate_name(&"x".repeat(129)).is_err());
     }
 }

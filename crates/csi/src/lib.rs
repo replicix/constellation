@@ -4,6 +4,7 @@
 
 pub mod control_client;
 pub mod controller;
+pub mod engine_pods;
 pub mod identity;
 pub mod node;
 pub mod params;

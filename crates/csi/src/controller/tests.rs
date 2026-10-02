@@ -441,6 +441,90 @@ async fn delete_trashes_and_is_idempotent() {
     assert_eq!(again.volume_id, v.volume_id);
 }
 
+/// The 37-K2a review's stuck-PV case: once the volume is in the trash, a
+/// retried `DeleteVolume` must answer `OK` without asking `quota.set` at
+/// all — whatever error kind the engine would give it (the fake fails it
+/// `Failed`, which `set_quota` would retry to exhaustion and `ABORTED`).
+#[tokio::test]
+async fn a_retried_delete_does_not_depend_on_quota_set() {
+    let f = fixture();
+    let v = f.create(create_req("pvc-1", GIB)).await.unwrap();
+    let fs = f.fs_of(&v.volume_id).await;
+    f.delete(&v.volume_id).await.unwrap();
+    let calls = fs.quota_set_calls();
+    fs.fail_next_quota_sets(1000);
+    f.delete(&v.volume_id).await.unwrap();
+    assert_eq!(
+        fs.quota_set_calls(),
+        calls,
+        "no quota.set for a gone volume"
+    );
+    // And with the engine's own answer for a missing subtree (`NotFound`,
+    // what `quota.set{subtree}` returns since K2; `crates/cli/tests/serve.rs`
+    // checks the real daemon): still OK.
+    fs.fail_next_quota_sets(0);
+    assert_eq!(
+        fs.quota_set(SubtreeQuotaParams {
+            subtree: "/volumes/pvc-1".into(),
+            max_bytes: Some(0),
+        })
+        .await
+        .unwrap_err()
+        .kind,
+        ErrorKind::NotFound
+    );
+    f.delete(&v.volume_id).await.unwrap();
+}
+
+/// Must-fix 1 of the 37-K2b review: no RPC on an existing volume walks it
+/// (the real engine's subtree usage is O(entries)). Create, expand,
+/// validate and delete — first and retried — ask for no usage at all.
+#[tokio::test]
+async fn no_rpc_walks_a_capped_volume() {
+    let f = fixture();
+    let v = f.create(create_req("pvc-big", GIB)).await.unwrap();
+    let fs = f.fs_of(&v.volume_id).await;
+    fs.set_used_bytes("/volumes/pvc-big", GIB as u64 / 2);
+    assert_eq!(f.expand(&v.volume_id, 2 * GIB).await.unwrap(), 2 * GIB);
+    f.service
+        .validate_volume_capabilities(Request::new(ValidateVolumeCapabilitiesRequest {
+            volume_id: v.volume_id.clone(),
+            volume_capabilities: create_req("x", GIB).volume_capabilities,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    f.delete(&v.volume_id).await.unwrap();
+    f.delete(&v.volume_id).await.unwrap();
+    assert_eq!(fs.usage_walks(), 0, "a walk on the RPC path");
+}
+
+/// A directory with no volume record is adopted only while it is empty
+/// (an attempt that died between `mkdir` and its first xattr); one holding
+/// data is somebody else's.
+#[tokio::test]
+async fn a_recordless_directory_is_adopted_only_when_empty() {
+    let f = fixture();
+    let v = f.create(create_req("pvc-1", GIB)).await.unwrap();
+    let fs = f.fs_of(&v.volume_id).await;
+    for name in ["pvc-empty", "pvc-full"] {
+        fs.browse_mkdir(MkdirParams {
+            path: format!("/volumes/{name}"),
+            mode: None,
+            parents: false,
+        })
+        .await
+        .unwrap();
+    }
+    fs.set_used_bytes("/volumes/pvc-full", 4096);
+    let adopted = f.create(create_req("pvc-empty", GIB)).await.unwrap();
+    assert_eq!(record(&fs, "/volumes/pvc-empty").await[X_PV], "pvc-empty");
+    assert_eq!(adopted.capacity_bytes, GIB);
+    let e = f.create(create_req("pvc-full", GIB)).await.unwrap_err();
+    assert_eq!(e.code(), GrpcCode::AlreadyExists, "{e:?}");
+    assert!(record(&fs, "/volumes/pvc-full").await.is_empty());
+}
+
 #[tokio::test]
 async fn delete_edge_cases() {
     let f = fixture();

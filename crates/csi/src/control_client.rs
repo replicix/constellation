@@ -6,12 +6,13 @@
 //! settled decision 1): every Controller/Node RPC reaches an engine pod only
 //! through this trait, in the same typed shapes
 //! `constellation-control::proto::types` already defines for the daemon's
-//! own CLI and UI clients. The real implementation — wrapping
-//! `constellation_control::Client` over `Transport::send_fd` — is 37-k2b's;
-//! this K1 chunk ships the trait plus [`InMemoryControl`], an in-process
-//! fake used by unit tests and by `csi-sanity` so the sanity suite never
-//! touches real S3.
+//! own CLI and UI clients. Two implementations: [`SocketControlClient`],
+//! the real one over any control-protocol transport (an engine pod's unix
+//! socket, or the controller's exec relay, [`crate::engine_pods`]), and
+//! [`InMemoryControl`], an in-process fake used by unit tests and by
+//! `csi-sanity` so the sanity suite never touches real S3.
 
+use crate::params::ClassParams;
 use async_trait::async_trait;
 use constellation_control::proto::types::{
     Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsUnlockParams, HandoffParams,
@@ -21,18 +22,18 @@ use constellation_control::proto::types::{
     ViewUnmountParams, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// §5's `quota.set{subtree, bytes}`: a byte cap on one directory subtree
 /// (`/volumes/<pv>` for a pool volume, `/` for a dedicated one).
 ///
-/// Not the control protocol's `SetQuotaParams` (`{max_bytes}`, a
-/// filesystem-wide cap): the engine has no per-subtree quota yet, so this
-/// is the one place the trait is shaped by what plan 37 needs rather than
-/// by what `constellation-control` already carries. The real client
-/// (37-k2b) maps `subtree: "/"` onto today's `quota.set{max_bytes}` and
-/// must refuse any other subtree with `Unsupported` until the engine grows
-/// subtree quotas — never silently widen a PV's cap to the whole pool.
+/// The control protocol's `SetQuotaParams{max_bytes, subtree}` with the
+/// subtree always spelled out: `"/"` is the filesystem-wide cap (a
+/// dedicated volume's), any other path that directory's own subtree cap
+/// (plan 37 K2 added those to the engine). A client must never map a
+/// subtree onto the filesystem-wide cap — that would widen a PV's cap to
+/// the whole pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtreeQuotaParams {
     /// Absolute path inside the filesystem the client is bound to.
@@ -55,10 +56,24 @@ pub trait ControlClient: Send + Sync {
     async fn browse_xattr(&self, params: XattrParams) -> Result<XattrResult, ControlError>;
     async fn browse_rename(&self, params: RenameParams) -> Result<Ack, ControlError>;
 
-    /// `quota.get` for `subtree` (see [`SubtreeQuotaParams`]). `NotFound`
-    /// when the subtree does not exist — `ValidateVolumeCapabilities`'
-    /// existence check (§5) relies on that.
+    /// `quota.get` for `subtree` (see [`SubtreeQuotaParams`]): the cap and
+    /// the bytes under it. `NotFound` when the subtree does not exist. For
+    /// any subtree but `/` the usage is a walk of every entry under it
+    /// (O(entries), seconds for a ten-million-file volume), so only callers
+    /// that need the bytes use it — `NodeGetVolumeStats` (K3) and the
+    /// adoption check on a directory with no record.
     async fn quota_get(&self, subtree: &str) -> Result<QuotaStatus, ControlError>;
+    /// `quota.get{cap_only}`: the cap alone, with no usage walk — O(1)
+    /// whatever the volume holds. `NotFound` when the subtree does not
+    /// exist; `ValidateVolumeCapabilities` and `ControllerExpandVolume`
+    /// use it as their existence check.
+    async fn quota_cap(&self, subtree: &str) -> Result<Option<u64>, ControlError>;
+    /// `quota.set` on `subtree`; the result's `used_bytes` is `0` for a
+    /// subtree (no walk). A missing subtree should be `NotFound`, but
+    /// callers must not depend on it for idempotency: an engine that
+    /// reports the failure as `Failed` (as the filesystem-wide path did)
+    /// would read as transient and be retried. `DeleteVolume` therefore
+    /// checks existence first (`browse.xattr list`, O(1)).
     async fn quota_set(&self, params: SubtreeQuotaParams) -> Result<QuotaStatus, ControlError>;
 
     async fn snapshot_create(
@@ -84,27 +99,62 @@ pub trait ControlClient: Send + Sync {
     async fn node_leave(&self, params: LeaveParams) -> Result<Ack, ControlError>;
 }
 
+/// One pool filesystem (one shard of a pool `StorageClass`), as
+/// `CreateVolume` knows it: where it lives, how to create it, and the
+/// credentials the request carried (`req.secrets`, the class's
+/// provisioner secret resolved by external-provisioner).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PoolRef {
+    pub class: ClassParams,
+    pub shard: u32,
+    /// Never logged: `Debug` prints the key names only.
+    pub secrets: BTreeMap<String, String>,
+}
+
+impl PoolRef {
+    /// The pool filesystem's bucket prefix.
+    pub fn prefix(&self) -> String {
+        self.class.pool_prefix(self.shard)
+    }
+}
+
+impl std::fmt::Debug for PoolRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolRef")
+            .field("bucket", &self.class.bucket)
+            .field("prefix", &self.prefix())
+            .field("shard", &self.shard)
+            .field("secrets", &self.secrets.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// How the controller reaches engine pods (plan 37 §4, §"Engine-pod
 /// lifecycle"): one [`ControlClient`] per filesystem, because `browse.*` and
 /// `quota.*` act on whichever filesystem the engine pod behind the client
 /// serves and carry no filesystem selector of their own.
 ///
 /// The controller is stateless (settled decision 7): it asks for a client
-/// by filesystem uuid on every RPC — parsed out of `volume_id`, or returned
-/// by `fs.create` — and never caches a volume-to-pod mapping itself. The
-/// real implementation (controller-owned engine pods, 37-k2b) may cache
-/// connections; [`InMemoryEngines`] backs the unit tests and `csi-sanity`.
+/// on every RPC — by pool for `CreateVolume`, by the filesystem uuid parsed
+/// out of `volume_id` for the rest — and never caches a volume-to-pod
+/// mapping itself. [`crate::engine_pods::EnginePodManager`] (the
+/// controller-owned engine pods) may cache connections; [`InMemoryEngines`]
+/// backs the unit tests and `csi-sanity`.
 #[async_trait]
 pub trait Engines: Send + Sync {
-    /// Any engine pod that can answer filesystem-registry calls
-    /// (`fs.create`) — the pool's own pod need not exist yet.
-    async fn registry(&self) -> Result<Arc<dyn ControlClient>, ControlError>;
+    /// An engine pod serving `pool`, brought up first if need be (and the
+    /// pool filesystem created with it): `fs.create` through it answers
+    /// the pool's uuid, `browse.*`/`quota.*` act on the pool.
+    async fn pool(&self, pool: &PoolRef) -> Result<Arc<dyn ControlClient>, ControlError>;
 
-    /// An engine pod serving filesystem `fs_uuid`. `NotFound` when no such
-    /// filesystem is registered, which `DeleteVolume` reads as "already
-    /// gone".
+    /// An engine pod serving filesystem `fs_uuid`. `NotFound` only when the
+    /// filesystem itself is known to be gone, which `DeleteVolume` reads as
+    /// "already gone"; an implementation that merely cannot find a pod for
+    /// it answers `Unavailable` (retryable), never `NotFound`.
     async fn filesystem(&self, fs_uuid: &str) -> Result<Arc<dyn ControlClient>, ControlError>;
 }
 
 mod fake;
+mod socket;
 pub use fake::{InMemoryControl, InMemoryEngines};
+pub use socket::SocketControlClient;
