@@ -30339,3 +30339,75 @@ Gates (this worktree, `CARGO_TARGET_DIR` unset):
 | `cargo build --release --workspace` | exit 0 |
 | `target/release/harness run gc-lifecycle gc-dedup-race gc-open-orphan-hold snapshot-lifecycle snapshot-churn clone-workflow mtree-gc-plateau git-under-flock-gc fsck-repair e2e-basic e2e-two-nodes` | ALL SCENARIOS PASSED (11/11) |
 | same GC/snapshot scenarios (the first nine) with `CONSTELLATION_GC_SNAP_WALK=full` | ALL SCENARIOS PASSED (9/9) |
+
+## Fix: a mutate outcome is the op's own rows, not a window over the journal
+
+Follow-up to the review of the flaky completion-ownership fix.
+`mutate::execute` returned `peek_journal_after(journal_tip())`, with the
+tip read before the op ran and outside its transaction: a window over the
+shared journal. Any journal write that another thread committed inside
+that window rode along. That could be the holder's own client's
+fast-path op with its `Completed`, a snapshot row, a refusal, or an
+inbox ack. Nothing serializes a holder's `execute_mutate` against those
+writers.
+
+### Harm (proven)
+
+`mutate::tests::foreign_journal_rows_never_ride_a_forwarded_outcome`: a
+holder executes a forwarded `Create f` for node 2. In the window, the
+holder's own client renames an unshipped `w` to `v` and a `SnapCreate2`
+lands, both before the op's transaction. The client then unlinks `u`
+after it. The requester installs the outcome as its rid's shadow
+(`install_shadow`) and covers `KeySet::from_records` at the reply's
+position. With the old window, the outcome was
+`[Rename w→v, Completed(node 1), SnapCreate2, Create f, Completed(node 2),
+Unlink u, Completed(node 1)]`, and on the requester:
+- the foreign snapshot row was installed as the requester's shadow;
+- `u` disappeared: another node's unlink was applied speculatively
+  under the requester's rid, ahead of the log;
+- a read of `v` counted as covered and was answered `ENOENT` from a
+  replica that lacked it (the rename's source create was still
+  unshipped), when it should have waited for the log.
+
+Replaying the holder's segment does reconcile the replica in the end.
+Until then, readers see wrong rows and wrong covering. The same window
+also fed the holder's dedup memory (`remember_outcome`, which replays a
+duplicate rid's reply with the foreign rows), `note_foreign_executed`,
+`recall_inos_executed` (spurious recalls), `note_unshipped`, and
+`recall_after_local_write` on the fast path.
+
+### Fix
+
+`journal::append_tx` and `append_completion_tx` record every row they
+write, including the trailing `Completed` and an `InboxAck`, in a
+thread-local (`journal::OwnRows`). `execute_inner` arms it around the op
+and returns exactly those rows. This uses the same scoping as
+`PendingCompletion`: the op's transaction runs on the caller's stack, and
+no other writer's transaction does. An op that fails returns `Err`, so
+rows from a transaction that was not committed are never returned.
+A `debug_assert` checks that the seqs strictly increase. The completion
+marker is still appended inside the op's own transaction, next to its
+rows. `completion_ownership.rs` now also asserts that the outcome is
+exactly `[Create, Completed(rid)]` while snapshot rows race it.
+
+### Files
+
+- `crates/meta/src/store/journal.rs` (`OwnRows`, notes in `append_tx` /
+  `append_completion_tx`)
+- `crates/meta/src/mutate.rs` (`execute_inner`, the test-only
+  `window_hook`, the regression test)
+- `crates/meta/tests/completion_ownership.rs`
+
+### Results (this worktree, `CARGO_TARGET_DIR` unset, prefix `mutwin`)
+
+Before the fix, the regression test fails on its first assertion, the
+foreign `SnapCreate2` in the shadow. Probes showed that the `u`
+assertion and the `v`-covered assertion fail too.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --no-fail-fast` | exit 0, 1891 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `harness run` forwarded-mutations, forward-timeout-reexec, holder-crash-phantom-shadow, holder-crash-phantom-new-holder, stale-base-rename-divergence, session-forwarded-ryw, session-exists-observed, session-ryw-after-holder-kill, mkdir-p-race, holder-ships-under-forward-load, takeover-marker-strands-promptly, snapshot-churn, lease-fencing | all PASSED |

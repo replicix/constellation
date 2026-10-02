@@ -244,17 +244,15 @@ impl MutateOutcome {
 }
 
 /// Execute `op` against the holder's authoritative replica and return
-/// every journal record appended since the call started — the op's own,
-/// with `LogRecord::Completed { rid }` directly behind the first of them
-/// when `rid` is given (plan 30 §M2), *plus* anything another thread
-/// journaled against the same `Meta` in the meantime. The window is
-/// `peek_journal_after(journal_tip())` (`execute_inner`), not a read of
-/// the op's transaction, so a concurrent writer's rows can bracket the
-/// op's pair on either side and the completion is not necessarily the
-/// last element. Its *adjacency* to the op's own first record is the
-/// guarantee (the pair gets consecutive seqs inside one
-/// `SingleWriterWriteTx`); that is what readers attribute a transaction
-/// by — see `engine::coop::fresh::written_chunks`.
+/// exactly the journal records its own transaction appended, as
+/// `journal::append_tx` wrote them on this thread (`journal::OwnRows`) —
+/// never another writer's rows committed while it ran. When `rid` is
+/// given, `LogRecord::Completed { rid }` sits directly behind the op's
+/// first record (plan 30 §M2): the pair gets consecutive seqs inside one
+/// `SingleWriterWriteTx`, so a concurrent writer's rows can land in the
+/// journal only entirely before or entirely after it. That adjacency is
+/// what readers attribute a transaction by — see
+/// `engine::coop::fresh::written_chunks`.
 /// The caller is responsible for checking lease ownership first.
 ///
 /// `rid` should be `Some` for every FUSE-issued mutation (local fast
@@ -283,11 +281,13 @@ pub fn execute(
 }
 
 fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {
-    // The last seq handed out (a point read of the counter), not the
-    // highest live row: the op's rows land above it either way, and the
-    // counter costs nothing when the journal is empty (see
-    // `journal::max_seq`).
-    let before = meta.journal_tip()?;
+    // The op's outcome is the rows its own transaction appended, as
+    // `journal::append_tx` wrote them on this thread — never a range of
+    // the shared journal, which other writers append to (and ships
+    // delete from) while the op runs (see `journal::OwnRows`).
+    let own = crate::store::journal::OwnRows::collect();
+    #[cfg(test)]
+    window_hook::fire(meta, window_hook::At::Before);
     match op {
         MutateOp::Mkdir {
             parent,
@@ -440,8 +440,47 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
             return Ok(Vec::new());
         }
     }
-    meta.peek_journal_after(before)
-        .map(|rows| rows.into_iter().map(|(_, r)| r).collect())
+    #[cfg(test)]
+    window_hook::fire(meta, window_hook::At::After);
+    let rows = own.take();
+    // One transaction's rows: strictly increasing seqs (a seq seen twice
+    // would be an aborted transaction's, reissued to the next).
+    debug_assert!(rows.windows(2).all(|w| w[0].0 < w[1].0), "{rows:?}");
+    Ok(rows.into_iter().map(|(_, r)| r).collect())
+}
+
+/// Test-only: a hook run on the executing thread right before the op's
+/// transaction and right after it — where another writer's journal
+/// commit can land while `execute` runs
+/// (`tests::foreign_journal_rows_never_ride_a_forwarded_outcome`).
+#[cfg(test)]
+pub(crate) mod window_hook {
+    use super::Meta;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum At {
+        Before,
+        After,
+    }
+
+    type Hook = Box<dyn FnMut(&Meta, At)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: Option<Hook>) {
+        HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(crate) fn fire(meta: &Meta, at: At) {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook(meta, at);
+            HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -860,5 +899,165 @@ mod tests {
         let err = execute(&m, &op, Some(r2)).unwrap_err();
         assert!(matches!(err, MetaError::Exists));
         assert!(m.completed_position(r2).unwrap().is_none());
+    }
+
+    /// The review of the flaky completion test: `execute` used to return
+    /// every journal row above the tip it read before the op ran — a
+    /// window over the shared journal, not the op's own transaction. A
+    /// row another writer committed inside that window (the holder's own
+    /// client's op with its `Completed`, a snapshot row) rode the
+    /// forwarded outcome into the requester's shadow under the
+    /// requester's rid, was applied there out of log order (ahead of
+    /// unshipped work it depends on), and widened the shadow's covering
+    /// set to keys the requester's replica does not hold — a session read
+    /// of such a key answered from the replica instead of waiting for
+    /// the log. The outcome is now exactly the op's own rows.
+    #[test]
+    fn foreign_journal_rows_never_ride_a_forwarded_outcome() {
+        use crate::session::{KeySet, Position, ReadKey};
+        use crate::SnapshotRow;
+
+        let holder = Meta::open_in_memory().unwrap();
+        // The shipped prefix every replica has: `u`.
+        holder.create(ROOT_INO, "u", 0o644, 0, 0).unwrap();
+        let requester = replica_of(&holder);
+        holder.ack_journal(u64::MAX).unwrap();
+        // The holder's own client, unshipped: `w` (the requester lacks it).
+        let w_ino = holder.allocate_ino(ROOT_INO).unwrap();
+        let local = |seq| crate::rid::Rid {
+            node: 1,
+            incarnation: 1,
+            seq,
+        };
+        execute(
+            &holder,
+            &MutateOp::Create {
+                parent: ROOT_INO,
+                name: "w".into(),
+                ino: w_ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            Some(local(1)),
+        )
+        .unwrap();
+
+        // While the forwarded op runs, the holder's client renames `w` to
+        // `v` and a snapshot row lands (before the op's transaction), and
+        // the client unlinks `u` (after it) — each on its own thread, as
+        // the FUSE fast path and the control service do.
+        window_hook::set(Some(Box::new(move |m: &Meta, at| {
+            std::thread::scope(|s| {
+                s.spawn(|| match at {
+                    window_hook::At::Before => {
+                        execute(
+                            m,
+                            &rename_op(ROOT_INO, "w", ROOT_INO, "v", false),
+                            Some(local(2)),
+                        )
+                        .unwrap();
+                        m.record_snapshot(&SnapshotRow::new("s-foreign", "/", "s", "00", 0))
+                            .unwrap();
+                    }
+                    window_hook::At::After => {
+                        execute(
+                            m,
+                            &MutateOp::Unlink {
+                                parent: ROOT_INO,
+                                name: "u".into(),
+                            },
+                            Some(local(3)),
+                        )
+                        .unwrap();
+                    }
+                })
+                .join()
+                .unwrap();
+            });
+        })));
+        let f_ino = holder.allocate_ino(ROOT_INO).unwrap();
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "f".into(),
+            ino: f_ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid_r = crate::rid::Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let records = execute(&holder, &op, Some(rid_r));
+        window_hook::set(None);
+        let records = records.unwrap();
+        // The holder did journal all of it.
+        assert_eq!(ino_at(&holder, ROOT_INO, "v"), Some(w_ino));
+        assert_eq!(ino_at(&holder, ROOT_INO, "u"), None);
+
+        // The requester installs the outcome as `rid_r`'s shadow and
+        // covers its keys at the reply's position; one of its clients has
+        // already observed that position (an earlier answer).
+        assert!(requester.install_shadow(rid_r, 1, &op, &records).unwrap());
+        let reply = Position {
+            seq: 1,
+            pending: None,
+            streams: Default::default(),
+        };
+        requester.session().raise_observed(reply);
+        requester
+            .session()
+            .note_covering(KeySet::from_records(&records), reply);
+        let covered = |key: ReadKey| requester.session().ready(&[key], 0, false, &Position::ZERO);
+        let seen = format!("outcome {records:?}");
+
+        // Its own write: installed, and read without waiting.
+        assert_eq!(ino_at(&requester, ROOT_INO, "f"), Some(f_ino), "{seen}");
+        assert!(covered(ReadKey::Dentry(ROOT_INO, "f".into())), "{seen}");
+        // Nobody else's row is installed under its rid: not the snapshot,
+        // not the unlink of `u` that followed the op.
+        assert!(
+            requester.snapshots(None).unwrap().is_empty(),
+            "a foreign snapshot row was installed as the requester's shadow: {seen}"
+        );
+        assert!(
+            ino_at(&requester, ROOT_INO, "u").is_some(),
+            "a foreign unlink was installed as the requester's shadow: {seen}"
+        );
+        // `v` is not on this replica (its create, `w`, is unshipped); a
+        // read of it must wait for the log, not be answered `ENOENT` as
+        // covered.
+        assert_eq!(ino_at(&requester, ROOT_INO, "v"), None);
+        assert!(
+            !covered(ReadKey::Dentry(ROOT_INO, "v".into())),
+            "a read of `v` was answered from a replica without it: {seen}"
+        );
+        // The holder's segment retires the shadow and the requester
+        // converges on the log.
+        let segment: Vec<LogRecord> = holder
+            .peek_journal_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        requester
+            .apply_segment(2, 1, &segment, &crate::replay::TouchSet::default())
+            .unwrap();
+        assert!(!requester.has_outstanding_speculation());
+        assert_eq!(ino_at(&requester, ROOT_INO, "v"), Some(w_ino));
+        assert_eq!(ino_at(&requester, ROOT_INO, "f"), Some(f_ino));
+        assert_eq!(ino_at(&requester, ROOT_INO, "u"), None);
+        assert_eq!(requester.snapshots(None).unwrap().len(), 1);
+        // The outcome is the op's transaction and nothing else.
+        assert!(
+            matches!(
+                records.as_slice(),
+                [LogRecord::Create { name, ino, .. }, LogRecord::Completed { rid }]
+                    if name == "f" && *ino == f_ino && *rid == rid_r
+            ),
+            "{seen}"
+        );
     }
 }

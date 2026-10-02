@@ -202,6 +202,68 @@ impl PendingCompletion {
 pub(crate) struct PendingCompletionGuard;
 
 thread_local! {
+    static OWN_ROWS: std::cell::RefCell<Option<Vec<(u64, LogRecord)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The journal rows `mutate::execute`'s op wrote, collected by
+/// [`append_tx`] (and [`append_completion_tx`]) on the executing thread —
+/// the op's outcome.
+///
+/// The outcome used to be every row above the journal tip read before
+/// the op ran: a window over the shared journal, not the op's
+/// transaction. Another thread's journal write committing inside it (the
+/// holder's own client's op, a snapshot row) rode a forwarded op's reply
+/// into the requester's shadow under the requester's rid, and a row
+/// acknowledged by a ship meanwhile was missing from it. Same
+/// thread-local scoping as [`PendingCompletion`], for the same reason: the
+/// op's transaction runs on this call stack, and no other writer's does.
+/// Every op is one transaction that commits right after its last append
+/// or fails the op, so the collected rows are exactly what it committed.
+pub(crate) struct OwnRows;
+
+impl OwnRows {
+    /// Not reentrant: a nested `collect` would overwrite the outer list
+    /// and its guard's drop would disarm the outer one.
+    pub(crate) fn collect() -> OwnRowsGuard {
+        OWN_ROWS.with(|c| {
+            let mut rows = c.borrow_mut();
+            debug_assert!(rows.is_none(), "OwnRows::collect nested on one thread");
+            *rows = Some(Vec::new());
+        });
+        OwnRowsGuard
+    }
+
+    fn note(seq: u64, record: &LogRecord) {
+        OWN_ROWS.with(|c| {
+            if let Some(rows) = c.borrow_mut().as_mut() {
+                rows.push((seq, record.clone()));
+            }
+        });
+    }
+}
+
+pub(crate) struct OwnRowsGuard;
+
+impl OwnRowsGuard {
+    /// The rows collected so far, in journal order.
+    pub(crate) fn take(&self) -> Vec<(u64, LogRecord)> {
+        OWN_ROWS.with(|c| {
+            c.borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+        })
+    }
+}
+
+impl Drop for OwnRowsGuard {
+    fn drop(&mut self) {
+        OWN_ROWS.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+thread_local! {
     static PENDING_INBOX_ACK: std::cell::Cell<Option<crate::store::inbox::InboxAck>> =
         const { std::cell::Cell::new(None) };
 }
@@ -264,13 +326,12 @@ pub(crate) fn append_tx(
 ) -> Result<u64, MetaError> {
     let seq = next_seq_tx(tx, local)?;
     tx.insert(journal, seq_key(seq), record.to_postcard()?);
+    OwnRows::note(seq, record);
     if let Some(rid) = PendingCompletion::take() {
         let cseq = next_seq_tx(tx, local)?;
-        tx.insert(
-            journal,
-            seq_key(cseq),
-            LogRecord::Completed { rid }.to_postcard()?,
-        );
+        let completed_row = LogRecord::Completed { rid };
+        tx.insert(journal, seq_key(cseq), completed_row.to_postcard()?);
+        OwnRows::note(cseq, &completed_row);
         let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
         tx.insert(
             completed,
@@ -282,7 +343,9 @@ pub(crate) fn append_tx(
     // behind the completion, plus the watermark it advances.
     if let Some(ack) = PendingInboxAck::take() {
         let aseq = next_seq_tx(tx, local)?;
-        tx.insert(journal, seq_key(aseq), ack.record().to_postcard()?);
+        let ack_row = ack.record();
+        tx.insert(journal, seq_key(aseq), ack_row.to_postcard()?);
+        OwnRows::note(aseq, &ack_row);
         crate::store::inbox::set_inbox_ack_tx(tx, local, ack)?;
     }
     Ok(seq)
@@ -298,11 +361,9 @@ pub(crate) fn append_completion_tx(
     rid: Rid,
 ) -> Result<u64, MetaError> {
     let cseq = next_seq_tx(tx, local)?;
-    tx.insert(
-        journal,
-        seq_key(cseq),
-        LogRecord::Completed { rid }.to_postcard()?,
-    );
+    let completed_row = LogRecord::Completed { rid };
+    tx.insert(journal, seq_key(cseq), completed_row.to_postcard()?);
+    OwnRows::note(cseq, &completed_row);
     let now_ms = constellation_fs_core::types::now_ns() / 1_000_000;
     tx.insert(
         completed,
