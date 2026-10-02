@@ -65,7 +65,49 @@ impl fmt::Debug for RingSet {
     }
 }
 
+/// CONSTELLATION PATCH (io-uring): a hook called once each time a queue's lock-wait budget
+/// serves a blocking lock request (`FUSE_SETLKW`) as a non-blocking one
+/// (`HeldRequest::downgrade_lock_wait`, `RingCommit::reserve_lock_wait`): a conflict on such a
+/// request is answered `ENOLCK` instead of waiting. Called on the ring thread, before the
+/// request is dispatched, so it must not block. Two hooks are equal when they are the same
+/// one (`Config` is `Eq`).
+#[derive(Clone)]
+pub struct LockWaitDowngrades(Arc<dyn Fn() + Send + Sync>);
+
+impl LockWaitDowngrades {
+    /// A hook calling `f`.
+    pub fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub(crate) fn notify(&self) {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for LockWaitDowngrades {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LockWaitDowngrades")
+    }
+}
+
+impl PartialEq for LockWaitDowngrades {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LockWaitDowngrades {}
+
 impl RingSet {
+    /// CONSTELLATION PATCH (io-uring): tells `hook` about every lock-wait budget downgrade on
+    /// any of this set's rings (`LockWaitDowngrades`).
+    pub(crate) fn set_lock_wait_downgrades(&self, hook: &LockWaitDowngrades) {
+        for ring in &self.rings {
+            ring.set_lock_wait_downgrades(hook.clone());
+        }
+    }
+
     /// Opens the io_urings of `min(n_threads, queues)` rings over every possible CPU's queue,
     /// reserves their buffers and spawns their parked threads. The error text names what
     /// failed, for the session's fallback warning.

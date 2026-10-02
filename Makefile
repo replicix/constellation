@@ -30,13 +30,13 @@ export CARGO_TERM_COLOR ?= always
 COMPOSE_SUITES ?=
 HARNESS_SCENARIOS ?=
 HARNESS_SEED ?= 42
-# FUSE transports the matrix lane runs (plan 38 §6): `dev-fuse` and the
-# ladder (`auto`), which falls back to `/dev/fuse` where the build or the
-# kernel cannot grant the ring and must pass either way.
-TRANSPORTS ?= dev-fuse auto
-# Cargo features for the binaries the lanes build. The ring transport is
-# off by default; `make ... CARGO_FEATURES=constellation-frontend-fuse/io-uring`
-# (or `make build-uring`) is what puts it in.
+# FUSE transports the matrix lane runs (plan 38 §6): `dev-fuse`, the
+# shipped ladder (`auto`, which keeps cluster-lock mounts on `/dev/fuse`)
+# and `uring` (the ladder for every mount); the last two fall back to
+# `/dev/fuse` where the kernel cannot grant the ring and must pass either way.
+TRANSPORTS ?= dev-fuse auto uring
+# Extra cargo features for the binaries the lanes build. Linux builds carry
+# the FUSE-over-io_uring transport without one (plan 38 Z2c).
 CARGO_FEATURES ?=
 FEATURE_FLAGS = $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES),)
 BENCH_FILES ?= 20000
@@ -52,7 +52,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration webui-check csi-sanity csi-image compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
-	harness-transport-matrix build-uring compliance-uring \
+	harness-transport-matrix compliance-uring \
 	dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live check-cross vfs-bench
 
@@ -197,20 +197,15 @@ perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## vfs-bench (§6.9 dispatch + allo
 read-cpu-gate: $(RELEASE_BIN) ## Daemon CPU-s/GiB + peak RSS on a real mount, fio-driven (plan 38 §6); needs fio, no root
 	tests/read-cpu-gate.sh
 
-# The lane's `auto` leg is only coverage with the ring built in; on a host
-# that grants it, tests/transport-matrix.sh fails a leg that fell back.
-transport-matrix harness-transport-matrix: CARGO_FEATURES = constellation-frontend-fuse/io-uring
-
+# On a host that grants the ring, tests/transport-matrix.sh fails a ring
+# scenario that fell back.
 transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Read-path scenarios once per FUSE transport (plan 38 §6)
 	TRANSPORTS="$(TRANSPORTS)" tests/transport-matrix.sh
 
 harness-transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## FULL fault-injection matrix once per FUSE transport (plan 38 §6; slow)
 	TRANSPORTS="$(TRANSPORTS)" SCENARIOS=all tests/transport-matrix.sh
 
-build-uring: ## Release binaries with the FUSE-over-io_uring transport built in (plan 38 §3(a))
-	$(MAKE) build-release CARGO_FEATURES=constellation-frontend-fuse/io-uring
-
-compliance-uring: ## pjdfstest in a container whose binary has the ring and whose seccomp permits io_uring (plan 38 §6)
+compliance-uring: ## pjdfstest on the ring: a container whose seccomp permits io_uring, CONSTELLATION_FUSE_TRANSPORT=uring (plan 38 §6)
 	docker compose --profile test-uring build compliance-uring
 	docker compose --profile test-uring run --rm compliance-uring
 

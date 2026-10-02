@@ -41,8 +41,10 @@
 #   READ_CPU_RAND_SECONDS   random-read runtime per repeat (default 15)
 #   READ_CPU_CHUNK_MIB      filesystem chunk size (default 4, the shape
 #                           bench/fuse-read-path measured)
-#   CONSTELLATION_FUSE_TRANSPORT  the daemon's transport (`dev-fuse`/`auto`,
-#                           plan 38 §2.4), passed through to it and recorded
+#   CONSTELLATION_FUSE_TRANSPORT  the daemon's transport (`auto`, the
+#                           default, which keeps this gate's cluster-lock
+#                           mount on `/dev/fuse`; `uring`; `dev-fuse` —
+#                           plan 38 §2.4, Z2c), passed through to it and recorded
 #                           in every result line; see tests/transport-matrix.sh,
 #                           whose READ_CPU_GATE=1 mode runs this gate per leg
 #
@@ -64,7 +66,7 @@ SEQ_MIB="${READ_CPU_SEQ_MIB:-512}"
 RAND_MIB="${READ_CPU_RAND_MIB:-256}"
 SMALL_FILES="${READ_CPU_SMALL_FILES:-4096}"
 RAND_SECONDS="${READ_CPU_RAND_SECONDS:-15}"
-TRANSPORT="${CONSTELLATION_FUSE_TRANSPORT:-dev-fuse}"
+TRANSPORT="${CONSTELLATION_FUSE_TRANSPORT:-auto}"
 ALL_LANES="cold-seq-1m warm-disk-seq-1m warm-mem-seq-1m rand-4k-dio smallfiles"
 LANES="${READ_CPU_LANES:-$ALL_LANES}"
 # The gate wants a *comparable* memory tier, not the host's share of RAM.

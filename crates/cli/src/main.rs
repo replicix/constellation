@@ -138,26 +138,32 @@ enum Command {
         #[arg(long)]
         cache_verify: Option<String>,
         /// FUSE transport for this daemon's plain mounts (plan 38 §2.4):
-        /// "dev-fuse" (the default) is the `/dev/fuse` `writev` path every
-        /// kernel and platform has; "auto" runs the transport ladder,
-        /// taking FUSE-over-io_uring when this build, the running kernel
-        /// (6.14+ with `fuse.enable_uring=Y`) and the process's sandbox
-        /// all grant it, and falling back to `/dev/fuse` — logged, and
-        /// visible in `node.status` — whenever one of them does not. A
-        /// mount that ends up on a ring **cannot be handed over**, so
-        /// `daemon --upgrade`/`node.handoff` refuses to detach it;
-        /// mounts somebody else handed us a descriptor for stay on
-        /// `/dev/fuse` regardless. CONSTELLATION_FUSE_TRANSPORT supplies
-        /// the default. Node-wide, not per-view: a `mount` that attaches a
-        /// view to an already-running daemon cannot change it.
+        /// "auto" (the default; "dev-fuse" under CONSTELLATION_PROFILE=mobile)
+        /// runs the transport ladder, taking FUSE-over-io_uring when this
+        /// build, the running kernel (6.14+ with `fuse.enable_uring=Y`) and
+        /// the process's sandbox all grant it, and falling back to
+        /// `/dev/fuse` — logged, and visible in `node.status` — whenever one
+        /// of them does not; a mount with cluster locks (`--locks cluster`,
+        /// the default with P2P) stays on `/dev/fuse` under "auto". "uring"
+        /// is "auto" that puts cluster-lock mounts on the ring too, where a
+        /// burst of contended blocking lock waits past the queue's budget
+        /// is answered ENOLCK. "dev-fuse" is the `/dev/fuse` `writev` path
+        /// every kernel and platform has. A mount that ends up on a ring
+        /// **cannot be handed over**, so `daemon --upgrade`/`node.handoff`
+        /// refuses to detach it; mounts somebody else handed us a
+        /// descriptor for stay on `/dev/fuse` regardless.
+        /// CONSTELLATION_FUSE_TRANSPORT overrides it. Node-wide, not
+        /// per-view: a `mount` that attaches a view to an already-running
+        /// daemon cannot change it.
         #[arg(long)]
         fuse_transport: Option<String>,
         /// Ring entries per kernel queue when the transport is a ring
-        /// (default 8). The ring's memory budget is
-        /// `queues x depth x payload` (plan 38 §4), so this is the knob
-        /// for an operator who has measured their own RSS/throughput
-        /// trade-off. CONSTELLATION_FUSE_URING_QUEUE_DEPTH supplies the
-        /// default.
+        /// (default 8; 32 for a cluster-lock mount on "uring"). The ring's
+        /// reserved address space is `queues x depth x payload` (plan 38
+        /// §4), and at most `depth - 1` of a queue's entries wait for
+        /// locks, so this is the knob for an operator who has measured
+        /// their own trade-off. CONSTELLATION_FUSE_URING_QUEUE_DEPTH
+        /// overrides it.
         #[arg(long)]
         fuse_uring_queue_depth: Option<usize>,
         /// Mount a snapshot selector through an automatically created clone.
@@ -2265,7 +2271,9 @@ fn cmd_mount(
         None => None,
         Some(raw) => Some(
             constellation_frontend_fuse::TransportPolicy::parse(raw).ok_or_else(|| {
-                anyhow::anyhow!("invalid --fuse-transport {raw:?} (expected auto or dev-fuse)")
+                anyhow::anyhow!(
+                    "invalid --fuse-transport {raw:?} (expected auto, uring or dev-fuse)"
+                )
             })?,
         ),
     };
@@ -2275,6 +2283,7 @@ fn cmd_mount(
     let fuse_transport = constellation_frontend_fuse::TransportConfig::resolve(
         fuse_transport_flag,
         fuse_uring_queue_depth,
+        crate::node_runtime::profile_transport()?,
     )
     .map_err(anyhow::Error::msg)?;
     // Plan 30 §M14: refuse an explicit `--locks cluster` with P2P turned

@@ -75,6 +75,36 @@ jobs:
       - name: Run all fault-injection scenarios
         run: cargo run --release -q -p constellation-harness -- run
 
+  # Plan 38 §6/Z2c: the transport matrix's `dev-fuse` leg on every push,
+  # plus the smoke test on the shipped default (`auto`) and on `dev-fuse`.
+  # A hosted runner's kernel does not grant FUSE-over-io_uring, so `auto`
+  # here is the ladder's fallback (its `last_fallback` reason is asserted
+  # by the smoke test); both ring legs run nightly on a 6.14+ runner
+  # (nightly.yml, `transport-matrix`).
+  transport-dev-fuse:
+    name: FUSE transport matrix (dev-fuse leg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE and suite tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 fio
+      - name: Build
+        run: cargo build --release -p constellation -p constellation-harness
+      - name: Smoke on the default transport (auto) and on dev-fuse
+        run: |
+          CONSTELLATION_HARNESS_BIN=target/release/harness bash tests/smoke.sh
+          CONSTELLATION_HARNESS_BIN=target/release/harness CONSTELLATION_FUSE_TRANSPORT=dev-fuse \
+            bash tests/smoke.sh
+      - name: Transport matrix, dev-fuse leg
+        run: make transport-matrix TRANSPORTS=dev-fuse
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: transport-dev-fuse, path: target/transport-matrix }
+
   cross-check:
     name: Darwin + Windows-library type-check from Linux
     runs-on: ubuntu-latest

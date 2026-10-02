@@ -4,8 +4,10 @@
 //! `transport-detach-refused` is **one scenario with two expected
 //! outcomes, keyed on the transport the mount actually negotiated** — not
 //! two scenarios, and not a scenario that skips off a ring kernel. It
-//! always asks for the ladder (`CONSTELLATION_FUSE_TRANSPORT=auto`) and
-//! then reads `node.status` to learn what it got:
+//! always asks for the ladder — `CONSTELLATION_FUSE_TRANSPORT=uring`, the
+//! ladder for every plain mount: the harness's mounts have cluster locks
+//! (P2P is on), which plain `auto` keeps on `/dev/fuse` since plan 38 Z2c
+//! — and then reads `node.status` to learn what it got:
 //!
 //! - **`uring`** (a 6.14+ kernel with `fuse.enable_uring=Y`, an
 //!   `io-uring`-feature build, and a sandbox that permits
@@ -44,17 +46,82 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// A client whose mount asks for plan 38 §2.4's ladder. Set on the client
-/// rather than inherited, so the scenario asks the same question on both
-/// legs of the transport matrix lane (the leg's own
-/// `CONSTELLATION_FUSE_TRANSPORT` would otherwise decide for it).
+/// What the ring scenarios ask for: plan 38 §2.4's ladder for every plain
+/// mount, cluster-lock ones included (`uring`). The harness's daemons run
+/// with P2P and so with cluster locks, and plain `auto` keeps those on
+/// `/dev/fuse` since plan 38 Z2c (`transport-cluster-locks-auto` is that
+/// rule's scenario); these scenarios are about the ladder itself. Set on
+/// the client rather than inherited, so a scenario asks the same question
+/// on every leg of the transport matrix lane.
+pub(crate) const RING_POLICY: &str = "uring";
+
+/// A client whose mount asks for the ladder ([`RING_POLICY`]).
 fn auto_client(env: &S3Env, root: &Path, prefix: &str) -> Result<Client> {
     let backend = format!("s3://{BUCKET}/{prefix}");
     let mut c = Client::new(root, "c0", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_FUSE_TRANSPORT", "auto");
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", RING_POLICY);
     c.fs_create()?;
     c.mount()?;
     Ok(c)
+}
+
+/// The fallback reasons `node.status` may name (plan 38 §2.4, Z2b; Z2c's
+/// `cluster_locks`).
+pub(crate) const FALLBACK_REASONS: &[&str] = &[
+    "no_io_uring_feature",
+    "kernel_not_offered",
+    "cluster_locks",
+    "handover_capable",
+    "ring_setup_failed",
+];
+
+/// The Z2b review's gap, closed on a real daemon: a mount that asked for
+/// the ring and got `dev_fuse` reports **why** in
+/// `node.status.fuse.mounts[0].last_fallback` — one of
+/// [`FALLBACK_REASONS`], `expected` when given — and the process-wide
+/// `transport_fallbacks` counts exactly that one fallback (the daemon has
+/// one mount). Returns the reason.
+pub(crate) fn fallback_reported(c: &Client, expected: Option<&str>) -> Result<String> {
+    let status = c.control_status()?;
+    let fuse = &status["fuse"];
+    let mount = &fuse["mounts"][0];
+    ensure!(
+        mount["transport"] == "dev_fuse",
+        "fuse.mounts[0] is not a fallback: {mount}"
+    );
+    let reason = mount["last_fallback"]["reason"]
+        .as_str()
+        .with_context(|| {
+            format!("a dev_fuse mount that asked for the ring has no last_fallback: {mount}")
+        })?
+        .to_string();
+    ensure!(
+        FALLBACK_REASONS.contains(&reason.as_str()),
+        "unknown fallback reason {reason:?}: {mount}"
+    );
+    if let Some(expected) = expected {
+        ensure!(
+            reason == expected,
+            "the fallback says {reason}, expected {expected}: {mount}"
+        );
+    }
+    let counted: Vec<(String, u64)> = fuse["transport_fallbacks"]
+        .as_array()
+        .context("node.status.fuse has no transport_fallbacks")?
+        .iter()
+        .map(|f| {
+            (
+                f["reason"].as_str().unwrap_or_default().to_string(),
+                f["count"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    let total: u64 = counted.iter().map(|(_, n)| n).sum();
+    ensure!(
+        total == 1 && counted.iter().any(|(r, n)| *r == reason && *n == 1),
+        "transport_fallbacks must count exactly this one {reason} fallback: {counted:?}"
+    );
+    Ok(reason)
 }
 
 /// The transport `node.status` reports for the daemon's one mount
@@ -96,10 +163,18 @@ pub fn transport_detach_refused(seed: u64) -> Result<()> {
             );
         }
         eprintln!(
-            "transport-detach-refused: the mount asked for auto and negotiated {negotiated}; \
-             expecting the handover to be {}",
+            "transport-detach-refused: the mount asked for {RING_POLICY} and negotiated \
+             {negotiated}; expecting the handover to be {}",
             if ring { "refused" } else { "served" }
         );
+        // Plan 38 Z2b review: a fallback says why, and counts once.
+        let first_reason = if ring {
+            None
+        } else {
+            let reason = fallback_reported(&c, None)?;
+            eprintln!("transport-detach-refused: fell back for {reason}");
+            Some(reason)
+        };
         let pid = c.pid().context("no daemon pid")?;
         let before = generation(&c)?;
         let watcher = Watcher::start(&c.mnt)?;
@@ -153,6 +228,11 @@ pub fn transport_detach_refused(seed: u64) -> Result<()> {
                 negotiated_transport(&c)? == "dev_fuse",
                 "a resumed session must be dev_fuse"
             );
+            // The resumed session (a new process, pinned to /dev/fuse)
+            // keeps the reason the first mount had, rather than reporting
+            // the pin (the Z2b review's finding).
+            let again = fallback_reported(&c, first_reason.as_deref())?;
+            eprintln!("transport-detach-refused: the resumed mount still says {again}");
         }
         // Both outcomes: the mount never stopped serving and the daemon is
         // the same process (a refused upgrade must not restart anything,
@@ -306,7 +386,7 @@ fn no_alarms(c: &Client) -> Result<()> {
 fn ring_client(env: &S3Env, root: &Path, name: &str) -> Result<Client> {
     let backend = format!("s3://{BUCKET}/{name}-{}", ts());
     let c = Client::new(root, "c0", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_FUSE_TRANSPORT", "auto");
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", RING_POLICY);
     c.fs_create()?;
     Ok(c)
 }
@@ -339,7 +419,11 @@ fn fallback_round(c: &mut Client, seed: u64, why: &[&str]) -> Result<()> {
     serve_check(&c.mnt, seed, "fallback")?;
     serve_check(&c.mnt, seed + 1, "fallback-again")?;
     let line = logged_once(c, why)?;
-    eprintln!("    fell back to dev_fuse, logged once: {}", line.trim());
+    let reason = fallback_reported(c, None)?;
+    eprintln!(
+        "    fell back to dev_fuse ({reason}), logged once: {}",
+        line.trim()
+    );
     no_alarms(c)?;
     let pid = c.pid();
     c.unmount()?;
@@ -412,7 +496,7 @@ pub fn transport_enomem_ring(seed: u64) -> Result<()> {
         serve_check(&c.mnt, seed, "probe")?;
         let peak = vm_peak(c.pid().context("no daemon pid")?)?;
         c.unmount()?;
-        c.set_env("CONSTELLATION_FUSE_TRANSPORT", "auto");
+        c.set_env("CONSTELLATION_FUSE_TRANSPORT", RING_POLICY);
         let cpus = possible_cpus()?;
         let reserved = cpus * DEPTH * (16 << 20);
         let margin = (reserved / 2).min(4 << 30);
@@ -584,5 +668,480 @@ pub fn transport_abort_while_armed(seed: u64) -> Result<()> {
     })();
     let _ = c.unmount();
     c.detach_dead_mount();
+    result
+}
+
+// ------------------------------------------------------------------------
+// Plan 38 Z2c: cluster locks and the ring.
+
+/// The daemon's per-mount transport records (`FUSE transport` /
+/// `FUSE transport (fell back)`, one per mount it made).
+fn transport_records(c: &Client) -> Vec<String> {
+    c.log_text()
+        .lines()
+        .filter(|l| l.contains("FUSE transport"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `fuse.mounts[0]` of the daemon's `node.status`.
+fn fuse_mount(c: &Client) -> Result<serde_json::Value> {
+    let status = c.control_status()?;
+    Ok(status["fuse"]["mounts"][0].clone())
+}
+
+/// Plan 38 Z2c, the maintainer's decision: under `auto` a mount with
+/// cluster locks (`--locks cluster`, the default with P2P, which the
+/// harness's daemons run with) stays on `/dev/fuse`, recorded as a
+/// `cluster_locks` fallback — once in the log, in `node.status`'s
+/// `last_fallback`, counted once — and serves; the same daemon with
+/// `--locks local` gets the ring under `auto`; and `uring` puts the
+/// cluster-lock mount on the ring with the deeper queue
+/// (`CLUSTER_LOCKS_URING_QUEUE_DEPTH`, 32). A `daemon --upgrade` of the
+/// `auto` mount is served, and the resumed session keeps reporting the same
+/// first rung. On a host that cannot grant the ring every leg is
+/// `dev_fuse`, and the reason is the earlier rung's (the ladder names the
+/// first rung that refused).
+pub fn transport_cluster_locks_auto(seed: u64) -> Result<()> {
+    let (env, root) = setup("transport-cluster-locks-auto")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/transport-cluster-locks-{}", ts());
+    let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", "auto");
+    c.fs_create()?;
+    let ring_host = crate::suites::unavailable(crate::suites::FUSE_URING).is_none();
+    let result = (|| -> Result<()> {
+        // 1. `auto`, cluster locks: /dev/fuse, and says why, once.
+        c.mount()?;
+        let negotiated = negotiated_transport(&c)?;
+        ensure!(
+            negotiated == "dev_fuse",
+            "auto with cluster locks negotiated {negotiated}"
+        );
+        let reason = fallback_reported(&c, ring_host.then_some("cluster_locks"))?;
+        ensure!(
+            downgrades(&c).is_empty(),
+            "auto asked for no ring for this mount, so no rung refused one: {:?}",
+            downgrades(&c)
+        );
+        serve_check(&c.mnt, seed, "cluster-auto")?;
+        let records = transport_records(&c);
+        ensure!(
+            records.len() == 1 && records[0].contains("fell back") && records[0].contains(&reason),
+            "the fallback must be logged exactly once, naming {reason}: {records:?}"
+        );
+        eprintln!("    auto, cluster locks: dev_fuse ({reason}), logged once");
+        c.unmount()?;
+
+        // 2. `auto`, local locks: the ring where the host grants it.
+        c.mount_view(None, &["--locks", "local"])?;
+        let negotiated = negotiated_transport(&c)?;
+        let mount = fuse_mount(&c)?;
+        if ring_host {
+            ensure!(
+                negotiated == "uring" && mount["last_fallback"].is_null(),
+                "auto with local locks on a ring host negotiated {negotiated}: {mount}"
+            );
+            ensure!(
+                mount["uring_queue_depth"] == 8,
+                "the ordinary queue depth: {mount}"
+            );
+        } else {
+            let why = fallback_reported(&c, None)?;
+            ensure!(
+                why != "cluster_locks",
+                "local locks cannot be held back for locks"
+            );
+        }
+        serve_check(&c.mnt, seed + 1, "local-auto")?;
+        eprintln!(
+            "    auto, local locks: {negotiated} {}",
+            mount["uring_queue_depth"]
+        );
+        c.unmount()?;
+
+        // 3. `uring`, cluster locks: the opt-in, on the deeper queue.
+        c.set_env("CONSTELLATION_FUSE_TRANSPORT", "uring");
+        c.mount()?;
+        let negotiated = negotiated_transport(&c)?;
+        let mount = fuse_mount(&c)?;
+        if ring_host {
+            ensure!(
+                negotiated == "uring" && mount["last_fallback"].is_null(),
+                "uring with cluster locks on a ring host negotiated {negotiated}: {mount}"
+            );
+            ensure!(
+                mount["uring_queue_depth"] == 32,
+                "a cluster-lock mount on the ring gets the deeper queue: {mount}"
+            );
+            ensure!(mount["lock_wait_downgrades"] == 0, "{mount}");
+        } else {
+            let why = fallback_reported(&c, None)?;
+            ensure!(
+                why != "cluster_locks",
+                "uring never holds a mount back for locks"
+            );
+        }
+        serve_check(&c.mnt, seed + 2, "cluster-uring")?;
+        eprintln!(
+            "    uring, cluster locks: {negotiated} {}",
+            mount["uring_queue_depth"]
+        );
+        no_alarms(&c)?;
+        c.unmount()?;
+
+        // 4. `daemon --upgrade` of the `auto` cluster-lock mount: it is on
+        // /dev/fuse, so the handover is served, and the resumed session —
+        // pinned now, in a new process — still names the rung that kept
+        // it off the ring, not the pin (the Z2b review's finding), logged
+        // once by the new image and counted once in its counters.
+        c.set_env("CONSTELLATION_FUSE_TRANSPORT", "auto");
+        c.mount()?;
+        let before = fallback_reported(&c, None)?;
+        let generation = super::handover::generation(&c)?;
+        let out = super::handover::try_upgrade(&c)?;
+        ensure!(
+            out.status.success(),
+            "daemon --upgrade of a dev_fuse mount must be served: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        ensure!(
+            super::handover::generation(&c)? == generation + 1,
+            "the generation did not advance"
+        );
+        let after = fallback_reported(&c, Some(&before))?;
+        let records = transport_records(&c);
+        ensure!(
+            records.len() == 2 && records[1].contains(&after),
+            "one record per daemon image, the resumed one naming {after}: {records:?}"
+        );
+        serve_check(&c.mnt, seed + 3, "resumed")?;
+        eprintln!("    auto, cluster locks, after daemon --upgrade: still {after}");
+        c.unmount()
+    })();
+    let _ = c.unmount();
+    result
+}
+
+/// `harness lock-probe ROLE FILE [INDEX]` (see the subcommand's doc): one
+/// process of [`transport_lock_wait_budget`]. Returns the exit code: 0
+/// done (`waiter`: granted), 3 `ENOLCK`, 1 anything else.
+pub fn lock_probe(role: &str, file: &Path, index: u64) -> i32 {
+    use std::io::{BufRead, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    let say = |what: &str| {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{what}");
+        let _ = out.flush();
+    };
+    let f = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            say(&format!("open: {e}"));
+            return 1;
+        }
+    };
+    let lock = |cmd: libc::c_int, typ: libc::c_int| -> std::io::Result<()> {
+        // SAFETY: a zeroed `flock` is a valid argument; every field the
+        // kernel reads is set below.
+        let mut l: libc::flock = unsafe { std::mem::zeroed() };
+        l.l_type = typ as libc::c_short;
+        l.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: an fcntl lock call on a descriptor this process owns.
+        if unsafe { libc::fcntl(f.as_raw_fd(), cmd, &l) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    match role {
+        "holder" => {
+            if let Err(e) = lock(libc::F_SETLK, libc::F_WRLCK) {
+                say(&format!("lock: {e}"));
+                return 1;
+            }
+            say("locked");
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            // The holder's own request while every other entry of its
+            // CPU's queue may be held by a waiter: the deadlock the budget
+            // exists to prevent would hang exactly here.
+            if let Err(e) = f.write_all_at(&[b'H'; 4096], 0) {
+                say(&format!("write: {e}"));
+                return 1;
+            }
+            if let Err(e) = lock(libc::F_SETLK, libc::F_UNLCK) {
+                say(&format!("unlock: {e}"));
+                return 1;
+            }
+            say("unlocked");
+            0
+        }
+        "waiter" => match lock(libc::F_SETLKW, libc::F_WRLCK) {
+            Ok(()) => {
+                let record = format!("waiter {index:04}\n");
+                let at = 4096 * (1 + index);
+                let r = f.write_all_at(record.as_bytes(), at);
+                let _ = lock(libc::F_SETLK, libc::F_UNLCK);
+                match r {
+                    Ok(()) => {
+                        say("granted");
+                        0
+                    }
+                    Err(e) => {
+                        say(&format!("write: {e}"));
+                        1
+                    }
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOLCK) => {
+                say("enolck");
+                3
+            }
+            Err(e) => {
+                say(&format!("lock: {e}"));
+                1
+            }
+        },
+        other => {
+            say(&format!("unknown role {other}"));
+            1
+        }
+    }
+}
+
+/// The CPU every process of [`transport_lock_wait_budget`] is pinned to:
+/// the last one this process may run on (an arbitrary but fixed queue).
+fn budget_cpu() -> Result<usize> {
+    // SAFETY: a zeroed set is valid; the kernel fills it.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: our own affinity, into a set of the right size.
+    let rc = unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) };
+    ensure!(
+        rc == 0,
+        "sched_getaffinity: {}",
+        std::io::Error::last_os_error()
+    );
+    (0..libc::CPU_SETSIZE as usize)
+        .rev()
+        // SAFETY: `cpu` is below CPU_SETSIZE.
+        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+        .context("no CPU in our affinity mask")
+}
+
+/// One round of [`transport_lock_wait_budget`] on a mounted client whose
+/// queue depth is `depth`: `depth + extra` waiters on one CPU, the holder
+/// on the same CPU. Returns the downgrades it expects (`extra + 1`).
+fn lock_wait_round(c: &Client, depth: u64, extra: u64, round: &str) -> Result<u64> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, Command, Stdio};
+    let mount = fuse_mount(c)?;
+    ensure!(
+        mount["transport"] == "uring",
+        "the cluster-lock mount must be on the ring here: {mount}"
+    );
+    ensure!(
+        mount["uring_queue_depth"] == depth,
+        "expected queue depth {depth}: {mount}"
+    );
+    let file = c.mnt.join(format!("budget-{round}"));
+    std::fs::write(&file, b"")?;
+    let cpu = budget_cpu()?.to_string();
+    let me = std::env::current_exe()?;
+    let pinned = |args: &[&str]| {
+        let mut cmd = Command::new("taskset");
+        cmd.arg("-c")
+            .arg(&cpu)
+            .arg(&me)
+            .arg("lock-probe")
+            .args(args);
+        cmd
+    };
+    let path = file.to_str().context("mount path")?;
+    let mut holder = pinned(&["holder", path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut said = BufReader::new(holder.stdout.take().context("holder stdout")?);
+    let mut line = String::new();
+    said.read_line(&mut line)?;
+    ensure!(line.trim() == "locked", "the holder said {line:?}");
+
+    let n = depth + extra;
+    let mut waiters: Vec<Child> = (0..n)
+        .map(|i| {
+            pinned(&["waiter", path, &i.to_string()])
+                .stdout(Stdio::piped())
+                .spawn()
+        })
+        .collect::<std::io::Result<_>>()?;
+    // `depth - 1` of them wait on the queue's entries; every other one is
+    // served as non-blocking and, the lock being held, answered ENOLCK.
+    let blocked = depth - 1;
+    let refused = n - blocked;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut exits: Vec<Option<i32>> = vec![None; n as usize];
+    let mut settled_since: Option<std::time::Instant> = None;
+    loop {
+        for (i, w) in waiters.iter_mut().enumerate() {
+            if exits[i].is_none() {
+                if let Some(st) = w.try_wait()? {
+                    exits[i] = Some(st.code().unwrap_or(-1));
+                }
+            }
+        }
+        let done = exits.iter().filter(|e| e.is_some()).count() as u64;
+        let enolck = exits.iter().filter(|e| **e == Some(3)).count() as u64;
+        ensure!(
+            exits.iter().flatten().all(|&code| code == 3),
+            "with the lock held a waiter may only be refused (exit 3): {exits:?}"
+        );
+        ensure!(
+            enolck <= refused,
+            "more waiters refused than the budget allows ({enolck} > {refused}): {exits:?}"
+        );
+        if enolck == refused {
+            // Stable: nobody else gives up while the lock is still held.
+            let since = *settled_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "after 60 s {done} of {n} waiters had exited ({enolck} with ENOLCK), \
+             expected {refused} refusals and {blocked} waiting: {exits:?}\n{}",
+            c.tail_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ensure!(
+        exits.iter().filter(|e| e.is_none()).count() as u64 == blocked,
+        "expected {blocked} waiters still waiting: {exits:?}"
+    );
+    // The queue's spare entry serves everything else from that CPU while
+    // `depth - 1` waiters hold the rest: a stat, then the holder's write
+    // and unlock.
+    let t = std::time::Instant::now();
+    let st = Command::new("taskset")
+        .arg("-c")
+        .arg(&cpu)
+        .arg("stat")
+        .arg(path)
+        .stdout(Stdio::null())
+        .status()?;
+    ensure!(st.success(), "a stat on the waiters' CPU failed");
+    ensure!(
+        t.elapsed() < Duration::from_secs(10),
+        "a stat on the waiters' CPU took {:?}",
+        t.elapsed()
+    );
+    holder
+        .stdin
+        .as_mut()
+        .context("holder stdin")?
+        .write_all(b"go\n")?;
+    line.clear();
+    said.read_line(&mut line)?;
+    ensure!(line.trim() == "unlocked", "the holder said {line:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut running = 0;
+        for (i, w) in waiters.iter_mut().enumerate() {
+            if exits[i].is_none() {
+                match w.try_wait()? {
+                    Some(st) => exits[i] = Some(st.code().unwrap_or(-1)),
+                    None => running += 1,
+                }
+            }
+        }
+        if running == 0 {
+            break;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "{running} waiters still blocked 60 s after the holder unlocked: {exits:?}\n{}",
+            c.tail_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ensure!(holder.wait()?.success(), "the holder failed");
+    let granted = exits.iter().filter(|e| **e == Some(0)).count() as u64;
+    let enolck = exits.iter().filter(|e| **e == Some(3)).count() as u64;
+    ensure!(
+        granted == blocked && enolck == refused,
+        "expected {blocked} granted and {refused} ENOLCK: {exits:?}"
+    );
+    // Every write that was answered landed.
+    let data = std::fs::read(&file)?;
+    ensure!(
+        data.len() >= 4096 && data[..4096].iter().all(|&b| b == b'H'),
+        "the holder's write is missing"
+    );
+    for (i, e) in exits.iter().enumerate() {
+        if *e == Some(0) {
+            let at = 4096 * (1 + i);
+            let want = format!("waiter {i:04}\n");
+            ensure!(
+                data.get(at..at + want.len()) == Some(want.as_bytes()),
+                "waiter {i}'s record is missing"
+            );
+        }
+    }
+    eprintln!(
+        "    {round}: depth {depth}, {n} waiters on CPU {cpu}: {granted} waited and were \
+         granted, {enolck} answered ENOLCK; the holder's write and unlock went through"
+    );
+    Ok(refused)
+}
+
+/// Plan 38 Z2c item 4, on a **real kernel** (not the in-memory ring of
+/// `wire_uring.rs`): a cluster-lock mount opted into the ring
+/// (`--fuse-transport uring`), `depth + 3` processes pinned to one CPU
+/// (`taskset`) blocking in `F_SETLKW` on a lock a process on the same CPU
+/// holds. Without the budget the first `depth` waiters would take every
+/// entry of that CPU's queue and the holder's `write` — and with it the
+/// unlock — would never be served. With it: `depth - 1` wait, the rest are
+/// answered `ENOLCK` at once, a `stat` from that CPU is served, the holder
+/// writes and unlocks, every waiter that waited is granted, and
+/// `node.status`'s `lock_wait_downgrades` (per mount and process-wide)
+/// equals the refusals. Run at depth 4 and at the shipped cluster-lock
+/// default (32).
+pub fn transport_lock_wait_budget(_seed: u64) -> Result<()> {
+    const EXTRA: u64 = 3;
+    let (env, root) = setup("transport-lock-wait-budget")?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/transport-lock-budget-{}", ts());
+    let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", "uring")
+        .with_env("CONSTELLATION_FUSE_URING_QUEUE_DEPTH", "4");
+    c.fs_create()?;
+    let result = (|| -> Result<()> {
+        for (round, depth) in [("explicit-depth", 4u64), ("default-depth", 32)] {
+            if round == "default-depth" {
+                c.unset_env("CONSTELLATION_FUSE_URING_QUEUE_DEPTH");
+            }
+            c.mount()?;
+            let expected = lock_wait_round(&c, depth, EXTRA, round)?;
+            let status = c.control_status()?;
+            let mount = &status["fuse"]["mounts"][0];
+            ensure!(
+                mount["lock_wait_downgrades"] == expected
+                    && status["fuse"]["lock_wait_downgrades_total"] == expected,
+                "lock_wait_downgrades must count the {expected} refusals: {}",
+                status["fuse"]
+            );
+            no_alarms(&c)?;
+            c.unmount()?;
+        }
+        Ok(())
+    })();
+    let _ = c.unmount();
     result
 }

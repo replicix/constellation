@@ -227,6 +227,58 @@ pub struct NodeRuntime {
     headless_view: Mutex<Option<Arc<View>>>,
 }
 
+/// The options `add_mount` mounts a view with. Plan 38 §3(e): a
+/// `view.mount{PreopenedFd}` session (`preopened`) is one somebody else
+/// mounted and may ask back for (plan 37's CSI engine-pod replacement hands
+/// the descriptor on), so it is handover-capable and pinned to `/dev/fuse`
+/// whatever the transport knob says. A mount this process made is plain:
+/// it takes the knob's policy, and `node.handoff`/`daemon --upgrade`
+/// refuses to detach it if that policy got it a ring (the refusal names
+/// the transport).
+fn mount_options_for(
+    fs_name: String,
+    fuse_threads: usize,
+    tuning: constellation_frontend_fuse::KernelTuning,
+    transport: constellation_frontend_fuse::TransportConfig,
+    preopened: bool,
+) -> constellation_frontend_fuse::MountOptions {
+    if preopened {
+        constellation_frontend_fuse::MountOptions::handover_capable(
+            fs_name,
+            fuse_threads,
+            tuning,
+            transport,
+            constellation_frontend_fuse::HandoverCapable,
+        )
+    } else {
+        constellation_frontend_fuse::MountOptions::new(fs_name, fuse_threads, tuning, transport)
+    }
+}
+
+/// Plan 38 Z2c: the transport a plain mount asks for when neither
+/// `--fuse-transport` nor `CONSTELLATION_FUSE_TRANSPORT` says — the engine
+/// profile's (`EngineProfile::fuse_transport`: the ladder, except under
+/// `CONSTELLATION_PROFILE=mobile`). Read from the environment the daemon
+/// will pick its profile from, so it agrees with [`NodeRuntime::start`];
+/// an unknown profile is the same error here, before the fork.
+pub(crate) fn profile_transport() -> Result<constellation_frontend_fuse::TransportPolicy> {
+    let profile = EngineProfile::from_env(EngineProfile::desktop()).map_err(anyhow::Error::msg)?;
+    Ok(transport_of(profile.fuse_transport))
+}
+
+fn transport_of(
+    mode: constellation_engine::FuseTransportMode,
+) -> constellation_frontend_fuse::TransportPolicy {
+    match mode {
+        constellation_engine::FuseTransportMode::Auto => {
+            constellation_frontend_fuse::TransportPolicy::Auto
+        }
+        constellation_engine::FuseTransportMode::DevFuse => {
+            constellation_frontend_fuse::TransportPolicy::DevFuse
+        }
+    }
+}
+
 impl NodeRuntime {
     /// This daemon's node.
     pub fn engine(&self) -> &Arc<Engine> {
@@ -506,30 +558,13 @@ impl NodeRuntime {
         let tuning = constellation_frontend_fuse::KernelTuning::for_workers(
             crate::parallelism::thread_plan().fuse,
         );
-        // Plan 38 §3(e): a `view.mount{PreopenedFd}` session is one
-        // somebody else mounted and may ask back for (plan 37's CSI
-        // engine-pod replacement hands the descriptor on), so it is
-        // handover-capable and pinned to `/dev/fuse` whatever the
-        // transport knob says. A mount this process made is plain: it
-        // takes the knob's policy, and `node.handoff`/`daemon --upgrade`
-        // refuses to detach it if that policy got it a ring (the refusal
-        // names the transport).
-        let mut mount_options = if preopened.is_some() {
-            constellation_frontend_fuse::MountOptions::handover_capable(
-                fs_name,
-                fuse_threads,
-                tuning,
-                self.fuse_transport,
-                constellation_frontend_fuse::HandoverCapable,
-            )
-        } else {
-            constellation_frontend_fuse::MountOptions::new(
-                fs_name,
-                fuse_threads,
-                tuning,
-                self.fuse_transport,
-            )
-        };
+        let mut mount_options = mount_options_for(
+            fs_name,
+            fuse_threads,
+            tuning,
+            self.fuse_transport,
+            preopened.is_some(),
+        );
         mount_options.allow_other = allow_other;
         mount_options.read_only = frozen_view;
         // An explicit session, so `remove_mount`/signals can unmount from
@@ -974,6 +1009,45 @@ mod tests {
             rt.clone(),
         )
         .expect("NodeRuntime::start")
+    }
+
+    /// Plan 38 Z2c: a `view.mount{PreopenedFd}` session (plan 37's CSI
+    /// pods) is pinned to `/dev/fuse` whatever the node's knob says; a
+    /// mount this daemon makes takes the knob, the ladder by default; the
+    /// mobile profile's default is `/dev/fuse`.
+    #[test]
+    fn a_preopened_view_mount_is_pinned_and_a_plain_one_takes_the_knob() {
+        use constellation_frontend_fuse::{KernelTuning, TransportConfig, TransportPolicy};
+        for policy in [TransportPolicy::Auto, TransportPolicy::Uring] {
+            let cfg = TransportConfig {
+                policy,
+                uring_queue_depth: None,
+                ..Default::default()
+            };
+            let csi = mount_options_for("csi".into(), 2, KernelTuning::for_workers(2), cfg, true);
+            assert_eq!(csi.transport(), TransportPolicy::DevFuse, "{policy}");
+            assert!(csi.is_handover_capable());
+            let plain =
+                mount_options_for("plain".into(), 2, KernelTuning::for_workers(2), cfg, false);
+            assert_eq!(plain.transport(), policy);
+            assert!(!plain.is_handover_capable());
+        }
+        let shipped = mount_options_for(
+            "default".into(),
+            2,
+            KernelTuning::for_workers(2),
+            TransportConfig::default(),
+            false,
+        );
+        assert_eq!(shipped.transport(), TransportPolicy::Auto);
+        assert_eq!(
+            transport_of(EngineProfile::desktop().fuse_transport),
+            TransportPolicy::Auto
+        );
+        assert_eq!(
+            transport_of(EngineProfile::mobile().fuse_transport),
+            TransportPolicy::DevFuse
+        );
     }
 
     fn view(inner_path: &str, mountpoint: PathBuf) -> ViewConfig {

@@ -181,6 +181,17 @@ enum Command {
     /// killed whose last thread is stuck in the kernel).
     #[command(hide = true)]
     MuteDaemon { state_dir: std::path::PathBuf },
+    /// (internal) One process of `transport-lock-wait-budget`: `holder`
+    /// write-locks FILE, says `locked`, and on a line from stdin writes and
+    /// unlocks; `waiter` blocks in `F_SETLKW` on FILE and says `granted`
+    /// (exit 0) or `enolck` (exit 3).
+    #[command(hide = true)]
+    LockProbe {
+        role: String,
+        file: std::path::PathBuf,
+        #[arg(default_value_t = 0)]
+        index: u64,
+    },
     /// Snapshot a local directory into an anonymized corpus manifest.
     CorpusSnapshot {
         /// Directory to walk (`.git` / `.hg` / `.svn` skipped).
@@ -382,6 +393,9 @@ fn main() -> Result<()> {
         }
         Command::CorpusSnapshot { src, out, seed } => corpus::snapshot_cmd(src, out, seed),
         Command::MuteDaemon { state_dir } => mute_daemon(&state_dir),
+        Command::LockProbe { role, file, index } => std::process::exit(
+            constellation_harness::scenarios::transport::lock_probe(&role, &file, index),
+        ),
     }
 }
 
@@ -482,6 +496,7 @@ fn run(opts: RunOpts) -> Result<()> {
             continue;
         }
         let t0 = std::time::Instant::now();
+        constellation_harness::client::set_scenario(s.name);
         eprintln!("=== {} (seed {seed}) ===", s.name);
         match (s.run)(seed) {
             Ok(()) => {

@@ -61,8 +61,8 @@ because they combine with it. See [Durability and failover](features/durability-
 | `--cto` | `bounded` | `bounded`, `strict` | `CONSTELLATION_CTO` | no | close-to-open mode (plan 30 M8). `strict`: an open, lookup or listing sees every close another node completed before it began |
 | `--locks` | `cluster` with P2P, `local` without | `local`, `cluster` | `CONSTELLATION_LOCKS` | no | `flock`/`fcntl` scope (plan 30 M14). An explicit `cluster` with P2P off fails the mount |
 | `--cache-verify` | `admit` | `admit`, `always` | `CONSTELLATION_CACHE_VERIFY` | no | when a disk-cache read re-hashes the chunk file it read (plan 38 §2.3). Every chunk is blake3-verified exactly once regardless — **while it streams in** from S3 or a peer, before it is ever admitted. `admit`: the local copy is trusted afterwards; a file a restart's directory scan found is still hashed on its first read (and then trusted). `always`: every disk read hashes again, so local corruption after admission (a bad sector, a scrub miss, a writer into the cache directory) is caught on the next read instead of at the next restart, at one blake3 pass per read. Echoed in `node.status` as `cache.cache_verify` (node-wide, so the per-mount `fuse` section does not repeat it); an unparseable `CONSTELLATION_CACHE_VERIFY` is warned about and ignored (see below the table), while an unparseable `--cache-verify` fails the mount before the daemon forks. `always` also turns FUSE passthrough off (see [FUSE passthrough](#fuse-passthrough) below; `node.status` reports the reason `cache_verify_always`), and plan 38 Z4 will do the same for zero-copy: both let the kernel serve a chunk file without the daemon seeing the bytes |
-| `--fuse-transport` | `dev-fuse` | `dev-fuse`, `auto` | `CONSTELLATION_FUSE_TRANSPORT` | no | **`auto` is not the default until plan 38 Z2c** (see the note below the table). Which transport this daemon's **plain** Linux mounts are served over (plan 38 §2.4). `dev-fuse`: `read(2)`/`writev(2)` on `/dev/fuse`, every kernel and every platform. `auto`: run the ladder — FUSE-over-io_uring when the binary carries the `io-uring` cargo feature, the kernel is 6.14+ with `fuse.enable_uring=Y`, and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once rather than failing the mount. Runtime-negotiated, never a build-time choice, and fixed for a connection's life: what a mount actually got is `node.status`'s per-mount `transport` (`dev_fuse`/`uring`/`uring_zc`, in `mounts[]` and in `fuse.mounts[]`), and the label `transport` on that mount's `constellation_vfs_ops_total`/`constellation_vfs_op_seconds` rows. A mount that asked for `auto` and got `/dev/fuse` records why in `fuse.mounts[].last_fallback` (`reason`: `no_io_uring_feature`, `kernel_not_offered`, `ring_setup_failed` or `handover_capable`, with a free-text `detail` and the time) and counts once in `constellation_fuse_transport_fallbacks_total{from,to,reason}`; the default `dev-fuse` asked for no ring and records no fallback. **A mount served over a ring cannot be handed to another process image**, so `daemon --upgrade`/`node.handoff` refuses it by name (plan 38 §3(e)/Z0a) — unmount and remount is the only upgrade path for such a mount. Mounts that are handover-capable by construction (`view.mount` on a descriptor somebody else opened, and anything an upgrade resumes) are `dev_fuse` whatever this says — with `auto` set, they report a `handover_capable` fallback |
-| `--fuse-uring-queue-depth` | `8` | a positive integer | `CONSTELLATION_FUSE_URING_QUEUE_DEPTH` | no | ring entries per kernel queue, read only when a mount's transport resolves to a ring. The reserved buffer is `queues x depth x max_write` of `MAP_NORESERVE` address space per mount (plan 38 §4), so this is the knob for an operator who has measured their own RSS/throughput trade-off and wants a different point on it. It also bounds blocking lock waits: at most `depth - 1` of one queue's entries wait for a lock (see the note below the table), so a depth of `1` serves every contended blocking `fcntl`/`flock` lock with `ENOLCK`. Reported per mount as `node.status`'s `fuse.mounts[].uring_queue_depth` and `/metrics`' `constellation_fuse_uring_queue_depth{mountpoint,transport}` — `0` on a `/dev/fuse` mount, which has no ring queues. Handover-capable mounts never use it (they are `dev_fuse`) |
+| `--fuse-transport` | `auto` (`dev-fuse` under `CONSTELLATION_PROFILE=mobile`) | `auto`, `uring`, `dev-fuse` | `CONSTELLATION_FUSE_TRANSPORT` | no | Which transport this daemon's **plain** Linux mounts are served over (plan 38 §2.4). `auto`: run the ladder — FUSE-over-io_uring when the binary carries the `io-uring` cargo feature (every Linux build of `constellation` since plan 38 Z2c), the kernel is 6.14+ with `fuse.enable_uring=Y`, and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once rather than failing the mount. **Under `auto` a mount with cluster locks (`--locks cluster`, the default with P2P) stays on `/dev/fuse`** (see the note below the table); a mount with `--locks local` (or without P2P) takes the ladder. `uring`: the ladder for every plain mount, cluster-lock ones included, accepting the ring's lock-wait budget — a contended blocking `fcntl`/`flock` lock past `depth - 1` waiters on one CPU's queue is answered **`ENOLCK`** instead of waiting (counted in `lock_wait_downgrades`); such a mount gets a deeper queue (32) unless `--fuse-uring-queue-depth` says otherwise. `dev-fuse`: `read(2)`/`writev(2)` on `/dev/fuse`, every kernel and every platform. Runtime-negotiated, never a build-time choice, and fixed for a connection's life: what a mount actually got is `node.status`'s per-mount `transport` (`dev_fuse`/`uring`/`uring_zc`, in `mounts[]` and in `fuse.mounts[]`), and the label `transport` on that mount's `constellation_vfs_ops_total`/`constellation_vfs_op_seconds` rows. A mount that asked for the ring (`auto` or `uring`) and got `/dev/fuse` records why in `fuse.mounts[].last_fallback` — `reason`, the first rung that refused, in this order: `no_io_uring_feature`, `kernel_not_offered`, `cluster_locks`, `handover_capable`, `ring_setup_failed`; with a free-text `detail` and the time — and counts once in `constellation_fuse_transport_fallbacks_total{from,to,reason}`; `dev-fuse` asked for no ring and records no fallback. **A mount served over a ring cannot be handed to another process image**, so `daemon --upgrade`/`node.handoff` refuses it by name (plan 38 §3(e)/Z0a) — unmount and remount is the only upgrade path for such a mount. A `view.mount` with a mountpoint path — on a daemon or a headless `constellation serve` node, a CSI engine pod's included — is a plain mount and follows this setting like any other (on `serve`, through `CONSTELLATION_FUSE_TRANSPORT` and the profile). Mounts that are handover-capable by construction (`view.mount` on a descriptor somebody else opened, and anything an upgrade resumes) are `dev_fuse` whatever this says — they report `handover_capable` where the ring would otherwise have been granted, and an earlier rung's reason (the kernel, the build, cluster locks under `auto`) where it would not |
+| `--fuse-uring-queue-depth` | `8`; `32` for a cluster-lock mount on `uring` | a positive integer | `CONSTELLATION_FUSE_URING_QUEUE_DEPTH` | no | ring entries per kernel queue, read only when a mount's transport resolves to a ring; when set it applies to every ring mount of the daemon. The reserved buffer is `possible CPUs x depth x (max_write + a page)` of `MAP_NORESERVE` address space per mount (plan 38 §4) — resident only as far as traffic touches it — so this is the knob for an operator who has measured their own trade-off. It also bounds blocking lock waits: at most `depth - 1` of one queue's entries wait for a lock (see the note below the table), so a depth of `1` serves every contended blocking `fcntl`/`flock` lock with `ENOLCK`. Reported per mount as `node.status`'s `fuse.mounts[].uring_queue_depth` and `/metrics`' `constellation_fuse_uring_queue_depth{mountpoint,transport}` — `0` on a `/dev/fuse` mount, which has no ring queues. Handover-capable mounts never use it (they are `dev_fuse`). The reservation needs the address space even though it stays non-resident: a depth-32 mount reserves about 16 GiB on a host with 32 possible CPUs (measured, plan 38 Z2 in PROGRESS), so under `vm.overcommit_memory=2` (strict accounting) or a tight `RLIMIT_AS` (`ulimit -v`) the ring's setup fails and the mount comes up on `/dev/fuse` with the fallback reason `ring_setup_failed` — lower this knob (or raise the limit) there |
 | `--fsync-mode` | `local` | `local`, `s3` | none | yes | what `fsync()` waits for. `local`: every chunk of the file still queued on this node is in the bucket (whoever wrote it, including a writer that already closed it under `--write-mode back`; on the node that sequenced a `back` close made elsewhere, also the chunks that writer has not uploaded yet) and the node's metadata store is forced to disk. `s3`: also the journal up to the call is in the bucket. The same in a continuation epoch: an `fsync` waits for the bucket (or a peer's chunk handoff) there too (plan 39b; before, `local` uploaded only what the `fsync` itself published, and nothing inside an epoch). `s3` also forces `--write-mode through`. Whatever it waits for, it waits like an NFS `hard` mount (plan 39): a *transient* S3 failure (timeout, refused or reset connection, 5xx, `SlowDown`, …) is retried with backoff until the data is durable, never answered `EIO`; a failure waiting cannot fix (`AccessDenied`, `NoSuchBucket`, a disabled KMS key, a queued chunk lost from this node's disk and not in the bucket, …) is `EIO` at once. Killable, not interruptible (as NFS `hard`): a signal the process handles (a timer, a caught `SIGINT`/`SIGTERM`) leaves it waiting, and only a signal that kills the process (`SIGKILL`, an unhandled default-fatal signal) ends the wait (`EINTR`, which the dying process never sees) — detected from the caller thread's pending `SIGKILL` in `/proc/<tid>/status`, so a caller the daemon cannot see there (another pid namespace, `hidepid`) is not killable until S3 returns or a timeout below ends the wait. An `O_SYNC`/`O_DSYNC` write waits the same way and answers `EIO` when cut short. In every failed case the data stays pending and the next `fsync` waits for it again. `fsyncdir` (an `fsync` of a directory) is the same barrier for the directory's entries |
 | `--fsync-timeout` | unset (wait until durable) | a duration: `500ms`, `30s`, `2m`, or a bare number of seconds; `0`/`off`/`hard` = wait until durable (on the flag this overrides `CONSTELLATION_FSYNC_TIMEOUT`) | `CONSTELLATION_FSYNC_TIMEOUT` | no | **the opt-in `soft` mode** (plan 39). Bounds how long an `fsync` (and an `O_SYNC`/`O_DSYNC` write) waits for an unreachable S3; when it elapses the call fails `EIO` with the data still pending: it keeps uploading in the background, and the next `fsync` waits for it again. **Warning**, as nfs(5) says of `soft`: use it "only when client responsiveness is more important than data integrity". Nothing is dropped, but an application that treats `EIO` from `fsync` as "the data is lost" (and acts on it — retries elsewhere, reports failure, PostgreSQL PANICs) gets that outcome for data that was merely late. Node-wide; an invalid flag fails the mount before the fork, an invalid env value is warned about and ignored. Reported as `node.status.fsync.mode` (`hard`/`soft`) and `timeout_ms`. Independently of it, when the host sets the kernel's FUSE request timeout (`fs.fuse.default_request_timeout` / `max_request_timeout`, Linux 6.15+), every `fsync` wait is capped just below it (`t − min(t/5, 5 s)`, logged once at warn, `node.status.fsync.kernel_cap_ms`): past that the kernel would abort the whole connection, failing every open file of the mount |
 | `--write-mode` | `through` | `through`, `back` | none | yes | chunk close policy. `through`: `close()` returns once the file's chunks are in S3 and its manifest is committed at the sequencer (one S3 round trip for a small file). `back`: `close()` returns once the chunks are queued durably on this node's disk and the manifest is committed at the sequencer (no S3 round trip, on the sequencer and on any other node); the bytes live only on this node until the upload drains. `fsync`, `O_SYNC`, `O_DSYNC`, `--fsync-mode s3` and a cluster lock's release always act as `through`. `constellation write-mode TARGET MODE` changes it on a running mount (switching to `through` drains the queue). Use `back` for bulk imports (untar, rsync, `cp -r`) and switch back afterwards; see [When to use `--write-mode back`](features/durability-and-failover.md#when-to-use---write-mode-back) |
@@ -99,47 +99,57 @@ knob, `CONSTELLATION_FUSE_PASSTHROUGH`, and what it changes. Zero-copy reads
 (plan 38 Z4) are counted (`fuse.mounts[].zero_copy_reads`,
 `constellation_fuse_zero_copy_reads_total`) and are 0 until then.
 
-> **Note — `--fuse-transport auto` / `CONSTELLATION_FUSE_TRANSPORT=auto`
-> is not the default yet** (plan 38 Z2c flips plain mounts). It only takes
-> effect on a binary built with the `io-uring` feature and a kernel with
-> `fuse.enable_uring=Y`. Plan 38 Z1b found that a request dispatched on a
-> ring's own thread could stall every unrelated request queued on that ring
-> while it waited on S3; since Z2a a ring thread dispatches only reads of data
-> and metadata itself (`read`, `getattr`, `readlink`, xattr reads, `statfs`,
-> `access`). Everything that can wait on S3, a lease or another node — opens,
-> writes, `close`'s flush/release, `fsync`, namespace changes, locks, lookups
-> and directory listings (a listing from its start may ask the sequencer for
-> a read position under `--cto strict`) — runs on a pool of `n_threads`
-> offload threads, and a read that would wait for the store or for another op
-> on the same file defers to the engine's completion pool. What stays on the
-> ring thread can still wait a bounded time on its own node, as a read
-> always could: the session wait for this node's own writes (at most
-> `CONSTELLATION_SESSION_WAIT_MS`, then it answers anyway) and the view's
-> admission gate when `max_inflight_ops` is set.
+> **Note — the ring transport, and why `auto` keeps cluster-lock mounts
+> on `/dev/fuse`.** Since plan 38 Z2c `auto` is the default for plain mounts
+> (the mobile profile excepted). It only reaches the ring on a kernel with
+> `fuse.enable_uring=Y` (6.14+) whose sandbox permits `io_uring_setup(2)`.
+> Over the ring, a ring thread dispatches only reads of data and metadata
+> itself (`read`, `getattr`, `readlink`, xattr reads, `statfs`, `access`).
+> Everything that can wait on S3, a lease or another node — opens, writes,
+> `close`'s flush/release, `fsync`, namespace changes, locks, lookups and
+> directory listings — runs on a pool of `n_threads` offload threads, and a
+> read that would wait for the store or for another op on the same file
+> defers to the engine's completion pool. What stays on the ring thread can
+> still wait a bounded time on its own node, as a read always could: the
+> session wait for this node's own writes (at most
+> `CONSTELLATION_SESSION_WAIT_MS`) and the view's admission gate when
+> `max_inflight_ops` is set.
 >
 > **What a ring cannot do that `/dev/fuse` can: let a waiting request hold
 > nothing.** Over a ring every request holds its entry until it is answered
 > — including one answered later from another thread: a cold read on the
 > completion pool, an offloaded flush waiting on S3, and a blocking
 > `F_SETLKW`/`flock` handed to the view's `lock-wait` thread. The kernel
-> queues a request on the queue of the CPU that issued it (each queue has
-> `--fuse-uring-queue-depth` entries, 8 by default) and, while all of that
-> queue's entries are held, the request waits there; it cannot be answered on
-> another queue or over `/dev/fuse`. For waits that end by themselves (the
-> store, a lease, the session wait) that is a stall of that CPU's requests
-> for as long as the wait. For a blocking lock it would be a **deadlock**:
-> 8 processes on CPU *k* blocked in `F_SETLKW` on a lock held by process *P*,
-> *P* on CPU *k* issues a `write()` before its unlock — the write waits for an
-> entry only the unlock could free, and every later request from CPU *k*
-> hangs with it. So, since Z2a, at most `depth - 1` entries of a queue may be
-> held by blocking lock requests; a further one on that queue is served
-> without waiting — granted if the lock is free, **`ENOLCK`** ("no lock
-> resources") if it is contended — instead of taking the queue's last entry.
-> `/dev/fuse` mounts never do this. Mounts under `--locks local` are
+> queues a request on the queue of the CPU that issued it and, while all of
+> that queue's entries are held, the request waits there; it cannot be
+> answered on another queue or over `/dev/fuse`. For waits that end by
+> themselves (the store, a lease, the session wait) that is a stall of that
+> CPU's requests for as long as the wait. For a blocking lock it would be a
+> **deadlock**: `depth` processes on CPU *k* blocked in `F_SETLKW` on a lock
+> held by process *P*, *P* on CPU *k* issues a `write()` before its unlock —
+> the write waits for an entry only the unlock could free, and every later
+> request from CPU *k* hangs with it. So at most `depth - 1` entries of a
+> queue may be held by blocking lock requests; a further one on that queue
+> is served without waiting — granted if the lock is free, **`ENOLCK`** ("no
+> lock resources") if it is contended — instead of taking the queue's last
+> entry. Every such downgrade is counted: `node.status`'s
+> `fuse.mounts[].lock_wait_downgrades` and `fuse.lock_wait_downgrades_total`,
+> and `/metrics`' `constellation_fuse_lock_wait_downgrades_total`.
+> `/dev/fuse` mounts never do this, and mounts under `--locks local` are
 > unaffected (the kernel keeps their locks and never sends a blocking lock
-> request). Plan 38 Z2c must settle whether that `ENOLCK` is acceptable for
-> `auto` as a default, or keep mounts with cluster locks on `/dev/fuse`, or
-> ship a deeper default queue.
+> request).
+>
+> Because a cluster-lock mount is exactly the one that sends blocking lock
+> requests, **`auto` keeps it on `/dev/fuse`** (its `last_fallback.reason` is
+> `cluster_locks`). `--fuse-transport uring` /
+> `CONSTELLATION_FUSE_TRANSPORT=uring` is the opt-in that puts it on the ring
+> anyway, accepting the `ENOLCK` behaviour above, with a deeper default queue
+> (32 entries, so 31 contended waiters per CPU before the next is refused,
+> against 7 at the ordinary depth 8; the price is address space, not
+> memory — see plan 38 §4 and PROGRESS "Plan 38 Z2"). Use it where the
+> applications on the mount do not pile dozens of contended blocking locks
+> onto one CPU, or where they handle `ENOLCK` by retrying. This default is
+> to be revisited after plan 38 Z4's zero-copy numbers.
 >
 > `CONSTELLATION_FUSE_URING_FAULT=malformed-register` is **fault injection
 > for the test harness only** (`transport-refused-registration`): a mount
@@ -168,6 +178,15 @@ once, before it serves anything: a process whose `CAP_SYS_ADMIN` is only a
 user namespace's (`EPERM`), or a cache directory on a stacked filesystem
 such as overlayfs (`ELOOP`), turns it off for the mount with reason
 `backing_open`.
+
+**Passthrough works on every transport** (`--fuse-transport`): the backing
+file is registered on the connection's `/dev/fuse` descriptor, which a ring
+session has too, and the open's reply carries its id over the ring as over
+`/dev/fuse` (harness `passthrough-on-every-transport`). A read-only snapshot
+mount takes no cluster locks, so under the default `auto` it is not held
+back on `/dev/fuse` for them and gets the ring where the host grants it —
+passthrough for the handles of verified chunks, the ring for everything
+else.
 
 **A chunk the daemon's memory tier holds is never handed over**
 (`CONSTELLATION_CHUNK_MEMCACHE_BYTES`): a memory hit is served faster by the

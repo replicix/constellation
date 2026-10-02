@@ -124,6 +124,7 @@ fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::
         transport: stats.transport().name().to_string(),
         uring_queue_depth: stats.uring_queue_depth(),
         zero_copy_reads: stats.zero_copy_reads(),
+        lock_wait_downgrades: stats.lock_wait_downgrades(),
         last_fallback: stats.last_fallback().map(|f| api::FuseFallback {
             from: f.from.name().to_string(),
             to: f.to.name().to_string(),
@@ -176,6 +177,8 @@ impl ControlHost for DaemonHost {
                 })
                 .collect(),
             zero_copy_reads_total: constellation_frontend_fuse::stats::zero_copy_reads_total(),
+            lock_wait_downgrades_total:
+                constellation_frontend_fuse::stats::lock_wait_downgrades_total(),
         }
     }
 

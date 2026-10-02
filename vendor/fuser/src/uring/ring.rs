@@ -250,6 +250,10 @@ pub(crate) struct Ring {
     /// instead of two, which the kernel refuses with `EINVAL` before it records anything
     /// (`fuse_uring_get_iovec_from_sqe`). Set only through `Config::io_uring_malformed_register`.
     malformed_register: std::sync::atomic::AtomicBool,
+    /// CONSTELLATION PATCH (io-uring): told about every lock-wait budget downgrade
+    /// (`HeldRequest::downgrade_lock_wait`). Set only through
+    /// `Config::io_uring_lock_wait_downgrades`, before any request is served.
+    lock_wait_downgrades: OnceLock<super::LockWaitDowngrades>,
     #[cfg(test)]
     hooks: test::RingHooks,
 }
@@ -810,6 +814,9 @@ impl HeldRequest {
             .entry()
             .lock_downgraded
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(hook) = self.commit.ring.lock_wait_downgrades.get() {
+            hook.notify();
+        }
     }
 }
 
@@ -1036,6 +1043,7 @@ impl Ring {
             entries,
             mem: ManuallyDrop::new(mem),
             malformed_register: std::sync::atomic::AtomicBool::new(false),
+            lock_wait_downgrades: OnceLock::new(),
             #[cfg(test)]
             hooks: test::RingHooks::default(),
         }))
@@ -1095,6 +1103,11 @@ impl Ring {
     pub(crate) fn set_malformed_register(&self) {
         self.malformed_register
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see `Ring::lock_wait_downgrades`.
+    pub(crate) fn set_lock_wait_downgrades(&self, hook: super::LockWaitDowngrades) {
+        let _ = self.lock_wait_downgrades.set(hook);
     }
 
     fn commit_sqe(&self, e: &RingEntry, commit_id: u64) -> squeue::Entry128 {

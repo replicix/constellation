@@ -61,7 +61,7 @@ use crate::passthrough::{
     reason, PassthroughHandoff, PassthroughPolicy, PassthroughState, PassthroughWish,
     PASSTHROUGH_ENV,
 };
-use crate::stats::SessionStats;
+use crate::stats::{Handshake, LockWaitCounter, SessionStats};
 use constellation_types::Code;
 use constellation_vfs::{Blocking, Caller, FrontendCaps, Observer, OpCtx, OpKind, Vfs};
 use fuser::{NegotiatedInit, Transport};
@@ -73,27 +73,56 @@ use std::time::Duration;
 /// Which transport a mount asks the kernel to serve it over (plan 38
 /// §3(e)). A *policy*, not an outcome: what the connection ended up on is
 /// [`FuseSession::transport`], runtime-negotiated.
+///
+/// # Cluster locks and the ring (plan 38 Z2c)
+///
+/// Over a ring every request holds its queue entry until it is answered,
+/// and the kernel queues a CPU's requests behind that CPU's queue only. A
+/// blocking lock request (`F_SETLKW`, a blocking `flock`) handed to the
+/// view's `lock-wait` thread therefore holds an entry for as long as the
+/// lock is contended, which `/dev/fuse` never does. The vendored fuser
+/// keeps one entry of every queue free by serving a blocking lock request
+/// past `depth - 1` waiters on one queue as a non-blocking one — granted
+/// if free, `ENOLCK` if contended (`RingCommit::reserve_lock_wait`) —
+/// which removes the deadlock and replaces it with an error that
+/// `/dev/fuse` mounts never return. The maintainer's decision
+/// (2026-10-02): [`Self::Auto`] keeps a mount whose frontend forwards
+/// locks to the cluster ([`FrontendCaps::cluster_locks`], the default
+/// with P2P) on `/dev/fuse`, recorded as a `cluster_locks` fallback;
+/// [`Self::Uring`] is the explicit opt-in that puts such a mount on the
+/// ring anyway, with a deeper queue ([`CLUSTER_LOCKS_URING_QUEUE_DEPTH`])
+/// and every downgrade counted (`lock_wait_downgrades`). To be revisited
+/// after plan 38 Z4's zero-copy numbers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TransportPolicy {
     /// Run plan 38 §2.4's ladder: FUSE-over-io_uring when this build
     /// carries the `io-uring` feature and the kernel and the process both
     /// grant it, `/dev/fuse` `writev` whenever anything in that chain
     /// says no. Every refusal is a logged, observable downgrade, never a
-    /// mount failure.
-    Auto,
-    /// `/dev/fuse` `read`/`writev`, on every kernel and every platform.
-    /// The default for **every** mount at plan 38 Z1 (Z2c is what flips
-    /// plain mounts to [`Self::Auto`]), and permanently the only policy a
-    /// handover-capable session may have ([`MountOptions::handover_capable`]).
+    /// mount failure. A mount with cluster locks stays on `/dev/fuse`
+    /// (see the type's doc). The default for a plain mount since plan 38
+    /// Z2c.
     #[default]
+    Auto,
+    /// [`Self::Auto`], and a mount with cluster locks takes the ring too,
+    /// accepting the per-queue lock-wait budget: at most `depth - 1`
+    /// blocking lock requests of one CPU wait at a time, and a further
+    /// contended one is answered `ENOLCK`.
+    Uring,
+    /// `/dev/fuse` `read`/`writev`, on every kernel and every platform:
+    /// the only policy a handover-capable session may have
+    /// ([`MountOptions::handover_capable`]), and the mobile profile's
+    /// default.
     DevFuse,
 }
 
 impl TransportPolicy {
-    /// `auto` / `dev-fuse`, as the knob and the CLI flag spell them.
+    /// `auto` / `uring` / `dev-fuse`, as the knob and the CLI flag spell
+    /// them.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
+            "uring" => Some(Self::Uring),
             "dev-fuse" | "dev_fuse" => Some(Self::DevFuse),
             _ => None,
         }
@@ -102,8 +131,14 @@ impl TransportPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Uring => "uring",
             Self::DevFuse => "dev-fuse",
         }
+    }
+
+    /// Whether this policy asks for the ring at all (for some mounts).
+    pub fn asks_for_ring(self) -> bool {
+        self != Self::DevFuse
     }
 }
 
@@ -124,19 +159,35 @@ pub const URING_QUEUE_DEPTH_ENV: &str = "CONSTELLATION_FUSE_URING_QUEUE_DEPTH";
 /// two numbers an operator who has measured their own trade-off turns.
 pub const DEFAULT_URING_QUEUE_DEPTH: usize = 8;
 
+/// Ring entries per kernel queue for a mount with cluster locks that
+/// [`TransportPolicy::Uring`] put on the ring (plan 38 Z2c), unless
+/// `--fuse-uring-queue-depth` says otherwise. The lock-wait budget is
+/// `depth - 1` blocked lock waiters per CPU, so 32 lets 31 processes of
+/// one CPU wait for contended locks at once before the next is answered
+/// `ENOLCK`, where 8 lets 7. The price is reserved address space —
+/// `possible CPUs x depth x (max_write + a page)`, `MAP_NORESERVE` and
+/// resident only as far as traffic touches it (Z1's measurement: 0 MiB
+/// idle, 3.2 MiB after a workload, at depth 8) — so four times the
+/// default's reservation and no resident memory of its own; Z2c's
+/// measurement is in `docs/plans/v1/PROGRESS.md`, "Plan 38 Z2".
+pub const CLUSTER_LOCKS_URING_QUEUE_DEPTH: usize = 32;
+
 /// The transport knob, resolved once (plan 38 §4): what a *plain* mount
 /// of this host asks for. A handover-capable session ignores it
 /// ([`MountOptions::handover_capable`]).
 ///
-/// [`Default`] is the shipped default — `dev-fuse`, depth 8 — and reads
-/// no environment, so a test or a library embedder gets today's transport
-/// without a knob in sight. The daemon calls [`Self::resolve`] once,
-/// before it forks, and carries the answer to every mount it makes.
+/// [`Default`] is the shipped default — `auto`, the queue depth chosen
+/// per mount — and reads no environment. The daemon calls
+/// [`Self::resolve`] once, before it forks, and carries the answer to
+/// every mount it makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportConfig {
     pub policy: TransportPolicy,
-    /// `io_uring_queue_depth`: ignored unless `policy` resolves to a ring.
-    pub uring_queue_depth: usize,
+    /// `io_uring_queue_depth`, read only when a mount resolves to a ring.
+    /// `None`: [`DEFAULT_URING_QUEUE_DEPTH`], or
+    /// [`CLUSTER_LOCKS_URING_QUEUE_DEPTH`] for a mount with cluster locks
+    /// that [`TransportPolicy::Uring`] put on the ring.
+    pub uring_queue_depth: Option<usize>,
     /// Plan 38 Z3b: which mounts ask for FUSE passthrough — by default the
     /// read-only ones ([`PassthroughPolicy`]; [`PASSTHROUGH_ENV`];
     /// [`Self::with_cache_verify_always`]). Independent of `policy`:
@@ -148,7 +199,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             policy: TransportPolicy::default(),
-            uring_queue_depth: DEFAULT_URING_QUEUE_DEPTH,
+            uring_queue_depth: None,
             passthrough: PassthroughPolicy::platform_default(),
         }
     }
@@ -158,7 +209,8 @@ impl TransportConfig {
     /// [`CONSTELLATION_FUSE_TRANSPORT`](TRANSPORT_ENV) /
     /// [`CONSTELLATION_FUSE_URING_QUEUE_DEPTH`](URING_QUEUE_DEPTH_ENV),
     /// else the `--fuse-transport` / `--fuse-uring-queue-depth` flags,
-    /// else the default.
+    /// else `default` (the engine profile's: `auto`, or `dev-fuse` under
+    /// the mobile profile) and the per-mount depth.
     ///
     /// The env wins over the flag, as `CONSTELLATION_PROFILE` wins over
     /// the profile its caller passes and `CONSTELLATION_CACHE_VERIFY`
@@ -175,8 +227,14 @@ impl TransportConfig {
     pub fn resolve(
         policy: Option<TransportPolicy>,
         uring_queue_depth: Option<usize>,
+        default: TransportPolicy,
     ) -> Result<Self, String> {
-        Self::resolve_from(|key| std::env::var(key).ok(), policy, uring_queue_depth)
+        Self::resolve_from(
+            |key| std::env::var(key).ok(),
+            policy,
+            uring_queue_depth,
+            default,
+        )
     }
 
     /// [`Self::resolve`] over any variable source (tests).
@@ -184,6 +242,7 @@ impl TransportConfig {
         var: impl Fn(&str) -> Option<String>,
         policy: Option<TransportPolicy>,
         uring_queue_depth: Option<usize>,
+        default: TransportPolicy,
     ) -> Result<Self, String> {
         let get = |key: &str| {
             var(key)
@@ -191,20 +250,18 @@ impl TransportConfig {
                 .filter(|v| !v.is_empty())
         };
         let policy = match get(TRANSPORT_ENV) {
-            Some(raw) => TransportPolicy::parse(&raw)
-                .ok_or_else(|| format!("{TRANSPORT_ENV}={raw}: expected auto or dev-fuse"))?,
-            None => policy.unwrap_or_default(),
+            Some(raw) => TransportPolicy::parse(&raw).ok_or_else(|| {
+                format!("{TRANSPORT_ENV}={raw}: expected auto, uring or dev-fuse")
+            })?,
+            None => policy.unwrap_or(default),
         };
-        let depth = match get(URING_QUEUE_DEPTH_ENV) {
-            Some(raw) => raw
-                .parse::<usize>()
-                .ok()
-                .filter(|d| *d > 0)
-                .ok_or_else(|| {
-                    format!("{URING_QUEUE_DEPTH_ENV}={raw}: expected a positive integer")
-                })?,
-            None => uring_queue_depth.unwrap_or(DEFAULT_URING_QUEUE_DEPTH),
-        };
+        let depth =
+            match get(URING_QUEUE_DEPTH_ENV) {
+                Some(raw) => Some(raw.parse::<usize>().ok().filter(|d| *d > 0).ok_or_else(
+                    || format!("{URING_QUEUE_DEPTH_ENV}={raw}: expected a positive integer"),
+                )?),
+                None => uring_queue_depth,
+            };
         // `CONSTELLATION_FUSE_PASSTHROUGH`: unset is the default (read-only
         // mounts only); `1` opts writable mounts in too, `ETXTBSY` caveat
         // and all (the `passthrough` module doc); `0` turns it off. An
@@ -276,9 +333,9 @@ pub struct MountOptions {
     /// pinned session that was asked for `Auto` took a fallback, and
     /// `node.status` says so (plan 38 §2.4, [`crate::stats`]).
     asked: TransportPolicy,
-    /// `io_uring_queue_depth`, read only when `transport` resolves to a
-    /// ring.
-    uring_queue_depth: usize,
+    /// `io_uring_queue_depth` when set explicitly, read only when
+    /// `transport` resolves to a ring ([`TransportConfig::uring_queue_depth`]).
+    uring_queue_depth: Option<usize>,
     /// This session may be detached and resumed in another process image,
     /// so `transport` is pinned.
     handover: bool,
@@ -336,9 +393,11 @@ impl MountOptions {
     /// again, so `detach` refuses it outright and there is nothing to
     /// hand over).
     ///
-    /// A `cfg` asking for [`TransportPolicy::Auto`] is logged at info, not
-    /// refused: the knob is host-wide, and a host that wants the ring for
-    /// its plain mounts must not fail to mount the ones it can upgrade.
+    /// A `cfg` asking for the ring is not refused: the knob is host-wide,
+    /// and a host that wants the ring for its plain mounts must not fail
+    /// to mount the ones it can upgrade. The session records the pin as a
+    /// `handover_capable` fallback where the ring would otherwise have
+    /// been granted ([`crate::stats`]).
     pub fn handover_capable(
         fs_name: impl Into<String>,
         n_threads: usize,
@@ -346,17 +405,10 @@ impl MountOptions {
         cfg: TransportConfig,
         _: HandoverCapable,
     ) -> Self {
-        let fs_name = fs_name.into();
-        if cfg.policy != TransportPolicy::DevFuse {
-            tracing::info!(
-                fs_name = %fs_name,
-                asked = %cfg.policy,
-                env = TRANSPORT_ENV,
-                "this session can be handed to another process image, so it is served over \
-                 /dev/fuse whatever the transport knob asks for (a ring session cannot be \
-                 detached)"
-            );
-        }
+        // Not logged here: the mount records the pin as its fallback
+        // (`handover_capable`, `crate::stats`) and the daemon logs that
+        // record once per mount, so a line here would be a second report of
+        // the same downgrade.
         Self {
             transport: TransportPolicy::DevFuse,
             handover: true,
@@ -385,9 +437,34 @@ impl MountOptions {
         self.transport
     }
 
-    /// Ring entries per kernel queue, when the ring is what it gets.
-    pub fn uring_queue_depth(&self) -> usize {
+    /// Ring entries per kernel queue an explicit setting asked for
+    /// (`None`: chosen per mount, [`TransportConfig::uring_queue_depth`]).
+    pub fn uring_queue_depth(&self) -> Option<usize> {
         self.uring_queue_depth
+    }
+
+    /// What a mount with these options and `caps` asks fuser for (plan 38
+    /// §2.4 and Z2c's cluster-lock rule, [`TransportPolicy`]'s doc). Pure:
+    /// the build rung is `feature`, so every case is testable on any host.
+    fn plan(&self, caps: &FrontendCaps, feature: bool) -> TransportPlan {
+        let cluster_locks = caps.cluster_locks;
+        let wanted = match self.transport {
+            TransportPolicy::DevFuse => false,
+            TransportPolicy::Auto => !cluster_locks,
+            TransportPolicy::Uring => true,
+        };
+        let depth = self.uring_queue_depth.unwrap_or(
+            if cluster_locks && self.transport == TransportPolicy::Uring {
+                CLUSTER_LOCKS_URING_QUEUE_DEPTH
+            } else {
+                DEFAULT_URING_QUEUE_DEPTH
+            },
+        );
+        TransportPlan {
+            ring: wanted && feature,
+            depth,
+            held_back_for_locks: self.asked == TransportPolicy::Auto && cluster_locks,
+        }
     }
 
     /// Whether this session may be handed to another process image.
@@ -403,7 +480,11 @@ impl MountOptions {
         MountSource::Path(mountpoint.to_path_buf(), opts)
     }
 
-    fn config(&self) -> fuser::Config {
+    /// The fuser configuration a mount with `plan` (from [`Self::plan`])
+    /// starts with; `lock_waits` counts the ring's lock-wait downgrades.
+    fn config(&self, plan: TransportPlan, lock_waits: &LockWaitCounter) -> fuser::Config {
+        #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+        let _ = lock_waits;
         let mut config = fuser::Config::default();
         config.acl = if self.allow_other {
             fuser::SessionACL::All
@@ -412,34 +493,49 @@ impl MountOptions {
         };
         config.n_threads = Some(self.n_threads.max(1));
         config.clone_fd = cfg!(target_os = "linux") && config.n_threads != Some(1);
-        config.io_uring_queue_depth = self.uring_queue_depth.clamp(1, u32::MAX as usize) as u32;
+        config.io_uring_queue_depth = plan.depth.clamp(1, u32::MAX as usize) as u32;
         // One ring per worker thread, the kernel's per-CPU queues
         // partitioned across them (plan 38 §3(a)/§4): fuser sizes the set
         // from `n_threads`, not from the CPU count the kernel would
         // otherwise give a ring each. `clone_fd` is ignored when the ring
         // is active -- the ring's own per-worker queues are what it
         // exists for -- and fuser logs that once.
-        if self.transport == TransportPolicy::Auto {
-            if cfg!(feature = "io-uring") {
-                config.io_uring = true;
-                #[cfg(all(feature = "io-uring", target_os = "linux"))]
-                {
-                    config.io_uring_malformed_register = uring_fault_malformed_register();
-                }
-            } else {
-                // A ladder that degrades: asking for a transport this
-                // build cannot speak is a downgrade, not a mount failure
-                // (fuser's own `Config::io_uring` would refuse the mount).
-                // Logged once per mount, as every other rung's refusal is
-                // (plan 38 §2.4).
-                tracing::warn!(
-                    fs_name = %self.fs_name,
-                    "transport auto, but this build has no io-uring feature; using /dev/fuse"
-                );
+        if plan.ring {
+            config.io_uring = true;
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            {
+                config.io_uring_malformed_register = uring_fault_malformed_register();
+                config.io_uring_lock_wait_downgrades = Some(lock_waits.hook());
             }
+        } else if !cfg!(feature = "io-uring")
+            && self.transport.asks_for_ring()
+            && !plan.held_back_for_locks
+        {
+            // A ladder that degrades: asking for a transport this build
+            // cannot speak is a downgrade, not a mount failure (fuser's own
+            // `Config::io_uring` would refuse the mount). Logged once per
+            // mount, as every other rung's refusal is (plan 38 §2.4).
+            tracing::warn!(
+                fs_name = %self.fs_name,
+                transport = %self.transport,
+                "the ring was asked for, but this build has no io-uring feature; using /dev/fuse"
+            );
         }
         config
     }
+}
+
+/// What a mount asks fuser for ([`MountOptions::plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransportPlan {
+    /// Ask for the ring (the build has it and the policy wants it for
+    /// this mount).
+    ring: bool,
+    /// `io_uring_queue_depth`, when `ring`.
+    depth: usize,
+    /// [`TransportPolicy::Auto`] kept this mount off the ring because its
+    /// frontend has cluster locks: the session's `cluster_locks` fallback.
+    held_back_for_locks: bool,
 }
 
 /// `CONSTELLATION_FUSE_URING_FAULT=malformed-register`: **fault injection,
@@ -663,7 +759,9 @@ pub fn mount_source<V: Vfs>(
     opts: &MountOptions,
     caps: FrontendCaps,
 ) -> std::io::Result<FuseSession<V>> {
-    let config = opts.config();
+    let plan = opts.plan(&caps, cfg!(feature = "io-uring"));
+    let lock_waits = LockWaitCounter::default();
+    let config = opts.config(plan, &lock_waits);
     match source {
         MountSource::PreopenedFd(fd) => {
             // Somebody else holds this connection and may want it handed
@@ -690,6 +788,8 @@ pub fn mount_source<V: Vfs>(
                 passthrough,
                 &caps,
                 opts,
+                plan,
+                lock_waits,
                 view,
                 config,
                 None,
@@ -703,6 +803,8 @@ pub fn mount_source<V: Vfs>(
                 &mountpoint,
                 &kernel,
                 opts,
+                plan,
+                &lock_waits,
                 caps.clone(),
                 config.clone(),
             ) {
@@ -723,7 +825,16 @@ pub fn mount_source<V: Vfs>(
                     );
                     let mut config = config;
                     config.io_uring = false;
-                    mount_path(&view, &mountpoint, &kernel, opts, caps, config)
+                    mount_path(
+                        &view,
+                        &mountpoint,
+                        &kernel,
+                        opts,
+                        plan,
+                        &lock_waits,
+                        caps,
+                        config,
+                    )
                 }
                 other => other,
             }
@@ -767,11 +878,14 @@ fn share_fd_without_a_device(config: &mut fuser::Config) {
 }
 
 /// One attempt at mounting `view` at `mountpoint` with `config`.
+#[allow(clippy::too_many_arguments)]
 fn mount_path<V: Vfs>(
     view: &Arc<V>,
     mountpoint: &Path,
     kernel: &constellation_platform::MountOpts,
     opts: &MountOptions,
+    plan: TransportPlan,
+    lock_waits: &LockWaitCounter,
     caps: FrontendCaps,
     config: fuser::Config,
 ) -> std::io::Result<FuseSession<V>> {
@@ -797,6 +911,8 @@ fn mount_path<V: Vfs>(
             passthrough,
             &declared,
             opts,
+            plan,
+            lock_waits.clone(),
             view.clone(),
             config,
             Some(mountpoint.to_path_buf()),
@@ -825,6 +941,8 @@ fn mount_path<V: Vfs>(
         passthrough,
         &declared,
         opts,
+        plan,
+        lock_waits.clone(),
         view.clone(),
         config,
         Some(mountpoint.to_path_buf()),
@@ -873,6 +991,8 @@ impl<V: Vfs> FuseSession<V> {
         passthrough: Arc<PassthroughState>,
         caps: &FrontendCaps,
         opts: &MountOptions,
+        plan: TransportPlan,
+        lock_waits: LockWaitCounter,
         vfs: Arc<V>,
         config: fuser::Config,
         mountpoint: Option<PathBuf>,
@@ -884,14 +1004,6 @@ impl<V: Vfs> FuseSession<V> {
         // `/dev/fuse` (plan 38 §3(e), Z0a). fuser refuses to arm one, so
         // ask it only for the transport that can be.
         let transport = session.transport();
-        let stats = Arc::new(SessionStats::at_handshake(
-            opts.asked,
-            opts.handover,
-            session.negotiated_init().as_ref(),
-            transport,
-            opts.uring_queue_depth,
-            passthrough.clone(),
-        ));
         let _ = observer.set(Observer::new(
             crate::adapter::FRONTEND,
             &vfs.identity(),
@@ -906,6 +1018,20 @@ impl<V: Vfs> FuseSession<V> {
             );
             None
         };
+        // Recorded (and a fallback counted) only once nothing here can fail
+        // any more: a session that never serves took no fallback.
+        let stats = Arc::new(SessionStats::at_handshake(
+            Handshake {
+                asked: opts.asked,
+                pinned: opts.handover,
+                held_back_for_locks: plan.held_back_for_locks,
+                init: session.negotiated_init().as_ref(),
+                negotiated: transport,
+                uring_queue_depth: plan.depth,
+            },
+            lock_waits,
+            passthrough.clone(),
+        ));
         let gate = NotifyGate::new(session.notifier());
         // The backing-id ioctls go to the connection; a duplicate of the
         // session's descriptor is the same connection, usable from any
@@ -963,7 +1089,9 @@ impl<V: Vfs> FuseSession<V> {
         caps: FrontendCaps,
         sink: Option<&FuseNotifySink>,
     ) -> std::io::Result<FuseSession<V>> {
-        let mut config = opts.config();
+        let plan = opts.plan(&caps, cfg!(feature = "io-uring"));
+        let lock_waits = LockWaitCounter::default();
+        let mut config = opts.config(plan, &lock_waits);
         // A resumed connection is `/dev/fuse` -- `check_resumable` refuses
         // anything else -- and there is no handshake here to create rings
         // in, so asking for the ring would be silently ignored. Clear it
@@ -1015,6 +1143,8 @@ impl<V: Vfs> FuseSession<V> {
             passthrough,
             &caps,
             opts,
+            plan,
+            lock_waits,
             view,
             config,
             handoff.mountpoint,
@@ -1416,57 +1546,76 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         };
-        // Nothing set anywhere: the shipped default (plan 38 Z1 leaves
-        // every mount on `/dev/fuse`; Z2c is what flips plain mounts).
-        let cfg = TransportConfig::resolve_from(none, None, None).unwrap();
-        assert_eq!(cfg.policy, TransportPolicy::DevFuse);
-        assert_eq!(cfg.uring_queue_depth, DEFAULT_URING_QUEUE_DEPTH);
-        // The flag alone.
-        let cfg =
-            TransportConfig::resolve_from(none, Some(TransportPolicy::Auto), Some(4)).unwrap();
+        let auto = TransportPolicy::Auto;
+        // Nothing set anywhere: the profile's default (plan 38 Z2c: `auto`
+        // for a plain mount, `dev-fuse` under the mobile profile), and the
+        // queue depth left to each mount.
+        let cfg = TransportConfig::resolve_from(none, None, None, auto).unwrap();
+        assert_eq!(cfg, TransportConfig::default());
         assert_eq!(cfg.policy, TransportPolicy::Auto);
-        assert_eq!(cfg.uring_queue_depth, 4);
+        assert_eq!(cfg.uring_queue_depth, None);
+        let cfg =
+            TransportConfig::resolve_from(none, None, None, TransportPolicy::DevFuse).unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::DevFuse);
+        // The flag alone, over the profile's default.
+        let cfg = TransportConfig::resolve_from(
+            none,
+            Some(TransportPolicy::Uring),
+            Some(4),
+            TransportPolicy::DevFuse,
+        )
+        .unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::Uring);
+        assert_eq!(cfg.uring_queue_depth, Some(4));
         // The env over the flag, either way round, and tolerant of
         // whitespace and case as the other knobs' parsers are.
         let cfg = TransportConfig::resolve_from(
             var(&[(TRANSPORT_ENV, " AUTO "), (URING_QUEUE_DEPTH_ENV, "16")]),
             Some(TransportPolicy::DevFuse),
             Some(4),
+            TransportPolicy::DevFuse,
         )
         .unwrap();
         assert_eq!(cfg.policy, TransportPolicy::Auto);
-        assert_eq!(cfg.uring_queue_depth, 16);
+        assert_eq!(cfg.uring_queue_depth, Some(16));
         let cfg = TransportConfig::resolve_from(
             var(&[(TRANSPORT_ENV, "dev_fuse")]),
             Some(TransportPolicy::Auto),
             None,
+            auto,
         )
         .unwrap();
         assert_eq!(cfg.policy, TransportPolicy::DevFuse);
+        let cfg = TransportConfig::resolve_from(
+            var(&[(TRANSPORT_ENV, "Uring")]),
+            None,
+            None,
+            TransportPolicy::DevFuse,
+        )
+        .unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::Uring);
         // An empty value is "unset", not a parse error: an exported but
         // empty variable is what a shell leaves behind.
         let cfg = TransportConfig::resolve_from(
             var(&[(TRANSPORT_ENV, "  ")]),
-            Some(TransportPolicy::Auto),
+            Some(TransportPolicy::DevFuse),
             None,
+            auto,
         )
         .unwrap();
-        assert_eq!(cfg.policy, TransportPolicy::Auto);
+        assert_eq!(cfg.policy, TransportPolicy::DevFuse);
         // Unparseable is an error, not a silent `dev-fuse` (see
         // `TransportConfig::resolve`'s doc for why this knob differs from
         // `--cache-verify`).
-        let err = TransportConfig::resolve_from(var(&[(TRANSPORT_ENV, "uring")]), None, None)
+        let err = TransportConfig::resolve_from(var(&[(TRANSPORT_ENV, "ring")]), None, None, auto)
             .expect_err("an unknown transport must be refused");
-        assert!(
-            err.contains(TRANSPORT_ENV) && err.contains("uring"),
-            "{err}"
-        );
+        assert!(err.contains(TRANSPORT_ENV) && err.contains("ring"), "{err}");
         for bad in [
             &[(URING_QUEUE_DEPTH_ENV, "0")],
             &[(URING_QUEUE_DEPTH_ENV, "-1")],
             &[(URING_QUEUE_DEPTH_ENV, "lots")],
         ] {
-            let err = TransportConfig::resolve_from(var(bad), None, None)
+            let err = TransportConfig::resolve_from(var(bad), None, None, auto)
                 .expect_err("a non-positive queue depth must be refused");
             assert!(err.contains(URING_QUEUE_DEPTH_ENV), "{err}");
         }
@@ -1489,7 +1638,8 @@ mod tests {
         // By default (Linux) only a read-only mount asks — plain or
         // handover-capable alike; a writable one says why it does not
         // (review 38-z3b must-fix 1: `open(O_RDWR)` would meet ETXTBSY).
-        let cfg = TransportConfig::resolve_from(none, None, None).unwrap();
+        let cfg =
+            TransportConfig::resolve_from(none, None, None, TransportPolicy::default()).unwrap();
         assert_eq!(cfg.passthrough, PassthroughPolicy::ReadOnlyMounts);
         let mut plain = MountOptions::new("p", 2, tuning, cfg);
         assert_eq!(
@@ -1506,8 +1656,13 @@ mod tests {
         pinned.read_only = true;
         assert_eq!(pinned.passthrough_wish(), PassthroughWish::On);
         // `1` opts writable mounts in; the mount option says the same.
-        let cfg =
-            TransportConfig::resolve_from(var(&[(PASSTHROUGH_ENV, "1")]), None, None).unwrap();
+        let cfg = TransportConfig::resolve_from(
+            var(&[(PASSTHROUGH_ENV, "1")]),
+            None,
+            None,
+            TransportPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(cfg.passthrough, PassthroughPolicy::On);
         let opted = MountOptions::new("p", 2, tuning, cfg);
         assert_eq!(opted.passthrough_wish(), PassthroughWish::On);
@@ -1515,7 +1670,7 @@ mod tests {
             "p",
             2,
             tuning,
-            TransportConfig::resolve_from(none, None, None).unwrap(),
+            TransportConfig::resolve_from(none, None, None, TransportPolicy::default()).unwrap(),
         );
         by_option.passthrough = PassthroughPolicy::On;
         assert_eq!(by_option.passthrough_wish(), PassthroughWish::On);
@@ -1523,7 +1678,9 @@ mod tests {
         for off in ["0", "off", " FALSE "] {
             let pairs: &'static [(&'static str, &'static str)] =
                 Box::leak(Box::new([(PASSTHROUGH_ENV, off)]));
-            let cfg = TransportConfig::resolve_from(var(pairs), None, None).unwrap();
+            let cfg =
+                TransportConfig::resolve_from(var(pairs), None, None, TransportPolicy::default())
+                    .unwrap();
             assert_eq!(
                 cfg.passthrough,
                 PassthroughPolicy::Off(reason::DISABLED),
@@ -1536,14 +1693,24 @@ mod tests {
                 PassthroughWish::Off(reason::DISABLED)
             );
         }
-        let err = TransportConfig::resolve_from(var(&[(PASSTHROUGH_ENV, "maybe")]), None, None)
-            .expect_err("an unknown value must be refused");
+        let err = TransportConfig::resolve_from(
+            var(&[(PASSTHROUGH_ENV, "maybe")]),
+            None,
+            None,
+            TransportPolicy::default(),
+        )
+        .expect_err("an unknown value must be refused");
         assert!(err.contains(PASSTHROUGH_ENV), "{err}");
         // `--cache-verify always` forces it off, whatever the env said,
         // and says why.
-        let cfg = TransportConfig::resolve_from(var(&[(PASSTHROUGH_ENV, "1")]), None, None)
-            .unwrap()
-            .with_cache_verify_always();
+        let cfg = TransportConfig::resolve_from(
+            var(&[(PASSTHROUGH_ENV, "1")]),
+            None,
+            None,
+            TransportPolicy::default(),
+        )
+        .unwrap()
+        .with_cache_verify_always();
         let mut opts = MountOptions::new("p", 2, tuning, cfg);
         opts.read_only = true;
         assert_eq!(
@@ -1580,15 +1747,33 @@ mod tests {
     /// the constructor that takes the marker, and it pins `dev-fuse`.
     #[test]
     fn a_handover_capable_session_ignores_the_knob() {
+        for policy in [TransportPolicy::Auto, TransportPolicy::Uring] {
+            let asked = TransportConfig {
+                policy,
+                uring_queue_depth: Some(4),
+                ..TransportConfig::default()
+            };
+            let pinned = MountOptions::handover_capable(
+                "pinned",
+                2,
+                KernelTuning::for_workers(2),
+                asked,
+                HandoverCapable,
+            );
+            assert_eq!(pinned.transport(), TransportPolicy::DevFuse);
+            for caps in [crate::caps(false), crate::caps(true)] {
+                assert!(!pinned.plan(&caps, true).ring, "{policy} {caps:?}");
+            }
+        }
         let asked = TransportConfig {
             policy: TransportPolicy::Auto,
-            uring_queue_depth: 4,
+            uring_queue_depth: Some(4),
             ..TransportConfig::default()
         };
         let plain = MountOptions::new("plain", 2, KernelTuning::for_workers(2), asked);
         assert_eq!(plain.transport(), TransportPolicy::Auto);
         assert!(!plain.is_handover_capable());
-        assert_eq!(plain.uring_queue_depth(), 4);
+        assert_eq!(plain.uring_queue_depth(), Some(4));
 
         let pinned = MountOptions::handover_capable(
             "pinned",
@@ -1620,15 +1805,62 @@ mod tests {
             KernelTuning::for_workers(2),
             TransportConfig {
                 policy: TransportPolicy::Auto,
-                uring_queue_depth: 3,
+                uring_queue_depth: Some(3),
                 ..TransportConfig::default()
             },
         );
-        let config = auto.config();
+        let plan = auto.plan(&crate::caps(false), cfg!(feature = "io-uring"));
+        let config = auto.config(plan, &LockWaitCounter::default());
         assert_eq!(config.io_uring, cfg!(feature = "io-uring"));
         assert_eq!(config.io_uring_queue_depth, 3);
-        let dev = auto.with_transport(TransportPolicy::DevFuse).config();
-        assert!(!dev.io_uring);
+        let dev = auto.with_transport(TransportPolicy::DevFuse);
+        let plan = dev.plan(&crate::caps(false), cfg!(feature = "io-uring"));
+        assert!(!dev.config(plan, &LockWaitCounter::default()).io_uring);
+    }
+
+    /// Plan 38 Z2c, the maintainer's decision: under `auto` a mount with
+    /// cluster locks stays on `/dev/fuse` (and says so as its fallback);
+    /// `uring` puts it on the ring with the deeper queue; an explicit
+    /// depth wins over both defaults; a mount with local locks gets the
+    /// ring under either policy at the ordinary depth.
+    #[test]
+    fn auto_keeps_cluster_lock_mounts_on_dev_fuse_and_uring_opts_in() {
+        let opts = |policy, depth| {
+            MountOptions::new(
+                "z2c",
+                2,
+                KernelTuning::for_workers(2),
+                TransportConfig {
+                    policy,
+                    uring_queue_depth: depth,
+                    ..TransportConfig::default()
+                },
+            )
+        };
+        let (local, cluster) = (crate::caps(false), crate::caps(true));
+        let plan = |o: &MountOptions, caps| o.plan(caps, true);
+        let p = |ring, depth, held| TransportPlan {
+            ring,
+            depth,
+            held_back_for_locks: held,
+        };
+        let d = DEFAULT_URING_QUEUE_DEPTH;
+        let deep = CLUSTER_LOCKS_URING_QUEUE_DEPTH;
+        let auto = opts(TransportPolicy::Auto, None);
+        assert_eq!(plan(&auto, &local), p(true, d, false));
+        assert_eq!(plan(&auto, &cluster), p(false, d, true));
+        let uring = opts(TransportPolicy::Uring, None);
+        assert_eq!(plan(&uring, &local), p(true, d, false));
+        assert_eq!(plan(&uring, &cluster), p(true, deep, false));
+        let explicit = opts(TransportPolicy::Uring, Some(4));
+        assert_eq!(plan(&explicit, &cluster), p(true, 4, false));
+        let dev = opts(TransportPolicy::DevFuse, None);
+        assert_eq!(plan(&dev, &cluster), p(false, d, false));
+        // The build rung comes after the policy: no ring without the
+        // feature, and the cluster-lock rule still recorded under `auto`.
+        assert_eq!(auto.plan(&cluster, false), p(false, d, true));
+        assert_eq!(uring.plan(&cluster, false), p(false, deep, false));
+        assert!(deep > d, "the deeper queue is deeper");
     }
 
     fn kernel_available() -> bool {

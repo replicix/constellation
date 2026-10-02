@@ -18,6 +18,8 @@
 //! | | `UnmeteredOnly` | while the host's last `NetworkChanged` said metered, opportunistic chunk uploads hold (closes journal locally, as `--write-mode back` does); explicit durability requests still upload |
 //! | `background` | `Continuous` | GC, prune, digests, registry and designation polls run all the time (paused only while suspended) |
 //! | | `OnDemand` | they also pause while the host is in the background or low on power |
+//! | `fuse_transport` | `Auto` | a Linux FUSE mount of this engine runs plan 38's transport ladder by default (FUSE-over-io_uring where the build, kernel and sandbox grant it) |
+//! | | `DevFuse` | it stays on `/dev/fuse` unless `--fuse-transport`/`CONSTELLATION_FUSE_TRANSPORT` asks otherwise (plan 38 §4/§8: the ring's buffers are not worth their memory on a constrained device) |
 //!
 //! `CONSTELLATION_PROFILE` and its per-field overrides pick a profile for
 //! the daemon ([`EngineProfile::from_env`]).
@@ -127,6 +129,19 @@ pub enum BackgroundMode {
     OnDemand,
 }
 
+/// Which FUSE transport a Linux mount of an engine under this profile asks
+/// for when nothing else says (plan 38 §4): the default the transport knob
+/// (`--fuse-transport`, `CONSTELLATION_FUSE_TRANSPORT`) overrides. Not a
+/// `constellation-frontend-fuse` type, because the engine does not depend
+/// on the frontend; the daemon maps it onto `TransportPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseTransportMode {
+    /// The ladder (`TransportPolicy::Auto`).
+    Auto,
+    /// `/dev/fuse` only (`TransportPolicy::DevFuse`).
+    DevFuse,
+}
+
 /// The host's budgets and modes for one engine (plan 31 §10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineProfile {
@@ -140,6 +155,7 @@ pub struct EngineProfile {
     pub leases: LeaseMode,
     pub uploads: UploadMode,
     pub background: BackgroundMode,
+    pub fuse_transport: FuseTransportMode,
 }
 
 impl EngineProfile {
@@ -154,6 +170,7 @@ impl EngineProfile {
             leases: LeaseMode::Hold,
             uploads: UploadMode::Always,
             background: BackgroundMode::Continuous,
+            fuse_transport: FuseTransportMode::Auto,
         }
     }
 
@@ -174,6 +191,11 @@ impl EngineProfile {
     /// dial-only P2P, forward-only leases, uploads on unmetered networks
     /// only, background work only in the foreground. Budgets are the
     /// host's share until plan 36's A1 tunes them against real devices.
+    /// FUSE mounts stay on `/dev/fuse` (plan 38 §4, §8 "Ring RSS on the
+    /// mobile profile"): Android never reaches the FUSE transport ladder
+    /// (plan 36 serves through SAF), but a constrained Linux device run
+    /// under this profile should not pay for ring buffers its tight memory
+    /// budget says it cannot spare — the operator can still ask for them.
     pub fn mobile() -> Self {
         Self {
             memory_budget: None,
@@ -182,6 +204,7 @@ impl EngineProfile {
             leases: LeaseMode::ForwardOnly,
             uploads: UploadMode::UnmeteredOnly,
             background: BackgroundMode::OnDemand,
+            fuse_transport: FuseTransportMode::DevFuse,
         }
     }
 
@@ -317,6 +340,8 @@ mode_names!(UploadMode, "always or unmetered-only",
     Always => "always", UnmeteredOnly => "unmetered-only");
 mode_names!(BackgroundMode, "continuous or on-demand",
     Continuous => "continuous", OnDemand => "on-demand");
+mode_names!(FuseTransportMode, "auto or dev-fuse",
+    Auto => "auto", DevFuse => "dev-fuse");
 
 impl Default for EngineProfile {
     /// [`EngineProfile::desktop`].
@@ -328,6 +353,31 @@ impl Default for EngineProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 38 Z2c: the ladder by default, except under the mobile
+    /// profile (§4, §8), whose memory budget the ring's buffers would
+    /// compete with.
+    #[test]
+    fn mobile_mounts_stay_on_dev_fuse() {
+        assert_eq!(
+            EngineProfile::desktop().fuse_transport,
+            FuseTransportMode::Auto
+        );
+        assert_eq!(
+            EngineProfile::server(1 << 30, 1 << 30).fuse_transport,
+            FuseTransportMode::Auto
+        );
+        assert_eq!(
+            EngineProfile::mobile().fuse_transport,
+            FuseTransportMode::DevFuse
+        );
+        let picked = EngineProfile::from_vars(EngineProfile::desktop(), |k| {
+            (k == "CONSTELLATION_PROFILE").then(|| "mobile".to_string())
+        })
+        .unwrap();
+        assert_eq!(picked.fuse_transport, FuseTransportMode::DevFuse);
+        assert_eq!(FuseTransportMode::DevFuse.as_str(), "dev-fuse");
+    }
 
     #[test]
     fn server_is_desktop_with_explicit_budgets() {

@@ -1291,6 +1291,33 @@ additions are listed below.
   (c) a deeper default queue (the budget grows with it, at `queues x depth x
   max_write` of reserved address space); or a combination, e.g. (a) with a
   deeper queue only on mounts with cluster locks.
+
+  **Settled (maintainer, 2026-10-02; implemented by Z2c): option (b) now,
+  with a ring opt-in; revisit after Z4.** Under `auto` a mount whose
+  frontend has cluster locks resolves to `/dev/fuse`, recorded as the
+  fallback reason `cluster_locks` (between `kernel_not_offered` and
+  `handover_capable` in the ladder's order: a fallback names the first
+  rung that refused). Mounts with `--locks local` (or no P2P) get the ring
+  under `auto`. `--fuse-transport uring` / `CONSTELLATION_FUSE_TRANSPORT=uring`
+  is the opt-in that puts a cluster-lock mount on the ring anyway, accepting
+  the `depth - 1` budget and its `ENOLCK`, with a deeper default queue for
+  such mounts (`CLUSTER_LOCKS_URING_QUEUE_DEPTH` = 32: 31 contended waiters
+  per CPU instead of 7, for 4x the reserved address space and no measurable
+  resident memory — PROGRESS "Plan 38 Z2"). Every downgrade is counted
+  (`lock_wait_downgrades` per mount and process-wide in `node.status`,
+  `constellation_fuse_lock_wait_downgrades_total`), and the budget is tested
+  on a real kernel (`transport-lock-wait-budget`). The default for
+  cluster-lock mounts is **to be revisited after Z4's zero-copy numbers**:
+  since the harness's and most real daemons run with P2P, `auto` leaves most
+  mounts on `/dev/fuse` until then (PROGRESS "Plan 38 Z2" counts how many).
+  The mobile profile's default is `dev-fuse` (§4, §8). A read-only snapshot
+  mount takes no cluster locks, so `auto` gives it the ring, and Z3's
+  passthrough composes with either transport (the backing id is registered
+  on the connection's `/dev/fuse` descriptor, which a ring session has
+  too; harness `passthrough-on-every-transport`). A `view.mount` with a
+  path — on a daemon or a headless `serve` node, CSI engine pods included —
+  is a plain mount and follows the same policy. The handoff now carries
+  `uring` and a per-mount (absent) queue depth, so `HANDOVER_VERSION` is 6.
 - **Z3 — Passthrough for single-chunk read-only opens.** §3(c)'s
   eligibility rule, the `Opened`/`View::open` extension, the pin-while-open
   `DiskCache` guard, and the scan-ahead/atime move to `open()` land,

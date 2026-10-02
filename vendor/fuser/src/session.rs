@@ -986,7 +986,7 @@ impl<FS: Filesystem> Session<FS> {
         let payload_cap = (config.max_write as usize)
             .max(usize::from(config.max_pages()) * page_size::get())
             .max(8192);
-        RingSet::new(
+        let set = RingSet::new(
             self.ch.device(),
             self.mount.mount.lock().is_some(),
             self.config.n_threads.unwrap_or(1),
@@ -994,7 +994,11 @@ impl<FS: Filesystem> Session<FS> {
             payload_cap,
             self.config.io_uring_kernel.as_ref(),
             self.config.io_uring_malformed_register,
-        )
+        )?;
+        if let Some(hook) = &self.config.io_uring_lock_wait_downgrades {
+            set.set_lock_wait_downgrades(hook);
+        }
+        Ok(set)
     }
 
     /// Unmount the filesystem

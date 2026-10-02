@@ -268,28 +268,25 @@ impl EngineControl {
         self.events.publish(topic, data);
     }
 
-    /// The host's views in the report's shape.
-    pub(crate) fn mount_infos(&self) -> Vec<api::MountInfo> {
+    /// The host's views in the report's shape: `node.status`'s `mounts[]`
+    /// and its `fuse` section (plan 38 §5: the host's per-session transport
+    /// state with the view's own passthrough status, and the host's
+    /// process-wide counters), from **one** `views()` snapshot, so a mount
+    /// added or removed between two calls cannot appear in one list and
+    /// not the other.
+    pub(crate) fn mounts_and_fuse(&self) -> (Vec<api::MountInfo>, api::FuseStatus) {
         let mut views = self.host.views();
         views.sort_by_key(|v| v.id);
-        views
-            .into_iter()
+        let infos = views
+            .iter()
             .map(|v| api::MountInfo {
                 id: v.id,
-                subtree: v.subtree,
+                subtree: v.subtree.clone(),
                 mountpoint: v.mountpoint.display().to_string(),
                 mounted_ms_ago: v.since.elapsed().as_millis() as u64,
-                transport: v.fuse.map(|f| f.transport),
+                transport: v.fuse.as_ref().map(|f| f.transport.clone()),
             })
-            .collect()
-    }
-
-    /// `node.status.fuse` (plan 38 §5): the host's per-session transport
-    /// state — with the view's own passthrough status where the host has
-    /// none — and the host's process-wide counters.
-    pub(crate) fn fuse_status(&self) -> api::FuseStatus {
-        let mut views = self.host.views();
-        views.sort_by_key(|v| v.id);
+            .collect();
         let mounts = views
             .into_iter()
             .filter_map(|v| {
@@ -312,10 +309,13 @@ impl EngineControl {
                 Some(fuse)
             })
             .collect();
-        api::FuseStatus {
-            mounts,
-            ..self.host.fuse_counters()
-        }
+        (
+            infos,
+            api::FuseStatus {
+                mounts,
+                ..self.host.fuse_counters()
+            },
+        )
     }
 
     /// A `ControlVfs` over the service's own whole-filesystem view, as

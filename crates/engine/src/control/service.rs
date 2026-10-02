@@ -136,6 +136,7 @@ impl EngineControl {
     }
 
     pub(crate) fn status(&self) -> api::StatusReport {
+        let (mounts, fuse) = self.mounts_and_fuse();
         let core = self.core.lock().unwrap().clone();
         let stats = core.stats;
         let speculation = (
@@ -234,7 +235,7 @@ impl EngineControl {
             handover: self.host.handover_status(),
             fs_uuid: self.fs_uuid.clone(),
             backend: self.backend.clone(),
-            mounts: self.mount_infos(),
+            mounts,
             node_id: self.node_id,
             version: self.version.clone(),
             enrolled,
@@ -703,7 +704,7 @@ impl EngineControl {
             lifecycle: self.engine.lifecycle().status(),
             s3: backend::s3_request_counts(),
             vfs_ops: super::ops::vfs_ops_status(),
-            fuse: self.fuse_status(),
+            fuse,
         }
     }
 

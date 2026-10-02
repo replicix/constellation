@@ -1932,63 +1932,134 @@ until plan 38's Z1 establishes a runner baseline.
 ## FUSE transport matrix (plan 38 §6)
 
 Constellation serves a Linux mount over one of two transports, chosen at
-mount time and fixed for the connection's life:
+mount time and fixed for the connection's life. Linux builds of the
+`constellation` binary carry the FUSE-over-io_uring transport (the
+`io-uring` cargo feature, on by default for Linux since plan 38 Z2c), so
+which one a mount gets is decided at runtime by the policy and the host:
 
 | `CONSTELLATION_FUSE_TRANSPORT` / `--fuse-transport` | what a mount gets |
 |---|---|
-| `dev-fuse` (**the default**) | `read(2)`/`writev(2)` on `/dev/fuse`: every kernel, every platform |
-| `auto` | plan 38 §2.4's ladder — FUSE-over-io_uring when the binary carries the `io-uring` cargo feature, the kernel is 6.14+ with `fuse.enable_uring=Y`, and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once and reported in `node.status` |
+| `auto` (**the default**; `dev-fuse` under `CONSTELLATION_PROFILE=mobile`) | plan 38 §2.4's ladder — FUSE-over-io_uring when the kernel is 6.14+ with `fuse.enable_uring=Y` and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once and reported in `node.status`. **A mount with cluster locks** (`--locks cluster`, the default with P2P — so almost every harness mount) **stays on `/dev/fuse`**, recorded as a `cluster_locks` fallback |
+| `uring` | the same ladder for every plain mount, cluster-lock ones included, on a deeper queue (32): a contended blocking lock wait past a queue's budget (`depth - 1` waiters per CPU) is answered `ENOLCK` and counted in `lock_wait_downgrades` |
+| `dev-fuse` | `read(2)`/`writev(2)` on `/dev/fuse`: every kernel, every platform |
 
 What a mount *negotiated* is in `node.status`'s per-mount `transport`
 field (`dev_fuse` / `uring` / `uring_zc`) and in the daemon's log
-(`FUSE transport`), so an `auto` mount that fell back is visible rather
-than assumed. Mounts that can be handed to another process image — a
-`view.mount` on a descriptor somebody else opened, and anything
-`daemon --upgrade` resumes — are `dev_fuse` whatever the knob says
-(§3(e): a ring session cannot be detached at all; the constructor that
-builds their `MountOptions` takes a `HandoverCapable` marker and pins it).
+(`FUSE transport`, one line per mount, `(fell back)` with the reason when it
+asked for the ring and did not get it), so an `auto` mount that fell back is
+visible rather than assumed. Mounts that can be handed to another process
+image — a `view.mount` on a descriptor somebody else opened (plan 37's CSI
+pods), and anything `daemon --upgrade` resumes — are `dev_fuse` whatever
+the knob says (§3(e): a ring session cannot be detached at all; the
+constructor that builds their `MountOptions` takes a `HandoverCapable`
+marker and pins it; `node_runtime::mount_options_for` and
+`handover::handover_options` are the two call sites, each with a test).
 
 `tests/transport-matrix.sh` (`make transport-matrix`) runs the read-path
-harness scenarios once per transport, so a transport-specific regression
+harness scenarios once per policy, so a transport-specific regression
 fails one leg instead of everything:
 
 ```bash
-tests/transport-matrix.sh                              # both legs
+tests/transport-matrix.sh                              # dev-fuse, auto, uring
 TRANSPORTS="dev-fuse" tests/transport-matrix.sh        # one leg
 SCENARIOS="cold-cache readahead" tests/transport-matrix.sh
 SCENARIOS=all tests/transport-matrix.sh                # the full matrix per leg
+SCENARIOS=all HARNESS_ARGS="--shard 1/2" tests/transport-matrix.sh
 READ_CPU_GATE=1 tests/transport-matrix.sh              # + the cost gate per leg
 make harness-transport-matrix                          # = SCENARIOS=all
 ```
 
-Each leg exports `CONSTELLATION_FUSE_TRANSPORT` and writes
-`target/transport-matrix/<transport>.json`. **Neither leg ever skips.**
-`make transport-matrix` / `make harness-transport-matrix` build the binaries
-with the ring in; running the script directly needs them built that way:
-
-```bash
-make build-uring     # = cargo build --release --features constellation-frontend-fuse/io-uring
-```
+Each leg exports `CONSTELLATION_FUSE_TRANSPORT`, writes
+`target/transport-matrix/<leg>.json`, and ends with a **census**: every
+daemon the harness started records its mounts' `FUSE transport` lines in
+`target/transport-matrix/<leg>.census.tsv` (`scenario client transport
+reason`, via `CONSTELLATION_HARNESS_TRANSPORT_CENSUS`), and the script
+prints how many mounts got each transport and why the rest fell back. That
+is how a leg says what it actually covered: the `auto` leg is mostly
+`dev_fuse (cluster_locks)` by design, the `uring` leg is the one that puts
+the matrix on the ring. **No leg ever skips.**
 
 On a kernel below 6.14, with `fuse.enable_uring=N`, or under a seccomp
-profile that denies `io_uring_setup`, the `auto` leg runs as a *fallback*
-leg, and still has to pass — that is the ladder's own promise, and the one
-property the lane can check on every host. On a host that **does** grant the
-ring (`fuse.enable_uring=Y`, `kernel.io_uring_disabled=0`) a fallback is a
-failure: the script exports `CONSTELLATION_FUSE_EXPECT_URING=1`, always
-runs `transport-detach-refused`, and that scenario fails if `auto`
-negotiated `dev_fuse` (typically a binary built without the feature).
+profile that denies `io_uring_setup`, the `auto` and `uring` legs run as
+*fallback* legs, and still have to pass — that is the ladder's own promise,
+and the one property the lane can check on every host. On a host that
+**does** grant the ring (`fuse.enable_uring=Y`, `kernel.io_uring_disabled=0`)
+a fallback is a failure: the script exports
+`CONSTELLATION_FUSE_EXPECT_URING=1`, always runs `transport-detach-refused`,
+and that scenario fails if its mount negotiated `dev_fuse`.
 `EXPECT_URING=0|1` overrides the detection.
 
-The `transport-detach-refused` scenario is in the default list and is how
-each leg says what it negotiated (`the mount asked for auto and
-negotiated <transport>`). It is **one scenario with two expected
-outcomes**, keyed on that answer: on a ring session `daemon --upgrade`
-must be refused with an error naming the transport, losing no request and
-leaving the mount serving under the same pid and generation; on a session
-that fell back to `dev_fuse` the handover must succeed. Either way a
-writer, a creator and a reader run throughout and every byte they wrote
-must be there afterwards, before and after a remount.
+The `transport-detach-refused` scenario is in the default list. It asks for
+`uring` itself (its daemon has cluster locks, which `auto` keeps on
+`/dev/fuse`) and is **one scenario with two expected outcomes**, keyed on
+what it negotiated: on a ring session `daemon --upgrade` must be refused
+with an error naming the transport, losing no request and leaving the
+mount serving under the same pid and generation; on a session that fell
+back to `dev_fuse` the handover must succeed, the fallback must be in
+`node.status` (`last_fallback.reason` one of the fixed names,
+`transport_fallbacks` summing to exactly 1), and the resumed mount must
+report the **same** reason as before (a resumed session is classified by
+the build and kernel rungs first; `handover_capable` only where the ring
+would otherwise have been granted). Either way a writer, a creator and a
+reader run throughout and every byte they wrote must be there afterwards,
+before and after a remount.
+
+### Running the ring legs: `fuse.enable_uring=Y`
+
+The `auto` and `uring` legs only exercise the ring on a 6.14+ kernel with
+the fuse module's `enable_uring` parameter on; anywhere else they are
+fallback legs (still required to pass). To get a host that grants it:
+
+```bash
+cat /sys/module/fuse/parameters/enable_uring        # want Y
+echo Y | sudo tee /sys/module/fuse/parameters/enable_uring   # runtime, until reboot
+# or persistently: fuse.enable_uring=1 on the kernel command line,
+# or `options fuse enable_uring=1` in /etc/modprobe.d/fuse.conf
+cat /proc/sys/kernel/io_uring_disabled               # want 0
+```
+
+A dev host whose own kernel is older (or that may not flip the parameter)
+runs the legs in a **KVM guest** with a 6.14+ kernel — e.g. a Fedora 43 or
+Ubuntu 26.04 cloud image booted with `fuse.enable_uring=1` on its command
+line, with docker, fuse3 and fio installed and the worktree synced in:
+
+```bash
+# in the guest, from the synced worktree (CARGO_TARGET_DIR unset)
+cargo build --release -p constellation -p constellation-harness -p constellation-chaos
+TRANSPORTS="dev-fuse auto uring" SCENARIOS=all tests/transport-matrix.sh
+make compliance-uring                                  # pjdfstest on the ring
+READ_CPU_GATE=1 TRANSPORTS="dev-fuse uring" SCENARIOS=fio-latency tests/transport-matrix.sh
+```
+
+(The project's own lane uses a `vm-run $RING_BOX <command>` wrapper that
+rsyncs the worktree into such a guest and runs the command there.)
+
+### The ring legs in CI
+
+`ci.yml`'s `transport-dev-fuse` job runs on every push: the smoke test on
+the default (`auto`, a fallback on a hosted runner, whose `last_fallback`
+the smoke test checks) and on `dev-fuse`, then the matrix's `dev-fuse` leg.
+`nightly.yml`'s `transport-matrix` job runs **every leg over the full
+matrix**, pjdfstest per transport (`compliance` with `dev-fuse`,
+`compliance-uring`) and the cost gate per leg, on a **self-managed runner**
+labelled `fuse-uring` (`runs-on: [self-hosted, linux, fuse-uring]`): kernel
+6.14+, `fuse.enable_uring=Y`, docker, fuse3, fio, python3 (the cost gate),
+util-linux's `taskset` (`transport-lock-wait-budget`) and passwordless sudo.
+Its first step fails if the runner does not actually grant the ring, so a
+mislabelled runner cannot turn the ring legs into a second fallback run. The
+job only runs when the repository variable `FUSE_URING_RUNNER` is `true`
+(set it once such a runner is registered); otherwise it is skipped at once
+and the nightly `summary` reports it `skipped`. The cost gate compares each
+leg with its own baseline (`read-cpu-uring-runner-baseline-<leg>.json`,
+created — blessed — by the leg's first run on a fresh checkout and uploaded
+with the artifacts), never one transport's numbers with another's.
+
+### Cluster locks on the ring (plan 38 Z2c)
+
+| scenario | what it checks | runs on |
+|---|---|---|
+| `transport-cluster-locks-auto` | `auto` keeps a cluster-lock mount on `dev_fuse` with a `cluster_locks` fallback (one `FUSE transport (fell back)` line, `node.status`, counted once) and it serves; `--locks local` gets the ring under `auto` (depth 8); `uring` puts the cluster-lock mount on the ring at depth 32. Off a ring host, every leg is `dev_fuse` and names the earlier rung | every host |
+| `transport-lock-wait-budget` | **real kernel**: a cluster-lock mount on `uring`, `depth + 3` processes pinned to one CPU (`taskset`) blocking in `F_SETLKW` while a process on the same CPU holds the lock. `depth - 1` wait, the rest get `ENOLCK` at once, a `stat` from that CPU is served, the holder's `write` and unlock go through, every waiter that waited is granted, and `lock_wait_downgrades` (per mount and process-wide) equals the refusals. At depth 4 and at the shipped 32 | ring hosts (`fuse-uring`, `taskset`) |
 
 ### Every downgrade, injected (plan 38 Z2a)
 
@@ -2019,9 +2090,19 @@ its arguments and fuser's `_FUSE_COMMFD` socket to a broker thread in the
 unsandboxed harness, which runs the real `fusermount3`; the mount is the
 ordinary host-visible one (`crates/harness/src/sandbox.rs`).
 
+Every one of them also requires `node.status` to say why: the mount's
+`last_fallback.reason` is one of the fixed names (`no_io_uring_feature`,
+`kernel_not_offered`, `cluster_locks`, `handover_capable`,
+`ring_setup_failed`) and `fuse.transport_fallbacks` counts exactly that one
+fallback. They ask for `uring` (the harness's daemons have cluster locks).
+The kernel-below-6.14 rung cannot be provoked on a ring host; it is covered
+by `frontend-fuse`'s `stats::an_init_without_the_ring_bit_is_kernel_not_offered`,
+which feeds the classification a negotiated `FUSE_INIT` without the ring
+bit.
+
 `s3-cut-one-node` is in the lane's default list as the regression guard for
 Z1b's ring-leg finding (a blocked flush stalling unrelated requests on its
-ring): Z2a's gate is seeds 1-8 on `auto`, negotiated `uring`.
+ring): Z2a's gate is seeds 1-8 on the ring.
 
 ### pjdfstest on both transports
 
@@ -2029,26 +2110,27 @@ POSIX compliance is gated per transport (plan 38 §6), still 8798/8798
 with no exceptions:
 
 ```bash
-docker compose --profile test run --rm compliance          # dev-fuse
-make compliance-uring                                     # auto
+docker compose --profile test run --rm compliance          # auto (dev_fuse: cluster locks)
+docker compose --profile test run --rm -e CONSTELLATION_FUSE_TRANSPORT=dev-fuse compliance
+make compliance-uring                                     # uring
 ```
 
-`compliance-uring` is a separate compose service and image because the
-ring needs two things the default suite container does not have: the
-`io-uring` feature in the binary (a `CARGO_FEATURES` build arg) and
-`seccomp:unconfined`. Docker's default seccomp profile blocks
-`io_uring_setup(2)` outright, and a blocked setup leaves nothing in
-sysfs to see — the mount would quietly fall back and the lane would pass
-while testing nothing (plan 38 §8). The relaxation is on that service
-only; `smoke`/`compliance`/`stress` keep running under an ordinary
-container profile on purpose.
+`compliance-uring` is a separate compose service (same image: the binary
+carries the ring) because the ring needs one thing the default suite
+container does not have: `seccomp:unconfined`. Docker's default seccomp
+profile blocks `io_uring_setup(2)` outright, and a blocked setup leaves
+nothing in sysfs to see — the mount would quietly fall back and the lane
+would pass while testing nothing (plan 38 §8). The relaxation is on that
+service only; `smoke`/`compliance`/`stress` keep running under an ordinary
+container profile on purpose. It asks for `uring`, because the suite's
+mount has cluster locks and `auto` would keep it on `/dev/fuse`.
 
 Each run prints the transport it actually negotiated before it starts
-(`FUSE transport: uring (asked for auto)`), read back from `node.status`:
-`auto` is a request, and a run that fell back would otherwise be mistaken
-for ring coverage. On a 6.14+ `enable_uring=Y` host the `auto` lane is
-8798/8798 over the ring; on an older kernel it is 8798/8798 over
-`/dev/fuse`, and says so.
+(`FUSE transport: uring (asked for uring)`), read back from `node.status`:
+the policy is a request, and a run that fell back would otherwise be
+mistaken for ring coverage. On a 6.14+ `enable_uring=Y` host the
+`compliance-uring` lane is 8798/8798 over the ring; on an older kernel it is
+8798/8798 over `/dev/fuse`, and says so.
 
 ### Where the ring is tested without a kernel
 
@@ -2081,8 +2163,9 @@ completes, which thread each op runs on, that a blocked flush does not
 stall a `stat` queued on the same ring queue, that blocking lock waits
 never take a queue's last entry (the second of two `F_SETLKW` waiters on a
 depth-2 queue is answered `ENOLCK`, and the lock holder's `write` and
-unlock still go through — without the budget that queue deadlocks), and
-that a refused registration fails the session by name. `tests/wire.rs` stays the
+unlock still go through — without the budget that queue deadlocks — and
+the downgrade reaches `Config::io_uring_lock_wait_downgrades` exactly once),
+and that a refused registration fails the session by name. `tests/wire.rs` stays the
 `/dev/fuse` socket-pair suite.
 
 ## FUSE passthrough (plan 38 Z3)
@@ -2110,6 +2193,7 @@ passthrough scenarios need root:
 | `passthrough-handover` | a passthrough handle held across `daemon --upgrade`: the new image counts it and holds its pin (a prune keeps the chunk), a new open of the file shares the handed-over backing id, the close releases both |
 | `passthrough-disabled-by-verify-always` | `--cache-verify always`: `enabled = false`, reason `cache_verify_always`, no pin, every read reaches the daemon — privileged or not (it requires nothing) |
 | `passthrough-default-by-mount-mode` | without the opt-in: a writable mount reports reason `writable_mount`, holds no passthrough handle and serves a read-write open beside a reader; a read-only mount of a snapshot of the same file negotiates passthrough (no reason); with the daemon's memory tier on (the default) the verifying first read admits the chunk to memory and the next open is **not** passthrough (a chunk held in memory never is, plan 38 Z3c), and on a second snapshot mount with `CONSTELLATION_CHUNK_MEMCACHE_BYTES=0` it serves the frozen file by passthrough: the first open after the new daemon's start is ordinary (its read verifies the chunk the daemon found on disk), the next is counted and pinned (`(opens, open_pins) = (1, 1)`, `opens_total` ≥ 1), reads byte-exact with neither the `read` series nor `cache.memory_misses` moving, a read-write open beside it is `EROFS` and leaves the counts alone, and the close releases the pin |
+| `passthrough-on-every-transport` | plan 38 Z2c with Z3b/Z3c: one read-only snapshot mount per policy (`dev-fuse`, `auto`, `uring`). Before any open, the mount reports the transport and fallback the ladder gives it (`dev-fuse`: `dev_fuse`, no fallback; `auto` and `uring`: the ring on a ring host — a frozen view has no cluster locks, so `auto` does not hold it back — and elsewhere a fallback naming an earlier rung, never `cluster_locks`, counted once). Then passthrough serves a verified chunk's open on that transport: counted and pinned `(1, 1)`, byte-exact, no read reaching the daemon, released at the close |
 
 All but `passthrough-disabled-by-verify-always` `require` `CAP_SYS_ADMIN` and `linux>=6.9` — `requires`
 entries that name a host capability rather than a binary

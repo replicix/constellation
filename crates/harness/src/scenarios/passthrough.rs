@@ -575,7 +575,12 @@ pub fn handover(seed: u64) -> Result<()> {
     check_root(root.path())?;
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/pt-handover-{}", ts());
-    let mut c = client(&env, root.path(), "c0", &backend)?;
+    // Handover-capable means `/dev/fuse` (plan 38 §3(e)), pinned as
+    // `handover`'s own scenarios pin it: on the transport matrix's `uring`
+    // leg this writable mount would otherwise be on the ring, which
+    // `daemon --upgrade` refuses by design (`transport-detach-refused`).
+    let mut c = client(&env, root.path(), "c0", &backend)?
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", "dev-fuse");
     c.fs_create()?;
     c.mount()?;
     with_clients(std::slice::from_mut(&mut c), |cs| {
@@ -812,4 +817,86 @@ pub fn default_by_mount_mode(seed: u64) -> Result<()> {
         expect_counts(c, (0, 0), "the pin released at the close")?;
         Ok(())
     })
+}
+
+/// Plan 38 Z2c merged with Z3b/Z3c: passthrough and the transport compose.
+/// The backing-id ioctls go to the connection's `/dev/fuse` descriptor and
+/// an open's reply carries the backing id whichever way it travels, so a
+/// read-only snapshot mount gets passthrough on `/dev/fuse` and on the ring
+/// alike. A frozen view takes no cluster locks (`node_runtime`'s
+/// `!frozen_view`), so under `auto` it is not held back for them: per
+/// policy — `dev-fuse` (no ring asked, no fallback); `auto` and `uring`
+/// (the ring on a ring host; elsewhere `/dev/fuse` naming an earlier rung,
+/// never `cluster_locks`) — the mount reports the transport and fallback
+/// the ladder gives it (checked before any open, so the counters hold the
+/// handshake's fallback alone), has passthrough on, and a verified chunk's
+/// open is served by passthrough: counted, pinned, byte-exact, no read
+/// reaching the daemon, released at the close.
+pub fn on_every_transport(seed: u64) -> Result<()> {
+    let (env, root) = setup("pt-transport")?;
+    check_root(root.path())?;
+    let _proxy = env.s3_proxy()?;
+    let backend = format!("s3://{BUCKET}/pt-transport-{}", ts());
+    let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?
+        .without_env("CONSTELLATION_FUSE_PASSTHROUGH")
+        .with_env(NO_MEMORY_TIER.0, NO_MEMORY_TIER.1);
+    let data = bytes(seed, LEN);
+    c.fs_create()?;
+    c.mount()?;
+    with_clients(std::slice::from_mut(&mut c), |cs| {
+        let c = &cs[0];
+        write_one_chunk(c, &c.mnt.join("frozen"), &data)?;
+        c.snapshot_create("/@pt-transport")?;
+        Ok(())
+    })?;
+    let ring_host = crate::suites::unavailable(crate::suites::FUSE_URING).is_none();
+    for policy in ["dev-fuse", "auto", "uring"] {
+        c.set_env("CONSTELLATION_FUSE_TRANSPORT", policy);
+        c.mount_view(Some("/@pt-transport"), &[])?;
+        let leg = policy;
+        with_clients(std::slice::from_mut(&mut c), |cs| {
+            let c = &cs[0];
+            let status = c.control_status()?;
+            let mount = &status["fuse"]["mounts"][0];
+            let transport = mount["transport"].as_str().unwrap_or_default().to_string();
+            match policy {
+                "dev-fuse" => ensure!(
+                    transport == "dev_fuse" && mount["last_fallback"].is_null(),
+                    "{leg}: asked for no ring: {mount}"
+                ),
+                _ if ring_host => ensure!(
+                    transport == "uring" && mount["last_fallback"].is_null(),
+                    "{leg}: a ring host must grant the ring: {mount}"
+                ),
+                _ => {
+                    let why = super::transport::fallback_reported(c, None).context(leg)?;
+                    ensure!(why != "cluster_locks", "{leg}: held back for locks");
+                }
+            }
+            require_enabled(c)?;
+            let path = c.mnt.join("frozen");
+            // Unverified in this process: served by the daemon, which
+            // hashes it; the next open is passthrough.
+            let first = std::fs::File::open(&path)?;
+            ensure!(pread_all(&first, LEN)? == data, "{leg}: other bytes");
+            drop(first);
+            expect_counts(c, (0, 0), "the first open of an unverified chunk")?;
+            let reads = daemon_reads(c)?;
+            let held = std::fs::File::open(&path)?;
+            expect_counts(c, (1, 1), "a snapshot file served by passthrough")?;
+            ensure!(
+                pread_all(&held, LEN)? == data,
+                "{leg}: the passthrough handle reads other bytes"
+            );
+            ensure!(
+                daemon_reads(c)? == reads,
+                "{leg}: a passthrough read reached the daemon"
+            );
+            drop(held);
+            expect_counts(c, (0, 0), "the pin released at the close")?;
+            eprintln!("    {leg}: {transport}, passthrough served the open");
+            Ok(())
+        })?;
+    }
+    Ok(())
 }

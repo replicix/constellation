@@ -57,6 +57,59 @@ fn transport_is_reported(status: &serde_json::Value, mnt: &Path) -> Result<()> {
             "FAIL: a fallback recorded on a {transport} mount: {ours}"
         );
     }
+    // The Z2b review's gap: what was asked for (the knob, else the engine
+    // profile's default: `dev-fuse` under `CONSTELLATION_PROFILE=mobile`,
+    // the shipped `auto` otherwise) against what the mount got. A mount
+    // that asked for the ring and is on `/dev/fuse` names one of the fixed
+    // reasons, and the process-wide counter holds exactly that one
+    // fallback (the smoke daemon has one mount); one that asked for
+    // `dev-fuse` took none.
+    let env = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+    };
+    let asked = env("CONSTELLATION_FUSE_TRANSPORT").unwrap_or_else(|| {
+        match env("CONSTELLATION_PROFILE").as_deref() {
+            Some("mobile") => "dev-fuse".into(),
+            _ => "auto".into(),
+        }
+    });
+    let counted: u64 = status["fuse"]["transport_fallbacks"]
+        .as_array()
+        .context("FAIL: status has no fuse.transport_fallbacks")?
+        .iter()
+        .map(|f| f["count"].as_u64().unwrap_or(0))
+        .sum();
+    if asked == "dev-fuse" || asked == "dev_fuse" || transport != "dev_fuse" {
+        ensure!(
+            ours["last_fallback"].is_null() && counted == 0,
+            "FAIL: asked for {asked}, got {transport}, yet a fallback is recorded: {}",
+            status["fuse"]
+        );
+    } else {
+        let reason = ours["last_fallback"]["reason"].as_str().with_context(|| {
+            format!("FAIL: asked for {asked}, got dev_fuse, and no last_fallback says why: {ours}")
+        })?;
+        ensure!(
+            [
+                "no_io_uring_feature",
+                "kernel_not_offered",
+                "cluster_locks",
+                "handover_capable",
+                "ring_setup_failed"
+            ]
+            .contains(&reason),
+            "FAIL: unknown fallback reason {reason:?}"
+        );
+        ensure!(
+            counted == 1,
+            "FAIL: transport_fallbacks must count this mount's one fallback: {}",
+            status["fuse"]
+        );
+        println!("   asked for {asked}, on dev_fuse: {reason}");
+    }
     let series = status["vfs_ops"]["series"]
         .as_array()
         .context("FAIL: status has no vfs_ops.series")?;

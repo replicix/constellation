@@ -1009,6 +1009,84 @@ impl Drop for Client {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.record_transport_census();
+    }
+}
+
+/// The scenario `harness run` is running, for [`TRANSPORT_CENSUS_ENV`].
+static SCENARIO: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// `harness run` names the scenario it starts (the transport census's
+/// first column).
+pub fn set_scenario(name: &str) {
+    *SCENARIO.lock().unwrap_or_else(|e| e.into_inner()) = name.to_string();
+}
+
+/// Plan 38 Z2c: a file each client appends one line per FUSE mount its
+/// daemons made to, when it is dropped — `scenario client transport
+/// reason` (`-` for no fallback), from the daemon's own per-mount
+/// `FUSE transport` record — so a matrix run can say how many of its
+/// mounts ended up on each transport (`tests/transport-matrix.sh` sums it
+/// per leg).
+pub const TRANSPORT_CENSUS_ENV: &str = "CONSTELLATION_HARNESS_TRANSPORT_CENSUS";
+
+/// `key=value` of a tracing line (quotes and ANSI styling stripped).
+fn log_field(line: &str, key: &str) -> Option<String> {
+    let plain: String = {
+        let mut out = String::with_capacity(line.len());
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let at = plain.find(&format!(" {key}="))? + key.len() + 2;
+    let value = plain[at..].split_whitespace().next()?;
+    Some(value.trim_matches('"').to_string())
+}
+
+impl Client {
+    fn record_transport_census(&self) {
+        let Some(path) = std::env::var_os(TRANSPORT_CENSUS_ENV) else {
+            return;
+        };
+        let scenario = SCENARIO.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut rows = String::new();
+        for log in self.log_files() {
+            let Ok(text) = std::fs::read_to_string(&log) else {
+                continue;
+            };
+            for line in text.lines().filter(|l| l.contains("FUSE transport")) {
+                let Some(transport) = log_field(line, "transport") else {
+                    continue;
+                };
+                let reason = log_field(line, "fallback_reason").unwrap_or_else(|| "-".into());
+                rows.push_str(&format!(
+                    "{}\t{}\t{transport}\t{reason}\n",
+                    if scenario.is_empty() { "-" } else { &scenario },
+                    self.name
+                ));
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = f.write_all(rows.as_bytes());
+        }
     }
 }
 

@@ -147,6 +147,9 @@ struct Kernel {
     next_unique: u64,
     session: Option<JoinHandle<std::io::Result<()>>>,
     transport: Transport,
+    /// Blocking lock requests the lock-wait budget served as non-blocking
+    /// (`Config::io_uring_lock_wait_downgrades`).
+    lock_wait_downgrades: Arc<std::sync::atomic::AtomicU64>,
 }
 
 const KERNEL_INIT_FLAGS: u32 = (1 << 1) | (1 << 10) | (1 << 18);
@@ -186,6 +189,7 @@ impl Kernel {
             next_unique: 1,
             session: None,
             transport: Transport::DevFuse,
+            lock_wait_downgrades: Arc::default(),
         };
         let (flags, flags2) = match leg {
             Leg::DevFuse => (KERNEL_INIT_FLAGS, 0),
@@ -209,6 +213,12 @@ impl Kernel {
         config.io_uring = leg == Leg::Ring;
         config.io_uring_queue_depth = DEPTH;
         config.io_uring_kernel = ring;
+        config.io_uring_lock_wait_downgrades = Some(fuser::LockWaitDowngrades::new({
+            let n = k.lock_wait_downgrades.clone();
+            move || {
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
         let fs = FuseFs::new(Arc::new(mock.clone()), caps, KernelTuning::for_workers(2));
         let session =
             fuser::Session::from_fd(fs, OwnedFd::from(daemon), fuser::SessionACL::All, config)?;
@@ -692,6 +702,7 @@ fn blocking_lock_waits_never_take_a_queues_last_entry() {
     let mut k =
         Kernel::try_start_with(&mock, Leg::Ring, None, FrontendCaps::linux_fuse(true)).unwrap();
     assert_eq!(k.transport, Transport::Uring);
+    let k_downgrades = k.lock_wait_downgrades.clone();
     let (p, waiter, other) = (0xA, 0xB, 0xC);
     let quiet = Duration::from_millis(300);
     let answer = |k: &mut Kernel, unique: u64, what: &str| {
@@ -711,6 +722,8 @@ fn blocking_lock_waits_never_take_a_queues_last_entry() {
     let second = k.send_on(0, op::SETLKW, ino, &lk_body(fh, other, libc::F_WRLCK));
     let r = answer(&mut k, second, "the second waiter");
     assert_eq!(r.error(), -libc::ENOLCK, "no entry to wait on");
+    let downgrades = || k_downgrades.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(downgrades(), 1, "the downgrade is counted, once");
     // P's write and unlock reach the filesystem on the entry kept free.
     let write = k.send_on(
         0,
@@ -750,5 +763,6 @@ fn blocking_lock_waits_never_take_a_queues_last_entry() {
     assert_eq!(got, vec![(again, 0), (release, 0)]);
     let done = k.send_on(0, op::SETLK, ino, &lk_body(fh, other, libc::F_UNLCK));
     assert_eq!(answer(&mut k, done, "the last unlock").error(), 0);
+    assert_eq!(downgrades(), 1, "a waiter that waited is no downgrade");
     k.finish();
 }

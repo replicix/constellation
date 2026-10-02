@@ -124,6 +124,10 @@ pub use crate::uring::uring_unavailable;
 pub use crate::uring::RegistrationRefused;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use crate::uring::memory::InMemoryRingKernel;
+// CONSTELLATION PATCH (io-uring): the hook a caller counts lock-wait budget
+// downgrades with (`Config::io_uring_lock_wait_downgrades`).
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub use crate::uring::LockWaitDowngrades;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]

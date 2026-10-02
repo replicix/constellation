@@ -222,6 +222,10 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
         "fuse_zero_copy_reads_total",
         status.fuse.zero_copy_reads_total,
     );
+    c(
+        "fuse_lock_wait_downgrades_total",
+        status.fuse.lock_wait_downgrades_total,
+    );
     let mut g = |name: &str, v: f64| {
         gauges.insert(format!("constellation_{name}"), v);
     };

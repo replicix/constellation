@@ -69,21 +69,21 @@ services:
     <<: *suite
     command: ["compliance"]
 
-  # The same pjdfstest run on plan 38's transport ladder
-  # (`CONSTELLATION_FUSE_TRANSPORT=auto`), so POSIX compliance is gated on
+  # The same pjdfstest run on plan 38's ring transport
+  # (`CONSTELLATION_FUSE_TRANSPORT=uring`: the ladder for every plain mount,
+  # including this one, which has cluster locks and which `auto` would keep
+  # on `/dev/fuse` since plan 38 Z2c), so POSIX compliance is gated on
   # every transport and not only on `/dev/fuse` (plan 38 §6: "pjdfstest
-  # 8798/8798 on every transport"). Its own image and its own profile,
-  # because reaching the ring needs two things the default suite image and
-  # the default container do not have:
-  #
-  #  * the `io-uring` cargo feature in the binary (`CARGO_FEATURES` below);
-  #  * `seccomp:unconfined`. Docker's default seccomp profile blocks
-  #    `io_uring_setup(2)`, `io_uring_enter(2)` and `io_uring_register(2)`
-  #    outright, and a blocked setup is invisible in sysfs — the mount
-  #    would quietly fall back to `/dev/fuse` and the lane would pass
-  #    while testing nothing (plan 38 §8). It is set *only* here, never on
-  #    the `smoke`/`compliance`/`stress` services, whose point is to run
-  #    under an ordinary container profile.
+  # 8798/8798 on every transport"). The image is the suite's own: Linux
+  # builds of `constellation` carry the `io-uring` feature since Z2c. What
+  # the default container does not have is `seccomp:unconfined`: Docker's
+  # default seccomp profile blocks `io_uring_setup(2)`, `io_uring_enter(2)`
+  # and `io_uring_register(2)` outright, and a blocked setup is invisible
+  # in sysfs — the mount would quietly fall back to `/dev/fuse` and the
+  # lane would pass while testing nothing (plan 38 §8; `tests/compliance.sh`
+  # prints the transport it got). It is set *only* here, never on the
+  # `smoke`/`compliance`/`stress` services, whose point is to run under an
+  # ordinary container profile.
   #
   # The host kernel decides the rest: 6.14+ with `fuse.enable_uring=Y`.
   # On a host without it the leg still runs and still has to pass, on the
@@ -93,14 +93,6 @@ services:
   #   make compliance-uring
   compliance-uring:
     <<: *suite
-    image: ${SUITE_URING_IMAGE:-constellation-suite-uring:local}
-    build:
-      context: .
-      dockerfile: tests/docker/Dockerfile
-      target: suite
-      args:
-        CARGO_FEATURES: constellation-frontend-fuse/io-uring
-        TARGET_CACHE_ID: constellation-target-uring-${COMPOSE_PROJECT_NAME}
     profiles: ["test-uring"]
     security_opt:
       - apparmor:unconfined
@@ -108,7 +100,7 @@ services:
       - seccomp:unconfined
     environment:
       <<: *suite-env
-      CONSTELLATION_FUSE_TRANSPORT: auto
+      CONSTELLATION_FUSE_TRANSPORT: uring
     command: ["compliance"]
 
   # Data-integrity (fio verify) + metadata churn (stress-ng).

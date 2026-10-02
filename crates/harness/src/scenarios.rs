@@ -61,7 +61,7 @@ mod rejoin;
 mod slowseal;
 /// Plan 38 §6/§3(e): the transport a mount negotiates, and whether a
 /// session on it can be handed over.
-mod transport;
+pub mod transport;
 mod watermark;
 /// The small-file write path: S3 round trips per close, `back` for
 /// non-owners.
@@ -1484,6 +1484,39 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
         caps: &[],
         run: passthrough::default_by_mount_mode,
+    },
+    Scenario {
+        name: "passthrough-on-every-transport",
+        desc: "plan 38 Z2c with Z3b/Z3c: a read-only snapshot mount (no cluster locks) under \
+               dev-fuse, auto and uring reports the transport and fallback the ladder gives it \
+               (auto and uring: the ring on a ring host, never a cluster_locks fallback) and \
+               serves a verified chunk's open by passthrough on each: counted, pinned, \
+               byte-exact, no daemon read",
+        requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
+        caps: &[],
+        run: passthrough::on_every_transport,
+    },
+    Scenario {
+        name: "transport-cluster-locks-auto",
+        desc: "plan 38 Z2c: under auto a mount with cluster locks stays on dev_fuse with a \
+               cluster_locks fallback (logged once, in node.status, counted once) and serves; \
+               --locks local gets the ring under auto, and --fuse-transport uring puts the \
+               cluster-lock mount on the ring with the deeper queue (32); after daemon \
+               --upgrade the resumed auto mount still reports cluster_locks; every host",
+        requires: &[],
+        caps: &[],
+        run: transport::transport_cluster_locks_auto,
+    },
+    Scenario {
+        name: "transport-lock-wait-budget",
+        desc: "plan 38 Z2c, real kernel: a cluster-lock mount opted into the ring, depth+3 \
+               processes pinned to one CPU blocking in F_SETLKW while a process on that CPU \
+               holds the lock -- depth-1 wait, the rest get ENOLCK at once, the holder's write \
+               and unlock go through, every waiter that waited is granted, and \
+               lock_wait_downgrades counts the refusals (depth 4, and the default 32)",
+        requires: &[crate::suites::FUSE_URING, "taskset"],
+        caps: &[],
+        run: transport::transport_lock_wait_budget,
     },
     Scenario {
         name: "lifecycle-suspend-mid-write",

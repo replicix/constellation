@@ -29,16 +29,17 @@ fs_create
 fs_mount --allow-other
 
 # Which transport this run is actually gating (plan 38 §6: "pjdfstest
-# 8798/8798 on every transport"). `CONSTELLATION_FUSE_TRANSPORT=auto` is a
-# *request*: the ladder falls back to `/dev/fuse` whenever the kernel is
-# too old, `fuse.enable_uring` is off, or the sandbox denies
-# `io_uring_setup(2)` — and a container's default seccomp profile denies
-# it silently. Printing what was negotiated is what keeps the ring leg
+# 8798/8798 on every transport"). `CONSTELLATION_FUSE_TRANSPORT` (default
+# `auto`, which keeps this cluster-lock mount on `/dev/fuse`; `uring` in
+# `compliance-uring`) is a *request*: the ladder falls back to `/dev/fuse`
+# whenever the kernel is too old, `fuse.enable_uring` is off, or the
+# sandbox denies `io_uring_setup(2)` — and a container's default seccomp
+# profile denies it silently. Printing what was negotiated is what keeps the ring leg
 # from passing while testing nothing. `sed`, not `jq`/`python3`: the suite
 # image carries neither.
 transport=$("$BIN" status tests --state-dir "$STATE" 2>/dev/null \
     | sed -n 's/.*"transport": *"\([a-z_]*\)".*/\1/p' | head -1)
-say "FUSE transport: ${transport:-unknown} (asked for ${CONSTELLATION_FUSE_TRANSPORT:-dev-fuse})"
+say "FUSE transport: ${transport:-unknown} (asked for ${CONSTELLATION_FUSE_TRANSPORT:-auto})"
 
 SCRATCH="$MNT/pjdfstest-scratch"
 mkdir -p "$SCRATCH"

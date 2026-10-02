@@ -5,11 +5,11 @@
 # itself) run inside a container for reproducibility.
 
 FROM rust:1-bookworm AS build
-# Extra cargo features for the binaries (plan 38 §6): empty by default, so
-# the image is the shipped build. `constellation-frontend-fuse/io-uring`
-# puts the FUSE-over-io_uring transport in, which the `compliance-uring`
-# compose service needs (and which also needs a seccomp profile that
-# permits `io_uring_setup(2)` at *run* time -- see docker-compose.yml).
+# Extra cargo features for the binaries: empty by default, so the image is
+# the shipped build — which on Linux already carries the FUSE-over-io_uring
+# transport (plan 38 Z2c); reaching the ring at *run* time also needs a
+# seccomp profile that permits `io_uring_setup(2)` (docker-compose.yml's
+# `compliance-uring`).
 ARG CARGO_FEATURES=
 # The target cache is per checkout: cargo decides freshness by mtime, COPY
 # keeps the context's mtimes, and every checkout builds at /src, so a

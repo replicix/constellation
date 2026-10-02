@@ -644,6 +644,13 @@ pub struct FuseStatus {
     /// (`constellation_fuse_zero_copy_reads_total`; 0 until plan 38 Z4).
     #[serde(default)]
     pub zero_copy_reads_total: u64,
+    /// Blocking lock requests (`F_SETLKW`, blocking `flock`) every ring
+    /// session of this process served as non-blocking because their ring
+    /// queue's lock-wait budget (`depth - 1` waiters) was spent — answered
+    /// `ENOLCK` where the lock was contended
+    /// (`constellation_fuse_lock_wait_downgrades_total`, plan 38 Z2c).
+    #[serde(default)]
+    pub lock_wait_downgrades_total: u64,
 }
 
 /// One mount of [`FuseStatus`].
@@ -667,6 +674,11 @@ pub struct FuseMountStatus {
     /// one (plan 38 §2.4: logged once, and visible here).
     #[serde(default)]
     pub last_fallback: Option<FuseFallback>,
+    /// Blocking lock requests this mount's ring served as non-blocking
+    /// (see [`FuseStatus::lock_wait_downgrades_total`]); always 0 on
+    /// `dev_fuse`.
+    #[serde(default)]
+    pub lock_wait_downgrades: u64,
 }
 
 /// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a
@@ -705,8 +717,9 @@ pub struct FuseFallback {
     pub from: String,
     /// What the connection got (`dev_fuse`).
     pub to: String,
-    /// The rung that refused, a fixed name: `handover_capable`,
-    /// `no_io_uring_feature`, `kernel_not_offered`, `ring_setup_failed`.
+    /// The rung that refused, a fixed name: `no_io_uring_feature`,
+    /// `kernel_not_offered`, `cluster_locks`, `handover_capable`,
+    /// `ring_setup_failed`.
     pub reason: String,
     /// What refused, as precisely as the daemon knows.
     #[serde(default)]

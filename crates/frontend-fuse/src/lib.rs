@@ -34,9 +34,10 @@ pub use reply::reply_code;
 pub use session::{
     mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, HandoverCapable,
     MountOptions, MountSource, SessionControl, SessionExit, SessionHandoff, TransportConfig,
-    TransportPolicy, DEFAULT_URING_QUEUE_DEPTH, TRANSPORT_ENV, URING_QUEUE_DEPTH_ENV,
+    TransportPolicy, CLUSTER_LOCKS_URING_QUEUE_DEPTH, DEFAULT_URING_QUEUE_DEPTH, TRANSPORT_ENV,
+    URING_QUEUE_DEPTH_ENV,
 };
-pub use stats::{FallbackReason, SessionStats, TransportFallback};
+pub use stats::{FallbackReason, LockWaitCounter, SessionStats, TransportFallback};
 
 /// Whether this build can serve FUSE-over-io_uring at all (the `io-uring`
 /// feature, on Linux): what `constellation daemon --fuse-transports`

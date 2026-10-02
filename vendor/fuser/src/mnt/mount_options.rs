@@ -82,6 +82,12 @@ pub struct Config {
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     #[doc(hidden)]
     pub io_uring_malformed_register: bool,
+    /// CONSTELLATION PATCH (io-uring): called each time a ring queue's lock-wait budget serves
+    /// a blocking lock request as a non-blocking one (see `Config::io_uring_queue_depth`'s
+    /// budget, `LockWaitDowngrades`), so the filesystem can count what its callers were
+    /// refused. `None` (the default): nobody is told.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub io_uring_lock_wait_downgrades: Option<crate::LockWaitDowngrades>,
 }
 
 // CONSTELLATION PATCH (io-uring): hand-written so `io_uring_queue_depth`
@@ -100,6 +106,8 @@ impl Default for Config {
             io_uring_kernel: None,
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             io_uring_malformed_register: false,
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring_lock_wait_downgrades: None,
         }
     }
 }

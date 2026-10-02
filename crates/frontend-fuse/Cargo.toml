@@ -17,10 +17,9 @@ tracing.workspace = true
 
 [features]
 # Plan 38 Z1a/Z1b: forwards to the vendored fuser's FUSE-over-io_uring
-# transport. Off by default -- and even with it on, no mount asks for the
-# ring unless its `MountOptions`'s `TransportPolicy` is `Auto`
-# (`--fuse-transport auto`/`CONSTELLATION_FUSE_TRANSPORT=auto`), which no
-# mount's is at Z1, so the workspace default stays `/dev/fuse`.
+# transport. Off in this crate's own defaults (a library embedder chooses);
+# the `constellation` binary turns it on for Linux targets (plan 38 Z2c,
+# `crates/cli/Cargo.toml`), so every workspace build on Linux has it.
 io-uring = ["fuser/io-uring"]
 
 [dev-dependencies]

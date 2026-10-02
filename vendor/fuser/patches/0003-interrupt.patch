@@ -5,7 +5,7 @@ vendor/fuser, after 0002-io-uring-transport.patch.
 diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -462,6 +462,14 @@
+@@ -466,6 +466,14 @@
      /// inodes will receive a forget message.
      fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
  

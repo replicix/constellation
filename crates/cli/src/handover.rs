@@ -123,8 +123,12 @@ use std::time::{Duration, Instant};
 /// probe refuses the mix up front. 4 — plan 37 K3a, a mount carries
 /// `foreign` (made by someone else, `view.mount{PreopenedFd}`).
 /// 5 — plan 38 Z3b, passthrough table + write-intent counts + passthrough
-/// chunk hashes.
-pub const HANDOVER_VERSION: u32 = 5;
+/// chunk hashes. 6 — plan 38 Z2c, `fuse_transport` may be `uring`, and an
+/// absent `fuse_uring_queue_depth` means "chosen per mount" (8, or 32 for
+/// a cluster-lock mount on `uring`) where a version-5 image always sent
+/// the depth it used: across the mix a version-5 image would refuse the
+/// policy and a version-6 one would pin every ring mount to 8.
+pub const HANDOVER_VERSION: u32 = 6;
 
 /// `daemon.lock`'s descriptor (held for the process's life; handed on).
 static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
@@ -207,11 +211,11 @@ pub struct NodeHandoff {
     /// the default, as a fresh mount would).
     #[serde(default)]
     cache_verify: Option<String>,
-    /// Plan 38 Z1b: `--fuse-transport` (`auto`/`dev-fuse`), absent in an
-    /// older image's handoff. The *resumed* mounts are `/dev/fuse` by
-    /// construction (a ring session cannot be handed over at all, §3(e));
-    /// this is for the views added to the new image afterwards, which
-    /// would otherwise lose a flag the environment did not also set.
+    /// Plan 38 Z1b: `--fuse-transport` (`auto`/`uring`/`dev-fuse`). The
+    /// *resumed* mounts are `/dev/fuse` by construction (a ring session
+    /// cannot be handed over at all, §3(e)); this is for the views added
+    /// to the new image afterwards, which would otherwise lose a flag the
+    /// environment did not also set.
     #[serde(default)]
     fuse_transport: Option<String>,
     #[serde(default)]
@@ -242,7 +246,7 @@ impl NodeHandoff {
             atime: cfg.atime_mode.as_str().to_string(),
             cache_verify: cfg.cache_verify.map(|v| v.as_str().to_string()),
             fuse_transport: Some(fuse_transport.policy.as_str().to_string()),
-            fuse_uring_queue_depth: Some(fuse_transport.uring_queue_depth),
+            fuse_uring_queue_depth: fuse_transport.uring_queue_depth,
             pin_target: cfg.pin_target.clone(),
             web_ui,
         }
@@ -274,8 +278,12 @@ impl NodeHandoff {
     /// [`Self::fuse_transport_flags`] with the environment applied over it.
     fn fuse_transport(&self) -> Result<constellation_frontend_fuse::TransportConfig> {
         let (policy, depth) = self.fuse_transport_flags()?;
-        constellation_frontend_fuse::TransportConfig::resolve(policy, depth)
-            .map_err(anyhow::Error::msg)
+        constellation_frontend_fuse::TransportConfig::resolve(
+            policy,
+            depth,
+            crate::node_runtime::profile_transport()?,
+        )
+        .map_err(anyhow::Error::msg)
     }
 
     fn engine_config(&self) -> Result<EngineConfig> {
@@ -563,24 +571,15 @@ impl SessionInfoParts {
     }
 
     fn options(&self, cfg: constellation_frontend_fuse::TransportConfig) -> MountOptions {
-        // Handover-capable by construction: these options only ever resume
-        // a detached session (`resume_in_place`), and a resumed connection
-        // is `/dev/fuse` -- a ring session cannot be handed over at all
-        // (plan 38 §3(e)). The marker is what pins it, whatever
-        // `CONSTELLATION_FUSE_TRANSPORT` says. `cfg` is the node's knob,
-        // passed so an `auto` there is logged as ignored for this view.
-        let mut opts = MountOptions::handover_capable(
+        // These options only ever resume a detached session
+        // (`resume_in_place`).
+        handover_options(
             self.fs_name.clone(),
             self.fuse_threads,
-            constellation_frontend_fuse::KernelTuning::for_workers(
-                crate::parallelism::thread_plan().fuse,
-            ),
+            self.allow_other,
+            self.read_only,
             cfg,
-            constellation_frontend_fuse::HandoverCapable,
-        );
-        opts.allow_other = self.allow_other;
-        opts.read_only = self.read_only;
-        opts
+        )
     }
 }
 
@@ -948,6 +947,36 @@ pub fn resume_main(
     }
 }
 
+/// The options of every session `daemon --upgrade` resumes (the new
+/// image's `resume_mount`, and the old one's `resume_in_place` after an
+/// abandoned detach). Handover-capable by construction: a resumed
+/// connection is `/dev/fuse` (`FuseHandoff::transport`; a ring session
+/// cannot be handed over at all, plan 38 §3(e)), and the marker says so at
+/// the call site rather than leaving it to a comment, whatever `cfg` (the
+/// node's knob) asks for. `cfg` still goes in: the session records what
+/// was asked, so a resumed mount on a ring-capable host reports its
+/// `handover_capable` fallback.
+fn handover_options(
+    fs_name: String,
+    fuse_threads: usize,
+    allow_other: bool,
+    read_only: bool,
+    cfg: constellation_frontend_fuse::TransportConfig,
+) -> MountOptions {
+    let mut opts = MountOptions::handover_capable(
+        fs_name,
+        fuse_threads,
+        constellation_frontend_fuse::KernelTuning::for_workers(
+            crate::parallelism::thread_plan().fuse,
+        ),
+        cfg,
+        constellation_frontend_fuse::HandoverCapable,
+    );
+    opts.allow_other = allow_other;
+    opts.read_only = read_only;
+    opts
+}
+
 /// Reopen one view and resume its session on the inherited descriptor.
 fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
     // SAFETY: the inherited connection, ours from here (closing it on an
@@ -961,21 +990,13 @@ fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
     let view =
         engine.open_view_resumed(m.view.spec, m.view.handles, caps.clone(), events.clone())?;
     node.ensure_status(&view);
-    // A resumed connection is `/dev/fuse` by construction
-    // (`FuseHandoff::transport`, plan 38 §3(e)), and the marker says so at
-    // the call site rather than leaving it to a comment. The node's knob
-    // goes in so an `auto` there is logged as ignored for this view.
-    let mut options = MountOptions::handover_capable(
+    let options = handover_options(
         m.fs_name.clone(),
         m.fuse_threads,
-        constellation_frontend_fuse::KernelTuning::for_workers(
-            crate::parallelism::thread_plan().fuse,
-        ),
+        m.allow_other,
+        m.read_only,
         node.fuse_transport,
-        constellation_frontend_fuse::HandoverCapable,
     );
-    options.allow_other = m.allow_other;
-    options.read_only = m.read_only;
     let session = match FuseSession::resume(
         FuseHandoff {
             fuse_fd,
@@ -1068,7 +1089,7 @@ mod tests {
                 8080,
                 constellation_frontend_fuse::TransportConfig {
                     policy: constellation_frontend_fuse::TransportPolicy::Auto,
-                    uring_queue_depth: 4,
+                    uring_queue_depth: Some(4),
                     ..Default::default()
                 },
             ),
@@ -1108,6 +1129,35 @@ mod tests {
         assert_eq!(depth, Some(4));
         assert!(cfg.pin_target.is_some());
         assert_eq!(got.node.web_ui, 8080);
+    }
+
+    /// Plan 38 Z2c: the sessions `daemon --upgrade` resumes are
+    /// `/dev/fuse` whatever the node's knob says — the shipped `auto`, the
+    /// cluster-lock opt-in `uring`, any depth — while the views the new
+    /// image mounts afterwards (plain ones) take the knob.
+    #[test]
+    fn an_upgrade_target_session_is_pinned_to_dev_fuse() {
+        use constellation_frontend_fuse::{TransportConfig, TransportPolicy};
+        for policy in [
+            TransportPolicy::Auto,
+            TransportPolicy::Uring,
+            TransportPolicy::DevFuse,
+        ] {
+            let cfg = TransportConfig {
+                policy,
+                uring_queue_depth: Some(16),
+                ..Default::default()
+            };
+            let opts = handover_options("v".into(), 2, true, false, cfg);
+            assert_eq!(opts.transport(), TransportPolicy::DevFuse, "{policy}");
+            assert!(opts.is_handover_capable());
+            assert!(opts.allow_other && !opts.read_only);
+        }
+        assert_eq!(
+            TransportConfig::default().policy,
+            TransportPolicy::Auto,
+            "plain mounts default to the ladder"
+        );
     }
 
     #[test]

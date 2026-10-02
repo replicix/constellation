@@ -1,9 +1,10 @@
 //! What a FUSE session reports about its transport (plan 38 §5): the
 //! transport it negotiated, its ring queue depth, the transport fallback
-//! it took (if any) and why, and its zero-copy read count — per session
-//! in [`SessionStats`], and process-wide in the counters a scrape needs to
-//! stay monotonic across unmounts ([`fallback_counts`],
-//! [`zero_copy_reads_total`]).
+//! it took (if any) and why, its zero-copy read count and how many blocking
+//! lock requests its ring's lock-wait budget served as non-blocking — per
+//! session in [`SessionStats`], and process-wide in the counters a scrape
+//! needs to stay monotonic across unmounts ([`fallback_counts`],
+//! [`zero_copy_reads_total`], [`lock_wait_downgrades_total`]).
 //!
 //! # A fallback is recorded once, at the handshake
 //!
@@ -23,7 +24,27 @@
 //! `io_uring_setup` errno, the value of `fuse.enable_uring`) goes in
 //! [`TransportFallback::detail`], which `node.status` carries and the
 //! metric does not. Each name is a rung of §2.4's ladder that can refuse:
-//! the build, the kernel's offer, the ring setup, and the handover pin.
+//! the build, the kernel's offer, the cluster-lock rule of plan 38 Z2c,
+//! the handover pin, and the ring setup.
+//!
+//! # The first rung that refused
+//!
+//! A session reports the rung that would have refused it first, in the
+//! ladder's order — build, kernel, cluster locks, handover pin, setup —
+//! so a policy reason (`cluster_locks`, `handover_capable`) is named only
+//! where the ring would otherwise have been granted. A session resumed by
+//! `daemon --upgrade` on a kernel that never offered the ring therefore
+//! keeps reporting `kernel_not_offered` (its handoff carries the original
+//! `FUSE_INIT`), not the pin it was resumed under.
+//!
+//! # Lock-wait downgrades
+//!
+//! A ring queue lends at most `depth - 1` of its entries to blocking lock
+//! requests; the vendored fuser serves a further one as non-blocking
+//! (`ENOLCK` if contended) and tells [`LockWaitCounter`] so. Each such
+//! downgrade is an error a `/dev/fuse` mount would not have returned, so
+//! it is counted per session and process-wide
+//! (`constellation_fuse_lock_wait_downgrades_total`).
 //!
 //! The vendored fuser does not hand back *why* its ring setup failed (it
 //! logs it, once, during the handshake), and this chunk does not change
@@ -47,6 +68,10 @@ pub enum FallbackReason {
     /// The session can be handed to another process image, so it is
     /// pinned to `/dev/fuse` (plan 38 §3(e)) whatever the knob asked.
     HandoverCapable,
+    /// `auto` keeps a mount whose frontend forwards locks to the cluster
+    /// on `/dev/fuse` (plan 38 Z2c; [`TransportPolicy`]'s doc):
+    /// `--fuse-transport uring` is the opt-in.
+    ClusterLocks,
     /// This binary was built without the `io-uring` feature.
     NoIoUringFeature,
     /// The kernel's `FUSE_INIT` did not offer `FUSE_OVER_IO_URING`
@@ -63,6 +88,7 @@ impl FallbackReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::HandoverCapable => "handover_capable",
+            Self::ClusterLocks => "cluster_locks",
             Self::NoIoUringFeature => "no_io_uring_feature",
             Self::KernelNotOffered => "kernel_not_offered",
             Self::RingSetupFailed => "ring_setup_failed",
@@ -85,31 +111,43 @@ pub struct TransportFallback {
     pub at_unix_ms: u64,
 }
 
-/// The downgrade a session took, or `None` when it got what it asked for
-/// (module doc). Pure, so every rung is testable on a host that can grant
-/// none of them: `asked` is the transport knob's policy *before* any
-/// handover pin, `pinned` whether the session is handover-capable,
-/// `feature` whether this build has the ring, `init` what the handshake
-/// recorded (`None` for a session that never ran one) and `negotiated`
-/// what the session is served over.
-pub(crate) fn classify(
-    asked: TransportPolicy,
-    pinned: bool,
-    feature: bool,
-    init: Option<&NegotiatedInit>,
-    negotiated: Transport,
-) -> Option<FallbackReason> {
-    if asked != TransportPolicy::Auto || !negotiated.is_dev_fuse() {
+/// What a session's handshake settled, as [`SessionStats::at_handshake`]
+/// records it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Handshake<'a> {
+    /// The transport knob's policy *before* any handover pin.
+    pub asked: TransportPolicy,
+    /// The session is handover-capable (pinned to `/dev/fuse`).
+    pub pinned: bool,
+    /// `auto` kept it off the ring for its cluster locks.
+    pub held_back_for_locks: bool,
+    /// What the handshake recorded (`None` for one that never ran).
+    pub init: Option<&'a NegotiatedInit>,
+    /// What the session is served over.
+    pub negotiated: Transport,
+    /// The queue depth a ring would have / has.
+    pub uring_queue_depth: usize,
+}
+
+/// The downgrade a session took, or `None` when it got what it asked for:
+/// the first rung that refused, in the ladder's order (module doc). Pure,
+/// so every rung is testable on a host that can grant none of them:
+/// `feature` is whether this build has the ring.
+pub(crate) fn classify(h: &Handshake<'_>, feature: bool) -> Option<FallbackReason> {
+    if !h.asked.asks_for_ring() || !h.negotiated.is_dev_fuse() {
         return None;
     }
-    Some(if pinned {
-        FallbackReason::HandoverCapable
-    } else if !feature {
+    let offered = |i: &NegotiatedInit| {
+        InitFlags::from_bits_retain(i.kernel_flags).contains(InitFlags::FUSE_OVER_IO_URING)
+    };
+    Some(if !feature {
         FallbackReason::NoIoUringFeature
-    } else if init.is_some_and(|i| {
-        !InitFlags::from_bits_retain(i.kernel_flags).contains(InitFlags::FUSE_OVER_IO_URING)
-    }) {
+    } else if h.init.is_some_and(|i| !offered(i)) {
         FallbackReason::KernelNotOffered
+    } else if h.held_back_for_locks {
+        FallbackReason::ClusterLocks
+    } else if h.pinned {
+        FallbackReason::HandoverCapable
     } else {
         FallbackReason::RingSetupFailed
     })
@@ -121,6 +159,11 @@ fn detail(reason: FallbackReason) -> String {
         FallbackReason::HandoverCapable => {
             "the session can be handed to another process image, so it stays on /dev/fuse \
              (a ring session cannot be detached)"
+        }
+        FallbackReason::ClusterLocks => {
+            "the mount forwards locks to the cluster, and transport auto keeps such a mount on \
+             /dev/fuse (a blocked lock wait holds a ring entry; --fuse-transport uring opts in \
+             and answers contended waits past the queue's budget with ENOLCK)"
         }
         FallbackReason::NoIoUringFeature => "this build has no io-uring feature",
         FallbackReason::KernelNotOffered => {
@@ -189,6 +232,54 @@ pub fn zero_copy_reads_total() -> u64 {
     ZERO_COPY_READS.load(Relaxed)
 }
 
+/// Blocking lock requests every ring session of this process served as
+/// non-blocking (`constellation_fuse_lock_wait_downgrades_total`).
+static LOCK_WAIT_DOWNGRADES: AtomicU64 = AtomicU64::new(0);
+
+/// Lock-wait downgrades of every session of this process (module doc).
+pub fn lock_wait_downgrades_total() -> u64 {
+    LOCK_WAIT_DOWNGRADES.load(Relaxed)
+}
+
+/// One session's lock-wait downgrades (module doc), counted by the hook
+/// the vendored fuser calls on its ring threads.
+///
+/// The hook runs on a ring thread, which must never block: it does two
+/// relaxed atomic adds and one `tracing::debug!` (no lock of ours, no
+/// I/O beyond what the installed subscriber does for an enabled debug
+/// event — off by default), and nothing else.
+#[derive(Debug, Clone, Default)]
+pub struct LockWaitCounter(Arc<AtomicU64>);
+
+impl LockWaitCounter {
+    /// The hook a ring session's `fuser::Config` carries: this session's
+    /// count and the process-wide total, one each per downgrade. Logged at
+    /// debug only: under a burst one line per refused waiter is the spam
+    /// plan 38 §2.4 rules out, and the counters are what an operator reads.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub(crate) fn hook(&self) -> fuser::LockWaitDowngrades {
+        let n = self.0.clone();
+        fuser::LockWaitDowngrades::new(move || {
+            n.fetch_add(1, Relaxed);
+            LOCK_WAIT_DOWNGRADES.fetch_add(1, Relaxed);
+            tracing::debug!(
+                "a ring queue's lock-wait budget served a blocking lock as non-blocking"
+            );
+        })
+    }
+
+    /// Count one downgrade by hand (what the hook does).
+    pub fn count(&self) {
+        self.0.fetch_add(1, Relaxed);
+        LOCK_WAIT_DOWNGRADES.fetch_add(1, Relaxed);
+    }
+
+    /// Downgrades counted so far.
+    pub fn get(&self) -> u64 {
+        self.0.load(Relaxed)
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -206,25 +297,22 @@ pub struct SessionStats {
     zero_copy_reads: AtomicU64,
     /// The session's passthrough state (plan 38 Z3b), read live.
     passthrough: Option<Arc<PassthroughState>>,
+    lock_wait_downgrades: LockWaitCounter,
 }
 
 impl SessionStats {
-    /// The stats of a session served over `negotiated`, recording — and
-    /// counting, once — the fallback [`classify`] finds.
+    /// The stats of a session whose handshake settled `h`, recording —
+    /// and counting, once — the fallback [`classify`] finds.
     pub(crate) fn at_handshake(
-        asked: TransportPolicy,
-        pinned: bool,
-        init: Option<&NegotiatedInit>,
-        negotiated: Transport,
-        uring_queue_depth: usize,
+        h: Handshake<'_>,
+        lock_waits: LockWaitCounter,
         passthrough: Arc<PassthroughState>,
     ) -> Self {
-        let feature = cfg!(feature = "io-uring");
-        let reason = classify(asked, pinned, feature, init, negotiated);
-        Self {
-            passthrough: Some(passthrough),
-            ..Self::with_fallback(negotiated, uring_queue_depth, reason)
-        }
+        let reason = classify(&h, cfg!(feature = "io-uring"));
+        let mut stats = Self::with_fallback(h.negotiated, h.uring_queue_depth, reason);
+        stats.lock_wait_downgrades = lock_waits;
+        stats.passthrough = Some(passthrough);
+        stats
     }
 
     /// The session's passthrough (plan 38 Z3b): whether it registers
@@ -272,6 +360,7 @@ impl SessionStats {
             last_fallback,
             zero_copy_reads: AtomicU64::new(0),
             passthrough: None,
+            lock_wait_downgrades: LockWaitCounter::default(),
         }
     }
 
@@ -293,6 +382,12 @@ impl SessionStats {
     /// Zero-copy reads this session served.
     pub fn zero_copy_reads(&self) -> u64 {
         self.zero_copy_reads.load(Relaxed)
+    }
+
+    /// Blocking lock requests this session's ring served as non-blocking
+    /// (module doc); always 0 on `/dev/fuse`.
+    pub fn lock_wait_downgrades(&self) -> u64 {
+        self.lock_wait_downgrades.get()
     }
 
     /// Count one zero-copy read (plan 38 Z4's read path).
@@ -330,37 +425,117 @@ mod tests {
         }
     }
 
+    fn hs(
+        asked: TransportPolicy,
+        pinned: bool,
+        held_back_for_locks: bool,
+        init: Option<&NegotiatedInit>,
+        negotiated: Transport,
+    ) -> Handshake<'_> {
+        Handshake {
+            asked,
+            pinned,
+            held_back_for_locks,
+            init,
+            negotiated,
+            uring_queue_depth: 8,
+        }
+    }
+
     #[test]
     fn every_rung_of_the_ladder_names_its_own_reason() {
         use FallbackReason::*;
-        use TransportPolicy::{Auto, DevFuse};
+        use TransportPolicy::{Auto, DevFuse, Uring};
         let dev = Transport::DevFuse;
         let (on, off) = (Some(init(true)), Some(init(false)));
+        let c = |h: Handshake<'_>, feature: bool| classify(&h, feature);
         // Never asked, or granted: nothing to record.
-        assert_eq!(classify(DevFuse, false, true, off.as_ref(), dev), None);
-        assert_eq!(classify(DevFuse, true, false, None, dev), None);
+        assert_eq!(c(hs(DevFuse, false, false, off.as_ref(), dev), true), None);
+        assert_eq!(c(hs(DevFuse, true, false, None, dev), false), None);
+        for asked in [Auto, Uring] {
+            assert_eq!(
+                c(hs(asked, false, false, on.as_ref(), Transport::Uring), true),
+                None
+            );
+            assert_eq!(
+                c(hs(asked, false, false, on.as_ref(), dev), false),
+                Some(NoIoUringFeature)
+            );
+            assert_eq!(
+                c(hs(asked, false, false, off.as_ref(), dev), true),
+                Some(KernelNotOffered)
+            );
+            assert_eq!(
+                c(hs(asked, false, false, on.as_ref(), dev), true),
+                Some(RingSetupFailed)
+            );
+        }
+        // The policy rungs, named only where the ring was on offer.
         assert_eq!(
-            classify(Auto, false, true, on.as_ref(), Transport::Uring),
-            None
+            c(hs(Auto, false, true, on.as_ref(), dev), true),
+            Some(ClusterLocks)
         );
-        // The pin wins over every other reason: it is why the ring was
-        // never asked for at all.
         assert_eq!(
-            classify(Auto, true, true, on.as_ref(), dev),
+            c(hs(Auto, true, false, on.as_ref(), dev), true),
             Some(HandoverCapable)
         );
+        // A pinned mount with cluster locks under `auto` would not have
+        // had the ring anyway: the earlier rung is the one named.
         assert_eq!(
-            classify(Auto, false, false, on.as_ref(), dev),
-            Some(NoIoUringFeature)
+            c(hs(Auto, true, true, on.as_ref(), dev), true),
+            Some(ClusterLocks)
+        );
+    }
+
+    /// The Z2b review's finding: a session `daemon --upgrade` resumed
+    /// (pinned, carrying the original `FUSE_INIT`) keeps the reason its
+    /// first mount had — the kernel or the build — and reports the pin
+    /// only where the kernel offered the ring.
+    #[test]
+    fn a_resumed_session_keeps_its_original_first_rung() {
+        use TransportPolicy::Auto;
+        let dev = Transport::DevFuse;
+        let off = init(false);
+        let on = init(true);
+        assert_eq!(
+            classify(&hs(Auto, true, false, Some(&off), dev), true),
+            Some(FallbackReason::KernelNotOffered)
         );
         assert_eq!(
-            classify(Auto, false, true, off.as_ref(), dev),
-            Some(KernelNotOffered)
+            classify(&hs(Auto, true, false, Some(&on), dev), false),
+            Some(FallbackReason::NoIoUringFeature)
         );
         assert_eq!(
-            classify(Auto, false, true, on.as_ref(), dev),
-            Some(RingSetupFailed)
+            classify(&hs(Auto, true, false, Some(&on), dev), true),
+            Some(FallbackReason::HandoverCapable)
         );
+    }
+
+    /// Plan 38 §2.4's kernel < 6.14 rung, which no host here can run: an
+    /// `InitFlags` without `FUSE_OVER_IO_URING` (every other bit a real
+    /// 6.x kernel offers set) is `kernel_not_offered`, with the bit it is
+    /// `ring_setup_failed`, and the classification reads nothing else of
+    /// the negotiation.
+    #[test]
+    fn an_init_without_the_ring_bit_is_kernel_not_offered() {
+        let mut old = init(false);
+        old.kernel_flags = (InitFlags::all() - InitFlags::FUSE_OVER_IO_URING).bits();
+        old.kernel_minor = 40;
+        let h = hs(
+            TransportPolicy::Auto,
+            false,
+            false,
+            Some(&old),
+            Transport::DevFuse,
+        );
+        assert_eq!(classify(&h, true), Some(FallbackReason::KernelNotOffered));
+        let mut new = old;
+        new.kernel_flags |= InitFlags::FUSE_OVER_IO_URING.bits();
+        let h = Handshake {
+            init: Some(&new),
+            ..h
+        };
+        assert_eq!(classify(&h, true), Some(FallbackReason::RingSetupFailed));
     }
 
     /// Plan 38 §2.4: a recorded fallback is visible on its session and
@@ -377,15 +552,12 @@ mod tests {
                 .map_or(0, |(.., n)| n)
         };
         let before = count();
-        let stats = SessionStats::at_handshake(
-            TransportPolicy::Auto,
-            true,
-            Some(&init(true)),
+        // The reason as `classify` names it (tested above), recorded: the
+        // build's feature does not enter into this one.
+        let stats = SessionStats::with_fallback(
             Transport::DevFuse,
             8,
-            crate::passthrough::PassthroughState::new(crate::passthrough::PassthroughWish::Off(
-                crate::passthrough::reason::DISABLED,
-            )),
+            Some(FallbackReason::HandoverCapable),
         );
         let fallback = stats.last_fallback().expect("the fallback is recorded");
         assert_eq!(
@@ -408,5 +580,32 @@ mod tests {
         granted.count_zero_copy_read();
         assert_eq!(granted.zero_copy_reads(), 1);
         assert!(zero_copy_reads_total() > zc);
+    }
+
+    /// Plan 38 Z2c: a lock-wait downgrade counts on its session and in
+    /// the process-wide total, once each.
+    #[test]
+    fn a_lock_wait_downgrade_counts_on_the_session_and_in_the_total() {
+        let counter = LockWaitCounter::default();
+        let offered = init(true);
+        let stats = SessionStats::at_handshake(
+            hs(
+                TransportPolicy::Uring,
+                false,
+                false,
+                Some(&offered),
+                Transport::Uring,
+            ),
+            counter.clone(),
+            crate::passthrough::PassthroughState::new(crate::passthrough::PassthroughWish::Off(
+                crate::passthrough::reason::DISABLED,
+            )),
+        );
+        let before = lock_wait_downgrades_total();
+        assert_eq!(stats.lock_wait_downgrades(), 0);
+        counter.count();
+        counter.count();
+        assert_eq!(stats.lock_wait_downgrades(), 2);
+        assert!(lock_wait_downgrades_total() >= before + 2);
     }
 }

@@ -67,7 +67,7 @@ index 3a501cb..4f14973 100644
      /// `EAGAIN` when no request is pending (an armed session polls first).
      pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
 diff --git a/src/lib.rs b/src/lib.rs
-index 90f96fc..c4d8b77 100644
+index 90f96fc..bd8f44d 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -84,6 +84,8 @@ use crate::session::MAX_WRITE_SIZE;
@@ -79,7 +79,7 @@ index 90f96fc..c4d8b77 100644
  
  mod access_flags;
  mod bsd_file_flags;
-@@ -106,6 +108,22 @@ mod request;
+@@ -106,6 +108,26 @@ mod request;
  mod request_param;
  mod session;
  mod time;
@@ -99,10 +99,14 @@ index 90f96fc..c4d8b77 100644
 +pub use crate::uring::RegistrationRefused;
 +#[cfg(all(feature = "io-uring", target_os = "linux"))]
 +pub use crate::uring::memory::InMemoryRingKernel;
++// CONSTELLATION PATCH (io-uring): the hook a caller counts lock-wait budget
++// downgrades with (`Config::io_uring_lock_wait_downgrades`).
++#[cfg(all(feature = "io-uring", target_os = "linux"))]
++pub use crate::uring::LockWaitDowngrades;
  
  /// We generally support async reads
  #[cfg(not(target_os = "macos"))]
-@@ -345,6 +363,14 @@ impl KernelConfig {
+@@ -345,6 +367,14 @@ impl KernelConfig {
      /// # Errors
      /// When the argument includes capabilities not supported by the kernel, returns the bits of the capabilities not supported.
      pub fn add_capabilities(&mut self, capabilities_to_add: InitFlags) -> Result<(), InitFlags> {
@@ -117,7 +121,7 @@ index 90f96fc..c4d8b77 100644
          if !self.capabilities.contains(capabilities_to_add) {
              let unsupported = capabilities_to_add & !self.capabilities;
              return Err(unsupported);
-@@ -353,6 +379,13 @@ impl KernelConfig {
+@@ -353,6 +383,13 @@ impl KernelConfig {
          Ok(())
      }
  
@@ -377,10 +381,10 @@ index 4b31108..043c10c 100644
  
  impl Response for ResponseEmpty {
 diff --git a/src/mnt/mount_options.rs b/src/mnt/mount_options.rs
-index 3ab2e0f..aa2bfb6 100644
+index 3ab2e0f..790d502 100644
 --- a/src/mnt/mount_options.rs
 +++ b/src/mnt/mount_options.rs
-@@ -5,19 +5,103 @@ use std::io::ErrorKind;
+@@ -5,19 +5,111 @@ use std::io::ErrorKind;
  use crate::SessionACL;
  
  /// Fuser session configuration, including mount options.
@@ -463,6 +467,12 @@ index 3ab2e0f..aa2bfb6 100644
 +    #[cfg(all(feature = "io-uring", target_os = "linux"))]
 +    #[doc(hidden)]
 +    pub io_uring_malformed_register: bool,
++    /// CONSTELLATION PATCH (io-uring): called each time a ring queue's lock-wait budget serves
++    /// a blocking lock request as a non-blocking one (see `Config::io_uring_queue_depth`'s
++    /// budget, `LockWaitDowngrades`), so the filesystem can count what its callers were
++    /// refused. `None` (the default): nobody is told.
++    #[cfg(all(feature = "io-uring", target_os = "linux"))]
++    pub io_uring_lock_wait_downgrades: Option<crate::LockWaitDowngrades>,
 +}
 +
 +// CONSTELLATION PATCH (io-uring): hand-written so `io_uring_queue_depth`
@@ -481,12 +491,14 @@ index 3ab2e0f..aa2bfb6 100644
 +            io_uring_kernel: None,
 +            #[cfg(all(feature = "io-uring", target_os = "linux"))]
 +            io_uring_malformed_register: false,
++            #[cfg(all(feature = "io-uring", target_os = "linux"))]
++            io_uring_lock_wait_downgrades: None,
 +        }
 +    }
  }
  
  /// Mount options accepted by the FUSE filesystem type
-@@ -308,6 +392,19 @@ mod test {
+@@ -308,6 +400,19 @@ mod test {
              .is_ok()
          );
      }
@@ -1100,7 +1112,7 @@ index 1ec5b91..8452275 100644
  
      /// Returns a Request reference for this request
 diff --git a/src/session.rs b/src/session.rs
-index cee8718..1f3795d 100644
+index cee8718..4330a1f 100644
 --- a/src/session.rs
 +++ b/src/session.rs
 @@ -41,6 +41,7 @@ use crate::ll::ResponseErrno;
@@ -1419,7 +1431,7 @@ index cee8718..1f3795d 100644
              <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
                  .send_ll(&response);
  
-@@ -781,6 +978,25 @@ impl<FS: Filesystem> Session<FS> {
+@@ -781,6 +978,29 @@ impl<FS: Filesystem> Session<FS> {
          }
      }
  
@@ -1431,7 +1443,7 @@ index cee8718..1f3795d 100644
 +        let payload_cap = (config.max_write as usize)
 +            .max(usize::from(config.max_pages()) * page_size::get())
 +            .max(8192);
-+        RingSet::new(
++        let set = RingSet::new(
 +            self.ch.device(),
 +            self.mount.mount.lock().is_some(),
 +            self.config.n_threads.unwrap_or(1),
@@ -1439,13 +1451,17 @@ index cee8718..1f3795d 100644
 +            payload_cap,
 +            self.config.io_uring_kernel.as_ref(),
 +            self.config.io_uring_malformed_register,
-+        )
++        )?;
++        if let Some(hook) = &self.config.io_uring_lock_wait_downgrades {
++            set.set_lock_wait_downgrades(hook);
++        }
++        Ok(set)
 +    }
 +
      /// Unmount the filesystem
      pub fn unmount(&mut self) -> io::Result<()> {
          self.mount.umount()
-@@ -793,12 +1009,372 @@ impl<FS: Filesystem> Session<FS> {
+@@ -793,12 +1013,372 @@ impl<FS: Filesystem> Session<FS> {
          }
      }
  
@@ -1818,7 +1834,7 @@ index cee8718..1f3795d 100644
  #[derive(Debug)]
  /// A thread-safe object that can be used to unmount a Filesystem
  pub struct SessionUnmounter {
-@@ -853,7 +1429,12 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
+@@ -853,7 +1433,12 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
              };
              match received {
                  Ok(None) => return Ok(LoopEnd::Stopped),
@@ -1832,7 +1848,7 @@ index cee8718..1f3795d 100644
                      // Dispatch request
                      Some(req) => {
                          if let Ok(Operation::Destroy(_)) = req.request.operation() {
-@@ -876,6 +1457,28 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
+@@ -876,6 +1461,28 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
              }
          }
      }
@@ -1861,7 +1877,7 @@ index cee8718..1f3795d 100644
  }
  
  /// The background session data structure
-@@ -915,3 +1518,2462 @@ impl BackgroundSession {
+@@ -915,3 +1522,2462 @@ impl BackgroundSession {
              })?
      }
  }
@@ -5092,10 +5108,10 @@ index 0000000..ab2babf
 +}
 diff --git a/src/uring/mod.rs b/src/uring/mod.rs
 new file mode 100644
-index 0000000..ac633cf
+index 0000000..f8ccd6d
 --- /dev/null
 +++ b/src/uring/mod.rs
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,532 @@
 +//! CONSTELLATION PATCH (io-uring): this whole file is Constellation's, not upstream
 +//! fuser's (vendor/fuser/CONSTELLATION-PATCH.md, patches/0002-io-uring-transport.patch).
 +//!
@@ -5163,7 +5179,49 @@ index 0000000..ac633cf
 +    }
 +}
 +
++/// CONSTELLATION PATCH (io-uring): a hook called once each time a queue's lock-wait budget
++/// serves a blocking lock request (`FUSE_SETLKW`) as a non-blocking one
++/// (`HeldRequest::downgrade_lock_wait`, `RingCommit::reserve_lock_wait`): a conflict on such a
++/// request is answered `ENOLCK` instead of waiting. Called on the ring thread, before the
++/// request is dispatched, so it must not block. Two hooks are equal when they are the same
++/// one (`Config` is `Eq`).
++#[derive(Clone)]
++pub struct LockWaitDowngrades(Arc<dyn Fn() + Send + Sync>);
++
++impl LockWaitDowngrades {
++    /// A hook calling `f`.
++    pub fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
++        Self(Arc::new(f))
++    }
++
++    pub(crate) fn notify(&self) {
++        (self.0)()
++    }
++}
++
++impl fmt::Debug for LockWaitDowngrades {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("LockWaitDowngrades")
++    }
++}
++
++impl PartialEq for LockWaitDowngrades {
++    fn eq(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.0, &other.0)
++    }
++}
++
++impl Eq for LockWaitDowngrades {}
++
 +impl RingSet {
++    /// CONSTELLATION PATCH (io-uring): tells `hook` about every lock-wait budget downgrade on
++    /// any of this set's rings (`LockWaitDowngrades`).
++    pub(crate) fn set_lock_wait_downgrades(&self, hook: &LockWaitDowngrades) {
++        for ring in &self.rings {
++            ring.set_lock_wait_downgrades(hook.clone());
++        }
++    }
++
 +    /// Opens the io_urings of `min(n_threads, queues)` rings over every possible CPU's queue,
 +    /// reserves their buffers and spawns their parked threads. The error text names what
 +    /// failed, for the session's fallback warning.
@@ -5588,10 +5646,10 @@ index 0000000..ac633cf
 +}
 diff --git a/src/uring/ring.rs b/src/uring/ring.rs
 new file mode 100644
-index 0000000..99620d4
+index 0000000..1de93ab
 --- /dev/null
 +++ b/src/uring/ring.rs
-@@ -0,0 +1,3827 @@
+@@ -0,0 +1,3840 @@
 +//! CONSTELLATION PATCH (io-uring): this whole file is Constellation's, not upstream
 +//! fuser's (vendor/fuser/CONSTELLATION-PATCH.md, patches/0002-io-uring-transport.patch).
 +//!
@@ -5844,6 +5902,10 @@ index 0000000..99620d4
 +    /// instead of two, which the kernel refuses with `EINVAL` before it records anything
 +    /// (`fuse_uring_get_iovec_from_sqe`). Set only through `Config::io_uring_malformed_register`.
 +    malformed_register: std::sync::atomic::AtomicBool,
++    /// CONSTELLATION PATCH (io-uring): told about every lock-wait budget downgrade
++    /// (`HeldRequest::downgrade_lock_wait`). Set only through
++    /// `Config::io_uring_lock_wait_downgrades`, before any request is served.
++    lock_wait_downgrades: OnceLock<super::LockWaitDowngrades>,
 +    #[cfg(test)]
 +    hooks: test::RingHooks,
 +}
@@ -6404,6 +6466,9 @@ index 0000000..99620d4
 +            .entry()
 +            .lock_downgraded
 +            .store(true, std::sync::atomic::Ordering::Relaxed);
++        if let Some(hook) = self.commit.ring.lock_wait_downgrades.get() {
++            hook.notify();
++        }
 +    }
 +}
 +
@@ -6630,6 +6695,7 @@ index 0000000..99620d4
 +            entries,
 +            mem: ManuallyDrop::new(mem),
 +            malformed_register: std::sync::atomic::AtomicBool::new(false),
++            lock_wait_downgrades: OnceLock::new(),
 +            #[cfg(test)]
 +            hooks: test::RingHooks::default(),
 +        }))
@@ -6689,6 +6755,11 @@ index 0000000..99620d4
 +    pub(crate) fn set_malformed_register(&self) {
 +        self.malformed_register
 +            .store(true, std::sync::atomic::Ordering::Relaxed);
++    }
++
++    /// CONSTELLATION PATCH (io-uring): see `Ring::lock_wait_downgrades`.
++    pub(crate) fn set_lock_wait_downgrades(&self, hook: super::LockWaitDowngrades) {
++        let _ = self.lock_wait_downgrades.set(hook);
 +    }
 +
 +    fn commit_sqe(&self, e: &RingEntry, commit_id: u64) -> squeue::Entry128 {

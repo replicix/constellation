@@ -378,6 +378,18 @@ marked `CONSTELLATION PATCH (io-uring)`:
   `blocking_lock_waits_never_take_a_queues_last_entry` fails without the
   budget (its second waiter takes the queue's last entry and is never
   answered) and passes with it.
+- **Each budget downgrade is reported** (plan 38 Z2c; `uring/mod.rs`:
+  `LockWaitDowngrades`; `mnt/mount_options.rs`:
+  `Config::io_uring_lock_wait_downgrades`; `uring/ring.rs`:
+  `Ring::lock_wait_downgrades`, called from `HeldRequest::downgrade_lock_wait`).
+  A downgraded request is answered differently from what the caller asked
+  (`ENOLCK` instead of a wait), and the filesystem never sees the original
+  opcode — the rewritten `FUSE_SETLK` is all that reaches `Filesystem::setlk`
+  — so only this crate can count them. The hook runs on the ring thread,
+  once per downgrade, before the dispatch; Constellation counts per session
+  and process-wide (`node.status`'s `lock_wait_downgrades`,
+  `constellation_fuse_lock_wait_downgrades_total`). `wire_uring.rs`'s budget
+  test asserts it fires exactly once for its one downgrade.
 - **A refused registration is a constructor error**
   (`uring/ring.rs`: `register_all`; `uring/mod.rs`: `RegistrationRefused`).
   The kernel validates a `REGISTER` when it is issued and posts a refusal's

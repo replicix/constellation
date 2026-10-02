@@ -118,8 +118,20 @@ pub fn cmd_serve(
             web_ui: 0,
             log_buffer,
             resumed: None,
-            // A headless node mounts nothing: no FUSE transport options.
-            fuse_transport: Default::default(),
+            // A headless node makes no mount of its own, but `view.mount`
+            // with a path (control.rs) makes a plain one — CSI engine pods
+            // included — and it follows the same transport policy as a
+            // daemon's plain mount (plan 38 Z2c): `auto` unless the
+            // environment or the profile says otherwise, with cluster-lock
+            // mounts on /dev/fuse under `auto` anyway. `view.mount` on a
+            // pre-opened descriptor is handover-capable and pinned to
+            // /dev/fuse whatever this says.
+            fuse_transport: constellation_frontend_fuse::TransportConfig::resolve(
+                None,
+                None,
+                crate::node_runtime::profile_transport()?,
+            )
+            .map_err(anyhow::Error::msg)?,
             control_socket: Some(control_socket.clone()),
             persistent: true,
         },

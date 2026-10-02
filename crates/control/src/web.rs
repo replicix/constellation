@@ -971,8 +971,9 @@ fn render_vfs_ops(output: &mut String, ops: &VfsOpsStatus) {
 }
 
 /// Plan 38 §5's FUSE transport metrics: the process-wide
-/// `constellation_fuse_transport_fallbacks_total{from,to,reason}` and
-/// `constellation_fuse_zero_copy_reads_total` counters, and per mount (by
+/// `constellation_fuse_transport_fallbacks_total{from,to,reason}`,
+/// `constellation_fuse_zero_copy_reads_total` and (Z2c)
+/// `constellation_fuse_lock_wait_downgrades_total` counters, and per mount (by
 /// `mountpoint`, as many series as there are mounts) the
 /// `constellation_fuse_passthrough_opens` and
 /// `constellation_fuse_uring_queue_depth` gauges.
@@ -998,6 +999,13 @@ fn render_fuse(output: &mut String, fuse: &FuseStatus) {
          # TYPE constellation_fuse_zero_copy_reads_total counter\n\
          constellation_fuse_zero_copy_reads_total {}\n",
         fuse.zero_copy_reads_total
+    );
+    let _ = write!(
+        output,
+        "# HELP constellation_fuse_lock_wait_downgrades_total Blocking FUSE lock requests a ring queue's lock-wait budget served as non-blocking (ENOLCK when contended).\n\
+         # TYPE constellation_fuse_lock_wait_downgrades_total counter\n\
+         constellation_fuse_lock_wait_downgrades_total {}\n",
+        fuse.lock_wait_downgrades_total
     );
     output.push_str(
         "# HELP constellation_fuse_passthrough_opens Open FUSE handles the kernel reads straight from a cached chunk file.\n\
@@ -1278,6 +1286,7 @@ mod tests {
                 count: 2,
             }],
             zero_copy_reads_total: 0,
+            lock_wait_downgrades_total: 5,
         };
         let mut out = String::new();
         render_fuse(&mut out, &fuse);
@@ -1286,6 +1295,8 @@ mod tests {
             "constellation_fuse_transport_fallbacks_total{from=\"uring\",to=\"dev_fuse\",reason=\"kernel_not_offered\"} 2",
             "# TYPE constellation_fuse_zero_copy_reads_total counter",
             "constellation_fuse_zero_copy_reads_total 0",
+            "# TYPE constellation_fuse_lock_wait_downgrades_total counter",
+            "constellation_fuse_lock_wait_downgrades_total 5",
             "# TYPE constellation_fuse_passthrough_opens gauge",
             "constellation_fuse_passthrough_opens{mountpoint=\"/mnt/a\"} 3",
             "constellation_fuse_passthrough_opens{mountpoint=\"/mnt/\\\"b\\\"\"} 0",

@@ -2473,7 +2473,7 @@
           "type": "string"
         },
         "reason": {
-          "description": "The rung that refused, a fixed name: `handover_capable`,\n`no_io_uring_feature`, `kernel_not_offered`, `ring_setup_failed`.",
+          "description": "The rung that refused, a fixed name: `no_io_uring_feature`,\n`kernel_not_offered`, `cluster_locks`, `handover_capable`,\n`ring_setup_failed`.",
           "type": "string"
         },
         "to": {
@@ -2535,6 +2535,13 @@
           ],
           "default": null,
           "description": "The transport fallback this mount's handshake took, if it took\none (plan 38 §2.4: logged once, and visible here)."
+        },
+        "lock_wait_downgrades": {
+          "default": 0,
+          "description": "Blocking lock requests this mount's ring served as non-blocking\n(see [`FuseStatus::lock_wait_downgrades_total`]); always 0 on\n`dev_fuse`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "mountpoint": {
           "type": "string"
@@ -2673,6 +2680,13 @@
     "FuseStatus": {
       "description": "Plan 38 §5's `fuse` section: what each FUSE mount's connection is\nserved over and what of the read path's fast lanes it uses, plus the\nprocess-wide counters behind `constellation_fuse_*`.\n\n`cache_verify` (`admit`/`always`, plan 38 §2.3), which decides whether\npassthrough and zero-copy may be used at all, is node-wide and is\nreported once, as [`CacheStatus::cache_verify`]; it is deliberately not\nrepeated here.",
       "properties": {
+        "lock_wait_downgrades_total": {
+          "default": 0,
+          "description": "Blocking lock requests (`F_SETLKW`, blocking `flock`) every ring\nsession of this process served as non-blocking because their ring\nqueue's lock-wait budget (`depth - 1` waiters) was spent — answered\n`ENOLCK` where the lock was contended\n(`constellation_fuse_lock_wait_downgrades_total`, plan 38 Z2c).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "mounts": {
           "default": [],
           "description": "One entry per mount with a FUSE session behind it, by mount id.",
@@ -7735,6 +7749,7 @@
         "fuse": {
           "$ref": "#/$defs/FuseStatus",
           "default": {
+            "lock_wait_downgrades_total": 0,
             "mounts": [],
             "transport_fallbacks": [],
             "zero_copy_reads_total": 0
