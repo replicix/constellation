@@ -31892,3 +31892,129 @@ Same host (load 25-45), `CARGO_TARGET_DIR` unset, `ulimit -n 65536`.
 - A rescheduled controller-owned pod starts with a fresh state dir and
   joins as a new Constellation node, leaving the old node in the roster
   until 37-k6b's drain/GC handles departures.
+
+## Fix: lock exclusion under load (`lock-exclusion`)
+
+Two lock scenarios failed once each in the `box-gates` full matrix on
+the shared 16-vCPU host (load 40–130). Both passed when rerun alone.
+
+### Fix: a grant recalled before its first use was not renewed (`git-under-flock-b2b`)
+
+The failure: 21 turns overlapped. b#21 got the turn lock and was in it
+for 21.5 s (`edit` took 19.4 s), and a took ten turns during that time.
+The daemon logs give the order of events. a pushed b the grant (granted
+at 01:43:11.1 on a's clock). a#21 asked straight away, so a recalled the
+grant. b's FUSE thread was still waiting for the grant's floor and hit
+the session budget (WARN "floor was not reached" at 14.28). It took its
+local lock with under a second of the window left. a got no renewal and
+outwaited the grant at 17.116, which is the grant time + ttl + margin
+(INFO "recall went unanswered"). a then granted itself the lock. b's
+grant had lapsed under `flock` (`fenced_io` 59, `lost` 0), so only the
+turn file was fenced. Git never touches the turn file, so b went on
+writing the repository unprotected.
+
+The mechanism: `due_renewals` renewed a recalled grant only while
+local locks were under it. A grant recalled before its first use has no
+local lock yet: `first_use` pins it, so it cannot be released either.
+It was not renewed until the FUSE thread took that lock. That thread
+first waits for the floor (up to the 2 s session budget) and the
+kernel's invalidation (up to 1 s), which can be past the renewal point
+(`sent + 2 s`). The first renewal then went out with a fraction of the
+4 s window left, and under load its answer did not come back in time.
+Meanwhile `lock_arm_renew_tick` armed the tick from that grant's past
+renewal point, so the tick re-armed every millisecond until the local
+lock came.
+
+Fix (`crates/meta/src/locks.rs`): `LockTables::renewable` treats a
+grant as renewable when it is not recalled, when local locks are under
+it, or when it is still waiting for its first use. `due_renewals` uses
+it, and the new `next_renewal_ms` arms the tick only from grants that
+will be renewed. `lock_arm_renew_tick` uses `next_renewal_ms`. Fencing
+semantics are unchanged: a grant that lapses is still never renewed,
+and I/O under it on the locked file is still `EIO`. The cluster-locks
+doc says so, and keeps its warning that a lapse leaves other files
+guarded by the lock unprotected.
+
+Regression test:
+`core::tests::locks::a_grant_recalled_before_its_first_use_is_renewed_in_its_window`.
+Before the fix it fails with "the renewal tick spins: 9 ticks by 2.007 s"
+and sends no renewal before the window ends.
+
+What remains: a stall longer than the grant's window still lapses the
+grant. That covers a whole node, its owner, or the P2P path between
+them (the failing run's b had 4 s path RTTs to a). This is the
+documented limit ("a lapsed grant fences I/O only on the locked file").
+The oracle is right to count overlaps, and it was not loosened.
+
+### Fix: a new tenure's first grant waited for a delegation it had made (`lock-grant-dead-generation`)
+
+The failure: b's first, uncontended `flock` on the root's `turn` file
+waited 451 s. The passing pre-fix run took 1.307 s for the same lock;
+after the fix it takes 54–65 ms. A new tenure makes no new root grant
+until every delegation it inherited has renewed with it
+(`lock_tenure_floor_ready`). The tenure collected those generations
+lazily, at its first grant. The scenario delegates `d1` to c at
+01:50:16.99 and b locks at 17.27, so gen 1, made by this tenure a
+moment before, was waited for as if it were inherited. c's renewal was
+lost under load. The wait ended only when a reclaimed gen 1 at 20.99.
+By then b's and c's pooled P2P connections to a had died (evicted at
+22.5 and 23.1). a's gossip could not reach b until the end of the run,
+and b's dial to a timed out at 01:52:41. So a's push of the grant was
+lost, and b's re-requests waited for the path to come back: 451 s. The
+lock protocol recovers from a lost push on its own. The next re-send
+re-affirms the grant on its reply, and a blocking request resumes within
+`8 × forward_backoff/4` of the link reporting up. What turned a
+4-second wait into 451 s was the P2P outage between a and b, which is
+outside the lock code.
+
+Fix (`crates/authority/src/core/locks.rs`): generations this tenure
+delegates before it has collected the ones to wait for
+(`LockState::tenure_minted`, recorded in `lock_on_delegated`) are not
+waited for. Their streams start in this tenure, so no earlier floor
+can name them. The set is cleared with the tenure (`lock_on_lease_gone`)
+and when the floor is noted. Regression test:
+`core::tests::locks::a_new_tenure_does_not_wait_for_a_delegation_it_made_itself`.
+Before the fix the request is parked behind the new delegate's renewal.
+
+### Harness: per-run log directory for the M11 scenarios
+
+`dump_logs_on_failure` (M11 scenarios, `lock-grant-dead-generation`) and
+the `HARNESS_KEEP_LOGS` dump in `m6` wrote to the fixed
+`/tmp/harness-m11-logs`. Concurrent runs on one host overwrote each
+other's logs of the same scenario. They now write to
+`$TMPDIR/harness-m11-logs-<pid>-<ts>`, one directory per harness run
+(`m11::kept_logs_dir`).
+
+### Files
+
+- `crates/meta/src/locks.rs` (`renewable`, `due_renewals`, `next_renewal_ms`)
+- `crates/authority/src/core/locks.rs` (`lock_arm_renew_tick`, `tenure_minted`)
+- `crates/authority/src/core/tests.rs` (two regression tests)
+- `crates/harness/src/scenarios/m11.rs`, `m6.rs` (`kept_logs_dir`)
+- `docs/reference/features/cluster-locks.md` (renewal of a grant awaiting its first use; own generations are not waited for)
+
+### Results (this worktree at `1575d1d`, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, prefix `lockx`, host load 25–110 from other agents)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test` per crate (whole workspace: authority incl. sim 107, meta, engine 407, model 138, the rest) | 0 failed |
+| the two regression tests without their fix | both fail (above) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `harness run lock-grant-dead-generation` ×10 (seeds 43–52) | 10/10 PASSED; b's first uncontended grant 54–65 ms (before: 1.307 s passing, 451 s failing) |
+| `harness run git-under-flock-b2b` ×10 | 9/10 PASSED, 0 overlapping turns in all 10. Run 6 failed on something else (below) |
+| `flock-cross-node lock-holder-partitioned lock-failover lock-holder-killed-contention lock-fence-at-close lock-latency stale-daemon-lock sqlite-two-nodes` ×3 | 24/24 PASSED |
+| `git-under-flock`, `git-under-flock-gc`, `git-under-flock-faults` ×3 each | 9/9 PASSED |
+| `git-under-flock-rounds` ×4 | 3/4 PASSED. Run 3 had 2 overlapping turns: the owner (a) stalled 5.5 s (no metadata publishes from 05:45:33.27 to 38.79, and b and c both evicted their connections to a as unanswered). That is past b's 4 s window, so the grant lapsed on b (`fenced_io` 4) and a outwaited it when it woke. This is the documented limit above. It ran while this worktree's clippy and test builds were loading the host. |
+| `git-under-flock-causal` ×3 | 0/3, the known reader-ordering bug (`git-flock-causal`). 0 overlapping turns |
+
+Not this change: b2b run 6 failed because `git add` on b got ENOENT
+creating `objects/xx/tmp_obj_*` ("unable to create temporary file: No
+such file or directory"). That is git's create, then mkdir, then create
+again in a directory, with the second create failing. b was the placed
+delegate of a subtree at the time. No lock anomaly (`lost` 0,
+`fenced_io` 0, `grants_degraded` 0, session timeouts 0). Causal run 3's
+committer b also hit `invalid object … Error building trees` under the
+lock. Both look like the cross-node visibility family that
+`git-under-flock-causal` is investigating.

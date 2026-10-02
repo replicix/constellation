@@ -201,14 +201,30 @@ pub(super) fn unmount_all(clients: &mut [Client]) {
     }
 }
 
-/// A failed scenario's daemon logs, kept under `/tmp/harness-m11-logs/`
-/// (the mounts' temp dir goes with the scenario).
+/// Where this harness run keeps daemon logs (`dump_logs_on_failure`,
+/// `HARNESS_KEEP_LOGS`): `$TMPDIR/harness-m11-logs-<pid>-<ts>`, one per
+/// run. A fixed `/tmp/harness-m11-logs` was shared by every run on the
+/// host, so concurrent runs (several worktrees, a matrix and a rerun)
+/// overwrote each other's logs of the same scenario.
+pub(super) fn kept_logs_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::temp_dir().join(format!(
+            "harness-m11-logs-{}-{}",
+            std::process::id(),
+            super::ts()
+        ))
+    })
+}
+
+/// A failed scenario's daemon logs, kept under [`kept_logs_dir`] (the
+/// mounts' temp dir goes with the scenario).
 pub(super) fn dump_logs_on_failure(scenario: &str, clients: &[Client], result: &Result<()>) {
     // `HARNESS_KEEP_LOGS=1` keeps a passing scenario's logs too.
     if result.is_ok() && std::env::var_os("HARNESS_KEEP_LOGS").is_none() {
         return;
     }
-    let dir = std::path::Path::new("/tmp/harness-m11-logs");
+    let dir = kept_logs_dir();
     let _ = std::fs::create_dir_all(dir);
     for c in clients {
         let path = dir.join(format!("{scenario}-{}.log", c.name));

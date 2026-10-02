@@ -6165,6 +6165,51 @@ mod locks {
         assert!(h2.core.stats.lock_dir_floors > 0);
     }
 
+    /// `lock-grant-dead-generation` (b's uncontended `flock` on a root
+    /// file waited 451 s): a new tenure grants nothing until the
+    /// delegations it *inherited* have renewed with it, but it collected
+    /// them at its first grant, so a generation it had just made itself
+    /// counted too, and the grant waited for that delegate's renewal (or
+    /// its reclaim, when the renewal was lost). Its own generation's
+    /// stream starts in this tenure: no earlier floor names it.
+    #[test]
+    fn a_new_tenure_does_not_wait_for_a_delegation_it_made_itself() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let op = h.create("d1");
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let MutateOp::Create { ino: dir, .. } = op else {
+            unreachable!()
+        };
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    op: OpId(900),
+                    result: Ok(_)
+                }
+            )),
+            "not delegated: {out:?}"
+        );
+        h.advance(10);
+        let out = request(&mut h, 2, 74, ino, X, true);
+        let rs = lock_replies(&out);
+        assert!(
+            matches!(rs.as_slice(), [(2, _, LockOutcome::Granted { .. })]),
+            "the root file's lock waited for the new delegate's renewal: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_tenure_waits, 0);
+    }
+
     /// A holder that lost its lease and holds it again keeps its floors
     /// (positions are the cluster's), and its new tenure's first grant
     /// floors everything with what it has.
@@ -6944,6 +6989,82 @@ mod locks {
         ));
         assert!(r.meta.locks().held(42).is_none());
         assert_eq!(r.core.stats.lock_released, 1);
+    }
+
+    /// `git-under-flock-b2b` (two committers in the turn lock at once): a
+    /// grant recalled before its first use — the other committer asked
+    /// while this node's FUSE thread still waited for the grant's floor
+    /// (up to the 2 s session budget, plus 1 s for the kernel's cache) —
+    /// is pinned by that first use, so it is neither released nor, as it
+    /// was, renewed: the renewal went out only once the local lock was
+    /// taken, past the renewal point, with a fraction of the window
+    /// left, and the grant lapsed under the application's `flock` while
+    /// the owner outwaited it and handed the lock on. It is renewed at
+    /// its renewal point like any grant in use, and the tick does not
+    /// spin meanwhile (it re-armed itself every millisecond).
+    #[test]
+    fn a_grant_recalled_before_its_first_use_is_renewed_in_its_window() {
+        let mut r = requester();
+        let sent = r.now;
+        let req = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 1 },
+            },
+        });
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::LockFlush { .. })),
+            "released before its first use: {out:?}"
+        );
+        if let Some(t) = timers(&out, TimerKind::LockRenewTick).first() {
+            tick = *t;
+        }
+        // The FUSE thread is still in its floor wait: run the ticks up
+        // to the window's end.
+        let mut ticks = 0;
+        let mut renewed = None;
+        while renewed.is_none() {
+            let at = r.core.timer_at(tick).expect("the renewal tick is armed");
+            assert!(
+                at.0 < sent.0 + 4_000,
+                "no renewal tick inside the window: next at {at:?}"
+            );
+            r.now = at;
+            let out = r.step(Event::Timer { id: tick });
+            ticks += 1;
+            assert!(
+                ticks <= 8,
+                "the renewal tick spins: {ticks} ticks by {:?}",
+                r.now
+            );
+            renewed = sends(&out).iter().find_map(|(to, m)| match m {
+                PeerMsg::LockRenew { entries, .. } if *to == 1 => Some(entries.clone()),
+                _ => None,
+            });
+            if renewed.is_none() {
+                tick = timer_of(&out, TimerKind::LockRenewTick);
+            }
+        }
+        assert!(
+            r.now.0 <= sent.0 + 2_000 + 1,
+            "renewed late, at {} ms into the window",
+            r.now.0 - sent.0
+        );
+        assert_eq!(renewed.unwrap()[0].grant, GrantId { node: 1, seq: 1 });
     }
 
     /// A recall that overtakes the reply carrying its grant is

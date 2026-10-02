@@ -781,26 +781,58 @@ impl LockTables {
         h
     }
 
-    /// Grants to renew: honoured, past `renew_at`, no renewal in flight.
-    /// Marks them renewing at `now_ms`.
+    /// Whether `h` is kept alive by renewals. A recalled grant is renewed
+    /// only while something pins it — local locks under it, or the one
+    /// local lock it was granted for and has not served yet
+    /// (`first_use`): its release is what the owner waits for, and it
+    /// cannot be released before that lock has come and gone. The FUSE
+    /// thread takes that lock only once the grant's floor is reached (up
+    /// to the session budget) and the kernel's cache dropped: unrenewed
+    /// meanwhile, the grant was renewed only from that lock on, past its
+    /// renewal point, and lapsed under the application's `flock` when
+    /// the late renewal's answer did not come back in what was left of
+    /// the window (`git-under-flock-b2b`: two committers in the turn at
+    /// once).
+    fn renewable(h: &HeldGrant, pinned: bool) -> bool {
+        !h.recalled || pinned || h.first_use
+    }
+
+    /// Grants to renew: honoured, past `renew_at`, no renewal in flight,
+    /// [`Self::renewable`]. Marks them renewing at `now_ms`.
     pub fn due_renewals(&self, now_ms: i64) -> Vec<(u64, HeldGrant)> {
         let mut g = self.lock();
         let mut due = Vec::new();
         let Inner { held, local, .. } = &mut *g;
         for (ino, h) in held.iter_mut() {
-            // A recalled grant is renewed only while local locks are
-            // under it (its release is what the owner waits for).
             let pinned = local.get(ino).is_some_and(|v| !v.is_empty());
             if h.until_ms > now_ms
                 && now_ms >= h.renew_at_ms
                 && h.renewing.is_none()
-                && (!h.recalled || pinned)
+                && Self::renewable(h, pinned)
             {
                 h.renewing = Some(now_ms);
                 due.push((*ino, *h));
             }
         }
         due
+    }
+
+    /// The earliest renewal point among the grants [`Self::due_renewals`]
+    /// would renew (honoured, no renewal in flight, renewable); `None`
+    /// when there is none. The renewal tick is armed from this alone: a
+    /// grant that is not renewed (released, or recalled with nothing
+    /// pinning it) has a renewal point in the past, and arming from it
+    /// re-armed the tick every millisecond for as long as it stayed.
+    pub fn next_renewal_ms(&self, now_ms: i64) -> Option<i64> {
+        let g = self.lock();
+        g.held
+            .iter()
+            .filter(|(ino, h)| {
+                let pinned = g.local.get(ino).is_some_and(|v| !v.is_empty());
+                h.until_ms > now_ms && h.renewing.is_none() && Self::renewable(h, pinned)
+            })
+            .map(|(_, h)| h.renew_at_ms)
+            .min()
     }
 
     /// A renewal of `id` sent at `sent_ms` was answered: the owner holds

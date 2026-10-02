@@ -242,6 +242,18 @@ pub(crate) struct LockState {
     tenure_waiting: Option<std::collections::BTreeSet<u64>>,
     /// The heads those renewals carried, for the tenure floor.
     tenure_heads: Vec<(u64, u64)>,
+    /// Generations this tenure delegated before `tenure_waiting` was
+    /// collected (it is collected at the tenure's first grant, not when
+    /// the tenure begins). They are not inherited: their streams start
+    /// in this tenure, so no floor of a previous one can name them, and
+    /// waiting for their delegate's renewal only held the root's own
+    /// first grant hostage to a delegate's liveness
+    /// (`lock-grant-dead-generation`: an uncontended `flock` on a root
+    /// file parked behind the renewal of a delegation made a moment
+    /// before; the renewal was lost, the grant waited for the delegation
+    /// to be reclaimed, and by then the requester's link was down —
+    /// 451 s).
+    tenure_minted: std::collections::BTreeSet<u64>,
 }
 
 /// How many subtree floors an owner keeps before folding them into one
@@ -767,7 +779,9 @@ impl Core {
                 self.dl
                     .gens
                     .iter()
-                    .filter(|(_, g)| !g.ended && g.node != me)
+                    .filter(|(gen, g)| {
+                        !g.ended && g.node != me && !self.lk.tenure_minted.contains(*gen)
+                    })
                     .map(|(gen, _)| *gen)
                     .collect(),
             );
@@ -795,6 +809,7 @@ impl Core {
         }
         self.lk.tenure_floor_due = false;
         self.lk.tenure_waiting = None;
+        self.lk.tenure_minted.clear();
         let mut floor = self.lock_release_floor(replica);
         for (gen, head) in std::mem::take(&mut self.lk.tenure_heads) {
             let mut p = Position::ZERO;
@@ -2071,14 +2086,7 @@ impl Core {
     /// closed, and the grant lapsed under the application's lock.
     fn lock_arm_renew_tick(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         let mut at = now.plus((self.cfg.lock_ttl_ms / 4).max(50));
-        if let Some(first) = replica
-            .locks()
-            .held_all()
-            .iter()
-            .filter(|(_, h)| h.renewing.is_none() && h.until_ms > now.0)
-            .map(|(_, h)| h.renew_at_ms)
-            .min()
-        {
+        if let Some(first) = replica.locks().next_renewal_ms(now.0) {
             at = at.min(Ms(first.max(now.0 + 1)));
         }
         if let Some((t, armed)) = self.lk.renew_timer.zip(self.lk.renew_at) {
@@ -2521,6 +2529,9 @@ impl Core {
     /// Root: a delegation was granted; its subtree's grants go with it
     /// (handed over with the delegate's first renewal).
     pub(crate) fn lock_on_delegated(&mut self, gen: u64, replica: &dyn Replica) {
+        if self.lk.tenure_floor_due && self.lk.tenure_waiting.is_none() {
+            self.lk.tenure_minted.insert(gen);
+        }
         let moved = replica.locks().take_where(|ino| {
             let keys = Self::read_keys(ino, None);
             matches!(
@@ -2881,6 +2892,7 @@ impl Core {
         self.lk.tenure_floor_due = true;
         self.lk.tenure_waiting = None;
         self.lk.tenure_heads.clear();
+        self.lk.tenure_minted.clear();
         let waiters = std::mem::take(&mut self.lk.waiters);
         for w in waiters {
             if let Some(t) = w.held_timer {

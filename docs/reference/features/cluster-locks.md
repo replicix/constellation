@@ -97,7 +97,17 @@ A grant is renewed half-way through the window the node honours it for
 `LockRenew` message per owning sequencer carrying every grant that is
 due; the renewal tick is armed for the earliest renewal point, so a
 short grant is renewed inside its window too. A grant is renewed only
-while it is still honoured; a lapsed grant is never renewed.
+while it is still honoured; a lapsed grant is never renewed. A recalled
+grant is renewed while something still pins it: local locks under it,
+or the one local lock it was granted for and has not served yet. That
+first lock is taken only after the grant's floor is reached (up to the
+session budget, 2 s) and the kernel's cache of the file is dropped
+(up to 1 s), which can be past the renewal point. Before, such a grant
+was renewed only once that lock was taken, with a fraction of its window
+left, and it lapsed under the application's lock when the late renewal's
+answer did not come back in time: the owner outwaited it and granted the
+lock to the next node while the application still held its `flock`
+(harness `git-under-flock-b2b`: two committers in the turn at once).
 
 A delegate's grants are capped by what is left of its own delegation,
 so it keeps that authority topped up: while it has grants out it renews
@@ -254,7 +264,14 @@ when the owner changes:
   position joined with those indices. A release that the previous
   tenure recorded may name a delegate's stream beyond what that
   delegate has re-streamed to the new root, and the renewal is how the
-  new root learns how far the stream goes.
+  new root learns how far the stream goes. A delegation the tenure made
+  itself is not waited for: its stream starts in this tenure, so no
+  earlier floor names it. Before, the tenure collected the delegations
+  to wait for at its first grant, so one it had just made counted too.
+  An uncontended lock on a root file then waited for that delegate's
+  renewal, or for its reclaim when the renewal was lost (harness
+  `lock-grant-dead-generation`: 451 s, the requester's link to the
+  root having failed meanwhile).
 
 A floor on a directory or on the whole namespace is coarser than a
 per-file one. It can make a grant wait for a position that the file

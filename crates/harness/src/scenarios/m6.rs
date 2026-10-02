@@ -373,7 +373,7 @@ pub fn session_forwarded_ryw(_seed: u64) -> Result<()> {
     })();
     // Kept at the end, so a failure in any phase has its logs.
     if std::env::var_os("HARNESS_KEEP_LOGS").is_some() {
-        let dir = std::path::Path::new("/tmp/harness-m11-logs");
+        let dir = super::m11::kept_logs_dir();
         let _ = std::fs::create_dir_all(dir);
         for c in [&a, &b] {
             let path = dir.join(format!("{NAME}-{}.log", c.name));
