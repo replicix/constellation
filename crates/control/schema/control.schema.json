@@ -4876,6 +4876,36 @@
       ],
       "type": "object"
     },
+    "ReclaimEstimate": {
+      "description": "What deleting a set of snapshots would give back once GC has run (plan\n32 Step 6): the bytes and chunks no other snapshot and not the live\ntree reference, as of the accounting index's commit `as_of_seq`;\n`building` while that index is still being built.",
+      "properties": {
+        "as_of_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "building": {
+          "type": "boolean"
+        },
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunks": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes",
+        "chunks",
+        "as_of_seq",
+        "building"
+      ],
+      "type": "object"
+    },
     "RefHashes": {
       "description": "`snapshot.refs`.",
       "properties": {
@@ -6111,6 +6141,29 @@
       ],
       "type": "object"
     },
+    "SnapshotDeleteManyParams": {
+      "description": "`snapshot.delete_many`: resolve `selectors` (as `snapshot.resolve`\ndoes) and delete them all in one batch at the lease holder. A held\nsnapshot is refused per item, naming its owner, unless `force`.\n`dry_run` resolves and reports what would be refused, and deletes\nnothing.",
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "type": "boolean"
+        },
+        "force": {
+          "default": false,
+          "type": "boolean"
+        },
+        "selectors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "selectors"
+      ],
+      "type": "object"
+    },
     "SnapshotDeleteParams": {
       "description": "`snapshot.delete`. A held snapshot is refused (the message names the\nowner) unless `force`.",
       "properties": {
@@ -6198,6 +6251,37 @@
       ],
       "type": "object"
     },
+    "SnapshotRefusal": {
+      "description": "One snapshot `snapshot.delete_many` did not delete, and why.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "SnapshotResolveParams": {
+      "description": "`snapshot.resolve`: plan 32 Step 5's selectors — `path@name`,\n`path@a%b` (the chain of `path@a` from `a` to `b` inclusive),\n`path@prefix*` (a single trailing glob), or a bare snapshot id.",
+      "properties": {
+        "selectors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "selectors"
+      ],
+      "type": "object"
+    },
     "SnapshotStatus": {
       "description": "One snapshot, as `snapshot.list`/`snapshot.create`/`snapshot.hold`\nreport it. Everything after `created_unix_ms` is plan 32 §0.4's row\nextension; a snapshot taken before it reports the defaults (`manual`,\nnot held, no owner, no size).",
       "properties": {
@@ -6258,6 +6342,16 @@
         },
         "root_hash": {
           "type": "string"
+        },
+        "seq": {
+          "default": null,
+          "description": "The metadata commit the snapshot froze (its `root_hash`'s seq):\nwith `created_unix_ms`, the order of a chain (plan 32 §0.2).\nAbsent when the root does not parse.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -6266,6 +6360,46 @@
         "name",
         "root_hash",
         "created_unix_ms"
+      ],
+      "type": "object"
+    },
+    "SnapshotsDeleted": {
+      "description": "`snapshot.delete_many`'s result. `resolved` is every snapshot the\nselectors named, in chain order; `deleted` the ids actually deleted\n(always empty for a dry run); `refused` the ones that were not, with\nthe reason. `reclaim` is `None` until space accounting exists.",
+      "properties": {
+        "deleted": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reclaim": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReclaimEstimate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "refused": {
+          "items": {
+            "$ref": "#/$defs/SnapshotRefusal"
+          },
+          "type": "array"
+        },
+        "resolved": {
+          "items": {
+            "$ref": "#/$defs/SnapshotStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "resolved",
+        "deleted",
+        "refused"
       ],
       "type": "object"
     },
@@ -8606,6 +8740,17 @@
       },
       "streaming": "none"
     },
+    "snapshot.delete_many": {
+      "min_role": "admin",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/SnapshotDeleteManyParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapshotsDeleted"
+      },
+      "streaming": "none"
+    },
     "snapshot.hold": {
       "min_role": "operator",
       "mutating": true,
@@ -8713,6 +8858,17 @@
       },
       "result": {
         "$ref": "#/$defs/RefHashes"
+      },
+      "streaming": "none"
+    },
+    "snapshot.resolve": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/SnapshotResolveParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapshotListing"
       },
       "streaming": "none"
     },

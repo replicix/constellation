@@ -55,7 +55,8 @@ pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
 pub use message::{
     ChunkDecline, ChunkStatus, EpochCarrier, EpochClaim, LockOutcomeWire, LockRenewResultWire,
     LockRenewWire, LockTestOutcomeWire, Payload, Signed, SnapshotBatchOutcome, SnapshotItem,
-    SnapshotItemResult, SnapshotRowWire, ALPN,
+    SnapshotItemResult, SnapshotRowWire, ALPN, MAX_SNAPSHOT_DELETES_PER_BATCH,
+    MAX_SNAPSHOT_REASON_BYTES,
 };
 pub use paths::PathSummary;
 pub use peers::{run_gossip, Peer, PeerEnrollment, Peers, Refresher};

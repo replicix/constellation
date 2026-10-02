@@ -189,6 +189,11 @@ pub struct SnapshotStatus {
     /// it was not available at creation.
     #[serde(default)]
     pub refer_bytes: Option<u64>,
+    /// The metadata commit the snapshot froze (its `root_hash`'s seq):
+    /// with `created_unix_ms`, the order of a chain (plan 32 §0.2).
+    /// Absent when the root does not parse.
+    #[serde(default)]
+    pub seq: Option<u64>,
 }
 
 /// One offline designation, as exposed by the control API.
@@ -2239,6 +2244,28 @@ pub struct SnapshotDeleteParams {
     pub force: bool,
 }
 
+/// `snapshot.resolve`: plan 32 Step 5's selectors — `path@name`,
+/// `path@a%b` (the chain of `path@a` from `a` to `b` inclusive),
+/// `path@prefix*` (a single trailing glob), or a bare snapshot id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotResolveParams {
+    pub selectors: Vec<String>,
+}
+
+/// `snapshot.delete_many`: resolve `selectors` (as `snapshot.resolve`
+/// does) and delete them all in one batch at the lease holder. A held
+/// snapshot is refused per item, naming its owner, unless `force`.
+/// `dry_run` resolves and reports what would be refused, and deletes
+/// nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotDeleteManyParams {
+    pub selectors: Vec<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// `clone.create`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CloneParams {
@@ -2706,6 +2733,38 @@ pub struct SnapshotCreated {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotListing {
     pub snapshots: Vec<SnapshotStatus>,
+}
+
+/// One snapshot `snapshot.delete_many` did not delete, and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotRefusal {
+    pub id: String,
+    pub reason: String,
+}
+
+/// What deleting a set of snapshots would give back once GC has run (plan
+/// 32 Step 6): the bytes and chunks no other snapshot and not the live
+/// tree reference, as of the accounting index's commit `as_of_seq`;
+/// `building` while that index is still being built.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReclaimEstimate {
+    pub bytes: u64,
+    pub chunks: u64,
+    pub as_of_seq: u64,
+    pub building: bool,
+}
+
+/// `snapshot.delete_many`'s result. `resolved` is every snapshot the
+/// selectors named, in chain order; `deleted` the ids actually deleted
+/// (always empty for a dry run); `refused` the ones that were not, with
+/// the reason. `reclaim` is `None` until space accounting exists.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotsDeleted {
+    pub resolved: Vec<SnapshotStatus>,
+    pub deleted: Vec<String>,
+    pub refused: Vec<SnapshotRefusal>,
+    #[serde(default)]
+    pub reclaim: Option<ReclaimEstimate>,
 }
 
 /// `snapshot.hold`'s result: the summary line, and the snapshot as it now

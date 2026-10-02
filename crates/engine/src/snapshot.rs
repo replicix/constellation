@@ -299,6 +299,30 @@ impl SnapshotManager {
         Ok((created_detail(&row, commit.0), row))
     }
 
+    /// Take `path@name` without [`validate_new_name`]: a snapshot as an
+    /// engine from before the rule could have named it (`a%b`), for the
+    /// tests that such names stay addressable.
+    #[cfg(test)]
+    pub(crate) async fn create_with_legacy_name(
+        &self,
+        path: &str,
+        name: &str,
+    ) -> Result<SnapshotRow> {
+        validate_name(name)?;
+        let options = SnapshotOptions::default();
+        let (path, ino) = self.prepare_create(path, "legacy", &options)?;
+        let commit = self.publish_commit().await?;
+        let row = match self
+            .put_record(&path, name, &options, self.creator, ino, commit)
+            .await?
+        {
+            PutRecord::Put(row) => row,
+            PutRecord::AlreadyExists(_) => bail!("snapshot {path}@{name} already exists"),
+        };
+        self.meta.record_snapshot(&row)?;
+        Ok(row)
+    }
+
     /// Validate a creation and resolve its directory: the normalized
     /// path and the directory's inode, as this replica has them.
     pub fn prepare_create(
@@ -307,7 +331,7 @@ impl SnapshotManager {
         name: &str,
         options: &SnapshotOptions,
     ) -> Result<(String, Ino)> {
-        validate_name(name)?;
+        validate_new_name(name)?;
         if let Some(by) = options.owner() {
             validate_owner(by)?;
         }
@@ -460,6 +484,11 @@ impl SnapshotManager {
     pub fn list(&self, path: Option<&str>) -> Result<Vec<SnapshotRow>> {
         let normalized = path.map(normalize_path);
         Ok(self.meta.snapshots(normalized.as_deref())?)
+    }
+
+    /// [`resolve_selectors`] over this replica's rows.
+    pub fn resolve(&self, selectors: &[String]) -> Result<Vec<SnapshotRow>> {
+        resolve_selectors(&self.meta.snapshots(None)?, selectors)
     }
 
     /// Snapshots whose frozen subtree contains the directory `directory`
@@ -849,10 +878,11 @@ pub fn hold_detail(row: &SnapshotRow) -> String {
     }
 }
 
-/// Why a delete without `force` refuses a held snapshot.
+/// Why a delete without `force` refuses a held snapshot (plan 32 Step 5's
+/// "held; `snapshot release` first", with the owner when there is one).
 pub fn held_refusal(row: &SnapshotRow) -> String {
     format!(
-        "snapshot {}@{} is held{}; release it first (`snapshot release`) or pass --force",
+        "snapshot {}@{} is held{}; `snapshot release` first (or pass --force)",
         row.path,
         row.name,
         match row.owner() {
@@ -918,11 +948,180 @@ pub fn validate_owner(by: &str) -> Result<()> {
     }
 }
 
+/// A snapshot name as an existing snapshot may have it: non-empty, and
+/// free of `/` and `@` (the selector separator). What every single-name
+/// method (`snapshot.delete`, `snapshot.hold`, `clone.create`) accepts,
+/// so a snapshot named before [`validate_new_name`] existed — `a%b` —
+/// stays addressable by its name.
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('/') || name.contains('@') {
         bail!("snapshot name must be non-empty and contain neither '/' nor '@'");
     }
     Ok(())
+}
+
+/// A name a new snapshot may take: [`validate_name`], and free of `%`
+/// and `*` too, which [`resolve_selectors`] reads as a range and a glob —
+/// a name spelled with them could never be selected exactly.
+pub fn validate_new_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains(['/', '@', '%', '*']) {
+        bail!("snapshot name must be non-empty and contain none of '/', '@', '%', '*'");
+    }
+    Ok(())
+}
+
+/// What one selector of [`resolve_selectors`] asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selector {
+    /// A bare snapshot id (no `@`): what plan 37's driver holds.
+    Id(String),
+    /// `path@name`.
+    Exact { path: String, name: String },
+    /// `path@a%b`: the chain of `path@a`, from `a` to `b` inclusive.
+    Range {
+        path: String,
+        from: String,
+        to: String,
+    },
+    /// `path@prefix*`: names of `path`'s own rows starting with `prefix`.
+    Glob { path: String, prefix: String },
+}
+
+impl Selector {
+    fn parse(selector: &str) -> Result<Selector> {
+        let Some((path, spec)) = selector.rsplit_once('@') else {
+            if selector.is_empty() || selector.contains(['/', '%', '*']) {
+                bail!("snapshot selector {selector:?} must be <path>@<name> or a snapshot id");
+            }
+            return Ok(Selector::Id(selector.to_string()));
+        };
+        let path = normalize_path(path);
+        if let Some((from, to)) = spec.split_once('%') {
+            for end in [from, to] {
+                validate_new_name(end).with_context(|| {
+                    format!("in the range {selector:?}: each end is one snapshot name")
+                })?;
+            }
+            return Ok(Selector::Range {
+                path,
+                from: from.to_string(),
+                to: to.to_string(),
+            });
+        }
+        if let Some(prefix) = spec.strip_suffix('*') {
+            if prefix.contains(['*', '/', '@']) {
+                bail!("snapshot selector {selector:?}: only a single trailing `*` is supported");
+            }
+            return Ok(Selector::Glob {
+                path,
+                prefix: prefix.to_string(),
+            });
+        }
+        if spec.contains('*') {
+            bail!("snapshot selector {selector:?}: `*` is only supported at the end of the name");
+        }
+        validate_new_name(spec)?;
+        Ok(Selector::Exact {
+            path,
+            name: spec.to_string(),
+        })
+    }
+}
+
+/// Plan 32 Step 5's selectors, resolved against `rows` (a replica's
+/// snapshot rows) — pure, so the control handlers, the CLI's confirmation
+/// prompt and the tests all agree on what a selector names:
+///
+/// - `path@name`: that snapshot.
+/// - `path@a%b`: every snapshot **of the chain** of `path@a` — the rows
+///   whose [`SnapshotRoot::ino`] is the same directory, ordered by
+///   `(seq, created_unix_ms)` (plan 32 §0.2's chain order) — from `a` to
+///   `b` inclusive. A snapshot of another directory taken in between is
+///   not in the range, and one of the same directory taken under an old
+///   name (before a rename) is. Either end missing, `b` in another chain,
+///   or `a` after `b` is an error naming the culprit.
+/// - `path@prefix*`: the rows recorded under exactly `path` whose name
+///   starts with `prefix`; only one trailing `*` is supported, and a glob
+///   matching nothing is an error (a typo must not read as "nothing to
+///   delete").
+/// - a bare id (no `@`): that snapshot.
+///
+/// The result is deduplicated and in chain order: by `(seq,
+/// created_unix_ms, id)`, which within one chain is the chain's own order
+/// and across chains is the order the snapshots were taken in. A row whose
+/// root does not parse (it never resolves to a chain) sorts by its
+/// creation time as if its seq were 0, and is never part of a range.
+pub fn resolve_selectors(rows: &[SnapshotRow], selectors: &[String]) -> Result<Vec<SnapshotRow>> {
+    let roots: Vec<Option<SnapshotRoot>> = rows
+        .iter()
+        .map(|row| SnapshotRoot::parse(&row.root_hash).ok())
+        .collect();
+    let order = |i: usize| {
+        (
+            roots[i].map_or(0, |root| root.seq),
+            rows[i].created_unix_ms,
+            rows[i].id.as_str(),
+        )
+    };
+    let exact = |path: &str, name: &str, selector: &str| {
+        rows.iter()
+            .position(|row| row.path == path && row.name == name)
+            .with_context(|| format!("no such snapshot: {path}@{name} (in {selector:?})"))
+    };
+    let mut picked = BTreeSet::new();
+    for selector in selectors {
+        match Selector::parse(selector)? {
+            Selector::Id(id) => {
+                let at = rows
+                    .iter()
+                    .position(|row| row.id == id)
+                    .with_context(|| format!("no such snapshot: {id}"))?;
+                picked.insert(at);
+            }
+            Selector::Exact { path, name } => {
+                picked.insert(exact(&path, &name, selector)?);
+            }
+            Selector::Range { path, from, to } => {
+                // A chain is a directory inode. That never joins a deleted
+                // directory's snapshots to a new one recreated at the same
+                // path, because inode numbers are not reused (per-node
+                // monotonic block allocation: PROGRESS "Plan 32 M0c", Inode
+                // reuse — plan 32 §4.4's assumption).
+                let (a, b) = (exact(&path, &from, selector)?, exact(&path, &to, selector)?);
+                let chain = roots[a].with_context(|| {
+                    format!(
+                        "snapshot {path}@{from} has no readable root, so no chain to range over"
+                    )
+                })?;
+                if roots[b].map(|root| root.ino) != Some(chain.ino) {
+                    bail!(
+                        "snapshot {path}@{to} is not in the same chain as {path}@{from} \
+                         (it is not a snapshot of the same directory)"
+                    );
+                }
+                if order(a) > order(b) {
+                    bail!("snapshot {path}@{from} was taken after {path}@{to}: write the range oldest first");
+                }
+                let (lo, hi) = (order(a), order(b));
+                picked.extend((0..rows.len()).filter(|&i| {
+                    roots[i].is_some_and(|root| root.ino == chain.ino)
+                        && (lo..=hi).contains(&order(i))
+                }));
+            }
+            Selector::Glob { path, prefix } => {
+                let hits: Vec<usize> = (0..rows.len())
+                    .filter(|&i| rows[i].path == path && rows[i].name.starts_with(&prefix))
+                    .collect();
+                if hits.is_empty() {
+                    bail!("no snapshot matches {path}@{prefix}*");
+                }
+                picked.extend(hits);
+            }
+        }
+    }
+    let mut picked: Vec<usize> = picked.into_iter().collect();
+    picked.sort_by(|&a, &b| order(a).cmp(&order(b)));
+    Ok(picked.into_iter().map(|i| rows[i].clone()).collect())
 }
 
 /// A manager that can take and read tree snapshots over `chunks`'
@@ -1000,6 +1199,160 @@ mod tests {
         let rows = meta.take_journal(usize::MAX).unwrap();
         let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
         meta.ack_journal_rows_at(&seqs, segment).unwrap();
+    }
+
+    /// A row of directory `ino`, taken as commit `seq`.
+    fn chain_row(path: &str, name: &str, ino: Ino, seq: u64) -> SnapshotRow {
+        let root = SnapshotRoot {
+            seq,
+            root: NodeHash([seq as u8; 32]),
+            ino,
+        };
+        SnapshotRow::new(
+            constellation_store_s3::snapshot_id(path, name),
+            path,
+            name,
+            root.encode(),
+            seq as i64 * 1000,
+        )
+    }
+
+    fn names(rows: &[SnapshotRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| format!("{}@{}", row.path, row.name))
+            .collect()
+    }
+
+    fn sel(selectors: &[&str]) -> Vec<String> {
+        selectors.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `/vol` (ino 10) snapshotted at seqs 1, 3, 5, 6; `/other` (ino 20) at
+    /// 2 and 4, in between; `/vol` was called `/old` at seq 1.
+    fn history() -> Vec<SnapshotRow> {
+        vec![
+            chain_row("/other", "auto-2", 20, 4),
+            chain_row("/vol", "auto-1", 10, 3),
+            chain_row("/old", "first", 10, 1),
+            chain_row("/vol", "auto-3", 10, 6),
+            chain_row("/other", "auto-1", 20, 2),
+            chain_row("/vol", "auto-2", 10, 5),
+        ]
+    }
+
+    #[test]
+    fn a_range_is_one_chain_in_chain_order() {
+        let rows = history();
+        let got = resolve_selectors(&rows, &sel(&["/vol@auto-1%auto-3"])).unwrap();
+        // `/other`'s snapshots at seqs 2 and 4 fall between the ends but
+        // belong to another chain.
+        assert_eq!(names(&got), ["/vol@auto-1", "/vol@auto-2", "/vol@auto-3"]);
+        // A range of one.
+        let got = resolve_selectors(&rows, &sel(&["/vol@auto-2%auto-2"])).unwrap();
+        assert_eq!(names(&got), ["/vol@auto-2"]);
+        // Both ends are named under the path they were recorded at: a
+        // snapshot from before a rename is an end under its old name.
+        let got = resolve_selectors(&rows, &sel(&["/old@first%first"])).unwrap();
+        assert_eq!(names(&got), ["/old@first"]);
+        // The chain is the directory, not the path: `/vol` renamed to
+        // `/tmp` and back between two snapshots, so the one taken as `/tmp`
+        // is inside `/vol`'s range — `/other`'s at seq 4 still is not.
+        let mut renamed = history();
+        renamed.push(chain_row("/tmp", "away", 10, 4));
+        renamed.push(chain_row("/tmp", "far", 30, 4));
+        let got = resolve_selectors(&renamed, &sel(&["/vol@auto-1%auto-2"])).unwrap();
+        assert_eq!(names(&got), ["/vol@auto-1", "/tmp@away", "/vol@auto-2"]);
+        // Same seq: `created_unix_ms` breaks the tie.
+        let mut rows = history();
+        rows.push(SnapshotRow {
+            created_unix_ms: 5_500,
+            ..chain_row("/vol", "auto-2b", 10, 5)
+        });
+        let got = resolve_selectors(&rows, &sel(&["/vol@auto-2%auto-3"])).unwrap();
+        assert_eq!(names(&got), ["/vol@auto-2", "/vol@auto-2b", "/vol@auto-3"]);
+    }
+
+    #[test]
+    fn globs_exact_names_and_ids_deduplicate_in_chain_order() {
+        let rows = history();
+        let got = resolve_selectors(&rows, &sel(&["/vol@auto-*"])).unwrap();
+        assert_eq!(names(&got), ["/vol@auto-1", "/vol@auto-2", "/vol@auto-3"]);
+        // A glob matches the row's path exactly: `/old@first` is in
+        // `/vol`'s chain but was recorded under another path.
+        let got = resolve_selectors(&rows, &sel(&["/vol@*"])).unwrap();
+        assert_eq!(got.len(), 3);
+        // Overlaps collapse; the order is the snapshots', not the
+        // selectors'.
+        let got = resolve_selectors(
+            &rows,
+            &sel(&[
+                "/vol@auto-3",
+                "/other@auto-*",
+                "/vol@auto-1%auto-3",
+                &constellation_store_s3::snapshot_id("/old", "first"),
+                "vol/@auto-2",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            names(&got),
+            [
+                "/old@first",
+                "/other@auto-1",
+                "/vol@auto-1",
+                "/other@auto-2",
+                "/vol@auto-2",
+                "/vol@auto-3"
+            ]
+        );
+        assert!(resolve_selectors(&rows, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn selector_errors_name_the_culprit() {
+        let rows = history();
+        let err = |selector: &str| {
+            format!(
+                "{:#}",
+                resolve_selectors(&rows, &sel(&[selector])).unwrap_err()
+            )
+        };
+        assert!(
+            err("/vol@nope").contains("/vol@nope"),
+            "{}",
+            err("/vol@nope")
+        );
+        assert!(err("/vol@nope%auto-3").contains("/vol@nope"));
+        assert!(err("/vol@auto-1%nope").contains("/vol@nope"));
+        assert!(err("/vol@auto-3%auto-1").contains("after"));
+        // Both ends exist, but in different chains.
+        let mut mixed = history();
+        mixed.push(chain_row("/vol", "elsewhere", 30, 7));
+        let e = format!(
+            "{:#}",
+            resolve_selectors(&mixed, &sel(&["/vol@auto-1%elsewhere"])).unwrap_err()
+        );
+        assert!(e.contains("same chain"), "{e}");
+        assert!(err("/vol@zzz*").contains("no snapshot matches"));
+        assert!(err("/vol@a*b").contains("end of the name"));
+        assert!(err("/vol@a**").contains("single trailing"));
+        assert!(err("/vol@*a*").contains("single trailing"));
+        assert!(err("/vol@a%b%c").contains("one snapshot name"));
+        assert!(err("/vol@%a").contains("one snapshot name"));
+        assert!(err("/vol").contains("<path>@<name>"));
+        assert!(err("no-such-id").contains("no such snapshot"));
+        // Names can no longer be spelled with the selector's operators.
+        assert!(validate_new_name("a%b").is_err());
+        assert!(validate_new_name("a*").is_err());
+        assert!(validate_new_name("auto-20260928T1100Z").is_ok());
+        // Names taken before the rule stay addressable one at a time.
+        assert!(validate_name("a%b").is_ok());
+        assert!(validate_name("a*").is_ok());
+        assert_eq!(
+            split_selector("/vol@a%b").unwrap(),
+            ("/vol".to_string(), "a%b".to_string())
+        );
+        assert!(split_selector("/vol@").is_err());
     }
 
     #[test]

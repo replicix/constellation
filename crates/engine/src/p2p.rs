@@ -487,10 +487,13 @@ impl constellation_net::PeerService for P2pBridge {
                 ));
                 return constellation_net::Payload::SnapshotBatchReply { req_id, outcome };
             }
-            let outcome = self
+            let mut outcome = self
                 .snapshot_batches
                 .execute(crate::snapshot_batch::rid_from_wire(rid), &items)
                 .await;
+            // Reasons name paths: bound them, or a large batch's reply
+            // outgrows the frame after the batch has run.
+            outcome.clip_reasons();
             constellation_net::Payload::SnapshotBatchReply { req_id, outcome }
         })
     }

@@ -16,7 +16,11 @@ use constellation_store_s3::ChunkStore;
 /// §0.4's `origin` is a small integer in the row and a word on the wire,
 /// so a reader never has to know that 1 means "a policy's own".
 pub(crate) fn snapshot_status(row: constellation_meta::SnapshotRow) -> api::SnapshotStatus {
+    let seq = snapshot::SnapshotRoot::parse(&row.root_hash)
+        .ok()
+        .map(|root| root.seq);
     api::SnapshotStatus {
+        seq,
         id: row.id,
         path: row.path,
         name: row.name,
@@ -963,6 +967,189 @@ impl EngineControl {
             .list(path)
             .map_err(|error| format!("{error:#}"))
             .map(|rows| rows.into_iter().map(snapshot_status).collect())
+    }
+
+    /// `snapshot.resolve`: plan 32 Step 5's selectors over this replica's
+    /// rows ([`snapshot::resolve_selectors`]).
+    ///
+    /// A snapshot taken, held or deleted through another node is in this
+    /// replica only once it has tailed that node's records. So a selector
+    /// that fails to resolve is retried once after a best-effort tail to
+    /// the log head (bounded like the batch's own catch-up): taking a
+    /// snapshot on one node and naming it on another a moment later works
+    /// as it did when every selector was hashed to an id, and the common
+    /// case costs no tail.
+    pub(crate) fn snapshot_resolve_rows(
+        &self,
+        selectors: &[String],
+    ) -> std::result::Result<Vec<constellation_meta::SnapshotRow>, String> {
+        if let Ok(rows) = self.snapshots.resolve(selectors) {
+            return Ok(rows);
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        if self
+            .sync_tx
+            .send(sync::SyncRequest::TailToHead { reply })
+            .is_ok()
+        {
+            let _ = tokio::task::block_in_place(|| {
+                self.rt.block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    receive,
+                ))
+            });
+        }
+        self.snapshots
+            .resolve(selectors)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    pub(crate) fn snapshot_resolve(
+        &self,
+        selectors: &[String],
+    ) -> std::result::Result<Vec<api::SnapshotStatus>, String> {
+        self.snapshot_resolve_rows(selectors)
+            .map(|rows| rows.into_iter().map(snapshot_status).collect())
+    }
+
+    /// `snapshot.delete_many`: resolve here, then delete the snapshots
+    /// at the lease holder in batches (plan 32 Step 0.1), so a range of a
+    /// hundred snapshots costs one round trip and never moves the lease.
+    /// A batch carries at most [`constellation_net::MAX_SNAPSHOT_DELETES_PER_BATCH`]
+    /// deletes, each under its own rid, run one after another: thousands
+    /// of `auto-*` snapshots would not fit one peer frame.
+    ///
+    /// Whether a snapshot is held is the holder's call, made inside its
+    /// delete (its replica is the one every hold was written to), and its
+    /// refusal names the owner. A dry run has no holder to ask: it reports
+    /// the holds this replica knows of, with the same message, and
+    /// deletes nothing. A delete whose row went but whose `snaps/` object
+    /// did not counts as deleted: the snapshot is gone from every listing,
+    /// and GC's reconciliation (plan 32 §0.3) removes the orphan object.
+    ///
+    /// Bare ids that no longer resolve (the CLI deletes the ids it had
+    /// confirmed, and one may have been deleted elsewhere since) are
+    /// refused one by one instead of failing the call; a missing
+    /// `path@name`, range end or glob still fails it, before anything is
+    /// deleted.
+    ///
+    /// A batch that fails (or answers with the wrong number of results)
+    /// does not fail the call: the batches before it did their work, so
+    /// the result is partial. That batch's snapshots are refused as
+    /// "not confirmed" (a forwarded batch may have run at the holder
+    /// before its reply was lost), the ones after it as "not attempted".
+    pub(crate) fn snapshot_delete_many(
+        &self,
+        selectors: &[String],
+        dry_run: bool,
+        force: bool,
+    ) -> std::result::Result<api::SnapshotsDeleted, String> {
+        let mut refused = Vec::new();
+        let rows = match self.snapshot_resolve_rows(selectors) {
+            Ok(rows) => rows,
+            Err(error) if selectors.iter().any(|s| s.contains('@')) => return Err(error),
+            Err(_) => {
+                let all = self
+                    .snapshots
+                    .list(None)
+                    .map_err(|error| format!("{error:#}"))?;
+                let (found, missing): (Vec<String>, Vec<String>) = selectors
+                    .iter()
+                    .cloned()
+                    .partition(|id| all.iter().any(|row| row.id == *id));
+                refused.extend(missing.into_iter().map(|id| api::SnapshotRefusal {
+                    reason: format!("no such snapshot: {id} (deleted meanwhile?)"),
+                    id,
+                }));
+                snapshot::resolve_selectors(&all, &found).map_err(|error| format!("{error:#}"))?
+            }
+        };
+        let mut deleted = Vec::new();
+        if dry_run {
+            refused.extend(rows.iter().filter(|row| row.held && !force).map(|row| {
+                api::SnapshotRefusal {
+                    id: row.id.clone(),
+                    reason: snapshot::held_refusal(row),
+                }
+            }));
+        } else {
+            let mut failed: Option<String> = None;
+            for batch in rows.chunks(constellation_net::MAX_SNAPSHOT_DELETES_PER_BATCH) {
+                if let Some(error) = &failed {
+                    refused.extend(batch.iter().map(|row| api::SnapshotRefusal {
+                        id: row.id.clone(),
+                        reason: format!("not attempted: an earlier delete batch failed: {error}"),
+                    }));
+                    continue;
+                }
+                let items = batch
+                    .iter()
+                    .map(|row| snapshot_batch::SnapshotItem::Delete {
+                        id: row.id.clone(),
+                        force,
+                    })
+                    .collect();
+                let results = match self.snapshot_batch(items) {
+                    Ok(results) if results.len() == batch.len() => Ok(results),
+                    Ok(results) => Err(format!(
+                        "the snapshot batch returned {} results for {} deletes",
+                        results.len(),
+                        batch.len()
+                    )),
+                    Err(error) => Err(error),
+                };
+                let results = match results {
+                    Ok(results) => results,
+                    Err(error) => {
+                        refused.extend(batch.iter().map(|row| api::SnapshotRefusal {
+                            id: row.id.clone(),
+                            reason: format!(
+                                "not confirmed: its delete batch failed ({error}); it may \
+                                 have been deleted — check `snapshot ls`"
+                            ),
+                        }));
+                        failed = Some(error);
+                        continue;
+                    }
+                };
+                for (row, result) in batch.iter().zip(results) {
+                    let id = row.id.clone();
+                    match result {
+                        snapshot_batch::ItemResult::Deleted => deleted.push(id),
+                        snapshot_batch::ItemResult::DeletedObjectRemains { reason } => {
+                            tracing::warn!(
+                                id,
+                                reason,
+                                "snapshot deleted; its snaps/ object is left for GC's reconciliation"
+                            );
+                            deleted.push(id);
+                        }
+                        snapshot_batch::ItemResult::NotFound => {
+                            refused.push(api::SnapshotRefusal {
+                                id,
+                                reason: format!(
+                                    "snapshot {}@{} does not exist (deleted meanwhile)",
+                                    row.path, row.name
+                                ),
+                            })
+                        }
+                        snapshot_batch::ItemResult::Refused { reason } => {
+                            refused.push(api::SnapshotRefusal { id, reason })
+                        }
+                        other => refused.push(api::SnapshotRefusal {
+                            id,
+                            reason: format!("unexpected snapshot delete result {other:?}"),
+                        }),
+                    }
+                }
+            }
+        }
+        Ok(api::SnapshotsDeleted {
+            resolved: rows.into_iter().map(snapshot_status).collect(),
+            deleted,
+            refused,
+            reclaim: None,
+        })
     }
 
     pub(crate) fn snapshot_delete(

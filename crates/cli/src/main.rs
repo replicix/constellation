@@ -7,6 +7,7 @@ mod handover;
 mod node_runtime;
 mod parallelism;
 mod serve;
+mod snapshot_cli;
 mod startup;
 
 // Plan 31 C3: the engine modules live in `constellation-engine`; importing
@@ -558,31 +559,64 @@ enum SnapshotCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// `myfs[:/path]` — a bare name lists from the root.
+    /// `myfs[:/path]`: the snapshots of that directory and of everything
+    /// below it; a bare name, or no target with `--state-dir`, lists them
+    /// all. A table (plan
+    /// 32 Step 5); `USED`, `WRITTEN` and `EXPIRES` print `-` until space
+    /// accounting and expiry exist, and `REFER` is `≈` the subtree's
+    /// logical size when the snapshot was taken.
     Ls {
-        target: String,
-        /// The raw records, as `snapshot ls` printed them before the
-        /// table (what scripts parse).
+        target: Option<String>,
+        /// Columns, comma separated: name, created, origin, used, written,
+        /// refer, kept-by, expires, id, seq, creator, policy.
+        #[arg(short = 'o', value_name = "COLS")]
+        columns: Option<String>,
+        /// Sort by this column (ascending).
+        #[arg(short = 's', value_name = "COL")]
+        sort: Option<String>,
+        /// Exact integers: bytes without units, times as Unix ms.
+        #[arg(short = 'p')]
+        parsable: bool,
+        /// The records as JSON (the shape scripts parse).
         #[arg(long)]
         json: bool,
+        /// Only snapshots a policy took.
+        #[arg(long, conflicts_with = "manual")]
+        auto: bool,
+        /// Only snapshots taken by hand.
+        #[arg(long)]
+        manual: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// `myfs:/path@name`. A held snapshot is refused; release it first,
-    /// or pass `--force`.
+    /// Delete snapshots: `myfs:/path@name`, `myfs:/path@a%b` (that
+    /// directory's snapshots from `a` to `b`), `myfs:/path@prefix*`, or a
+    /// bare id with `--state-dir`. More than one asks first. A held
+    /// snapshot is refused; release it first, or pass `--force`. Exits
+    /// non-zero when any snapshot was not deleted (after deleting the
+    /// rest); a `--dry-run` exits 0 even when it lists refusals.
     Delete {
-        target: String,
-        /// Delete it even though it is held.
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+        /// List what would be deleted (and refused); delete nothing.
+        /// Exits 0 whatever it would refuse.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask before deleting more than one.
+        #[arg(long)]
+        yes: bool,
+        /// Delete held snapshots too.
         #[arg(long)]
         force: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Keep a snapshot forever. The target is `myfs:/path@name`, or a
-    /// bare snapshot id with `--state-dir` (an id names no filesystem, so
-    /// there is nothing to look up in the registry).
+    /// Keep snapshots forever. Takes the selectors `snapshot delete`
+    /// takes; a bare snapshot id needs `--state-dir` (an id names no
+    /// filesystem, so there is nothing to look up in the registry).
     Hold {
-        target: String,
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
         /// The hold's owner: `user:<name>` or `csi:<id>`.
         #[arg(long = "by")]
         by: Option<String>,
@@ -592,10 +626,11 @@ enum SnapshotCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Release a hold, so the snapshot can expire and be deleted again.
+    /// Release holds, so the snapshots can expire and be deleted again.
     /// Takes the same targets as `snapshot hold`.
     Release {
-        target: String,
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
         /// The owner releasing it; must match the recorded owner.
         #[arg(long = "by")]
         by: Option<String>,
@@ -1672,109 +1707,120 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Command::Snapshot { command } => match command {
-            SnapshotCommand::Create {
-                target,
-                hold,
-                held_by,
-                state_dir,
-            } => {
-                let (t, dir) = resolve_target(&target, state_dir)?;
-                let selector = snapshot_selector(&t, "create")?;
-                ctl::<cm::SnapshotCreate>(
-                    &rt,
-                    &dir,
-                    api::SnapshotCreateParams {
-                        selector,
-                        hold: api::Hold::flag(hold),
-                        held_by,
-                    },
-                    |c| {
-                        println!("{}", c.detail);
-                        Ok(())
-                    },
-                )
+        Command::Snapshot { command } => {
+            match command {
+                SnapshotCommand::Create {
+                    target,
+                    hold,
+                    held_by,
+                    state_dir,
+                } => {
+                    let (t, dir) = resolve_target(&target, state_dir)?;
+                    let selector = snapshot_selector(&t, "create")?;
+                    ctl::<cm::SnapshotCreate>(
+                        &rt,
+                        &dir,
+                        api::SnapshotCreateParams {
+                            selector,
+                            hold: api::Hold::flag(hold),
+                            held_by,
+                        },
+                        |c| {
+                            println!("{}", c.detail);
+                            Ok(())
+                        },
+                    )
+                }
+                SnapshotCommand::Ls {
+                    target,
+                    columns,
+                    sort,
+                    parsable,
+                    json,
+                    auto,
+                    manual,
+                    state_dir,
+                } => {
+                    let (path, dir) = match (target, state_dir) {
+                        (Some(target), state_dir) => match resolve_target(&target, state_dir)? {
+                            (target::Target::Named { path, .. }, dir) => (path, dir),
+                            (target::Target::Raw(raw), dir) => (Some(raw), dir),
+                        },
+                        (None, Some(dir)) => (None, dir),
+                        (None, None) => {
+                            bail!("TARGET (a registered filesystem name, `myfs[:/path]`) or --state-dir")
+                        }
+                    };
+                    let columns = match columns {
+                        Some(raw) => snapshot_cli::Column::parse_list(&raw)?,
+                        None => snapshot_cli::DEFAULT_COLUMNS.to_vec(),
+                    };
+                    let sort = sort
+                        .map(|raw| snapshot_cli::Column::parse(&raw))
+                        .transpose()?;
+                    let filter = match (auto, manual) {
+                        (true, _) => snapshot_cli::OriginFilter::Auto,
+                        (_, true) => snapshot_cli::OriginFilter::Manual,
+                        _ => snapshot_cli::OriginFilter::All,
+                    };
+                    // The whole subtree: `ls myfs:/projects` lists
+                    // `/projects/web@…` too, and `/` lists everything.
+                    // `snapshot.list`'s own `path` is an exact match.
+                    let path = path.map(|p| format!("/{}", p.trim_matches('/')));
+                    let params = api::SnapshotListParams { path: None };
+                    ctl::<cm::SnapshotList>(&rt, &dir, params, |l| {
+                        let rows: Vec<_> = l
+                            .snapshots
+                            .into_iter()
+                            .filter(|row| {
+                                filter.keep(row)
+                                    && path
+                                        .as_deref()
+                                        .is_none_or(|p| snapshot_cli::under(&row.path, p))
+                            })
+                            .collect();
+                        if json {
+                            print_json(&rows)
+                        } else {
+                            print!(
+                                "{}",
+                                snapshot_cli::render_table(&rows, &columns, sort, parsable)
+                            );
+                            Ok(())
+                        }
+                    })
+                }
+                SnapshotCommand::Delete {
+                    targets,
+                    dry_run,
+                    yes,
+                    force,
+                    state_dir,
+                } => {
+                    let (dir, selectors) = snapshot_targets(&targets, state_dir, "delete")?;
+                    rt.block_on(snapshot_cli::delete(&dir, selectors, dry_run, yes, force))
+                }
+                SnapshotCommand::Hold {
+                    targets,
+                    by,
+                    force,
+                    state_dir,
+                } => {
+                    let (dir, selectors) = snapshot_targets(&targets, state_dir, "hold")?;
+                    rt.block_on(snapshot_cli::hold(&dir, selectors, true, by, force))
+                }
+                SnapshotCommand::Release {
+                    targets,
+                    by,
+                    force,
+                    state_dir,
+                } => {
+                    let (dir, selectors) = snapshot_targets(&targets, state_dir, "release")?;
+                    rt.block_on(snapshot_cli::hold(&dir, selectors, false, by, force))
+                }
+                SnapshotCommand::Policy { command } => run_snapshot_policy_command(&rt, command),
             }
-            SnapshotCommand::Ls {
-                target,
-                json,
-                state_dir,
-            } => {
-                let (t, dir) = resolve_target(&target, state_dir)?;
-                let path = match &t {
-                    target::Target::Named { path, .. } => path.clone(),
-                    target::Target::Raw(raw) => Some(raw.clone()),
-                };
-                ctl::<cm::SnapshotList>(&rt, &dir, api::SnapshotListParams { path }, |l| {
-                    if json {
-                        print_json(&l.snapshots)
-                    } else {
-                        print_snapshots(&l.snapshots)
-                    }
-                })
-            }
-            SnapshotCommand::Delete {
-                target,
-                force,
-                state_dir,
-            } => {
-                let (t, dir) = resolve_target(&target, state_dir)?;
-                let selector = snapshot_selector(&t, "delete")?;
-                ctl::<cm::SnapshotDelete>(
-                    &rt,
-                    &dir,
-                    api::SnapshotDeleteParams { selector, force },
-                    print_ack,
-                )
-            }
-            SnapshotCommand::Hold {
-                target,
-                by,
-                force,
-                state_dir,
-            } => {
-                let (t, dir) = resolve_target(&target, state_dir)?;
-                let id = snapshot_selector(&t, "hold")?;
-                ctl::<cm::SnapshotHold>(
-                    &rt,
-                    &dir,
-                    api::SnapshotHoldParams {
-                        id,
-                        held: true,
-                        by,
-                        force,
-                    },
-                    |h| {
-                        println!("{}", h.detail);
-                        Ok(())
-                    },
-                )
-            }
-            SnapshotCommand::Release {
-                target,
-                by,
-                force,
-                state_dir,
-            } => {
-                let (t, dir) = resolve_target(&target, state_dir)?;
-                let id = snapshot_selector(&t, "release")?;
-                ctl::<cm::SnapshotHold>(
-                    &rt,
-                    &dir,
-                    api::SnapshotHoldParams {
-                        id,
-                        held: false,
-                        by,
-                        force,
-                    },
-                    |h| {
-                        println!("{}", h.detail);
-                        Ok(())
-                    },
-                )
-            }
-            SnapshotCommand::Policy { command } => run_snapshot_policy_command(&rt, command),
-        },
+        }
         Command::Clone {
             target,
             destination,
@@ -3346,6 +3392,32 @@ fn print_ack(ack: api::Ack) -> Result<()> {
     Ok(())
 }
 
+/// The state dir and selectors of a multi-target `snapshot` subcommand:
+/// every target must name the same filesystem (one daemon resolves them
+/// all together).
+fn snapshot_targets(
+    targets: &[String],
+    state_dir: Option<PathBuf>,
+    verb: &str,
+) -> Result<(PathBuf, Vec<String>)> {
+    let mut dir: Option<PathBuf> = None;
+    let mut selectors = Vec::new();
+    for raw in targets {
+        let (t, this) = resolve_target(raw, state_dir.clone())?;
+        match &dir {
+            Some(first) if *first != this => {
+                bail!(
+                    "snapshot {verb}: {raw:?} names another filesystem than the targets before it"
+                )
+            }
+            _ => dir = Some(this),
+        }
+        selectors.push(snapshot_selector(&t, verb)?);
+    }
+    let dir = dir.context("no snapshot targets")?;
+    Ok((dir, selectors))
+}
+
 /// The selector (or snapshot id) a `snapshot` subcommand was given: a
 /// registered name always carries a path, a raw target is used verbatim
 /// (which is what lets `snapshot hold <id>` take a bare id — a raw target
@@ -3544,40 +3616,6 @@ fn fmt_span_ms(ms: u64) -> String {
         out.push_str("0s");
     }
     out
-}
-
-/// `snapshot ls`: one row per snapshot, with plan 32 §0.4's hold and its
-/// owner in the `HELD` column — `held: csi:<uid>` reads differently from
-/// an operator's own `held: user:attila`, and from a plain `held` with no
-/// recorded owner, on purpose (plan 32 Step 5). `--json` keeps the
-/// machine-readable shape.
-fn print_snapshots(rows: &[api::SnapshotStatus]) -> Result<()> {
-    if rows.is_empty() {
-        println!("no snapshots");
-        return Ok(());
-    }
-    println!(
-        "{:<24} {:<20} {:<8} {:<28} {:<14} ID",
-        "PATH", "NAME", "ORIGIN", "HELD", "REFER"
-    );
-    for row in rows {
-        let held = match (row.held, row.held_by.as_deref()) {
-            (false, _) => "-".to_string(),
-            (true, None) => "held".to_string(),
-            (true, Some(by)) => format!("held: {by}"),
-        };
-        println!(
-            "{:<24} {:<20} {:<8} {:<28} {:<14} {}",
-            row.path,
-            row.name,
-            row.origin,
-            held,
-            row.refer_bytes
-                .map_or_else(|| "-".to_string(), |b| b.to_string()),
-            row.id
-        );
-    }
-    Ok(())
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {

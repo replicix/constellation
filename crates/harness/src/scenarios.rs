@@ -387,7 +387,8 @@ pub const SCENARIOS: &[Scenario] = &[
         name: "snapshot-lifecycle",
         desc: "snapshot remains frozen behind hidden .constellation view, then becomes stale; \
                a second node snapshots, holds and deletes while the first writes, and the \
-               write lease never moves",
+               write lease never moves; then plan 32 Step 5's CLI from that node: the ls table, \
+               ranges across a chain, globs, dry run, prompt, per-item hold refusals",
         requires: &[],
         caps: &[],
         run: snapshot_lifecycle,
@@ -2616,8 +2617,151 @@ fn snapshot_lifecycle(_seed: u64) -> Result<()> {
         );
         Ok(())
     })?;
+    snapshot_selectors_from_the_cli(&client, &other)?;
+    // The CLI phase's forwarded multi-deletes and holds never moved the
+    // lease either.
+    let last = lease_of(&client)?;
+    eprintln!("    snapshot-lifecycle: lease after the CLI phase {last}");
+    anyhow::ensure!(
+        last["held"] == true
+            && last["holder"] == before["holder"]
+            && last["epoch"] == before["epoch"],
+        "the CLI's snapshot selectors from a non-holder moved the lease: \
+         before {before}, after {last}"
+    );
+    anyhow::ensure!(
+        lease_of(&other)?["held"] != true,
+        "c1 took the lease in the CLI phase"
+    );
     other.unmount()?;
     client.unmount()
+}
+
+/// Plan 32 Step 5 through the real CLI, from `other` (not the lease
+/// holder, so every delete and hold runs at `holder` as one batch): the
+/// table, a range across a chain with another directory's snapshot taken
+/// in the middle, the dry run, the prompt, per-item hold refusals, globs
+/// and multi-target hold/release. Selectors resolve against the asking
+/// node's replica, so each step first waits for `other` to see the state
+/// the previous one made.
+fn snapshot_selectors_from_the_cli(holder: &Client, other: &Client) -> Result<()> {
+    let named = |rows: &[serde_json::Value], name: &str| {
+        rows.iter()
+            .find(|r| {
+                format!(
+                    "{}@{}",
+                    r["path"].as_str().unwrap_or(""),
+                    r["name"].as_str().unwrap_or("")
+                ) == name
+            })
+            .cloned()
+    };
+    let wait_for = |what: &str, check: &dyn Fn(&[serde_json::Value]) -> bool| {
+        eventually(what, Duration::from_secs(30), || {
+            let rows = other.snapshot_rows()?;
+            anyhow::ensure!(check(&rows), "c1 lists {rows:?}");
+            Ok(())
+        })
+    };
+    std::fs::create_dir(holder.mnt.join("side"))?;
+    holder.snapshot_create("/project@r1")?;
+    holder.snapshot_create("/side@mid")?;
+    holder.snapshot_create("/project@r2")?;
+    holder.snapshot_create("/project@r3")?;
+    wait_for("c1 sees r1..r3 and side@mid", &|rows| {
+        ["/project@r1", "/project@r2", "/project@r3", "/side@mid"]
+            .iter()
+            .all(|n| named(rows, n).is_some())
+    })?;
+
+    let (ok, out, err) =
+        other.snapshot_cli(&["hold", "/project@r2", "/side@mid", "--by", "user:harness"])?;
+    anyhow::ensure!(ok, "multi-target hold failed: {out}{err}");
+    wait_for("c1 sees the holds", &|rows| {
+        ["/project@r2", "/side@mid"]
+            .iter()
+            .all(|n| named(rows, n).is_some_and(|r| r["held"] == true))
+    })?;
+    let (ok, table, err) = other.snapshot_cli(&["ls", "/"])?;
+    anyhow::ensure!(ok, "snapshot ls failed: {table}{err}");
+    let header = table.lines().next().unwrap_or("");
+    for column in [
+        "NAME",
+        "CREATED (UTC)",
+        "ORIGIN",
+        "USED",
+        "WRITTEN",
+        "REFER",
+        "KEPT BY",
+        "EXPIRES",
+    ] {
+        anyhow::ensure!(header.contains(column), "no {column} column in:\n{table}");
+    }
+    let r2 = table
+        .lines()
+        .find(|l| l.starts_with("/project@r2 "))
+        .unwrap_or("");
+    anyhow::ensure!(
+        r2.contains('⚑') && r2.contains("held: user") && r2.trim_end().ends_with("never"),
+        "the held row reads wrong:\n{table}"
+    );
+
+    // The range is /project's chain only: /side@mid, taken between r1
+    // and r2, is not in it. r2 is held.
+    let (ok, out, err) = other.snapshot_cli(&["delete", "/project@r1%r3", "--dry-run"])?;
+    anyhow::ensure!(ok, "dry run failed: {out}{err}");
+    anyhow::ensure!(
+        out.contains("would delete /project@r1")
+            && out.contains("would refuse: snapshot /project@r2 is held by user:harness")
+            && out.contains("would delete /project@r3")
+            && !out.contains("/side@mid")
+            && out.lines().count() == 3,
+        "dry run listed:\n{out}"
+    );
+    // More than one: it asks, and stdin's EOF declines.
+    let (ok, out, err) = other.snapshot_cli(&["delete", "/project@r1%r3"])?;
+    anyhow::ensure!(
+        !ok && err.contains("delete 3 snapshots? [y/N]"),
+        "an unconfirmed multi-delete went ahead: {out}{err}"
+    );
+    anyhow::ensure!(
+        named(&other.snapshot_rows()?, "/project@r1").is_some(),
+        "declined, yet r1 is gone"
+    );
+    let (ok, out, err) = other.snapshot_cli(&["delete", "/project@r1%r3", "--yes"])?;
+    anyhow::ensure!(
+        !ok && out.contains("deleted snapshot /project@r1")
+            && out.contains("deleted snapshot /project@r3")
+            && err.contains("/project@r2 is held by user:harness; `snapshot release` first"),
+        "the held one must be refused and the rest deleted: {out}{err}"
+    );
+    wait_for("c1 sees r1 and r3 deleted", &|rows| {
+        named(rows, "/project@r1").is_none() && named(rows, "/project@r3").is_none()
+    })?;
+
+    let (ok, out, err) =
+        other.snapshot_cli(&["release", "/project@r2", "/side@*", "--by", "user:harness"])?;
+    anyhow::ensure!(ok, "multi-target release failed: {out}{err}");
+    wait_for("c1 sees the releases", &|rows| {
+        rows.iter().all(|r| r["held"] != true)
+    })?;
+    let (ok, out, err) = other.snapshot_cli(&[
+        "delete",
+        "/project@busy*",
+        "/project@r2",
+        "/side@mid",
+        "--yes",
+    ])?;
+    anyhow::ensure!(ok, "glob delete failed: {out}{err}");
+    anyhow::ensure!(
+        out.lines().count() == 4,
+        "busy1, busy2, r2, side@mid: {out}"
+    );
+    wait_for("c1 lists nothing", &|rows| rows.is_empty())?;
+    eventually("c0 lists nothing", Duration::from_secs(30), || {
+        anyhow::ensure!(holder.snapshot_count()? == 0, "c0 still lists snapshots");
+        Ok(())
+    })
 }
 
 fn clone_workflow(_seed: u64) -> Result<()> {

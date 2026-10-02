@@ -1015,6 +1015,65 @@ mod tests {
         }
     }
 
+    /// Plan 32 Step 7.6: the largest snapshot delete batch a requester
+    /// sends, and the largest reply a holder sends for it (every item
+    /// refused with a reason far past the clip), both fit a frame.
+    #[test]
+    fn maximum_snapshot_delete_batch_fits_a_frame() {
+        let request = Payload::SnapshotBatchRequest {
+            requester: u64::MAX,
+            req_id: u64::MAX,
+            rid: (u64::MAX, u32::MAX, u64::MAX),
+            items: (0..MAX_SNAPSHOT_DELETES_PER_BATCH)
+                .map(|_| SnapshotItem::Delete {
+                    id: "f".repeat(64),
+                    force: true,
+                })
+                .collect(),
+        };
+        let n = Signed::new(&key(), &request)
+            .unwrap()
+            .encode()
+            .unwrap()
+            .len();
+        assert!(n <= MAX_FRAME, "{n}");
+
+        let mut outcome = SnapshotBatchOutcome::Done(
+            (0..MAX_SNAPSHOT_DELETES_PER_BATCH)
+                .map(|_| SnapshotItemResult::Refused {
+                    // Multi-byte chars, so the clip must find a boundary.
+                    reason: "é/".repeat(4096),
+                })
+                .collect(),
+        );
+        outcome.clip_reasons();
+        let SnapshotBatchOutcome::Done(results) = &outcome else {
+            unreachable!()
+        };
+        for result in results {
+            let SnapshotItemResult::Refused { reason } = result else {
+                unreachable!()
+            };
+            assert!(
+                reason.len() <= MAX_SNAPSHOT_REASON_BYTES,
+                "{}",
+                reason.len()
+            );
+            assert!(reason.ends_with('…'));
+        }
+        let reply = Payload::SnapshotBatchReply {
+            req_id: u64::MAX,
+            outcome,
+        };
+        let n = Signed::new(&key(), &reply).unwrap().encode().unwrap().len();
+        assert!(n <= MAX_FRAME, "{n}");
+
+        // A short reason is left alone.
+        let mut short = SnapshotBatchOutcome::Failed("drain failed".into());
+        short.clip_reasons();
+        assert_eq!(short, SnapshotBatchOutcome::Failed("drain failed".into()));
+    }
+
     #[test]
     fn oversized_frame_is_refused() {
         let k = key();
@@ -1346,4 +1405,52 @@ pub enum SnapshotBatchOutcome {
     /// The batch could not run (its drain or its publish failed);
     /// nothing executed. The requester may retry under the same rid.
     Failed(String),
+}
+
+/// The most snapshot deletes one [`Payload::SnapshotBatchRequest`]
+/// carries. A delete item is a fixed 67 bytes on the wire (a 64-hex id),
+/// so a `snapshot delete <range>` of thousands of snapshots would
+/// overflow [`MAX_FRAME`] in one batch: a requester splits its deletes
+/// into batches of at most this many (plan 32 Step 7.6). Together with
+/// [`MAX_SNAPSHOT_REASON_BYTES`] it bounds the reply as well; the tests
+/// pin both under the frame.
+pub const MAX_SNAPSHOT_DELETES_PER_BATCH: usize = 256;
+
+/// The longest reason a forwarded [`Payload::SnapshotBatchReply`]
+/// carries per item. A refusal names the snapshot's path, which has no
+/// useful bound, so a reply of 256 refusals could otherwise outgrow
+/// [`MAX_FRAME`] after the holder had already executed the batch.
+pub const MAX_SNAPSHOT_REASON_BYTES: usize = 192;
+
+impl SnapshotBatchOutcome {
+    /// Clip every reason to [`MAX_SNAPSHOT_REASON_BYTES`] (on a char
+    /// boundary, marked with `…`) before the outcome goes on the wire.
+    pub fn clip_reasons(&mut self) {
+        match self {
+            Self::Done(results) => {
+                for result in results {
+                    if let SnapshotItemResult::Refused { reason }
+                    | SnapshotItemResult::DeletedObjectRemains { reason } = result
+                    {
+                        clip_reason(reason);
+                    }
+                }
+            }
+            Self::Failed(reason) => clip_reason(reason),
+            Self::NotHolder => {}
+        }
+    }
+}
+
+fn clip_reason(reason: &mut String) {
+    const MARK: &str = "…";
+    if reason.len() <= MAX_SNAPSHOT_REASON_BYTES {
+        return;
+    }
+    let mut end = MAX_SNAPSHOT_REASON_BYTES - MARK.len();
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason.truncate(end);
+    reason.push_str(MARK);
 }

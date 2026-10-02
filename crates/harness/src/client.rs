@@ -540,6 +540,30 @@ impl Client {
         self.control_command(&["clone", selector, destination])
     }
 
+    /// `constellation snapshot <args> --state-dir …`, whatever its exit
+    /// status: `(succeeded, stdout, stderr)`. Stdin is closed, so a
+    /// confirmation prompt reads EOF and declines.
+    pub fn snapshot_cli(&self, args: &[&str]) -> Result<(bool, String, String)> {
+        let mut all = vec!["snapshot"];
+        all.extend_from_slice(args);
+        all.extend_from_slice(&["--state-dir", self.state.to_str().unwrap()]);
+        let output = self.cmd(&all).output()?;
+        Ok((
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+
+    /// `snapshot ls / --json`: the daemon's snapshot records.
+    pub fn snapshot_rows(&self) -> Result<Vec<serde_json::Value>> {
+        let (ok, stdout, stderr) = self.snapshot_cli(&["ls", "/", "--json"])?;
+        anyhow::ensure!(ok, "snapshot ls failed: {stdout}{stderr}");
+        let value: serde_json::Value = serde_json::from_str(&stdout)
+            .with_context(|| format!("parsing snapshot ls output: {stdout}"))?;
+        Ok(value.as_array().cloned().unwrap_or_default())
+    }
+
     /// How many snapshots the live daemon reports, via the control
     /// socket (`constellation snapshot ls`) rather than opening the
     /// metadata store's own file/directory from a second process —

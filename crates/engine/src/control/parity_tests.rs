@@ -141,6 +141,8 @@ const MUST_SUCCEED: &[&str] = &[
     "snapshot.policy.simulate",
     "snapshot.policy.list",
     "snapshot.policy.set",
+    "snapshot.resolve",
+    "snapshot.delete_many",
     "browse.readdir",
     "browse.inspect",
     "browse.stat",
@@ -185,6 +187,10 @@ fn params_for(name: &str, root_view: u64, backend_dir: &str) -> Value {
         "snapshot.delete" => json!({"selector": "/@no-such-snapshot"}),
         "snapshot.refs" => json!({"id": "no-such-id"}),
         "snapshot.hold" => json!({"id": "/@no-such-snapshot", "held": true}),
+        // Nothing to name in this empty filesystem: both answer `Ok` with
+        // nothing in them (a dry run, so no batch either).
+        "snapshot.resolve" => json!({"selectors": []}),
+        "snapshot.delete_many" => json!({"selectors": [], "dry_run": true}),
         "clone.create" => json!({"selector": "/@no-such-snapshot", "destination": "/c"}),
         // Over the root's (empty) history, simulated for one hour: two
         // creations whatever the clock, so both calls agree.

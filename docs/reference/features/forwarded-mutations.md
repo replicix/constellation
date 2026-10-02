@@ -736,7 +736,13 @@ the requester's own `Barrier` did when it took the lease. A drain
 failure is the caller's error, before anything is forwarded.
 
 `snapshot create`, `snapshot delete` and `snapshot hold`/`release` all
-take this path; `clone` still takes the lease and a barrier
+take this path (a multi-selector `snapshot delete`, control method
+`snapshot.delete_many`, sends its `Delete` items in batches of at most
+`MAX_SNAPSHOT_DELETES_PER_BATCH` = 256, one after another, each under
+its own rid, so the request and its reply fit a 64 KiB peer frame; a
+batch that fails leaves the call partial — its snapshots "not
+confirmed", the later ones "not attempted" — rather than an error after
+earlier batches deleted); `clone` still takes the lease and a barrier
 (`acquire_namespace_barrier`), and `quota set` takes the lease alone.
 
 `SnapshotBatchRequest { requester, req_id, rid, items }` carries the
@@ -745,10 +751,16 @@ items (`Create`, `Delete`, `Hold`) as typed postcard data, and
 `NotHolder` or `Failed(reason)`; per-item results are `Created` (with
 the recorded row), `Skipped`, `AlreadyExists`, `Deleted`, `NotFound`,
 `HoldSet` (the row), `Refused` and `DeletedObjectRemains` (the row is
-deleted but deleting the `snaps/` object failed; `snapshot delete`
-reports it as an error, as before batches, and the orphan object is left
-to plan 32 §0.3's reconciliation). Both were appended at the end of
-`Payload`. The executing holder drains what `Barrier` drains for each
+deleted but deleting the `snaps/` object failed; `snapshot.delete`
+reports it as an error, as before batches, `snapshot.delete_many` counts
+the snapshot as deleted and logs a warning, and the orphan object is left
+to plan 32 §0.3's reconciliation). A forwarded reply clips every
+`Refused`/`DeletedObjectRemains`/`Failed` reason to
+`MAX_SNAPSHOT_REASON_BYTES` = 192 bytes (a refusal names the snapshot's
+path, which is unbounded); `message.rs`'s
+`maximum_snapshot_delete_batch_fits_a_frame` pins the largest delete
+request and its all-refused reply under `MAX_FRAME`. Both were appended
+at the end of `Payload`. The executing holder drains what `Barrier` drains for each
 distinct create path, forces **one** publish for the whole batch, then
 runs the items in order.
 

@@ -32018,3 +32018,154 @@ delegate of a subtree at the time. No lock anomaly (`lost` 0,
 committer b also hit `invalid object … Error building trees` under the
 lock. Both look like the cross-node visibility family that
 `git-under-flock-causal` is investigating.
+
+## Plan 32 M0 — snapshots at automatic scale
+
+Step 12's milestone M0 of [plan 32](wip/32-snapshot-policies-and-space.md)
+("Step 0 … table `snapshot ls`") is complete. Four chunks built it: the
+three below whose own sections carry their detail and gates, and the
+close-out `32-m0d` (this section's second table), which adds the
+user-facing selector and listing surface and ran the full CONVENTIONS
+gates for the milestone. No snapshot is deleted by anything but an
+explicit request; every GC change is protective.
+
+| Item | State | Where |
+|---|---|---|
+| **§0.1** holder-side `SnapshotBatch`: every snapshot create/delete/hold runs at the root-lease holder (local, forwarded over the plan-30 path with an exactly-once `rid`, or after taking a free lease); one publish per batch; per-item results. Creating, deleting or holding never moves the lease | DONE (`32-m0a`, "Plan 32 M0a (holder-side snapshot batch)" above) | `crates/engine/src/snapshot_batch.rs`, `crates/net/src/message.rs` |
+| **§0.2** GC marks snapshot chunks per chain, by diff (`ChainWalk`: one full walk of a chain's oldest snapshot plus one `Tree::diff` per later one; `diff ⊇ full`); `CONSTELLATION_GC_SNAP_WALK=diff\|full`; bounded spilled-list cache | DONE (`32-m0b`, "Plan 32 M0b (snapwalk, per-chain GC mark)" above) | `crates/engine/src/snapwalk.rs`, `crates/engine/src/gc.rs` |
+| **§0.3** delete by computed id (no scan); GC reconciliation of orphan `snaps/` objects (`snap-orphan-object`) and rows without objects (`snap-object-restored`) | DONE (`32-m0c`, "Plan 32 M0c (…)" above) | `crates/meta/src/store/snapshot.rs`, `crates/engine/src/gc.rs` |
+| **§0.4** row and record extensions (`origin`, `policy_ino`, `held`, `creator`, `held_by`, `refer_bytes`), `SnapCreate2`/`SnapHold`, `snapshot.hold` with owner namespaces | DONE (`32-s0-holds`, "Plan 32 Step 0.4 (holds)" above) | `crates/meta`, `crates/store-s3/src/snapshot.rs`, `crates/engine/src/snapshot.rs` |
+| **§0.5** rename-safe listing: `.constellation/snapshot/` follows a directory by inode | DONE (`32-m0c`) | `crates/engine/src/snapshot.rs` `covering`, `crates/engine/src/view/synthetic.rs` |
+| **Step 5 (M0 part)** selectors, `snapshot.resolve` / `snapshot.delete_many`, the table `snapshot ls`, multi-target `delete`/`hold`/`release` | DONE (`32-m0d`, below) | below |
+
+### M0d — selectors, `snapshot.resolve`, `snapshot.delete_many`, the table `snapshot ls`
+
+| Item | State | Where |
+|---|---|---|
+| `resolve_selectors(rows, selectors) -> Result<Vec<SnapshotRow>>`, pure: `path@name`; `path@a%b` = the chain of `path@a` (rows whose `SnapshotRoot.ino` is the same directory, ordered `(seq, created_unix_ms)`) from `a` to `b` inclusive (either end missing → error naming it; `b` in another chain → error; `a` after `b` → error); `path@prefix*` = one trailing `*` on names of rows recorded under exactly `path` (any other `*` → error; matching nothing → error); a bare id. Deduplicated, ordered `(seq, created_unix_ms, id)` (chain order within a chain). `SnapshotManager::resolve` runs it over the replica | DONE | `crates/engine/src/snapshot.rs` |
+| New snapshot names may no longer contain `%` or `*` (the selector operators), besides `/` and `@`: enforced at creation and by the selector parser only, so a snapshot named `a%b` before the rule stays addressable through `snapshot.delete`, `snapshot.hold` and `clone.create` (which `split_selector` serves with the old `/`/`@` check) | DONE | `snapshot::validate_new_name` (in `prepare_create`, `Selector::parse`), `snapshot::validate_name` |
+| Control `snapshot.resolve` (viewer, read) `{selectors}` → `SnapshotListing`; `snapshot.delete_many` (admin, mutating) `{selectors, dry_run, force}` → `SnapshotsDeleted {resolved, deleted, refused: [{id, reason}], reclaim: Option<ReclaimEstimate>}`; `ReclaimEstimate {bytes, chunks, as_of_seq, building}` declared, always `None` until M5. `SnapshotStatus` gains `seq` (the frozen commit, from `root_hash`). Method table 65 → **67** (58 → 60 before the rebase onto M2a's policy methods); schema re-blessed; existing `snapshot.list/delete/hold` untouched | DONE | `crates/control/src/{methods,proto/types}.rs`, `crates/control/schema/control.schema.json`, `crates/engine/src/control/{mod,service}.rs` |
+| `delete_many` deletes at the holder in batches of at most `MAX_SNAPSHOT_DELETES_PER_BATCH` = 256 (one round trip per 256, each its own rid, run in order), so the forwarded request and reply fit the 64 KiB peer frame; a forwarded reply clips reasons to 192 bytes; a failed batch (or a result-count mismatch) makes the call partial — its snapshots refused as "not confirmed", later ones "not attempted" — never a bare error after earlier batches deleted; a bare id that no longer resolves is refused alone ("no such snapshot"); held snapshots are refused per item by the holder's own check (its replica holds every hold), naming the owner (`snapshot … is held by user:x; \`snapshot release\` first (or pass --force)`); a dry run reports this replica's holds the same way and deletes nothing; `DeletedObjectRemains` counts as deleted (warned; §0.3 reconciles the object) | DONE | `EngineControl::snapshot_delete_many`, `crates/net/src/message.rs` |
+| Resolution retries once after a bounded tail to the log head when it fails, so a snapshot taken through another node a moment ago resolves | DONE | `EngineControl::snapshot_resolve_rows` |
+| Parity rows for both methods (in `MUST_SUCCEED`); stub-router rows in the control crate; role-class test rows | DONE | `crates/engine/src/control/parity_tests.rs`, `crates/control/src/{tests,methods}.rs` |
+| CLI `snapshot ls [<fs[:path]>] [-o cols] [-s col] [-p] [--json] [--auto\|--manual]`: table `NAME CREATED (UTC) ORIGIN USED WRITTEN REFER KEPT BY EXPIRES`; extra `-o` columns `id`, `seq`, `creator`, `policy`; `⚑` on held rows; `-p` exact integers (bytes, Unix ms); `--json` = the old array of `SnapshotStatus` plus `seq`; a path lists its whole subtree; no target with `--state-dir` lists everything | DONE | `crates/cli/src/snapshot_cli.rs`, `crates/cli/src/main.rs` |
+| CLI `snapshot delete <sel>... [--dry-run] [--yes] [--force]` (resolve; more than one prompts `delete N snapshots? [y/N]` on stderr unless `--yes`; then deletes exactly the confirmed ids; any refusal → exit non-zero after the rest); `hold`/`release <sel>... [--by] [--force]` (resolve, then `snapshot.hold` per id) | DONE | `crates/cli/src/snapshot_cli.rs` |
+| Tests: resolver (range across a chain with another chain's snapshots between its ends, a range including a snapshot taken while the directory had another name (renamed away and back), an old-name end, `created_unix_ms` tie-break, globs, ids, dedup + order, every error); engine control round trip on a real offline engine (resolve, dry run, range delete around a hold, `force` + id + glob; 259 deletes split across two batches with a hold in the second; a confirmed id deleted meanwhile; a legacy `a%b` name held, cloned and deleted); `message.rs` pins the largest delete batch and its all-refused reply under `MAX_FRAME`; table rendering (columns, `KEPT BY`, `⚑`/`—` alignment, sort, `-p`, UTC dates incl. leap day and pre-1970) | DONE | `snapshot::tests`, `crates/engine/src/control/snapshot_tests.rs`, `snapshot_cli::tests` |
+| Harness `snapshot-lifecycle` third phase, from the non-holder: table, multi-target hold, dry-run range skipping `/side@mid`, prompt declined on EOF, `--yes` around the held one, glob release, final multi-selector delete; `Client::snapshot_cli`/`snapshot_rows` | DONE | `crates/harness/src/{scenarios,client}.rs`, `docs/how-to-guides/development/TESTING.md` |
+| `snapshot_count` (harness) already parsed `--json`; it now counts every snapshot (`ls /` used to match only snapshots *of* `/`, so `snapchurn`'s "replica clean" check saw none of its subtree snapshots) | DONE | `crates/cli/src/main.rs` (subtree listing) |
+
+#### Decisions taken here (the brief left them open)
+
+- **`REFER` shows `≈<size>`** from the row's creation-time `refer_bytes`
+  (the replica DFS of §0.4), `-` when absent; `≈` because it is a
+  measurement at creation, not M5's accounting figure. `-p` prints the
+  exact integer without `≈`. `USED`/`WRITTEN` print `-`; `EXPIRES` is
+  `never` for manual or held snapshots, `-` otherwise (M4).
+- **`KEPT BY`** is the hold owner's *namespace* (`held: csi`,
+  `held: user`), or `held`, or `—`, as the plan's mock-up — not the full
+  owner the holds chunk printed. The full owner is in `--json` and in
+  every refusal message.
+- **The `⚑` marker is appended to the `CREATED` cell**, where the plan's
+  mock-up puts it; `-p` drops it.
+- **Default row order** is per path, then chain order `(seq,
+  created_unix_ms)`, not the server's name order; `-s` sorts stably
+  ascending (numbers numerically; `used`/`written`/`expires` have nothing
+  to sort by yet).
+- **`ls <fs:path>` lists the subtree** (component-aware), filtering
+  client-side over `snapshot.list` with no path; `snapshot.list`'s exact
+  `path` parameter is unchanged for plan 37.
+- **Selector resolution runs on the asking node's replica.** Held-ness
+  for a real delete is the holder's call, inside its delete; only the dry
+  run reports from the local replica. A failed resolution is retried
+  once after a ≤ 5 s tail to the log head.
+- **A glob matching nothing is an error**, so a typo cannot read as
+  "nothing to delete". A glob matches the row's recorded path exactly; a
+  range follows the directory (inode), so it includes snapshots taken
+  under an old name between its ends.
+- **The CLI deletes the confirmed ids**, not the selectors again, so a
+  snapshot taken between the prompt and the answer is never deleted.
+- **`hold`/`release` keep `--force`** (admin, from `32-s0-holds`) and try
+  every resolved snapshot, failing at the end if any failed.
+- **A dry run that would refuse exits 0**; a real delete with any
+  refusal exits non-zero after deleting the rest.
+- **`--orphaned`** (in Step 5's synopsis) is not offered: an orphaned
+  *auto* snapshot is a policy notion (M4). Orphan `snaps/` objects never
+  have rows and never list.
+
+### DESIGN §13 is stale
+
+`docs/explanation/DESIGN.md` §13 still describes plan 09's snapshots: a
+snapshot as a "git-style tree object" of content-addressed metadata blobs
+uploaded at creation, loaded on demand, with `snaps/<id>.json` naming a
+tree root hash; clones with "metadata copied lazily"; and `snapshot delete`
+warning when gossip shows the snapshot mounted, with `--force` skipping
+that prompt. Since plan 28 a snapshot is a **retained metadata root**,
+the triple `(commit seq, whole-FS mtree root, dir ino)`, recorded in the
+`snaps/` object (`SnapshotRecord` v2) and in a replicated row; creation
+uploads nothing (it forces one publish, at the lease holder since §0.1).
+Clones are **eager** metadata copies in one transaction, sharing data
+chunks. `snapshot delete --force` now means "delete it even though it is
+held" (§0.4), there is no in-use warning, and `delete` takes selectors,
+ranges and globs (Step 5). §13's `snapshot ls [path]` is a table now.
+DESIGN.md is not edited (CONVENTIONS rule 5); this records the drift.
+
+### Exit criteria (plan 32 Step 12, M0)
+
+- [x] Holder-side `SnapshotBatch`; the lease never moves — harness
+      `snapshot-lifecycle`: lease before `{"epoch":1,"holder":1}`, after
+      `{"epoch":1,"holder":1}` across 3 creates, a hold, a refused and a
+      real delete from the non-holder while the holder wrote (119 writes),
+      and asserted again after the whole Step 5 CLI phase from the
+      non-holder (review fix round: holder 1, epoch 1 throughout)
+- [x] Diff-based GC mark (`32-m0b`; full vs diff measured there:
+      31–36 s vs 0.6–1.2 s for 50 snapshots of a 10k-file tree)
+- [x] Orphan reconciliation and delete-by-id (`32-m0c`)
+- [x] Row/record extensions (`32-s0-holds`)
+- [x] Rename-safe listing (`32-m0c`)
+- [x] Table `snapshot ls`, selectors, `snapshot.resolve`,
+      `snapshot.delete_many`, multi-target `delete/hold/release` (`32-m0d`)
+- [x] Full CONVENTIONS gates (below)
+
+### Gates (`32-m0d` worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m0d`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff (`--check` exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | built once (`--no-run`), every test binary then run from its package dir (the tool's 10-minute limit cannot hold the whole run): 56 binaries, **2034 passed, 0 failed**, 40 ignored, plus 1 doctest (`--doc`). Two binaries exceed the limit in debug and were split: authority `sim` (106 + 1 run alone = 107 passed, 11 ignored) and model `locks` (run in release as earlier chunks did: 29 passed, 1 ignored) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh --down` | INTEGRATION TEST PASSED (`COMPOSE_PROJECT_NAME=m0d`, a `/tmp` compose override adding `security_opt: label:disable` to floci — the `box-gates` fix is not on this base) |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run` (full matrix, 183 scenarios, run one scenario per invocation in 9-minute slices) | **178 PASSED, 5 FAILED** on the first pass; each failure rerun alone: `e2e-basic` PASSED (first pass: "published no metadata tree" — a publish-timing flake), `ack-s3-failover` PASSED, `git-under-flock-b2b` PASSED (242 s), `visibility-after-burst` FAILED again (17 S3 tail GETs during the markers, load ≈ 40–65 from other sessions) then PASSED on a third run (1 GET; the load-sensitive threshold recorded by plan 38 Z1), `subtree-confinement` PASSED as root (`sudo` without `-E`, own prefix: it needs `CAP_SYS_ADMIN` for `trusted.*`). **`git-under-flock-causal` FAILED** (rerun alone: 24 publications visible before their objects, 401 s) — pre-existing, recorded failing on `main` before this branch ("Known failures owned elsewhere", plan 38 Z1b); this chunk changes no replay, lock or publish path. No fio/stress SKIP (tools installed) |
+| `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed**, COMPLIANCE TEST PASSED (baseline: 0 known failures); private image `constellation-smoke:m0d` built from a `/tmp` Dockerfile copy with a private `target` cache id, project `m0d`, floci's host port dropped (4566 held by another agent) and `label:disable` |
+
+### Review fixes (round 1, rebased onto M2a / Z2a / Z2b / K2b)
+
+| Finding | Fix |
+|---|---|
+| Must 1: a forwarded `delete_many` of ~1000 snapshots overflowed the 64 KiB peer frame (and an all-refused reply of ~700 could, after the holder had deleted) | batches of ≤ 256 deletes, each its own rid, run in order; forwarded replies clip reasons to 192 bytes; `maximum_snapshot_delete_batch_fits_a_frame`; `delete_many_splits_into_frame_sized_batches` (259 deletes, a hold in the second batch) |
+| Should 1: the `%`/`*` rule made existing `a%b` snapshots unaddressable by name | rule only at creation and in `Selector::parse`; `a_name_taken_before_the_rule_stays_addressable` (hold, clone, delete of a legacy `a%b` and `x*`) |
+| Should 2: the lease was not checked after the CLI phase | `snapshot-lifecycle` re-reads it after phase 3: holder 1 / epoch 1 unchanged, `c1` holds nothing |
+| Should 3: a result-count mismatch was a bare `Err` after deleting | partial result: that batch "not confirmed", later batches "not attempted" |
+| Nits | `ls [<fs[:path]>]` (or `--state-dir` alone); a confirmed id deleted meanwhile is refused alone (`a_confirmed_id_deleted_meanwhile_is_refused_alone`); comment on chains vs inode reuse (M0c's "inodes are not reused"); a real rename-spanning range test, the old one described as an old-name end; `--help` states a dry run exits 0 |
+
+Gates of this round (`CARGO_TARGET_DIR` unset, `ulimit -n` 65536): `cargo
+fmt --all -- --check` exit 0; `cargo clippy --workspace --all-targets --
+-D warnings` clean; `cargo test` per package, all green (engine 437 + 5
+ignored, net 102, control 135, constellation 30, meta 280, store-s3 222,
+harness 51, csi 57, every other package green; authority incl. `sim`
+107 + 11 ignored; model in release, `locks` 29); `bash tests/smoke.sh`
+SMOKE TEST PASSED; `cargo build --release --workspace` exit 0;
+`harness run snapshot-lifecycle snapshot-mount snapshot-churn` and
+`clone-workflow e2e-basic` (prefix `m0dfix`): ALL SCENARIOS PASSED —
+lease `{"epoch":1,"holder":1}` before, after phase 2 (202 writes) and
+after the CLI phase. The full matrix and the compliance lane were not
+rerun (they ran on this change, above).
+
+### Not done here (deliberately)
+
+- Sizes (`USED`, `WRITTEN`, a real `REFER`, `reclaim`): M5.
+- Retention reasons in `KEPT BY`, `EXPIRES`, `--orphaned`: M4.
+- Policy commands, a timezone database, the policy's `tz` for `CREATED`:
+  M1/M2 (`jiff` arrives with them).
+- The web UI's multi-select delete over `snapshot.delete_many`: M6.

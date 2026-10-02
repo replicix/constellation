@@ -864,6 +864,16 @@ roots:
   writing a counter file: the lease's holder and epoch must not change,
   a held snapshot must refuse deletion, and the surviving snapshots'
   frozen counters must be non-decreasing and within what was written.
+  Its third phase (plan 32 Step 5) drives the CLI's selectors from the
+  non-holder: `snapshot ls`'s table (Step 5's columns, `⚑` and
+  `held: user` on a held row), a multi-target `hold --by`, a
+  `delete path@a%b --dry-run` whose range skips another directory's
+  snapshot taken in the middle and reports the held one as refused, the
+  `delete N snapshots? [y/N]` prompt declining on EOF, `--yes` deleting
+  around the held snapshot (exit non-zero, naming its owner), a
+  `release` by glob, and a final multi-selector delete that leaves both
+  nodes with no snapshots. The lease's holder and epoch are checked
+  again after this phase.
 - `clone-workflow` eagerly clones snapshot metadata, independently edits the
   origin and clone, verifies both byte strings, and checks the frozen source
   remained unchanged. Deleting the snapshot must not affect the clone.

@@ -140,7 +140,7 @@ pub(crate) fn vfs_ops_status() -> VfsOpsStatus {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::node::ViewInfo as EngineViewInfo;
     use crate::{DeferredEvents, EngineConfig, EngineProfile, P2pMode, ViewSpec};
@@ -183,16 +183,17 @@ mod tests {
         }
     }
 
-    struct Fixture {
+    /// Also the fixture of `super::snapshot_tests`.
+    pub(in crate::control) struct Fixture {
         _dir: tempfile::TempDir,
-        rt: tokio::runtime::Runtime,
-        svc: Arc<EngineControl>,
+        pub(in crate::control) rt: tokio::runtime::Runtime,
+        pub(in crate::control) svc: Arc<EngineControl>,
         host: Arc<Host>,
         views: Vec<Arc<View>>,
     }
 
     /// An offline engine with one view per label set.
-    fn fixture(labels: &[&[(&str, &str)]]) -> Fixture {
+    pub(in crate::control) fn fixture(labels: &[&[(&str, &str)]]) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let backend = format!("file://{}", dir.path().join("backend").display());
         let rt = tokio::runtime::Builder::new_multi_thread()
