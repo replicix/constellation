@@ -251,6 +251,8 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
         "writeback_pending_uploads",
         status.writeback.pending_uploads as f64,
     );
+    g("fsync_waiting", status.fsync.waiting as f64);
+    g("fsync_longest_wait_ms", status.fsync.longest_wait_ms as f64);
     g("prefetch_inflight", status.prefetch.inflight as f64);
     g(
         "fuse_requests_in_flight",

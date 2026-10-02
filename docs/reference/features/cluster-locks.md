@@ -373,9 +373,10 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 
 ### Limits
 
-- **A blocked lock wait cannot be interrupted.** fuser 0.18 does not
-  deliver `FUSE_INTERRUPT`, so Ctrl-C (or `SIGKILL`) of a process
-  blocked in `F_SETLKW` or `flock` returns only once the lock is granted.
+- **A blocked lock wait cannot be interrupted.** The FUSE adapter honours
+  `FUSE_INTERRUPT` only for the `fsync` family (plan 39), so Ctrl-C (or
+  `SIGKILL`) of a process blocked in `F_SETLKW` or `flock` returns only
+  once the lock is granted.
 - **No deadlock detection.** There is no `EDEADLK`: two owners waiting
   on each other wait forever, as they do with `flock`.
 - **`flock` and `fcntl` share one table.** fuser delivers `flock`

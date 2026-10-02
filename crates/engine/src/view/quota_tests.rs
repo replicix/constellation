@@ -407,3 +407,73 @@ fn view_usage_scopes_to_snapshot_mount() {
     fs.set_snapshot_root("/source", "snap").unwrap();
     assert_eq!(fs.view_usage(), (42, 1));
 }
+
+/// Plan 39 §3.7: a node's discard error events are shared by every view
+/// of it, so one view's last close must not forget an event a
+/// description in another view (another mount of the node) still owes.
+/// Forgotten once no view has the inode open.
+#[test]
+fn a_discard_error_outlives_one_views_last_close_while_another_has_it_open() {
+    use crate::holds::{HoldConfig, HoldSources, Holds, OpenHandles};
+    use constellation_vfs::{Blocking, Caller, OpCtx, OpKind, OpenFlags, OpenOwner, Vfs};
+    use std::sync::Mutex;
+    struct OtherView(Mutex<Vec<Ino>>);
+    impl OpenHandles for OtherView {
+        fn open_inos(&self) -> Vec<Ino> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let (mut fs, _tmpdir) = test_fs(meta.clone());
+    let other = Arc::new(OtherView(Mutex::new(vec![f.ino])));
+    let sources = Arc::new(HoldSources::default());
+    sources.register(
+        2,
+        Arc::downgrade(&other) as std::sync::Weak<dyn OpenHandles>,
+    );
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    fs.holds = Some(Holds::new(
+        store.clone(),
+        Arc::new(ChunkStore::new(store)),
+        meta.clone(),
+        1,
+        sources,
+        HoldConfig {
+            refresh: std::time::Duration::from_secs(1),
+            ttl: std::time::Duration::from_secs(3),
+        },
+    ));
+    let caller = Caller::new(0, 0, None);
+    let open_close = || {
+        let fh = Blocking::run(|r| {
+            fs.open(
+                &OpCtx::new(OpKind::Open, &caller),
+                f.ino,
+                OpenFlags::READ,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap()
+        .fh;
+        Blocking::run(|r| {
+            fs.release(
+                &OpCtx::new(OpKind::Release, &caller),
+                f.ino,
+                fh,
+                OpenFlags::READ,
+                None,
+                r,
+            )
+        })
+    };
+    let seq = meta.locks().note_discard(f.ino);
+    // This view's last close: the other view still has the inode open.
+    open_close().unwrap();
+    assert_eq!(meta.locks().error_seq(f.ino), seq, "still owed elsewhere");
+    other.0.lock().unwrap().clear();
+    open_close().unwrap();
+    assert_eq!(meta.locks().error_seq(f.ino), 0, "open nowhere: forgotten");
+}

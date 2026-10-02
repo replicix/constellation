@@ -198,7 +198,8 @@ fn create_write_read_close_and_the_size_is_visible_throughout() {
     assert_eq!(entry.attr.kind, FileKind::File);
     assert_eq!(entry.attr.ttl, TTL);
     let ino = entry.attr.ino;
-    assert_eq!(opened.fh, Fh(ino));
+    // One handle per open, addressing only its inode (plan 39 §3.7).
+    assert_ne!(opened.fh, Fh(0));
     assert_eq!(c.write(ino, opened.fh, 0, b"hello").unwrap(), 5);
     assert_eq!(c.write(ino, opened.fh, 5, b" world").unwrap(), 6);
     // Unflushed: served from the write session, and the pending size
@@ -210,8 +211,28 @@ fn create_write_read_close_and_the_size_is_visible_throughout() {
     c.close(ino, opened.fh).unwrap();
     let attr = c.getattr(ino).unwrap();
     assert_eq!((attr.size, attr.blocks, attr.blksize), (11, 1, BLOCK_SIZE));
-    assert_eq!(c.read(ino, opened.fh, 0, 64).unwrap(), b"hello world");
-    assert_eq!(c.read(ino, opened.fh, 64, 8).unwrap(), b"", "past the end");
+    assert_eq!(
+        code(c.read(ino, opened.fh, 0, 64)),
+        Code::BadFd,
+        "a released handle is gone"
+    );
+    let reopened = Blocking::run(|r| {
+        c.view.open(
+            &c.cx(OpKind::Open),
+            ino,
+            OpenFlags::READ,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    assert_ne!(reopened.fh, opened.fh);
+    assert_eq!(c.read(ino, reopened.fh, 0, 64).unwrap(), b"hello world");
+    assert_eq!(
+        c.read(ino, reopened.fh, 64, 8).unwrap(),
+        b"",
+        "past the end"
+    );
     // The root answers as the root.
     assert_eq!(c.getattr(ROOT_INO).unwrap().kind, FileKind::Dir);
 }
@@ -706,4 +727,63 @@ fn an_unlinked_open_file_keeps_working_until_its_last_close() {
     assert!(c.view.writes.pending_inos().is_empty());
     assert!(c.view.meta.getattr(ino).unwrap().is_none(), "reaped");
     assert!(c.view.meta.orphans().unwrap().is_empty());
+}
+
+/// Plan 39 §3.7: a discard of writes made under a lapsed lock grant is an
+/// error event reported errseq-style — every open file description that
+/// was open when it happened sees `EIO` exactly once, at its next `fsync`
+/// or close, and one opened afterwards never does. Before, the inode owed
+/// one `EIO` the first publication point took, and a second descriptor's
+/// `fsync` returned 0 for data that had been thrown away.
+#[test]
+fn a_discard_is_reported_once_to_every_description_open_when_it_happened() {
+    let c = client();
+    let ino = c.put(ROOT_INO, "f", b"data");
+    let open = || {
+        Blocking::run(|r| {
+            c.view.open(
+                &c.cx(OpKind::Open),
+                ino,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap()
+        .fh
+    };
+    let flush =
+        |fh: Fh| Blocking::run(|r| c.view.flush(&c.cx(OpKind::Flush), ino, fh, LockOwner(3), r));
+    let (first, second, third) = (open(), open(), open());
+    // What `lock_discard_tainted`/a recalled grant's flush record when
+    // they throw dirty data away with no publication point to tell.
+    c.view.meta.locks().note_discard(ino);
+    let later = open();
+
+    assert_eq!(code(c.fsync(ino, first)), Code::Io);
+    c.fsync(ino, first).expect("reported once per description");
+    assert_eq!(code(c.fsync(ino, second)), Code::Io, "a second descriptor");
+    c.fsync(ino, second).unwrap();
+    assert_eq!(code(flush(third)), Code::Io, "a close reports it too");
+    flush(third).unwrap();
+    c.fsync(ino, later).expect("opened after the discard");
+    flush(later).unwrap();
+
+    // A second event: owed again to every description still open.
+    c.view.meta.locks().note_discard(ino);
+    assert_eq!(code(c.fsync(ino, later)), Code::Io);
+    assert_eq!(code(flush(first)), Code::Io);
+    for fh in [first, second, third, later] {
+        let _ = flush(fh);
+        Blocking::run(|r| {
+            c.view
+                .release(&c.cx(OpKind::Release), ino, fh, OpenFlags::WRITE, None, r)
+        })
+        .unwrap();
+    }
+    // The last close forgets the inode's events: a new open owes nothing.
+    assert_eq!(c.view.meta.locks().error_seq(ino), 0);
+    let fresh = open();
+    c.fsync(ino, fresh).unwrap();
+    c.close(ino, fresh).unwrap();
 }

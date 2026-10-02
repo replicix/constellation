@@ -100,6 +100,8 @@
 mod admission;
 mod confine;
 mod create;
+mod durable;
+pub use durable::Handle as OpenHandle;
 mod flush;
 mod handoff;
 mod io;
@@ -110,6 +112,11 @@ mod shards;
 mod spec;
 mod synthetic;
 mod write_gate;
+
+/// A uniform draw from `[0, 1)` (backoff jitter).
+pub(crate) fn jitter() -> f64 {
+    write_gate::jitter_fraction()
+}
 
 pub use confine::LINK_DOMAIN_XATTR;
 pub use handoff::{HandleTableSnapshot, ViewHandoff};
@@ -230,6 +237,9 @@ pub struct SyncHandle {
     pub tx: tokio::sync::mpsc::UnboundedSender<SyncRequest>,
     /// `--fsync-mode s3`: fsync() returns only once the journal is in S3.
     pub fsync_s3: bool,
+    /// Plan 39: the node's `fsync` policy (hard, or the opt-in soft
+    /// timeout) and its waits.
+    pub fsync: Arc<crate::fsync_wait::FsyncWaits>,
     /// Plan 30 §M8: `--cto strict` (see `crate::cto`).
     pub cto_strict: bool,
     /// Plan 30 §M14: `--locks cluster` (see `crate::locks`); `None` is
@@ -327,11 +337,20 @@ pub struct View {
     inode_ops: InodeOps,
     /// Open handle counts per inode, for orphan reaping on last close.
     opens: Mutex<HashMap<Ino, u32>>,
+    /// Every open file description this view handed out (plan 39 §3.7):
+    /// its inode (§6.12: a handle addresses only that one) and the discard
+    /// error event it has seen ([`durable`]'s module doc).
+    handles: durable::Handles,
+    /// Inodes whose last `fsync` failed after its write session was
+    /// published: the next one drains their pending chunks whatever the
+    /// mode, so it never reports durable what the failed one could not
+    /// make durable (plan 39 §3.2).
+    fsync_owed: Mutex<std::collections::HashSet<Ino>>,
     /// What each passthrough open holds until its `release`
     /// ([`PassthroughHandle`]), per inode. Keyed by inode and not by
-    /// handle because a view's handle *is* its inode (`open` answers
-    /// `Fh(ino)`, §6.12), so several concurrent passthrough opens of one
-    /// file are several entries in one vector.
+    /// handle because `release` does not tell the engine which of an
+    /// inode's passthrough opens ended, so several concurrent passthrough
+    /// opens of one file are several entries in one vector.
     passthrough: Mutex<HashMap<Ino, Vec<PassthroughHandle>>>,
     /// Sequential readahead.
     pub(crate) prefetch: crate::prefetch::Prefetcher,
@@ -447,6 +466,8 @@ impl View {
             writes: WriteShards::new(),
             inode_ops: InodeOps::new(),
             opens: Mutex::new(HashMap::new()),
+            handles: durable::Handles::default(),
+            fsync_owed: Mutex::new(std::collections::HashSet::new()),
             passthrough: Mutex::new(HashMap::new()),
             prefetch,
             scan,
@@ -545,6 +566,10 @@ impl View {
             .holds
             .as_ref()
             .is_some_and(|h| h.sources().is_open(ino));
+        if !open_here {
+            // Nothing of this view can `fsync` it again.
+            self.forget_fsync_owed(ino);
+        }
         if open_here || open_elsewhere {
             if let Some(h) = &self.holds {
                 h.nudge();

@@ -2366,6 +2366,87 @@
       },
       "type": "object"
     },
+    "FsyncStatus": {
+      "description": "Plan 39: the `fsync` policy (`hard` by default; `soft` with\n`--fsync-timeout`) and the waits it caused.",
+      "properties": {
+        "interrupted": {
+          "default": 0,
+          "description": "`fsync`s answered `EINTR`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kernel_cap_ms": {
+          "default": 0,
+          "description": "The cap the kernel's FUSE request timeout imposes, in ms (0: none).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "longest_wait_ms": {
+          "default": 0,
+          "description": "How long the oldest of them has waited, in ms (0: none).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_wait_ms": {
+          "default": 0,
+          "description": "The longest any `fsync` has waited since the node started, in ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "default": "",
+          "description": "`hard` (wait until durable) or `soft` (`--fsync-timeout`).",
+          "type": "string"
+        },
+        "permanent_errors": {
+          "default": 0,
+          "description": "`fsync`s answered `EIO` for a failure waiting does not fix.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retries": {
+          "default": 0,
+          "description": "Attempts retried after a transient failure.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "default": 0,
+          "description": "The soft timeout in ms (0: none).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeouts": {
+          "default": 0,
+          "description": "`fsync`s answered `EIO` because the soft timeout (or the kernel cap)\nelapsed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waited": {
+          "default": 0,
+          "description": "`fsync`s that retried at least once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "waiting": {
+          "default": 0,
+          "description": "`fsync`s waiting now after a failed attempt.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "FuseFallback": {
       "description": "One transport downgrade (plan 38 §2.4).",
       "properties": {
@@ -7580,6 +7661,23 @@
         },
         "fs_uuid": {
           "type": "string"
+        },
+        "fsync": {
+          "$ref": "#/$defs/FsyncStatus",
+          "default": {
+            "interrupted": 0,
+            "kernel_cap_ms": 0,
+            "longest_wait_ms": 0,
+            "max_wait_ms": 0,
+            "mode": "",
+            "permanent_errors": 0,
+            "retries": 0,
+            "timeout_ms": 0,
+            "timeouts": 0,
+            "waited": 0,
+            "waiting": 0
+          },
+          "description": "Plan 39: `fsync`s waiting out an unreachable S3, and how they ended."
         },
         "fuse": {
           "$ref": "#/$defs/FuseStatus",

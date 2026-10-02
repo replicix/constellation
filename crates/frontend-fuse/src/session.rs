@@ -38,8 +38,9 @@
 //!    kernel queues from now on stay queued, for the next server.
 //! 5. On the session's own thread, once every worker has returned:
 //!    **re-check** the deferred replies (a lock wait may have begun between
-//!    2 and 4), **drain the deferred reads** (a cold read the engine answers
-//!    from its completion pool: bounded, so waited for — up to
+//!    2 and 4), **drain the deferred reads and `fsync`s** (a cold read the
+//!    engine answers from its completion pool, an `fsync` from its `fsync`
+//!    pool, plan 39: waited for — up to
 //!    `CONSTELLATION_HANDOVER_READ_DRAIN_MS` — rather than refused), then
 //!    **publish every pending write** (`Vfs::sync_view`, the whole-view
 //!    barrier). Either failing aborts the detach: the session
@@ -486,9 +487,10 @@ fn notify_wait() -> Duration {
     )
 }
 
-/// How long a detach waits for the reads the engine is still answering
-/// from its completion pool (`CONSTELLATION_HANDOVER_READ_DRAIN_MS`,
-/// default 30 s): each is a bounded fetch.
+/// How long a detach waits for the reads and `fsync`s the engine is still
+/// answering from its pools (`CONSTELLATION_HANDOVER_READ_DRAIN_MS`,
+/// default 30 s): a read is a bounded fetch, an `fsync` its barrier —
+/// unless S3 is away, and then the detach refuses after this long.
 fn read_drain_wait() -> Duration {
     Duration::from_millis(
         std::env::var("CONSTELLATION_HANDOVER_READ_DRAIN_MS")
@@ -498,7 +500,7 @@ fn read_drain_wait() -> Duration {
     )
 }
 
-/// Wait, up to `within`, for every deferred read to be answered.
+/// Wait, up to `within`, for every deferred read and `fsync` to be answered.
 fn drain_reads(deferred: &Deferred, within: Duration) -> bool {
     let deadline = std::time::Instant::now() + within;
     while deferred.bounded() > 0 {
@@ -941,7 +943,7 @@ impl<V: Vfs> FuseSession<V> {
                 Err(refused(
                     Code::Busy,
                     format!(
-                        "{} deferred read(s) still unanswered after {:?}",
+                        "{} deferred read(s) or fsync(s) still unanswered after {:?}",
                         shared.deferred.bounded(),
                         read_drain_wait()
                     ),

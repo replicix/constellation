@@ -6,8 +6,9 @@
 //! knows lives only in the view. Inode numbers are the replica's (`Meta`,
 //! on disk): the kernel's cached dentries and its lookup counts name
 //! numbers the next process resolves the same way, and the view keeps no
-//! lookup table (`forget` is a no-op). File handles are the inode number
-//! (`open` answers `Fh(ino)`), so an open descriptor needs nothing but the
+//! lookup table (`forget` is a no-op). File handles are the view's own
+//! numbering (one per open, plan 39 §3.7), so they cross as a table: each
+//! handle's inode and the discard error event it has seen, plus the
 //! view's count of handles per inode, which the last-close orphan reap and
 //! the node's open-orphan holds read. Write sessions do not cross: a
 //! detach publishes every one first (`Vfs::sync_view`), and a write on a
@@ -17,6 +18,13 @@
 //!
 //! - **`opens`**: handles per inode (the last close still reaps an
 //!   unlinked-open orphan; the hold writer still claims it).
+//! - **`handles`**: every handle the kernel holds, and the next number —
+//!   without them every handed-over descriptor would read `EBADF`.
+//! - **`errors`**: the node's discard error events (`LockTables`, plan 39
+//!   §3.7) not yet forgotten — without them a description open at a
+//!   discard would `fsync` to 0 in the next process. The import also
+//!   raises the node's event numbering above every number that crossed,
+//!   so a later event is newer than what each handle has seen.
 //! - **`synthetic`**: the `.constellation` tree's numbering, which is the
 //!   view's own (a counter above `SYNTHETIC_INO_BIT`, in lookup order) —
 //!   without it every synthetic inode the kernel holds, and a snapshot
@@ -47,6 +55,11 @@ use serde::{Deserialize, Serialize};
 pub struct HandleTableSnapshot {
     /// `(inode, open handles)`.
     pub opens: Vec<(Ino, u32)>,
+    /// `(handle, its inode and seen error event)`, and the next number.
+    pub handles: Vec<(u64, super::OpenHandle)>,
+    pub handles_next: u64,
+    /// `(inode, its latest discard error event)`, node-wide.
+    pub errors: Vec<(Ino, u64)>,
     /// The confined view's reach cache.
     pub reached: Vec<Ino>,
     /// The synthetic registry: `(ino, key, node)` and the next number.
@@ -114,8 +127,12 @@ impl View {
             })
             .collect();
         synthetic.sort_by_key(|(ino, _, _)| *ino);
+        let (handles, handles_next) = self.handles.export();
         HandleTableSnapshot {
             opens,
+            handles,
+            handles_next,
+            errors: self.meta.locks().export_errors(),
             reached,
             synthetic,
             synthetic_next: registry.next,
@@ -132,6 +149,12 @@ impl View {
                 *opens.entry(*ino).or_insert(0) += n;
             }
         }
+        self.handles
+            .import(&snapshot.handles, snapshot.handles_next);
+        let seen = snapshot.handles.iter().map(|(_, h)| h.seen).max();
+        self.meta
+            .locks()
+            .import_errors(&snapshot.errors, seen.unwrap_or(0));
         for ino in &snapshot.reached {
             self.reach.mark(*ino);
         }
@@ -285,6 +308,44 @@ mod tests {
             meta.getattr(ino).unwrap().is_none(),
             "the orphan was reaped at the last close, on the new view"
         );
+    }
+
+    /// Plan 39 §3.7: a discard error a handed-over description has not
+    /// reported yet crosses into the next process (whose lock tables start
+    /// empty), is reported there once, and an event noted there afterwards
+    /// is newer than everything that crossed.
+    #[test]
+    fn an_unreported_discard_error_crosses_a_handover() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let file = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let (old, _d1) = super::super::quota_tests::test_fs(meta.clone());
+        let caller = Caller::new(0, 0, None);
+        let fh = Blocking::run(|r| {
+            old.open(
+                &cx(&caller, OpKind::Open),
+                file.ino,
+                OpenFlags::READ,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap()
+        .fh;
+        // Events on another inode first: the numbering is the node's.
+        meta.locks().note_discard(file.ino + 1000);
+        meta.locks().note_discard(file.ino + 1000);
+        let seq = meta.locks().note_discard(file.ino);
+        let snapshot = old.export_handles();
+        assert!(snapshot.errors.contains(&(file.ino, seq)));
+
+        // The next process: the same replica reopened, fresh lock tables.
+        let next = Arc::new(Meta::open_in_memory().unwrap());
+        let (new, _d2) = super::super::quota_tests::test_fs(next.clone());
+        new.import_handles(&snapshot);
+        assert_eq!(new.lock_publish_gate(file.ino, fh), Ok(true), "still owed");
+        assert_eq!(new.lock_publish_gate(file.ino, fh), Ok(false), "once");
+        assert!(next.locks().note_discard(file.ino) > seq, "numbered above");
+        assert_eq!(new.lock_publish_gate(file.ino, fh), Ok(true), "a newer one");
     }
 
     #[test]

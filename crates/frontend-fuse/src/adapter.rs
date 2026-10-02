@@ -20,7 +20,23 @@
 //! thread, and a cold read (a chunk in no local cache), which the engine
 //! completes from its completion pool (`FrontendCaps::linux_fuse` declares
 //! every op deferrable; locks and cold reads defer so far — plan 31 §6.3,
-//! C7b). Both are counted ([`Deferred`]) for a session handover.
+//! C7b), and an `fsync`, which the engine finishes on its `fsync` pool
+//! (plan 39 §3.3). All are counted ([`Deferred`]) for a session handover.
+//!
+//! `FUSE_INTERRUPT` (plan 39 §3.3, vendored fuser patch `interrupt`): an
+//! `fsync`/`fsyncdir` and an `O_SYNC`/`O_DSYNC` write register their
+//! request with [`Interrupts`] and carry the resulting [`CancelToken`] in
+//! their context. The policy is NFS `hard`'s: **killable, not
+//! interruptible**. An interrupt alone cancels nothing — the kernel sends
+//! one for any signal, a timer's or a handled `SIGINT`'s, and an `fsync`
+//! that answered `EINTR` to those would fail applications that never saw
+//! an outage. It marks the request, and the token is cancelled once the
+//! calling thread has a fatal signal pending (checked at once and then
+//! every 100 ms while the request waits): the engine's wait ends, the
+//! caller — which the kernel keeps waiting for this answer even after
+//! `SIGKILL`, the request being already in userspace — is released to
+//! die, and the data stays pending. Other ops ignore interrupts, as
+//! before.
 
 use crate::reply::{
     AttrReply, BytesReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply, LseekReply,
@@ -29,9 +45,9 @@ use crate::reply::{
 };
 use constellation_types::{Code, Rdev};
 use constellation_vfs::{
-    Caller, Durability, FallocateMode, Fh, FrontendCaps, LockKind, LockOwner, LockRange, LockSpec,
-    Name, Observer, OpKind, OpenFlags, OpenOwner, RenameFlags, Responder, SeekWhence, SetAttr,
-    SetXattrFlags, TimeSet, Vfs, WriteData, XattrName,
+    Caller, CancelToken, Durability, FallocateMode, Fh, FrontendCaps, LockKind, LockOwner,
+    LockRange, LockSpec, Name, Observer, OpKind, OpenFlags, OpenOwner, RenameFlags, Responder,
+    SeekWhence, SetAttr, SetXattrFlags, TimeSet, Vfs, WriteData, XattrName,
 };
 use fuser::{
     BsdFileFlags, FileHandle, Filesystem, INodeNo, InitFlags, KernelConfig, ReplyAttr, ReplyData,
@@ -85,6 +101,8 @@ pub struct FuseFs<V: Vfs> {
     /// Requests answered from another thread and not answered yet (plan
     /// 31 §6.11: a handover drains them, or refuses).
     deferred: Arc<Deferred>,
+    /// Plan 39 §3.3: the requests `FUSE_INTERRUPT` may cancel.
+    interrupts: Arc<Interrupts>,
 }
 
 impl<V: Vfs> FuseFs<V> {
@@ -95,6 +113,7 @@ impl<V: Vfs> FuseFs<V> {
             tuning,
             obs: Arc::default(),
             deferred: Arc::default(),
+            interrupts: Arc::default(),
         }
     }
 
@@ -112,6 +131,35 @@ impl<V: Vfs> FuseFs<V> {
     /// [`crate::FuseSession`] (the wire tests drive one over a socket
     /// pair) never has its slot filled and counts as `/dev/fuse`, which
     /// is what such a connection is.
+    /// Replace how a caller's fatal signal is detected (tests; see
+    /// [`fatal_signal_pending`]).
+    pub fn with_fatal_signal_probe(mut self, probe: fn(u32) -> bool) -> Self {
+        self.interrupts = Arc::new(Interrupts::with_probe(probe));
+        self
+    }
+
+    /// `fsync` and `fsyncdir` (see there).
+    fn sync_barrier(&self, req: &Request, ino: INodeNo, fh: Fh, reply: ReplyEmpty) {
+        let caller = caller(req);
+        let op = self.obs().begin(OpKind::Fsync, ino.0);
+        let _in = op.enter();
+        let unique = req.unique().0;
+        let token = self.interrupts.register(unique, req.pid());
+        // Counted as a bounded deferral, like a cold read: a detach waits
+        // for it (bounded) and refuses if it is still waiting for S3.
+        let reply = op.responder(
+            self.deferred
+                .track_bounded(self.interrupts.guard(unique, EmptyReply(reply))),
+        );
+        self.vfs.fsync(
+            &op.ctx(&caller).with_cancel(&token),
+            ino.0,
+            fh,
+            Durability::Configured,
+            reply,
+        );
+    }
+
     #[inline]
     fn obs(&self) -> &Observer {
         self.obs.get_or_init(|| {
@@ -132,9 +180,13 @@ impl<V: Vfs> FuseFs<V> {
 ///   must be written on the descriptor its request was read from, by a
 ///   process that still serves it.
 /// - **bounded**: reads, which the engine may answer from its completion
-///   pool when they are cold (plan 31 C7b). Their waits end on their own
-///   (a fetch succeeds or fails), so a detach drains them instead of
-///   refusing.
+///   pool when they are cold (plan 31 C7b), and `fsync`s, which it answers
+///   from its `fsync` pool (plan 39). A read's wait ends on its own (a
+///   fetch succeeds or fails); an `fsync` normally answers within its
+///   barrier but waits out an S3 outage. A detach drains them for a
+///   bounded time instead of refusing up front, and refuses if one is
+///   still unanswered then (an `fsync` waiting for S3 — before plan 39 the
+///   same `fsync` held its worker, and the detach waited for the worker).
 ///
 /// Every other op answers inline, on the worker, before it reads again, so
 /// stopping the workers drains those by itself.
@@ -236,6 +288,234 @@ impl<R> Drop for Tracked<R> {
         self.deferred
             .counter(self.bounded)
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// How long an interrupt that names a request no handler has registered
+/// yet is remembered. The kernel only interrupts a request it already
+/// handed to the daemon, so the race is the time between a reader taking
+/// the request and its handler registering it: microseconds on a
+/// `/dev/fuse` worker, but over io_uring the request may queue for an
+/// offload thread first (fuser's `dispatch_on_ring`), and the kernel sends
+/// a request's interrupt only once. Linux request uniques are never reused
+/// (`fuse_get_unique` only ever increments the counter), so a remembered
+/// interrupt can only match the request it names; the time and count
+/// bounds just bound the memory of interrupts for ops that never register.
+const EARLY_INTERRUPT_KEPT: std::time::Duration = std::time::Duration::from_secs(60);
+const EARLY_INTERRUPTS_MAX: usize = 4096;
+
+/// How often an interrupted request's caller is checked for a fatal signal.
+const FATAL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether the thread `tid` has a fatal signal pending — the kernel's own
+/// `fatal_signal_pending()`, read from `/proc/<tid>/status`.
+///
+/// A FUSE request's `pid` is the caller's *thread* id (the kernel fills it
+/// from `task_pid(current)`), and `/proc/<tid>/status` is that thread's
+/// view: `SigPnd` its private pending set, `ShdPnd` the process's. When a
+/// signal is going to kill the process — `SIGKILL`, or any signal whose
+/// action is the default fatal one (an unhandled `SIGTERM`/`SIGINT`, …),
+/// or another thread's `exit_group` — the kernel adds `SIGKILL` to every
+/// thread's private set (`complete_signal`, `zap_other_threads`); that bit
+/// is exactly what `fatal_signal_pending()` tests. A handled or blocked
+/// signal never sets it, so those keep waiting. `ShdPnd`'s `SIGKILL` is
+/// read too (a group kill not yet distributed).
+///
+/// Unknowable is "no": `pid` 0 (a request the kernel makes itself, or a
+/// caller outside the mount's pid namespace) and a thread `/proc` does not
+/// show (another pid namespace, `hidepid`) keep the request waiting as
+/// `hard` does — the soft timeout and the kernel cap still apply.
+pub fn fatal_signal_pending(tid: u32) -> bool {
+    if tid == 0 {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{tid}/status"))
+        .is_ok_and(|status| status_has_sigkill_pending(&status))
+}
+
+fn status_has_sigkill_pending(status: &str) -> bool {
+    let sigkill: u64 = 1 << (libc::SIGKILL - 1);
+    status
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("SigPnd:")
+                .or_else(|| l.strip_prefix("ShdPnd:"))
+        })
+        .filter_map(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .any(|mask| mask & sigkill != 0)
+}
+
+/// The requests that honour `FUSE_INTERRUPT`, by `unique` (see the module
+/// doc).
+pub(crate) struct Interrupts {
+    state: std::sync::Mutex<InterruptState>,
+    /// [`fatal_signal_pending`], or a test's stand-in.
+    fatal: fn(u32) -> bool,
+}
+
+impl Default for Interrupts {
+    fn default() -> Self {
+        Self::with_probe(fatal_signal_pending)
+    }
+}
+
+struct Waiting {
+    token: CancelToken,
+    /// The caller's thread.
+    pid: u32,
+    /// The kernel interrupted it: watched for a fatal signal.
+    interrupted: bool,
+}
+
+#[derive(Default)]
+struct InterruptState {
+    waiting: std::collections::HashMap<u64, Waiting>,
+    /// Interrupts that overtook their request, oldest first.
+    early: std::collections::VecDeque<(u64, std::time::Instant)>,
+    /// A watcher thread is running.
+    watcher: bool,
+}
+
+impl InterruptState {
+    fn prune_early(&mut self) {
+        let now = std::time::Instant::now();
+        self.early
+            .retain(|(_, at)| now.duration_since(*at) < EARLY_INTERRUPT_KEPT);
+    }
+
+    /// Interrupted, not cancelled yet.
+    fn watched(&self) -> bool {
+        self.waiting
+            .values()
+            .any(|w| w.interrupted && !w.token.is_cancelled())
+    }
+}
+
+impl Interrupts {
+    fn with_probe(fatal: fn(u32) -> bool) -> Self {
+        Self {
+            state: std::sync::Mutex::default(),
+            fatal,
+        }
+    }
+
+    /// `unique`, from the thread `pid`, honours interrupts until its reply:
+    /// the token to wait on.
+    pub(crate) fn register(self: &Arc<Self>, unique: u64, pid: u32) -> CancelToken {
+        let token = CancelToken::new();
+        let mut st = self.state.lock().unwrap();
+        st.prune_early();
+        let interrupted = match st.early.iter().position(|(u, _)| *u == unique) {
+            Some(i) => {
+                st.early.remove(i);
+                true
+            }
+            None => false,
+        };
+        st.waiting.insert(
+            unique,
+            Waiting {
+                token: token.clone(),
+                pid,
+                interrupted,
+            },
+        );
+        if interrupted {
+            self.watch(st);
+        }
+        token
+    }
+
+    pub(crate) fn unregister(&self, unique: u64) {
+        self.state.lock().unwrap().waiting.remove(&unique);
+    }
+
+    /// The kernel interrupts `unique`.
+    pub(crate) fn interrupt(self: &Arc<Self>, unique: u64) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(w) = st.waiting.get_mut(&unique) {
+            w.interrupted = true;
+            self.watch(st);
+            return;
+        }
+        st.prune_early();
+        // Interrupts of ops that do not honour them land here too; the
+        // bound keeps a signal storm from growing the list.
+        if st.early.len() >= EARLY_INTERRUPTS_MAX {
+            st.early.pop_front();
+        }
+        st.early.push_back((unique, std::time::Instant::now()));
+    }
+
+    /// Cancel every interrupted request whose caller is dying.
+    fn cancel_dying(&self, st: &InterruptState) {
+        for w in st.waiting.values() {
+            if w.interrupted && !w.token.is_cancelled() && (self.fatal)(w.pid) {
+                w.token.cancel();
+            }
+        }
+    }
+
+    /// Check the interrupted requests now, and from a watcher thread every
+    /// [`FATAL_POLL`] for as long as one of them is still waiting (the
+    /// kernel interrupts a request once; the fatal signal may come later).
+    fn watch(self: &Arc<Self>, mut st: std::sync::MutexGuard<'_, InterruptState>) {
+        self.cancel_dying(&st);
+        if st.watcher || !st.watched() {
+            return;
+        }
+        st.watcher = true;
+        drop(st);
+        let this = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("fuse-interrupts".into())
+            .spawn(move || loop {
+                std::thread::sleep(FATAL_POLL);
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                let mut st = this.state.lock().unwrap();
+                this.cancel_dying(&st);
+                if !st.watched() {
+                    st.watcher = false;
+                    return;
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start the FUSE interrupt watcher");
+            self.state.lock().unwrap().watcher = false;
+        }
+    }
+
+    fn guard<R>(self: &Arc<Self>, unique: u64, reply: R) -> Interruptible<R> {
+        Interruptible {
+            reply: Some(reply),
+            interrupts: self.clone(),
+            unique,
+        }
+    }
+}
+
+/// A responder whose request stops honouring interrupts once answered (or
+/// dropped, which answers `EIO`).
+struct Interruptible<R> {
+    reply: Option<R>,
+    interrupts: Arc<Interrupts>,
+    unique: u64,
+}
+
+impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for Interruptible<R> {
+    fn done(mut self, result: constellation_vfs::VfsResult<T>) {
+        self.interrupts.unregister(self.unique);
+        if let Some(reply) = self.reply.take() {
+            reply.done(result);
+        }
+    }
+}
+
+impl<R> Drop for Interruptible<R> {
+    fn drop(&mut self) {
+        self.interrupts.unregister(self.unique);
     }
 }
 
@@ -708,14 +988,36 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // (`HeldRequest` in `vendor/fuser/src/uring/ring.rs`), and a view
         // that keeps the bytes past the call copies them into
         // `WriteData::Shared` itself.
+        let flags = open_flags(flags.0);
+        if !flags.contains(OpenFlags::SYNC) {
+            self.vfs.write(
+                &op.ctx(&caller),
+                ino.0,
+                Fh(fh.0),
+                offset,
+                WriteData::Borrowed(data),
+                flags,
+                op.responder(WriteReply(reply)),
+            );
+            return;
+        }
+        // Plan 39 §3.3: an `O_SYNC`/`O_DSYNC` write waits for durability
+        // like an `fsync` — on the engine's `fsync` pool, so a bounded
+        // deferral, and ended by its caller's death.
+        let unique = req.unique().0;
+        let token = self.interrupts.register(unique, req.pid());
+        let reply = op.responder(
+            self.deferred
+                .track_bounded(self.interrupts.guard(unique, WriteReply(reply))),
+        );
         self.vfs.write(
-            &op.ctx(&caller),
+            &op.ctx(&caller).with_cancel(&token),
             ino.0,
             Fh(fh.0),
             offset,
             WriteData::Borrowed(data),
-            open_flags(flags.0),
-            op.responder(WriteReply(reply)),
+            flags,
+            reply,
         );
     }
 
@@ -739,6 +1041,10 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         );
     }
 
+    /// `fsync`/`fdatasync` (the engine has no cheaper data-only barrier:
+    /// `datasync` is ignored). Plan 39: the engine may wait out an S3
+    /// outage and answer from its `fsync` pool, so the reply is counted as
+    /// a deferral, and an interrupt ends the wait with `EINTR`.
     fn fsync(
         &self,
         req: &Request,
@@ -747,16 +1053,33 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let caller = caller(req);
-        let op = self.obs().begin(OpKind::Fsync, ino.0);
-        let _in = op.enter();
-        self.vfs.fsync(
-            &op.ctx(&caller),
-            ino.0,
-            Fh(fh.0),
-            Durability::Configured,
-            op.responder(EmptyReply(reply)),
-        );
+        self.sync_barrier(req, ino, Fh(fh.0), reply);
+    }
+
+    /// Plan 39 §3.6: the same barrier for a directory — its entries'
+    /// mutations committed, the local store synced, and under
+    /// `--fsync-mode s3` the journal shipped — so "fsync the directory
+    /// after a create or rename" means what applications rely on it to
+    /// mean. Before, fuser's default answered `ENOSYS`, and the kernel then
+    /// answered every later directory `fsync` on the mount 0 without
+    /// asking. `fh` is the `opendir` handle (always 0: the view keeps
+    /// none for directories).
+    fn fsyncdir(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.sync_barrier(req, ino, Fh(fh.0), reply);
+    }
+
+    /// CONSTELLATION PATCH (interrupt) in vendored fuser: see [`Interrupts`].
+    fn interrupt(&self, _req: &Request, unique: fuser::RequestId) {
+        // An `Arc` method: the first interrupt of a wait starts the
+        // watcher, which holds the table weakly.
+        self.interrupts.interrupt(unique.0);
     }
 
     fn release(
@@ -969,8 +1292,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
     /// Plan 30 §M14: `F_SETLK`/`F_SETLKW`/`flock` under `--locks
     /// cluster`. Non-blocking requests are answered on this worker; the
     /// view answers a blocking one (`sleep`) from a thread of its own, so
-    /// a contended lock never pins a FUSE worker. fuser 0.18 delivers no
-    /// interrupts: a blocked wait cannot be cancelled by a signal.
+    /// a contended lock never pins a FUSE worker. Interrupts are wired to
+    /// `fsync` only ([`Interrupts`]): a blocked lock wait cannot be
+    /// cancelled by a signal.
     fn setlk(
         &self,
         req: &Request,
@@ -1038,6 +1362,78 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 mod tests {
     use super::*;
     use constellation_vfs::types::mode;
+
+    /// The stand-in caller: thread 66 is dying (from the moment
+    /// [`DYING`] is set), every other thread lives.
+    static DYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn probe(pid: u32) -> bool {
+        pid == 66 && DYING.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Killable, not interruptible (plan 39 §3.3): an interrupt cancels
+    /// what it names only once its caller is dying — at once, or when the
+    /// fatal signal comes later; early or late; nothing else.
+    #[test]
+    fn interrupts_cancel_only_what_they_name_and_only_for_a_dying_caller() {
+        let i = Arc::new(Interrupts::with_probe(probe));
+        let living = i.register(10, 55);
+        i.interrupt(10);
+        std::thread::sleep(FATAL_POLL * 3);
+        assert!(!living.is_cancelled(), "a handled signal keeps waiting");
+        i.unregister(10);
+        let doomed = i.register(12, 66);
+        i.interrupt(11);
+        assert!(!doomed.is_cancelled(), "another request's interrupt");
+        i.interrupt(12);
+        assert!(!doomed.is_cancelled(), "not dying yet");
+        DYING.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !doomed.is_cancelled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(doomed.is_cancelled(), "the fatal signal came later");
+        i.unregister(12);
+        // Overtaken: the interrupt came before its request registered.
+        i.interrupt(13);
+        assert!(i.register(13, 66).is_cancelled(), "an early interrupt");
+        i.unregister(13);
+        assert!(!i.register(14, 66).is_cancelled(), "never interrupted");
+        i.unregister(14);
+        i.interrupt(15);
+        assert!(
+            !i.register(15, 55).is_cancelled(),
+            "early, the caller lives"
+        );
+        i.unregister(15);
+        assert!(!i.state.lock().unwrap().watched());
+    }
+
+    #[test]
+    fn a_pending_sigkill_is_read_from_the_threads_status() {
+        let status = |sig: &str, shd: &str| {
+            format!("Name:\tpg\nSigQ:\t0/1\nSigPnd:\t{sig}\nShdPnd:\t{shd}\nSigBlk:\t0000000000000000\n")
+        };
+        assert!(!status_has_sigkill_pending(&status(
+            "0000000000000000",
+            "0000000000000000"
+        )));
+        // SIGINT (2) and SIGALRM (14) pending: not fatal by themselves.
+        assert!(!status_has_sigkill_pending(&status(
+            "0000000000002002",
+            "0000000000000000"
+        )));
+        assert!(status_has_sigkill_pending(&status(
+            "0000000000000100",
+            "0000000000000000"
+        )));
+        assert!(status_has_sigkill_pending(&status(
+            "0000000000000000",
+            "0000000000000100"
+        )));
+        // This thread is alive and has nothing pending; thread 0 is unknowable.
+        assert!(!fatal_signal_pending(std::process::id()));
+        assert!(!fatal_signal_pending(0));
+    }
 
     #[test]
     fn open_flags_decode_the_access_mode_as_the_kernel_does() {

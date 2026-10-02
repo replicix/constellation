@@ -231,9 +231,9 @@ impl View {
     /// One of `ino`'s passthrough handles is gone (its `release`), and
     /// `remaining` handles of any kind are still open on it.
     ///
-    /// A `release` names the inode and not the handle — a view's handle
-    /// *is* its inode (`Fh(ino)`, §6.12) — so the table cannot know which
-    /// of several concurrent opens ended. What it can know is that the
+    /// The table is kept per inode, not per handle (it predates plan 39's
+    /// one-handle-per-open numbering, which it does not consult), so it
+    /// cannot know which of several concurrent opens ended. What it can know is that the
     /// pins must never outnumber the live handles, and that their count
     /// must never fall below the number of live *passthrough* handles: a
     /// pin dropped while the handle it belongs to is still being served

@@ -495,6 +495,41 @@ pub fn render_metrics(status: &StatusReport) -> String {
         status.speculation.copies_stalled
     );
     gauge!(
+        "constellation_fsync_waiting",
+        "fsyncs waiting out an unreachable S3 after a failed attempt (plan 39).",
+        status.fsync.waiting
+    );
+    gauge!(
+        "constellation_fsync_longest_wait_ms",
+        "How long the oldest waiting fsync has waited, in ms.",
+        status.fsync.longest_wait_ms
+    );
+    gauge!(
+        "constellation_fsync_max_wait_ms",
+        "The longest any fsync has waited since start, in ms.",
+        status.fsync.max_wait_ms
+    );
+    gauge!(
+        "constellation_fsync_retries_total",
+        "fsync attempts retried after a transient S3 failure.",
+        status.fsync.retries
+    );
+    gauge!(
+        "constellation_fsync_timeouts_total",
+        "fsyncs answered EIO by --fsync-timeout or the kernel request-timeout cap.",
+        status.fsync.timeouts
+    );
+    gauge!(
+        "constellation_fsync_permanent_errors_total",
+        "fsyncs answered EIO for an S3 failure waiting does not fix.",
+        status.fsync.permanent_errors
+    );
+    gauge!(
+        "constellation_fsync_interrupted_total",
+        "fsyncs answered EINTR.",
+        status.fsync.interrupted
+    );
+    gauge!(
         "constellation_held_transactions",
         "Journaled transactions held back behind unrecoverable pending chunks.",
         status.held.transactions

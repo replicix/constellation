@@ -20,36 +20,49 @@ impl View {
     /// discarded, never published: a later publication would overwrite
     /// what the next holder wrote under its own grant. `Err(EIO)` then,
     /// if anything was discarded or local locks are still fenced.
-    /// `Ok(true)`: such a discard happened earlier where nobody could be
-    /// told (a new lock, a recalled grant's flush); the caller reports
-    /// `EIO` after its own flush. One or two relaxed loads when this node
-    /// holds no grant, lock or taint.
-    pub(crate) fn lock_publish_gate(&self, ino: Ino) -> Result<bool, Code> {
-        let Some(l) = self.cluster_locks() else {
-            return Ok(false);
-        };
+    ///
+    /// `Ok(true)`: `fh`, the description publishing, was open when such a
+    /// discard happened earlier and has not reported it yet (plan 39
+    /// §3.7, errseq-style: [`super::durable`]'s module doc); the caller
+    /// reports `EIO` after its own flush. A discard found here is an error
+    /// event too: `fh` reports it now, every other description open on the
+    /// inode at its next close or `fsync`. One or two relaxed loads when
+    /// this node holds no grant, lock or taint and never discarded.
+    pub(crate) fn lock_publish_gate(
+        &self,
+        ino: Ino,
+        fh: constellation_vfs::Fh,
+    ) -> Result<bool, Code> {
         if View::is_synthetic(ino) {
             return Ok(false);
         }
-        if let Some(fenced) = l.take_discard(ino) {
-            let dirty = self.discard_lock_writes(ino);
-            if fenced || dirty {
-                return Err(Code::Io);
+        if let Some(l) = self.cluster_locks() {
+            if let Some(fenced) = l.take_discard(ino) {
+                let dirty = self.discard_lock_writes(ino);
+                if dirty {
+                    let seq = l.note_discard(ino);
+                    self.handles.mark_seen(fh, seq);
+                }
+                if fenced || dirty {
+                    return Err(Code::Io);
+                }
             }
         }
-        Ok(l.take_owed(ino))
+        let current = self.meta.locks().error_seq(ino);
+        Ok(current != 0 && self.handles.take_error(fh, ino, current))
     }
 
     /// Plan 30 §M14: before a new local lock or a write on `ino` — dirty
     /// data written under an earlier grant that ended without its flush
     /// must not ride along with what comes next (under a fresh grant, or
-    /// unlocked). Discarded; the next close or `fsync` reports `EIO`.
+    /// unlocked). Discarded; every description open now reports `EIO` at
+    /// its next close or `fsync`.
     pub(crate) fn lock_discard_tainted(&self, ino: Ino) {
         let Some(l) = self.cluster_locks() else {
             return;
         };
         if l.take_discard(ino).is_some() && self.discard_lock_writes(ino) {
-            l.owe(ino);
+            l.note_discard(ino);
         }
     }
 
@@ -87,7 +100,7 @@ impl crate::locks::LockFlush for View {
         // since — its data is discarded (reported at the next close).
         if let Some(l) = self.cluster_locks() {
             if l.take_discard(ino).is_some() && self.discard_lock_writes(ino) {
-                l.owe(ino);
+                l.note_discard(ino);
             }
         }
         let r = self

@@ -83,6 +83,12 @@ pub struct EngineConfig {
     pub cache_verify: Option<CacheVerify>,
     /// `--fsync-mode s3`.
     pub fsync_s3: bool,
+    /// Plan 39: `--fsync-timeout`, the opt-in soft bound on how long an
+    /// `fsync` waits for an unreachable S3. `None` (no flag):
+    /// `CONSTELLATION_FSYNC_TIMEOUT`, else wait forever; `Some(None)`: an
+    /// explicit `hard` (`0`/`off`/`hard`), which the environment does not
+    /// override; `Some(Some(t))`: soft, `t`.
+    pub fsync_timeout: Option<Option<std::time::Duration>>,
     /// `--cto strict`.
     pub cto_strict: bool,
     /// `--locks cluster` (`Some(true)`) / `local` (`Some(false)`) /
@@ -121,6 +127,7 @@ impl EngineConfig {
             staging_budget: None,
             cache_verify: None,
             fsync_s3: false,
+            fsync_timeout: None,
             cto_strict: false,
             locks: None,
             initial_write_mode: writeback::WriteMode::Through,
@@ -296,6 +303,8 @@ pub struct Engine {
     last_sync_ms: Arc<AtomicU64>,
     read_only_member: bool,
     fsync_s3: bool,
+    /// Plan 39: every view's `fsync` policy and waits.
+    fsync_waits: Arc<crate::fsync_wait::FsyncWaits>,
     cto_strict: bool,
     /// Plan 30 §M14: the effective `--locks` mode, and every view's flush
     /// for a recalled grant.
@@ -353,6 +362,7 @@ impl Engine {
             staging_budget,
             cache_verify,
             fsync_s3,
+            fsync_timeout,
             cto_strict,
             locks,
             initial_write_mode,
@@ -1550,6 +1560,9 @@ impl Engine {
             last_sync_ms,
             read_only_member,
             fsync_s3,
+            fsync_waits: Arc::new(crate::fsync_wait::FsyncWaits::new(
+                fsync_timeout.unwrap_or_else(crate::fsync_wait::timeout_from_env),
+            )),
             cto_strict,
             locks_cluster,
             lock_flushers,
@@ -1693,6 +1706,7 @@ impl Engine {
                 sync: Some(SyncHandle {
                     tx: self.sync_tx.clone(),
                     fsync_s3: self.fsync_s3,
+                    fsync: self.fsync_waits.clone(),
                     cto_strict: self.cto_strict,
                     locks: self.locks_cluster.then(|| {
                         Arc::new(crate::locks::ClusterLocks {
@@ -2189,6 +2203,11 @@ impl Engine {
     pub fn last_sync_ms(&self) -> &Arc<AtomicU64> {
         &self.last_sync_ms
     }
+    /// Plan 39: the node's `fsync` policy and waits (`node.status.fsync`).
+    pub fn fsync_waits(&self) -> &Arc<crate::fsync_wait::FsyncWaits> {
+        &self.fsync_waits
+    }
+
     pub fn read_only_member(&self) -> bool {
         self.read_only_member
     }

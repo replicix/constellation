@@ -32588,3 +32588,96 @@ the service's logical-over-stored ratio), the CLI lays them out.
 | `cargo build --release --workspace` | exit 0 |
 | `target/release/harness run snapshot-lifecycle snapshot-churn gc-lifecycle web-ui-smoke e2e-basic e2e-two-nodes` | ALL SCENARIOS PASSED (6/6) |
 | `snapshot-lifecycle snapshot-churn gc-lifecycle` with `CONSTELLATION_SNAPACCT=on` and with `=off` | 3/3 and 3/3 passed |
+
+## Plan 39 — fsync durability under S3 outages: `hard` by default
+
+Plan 39 (`docs/plans/v1/wip/39-fsync-durability.md`), milestones F1–F5 in one
+chunk. An `fsync` now behaves like an NFS `hard` mount: a *transient* S3
+failure is retried until the data is as durable as `--fsync-mode` says, a
+*permanent* one answers `EIO` at once, a killed caller ends the wait (a
+handled signal does not: killable, not interruptible, as NFS `hard`), and
+`--fsync-timeout` / `CONSTELLATION_FSYNC_TIMEOUT` is the documented opt-in
+`soft` bound. No path drops data and no `fsync` after a failed one returns 0
+for data that is still only local. What each `--fsync-mode` waits *for* is
+unchanged (§6 leaves `local`'s chunk wait to the maintainer).
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| Error classification (F1) | done | `crates/store-s3/src/classify.rs`: one `classify` walking the source chain (`object_store::Error` variant, `HttpErrorKind`, `io::ErrorKind`, `StoreError`), then the rendered text (status line, `<Code>`). Table test `the_classification_table` plus wrapped-error, text-only and `ExpiredToken`-refreshable tests. Unrecognised → transient (waiting is always safe; `EIO` never is). The engine adds `SyncFailure::from_error` (`crates/engine/src/sync.rs`): a `MetaError` in the chain is local and permanent; the sync task's `DrainInode`/`Barrier` replies now carry a classified `SyncFailure` |
+| Hard retry loop (F1) | done | `crates/engine/src/fsync_wait.rs`: `FsyncWaits::run` (attempt inside a thread-local `Scope`; transient → `Backoff` 100 ms doubling to 5 s, delay drawn from `[d/2, d]`; permanent → `EIO`; nothing recorded → the refusal is returned unchanged), `recv` (reply waits poll interrupt and deadline only inside a scope; outside, exactly `blocking_recv`). `View::fsync_durable` (`crates/engine/src/view/durable.rs`) is the attempt; `View::fsync` runs it on the elastic `fsync_wait::pool()` so an outage pins no FUSE worker |
+| No false success after a failed fsync | done | the owed drain: every retry and the first attempt of the next `fsync` after a failed one drain the inode's pending chunks again (the write session was already published, so `flush_inode` alone would skip the drain). Engine tests `an_fsync_retries_a_transient_drain_failure_until_it_succeeds`, `a_permanent_drain_failure_is_eio_and_the_next_fsync_drains_again` (`view/durable_ack_tests.rs`) |
+| Forwarded/in-doubt commit on the fsync path | done | `view/write_gate.rs` (`submit_to_core`): `InDoubt`/`Busy`/`NotHolder`/`Held` noted transient inside a scope; `authority_driver.rs` classifies the sync task's drain/barrier failures (`SyncFailure::from_error`/`from_text`), so the attempt is retried (an in-doubt op is retried by design) |
+| `O_SYNC`/`O_DSYNC` writes | done | `View::flush_sync_write`: the same loop and owed bookkeeping as `fsync` (`View::owing_run`), on the `fsync` pool (never a FUSE worker), killable; cut short it answers `EIO`, not `EINTR` (the bytes are written but not durable). Test `a_failed_o_sync_write_leaves_the_next_fsync_draining_again`; wire test `an_o_sync_write_is_killable_like_an_fsync` |
+| Interrupts (F2) | done | `vendor/fuser/patches/0003-interrupt.patch` (`Filesystem::interrupt(req, unique)`, never answered; regenerated on main's Z2a `0002`; `tools/vendor-fuser.sh --check` reproduces `vendor/fuser`); adapter `Interrupts` table in `crates/frontend-fuse/src/adapter.rs`: **killable only** — an interrupt marks the request, and its `CancelToken` is cancelled once the caller's thread has `SIGKILL` pending (`fatal_signal_pending`: `/proc/<tid>/status` `SigPnd`/`ShdPnd`; the kernel turns every default-fatal signal into a per-thread `SIGKILL`), checked at once and every 100 ms by a `fuse-interrupts` watcher (the kernel interrupts a request once, possibly for a handled signal). Overtaking interrupts remembered up to 60 s (uniques are never reused). Before this the connection had `no_interrupt` and a request already in userspace was waited out even under `SIGKILL`. Tests `interrupts_cancel_only_what_they_name_and_only_for_a_dying_caller`, `a_pending_sigkill_is_read_from_the_threads_status`, wire `an_interrupt_cancels_a_dying_callers_fsync_and_is_not_answered` |
+| `fsyncdir` (F2) | done | the adapter answers `fsyncdir` with the view's `fsync` on the directory inode (the barrier; journal shipped under `--fsync-mode s3`), same kill/timeout/retry. Wire test `fsyncdir_is_the_fsync_barrier_on_the_directory` |
+| errseq discard reporting (F3) | done | one `Fh` per open (`view::durable::Handles`), each with the error sequence it has seen; `LockTables::note_discard`/`error_seq`/`forget_errors` (`crates/meta/src/locks.rs`); `lock_publish_gate(ino, fh)`; an event is forgotten only once no view on the node has the inode open (`View::forget_discard_errors`, via the hold sources); the handle table and the node's events cross `daemon --upgrade` (`HandleTableSnapshot.handles`/`errors`, `LockTables::export_errors`/`import_errors`, numbering raised above what crossed), `HANDOVER_VERSION` 3. Tests `an_error_event_is_reported_once_per_description_open_at_the_time`, `a_discard_is_reported_once_to_every_description_open_when_it_happened`, `a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time` (a real lapsed grant through the fence), `a_discard_error_outlives_one_views_last_close_while_another_has_it_open`, `an_unreported_discard_error_crosses_a_handover` |
+| `--fsync-timeout` and the kernel cap (F4) | done | `mount --fsync-timeout`, `CONSTELLATION_FSYNC_TIMEOUT` (an explicit `--fsync-timeout hard`/`off`/`0` overrides it), parsed before the fork, carried in `NodeHandoff`. `/proc/sys/fs/fuse/{default,max}_request_timeout` (Linux 6.15+) read at start; when set, every wait is capped at `t − min(t/5, 5 s)`, warned once |
+| Observability (F4) | done | warn once per inode after 10 s from the start of the call, checked while a reply is awaited too, so a slow first attempt is covered ("fsync: S3 unreachable, still trying"), info when it ends; `waiting`/`longest_wait_ms` list every wait from its start (test `a_slow_first_attempt_is_listed_while_it_runs`); the pool's threads are `fsync-wait-N`; `node.status.fsync` (`mode`, `timeout_ms`, `kernel_cap_ms`, `waiting`, `longest_wait_ms`, `max_wait_ms`, `waited`, `retries`, `timeouts`, `permanent_errors`, `interrupted`), `/metrics` `constellation_fsync_*`, event-stream gauges; schema re-blessed |
+| Docs (F4) | done | `configuration.md` (both knobs, nfs(5)-style warning), `durability-and-failover.md`, `TESTING.md`, `vendor/fuser/CONSTELLATION-PATCH.md` |
+| Harness (F5) | done | `crates/harness/src/scenarios/fsync.rs`: `fsync-hard-outage` (20 s cut under a waiting `fsync`: no `EIO`, no early return, `node.status.fsync` shows the wait, a fresh node reads the bytes), `fsync-soft-timeout` (`--fsync-timeout 2s`: `EIO` after ~2 s, data pending, uploads by itself after the heal), `fsync-interrupt` (during a cut a handled `SIGINT` leaves the `fsync` waiting; `SIGKILL` gets the process reaped within 5 s; data still uploads), `fsyncdir-barrier`. `fio-blips` unchanged; the harness's `CONSTELLATION_S3_MAX_RETRIES=2` client settings stay |
+
+Unchanged on purpose: background uploads (three attempts per pass, retried
+every round), `close()` and `--write-mode` (outside a scope their waits block
+and fail as before), peer chunk handoff, lock waits (not wired to interrupts:
+`EINTR` from a blocked `flock` is its own decision). Forwarded commits and the
+lease acquisition on the `fsync` path wait through `fsync_wait::recv`/`sleep`,
+so they honour the kill, the soft timeout and the kernel cap.
+
+Recorded for chunk 39b (plan 39 §6): a `--fsync-mode local` `fsync` started
+before a continuation epoch can succeed with its chunks only on this node once
+the epoch activates (the owed drain is gated on `!epoch_active()`), and
+`local` never drains chunks an earlier `close()` published under
+`--write-mode back`.
+
+### Gates (2026-10-02, kernel 7.3.0-rc4)
+
+- `cargo fmt --all -- --check`: clean. `cargo clippy --workspace
+  --all-targets -- -D warnings` and with `--features
+  constellation-frontend-fuse/io-uring`: clean.
+- `cargo test`, per crate: every crate green (engine 428 + 1, store-s3 226,
+  meta 279, authority 264, control 135, frontend-fuse 27 + 22, …, 0 failed);
+  vendored fuser `cargo test --lib` 72/72.
+- `tests/smoke.sh`, `tests/integration.sh`: passed. Release build: ok.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=f39`): `fio-blips` **10/10**;
+  `fsync-hard-outage`, `fsync-soft-timeout`, `fsync-interrupt`,
+  `fsyncdir-barrier` 3/3 each; `s3-cut-one-node`, `forwarded-mutations`,
+  `lease-handover`, `e2e-basic`, `e2e-two-nodes`, `git-under-flock` passed.
+- Compliance (`docker compose --profile test run --rm compliance`): **8798
+  passed, 0 failed**, dev_fuse transport. Port 4566 was held by another
+  chunk's floci for the whole session, so the lane ran with `--no-deps -e
+  AWS_ENDPOINT=http://<host-ip>:4566`, i.e. against that floci (per-run
+  bucket prefix) instead of its own.
+
+### Review round (2026-10-02, rebased onto main with 38-Z2a)
+
+| Finding | State | Where |
+|---|---|---|
+| M1 handoff format changed, version did not | fixed | `HANDOVER_VERSION` 3 (`crates/cli/src/handover.rs`): the ABI probe refuses a mixed upgrade/downgrade up front |
+| M2 a failed `O_SYNC` write let the next `fsync` succeed falsely | fixed | `View::owing_run` shared by `fsync_durable` and `flush_sync_write`; test `a_failed_o_sync_write_leaves_the_next_fsync_draining_again` |
+| M3 an `O_SYNC` write could pin a FUSE worker forever | fixed | the publication runs on `fsync_wait::pool()`; the adapter registers it with `Interrupts` and tracks it as a bounded deferral; cut short → `EIO`, inode owed |
+| S1 one mount's last close forgot another's discard error | fixed | `View::forget_discard_errors` (node-wide via the hold sources); events cross `daemon --upgrade` (`HandleTableSnapshot.errors`) |
+| S2 any handled signal turned an `fsync` into `EINTR` | fixed (maintainer: killable-only) | adapter `Interrupts` + `fatal_signal_pending`; plan §3.3, `configuration.md`, `durability-and-failover.md` |
+| S3 forwarded commit waited in a plain `blocking_recv` | fixed | `submit_to_core` and the lease acquisition use `fsync_wait::recv`/`sleep` |
+| S4 no warning/gauge during a slow first attempt | fixed | `WaitEntry` from the start of `run`; the warning is also checked from `recv`'s poll |
+| S5 no evidence for `kill -9` | fixed | `fsync-interrupt`: handled `SIGINT` keeps waiting, `SIGKILL` reaped in 50–100 ms (`/dev/fuse` and `uring`) |
+| S6 `--fsync-mode local` + epoch outcome | recorded | plan 39 §6, for chunk 39b |
+| Nits | fixed | explicit `--fsync-timeout hard` overrides the env (`EngineConfig::fsync_timeout: Option<Option<Duration>>`); `fsync_owed` pruned when an unlinked inode's last description closes; pool threads `fsync-wait-N` (`CompletionPool::named`); `release` closes its handle on every path (`Handles::closing`); the `Interrupts` comment (uniques are monotonic; early interrupts kept 60 s); errseq test through a real lapsed grant |
+
+Gates: `cargo fmt --all -- --check` clean; clippy `-D warnings` clean with
+and without `--features constellation-frontend-fuse/io-uring`; `cargo test
+-p` for all 19 crates, 0 failed (engine 482 + 1, meta 281, authority 266,
+store-s3 227, control 135, net 102, frontend-fuse 51, harness 51, model 138
+in `--release`, …); vendored fuser `cargo test` 72 + 163 (`io-uring`), and
+`tools/vendor-fuser.sh --check` reproduces `vendor/fuser` (`0003`
+regenerated on main's `0002`); `tests/smoke.sh` passed; integration
+(`smoke.sh` against the shared floci on 4566, private prefix) passed;
+release build ok. Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=f39x`):
+`fio-blips` 5/5; `fsync-hard-outage`, `fsync-soft-timeout`,
+`fsync-interrupt`, `fsyncdir-barrier` 3/3 each; `fsync-interrupt` and
+`fsync-hard-outage` 3/3 again over `CONSTELLATION_FUSE_TRANSPORT=auto`
+(negotiated `uring`: the `fsync` on an offload thread, its interrupt on the
+`/dev/fuse` reader); `s3-cut-one-node`, `upgrade-under-load`,
+`session-handover-idle`, `e2e-two-nodes` passed. Compliance not re-run this
+round (not in the round's gate list).

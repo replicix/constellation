@@ -462,6 +462,14 @@ pub trait Filesystem: Send + Sync + 'static {
     /// inodes will receive a forget message.
     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 
+    /// CONSTELLATION PATCH (interrupt): the kernel asks to interrupt the
+    /// request `unique` (its caller got a signal). No reply is sent. A
+    /// filesystem that honours it answers that request `EINTR`; it may
+    /// also ignore it. The interrupt can arrive before the request it
+    /// names reaches its handler on another thread, so a filesystem that
+    /// honours interrupts remembers unmatched ones for a while.
+    fn interrupt(&self, _req: &Request, _unique: RequestId) {}
+
     /// Like [`forget`](Self::forget), but take multiple forget requests at once for performance. The default
     /// implementation will fallback to `forget`.
     fn batch_forget(&self, req: &Request, nodes: &[ForgetOne]) {

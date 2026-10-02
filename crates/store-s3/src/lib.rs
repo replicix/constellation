@@ -6,6 +6,7 @@
 pub mod aws_auth;
 pub mod blobs;
 pub mod cas;
+pub mod classify;
 pub mod codec;
 pub mod commits;
 pub mod compact;
@@ -42,6 +43,7 @@ pub use aws_auth::{
 };
 
 pub use blobs::BlobStore;
+pub use classify::{classify, classify_chain, classify_message, ErrorClass};
 pub use codec::{Codec, CompressionSetting};
 pub use commits::{vector_covers, Commit, CommitAgg, CommitChain, CommitPayload, Intent, SHARD0};
 pub use compact::{CompactionPacer, Compactor, PackFate, PackVerdict, Reclaim, Sweep, Unpaced};

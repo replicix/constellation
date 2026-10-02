@@ -1,0 +1,53 @@
+Plan 39 §3.3: deliver FUSE_INTERRUPT to the filesystem for fuser 0.18.0
+(vendor/fuser/CONSTELLATION-PATCH.md, "interrupt"). Apply with -p1 in
+vendor/fuser, after 0002-io-uring-transport.patch.
+
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -462,6 +462,14 @@
+     /// inodes will receive a forget message.
+     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
+ 
++    /// CONSTELLATION PATCH (interrupt): the kernel asks to interrupt the
++    /// request `unique` (its caller got a signal). No reply is sent. A
++    /// filesystem that honours it answers that request `EINTR`; it may
++    /// also ignore it. The interrupt can arrive before the request it
++    /// names reaches its handler on another thread, so a filesystem that
++    /// honours interrupts remembers unmatched ones for a while.
++    fn interrupt(&self, _req: &Request, _unique: RequestId) {}
++
+     /// Like [`forget`](Self::forget), but take multiple forget requests at once for performance. The default
+     /// implementation will fallback to `forget`.
+     fn batch_forget(&self, req: &Request, nodes: &[ForgetOne]) {
+diff --git a/src/request.rs b/src/request.rs
+--- a/src/request.rs
++++ b/src/request.rs
+@@ -96,6 +96,9 @@
+                     | ll::Operation::Write(_)
+                     | ll::Operation::FSync(_)
+                     | ll::Operation::FSyncDir(_)
++                    // CONSTELLATION PATCH (interrupt): the kernel sends it
++                    // for any interrupted request, whoever issued it.
++                    | ll::Operation::Interrupt(_)
+                     | ll::Operation::Release(_)
+                     | ll::Operation::ReleaseDir(_) => {}
+                     ll::Operation::ReadDirPlus(_) => {}
+@@ -123,9 +126,14 @@
+                 return Err(Errno::EIO);
+             }
+ 
+-            ll::Operation::Interrupt(_) => {
+-                // TODO: handle FUSE_INTERRUPT
+-                return Err(Errno::ENOSYS);
++            // CONSTELLATION PATCH (interrupt): handed to the filesystem, and
++            // never answered. Upstream answered `ENOSYS`, which makes the
++            // kernel set `no_interrupt` and stop sending interrupts for the
++            // rest of the connection; the protocol needs no reply unless the
++            // filesystem wants the interrupt requeued (`EAGAIN`), which a
++            // filesystem that remembers early interrupts never does.
++            ll::Operation::Interrupt(x) => {
++                filesystem.interrupt(self.request_header(), x.unique());
+             }
+ 
+             ll::Operation::Lookup(x) => {

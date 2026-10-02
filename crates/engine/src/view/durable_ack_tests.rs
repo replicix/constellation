@@ -66,6 +66,7 @@ fn holder_fs(
             sync: Some(SyncHandle {
                 tx,
                 fsync_s3: false,
+                fsync: crate::fsync_wait::default_waits(),
                 cto_strict: false,
                 lease: view,
                 delegates: Arc::new(crate::lease::DelegateView::default()),
@@ -307,4 +308,232 @@ fn an_ungated_holders_close_does_not_wait() {
     fs.flush_inode(file.ino, false).unwrap();
     assert_eq!(meta.getattr(file.ino).unwrap().unwrap().size, 5);
     assert_eq!(meta.session().stats().fast_acks_waited, 0);
+}
+
+/// What [`ops_against`] runs, in order.
+#[derive(Clone, Copy)]
+enum SyncOp {
+    Fsync,
+    /// A write on an `O_SYNC` descriptor.
+    SyncWrite,
+}
+
+/// Plan 39 §3.2: `fsyncs` `fsync`s drive the scripted core's drain
+/// replies — each failure classified as `class` — and the drains they
+/// asked for.
+fn fsync_against(
+    replies: Vec<Result<(), crate::sync::ErrorClass>>,
+    fsyncs: usize,
+) -> (Vec<Result<(), Code>>, usize) {
+    ops_against(replies, &vec![SyncOp::Fsync; fsyncs])
+}
+
+fn ops_against(
+    replies: Vec<Result<(), crate::sync::ErrorClass>>,
+    ops: &[SyncOp],
+) -> (Vec<Result<(), Code>>, usize) {
+    use constellation_vfs::{Blocking, Caller, OpCtx, OpKind, OpenFlags, Vfs, WriteData};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (fs, _dir, mut core) = holder_fs(meta, false);
+    fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
+    let caller = Caller::new(0, 0, None);
+    let mut drains = 0;
+    let mut results = Vec::new();
+    std::thread::scope(|scope| {
+        let fsync = scope.spawn(|| {
+            ops.iter()
+                .map(|op| match op {
+                    SyncOp::Fsync => Blocking::run(|r| {
+                        fs.fsync(
+                            &OpCtx::new(OpKind::Fsync, &caller),
+                            file.ino,
+                            constellation_vfs::Fh(0),
+                            constellation_vfs::Durability::Configured,
+                            r,
+                        )
+                    })
+                    .map_err(|e| e.code()),
+                    SyncOp::SyncWrite => Blocking::run(|r| {
+                        fs.write(
+                            &OpCtx::new(OpKind::Write, &caller),
+                            file.ino,
+                            constellation_vfs::Fh(0),
+                            0,
+                            WriteData::Borrowed(b"must reach"),
+                            OpenFlags::WRITE | OpenFlags::SYNC,
+                            r,
+                        )
+                    })
+                    .map(|_| ())
+                    .map_err(|e| e.code()),
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut replies = replies.into_iter();
+        while !fsync.is_finished() {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { ino, reply }) => {
+                    assert_eq!(ino, file.ino);
+                    drains += 1;
+                    let answer = replies.next().expect("more drains than scripted");
+                    let _ = reply.send(answer.map_err(|class| crate::sync::SyncFailure {
+                        class,
+                        message: format!("scripted {} failure", class.as_str()),
+                    }));
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        results = fsync.join().unwrap();
+    });
+    (results, drains)
+}
+
+/// The `hard` contract on the drain: a transient failure is retried — the
+/// retry drains again although the first attempt already published the
+/// write session — and the `fsync` returns 0 only once a drain succeeded.
+#[test]
+fn an_fsync_retries_a_transient_drain_failure_until_it_succeeds() {
+    use crate::sync::ErrorClass::Transient;
+    let (results, drains) = fsync_against(vec![Err(Transient), Err(Transient), Ok(())], 1);
+    assert_eq!(results, vec![Ok(())]);
+    assert_eq!(drains, 3, "every retry drains; only the last one succeeded");
+}
+
+/// A permanent failure is `EIO` at once, and the next `fsync` — with
+/// nothing new written — still waits for the chunks the failed one could
+/// not upload: never a false success.
+#[test]
+fn a_permanent_drain_failure_is_eio_and_the_next_fsync_drains_again() {
+    use crate::sync::ErrorClass::Permanent;
+    let (results, drains) = fsync_against(vec![Err(Permanent), Err(Permanent), Ok(())], 3);
+    assert_eq!(results, vec![Err(Code::Io), Err(Code::Io), Ok(())]);
+    assert_eq!(drains, 3);
+}
+
+/// The same for an `O_SYNC` write that fails: it publishes the write
+/// session, so the `fsync` after it finds none — and under `--fsync-mode
+/// local` would skip the drain and answer 0 for chunks still only on this
+/// node — unless the failed write left the inode owed, as a failed
+/// `fsync` does.
+#[test]
+fn a_failed_o_sync_write_leaves_the_next_fsync_draining_again() {
+    use crate::sync::ErrorClass::Permanent;
+    let (results, drains) = ops_against(
+        vec![Err(Permanent), Err(Permanent), Ok(())],
+        &[SyncOp::SyncWrite, SyncOp::Fsync, SyncOp::Fsync],
+    );
+    assert_eq!(results, vec![Err(Code::Io), Err(Code::Io), Ok(())]);
+    assert_eq!(drains, 3, "each fsync after the failed write drained");
+}
+
+/// Plan 39 §3.7 through the real fence: data written under a cluster-lock
+/// grant that then lapses is discarded at the first publication point
+/// (`lock_publish_gate`), and every open file description that was open
+/// then reports `EIO` exactly once — the descriptor whose `fsync` found
+/// the discard, and a second one at its own next `fsync` (before, the
+/// inode's one-shot "owed" flag let the second `fsync` return 0 for
+/// thrown-away data). A descriptor opened after the discard owes nothing.
+#[test]
+fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
+    use constellation_meta::locks::{GrantId, HeldGrant, LockMode};
+    use constellation_vfs::{Blocking, Caller, Fh, OpCtx, OpKind, OpenFlags, OpenOwner, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (mut fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    {
+        let h = fs.sync.as_mut().unwrap();
+        h.locks = Some(Arc::new(crate::locks::ClusterLocks {
+            meta: meta.clone(),
+            tx: h.tx.clone(),
+            inval: None,
+        }));
+    }
+    let caller = Caller::new(0, 0, None);
+    let open = || {
+        Blocking::run(|r| {
+            fs.open(
+                &OpCtx::new(OpKind::Open, &caller),
+                file.ino,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap()
+        .fh
+    };
+    let fsync = |fh: Fh| {
+        Blocking::run(|r| {
+            fs.fsync(
+                &OpCtx::new(OpKind::Fsync, &caller),
+                file.ino,
+                fh,
+                constellation_vfs::Durability::Configured,
+                r,
+            )
+        })
+        .map_err(|e| e.code())
+    };
+    let (first, second) = (open(), open());
+    // An exclusive grant, about to lapse without its release's flush.
+    let now = now_unix_ms();
+    meta.locks().install_held(
+        file.ino,
+        HeldGrant {
+            id: GrantId { node: 1, seq: 1 },
+            mode: LockMode::Exclusive,
+            until_ms: now + 300,
+            renew_at_ms: now + 150,
+            owner: 1,
+            recalled: false,
+            position: constellation_meta::Position::ZERO,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since_ms: None,
+        },
+    );
+    Blocking::run(|r| {
+        fs.write(
+            &OpCtx::new(OpKind::Write, &caller),
+            file.ino,
+            first,
+            0,
+            constellation_vfs::WriteData::Borrowed(b"written under the grant"),
+            OpenFlags::WRITE,
+            r,
+        )
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        // The core: every drain succeeds (nothing is left to drain).
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                match core.try_recv() {
+                    Ok(SyncRequest::DrainInode { reply, .. }) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        });
+        assert_eq!(fsync(first), Err(Code::Io), "the fence discards");
+        let later = open();
+        assert_eq!(fsync(second), Err(Code::Io), "a second descriptor");
+        assert_eq!(fsync(second), Ok(()), "reported once");
+        assert_eq!(fsync(first), Ok(()), "the first reported it itself");
+        assert_eq!(fsync(later), Ok(()), "opened after the discard");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert_eq!(
+        meta.getattr(file.ino).unwrap().unwrap().size,
+        0,
+        "nothing written under the lapsed grant was published"
+    );
 }

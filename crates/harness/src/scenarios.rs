@@ -20,6 +20,9 @@ use std::time::Duration;
 mod confinement;
 mod coop_churn;
 mod ec2;
+/// Plan 39: `fsync` under S3 outages (hard, soft, interrupted) and
+/// `fsyncdir`.
+mod fsync;
 /// EC2 campaign 4 B-1/B-2: a git repository committed to by two nodes
 /// taking turns under `flock`.
 mod gitflock;
@@ -532,6 +535,34 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &["fio"],
         caps: &[],
         run: fio_blips,
+    },
+    Scenario {
+        name: "fsync-hard-outage",
+        desc: "plan 39: S3 cut for 20 s under an fsync of unuploaded data; the fsync waits (no EIO, no early return), returns 0 after the heal, node.status.fsync shows the wait, and a fresh node reads the bytes back",
+        requires: &[],
+        caps: &[],
+        run: fsync::fsync_hard_outage,
+    },
+    Scenario {
+        name: "fsync-soft-timeout",
+        desc: "plan 39: --fsync-timeout 2s under an S3 cut answers EIO after ~2 s with the data still pending; after the heal it uploads by itself (a fresh node reads it) and the descriptor's next fsync returns 0",
+        requires: &[],
+        caps: &[],
+        run: fsync::fsync_soft_timeout,
+    },
+    Scenario {
+        name: "fsync-interrupt",
+        desc: "plan 39: during an S3 cut, a handled SIGINT leaves a process blocked in fsync waiting (no EINTR); SIGKILL ends the wait and the process is reaped within seconds; its data still uploads after the heal",
+        requires: &["python3"],
+        caps: &[],
+        run: fsync::fsync_interrupt,
+    },
+    Scenario {
+        name: "fsyncdir-barrier",
+        desc: "plan 39: under --fsync-mode s3, fsync of a directory after a rename into it returns with the journal shipped; after kill -9 a fresh node sees every rename",
+        requires: &[],
+        caps: &[],
+        run: fsync::fsyncdir_barrier,
     },
     Scenario {
         name: "stress-ng-flap",

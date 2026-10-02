@@ -201,9 +201,13 @@ impl Caller {
 /// cancel, an NFS disconnect, a control client's `Cancel` frame), checked
 /// by the engine at its wait points.
 ///
-/// **Linux FUSE never sets it**: fuser 0.18 delivers no `FUSE_INTERRUPT`
-/// (plan 31 §6.3's known gap, carried forward explicitly) — a blocked
-/// `F_SETLKW`/`flock` returns only once granted, Ctrl-C or not.
+/// **Linux FUSE sets it for `fsync`/`fsyncdir` and `O_SYNC`/`O_DSYNC`
+/// writes only, and only for a dying caller** (plan 39 §3.3: the vendored
+/// fuser delivers `FUSE_INTERRUPT`; the adapter cancels the request it
+/// names once the calling thread has a fatal signal pending — killable,
+/// as NFS `hard`, not interruptible by a handled signal). A blocked
+/// `F_SETLKW`/`flock` is not wired to it yet and returns only once
+/// granted, Ctrl-C or not (plan 31 §6.3's gap).
 #[derive(Debug, Clone, Default)]
 pub struct CancelToken(Arc<AtomicBool>);
 

@@ -20,6 +20,7 @@ opt-in.
   - [No client observes a tentative effect](#no-client-observes-a-tentative-effect)
   - [Pre-S3 streaming](#pre-s3-streaming)
   - [`--fsync-mode` and `--write-mode`](#--fsync-mode-and---write-mode)
+  - [fsync during an S3 outage](#fsync-during-an-s3-outage)
   - [When to use `--write-mode back`](#when-to-use---write-mode-back)
   - [Flexible continuation epochs](#flexible-continuation-epochs)
   - [Epochs and fast takeovers](#epochs-and-fast-takeovers)
@@ -285,6 +286,8 @@ These are older, per-mount knobs that combine with the policies above:
   store to disk and nudges the shipper.
   `--fsync-mode s3`: `fsync()` also waits until the inode's chunks and
   records are in the bucket. It is the per-call form of Layer C.
+- **While it waits** (plan 39), `fsync()` behaves like an NFS `hard`
+  mount in every mode: see [fsync during an S3 outage](#fsync-during-an-s3-outage).
 - `--write-mode through` (default): `close()` waits for the file's chunk
   uploads. `back`: `close()` returns once the uploads are queued durably
   on local disk. `fsync`, `O_SYNC`, `O_DSYNC`, `--fsync-mode s3` and a
@@ -307,6 +310,56 @@ forward names as pending uploads it awaits from that node, before it
 executes the op; the node reports them once they are up, and the
 sequencer checks S3 itself if the report never comes (2 s, doubling to
 16 s).
+
+### fsync during an S3 outage
+
+Plan 39. What an `fsync` waits for is the mode's (above); how it waits is
+the same in every mode:
+
+- **Transient failures are waited out.** A timeout, a refused or reset
+  connection, a DNS failure, a 5xx, a 429/`SlowDown`, a lost conditional
+  write, an expired token the credential provider will renew: the attempt
+  (the inode's chunk drain with its peer handoff, the journal barrier, a
+  forwarded commit left in doubt) is retried after a backoff of 100 ms
+  doubling to 5 s, with jitter, until it succeeds. No `EIO` for a blip or
+  an outage, however long — the NFS `hard` contract. `fio --end_fsync=1`
+  under 800 ms S3 cuts (`fio-blips`) no longer sees `EIO`.
+- **Permanent failures are `EIO` at once**: `AccessDenied`, `NoSuchBucket`,
+  `InvalidRequest`/`InvalidArgument`, a disabled or deleted KMS key, a
+  pending chunk this node lost. The data stays pending and every later
+  `fsync` of the file tries again, returning `EIO` while the condition
+  lasts — never a false success.
+- **Killable, not interruptible** — again NFS `hard`. A signal the process
+  handles or ignores (a timer, `SIGINT` with a handler, `SIGTERM` caught
+  for a clean shutdown) leaves the `fsync` waiting: no `EINTR`, which
+  applications that treat any `fsync` failure as fatal would act on
+  without any outage. A signal that kills the process (`SIGKILL`, or an
+  unhandled `SIGTERM`/`SIGINT`) ends the wait within about 100 ms and the
+  process dies; the data stays pending and keeps uploading in the
+  background. The same holds for an `O_SYNC`/`O_DSYNC` write, which
+  answers `EIO` rather than `EINTR` when its wait is cut short.
+- **Opt-in bound**: `mount --fsync-timeout 30s` (`CONSTELLATION_FSYNC_TIMEOUT`)
+  ends a wait with `EIO` after that long, data pending — nfs(5)'s `soft`,
+  with its warning: only when responsiveness matters more than integrity to
+  the application. A host with the kernel's FUSE request timeout set
+  (`fs.fuse.default_request_timeout`/`max_request_timeout`) caps every wait
+  just below it, because the kernel would otherwise abort the connection.
+- **Never a false success.** No failure drops data; after a failed `fsync`
+  the next one drains what the failed one left (under `--fsync-mode local`
+  too, where a published file's chunks were otherwise no longer waited for).
+- **Inside a continuation epoch** (S3 away; a single node enters one within
+  about a second) an `--fsync-mode local` `fsync` does not wait for the
+  bucket at all — the epoch's writes are as durable as their nodes, as
+  before plan 39. Under `--fsync-mode s3` it waits for the bucket. Whether
+  `local` should wait for chunk uploads is open (plan 39 §6).
+- **`fsync` of a directory** (`fsyncdir`) is the same barrier for its
+  entries: their mutations committed, the local store synced, under
+  `--fsync-mode s3` the journal shipped. Before plan 39 it was a silent no-op.
+
+Visible as `status.fsync` (`waiting`, `longest_wait_ms`, `retries`,
+`timeouts`, `permanent_errors`, `interrupted`, …) and `constellation_fsync_*`
+on `/metrics`; a wait past 10 s logs "fsync: S3 unreachable, still trying"
+once per inode, and "done waiting" when it ends.
 
 ### When to use `--write-mode back`
 
@@ -545,6 +598,7 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 |---|---|---|
 | `fs create --ack-policy local\|s3` | `CONSTELLATION_ACK`, else `local` | the filesystem's acknowledgement policy, for every mount and tenure; fixed at creation |
 | `--fsync-mode local\|s3` | `local` | what `fsync()` waits for |
+| `--fsync-timeout DUR`, `CONSTELLATION_FSYNC_TIMEOUT` | unset (wait until durable) | the opt-in `soft` bound on an `fsync`'s wait for an unreachable S3 (see [fsync during an S3 outage](#fsync-during-an-s3-outage)) |
 | `--write-mode through\|back` | `through` | what `close()` waits for (see [When to use `--write-mode back`](#when-to-use---write-mode-back)) |
 | `CONSTELLATION_REMOTE_CHUNK_WAIT_S` | `60` | how long the sequencer's readers and must-finish passes wait for a non-owner's `back` chunks |
 | `CONSTELLATION_ACK` | unset | default for `fs create --ack-policy` (a mount only warns when it disagrees with the filesystem) |
@@ -580,6 +634,9 @@ See [Configuration](../configuration.md) for parsing rules.
   `takeovers_refused_promises`, `promise_flush_exempt`, `stale_claims`,
   `streamed_ahead` (hold owner), `streamed_installed`,
   `forwards_streamed` (member), `handoffs_behind`;
+- `fsync` (plan 39): `mode` (`hard`/`soft`), `timeout_ms`,
+  `kernel_cap_ms`, `waiting`, `longest_wait_ms`, `max_wait_ms`, `waited`,
+  `retries`, `timeouts`, `permanent_errors`, `interrupted`;
 - `held`: `deferred` (transactions waiting for a chunk still uploading,
   a member's included) and `remote[]` (each awaited chunk: `ino`,
   `path`, `node`, `chunk`, `age_s`); see
@@ -607,6 +664,20 @@ promised past the lease's expiry. Either enough nodes are unreachable
 that an epoch could be holding the lease, or `f` is too large for the
 cluster. Bring nodes back, retire the dead holder with
 `constellation leave --node-id`, or lower `f`.
+
+### An application hangs in `fsync` during a bucket outage
+
+Expected (plan 39): `fsync` waits until the data is durable, like an NFS
+`hard` mount. `status.fsync.waiting` and `longest_wait_ms` show it, and the
+log says "fsync: S3 unreachable, still trying" with the last error. It
+returns once S3 is back. A handled signal (`Ctrl-C` in a program that
+catches it, a timer) does not end it; killing the process (`kill -9`, or a
+signal the process does not handle) does, within about 100 ms.
+If the application must not block that long, mount with `--fsync-timeout`
+and make sure it treats `EIO` from `fsync` as "not yet durable", not as
+"lost". An `fsync` that fails at once with `EIO` and
+`status.fsync.permanent_errors` rising is a failure waiting cannot fix: the
+log names it (`AccessDenied`, `NoSuchBucket`, a KMS key, …).
 
 ### Writes stall during a bucket outage under `ack=s3`
 

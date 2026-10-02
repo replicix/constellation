@@ -40,9 +40,10 @@
 //! - `CONSTELLATION_LOCK_CACHE_IDLE_MS` (default 30000): how long an
 //!   unused cached grant is kept before it is released.
 //!
-//! Not supported: interrupting a blocked lock wait (fuser 0.18 delivers no
-//! `FUSE_INTERRUPT`, so Ctrl-C of a blocked `flock`/`F_SETLKW` returns
-//! only once the lock is granted), and POSIX deadlock detection
+//! Not supported: interrupting a blocked lock wait (the FUSE adapter wires
+//! `FUSE_INTERRUPT` to the `fsync` family only, plan 39 §3.3, so Ctrl-C of
+//! a blocked `flock`/`F_SETLKW` returns only once the lock is granted), and
+//! POSIX deadlock detection
 //! (`EDEADLK`) — two owners waiting on each other wait forever, as they do
 //! with `flock`.
 
@@ -152,14 +153,11 @@ impl ClusterLocks {
         self.meta.locks().take_discard(ino, now_ms())
     }
 
-    /// A discard nobody could be told about: the next close or `fsync`
-    /// of `ino` reports `EIO`.
-    pub fn owe(&self, ino: Ino) {
-        self.meta.locks().owe(ino)
-    }
-
-    pub fn take_owed(&self, ino: Ino) -> bool {
-        self.meta.locks().take_owed(ino)
+    /// Dirty data of `ino` was discarded: every open file description of
+    /// it reports `EIO` once, at its next close or `fsync`
+    /// (`LockTables::note_discard`). Returns the event's sequence number.
+    pub fn note_discard(&self, ino: Ino) -> u64 {
+        self.meta.locks().note_discard(ino)
     }
 
     /// Drop the kernel's pages and attributes of `ino` (not waited for:
@@ -244,8 +242,8 @@ impl ClusterLocks {
     /// the runtime's blocking pool either: it is small (4 threads on one
     /// CPU) and the release a waiter waits for may itself need it (the
     /// driver's `Action::LockFlush`), so waiters must never be able to
-    /// fill it. fuser 0.18 has no `FUSE_INTERRUPT`: such a wait cannot be
-    /// cancelled from the application (see the module doc).
+    /// fill it. The FUSE adapter does not wire `FUSE_INTERRUPT` to it: such
+    /// a wait cannot be cancelled from the application (see the module doc).
     ///
     /// `done` answers the request (the view's completes the op's
     /// responder), on this thread or on the waiter's.

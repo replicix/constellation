@@ -116,8 +116,12 @@ use std::time::{Duration, Instant};
 /// The handoff's format: an old and a new binary must agree on it
 /// (`daemon --handover-abi`). Bump it on any change to what crosses:
 /// 2 — plan 32 M0c, the `.constellation` synthetic nodes carry the
-/// directory's inode instead of its path.
-pub const HANDOVER_VERSION: u32 = 2;
+/// directory's inode instead of its path. 3 — plan 39 §3.7, a view's
+/// file handles are its own per-open numbers (`handles`), and the node's
+/// discard error events cross (`errors`): a version-2 image could neither
+/// parse this handoff nor serve the handles the kernel holds, so the ABI
+/// probe refuses the mix up front.
+pub const HANDOVER_VERSION: u32 = 3;
 
 /// `daemon.lock`'s descriptor (held for the process's life; handed on).
 static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
@@ -186,6 +190,10 @@ pub struct NodeHandoff {
     cache_size: u64,
     staging_budget: Option<u64>,
     fsync_s3: bool,
+    /// Plan 39: `--fsync-timeout` in ms; `0` an explicit `hard`, absent
+    /// no flag (`CONSTELLATION_FSYNC_TIMEOUT`, else wait until durable).
+    #[serde(default)]
+    fsync_timeout_ms: Option<u64>,
     cto_strict: bool,
     locks: Option<bool>,
     write_mode: String,
@@ -221,6 +229,9 @@ impl NodeHandoff {
             cache_size: cfg.cache_size,
             staging_budget: cfg.staging_budget,
             fsync_s3: cfg.fsync_s3,
+            fsync_timeout_ms: cfg
+                .fsync_timeout
+                .map(|t| t.map_or(0, |t| (t.as_millis() as u64).max(1))),
             cto_strict: cfg.cto_strict,
             locks: cfg.locks,
             write_mode: cfg.initial_write_mode.as_str().to_string(),
@@ -270,6 +281,9 @@ impl NodeHandoff {
         cfg.cache_size = self.cache_size;
         cfg.staging_budget = self.staging_budget;
         cfg.fsync_s3 = self.fsync_s3;
+        cfg.fsync_timeout = self
+            .fsync_timeout_ms
+            .map(|ms| (ms > 0).then(|| std::time::Duration::from_millis(ms)));
         cfg.cto_strict = self.cto_strict;
         cfg.locks = self.locks;
         cfg.initial_write_mode = self.write_mode.parse().map_err(anyhow::Error::msg)?;

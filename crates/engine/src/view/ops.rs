@@ -759,19 +759,11 @@ impl Vfs for View {
                 return;
             }
             // Plan 30 §M14: publishing the file is a publication point.
-            match self.lock_publish_gate(attr.ino) {
-                Err(error) => {
-                    r.done(err(error));
-                    return;
-                }
-                Ok(true) => {
-                    // Owed to the application's next close, not to this
-                    // rename.
-                    if let Some(l) = self.cluster_locks() {
-                        l.owe(attr.ino);
-                    }
-                }
-                Ok(false) => {}
+            // No description publishes here (`Fh(0)`): an earlier
+            // discard stays owed to the application's descriptions.
+            if let Err(error) = self.lock_publish_gate(attr.ino, Fh(0)) {
+                r.done(err(error));
+                return;
             }
             if let Err(error) = self.flush_inode(attr.ino, true) {
                 r.done(err(error));
@@ -882,7 +874,7 @@ impl Vfs for View {
                     ..
                 }
             ) {
-                r.done(Ok(Opened::new(Fh(ino))));
+                r.done(Ok(Opened::new(self.open_handle(ino))));
             } else {
                 r.done(err(Code::IsDir));
             }
@@ -906,7 +898,7 @@ impl Vfs for View {
                 // handle expects it is dropped in `release`.
                 let backing = self.passthrough_backing(ino, flags, &attr);
                 r.done(Ok(Opened {
-                    fh: Fh(ino),
+                    fh: self.open_handle(ino),
                     backing,
                 }))
             }
@@ -939,7 +931,10 @@ impl Vfs for View {
         match result {
             Ok((attr, _created)) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
-                r.done(Ok((self.entry_out(&attr), Opened::new(Fh(attr.ino)))))
+                r.done(Ok((
+                    self.entry_out(&attr),
+                    Opened::new(self.open_handle(attr.ino)),
+                )))
             }
             Err(e) => r.done(err(e)),
         }
@@ -958,8 +953,9 @@ impl Vfs for View {
         let _admitted = admit!(self, cx, r);
         let ino = enter!(self, ino, r);
         // §6.12: a handle addresses only the inode it was opened on (the
-        // view hands out `Fh(ino)`); anything else was never given out.
-        if fh != Fh(ino) {
+        // view hands out one per open and knows its inode); anything else
+        // was never given out.
+        if self.handle_ino(fh) != Some(ino) {
             r.done(err(Code::BadFd));
             return;
         }
@@ -1039,17 +1035,41 @@ impl Vfs for View {
             return;
         }
         self.lock_discard_tainted(ino);
-        match self.do_write(ino, off, data.as_slice()) {
-            Ok(n) if flags.contains(OpenFlags::SYNC) => match self.flush_inode(ino, true) {
-                Ok(()) => r.done(Ok(n)),
-                Err(error) => r.done(err(error)),
-            },
-            Ok(n) => r.done(Ok(n)),
-            Err(e) => r.done(err(e)),
-        }
+        let n = match self.do_write(ino, off, data.as_slice()) {
+            Ok(n) if flags.contains(OpenFlags::SYNC) => n,
+            Ok(n) => return r.done(Ok(n)),
+            Err(e) => return r.done(err(e)),
+        };
+        // `O_SYNC`/`O_DSYNC` (plan 39 §3.3): the publication waits like
+        // an `fsync`, and so, like one, on the `fsync` pool — a database
+        // writing its WAL this way during an outage must not occupy every
+        // frontend worker (they deliver the interrupt that ends a killed
+        // caller's wait).
+        let cancel = cx.cancel.cloned();
+        let Some(view) = self.fsync_deferral(OpKind::Write) else {
+            r.done(
+                self.flush_sync_write(ino, cancel)
+                    .map(|()| n)
+                    .map_err(VfsError::from),
+            );
+            return;
+        };
+        let admitted = _admitted.defer();
+        let (watch, inflight) = (_w, _inflight);
+        crate::fsync_wait::pool().submit(move || {
+            watch.adopt();
+            r.done(
+                view.flush_sync_write(ino, cancel)
+                    .map(|()| n)
+                    .map_err(VfsError::from),
+            );
+            drop(inflight);
+            view.admission.leave_deferred(admitted);
+            drop(watch);
+        });
     }
 
-    fn flush<R: Responder<()>>(&self, _cx: &OpCtx<'_>, ino: Ino, _fh: Fh, owner: LockOwner, r: R) {
+    fn flush<R: Responder<()>>(&self, _cx: &OpCtx<'_>, ino: Ino, fh: Fh, owner: LockOwner, r: R) {
         let _w = self.watch.enter("flush", ino);
         let ino = enter!(self, ino, r);
         // Plan 30 §M14: the fence first, while the closing owner's locks
@@ -1059,7 +1079,7 @@ impl Vfs for View {
         // descriptor's close, as POSIX says); the kernel also sends an
         // explicit unlock, which then finds nothing.
         let locks = self.cluster_locks().filter(|_| !View::is_synthetic(ino));
-        let gate = self.lock_publish_gate(ino);
+        let gate = self.lock_publish_gate(ino, fh);
         let idle = locks.map(|l| l.drop_owner(ino, owner.0));
         let result = gate.and_then(|owed| {
             self.flush_inode(ino, false)?;
@@ -1083,11 +1103,14 @@ impl Vfs for View {
         &self,
         _cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh: Fh,
         flags: OpenFlags,
         owner: Option<LockOwner>,
         r: R,
     ) {
+        // The description ends with this call however it answers (an
+        // `enter!` refusal included): nothing addresses it any more.
+        let _closed = self.handles.closing(fh);
         let _w = self.watch.enter("release", ino);
         let ino = enter!(self, ino, r);
         if View::is_synthetic(ino) {
@@ -1098,7 +1121,8 @@ impl Vfs for View {
         // `FUSE_RELEASE_FLOCK_UNLOCK` — the last close of an open file
         // drops its `flock` lock (whose owner is the open file).
         let locks = self.cluster_locks();
-        let gate = self.lock_publish_gate(ino);
+        let gate = self.lock_publish_gate(ino, fh);
+        drop(_closed);
         let idle = match (locks, owner) {
             (Some(l), Some(owner)) => l.drop_owner(ino, owner.0),
             _ => false,
@@ -1134,10 +1158,14 @@ impl Vfs for View {
         // which handle closed, so what is dropped is whatever the inode
         // holds beyond the handles still open on it.
         self.drop_passthrough(ino, still_open);
+        if last {
+            self.forget_discard_errors(ino);
+        }
         // Orphan reap on last close (unlink-while-open, DESIGN.md §3),
         // with the write session a flush kept for the descriptors
         // (`flush_inode`: an unlinked file publishes nothing).
         if last && self.unlinked(ino) {
+            self.forget_fsync_owed(ino);
             self.drop_writes(ino);
             if let Ok(Some(attr)) = self.meta.getattr(ino) {
                 if attr.nlink == 0 {
@@ -1155,27 +1183,40 @@ impl Vfs for View {
         }
     }
 
-    fn fsync<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, _fh: Fh, level: Durability, r: R) {
+    fn fsync<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, level: Durability, r: R) {
         let _w = self.watch.enter("fsync", ino);
         let _admitted = admit!(self, cx, r);
         let ino = enter!(self, ino, r);
         // Plan 30 §M14: nothing written under a lapsed grant is made
-        // durable (`lock_publish_gate`).
-        let owed = match self.lock_publish_gate(ino) {
+        // durable (`lock_publish_gate`); a discard this description has
+        // not reported yet is reported after the barrier.
+        let owed = match self.lock_publish_gate(ino, fh) {
             Ok(owed) => owed,
             Err(e) => {
                 r.done(err(e));
                 return;
             }
         };
-        match self.flush_inode(ino, true) {
-            Ok(()) => match self.sync_barrier_at(ino, level) {
-                Ok(()) if owed => r.done(err(Code::Io)),
-                Ok(()) => r.done(Ok(())),
-                Err(e) => r.done(err(e)),
-            },
-            Err(e) => r.done(err(e)),
-        }
+        let cancel = cx.cancel.cloned();
+        let finish = move |view: &View| match view.fsync_durable(ino, level, cancel) {
+            Ok(()) if owed => Err(Code::Io),
+            result => result,
+        };
+        // Plan 39 §3.3: the wait may last an S3 outage, so it runs on the
+        // `fsync` pool, never on a frontend worker (the workers must stay
+        // free to deliver the interrupt that ends it).
+        let Some(view) = self.fsync_deferral(OpKind::Fsync) else {
+            r.done(finish(self).map_err(VfsError::from));
+            return;
+        };
+        let admitted = _admitted.defer();
+        let watch = _w;
+        crate::fsync_wait::pool().submit(move || {
+            watch.adopt();
+            r.done(finish(&view).map_err(VfsError::from));
+            view.admission.leave_deferred(admitted);
+            drop(watch);
+        });
     }
 
     fn readdir<R: DirSink + Responder<()>>(
@@ -1637,8 +1678,8 @@ impl Vfs for View {
     /// frontend worker, and completes the responder from there — the
     /// deferred path of plan 31 §6.3, for a frontend that can answer from
     /// another thread (`FrontendCaps::deferrable`; one that cannot waits
-    /// here). fuser 0.18 delivers no interrupts: a blocked wait cannot be
-    /// cancelled by a signal.
+    /// here). The FUSE adapter wires interrupts to the `fsync` family only
+    /// (plan 39 §3.3): a blocked lock wait cannot be cancelled by a signal.
     fn lock_acquire<R: Responder<()>>(
         &self,
         _cx: &OpCtx<'_>,

@@ -96,6 +96,9 @@ impl<'a> RequestWithSender<'a> {
                     | ll::Operation::Write(_)
                     | ll::Operation::FSync(_)
                     | ll::Operation::FSyncDir(_)
+                    // CONSTELLATION PATCH (interrupt): the kernel sends it
+                    // for any interrupted request, whoever issued it.
+                    | ll::Operation::Interrupt(_)
                     | ll::Operation::Release(_)
                     | ll::Operation::ReleaseDir(_) => {}
                     ll::Operation::ReadDirPlus(_) => {}
@@ -123,9 +126,14 @@ impl<'a> RequestWithSender<'a> {
                 return Err(Errno::EIO);
             }
 
-            ll::Operation::Interrupt(_) => {
-                // TODO: handle FUSE_INTERRUPT
-                return Err(Errno::ENOSYS);
+            // CONSTELLATION PATCH (interrupt): handed to the filesystem, and
+            // never answered. Upstream answered `ENOSYS`, which makes the
+            // kernel set `no_interrupt` and stop sending interrupts for the
+            // rest of the connection; the protocol needs no reply unless the
+            // filesystem wants the interrupt requeued (`EAGAIN`), which a
+            // filesystem that remembers early interrupts never does.
+            ll::Operation::Interrupt(x) => {
+                filesystem.interrupt(self.request_header(), x.unique());
             }
 
             ll::Operation::Lookup(x) => {

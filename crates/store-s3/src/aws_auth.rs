@@ -186,7 +186,12 @@ pub async fn amazon_s3_builder_resolved_with(
         Arc<dyn CredentialProvider<Credential = AwsCredential>>,
         Option<String>,
     ) = match supplied {
-        Some((provider, name)) => (provider, Some(name)),
+        Some((provider, name)) => {
+            // An engine's own source is re-asked whenever what it gave
+            // expires (`CredentialSource`).
+            crate::classify::set_refreshable_credentials(true);
+            (provider, Some(name))
+        }
         None => {
             let provider = sdk.credentials_provider().ok_or_else(|| {
                 StoreError::AwsCredentials(
@@ -206,6 +211,9 @@ pub async fn amazon_s3_builder_resolved_with(
                 ))
             })?;
             let credentials = provider_name(&first);
+            // Plan 39: an `ExpiredToken` is worth waiting out only when
+            // the chain hands out expiring credentials it renews.
+            crate::classify::set_refreshable_credentials(first.expiry().is_some());
             let adapter = SdkCredentialProvider {
                 provider,
                 cache: RwLock::new(Some(CachedCreds::from_sdk(&first))),

@@ -63,6 +63,7 @@ impl EngineControl {
             .map_err(|_| "sync task is not running".to_string())?;
         tokio::task::block_in_place(|| self.rt.block_on(receive))
             .map_err(|_| "snapshot barrier stopped".to_string())?
+            .map_err(String::from)
     }
 
     /// Take the write lease for a control-plane metadata mutation that is
@@ -515,6 +516,22 @@ impl EngineControl {
             },
             coop,
             prefetch: self.prefetch_stats.snapshot(),
+            fsync: {
+                let f = self.engine.fsync_waits().status();
+                api::FsyncStatus {
+                    mode: f.mode.into(),
+                    timeout_ms: f.timeout_ms,
+                    kernel_cap_ms: f.kernel_cap_ms,
+                    waiting: f.waiting,
+                    longest_wait_ms: f.longest_wait_ms,
+                    max_wait_ms: f.max_wait_ms,
+                    waited: f.waited,
+                    retries: f.retries,
+                    timeouts: f.timeouts,
+                    permanent_errors: f.permanent_errors,
+                    interrupted: f.interrupted,
+                }
+            },
             writeback: {
                 let remote = self.meta.remote_chunks().unwrap_or_default();
                 let probe = self.upload.probe.lock().unwrap();
@@ -900,6 +917,7 @@ impl EngineControl {
                 self.rt
                     .block_on(receive)
                     .map_err(|_| "upload drain stopped".to_string())?
+                    .map_err(String::from)
             })?;
         }
         self.write_mode.set(requested);

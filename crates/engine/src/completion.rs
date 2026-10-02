@@ -68,6 +68,8 @@ struct Shared {
     ready: Condvar,
     max: usize,
     idle_exit: Duration,
+    /// Thread names are `{name}-{n}`.
+    name: &'static str,
 }
 
 /// See the module doc. Cheap to clone (one `Arc`).
@@ -77,10 +79,16 @@ pub struct CompletionPool(Arc<Shared>);
 impl CompletionPool {
     /// A pool of at most `max` threads (at least one).
     pub fn new(max: usize) -> Self {
-        Self::with_idle_exit(max, IDLE_EXIT)
+        Self::named("completion", max)
     }
 
-    fn with_idle_exit(max: usize, idle_exit: Duration) -> Self {
+    /// [`Self::new`], its threads named `{name}-{n}` (a pool of its own
+    /// reads as such in a stack dump).
+    pub fn named(name: &'static str, max: usize) -> Self {
+        Self::with_idle_exit(name, max, IDLE_EXIT)
+    }
+
+    fn with_idle_exit(name: &'static str, max: usize, idle_exit: Duration) -> Self {
         Self(Arc::new(Shared {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
@@ -91,6 +99,7 @@ impl CompletionPool {
             ready: Condvar::new(),
             max: max.clamp(1, HARD_MAX_THREADS),
             idle_exit,
+            name,
         }))
     }
 
@@ -127,7 +136,7 @@ impl CompletionPool {
         drop(st);
         let worker = self.0.clone();
         let spawned = std::thread::Builder::new()
-            .name(format!("completion-{n}"))
+            .name(format!("{}-{n}", shared.name))
             .spawn(move || worker_loop(&worker));
         if spawned.is_ok() {
             return;
@@ -267,7 +276,7 @@ mod tests {
 
     #[test]
     fn an_idle_thread_is_reused_and_idle_threads_exit() {
-        let pool = CompletionPool::with_idle_exit(8, Duration::from_millis(100));
+        let pool = CompletionPool::with_idle_exit("completion", 8, Duration::from_millis(100));
         for _ in 0..5 {
             let (tx, rx) = mpsc::channel();
             pool.submit(move || tx.send(()).unwrap());

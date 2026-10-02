@@ -1052,13 +1052,25 @@ impl Driver {
                 tokio::spawn(async move {
                     match upload.run(Some(ino)).await {
                         Ok(_) => {
+                            // The round's outcome crosses the core as
+                            // text: classified from it (plan 39).
+                            let (round, outcome) = tokio::sync::oneshot::channel();
                             let _ = tx.send(Internal::Control {
                                 req: Control::Barrier { ino: Some(ino) },
-                                reply: ControlReply::Done(reply),
+                                reply: ControlReply::Done(round),
                             });
+                            let result = match outcome.await {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(error)) => Err(crate::sync::SyncFailure::from_text(error)),
+                                Err(_) => Err(crate::sync::SyncFailure {
+                                    class: crate::sync::ErrorClass::Permanent,
+                                    message: "the sync task stopped".into(),
+                                }),
+                            };
+                            let _ = reply.send(result);
                         }
                         Err(e) => {
-                            let _ = reply.send(Err(format!("{e:#}")));
+                            let _ = reply.send(Err(crate::sync::SyncFailure::from_error(&e)));
                         }
                     }
                 });
@@ -1112,7 +1124,7 @@ impl Driver {
                 let handoff = (ino != 0).then(|| self.chunk_handoff());
                 tokio::spawn(async move {
                     let r = drain_with_handoff(upload, handoff, ino).await;
-                    let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+                    let _ = reply.send(r.map_err(|e| crate::sync::SyncFailure::from_error(&e)));
                 });
                 None
             }

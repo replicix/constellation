@@ -546,6 +546,9 @@ pub struct StatusReport {
     /// Phase 5b write-back queue and adaptive upload policy.
     #[serde(default)]
     pub writeback: WritebackStatus,
+    /// Plan 39: `fsync`s waiting out an unreachable S3, and how they ended.
+    #[serde(default)]
+    pub fsync: FsyncStatus,
     #[serde(default)]
     pub forwarded_ok: u64,
     #[serde(default)]
@@ -1010,6 +1013,46 @@ pub struct PrefetchStatus {
     /// readers that never came back for them.
     #[serde(default)]
     pub abandoned_chunks: u64,
+}
+
+/// Plan 39: the `fsync` policy (`hard` by default; `soft` with
+/// `--fsync-timeout`) and the waits it caused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct FsyncStatus {
+    /// `hard` (wait until durable) or `soft` (`--fsync-timeout`).
+    #[serde(default)]
+    pub mode: String,
+    /// The soft timeout in ms (0: none).
+    #[serde(default)]
+    pub timeout_ms: u64,
+    /// The cap the kernel's FUSE request timeout imposes, in ms (0: none).
+    #[serde(default)]
+    pub kernel_cap_ms: u64,
+    /// `fsync`s waiting now after a failed attempt.
+    #[serde(default)]
+    pub waiting: u64,
+    /// How long the oldest of them has waited, in ms (0: none).
+    #[serde(default)]
+    pub longest_wait_ms: u64,
+    /// The longest any `fsync` has waited since the node started, in ms.
+    #[serde(default)]
+    pub max_wait_ms: u64,
+    /// `fsync`s that retried at least once.
+    #[serde(default)]
+    pub waited: u64,
+    /// Attempts retried after a transient failure.
+    #[serde(default)]
+    pub retries: u64,
+    /// `fsync`s answered `EIO` because the soft timeout (or the kernel cap)
+    /// elapsed.
+    #[serde(default)]
+    pub timeouts: u64,
+    /// `fsync`s answered `EIO` for a failure waiting does not fix.
+    #[serde(default)]
+    pub permanent_errors: u64,
+    /// `fsync`s answered `EINTR`.
+    #[serde(default)]
+    pub interrupted: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

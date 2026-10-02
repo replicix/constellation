@@ -85,6 +85,17 @@ enum Command {
         /// ship) or "s3" (record durable in the shared log).
         #[arg(long)]
         fsync_mode: Option<String>,
+        /// Plan 39: bound how long fsync() waits for an unreachable S3
+        /// (e.g. 30s, 2m); when it elapses fsync returns EIO with the data
+        /// still pending (it keeps uploading in the background). Unset, the
+        /// default, waits until the data is durable, like an NFS `hard`
+        /// mount — an EIO then only ever means a failure waiting cannot fix.
+        /// Like nfs(5)'s `soft`, a timeout trades integrity for
+        /// responsiveness: an application that treats EIO as "lost" may
+        /// discard data that was not. CONSTELLATION_FSYNC_TIMEOUT supplies
+        /// the default.
+        #[arg(long)]
+        fsync_timeout: Option<String>,
         /// Close-to-open consistency (plan 30 §M8): "bounded" (the
         /// default: an open reads the local replica, which follows the
         /// log within the visibility bound) or "strict" (an open or lookup
@@ -1118,6 +1129,7 @@ fn main() -> Result<()> {
         allow_other,
         fs_name,
         fsync_mode,
+        fsync_timeout,
         cto,
         locks,
         write_mode,
@@ -1145,6 +1157,7 @@ fn main() -> Result<()> {
                 allow_other,
                 fs_name,
                 fsync_mode,
+                fsync_timeout,
                 cto,
                 locks,
                 write_mode,
@@ -1988,6 +2001,7 @@ struct MountArgs {
     allow_other: bool,
     fs_name: Option<String>,
     fsync_mode: Option<String>,
+    fsync_timeout: Option<String>,
     cto: Option<String>,
     locks: Option<String>,
     write_mode: Option<String>,
@@ -2103,6 +2117,7 @@ fn cmd_mount(
         allow_other,
         fs_name,
         fsync_mode,
+        fsync_timeout,
         cto,
         locks,
         write_mode,
@@ -2118,6 +2133,17 @@ fn cmd_mount(
         web_ui,
     } = args;
     let cto_strict = crate::cto::strict_from(cto.as_deref())?;
+    // Plan 39: refused here, before the fork, like `--cache-verify`. No
+    // flag leaves the engine to `CONSTELLATION_FSYNC_TIMEOUT`, else to wait
+    // until durable; an explicit `0`/`off`/`hard` is `hard` whatever the
+    // environment says (the flag wins, as documented).
+    let fsync_timeout = match fsync_timeout.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            constellation_engine::fsync_wait::parse_timeout(raw)
+                .map_err(|e| anyhow::anyhow!("invalid --fsync-timeout: {e}"))?,
+        ),
+    };
     // Plan 38 §2.3. Refused here, before the fork, so a typo reaches this
     // terminal rather than dying as "daemon exited before reporting
     // status" — as `--cto`, `--locks` and `--atime` below also do. The env
@@ -2384,6 +2410,13 @@ fn cmd_mount(
     let mount_passphrase = if daemon_socket_is_live(&state_dir) {
         // The transport is the daemon's, fixed when it started: the views
         // this invocation attaches are served the way it serves its own.
+        if fsync_timeout.is_some() {
+            eprintln!(
+                "warning: a daemon already serves this state dir; --fsync-timeout is ignored \
+                 (the daemon's fsync policy is the one it started with; `constellation status` \
+                 reports it as fsync.mode)"
+            );
+        }
         if fuse_transport_flag.is_some() || fuse_uring_queue_depth.is_some() {
             eprintln!(
                 "warning: a daemon already serves this state dir; --fuse-transport and \
@@ -2416,6 +2449,7 @@ fn cmd_mount(
             node_s3,
             node_cache_size,
             fsync_s3,
+            fsync_timeout,
             cto_strict,
             locks,
             initial_write_mode,
@@ -2437,6 +2471,7 @@ fn cmd_mount(
                 node_s3,
                 node_cache_size,
                 fsync_s3,
+                fsync_timeout,
                 cto_strict,
                 locks,
                 initial_write_mode,
@@ -2511,6 +2546,7 @@ fn cmd_mount_body(
     s3: String,
     cache_size: u64,
     fsync_s3: bool,
+    fsync_timeout: Option<Option<std::time::Duration>>,
     cto_strict: bool,
     locks: Option<bool>,
     initial_write_mode: writeback::WriteMode,
@@ -2714,6 +2750,7 @@ fn cmd_mount_body(
                         state_dir: Some(state_dir.to_path_buf()),
                         cache_size,
                         fsync_s3,
+                        fsync_timeout,
                         cto_strict,
                         locks,
                         initial_write_mode,

@@ -4,10 +4,11 @@
 //!
 //! The waiting op in the contract today is a blocking lock
 //! (`lock_acquire` with `sleep`). The token exists for NFS, WinFsp and
-//! control-client cancellation and for tests; **Linux FUSE never sets
-//! it**, because fuser 0.18 delivers no `FUSE_INTERRUPT` (plan 31 §6.3's
-//! known gap, carried forward on purpose): a blocked `F_SETLKW`/`flock` on
-//! a Linux mount returns only once granted, Ctrl-C or not. A target
+//! control-client cancellation and for tests; **Linux FUSE sets it only
+//! for the `fsync` family, and only for a dying caller** (plan 39 §3.3): a
+//! blocked `F_SETLKW`/`flock` on a Linux
+//! mount still returns only once granted, Ctrl-C or not (plan 31 §6.3's
+//! gap, carried forward). A target
 //! declares whether its waits honour the token
 //! ([`super::Declared::cancellable_waits`]); one that does not skips this
 //! group naming the gap.
@@ -19,7 +20,7 @@ use constellation_types::Code;
 use std::time::{Duration, Instant};
 
 const GAP: &str = "the target does not honour CancelToken on waits (declared); a Linux FUSE \
-                   frontend never has one set: fuser 0.18 delivers no FUSE_INTERRUPT (plan 31 §6.3)";
+                   frontend sets one only for the fsync family (plan 39 §3.3), not for lock waits (plan 31 §6.3)";
 
 fn range() -> LockRange {
     LockRange {

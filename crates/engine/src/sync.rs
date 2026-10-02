@@ -38,6 +38,62 @@ pub struct HandoffResult {
     pub head_seq: Option<u64>,
 }
 
+/// Why a durability request (`Barrier`, `DrainInode`) failed, and whether
+/// it is worth waiting out (plan 39: an `fsync` retries a
+/// [`ErrorClass::Transient`] failure until the data is durable and
+/// answers a [`ErrorClass::Permanent`] one with `EIO` at once).
+#[derive(Debug, Clone)]
+pub struct SyncFailure {
+    pub class: ErrorClass,
+    pub message: String,
+}
+
+pub use constellation_store_s3::ErrorClass;
+
+impl SyncFailure {
+    /// Classified from the error's chain: content this node lost, or a
+    /// local metadata-store failure, is permanent; the rest is the store's
+    /// table (`constellation_store_s3::classify`).
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        let local = error
+            .chain()
+            .any(|e| e.downcast_ref::<constellation_meta::MetaError>().is_some());
+        let class = if local {
+            ErrorClass::Permanent
+        } else {
+            constellation_store_s3::classify_chain(error.chain())
+        };
+        Self {
+            class,
+            message: format!("{error:#}"),
+        }
+    }
+
+    /// A failure known only as text (a sync round's outcome crosses the
+    /// authority core as a string).
+    pub fn from_text(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            class: constellation_store_s3::classify_message(&message),
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for SyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SyncFailure {}
+
+impl From<SyncFailure> for String {
+    fn from(failure: SyncFailure) -> String {
+        failure.message
+    }
+}
+
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
@@ -59,7 +115,7 @@ pub enum SyncRequest {
     /// (fsync barrier).
     Barrier {
         ino: Ino,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), SyncFailure>>,
     },
     /// Upload `ino`'s pending chunks (all of them for `ino == 0`). EC2
     /// finding 1: when this node's own uploads make no progress for
@@ -68,7 +124,7 @@ pub enum SyncRequest {
     /// has them in S3.
     DrainInode {
         ino: Ino,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), SyncFailure>>,
     },
     /// EC2 finding 1: `requester` cannot reach S3 and hands us `hashes`
     /// to fetch from it and upload; `reply` is whether all are in S3.

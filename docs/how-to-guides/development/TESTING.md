@@ -246,7 +246,9 @@ serial floor). Suite-under-fault scenarios
 run the external tools from the stress lane through the same fault
 injector: `fio-latency` (crc32c-verified random writes under 80 ms S3
 latency), `fio-blips` (fio verify while S3 is cut for 800 ms every
-~4 s — the retry layer must absorb the blips), and `stress-ng-flap`
+~4 s — since plan 39 `fsync` waits out the blips itself instead of
+leaning on the per-request retry budget, which the harness keeps tight at
+`CONSTELLATION_S3_MAX_RETRIES=2`), and `stress-ng-flap`
 (metadata churn during S3 flapping; the mount must stay healthy and
 the spool drain afterwards). Scenarios declare required host binaries
 and are skipped loudly when a tool is missing (CI installs fio and
@@ -1409,6 +1411,28 @@ relay of its own so requests can be attributed per role):
     `root:root 0755` for good (`adopt_root` was one `Policy::System`
     attempt, and the strict kernel-cache drain kept the new holder's
     gate shut for that attempt).
+- **Plan 39, `fsync` under S3 outages** (`crates/harness/src/scenarios/fsync.rs`;
+  the outage scenarios mount `--fsync-mode s3`, because a single node's cut
+  starts a continuation epoch within a second and a `local` `fsync` in an
+  epoch does not wait for the bucket):
+  - `fsync-hard-outage`: S3 cut for 20 s under an `fsync` of unuploaded
+    data; it must still be waiting when the cut ends (`status.fsync.waiting`
+    1, `longest_wait_ms` past 5 s), then return 0, log "S3 unreachable,
+    still trying", and a fresh node must read the bytes from the bucket.
+  - `fsync-soft-timeout`: `--fsync-timeout 2s` under a cut answers `EIO`
+    in ~2 s with `pending_uploads` > 0; after the heal the chunks upload by
+    themselves (no further `fsync`), a fresh node reads them, and the same
+    descriptor's next `fsync` returns 0.
+  - `fsync-interrupt` (needs `python3`): killable, not interruptible. A
+    handled `SIGINT` (Python's `KeyboardInterrupt`) to a process blocked in
+    `fsync` during a cut leaves it blocked 3 s later (`fsync.interrupted`
+    stays 0); `SIGKILL` then gets the process reaped within 5 s (the daemon
+    sees the pending `SIGKILL` in `/proc/<tid>/status` — the kernel sends no
+    second `FUSE_INTERRUPT`); the data still uploads after the heal.
+  - `fsyncdir-barrier`: under `--fsync-mode s3` with rare sync rounds, an
+    `fsync` of a directory after a rename into it returns with
+    `spool.journal_backlog` 0; after `kill -9` a fresh node sees every
+    rename. Fails 3/3 with the old `ENOSYS` `fsyncdir`.
 - **EC2 real-S3 findings** (`crates/harness/src/scenarios/ec2.rs`):
   - `s3-cut-one-node`: three nodes; a non-holder's S3 is black-holed
     (`CountingProxy::blackhole`: accepted, never answered — a firewall
@@ -2244,9 +2268,9 @@ failure message or the skip reason) and returns a `Report`; the JSON form
   `requires capability <Cap>`; one that needs something only the fixture can
   offer (a snapshot hook, a subtree view, a second view with recorded
   events) skips naming that; the cancellation group skips where a target does
-  not honour `CancelToken` on waits, naming the Linux FUSE gap (fuser 0.18
-  delivers no `FUSE_INTERRUPT`, so a Linux mount never sets a token: plan 31
-  §6.3). `Declared::rename_flags` is the engine's declared gap
+  not honour `CancelToken` on waits, naming the Linux FUSE gap (the adapter
+  wires `FUSE_INTERRUPT` to the `fsync` family only, plan 39 §3.3, so a lock
+  wait's token is never set: plan 31 §6.3). `Declared::rename_flags` is the engine's declared gap
   (`View::rename` ignores `RENAME_NOREPLACE`/`EXCHANGE` today).
 - **Plugging a target in.** Implement `ConformanceTarget` (a factory of fresh
   `Fixture<V>`s: the `Vfs`, the root inode, the `FrontendCaps`, optional

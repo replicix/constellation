@@ -1,12 +1,13 @@
 # Vendored fuser 0.18.0: Constellation's patch series
 
-Two named series live in `patches/`, applied in filename order:
+Three named series live in `patches/`, applied in filename order:
 
 1. `0001-constellation-session-handover.patch` — plan 31 §6.11 / C4b. This
    file's first half.
 2. `0002-io-uring-transport.patch` — plan 38 §3(a) / Z1, behind the
    `io-uring` cargo feature, off by default. "The io-uring transport",
    below.
+3. `0003-interrupt.patch` — plan 39 §3.3. "FUSE_INTERRUPT", at the end.
 
 ## FUSE session handover (`patches/0001-constellation-session-handover.patch`)
 
@@ -581,3 +582,38 @@ of 0001). Then re-run fuser's own suite both ways
 (`cargo test --manifest-path vendor/fuser/Cargo.toml [--features io-uring]`)
 on a host with `fuse.enable_uring=Y`, where the 18 real-kernel ring tests
 actually run.
+
+## FUSE_INTERRUPT (`patches/0003-interrupt.patch`)
+
+Plan 39 §3.3 (`docs/plans/v1/wip/39-fsync-durability.md`): an `fsync` that
+waits for an unreachable S3 must end when its caller is killed (NFS
+`hard`'s "killable"), and the daemon only learns of a signal through the
+interrupt. Upstream 0.18 answers every `FUSE_INTERRUPT` with `ENOSYS`
+(`// TODO: handle FUSE_INTERRUPT`), and the kernel's answer to that is to
+set `no_interrupt` on the connection (`fs/fuse/dev.c`,
+`fuse_dev_do_write`) and never send another one — after which a signalled
+caller of a request the daemon already read waits it out uninterruptibly,
+`SIGKILL` included (`request_wait_answer`: "Either request is already in
+userspace, or it was forced. Wait it out.").
+
+- New `Filesystem::interrupt(&self, req, unique: RequestId)`, default a
+  no-op, called for every `FUSE_INTERRUPT` with the `unique` it names.
+- The dispatcher sends no reply to an interrupt (the protocol needs one
+  only to have it requeued, `EAGAIN`), and `Interrupt` joins the
+  operations a non-owner may issue under `allow_root` (the kernel sends it
+  for anyone's request).
+
+A filesystem that ignores `interrupt` sees no change except that the kernel
+keeps sending interrupts, which it does not answer. Constellation's
+adapter (`crates/frontend-fuse/src/adapter.rs`, `Interrupts`) marks the
+named request and cancels its `CancelToken` once the caller's thread has a
+fatal signal pending (`/proc/<tid>/status`), polling while it waits — the
+kernel sends one interrupt per request, for the first signal, which may be
+a handled one — and remembers an interrupt that overtook its request (up
+to a minute; Linux uniques are never reused). On the ring transport
+interrupts still arrive over `/dev/fuse` (0002's reader thread), through
+the same dispatcher, while the request they name may be served on one of
+0002's offload threads: the adapter's table is shared by both.
+
+Regenerated as `git diff --no-index <pristine-plus-0001-and-0002>
+vendor/fuser`; `tools/vendor-fuser.sh --check` verifies the series.

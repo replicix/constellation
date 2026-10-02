@@ -265,13 +265,21 @@ impl View {
             .tx
             .send(SyncRequest::DrainInode { ino, reply })
             .map_err(|_| Code::Io)?;
-        match receive.blocking_recv() {
+        // On the `fsync` path (plan 39) the wait also ends on an interrupt
+        // or the soft timeout, and the failure is classified for its
+        // retry loop (`crate::fsync_wait`).
+        match crate::fsync_wait::recv(&self.rt, receive) {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, ino, "write-through upload failed");
+            Ok(Err(failure)) => {
+                if crate::fsync_wait::in_scope() {
+                    tracing::debug!(error = %failure, class = failure.class.as_str(), ino, "fsync upload attempt failed");
+                } else {
+                    tracing::warn!(error = %failure, ino, "write-through upload failed");
+                }
+                crate::fsync_wait::note_sync_failure(&failure);
                 Err(Code::Io)
             }
-            Err(_) => Err(Code::Io),
+            Err(()) => Err(Code::Io),
         }
     }
 

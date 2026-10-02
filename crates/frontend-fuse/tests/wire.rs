@@ -22,8 +22,8 @@
 //! `F_SETLKW` end to end).
 //!
 //! What it cannot: anything the kernel's VFS does above the daemon
-//! (permission checks, path walks, page cache, `FUSE_INTERRUPT`, which
-//! fuser 0.18 does not deliver anyway) and the real `/dev/fuse` and mount
+//! (permission checks, path walks, page cache, when the kernel decides to
+//! send `FUSE_INTERRUPT`) and the real `/dev/fuse` and mount
 //! plumbing, which the harness scenarios and pjdfstest cover.
 
 #![cfg(target_os = "linux")]
@@ -64,6 +64,8 @@ mod op {
     pub const STATFS: u32 = 17;
     pub const RELEASE: u32 = 18;
     pub const FSYNC: u32 = 20;
+    pub const FSYNCDIR: u32 = 30;
+    pub const INTERRUPT: u32 = 36;
     pub const SETXATTR: u32 = 21;
     pub const GETXATTR: u32 = 22;
     pub const LISTXATTR: u32 = 23;
@@ -222,7 +224,9 @@ impl Kernel {
         let mut config = fuser::Config::default();
         config.acl = fuser::SessionACL::All;
         config.n_threads = Some(1);
-        let fs = FuseFs::new(vfs, caps, KernelTuning::for_workers(workers));
+        // Thread `DYING_PID` has a fatal signal pending; no other has.
+        let fs = FuseFs::new(vfs, caps, KernelTuning::for_workers(workers))
+            .with_fatal_signal_probe(|pid| pid == DYING_PID);
         let session =
             fuser::Session::from_fd(fs, OwnedFd::from(daemon), fuser::SessionACL::All, config)
                 .expect("the FUSE handshake");
@@ -1421,5 +1425,116 @@ fn forget_needs_no_reply_and_unknown_opcodes_are_refused_not_fatal() {
     assert_eq!(r.errno(), libc::ENOSYS);
     k.call(op::GETATTR, 1, &Body::new().u32(0).u32(0).u64(0))
         .ok();
+    k.finish();
+}
+
+/// Plan 39 §3.6: `fsyncdir` is the view's `fsync` barrier on the directory
+/// (before, fuser's default answered `ENOSYS` and the kernel stopped
+/// asking).
+#[test]
+fn fsyncdir_is_the_fsync_barrier_on_the_directory() {
+    let (mut k, mock) = plain();
+    mock.always_fsync(Script::ok(()));
+    for datasync in [0u32, 1] {
+        let r = k.call(op::FSYNCDIR, 5, &Body::new().u64(0).u32(datasync).u32(0));
+        assert_eq!(r.error, 0);
+        assert_eq!(
+            mock.last_call().unwrap().args,
+            Args::Fsync {
+                ino: 5,
+                fh: Fh(0),
+                level: Durability::Configured
+            }
+        );
+    }
+    k.finish();
+}
+
+/// A caller thread the test's fatal-signal probe reports dying.
+const DYING_PID: u32 = 6666;
+
+/// Plan 39 §3.3: `FUSE_INTERRUPT` reaches the adapter (vendored fuser's
+/// `interrupt` patch) and is never answered. It cancels the `fsync` it
+/// names only when the caller is dying (killable, not interruptible) —
+/// here one it overtook, the race the adapter remembers early interrupts
+/// for. A living caller's interrupt (a handled signal) cancels nothing,
+/// and neither does an interrupt for another request.
+#[test]
+fn an_interrupt_cancels_a_dying_callers_fsync_and_is_not_answered() {
+    let (mut k, mock) = plain();
+    mock.always_fsync(Script::With(std::sync::Arc::new(|call| {
+        if call.cancelled {
+            Err(constellation_vfs::VfsError::new(Code::Intr))
+        } else {
+            Ok(())
+        }
+    })));
+    // The interrupt takes one unique; the fsync it names takes the next.
+    let named = k.next_unique + 1;
+    k.send(op::INTERRUPT, 0, &Body::new().u64(named).0);
+    let fsync = k.send_as(
+        op::FSYNC,
+        9,
+        (1000, 100, DYING_PID),
+        &Body::new().u64(3).u32(0).u32(0).0,
+    );
+    assert_eq!(fsync, named);
+    let r = k.recv();
+    assert_eq!(r.unique, fsync, "the interrupt itself is not answered");
+    assert_eq!(r.errno(), libc::EINTR);
+    assert!(mock.last_call().unwrap().cancelled);
+    // The same race for a caller that lives: it keeps its fsync.
+    let named = k.next_unique + 1;
+    k.send(op::INTERRUPT, 0, &Body::new().u64(named).0);
+    let r = k.call(op::FSYNC, 9, &Body::new().u64(3).u32(0).u32(0));
+    assert_eq!(r.unique, named);
+    assert_eq!(r.error, 0);
+    assert!(!mock.last_call().unwrap().cancelled);
+    // An interrupt naming a request that never comes cancels nothing.
+    k.send(op::INTERRUPT, 0, &Body::new().u64(1_000_000).0);
+    let r = k.call(op::FSYNC, 9, &Body::new().u64(3).u32(0).u32(0));
+    assert_eq!(r.error, 0);
+    assert!(!mock.last_call().unwrap().cancelled);
+    k.finish();
+}
+
+/// Plan 39 §3.3: an `O_SYNC`/`O_DSYNC` write waits like an `fsync`, so it
+/// honours its dying caller's interrupt the same way; a plain write never
+/// registers, and a living caller's interrupt cancels nothing.
+#[test]
+fn an_o_sync_write_is_killable_like_an_fsync() {
+    let (mut k, mock) = plain();
+    mock.always_write(Script::ok(5));
+    let write = |flags: i32| {
+        Body::new()
+            .u64(3)
+            .u64(0)
+            .u32(5)
+            .u32(0)
+            .u64(0)
+            .i32(flags)
+            .u32(0)
+            .bytes(b"hello")
+            .0
+    };
+    for (flags, pid, cancelled) in [
+        (libc::O_WRONLY | libc::O_SYNC, DYING_PID, true),
+        (libc::O_WRONLY | libc::O_DSYNC, DYING_PID, true),
+        (libc::O_WRONLY | libc::O_SYNC, 4242, false),
+        (libc::O_WRONLY, DYING_PID, false),
+    ] {
+        let named = k.next_unique + 1;
+        k.send(op::INTERRUPT, 0, &Body::new().u64(named).0);
+        let unique = k.send_as(op::WRITE, 9, (1000, 100, pid), &write(flags));
+        assert_eq!(unique, named);
+        let r = k.recv();
+        assert_eq!(r.unique, unique);
+        assert_eq!(r.error, 0);
+        assert_eq!(
+            mock.last_call().unwrap().cancelled,
+            cancelled,
+            "flags {flags:#o} from {pid}"
+        );
+    }
     k.finish();
 }

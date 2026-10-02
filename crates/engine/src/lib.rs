@@ -34,6 +34,7 @@ pub mod existence;
 pub mod fault;
 pub mod forward;
 pub mod fsck;
+pub mod fsync_wait;
 pub mod gc;
 pub mod held;
 pub mod holds;

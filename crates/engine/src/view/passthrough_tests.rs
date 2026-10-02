@@ -114,8 +114,14 @@ impl Env {
 
     fn read(&self, ino: Ino, off: u64, len: u32) -> Vec<u8> {
         Blocking::run(|r| {
-            self.fs
-                .read(&self.cx(OpKind::Read), ino, Fh(ino), off, len, r)
+            self.fs.read(
+                &self.cx(OpKind::Read),
+                ino,
+                self.fs.any_handle(ino),
+                off,
+                len,
+                r,
+            )
         })
         .expect("read")
         .contiguous()
@@ -168,7 +174,7 @@ fn an_eligible_read_only_open_is_answered_with_the_chunk_file() {
     let hash = e.chunks(ino)[0];
 
     let opened = e.open_ro(ino);
-    assert_eq!(opened.fh, Fh(ino));
+    assert_eq!(e.fs.handle_ino(opened.fh), Some(ino));
     let backing = opened.backing.as_ref().expect("backing chunk file");
     assert_eq!(backing.len, data.len() as u64);
     assert_eq!(backing.hash, hash.0);

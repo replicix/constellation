@@ -53,9 +53,9 @@
 //! - Permission bits: the kernel checks modes above the trait.
 //! - Timing and durability levels beyond "every level succeeds or is
 //!   `NotSupported`, and the data is there afterwards".
-//! - **Cancellation on Linux FUSE.** fuser 0.18 delivers no
-//!   `FUSE_INTERRUPT`, so a Linux FUSE frontend's `CancelToken` is never
-//!   set by the kernel (plan 31 §6.3's known gap). The `cancellation`
+//! - **Cancellation on Linux FUSE.** The adapter wires `FUSE_INTERRUPT`
+//!   to the `fsync` family only (plan 39 §3.3), so a lock wait's `CancelToken` is
+//!   never set by the kernel (plan 31 §6.3's known gap). The `cancellation`
 //!   group tests the token where a target says its waits honour it
 //!   ([`Declared::cancellable_waits`]) and skips, naming the gap, where it
 //!   does not.

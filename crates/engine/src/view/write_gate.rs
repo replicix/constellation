@@ -127,7 +127,9 @@ impl View {
             if h.tx.send(SyncRequest::Acquire { reply: tx }).is_err() {
                 return Err(Code::Io);
             }
-            match rx.blocking_recv() {
+            // On the `fsync` path (plan 39) the wait also ends on the
+            // caller's death, the soft timeout or the kernel cap.
+            match crate::fsync_wait::recv(&self.rt, rx) {
                 Ok(Ok(progress)) if progress.acquired => {
                     h.lease.touch();
                     return Ok(());
@@ -167,7 +169,7 @@ impl View {
             // 2xTTL this way, which is a livelock between waiters, not
             // contention with the holder. A random 0-50% stretch on each
             // sleep breaks the lockstep after a handful of retries.
-            std::thread::sleep(backoff + backoff.mul_f64(jitter_fraction() * 0.5));
+            crate::fsync_wait::sleep(backoff + backoff.mul_f64(jitter_fraction() * 0.5));
             backoff = (backoff * 2).min(Duration::from_millis(2000));
         }
     }
@@ -601,11 +603,20 @@ impl View {
         {
             return Err(MutateFail::Errno(Code::Io));
         }
-        match rx.blocking_recv() {
+        // On the `fsync` path (plan 39) a forwarded commit's wait (its
+        // forward deadline is tens of seconds) ends on the caller's death,
+        // the soft timeout or the kernel cap like every other wait there:
+        // overshooting the cap would let the kernel abort the connection.
+        match crate::fsync_wait::recv(&self.rt, rx) {
             Ok(constellation_authority::ClientReply::Outcome(outcome)) => match outcome {
                 constellation_meta::MutateOutcome::Accepted { .. } => Ok(()),
                 // Never a client outcome: the core retries it.
-                constellation_meta::MutateOutcome::Held { .. } => Err(MutateFail::Errno(Code::Io)),
+                constellation_meta::MutateOutcome::Held { .. } => {
+                    crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
+                        "metadata commit held".into(),
+                    ));
+                    Err(MutateFail::Errno(Code::Io))
+                }
                 constellation_meta::MutateOutcome::Errno(e) => Err(MutateFail::Errno(e)),
                 // The name exists on the holder; the core installed the
                 // entry it sent with the refusal, so the caller's next
@@ -618,12 +629,23 @@ impl View {
                 }
                 constellation_meta::MutateOutcome::Busy
                 | constellation_meta::MutateOutcome::NotHolder { .. } => {
+                    crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
+                        "no sequencer answered the metadata commit".into(),
+                    ));
                     Err(MutateFail::Errno(Code::Io))
                 }
             },
             // Neither executed here nor answered by a holder within the
-            // deadline: `EIO`, and the op stays retryable.
-            Ok(constellation_authority::ClientReply::InDoubt) => Err(MutateFail::Errno(Code::Io)),
+            // deadline: `EIO`, and the op stays retryable — by the same
+            // rid, which is what lets an `fsync` retry it (plan 39: the
+            // base check refuses a duplicate and the rebase lays the
+            // flush over whatever survived).
+            Ok(constellation_authority::ClientReply::InDoubt) => {
+                crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
+                    "metadata commit in doubt (S3 or the sequencer unreachable)".into(),
+                ));
+                Err(MutateFail::Errno(Code::Io))
+            }
             Err(_) => Err(MutateFail::Errno(Code::Io)),
         }
     }
@@ -662,13 +684,18 @@ impl View {
         {
             return Err(Code::Io);
         }
-        match reply_rx.blocking_recv() {
+        match crate::fsync_wait::recv(&self.rt, reply_rx) {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "fsync barrier: sync failed");
+            Ok(Err(failure)) => {
+                if crate::fsync_wait::in_scope() {
+                    tracing::debug!(error = %failure, class = failure.class.as_str(), "fsync barrier attempt failed");
+                } else {
+                    tracing::warn!(error = %failure, "fsync barrier: sync failed");
+                }
+                crate::fsync_wait::note_sync_failure(&failure);
                 Err(Code::Io)
             }
-            Err(_) => Err(Code::Io),
+            Err(()) => Err(Code::Io),
         }
     }
 }

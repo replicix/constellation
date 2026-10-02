@@ -47,6 +47,13 @@
 //!   the inode is **tainted**, and every point that would publish it
 //!   (close, release, `fsync`, a recalled grant's flush, the next lock)
 //!   asks [`LockTables::take_discard`] first and throws the data away.
+//!   Each such discard is an **error event** on the inode
+//!   ([`LockTables::note_discard`]), reported errseq-style (Linux 4.13's
+//!   `errseq_t`): every open file description that was open when it
+//!   happened sees `EIO` exactly once, at its next `fsync` or close, and
+//!   descriptions opened afterwards never do. A description samples
+//!   [`LockTables::error_seq`] when it opens and compares at each
+//!   publication point (plan 39 §3.7; the view keeps the samples).
 //!
 //! # Cost when unused
 //!
@@ -282,17 +289,13 @@ struct Inner {
     newest: BTreeMap<(u64, u64), u64>,
     /// Node side: inodes whose dirty data may have been written under a
     /// grant that ended without the release's flush (see
-    /// [`LockTables::take_discard`]); `Owed`: it was discarded while no
-    /// publish point was there to report it, and the next one reports
-    /// `EIO`.
-    taint: BTreeMap<u64, Taint>,
+    /// [`LockTables::take_discard`]).
+    taint: std::collections::BTreeSet<u64>,
+    /// Node side: per inode, the sequence number of its latest discard
+    /// error event ([`LockTables::note_discard`]); absent: none since the
+    /// last [`LockTables::forget_errors`].
+    errors: BTreeMap<u64, u64>,
     stats: LockStats,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Taint {
-    Dirty,
-    Owed,
 }
 
 const RELEASED_KEPT: usize = 512;
@@ -311,7 +314,7 @@ impl Inner {
     /// `ino`'s grant ended without the release's flush: whatever is
     /// dirty on it must not be published.
     fn taint(&mut self, ino: u64) {
-        self.taint.insert(ino, Taint::Dirty);
+        self.taint.insert(ino);
     }
 
     /// Local locks on `ino` and no honoured grant.
@@ -347,6 +350,9 @@ pub struct LockTables {
     /// fast path (with `local_inos`).
     tracked: AtomicUsize,
     next_seq: AtomicU64,
+    /// Discard error events ever noted (the last one's sequence number):
+    /// [`LockTables::error_seq`]'s fast path while it is 0.
+    error_events: AtomicU64,
 }
 
 /// What a local lock request needs from the cross-node level.
@@ -935,10 +941,7 @@ impl LockTables {
             g.taint(ino);
         }
         let fenced = g.fenced_at(ino, now_ms);
-        let tainted = g.taint.get(&ino) == Some(&Taint::Dirty);
-        if tainted {
-            g.taint.remove(&ino);
-        }
+        let tainted = g.taint.remove(&ino);
         if fenced {
             g.stats.fenced_io += 1;
         }
@@ -946,27 +949,56 @@ impl LockTables {
         (fenced || tainted).then_some(fenced)
     }
 
-    /// Dirty data of `ino` was discarded where nobody could be told (a
-    /// new lock, a recalled grant's flush): the next close or `fsync`
-    /// reports `EIO` ([`Self::take_owed`]).
-    pub fn owe(&self, ino: u64) {
+    /// Dirty data of `ino` was discarded: an error event every open file
+    /// description of it reports once (see the module doc). Returns the
+    /// event's sequence number (what a description that is told now
+    /// records as seen).
+    pub fn note_discard(&self, ino: u64) -> u64 {
         let mut g = self.lock();
-        g.taint.entry(ino).or_insert(Taint::Owed);
-        self.track(&g);
+        let seq = self.error_events.fetch_add(1, Ordering::Relaxed) + 1;
+        g.errors.insert(ino, seq);
+        seq
     }
 
-    /// Whether an `EIO` for discarded data is owed on `ino` (cleared).
-    pub fn take_owed(&self, ino: u64) -> bool {
-        if self.tracked.load(Ordering::Relaxed) == 0 {
-            return false;
+    /// The sequence number of `ino`'s latest discard error event (0:
+    /// none). One relaxed load while no event was ever noted.
+    pub fn error_seq(&self, ino: u64) -> u64 {
+        if self.error_events.load(Ordering::Relaxed) == 0 {
+            return 0;
         }
+        self.lock().errors.get(&ino).copied().unwrap_or(0)
+    }
+
+    /// Every inode's latest discard error event (a handover carries them).
+    pub fn export_errors(&self) -> Vec<(u64, u64)> {
+        if self.error_events.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        self.lock().errors.iter().map(|(i, s)| (*i, *s)).collect()
+    }
+
+    /// Adopt a previous process's events ([`Self::export_errors`]), and
+    /// number every later event above `floor` and above each of them: a
+    /// description that crossed having seen event `n` must see the next
+    /// one as newer.
+    pub fn import_errors(&self, errors: &[(u64, u64)], floor: u64) {
         let mut g = self.lock();
-        let owed = g.taint.get(&ino) == Some(&Taint::Owed);
-        if owed {
-            g.taint.remove(&ino);
-            self.track(&g);
+        let mut top = floor;
+        for (ino, seq) in errors {
+            let e = g.errors.entry(*ino).or_insert(0);
+            *e = (*e).max(*seq);
+            top = top.max(*seq);
         }
-        owed
+        self.error_events.fetch_max(top, Ordering::Relaxed);
+    }
+
+    /// No description of `ino` is open any more: nobody is owed its
+    /// error events.
+    pub fn forget_errors(&self, ino: u64) {
+        if self.error_events.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        self.lock().errors.remove(&ino);
     }
 
     // ------------------------------------------------------ node: local locks
@@ -1434,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn a_released_grant_leaves_nothing_to_discard_and_owed_eio_is_reported_once() {
+    fn a_released_grant_leaves_nothing_to_discard_and_discard_errors_are_sequenced() {
         let t = LockTables::default();
         let id = GrantId { node: 1, seq: 1 };
         t.install_held(7, held(LockMode::Exclusive, 100));
@@ -1444,11 +1476,25 @@ mod tests {
         assert!(t.begin_release(7).is_some());
         assert!(t.end_release(7, id));
         assert_eq!(t.take_discard(7, 500), None);
-        assert!(!t.take_owed(7));
-        t.owe(7);
-        assert_eq!(t.take_discard(7, 500), None, "owed is not a discard");
-        assert!(t.take_owed(7));
-        assert!(!t.take_owed(7));
+        assert_eq!(t.error_seq(7), 0);
+        let seq = t.note_discard(7);
+        assert_eq!(
+            t.take_discard(7, 500),
+            None,
+            "an error event is not a discard"
+        );
+        assert_eq!(t.error_seq(7), seq);
+        assert_eq!(t.error_seq(8), 0, "events are per inode");
+        let later = t.note_discard(7);
+        assert!(later > seq, "every event is newer than the last");
+        t.forget_errors(7);
+        assert_eq!(t.error_seq(7), 0);
+        // A handover: the next process's tables adopt the events, and
+        // number the next one above everything that crossed.
+        let next = LockTables::default();
+        next.import_errors(&[(9, later)], later + 5);
+        assert_eq!(next.error_seq(9), later);
+        assert!(next.note_discard(7) > later + 5);
     }
 
     #[test]
