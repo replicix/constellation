@@ -342,6 +342,13 @@ pub fn utc_minutes(unix_ms: i64) -> String {
     )
 }
 
+/// `YYYY-MM-DD HH:MM:SS` in UTC (the scheduler's `s` tiers need the
+/// seconds).
+pub fn utc_seconds(unix_ms: i64) -> String {
+    let secs = unix_ms.div_euclid(1000);
+    format!("{}:{:02}", utc_minutes(unix_ms), secs.rem_euclid(60))
+}
+
 /// Days since 1970-01-01 → proleptic Gregorian `(year, month, day)`
 /// (Howard Hinnant's `civil_from_days`).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {

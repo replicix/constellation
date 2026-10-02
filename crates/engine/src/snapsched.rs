@@ -633,6 +633,23 @@ impl Scheduler {
         stats.orphaned_snapshots.store(orphaned, Ordering::Relaxed);
     }
 
+    /// A leader's tick that failed as a whole (the store unreachable for
+    /// its lease or its batch): every due root's snapshot was not taken,
+    /// so each counts `create_failed` and carries the error; the next tick
+    /// asks again.
+    fn fail_due(&self, due: &[&RootPlan], error: String, result: &mut SnapSchedRunResult) {
+        inc(&self.deps.stats.create_failed, due.len() as u64);
+        for p in due {
+            self.errors.lock().unwrap().insert(p.ino, error.clone());
+        }
+        self.deps.stats.record_error(error.clone());
+        result.roots = due
+            .iter()
+            .map(|p| run_root(p, "failed", None, Some(error.clone())))
+            .collect();
+        result.error = Some(error);
+    }
+
     fn note_error(&self, ino: Option<Ino>, error: String) {
         if let Some(ino) = ino {
             self.errors.lock().unwrap().insert(ino, error.clone());
@@ -734,9 +751,17 @@ impl Scheduler {
             }
             Err(error) => {
                 let error = format!("the {LEASE_NAME} lease: {error:#}");
-                self.note_error(None, error.clone());
                 result.leader = state.lease.is_some();
-                result.error = Some(error);
+                if result.leader {
+                    // The leader could not reach the store: its due
+                    // snapshots are not taken, and count as failed (an
+                    // outage's signature). A node that does not lead
+                    // does not know it would have, and counts nothing.
+                    self.fail_due(&due, error, &mut result);
+                } else {
+                    self.note_error(None, error.clone());
+                    result.error = Some(error);
+                }
                 return result;
             }
         }
@@ -763,8 +788,7 @@ impl Scheduler {
                     result.refused = Some("fenced: another node took the scheduler lease".into());
                 } else {
                     let error = format!("renewing the {LEASE_NAME} lease: {error:#}");
-                    self.note_error(None, error.clone());
-                    result.error = Some(error);
+                    self.fail_due(&due, error, &mut result);
                 }
                 return result;
             }
@@ -788,17 +812,7 @@ impl Scheduler {
             Err(error) => {
                 // Nothing was created; the next tick asks again (the
                 // names make a retry of a half-done batch harmless).
-                let error = format!("snapshot batch: {error:#}");
-                inc(&stats.create_failed, due.len() as u64);
-                for p in &due {
-                    self.errors.lock().unwrap().insert(p.ino, error.clone());
-                }
-                stats.record_error(error.clone());
-                result.error = Some(error);
-                result.roots = due
-                    .iter()
-                    .map(|p| run_root(p, "failed", None, result.error.clone()))
-                    .collect();
+                self.fail_due(&due, format!("snapshot batch: {error:#}"), &mut result);
                 return result;
             }
         };
@@ -1772,11 +1786,33 @@ mod tests {
         );
     }
 
-    /// A store that counts every request.
+    /// A store that counts every request, and while `down` fails every
+    /// get and put (an S3 outage, as far as a lease is concerned).
     #[derive(Debug)]
     struct Counting {
         inner: Arc<InMemory>,
         requests: AtomicUsize,
+        down: AtomicBool,
+    }
+
+    impl Counting {
+        fn over(inner: &Arc<InMemory>) -> Arc<Counting> {
+            Arc::new(Counting {
+                inner: inner.clone(),
+                requests: AtomicUsize::new(0),
+                down: AtomicBool::new(false),
+            })
+        }
+
+        fn outage(&self) -> object_store::Result<()> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "Counting",
+                    source: "connection reset by peer".into(),
+                });
+            }
+            Ok(())
+        }
     }
 
     impl std::fmt::Display for Counting {
@@ -1794,6 +1830,7 @@ mod tests {
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
             self.requests.fetch_add(1, Ordering::SeqCst);
+            self.outage()?;
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -1812,6 +1849,7 @@ mod tests {
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
             self.requests.fetch_add(1, Ordering::SeqCst);
+            self.outage()?;
             self.inner.get_opts(location, options).await
         }
 
@@ -1851,6 +1889,42 @@ mod tests {
         }
     }
 
+    /// Plan 32 Step 9's outage signature: a leader that cannot reach the
+    /// store (its lease renewal fails before any batch) counts each due
+    /// root's snapshot as `create_failed`, creates nothing, keeps its
+    /// lease, and takes the bucket once the store is back. A node that
+    /// does not lead counts nothing: it does not know it would have.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unreachable_store_counts_create_failed_at_the_leader_only() {
+        let (store, a, _) = solo("10s:1m; skip-empty=no").await;
+        let counting = Counting::over(&store);
+        let now = test_clock();
+        let sched = scheduler(&a, counting.clone(), &now, config());
+        assert_eq!(outcomes(&sched.tick(Run::Periodic).await), ["created"]);
+        advance(&now, 10 * SEC);
+        counting.down.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            let report = sched.tick(Run::Periodic).await;
+            assert_eq!(outcomes(&report), ["failed"]);
+            assert!(report.leader, "still the leader as far as anyone knows");
+            assert!(report.error.unwrap().contains("_snapsched"));
+        }
+        let stats = sched.deps.stats.status();
+        assert_eq!((stats.created, stats.create_failed), (1, 3));
+        assert!(stats.last_error.unwrap().contains("connection reset"));
+        // A second scheduler that never led: the same failure, no count.
+        let other = scheduler(&a, counting.clone(), &now, config());
+        let report = other.tick(Run::Periodic).await;
+        assert!(report.error.is_some() && report.roots.is_empty() && !report.leader);
+        assert_eq!(other.deps.stats.status().create_failed, 0);
+        assert_eq!(autos(&a).len(), 1);
+        // The store is back: one snapshot for the bucket, no more.
+        counting.down.store(false, Ordering::SeqCst);
+        assert_eq!(outcomes(&sched.tick(Run::Periodic).await), ["created"]);
+        assert!(sched.tick(Run::Periodic).await.roots.is_empty());
+        assert_eq!(autos(&a).len(), 2);
+    }
+
     /// The feature is inert by default (plan 32 Goal): with no policy root
     /// a tick makes no request at all — no lease object, nothing. A leader
     /// whose last policy is removed gives its lease back once and is quiet
@@ -1864,10 +1938,7 @@ mod tests {
         a.acquire().await;
         let data = a.meta.mkdir(1, "data", 0o755, 0, 0).unwrap().ino;
         a.sync().await;
-        let counting = Arc::new(Counting {
-            inner: store.clone(),
-            requests: AtomicUsize::new(0),
-        });
+        let counting = Counting::over(&store);
         let now = test_clock();
         let sched = scheduler(&a, counting.clone(), &now, config());
         for _ in 0..5 {

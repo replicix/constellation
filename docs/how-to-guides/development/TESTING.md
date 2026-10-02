@@ -69,8 +69,13 @@ it over FUSE, and exercises: namespace ops (mkdir/rename/symlink),
 `--against` a `csi:`-held snapshot through the daemon), the `snapshot policy
 set/show/ls/pause/resume/rm` round trip on a directory (an invalid
 expression's caret, a file refused, `--dry-run` writing nothing, `rm`
-declined without `--yes`, `rm --expire` refused until M4) and `snapshot ls
---orphaned`, multi-chunk files, partial in-place edits, truncate, append,
+declined without `--yes`, `rm --expire` refused until M4) with the
+scheduler driven by hand (plan 32 M3; the smoke daemon's periodic tick is
+an hour away: `snapshot sched status` shows `/dir` due with nobody leading,
+`sched run --dry-run` reports `would_create`, `sched run` creates the
+`auto-…` snapshot and leads, a second run has `nothing due`, and after
+`policy rm` the snapshot is listed as `auto (orphaned)` until it is deleted
+by hand) and `snapshot ls --orphaned`, multi-chunk files, partial in-place edits, truncate, append,
 snapshot space accounting (plan 32 M5c: a 2 MiB file only one of three
 snapshots keeps; `snapshot space --verify` = 0 mismatches, `snapshot ls`'s
 `USED`/`WRITTEN` and footer, `-p -s used`, `snapshot delete --dry-run`'s
@@ -488,7 +493,7 @@ unchanged (the platform unmount runs the same `fusermount3 -u` / `-uz`).
 `harness smoke [backend]` is `tests/smoke.sh` ported to Rust (see above):
 create + `doctor`, refused double create, mount, namespace ops,
 `snapshot policy check` (local, caret, `--against`), the `snapshot policy
-set/show/ls/pause/resume/rm` round trip, a 3.5 MiB
+set/show/ls/pause/resume/rm` round trip with `snapshot sched status/run`, a 3.5 MiB
 multi-chunk file, partial edit, truncate, append, snapshot sizes (`snapshot
 space --verify`, `snapshot ls` size columns, `delete --dry-run`'s reclaim
 estimate), unlink-while-open,
@@ -928,6 +933,56 @@ roots:
   directory lists its own two snapshots only; and it replaces
   another snapshotted directory (`rm -r`, `mkdir`) and reads the old
   directory's snapshot under the new one (the path rule, unchanged).
+
+Plan 32 M3 (automatic snapshot creation) adds two scenarios
+(`crates/harness/src/scenarios/snapsched.rs`). Both put the policy
+`10s:1m 1m:4m; last=2` on `/proj` by `setxattr`, tick the scheduler every
+second (`CONSTELLATION_SNAPSCHED_TICK_MS=1000`), and run a seeded writer that
+renames a fresh counter value into `/proj/counter` every 0.8–1.2 s, so every
+10 s bucket has a change (`skip-empty` is on). Nothing is ever deleted (the
+auto set only grows); plan 32 M4 (expiry) extends both with retention
+assertions.
+
+- `snapsched-create`: two nodes with their own node keys. `b` creates the
+  filesystem, holds the root lease and runs the writer; `a` binds the policy
+  and runs `snapshot sched run` at once, so `a` leads the scheduler and
+  every snapshot is created at `b` through the holder-side batch (forwarded
+  over P2P). If `b`'s own tick wins that race, the scenario runs anyway with
+  the leader at the holder, and its log says so. After three minutes: at most
+  one leader in every 5 s sample (`snapshot sched status --json` on both);
+  the root lease's holder and epoch unchanged; both nodes' `snapshot ls
+  --json` list the same set (at least 15 snapshots); every name is
+  `auto-<UTC>` of a distinct 10 s bucket, stamped no earlier than the bucket
+  began; the counter read through `.constellation/snapshot/<name>/counter` on
+  both mounts never goes backwards in `created` order. Then it `kill -9`s
+  the leader (the node whose `sched status` says `leader`) right after a
+  snapshot lands. The survivor must lead within TTL + 5 ticks + margin, the
+  next minute must add at least 4 snapshots, no bucket may appear twice, no
+  gap between consecutive snapshots may exceed 16 s, and (the check that
+  catches a dropped bucket) while the writer runs consecutive snapshots must
+  name consecutive 10 s buckets (including across the kill, so a new leader
+  that skips its first bucket fails), except that when the killed leader is
+  `b`, which also carries the writer, the pair straddling the kill may miss
+  one bucket (its writes stall until `a` holds the root lease). The 16 s bound is lease
+  TTL (`CONSTELLATION_LEASE_TTL_MS=10000`) + one tick + a 5 s margin for
+  noticing the last snapshot through a replica, the kill, the new leader's
+  batch on a loaded host, and (when the dead leader held the root lease) the
+  root lease takeover. Measured gaps across the takeover are 10.5–10.9 s;
+  steady-state gaps are 10.0 s ± 30 ms. Skip-empty: the writer stops; once
+  the newest snapshot holds the last value, 40 s pass with no new snapshot
+  while `skipped_empty` rises (the leader asked, the holder said
+  "unchanged"). One write then gives exactly one snapshot, holding that
+  value, named for the bucket of the write or the next one.
+- `snapsched-s3-outage`: one node, default lease TTL (60 s, shorter than the
+  cut). After three healthy snapshots, toxiproxy cuts S3 for 90 s. No
+  snapshot may appear during the cut (a snapshot stamped in its first 2 s,
+  already past its S3 writes, is tolerated), and `create_failed` must rise.
+  After the heal: one catch-up snapshot, every new snapshot created within a
+  bucket + tick + 10 s of the bucket it names, and no snapshot naming a bucket
+  that ended during the cut (no backfill). Exactly one snapshot falls in the
+  catch-up's first tick (no burst), and at least four arrive in the 40 s
+  after it, at most a bucket + tick + 10 s apart. The snapshots from before
+  the cut are all still there.
 
 Phase 6b scenarios exercise E2E passphrase mode:
 

@@ -166,6 +166,10 @@ impl Mount {
             .open(&self.log)?;
         let child = self
             .cmd(&["mount", "/"])
+            // The snapshot scheduler is driven by hand here (`snapshot
+            // sched run`, `policy_round_trip`): its periodic tick, an hour
+            // away, never races an assertion.
+            .env("CONSTELLATION_SNAPSCHED_TICK_MS", "3600000")
             .arg(&self.mnt)
             .args(["--s3", &self.backend, "--state-dir"])
             .arg(&self.state)
@@ -432,7 +436,7 @@ fn snapshot_space(m: &Mount, state: &str) -> Result<()> {
 /// held manual snapshot: the policy expires nothing, so `set` writes
 /// without asking. Leaves `/dir` without a policy.
 fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
-    say("snapshot policy set/show/ls/pause/resume/rm, snapshot ls --orphaned");
+    say("snapshot policy set/show/ls/pause/resume/rm, snapshot sched status/run, snapshot ls --orphaned");
     let run = |args: &[&str]| -> Result<(std::process::ExitStatus, String, String)> {
         let out = m
             .cmd(args)
@@ -485,7 +489,7 @@ fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
             && out.contains("would expire 0 of 1 snapshots"),
         "FAIL: policy show ({st}): {out}{err}"
     );
-    let ls_row = |want: &str| -> Result<()> {
+    let ls_row = |want: &str, autos: &str| -> Result<()> {
         let (st, out, err) = run(&["snapshot", "policy", "ls"])?;
         let row: Vec<String> = out
             .lines()
@@ -502,24 +506,74 @@ fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
                 && out.starts_with("PATH ")
                 && row.len() == 5
                 && row[3] == want
-                && row[4] == "0",
-            "FAIL: policy ls, want {want} ({st}): {out}{err}"
+                && row[4] == autos,
+            "FAIL: policy ls, want {want} with {autos} auto ({st}): {out}{err}"
         );
         Ok(())
     };
-    ls_row("armed")?;
+    ls_row("armed", "0")?;
+
+    // The scheduler (plan 32 M3): /dir is due, nobody leads yet.
+    let sched_row = |out: &str| -> String {
+        out.lines()
+            .find(|l| l.starts_with("/dir "))
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    };
+    let (st, out, err) = run(&["snapshot", "sched", "status"])?;
+    ensure!(
+        st.success()
+            && out.contains(": not leading (scheduler enabled, tick 3600000 ms")
+            && out.contains("\nPATH ")
+            && sched_row(&out).starts_with("/dir 1h:1d 1d:7d due now (auto-"),
+        "FAIL: snapshot sched status, due ({st}): {out}{err}"
+    );
+    let (st, out, err) = run(&["snapshot", "sched", "run", "--dry-run"])?;
+    ensure!(
+        st.success()
+            && out.starts_with("dry run: no lease taken, nothing created\n")
+            && sched_row(&out).contains(" would_create -"),
+        "FAIL: snapshot sched run --dry-run ({st}): {out}{err}"
+    );
+    ls_row("armed", "0")?;
+    let (st, out, err) = run(&["snapshot", "sched", "run"])?;
+    let created = sched_row(&out);
+    let auto_name = created.split(' ').nth(1).unwrap_or_default().to_string();
+    ensure!(
+        st.success()
+            && out.starts_with("this node leads the scheduler\n")
+            && auto_name.starts_with("auto-")
+            && created.contains(" created "),
+        "FAIL: snapshot sched run ({st}): {out}{err}"
+    );
+    let (st, out, err) = run(&["snapshot", "sched", "status"])?;
+    ensure!(
+        st.success()
+            && out.contains(": leader (scheduler enabled")
+            && out.contains("created 1  skipped-empty 0  create-failed 0")
+            && sched_row(&out).starts_with("/dir 1h:1d 1d:7d armed "),
+        "FAIL: snapshot sched status, after a run ({st}): {out}{err}"
+    );
+    // The bucket is covered: a second run has nothing to do.
+    let (st, out, err) = run(&["snapshot", "sched", "run"])?;
+    ensure!(
+        st.success() && out.ends_with("nothing due\n"),
+        "FAIL: snapshot sched run, covered ({st}): {out}{err}"
+    );
+    ls_row("armed", "1")?;
+
     let (st, out, err) = run(&["snapshot", "policy", "pause", "/dir"])?;
     ensure!(
         st.success() && out.contains("/dir: paused (1h:1d 1d:7d; paused)"),
         "FAIL: policy pause ({st}): {out}{err}"
     );
-    ls_row("paused")?;
+    ls_row("paused", "1")?;
     let (st, out, err) = run(&["snapshot", "policy", "resume", "/dir"])?;
     ensure!(
         st.success() && out.contains("/dir: armed (1h:1d 1d:7d)"),
         "FAIL: policy resume ({st}): {out}{err}"
     );
-    ls_row("armed")?;
+    ls_row("armed", "1")?;
     let (st, out, err) = run(&["snapshot", "policy", "rm", "/dir", "--expire", "--yes"])?;
     ensure!(
         !st.success() && err.contains("not available until expiry ships"),
@@ -531,11 +585,28 @@ fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
         !st.success() && err.contains("[y/N]") && err.contains("nothing removed"),
         "FAIL: policy rm without --yes ({st}): {err}"
     );
-    ls_row("armed")?;
+    ls_row("armed", "1")?;
     let (st, out, err) = run(&["snapshot", "policy", "rm", "/dir", "--yes"])?;
     ensure!(
-        st.success() && out.contains("/dir: snapshot policy removed; 0 auto snapshot(s) kept"),
+        st.success()
+            && out.contains("/dir: snapshot policy removed; 1 auto snapshot(s) kept (orphaned)"),
         "FAIL: policy rm ({st}): {out}{err}"
+    );
+    // The scheduler's snapshot outlives its policy, orphaned.
+    ls_row("orphaned", "1")?;
+    let (st, out, err) = run(&["snapshot", "ls", "--orphaned"])?;
+    ensure!(
+        st.success()
+            && out.contains(&format!("/dir@{auto_name}"))
+            && out.contains("auto (orphaned)"),
+        "FAIL: snapshot ls --orphaned ({st}): {out}{err}"
+    );
+    // Deleted by hand, the stream is gone, and the steps below see /dir's
+    // snapshots as they were.
+    let (st, out, err) = run(&["snapshot", "delete", &format!("/dir@{auto_name}")])?;
+    ensure!(
+        st.success(),
+        "FAIL: snapshot delete of {auto_name} ({st}): {out}{err}"
     );
     let (st, out, err) = run(&["snapshot", "policy", "ls"])?;
     ensure!(

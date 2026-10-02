@@ -61,6 +61,8 @@ mod rejoin;
 mod slowseal;
 /// Plan 32 §11: the reclaim estimate against what GC deletes.
 mod snapacct;
+/// Plan 32 M3: automatic snapshot creation (`snapsched-*`).
+mod snapsched;
 /// Plan 38 §6/§3(e): the transport a mount negotiates, and whether a
 /// session on it can be handed over.
 pub mod transport;
@@ -427,6 +429,26 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: crate::snapchurn::run,
+    },
+    Scenario {
+        name: "snapsched-create",
+        desc: "plan 32 M3: a 10s policy on /proj, two nodes, a writer on b: 3 min of one \
+               auto-<UTC> snapshot per bucket, the same set on both mounts, frozen counters \
+               never go backwards, the root lease never moves; kill -9 the scheduler leader: no \
+               bucket twice, no gap over TTL + tick + margin; skip-empty: 40 s idle gives none, \
+               one write exactly one",
+        requires: &[],
+        caps: &[],
+        run: snapsched::snapsched_create,
+    },
+    Scenario {
+        name: "snapsched-s3-outage",
+        desc: "plan 32 M3: a 10s policy through a 90 s S3 cut: create_failed rises, no snapshot \
+               appears during the cut, exactly one catch-up after the heal (no backfill), then \
+               one per bucket again",
+        requires: &[],
+        caps: &[],
+        run: snapsched::snapsched_s3_outage,
     },
     Scenario {
         name: "e2e-basic",

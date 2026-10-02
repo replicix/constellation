@@ -34222,3 +34222,205 @@ conflicts, then the review's findings.
 | `target/release/harness run --shard 1/2` | 93 PASSED, 1 SKIPPED (`transport-abort-while-armed`: release binary built without the `io-uring` feature), 0 FAILED |
 | `target/release/harness run --shard 2/2` | 89 PASSED, **3 FAILED**: `fio-blips` (known: fsync EIO after an 800 ms S3 cut; PASSED rerun alone, 6.5 s), `lock-failover` ("contender flock: no locks available (ENOLCK)"; PASSED rerun alone, 36 s), `ack-s3-failover` (known: the test assumes B wins the takeover; FAILED again alone the same way, `holder: 3`). This chunk touches no lock, failover or fio path |
 | `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed**, COMPLIANCE TEST PASSED (baseline: 0 known failures); `SMOKE_IMAGE=m5d-smoke:local`, a `/tmp` override dropping floci's host port (4566 held by another agent) |
+
+## Plan 32 M3 — scheduler and creation
+
+**Milestone M3 of [plan 32](wip/32-snapshot-policies-and-space.md) (Steps
+3.2–3.4 plus Step 5's `snapshot sched status | run [--dry-run]`): closed.**
+Three chunks: `32-m3a` (the scheduler; "Plan 32 M3a (scheduler)" above keeps its
+detail and decisions), `32-m3b` (skip-empty; "Plan 32 M3b (skip-empty)" above)
+and `32-m3c` (this one: the `sched` CLI, the creation half of Step 11's two
+harness scenarios, one scheduler fix, and the milestone gate). A policy on a
+directory now **creates** snapshots on its own, one per finest bucket, at the
+root-lease holder, without moving the lease. **Nothing deletes a snapshot**:
+expiry is M4. Until then an auto stream grows without bound (the
+`CONSTELLATION_SNAPSCHED_MAX_PER_ROOT` cap, 5000, stops it).
+
+| Item | State | Where |
+|---|---|---|
+| **M3a** sticky `_snapsched` singleton (renewed every tick and before every batch, `Fenced` ends it), refusal gates, inert without policies (no S3 request), due roots (catch-up, not backfill), bucket names `auto-<UTC>`, one holder-side `SnapshotBatch` per tick, `AlreadyExists` = success, the cap, the audit journal `snapsched/journal/<ts>-<uuid>.json`, `snapshot.sched.status` / `snapshot.sched.run` | DONE (`32-m3a`) | `crates/engine/src/snapsched.rs`, `crates/store-s3/src/snapsched.rs`, `crates/engine/src/control/snapsched.rs` |
+| **M3b** skip-empty at the holder: `subtree_unchanged` over `Tree::diff_each`, snapwalk membership, the `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` budget, atime out of the tree by construction | DONE (`32-m3b`) | `crates/engine/src/snapshot_batch.rs`, `crates/mtree/src/tree.rs` |
+| `constellation snapshot sched status [<fs>] [--json] [--state-dir]`: `node N: leader / not leading (scheduler enabled / disabled here, tick, cap)`; the counters (ticks, created, skipped-empty, create-failed, expired, refused-lag, refused-state); the gauges and `last created`; `last error` and the last refused policy when set; then `PATH POLICY STATE NEXT LAST CREATED ERROR` per root. STATE is `unparseable` > `gone` > `paused` > `capped` > `due` > `armed`; NEXT is `now (<bucket name>)` while due, else the next bucket's start (UTC, seconds), `-` when never; `(unlinked)` for a gone directory; `times UTC` footer | DONE | `crates/cli/src/sched_cli.rs`, `crates/cli/src/main.rs` (`SnapshotSchedCommand`, `node_state_dir`) |
+| `constellation snapshot sched run [--dry-run] [--json]`: `this node leads the scheduler` / `dry run: no lease taken, nothing created`, `refused: …`, `error: … (nothing created; the next tick retries)`, then `PATH NAME OUTCOME ID / ERROR` or `nothing due`. Exit non-zero when refused, when the batch failed as a whole, or when a root `failed` | DONE | `crates/cli/src/sched_cli.rs` |
+| `snapshot_cli::utc_seconds`; `policy_cli::align` made `pub` (shared) | DONE | `crates/cli/src/{snapshot_cli,policy_cli}.rs` |
+| **Fix (product, plan-32 code):** a leader whose `_snapsched` renewal fails with a store error (an S3 outage) now counts each due root's snapshot as `create_failed` (with the per-root error and `last_error`) and reports the roots as `failed`. Before, that path set only `last_error`, so `create_failed` stayed **0** through a 90 s outage, contrary to Step 9's "healthy outage signature" and Step 11. A node that does not lead counts nothing (it does not know it would have). The batch-error path shares the helper (`fail_due`) | DONE | `crates/engine/src/snapsched.rs`; test `an_unreachable_store_counts_create_failed_at_the_leader_only` (the test store `Counting` gained an outage switch) |
+| Harness `snapsched-create` and `snapsched-s3-outage` (designs below), registered in `SCENARIOS`, in their own module | DONE | `crates/harness/src/scenarios/snapsched.rs`, `crates/harness/src/scenarios.rs` |
+| Smoke lane: the scheduler driven by hand (`CONSTELLATION_SNAPSCHED_TICK_MS=3600000` on the smoke daemon, so no periodic tick races an assertion): `sched status` (`/dir` due, not leading) → `sched run --dry-run` (`would_create`, nothing taken) → `sched run` (leads, `created`) → `sched status` (leader, `created 1`, armed) → `sched run` (`nothing due`) → the existing pause/resume/rm steps now see 1 auto snapshot → `policy ls` `orphaned 1` → `snapshot ls --orphaned` lists it → deleted by hand → the old final checks | DONE | `crates/harness/src/smoke.rs` (`Mount::mount`, `policy_round_trip`) |
+| Docs: TESTING.md (both scenarios with their tolerances, the smoke steps), `configuration.md` (the `sched` CLI, outage counting) | DONE | `docs/how-to-guides/development/TESTING.md`, `docs/reference/configuration.md` |
+| Unit tests: `sched_cli` (STATE precedence; the status page with a due, an armed and an unparseable unlinked root; leader / disabled headers; `run`'s exit rule for refused, batch error, failed root, dry run, nothing due); the harness's name parser and series check | DONE | `crates/cli/src/sched_cli.rs` (3), `crates/harness/src/scenarios/snapsched.rs` (2) |
+
+### Harness scenarios (Step 11, creation half)
+
+Both use the policy `10s:1m 1m:4m; last=2` on `/proj` (set by `setxattr`),
+`CONSTELLATION_SNAPSCHED_TICK_MS=1000`, and a seeded writer that renames a fresh
+counter value into `/proj/counter` every 0.8–1.2 s (the jitter comes from the
+seed). The rename means no snapshot can freeze a half-written file.
+
+**`snapsched-create`** (two nodes with their own node keys, lease TTL 10 s,
+~340 s):
+
+1. `b` creates the filesystem, mounts first, holds the root lease, and runs
+   the writer. `a` sets the policy (the setxattr is forwarded to `b`) and at
+   once runs `snapshot sched run`, which takes `_snapsched`. So `a` leads and
+   every snapshot is created at `b` through a forwarded batch. This is the
+   plan's "scheduler on A while B holds the lease". If `b`'s own tick wins
+   the race, the run continues with the leader at the holder, and its log
+   says which happened. In all four final runs `a` led (`leader samples
+   {2: 36}`).
+2. 180 s of schedule, sampling `snapshot sched status --json` on both nodes
+   every 5 s: never two leaders, and the auto set never shrinks.
+3. Assertions:
+   - The root lease's (holder, epoch) is unchanged: **before `holder 1 epoch
+     1`, after `holder 1 epoch 1`**, in each of the 3 gate runs and the
+     earlier passing runs.
+   - Both nodes' `snapshot ls --json` give the same (name, id) set, with at
+     least 15 snapshots (19 every time).
+   - Every name is `auto-<UTC>` of a distinct 10 s bucket and was stamped no
+     earlier than its bucket began.
+   - Consecutive gaps are at most `MAX_GAP_MS`. Steady-state gaps measured
+     9 016–10 019 ms; the first gap is shorter (the `sched run` snapshot and
+     the next bucket's).
+   - The counter read through `.constellation/snapshot/<name>/counter` on
+     **both** mounts is non-decreasing in `created` order and no newer than
+     the writer.
+4. Kill the leader (the node whose `sched status` reports `leader`) right
+   after a new snapshot shows on the survivor. The survivor must lead within
+   TTL + 5 ticks + 10 s. The next minute must add at least 4 snapshots; the
+   whole series is re-checked (no bucket twice, gaps at most `MAX_GAP_MS`,
+   consecutive snapshots name consecutive buckets; only when the killed
+   leader was `b`, which also carries the writer, the one pair straddling
+   the kill may miss one bucket, since the writes stall until `a` holds the
+   root lease), and nothing
+   vanished. The run's `RESULT killed leader = …` line records which node led. **Takeover gaps measured: 10 872, 10 913,
+   10 858 ms** (and 10 879 ms, 10 898 ms in earlier runs; one of those runs
+   had `b` leading, so killing it also moved the root lease).
+5. Skip-empty: stop the writer and wait until the newest snapshot holds its
+   last value. Then 40 s must pass with no new snapshot while the leader's
+   `skipped_empty` rises (0 → 4: the idle buckets were asked and answered
+   "unchanged"). One write then gives exactly one snapshot, holding that
+   value, named for the write's bucket or the next one, checked again 30 s
+   later (803–899 ms after the write).
+
+**Gap tolerance.** `MAX_GAP_MS = TTL (10 000) + one tick (1 000) + margin
+(5 000) = 16 000 ms`. The plan's bound is "lease TTL plus one tick". The
+margin covers the rest of the path:
+- the harness noticing the last snapshot through a replica (up to a sync
+  round, ~1 s);
+- the kill and reap (< 1 s);
+- the new leader's batch (one drain + one publish, 1–3 s on a loaded host);
+- when the dead leader was the root-lease holder, the root lease takeover
+  (one more CAS round).
+
+Measured takeover gaps are 10.5–10.9 s, so 5 s leaves about 5 s of slack. A
+scheduler that waited a second TTL would exceed the bound. **The bound alone
+does not catch one dropped bucket** (a ~20 s gap is above 16 s only barely,
+and a slow host could blur that), so `check_consecutive` asserts it on the
+names: while the writer runs, consecutive snapshots name consecutive 10 s
+buckets. The takeover lands inside the first bucket after the kill (gap
+10.5–10.9 s, and the 16 s bound keeps it there), so a new leader that skips
+its first bucket fails. The one exception is the case where the killed
+leader is `b` (it also carries the writer, whose writes stall until `a` holds
+the root lease, so a bucket may be legitimately empty): the pair straddling
+the kill may then miss one bucket. Any other dropped bucket fails. Unit test `the_consecutive_check_catches_a_dropped_bucket`
+covers the check itself.
+
+**`snapsched-s3-outage`** (one node, default lease TTL 60 s, so the cut
+outlasts it; ~150 s):
+
+1. After three healthy snapshots, toxiproxy cuts S3 for 90 s.
+2. During the cut, polled every 5 s: no new snapshot may appear (one stamped
+   in the cut's first 2 s, already past its S3 writes, is tolerated; none
+   was seen), and `create_failed` must rise. Measured **0 → 81** (one per
+   tick), with `last_error` naming the failed `_snapsched` renewal.
+3. After the heal, the catch-up was **`auto-…141440Z` created 863 ms after
+   the heal** (880 and 875 ms in the other runs). Then one snapshot per
+   bucket: 4 in the next 40 s.
+4. Assertions on everything new:
+   - each one was created within a bucket + tick + 10 s of the bucket it
+     names (a backfilled bucket would be up to 90 s late);
+   - none names a bucket that ended during the cut;
+   - exactly one falls in the catch-up's first tick (no burst);
+   - at least four arrive after it, at most a bucket + tick + 10 s apart;
+   - every pre-cut snapshot is still present.
+
+Before the fix above, this scenario failed with `create_failed did not rise
+during a 90s cut (0 -> 0)`. That is the evidence for the fix.
+
+### Decisions taken here
+
+- **`sched` takes an optional `<fs>` or `--state-dir`** like `policy ls`: the
+  scheduler is per node, so a path in the target means nothing and is
+  ignored. To find the leader, run `status` on every node (the harness does).
+- **`run` exits non-zero when refused.** A `run` on a node another node leads
+  is a `refused` result, not a control error. For someone asking "take the
+  due snapshots now" it still means "not done here", so the CLI fails it,
+  with the reason. A dry run fails only when refused.
+- **`create_failed` counts once per due root per failed tick** (81 for a 90 s
+  cut at a 1 s tick), the unit the existing batch-error path already used. It
+  is "snapshots that were not taken when asked", not "buckets missed".
+- **The harness leader is steered, not forced.** The plan's interesting case
+  (leader ≠ holder) is made the likely one: `a` binds the policy and ticks by
+  hand, and `b`'s scheduler is not disabled (it must be able to take over
+  after the kill). Forcing it would need a scheduler toggle that does not
+  exist.
+- **The smoke daemon's tick is an hour.** The M2 smoke steps armed a `1h:1d`
+  policy for about a second while the default 10 s tick ran. A tick in that
+  window would have created a snapshot and broken `0 auto snapshot(s) kept`
+  (a latent flake since M3a). Now the lane drives the scheduler by hand and
+  asserts on the snapshot it made.
+
+### Findings (not fixed: outside this chunk's scope)
+
+- **Snapshot batches have no S3 slow path.** With the harness's default shared
+  node key (P2P impossible), a leader that is not the root-lease holder failed
+  every tick: `forwarding the snapshot operation to node 2 … dialing peer:
+  Connecting to ourself is not supported`. `create_failed` and `last_error`
+  show it, but no snapshot is taken until the leader and the holder can talk
+  over P2P, or leadership moves to the holder. Ordinary mutations fall back
+  to the S3 inbox in the same setup. This is plan 32 §0.1 by design (the
+  holder-side batch is P2P-only), but a P2P partition between leader and
+  holder stalls policies indefinitely. Two candidate fixes: a leader whose
+  batch cannot reach the holder for N ticks resigns `_snapsched`, or the
+  batch gets an inbox path. For M4 or plan 30's owner to decide. The scenario
+  gives each node its own key.
+- With P2P working, a non-holder's writes are forwarded and never escalate the
+  root lease (escalation counts S3-inbox demand only). The scenario therefore
+  makes the writer the holder from the start, instead of moving the lease to
+  it by demand.
+
+### Gates (2026-10-02, this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace --no-fail-fast` | **2166 passed, 0 failed**, 43 ignored. The workspace run exceeded the tool's 10-minute call limit inside `constellation-model` (slow in debug), so the rest ran per crate: the first run covered every crate up to the model's `cto` test, then `-p` for mtree, net, platform, store-s3, types, upload-concurrency, vfs, uploadbench, then the model's remaining test binaries |
+| `cargo test -p constellation-engine --lib snapsched::tests` | 21/21 (20 + the new one) |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` (with the new `sched` steps) |
+| `bash tests/integration.sh` | port 4566 held by another agent's floci (`32-m3a-1002-070039-floci-1`), so the script's body ran against it with its `AWS_*` settings (`tests/smoke.sh s3://constellation-ci/run-m3c-1790949872-…`): `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | exit 0 |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX=m3c target/release/harness run snapsched-create snapsched-s3-outage` ×3 in a row | `ALL SCENARIOS PASSED` ×3 (create 336.4 / 353.9 / 344.7 s; outage 150.3 / 164.3 / 148.9 s) |
+| `target/release/harness run` (full matrix, 193 scenarios) | Run as `--shard 1/6` … `6/6` (prefix `m3c`; each shard fits the tool's 40-minute limit): **189 PASSED, 3 SKIPPED, 1 FAILED**. The skips are `transport-refused-registration`, `transport-enomem-ring` and `transport-abort-while-armed` (the plain release build has no `io-uring` feature). The failure was `p2p-partition-one-node` in shard 6: "b (majority side) had a write take 17.5 s during the partition". It has no snapshot policy, and the scheduler is inert without one; rerun alone it **PASSED** (69.3 s). It is load-sensitive on this shared host; compare the docker-bridge churn stalls in earlier notes. `snapsched-create` and `snapsched-s3-outage` passed inside the matrix too (a 4th run each). `subtree-confinement` also ran as root (`sudo env PATH=$PATH CONSTELLATION_HARNESS_DOCKER_PREFIX=m3c-root …`): PASSED |
+| `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed**, `COMPLIANCE TEST PASSED (baseline: 0 known failures)`, dev_fuse transport. The scheduler was on (default) with no policy: inert. Ran as `SMOKE_IMAGE=m3c-smoke:local docker compose -p 32-m3c-1002-124151 -f docker-compose.yml -f <override> --profile test run --rm compliance`; the override is `floci: ports: !reset []`, because 4566 was held by another agent's floci. Its own floci was used on the compose network |
+
+### Exit criteria (plan 32 Step 12, M3)
+
+- [x] Step 3.2: the sticky singleton scheduler, its refusal gates, inert without policies (`32-m3a`).
+- [x] Step 3.3: due roots, catch-up not backfill, `auto-<UTC>` bucket names, one holder-side batch per tick, `AlreadyExists` = success, the cap (`32-m3a`); end to end in `snapsched-create` / `snapsched-s3-outage`.
+- [x] Step 3.4: skip-empty at the holder (`32-m3b`); end to end in `snapsched-create` (40 s idle → no snapshot, one write → one).
+- [x] Stats and audit (`32-m3a`); `create_failed` rises in an outage (fixed here).
+- [x] Step 5: `snapshot sched status | run [--dry-run]`.
+- [x] Creation never moves the root lease: holder 1 / epoch 1 before and after in every `snapsched-create` run.
+- [x] Step 4.4 answered (`32-m3a`): inode numbers are never reused within a filesystem. Ino = node prefix (a never-reused node id; retired ids are tombstoned) `<< 40 | ` a per-prefix counter that only grows and survives rebuilds. `policy_ino` stays a bare `u64`.
+- [x] Nothing deletes a snapshot (both scenarios assert the set only grows; M4 changes that assertion).
+- [x] Full CONVENTIONS gates (above): fmt, clippy, tests, smoke, integration, release build, the two scenarios 3/3, the full matrix (one unrelated load flake that passed alone), compliance 8798/8798.
+
+### Not done here (deliberately)
+
+- Step 11's retention assertions (the survivors equal `retention::evaluate`
+  over the journal's creation list; a manual and a held auto snapshot
+  survive; "nothing expires" during the outage), and the 6-minute run length:
+  M4, which extends these two scenarios.
+- `snapacct` and `web-ui-smoke` extensions (M5 / M6); the perf numbers
+  (fio regression, GC `full` vs `diff`): M8.
+- `/metrics` export of the counters: M8.

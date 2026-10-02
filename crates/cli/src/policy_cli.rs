@@ -81,7 +81,7 @@ fn path_text(root: &api::SnapPolicyRoot) -> &str {
 
 /// Left-aligned columns two spaces apart, padded by `char`s (`—`, `⚑`),
 /// trailing blanks trimmed.
-fn align(header: &[&str], rows: &[Vec<String>]) -> String {
+pub fn align(header: &[&str], rows: &[Vec<String>]) -> String {
     let widths: Vec<usize> = (0..header.len())
         .map(|i| {
             rows.iter()

@@ -7,6 +7,7 @@ mod handover;
 mod node_runtime;
 mod parallelism;
 mod policy_cli;
+mod sched_cli;
 mod serve;
 mod snapshot_cli;
 mod startup;
@@ -693,6 +694,48 @@ enum SnapshotCommand {
     Policy {
         #[command(subcommand)]
         command: SnapshotPolicyCommand,
+    },
+    /// This node's snapshot scheduler (plan 32): `status` (whether it
+    /// leads, its counters, every policy root's state and next snapshot)
+    /// and `run` (one tick now).
+    Sched {
+        #[command(subcommand)]
+        command: SnapshotSchedCommand,
+    },
+}
+
+/// `constellation snapshot sched …` (plan 32 Step 5). The scheduler is
+/// per node: `status` reports the node the target's state dir names (run
+/// it on every node to find the leader), `run` ticks that node.
+#[derive(Subcommand)]
+enum SnapshotSchedCommand {
+    /// Whether this node leads, its counters (created, skipped-empty,
+    /// create-failed, refused-*), and per policy root: PATH, POLICY, STATE
+    /// (due, armed, capped, paused, gone, unparseable), NEXT, LAST CREATED,
+    /// ERROR.
+    Status {
+        /// A registered filesystem name (`myfs`); or `--state-dir`.
+        target: Option<String>,
+        /// The raw `snapshot.sched.status` report.
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Run one scheduler tick now on this node: take the scheduler's lease
+    /// if it is free and create every due snapshot (never deletes). Exits
+    /// non-zero when refused (another node leads, a refusal gate is up)
+    /// or when a snapshot was not taken.
+    Run {
+        target: Option<String>,
+        /// Report what a tick would create; take no lease, create nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// The raw `snapshot.sched.run` result.
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -1976,6 +2019,25 @@ fn main() -> Result<()> {
                     rt.block_on(snapshot_cli::hold(&dir, selectors, false, by, force))
                 }
                 SnapshotCommand::Policy { command } => run_snapshot_policy_command(&rt, command),
+                SnapshotCommand::Sched { command } => match command {
+                    SnapshotSchedCommand::Status {
+                        target,
+                        json,
+                        state_dir,
+                    } => {
+                        let dir = node_state_dir(target, state_dir)?;
+                        rt.block_on(sched_cli::status(&dir, json))
+                    }
+                    SnapshotSchedCommand::Run {
+                        target,
+                        dry_run,
+                        json,
+                        state_dir,
+                    } => {
+                        let dir = node_state_dir(target, state_dir)?;
+                        rt.block_on(sched_cli::run(&dir, dry_run, json))
+                    }
+                },
             }
         }
         Command::Clone {
@@ -3721,6 +3783,16 @@ fn run_snapshot_policy_command(
             let (dir, path) = policy_target(&target, state_dir)?;
             rt.block_on(policy_cli::pause(&dir, path, false))
         }
+    }
+}
+
+/// The state dir of a node-wide command's optional target: `myfs` (any
+/// path in it is ignored) or `--state-dir`.
+fn node_state_dir(target: Option<String>, state_dir: Option<PathBuf>) -> Result<PathBuf> {
+    match (target, state_dir) {
+        (Some(target), state_dir) => Ok(resolve_target(&target, state_dir)?.1),
+        (None, Some(dir)) => Ok(dir),
+        (None, None) => bail!("TARGET (a registered filesystem name, `myfs`) or --state-dir"),
     }
 }
 

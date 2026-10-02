@@ -851,7 +851,15 @@ snapshot table above.
 | `CONSTELLATION_SNAPSCHED_MAX_PER_ROOT` | `5000` | snapshots | a policy root with this many live auto snapshots (held ones included) gets no more: `capped_roots`, `last_error` naming the root, and an error in `snapshot.sched.status` |
 
 The `_snapsched` lease's TTL is `CONSTELLATION_LEASE_TTL_MS` (default
-60 s), raised to at least three ticks.
+60 s), raised to at least three ticks. `constellation snapshot sched status`
+shows, per node, whether it leads, the counters, and every policy root's
+state and next snapshot; `snapshot sched run [--dry-run]` runs one tick now.
+A leader that cannot reach the store (an S3 outage) counts every due root's
+snapshot as `create_failed` on each tick, and catches up with one snapshot
+(not one per missed bucket) once the store is back. `create_failed` counts
+once per due root per tick, so a 90 s outage with one root and a 1 s tick
+reads about 90; when M8 exports these counters on `/metrics`, read the rate,
+not the value, as "ticks that could not create".
 
 ### FUSE and runtime threads
 
