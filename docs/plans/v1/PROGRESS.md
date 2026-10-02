@@ -33023,6 +33023,227 @@ answers only — no retention or accounting arithmetic in the page.
 
 ### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m6a`)
 
+## Plan 32 M5 — space accounting
+
+Step 12's milestone M5 of [plan 32](wip/32-snapshot-policies-and-space.md)
+("Step 6: snapwalk-based index, sizes in `ls`, `space`, `delete
+--dry-run`, `--verify`") is complete. Four chunks built it: the three
+below, whose own sections above carry their detail, decisions and gates,
+and the close-out `32-m5d` (this section), which adds the `snapacct`
+harness scenario, measures the GC mark `full` vs `diff` at the plan's
+scale, fixes two accounting bugs the scenario found, and ran the full
+CONVENTIONS gates for the milestone. The index is advisory throughout:
+GC and snapshot deletion never read it.
+
+| Item | State | Where |
+|---|---|---|
+| **§6.2** the index core: per-chain interval runs in a node-local fjall database; `USED`/`WRITTEN`/`REFER`/`LSIZE`, `reclaim(D)`, the space breakdown, each O(what changed); tombstones and `awaiting_gc`; model test against brute force | DONE (`32-m5a`, "Plan 32 M5a (accounting index core)" above) | `crates/engine/src/snapacct/{mod,ops,encoding}.rs` |
+| **§6.2–6.3** on a node: `SnapAcctService` (`CONSTELLATION_SNAPACCT=auto\|on\|off`), build = reconcile against the replica's rows, resumable and budgeted; live flags by commit diff with the cover rule; `verify()` against a brute force; GC census; `node.status` and `/metrics` | DONE (`32-m5b`, "Plan 32 M5b (accounting integration)" above) | `crates/engine/src/snapacct/{service,verify}.rs` |
+| **Step 5 / 7.6** surfaces: `snapshot ls` sizes, `snapshot space [--verify]`, `snapshot delete --dry-run` reclaim line, control `snapshot.reclaim` / `snapshot.space` / `snapshot.space.verify` | DONE (`32-m5c`, "Plan 32 M5c (space surfaces)" above) | `crates/engine/src/control/snapspace.rs`, `crates/cli/src/snapshot_cli.rs` |
+| **§11 `snapacct`** harness scenario: two nodes, seeded workload with 18 snapshots of two nested chains, `--verify` clean on both nodes, dry-run reclaim set of a middle range **equal** to the chunks GC journals as deleted | DONE (`32-m5d`, below) | `crates/harness/src/scenarios/snapacct.rs` |
+| `snapshot.reclaim {selectors, list_chunks}`: `list_chunks: true` (a documented test aid) adds `ReclaimEstimate.chunk_hashes` — the counted chunks' hashes, sorted hex, from the same index read; `null` otherwise. Needs the operator role (the estimate alone stays a viewer's); refused past 100,000 chunks (`LIST_CHUNKS_MAX`, one reply frame), the list never held beyond that. Schema re-blessed; no method added | DONE (`32-m5d`) | `crates/control/src/proto/types.rs`, `SnapAcct::reclaim_listed`, `SnapAcctService::reclaim_listed`, `EngineControl::reclaim_listed_of` |
+| **§11 "Compliance and performance"**: GC round time — measured as the GC **mark** time, the one phase the two modes do differently — on 300 snapshots of a 100k-file tree, `full` vs `diff` | DONE (`32-m5d`, below) | `gc::tests::bench_gc_mark_full_versus_diff` (`#[ignore]`) |
+
+### The `snapacct` scenario
+
+Two nodes on one filesystem: `acct-a` with `CONSTELLATION_SNAPACCT=on`
+(its index applied snapshot by snapshot from the start) and `acct-b`
+with `auto` (built from scratch on the first size request), both with
+`CONSTELLATION_GC_HORIZON_S=0`, a 1 s lease TTL and a 2 s refresh. Twelve
+rounds, writers alternating between the nodes: creates (one-chunk and
+4–10 MiB multi-chunk files with a partial tail), whole and partial
+(4 KiB in place) overwrites, truncates (shrinking, and extending past
+the end), reverts to an earlier content, hardlinks and copies across the
+subtree boundaries, unlinks, renames, and directories moved into, out of
+and between `/proj` and `/proj/sub` (the scenario asserts every kind
+occurred). After every round the other node snapshots `/proj`
+(`p01`…`p12`), every second round `/proj/sub` (`s02`…`s12`): 18
+snapshots, two nested chains. Round 5 creates four files (one of three
+chunks) that round 8 unlinks, so the middle range `/proj@p04%p08` alone
+keeps at least 6 chunks.
+
+Then: **quiesce** (both journals drained, both mounts byte-identical,
+one GC round to completion — the precondition stated in the module doc:
+an overwritten version no snapshot saw is garbage the index never
+indexes, so without this GC deletes more than any estimate covers; the
+live tree is left unchanged from here to the last GC round);
+`snapshot space --verify` 0 mismatches on both nodes; `snapshot.reclaim
+/proj@p04%p08` with `list_chunks` on both nodes (the same set; `snapshot
+delete --dry-run` prints 5 snapshots and the same chunk count);
+`snapshot delete /proj@p04%p08 --yes`; both indexes show exactly the set
+as `awaiting GC`; a GC round; the `orphan-horizon` chunk deletions it
+journaled under `gc/journal/` (new keys only) must equal the dry-run set
+and the round's own report; `--verify` 0 mismatches on both nodes again.
+
+Run (seed 42, `harness run snapacct`, identical on all three gate runs):
+
+| | Count | First 5 hashes |
+|---|---|---|
+| Dry run `/proj@p04%p08` (both nodes, equal bytes asserted: 9,730,640) | **15** | `0ba6256afca71a804792f619ed64bed613f0471fbcaa690c588979afcd19dabc`, `27b8fe0f70305a6e04b196cf44abcddf52f32f61c1a0a749ba8ff817c2c90886`, `37659870c3a25d34463517ceb029f4c35fe2b6a3af16f47f436634ec51384405`, `42a409e9ca86101104cadd223ba15db81be17d177b7e1b9a99ec1839d5a7aef5`, `6ef741d7c3e5435119633d64ada01500d323affee80cf96f269cb86069a1fce8` |
+| GC-journaled chunk deletions | **15** | `0ba6256afca71a804792f619ed64bed613f0471fbcaa690c588979afcd19dabc`, `27b8fe0f70305a6e04b196cf44abcddf52f32f61c1a0a749ba8ff817c2c90886`, `37659870c3a25d34463517ceb029f4c35fe2b6a3af16f47f436634ec51384405`, `42a409e9ca86101104cadd223ba15db81be17d177b7e1b9a99ec1839d5a7aef5`, `6ef741d7c3e5435119633d64ada01500d323affee80cf96f269cb86069a1fce8` |
+
+The whole sets are equal (asserted). Workload: 198 operations, 69 files at
+the end; `--verify` before the deletion 18 snapshots / 112 chunks, after
+GC 13 snapshots / 97 chunks, 0 mismatches on both nodes each time. The
+quiesce round deleted 43 objects (42 in the fix round's runs). Other
+seeds (`--seed 7`, `1234`, `99999`) also pass, with 17, 31 and 41 chunks
+(9,973,500, 21,022,555 and 30,407,487 bytes), sets and bytes equal on
+both nodes.
+
+### Two accounting bugs the scenario found (fixed here)
+
+1. **One hash at two derived sizes.** A chunk's logical size is derived
+   per occurrence, `min(chunk_size, file_len − offset)`. A short tail
+   chunk whose file is then extended past it by a truncate keeps its hash
+   and now occurs as a whole chunk, at another size. The index kept one
+   size per chunk — the first occurrence it applied, which depends on the
+   order it met the snapshots — while `verify`'s brute force summed each
+   occurrence's own size: `REFER`, `reclaim` and the buckets disagreed by
+   the tail's growth, and the incrementally built index (`a`) and the
+   from-scratch one (`b`) could disagree in bytes. The first fix
+   (`BruteForce::adopt_sizes`, verify taking the index's sizes) was
+   rejected in review: verify could no longer catch a wrong size, and the
+   bytes still depended on application order. **Fix (review round,
+   coordinator decision):** a chunk counts at the **largest** derived size
+   it occurs at in any snapshot — a function of the snapshots alone. The
+   index keeps runs per size (`Run.size`; snapwalk's occurrences and
+   deltas are per hash and size), the entry's size is its runs' largest,
+   and a change of the largest moves `REFER`/`WRITTEN` of every snapshot
+   holding the chunk (`Ctx::resize` in the flush; owner `USED` and buckets
+   move with the class). `verify` records every size the walk sees per
+   hash, counts at the largest, and reports a chunk whose indexed size
+   differs by name. Plan 32 §6.1/§6.2/§6.3 amended. Tests:
+   `one_chunk_at_two_derived_sizes_counts_the_largest` (incremental vs
+   rebuilt equal; deleting the large holders drops the size; a corrupted
+   but self-consistent size caught by name), both model tests extended
+   with a second size per hash (`size change in a chain`, `one hash at two
+   sizes` asserted exercised; the service model gains a resize kind). The
+   scenario now asserts **equal byte totals** on both nodes.
+2. **A live flag read ahead of its commit stuck.** The live refresh reads
+   flags from the replica, which can be past the commit it labels them
+   with. A file reverted to an old content and overwritten again between
+   two commits names the old chunk only in between; neither diff around
+   it names the chunk again, so the flag stayed `live` for good (the
+   chunk then never showed as reclaimable). Fix: every flag read while the
+   replica is not at exactly the labelled commit's state (`applied`
+   position equal to the commit's, nothing unshipped, unchanged across the
+   read) is recorded in `aux/live_recheck` and read again by the next
+   refresh, with or without a newer commit, until one read happens at a
+   settled state; snapshot applications' flag reads join the set; past
+   50,000 chunks it becomes one full recompute at the next settled moment.
+   `LiveRoot` gains the commit's `applied`; index `FORMAT` 2 → 3 (an old
+   index is wiped and rebuilt). Test:
+   `a_flag_read_ahead_of_its_commit_is_read_again`. **Review round:** as
+   first written, a node never at a settled state fell back to a full
+   O(index) recompute on *every* refresh (the pending full recheck forced
+   the diff path to fail). Now a pending full recheck runs only at a
+   settled moment; meanwhile refreshes diff as before (O(what changed))
+   and keep it pending; the per-hash set, in memory and stored, collapses
+   to "full" past 50,000. Snapshot applications' reads are merged into
+   `aux/live_recheck` after each operation, with `aux/recheck_inflight`
+   set around it so a crash in between reads as a full recheck; the stored
+   set is replaced only after its rereads succeed (nothing is drained
+   early). Tests: `a_never_settled_replica_never_recomputes_every_flag`
+   (25 rounds of publish → unshipped write → refresh: 0 full recomputes
+   per round — the review's 5-round probe asserted at round 5 — then
+   exactly 1 at the first settled moment, verify clean) and
+   `flags_read_by_an_application_survive_a_restart` (fails if the reads
+   are only kept in memory; the marker alone forces one full recompute).
+
+### GC mark: `full` vs `diff` (§11 "Compliance and performance")
+
+`cargo test --release -p constellation-engine --lib
+gc::tests::bench_gc_mark_full_versus_diff -- --ignored --nocapture`:
+in process, in-memory bucket, one verify-only `mark_chunks` per mode
+(tail, snapshot reconciliation, live roots, the `chunks/` LIST, snapshot
+roots). Tree: `/vol` = 1,000 directories × 100 one-chunk files (100,000
+files), built once; 300 snapshots of `/vol`, 20 random files rewritten
+before each. Host: EC2, AMD EPYC 9R45, 32 vCPU, 61 GB, Fedora Rawhide,
+kernel 7.3.0-rc4, shared with other agents' builds (load average 30–58
+during the run).
+
+| Mode | Mark time | Candidates |
+|---|---|---|
+| `diff` | **2.63 s** | 20 |
+| `full` | **567.2 s** (9 min 27 s; ≈1.89 s per snapshot) | 20 |
+| `diff` (again) | 2.57 s | — |
+| full / diff | **216×** | equal sets (asserted) |
+
+Tree build 7.6 s; 300 snapshots 37.4 s in total (slowest create 1.85 s).
+The full walk stayed under the 30-minute stop. These figures predate the
+review round (per-size deltas); the 300 × 100k run takes ≈ 10 min and
+was not repeated under that round's 10-minute foreground limit. A small
+run after it (2,000 files, 20 snapshots) gave diff 65 ms, full 630 ms,
+equal sets. The 30-minute stop now spawns the `full` mark as its own
+task and races it against a timer, so it fires even while the walk
+holds a worker thread (a plain `timeout` around the future could not);
+exercised with `CONSTELLATION_BENCH_FULL_LIMIT_S=0` on the small tree
+(stopped, 5-snapshot sample, extrapolated). M0b's figure for 50
+snapshots of a 10k-file tree was 31–36 s vs 0.6–1.2 s; at 6× the
+snapshots and 10× the tree the full walk grew ≈ 17× and the diff walk
+≈ 2–4× (one full walk of the chain's oldest snapshot plus 299 small
+diffs).
+
+**Post-fix confirmation** (the review's re-run after the per-size
+deltas, `CONSTELLATION_BENCH_FULL_LIMIT_S=440` to fit a 600 s limit):
+`diff` **2.53 s** (20 candidates); `full` stopped at 440 s, its
+5-snapshot sample giving ≈ 1.62 s per snapshot, ≈ 486 s extrapolated for
+300; tree build 4.9 s, 300 snapshots 33.9 s. Same order as the figures
+above (full ≈ 190×–220× diff).
+
+**Live-recheck visibility** (review round 2): `live_rechecks` and
+`live_recheck_full` are in the node-status `snapacct` block and on
+`/metrics` (`constellation_snapacct_live_rechecks`,
+`constellation_snapacct_live_recheck_full`), loaded from the stored set
+when the index opens (right after a restart); `snapshot space` prints an
+"estimate: the live flags are pending a recheck" line (`estimate_pending`
+in `SpaceBreakdown`) while one is pending. Index format stays 3 (main's
+is 2).
+
+### Decisions taken here (the brief left them open)
+
+- **The chunk list is a `list_chunks` flag on `snapshot.reclaim`**, not a
+  CLI flag: a test aid, documented as such in the schema; the CLI's
+  dry run is unchanged (the scenario checks its printed count against the
+  listed set's size).
+- **GC is driven over the control socket** (`gc.run` on `acct-a`) with
+  `CONSTELLATION_GC_HORIZON_S=0` and a 1 s lease TTL (the condemned-list
+  grace wait), as `gc-lifecycle` does; only this round's new
+  `gc/journal/` keys count, and the round's own report must agree with
+  them.
+- **The equality is on chunk sets, both ways**, never a subset; since the
+  review round the two nodes' byte totals must be equal too (finding 1's
+  canonical size), and each node's `awaiting GC` must equal the estimate.
+- **The bench is an `#[ignore]` release test in `gc.rs`** next to M0b's
+  smaller measurement, in process over an in-memory bucket, so it times
+  the walks and not S3 latency; knobs `CONSTELLATION_BENCH_*`, and a
+  `full` mark past 30 minutes is stopped and extrapolated from a 5-snapshot
+  sample (not needed at 300 × 100k; exercised on a small tree).
+
+### Not done
+
+- Per-root `USED` gauges on `/metrics` (Step 9) and the web UI's size
+  columns (M6): other milestones.
+- The `10s:1h` policy fio throughput item of §11 belongs to the
+  scheduler milestones (M3/M8), not M5.
+
+### Exit criteria (plan 32 Step 12, M5)
+
+- [x] Snapwalk-based index (`32-m5a`), built and maintained on a node
+      (`32-m5b`)
+- [x] Sizes in `snapshot ls`, `snapshot space`, `snapshot delete
+      --dry-run` (`32-m5c`)
+- [x] `--verify` against a brute force: 0 mismatches on both nodes,
+      before the deletion and after GC (`snapacct`)
+- [x] The dry-run reclaim set equals what GC deletes, exactly: 15 = 15
+      chunks, same hashes (`snapacct`, three runs in a row; other seeds
+      17, 31, 41)
+- [x] GC **mark** time `full` vs `diff` at 300 snapshots × 100k files:
+      567 s vs 2.6 s
+- [x] Full CONVENTIONS gates (below)
+
+### Gates (`32-m5d` worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m5d`)
+
 | Command | Result |
 |---|---|
 | `cargo fmt --all` | no diff (`--check` exit 0) |
@@ -33032,6 +33253,31 @@ answers only — no retention or accounting arithmetic in the page.
 | `cargo build --release --workspace` | exit 0 |
 | `bash tests/webui-headless.sh` / `make webui-check` (`CHROME_BIN` = Chromium 124.0.6367.78 Alpine Linux from `zenika/alpine-chrome` in docker, host network: the host has no Chrome) | PASS (14 DOM checks, no JS error, screenshot written) |
 | `target/release/harness run web-ui-smoke web-fleet` | ALL SCENARIOS PASSED (2/2) |
+
+### Review fix round
+
+| Finding | Outcome |
+|---|---|
+| Must-fix 1: O(index) recompute on every refresh of a never-settled node | Fixed (finding 2 above): full recheck deferred to a settled moment, diff refresh continues; regression test over 25 rounds plus the 5-round probe |
+| Should-fix 1: unbounded in-memory oracle set, lost on restart | Fixed: bounded (collapses to full past 50,000), merged into `aux/live_recheck` after each operation with an in-flight marker; restart test |
+| Should-fix 2: `--verify` adopted the index's sizes | Fixed: per-hash sizes from the walk, the largest checked per chunk by name; corrupted-size test |
+| Should-fix 3: order-dependent size | Fixed by the canonical rule (largest derived size); plan §6.1/§6.2/§6.3 amended; scenario asserts equal bytes on both nodes |
+| Should-fix 4: `list_chunks` for viewers, unbounded | Fixed: operator role, refused past 100,000 chunks without building more; tests for both |
+| Nits | Bench stop branch fixed and exercised; "GC round time" → mark time; comment on journal entries under other rules; the stored recheck set is no longer drained before its rereads (a failed reread loses nothing) |
+
+Gates (fix round; `CARGO_TARGET_DIR` unset; harness prefix `m5dfix`):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p constellation-engine` | 493 + 1 passed, 0 failed (8 ignored) |
+| `cargo test` of every other package (model's ten test binaries in `--release`) | all passed, 0 failed |
+| `cargo test --release -p constellation-engine --lib snapacct::tests::model_agrees_with_brute_force_heavy -- --ignored` | passed (200 seeds × 400 steps; 21,100 creates holding one hash at two sizes, 4,858 size changes in a chain) |
+| `cargo test --release -p constellation-engine --lib snapacct::service_tests::model_agrees_with_brute_force_heavy -- --ignored` | passed |
+| `cargo build --release --workspace`; `bash tests/smoke.sh` | exit 0; SMOKE TEST PASSED |
+| `target/release/harness run snapacct --seed N`, N = 42, 7, 1234, 99999, then 42 twice more | all PASSED; sets **and** bytes equal on both nodes; journal = dry run (15, 17, 31, 41 chunks) |
+| `target/release/harness run gc-lifecycle snapshot-lifecycle snapshot-churn web-ui-smoke` | ALL SCENARIOS PASSED |
+| `tests/integration.sh`, the full harness matrix, compliance | not re-run in this round (over the 10-minute foreground limit, background jobs not allowed) |
 
 ## Plan 37 K3a — Node service: stage, publish, stats (review fix round)
 
@@ -33967,3 +34213,12 @@ conflicts, then the review's findings.
   d, `p19`). Separate engine chunk.
 - The nightly `transport-matrix` job is dormant until a `fuse-uring`
   runner is registered and `FUSE_URING_RUNNER=true` is set.
+
+| `cargo test --workspace` (one run, output to a log polled in 10-minute slices) | exit 0: 83 test suites (incl. doctests), **2131 passed, 0 failed**, 45 ignored |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `tests/integration.sh` body (port 4566 held by another agent's floci `32-m3a-…-floci-1`; reused with the script's `AWS_*`, own prefix) | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run snapacct` × 3 in a row | **PASSED** (12.1 s, 11.6 s, 9.6 s), 15 = 15 chunks each time |
+| `target/release/harness run --shard 1/2` | 93 PASSED, 1 SKIPPED (`transport-abort-while-armed`: release binary built without the `io-uring` feature), 0 FAILED |
+| `target/release/harness run --shard 2/2` | 89 PASSED, **3 FAILED**: `fio-blips` (known: fsync EIO after an 800 ms S3 cut; PASSED rerun alone, 6.5 s), `lock-failover` ("contender flock: no locks available (ENOLCK)"; PASSED rerun alone, 36 s), `ack-s3-failover` (known: the test assumes B wins the takeover; FAILED again alone the same way, `holder: 3`). This chunk touches no lock, failover or fio path |
+| `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed**, COMPLIANCE TEST PASSED (baseline: 0 known failures); `SMOKE_IMAGE=m5d-smoke:local`, a `/tmp` override dropping floci's host port (4566 held by another agent) |

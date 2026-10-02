@@ -695,6 +695,8 @@ impl EngineControl {
                     verify_mismatches: s.verify_mismatches.load(Relaxed),
                     stalled_chains: s.stalled_chains.load(Relaxed),
                     refreshes_deferred: s.refreshes_deferred.load(Relaxed),
+                    live_rechecks: s.live_rechecks.load(Relaxed),
+                    live_recheck_full: s.live_recheck_full.load(Relaxed),
                     passes: s.passes.load(Relaxed),
                     errors: s.errors.load(Relaxed),
                     last_error: s.last_error.lock().ok().and_then(|g| g.clone()),

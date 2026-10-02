@@ -2,7 +2,7 @@
 //!
 //! The chunk entry is the one record per indexed chunk, so it is encoded
 //! by hand (LEB128 varints, the open sentinel stored as `0`) to keep it
-//! near its information content: a one-run entry is 6–12 bytes of value.
+//! near its information content: a one-run entry is 7–13 bytes of value.
 //! Everything else is per snapshot or per chain and uses postcard.
 //!
 //! Keys are fixed-width big-endian so that lexicographic order is numeric
@@ -28,7 +28,7 @@ use smallvec::SmallVec;
 
 /// Bumped whenever any encoding below changes: a mismatch on open wipes
 /// the index and it is rebuilt from replicated state.
-pub(super) const FORMAT: u32 = 2;
+pub(super) const FORMAT: u32 = 3;
 
 pub(super) const META_HEADER: &[u8] = b"header";
 pub(super) const META_NEXT_CHAIN: &[u8] = b"next_chain";
@@ -38,6 +38,9 @@ pub(super) const META_FS: &[u8] = b"fs";
 /// references it, and its runs (see the module docs for the invariant).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkEntry {
+    /// The size the chunk counts at everywhere: the largest of its runs'
+    /// (plan 32 §6.1), so a pure function of which snapshots hold it at
+    /// which sizes, whatever order they were applied in.
     pub size: u64,
     pub live: bool,
     pub runs: SmallVec<[Run; 1]>,
@@ -111,7 +114,9 @@ fn get_u32(input: &mut &[u8]) -> Result<u32, SnapAcctError> {
     u32::try_from(get_varint(input)?).map_err(|_| SnapAcctError::Corrupt("u32 out of range".into()))
 }
 
-/// `size, live, n, n × (chain, first, last + 1 | 0 = open, occ)`.
+/// `size, live, n, n × (chain, first, last + 1 | 0 = open, occ, size −
+/// run size)`: a run's size is stored below the entry's (the largest), so
+/// the usual one-size entry spends one byte on it.
 pub(super) fn encode_chunk(entry: &ChunkEntry) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + 8 * entry.runs.len());
     put_varint(&mut out, entry.size);
@@ -122,6 +127,11 @@ pub(super) fn encode_chunk(entry: &ChunkEntry) -> Vec<u8> {
         put_varint(&mut out, u64::from(run.first));
         put_varint(&mut out, u64::from(run.last.wrapping_add(1)));
         put_varint(&mut out, run.occ);
+        let below = entry
+            .size
+            .checked_sub(run.size)
+            .expect("an entry's size is its runs' largest");
+        put_varint(&mut out, below);
     }
     out
 }
@@ -140,11 +150,15 @@ pub(super) fn decode_chunk(mut input: &[u8]) -> Result<ChunkEntry, SnapAcctError
         let first = get_u32(input)?;
         let last = get_u32(input)?.wrapping_sub(1);
         let occ = get_varint(input)?;
+        let run_size = size
+            .checked_sub(get_varint(input)?)
+            .ok_or_else(|| SnapAcctError::Corrupt("run larger than its chunk".into()))?;
         runs.push(Run {
             chain,
             first,
             last,
             occ,
+            size: run_size,
         });
     }
     if !input.is_empty() || live > 1 {
@@ -276,11 +290,12 @@ mod tests {
                 chain: 3,
                 first: 17,
                 last: OPEN,
-                occ: 2
+                occ: 2,
+                size: 4 << 20,
             }],
         };
         let bytes = encode_chunk(&entry);
-        assert!(bytes.len() <= 10, "{} bytes", bytes.len());
+        assert!(bytes.len() <= 11, "{} bytes", bytes.len());
         assert_eq!(decode_chunk(&bytes).unwrap(), entry);
         let entry = ChunkEntry {
             size: 1,
@@ -290,18 +305,22 @@ mod tests {
                     chain: 0,
                     first: 0,
                     last: 0,
-                    occ: 0
+                    occ: 0,
+                    size: 1,
                 },
                 Run {
                     chain: u32::MAX - 1,
                     first: 5,
                     last: u32::MAX - 1,
-                    occ: 0
+                    occ: 0,
+                    size: 0,
                 },
             ],
         };
         assert_eq!(decode_chunk(&encode_chunk(&entry)).unwrap(), entry);
         assert!(decode_chunk(&[1, 2]).is_err());
+        // A run's size is stored below the entry's; above it is corrupt.
+        assert!(decode_chunk(&[1, 0, 1, 0, 0, 0, 0, 2]).is_err());
         assert!(decode_chunk(&[1, 0, 0, 9]).is_err());
     }
 }

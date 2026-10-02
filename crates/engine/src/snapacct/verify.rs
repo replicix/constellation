@@ -7,6 +7,17 @@
 //! every number of plan 32 §6.1 is computed from those sets by its
 //! definition. O(Σ snapshot sizes): an oracle for tests and for an
 //! operator's "do I trust these numbers", never a query path.
+//!
+//! **Chunk sizes.** A chunk's logical size is derived per occurrence,
+//! `min(chunk_size, file_len − offset)`, and one hash can occur at
+//! different sizes: a short tail chunk whose file was later extended past
+//! it (or cut inside it by a truncate that kept its hash) occurs again
+//! with the same hash at another size. Plan 32 §6.1 counts a chunk at the
+//! **largest** size it occurs at in any snapshot — a pure function of the
+//! snapshots, whatever order an index met them in. The walk records every
+//! size each hash occurs at, counts every number at the largest, and
+//! reports any chunk whose indexed size is not that largest one by name
+//! (the sums alone could hide two errors that cancel).
 
 use super::service::{desired_chains, VerifyReport};
 use super::{Amount, SnapAcct};
@@ -26,8 +37,11 @@ const MAX_DETAILS: usize = 200;
 pub(crate) struct Walked {
     pub id: String,
     pub dir: u64,
-    /// Distinct chunks and their plaintext size.
+    /// Distinct chunks and the largest plaintext size each occurs at
+    /// here.
     pub chunks: HashMap<ChunkHash, u64>,
+    /// Every size each chunk occurs at here.
+    pub sizes: HashMap<ChunkHash, BTreeSet<u64>>,
     pub lsize: u64,
 }
 
@@ -38,7 +52,10 @@ pub(crate) struct BruteForce {
     pub live: HashSet<ChunkHash>,
     /// Which snapshots (indices into `snapshots`) hold each chunk.
     holders: HashMap<ChunkHash, BTreeSet<usize>>,
+    /// Each chunk's size: the largest it occurs at in any snapshot.
     sizes: HashMap<ChunkHash, u64>,
+    /// Every size each chunk occurs at, over all snapshots.
+    seen_sizes: HashMap<ChunkHash, BTreeSet<u64>>,
 }
 
 /// Exact numbers of one snapshot.
@@ -59,11 +76,15 @@ impl BruteForce {
         let mut snapshots = Vec::new();
         for (dir, chain) in desired_chains(meta)? {
             for snapshot in chain {
-                let (chunk_sizes, lsize) = walk(tree, chunks, snapshot.root).await?;
+                let (sizes, lsize) = walk(tree, chunks, snapshot.root).await?;
                 snapshots.push(Walked {
                     id: snapshot.id,
                     dir,
-                    chunks: chunk_sizes,
+                    chunks: sizes
+                        .iter()
+                        .map(|(hash, sizes)| (*hash, *sizes.last().expect("a size per chunk")))
+                        .collect(),
+                    sizes,
                     lsize,
                 });
             }
@@ -79,18 +100,23 @@ impl BruteForce {
             }
         }
         let mut holders: HashMap<ChunkHash, BTreeSet<usize>> = HashMap::new();
-        let mut sizes = HashMap::new();
+        let mut seen_sizes: HashMap<ChunkHash, BTreeSet<u64>> = HashMap::new();
         for (i, snapshot) in snapshots.iter().enumerate() {
-            for (hash, size) in &snapshot.chunks {
+            for (hash, sizes) in &snapshot.sizes {
                 holders.entry(*hash).or_default().insert(i);
-                sizes.entry(*hash).or_insert(*size);
+                seen_sizes.entry(*hash).or_default().extend(sizes);
             }
         }
+        let sizes = seen_sizes
+            .iter()
+            .map(|(hash, sizes)| (*hash, *sizes.last().expect("a size per chunk")))
+            .collect();
         Ok(BruteForce {
             snapshots,
             live,
             holders,
             sizes,
+            seen_sizes,
         })
     }
 
@@ -105,7 +131,8 @@ impl BruteForce {
             lsize: snapshot.lsize,
             ..Exact::default()
         };
-        for (hash, size) in &snapshot.chunks {
+        for hash in snapshot.chunks.keys() {
+            let size = self.sizes[hash];
             out.refer += size;
             if prev.is_none_or(|p| !p.chunks.contains_key(hash)) {
                 out.written += size;
@@ -227,6 +254,34 @@ impl BruteForce {
                 ));
             }
         }
+        // Per chunk, so a mismatch in the sums names its chunks: every
+        // chunk a snapshot holds is indexed, with the replica's liveness,
+        // at the largest size it occurs at.
+        let mut hashes: Vec<&ChunkHash> = self.holders.keys().collect();
+        hashes.sort_unstable_by_key(|hash| hash.0);
+        for hash in hashes {
+            let live = self.live.contains(hash);
+            let Some(entry) = ix.chunk_entry(hash)? else {
+                miss(format!("chunk {} is not indexed", hash.to_hex()));
+                continue;
+            };
+            if entry.live != live {
+                miss(format!(
+                    "chunk {}: live index {} ≠ brute force {live}",
+                    hash.to_hex(),
+                    entry.live
+                ));
+            }
+            if entry.size != self.sizes[hash] {
+                miss(format!(
+                    "chunk {}: size index {} ≠ brute force {} (the largest of {:?})",
+                    hash.to_hex(),
+                    entry.size,
+                    self.sizes[hash],
+                    self.seen_sizes[hash]
+                ));
+            }
+        }
         let fs = ix.fs_breakdown()?;
         let (unique, shared, with_live) = self.buckets();
         for (what, index, brute) in [
@@ -253,13 +308,13 @@ impl BruteForce {
     }
 }
 
-/// One snapshot's distinct chunks with their sizes, and its `LSIZE`, by
-/// a full walk with the tree reader.
+/// One snapshot's distinct chunks with every size each occurs at, and its
+/// `LSIZE`, by a full walk with the tree reader.
 async fn walk(
     tree: &TreeAccess,
     chunks: &ChunkStore,
     snapshot: SnapshotRoot,
-) -> Result<(HashMap<ChunkHash, u64>, u64)> {
+) -> Result<(HashMap<ChunkHash, BTreeSet<u64>>, u64)> {
     let SnapshotRoot { root, ino, .. } = snapshot;
     // `(size, manifest)` once per name.
     let files = tree
@@ -281,7 +336,7 @@ async fn walk(
             Ok(files)
         })
         .await?;
-    let mut out = HashMap::new();
+    let mut out: HashMap<ChunkHash, BTreeSet<u64>> = HashMap::new();
     let mut lsize = 0;
     for (size, manifest) in files {
         lsize += size;
@@ -298,12 +353,12 @@ async fn walk(
             ChunkInfo::Inline(list) => list.clone(),
             ChunkInfo::Spilled(spill) => {
                 let blob = chunks.get_chunk(spill).await?;
-                out.entry(*spill).or_insert(blob.len() as u64);
+                out.entry(*spill).or_default().insert(blob.len() as u64);
                 decode_chunk_list(&blob)?
             }
         };
         for (index, hash) in list {
-            out.entry(hash).or_insert(at(index));
+            out.entry(hash).or_default().insert(at(index));
         }
     }
     Ok((out, lsize))

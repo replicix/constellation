@@ -22,14 +22,32 @@
 //! *existing* ordinals.
 //!
 //! A chunk's presence in a chain is stored as **runs**, `(chain, first,
-//! last | OPEN, occ)`. The invariant:
+//! last | OPEN, occ, size)`, one set per derived size (see "Sizes"). The
+//! invariant, per size:
 //!
-//! > Within a chain, a chunk is present in exactly the snapshots whose
-//! > ordinals fall in one of its runs. Runs are maximal (between two runs
-//! > of one chain there is an existing snapshot without the chunk), their
-//! > endpoints are existing snapshots, and a run is **open** exactly when
-//! > the chunk is present in the chain's newest snapshot (the head). `occ`
-//! > is the chunk's occurrence count at the head, for the open run only.
+//! > Within a chain, a chunk is present at a size in exactly the snapshots
+//! > whose ordinals fall in one of its runs of that size. Runs are maximal
+//! > (between two runs of one chain and size there is an existing
+//! > snapshot without the chunk at that size), their endpoints are
+//! > existing snapshots, and a run is **open** exactly when the chunk is
+//! > present at its size in the chain's newest snapshot (the head). `occ`
+//! > is the chunk's occurrence count at that size at the head, for open
+//! > runs only.
+//!
+//! ## Sizes
+//!
+//! A chunk's size is derived per occurrence (`min(chunk_size, file_len −
+//! offset)`), and one hash can occur at two sizes: a tail chunk whose file
+//! was extended past it, or cut inside it, keeps its hash. The chunk
+//! counts at the **largest** size any snapshot holds it at (plan 32
+//! §6.1), so every number is a function of the snapshots alone, whatever
+//! order the index applied them in. Hence runs per size: the chunk is in a
+//! snapshot when any of its runs covers it (`REFER`, `WRITTEN`,
+//! ownership and `reclaim` look at that union), and its size is its runs'
+//! largest — which can only change when a run of a new largest size opens
+//! or the last run of the largest goes. The operations below work at the
+//! entry's size so far; `ops::Ctx::flush` then moves every snapshot
+//! holding the chunk to the new size.
 //!
 //! Applying a new snapshot's deltas is then local: a count crossing zero
 //! upwards opens a run at the new ordinal, one crossing downwards closes
@@ -138,16 +156,22 @@ pub const MARKER: &str = "SNAPACCT";
 /// The fjall database, inside the index directory.
 const DB_DIR: &str = "db";
 
-/// One maximal interval of a chunk's presence in a chain.
+/// One maximal interval of a chunk's presence in a chain at one derived
+/// size. A chunk occurs at one size almost always; one that occurs at
+/// two (a tail chunk whose file was extended past it) has a run per size,
+/// and runs of different sizes may overlap. The chunk is in a snapshot
+/// when any of its runs covers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
     pub chain: u32,
     pub first: u32,
-    /// The last snapshot containing the chunk, or [`OPEN`] while the
-    /// chain's head still does.
+    /// The last snapshot containing the chunk at this size, or [`OPEN`]
+    /// while the chain's head still does.
     pub last: u32,
-    /// Occurrences at the head; 0 for a closed run.
+    /// Occurrences at this size at the head; 0 for a closed run.
     pub occ: u64,
+    /// The derived plaintext size of these occurrences.
+    pub size: u64,
 }
 
 impl Run {
@@ -704,6 +728,19 @@ impl SnapAcct {
     /// D, plus that range's snapshot records. Unknown snapshots are
     /// refused.
     pub fn reclaim(&self, snapshots: &[(u32, u32)]) -> Result<Amount> {
+        Ok(self.reclaim_listed(snapshots, None)?.0)
+    }
+
+    /// [`Self::reclaim`], and with `list_max` the hashes of the chunks it
+    /// counted, sorted: a test aid (the `snapacct` harness scenario
+    /// compares them with the chunks GC journals as deleted). The list is
+    /// `None` when more than `list_max` chunks count: it is dropped as
+    /// soon as it would pass that, so it never holds more.
+    pub fn reclaim_listed(
+        &self,
+        snapshots: &[(u32, u32)],
+        list_max: Option<usize>,
+    ) -> Result<(Amount, Option<Vec<ChunkHash>>)> {
         let r = self.db.read_tx();
         let mut by_chain: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for &(chain, ord) in snapshots {
@@ -760,6 +797,7 @@ impl SnapAcct {
             );
         }
         let mut out = Amount::default();
+        let mut listed = list_max.map(|_| Vec::new());
         for hash in candidates {
             let Some(v) = r.get(&self.chunk, hash.0)? else {
                 return Err(SnapAcctError::Corrupt(format!(
@@ -784,9 +822,19 @@ impl SnapAcct {
             if covered {
                 out.bytes += entry.size;
                 out.chunks += 1;
+                if let Some(list) = &mut listed {
+                    if list_max.is_some_and(|max| list.len() >= max) {
+                        listed = None;
+                    } else {
+                        list.push(hash);
+                    }
+                }
             }
         }
-        Ok(out)
+        if let Some(listed) = &mut listed {
+            listed.sort_unstable_by_key(|hash| hash.0);
+        }
+        Ok((out, listed))
     }
 
     /// Every indexed chunk, in hash order. O(index): `--verify` and the
@@ -954,6 +1002,16 @@ impl SnapAcct {
         Ok(())
     }
 
+    /// Overwrite one chunk entry as it is, bypassing every rule: tests
+    /// corrupt the index with it to see `--verify` notice.
+    #[cfg(test)]
+    pub(crate) fn overwrite_chunk_entry(&self, hash: &ChunkHash, entry: &ChunkEntry) -> Result<()> {
+        let mut tx = self.db.write_tx();
+        tx.insert(&self.chunk, hash.0, encode_chunk(entry));
+        tx.commit()?;
+        Ok(())
+    }
+
     /// A full scan checking every structural invariant and recomputing
     /// every counter from the chunk entries: the index's self-check
     /// (tests, `--verify`). O(index).
@@ -968,10 +1026,10 @@ impl SnapAcct {
 /// Occurrences as the all-positive deltas [`SnapAcct::apply_first`]
 /// takes.
 pub fn first_deltas(occurrences: &Occurrences) -> impl Iterator<Item = Delta> + '_ {
-    occurrences.iter().map(|(hash, occurrence)| Delta {
+    occurrences.iter_sized().map(|(hash, size, count)| Delta {
         hash: *hash,
-        delta: occurrence.count as i64,
-        size_bytes: occurrence.size_bytes,
+        delta: count as i64,
+        size_bytes: size,
     })
 }
 

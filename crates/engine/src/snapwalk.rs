@@ -18,7 +18,8 @@
 //! between the two roots and not their size. GC protects
 //! `first ∪ ⋃ additions(step)`; the space-accounting index (plan 32
 //! §6.2) applies the deltas to per-chunk occurrence counts, which is why
-//! a delta carries its plaintext size and why the counts are exact
+//! occurrences and deltas are kept per chunk *and plaintext size* (one
+//! hash can occur at two derived sizes) and why the counts are exact
 //! rather than "at least".
 //!
 //! ## Exact, file by file
@@ -134,46 +135,64 @@ fn spill_cache_bytes_from_env() -> u64 {
 
 // ------------------------------------------------------------- results
 
-/// One chunk object's occurrences in a snapshot.
+/// One chunk object's occurrences in a snapshot, summed over sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Occurrence {
     /// How many times the subtree references it: once per in-subtree
     /// link of every file naming it, once per chunk index naming it.
     pub count: u64,
-    /// Plaintext bytes per occurrence: `min(chunk_size, file_len −
-    /// offset)` for a data chunk, the encoded length for a spilled list.
-    /// Taken from whichever occurrence was counted first. Usually every
+    /// The largest plaintext size of its occurrences (see
+    /// [`Occurrences::sizes`]): `min(chunk_size, file_len − offset)` for a
+    /// data chunk, the encoded length for a spilled list. Usually every
     /// occurrence agrees, but not always: a short tail chunk whose file
-    /// was later extended (or hole-punched around) can occur again at a
-    /// larger size with the same hash.
+    /// was later extended (or cut inside it by a truncate that kept it)
+    /// occurs again at another size with the same hash. Plan 32 §6.1
+    /// counts a chunk at the largest size it occurs at anywhere.
     pub size_bytes: u64,
 }
 
-/// The multiset of chunk objects a snapshot keeps alive.
+/// `(size, count)` pairs of one hash, sorted by size, counts non-zero.
+type BySize = smallvec::SmallVec<[(u64, u64); 1]>;
+
+/// The multiset of chunk objects a snapshot keeps alive, per plaintext
+/// size: the same hash at two derived sizes is two entries
+/// ([`Occurrence::size_bytes`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Occurrences {
-    entries: HashMap<ChunkHash, Occurrence>,
+    entries: HashMap<ChunkHash, BySize>,
     /// `LSIZE` (plan 32 §6.1): Σ apparent file size under the directory,
     /// once per in-subtree name, like the chunk occurrences.
     lsize: u64,
 }
 
+fn summed(sizes: &BySize) -> Occurrence {
+    Occurrence {
+        count: sizes.iter().map(|&(_, count)| count).sum(),
+        size_bytes: sizes.iter().map(|&(size, _)| size).max().unwrap_or(0),
+    }
+}
+
 impl Occurrences {
     fn add(&mut self, hash: ChunkHash, size_bytes: u64, count: u64) {
-        let entry = self.entries.entry(hash).or_insert(Occurrence {
-            count: 0,
-            size_bytes,
-        });
-        entry.count += count;
+        let sizes = self.entries.entry(hash).or_default();
+        match sizes.binary_search_by_key(&size_bytes, |&(size, _)| size) {
+            Ok(i) => sizes[i].1 += count,
+            Err(i) => sizes.insert(i, (size_bytes, count)),
+        }
     }
 
-    /// How many times `hash` occurs (0 when it does not).
+    /// How many times `hash` occurs, at any size (0 when it does not).
     pub fn count(&self, hash: &ChunkHash) -> u64 {
-        self.entries.get(hash).map_or(0, |entry| entry.count)
+        self.get(hash).map_or(0, |occurrence| occurrence.count)
     }
 
-    pub fn get(&self, hash: &ChunkHash) -> Option<&Occurrence> {
-        self.entries.get(hash)
+    pub fn get(&self, hash: &ChunkHash) -> Option<Occurrence> {
+        self.entries.get(hash).map(summed)
+    }
+
+    /// `(size, count)` of `hash`'s occurrences per size, sorted by size.
+    pub fn sizes(&self, hash: &ChunkHash) -> &[(u64, u64)] {
+        self.entries.get(hash).map_or(&[], |sizes| sizes.as_slice())
     }
 
     /// Distinct chunk objects.
@@ -185,8 +204,18 @@ impl Occurrences {
         self.entries.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ChunkHash, &Occurrence)> {
-        self.entries.iter()
+    /// Every chunk object, summed over sizes.
+    pub fn iter(&self) -> impl Iterator<Item = (&ChunkHash, Occurrence)> {
+        self.entries
+            .iter()
+            .map(|(hash, sizes)| (hash, summed(sizes)))
+    }
+
+    /// Every `(hash, size, count)`.
+    pub fn iter_sized(&self) -> impl Iterator<Item = (&ChunkHash, u64, u64)> {
+        self.entries
+            .iter()
+            .flat_map(|(hash, sizes)| sizes.iter().map(move |&(size, count)| (hash, size, count)))
     }
 
     pub fn hashes(&self) -> impl Iterator<Item = &ChunkHash> {
@@ -212,25 +241,27 @@ impl Occurrences {
                 )
             })?;
         for delta in deltas.iter() {
-            let have = self.count(&delta.hash) as i64;
+            let sizes = self.entries.entry(delta.hash).or_default();
+            let at = sizes.binary_search_by_key(&delta.size_bytes, |&(size, _)| size);
+            let have = at.map_or(0, |i| sizes[i].1) as i64;
             let now = have + delta.delta;
             if now < 0 {
                 bail!(
-                    "chunk {} would occur {now} times after a delta of {}",
+                    "chunk {} would occur {now} times at {} bytes after a delta of {}",
                     delta.hash.to_hex(),
+                    delta.size_bytes,
                     delta.delta
                 );
             }
-            if now == 0 {
+            match (at, now) {
+                (Ok(i), 0) => {
+                    sizes.remove(i);
+                }
+                (Ok(i), now) => sizes[i].1 = now as u64,
+                (Err(i), now) => sizes.insert(i, (delta.size_bytes, now as u64)),
+            }
+            if sizes.is_empty() {
                 self.entries.remove(&delta.hash);
-            } else {
-                self.entries.insert(
-                    delta.hash,
-                    Occurrence {
-                        count: now as u64,
-                        size_bytes: delta.size_bytes,
-                    },
-                );
             }
         }
         Ok(())
@@ -243,18 +274,21 @@ impl Occurrences {
             lsize_delta: self.lsize as i64 - base.lsize as i64,
             ..Deltas::default()
         };
-        for (hash, occurrence) in &self.entries {
-            deltas.add(*hash, occurrence.size_bytes, occurrence.count as i64);
+        for (hash, size, count) in self.iter_sized() {
+            deltas.add(*hash, size, count as i64);
         }
-        for (hash, occurrence) in &base.entries {
-            deltas.add(*hash, occurrence.size_bytes, -(occurrence.count as i64));
+        for (hash, size, count) in base.iter_sized() {
+            deltas.add(*hash, size, -(count as i64));
         }
         deltas.prune();
         deltas
     }
 }
 
-/// One chunk object's change in occurrence count between two snapshots.
+/// One chunk object's change in occurrence count at one plaintext size
+/// between two snapshots. A hash whose occurrences change size (a tail
+/// chunk whose file was extended past it) has one delta per size: `−1`
+/// at the old, `+1` at the new.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Delta {
     pub hash: ChunkHash,
@@ -264,11 +298,11 @@ pub struct Delta {
     pub size_bytes: u64,
 }
 
-/// Occurrence changes from one snapshot of a chain to the next, in hash
-/// order.
+/// Occurrence changes from one snapshot of a chain to the next, per hash
+/// and size, in hash order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Deltas {
-    entries: BTreeMap<ChunkHash, (i64, u64)>,
+    entries: BTreeMap<(ChunkHash, u64), i64>,
     /// `LSIZE[next] − LSIZE[prev]`.
     pub lsize_delta: i64,
     /// Set when the step could not be computed from the diff and was
@@ -279,33 +313,35 @@ pub struct Deltas {
 
 impl Deltas {
     fn add(&mut self, hash: ChunkHash, size_bytes: u64, delta: i64) {
-        let entry = self.entries.entry(hash).or_insert((0, size_bytes));
-        entry.0 += delta;
+        *self.entries.entry((hash, size_bytes)).or_insert(0) += delta;
     }
 
     fn prune(&mut self) {
-        self.entries.retain(|_, (delta, _)| *delta != 0);
+        self.entries.retain(|_, delta| *delta != 0);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Delta> + '_ {
         self.entries
             .iter()
-            .map(|(hash, (delta, size_bytes))| Delta {
-                hash: *hash,
-                delta: *delta,
-                size_bytes: *size_bytes,
+            .map(|(&(hash, size_bytes), &delta)| Delta {
+                hash,
+                delta,
+                size_bytes,
             })
     }
 
-    /// The chunk objects that gained occurrences: what GC adds to a
-    /// chain's protected set.
+    /// The chunk objects that gained occurrences at some size: what GC
+    /// adds to a chain's protected set. A hash that only changed size is
+    /// in it too, which is harmless: it was in the previous snapshot, so
+    /// it is protected already.
     pub fn additions(&self) -> impl Iterator<Item = &ChunkHash> {
         self.entries
             .iter()
-            .filter(|(_, (delta, _))| *delta > 0)
-            .map(|(hash, _)| hash)
+            .filter(|(_, delta)| **delta > 0)
+            .map(|((hash, _), _)| hash)
     }
 
+    /// `(hash, size)` entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }

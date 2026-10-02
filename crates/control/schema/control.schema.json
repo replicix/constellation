@@ -5053,6 +5053,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "chunk_hashes": {
+          "default": null,
+          "description": "With `snapshot.reclaim`'s `list_chunks` (a test aid), the counted\nchunks' hashes (lowercase hex, sorted); `null` otherwise and while\nbuilding.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "chunks": {
           "format": "uint64",
           "minimum": 0,
@@ -5479,6 +5490,18 @@
             "string",
             "null"
           ]
+        },
+        "live_recheck_full": {
+          "default": false,
+          "description": "A full recompute of the live flags is pending a settled moment:\nthe space figures are an estimate until it runs.",
+          "type": "boolean"
+        },
+        "live_rechecks": {
+          "default": 0,
+          "description": "Chunks whose live flags the next settled refresh reads again.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "maintaining": {
           "default": false,
@@ -6740,6 +6763,11 @@
     "SnapshotReclaimParams": {
       "description": "`snapshot.reclaim`: what deleting exactly the snapshots `selectors`\nname (as `snapshot.resolve` resolves them) would give back.",
       "properties": {
+        "list_chunks": {
+          "default": false,
+          "description": "A test aid: also return the hashes of the chunks the estimate\ncounts (`ReclaimEstimate::chunk_hashes`), so a test can compare the\nestimate with what GC deletes afterwards. Needs the operator role;\nrefused when the estimate counts more than 100,000 chunks (one\n64-character string each, inside one reply frame).",
+          "type": "boolean"
+        },
         "selectors": {
           "items": {
             "type": "string"
@@ -7116,6 +7144,11 @@
           "maximum": 255,
           "minimum": 0,
           "type": "integer"
+        },
+        "estimate_pending": {
+          "default": false,
+          "description": "A recheck of the live flags is pending a settled moment (the\nreplica never was at one commit's state): the \"shared with live\"\nand \"reclaimable\" figures are an estimate until it runs.",
+          "type": "boolean"
         },
         "gc_horizon_ms": {
           "description": "How long GC keeps freed chunks (`CONSTELLATION_GC_HORIZON_S`):\nwhat \"awaiting GC\" waits for.",
@@ -8083,6 +8116,8 @@
             "index_bytes": 0,
             "indexed_chunks": 0,
             "last_error": null,
+            "live_recheck_full": false,
+            "live_rechecks": 0,
             "maintaining": false,
             "mode": "",
             "passes": 0,

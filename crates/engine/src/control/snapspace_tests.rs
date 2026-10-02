@@ -6,9 +6,11 @@
 //! index is ready, while it is building, and with accounting off.
 
 use super::ops::tests::{fixture_with, Fixture};
+use super::snapspace::LIST_CHUNKS_MAX;
 use super::*;
 use crate::snapacct::{SnapAcctConfig, SnapAcctMode, SnapAnswer};
 use constellation_control::dispatch_in_process;
+use constellation_control::proto::ErrorKind;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -162,6 +164,74 @@ fn sizes_reclaim_and_space_are_the_indexs_numbers() {
     assert_eq!(est["bytes"], want.bytes, "{est}");
     assert_eq!(est["chunks"], want.chunks, "{est}");
     assert_eq!(est["building"], false);
+    assert!(
+        est["chunk_hashes"].is_null(),
+        "listed only on request: {est}"
+    );
+    // The `list_chunks` test aid: the counted chunks, sorted, one per
+    // chunk of the same estimate.
+    let listed = call(
+        &f,
+        "snapshot.reclaim",
+        json!({"selectors": ["/vol@a1%a2"], "list_chunks": true}),
+    )
+    .unwrap();
+    assert_eq!(listed["chunks"], want.chunks, "{listed}");
+    let hashes: Vec<&str> = listed["chunk_hashes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h.as_str().unwrap())
+        .collect();
+    assert_eq!(hashes.len() as u64, want.chunks, "{listed}");
+    assert!(hashes.windows(2).all(|w| w[0] < w[1]), "{listed}");
+    assert!(hashes.iter().all(|h| h.len() == 64), "{listed}");
+    // Not for a viewer: the list costs one string per chunk.
+    let viewer = Arc::new(router(&f.svc).with_policy(
+        constellation_control::Policy::in_process_only().with_grant(
+            constellation_control::authz::Grant {
+                subject: constellation_control::authz::Subject::Device("viewer".into()),
+                role: constellation_control::Role::Viewer,
+            },
+        ),
+    ));
+    let as_viewer = |params: Value| {
+        f.rt.block_on(dispatch_in_process(
+            &viewer,
+            &Principal::Remote {
+                device: "viewer".into(),
+            },
+            "snapshot.reclaim",
+            params,
+        ))
+    };
+    let denied = as_viewer(json!({"selectors": ["/vol@a1%a2"], "list_chunks": true})).unwrap_err();
+    assert_eq!(denied.kind, ErrorKind::Denied, "{denied:?}");
+    let estimate = as_viewer(json!({"selectors": ["/vol@a1%a2"]})).unwrap();
+    assert_eq!(
+        estimate["chunks"], want.chunks,
+        "the estimate alone is a viewer's"
+    );
+    // Bounded: past the bound it refuses rather than list, and holds no
+    // more than the bound meanwhile.
+    let range: Vec<String> = f
+        .svc
+        .snapshot_resolve_rows(&["/vol@a1%a2".to_string()])
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    let svc = f.svc.clone();
+    let bound = want.chunks as usize - 1;
+    let over =
+        f.rt.block_on(async move {
+            tokio::task::spawn_blocking(move || svc.reclaim_listed_of(&range, Some(bound))).await
+        })
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(over.kind, ErrorKind::Invalid, "{over:?}");
+    assert!(over.message.contains("at most"), "{over:?}");
+    const { assert!(LIST_CHUNKS_MAX >= 100_000) };
     // f0's first content is only in a1 and a2 (rewritten before a3).
     assert!(want.bytes >= 300_000, "{want:?}");
     let a1_used = by_name(&listing, "a1")["used"].as_u64().unwrap();

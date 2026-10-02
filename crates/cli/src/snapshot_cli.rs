@@ -636,6 +636,12 @@ pub fn render_space(b: &api::SpaceBreakdown, now_ms: u64) -> String {
          more snapshots share is in no snapshot's USED (it becomes one snapshot's USED once \
          the others are deleted).\n",
     );
+    if b.estimate_pending {
+        out.push_str(
+            "estimate: the live flags are pending a recheck at a settled moment; \
+             \"shared with live\" and the reclaimable figures may be off until it runs.\n",
+        );
+    }
     out.push_str(&format!(
         "as of commit {} ({}) · logical bytes, pre-compression\n",
         b.as_of_seq,
@@ -1240,6 +1246,16 @@ mod tests {
             );
         }
 
+        let pending = api::SpaceBreakdown {
+            estimate_pending: true,
+            ..Default::default()
+        };
+        let text = render_space(&pending, 0);
+        assert!(
+            text.contains("estimate: the live flags are pending"),
+            "{text}"
+        );
+        assert!(!render_space(&b, 1_004_000).contains("estimate: the live flags"));
         let none = api::SpaceBreakdown {
             path: Some("/projects".into()),
             gc_horizon_ms: 36 * 3_600_000,

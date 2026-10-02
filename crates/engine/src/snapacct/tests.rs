@@ -29,6 +29,11 @@ fn hash(chunk: u32) -> ChunkHash {
     ChunkHash(*blake3::hash(&chunk.to_le_bytes()).as_bytes())
 }
 
+/// Occurrence counts by *key*. A key names a hash and a derived size: in
+/// the unit tests below every key is its own hash; in the [`World`] model
+/// key `k` and key `k + chunks` are the same hash at two sizes (a tail
+/// chunk met again after its file was extended or cut), see
+/// [`World::chunk`].
 type Content = BTreeMap<u32, u64>;
 
 const PARAMS: SnapAcctParams = SnapAcctParams {
@@ -69,6 +74,9 @@ struct World {
     _dir: tempfile::TempDir,
     now: Arc<AtomicU64>,
     rng: Rng,
+    /// Distinct hashes: keys `c` and `c + chunks` are hash `c`.
+    chunks: u32,
+    /// Per key: the derived size of an occurrence.
     sizes: Vec<u64>,
     chains: Vec<ModelChain>,
     live: BTreeSet<u32>,
@@ -83,23 +91,29 @@ struct World {
 }
 
 fn deltas(sizes: &[u64], from: &Content, to: &Content) -> Vec<Delta> {
+    deltas_of(sizes.len() as u32, sizes, from, to)
+}
+
+/// Deltas between two contents whose keys `k` and `k + chunks` share a
+/// hash: one delta per key, i.e. per hash and size.
+fn deltas_of(chunks: u32, sizes: &[u64], from: &Content, to: &Content) -> Vec<Delta> {
     let mut out = Vec::new();
-    for (&chunk, &occ) in to {
-        let was = from.get(&chunk).copied().unwrap_or(0);
+    for (&key, &occ) in to {
+        let was = from.get(&key).copied().unwrap_or(0);
         if occ != was {
             out.push(Delta {
-                hash: hash(chunk),
+                hash: hash(key % chunks),
                 delta: occ as i64 - was as i64,
-                size_bytes: sizes[chunk as usize],
+                size_bytes: sizes[key as usize],
             });
         }
     }
-    for (&chunk, &was) in from {
-        if !to.contains_key(&chunk) {
+    for (&key, &was) in from {
+        if !to.contains_key(&key) {
             out.push(Delta {
-                hash: hash(chunk),
+                hash: hash(key % chunks),
                 delta: -(was as i64),
-                size_bytes: sizes[chunk as usize],
+                size_bytes: sizes[key as usize],
             });
         }
     }
@@ -113,6 +127,7 @@ fn deltas(sizes: &[u64], from: &Content, to: &Content) -> Vec<Delta> {
 fn noisy(
     rng: &mut Rng,
     stats: &mut BTreeMap<&'static str, u64>,
+    chunks: u32,
     sizes: &[u64],
     mut ds: Vec<Delta>,
 ) -> Vec<Delta> {
@@ -129,12 +144,12 @@ fn noisy(
         tail.delta = x;
         ds.push(tail);
     } else {
-        let chunk = rng.below(sizes.len() as u64) as u32;
+        let key = rng.below(sizes.len() as u64) as u32;
         for d in [1, -1] {
             ds.push(Delta {
-                hash: hash(chunk),
+                hash: hash(key % chunks),
                 delta: d,
-                size_bytes: sizes[chunk as usize],
+                size_bytes: sizes[key as usize],
             });
         }
     }
@@ -148,12 +163,24 @@ impl World {
     fn new(seed: u64, chunks: u32) -> World {
         let (ix, dir, now) = open_temp();
         let mut rng = Rng(seed);
-        let sizes = (0..chunks).map(|_| 1 + rng.below(5000)).collect();
+        let mut sizes: Vec<u64> = (0..chunks).map(|_| 2 + rng.below(5000)).collect();
+        // Each hash's second size: larger (extended past) or smaller (cut
+        // inside), never equal.
+        for c in 0..chunks as usize {
+            let base = sizes[c];
+            let other = if rng.chance(50) {
+                base + 1 + rng.below(3000)
+            } else {
+                1 + rng.below(base - 1)
+            };
+            sizes.push(other);
+        }
         let mut world = World {
             ix,
             _dir: dir,
             now,
             rng,
+            chunks,
             sizes,
             chains: Vec::new(),
             live: BTreeSet::new(),
@@ -188,11 +215,29 @@ impl World {
         });
     }
 
-    fn referenced(&self) -> BTreeSet<u32> {
-        self.chains
-            .iter()
-            .flat_map(|c| c.snaps.iter().flat_map(|s| s.content.keys().copied()))
-            .collect()
+    /// The hash (chunk) a key names.
+    fn chunk(&self, key: u32) -> u32 {
+        key % self.chunks
+    }
+
+    /// Every referenced chunk at the size it counts at: the largest of
+    /// its keys any snapshot holds (plan 32 §6.1).
+    fn referenced(&self) -> BTreeMap<u32, u64> {
+        let mut out: BTreeMap<u32, u64> = BTreeMap::new();
+        for chain in &self.chains {
+            for s in &chain.snaps {
+                for &key in s.content.keys() {
+                    let size = out.entry(self.chunk(key)).or_default();
+                    *size = (*size).max(self.sizes[key as usize]);
+                }
+            }
+        }
+        out
+    }
+
+    /// The chunks a content holds.
+    fn chunks_of(&self, content: &Content) -> BTreeSet<u32> {
+        content.keys().map(|&key| self.chunk(key)).collect()
     }
 
     fn live_oracle(&self) -> impl FnMut(&ChunkHash) -> bool + 'static {
@@ -201,17 +246,19 @@ impl World {
     }
 
     /// Mirror the index's tombstone rule across one operation.
-    fn settle(&mut self, before: &BTreeSet<u32>) {
+    /// A tombstone keeps the size the chunk counted at when it went.
+    fn settle(&mut self, before: &BTreeMap<u32, u64>) {
         let after = self.referenced();
         let now = self.now.load(Ordering::Relaxed);
-        for &chunk in before.difference(&after) {
-            if !self.live.contains(&chunk) {
-                let size = self.sizes[chunk as usize];
+        for (&chunk, &size) in before {
+            if !after.contains_key(&chunk) && !self.live.contains(&chunk) {
                 self.tombs.entry(chunk).or_insert((size, now));
             }
         }
-        for chunk in after.difference(before) {
-            self.tombs.remove(chunk);
+        for chunk in after.keys() {
+            if !before.contains_key(chunk) {
+                self.tombs.remove(chunk);
+            }
         }
     }
 
@@ -267,9 +314,9 @@ impl World {
         let ds = {
             let empty = Content::new();
             let from = self.chains[c].snaps.last().map_or(&empty, |h| &h.content);
-            deltas(&self.sizes, from, &work)
+            deltas_of(self.chunks, &self.sizes, from, &work)
         };
-        let ds = noisy(&mut self.rng, &mut self.stats, &self.sizes, ds);
+        let ds = noisy(&mut self.rng, &mut self.stats, self.chunks, &self.sizes, ds);
         let chain = &mut self.chains[c];
         chain.dropped = dropped;
         chain.work = work.clone();
@@ -294,13 +341,31 @@ impl World {
         };
         assert!(chain.snaps.last().is_none_or(|h| h.ord < ord));
         *self.stats.entry("create").or_default() += 1;
+        let held = self.chunks_of(&work);
         let shared = self.chains.iter().enumerate().any(|(i, other)| {
             i != c
                 && other
                     .snaps
                     .iter()
-                    .any(|s| s.content.keys().any(|k| work.contains_key(k)))
+                    .any(|s| s.content.keys().any(|&k| held.contains(&self.chunk(k))))
         });
+        if held.len() < work.len() {
+            *self.stats.entry("one hash at two sizes").or_default() += 1;
+        }
+        let largest = |w: &World, content: &Content| -> BTreeMap<u32, u64> {
+            let mut out: BTreeMap<u32, u64> = BTreeMap::new();
+            for &key in content.keys() {
+                let size = out.entry(w.chunk(key)).or_default();
+                *size = (*size).max(w.sizes[key as usize]);
+            }
+            out
+        };
+        if let Some(head) = self.chains[c].snaps.last() {
+            let (was, is) = (largest(self, &head.content), largest(self, &work));
+            if is.iter().any(|(c, s)| was.get(c).is_some_and(|w| w != s)) {
+                *self.stats.entry("size change in a chain").or_default() += 1;
+            }
+        }
         if shared {
             *self
                 .stats
@@ -324,7 +389,8 @@ impl World {
         let chain = &mut self.chains[c];
         let ord = chain.snaps[pos].ord;
         let head_step = (pos + 1 == chain.snaps.len() && pos > 0).then(|| {
-            deltas(
+            deltas_of(
+                self.chunks,
                 &self.sizes,
                 &chain.snaps[pos - 1].content,
                 &chain.snaps[pos].content,
@@ -358,6 +424,7 @@ impl World {
         let mut live = self.live_oracle();
         let seq = self.next_seq();
         let sizes = self.sizes.clone();
+        let chunks = self.chunks;
         let chain = &mut self.chains[c];
         chain.dropped = dropped;
         let empty = Content::new();
@@ -367,8 +434,9 @@ impl World {
             Some(p) => noisy(
                 &mut self.rng,
                 &mut self.stats,
+                chunks,
                 &sizes,
-                deltas(&sizes, &chain.snaps[p].content, &head.content),
+                deltas_of(chunks, &sizes, &chain.snaps[p].content, &head.content),
             ),
             None => Vec::new(),
         };
@@ -395,8 +463,9 @@ impl World {
                 deltas: noisy(
                     &mut self.rng,
                     &mut self.stats,
+                    chunks,
                     &sizes,
-                    deltas(&sizes, prev, &s.content),
+                    deltas_of(chunks, &sizes, prev, &s.content),
                 ),
             });
         }
@@ -414,7 +483,7 @@ impl World {
     }
 
     fn toggle_live(&mut self) {
-        let chunk = self.rng.below(self.sizes.len() as u64) as u32;
+        let chunk = self.rng.below(u64::from(self.chunks)) as u32;
         let live = !self.live.contains(&chunk);
         if live {
             self.live.insert(chunk);
@@ -471,8 +540,10 @@ impl World {
         let mut out: BTreeMap<u32, BTreeSet<(u32, u32)>> = BTreeMap::new();
         for chain in &self.chains {
             for s in &chain.snaps {
-                for &chunk in s.content.keys() {
-                    out.entry(chunk).or_default().insert((chain.chain, s.ord));
+                for &key in s.content.keys() {
+                    out.entry(self.chunk(key))
+                        .or_default()
+                        .insert((chain.chain, s.ord));
                 }
             }
         }
@@ -480,10 +551,11 @@ impl World {
     }
 
     fn brute_reclaim(&self, d: &BTreeSet<(u32, u32)>) -> Amount {
+        let sizes = self.referenced();
         let mut out = Amount::default();
         for (chunk, refs) in self.referrers() {
             if !self.live.contains(&chunk) && refs.is_subset(d) {
-                out.bytes += self.sizes[chunk as usize];
+                out.bytes += sizes[&chunk];
                 out.chunks += 1;
             }
         }
@@ -498,26 +570,24 @@ impl World {
         }
         assert_eq!(self.ix.accounted_seq().unwrap(), self.seq, "{}", ctx());
         let referrers = self.referrers();
-        let sizes = self.sizes.clone();
-        let size = |chunk: &u32| sizes[*chunk as usize];
+        let sizes = self.referenced();
+        let size = |chunk: &u32| sizes[chunk];
         let mut unique = Amount::default();
         for chain in &self.chains {
             let mut used_sum = 0;
             let mut written_sum = 0;
             for (p, s) in chain.snaps.iter().enumerate() {
-                let refer: u64 = s.content.keys().map(size).sum();
+                let held = self.chunks_of(&s.content);
+                let refer: u64 = held.iter().map(size).sum();
                 let written: u64 = match p.checked_sub(1) {
-                    Some(q) => s
-                        .content
-                        .keys()
-                        .filter(|k| !chain.snaps[q].content.contains_key(k))
-                        .map(size)
-                        .sum(),
+                    Some(q) => {
+                        let before = self.chunks_of(&chain.snaps[q].content);
+                        held.iter().filter(|k| !before.contains(k)).map(size).sum()
+                    }
                     None => refer,
                 };
-                let owned: Vec<u32> = s
-                    .content
-                    .keys()
+                let owned: Vec<u32> = held
+                    .iter()
                     .copied()
                     .filter(|k| !self.live.contains(k) && referrers[k].len() == 1)
                     .collect();
@@ -569,7 +639,7 @@ impl World {
         }
 
         // The run invariant, chunk by chunk.
-        for chunk in 0..self.sizes.len() as u32 {
+        for chunk in 0..self.chunks {
             let entry = self.ix.chunk_entry(&hash(chunk)).unwrap();
             let Some(refs) = referrers.get(&chunk) else {
                 assert!(entry.is_none(), "chunk {chunk} unreferenced but indexed");
@@ -577,7 +647,7 @@ impl World {
             };
             let entry = entry.unwrap_or_else(|| panic!("chunk {chunk} referenced, not indexed"));
             assert_eq!(entry.live, self.live.contains(&chunk));
-            assert_eq!(entry.size, self.sizes[chunk as usize]);
+            assert_eq!(entry.size, sizes[&chunk], "chunk {chunk}: {entry:?}");
             for chain in &self.chains {
                 let head = chain.snaps.last().map(|s| s.ord);
                 let mut covered = BTreeSet::new();
@@ -595,14 +665,17 @@ impl World {
                             .filter(|&o| o >= run.first && o <= last),
                     );
                     if run.is_open() {
-                        assert_eq!(
-                            Some(run.occ),
-                            chain
-                                .snaps
-                                .last()
-                                .and_then(|s| s.content.get(&chunk).copied()),
-                            "chunk {chunk}: open run occ"
-                        );
+                        // The head's occurrences at the run's size.
+                        let at_head: u64 = chain.snaps.last().map_or(0, |s| {
+                            s.content
+                                .iter()
+                                .filter(|&(&k, _)| {
+                                    self.chunk(k) == chunk && self.sizes[k as usize] == run.size
+                                })
+                                .map(|(_, &occ)| occ)
+                                .sum()
+                        });
+                        assert_eq!(run.occ, at_head, "chunk {chunk}: open run occ");
                     }
                 }
                 let present: BTreeSet<u32> = refs
@@ -720,6 +793,8 @@ fn run_model(seeds: std::ops::Range<u64>, steps: usize) {
         "delete only",
         "out-of-order insert",
         "duplicate-hash deltas",
+        "one hash at two sizes",
+        "size change in a chain",
         "live toggle",
         "tombstones expired",
     ] {
@@ -985,7 +1060,8 @@ fn duplicate_hashes_in_one_delta_list_are_summed() {
             chain: 0,
             first: 0,
             last: OPEN,
-            occ: 1
+            occ: 1,
+            size: sizes[1],
         }]
     );
     assert_eq!(

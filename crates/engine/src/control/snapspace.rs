@@ -31,18 +31,32 @@ use constellation_meta::MetaStore;
 use std::sync::Arc;
 
 pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
-    unary::<SnapshotReclaim>(r, svc, |s, _, p| {
+    unary::<SnapshotReclaim>(r, svc, |s, c, p| {
+        // The hash list is a test aid with a cost (one string per chunk):
+        // not for every viewer, and bounded.
+        if p.list_chunks && c.role < constellation_control::authz::Role::Operator {
+            return Err(ControlError::denied(
+                "listing the reclaimable chunks (`list_chunks`) needs the operator role",
+            )
+            .with_remediation("ask without list_chunks for the estimate alone"));
+        }
         let ids: Vec<String> = s
             .snapshot_resolve_rows(&p.selectors)
             .map_err(ControlError::failed)?
             .into_iter()
             .map(|row| row.id)
             .collect();
-        s.reclaim_of(&ids)?.ok_or_else(off)
+        let list_max = p.list_chunks.then_some(LIST_CHUNKS_MAX);
+        s.reclaim_listed_of(&ids, list_max)?.ok_or_else(off)
     });
     unary::<SnapshotSpace>(r, svc, |s, _, p| s.snapshot_space(p.path.as_deref()));
     unary::<SnapshotSpaceVerify>(r, svc, |s, _, _| s.snapshot_space_verify());
 }
+
+/// The most hashes `snapshot.reclaim {list_chunks}` returns: about 6.7 MB
+/// of JSON, inside one control frame (`MAX_FRAME_LEN`, 8 MiB). A larger
+/// estimate is refused rather than listed.
+pub(crate) const LIST_CHUNKS_MAX: usize = 100_000;
 
 fn off() -> ControlError {
     ControlError::unsupported("snapshot accounting is off (CONSTELLATION_SNAPACCT=off)")
@@ -120,15 +134,39 @@ impl EngineControl {
         &self,
         ids: &[String],
     ) -> Result<Option<api::ReclaimEstimate>, ControlError> {
-        let answer = self.acct(self.snapacct().reclaim(ids)).map_err(internal)?;
+        self.reclaim_listed_of(ids, None)
+    }
+
+    /// [`Self::reclaim_of`], with the counted chunks' hashes when
+    /// `list_max` is given (`snapshot.reclaim`'s `list_chunks` test aid);
+    /// refused, without building the list past the bound, when more than
+    /// `list_max` chunks count.
+    pub(crate) fn reclaim_listed_of(
+        &self,
+        ids: &[String],
+        list_max: Option<usize>,
+    ) -> Result<Option<api::ReclaimEstimate>, ControlError> {
+        let answer = self
+            .acct(self.snapacct().reclaim_listed(ids, list_max))
+            .map_err(internal)?;
         Ok(match answer {
-            SnapAnswer::Ready(r) => Some(api::ReclaimEstimate {
+            SnapAnswer::Ready((r, None)) if list_max.is_some() => {
+                return Err(ControlError::invalid(format!(
+                    "the estimate counts {} chunks; list_chunks lists at most {}",
+                    r.chunks,
+                    list_max.unwrap_or_default()
+                ))
+                .with_remediation("name fewer snapshots, or ask without list_chunks"));
+            }
+            SnapAnswer::Ready((r, hashes)) => Some(api::ReclaimEstimate {
                 bytes: r.bytes,
                 chunks: r.chunks,
                 as_of_seq: r.as_of_seq,
                 as_of_ms: r.as_of_ms,
                 building: false,
                 building_pct: 0,
+                chunk_hashes: hashes
+                    .map(|hashes| hashes.iter().map(|hash| hash.to_hex()).collect()),
             }),
             SnapAnswer::Building { pct } => Some(api::ReclaimEstimate {
                 building: true,
@@ -171,6 +209,7 @@ impl EngineControl {
         let mut out = api::SpaceBreakdown {
             path,
             gc_horizon_ms: acct.gc_horizon_ms(),
+            estimate_pending: acct.recheck_pending(),
             ..Default::default()
         };
         match answer {

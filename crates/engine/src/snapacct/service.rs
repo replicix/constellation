@@ -99,8 +99,27 @@
 //! are and tries again next tick (`refreshes_deferred`). Otherwise a
 //! change in the diff the replica had not applied yet would be judged on
 //! the old state and then never looked at again — the next diff starts
-//! past it. A replica *ahead* of the commit is harmless: everything it
-//! has beyond the commit is in a later diff and is looked at again.
+//! past it.
+//!
+//! A replica *ahead* of the commit is not harmless on its own: a flag
+//! read there can reflect a state no commit ever holds — a file reverted
+//! to an old content and overwritten again between two commits names the
+//! old chunk only in between, and neither diff around it names the chunk
+//! again, so the flag would stay `live` for good (the `snapacct` harness
+//! scenario found exactly that). So every flag read while the replica is
+//! not at exactly the labelled commit's state (its `applied` position
+//! equal to the commit's, nothing unshipped, unchanged across the read) is
+//! recorded in `aux/live_recheck` ([`Recheck`]) and read again by the next
+//! refresh — with or without a newer commit — until one read happens at a
+//! settled state. Snapshot applications read the flags of chunks entering
+//! the index the same way, so those join the set too: merged into it
+//! after each operation, with `aux/recheck_inflight` set in between so
+//! that a crash there reads as "everything" rather than losing them. Past
+//! [`RECHECK_MAX`] chunks the set (in memory or stored) becomes
+//! "everything", served by one full recompute at the next settled moment
+//! — and only there: while the replica is not settled, refreshes go on
+//! diffing (O(what changed)) with the full recompute still pending, so a
+//! node that is never settled never pays O(index) per refresh.
 //!
 //! A refresh that cannot diff (the old root collected), a crash
 //! interrupted (`aux/refresh_pending`), or that starts a new index
@@ -153,6 +172,18 @@ const AUX_BUILT: &str = "built";
 const AUX_LIVE_ROOT: &str = "live_root";
 const AUX_REFRESH_PENDING: &str = "refresh_pending";
 const AUX_AS_OF_MS: &str = "as_of_ms";
+/// The chunks whose live flag was last read from a replica ahead of the
+/// commit it is labelled with ([`Recheck`]).
+const AUX_LIVE_RECHECK: &str = "live_recheck";
+/// Set while an operation runs whose flag reads are not in
+/// `aux/live_recheck` yet: found on the next refresh (a crash in
+/// between), it stands for a full recheck.
+const AUX_RECHECK_INFLIGHT: &str = "recheck_inflight";
+
+/// Past this many chunks to recheck, the set becomes "recompute every
+/// flag" ([`Recheck::full`]): a bounded record, at the cost of one
+/// O(index) recompute once the replica is settled.
+const RECHECK_MAX: usize = 50_000;
 
 /// How many commits back from the newest a live refresh looks for one
 /// this replica has applied (module docs).
@@ -290,6 +321,12 @@ pub struct SnapAcctStats {
     pub refreshes: AtomicU64,
     /// Refreshes that recomputed every flag.
     pub full_refreshes: AtomicU64,
+    /// Chunks the next live refresh reads again ([`Recheck`]; 0 when a
+    /// full recompute is due instead).
+    pub live_rechecks: AtomicU64,
+    /// A full recompute of the flags is due at the next settled moment
+    /// ([`Recheck::full`]).
+    pub live_recheck_full: AtomicBool,
     pub errors: AtomicU64,
     pub last_error: Mutex<Option<String>>,
 }
@@ -390,6 +427,83 @@ pub struct VerifyReport {
 struct LiveRoot {
     seq: u64,
     root: String,
+    /// The commit's `applied` log position: a replica at exactly this
+    /// position, with nothing unshipped, holds exactly the commit's tree.
+    applied: u64,
+}
+
+/// Flags read from a replica state the labelled commit does not hold
+/// exactly, to be read again (module docs, "Live flags"). `hashes` are
+/// indexed chunks; `full` stands for every indexed chunk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Recheck {
+    full: bool,
+    hashes: Vec<[u8; 32]>,
+}
+
+impl Recheck {
+    /// Every indexed chunk.
+    fn all() -> Recheck {
+        Recheck {
+            full: true,
+            hashes: Vec::new(),
+        }
+    }
+
+    /// After a full recompute: nothing if it read a settled state,
+    /// everything again otherwise.
+    fn after_full(settled: bool) -> Recheck {
+        if settled {
+            Recheck::default()
+        } else {
+            Recheck::all()
+        }
+    }
+
+    /// Add `reads`; past [`RECHECK_MAX`] chunks, everything.
+    fn merge(&mut self, reads: OracleReads) {
+        if self.full {
+            return;
+        }
+        if reads.overflowed {
+            *self = Recheck::all();
+            return;
+        }
+        self.hashes
+            .extend(reads.hashes.into_iter().map(|hash| hash.0));
+        self.hashes.sort_unstable();
+        self.hashes.dedup();
+        if self.hashes.len() > RECHECK_MAX {
+            *self = Recheck::all();
+        }
+    }
+}
+
+/// The chunks whose flag snapshot applications read from the replica and
+/// that are not in `aux/live_recheck` yet; bounded: past [`RECHECK_MAX`]
+/// it only remembers that it overflowed (a full recheck).
+#[derive(Clone, Debug, Default)]
+struct OracleReads {
+    hashes: HashSet<ChunkHash>,
+    overflowed: bool,
+}
+
+impl OracleReads {
+    fn insert(&mut self, hash: ChunkHash) {
+        if self.overflowed {
+            return;
+        }
+        if self.hashes.len() >= RECHECK_MAX && !self.hashes.contains(&hash) {
+            self.overflowed = true;
+            self.hashes = HashSet::new();
+            return;
+        }
+        self.hashes.insert(hash);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.hashes.is_empty() && !self.overflowed
+    }
 }
 
 /// One snapshot row, as a chain member.
@@ -580,6 +694,9 @@ pub struct SnapAcctService {
     warned: Mutex<HashSet<Ino>>,
     census: Mutex<Option<(Instant, Option<ChunkCensus>)>>,
     wipe_pending: Arc<AtomicBool>,
+    /// Chunks whose flag a snapshot application took from the replica
+    /// since the last live refresh: rechecked by it ([`Recheck`]).
+    oracle_read: Arc<Mutex<OracleReads>>,
 }
 
 /// How far [`SnapAcctService::reconcile`] got.
@@ -632,11 +749,19 @@ impl SnapAcctService {
             warned: Mutex::new(HashSet::new()),
             census: Mutex::new(None),
             wipe_pending: Arc::new(AtomicBool::new(false)),
+            oracle_read: Arc::new(Mutex::new(OracleReads::default())),
         })
     }
 
     pub fn mode(&self) -> SnapAcctMode {
         self.cfg.mode
+    }
+
+    /// Whether a recheck of the live flags is waiting for a settled
+    /// moment, so the figures built on them are an estimate.
+    pub fn recheck_pending(&self) -> bool {
+        self.stats.live_recheck_full.load(Ordering::Relaxed)
+            || self.stats.live_rechecks.load(Ordering::Relaxed) > 0
     }
 
     pub fn stats(&self) -> &Arc<SnapAcctStats> {
@@ -694,7 +819,12 @@ impl SnapAcctService {
         let dir = self.deps.dir.clone();
         let fs_uuid = self.deps.fs_uuid.clone();
         let params = self.cfg.params;
-        blocking(move || open_index(&slot, &wipe, &last_refresh, &dir, &fs_uuid, params)).await
+        let ix = blocking(move || open_index(&slot, &wipe, &last_refresh, &dir, &fs_uuid, params))
+            .await?;
+        if let Some(ix) = &ix {
+            self.publish_recheck(ix)?;
+        }
+        Ok(ix)
     }
 
     /// Ask for the index to be deleted and rebuilt: the recovery for an
@@ -1060,7 +1190,34 @@ impl SnapAcctService {
         Ok((deltas.lsize_delta, deltas.iter().collect()))
     }
 
+    /// One operation. Flags it reads for chunks entering the index are
+    /// stored for the next refresh right after it ([`Recheck`]), with a
+    /// marker covering the gap in between.
     async fn execute(
+        &self,
+        ix: &Arc<SnapAcct>,
+        walk: &ChainWalk,
+        chain: u32,
+        op: Op,
+    ) -> Result<()> {
+        if !matches!(op, Op::Append { .. } | Op::Rederive { .. }) {
+            return self.execute_op(ix, walk, chain, op).await;
+        }
+        ix.put_aux(AUX_RECHECK_INFLIGHT, &[])?;
+        let result = self.execute_op(ix, walk, chain, op).await;
+        match self.persist_oracle_reads(ix) {
+            Ok(()) => result,
+            // Both failed: the operation's error is the cause, keep it.
+            Err(persist) => match result {
+                Ok(()) => Err(persist),
+                Err(op_err) => {
+                    Err(op_err.context(format!("and storing its flag reads failed: {persist:#}")))
+                }
+            },
+        }
+    }
+
+    async fn execute_op(
         &self,
         ix: &Arc<SnapAcct>,
         walk: &ChainWalk,
@@ -1172,12 +1329,164 @@ impl SnapAcctService {
     /// Whether the live tree references `hash`, as the index needs it for
     /// a chunk entering it. An error reads as live: a chunk wrongly live
     /// is shown as shared rather than reclaimable, the safe mistake.
+    /// Every answer is read from the replica, which may be ahead of the
+    /// accounted commit, so the next live refresh reads it again
+    /// ([`Recheck`]): the hashes are kept in memory, bounded by
+    /// [`RECHECK_MAX`], and merged into `aux/live_recheck` after each
+    /// operation ([`Self::persist_oracle_reads`]).
     fn oracle(&self, ix: &Arc<SnapAcct>) -> impl FnMut(&ChunkHash) -> bool + Send + 'static {
         let meta = self.deps.meta.clone();
         let ix = ix.clone();
-        move |hash| is_live(&meta, &ix, hash)
+        let read = self.oracle_read.clone();
+        move |hash| {
+            read.lock().expect("oracle set").insert(*hash);
+            is_live(&meta, &ix, hash)
+        }
     }
 
+    /// `(applied log position, nothing unshipped)`: read on both sides of
+    /// reading flags, it tells whether the replica held exactly one state
+    /// meanwhile, and which.
+    fn settle_mark(&self) -> Result<(u64, bool)> {
+        use constellation_meta::MetaStore;
+        Ok((
+            self.deps.meta.applied_seq()?,
+            self.deps.meta.journal_len()? == 0,
+        ))
+    }
+
+    /// Merge the flags snapshot applications read since the last call
+    /// into `aux/live_recheck`, and clear [`AUX_RECHECK_INFLIGHT`]. Runs
+    /// after every operation: a crash between an operation and this
+    /// leaves the marker, which reads as a full recheck
+    /// ([`Self::take_recheck`]), so no read is ever lost to a restart.
+    fn persist_oracle_reads(&self, ix: &SnapAcct) -> Result<()> {
+        let read = std::mem::take(&mut *self.oracle_read.lock().expect("oracle set"));
+        if !read.is_empty() {
+            let mut recheck = self.stored_recheck(ix)?;
+            recheck.merge(read);
+            self.store_recheck(ix, recheck)?;
+        } else {
+            ix.remove_aux(AUX_RECHECK_INFLIGHT)?;
+        }
+        Ok(())
+    }
+
+    /// Publish the stored recheck set's size in the stats (at open, so a
+    /// restart does not read as nothing pending).
+    fn publish_recheck(&self, ix: &SnapAcct) -> Result<()> {
+        let stored = self.stored_recheck(ix)?;
+        let full = stored.full || ix.aux(AUX_RECHECK_INFLIGHT)?.is_some();
+        self.stats
+            .live_rechecks
+            .store(stored.hashes.len() as u64, Ordering::Relaxed);
+        self.stats.live_recheck_full.store(full, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `aux/live_recheck` as stored.
+    fn stored_recheck(&self, ix: &SnapAcct) -> Result<Recheck> {
+        Ok(ix
+            .aux(AUX_LIVE_RECHECK)?
+            .map(|v| postcard::from_bytes(&v))
+            .transpose()
+            .context("the accounting index's recheck set")?
+            .unwrap_or_default())
+    }
+
+    /// What the next refresh must read again: the stored set, everything
+    /// when an operation was interrupted before its reads were stored
+    /// ([`AUX_RECHECK_INFLIGHT`]), and reads not stored yet (only after a
+    /// failed [`Self::persist_oracle_reads`]). Nothing is drained: all of
+    /// it stays until [`Self::store_recheck`] replaces it, after the
+    /// rereads it asks for succeeded.
+    fn take_recheck(&self, ix: &SnapAcct) -> Result<Recheck> {
+        let mut recheck = self.stored_recheck(ix)?;
+        if ix.aux(AUX_RECHECK_INFLIGHT)?.is_some() {
+            recheck = Recheck::all();
+        }
+        recheck.merge(self.oracle_read.lock().expect("oracle set").clone());
+        Ok(recheck)
+    }
+
+    /// Replace the stored [`Recheck`] (the reads it stood for, the ones
+    /// in memory included, are done or are in `next`).
+    fn store_recheck(&self, ix: &SnapAcct, next: Recheck) -> Result<()> {
+        *self.oracle_read.lock().expect("oracle set") = OracleReads::default();
+        if next == Recheck::default() {
+            ix.remove_aux(AUX_LIVE_RECHECK)?;
+        } else {
+            ix.put_aux(AUX_LIVE_RECHECK, &postcard::to_allocvec(&next)?)?;
+        }
+        ix.remove_aux(AUX_RECHECK_INFLIGHT)?;
+        self.stats
+            .live_rechecks
+            .store(next.hashes.len() as u64, Ordering::Relaxed);
+        self.stats
+            .live_recheck_full
+            .store(next.full, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The recheck after reading `read` while the replica was not settled:
+    /// the indexed chunks among them (everything past [`RECHECK_MAX`]).
+    fn unsettled(
+        &self,
+        ix: &SnapAcct,
+        read: impl IntoIterator<Item = ChunkHash>,
+    ) -> Result<Recheck> {
+        let mut hashes = Vec::new();
+        for hash in read {
+            if ix.chunk_entry(&hash)?.is_some() {
+                hashes.push(hash.0);
+            }
+        }
+        hashes.sort_unstable();
+        hashes.dedup();
+        Ok(if hashes.len() > RECHECK_MAX {
+            Recheck::all()
+        } else {
+            Recheck {
+                full: false,
+                hashes,
+            }
+        })
+    }
+
+    /// The open index (tests).
+    #[cfg(test)]
+    pub(crate) async fn index(&self) -> Arc<SnapAcct> {
+        self.open().await.unwrap().expect("index in use")
+    }
+
+    /// What a crash between an operation and storing its flag reads
+    /// leaves behind (tests).
+    #[cfg(test)]
+    pub(crate) async fn interrupt_after_operation(&self) -> Result<()> {
+        let ix = self.open().await?.context("index in use")?;
+        ix.put_aux(AUX_RECHECK_INFLIGHT, &[])?;
+        Ok(())
+    }
+
+    /// Read the flags of `hashes` from the replica again.
+    async fn reread_flags(&self, ix: &Arc<SnapAcct>, hashes: Vec<ChunkHash>) -> Result<()> {
+        let ix = ix.clone();
+        let meta = self.deps.meta.clone();
+        blocking(move || {
+            let mut updates = Vec::new();
+            for hash in hashes {
+                if let Some(entry) = ix.chunk_entry(&hash)? {
+                    let live = is_live(&meta, &ix, &hash);
+                    if live != entry.live {
+                        updates.push((hash, live));
+                    }
+                }
+            }
+            ix.set_live_many(updates, None)?;
+            Ok(())
+        })
+        .await
+    }
     // ------------------------------------------------------ live refresh
 
     /// The newest commit in `(floor, newest]` whose `applied` position
@@ -1189,7 +1498,7 @@ impl SnapAcctService {
         newest: u64,
         floor: u64,
         mine: u64,
-    ) -> Result<Option<(u64, NodeHash)>> {
+    ) -> Result<Option<(u64, NodeHash, u64)>> {
         let lowest = newest.saturating_sub(COVER_SEARCH - 1).max(floor + 1);
         for seq in (lowest..=newest).rev() {
             let Some(commit) = self.deps.commits.get(seq).await? else {
@@ -1199,7 +1508,7 @@ impl SnapAcctService {
                 let root = commit
                     .root(SHARD0)
                     .with_context(|| format!("commit {seq} names no shard 0 root"))?;
-                return Ok(Some((seq, root)));
+                return Ok(Some((seq, root, commit.applied)));
             }
         }
         Ok(None)
@@ -1218,7 +1527,8 @@ impl SnapAcctService {
             .context("the accounting index's live root")?;
         let known = state.as_ref().map_or(0, |s| s.seq);
         // Read before the flags are: the replica only moves forward.
-        let mine = self.deps.meta.applied_seq()?;
+        let before = self.settle_mark()?;
+        let mine = before.0;
         // Nothing newer: the probe alone (no commit GET).
         let head = match self.deps.commits.discover_head(known).await? {
             Some(seq) if seq > known => {
@@ -1238,7 +1548,33 @@ impl SnapAcctService {
             }
             _ => None,
         };
-        let Some((seq, root)) = head else {
+        let recheck = self.take_recheck(ix)?;
+        let Some((seq, root, applied)) = head else {
+            // No newer commit: only flags read ahead of the accounted one
+            // are read again, until a read happens at exactly its state.
+            let labelled = state.as_ref().map(|s| s.applied);
+            let settled_now =
+                |after: (u64, bool)| before == after && before.1 && labelled == Some(before.0);
+            if recheck.full {
+                // Only at a settled moment: an O(index) recompute per
+                // tick while the replica moves would be no truer.
+                if settled_now(self.settle_mark()?) {
+                    if !self.recompute_flags(ix, budget).await? {
+                        return Ok(false);
+                    }
+                    let settled = settled_now(self.settle_mark()?);
+                    self.store_recheck(ix, Recheck::after_full(settled))?;
+                }
+            } else if !recheck.hashes.is_empty() {
+                let hashes: Vec<ChunkHash> = recheck.hashes.iter().map(|h| ChunkHash(*h)).collect();
+                self.reread_flags(ix, hashes.clone()).await?;
+                let next = if settled_now(self.settle_mark()?) {
+                    Recheck::default()
+                } else {
+                    self.unsettled(ix, hashes)?
+                };
+                self.store_recheck(ix, next)?;
+            }
             *self.last_refresh.lock().expect("refresh lock") = Some(Instant::now());
             return Ok(true);
         };
@@ -1246,22 +1582,46 @@ impl SnapAcctService {
             .as_ref()
             .filter(|s| s.seq != 0)
             .and_then(|s| NodeHash::from_hex(&s.root));
+        // A pending full recheck is served by a full recompute only where
+        // that can settle it: with the replica at exactly this commit's
+        // state. Anywhere else the diff refresh goes on and the full
+        // recheck stays pending, so a replica that is never settled pays
+        // O(diff) per refresh, never O(index).
+        let at_commit = before.1 && applied == before.0;
         ix.put_aux(AUX_REFRESH_PENDING, &seq.to_be_bytes())?;
         let diffed = match old {
-            Some(old) => self.refresh_by_diff(ix, old, root).await,
             None => Err(anyhow::anyhow!("no accounted commit to diff from")),
-        };
-        if let Err(error) = diffed {
-            tracing::debug!(error = %format!("{error:#}"), "snapshot accounting: recomputing every live flag");
-            // `refresh_pending` is set: an interrupted recompute resumes
-            // as the next pass's first step.
-            let done = self.refresh_full(ix, budget).await?;
-            if done {
-                *self.last_refresh.lock().expect("refresh lock") = Some(Instant::now());
+            Some(_) if recheck.full && at_commit => {
+                Err(anyhow::anyhow!("every flag is due a recheck"))
             }
-            return Ok(done);
-        }
-        self.set_live_root(ix, seq, root)?;
+            Some(old) => {
+                let extra = recheck.hashes.iter().map(|h| ChunkHash(*h)).collect();
+                self.refresh_by_diff(ix, old, root, extra).await
+            }
+        };
+        let read = match diffed {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::debug!(error = %format!("{error:#}"), "snapshot accounting: recomputing every live flag");
+                // `refresh_pending` is set: an interrupted recompute resumes
+                // as the next pass's first step. The stored recheck stays
+                // until the recompute lands.
+                let done = self.refresh_full(ix, budget).await?;
+                if done {
+                    *self.last_refresh.lock().expect("refresh lock") = Some(Instant::now());
+                }
+                return Ok(done);
+            }
+        };
+        let next = if recheck.full {
+            Recheck::all()
+        } else if before == self.settle_mark()? && at_commit {
+            Recheck::default()
+        } else {
+            self.unsettled(ix, read)?
+        };
+        self.store_recheck(ix, next)?;
+        self.set_live_root(ix, seq, root, applied)?;
         self.stats.refreshes.fetch_add(1, Ordering::Relaxed);
         self.stats
             .refresh_ms_last
@@ -1270,12 +1630,13 @@ impl SnapAcctService {
         Ok(true)
     }
 
-    fn set_live_root(&self, ix: &SnapAcct, seq: u64, root: NodeHash) -> Result<()> {
+    fn set_live_root(&self, ix: &SnapAcct, seq: u64, root: NodeHash, applied: u64) -> Result<()> {
         ix.put_aux(
             AUX_LIVE_ROOT,
             &postcard::to_allocvec(&LiveRoot {
                 seq,
                 root: root.to_hex(),
+                applied,
             })?,
         )?;
         if seq > ix.accounted_seq()? {
@@ -1285,12 +1646,16 @@ impl SnapAcctService {
         Ok(())
     }
 
+    /// The flags of every indexed chunk a manifest changed between `old`
+    /// and `new` names, and of `extra` (a [`Recheck`]), read from the
+    /// replica; returns the chunks read.
     async fn refresh_by_diff(
         &self,
         ix: &Arc<SnapAcct>,
         old: NodeHash,
         new: NodeHash,
-    ) -> Result<()> {
+        extra: Vec<ChunkHash>,
+    ) -> Result<Vec<ChunkHash>> {
         let tree = self.deps.tree.clone();
         let (direct, spills) = tokio::task::spawn_blocking(move || -> Result<_> {
             let handle = tokio::runtime::Handle::current();
@@ -1328,6 +1693,7 @@ impl SnapAcctService {
         .await
         .context("live refresh diff task")??;
         let mut candidates = direct;
+        candidates.extend(extra);
         for spill in spills {
             let live = self.deps.meta.chunk_ref_any(&spill)?;
             let known = ix.live_spill_known(&spill)?;
@@ -1350,22 +1716,9 @@ impl SnapAcctService {
                 ix.forget_live_spill(&spill, members)?;
             }
         }
-        let ix = ix.clone();
-        let meta = self.deps.meta.clone();
-        blocking(move || {
-            let mut updates = Vec::new();
-            for hash in candidates {
-                if let Some(entry) = ix.chunk_entry(&hash)? {
-                    let live = is_live(&meta, &ix, &hash);
-                    if live != entry.live {
-                        updates.push((hash, live));
-                    }
-                }
-            }
-            ix.set_live_many(updates, None)?;
-            Ok(())
-        })
-        .await
+        let read: Vec<ChunkHash> = candidates.into_iter().collect();
+        self.reread_flags(ix, read.clone()).await?;
+        Ok(read)
     }
 
     /// Record every live spilled list from the replica and recompute
@@ -1380,16 +1733,26 @@ impl SnapAcctService {
         // Read before the flags are: the commit the flags are labelled
         // with must be one the replica had applied by then, so that every
         // change after it is in a later diff (module docs).
-        let mine = self.deps.meta.applied_seq()?;
+        let before = self.settle_mark()?;
+        let mine = before.0;
         if !self.recompute_flags(ix, budget).await? {
             return Ok(false);
         }
+        let after = self.settle_mark()?;
         let head = match self.deps.commits.discover_head(0).await? {
             Some(seq) => self.covered_commit(seq, 0, mine).await?,
             None => None,
         };
         match head {
-            Some((seq, root)) => self.set_live_root(ix, seq, root)?,
+            Some((seq, root, applied)) => {
+                // Read at exactly the commit's state, or due again in
+                // full once the replica settles.
+                let settled = before == after && before.1 && applied == before.0;
+                // Everything snapshot applications read so far is reread
+                // above.
+                self.store_recheck(ix, Recheck::after_full(settled))?;
+                self.set_live_root(ix, seq, root, applied)?
+            }
             None => {
                 // No commit yet, or none this replica has applied: no
                 // commit to diff from, so the next refresh recomputes in
@@ -1399,6 +1762,7 @@ impl SnapAcctService {
                     &postcard::to_allocvec(&LiveRoot {
                         seq: 0,
                         root: String::new(),
+                        applied: 0,
                     })?,
                 )?;
                 ix.remove_aux(AUX_REFRESH_PENDING)?;
@@ -1633,6 +1997,21 @@ impl SnapAcctService {
 
     /// `reclaim(D)` for the snapshots with these ids.
     pub async fn reclaim(&self, ids: &[String]) -> Result<SnapAnswer<ReclaimEstimate>> {
+        Ok(match self.reclaim_listed(ids, None).await? {
+            SnapAnswer::Ready((estimate, _)) => SnapAnswer::Ready(estimate),
+            SnapAnswer::Building { pct } => SnapAnswer::Building { pct },
+            SnapAnswer::Off => SnapAnswer::Off,
+        })
+    }
+
+    /// [`Self::reclaim`], and with `list_max` the counted chunks' hashes,
+    /// sorted, from the same index read — `None` past `list_max` chunks (a
+    /// test aid: [`SnapAcct::reclaim_listed`]).
+    pub async fn reclaim_listed(
+        &self,
+        ids: &[String],
+        list_max: Option<usize>,
+    ) -> Result<SnapAnswer<(ReclaimEstimate, Option<Vec<ChunkHash>>)>> {
         let ix = match self.gate().await? {
             Ok(ix) => ix,
             Err(other) => return Ok(cast(other)),
@@ -1644,18 +2023,21 @@ impl SnapAcctService {
                 Err(other) => return Ok(cast(other)),
             }
         }
-        let amount = if at.is_empty() {
-            Amount::default()
+        let (amount, listed) = if at.is_empty() {
+            (Amount::default(), list_max.map(|_| Vec::new()))
         } else {
-            ix.reclaim(&at)?
+            ix.reclaim_listed(&at, list_max)?
         };
         let (as_of_seq, as_of_ms) = self.as_of(&ix)?;
-        Ok(SnapAnswer::Ready(ReclaimEstimate {
-            bytes: amount.bytes,
-            chunks: amount.chunks,
-            as_of_seq,
-            as_of_ms,
-        }))
+        Ok(SnapAnswer::Ready((
+            ReclaimEstimate {
+                bytes: amount.bytes,
+                chunks: amount.chunks,
+                as_of_seq,
+                as_of_ms,
+            },
+            listed,
+        )))
     }
 
     /// `snapshot space` (see [`SpaceBreakdown`]).

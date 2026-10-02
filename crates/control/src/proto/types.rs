@@ -982,6 +982,13 @@ pub struct SnapAcctStatus {
     /// applied yet, and so kept the flags at the older one.
     #[serde(default)]
     pub refreshes_deferred: u64,
+    /// Chunks whose live flags the next settled refresh reads again.
+    #[serde(default)]
+    pub live_rechecks: u64,
+    /// A full recompute of the live flags is pending a settled moment:
+    /// the space figures are an estimate until it runs.
+    #[serde(default)]
+    pub live_recheck_full: bool,
     #[serde(default)]
     pub passes: u64,
     #[serde(default)]
@@ -2428,6 +2435,13 @@ pub struct SnapshotResolveParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotReclaimParams {
     pub selectors: Vec<String>,
+    /// A test aid: also return the hashes of the chunks the estimate
+    /// counts (`ReclaimEstimate::chunk_hashes`), so a test can compare the
+    /// estimate with what GC deletes afterwards. Needs the operator role;
+    /// refused when the estimate counts more than 100,000 chunks (one
+    /// 64-character string each, inside one reply frame).
+    #[serde(default)]
+    pub list_chunks: bool,
 }
 
 /// `snapshot.space`: the breakdown for the whole filesystem, or for the
@@ -3055,6 +3069,11 @@ pub struct ReclaimEstimate {
     pub building: bool,
     #[serde(default)]
     pub building_pct: u8,
+    /// With `snapshot.reclaim`'s `list_chunks` (a test aid), the counted
+    /// chunks' hashes (lowercase hex, sorted); `null` otherwise and while
+    /// building.
+    #[serde(default)]
+    pub chunk_hashes: Option<Vec<String>>,
 }
 
 /// Logical bytes and the distinct chunks they are in.
@@ -3103,6 +3122,11 @@ pub struct SpaceBreakdown {
     pub physical_estimate: Option<u64>,
     pub as_of_seq: u64,
     pub as_of_ms: u64,
+    /// A recheck of the live flags is pending a settled moment (the
+    /// replica never was at one commit's state): the "shared with live"
+    /// and "reclaimable" figures are an estimate until it runs.
+    #[serde(default)]
+    pub estimate_pending: bool,
 }
 
 /// `snapshot.space.verify`: the accounting index against a brute-force

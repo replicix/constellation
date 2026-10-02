@@ -2198,4 +2198,203 @@ mod tests {
             .iter()
             .all(|entry| !entry.key.starts_with("snaps/")));
     }
+
+    /// Plan 32 §11 "Compliance and performance" (its "GC round time", as
+    /// the mark: the one phase the two modes do differently): one GC mark (verify-only
+    /// `mark_chunks`: tail, snapshot reconciliation, live roots, the
+    /// `chunks/` LIST, snapshot roots) with `CONSTELLATION_GC_SNAP_WALK`
+    /// `full` and `diff`, over 300 snapshots of a 100k-file tree. The tree
+    /// is created once (1,000 directories × 100 one-chunk files under
+    /// `/vol`); between snapshots `CONSTELLATION_BENCH_TOUCH` (20) random
+    /// files are rewritten, so diffs are small. In-process, in-memory
+    /// bucket: what it measures is the walk's CPU and node-cache cost, not
+    /// S3 latency (which both modes would pay per tree node read).
+    ///
+    /// Knobs (env): `CONSTELLATION_BENCH_FILES` (100000),
+    /// `CONSTELLATION_BENCH_SNAPSHOTS` (300), `CONSTELLATION_BENCH_TOUCH`
+    /// (20), `CONSTELLATION_BENCH_FULL_LIMIT_S` (1800: a `full` mark still
+    /// running then is stopped, and the per-snapshot rate of the full walk
+    /// is measured over a few snapshots instead and extrapolated). Run:
+    ///
+    /// ```text
+    /// cargo test --release -p constellation-engine --lib \
+    ///     gc::tests::bench_gc_mark_full_versus_diff -- --ignored --nocapture
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement, not a check (minutes in release)"]
+    async fn bench_gc_mark_full_versus_diff() {
+        use constellation_fs_core::manifest::Manifest;
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::MetaStore;
+        use constellation_store_s3::CompressionSetting;
+        use std::time::{Duration, Instant};
+        const CS: u32 = 4096;
+        const PER_DIR: usize = 100;
+        let knob = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let files_n = knob("CONSTELLATION_BENCH_FILES", 100_000) as usize;
+        let snapshots = knob("CONSTELLATION_BENCH_SNAPSHOTS", 300) as usize;
+        let touch = knob("CONSTELLATION_BENCH_TOUCH", 20) as usize;
+        let full_limit = Duration::from_secs(knob("CONSTELLATION_BENCH_FULL_LIMIT_S", 1800));
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        let (manager, _nodes) = crate::snapshot::test_manager(meta.clone(), chunks.clone(), CS);
+        let write = |ino: u64, tag: String| {
+            let chunks = chunks.clone();
+            let meta = meta.clone();
+            async move {
+                let bytes = tag.into_bytes();
+                let hash = ChunkHash::of(&bytes);
+                chunks
+                    .put_chunk(&hash, &bytes, CompressionSetting::RAW)
+                    .await
+                    .unwrap();
+                let len = bytes.len() as u64;
+                let (manifest, _) = Manifest::from_chunks(CS, len, vec![hash], 8, ChunkHash::of);
+                meta.set_manifest(ino, &manifest.encode(), len).unwrap();
+            }
+        };
+        let mut segment = 0;
+        let mut ship = || {
+            segment += 1;
+            let rows = meta.take_journal(usize::MAX).unwrap();
+            let seqs: Vec<u64> = rows.iter().map(|(seq, _)| *seq).collect();
+            meta.ack_journal_rows_at(&seqs, segment).unwrap();
+        };
+
+        let started = Instant::now();
+        let vol = meta.mkdir(ROOT_INO, "vol", 0o755, 0, 0).unwrap().ino;
+        let mut files = Vec::with_capacity(files_n);
+        let mut dir = vol;
+        for f in 0..files_n {
+            if f % PER_DIR == 0 {
+                dir = meta
+                    .mkdir(vol, &format!("d{}", f / PER_DIR), 0o755, 0, 0)
+                    .unwrap()
+                    .ino;
+            }
+            let ino = meta.create(dir, &format!("f{f}"), 0o644, 0, 0).unwrap().ino;
+            write(ino, format!("file {f} v0")).await;
+            files.push(ino);
+        }
+        let tree_built = started.elapsed();
+        // A fixed LCG: the same history on every run.
+        let mut state = 0x5eed_u64;
+        let mut below = |n: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % n
+        };
+        let mut slowest_snapshot = Duration::ZERO;
+        for s in 0..snapshots {
+            for c in 0..touch {
+                let ino = files[below(files.len())];
+                write(ino, format!("file {ino} s{s} c{c}")).await;
+            }
+            ship();
+            let one = Instant::now();
+            manager.create("/vol", &format!("s{s:03}")).await.unwrap();
+            slowest_snapshot = slowest_snapshot.max(one.elapsed());
+        }
+        eprintln!(
+            "BENCH built {files_n} files in {tree_built:?}; {snapshots} snapshots ({touch} rewrites each, slowest create {slowest_snapshot:?}) in {:?} total",
+            started.elapsed()
+        );
+
+        let mark = |mode: SnapWalkMode| {
+            let (store, chunks, meta) = (store.clone(), chunks.clone(), meta.clone());
+            async move {
+                let config = GcConfig {
+                    snap_walk: mode,
+                    ..fast_config()
+                };
+                let tail = GcTail::standalone(LogStore::new(store.clone()), &meta).unwrap();
+                let mut lease = gc_lease(&store, 3_600_000).await;
+                let started = Instant::now();
+                let report = mark_chunks(
+                    &store,
+                    &chunks,
+                    &meta,
+                    LeaseMode::Cas,
+                    &config,
+                    true,
+                    &tail,
+                    &mut lease,
+                )
+                .await
+                .unwrap();
+                let elapsed = started.elapsed();
+                lease.release().await;
+                let Err(report) = report else {
+                    panic!("verify-only returns its report");
+                };
+                let candidates: HashSet<ChunkHash> =
+                    report.candidates.iter().filter_map(|m| m.hash).collect();
+                (elapsed, candidates)
+            }
+        };
+        // Diff first, then full, then diff again (warm caches either way:
+        // each mark builds its own scratch node cache).
+        let (diff, diff_set) = mark(SnapWalkMode::Diff).await;
+        eprintln!("BENCH mark diff: {diff:?} ({} candidates)", diff_set.len());
+        // Its own task, so the timer fires even while the mark's walk
+        // holds a worker thread (`block_in_place`); a stopped mark is
+        // aborted at its next await and its blocking reads finish unseen.
+        let full_mark = tokio::spawn(mark(SnapWalkMode::Full));
+        let abort = full_mark.abort_handle();
+        let stopped = match tokio::time::timeout(full_limit, full_mark).await {
+            Ok(Err(panicked)) => panic!("the full mark failed: {panicked}"),
+            Ok(Ok((full, full_set))) => {
+                eprintln!(
+                    "BENCH mark full: {full:?} ({} candidates); full/diff = {:.1}x",
+                    full_set.len(),
+                    full.as_secs_f64() / diff.as_secs_f64()
+                );
+                assert_eq!(diff_set, full_set, "both modes condemn the same chunks");
+                false
+            }
+            Err(_) => {
+                abort.abort();
+                // Stopped: the full walk's cost is one subtree walk per
+                // snapshot, so time a few of those (the same function the
+                // `full` mark calls, over one shared reader as it does).
+                use crate::snapshot::{snapshot_chunk_refs, SnapshotRoot, TreeAccess};
+                let sample = 5.min(snapshots);
+                let scratch = ScratchDir::new("bench-full-sample").unwrap();
+                let reader = crate::mtree_read::ChainReader::for_store(
+                    store.clone(),
+                    chunks.e2e_keys(),
+                    &scratch.0,
+                )
+                .unwrap();
+                reader.cache.refresh_catalog().await.unwrap();
+                let tree = TreeAccess::from_reader(reader);
+                let records = SnapshotStore::new(store.clone()).list().await.unwrap();
+                let started = Instant::now();
+                for record in records.iter().take(sample) {
+                    let root = SnapshotRoot::of_record(record).unwrap();
+                    snapshot_chunk_refs(&chunks, &tree, &root).await.unwrap();
+                }
+                let per = started.elapsed() / sample as u32;
+                eprintln!(
+                    "BENCH mark full: STOPPED after {full_limit:?}; per-snapshot full walk {per:?} (mean of {sample}), so ≈ {:?} for {} snapshots",
+                    per * records.len() as u32,
+                    records.len()
+                );
+                true
+            }
+        };
+        // The stopped mark still holds the `_gc` lease.
+        if !stopped {
+            let (diff2, _) = mark(SnapWalkMode::Diff).await;
+            eprintln!("BENCH mark diff (again): {diff2:?}");
+        }
+    }
 }

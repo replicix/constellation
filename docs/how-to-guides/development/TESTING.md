@@ -888,6 +888,33 @@ roots:
   `release` by glob, and a final multi-selector delete that leaves both
   nodes with no snapshots. The lease's holder and epoch are checked
   again after this phase.
+- `snapacct` (plan 32 §11, M5d) is the end-to-end proof that the reclaim
+  estimate is the truth. Two nodes (`a` with `CONSTELLATION_SNAPACCT=on`,
+  `b` with `auto`, so each builds its own index — incrementally and from
+  scratch) run a seeded twelve-round workload alternating writers:
+  creates (one-chunk and multi-chunk files), whole and partial
+  overwrites, truncates (shrinking and extending), reverts to an earlier
+  content, hardlinks and copies across the subtree boundaries, unlinks,
+  renames, and directories moved into, out of and between `/proj` and
+  `/proj/sub`. After every round the other node snapshots `/proj`
+  (`p01`…`p12`), every second round `/proj/sub` (`s02`…`s12`). Then it
+  **quiesces** (journals drained, both mounts byte-identical, one GC round
+  run to completion so never-snapshotted garbage is gone — the index only
+  holds snapshot-referenced chunks, so without this GC would delete more
+  than any estimate covers; the live tree is left unchanged from here
+  on), checks `snapshot space --verify` reports 0 mismatches on both
+  nodes, takes `snapshot.reclaim` of `/proj@p04%p08` with `list_chunks`
+  (the control method's test aid; it needs the operator role and refuses
+  past 100,000 chunks) on both nodes (the same set **and** the same bytes:
+  a chunk counts at the largest derived size it occurs at, so the two
+  indexes agree whatever order they applied the snapshots in; `snapshot
+  delete --dry-run` prints the same count), deletes the range, waits for
+  both indexes to show exactly that set as `awaiting GC`, runs GC with
+  `CONSTELLATION_GC_HORIZON_S=0` (1 s lease TTL) and requires the chunk
+  deletions this round journaled under `gc/journal/` (rule
+  `orphan-horizon`) to **equal** the dry-run set — same count, same
+  hashes (it prints both counts and the first 5 hashes) — and the round's
+  own report, then `--verify` clean on both nodes again. About 10 s.
 - `clone-workflow` eagerly clones snapshot metadata, independently edits the
   origin and clone, verifies both byte strings, and checks the frozen source
   remained unchanged. Deleting the snapshot must not affect the clone.
@@ -2538,6 +2565,35 @@ fixture's `evict` hook: the engine drops the file's clean chunks,
 test `view::qos_tests::a_deferred_cold_read_answers_off_the_caller_and_holds_its_slot`,
 `completion::tests`, and the FUSE session's
 `a_detach_drains_deferred_reads_and_gives_up_past_its_wait`.
+
+## GC mark at scale: `full` vs `diff` snapshot walk (plan 32 M5d)
+
+Plan 32 §11 asks for the GC round time over 300 snapshots of a
+100k-file tree with `CONSTELLATION_GC_SNAP_WALK=full` and `diff`; this
+measures the GC **mark**, the one phase the two modes do differently. It is an
+`#[ignore]`d release test, in process over an in-memory bucket (so it
+measures the walk's CPU and node-cache cost, not S3 latency):
+
+```sh
+cargo test --release -p constellation-engine --lib \
+    gc::tests::bench_gc_mark_full_versus_diff -- --ignored --nocapture
+```
+
+It builds `/vol` once (1,000 directories × 100 one-chunk files), then
+takes 300 snapshots of `/vol` with 20 random files rewritten before each,
+and times one verify-only GC mark (`mark_chunks`: tail, snapshot
+reconciliation, live roots, the `chunks/` LIST, the snapshot roots) per
+mode — `diff`, then `full`, then `diff` again — and asserts both modes
+condemn the same chunks. Lines starting `BENCH` carry the numbers. Knobs:
+`CONSTELLATION_BENCH_FILES` (100000), `CONSTELLATION_BENCH_SNAPSHOTS`
+(300), `CONSTELLATION_BENCH_TOUCH` (20), and
+`CONSTELLATION_BENCH_FULL_LIMIT_S` (1800): a `full` mark still running
+then is stopped (it runs as its own task against a timer, so the stop
+fires even mid-walk), and the per-snapshot full-walk time is measured
+over 5 snapshots and extrapolated instead; `=0` on a small tree
+(`CONSTELLATION_BENCH_FILES=2000 CONSTELLATION_BENCH_SNAPSHOTS=20`)
+exercises that path in a second. Results are in PROGRESS.md, "Plan 32
+M5 — space accounting".
 
 ## Subtree confinement (plan 31 §6.12)
 

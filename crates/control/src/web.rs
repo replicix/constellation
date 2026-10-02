@@ -884,6 +884,16 @@ pub fn render_metrics(status: &StatusReport) -> String {
         "Live refreshes deferred because the replica had not applied the newest commit.",
         status.snapacct.refreshes_deferred
     );
+    gauge!(
+        "constellation_snapacct_live_rechecks",
+        "Chunks whose live flags the next settled accounting refresh reads again.",
+        status.snapacct.live_rechecks
+    );
+    gauge!(
+        "constellation_snapacct_live_recheck_full",
+        "1 while a full recompute of the accounting live flags waits for a settled moment.",
+        u8::from(status.snapacct.live_recheck_full)
+    );
     render_vfs_ops(&mut output, &status.vfs_ops);
     render_fuse(&mut output, &status.fuse);
     output

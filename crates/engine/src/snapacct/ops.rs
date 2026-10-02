@@ -17,7 +17,7 @@ use crate::snapwalk::Delta;
 use constellation_fs_core::ChunkHash;
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 use smallvec::SmallVec;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// One snapshot to append, for [`SnapAcct::rederive_suffix`].
 #[derive(Clone, Debug)]
@@ -57,17 +57,21 @@ pub(super) fn class_of(
     if entry.live {
         return Ok(Class::Live);
     }
-    if let [run] = entry.runs.as_slice() {
+    // Unique when every run (one per size) covers the same one snapshot.
+    let mut only = None;
+    for run in &entry.runs {
         let last = if run.is_open() {
             head(run.chain)?
         } else {
             Some(run.last)
         };
-        if last == Some(run.first) {
-            return Ok(Class::Unique(run.chain, run.first));
+        if last != Some(run.first) || only.is_some_and(|at| at != (run.chain, run.first)) {
+            return Ok(Class::Shared);
         }
+        only = Some((run.chain, run.first));
     }
-    Ok(Class::Shared)
+    let (chain, ord) = only.expect("runs are not empty");
+    Ok(Class::Unique(chain, ord))
 }
 
 struct Slot {
@@ -96,18 +100,45 @@ fn shift(value: u64, delta: i64, what: &str) -> Result<u64> {
         .ok_or_else(|| SnapAcctError::Corrupt(format!("{what} out of range")))
 }
 
-/// A delta list summed per hash, net-zero entries dropped, with the
-/// first size seen. The lists are per-chunk changes between two trees
-/// (snapwalk's are already one per hash), but nothing in the public
-/// signatures promises that, and applying `[(h, +1), (h, −1)]` one by one
-/// would open a run and close it before it began.
-fn net_deltas(deltas: impl IntoIterator<Item = Delta>) -> HashMap<ChunkHash, (i128, u64)> {
-    let mut net: HashMap<ChunkHash, (i128, u64)> = HashMap::new();
+/// A delta list summed per hash and size, net-zero entries dropped. The
+/// lists are per-(chunk, size) changes between two trees (snapwalk's are
+/// already one per pair), but nothing in the public signatures promises
+/// that, and applying `[(h, +1), (h, −1)]` one by one would open a run and
+/// close it before it began.
+type NetDeltas = HashMap<ChunkHash, BTreeMap<u64, i128>>;
+
+fn net_deltas(deltas: impl IntoIterator<Item = Delta>) -> NetDeltas {
+    let mut net: NetDeltas = HashMap::new();
     for delta in deltas {
-        net.entry(delta.hash).or_insert((0, delta.size_bytes)).0 += i128::from(delta.delta);
+        *net.entry(delta.hash)
+            .or_default()
+            .entry(delta.size_bytes)
+            .or_default() += i128::from(delta.delta);
     }
-    net.retain(|_, (d, _)| *d != 0);
+    for sizes in net.values_mut() {
+        sizes.retain(|_, d| *d != 0);
+    }
+    net.retain(|_, sizes| !sizes.is_empty());
     net
+}
+
+/// Whether `entry` is in snapshot `ord` of `chain`: some run of any size
+/// covers it (an open run reaches the head).
+fn present(entry: &ChunkEntry, chain: u32, ord: u32) -> bool {
+    entry
+        .runs
+        .iter()
+        .any(|r| r.chain == chain && r.first <= ord && (r.is_open() || r.last >= ord))
+}
+
+/// The size an entry counts at: its runs' largest (plan 32 §6.1).
+fn canonical_size(entry: &ChunkEntry) -> u64 {
+    entry
+        .runs
+        .iter()
+        .map(|r| r.size)
+        .max()
+        .unwrap_or(entry.size)
 }
 
 pub(super) struct Ctx<'a> {
@@ -339,45 +370,61 @@ impl<'a> Ctx<'a> {
             None => (0, 0),
         };
         let (mut opened, mut closed) = (0u64, 0u64);
-        for (hash, (delta, size_bytes)) in net_deltas(deltas) {
+        for (hash, sizes) in net_deltas(deltas) {
             let slot = self.load(hash)?;
+            // A new entry counts at the largest size it enters with; the
+            // flush moves an existing one's size to its runs' largest.
             let entry = slot.entry.get_or_insert_with(|| ChunkEntry {
-                size: size_bytes,
+                size: sizes
+                    .iter()
+                    .filter(|(_, d)| **d > 0)
+                    .map(|(size, _)| *size)
+                    .max()
+                    .unwrap_or(0),
                 live: live(&hash),
                 runs: SmallVec::new(),
             });
-            let open = entry
-                .runs
-                .iter()
-                .position(|r| r.chain == chain && r.is_open());
-            let was = open.map_or(0, |i| entry.runs[i].occ);
-            let now = (was as i128) + delta;
-            if now < 0 || now > i128::from(u64::MAX) {
-                return Err(SnapAcctError::Invalid(format!(
-                    "chunk {} would occur {now} times in chain {chain} (delta {delta} against the head)",
-                    hash.to_hex(),
-                )));
-            }
-            let now = now as u64;
-            match (open, now) {
-                (None, _) => {
-                    entry.runs.push(Run {
+            let was_present = entry.runs.iter().any(|r| r.chain == chain && r.is_open());
+            for (size, delta) in sizes {
+                let open = entry
+                    .runs
+                    .iter()
+                    .position(|r| r.chain == chain && r.is_open() && r.size == size);
+                let was = open.map_or(0, |i| entry.runs[i].occ);
+                let now = (was as i128) + delta;
+                if now < 0 || now > i128::from(u64::MAX) {
+                    return Err(SnapAcctError::Invalid(format!(
+                        "chunk {} would occur {now} times at {size} bytes in chain {chain} \
+                         (delta {delta} against the head)",
+                        hash.to_hex(),
+                    )));
+                }
+                let now = now as u64;
+                match (open, now) {
+                    (None, _) => entry.runs.push(Run {
                         chain,
                         first: new,
                         last: OPEN,
                         occ: now,
-                    });
-                    opened += entry.size;
+                        size,
+                    }),
+                    (Some(i), 0) => {
+                        let h = head.ok_or_else(|| {
+                            SnapAcctError::Corrupt(format!("open run in empty chain {chain}"))
+                        })?;
+                        entry.runs[i].last = h;
+                        entry.runs[i].occ = 0;
+                    }
+                    (Some(i), _) => entry.runs[i].occ = now,
                 }
-                (Some(i), 0) => {
-                    let h = head.ok_or_else(|| {
-                        SnapAcctError::Corrupt(format!("open run in empty chain {chain}"))
-                    })?;
-                    entry.runs[i].last = h;
-                    entry.runs[i].occ = 0;
-                    closed += entry.size;
-                }
-                (Some(i), _) => entry.runs[i].occ = now,
+            }
+            // `REFER`/`WRITTEN` count chunks, whatever their sizes: only
+            // entering or leaving the chain's head counts.
+            let is_present = entry.runs.iter().any(|r| r.chain == chain && r.is_open());
+            match (was_present, is_present) {
+                (false, true) => opened += entry.size,
+                (true, false) => closed += entry.size,
+                _ => {}
             }
         }
         // A run open and born at the old head covered one snapshot and now
@@ -430,60 +477,65 @@ impl<'a> Ctx<'a> {
                 }
             };
         };
-        let born_k = self.scan(&self.ix.birth, chain, k, k)?;
-        let dead_k = self.scan(&self.ix.death, chain, k, k)?;
-        let born_next = self.scan(&self.ix.birth, chain, next, next)?;
+        // Every chunk whose runs begin or end at k, or begin at next(k):
+        // the only ones whose runs or `WRITTEN[next]` share change.
+        let mut candidates = self.scan(&self.ix.birth, chain, k, k)?;
+        candidates.extend(self.scan(&self.ix.death, chain, k, k)?);
+        candidates.extend(self.scan(&self.ix.birth, chain, next, next)?);
+        let mut seen = HashSet::new();
         let mut written_next: i64 = 0;
-        // Runs starting at k: [k,k] goes, [k,j] starts at next(k) instead,
-        // and next(k) has now "written" it.
-        for hash in born_k {
-            let entry = self.entry(hash, "birth at a deleted snapshot")?;
-            let i = entry
-                .runs
-                .iter()
-                .position(|r| r.chain == chain && r.first == k)
-                .ok_or_else(|| SnapAcctError::Corrupt(format!("birth key without run ({k})")))?;
-            if entry.runs[i].last == k {
-                entry.runs.remove(i);
-            } else {
-                entry.runs[i].first = next;
-                written_next += entry.size as i64;
+        for hash in candidates {
+            if !seen.insert(hash) {
+                continue;
             }
-        }
-        // Runs ending at k (and starting before it) end at prev(k).
-        for hash in dead_k {
-            let entry = self.entry(hash, "death at a deleted snapshot")?;
-            if let Some(run) = entry
-                .runs
-                .iter_mut()
-                .find(|r| r.chain == chain && !r.is_open() && r.last == k)
-            {
-                run.last = prev.ok_or_else(|| {
-                    SnapAcctError::Corrupt(format!("run ending at the tail {k} began before it"))
-                })?;
+            let entry = self.entry(hash, "birth or death at a deleted snapshot")?;
+            // next(k) wrote it if k did not have it; from now on, if
+            // prev(k) does not.
+            let in_prev = prev.is_some_and(|p| present(entry, chain, p));
+            let (in_k, in_next) = (present(entry, chain, k), present(entry, chain, next));
+            let mut runs = SmallVec::<[Run; 1]>::new();
+            for mut run in entry.runs.drain(..) {
+                if run.chain == chain && run.first == k {
+                    // [k,k] goes; [k,j] starts at next(k) instead.
+                    if !run.is_open() && run.last == k {
+                        continue;
+                    }
+                    run.first = next;
+                } else if run.chain == chain && !run.is_open() && run.last == k {
+                    // Runs ending at k (and starting before it) end at
+                    // prev(k).
+                    run.last = prev.ok_or_else(|| {
+                        SnapAcctError::Corrupt(format!(
+                            "run ending at the tail {k} began before it"
+                        ))
+                    })?;
+                }
+                runs.push(run);
             }
-        }
-        // A chunk absent only from k now has adjacent runs [i, prev] and
-        // [next, j]: merge them, and next(k) no longer wrote it.
-        if let Some(p) = prev {
-            for hash in born_next {
-                let entry = self.entry(hash, "birth at next")?;
-                let a = entry
-                    .runs
-                    .iter()
-                    .position(|r| r.chain == chain && !r.is_open() && r.last == p);
-                let b = entry
-                    .runs
-                    .iter()
-                    .position(|r| r.chain == chain && r.first == next);
-                if let (Some(a), Some(b)) = (a, b) {
-                    let later = entry.runs[b];
-                    entry.runs[a].last = later.last;
-                    entry.runs[a].occ = later.occ;
-                    entry.runs.remove(b);
-                    written_next -= entry.size as i64;
+            // A size absent only from k now has adjacent runs [i, prev]
+            // and [next, j]: merge them.
+            if let Some(p) = prev {
+                let adjacent = |runs: &[Run]| {
+                    runs.iter().enumerate().find_map(|(i, r)| {
+                        if r.chain != chain || r.is_open() || r.last != p {
+                            return None;
+                        }
+                        let j = runs.iter().position(|n| {
+                            n.chain == chain && n.size == r.size && n.first == next
+                        })?;
+                        Some((i, j))
+                    })
+                };
+                while let Some((i, j)) = adjacent(&runs) {
+                    let later = runs.remove(j);
+                    let i = if j < i { i - 1 } else { i };
+                    runs[i].last = later.last;
+                    runs[i].occ = later.occ;
                 }
             }
+            entry.runs = runs;
+            let wrote = |by_prev: bool| i64::from(in_next && !by_prev);
+            written_next += entry.size as i64 * (wrote(in_prev) - wrote(in_k));
         }
         self.snap_slot(chain, k)?.now = None;
         if written_next != 0 {
@@ -542,47 +594,66 @@ impl<'a> Ctx<'a> {
         candidates.extend(self.scan(&self.ix.death, chain, p, head)?);
         candidates.extend(rewind_by.keys().copied());
         let mut seen = HashSet::new();
+        let none = BTreeMap::new();
         for hash in candidates {
             if !seen.insert(hash) {
                 continue;
             }
-            let delta = rewind_by.get(&hash).map_or(0, |&(d, _)| d);
+            let by_size = rewind_by.get(&hash).unwrap_or(&none);
             let Some(entry) = self.load(hash)?.entry.as_mut() else {
                 return Err(SnapAcctError::Invalid(format!(
                     "rewind names {}, which no snapshot holds",
                     hash.to_hex()
                 )));
             };
-            let at_head = entry
-                .runs
-                .iter()
-                .find(|r| r.chain == chain && r.is_open())
-                .map_or(0, |r| r.occ);
-            let at_p = i128::from(at_head) - delta;
-            if at_p < 0 || at_p > i128::from(u64::MAX) {
-                return Err(SnapAcctError::Invalid(format!(
-                    "rewind: chunk {} would occur {at_p} times at {p}",
-                    hash.to_hex()
-                )));
-            }
-            let at_p = at_p as u64;
-            entry.runs.retain(|r| !(r.chain == chain && r.first > p));
-            let covering = entry
-                .runs
-                .iter_mut()
-                .find(|r| r.chain == chain && r.first <= p && (r.is_open() || r.last >= p));
-            match (covering, at_p) {
-                (Some(run), n) if n > 0 => {
-                    run.last = OPEN;
-                    run.occ = n;
-                }
-                (None, 0) => {}
-                (covering, at_p) => {
+            // Per size: occurrences at p = at the head − (head − p).
+            let mut sizes: BTreeSet<u64> = by_size.keys().copied().collect();
+            sizes.extend(
+                entry
+                    .runs
+                    .iter()
+                    .filter(|r| r.chain == chain)
+                    .map(|r| r.size),
+            );
+            let mut at_p = Vec::with_capacity(sizes.len());
+            for size in sizes {
+                let delta = by_size.get(&size).copied().unwrap_or(0);
+                let at_head = entry
+                    .runs
+                    .iter()
+                    .find(|r| r.chain == chain && r.is_open() && r.size == size)
+                    .map_or(0, |r| r.occ);
+                let n = i128::from(at_head) - delta;
+                if n < 0 || n > i128::from(u64::MAX) {
                     return Err(SnapAcctError::Invalid(format!(
-                        "rewind of chain {chain} to {p} disagrees with the runs of {}: \
-                         run covering {p}: {covering:?}, occurrences there per rewind: {at_p}",
+                        "rewind: chunk {} would occur {n} times at {size} bytes at {p}",
                         hash.to_hex()
                     )));
+                }
+                at_p.push((size, n as u64));
+            }
+            entry.runs.retain(|r| !(r.chain == chain && r.first > p));
+            for (size, n) in at_p {
+                let covering = entry.runs.iter_mut().find(|r| {
+                    r.chain == chain
+                        && r.size == size
+                        && r.first <= p
+                        && (r.is_open() || r.last >= p)
+                });
+                match (covering, n) {
+                    (Some(run), n) if n > 0 => {
+                        run.last = OPEN;
+                        run.occ = n;
+                    }
+                    (None, 0) => {}
+                    (covering, n) => {
+                        return Err(SnapAcctError::Invalid(format!(
+                            "rewind of chain {chain} to {p} disagrees with the runs of {} \
+                             at {size} bytes: run covering {p}: {covering:?}, occurrences \
+                             there per rewind: {n}",
+                            hash.to_hex()
+                        )));
+                    }
                 }
             }
         }
@@ -654,6 +725,64 @@ impl<'a> Ctx<'a> {
 
     // ------------------------------------------------------------ flush
 
+    /// `chain`'s ordinals as this step leaves them.
+    fn ords_now(&self, chain: u32) -> Result<Vec<u32>> {
+        let mut ords: BTreeSet<u32> = self.snap_ords(chain, 0, u32::MAX)?.into_iter().collect();
+        for (&(c, ord), slot) in &self.snaps {
+            if c == chain {
+                if slot.now.is_some() {
+                    ords.insert(ord);
+                } else {
+                    ords.remove(&ord);
+                }
+            }
+        }
+        Ok(ords.into_iter().collect())
+    }
+
+    /// `entry`'s size changes by `delta`: `REFER` of every snapshot
+    /// holding it, and `WRITTEN` of each one holding it whose
+    /// predecessor does not. (The owner's `USED` and the buckets move
+    /// with the class.) Cost: the chains' ordinals from the chunk's first
+    /// run on; a size changes only for a chunk met at a new largest size,
+    /// or losing the run that had it.
+    fn resize(
+        &mut self,
+        entry: &ChunkEntry,
+        delta: i64,
+        ords: &mut HashMap<u32, Vec<u32>>,
+    ) -> Result<()> {
+        let chains: BTreeSet<u32> = entry.runs.iter().map(|r| r.chain).collect();
+        for chain in chains {
+            let chain_ords = match ords.entry(chain) {
+                std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => v.insert(self.ords_now(chain)?),
+            };
+            let from = entry
+                .runs
+                .iter()
+                .filter(|r| r.chain == chain)
+                .map(|r| r.first)
+                .min()
+                .unwrap_or(0);
+            let mut held_before = false;
+            for &ord in chain_ords.iter().filter(|&&o| o >= from) {
+                let held = present(entry, chain, ord);
+                if held {
+                    let rec = self.snap_slot(chain, ord)?.now.as_mut().ok_or_else(|| {
+                        SnapAcctError::Corrupt(format!("snapshot {chain}/{ord} has no record"))
+                    })?;
+                    rec.refer = shift(rec.refer, delta, "REFER")?;
+                    if !held_before {
+                        rec.written = shift(rec.written, delta, "WRITTEN")?;
+                    }
+                }
+                held_before = held;
+            }
+        }
+        Ok(())
+    }
+
     fn move_class(&mut self, class: Class, size: u64, sign: i64) -> Result<()> {
         match class {
             Class::Absent => {}
@@ -674,6 +803,7 @@ impl<'a> Ctx<'a> {
     /// bookkeeping (see the module docs). Later steps read what it wrote.
     pub(super) fn flush(&mut self) -> Result<()> {
         let chunks = std::mem::take(&mut self.chunks);
+        let mut ords: HashMap<u32, Vec<u32>> = HashMap::new();
         for (hash, slot) in chunks {
             let Slot {
                 orig,
@@ -684,11 +814,21 @@ impl<'a> Ctx<'a> {
             if entry.as_ref().is_some_and(|e| e.runs.is_empty()) {
                 dropped_live = entry.take().map(|e| e.live);
             }
+            // The step counted the chunk at its size so far; if its runs'
+            // largest moved, every snapshot holding it moves with it.
+            if let Some(e) = entry.as_mut() {
+                let canonical = canonical_size(e);
+                if canonical != e.size {
+                    self.resize(e, canonical as i64 - e.size as i64, &mut ords)?;
+                    e.size = canonical;
+                }
+            }
             let after = class_of(entry.as_ref(), &mut |chain| self.head_now(chain))?;
-            let size = orig.as_ref().or(entry.as_ref()).map_or(0, |e| e.size);
-            if before != after {
+            let size = orig.as_ref().map_or(0, |e| e.size);
+            let size_after = entry.as_ref().map_or(0, |e| e.size);
+            if before != after || size != size_after {
                 self.move_class(before, size, -1)?;
-                self.move_class(after, size, 1)?;
+                self.move_class(after, size_after, 1)?;
             }
             let runs = |e: &Option<ChunkEntry>| -> SmallVec<[Run; 2]> {
                 e.as_ref()
@@ -827,11 +967,21 @@ pub(super) fn check_structure(ix: &SnapAcct) -> Result<()> {
         if r.contains_key(&ix.tomb, tomb_hash_key(&hash))? {
             return bad(format!("{hex}: indexed and tombstoned"));
         }
-        let mut by_chain: BTreeMap<u32, Vec<Run>> = BTreeMap::new();
-        for run in &entry.runs {
-            by_chain.entry(run.chain).or_default().push(*run);
+        if entry.size != canonical_size(&entry) {
+            return bad(format!(
+                "{hex}: size {} but its runs' largest is {}",
+                entry.size,
+                canonical_size(&entry)
+            ));
         }
-        for (chain, mut runs) in by_chain {
+        // Per chain and size: maximal runs, keyed.
+        let mut by_size: BTreeMap<(u32, u64), Vec<Run>> = BTreeMap::new();
+        for run in &entry.runs {
+            by_size.entry((run.chain, run.size)).or_default().push(*run);
+        }
+        let mut keys_birth = BTreeSet::new();
+        let mut keys_death = BTreeSet::new();
+        for ((chain, _), mut runs) in by_size {
             runs.sort_by_key(|r| r.first);
             let chain_ords = ords.get(&chain).map(Vec::as_slice).unwrap_or_default();
             let head = chain_ords.last().copied();
@@ -842,6 +992,7 @@ pub(super) fn check_structure(ix: &SnapAcct) -> Result<()> {
                 if !r.contains_key(&ix.birth, ord_key(chain, run.first, &hash))? {
                     return bad(format!("{hex}: run {run:?} has no birth key"));
                 }
+                keys_birth.insert((chain, run.first));
                 let last = if run.is_open() {
                     if i + 1 != runs.len() || run.occ == 0 {
                         return bad(format!("{hex}: open run {run:?} not last or occ 0"));
@@ -857,20 +1008,33 @@ pub(super) fn check_structure(ix: &SnapAcct) -> Result<()> {
                     if !r.contains_key(&ix.death, ord_key(chain, run.last, &hash))? {
                         return bad(format!("{hex}: run {run:?} has no death key"));
                     }
-                    deaths += 1;
+                    keys_death.insert((chain, run.last));
                     run.last
                 };
-                births += 1;
                 if let Some(next) = runs.get(i + 1) {
                     let gap = chain_ords.iter().any(|&o| o > last && o < next.first);
                     if run.is_open() || next.first <= last || !gap {
                         return bad(format!("{hex}: runs {run:?} and {next:?} not maximal"));
                     }
                 }
-                *written.entry((chain, run.first)).or_default() += entry.size;
-                for &o in chain_ords.iter().filter(|&&o| o >= run.first && o <= last) {
+            }
+        }
+        births += keys_birth.len() as u64;
+        deaths += keys_death.len() as u64;
+        // The chunk is in a snapshot when any run covers it.
+        let chains: BTreeSet<u32> = entry.runs.iter().map(|r| r.chain).collect();
+        for chain in chains {
+            let chain_ords = ords.get(&chain).map(Vec::as_slice).unwrap_or_default();
+            let mut held_before = false;
+            for &o in chain_ords {
+                let held = present(&entry, chain, o);
+                if held {
                     *refer.entry((chain, o)).or_default() += entry.size;
+                    if !held_before {
+                        *written.entry((chain, o)).or_default() += entry.size;
+                    }
                 }
+                held_before = held;
             }
         }
         let class = class_of(Some(&entry), &mut |chain| {

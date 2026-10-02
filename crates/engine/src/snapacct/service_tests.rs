@@ -21,8 +21,9 @@ const CS: u32 = 4096;
 /// Chunk lists longer than this spill (small, so tests spill often).
 const INLINE_MAX: usize = 3;
 
-/// A chunk's content is named by its tag and its length, so a hash
-/// always has one size (as real content addressing guarantees).
+/// A chunk's content is named by its tag and its length, so a hash's
+/// content always has one length (as real content addressing guarantees).
+/// Its *derived* size can still vary: `one_chunk_at_two_derived_sizes_…`.
 fn chunk(tag: &str, size: u64) -> ChunkHash {
     ChunkHash::of(format!("{tag}/{size}").as_bytes())
 }
@@ -269,6 +270,34 @@ async fn check_reclaim(fx: &Fixture, svc: &SnapAcctService, rng: &mut Rng, what:
     );
 }
 
+/// Change `ino`'s length keeping its (inline) chunks: past its last
+/// chunk's end, or to inside the last chunk. Its last chunk then occurs
+/// at another derived size under the same hash.
+fn resize(fx: &Fixture, ino: Ino, rng: &mut Rng) {
+    let Some(bytes) = fx.meta.manifest(ino).unwrap() else {
+        return;
+    };
+    let manifest = Manifest::decode(&bytes).unwrap();
+    let ChunkInfo::Inline(sparse) = manifest.chunks else {
+        return;
+    };
+    let Some(&last) = sparse.keys().next_back() else {
+        return;
+    };
+    let start = last * CS as u64;
+    let tail = manifest.file_len - start;
+    let file_len = if tail > 1 && rng.below(2) == 0 {
+        start + 1 + rng.below(tail as usize - 1) as u64
+    } else {
+        manifest.file_len + 1 + rng.below(2 * CS as usize) as u64
+    };
+    let (manifest, _) =
+        Manifest::from_sparse_chunks(CS, file_len, sparse, INLINE_MAX, ChunkHash::of);
+    fx.meta
+        .set_manifest(ino, &manifest.encode(), file_len)
+        .unwrap();
+}
+
 async fn model_history(seed: u64, steps: usize) {
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     let mut fx = Fixture::new();
@@ -283,7 +312,7 @@ async fn model_history(seed: u64, steps: usize) {
     let mut written: Vec<(Vec<String>, u64)> = Vec::new();
     let mut snapshots: Vec<(String, String)> = Vec::new();
     let mut names = 0u64;
-    let mut kinds = [0usize; 12];
+    let mut kinds = [0usize; 13];
     for step in 0..steps {
         let all = entries(&fx.meta);
         let dirs: Vec<Ino> = std::iter::once(ROOT_INO)
@@ -311,7 +340,7 @@ async fn model_history(seed: u64, steps: usize) {
                 .collect();
             (tags, [CS as u64, 1000, 17][rng.below(3)])
         };
-        let kind = rng.below(12);
+        let kind = rng.below(13);
         kinds[kind] += 1;
         match kind {
             0 | 1 => {
@@ -373,6 +402,13 @@ async fn model_history(seed: u64, steps: usize) {
                 if let Some(at) = (!snapshots.is_empty()).then(|| rng.below(snapshots.len())) {
                     let (path, snap) = snapshots.remove(at);
                     fx.manager.delete(&path, &snap, true).await.unwrap();
+                }
+            }
+            12 => {
+                // Extend past the last chunk, or cut inside it, keeping the
+                // chunks: one hash at a new derived size.
+                if let Some(file) = rng.pick(&files) {
+                    resize(&fx, file.2, &mut rng);
                 }
             }
             _ => {
@@ -949,6 +985,260 @@ async fn a_recreated_snapshot_id_moves_between_chains() {
     assert_verified(&svc, "re-created over another directory").await;
     let n = svc.snap_numbers(&second).await.unwrap().ready().unwrap();
     assert_eq!(n.refer, 10);
+}
+
+/// One hash at two derived sizes: a 1000-byte tail chunk whose file is
+/// then extended past the chunk's end by a truncate keeps its hash, and
+/// now occurs as a whole `CS`-byte chunk (`min(chunk_size, file_len −
+/// offset)`). Plan 32 §6.1 counts it at the largest size any snapshot
+/// holds it at, so every snapshot holding it counts `CS` — however the
+/// index met them: incrementally (`/x` first), or rebuilt from scratch
+/// (`/a` sorts first) — and once the snapshots holding it at `CS` go,
+/// the rest count it at 1000 again. Found by the `snapacct` harness
+/// scenario: with the size of whichever occurrence was applied first,
+/// `REFER`, `reclaim` and the buckets disagreed by the 3,096 bytes of
+/// growth, and two nodes reported different bytes for the same set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_chunk_at_two_derived_sizes_counts_the_largest() {
+    let mut fx = Fixture::new();
+    let a = fx.mkdir(ROOT_INO, "a");
+    let x = fx.mkdir(ROOT_INO, "x");
+    assert!(a < x);
+    let tail = chunk("tail", 1000);
+    let set = |fx: &Fixture, ino: Ino, file_len: u64| {
+        let sparse: SparseChunks = [(0u64, tail)].into_iter().collect();
+        let (manifest, _) =
+            Manifest::from_sparse_chunks(CS, file_len, sparse, INLINE_MAX, ChunkHash::of);
+        fx.meta
+            .set_manifest(ino, &manifest.encode(), file_len)
+            .unwrap();
+    };
+    let short = fx.meta.create(a, "f", 0o644, 1, 1).unwrap().ino;
+    set(&fx, short, 1000);
+    let long = fx.meta.create(x, "f", 0o644, 1, 1).unwrap().ino;
+    set(&fx, long, CS as u64 + 5);
+    let svc = fx.service(Fixture::config(SnapAcctMode::On));
+    let on_x = fx.snap("/x").await;
+    fx.publish().await;
+    svc.catch_up().await.unwrap();
+    let on_a = fx.snap("/a").await;
+    // The short file is extended too, then goes: `/a`'s next snapshot
+    // holds it at `CS`, and the chunk is held by snapshots only.
+    set(&fx, short, 2 * CS as u64);
+    let on_a2 = fx.snap("/a").await;
+    fx.meta.unlink(a, "f").unwrap();
+    fx.meta.unlink(x, "f").unwrap();
+    fx.publish().await;
+    svc.catch_up().await.unwrap();
+    assert_verified(&svc, "one hash at two sizes").await;
+    let refer = |svc: &Arc<SnapAcctService>, id: &String| {
+        let svc = svc.clone();
+        let id = id.clone();
+        async move { svc.snap_numbers(&id).await.unwrap().ready().unwrap().refer }
+    };
+    assert_eq!(refer(&svc, &on_x).await, CS as u64);
+    assert_eq!(
+        refer(&svc, &on_a).await,
+        CS as u64,
+        "counted at the largest"
+    );
+    assert_eq!(refer(&svc, &on_a2).await, CS as u64);
+    let all = svc
+        .reclaim(&[on_x.clone(), on_a.clone(), on_a2.clone()])
+        .await
+        .unwrap()
+        .ready()
+        .unwrap();
+    assert_eq!((all.bytes, all.chunks), (CS as u64, 1));
+    let incremental = snapshot_of_numbers(&svc, &fx).await;
+    let state = tempfile::TempDir::new().unwrap();
+    let rebuilt = fx.service_on(
+        Fixture::config(SnapAcctMode::On),
+        fx.meta.clone(),
+        state.path(),
+    );
+    rebuilt.catch_up().await.unwrap();
+    assert_eq!(
+        snapshot_of_numbers(&rebuilt, &fx).await,
+        incremental,
+        "the same numbers whatever order the snapshots were applied in"
+    );
+
+    // The snapshots holding it at `CS` go: the largest is 1000 again.
+    fx.manager.delete("/x", "s1", true).await.unwrap();
+    fx.manager.delete("/a", "s3", true).await.unwrap();
+    fx.publish().await;
+    svc.catch_up().await.unwrap();
+    assert_verified(&svc, "the larger occurrences deleted").await;
+    assert_eq!(refer(&svc, &on_a).await, 1000);
+    rebuilt.catch_up().await.unwrap();
+    assert_eq!(
+        snapshot_of_numbers(&rebuilt, &fx).await,
+        snapshot_of_numbers(&svc, &fx).await
+    );
+
+    // `--verify` checks the size itself, by name, even when the index is
+    // consistent with itself (every run and the entry moved together).
+    let ix = svc.index().await;
+    let mut entry = ix.chunk_entry(&tail).unwrap().unwrap();
+    entry.size += 7;
+    for run in entry.runs.iter_mut() {
+        run.size += 7;
+    }
+    ix.overwrite_chunk_entry(&tail, &entry).unwrap();
+    drop(ix);
+    let report = svc.verify().await.unwrap();
+    let named = format!(
+        "chunk {}: size index 1007 ≠ brute force 1000",
+        tail.to_hex()
+    );
+    assert!(
+        report.details.iter().any(|line| line.starts_with(&named)),
+        "{:#?}",
+        report.details
+    );
+}
+
+/// A flag read from a state no commit holds is read again. A snapshot
+/// keeps `c`; `h` names it too, and is unlinked by commit 3, so the
+/// refresh to commit 3 reads `c`'s flag — while the replica, already past
+/// commit 3, has `k` naming `c` for a moment. `k` is rewritten before
+/// commit 4, whose diff names only `k`'s new chunk: before the fix the
+/// flag stayed `live` for good (found by the `snapacct` harness scenario:
+/// a revert and an overwrite between two snapshots).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flag_read_ahead_of_its_commit_is_read_again() {
+    let mut fx = Fixture::new();
+    let a = fx.mkdir(ROOT_INO, "a");
+    let c = vec!["c".to_string()];
+    fx.file(a, "f", &c, 100).await;
+    fx.file(ROOT_INO, "h", &c, 100).await;
+    let snap = fx.snap("/a").await;
+    fx.meta.unlink(a, "f").unwrap();
+    fx.publish().await;
+    let svc = fx.service(Fixture::config(SnapAcctMode::On));
+    svc.catch_up().await.unwrap();
+    assert_verified(&svc, "c live through h").await;
+
+    fx.meta.unlink(ROOT_INO, "h").unwrap();
+    fx.publish().await;
+    // Past the commit, unpublished: `k` names `c` while the flag is read.
+    let k = fx.file(ROOT_INO, "k", &c, 100).await;
+    svc.catch_up().await.unwrap();
+    fx.write(k, &["other".to_string()], 100).await;
+    fx.publish().await;
+    svc.catch_up().await.unwrap();
+    assert_verified(&svc, "c named only by a state between two commits").await;
+    let n = svc.snap_numbers(&snap).await.unwrap().ready().unwrap();
+    assert_eq!(n.used, 100, "c is the snapshot's alone again");
+    // Settled: the last refresh read at exactly the commit's state.
+    svc.catch_up().await.unwrap();
+    assert_eq!(svc.stats().live_rechecks.load(Ordering::Relaxed), 0);
+}
+
+/// A replica that is never at exactly a commit's state (a local write is
+/// always unshipped when the refresh runs) never recomputes every flag
+/// per refresh: the full recheck its first build leaves pending waits for
+/// a settled moment while each refresh diffs, O(what changed). Before,
+/// every refresh fell back to a full recompute (review of 32-M5d: one
+/// per round of publish → unshipped write → refresh).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_never_settled_replica_never_recomputes_every_flag() {
+    let mut fx = Fixture::new();
+    let a = fx.mkdir(ROOT_INO, "a");
+    let f = fx.file(a, "f", &["c0".to_string()], 100).await;
+    let busy = fx.file(ROOT_INO, "busy", &["b".to_string()], 100).await;
+    fx.snap("/a").await;
+    fx.publish().await;
+    // Built with a write unshipped: the flags are not at a commit's state.
+    fx.write(busy, &["b0".to_string()], 100).await;
+    let svc = fx.service(Fixture::config(SnapAcctMode::On));
+    svc.catch_up().await.unwrap();
+    let stats = svc.stats().clone();
+    let full = || stats.full_refreshes.load(Ordering::Relaxed);
+    let after_build = full();
+    assert!(stats.live_recheck_full.load(Ordering::Relaxed));
+    assert!(svc.recheck_pending());
+    let mut per_round = Vec::new();
+    for round in 1..=25u64 {
+        let before = full();
+        fx.write(f, &[format!("c{round}")], 100).await;
+        if round % 3 == 0 {
+            fx.snap("/a").await;
+        }
+        fx.publish().await;
+        fx.write(busy, &[format!("b{round}")], 100).await;
+        svc.catch_up().await.unwrap();
+        per_round.push(full() - before);
+        assert_eq!(
+            per_round.last(),
+            Some(&0),
+            "a full recompute in unsettled round {round}: {per_round:?}"
+        );
+    }
+    assert_eq!(full(), after_build, "no full recompute while unsettled");
+    assert!(stats.refreshes.load(Ordering::Relaxed) >= 25);
+    assert!(
+        stats.live_recheck_full.load(Ordering::Relaxed),
+        "still pending"
+    );
+    // The first settled moment serves it, once.
+    fx.publish().await;
+    svc.catch_up().await.unwrap();
+    assert_eq!(full() - after_build, 1);
+    assert!(!stats.live_recheck_full.load(Ordering::Relaxed));
+    assert_eq!(stats.live_rechecks.load(Ordering::Relaxed), 0);
+    assert!(!svc.recheck_pending());
+    assert_verified(&svc, "settled after 25 unsettled refreshes").await;
+}
+
+/// The flags a snapshot application reads ahead of the accounted commit
+/// are stored with it, so a restart before the next refresh does not lose
+/// them: `c` enters the index while `k` names it, `k` is rewritten and the
+/// snapshotted file removed before the next commit, and no diff names
+/// `c` again. A crash between an operation and storing its reads leaves a
+/// marker that reads as a full recheck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flags_read_by_an_application_survive_a_restart() {
+    let mut fx = Fixture::new();
+    let a = fx.mkdir(ROOT_INO, "a");
+    fx.publish().await;
+    let svc = fx.service(Fixture::config(SnapAcctMode::On));
+    svc.catch_up().await.unwrap();
+    let c = vec!["c".to_string()];
+    let k = fx.file(ROOT_INO, "k", &c, 100).await;
+    fx.file(a, "f", &c, 100).await;
+    let snap = fx.snap("/a").await;
+    // Applied (no refresh: not due), reading `c` as live.
+    while svc.step(1).await.unwrap() {}
+    assert!(svc.stats().live_rechecks.load(Ordering::Relaxed) <= 1);
+    fx.meta.unlink(a, "f").unwrap();
+    fx.write(k, &["other".to_string()], 100).await;
+    fx.publish().await;
+    drop(svc);
+    let svc = fx.service(Fixture::config(SnapAcctMode::On));
+    svc.catch_up().await.unwrap();
+    assert_verified(&svc, "a read ahead, then a restart").await;
+    let n = svc.snap_numbers(&snap).await.unwrap().ready().unwrap();
+    assert_eq!(n.used, 100, "c is the snapshot's alone");
+
+    // The crash window: the marker alone forces a full recheck, at the
+    // next settled refresh.
+    svc.interrupt_after_operation().await.unwrap();
+    drop(svc);
+    let svc = fx.service(Fixture::config(SnapAcctMode::On));
+    // Opening alone publishes what the stored marker stands for.
+    svc.index().await;
+    assert!(
+        svc.recheck_pending(),
+        "the marker reads as a pending recheck"
+    );
+    assert!(svc.stats().live_recheck_full.load(Ordering::Relaxed));
+    svc.catch_up().await.unwrap();
+    assert_eq!(svc.stats().full_refreshes.load(Ordering::Relaxed), 1);
+    assert!(!svc.recheck_pending());
+    assert!(!svc.stats().live_recheck_full.load(Ordering::Relaxed));
+    assert_verified(&svc, "after an interrupted operation").await;
 }
 
 /// A chain that cannot be applied (its snapshot's tree is unreadable)

@@ -754,7 +754,21 @@ For a snapshot S in chain C:
 
 A chunk's **size** is its plaintext length, derived from the manifest
 (`min(chunk_size, file_len − offset)`, sparse-aware). Spilled chunk
-lists count at their encoded length. Physical size (after zstd and E2E)
+lists count at their encoded length. One hash can occur at several
+derived sizes: a short tail chunk whose file is later extended past it,
+or cut inside it by a truncate that keeps the chunk, occurs again under
+the same hash at another size. A chunk then counts at the **largest size
+it occurs at in any snapshot**, in every number. *(Amended in 32-M5d:
+the `snapacct` harness scenario found the index counting the size of
+whichever occurrence it applied first, so two nodes — or one node before
+and after a rebuild — reported different bytes for the same snapshots,
+and `--verify` had to adopt the index's sizes, so it could no longer
+catch a wrong one. "The largest" is a function of the snapshots alone,
+so it keeps §6.3's "pure function of replicated state"; it rounds up,
+like the extended file's apparent size does. Its cost: a chunk met at a
+new largest size, or losing the snapshots that held it at its largest,
+moves the `REFER`/`WRITTEN` of every snapshot holding it — rare, and
+O(the chain's snapshots) when it happens.)* Physical size (after zstd and E2E)
 is not per-chunk knowable without a HEAD, so physical figures are
 **estimates**. They are logical bytes times the filesystem's
 compression ratio, from the last GC round's LIST totals. The GC round
@@ -778,7 +792,7 @@ header `{format, fs_uuid, accounted_seq}`.
 
 ```
 snapacct_chunk   hash                 -> { size: u32, live: bool,
-                                           runs: SmallVec<[(chain u32, first u32, last u32|OPEN, occ u32); 1]> }
+                                           runs: SmallVec<[(chain u32, first u32, last u32|OPEN, occ u32, size); 1]> }
 snapacct_birth   chain | first | hash -> ()      // range queries by birth
 snapacct_death   chain | last  | hash -> ()      // endpoint fix-ups on delete
 snapacct_snap    chain | ord          -> { id, root, used, written, refer, lsize }
@@ -790,6 +804,14 @@ snapacct_meta    chain registry (chain id <-> dir ino), per-chain ordinal counte
 snapshots whose ordinals fall in one of its runs. A run is **open**
 while the chunk is still present in the chain's newest snapshot. `occ`
 is the occurrence count at the chain head, for open runs only.
+
+Runs are kept per derived size (amended in 32-M5d, see §6.1): a chunk
+that occurs at two sizes has a run per size, runs of different sizes
+may overlap, and the chunk is in a snapshot when any of its runs covers
+it; `occ` counts the head's occurrences at the run's size, which is
+what lets the head's largest size drop when its last large occurrence
+goes. The entry's `size` is its runs' largest. Nearly every chunk has
+one size, and stores the run's size as a one-byte difference.
 
 A chunk that disappears and later reappears (a revert, a restored file)
 gets a **second run**. That is the "afterlife" ZFS's deadlists cannot
@@ -844,7 +866,11 @@ scans itself.
 
 - **Every node may build its own index.** It is a pure function of
   replicated state, so no RPC is needed and every node's CLI and UI can
-  answer locally. `CONSTELLATION_SNAPACCT=auto|on|off`, default `auto`.
+  answer locally. That includes the bytes: a chunk's size is the
+  largest it occurs at in the snapshots (§6.1), not the size of the
+  first occurrence an index happened to apply, so nodes that applied
+  the same snapshots in different orders, or rebuilt, agree to the byte
+  (the `snapacct` harness scenario asserts it on two nodes). `CONSTELLATION_SNAPACCT=auto|on|off`, default `auto`.
   With `auto`, the index is built on the first size request, and
   maintained from then on while the node has a policy root or the web
   UI is enabled. With `on`, it is always maintained. With `off`, size
@@ -869,7 +895,8 @@ scans itself.
   disk. Report the index footprint in `status`.
 - **`snapshot space --verify`** is a brute-force oracle. It fully walks
   every snapshot, computes the exact sets, and diffs them against the
-  index. It is the unit-test and harness oracle, and an operator's
+  index — every chunk's indexed size included, against the largest size
+  the walk saw it at, reported by chunk. It is the unit-test and harness oracle, and an operator's
   "do I trust these numbers" button.
 
 ### 6.4 Why not the alternatives

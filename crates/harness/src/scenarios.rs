@@ -59,6 +59,8 @@ mod passthrough;
 /// `daemon.lock` still held by a daemon the kernel has killed.
 mod rejoin;
 mod slowseal;
+/// Plan 32 §11: the reclaim estimate against what GC deletes.
+mod snapacct;
 /// Plan 38 §6/§3(e): the transport a mount negotiates, and whether a
 /// session on it can be handed over.
 pub mod transport;
@@ -338,6 +340,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: gc_lifecycle,
+    },
+    Scenario {
+        name: "snapacct",
+        desc: "snapshot accounting: --verify clean on two nodes; a dry-run reclaim set equals what GC then deletes",
+        requires: &[],
+        caps: &[],
+        run: snapacct::snapacct,
     },
     Scenario {
         name: "gc-dedup-race",
