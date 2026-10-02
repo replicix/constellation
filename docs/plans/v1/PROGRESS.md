@@ -30408,6 +30408,75 @@ per 10M chunks; ≈1.2 GB if most runs are closed).
 
 Gates (this worktree, `CARGO_TARGET_DIR` unset):
 
+## Plan 32 M0c (delete-by-id, orphan reconciliation, rename-safe listing)
+
+Steps 0.3 and 0.5 of [plan 32](wip/32-snapshot-policies-and-space.md): a
+snapshot delete is a point lookup by its computed id; every GC round makes
+the two copies of a snapshot (the `snaps/` object and the replicated row)
+agree again before it marks; and `.constellation/snapshot/` follows a
+renamed directory.
+
+| Item | State | Where |
+|---|---|---|
+| `snapshot_id(path, name)` (blake3 of `path@name`) moved to `constellation_mtree::keys`, the one crate below both the replica and the bucket layout; `constellation_store_s3::snapshot_id` and `constellation_meta::snapshot_id` re-export it, so the row key and the object name cannot drift apart | DONE | `crates/mtree/src/keys.rs`, `crates/store-s3/src/snapshot.rs`, `crates/meta/src/lib.rs` |
+| `Meta::delete_snapshot(path, name)` computes the id and calls the new `Meta::delete_snapshot_by_id(id) -> bool` (a `get` on the row key, no scan); the `SnapDelete` record is unchanged (path/name taken from the row); a missing id is `false` and writes nothing. `SnapshotManager::delete` deletes by the id it already computed for the hold check | DONE | `crates/meta/src/store/snapshot.rs`, `crates/engine/src/snapshot.rs` |
+| GC reconciliation (`reconcile_snapshots`), after the round's first tail and **before marking**, behind the `_gc` lease (renewed before every delete/PUT): an object with no row older than `gc.horizon` (and never younger than one lease TTL) is deleted and journaled `snap-orphan-object` (evidence `id`, `path`, `name`, `created_unix_ms`, `horizon_ms`); a row with no object is logged at `warn` and re-PUT from the row (plan-32 extensions included, `created_unix_ms` preserved) with create-if-absent, journaled `snap-object-restored` | DONE | `crates/engine/src/gc.rs` |
+| The orphans a round deletes stay chunk-GC roots for the rest of that round — the mark and the sweep's refresh (`snapshot_roots_kept`, both `diff` and `full` modes); rows and objects stay roots as `32-m0b` made them | DONE | `crates/engine/src/gc.rs` |
+| Verify-only rounds report both kinds as candidates (`hash: None`, the rule above, `snaps/<id>.json` key) and act on nothing; real rounds report deleted orphans in `deleted` and restored objects in the new `GcReport.restored` (serialized only when non-empty); fsck still counts only `orphan-horizon` marks | DONE | `crates/engine/src/gc.rs` |
+| `covering` is rename-safe: a snapshot also covers a directory when its `SnapshotRoot.ino` is the current ino of that directory or of one of its ancestors; a path match whose ino differs (a replaced directory) keeps today's behaviour; precedence documented on `covering` | DONE | `crates/engine/src/snapshot.rs` |
+| Tests: delete by id and by `path@name`, misses are `false` and journal nothing, follower replay (`snapshot_holds::snapshots_are_deleted_by_their_computed_id`); orphan younger than the horizon left alone / verify-only reports without acting / real round deletes, journals, keeps the orphan's chunk that round / next round collects it, in both walk modes (`gc::tests::an_orphan_snapshot_object_is_deleted_after_the_horizon`); row without object restored byte-identically, verify-only only reports, journaled (`gc::tests::a_row_without_its_object_gets_it_back`); a delete in flight is not restored (`gc::tests::a_delete_in_flight_is_not_restored`); rename (`snapshot::tests::a_renamed_directory_keeps_its_snapshots`) and replace + identity-over-path precedence (`snapshot::tests::a_replaced_directory_keeps_the_path_rule`); `snapshot-mount` harness scenario gained the rename and replace reads | DONE | as named; `crates/harness/src/scenarios.rs` |
+| `dirty.rs` / `holder_capture.rs` recorded rows under ids that were not `snapshot_id(path, name)` (`"snap1"` for `/@s`), which the old scan tolerated and a point lookup does not: they now use the computed id and assert the delete found its row | DONE | `crates/meta/tests/{dirty,holder_capture}.rs` |
+
+### Decisions taken here (the brief left them open)
+
+- **Covering precedence.** Per row, an identity (ino) match beats a path
+  match (a row matching both is an identity match). Across rows, one entry
+  per name; first wins on: (1) distance — a snapshot of the directory itself
+  beats an ancestor's (as before); (2) at equal distance, identity match
+  whose recorded path is the directory's current path, then identity match
+  recorded under an old name (renamed), then path-only match (a replaced
+  directory's snapshot) — the directory's own history beats a predecessor
+  that merely held the path; (3) newer `created_unix_ms`, then id.
+  Ancestor identity matches are included (snapshot `/a`, `mv /a /b`, then
+  `/b/sub/.constellation/snapshot` shows the snapshot's `sub`), the natural
+  extension of the existing ancestor path rule.
+- **Replaced-directory behaviour (kept).** Snapshot `/a`, `rm -r /a`,
+  `mkdir /a`: the new `/a`'s `.constellation/snapshot/` still lists the old
+  directory's snapshots, showing the *old* directory frozen (its inode in
+  the snapshot's tree). The same holds for a path vacated by a rename and
+  re-created. Only a name collision with the directory's own history hides
+  the predecessor's entry (rule 2).
+- **Restores wait a lease TTL first.** A row without its object is
+  expected to be impossible, but it is *observable*: a delete on another
+  node removes its row locally and the object immediately, and this replica
+  keeps the row until that `SnapDelete` is shipped and tailed. Restoring then
+  would resurrect a deleted snapshot's object and block re-creating its
+  name. So when such rows are seen, reconciliation holds the lease for one
+  TTL, tails again, and restores only rows still present whose object is
+  still absent. The wait is paid only in rounds that saw such a row, and it
+  still happens before marking.
+- **Orphan age floor.** `gc.horizon` as specified, but never less than one
+  lease TTL: with a test horizon of `0` a create in flight on another node
+  (object written, row not yet shipped) would otherwise be deleted.
+- **Rows are read before objects are listed**, so a create landing between
+  the two reads shows as a young object, never as a row without an object;
+  each finding is re-checked against the replica right before acting.
+- **The metadata-tree pass is unchanged.** `mtree_gc` still takes snapshot
+  roots from `snaps/` objects only; an orphan this round deleted no longer
+  roots its tree nodes there (they then follow that pass's own condemn /
+  horizon protocol). The brief asked for same-round protection of chunks;
+  a restore runs before the metadata pass, so a restored row's tree is
+  rooted again in the same round.
+- **Inode reuse** (plan 32 §4.4's assumption, relevant because identity
+  matching keys on ino): `alloc_ino_tx` hands out per-directory blocks from a
+  monotonic per-node counter under the node prefix, and
+  `reclaim_ino_counter` only moves it forward; inode numbers are not reused.
+- The `vfs` reference filesystem (`mock/reffs.rs`) still models the
+  path-only rule; no conformance test combines renames with snapshots, and
+  changing the reference contract is outside this chunk.
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
+
 | Command | Result |
 |---|---|
 | `cargo fmt --all -- --check` | exit 0, no diff |
@@ -30418,6 +30487,50 @@ Gates (this worktree, `CARGO_TARGET_DIR` unset):
 | `cargo build --release --workspace` | exit 0 |
 | `target/release/harness run gc-lifecycle gc-dedup-race gc-open-orphan-hold snapshot-lifecycle snapshot-churn clone-workflow mtree-gc-plateau git-under-flock-gc fsck-repair e2e-basic e2e-two-nodes` (two invocations) | ALL SCENARIOS PASSED (11/11) |
 | the first nine again with `CONSTELLATION_GC_SPILL_CACHE_MIB=0` | ALL SCENARIOS PASSED (9/9) |
+
+### Review fix round
+
+| Item | State | Where |
+|---|---|---|
+| **Must fix — listing after a prior lookup.** The `.constellation` / `snapshot` synthetic nodes are interned once per `{parent ino}/{name}` and kept, and they captured the directory's *path* at first lookup: after `ls /a/.constellation/snapshot; mv /a /b` the mount listed by `/a`, missing snapshots taken as `/b@…` and showing a new `/a`'s. They now carry the directory's inode (`SyntheticNode::ConstellationOf { dir }`, `SnapshotsOf { dir }`), and `SnapshotManager::covering(dir: Ino)` builds the path and ancestor chain from the replica on every call (`MetaStore::ancestry(ino)`: root-to-`ino` `(ino, name)` pairs in one read snapshot, `None` for a chain that does not reach the root, where `path_of` would return a partial path). A directory no longer linked in lists nothing | DONE | `crates/engine/src/view/synthetic.rs`, `crates/engine/src/snapshot.rs`, `crates/meta/src/store/reads.rs` |
+| **Should fix 1.** A row whose root does not parse is skipped with a `warn` in `covering` instead of failing every listing with `EIO` | DONE | `crates/engine/src/snapshot.rs` |
+| **Should fix 2.** The holder-side batch delete (`snapshot_batch.rs`, from `32-m0a`) deletes by the id it already has (`delete_snapshot_by_id`); `SnapshotManager::delete` has the one shape after the rebase | DONE | `crates/engine/src/snapshot_batch.rs` |
+| Nits: `a_delete_in_flight_is_not_restored` calls `reconcile_snapshots` with a `GcTail::Daemon` channel the test serves: the deleter's delete lands *in* the reconciliation's one tail (asserting the row is still there and exactly one tail was asked for), so the wait is always exercised; the orphan loop's re-check comment says what it covers (a local create; no tail runs there) | DONE | `crates/engine/src/gc.rs` |
+| Tests: `view::confine_tests::snapshot_listing_follows_a_renamed_directory` (through `View`: look up and list `.constellation/snapshot`, rename, snapshot under the new name, list the same nodes again, recreate the old name and snapshot it — not shown under the moved directory; the new one lists its own plus the path rule's), `snapshot::tests::an_unreadable_snapshot_row_does_not_break_listings`; harness `snapshot-mount` lists `project/.constellation/snapshot` before the `mv`, snapshots `/renamed@after`, recreates `/project` and snapshots it, and checks the moved directory lists `after release` only | DONE | as named; `crates/harness/src/scenarios.rs` |
+
+Gates of the fix round (rebased on `fe32940`, `CARGO_TARGET_DIR` unset,
+`ulimit -n` 65536, private `CONSTELLATION_HARNESS_DOCKER_PREFIX`):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace`, split by crate (engine, meta, mtree, store-s3 / types, platform, vfs, net, upload-concurrency, frontend-fuse, chaos, csi, uploadbench / authority / control and model's lib, backup, cto, delegation, flex_epochs, holder_side, hotdir, inbox targets / constellation, harness) | every binary passed, 0 failed |
+| `cargo test -p constellation-model --release --test locks --test positions --test today_bugs` (the model checker's long targets; in debug they exceed the tool's 10-minute limit) | 45 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run` gc-lifecycle gc-dedup-race gc-open-orphan-hold snapshot-lifecycle snapshot-mount snapshot-churn clone-workflow fsck-repair e2e-basic e2e-two-nodes (three invocations) | ALL SCENARIOS PASSED (10/10) |
+| the review's repro by hand on a release mount (local backend): `mkdir /a; ls /a/.constellation/snapshot; snapshot /a@before; mv /a /b; snapshot /b@after; mkdir /a; snapshot /a@newa` | `/b` lists `after before` (before and after the new `/a`), `/a` lists `before newa` |
+| `bash tests/integration.sh` | not run this round. On this host its compose floci container exits at once: port 4566 is taken by another agent's container, and the init hook's bind mount gets `Permission denied` because it lacks an SELinux `:Z` label. The first round ran the script's body against a private floci (`-v init.sh:ro,Z`): SMOKE TEST PASSED. The `box-gates` chunk owns the compose fix |
+
+### Review fix round 2
+
+| Item | State | Where |
+|---|---|---|
+| The pre-M0c path variants `SyntheticNode::Constellation { path }` / `SnapshotDirectory { path }` and every path that served them (`View::listed_directory`, the path-resolving arms of lookup/readdir/attr) are removed, with the test `view::confine_tests::a_handed_over_path_node_still_lists`; `ConstellationOf { dir }` / `SnapshotsOf { dir }` take their place in the enum | DONE | `crates/engine/src/view/synthetic.rs`, `crates/engine/src/view/confine_tests.rs` |
+| `HANDOVER_VERSION` 1 → 2: the synthetic registry crosses in the handoff, and an older binary's nodes no longer decode, so the upgrade preflight (`daemon --handover-abi`) refuses a handover between the two instead of failing after the `exec` | DONE | `crates/cli/src/handover.rs` |
+
+Gates (`CARGO_TARGET_DIR` unset, `ulimit -n` 65536, prefix `m0cfix2`):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test -p constellation-engine -p constellation-meta -p constellation-frontend-fuse -p constellation` | every binary passed, 0 failed |
+| `cargo test --workspace --exclude` those four `--exclude constellation-model` | 1126 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run snapshot-mount session-handover-idle upgrade-under-load` | ALL SCENARIOS PASSED (3/3) |
 
 ## Fix: a mutate outcome is the op's own rows, not a window over the journal
 
@@ -30982,3 +31095,9 @@ constellation-engine` 377 + 1 passed, 5 ignored; the workspace split per crate
 (with control `web` and vfs `conformance`, as the workspace build unifies them;
 the model crate per test binary) 1991 passed, 0 failed (1987 + 4 new tests);
 release heavy model and measurement ok; smoke passed.
+
+| `cargo test --workspace` | exit 0; 1988 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | port 4566 held by another agent's floci (`boxgates-floci-1`), so the script's body was run against it with its AWS_* settings (`bash tests/smoke.sh s3://constellation-ci/run-m0c-…`): SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run …` (snapshot-mount snapshot-lifecycle clone-workflow / gc-lifecycle gc-dedup-race gc-open-orphan-hold fsck-repair / snapshot-churn e2e-basic e2e-two-nodes, three invocations) | ALL SCENARIOS PASSED (10/10) |

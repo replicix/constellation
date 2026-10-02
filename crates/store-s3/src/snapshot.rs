@@ -108,11 +108,7 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn snapshot_id(path: &str, name: &str) -> String {
-    blake3::hash(format!("{path}@{name}").as_bytes())
-        .to_hex()
-        .to_string()
-}
+pub use constellation_mtree::keys::snapshot_id;
 
 #[derive(Clone)]
 pub struct SnapshotStore {

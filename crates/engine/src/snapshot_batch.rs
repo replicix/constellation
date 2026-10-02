@@ -858,7 +858,7 @@ impl SnapshotBatcher {
             let Some(_admitted) = self.host.admit() else {
                 return lease_lost();
             };
-            match self.meta.delete_snapshot(&row.path, &row.name) {
+            match self.meta.delete_snapshot_by_id(id) {
                 Ok(true) => *wrote = true,
                 Ok(false) => return ItemResult::NotFound,
                 Err(error) => {
@@ -869,7 +869,8 @@ impl SnapshotBatcher {
             }
         }
         // Row first, then the object: a failure here leaves an orphan
-        // object (a leak §0.3 reconciles), never a dangling row. The
+        // object (GC's reconciliation deletes it once it is older than
+        // `gc.horizon`, plan 32 §0.3), never a dangling row. The
         // caller hears of it, as it did before batches.
         if let Err(error) = self.snapshots.delete_record(&row.path, &row.name).await {
             tracing::warn!(

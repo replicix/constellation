@@ -99,6 +99,39 @@ impl Meta {
         Ok(format!("/{}", names.join("/")))
     }
 
+    /// The directories from the root down to `ino` with the name each
+    /// has in the one above: `[(ROOT_INO, ""), (a, "a"), …, (ino, "x")]`,
+    /// in one read snapshot. Unlike [`Self::path_of`] a chain that does
+    /// not reach the root (an unlinked directory, a broken reverse index)
+    /// is `None`, never a partial path.
+    pub fn ancestry(&self, ino: Ino) -> Result<Option<Vec<(Ino, String)>>, MetaError> {
+        let r = self.db.read_tx();
+        let mut chain = vec![(ino, String::new())];
+        let mut cur = ino;
+        while cur != ROOT_INO {
+            let range = keys::names_of(cur);
+            let Some(guard) = r.range(&self.ns, ns::key_range_bounds(&range)).next() else {
+                return Ok(None);
+            };
+            let (k, _) = guard.into_inner()?;
+            let keys::Key::RDentry {
+                parent_ino, name, ..
+            } = keys::Key::parse(&k)?
+            else {
+                return Ok(None);
+            };
+            chain.last_mut().unwrap().1 = String::from_utf8_lossy(name).into_owned();
+            // A directory has one parent; a cycle is a corrupt index.
+            if chain.iter().any(|(seen, _)| *seen == parent_ino) {
+                return Ok(None);
+            }
+            chain.push((parent_ino, String::new()));
+            cur = parent_ino;
+        }
+        chain.reverse();
+        Ok(Some(chain))
+    }
+
     pub fn child_ino(&self, parent: Ino, name: &str) -> Result<Option<Ino>, MetaError> {
         let r = self.db.read_tx();
         ns::child_ino(&r, &self.ns, parent, name)

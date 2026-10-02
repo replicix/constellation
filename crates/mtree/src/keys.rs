@@ -258,6 +258,18 @@ pub fn subsystem(subsystem: Subsystem, id: &[u8]) -> Vec<u8> {
     key
 }
 
+/// A snapshot's id: the hex blake3 of `path@name`. It is both the
+/// `Subsystem::Snapshot` row's id and the `snaps/<id>.json` object's
+/// name, so it lives here, below the replica (`meta`) and the bucket
+/// layout (`store-s3`) alike: two copies of the hash could drift apart,
+/// and a row whose key no longer matched its object would be an orphan
+/// on both sides.
+pub fn snapshot_id(path: &str, name: &str) -> String {
+    blake3::hash(format!("{path}@{name}").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 // -------------------------------------------------------------- ranges
 
 /// A half-open key range, which is what a scan actually needs.

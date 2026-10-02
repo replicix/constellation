@@ -110,7 +110,8 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
         meta.set_xattr(f1, &format!("user.k{i}"), b"vvvvvvvv", SetXattrMode::Set)
             .unwrap();
     }
-    meta.record_snapshot(&SnapshotRow::new("snap0", "/", "s0", "abc", 0))
+    let snap0 = constellation_meta::snapshot_id("/", "s0");
+    meta.record_snapshot(&SnapshotRow::new(&snap0, "/", "s0", "abc", 0))
         .unwrap();
 
     assert_captured(&meta, "mkdir", |m| {
@@ -168,12 +169,12 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
     // Plan 32 §0.4: a hold is a journaled `ns` write like any other, so a
     // stranded one must roll back to exactly the unheld row.
     assert_captured(&meta, "set_snapshot_hold", |m| {
-        m.set_snapshot_hold("snap0", true, Some("csi:content-uid"), false)
+        m.set_snapshot_hold(&snap0, true, Some("csi:content-uid"), false)
             .unwrap()
             .expect("the row seeded above")
     });
     assert_captured(&meta, "delete_snapshot", |m| {
-        m.delete_snapshot("/", "s0").unwrap()
+        assert!(m.delete_snapshot("/", "s0").unwrap())
     });
     assert_captured(&meta, "write_quota", |m| {
         m.write_quota(Some(1 << 30)).unwrap()

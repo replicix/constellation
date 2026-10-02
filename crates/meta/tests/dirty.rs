@@ -159,7 +159,8 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
     });
 
     step!(meta, "record_snapshot", {
-        meta.record_snapshot(&SnapshotRow::new("snap1", "/", "s", "abc", 0))
+        let id = constellation_meta::snapshot_id("/", "s");
+        meta.record_snapshot(&SnapshotRow::new(&id, "/", "s", "abc", 0))
             .unwrap();
     });
 
@@ -167,13 +168,20 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
     // easiest kind of `ns` write to forget to dirty: the key already
     // existed, so nothing about it looks new.
     step!(meta, "set_snapshot_hold", {
-        meta.set_snapshot_hold("snap1", true, Some("user:attila"), false)
-            .unwrap()
-            .expect("the row this test just recorded");
+        meta.set_snapshot_hold(
+            &constellation_meta::snapshot_id("/", "s"),
+            true,
+            Some("user:attila"),
+            false,
+        )
+        .unwrap()
+        .expect("the row this test just recorded");
     });
 
     step!(meta, "delete_snapshot", {
-        meta.delete_snapshot("/", "s").unwrap();
+        // A point lookup by the computed id (plan 32 §0.3): the row must
+        // be recorded under `snapshot_id(path, name)` to be found.
+        assert!(meta.delete_snapshot("/", "s").unwrap());
     });
 
     step!(meta, "write_quota", {

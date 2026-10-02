@@ -17,6 +17,7 @@ pub mod session;
 pub mod snapsched;
 pub mod store;
 
+pub use constellation_mtree::keys::snapshot_id;
 pub use error::MetaError;
 pub use mutate::{execute as execute_mutate, MutateOp, MutateOutcome};
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};

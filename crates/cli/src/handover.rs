@@ -114,8 +114,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The handoff's format: an old and a new binary must agree on it
-/// (`daemon --handover-abi`).
-pub const HANDOVER_VERSION: u32 = 1;
+/// (`daemon --handover-abi`). Bump it on any change to what crosses:
+/// 2 — plan 32 M0c, the `.constellation` synthetic nodes carry the
+/// directory's inode instead of its path.
+pub const HANDOVER_VERSION: u32 = 2;
 
 /// `daemon.lock`'s descriptor (held for the process's life; handed on).
 static LOCK_FD: AtomicI32 = AtomicI32::new(-1);

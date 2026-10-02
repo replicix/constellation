@@ -25,7 +25,7 @@ use constellation_store_s3::{
     BlobStore, NodeCache, SnapshotRecord, SnapshotStore, SnapshotTreeRoot, StoreError,
 };
 use futures::future::BoxFuture;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Force a metadata publish and return the commit that now reflects this
@@ -462,37 +462,85 @@ impl SnapshotManager {
         Ok(self.meta.snapshots(normalized.as_deref())?)
     }
 
-    /// Snapshots whose frozen subtree contains `directory`, paired with the
-    /// frozen object corresponding to that directory.  Component-aware
-    /// prefix matching avoids treating `/project-old` as a child of
-    /// `/project`.
-    pub async fn covering(&self, directory: &str) -> Result<Vec<(SnapshotRow, FrozenObject)>> {
-        let directory = normalize_path(directory);
+    /// Snapshots whose frozen subtree contains the directory `directory`
+    /// (an inode), paired with the frozen object corresponding to that
+    /// directory: what `<directory>/.constellation/snapshot/` lists.
+    ///
+    /// The directory is named by inode, and its current path and
+    /// ancestors are read from the replica on every call, so a listing
+    /// follows the directory through renames; a directory no longer
+    /// linked into the tree (removed while a listing of it was open)
+    /// lists nothing.
+    ///
+    /// A snapshot covers `directory` in one of two ways:
+    ///
+    /// - **by identity** (plan 32 §0.5): its `SnapshotRoot.ino` is the
+    ///   current inode of `directory` or of one of its ancestors. A renamed
+    ///   directory keeps its whole history this way, whatever path the
+    ///   snapshots were taken under.
+    /// - **by path** (the pre-plan-32 rule, kept): its recorded path is
+    ///   `directory` or a component-aware ancestor of it (`/project-old`
+    ///   is not under `/project`). This is the only way a snapshot of a
+    ///   directory that was since *replaced* — removed, and a new one
+    ///   made at the same path — still shows: under the new directory, as
+    ///   it always has. A snapshot matching both ways is an identity match.
+    ///
+    /// Either way the relative path from the matched ancestor down to
+    /// `directory` must still name a directory inside the frozen tree.
+    ///
+    /// One name shows once. Precedence, first wins:
+    /// 1. the nearest match: a snapshot of `directory` itself beats an
+    ///    ancestor's snapshot of the same name (as before);
+    /// 2. at the same distance, an identity match whose recorded path is
+    ///    still the directory's current path, then an identity match taken
+    ///    under an old name (renamed), then a path-only match (a replaced
+    ///    directory's) — the directory's own history beats a predecessor's
+    ///    that merely shared the path;
+    /// 3. the newer snapshot (`created_unix_ms`), then the id, so the
+    ///    choice never depends on row order.
+    ///
+    /// A row whose root does not parse is skipped with a warning: it
+    /// cannot be listed, and it must not take every other listing down.
+    pub async fn covering(&self, directory: Ino) -> Result<Vec<(SnapshotRow, FrozenObject)>> {
+        let Some(chain) = self.meta.ancestry(directory)? else {
+            return Ok(Vec::new());
+        };
+        let components: Vec<String> = chain.iter().skip(1).map(|(_, name)| name.clone()).collect();
+        let directory = format!("/{}", components.join("/"));
+        // The directory and its ancestors, by inode: where each sits now,
+        // and how many components of `directory` it spans.
+        let live: HashMap<Ino, (String, usize)> = chain
+            .iter()
+            .enumerate()
+            .map(|(depth, (ino, _))| (*ino, (format!("/{}", components[..depth].join("/")), depth)))
+            .collect();
         let mut covered = Vec::new();
         for row in self.meta.snapshots(None)? {
-            let relative = if directory == row.path {
-                Some("")
-            } else if row.path == "/" {
-                // A snapshot of the root covers every directory (the
-                // component check below would look for a second `/`).
-                Some(directory.trim_start_matches('/'))
-            } else {
-                directory
-                    .strip_prefix(&row.path)
-                    .and_then(|rest| rest.strip_prefix('/'))
+            let snapshot = match SnapshotRoot::parse(&row.root_hash) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(id = %row.id, path = %row.path, name = %row.name, %error,
+                        "snapshot listing: a snapshot row with an unreadable root; skipped");
+                    continue;
+                }
             };
-            let Some(relative) = relative else { continue };
-            let components: Vec<String> = relative
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(str::to_string)
-                .collect();
-            let SnapshotRoot { root, ino, .. } = SnapshotRoot::parse(&row.root_hash)?;
+            let matched = match live.get(&snapshot.ino) {
+                Some((current, depth)) => {
+                    let rank = if *current == row.path { 0u8 } else { 1 };
+                    Some((*depth, rank))
+                }
+                None => path_depth(&row.path, &directory).map(|depth| (depth, 2)),
+            };
+            let Some((depth, rank)) = matched else {
+                continue;
+            };
+            let relative = components[depth..].to_vec();
+            let SnapshotRoot { root, ino, .. } = snapshot;
             let found = self
                 .tree()?
                 .read(root, move |reader, _| {
                     let mut ino = ino;
-                    for component in &components {
+                    for component in &relative {
                         match reader.lookup(ino, component.as_bytes())? {
                             Some(entry) if entry.attrs.kind.as_u8() == InodeKind::Dir.as_u8() => {
                                 ino = entry.ino
@@ -504,14 +552,21 @@ impl SnapshotManager {
                 })
                 .await?;
             if let Some(object) = found {
-                covered.push((row, object));
+                let distance = components.len() - depth;
+                covered.push(((distance, rank), row, object));
             }
         }
-        // An exact-path name wins over the same name inherited from an
-        // ancestor; otherwise the nearest ancestor wins.
-        covered.sort_by_key(|(row, _)| std::cmp::Reverse(row.path.len()));
+        covered.sort_by(|(a, ra, _), (b, rb, _)| {
+            a.cmp(b)
+                .then(rb.created_unix_ms.cmp(&ra.created_unix_ms))
+                .then(ra.id.cmp(&rb.id))
+        });
         let mut names = BTreeSet::new();
-        covered.retain(|(row, _)| names.insert(row.name.clone()));
+        let mut covered: Vec<(SnapshotRow, FrozenObject)> = covered
+            .into_iter()
+            .filter(|(_, row, _)| names.insert(row.name.clone()))
+            .map(|(_, row, object)| (row, object))
+            .collect();
         covered.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
         Ok(covered)
     }
@@ -584,17 +639,20 @@ impl SnapshotManager {
 
     pub async fn delete(&self, path: &str, name: &str, force: bool) -> Result<String> {
         let path = normalize_path(path);
+        let id = constellation_store_s3::snapshot_id(&path, name);
         // A held snapshot is never deleted out from under its owner
         // (plan 32 Step 5, plan 37's CSI driver): release it first.
         if !force {
-            let id = constellation_store_s3::snapshot_id(&path, name);
             if let Some(row) = self.meta.snapshot_by_id(&id)? {
                 if row.held {
                     bail!("{}", held_refusal(&row));
                 }
             }
         }
-        if !self.meta.delete_snapshot(&path, name)? {
+        // Row first, then the object: an interruption between the two
+        // leaves an orphan object (never a dangling row), which GC's
+        // reconciliation deletes once it is older than `gc.horizon`.
+        if !self.meta.delete_snapshot_by_id(&id)? {
             bail!("snapshot {path}@{name} does not exist");
         }
         self.records.delete(&path, name).await?;
@@ -823,6 +881,19 @@ pub fn snapshot_id_of(target: &str) -> Result<String> {
         }
         false => Ok(target.to_string()),
     }
+}
+
+/// How many leading components of `directory` (both normalized) the
+/// snapshot path `path` spans, when `path` is `directory` or a
+/// component-aware ancestor of it; `None` otherwise.
+fn path_depth(path: &str, directory: &str) -> Option<usize> {
+    let depth = path.split('/').filter(|part| !part.is_empty()).count();
+    let covers = path == directory
+        || path == "/"
+        || directory
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'));
+    covers.then_some(depth)
 }
 
 pub fn normalize_path(path: &str) -> String {
@@ -1231,7 +1302,7 @@ mod tests {
         );
 
         // What the FUSE view resolves for a subdirectory of the source.
-        let covering = manager.covering("/source/sub").await.unwrap();
+        let covering = covering_at(&manager, "/source/sub").await;
         assert_eq!(covering.len(), 1);
         let sub_frozen = manager.list_frozen(&covering[0].1).await.unwrap();
         assert_eq!(sub_frozen.entries[0].target.as_deref(), Some("../file"));
@@ -1243,5 +1314,195 @@ mod tests {
         assert!(refs.contains(&ChunkHash::of(b"old")));
         assert!(!refs.contains(&ChunkHash::of(b"newer")));
         assert_eq!(manager.refs(&row.id).await.unwrap().len(), refs.len());
+    }
+
+    /// `covering` of the directory at `dir` now.
+    async fn covering_at(manager: &SnapshotManager, dir: &str) -> Vec<(SnapshotRow, FrozenObject)> {
+        let ino = manager
+            .meta
+            .resolve_path(dir)
+            .unwrap()
+            .expect("no such directory");
+        manager.covering(ino).await.unwrap()
+    }
+
+    /// What `<dir>/.constellation/snapshot` lists, as `(name, path@name)`.
+    async fn listed(manager: &SnapshotManager, dir: &str) -> Vec<(String, String)> {
+        covering_at(manager, dir)
+            .await
+            .into_iter()
+            .map(|(row, _)| (row.name.clone(), format!("{}@{}", row.path, row.name)))
+            .collect()
+    }
+
+    /// The names of a frozen directory's entries.
+    async fn frozen_names(manager: &SnapshotManager, object: &FrozenObject) -> Vec<String> {
+        manager
+            .list_frozen(object)
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    /// Plan 32 §0.5: a renamed directory still lists its whole history —
+    /// itself and its subdirectories — because a snapshot also covers the
+    /// directory whose *inode* it froze, not only the path it was taken at.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renamed_directory_keeps_its_snapshots() {
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        let a = meta.mkdir(1, "a", 0o755, 1, 1).unwrap();
+        let sub = meta.mkdir(a.ino, "sub", 0o755, 1, 1).unwrap();
+        meta.create(sub.ino, "f", 0o644, 1, 1).unwrap();
+        let chunks = Arc::new(constellation_store_s3::ChunkStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let (manager, _nodes) = test_manager(meta.clone(), chunks.clone(), DEFAULT_CHUNK_SIZE);
+        // A publish refuses while anything is unshipped, a snapshot's own
+        // row included.
+        let mut segment = 0;
+        let mut ship = || {
+            segment += 1;
+            ship_all(&meta, segment)
+        };
+        ship();
+        manager.create("/a", "before").await.unwrap();
+        ship();
+        assert_eq!(
+            listed(&manager, "/a").await,
+            [("before".into(), "/a@before".into())]
+        );
+
+        meta.rename(1, "a", 1, "b").unwrap();
+        ship();
+        assert_eq!(
+            listed(&manager, "/b").await,
+            [("before".into(), "/a@before".into())],
+            "the renamed directory lost its history"
+        );
+        let below = covering_at(&manager, "/b/sub").await;
+        assert_eq!(below.len(), 1);
+        assert_eq!(frozen_names(&manager, &below[0].1).await, ["f"]);
+
+        // A snapshot taken under the new name joins it, and a name taken
+        // both before and after the rename shows once: the one recorded
+        // under the directory's current path.
+        manager.create("/b", "after").await.unwrap();
+        ship();
+        manager.create("/b", "before").await.unwrap();
+        ship();
+        assert_eq!(
+            listed(&manager, "/b").await,
+            [
+                ("after".into(), "/b@after".into()),
+                ("before".into(), "/b@before".into()),
+            ]
+        );
+        manager.delete("/b", "before", false).await.unwrap();
+        ship();
+        assert_eq!(
+            listed(&manager, "/b").await,
+            [
+                ("after".into(), "/b@after".into()),
+                ("before".into(), "/a@before".into()),
+            ]
+        );
+    }
+
+    /// A row whose root does not parse is skipped, with a warning: it
+    /// takes no listing down with it, neither its own directory's nor any
+    /// other's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_snapshot_row_does_not_break_listings() {
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        meta.mkdir(1, "a", 0o755, 1, 1).unwrap();
+        meta.mkdir(1, "other", 0o755, 1, 1).unwrap();
+        let chunks = Arc::new(constellation_store_s3::ChunkStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let (manager, _nodes) = test_manager(meta.clone(), chunks.clone(), DEFAULT_CHUNK_SIZE);
+        ship_all(&meta, 1);
+        manager.create("/a", "good").await.unwrap();
+        ship_all(&meta, 2);
+        let good = meta.snapshots(None).unwrap().pop().unwrap();
+        for (path, name) in [("/a", "bad"), ("/", "bad-root"), ("/other", "bad")] {
+            meta.record_snapshot(&SnapshotRow {
+                id: constellation_store_s3::snapshot_id(path, name),
+                path: path.into(),
+                name: name.into(),
+                root_hash: "not a tree root".into(),
+                ..good.clone()
+            })
+            .unwrap();
+        }
+        ship_all(&meta, 3);
+        assert_eq!(
+            listed(&manager, "/a").await,
+            [("good".into(), "/a@good".into())]
+        );
+        assert!(listed(&manager, "/other").await.is_empty());
+        assert!(listed(&manager, "/").await.is_empty());
+    }
+
+    /// Plan 32 §0.5's other half: a directory that was *replaced* — removed,
+    /// and a new one made at the same path — keeps today's behavior. The
+    /// path matches and the inode does not, so the old directory's
+    /// snapshots still show under the new one, frozen as they were. Only
+    /// where the replaced directory's snapshot and the new directory's own
+    /// (renamed-in) history share a name does identity win.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_directory_keeps_the_path_rule() {
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        let a = meta.mkdir(1, "a", 0o755, 1, 1).unwrap();
+        meta.create(a.ino, "old-file", 0o644, 1, 1).unwrap();
+        let chunks = Arc::new(constellation_store_s3::ChunkStore::new(Arc::new(
+            InMemory::new(),
+        )));
+        let (manager, _nodes) = test_manager(meta.clone(), chunks.clone(), DEFAULT_CHUNK_SIZE);
+        // A publish refuses while anything is unshipped, a snapshot's own
+        // row included.
+        let mut segment = 0;
+        let mut ship = || {
+            segment += 1;
+            ship_all(&meta, segment)
+        };
+        ship();
+        manager.create("/a", "daily").await.unwrap();
+        ship();
+        manager.create("/a", "weekly").await.unwrap();
+        ship();
+
+        // rm -r /a; mkdir /a
+        meta.unlink(a.ino, "old-file").unwrap();
+        meta.rmdir(1, "a").unwrap();
+        let new_a = meta.mkdir(1, "a", 0o755, 1, 1).unwrap();
+        assert_ne!(new_a.ino, a.ino);
+        ship();
+        let covering = covering_at(&manager, "/a").await;
+        let names: Vec<&str> = covering.iter().map(|(row, _)| row.name.as_str()).collect();
+        assert_eq!(names, ["daily", "weekly"]);
+        assert_eq!(covering[0].1.ino, a.ino, "the old directory, frozen");
+        assert_eq!(frozen_names(&manager, &covering[0].1).await, ["old-file"]);
+
+        // Move another directory, with a `daily` of its own, onto the path:
+        // its own `daily` (identity) beats the replaced one's (path);
+        // the replaced one's `weekly` still shows.
+        let c = meta.mkdir(1, "c", 0o755, 1, 1).unwrap();
+        meta.create(c.ino, "c-file", 0o644, 1, 1).unwrap();
+        ship();
+        manager.create("/c", "daily").await.unwrap();
+        ship();
+        meta.rmdir(1, "a").unwrap();
+        meta.rename(1, "c", 1, "a").unwrap();
+        ship();
+        let covering = covering_at(&manager, "/a").await;
+        let shown: Vec<String> = covering
+            .iter()
+            .map(|(row, _)| format!("{}@{}", row.path, row.name))
+            .collect();
+        assert_eq!(shown, ["/c@daily", "/a@weekly"]);
+        assert_eq!(frozen_names(&manager, &covering[0].1).await, ["c-file"]);
     }
 }

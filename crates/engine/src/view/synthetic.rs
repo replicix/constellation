@@ -9,12 +9,13 @@ pub(super) const SYNTHETIC_INO_BIT: u64 = 1 << 63;
 /// to the next process (`view::handoff`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SyntheticNode {
-    Constellation {
-        path: String,
-    },
-    SnapshotDirectory {
-        path: String,
-    },
+    /// `<dir>/.constellation` of the directory with inode `dir`, wherever
+    /// it sits now: the node is interned once per parent inode and kept,
+    /// so it must not capture the path (plan 32 §0.5 — a renamed
+    /// directory keeps listing its own snapshots, not its old path's).
+    ConstellationOf { dir: Ino },
+    /// `<dir>/.constellation/snapshot` (see [`Self::ConstellationOf`]).
+    SnapshotsOf { dir: Ino },
     Frozen {
         snapshot_id: String,
         kind: InodeKind,
@@ -68,7 +69,7 @@ impl View {
 
     pub(crate) fn synthetic_attr(&self, ino: Ino, node: &SyntheticNode) -> FileAttr {
         let (kind, mode, uid, gid, size, mtime_ns) = match node {
-            SyntheticNode::Constellation { .. } | SyntheticNode::SnapshotDirectory { .. } => {
+            SyntheticNode::ConstellationOf { .. } | SyntheticNode::SnapshotsOf { .. } => {
                 (InodeKind::Dir, 0o555, 0, 0, 0, 0)
             }
             SyntheticNode::Frozen {
@@ -197,6 +198,25 @@ impl View {
         Ok(tree)
     }
 
+    /// The snapshots `<dir>/.constellation/snapshot` lists.
+    fn covering(
+        &self,
+        dir: Ino,
+    ) -> Result<
+        Vec<(
+            constellation_meta::SnapshotRow,
+            crate::snapshot::FrozenObject,
+        )>,
+        Code,
+    > {
+        self.rt
+            .block_on(self.snapshots.covering(dir))
+            .map_err(|error| {
+                tracing::debug!(dir, %error, "snapshot listing failed");
+                Code::Io
+            })
+    }
+
     pub(crate) fn lookup_synthetic(
         &self,
         parent: Ino,
@@ -214,22 +234,19 @@ impl View {
             if attr.kind != InodeKind::Dir {
                 return Ok(None);
             }
-            let path = self.meta.path_of(parent).map_err(|_| Code::Io)?;
-            SyntheticNode::Constellation { path }
+            SyntheticNode::ConstellationOf { dir: parent }
         } else {
             let parent_node = self.synthetic_node(parent).ok_or(Code::Stale)?;
             if !self.synthetic_active(&parent_node) {
                 return Err(Code::Stale);
             }
             match parent_node {
-                SyntheticNode::Constellation { path } if name == "snapshot" => {
-                    SyntheticNode::SnapshotDirectory { path }
+                SyntheticNode::ConstellationOf { dir } if name == "snapshot" => {
+                    SyntheticNode::SnapshotsOf { dir }
                 }
-                SyntheticNode::SnapshotDirectory { path } => {
+                SyntheticNode::SnapshotsOf { dir } => {
                     let (row, root) = self
-                        .rt
-                        .block_on(self.snapshots.covering(&path))
-                        .map_err(|_| Code::Io)?
+                        .covering(dir)?
                         .into_iter()
                         .find(|(row, _)| row.name == name)
                         .ok_or(Code::NotFound)?;
@@ -287,13 +304,11 @@ impl View {
             return Err(Code::Stale);
         }
         let children: Vec<(String, SyntheticNode)> = match node {
-            SyntheticNode::Constellation { path } => {
-                vec![("snapshot".into(), SyntheticNode::SnapshotDirectory { path })]
+            SyntheticNode::ConstellationOf { dir } => {
+                vec![("snapshot".into(), SyntheticNode::SnapshotsOf { dir })]
             }
-            SyntheticNode::SnapshotDirectory { path } => self
-                .rt
-                .block_on(self.snapshots.covering(&path))
-                .map_err(|_| Code::Io)?
+            SyntheticNode::SnapshotsOf { dir } => self
+                .covering(dir)?
                 .into_iter()
                 .map(|(row, root)| {
                     Ok((

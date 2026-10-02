@@ -254,42 +254,33 @@ impl Meta {
         Ok(Some(row))
     }
 
+    /// Remove `path@name`'s row. The row key is computed from the id
+    /// (plan 32 §0.3), so this is a point lookup, not a scan.
     pub fn delete_snapshot(&self, path: &str, name: &str) -> Result<bool, MetaError> {
+        self.delete_snapshot_by_id(&keys::snapshot_id(path, name))
+    }
+
+    /// Remove snapshot `id`'s row; `false` when there is none. The
+    /// `SnapDelete` record carries the path and name the row recorded.
+    pub fn delete_snapshot_by_id(&self, id: &str) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
         let dirty = local.dirty(self);
-        let range = keys::records_of(Subsystem::Snapshot);
-        let mut found: Option<String> = None;
-        for guard in tx.range(&self.ns, ns::key_range_bounds(&range)) {
-            let (k, v) = guard.into_inner()?;
-            let id = match constellation_mtree::keys::Key::parse(&k)? {
-                constellation_mtree::keys::Key::Subsystem { id, .. } => {
-                    String::from_utf8_lossy(id).into_owned()
-                }
-                _ => continue,
-            };
-            let row = parse_snapshot_record(&id, &v)?;
-            if row.path == path && row.name == name {
-                found = Some(id);
-                break;
-            }
-        }
-        let Some(id) = found else { return Ok(false) };
-        ns::ns_remove(
-            &mut tx,
-            &self.ns,
-            dirty,
-            keys::subsystem(Subsystem::Snapshot, id.as_bytes()),
-        )?;
+        let key = keys::subsystem(Subsystem::Snapshot, id.as_bytes());
+        let Some(value) = tx.get(&self.ns, &key)? else {
+            return Ok(false);
+        };
+        let row = parse_snapshot_record(id, &value)?;
+        ns::ns_remove(&mut tx, &self.ns, dirty, key)?;
         journal::append_tx(
             &mut tx,
             &self.journal_ks,
             &self.local,
             &self.completed,
             &LogRecord::SnapDelete {
-                id,
-                path: path.to_string(),
-                name: name.to_string(),
+                id: id.to_string(),
+                path: row.path,
+                name: row.name,
             },
         )?;
         self.finish_local(&mut tx, local)?;

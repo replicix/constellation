@@ -827,6 +827,13 @@ roots:
 - `snapshot-mount` mounts `<path>@<name>` as a FUSE root, checks exact content
   and `EROFS` on mutation, then mounts `--rw --ephemeral`, writes the clone,
   cleanly unmounts, and verifies the temporary namespace entry disappears.
+  Then (plan 32 §0.5) it lists the snapshotted directory's
+  `.constellation/snapshot/` (so the mount holds those nodes), renames the
+  directory and reads the snapshot through the new name, snapshots it under
+  the new name, re-creates and snapshots the old name, and checks the moved
+  directory lists its own two snapshots only; and it replaces
+  another snapshotted directory (`rm -r`, `mkdir`) and reads the old
+  directory's snapshot under the new one (the path rule, unchanged).
 
 Phase 6b scenarios exercise E2E passphrase mode:
 

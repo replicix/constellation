@@ -62,9 +62,10 @@
 //!   addressable by handle, as an open descriptor across a bind mount's
 //!   boundary does on Linux; lookup by name never reaches it again.
 //! - **`.constellation` stays inside.** The synthetic tree under a
-//!   directory lists the snapshots covering *that directory's own path*
-//!   (taken of it or of an ancestor) and mirrors each at the same
-//!   relative path — so a view rooted at `/volumes/pv-1` sees pv-1's
+//!   directory lists the snapshots covering *that directory* (taken of
+//!   it or of an ancestor, matched by inode or by path:
+//!   `SnapshotManager::covering`) and mirrors each at the same relative
+//!   path — so a view rooted at `/volumes/pv-1` sees pv-1's
 //!   history only, never a sibling volume's, and never the filesystem
 //!   root's content.
 //!

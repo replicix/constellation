@@ -252,3 +252,51 @@ fn the_owner_rule_is_part_of_the_hold_transaction() {
         .unwrap();
     assert_eq!(row.owner(), Some("csi:y"));
 }
+
+/// Plan 32 §0.3: a delete computes the row key from `snapshot_id(path,
+/// name)` and removes it with a point lookup, journaling the same
+/// `SnapDelete` it always did; an id with no row is `false`, and writes
+/// nothing.
+#[test]
+fn snapshots_are_deleted_by_their_computed_id() {
+    let meta = Meta::open_in_memory().unwrap();
+    let daily = constellation_meta::snapshot_id("/data", "daily");
+    let weekly = constellation_meta::snapshot_id("/data", "weekly");
+    meta.record_snapshot(&SnapshotRow::new(&daily, "/data", "daily", "h", 1))
+        .unwrap();
+    meta.record_snapshot(&SnapshotRow::new(&weekly, "/data", "weekly", "h", 2))
+        .unwrap();
+    drain(&meta);
+
+    assert!(!meta.delete_snapshot_by_id("no-such-id").unwrap());
+    assert!(!meta.delete_snapshot("/data", "monthly").unwrap());
+    assert!(drain(&meta).is_empty(), "a miss journaled something");
+
+    assert!(meta.delete_snapshot("/data", "daily").unwrap());
+    assert!(meta.delete_snapshot_by_id(&weekly).unwrap());
+    let records = drain(&meta);
+    assert!(
+        matches!(
+            records.as_slice(),
+            [
+                LogRecord::SnapDelete { id: a, path: pa, name: na },
+                LogRecord::SnapDelete { id: b, path: pb, name: nb },
+            ] if a == &daily && pa == "/data" && na == "daily"
+                && b == &weekly && pb == "/data" && nb == "weekly"
+        ),
+        "{records:?}"
+    );
+    assert!(snapshot_rows(&meta).is_empty());
+    assert!(!meta.delete_snapshot_by_id(&daily).unwrap(), "already gone");
+
+    // The replayed delete removes the same row on a follower.
+    let follower = Meta::open_in_memory().unwrap();
+    let writer = Meta::open_in_memory().unwrap();
+    writer
+        .record_snapshot(&SnapshotRow::new(&daily, "/data", "daily", "h", 1))
+        .unwrap();
+    follower.apply_records(&drain(&writer)).unwrap();
+    assert!(writer.delete_snapshot("/data", "daily").unwrap());
+    follower.apply_records(&drain(&writer)).unwrap();
+    assert!(snapshot_rows(&follower).is_empty());
+}

@@ -401,7 +401,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "snapshot-mount",
-        desc: "snapshot subtree mounts read-only and ephemeral rw clone is removed",
+        desc: "snapshot subtree mounts read-only, ephemeral rw clone is removed, listing survives rename/replace",
         requires: &[],
         caps: &[],
         run: snapshot_mount,
@@ -2656,6 +2656,81 @@ fn snapshot_mount(_seed: u64) -> Result<()> {
         anyhow::ensure!(!leaked, "ephemeral clone remains visible");
         Ok(())
     })?;
+
+    // Plan 32 §0.5: a renamed directory keeps its history (the snapshot
+    // covers the directory's inode, not only the path it was taken at)…
+    // Listed first, so the `.constellation` nodes the mount keeps were
+    // made before the rename and must follow it.
+    let listing = |dir: &str| -> Result<Vec<String>> {
+        let mut names = std::fs::read_dir(source.mnt.join(dir).join(".constellation/snapshot"))?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    };
+    anyhow::ensure!(
+        listing("project")? == ["release"],
+        "before the rename: {:?}",
+        listing("project")?
+    );
+    std::fs::rename(source.mnt.join("project"), source.mnt.join("renamed"))?;
+    eventually(
+        "renamed directory lists its snapshot",
+        Duration::from_secs(20),
+        || {
+            let data = std::fs::read(
+                source
+                    .mnt
+                    .join("renamed/.constellation/snapshot/release/data"),
+            )?;
+            anyhow::ensure!(data == b"mounted-snapshot", "wrong frozen content");
+            Ok(())
+        },
+    )?;
+    // A snapshot under the new name joins the history; one of a new
+    // directory at the old path does not.
+    source.snapshot_create("/renamed@after")?;
+    eventually(
+        "renamed directory lists a snapshot taken after the rename",
+        Duration::from_secs(20),
+        || {
+            let names = listing("renamed")?;
+            anyhow::ensure!(names == ["after", "release"], "{names:?}");
+            Ok(())
+        },
+    )?;
+    std::fs::create_dir(source.mnt.join("project"))?;
+    source.snapshot_create("/project@newp")?;
+    eventually(
+        "a new directory at the old path lists its own snapshot",
+        Duration::from_secs(20),
+        || {
+            let names = listing("project")?;
+            anyhow::ensure!(names == ["newp", "release"], "{names:?}");
+            Ok(())
+        },
+    )?;
+    let names = listing("renamed")?;
+    anyhow::ensure!(
+        names == ["after", "release"],
+        "the renamed directory lists another directory's snapshot: {names:?}"
+    );
+    // …and a replaced one keeps the path rule: the old directory's
+    // snapshot still shows, frozen, under the new directory at its path.
+    std::fs::create_dir(source.mnt.join("replaced"))?;
+    std::fs::write(source.mnt.join("replaced/old"), b"before-replace")?;
+    source.snapshot_create("/replaced@old")?;
+    std::fs::remove_dir_all(source.mnt.join("replaced"))?;
+    std::fs::create_dir(source.mnt.join("replaced"))?;
+    eventually(
+        "replaced directory lists its predecessor's snapshot",
+        Duration::from_secs(20),
+        || {
+            let data = std::fs::read(source.mnt.join("replaced/.constellation/snapshot/old/old"))?;
+            anyhow::ensure!(data == b"before-replace", "wrong frozen content");
+            Ok(())
+        },
+    )?;
     source.unmount()
 }
 

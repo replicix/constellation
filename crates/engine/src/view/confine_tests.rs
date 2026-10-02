@@ -323,6 +323,64 @@ fn dot_constellation_under_a_subtree_view_mirrors_only_its_own_history() {
     }
 }
 
+/// Plan 32 §0.5 through the view, the way a mount reaches it: the
+/// `.constellation` and `snapshot` nodes are interned on first lookup and
+/// kept, so they must follow the directory's inode, not the path it had
+/// then. `/a` is looked up and listed, renamed to `/b`, snapshotted under
+/// the new name, and a new `/a` is made and snapshotted: the moved
+/// directory lists its own history (taken under either name) and never
+/// the new `/a`'s.
+#[test]
+fn snapshot_listing_follows_a_renamed_directory() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let a = meta.mkdir(ROOT_INO, "a", 0o755, 0, 0).unwrap().ino;
+    meta.create(a, "f", 0o644, 0, 0).unwrap();
+    let (v, _dir, _nodes) = view_with_snapshots(&meta, &[("/a", "before")]);
+    let mut segment = 100;
+    let mut snapshot = |path: &str, name: &str| {
+        segment += 1;
+        let rows = meta.take_journal(usize::MAX).unwrap();
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        meta.ack_journal_rows_at(&seqs, segment).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(v.snapshots.create(path, name))
+            .unwrap();
+    };
+    let sorted = |ino| {
+        let mut names = readdir(&v, ino).unwrap();
+        names.sort();
+        names
+    };
+
+    let dot = lookup(&v, a, ".constellation").unwrap().attr.ino;
+    let snapdir = lookup(&v, dot, "snapshot").unwrap().attr.ino;
+    assert_eq!(sorted(snapdir), ["before"]);
+
+    meta.rename(ROOT_INO, "a", ROOT_INO, "b").unwrap();
+    snapshot("/b", "after");
+    // The nodes the kernel already holds, and a fresh lookup (which
+    // finds the same interned numbers).
+    assert_eq!(sorted(snapdir), ["after", "before"]);
+    assert_eq!(lookup(&v, a, ".constellation").unwrap().attr.ino, dot);
+    assert_eq!(lookup(&v, dot, "snapshot").unwrap().attr.ino, snapdir);
+    let after = lookup(&v, snapdir, "after").unwrap().attr.ino;
+    assert_eq!(readdir(&v, after).unwrap(), ["f"]);
+
+    let new_a = meta.mkdir(ROOT_INO, "a", 0o755, 0, 0).unwrap().ino;
+    snapshot("/a", "newa");
+    assert_eq!(sorted(snapdir), ["after", "before"]);
+    assert_eq!(code(lookup(&v, snapdir, "newa")), Code::NotFound);
+    // The new `/a` lists its own snapshot, and the path rule's: `/a@before`
+    // was taken at its path (the replaced-directory behaviour, kept).
+    let new_dot = lookup(&v, new_a, ".constellation").unwrap().attr.ino;
+    let new_snapdir = lookup(&v, new_dot, "snapshot").unwrap().attr.ino;
+    assert_eq!(sorted(new_snapdir), ["before", "newa"]);
+}
+
 /// `/volumes/pv-1/f` with a second name in `/volumes/pv-1/sub`, pv-2
 /// beside it, `/loose` unmarked; the volumes marked as link domains.
 struct Pool {

@@ -555,7 +555,7 @@ hinted), never "proven absent".
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_GC_INTERVAL_S` | `86400` | seconds | background GC tick interval |
-| `CONSTELLATION_GC_HORIZON_S` | `604800` | seconds | age before unreferenced chunks are eligible (`0` for tests) |
+| `CONSTELLATION_GC_HORIZON_S` | `604800` | seconds | age before unreferenced chunks are eligible (`0` for tests); also the age before a `snaps/` object with no snapshot row is deleted as an orphan (plan 32 §0.3, never younger than one lease TTL) |
 | `CONSTELLATION_LOG_RETENTION_SEGMENTS` | `128` | segments | sealed log segments kept before GC |
 | `CONSTELLATION_GC_SNAP_WALK` | `diff` | `diff` or `full` | how chunk GC finds snapshot chunks: `diff` walks each snapshot chain's oldest snapshot once and diffs the rest (plan 32 §0.2), with roots from `snaps/` and the replica's snapshot rows; `full` is the old walk of every snapshot's whole subtree each round, kept for one release |
 | `CONSTELLATION_GC_SPILL_CACHE_MIB` | `64` | MiB of decoded chunk lists; `0` caches nothing | cap on the spilled chunk lists a `diff` snapshot walk keeps decoded during one GC pass (plan 32 §0.2). The cache is freed when the pass ends; a list evicted before it is read again, or larger than the cap, is fetched from the bucket again, so a smaller cap trades GETs for memory in the daemon running GC |

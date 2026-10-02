@@ -13,7 +13,8 @@ use anyhow::{Context, Result};
 use constellation_fs_core::ChunkHash;
 use constellation_meta::Meta;
 use constellation_store_s3::{
-    append_journal, publish_condemned, GcJournalEntry, LeaseMode, LogStore, SnapshotStore,
+    append_journal, publish_condemned, GcJournalEntry, LeaseMode, LogStore, SnapshotRecord,
+    SnapshotStore, StoreError,
 };
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -152,6 +153,11 @@ pub struct GcReport {
     pub verify_only: bool,
     pub candidates: Vec<Mark>,
     pub deleted: Vec<String>,
+    /// Plan 32 §0.3: `snaps/` objects this round re-PUT from their rows
+    /// (rule `snap-object-restored`). Orphan objects it deleted are in
+    /// `deleted`, like any other key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restored: Vec<String>,
     pub condemned_epoch: Option<u64>,
     /// Plan 28 S7b: the metadata tree's round (commit retention, pack
     /// sweep and compaction). `None` when the phase did not run.
@@ -242,6 +248,8 @@ struct Marked {
     condemned: constellation_store_s3::CondemnedList,
     /// The mark's snapshot walk mode, which the sweep's refresh reuses.
     snap_walk: SnapWalkMode,
+    /// What snapshot reconciliation found and did before the mark.
+    snaps: SnapFindings,
 }
 
 /// Chunk candidates come from a single pass: LIST `chunks/` and mark
@@ -323,6 +331,7 @@ async fn run_chunks(
         config,
         verify_only,
         tail,
+        lease,
     )
     .await?
     {
@@ -343,8 +352,9 @@ async fn run_chunks(
     sweep_chunks(&store, &chunks, &meta, lease_mode, tail, lease, marked).await
 }
 
-/// The mark phase: tail, list, protect, publish. `Err(report)` is an
-/// early, complete report (verify-only, or nothing to condemn).
+/// The mark phase: tail, reconcile snapshots, list, protect, publish.
+/// `Err(report)` is an early, complete report (verify-only, or nothing to
+/// condemn).
 #[allow(clippy::too_many_arguments)]
 async fn mark_chunks(
     store: &Arc<dyn ObjectStore>,
@@ -354,13 +364,18 @@ async fn mark_chunks(
     config: &GcConfig,
     verify_only: bool,
     tail: &GcTail,
+    lease: &mut crate::singleton::SingletonLease,
 ) -> Result<std::result::Result<Marked, GcReport>> {
     tail.tail_to_head(meta, lease_mode)
         .await
         .context("tailing the metadata log to head before marking chunk GC candidates")?;
+    let snaps = reconcile_snapshots(store, meta, lease_mode, config, verify_only, tail, lease)
+        .await
+        .context("reconciling snaps/ objects with snapshot rows")?;
     let now = constellation_store_s3::lease::now_unix_ms();
     let live = live_roots(chunks, meta).await?;
-    let snapshots = snapshot_roots_with(config.snap_walk, chunks, store.clone(), meta).await?;
+    let snapshots =
+        snapshot_roots_kept(config.snap_walk, chunks, store.clone(), meta, &snaps.kept).await?;
     let holds = hold_roots(store.clone(), now).await?;
     let protected: HashSet<_> = live
         .iter()
@@ -390,13 +405,14 @@ async fn mark_chunks(
     candidates.sort_by(|a, b| a.key.cmp(&b.key));
 
     if verify_only || candidates.is_empty() {
-        return Ok(Err(GcReport {
+        return Ok(Err(snaps.into_report(GcReport {
             verify_only,
             candidates,
             deleted: Vec::new(),
+            restored: Vec::new(),
             condemned_epoch: None,
             metadata: None,
-        }));
+        })));
     }
 
     let condemned_hashes: Vec<_> = candidates
@@ -408,6 +424,7 @@ async fn mark_chunks(
         candidates,
         condemned,
         snap_walk: config.snap_walk,
+        snaps,
     }))
 }
 
@@ -427,12 +444,16 @@ async fn sweep_chunks(
         candidates,
         condemned,
         snap_walk,
+        snaps,
     } = marked;
     tail.tail_to_head(meta, lease_mode).await.context(
         "tailing the metadata log to head after the condemned-list wait, before deletion",
     )?;
     let refreshed_live = live_roots(chunks, meta).await?;
-    let refreshed_snaps = snapshot_roots_with(snap_walk, chunks, store.clone(), meta).await?;
+    // Orphan objects this round deleted before marking still protect
+    // their chunks until it ends (plan 32 §0.3).
+    let refreshed_snaps =
+        snapshot_roots_kept(snap_walk, chunks, store.clone(), meta, &snaps.kept).await?;
     // Holds are re-read too: a node that applied an unlink of a file it
     // has open publishes its hold asynchronously (`cli::holds`), and the
     // wait above is the window it gets before this round's deletes.
@@ -485,13 +506,14 @@ async fn sweep_chunks(
         .await?;
         deleted.push(mark.key.clone());
     }
-    Ok(GcReport {
+    Ok(snaps.into_report(GcReport {
         verify_only: false,
         candidates,
         deleted,
+        restored: Vec::new(),
         condemned_epoch: Some(condemned.epoch),
         metadata: None,
-    })
+    }))
 }
 
 /// Whether the object behind a chunk mark was written again after the
@@ -501,6 +523,228 @@ fn reuploaded_since_marked(mark: &Mark, head_last_modified_ms: i64) -> bool {
     mark.evidence["last_modified_ms"]
         .as_i64()
         .is_some_and(|marked| head_last_modified_ms > marked + 1000)
+}
+
+/// What one round's snapshot reconciliation (plan 32 §0.3) found, and,
+/// unless it was verify-only, did.
+#[derive(Debug, Default)]
+struct SnapFindings {
+    /// Every finding, as a report candidate (`hash: None`); never handed
+    /// to the chunk sweep, which deletes whatever it is given.
+    marks: Vec<Mark>,
+    /// The orphan objects deleted.
+    deleted: Vec<String>,
+    /// The objects re-PUT from their rows.
+    restored: Vec<String>,
+    /// The deleted orphans' records: their chunks stay protected for the
+    /// rest of the round, through the mark *and* the sweep's refresh.
+    kept: Vec<SnapshotRecord>,
+}
+
+impl SnapFindings {
+    fn into_report(self, mut report: GcReport) -> GcReport {
+        report.candidates.extend(self.marks);
+        report.candidates.sort_by(|a, b| a.key.cmp(&b.key));
+        report.deleted.extend(self.deleted);
+        report.restored.extend(self.restored);
+        report
+    }
+}
+
+/// Plan 32 §0.3: make the two copies of every snapshot agree again.
+///
+/// A snapshot is a `snaps/<id>.json` object *and* a replicated row, with no
+/// transaction spanning them. Create writes the object, then the row;
+/// delete removes the row, then the object. An interruption therefore
+/// leaves an **object without a row**: an orphan that pins its chunks
+/// with no listing and blocks re-creating that `path@name`. Such an object
+/// older than `gc.horizon` is deleted (rule `snap-orphan-object`). A
+/// younger one may be a create in flight — its row not yet written,
+/// shipped or tailed here — and is left alone; so is one younger than a
+/// lease TTL whatever the horizon says, the bound a writer's row takes to
+/// reach the log (a test horizon of 0 must not race a create).
+///
+/// A **row without an object** should be impossible, so it is logged at
+/// `warn` and the object is re-PUT from the row, create-if-absent (rule
+/// `snap-object-restored`). It is *not* impossible to observe, though: a
+/// delete on another node removes its row locally and the object at once,
+/// and this replica keeps the row until that node's `SnapDelete` is
+/// shipped and tailed. Restoring then would resurrect a deleted snapshot's
+/// object, so the round first waits a lease TTL (renewing its own lease),
+/// tails again, and restores only rows still present whose object is
+/// still absent. That wait is only paid when such a row was seen.
+///
+/// Rows are read before objects are listed: a create landing in between
+/// shows up as a young object (left alone), never as a row without its
+/// object. Every destructive step renews the `_gc` lease first, as the
+/// chunk sweep does. A verify-only round reports what it found, acts on
+/// nothing and renews nothing.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_snapshots(
+    store: &Arc<dyn ObjectStore>,
+    meta: &Arc<Meta>,
+    lease_mode: LeaseMode,
+    config: &GcConfig,
+    verify_only: bool,
+    tail: &GcTail,
+    lease: &mut crate::singleton::SingletonLease,
+) -> Result<SnapFindings> {
+    use crate::snapshot::SnapshotRoot;
+    use constellation_store_s3::{layout, SnapshotTreeRoot};
+    use std::collections::BTreeMap;
+    let records = SnapshotStore::new(store.clone());
+    let rows: BTreeMap<String, constellation_meta::SnapshotRow> = meta
+        .snapshots(None)?
+        .into_iter()
+        .map(|row| (row.id.clone(), row))
+        .collect();
+    let objects: BTreeMap<String, SnapshotRecord> = records
+        .list()
+        .await?
+        .into_iter()
+        .map(|record| (record.id(), record))
+        .collect();
+    let now = constellation_store_s3::lease::now_unix_ms();
+    let floor_ms = config.horizon_ms.max(config.lease_ttl_ms as i64);
+    let mut found = SnapFindings::default();
+
+    for (id, record) in objects.iter().filter(|(id, _)| !rows.contains_key(*id)) {
+        if record.created_unix_ms > now - floor_ms {
+            continue;
+        }
+        let key = layout::snapshot(id).to_string();
+        let mark = Mark {
+            key: key.clone(),
+            rule: "snap-orphan-object".into(),
+            evidence: json!({
+                "id": id,
+                "path": record.path,
+                "name": record.name,
+                "created_unix_ms": record.created_unix_ms,
+                "horizon_ms": config.horizon_ms,
+            }),
+            hash: None,
+        };
+        if !verify_only {
+            // Re-read the row just before deleting: one written on this
+            // node since the scan (no tail runs in between, so only a
+            // local create can) keeps its object.
+            if meta.snapshot_by_id(id)?.is_some() {
+                continue;
+            }
+            lease.renew().await.with_context(|| {
+                format!("snapshot reconciliation stopped before deleting {key}: the round is no longer the lease holder")
+            })?;
+            // Kept as a root before it is gone, so no ordering of this
+            // round's later steps can see its chunks unprotected.
+            found.kept.push(record.clone());
+            records.delete(&record.path, &record.name).await?;
+            append_journal(
+                store,
+                &GcJournalEntry {
+                    key: key.clone(),
+                    rule: mark.rule.clone(),
+                    evidence: mark.evidence.clone(),
+                    ts: constellation_store_s3::lease::now_unix_ms(),
+                },
+            )
+            .await?;
+            tracing::info!(%key, path = %record.path, name = %record.name, "GC: deleted an orphan snapshot object");
+            found.deleted.push(key);
+        }
+        found.marks.push(mark);
+    }
+
+    let mut missing = Vec::new();
+    for (id, row) in rows.iter().filter(|(id, _)| !objects.contains_key(*id)) {
+        let root = match SnapshotRoot::parse(&row.root_hash) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(%id, %error, "GC: a snapshot row without its object has an unreadable root; not restored");
+                continue;
+            }
+        };
+        let mut record = SnapshotRecord::new(
+            &row.path,
+            &row.name,
+            row.creator,
+            SnapshotTreeRoot {
+                seq: root.seq,
+                root: root.root.to_hex(),
+                ino: root.ino,
+            },
+        )
+        .with_extensions(row.origin, row.policy_ino, row.refer_bytes);
+        record.created_unix_ms = row.created_unix_ms;
+        if record.id() != *id {
+            tracing::warn!(%id, path = %row.path, name = %row.name, "GC: a snapshot row is not keyed by its path@name; not restored");
+            continue;
+        }
+        let key = layout::snapshot(id).to_string();
+        tracing::warn!(%key, path = %row.path, name = %row.name, "GC: a snapshot row has no snaps/ object");
+        let mark = Mark {
+            key,
+            rule: "snap-object-restored".into(),
+            evidence: json!({
+                "id": id,
+                "path": row.path,
+                "name": row.name,
+                "created_unix_ms": row.created_unix_ms,
+                "root": row.root_hash,
+            }),
+            hash: None,
+        };
+        missing.push((record, mark));
+    }
+    if verify_only {
+        found
+            .marks
+            .extend(missing.into_iter().map(|(_, mark)| mark));
+        return Ok(found);
+    }
+    if missing.is_empty() {
+        return Ok(found);
+    }
+    lease
+        .hold_for(std::time::Duration::from_millis(config.lease_ttl_ms))
+        .await
+        .context("waiting out a lease TTL before restoring snapshot objects")?;
+    tail.tail_to_head(meta, lease_mode)
+        .await
+        .context("tailing the metadata log to head before restoring snapshot objects")?;
+    for (record, mark) in missing {
+        let id = record.id();
+        if meta.snapshot_by_id(&id)?.is_none() || records.get(&id).await?.is_some() {
+            tracing::info!(key = %mark.key, "GC: a snapshot row without its object resolved itself (a delete or create in flight)");
+            continue;
+        }
+        lease.renew().await.with_context(|| {
+            format!(
+                "snapshot reconciliation stopped before restoring {}: the round is no longer the lease holder",
+                mark.key
+            )
+        })?;
+        match records.create(&record).await {
+            Ok(()) => {}
+            // Someone else wrote it meanwhile: there is nothing to restore.
+            Err(StoreError::AlreadyExists) => continue,
+            Err(error) => return Err(error.into()),
+        }
+        append_journal(
+            store,
+            &GcJournalEntry {
+                key: mark.key.clone(),
+                rule: mark.rule.clone(),
+                evidence: mark.evidence.clone(),
+                ts: constellation_store_s3::lease::now_unix_ms(),
+            },
+        )
+        .await?;
+        tracing::warn!(key = %mark.key, "GC: restored a snapshot object from its row");
+        found.restored.push(mark.key.clone());
+        found.marks.push(mark);
+    }
+    Ok(found)
 }
 
 async fn live_roots(
@@ -548,15 +792,29 @@ impl SnapWalkMode {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn snapshot_roots_with(
     mode: SnapWalkMode,
     chunks: &Arc<constellation_store_s3::ChunkStore>,
     store: Arc<dyn ObjectStore>,
     meta: &Meta,
 ) -> Result<HashSet<ChunkHash>> {
+    snapshot_roots_kept(mode, chunks, store, meta, &[]).await
+}
+
+/// [`snapshot_roots_with`], plus `kept`: snapshot records whose object is
+/// gone but whose chunks this round must still protect (the orphans its
+/// own reconciliation deleted).
+async fn snapshot_roots_kept(
+    mode: SnapWalkMode,
+    chunks: &Arc<constellation_store_s3::ChunkStore>,
+    store: Arc<dyn ObjectStore>,
+    meta: &Meta,
+    kept: &[SnapshotRecord],
+) -> Result<HashSet<ChunkHash>> {
     match mode {
-        SnapWalkMode::Full => snapshot_roots_full(chunks, store).await,
-        SnapWalkMode::Diff => snapshot_roots_by_chain(chunks, store, meta).await,
+        SnapWalkMode::Full => snapshot_roots_full(chunks, store, kept).await,
+        SnapWalkMode::Diff => snapshot_roots_by_chain(chunks, store, meta, kept).await,
     }
 }
 
@@ -570,6 +828,7 @@ async fn snapshot_roots_by_chain(
     chunks: &Arc<constellation_store_s3::ChunkStore>,
     store: Arc<dyn ObjectStore>,
     meta: &Meta,
+    kept: &[SnapshotRecord],
 ) -> Result<HashSet<ChunkHash>> {
     use crate::snapshot::{SnapshotRoot, TreeAccess};
     use std::collections::BTreeMap;
@@ -584,8 +843,13 @@ async fn snapshot_roots_by_chain(
             .and_modify(|(_, at)| *at = (*at).min(created))
             .or_insert((root, created));
     };
-    for record in SnapshotStore::new(store.clone()).list().await? {
-        note(SnapshotRoot::of_record(&record)?, record.created_unix_ms);
+    for record in SnapshotStore::new(store.clone())
+        .list()
+        .await?
+        .iter()
+        .chain(kept)
+    {
+        note(SnapshotRoot::of_record(record)?, record.created_unix_ms);
     }
     for row in meta.snapshots(None)? {
         match SnapshotRoot::parse(&row.root_hash) {
@@ -639,9 +903,11 @@ async fn snapshot_roots_by_chain(
 async fn snapshot_roots_full(
     chunks: &constellation_store_s3::ChunkStore,
     store: Arc<dyn ObjectStore>,
+    kept: &[SnapshotRecord],
 ) -> Result<HashSet<ChunkHash>> {
     use crate::snapshot::{snapshot_chunk_refs, SnapshotRoot, TreeAccess};
-    let records = SnapshotStore::new(store.clone()).list().await?;
+    let mut records = SnapshotStore::new(store.clone()).list().await?;
+    records.extend(kept.iter().cloned());
     let mut roots = HashSet::new();
     if records.is_empty() {
         return Ok(roots);
@@ -880,6 +1146,7 @@ mod tests {
 
         let meta = replica_with_live(1, None);
         let tail = GcTail::standalone(LogStore::new(store.clone()), &meta).unwrap();
+        let mut lease = gc_lease(&store, 60_000).await;
         let marked = mark_chunks(
             &store,
             &chunks,
@@ -888,6 +1155,7 @@ mod tests {
             &fast_config(),
             false,
             &tail,
+            &mut lease,
         )
         .await
         .unwrap()
@@ -940,6 +1208,7 @@ mod tests {
             &fast_config(),
             false,
             &tail_1,
+            &mut lease_1,
         )
         .await
         .unwrap()
@@ -1471,9 +1740,20 @@ mod tests {
                 ..fast_config()
             };
             let tail = GcTail::standalone(LogStore::new(store.clone()), &meta).unwrap();
-            let report = mark_chunks(&store, &chunks, &meta, LeaseMode::Cas, &config, true, &tail)
-                .await
-                .unwrap();
+            let mut lease = gc_lease(&store, 60_000).await;
+            let report = mark_chunks(
+                &store,
+                &chunks,
+                &meta,
+                LeaseMode::Cas,
+                &config,
+                true,
+                &tail,
+                &mut lease,
+            )
+            .await
+            .unwrap();
+            lease.release().await;
             let Err(report) = report else {
                 panic!("verify-only returns its report");
             };
@@ -1515,5 +1795,332 @@ mod tests {
             assert!(chunks.has_chunk(&kept).await.unwrap());
         }
         assert!(!chunks.has_chunk(&v2).await.unwrap());
+    }
+
+    /// Every GC journal entry, oldest first.
+    async fn journal(store: &Arc<dyn ObjectStore>) -> Vec<GcJournalEntry> {
+        let mut entries = Vec::new();
+        for object in store
+            .list(Some(&constellation_store_s3::layout::gc_journal_prefix()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+        {
+            let bytes = store
+                .get(&object.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            entries.push(serde_json::from_slice::<GcJournalEntry>(&bytes).unwrap());
+        }
+        entries.sort_by_key(|entry| entry.ts);
+        entries
+    }
+
+    /// One snapshot `/vol@s1` whose only file named chunk `frozen`, now
+    /// rewritten to `live`: after it, `frozen` is protected by the
+    /// snapshot alone.
+    struct SnapFixture {
+        store: Arc<dyn ObjectStore>,
+        chunks: Arc<ChunkStore>,
+        meta: Arc<Meta>,
+        _nodes: tempfile::TempDir,
+        id: String,
+        frozen: ChunkHash,
+        live: ChunkHash,
+    }
+
+    async fn snap_fixture() -> SnapFixture {
+        use constellation_fs_core::manifest::Manifest;
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::MetaStore;
+        use constellation_store_s3::CompressionSetting;
+        const CS: u32 = 4096;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        let (manager, nodes) = crate::snapshot::test_manager(meta.clone(), chunks.clone(), CS);
+        let mut segment = 0;
+        let mut ship = || {
+            segment += 1;
+            let rows = meta.take_journal(usize::MAX).unwrap();
+            let seqs: Vec<u64> = rows.iter().map(|(seq, _)| *seq).collect();
+            meta.ack_journal_rows_at(&seqs, segment).unwrap();
+        };
+        let (frozen, live) = (ChunkHash::of(b"frozen"), ChunkHash::of(b"live"));
+        for (hash, bytes) in [(frozen, &b"frozen"[..]), (live, &b"live"[..])] {
+            chunks
+                .put_chunk(&hash, bytes, CompressionSetting::RAW)
+                .await
+                .unwrap();
+        }
+        let write = |ino, hash| {
+            let (manifest, _) = Manifest::from_chunks(CS, CS as u64, vec![hash], 8, ChunkHash::of);
+            meta.set_manifest(ino, &manifest.encode(), CS as u64)
+                .unwrap();
+        };
+        let vol = meta.mkdir(ROOT_INO, "vol", 0o755, 0, 0).unwrap().ino;
+        let file = meta.create(vol, "f", 0o644, 0, 0).unwrap().ino;
+        write(file, frozen);
+        ship();
+        manager.create("/vol", "s1").await.unwrap();
+        write(file, live);
+        ship();
+        SnapFixture {
+            store,
+            chunks,
+            meta,
+            _nodes: nodes,
+            id: constellation_store_s3::snapshot_id("/vol", "s1"),
+            frozen,
+            live,
+        }
+    }
+
+    impl SnapFixture {
+        async fn round(&self, config: &GcConfig, verify_only: bool) -> GcReport {
+            let mut lease = gc_lease(&self.store, 60_000).await;
+            let tail = GcTail::standalone(LogStore::new(self.store.clone()), &self.meta).unwrap();
+            let report = match verify_only {
+                true => mark_chunks(
+                    &self.store,
+                    &self.chunks,
+                    &self.meta,
+                    LeaseMode::Cas,
+                    config,
+                    true,
+                    &tail,
+                    &mut lease,
+                )
+                .await
+                .unwrap()
+                .err()
+                .expect("verify-only returns its report"),
+                false => run_chunks(
+                    self.store.clone(),
+                    self.chunks.clone(),
+                    self.meta.clone(),
+                    LeaseMode::Cas,
+                    config,
+                    false,
+                    None,
+                    &tail,
+                    &mut lease,
+                )
+                .await
+                .unwrap(),
+            };
+            lease.release().await;
+            report
+        }
+
+        fn key(&self) -> String {
+            constellation_store_s3::layout::snapshot(&self.id).to_string()
+        }
+
+        async fn object(&self) -> Option<SnapshotRecord> {
+            SnapshotStore::new(self.store.clone())
+                .get(&self.id)
+                .await
+                .unwrap()
+        }
+
+        /// Drop the row and keep the object: a delete interrupted between
+        /// its two steps.
+        fn orphan_the_object(&self) {
+            use constellation_meta::MetaStore;
+            assert!(self.meta.delete_snapshot_by_id(&self.id).unwrap());
+            let rows = self.meta.take_journal(usize::MAX).unwrap();
+            let seqs: Vec<u64> = rows.iter().map(|(seq, _)| *seq).collect();
+            self.meta.ack_journal_rows_at(&seqs, 1_000).unwrap();
+        }
+    }
+
+    fn rules(report: &GcReport) -> Vec<(&str, &str)> {
+        report
+            .candidates
+            .iter()
+            .filter(|mark| mark.key.starts_with("snaps/"))
+            .map(|mark| (mark.rule.as_str(), mark.key.as_str()))
+            .collect()
+    }
+
+    /// Plan 32 §0.3: a `snaps/` object with no row is left alone while it
+    /// is younger than `gc.horizon` (a create in flight writes the object
+    /// first), reported but untouched by a verify-only round, and deleted
+    /// and journaled by a real one — which still keeps the orphan's chunks
+    /// for the rest of that round. The next round, with no root left,
+    /// collects them. Both walk modes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_orphan_snapshot_object_is_deleted_after_the_horizon() {
+        for mode in [SnapWalkMode::Diff, SnapWalkMode::Full] {
+            let fx = snap_fixture().await;
+            fx.orphan_the_object();
+            let config = GcConfig {
+                snap_walk: mode,
+                ..fast_config()
+            };
+
+            // Younger than the horizon: not even a candidate.
+            let young = GcConfig {
+                horizon_ms: 3_600_000,
+                ..config.clone()
+            };
+            let report = fx.round(&young, false).await;
+            assert!(
+                rules(&report).is_empty(),
+                "{mode:?}: {:?}",
+                report.candidates
+            );
+            assert!(fx.object().await.is_some());
+
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Verify-only: reported, not acted on.
+            let report = fx.round(&config, true).await;
+            assert_eq!(rules(&report), [("snap-orphan-object", fx.key().as_str())]);
+            assert!(report.deleted.is_empty());
+            assert!(
+                fx.object().await.is_some(),
+                "{mode:?}: verify-only deleted it"
+            );
+            assert!(journal(&fx.store).await.is_empty());
+
+            // A real round deletes it, journals it, and keeps its chunk.
+            let report = fx.round(&config, false).await;
+            assert_eq!(rules(&report), [("snap-orphan-object", fx.key().as_str())]);
+            assert!(report.deleted.contains(&fx.key()), "{:?}", report.deleted);
+            assert!(fx.object().await.is_none());
+            assert!(
+                fx.chunks.has_chunk(&fx.frozen).await.unwrap(),
+                "{mode:?}: the round that deleted the orphan collected its chunk"
+            );
+            let entries = journal(&fx.store).await;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.key == fx.key())
+                .expect("journaled");
+            assert_eq!(entry.rule, "snap-orphan-object");
+            assert_eq!(entry.evidence["id"], fx.id.as_str());
+            assert_eq!(entry.evidence["path"], "/vol");
+            assert_eq!(entry.evidence["name"], "s1");
+            assert!(entry.evidence["created_unix_ms"].as_i64().unwrap() > 0);
+
+            // The next round has no root for it any more.
+            let report = fx.round(&config, false).await;
+            assert!(rules(&report).is_empty());
+            assert!(!fx.chunks.has_chunk(&fx.frozen).await.unwrap(), "{mode:?}");
+            assert!(fx.chunks.has_chunk(&fx.live).await.unwrap());
+        }
+    }
+
+    /// Plan 32 §0.3: a row whose object is gone (which should not happen)
+    /// gets the object back, rebuilt from the row — plan 32's extensions
+    /// included — byte-for-byte the record creation wrote; verify-only
+    /// only reports it. The snapshot's chunk is never at risk meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_without_its_object_gets_it_back() {
+        let fx = snap_fixture().await;
+        let original = fx.object().await.expect("created");
+        assert!(
+            original.refer_bytes.is_some(),
+            "the fixture exercises the extensions"
+        );
+        assert!(SnapshotStore::new(fx.store.clone())
+            .delete("/vol", "s1")
+            .await
+            .unwrap());
+
+        let report = fx.round(&fast_config(), true).await;
+        assert_eq!(
+            rules(&report),
+            [("snap-object-restored", fx.key().as_str())]
+        );
+        assert!(report.restored.is_empty());
+        assert!(fx.object().await.is_none(), "verify-only restored it");
+        assert!(journal(&fx.store).await.is_empty());
+
+        let report = fx.round(&fast_config(), false).await;
+        assert_eq!(
+            rules(&report),
+            [("snap-object-restored", fx.key().as_str())]
+        );
+        assert_eq!(report.restored, [fx.key()]);
+        assert_eq!(fx.object().await, Some(original));
+        assert!(fx.chunks.has_chunk(&fx.frozen).await.unwrap());
+        let entries = journal(&fx.store).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].rule, "snap-object-restored");
+        assert_eq!(entries[0].key, fx.key());
+        assert_eq!(entries[0].evidence["id"], fx.id.as_str());
+
+        // And the copies agree again: nothing more to do.
+        let report = fx.round(&fast_config(), false).await;
+        assert!(rules(&report).is_empty());
+        assert!(report.restored.is_empty());
+    }
+
+    /// A row seen without its object that is gone by the time the round
+    /// has waited and tailed again was a delete in flight, not damage:
+    /// nothing is restored. The deleter's `SnapDelete` lands *in* that
+    /// tail — the reconciliation's only one, served here through the
+    /// daemon channel — so the row is certainly there at the scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_in_flight_is_not_restored() {
+        let fx = snap_fixture().await;
+        assert!(SnapshotStore::new(fx.store.clone())
+            .delete("/vol", "s1")
+            .await
+            .unwrap());
+        let config = GcConfig {
+            lease_ttl_ms: 1_500,
+            ..fast_config()
+        };
+        let (tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let meta = fx.meta.clone();
+        let id = fx.id.clone();
+        let deleter = tokio::spawn(async move {
+            let mut tails = 0;
+            while let Some(request) = requests.recv().await {
+                let crate::sync::SyncRequest::TailToHead { reply } = request else {
+                    panic!("reconciliation asks the sync task for nothing but a tail");
+                };
+                tails += 1;
+                assert!(
+                    meta.delete_snapshot_by_id(&id).unwrap(),
+                    "the row is there until the tail brings its delete"
+                );
+                reply.send(Ok(())).unwrap();
+            }
+            tails
+        });
+        let tail = GcTail::Daemon(tx);
+        let mut lease = gc_lease(&fx.store, 60_000).await;
+        let found = reconcile_snapshots(
+            &fx.store,
+            &fx.meta,
+            LeaseMode::Cas,
+            &config,
+            false,
+            &tail,
+            &mut lease,
+        )
+        .await
+        .unwrap();
+        lease.release().await;
+        drop(tail);
+        assert_eq!(
+            deleter.await.unwrap(),
+            1,
+            "the row was seen without its object"
+        );
+        assert!(found.restored.is_empty());
+        assert!(found.marks.is_empty(), "{:?}", found.marks);
+        assert!(fx.object().await.is_none());
+        assert!(journal(&fx.store)
+            .await
+            .iter()
+            .all(|entry| !entry.key.starts_with("snaps/")));
     }
 }
