@@ -63,6 +63,7 @@ pub mod scan;
 pub mod shipper;
 mod singleton;
 pub mod snapshot;
+pub mod snapwalk;
 mod sources;
 pub mod staging;
 pub mod sync;

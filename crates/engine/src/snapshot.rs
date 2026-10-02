@@ -258,7 +258,7 @@ impl SnapshotManager {
         self
     }
 
-    fn tree(&self) -> Result<&TreeAccess> {
+    pub(crate) fn tree(&self) -> Result<&TreeAccess> {
         self.tree
             .as_ref()
             .context("this mount has no metadata tree reader")

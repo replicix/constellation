@@ -30292,3 +30292,50 @@ Host load was high and varied during these runs: load1 was 44-75 in the
 ratios are therefore indicative only. The error rates are not: after the
 change, all 90,000 sequences in the main grid and the reproducibility run
 succeeded.
+
+## Plan 32 M0b (snapwalk, per-chain GC mark)
+
+Step 0.2 of [plan 32](wip/32-snapshot-policies-and-space.md): chunk GC no
+longer walks every snapshot's whole subtree every round. Snapshot roots are
+grouped into chains by directory `ino`, ordered by `(seq, created_unix_ms)`,
+and each chain costs one full walk of its oldest snapshot plus one
+`Tree::diff` per later snapshot. The walker (`ChainWalk`) is the API that
+`32-m3b` (skip-empty, via `in_subtree`) and `32-m5a`/`32-m5b` (accounting
+index, via `Deltas` with plaintext sizes) build on.
+
+| Item | State | Where |
+|---|---|---|
+| `ChainWalk::{new, first, step, in_subtree, protect_chain, spill_fetches}`, `Occurrences` (multiset with per-occurrence plaintext size, `apply`, `minus`), `Deltas` (`iter() -> Delta { hash, delta: i64, size_bytes }`, `additions`, `fell_back`), free `in_subtree(tree, root, ino, dir, &mut Membership)` cached per `(root, dir)` | DONE | `crates/engine/src/snapwalk.rs` |
+| `step` exact per file: every inode with a changed `0x01` or `0x04` key, plus every file under a directory that crossed the subtree boundary (walked in the root where it is a member), has its `links_in_subtree × chunks` term recomputed in both roots; `0x02` mirrors `0x04` and is ignored; atime never reaches the tree; chmod/utimes recompute to zero | DONE | `snapwalk.rs` `Inner::step_with` |
+| Fallback: chain dir not a directory in either root, a directory with two names, a non-terminating ancestor chain → two full walks and their difference (`debug` log, `Deltas::fell_back`); `prev.ino == next.ino` asserted | DONE | `snapwalk.rs` `ChainWalk::step` |
+| Spilled chunk lists fetched at most once per walker (one GC pass), plus a process-wide LRU bounded at 256 MiB of encoded bytes; `fs-core/src/cache.rs` untouched | DONE | `snapwalk.rs` `SpillLru` |
+| GC: `snapshot_roots_with(mode, …)` in `mark_chunks` and the sweep's refresh (same mode as the mark); `diff` roots = `snaps/` ∪ replica snapshot rows; `CONSTELLATION_GC_SNAP_WALK=diff\|full` (default `diff`; `full` = the old code path unchanged) | DONE | `crates/engine/src/gc.rs`, `docs/reference/configuration.md` |
+| Unit tests: write/truncate/delete/revert, sparse sizes, atime/attr-only, hardlinks in/out, renames within/across, directory crossing both ways (nested, with hardlinks), nested chain, spilled manifest (+ fetch-once), fallback, cross-chain assert | DONE | `snapwalk::tests` |
+| Seeded randomized test (16 seeds × 60 ops, two nested chains; odd seeds delete mid-chain snapshots): `first + Σ steps` == brute-force multiset after every snapshot; GC `diff ⊇ full` always, `==` with no deletion; `protect_chain` == union of full walks at the end | DONE | `snapwalk::tests::random_histories_agree_with_the_brute_force` |
+| GC integration: a verify-only mark in both modes yields identical candidate sets over a history with a rewrite, a directory moved out, and a mid-chain deletion; a real `diff` round deletes exactly the unnamed chunks | DONE | `gc::tests::per_chain_marking_keeps_everything_the_full_walk_keeps` |
+| Not done (other chunks): orphan reconciliation (32-m0c), accounting index (32-m5a/b), skip-empty wiring (32-m3b), the 300×100k harness bench (32-m5d) | — | — |
+
+**Measurement** (report only; in-process, release build, in-memory store,
+`snapwalk::tests::measure_gc_mark_full_versus_diff`): 10,000 files (100
+dirs × 100), 50 snapshots of `/vol` with 20 file rewrites between each,
+10,981 protected chunks either way.
+
+| Mode | Run 1 | Run 2 |
+|---|---|---|
+| `full` | 36.3 s | 31.1 s |
+| `diff` | 1.19 s | 0.57 s |
+
+≈30–55× faster; the second `diff` run benefits from warm node and spill caches.
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0; 69 test binaries, 1889 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | port 4566 held by another agent's floci, so the script's body was run against it (its AWS_* settings, `bash tests/smoke.sh s3://constellation-ci/run-m0b-…`): SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run gc-lifecycle gc-dedup-race gc-open-orphan-hold snapshot-lifecycle snapshot-churn clone-workflow mtree-gc-plateau git-under-flock-gc fsck-repair e2e-basic e2e-two-nodes` | ALL SCENARIOS PASSED (11/11) |
+| same GC/snapshot scenarios (the first nine) with `CONSTELLATION_GC_SNAP_WALK=full` | ALL SCENARIOS PASSED (9/9) |

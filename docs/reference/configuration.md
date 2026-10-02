@@ -530,6 +530,7 @@ hinted), never "proven absent".
 | `CONSTELLATION_GC_INTERVAL_S` | `86400` | seconds | background GC tick interval |
 | `CONSTELLATION_GC_HORIZON_S` | `604800` | seconds | age before unreferenced chunks are eligible (`0` for tests) |
 | `CONSTELLATION_LOG_RETENTION_SEGMENTS` | `128` | segments | sealed log segments kept before GC |
+| `CONSTELLATION_GC_SNAP_WALK` | `diff` | `diff` or `full` | how chunk GC finds snapshot chunks: `diff` walks each snapshot chain's oldest snapshot once and diffs the rest (plan 32 §0.2), with roots from `snaps/` and the replica's snapshot rows; `full` is the old walk of every snapshot's whole subtree each round, kept for one release |
 | `CONSTELLATION_COMMIT_RETENTION` | `64` | commits, at least 1 | newest plan 28 metadata commits always kept by GC |
 | `CONSTELLATION_COMMIT_RETENTION_S` | `86400` | seconds | commits younger than this are kept however many there are; a commit is deleted only when it is outside the newest `CONSTELLATION_COMMIT_RETENTION` *and* older than this |
 | `CONSTELLATION_COMPACT_BYTES_PER_S` | `33554432` (32 MiB/s) | bytes per second; `0` unpaced | read budget for metadata pack deletion and compaction in a GC round |

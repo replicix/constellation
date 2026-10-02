@@ -109,6 +109,8 @@ pub struct GcConfig {
     pub lease_ttl_ms: u64,
     /// Plan 30 §M2 coverage rule floor, in milliseconds.
     pub completion_retention_ms: i64,
+    /// How snapshot chunks are enumerated (`CONSTELLATION_GC_SNAP_WALK`).
+    pub snap_walk: SnapWalkMode,
 }
 
 impl GcConfig {
@@ -131,6 +133,7 @@ impl GcConfig {
                 DEFAULT_COMPLETION_RETENTION_S,
             ) as i64
                 * 1000,
+            snap_walk: SnapWalkMode::from_env(),
         }
     }
 }
@@ -237,6 +240,8 @@ const DELETE_FENCE_EVERY: usize = 64;
 struct Marked {
     candidates: Vec<Mark>,
     condemned: constellation_store_s3::CondemnedList,
+    /// The mark's snapshot walk mode, which the sweep's refresh reuses.
+    snap_walk: SnapWalkMode,
 }
 
 /// Chunk candidates come from a single pass: LIST `chunks/` and mark
@@ -355,7 +360,7 @@ async fn mark_chunks(
         .context("tailing the metadata log to head before marking chunk GC candidates")?;
     let now = constellation_store_s3::lease::now_unix_ms();
     let live = live_roots(chunks, meta).await?;
-    let snapshots = snapshot_roots(chunks, store.clone()).await?;
+    let snapshots = snapshot_roots_with(config.snap_walk, chunks, store.clone(), meta).await?;
     let holds = hold_roots(store.clone(), now).await?;
     let protected: HashSet<_> = live
         .iter()
@@ -402,6 +407,7 @@ async fn mark_chunks(
     Ok(Ok(Marked {
         candidates,
         condemned,
+        snap_walk: config.snap_walk,
     }))
 }
 
@@ -420,12 +426,13 @@ async fn sweep_chunks(
     let Marked {
         candidates,
         condemned,
+        snap_walk,
     } = marked;
     tail.tail_to_head(meta, lease_mode).await.context(
         "tailing the metadata log to head after the condemned-list wait, before deletion",
     )?;
     let refreshed_live = live_roots(chunks, meta).await?;
-    let refreshed_snaps = snapshot_roots(chunks, store.clone()).await?;
+    let refreshed_snaps = snapshot_roots_with(snap_walk, chunks, store.clone(), meta).await?;
     // Holds are re-read too: a node that applied an unlink of a file it
     // has open publishes its hold asynchronously (`cli::holds`), and the
     // wait above is the window it gets before this round's deletes.
@@ -507,7 +514,116 @@ async fn live_roots(
     Ok(roots)
 }
 
-async fn snapshot_roots(
+/// How chunk GC enumerates what snapshots keep alive:
+/// `CONSTELLATION_GC_SNAP_WALK`, `diff` (the default) or `full`.
+///
+/// - `diff` (plan 32 §0.2): roots from `snaps/` **and** the replica's
+///   snapshot rows (tailed to head by the round), grouped into chains by
+///   directory inode; each chain costs one full walk of its oldest
+///   snapshot plus one `Tree::diff` per later snapshot
+///   ([`crate::snapwalk::ChainWalk::protect_chain`]). Protects a superset
+///   of `full`'s set (equal, in practice: the deltas are exact).
+/// - `full`: the pre-plan-32 walk of every `snaps/` object's whole
+///   subtree, every round, kept for one release as the fallback. An
+///   unrecognized value reads as `diff`, with a warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapWalkMode {
+    Diff,
+    Full,
+}
+
+impl SnapWalkMode {
+    pub fn from_env() -> SnapWalkMode {
+        match std::env::var("CONSTELLATION_GC_SNAP_WALK").as_deref() {
+            Ok("full") => SnapWalkMode::Full,
+            Ok("diff") | Err(_) => SnapWalkMode::Diff,
+            Ok(other) => {
+                tracing::warn!(
+                    value = other,
+                    "CONSTELLATION_GC_SNAP_WALK is neither `diff` nor `full`; using `diff`"
+                );
+                SnapWalkMode::Diff
+            }
+        }
+    }
+}
+
+pub(crate) async fn snapshot_roots_with(
+    mode: SnapWalkMode,
+    chunks: &Arc<constellation_store_s3::ChunkStore>,
+    store: Arc<dyn ObjectStore>,
+    meta: &Meta,
+) -> Result<HashSet<ChunkHash>> {
+    match mode {
+        SnapWalkMode::Full => snapshot_roots_full(chunks, store).await,
+        SnapWalkMode::Diff => snapshot_roots_by_chain(chunks, store, meta).await,
+    }
+}
+
+/// Plan 32 §0.2: every snapshot's chunks, one chain at a time.
+async fn snapshot_roots_by_chain(
+    chunks: &Arc<constellation_store_s3::ChunkStore>,
+    store: Arc<dyn ObjectStore>,
+    meta: &Meta,
+) -> Result<HashSet<ChunkHash>> {
+    use crate::snapshot::{SnapshotRoot, TreeAccess};
+    use std::collections::BTreeMap;
+    // Every distinct root, from both copies: the bucket object and the
+    // replicated row are written without a transaction spanning them, so
+    // either may exist alone for a while (plan 32 §0.3), and either one
+    // is reason enough to keep the chunks.
+    let mut roots: BTreeMap<String, (SnapshotRoot, i64)> = BTreeMap::new();
+    let mut note = |root: SnapshotRoot, created: i64| {
+        roots
+            .entry(root.encode())
+            .and_modify(|(_, at)| *at = (*at).min(created))
+            .or_insert((root, created));
+    };
+    for record in SnapshotStore::new(store.clone()).list().await? {
+        note(SnapshotRoot::of_record(&record)?, record.created_unix_ms);
+    }
+    for row in meta.snapshots(None)? {
+        match SnapshotRoot::parse(&row.root_hash) {
+            Ok(root) => note(root, row.created_unix_ms),
+            // Not a tree root, so not walkable by either mode; its
+            // `snaps/` object (if any) was parsed above or failed loudly.
+            Err(error) => {
+                tracing::warn!(id = %row.id, %error, "GC: a snapshot row with an unreadable root")
+            }
+        }
+    }
+    let mut protected = HashSet::new();
+    if roots.is_empty() {
+        return Ok(protected);
+    }
+    let mut chains: BTreeMap<constellation_fs_core::Ino, Vec<(u64, i64, SnapshotRoot)>> =
+        BTreeMap::new();
+    for (root, created) in roots.into_values() {
+        chains
+            .entry(root.ino)
+            .or_default()
+            .push((root.seq, created, root));
+    }
+    let scratch = ScratchDir::new("gc-snapshot-nodes")?;
+    let reader =
+        crate::mtree_read::ChainReader::for_store(store.clone(), chunks.e2e_keys(), &scratch.0)?;
+    reader.cache.refresh_catalog().await?;
+    let walk = crate::snapwalk::ChainWalk::new(TreeAccess::from_reader(reader), chunks.clone());
+    for (ino, mut chain) in chains {
+        chain.sort_by_key(|(seq, created, root)| (*seq, *created, root.root));
+        let chain: Vec<SnapshotRoot> = chain.into_iter().map(|(_, _, root)| root).collect();
+        tracing::debug!(
+            dir = ino,
+            snapshots = chain.len(),
+            "GC: marking a snapshot chain"
+        );
+        walk.protect_chain(&chain, &mut protected).await?;
+    }
+    Ok(protected)
+}
+
+/// The pre-plan-32 snapshot walk (`CONSTELLATION_GC_SNAP_WALK=full`).
+async fn snapshot_roots_full(
     chunks: &constellation_store_s3::ChunkStore,
     store: Arc<dyn ObjectStore>,
 ) -> Result<HashSet<ChunkHash>> {
@@ -696,6 +812,7 @@ mod tests {
             retention_segments: 128,
             lease_ttl_ms: 1,
             completion_retention_ms: 0,
+            snap_walk: SnapWalkMode::Diff,
         }
     }
 
@@ -878,6 +995,7 @@ mod tests {
             retention_segments: 2,
             lease_ttl_ms: 1,
             completion_retention_ms: 0,
+            snap_walk: SnapWalkMode::Diff,
         };
         assert_eq!(250 - config.horizon_ms, 150);
     }
@@ -905,6 +1023,7 @@ mod tests {
             retention_segments: 128,
             lease_ttl_ms: 1,
             completion_retention_ms: 0,
+            snap_walk: SnapWalkMode::Diff,
         };
         assert!(metadata_candidates(
             &store,
@@ -959,6 +1078,7 @@ mod tests {
             retention_segments: 128,
             lease_ttl_ms: 1,
             completion_retention_ms: 0,
+            snap_walk: SnapWalkMode::Diff,
         };
         let marked: Vec<u64> = metadata_candidates(
             &store,
@@ -1227,6 +1347,7 @@ mod tests {
             retention_segments: 128,
             lease_ttl_ms: 1,
             completion_retention_ms: 0,
+            snap_walk: SnapWalkMode::Diff,
         };
         let tail = GcTail::standalone(LogStore::new(store.clone()), &meta_b).unwrap();
         let mut lease = gc_lease(&store, 60_000).await;
@@ -1255,5 +1376,131 @@ mod tests {
         );
         // The mandatory tail is why: B must now know about `new` too.
         assert!(meta_b.getattr(new.ino).unwrap().is_some());
+    }
+
+    /// Plan 32 §0.2: a chunk round over a history of snapshots — a file
+    /// rewritten, one deleted, a directory moved out of the snapshotted
+    /// tree, a snapshot deleted from the middle of the chain — keeps in
+    /// `diff` mode every chunk `full` mode keeps, and the sweep's refresh
+    /// (same mode) deletes nothing a snapshot still names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_chain_marking_keeps_everything_the_full_walk_keeps() {
+        use constellation_fs_core::manifest::Manifest;
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::MetaStore;
+        use constellation_store_s3::CompressionSetting;
+        const CS: u32 = 4096;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        let (manager, _nodes) = crate::snapshot::test_manager(meta.clone(), chunks.clone(), CS);
+        let put = |tag: &'static str| {
+            let chunks = chunks.clone();
+            async move {
+                let hash = ChunkHash::of(tag.as_bytes());
+                chunks
+                    .put_chunk(&hash, tag.as_bytes(), CompressionSetting::RAW)
+                    .await
+                    .unwrap();
+                hash
+            }
+        };
+        let write = |ino, hashes: Vec<ChunkHash>| {
+            let len = hashes.len() as u64 * CS as u64;
+            let (manifest, _) = Manifest::from_chunks(CS, len, hashes, 8, ChunkHash::of);
+            meta.set_manifest(ino, &manifest.encode(), len).unwrap();
+        };
+        let mut segment = 0;
+        let mut ship = || {
+            segment += 1;
+            let rows = meta.take_journal(usize::MAX).unwrap();
+            let seqs: Vec<u64> = rows.iter().map(|(seq, _)| *seq).collect();
+            meta.ack_journal_rows_at(&seqs, segment).unwrap();
+        };
+
+        let vol = meta.mkdir(ROOT_INO, "vol", 0o755, 0, 0).unwrap().ino;
+        let sub = meta.mkdir(vol, "sub", 0o755, 0, 0).unwrap().ino;
+        let file = meta.create(vol, "f", 0o644, 0, 0).unwrap().ino;
+        let doomed = meta.create(sub, "d", 0o644, 0, 0).unwrap().ino;
+        let (v1, v2, v3, d, live) = (
+            put("v1").await,
+            put("v2").await,
+            put("v3").await,
+            put("in a moved-out dir").await,
+            put("live").await,
+        );
+        let orphan = put("never referenced").await;
+        write(file, vec![v1]);
+        write(doomed, vec![d]);
+        ship();
+        manager.create("/vol", "s1").await.unwrap();
+        write(file, vec![v2]);
+        ship();
+        manager.create("/vol", "s2").await.unwrap();
+        // `sub` leaves the tree, then its file goes; `f` is rewritten.
+        meta.rename(vol, "sub", ROOT_INO, "away").unwrap();
+        meta.unlink(sub, "d").unwrap();
+        write(file, vec![v3]);
+        ship();
+        manager.create("/vol", "s3").await.unwrap();
+        write(file, vec![live]);
+        ship();
+        manager.create("/vol", "s4").await.unwrap();
+        // From the middle: `v2` is now named by no snapshot at all.
+        manager.delete("/vol", "s2", false).await.unwrap();
+        ship();
+
+        let mut candidates = std::collections::BTreeMap::new();
+        for mode in [SnapWalkMode::Full, SnapWalkMode::Diff] {
+            let config = GcConfig {
+                snap_walk: mode,
+                ..fast_config()
+            };
+            let tail = GcTail::standalone(LogStore::new(store.clone()), &meta).unwrap();
+            let report = mark_chunks(&store, &chunks, &meta, LeaseMode::Cas, &config, true, &tail)
+                .await
+                .unwrap();
+            let Err(report) = report else {
+                panic!("verify-only returns its report");
+            };
+            let marked: HashSet<ChunkHash> =
+                report.candidates.iter().filter_map(|m| m.hash).collect();
+            candidates.insert(format!("{mode:?}"), marked);
+        }
+        let (diff, full) = (&candidates["Diff"], &candidates["Full"]);
+        assert!(
+            diff.is_subset(full),
+            "diff mode condemns what full mode keeps: {:?}",
+            diff.difference(full).collect::<Vec<_>>()
+        );
+        assert_eq!(diff, full);
+        for kept in [v1, v3, d, live] {
+            assert!(!diff.contains(&kept), "{kept:?} is still named");
+        }
+        assert!(diff.contains(&v2), "only the deleted snapshot named v2");
+        assert!(diff.contains(&orphan));
+
+        // A real round in diff mode deletes exactly those, nothing named.
+        let mut lease = gc_lease(&store, 60_000).await;
+        let tail = GcTail::standalone(LogStore::new(store.clone()), &meta).unwrap();
+        let report = run_chunks(
+            store.clone(),
+            chunks.clone(),
+            meta.clone(),
+            LeaseMode::Cas,
+            &fast_config(),
+            false,
+            None,
+            &tail,
+            &mut lease,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.deleted.len(), 2, "{:?}", report.deleted);
+        for kept in [v1, v3, d, live] {
+            assert!(chunks.has_chunk(&kept).await.unwrap());
+        }
+        assert!(!chunks.has_chunk(&v2).await.unwrap());
     }
 }

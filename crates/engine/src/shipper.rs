@@ -413,6 +413,7 @@ mod tests {
             retention_segments: 2,
             lease_ttl_ms: 1,
             completion_retention_ms: 0,
+            snap_walk: crate::gc::SnapWalkMode::Diff,
         };
         let marks = crate::gc::metadata_candidates(
             &backend,
@@ -577,6 +578,7 @@ mod tests {
             retention_segments: 2,
             lease_ttl_ms: 1,
             completion_retention_ms: 0,
+            snap_walk: crate::gc::SnapWalkMode::Diff,
         };
         for mark in crate::gc::metadata_candidates(
             &backend,
