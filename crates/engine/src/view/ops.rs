@@ -52,6 +52,24 @@ macro_rules! enter {
 macro_rules! admit {
     ($self:expr, $cx:expr, $r:ident) => {
         match $self.admission.admit($cx) {
+            Ok(admitted) => {
+                // Plan 30 §M14: the caller is a lock owner (or its
+                // process) whose grant lapsed: `EIO`, on any file.
+                if $self.lock_owner_fenced($cx) {
+                    $r.done(Err(Code::Io.into()));
+                    return;
+                }
+                admitted
+            }
+            Err(code) => {
+                $r.done(Err(code.into()));
+                return;
+            }
+        }
+    };
+    // The caller checks the owner fence itself (`fsync`: after `enter!`).
+    ($self:expr, $cx:expr, $r:ident, owner_fence_checked_later) => {
+        match $self.admission.admit($cx) {
             Ok(admitted) => admitted,
             Err(code) => {
                 $r.done(Err(code.into()));
@@ -867,6 +885,13 @@ impl Vfs for View {
     ) {
         let _w = self.watch.enter("open", ino);
         let _admitted = admit!(self, cx, r);
+        // Plan 30 §M14: opening for writing is a write (a read-only open
+        // is not fenced: the fence must not stop a fenced owner from
+        // reaching its own close).
+        if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC) && self.lock_owner_fenced_any(cx) {
+            r.done(err(Code::Io));
+            return;
+        }
         let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
@@ -1204,8 +1229,16 @@ impl Vfs for View {
 
     fn fsync<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, level: Durability, r: R) {
         let _w = self.watch.enter("fsync", ino);
-        let _admitted = admit!(self, cx, r);
+        let _admitted = admit!(self, cx, r, owner_fence_checked_later);
         let ino = enter!(self, ino, r);
+        if self.lock_owner_fenced(cx) {
+            // This `EIO` also reports a discard this description has not
+            // reported yet (plan 39 §3.7: once, not again after the fence
+            // lifts).
+            self.lock_errors_reported(ino, fh);
+            r.done(err(Code::Io));
+            return;
+        }
         // Plan 30 §M14: nothing written under a lapsed grant is made
         // durable (`lock_publish_gate`); a discard this description has
         // not reported yet is reported after the barrier.
@@ -1730,6 +1763,7 @@ impl Vfs for View {
         let local = constellation_meta::locks::LocalLock {
             owner: lock.owner.0,
             pid: lock.pid,
+            pid_start: 0,
             write: lock.kind == LockKind::Write,
             start: lock.range.start,
             end: lock.range.end,

@@ -630,15 +630,25 @@ impl Core {
         } else {
             self.reclaim_horizon_ms() as i64
         };
+        let bound = |ttl: u64| {
+            now.0
+                + self.cfg.backup_takeover_ms as i64
+                + ttl as i64
+                + deleg
+                + 2 * self.cfg.expiry_margin_ms as i64
+        };
         // Plan 30 §M14: lock grants are capped like read delegations and
-        // marked the same way; the longer ttl covers both.
-        let ttl = self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms) as i64;
-        let bound = now.0
-            + self.cfg.backup_takeover_ms as i64
-            + ttl
-            + deleg
-            + 2 * self.cfg.expiry_margin_ms as i64;
-        let until = prev_expires.min(bound);
+        // marked the same way, but only new lock grants wait for them —
+        // a lock grant still honoured elsewhere does not make an
+        // acknowledgement stale — so their (longer) ttl is a quarantine
+        // of the lock table's own.
+        let locks_until = prev_expires.min(bound(
+            self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms),
+        ));
+        if self.cfg.locks && locks_until > now.0 {
+            replica.locks().set_quarantine(locks_until);
+        }
+        let until = prev_expires.min(bound(self.cfg.read_delegation_ttl_ms));
         if until <= now.0 {
             return;
         }

@@ -129,6 +129,21 @@ pub fn parse_process_facts(status: &str, tasks: &[String]) -> ProcessFacts {
     }
 }
 
+/// `(Tgid, PPid)` from a `/proc/<pid>/status`.
+pub fn parse_lineage(status: &str) -> Option<(u32, u32)> {
+    let tgid = status_field(status, "Tgid")?.parse().ok()?;
+    let ppid = status_field(status, "PPid")?.parse().ok()?;
+    Some((tgid, ppid))
+}
+
+/// `starttime` (field 22) from a `/proc/<pid>/stat`; the command name
+/// before it may hold spaces and parentheses, so fields count from the
+/// last `)`.
+pub fn parse_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// `Groups:` of a `/proc/<pid>/status`.
 pub fn parse_groups(status: &str) -> Vec<u32> {
     status_field(status, "Groups")
@@ -172,6 +187,18 @@ impl Process for LinuxProcess {
     fn supplementary_groups(&self, pid: u32) -> io::Result<Vec<u32>> {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
         Ok(parse_groups(&status))
+    }
+
+    fn lineage(&self, pid: u32) -> io::Result<crate::Lineage> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        let (tgid, ppid) = parse_lineage(&status).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "no Tgid/PPid in the status")
+        })?;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let start = parse_start_time(&stat).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "no starttime in the stat")
+        })?;
+        Ok(crate::Lineage { tgid, ppid, start })
     }
 
     fn effective_ids(&self) -> (u32, u32) {
@@ -526,6 +553,15 @@ mod tests {
     use crate::lock::open_lock_file;
 
     #[test]
+    fn a_stat_line_yields_the_start_time_whatever_the_command_name() {
+        let stat = "4242 (a (weird) name) S 1 4242 4242 0 -1 4194560 100 0 0 0 \
+                    1 2 0 0 20 0 1 0 987654 1000 10 18446744073709551615";
+        assert_eq!(parse_start_time(stat), Some(987654));
+        assert_eq!(parse_start_time("4242 (cut) S 1"), None);
+        assert_eq!(parse_start_time("no parenthesis"), None);
+    }
+
+    #[test]
     fn mountinfo_lines_yield_the_device_type_source_and_unescaped_mountpoint() {
         let text = "\
 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
@@ -645,6 +681,17 @@ garbage line without the separator
         assert!(p.memory_budget().unwrap() > 0);
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
         assert_eq!(p.supplementary_groups(me).unwrap(), parse_groups(&status));
+        // A thread names its process; the process's parent is ours.
+        let mine = p.lineage(me).unwrap();
+        assert_eq!(mine.tgid, me);
+        assert_eq!(mine.ppid, std::os::unix::process::parent_id());
+        assert!(mine.start > 0);
+        assert_eq!(p.lineage(me).unwrap(), mine, "a start time is stable");
+        let of_thread = std::thread::spawn(|| LinuxProcess.lineage(gettid() as u32).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!((of_thread.tgid, of_thread.ppid), (me, mine.ppid));
+        assert!(of_thread.start >= mine.start);
         let t = p.current_thread();
         let other = std::thread::spawn(|| LinuxProcess.current_thread())
             .join()

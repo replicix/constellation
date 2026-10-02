@@ -24,18 +24,21 @@
 //! - `--locks cluster` (the default with P2P): a lock taken on one node
 //!   excludes conflicting locks on every other node. The first lock on a
 //!   file costs one round trip to its sequencer; the grant is then cached
-//!   (an uncontended re-lock costs nothing) until another node wants a
+//!   (an uncontended re-lock costs no message) until another node wants a
 //!   conflicting one. Data written under a lock is flushed through before
 //!   the grant moves, and the next holder waits for it and drops its
 //!   kernel cache of the file, so lock-protected read-modify-write works
 //!   across nodes. A node whose grant lapsed (partitioned from the
 //!   sequencer past the ttl) fails I/O on the files it holds locks on
-//!   with `EIO` until they are unlocked (NFSv4's rule).
+//!   with `EIO` until they are unlocked (NFSv4's rule), and the lock's
+//!   owner — its process and the processes it started — gets `EIO` from
+//!   every write and namespace op on the mount meanwhile
+//!   ([`ClusterLocks::owner_fenced`]).
 //! - Without P2P (`CONSTELLATION_P2P=off`, or an endpoint that could not
 //!   start) the effective mode is `local`: the inbox is not a lock path.
 //!   An explicit `--locks cluster` then fails the mount.
 //! - `CONSTELLATION_LOCKS` supplies the default when the flag is absent.
-//! - `CONSTELLATION_LOCK_TTL_MS` (default 5000): a grant's lifetime,
+//! - `CONSTELLATION_LOCK_TTL_MS` (default 20000): a grant's lifetime,
 //!   renewed in the background while held.
 //! - `CONSTELLATION_LOCK_CACHE_IDLE_MS` (default 30000): how long an
 //!   unused cached grant is kept before it is released.
@@ -53,7 +56,7 @@ use constellation_authority::{
     LockAnswer, LockOutcome, LockRenewEntry, LockRenewResult, LockTestAnswer, LockTestOutcome,
 };
 use constellation_fs_core::Ino;
-use constellation_meta::locks::{Grant, GrantId, LocalLock, LocalOutcome, LockMode};
+use constellation_meta::locks::{FencedOwner, Grant, GrantId, LocalLock, LocalOutcome, LockMode};
 use constellation_meta::{JournalPos, Meta, Position, ReadKey};
 use constellation_net::{LockOutcomeWire, LockRenewResultWire, LockRenewWire, LockTestOutcomeWire};
 use constellation_types::Code;
@@ -96,7 +99,7 @@ fn env_ms(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// `CONSTELLATION_LOCK_TTL_MS` (default 5000).
+/// `CONSTELLATION_LOCK_TTL_MS` (default 20000).
 pub fn lock_ttl_ms(default: u64) -> u64 {
     env_ms("CONSTELLATION_LOCK_TTL_MS", default)
 }
@@ -108,6 +111,47 @@ pub fn lock_cache_idle_ms(default: u64) -> u64 {
 
 fn now_ms() -> i64 {
     constellation_store_s3::lease::now_unix_ms()
+}
+
+/// The process of task `pid` (FUSE names a request by its thread),
+/// named across pid reuse: `(thread group id, start time)` — `(pid, 0)`
+/// where `/proc` cannot tell (gone, or no `/proc`).
+pub fn process_of(pid: u32) -> (u32, u64) {
+    if pid == 0 {
+        return (0, 0);
+    }
+    let process = &constellation_platform::native().process;
+    match process.lineage(pid) {
+        Ok(l) if l.tgid == pid => (pid, l.start),
+        Ok(l) => (l.tgid, process.lineage(l.tgid).map_or(0, |p| p.start)),
+        Err(_) => (pid, 0),
+    }
+}
+
+/// Whether two `(pid, start time)` name the same process (an unknown
+/// start time matches by pid alone).
+fn same_process(a: (u32, u64), b: (u32, u64)) -> bool {
+    a.0 == b.0 && (a.1 == 0 || b.1 == 0 || a.1 == b.1)
+}
+
+/// Whether the process `proc` (with parent `ppid`) is one of `fenced`
+/// or descends from one: up the parent chain through `/proc`.
+fn lineage_hits(mut proc: (u32, u64), mut ppid: u32, fenced: &[(u32, u64)]) -> bool {
+    let process = &constellation_platform::native().process;
+    for _ in 0..LINEAGE_DEPTH {
+        if fenced.iter().any(|f| same_process(*f, proc)) {
+            return true;
+        }
+        if ppid <= 1 {
+            return false;
+        }
+        let Ok(l) = process.lineage(ppid) else {
+            return false;
+        };
+        proc = (ppid, l.start);
+        ppid = l.ppid;
+    }
+    false
 }
 
 /// The largest offset the kernel accepts in a lock reply (`OFFSET_MAX`);
@@ -124,6 +168,18 @@ const LOCAL_POLL: Duration = Duration::from_millis(15);
 /// by a notification waiting on an unrelated FUSE request).
 const INVAL_WAIT: Duration = Duration::from_secs(1);
 
+/// How far up the process tree the owner fence looks for a fenced
+/// process (`flock(1) sh -c 'git …'`: git is two levels below the lock).
+const LINEAGE_DEPTH: usize = 64;
+
+/// How long after its install a recalled grant still waits for the local
+/// lock it was asked for: what [`ClusterLocks::granted`] may wait (the
+/// session budget, then the kernel invalidation) plus the lease margin's
+/// ceiling (1 s). Past it the grant is released rather than renewed.
+pub fn first_use_budget_ms(meta: &Meta) -> i64 {
+    (meta.session().budget() + INVAL_WAIT).as_millis() as i64 + 1_000
+}
+
 /// Non-blocking requests give up with `EAGAIN` after this many grant
 /// round trips that did not end in a lock (each one lost to a recall that
 /// overtook it: another node wants the file).
@@ -138,13 +194,101 @@ pub struct ClusterLocks {
     /// The frontends' kernel caches of a file, dropped after a grant
     /// (`crate::kernel_inval`); `None` with kernel invalidation off.
     pub inval: Option<crate::kernel_inval::InodeInvalidator>,
+    /// The owner fence's verdicts per pid, valid for one set of fenced
+    /// owners (see [`Self::owner_fenced`]).
+    pub lineage: Mutex<LineageCache>,
 }
+
+/// Which tasks descend from a fenced owner's process, for the fenced set
+/// it was worked out for: a fence that stays (an application that keeps
+/// its lock after the lapse) costs every other task one `/proc` walk and
+/// then one `/proc` read per op (its start time, against pid reuse).
+#[derive(Default)]
+pub struct LineageCache {
+    fenced: Vec<FencedOwner>,
+    /// By `(task id, task start time)`.
+    verdicts: std::collections::HashMap<(u32, u64), bool>,
+}
+
+/// Past this many pids the cache starts over.
+const LINEAGE_CACHE_MAX: usize = 4096;
 
 impl ClusterLocks {
     /// Whether I/O on `ino` must be refused (`EIO`): local locks under a
     /// lapsed grant. One relaxed atomic load when no local lock exists.
     pub fn fenced(&self, ino: Ino) -> bool {
         self.meta.locks().fenced(ino, now_ms())
+    }
+
+    /// Plan 30 §M14, the owner fence: whether an op by `pid` (FUSE: the
+    /// calling thread) or by the kernel lock owner `lock_owner` must be
+    /// refused (`EIO`) because it comes from a lock owner whose grant
+    /// lapsed with its local lock still held — any thread of the process
+    /// that took the lock, or a process it started (a `flock(1)`
+    /// wrapper's git), matched by thread group. The lock owner only
+    /// matches `fcntl` locks on direct I/O (the kernel sends one with
+    /// direct-I/O reads and writes only, and a `flock`'s owner is its open
+    /// file, never a write's). Other processes on the node are never
+    /// fenced. One or two relaxed atomic loads while no owner can be
+    /// fenced.
+    pub fn owner_fenced(&self, pid: Option<u32>, lock_owner: Option<u64>) -> bool {
+        let now = now_ms();
+        let locks = self.meta.locks();
+        if !locks.owner_fence_armed(now) {
+            return false;
+        }
+        let fenced = locks.fenced_owners(now);
+        if fenced.is_empty() {
+            return false;
+        }
+        let hit = lock_owner.is_some_and(|o| fenced.iter().any(|f| f.owner == o))
+            || pid.is_some_and(|pid| self.descends_from_fenced(pid, fenced));
+        if hit {
+            locks.note_owner_fenced_op();
+        }
+        hit
+    }
+
+    /// Whether the process of task `pid`, or one of its ancestors, is the
+    /// process of a fenced owner: by thread group, so a sibling thread of
+    /// the locking thread and a process the locker started are fenced
+    /// whichever thread took the lock. Verdicts are cached per fenced set
+    /// and keyed by the task's start time too, so a recycled pid is
+    /// judged afresh (one `/proc` read per op while an owner is fenced;
+    /// the walk up the tree once per task).
+    fn descends_from_fenced(&self, pid: u32, fenced: Vec<FencedOwner>) -> bool {
+        let process = &constellation_platform::native().process;
+        let task = process.lineage(pid).ok();
+        let key = (pid, task.map_or(0, |t| t.start));
+        let mut cache = self.lineage.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.fenced != fenced || cache.verdicts.len() >= LINEAGE_CACHE_MAX {
+            cache.fenced = fenced;
+            cache.verdicts.clear();
+        }
+        if let Some(v) = cache.verdicts.get(&key) {
+            return *v;
+        }
+        let owners: Vec<(u32, u64)> = cache
+            .fenced
+            .iter()
+            .filter(|f| f.pid > 1)
+            .map(|f| (f.pid, f.pid_start))
+            .collect();
+        let verdict = !owners.is_empty()
+            && match task {
+                Some(t) => {
+                    let proc = if t.tgid == pid {
+                        (pid, t.start)
+                    } else {
+                        (t.tgid, process.lineage(t.tgid).map_or(0, |p| p.start))
+                    };
+                    lineage_hits(proc, t.ppid, &owners)
+                }
+                // No `/proc` (or the task is gone): by pid alone.
+                None => owners.iter().any(|o| o.0 == pid),
+            };
+        cache.verdicts.insert(key, verdict);
+        verdict
     }
 
     /// Whether `ino`'s dirty data must be discarded rather than
@@ -281,7 +425,32 @@ impl ClusterLocks {
         self.set(ino, lock, sleep)
     }
 
-    fn set(&self, ino: Ino, lock: LocalLock, sleep: bool) -> Result<(), Code> {
+    fn set(&self, ino: Ino, mut lock: LocalLock, sleep: bool) -> Result<(), Code> {
+        // FUSE names the locking *thread*; the owner fence (and `getlk`)
+        // need its process, named across pid reuse.
+        (lock.pid, lock.pid_start) = process_of(lock.pid);
+        let mut asked = false;
+        let r = self.set_inner(ino, lock, sleep, &mut asked);
+        if r.is_err() && asked {
+            // A grant may have come for this request (or its answer was
+            // lost after the core installed it) that it will now never
+            // use: the grant must not wait for that first lock — recalled,
+            // it would be renewed for ever and its waiters would wait for
+            // ever.
+            if self.meta.locks().abandon_first_use(ino, now_ms()) {
+                self.idle(ino);
+            }
+        }
+        r
+    }
+
+    fn set_inner(
+        &self,
+        ino: Ino,
+        lock: LocalLock,
+        sleep: bool,
+        asked: &mut bool,
+    ) -> Result<(), Code> {
         let mut rounds = 0u32;
         loop {
             match self.meta.locks().local_set(ino, lock, now_ms()) {
@@ -305,6 +474,7 @@ impl ClusterLocks {
                     rounds += 1;
                     constellation_vfs::watch::stage("lock grant (core reply)");
                     let (reply, answer) = tokio::sync::oneshot::channel();
+                    *asked = true;
                     self.tx
                         .send(SyncRequest::Lock {
                             ino,

@@ -340,6 +340,9 @@ pub trait Replica {
     /// `until_ms` (the restart quarantine's horizon). `false`: it could not
     /// be persisted, and the grant must not be made.
     fn note_grant_horizon(&self, until_ms: i64) -> bool;
+    /// The same for a lock grant: its own horizon, which only new lock
+    /// grants wait for after a restart (`load_lock_quarantine`).
+    fn note_lock_grant_horizon(&self, until_ms: i64) -> bool;
     /// M16: the inodes whose read delegations an op not yet executed must
     /// recall (`Meta::recall_inos_of_op_now`: an unlink's or rename's
     /// victims included).
@@ -347,6 +350,9 @@ pub trait Replica {
     /// At start: the previous incarnation's grants may be live until the
     /// returned time; the table is quarantined until then.
     fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64>;
+    /// At start: the previous incarnation's lock grants may be live until
+    /// the returned time; no new lock grant until then.
+    fn load_lock_quarantine(&self, now_ms: i64) -> Option<i64>;
     /// Whether the unshipped journal touched what a ReadIndex for `ino`
     /// (a directory's entries with `dir`; the entry `name` → `child`)
     /// reads.
@@ -981,6 +987,20 @@ impl Replica for Meta {
 
     fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64> {
         Meta::load_grant_quarantine(self, now_ms)
+    }
+
+    fn note_lock_grant_horizon(&self, until_ms: i64) -> bool {
+        match Meta::note_lock_grant_horizon(self, until_ms) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "persisting the lock-grant horizon failed; not granting");
+                false
+            }
+        }
+    }
+
+    fn load_lock_quarantine(&self, now_ms: i64) -> Option<i64> {
+        Meta::load_lock_quarantine(self, now_ms)
     }
 
     fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino> {

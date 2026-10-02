@@ -91,6 +91,10 @@ impl Process for MacProcess {
         Err(unsupported("another process's groups (plan 34 M2)"))
     }
 
+    fn lineage(&self, _pid: u32) -> io::Result<crate::Lineage> {
+        Err(unsupported("another process's parent (plan 34 M2)"))
+    }
+
     fn effective_ids(&self) -> (u32, u32) {
         crate::unix::effective_ids()
     }

@@ -509,6 +509,11 @@ impl crate::store::Meta {
 /// before the grant is answered (see [`crate::store::Meta::note_grant_horizon`]).
 pub(crate) const KV_READ_GRANT_HORIZON: &str = "read_grant_horizon_ms";
 
+/// Local kv key: the same for lock grants (plan 30 §M14), kept apart: a
+/// lock grant may be honoured for much longer than a read delegation, and
+/// only new lock grants wait for it, not acknowledgements.
+pub(crate) const KV_LOCK_GRANT_HORIZON: &str = "lock_grant_horizon_ms";
+
 impl crate::store::Meta {
     /// This node's read-delegation tables (plan 30 §M8).
     pub fn read_delegations(&self) -> &ReadDelegations {
@@ -523,8 +528,20 @@ impl crate::store::Meta {
     /// ([`Self::load_grant_quarantine`]). Written at most once per second
     /// of horizon growth.
     pub fn note_grant_horizon(&self, until_ms: i64) -> Result<(), crate::MetaError> {
+        self.note_horizon(KV_READ_GRANT_HORIZON, until_ms)
+    }
+
+    /// [`Self::note_grant_horizon`] for a lock grant: a holder that
+    /// restarts inside its lease grants no lock until it has passed
+    /// ([`Self::load_lock_quarantine`]); acknowledgements do not wait for
+    /// it.
+    pub fn note_lock_grant_horizon(&self, until_ms: i64) -> Result<(), crate::MetaError> {
+        self.note_horizon(KV_LOCK_GRANT_HORIZON, until_ms)
+    }
+
+    fn note_horizon(&self, key: &str, until_ms: i64) -> Result<(), crate::MetaError> {
         let stored = self
-            .kv_get(KV_READ_GRANT_HORIZON)?
+            .kv_get(key)?
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
         if until_ms > stored {
@@ -532,7 +549,7 @@ impl crate::store::Meta {
             let value = until_ms + 1_000;
             // M16: synced — a holder that forgot it on a power loss would
             // acknowledge writes behind grants still honoured elsewhere.
-            self.kv_set_durable(KV_READ_GRANT_HORIZON, &value.to_string())?;
+            self.kv_set_durable(key, &value.to_string())?;
         }
         Ok(())
     }
@@ -547,6 +564,21 @@ impl crate::store::Meta {
             .and_then(|v| v.parse::<i64>().ok())?;
         (until > now_ms).then(|| {
             self.read_delegations.set_quarantine(until);
+            until
+        })
+    }
+
+    /// At start: lock grants the previous incarnation made may still be
+    /// honoured until the persisted lock horizon; no new lock grant until
+    /// then.
+    pub fn load_lock_quarantine(&self, now_ms: i64) -> Option<i64> {
+        let until = self
+            .kv_get(KV_LOCK_GRANT_HORIZON)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok())?;
+        (until > now_ms).then(|| {
+            self.locks.set_quarantine(until);
             until
         })
     }
@@ -710,5 +742,19 @@ mod tests {
         assert_eq!(meta.load_grant_quarantine(1_000), Some(6_000));
         assert_eq!(meta.read_delegations().quarantine_until(), 6_000);
         assert_eq!(meta.load_grant_quarantine(7_000), None);
+    }
+
+    /// Lock grants keep a horizon of their own: it quarantines new lock
+    /// grants after a restart, not acknowledgements.
+    #[test]
+    fn the_lock_grant_horizon_is_kept_apart() {
+        let meta = crate::store::Meta::open_in_memory().unwrap();
+        assert_eq!(meta.load_lock_quarantine(0), None);
+        meta.note_lock_grant_horizon(21_000).unwrap();
+        assert_eq!(meta.load_grant_quarantine(1_000), None);
+        assert_eq!(meta.read_delegations().quarantine_until(), 0);
+        assert_eq!(meta.load_lock_quarantine(1_000), Some(22_000));
+        assert_eq!(meta.locks().quarantine_until(), 22_000);
+        assert_eq!(meta.load_lock_quarantine(23_000), None);
     }
 }

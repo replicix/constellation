@@ -3547,6 +3547,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "first_use_abandoned": {
+          "default": 0,
+          "description": "Recalled grants given up before their first local lock (the\nrequester gave up, or the first-use budget ran out).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "grace_refusals": {
           "default": 0,
           "format": "uint64",
@@ -3637,6 +3644,19 @@
           "default": "",
           "description": "`cluster` or `local`.",
           "type": "string"
+        },
+        "owner_fenced_ops": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "owners_fenced": {
+          "default": 0,
+          "description": "Lock owners fenced on this node (their grant lapsed under their\nlocal lock), and the ops of theirs refused with `EIO` for it, on\nany file.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "recalled": {
           "default": 0,
@@ -7900,6 +7920,7 @@
           "$ref": "#/$defs/LockStatus",
           "default": {
             "fenced_io": 0,
+            "first_use_abandoned": 0,
             "grace_refusals": 0,
             "grant_ms": [],
             "grant_ms_total": 0,
@@ -7914,6 +7935,8 @@
             "local_hits": 0,
             "lost": 0,
             "mode": "",
+            "owner_fenced_ops": 0,
+            "owners_fenced": 0,
             "recalled": 0,
             "recalled_busy": 0,
             "recalls_expired": 0,

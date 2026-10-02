@@ -335,6 +335,8 @@ fn replay_seed() {
         Ok("locks-released-writes") => with_lock_writes(locks_released_delegated_config(), "d2"),
         Ok("locks-failover-backup-writes") => with_lock_writes(locks_failover_backup_config(), ""),
         Ok("locks-writes") => with_lock_writes(locks_config(), ""),
+        Ok("locks-partition-writes") => with_lock_writes(locks_partition_config(), ""),
+        Ok("locks-pause-writes") => with_lock_writes(locks_pause_config(), ""),
         Ok("locks-nofence") => SimConfig {
             lock_ignore_fence: true,
             ..locks_partition_config()
@@ -3783,6 +3785,7 @@ impl M14Totals {
         c.acquired += l.acquired;
         c.ios += l.ios;
         c.fenced_ios += l.fenced_ios;
+        c.owner_fenced_ios += l.owner_fenced_ios;
         c.local_conflicts += l.local_conflicts;
         c.granted += l.granted;
         c.would_block += l.would_block;
@@ -3863,6 +3866,34 @@ fn locks_partitioned_holder_is_fenced() {
     let t = run_m14("locks-partition", locks_partition_config(), 91_000..91_120);
     assert!(t.clients.fenced_ios > 0, "no I/O was ever fenced: {t:?}");
     assert!(t.recalls_expired > 0, "no recall was outwaited: {t:?}");
+}
+
+/// Plan 30 §M14, the owner fence (the git-under-flock follow-up): every
+/// exclusive holder writes its turn into a data file — another file the
+/// lock guards, as git's objects and refs are — while holders are cut
+/// off or paused past their grant. The lapsed owner is fenced on that
+/// file too (the lock file's own fence covers only the lock file), so no
+/// later holder ever reads a turn older than one written under the lock
+/// before it.
+#[test]
+fn locks_lapsed_owner_is_fenced_on_other_files() {
+    for (label, cfg, seeds) in [
+        (
+            "locks-partition-writes",
+            with_lock_writes(locks_partition_config(), ""),
+            98_000..98_040,
+        ),
+        (
+            "locks-pause-writes",
+            with_lock_writes(locks_pause_config(), ""),
+            98_100..98_140,
+        ),
+    ] {
+        let t = run_m14(label, cfg, seeds);
+        assert!(t.clients.fenced_ios > 0, "{label}: nothing fenced: {t:?}");
+        assert!(t.clients.turns_written > 100, "{label}: {t:?}");
+        assert_eq!(t.clients.stale_turn_reads, 0, "{label}: {t:?}");
+    }
 }
 
 /// Plan 30 §M14: clock skew within the margin keeps mutual exclusion.

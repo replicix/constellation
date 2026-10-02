@@ -1720,10 +1720,14 @@ impl Engine {
                     fsync: self.fsync_waits.clone(),
                     cto_strict: self.cto_strict,
                     locks: self.locks_cluster.then(|| {
+                        self.meta
+                            .locks()
+                            .set_first_use_budget_ms(crate::locks::first_use_budget_ms(&self.meta));
                         Arc::new(crate::locks::ClusterLocks {
                             meta: self.meta.clone(),
                             tx: self.sync_tx.clone(),
                             inval: self.kernel_inval.as_ref().map(|k| k.inodes()),
+                            lineage: Default::default(),
                         })
                     }),
                     lease: self.lease.clone(),

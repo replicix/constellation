@@ -235,6 +235,12 @@ pub struct OpCtx<'a> {
     pub op: OpId,
     pub kind: OpKind,
     pub caller: &'a Caller,
+    /// The kernel's lock owner of the request, where it says (FUSE: a
+    /// direct-I/O read or write; the POSIX owner, the caller's file
+    /// table): an `fcntl` lock owner whose cluster-lock grant lapsed is
+    /// fenced by it even when the pid does not tell (plan 30 §M14). Never
+    /// a `flock` owner (the open file).
+    pub lock_owner: Option<u64>,
     pub deadline: Option<Instant>,
     pub cancel: Option<&'a CancelToken>,
     pub span: &'a tracing::Span,
@@ -249,10 +255,16 @@ impl<'a> OpCtx<'a> {
             op: OpId::next(),
             kind,
             caller,
+            lock_owner: None,
             deadline: None,
             cancel: None,
             span: &NO_SPAN,
         }
+    }
+
+    pub fn with_lock_owner(mut self, owner: Option<u64>) -> Self {
+        self.lock_owner = owner;
+        self
     }
 
     pub fn with_deadline(mut self, deadline: Instant) -> Self {

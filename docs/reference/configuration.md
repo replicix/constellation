@@ -480,7 +480,7 @@ Plan 30 M14. See [Cluster locks](features/cluster-locks.md).
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_LOCKS` | `cluster` with P2P, `local` without | `local`, `cluster` | default for `--locks`; the flag wins |
-| `CONSTELLATION_LOCK_TTL_MS` | `5000` | milliseconds; `0` means the default | a lock grant's lifetime, renewed in the background while held. A node whose grant lapsed fails I/O on the locked files with `EIO` |
+| `CONSTELLATION_LOCK_TTL_MS` | `20000` | milliseconds; `0` means the default | a lock grant's lifetime, renewed in the background while held. A holder whose node stalls longer loses the lock: its node fails I/O on the locked files, and every write and namespace operation of the lock's owner on any file, with `EIO`. A waiter behind a *crashed* holder waits up to `ttl + margin`; see [Cluster locks](features/cluster-locks.md#configuration) |
 | `CONSTELLATION_LOCK_CACHE_IDLE_MS` | `30000` | milliseconds; `0` means the default | how long a grant with no local lock under it is kept (so an uncontended re-lock costs nothing) before it is released |
 
 ### Metadata sync

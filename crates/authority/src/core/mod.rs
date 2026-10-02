@@ -318,8 +318,11 @@ pub struct Config {
     /// the owning sequencer. Off: the kernel keeps locks node-local and
     /// nothing here runs.
     pub locks: bool,
-    /// `CONSTELLATION_LOCK_TTL_MS` (default 5000): a lock grant's ttl;
-    /// the margin is the lease's (`expiry_margin_ms`).
+    /// `CONSTELLATION_LOCK_TTL_MS` (default 20000): a lock grant's ttl;
+    /// the margin is the lease's (`expiry_margin_ms`). Long, because a
+    /// holder that stalls past it loses the lock under the application
+    /// (whose process is then fenced); a waiter behind a crashed holder
+    /// waits up to `ttl + margin` for it.
     pub lock_ttl_ms: u64,
     /// `CONSTELLATION_LOCK_CACHE_IDLE_MS` (default 30000): a grant with
     /// no local lock under it for this long is released (its renewals
@@ -461,7 +464,7 @@ impl Config {
             delegation: true,
             delegation_ttl_ms: 5_000,
             locks: true,
-            lock_ttl_ms: 5_000,
+            lock_ttl_ms: 20_000,
             lock_cache_idle_ms: 30_000,
             delegation_stream_rows: 256,
             delegation_stream_tick_ms: 50,
@@ -1349,7 +1352,7 @@ impl Core {
         self.arm_poll(now, 0, out);
         self.arm_drain(now, out);
         self.read_start(now, replica, out);
-        self.locks_start(replica);
+        self.locks_start(now, replica);
         self.backup_start(now, replica, out);
         self.promise_start(now, replica, out);
         // EC2 campaign 8 A-1: learn who holds the lease now, not at the

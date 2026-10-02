@@ -17,7 +17,7 @@ use tempfile::TempDir;
 /// A holder's filesystem: the lease view is held with the durability
 /// gate `gated`; the core's side of the channel is returned (kept
 /// open, never answered — nothing here goes through the core).
-fn holder_fs(
+pub(super) fn holder_fs(
     meta: Arc<Meta>,
     gated: bool,
 ) -> (
@@ -449,6 +449,7 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
             meta: meta.clone(),
             tx: h.tx.clone(),
             inval: None,
+            lineage: Default::default(),
         }));
     }
     let caller = Caller::new(0, 0, None);
@@ -494,6 +495,7 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
+            installed_ms: now,
         },
     );
     Blocking::run(|r| {

@@ -34500,6 +34500,352 @@ each, plus 1 controller engine pod), `csi-plugin-restart-survives` 83.0 s
 
 ### Gates (37-k3b worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `k3b`)
 
+## Fix: fence the lock owner, not just the locked file (`lock-fence-owner`; plan 30 M11/M14 follow-up)
+
+### The problem
+
+A grant is honoured for `CONSTELLATION_LOCK_TTL_MS` minus the margin
+(4 s at the old 5 s default). If the holding node, or its path to the
+sequencer, stalled for longer, the grant lapsed and the sequencer granted
+the lock to another node. A lapsed grant fenced only I/O **on the locked
+inode** (`LockTables::fenced`, `View::lock_fenced`, `lock_publish_gate`).
+Namespace operations and writes to other files were not fenced. Git
+`flock`s one turn file, then creates, links and unlinks loose objects and
+renames refs, so after such a stall two nodes modified the repository at
+once (harness `git-under-flock-b2b`/`-rounds`: overlapping turns on this
+host, see "Fix: lock exclusion under load" above: rounds run 3, a 5.5 s
+owner stall, 2 overlapping turns).
+
+The decision (Chubby sequencers and jeopardy, CephFS client blocklisting,
+GPFS expel, Lustre evict, NFSv4 lease expiry to `EIO`, Kleppmann's
+fencing tokens): fence the *actor*, keep `EIO` as the signal, and make
+lapses rarer.
+
+### Milestone 1 (this change: node-local, no wire change)
+
+**Owner fence** (`crates/meta/src/locks.rs`). `LockTables` keeps
+`fenced_owners: owner → FencedOwner { owner, pid, since_ms }`. An owner is
+captured when any of its local locks is under no honoured, covering
+grant: the grant lapsed (seen by the op path, `fenced`, `take_discard`),
+was lost (`lost`), dropped by the renewal tick (`drop_held`,
+`drop_held_any`), or was replaced after a lapse (`install_held`, judged at
+the new grant's `installed_ms`). The entry is sticky. It is removed only
+when that owner has no local lock left (`local_unlock`,
+`local_release_owner`), not when a new grant arrives, because the lock was
+not held throughout. The fast path is `owner_fence_armed(now)`: one
+relaxed load of `local_inos` (0: no local lock anywhere), then one of
+`fence_from_ms`. That is the earliest `until_ms` among the grants under
+local locks (`i64::MIN` once an owner is fenced), refreshed under the
+table lock on every change to `held`/`local` (`track`/`refence`).
+
+**Caller identity** (`crates/vfs/src/ctx.rs`, the FUSE adapter).
+`OpCtx.lock_owner: Option<u64>` is set from the kernel's lock owner on
+`read`/`write` (`with_lock_owner`). `Caller.pid` was already there (FUSE
+sends the calling *thread's* id), and `flock(1)`-style wrappers run git
+as a child. `ClusterLocks::set` records a local lock's pid as the
+locking thread's process (`tgid`) with that process's start time
+(`LocalLock.pid_start`; `process_of`), and `ClusterLocks::owner_fenced`
+(`crates/engine/src/locks.rs`) matches the lock owner id, or takes the
+caller's thread group and walks `/proc/<pid>/{status,stat}` (`Tgid`,
+`PPid`, `starttime`; new `Process::lineage` in `constellation-platform`)
+up at most 64 levels looking for a fenced owner's `(pid, start time)`.
+The verdict is cached per `(thread id, thread start time)` for the
+current fenced set (`LineageCache`, reset when the set changes or past
+4096 entries). (The first version compared the stored *thread* id; see
+the fix round below.)
+
+**Where it is checked** (`crates/engine/src/view/ops.rs` `admit!`, every
+op's entry; `view/lock_gate.rs`). `lock_owner_fenced(cx)` refuses with
+`EIO`: setattr, mknod, mkdir, symlink, link, unlink, rmdir, rename,
+create, read, write, fsync, fallocate, setxattr, removexattr, and `open`
+with `WRITE|TRUNC`. It does not fence lookup, getattr, readlink, readdir,
+statfs, getxattr, listxattr, lseek, a read-only open, flush, release, the
+lock ops or `sync_view`: those are how the application sees the tree,
+closes and unlocks, which lifts the fence. Other processes on the node are
+never fenced. Tainted dirty data is still discarded at publish as before.
+
+**Before vs now.** Before, a lapsed grant fenced `read`/`write`/`flush`/
+`fsync`/`fallocate`/truncate on the locked inode, for every process on the
+node. Now the same holds, and in addition the owner (its lock owner id,
+its process and threads, and its descendants) gets `EIO` on every write
+and namespace op on any file of the mount until its locks are gone.
+
+**Default TTL 5000 → 20000 ms** (`Config::defaults`, `lock_ttl_ms`).
+`CONSTELLATION_LOCK_TTL_MS` still overrides it. The trade-off: a waiter
+behind a *crashed* holder waits up to `ttl + margin` (≈21 s). Renewals
+come every `(ttl − margin)/2` = 9.5 s. Grants under a delegation are
+still capped by the delegation (5 s TTL), so the longer TTL helps
+root-owned files only.
+
+The longer TTL would also have stretched every fast-takeover and
+restart quarantine, because lock grants shared the read delegations'
+horizon. That would have meant acknowledgements held for up to ≈23 s
+after a fast takeover of a tenure that granted locks, and ≈22 s after a
+restart inside the lease. Lock grants now persist a horizon of their own
+(`KV_LOCK_GRANT_HORIZON`, `Meta::note_lock_grant_horizon`,
+`load_lock_quarantine` at `locks_start`). A fast takeover sets
+`LockTables::set_quarantine` from the lock TTL, and the acknowledgement
+floor (`read_delegations().set_quarantine`) from the read-delegation TTL
+alone (`backup.rs::note_marker_landed`). `lock_grace_active` and
+`lock_grace_for_generation` use the later of the two. Acknowledgements do
+not need to wait for lock grants: a grant still honoured elsewhere does
+not make an acknowledged mutation stale, and only new lock grants must
+wait.
+
+Scenarios that test the lapse itself already pin the TTL:
+`lock-holder-partitioned`, `lock-holder-killed-contention` and
+`lock-fence-at-close` set 3000; `lock-failover` sets 15000. The
+simulation sets 1500 (`sim/run.rs`). The core unit-test harness now pins
+5000 (`core/tests.rs::Harness::with`; its lease TTL is 10 s), and seven
+lock tests there depended on it. No harness scenario needed a change for
+the TTL.
+
+**Carried from the lock-exclusion review: first use bounded.**
+`HeldGrant.installed_ms` (new). `LockTables::renewable` renews a recalled
+grant awaiting its first local lock only while
+`now < installed_ms + first_use_budget_ms`. The budget is the session
+budget + `INVAL_WAIT` (1 s) + 1 s (the margin's ceiling), set at mount
+(`locks::first_use_budget_ms`; 4 s default). `expire_first_use` (run by
+the renewal tick) clears `first_use` on such grants, and the tick then
+releases them (`first_use_abandoned`). `ClusterLocks::set` clears it at
+once (`abandon_first_use`, then `LockIdle`) when a request that asked the
+core gives up with an error: an `answer.blocking_recv()` error, `EAGAIN`,
+`ENOLCK` or `EIO`.
+
+**Status** (`status.locks`): `owners_fenced`, `owner_fenced_ops`,
+`first_use_abandoned`.
+
+**Harness** (`gitflock.rs`): a turn whose *git* step (or the edit before
+git ran) failed with `EIO` is marked `fenced`, and only if its node
+counted fenced ops (`owner_fenced_ops`, summed over the workload across
+restarts) during the workload. A turn overlapping a fenced turn is
+reported apart ("overlapping a fenced turn"), not as a broken lock, as
+long as the fenced turn completed no writing step (edit, add, commit,
+marker, gc) after the later turn got the lock; otherwise it is a broken
+lock. Every committer's lock counters are printed. (The first version
+counted any `EIO`; see the fix round below.)
+
+### History moved here from `cluster-locks.md`
+
+- Before the lock-exclusion fix, a grant recalled before its first use
+  was renewed only once that lock was taken, with a fraction of its window
+  left. It lapsed under the application's lock when the late renewal's
+  answer did not come back in time: the owner outwaited it and granted
+  the lock to the next node while the application still held its `flock`
+  (harness `git-under-flock-b2b`: two committers in the turn at once).
+- Before, a delegate could hand out a grant of barely more than the
+  margin, which its holder then honoured for a fraction of a second. The
+  grant lapsed while the application still held its lock, and the owner
+  granted the lock to another node (two `git commit`s under one `flock`
+  at once, EC2 campaign 5's `index.lock: File exists` stall; harness
+  `git-under-flock-rounds`). The reference doc said then that a lapsed
+  grant fenced I/O only on the locked file, so "the grant must not lapse".
+- Before, a new tenure collected the delegations to wait for at its first
+  grant, so one it had just made counted too. An uncontended lock on a
+  root file then waited for that delegate's renewal, or for its reclaim
+  when the renewal was lost (harness `lock-grant-dead-generation`: 451 s,
+  the requester's link to the root having failed meanwhile).
+
+### Milestone 2: fencing token at the sequencer (design; not implemented)
+
+What M1 cannot close is an op checked against the fence before the
+holder's pause and delivered after the lapse: a forward in flight, a
+retry, a flush already past `take_discard`. Design:
+
+- **Tag.** `OpCtx` gains `lock_token: Option<(GrantId, gen)>`, the
+  honoured grant under which the caller's owner holds its oldest local
+  lock. It is looked up on the same slow path as the owner fence
+  (`fence_from_ms` armed), so the no-lock fast path stays one load.
+  `SyncRequest::Submit` carries it to the driver. `MutateRequest` (net
+  `Payload::MutateRequest`) gains `#[serde(default)] lock_token:
+  Option<(u64, u64, u64)>`, and the inbox record gets the same field.
+  Bump the forward protocol version (no backward compatibility).
+- **Check.** The sequencer that executes the op rejects it when the token
+  names a grant it minted (`GrantId.node == me` in the current
+  incarnation, or in this generation for a delegate) and that grant is
+  gone from `LockTables::grants` or past `until_ms`. The op then fails
+  with a new `Refusal::LockLapsed`, which the requester maps to `EIO`
+  without replay (the op is not idempotent across a lost lock). A token
+  minted by *another* sequencer cannot be checked locally. The lock file
+  is often root-owned while the files written live in a delegated
+  subtree, and checking would mean a synchronous `LockTest` to the
+  minter. Proposal: such ops pass unchecked (M1 still fences them), and
+  the gap is documented. The alternative is for the minter to gossip
+  revocations (a recall that expired) to every sequencer, which then
+  rejects tokens on its revocation list for `ttl + margin`.
+- **Cost.** About 25 bytes per forwarded mutation (only when a lock is
+  held). One `BTreeMap` lookup at the sequencer per tagged op. No extra
+  message.
+- **Replay.** A tagged op's in-doubt replay by rid must re-check the
+  token. If the grant is gone, the op answers `LockLapsed` unless `recent`
+  already records its outcome (then the recorded outcome stands).
+- **Scope estimate.** `meta` (`Refusal`, `MutateRequest` decode), `net`
+  wire, `authority` core (`client.rs`, `holder.rs` execute path,
+  `inbox.rs`), engine driver and `ClusterLocks`. About 400 lines plus sim
+  coverage: a `lock_writes` turn submitted with the token across a pause
+  must be refused, and the turn ghost's `late_unacked_turns` must drop to
+  0. Not done in this chunk: M1 plus the TTL removed every overlap
+  observed here, and the cross-sequencer case needs the revocation design
+  decided first.
+
+### `lock-failover` `ENOLCK` (pre-existing; fixed in the review round)
+
+`lock-failover` failed 1 of 7 runs with `contender flock: no locks
+available (ENOLCK)`. The contender's non-blocking `flock` routes to its
+cached holder. Once that holder is dead and the pooled connection is
+evicted (`reaches` false, 7 s after the kill here),
+`lock_route_op`'s `Route::Node(n)` branch calls `lock_op_unreachable`,
+which answers a non-blocking request `Unavailable` at once without
+re-reading the lease. The `Route::Unknown` branch does re-read it. The
+contender had not yet learned of the backup's takeover from gossip. Fix
+sketch: on an unreachable cached holder, re-read the lease once
+(`S3For::LockHolder`) before giving up. Done in the review round below.
+
+### Files
+
+- `crates/meta/src/locks.rs`: owner fence, `installed_ms`, the first-use
+  bound, lock quarantine, tests
+- `crates/meta/src/readdeleg.rs`: lock grant horizon
+- `crates/authority/src/{replica.rs, core/locks.rs, core/backup.rs, core/mod.rs}`:
+  lock horizon and quarantine split, `expire_first_use` in the tick,
+  TTL 20 s
+- `crates/authority/src/core/tests.rs`: harness TTL pin, 2 new tests
+- `crates/authority/tests/{sim.rs, sim/locks.rs}`: owner fence in the
+  sim client, `locks_lapsed_owner_is_fenced_on_other_files`
+- `crates/platform/src/{process.rs, linux.rs, macos.rs, unsupported.rs}`:
+  `Process::lineage`
+- `crates/vfs/src/{ctx.rs, observe.rs}`, `crates/frontend-fuse/src/adapter.rs`:
+  `OpCtx.lock_owner`
+- `crates/engine/src/{locks.rs, node.rs, view/ops.rs, view/lock_gate.rs,
+  view/owner_fence_tests.rs, view/durable_ack_tests.rs, view/mod.rs,
+  control/service.rs}`
+- `crates/control/src/proto/types.rs`, `crates/control/schema/control.schema.json`:
+  three counters
+- `crates/harness/src/scenarios/gitflock.rs`: fenced turns
+- docs: `cluster-locks.md` (rewritten fencing, TTL guidance, history
+  moved here), `configuration.md`, `DESIGN.md`, `DECISIONS.md`,
+  `TESTING.md`
+
+### Results (this worktree at `038b8df`, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, prefix `lfo`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p <crate>` for every workspace crate (authority incl. sim: 157 lib + 108 sim; engine 431; meta 210 lib; model; the rest) | 0 failed. The control schema was regenerated for the three new counters (`CONSTELLATION_BLESS=1`). |
+| new tests | meta `a_lapsed_owner_is_fenced_until_its_locks_are_gone`, `a_lost_or_dropped_grant_fences_its_owners_at_once`, `a_recalled_grant_waits_for_its_first_use_only_so_long`, `the_lock_grant_horizon_is_kept_apart`; engine `owner_fence_tests` (2: other files' create/rename/write/mkdir/unlink/open-for-write → `EIO` for the owner's process, its thread and its lock owner id; the parent process unaffected; lifts on unlock; a time-only lapse); core `a_recalled_grant_never_used_is_released_after_the_first_use_budget` (fails without the bound: never released), `a_fast_takeover_quarantines_lock_grants_longer_than_acknowledgements`; sim `locks_lapsed_owner_is_fenced_on_other_files` (partition and pause configs with turns written to a data file: 67 + 10 fenced I/Os, 0 stale turn reads over 80 seeds); platform `lineage` |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `git-under-flock-b2b` ×10 | 10/10 PASSED, **0 overlapping turns** (206–308 turns per run, longest turn 1.6–8.4 s), `lost`/`fenced_io`/`owners_fenced` 0 on every node |
+| `git-under-flock-rounds` ×10 | 10/10 PASSED, **0 overlapping turns** in all 30 rounds, no grant lost |
+| `git-under-flock`, `-gc`, `-faults`, `-causal` ×3 each | 12/12 PASSED, 0 overlapping turns |
+| `lock-holder-partitioned`, `lock-fence-at-close`, `flock-cross-node`, `sqlite-two-nodes`, `lock-holder-killed-contention`, `lock-latency`, `lock-grant-dead-generation`, `stale-daemon-lock` ×3 each | 24/24 PASSED. `lock-holder-partitioned`: b's writes refused by the owner fence (`owners_fenced` 1, `owner_fenced_ops` 40), C granted 4.0 s after the cut, after B was fenced |
+| `lock-failover` ×7 | 6/7. Run 3: the pre-existing `ENOLCK` routing gap above |
+| `lease-handover` ×3, `holder-kill-rejoin`, `p2p-handover`, `fsck-while-mounted`, `sticky-lease-handoff-over-s3`, `fuse-inval-storm` | all PASSED |
+| `git-under-flock-b2b` with `GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000` | PASSED, 147 turns, no lapse even at a 1 s window |
+| `git-under-flock-faults` with `CONSTELLATION_LOCK_TTL_MS=2000` (lapses provoked by kill/SIGSTOP/isolation) | PASSED. 575 turns: **0 overlapping**, 89 overlapping a *fenced* turn (b#107's grant lapsed after the whole-cluster kill; its git got `EIO` unlinking `index.lock` instead of writing), 570 acknowledged commits intact and fsck clean on all four nodes and a fresh one |
+
+Overlaps before and after: before this change on this host (above,
+"lock exclusion under load"): b2b 0 in 10 runs, rounds 2 overlapping
+turns in 1 of 4 runs (a 5.5 s owner stall past the 4 s window). After:
+b2b 0/10, rounds 0/10 runs (0/30 rounds). With lapses provoked at a 2 s
+TTL there were 0 unfenced overlaps; every overlap was against a turn
+whose git the fence refused.
+
+### Review fix round (rebased onto `0ac0d74`: plan 39, 37-K3a, the P2P fix, 32-M2b/M5c/M6a)
+
+**Rebase.** Two conflicts. `meta/src/locks.rs`: plan 39 replaced the
+`Taint::{Dirty, Owed}` map with a taint set plus per-inode discard error
+events (`note_discard`/`error_seq`). This chunk's `fenced_owners`/
+`FencedOwner` and the capture in `take_discard` were kept on top. The
+FUSE adapter: plan 39's `O_SYNC` write path (`with_cancel`) also carries
+`with_lock_owner`, and so does its new non-`O_SYNC` path. The two
+compose: a fenced owner's `fsync` is refused by the owner fence after
+`enter!` and also counts as the report of any discard error its
+description has not reported yet (`View::lock_errors_reported`), so the
+`EIO` is reported once, not again after the fence lifts. Other
+descriptions still get theirs (test
+`a_fenced_owners_fsync_reports_a_pending_discard_once`).
+
+1. **Thread id vs process (must fix).** FUSE's `req.pid()` is the
+   calling *thread*. The first version stored it as the lock's pid and
+   walked parents from the caller, so a lock taken by a non-main thread
+   fenced only that thread: a child's `PPid` is the tgid, never a
+   thread id. This is the harness committer's own shape (a spawned
+   thread `flock`s, git is a child of the process). Now
+   `ClusterLocks::set` records `(tgid, process start time)`
+   (`process_of`; `LocalLock.pid_start`, new), and `descends_from_fenced`
+   starts from the caller's tgid. `Process::lineage` returns
+   `Lineage { tgid, ppid, start }` (`/proc/<pid>/status` + `stat`
+   field 22, `parse_start_time`). Verdicts are keyed by `(pid, start
+   time)` on both sides, so a recycled pid is neither fenced nor let
+   through by a stale verdict (nit). Tests:
+   `a_lock_taken_by_a_non_main_thread_fences_its_whole_process_and_children`
+   (locking thread, sibling thread, main thread and a `sleep` child all
+   get `EIO`; the parent process does not; fails on the old code: the
+   sibling is not fenced) and `a_recycled_pid_is_not_taken_for_the_fenced_owner`.
+   Cost while an owner is fenced: one `/proc` read pair per op for its
+   start time; a lock acquire reads the locking thread's `/proc` once.
+2. **Harness classification (must fix).** A turn is `fenced` only if
+   the step that failed is git's (`add`, `commit`, `rev-parse`, `gc`)
+   or the edit before git ran, *and* its node's `owner_fenced_ops` rose
+   during the turn. That count is sampled before the `flock` and after
+   the failure, so git's errno-less `couldn't set 'refs/heads/master'`
+   counts. With no answer from a dead daemon, the error text must say
+   `EIO`. A turn whose git succeeded and whose marker write then got
+   `EIO` is *not* fenced, so an overlap with it counts as a broken lock.
+   An overlap with a fenced turn is still a broken lock if that turn
+   completed any writing step (edit, add, commit, marker, gc) after the
+   later turn's `got`. The workload's per-node
+   `lost`/`owners_fenced`/`owner_fenced_ops` are summed across daemon
+   restarts (`FenceTally`). A node that fenced nothing during the whole
+   workload has its turns' fenced flags cleared. Each overlap line prints
+   the earlier turn's step timeline relative to the later turn's `got`.
+3. **Docs (should fix).** `cluster-locks.md`, `DESIGN.md`,
+   `engine/src/locks.rs`, `vfs/src/ctx.rs`: the rule is the caller's
+   thread group against the locker's process (pid plus start time) and
+   its descendants. The kernel lock owner helps only `fcntl` locks with
+   direct I/O: the kernel sends `lock_owner` only with direct-I/O
+   reads/writes, and a `flock`'s owner is the open file, never a write's.
+   Without `/proc` the match is by pid alone.
+4. **mmap writeback (should fix).** Named in the limits: flusher
+   requests carry a kworker pid and no lock owner.
+5. **`abandon_first_use` (should fix).** Takes `now_ms`. An abandoned
+   grant with no local lock is idle from then on, so
+   `CONSTELLATION_LOCK_CACHE_IDLE_MS` reclaims it (test extended:
+   `idle_since_ms == Some(60)`, swept by `idle_before(61)` and not
+   before).
+6. **`lock-failover` `ENOLCK` (should fix; the review saw 2 of 5 fail;
+   here 1 of 3 still failed with (a) alone).** Two causes, both fixed in
+   `authority/src/core/locks.rs`.
+   (a) A non-blocking request whose cached holder is unreachable, or
+   whose requests to it timed out until `forward_retries` was spent,
+   answered `Unavailable` without reading the lease. It now re-reads it
+   once per request (`LockOp.reread`, `lock_reread_holder`, called from
+   `lock_route_op` and `lock_retry`) and asks the successor the lease
+   names.
+   (b) The successor (the node log showed b taking over 9 s before the
+   contender's re-read) could not grant yet (strict-answer or granting
+   mark gate) and answered `Busy`. The contender had no attempts left,
+   so `Busy` became `ENOLCK`. A refusal grants nothing, so `lock_serve`
+   now answers `WouldBlock` to a non-blocking request that a live
+   mirrored grant conflicts with, even before the tenure may grant.
+   `Busy` stays for requests it would have to grant.
+   Tests: `an_unreachable_cached_holder_rereads_the_lease_once`,
+   `a_non_blocking_request_out_of_attempts_rereads_the_lease_once`,
+   `a_tenure_that_may_not_grant_yet_still_refuses_a_conflicting_try`.
+7. **Nits.** `fenced_owners` runs `capture_lapsed` only once the
+   earliest lapse among owners not fenced yet has passed
+   (`Inner::next_lapse`, `LockTables::lapse_from_ms`). `DESIGN.md` was
+   edited by this chunk (the fencing bullet and "Lock holders", now the
+   tgid rule) as the repo's fix commits routinely do (CONVENTIONS rule
+   5), and is noted here.
+
+Status counters: `lost` counts grants lost to a recall or reclaim
+(`LockTables::lost`), not time lapses. A lapse shows as `owners_fenced`
+(an owner captured under a lapsed grant) and `owner_fenced_ops`.
+
+#### Results (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, prefix `lfo2`, host load 20–30 on 32 vCPU)
+
 | Command | Result |
 |---|---|
 | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
@@ -34549,3 +34895,14 @@ engine pods and floci were gone, the cluster was kept, and no engine pod
 came back within 45 s. `csi-pod-rw` passed on that reused cluster and left
 0 engine pods. SIGINT followed by SIGTERM led to exit 130 at once, and
 `kind-e2e`'s cleanup commands removed what was left.
+
+| `cargo test -p` engine / meta / platform / vfs / frontend-fuse / control | 491 / 211 (+ integration bins) / 36 / 47+11 / 29+23 / 135 passed, 0 failed |
+| `cargo test -p constellation-authority --tests` (lib, meta_repro, sim) | 160 / 4 / 108 passed, 0 failed (sim 242 s) |
+| `cargo test --workspace` minus the crates above | 0 failed |
+| `bash tests/smoke.sh`; `cargo build --release --workspace` | SMOKE TEST PASSED; ok |
+| `git-under-flock-faults` with `GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000`, seeds 1–6, final build | 6/6 PASSED. Lapses in every run: `owners_fenced` per run (a+b) 4, 3, 3, 4, 3, 3; `owner_fenced_ops` 12, 8, 6, 7, 7, 11. **0 real overlaps.** 32, 29, 10, 0, 135 and 0 turns (seeds 1–6) overlapped a fenced turn, whose git got `EIO` (`unable to unlink …: Input/output error`, `read error while indexing …`, `couldn't set 'refs/heads/master'`) and whose last write ended before the other turn got the lock (2.8–6.7 s before in the printed lines, or no write at all). Every acknowledged commit intact, `git fsck` clean on 4 nodes plus a fresh one in every run. |
+| (the same, before the per-turn corroboration) seed 1 | 1 overlap by the strict rule: `b#37`'s commit was done, then its marker write got `EIO`; `a#38` got the lock 2.9 s after the turn began. Counted as a broken lock, as must-fix 2 asks; reported, not fatal, under faults. |
+| `git-under-flock-b2b` ×10 (default TTL, seeds 42, 2–10) | 10/10 PASSED, **0 overlapping**, 215–319 turns per run, longest turn 1.8–4.6 s, no lapse (`owners_fenced` 0) |
+| `git-under-flock-rounds` ×10 (seeds 42, 2–10) | 10/10 PASSED, 30/30 rounds with **0 overlapping**, longest turn ≤ 11.3 s, no lapse |
+| `lock-failover` with (a) on the unreachable branch only / (a) complete / (a) and (b) | 2 of 3 / 2 of 3 passed (`ENOLCK`) / **10 of 10** + 1 in the gate batch (29–51 s each) |
+| `flock-cross-node`, `lock-holder-partitioned` (B fenced 2.0 s after the cut, C granted 4.0 s after; `owners_fenced` 1, `owner_fenced_ops` 41), `lock-fence-at-close`, `lock-holder-killed-contention`, `lock-latency`, `stale-daemon-lock`, `sqlite-two-nodes`, `lease-handover`, `git-under-flock`, `git-under-flock-gc`, `git-under-flock-faults` (default TTL), `lock-grant-dead-generation` | all PASSED ×1 |

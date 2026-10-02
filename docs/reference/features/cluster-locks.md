@@ -40,7 +40,12 @@ between nodes safely. It is on by default whenever P2P is on.
 - **Recall**: the owning sequencer asking a node to give a grant back
   because another node wants a conflicting one.
 - **Fenced**: a node holds local locks on a file, but its grant has
-  lapsed. All I/O on that file from that node fails with `EIO`.
+  lapsed. All I/O on that file from that node fails with `EIO`, and so
+  does every write and namespace operation the lock's owner issues on
+  the node, on any file.
+- **Lock owner**: the kernel's owner of a local lock (`flock`: the open
+  file; `fcntl`: the process's file table), and the process that took
+  it.
 
 ## Modes
 
@@ -80,7 +85,7 @@ a new grant.
 
 ### Leases, renewal and fencing
 
-A grant lasts `CONSTELLATION_LOCK_TTL_MS` (5 s). It never outlives the
+A grant lasts `CONSTELLATION_LOCK_TTL_MS` (20 s). It never outlives the
 authority that backs it: the owning sequencer caps it at its own lease
 (or delegation) expiry minus the lease's margin. The timing rule is the
 same as for [read delegations](cto-modes.md#read-delegations):
@@ -93,7 +98,7 @@ same as for [read delegations](cto-modes.md#read-delegations):
   the rule holds while clocks stay within half the margin of each other.
 
 A grant is renewed half-way through the window the node honours it for
-(`(ttl − margin) / 2` after the send: 2 s at the defaults), one
+(`(ttl − margin) / 2` after the send: 9.5 s at the defaults), one
 `LockRenew` message per owning sequencer carrying every grant that is
 due; the renewal tick is armed for the earliest renewal point, so a
 short grant is renewed inside its window too. A grant is renewed only
@@ -102,36 +107,64 @@ grant is renewed while something still pins it: local locks under it,
 or the one local lock it was granted for and has not served yet. That
 first lock is taken only after the grant's floor is reached (up to the
 session budget, 2 s) and the kernel's cache of the file is dropped
-(up to 1 s), which can be past the renewal point. Before, such a grant
-was renewed only once that lock was taken, with a fraction of its window
-left, and it lapsed under the application's lock when the late renewal's
-answer did not come back in time: the owner outwaited it and granted the
-lock to the next node while the application still held its `flock`
-(harness `git-under-flock-b2b`: two committers in the turn at once).
+(up to 1 s), which can be past the renewal point. The first use is
+waited for only that long: a recalled grant whose first lock has not
+come within the session budget + 1 s + 1 s of its install is no longer
+renewed and is released, and so is one whose requester gave up (its
+answer lost, a non-blocking request that lost a race). Otherwise the
+node would renew it for ever while the owner's waiters waited.
 
 A delegate's grants are capped by what is left of its own delegation,
 so it keeps that authority topped up: while it has grants out it renews
 the delegation at a quarter of its TTL, a lock renewal that finds less
 than `2 × margin` of it left renews it at once, and it grants nothing
 new on less than `2 × margin` (the request waits for the delegation's
-renewal). Before, it could hand out a grant of barely more than the
-margin, which its holder then honoured for a fraction of a second: the
-grant lapsed while the application still held its lock, and the owner
-granted the lock to another node (two `git commit`s under one `flock`
-at once, EC2 campaign 5's `index.lock: File exists` stall; harness
-`git-under-flock-rounds`). Note that a lapsed grant fences I/O only on
-the locked file: an application that guards *other* files with the
-lock, as git does, runs on unprotected, so the grant must not lapse.
+renewal). A grant under a delegation is therefore never longer than
+what is left of the delegation (`CONSTELLATION_DELEGATION_TTL_MS`, 5 s),
+whatever the lock TTL says.
 
-A node whose grant lapsed (for example, because it was partitioned from
-the sequencer for longer than the TTL) is **fenced** on that file:
-`read`, `write`, `flush`, `fsync`, `fallocate` and truncating `setattr`
-fail with `EIO`, for every process on the node. This is NFSv4's rule:
-the application learns that its lock is gone instead of writing on
-without it. The fence lifts when the file's local locks are gone (unlock
-or close) or a new grant arrives. Namespace operations (create, rename,
-unlink) are not fenced. With no local lock anywhere on the node, the
-fence check is a single atomic load.
+A grant lapses when its holding node, or that node's path to the
+sequencer, stalls for longer than the TTL: a partition, a stopped or
+swapped-out daemon, an overloaded host. The sequencer then outwaits the
+grant and may give the lock to another node while the application on
+the first node still holds its `flock`. That node is **fenced**:
+
+- **On the locked file**, `read`, `write`, `flush`, `fsync`, `fallocate`
+  and truncating `setattr` fail with `EIO`, for every process on the
+  node. This fence lifts when the file's local locks are gone (unlock or
+  close) or a new grant arrives.
+- **The lock's owner is fenced on every file of the mount.** An
+  application that guards *other* files with the lock — git creates,
+  links and unlinks loose objects and renames refs under one `flock` of
+  a turn file — gets `EIO` from every operation it issues that reads or
+  changes data or the namespace: `read`, `write`, `fsync`, `fallocate`,
+  `setattr`, an open for writing, `create`, `mknod`, `mkdir`,
+  `symlink`, `link`, `unlink`, `rmdir`, `rename`, `setxattr` and
+  `removexattr`. The owner is recognised by its **process**: a lock
+  records the process (thread group) of the thread that took it, named
+  by its pid and start time, and a request is fenced when it comes from
+  any thread of that process or of a process it started — whichever
+  thread took the lock (`flock turn.lock git commit …` fences the git
+  under the `flock` command; a program that locks from a worker thread
+  and runs git as a child is fenced as a whole). The start time keeps a
+  recycled pid from being taken for the fenced process. A request that
+  carries the kernel's lock owner and names the fenced owner is fenced
+  too, but that only helps `fcntl` locks with direct I/O: the kernel
+  sends a lock owner only with direct-I/O reads and writes, and for
+  `flock` the lock's owner is the open file while a write's is the
+  process's file table, so it never matches a `flock`. Lookups, `getattr`, `readdir`, `close`
+  and the lock calls are not fenced, so the application can still see
+  the tree and unlock. Other processes on the node are not fenced.
+- The owner fence lifts when that owner's local locks are gone (unlock
+  or close), and only then: a new grant on the file does not lift it,
+  because the lock was not held throughout.
+
+This is NFSv4's rule for an expired lease (and what CephFS, GPFS and
+Lustre do to an evicted client): the application learns from an error
+that its lock is gone, instead of writing on without it while another
+node holds it. It must unlock (or close), lock again, and redo its work
+from what the next holder left. With no local lock anywhere on the
+node, each fence check is a single atomic load.
 
 Data written under a grant that ended without its release's flush is
 **never published**. That covers a grant that lapsed with local locks
@@ -266,12 +299,7 @@ when the owner changes:
   delegate has re-streamed to the new root, and the renewal is how the
   new root learns how far the stream goes. A delegation the tenure made
   itself is not waited for: its stream starts in this tenure, so no
-  earlier floor names it. Before, the tenure collected the delegations
-  to wait for at its first grant, so one it had just made counted too.
-  An uncontended lock on a root file then waited for that delegate's
-  renewal, or for its reclaim when the renewal was lost (harness
-  `lock-grant-dead-generation`: 451 s, the requester's link to the
-  root having failed meanwhile).
+  earlier floor names it.
 
 A floor on a directory or on the whole namespace is coarser than a
 per-file one. It can make a grant wait for a position that the file
@@ -301,16 +329,19 @@ owner has replaced it.
 - **Fast takeover** (a sealed backup, or `ack=s3`; see [Durability and
   failover](durability-and-failover.md)): the new holder waits out a
   grace period before it grants anything new, and accepts renewals of
-  grants it does not know as *reclaims*. The grace is the same floor
-  that protects read delegations: `min(old expiry, marker + takeover
-  window + max(read delegation TTL, lock TTL) + 2 × margin)`. The holder
-  also mirrors its lock table to its backups asynchronously
-  (`LockMirror`), and a fast successor installs the last mirror. The
-  mirror is only an availability aid; the grace is what keeps locks
-  exclusive.
-- **Restart inside the lease**: the persisted grant horizon also covers
-  lock grants. A holder that restarts grants nothing new until that
-  horizon has passed, and accepts reclaims meanwhile.
+  grants it does not know as *reclaims*. The grace is `min(old expiry,
+  marker + takeover window + max(read delegation TTL, lock TTL) + 2 ×
+  margin)`. It holds back new lock grants only: the acknowledgement
+  floor that protects read delegations is computed with the read
+  delegation TTL alone, so a long lock TTL does not stall writes after a
+  takeover. The holder also mirrors its lock table to its backups
+  asynchronously (`LockMirror`), and a fast successor installs the last
+  mirror. The mirror is only an availability aid; the grace is what
+  keeps locks exclusive.
+- **Restart inside the lease**: lock grants persist a horizon of their
+  own (next to the read delegations' one). A holder that restarts grants
+  no lock until that horizon has passed, and accepts reclaims meanwhile;
+  acknowledgements wait only for the read delegations' horizon.
 
 While any grant is live, the holder does not release the root lease
 when idle and declines a cooperative handoff. A cached grant (up to
@@ -350,14 +381,21 @@ resolved from its primary link, like every other ownership lookup.
 ### Without P2P
 
 Locks never go through the [S3 inbox](forwarded-mutations.md#the-inbox-forwarding-without-p2p).
-One S3 round trip per lock, plus renewals every 2.5 s as S3 writes,
+One S3 round trip per lock, plus renewals every few seconds as S3 writes,
 would make SQLite unusable and would fence I/O whenever S3 is slow. So:
 
 - with P2P off, the mode is `local`;
 - with P2P on but the owning sequencer unreachable, a non-blocking lock
   fails with `ENOLCK` after the forward retries, and a blocking lock
   keeps retrying until the sequencer is reachable again. The node
-  re-reads the lease from S3 to find the current owner.
+  re-reads the lease from S3 to find the current owner, and a
+  non-blocking lock re-reads it once before it gives up on the owner it
+  knew (a dead holder whose successor gossip has not announced yet).
+- a successor that has taken the lease over but may not grant yet (its
+  lease is not marked as granting, or its S3 liveness is stale) still
+  refuses a non-blocking lock that a grant it knows of conflicts with
+  (`EWOULDBLOCK`, as before the failover); only a lock it would have to
+  grant gets `ENOLCK` after the retries.
 
 ### Cost
 
@@ -367,7 +405,15 @@ would make SQLite unusable and would fence I/O whenever S3 is slow. So:
 - A node that is not the sequencer pays one round trip for the first
   lock on a file, and nothing for re-locks while it keeps the grant.
 - A conflict costs a recall round trip plus the recalled node's flush.
-- Workloads that never lock pay one atomic load per I/O.
+- Workloads that never lock pay one atomic load per I/O, and one per
+  write or namespace operation for the owner fence. While locks are
+  held under honoured grants, the owner fence costs a second load. While
+  an owner is fenced, every such operation on the node takes the lock
+  table's mutex and reads its thread's `/proc` entry (its start time, so
+  a recycled pid is judged afresh); a thread not yet seen reads `/proc`
+  up its parent chain once (the verdict is cached per thread until the
+  fenced set changes). Taking a lock reads the locking thread's `/proc`
+  entries once (its process and their start times).
 
 WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 
@@ -396,6 +442,24 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   two margins (`2 × margin`) cover a flush that finishes promptly. A
   flush stalled for longer can land after another node was granted the
   lock, because the sequencer does not check grants on a commit.
+  The owner fence has the same limit: an operation checked while the
+  grant was still honoured, then delayed past its lapse (a stalled
+  forward), is still applied.
+- **The owner fence knows processes, not intentions.** A process the
+  lock holder started is fenced only while it is still the holder's
+  descendant: one that daemonized (re-parented to `init`) is not. A
+  process that merely shares the lock file without taking the lock is
+  not fenced either. Reads through a passthrough handle (plan 38) never
+  reach the daemon and are not fenced.
+- **Shared-mmap writeback is not fenced by owner.** Dirty pages of a
+  shared `mmap` are written back by the kernel's flusher threads: the
+  request carries a kernel worker's pid and no lock owner, so a fenced
+  owner's mmap'd writes to *other* files are published. (On the locked
+  file itself the per-file fence and the discard at publication still
+  apply.)
+- **Without `/proc`** (macOS, other platforms) the owner fence matches
+  a request by the pid it carries alone: requests with the pid that took
+  the lock are fenced, the processes it started are not.
 - OFD locks and mandatory locks get no special handling.
 
 ## Configuration
@@ -404,10 +468,24 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 |---|---|---|
 | `--locks local\|cluster` | `cluster` with P2P, else `local` | the mode |
 | `CONSTELLATION_LOCKS` | unset | default for `--locks`; the flag wins |
-| `CONSTELLATION_LOCK_TTL_MS` | `5000` | a grant's lifetime, renewed at half of it while held |
+| `CONSTELLATION_LOCK_TTL_MS` | `20000` | a grant's lifetime, renewed half-way through the window it is honoured for |
 | `CONSTELLATION_LOCK_CACHE_IDLE_MS` | `30000` | how long a grant with no local lock under it is kept |
 
 The margin is the lease's; see [Configuration](../configuration.md#cluster-locks).
+
+**Choosing the TTL.** The TTL is how long a lock holder's node may stall
+(a partition from the sequencer, a stopped daemon, an overloaded host)
+before its lock can be lost under the application: past it the owner
+outwaits the grant, and the application is fenced. It is also how long
+the next waiter waits when the holding node *crashed* (`ttl + margin`
+after the dead node's last renewal: about 21 s at the default), and
+how long a new root lease holder grants no lock after a fast takeover
+or a restart inside its lease. A healthy holder's unlock hands the
+lock on at once whatever the TTL; renewals cost one message per
+`(ttl − margin) / 2`. Raise the TTL where stalls are common and crashes
+rare; lower it where a crashed holder must be replaced quickly and the
+applications cope with `EIO`. Grants under a delegation are capped by
+the delegation's TTL anyway.
 
 ## Status
 
@@ -417,7 +495,11 @@ for both roles:
 - node side: `grants_held`, `requests`, `local_hits`,
   `local_conflicts`, `granted`, `would_block`, `unavailable`,
   `grant_ms_total` and the `grant_ms` histogram, `renewals`, `lost`,
-  `recalled`, `recalled_busy`, `released`, `fenced_io`;
+  `recalled`, `recalled_busy`, `released`, `fenced_io`,
+  `owners_fenced` (lock owners fenced on this node), `owner_fenced_ops`
+  (their operations refused with `EIO`, on any file),
+  `first_use_abandoned` (recalled grants released before their first
+  lock, see [Leases, renewal and fencing](#leases-renewal-and-fencing));
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
   `grace_refusals`, `requeued_in_place`, `released_superseded`,
@@ -427,10 +509,12 @@ These counters are not exported to `/metrics` or shown in the web UI.
 
 ## Troubleshooting
 
-### I/O fails with `EIO` on a locked file
+### I/O fails with `EIO` on a locked file, or on any file while a lock is held
 
-The node's grant lapsed: `fenced_io` rises and `lost` counts the grants.
-The usual cause is a partition from the owning sequencer longer than
+The node's grant lapsed: `fenced_io` rises on the locked file,
+`owner_fenced_ops` on the lock owner's operations elsewhere, and `lost`
+counts the grants. The usual cause is a stall of the node, or a
+partition from the owning sequencer, longer than
 `CONSTELLATION_LOCK_TTL_MS`, or a TTL takeover of the root lease. Close
 the file or unlock, then lock again. The application must assume that
 another node may have taken the lock in between. If `close` or `fsync`
@@ -461,8 +545,12 @@ off. Use `--locks local`, or turn P2P on.
   own sequencer, so every lock operation is one local call.
 - **Are locks durable across a crash?** No. POSIX locks do not survive
   their process, and a crashed node's grants lapse with their TTL.
-- **Do locks slow down files nobody locks?** No: the fence check is one
-  atomic load when the node holds no local lock.
+- **Do locks slow down files nobody locks?** No: each fence check is
+  one atomic load when the node holds no local lock.
+- **Why is the TTL so long?** A lapse is not harmless: the application
+  that held the lock gets `EIO` and must redo its work. A long TTL makes
+  lapses rare; the price is paid only when a holder's node crashes. See
+  [Configuration](#configuration).
 
 ## References
 
@@ -470,9 +558,10 @@ off. Use `--locks local`, or turn P2P on.
 - [ADR-25](../../explanation/DECISIONS.md#adr-25-cluster-locks-are-leased-grants-from-the-owning-sequencer)
 - [`crates/authority/src/core/locks.rs`](../../../crates/authority/src/core/locks.rs) (protocol),
   [`crates/meta/src/locks.rs`](../../../crates/meta/src/locks.rs) (tables),
-  [`crates/cli/src/locks.rs`](../../../crates/cli/src/locks.rs) (mount option and FUSE side)
+  [`crates/engine/src/locks.rs`](../../../crates/engine/src/locks.rs) (mount option and FUSE side),
+  [`crates/engine/src/view/lock_gate.rs`](../../../crates/engine/src/view/lock_gate.rs) (the fences)
 - Model: `crates/model/src/locks.rs`; harness: `flock-cross-node`,
   `sqlite-two-nodes`, `lock-holder-partitioned`, `lock-failover`,
-  `lock-latency`
+  `lock-latency`, `git-under-flock-b2b` and `-rounds` (the owner fence)
 - [Close-to-open modes](cto-modes.md), [Durability and failover](durability-and-failover.md),
   [Delegations](delegations.md)

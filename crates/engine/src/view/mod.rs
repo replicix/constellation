@@ -133,6 +133,8 @@ mod fsync_drain_tests;
 #[cfg(test)]
 mod memcache_tests;
 #[cfg(test)]
+mod owner_fence_tests;
+#[cfg(test)]
 mod passthrough_tests;
 #[cfg(test)]
 mod pending_row_tests;

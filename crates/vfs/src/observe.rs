@@ -141,6 +141,7 @@ impl<'o> ObservedOp<'o> {
             op: self.id,
             kind: self.kind,
             caller,
+            lock_owner: None,
             deadline: None,
             cancel: None,
             span: &self.span,

@@ -67,6 +67,9 @@ impl Process for Unsupported {
     fn supplementary_groups(&self, _pid: u32) -> io::Result<Vec<u32>> {
         Err(unsupported("supplementary groups"))
     }
+    fn lineage(&self, _pid: u32) -> io::Result<crate::Lineage> {
+        Err(unsupported("process lineage"))
+    }
     /// No POSIX ids: files are owned by 0/0 (plan 35's `IdentityMap`
     /// decides what a Windows owner is).
     fn effective_ids(&self) -> (u32, u32) {

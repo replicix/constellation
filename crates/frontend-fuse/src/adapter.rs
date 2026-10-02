@@ -1031,14 +1031,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         offset: u64,
         size: u32,
         _flags: fuser::OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
+        lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Read, ino.0);
         let _in = op.enter();
         self.vfs.read(
-            &op.ctx(&caller),
+            &op.ctx(&caller).with_lock_owner(lock_owner.map(|o| o.0)),
             ino.0,
             Fh(fh.0),
             offset,
@@ -1058,7 +1058,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         data: &[u8],
         _write_flags: WriteFlags,
         flags: fuser::OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
+        lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
         let caller = caller(req);
@@ -1076,7 +1076,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let flags = open_flags(flags.0);
         if !flags.contains(OpenFlags::SYNC) {
             self.vfs.write(
-                &op.ctx(&caller),
+                &op.ctx(&caller).with_lock_owner(lock_owner.map(|o| o.0)),
                 ino.0,
                 Fh(fh.0),
                 offset,
@@ -1096,7 +1096,9 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 .track_bounded(self.interrupts.guard(unique, WriteReply(reply))),
         );
         self.vfs.write(
-            &op.ctx(&caller).with_cancel(&token),
+            &op.ctx(&caller)
+                .with_cancel(&token)
+                .with_lock_owner(lock_owner.map(|o| o.0)),
             ino.0,
             Fh(fh.0),
             offset,

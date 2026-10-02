@@ -64,6 +64,19 @@ pub struct TaskFacts {
     pub has_mm: bool,
 }
 
+/// A task's place in the process tree ([`Process::lineage`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lineage {
+    /// Its thread group: the process a thread belongs to (a process's
+    /// own id for its main thread).
+    pub tgid: u32,
+    /// The parent of its process.
+    pub ppid: u32,
+    /// When the task started (clock ticks since boot; 0: unknown). With
+    /// the id it names the task across pid reuse.
+    pub start: u64,
+}
+
 pub trait Process: Send + Sync {
     /// This host's name, as `uname -n` prints it.
     fn hostname(&self) -> io::Result<String>;
@@ -78,6 +91,11 @@ pub trait Process: Send + Sync {
 
     /// The supplementary group ids of process `pid`.
     fn supplementary_groups(&self, pid: u32) -> io::Result<Vec<u32>>;
+
+    /// Task `pid`'s place in the process tree (a thread id names its
+    /// process; the parent is the process's parent): to tell whether a
+    /// request comes from a given process or one it started.
+    fn lineage(&self, pid: u32) -> io::Result<Lineage>;
 
     /// This process's effective `(uid, gid)`: the owner a file this
     /// process creates on its own behalf gets.

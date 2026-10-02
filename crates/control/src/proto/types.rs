@@ -1736,6 +1736,17 @@ pub struct LockStatus {
     /// I/O refused with `EIO` under a lapsed grant.
     #[serde(default)]
     pub fenced_io: u64,
+    /// Lock owners fenced on this node (their grant lapsed under their
+    /// local lock), and the ops of theirs refused with `EIO` for it, on
+    /// any file.
+    #[serde(default)]
+    pub owners_fenced: u64,
+    #[serde(default)]
+    pub owner_fenced_ops: u64,
+    /// Recalled grants given up before their first local lock (the
+    /// requester gave up, or the first-use budget ran out).
+    #[serde(default)]
+    pub first_use_abandoned: u64,
     /// Grants whose floor this replica had not reached on arrival (the
     /// first read under the lock waited), how long those waits took in
     /// all, and the ones that timed out after the session budget: under

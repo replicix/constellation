@@ -334,7 +334,48 @@ struct Turn {
     released: Instant,
     /// How long each step of the turn took.
     steps: Vec<(&'static str, Duration)>,
+    /// The turn's git (or the edit before git ran) failed while its node
+    /// refused ops of a lapsed lock owner (its `owner_fenced_ops` rose
+    /// during the turn): its lock grant lapsed under the turn, so the lock
+    /// may have moved, and what git did after that was refused rather
+    /// than written. Not a turn whose git succeeded and whose marker
+    /// write then got `EIO`: git may have written under the lapsed grant
+    /// then. Also cleared when the node counted no fenced op during the
+    /// whole workload.
+    fenced: bool,
+    /// When the turn's last step that wrote to the repository or the
+    /// marker (edit, git add, git commit, marker, git gc) completed.
+    wrote_until: Option<Instant>,
+    /// When each step began (to tell, for a turn overlapping it, what
+    /// ran before and after the other got the lock).
+    began: Vec<(&'static str, Instant)>,
 }
+
+/// Whether a turn's error is the lock fence's `EIO`.
+fn is_fence_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    s.contains("os error 5") || s.contains("Input/output error")
+}
+
+/// The node's `owner_fenced_ops` (`None`: its daemon does not answer).
+fn owner_fenced_ops(state: &Path) -> Option<u64> {
+    crate::client::control_call_at(
+        state,
+        "node.status",
+        serde_json::json!({}),
+        Duration::from_secs(5),
+    )
+    .ok()?["locks"]["owner_fenced_ops"]
+        .as_u64()
+}
+
+/// The steps whose `EIO` shows the owner fence stopped the turn's git
+/// before it wrote under a lapsed grant: git's own, and the edit before
+/// git ran at all.
+const FENCEABLE_STEPS: [&str; 5] = ["edit", "add", "commit", "rev-parse", "gc"];
+
+/// The steps that write.
+const WRITING_STEPS: [&str; 5] = ["edit", "add", "commit", "marker", "gc"];
 
 #[derive(Default)]
 struct WorkerLog {
@@ -424,6 +465,7 @@ fn soak_edit(repo: &Path, name: &str, i: u64) -> Result<()> {
 fn committer(
     name: String,
     mnt: PathBuf,
+    state: PathBuf,
     home: PathBuf,
     stop: Arc<AtomicBool>,
     variant: Variant,
@@ -448,15 +490,29 @@ fn committer(
                 .write(true)
                 .open(mnt.join(&paths.turn))
                 .context("opening the turn file")?;
+            // The node's fenced-op count before the turn (no lock is held
+            // here, so nothing of ours can be fenced until the `flock`).
+            let fenced_before = owner_fenced_ops(&state);
             let asked = Instant::now();
             flock(&lf, libc::LOCK_EX).context("flock")?;
             let got = Instant::now();
             let steps = std::cell::RefCell::new(Vec::new());
             let mark = std::cell::Cell::new(Instant::now());
+            // The step in progress, and when the last writing one ended.
+            let current = std::cell::Cell::new("check");
+            let wrote_until = std::cell::Cell::new(None);
             let step = |name: &'static str| {
                 let now = Instant::now();
                 steps.borrow_mut().push((name, now - mark.get()));
                 mark.set(now);
+                if WRITING_STEPS.contains(&name) {
+                    wrote_until.set(Some(now));
+                }
+            };
+            let began = std::cell::RefCell::new(vec![("check", got)]);
+            let begin = |name: &'static str| {
+                current.set(name);
+                began.borrow_mut().push((name, Instant::now()));
             };
             let inner = (|| -> Result<()> {
                 // What the previous turn left: `refs/heads/master` must
@@ -493,6 +549,7 @@ fn committer(
                     }
                 }
                 step("check");
+                begin("edit");
                 for stale in ["index.lock", "refs/heads/master.lock", "HEAD.lock"] {
                     let p = repo.join(".git").join(stale);
                     if p.exists() {
@@ -508,8 +565,10 @@ fn committer(
                     soak_edit(&repo, &name, i)?;
                 }
                 step("edit");
+                begin("add");
                 git_ok(&repo, &home, &["add", "-A"])?;
                 step("add");
+                begin("commit");
                 git_ok(
                     &repo,
                     &home,
@@ -522,13 +581,17 @@ fn committer(
                     ],
                 )?;
                 step("commit");
+                begin("rev-parse");
                 let head = git_ok(&repo, &home, &["rev-parse", "HEAD"])?;
+                begin("marker");
                 std::fs::write(&marker, format!("{head}\n")).context("writing the marker")?;
                 step("marker");
                 *shared.last.lock().unwrap() = Some(head.clone());
                 log.lock().unwrap().acked.push(head);
                 if variant == Variant::Gc && i.is_multiple_of(8) {
+                    begin("gc");
                     git_ok(&repo, &home, &["gc", "-q"])?;
+                    step("gc");
                     log.lock().unwrap().gcs += 1;
                 }
                 Ok(())
@@ -540,6 +603,19 @@ fn committer(
                 got,
                 released: Instant::now(),
                 steps: steps.take(),
+                fenced: inner.as_ref().err().is_some_and(|e| {
+                    FENCEABLE_STEPS.contains(&current.get())
+                        // The node says it refused an op of ours during
+                        // the turn (git often drops the errno: "couldn't
+                        // set 'refs/heads/master'"); with no answer (a
+                        // dead daemon), the error itself must say `EIO`.
+                        && match (fenced_before, owner_fenced_ops(&state)) {
+                            (Some(was), Some(is)) => is > was || (is < was && is > 0),
+                            _ => is_fence_error(e),
+                        }
+                }),
+                wrote_until: wrote_until.get(),
+                began: began.take(),
             });
             let _ = flock(&lf, libc::LOCK_UN);
             inner
@@ -1123,25 +1199,57 @@ fn reader(
     }
 }
 
-/// Two turns that held the lock at once (a broken lock), and the turn
-/// durations by decile.
-fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, String, Duration) {
+/// The turns, judged: `(overlaps, fenced overlaps, deciles, longest)` —
+/// two turns that held the lock at once (a broken lock), and the turn
+/// durations by decile. A turn that overlaps a *fenced* earlier one (its
+/// committer's grant lapsed and its node refused its git with `EIO` from
+/// then on) is not a broken lock, as long as the earlier turn wrote
+/// nothing after the later one got the lock: the fence is what keeps the
+/// two from both writing.
+fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, Vec<String>, String, Duration) {
     let mut t: Vec<Turn> = turns.to_vec();
     t.sort_by_key(|x| x.got);
     let mut overlaps = Vec::new();
+    let mut fenced = Vec::new();
     let mut open: Option<&Turn> = None;
     for x in &t {
         if let Some(prev) = open {
             if x.got < prev.released && x.who != prev.who {
-                overlaps.push(format!(
-                    "{}#{} held the lock {:?}..{:?} while {}#{} got it at {:?}",
+                let fenced_in_time = prev.fenced && prev.wrote_until.is_none_or(|t| t <= x.got);
+                let into = if fenced_in_time {
+                    &mut fenced
+                } else {
+                    &mut overlaps
+                };
+                // Relative to the later turn's `got`: what of the earlier
+                // turn ran before (-) and after (+) it.
+                let rel = |t: Instant| {
+                    if t >= x.got {
+                        format!("+{:.3}s", (t - x.got).as_secs_f64())
+                    } else {
+                        format!("-{:.3}s", (x.got - t).as_secs_f64())
+                    }
+                };
+                let timeline: Vec<String> = prev
+                    .began
+                    .iter()
+                    .map(|(step, at)| format!("{step}@{}", rel(*at)))
+                    .collect();
+                into.push(format!(
+                    "{}#{} held the lock {:?}..{:?} while {}#{} got it at {:?} \
+                     ({}#{}: {}, last write done {}, released {})",
                     prev.who,
                     prev.i,
                     prev.got - base,
                     prev.released - base,
                     x.who,
                     x.i,
-                    x.got - base
+                    x.got - base,
+                    prev.who,
+                    prev.i,
+                    timeline.join(" "),
+                    prev.wrote_until.map_or("never".into(), rel),
+                    rel(prev.released),
                 ));
             }
         }
@@ -1204,7 +1312,7 @@ fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, String, Duration)
         durations.sort();
         format!("{durations:?}")
     };
-    (overlaps, deciles, max)
+    (overlaps, fenced, deciles, max)
 }
 
 /// `refs/heads/master` as git resolves it, read straight from the files
@@ -1620,6 +1728,47 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
     result
 }
 
+/// The committers' nodes' `[lost, owners_fenced, owner_fenced_ops]` lock
+/// counters, summed over the workload: sampled now and then, a counter
+/// that went down is a restarted daemon's (its new count is all new).
+struct FenceTally {
+    last: Vec<Option<[u64; 3]>>,
+    sum: Vec<[u64; 3]>,
+}
+
+impl FenceTally {
+    fn new(clients: &[Client], committers: &[usize]) -> FenceTally {
+        let mut t = FenceTally {
+            last: vec![None; committers.len()],
+            sum: vec![[0; 3]; committers.len()],
+        };
+        t.sample(clients, committers);
+        t.sum = vec![[0; 3]; committers.len()];
+        t
+    }
+
+    fn sample(&mut self, clients: &[Client], committers: &[usize]) {
+        for (k, &c) in committers.iter().enumerate() {
+            let Ok(s) = clients[c].control_status() else {
+                continue;
+            };
+            let l = &s["locks"];
+            let now = ["lost", "owners_fenced", "owner_fenced_ops"]
+                .map(|key| l[key].as_u64().unwrap_or(0));
+            let was = self.last[k].unwrap_or([0; 3]);
+            for j in 0..3 {
+                // Down: a restarted daemon, all of its count is new.
+                self.sum[k][j] += if now[j] >= was[j] {
+                    now[j] - was[j]
+                } else {
+                    now[j]
+                };
+            }
+            self.last[k] = Some(now);
+        }
+    }
+}
+
 /// One workload: the repository initialized, the two committers taking
 /// turns for `secs` (with faults for `Variant::Faults`), then the turn
 /// checks. Returns the acknowledged commits.
@@ -1666,16 +1815,20 @@ fn workload(
     } else {
         vec![0, 1]
     };
+    let mut tally = FenceTally::new(clients, &committers);
     let started = Instant::now();
     let workers: Vec<_> = (0..2)
         .map(|k| {
             let c = &clients[committers[k]];
             let (name, mnt) = (c.name.clone(), c.mnt.clone());
+            let state = c.state_dir().to_path_buf();
             let (home, stop, log) = (home.to_path_buf(), stop.clone(), logs[k].clone());
             let (shared, paths) = (shared.clone(), paths.clone());
             let seed = seed.wrapping_mul(31).wrapping_add(k as u64);
             std::thread::spawn(move || {
-                committer(name, mnt, home, stop, variant, paths, log, shared, seed)
+                committer(
+                    name, mnt, state, home, stop, variant, paths, log, shared, seed,
+                )
             })
         })
         .collect();
@@ -1713,8 +1866,10 @@ fn workload(
     let mut faults = Vec::new();
     let mut fault_err = None;
     while started.elapsed() < Duration::from_secs(secs) {
+        tally.sample(clients, &committers);
         if variant == Variant::Faults {
             std::thread::sleep(Duration::from_millis(rng.random_range(2000..6000)));
+            tally.sample(clients, &committers);
             match fleet.fault(&mut rng, clients, faults.len() as u64 + 1) {
                 Ok(f) => {
                     eprintln!("    {label}: {f} ({:?})", started.elapsed());
@@ -1770,6 +1925,7 @@ fn workload(
     for w in workers {
         let _ = w.join();
     }
+    tally.sample(clients, &committers);
     for w in reader_threads {
         let _ = w.join();
     }
@@ -1807,14 +1963,62 @@ fn workload(
     for st in stale.iter().take(10) {
         eprintln!("    {label}: stale turn: {st}");
     }
-    let turns = shared.turns.lock().unwrap().clone();
-    let (overlaps, deciles, max) = judge_turns(&turns, started);
+    let mut turns = shared.turns.lock().unwrap().clone();
+    // A fenced turn is one its node says it fenced: the committer's node
+    // refused at least one op of a lapsed owner during the workload.
+    let mut fence_counts = Vec::new();
+    for (k, &c) in committers.iter().enumerate() {
+        let [lost, owners, ops] = tally.sum[k];
+        fence_counts.push(format!(
+            "{} lost {lost} owners_fenced {owners} owner_fenced_ops {ops}",
+            clients[c].name
+        ));
+        if ops == 0 {
+            let name = &clients[c].name;
+            let n = turns
+                .iter_mut()
+                .filter(|t| &t.who == name && t.fenced)
+                .map(|t| t.fenced = false)
+                .count();
+            if n > 0 {
+                eprintln!(
+                    "    {label}: {n} turns of {name} failed with EIO but its node fenced no op: not counted as fenced"
+                );
+            }
+        }
+    }
     eprintln!(
-        "    {label}: {} turns, median duration per decile (s): {deciles}; longest {max:?}",
-        turns.len()
+        "    {label}: during the workload: {}",
+        fence_counts.join("; ")
+    );
+    let (overlaps, fenced_overlaps, deciles, max) = judge_turns(&turns, started);
+    eprintln!(
+        "    {label}: {} turns, median duration per decile (s): {deciles}; longest {max:?}; \
+         {} overlapping, {} overlapping a fenced turn, {} fenced",
+        turns.len(),
+        overlaps.len(),
+        fenced_overlaps.len(),
+        turns.iter().filter(|t| t.fenced).count()
     );
     for o in overlaps.iter().take(10) {
         eprintln!("    {label}: overlapping turns: {o}");
+    }
+    for o in fenced_overlaps.iter().take(10) {
+        eprintln!("    {label}: a turn overlapping a fenced turn (its git got EIO): {o}");
+    }
+    for &k in &committers {
+        if let Ok(s) = clients[k].control_status() {
+            let l = &s["locks"];
+            eprintln!(
+                "    {label}: {} locks: lost {}, fenced_io {}, owners_fenced {}, owner_fenced_ops {}, first_use_abandoned {}",
+                clients[k].name,
+                l["lost"],
+                l["fenced_io"],
+                l["owners_fenced"],
+                l["owner_fenced_ops"],
+                l["first_use_abandoned"]
+            );
+        }
     }
     anyhow::ensure!(acked.len() >= 4, "only {} commits were made", acked.len());
     if variant == Variant::Faults {

@@ -110,7 +110,7 @@ pub use fs::FsPrimitives;
 pub use lifecycle::{LifecycleEvent, LifecycleSource, ManualLifecycle, Subscription};
 pub use lock::{FileLock, LockGuard};
 pub use mounts::{MountEntry, MountOpts, MountTable, UnmountMode};
-pub use process::{Process, ProcessFacts, TaskFacts, ThreadRef};
+pub use process::{Lineage, Process, ProcessFacts, TaskFacts, ThreadRef};
 pub use secrets::{
     Credential, CredentialSource, EphemeralSecretStore, FileSecretStore, Secret, SecretStore,
 };

@@ -2,8 +2,63 @@
 //! recalled grant's flush.
 
 use super::*;
+use constellation_vfs::{OpCtx, OpKind};
+
+/// Plan 30 §M14: the ops the owner fence refuses — every op that reads
+/// or changes file data or the namespace. Lookups, `getattr`, `readdir`
+/// and the like are not (git's failure path and the shell around it must
+/// still see the tree), nor are `flush`, `release` and the lock ops: the
+/// close and the unlock are how the fence lifts. An open for writing is
+/// checked in `open` itself.
+fn owner_fence_applies(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Setattr
+            | OpKind::Mknod
+            | OpKind::Mkdir
+            | OpKind::Symlink
+            | OpKind::Link
+            | OpKind::Unlink
+            | OpKind::Rmdir
+            | OpKind::Rename
+            | OpKind::Create
+            | OpKind::Read
+            | OpKind::Write
+            | OpKind::Fsync
+            | OpKind::Fallocate
+            | OpKind::Setxattr
+            | OpKind::Removexattr
+    )
+}
 
 impl View {
+    /// Plan 30 §M14, the owner fence: whether `cx` is an op the fence
+    /// refuses ([`owner_fence_applies`]) issued by a lock owner whose
+    /// grant lapsed — by its lock owner id, or by its process or one that
+    /// process started. One relaxed atomic load while this node holds no
+    /// local lock; two while every grant under one is still honoured.
+    pub(crate) fn lock_owner_fenced(&self, cx: &OpCtx<'_>) -> bool {
+        owner_fence_applies(cx.kind) && self.lock_owner_fenced_any(cx)
+    }
+
+    /// [`Self::lock_owner_fenced`] whatever the op.
+    pub(crate) fn lock_owner_fenced_any(&self, cx: &OpCtx<'_>) -> bool {
+        let Some(l) = self.cluster_locks() else {
+            return false;
+        };
+        let fenced = l.owner_fenced(cx.caller.pid, cx.lock_owner);
+        if fenced {
+            tracing::debug!(
+                target: "constellation::locks",
+                op = cx.kind.name(),
+                pid = ?cx.caller.pid,
+                lock_owner = ?cx.lock_owner,
+                "refused: the caller's lock grant lapsed (EIO until its locks are gone)"
+            );
+        }
+        fenced
+    }
+
     /// Plan 30 §M14: I/O on `ino` is fenced (`EIO`) — this node holds
     /// local locks on it under a grant that lapsed. One relaxed atomic
     /// load while no local lock exists anywhere (and nothing at all under
@@ -50,6 +105,16 @@ impl View {
         }
         let current = self.meta.locks().error_seq(ino);
         Ok(current != 0 && self.handles.take_error(fh, ino, current))
+    }
+
+    /// `fh` reports an `EIO` for another reason (the owner fence): it
+    /// counts as the report of every discard on `ino` it has not reported
+    /// yet.
+    pub(crate) fn lock_errors_reported(&self, ino: Ino, fh: constellation_vfs::Fh) {
+        let current = self.meta.locks().error_seq(ino);
+        if current != 0 {
+            self.handles.take_error(fh, ino, current);
+        }
     }
 
     /// Plan 30 §M14: before a new local lock or a write on `ino` — dirty

@@ -28,6 +28,9 @@ impl Harness {
         let mut cfg = Config::defaults(node_id, 1);
         cfg.log_streams = streams;
         cfg.ttl_ms = 10_000;
+        // The lock tests' timings are written for a 5 s grant (inside
+        // this 10 s lease); the production default is 20 s.
+        cfg.lock_ttl_ms = 5_000;
         cfg.forward_timeout_ms = 500;
         cfg.forward_backoff_ms = 100;
         cfg.forward_retries = 2;
@@ -6002,6 +6005,7 @@ mod locks {
                 LocalLock {
                     owner: 9,
                     pid: 1,
+                    pid_start: 0,
                     write: true,
                     start: 0,
                     end: u64::MAX
@@ -6082,6 +6086,7 @@ mod locks {
                 LocalLock {
                     owner: 9,
                     pid: 1,
+                    pid_start: 0,
                     write: true,
                     start: 0,
                     end: u64::MAX
@@ -6203,6 +6208,7 @@ mod locks {
         let local = LocalLock {
             owner: 9,
             pid: 1,
+            pid_start: 0,
             write: true,
             start: 0,
             end: u64::MAX,
@@ -7118,6 +7124,7 @@ mod locks {
                 LocalLock {
                     owner: 9,
                     pid: 1,
+                    pid_start: 0,
                     write: true,
                     start: 0,
                     end: u64::MAX
@@ -7232,6 +7239,96 @@ mod locks {
         assert_eq!(renewed.unwrap()[0].grant, GrantId { node: 1, seq: 1 });
     }
 
+    /// A fast takeover of a tenure that granted: new lock grants wait
+    /// out the predecessor's lock grants (the lock TTL), acknowledgements
+    /// only its read delegations (their TTL) — a long lock TTL must not
+    /// stall every write after a takeover.
+    #[test]
+    fn a_fast_takeover_quarantines_lock_grants_longer_than_acknowledgements() {
+        let mut h = Harness::new(2);
+        h.core.cfg.lock_ttl_ms = 20_000;
+        h.core.cfg.read_delegation_ttl_ms = 5_000;
+        let mut prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
+        prev.expires_unix_ms = h.now.0 + 60_000;
+        h.core.note_fast_takeover(&prev);
+        let mut out = Vec::new();
+        let now = h.now;
+        h.core.note_marker_landed(now, &h.meta, &mut out);
+        let margins = 2 * h.core.cfg.expiry_margin_ms as i64 + h.core.cfg.backup_takeover_ms as i64;
+        assert_eq!(
+            h.meta.read_delegations().quarantine_until(),
+            now.0 + 5_000 + margins,
+            "acknowledgements wait for the read delegations only"
+        );
+        assert_eq!(
+            h.meta.locks().quarantine_until(),
+            now.0 + 20_000 + margins,
+            "new lock grants wait for the lock grants"
+        );
+    }
+
+    /// The lock-exclusion review's follow-up: a recalled grant whose
+    /// first local lock never comes (the requester gave up: its answer
+    /// lost, a non-blocking request that lost a race) is renewed only
+    /// for the first-use budget from its install, then released — not
+    /// renewed for ever while the owner's waiters wait.
+    #[test]
+    fn a_recalled_grant_never_used_is_released_after_the_first_use_budget() {
+        let mut r = requester();
+        r.meta.locks().set_first_use_budget_ms(1_500);
+        let req = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        let installed = r.now;
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 1 },
+            },
+        });
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::LockFlush { .. })),
+            "released before its first use could come: {out:?}"
+        );
+        if let Some(t) = timers(&out, TimerKind::LockRenewTick).first() {
+            tick = *t;
+        }
+        // Nobody takes the local lock: the ticks run on.
+        let mut released_at = None;
+        for _ in 0..20 {
+            let at = r.core.timer_at(tick).expect("the renewal tick is armed");
+            r.now = at;
+            let out = r.step(Event::Timer { id: tick });
+            if out.iter().any(|a| matches!(a, Action::LockFlush { .. })) {
+                released_at = Some(r.now);
+                break;
+            }
+            tick = timer_of(&out, TimerKind::LockRenewTick);
+        }
+        let at = released_at.expect("the unused recalled grant was never released");
+        assert!(
+            at.0 >= installed.0 + 1_500,
+            "released {} ms after the install, inside the first-use budget",
+            at.0 - installed.0
+        );
+        assert!(
+            r.meta.locks().honoured(42, at.0).is_some(),
+            "released only once it had lapsed: the waiters waited a window"
+        );
+        assert_eq!(r.meta.locks().stats().first_use_abandoned, 1);
+    }
+
     /// A recall that overtakes the reply carrying its grant is
     /// remembered; the reply installs the grant recalled, and — with no
     /// local lock under it — the release starts at once.
@@ -7276,6 +7373,7 @@ mod locks {
                 LocalLock {
                     owner: 9,
                     pid: 1,
+                    pid_start: 0,
                     write: true,
                     start: 0,
                     end: u64::MAX
@@ -7358,6 +7456,158 @@ mod locks {
             },
         });
         assert_eq!(lock_answer(&out, 60), LockAnswer::Unavailable);
+    }
+
+    /// The harness's lock-failover (`contender flock: ENOLCK`): the
+    /// cached holder died and the backup took the lease over before
+    /// gossip told this node. A non-blocking request whose cached holder
+    /// cannot be reached re-reads the lease once and asks the successor;
+    /// if the lease still names the unreachable holder, it is unavailable
+    /// — after one read, not a loop of them.
+    #[test]
+    fn an_unreachable_cached_holder_rereads_the_lease_once() {
+        let mut r = requester();
+        // Node 1, the cached holder, is gone.
+        r.step(Event::Peers {
+            links: (2..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: None,
+                })
+                .collect(),
+        });
+        let lock = |r: &mut Harness, op: u64, ino: Ino| {
+            r.step(Event::Control {
+                op: OpId(op),
+                req: Control::Lock {
+                    ino,
+                    mode: X,
+                    blocking: false,
+                },
+            })
+        };
+        let lease_read = |out: &[Action]| {
+            let ops = s3_ops(out);
+            assert!(matches!(ops.as_slice(), [(_, S3Op::LeaseGet)]), "{out:?}");
+            ops[0].0
+        };
+        let answered = |out: &[Action], op: u64| {
+            out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: o, .. } if *o == OpId(op)))
+        };
+        let out = lock(&mut r, 70, 42);
+        assert!(!answered(&out, 70), "not ENOLCK at once: {out:?}");
+        let get = lease_read(&out);
+        // The backup, node 3, holds the lease now: asked.
+        let expires = r.now.0 + 10_000;
+        let out = r.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease_of(3, 2, expires), tag())))),
+        });
+        assert_eq!(r.core.lease.cached_holder, Some(3));
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(3, PeerMsg::LockRequest { ino: 42, .. })]
+        ));
+        // The lease still names the dead holder (not yet expired): one
+        // read, then unavailable.
+        r.core.lease.cached_holder = Some(1);
+        let out = lock(&mut r, 71, 43);
+        let get = lease_read(&out);
+        let out = r.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((lease_of(1, 1, expires), tag())))),
+        });
+        assert_eq!(lock_answer(&out, 71), LockAnswer::Unavailable);
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+    }
+
+    /// A tenure that may not grant yet (its lease is not marked as
+    /// granting: a fresh successor) still refuses a non-blocking request
+    /// that a live grant conflicts with — a refusal grants nothing — and
+    /// answers `Busy` only when it would have to grant.
+    #[test]
+    fn a_tenure_that_may_not_grant_yet_still_refuses_a_conflicting_try() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 1, ino, X, false);
+        granted(&lock_replies(&out)[0].2);
+        // The lease loses its granting mark (as a successor's starts).
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+        let out = request(&mut h, 3, 2, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(2), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        // A free file: it would have to grant, so not yet.
+        let other = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = request(&mut h, 3, 3, other, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(3), LockOutcome::Busy)]
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// The same failover seen earlier: the dead holder's link is not
+    /// declared dead yet, so the requests to it time out; out of
+    /// attempts, a non-blocking request reads the lease once before
+    /// answering `ENOLCK`, and asks the successor it names.
+    #[test]
+    fn a_non_blocking_request_out_of_attempts_rereads_the_lease_once() {
+        let mut r = requester();
+        let mut out = r.step(Event::Control {
+            op: OpId(80),
+            req: Control::Lock {
+                ino: 42,
+                mode: X,
+                blocking: false,
+            },
+        });
+        // Every request to node 1 goes unanswered.
+        for _ in 0..r.core.cfg.forward_retries {
+            assert!(matches!(
+                sends(&out).as_slice(),
+                [(1, PeerMsg::LockRequest { .. })]
+            ));
+            r.advance(r.core.cfg.forward_timeout_ms);
+            out = r.step(Event::Timer {
+                id: timer_of(&out, TimerKind::LockRequestTimeout),
+            });
+            if let Some(retry) = timers(&out, TimerKind::LockRetry).first().copied() {
+                r.advance(1_000);
+                out = r.step(Event::Timer { id: retry });
+            }
+        }
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op, .. } if *op == OpId(80))),
+            "not ENOLCK before the lease is read: {out:?}"
+        );
+        let ops = s3_ops(&out);
+        assert!(matches!(ops.as_slice(), [(_, S3Op::LeaseGet)]), "{out:?}");
+        let expires = r.now.0 + 10_000;
+        let out = r.step(Event::S3 {
+            op: ops[0].0,
+            result: S3Result::LeaseGet(Ok(Some((lease_of(3, 2, expires), tag())))),
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(3, PeerMsg::LockRequest { ino: 42, .. })]
+        ));
+        // Node 3 does not answer either: unavailable, no second read.
+        let out = r.step(Event::Timer {
+            id: timer_of(&out, TimerKind::LockRequestTimeout),
+        });
+        assert_eq!(lock_answer(&out, 80), LockAnswer::Unavailable);
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
 }
 

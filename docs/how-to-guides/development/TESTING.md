@@ -294,7 +294,16 @@ still fails the end-state check.
 Every variant also checks the marker file the previous turn wrote under
 the lock after its commit (campaign 5's check, done right: one marker for
 the last commit by anyone), and that no two turns held the lock at once
-(each turn records when it got and released it).
+(each turn records when it got and released it). A turn whose git (or
+the edit before it) failed while its node counted refused ops of a lapsed
+lock owner (`owner_fenced_ops` rose during the turn) is *fenced*: a turn
+overlapping it is reported apart, not as a broken lock, unless the fenced
+turn completed a writing step after the other got the lock. A turn whose
+git succeeded and whose marker write then failed is not fenced. Each
+overlap prints the earlier turn's steps relative to the later turn's
+`got`, and each workload prints the committers' `lost`, `owners_fenced`
+and `owner_fenced_ops`. With `GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000`
+the faults variant provokes real lapses.
 `git-under-flock-b2b` is campaign 5's shape: back to back, 5–20 files per
 commit (new files and appends to any tracked file), with the turn
 duration reported per decile and the slowest turns broken into steps; a
@@ -2320,7 +2329,7 @@ makes POSIX and `flock` locks cluster-wide: per-node, per-file *grants*
 leased from the file's owning sequencer, cached across local unlocks,
 recalled on conflict, and fenced with `EIO` once a grant lapses. `--locks
 local` is the node-local behaviour of before (and the only mode without
-P2P). Knobs: `CONSTELLATION_LOCK_TTL_MS` (5000), `CONSTELLATION_LOCK_CACHE_IDLE_MS`
+P2P). Knobs: `CONSTELLATION_LOCK_TTL_MS` (20000), `CONSTELLATION_LOCK_CACHE_IDLE_MS`
 (30000). `constellation status` has a `locks` section (both tables'
 counters).
 

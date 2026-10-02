@@ -895,7 +895,7 @@ of another node's `close()` out of band, with no lock between them
   under its grant. A grant is cached after the last unlock, so an
   uncontended re-lock costs no message.
 - **Leased, with one time discipline.** A grant lasts
-  `CONSTELLATION_LOCK_TTL_MS` (5 s), capped by the sequencer's own
+  `CONSTELLATION_LOCK_TTL_MS` (20 s), capped by the sequencer's own
   authority, and follows §5's discipline. It is renewed half-way through
   the window its holder honours it for, so a short grant is renewed
   inside its window too. A delegate grants nothing on less than
@@ -920,10 +920,15 @@ of another node's `close()` out of band, with no lock between them
 - **Fencing.** A node whose grant lapsed (for example, partitioned past
   the lock TTL) fails I/O with `EIO` on the files it holds locks on,
   until they are unlocked or a new grant arrives (NFSv4's rule), and its
-  writes under the lapsed grant are never published. The limit: only I/O
-  on the *locked* file is fenced. An application that guards other files
-  with the lock, as git does, runs on unprotected once the grant has
-  lapsed, which is why renewal must happen inside the window.
+  writes under the lapsed grant are never published. The lock's *owner*
+  is fenced on every file: the process of the thread that took the lock
+  (by thread group, named by pid and start time), all its threads and
+  the processes it started get `EIO` from every write and namespace
+  operation until the owner's locks are gone, because an application that guards other files with the
+  lock, as git does, must not write on once another node may hold it.
+  The limit: an operation checked before the lapse and applied after it
+  (a stalled forward) is not caught; a fencing token checked by the
+  sequencer would close that (PROGRESS, plan 30 M11 follow-up).
 - **Failover.** After a TTL takeover every old grant has already lapsed,
   so there is nothing to reclaim. After a fast takeover the successor
   waits out a grace period and accepts reclaims. A delegation's first
@@ -1207,7 +1212,9 @@ latency.
 ### Lock holders
 
 A node partitioned from a file's sequencer past the lock TTL loses its
-grant and is fenced: `EIO` on the locked files until they are unlocked.
+grant and is fenced: `EIO` on the locked files until they are unlocked,
+and on every write or namespace operation of the lock's owner, on any
+file, until the owner's locks are gone.
 The sequencer outwaits the grant (`granted + ttl + margin`) before
 granting the lock elsewhere, so the fence always comes first. With P2P up
 but the sequencer unreachable, a non-blocking lock fails with `ENOLCK`

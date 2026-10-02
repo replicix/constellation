@@ -10,8 +10,10 @@
 //!   holder wrote), then `local_set` again; `Conflict` (another local
 //!   owner) waits locally;
 //! - the critical section: a few I/O steps, each asking
-//!   `LockTables::fenced` first — a fenced step is refused (`EIO`) and
-//!   the client gives the lock up;
+//!   `LockTables::fenced` first, and the owner fence
+//!   (`LockTables::fenced_owners`: the turn write goes to *another* file,
+//!   which only the owner fence covers) — a fenced step is refused
+//!   (`EIO`) and the client gives the lock up;
 //! - `local_unlock`; when that left the inode idle under a recalled
 //!   grant, `Control::LockIdle` (the core flushes, then releases).
 //!
@@ -64,6 +66,9 @@ pub struct LockCounters {
     /// I/O steps performed, and refused because the grant had lapsed.
     pub ios: u64,
     pub fenced_ios: u64,
+    /// Of those, refused by the owner fence alone (the lock file's own
+    /// fence had lifted: a new grant arrived after the lapse).
+    pub owner_fenced_ios: u64,
     /// `local_set` found another local owner in the way.
     pub local_conflicts: u64,
     /// `Control::Lock` answers.
@@ -614,6 +619,7 @@ pub async fn client_lock(
     let lock = LocalLock {
         owner: thread,
         pid: thread as u32,
+        pid_start: 0,
         write: step.mode == LockMode::Exclusive,
         start: 0,
         end: u64::MAX,
@@ -796,8 +802,21 @@ pub async fn client_lock(
             ghost.count(|c| c.abandoned += 1);
             return;
         };
-        if h.meta.locks().fenced(ino, h.clock.now().0) && !ignore_fence {
-            ghost.count(|c| c.fenced_ios += 1);
+        let now = h.clock.now().0;
+        let ino_fenced = h.meta.locks().fenced(ino, now);
+        let owner_fenced = h
+            .meta
+            .locks()
+            .fenced_owners(now)
+            .iter()
+            .any(|f| f.owner == thread);
+        if (ino_fenced || owner_fenced) && !ignore_fence {
+            ghost.count(|c| {
+                c.fenced_ios += 1;
+                if !ino_fenced {
+                    c.owner_fenced_ios += 1;
+                }
+            });
             if entered {
                 ghost.leave(ino, node, thread, clock.elapsed_ms(), "fenced");
             } else {

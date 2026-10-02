@@ -76,6 +76,9 @@ struct LockOp {
     since: Ms,
     /// Waiting in this node's own waiter list (the owner is here).
     local_wait: bool,
+    /// The lease was re-read once because the cached holder could not be
+    /// reached (see `lock_route_op`).
+    reread: bool,
 }
 
 /// How many `LockState::done_reqs` entries are kept.
@@ -416,8 +419,17 @@ impl Core {
 
     /// Whether new grants are refused now (reclaims still accepted).
     fn lock_grace_active(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> bool {
-        replica.read_delegations().quarantine_until() > now.0
-            || self.lock_in_grace(now, ino, replica)
+        Self::lock_quarantine_until(replica) > now.0 || self.lock_in_grace(now, ino, replica)
+    }
+
+    /// The whole-namespace grace: the restart or takeover quarantine of
+    /// read delegations, or of lock grants (kept apart, see
+    /// `LockTables::set_quarantine`), whichever ends later.
+    fn lock_quarantine_until(replica: &dyn Replica) -> i64 {
+        replica
+            .read_delegations()
+            .quarantine_until()
+            .max(replica.locks().quarantine_until())
     }
 
     // ------------------------------------------------------------ owner side
@@ -511,6 +523,20 @@ impl Core {
         if root_owned
             && (!self.strict_answer_allowed(now, out) || !self.ensure_granting_marked(out))
         {
+            // A refusal grants nothing: a non-blocking request that a
+            // live grant conflicts with is refused even before this
+            // tenure may grant (a fresh successor whose lease is not
+            // marked yet: the harness's lock-failover contender got
+            // `Busy`, then `ENOLCK`, while the locker held its grant).
+            if !blocking
+                && !replica
+                    .locks()
+                    .conflicting(ino, from, mode, now.0)
+                    .is_empty()
+            {
+                self.stats.lock_would_block += 1;
+                return Served::Outcome(LockOutcome::WouldBlock);
+            }
             return Served::Outcome(LockOutcome::Busy);
         }
         if self.lock_grace_active(now, ino, replica) {
@@ -600,7 +626,7 @@ impl Core {
             }
         }
         let until = base.0.min(now.0) + ttl + self.lock_margin_ms();
-        if !replica.note_grant_horizon(until) {
+        if !replica.note_lock_grant_horizon(until) {
             return Ok(LockOutcome::Busy);
         }
         // Every grant is a new id, an own grant re-asked for included:
@@ -1412,7 +1438,7 @@ impl Core {
         // Unknown: a reclaim during a grace period, if nothing conflicts.
         let grace = self.lock_grace_active(now, ino, replica);
         let conflicting = replica.locks().conflicting(ino, from, mode, now.0);
-        if grace && conflicting.is_empty() && replica.note_grant_horizon(until) {
+        if grace && conflicting.is_empty() && replica.note_lock_grant_horizon(until) {
             replica.locks().install(Grant {
                 id,
                 node: from,
@@ -1567,6 +1593,7 @@ impl Core {
                 attempts: 0,
                 since: now,
                 local_wait: false,
+                reread: false,
             },
         );
         self.lock_route_op(now, op, replica, out);
@@ -1628,7 +1655,9 @@ impl Core {
             }
             Route::Node(n) => {
                 if !self.cfg.p2p || !self.reaches(now, n) {
-                    self.lock_op_unreachable(now, op, out);
+                    if !self.lock_reread_holder(op, out) {
+                        self.lock_op_unreachable(now, op, out);
+                    }
                     return;
                 }
                 let req = self.op_id();
@@ -1687,11 +1716,40 @@ impl Core {
         });
     }
 
+    /// The holder this node asked (or would ask) cannot be reached: it
+    /// may be stale — it died, and a successor took the lease before
+    /// gossip said so (the harness's lock-failover: a non-blocking `flock`
+    /// answered `ENOLCK` while the backup already served). Re-read the
+    /// lease, once per request, as for an unknown holder, before a
+    /// non-blocking request gives up. `false`: read already (or no P2P).
+    fn lock_reread_holder(&mut self, op: OpId, out: &mut Vec<Action>) -> bool {
+        if !self.cfg.p2p {
+            return false;
+        }
+        let Some(o) = self.lk.ops.get_mut(&op).filter(|o| !o.reread) else {
+            return false;
+        };
+        o.reread = true;
+        o.attempts += 1;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ino = o.ino,
+            "lock holder unreachable: re-reading the lease before giving up"
+        );
+        self.issue_s3(S3Op::LeaseGet, super::S3For::LockHolder(op), out);
+        true
+    }
+
     fn lock_retry(&mut self, now: Ms, op: OpId, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
         };
         if !o.blocking && o.attempts >= self.cfg.forward_retries {
+            // Out of attempts against the holder this node knew (its
+            // requests timed out before the link was declared dead).
+            if self.lock_reread_holder(op, out) {
+                return;
+            }
             self.stats.lock_unavailable += 1;
             self.lk.ops.remove(&op);
             out.push(Action::ControlDone {
@@ -1831,6 +1889,7 @@ impl Core {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
+            installed_ms: now.0,
         };
         if matches!(
             replica.locks().install_held(ino, held),
@@ -1944,6 +2003,7 @@ impl Core {
                     releasing: false,
                     first_use: false,
                     idle_since_ms: None,
+                    installed_ms: now.0,
                 };
                 let ino = o.ino;
                 let waited = now.since(o.since).max(0) as u64;
@@ -2117,6 +2177,16 @@ impl Core {
         for (ino, _) in idle {
             self.stats.lock_idle_released += 1;
             self.lock_release_begin(now, ino, replica, out);
+        }
+        // A recalled grant whose first local lock never came (the
+        // requester gave up, or is gone) stops being pinned by it: it is
+        // released below, not renewed for ever under the waiters.
+        for ino in replica.locks().expire_first_use(now.0) {
+            tracing::info!(
+                node = self.cfg.node_id,
+                ino,
+                "a recalled lock grant was never used by its requester; releasing it"
+            );
         }
         // A recalled grant with no local lock under it is released, not
         // renewed; a lapsed one is dropped (sim seed 90010: a grant that
@@ -2807,7 +2877,7 @@ impl Core {
             return 0;
         };
         self.lk.grace.retain(|(_, until)| *until > now);
-        let mut until = replica.read_delegations().quarantine_until();
+        let mut until = Self::lock_quarantine_until(replica);
         for (g, u) in &self.lk.grace {
             if *g == constellation_fs_core::types::ROOT_INO
                 || replica.is_under(dir, *g)
@@ -2855,11 +2925,23 @@ impl Core {
         self.stats.lock_grace_periods += 1;
     }
 
-    pub(crate) fn locks_start(&mut self, replica: &dyn Replica) {
+    pub(crate) fn locks_start(&mut self, now: Ms, replica: &dyn Replica) {
         self.lk.tenure_floor_due = true;
         replica
             .locks()
             .seed_ids(u64::from(self.cfg.incarnation) << 40);
+        if !self.cfg.locks {
+            return;
+        }
+        if let Some(until) = replica.load_lock_quarantine(now.0) {
+            tracing::info!(
+                node = self.cfg.node_id,
+                wait_ms = until - now.0,
+                "lock grants made before this restart may still be honoured; \
+                 no new lock grant until they have expired (parked requests are \
+                 served by the waiter tick then)"
+            );
+        }
     }
 
     /// The lease is gone (deposed, released, an epoch closed): this

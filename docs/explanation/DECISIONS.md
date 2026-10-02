@@ -794,13 +794,17 @@ strict mode (cross-node byte-range locks) had never been built.
   its subtree or range) grants whole-file shared or exclusive *grants*
   to nodes; byte ranges and lock owners are resolved on the node under
   its grant.
-- Grants are leased (`CONSTELLATION_LOCK_TTL_MS`, 5 s), capped by the
+- Grants are leased (`CONSTELLATION_LOCK_TTL_MS`, 20 s), capped by the
   sequencer's own authority, and use read delegations' time discipline:
   the node honours a grant until `sent + ttl − margin`, the sequencer
   outwaits it until `granted + ttl + margin`.
 - A node whose grant lapsed fails I/O on the files it holds locks on
   with `EIO` until they are unlocked or a new grant arrives (NFSv4's
-  fencing rule).
+  fencing rule), and fences the lock's *owner* (its process and the
+  processes it started) on every file of the mount until the owner's
+  locks are gone: an application guarding other files with the lock
+  (git) must not write on without it. The TTL is long (20 s) so that
+  lapses are rare; a crashed holder costs its waiters `ttl + margin`.
 - A conflicting request recalls the other grants; a recalled node
   flushes the file's dirty data before it releases. The next grant
   carries a position the new holder waits for, and it drops its kernel
