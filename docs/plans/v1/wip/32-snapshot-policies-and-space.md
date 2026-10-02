@@ -771,7 +771,8 @@ Deliberately excluded from per-snapshot numbers:
 
 ### 6.2 The index: interval runs, not birth times (L10, L11)
 
-Module `crates/cli/src/snapacct.rs`, plus node-local fjall keyspaces.
+Module `crates/engine/src/snapacct/` (next to `snapwalk`, whose deltas it
+consumes), in its own node-local fjall database.
 These are **not published**: derived, rebuildable, and versioned with a
 header `{format, fs_uuid, accounted_seq}`.
 
@@ -857,9 +858,15 @@ scans itself.
   Snapshot creation and deletion update the index on apply, so the
   snapshot list is fresh. Live-tree refresh lags by at most the refresh
   interval.
-- **Size budget:** about 60 B per indexed chunk. 10 M snapshot-referenced
-  chunks (≈ 40 TiB at 4 MiB) is about 600 MiB of local disk. Report the
-  index footprint in `status`.
+- **Size budget:** ≈90 B per indexed chunk (≈0.9 GB per 10M chunks; ≈1.2 GB
+  if most runs are closed). Measured 90.9 B per chunk in compacted tables
+  (M5a); the 32-byte hash appears in the chunk key and again in the birth
+  key, plus the death key once a run closes (32 + ≈10 + 40 + 40 ≈ 122 B
+  worst case), and a short local chunk id would save only 25–45 B for a
+  second lookup per delta, so it is deferred (the index is versioned and
+  rebuildable, so changing keys later costs nothing). 10 M
+  snapshot-referenced chunks (≈ 40 TiB at 4 MiB) is about 0.9 GB of local
+  disk. Report the index footprint in `status`.
 - **`snapshot space --verify`** is a brute-force oracle. It fully walks
   every snapshot, computes the exact sets, and diffs them against the
   index. It is the unit-test and harness oracle, and an operator's

@@ -30362,6 +30362,50 @@ gauge), against 3,264 B capped. The M0b measurement (50 snapshots of a
 inline limit, so it spills no list and its spill memory is zero both
 before and after.
 
+## Plan 32 M5a (accounting index core)
+
+Step 6.2 of [plan 32](wip/32-snapshot-policies-and-space.md), the data
+structure and its algorithms only: a node-local fjall database of per-chain
+interval runs that turns `snapwalk` deltas into ZFS-style `USED` /
+`WRITTEN` / `REFER` / `LSIZE`, `reclaim(D)` and the `snapshot space`
+breakdown, each operation O(what changed). Nothing is wired into the node
+(that is `32-m5b`: building from real snapshots, the live-tree refresh,
+status, `--verify`). The module lives in `crates/engine/src/snapacct/`
+(the brief's location; plan §6.2 updated to match).
+
+| Item | State | Where |
+|---|---|---|
+| Own fjall database (`SnapAcct::open(dir, fs_uuid, params)`), keyspaces `snapacct_chunk` (hash → `{size, live, runs: SmallVec<[Run;1]>}`, hand-encoded varints, open = 0), `snapacct_birth` (`chain|first|hash`), `snapacct_death` (`chain|last|hash`, closed runs only), `snapacct_snap` (`chain|ord` → `{id, root, used, written, refer, lsize}`), `snapacct_meta` (header `{format, fs_uuid, accounted_seq}`, chain registry both ways, per-chain ordinal counter and Σ `USED`/`WRITTEN`, id → `(chain, ord)`, FS counters), `snapacct_tomb` (`h|hash` → `{size, since_ms}`, `t|since|hash` for expiry); a header mismatch or an undecodable header wipes the database (`Opened::{Fresh, Reused, Rebuilt}`); the directory holds a `SNAPACCT` marker and fjall in `db/`, and a non-empty directory without the marker is refused, never wiped | DONE | `snapacct/mod.rs`, `snapacct/encoding.rs` |
+| `register_chain`, `apply_first`, `apply_created` (deltas summed per hash first, so duplicate entries for one hash cannot malform a run; zero-crossings open/close runs; `WRITTEN` = runs opened, `REFER` = prev + opened − closed, `LSIZE` from an `lsize_delta`), `apply_deleted` (`[k,k]` removed, `[k,j]` → `[next,j]`, `[i,k]` → `[i,prev]`, runs separated only by k merged, `WRITTEN[next]` fixed up; a closed run ending at the head is impossible: `debug_assert!` + `Corrupt`) | DONE | `snapacct/ops.rs` |
+| Head deletion and out-of-order insertion: occurrence counts are stored only at a chain's head, so moving the head backwards takes `step(P, head)` (validated against the runs; a mismatch is refused and nothing changes). `rederive_suffix(chain, after, rewind, suffix)` rewinds to `after` and re-appends the new snapshot and the old suffix from the caller's steps in one transaction; the suffix gets fresh ordinals, so ordinals never reorder. Cost: one `ChainWalk::step` per suffix snapshot plus the rewind (rare: late-applied rows only). `clear_chain` is the fallback when a rewind's roots are gone | DONE | `ops.rs` `Ctx::truncate`, `mod.rs` |
+| Sole owner recomputed after every chunk-entry change (not live, one run, covering one snapshot: `first == last`, or open and born at the head — runs born at the old/new head are re-examined when the head moves); `size` moves between owners' `USED` and the FS buckets (`unique`, `shared` ≥2 snapshots only, shared with `live`) | DONE | `ops.rs` `Ctx::flush`, `class_of` |
+| `accounted_seq` atomic with the change: every mutation (`apply_first`, `apply_created`, `apply_deleted`, `rederive_suffix`, `clear_chain`, `set_live`, `set_live_many`) takes `seq: Option<u64>` written into the header in the same transaction; it never moves backwards (refused); `set_accounted_seq` advances over commits that touch no snapshot. Replay contract for m5b in the module doc | DONE | `mod.rs` `advance_seq`, `ops.rs` `Ctx::commit` |
+| `set_live` / `set_live_many`; tombstones on losing the last run while not live, revived on a new run or `live`, dropped after `gc_horizon_ms + gc_interval_ms` (`expire_tombstones`, cost = expired); `awaiting_gc()` | DONE | `ops.rs` |
+| `reclaim(D)` (births over each chain's `[min, max]` of D; a chunk counts if not live and every run, in any chain, is covered by D), `snap_numbers`, `chain_snapshots`, `chain_numbers`, `fs_breakdown`, `locate(id)`, `footprint_bytes` (Σ keyspace table bytes; excludes the preallocated journal and memtables), `chunk_entry`, `check_structure` (full-scan self-check: runs maximal, keys, every counter recomputed) | DONE | `mod.rs` |
+| Model test: 16 seeds × 150 steps over 3–5 chains and a 40-chunk global pool (afterlife re-adds, cross-chain sharing, duplicate-hash delta lists — a delta split in two or a `+1/−1` pair, shuffled — in creates, rewinds and re-appended suffixes, deletes at head/tail/middle/only, live toggles, out-of-order inserts, tombstone expiry); every mutation carries a rising seq; after every step `accounted_seq`, `USED`/`WRITTEN`/`REFER`/`LSIZE` per snapshot, chain sums, `reclaim(D)` (all, each chain, a range per chain, 3 random sets), the breakdown, `awaiting_gc` and the run invariant against brute force, plus `check_structure`; asserts every operation kind occurred. ≈17 s debug. Heavy variant 200 seeds × 400 steps (`#[ignore]`, ≈160 s release alongside the measurement). Three hand-seeded bugs (no merge on delete, no head re-examination, `reclaim` ignoring gaps) are each caught | DONE | `snapacct::tests::model_agrees_with_brute_force{,_heavy}` |
+| Named tests: deleting S moves the chunks it shared with exactly one neighbour into that neighbour's `USED` (and its own into awaiting GC; head deletion needs its step; a wrong step is refused); afterlife = second run, merged when the gap is deleted; foreign/outdated index wiped; undecodable header wiped; foreign non-empty directory refused and untouched; duplicate hashes summed (`[(h,+1),(h,−1)]`, `[(h,−2),(h,+1)]` against an index built from netted lists); `accounted_seq` commits with the change (a refused change or a backwards seq commits neither) | DONE | `snapacct::tests` |
+| Not done (`32-m5b`): building from snapshot rows, live refresh, `building (n%)` budgeting/resume cursor, control/CLI/UI, `--verify` against full walks | — | — |
+
+**Measurement** (report only; release, `snapacct::tests::measure_footprint_and_apply_cost`,
+one chain, a 200k-chunk first snapshot then 20 snapshots of 10k deltas each,
+300k indexed chunks, 100k of them with closed runs):
+
+| Figure | Value |
+|---|---|
+| Logical bytes (keys + values, all keyspaces) | 94.3 B / indexed chunk |
+| Compacted tables on disk | **90.9 B / indexed chunk** |
+| First snapshot, 200k chunks | 0.72 s |
+| 10k-delta `apply_created` | median 42 ms, max 259 ms (fix round: 41 / 252 ms) |
+| `footprint_bytes()` after flush + compaction | equal to the compacted tables (asserted) |
+
+The plan's ≈60 B estimate is not met: the 32-byte hash appears in the chunk
+key and again in the birth key (and the death key of a closed run), and
+hashes do not compress — an open-run chunk floors at ≈81 B. Shrinking it
+needs a local chunk id instead of the hash in birth/death keys; deferred
+after review (saves 25–45 B for a second lookup per delta; the index is
+rebuildable). Plan §6.3's budget is now ≈90 B per indexed chunk (≈0.9 GB
+per 10M chunks; ≈1.2 GB if most runs are closed).
+
 Gates (this worktree, `CARGO_TARGET_DIR` unset):
 
 | Command | Result |
@@ -30926,3 +30970,15 @@ Gates (this worktree, `CARGO_TARGET_DIR` unset):
 | `bash tests/smoke.sh` | SMOKE TEST PASSED |
 | `cargo build --release --workspace` | exit 0 |
 | `target/release/harness run snapshot-lifecycle snapshot-churn gc-lifecycle atime-eventual e2e-basic` | ALL SCENARIOS PASSED (5/5) |
+
+| `cargo test --workspace` | exit 0; 81 test binaries, 1987 passed, 0 failed, 42 ignored |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo test -p constellation-engine --release --lib snapacct -- --ignored --nocapture` | heavy model (200 × 400) ok; measurement as above |
+
+Review fix round (duplicate-hash deltas summed, atomic `accounted_seq`,
+undecodable header wiped, marker-guarded wipe, `footprint_bytes` = tables,
+plan §6.2/§6.3 text): fmt and workspace clippy clean; `cargo test -p
+constellation-engine` 377 + 1 passed, 5 ignored; the workspace split per crate
+(with control `web` and vfs `conformance`, as the workspace build unifies them;
+the model crate per test binary) 1991 passed, 0 failed (1987 + 4 new tests);
+release heavy model and measurement ok; smoke passed.

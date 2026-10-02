@@ -31,6 +31,8 @@ constellation-net.workspace = true
 constellation-upload-concurrency.workspace = true
 constellation-store-s3.workspace = true
 fjall = { version = "3.1", package = "fjall" }
+# `snapacct`'s per-chunk run list: almost every chunk has exactly one run.
+smallvec = "1.15"
 anyhow.workspace = true
 object_store.workspace = true
 postcard.workspace = true
