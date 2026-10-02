@@ -31,8 +31,14 @@
 //! which is exactly the old, non-deferred behaviour.
 //!
 //! Jobs must be bounded waits: a job that waited for another job of this
-//! pool could deadlock it once the pool is full. A cold read waits for
-//! the runtime and the store only.
+//! pool could deadlock it once the pool is full. A deferred read waits
+//! for the runtime and the store, and — when it deferred because another
+//! op held its file's op lock (`View::read`) — for that lock. The holder
+//! is already running (a flush or write on a frontend or offload thread,
+//! or a read that is itself a job here, which has its thread): never a
+//! job still queued, so the wait cannot deadlock the pool, but it lasts
+//! as long as the holder's own wait on the store, and enough of them fill
+//! the pool (later jobs queue, the frontend's threads still go free).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};

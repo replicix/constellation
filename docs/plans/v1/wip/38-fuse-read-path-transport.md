@@ -1108,6 +1108,38 @@ additions are listed below.
   becomes the default for non-handover-capable mounts (plain desktop/server
   daemons); handover-capable mounts (CSI, `daemon --upgrade`) stay
   `DevFuse` (Z0a, §3(e)). `node.status`/metrics/docs updated per §5.
+
+  **Z2c (the default flip) is blocked on the ring-queue lock-wait problem
+  being settled** (found in the Z2a review). Over a ring every request
+  holds its entry until it is answered — including one answered later from
+  another thread (a cold read on the completion pool, an offloaded flush, a
+  blocking `F_SETLKW`/`flock` on the view's `lock-wait` thread) — and the
+  kernel queues a request on the issuing CPU's queue until one of that
+  queue's `depth` entries is free; it cannot be answered on another queue
+  or over `/dev/fuse` (`fuse_uring_queue_fuse_req`; the reply must be the
+  `COMMIT_AND_FETCH` of its own entry). `/dev/fuse` has no such coupling: a
+  waiting request holds nothing there. Waits that end by themselves (the
+  store, a lease, the session wait) only stall that CPU's requests; a
+  blocking lock can **deadlock** it: at depth 8, 8 processes on CPU *k*
+  block in `F_SETLKW` on a lock held by *P*; *P*, on CPU *k*, issues a
+  `write()` before its unlock; the write waits behind entries only the
+  unlock can free, and the mount hangs for every request from CPU *k*.
+  Z2a's mitigation (the protocol allows no other answer): a queue lends at
+  most `depth - 1` entries to blocking lock requests; a further one on that
+  queue is served as non-blocking, granted if free and answered **`ENOLCK`**
+  if contended (`RingCommit::reserve_lock_wait` in the vendored fuser; the
+  deterministic test is `wire_uring.rs`'s
+  `blocking_lock_waits_never_take_a_queues_last_entry`). That removes the
+  deadlock at the price of a POSIX-legal but unusual error under a burst of
+  contended waits on one CPU. Before `auto` becomes a default Z2c must pick
+  one of: (a) accept the `ENOLCK` budget as is (document it as the ring's
+  behaviour under `--locks cluster`); (b) keep mounts with cluster locks
+  (`FrontendCaps::cluster_locks`, the default with P2P) on `dev_fuse` under
+  `auto`, recorded as a fallback reason — which would leave most real mounts
+  on `/dev/fuse` and the ring lane needing `--locks local` for coverage;
+  (c) a deeper default queue (the budget grows with it, at `queues x depth x
+  max_write` of reserved address space); or a combination, e.g. (a) with a
+  deeper queue only on mounts with cluster locks.
 - **Z3 — Passthrough for single-chunk read-only opens.** §3(c)'s
   eligibility rule, the `Opened`/`View::open` extension, the pin-while-open
   `DiskCache` guard, and the scan-ahead/atime move to `open()` land,

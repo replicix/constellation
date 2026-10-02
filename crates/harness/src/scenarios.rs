@@ -1345,6 +1345,41 @@ pub const SCENARIOS: &[Scenario] = &[
         run: transport::transport_detach_refused,
     },
     Scenario {
+        name: "transport-refused-registration",
+        desc: "plan 38 §2.4: the kernel refuses the io_uring queues' registration after FUSE_INIT \
+               committed the connection to rings (CONSTELLATION_FUSE_URING_FAULT=malformed-register) \
+               -- the mount comes up on dev_fuse anyway, serves, and logs the downgrade once",
+        requires: &[crate::suites::FUSE_URING],
+        caps: &[],
+        run: transport::transport_refused_registration,
+    },
+    Scenario {
+        name: "transport-seccomp-denied",
+        desc: "plan 38 §2.4/§8: the daemon runs under a seccomp filter refusing io_uring_setup(2) \
+               (EPERM), as a container's default profile does -- auto falls back to dev_fuse, the \
+               mount serves, the downgrade is logged once; passes on every host",
+        requires: &[],
+        caps: &[],
+        run: transport::transport_seccomp_denied,
+    },
+    Scenario {
+        name: "transport-enomem-ring",
+        desc: "plan 38 §2.4: RLIMIT_AS shaped so the ring's buffer reservation fails (ENOMEM) -- \
+               auto falls back to dev_fuse without a crash, the mount serves, logged once",
+        requires: &[crate::suites::FUSE_URING],
+        caps: &[],
+        run: transport::transport_enomem_ring,
+    },
+    Scenario {
+        name: "transport-abort-while-armed",
+        desc: "plan 38 §6: a fusectl abort of a ring session with its entries armed and a reader \
+               running -- the reader fails at once, the daemon unwinds and exits cleanly, nothing \
+               leaks, the mountpoint takes a fresh ring mount",
+        requires: &[crate::suites::FUSE_URING],
+        caps: &[Cap::FuseAbort],
+        run: transport::transport_abort_while_armed,
+    },
+    Scenario {
         name: "lifecycle-suspend-mid-write",
         desc: "plan 31 C8: a writer on the lease holder records every fsync'd file; the holder is suspended (node.lifecycle, 15 s deadline) mid-stream: every view published, journal shipped, lease released, P2P quiet, all within the deadline; another node takes the writes over and every node reads every acknowledged file byte-exact; the holder resumes and the writer goes on: no acknowledged write lost",
         requires: &[],

@@ -222,6 +222,10 @@ enum InteropAction {
 }
 
 fn main() -> Result<()> {
+    // Exec'd as `fusermount3` by a sandboxed daemon (`sandbox`'s relay).
+    if let Some(code) = constellation_harness::sandbox::relay_main() {
+        std::process::exit(code);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -469,7 +473,18 @@ fn run(opts: RunOpts) -> Result<()> {
             skipped.push(s.name);
             continue;
         }
-        if let Some(missing) = s.requires.iter().find(|b| !suites::have(b)) {
+        // Plan 38 Z2a: a kernel/build requirement, skipped with its reason.
+        if let Some(why) = s.requires.iter().find_map(|r| suites::unavailable(r)) {
+            eprintln!("=== {} SKIPPED ({why})", s.name);
+            report.push(s.name, Outcome::Skipped, 0.0, Some(why));
+            skipped.push(s.name);
+            continue;
+        }
+        if let Some(missing) = s
+            .requires
+            .iter()
+            .find(|b| !suites::is_platform_requirement(b) && !suites::have(b))
+        {
             eprintln!("=== {} SKIPPED ({missing} not installed)", s.name);
             report.push(
                 s.name,

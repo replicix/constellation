@@ -365,6 +365,10 @@ impl MountOptions {
         if self.transport == TransportPolicy::Auto {
             if cfg!(feature = "io-uring") {
                 config.io_uring = true;
+                #[cfg(all(feature = "io-uring", target_os = "linux"))]
+                {
+                    config.io_uring_malformed_register = uring_fault_malformed_register();
+                }
             } else {
                 // A ladder that degrades: asking for a transport this
                 // build cannot speak is a downgrade, not a mount failure
@@ -379,6 +383,19 @@ impl MountOptions {
         }
         config
     }
+}
+
+/// `CONSTELLATION_FUSE_URING_FAULT=malformed-register`: **fault injection,
+/// for the harness's `transport-refused-registration` scenario only.** A
+/// mount that asks for the ring makes every ring REGISTER malformed, so a
+/// kernel that offered the ring refuses it after the `FUSE_INIT` reply —
+/// the one downgrade of plan 38 §2.4 no host setting can provoke — and the
+/// mount falls back to `/dev/fuse` ([`mount_source`]). Unset (the default)
+/// or any other value: no fault.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn uring_fault_malformed_register() -> bool {
+    std::env::var("CONSTELLATION_FUSE_URING_FAULT")
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("malformed-register"))
 }
 
 /// Where a session's connection comes from (see the module doc).
@@ -565,9 +582,6 @@ pub fn mount_source<V: Vfs>(
     caps: FrontendCaps,
 ) -> std::io::Result<FuseSession<V>> {
     let config = opts.config();
-    let fs = FuseFs::new(view.clone(), caps, opts.tuning);
-    let deferred = fs.deferred().clone();
-    let observer = fs.observer_slot();
     match source {
         MountSource::PreopenedFd(fd) => {
             // Somebody else holds this connection and may want it handed
@@ -578,59 +592,116 @@ pub fn mount_source<V: Vfs>(
                 opts.is_handover_capable(),
                 "a PreopenedFd session's options must be handover-capable"
             );
+            let fs = FuseFs::new(view.clone(), caps, opts.tuning);
+            let deferred = fs.deferred().clone();
+            let observer = fs.observer_slot();
             let mut config = config;
             config.io_uring = false;
             let session = fuser::Session::from_fd(fs, fd, config.acl, config.clone())?;
             FuseSession::new(session, deferred, observer, opts, view, config, None, None)
         }
-        MountSource::Path(mountpoint, kernel) if privileged() => {
-            let fd = mount_fd(&mountpoint, &kernel)?;
-            let session = match fuser::Session::from_fd(fs, fd, config.acl, config.clone()) {
-                Ok(session) => session,
-                Err(error) => {
-                    // The mount exists; a failed handshake must not leave it.
-                    let _ = unmount_path(&mountpoint, true);
-                    return Err(error);
-                }
-            };
-            FuseSession::new(
-                session,
-                deferred,
-                observer,
-                opts,
-                view,
-                config,
-                Some(mountpoint),
-                None,
-            )
-        }
         MountSource::Path(mountpoint, kernel) => {
-            let mut options = vec![fuser::MountOption::FSName(kernel.fsname.clone())];
-            if kernel.default_permissions {
-                options.push(fuser::MountOption::DefaultPermissions);
-            }
-            if kernel.read_only {
-                options.push(fuser::MountOption::RO);
-            }
-            let mut config = config;
-            config.mount_options = options;
-            if kernel.allow_other {
-                config.acl = fuser::SessionACL::All;
-            }
-            let mut session = fuser::Session::new(fs, &mountpoint, &config)?;
-            let unmounter = session.unmount_callable();
-            FuseSession::new(
-                session,
-                deferred,
-                observer,
+            match mount_path(
+                &view,
+                &mountpoint,
+                &kernel,
                 opts,
-                view,
-                config,
-                Some(mountpoint),
-                Some(unmounter),
-            )
+                caps.clone(),
+                config.clone(),
+            ) {
+                // Plan 38 §2.4, the "refused ring registration mid-INIT"
+                // rung: the INIT reply had already committed the
+                // connection to rings, which the kernel then would not
+                // register, and such a connection can neither be served
+                // nor moved back to `/dev/fuse` (Z0a). fuser's constructor
+                // failed and its drop took the mount down with it; this is
+                // a new mount, on `/dev/fuse`. Logged once, here: the
+                // refusal itself is not logged anywhere else.
+                Err(error) if config.io_uring && registration_refused(&error) => {
+                    tracing::warn!(
+                        %error,
+                        mountpoint = %mountpoint.display(),
+                        "io_uring requested but the kernel refused to register the rings; \
+                         mounting again over /dev/fuse"
+                    );
+                    let mut config = config;
+                    config.io_uring = false;
+                    mount_path(&view, &mountpoint, &kernel, opts, caps, config)
+                }
+                other => other,
+            }
         }
     }
+}
+
+/// The ring registration refusal [`mount_source`] falls back from.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn registration_refused(error: &std::io::Error) -> bool {
+    fuser::RegistrationRefused::is(error)
+}
+
+#[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+fn registration_refused(_: &std::io::Error) -> bool {
+    false
+}
+
+/// One attempt at mounting `view` at `mountpoint` with `config`.
+fn mount_path<V: Vfs>(
+    view: &Arc<V>,
+    mountpoint: &Path,
+    kernel: &constellation_platform::MountOpts,
+    opts: &MountOptions,
+    caps: FrontendCaps,
+    config: fuser::Config,
+) -> std::io::Result<FuseSession<V>> {
+    let fs = FuseFs::new(view.clone(), caps, opts.tuning);
+    let deferred = fs.deferred().clone();
+    let observer = fs.observer_slot();
+    if privileged() {
+        let fd = mount_fd(mountpoint, kernel)?;
+        let session = match fuser::Session::from_fd(fs, fd, config.acl, config.clone()) {
+            Ok(session) => session,
+            Err(error) => {
+                // The mount exists; a failed handshake must not leave it.
+                let _ = unmount_path(mountpoint, true);
+                return Err(error);
+            }
+        };
+        return FuseSession::new(
+            session,
+            deferred,
+            observer,
+            opts,
+            view.clone(),
+            config,
+            Some(mountpoint.to_path_buf()),
+            None,
+        );
+    }
+    let mut options = vec![fuser::MountOption::FSName(kernel.fsname.clone())];
+    if kernel.default_permissions {
+        options.push(fuser::MountOption::DefaultPermissions);
+    }
+    if kernel.read_only {
+        options.push(fuser::MountOption::RO);
+    }
+    let mut config = config;
+    config.mount_options = options;
+    if kernel.allow_other {
+        config.acl = fuser::SessionACL::All;
+    }
+    let mut session = fuser::Session::new(fs, mountpoint, &config)?;
+    let unmounter = session.unmount_callable();
+    FuseSession::new(
+        session,
+        deferred,
+        observer,
+        opts,
+        view.clone(),
+        config,
+        Some(mountpoint.to_path_buf()),
+        Some(unmounter),
+    )
 }
 
 #[cfg(target_os = "linux")]

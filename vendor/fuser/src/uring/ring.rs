@@ -83,10 +83,27 @@ pub(crate) fn ring_sizes(entries: usize) -> (u32, u32) {
 }
 
 /// The io_uring instance, owned by the ring thread alone; nothing else may touch it.
+///
+/// CONSTELLATION PATCH (io-uring): the instance is one of two backends. `Kernel` is the real
+/// io_uring; `Memory` is `InMemoryRingKernel`'s (`uring::memory`), which decodes the same SQEs
+/// the way the kernel does and answers with the same CQEs, so that everything above this type
+/// -- the ring thread's loop, the entry state machine, the commit protocol, the session -- runs
+/// unchanged in a test with no io_uring, no mount and no root (plan 38 §6).
 pub(crate) struct RingIo {
-    io: IoUring<squeue::Entry128, cqueue::Entry>,
+    io: Backend,
+    /// CQEs reaped right after the REGISTER submit (to see the kernel's synchronous refusals);
+    /// whatever else was among them is handed to the first pass of `serve`.
+    early: SmallVec<[(u64, i32, u32); 8]>,
     #[cfg(test)]
     hooks: test::IoHooks,
+}
+
+/// CONSTELLATION PATCH (io-uring): see `RingIo`.
+/// The kernel's instance is boxed: it is several times the size of the in-memory one, and
+/// lives as long as the ring, so the one allocation buys nothing back by being inline.
+enum Backend {
+    Kernel(Box<IoUring<squeue::Entry128, cqueue::Entry>>),
+    Memory(crate::uring::memory::MemoryRing),
 }
 
 impl RingIo {
@@ -102,10 +119,30 @@ impl RingIo {
             .setup_r_disabled()
             .build(sq_entries)?;
         Ok(Self {
-            io,
+            io: Backend::Kernel(Box::new(io)),
+            early: SmallVec::new(),
             #[cfg(test)]
             hooks: test::IoHooks::default(),
         })
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a ring served by an `InMemoryRingKernel`.
+    pub(crate) fn memory(ring: crate::uring::memory::MemoryRing) -> Self {
+        Self {
+            io: Backend::Memory(ring),
+            early: SmallVec::new(),
+            #[cfg(test)]
+            hooks: test::IoHooks::default(),
+        }
+    }
+
+    /// The real io_uring, for tests that poke at it directly.
+    #[cfg(test)]
+    pub(crate) fn uring(&mut self) -> &mut IoUring<squeue::Entry128, cqueue::Entry> {
+        match &mut self.io {
+            Backend::Kernel(io) => io,
+            Backend::Memory(_) => panic!("not a kernel io_uring"),
+        }
     }
 
     /// Enables the ring and binds the calling thread as its issuer; every later
@@ -113,44 +150,89 @@ impl RingIo {
     fn enable(&mut self) -> io::Result<()> {
         #[cfg(test)]
         self.hooks.before_enable()?;
-        self.io.submitter().register_enable_rings()
+        match &mut self.io {
+            Backend::Kernel(io) => io.submitter().register_enable_rings(),
+            Backend::Memory(_) => Ok(()),
+        }
     }
 
     fn submit(&mut self) -> io::Result<usize> {
         #[cfg(test)]
         self.hooks.before_submit()?;
-        self.io.submit()
+        match &mut self.io {
+            Backend::Kernel(io) => io.submit(),
+            Backend::Memory(m) => m.submit(),
+        }
     }
 
     /// Submits the queue and waits for one CQE; `timed` bounds the wait to 10 ms.
     fn submit_and_wait(&mut self, timed: bool) -> io::Result<usize> {
-        if timed {
-            let ts = types::Timespec::new().nsec(10_000_000);
-            let args = types::SubmitArgs::new().timespec(&ts);
-            self.io.submitter().submit_with_args(1, &args)
-        } else {
-            self.io.submit_and_wait(1)
+        if !self.early.is_empty() {
+            return self.submit();
+        }
+        match &mut self.io {
+            Backend::Kernel(io) if timed => {
+                let ts = types::Timespec::new().nsec(10_000_000);
+                let args = types::SubmitArgs::new().timespec(&ts);
+                io.submitter().submit_with_args(1, &args)
+            }
+            Backend::Kernel(io) => io.submit_and_wait(1),
+            Backend::Memory(m) => m.submit_and_wait(timed),
         }
     }
 
     /// Pushes one SQE, making room with a `submit` when the queue is full. `Err` means the
     /// SQE was not pushed.
     fn push_or_submit(&mut self, sqe: &squeue::Entry128) -> io::Result<()> {
+        let io = match &mut self.io {
+            Backend::Kernel(io) => io,
+            Backend::Memory(m) => {
+                m.push(sqe_bytes(sqe.clone()));
+                return Ok(());
+            }
+        };
         // SAFETY: every buffer an SQE names lives in `Ring::mem`, which stays mapped while a
         // command is pending (`Drop for Ring`), or in a `RingEntry::iov` that lives as long.
-        if unsafe { self.io.submission().push(sqe) }.is_ok() {
+        if unsafe { io.submission().push(sqe) }.is_ok() {
             return Ok(());
         }
-        self.submit()?;
+        {
+            #[cfg(test)]
+            self.hooks.before_submit()?;
+            io.submit()
+        }?;
         // SAFETY: as above.
-        unsafe { self.io.submission().push(sqe) }
+        unsafe { io.submission().push(sqe) }
             .map_err(|_| io::Error::other("submission queue still full after submit"))
     }
+
+    /// Every CQE available now, as `(user_data, res, flags)`, the early ones first.
+    fn reap(&mut self) -> SmallVec<[(u64, i32, u32); 64]> {
+        let mut cqes: SmallVec<[(u64, i32, u32); 64]> = self.early.drain(..).collect();
+        match &mut self.io {
+            Backend::Kernel(io) => {
+                cqes.extend(
+                    io.completion()
+                        .map(|c| (c.user_data(), c.result(), c.flags())),
+                );
+            }
+            Backend::Memory(m) => m.reap(&mut cqes),
+        }
+        cqes
+    }
+}
+
+/// An SQE as the 128 bytes the kernel reads.
+pub(crate) fn sqe_bytes(sqe: squeue::Entry128) -> [u8; 128] {
+    // SAFETY: as in `set_sqe_len`.
+    unsafe { std::mem::transmute(sqe) }
 }
 
 /// State shared between the ring thread and every `RingCommit`.
 pub(crate) struct Ring {
     index: usize,
+    /// CONSTELLATION PATCH (io-uring): entries per queue.
+    depth: u32,
     /// Whether an unmount will end the connection when the session is dropped without
     /// running; `Session::from_fd` sessions have nothing that will.
     mounted: bool,
@@ -164,6 +246,10 @@ pub(crate) struct Ring {
     entries: Box<[RingEntry]>,
     /// Dropped only when `live.in_kernel` is zero; otherwise leaked, see `Drop`.
     mem: ManuallyDrop<RingMemory>,
+    /// CONSTELLATION PATCH (io-uring): fault injection -- every REGISTER names one iovec
+    /// instead of two, which the kernel refuses with `EINVAL` before it records anything
+    /// (`fuse_uring_get_iovec_from_sqe`). Set only through `Config::io_uring_malformed_register`.
+    malformed_register: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     hooks: test::RingHooks,
 }
@@ -189,6 +275,9 @@ struct Live {
     /// Set in the same critical section that decides to exit, so a commit either finds it or
     /// is counted in `in_kernel` before the decision.
     exited: bool,
+    /// CONSTELLATION PATCH (io-uring): per queue of this ring (`RingEntry::queue`), the
+    /// entries a blocking lock request holds (`RingCommit::reserve_lock_wait`).
+    lock_waits: Vec<u32>,
 }
 
 /// Decrements a `Live` count; a count already at zero means the accounting is wrong, which is
@@ -209,7 +298,20 @@ impl Live {
         if state.is_outstanding() {
             dec(&mut self.outstanding, e, "outstanding");
         }
+        self.release_lock_wait(e);
         *state = EntryState::Dead;
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `e` no longer holds its queue's lock-wait budget (its
+    /// reply is committed, or it died); a no-op for an entry that never reserved it.
+    fn release_lock_wait(&mut self, e: &RingEntry) {
+        if e.lock_wait
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(n) = self.lock_waits.get_mut(e.queue as usize) {
+                *n = n.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -235,6 +337,21 @@ pub(crate) struct RingEntry {
     payload_cap: usize,
     iov: EntryIov,
     state: Mutex<EntryState>,
+    /// CONSTELLATION PATCH (io-uring): the handler of the current fetch took the request with
+    /// `RingCommit::hold`, so the ring thread leaves the end of its dispatch to the
+    /// `HeldRequest`. Only the ring thread reads or writes it, around and within a dispatch.
+    held: std::sync::atomic::AtomicBool,
+    /// CONSTELLATION PATCH (io-uring): the position of `qid` among this ring's queues, the
+    /// index of its `Live::lock_waits` count.
+    queue: u32,
+    /// CONSTELLATION PATCH (io-uring): the current fetch counts against its queue's lock-wait
+    /// budget (`RingCommit::reserve_lock_wait`); cleared, under `live`, when it stops holding
+    /// the entry.
+    lock_wait: std::sync::atomic::AtomicBool,
+    /// CONSTELLATION PATCH (io-uring): the current fetch is a blocking lock request served as
+    /// a non-blocking one (`HeldRequest::downgrade_lock_wait`), so a contended answer
+    /// (`EAGAIN`) is committed as `ENOLCK`. Reset at every fetch.
+    lock_downgraded: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -405,6 +522,22 @@ impl RingCommit {
             let header = errno_header(self.commit_id, Errno::EINVAL);
             return self.commit(&[IoSlice::new(header.as_bytes())]);
         }
+        if self
+            .entry()
+            .lock_downgraded
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && iov[0][4..8] == (-Errno::EAGAIN.code()).to_ne_bytes()
+        {
+            // A blocking lock request that was not allowed to wait on this queue
+            // (`HeldRequest::downgrade_lock_wait`): "would block" is not an answer `F_SETLKW` or
+            // a blocking `flock` may give, "no lock resources" is
+            let header = errno_header(self.commit_id, Errno::ENOLCK);
+            return self.commit_unmapped(&[IoSlice::new(header.as_bytes())]);
+        }
+        self.commit_unmapped(iov)
+    }
+
+    fn commit_unmapped(&self, iov: &[IoSlice<'_>]) -> io::Result<()> {
         if let Begun::Direct = self.begin(Some(iov))? {
             // SAFETY: `Committing` makes this thread the only writer; a request slice can
             // only be live if the request had no payload, and it never covers the header
@@ -415,11 +548,26 @@ impl RingCommit {
         Ok(())
     }
 
+    /// `fill_with` with a zeroed buffer, for the tests (replies go through `fill_with`).
+    #[cfg(test)]
+    pub(crate) fn fill<F>(&self, max_len: usize, f: F) -> io::Result<Option<F>>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
+        self.fill_with(max_len, true, f)
+    }
+
     /// Commits a reply whose payload `f` writes into the entry's payload buffer itself.
     /// `Ok(None)` means the reply is done (written, dropped, or answered `EINVAL`);
     /// `Ok(Some(f))` hands the closure back because the request's payload is borrowed, and
     /// the caller commits a heap buffer through `commit` instead.
-    pub(crate) fn fill<F>(&self, max_len: usize, f: F) -> io::Result<Option<F>>
+    ///
+    /// CONSTELLATION PATCH (io-uring): `zero: false` skips zeroing the buffer handed to `f`.
+    /// The gather form writes every byte it reports, so the memset a closure that might not
+    /// is owed would only double the work of the copy it precedes. The bytes `f` sees are
+    /// then whatever the entry held (an earlier request or reply, or the mapping's zeros):
+    /// initialized memory, never anything outside this entry.
+    pub(crate) fn fill_with<F>(&self, max_len: usize, zero: bool, f: F) -> io::Result<Option<F>>
     where
         F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
     {
@@ -448,7 +596,7 @@ impl RingCommit {
                 // SAFETY: `Committing` makes this thread the only writer, and a request slice
                 // can only be live if the request had no payload, so it ends before the
                 // payload area; `max_len <= payload_cap` keeps the slice inside it.
-                let res = unsafe { e.with_payload(max_len, f) };
+                let res = unsafe { e.with_payload(max_len, zero, f) };
                 std::mem::forget(guard);
                 match self.checked(res, max_len) {
                     Ok(n) => {
@@ -510,6 +658,82 @@ impl RingCommit {
         self.ring.hand_off(self.entry(), self.commit_id);
     }
 
+    /// CONSTELLATION PATCH (io-uring): counts this fetch -- a blocking lock request -- against
+    /// its queue's lock-wait budget, if the budget allows: at most `depth - 1` entries of one
+    /// queue may be held by blocking lock requests, so one entry of every queue is always left
+    /// for requests that do not wait on another process.
+    ///
+    /// Why: the kernel queues a request on the queue of the CPU that submitted it and lets it
+    /// wait there until one of that queue's entries is committed; it cannot be answered on any
+    /// other entry, any other queue or `/dev/fuse`. A blocking lock request holds its entry
+    /// until the lock is granted, which may wait on the holder's next request -- a `write()`
+    /// before its unlock. Were all `depth` entries of the holder's CPU's queue held by such
+    /// waiters, that request, and with it the unlock, would never be served: a deadlock no
+    /// `/dev/fuse` session has, where a waiting request holds nothing. `false` means the
+    /// budget is spent; the caller then serves the request without waiting
+    /// (`HeldRequest::downgrade_lock_wait`).
+    pub(crate) fn reserve_lock_wait(&self) -> bool {
+        let e = self.entry();
+        let mut live = self.ring.live.lock();
+        let budget = self.ring.depth.saturating_sub(1);
+        let Some(n) = live.lock_waits.get_mut(e.queue as usize) else {
+            return false;
+        };
+        if *n >= budget {
+            return false;
+        }
+        *n += 1;
+        e.lock_wait
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// CONSTELLATION PATCH (io-uring): takes the fetched request off the ring thread.
+    ///
+    /// Called by a `FetchHandler` during `handle`, on the ring thread, with the request slice
+    /// it was given. The ring thread then returns to its queues at once instead of finishing
+    /// the dispatch: the entry stays fetched -- out of the kernel, its buffers untouched by it
+    /// -- and the returned `HeldRequest` carries the request to whichever thread dispatches
+    /// it, and finishes the dispatch there when it is dropped, exactly as the ring thread
+    /// would have. This is what keeps a callback that blocks (a flush waiting on a remote
+    /// store) from stalling every other request the kernel queues on this ring.
+    pub(crate) fn hold(self, request: &[u8]) -> HeldRequest {
+        let e = self.entry();
+        debug_assert_eq!(
+            self.ring.ring_thread.get(),
+            Some(&thread::current().id()),
+            "a fetch is held by its ring thread, while it dispatches"
+        );
+        let base = e.base.0.as_ptr() as usize;
+        let start = request.as_ptr() as usize;
+        assert!(
+            start >= base && start + request.len() <= base + e.gap + e.payload_cap,
+            "a held request lies in its own entry"
+        );
+        // A reply made while the request is held is stashed, never written at once, even for a
+        // request without a payload: a direct reply re-arms the entry, and the next fetch
+        // into it would be staged over the bytes the held slice still covers
+        match &mut *e.state.lock() {
+            EntryState::Dispatching {
+                direct_ok,
+                commit_id,
+                ..
+            } if *commit_id == self.commit_id => *direct_ok = false,
+            other => panic!(
+                "io_uring: entry {} is {other:?} when its fetch is held; a handler holds a \
+                 fetch before anything replies to it",
+                e.idx
+            ),
+        }
+        e.held.store(true, std::sync::atomic::Ordering::Relaxed);
+        HeldRequest {
+            req: EntryPtr(NonNull::from(request).cast()),
+            len: request.len(),
+            commit: self,
+            rewritten: None,
+        }
+    }
+
     /// Records that a reply object exists for this fetch, so the ring thread does not answer
     /// with an empty reply when dispatch returns without one.
     pub(crate) fn reply_created(&self) {
@@ -523,6 +747,87 @@ impl RingCommit {
                 *reply_taken = true;
             }
         }
+    }
+}
+
+/// CONSTELLATION PATCH (io-uring): a fetched request whose dispatch continues off the ring
+/// thread (`RingCommit::hold`).
+///
+/// **The borrow invariant, upheld here and only here.** `request()` is a slice of the entry's
+/// own stride -- the staged header and, for a `FUSE_WRITE` or `FUSE_SETXATTR`, the payload the
+/// kernel copied in, so a write's bytes reach the filesystem with no copy at all. It stays
+/// valid exactly as long as this value: the entry cannot be re-armed (`COMMIT_AND_FETCH`)
+/// before `Drop` has run `Ring::finish_dispatch`, because until then the entry is
+/// `Dispatching` with `direct_ok` cleared by `hold` (counted `outstanding`, never `Pending`), so
+/// a reply made meanwhile, from any thread, is stashed (`Deferred`) and written by that
+/// `finish_dispatch`, after the last use of the slice. `request()` borrows `self`, so
+/// no slice can outlive the drop; and the `Arc<Ring>` in `commit` keeps the mapping alive even
+/// if the ring thread has exited meanwhile.
+///
+/// Holding takes the request off the ring *thread*, not off its *entry*: the entry stays
+/// fetched until the request is answered, however late and from whatever thread, and while
+/// every entry of a queue is fetched the kernel holds that CPU's further requests back. A
+/// request whose answer waits on another request from the same CPU can therefore deadlock
+/// the queue; for blocking locks, the one such request a filesystem has, see
+/// `RingCommit::reserve_lock_wait`.
+pub(crate) struct HeldRequest {
+    commit: RingCommit,
+    req: EntryPtr,
+    len: usize,
+    /// A rewritten copy of the request, served instead of the entry's
+    /// (`downgrade_lock_wait`).
+    rewritten: Option<Box<[u8]>>,
+}
+
+impl HeldRequest {
+    /// The handle a reply to this request commits through (it may be cloned and outlive this).
+    pub(crate) fn commit(&self) -> &RingCommit {
+        &self.commit
+    }
+
+    /// The contiguous request, as the ring thread's handler was given it.
+    pub(crate) fn request(&self) -> &[u8] {
+        if let Some(rewritten) = &self.rewritten {
+            return rewritten;
+        }
+        // SAFETY: see the type's doc: `[req, req + len)` is inside the entry and nothing writes
+        // it until `Drop` finishes the dispatch, which `&self` outlives.
+        unsafe { slice::from_raw_parts(self.req.0.as_ptr(), self.len) }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): serves this `FUSE_SETLKW` as a `FUSE_SETLK`, because
+    /// its queue's lock-wait budget is spent (`RingCommit::reserve_lock_wait`): granted at
+    /// once if the lock is free, and a conflict answered `ENOLCK` instead of waiting on an
+    /// entry the queue cannot spare. The request is small (a header and a `fuse_lk_in`), so it
+    /// is copied rather than rewritten in the entry.
+    pub(crate) fn downgrade_lock_wait(&mut self) {
+        let mut copy: Box<[u8]> = self.request().into();
+        if let Some(opcode) = copy.get_mut(4..8) {
+            opcode.copy_from_slice(&(abi::fuse_opcode::FUSE_SETLK as u32).to_ne_bytes());
+        }
+        self.rewritten = Some(copy);
+        self.commit
+            .entry()
+            .lock_downgraded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl fmt::Debug for HeldRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeldRequest")
+            .field("commit", &self.commit)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl Drop for HeldRequest {
+    fn drop(&mut self) {
+        let e = self.commit.entry();
+        self.commit
+            .ring
+            .finish_dispatch(e, self.commit.commit_id, true);
     }
 }
 
@@ -589,18 +894,22 @@ impl RingEntry {
         }
     }
 
-    /// Runs `f` on the first `len` bytes of the payload area, zeroed.
+    /// Runs `f` on the first `len` bytes of the payload area, zeroed when `zero`.
     ///
     /// # Safety
     ///
     /// As for `write_reply`, `len <= payload_cap`, and no other reference into the payload
     /// area exists while `f` runs.
-    unsafe fn with_payload<R>(&self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    unsafe fn with_payload<R>(&self, len: usize, zero: bool, f: impl FnOnce(&mut [u8]) -> R) -> R {
         // SAFETY: `[gap, gap + len)` is inside the stride and, by the caller's guarantee,
-        // aliased by nothing else while the slice is live.
+        // aliased by nothing else while the slice is live. Unzeroed, its bytes are still
+        // initialized: the mapping is anonymous memory, written since only by the kernel and
+        // this entry's own requests and replies.
         let buf = unsafe {
             let payload = self.base.0.as_ptr().add(self.gap);
-            ptr::write_bytes(payload, 0, len);
+            if zero {
+                ptr::write_bytes(payload, 0, len);
+            }
             slice::from_raw_parts_mut(payload, len)
         };
         f(buf)
@@ -699,11 +1008,16 @@ impl Ring {
                     payload_cap: mem.payload_cap(),
                     iov: EntryIov(iov),
                     state: Mutex::new(EntryState::Dead),
+                    held: std::sync::atomic::AtomicBool::new(false),
+                    queue: idx as u32 / depth,
+                    lock_wait: std::sync::atomic::AtomicBool::new(false),
+                    lock_downgraded: std::sync::atomic::AtomicBool::new(false),
                 }
             })
             .collect();
         Ok(Arc::new(Ring {
             index,
+            depth,
             mounted,
             device,
             ring_thread: OnceLock::new(),
@@ -717,9 +1031,11 @@ impl Ring {
                 shutdown: false,
                 abandon: false,
                 exited: false,
+                lock_waits: vec![0; qids.len()],
             }),
             entries,
             mem: ManuallyDrop::new(mem),
+            malformed_register: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             hooks: test::RingHooks::default(),
         }))
@@ -764,7 +1080,21 @@ impl Ring {
         .addr(Some(e.iov.0.as_ptr() as u64))
         .build()
         .user_data(user_data(e.qid, e.idx));
-        set_sqe_len(sqe, 2)
+        let segments = if self
+            .malformed_register
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            1
+        } else {
+            2
+        };
+        set_sqe_len(sqe, segments)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see `Ring::malformed_register`.
+    pub(crate) fn set_malformed_register(&self) {
+        self.malformed_register
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn commit_sqe(&self, e: &RingEntry, commit_id: u64) -> squeue::Entry128 {
@@ -861,6 +1191,13 @@ impl Ring {
     }
 
     /// Pushes one REGISTER per entry plus the eventfd poll and submits once.
+    ///
+    /// CONSTELLATION PATCH (io-uring): the kernel validates a REGISTER when it is issued, inside
+    /// that very `io_uring_enter`, and posts a refusal's CQE before the call returns; an
+    /// accepted one completes only with a fetch. So the CQEs present right after the submit are
+    /// the refusals, and one is an error here -- `RegistrationRefused`, which the session
+    /// returns from its constructor -- rather than a fatal CQE in `serve` once the session
+    /// already runs, with every request on the mount blocked on queues that never become ready.
     fn register_all(&self, io: &mut RingIo) -> io::Result<()> {
         self.live.lock().in_kernel = self.entries.len();
         for e in &self.entries {
@@ -869,6 +1206,32 @@ impl Ring {
         }
         self.arm_wake(io)?;
         io.submit()?;
+        let early = io.reap();
+        #[cfg(test)]
+        let early_check = !io.hooks.refusals_in_serve;
+        #[cfg(not(test))]
+        let early_check = true;
+        let refused = early
+            .iter()
+            .find(|&&(ud, res, _)| early_check && ud != WAKE && res < 0);
+        if let Some(&(ud, res, _)) = refused {
+            // The refused entries never reached the kernel; whichever were accepted are
+            // cancelled when this ring's io_uring is closed, and keep the mapping alive till then
+            for &(ud, res, _) in &early {
+                let (qid, idx) = decode(ud);
+                let e = self.entries.get(idx as usize).filter(|e| e.qid == qid);
+                if let (true, Some(e)) = (ud != WAKE && res < 0, e) {
+                    self.retire(e, None);
+                }
+            }
+            let (qid, _) = decode(ud);
+            return Err(crate::uring::RegistrationRefused::error(
+                self.index,
+                qid,
+                io::Error::from_raw_os_error(-res),
+            ));
+        }
+        io.early.extend(early);
         Ok(())
     }
 
@@ -976,6 +1339,7 @@ impl Ring {
                 return;
             }
             dec(&mut live.outstanding, e, "outstanding");
+            live.release_lock_wait(e);
             *state = EntryState::Pending { commit_id };
             live.in_kernel += 1;
             live.pending.push(e.idx);
@@ -1027,11 +1391,7 @@ impl Ring {
                 }
                 Err(e) => return Err(e),
             }
-            let cqes: SmallVec<[(u64, i32, u32); 64]> = io
-                .io
-                .completion()
-                .map(|c| (c.user_data(), c.result(), c.flags()))
-                .collect();
+            let cqes = io.reap();
             for (ud, res, flags) in cqes {
                 if ud == WAKE {
                     let failed = if res < 0 {
@@ -1185,9 +1545,14 @@ impl Ring {
             dec(&mut live.in_kernel, e, "in-kernel");
             live.outstanding += 1;
         }
+        e.held.store(false, std::sync::atomic::Ordering::Relaxed);
+        e.lock_downgraded
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         {
             // SAFETY: `stage_request` made `[req, req + len)` one contiguous request inside
-            // the stride; the slice ends with this block, before the entry is touched again.
+            // the stride; the slice ends with this block, before the entry is touched again
+            // (a handler that kept it did so through `RingCommit::hold`, whose `HeldRequest`
+            // ends the dispatch itself).
             let request = unsafe { slice::from_raw_parts(staged.req.as_ptr(), staged.len) };
             let commit = RingCommit {
                 ring: Arc::clone(self),
@@ -1196,6 +1561,19 @@ impl Ring {
             };
             handler.handle(commit, request);
         }
+        if e.held.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        self.finish_dispatch(e, commit_id, false);
+    }
+
+    /// The end of a dispatch: a reply stashed during it is written now, a request the
+    /// filesystem was given no reply object for is answered with an empty one, and otherwise
+    /// the entry waits for its reply as `Dispatched`. Run by the ring thread right after its
+    /// handler returns, or -- CONSTELLATION PATCH (io-uring) -- by a `HeldRequest`'s drop on
+    /// the thread that took the dispatch over (`held`), where the ring may have exited
+    /// meanwhile and left the entry `Dead`.
+    fn finish_dispatch(&self, e: &RingEntry, commit_id: u64, held: bool) {
         let reply: Option<(Vec<u8>, u64)> = {
             let mut state = e.state.lock();
             match &mut *state {
@@ -1223,6 +1601,8 @@ impl Ring {
                 }
                 // A reply already happened, or another thread is writing one right now
                 EntryState::Pending { .. } | EntryState::Committing => None,
+                // The ring exited while a held dispatch ran; a reply would have nowhere to go
+                EntryState::Dead if held => None,
                 other @ (EntryState::InKernel { .. }
                 | EntryState::Dispatched { .. }
                 | EntryState::Dead) => panic!(
@@ -1287,6 +1667,10 @@ pub(crate) mod test {
         submits: usize,
         /// Errno `enable` fails with instead of enabling the ring.
         fail_enable: Option<i32>,
+        /// CONSTELLATION PATCH (io-uring): leave the REGISTER refusals `register_all` sees at
+        /// once to `serve`, as before it checked for them -- for the tests that use a non-FUSE
+        /// device's synchronous `EOPNOTSUPP` to exercise `serve`'s handling of a fatal CQE.
+        pub(super) refusals_in_serve: bool,
     }
 
     impl IoHooks {
@@ -1339,11 +1723,6 @@ pub(crate) mod test {
         }
     }
 
-    fn sqe_bytes(sqe: squeue::Entry128) -> [u8; 128] {
-        // SAFETY: as in `set_sqe_len`.
-        unsafe { std::mem::transmute(sqe) }
-    }
-
     fn sqe_from_bytes(raw: [u8; 128]) -> squeue::Entry128 {
         // SAFETY: as in `set_sqe_len`.
         unsafe { std::mem::transmute(raw) }
@@ -1392,7 +1771,10 @@ pub(crate) mod test {
     /// `None` when the environment forbids io_uring or the kernel predates the setup flags
     fn try_ring_io(sq: u32, cq: u32) -> Option<RingIo> {
         match RingIo::open(sq, cq) {
-            Ok(io) => Some(io),
+            Ok(mut io) => {
+                io.hooks.refusals_in_serve = true;
+                Some(io)
+            }
             Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => {
                 eprintln!("skipping: io_uring_setup failed with {e}");
                 None
@@ -1581,8 +1963,8 @@ pub(crate) mod test {
     /// with 0 as if the flag were not there
     fn nop_results_supported(io: &mut RingIo) -> bool {
         io.push_or_submit(&nop_with_result(WAKE - 1, -42)).unwrap();
-        io.io.submit_and_wait(1).unwrap();
-        let res = io.io.completion().next().unwrap().result();
+        io.uring().submit_and_wait(1).unwrap();
+        let res = io.uring().completion().next().unwrap().result();
         match res {
             -42 => true,
             0 => {
@@ -1763,13 +2145,13 @@ pub(crate) mod test {
         let (err, mut io) = thread::spawn(move || {
             let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
             io.push_or_submit(&nop).unwrap();
-            (io.io.submit().unwrap_err(), io)
+            (io.uring().submit().unwrap_err(), io)
         })
         .join()
         .unwrap();
         assert_eq!(errno_of(&err), Some(libc::EEXIST), "{err}");
-        assert_eq!(io.io.submit_and_wait(1).unwrap(), 1);
-        let cqe = io.io.completion().next().unwrap();
+        assert_eq!(io.uring().submit_and_wait(1).unwrap(), 1);
+        let cqe = io.uring().completion().next().unwrap();
         assert_eq!((cqe.user_data(), cqe.result()), (WAKE - 1, 0));
     }
 
@@ -1780,7 +2162,7 @@ pub(crate) mod test {
         };
         let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
         io.push_or_submit(&nop).unwrap();
-        let err = io.io.submit().unwrap_err();
+        let err = io.uring().submit().unwrap_err();
         assert_eq!(errno_of(&err), Some(libc::EBADFD), "{err}");
     }
 
@@ -1923,7 +2305,7 @@ pub(crate) mod test {
         ring.register_all(&mut io).unwrap();
         // 20 REGISTERs and the poll: the queue fills after 8 and 16, then the final submit
         assert_eq!(io.hooks.submits, 3);
-        assert_eq!(io.io.submission().len(), 0);
+        assert_eq!(io.uring().submission().len(), 0);
         assert_eq!(ring.live.lock().in_kernel, 20);
         for e in &ring.entries {
             assert_eq!(last_command(e), Some(0));
@@ -2038,7 +2420,7 @@ pub(crate) mod test {
 
         let (outcome, mut io) = served.finish();
         outcome.unwrap();
-        assert!(io.io.submission().is_empty());
+        assert!(io.uring().submission().is_empty());
     }
 
     #[test]
@@ -2422,6 +2804,171 @@ pub(crate) mod test {
             .expect("handle_fetch deadlocked or panicked");
     }
 
+    /// CONSTELLATION PATCH (io-uring): a held fetch leaves the ring thread at once; a reply
+    /// made while it is held -- even one without a payload, from another thread -- is stashed
+    /// rather than written, so the entry is not re-armed under the held slice, and goes out
+    /// when the `HeldRequest` is dropped.
+    #[test]
+    fn a_held_fetch_finishes_where_it_is_dropped() {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let ring = fake_ring(1, true);
+            ring.ring_thread.set(thread::current().id()).ok();
+            let e = &ring.entries[0];
+            // No payload: an unheld fetch of it could be answered directly
+            fake_fetch(e, 11, fuse_opcode::FUSE_GETATTR, &[0u8; 16], &[]);
+            set_in_kernel(&ring, 0, 0);
+            let mut held = None;
+            let mut handler = |commit: RingCommit, request: &[u8]| {
+                held = Some(commit.hold(request));
+            };
+            ring.handle_fetch(e, &mut handler);
+            let held = held.unwrap();
+            // The ring thread is done with it, the entry is not
+            assert_eq!(state_name(e), "Dispatching");
+            assert_eq!(ring.live.lock().outstanding, 1);
+            let before = held.request().to_vec();
+            let commit = held.commit().clone();
+            thread::spawn(move || commit.commit_errno(Errno::ENOENT))
+                .join()
+                .unwrap();
+            assert_eq!(state_name(e), "Deferred", "stashed, not written");
+            assert!(ring.live.lock().pending.is_empty(), "not re-armed");
+            assert_eq!(held.request(), &before[..], "the held slice is intact");
+            assert_eq!(AnyRequest::try_from(held.request()).unwrap().unique().0, 11);
+            drop(held);
+            assert_eq!(state_name(e), "Pending");
+            assert_eq!(ring.live.lock().pending, [0]);
+            let (len, error, unique, _) = reply_fields(e);
+            assert_eq!((len, error, unique), (16, -libc::ENOENT, 11));
+            ring.live.lock().in_kernel = 0;
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a held fetch deadlocked or panicked");
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a held fetch with no reply object answers itself with
+    /// an empty reply when dropped, as an unheld one does when its dispatch returns; one whose
+    /// reply object outlives it waits for that reply, which then commits directly.
+    #[test]
+    fn a_held_fetch_without_a_reply_is_answered_and_one_with_waits() {
+        let ring = fake_ring(2, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        for idx in 0..2 {
+            fake_fetch(&ring.entries[idx], 20 + idx as u64, fuse_opcode::FUSE_FLUSH, &[0u8; 24], &[]);
+            set_in_kernel(&ring, idx, 0);
+        }
+        let mut held = Vec::new();
+        let mut hold = |commit: RingCommit, request: &[u8]| held.push(commit.hold(request));
+        ring.handle_fetch(&ring.entries[0], &mut hold);
+        ring.handle_fetch(&ring.entries[1], &mut hold);
+        let second = held.pop().unwrap();
+        drop(held);
+        assert_eq!(state_name(&ring.entries[0]), "Pending", "answered empty");
+        assert_eq!(reply_fields(&ring.entries[0]).1, 0);
+        second.commit().reply_created();
+        let commit = second.commit().clone();
+        drop(second);
+        assert_eq!(state_name(&ring.entries[1]), "Dispatched");
+        thread::spawn(move || commit.commit_errno(Errno::EIO))
+            .join()
+            .unwrap();
+        assert_eq!(state_name(&ring.entries[1]), "Pending");
+        assert_eq!(reply_fields(&ring.entries[1]).1, -libc::EIO);
+        ring.live.lock().in_kernel = 0;
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a ring that leaves while a fetch is held (the session
+    /// shut down) leaves the held dispatch nothing to answer: no panic, no write.
+    #[test]
+    fn a_held_fetch_outlives_its_ring_thread() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        fake_fetch(e, 30, fuse_opcode::FUSE_FSYNC, &[0u8; 16], &[]);
+        set_in_kernel(&ring, 0, 0);
+        let mut held = None;
+        ring.handle_fetch(e, &mut |c: RingCommit, r: &[u8]| held = Some(c.hold(r)));
+        let held = held.unwrap();
+        ring.live.lock().exited = true;
+        held.commit().commit_errno(Errno::EIO);
+        assert_eq!(state_name(e), "Dead");
+        drop(held);
+        assert_eq!(state_name(e), "Dead");
+        assert!(ring.live.lock().pending.is_empty());
+    }
+
+    /// CONSTELLATION PATCH (io-uring): plan 38 §3(b)'s write side. A `FUSE_WRITE` fetched over
+    /// a ring reaches the filesystem as a slice of the entry's own payload buffer -- the bytes
+    /// the kernel copied in, not a copy of them -- whether the ring thread dispatches it or an
+    /// offload thread does through a `HeldRequest`.
+    #[test]
+    fn a_ring_write_borrows_the_entry_payload() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        let payload_at = e.base.0.as_ptr() as usize + e.gap;
+        let mut write_in = [0u8; 40];
+        write_in[16..20].copy_from_slice(&5u32.to_ne_bytes());
+        for hold in [false, true] {
+            fake_fetch(e, 40, fuse_opcode::FUSE_WRITE, &write_in, b"world");
+            set_in_kernel(&ring, 0, 0);
+            let mut held = None;
+            let mut seen = None;
+            ring.handle_fetch(e, &mut |c: RingCommit, request: &[u8]| {
+                if hold {
+                    held = Some(c.hold(request));
+                    return;
+                }
+                let req = AnyRequest::try_from(request).unwrap();
+                let Ok(Operation::Write(w)) = req.operation() else {
+                    panic!("not a write")
+                };
+                seen = Some((w.data().as_ptr() as usize, w.data().to_vec()));
+            });
+            if let Some(held) = held {
+                let req = AnyRequest::try_from(held.request()).unwrap();
+                let Ok(Operation::Write(w)) = req.operation() else {
+                    panic!("not a write")
+                };
+                seen = Some((w.data().as_ptr() as usize, w.data().to_vec()));
+            }
+            assert_eq!(seen, Some((payload_at, b"world".to_vec())), "held: {hold}");
+            *e.state.lock() = EntryState::Dead;
+            let mut live = ring.live.lock();
+            (live.in_kernel, live.outstanding) = (0, 0);
+            live.pending.clear();
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `fill_with(.., zero: false, ..)` hands the closure the
+    /// entry's bytes as they are, and `fill` zeroes them.
+    #[test]
+    fn an_unzeroed_fill_sees_the_entry_as_it_was() {
+        let ring = fake_ring(1, true);
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        poison_payload(e);
+        let seen = |zero: bool| {
+            let commit = fake_dispatched(&ring, 0, 5);
+            let mut first = 0u8;
+            commit
+                .fill_with(16, zero, |buf| {
+                    first = buf[0];
+                    Ok(0)
+                })
+                .unwrap();
+            *e.state.lock() = EntryState::Dead;
+            ring.live.lock().in_kernel -= 1;
+            ring.live.lock().pending.clear();
+            first
+        };
+        assert_ne!(seen(false), 0, "the poison is still there");
+        assert_eq!(seen(true), 0);
+    }
+
     #[test]
     fn direct_reply_and_reply_taken() {
         let ring = fake_ring(2, true);
@@ -2720,8 +3267,8 @@ pub(crate) mod test {
         let fill_queue = |io: &mut RingIo| {
             let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
             // SAFETY: a Nop names no buffers.
-            while unsafe { io.io.submission().push(&nop) }.is_ok() {}
-            assert!(io.io.submission().is_full());
+            while unsafe { io.uring().submission().push(&nop) }.is_ok() {}
+            assert!(io.uring().submission().is_full());
         };
         let queue = |idx: u32, commit_id: u64| {
             *ring.entries[idx as usize].state.lock() = EntryState::Pending { commit_id };
@@ -2741,7 +3288,7 @@ pub(crate) mod test {
         assert!(live.pending.is_empty());
         assert_eq!(errno_of(live.fatal.as_ref().unwrap()), Some(libc::EBUSY));
         drop(live);
-        assert!(io.io.submission().is_full(), "the SQE was never pushed");
+        assert!(io.uring().submission().is_full(), "the SQE was never pushed");
 
         // A ring-level errno from the room-making submit ends the loop with the entry neither
         // pushed nor retired, which is why the mapping is then leaked
@@ -2766,7 +3313,7 @@ pub(crate) mod test {
         io.hooks.fail_submit = Some(libc::EBUSY);
         ring.flush_pending(&mut io).unwrap();
         assert_eq!(last_command(&ring.entries[0]), Some(83));
-        assert_eq!(io.io.submission().len(), 1);
+        assert_eq!(io.uring().submission().len(), 1);
         assert_eq!(
             io.hooks.fail_submit,
             Some(libc::EBUSY),
@@ -2924,7 +3471,7 @@ pub(crate) mod test {
         let commit = fake_dispatched(&ring, 0, 41);
         let addr = payload_addr(e);
         let handed_back = commit
-            .fill(8, |buf| {
+            .fill_with(8, true, |buf| {
                 assert_eq!(buf.len(), 8);
                 assert_eq!(buf, [0; 8]);
                 assert_eq!(
@@ -2948,7 +3495,7 @@ pub(crate) mod test {
         poison_payload(e);
         let commit = fake_dispatched(&ring, 0, 42);
         commit
-            .fill(8, |buf| {
+            .fill_with(8, true, |buf| {
                 buf[..3].copy_from_slice(b"abc");
                 Ok(8)
             })

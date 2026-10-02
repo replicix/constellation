@@ -26,6 +26,8 @@ io-uring = ["fuser/io-uring"]
 # `MockVfs` (tests/wire.rs): the adapter driven by a fake kernel over a
 # socket pair, against a recording, scriptable `Vfs`.
 constellation-vfs = { workspace = true, features = ["mock"] }
+# `tests/wire_uring.rs`: multi-segment `ReadData`.
+bytes.workspace = true
 # The handover tests (`session.rs`): a mountpoint, the wire round trips.
 tempfile.workspace = true
 serde_json.workspace = true

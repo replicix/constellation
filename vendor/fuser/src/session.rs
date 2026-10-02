@@ -55,6 +55,8 @@ use crate::request::RequestWithSender;
 use crate::uring::RingSet;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use crate::uring::ring::RingCommit;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use crate::uring::ring::HeldRequest;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -990,6 +992,8 @@ impl<FS: Filesystem> Session<FS> {
             self.config.n_threads.unwrap_or(1),
             self.config.io_uring_queue_depth,
             payload_cap,
+            self.config.io_uring_kernel.as_ref(),
+            self.config.io_uring_malformed_register,
         )
     }
 
@@ -1084,13 +1088,92 @@ struct RingHandler<FS: Filesystem> {
     /// A callback panicked on this ring: it no longer enters the filesystem, as a `/dev/fuse`
     /// reader that died does not either; other rings and the reader are unaffected
     panicked: bool,
+    /// CONSTELLATION PATCH (io-uring): where requests that may block are dispatched instead
+    /// of on this thread (`dispatch_on_ring`).
+    offload: std::sync::mpsc::Sender<HeldRequest>,
+    /// CONSTELLATION PATCH (io-uring): a callback panicked on an offload thread. The offload
+    /// threads serve every ring, so every ring stops entering the filesystem then, as this one
+    /// does after a panic of its own (`panicked`).
+    offload_panicked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// CONSTELLATION PATCH (io-uring): whether a ring thread dispatches a request with this
+/// opcode itself, rather than handing it to the session's offload threads.
+///
+/// A ring thread serves every request the kernel queues on its CPUs' queues, one at a time,
+/// so a callback that blocks on it blocks them all -- a `stat` behind a `close` whose flush
+/// waits on a remote store (plan 38 Z1b: `s3-cut-one-node` on the ring leg). A `/dev/fuse`
+/// session has no such coupling: any of its `n_threads` readers takes the next request.
+/// So only reads of data and of metadata that a filesystem answers from what it holds stay on
+/// the ring, where the transport's saving is the whole point; a filesystem that must wait for
+/// the data can reply from another thread (`ReplyData` is `Send`). Everything that creates,
+/// changes, opens, syncs, locks or flushes -- the operations that wait for leases, for a
+/// remote store, for another node -- directory listings (a listing from its start may ask
+/// another node for a read position first, as a lookup may), and every opcode this list
+/// does not know is offloaded: one thread hop, then exactly the dispatch the ring thread
+/// would have made, with the request still in the entry's buffers (`HeldRequest`).
+///
+/// "Answers from what it holds" is not "never waits": a callback on this list may still wait
+/// for a bounded time on its own node -- Constellation's `getattr`, `readlink` and xattr reads
+/// wait for the local replica to catch up with this node's own writes (at most
+/// `CONSTELLATION_SESSION_WAIT_MS`, then answer anyway), and any op may queue at the view's
+/// admission gate when `max_inflight_ops` is set -- exactly the waits a read already has.
+/// What it never does is wait on a remote store, a lease or another node's answer.
+///
+/// An offloaded request still holds its ring entry until it is answered, as does a read the
+/// filesystem answers later from another thread. That is what bounds blocking lock requests
+/// per queue (`RingCommit::reserve_lock_wait`).
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub(crate) fn dispatch_on_ring(opcode: u32) -> bool {
+    use crate::ll::fuse_abi::fuse_opcode::*;
+    matches!(
+        crate::ll::fuse_abi::fuse_opcode::try_from(opcode),
+        Ok(FUSE_READ
+            | FUSE_GETATTR
+            | FUSE_READLINK
+            | FUSE_GETXATTR
+            | FUSE_LISTXATTR
+            | FUSE_STATFS
+            | FUSE_ACCESS
+            | FUSE_RELEASEDIR
+            | FUSE_DESTROY)
+    )
 }
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 impl<FS: Filesystem> crate::uring::ring::FetchHandler for RingHandler<FS> {
     fn handle(&mut self, commit: RingCommit, request: &[u8]) {
-        if self.panicked {
+        if self.panicked || self.offload_panicked.load(Ordering::SeqCst) {
             return commit.commit_errno(Errno::EIO);
+        }
+        // `fuse_in_header.opcode`; a request too short to have one is the parser's to refuse
+        let opcode = request
+            .get(4..8)
+            .map_or(u32::MAX, |b| u32::from_ne_bytes(b.try_into().unwrap()));
+        if request.len() >= 8 && !dispatch_on_ring(opcode) {
+            // The receiving end lives as long as any sender; if the offload threads are gone
+            // (spawning them failed part way), the request is served here after all
+            let mut held = commit.hold(request);
+            if opcode == crate::ll::fuse_abi::fuse_opcode::FUSE_SETLKW as u32
+                && !held.commit().reserve_lock_wait()
+            {
+                // This queue already has `depth - 1` blocking lock requests waiting on their
+                // entries; one more could take its last, which the lock holder's next request
+                // may need (`RingCommit::reserve_lock_wait`)
+                held.downgrade_lock_wait();
+            }
+            let Err(std::sync::mpsc::SendError(held)) = self.offload.send(held) else {
+                return;
+            };
+            let ctx = &self.ctx;
+            let dispatch = std::panic::AssertUnwindSafe(|| {
+                ctx.handle_fetch(held.commit().clone(), held.request())
+            });
+            if std::panic::catch_unwind(dispatch).is_err() {
+                self.panicked = true;
+                let _ = self.exit.events.send(Event::Panicked);
+            }
+            return;
         }
         // A ring thread must outlive its panicking callback: only it can submit the EIO the
         // unwind committed, and its kernel commands hold the mount's queues
@@ -1103,8 +1186,43 @@ impl<FS: Filesystem> crate::uring::ring::FetchHandler for RingHandler<FS> {
     }
 }
 
+/// CONSTELLATION PATCH (io-uring): one offload thread: dispatches what ring threads hand it
+/// (`dispatch_on_ring`), until every ring thread is gone.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn offload_thread<FS: Filesystem>(
+    ctx: SessionEventLoop<FS>,
+    jobs: Arc<Mutex<std::sync::mpsc::Receiver<HeldRequest>>>,
+    events: std::sync::mpsc::Sender<Event>,
+    panicked: Arc<std::sync::atomic::AtomicBool>,
+) -> io::Result<()> {
+    loop {
+        let held = jobs.lock().recv();
+        let Ok(held) = held else {
+            return Ok(());
+        };
+        if panicked.load(Ordering::SeqCst) {
+            held.commit().commit_errno(Errno::EIO);
+            continue;
+        }
+        let dispatch = std::panic::AssertUnwindSafe(|| {
+            ctx.handle_fetch(held.commit().clone(), held.request())
+        });
+        if std::panic::catch_unwind(dispatch).is_err() {
+            // As on a ring thread: the reply went out as EIO during the unwind, later requests
+            // are answered EIO here, and the session ends with the panic
+            panicked.store(true, Ordering::SeqCst);
+            let _ = events.send(Event::Panicked);
+        }
+        // Dropping `held` ends the dispatch (`HeldRequest`'s doc), here and not on the ring
+    }
+}
+
 /// Serves the session over its rings, with one `/dev/fuse` reader for the requests the kernel
 /// never sends over a ring, until the connection ends or a thread fails.
+///
+/// CONSTELLATION PATCH (io-uring): plus `n_threads` offload threads for the requests a ring
+/// thread does not dispatch itself (`dispatch_on_ring`), so that a callback that blocks holds
+/// up one offload thread, as it holds up one reader of a `/dev/fuse` session, and not a ring.
 ///
 /// The ring threads have no way to learn that the connection ended while every entry they
 /// own is held by userspace, so they are told to leave once the `/dev/fuse` reader has seen
@@ -1113,6 +1231,12 @@ impl<FS: Filesystem> crate::uring::ring::FetchHandler for RingHandler<FS> {
 /// to exit with the connection, which is still alive at that point and is not told to shut
 /// down: `Session::run` callers end it by dropping the mount, a `Session::spawn` session
 /// keeps it, answering EIO, until the `BackgroundSession` is dropped.
+///
+/// CONSTELLATION PATCH (io-uring): the offload threads are joined last on the clean path, and
+/// on the others left to exit with the ring threads that feed them, for the same reason: an
+/// offload thread leaves once every ring thread is gone, a ring thread once the connection
+/// ends, and `run`'s caller ends the connection only after `run` returns -- joining them on a
+/// panic or error path would hang `run` instead of reporting the failure.
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 fn serve_ring<FS: Filesystem>(
     mut ring: RingSet,
@@ -1125,6 +1249,28 @@ fn serve_ring<FS: Filesystem>(
         debug!("clone_fd has no effect with io_uring");
     }
     let (events_tx, events) = std::sync::mpsc::channel();
+    let (offload_tx, offload_rx) = std::sync::mpsc::channel::<HeldRequest>();
+    let offload_rx = Arc::new(Mutex::new(offload_rx));
+    let offload_panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let offload = spawn_named((0..config.n_threads.unwrap_or(1).max(1)).map(|i| {
+        let name = format!("fuser-offload-{i}");
+        let ctx = event_loop(name.clone(), ch.clone());
+        let (jobs, events, panicked) = (
+            offload_rx.clone(),
+            events_tx.clone(),
+            offload_panicked.clone(),
+        );
+        (name, move || offload_thread(ctx, jobs, events, panicked))
+    }));
+    drop(offload_rx);
+    let offload = match offload {
+        Ok(threads) => threads,
+        // The ring threads dispatch everything themselves then (`RingHandler::handle`)
+        Err(err) => {
+            error!("spawning the io_uring offload threads failed ({err}); dispatching on the rings");
+            Vec::new()
+        }
+    };
     ring.serve(|index| {
         Box::new(RingHandler {
             ctx: event_loop(format!("fuser-ring-{index}"), ch.clone()),
@@ -1133,8 +1279,13 @@ fn serve_ring<FS: Filesystem>(
                 thread: index + 1,
             },
             panicked: false,
+            offload: offload_tx.clone(),
+            offload_panicked: offload_panicked.clone(),
         })
     })?;
+    // Only the ring threads' handlers hold senders now: the offload threads leave once the
+    // last ring thread is gone and its queued requests are served.
+    drop(offload_tx);
     let dev = spawn_named([("fuser-dev".to_string(), {
         let event_loop = event_loop("fuser-dev".to_string(), ch);
         let exit = ExitNotice {
@@ -1178,7 +1329,8 @@ fn serve_ring<FS: Filesystem>(
             Event::Exited(DEV) => {
                 join_all(threads[DEV].take())?;
                 ring.shutdown();
-                return join_all(threads.into_iter().flatten());
+                join_all(threads.into_iter().flatten())?;
+                return join_all(offload);
             }
             // A ring leaving cleanly before the reader means the connection is ending
             Event::Exited(thread) => join_all(threads[thread].take())?,
@@ -1318,9 +1470,8 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                 return commit.commit_errno(Errno::EIO);
             }
         };
-        // TODO(38-z2a): this runs on the ring thread itself, so a request that blocks here
-        // (a flush/release/fsync waiting on S3) stalls every other request the kernel queues
-        // on this ring; offload blocking ops or hand fetched entries to a worker pool.
+        // CONSTELLATION PATCH (io-uring): on the ring thread for what `dispatch_on_ring`
+        // keeps there, on an offload thread for the rest (`offload_thread`).
         let req = RequestWithSender::from_request(ReplySender::Ring(commit), request);
         if let Ok(Operation::Destroy(_)) = req.request.operation() {
             req.reply::<ReplyEmpty>().ok();
@@ -3577,6 +3728,54 @@ mod uring_test {
         m.finish();
     }
 
+    /// CONSTELLATION PATCH (io-uring): a REGISTER the kernel refuses after the INIT reply has
+    /// committed the connection to rings fails the constructor with `RegistrationRefused` --
+    /// not a session whose every request hangs on queues that never become ready -- and the
+    /// failed session's drop unmounts, so a caller can mount again (plan 38 §2.4, the
+    /// "refused ring registration mid-INIT" rung). The kernel's own refusal, provoked with a
+    /// malformed REGISTER (one iovec instead of two).
+    #[test]
+    fn a_refused_registration_fails_the_constructor_and_unmounts() {
+        let _serial = serial();
+        if let Some(why) = uring_unavailable() {
+            eprintln!("skipping a_refused_registration_fails_the_constructor_and_unmounts: {why}");
+            return;
+        }
+        let m = Mounted::new();
+        let config = Config {
+            io_uring_malformed_register: true,
+            ..ring_config()
+        };
+        let err = Session::new(RingFs::default(), &m.mountpoint, &config)
+            .err()
+            .expect("a malformed REGISTER is refused");
+        assert!(crate::RegistrationRefused::is(&err), "{err}");
+        let refused = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<crate::RegistrationRefused>())
+            .unwrap();
+        assert_eq!(refused.kernel_error().raw_os_error(), Some(libc::EINVAL));
+        // Every REGISTER was refused, so nothing is in the kernel and nothing is leaked (the
+        // size names this session's one ring, not a ring unit test's running alongside)
+        let leaked = format!("leaking {} bytes", reserved_bytes(8));
+        assert!(
+            logged(log::Level::Error, &leaked).is_empty(),
+            "{:?}",
+            logged(log::Level::Error, "")
+        );
+        assert!(
+            wait_ring_threads_gone(Duration::from_secs(5)),
+            "{:?}",
+            thread_names()
+        );
+        assert_not_mounted(&m.mountpoint);
+        // The host is fine; the same mountpoint takes a ring session at once
+        let bg = m.session(RingFs::default(), &ring_config()).spawn().unwrap();
+        assert_eq!(std::fs::read(m.path("hello.txt")).unwrap(), HELLO);
+        bg.umount_and_join().unwrap();
+        m.finish();
+    }
+
     #[test]
     fn late_reply_after_the_connection_ended_is_not_an_error() {
         let _serial = serial();
@@ -3629,10 +3828,15 @@ mod uring_test {
         std::fs::write(abort_path, b"1").unwrap();
         umount_and_join_within(bg, Duration::from_secs(5))
             .expect("session must end cleanly after the connection was aborted");
-        let exited = logged(log::Level::Debug, "ring 0 exited");
-        assert_eq!(
-            exited,
-            ["io_uring: ring 0 exited, in_kernel=0 outstanding=0"]
+        // CONSTELLATION PATCH (io-uring): the RELEASE that follows the read runs on an offload
+        // thread (`dispatch_on_ring`) and may still be held when the abort lands; its reply is
+        // then dropped (at debug level) once the ring has left. Nothing may be left in the
+        // kernel, and nothing may be an error.
+        let exited = logged(log::Level::Debug, "ring 0 exited,");
+        assert_eq!(exited.len(), 1, "{exited:?}");
+        assert!(
+            exited[0].starts_with("io_uring: ring 0 exited, in_kernel=0 outstanding="),
+            "{exited:?}"
         );
         assert!(logged(log::Level::Error, "ring 0").is_empty());
         // The dead mount stays in the table after an abort, as after any abort

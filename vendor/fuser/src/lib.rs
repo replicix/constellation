@@ -117,6 +117,13 @@ mod uring;
 // tell a legitimate fallback from a broken one without repeating the checks.
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use crate::uring::uring_unavailable;
+// CONSTELLATION PATCH (io-uring): the in-memory kernel a caller's tests drive a
+// ring session with (plan 38 §6), and the error a refused registration ends a
+// session's constructor with (plan 38 §2.4: the caller's ladder falls back).
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub use crate::uring::RegistrationRefused;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub use crate::uring::memory::InMemoryRingKernel;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]

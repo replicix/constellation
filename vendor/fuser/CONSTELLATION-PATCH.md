@@ -288,11 +288,9 @@ was not needed.
   down both transports and asserts the reply bytes are equal. It runs
   anywhere — no root, no mount, no `fuse.enable_uring=Y` — which is the
   point: the 18 real-kernel ring tests skip on the dev host, and this
-  one does not. It is also where a Constellation-side counterpart would
-  have had to live: `FuseFs` is just another `Filesystem`, and putting
-  the seam in `crates/frontend-fuse` would have meant exporting
-  `SessionEventLoop`, `RingCommit` and an entry constructor from this
-  crate's public API for a test.
+  one does not. Plan 38 Z2a added the Constellation-side counterpart
+  over a whole session (`InMemoryRingKernel`, below) rather than
+  exporting `SessionEventLoop`, `RingCommit` and an entry constructor.
 
 - **One flaky test of the fork's own was fixed.** `uring::mem`'s
   `vm_flags` helper took a mapping's address range from one
@@ -321,6 +319,103 @@ was not needed.
   `uring/mod.rs`. Three of the fork's tests were adapted to 0.18.0's
   narrower `Filesystem` trait (`open`/`setattr` without `kill_suid_gid`)
   and to patch 0001's `negotiated: Option<NegotiatedInit>`.
+
+### Plan 38 Z2a: the adapter integration's hunks
+
+Z2a (the FUSE adapter on the ring) added six things to this patch, each
+marked `CONSTELLATION PATCH (io-uring)`:
+
+- **Blocking callbacks leave the ring thread** (`session.rs`:
+  `dispatch_on_ring`, `offload_thread`; `uring/ring.rs`: `RingCommit::hold`,
+  `HeldRequest`, `Ring::finish_dispatch`). A ring thread serves every
+  request the kernel queues on its CPUs' queues one at a time, so a callback
+  that blocked on it blocked them all — Z1b's `s3-cut-one-node` ring-leg
+  finding (a `stat` behind a `close` whose flush waited on a cut S3). A ring
+  thread now dispatches only `READ`, `GETATTR`, `READLINK`,
+  `GETXATTR`, `LISTXATTR`, `STATFS`, `ACCESS`, `RELEASEDIR` and `DESTROY`
+  itself (`READDIR[PLUS]` was on the list at first; a listing from its start
+  may make a `--cto strict` read-position round trip to the sequencer, the
+  reason `LOOKUP` is not on it either, so it left in the Z2a review round);
+  everything else (and any opcode the list does not know) is
+  *held* — `RingCommit::hold` marks the entry, the ring thread returns to
+  its queues, and the `HeldRequest` carries the request, still in the
+  entry's own buffers, to one of `n_threads` `fuser-offload-<i>` threads,
+  whose dispatch is exactly the ring thread's. While held, a reply from any
+  thread is stashed (`Deferred`) even for a request without a payload: a
+  direct reply would re-arm the entry and the next fetch would be staged
+  over the held slice. Dropping the `HeldRequest` runs `finish_dispatch`
+  (the end of dispatch the ring thread used to run inline: write a stashed
+  reply, answer a request given no reply object, or wait as `Dispatched`).
+  The `HeldRequest` doc is the one place the borrow invariant is stated: a
+  `FUSE_WRITE`'s data is a slice of the entry's payload buffer — no copy —
+  and the entry cannot be re-armed before that slice is dead. Measured:
+  the stall test in `crates/frontend-fuse/tests/wire_uring.rs` fails with
+  every opcode on the ring and passes with the split; `s3-cut-one-node`
+  passes seeds 1–8 on `auto`. An offload-thread panic stops every ring
+  entering the filesystem (`RingHandler::offload_panicked`), since the
+  offload threads serve all rings; a ring-thread panic still confines itself
+  to its ring.
+- **Blocking lock requests may hold at most `depth - 1` entries of a queue**
+  (`uring/ring.rs`: `RingCommit::reserve_lock_wait`, `Live::lock_waits`,
+  `HeldRequest::downgrade_lock_wait`; `session.rs`: `RingHandler::handle`).
+  A ring request holds its entry until it is answered, and the kernel queues
+  a request on its CPU's queue until an entry of that queue is free — it can
+  be answered nowhere else (`/dev/fuse` does not find it: it is on the
+  queue's own processing list). A `FUSE_SETLKW` that waits for a lock holds
+  its entry for as long as the holder takes, and the holder's own next
+  request (a `write()` before its unlock) may be queued on the same CPU: with
+  every entry of that queue held by waiters, nothing frees one — a deadlock
+  `/dev/fuse` cannot have, where a waiting request holds nothing. So a ring
+  thread counts each `FUSE_SETLKW` it fetches against its queue's budget
+  until the entry's reply is committed (or the entry dies); one that would
+  exceed `depth - 1` is served as `FUSE_SETLK` — the request is small, so a
+  rewritten copy is dispatched — and a contended answer (`EAGAIN`) is
+  committed as `ENOLCK`, an error both `F_SETLKW` and `flock(2)` document
+  for exhausted lock resources. The protocol leaves nothing better: an
+  errno is the only answer that frees the entry without waiting.
+  `crates/frontend-fuse/tests/wire_uring.rs`'s
+  `blocking_lock_waits_never_take_a_queues_last_entry` fails without the
+  budget (its second waiter takes the queue's last entry and is never
+  answered) and passes with it.
+- **A refused registration is a constructor error**
+  (`uring/ring.rs`: `register_all`; `uring/mod.rs`: `RegistrationRefused`).
+  The kernel validates a `REGISTER` when it is issued and posts a refusal's
+  CQE inside the same `io_uring_enter`, so `register_all` reaps right after
+  its submit; a refusal retires the refused entries (nothing is leaked) and
+  fails `RingSet::start`, and so the session's constructor, with
+  `RegistrationRefused` (`RegistrationRefused::is` tells it apart). Before,
+  the refusal surfaced in `serve` as a fatal CQE once the session already
+  ran, with every request on the mount blocked on queues that never became
+  ready. The INIT reply has committed the connection to rings by then, so
+  the caller's fallback is a new mount (`crates/frontend-fuse`'s
+  `mount_source`). `Config::io_uring_malformed_register` (hidden) makes
+  every REGISTER name one iovec instead of two, which the real kernel
+  refuses with `EINVAL` — the fault the harness's
+  `transport-refused-registration` provokes. The ring unit tests that use a
+  non-FUSE device's synchronous `EOPNOTSUPP` to exercise `serve`'s fatal-CQE
+  path keep it through a test hook (`IoHooks::refusals_in_serve`).
+- **`InMemoryRingKernel`** (`uring/memory.rs`, exported; `Config::io_uring_kernel`,
+  hidden): the seam for testing a whole ring session without a kernel. `RingIo`
+  has two backends now, the kernel's io_uring and this; the memory backend
+  decodes the SQEs a ring thread pushes the way `fs/fuse/dev_uring.c` does
+  (`REGISTER` with its two iovecs — and refuses a malformed one as the kernel
+  does —, `COMMIT_AND_FETCH`, the wake eventfd's `POLL_ADD`), writes each
+  request into a registered entry through those iovecs, and reads each reply
+  back out. `FUSE_INIT`/`DESTROY` still go over the session's descriptor (a
+  socket pair in tests). `crates/frontend-fuse/tests/wire_uring.rs` is its
+  user.
+- **`ReplyData::transport()`**, so the adapter's read reply keeps the
+  `/dev/fuse` path byte for byte (`contiguous()` + `data()`) and uses
+  `gather` only over a ring.
+- **`gather` no longer zeroes the payload first** (`RingCommit::fill_with`,
+  `ReplySender::fill_with`): it overwrites every byte it reports, so `fill`'s
+  memset only doubled the copy. The unzeroed bytes are the entry's own
+  (anonymous memory, written only by this entry's requests and replies).
+
+`ring_session_ends_cleanly_after_abort` was adapted: the `RELEASE` after
+its read now runs on an offload thread and may still be held when the
+abort lands, so its reply may be dropped (debug level) once the ring has
+left; the test still requires nothing left in the kernel and no error.
 
 ### The ring budget, as it actually sizes itself
 

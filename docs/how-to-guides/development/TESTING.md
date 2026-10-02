@@ -1939,6 +1939,39 @@ that fell back to `dev_fuse` the handover must succeed. Either way a
 writer, a creator and a reader run throughout and every byte they wrote
 must be there afterwards, before and after a remount.
 
+### Every downgrade, injected (plan 38 Z2a)
+
+Each rung of §2.4's ladder has a scenario that refuses it for real and
+requires the same three things: the mount comes up and serves a seeded
+workload on `dev_fuse`, and the downgrade is logged **exactly once** over the
+daemon's whole life (a busy mount must not log a fallback per request).
+
+| scenario | the refusal | runs on |
+|---|---|---|
+| `transport-refused-registration` | the kernel refuses the queues' `REGISTER` *after* the `FUSE_INIT` reply committed the connection to rings (`CONSTELLATION_FUSE_URING_FAULT=malformed-register`: one iovec instead of two, the kernel's own `EINVAL`). Such a connection can neither be served nor moved back to `/dev/fuse` (Z0a), so fuser's constructor fails with `RegistrationRefused` and the frontend **mounts again** over `/dev/fuse` | ring hosts (`fuse-uring`) |
+| `transport-seccomp-denied` | `io_uring_setup(2)` refused with `EPERM` by a seccomp filter on the daemon (plan 37's container case) | **every host**: elsewhere the ladder stops at an earlier rung (the kernel, the build), which must be logged once just the same |
+| `transport-enomem-ring` | the ring's buffer reservation refused: `RLIMIT_AS` set to what the daemon measurably needs on `/dev/fuse` plus a margin far below the ring's reservation (deepened to 64 per queue) | ring hosts |
+| `transport-abort-while-armed` | a fusectl `abort` of a ring session with every entry armed and a reader running: the reader fails at once (`ENOTCONN`), the daemon unwinds and exits 0, nothing leaks, the mountpoint takes a fresh ring mount (`FuseAbort` holds on the ring) | ring hosts |
+
+The ring-only ones first mount *without* the fault and require `uring`, so
+the fallback they then see is the fault's. Their `requires` entry
+`fuse-uring` is not a binary: the harness checks `fuse.enable_uring=Y`,
+`kernel.io_uring_disabled=0`, a real `io_uring_setup(2)` probe, and that the
+`constellation` under test was built with the feature (`constellation daemon
+--fuse-transports`), and skips naming whichever is missing.
+
+The seccomp filter needs `no_new_privs`, which makes `execve` ignore the
+set-uid bit of `fusermount3` — an unprivileged daemon could no longer
+mount. The harness therefore gives the sandboxed daemon a `fusermount3`
+(`FUSERMOUNT_PATH`) that is the harness binary under another name: it hands
+its arguments and fuser's `_FUSE_COMMFD` socket to a broker thread in the
+unsandboxed harness, which runs the real `fusermount3`; the mount is the
+ordinary host-visible one (`crates/harness/src/sandbox.rs`).
+
+`s3-cut-one-node` is in the lane's default list as the regression guard for
+Z1b's ring-leg finding (a blocked flush stalling unrelated requests on its
+ring): Z2a's gate is seeds 1-8 on `auto`, negotiated `uring`.
+
 ### pjdfstest on both transports
 
 POSIX compliance is gated per transport (plan 38 §6), still 8798/8798
@@ -1970,20 +2003,36 @@ for ring coverage. On a 6.14+ `enable_uring=Y` host the `auto` lane is
 
 `vendor/fuser`'s own suite carries the transport's unit coverage
 (`cargo test --manifest-path vendor/fuser/Cargo.toml --features io-uring`):
-the entry state machine, the staging layout against the ABI, the reply
+the entry state machine (including a fetch *held* by an offload thread:
+replies stashed until its dispatch ends, a write's bytes borrowed from the
+entry's payload buffer), the staging layout against the ABI, the reply
 paths, and — without any io_uring at all, over an entry in an ordinary
 private mapping — that the *same* request bytes dispatched over
 `/dev/fuse` and over a ring entry produce **byte-identical** replies
-(`transport_parity_is_byte_for_byte`, plan 38 §6's "`tests/wire.rs`-style
-adapter test ... identical regardless of transport"). 18 further ring
-tests mount a real kernel mount and skip loudly on a
-`fuse.enable_uring=N` host; the fork's `fuse_over_io_uring_tests_ran`
-guard fails if the kernel advertises the flag while they skipped, so a
-silently-never-exercised ring cannot pass as green.
-`crates/frontend-fuse/tests/wire.rs` stays transport-independent by
-construction: it drives `FuseFs` through fuser's decode/encode over a
-socket pair, and the parity test above is what says the ring's seam
-produces the same bytes.
+(`transport_parity_is_byte_for_byte`). The real-kernel ring tests mount a
+real kernel mount and skip loudly on a `fuse.enable_uring=N` host; the
+fork's `fuse_over_io_uring_tests_ran` guard fails if the kernel advertises
+the flag while they skipped, so a silently-never-exercised ring cannot pass
+as green.
+
+`crates/frontend-fuse/tests/wire_uring.rs` (feature `io-uring`) is the
+adapter-level counterpart over `MockVfs` (plan 38 §6): fuser's
+`InMemoryRingKernel` stands in for the kernel's half of the ring at the
+ring's own io_uring (`RingIo`), decoding the very SQEs a ring thread pushes
+(`REGISTER`, `COMMIT_AND_FETCH`, the wake poll) and scattering each request
+into a registered entry as the kernel does, so the whole session — ring
+threads, offload threads, `FuseFs`, the responders — runs unmodified with
+no io_uring, mount or root. It proves the same requests give byte-identical
+replies and identical `Vfs` calls on both transports (reads of one segment
+and of several, short and empty reads, writes, opens, getattrs, lookups,
+the close path), that a cold read answered from a foreign thread
+completes, which thread each op runs on, that a blocked flush does not
+stall a `stat` queued on the same ring queue, that blocking lock waits
+never take a queue's last entry (the second of two `F_SETLKW` waiters on a
+depth-2 queue is answered `ENOLCK`, and the lock holder's `write` and
+unlock still go through — without the budget that queue deadlocks), and
+that a refused registration fails the session by name. `tests/wire.rs` stays the
+`/dev/fuse` socket-pair suite.
 
 ## Cross-node `flock`/`fcntl` (plan 30 M14)
 

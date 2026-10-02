@@ -15,6 +15,7 @@ pub mod reqlog;
 pub mod results;
 pub mod s3auth;
 pub mod s3env;
+pub mod sandbox;
 pub mod scenarios;
 pub mod smoke;
 pub mod snapchurn;

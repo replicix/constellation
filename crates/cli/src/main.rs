@@ -225,6 +225,10 @@ enum Command {
         /// (internal) Print this binary's handover version.
         #[arg(long, hide = true)]
         handover_abi: bool,
+        /// (internal) Print the FUSE transports this build can negotiate
+        /// (`dev_fuse`, and `uring` with the io-uring feature), one per line.
+        #[arg(long, hide = true)]
+        fuse_transports: bool,
         /// (internal) Resume a handed-over daemon from this memfd.
         #[arg(long, hide = true)]
         resume_from: Option<i32>,
@@ -1134,11 +1138,19 @@ fn main() -> Result<()> {
     if let Command::Daemon {
         resume_from,
         handover_abi,
+        fuse_transports,
         ..
     } = &cli.command
     {
         if *handover_abi {
             println!("{}", handover::handover_abi());
+            return Ok(());
+        }
+        if *fuse_transports {
+            println!("dev_fuse");
+            if constellation_frontend_fuse::URING_BUILT {
+                println!("uring");
+            }
             return Ok(());
         }
         if let Some(fd) = *resume_from {

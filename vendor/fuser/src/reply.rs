@@ -81,9 +81,24 @@ impl ReplySender {
     where
         F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
     {
+        self.fill_with(unique, max_len, true, f)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `fill`, with the ring's buffer handed to `f` unzeroed
+    /// when `zero` is false (`RingCommit::fill_with`); a heap buffer is always zeroed.
+    fn fill_with<F>(
+        &self,
+        unique: ll::RequestId,
+        max_len: usize,
+        zero: bool,
+        f: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
+    {
         #[cfg(all(feature = "io-uring", target_os = "linux"))]
         let f = match self {
-            ReplySender::Ring(commit) => match commit.fill(max_len, f)? {
+            ReplySender::Ring(commit) => match commit.fill_with(max_len, zero, f)? {
                 None => return Ok(()),
                 Some(f) => f,
             },
@@ -129,7 +144,8 @@ impl ReplySender {
             .ok_or_else(|| std::io::Error::other("gathered reply length overflows"))?;
         #[cfg(all(feature = "io-uring", target_os = "linux"))]
         if matches!(self, ReplySender::Ring(_)) {
-            return self.fill(unique, total, |buf| {
+            // Every byte of the buffer is overwritten, so it is not zeroed first
+            return self.fill_with(unique, total, false, |buf| {
                 let mut at = 0;
                 for segment in segments {
                     let segment = segment.as_ref();
@@ -143,6 +159,15 @@ impl ReplySender {
         let slices: smallvec::SmallVec<[IoSlice<'_>; 4]> =
             segments.iter().map(|s| IoSlice::new(s.as_ref())).collect();
         ll::ResponseSegments(slices.as_slice()).with_iovec(unique, |iov| self.send(iov))
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over.
+    pub(crate) fn transport(&self) -> crate::Transport {
+        match self {
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(_) => crate::Transport::Uring,
+            _ => crate::Transport::DevFuse,
+        }
     }
 
     /// Records that a reply object was created for the request, so a transport that answers
@@ -259,6 +284,13 @@ impl Reply for ReplyRaw {
 }
 
 impl ReplyRaw {
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyData::transport`].
+    pub(crate) fn transport(&self) -> crate::Transport {
+        self.sender
+            .as_ref()
+            .map_or(crate::Transport::DevFuse, ReplySender::transport)
+    }
+
     /// Reply to a request with the given error code and data. Must be called
     /// only once (the `ok` and `error` methods ensure this by consuming `self`)
     pub(crate) fn send_ll_mut(&mut self, response: &impl Response) {
@@ -424,6 +456,14 @@ impl ReplyData {
     /// ```
     pub fn gather<B: AsRef<[u8]>>(self, segments: &[B]) {
         self.reply.send_gather(segments);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over --
+    /// [`crate::Transport::Uring`] when the request came over an io_uring entry, whose payload
+    /// buffer [`Self::fill`] and [`Self::gather`] write in place, and
+    /// [`crate::Transport::DevFuse`] otherwise.
+    pub fn transport(&self) -> crate::Transport {
+        self.reply.transport()
     }
 
     /// Reply to a request with the given error code

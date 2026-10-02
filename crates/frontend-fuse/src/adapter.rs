@@ -680,7 +680,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             size,
             // A cold read may be answered from the engine's completion
             // pool: counted until it is, for a detach to drain.
-            op.responder(self.deferred.track_bounded(ReadReply(reply))),
+            op.responder(self.deferred.track_bounded(ReadReply { reply, size })),
         );
     }
 
@@ -699,6 +699,15 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Write, ino.0);
         let _in = op.enter();
+        // Borrowed from wherever fuser received the request: the worker's
+        // `/dev/fuse` buffer, or, over io_uring, the ring entry's own payload
+        // buffer the kernel copied the bytes into — no copy into a worker
+        // buffer either way (plan 38 §3(b)). The borrow ends when this call
+        // returns, before the entry can be re-armed: fuser keeps the entry
+        // fetched until the dispatch that received `data` is over
+        // (`HeldRequest` in `vendor/fuser/src/uring/ring.rs`), and a view
+        // that keeps the bytes past the call copies them into
+        // `WriteData::Shared` itself.
         self.vfs.write(
             &op.ctx(&caller),
             ino.0,

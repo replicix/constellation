@@ -32,6 +32,12 @@ pub use session::{
 };
 pub use stats::{FallbackReason, SessionStats, TransportFallback};
 
+/// Whether this build can serve FUSE-over-io_uring at all (the `io-uring`
+/// feature, on Linux): what `constellation daemon --fuse-transports`
+/// reports, so a test lane can tell a build that cannot reach the ring
+/// from a host that refuses it.
+pub const URING_BUILT: bool = cfg!(all(feature = "io-uring", target_os = "linux"));
+
 /// The capabilities this frontend declares: [`FrontendCaps::linux_fuse`]
 /// (`cluster_locks`: the mount forwards POSIX/`flock` locks to the view).
 pub fn caps(cluster_locks: bool) -> FrontendCaps {

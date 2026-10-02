@@ -17,7 +17,7 @@ use constellation_vfs::{
 use fuser::{
     Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyLseek, ReplyOpen,
-    ReplyStatfs, ReplyWrite, ReplyXattr,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Transport,
 };
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -108,13 +108,54 @@ impl Responder<Vec<u8>> for BytesReply {
     }
 }
 
-pub(crate) struct ReadReply(pub ReplyData);
+/// A read's reply, and the `size` the kernel asked for.
+///
+/// Over `/dev/fuse` the bytes go out exactly as they always did: joined
+/// (`ReadData::contiguous`, a copy only when there is more than one
+/// segment) and written with one `writev(2)`. Over an io_uring entry (plan
+/// 38 §3(b)) each segment is copied straight into the entry's payload
+/// buffer in order (`ReplyData::gather`): one copy, no syscall, and no
+/// join first even for a multi-segment read. Either way the reply may come
+/// from any thread — the engine's completion pool answers cold reads.
+///
+/// A short read (EOF, a hole at the end) is just fewer bytes, and an empty
+/// one an empty reply. More bytes than were asked for is a bug beneath the
+/// adapter: the kernel sized the request — and over a ring, the entry's
+/// payload buffer — from the negotiated `max_write`/`max_pages`, so the
+/// excess would not fit, and cutting it off would hand the application a
+/// silently different file. Debug builds stop on it; release builds answer
+/// `EIO`, never a truncated read.
+pub(crate) struct ReadReply {
+    pub reply: ReplyData,
+    pub size: u32,
+}
 
 impl Responder<ReadData> for ReadReply {
     fn done(self, r: VfsResult<ReadData>) {
-        match r {
-            Ok(data) => self.0.data(&data.contiguous()),
-            Err(e) => self.0.error(reply_code(e.code())),
+        let data = match r {
+            Ok(data) => data,
+            Err(e) => return self.reply.error(reply_code(e.code())),
+        };
+        if data.len() > self.size as usize {
+            debug_assert!(
+                false,
+                "a read of {} bytes answered with {}",
+                self.size,
+                data.len()
+            );
+            tracing::error!(
+                asked = self.size,
+                got = data.len(),
+                "a read was answered with more bytes than it asked for; replying EIO"
+            );
+            return self.reply.error(reply_code(Code::Io));
+        }
+        if data.is_empty() {
+            return self.reply.data(&[]);
+        }
+        match self.reply.transport() {
+            Transport::DevFuse => self.reply.data(&data.contiguous()),
+            _ => self.reply.gather(data.segments()),
         }
     }
 }

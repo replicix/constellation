@@ -1,4 +1,4 @@
-Plan 38 Z1: the FUSE-over-io_uring transport for fuser 0.18.0
+Plan 38 Z1 + Z2a: the FUSE-over-io_uring transport for fuser 0.18.0
 (vendor/fuser/CONSTELLATION-PATCH.md, "io-uring"), behind the `io-uring`
 cargo feature and off by default. Apply with -p1 in vendor/fuser, after
 0001-constellation-session-handover.patch.
@@ -67,7 +67,7 @@ index 3a501cb..4f14973 100644
      /// `EAGAIN` when no request is pending (an armed session polls first).
      pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
 diff --git a/src/lib.rs b/src/lib.rs
-index 90f96fc..08ce024 100644
+index 90f96fc..c4d8b77 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -84,6 +84,8 @@ use crate::session::MAX_WRITE_SIZE;
@@ -79,7 +79,7 @@ index 90f96fc..08ce024 100644
  
  mod access_flags;
  mod bsd_file_flags;
-@@ -106,6 +108,15 @@ mod request;
+@@ -106,6 +108,22 @@ mod request;
  mod request_param;
  mod session;
  mod time;
@@ -92,10 +92,17 @@ index 90f96fc..08ce024 100644
 +// tell a legitimate fallback from a broken one without repeating the checks.
 +#[cfg(all(feature = "io-uring", target_os = "linux"))]
 +pub use crate::uring::uring_unavailable;
++// CONSTELLATION PATCH (io-uring): the in-memory kernel a caller's tests drive a
++// ring session with (plan 38 §6), and the error a refused registration ends a
++// session's constructor with (plan 38 §2.4: the caller's ladder falls back).
++#[cfg(all(feature = "io-uring", target_os = "linux"))]
++pub use crate::uring::RegistrationRefused;
++#[cfg(all(feature = "io-uring", target_os = "linux"))]
++pub use crate::uring::memory::InMemoryRingKernel;
  
  /// We generally support async reads
  #[cfg(not(target_os = "macos"))]
-@@ -345,6 +356,14 @@ impl KernelConfig {
+@@ -345,6 +363,14 @@ impl KernelConfig {
      /// # Errors
      /// When the argument includes capabilities not supported by the kernel, returns the bits of the capabilities not supported.
      pub fn add_capabilities(&mut self, capabilities_to_add: InitFlags) -> Result<(), InitFlags> {
@@ -110,7 +117,7 @@ index 90f96fc..08ce024 100644
          if !self.capabilities.contains(capabilities_to_add) {
              let unsupported = capabilities_to_add & !self.capabilities;
              return Err(unsupported);
-@@ -353,6 +372,13 @@ impl KernelConfig {
+@@ -353,6 +379,13 @@ impl KernelConfig {
          Ok(())
      }
  
@@ -370,10 +377,10 @@ index 4b31108..043c10c 100644
  
  impl Response for ResponseEmpty {
 diff --git a/src/mnt/mount_options.rs b/src/mnt/mount_options.rs
-index 3ab2e0f..c26e576 100644
+index 3ab2e0f..aa2bfb6 100644
 --- a/src/mnt/mount_options.rs
 +++ b/src/mnt/mount_options.rs
-@@ -5,19 +5,85 @@ use std::io::ErrorKind;
+@@ -5,19 +5,103 @@ use std::io::ErrorKind;
  use crate::SessionACL;
  
  /// Fuser session configuration, including mount options.
@@ -442,6 +449,20 @@ index 3ab2e0f..c26e576 100644
 +    /// (73 per queue on a 448-CPU machine with one ring); a larger product falls back to
 +    /// `/dev/fuse` with a warning.
 +    pub io_uring_queue_depth: u32,
++    /// CONSTELLATION PATCH (io-uring): serve the rings from this in-memory stand-in for the
++    /// kernel instead of `io_uring_setup(2)` (`InMemoryRingKernel`), for tests that drive a
++    /// whole ring session over a socket pair with no io_uring, mount or root. `None` (the
++    /// default) is the kernel.
++    #[cfg(all(feature = "io-uring", target_os = "linux"))]
++    #[doc(hidden)]
++    pub io_uring_kernel: Option<crate::InMemoryRingKernel>,
++    /// CONSTELLATION PATCH (io-uring): fault injection for the fallback ladder's tests. Every
++    /// ring REGISTER this session makes is malformed (one iovec instead of two), so a real
++    /// kernel refuses it with `EINVAL` after the `FUSE_INIT` reply committed the connection to
++    /// rings, and the constructor fails with `RegistrationRefused`. Never set it otherwise.
++    #[cfg(all(feature = "io-uring", target_os = "linux"))]
++    #[doc(hidden)]
++    pub io_uring_malformed_register: bool,
 +}
 +
 +// CONSTELLATION PATCH (io-uring): hand-written so `io_uring_queue_depth`
@@ -456,12 +477,16 @@ index 3ab2e0f..c26e576 100644
 +            clone_fd: false,
 +            io_uring: false,
 +            io_uring_queue_depth: 8,
++            #[cfg(all(feature = "io-uring", target_os = "linux"))]
++            io_uring_kernel: None,
++            #[cfg(all(feature = "io-uring", target_os = "linux"))]
++            io_uring_malformed_register: false,
 +        }
 +    }
  }
  
  /// Mount options accepted by the FUSE filesystem type
-@@ -308,6 +374,19 @@ mod test {
+@@ -308,6 +392,19 @@ mod test {
              .is_ok()
          );
      }
@@ -482,7 +507,7 @@ index 3ab2e0f..c26e576 100644
      fn option_round_trip() {
          use crate::mnt::mount_options::MountOption::*;
 diff --git a/src/reply.rs b/src/reply.rs
-index c8e44ec..c83bd4b 100644
+index c8e44ec..b7aff50 100644
 --- a/src/reply.rs
 +++ b/src/reply.rs
 @@ -14,6 +14,7 @@ use std::time::Duration;
@@ -526,7 +551,7 @@ index c8e44ec..c83bd4b 100644
              #[cfg(test)]
              ReplySender::Assert(sender) => sender.send(data),
              #[cfg(test)]
-@@ -56,6 +66,91 @@ impl ReplySender {
+@@ -56,6 +66,116 @@ impl ReplySender {
                  sender.send(()).unwrap();
                  Ok(())
              }
@@ -545,9 +570,24 @@ index c8e44ec..c83bd4b 100644
 +    where
 +        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
 +    {
++        self.fill_with(unique, max_len, true, f)
++    }
++
++    /// CONSTELLATION PATCH (io-uring): `fill`, with the ring's buffer handed to `f` unzeroed
++    /// when `zero` is false (`RingCommit::fill_with`); a heap buffer is always zeroed.
++    fn fill_with<F>(
++        &self,
++        unique: ll::RequestId,
++        max_len: usize,
++        zero: bool,
++        f: F,
++    ) -> std::io::Result<()>
++    where
++        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
++    {
 +        #[cfg(all(feature = "io-uring", target_os = "linux"))]
 +        let f = match self {
-+            ReplySender::Ring(commit) => match commit.fill(max_len, f)? {
++            ReplySender::Ring(commit) => match commit.fill_with(max_len, zero, f)? {
 +                None => return Ok(()),
 +                Some(f) => f,
 +            },
@@ -593,7 +633,8 @@ index c8e44ec..c83bd4b 100644
 +            .ok_or_else(|| std::io::Error::other("gathered reply length overflows"))?;
 +        #[cfg(all(feature = "io-uring", target_os = "linux"))]
 +        if matches!(self, ReplySender::Ring(_)) {
-+            return self.fill(unique, total, |buf| {
++            // Every byte of the buffer is overwritten, so it is not zeroed first
++            return self.fill_with(unique, total, false, |buf| {
 +                let mut at = 0;
 +                for segment in segments {
 +                    let segment = segment.as_ref();
@@ -609,6 +650,15 @@ index c8e44ec..c83bd4b 100644
 +        ll::ResponseSegments(slices.as_slice()).with_iovec(unique, |iov| self.send(iov))
 +    }
 +
++    /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over.
++    pub(crate) fn transport(&self) -> crate::Transport {
++        match self {
++            #[cfg(all(feature = "io-uring", target_os = "linux"))]
++            ReplySender::Ring(_) => crate::Transport::Uring,
++            _ => crate::Transport::DevFuse,
++        }
++    }
++
 +    /// Records that a reply object was created for the request, so a transport that answers
 +    /// unreplied requests itself knows one is coming.
 +    pub(crate) fn reply_created(&self) {
@@ -618,7 +668,7 @@ index c8e44ec..c83bd4b 100644
          }
      }
  
-@@ -63,10 +158,12 @@ impl ReplySender {
+@@ -63,10 +183,12 @@ impl ReplySender {
      pub(crate) fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
          match self {
              ReplySender::Channel(sender) => sender.open_backing(fd),
@@ -634,7 +684,7 @@ index c8e44ec..c83bd4b 100644
          }
      }
  
-@@ -74,16 +171,51 @@ impl ReplySender {
+@@ -74,16 +196,51 @@ impl ReplySender {
      pub(crate) unsafe fn wrap_backing(&self, id: u32) -> BackingId {
          match self {
              ReplySender::Channel(sender) => unsafe { sender.wrap_backing(id) },
@@ -690,7 +740,20 @@ index c8e44ec..c83bd4b 100644
  pub(crate) struct AssertSender {
      expected: Vec<u8>,
  }
-@@ -133,14 +265,31 @@ impl ReplyRaw {
+@@ -127,20 +284,44 @@ impl Reply for ReplyRaw {
+ }
+ 
+ impl ReplyRaw {
++    /// CONSTELLATION PATCH (io-uring): see [`ReplyData::transport`].
++    pub(crate) fn transport(&self) -> crate::Transport {
++        self.sender
++            .as_ref()
++            .map_or(crate::Transport::DevFuse, ReplySender::transport)
++    }
++
+     /// Reply to a request with the given error code and data. Must be called
+     /// only once (the `ok` and `error` methods ensure this by consuming `self`)
+     pub(crate) fn send_ll_mut(&mut self, response: &impl Response) {
          assert!(self.sender.is_some());
          let sender = self.sender.take().unwrap();
          let res = response.with_iovec(self.unique, |iov| sender.send(iov));
@@ -725,7 +788,7 @@ index c8e44ec..c83bd4b 100644
      /// Reply to a request with the given error code
      pub(crate) fn error(self, err: ll::Errno) {
          self.send_ll(&ll::ResponseErrno(err));
-@@ -209,6 +358,74 @@ impl ReplyData {
+@@ -209,6 +390,82 @@ impl ReplyData {
          self.reply.send_ll(&ll::ResponseSlice(data));
      }
  
@@ -797,10 +860,18 @@ index c8e44ec..c83bd4b 100644
 +        self.reply.send_gather(segments);
 +    }
 +
++    /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over --
++    /// [`crate::Transport::Uring`] when the request came over an io_uring entry, whose payload
++    /// buffer [`Self::fill`] and [`Self::gather`] write in place, and
++    /// [`crate::Transport::DevFuse`] otherwise.
++    pub fn transport(&self) -> crate::Transport {
++        self.reply.transport()
++    }
++
      /// Reply to a request with the given error code
      pub fn error(self, err: Errno) {
          self.reply.error(err);
-@@ -951,6 +1168,109 @@ mod test {
+@@ -951,6 +1208,109 @@ mod test {
          reply.data(&[0xde, 0xad, 0xbe, 0xef]);
      }
  
@@ -910,7 +981,7 @@ index c8e44ec..c83bd4b 100644
      #[test]
      fn reply_entry() {
          let mut expected = if cfg!(target_os = "macos") {
-@@ -1267,4 +1587,23 @@ mod test {
+@@ -1267,4 +1627,23 @@ mod test {
          });
          rx.recv().unwrap();
      }
@@ -1029,7 +1100,7 @@ index 1ec5b91..8452275 100644
  
      /// Returns a Request reference for this request
 diff --git a/src/session.rs b/src/session.rs
-index cee8718..54dcf09 100644
+index cee8718..1f3795d 100644
 --- a/src/session.rs
 +++ b/src/session.rs
 @@ -41,6 +41,7 @@ use crate::ll::ResponseErrno;
@@ -1040,7 +1111,7 @@ index cee8718..54dcf09 100644
  use crate::mnt::Mount;
  use crate::mnt::mount_options::Config;
  use crate::mnt::mount_options::check_option_conflicts;
-@@ -50,12 +51,22 @@ use crate::reply::Reply;
+@@ -50,12 +51,24 @@ use crate::reply::Reply;
  use crate::reply::ReplyRaw;
  use crate::reply::ReplySender;
  use crate::request::RequestWithSender;
@@ -1048,6 +1119,8 @@ index cee8718..54dcf09 100644
 +use crate::uring::RingSet;
 +#[cfg(all(feature = "io-uring", target_os = "linux"))]
 +use crate::uring::ring::RingCommit;
++#[cfg(all(feature = "io-uring", target_os = "linux"))]
++use crate::uring::ring::HeldRequest;
  
  /// The max size of write requests from the kernel. The absolute minimum is 4k,
  /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -1063,7 +1136,7 @@ index cee8718..54dcf09 100644
  #[derive(Default, Debug, Eq, PartialEq, Clone, Copy)]
  /// How requests should be filtered based on the calling UID.
  pub enum SessionACL {
-@@ -132,6 +143,11 @@ pub struct Session<FS: Filesystem> {
+@@ -132,6 +145,11 @@ pub struct Session<FS: Filesystem> {
      pub(crate) ch: Channel,
      /// Handle to the mount.  Dropping this unmounts.
      mount: UmountOnDrop,
@@ -1075,7 +1148,7 @@ index cee8718..54dcf09 100644
      /// Whether to restrict access to owner, root + owner, or unrestricted
      /// Used to implement `allow_root` and `auto_unmount`
      pub(crate) allowed: SessionACL,
-@@ -148,6 +164,54 @@ pub struct Session<FS: Filesystem> {
+@@ -148,6 +166,54 @@ pub struct Session<FS: Filesystem> {
      detach: Option<Arc<DetachSignal>>,
  }
  
@@ -1130,7 +1203,7 @@ index cee8718..54dcf09 100644
  /// CONSTELLATION PATCH (negotiated-init): the `FUSE_INIT` parameters a
  /// session agreed with the kernel, recorded by the handshake
  /// ([`Session::negotiated_init`]) so that another process can serve the
-@@ -183,6 +247,16 @@ pub struct NegotiatedInit {
+@@ -183,6 +249,16 @@ pub struct NegotiatedInit {
      pub time_gran_ns: u32,
      pub max_pages: u16,
      pub max_stack_depth: u32,
@@ -1147,7 +1220,7 @@ index cee8718..54dcf09 100644
  }
  
  impl NegotiatedInit {
-@@ -205,6 +279,18 @@ impl NegotiatedInit {
+@@ -205,6 +281,18 @@ impl NegotiatedInit {
                  "the connection agreed capabilities this build does not know: {unknown:#x}"
              ));
          }
@@ -1166,7 +1239,7 @@ index cee8718..54dcf09 100644
          if self.max_write as usize > MAX_WRITE_SIZE {
              return refuse(format!(
                  "the connection's max_write {} exceeds this build's request buffer {MAX_WRITE_SIZE}",
-@@ -326,6 +412,7 @@ impl<FS: Filesystem> Session<FS> {
+@@ -326,6 +414,7 @@ impl<FS: Filesystem> Session<FS> {
          options: &Config,
      ) -> io::Result<Session<FS>> {
          check_option_conflicts(options)?;
@@ -1174,7 +1247,7 @@ index cee8718..54dcf09 100644
  
          let mountpoint = mountpoint.as_ref();
          info!("Mounting {}", mountpoint.display());
-@@ -351,6 +438,9 @@ impl<FS: Filesystem> Session<FS> {
+@@ -351,6 +440,9 @@ impl<FS: Filesystem> Session<FS> {
              mount: UmountOnDrop {
                  mount: Arc::new(Mutex::new(Some(mount))),
              },
@@ -1184,7 +1257,7 @@ index cee8718..54dcf09 100644
              allowed: options.acl,
              session_owner: geteuid(),
              proto_version: None,
-@@ -372,6 +462,7 @@ impl<FS: Filesystem> Session<FS> {
+@@ -372,6 +464,7 @@ impl<FS: Filesystem> Session<FS> {
          acl: SessionACL,
          config: Config,
      ) -> io::Result<Self> {
@@ -1192,7 +1265,7 @@ index cee8718..54dcf09 100644
          let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
          let mut session = Session {
              filesystem: FilesystemHolder {
-@@ -381,6 +472,9 @@ impl<FS: Filesystem> Session<FS> {
+@@ -381,6 +474,9 @@ impl<FS: Filesystem> Session<FS> {
              mount: UmountOnDrop {
                  mount: Arc::new(Mutex::new(None)),
              },
@@ -1202,7 +1275,7 @@ index cee8718..54dcf09 100644
              allowed: acl,
              session_owner: geteuid(),
              proto_version: None,
-@@ -420,6 +514,10 @@ impl<FS: Filesystem> Session<FS> {
+@@ -420,6 +516,10 @@ impl<FS: Filesystem> Session<FS> {
              mount: UmountOnDrop {
                  mount: Arc::new(Mutex::new(None)),
              },
@@ -1213,7 +1286,7 @@ index cee8718..54dcf09 100644
              allowed: acl,
              session_owner: geteuid(),
              proto_version: Some(Version(init.kernel_major, init.kernel_minor)),
-@@ -448,6 +546,17 @@ impl<FS: Filesystem> Session<FS> {
+@@ -448,6 +548,17 @@ impl<FS: Filesystem> Session<FS> {
                  "an auto_unmount session cannot be detached",
              ));
          }
@@ -1231,7 +1304,7 @@ index cee8718..54dcf09 100644
          let signal = match &self.detach {
              Some(signal) => signal.clone(),
              None => {
-@@ -496,6 +605,9 @@ impl<FS: Filesystem> Session<FS> {
+@@ -496,6 +607,9 @@ impl<FS: Filesystem> Session<FS> {
              filesystem,
              ch,
              mount: do_not_umount_yet,
@@ -1241,7 +1314,7 @@ index cee8718..54dcf09 100644
              allowed,
              session_owner,
              proto_version: _,
-@@ -505,6 +617,42 @@ impl<FS: Filesystem> Session<FS> {
+@@ -505,6 +619,42 @@ impl<FS: Filesystem> Session<FS> {
          } = self;
          let master = ch.clone();
  
@@ -1284,7 +1357,7 @@ index cee8718..54dcf09 100644
          let n_threads = config.n_threads.unwrap_or(1);
  
          if !cfg!(target_os = "linux") && n_threads != 1 {
-@@ -711,6 +859,32 @@ impl<FS: Filesystem> Session<FS> {
+@@ -711,6 +861,32 @@ impl<FS: Filesystem> Session<FS> {
                  return Err(error);
              }
  
@@ -1317,7 +1390,7 @@ index cee8718..54dcf09 100644
              // Remember the ABI version supported by kernel and mark the session initialized.
              self.proto_version = Some(v);
  
-@@ -773,7 +947,28 @@ impl<FS: Filesystem> Session<FS> {
+@@ -773,7 +949,28 @@ impl<FS: Filesystem> Session<FS> {
                  } else {
                      0
                  },
@@ -1346,7 +1419,7 @@ index cee8718..54dcf09 100644
              <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
                  .send_ll(&response);
  
-@@ -781,6 +976,23 @@ impl<FS: Filesystem> Session<FS> {
+@@ -781,6 +978,25 @@ impl<FS: Filesystem> Session<FS> {
          }
      }
  
@@ -1364,13 +1437,15 @@ index cee8718..54dcf09 100644
 +            self.config.n_threads.unwrap_or(1),
 +            self.config.io_uring_queue_depth,
 +            payload_cap,
++            self.config.io_uring_kernel.as_ref(),
++            self.config.io_uring_malformed_register,
 +        )
 +    }
 +
      /// Unmount the filesystem
      pub fn unmount(&mut self) -> io::Result<()> {
          self.mount.umount()
-@@ -793,12 +1005,224 @@ impl<FS: Filesystem> Session<FS> {
+@@ -793,12 +1009,372 @@ impl<FS: Filesystem> Session<FS> {
          }
      }
  
@@ -1453,13 +1528,92 @@ index cee8718..54dcf09 100644
 +    /// A callback panicked on this ring: it no longer enters the filesystem, as a `/dev/fuse`
 +    /// reader that died does not either; other rings and the reader are unaffected
 +    panicked: bool,
++    /// CONSTELLATION PATCH (io-uring): where requests that may block are dispatched instead
++    /// of on this thread (`dispatch_on_ring`).
++    offload: std::sync::mpsc::Sender<HeldRequest>,
++    /// CONSTELLATION PATCH (io-uring): a callback panicked on an offload thread. The offload
++    /// threads serve every ring, so every ring stops entering the filesystem then, as this one
++    /// does after a panic of its own (`panicked`).
++    offload_panicked: Arc<std::sync::atomic::AtomicBool>,
++}
++
++/// CONSTELLATION PATCH (io-uring): whether a ring thread dispatches a request with this
++/// opcode itself, rather than handing it to the session's offload threads.
++///
++/// A ring thread serves every request the kernel queues on its CPUs' queues, one at a time,
++/// so a callback that blocks on it blocks them all -- a `stat` behind a `close` whose flush
++/// waits on a remote store (plan 38 Z1b: `s3-cut-one-node` on the ring leg). A `/dev/fuse`
++/// session has no such coupling: any of its `n_threads` readers takes the next request.
++/// So only reads of data and of metadata that a filesystem answers from what it holds stay on
++/// the ring, where the transport's saving is the whole point; a filesystem that must wait for
++/// the data can reply from another thread (`ReplyData` is `Send`). Everything that creates,
++/// changes, opens, syncs, locks or flushes -- the operations that wait for leases, for a
++/// remote store, for another node -- directory listings (a listing from its start may ask
++/// another node for a read position first, as a lookup may), and every opcode this list
++/// does not know is offloaded: one thread hop, then exactly the dispatch the ring thread
++/// would have made, with the request still in the entry's buffers (`HeldRequest`).
++///
++/// "Answers from what it holds" is not "never waits": a callback on this list may still wait
++/// for a bounded time on its own node -- Constellation's `getattr`, `readlink` and xattr reads
++/// wait for the local replica to catch up with this node's own writes (at most
++/// `CONSTELLATION_SESSION_WAIT_MS`, then answer anyway), and any op may queue at the view's
++/// admission gate when `max_inflight_ops` is set -- exactly the waits a read already has.
++/// What it never does is wait on a remote store, a lease or another node's answer.
++///
++/// An offloaded request still holds its ring entry until it is answered, as does a read the
++/// filesystem answers later from another thread. That is what bounds blocking lock requests
++/// per queue (`RingCommit::reserve_lock_wait`).
++#[cfg(all(feature = "io-uring", target_os = "linux"))]
++pub(crate) fn dispatch_on_ring(opcode: u32) -> bool {
++    use crate::ll::fuse_abi::fuse_opcode::*;
++    matches!(
++        crate::ll::fuse_abi::fuse_opcode::try_from(opcode),
++        Ok(FUSE_READ
++            | FUSE_GETATTR
++            | FUSE_READLINK
++            | FUSE_GETXATTR
++            | FUSE_LISTXATTR
++            | FUSE_STATFS
++            | FUSE_ACCESS
++            | FUSE_RELEASEDIR
++            | FUSE_DESTROY)
++    )
 +}
 +
 +#[cfg(all(feature = "io-uring", target_os = "linux"))]
 +impl<FS: Filesystem> crate::uring::ring::FetchHandler for RingHandler<FS> {
 +    fn handle(&mut self, commit: RingCommit, request: &[u8]) {
-+        if self.panicked {
++        if self.panicked || self.offload_panicked.load(Ordering::SeqCst) {
 +            return commit.commit_errno(Errno::EIO);
++        }
++        // `fuse_in_header.opcode`; a request too short to have one is the parser's to refuse
++        let opcode = request
++            .get(4..8)
++            .map_or(u32::MAX, |b| u32::from_ne_bytes(b.try_into().unwrap()));
++        if request.len() >= 8 && !dispatch_on_ring(opcode) {
++            // The receiving end lives as long as any sender; if the offload threads are gone
++            // (spawning them failed part way), the request is served here after all
++            let mut held = commit.hold(request);
++            if opcode == crate::ll::fuse_abi::fuse_opcode::FUSE_SETLKW as u32
++                && !held.commit().reserve_lock_wait()
++            {
++                // This queue already has `depth - 1` blocking lock requests waiting on their
++                // entries; one more could take its last, which the lock holder's next request
++                // may need (`RingCommit::reserve_lock_wait`)
++                held.downgrade_lock_wait();
++            }
++            let Err(std::sync::mpsc::SendError(held)) = self.offload.send(held) else {
++                return;
++            };
++            let ctx = &self.ctx;
++            let dispatch = std::panic::AssertUnwindSafe(|| {
++                ctx.handle_fetch(held.commit().clone(), held.request())
++            });
++            if std::panic::catch_unwind(dispatch).is_err() {
++                self.panicked = true;
++                let _ = self.exit.events.send(Event::Panicked);
++            }
++            return;
 +        }
 +        // A ring thread must outlive its panicking callback: only it can submit the EIO the
 +        // unwind committed, and its kernel commands hold the mount's queues
@@ -1472,8 +1626,43 @@ index cee8718..54dcf09 100644
 +    }
 +}
 +
++/// CONSTELLATION PATCH (io-uring): one offload thread: dispatches what ring threads hand it
++/// (`dispatch_on_ring`), until every ring thread is gone.
++#[cfg(all(feature = "io-uring", target_os = "linux"))]
++fn offload_thread<FS: Filesystem>(
++    ctx: SessionEventLoop<FS>,
++    jobs: Arc<Mutex<std::sync::mpsc::Receiver<HeldRequest>>>,
++    events: std::sync::mpsc::Sender<Event>,
++    panicked: Arc<std::sync::atomic::AtomicBool>,
++) -> io::Result<()> {
++    loop {
++        let held = jobs.lock().recv();
++        let Ok(held) = held else {
++            return Ok(());
++        };
++        if panicked.load(Ordering::SeqCst) {
++            held.commit().commit_errno(Errno::EIO);
++            continue;
++        }
++        let dispatch = std::panic::AssertUnwindSafe(|| {
++            ctx.handle_fetch(held.commit().clone(), held.request())
++        });
++        if std::panic::catch_unwind(dispatch).is_err() {
++            // As on a ring thread: the reply went out as EIO during the unwind, later requests
++            // are answered EIO here, and the session ends with the panic
++            panicked.store(true, Ordering::SeqCst);
++            let _ = events.send(Event::Panicked);
++        }
++        // Dropping `held` ends the dispatch (`HeldRequest`'s doc), here and not on the ring
++    }
++}
++
 +/// Serves the session over its rings, with one `/dev/fuse` reader for the requests the kernel
 +/// never sends over a ring, until the connection ends or a thread fails.
++///
++/// CONSTELLATION PATCH (io-uring): plus `n_threads` offload threads for the requests a ring
++/// thread does not dispatch itself (`dispatch_on_ring`), so that a callback that blocks holds
++/// up one offload thread, as it holds up one reader of a `/dev/fuse` session, and not a ring.
 +///
 +/// The ring threads have no way to learn that the connection ended while every entry they
 +/// own is held by userspace, so they are told to leave once the `/dev/fuse` reader has seen
@@ -1482,6 +1671,12 @@ index cee8718..54dcf09 100644
 +/// to exit with the connection, which is still alive at that point and is not told to shut
 +/// down: `Session::run` callers end it by dropping the mount, a `Session::spawn` session
 +/// keeps it, answering EIO, until the `BackgroundSession` is dropped.
++///
++/// CONSTELLATION PATCH (io-uring): the offload threads are joined last on the clean path, and
++/// on the others left to exit with the ring threads that feed them, for the same reason: an
++/// offload thread leaves once every ring thread is gone, a ring thread once the connection
++/// ends, and `run`'s caller ends the connection only after `run` returns -- joining them on a
++/// panic or error path would hang `run` instead of reporting the failure.
 +#[cfg(all(feature = "io-uring", target_os = "linux"))]
 +fn serve_ring<FS: Filesystem>(
 +    mut ring: RingSet,
@@ -1494,6 +1689,28 @@ index cee8718..54dcf09 100644
 +        debug!("clone_fd has no effect with io_uring");
 +    }
 +    let (events_tx, events) = std::sync::mpsc::channel();
++    let (offload_tx, offload_rx) = std::sync::mpsc::channel::<HeldRequest>();
++    let offload_rx = Arc::new(Mutex::new(offload_rx));
++    let offload_panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let offload = spawn_named((0..config.n_threads.unwrap_or(1).max(1)).map(|i| {
++        let name = format!("fuser-offload-{i}");
++        let ctx = event_loop(name.clone(), ch.clone());
++        let (jobs, events, panicked) = (
++            offload_rx.clone(),
++            events_tx.clone(),
++            offload_panicked.clone(),
++        );
++        (name, move || offload_thread(ctx, jobs, events, panicked))
++    }));
++    drop(offload_rx);
++    let offload = match offload {
++        Ok(threads) => threads,
++        // The ring threads dispatch everything themselves then (`RingHandler::handle`)
++        Err(err) => {
++            error!("spawning the io_uring offload threads failed ({err}); dispatching on the rings");
++            Vec::new()
++        }
++    };
 +    ring.serve(|index| {
 +        Box::new(RingHandler {
 +            ctx: event_loop(format!("fuser-ring-{index}"), ch.clone()),
@@ -1502,8 +1719,13 @@ index cee8718..54dcf09 100644
 +                thread: index + 1,
 +            },
 +            panicked: false,
++            offload: offload_tx.clone(),
++            offload_panicked: offload_panicked.clone(),
 +        })
 +    })?;
++    // Only the ring threads' handlers hold senders now: the offload threads leave once the
++    // last ring thread is gone and its queued requests are served.
++    drop(offload_tx);
 +    let dev = spawn_named([("fuser-dev".to_string(), {
 +        let event_loop = event_loop("fuser-dev".to_string(), ch);
 +        let exit = ExitNotice {
@@ -1547,7 +1769,8 @@ index cee8718..54dcf09 100644
 +            Event::Exited(DEV) => {
 +                join_all(threads[DEV].take())?;
 +                ring.shutdown();
-+                return join_all(threads.into_iter().flatten());
++                join_all(threads.into_iter().flatten())?;
++                return join_all(offload);
 +            }
 +            // A ring leaving cleanly before the reader means the connection is ending
 +            Event::Exited(thread) => join_all(threads[thread].take())?,
@@ -1595,7 +1818,7 @@ index cee8718..54dcf09 100644
  #[derive(Debug)]
  /// A thread-safe object that can be used to unmount a Filesystem
  pub struct SessionUnmounter {
-@@ -853,7 +1277,12 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
+@@ -853,7 +1429,12 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
              };
              match received {
                  Ok(None) => return Ok(LoopEnd::Stopped),
@@ -1609,7 +1832,7 @@ index cee8718..54dcf09 100644
                      // Dispatch request
                      Some(req) => {
                          if let Ok(Operation::Destroy(_)) = req.request.operation() {
-@@ -876,6 +1305,29 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
+@@ -876,6 +1457,28 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
              }
          }
      }
@@ -1626,9 +1849,8 @@ index cee8718..54dcf09 100644
 +                return commit.commit_errno(Errno::EIO);
 +            }
 +        };
-+        // TODO(38-z2a): this runs on the ring thread itself, so a request that blocks here
-+        // (a flush/release/fsync waiting on S3) stalls every other request the kernel queues
-+        // on this ring; offload blocking ops or hand fetched entries to a worker pool.
++        // CONSTELLATION PATCH (io-uring): on the ring thread for what `dispatch_on_ring`
++        // keeps there, on an offload thread for the rest (`offload_thread`).
 +        let req = RequestWithSender::from_request(ReplySender::Ring(commit), request);
 +        if let Ok(Operation::Destroy(_)) = req.request.operation() {
 +            req.reply::<ReplyEmpty>().ok();
@@ -1639,7 +1861,7 @@ index cee8718..54dcf09 100644
  }
  
  /// The background session data structure
-@@ -915,3 +1367,2409 @@ impl BackgroundSession {
+@@ -915,3 +1518,2462 @@ impl BackgroundSession {
              })?
      }
  }
@@ -3853,6 +4075,54 @@ index cee8718..54dcf09 100644
 +        m.finish();
 +    }
 +
++    /// CONSTELLATION PATCH (io-uring): a REGISTER the kernel refuses after the INIT reply has
++    /// committed the connection to rings fails the constructor with `RegistrationRefused` --
++    /// not a session whose every request hangs on queues that never become ready -- and the
++    /// failed session's drop unmounts, so a caller can mount again (plan 38 §2.4, the
++    /// "refused ring registration mid-INIT" rung). The kernel's own refusal, provoked with a
++    /// malformed REGISTER (one iovec instead of two).
++    #[test]
++    fn a_refused_registration_fails_the_constructor_and_unmounts() {
++        let _serial = serial();
++        if let Some(why) = uring_unavailable() {
++            eprintln!("skipping a_refused_registration_fails_the_constructor_and_unmounts: {why}");
++            return;
++        }
++        let m = Mounted::new();
++        let config = Config {
++            io_uring_malformed_register: true,
++            ..ring_config()
++        };
++        let err = Session::new(RingFs::default(), &m.mountpoint, &config)
++            .err()
++            .expect("a malformed REGISTER is refused");
++        assert!(crate::RegistrationRefused::is(&err), "{err}");
++        let refused = err
++            .get_ref()
++            .and_then(|e| e.downcast_ref::<crate::RegistrationRefused>())
++            .unwrap();
++        assert_eq!(refused.kernel_error().raw_os_error(), Some(libc::EINVAL));
++        // Every REGISTER was refused, so nothing is in the kernel and nothing is leaked (the
++        // size names this session's one ring, not a ring unit test's running alongside)
++        let leaked = format!("leaking {} bytes", reserved_bytes(8));
++        assert!(
++            logged(log::Level::Error, &leaked).is_empty(),
++            "{:?}",
++            logged(log::Level::Error, "")
++        );
++        assert!(
++            wait_ring_threads_gone(Duration::from_secs(5)),
++            "{:?}",
++            thread_names()
++        );
++        assert_not_mounted(&m.mountpoint);
++        // The host is fine; the same mountpoint takes a ring session at once
++        let bg = m.session(RingFs::default(), &ring_config()).spawn().unwrap();
++        assert_eq!(std::fs::read(m.path("hello.txt")).unwrap(), HELLO);
++        bg.umount_and_join().unwrap();
++        m.finish();
++    }
++
 +    #[test]
 +    fn late_reply_after_the_connection_ended_is_not_an_error() {
 +        let _serial = serial();
@@ -3905,10 +4175,15 @@ index cee8718..54dcf09 100644
 +        std::fs::write(abort_path, b"1").unwrap();
 +        umount_and_join_within(bg, Duration::from_secs(5))
 +            .expect("session must end cleanly after the connection was aborted");
-+        let exited = logged(log::Level::Debug, "ring 0 exited");
-+        assert_eq!(
-+            exited,
-+            ["io_uring: ring 0 exited, in_kernel=0 outstanding=0"]
++        // CONSTELLATION PATCH (io-uring): the RELEASE that follows the read runs on an offload
++        // thread (`dispatch_on_ring`) and may still be held when the abort lands; its reply is
++        // then dropped (at debug level) once the ring has left. Nothing may be left in the
++        // kernel, and nothing may be an error.
++        let exited = logged(log::Level::Debug, "ring 0 exited,");
++        assert_eq!(exited.len(), 1, "{exited:?}");
++        assert!(
++            exited[0].starts_with("io_uring: ring 0 exited, in_kernel=0 outstanding="),
++            "{exited:?}"
 +        );
 +        assert!(logged(log::Level::Error, "ring 0").is_empty());
 +        // The dead mount stays in the table after an abort, as after any abort
@@ -4324,12 +4599,503 @@ index 0000000..d0c1426
 +        assert!(RingMemory::new(1, 1 << 32).is_err(), "payload_sz is a u32");
 +    }
 +}
+diff --git a/src/uring/memory.rs b/src/uring/memory.rs
+new file mode 100644
+index 0000000..ab2babf
+--- /dev/null
++++ b/src/uring/memory.rs
+@@ -0,0 +1,485 @@
++//! CONSTELLATION PATCH (io-uring): this whole file is Constellation's, not upstream
++//! fuser's (vendor/fuser/CONSTELLATION-PATCH.md, patches/0002-io-uring-transport.patch).
++//!
++//! An in-memory stand-in for the kernel's half of FUSE-over-io_uring, so that a test can drive
++//! a whole ring session -- `Session`, its ring threads, the entry state machine, the commit
++//! protocol, replies from foreign threads -- without io_uring, a mount, root or
++//! `fuse.enable_uring=Y` (plan 38 §6).
++//!
++//! The seam is `RingIo` (`ring.rs`): a ring thread pushes exactly the SQEs it pushes to the
++//! kernel and reaps CQEs of exactly the kernel's shape. This backend decodes each SQE the way
++//! `fs/fuse/dev_uring.c` does -- `IORING_OP_URING_CMD` carrying `FUSE_IO_URING_CMD_REGISTER`
++//! (two iovecs: the entry's header and payload) or `COMMIT_AND_FETCH` (a `commit_id` and a
++//! queue), and `IORING_OP_POLL_ADD` of the ring's wake eventfd -- writes each request into a
++//! registered entry through the iovecs its REGISTER named (`fuse_in_header` into the header,
++//! the op's fixed arguments into `op_in`, the rest into the payload, `commit_id` and
++//! `payload_sz` into the trailer), and on a commit reads the reply back out of the same
++//! buffers, in the `/dev/fuse` wire shape. Everything above `RingIo` is the production code.
++//!
++//! What it does not model: which CPU's queue a request lands on (the test names the queue),
++//! `FUSE_INTERRUPT`, and the kernel's own request lifetimes. `FUSE_INIT` goes over the session's
++//! `/dev/fuse` descriptor as it does in the kernel, so a test pairs this with a socket pair.
++
++use std::collections::HashMap;
++use std::collections::VecDeque;
++use std::fmt;
++use std::io;
++use std::os::fd::AsFd;
++use std::os::fd::BorrowedFd;
++use std::os::fd::RawFd;
++use std::ptr;
++use std::sync::Arc;
++use std::time::Duration;
++use std::time::Instant;
++
++use nix::poll::PollFd;
++use nix::poll::PollFlags;
++use nix::poll::PollTimeout;
++use nix::sys::eventfd::EfdFlags;
++use nix::sys::eventfd::EventFd;
++use parking_lot::Condvar;
++use parking_lot::Mutex;
++
++use crate::ll::fuse_abi as abi;
++use crate::uring::mem::COMMIT_ID_OFFSET;
++use crate::uring::mem::HEADER_SZ;
++use crate::uring::mem::OP_IN_OFFSET;
++use crate::uring::mem::PAYLOAD_SZ_OFFSET;
++use crate::uring::ring::WAKE;
++
++const IORING_OP_POLL_ADD: u8 = 6;
++const IORING_OP_URING_CMD: u8 = 46;
++const IORING_CQE_F_MORE: u32 = 1 << 1;
++const IN_HEADER_SZ: usize = size_of::<abi::fuse_in_header>();
++const OUT_HEADER_SZ: usize = size_of::<abi::fuse_out_header>();
++
++/// The kernel side of an in-memory FUSE-over-io_uring connection; see the module doc.
++///
++/// Give it to a session through `Config::io_uring_kernel` (with `Config::io_uring` set) and
++/// offer `FUSE_OVER_IO_URING` in the `FUSE_INIT` written to the session's descriptor: the
++/// session then creates its rings on this backend instead of `io_uring_setup(2)`, registers
++/// every entry here, and serves what [`Self::send`] queues. Cloning shares the connection.
++#[derive(Clone)]
++pub struct InMemoryRingKernel {
++    shared: Arc<Shared>,
++}
++
++struct Shared {
++    state: Mutex<State>,
++    replied: Condvar,
++}
++
++/// A registered entry's two buffers, as the REGISTER's iovecs named them.
++#[derive(Clone, Copy)]
++struct Buffers {
++    header: *mut u8,
++    payload: *mut u8,
++    payload_len: usize,
++}
++
++// SAFETY: the pointers name a ring's mapping, which its `Ring` keeps mapped while an entry is
++// registered (it leaks the mapping rather than unmap it while a command is pending), and are
++// only dereferenced under `Shared::state`'s lock while the entry is with this "kernel".
++unsafe impl Send for Buffers {}
++
++struct Entry {
++    ring: usize,
++    qid: u16,
++    buffers: Buffers,
++    /// `Some(commit_id)` while a request delivered into it awaits its commit.
++    busy: Option<u64>,
++}
++
++struct RingState {
++    /// Completions not yet reaped, as `(user_data, res, flags)`.
++    cq: VecDeque<(u64, i32, u32)>,
++    /// The eventfd the ring's multishot `POLL_ADD` watches, once armed.
++    wake: Option<RawFd>,
++    /// Rings the ring thread's `poll(2)` when this side posts a completion.
++    doorbell: Arc<EventFd>,
++}
++
++#[derive(Default)]
++struct State {
++    rings: Vec<RingState>,
++    /// By `user_data`, which is unique per entry across the session's rings.
++    entries: HashMap<u64, Entry>,
++    queued: HashMap<u16, VecDeque<(Vec<u8>, usize)>>,
++    replies: VecDeque<Vec<u8>>,
++    /// The connection ended: every parked fetch and later command completes `-ENOTCONN`.
++    hung_up: bool,
++    /// Refuse every REGISTER with this errno, as the kernel refuses a malformed one.
++    refuse_register: Option<i32>,
++    delivered: u64,
++}
++
++impl fmt::Debug for InMemoryRingKernel {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let state = self.shared.state.lock();
++        f.debug_struct("InMemoryRingKernel")
++            .field("rings", &state.rings.len())
++            .field("registered", &state.entries.len())
++            .field("hung_up", &state.hung_up)
++            .finish_non_exhaustive()
++    }
++}
++
++/// Two handles are equal when they are the same connection (`Config` is `Eq`).
++impl PartialEq for InMemoryRingKernel {
++    fn eq(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.shared, &other.shared)
++    }
++}
++
++impl Eq for InMemoryRingKernel {}
++
++impl Default for InMemoryRingKernel {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl InMemoryRingKernel {
++    /// A connection that accepts every well-formed REGISTER.
++    pub fn new() -> Self {
++        Self {
++            shared: Arc::new(Shared {
++                state: Mutex::new(State::default()),
++                replied: Condvar::new(),
++            }),
++        }
++    }
++
++    /// A connection that refuses every REGISTER with `errno`, synchronously, as the kernel
++    /// refuses one it cannot accept: the session's constructor then fails (the INIT reply has
++    /// already committed the connection to rings) and the caller decides what to do.
++    pub fn refusing_registration(errno: i32) -> Self {
++        let kernel = Self::new();
++        kernel.shared.state.lock().refuse_register = Some(errno);
++        kernel
++    }
++
++    /// Queues `request` -- a whole `/dev/fuse` request: `fuse_in_header`, the op's fixed
++    /// arguments (`op_in_len` bytes, a multiple of 8, at most 128), then its payload -- on
++    /// queue `qid`. It is delivered into the next entry of that queue the session has
++    /// registered and not yet been handed a request in, scattered as the kernel scatters it.
++    pub fn send(&self, qid: u16, request: &[u8], op_in_len: usize) {
++        assert!(request.len() >= IN_HEADER_SZ + op_in_len, "a whole request");
++        assert!(
++            op_in_len % 8 == 0 && op_in_len <= abi::FUSE_URING_OP_IN_OUT_SZ,
++            "op_in is whole 8-byte words, at most 128 bytes"
++        );
++        let mut state = self.shared.state.lock();
++        state
++            .queued
++            .entry(qid)
++            .or_default()
++            .push_back((request.to_vec(), op_in_len));
++        state.deliver();
++    }
++
++    /// The next reply a commit carried, in the `/dev/fuse` wire shape (`fuse_out_header`,
++    /// then `payload_sz` bytes), or `None` if none arrives within `timeout`.
++    pub fn recv(&self, timeout: Duration) -> Option<Vec<u8>> {
++        let deadline = Instant::now() + timeout;
++        let mut state = self.shared.state.lock();
++        loop {
++            if let Some(reply) = state.replies.pop_front() {
++                return Some(reply);
++            }
++            if self
++                .shared
++                .replied
++                .wait_until(&mut state, deadline)
++                .timed_out()
++            {
++                return state.replies.pop_front();
++            }
++        }
++    }
++
++    /// Entries registered by the session (on every ring) and not refused.
++    pub fn registered(&self) -> usize {
++        self.shared.state.lock().entries.len()
++    }
++
++    /// Requests delivered into an entry so far.
++    pub fn delivered(&self) -> u64 {
++        self.shared.state.lock().delivered
++    }
++
++    /// The connection ends, as at unmount or a fusectl abort: every entry parked for a fetch
++    /// completes `-ENOTCONN`, and so does every command pushed later.
++    pub fn hang_up(&self) {
++        let mut state = self.shared.state.lock();
++        state.hung_up = true;
++        let parked: Vec<u64> = state
++            .entries
++            .iter()
++            .filter(|(_, e)| e.busy.is_none())
++            .map(|(ud, _)| *ud)
++            .collect();
++        for ud in parked {
++            let ring = state.entries.remove(&ud).unwrap().ring;
++            state.complete(ring, ud, -libc::ENOTCONN, 0);
++        }
++    }
++
++    /// The backend of ring `index` of the session (`RingSet::new`).
++    pub(crate) fn ring(&self, index: usize) -> io::Result<MemoryRing> {
++        let doorbell = Arc::new(
++            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
++                .map_err(io::Error::from)?,
++        );
++        let mut state = self.shared.state.lock();
++        if state.rings.len() <= index {
++            state.rings.resize_with(index + 1, || RingState {
++                cq: VecDeque::new(),
++                wake: None,
++                doorbell: doorbell.clone(),
++            });
++        }
++        state.rings[index] = RingState {
++            cq: VecDeque::new(),
++            wake: None,
++            doorbell: doorbell.clone(),
++        };
++        Ok(MemoryRing {
++            kernel: self.clone(),
++            index,
++            doorbell,
++            sq: Vec::new(),
++        })
++    }
++}
++
++fn u16_at(b: &[u8], off: usize) -> u16 {
++    u16::from_ne_bytes(b[off..off + 2].try_into().unwrap())
++}
++
++fn u32_at(b: &[u8], off: usize) -> u32 {
++    u32::from_ne_bytes(b[off..off + 4].try_into().unwrap())
++}
++
++fn u64_at(b: &[u8], off: usize) -> u64 {
++    u64::from_ne_bytes(b[off..off + 8].try_into().unwrap())
++}
++
++impl State {
++    fn complete(&mut self, ring: usize, user_data: u64, res: i32, flags: u32) {
++        if let Some(r) = self.rings.get_mut(ring) {
++            r.cq.push_back((user_data, res, flags));
++            let _ = r.doorbell.write(1);
++        }
++    }
++
++    /// One SQE of ring `ring`, as `io_uring_enter` issues it.
++    fn issue(&mut self, ring: usize, sqe: &[u8; 128], replied: &Condvar) {
++        let user_data = u64_at(sqe, 32);
++        match sqe[0] {
++            IORING_OP_POLL_ADD => {
++                if let Some(r) = self.rings.get_mut(ring) {
++                    r.wake = Some(u32_at(sqe, 4) as RawFd);
++                }
++            }
++            IORING_OP_URING_CMD if self.hung_up => {
++                self.complete(ring, user_data, -libc::ENOTCONN, 0)
++            }
++            IORING_OP_URING_CMD => {
++                let qid = u16_at(sqe, 64);
++                let commit_id = u64_at(sqe, 56);
++                match u32_at(sqe, 8) {
++                    c if c == abi::fuse_uring_cmd::FUSE_IO_URING_CMD_REGISTER as u32 => {
++                        // `fuse_uring_get_iovec_from_sqe`: exactly two iovecs
++                        if u32_at(sqe, 24) != 2 {
++                            return self.complete(ring, user_data, -libc::EINVAL, 0);
++                        }
++                        if let Some(errno) = self.refuse_register {
++                            return self.complete(ring, user_data, -errno, 0);
++                        }
++                        let iov = u64_at(sqe, 16) as *const libc::iovec;
++                        // SAFETY: a REGISTER names its entry's `[libc::iovec; 2]`, which lives
++                        // as long as the ring (`RingEntry::iov`).
++                        let (header, payload) = unsafe { (ptr::read(iov), ptr::read(iov.add(1))) };
++                        if header.iov_len < HEADER_SZ {
++                            return self.complete(ring, user_data, -libc::EINVAL, 0);
++                        }
++                        self.entries.insert(
++                            user_data,
++                            Entry {
++                                ring,
++                                qid,
++                                buffers: Buffers {
++                                    header: header.iov_base.cast(),
++                                    payload: payload.iov_base.cast(),
++                                    payload_len: payload.iov_len,
++                                },
++                                busy: None,
++                            },
++                        );
++                        self.deliver();
++                    }
++                    c if c == abi::fuse_uring_cmd::FUSE_IO_URING_CMD_COMMIT_AND_FETCH as u32 => {
++                        let Some(entry) = self
++                            .entries
++                            .get_mut(&user_data)
++                            .filter(|e| e.qid == qid && e.busy == Some(commit_id))
++                        else {
++                            // `fuse_uring_commit_fetch`: no request with this id in flight
++                            return self.complete(ring, user_data, -libc::ENOENT, 0);
++                        };
++                        entry.busy = None;
++                        let b = entry.buffers;
++                        // SAFETY: the entry was with userspace until this commit, whose
++                        // submit hands its buffers back; the header area holds the 16-byte
++                        // out header and the trailer, the payload `payload_sz` bytes, as the
++                        // kernel's `fuse_uring_copy_from_ring` reads them.
++                        let reply = unsafe {
++                            let payload_sz =
++                                ptr::read_unaligned(b.header.add(PAYLOAD_SZ_OFFSET).cast::<u32>())
++                                    as usize;
++                            let mut reply = vec![0u8; OUT_HEADER_SZ + payload_sz.min(b.payload_len)];
++                            ptr::copy_nonoverlapping(b.header, reply.as_mut_ptr(), OUT_HEADER_SZ);
++                            ptr::copy_nonoverlapping(
++                                b.payload,
++                                reply.as_mut_ptr().add(OUT_HEADER_SZ),
++                                reply.len() - OUT_HEADER_SZ,
++                            );
++                            reply
++                        };
++                        self.replies.push_back(reply);
++                        replied.notify_all();
++                        self.deliver();
++                    }
++                    _ => self.complete(ring, user_data, -libc::EINVAL, 0),
++                }
++            }
++            _ => self.complete(ring, user_data, -libc::EINVAL, 0),
++        }
++    }
++
++    /// Hands queued requests to parked entries of their queues.
++    fn deliver(&mut self) {
++        if self.hung_up {
++            return;
++        }
++        let mut parked: Vec<u64> = self
++            .entries
++            .iter()
++            .filter(|(_, e)| e.busy.is_none())
++            .map(|(ud, _)| *ud)
++            .collect();
++        parked.sort_unstable();
++        for ud in parked {
++            let qid = self.entries[&ud].qid;
++            let Some((request, op_in_len)) = self.queued.get_mut(&qid).and_then(VecDeque::pop_front)
++            else {
++                continue;
++            };
++            let entry = self.entries.get_mut(&ud).unwrap();
++            let b = entry.buffers;
++            let unique = u64_at(&request, 8);
++            let op_in = &request[IN_HEADER_SZ..IN_HEADER_SZ + op_in_len];
++            let payload = &request[IN_HEADER_SZ + op_in_len..];
++            assert!(
++                payload.len() <= b.payload_len,
++                "a request's payload fits the entry's buffer"
++            );
++            // SAFETY: the entry is parked with this "kernel" (its REGISTER or commit is
++            // pending), so nothing in userspace touches its buffers; every write lies inside
++            // the header area or the payload buffer the REGISTER named.
++            unsafe {
++                ptr::copy_nonoverlapping(request.as_ptr(), b.header, IN_HEADER_SZ);
++                ptr::copy_nonoverlapping(op_in.as_ptr(), b.header.add(OP_IN_OFFSET), op_in.len());
++                ptr::write_unaligned(b.header.add(COMMIT_ID_OFFSET).cast::<u64>(), unique);
++                ptr::write_unaligned(
++                    b.header.add(PAYLOAD_SZ_OFFSET).cast::<u32>(),
++                    payload.len() as u32,
++                );
++                ptr::copy_nonoverlapping(payload.as_ptr(), b.payload, payload.len());
++            }
++            entry.busy = Some(unique);
++            let ring = entry.ring;
++            self.delivered += 1;
++            self.complete(ring, ud, 0, 0);
++        }
++    }
++}
++
++/// One ring's view of an `InMemoryRingKernel`: its submission queue, and its completion queue
++/// in the shared state. Owned by the ring thread, as an io_uring is.
++pub(crate) struct MemoryRing {
++    kernel: InMemoryRingKernel,
++    index: usize,
++    doorbell: Arc<EventFd>,
++    sq: Vec<[u8; 128]>,
++}
++
++impl MemoryRing {
++    pub(crate) fn push(&mut self, sqe: [u8; 128]) {
++        self.sq.push(sqe);
++    }
++
++    pub(crate) fn submit(&mut self) -> io::Result<usize> {
++        let n = self.sq.len();
++        let shared = &self.kernel.shared;
++        let mut state = shared.state.lock();
++        for sqe in self.sq.drain(..) {
++            state.issue(self.index, &sqe, &shared.replied);
++        }
++        Ok(n)
++    }
++
++    /// Submits, then blocks until a completion is posted or the wake eventfd is readable (a
++    /// commit from another thread), as `io_uring_enter(.., min_complete = 1, ..)` with the
++    /// multishot poll armed would; `timed` bounds the wait to 10 ms.
++    pub(crate) fn submit_and_wait(&mut self, timed: bool) -> io::Result<usize> {
++        let n = self.submit()?;
++        loop {
++            let wake = {
++                let mut state = self.kernel.shared.state.lock();
++                let ring = &mut state.rings[self.index];
++                if !ring.cq.is_empty() {
++                    return Ok(n);
++                }
++                ring.wake
++            };
++            // SAFETY: the wake eventfd belongs to the `Ring` this ring thread serves, which
++            // outlives the thread's loop.
++            let wake_fd = wake.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
++            let mut fds = vec![PollFd::new(self.doorbell.as_fd(), PollFlags::POLLIN)];
++            if let Some(fd) = wake_fd {
++                fds.push(PollFd::new(fd, PollFlags::POLLIN));
++            }
++            let timeout = if timed {
++                PollTimeout::from(10u16)
++            } else {
++                PollTimeout::NONE
++            };
++            match nix::poll::poll(&mut fds, timeout) {
++                Ok(0) => return Ok(n),
++                Ok(_) => {}
++                Err(nix::errno::Errno::EINTR) => continue,
++                Err(err) => return Err(err.into()),
++            }
++            let woken = fds
++                .get(1)
++                .and_then(PollFd::revents)
++                .is_some_and(|r| r.contains(PollFlags::POLLIN));
++            let _ = self.doorbell.read();
++            if woken {
++                // The multishot poll fires; the ring thread drains the eventfd itself
++                let mut state = self.kernel.shared.state.lock();
++                state.rings[self.index]
++                    .cq
++                    .push_back((WAKE, libc::POLLIN as i32, IORING_CQE_F_MORE));
++                return Ok(n);
++            }
++        }
++    }
++
++    pub(crate) fn reap(&mut self, out: &mut impl Extend<(u64, i32, u32)>) {
++        let mut state = self.kernel.shared.state.lock();
++        out.extend(state.rings[self.index].cq.drain(..));
++    }
++}
 diff --git a/src/uring/mod.rs b/src/uring/mod.rs
 new file mode 100644
-index 0000000..8a051af
+index 0000000..ac633cf
 --- /dev/null
 +++ b/src/uring/mod.rs
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,490 @@
 +//! CONSTELLATION PATCH (io-uring): this whole file is Constellation's, not upstream
 +//! fuser's (vendor/fuser/CONSTELLATION-PATCH.md, patches/0002-io-uring-transport.patch).
 +//!
@@ -4344,6 +5110,7 @@ index 0000000..8a051af
 +//! `io_uring_enter` rather than being signalled to it.
 +
 +pub(crate) mod mem;
++pub(crate) mod memory;
 +pub(crate) mod ring;
 +pub(crate) mod staging;
 +
@@ -4400,12 +5167,18 @@ index 0000000..8a051af
 +    /// Opens the io_urings of `min(n_threads, queues)` rings over every possible CPU's queue,
 +    /// reserves their buffers and spawns their parked threads. The error text names what
 +    /// failed, for the session's fallback warning.
++    ///
++    /// CONSTELLATION PATCH (io-uring): `backend` serves the rings from an `InMemoryRingKernel`
++    /// instead of `io_uring_setup(2)`; `malformed_register` makes every REGISTER one the kernel
++    /// refuses (`Ring::set_malformed_register`), for the fault-injection tests of the fallback.
 +    pub(crate) fn new(
 +        device: Arc<DevFuse>,
 +        mounted: bool,
 +        n_threads: usize,
 +        depth: u32,
 +        payload_cap: usize,
++        backend: Option<&memory::InMemoryRingKernel>,
++        malformed_register: bool,
 +    ) -> io::Result<Self> {
 +        let n_queues = possible_cpus().map_err(|err| {
 +            io::Error::other(format!("the possible CPU count is unknown ({err})"))
@@ -4431,9 +5204,15 @@ index 0000000..8a051af
 +        for (index, qids) in rings.into_iter().enumerate() {
 +            // The cheapest and likeliest refusal (a sandbox without io_uring) comes first
 +            let (sq, cq) = ring_sizes(qids.len() * depth as usize);
-+            let io = RingIo::open(sq, cq)
-+                .map_err(|err| io::Error::other(format!("io_uring_setup failed ({err})")))?;
++            let io = match backend {
++                Some(kernel) => RingIo::memory(kernel.ring(index)?),
++                None => RingIo::open(sq, cq)
++                    .map_err(|err| io::Error::other(format!("io_uring_setup failed ({err})")))?,
++            };
 +            let ring = Ring::new(index, mounted, device.clone(), &qids, depth, payload_cap)?;
++            if malformed_register {
++                ring.set_malformed_register();
++            }
 +            let (go_tx, go_rx) = mpsc::channel();
 +            let (registered_tx, registered_rx) = mpsc::channel();
 +            let (handler_tx, handler_rx) = mpsc::channel();
@@ -4525,6 +5304,50 @@ index 0000000..8a051af
 +        }
 +    }
 +}
++
++/// CONSTELLATION PATCH (io-uring): the kernel refused a ring's registration after the
++/// `FUSE_INIT` reply had committed the connection to rings.
++///
++/// The kernel validates a REGISTER when it is issued and refuses a malformed one at once (see
++/// `Ring::register_all`). Nothing can serve such a connection: the kernel does not route its
++/// requests back to `/dev/fuse` (plan 38 Z0a), and holds every one of them until the ring is
++/// ready. So the session's constructor fails with this, wrapped in an `io::Error`, and its drop
++/// ends the connection; a caller that wants the plan 38 §2.4 ladder mounts again without the
++/// ring ([`Self::is`] tells this refusal from any other failure of the constructor).
++#[derive(Debug)]
++pub struct RegistrationRefused {
++    ring: usize,
++    qid: u16,
++    error: io::Error,
++}
++
++impl RegistrationRefused {
++    pub(crate) fn error(ring: usize, qid: u16, error: io::Error) -> io::Error {
++        io::Error::other(Self { ring, qid, error })
++    }
++
++    /// Whether `err` is a refused registration.
++    pub fn is(err: &io::Error) -> bool {
++        err.get_ref().is_some_and(|e| e.is::<Self>())
++    }
++
++    /// The kernel's own error.
++    pub fn kernel_error(&self) -> &io::Error {
++        &self.error
++    }
++}
++
++impl fmt::Display for RegistrationRefused {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            f,
++            "the kernel refused to register io_uring queue {} of ring {} ({})",
++            self.qid, self.ring, self.error
++        )
++    }
++}
++
++impl std::error::Error for RegistrationRefused {}
 +
 +/// Number of queues the kernel expects, from `num_possible_cpus()`.
 +///
@@ -4667,13 +5490,13 @@ index 0000000..8a051af
 +        let device = Arc::new(DevFuse(fs::File::open("/dev/zero").unwrap()));
 +        let queues = usize::from(possible_cpus().unwrap());
 +        let depth = (IORING_MAX_ENTRIES / queues + 1) as u32;
-+        let err = RingSet::new(device.clone(), true, 1, depth, 8192).unwrap_err();
++        let err = RingSet::new(device.clone(), true, 1, depth, 8192, None, false).unwrap_err();
 +        assert!(
 +            err.to_string()
 +                .starts_with(&format!("{queues} queues x depth {depth} exceed")),
 +            "{err}"
 +        );
-+        assert!(RingSet::new(device, true, 1, u32::MAX, 8192).is_err());
++        assert!(RingSet::new(device, true, 1, u32::MAX, 8192, None, false).is_err());
 +    }
 +
 +    #[test]
@@ -4765,10 +5588,10 @@ index 0000000..8a051af
 +}
 diff --git a/src/uring/ring.rs b/src/uring/ring.rs
 new file mode 100644
-index 0000000..b8f63be
+index 0000000..99620d4
 --- /dev/null
 +++ b/src/uring/ring.rs
-@@ -0,0 +1,3280 @@
+@@ -0,0 +1,3827 @@
 +//! CONSTELLATION PATCH (io-uring): this whole file is Constellation's, not upstream
 +//! fuser's (vendor/fuser/CONSTELLATION-PATCH.md, patches/0002-io-uring-transport.patch).
 +//!
@@ -4854,10 +5677,27 @@ index 0000000..b8f63be
 +}
 +
 +/// The io_uring instance, owned by the ring thread alone; nothing else may touch it.
++///
++/// CONSTELLATION PATCH (io-uring): the instance is one of two backends. `Kernel` is the real
++/// io_uring; `Memory` is `InMemoryRingKernel`'s (`uring::memory`), which decodes the same SQEs
++/// the way the kernel does and answers with the same CQEs, so that everything above this type
++/// -- the ring thread's loop, the entry state machine, the commit protocol, the session -- runs
++/// unchanged in a test with no io_uring, no mount and no root (plan 38 §6).
 +pub(crate) struct RingIo {
-+    io: IoUring<squeue::Entry128, cqueue::Entry>,
++    io: Backend,
++    /// CQEs reaped right after the REGISTER submit (to see the kernel's synchronous refusals);
++    /// whatever else was among them is handed to the first pass of `serve`.
++    early: SmallVec<[(u64, i32, u32); 8]>,
 +    #[cfg(test)]
 +    hooks: test::IoHooks,
++}
++
++/// CONSTELLATION PATCH (io-uring): see `RingIo`.
++/// The kernel's instance is boxed: it is several times the size of the in-memory one, and
++/// lives as long as the ring, so the one allocation buys nothing back by being inline.
++enum Backend {
++    Kernel(Box<IoUring<squeue::Entry128, cqueue::Entry>>),
++    Memory(crate::uring::memory::MemoryRing),
 +}
 +
 +impl RingIo {
@@ -4873,10 +5713,30 @@ index 0000000..b8f63be
 +            .setup_r_disabled()
 +            .build(sq_entries)?;
 +        Ok(Self {
-+            io,
++            io: Backend::Kernel(Box::new(io)),
++            early: SmallVec::new(),
 +            #[cfg(test)]
 +            hooks: test::IoHooks::default(),
 +        })
++    }
++
++    /// CONSTELLATION PATCH (io-uring): a ring served by an `InMemoryRingKernel`.
++    pub(crate) fn memory(ring: crate::uring::memory::MemoryRing) -> Self {
++        Self {
++            io: Backend::Memory(ring),
++            early: SmallVec::new(),
++            #[cfg(test)]
++            hooks: test::IoHooks::default(),
++        }
++    }
++
++    /// The real io_uring, for tests that poke at it directly.
++    #[cfg(test)]
++    pub(crate) fn uring(&mut self) -> &mut IoUring<squeue::Entry128, cqueue::Entry> {
++        match &mut self.io {
++            Backend::Kernel(io) => io,
++            Backend::Memory(_) => panic!("not a kernel io_uring"),
++        }
 +    }
 +
 +    /// Enables the ring and binds the calling thread as its issuer; every later
@@ -4884,44 +5744,89 @@ index 0000000..b8f63be
 +    fn enable(&mut self) -> io::Result<()> {
 +        #[cfg(test)]
 +        self.hooks.before_enable()?;
-+        self.io.submitter().register_enable_rings()
++        match &mut self.io {
++            Backend::Kernel(io) => io.submitter().register_enable_rings(),
++            Backend::Memory(_) => Ok(()),
++        }
 +    }
 +
 +    fn submit(&mut self) -> io::Result<usize> {
 +        #[cfg(test)]
 +        self.hooks.before_submit()?;
-+        self.io.submit()
++        match &mut self.io {
++            Backend::Kernel(io) => io.submit(),
++            Backend::Memory(m) => m.submit(),
++        }
 +    }
 +
 +    /// Submits the queue and waits for one CQE; `timed` bounds the wait to 10 ms.
 +    fn submit_and_wait(&mut self, timed: bool) -> io::Result<usize> {
-+        if timed {
-+            let ts = types::Timespec::new().nsec(10_000_000);
-+            let args = types::SubmitArgs::new().timespec(&ts);
-+            self.io.submitter().submit_with_args(1, &args)
-+        } else {
-+            self.io.submit_and_wait(1)
++        if !self.early.is_empty() {
++            return self.submit();
++        }
++        match &mut self.io {
++            Backend::Kernel(io) if timed => {
++                let ts = types::Timespec::new().nsec(10_000_000);
++                let args = types::SubmitArgs::new().timespec(&ts);
++                io.submitter().submit_with_args(1, &args)
++            }
++            Backend::Kernel(io) => io.submit_and_wait(1),
++            Backend::Memory(m) => m.submit_and_wait(timed),
 +        }
 +    }
 +
 +    /// Pushes one SQE, making room with a `submit` when the queue is full. `Err` means the
 +    /// SQE was not pushed.
 +    fn push_or_submit(&mut self, sqe: &squeue::Entry128) -> io::Result<()> {
++        let io = match &mut self.io {
++            Backend::Kernel(io) => io,
++            Backend::Memory(m) => {
++                m.push(sqe_bytes(sqe.clone()));
++                return Ok(());
++            }
++        };
 +        // SAFETY: every buffer an SQE names lives in `Ring::mem`, which stays mapped while a
 +        // command is pending (`Drop for Ring`), or in a `RingEntry::iov` that lives as long.
-+        if unsafe { self.io.submission().push(sqe) }.is_ok() {
++        if unsafe { io.submission().push(sqe) }.is_ok() {
 +            return Ok(());
 +        }
-+        self.submit()?;
++        {
++            #[cfg(test)]
++            self.hooks.before_submit()?;
++            io.submit()
++        }?;
 +        // SAFETY: as above.
-+        unsafe { self.io.submission().push(sqe) }
++        unsafe { io.submission().push(sqe) }
 +            .map_err(|_| io::Error::other("submission queue still full after submit"))
 +    }
++
++    /// Every CQE available now, as `(user_data, res, flags)`, the early ones first.
++    fn reap(&mut self) -> SmallVec<[(u64, i32, u32); 64]> {
++        let mut cqes: SmallVec<[(u64, i32, u32); 64]> = self.early.drain(..).collect();
++        match &mut self.io {
++            Backend::Kernel(io) => {
++                cqes.extend(
++                    io.completion()
++                        .map(|c| (c.user_data(), c.result(), c.flags())),
++                );
++            }
++            Backend::Memory(m) => m.reap(&mut cqes),
++        }
++        cqes
++    }
++}
++
++/// An SQE as the 128 bytes the kernel reads.
++pub(crate) fn sqe_bytes(sqe: squeue::Entry128) -> [u8; 128] {
++    // SAFETY: as in `set_sqe_len`.
++    unsafe { std::mem::transmute(sqe) }
 +}
 +
 +/// State shared between the ring thread and every `RingCommit`.
 +pub(crate) struct Ring {
 +    index: usize,
++    /// CONSTELLATION PATCH (io-uring): entries per queue.
++    depth: u32,
 +    /// Whether an unmount will end the connection when the session is dropped without
 +    /// running; `Session::from_fd` sessions have nothing that will.
 +    mounted: bool,
@@ -4935,6 +5840,10 @@ index 0000000..b8f63be
 +    entries: Box<[RingEntry]>,
 +    /// Dropped only when `live.in_kernel` is zero; otherwise leaked, see `Drop`.
 +    mem: ManuallyDrop<RingMemory>,
++    /// CONSTELLATION PATCH (io-uring): fault injection -- every REGISTER names one iovec
++    /// instead of two, which the kernel refuses with `EINVAL` before it records anything
++    /// (`fuse_uring_get_iovec_from_sqe`). Set only through `Config::io_uring_malformed_register`.
++    malformed_register: std::sync::atomic::AtomicBool,
 +    #[cfg(test)]
 +    hooks: test::RingHooks,
 +}
@@ -4960,6 +5869,9 @@ index 0000000..b8f63be
 +    /// Set in the same critical section that decides to exit, so a commit either finds it or
 +    /// is counted in `in_kernel` before the decision.
 +    exited: bool,
++    /// CONSTELLATION PATCH (io-uring): per queue of this ring (`RingEntry::queue`), the
++    /// entries a blocking lock request holds (`RingCommit::reserve_lock_wait`).
++    lock_waits: Vec<u32>,
 +}
 +
 +/// Decrements a `Live` count; a count already at zero means the accounting is wrong, which is
@@ -4980,7 +5892,20 @@ index 0000000..b8f63be
 +        if state.is_outstanding() {
 +            dec(&mut self.outstanding, e, "outstanding");
 +        }
++        self.release_lock_wait(e);
 +        *state = EntryState::Dead;
++    }
++
++    /// CONSTELLATION PATCH (io-uring): `e` no longer holds its queue's lock-wait budget (its
++    /// reply is committed, or it died); a no-op for an entry that never reserved it.
++    fn release_lock_wait(&mut self, e: &RingEntry) {
++        if e.lock_wait
++            .swap(false, std::sync::atomic::Ordering::Relaxed)
++        {
++            if let Some(n) = self.lock_waits.get_mut(e.queue as usize) {
++                *n = n.saturating_sub(1);
++            }
++        }
 +    }
 +}
 +
@@ -5006,6 +5931,21 @@ index 0000000..b8f63be
 +    payload_cap: usize,
 +    iov: EntryIov,
 +    state: Mutex<EntryState>,
++    /// CONSTELLATION PATCH (io-uring): the handler of the current fetch took the request with
++    /// `RingCommit::hold`, so the ring thread leaves the end of its dispatch to the
++    /// `HeldRequest`. Only the ring thread reads or writes it, around and within a dispatch.
++    held: std::sync::atomic::AtomicBool,
++    /// CONSTELLATION PATCH (io-uring): the position of `qid` among this ring's queues, the
++    /// index of its `Live::lock_waits` count.
++    queue: u32,
++    /// CONSTELLATION PATCH (io-uring): the current fetch counts against its queue's lock-wait
++    /// budget (`RingCommit::reserve_lock_wait`); cleared, under `live`, when it stops holding
++    /// the entry.
++    lock_wait: std::sync::atomic::AtomicBool,
++    /// CONSTELLATION PATCH (io-uring): the current fetch is a blocking lock request served as
++    /// a non-blocking one (`HeldRequest::downgrade_lock_wait`), so a contended answer
++    /// (`EAGAIN`) is committed as `ENOLCK`. Reset at every fetch.
++    lock_downgraded: std::sync::atomic::AtomicBool,
 +}
 +
 +#[derive(Debug)]
@@ -5176,6 +6116,22 @@ index 0000000..b8f63be
 +            let header = errno_header(self.commit_id, Errno::EINVAL);
 +            return self.commit(&[IoSlice::new(header.as_bytes())]);
 +        }
++        if self
++            .entry()
++            .lock_downgraded
++            .load(std::sync::atomic::Ordering::Relaxed)
++            && iov[0][4..8] == (-Errno::EAGAIN.code()).to_ne_bytes()
++        {
++            // A blocking lock request that was not allowed to wait on this queue
++            // (`HeldRequest::downgrade_lock_wait`): "would block" is not an answer `F_SETLKW` or
++            // a blocking `flock` may give, "no lock resources" is
++            let header = errno_header(self.commit_id, Errno::ENOLCK);
++            return self.commit_unmapped(&[IoSlice::new(header.as_bytes())]);
++        }
++        self.commit_unmapped(iov)
++    }
++
++    fn commit_unmapped(&self, iov: &[IoSlice<'_>]) -> io::Result<()> {
 +        if let Begun::Direct = self.begin(Some(iov))? {
 +            // SAFETY: `Committing` makes this thread the only writer; a request slice can
 +            // only be live if the request had no payload, and it never covers the header
@@ -5186,11 +6142,26 @@ index 0000000..b8f63be
 +        Ok(())
 +    }
 +
++    /// `fill_with` with a zeroed buffer, for the tests (replies go through `fill_with`).
++    #[cfg(test)]
++    pub(crate) fn fill<F>(&self, max_len: usize, f: F) -> io::Result<Option<F>>
++    where
++        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
++    {
++        self.fill_with(max_len, true, f)
++    }
++
 +    /// Commits a reply whose payload `f` writes into the entry's payload buffer itself.
 +    /// `Ok(None)` means the reply is done (written, dropped, or answered `EINVAL`);
 +    /// `Ok(Some(f))` hands the closure back because the request's payload is borrowed, and
 +    /// the caller commits a heap buffer through `commit` instead.
-+    pub(crate) fn fill<F>(&self, max_len: usize, f: F) -> io::Result<Option<F>>
++    ///
++    /// CONSTELLATION PATCH (io-uring): `zero: false` skips zeroing the buffer handed to `f`.
++    /// The gather form writes every byte it reports, so the memset a closure that might not
++    /// is owed would only double the work of the copy it precedes. The bytes `f` sees are
++    /// then whatever the entry held (an earlier request or reply, or the mapping's zeros):
++    /// initialized memory, never anything outside this entry.
++    pub(crate) fn fill_with<F>(&self, max_len: usize, zero: bool, f: F) -> io::Result<Option<F>>
 +    where
 +        F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
 +    {
@@ -5219,7 +6190,7 @@ index 0000000..b8f63be
 +                // SAFETY: `Committing` makes this thread the only writer, and a request slice
 +                // can only be live if the request had no payload, so it ends before the
 +                // payload area; `max_len <= payload_cap` keeps the slice inside it.
-+                let res = unsafe { e.with_payload(max_len, f) };
++                let res = unsafe { e.with_payload(max_len, zero, f) };
 +                std::mem::forget(guard);
 +                match self.checked(res, max_len) {
 +                    Ok(n) => {
@@ -5281,6 +6252,82 @@ index 0000000..b8f63be
 +        self.ring.hand_off(self.entry(), self.commit_id);
 +    }
 +
++    /// CONSTELLATION PATCH (io-uring): counts this fetch -- a blocking lock request -- against
++    /// its queue's lock-wait budget, if the budget allows: at most `depth - 1` entries of one
++    /// queue may be held by blocking lock requests, so one entry of every queue is always left
++    /// for requests that do not wait on another process.
++    ///
++    /// Why: the kernel queues a request on the queue of the CPU that submitted it and lets it
++    /// wait there until one of that queue's entries is committed; it cannot be answered on any
++    /// other entry, any other queue or `/dev/fuse`. A blocking lock request holds its entry
++    /// until the lock is granted, which may wait on the holder's next request -- a `write()`
++    /// before its unlock. Were all `depth` entries of the holder's CPU's queue held by such
++    /// waiters, that request, and with it the unlock, would never be served: a deadlock no
++    /// `/dev/fuse` session has, where a waiting request holds nothing. `false` means the
++    /// budget is spent; the caller then serves the request without waiting
++    /// (`HeldRequest::downgrade_lock_wait`).
++    pub(crate) fn reserve_lock_wait(&self) -> bool {
++        let e = self.entry();
++        let mut live = self.ring.live.lock();
++        let budget = self.ring.depth.saturating_sub(1);
++        let Some(n) = live.lock_waits.get_mut(e.queue as usize) else {
++            return false;
++        };
++        if *n >= budget {
++            return false;
++        }
++        *n += 1;
++        e.lock_wait
++            .store(true, std::sync::atomic::Ordering::Relaxed);
++        true
++    }
++
++    /// CONSTELLATION PATCH (io-uring): takes the fetched request off the ring thread.
++    ///
++    /// Called by a `FetchHandler` during `handle`, on the ring thread, with the request slice
++    /// it was given. The ring thread then returns to its queues at once instead of finishing
++    /// the dispatch: the entry stays fetched -- out of the kernel, its buffers untouched by it
++    /// -- and the returned `HeldRequest` carries the request to whichever thread dispatches
++    /// it, and finishes the dispatch there when it is dropped, exactly as the ring thread
++    /// would have. This is what keeps a callback that blocks (a flush waiting on a remote
++    /// store) from stalling every other request the kernel queues on this ring.
++    pub(crate) fn hold(self, request: &[u8]) -> HeldRequest {
++        let e = self.entry();
++        debug_assert_eq!(
++            self.ring.ring_thread.get(),
++            Some(&thread::current().id()),
++            "a fetch is held by its ring thread, while it dispatches"
++        );
++        let base = e.base.0.as_ptr() as usize;
++        let start = request.as_ptr() as usize;
++        assert!(
++            start >= base && start + request.len() <= base + e.gap + e.payload_cap,
++            "a held request lies in its own entry"
++        );
++        // A reply made while the request is held is stashed, never written at once, even for a
++        // request without a payload: a direct reply re-arms the entry, and the next fetch
++        // into it would be staged over the bytes the held slice still covers
++        match &mut *e.state.lock() {
++            EntryState::Dispatching {
++                direct_ok,
++                commit_id,
++                ..
++            } if *commit_id == self.commit_id => *direct_ok = false,
++            other => panic!(
++                "io_uring: entry {} is {other:?} when its fetch is held; a handler holds a \
++                 fetch before anything replies to it",
++                e.idx
++            ),
++        }
++        e.held.store(true, std::sync::atomic::Ordering::Relaxed);
++        HeldRequest {
++            req: EntryPtr(NonNull::from(request).cast()),
++            len: request.len(),
++            commit: self,
++            rewritten: None,
++        }
++    }
++
 +    /// Records that a reply object exists for this fetch, so the ring thread does not answer
 +    /// with an empty reply when dispatch returns without one.
 +    pub(crate) fn reply_created(&self) {
@@ -5294,6 +6341,87 @@ index 0000000..b8f63be
 +                *reply_taken = true;
 +            }
 +        }
++    }
++}
++
++/// CONSTELLATION PATCH (io-uring): a fetched request whose dispatch continues off the ring
++/// thread (`RingCommit::hold`).
++///
++/// **The borrow invariant, upheld here and only here.** `request()` is a slice of the entry's
++/// own stride -- the staged header and, for a `FUSE_WRITE` or `FUSE_SETXATTR`, the payload the
++/// kernel copied in, so a write's bytes reach the filesystem with no copy at all. It stays
++/// valid exactly as long as this value: the entry cannot be re-armed (`COMMIT_AND_FETCH`)
++/// before `Drop` has run `Ring::finish_dispatch`, because until then the entry is
++/// `Dispatching` with `direct_ok` cleared by `hold` (counted `outstanding`, never `Pending`), so
++/// a reply made meanwhile, from any thread, is stashed (`Deferred`) and written by that
++/// `finish_dispatch`, after the last use of the slice. `request()` borrows `self`, so
++/// no slice can outlive the drop; and the `Arc<Ring>` in `commit` keeps the mapping alive even
++/// if the ring thread has exited meanwhile.
++///
++/// Holding takes the request off the ring *thread*, not off its *entry*: the entry stays
++/// fetched until the request is answered, however late and from whatever thread, and while
++/// every entry of a queue is fetched the kernel holds that CPU's further requests back. A
++/// request whose answer waits on another request from the same CPU can therefore deadlock
++/// the queue; for blocking locks, the one such request a filesystem has, see
++/// `RingCommit::reserve_lock_wait`.
++pub(crate) struct HeldRequest {
++    commit: RingCommit,
++    req: EntryPtr,
++    len: usize,
++    /// A rewritten copy of the request, served instead of the entry's
++    /// (`downgrade_lock_wait`).
++    rewritten: Option<Box<[u8]>>,
++}
++
++impl HeldRequest {
++    /// The handle a reply to this request commits through (it may be cloned and outlive this).
++    pub(crate) fn commit(&self) -> &RingCommit {
++        &self.commit
++    }
++
++    /// The contiguous request, as the ring thread's handler was given it.
++    pub(crate) fn request(&self) -> &[u8] {
++        if let Some(rewritten) = &self.rewritten {
++            return rewritten;
++        }
++        // SAFETY: see the type's doc: `[req, req + len)` is inside the entry and nothing writes
++        // it until `Drop` finishes the dispatch, which `&self` outlives.
++        unsafe { slice::from_raw_parts(self.req.0.as_ptr(), self.len) }
++    }
++
++    /// CONSTELLATION PATCH (io-uring): serves this `FUSE_SETLKW` as a `FUSE_SETLK`, because
++    /// its queue's lock-wait budget is spent (`RingCommit::reserve_lock_wait`): granted at
++    /// once if the lock is free, and a conflict answered `ENOLCK` instead of waiting on an
++    /// entry the queue cannot spare. The request is small (a header and a `fuse_lk_in`), so it
++    /// is copied rather than rewritten in the entry.
++    pub(crate) fn downgrade_lock_wait(&mut self) {
++        let mut copy: Box<[u8]> = self.request().into();
++        if let Some(opcode) = copy.get_mut(4..8) {
++            opcode.copy_from_slice(&(abi::fuse_opcode::FUSE_SETLK as u32).to_ne_bytes());
++        }
++        self.rewritten = Some(copy);
++        self.commit
++            .entry()
++            .lock_downgraded
++            .store(true, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
++impl fmt::Debug for HeldRequest {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("HeldRequest")
++            .field("commit", &self.commit)
++            .field("len", &self.len)
++            .finish()
++    }
++}
++
++impl Drop for HeldRequest {
++    fn drop(&mut self) {
++        let e = self.commit.entry();
++        self.commit
++            .ring
++            .finish_dispatch(e, self.commit.commit_id, true);
 +    }
 +}
 +
@@ -5360,18 +6488,22 @@ index 0000000..b8f63be
 +        }
 +    }
 +
-+    /// Runs `f` on the first `len` bytes of the payload area, zeroed.
++    /// Runs `f` on the first `len` bytes of the payload area, zeroed when `zero`.
 +    ///
 +    /// # Safety
 +    ///
 +    /// As for `write_reply`, `len <= payload_cap`, and no other reference into the payload
 +    /// area exists while `f` runs.
-+    unsafe fn with_payload<R>(&self, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
++    unsafe fn with_payload<R>(&self, len: usize, zero: bool, f: impl FnOnce(&mut [u8]) -> R) -> R {
 +        // SAFETY: `[gap, gap + len)` is inside the stride and, by the caller's guarantee,
-+        // aliased by nothing else while the slice is live.
++        // aliased by nothing else while the slice is live. Unzeroed, its bytes are still
++        // initialized: the mapping is anonymous memory, written since only by the kernel and
++        // this entry's own requests and replies.
 +        let buf = unsafe {
 +            let payload = self.base.0.as_ptr().add(self.gap);
-+            ptr::write_bytes(payload, 0, len);
++            if zero {
++                ptr::write_bytes(payload, 0, len);
++            }
 +            slice::from_raw_parts_mut(payload, len)
 +        };
 +        f(buf)
@@ -5470,11 +6602,16 @@ index 0000000..b8f63be
 +                    payload_cap: mem.payload_cap(),
 +                    iov: EntryIov(iov),
 +                    state: Mutex::new(EntryState::Dead),
++                    held: std::sync::atomic::AtomicBool::new(false),
++                    queue: idx as u32 / depth,
++                    lock_wait: std::sync::atomic::AtomicBool::new(false),
++                    lock_downgraded: std::sync::atomic::AtomicBool::new(false),
 +                }
 +            })
 +            .collect();
 +        Ok(Arc::new(Ring {
 +            index,
++            depth,
 +            mounted,
 +            device,
 +            ring_thread: OnceLock::new(),
@@ -5488,9 +6625,11 @@ index 0000000..b8f63be
 +                shutdown: false,
 +                abandon: false,
 +                exited: false,
++                lock_waits: vec![0; qids.len()],
 +            }),
 +            entries,
 +            mem: ManuallyDrop::new(mem),
++            malformed_register: std::sync::atomic::AtomicBool::new(false),
 +            #[cfg(test)]
 +            hooks: test::RingHooks::default(),
 +        }))
@@ -5535,7 +6674,21 @@ index 0000000..b8f63be
 +        .addr(Some(e.iov.0.as_ptr() as u64))
 +        .build()
 +        .user_data(user_data(e.qid, e.idx));
-+        set_sqe_len(sqe, 2)
++        let segments = if self
++            .malformed_register
++            .load(std::sync::atomic::Ordering::Relaxed)
++        {
++            1
++        } else {
++            2
++        };
++        set_sqe_len(sqe, segments)
++    }
++
++    /// CONSTELLATION PATCH (io-uring): see `Ring::malformed_register`.
++    pub(crate) fn set_malformed_register(&self) {
++        self.malformed_register
++            .store(true, std::sync::atomic::Ordering::Relaxed);
 +    }
 +
 +    fn commit_sqe(&self, e: &RingEntry, commit_id: u64) -> squeue::Entry128 {
@@ -5632,6 +6785,13 @@ index 0000000..b8f63be
 +    }
 +
 +    /// Pushes one REGISTER per entry plus the eventfd poll and submits once.
++    ///
++    /// CONSTELLATION PATCH (io-uring): the kernel validates a REGISTER when it is issued, inside
++    /// that very `io_uring_enter`, and posts a refusal's CQE before the call returns; an
++    /// accepted one completes only with a fetch. So the CQEs present right after the submit are
++    /// the refusals, and one is an error here -- `RegistrationRefused`, which the session
++    /// returns from its constructor -- rather than a fatal CQE in `serve` once the session
++    /// already runs, with every request on the mount blocked on queues that never become ready.
 +    fn register_all(&self, io: &mut RingIo) -> io::Result<()> {
 +        self.live.lock().in_kernel = self.entries.len();
 +        for e in &self.entries {
@@ -5640,6 +6800,32 @@ index 0000000..b8f63be
 +        }
 +        self.arm_wake(io)?;
 +        io.submit()?;
++        let early = io.reap();
++        #[cfg(test)]
++        let early_check = !io.hooks.refusals_in_serve;
++        #[cfg(not(test))]
++        let early_check = true;
++        let refused = early
++            .iter()
++            .find(|&&(ud, res, _)| early_check && ud != WAKE && res < 0);
++        if let Some(&(ud, res, _)) = refused {
++            // The refused entries never reached the kernel; whichever were accepted are
++            // cancelled when this ring's io_uring is closed, and keep the mapping alive till then
++            for &(ud, res, _) in &early {
++                let (qid, idx) = decode(ud);
++                let e = self.entries.get(idx as usize).filter(|e| e.qid == qid);
++                if let (true, Some(e)) = (ud != WAKE && res < 0, e) {
++                    self.retire(e, None);
++                }
++            }
++            let (qid, _) = decode(ud);
++            return Err(crate::uring::RegistrationRefused::error(
++                self.index,
++                qid,
++                io::Error::from_raw_os_error(-res),
++            ));
++        }
++        io.early.extend(early);
 +        Ok(())
 +    }
 +
@@ -5747,6 +6933,7 @@ index 0000000..b8f63be
 +                return;
 +            }
 +            dec(&mut live.outstanding, e, "outstanding");
++            live.release_lock_wait(e);
 +            *state = EntryState::Pending { commit_id };
 +            live.in_kernel += 1;
 +            live.pending.push(e.idx);
@@ -5798,11 +6985,7 @@ index 0000000..b8f63be
 +                }
 +                Err(e) => return Err(e),
 +            }
-+            let cqes: SmallVec<[(u64, i32, u32); 64]> = io
-+                .io
-+                .completion()
-+                .map(|c| (c.user_data(), c.result(), c.flags()))
-+                .collect();
++            let cqes = io.reap();
 +            for (ud, res, flags) in cqes {
 +                if ud == WAKE {
 +                    let failed = if res < 0 {
@@ -5956,9 +7139,14 @@ index 0000000..b8f63be
 +            dec(&mut live.in_kernel, e, "in-kernel");
 +            live.outstanding += 1;
 +        }
++        e.held.store(false, std::sync::atomic::Ordering::Relaxed);
++        e.lock_downgraded
++            .store(false, std::sync::atomic::Ordering::Relaxed);
 +        {
 +            // SAFETY: `stage_request` made `[req, req + len)` one contiguous request inside
-+            // the stride; the slice ends with this block, before the entry is touched again.
++            // the stride; the slice ends with this block, before the entry is touched again
++            // (a handler that kept it did so through `RingCommit::hold`, whose `HeldRequest`
++            // ends the dispatch itself).
 +            let request = unsafe { slice::from_raw_parts(staged.req.as_ptr(), staged.len) };
 +            let commit = RingCommit {
 +                ring: Arc::clone(self),
@@ -5967,6 +7155,19 @@ index 0000000..b8f63be
 +            };
 +            handler.handle(commit, request);
 +        }
++        if e.held.load(std::sync::atomic::Ordering::Relaxed) {
++            return;
++        }
++        self.finish_dispatch(e, commit_id, false);
++    }
++
++    /// The end of a dispatch: a reply stashed during it is written now, a request the
++    /// filesystem was given no reply object for is answered with an empty one, and otherwise
++    /// the entry waits for its reply as `Dispatched`. Run by the ring thread right after its
++    /// handler returns, or -- CONSTELLATION PATCH (io-uring) -- by a `HeldRequest`'s drop on
++    /// the thread that took the dispatch over (`held`), where the ring may have exited
++    /// meanwhile and left the entry `Dead`.
++    fn finish_dispatch(&self, e: &RingEntry, commit_id: u64, held: bool) {
 +        let reply: Option<(Vec<u8>, u64)> = {
 +            let mut state = e.state.lock();
 +            match &mut *state {
@@ -5994,6 +7195,8 @@ index 0000000..b8f63be
 +                }
 +                // A reply already happened, or another thread is writing one right now
 +                EntryState::Pending { .. } | EntryState::Committing => None,
++                // The ring exited while a held dispatch ran; a reply would have nowhere to go
++                EntryState::Dead if held => None,
 +                other @ (EntryState::InKernel { .. }
 +                | EntryState::Dispatched { .. }
 +                | EntryState::Dead) => panic!(
@@ -6058,6 +7261,10 @@ index 0000000..b8f63be
 +        submits: usize,
 +        /// Errno `enable` fails with instead of enabling the ring.
 +        fail_enable: Option<i32>,
++        /// CONSTELLATION PATCH (io-uring): leave the REGISTER refusals `register_all` sees at
++        /// once to `serve`, as before it checked for them -- for the tests that use a non-FUSE
++        /// device's synchronous `EOPNOTSUPP` to exercise `serve`'s handling of a fatal CQE.
++        pub(super) refusals_in_serve: bool,
 +    }
 +
 +    impl IoHooks {
@@ -6110,11 +7317,6 @@ index 0000000..b8f63be
 +        }
 +    }
 +
-+    fn sqe_bytes(sqe: squeue::Entry128) -> [u8; 128] {
-+        // SAFETY: as in `set_sqe_len`.
-+        unsafe { std::mem::transmute(sqe) }
-+    }
-+
 +    fn sqe_from_bytes(raw: [u8; 128]) -> squeue::Entry128 {
 +        // SAFETY: as in `set_sqe_len`.
 +        unsafe { std::mem::transmute(raw) }
@@ -6163,7 +7365,10 @@ index 0000000..b8f63be
 +    /// `None` when the environment forbids io_uring or the kernel predates the setup flags
 +    fn try_ring_io(sq: u32, cq: u32) -> Option<RingIo> {
 +        match RingIo::open(sq, cq) {
-+            Ok(io) => Some(io),
++            Ok(mut io) => {
++                io.hooks.refusals_in_serve = true;
++                Some(io)
++            }
 +            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) => {
 +                eprintln!("skipping: io_uring_setup failed with {e}");
 +                None
@@ -6352,8 +7557,8 @@ index 0000000..b8f63be
 +    /// with 0 as if the flag were not there
 +    fn nop_results_supported(io: &mut RingIo) -> bool {
 +        io.push_or_submit(&nop_with_result(WAKE - 1, -42)).unwrap();
-+        io.io.submit_and_wait(1).unwrap();
-+        let res = io.io.completion().next().unwrap().result();
++        io.uring().submit_and_wait(1).unwrap();
++        let res = io.uring().completion().next().unwrap().result();
 +        match res {
 +            -42 => true,
 +            0 => {
@@ -6534,13 +7739,13 @@ index 0000000..b8f63be
 +        let (err, mut io) = thread::spawn(move || {
 +            let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
 +            io.push_or_submit(&nop).unwrap();
-+            (io.io.submit().unwrap_err(), io)
++            (io.uring().submit().unwrap_err(), io)
 +        })
 +        .join()
 +        .unwrap();
 +        assert_eq!(errno_of(&err), Some(libc::EEXIST), "{err}");
-+        assert_eq!(io.io.submit_and_wait(1).unwrap(), 1);
-+        let cqe = io.io.completion().next().unwrap();
++        assert_eq!(io.uring().submit_and_wait(1).unwrap(), 1);
++        let cqe = io.uring().completion().next().unwrap();
 +        assert_eq!((cqe.user_data(), cqe.result()), (WAKE - 1, 0));
 +    }
 +
@@ -6551,7 +7756,7 @@ index 0000000..b8f63be
 +        };
 +        let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
 +        io.push_or_submit(&nop).unwrap();
-+        let err = io.io.submit().unwrap_err();
++        let err = io.uring().submit().unwrap_err();
 +        assert_eq!(errno_of(&err), Some(libc::EBADFD), "{err}");
 +    }
 +
@@ -6694,7 +7899,7 @@ index 0000000..b8f63be
 +        ring.register_all(&mut io).unwrap();
 +        // 20 REGISTERs and the poll: the queue fills after 8 and 16, then the final submit
 +        assert_eq!(io.hooks.submits, 3);
-+        assert_eq!(io.io.submission().len(), 0);
++        assert_eq!(io.uring().submission().len(), 0);
 +        assert_eq!(ring.live.lock().in_kernel, 20);
 +        for e in &ring.entries {
 +            assert_eq!(last_command(e), Some(0));
@@ -6809,7 +8014,7 @@ index 0000000..b8f63be
 +
 +        let (outcome, mut io) = served.finish();
 +        outcome.unwrap();
-+        assert!(io.io.submission().is_empty());
++        assert!(io.uring().submission().is_empty());
 +    }
 +
 +    #[test]
@@ -7193,6 +8398,171 @@ index 0000000..b8f63be
 +            .expect("handle_fetch deadlocked or panicked");
 +    }
 +
++    /// CONSTELLATION PATCH (io-uring): a held fetch leaves the ring thread at once; a reply
++    /// made while it is held -- even one without a payload, from another thread -- is stashed
++    /// rather than written, so the entry is not re-armed under the held slice, and goes out
++    /// when the `HeldRequest` is dropped.
++    #[test]
++    fn a_held_fetch_finishes_where_it_is_dropped() {
++        let (done_tx, done_rx) = mpsc::channel();
++        thread::spawn(move || {
++            let ring = fake_ring(1, true);
++            ring.ring_thread.set(thread::current().id()).ok();
++            let e = &ring.entries[0];
++            // No payload: an unheld fetch of it could be answered directly
++            fake_fetch(e, 11, fuse_opcode::FUSE_GETATTR, &[0u8; 16], &[]);
++            set_in_kernel(&ring, 0, 0);
++            let mut held = None;
++            let mut handler = |commit: RingCommit, request: &[u8]| {
++                held = Some(commit.hold(request));
++            };
++            ring.handle_fetch(e, &mut handler);
++            let held = held.unwrap();
++            // The ring thread is done with it, the entry is not
++            assert_eq!(state_name(e), "Dispatching");
++            assert_eq!(ring.live.lock().outstanding, 1);
++            let before = held.request().to_vec();
++            let commit = held.commit().clone();
++            thread::spawn(move || commit.commit_errno(Errno::ENOENT))
++                .join()
++                .unwrap();
++            assert_eq!(state_name(e), "Deferred", "stashed, not written");
++            assert!(ring.live.lock().pending.is_empty(), "not re-armed");
++            assert_eq!(held.request(), &before[..], "the held slice is intact");
++            assert_eq!(AnyRequest::try_from(held.request()).unwrap().unique().0, 11);
++            drop(held);
++            assert_eq!(state_name(e), "Pending");
++            assert_eq!(ring.live.lock().pending, [0]);
++            let (len, error, unique, _) = reply_fields(e);
++            assert_eq!((len, error, unique), (16, -libc::ENOENT, 11));
++            ring.live.lock().in_kernel = 0;
++            done_tx.send(()).unwrap();
++        });
++        done_rx
++            .recv_timeout(Duration::from_secs(5))
++            .expect("a held fetch deadlocked or panicked");
++    }
++
++    /// CONSTELLATION PATCH (io-uring): a held fetch with no reply object answers itself with
++    /// an empty reply when dropped, as an unheld one does when its dispatch returns; one whose
++    /// reply object outlives it waits for that reply, which then commits directly.
++    #[test]
++    fn a_held_fetch_without_a_reply_is_answered_and_one_with_waits() {
++        let ring = fake_ring(2, true);
++        ring.ring_thread.set(thread::current().id()).ok();
++        for idx in 0..2 {
++            fake_fetch(&ring.entries[idx], 20 + idx as u64, fuse_opcode::FUSE_FLUSH, &[0u8; 24], &[]);
++            set_in_kernel(&ring, idx, 0);
++        }
++        let mut held = Vec::new();
++        let mut hold = |commit: RingCommit, request: &[u8]| held.push(commit.hold(request));
++        ring.handle_fetch(&ring.entries[0], &mut hold);
++        ring.handle_fetch(&ring.entries[1], &mut hold);
++        let second = held.pop().unwrap();
++        drop(held);
++        assert_eq!(state_name(&ring.entries[0]), "Pending", "answered empty");
++        assert_eq!(reply_fields(&ring.entries[0]).1, 0);
++        second.commit().reply_created();
++        let commit = second.commit().clone();
++        drop(second);
++        assert_eq!(state_name(&ring.entries[1]), "Dispatched");
++        thread::spawn(move || commit.commit_errno(Errno::EIO))
++            .join()
++            .unwrap();
++        assert_eq!(state_name(&ring.entries[1]), "Pending");
++        assert_eq!(reply_fields(&ring.entries[1]).1, -libc::EIO);
++        ring.live.lock().in_kernel = 0;
++    }
++
++    /// CONSTELLATION PATCH (io-uring): a ring that leaves while a fetch is held (the session
++    /// shut down) leaves the held dispatch nothing to answer: no panic, no write.
++    #[test]
++    fn a_held_fetch_outlives_its_ring_thread() {
++        let ring = fake_ring(1, true);
++        ring.ring_thread.set(thread::current().id()).ok();
++        let e = &ring.entries[0];
++        fake_fetch(e, 30, fuse_opcode::FUSE_FSYNC, &[0u8; 16], &[]);
++        set_in_kernel(&ring, 0, 0);
++        let mut held = None;
++        ring.handle_fetch(e, &mut |c: RingCommit, r: &[u8]| held = Some(c.hold(r)));
++        let held = held.unwrap();
++        ring.live.lock().exited = true;
++        held.commit().commit_errno(Errno::EIO);
++        assert_eq!(state_name(e), "Dead");
++        drop(held);
++        assert_eq!(state_name(e), "Dead");
++        assert!(ring.live.lock().pending.is_empty());
++    }
++
++    /// CONSTELLATION PATCH (io-uring): plan 38 §3(b)'s write side. A `FUSE_WRITE` fetched over
++    /// a ring reaches the filesystem as a slice of the entry's own payload buffer -- the bytes
++    /// the kernel copied in, not a copy of them -- whether the ring thread dispatches it or an
++    /// offload thread does through a `HeldRequest`.
++    #[test]
++    fn a_ring_write_borrows_the_entry_payload() {
++        let ring = fake_ring(1, true);
++        ring.ring_thread.set(thread::current().id()).ok();
++        let e = &ring.entries[0];
++        let payload_at = e.base.0.as_ptr() as usize + e.gap;
++        let mut write_in = [0u8; 40];
++        write_in[16..20].copy_from_slice(&5u32.to_ne_bytes());
++        for hold in [false, true] {
++            fake_fetch(e, 40, fuse_opcode::FUSE_WRITE, &write_in, b"world");
++            set_in_kernel(&ring, 0, 0);
++            let mut held = None;
++            let mut seen = None;
++            ring.handle_fetch(e, &mut |c: RingCommit, request: &[u8]| {
++                if hold {
++                    held = Some(c.hold(request));
++                    return;
++                }
++                let req = AnyRequest::try_from(request).unwrap();
++                let Ok(Operation::Write(w)) = req.operation() else {
++                    panic!("not a write")
++                };
++                seen = Some((w.data().as_ptr() as usize, w.data().to_vec()));
++            });
++            if let Some(held) = held {
++                let req = AnyRequest::try_from(held.request()).unwrap();
++                let Ok(Operation::Write(w)) = req.operation() else {
++                    panic!("not a write")
++                };
++                seen = Some((w.data().as_ptr() as usize, w.data().to_vec()));
++            }
++            assert_eq!(seen, Some((payload_at, b"world".to_vec())), "held: {hold}");
++            *e.state.lock() = EntryState::Dead;
++            let mut live = ring.live.lock();
++            (live.in_kernel, live.outstanding) = (0, 0);
++            live.pending.clear();
++        }
++    }
++
++    /// CONSTELLATION PATCH (io-uring): `fill_with(.., zero: false, ..)` hands the closure the
++    /// entry's bytes as they are, and `fill` zeroes them.
++    #[test]
++    fn an_unzeroed_fill_sees_the_entry_as_it_was() {
++        let ring = fake_ring(1, true);
++        ring.ring_thread.set(thread::current().id()).ok();
++        let e = &ring.entries[0];
++        poison_payload(e);
++        let seen = |zero: bool| {
++            let commit = fake_dispatched(&ring, 0, 5);
++            let mut first = 0u8;
++            commit
++                .fill_with(16, zero, |buf| {
++                    first = buf[0];
++                    Ok(0)
++                })
++                .unwrap();
++            *e.state.lock() = EntryState::Dead;
++            ring.live.lock().in_kernel -= 1;
++            ring.live.lock().pending.clear();
++            first
++        };
++        assert_ne!(seen(false), 0, "the poison is still there");
++        assert_eq!(seen(true), 0);
++    }
++
 +    #[test]
 +    fn direct_reply_and_reply_taken() {
 +        let ring = fake_ring(2, true);
@@ -7491,8 +8861,8 @@ index 0000000..b8f63be
 +        let fill_queue = |io: &mut RingIo| {
 +            let nop: squeue::Entry128 = opcode::Nop::new().build().user_data(WAKE - 1).into();
 +            // SAFETY: a Nop names no buffers.
-+            while unsafe { io.io.submission().push(&nop) }.is_ok() {}
-+            assert!(io.io.submission().is_full());
++            while unsafe { io.uring().submission().push(&nop) }.is_ok() {}
++            assert!(io.uring().submission().is_full());
 +        };
 +        let queue = |idx: u32, commit_id: u64| {
 +            *ring.entries[idx as usize].state.lock() = EntryState::Pending { commit_id };
@@ -7512,7 +8882,7 @@ index 0000000..b8f63be
 +        assert!(live.pending.is_empty());
 +        assert_eq!(errno_of(live.fatal.as_ref().unwrap()), Some(libc::EBUSY));
 +        drop(live);
-+        assert!(io.io.submission().is_full(), "the SQE was never pushed");
++        assert!(io.uring().submission().is_full(), "the SQE was never pushed");
 +
 +        // A ring-level errno from the room-making submit ends the loop with the entry neither
 +        // pushed nor retired, which is why the mapping is then leaked
@@ -7537,7 +8907,7 @@ index 0000000..b8f63be
 +        io.hooks.fail_submit = Some(libc::EBUSY);
 +        ring.flush_pending(&mut io).unwrap();
 +        assert_eq!(last_command(&ring.entries[0]), Some(83));
-+        assert_eq!(io.io.submission().len(), 1);
++        assert_eq!(io.uring().submission().len(), 1);
 +        assert_eq!(
 +            io.hooks.fail_submit,
 +            Some(libc::EBUSY),
@@ -7695,7 +9065,7 @@ index 0000000..b8f63be
 +        let commit = fake_dispatched(&ring, 0, 41);
 +        let addr = payload_addr(e);
 +        let handed_back = commit
-+            .fill(8, |buf| {
++            .fill_with(8, true, |buf| {
 +                assert_eq!(buf.len(), 8);
 +                assert_eq!(buf, [0; 8]);
 +                assert_eq!(
@@ -7719,7 +9089,7 @@ index 0000000..b8f63be
 +        poison_payload(e);
 +        let commit = fake_dispatched(&ring, 0, 42);
 +        commit
-+            .fill(8, |buf| {
++            .fill_with(8, true, |buf| {
 +                buf[..3].copy_from_slice(b"abc");
 +                Ok(8)
 +            })

@@ -322,3 +322,101 @@ fn a_deferred_cold_read_answers_off_the_caller_and_holds_its_slot() {
     );
     assert_eq!(rx.try_recv().unwrap(), (content.len(), me));
 }
+
+/// Plan 38 Z2a: a read tried inline that would wait for the inode's op
+/// lock — another op on the file holds it, as a flush publishing the file
+/// does for as long as the store takes — defers to the completion pool
+/// like a cold read: the call returns at once, and the answer comes from a
+/// pool thread once the lock is free. A FUSE-over-io_uring ring thread
+/// serves reads inline, so this is what keeps one file's slow flush from
+/// stalling every other request on that ring.
+#[test]
+fn a_read_behind_another_ops_inode_lock_defers() {
+    let (v, _dir) = limited(ViewQos::default());
+    v.bind();
+    let c = caller();
+    let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+    let (entry, opened) = Blocking::run(|r| {
+        v.create(
+            &OpCtx::new(OpKind::Create, &c),
+            ROOT_INO,
+            Name::new(b"held"),
+            0o644,
+            rw,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    let ino = entry.attr.ino;
+    Blocking::run(|r| {
+        v.write(
+            &OpCtx::new(OpKind::Write, &c),
+            ino,
+            opened.fh,
+            0,
+            WriteData::Borrowed(b"resident bytes"),
+            rw,
+            r,
+        )
+    })
+    .unwrap();
+    // Another thread holds the file's op lock, as an in-flight flush does.
+    let (locked, is_locked) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    let holder = {
+        let v = v.clone();
+        std::thread::spawn(move || {
+            let _op = v.inode_ops.lock(ino);
+            locked.send(()).unwrap();
+            released.recv().unwrap();
+        })
+    };
+    is_locked.recv().unwrap();
+    let me = std::thread::current().id();
+    let (answered, answer) = mpsc::channel();
+    let started = Instant::now();
+    v.read(
+        &OpCtx::new(OpKind::Read, &c),
+        ino,
+        opened.fh,
+        0,
+        64,
+        FnResponder::new(move |got: VfsResult<ReadData>| {
+            answered
+                .send((
+                    got.map(|d| d.contiguous().into_owned()),
+                    std::thread::current().id(),
+                ))
+                .unwrap();
+        }),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the read waited for the lock on the calling thread"
+    );
+    assert!(
+        answer.recv_timeout(Duration::from_millis(200)).is_err(),
+        "nothing can answer while the lock is held"
+    );
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let (got, on) = answer.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(got.unwrap(), b"resident bytes");
+    assert_ne!(on, me, "answered from the pool, not the caller");
+    // Uncontended, the same read answers inline, as before.
+    let (answered, answer) = mpsc::channel();
+    v.read(
+        &OpCtx::new(OpKind::Read, &c),
+        ino,
+        opened.fh,
+        0,
+        64,
+        FnResponder::new(move |got: VfsResult<ReadData>| {
+            answered
+                .send((got.is_ok(), std::thread::current().id()))
+                .unwrap();
+        }),
+    );
+    assert_eq!(answer.try_recv().unwrap(), (true, me));
+}

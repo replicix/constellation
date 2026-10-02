@@ -14,6 +14,18 @@
 //! inline attempt did before it stopped is idempotent (readahead's stream
 //! cursor, the atime bump), so the second run repeats it harmlessly.
 //!
+//! The same holds for the inode's op lock (below): an inline read that
+//! would wait for it refuses and defers the same way. The holder is
+//! another op on the same file — a flush publishing it (which may wait as
+//! long as the store does), a write, or simply **another read**: reads
+//! take the lock exclusively, and kernel readahead routinely has several
+//! READs of one file in flight. So on every frontend that defers, on
+//! `/dev/fuse` as on a ring, a *resident* read that contends with another
+//! op on its file also hops to the completion pool, not only a cold one.
+//! That costs one thread hop, and fio showed no regression (plan 38 Z2a);
+//! it is needed on the ring, where a read is served on the ring thread
+//! itself and a deferred cold read holds this lock for its whole fetch.
+//!
 //! Only a frontend that can answer from another thread
 //! (`FrontendCaps::deferrable` holds `Read`) defers; for any other, and
 //! with `CONSTELLATION_DEFER_COLD_READS=0`, the read waits on the calling
@@ -135,7 +147,18 @@ impl View {
         // its whole duration; the session is detached from its shard so
         // a chunk fetch (which may wait on S3) holds no shard lock
         // (EC2 finding 1).
-        let _op = self.inode_ops.lock(ino);
+        //
+        // Waiting for that lock is a wait like any other: tried inline, a
+        // read that finds another op holding it (a flush publishing the
+        // file, which may take as long as the store does) defers instead
+        // (the module doc). Over FUSE-over-io_uring this is what keeps a
+        // ring thread — which reads stay on, plan 38 §3(b) — from stalling
+        // every other request of its queues behind someone else's flush.
+        let _op = match self.inode_ops.try_lock(ino) {
+            Some(op) => op,
+            None if cold_probe::refuse() => return Err(Code::Again),
+            None => self.inode_ops.lock(ino),
+        };
         let ws = self.writes.detach(ino);
         let result = self.do_read_detached(ino, ws.as_ref(), offset, size);
         if let Some(ws) = ws {

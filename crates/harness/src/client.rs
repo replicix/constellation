@@ -88,6 +88,16 @@ pub struct Client {
     write_mode: Option<String>,
     e2e: bool,
     web_ui_port: Option<u16>,
+    /// Plan 38 Z2a: the daemon runs with `io_uring_setup(2)` refused by a
+    /// seccomp filter (`crate::sandbox`).
+    deny_io_uring: bool,
+    /// Plan 38 Z2a: the daemon's `RLIMIT_AS`.
+    address_space: Option<u64>,
+}
+
+/// The `constellation` binary under test.
+pub fn constellation_bin() -> PathBuf {
+    bin()
 }
 
 fn bin() -> PathBuf {
@@ -127,6 +137,8 @@ impl Client {
             write_mode: None,
             e2e: false,
             web_ui_port: None,
+            deny_io_uring: false,
+            address_space: None,
         })
     }
 
@@ -196,6 +208,21 @@ impl Client {
     pub fn with_web_ui(mut self, port: u16) -> Self {
         self.web_ui_port = Some(port);
         self
+    }
+
+    /// Mount with `io_uring_setup(2)` refused (`EPERM`) by a seccomp
+    /// filter on the daemon, as a container runtime's default profile
+    /// refuses it; the daemon mounts through `crate::sandbox`'s
+    /// `fusermount3` relay, since the filter needs `no_new_privs`.
+    pub fn with_io_uring_denied(mut self) -> Self {
+        self.deny_io_uring = true;
+        self
+    }
+
+    /// Mount with the daemon's address space limited to `bytes`
+    /// (`RLIMIT_AS`); `None` lifts it again.
+    pub fn set_address_space_limit(&mut self, bytes: Option<u64>) {
+        self.address_space = bytes;
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -403,8 +430,9 @@ impl Client {
             args.push(port.to_string());
         }
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let child = self
-            .cmd(&arg_refs)
+        let mut cmd = self.cmd(&arg_refs);
+        self.sandbox(&mut cmd)?;
+        let child = cmd
             .stdout(Stdio::from(logf.try_clone()?))
             .stderr(Stdio::from(logf))
             .spawn()
@@ -434,6 +462,65 @@ impl Client {
             self.name,
             self.tail_log()
         )
+    }
+
+    /// Applies [`Self::with_io_uring_denied`] and
+    /// [`Self::set_address_space_limit`] to the daemon about to be spawned.
+    fn sandbox(&self, cmd: &mut Command) -> Result<()> {
+        use std::os::unix::process::CommandExt;
+        if self.deny_io_uring {
+            for (k, v) in crate::sandbox::Broker::get()?.env() {
+                cmd.env(k, v);
+            }
+        }
+        let (deny, limit) = (self.deny_io_uring, self.address_space);
+        if deny || limit.is_some() {
+            // SAFETY: both hooks make only async-signal-safe syscalls.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if let Some(bytes) = limit {
+                        crate::sandbox::limit_address_space(bytes)?;
+                    }
+                    if deny {
+                        crate::sandbox::deny_io_uring_setup()?;
+                    }
+                    Ok(())
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The daemon's exit status, once it exits by itself (no unmount is
+    /// made): within `within`, or the daemon is killed and this fails.
+    pub fn wait_exit(&mut self, within: Duration) -> Result<std::process::ExitStatus> {
+        let mut child = self.child.take().context("not mounted")?;
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child.kill().ok();
+        let _ = child.wait();
+        bail!(
+            "{} daemon did not exit within {within:?}: {}",
+            self.name,
+            self.tail_log()
+        )
+    }
+
+    /// The FUSE connection number of this client's mount
+    /// (`/sys/fs/fuse/connections/<n>`).
+    pub fn fuse_connection(&self) -> Option<u32> {
+        fuse_connection_of(&self.mnt)
+    }
+
+    /// Detach the dead mount a daemon left behind (after an abort or a
+    /// crash), bounded.
+    pub fn detach_dead_mount(&self) {
+        detach_bounded(&self.mnt, Duration::from_secs(10));
     }
 
     pub fn snapshot_create(&self, selector: &str) -> Result<()> {

@@ -68,6 +68,20 @@ pub struct Config {
     /// (73 per queue on a 448-CPU machine with one ring); a larger product falls back to
     /// `/dev/fuse` with a warning.
     pub io_uring_queue_depth: u32,
+    /// CONSTELLATION PATCH (io-uring): serve the rings from this in-memory stand-in for the
+    /// kernel instead of `io_uring_setup(2)` (`InMemoryRingKernel`), for tests that drive a
+    /// whole ring session over a socket pair with no io_uring, mount or root. `None` (the
+    /// default) is the kernel.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[doc(hidden)]
+    pub io_uring_kernel: Option<crate::InMemoryRingKernel>,
+    /// CONSTELLATION PATCH (io-uring): fault injection for the fallback ladder's tests. Every
+    /// ring REGISTER this session makes is malformed (one iovec instead of two), so a real
+    /// kernel refuses it with `EINVAL` after the `FUSE_INIT` reply committed the connection to
+    /// rings, and the constructor fails with `RegistrationRefused`. Never set it otherwise.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[doc(hidden)]
+    pub io_uring_malformed_register: bool,
 }
 
 // CONSTELLATION PATCH (io-uring): hand-written so `io_uring_queue_depth`
@@ -82,6 +96,10 @@ impl Default for Config {
             clone_fd: false,
             io_uring: false,
             io_uring_queue_depth: 8,
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring_kernel: None,
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring_malformed_register: false,
         }
     }
 }

@@ -12,6 +12,7 @@
 //! `io_uring_enter` rather than being signalled to it.
 
 pub(crate) mod mem;
+pub(crate) mod memory;
 pub(crate) mod ring;
 pub(crate) mod staging;
 
@@ -68,12 +69,18 @@ impl RingSet {
     /// Opens the io_urings of `min(n_threads, queues)` rings over every possible CPU's queue,
     /// reserves their buffers and spawns their parked threads. The error text names what
     /// failed, for the session's fallback warning.
+    ///
+    /// CONSTELLATION PATCH (io-uring): `backend` serves the rings from an `InMemoryRingKernel`
+    /// instead of `io_uring_setup(2)`; `malformed_register` makes every REGISTER one the kernel
+    /// refuses (`Ring::set_malformed_register`), for the fault-injection tests of the fallback.
     pub(crate) fn new(
         device: Arc<DevFuse>,
         mounted: bool,
         n_threads: usize,
         depth: u32,
         payload_cap: usize,
+        backend: Option<&memory::InMemoryRingKernel>,
+        malformed_register: bool,
     ) -> io::Result<Self> {
         let n_queues = possible_cpus().map_err(|err| {
             io::Error::other(format!("the possible CPU count is unknown ({err})"))
@@ -99,9 +106,15 @@ impl RingSet {
         for (index, qids) in rings.into_iter().enumerate() {
             // The cheapest and likeliest refusal (a sandbox without io_uring) comes first
             let (sq, cq) = ring_sizes(qids.len() * depth as usize);
-            let io = RingIo::open(sq, cq)
-                .map_err(|err| io::Error::other(format!("io_uring_setup failed ({err})")))?;
+            let io = match backend {
+                Some(kernel) => RingIo::memory(kernel.ring(index)?),
+                None => RingIo::open(sq, cq)
+                    .map_err(|err| io::Error::other(format!("io_uring_setup failed ({err})")))?,
+            };
             let ring = Ring::new(index, mounted, device.clone(), &qids, depth, payload_cap)?;
+            if malformed_register {
+                ring.set_malformed_register();
+            }
             let (go_tx, go_rx) = mpsc::channel();
             let (registered_tx, registered_rx) = mpsc::channel();
             let (handler_tx, handler_rx) = mpsc::channel();
@@ -193,6 +206,50 @@ impl Drop for RingSet {
         }
     }
 }
+
+/// CONSTELLATION PATCH (io-uring): the kernel refused a ring's registration after the
+/// `FUSE_INIT` reply had committed the connection to rings.
+///
+/// The kernel validates a REGISTER when it is issued and refuses a malformed one at once (see
+/// `Ring::register_all`). Nothing can serve such a connection: the kernel does not route its
+/// requests back to `/dev/fuse` (plan 38 Z0a), and holds every one of them until the ring is
+/// ready. So the session's constructor fails with this, wrapped in an `io::Error`, and its drop
+/// ends the connection; a caller that wants the plan 38 §2.4 ladder mounts again without the
+/// ring ([`Self::is`] tells this refusal from any other failure of the constructor).
+#[derive(Debug)]
+pub struct RegistrationRefused {
+    ring: usize,
+    qid: u16,
+    error: io::Error,
+}
+
+impl RegistrationRefused {
+    pub(crate) fn error(ring: usize, qid: u16, error: io::Error) -> io::Error {
+        io::Error::other(Self { ring, qid, error })
+    }
+
+    /// Whether `err` is a refused registration.
+    pub fn is(err: &io::Error) -> bool {
+        err.get_ref().is_some_and(|e| e.is::<Self>())
+    }
+
+    /// The kernel's own error.
+    pub fn kernel_error(&self) -> &io::Error {
+        &self.error
+    }
+}
+
+impl fmt::Display for RegistrationRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the kernel refused to register io_uring queue {} of ring {} ({})",
+            self.qid, self.ring, self.error
+        )
+    }
+}
+
+impl std::error::Error for RegistrationRefused {}
 
 /// Number of queues the kernel expects, from `num_possible_cpus()`.
 ///
@@ -335,13 +392,13 @@ mod test {
         let device = Arc::new(DevFuse(fs::File::open("/dev/zero").unwrap()));
         let queues = usize::from(possible_cpus().unwrap());
         let depth = (IORING_MAX_ENTRIES / queues + 1) as u32;
-        let err = RingSet::new(device.clone(), true, 1, depth, 8192).unwrap_err();
+        let err = RingSet::new(device.clone(), true, 1, depth, 8192, None, false).unwrap_err();
         assert!(
             err.to_string()
                 .starts_with(&format!("{queues} queues x depth {depth} exceed")),
             "{err}"
         );
-        assert!(RingSet::new(device, true, 1, u32::MAX, 8192).is_err());
+        assert!(RingSet::new(device, true, 1, u32::MAX, 8192, None, false).is_err());
     }
 
     #[test]

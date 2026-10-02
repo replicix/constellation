@@ -284,6 +284,22 @@ impl InodeOps {
         }
         InodeOpGuard { ops: self, ino }
     }
+
+    /// [`Self::lock`] if it would not wait: `None` while another thread
+    /// holds `ino` (this thread's own hold re-enters, as `lock` does).
+    pub(super) fn try_lock(&self, ino: Ino) -> Option<InodeOpGuard<'_>> {
+        let me = std::thread::current().id();
+        let (m, _) = &self.shards[ino as usize % 64];
+        let mut held = m.lock().unwrap_or_else(|e| e.into_inner());
+        match held.get_mut(&ino) {
+            None => {
+                held.insert(ino, (me, 1));
+            }
+            Some((owner, depth)) if *owner == me => *depth += 1,
+            Some(_) => return None,
+        }
+        Some(InodeOpGuard { ops: self, ino })
+    }
 }
 
 impl Drop for InodeOpGuard<'_> {

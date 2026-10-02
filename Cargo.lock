@@ -1270,6 +1270,7 @@ dependencies = [
 name = "constellation-frontend-fuse"
 version = "1.0.0"
 dependencies = [
+ "bytes",
  "constellation-platform",
  "constellation-types",
  "constellation-vfs",

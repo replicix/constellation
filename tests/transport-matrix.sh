@@ -57,12 +57,16 @@ TRANSPORTS="${TRANSPORTS:-dev-fuse auto}"
 
 # The read-path scenarios: the cache/prefetch/coop paths a transport
 # change can break, plus the end-to-end and fault legs that read back
-# what they wrote, plus the transport's own handover policy. Deliberately
+# what they wrote, plus the transport's own handover policy, the blocked-
+# close regression of plan 38 Z1b (`s3-cut-one-node`) and Z2a's injected
+# downgrades (the ring-only ones skip, naming why, where the host or build
+# cannot grant the ring; `transport-seccomp-denied` runs everywhere). Deliberately
 # not the full matrix — `SCENARIOS=all` (or `make harness-transport-matrix`)
 # is the slower gate.
 SCENARIOS="${SCENARIOS:-cold-cache readahead coop-cache-hit coop-exact-churn e2e-basic \
 e2e-two-nodes poison-record-isolation s3-outage truncate-never-resurrects fio-latency \
-transport-detach-refused}"
+s3-cut-one-node transport-detach-refused transport-seccomp-denied \
+transport-refused-registration transport-enomem-ring transport-abort-while-armed}"
 if [ "$SCENARIOS" = all ]; then SCENARIOS=""; fi
 
 # Whether this host's kernel grants FUSE-over-io_uring to an unprivileged
