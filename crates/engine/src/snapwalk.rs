@@ -69,31 +69,68 @@
 //!
 //! ## Spilled chunk lists
 //!
-//! A spilled list is content-addressed and therefore immutable: it is
-//! fetched once per [`ChainWalk`] (one GC pass), and kept across passes
-//! in a small process-wide LRU bounded by encoded bytes. The node-local
-//! chunk cache is deliberately not involved — it is a data cache with
-//! its own eviction story, and a GC pass must not churn it.
+//! A spilled list is content-addressed and therefore immutable, so a
+//! decoded copy never goes stale. Each [`ChainWalk`] (one GC pass) keeps
+//! decoded lists in an LRU bounded by their **decoded** size
+//! (`CONSTELLATION_GC_SPILL_CACHE_MIB`, default 64 MiB), and that LRU is
+//! the only thing holding them: a step keeps alive just the list it is
+//! reading, so a pass's peak is the cap plus one list, however many
+//! snapshots rewrote however large a file. A list evicted before it is
+//! read again is fetched again (counted by
+//! [`ChainWalk::spill_refetches`]); a list larger than the whole cap is
+//! never admitted and is fetched on every read. That is the price of the
+//! bound, and it only falls on sets of lists bigger than the cap.
+//!
+//! The cache goes with the walker at the end of the pass rather than
+//! living on in the process: chunk GC runs once a day by default
+//! (`CONSTELLATION_GC_INTERVAL_S`), so a cross-pass cache would hold its
+//! memory for a day to save a handful of GETs. The node-local chunk cache
+//! is deliberately not involved either — it is a data cache with its own
+//! eviction story, and a GC pass must not churn it.
 
 use crate::mtree_read::Resolver;
 use crate::snapshot::{SnapshotRoot, TreeAccess};
 use anyhow::{bail, Context, Result};
-use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest, SparseChunks};
+use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::keys::{self, Key};
 use constellation_mtree::record::{DentryRecord, InodeRecord, Kind};
 use constellation_mtree::{NodeHash, NodeStore, Tree};
 use constellation_store_s3::{ChunkStore, NodeCache};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// How deep an ancestor walk may go before the tree is presumed
 /// malformed (a `0x04` cycle) and the step falls back to full walks.
 const MAX_DEPTH: usize = 4096;
 
-/// The process-wide spilled-list cache's budget, in encoded bytes.
-const SPILL_CACHE_BYTES: u64 = 256 << 20;
+/// A walker's spilled-list cache budget, in decoded bytes, when
+/// `CONSTELLATION_GC_SPILL_CACHE_MIB` is unset (module docs). 64 MiB holds
+/// about 1.6 M decoded entries — at 4 MiB chunks, the lists of ~6 TiB of
+/// file data, or a few versions of a 1 TiB file, which is what a chain of
+/// rewrites of one large file needs to read each list once.
+const SPILL_CACHE_DEFAULT_MIB: u64 = 64;
+
+/// `CONSTELLATION_GC_SPILL_CACHE_MIB`: the per-pass spilled-list cache
+/// budget in MiB of decoded lists; `0` caches nothing (every read is a
+/// GET). An unparsable value reads as the default, with a warning.
+fn spill_cache_bytes_from_env() -> u64 {
+    let mib = match std::env::var("CONSTELLATION_GC_SPILL_CACHE_MIB") {
+        Err(_) => SPILL_CACHE_DEFAULT_MIB,
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(mib) => mib,
+            Err(_) => {
+                tracing::warn!(
+                    value = %value,
+                    "CONSTELLATION_GC_SPILL_CACHE_MIB is not a number of MiB; using {SPILL_CACHE_DEFAULT_MIB}"
+                );
+                SPILL_CACHE_DEFAULT_MIB
+            }
+        },
+    };
+    mib.saturating_mul(1 << 20)
+}
 
 // ------------------------------------------------------------- results
 
@@ -105,7 +142,10 @@ pub struct Occurrence {
     pub count: u64,
     /// Plaintext bytes per occurrence: `min(chunk_size, file_len −
     /// offset)` for a data chunk, the encoded length for a spilled list.
-    /// Content-addressed, so the same for every occurrence.
+    /// Taken from whichever occurrence was counted first. Usually every
+    /// occurrence agrees, but not always: a short tail chunk whose file
+    /// was later extended (or hole-punched around) can occur again at a
+    /// larger size with the same hash.
     pub size_bytes: u64,
 }
 
@@ -372,21 +412,58 @@ fn links_in_subtree<S: NodeStore>(
 
 // -------------------------------------------------------- spilled lists
 
-/// A decoded spilled chunk list and its encoded length.
+/// A decoded spilled chunk list and its encoded length. The entries are
+/// a flat vector rather than the decoder's `BTreeMap`, so the decoded
+/// size the cache charges is exact rather than estimated.
 struct SpilledList {
-    chunks: SparseChunks,
+    chunks: Vec<(u64, ChunkHash)>,
     encoded_len: u64,
 }
 
-#[derive(Default)]
+impl SpilledList {
+    fn decode(bytes: &[u8]) -> Result<SpilledList> {
+        let mut chunks: Vec<(u64, ChunkHash)> = decode_chunk_list(bytes)?.into_iter().collect();
+        chunks.shrink_to_fit();
+        Ok(SpilledList {
+            chunks,
+            encoded_len: bytes.len() as u64,
+        })
+    }
+
+    /// Bytes resident while decoded.
+    fn decoded_bytes(&self) -> u64 {
+        (std::mem::size_of::<SpilledList>()
+            + self.chunks.capacity() * std::mem::size_of::<(u64, ChunkHash)>()) as u64
+    }
+}
+
+/// Decoded spilled lists, least recently used first out, bounded by
+/// decoded bytes. A list over the whole budget is refused outright.
 struct SpillLru {
+    cap: u64,
     entries: HashMap<ChunkHash, (Arc<SpilledList>, u64)>,
     order: BTreeMap<u64, ChunkHash>,
     bytes: u64,
+    peak: u64,
     tick: u64,
+    /// Lists dropped to stay under `cap`, plus lists refused for being
+    /// over it: every reason a later read may have to GET again.
+    evictions: u64,
 }
 
 impl SpillLru {
+    fn new(cap: u64) -> SpillLru {
+        SpillLru {
+            cap,
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            bytes: 0,
+            peak: 0,
+            tick: 0,
+            evictions: 0,
+        }
+    }
+
     fn get(&mut self, hash: &ChunkHash) -> Option<Arc<SpilledList>> {
         let (list, tick) = self.entries.get_mut(hash)?;
         self.order.remove(tick);
@@ -397,33 +474,37 @@ impl SpillLru {
     }
 
     fn insert(&mut self, hash: ChunkHash, list: Arc<SpilledList>) {
-        if self.entries.contains_key(&hash) || list.encoded_len > SPILL_CACHE_BYTES {
+        if self.entries.contains_key(&hash) {
             return;
         }
-        self.tick += 1;
-        self.bytes += list.encoded_len;
-        self.order.insert(self.tick, hash);
-        self.entries.insert(hash, (list, self.tick));
-        while self.bytes > SPILL_CACHE_BYTES {
+        let size = list.decoded_bytes();
+        if size > self.cap {
+            self.evictions += 1;
+            return;
+        }
+        // Make room first, so the cache never holds more than `cap`.
+        while self.bytes + size > self.cap {
             let Some((_, oldest)) = self.order.pop_first() else {
                 break;
             };
             if let Some((list, _)) = self.entries.remove(&oldest) {
-                self.bytes -= list.encoded_len;
+                self.bytes -= list.decoded_bytes();
+                self.evictions += 1;
             }
         }
+        self.tick += 1;
+        self.bytes += size;
+        self.peak = self.peak.max(self.bytes);
+        self.order.insert(self.tick, hash);
+        self.entries.insert(hash, (list, self.tick));
     }
-}
-
-fn process_spills() -> &'static Mutex<SpillLru> {
-    static SPILLS: OnceLock<Mutex<SpillLru>> = OnceLock::new();
-    SPILLS.get_or_init(Default::default)
 }
 
 // -------------------------------------------------------------- walker
 
 /// Snapshot occurrences of one bucket's chains. One per GC pass: it
-/// owns the pass's spilled-list map and membership answers.
+/// owns the pass's spilled-list cache and membership answers, and both
+/// go when the last clone is dropped.
 #[derive(Clone)]
 pub struct ChainWalk {
     inner: Arc<Inner>,
@@ -432,10 +513,16 @@ pub struct ChainWalk {
 struct Inner {
     tree: TreeAccess,
     chunks: Arc<ChunkStore>,
-    spills: Mutex<HashMap<ChunkHash, Arc<SpilledList>>>,
+    /// The only holder of decoded lists (module docs).
+    spills: Mutex<SpillLru>,
+    /// Hashes of the lists this walker has fetched: hashes, not lists,
+    /// so a second fetch can be told apart from a first.
+    fetched: Mutex<HashSet<ChunkHash>>,
     membership: Mutex<Membership>,
-    /// Spilled lists this walker actually fetched from the store.
+    /// Spilled lists this walker fetched from the store.
     fetches: AtomicU64,
+    /// Of those, fetches of a list this walker had fetched before.
+    refetches: AtomicU64,
 }
 
 /// One root, read synchronously on a blocking thread.
@@ -445,14 +532,28 @@ struct Side<'a> {
 }
 
 impl ChainWalk {
+    /// A walker whose spilled-list cache is sized by
+    /// `CONSTELLATION_GC_SPILL_CACHE_MIB`.
     pub fn new(tree: TreeAccess, chunks: Arc<ChunkStore>) -> ChainWalk {
+        ChainWalk::with_spill_cache(tree, chunks, spill_cache_bytes_from_env())
+    }
+
+    /// A walker whose spilled-list cache holds at most `cap_bytes` of
+    /// decoded lists.
+    pub fn with_spill_cache(
+        tree: TreeAccess,
+        chunks: Arc<ChunkStore>,
+        cap_bytes: u64,
+    ) -> ChainWalk {
         ChainWalk {
             inner: Arc::new(Inner {
                 tree,
                 chunks,
-                spills: Mutex::new(HashMap::new()),
+                spills: Mutex::new(SpillLru::new(cap_bytes)),
+                fetched: Mutex::new(HashSet::new()),
                 membership: Mutex::new(Membership::default()),
                 fetches: AtomicU64::new(0),
+                refetches: AtomicU64::new(0),
             }),
         }
     }
@@ -460,6 +561,21 @@ impl ChainWalk {
     /// Spilled chunk lists fetched from the store by this walker.
     pub fn spill_fetches(&self) -> u64 {
         self.inner.fetches.load(Ordering::Relaxed)
+    }
+
+    /// Of [`ChainWalk::spill_fetches`], the GETs of a list this walker
+    /// had already fetched once: the lists the cache evicted (or never
+    /// admitted) before they were needed again.
+    pub fn spill_refetches(&self) -> u64 {
+        self.inner.refetches.load(Ordering::Relaxed)
+    }
+
+    /// The spilled-list cache's gauges: `(bytes held now, the most it
+    /// ever held, evictions)`, in decoded bytes. Evictions include lists
+    /// refused for being larger than the whole cap.
+    pub fn spill_cache_gauges(&self) -> (u64, u64, u64) {
+        let lru = self.inner.spills.lock().expect("spill lock");
+        (lru.bytes, lru.peak, lru.evictions)
     }
 
     /// The occurrences of a chain's first snapshot, by a full walk of
@@ -575,34 +691,27 @@ impl TreeAccess {
 }
 
 impl Inner {
-    /// A spilled chunk list, at most one GET per walker.
+    /// A spilled chunk list: from the cache, or one GET. The caller holds
+    /// the returned list only while it reads it.
     fn spilled(
         &self,
         hash: &ChunkHash,
         handle: &tokio::runtime::Handle,
     ) -> Result<Arc<SpilledList>> {
         if let Some(list) = self.spills.lock().expect("spill lock").get(hash) {
-            return Ok(list.clone());
+            return Ok(list);
         }
-        let cached = process_spills().lock().expect("spill lru lock").get(hash);
-        let list = match cached {
-            Some(list) => list,
-            None => {
-                let bytes =
-                    tokio::task::block_in_place(|| handle.block_on(self.chunks.get_chunk(hash)))
-                        .with_context(|| format!("spilled chunk list {}", hash.to_hex()))?;
-                self.fetches.fetch_add(1, Ordering::Relaxed);
-                let list = Arc::new(SpilledList {
-                    chunks: decode_chunk_list(&bytes)?,
-                    encoded_len: bytes.len() as u64,
-                });
-                process_spills()
-                    .lock()
-                    .expect("spill lru lock")
-                    .insert(*hash, list.clone());
-                list
-            }
-        };
+        let bytes = tokio::task::block_in_place(|| handle.block_on(self.chunks.get_chunk(hash)))
+            .with_context(|| format!("spilled chunk list {}", hash.to_hex()))?;
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        if !self.fetched.lock().expect("fetched lock").insert(*hash) {
+            self.refetches.fetch_add(1, Ordering::Relaxed);
+        }
+        let list = Arc::new(
+            SpilledList::decode(&bytes)
+                .with_context(|| format!("spilled chunk list {}", hash.to_hex()))?,
+        );
+        drop(bytes);
         self.spills
             .lock()
             .expect("spill lock")
@@ -747,6 +856,10 @@ impl Inner {
                 .into());
             }
         }
+        // Held across the whole step, tree reads and spilled-list GETs
+        // included: concurrent steps on clones of one walker serialize
+        // here. GC steps one chain at a time, so nothing waits on it; a
+        // caller wanting parallel steps should use one walker per task.
         let mut membership = self.membership.lock().expect("membership lock");
         let mut answers_before = membership
             .answers
@@ -765,9 +878,10 @@ impl Inner {
             &mut answers_after,
             &mut deltas,
         );
-        membership
-            .answers
-            .insert((before.root, dir), answers_before);
+        // Chains are stepped in order, so `before` is behind us: only
+        // `after` (the next step's `before`) is worth keeping. A caller
+        // that steps out of order merely recomputes answers.
+        drop(answers_before);
         membership.answers.insert((after.root, dir), answers_after);
         result?;
         deltas.prune();
@@ -891,6 +1005,7 @@ mod tests {
     use super::*;
     use crate::gc::SnapWalkMode;
     use crate::snapshot::{test_manager, SnapshotManager, SnapshotOptions};
+    use constellation_fs_core::manifest::SparseChunks;
     use constellation_fs_core::types::ROOT_INO;
     use constellation_fs_core::InodeKind;
     use constellation_meta::{Meta, MetaStore};
@@ -1355,15 +1470,110 @@ mod tests {
             .unwrap();
         let blob = fx.chunks.get_chunk(&spill.0).await.unwrap();
         assert_eq!(spill.1, blob.len() as u64);
-        // Fresh walker: each list GET once, whatever the number of reads
-        // (the process LRU may already hold them, so at most once).
+        // Fresh walker: each list GET once, whatever the number of reads.
         let walk = ChainWalk::new(fx.manager.tree().unwrap().clone(), fx.chunks.clone());
         for _ in 0..3 {
             walk.first(s0).await.unwrap();
             walk.first(s1).await.unwrap();
             walk.step(s0, s1).await.unwrap();
         }
-        assert!(walk.spill_fetches() <= 2, "{}", walk.spill_fetches());
+        assert_eq!(walk.spill_fetches(), 2);
+        assert_eq!(walk.spill_refetches(), 0);
+    }
+
+    /// A chain whose spilled lists outgrow a small cache: the cache never
+    /// holds more than its cap, the marked set is the unbounded one, and
+    /// a list is fetched again only after the cache let it go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spilled_lists_beyond_the_cache_cap() {
+        const CHUNKS: usize = 40;
+        const SNAPSHOTS: usize = 8;
+        let mut fx = Fixture::new();
+        let vol = fx.mkdir(ROOT_INO, "vol");
+        let version = |name: &str, v: usize| -> Vec<String> {
+            (0..CHUNKS).map(|i| format!("{name}{v}/{i}")).collect()
+        };
+        let mut big = Vec::new();
+        for name in ["p", "q", "r"] {
+            let tags = version(name, 0);
+            let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+            big.push((name, fx.file(vol, name, &tags).await));
+        }
+        // Unchanged spilled files, read once by the first walk only.
+        for name in ["s", "t"] {
+            let tags = version(name, 0);
+            let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+            fx.file(vol, name, &tags).await;
+        }
+        let mut chain = vec![fx.snap("/vol").await];
+        for v in 1..SNAPSHOTS {
+            for (name, ino) in &big {
+                let tags = version(name, v);
+                let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+                fx.write(*ino, &tags).await;
+            }
+            chain.push(fx.snap("/vol").await);
+        }
+
+        // Every list here decodes to the same size; the cap fits two.
+        let first = fx.walk.first(chain[0]).await.unwrap();
+        let spill = first
+            .iter()
+            .find(|(_, occurrence)| occurrence.size_bytes != CS as u64)
+            .map(|(hash, _)| *hash)
+            .unwrap();
+        let one = SpilledList::decode(&fx.chunks.get_chunk(&spill).await.unwrap())
+            .unwrap()
+            .decoded_bytes();
+        let cap = 2 * one + one / 2;
+        let tree = fx.manager.tree().unwrap().clone();
+        let walker = |cap| ChainWalk::with_spill_cache(tree.clone(), fx.chunks.clone(), cap);
+
+        let unbounded = walker(u64::MAX);
+        let mut want = HashSet::new();
+        unbounded.protect_chain(&chain, &mut want).await.unwrap();
+        // 5 lists in the first snapshot, 3 new ones per later snapshot.
+        let lists = 5 + 3 * (SNAPSHOTS as u64 - 1);
+        assert_eq!(unbounded.spill_fetches(), lists);
+        assert_eq!(unbounded.spill_refetches(), 0);
+        assert_eq!(unbounded.spill_cache_gauges().2, 0, "no evictions");
+
+        let bounded = walker(cap);
+        let mut got = HashSet::new();
+        bounded.protect_chain(&chain, &mut got).await.unwrap();
+        assert_eq!(got, want, "the cap changed the marked set");
+        let (held, peak, evictions) = bounded.spill_cache_gauges();
+        assert!(
+            peak <= cap && held <= cap,
+            "peak {peak}, held {held}, cap {cap}"
+        );
+        assert!(peak >= 2 * one, "the cache was used: peak {peak}");
+        // Each step reads p, q, r's old and new lists in that order, so
+        // by the next step p's newest list has been pushed out by r's.
+        let refetches = bounded.spill_refetches();
+        assert!(refetches > 0, "a cap of two lists forced no re-GET");
+        assert!(
+            refetches <= evictions,
+            "{refetches} re-GETs, {evictions} evictions"
+        );
+        assert_eq!(bounded.spill_fetches(), lists + refetches);
+
+        // A cap below one list admits nothing: every read is a GET, and
+        // every GET after a list's first is a re-GET of a refused list.
+        let tiny = walker(one - 1);
+        let mut tiny_set = HashSet::new();
+        tiny.protect_chain(&chain, &mut tiny_set).await.unwrap();
+        assert_eq!(tiny_set, want);
+        let (held, peak, evictions) = tiny.spill_cache_gauges();
+        assert_eq!((held, peak), (0, 0));
+        assert_eq!(tiny.spill_fetches(), lists + tiny.spill_refetches());
+        assert_eq!(evictions, tiny.spill_fetches(), "every list refused");
+
+        // And GC's own pass, at the configured cap, agrees with the full
+        // walk of every snapshot.
+        let (diff, full) = gc_sets(&fx).await;
+        assert_eq!(diff, want);
+        assert_eq!(full, want);
     }
 
     /// The chain's directory replaced by another at the same path is a

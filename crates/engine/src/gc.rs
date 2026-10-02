@@ -561,6 +561,11 @@ pub(crate) async fn snapshot_roots_with(
 }
 
 /// Plan 32 §0.2: every snapshot's chunks, one chain at a time.
+///
+/// A root known only from a replica row (its `snaps/` object missing) is
+/// walked like any other. If its tree cannot be read from the bucket, the
+/// walk errors and the round marks nothing, so it fails closed until
+/// 32-m0c's orphan reconciliation re-PUTs the object from the row.
 async fn snapshot_roots_by_chain(
     chunks: &Arc<constellation_store_s3::ChunkStore>,
     store: Arc<dyn ObjectStore>,
@@ -619,6 +624,14 @@ async fn snapshot_roots_by_chain(
         );
         walk.protect_chain(&chain, &mut protected).await?;
     }
+    let (_, spill_peak_bytes, spill_evictions) = walk.spill_cache_gauges();
+    tracing::debug!(
+        spill_fetches = walk.spill_fetches(),
+        spill_refetches = walk.spill_refetches(),
+        spill_peak_bytes,
+        spill_evictions,
+        "GC: snapshot chains marked"
+    );
     Ok(protected)
 }
 

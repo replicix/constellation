@@ -30340,6 +30340,41 @@ Gates (this worktree, `CARGO_TARGET_DIR` unset):
 | `target/release/harness run gc-lifecycle gc-dedup-race gc-open-orphan-hold snapshot-lifecycle snapshot-churn clone-workflow mtree-gc-plateau git-under-flock-gc fsck-repair e2e-basic e2e-two-nodes` | ALL SCENARIOS PASSED (11/11) |
 | same GC/snapshot scenarios (the first nine) with `CONSTELLATION_GC_SNAP_WALK=full` | ALL SCENARIOS PASSED (9/9) |
 
+**Fix: bounded spilled-list memory** (follow-up from the M0b review). The
+walker kept a per-pass `HashMap<ChunkHash, Arc<SpilledList>>` that was
+never pruned and pinned every list, so evicting from the 256 MiB
+process-wide LRU freed nothing during a pass; a large file rewritten
+between hundreds of snapshots meant gigabytes resident in the daemon
+running GC, and the LRU then kept up to 256 MiB for good.
+
+| Item | State | Where |
+|---|---|---|
+| The per-walker list map is gone. Each `ChainWalk` owns one LRU of decoded lists, charged by **decoded** bytes (lists are now a flat `Vec<(u64, ChunkHash)>`, so the charge is exact), and it is the only holder: a step keeps alive just the list it is reading. Peak is the cap plus one list. A list larger than the cap is never admitted | DONE | `snapwalk.rs` `SpillLru`, `Inner::spilled` |
+| Cap `CONSTELLATION_GC_SPILL_CACHE_MIB`, default 64 MiB (`0` caches nothing). The cache is per pass and goes with the walker, with no process-wide cache: GC runs daily by default, so a cross-pass cache would hold memory for a day to save a few GETs | DONE | `snapwalk.rs`, `docs/reference/configuration.md` |
+| A list evicted before it is read again (or refused as oversized) is re-fetched. `spill_refetches()` counts those GETs, from a per-walker set of fetched *hashes*. `spill_cache_gauges()` returns `(held, peak, evictions)`, and GC logs them at `debug` after the chains | DONE | `snapwalk.rs`, `gc.rs` `snapshot_roots_by_chain` |
+| Nits: `Occurrence::size_bytes` doc softened (a short tail chunk can recur at a larger size); `step` drops the `before` root's membership answers; comment that `step` holds the membership mutex across blocking I/O; `snapshot_roots_by_chain` doc says an unreadable row-only root fails the pass closed until 32-m0c re-PUTs its object | DONE | `snapwalk.rs`, `gc.rs` |
+| Test: 5 spilled files (40 entries, 1,632 B decoded each), 3 of them rewritten between each of 8 snapshots. With a cap of 2.5 lists, the cache peaks at 3,264 B (≤ cap) and the marked set equals the unbounded walker's and both GC modes'. Re-GETs number 21, against 45 evictions; with no cap there are 0 re-GETs and 0 evictions. Below one list, nothing is admitted and every read is a GET. `spilled_manifests` now asserts exactly one GET per list (2) | DONE | `snapwalk::tests::spilled_lists_beyond_the_cache_cap` |
+
+Peak before/after: on the new test's chain, the old per-walker map would
+have held all 26 lists (42,432 B, which is the unbounded walker's peak
+gauge), against 3,264 B capped. The M0b measurement (50 snapshots of a
+10k-file tree) was not rerun: every file there has two chunks, under the
+inline limit, so it spills no list and its spill memory is zero both
+before and after.
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test -p constellation-engine` | exit 0; 370 passed, 0 failed (3 ignored) |
+| `cargo test --workspace --exclude constellation-engine` | exit 0; 70 test binaries, 1607 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run gc-lifecycle gc-dedup-race gc-open-orphan-hold snapshot-lifecycle snapshot-churn clone-workflow mtree-gc-plateau git-under-flock-gc fsck-repair e2e-basic e2e-two-nodes` (two invocations) | ALL SCENARIOS PASSED (11/11) |
+| the first nine again with `CONSTELLATION_GC_SPILL_CACHE_MIB=0` | ALL SCENARIOS PASSED (9/9) |
+
 ## Fix: a mutate outcome is the op's own rows, not a window over the journal
 
 Follow-up to the review of the flaky completion-ownership fix.
