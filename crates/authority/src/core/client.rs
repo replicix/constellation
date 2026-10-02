@@ -1046,7 +1046,7 @@ impl Core {
                     // already — streamed ahead of the log, with what the
                     // holder did after it — so the hint is stale (backup
                     // sim seed 600396); the refusal is uncovered, as below.
-                    match replica.install_hint(rid, records, floor, epoch, gen) {
+                    match replica.install_hint(rid, records, position, epoch, gen) {
                         Ok(true) => {
                             self.stats.hints_installed += 1;
                             replica.note_covering(KeySet::from_records(records), position);

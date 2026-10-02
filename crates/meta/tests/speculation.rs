@@ -14,7 +14,8 @@
 
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{
-    execute_mutate, LogRecord, Meta, MetaStore, MutateOp, PublishBasis, Rid, TouchSet,
+    execute_mutate, JournalPos, LogRecord, Meta, MetaStore, MutateOp, Position, PublishBasis, Rid,
+    TouchSet,
 };
 use constellation_types::Code;
 
@@ -87,6 +88,14 @@ fn chmod(ino: u64, mode: u32, t: i64) -> LogRecord {
         atime_ns: None,
         mtime_ns: None,
         time_ns: t,
+    }
+}
+
+/// A refusal's position with nothing unshipped: the log through `seq`.
+fn shipped(seq: u64) -> Position {
+    Position {
+        seq,
+        ..Position::ZERO
     }
 }
 
@@ -259,7 +268,8 @@ fn a_segment_that_completes_a_lower_epoch_shadow_retires_it() {
 fn a_hint_retires_at_its_floor_and_strands_on_a_later_epoch() {
     let meta = Meta::open_in_memory().unwrap();
     // Retired: the floor segment carries the entry.
-    meta.install_hint(&[create("h", ino(1), 10)], 1, 1).unwrap();
+    meta.install_hint(&[create("h", ino(1), 10)], shipped(1), 1)
+        .unwrap();
     assert!(meta.has_outstanding_speculation());
     let applied = meta
         .apply_segment(1, 1, &[create("h", ino(1), 10)], &TouchSet::default())
@@ -270,7 +280,7 @@ fn a_hint_retires_at_its_floor_and_strands_on_a_later_epoch() {
 
     // Stranded: the answering holder's unshipped entry never lands, and a
     // later epoch's segment arrives before the floor.
-    meta.install_hint(&[create("ghost", ino(2), 20)], 3, 1)
+    meta.install_hint(&[create("ghost", ino(2), 20)], shipped(3), 1)
         .unwrap();
     assert!(meta.lookup(ROOT_INO, "ghost").unwrap().is_some());
     let applied = meta
@@ -334,7 +344,13 @@ fn a_hint_whose_refusal_was_streamed_first_is_not_installed() {
     let f3 = |m: &Meta| m.lookup(ROOT_INO, "f3").unwrap().map(|e| e.ino);
     assert_eq!(f3(&meta), Some(a));
     let installed = meta
-        .install_hint_from(Some(requester), &[create("f3", b, t0 + 11)], 2, 1, 0)
+        .install_hint_from(
+            Some(requester),
+            &[create("f3", b, t0 + 11)],
+            shipped(2),
+            1,
+            0,
+        )
         .unwrap();
     assert!(
         !installed,
@@ -464,8 +480,36 @@ impl View {
     }
 }
 
+/// A whole-file write of `ino` (a close's manifest commit): one chunk
+/// named after `byte`, `len` bytes long.
+fn write_manifest(ino: u64, byte: u8, len: u64, t: i64) -> (LogRecord, MutateOp) {
+    let chunks = [(0, constellation_fs_core::ChunkHash([byte; 32]))]
+        .into_iter()
+        .collect();
+    let (manifest, _) =
+        constellation_fs_core::Manifest::from_sparse_chunks(1 << 20, len, chunks, 8, |_| {
+            unreachable!("one chunk is inline")
+        });
+    let manifest = manifest.encode();
+    (
+        LogRecord::WriteManifest {
+            ino,
+            base_manifest: None,
+            manifest: manifest.clone(),
+            size: len,
+            time_ns: t,
+        },
+        MutateOp::SetManifest {
+            ino,
+            base_manifest: None,
+            manifest,
+            size: len,
+        },
+    )
+}
+
 /// A valid op against `view` (and applied to it): create a free name,
-/// unlink a present one, or chmod a present one.
+/// unlink a present one, or chmod or write (a close) a present one.
 fn gen_op(
     rng: &mut Rng,
     view: &mut View,
@@ -487,6 +531,10 @@ fn gen_op(
                 name: name.into(),
             },
         ),
+        Some(i) if rng.chance(50) => {
+            let byte = 1 + rng.below(250) as u8;
+            write_manifest(i, byte, 1 + rng.below(64), *t)
+        }
         Some(i) => {
             let mode = 0o600 | (rng.below(8) as u32);
             (
@@ -526,8 +574,10 @@ struct Spec {
     epoch: u64,
     /// `Some` for a shadow or a local transaction, `None` for a hint.
     rid: Option<Rid>,
-    /// Hints only.
-    floor: u64,
+    /// Hints only: the position the refusal was evaluated at, and the
+    /// entry (name, inode) it installs.
+    at: Position,
+    entry: Option<(&'static str, u64)>,
     /// Local transactions only: how many journal rows it wrote.
     local_rows: Option<usize>,
     fate: Fate,
@@ -559,10 +609,20 @@ impl Spec {
 /// every unshipped local transaction.
 ///
 /// Segments may carry any prefix of the journal — a split can separate
-/// an op's records from its `Completed` — except while a hint is
-/// outstanding: a hint's floor is only exact when the segment at the
-/// floor carries everything the holder had when it answered (see
-/// `Meta::install_hint`; plan 30 §M6 replaces floors with positions).
+/// an op's records from its `Completed`, and an `Exists` answer's entry
+/// from the segment right after the position it was read at (the
+/// holder's in-flight ship, cut before the entry was journaled: harness
+/// `concurrent-create-no-excl`). A hint retires only once the log carries
+/// that whole position. Ops include whole-file writes (a close's
+/// manifest commit), so this node's own writes are completed by the very
+/// segments that split around a hint.
+///
+/// After every step the replica's names must be the reference's — the
+/// durable log plus the speculation still outstanding — each resolving
+/// to its inode, not only at the end: an entry that vanishes and comes
+/// back (a file open on this node gone from its replica for a segment)
+/// is the bug, even when the run converges. The end state is compared
+/// byte for byte.
 fn run_case(seed: u64, steps: usize) -> Result<(), String> {
     let mut rng = Rng(seed);
     let meta = Meta::open_in_memory().unwrap();
@@ -572,6 +632,9 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
     let mut durable = View::default();
     let mut holder = View::default();
     let mut journal: Vec<LogRecord> = Vec::new();
+    // The holder's journal seq of `journal[0]` (its tenure's first row
+    // is 1); a segment ships through `journal_jseq + take - 1`.
+    let mut journal_jseq = 1u64;
     let mut epoch = 1u64;
     let mut next_seq = 1u64;
     let mut next_ino = 1u64;
@@ -602,7 +665,8 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                             specs.push(Spec {
                                 epoch,
                                 rid: Some(r),
-                                floor: 0,
+                                at: Position::ZERO,
+                                entry: None,
                                 local_rows: Some(recs.len()),
                                 fate: Fate::Outstanding,
                             });
@@ -703,6 +767,7 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                     meta.set_holder_epoch(0);
                     leftover.clear();
                     journal.clear();
+                    journal_jseq = 1;
                     for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
                         if s.epoch < epoch {
                             s.fate = Fate::Stranded;
@@ -736,7 +801,8 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                     specs.push(Spec {
                         epoch,
                         rid: Some(r),
-                        floor: 0,
+                        at: Position::ZERO,
+                        entry: None,
                         local_rows: None,
                         fate: Fate::Outstanding,
                     });
@@ -757,7 +823,17 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                         continue;
                     };
                     let recs = vec![create(name, i, 0)];
-                    if !meta.install_hint(&recs, next_seq, epoch).unwrap() {
+                    // What the holder answers with: the log through the
+                    // last segment, plus its unshipped journal.
+                    let at = Position {
+                        seq: next_seq - 1,
+                        pending: (!journal.is_empty()).then(|| JournalPos {
+                            epoch,
+                            jseq: journal_jseq + journal.len() as u64 - 1,
+                        }),
+                        ..Position::ZERO
+                    };
+                    if !meta.install_hint(&recs, at, epoch).unwrap() {
                         // Live speculation touches the name: not installed.
                         trace.push(format!("hint {name} refused"));
                         continue;
@@ -766,11 +842,12 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                     specs.push(Spec {
                         epoch,
                         rid: None,
-                        floor: next_seq,
+                        at,
+                        entry: Some((name, i)),
                         local_rows: None,
                         fate: Fate::Outstanding,
                     });
-                    trace.push(format!("hint {name} floor {next_seq} epoch {epoch}"));
+                    trace.push(format!("hint {name} at {at:?} epoch {epoch}"));
                 }
                 // The holder ships (a prefix of) its journal; this replica
                 // tails it.
@@ -778,15 +855,11 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                     if journal.is_empty() {
                         continue;
                     }
-                    let hint_outstanding = specs
-                        .iter()
-                        .any(|s| s.rid.is_none() && s.fate == Fate::Outstanding);
-                    let take = if hint_outstanding {
-                        journal.len()
-                    } else {
-                        1 + rng.below(journal.len() as u64) as usize
-                    };
+                    let take = 1 + rng.below(journal.len() as u64) as usize;
                     let recs: Vec<LogRecord> = journal.drain(..take).collect();
+                    let rows: Vec<u64> = (journal_jseq..journal_jseq + take as u64).collect();
+                    journal_jseq += take as u64;
+                    let through = journal_jseq - 1;
                     let seq = next_seq;
                     next_seq += 1;
                     let completes: Vec<Rid> = recs
@@ -807,19 +880,47 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                     for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
                         let done = match s.rid {
                             Some(r) => completes.contains(&r),
-                            None => seq >= s.floor,
+                            // A hint ends once the log holds its position,
+                            // or changes its entry after it.
+                            None => {
+                                let (name, i) = s.entry.unwrap();
+                                let superseded = recs.iter().zip(&rows).any(|(rec, j)| {
+                                    let later = s.at.pending.is_none_or(|p| *j > p.jseq);
+                                    later
+                                        && match rec {
+                                            LogRecord::Create { name: n, .. }
+                                            | LogRecord::Unlink { name: n, .. } => n == name,
+                                            LogRecord::Setattr { ino, .. }
+                                            | LogRecord::WriteManifest { ino, .. } => *ino == i,
+                                            _ => false,
+                                        }
+                                });
+                                superseded
+                                    || (seq >= s.at.seq
+                                        && s.at
+                                            .pending
+                                            .is_none_or(|p| (epoch, through) >= (p.epoch, p.jseq)))
+                            }
                         };
                         if done {
                             s.fate = Fate::Retired;
                         }
                     }
-                    meta.apply_segment(seq, epoch, &recs, &TouchSet::default())
-                        .unwrap();
+                    meta.apply_segment_rows(
+                        seq,
+                        epoch,
+                        through,
+                        &rows,
+                        &[],
+                        &recs,
+                        &TouchSet::default(),
+                    )
+                    .unwrap();
                     for rec in &recs {
                         durable.apply(rec);
                     }
                     trace.push(format!(
-                        "segment {seq} epoch {epoch}: {} of {} journal records",
+                        "segment {seq} epoch {epoch} through {through}: {} of {} journal records",
                         recs.len(),
                         recs.len() + journal.len()
                     ));
@@ -843,6 +944,7 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                 80..=91 => {
                     epoch += 1;
                     journal.clear();
+                    journal_jseq = 1;
                     holder = durable.clone();
                     trace.push(format!("another node takes over, epoch {epoch}"));
                 }
@@ -850,6 +952,7 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                 _ => {
                     leftover_epoch = epoch;
                     leftover = std::mem::take(&mut journal);
+                    journal_jseq = 1;
                     epoch += 1;
                     holder = durable.clone();
                     for s in specs.iter_mut().filter(|s| s.fate == Fate::Outstanding) {
@@ -895,6 +998,13 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
                 trace.join("\n")
             ));
         }
+        check_names(&meta, &events, &specs).map_err(|e| {
+            format!(
+                "seed {seed}, after step {}: {e}\ntrace:\n{}",
+                trace.len(),
+                trace.join("\n")
+            )
+        })?;
         // Plan 30 §M3b: whenever only local speculation is outstanding,
         // the publish view is exactly the log prefix — the durable events
         // alone.
@@ -926,15 +1036,53 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
         }
     }
 
-    // The reference: the durable log plus the speculation that survived,
-    // in log order — a segment before whatever of this replica was still
-    // outstanding when it arrived (a late segment before the local work
-    // it was inserted under, a tailed one before the shadows and hints). Retired requester
-    // speculation is left out — the segment that retired it carries the
-    // same records — and so is stranded speculation. A local transaction
-    // stays unless stranded: shipping it made it durable in place.
+    check_reference(&meta, &events, &specs)
+        .map_err(|e| format!("seed {seed}: {e}\ntrace:\n{}", trace.join("\n")))
+}
+
+/// [`check_reference`]'s names alone, every step: the reference's
+/// entries replayed into a [`View`] (cheap), against this replica's
+/// lookups and the inodes they name.
+fn check_names(meta: &Meta, events: &[Event], specs: &[Spec]) -> Result<(), String> {
+    let mut want = View::default();
+    for event in events {
+        let recs = match event {
+            Event::Segment(recs) => recs,
+            Event::Speculation(i, recs) if specs[*i].fate == Fate::Outstanding => recs,
+            Event::Local(i, recs) if specs[*i].fate != Fate::Stranded => recs,
+            _ => continue,
+        };
+        for rec in recs {
+            want.apply(rec);
+        }
+    }
+    for name in NAMES {
+        let got = meta.lookup(ROOT_INO, name).unwrap().map(|e| e.ino);
+        if got != want.entries.get(name).copied() {
+            return Err(format!(
+                "{name} is {got:?} on the replica, {:?} in the log + surviving speculation",
+                want.entries.get(name)
+            ));
+        }
+        if let Some(ino) = got {
+            if meta.getattr(ino).unwrap().is_none() {
+                return Err(format!("{name} names inode {ino}, which the replica lacks"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The reference: the durable log plus the speculation that survived,
+/// in log order — a segment before whatever of this replica was still
+/// outstanding when it arrived (a late segment before the local work it
+/// was inserted under, a tailed one before the shadows and hints).
+/// Retired requester speculation is left out — the log carries the same
+/// records — and so is stranded speculation. A local transaction stays
+/// unless stranded: shipping it made it durable in place.
+fn check_reference(meta: &Meta, events: &[Event], specs: &[Spec]) -> Result<(), String> {
     let reference = Meta::open_in_memory().unwrap();
-    for event in &events {
+    for event in events {
         match event {
             Event::Segment(recs) => reference.apply_records(recs).unwrap(),
             Event::Speculation(i, recs) => {
@@ -953,9 +1101,8 @@ fn run_case(seed: u64, steps: usize) -> Result<(), String> {
     let want = reference.dump_replicated().unwrap();
     if got != want {
         return Err(format!(
-            "seed {seed}: replica diverged from log + surviving speculation\n\
-             got:  {got:#?}\nwant: {want:#?}\ntrace:\n{}",
-            trace.join("\n")
+            "replica diverged from log + surviving speculation\n\
+             got:  {got:#?}\nwant: {want:#?}"
         ));
     }
     Ok(())
@@ -987,6 +1134,15 @@ fn published_names(meta: &Meta, basis: &PublishBasis) -> std::collections::BTree
 fn speculation_matches_log_plus_surviving_speculation() {
     for seed in 0..64 {
         if let Err(e) = run_case(seed, 60) {
+            panic!("{e}");
+        }
+    }
+    // Long-run seeds that found a bug, pinned. 89: an `Exists` hint
+    // retired at the segment after its position, which did not carry the
+    // entry; a rewind under it then dropped it (`n0` gone from the
+    // replica at step 78 — harness `concurrent-create-no-excl`).
+    for seed in [89] {
+        if let Err(e) = run_case(seed, 200) {
             panic!("{e}");
         }
     }
@@ -1081,7 +1237,7 @@ fn a_hint_is_not_installed_over_live_speculation_on_its_keys() {
         .install_shadow(rid(51), 1, &op, &[rename, completed(rid(51))])
         .unwrap());
     let installed = meta
-        .install_hint_from(Some(rid(52)), &[create("f0", a, 10)], 3, 1, 0)
+        .install_hint_from(Some(rid(52)), &[create("f0", a, 10)], shipped(3), 1, 0)
         .unwrap();
     assert!(!installed, "the stale hint went in over the shadow");
     assert!(meta.lookup(ROOT_INO, "f0").unwrap().is_none());
@@ -1551,4 +1707,158 @@ fn a_refused_rid_in_the_log_rolls_its_shadow_back_without_a_replay() {
         "{counts:?}"
     );
     assert!(meta.pending_replays().unwrap().is_empty());
+}
+
+/// Harness `concurrent-create-no-excl` (lost byte; `ENOENT` on the
+/// loser's `fstat`): an `Exists` hint retires only once the log carries
+/// what the holder had when it refused, not at the next segment. The
+/// holder answered `create p19` with the last segment it had confirmed
+/// shipped (1) plus its unshipped journal through row 5; segment 2 was
+/// already on its way to S3, cut at row 3 — before the winner's `Create`
+/// (row 4) was journaled. That segment also completes this node's own
+/// write of `p18` from the round before, so applying it rewinds from that
+/// shadow, rolling the hint back with it. Retired "at its floor" (2), the
+/// hint was then dropped as carried by the segment, which it was not:
+/// `p19`, open on this node, was gone from the replica until segment 3,
+/// and a close meanwhile took it for unlinked and never published its
+/// write.
+#[test]
+fn a_hint_outlives_a_segment_that_does_not_carry_its_entry() {
+    let meta = Meta::open_in_memory().unwrap();
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
+    let (p18, p19) = (ino(18), ino(19));
+    apply(&meta, 1, 1, &[create("p18", p18, t0)]);
+    let write = MutateOp::Setattr {
+        ino: p18,
+        mode: Some(0o600),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    let written = vec![chmod(p18, 0o600, t0 + 1), completed(rid(1))];
+    assert!(meta.install_shadow(rid(1), 1, &write, &written).unwrap());
+    let refused_at = Position {
+        seq: 1,
+        pending: Some(JournalPos { epoch: 1, jseq: 5 }),
+        ..Position::ZERO
+    };
+    let entry = create("p19", p19, t0 + 2);
+    assert!(meta
+        .install_hint_from(Some(rid(2)), std::slice::from_ref(&entry), refused_at, 1, 0)
+        .unwrap());
+    let present = |m: &Meta| {
+        m.lookup(ROOT_INO, "p19").unwrap().map(|e| e.ino) == Some(p19)
+            && m.getattr(p19).unwrap().is_some()
+    };
+    assert!(present(&meta));
+    // Segment 2: journal rows 2..=3, this node's write of `p18`.
+    let applied = meta
+        .apply_segment_rows(2, 1, 3, &[2, 3], &[], &written, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.retired, 1, "the shadow retires, the hint does not");
+    assert!(
+        present(&meta),
+        "the hinted entry vanished under a segment that does not carry it"
+    );
+    assert!(meta.has_outstanding_speculation());
+    // Segment 3: rows 4..=5, the winner's create (and its completion).
+    let applied = meta
+        .apply_segment_rows(
+            3,
+            1,
+            5,
+            &[4, 5],
+            &[],
+            &[entry, completed(rid(3))],
+            &TouchSet::default(),
+        )
+        .unwrap();
+    assert_eq!(applied.retired, 1);
+    assert!(!meta.has_outstanding_speculation());
+    assert!(present(&meta));
+}
+
+/// The supersession rule, locally (the authority sim's `flex-zero` seed
+/// 1000 found it): a segment that changes a hinted entry *after* the
+/// refusal's position — here, rows held back for their chunks keep its
+/// journal position below the refusal's, so the hint has not been
+/// reached — ends the hint all the same. Kept, the rewind of this node's
+/// own write (completed by that segment) would redo the hint over the
+/// later change and put the old name back.
+fn a_later_change_of_a_hinted_name_ends_the_hint(later: LogRecord, renamed_to: Option<&str>) {
+    let meta = Meta::open_in_memory().unwrap();
+    let t0 = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS;
+    let (p18, p19) = (ino(18), ino(19));
+    apply(&meta, 1, 1, &[create("p18", p18, t0)]);
+    let write = MutateOp::Setattr {
+        ino: p18,
+        mode: Some(0o600),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    let written = vec![chmod(p18, 0o600, t0 + 1), completed(rid(1))];
+    assert!(meta.install_shadow(rid(1), 1, &write, &written).unwrap());
+    // Refused with the winner's create at journal row 5 of 6.
+    let refused_at = Position {
+        seq: 1,
+        pending: Some(JournalPos { epoch: 1, jseq: 6 }),
+        ..Position::ZERO
+    };
+    let entry = create("p19", p19, t0 + 2);
+    assert!(meta
+        .install_hint_from(Some(rid(2)), std::slice::from_ref(&entry), refused_at, 1, 0)
+        .unwrap());
+    assert_eq!(
+        meta.lookup(ROOT_INO, "p19").unwrap().map(|e| e.ino),
+        Some(p19)
+    );
+    // Segment 2: rows 2, 3 (this node's write), 5 (the create) and 7
+    // (the later change); rows 4 and 6 are held back for their chunks,
+    // so the tenure has shipped its journal only through row 3.
+    let mut records = written.clone();
+    records.push(entry);
+    records.push(later);
+    let applied = meta
+        .apply_segment_rows(2, 1, 3, &[2, 3, 5, 7], &[], &records, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.retired, 2, "the shadow and the superseded hint");
+    assert!(!meta.has_outstanding_speculation());
+    assert_eq!(
+        meta.lookup(ROOT_INO, "p19").unwrap(),
+        None,
+        "the hint was redone over the later change of its name"
+    );
+    if let Some(to) = renamed_to {
+        assert_eq!(meta.lookup(ROOT_INO, to).unwrap().map(|e| e.ino), Some(p19));
+    }
+    assert_eq!(
+        meta.getattr(p18).unwrap().map(|a| a.mode & 0o777),
+        Some(0o600)
+    );
+}
+
+#[test]
+fn a_later_unlink_of_a_hinted_name_ends_the_hint() {
+    let t = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS + 10;
+    a_later_change_of_a_hinted_name_ends_the_hint(unlink("p19", t), None);
+}
+
+#[test]
+fn a_later_rename_of_a_hinted_name_ends_the_hint() {
+    let t = constellation_fs_core::types::now_ns() + STAMP_MARGIN_NS + 10;
+    a_later_change_of_a_hinted_name_ends_the_hint(
+        LogRecord::Rename {
+            parent: ROOT_INO,
+            name: "p19".into(),
+            new_parent: ROOT_INO,
+            new_name: "q19".into(),
+            time_ns: t,
+        },
+        Some("q19"),
+    );
 }

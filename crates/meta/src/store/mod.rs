@@ -219,6 +219,14 @@ pub(crate) const KV_PENDING_BY_INO: &str = "pending_upload_by_ino_built";
 /// `clear_dirty_upto` can tell "still dirty at the counter a publish
 /// observed" from "re-dirtied since".
 pub(crate) const KV_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
+/// The layout version of this store's persisted rows, written when the
+/// store is created and checked by every open ([`Meta::check_format`]).
+pub(crate) const KV_FORMAT: &str = "format";
+/// The on-disk format this binary reads and writes. There is no migration:
+/// a store of another format is refused at open. 2: a `spec` hint row
+/// carries the reply's whole `Position` (`SpecKind::Hint::at`), not a
+/// `seq` floor; 1 is every store written before the marker existed.
+pub const META_FORMAT: u32 = 2;
 
 pub type JournalBatch = Vec<(u64, crate::record::LogRecord)>;
 /// Plan 30 §M2: `Meta::recent`'s value type — see that field's doc. Each
@@ -831,6 +839,7 @@ impl Meta {
             syncs: AtomicU64::new(0),
             path,
         };
+        meta.check_format()?;
         meta.bootstrap()?;
         meta.build_pending_by_ino()?;
         let table = meta.delegation_table();
@@ -851,6 +860,37 @@ impl Meta {
         let applied_seq = meta.applied_seq().unwrap_or(0);
         meta.session.seed_applied(applied_seq, meta.applied_pos());
         Ok(meta)
+    }
+
+    /// Refuse a store of another on-disk format ([`META_FORMAT`]) before
+    /// anything reads its rows, and mark a brand-new one (no root inode
+    /// yet) with this binary's. A store with a root but no marker
+    /// predates the marker: format 1.
+    fn check_format(&self) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let found = match kv_get_tx(&tx, &self.local, KV_FORMAT)? {
+            Some(v) => v.parse::<u32>().ok(),
+            None if tx.get(&self.ns, keys::inode(ROOT_INO))?.is_none() => {
+                kv_set_tx(&mut tx, &self.local, KV_FORMAT, &META_FORMAT.to_string());
+                tx.commit()?;
+                return Ok(());
+            }
+            None => Some(1),
+        };
+        if found == Some(META_FORMAT) {
+            return Ok(());
+        }
+        let found = found.map_or_else(|| "unreadable".to_string(), |f| f.to_string());
+        let at = self
+            .path
+            .as_ref()
+            .map_or_else(|| "(in memory)".to_string(), |p| p.display().to_string());
+        Err(MetaError::Invalid(format!(
+            "metadata store {at} has on-disk format {found}, this binary reads only \
+             format {META_FORMAT} and has no migration: stop the node cleanly on the \
+             binary that wrote it (its journal shipped), remove the store, and start \
+             it again to rebuild from the log"
+        )))
     }
 
     /// A store written before `pending_upload_by_ino` existed: build the
@@ -2102,5 +2142,66 @@ impl UnshippedSeqs {
         for ino in &touched.inos {
             raise(self.inos.entry(*ino).or_insert(0), seq);
         }
+    }
+}
+
+/// The on-disk format marker: no migration, a store of another format
+/// is refused at open with a message that says what to do.
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn refusal(dir: &Path) -> String {
+        match Meta::open(dir) {
+            Ok(_) => panic!("an old-format store opened"),
+            Err(MetaError::Invalid(msg)) => msg,
+            Err(other) => panic!("not a format refusal: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_new_store_is_marked_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Meta::open(dir.path()).unwrap());
+        let meta = Meta::open(dir.path()).unwrap();
+        assert_eq!(
+            meta.kv_get(KV_FORMAT).unwrap(),
+            Some(META_FORMAT.to_string())
+        );
+    }
+
+    /// A store from before the marker (format 1: `spec` hint rows with a
+    /// `seq` floor, which this binary cannot decode) is refused at open,
+    /// not when `apply_segment_rows` first reads such a row.
+    #[test]
+    fn a_store_from_before_the_marker_is_refused_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            meta.local.remove(KV_FORMAT).unwrap();
+            meta.sync().unwrap();
+        }
+        let msg = refusal(dir.path());
+        assert!(
+            msg.contains("on-disk format 1") && msg.contains("no migration"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_store_of_another_format_is_refused_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            meta.kv_set(KV_FORMAT, "3").unwrap();
+            meta.sync().unwrap();
+        }
+        let msg = refusal(dir.path());
+        assert!(
+            msg.contains(&format!(
+                "on-disk format 3, this binary reads only format {META_FORMAT}"
+            )),
+            "{msg}"
+        );
     }
 }

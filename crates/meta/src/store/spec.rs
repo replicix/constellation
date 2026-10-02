@@ -57,9 +57,11 @@
 //! # Lifecycle
 //!
 //! - **Retirement.** A shadow retires when a tailed segment carries its
-//!   `Completed { rid }`; a hint when the applied position reaches its
-//!   floor; a `Local` entry when its journal rows ship. Retiring only
-//!   drops the index entry. The row stays while anything older is
+//!   `Completed { rid }`; a hint when the applied log holds everything
+//!   its refusal was read at (the reply's position — not just the next
+//!   segment, which need not carry the entry), or changes its entry
+//!   after that; a `Local` entry when its journal rows ship. Retiring
+//!   only drops the index entry. The row stays while anything older is
 //!   outstanding, because rolling that older entry back unwinds
 //!   everything after it too.
 //! - **Compaction.** Every row older than the oldest outstanding entry is
@@ -113,6 +115,7 @@ use crate::mutate::MutateOp;
 use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, apply_record, ApplyCx, TouchSet};
 use crate::rid::Rid;
+use crate::session::{JournalPos, Position};
 use crate::store::local::{self, LogPrefixView};
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, kv_get_tx, kv_set_tx, misc, ns,
@@ -149,11 +152,12 @@ pub enum SpecKind {
         op: MutateOp,
         gen: u64,
     },
-    /// The `Exists` early install: retires once the applied position
-    /// reaches `floor`, strands if a segment above `epoch` arrives first
-    /// (or, plan 30 §M11, the log recalls the answering delegate's
+    /// The `Exists` early install: retires once the applied state
+    /// reaches `at`, the position the refusal was evaluated at
+    /// ([`hint_reached`]); strands if a segment above `epoch` arrives
+    /// first (or, plan 30 §M11, the log recalls the answering delegate's
     /// generation `gen`).
-    Hint { floor: u64, epoch: u64, gen: u64 },
+    Hint { at: Position, epoch: u64, gen: u64 },
     /// Plan 30 §M9: one of the holder's journal transactions (rows
     /// `first..=last` of its tenure at `epoch`), streamed to this
     /// subscriber once its backups held it, ahead of the log. Retires
@@ -214,7 +218,7 @@ enum LiveEntry {
         gen: u64,
     },
     Hint {
-        floor: u64,
+        at: Position,
         epoch: u64,
         gen: u64,
     },
@@ -640,8 +644,8 @@ fn record_tx(
             epoch: *epoch,
             gen: *gen,
         }),
-        SpecKind::Hint { floor, epoch, gen } => Some(LiveEntry::Hint {
-            floor: *floor,
+        SpecKind::Hint { at, epoch, gen } => Some(LiveEntry::Hint {
+            at: *at,
             epoch: *epoch,
             gen: *gen,
         }),
@@ -1554,14 +1558,116 @@ fn strand_tx(
     Ok(rewind_tx(tx, meta, staged, &live, &stranded, cutoff, None)?.0)
 }
 
+/// Whether a replica that has applied the log through `applied_seq` —
+/// and, with it, the shipping tenures' journals through its recorded
+/// journal position, joined with `segment`'s (the segment being applied,
+/// whose position is recorded only at the end of its transaction) —
+/// holds everything a hint's refusal was evaluated at (`at`), and so the
+/// hint's entry, or what the log did to it since.
+///
+/// Not `at`'s next segment (`Position::hint_floor`), the rule before: a
+/// holder answers with the last segment it *confirmed* shipped plus its
+/// unshipped journal, so a segment already on its way to S3 — cut before
+/// the winner's `Create` was journaled — is that next segment, and does
+/// not carry the entry. Retired by it, the hint stayed only as long as
+/// nothing rolled it back; the first rewind that reached it (the loser's
+/// own earlier write, completed by that very segment) dropped it as
+/// "carried by the segment", and the file the loser had just opened was
+/// gone from its replica until the next segment: `fstat` answered
+/// `ENOENT`, and a `close` meanwhile took the file for unlinked and never
+/// published its write (harness `concurrent-create-no-excl`).
+fn hint_reached(
+    r: &impl Readable,
+    meta: &Meta,
+    at: &Position,
+    applied_seq: u64,
+    segment: Option<JournalPos>,
+) -> Result<bool, MetaError> {
+    if applied_seq < at.seq {
+        return Ok(false);
+    }
+    if let Some(pending) = at.pending {
+        let applied = crate::store::applied_pos_at(r, &meta.local).max(segment);
+        if applied < Some(pending) {
+            return Ok(false);
+        }
+    }
+    // Plan 30 §M11: a delegate's refusal names the stream rows it held;
+    // the log carries them once the root appended them (the persisted
+    // per-generation index `apply_segment_rows` raises first).
+    for (gen, idx) in at.streams.iter() {
+        let logged = kv_get_tx(r, &meta.local, &local::deleg_log_idx_key(gen))?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if logged < idx {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The keys a segment's records change *after* position `at`: what a
+/// replica that holds `at` has not seen yet. A segment at or below
+/// `at.seq` is wholly inside it. Above it, a row of the answering
+/// holder's tenure at or below `at.pending` was in its journal, and a
+/// delegate's row at or below `at.streams`' index for its generation was
+/// in the delegate's stream; anything else came later. (`rows`/`origins`
+/// pair with the non-`Atime` records, in order; a segment without them
+/// counts as within `at`, never as a later change.)
+fn touched_after(
+    at: &Position,
+    seq: u64,
+    epoch: u64,
+    rows: &[u64],
+    origins: &[(u64, u64)],
+    records: &[LogRecord],
+) -> TouchSet {
+    let mut out = TouchSet::default();
+    if seq <= at.seq || rows.is_empty() {
+        return out;
+    }
+    let journaled = |jseq: u64| {
+        at.pending
+            .is_some_and(|p| epoch < p.epoch || (epoch == p.epoch && jseq <= p.jseq))
+    };
+    let mut row = 0;
+    for rec in records {
+        if matches!(rec, LogRecord::Atime { .. }) {
+            continue;
+        }
+        let jseq = rows.get(row).copied();
+        let (gen, idx) = origins.get(row).copied().unwrap_or((0, 0));
+        row += 1;
+        let streamed = gen != 0 && at.streams.get(gen).is_some_and(|held| idx <= held);
+        if !(jseq.is_some_and(journaled) || streamed) {
+            out.add(rec);
+        }
+    }
+    out
+}
+
+/// Whether `later` (a segment's [`touched_after`]) changes the entry a
+/// hint's `records` install: its name or its inode. Not its parent's
+/// times — a create next to it says nothing about the entry.
+fn supersedes(later: &TouchSet, records: &[LogRecord]) -> bool {
+    let entry = TouchSet::from_records(records.iter());
+    entry.dentries.iter().any(|d| later.dentries.contains(d))
+        || entry.inos.iter().any(|i| later.inos.contains(i))
+}
+
 /// Retire every outstanding shadow whose rid `completes` names and every
-/// hint whose floor `applied_seq` has reached. A streamed transaction
-/// retires only rows-confirmed (`apply_segment_rows` converts it).
+/// hint the applied state has reached ([`hint_reached`]; `segment`: the
+/// journal position of the segment being applied, if any) or that is in
+/// `superseded` (the segment changes its entry after its position). A
+/// streamed transaction retires only rows-confirmed
+/// (`apply_segment_rows` converts it).
 pub(crate) fn retire_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     completes: &HashSet<Rid>,
     applied_seq: u64,
+    segment: Option<JournalPos>,
+    superseded: &HashSet<u64>,
 ) -> Result<usize, MetaError> {
     let mut retired = 0;
     if counter_get(tx, &meta.local, KV_SPEC_LIVE_COUNT)? == 0 {
@@ -1579,7 +1685,9 @@ pub(crate) fn retire_tx(
     for (seq, entry) in entries {
         let done = match entry {
             LiveEntry::Shadow { rid, .. } => completes.contains(&rid),
-            LiveEntry::Hint { floor, .. } => applied_seq >= floor,
+            LiveEntry::Hint { at, .. } => {
+                superseded.contains(&seq) || hint_reached(&*tx, meta, &at, applied_seq, segment)?
+            }
             // Rows-confirmed entries are converted by `apply_segment_rows`
             // (their records were skipped). One the tenure shipped past
             // without naming its rows was dropped on the holder, and is
@@ -2134,18 +2242,18 @@ impl Meta {
     }
 
     /// Install the entry behind an `Exists` refusal ahead of the log, as a
-    /// `Hint` entry: it retires once the applied position reaches `floor`
-    /// (the holder's next ship position when it answered), and is rolled
-    /// back if a segment from a later epoch than the answering holder's
-    /// arrives first. `false`: not installed (see
-    /// [`Self::install_hint_from`]).
+    /// `Hint` entry: it retires once the applied log holds everything the
+    /// answering holder had (`at`, the reply's position; see
+    /// `hint_reached`), and is rolled back if a segment from a later epoch
+    /// than the answering holder's arrives first. `false`: not installed
+    /// (see [`Self::install_hint_from`]).
     pub fn install_hint(
         &self,
         records: &[LogRecord],
-        floor: u64,
+        at: Position,
         epoch: u64,
     ) -> Result<bool, MetaError> {
-        self.install_hint_from(None, records, floor, epoch, 0)
+        self.install_hint_from(None, records, at, epoch, 0)
     }
 
     /// [`Self::install_hint`] for the refusal of `rid` (when known),
@@ -2177,7 +2285,7 @@ impl Meta {
         &self,
         rid: Option<Rid>,
         records: &[LogRecord],
-        floor: u64,
+        at: Position,
         epoch: u64,
         gen: u64,
     ) -> Result<bool, MetaError> {
@@ -2192,7 +2300,7 @@ impl Meta {
         if live_speculation_touches(&tx, self, &TouchSet::from_records(records.iter()))? {
             return Ok(false);
         }
-        self.install_speculative_tx(tx, SpecKind::Hint { floor, epoch, gen }, records)?;
+        self.install_speculative_tx(tx, SpecKind::Hint { at, epoch, gen }, records)?;
         Ok(true)
     }
 
@@ -2446,6 +2554,13 @@ impl Meta {
                 _ => None,
             })
             .collect();
+        // The journal position this segment brings the replica to,
+        // recorded at the end of the transaction; the hint retirement
+        // below already counts it.
+        let seg_pos = JournalPos {
+            epoch,
+            jseq: through,
+        };
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
         let stranded = strand_tx(&mut tx, self, &staged, |entry| {
@@ -2509,6 +2624,37 @@ impl Meta {
                 .collect()
         };
         let live: HashMap<u64, LiveEntry> = read_live(&tx, self)?.into_iter().collect();
+        // The hints this segment ends: the log now holds everything their
+        // refusal was read at, or it changes their entry after that (the
+        // later change ships only with or after the entry's own row: a
+        // row touching a held-back row's keys is held too, plan 30 §M4).
+        // Either way the log speaks for the entry from here on; a hint
+        // kept past a later change would be redone over it by a rewind
+        // (flex-zero seed 1000: `f0` put back over the rename that
+        // replaced it, while rows held for their chunks kept `through`
+        // below the refusal's position).
+        let mut superseded: HashSet<u64> = HashSet::new();
+        let mut hints_ending: HashSet<u64> = HashSet::new();
+        for (spec_seq, entry) in &live {
+            let LiveEntry::Hint { at, .. } = entry else {
+                continue;
+            };
+            let later = touched_after(at, seq, epoch, rows, origins, records);
+            let changed = !later.dentries.is_empty() || !later.inos.is_empty();
+            if changed {
+                if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
+                    let row: SpecRow = postcard::from_bytes(&v)?;
+                    if supersedes(&later, &row.records) {
+                        superseded.insert(*spec_seq);
+                        hints_ending.insert(*spec_seq);
+                        continue;
+                    }
+                }
+            }
+            if hint_reached(&tx, self, at, seq, Some(seg_pos))? {
+                hints_ending.insert(*spec_seq);
+            }
+        }
         // Plan 30 §M9: the streamed transactions this segment carries are
         // applied already. Re-applying their records would not converge
         // (a `Create` re-runs once a later speculation renamed the name
@@ -2643,7 +2789,10 @@ impl Meta {
                 .iter()
                 .filter(|(spec_seq, entry)| match entry {
                     LiveEntry::Shadow { rid, .. } => !completes.contains(rid),
-                    LiveEntry::Hint { floor, .. } => seq < *floor,
+                    // Not "the segment reaches its floor": the next
+                    // segment need not carry the entry, and one that does
+                    // not must find it redone over itself.
+                    LiveEntry::Hint { .. } => !hints_ending.contains(spec_seq),
                     LiveEntry::Streamed { .. } => !confirmed.iter().any(|(s, _, _)| s == *spec_seq),
                     LiveEntry::Local { .. } => !own_spec.contains(spec_seq),
                 })
@@ -2691,7 +2840,7 @@ impl Meta {
             };
             apply_batch_tx(&mut tx, self, cx, records, pending, &staged, false)?.0
         };
-        let mut retired = retire_tx(&mut tx, self, &completes, seq)?;
+        let mut retired = retire_tx(&mut tx, self, &completes, seq, Some(seg_pos), &superseded)?;
         for (spec_seq, _, _) in &confirmed {
             if let Some(v) = tx.get(&self.spec, seq_key(*spec_seq))? {
                 let mut row: SpecRow = postcard::from_bytes(&v)?;
@@ -2755,14 +2904,7 @@ impl Meta {
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;
         kv_set_tx(&mut tx, &self.local, KV_APPLIED_SEQ, &seq.to_string());
-        crate::store::note_applied_pos_tx(
-            &mut tx,
-            &self.local,
-            crate::session::JournalPos {
-                epoch,
-                jseq: through,
-            },
-        );
+        crate::store::note_applied_pos_tx(&mut tx, &self.local, seg_pos);
         let (bytes, files) = staged.raw_delta();
         adjust_usage_tx(&mut tx, &self.local, bytes, files)?;
         tx.commit()?;

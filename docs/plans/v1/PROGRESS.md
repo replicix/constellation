@@ -35100,3 +35100,206 @@ root-failover-with-delegates: 10 PASSED.
   The journal part is "everything journaled before me", not "this
   subtree's rows". Scoping it would need per-row subtree membership, and
   nothing has asked for that since rows ship in order anyway.
+
+## Fix: create-race — a just-opened file vanished from the loser's replica (`concurrent-create-no-excl`)
+
+The 38-Z2c review found two failures of `concurrent-create-no-excl` (four
+nodes `open(O_CREAT)` one name at once, each `pwrite`s its byte, then
+everyone reads). Once in ~120 runs node a read `"a\0cd"` for a minute: b's
+byte was gone although b's `close` returned 0. On `uring`, 6 of 81 runs: a
+loser's `fstat` (or `close`) answered `ENOENT` right after its create
+"found its name existing; opened the file there". Both pre-date Z2c, and
+both are one mechanism: for a moment after the open, the loser's replica
+did not have the winner's inode.
+
+### Mechanism
+
+- **The hint.** A loser's forwarded `Create` is refused `Exists`; with the
+  reply's base applied, the requester installs the winner's entry ahead of
+  the log as an `Exists` *hint* (plan 29 M6 / plan 30 §M6), so its next
+  lookup finds it. `open_existing` opens that inode.
+- **Its retirement.** A hint retired once the applied log reached
+  `Position::hint_floor()`: the holder's `head_seq`, plus one when it had
+  an unshipped journal. `head_seq` is the last segment the holder has
+  *confirmed* shipped, and `journal_position` counts every unacknowledged
+  row, so a segment already on its way to S3 — cut before the winner's
+  `Create` was journaled — *is* `head_seq + 1`. It need not carry the
+  entry. The property test even said so ("a hint's floor is only exact
+  when the segment at the floor carries everything the holder had when it
+  answered") and kept segments whole while a hint was outstanding.
+- **Its loss.** A retired hint keeps its effect in `ns` only until a rewind
+  reaches its row. `apply_segment_rows` rewinds from the oldest outstanding
+  row the segment overlaps or completes — in this scenario, the loser's own
+  `SetManifest` shadow from the round before, which that very in-flight
+  segment completes. The redo then drops every row that is "retired
+  speculation whose effect the segment carries"; for this hint the segment
+  carried nothing. The winner's inode was gone from the loser's replica
+  until the next segment.
+- **The two symptoms.** In that window `getattr` (the `fstat`) answered
+  `NotFound`. `flush_inode` took the missing inode for an unlinked one (an
+  inode the replica lacks counted as unlinked), kept the session and
+  returned 0 without publishing anything. If the `release` also fell in the
+  window, it dropped the session (`last && unlinked` → `drop_writes`): the
+  acknowledged byte was lost for good, and every replica converged on the
+  file without it.
+- **Evidence from the real cluster.** An instrumented build (warn per hint
+  installed, per hint the old rule would retire before the log holds its
+  position, per rewind that would drop it) over 9 runs of 100 rounds: 390
+  hints installed; 1 of the 127 checked for it had no durable entry behind
+  it (the hint was the loser's only copy of the winner's file); 16 were at
+  a segment shipped short of the refusal's position, where the old rule
+  retired them. The three together are rare, matching the review's rates;
+  no run of this host reproduced the failure itself (`uring`, 0 of 26 runs
+  × 100 rounds; 0 of 12 runs with `CREATE_RACE_S3_LATENCY_MS=20`).
+- **Not the merge.** The suspected manifest rebase (`compose_manifest` /
+  `commit_manifest_with_rebase`) is sound: a rebase re-lays only the ranges
+  this session's `write()`s delivered over the base the holder answered
+  with, and the holder's base check refuses any other base. The lost byte
+  was a commit that never happened.
+
+### Fix
+
+- **`crates/meta/src/store/spec.rs`.** A hint carries the reply's whole
+  `Position` (`SpecKind::Hint { at, .. }`, `LiveEntry::Hint { at, .. }`;
+  `install_hint`/`install_hint_from` and `Replica::install_hint` take it)
+  and ends only when
+  - the log holds the position (`hint_reached`): segment `at.seq` applied,
+    the answering tenure's journal shipped through `at.pending` (the
+    replica's recorded journal position joined with the segment being
+    applied), and each delegation stream of `at.streams` appended through
+    its index; or
+  - a segment changes the hint's own entry — its name or its inode, not
+    its parent's times — with a row *after* the position
+    (`touched_after`, `supersedes`). Such a row ships only with or after
+    the entry's own row (a row touching a held-back row's keys is held
+    too, plan 30 §M4), so the log speaks for the entry from there. Without
+    this second rule the long-lived hint was redone over a later rename of
+    its name by a rewind (authority sim `flex-zero` seed 1000: rows held
+    for their chunks kept `through` below the refusal's position while
+    later rows shipped).
+  `apply_segment_rows` decides both once per segment, for the rewind's
+  live set and for `retire_tx`. `Position::hint_floor` is now only the
+  install condition (`client.rs`), as its doc says.
+  A hint now lives until the answering tenure's journal ships through the
+  refusal's position, and `through` stays below any row held back for its
+  chunks — under write-back with slow uploads that is many segments, not
+  one, each of which captures it as a `Foreign` row with before-images
+  and rewinds from it when it touches the entry or its parent (measured
+  below).
+- **On-disk format (`crates/meta/src/store/mod.rs`).** The `spec` hint row
+  changed layout (`floor: u64` → `at: Position`), so the meta store now
+  has a format marker (`local` key `format`, `META_FORMAT` = 2; a store
+  with a root inode and no marker is format 1). `Meta::open` refuses any
+  other format before reading a row, saying there is no migration (stop
+  the node cleanly on the old binary, remove the store, rebuild from the
+  log), instead of failing later in `apply_segment_rows` on an old hint
+  row.
+- **`crates/engine/src/view/flush.rs`, `ops.rs`.** `flush_inode` keeps its
+  "unlinked while open: publish nothing" shortcut for an orphan this
+  replica holds (`View::orphaned`, `nlink == 0`) only. An inode the
+  replica merely lacks goes to the sequencer, which decides. A `NotFound`
+  from it is taken for an unlink only once the replica, after the session
+  wait (the refusal raised the watermark to the state it was answered
+  from), holds the inode as an orphan — a replayed unlink always leaves
+  one. Otherwise the replica never held the file, or held it only through
+  a hint a takeover rolled back (the winner's unshipped create stranded
+  with the old tenure), and the sequencer has no such file: the close
+  answers `ESTALE` and keeps the session for a later close to retry.
+  `release` drops a session only for an orphan, or, for an inode the
+  replica lacks, after its own flush answered `ESTALE` (logged as a
+  warning) — never behind a success; after any other failure the session
+  stays, as a present file's does. So the one window left (a takeover
+  between the `Exists` reply and the segment carrying the winner's create)
+  yields `ENOENT` on `fstat` and an error on `close`, never a silent loss.
+- **Harness oracle (`crates/harness/src/scenarios/ovh.rs`, `converged`).**
+  The content check waited a minute on the first node before failing and
+  named only that node's read. It now polls every name on every mount at
+  once, fails as soon as every mount, the sequencer's included, has read
+  the same content lacking a mark for 10 s (`LOST_WRITE_STABLE`; the
+  sequencer's replica holds every acknowledged commit before the close
+  returns, so only an attribute-TTL-bound kernel cache can lag there), and
+  otherwise fails at the deadline with every mount's read. The deadlines
+  are 180 s (270 s for the S3-inbox races, the old 90/60 ratio): the first
+  run on a fresh prefix took 159 s for the whole scenario against 20–50 s
+  warm, and a phase must survive all of that landing on it; a lost write
+  still fails after 10 s whatever the deadline.
+  `CREATE_RACE_S3_LATENCY_MS` (0) puts every mount behind toxiproxy with
+  that latency, widening the in-flight-ship window;
+  `CREATE_RACE_WRITE_MODE` sets every node's write mode;
+  `CREATE_RACE_SPEC_COUNTS=1` prints each racer's outstanding speculation
+  after every round (max and last) and once converged.
+
+### Tests (each fails without its fix)
+
+| Test | What it pins |
+|---|---|
+| `meta/tests/speculation.rs` `a_hint_outlives_a_segment_that_does_not_carry_its_entry` | the harness interleaving: the loser's shadow for `p18`, the hint for `p19` read at seq 1 + journal row 5, segment 2 shipped through row 3 completing the shadow — `p19` stays (lookup and `getattr`), retires with segment 3. Old rule: "the hinted entry vanished" |
+| `meta/tests/speculation.rs` `speculation_matches_log_plus_surviving_speculation` (the property model, extended) | hints carry the holder's reply position; segments split the journal anywhere even with a hint outstanding (the restriction is gone); ops include whole-file writes (`SetManifest` shadows: a close); every step checks each name and the inode it names against the log + surviving speculation (`check_names`), the end state byte for byte. Pinned long-run seed 89: under the old rule `n0` vanished at step 78. `_long` (2 000 seeds × 200 steps) passes |
+| `engine/src/view/durable_ack_tests.rs` `a_close_of_a_file_the_replica_lost_asks_the_sequencer` | a non-owner writes the winner's file it knows by a hint, the hint is rolled back (the tenure ends), the close forwards the `SetManifest` (size 2) instead of answering 0 with nothing published |
+| `engine/src/view/durable_ack_tests.rs` `a_close_the_sequencer_answers_not_found_fails_and_keeps_the_bytes` | the takeover window: the same rolled-back hint, and the new holder answers the forwarded `SetManifest` `NotFound`; the close answers `ESTALE`, not 0, and the session (2 bytes) stays. With the post-forward branch on `unlinked` it answered `Ok(())` |
+| `meta/tests/speculation.rs` `a_later_unlink_of_a_hinted_name_ends_the_hint`, `a_later_rename_of_a_hinted_name_ends_the_hint` | the supersession rule locally: a segment shipped through row 3 (rows 4 and 6 held) carries the hinted create (row 5) and a later unlink/rename of its name (row 7) and completes this node's older shadow; the hint retires with the shadow and `p19` stays gone (renamed: `q19` names the inode). Rule off: `p19` is put back by the rewind's redo |
+| `meta/src/store/mod.rs` `format_tests` (3) | a new store is marked and reopens; a store without the marker (format 1) and one marked 3 are refused at open with the format and "no migration" in the message |
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefixes `crace`/`crace-sub`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | no diff; clean |
+| `cargo test --workspace --no-fail-fast` | 2 265 passed, 1 failed, 46 ignored. The failure is `engine` `coop::tests::a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3` (2 of 8 burst chunks from S3 while two hedges fired, host load ~40); it passed 20/20 alone right after. `coop.rs` is untouched here |
+| `cargo test -p constellation-authority --release --test sim -- --ignored --exact <t>`, `AUTHORITY_SIM_SEEDS=3000` | `long_random`, `long_flex`, `long_delegated`, `long_strict` pass. `long_backup` fails on seed 52088 (`long-backup`: a directory linearizability violation) and `long_locks` on seed 191524 (`locks-partition`: a lock never granted); **both fail identically on `main` (0d0291d)**, not this change. `flex-zero` seed 1000 (CI set) found the supersession rule above |
+| `cargo test -p constellation-meta --test speculation -- --ignored` (`_long`) | 2 000 seeds × 200 steps pass |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `cargo build --release --workspace --features constellation-frontend-fuse/io-uring` | ok |
+| `harness run concurrent-create-no-excl` ×100, `dev-fuse`, `CREATE_RACE_ROUNDS=100` | **100/100 PASSED** (one run took 158 s at host load 42) |
+| the same ×100, `CONSTELLATION_FUSE_TRANSPORT=auto` (every mount `uring`, checked in the mount logs) | **100/100 PASSED** |
+| the same ×18, `uring`, `CREATE_RACE_S3_LATENCY_MS=20` | 18/18 PASSED |
+| `harness run` on every scenario named `*create*`, `*rename*`, `*mkdir*`, `*forward*`, `*mutate*` (13) plus `session-exists-observed`, on `dev-fuse` and on `uring` | 14/14 and 14/14 PASSED |
+| `docker compose --profile test run --rm compliance` (private image tag, floci port unbound) | `8798 passed, 0 failed` |
+
+Before the fix, against `main`'s own binaries on this host: `uring`,
+`CREATE_RACE_ROUNDS=100`, 26 runs and `CREATE_RACE_S3_LATENCY_MS=20`, 12
+runs, all passed. The review's failure rates were not reproducible here
+(load was the obvious difference, and adding artificial load is not
+allowed). The instrumented runs above show what the old rule did in the
+real cluster; the meta tests reproduce the vanish deterministically.
+
+### Review round (rebased on `main` b458669)
+
+The review's must-fix: the post-forward branch of `flush_inode` still took
+a `NotFound` for an unlink of an inode the replica merely lacked, so in
+the takeover window the close answered 0 and the last `release` dropped
+the bytes. Fixed as described under Fix above (`ESTALE`, session kept,
+`release` drops only behind an error); the format marker, the deadlines,
+the supersession tests and the knobs below are this round's too.
+
+**Hint lifetime under slow S3** (`CREATE_RACE_SPEC_COUNTS=1`,
+`CREATE_RACE_S3_LATENCY_MS=50`, so every S3 request ≥ 100 ms; `dev-fuse`;
+outstanding speculation counts hints and shadows together, sampled after
+each round on each racer; the holder `a` always 0):
+
+| Write mode, rounds | sequencer races (`p`/`t`/`x`), max per non-holder | after the last round | delegated races, max | once converged |
+|---|---|---|---|---|
+| `back`, 100 | 80 / 73 / 45 | 72 / 39 / 21 | 8 / 7 | 0 on every node |
+| `through`, 100 | 65 / 81 / 104 | 56 / 53 / 76 | 2 / 7 | 0 on every node |
+| `back`, 400 | 128 / 130 / 135 | 59 / 60 / 46 | 8 / 7 | 0 on every node |
+
+The count is the burst rate times the ship lag: four times the rounds
+raised the peak by about 1.6×, not 4×, it plateaus near 130, and every
+node drains to 0 once the log catches up. No unbounded pile-up here, so no
+bound is proposed; the write-back cost the review named (a hint held by a
+held-back manifest row, captured with before-images by every segment in
+between) did not show as a difference between `back` and `through` in
+this scenario, whose files are one byte.
+
+| Command (review round) | Result |
+|---|---|
+| `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings` | no diff; clean |
+| `cargo test --workspace --no-fail-fast` (`ulimit -n` 65536) | **2 322 passed, 0 failed**, 47 ignored |
+| `cargo test --release -p constellation-meta --test speculation -- --ignored speculation_matches_log_plus_surviving_speculation_long` | ok (32 s) |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `cargo build --release --workspace --features constellation-frontend-fuse/io-uring` | ok |
+| `harness run concurrent-create-no-excl` ×100, `CREATE_RACE_ROUNDS=100`, `dev-fuse` (2 workers × 50) | **100/100 PASSED** (14–135 s per run) |
+| the same ×100, `CONSTELLATION_FUSE_TRANSPORT=auto` (ring confirmed: `transport-detach-refused` with `EXPECT_URING=1` "negotiated uring") | **100/100 PASSED** |
+| `harness run` on the 14 scenarios named `*create*`, `*rename*`, `*mkdir*`, `*forward*`, `*mutate*` plus `session-exists-observed`, `dev-fuse` and `auto` | 15/15 and 15/15 PASSED |
+| `docker compose -p crfix --profile test run --rm --build compliance` (private image tag, floci port unbound; image rebuilt from this tree) | `8798 passed, 0 failed` |
+| Revert checks | post-forward branch on `unlinked`: `a_close_the_sequencer_answers_not_found…` fails (`Ok(())` vs `Err(Stale)`); supersession rule off: both `a_later_*_of_a_hinted_name_ends_the_hint` fail (`p19` put back) |

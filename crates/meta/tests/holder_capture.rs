@@ -441,7 +441,10 @@ fn a_holder_publishes_the_log_prefix_by_before_image_substitution() {
             gid: 0,
             time_ns: 1,
         }],
-        10,
+        constellation_meta::Position {
+            seq: 10,
+            ..constellation_meta::Position::ZERO
+        },
         1,
     )
     .unwrap();

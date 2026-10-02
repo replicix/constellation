@@ -414,7 +414,15 @@ impl View {
         // the data: keep the session attached — this node's reads overlay
         // it — until the last close drops it with the inode
         // (`View::release`, [`Self::drop_writes`]).
-        if self.unlinked(ino) {
+        //
+        // Only for an orphan this replica holds. An inode it merely lacks
+        // is not known to be unlinked — speculation that installed it may
+        // be rolled back and redone, the entry not in the log yet — so the
+        // sequencer decides, below: taken for unlinked, the close of a
+        // file another node had just created answered success, published
+        // nothing, and the last close dropped the bytes (harness
+        // `concurrent-create-no-excl`).
+        if self.orphaned(ino) {
             self.writes.reattach(ino, ws);
             return Ok(());
         }
@@ -432,10 +440,25 @@ impl View {
                 ws: Some(ws),
             }) => {
                 self.writes.reattach(ino, *ws);
-                // Unlinked by another node between the check above and
-                // the sequencer's answer: as above.
-                if errno == Code::NotFound && self.unlinked(ino) {
-                    return Ok(());
+                if errno == Code::NotFound {
+                    // Unlinked by another node between the check above
+                    // and the sequencer's answer: as above, once this
+                    // replica has applied the unlink — the refusal raised
+                    // the session watermark to the state it was answered
+                    // from, and a replayed unlink of an inode the replica
+                    // holds leaves the orphan record.
+                    self.session_wait(&[ReadKey::Ino(ino)]);
+                    if self.orphaned(ino) {
+                        return Ok(());
+                    }
+                    // An inode this replica never held, or held only
+                    // through speculation that was rolled back (a
+                    // takeover stranded the `Exists` hint's create): the
+                    // sequencer has no such file, so nothing was written.
+                    // Never a success — the session stays attached for a
+                    // later close to retry, and the last close drops it
+                    // only after answering this error (`View::release`).
+                    return Err(Code::Stale);
                 }
                 Err(errno)
             }
@@ -444,6 +467,17 @@ impl View {
                 Err(errno)
             }
         }
+    }
+
+    /// Whether `ino` (a shared-namespace inode, not a scratch one) is an
+    /// orphan record on this replica: unlinked (`nlink == 0`) and kept
+    /// for its open descriptors. Unlike [`Self::unlinked`], an inode the
+    /// replica lacks altogether is not one.
+    pub(super) fn orphaned(&self, ino: Ino) -> bool {
+        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            return false;
+        }
+        matches!(self.meta.getattr(ino), Ok(Some(attr)) if attr.nlink == 0)
     }
 
     /// Whether `ino` (a shared-namespace inode, not a scratch one) has no

@@ -112,6 +112,12 @@ fn race(
     let mut out = Vec::new();
     let mut losers_opened = 0usize;
     let started = Instant::now();
+    // `CREATE_RACE_SPEC_COUNTS=1`: each racer's outstanding speculation
+    // (hints and shadows, `node.status`) after every round — the highest
+    // and the last, to see whether hints pile up.
+    let sample = knob("CREATE_RACE_SPEC_COUNTS", 0) > 0;
+    let mut spec_max = vec![0u64; racers.len()];
+    let mut spec_last = vec![0u64; racers.len()];
     for i in 0..rounds {
         let name = format!("{dir}/{tag}{i}");
         let barrier = Arc::new(Barrier::new(racers.len()));
@@ -171,6 +177,23 @@ fn race(
                 out.push((name, won[0].1.expect("won")));
             }
         }
+        if sample {
+            for (k, c) in racers.iter().enumerate() {
+                spec_last[k] = outstanding_speculation(c)?;
+                spec_max[k] = spec_max[k].max(spec_last[k]);
+            }
+        }
+    }
+    if sample {
+        eprintln!(
+            "    {scenario}: {tag}* in {dir}: outstanding speculation per racer ({}) after \
+             a round: max {spec_max:?}, after the last {spec_last:?}",
+            racers
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
     eprintln!(
         "    {scenario}: {tag}* in {dir} ({kind:?}): {rounds} rounds x {} racers in {:?}{}",
@@ -185,45 +208,130 @@ fn race(
     Ok(out)
 }
 
+/// How long every mount, the sequencer's included, must agree on the same
+/// wrong content of a raced file before [`converged`] calls a racer's
+/// write lost instead of not yet visible. The sequencer's replica holds
+/// every acknowledged commit before its close returns; what can lag there
+/// is only its kernel's cache, for an attribute TTL — well under this.
+const LOST_WRITE_STABLE: Duration = Duration::from_secs(10);
+
+/// How long [`converged`] waits for a raced name to settle everywhere.
+/// Generous on purpose: a lost write fails after [`LOST_WRITE_STABLE`]
+/// whatever this is, so only a slow cluster ever waits it out. The first
+/// run on a fresh prefix (cold caches, images and S3 buckets) took 159 s
+/// for the whole scenario against 20–50 s warm (38-create-race review);
+/// one phase must survive all of that cold cost landing on it, so the
+/// deadline is above the whole cold run.
+const CONVERGE_DEADLINE: Duration = Duration::from_secs(180);
+/// [`CONVERGE_DEADLINE`] for the S3-inbox races: d reaches the sequencer
+/// only through S3 polling, half again as slow (the old 90 s against 60 s).
+const CONVERGE_INBOX_DEADLINE: Duration = Duration::from_secs(270);
+
 /// Every name resolves to the inode its race opened on every mount, and
 /// a `Plain` race's file holds every racer's mark byte.
+///
+/// Each poll reads every name on every mount. A file whose content every
+/// mount agrees on, and which lacks a mark, for [`LOST_WRITE_STABLE`] has
+/// lost a racer's acknowledged write (its `close` returned 0): every
+/// replica, the sequencer's too, has converged without it — that fails at
+/// once, instead of after `deadline` (a minute's wait for the one node the
+/// old check looked at, which named neither the others' content nor when
+/// it settled). Anything else fails at `deadline`, with every mount's read.
 fn converged(
     clients: &[&Client],
     names: &[(String, u64)],
     marks: Option<&[u8]>,
     deadline: Duration,
 ) -> Result<()> {
-    for c in clients {
-        eventually(
-            &format!("{} agrees on every raced inode", c.name),
-            deadline,
-            || {
-                for (name, ino) in names {
-                    let md = std::fs::metadata(c.mnt.join(name))
-                        .with_context(|| format!("{}: stat {name}", c.name))?;
-                    anyhow::ensure!(
-                        md.ino() == *ino && md.is_file(),
-                        "{}: {name} is inode {} (file: {}), the race opened {ino}",
-                        c.name,
-                        md.ino(),
-                        md.is_file()
-                    );
-                    if let Some(marks) = marks {
-                        let got = std::fs::read(c.mnt.join(name))?;
+    let started = Instant::now();
+    // Per name: the wrong content every mount agreed on, and since when.
+    let mut agreed: std::collections::HashMap<&str, (Vec<u8>, Instant)> = Default::default();
+    loop {
+        let mut pending = Vec::new();
+        for (name, ino) in names {
+            let reads: Vec<(&str, Result<Vec<u8>>)> = clients
+                .iter()
+                .map(|c| {
+                    let read = (|| -> Result<Vec<u8>> {
+                        let md = std::fs::metadata(c.mnt.join(name))
+                            .with_context(|| format!("stat {name}"))?;
                         anyhow::ensure!(
-                            got == marks,
-                            "{}: {name} reads {:?}, want every racer's mark {:?}",
-                            c.name,
-                            String::from_utf8_lossy(&got),
-                            String::from_utf8_lossy(marks)
+                            md.ino() == *ino && md.is_file(),
+                            "{name} is inode {} (file: {}), the race opened {ino}",
+                            md.ino(),
+                            md.is_file()
                         );
+                        match marks {
+                            Some(_) => Ok(std::fs::read(c.mnt.join(name))?),
+                            None => Ok(Vec::new()),
+                        }
+                    })();
+                    (c.name.as_str(), read)
+                })
+                .collect();
+            let good = |r: &Result<Vec<u8>>| matches!(r, Ok(got) if marks.is_none_or(|m| got.as_slice() == m));
+            if reads.iter().all(|(_, r)| good(r)) {
+                agreed.remove(name.as_str());
+                continue;
+            }
+            let first = reads.first().and_then(|(_, r)| r.as_ref().ok());
+            let unanimous = first.filter(|first| {
+                reads
+                    .iter()
+                    .all(|(_, r)| r.as_ref().is_ok_and(|got| got == *first))
+            });
+            match (marks, unanimous) {
+                (Some(marks), Some(content)) => {
+                    let since = agreed
+                        .entry(name.as_str())
+                        .or_insert_with(|| (content.clone(), Instant::now()));
+                    if since.0 != *content {
+                        *since = (content.clone(), Instant::now());
                     }
+                    anyhow::ensure!(
+                        since.1.elapsed() < LOST_WRITE_STABLE,
+                        "{name}: every mount has read {:?} for {:?}, want every racer's mark \
+                         {:?}: a write whose close returned 0 is lost",
+                        String::from_utf8_lossy(content),
+                        since.1.elapsed(),
+                        String::from_utf8_lossy(marks)
+                    );
                 }
-                Ok(())
-            },
-        )?;
+                _ => {
+                    agreed.remove(name.as_str());
+                }
+            }
+            pending.push(format!(
+                "{name}: {}",
+                reads
+                    .iter()
+                    .map(|(who, r)| match r {
+                        Ok(got) => format!("{who} reads {:?}", String::from_utf8_lossy(got)),
+                        Err(e) => format!("{who}: {e:#}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            started.elapsed() < deadline,
+            "not converged within {deadline:?}{}: {}",
+            marks
+                .map(|m| format!(" on every racer's mark {:?}", String::from_utf8_lossy(m)))
+                .unwrap_or_default(),
+            pending.join("; ")
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
-    Ok(())
+}
+
+fn outstanding_speculation(c: &Client) -> Result<u64> {
+    Ok(c.control_status()?["speculation"]["outstanding"]
+        .as_u64()
+        .unwrap_or(0))
 }
 
 fn inbox_ops(c: &Client) -> Result<u64> {
@@ -287,7 +395,31 @@ fn sqlite_first_touch(scenario: &str, a: &Client, b: &Client, rounds: usize) -> 
 pub fn concurrent_create_no_excl(_seed: u64) -> Result<()> {
     const NAME: &str = "concurrent-create-no-excl";
     let rounds = knob("CREATE_RACE_ROUNDS", 20) as usize;
-    let (_env, root, mut clients, _) = cluster(NAME, &["a", "b", "c", "d"], &[], 0)?;
+    // `CREATE_RACE_S3_LATENCY_MS`: every S3 request (each mount reaches S3
+    // through toxiproxy then) takes at least twice this, so a ship is in
+    // flight while most refusals are answered — the window of the hint a
+    // segment cut before its entry used to retire (PROGRESS.md, "Fix:
+    // create-race").
+    let s3_latency = knob("CREATE_RACE_S3_LATENCY_MS", 0);
+    let relays = if s3_latency > 0 { 4 } else { 0 };
+    let (env, root, mut clients, _relays) = cluster(NAME, &["a", "b", "c", "d"], &[], relays)?;
+    if s3_latency > 0 {
+        env.existing_s3_proxy().latency(s3_latency, 0)?;
+        eprintln!(
+            "    {NAME}: S3 latency injected: every request >= {}ms",
+            2 * s3_latency
+        );
+    }
+    // `CREATE_RACE_WRITE_MODE` (the mount default): `back` holds a
+    // manifest row back until its chunks are uploaded, and with it every
+    // later row touching its keys — what keeps a hint outstanding longest.
+    let write_mode = std::env::var("CREATE_RACE_WRITE_MODE").ok();
+    if let Some(mode) = &write_mode {
+        for c in &clients {
+            c.set_write_mode(mode)?;
+        }
+        eprintln!("    {NAME}: write mode {mode} on every node");
+    }
     let result = (|| -> Result<()> {
         let all: Vec<&Client> = clients.iter().collect();
         let a = &clients[0];
@@ -308,9 +440,9 @@ pub fn concurrent_create_no_excl(_seed: u64) -> Result<()> {
         let plain = race(NAME, &all, "race", "p", rounds, Race::Plain)?;
         let trunc = race(NAME, &all, "race", "t", rounds, Race::Trunc)?;
         let excl = race(NAME, &all, "race", "x", rounds, Race::Excl)?;
-        converged(&all, &plain, Some(b"abcd"), Duration::from_secs(60))?;
-        converged(&all, &trunc, None, Duration::from_secs(60))?;
-        converged(&all, &excl, None, Duration::from_secs(60))?;
+        converged(&all, &plain, Some(b"abcd"), CONVERGE_DEADLINE)?;
+        converged(&all, &trunc, None, CONVERGE_DEADLINE)?;
+        converged(&all, &excl, None, CONVERGE_DEADLINE)?;
         if sqlite_available() {
             sqlite_first_touch(NAME, b, clients.get(2).expect("c"), rounds.min(10))?;
         } else {
@@ -322,8 +454,8 @@ pub fn concurrent_create_no_excl(_seed: u64) -> Result<()> {
         wait_installed(b, "/deleg", Duration::from_secs(30))?;
         let dplain = race(NAME, &all, "deleg", "p", rounds, Race::Plain)?;
         let dexcl = race(NAME, &all, "deleg", "x", rounds, Race::Excl)?;
-        converged(&all, &dplain, Some(b"abcd"), Duration::from_secs(60))?;
-        converged(&all, &dexcl, None, Duration::from_secs(60))?;
+        converged(&all, &dplain, Some(b"abcd"), CONVERGE_DEADLINE)?;
+        converged(&all, &dexcl, None, CONVERGE_DEADLINE)?;
 
         // The S3 inbox: d has no P2P path to anyone, a (the sequencer)
         // and d race.
@@ -353,8 +485,18 @@ pub fn concurrent_create_no_excl(_seed: u64) -> Result<()> {
             let _ = std::fs::remove_file(c_deny_path(root.path(), &x.name));
         }
         let _ = std::fs::remove_file(c_deny_path(root.path(), &d.name));
-        converged(&pair, &iplain, Some(b"ab"), Duration::from_secs(90))?;
-        converged(&all, &iexcl, None, Duration::from_secs(90))?;
+        converged(&pair, &iplain, Some(b"ab"), CONVERGE_INBOX_DEADLINE)?;
+        converged(&all, &iexcl, None, CONVERGE_INBOX_DEADLINE)?;
+        if knob("CREATE_RACE_SPEC_COUNTS", 0) > 0 {
+            let settled: Vec<String> = all
+                .iter()
+                .map(|c| Ok(format!("{} {}", c.name, outstanding_speculation(c)?)))
+                .collect::<Result<_>>()?;
+            eprintln!(
+                "    {NAME}: outstanding speculation once converged: {}",
+                settled.join(", ")
+            );
+        }
         Ok(())
     })();
     if result.is_err() {

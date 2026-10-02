@@ -248,8 +248,12 @@ impl Position {
 
     /// The lowest log sequence at which a delete of what this position
     /// observed could ship: its `seq` when nothing was unshipped, else
-    /// the next segment (what the `Exists` hint retires at; plan 29 M6's
-    /// `ship_floor`, now exact for an idle holder).
+    /// the next segment (plan 29 M6's `ship_floor`, now exact for an idle
+    /// holder). A replica below it may install an `Exists` hint read at
+    /// this position. Not where the hint retires: the next segment need
+    /// not carry the entry (it may have been cut before the entry was
+    /// journaled) — that is the whole position (`store::spec`'s
+    /// `hint_reached`).
     pub fn hint_floor(&self) -> u64 {
         self.seq + u64::from(self.pending.is_some())
     }

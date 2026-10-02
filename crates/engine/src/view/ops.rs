@@ -1208,9 +1208,21 @@ impl Vfs for View {
         }
         // Orphan reap on last close (unlink-while-open, DESIGN.md §3),
         // with the write session a flush kept for the descriptors
-        // (`flush_inode`: an unlinked file publishes nothing).
-        if last && self.unlinked(ino) {
-            self.drop_writes(ino);
+        // (`flush_inode`: an unlinked file publishes nothing). An inode
+        // the replica lacks but holds no orphan record of is the
+        // sequencer's to judge: its session goes only once the flush
+        // above answered `ESTALE` (no such file there), never with a
+        // success; after any other failure it stays, as a present
+        // file's does.
+        let orphan = last && self.orphaned(ino);
+        if orphan || (last && self.unlinked(ino) && flush_result == Err(Code::Stale)) {
+            if self.drop_writes(ino) && !orphan {
+                tracing::warn!(
+                    ino,
+                    "the last close dropped writes to a file the sequencer does not have; \
+                     the close answered ESTALE"
+                );
+            }
             if let Ok(Some(attr)) = self.meta.getattr(ino) {
                 if attr.nlink == 0 {
                     let _ = self.meta.reap_orphan(ino);

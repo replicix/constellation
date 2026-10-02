@@ -118,14 +118,15 @@ pub trait Replica {
     /// adopt it as this node's own op (`Meta::adopt_streamed`).
     fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError>;
     /// Install the entry behind `rid`'s `Exists` refusal ahead of the
-    /// log. `false` when not installed: this replica already has the
+    /// log; it retires once the applied log reaches `at`, the reply's
+    /// position. `false` when not installed: this replica already has the
     /// refusal (applied, or streamed ahead of the log with whatever the
     /// holder streamed after it).
     fn install_hint(
         &self,
         rid: Rid,
         records: &[LogRecord],
-        floor: Seq,
+        at: Position,
         epoch: Epoch,
         gen: u64,
     ) -> Result<bool, MetaError>;
@@ -591,11 +592,11 @@ impl Replica for Meta {
         &self,
         rid: Rid,
         records: &[LogRecord],
-        floor: Seq,
+        at: Position,
         epoch: Epoch,
         gen: u64,
     ) -> Result<bool, MetaError> {
-        Meta::install_hint_from(self, Some(rid), records, floor, epoch, gen)
+        Meta::install_hint_from(self, Some(rid), records, at, epoch, gen)
     }
 
     fn has_outstanding_speculation(&self) -> bool {

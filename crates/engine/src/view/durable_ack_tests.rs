@@ -635,3 +635,151 @@ fn an_fsync_drains_a_back_closes_chunks_in_and_out_of_an_epoch() {
         );
     }
 }
+
+/// The loser of a create race (harness `concurrent-create-no-excl`):
+/// `ino` is the winner's file, which this replica knows only through the
+/// `Exists` hint; the replica wrote `b` at offset 1, and then a later
+/// epoch's segment stranded the hint (the answering tenure ended before
+/// shipping it), so the inode is gone here. `fs` is not the holder.
+fn hinted_and_lost(
+    meta: &Arc<Meta>,
+    ino: Ino,
+) -> (
+    View,
+    TempDir,
+    tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+) {
+    let hinted = meta
+        .install_hint(
+            &[constellation_meta::LogRecord::Create {
+                parent: ROOT_INO,
+                name: "p19".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+            constellation_meta::Position {
+                seq: 0,
+                pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 5 }),
+                ..constellation_meta::Position::ZERO
+            },
+            1,
+        )
+        .unwrap();
+    assert!(hinted);
+    let (mut fs, dir, core) = holder_fs(meta.clone(), false);
+    // Not the holder: the close forwards.
+    fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+    fs.do_write(ino, 1, b"b").unwrap();
+    // A later epoch's segment: the hint strands, the inode is gone here.
+    meta.apply_segment(1, 2, &[], &constellation_meta::TouchSet::default())
+        .unwrap();
+    assert!(meta.getattr(ino).unwrap().is_none());
+    (fs, dir, core)
+}
+
+/// Close `ino` on `fs`, the sequencer answering its forward with
+/// `answer`: the close's result and the op it forwarded.
+fn close_answered(
+    fs: &View,
+    core: &mut tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+    ino: Ino,
+    answer: constellation_meta::MutateOutcome,
+) -> (Result<(), Code>, Option<constellation_meta::MutateOp>) {
+    let mut forwarded = None;
+    let mut answer = Some(answer);
+    let result = std::thread::scope(|scope| {
+        let close = scope.spawn(|| fs.flush_inode(ino, false));
+        let started = std::time::Instant::now();
+        loop {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => reply.send(Ok(())).unwrap(),
+                Ok(SyncRequest::Submit { op, reply, .. }) => {
+                    forwarded = Some(op);
+                    reply
+                        .send(constellation_authority::ClientReply::Outcome(
+                            answer.take().expect("one forward"),
+                        ))
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(_) if close.is_finished() => break,
+                Err(_) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "the close is stuck"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        close.join().unwrap()
+    });
+    (result, forwarded)
+}
+
+/// Harness `concurrent-create-no-excl`'s lost byte: the hint is rolled
+/// back before the loser's close. The close must not take an inode the
+/// replica merely lacks for an unlinked one — that answered success,
+/// published nothing, and the last close dropped the bytes. It asks the
+/// sequencer, which has the file.
+#[test]
+fn a_close_of_a_file_the_replica_lost_asks_the_sequencer() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let ino = (7 << 40) | 19;
+    let (fs, _dir, mut core) = hinted_and_lost(&meta, ino);
+    let (result, forwarded) = close_answered(
+        &fs,
+        &mut core,
+        ino,
+        constellation_meta::MutateOutcome::Accepted {
+            epoch: 2,
+            records: Vec::new(),
+        },
+    );
+    result.unwrap();
+    match forwarded {
+        Some(constellation_meta::MutateOp::SetManifest { ino: i, size, .. }) => {
+            assert_eq!((i, size), (ino, 2), "the write went to the sequencer");
+        }
+        other => panic!("the close published nothing: {other:?}"),
+    }
+}
+
+/// The takeover window: the hint is rolled back because the create it
+/// carried was stranded with the old holder's tenure, so the new holder
+/// has no such file either and answers the forwarded manifest
+/// `NotFound`. The close must fail — a close that answered 0 must never
+/// have lost its write — and the bytes stay for a later close to retry.
+#[test]
+fn a_close_the_sequencer_answers_not_found_fails_and_keeps_the_bytes() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let ino = (7 << 40) | 19;
+    let (fs, _dir, mut core) = hinted_and_lost(&meta, ino);
+    let (result, forwarded) = close_answered(
+        &fs,
+        &mut core,
+        ino,
+        constellation_meta::MutateOutcome::Errno(Code::NotFound),
+    );
+    assert!(
+        matches!(
+            forwarded,
+            Some(constellation_meta::MutateOp::SetManifest { ino: i, .. }) if i == ino
+        ),
+        "the close asked the sequencer: {forwarded:?}"
+    );
+    assert_eq!(
+        result,
+        Err(Code::Stale),
+        "nothing was written: not a success"
+    );
+    let writes = fs.writes.lock(ino);
+    assert_eq!(
+        fs.writes.pending_len(&writes, ino),
+        Some(2),
+        "the session stays for a retry"
+    );
+}
