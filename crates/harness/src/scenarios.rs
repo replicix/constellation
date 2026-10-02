@@ -8501,6 +8501,11 @@ fn chaos_soak_4(seed: u64) -> Result<()> {
     for c in &mut clients {
         let _ = c.unmount();
     }
+    // The history is only worth keeping for a failure; a pass would leave
+    // ~600 MiB per run in /tmp (a tmpfs on the CI hosts).
+    if result.is_ok() {
+        let _ = std::fs::remove_dir_all(&store);
+    }
     result.with_context(|| format!("chaos-soak-4 artifacts under {}", store.display()))?;
     Ok(())
 }
