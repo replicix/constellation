@@ -362,6 +362,39 @@ fn diff_names_additions_removals_and_modifications_exactly() {
     assert_eq!(tree.apply(&root, &delta).unwrap(), other);
 }
 
+/// `diff_each` visits exactly `diff`'s keys in order, and stopping it
+/// after `n` keys yields those `n` and reports that it stopped.
+#[test]
+fn diff_each_is_diff_and_stops_when_asked() {
+    let tree = tree();
+    let root = tree.build((0..4_000).map(pair)).unwrap();
+    let edits: Vec<Edit> = (0..50)
+        .map(|i| (key(i * 70), Some(b"changed".to_vec())))
+        .collect();
+    let other = tree.apply(&root, &edits).unwrap();
+    let all = tree.diff(&root, &other).unwrap();
+    assert_eq!(all.len(), 50);
+    let mut seen = Vec::new();
+    let finished = tree
+        .diff_each(&root, &other, |key, kind| {
+            seen.push((key.to_vec(), kind));
+            true
+        })
+        .unwrap();
+    assert!(finished);
+    assert_eq!(seen, all);
+    let mut seen = Vec::new();
+    let finished = tree
+        .diff_each(&root, &other, |key, kind| {
+            seen.push((key.to_vec(), kind));
+            seen.len() < 7
+        })
+        .unwrap();
+    assert!(!finished);
+    assert_eq!(seen, all[..7]);
+    assert!(tree.diff_each(&root, &root, |_, _| false).unwrap());
+}
+
 // -------------------------------------------------------------------
 // 5. Disjoint merges agree
 // -------------------------------------------------------------------

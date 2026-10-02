@@ -456,8 +456,26 @@ impl<S: NodeStore> Tree<S> {
         b: &NodeHash,
     ) -> Result<Vec<(Vec<u8>, ChangeKind)>, MtreeError> {
         let mut out = Vec::new();
+        self.diff_each(a, b, |key, kind| {
+            out.push((key.to_vec(), kind));
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// [`Self::diff`] as a visit: `visit` sees each differing key in key
+    /// order and returns `false` to stop early, which costs nothing past
+    /// the keys seen (a bounded "did anything here change" check need
+    /// not materialize a large diff). `Ok(true)` when the diff ran to its
+    /// end, `Ok(false)` when `visit` stopped it.
+    pub fn diff_each(
+        &self,
+        a: &NodeHash,
+        b: &NodeHash,
+        mut visit: impl FnMut(&[u8], ChangeKind) -> bool,
+    ) -> Result<bool, MtreeError> {
         if a == b {
-            return Ok(out);
+            return Ok(true);
         }
         let mut ca = self.cursor(a)?;
         let mut cb = self.cursor(b)?;
@@ -481,32 +499,38 @@ impl<S: NodeStore> Tree<S> {
                     },
                 }
             };
-            match step {
-                Step::Done => break,
+            let go_on = match step {
+                Step::Done => return Ok(true),
                 Step::TakeA(kind) => {
-                    if let Some((key, _)) = ca.peek()? {
-                        out.push((key.to_vec(), kind));
-                    }
+                    let go_on = match ca.peek()? {
+                        Some((key, _)) => visit(key, kind),
+                        None => true,
+                    };
                     ca.next()?;
+                    go_on
                 }
                 Step::TakeB(kind) => {
-                    if let Some((key, _)) = cb.peek()? {
-                        out.push((key.to_vec(), kind));
-                    }
+                    let go_on = match cb.peek()? {
+                        Some((key, _)) => visit(key, kind),
+                        None => true,
+                    };
                     cb.next()?;
+                    go_on
                 }
                 Step::TakeBoth(modified) => {
-                    if modified {
-                        if let Some((key, _)) = ca.peek()? {
-                            out.push((key.to_vec(), ChangeKind::Modified));
-                        }
-                    }
+                    let go_on = match (modified, ca.peek()?) {
+                        (true, Some((key, _))) => visit(key, ChangeKind::Modified),
+                        _ => true,
+                    };
                     ca.next()?;
                     cb.next()?;
+                    go_on
                 }
+            };
+            if !go_on {
+                return Ok(false);
             }
         }
-        Ok(out)
     }
 
     /// The delta from `base` to `other` as edits applicable to any

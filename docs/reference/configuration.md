@@ -158,6 +158,7 @@ quarter of the lease TTL and logs an error.
 | `CONSTELLATION_FORWARD_TIMEOUT_MS` | `500` | milliseconds | forwarded mutation request |
 | `CONSTELLATION_FORWARD` | `on` | boolean | requester-side mutation forwarding; `off` makes non-holder writes acquire the lease instead |
 | `CONSTELLATION_SNAPSHOT_FORWARD_TIMEOUT_MS` | `30000` | milliseconds | a snapshot batch (create, delete, hold) forwarded to the root-lease holder, which drains, ships and publishes before it answers; on timeout the caller gets an error and nothing moves the lease (see [Forwarded mutations](features/forwarded-mutations.md#snapshot-batches)) |
+| `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` | `100000` | diff keys | skip-empty (plan 32 §3.4): how many keys of the tree diff between a create's `skip_if_unchanged_since` root and the holder's fresh commit are examined for one under the snapshot's directory; past it the directory counts as changed and the snapshot is taken. `0` takes every snapshot whose tree root moved |
 | `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement of the root lease (see [Lease placement](features/lease-placement.md)) |
 | `CONSTELLATION_LEASE_DWELL_MS` | `5000` | milliseconds; `0` means the default | a lease handed over cannot be handed back before this (it stops two competing writers ping-ponging it) |
 | `CONSTELLATION_LEASE_WANTED_GRACE_MS` | `5000` | milliseconds; `0` means the default | a requester registered in `wanted_by` is answered within this, busy holder or not |

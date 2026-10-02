@@ -685,7 +685,7 @@ where
 }
 
 impl TreeAccess {
-    fn tree(&self) -> Result<Tree<Arc<NodeCache>>> {
+    pub(crate) fn tree(&self) -> Result<Tree<Arc<NodeCache>>> {
         Ok(Tree::with_config(self.nodes.clone(), self.config)?)
     }
 }

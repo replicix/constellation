@@ -30896,3 +30896,33 @@ it is what the sequential lanes above are waiting for), no `transport`
 metric label and no `fuse` section in `node.status` beyond the one
 per-mount field (Z2b), no passthrough (Z3), no zero-copy (Z4). The 7.3
 zero-copy lane and `uring_zc` remain a name with no code behind it.
+
+## Plan 32 M3b (skip-empty)
+
+Step 3.4 of [plan 32](wip/32-snapshot-policies-and-space.md) (chunk
+`32-m3b`): the holder decides, after the batch's one publish, whether
+anything under a create's directory changed since its
+`skip_if_unchanged_since` root. It replaces `32-m0a`'s equal-roots
+placeholder. Wire types, routing, the scheduler and snapwalk's semantics
+are unchanged.
+
+| Item | State | Where |
+|---|---|---|
+| `subtree_unchanged(tree, prev, root, ino, budget, &mut Membership) -> Emptiness::{Unchanged, Changed}`: equal roots → `Unchanged`; `prev.ino != ino` (root replaced) → `Changed`; otherwise no key of the diff maps into the subtree in either root: `0x01 ino` / `0x03 ino\|name` → `ino` in the subtree; `0x02 parent\|name` / `0x04 ino\|parent\|name` → `parent` in the subtree (or the directory itself); `0x30` subsystem rows never count. Any error (unreadable root, bad key, a membership walk snapwalk cannot vouch for) → `Changed` + `debug` log | DONE | `crates/engine/src/snapshot_batch.rs` |
+| Membership is snapwalk's free `in_subtree` with its `(root, dir)`-keyed `Membership` cache, shared by a batch's items; no second ancestor walk. Only API change in snapwalk: `TreeAccess::tree()` is `pub(crate)` | DONE | `crates/engine/src/snapwalk.rs` |
+| atime-only changes: plan 20 keeps atime out of the tree (`InodeRecord` has no atime field; its width test pins that), so a read's atime bump is not a diff key at all and needs no filter. An explicit `utimensat` moves ctime and counts | DONE (by construction; tested) | `snapshot_batch.rs` doc of `subtree_unchanged` |
+| Budget: `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` (default 100 000) diff keys, read once per batch; one key past it → `Changed`. `Tree::diff_each` (a visitor that can stop early; `diff` is built on it) so a busy diff is never materialized | DONE | `snapshot_batch.rs` `empty_check_keys`, `crates/mtree/src/tree.rs`, `docs/reference/configuration.md` |
+| Executor: the check runs on a blocking thread per create with a `skip_if_unchanged_since`; `Skipped` writes neither `snaps/` nor a row | DONE | `SnapshotBatcher::emptiness` |
+| Tests (single in-process holder, real `Meta`, driver, publisher and tree): idle → skipped (twice, then a write → created); one-byte write, mkdir, create and write two levels down → created; atime-only (plan 20 apply + queue, atime visibly moved) → skipped; changes outside only (`/`, `/a`, an xattr on `/a`; tree root asserted moved) → skipped; nested sibling `/a/c` → skipped; rename file in/out, directory in/out, hardlink in → created; xattr, chmod of a file, chmod of the root → created; budget 3 / 0 → `Changed` where the unbounded check says `Unchanged`; replaced root dir → created, then skipped against the new one; `diff_each` == `diff` and stops when asked | DONE | `snapshot_batch::tests::{an_idle_subtree_is_skipped, a_one_byte_write_under_the_root_is_taken, an_atime_only_change_is_skipped, a_change_outside_the_subtree_only_is_skipped, a_change_in_a_sibling_subtree_is_skipped, a_rename_into_or_out_of_the_subtree_is_taken, an_xattr_or_chmod_under_the_root_is_taken, a_diff_past_the_budget_counts_as_changed, a_replaced_root_directory_is_taken}`, `crates/mtree/tests/properties.rs::diff_each_is_diff_and_stops_when_asked` |
+| Not done (other chunks): the scheduler passing the field (32-m3a), the multi-node skip-empty test of Step 11 (with the scheduler) | — | — |
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0; 2006 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run snapshot-lifecycle snapshot-churn gc-lifecycle atime-eventual e2e-basic` | ALL SCENARIOS PASSED (5/5) |
