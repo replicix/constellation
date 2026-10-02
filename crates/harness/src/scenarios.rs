@@ -2715,7 +2715,14 @@ fn snapshot_selectors_from_the_cli(holder: &Client, other: &Client) -> Result<()
             && out.contains("would refuse: snapshot /project@r2 is held by user:harness")
             && out.contains("would delete /project@r3")
             && !out.contains("/side@mid")
-            && out.lines().count() == 3,
+            // Plus plan 32 M5c's estimate of what the two deletable ones
+            // give back (from the asking node's accounting index; its
+            // numbers are the smoke test's and the unit tests').
+            && out.lines().count() == 4
+            && out
+                .lines()
+                .last()
+                .is_some_and(|l| l.starts_with("would reclaim")),
         "dry run listed:\n{out}"
     );
     // More than one: it asks, and stdin's EOF declines.
@@ -2723,6 +2730,11 @@ fn snapshot_selectors_from_the_cli(holder: &Client, other: &Client) -> Result<()
     anyhow::ensure!(
         !ok && err.contains("delete 3 snapshots? [y/N]"),
         "an unconfirmed multi-delete went ahead: {out}{err}"
+    );
+    // The prompt shows the dry run's estimate line.
+    anyhow::ensure!(
+        err.contains("would reclaim"),
+        "the confirmation shows no reclaim estimate: {err}"
     );
     anyhow::ensure!(
         named(&other.snapshot_rows()?, "/project@r1").is_some(),

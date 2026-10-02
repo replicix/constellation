@@ -194,6 +194,15 @@ pub(super) mod tests {
 
     /// An offline engine with one view per label set.
     pub(in crate::control) fn fixture(labels: &[&[(&str, &str)]]) -> Fixture {
+        fixture_with(labels, None)
+    }
+
+    /// [`fixture`] with the space-accounting service's knobs (`None`: the
+    /// environment's).
+    pub(in crate::control) fn fixture_with(
+        labels: &[&[(&str, &str)]],
+        snapacct: Option<crate::snapacct::SnapAcctConfig>,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let backend = format!("file://{}", dir.path().join("backend").display());
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -210,6 +219,7 @@ pub(super) mod tests {
                     state_dir: Some(dir.path().join("state")),
                     cache_size: 16 * 1024 * 1024,
                     runtime: Some(rt.handle().clone()),
+                    snapacct,
                     ..EngineConfig::new(&backend)
                 },
                 HostServices::native(),

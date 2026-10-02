@@ -262,6 +262,118 @@ pub fn run(backend: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Plan 32 M5c on the mounted filesystem: a 2 MiB file only `/dir@m2`
+/// keeps (written after `m1`, removed before `m3`), then `snapshot space
+/// --verify`, the `snapshot ls` size columns and footer, `-p`, and `snapshot
+/// delete --dry-run`'s reclaim estimate — all from the node's accounting
+/// index, which the first of these requests builds (`auto`).
+fn snapshot_space(m: &Mount, state: &str) -> Result<()> {
+    say("snapshot sizes: space --verify, ls USED/WRITTEN/REFER, delete --dry-run");
+    let mnt = &m.mnt;
+    // Success and stdout; a failure's stderr is in the error.
+    let run = |args: &[&str]| -> Result<(bool, String)> {
+        let mut all = vec!["snapshot"];
+        all.extend_from_slice(args);
+        all.extend(["--state-dir", state]);
+        let out = m.cmd(&all).output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.status.success() {
+            println!(
+                "snapshot {args:?} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok((out.status.success(), stdout))
+    };
+    let create = |selector: &str| -> Result<()> {
+        let (ok, text) = run(&["create", selector])?;
+        ensure!(ok, "FAIL: snapshot create {selector}: {text}");
+        Ok(())
+    };
+    create("/dir@m1")?;
+    fs::write(mnt.join("dir/only-m2.bin"), random_bytes(2 << 20)?)?;
+    create("/dir@m2")?;
+    fs::remove_file(mnt.join("dir/only-m2.bin"))?;
+    // Publishes the removal: the live refresh `--verify` forces sees it.
+    create("/dir@m3")?;
+
+    let (ok, text) = run(&["space", "--verify"])?;
+    print!("{text}");
+    ensure!(
+        ok && text.contains("verify: 0 mismatches")
+            && text.contains("live data (logical)")
+            && text.contains("snapshots, total (usedbysnapshots)")
+            && text.contains("awaiting GC")
+            && text.contains("note: per-snapshot USED values do not sum")
+            && text.contains("logical bytes, pre-compression"),
+        "FAIL: snapshot space --verify: {text}"
+    );
+    let (ok, text) = run(&["space", "/dir"])?;
+    ensure!(
+        ok && text.starts_with("space of /dir:") && text.contains("2.0M"),
+        "FAIL: snapshot space /dir: {text}"
+    );
+
+    // Sizes are ready now (`--verify` brought the index current), but a
+    // snapshot change since would answer `building`: poll briefly.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let table = loop {
+        let (ok, text) = run(&["ls", "/dir"])?;
+        ensure!(ok, "FAIL: snapshot ls: {text}");
+        if !text.contains("building (") || Instant::now() > deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    print!("{table}");
+    let m2 = table
+        .lines()
+        .find(|l| l.starts_with("/dir@m2 "))
+        .with_context(|| format!("FAIL: no /dir@m2 in snapshot ls: {table}"))?;
+    let cells: Vec<&str> = m2
+        .split("  ")
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    // NAME CREATED ORIGIN USED WRITTEN REFER …
+    ensure!(
+        cells.get(3) == Some(&"2.0M") && cells.get(4) == Some(&"2.0M"),
+        "FAIL: /dir@m2's USED and WRITTEN: {table}"
+    );
+    ensure!(
+        table
+            .lines()
+            .last()
+            .is_some_and(|l| l.starts_with("USED/WRITTEN/REFER as of commit ")
+                && l.ends_with("· logical bytes, pre-compression")),
+        "FAIL: snapshot ls footer: {table}"
+    );
+    // `-p`: exact bytes, no footer; `-s used` puts the biggest last.
+    let (ok, exact) = run(&["ls", "/dir", "-p", "-o", "name,used", "-s", "used"])?;
+    ensure!(
+        ok && exact
+            .lines()
+            .last()
+            .is_some_and(|l| l.split_whitespace().eq(["/dir@m2", "2097152"])),
+        "FAIL: snapshot ls -p -s used: {exact}"
+    );
+
+    let (ok, text) = run(&["delete", "--dry-run", "/dir@m1%m3"])?;
+    print!("{text}");
+    ensure!(
+        ok && text.contains("would delete /dir@m2")
+            && text.contains("would reclaim ≈ 2.0M in 2 chunks (after GC)"),
+        "FAIL: snapshot delete --dry-run: {text}"
+    );
+    let (ok, text) = run(&["ls", "/dir", "-o", "name"])?;
+    ensure!(
+        ok && text.contains("/dir@m2"),
+        "FAIL: a dry run deleted: {text}"
+    );
+    Ok(())
+}
+
 fn smoke(m: &mut Mount, work: &Path) -> Result<()> {
     let mnt = m.mnt.clone();
     let backend = m.backend.clone();
@@ -432,6 +544,8 @@ fn smoke(m: &mut Mount, work: &Path) -> Result<()> {
     append(&mnt.join("dir/random.bin"), b"tail\n")?;
     append(&reference, b"tail\n")?;
     cmp(&reference, &mnt.join("dir/random.bin"))?;
+
+    snapshot_space(m, &state)?;
 
     say("unlink while open");
     fs::write(mnt.join("orphan.txt"), "orphan data\n")?;

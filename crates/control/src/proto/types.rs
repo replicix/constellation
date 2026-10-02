@@ -194,6 +194,43 @@ pub struct SnapshotStatus {
     /// Absent when the root does not parse.
     #[serde(default)]
     pub seq: Option<u64>,
+    /// Plan 32 §6.1's sizes, logical bytes, from this node's accounting
+    /// index, all "as of" the commit `as_of_seq` (`as_of_ms` when the
+    /// index last caught up): `USED` (chunks nothing else references,
+    /// live tree included), `WRITTEN` (new since the chain's previous
+    /// snapshot), `REFER` (the distinct chunks it references — exact, so
+    /// unlike `refer_bytes` it is deduplicated), `LSIZE` (apparent size).
+    /// Present only with `size_state: ok`.
+    #[serde(default)]
+    pub used: Option<u64>,
+    #[serde(default)]
+    pub written: Option<u64>,
+    #[serde(default)]
+    pub refer: Option<u64>,
+    #[serde(default)]
+    pub lsize: Option<u64>,
+    #[serde(default)]
+    pub as_of_seq: Option<u64>,
+    #[serde(default)]
+    pub as_of_ms: Option<u64>,
+    /// Whether the sizes above are there: `ok`, `building` (the index
+    /// does not match the snapshots yet; never a partial number) or `off`
+    /// (`CONSTELLATION_SNAPACCT=off`). Absent when the caller did not ask
+    /// for sizes and the index had none ready.
+    #[serde(default)]
+    pub size_state: Option<SizeState>,
+    /// With `size_state: building`: the share of snapshot rows applied.
+    #[serde(default)]
+    pub building_pct: Option<u8>,
+}
+
+/// Whether a snapshot's sizes are available (plan 32 §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeState {
+    Ok,
+    Building,
+    Off,
 }
 
 /// One offline designation, as exposed by the control API.
@@ -2285,6 +2322,13 @@ pub struct SnapshotHoldParams {
 pub struct SnapshotListParams {
     #[serde(default)]
     pub path: Option<String>,
+    /// Ask for every snapshot's sizes (plan 32 §6.3): under
+    /// `CONSTELLATION_SNAPACCT=auto` this is the request that builds the
+    /// accounting index, answering `size_state: building` meanwhile.
+    /// Without it the sizes are filled only when the index is already
+    /// current, and the listing causes no accounting work.
+    #[serde(default)]
+    pub sizes: bool,
 }
 
 /// `snapshot.delete`. A held snapshot is refused (the message names the
@@ -2302,6 +2346,21 @@ pub struct SnapshotDeleteParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotResolveParams {
     pub selectors: Vec<String>,
+}
+
+/// `snapshot.reclaim`: what deleting exactly the snapshots `selectors`
+/// name (as `snapshot.resolve` resolves them) would give back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotReclaimParams {
+    pub selectors: Vec<String>,
+}
+
+/// `snapshot.space`: the breakdown for the whole filesystem, or for the
+/// snapshots of directories at or under `path`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotSpaceParams {
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// `snapshot.delete_many`: resolve `selectors` (as `snapshot.resolve`
@@ -2891,21 +2950,91 @@ pub struct SnapshotRefusal {
 }
 
 /// What deleting a set of snapshots would give back once GC has run (plan
-/// 32 Step 6): the bytes and chunks no other snapshot and not the live
-/// tree reference, as of the accounting index's commit `as_of_seq`;
-/// `building` while that index is still being built.
+/// 32 §6.1 `reclaim(D)`): the logical bytes and chunks no other snapshot
+/// and not the live tree reference, as of the accounting index's commit
+/// `as_of_seq`. While the index does not match the snapshots yet,
+/// `building` is set (with `building_pct`) and `bytes`/`chunks` are 0 and
+/// mean nothing: never a partial number.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReclaimEstimate {
     pub bytes: u64,
     pub chunks: u64,
     pub as_of_seq: u64,
+    #[serde(default)]
+    pub as_of_ms: u64,
     pub building: bool,
+    #[serde(default)]
+    pub building_pct: u8,
+}
+
+/// Logical bytes and the distinct chunks they are in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SpaceAmount {
+    pub bytes: u64,
+    pub chunks: u64,
+}
+
+/// `snapshot.space` (plan 32 Step 5, ZFS's `usedby*`), logical bytes.
+/// While the index does not match the snapshots yet, `building` is set
+/// and every number is 0 and means nothing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SpaceBreakdown {
+    /// The path asked about; absent for the whole filesystem.
+    #[serde(default)]
+    pub path: Option<String>,
+    pub building: bool,
+    #[serde(default)]
+    pub building_pct: u8,
+    /// Apparent size of the live tree (or of the subtree).
+    pub live_logical: u64,
+    /// `usedbysnapshots`: what deleting every snapshot in scope returns.
+    pub snapshots_total: SpaceAmount,
+    /// Σ `USED`: chunks exactly one snapshot holds. Not the total: chunks
+    /// two or more snapshots share are in nobody's `USED`.
+    pub unique: SpaceAmount,
+    /// Not live, held by two or more snapshots.
+    pub shared_snapshots_only: SpaceAmount,
+    /// In a snapshot and in the live tree: costs nothing extra.
+    pub shared_with_live: SpaceAmount,
+    /// Freed by snapshot deletion and presumed not yet collected
+    /// (filesystem-wide even with a path).
+    pub awaiting_gc: SpaceAmount,
+    /// How long GC keeps freed chunks (`CONSTELLATION_GC_HORIZON_S`):
+    /// what "awaiting GC" waits for.
+    pub gc_horizon_ms: u64,
+    /// **Estimate**: stored bytes per logical byte (e.g. 0.61), from the
+    /// last GC round's census of `chunks/`; absent before any round wrote
+    /// one. Show physical figures derived from it with `≈`.
+    #[serde(default)]
+    pub physical_ratio: Option<f64>,
+    /// **Estimate**: `snapshots_total` in stored bytes (logical ×
+    /// `physical_ratio`).
+    #[serde(default)]
+    pub physical_estimate: Option<u64>,
+    pub as_of_seq: u64,
+    pub as_of_ms: u64,
+}
+
+/// `snapshot.space.verify`: the accounting index against a brute-force
+/// walk of every snapshot (plan 32 §6.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SpaceVerified {
+    /// Numbers that differ; 0 means the index is exact.
+    pub mismatches: u64,
+    /// One line per mismatch (the first 200).
+    pub details: Vec<String>,
+    pub snapshots: u64,
+    /// Distinct chunks the snapshots reference.
+    pub chunks: u64,
+    pub as_of_seq: u64,
 }
 
 /// `snapshot.delete_many`'s result. `resolved` is every snapshot the
 /// selectors named, in chain order; `deleted` the ids actually deleted
 /// (always empty for a dry run); `refused` the ones that were not, with
-/// the reason. `reclaim` is `None` until space accounting exists.
+/// the reason. `reclaim` is filled for a dry run (over the snapshots it
+/// would delete, not the refused ones) and `None` otherwise, or when
+/// accounting is off.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotsDeleted {
     pub resolved: Vec<SnapshotStatus>,

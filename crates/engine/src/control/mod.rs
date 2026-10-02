@@ -9,7 +9,7 @@
 //! embedding host calls it in-process through the same [`Router`]. It lives
 //! in the engine, not in the CLI, because every host of an engine (the
 //! desktop daemon today; plan 37's CSI engine pod, plan 36's Android
-//! service) needs the same 69 methods with the same semantics, and
+//! service) needs the same 72 methods with the same semantics, and
 //! everything they touch — the metadata replica, the sync task, the
 //! snapshot manager, the registry, the op watchdog — is the engine's.
 //!
@@ -51,6 +51,7 @@ mod lifecycle;
 mod ops;
 mod service;
 pub mod snapsched;
+mod snapspace;
 mod streams;
 
 #[cfg(test)]
@@ -59,6 +60,8 @@ mod parity_tests;
 mod snapsched_tests;
 #[cfg(test)]
 mod snapshot_tests;
+#[cfg(test)]
+mod snapspace_tests;
 
 pub use browse::ControlVfs;
 
@@ -621,9 +624,8 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
         Ok(SnapshotCreated { detail, snapshot })
     });
     unary::<SnapshotList>(r, svc, |s, _, p| {
-        s.snapshot_list(p.path.as_deref())
+        s.snapshot_list(p.path.as_deref(), p.sizes)
             .map(|snapshots| SnapshotListing { snapshots })
-            .map_err(failed)
     });
     unary::<SnapshotResolve>(r, svc, |s, _, p| {
         s.snapshot_resolve(&p.selectors)
@@ -666,6 +668,7 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
         ack(s.clone_snapshot(&p.selector, &p.destination))
     });
     snapsched::register(r, svc);
+    snapspace::register(r, svc);
 
     // ---- browse ----
     unary::<BrowseReaddir>(r, svc, |s, _, p| {

@@ -2265,6 +2265,9 @@ fn stub_router() -> Router {
         SnapshotHold,
         SnapshotResolve,
         SnapshotDeleteMany,
+        SnapshotReclaim,
+        SnapshotSpace,
+        SnapshotSpaceVerify,
         SnapshotRefs,
         SnapshotPolicyCheck,
         SnapshotPolicySimulate,
@@ -2343,8 +2346,10 @@ fn sample_params(name: &str) -> serde_json::Value {
         "snapshot.policy.show" | "snapshot.policy.remove" => json!({"path": "/p"}),
         "snapshot.policy.set" => json!({"path": "/p", "expr": "1h:1d"}),
         "snapshot.policy.pause" => json!({"path": "/p", "paused": true}),
-        "snapshot.resolve" | "snapshot.delete_many" => json!({"selectors": ["s"]}),
-        "snapshot.sched.status" => json!({}),
+        "snapshot.resolve" | "snapshot.delete_many" | "snapshot.reclaim" => {
+            json!({"selectors": ["s"]})
+        }
+        "snapshot.sched.status" | "snapshot.space" | "snapshot.space.verify" => json!({}),
         "snapshot.sched.run" => json!({"dry_run": true}),
         "clone.create" => json!({"selector": "s", "destination": "/d"}),
         "browse.read" => json!({"path": "/p"}),

@@ -105,6 +105,9 @@ pub struct EngineConfig {
     /// [`Engine::start`] must not be called from one of its workers.
     pub runtime: Option<tokio::runtime::Handle>,
     pub on_phase: Option<PhaseHook>,
+    /// The space-accounting service's knobs (plan 32 §6.3); `None`:
+    /// `CONSTELLATION_SNAPACCT*` ([`crate::snapacct::SnapAcctConfig::from_env`]).
+    pub snapacct: Option<crate::snapacct::SnapAcctConfig>,
 }
 
 impl EngineConfig {
@@ -129,6 +132,7 @@ impl EngineConfig {
             version: env!("CARGO_PKG_VERSION").to_string(),
             runtime: None,
             on_phase: None,
+            snapacct: None,
         }
     }
 }
@@ -360,7 +364,10 @@ impl Engine {
             version,
             runtime,
             on_phase,
+            snapacct: snapacct_config,
         } = cfg;
+        let snapacct_config =
+            snapacct_config.unwrap_or_else(crate::snapacct::SnapAcctConfig::from_env);
         let rt = match runtime {
             Some(rt) => rt,
             None => tokio::runtime::Handle::try_current()
@@ -1322,7 +1329,7 @@ impl Engine {
         // Plan 32 §6.3: the space-accounting index. Under the default
         // `auto` its task sleeps until something asks for a size.
         let snapacct = crate::snapacct::SnapAcctService::new(
-            crate::snapacct::SnapAcctConfig::from_env(),
+            snapacct_config,
             crate::snapacct::SnapAcctDeps {
                 meta: meta.clone(),
                 chunks: store.clone(),

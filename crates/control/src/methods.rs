@@ -22,7 +22,7 @@
 //!
 //! Because [`METHODS`], [`visit_all`] and the `impl Method` blocks come out of
 //! the same macro invocation, "a method exists but is missing from the table"
-//! cannot happen; the tests instead pin the *contents* (69 methods, no
+//! cannot happen; the tests instead pin the *contents* (72 methods, no
 //! duplicates, every one of the 37 old `Request` variants maps to exactly
 //! one).
 //!
@@ -37,8 +37,8 @@
 //!
 //! | class | role | methods |
 //! |---|---|---|
-//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs/resolve`, `snapshot.policy.check/simulate/list/show`, `snapshot.sched.status`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
-//! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
+//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs/resolve/reclaim/space`, `snapshot.policy.check/simulate/list/show`, `snapshot.sched.status`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
+//! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `snapshot.space.verify` (a heavy read-only probe), `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
 //! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete/delete_many`, `snapshot.policy.set/remove/pause`, `snapshot.sched.run`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
 //! `fsck.run` is admin although a dry run only reads: one method, one role,
@@ -285,6 +285,24 @@ define_methods! {
     /// `force`; `dry_run` deletes nothing.
     SnapshotDeleteMany { name: "snapshot.delete_many", role: Admin, mutating: true, stream: None,
         params: SnapshotDeleteManyParams, result: SnapshotsDeleted }
+    /// Plan 32 §6.1 `reclaim(D)`: what deleting exactly the snapshots the
+    /// selectors name would give back after GC, from this node's
+    /// accounting index (a size request: under `auto` it builds the
+    /// index, answering `building` meanwhile). Refused when accounting is
+    /// off.
+    SnapshotReclaim { name: "snapshot.reclaim", role: Viewer, mutating: false, stream: None,
+        params: SnapshotReclaimParams, result: ReclaimEstimate }
+    /// Plan 32 Step 5's `snapshot space`: live data, snapshots total,
+    /// unique / shared-only / shared-with-live, awaiting GC, and the
+    /// physical estimate, for the filesystem or a path. Refused when
+    /// accounting is off.
+    SnapshotSpace { name: "snapshot.space", role: Viewer, mutating: false, stream: None,
+        params: SnapshotSpaceParams, result: SpaceBreakdown }
+    /// `snapshot space --verify`: bring the accounting index current, walk
+    /// every snapshot in full and diff the two. Operator: a full walk of
+    /// every snapshot is a heavy probe, though it changes nothing.
+    SnapshotSpaceVerify { name: "snapshot.space.verify", role: Operator, mutating: false, stream: None,
+        params: Empty, result: SpaceVerified }
     SnapshotRefs { name: "snapshot.refs", role: Viewer, mutating: false, stream: None,
         params: SnapRefsParams, result: RefHashes }
     /// Parse a snapshot-schedule expression and report its canonical
@@ -545,11 +563,11 @@ mod tests {
         assert_eq!(unique.len(), METHODS.len(), "duplicate method names");
         assert_eq!(
             METHODS.len(),
-            69,
+            72,
             "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate \
              + snapshot.policy.list/show/set/remove/pause \
-             + snapshot.resolve/delete_many \
-             + snapshot.sched.status/run"
+             + snapshot.resolve/delete_many + snapshot.sched.status/run \
+             + snapshot.reclaim/space/space.verify"
         );
         for m in METHODS {
             assert!(
@@ -634,6 +652,8 @@ mod tests {
             "snapshot.policy.show",
             "snapshot.resolve",
             "snapshot.sched.status",
+            "snapshot.reclaim",
+            "snapshot.space",
         ] {
             assert_eq!(role(n), Role::Viewer, "{n}");
             assert!(!method_info(n).unwrap().mutating, "{n}");
@@ -643,9 +663,11 @@ mod tests {
             "cache.prune",
             "designation.offline",
             "snapshot.create",
+            "snapshot.space.verify",
         ] {
             assert_eq!(role(n), Role::Operator, "{n}");
         }
+        assert!(!method_info("snapshot.space.verify").unwrap().mutating);
         for n in [
             "node.leave",
             "fsck.run",

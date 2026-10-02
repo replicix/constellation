@@ -10,6 +10,7 @@ use crate::{
     backend, doctor, fsck, gc, held, leave, paths, snapshot, snapshot_batch, sync, writeback,
 };
 use constellation_control::proto::types as api;
+use constellation_control::proto::ControlError;
 use constellation_store_s3::ChunkStore;
 
 /// A replicated snapshot row as the control protocol reports it. Plan 32
@@ -36,6 +37,7 @@ pub(crate) fn snapshot_status(row: constellation_meta::SnapshotRow) -> api::Snap
         held_by: row.held_by.filter(|by| !by.is_empty()),
         creator: row.creator,
         refer_bytes: row.refer_bytes,
+        ..Default::default()
     }
 }
 
@@ -980,14 +982,22 @@ impl EngineControl {
         }
     }
 
+    /// `snapshot.list`, with each row's sizes when `sizes` asks for them
+    /// or the accounting index has them ready ([`Self::fill_sizes`]).
     pub(crate) fn snapshot_list(
         &self,
         path: Option<&str>,
-    ) -> std::result::Result<Vec<api::SnapshotStatus>, String> {
-        self.snapshots
+        sizes: bool,
+    ) -> std::result::Result<Vec<api::SnapshotStatus>, ControlError> {
+        let mut rows: Vec<api::SnapshotStatus> = self
+            .snapshots
             .list(path)
-            .map_err(|error| format!("{error:#}"))
-            .map(|rows| rows.into_iter().map(snapshot_status).collect())
+            .map_err(|error| ControlError::failed(format!("{error:#}")))?
+            .into_iter()
+            .map(snapshot_status)
+            .collect();
+        self.fill_sizes(&mut rows, sizes)?;
+        Ok(rows)
     }
 
     /// `snapshot.resolve`: plan 32 Step 5's selectors over this replica's
@@ -1165,11 +1175,28 @@ impl EngineControl {
                 }
             }
         }
+        // A dry run is the preview of a delete (the CLI's confirmation
+        // prompt shows it), so it says what the delete would give back:
+        // `reclaim` of exactly the snapshots it would delete.
+        let reclaim = if dry_run {
+            let ids: Vec<String> = rows
+                .iter()
+                .filter(|row| !refused.iter().any(|r| r.id == row.id))
+                .map(|row| row.id.clone())
+                .collect();
+            // An estimate that fails is left out, not the dry run.
+            self.reclaim_of(&ids).unwrap_or_else(|error| {
+                tracing::warn!(%error, "snapshot delete dry run: no reclaim estimate");
+                None
+            })
+        } else {
+            None
+        };
         Ok(api::SnapshotsDeleted {
             resolved: rows.into_iter().map(snapshot_status).collect(),
             deleted,
             refused,
-            reclaim: None,
+            reclaim,
         })
     }
 

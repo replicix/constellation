@@ -145,6 +145,9 @@ const MUST_SUCCEED: &[&str] = &[
     "snapshot.delete_many",
     "snapshot.sched.status",
     "snapshot.sched.run",
+    "snapshot.reclaim",
+    "snapshot.space",
+    "snapshot.space.verify",
     "browse.readdir",
     "browse.inspect",
     "browse.stat",
@@ -193,6 +196,11 @@ fn params_for(name: &str, root_view: u64, backend_dir: &str) -> Value {
         // nothing in them (a dry run, so no batch either).
         "snapshot.resolve" => json!({"selectors": []}),
         "snapshot.delete_many" => json!({"selectors": [], "dry_run": true}),
+        // Plan 32 M5c: the accounting index of an empty filesystem (no
+        // snapshots: nothing to reclaim, every bucket empty).
+        "snapshot.reclaim" => json!({"selectors": []}),
+        "snapshot.space" => json!({}),
+        "snapshot.space.verify" => json!({}),
         "clone.create" => json!({"selector": "/@no-such-snapshot", "destination": "/c"}),
         // Over the root's (empty) history, simulated for one hour: two
         // creations whatever the clock, so both calls agree.
@@ -344,6 +352,9 @@ fn stable(method: &str, value: Value) -> Value {
                     "last_seen_ms",
                     "coop",
                     "atime_ns",
+                    // The accounting index's last catch-up: every size
+                    // request may run a pass.
+                    "as_of_ms",
                 ],
             );
             value

@@ -1,16 +1,22 @@
-//! `constellation snapshot ls|delete|hold|release` (plan 32 Step 5): the
-//! snapshot table and the multi-selector commands.
+//! `constellation snapshot ls|space|delete|hold|release` (plan 32 Step 5):
+//! the snapshot table, the space breakdown and the multi-selector
+//! commands.
 //!
 //! The table is rendered here from `snapshot.list`'s rows, by pure
-//! functions the tests drive directly. Its columns are Step 5's; the ones
-//! whose numbers come from later milestones print `-` until then: `USED`
-//! and `WRITTEN` need the accounting index (M5), `EXPIRES` needs expiry
-//! (M4), which is also when `KEPT BY` learns retention reasons. `REFER`
-//! already has a number for most snapshots — the subtree's logical size
-//! the replica measured when the snapshot was taken (plan 32 §0.4's
-//! `refer_bytes`) — and prints it with a `≈`, because it is a creation-time
-//! measurement and not yet the accounting index's figure. `-p` drops the
-//! `≈` and every unit: exact integers, as ZFS's `-p`.
+//! functions the tests drive directly. `USED`, `WRITTEN`, `REFER` and the
+//! extra `LSIZE` are the accounting index's (plan 32 §6.1, logical bytes,
+//! deduplicated), which `snapshot ls` asks for (`sizes: true`) whenever it
+//! shows one of them; a footer says which commit they are as of. While the
+//! index is being built the cells read `building (37%)`, with accounting
+//! off they read `-` — never `0`, which would be a real (and wrong) answer.
+//! `REFER` then falls back to `≈` the subtree size the replica measured
+//! when the snapshot was taken (plan 32 §0.4's `refer_bytes`), the one
+//! size that needs no index. `EXPIRES` waits for expiry (M4), which is
+//! also when `KEPT BY` learns retention reasons. `-p` drops every unit and
+//! `≈`: exact integers, as ZFS's `-p`, and `-` for "no number".
+//!
+//! `snapshot space` prints Step 5's breakdown from `snapshot.space`; every
+//! figure in it is the daemon's, the CLI only lays it out.
 //!
 //! Times print in UTC (`CREATED (UTC)`), computed here from the Unix
 //! epoch: no timezone database yet. The policy chunks bring one, and with
@@ -19,7 +25,9 @@
 //! `delete`, `hold` and `release` take any number of selectors
 //! (`path@name`, `path@a%b`, `path@prefix*`, or a bare id), resolved by the
 //! daemon (`snapshot.resolve`) so the CLI and every other client agree on
-//! what a selector names.
+//! what a selector names. A `delete --dry-run`, and the confirmation a
+//! multi-snapshot delete asks for, show what the delete would give back
+//! (`would reclaim ≈ X in N chunks (after GC)`).
 
 use crate::control;
 use anyhow::{bail, Result};
@@ -39,6 +47,7 @@ pub enum Column {
     Refer,
     KeptBy,
     Expires,
+    Lsize,
     Id,
     Seq,
     Creator,
@@ -58,7 +67,7 @@ pub const DEFAULT_COLUMNS: &[Column] = &[
 ];
 
 impl Column {
-    const ALL: [Column; 12] = [
+    const ALL: [Column; 13] = [
         Column::Name,
         Column::Created,
         Column::Origin,
@@ -67,6 +76,7 @@ impl Column {
         Column::Refer,
         Column::KeptBy,
         Column::Expires,
+        Column::Lsize,
         Column::Id,
         Column::Seq,
         Column::Creator,
@@ -84,6 +94,7 @@ impl Column {
             Column::Refer => "refer",
             Column::KeptBy => "kept-by",
             Column::Expires => "expires",
+            Column::Lsize => "lsize",
             Column::Id => "id",
             Column::Seq => "seq",
             Column::Creator => "creator",
@@ -101,6 +112,7 @@ impl Column {
             Column::Refer => "REFER",
             Column::KeptBy => "KEPT BY",
             Column::Expires => "EXPIRES",
+            Column::Lsize => "LSIZE",
             Column::Id => "ID",
             Column::Seq => "SEQ",
             Column::Creator => "CREATOR",
@@ -137,18 +149,74 @@ impl Column {
         Ok(columns)
     }
 
+    /// Whether the column is one of the accounting index's sizes (the
+    /// ones `snapshot ls` asks for and the footer dates).
+    pub fn is_size(self) -> bool {
+        matches!(
+            self,
+            Column::Used | Column::Written | Column::Refer | Column::Lsize
+        )
+    }
+
+    /// The accounting index's figure for this column, if the row has it.
+    fn size(self, row: &api::SnapshotStatus) -> Option<u64> {
+        if row.size_state != Some(api::SizeState::Ok) {
+            return None;
+        }
+        match self {
+            Column::Used => row.used,
+            Column::Written => row.written,
+            Column::Refer => row.refer,
+            Column::Lsize => row.lsize,
+            _ => None,
+        }
+    }
+
     /// `-s`'s order for this column: numbers as numbers, absent values
-    /// first.
+    /// first. `REFER` without the index's figure orders by the
+    /// creation-time `refer_bytes` it then shows.
     fn compare(self, a: &api::SnapshotStatus, b: &api::SnapshotStatus) -> Ordering {
         match self {
             Column::Created => a.created_unix_ms.cmp(&b.created_unix_ms),
-            Column::Refer => a.refer_bytes.cmp(&b.refer_bytes),
+            Column::Refer => {
+                let refer = |r: &api::SnapshotStatus| match self.size(r) {
+                    Some(bytes) => (1, bytes),
+                    None => (0, r.refer_bytes.unwrap_or(0)),
+                };
+                refer(a).cmp(&refer(b))
+            }
+            Column::Used | Column::Written | Column::Lsize => self.size(a).cmp(&self.size(b)),
             Column::Seq => a.seq.cmp(&b.seq),
             Column::Creator => a.creator.cmp(&b.creator),
             Column::Policy => a.policy_ino.cmp(&b.policy_ino),
-            // Nothing to order by until M4/M5 fill them in.
-            Column::Used | Column::Written | Column::Expires => Ordering::Equal,
+            // Nothing to order by until M4 fills it in.
+            Column::Expires => Ordering::Equal,
             _ => self.cell(a, false).cmp(&self.cell(b, false)),
+        }
+    }
+
+    /// A size cell: the number, `building (37%)` (`-` with `-p`), or `-`
+    /// (accounting off, or not asked for), where `REFER` shows `≈` the
+    /// creation-time measurement instead.
+    fn size_cell(self, row: &api::SnapshotStatus, parsable: bool) -> String {
+        if let Some(bytes) = self.size(row) {
+            return if parsable {
+                bytes.to_string()
+            } else {
+                human_bytes(bytes)
+            };
+        }
+        if row.size_state == Some(api::SizeState::Building) {
+            return if parsable {
+                "-".into()
+            } else {
+                format!("building ({}%)", row.building_pct.unwrap_or(0))
+            };
+        }
+        match (self, row.refer_bytes) {
+            (Column::Refer, Some(bytes)) if parsable => bytes.to_string(),
+            (Column::Refer, Some(bytes)) => format!("≈{}", human_bytes(bytes)),
+            _ => "-".into(),
         }
     }
 
@@ -166,12 +234,9 @@ impl Column {
                 }
             }
             Column::Origin => row.origin.clone(),
-            Column::Used | Column::Written => "-".into(),
-            Column::Refer => match row.refer_bytes {
-                Some(bytes) if parsable => bytes.to_string(),
-                Some(bytes) => format!("≈{}", human_bytes(bytes)),
-                None => "-".into(),
-            },
+            Column::Used | Column::Written | Column::Refer | Column::Lsize => {
+                self.size_cell(row, parsable)
+            }
             Column::KeptBy => kept_by(row),
             // Manual and held snapshots never expire; an automatic one's
             // expiry is M4's.
@@ -340,6 +405,234 @@ pub fn render_table(
     out
 }
 
+/// The line under the table that dates its sizes (plan 32 Step 5):
+/// `USED/WRITTEN/REFER as of commit 88213 (4s ago) · logical bytes,
+/// pre-compression`, naming the size columns shown; or why there are no
+/// sizes. `None` when no size column is shown or nothing was asked.
+pub fn size_footer(
+    rows: &[api::SnapshotStatus],
+    columns: &[Column],
+    now_ms: u64,
+) -> Option<String> {
+    let names: Vec<&str> = columns
+        .iter()
+        .filter(|c| c.is_size())
+        .map(|c| c.header())
+        .collect();
+    if names.is_empty() || rows.is_empty() {
+        return None;
+    }
+    let names = names.join("/");
+    let state = |s: api::SizeState| rows.iter().filter(move |r| r.size_state == Some(s));
+    if let Some(as_of_seq) = state(api::SizeState::Ok).filter_map(|r| r.as_of_seq).max() {
+        let as_of_ms = state(api::SizeState::Ok)
+            .filter_map(|r| r.as_of_ms)
+            .max()
+            .unwrap_or(0);
+        return Some(format!(
+            "{names} as of commit {as_of_seq} ({}) · logical bytes, pre-compression",
+            ago(now_ms, as_of_ms)
+        ));
+    }
+    if let Some(row) = state(api::SizeState::Building).next() {
+        return Some(format!(
+            "{names}: the accounting index is building ({}%); run again shortly",
+            row.building_pct.unwrap_or(0)
+        ));
+    }
+    if state(api::SizeState::Off).next().is_some() {
+        return Some(format!(
+            "{names}: snapshot accounting is off (CONSTELLATION_SNAPACCT=off)"
+        ));
+    }
+    None
+}
+
+/// `4s ago`, `3m ago`, …; `time unknown` for a zero timestamp.
+fn ago(now_ms: u64, then_ms: u64) -> String {
+    if then_ms == 0 {
+        return "time unknown".into();
+    }
+    let secs = now_ms.saturating_sub(then_ms) / 1000;
+    let text = match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    };
+    format!("{text} ago")
+}
+
+/// A configured duration in its largest exact unit (`7d`, `36h`, `90s`).
+fn exact_duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    for (unit, size) in [("d", 86_400), ("h", 3600), ("m", 60)] {
+        if secs >= size && secs.is_multiple_of(size) {
+            return format!("{}{unit}", secs / size);
+        }
+    }
+    format!("{secs}s")
+}
+
+/// `would reclaim ≈ 41.3G in 812 chunks (after GC)`, or why there is no
+/// estimate: still building, or none at all (accounting off, or the
+/// estimate failed — the daemon logs why).
+pub fn reclaim_line(reclaim: Option<&api::ReclaimEstimate>) -> String {
+    let Some(reclaim) = reclaim else {
+        return "would reclaim: no estimate (snapshot accounting is off or unavailable)".into();
+    };
+    if reclaim.building {
+        return format!(
+            "would reclaim: no estimate yet, the accounting index is building ({}%)",
+            reclaim.building_pct
+        );
+    }
+    format!(
+        "would reclaim ≈ {} in {} chunks (after GC)",
+        human_bytes(reclaim.bytes),
+        reclaim.chunks
+    )
+}
+
+/// `snapshot space`: plan 32 Step 5's breakdown, every figure the
+/// daemon's.
+pub fn render_space(b: &api::SpaceBreakdown, now_ms: u64) -> String {
+    if b.building {
+        return format!(
+            "the accounting index is building ({}%); run again shortly\n",
+            b.building_pct
+        );
+    }
+    let mut out = String::new();
+    if let Some(path) = &b.path {
+        out.push_str(&format!(
+            "space of {path}: snapshots of directories at or under it \
+             (awaiting GC is filesystem-wide)\n"
+        ));
+    }
+    let rows: [(&str, String, String); 6] = [
+        (
+            "live data (logical)",
+            human_bytes(b.live_logical),
+            String::new(),
+        ),
+        (
+            "snapshots, total (usedbysnapshots)",
+            human_bytes(b.snapshots_total.bytes),
+            "← deleting every snapshot returns this".into(),
+        ),
+        (
+            "  unique to one snapshot",
+            human_bytes(b.unique.bytes),
+            "← Σ USED; not the total (see note)".into(),
+        ),
+        (
+            "  shared by ≥2 snapshots only",
+            human_bytes(b.shared_snapshots_only.bytes),
+            String::new(),
+        ),
+        (
+            "shared between live and snapshots",
+            human_bytes(b.shared_with_live.bytes),
+            "(costs nothing extra)".into(),
+        ),
+        (
+            "awaiting GC",
+            human_bytes(b.awaiting_gc.bytes),
+            format!(
+                "(freed snapshots; horizon {})",
+                exact_duration(b.gc_horizon_ms)
+            ),
+        ),
+    ];
+    let label_w = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+    let value_w = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
+    for (label, value, note) in &rows {
+        let line = format!("{label:<label_w$}  {value:<value_w$}  {note}");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    match (b.physical_ratio, b.physical_estimate) {
+        (Some(ratio), Some(physical)) => out.push_str(&format!(
+            "estimated physical (×{ratio:.2} compression, from last GC round): \
+             snapshots, total ≈ {}\n",
+            human_bytes(physical)
+        )),
+        _ => out.push_str("estimated physical: - (no GC round has measured the bucket yet)\n"),
+    }
+    out.push_str(
+        "note: per-snapshot USED values do not sum to the snapshots total: a chunk two or \
+         more snapshots share is in no snapshot's USED (it becomes one snapshot's USED once \
+         the others are deleted).\n",
+    );
+    out.push_str(&format!(
+        "as of commit {} ({}) · logical bytes, pre-compression\n",
+        b.as_of_seq,
+        ago(now_ms, b.as_of_ms)
+    ));
+    out
+}
+
+/// `snapshot space [<fs:path>] [--verify] [--json]`. With `--verify` the
+/// index is first checked against a full walk of every snapshot (which
+/// also brings it current); any mismatch fails the command after printing
+/// the breakdown and the differences.
+pub async fn space(dir: &Path, path: Option<String>, verify: bool, json: bool) -> Result<()> {
+    let verified = if verify {
+        Some(
+            control::call::<cm::SnapshotSpaceVerify>(dir, constellation_control::proto::Empty {})
+                .await?,
+        )
+    } else {
+        None
+    };
+    let breakdown =
+        control::call::<cm::SnapshotSpace>(dir, api::SnapshotSpaceParams { path }).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "space": breakdown,
+                "verify": verified,
+            }))?
+        );
+    } else {
+        print!("{}", render_space(&breakdown, now_ms()));
+        if let Some(v) = &verified {
+            print!("{}", render_verify(v));
+        }
+    }
+    match verified {
+        Some(v) if v.mismatches > 0 => bail!("{} accounting mismatches", v.mismatches),
+        _ => Ok(()),
+    }
+}
+
+/// `--verify`'s verdict: `0 mismatches` or the differences.
+pub fn render_verify(v: &api::SpaceVerified) -> String {
+    let mut out = format!(
+        "verify: {} mismatches ({} snapshots, {} chunks walked, as of commit {})\n",
+        v.mismatches, v.snapshots, v.chunks, v.as_of_seq
+    );
+    for detail in &v.details {
+        out.push_str(&format!("  {detail}\n"));
+    }
+    if v.details.len() as u64 > 0 && (v.details.len() as u64) < v.mismatches {
+        out.push_str(&format!(
+            "  … and {} more\n",
+            v.mismatches - v.details.len() as u64
+        ));
+    }
+    out
+}
+
+/// Wall-clock Unix ms (for "4s ago").
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// The confirmation `snapshot delete` asks for before deleting more than
 /// one snapshot. Anything but `y`/`yes` (EOF included) declines.
 fn confirm(question: &str) -> Result<bool> {
@@ -383,18 +676,7 @@ pub async fn delete(
                 None => println!("would delete {} ({})", label(row), row.id),
             }
         }
-        if let Some(reclaim) = &out.reclaim {
-            println!(
-                "would reclaim ≈ {} in {} chunks (after GC){}",
-                human_bytes(reclaim.bytes),
-                reclaim.chunks,
-                if reclaim.building {
-                    "; the accounting index is still building"
-                } else {
-                    ""
-                }
-            );
-        }
+        println!("{}", reclaim_line(out.reclaim.as_ref()));
         return Ok(());
     }
     let resolved =
@@ -402,9 +684,25 @@ pub async fn delete(
             .await?
             .snapshots;
     if resolved.len() > 1 && !yes {
+        // The preview is a dry run over exactly these ids: what the delete
+        // would refuse, and what it would give back. A single snapshot is
+        // deleted without asking, so it costs no estimate.
+        let preview = control::call::<cm::SnapshotDeleteMany>(
+            dir,
+            api::SnapshotDeleteManyParams {
+                selectors: resolved.iter().map(|r| r.id.clone()).collect(),
+                dry_run: true,
+                force,
+            },
+        )
+        .await?;
         for row in &resolved {
-            eprintln!("  {}", label(row));
+            match preview.refused.iter().find(|r| r.id == row.id) {
+                Some(_) => eprintln!("  {} (would be refused)", label(row)),
+                None => eprintln!("  {}", label(row)),
+            }
         }
+        eprintln!("{}", reclaim_line(preview.reclaim.as_ref()));
         if !confirm(&format!("delete {} snapshots?", resolved.len()))? {
             bail!("nothing deleted");
         }
@@ -481,6 +779,13 @@ pub async fn hold(
             if held { "held" } else { "released" }
         ),
     }
+}
+
+/// Whether `snapshot ls` asks the node for the accounting index's sizes:
+/// JSON always carries them; a table only when a size column is shown or
+/// is the sort key (`-o name,created -s used`).
+pub fn wants_sizes(json: bool, columns: &[Column], sort: Option<Column>) -> bool {
+    json || columns.iter().any(|c| c.is_size()) || sort.is_some_and(|c| c.is_size())
 }
 
 #[cfg(test)]
@@ -607,5 +912,286 @@ mod tests {
         );
         assert!(under("/a", "/") && under("/a/b", "/a") && under("/a", "/a/"));
         assert!(!under("/ab", "/a") && !under("/", "/a"));
+    }
+
+    fn sized(
+        mut r: api::SnapshotStatus,
+        used: u64,
+        written: u64,
+        refer: u64,
+    ) -> api::SnapshotStatus {
+        r.used = Some(used);
+        r.written = Some(written);
+        r.refer = Some(refer);
+        r.lsize = Some(refer + 7);
+        r.as_of_seq = Some(88_213);
+        r.as_of_ms = Some(1_790_603_755_000);
+        r.size_state = Some(api::SizeState::Ok);
+        r
+    }
+
+    fn cells(table: &str, line: usize) -> Vec<String> {
+        table
+            .lines()
+            .nth(line)
+            .unwrap()
+            .split("  ")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn sizes_are_requested_for_a_size_sort_column_too() {
+        let names = [Column::Name, Column::Created];
+        assert!(!wants_sizes(false, &names, None));
+        assert!(!wants_sizes(false, &names, Some(Column::Created)));
+        assert!(wants_sizes(false, &names, Some(Column::Used)));
+        assert!(wants_sizes(false, &[Column::Name, Column::Refer], None));
+        assert!(wants_sizes(true, &names, None));
+    }
+
+    #[test]
+    fn sizes_render_in_units_parsable_and_sort_by_used() {
+        let mut big = sized(
+            row("/p", "big", 1, 1000),
+            4_402_341_478,
+            6_442_450_944,
+            86_114_094_285,
+        );
+        big.refer_bytes = Some(1);
+        let small = sized(
+            row("/p", "small", 2, 2000),
+            3 << 20,
+            9 << 20,
+            87_295_506_841,
+        );
+        let zero = sized(row("/p", "zero", 3, 3000), 0, 0, 87_295_506_841);
+        let rows = vec![big, small, zero];
+        let table = render_table(&rows, DEFAULT_COLUMNS, None, false);
+        // The index's REFER, not `≈refer_bytes`; a real 0 is printed as 0.
+        assert_eq!(cells(&table, 1)[3..6], ["4.1G", "6.0G", "80G"], "{table}");
+        assert_eq!(cells(&table, 2)[3..6], ["3.0M", "9.0M", "81G"], "{table}");
+        assert_eq!(cells(&table, 3)[3..6], ["0", "0", "81G"], "{table}");
+        assert!(!table.contains('≈'), "{table}");
+
+        // `-s used` finds the one eating the space (ascending: last).
+        let sorted = render_table(
+            &rows,
+            &[Column::Name, Column::Used],
+            Some(Column::Used),
+            false,
+        );
+        let order: Vec<String> = (1..=3).map(|i| cells(&sorted, i)[0].clone()).collect();
+        assert_eq!(order, ["/p@zero", "/p@small", "/p@big"]);
+
+        // `-p`: exact bytes; `-o lsize` is an extra column.
+        let columns = Column::parse_list("name,used,written,refer,lsize").unwrap();
+        let exact = render_table(&rows[..1], &columns, None, true);
+        assert_eq!(
+            cells(&exact, 0),
+            ["NAME", "USED", "WRITTEN", "REFER", "LSIZE"]
+        );
+        assert_eq!(
+            cells(&exact, 1),
+            [
+                "/p@big",
+                "4402341478",
+                "6442450944",
+                "86114094285",
+                "86114094292"
+            ]
+        );
+        assert!(!DEFAULT_COLUMNS.contains(&Column::Lsize));
+
+        // The footer names the size columns shown and the commit.
+        let now = 1_790_603_759_000;
+        assert_eq!(
+            size_footer(&rows, DEFAULT_COLUMNS, now).as_deref(),
+            Some("USED/WRITTEN/REFER as of commit 88213 (4s ago) · logical bytes, pre-compression")
+        );
+        assert_eq!(
+            size_footer(&rows, &columns, now + 3_600_000).as_deref(),
+            Some(
+                "USED/WRITTEN/REFER/LSIZE as of commit 88213 (1h ago) · logical bytes, \
+                 pre-compression"
+            )
+        );
+        assert_eq!(size_footer(&rows, &[Column::Name, Column::Id], now), None);
+        assert_eq!(size_footer(&[], DEFAULT_COLUMNS, now), None);
+    }
+
+    #[test]
+    fn building_and_off_cells_are_never_zero() {
+        let mut building = row("/p", "b", 1, 1000);
+        building.size_state = Some(api::SizeState::Building);
+        building.building_pct = Some(37);
+        building.refer_bytes = Some(5 << 30);
+        let table = render_table(&[building.clone()], DEFAULT_COLUMNS, None, false);
+        assert_eq!(
+            table.matches("building (37%)").count(),
+            3,
+            "USED, WRITTEN and REFER: {table}"
+        );
+        assert!(!table.contains(" 0 ") && !table.contains('≈'), "{table}");
+        let exact = render_table(
+            &[building.clone()],
+            &[Column::Used, Column::Refer],
+            None,
+            true,
+        );
+        assert_eq!(cells(&exact, 1), ["-", "-"]);
+        assert_eq!(
+            size_footer(&[building], DEFAULT_COLUMNS, 0).as_deref(),
+            Some("USED/WRITTEN/REFER: the accounting index is building (37%); run again shortly")
+        );
+
+        let mut off = row("/p", "o", 1, 1000);
+        off.size_state = Some(api::SizeState::Off);
+        off.refer_bytes = Some(5 << 30);
+        let table = render_table(&[off.clone()], DEFAULT_COLUMNS, None, false);
+        // USED/WRITTEN `-`; REFER falls back to the creation-time size.
+        assert_eq!(cells(&table, 1)[3..6], ["-", "-", "≈5.0G"], "{table}");
+        assert_eq!(
+            size_footer(&[off.clone()], DEFAULT_COLUMNS, 0).as_deref(),
+            Some("USED/WRITTEN/REFER: snapshot accounting is off (CONSTELLATION_SNAPACCT=off)")
+        );
+        off.refer_bytes = None;
+        let table = render_table(&[off], DEFAULT_COLUMNS, None, false);
+        assert_eq!(cells(&table, 1)[3..6], ["-", "-", "-"], "{table}");
+    }
+
+    #[test]
+    fn reclaim_and_space_lines() {
+        let est = api::ReclaimEstimate {
+            bytes: 44_345_643_008,
+            chunks: 812,
+            as_of_seq: 9,
+            ..Default::default()
+        };
+        assert_eq!(
+            reclaim_line(Some(&est)),
+            "would reclaim ≈ 41G in 812 chunks (after GC)"
+        );
+        let building = api::ReclaimEstimate {
+            building: true,
+            building_pct: 12,
+            ..Default::default()
+        };
+        assert_eq!(
+            reclaim_line(Some(&building)),
+            "would reclaim: no estimate yet, the accounting index is building (12%)"
+        );
+        assert_eq!(
+            reclaim_line(None),
+            "would reclaim: no estimate (snapshot accounting is off or unavailable)"
+        );
+
+        let gib = 1u64 << 30;
+        let amount = |bytes: u64| api::SpaceAmount {
+            bytes,
+            chunks: bytes >> 22,
+        };
+        let b = api::SpaceBreakdown {
+            live_logical: 1_121_501_860_331,
+            snapshots_total: amount(96 * gib + 400 * (1 << 20)),
+            unique: amount(7 * gib + 100 * (1 << 20)),
+            shared_snapshots_only: amount(89 * gib + 300 * (1 << 20)),
+            shared_with_live: amount(500 * gib),
+            awaiting_gc: amount(12 * gib),
+            gc_horizon_ms: 7 * 86_400_000,
+            physical_ratio: Some(0.61),
+            physical_estimate: Some(63_150_000_000),
+            as_of_seq: 88_213,
+            as_of_ms: 1_000_000,
+            ..Default::default()
+        };
+        let text = render_space(&b, 1_004_000);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("live data (logical)") && lines[0].ends_with("1.0T"),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains("96G")
+                && lines[1].ends_with("← deleting every snapshot returns this"),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains("7.1G") && lines[2].contains("Σ USED; not the total"),
+            "{text}"
+        );
+        assert!(lines[3].starts_with("  shared by ≥2 snapshots only") && lines[3].contains("89G"));
+        assert!(lines[4].contains("500G") && lines[4].ends_with("(costs nothing extra)"));
+        assert!(lines[5].ends_with("(freed snapshots; horizon 7d)") && lines[5].contains("12G"));
+        assert_eq!(
+            lines[6],
+            "estimated physical (×0.61 compression, from last GC round): snapshots, total ≈ 59G"
+        );
+        assert!(
+            lines[7].starts_with("note: per-snapshot USED values do not sum"),
+            "{text}"
+        );
+        assert_eq!(
+            lines[8],
+            "as of commit 88213 (4s ago) · logical bytes, pre-compression"
+        );
+        // The values line up in one column (by chars: `≥`, `Σ` are
+        // multi-byte).
+        let col = lines[0].chars().count() - "1.0T".len();
+        for line in &lines[1..6] {
+            let chars: Vec<char> = line.chars().collect();
+            assert!(
+                chars[col].is_ascii_digit() && chars[col - 1] == ' ',
+                "{line:?} (value column {col})"
+            );
+        }
+
+        let none = api::SpaceBreakdown {
+            path: Some("/projects".into()),
+            gc_horizon_ms: 36 * 3_600_000,
+            ..Default::default()
+        };
+        let text = render_space(&none, 0);
+        assert!(text.starts_with("space of /projects:"), "{text}");
+        assert!(
+            text.contains("horizon 36h") && text.contains("estimated physical: -"),
+            "{text}"
+        );
+        assert!(text.contains("(time unknown)"), "{text}");
+        let building = api::SpaceBreakdown {
+            building: true,
+            building_pct: 40,
+            ..Default::default()
+        };
+        assert_eq!(
+            render_space(&building, 0),
+            "the accounting index is building (40%); run again shortly\n"
+        );
+
+        let ok = api::SpaceVerified {
+            snapshots: 4,
+            chunks: 9,
+            as_of_seq: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            render_verify(&ok),
+            "verify: 0 mismatches (4 snapshots, 9 chunks walked, as of commit 3)\n"
+        );
+        let bad = api::SpaceVerified {
+            mismatches: 3,
+            details: vec!["USED of /a@x: index 5, brute force 7".into()],
+            ..ok
+        };
+        let text = render_verify(&bad);
+        assert!(text.starts_with("verify: 3 mismatches"), "{text}");
+        assert!(
+            text.contains("  USED of /a@x: index 5, brute force 7\n  … and 2 more"),
+            "{text}"
+        );
+        assert_eq!(exact_duration(90_000), "90s");
+        assert_eq!(ago(3 * 86_400_000, 86_400_000), "2d ago");
     }
 }

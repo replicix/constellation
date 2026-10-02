@@ -2,8 +2,9 @@
 //! engine: `snapshot.resolve`'s selectors and `snapshot.delete_many`'s
 //! one batch, its per-item hold refusals, its dry run and its `force`.
 
-use super::ops::tests::fixture;
+use super::ops::tests::{fixture, fixture_with};
 use super::*;
+use crate::snapacct::{SnapAcctConfig, SnapAcctMode};
 use constellation_control::dispatch_in_process;
 use serde_json::{json, Value};
 
@@ -44,7 +45,14 @@ fn ids_of(listing: &Value) -> Vec<String> {
 
 #[test]
 fn selectors_resolve_and_delete_many_refuses_holds_per_item() {
-    let f = fixture(&[&[]]);
+    // Auto accounting, whatever the environment says: the dry run estimates.
+    let f = fixture_with(
+        &[&[]],
+        Some(SnapAcctConfig {
+            mode: SnapAcctMode::Auto,
+            ..SnapAcctConfig::from_env()
+        }),
+    );
     for dir in ["/vol", "/other"] {
         call(&f, "browse.mkdir", json!({"path": dir})).unwrap();
     }
@@ -105,7 +113,8 @@ fn selectors_resolve_and_delete_many_refuses_holds_per_item() {
         dry["refused"][0]["reason"],
         "snapshot /vol@a2 is held by user:ops; `snapshot release` first (or pass --force)"
     );
-    assert!(dry["reclaim"].is_null(), "no space accounting yet: {dry}");
+    // The dry run's reclaim estimate (its numbers: `snapspace_tests`).
+    assert!(dry["reclaim"].is_object(), "a dry run estimates: {dry}");
     let all = call(&f, "snapshot.list", json!({})).unwrap();
     assert_eq!(all["snapshots"].as_array().unwrap().len(), 5);
 

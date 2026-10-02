@@ -32516,3 +32516,75 @@ more than `policy_ino` (log segment origin, rids).
 - [x] Audit object per tick; `snapshot.sched.status` / `snapshot.sched.run`; schema and parity.
 - [x] Step 4.4 answered: no inode reuse.
 - [x] Nothing deletes a snapshot.
+
+## Plan 32 M5c (space surfaces)
+
+Step 5's size columns, `snapshot space` and `snapshot delete --dry-run`
+estimates, and Step 7.6's `snapshot_reclaim` / `snapshot_space`, over the
+`32-m5b` accounting service. Every number is `SnapAcctService`'s: the
+control layer changes types (plus one unit change, `physical_ratio` = 1 /
+the service's logical-over-stored ratio), the CLI lays them out.
+
+| Item | State | Where |
+|---|---|---|
+| `SnapshotStatus` gains `used`, `written`, `refer`, `lsize`, `as_of_seq`, `as_of_ms`, `size_state` (`ok`/`building`/`off`, enum `SizeState`) and `building_pct`, all `#[serde(default)] Option` (null when absent); `refer_bytes` untouched (plan 37 reads it) | DONE | `crates/control/src/proto/types.rs` |
+| `snapshot.list {path?, sizes}`: `sizes: true` is a size request (records demand, builds under `auto`, waits ≤ 2 s, then `building`/`off` per row); without it the rows get sizes only when the index is open and current (a peek: no demand, no wake-up, no work). One gate for the whole listing: `SnapAcctService::snap_numbers_many(ids, demand)` (new; a row the index has not applied makes the whole answer `Building`) | DONE | `crates/engine/src/control/{service,snapspace}.rs`, `crates/engine/src/snapacct/service.rs` |
+| `snapshot.reclaim {selectors}` (Viewer, read) → `ReclaimEstimate {bytes, chunks, as_of_seq, as_of_ms, building, building_pct}` (resolution as `snapshot.resolve`); `snapshot.space {path?}` (Viewer, read) → `SpaceBreakdown {path, building, building_pct, live_logical, snapshots_total, unique, shared_snapshots_only, shared_with_live, awaiting_gc (SpaceAmount{bytes, chunks}), gc_horizon_ms, physical_ratio?, physical_estimate?, as_of_seq, as_of_ms}` (`/` = whole FS, unknown path → `not_found`); `snapshot.space.verify` (Operator, non-mutating) → `SpaceVerified {mismatches, details, snapshots, chunks, as_of_seq}`. With accounting off all three refuse `unsupported` (naming `CONSTELLATION_SNAPACCT=off`) | DONE | `crates/control/src/methods.rs`, `crates/engine/src/control/snapspace.rs` |
+| `snapshot.delete_many` fills `reclaim` for a dry run, over the snapshots it would delete (refused/held ones excluded); `None` for a real delete, with accounting off, or when the estimate fails (warned; the dry run still answers) | DONE | `crates/engine/src/control/service.rs` |
+| Method table 67 → **70**; schema re-blessed; stub-router and sample-param rows; role-class rows; parity rows (`MUST_SUCCEED`, `as_of_ms` stripped as live) | DONE | `crates/control/{src/methods.rs,src/tests.rs,schema/control.schema.json}`, `crates/engine/src/control/parity_tests.rs` |
+| `EngineConfig.snapacct: Option<SnapAcctConfig>` (`None` = env) so tests choose `auto`/`off`/answer wait per engine | DONE | `crates/engine/src/node.rs`, `crates/engine/src/control/ops.rs` (`fixture_with`) |
+| CLI `snapshot ls`: `USED WRITTEN REFER` from the index in binary units (`-p` exact bytes), extra column `-o lsize`, `-s used/written/refer/lsize` numeric; `building (37%)` in every size cell while building (`-` with `-p`), `-` with accounting off (`REFER` then falls back to `≈refer_bytes`); footer `USED/WRITTEN/REFER as of commit N (4s ago) · logical bytes, pre-compression` naming the size columns shown, or the building/off reason; no footer with `-p`. Sizes are requested only when a size column is shown or with `--json` | DONE | `crates/cli/src/{snapshot_cli,main}.rs` |
+| CLI `snapshot space [<fs[:path]>] [--verify] [--json]`: the Step 5 layout (values in one column, the `←` notes), `awaiting GC … (freed snapshots; horizon 7d)`, `estimated physical (×0.61 compression, from last GC round): snapshots, total ≈ X` (or `-` before any GC census), the note line on Σ `USED`, the as-of line; `--verify` runs `snapshot.space.verify` first and prints `verify: 0 mismatches (…)` or every detail, exit 1 on a mismatch | DONE | `crates/cli/src/snapshot_cli.rs` |
+| CLI `snapshot delete --dry-run` prints `would reclaim ≈ X in N chunks (after GC)` (or `no estimate yet, … building (N%)`, or `no estimate (snapshot accounting is off or unavailable)`); a multi-snapshot delete's prompt shows the same line from a dry run over exactly the resolved ids (a single delete or `--yes` costs no estimate) | DONE | `crates/cli/src/snapshot_cli.rs` |
+| Tests: control round trips on a real engine — `sizes_reclaim_and_space_are_the_indexs_numbers` (list/plain-list/reclaim/dry-run/space/scoped space/verify equal to the service's own answers; a rewritten file's old chunks counted as snapshot-only), `a_listing_says_building_until_the_index_is_built` (a plain list causes zero passes; `sizes: true` answers `building`, no number, then `ok`), `accounting_off_says_off_and_refuses_the_space_methods`; CLI rendering (`sizes_render_in_units_parsable_and_sort_by_used`, `building_and_off_cells_are_never_zero`, `reclaim_and_space_lines`); smoke step on a mounted FS (2 MiB file only `/dir@m2` keeps: `space --verify` 0 mismatches, `USED`/`WRITTEN` 2.0M, footer, `-p -s used` = 2097152, dry run `would reclaim ≈ 2.0M in 2 chunks`); `snapshot-lifecycle` asserts the reclaim line in the dry run and the prompt | DONE | `crates/engine/src/control/snapspace_tests.rs`, `crates/cli/src/snapshot_cli.rs`, `crates/harness/src/{smoke,scenarios}.rs` |
+| Docs: `CONSTELLATION_SNAPACCT` row lists the size requests and the off/building display; TESTING.md smoke and `snapshot-lifecycle` | DONE | `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md` |
+
+### Decisions taken here (the brief left them open)
+
+- **No `skip_serializing_if`.** The brief asked for skip-if-none fields;
+  the control types forbid it (postcard is positional; a test enforces
+  it), so the new fields are `#[serde(default)] Option` and read `null`
+  in JSON when absent.
+- **`size_state` is an enum** (`SizeState`), not a string.
+- **Off is a refusal for `snapshot.reclaim`/`snapshot.space`/`verify`**
+  (`unsupported`, with a remediation), a per-row `off` for the listing, and
+  `reclaim: None` for a dry run. Building is `building: true` + 0 numbers
+  in `ReclaimEstimate`/`SpaceBreakdown` (documented as meaningless), not an
+  `Option`, matching the `ReclaimEstimate` shape M0 declared.
+- **`snapshot.space.verify` is a separate Operator method**, not a
+  `verify` flag on the Viewer `snapshot.space`: a full walk of every
+  snapshot is a heavy probe.
+- **A plain `snapshot.list` peeks** (fills sizes only from a current index,
+  never starts one), so the CSI driver's and scripts' listings stay free;
+  `snapshot ls` asks only when it shows a size column (or `--json`).
+- **`REFER` without the index** (off, or a listing that did not ask)
+  falls back to M0's `≈refer_bytes`; while building it shows
+  `building (N%)` like the others.
+- **Physical estimate** = `snapshots_total × physical_ratio`, where
+  `physical_ratio` = stored per logical byte (the plan's "×0.61"), the
+  inverse of the service's `compression_ratio`.
+- **The dry-run estimate covers what would be deleted**, not refused held
+  snapshots; the confirmation prompt's estimate is a dry run over exactly
+  the confirmed ids.
+- **`-p` prints no footer** (parsable output), and `-` for any size without
+  a number.
+
+### Not done
+
+- The `snapacct` harness scenario (plan 32 §11: `--verify` on two nodes,
+  dry-run reclaim == GC's deletions) and per-root `USED` gauges (Step 9):
+  M8 / a later chunk; the surfaces they need exist now.
+- The web UI's size columns and multi-select footer: M6.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m5c`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff (`--check` exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test` (per package: the whole run exceeds one 10-minute tool call) | all green: engine 454 passed / 7 ignored (+1 integration); control 135; constellation 32 + 1; harness 48 + 2 + 1; meta, store-s3 222, net 99 + 3, csi 56 + 1, authority 155 + 107 (`sim`) + 4, every other package green; model: every test binary in debug, `locks` in release (29 passed); doctests green. 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `tests/integration.sh` body (port 4566 held by another agent's floci `32-m3a-…-floci-1`; reused with the script's `AWS_*`) | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run snapshot-lifecycle snapshot-churn gc-lifecycle web-ui-smoke e2e-basic e2e-two-nodes` | ALL SCENARIOS PASSED (6/6) |
+| `snapshot-lifecycle snapshot-churn gc-lifecycle` with `CONSTELLATION_SNAPACCT=on` and with `=off` | 3/3 and 3/3 passed |

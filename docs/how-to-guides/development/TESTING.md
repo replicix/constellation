@@ -67,7 +67,10 @@ its arguments; `CONSTELLATION_BIN` still selects the binary under test
 it over FUSE, and exercises: namespace ops (mkdir/rename/symlink),
 `snapshot policy check` (locally, an invalid expression's caret, and
 `--against` a `csi:`-held snapshot through the daemon), multi-chunk files, partial in-place edits, truncate, append,
-unlink-while-open orphan semantics, unmount/remount persistence, and
+snapshot space accounting (plan 32 M5c: a 2 MiB file only one of three
+snapshots keeps; `snapshot space --verify` = 0 mismatches, `snapshot ls`'s
+`USED`/`WRITTEN` and footer, `-p -s used`, `snapshot delete --dry-run`'s
+`would reclaim ≈ 2.0M in 2 chunks`), unlink-while-open orphan semantics, unmount/remount persistence, and
 cold-cache reads after wiping the local chunk cache.
 
 The backend URL decides where it runs:
@@ -479,7 +482,9 @@ unchanged (the platform unmount runs the same `fusermount3 -u` / `-uz`).
 `harness smoke [backend]` is `tests/smoke.sh` ported to Rust (see above):
 create + `doctor`, refused double create, mount, namespace ops,
 `snapshot policy check` (local, caret, `--against`), a 3.5 MiB
-multi-chunk file, partial edit, truncate, append, unlink-while-open,
+multi-chunk file, partial edit, truncate, append, snapshot sizes (`snapshot
+space --verify`, `snapshot ls` size columns, `delete --dry-run`'s reclaim
+estimate), unlink-while-open,
 rm/rmdir, remount, cold-cache read, `status`. The backend is a directory
 (default: a fresh temp dir) or `s3://bucket/prefix` with `AWS_*` in the
 environment.
@@ -868,8 +873,10 @@ roots:
   non-holder: `snapshot ls`'s table (Step 5's columns, `⚑` and
   `held: user` on a held row), a multi-target `hold --by`, a
   `delete path@a%b --dry-run` whose range skips another directory's
-  snapshot taken in the middle and reports the held one as refused, the
-  `delete N snapshots? [y/N]` prompt declining on EOF, `--yes` deleting
+  snapshot taken in the middle and reports the held one as refused (and,
+  plan 32 M5c, ends with a `would reclaim …` line), the
+  `delete N snapshots? [y/N]` prompt declining on EOF (showing the same
+  reclaim line), `--yes` deleting
   around the held snapshot (exit non-zero, naming its owner), a
   `release` by glob, and a final multi-selector delete that leaves both
   nodes with no snapshots. The lease's holder and epoch are checked

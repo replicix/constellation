@@ -132,7 +132,7 @@ use constellation_mtree::record::InodeRecord;
 use constellation_mtree::NodeHash;
 use constellation_store_s3::{vector_covers, ChunkCensus, ChunkStore, CommitChain, SHARD0};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1555,6 +1555,80 @@ impl SnapAcctService {
             as_of_seq,
             as_of_ms,
         }))
+    }
+
+    /// Every listed snapshot's numbers under one gate: what a snapshot
+    /// listing shows (`snapshot.list`). Ids without a row any more are
+    /// left out; a row the index has not applied yet makes the whole
+    /// answer `Building`, so a listing never mixes figures from before
+    /// and after a change.
+    ///
+    /// With `demand`, this is a size request like the others (it records
+    /// demand, starts a build under `auto`, waits for a pending pass).
+    /// Without, it only *peeks*: the numbers when the index is open and
+    /// current right now, `Building` otherwise, and no work is caused —
+    /// a plain listing must not start a build.
+    pub async fn snap_numbers_many(
+        &self,
+        ids: &[String],
+        demand: bool,
+    ) -> Result<SnapAnswer<HashMap<String, Numbers>>> {
+        let ix = if demand {
+            match self.gate().await? {
+                Ok(ix) => ix,
+                Err(other) => return Ok(cast(other)),
+            }
+        } else {
+            if self.cfg.mode == SnapAcctMode::Off {
+                return Ok(SnapAnswer::Off);
+            }
+            let open = if self.wipe_pending.load(Ordering::Acquire) {
+                None
+            } else {
+                self.index.lock().expect("index lock").clone()
+            };
+            match open {
+                Some(ix) if self.current(&ix)? => ix,
+                _ => return Ok(cast(self.building())),
+            }
+        };
+        let (as_of_seq, as_of_ms) = self.as_of(&ix)?;
+        let mut out = HashMap::with_capacity(ids.len());
+        for id in ids {
+            let Some((chain, ord)) = ix.locate(id)? else {
+                if self.deps.meta.snapshot_by_id(id)?.is_some() {
+                    if demand {
+                        self.wake.notify_one();
+                    }
+                    return Ok(cast(self.building()));
+                }
+                continue;
+            };
+            let numbers = ix.snap_numbers(chain, ord)?.ok_or_else(|| {
+                SnapAcctError::Corrupt(format!("snapshot {id} located but not recorded"))
+            })?;
+            out.insert(
+                id.clone(),
+                Numbers {
+                    id: numbers.id,
+                    used: numbers.used,
+                    written: numbers.written,
+                    refer: numbers.refer,
+                    lsize: numbers.lsize,
+                    as_of_seq,
+                    as_of_ms,
+                },
+            );
+        }
+        Ok(SnapAnswer::Ready(out))
+    }
+
+    /// The GC horizon the "awaiting GC" bucket assumes
+    /// (`CONSTELLATION_GC_HORIZON_S`): freed chunks are presumed collected
+    /// one horizon plus one GC interval after they lost their last
+    /// snapshot.
+    pub fn gc_horizon_ms(&self) -> u64 {
+        self.cfg.params.gc_horizon_ms
     }
 
     /// `reclaim(D)` for the snapshots with these ids.

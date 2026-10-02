@@ -4877,8 +4877,14 @@
       "type": "object"
     },
     "ReclaimEstimate": {
-      "description": "What deleting a set of snapshots would give back once GC has run (plan\n32 Step 6): the bytes and chunks no other snapshot and not the live\ntree reference, as of the accounting index's commit `as_of_seq`;\n`building` while that index is still being built.",
+      "description": "What deleting a set of snapshots would give back once GC has run (plan\n32 §6.1 `reclaim(D)`): the logical bytes and chunks no other snapshot\nand not the live tree reference, as of the accounting index's commit\n`as_of_seq`. While the index does not match the snapshots yet,\n`building` is set (with `building_pct`) and `bytes`/`chunks` are 0 and\nmean nothing: never a partial number.",
       "properties": {
+        "as_of_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "as_of_seq": {
           "format": "uint64",
           "minimum": 0,
@@ -4886,6 +4892,13 @@
         },
         "building": {
           "type": "boolean"
+        },
+        "building_pct": {
+          "default": 0,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
         },
         "bytes": {
           "format": "uint64",
@@ -5261,6 +5274,15 @@
         "mode"
       ],
       "type": "object"
+    },
+    "SizeState": {
+      "description": "Whether a snapshot's sizes are available (plan 32 §6.3).",
+      "enum": [
+        "ok",
+        "building",
+        "off"
+      ],
+      "type": "string"
     },
     "SnapAcctStatus": {
       "description": "Plan 32 Step 9's `SnapAcctStats`: the node-local space-accounting\nindex (advisory; never published, never consulted by GC).",
@@ -6543,6 +6565,11 @@
             "string",
             "null"
           ]
+        },
+        "sizes": {
+          "default": false,
+          "description": "Ask for every snapshot's sizes (plan 32 §6.3): under\n`CONSTELLATION_SNAPACCT=auto` this is the request that builds the\naccounting index, answering `size_state: building` meanwhile.\nWithout it the sizes are filled only when the index is already\ncurrent, and the listing causes no accounting work.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -6559,6 +6586,21 @@
       },
       "required": [
         "snapshots"
+      ],
+      "type": "object"
+    },
+    "SnapshotReclaimParams": {
+      "description": "`snapshot.reclaim`: what deleting exactly the snapshots `selectors`\nname (as `snapshot.resolve` resolves them) would give back.",
+      "properties": {
+        "selectors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "selectors"
       ],
       "type": "object"
     },
@@ -6593,9 +6635,51 @@
       ],
       "type": "object"
     },
+    "SnapshotSpaceParams": {
+      "description": "`snapshot.space`: the breakdown for the whole filesystem, or for the\nsnapshots of directories at or under `path`.",
+      "properties": {
+        "path": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "SnapshotStatus": {
       "description": "One snapshot, as `snapshot.list`/`snapshot.create`/`snapshot.hold`\nreport it. Everything after `created_unix_ms` is plan 32 §0.4's row\nextension; a snapshot taken before it reports the defaults (`manual`,\nnot held, no owner, no size).",
       "properties": {
+        "as_of_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "as_of_seq": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "building_pct": {
+          "default": null,
+          "description": "With `size_state: building`: the share of snapshot rows applied.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "created_unix_ms": {
           "format": "int64",
           "type": "integer"
@@ -6623,6 +6707,15 @@
         "id": {
           "type": "string"
         },
+        "lsize": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -6640,6 +6733,15 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "refer": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "refer_bytes": {
           "default": null,
@@ -6663,6 +6765,37 @@
             "integer",
             "null"
           ]
+        },
+        "size_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SizeState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether the sizes above are there: `ok`, `building` (the index\ndoes not match the snapshots yet; never a partial number) or `off`\n(`CONSTELLATION_SNAPACCT=off`). Absent when the caller did not ask\nfor sizes and the index had none ready."
+        },
+        "used": {
+          "default": null,
+          "description": "Plan 32 §6.1's sizes, logical bytes, from this node's accounting\nindex, all \"as of\" the commit `as_of_seq` (`as_of_ms` when the\nindex last caught up): `USED` (chunks nothing else references,\nlive tree included), `WRITTEN` (new since the chain's previous\nsnapshot), `REFER` (the distinct chunks it references — exact, so\nunlike `refer_bytes` it is deduplicated), `LSIZE` (apparent size).\nPresent only with `size_state: ok`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "written": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -6675,7 +6808,7 @@
       "type": "object"
     },
     "SnapshotsDeleted": {
-      "description": "`snapshot.delete_many`'s result. `resolved` is every snapshot the\nselectors named, in chain order; `deleted` the ids actually deleted\n(always empty for a dry run); `refused` the ones that were not, with\nthe reason. `reclaim` is `None` until space accounting exists.",
+      "description": "`snapshot.delete_many`'s result. `resolved` is every snapshot the\nselectors named, in chain order; `deleted` the ids actually deleted\n(always empty for a dry run); `refused` the ones that were not, with\nthe reason. `reclaim` is filled for a dry run (over the snapshots it\nwould delete, not the refused ones) and `None` otherwise, or when\naccounting is off.",
       "properties": {
         "deleted": {
           "items": {
@@ -6786,6 +6919,165 @@
       },
       "required": [
         "id"
+      ],
+      "type": "object"
+    },
+    "SpaceAmount": {
+      "description": "Logical bytes and the distinct chunks they are in.",
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunks": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes",
+        "chunks"
+      ],
+      "type": "object"
+    },
+    "SpaceBreakdown": {
+      "description": "`snapshot.space` (plan 32 Step 5, ZFS's `usedby*`), logical bytes.\nWhile the index does not match the snapshots yet, `building` is set\nand every number is 0 and means nothing.",
+      "properties": {
+        "as_of_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "as_of_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "awaiting_gc": {
+          "$ref": "#/$defs/SpaceAmount",
+          "description": "Freed by snapshot deletion and presumed not yet collected\n(filesystem-wide even with a path)."
+        },
+        "building": {
+          "type": "boolean"
+        },
+        "building_pct": {
+          "default": 0,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "gc_horizon_ms": {
+          "description": "How long GC keeps freed chunks (`CONSTELLATION_GC_HORIZON_S`):\nwhat \"awaiting GC\" waits for.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "live_logical": {
+          "description": "Apparent size of the live tree (or of the subtree).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "default": null,
+          "description": "The path asked about; absent for the whole filesystem.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "physical_estimate": {
+          "default": null,
+          "description": "**Estimate**: `snapshots_total` in stored bytes (logical ×\n`physical_ratio`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "physical_ratio": {
+          "default": null,
+          "description": "**Estimate**: stored bytes per logical byte (e.g. 0.61), from the\nlast GC round's census of `chunks/`; absent before any round wrote\none. Show physical figures derived from it with `≈`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "shared_snapshots_only": {
+          "$ref": "#/$defs/SpaceAmount",
+          "description": "Not live, held by two or more snapshots."
+        },
+        "shared_with_live": {
+          "$ref": "#/$defs/SpaceAmount",
+          "description": "In a snapshot and in the live tree: costs nothing extra."
+        },
+        "snapshots_total": {
+          "$ref": "#/$defs/SpaceAmount",
+          "description": "`usedbysnapshots`: what deleting every snapshot in scope returns."
+        },
+        "unique": {
+          "$ref": "#/$defs/SpaceAmount",
+          "description": "Σ `USED`: chunks exactly one snapshot holds. Not the total: chunks\ntwo or more snapshots share are in nobody's `USED`."
+        }
+      },
+      "required": [
+        "building",
+        "live_logical",
+        "snapshots_total",
+        "unique",
+        "shared_snapshots_only",
+        "shared_with_live",
+        "awaiting_gc",
+        "gc_horizon_ms",
+        "as_of_seq",
+        "as_of_ms"
+      ],
+      "type": "object"
+    },
+    "SpaceVerified": {
+      "description": "`snapshot.space.verify`: the accounting index against a brute-force\nwalk of every snapshot (plan 32 §6.3).",
+      "properties": {
+        "as_of_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunks": {
+          "description": "Distinct chunks the snapshots reference.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "details": {
+          "description": "One line per mismatch (the first 200).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mismatches": {
+          "description": "Numbers that differ; 0 means the index is exact.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshots": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mismatches",
+        "details",
+        "snapshots",
+        "chunks",
+        "as_of_seq"
       ],
       "type": "object"
     },
@@ -9181,6 +9473,17 @@
       },
       "streaming": "none"
     },
+    "snapshot.reclaim": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/SnapshotReclaimParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ReclaimEstimate"
+      },
+      "streaming": "none"
+    },
     "snapshot.refs": {
       "min_role": "viewer",
       "mutating": false,
@@ -9222,6 +9525,28 @@
       },
       "result": {
         "$ref": "#/$defs/SnapSchedReport"
+      },
+      "streaming": "none"
+    },
+    "snapshot.space": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/SnapshotSpaceParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SpaceBreakdown"
+      },
+      "streaming": "none"
+    },
+    "snapshot.space.verify": {
+      "min_role": "operator",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/SpaceVerified"
       },
       "streaming": "none"
     },

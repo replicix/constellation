@@ -561,23 +561,28 @@ enum SnapshotCommand {
     },
     /// `myfs[:/path]`: the snapshots of that directory and of everything
     /// below it; a bare name, or no target with `--state-dir`, lists them
-    /// all. A table (plan
-    /// 32 Step 5); `USED`, `WRITTEN` and `EXPIRES` print `-` until space
-    /// accounting and expiry exist, and `REFER` is `≈` the subtree's
-    /// logical size when the snapshot was taken.
+    /// all. A table (plan 32 Step 5). `USED` (bytes only this snapshot
+    /// holds), `WRITTEN` (new since the previous snapshot of the same
+    /// directory), `REFER` and `LSIZE` come from the node's accounting
+    /// index — logical bytes, before compression, as of the commit the
+    /// footer names; the first listing under CONSTELLATION_SNAPACCT=auto
+    /// builds it and shows `building (N%)` meanwhile. `EXPIRES` prints `-`
+    /// until expiry exists.
     Ls {
         target: Option<String>,
         /// Columns, comma separated: name, created, origin, used, written,
-        /// refer, kept-by, expires, id, seq, creator, policy.
+        /// refer, kept-by, expires, lsize, id, seq, creator, policy.
         #[arg(short = 'o', value_name = "COLS")]
         columns: Option<String>,
-        /// Sort by this column (ascending).
+        /// Sort by this column (ascending); `-s used` finds the snapshot
+        /// eating the space.
         #[arg(short = 's', value_name = "COL")]
         sort: Option<String>,
-        /// Exact integers: bytes without units, times as Unix ms.
+        /// Exact integers: bytes without units, times as Unix ms; `-` for
+        /// a size not available; no footer.
         #[arg(short = 'p')]
         parsable: bool,
-        /// The records as JSON (the shape scripts parse).
+        /// The records as JSON (the shape scripts parse), sizes included.
         #[arg(long)]
         json: bool,
         /// Only snapshots a policy took.
@@ -589,12 +594,32 @@ enum SnapshotCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Where the space goes (plan 32 Step 5, ZFS's `usedby*`): live data,
+    /// what deleting every snapshot would return, how much of that is
+    /// unique to one snapshot or shared, and what is awaiting GC — for the
+    /// filesystem, or (`myfs:/path`) the snapshots of directories at or
+    /// under a path. Logical bytes, from the node's accounting index.
+    Space {
+        target: Option<String>,
+        /// Check the index against a full walk of every snapshot first,
+        /// print `0 mismatches` or the differences; exit non-zero on a
+        /// mismatch. Walks every snapshot: slow on a large filesystem.
+        #[arg(long)]
+        verify: bool,
+        /// The raw `snapshot.space` (and `--verify`) results.
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Delete snapshots: `myfs:/path@name`, `myfs:/path@a%b` (that
     /// directory's snapshots from `a` to `b`), `myfs:/path@prefix*`, or a
     /// bare id with `--state-dir`. More than one asks first. A held
     /// snapshot is refused; release it first, or pass `--force`. Exits
     /// non-zero when any snapshot was not deleted (after deleting the
-    /// rest); a `--dry-run` exits 0 even when it lists refusals.
+    /// rest); a `--dry-run` exits 0 even when it lists refusals. The dry
+    /// run and the confirmation say what the delete would give back after
+    /// GC (`would reclaim ≈ X in N chunks`).
     Delete {
         #[arg(required = true, num_args = 1..)]
         targets: Vec<String>,
@@ -1767,7 +1792,10 @@ fn main() -> Result<()> {
                     // `/projects/web@…` too, and `/` lists everything.
                     // `snapshot.list`'s own `path` is an exact match.
                     let path = path.map(|p| format!("/{}", p.trim_matches('/')));
-                    let params = api::SnapshotListParams { path: None };
+                    // Sizes are a request (under `auto` the first one
+                    // builds the index): only when they are shown.
+                    let sizes = snapshot_cli::wants_sizes(json, &columns, sort);
+                    let params = api::SnapshotListParams { path: None, sizes };
                     ctl::<cm::SnapshotList>(&rt, &dir, params, |l| {
                         let rows: Vec<_> = l
                             .snapshots
@@ -1786,9 +1814,35 @@ fn main() -> Result<()> {
                                 "{}",
                                 snapshot_cli::render_table(&rows, &columns, sort, parsable)
                             );
+                            if !parsable {
+                                let now = snapshot_cli::now_ms();
+                                if let Some(footer) =
+                                    snapshot_cli::size_footer(&rows, &columns, now)
+                                {
+                                    println!("{footer}");
+                                }
+                            }
                             Ok(())
                         }
                     })
+                }
+                SnapshotCommand::Space {
+                    target,
+                    verify,
+                    json,
+                    state_dir,
+                } => {
+                    let (path, dir) = match (target, state_dir) {
+                        (Some(target), state_dir) => match resolve_target(&target, state_dir)? {
+                            (target::Target::Named { path, .. }, dir) => (path, dir),
+                            (target::Target::Raw(raw), dir) => (Some(raw), dir),
+                        },
+                        (None, Some(dir)) => (None, dir),
+                        (None, None) => {
+                            bail!("TARGET (a registered filesystem name, `myfs[:/path]`) or --state-dir")
+                        }
+                    };
+                    rt.block_on(snapshot_cli::space(&dir, path, verify, json))
                 }
                 SnapshotCommand::Delete {
                     targets,
