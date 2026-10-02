@@ -137,6 +137,8 @@ const MUST_SUCCEED: &[&str] = &[
     "gc.run",
     "fsck.run",
     "snapshot.list",
+    "snapshot.policy.check",
+    "snapshot.policy.simulate",
     "browse.readdir",
     "browse.inspect",
     "browse.stat",
@@ -182,6 +184,14 @@ fn params_for(name: &str, root_view: u64, backend_dir: &str) -> Value {
         "snapshot.refs" => json!({"id": "no-such-id"}),
         "snapshot.hold" => json!({"id": "/@no-such-snapshot", "held": true}),
         "clone.create" => json!({"selector": "/@no-such-snapshot", "destination": "/c"}),
+        // Over the root's (empty) history, simulated for one hour: two
+        // creations whatever the clock, so both calls agree.
+        "snapshot.policy.check" => {
+            json!({"expr": "1d:7d 1h:1d", "against": "/", "simulate_ms": 3_600_000u64})
+        }
+        "snapshot.policy.simulate" => {
+            json!({"path": "/", "expr": "1h:1d", "horizon_ms": 3_600_000u64})
+        }
         "browse.readdir" | "browse.inspect" | "browse.stat" => json!({"path": "/"}),
         "browse.read" => json!({"path": "/f"}),
         "browse.write" => {
@@ -261,6 +271,20 @@ fn stable(method: &str, value: Value) -> Value {
         "stats.subscribe" => {
             json!({"counters": value["counters"].as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()),
                    "gauges": value["gauges"].as_object().map(|m| m.keys().cloned().collect::<Vec<_>>())})
+        }
+        // The daemon's clock places the synthetic ticks: compare what
+        // the expression and the history decide, not when.
+        "snapshot.policy.simulate" => {
+            json!({"policy": value["policy"], "policy_ino": value["policy_ino"],
+                   "cadence": value["cadence"], "created": value["created"],
+                   "steady_state_bound": value["steady_state_bound"],
+                   "truncated": value["truncated"]})
+        }
+        // How far the simulation got is measured from the daemon's
+        // clock, which a non-aligned `now` shifts by the call's delay.
+        "snapshot.policy.check" => {
+            strip(&mut value, &["simulate_reached_ms"]);
+            value
         }
         // Log lines and probe objects are written between the two calls.
         "node.logs.tail"
@@ -611,6 +635,24 @@ fn unix_socket_and_http_dispatch_the_whole_table_identically() {
         }
         assert_eq!(forced_unix, forced_http, "forced hold as {role:?}");
 
+        // Plan 32 Step 5: an invalid policy is a *result* carrying the
+        // byte offset (for the CLI's caret), identical on both transports
+        // and for every role that may call the method.
+        let check = method_info("snapshot.policy.check").unwrap();
+        let invalid = json!({"expr": "1h:1d 7m:1d"});
+        let invalid_unix = rt.block_on(over_socket(&client, check, invalid.clone()));
+        let invalid_http = rt.block_on(over_http(&app, check, invalid));
+        assert_eq!(invalid_unix, invalid_http, "invalid policy as {role:?}");
+        if role.is_some() {
+            match &invalid_unix {
+                Outcome::Ok(v) => {
+                    assert_eq!(v["ok"], json!(false), "{v}");
+                    assert_eq!(v["error"]["offset"], json!(6), "{v}");
+                }
+                other => panic!("an invalid policy is a result, not {other:?}"),
+            }
+        }
+
         // Plan 37 §5 spells the CSI driver's call `snapshot.create{hold:
         // "csi:<content-uid>"}` — a string where the CLI sends a boolean.
         // Both spellings must reach the handler and be refused for the same
@@ -637,6 +679,63 @@ fn unix_socket_and_http_dispatch_the_whole_table_identically() {
     }
     assert_eq!(compared, 4 * METHODS.len());
     assert!(method_info("node.handoff").is_some());
+
+    // `snapshot.policy.check {against}` end to end, over real rows of the
+    // root: two hourly autos of the root a day apart, a manual one, a
+    // `csi:`-held auto one and another root's auto one. `1h:1d` anchored
+    // on the newest keeps it and expires only the root's older, unheld
+    // auto snapshot.
+    let root_ino = constellation_fs_core::types::ROOT_INO;
+    let day = 86_400_000i64;
+    let t0 = constellation_store_s3::lease::now_unix_ms() - 3 * day;
+    let auto = |id: &str, at: i64, policy_ino: u64| constellation_meta::SnapshotRow {
+        origin: 1,
+        policy_ino,
+        ..constellation_meta::SnapshotRow::new(id, "/", id, "mtree:0:00:1", at)
+    };
+    let meta = engine.meta();
+    meta.record_snapshot(&auto("old-auto", t0, root_ino))
+        .unwrap();
+    meta.record_snapshot(&auto("new-auto", t0 + 2 * day, root_ino))
+        .unwrap();
+    meta.record_snapshot(&constellation_meta::SnapshotRow::new(
+        "manual",
+        "/",
+        "manual",
+        "mtree:0:00:1",
+        t0,
+    ))
+    .unwrap();
+    meta.record_snapshot(&constellation_meta::SnapshotRow {
+        held: true,
+        held_by: Some("csi:content-uid".into()),
+        ..auto("csi-held", t0 + 1, root_ino)
+    })
+    .unwrap();
+    meta.record_snapshot(&auto("foreign", t0 + 2, root_ino + 4242))
+        .unwrap();
+    let checked = rt
+        .block_on(constellation_control::dispatch_in_process(
+            &admin_router,
+            &Principal::InProcess,
+            "snapshot.policy.check",
+            json!({"expr": "1h:1d", "against": "/"}),
+        ))
+        .expect("snapshot.policy.check against /");
+    let checked: api::SnapPolicyCheckResult = serde_json::from_value(checked).unwrap();
+    let against = checked.against.expect("against");
+    assert_eq!(
+        (against.snapshots, against.would_expire),
+        (5, 1),
+        "{against:?}"
+    );
+    let expired: Vec<&str> = against
+        .verdicts
+        .iter()
+        .filter(|v| !v.keep)
+        .map(|v| v.id.as_str())
+        .collect();
+    assert_eq!(expired, ["old-auto"]);
 
     // The unix socket really did go through peer credentials: a stranger
     // policy denied the same process above; admin reached every handler.

@@ -553,6 +553,41 @@ enum SnapshotCommand {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Automatic snapshot policies (plan 32): schedule expressions such
+    /// as '5m:1d 1h:7d 1d:30d'.
+    Policy {
+        #[command(subcommand)]
+        command: SnapshotPolicyCommand,
+    },
+}
+
+/// `constellation snapshot policy …`. Plan 32 M2 adds `set`, `show`,
+/// `ls`, `rm`, `pause` and `resume` here.
+#[derive(Subcommand)]
+enum SnapshotPolicyCommand {
+    /// Explain a policy expression without setting it: its canonical
+    /// form, the steady-state upper bound, a simulated count and any
+    /// warnings. Runs locally; `--against` asks the daemon to evaluate it
+    /// over a directory's real snapshots. Exit 2 on a parse error.
+    Check {
+        /// The policy, e.g. '5m:1d 1h:7d 1d:30d 1mo:1y; tz=Europe/Budapest'.
+        expr: String,
+        /// How long to simulate (`30d`, `12w`, `6mo`, `1y`; `m` is
+        /// minutes). Default: until the count settles (a year with a `*`
+        /// tier).
+        #[arg(long)]
+        simulate: Option<String>,
+        /// `myfs:/path`: evaluate the policy over that directory's
+        /// snapshots, as if it were the directory's policy, and list what
+        /// it would expire.
+        #[arg(long)]
+        against: Option<String>,
+        /// The raw `snapshot.policy.check` result.
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1625,6 +1660,7 @@ fn main() -> Result<()> {
                     },
                 )
             }
+            SnapshotCommand::Policy { command } => run_snapshot_policy_command(&rt, command),
         },
         Command::Clone {
             target,
@@ -3207,6 +3243,192 @@ fn snapshot_selector(t: &target::Target, verb: &str) -> Result<String> {
     }
 }
 
+/// `constellation snapshot policy …` (plan 32 Step 5).
+fn run_snapshot_policy_command(
+    rt: &tokio::runtime::Runtime,
+    command: SnapshotPolicyCommand,
+) -> Result<()> {
+    use constellation_meta::snapsched::{check, SnapPolicy};
+    match command {
+        SnapshotPolicyCommand::Check {
+            expr,
+            simulate,
+            against,
+            json,
+            state_dir,
+        } => {
+            let simulate_ms = simulate
+                .as_deref()
+                .map(|s| {
+                    check::parse_horizon(s)
+                        .map(|ms| ms as u64)
+                        .map_err(|e| anyhow::anyhow!("--simulate {s}: {}", e.msg))
+                })
+                .transpose()?;
+            let local = || {
+                constellation_engine::control::snapsched::check_expression(
+                    &expr,
+                    simulate_ms,
+                    constellation_store_s3::lease::now_unix_ms(),
+                )
+            };
+            let result = match against {
+                None => local(),
+                // A typo should not need a daemon to be pointed out, and
+                // is reported in the same shape (caret or `--json`) as
+                // without `--against`.
+                Some(_) if SnapPolicy::parse(&expr).is_err() => local(),
+                Some(target) => {
+                    let (t, dir) = resolve_target(&target, state_dir)?;
+                    let path = target::effective_path(&t);
+                    rt.block_on(control::call::<cm::SnapshotPolicyCheck>(
+                        &dir,
+                        api::SnapPolicyCheckParams {
+                            expr: expr.clone(),
+                            against: Some(path),
+                            simulate_ms,
+                        },
+                    ))?
+                }
+            };
+            if json {
+                print_json(&result)?;
+                if !result.ok {
+                    std::process::exit(2);
+                }
+                return Ok(());
+            }
+            print_policy_check(&expr, &result);
+            if !result.ok {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `snapshot policy check`'s report. Every figure is the method's: this
+/// only lays it out.
+fn print_policy_check(expr: &str, r: &api::SnapPolicyCheckResult) {
+    if let Some(e) = &r.error {
+        // The same two-line caret rendering as `prune check`.
+        let e = constellation_meta::policy_lex::PolicyError {
+            offset: usize::try_from(e.offset).unwrap_or(usize::MAX),
+            msg: e.message.clone(),
+        };
+        eprintln!("{}", e.render(expr));
+        return;
+    }
+    println!("ok: {}", r.canonical.as_deref().unwrap_or(expr));
+    match r.steady_state_bound {
+        Some(bound) => println!("steady-state bound: <= {bound} snapshots"),
+        None => println!("steady-state bound: none (a `*` tier keeps forever)"),
+    }
+    if let (Some(count), Some(horizon)) = (r.simulated_count, r.simulate_horizon_ms) {
+        if r.simulate_truncated {
+            // The count is where the simulation stopped, not the horizon.
+            let reached = r.simulate_reached_ms.unwrap_or(0);
+            println!(
+                "simulated: at least {count} snapshots after {} (stopped early: the policy \
+                 keeps too many to simulate the full {})",
+                fmt_span_ms(reached),
+                fmt_span_ms(horizon)
+            );
+        } else {
+            println!(
+                "simulated: {count} snapshots after {}",
+                fmt_span_ms(horizon)
+            );
+        }
+    }
+    for w in &r.warnings {
+        println!("warning: {w}");
+    }
+    if let Some(a) = &r.against {
+        println!(
+            "against {} (ino {}): would expire {} of {} snapshots",
+            a.path, a.policy_ino, a.would_expire, a.snapshots
+        );
+        if !a.verdicts.is_empty() {
+            println!("  {:<32} {:<17} KEPT BY", "NAME", "CREATED (UTC)");
+            for v in &a.verdicts {
+                println!(
+                    "  {:<32} {:<17} {}",
+                    v.name,
+                    fmt_utc_ms(v.created_unix_ms),
+                    kept_by(v)
+                );
+            }
+        }
+    }
+}
+
+/// A verdict's `KEPT BY` cell (plan 32 Step 5): the keeping tiers as
+/// `5m·1h·1d`, `last=n`, a hold by owner namespace (`held: csi`), or
+/// `expire` for one the policy would delete.
+fn kept_by(v: &api::SnapVerdict) -> String {
+    if !v.keep {
+        return "expire".to_string();
+    }
+    let tiers: Vec<&str> = v
+        .reasons
+        .iter()
+        .filter(|r| r.kind == "tier")
+        .filter_map(|r| r.every.as_deref())
+        .collect();
+    let mut parts = Vec::new();
+    if !tiers.is_empty() {
+        parts.push(tiers.join("·"));
+    }
+    for r in &v.reasons {
+        match r.kind.as_str() {
+            "tier" => {}
+            "last" => parts.push(format!("last={}", r.last.unwrap_or(1))),
+            "held" => parts.push(
+                match r.held_by.as_deref().and_then(|by| by.split(':').next()) {
+                    Some(ns) if !ns.is_empty() => format!("held: {ns}"),
+                    _ => "held".to_string(),
+                },
+            ),
+            "grace" => parts.push("grace".to_string()),
+            "not_candidate" if v.origin == "auto" => parts.push("another policy".to_string()),
+            "not_candidate" => parts.push(v.origin.clone()),
+            other => parts.push(other.to_string()),
+        }
+    }
+    parts.join(", ")
+}
+
+fn fmt_utc_ms(ms: i64) -> String {
+    jiff::Timestamp::from_millisecond(ms)
+        .map(|t| t.strftime("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| ms.to_string())
+}
+
+/// A span in the units `--simulate` takes, largest first, zero units
+/// left out: `8d`, `1d12h`, `1y1m` (a 365-day year and a minute: `m` is
+/// minutes, as in the policy grammar), `0s`.
+fn fmt_span_ms(ms: u64) -> String {
+    let mut secs = ms / 1000;
+    let mut out = String::new();
+    for (unit, len) in [
+        ("y", 365 * 86_400),
+        ("d", 86_400),
+        ("h", 3_600),
+        ("m", 60),
+        ("s", 1),
+    ] {
+        if secs >= len {
+            out.push_str(&format!("{}{unit}", secs / len));
+            secs %= len;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("0s");
+    }
+    out
+}
+
 /// `snapshot ls`: one row per snapshot, with plan 32 §0.4's hold and its
 /// owner in the `HELD` column — `held: csi:<uid>` reads differently from
 /// an operator's own `held: user:attila`, and from a plain `held` with no
@@ -3373,6 +3595,21 @@ fn parse_quota_arg(input: &str) -> Result<Option<u64>> {
         Ok(None)
     } else {
         Ok(Some(n))
+    }
+}
+
+#[cfg(test)]
+mod fmt_span_tests {
+    use super::fmt_span_ms;
+
+    #[test]
+    fn spans_print_every_nonzero_unit_largest_first() {
+        assert_eq!(fmt_span_ms(8 * 86_400_000), "8d");
+        assert_eq!(fmt_span_ms(36 * 3_600_000), "1d12h");
+        // The review's `525601m`: a year and a minute.
+        assert_eq!(fmt_span_ms(525_601 * 60_000), "1y1m");
+        assert_eq!(fmt_span_ms(4095 * 60_000 + 1500), "2d20h15m1s");
+        assert_eq!(fmt_span_ms(999), "0s");
     }
 }
 

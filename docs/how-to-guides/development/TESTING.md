@@ -65,7 +65,8 @@ it builds it) and forwards
 its arguments; `CONSTELLATION_BIN` still selects the binary under test
 (default `$CARGO_TARGET_DIR/debug/constellation`). It creates a filesystem, runs `doctor`, mounts
 it over FUSE, and exercises: namespace ops (mkdir/rename/symlink),
-multi-chunk files, partial in-place edits, truncate, append,
+`snapshot policy check` (locally, an invalid expression's caret, and
+`--against` a `csi:`-held snapshot through the daemon), multi-chunk files, partial in-place edits, truncate, append,
 unlink-while-open orphan semantics, unmount/remount persistence, and
 cold-cache reads after wiping the local chunk cache.
 
@@ -471,7 +472,8 @@ unchanged (the platform unmount runs the same `fusermount3 -u` / `-uz`).
 ### `harness smoke`
 
 `harness smoke [backend]` is `tests/smoke.sh` ported to Rust (see above):
-create + `doctor`, refused double create, mount, namespace ops, a 3.5 MiB
+create + `doctor`, refused double create, mount, namespace ops,
+`snapshot policy check` (local, caret, `--against`), a 3.5 MiB
 multi-chunk file, partial edit, truncate, append, unlink-while-open,
 rm/rmdir, remount, cold-cache read, `status`. The backend is a directory
 (default: a fresh temp dir) or `s3://bucket/prefix` with `AWS_*` in the

@@ -11,6 +11,9 @@
 //!   survive ([`retention`]): [`retention::evaluate`] is the *only*
 //!   implementation of the rule, and the scheduler, the CLI and the web
 //!   UI all call it rather than restating it.
+//! * Step 5's `policy check` ([`check`]): warnings, how far to
+//!   simulate, and the settled count, shared by the control method and
+//!   the daemonless CLI.
 //!
 //! The scheduler and the accountant come later and consume these types.
 //!
@@ -19,14 +22,15 @@
 //! a policy differently would delete different snapshots.
 
 pub mod calendar;
+pub mod check;
 pub mod policy;
 pub mod retention;
 
 pub use calendar::{add_keep, bucket_start, next_bucket_start, subtract_keep};
 pub use policy::{Interval, Keep, SnapPolicy, Tier, WeekStart};
 pub use retention::{
-    due, evaluate, grace_first_seen, grace_intersection, simulate, Origin, Reason, SnapFacts,
-    Timeline, Verdict,
+    due, evaluate, grace_first_seen, grace_intersection, simulate, simulate_capped, Origin, Reason,
+    SimLimits, SnapFacts, Timeline, Verdict,
 };
 
 /// The xattr that binds a snapshot schedule to a directory. Set it, and

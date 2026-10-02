@@ -31176,3 +31176,187 @@ the publish is still running.
 | the two regression tests | 20× pass, 5× pass under `taskset -c 0` |
 | `bash tests/smoke.sh` | SMOKE TEST PASSED |
 | `harness run e2e-basic` | 10/10 PASSED; 5/5 more under `taskset -c 0` (`/dev/fuse`; the ring transport needs the non-default `io-uring` build feature, and the fix is in the transport-independent core) |
+
+## Plan 32 M1 — policy language and retention
+
+**Milestone M1 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 1 +
+Step 2 + Step 5's `policy check`): closed.** Three chunks: `32-m1a` (the
+language), `32-m1b` (retention as a pure function) and `32-m1c` (this one:
+the read-only control methods, the CLI and the milestone gate). The policy
+language, retention and simulation exist, are reachable through the control
+protocol and the CLI, and **nothing runs**: no xattr gate, no `policy set`, no
+scheduler, no expiry. M1 deletes nothing and creates nothing, which is what
+the plan's milestone table promises ("Deletes data? no").
+
+The detail of the first two chunks — every decision taken where the plan was
+open — stays in their own sections, "Plan 32 M1a (policy language)" and
+"Plan 32 M1b (retention)" above; their tables are folded into the one below.
+
+| Item | State | Where |
+|---|---|---|
+| **M1a** `policy_lex`: the offset-carrying `PolicyError` with `render`'s caret, plan 22's duration/size/int lexers, shared by the prune and snapshot-schedule parsers (`parse_duration` is now `pub`, for `--simulate`) | DONE | `crates/meta/src/policy_lex.rs` |
+| **M1a** `Interval` (the calendar-dividing set; `s` test-only), `Keep` (months/years symbolic, written unit preserved), `Tier`, `WeekStart`, `SnapPolicy` with the settings table's defaults | DONE | `crates/meta/src/snapsched/policy.rs` |
+| **M1a** `SnapPolicy::parse` — every refusal at a byte offset (no tier, duplicate interval, `keep < every`, non-dividing interval, `1M` / ambiguous bare-`m`, `day-start` off-grid, `last=0`, unknown `tz`/setting); `tz` against jiff's **bundled** tzdb, canonicalized; canonical `Display`; `steady_state_bound()`, `finest()`, `has_subminute()` | DONE | `crates/meta/src/snapsched/policy.rs` |
+| **M1a** tests: every Step 1 example round-trips byte-identically; the bounds 31/186/510/∞/7; the rejection list with offsets; proptest round-trip; 20 000-case byte soup; fuzz target `meta_snap_policy` | DONE | `crates/meta/src/snapsched/policy.rs`, `fuzz/fuzz_targets/meta_snap_policy.rs` |
+| **M1b** `calendar`: `bucket_start`/`next_bucket_start` (sub-hour on the absolute clock, 1h+ in `tz` with `day-start`/`week-start`), `subtract_keep`/`add_keep` (exact or calendar per tier) | DONE | `crates/meta/src/snapsched/calendar.rs` |
+| **M1b** `retention::evaluate(policy, policy_ino, snaps)` — the only implementation of the rule; `SnapFacts::from_row`, `Origin`, `Verdict { keep, reasons, expires_at }`, `Reason::{Tier, Last, Held, Grace, NotCandidate}`; `grace_intersection`/`grace_first_seen`; `due` | DONE | `crates/meta/src/snapsched/retention.rs` |
+| **M1b** `retention::simulate(…) -> Timeline` (serialized names stable), capped at `MAX_SYNTHETIC` = 10 000 | DONE | `crates/meta/src/snapsched/retention.rs` |
+| **M1b** tests: DST (23/25 hourly buckets, one daily), Kolkata/Chatham/Lord_Howe, 29 Feb, month ends, ISO weeks, `5m:1d` = 288 buckets; idempotence/monotonicity/outage-safety/nesting properties; the naive differential implementation (192 cases; 20 000 `#[ignore]`d) | DONE | `crates/meta/src/snapsched/{calendar,retention}.rs` |
+| **M1c** `retention::simulate_capped(…, SimLimits)` — `simulate` under caller-chosen limits: creations (`max_synthetic`), live candidates (`max_live`) and **work** (`max_work`: live candidates evaluated, summed over every expiry pass; `MAX_WORK` = 2²⁷). `simulate` is `simulate_capped(…, SimLimits::DEFAULT)` = 10 000 creations, no live cap, `MAX_WORK`; `Timeline.work` (not serialized) reports the count. No rule change | DONE | `crates/meta/src/snapsched/retention.rs` |
+| **M1c** `snapsched::check`: `warnings(policy)` (sub-minute tier "test-only"; bound > `BOUND_WARNING` = 2000), `settle_horizon_ms(policy)` (longest finite window + its interval; ≥ 366 d with a `*` tier), `parse_horizon` (`--simulate`: plan 22 units plus `mo` = 30 d), `check(policy, ino, existing, now, horizon) -> CheckReport` (canonical, warnings, bound, horizon, **simulated count = the policy's own candidates alive at the horizon**, `reached_ms`, `truncated`, `work`) under `check_limits(policy)`: `CHECK_MAX_SYNTHETIC` = 131 072 creations, `MAX_WORK`, and a live cap of the bound + ¼ when the bound is ≤ `CHECK_AFFORDABLE_BOUND` = 16 384, else `CHECK_MAX_LIVE` = 4096 | DONE | `crates/meta/src/snapsched/check.rs` (7 tests) |
+| **M1c** control methods `snapshot.policy.check` and `snapshot.policy.simulate` (both **viewer, non-mutating**, documented in the method table; 60 methods); types `SnapPolicyCheckParams`, `SnapPolicyCheckResult`, `PolicyErrorInfo`, `SnapPolicyAgainst`, `SnapVerdict`, `SnapReason`, `SnapPolicySimulateParams`, `SnapTimeline`/`SnapTimelineEntry`/`SnapCountPoint` (the meta `Timeline` field for field); schema re-blessed | DONE | `crates/control/src/methods.rs`, `crates/control/src/proto/types.rs`, `crates/control/schema/control.schema.json`, `crates/control/src/tests.rs` (stub router + sample params) |
+| **M1c** handlers: `check_expression` (no daemon state; the CLI's local path calls it), `policy_check` (`against` → the directory's rows, `policy_ino` = its current ino, `retention::evaluate`), `policy_simulate` (`retention::simulate` from the daemon's clock, converted by serde so the wire shape *is* meta's) | DONE | `crates/engine/src/control/snapsched.rs` (7 tests), registered from `crates/engine/src/control/mod.rs` |
+| **M1c** parity: both methods in the table sweep (`MUST_SUCCEED`; `simulate` compared minus its clock), an invalid expression's `{ok: false, error.offset: 6}` identical on socket and HTTP for every role, and `against: "/"` end to end over real rows (manual, `csi:`-held, other-ino auto, two own autos → expires exactly the older own one) | DONE | `crates/engine/src/control/parity_tests.rs` |
+| **M1c** CLI `constellation snapshot policy check '<expr>' [--simulate <dur>] [--against <fs:path>] [--json]` — local without `--against`; caret error as `prune check` (exit 2); `would expire N of M snapshots` + `NAME / CREATED (UTC) / KEPT BY` list. `snapshot policy` is a subcommand group (`SnapshotPolicyCommand`) M2 extends | DONE | `crates/cli/src/main.rs`, `crates/cli/Cargo.toml` (`jiff` for the UTC column) |
+| **M1c** smoke: local check (canonical form, bound, simulated line), invalid expression (exit 2, caret under byte 6), `1m:*` stopping early (`at least 4096 snapshots after 2d20h1…`), `--json --against` with an invalid expression (exit 2, JSON `ok: false`, `error.offset: 6`), `snapshot create --by csi:smoke` then `--against /dir` (`would expire 0 of 1`, `held: csi`) | DONE | `crates/harness/src/smoke.rs` |
+
+### The examples table, as `policy check` prints it
+
+`target/release/constellation snapshot policy check '<expr>'` (no
+`--simulate`: each simulated until it settles; run 2026-10-02 UTC, after the
+review fixes below, which print spans in every unit, `1y30d` rather than
+`395d`):
+
+| Policy | Bound (plan) | `steady-state bound:` | `simulated:` |
+|---|---|---|---|
+| `1h:1d 1d:7d` | ≤ 31 | `<= 31 snapshots` | `30 snapshots after 8d` |
+| `15m:1d 1h:2d 1d:30d 1mo:1y` | ≤ 186 | `<= 186 snapshots` | `159 snapshots after 1y30d` (160 on an earlier run: the months the year covers depend on the day it starts) |
+| `5m:1d 1h:7d 1d:30d 1w:12w 1mo:1y; tz=Europe/Budapest` | ≤ 510 | `<= 510 snapshots` | `473 snapshots after 1y30d` (0.76 s, release) |
+| `1d:14d 1mo:*; day-start=02:00` | 14 + months elapsed | `none (a `*` tier keeps forever)` | `26 snapshots after 1y1d`; `--simulate 5y`: `74 snapshots after 5y` |
+| `1d:7d; last=3; skip-empty=no` | ≤ 7 | `<= 7 snapshots` | `7 snapshots after 8d` |
+
+The gap between the two columns is union semantics (L2): the midnight
+snapshot is the 5m, 1h and 1d representative at once and the bound counts it
+three times. `1d:14d 1mo:*` after 366 days is 14 dailies plus the 13 monthly
+buckets the run touched (October 2026 to October 2027), the newest monthly
+being one of the 14 dailies: 14 + 13 − 1 = 26.
+
+### Decisions taken here (the brief left them open)
+
+- **An invalid expression is a result, not an error.** `snapshot.policy.check`
+  answers `{ok: false, error: {offset, message}}` and the call succeeds:
+  checking an expression is the method working, and the web UI's editor will
+  call it per keystroke. A bad `against` path is an error (`not_found`, or
+  `invalid` for a non-directory), as is any parse failure in
+  `snapshot.policy.simulate` (`invalid`, message `at byte N: …`).
+- **The method always simulates.** `simulate_ms` absent means "until it
+  settles" (`check::settle_horizon_ms`), so `simulated_count` is present on
+  every valid result and the CLI always prints both figures; the result
+  carries `simulate_horizon_ms` and `simulate_truncated` so the figure is
+  never shown without its horizon.
+- **The simulated count is the policy's own snapshots**, the last count
+  point's `candidates`, not `final_count`: with `against`, manual, held and
+  foreign snapshots are in the history and would otherwise inflate it. With
+  `against` the simulation starts from the directory's real history; without,
+  from an empty one.
+- **`check` simulates under a larger cap than the UI's timeline.** A settled
+  `5m:… 1mo:1y` needs ≈ 114 000 synthetic snapshots, eleven times
+  `MAX_SYNTHETIC`. Rather than report a truncated figure for the plan's own
+  user-story example, M1c added `simulate_capped` and runs `check` under
+  `CHECK_MAX_SYNTHETIC` = 131 072 (it returns one number, not the timeline).
+  `snapshot.policy.simulate` keeps `MAX_SYNTHETIC`.
+- **Both simulations are bounded in work, not only in creations** (32-M1c
+  review). Each expiry pass looks at every live candidate, so a policy that
+  keeps what it creates costs the square of its creations: before the fix
+  `check '1m:1y'` took 62.8 s and `'1m:*'` 46.0 s, from a viewer method on the
+  blocking pool. Now every simulation stops with `truncated` after
+  `MAX_WORK` = 2²⁷ evaluations (≈ 1 s release; the dense example uses under
+  half), and `check` also stops once more of the policy's snapshots are alive
+  than it can afford (`check::check_limits`: a little over the bound when the
+  bound is ≤ 16 384, else 4096 — already twice the bound warning). A
+  truncated result carries `simulate_reached_ms`, and the CLI prints the
+  instant reached, not the horizon: `simulated: at least 4096 snapshots after
+  2d20h14m26s (stopped early: the policy keeps too many to simulate the full
+  1y1m)`. `keep_mask` was left whole rather than made incremental: an
+  incremental pass would be a second statement of the rule.
+- **A directory's rows are those recorded at its path or carrying its ino.**
+  An auto snapshot keeps its creation-time path after a rename (§0.5), but
+  its `policy_ino` still names the root, so `against` and `simulate {path}`
+  include it (`against_expires_only_the_roots_unheld_auto_snapshots` has a
+  `renamed` row). Manual and foreign rows at the path are listed with their
+  verdict (kept, `not_candidate`) so the list reads like `snapshot ls`.
+- **The CLI parses locally before calling the daemon** with `--against`, so a
+  typo gets its caret without a daemon; the daemon's own `error` result is
+  rendered the same way (`PolicyError::render`, as `prune check`). The local
+  answer is `check_expression`'s error result, so `--json` prints the same
+  `{ok: false, error}` with or without `--against`.
+- **`KEPT BY`**: the keeping tiers joined `5m·1h·1d`, `last=n`, `held: <ns>`
+  (the owner's namespace prefix, `held` alone without an owner), `grace`,
+  `manual` / `another policy` for non-candidates, and `expire` for what the
+  policy would delete.
+- **`--simulate` takes plan 22's durations plus `mo`** (30 days nominal; a
+  horizon is a length, not a bucket). `m` is minutes, as everywhere in plan
+  22's grammar.
+
+### 32-M1c review fixes: timings and gates
+
+`target/release/constellation snapshot policy check '<expr>'`, wall clock of
+three runs each (16 vCPUs, other agents' load on the host):
+
+| Expression | Before the fix | After | `simulated:` after |
+|---|---|---|---|
+| `1m:*` | 46.0 s | 0.20 / 0.20 / 0.15 s | `at least 4096 snapshots after 2d20h14m26s (stopped early …)` |
+| `1m:1y` | 62.8 s | 0.20 / 0.13 / 0.16 s | `at least 4096 snapshots after 2d20h14m25s (stopped early …)` |
+| `10s:1d` | 0.29 s | 0.39 / 0.38 / 0.35 s | `8640 snapshots after 1d10s` (bound affordable: settles) |
+| `5m:1d 1h:7d 1d:30d 1w:12w 1mo:1y; tz=Europe/Budapest` | ≈ 0.5 s | 1.13 / 0.76 / 0.76 s | `473 snapshots after 1y30d`, not truncated |
+
+In a debug build `check("1m:*")` and `check("1m:1y")` take ≈ 0.95 s each
+(`a_policy_that_keeps_everything_truncates_on_bounded_work`, 1.89 s for both;
+it asserts the work counter, ≤ 4096·4097/2 evaluations, not the clock).
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test -p <crate>`, every workspace crate in turn | all pass, 0 failed (meta 278, control 135, engine 405 + 1, cli 26, harness 49, model, and the rest); schema re-blessed for `simulate_reached_ms` |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED`, with the new truncated and `--json --against` cases |
+| `cargo build --release --workspace` | exit 0 |
+| full harness matrix, compliance | not rerun: the coordinator recorded them for this change above (177/182 with the known failures, 8798/8798); the fix touches only the simulation's limits, the control result and the CLI |
+
+### Exit criteria (M1)
+
+- [x] Step 1: the language parses, refuses at byte offsets, prints canonically (M1a).
+- [x] Step 2: `evaluate`, the calendar, grace helpers, `due`, `simulate`, with the property and differential tests (M1b).
+- [x] Step 5 `policy check '<expr>' [--simulate <dur>] [--against <fs:path>]`: caret errors, warnings, bound and simulated figures, `would expire N of M` (M1c).
+- [x] Step 7.6 `snap_policy_check` / `snap_policy_simulate` as control methods `snapshot.policy.check` / `snapshot.policy.simulate`, schema blessed, parity table extended (M1c).
+- [x] No retention math outside `meta::snapsched`; nothing writes, schedules or expires.
+- [x] Gates (below).
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0: **1948 passed, 0 failed** (new: 6 in `snapsched::check`, 6 in `control::snapsched`; the parity sweep now covers 60 methods × 4 roles plus the invalid-policy and `against` checks) |
+| `CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`, then `cargo test -p constellation-control` | schema re-blessed; 135 passed |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED`, including the new `snapshot policy check` step |
+| `bash tests/integration.sh` | its body run by hand (`AWS_*` as in the script, `tests/smoke.sh s3://constellation-ci/run-m1c-…`) against the floci another agent already had on `:4566` (`docker compose up floci` cannot bind it): `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | exit 0 |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX=m1c target/release/harness run` | `=== lane linux-fuse (S3 backend: docker, frontend: fuse)` … `Error: 5 scenario(s) failed: fio-blips, git-under-flock-causal, ack-s3-failover, epoch-slack-zero-unchanged, subtree-confinement` — **177 of 182 passed** (host load average 38–46 on 16 vCPUs, four agents) |
+| rerun alone: `fio-blips`, `epoch-slack-zero-unchanged`, `ack-s3-failover` | `PASSED` in 7.6 s / 90.2 s / 13.1 s — load flakes |
+| rerun alone: `subtree-confinement` | unprivileged: the same `setxattr "trusted.constellation.link_domain" … Operation not permitted` (needs CAP_SYS_ADMIN, as recorded under plan 33 U1 above); under `sudo` (prefix `m1croot`): `=== subtree-confinement PASSED in 3.2s` |
+| rerun alone: `git-under-flock-causal` | `FAILED in 247.7s: reader c: 2 publications visible before an object they depend on …`; **also fails on a clean `main` build** (`fe32940`, release, same host, alone): `FAILED in 600.7s: reader c: 38 publications visible before an object they depend on …` — pre-existing, not this chunk's (M1c touches no data path; the methods are read-only) |
+| `docker compose --profile test run --rm compliance` | **`== results: 8798 passed, 0 failed` / `COMPLIANCE TEST PASSED (baseline: 0 known failures)`**. Run as `docker compose -p m1c -f docker-compose.yml -f <override> --profile test run --rm compliance` with the image built under a private tag from a copy of `tests/docker/Dockerfile` whose `/src/target` cache mount has `id=m1c-target`; see the host notes below |
+
+**Host notes for whoever runs the compliance lane here next.** Three things
+on this shared host, none in the repo: (1) `tests/docker/Dockerfile`'s
+`--mount=type=cache,target=/src/target` is one BuildKit cache shared by every
+worktree; cargo's mtime fingerprints accepted another agent's newer
+`constellation-control` artifact as fresh and the image build failed with
+unresolved imports of this chunk's new types — a private cache `id` fixes it.
+(2) Port 4566 was held by another agent's floci; the override drops the
+`ports:` mapping (the suite reaches floci over the compose network). (3)
+SELinux is **enforcing** on this host: floci cannot execute the bind-mounted
+`floci-init.sh` (`user_home_t`; the override mounts a `/tmp` copy with `:z`),
+and pjdfstest's block/char `mknod`s are denied `create` on `fusefs_t`
+(`avc: denied { create } … container_t … tclass=blk_file`), which surfaced as
+**1798 "regressions"**; `security_opt: label=disable` on the compliance
+container (in the override) gives the full pass.
+
+### Not done here (deliberately)
+
+M2's `policy set/show/ls/rm/pause/resume` and the xattr gate (the
+`SnapshotPolicyCommand` group is where they go), the scheduler (M3), expiry
+(M4), sizes (M5), the UI (M6). `snapshot.policy.simulate` has no CLI verb: the
+brief asks for `check --simulate`, and the timeline is the web UI's.

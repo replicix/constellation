@@ -54,7 +54,7 @@ impl std::error::Error for PolicyError {}
 
 /// Plan 22's duration grammar: `<n><s|m|h|d|w|y>`, every unit a fixed
 /// number of seconds (`m` is minutes; a year is 365 days).
-pub(crate) fn parse_duration(s: &str, off: usize) -> Result<Duration, PolicyError> {
+pub fn parse_duration(s: &str, off: usize) -> Result<Duration, PolicyError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(PolicyError::at(off, "expected a duration"));

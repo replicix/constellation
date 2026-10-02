@@ -343,6 +343,46 @@ pub fn due(policy: &SnapPolicy, policy_ino: u64, snaps: &[SnapFacts], now_ms: i6
 /// truncated answer rather than a hung node.
 pub const MAX_SYNTHETIC: usize = 10_000;
 
+/// The expiry work [`simulate`] will do before it gives up and reports
+/// [`Timeline::truncated`], counted in live candidates evaluated, summed
+/// over every expiry pass.
+///
+/// Capping creations alone does not bound the time: each pass looks at
+/// every live candidate, so a policy that keeps most of what it creates
+/// (`1m:1y`, `1m:*`), or a directory with many existing candidates,
+/// costs the *square* of its creations. 2²⁷ evaluations is about a
+/// second of a release build; the densest policy the plan's examples
+/// table settles (`5m:1d 1h:7d 1d:30d 1w:12w 1mo:1y`, ~114 000
+/// creations over ~400 live) needs under half of it.
+pub const MAX_WORK: u64 = 1 << 27;
+
+/// How much a simulation may do; past any of these it stops and reports
+/// [`Timeline::truncated`]. [`simulate`] runs under
+/// [`SimLimits::DEFAULT`]; `policy check` chooses its own (see
+/// `snapsched::check`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimLimits {
+    /// Synthetic snapshots created.
+    pub max_synthetic: usize,
+    /// Live candidates: the simulation stops before a creation once this
+    /// many of the policy's own snapshots are alive.
+    pub max_live: usize,
+    /// Live candidates evaluated, summed over every expiry pass; see
+    /// [`MAX_WORK`].
+    pub max_work: u64,
+}
+
+impl SimLimits {
+    /// [`simulate`]'s limits: the UI's timeline returns every snapshot,
+    /// so creations are capped at [`MAX_SYNTHETIC`]; the work at
+    /// [`MAX_WORK`] (existing rows can make each pass large).
+    pub const DEFAULT: SimLimits = SimLimits {
+        max_synthetic: MAX_SYNTHETIC,
+        max_live: usize::MAX,
+        max_work: MAX_WORK,
+    };
+}
+
 /// What [`simulate`] returns: every snapshot's fate plus the
 /// snapshot-count-over-time series the UI plots (Step 7.4).
 ///
@@ -363,7 +403,7 @@ pub const MAX_SYNTHETIC: usize = 10_000;
 /// | `expired` | snapshots the simulation expired, existing and synthetic |
 /// | `final_count` | snapshots alive at the horizon |
 /// | `steady_state_bound` | [`SnapPolicy::steady_state_bound`], the plan's upper bound, for comparison |
-/// | `truncated` | the horizon needed more than [`MAX_SYNTHETIC`] creations |
+/// | `truncated` | the simulation stopped before the horizon: it needed more than [`MAX_SYNTHETIC`] creations or [`MAX_WORK`] evaluations ([`SimLimits`]); `counts`' last point is where it stopped |
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Timeline {
     pub policy: String,
@@ -379,6 +419,10 @@ pub struct Timeline {
     pub final_count: u32,
     pub steady_state_bound: Option<u64>,
     pub truncated: bool,
+    /// Live candidates evaluated over every expiry pass, the quantity
+    /// [`SimLimits::max_work`] bounds. Not part of the protocol.
+    #[serde(skip)]
+    pub work: u64,
 }
 
 /// One snapshot in a [`Timeline`]. Field names are stable; see
@@ -443,6 +487,28 @@ pub fn simulate(
     now_ms: i64,
     horizon_ms: i64,
 ) -> Timeline {
+    simulate_capped(
+        policy,
+        policy_ino,
+        existing,
+        now_ms,
+        horizon_ms,
+        SimLimits::DEFAULT,
+    )
+}
+
+/// [`simulate`] under caller-chosen [`SimLimits`] in place of
+/// [`SimLimits::DEFAULT`]. `policy check` wants one settled count, not a
+/// timeline to ship, and a settled yearly policy on a 5-minute cadence
+/// needs ten times the UI's creations (see `snapsched::check`).
+pub fn simulate_capped(
+    policy: &SnapPolicy,
+    policy_ino: u64,
+    existing: &[SnapFacts],
+    now_ms: i64,
+    horizon_ms: i64,
+    limits: SimLimits,
+) -> Timeline {
     let horizon_end = now_ms.saturating_add(horizon_ms.max(0));
     let mut timeline = Timeline {
         policy: policy.to_string(),
@@ -458,6 +524,7 @@ pub fn simulate(
         final_count: 0,
         steady_state_bound: policy.steady_state_bound(),
         truncated: false,
+        work: 0,
     };
 
     let Some(tz) = policy_time_zone(policy) else {
@@ -491,8 +558,7 @@ pub fn simulate(
         &mut live,
         &mut expired_at,
         now_ms,
-        &mut timeline.expired,
-        &mut timeline.counts,
+        &mut timeline,
         live_others,
     );
 
@@ -512,7 +578,10 @@ pub fn simulate(
             let first = covered.partition_point(|c| *c < from);
             let already = covered.get(first).is_some_and(|c| *c < to);
             if !already {
-                if timeline.created as usize >= MAX_SYNTHETIC {
+                if timeline.created as usize >= limits.max_synthetic
+                    || live.len() >= limits.max_live
+                    || timeline.work >= limits.max_work
+                {
                     timeline.truncated = true;
                     break;
                 }
@@ -540,8 +609,7 @@ pub fn simulate(
                     &mut live,
                     &mut expired_at,
                     at,
-                    &mut timeline.expired,
-                    &mut timeline.counts,
+                    &mut timeline,
                     live_others,
                 );
             }
@@ -590,10 +658,10 @@ fn expire_pass(
     live: &mut Vec<Cand>,
     expired_at: &mut [Option<i64>],
     at: i64,
-    expired: &mut u32,
-    counts: &mut Vec<CountPoint>,
+    timeline: &mut Timeline,
     live_others: usize,
 ) {
+    timeline.work = timeline.work.saturating_add(live.len() as u64);
     let keep = rule.keep_mask(live);
     let mut kept: Vec<Cand> = Vec::with_capacity(live.len());
     for (pos, cand) in live.drain(..).enumerate() {
@@ -601,11 +669,11 @@ fn expire_pass(
             kept.push(cand);
         } else {
             expired_at[cand.snap] = Some(at);
-            *expired += 1;
+            timeline.expired += 1;
         }
     }
     *live = kept;
-    counts.push(CountPoint {
+    timeline.counts.push(CountPoint {
         at_unix_ms: at,
         total: (live.len() + live_others) as u32,
         candidates: live.len() as u32,
@@ -1621,6 +1689,39 @@ mod tests {
         let t = simulate(&p, INO, &[], T0, 365 * DAY);
         assert!(t.truncated);
         assert_eq!(t.created as usize, MAX_SYNTHETIC);
+    }
+
+    /// Creations do not bound the time when each pass is large: a
+    /// directory full of candidates the policy keeps makes every pass
+    /// look at all of them. The work cap stops it, the live cap too.
+    #[test]
+    fn simulate_truncates_on_work_and_on_live_candidates() {
+        let p = policy("1m:*");
+        let history: Vec<SnapFacts> = (0..2000).map(|i| auto(T0 + i * MIN)).collect();
+        let now = T0 + 2000 * MIN;
+        let limits = SimLimits {
+            max_work: 100_000,
+            ..SimLimits::DEFAULT
+        };
+        let t = simulate_capped(&p, INO, &history, now, DAY, limits);
+        assert!(t.truncated);
+        // One pass may overshoot the cap by its own size, never more.
+        assert!(t.work >= 100_000 && t.work < 100_000 + 2100, "{}", t.work);
+        assert!(t.created < 60, "{}", t.created);
+        assert!(t.counts.last().unwrap().at_unix_ms < now + DAY);
+
+        let limits = SimLimits {
+            max_live: 2010,
+            ..SimLimits::DEFAULT
+        };
+        let t = simulate_capped(&p, INO, &history, now, DAY, limits);
+        assert!(t.truncated);
+        assert_eq!(t.created, 10);
+        assert_eq!(t.final_count, 2010);
+        // The default work cap does not fire on a plain simulation.
+        let t = simulate(&p, INO, &history, now, HOUR);
+        assert!(!t.truncated);
+        assert!(t.work < MAX_WORK);
     }
 
     /// The serialized shape is part of the control protocol's surface,

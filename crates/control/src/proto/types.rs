@@ -2408,6 +2408,180 @@ pub struct SnapshotHeld {
     pub snapshot: SnapshotStatus,
 }
 
+/// `snapshot.policy.check` (plan 32 Step 5): parse a snapshot-schedule
+/// expression and say what it means, without writing it anywhere.
+///
+/// `against` is a directory path: the policy is evaluated over that
+/// directory's real snapshot rows, as if it were the directory's policy
+/// (`policy_ino` = the path's current inode). `simulate_ms` is the
+/// simulation horizon; absent, the daemon simulates until the policy's
+/// count settles (`constellation_meta::snapsched::check`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyCheckParams {
+    pub expr: String,
+    #[serde(default)]
+    pub against: Option<String>,
+    #[serde(default)]
+    pub simulate_ms: Option<u64>,
+}
+
+/// Where a policy expression fails to parse: the byte offset of the
+/// token at fault (for a caret under it) and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyErrorInfo {
+    pub offset: u64,
+    pub message: String,
+}
+
+/// Why retention keeps a snapshot, in the uniform four-key shape
+/// `constellation_meta::snapsched::Reason` serializes to: `kind` is
+/// `tier` (with `every`, e.g. `"1h"`), `last` (with `last`, the `n` of
+/// `last=n`), `held` (with `held_by`, the owner if recorded), `grace`, or
+/// `not_candidate` (manual, or another root's).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapReason {
+    pub kind: String,
+    #[serde(default)]
+    pub every: Option<String>,
+    #[serde(default)]
+    pub last: Option<u32>,
+    #[serde(default)]
+    pub held_by: Option<String>,
+}
+
+/// One real snapshot's fate under a checked policy: its identity, the
+/// facts retention read (`origin`, `policy_ino`, `held`, `held_by`,
+/// `created_unix_ms`), and the verdict. `keep: false` means the policy,
+/// were it set on that directory, would expire it; `reasons` is empty
+/// exactly then. `expires_unix_ms` is the display forecast (absent when
+/// kept forever or already expired).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapVerdict {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub created_unix_ms: i64,
+    pub origin: String,
+    pub policy_ino: u64,
+    pub held: bool,
+    #[serde(default)]
+    pub held_by: Option<String>,
+    pub keep: bool,
+    pub reasons: Vec<SnapReason>,
+    #[serde(default)]
+    pub expires_unix_ms: Option<i64>,
+}
+
+/// `snapshot.policy.check`'s `against`: the directory's snapshots, how
+/// many the policy would expire, and every verdict, oldest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyAgainst {
+    pub path: String,
+    pub policy_ino: u64,
+    pub snapshots: u32,
+    pub would_expire: u32,
+    pub verdicts: Vec<SnapVerdict>,
+}
+
+/// `snapshot.policy.check`'s result. A parse error is a *result*
+/// (`ok: false`, `error` set, everything else empty), not a failed call:
+/// checking an expression that turns out invalid is the method working.
+///
+/// `simulated_count` is the policy's own snapshots alive after
+/// `simulate_horizon_ms` of simulated schedule (over the `against`
+/// directory's history when given, an empty one otherwise);
+/// `simulate_truncated` means the simulation hit its work limits before
+/// the horizon (a policy that keeps most of what it creates, or a very
+/// fine cadence), and the count is where it stopped:
+/// `simulate_reached_ms` after the start, always set alongside
+/// `simulated_count`. `steady_state_bound` is the plan's upper bound, absent for a
+/// policy with a `*` tier.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyCheckResult {
+    pub ok: bool,
+    #[serde(default)]
+    pub canonical: Option<String>,
+    #[serde(default)]
+    pub error: Option<PolicyErrorInfo>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub steady_state_bound: Option<u64>,
+    #[serde(default)]
+    pub simulated_count: Option<u64>,
+    #[serde(default)]
+    pub simulate_horizon_ms: Option<u64>,
+    #[serde(default)]
+    pub simulate_truncated: bool,
+    #[serde(default)]
+    pub simulate_reached_ms: Option<u64>,
+    #[serde(default)]
+    pub against: Option<SnapPolicyAgainst>,
+}
+
+/// `snapshot.policy.simulate` (plan 32 Step 2 "Simulation", Step 7.4):
+/// run `expr` forward for `horizon_ms` from the daemon's clock, over the
+/// snapshots of `path` (as that directory's policy) or over nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicySimulateParams {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub expr: String,
+    pub horizon_ms: u64,
+}
+
+/// `snapshot.policy.simulate`'s result: `constellation_meta::snapsched::
+/// Timeline`, field for field (its docs are the reference). The daemon's
+/// clock only places the synthetic future ticks; `now_unix_ms` says
+/// which instant that was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapTimeline {
+    pub policy: String,
+    pub policy_ino: u64,
+    pub paused: bool,
+    pub now_unix_ms: i64,
+    pub horizon_unix_ms: i64,
+    #[serde(default)]
+    pub cadence: Option<String>,
+    pub snapshots: Vec<SnapTimelineEntry>,
+    pub counts: Vec<SnapCountPoint>,
+    pub created: u32,
+    pub expired: u32,
+    pub final_count: u32,
+    #[serde(default)]
+    pub steady_state_bound: Option<u64>,
+    pub truncated: bool,
+}
+
+/// One snapshot of a [`SnapTimeline`]: an existing one, or one the
+/// simulation invented (`synthetic`, named as the scheduler would name
+/// it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapTimelineEntry {
+    pub id: String,
+    pub created_unix_ms: i64,
+    pub synthetic: bool,
+    pub candidate: bool,
+    pub held: bool,
+    #[serde(default)]
+    pub held_by: Option<String>,
+    pub keep: bool,
+    pub reasons: Vec<SnapReason>,
+    #[serde(default)]
+    pub expires_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub expired_unix_ms: Option<i64>,
+}
+
+/// One step of a [`SnapTimeline`]'s count-over-time series: every live
+/// snapshot (`total`) and the policy's own (`candidates`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapCountPoint {
+    pub at_unix_ms: i64,
+    pub total: u32,
+    pub candidates: u32,
+}
+
 /// `snapshot.refs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RefHashes {

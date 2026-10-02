@@ -9,7 +9,7 @@
 //! embedding host calls it in-process through the same [`Router`]. It lives
 //! in the engine, not in the CLI, because every host of an engine (the
 //! desktop daemon today; plan 37's CSI engine pod, plan 36's Android
-//! service) needs the same 58 methods with the same semantics, and
+//! service) needs the same 60 methods with the same semantics, and
 //! everything they touch — the metadata replica, the sync task, the
 //! snapshot manager, the registry, the op watchdog — is the engine's.
 //!
@@ -42,12 +42,15 @@
 //!   watcher started with the first subscriber).
 //! - `node.lifecycle` (plan 31 C8): a host lifecycle event, applied by the
 //!   engine before the answer ([`lifecycle`]).
+//!
+//! Plan 32's `snapshot.policy.*` methods live in [`snapsched`].
 
 mod browse;
 mod fs;
 mod lifecycle;
 mod ops;
 mod service;
+pub mod snapsched;
 mod streams;
 
 #[cfg(test)]
@@ -535,6 +538,7 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     unary::<CloneCreate>(r, svc, |s, _, p| {
         ack(s.clone_snapshot(&p.selector, &p.destination))
     });
+    snapsched::register(r, svc);
 
     // ---- browse ----
     unary::<BrowseReaddir>(r, svc, |s, _, p| {

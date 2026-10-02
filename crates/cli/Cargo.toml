@@ -26,6 +26,7 @@ futures.workspace = true
 constellation-net.workspace = true
 constellation-store-s3.workspace = true
 anyhow.workspace = true
+jiff.workspace = true
 clap.workspace = true
 libc.workspace = true
 object_store.workspace = true

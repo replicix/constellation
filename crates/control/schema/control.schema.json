@@ -4276,6 +4276,24 @@
       ],
       "type": "object"
     },
+    "PolicyErrorInfo": {
+      "description": "Where a policy expression fails to parse: the byte offset of the\ntoken at fault (for a caret under it) and why.",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "offset": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset",
+        "message"
+      ],
+      "type": "object"
+    },
     "Pong": {
       "description": "`node.ping`'s answer.",
       "type": "object"
@@ -5016,6 +5034,244 @@
       ],
       "type": "object"
     },
+    "SnapCountPoint": {
+      "description": "One step of a [`SnapTimeline`]'s count-over-time series: every live\nsnapshot (`total`) and the policy's own (`candidates`).",
+      "properties": {
+        "at_unix_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "candidates": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "at_unix_ms",
+        "total",
+        "candidates"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyAgainst": {
+      "description": "`snapshot.policy.check`'s `against`: the directory's snapshots, how\nmany the policy would expire, and every verdict, oldest first.",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "policy_ino": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshots": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verdicts": {
+          "items": {
+            "$ref": "#/$defs/SnapVerdict"
+          },
+          "type": "array"
+        },
+        "would_expire": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "policy_ino",
+        "snapshots",
+        "would_expire",
+        "verdicts"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyCheckParams": {
+      "description": "`snapshot.policy.check` (plan 32 Step 5): parse a snapshot-schedule\nexpression and say what it means, without writing it anywhere.\n\n`against` is a directory path: the policy is evaluated over that\ndirectory's real snapshot rows, as if it were the directory's policy\n(`policy_ino` = the path's current inode). `simulate_ms` is the\nsimulation horizon; absent, the daemon simulates until the policy's\ncount settles (`constellation_meta::snapsched::check`).",
+      "properties": {
+        "against": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expr": {
+          "type": "string"
+        },
+        "simulate_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "expr"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyCheckResult": {
+      "description": "`snapshot.policy.check`'s result. A parse error is a *result*\n(`ok: false`, `error` set, everything else empty), not a failed call:\nchecking an expression that turns out invalid is the method working.\n\n`simulated_count` is the policy's own snapshots alive after\n`simulate_horizon_ms` of simulated schedule (over the `against`\ndirectory's history when given, an empty one otherwise);\n`simulate_truncated` means the simulation hit its work limits before\nthe horizon (a policy that keeps most of what it creates, or a very\nfine cadence), and the count is where it stopped:\n`simulate_reached_ms` after the start, always set alongside\n`simulated_count`. `steady_state_bound` is the plan's upper bound, absent for a\npolicy with a `*` tier.",
+      "properties": {
+        "against": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SnapPolicyAgainst"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "canonical": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyErrorInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "simulate_horizon_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "simulate_reached_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "simulate_truncated": {
+          "default": false,
+          "type": "boolean"
+        },
+        "simulated_count": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "steady_state_bound": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "warnings": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "SnapPolicySimulateParams": {
+      "description": "`snapshot.policy.simulate` (plan 32 Step 2 \"Simulation\", Step 7.4):\nrun `expr` forward for `horizon_ms` from the daemon's clock, over the\nsnapshots of `path` (as that directory's policy) or over nothing.",
+      "properties": {
+        "expr": {
+          "type": "string"
+        },
+        "horizon_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "expr",
+        "horizon_ms"
+      ],
+      "type": "object"
+    },
+    "SnapReason": {
+      "description": "Why retention keeps a snapshot, in the uniform four-key shape\n`constellation_meta::snapsched::Reason` serializes to: `kind` is\n`tier` (with `every`, e.g. `\"1h\"`), `last` (with `last`, the `n` of\n`last=n`), `held` (with `held_by`, the owner if recorded), `grace`, or\n`not_candidate` (manual, or another root's).",
+      "properties": {
+        "every": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "held_by": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "last": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
     "SnapRefsParams": {
       "description": "`snapshot.refs`.",
       "properties": {
@@ -5025,6 +5281,218 @@
       },
       "required": [
         "id"
+      ],
+      "type": "object"
+    },
+    "SnapTimeline": {
+      "description": "`snapshot.policy.simulate`'s result: `constellation_meta::snapsched::\nTimeline`, field for field (its docs are the reference). The daemon's\nclock only places the synthetic future ticks; `now_unix_ms` says\nwhich instant that was.",
+      "properties": {
+        "cadence": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "counts": {
+          "items": {
+            "$ref": "#/$defs/SnapCountPoint"
+          },
+          "type": "array"
+        },
+        "created": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expired": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "final_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "horizon_unix_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "now_unix_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "policy": {
+          "type": "string"
+        },
+        "policy_ino": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshots": {
+          "items": {
+            "$ref": "#/$defs/SnapTimelineEntry"
+          },
+          "type": "array"
+        },
+        "steady_state_bound": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "policy",
+        "policy_ino",
+        "paused",
+        "now_unix_ms",
+        "horizon_unix_ms",
+        "snapshots",
+        "counts",
+        "created",
+        "expired",
+        "final_count",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "SnapTimelineEntry": {
+      "description": "One snapshot of a [`SnapTimeline`]: an existing one, or one the\nsimulation invented (`synthetic`, named as the scheduler would name\nit).",
+      "properties": {
+        "candidate": {
+          "type": "boolean"
+        },
+        "created_unix_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "expired_unix_ms": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "expires_unix_ms": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "held": {
+          "type": "boolean"
+        },
+        "held_by": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "keep": {
+          "type": "boolean"
+        },
+        "reasons": {
+          "items": {
+            "$ref": "#/$defs/SnapReason"
+          },
+          "type": "array"
+        },
+        "synthetic": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "created_unix_ms",
+        "synthetic",
+        "candidate",
+        "held",
+        "keep",
+        "reasons"
+      ],
+      "type": "object"
+    },
+    "SnapVerdict": {
+      "description": "One real snapshot's fate under a checked policy: its identity, the\nfacts retention read (`origin`, `policy_ino`, `held`, `held_by`,\n`created_unix_ms`), and the verdict. `keep: false` means the policy,\nwere it set on that directory, would expire it; `reasons` is empty\nexactly then. `expires_unix_ms` is the display forecast (absent when\nkept forever or already expired).",
+      "properties": {
+        "created_unix_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "expires_unix_ms": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "held": {
+          "type": "boolean"
+        },
+        "held_by": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "keep": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "origin": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "policy_ino": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reasons": {
+          "items": {
+            "$ref": "#/$defs/SnapReason"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "path",
+        "name",
+        "created_unix_ms",
+        "origin",
+        "policy_ino",
+        "held",
+        "keep",
+        "reasons"
       ],
       "type": "object"
     },
@@ -7541,6 +8009,28 @@
       },
       "result": {
         "$ref": "#/$defs/SnapshotListing"
+      },
+      "streaming": "none"
+    },
+    "snapshot.policy.check": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/SnapPolicyCheckParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapPolicyCheckResult"
+      },
+      "streaming": "none"
+    },
+    "snapshot.policy.simulate": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/SnapPolicySimulateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapTimeline"
       },
       "streaming": "none"
     },

@@ -22,7 +22,7 @@
 //!
 //! Because [`METHODS`], [`visit_all`] and the `impl Method` blocks come out of
 //! the same macro invocation, "a method exists but is missing from the table"
-//! cannot happen; the tests instead pin the *contents* (58 methods, no
+//! cannot happen; the tests instead pin the *contents* (60 methods, no
 //! duplicates, every one of the 37 old `Request` variants maps to exactly
 //! one).
 //!
@@ -37,7 +37,7 @@
 //!
 //! | class | role | methods |
 //! |---|---|---|
-//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
+//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs`, `snapshot.policy.check/simulate`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
 //! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
 //! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
@@ -277,6 +277,20 @@ define_methods! {
         params: SnapshotHoldParams, result: SnapshotHeld }
     SnapshotRefs { name: "snapshot.refs", role: Viewer, mutating: false, stream: None,
         params: SnapRefsParams, result: RefHashes }
+    /// Parse a snapshot-schedule expression and report its canonical
+    /// form, warnings, steady-state bound and simulated count; with
+    /// `against`, evaluate it over that directory's real snapshots as if
+    /// it were the directory's policy (plan 32 Step 5). Reads only: an
+    /// invalid expression is an `ok: false` result carrying the byte
+    /// offset, not a failed call.
+    SnapshotPolicyCheck { name: "snapshot.policy.check", role: Viewer, mutating: false, stream: None,
+        params: SnapPolicyCheckParams, result: SnapPolicyCheckResult }
+    /// Run a policy expression forward from the daemon's clock for
+    /// `horizon_ms`, over `path`'s snapshots or none: every snapshot's
+    /// fate and the count over time (plan 32 Step 2 "Simulation", the web
+    /// UI's retention timeline). An invalid expression is `invalid`.
+    SnapshotPolicySimulate { name: "snapshot.policy.simulate", role: Viewer, mutating: false, stream: None,
+        params: SnapPolicySimulateParams, result: SnapTimeline }
     /// Clone a snapshot to a destination path.
     CloneCreate { name: "clone.create", role: Operator, mutating: true, stream: None,
         params: CloneParams, result: Ack }
@@ -471,8 +485,8 @@ mod tests {
         assert_eq!(unique.len(), METHODS.len(), "duplicate method names");
         assert_eq!(
             METHODS.len(),
-            58,
-            "36 old methods + 21 new ones + snapshot.hold"
+            60,
+            "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate"
         );
         for m in METHODS {
             assert!(
@@ -551,8 +565,11 @@ mod tests {
             "quota.get",
             "browse.read",
             "view.stats",
+            "snapshot.policy.check",
+            "snapshot.policy.simulate",
         ] {
             assert_eq!(role(n), Role::Viewer, "{n}");
+            assert!(!method_info(n).unwrap().mutating, "{n}");
         }
         for n in [
             "pin.add",

@@ -267,6 +267,96 @@ fn smoke(m: &mut Mount, work: &Path) -> Result<()> {
         "FAIL: old name still present"
     );
 
+    say("snapshot policy check (local, caret, truncated, --json, --against a held snapshot)");
+    let state = m.state.display().to_string();
+    let local = m
+        .cmd(&["snapshot", "policy", "check", "1d:7d 1h:1d"])
+        .output()?;
+    let text = String::from_utf8_lossy(&local.stdout);
+    ensure!(
+        local.status.success()
+            && text.contains("ok: 1h:1d 1d:7d")
+            && text.contains("steady-state bound: <= 31")
+            && text.contains("simulated: "),
+        "FAIL: policy check: {text}"
+    );
+    let bad = m
+        .cmd(&["snapshot", "policy", "check", "1h:1d 7m:1d"])
+        .output()?;
+    let err = String::from_utf8_lossy(&bad.stderr);
+    ensure!(
+        bad.status.code() == Some(2) && err.contains("1h:1d 7m:1d\n      ^ "),
+        "FAIL: policy check of an invalid policy ({}): {err}",
+        bad.status
+    );
+    // A policy that keeps everything stops early, and says where.
+    let dense = m.cmd(&["snapshot", "policy", "check", "1m:*"]).output()?;
+    let text = String::from_utf8_lossy(&dense.stdout);
+    ensure!(
+        dense.status.success()
+            // 4095 minutes from a `now` that is not on the minute.
+            && text.contains("simulated: at least 4096 snapshots after 2d20h1")
+            && text.contains("(stopped early"),
+        "FAIL: policy check of a keep-everything policy: {text}"
+    );
+    // `--json` reports a parse error as JSON with or without `--against`
+    // (the expression is checked before any daemon is asked).
+    let bad_json = m
+        .cmd(&[
+            "snapshot",
+            "policy",
+            "check",
+            "1h:1d 7m:1d",
+            "--json",
+            "--against",
+            "/dir",
+            "--state-dir",
+            &state,
+        ])
+        .output()?;
+    let parsed: serde_json::Value = serde_json::from_slice(&bad_json.stdout)
+        .context("FAIL: policy check --json --against: not JSON")?;
+    ensure!(
+        bad_json.status.code() == Some(2)
+            && parsed["ok"] == false
+            && parsed["error"]["offset"] == 6,
+        "FAIL: policy check --json of an invalid policy ({}): {parsed}",
+        bad_json.status
+    );
+    let held = m
+        .cmd(&[
+            "snapshot",
+            "create",
+            "/dir@smoke",
+            "--by",
+            "csi:smoke",
+            "--state-dir",
+            &state,
+        ])
+        .status()?;
+    ensure!(held.success(), "FAIL: snapshot create --by ({held})");
+    let against = m
+        .cmd(&[
+            "snapshot",
+            "policy",
+            "check",
+            "1h:1d",
+            "--against",
+            "/dir",
+            "--state-dir",
+            &state,
+        ])
+        .output()?;
+    let text = String::from_utf8_lossy(&against.stdout);
+    ensure!(
+        against.status.success()
+            && text.contains("would expire 0 of 1 snapshots")
+            && text.contains("held: csi"),
+        "FAIL: policy check --against ({}): {text}{}",
+        against.status,
+        String::from_utf8_lossy(&against.stderr)
+    );
+
     say("multi-chunk file (3.5 MiB across 1 MiB chunks)");
     let reference = work.join("random.bin");
     let mut data = random_bytes(3 << 20)?;
