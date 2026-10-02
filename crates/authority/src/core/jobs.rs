@@ -626,16 +626,30 @@ impl Core {
 
     /// Apply a probed run. `Ok(true)` when the run was saturated (the
     /// caller probes again).
+    ///
+    /// `round`: a round's tail, which a live log stream may race — a
+    /// tail leaves the cursor free, so the stream applies what arrives
+    /// while the GETs are out. A run whose last segment the stream had
+    /// already applied is then no sign that S3 is ahead of this node:
+    /// the stream reached the run's end first, and this round's follow-up
+    /// would be a full-width run of 404s (`visibility-after-burst`: the
+    /// one-GET backstop probe "hit" the marker the stream had just
+    /// delivered, and 16 GETs followed — 17 tail GETs in about one run
+    /// in three). An acquisition's tail keeps probing on any full run:
+    /// it must reach the head before its CAS.
     fn apply_run(
         &mut self,
         now: Ms,
         run: Vec<(Seq, Vec<u8>)>,
+        round: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<bool, String> {
         let width = self.job.as_ref().map(|j| j.width).unwrap_or(1);
         let n = run.len();
+        let mut last_new = false;
         for (seq, payload) in run {
+            last_new = seq >= self.ship.next_seq;
             self.apply_incoming(now, seq, &payload, replica, out)
                 .map_err(|e| e.to_string())?;
         }
@@ -643,7 +657,7 @@ impl Core {
             self.stats.segments_applied += n as u64;
             self.answer_awaiting_log(now, replica, out);
         }
-        Ok(n >= width && n > 0)
+        Ok(n >= width && n > 0 && (last_new || !round))
     }
 
     /// `Shipper::apply_decoded_segment`: own-segment recovery, epoch
@@ -2854,7 +2868,8 @@ impl Core {
                 // which read as an S3 client that never recovered.)
                 self.ship.last_error = None;
                 let empty = run.is_empty();
-                match self.apply_run(now, run, replica, out) {
+                let round = matches!(then, TailThen::Round);
+                match self.apply_run(now, run, round, replica, out) {
                     Ok(true) => self.issue_tail(out),
                     Ok(false) if empty && self.gap_check_due(now, then) => {
                         self.issue_gap_check(then, out)

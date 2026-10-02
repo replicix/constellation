@@ -562,23 +562,41 @@ pub fn ack_s3_failover(_seed: u64) -> Result<()> {
         std::fs::write(clients[1].mnt.join("after-freeze"), b"after-freeze")
             .context("B's write after A froze")?;
         let took = t.elapsed();
-        let b_lease = lease_of(&clients[1])?;
-        let b = ack_of(&clients[1])?;
-        print_ack(NAME, "B", &b);
-        eprintln!("    {NAME}: B's write returned {took:?} after A froze; B's lease {b_lease}");
-        anyhow::ensure!(
-            b_lease["held"] == true && b_lease["epoch"].as_u64().unwrap_or(0) > epoch,
-            "B does not hold a newer epoch: {b_lease}"
-        );
+        eprintln!("    {NAME}: B's write returned {took:?} after A froze");
         anyhow::ensure!(
             frozen.elapsed() < Duration::from_millis(TTL_MS / 2),
             "the takeover took {:?}: not the fast path (TTL {TTL_MS} ms)",
             frozen.elapsed()
         );
+        // Every live non-holder watches the holder's stream under `ack=s3`
+        // and races for the log slot once it falls silent (the slot's CAS
+        // picks one): the plan promises that *a* live node takes over
+        // fast, not which one. B's write returned, so it either holds the
+        // lease or forwarded to the winner; find the winner by its epoch.
+        let mut winner = None;
+        for (i, c) in clients.iter().enumerate().skip(1) {
+            let l = lease_of(c)?;
+            let ack = ack_of(c)?;
+            print_ack(NAME, &c.name, &ack);
+            eprintln!("    {NAME}: {}'s lease {l}", c.name);
+            if l["held"] == true && l["epoch"].as_u64().unwrap_or(0) > epoch {
+                anyhow::ensure!(
+                    winner.is_none(),
+                    "two live nodes hold a newer epoch than {epoch}"
+                );
+                winner = Some((i, ack));
+            }
+        }
+        let Some((w, w_ack)) = winner else {
+            bail!("no live node holds an epoch newer than A's {epoch}");
+        };
+        eprintln!("    {NAME}: {} took the lease over", clients[w].name);
         anyhow::ensure!(
-            n(&b, "s3_fast_takeovers") >= 1,
-            "B did not take over fast: {b}"
+            n(&w_ack, "s3_fast_takeovers") >= 1,
+            "{} holds the lease but did not take it over fast: {w_ack}",
+            clients[w].name
         );
+        all_visible(&clients[w], &names, Duration::from_secs(10))?;
         all_visible(&clients[1], &names, Duration::from_secs(10))?;
         clients[0].resume()?;
         eventually("A learns it was deposed", Duration::from_secs(30), || {

@@ -2199,6 +2199,13 @@ mod tests {
         let store = Arc::new(ChunkStore::new(s3));
         let chunks: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8 + 1; CHUNK]).collect();
         let hashes: Vec<ChunkHash> = chunks.iter().map(|d| ChunkHash::of(d)).collect();
+        // Warm-up chunks, not part of the burst: B's first peer fetch
+        // dials A, and under host load that dial alone can outlast the
+        // 2 s a queued chunk may wait for a slot (the S3 ETA), sending
+        // the queued half to S3 for a reason that is not the cap's.
+        const WARM: usize = 4;
+        let warm: Vec<Vec<u8>> = (0..WARM).map(|i| vec![0x80 + i as u8; CHUNK]).collect();
+        let warm_hashes: Vec<ChunkHash> = warm.iter().map(|d| ChunkHash::of(d)).collect();
 
         let cache_a = Arc::new(DiskCache::open(dir.path().join("a"), 4 << 20).unwrap());
         let a = Coop::new_with_config(
@@ -2210,7 +2217,11 @@ mod tests {
             test_config(DigestMode::Exact),
         );
         let _ = cache_a.take_digest_events();
-        for (h, data) in hashes.iter().zip(&chunks) {
+        for (h, data) in hashes
+            .iter()
+            .zip(&chunks)
+            .chain(warm_hashes.iter().zip(&warm))
+        {
             store
                 .put_chunk(h, data, CompressionSetting::RAW)
                 .await
@@ -2246,6 +2257,24 @@ mod tests {
             }
         }
         assert_eq!(b.holders(&hashes[0]), vec![1], "B's mirror names A");
+        // The connection is up before the burst, as the scenario's
+        // reader's is: one warm-up chunk at a time until one comes from
+        // the peer (an earlier one may have gone to S3 on the dial).
+        let mut warmed = false;
+        for (h, want) in warm_hashes.iter().zip(&warm) {
+            let hits = b.report().peer_hits;
+            assert_eq!(&b.fetch(h).await.expect("warm-up fetch failed"), want);
+            if b.report().peer_hits > hits {
+                warmed = true;
+                break;
+            }
+        }
+        assert!(
+            warmed,
+            "no warm-up chunk came from the peer: {:?}",
+            b.report()
+        );
+        let before = b.report();
 
         let fetched = futures::future::join_all(hashes.iter().map(|h| b.fetch(h))).await;
         for (got, want) in fetched.into_iter().zip(&chunks) {
@@ -2253,9 +2282,13 @@ mod tests {
         }
         let status = b.report();
         assert_eq!(
-            (status.peer_hits, status.s3_fetches),
+            (
+                status.peer_hits - before.peer_hits,
+                status.s3_fetches - before.s3_fetches
+            ),
             (N as u64, 0),
-            "every chunk of the burst must come from the peer: {status:?}"
+            "every chunk of the burst must come from the peer: {status:?} (before the burst \
+             {before:?})"
         );
         assert_eq!(status.peer_false_positives, 0);
         assert_eq!(status.peer_stale_misses, 0);

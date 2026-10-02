@@ -33523,3 +33523,163 @@ each), and a `perf record` of passes 3–5 at 2048 files put them at parity
   small hot snapshot set is served from memory and never by passthrough;
   its daemon CPU is the ordinary path's. A CPU win for that shape would
   need passthrough to beat a memory hit, which it did not on this host.
+
+## Fix: load-exposed flakes, round 4 (`fix-flakes-4`)
+
+Six items failed once in today's gate runs and passed when rerun alone.
+Two are real product costs: a follower's S3 tail after its log stream
+went or raced it was a full-width run of 404s. Three are tests that
+asserted something the system does not promise. One was the P2P stall
+that `p2p-addr-churn` (6677eea) already fixed.
+
+### 1. `ack-s3-failover`: the oracle assumed B wins (test)
+
+Every live non-holder runs `watch_s3_holder` under `ack=s3`. Each one
+that sees the holder's stream fall silent claims the log slot, and the
+slot's CAS picks one of them. Plan 30 §M9 promises a fast takeover
+without a backup. It does not promise which peer takes over. The
+scenario wrote through B and required B's lease to be newer, so it
+failed whenever C won (the failing gate run: "B does not hold a newer
+epoch … holder 3"). Run 7 of the 10 below also went to C.
+
+The oracle now checks that B's write returns inside TTL/2, and that
+exactly one live node (B or C) holds an epoch newer than A's and counts
+an `s3_fast_takeover`. Every acknowledged file must be visible on that
+winner and on B. The deposition and no-conflict checks are unchanged.
+`crates/harness/src/scenarios/m9.rs`, TESTING.md.
+
+### 2. `sqlite-first-touch-latency`: the P2P stall from bridge churn (fixed already)
+
+The kept logs of the failing run
+(`/tmp/harness-sqlite-first-touch-latency-logs-1790941416537141919`,
+11:39–11:43 UTC) show what SQLite waited on. It was not a lock grant, a
+cold read or a forward timeout of its own. In round 22, c's `fsync`
+(a forwarded `SetManifest`) waited 55.8 s in the inbox: "the holder is
+reachable over P2P now; forwarding the waiting op" at 11:41:27. c had
+lost its gossip neighbour a at 11:40:35, 4 s after another agent's
+docker bridge `br-2fd9f1e8b0c8` was removed (journal 11:40:31,
+`activated -> unmanaged`). The link stayed down for about a minute
+(`LastOpenPath`), and SQLite's lock lapsed under the stall: the
+`disk I/O error` is the fence. Round 45 ("database is locked" after
+36.6 s) is the same stall: bridges were removed at 11:42:30 and 11:42:37,
+all three nodes lost gossip neighbours between 11:42:41 and 11:43:16,
+and a create waited 34.7 s.
+
+That run predates 6677eea (13:00 UTC), which stops advertising
+container interfaces and resets only the links whose path used a lost
+address. The bound is realistic. On this tree, 10/10 runs finished their
+50 rounds in 113.7–118.6 s with 0 failed rounds, while the host removed
+205 docker bridges over the 26 minutes of those runs.
+
+### 3. `idle-cost`: a dropped caught-up stream fell back to a 16-GET speculative tail (product)
+
+In the failing gate run (z3b, 10:09 UTC, also before 6677eea), b made
+75 `GET log` in the window against its peers' 11. Every other area
+matched theirs, including `GET commits` 9. An idle follower's ~11 GETs
+are its stream's 10 s backstop probes, one GET each. The surplus is
+64 = 4 × 16, which is four full-width (`tail_width` 16) speculative
+runs of 404s. Each time a live stream drops (a heartbeat late past
+`stream_timeout_ms` under load, or a P2P path stall),
+`drop_subscription` nudges a round. That round is not "caught up", so
+`stream_tail_width` returned the full width, although the stream had
+just reported a head the cursor was past.
+
+**Fix:** `crates/authority/src/core/stream.rs`. `StreamState` gains
+`dropped_caught_up`. It is set when a subscription goes while it was
+caught up (live, nothing buffered, cursor past its last head) and
+cleared by the next live frame. While it is set and no gossip hint
+names a sequence past the cursor, `stream_tail_width` returns 1. A
+narrow probe that hits is followed by a full-width run, the existing
+R2-2 saturation rule, so the follower never stops short of the head.
+Each drop now costs 1 GET instead of 16.
+
+The budget (60/min, twice the measured cost) stays. It was honest:
+the overshoot was a real cost per stream drop, not measurement noise.
+The scenario now prints each node's log-stream state and its subscribe,
+timeout, lost and ended deltas in the window, so the next overshoot can
+be attributed from its output.
+
+Regression test:
+`core::tests::a_dropped_caught_up_stream_tails_one_get_wide`. A
+caught-up stream times out. Each of the next three rounds probes 1
+GET. A probe that hits is followed by a full-width run from past it.
+Before the fix the first round after the drop runs 16 wide
+("left: [16] right: [1]").
+
+### 4. `visibility-after-burst`: a backstop probe the stream overtook counted as saturated (product)
+
+The previous `visibility-after-burst` fix (plan 30 M9 review round 3)
+explained the "17 tail GETs" by journal holes. This chunk reproduced it
+with that fix in place: 1 run in 3 at load 13, and again with
+`VIS_RUST_LOG` stream tracing and `CHAOS_KEEP_TMP`. The status in those
+runs showed 1 subscribe, 0 timeouts, 0 gaps, a live stream, and every
+segment applied by the stream ("stream apply" for each seq, none from
+the tail). The count is always 1 + 16. The one-GET backstop probe is
+in flight when the holder ships the next marker. The S3 PUT lands, then
+the stream frame arrives. A `Phase::Tail` leaves the cursor free, so the
+stream applies the segment, and the probe returns that same segment.
+`apply_run` counted the duplicate toward saturation and issued a
+full-width run of 16 404s.
+
+**Fix:** `crates/authority/src/core/jobs.rs`. In a round's tail
+(`TailThen::Round`), `apply_run` treats a full run as saturated only if
+its last segment was new to this node. If the stream already applied
+it, the stream reached the run's end first, and S3 is not known to be
+ahead. An acquisition's tails (catch-up, marker, takeover) still probe
+again on any full run: they must reach the head before their CAS.
+
+Regression test: `core::tests::a_probe_the_stream_overtook_is_not_saturated`.
+The backstop probe for segment 1 is in flight, the stream delivers
+segment 1, and the probe answers with it. No follow-up run may be
+issued. Before the fix it issues one.
+
+### 5. `coop::tests::a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3` (test)
+
+There was no record of the failure's output, and it did not reproduce
+here: 15/15 runs pinned to one CPU before the change. The test uses real
+iroh endpoints. The burst's first fetch also dialed A, so the time to
+set up the connection counted against the 2 s that each queued chunk
+may wait for a serving slot (the S3 ETA). A dial slowed by load (or by
+the bridge churn above) sent the queued half to S3. That is correct
+product behaviour (S3 really was sooner), not the `Busy` spill the test
+guards. Now the test first fetches warm-up chunks, one at a time, until
+one comes from the peer. It then asserts on the burst's deltas: N peer
+hits and 0 S3 fetches. A `Busy` decline still spills to S3 whatever the
+ETA, so the regression it was written for still fails it.
+`crates/engine/src/coop.rs`.
+
+### 6. `harness::s3_cut_heal::a_cut_in_the_middle_of_a_burst_heals_at_once` (test)
+
+The recorded failure (38-z3b's gate) is `up.served >= served + BURST`
+in `recovers`. The stand-in upstream bumped `served` only after its
+last `write_all` returned. A client that had read the whole answer
+could check the count before that thread ran again. The claim is that
+the requests reached S3, so the upstream now counts `received`, before
+it answers.
+
+A second timing assumption is gone too. The tests slept 150 ms after
+starting the in-flight burst and assumed it was still in flight
+against a 400 ms upstream delay. A starved runtime could overshoot that
+window, and the whole burst would complete before the cut or the black
+hole. The upstream now holds its answers. The tests wait until it has
+read all 15 requests, cut or black-hole the path, and only then let the
+answers go. The while-cut check is exact: no request reaches the
+upstream through the cut (it was `served <= served_at_cut + BURST`).
+`crates/harness/tests/s3_cut_heal.rs`.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `ff4`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p <crate> --no-fail-fast`, every package | 0 failed: engine 487, meta 281, store-s3 227, authority 157 + 4 + 107 (sim), control 135, net 119, model 122 (debug) + `positions` 9 and `today_bugs` 7 (release; the debug run of the whole crate exceeded the 10-minute tool limit, and the model crate depends on no other workspace crate), mtree 71, fs-core 68, vfs 58, csi 57, harness 51, frontend-fuse 51, chaos 37, platform 35, constellation 44, types 26, upload-concurrency 11, uploadbench 4 |
+| `cargo test -p constellation-authority --release --test sim -- --ignored --exact long_random long_backup` | 2 passed |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| unit loops (50× plain + 10× `taskset -c 0`) | `a_dropped_caught_up_stream_tails_one_get_wide` 60/60, `a_probe_the_stream_overtook_is_not_saturated` 60/60, `a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3` 60/60, `a_cut_in_the_middle_of_a_burst_heals_at_once` 60/60; also `a_black_hole_in_the_middle_of_a_burst_heals_at_once` 20 + 10 pinned |
+| `harness run ack-s3-failover` ×10 | 10/10 PASSED (B won 9, C won 1; B's write returned in 1.6–2.9 s) |
+| `harness run visibility-after-burst` ×10 (load 38–46) | 10/10 PASSED, streams on 0–1 tail GETs per poller (streams off 1 286–1 722). Before the jobs.rs fix: 2 of 6 failed with 17 |
+| `harness run idle-cost` ×10 | 10/10 PASSED: holder 27.0/min, followers 29.0–29.5 (two runs at load ≈ 81) |
+| `harness run idle-cost-link-flap` ×10 | 10/10 PASSED: holder 41.5/min, followers 29.5–30.5 (one run at load 98) |
+| `harness run sqlite-first-touch-latency` ×10 | 10/10 PASSED, 0 failed rounds, 122–135 s |
+| `harness run visibility-s3-latency e2e-two-nodes backup-failover lease-handover holder-publishes-log-prefix p2p-handover` | ALL SCENARIOS PASSED |

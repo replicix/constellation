@@ -1464,8 +1464,11 @@ relay of its own so requests can be attributed per role):
     under 12 s. Prints `inbox.leases_kept_for_p2p_side`.
   - `idle-cost`: four converged nodes idle for 120 s on the product's
     default intervals; S3 requests per node per minute by kind and key
-    area, on each node's relay and in `status.s3` (they agree). Budget
-    60/min per node (measured ~40).
+    area, on each node's relay and in `status.s3` (they agree), and
+    each node's log stream in the window (upstream, live, subscribes
+    and how they ended): a follower's `GET log` beyond its ~11 backstop
+    probes is S3 tailing in the stream's place. Budget 60/min per node
+    (measured: holder 27, followers 29–29.5).
   - `idle-cost-link-flap`: `idle-cost` with the lease holder's peer
     directory flagging every link down (the P2P deny file) for 5 s every
     15 s, as one late registry-tick ping round does under host load. The
@@ -1506,9 +1509,11 @@ relay of its own so requests can be attributed per role):
     (`CONSTELLATION_ACK=s3` in `fs create`'s environment): the fast
     path is gated and every acknowledgement waited for the log (a
     follower through S3 alone sees each acknowledged file); the holder
-    frozen (SIGSTOP), a peer's write takes the lease over well inside
-    the TTL (`s3_fast_takeovers`); the thawed holder is deposed with no
-    conflict.
+    frozen (SIGSTOP), B's write returns well inside the TTL and a live
+    peer holds a newer epoch through `s3_fast_takeovers` — B or C,
+    whichever wins the log-slot race (both watch the silent holder);
+    every acknowledged file is on the winner and on B; the thawed
+    holder is deposed with no conflict.
   - `single-node-unchanged`: one node with default knobs (behind a
     counting proxy): local policy, no backup, the fast path open, every
     M9 counter zero over 200 writes; prints their latency and S3

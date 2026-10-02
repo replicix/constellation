@@ -2622,6 +2622,171 @@ fn a_caught_up_stream_skips_the_tail_until_the_backstop() {
     assert_eq!(sub.core.stats.stream_tail_skips, 1);
 }
 
+/// `idle-cost` under host load (fix-flakes-4): a caught-up stream that
+/// goes silent past the timeout leaves its rounds tailing S3, one GET of
+/// the next sequence each (nothing is expected), not a full-width
+/// speculative run of 404s per drop; a probe that hits is followed by a
+/// full-width run, so the follower still reaches the head at once.
+#[test]
+fn a_dropped_caught_up_stream_tails_one_get_wide() {
+    let (mut holder, mut sub, _req) = stream_pair();
+    let full = sub.core.cfg.tail_width;
+    assert!(full > 1, "the test needs a full width above one: {full}");
+    let run_round = |sub: &mut Harness| -> Vec<(OpId, usize)> {
+        sub.core.nudge(sub.now, &mut Vec::new());
+        let poll = sub
+            .core
+            .timers
+            .iter()
+            .find(|(_, (t, _))| matches!(t, Timer::Poll))
+            .map(|(id, _)| *id)
+            .expect("poll timer");
+        let mut out = sub.step(Event::Timer { id: poll });
+        let upload = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        });
+        if let Some(op) = upload {
+            out.extend(sub.step(Event::UploadsDone {
+                op,
+                result: UploadResult::Done { held: 0 },
+            }));
+        }
+        s3_ops(&out)
+            .into_iter()
+            .filter_map(|(op, r)| match r {
+                S3Op::SegmentRun { width, .. } => Some((op, *width)),
+                _ => None,
+            })
+            .collect()
+    };
+    let runs = run_round(&mut sub);
+    assert_eq!(runs.len(), 1);
+    let out = sub.step(Event::S3 {
+        op: runs[0].0,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let _ = at_head(&mut sub, out);
+    // The holder falls silent (a heartbeat late under load): the
+    // watchdog drops the caught-up stream.
+    sub.advance(sub.core.cfg.stream_timeout_ms + 1);
+    let watchdog = sub
+        .core
+        .timers
+        .iter()
+        .find(|(_, (t, _))| matches!(t, Timer::StreamWatchdog))
+        .map(|(id, _)| *id)
+        .expect("watchdog timer");
+    sub.step(Event::Timer { id: watchdog });
+    assert_eq!(sub.core.stats.stream_timeouts, 1);
+    assert!(!sub.core.stream_view().live);
+    // Each round in the stream's place probes one GET wide.
+    for _ in 0..3 {
+        sub.advance(1_000);
+        let runs = run_round(&mut sub);
+        assert_eq!(
+            runs.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
+            vec![1],
+            "a dropped caught-up stream's tail is one GET (full width {full})"
+        );
+        let out = sub.step(Event::S3 {
+            op: runs[0].0,
+            result: S3Result::SegmentRun(Ok(Vec::new())),
+        });
+        let _ = at_head(&mut sub, out);
+    }
+    // The holder shipped meanwhile: the narrow probe hits, and the very
+    // next step is a full-width run from past it.
+    let payload = holder_segment(&mut holder, "a", 1);
+    sub.advance(1_000);
+    let runs = run_round(&mut sub);
+    assert_eq!(runs.iter().map(|(_, w)| *w).collect::<Vec<_>>(), vec![1]);
+    let out = sub.step(Event::S3 {
+        op: runs[0].0,
+        result: S3Result::SegmentRun(Ok(vec![(1, payload)])),
+    });
+    assert_eq!(sub.core.ship().next_seq, 2, "the hit was applied");
+    let follow: Vec<usize> = s3_ops(&out)
+        .into_iter()
+        .filter_map(|(_, r)| match r {
+            S3Op::SegmentRun { from: 2, width } => Some(*width),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        follow,
+        vec![full],
+        "a saturated narrow probe runs full width"
+    );
+}
+
+/// `visibility-after-burst`'s 17 tail GETs (fix-flakes-4): the
+/// backstop probe of a caught-up stream is in flight when the stream
+/// delivers the very segment it asks for (a tail leaves the cursor free,
+/// so the stream applies it). The probe's answer is then a duplicate:
+/// the round ends there, with no full-width follow-up run of 404s. A
+/// probe that brings something new still runs full width after.
+#[test]
+fn a_probe_the_stream_overtook_is_not_saturated() {
+    let (mut holder, mut sub, req) = stream_pair();
+    let poll_round = |sub: &mut Harness| -> Vec<Action> {
+        sub.core.nudge(sub.now, &mut Vec::new());
+        let poll = sub
+            .core
+            .timers
+            .iter()
+            .find(|(_, (t, _))| matches!(t, Timer::Poll))
+            .map(|(id, _)| *id)
+            .expect("poll timer");
+        let mut out = sub.step(Event::Timer { id: poll });
+        let upload = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        });
+        if let Some(op) = upload {
+            out.extend(sub.step(Event::UploadsDone {
+                op,
+                result: UploadResult::Done { held: 0 },
+            }));
+        }
+        out
+    };
+    let runs = |out: &[Action]| -> Vec<(OpId, Seq, usize)> {
+        s3_ops(out)
+            .into_iter()
+            .filter_map(|(op, r)| match r {
+                S3Op::SegmentRun { from, width } => Some((op, *from, *width)),
+                _ => None,
+            })
+            .collect()
+    };
+    // The caught-up stream's backstop probe, one GET of segment 1.
+    let probe = runs(&poll_round(&mut sub));
+    assert_eq!(probe.len(), 1);
+    assert_eq!((probe[0].1, probe[0].2), (1, 1));
+    // Segment 1 lands in S3, and the stream delivers it while the GET is
+    // out.
+    let payload = holder_segment(&mut holder, "a", 1);
+    sub.step(Event::Peer {
+        from: 1,
+        msg: segment_frame(req, 1, 1, payload.clone()),
+    });
+    assert_eq!(sub.core.stats.stream_applied, 1, "the stream applied 1");
+    assert_eq!(sub.core.ship().next_seq, 2);
+    // The probe answers with the segment the stream already applied.
+    let out = sub.step(Event::S3 {
+        op: probe[0].0,
+        result: S3Result::SegmentRun(Ok(vec![(1, payload)])),
+    });
+    let out = at_head(&mut sub, out);
+    assert_eq!(
+        runs(&out),
+        Vec::new(),
+        "a probe the stream overtook ran again: {out:?}"
+    );
+    assert_eq!(sub.core.ship().next_seq, 2);
+}
+
 /// A holder that lets the lease go ends every subscription; a node that
 /// does not hold refuses one.
 #[test]

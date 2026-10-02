@@ -745,7 +745,7 @@ fn idle_cost_run(scenario: &'static str, flap: bool) -> Result<()> {
         std::thread::sleep(Duration::from_secs(45));
         let before: Vec<serde_json::Value> = clients
             .iter()
-            .map(|c| c.control_status().map(|s| s["s3"].clone()))
+            .map(|c| c.control_status())
             .collect::<Result<_>>()?;
         // The holder, and everyone else's node id (what its deny file
         // lists while its links are down).
@@ -798,13 +798,22 @@ fn idle_cost_run(scenario: &'static str, flap: bool) -> Result<()> {
             let t = crate::reqlog::tally(&reqs);
             let s = c.control_status()?;
             let after = &s["s3"];
-            let d = |k: &str| after[k].as_u64().unwrap_or(0) - b[k].as_u64().unwrap_or(0);
+            let d = |k: &str| after[k].as_u64().unwrap_or(0) - b["s3"][k].as_u64().unwrap_or(0);
+            // How the node's log stream fared in the window: each drop
+            // leaves its rounds tailing S3 (`GET log`) until it is back.
+            let ls = |k: &str| {
+                s["log_stream"][k]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_sub(b["log_stream"][k].as_u64().unwrap_or(0))
+            };
             let per_min = t.total() as f64 / minutes;
             worst = worst.max(per_min);
             eprintln!(
                 "    {scenario}: {} ({}): {:.1} requests/min idle: {t}\n        by area: {}\n        \
                  status.s3 delta: GET {} HEAD {} PUT {} LIST {} DELETE {}; ship rounds {} \
-                 reconcile rounds {}",
+                 reconcile rounds {}\n        log stream: upstream {} live {}; subscribes {} \
+                 timeouts {} lost {} ended {} refused {} gaps {} tail skips {}",
                 c.name,
                 if s["lease"]["held"] == true { "holder" } else { "follower" },
                 per_min,
@@ -816,6 +825,15 @@ fn idle_cost_run(scenario: &'static str, flap: bool) -> Result<()> {
                 d("delete"),
                 s["spool"]["ship_rounds_completed"],
                 s["coop"]["reconcile_rounds"],
+                s["log_stream"]["upstream"],
+                s["log_stream"]["live"],
+                ls("subscribes"),
+                ls("timeouts"),
+                ls("lost"),
+                ls("ended"),
+                ls("refused"),
+                ls("gaps"),
+                ls("tail_skips"),
             );
         }
         anyhow::ensure!(

@@ -155,6 +155,18 @@ pub(crate) struct StreamState {
     /// tailing because of hints probes just past it rather than a full
     /// speculative run (gossip hints carry no payload since M7).
     hinted: Seq,
+    /// The last subscription was caught up when it went (live, nothing
+    /// buffered, the cursor past the holder's last reported head): S3
+    /// is expected to hold nothing new, so the rounds that tail in its
+    /// place probe one GET wide until a stream is live again. On a
+    /// loaded host a heartbeat late past `stream_timeout_ms` drops an
+    /// idle cluster's streams every few minutes, and each drop cost a
+    /// full-width speculative run of 404s (`tail_width`, 16 GETs):
+    /// `idle-cost`'s follower at 61 requests/min, 75 `GET log` in two
+    /// minutes against its peers' 11. A narrow probe that hits is
+    /// followed by a full-width run, so it never stops short of the
+    /// head.
+    dropped_caught_up: bool,
 }
 
 /// What a subscriber's stream looks like, for `status`.
@@ -500,6 +512,8 @@ impl Core {
         let Some(sub) = self.stream.sub.take() else {
             return;
         };
+        self.stream.dropped_caught_up =
+            sub.live && sub.buf.is_empty() && self.ship.next_seq > sub.head;
         tracing::debug!(
             target: "constellation_authority::stream",
             node = self.cfg.node_id,
@@ -562,6 +576,7 @@ impl Core {
         sub.next_n += 1;
         sub.last_frame = now;
         sub.live = true;
+        self.stream.dropped_caught_up = false;
         sub.head = sub.head.max(head);
         self.stream.retry_ms = self.cfg.stream_retry_min_ms;
         if epoch >= self.ship.max_epoch {
@@ -747,9 +762,11 @@ impl Core {
     /// The width of a round's S3 tail probe: 1 for the backstop probe of
     /// a caught-up stream (nothing is expected); one past the highest
     /// hinted sequence when hints say how far the log went (a hint costs
-    /// a GET per new segment plus one, not a full speculative run); the
-    /// configured width otherwise. A saturated probe is followed by a
-    /// full-width one, so a narrow probe never stops short of the head.
+    /// a GET per new segment plus one, not a full speculative run); 1
+    /// again once a caught-up stream went and nothing hints past the
+    /// cursor (`dropped_caught_up`); the configured width otherwise. A
+    /// saturated probe is followed by a full-width one, so a narrow probe
+    /// never stops short of the head.
     pub(crate) fn stream_tail_width(&mut self, now: Ms) -> usize {
         self.stream.last_s3_tail = now;
         let full = self.cfg.tail_width.max(1);
@@ -757,6 +774,8 @@ impl Core {
             1
         } else if self.stream.hinted >= self.ship.next_seq {
             ((self.stream.hinted - self.ship.next_seq + 2) as usize).min(full)
+        } else if self.stream.dropped_caught_up {
+            1
         } else {
             full
         }

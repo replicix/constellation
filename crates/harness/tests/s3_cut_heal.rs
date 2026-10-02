@@ -15,15 +15,18 @@
 //!
 //! The upstream is a tiny keep-alive HTTP/1.1 server (so the client's
 //! pool holds idle connections when the cut comes) that answers every
-//! GET with a fixed body, after an optional delay (so a burst is in
-//! flight when the cut comes).
+//! GET with a fixed body, held back while asked to (so a burst is in
+//! flight when the cut comes: the tests wait until the upstream has
+//! every request of it, cut, and only then let the answers go — a timed
+//! delay raced the cut on a loaded host, where the test's sleep before
+//! the cut could outlast the delay and the whole burst completed).
 
 use constellation_harness::reqlog::CountingProxy;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,36 +34,41 @@ const BODY: usize = 64 << 10;
 const BURST: usize = 15;
 
 /// A keep-alive S3 stand-in: every request is answered 200 with `BODY`
-/// bytes, after `delay_ms`.
+/// bytes, once `hold` is off.
 struct Upstream {
     addr: String,
-    delay_ms: Arc<AtomicU64>,
-    served: Arc<AtomicU64>,
+    hold: Arc<AtomicBool>,
+    /// Requests read (answered or held): what reached S3. Counted
+    /// before the answer, not after it: a count bumped once the last
+    /// write returned can lag a client that has read the whole answer
+    /// already (the oracle used to count answers, and `served >= served
+    /// + BURST` failed under load in a gate run).
+    received: Arc<AtomicU64>,
 }
 
 fn upstream() -> Upstream {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let delay_ms = Arc::new(AtomicU64::new(0));
-    let served = Arc::new(AtomicU64::new(0));
+    let hold = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(AtomicU64::new(0));
     {
-        let (delay_ms, served) = (delay_ms.clone(), served.clone());
+        let (hold, received) = (hold.clone(), received.clone());
         std::thread::spawn(move || {
             for sock in listener.incoming() {
                 let Ok(sock) = sock else { return };
-                let (delay_ms, served) = (delay_ms.clone(), served.clone());
-                std::thread::spawn(move || serve(sock, &delay_ms, &served));
+                let (hold, received) = (hold.clone(), received.clone());
+                std::thread::spawn(move || serve(sock, &hold, &received));
             }
         });
     }
     Upstream {
         addr,
-        delay_ms,
-        served,
+        hold,
+        received,
     }
 }
 
-fn serve(mut sock: TcpStream, delay_ms: &AtomicU64, served: &AtomicU64) {
+fn serve(mut sock: TcpStream, hold: &AtomicBool, received: &AtomicU64) {
     let body = vec![7u8; BODY];
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -75,7 +83,10 @@ fn serve(mut sock: TcpStream, delay_ms: &AtomicU64, served: &AtomicU64) {
             }
         };
         buf.drain(..end);
-        std::thread::sleep(Duration::from_millis(delay_ms.load(Ordering::Relaxed)));
+        received.fetch_add(1, Ordering::Relaxed);
+        while hold.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\nETag: \"e1\"\r\n\
              Last-Modified: Tue, 15 Nov 1994 08:12:31 GMT\r\n\r\n"
@@ -83,7 +94,6 @@ fn serve(mut sock: TcpStream, delay_ms: &AtomicU64, served: &AtomicU64) {
         if sock.write_all(head.as_bytes()).is_err() || sock.write_all(&body).is_err() {
             return;
         }
-        served.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -131,10 +141,31 @@ async fn burst(s3: &Arc<dyn ObjectStore>, tag: &str) -> usize {
     ok
 }
 
+/// A burst whose every GET has reached the upstream and is held there:
+/// whatever happens to the path next happens with all of it in flight.
+async fn held_burst(s3: &Arc<dyn ObjectStore>, up: &Upstream) -> tokio::task::JoinHandle<usize> {
+    let received = up.received.load(Ordering::Relaxed);
+    up.hold.store(true, Ordering::Relaxed);
+    let in_flight = {
+        let s3 = s3.clone();
+        tokio::spawn(async move { burst(&s3, "in-flight").await })
+    };
+    let t0 = Instant::now();
+    while up.received.load(Ordering::Relaxed) < received + BURST as u64 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "the burst never reached the upstream ({} of {BURST})",
+            up.received.load(Ordering::Relaxed) - received
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    in_flight
+}
+
 /// After the heal, the next burst succeeds in full and promptly; returns
 /// how long it took.
 async fn recovers(s3: &Arc<dyn ObjectStore>, proxy: &CountingProxy, up: &Upstream) -> Duration {
-    let (counted, served) = (proxy.requests().len(), up.served.load(Ordering::Relaxed));
+    let (counted, received) = (proxy.requests().len(), up.received.load(Ordering::Relaxed));
     let t0 = Instant::now();
     let ok = burst(s3, "after-heal").await;
     let took = t0.elapsed();
@@ -147,7 +178,7 @@ async fn recovers(s3: &Arc<dyn ObjectStore>, proxy: &CountingProxy, up: &Upstrea
         proxy.requests().len() >= counted + BURST,
         "the relay did not count the requests after the heal"
     );
-    assert!(up.served.load(Ordering::Relaxed) >= served + BURST as u64);
+    assert!(up.received.load(Ordering::Relaxed) >= received + BURST as u64);
     // And the one after that, on the pool the first one refilled.
     assert_eq!(burst(s3, "after-heal-2").await, BURST);
     proxy.ensure_sane().unwrap();
@@ -163,20 +194,16 @@ async fn a_cut_in_the_middle_of_a_burst_heals_at_once() {
     // A warm pool: `BURST` idle keep-alive connections.
     assert_eq!(burst(&s3, "warm").await, BURST);
 
-    // The cut comes with a burst in flight.
-    up.delay_ms.store(400, Ordering::Relaxed);
-    let in_flight = {
-        let s3 = s3.clone();
-        tokio::spawn(async move { burst(&s3, "in-flight").await })
-    };
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The cut comes with a burst in flight; its answers are let go once
+    // the cut is in place.
+    let in_flight = held_burst(&s3, &up).await;
     proxy.cut();
-    let served_at_cut = up.served.load(Ordering::Relaxed);
+    let received_at_cut = up.received.load(Ordering::Relaxed);
+    up.hold.store(false, Ordering::Relaxed);
     let ok = in_flight.await.unwrap();
     assert!(ok < BURST, "the cut killed none of the burst ({ok} ok)");
 
     // While cut, every request fails fast and nothing reaches upstream.
-    up.delay_ms.store(0, Ordering::Relaxed);
     let counted = proxy.requests().len();
     let t0 = Instant::now();
     assert_eq!(
@@ -186,9 +213,13 @@ async fn a_cut_in_the_middle_of_a_burst_heals_at_once() {
     );
     assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
     assert_eq!(proxy.requests().len(), counted, "the cut relayed a request");
-    // (A response the upstream had already begun writing may complete
-    // upstream; none may start.)
-    assert!(up.served.load(Ordering::Relaxed) <= served_at_cut + BURST as u64);
+    // (The held answers may complete upstream; no request may reach it:
+    // neither the in-flight burst's retries nor the burst made while cut.)
+    assert_eq!(
+        up.received.load(Ordering::Relaxed),
+        received_at_cut,
+        "a request reached the upstream through the cut"
+    );
 
     proxy.heal();
     let took = recovers(&s3, &proxy, &up).await;
@@ -202,17 +233,14 @@ async fn a_black_hole_in_the_middle_of_a_burst_heals_at_once() {
     let s3 = client(&proxy.endpoint());
     assert_eq!(burst(&s3, "warm").await, BURST);
 
-    // A firewall DROP with a burst in flight: nothing is answered.
-    up.delay_ms.store(400, Ordering::Relaxed);
-    let in_flight = {
-        let s3 = s3.clone();
-        tokio::spawn(async move { burst(&s3, "in-flight").await })
-    };
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // A firewall DROP with a burst in flight: nothing is answered (the
+    // upstream's answers, let go once the hole is in place, are
+    // swallowed).
+    let in_flight = held_burst(&s3, &up).await;
     proxy.blackhole();
+    up.hold.store(false, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(!in_flight.is_finished(), "a black-holed burst returned");
-    up.delay_ms.store(0, Ordering::Relaxed);
 
     // The heal closes what sat in the hole: the stalled requests fail or
     // retry through, promptly either way.
