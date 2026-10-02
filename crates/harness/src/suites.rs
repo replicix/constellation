@@ -45,6 +45,9 @@ pub fn fio_verify(mnt: &Path, size: &str, jobs: u32) -> Result<()> {
             "--end_fsync=1",
             "--group_reporting",
             "--output-format=terse",
+            // Otherwise fio leaves `local-harness-verify-*-verify.state`
+            // in the harness's working directory (the checkout).
+            "--verify_state_save=0",
         ]);
     run(cmd, "fio verify")
 }

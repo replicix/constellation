@@ -144,6 +144,7 @@ FUSE mount itself. The `smoke` compose service (profile `test`) gets:
 - `/dev/fuse` device passthrough
 - `CAP_SYS_ADMIN` (mount syscall)
 - `apparmor:unconfined` (default docker profile denies mount)
+- `label:disable` (SELinux; see below)
 
 The runner image (`tests/docker/Dockerfile`) is a two-stage build:
 `rust:1-bookworm` compiles a release binary (with cargo cache mounts for
@@ -164,6 +165,41 @@ Reasons this lane exists (vs. mounting on the host):
 Caveats: the kernel is still shared with the host (FUSE behavior is
 kernel-dependent), and hardened runners that forbid `CAP_SYS_ADMIN`
 can't run this lane — use the host lanes there.
+
+### Running the docker lanes on SELinux hosts
+
+On an SELinux-enforcing host (Fedora, RHEL) with the default docker
+labelling, two things break, neither with a logged denial (both are
+`dontaudit`ed; `sudo semodule -DB` shows them, `sudo semodule -B` hides
+them again):
+
+- **floci exits 126 at startup** (`init.sh: Permission denied`): its
+  init hook is a bind mount from the checkout (`user_home_t`), which a
+  `container_t` process may not read. `tests/integration.sh`, the
+  compose lanes and anything else that starts floci through
+  `docker-compose.yml` then fail with "dependency floci failed to start".
+- **pjdfstest loses 1798 checks** (7000 of 8798 pass): `container_t` may
+  not create block or character devices on the FUSE mount, so every
+  `mknod … b|c` gets `EACCES` and the checks after it cascade.
+
+`docker-compose.yml` therefore runs floci and every FUSE service with
+`security_opt: label:disable` (next to `apparmor:unconfined`). On hosts
+without SELinux the option is a no-op. Don't replace it with `:z` on the
+floci volume: that relabels the file in your checkout on the host.
+Containers started with `--privileged` (the `bench/` probes) are
+unlabelled already. The harness's own floci/toxiproxy containers mount
+nothing from the host and need no change.
+
+### Several checkouts on one docker host
+
+The image build keeps cargo's `target/` in a BuildKit cache mount. Cargo
+judges freshness by mtime and every checkout builds at `/src`, so two
+worktrees sharing that cache can get each other's binaries. The cache id
+is therefore the build arg `TARGET_CACHE_ID`, which `docker-compose.yml`
+sets to `constellation-target-<compose project>` (the checkout's
+directory name unless `-p`/`COMPOSE_PROJECT_NAME` says otherwise). Also
+give each checkout its own image tag (`SMOKE_IMAGE=constellation-smoke:<name>`):
+the default `constellation-smoke:local` is shared.
 
 ## Fault injection: the harness (`crates/harness`)
 
@@ -2251,6 +2287,15 @@ does not; plus ordinary write/read/rename/xattr/`flock`/unlink through
 the volume view. The in-process cases (forged and stale inode numbers
 answered `ESTALE`, snapshot views, `ViewQos` admission) are
 `constellation-engine`'s `view::confine_tests` and `view::qos_tests`.
+
+The link-domain marks are `trusted.*` xattrs, which the kernel lets only
+a `CAP_SYS_ADMIN` process set, before the request reaches the daemon.
+Run unprivileged (as CI's harness job does), the scenario cannot mark
+the volumes: it says so on stderr, skips the maintenance view's
+between-volume checks (the three cross-volume `EXDEV` links and the
+multiply-linked rename), and runs everything else. To cover those checks
+too, run it as root:
+`sudo env PATH=$PATH CONSTELLATION_HARNESS_DOCKER_PREFIX=<p> target/release/harness run subtree-confinement`.
 
 ## FUSE session handover (plan 31 §6.11, C4b)
 

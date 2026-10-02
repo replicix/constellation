@@ -11,10 +11,17 @@ FROM rust:1-bookworm AS build
 # compose service needs (and which also needs a seccomp profile that
 # permits `io_uring_setup(2)` at *run* time -- see docker-compose.yml).
 ARG CARGO_FEATURES=
+# The target cache is per checkout: cargo decides freshness by mtime, COPY
+# keeps the context's mtimes, and every checkout builds at /src, so a
+# target cache shared by two worktrees on one host hands one of them the
+# other's newer artifacts (a binary that is not its source).
+# `docker-compose.yml` passes its project name (by default the checkout's
+# directory); other builds share the default id.
+ARG TARGET_CACHE_ID=constellation-target
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+    --mount=type=cache,id=${TARGET_CACHE_ID},target=/src/target \
     cargo build --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
         -p constellation -p constellation-harness \
     && cp target/release/constellation /constellation \
@@ -60,6 +67,7 @@ RUN apt-get update \
 # (mounted socket) to start floci/toxiproxy as sibling containers, and
 # runs the FUSE mounts inside this container. Run with:
 #   network_mode: host, /dev/fuse, CAP_SYS_ADMIN, apparmor:unconfined,
+#   label:disable (SELinux hosts),
 #   -v /var/run/docker.sock:/var/run/docker.sock
 FROM runtime-base AS harness
 ARG DOCKER_VERSION=27.3.1

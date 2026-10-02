@@ -70,11 +70,20 @@ impl PrefixLock {
     fn acquire(prefix: &str) -> Result<PrefixLock> {
         use std::os::fd::AsRawFd;
         let path = std::env::temp_dir().join(format!(".{prefix}.lock"));
+        // A file another user left (a `sudo` run of the same prefix) may
+        // not be opened with `O_CREAT` in a sticky world-writable /tmp
+        // (`fs.protected_regular`, on by default on Fedora) nor for
+        // writing (it is 0644): `flock` needs neither, so open it
+        // read-only then.
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
+            .or_else(|e| match e.kind() {
+                std::io::ErrorKind::PermissionDenied => std::fs::File::open(&path),
+                _ => Err(e),
+            })
             .with_context(|| format!("opening the harness lock file {}", path.display()))?;
         // SAFETY: a plain `flock(2)` on a file descriptor we own.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {

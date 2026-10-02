@@ -16,6 +16,12 @@ services:
       - "4566:4566"
     environment:
       - FLOCI_STORAGE_MODE=memory
+    # SELinux hosts (Fedora/RHEL): the init hook below is a bind mount of
+    # the source tree, which container_t may not read, so floci exits 126
+    # at startup. Disabling the label beats `:z`, which would relabel the
+    # checkout on the host. A no-op where SELinux is off (Ubuntu CI).
+    security_opt:
+      - label:disable
     volumes:
       # LocalStack-compatible init path, honored by floci.
       - ./tests/docker/floci-init.sh:/etc/localstack/init/ready.d/init.sh:ro
@@ -32,18 +38,24 @@ services:
       context: .
       dockerfile: tests/docker/Dockerfile
       target: suite
+      args:
+        TARGET_CACHE_ID: constellation-target-${COMPOSE_PROJECT_NAME}
     profiles: ["test"]
     depends_on:
       floci:
         condition: service_healthy
-    # FUSE inside a container: the fuse device, mount capability, and an
-    # unconfined apparmor profile (mount is otherwise denied).
+    # FUSE inside a container: the fuse device, mount capability, an
+    # unconfined apparmor profile (mount is otherwise denied), and no
+    # SELinux label: container_t may not create device nodes on a FUSE
+    # mount, so pjdfstest's `mknod b/c` gets EACCES and 1798 checks
+    # cascade. Both options are no-ops where that LSM is not enabled.
     devices:
       - /dev/fuse
     cap_add:
       - SYS_ADMIN
     security_opt:
       - apparmor:unconfined
+      - label:disable
     environment: &suite-env
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
@@ -88,9 +100,11 @@ services:
       target: suite
       args:
         CARGO_FEATURES: constellation-frontend-fuse/io-uring
+        TARGET_CACHE_ID: constellation-target-uring-${COMPOSE_PROJECT_NAME}
     profiles: ["test-uring"]
     security_opt:
       - apparmor:unconfined
+      - label:disable
       - seccomp:unconfined
     environment:
       <<: *suite-env
@@ -110,6 +124,8 @@ services:
       context: .
       dockerfile: tests/docker/Dockerfile
       target: xfstests-runner
+      args:
+        TARGET_CACHE_ID: constellation-target-${COMPOSE_PROJECT_NAME}
     command: []
 
   # Fault-injection harness, fully containerized: only docker is needed
@@ -123,14 +139,19 @@ services:
       context: .
       dockerfile: tests/docker/Dockerfile
       target: harness
+      args:
+        TARGET_CACHE_ID: constellation-target-${COMPOSE_PROJECT_NAME}
     profiles: ["test"]
     network_mode: host
     devices:
       - /dev/fuse
     cap_add:
       - SYS_ADMIN
+    # Same FUSE confinement as the suite; without a label the container
+    # may also use the host's docker socket.
     security_opt:
       - apparmor:unconfined
+      - label:disable
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command: ["run"]

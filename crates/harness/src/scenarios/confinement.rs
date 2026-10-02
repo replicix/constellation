@@ -36,11 +36,9 @@ fn set_xattr(path: &Path, name: &str, value: &[u8]) -> Result<()> {
         )
     };
     if rc != 0 {
-        bail!(
-            "setxattr {name:?} on {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
+        // Kept as the source so a caller can tell the errno.
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("setxattr {name:?} on {}", path.display()));
     }
     Ok(())
 }
@@ -146,8 +144,7 @@ pub(super) fn subtree_confinement(_seed: u64) -> Result<()> {
     std::fs::write(pv1.join("data.txt"), b"pv-1 data")?;
     std::fs::write(pv2.join("secret.txt"), b"pv-2 secret")?;
     std::fs::write(whole.join("top.txt"), b"top")?;
-    set_xattr(&pv1, DOMAIN_XATTR, b"1")?;
-    set_xattr(&pv2, DOMAIN_XATTR, b"1")?;
+    let marked = mark_domain(&pv1)? && mark_domain(&pv2)?;
     c.snapshot_create("/volumes/pv-1@own")?;
     c.snapshot_create("/volumes/pv-2@sibling")?;
     c.snapshot_create("/@whole")?;
@@ -167,7 +164,7 @@ pub(super) fn subtree_confinement(_seed: u64) -> Result<()> {
             status["mounts"].as_array().map(|m| m.len()) == Some(3),
             "one daemon should serve three views: {status}"
         );
-        checks(&whole, &vol, &maint)
+        checks(&whole, &vol, &maint, marked)
     })();
     for mnt in attached.iter().rev() {
         let _ = Command::new("fusermount3").arg("-u").arg(mnt).status();
@@ -227,7 +224,37 @@ fn attach(c: &crate::client::Client, endpoint: &str, inner: &str, mnt: &Path) ->
     Ok(())
 }
 
-fn checks(whole: &Path, vol: &Path, maint: &Path) -> Result<()> {
+/// Marks `dir` as a link domain. `trusted.*` needs `CAP_SYS_ADMIN` in
+/// the initial user namespace, checked by the kernel before the request
+/// reaches the daemon, so an unprivileged harness (the CI lane) cannot
+/// set it: `Ok(false)` there, and the checks that depend on the marks
+/// are skipped loudly. As root a refusal is a failure.
+fn mark_domain(dir: &Path) -> Result<bool> {
+    match set_xattr(dir, DOMAIN_XATTR, b"1") {
+        Ok(()) => Ok(true),
+        Err(e) if !is_root() && is_eperm(&e) => {
+            eprintln!(
+                "    subtree-confinement: not root, so {DOMAIN_XATTR} cannot be set ({e:#}); \
+                 SKIPPING the maintenance view's between-volume checks (run the scenario \
+                 as root to cover them)"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn is_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+fn is_eperm(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|e| Code::from_io_error(e) == Code::Perm)
+}
+
+fn checks(whole: &Path, vol: &Path, maint: &Path, marked: bool) -> Result<()> {
     // `..` at the volume view's root: the kernel leaves the mount for the
     // host directory holding the mountpoint; nothing of the filesystem
     // above the volume is ever listed.
@@ -305,15 +332,19 @@ fn checks(whole: &Path, vol: &Path, maint: &Path) -> Result<()> {
     // link-disjoint; within one, and in the unmarked rest, POSIX.
     let m1 = maint.join("volumes/pv-1");
     let m2 = maint.join("volumes/pv-2");
-    expect_exdev(&m1.join("data.txt"), &m2.join("x"))?;
-    expect_exdev(&m2.join("secret.txt"), &m1.join("x"))?;
-    expect_exdev(&m1.join("data.txt"), &maint.join("x"))?;
+    if marked {
+        expect_exdev(&m1.join("data.txt"), &m2.join("x"))?;
+        expect_exdev(&m2.join("secret.txt"), &m1.join("x"))?;
+        expect_exdev(&m1.join("data.txt"), &maint.join("x"))?;
+    }
     std::fs::hard_link(maint.join("top.txt"), maint.join("top-link"))?;
     std::fs::hard_link(m1.join("data.txt"), m1.join("data-2"))?;
     // One of several names of a file cannot move to another volume.
-    match std::fs::rename(m1.join("data-2"), m2.join("data-2")) {
-        Err(e) if Code::from_io_error(&e) == Code::CrossDevice => {}
-        other => bail!("rename of a multiply-linked file across volumes: {other:?}"),
+    if marked {
+        match std::fs::rename(m1.join("data-2"), m2.join("data-2")) {
+            Err(e) if Code::from_io_error(&e) == Code::CrossDevice => {}
+            other => bail!("rename of a multiply-linked file across volumes: {other:?}"),
+        }
     }
     // The whole-filesystem view without `--confine-links` is POSIX.
     std::fs::hard_link(
