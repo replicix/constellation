@@ -91,6 +91,57 @@ impl Model {
         Ok(())
     }
 
+    /// The same check as [`Model::verify`], against a tree observed
+    /// somewhere the harness cannot `stat` itself (inside a Kubernetes
+    /// pod, `crate::k8s`): every entry with its kind, and a file's size and
+    /// SHA-256 rather than its bytes. The checks are the same: missing or
+    /// extra entries, kind, size, content, symlink target.
+    pub fn verify_observed(&self, observed: &BTreeMap<PathBuf, Observed>) -> Result<()> {
+        for (rel, node) in &self.nodes {
+            let Some(seen) = observed.get(rel) else {
+                bail!(divergence(rel, "present", "missing"));
+            };
+            match (node, seen) {
+                (Node::Dir, Observed::Dir) => {}
+                (Node::Symlink { target }, Observed::Symlink { target: t }) => {
+                    if t != target {
+                        bail!(divergence(rel, target, t));
+                    }
+                }
+                (Node::File { data }, Observed::File { size, sha256 }) => {
+                    if *size != data.len() as u64 {
+                        bail!(divergence(
+                            rel,
+                            &format!("size {}", data.len()),
+                            &format!("size {size}")
+                        ));
+                    }
+                    if *sha256 != sha256_of(data) {
+                        bail!(divergence(rel, "content hash", "differs"));
+                    }
+                }
+                (node, seen) => bail!(divergence(
+                    rel,
+                    &format!("{node:?}").chars().take(40).collect::<String>(),
+                    &format!("{seen:?}")
+                )),
+            }
+        }
+        if let Some(rel) = observed.keys().find(|k| !self.nodes.contains_key(*k)) {
+            bail!(divergence(rel, "absent from model", "exists"));
+        }
+        Ok(())
+    }
+
+    /// This model with every path moved under `dir` (which must be one of
+    /// `into`'s directories): two subtrees written by different clients,
+    /// each against its own model, checked as one tree.
+    pub fn graft(&self, into: &mut Model, dir: &Path) {
+        for (rel, node) in &self.nodes {
+            into.nodes.insert(dir.join(rel), node.clone());
+        }
+    }
+
     // --- model mutations mirroring the workload ops ---
 
     pub fn mkdir(&mut self, p: &Path) {
@@ -187,6 +238,79 @@ impl Model {
     }
 }
 
+/// One entry of a tree observed remotely ([`Model::verify_observed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    File { size: u64, sha256: [u8; 32] },
+    Dir,
+    Symlink { target: String },
+}
+
+pub fn sha256_of(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
+
 fn divergence(path: &Path, expected: &str, got: &str) -> anyhow::Error {
     anyhow::anyhow!("MODEL DIVERGENCE at {path:?}: expected {expected}, got {got}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observed_of(m: &Model) -> BTreeMap<PathBuf, Observed> {
+        m.nodes
+            .iter()
+            .map(|(p, n)| {
+                let o = match n {
+                    Node::Dir => Observed::Dir,
+                    Node::Symlink { target } => Observed::Symlink {
+                        target: target.clone(),
+                    },
+                    Node::File { data } => Observed::File {
+                        size: data.len() as u64,
+                        sha256: sha256_of(data),
+                    },
+                };
+                (p.clone(), o)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_observed_tree_must_match_the_model_exactly() {
+        let mut m = Model::default();
+        m.mkdir(Path::new("d"));
+        m.write_file(Path::new("d/f"), b"hello".to_vec());
+        m.symlink(Path::new("l"), "d/f");
+        let seen = observed_of(&m);
+        m.verify_observed(&seen).unwrap();
+
+        let mut changed = m.clone();
+        changed.overwrite(Path::new("d/f"), 0, b"J");
+        assert!(changed.verify_observed(&seen).is_err(), "content");
+        let mut longer = m.clone();
+        longer.append(Path::new("d/f"), b"!");
+        assert!(longer.verify_observed(&seen).is_err(), "size");
+        let mut more = m.clone();
+        more.mkdir(Path::new("e"));
+        assert!(more.verify_observed(&seen).is_err(), "missing entry");
+        let mut fewer = m.clone();
+        fewer.remove(Path::new("l"));
+        assert!(fewer.verify_observed(&seen).is_err(), "extra entry");
+        let mut relinked = m.clone();
+        relinked.symlink(Path::new("l"), "elsewhere");
+        assert!(relinked.verify_observed(&seen).is_err(), "link target");
+    }
+
+    #[test]
+    fn a_grafted_model_lives_under_its_directory() {
+        let mut sub = Model::default();
+        sub.write_file(Path::new("x"), vec![1]);
+        let mut root = Model::default();
+        root.mkdir(Path::new("a"));
+        sub.graft(&mut root, Path::new("a"));
+        assert_eq!(root.files(), vec![PathBuf::from("a/x")]);
+    }
 }

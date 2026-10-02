@@ -102,6 +102,12 @@ pub const LABEL_VOLUME_ID: &str = "volume-id";
 /// How long a `stat` of a mount may take before it counts as wedged.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long recording an engine pod's view count (a PATCH to the API
+/// server) may take. A slow API server must not hold up the end of every
+/// later stage and unstage of the pod's unit; the count a timed-out patch
+/// missed is recorded by the unit's next stage or unstage.
+const ANNOTATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// What a bounded look at a mount found ([`NodeService::probe`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
@@ -128,6 +134,17 @@ pub struct NodeService {
     locks: VolumeLocks,
     /// Pod incarnations `fs.unlock` has reached (module docs, step 2).
     unlocked: Mutex<HashSet<String>>,
+    /// Held from counting an engine pod's views to the end of the patch
+    /// that records the count. Stages and unstages of different volumes
+    /// run concurrently; without it two of them count 24 and 25, and their
+    /// patches can land in the other order, leaving the pod annotated
+    /// with a count it no longer has — or `0` and idle while it serves a
+    /// view (37-k3b's `csi-many-pvs-one-pool` saw 23 of 25). One lock
+    /// per engine pod unit: units are independent, and a slow patch of
+    /// one must not hold up the others.
+    views_annotation: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// [`ANNOTATION_TIMEOUT`]; tests shorten it.
+    annotation_timeout: Duration,
 }
 
 impl NodeService {
@@ -144,6 +161,8 @@ impl NodeService {
             state,
             locks: VolumeLocks::default(),
             unlocked: Mutex::default(),
+            views_annotation: Mutex::default(),
+            annotation_timeout: ANNOTATION_TIMEOUT,
         }
     }
 
@@ -193,9 +212,29 @@ impl NodeService {
     }
 
     async fn record_views(&self, engines: &dyn NodeEngines, unit: &str, pod: &str) {
+        let serial = self
+            .views_annotation
+            .lock()
+            .unwrap()
+            .entry(unit.to_string())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
         let views = self.state.views_of(pod);
-        if let Err(e) = engines.set_view_count(unit, views).await {
-            tracing::warn!(pod, views, error = %e, "recording the engine pod's view count");
+        match tokio::time::timeout(self.annotation_timeout, engines.set_view_count(unit, views))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(pod, views, error = %e, "recording the engine pod's view count")
+            }
+            Err(_) => tracing::warn!(
+                pod,
+                views,
+                timeout = ?self.annotation_timeout,
+                "recording the engine pod's view count timed out; the unit's next stage or \
+                 unstage records it"
+            ),
         }
     }
 

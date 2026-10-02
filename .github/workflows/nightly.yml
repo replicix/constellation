@@ -248,6 +248,78 @@ jobs:
             package.log
             target/dist/*
 
+  # Plan 37 §13. csi-sanity's Identity, Controller and Node groups against
+  # constellation-csi on its in-memory backends: no S3, no cluster, no
+  # mount(2), so a hosted runner does (K0's consequence keeps it there).
+  csi-sanity:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - run: go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
+      - run: |
+          set -o pipefail
+          CSI_SANITY_BIN="$(go env GOPATH)/bin/csi-sanity" make csi-sanity 2>&1 | tee csi-sanity.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: csi-sanity-logs, path: csi-sanity.log }
+
+  # Plan 37 §13 / K3: the driver on a real kind cluster — csi-sanity's Node
+  # group against the deployed node plugin (real FUSE staging mounts, real
+  # engine pods), then every `harness k8s-scenario`. Plan 37 "K0 results"
+  # (question 5) could not verify FUSE in a hosted runner's kind nodes, so
+  # this runs on a self-hosted, FUSE-capable runner (labels below; docker,
+  # /dev/fuse, kind, kubectl and helm installed) until a hosted one is
+  # verified. Without such a runner registered the job would queue forever:
+  # it runs only when the repository variable CONSTELLATION_FUSE_RUNNER is
+  # "true". Each step brings up and deletes its own cluster (one at a time).
+  kind-e2e:
+    needs: csi-sanity
+    if: vars.CONSTELLATION_FUSE_RUNNER == 'true'
+    runs-on: [self-hosted, linux, x64, fuse]
+    timeout-minutes: 120
+    env:
+      CSI_IMAGE: constellation-csi:nightly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - run: go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
+      - run: cargo build --release -p constellation-harness
+      - run: make csi-image CSI_IMAGE="$CSI_IMAGE"
+      - run: |
+          set -o pipefail
+          CSI_SKIP_BUILD=1 KIND_CLUSTER=nightly-sanity-kind \
+          CSI_SANITY_BIN="$(go env GOPATH)/bin/csi-sanity" \
+            bash tests/csi/sanity-kind.sh 2>&1 | tee kind-e2e.log
+      - run: |
+          set -o pipefail
+          KIND_CLUSTER=nightly-k8s-harness target/release/harness k8s-scenario --all \
+            --image "$CSI_IMAGE" --results-json results-linux-k8s-kind.json 2>&1 | tee -a kind-e2e.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kind-e2e
+          path: |
+            kind-e2e.log
+            results-linux-k8s-kind.json
+      # The harness and sanity-kind.sh tear down what they created, also on
+      # SIGINT/SIGTERM, but a cancellation's follow-up SIGKILL or a runner
+      # crash skips that. The names are fixed and the runner persistent, so
+      # a leftover cluster would make every later night refuse to start.
+      - name: Remove leftover clusters
+        if: always()
+        run: |
+          kind delete cluster --name nightly-sanity-kind || true
+          kind delete cluster --name nightly-k8s-harness || true
+          docker ps -aq --filter name='^nightly-k8s-harness-k8s-floci' | xargs -r docker rm -f || true
+
   macos:
     needs: lint
     runs-on: macos-latest
@@ -267,7 +339,7 @@ jobs:
 
   summary:
     if: always()
-    needs: [lint, unit, integration, compliance, harness, harness-lanes-linux, conformance, parity, xfstests, performance, transport-matrix, linux-package, macos]
+    needs: [lint, unit, integration, compliance, harness, harness-lanes-linux, conformance, parity, xfstests, performance, transport-matrix, linux-package, csi-sanity, kind-e2e, macos]
     runs-on: ubuntu-latest
     steps:
       - name: Publish summary

@@ -2027,14 +2027,19 @@ fn cold_cache(seed: u64) -> Result<()> {
 /// chunk plane doesn't cross-corrupt. Upgraded to a shared-namespace
 /// scenario when metadata log shipping lands (phase 2).
 /// Poll until `f` succeeds or `deadline` passes (cross-node
-/// propagation is asynchronous: sync interval + FUSE TTLs).
-fn eventually(what: &str, deadline: Duration, mut f: impl FnMut() -> Result<()>) -> Result<()> {
+/// propagation is asynchronous: sync interval + FUSE TTLs). An
+/// interrupted run ([`crate::interrupt::aborting`]) stops polling at the
+/// first failure.
+pub fn eventually(what: &str, deadline: Duration, mut f: impl FnMut() -> Result<()>) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
         match f() {
             Ok(()) => return Ok(()),
             Err(e) if start.elapsed() > deadline => {
                 return Err(e.context(format!("'{what}' not reached within {deadline:?}")))
+            }
+            Err(e) if crate::interrupt::aborting() => {
+                return Err(e.context(format!("'{what}' interrupted")))
             }
             Err(_) => std::thread::sleep(Duration::from_millis(250)),
         }

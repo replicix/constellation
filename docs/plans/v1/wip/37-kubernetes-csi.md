@@ -2010,6 +2010,32 @@ can honestly recommend a `shards` value.
       revisits this.
 - `kind-e2e` CI job stood up (§"CI"), including the `extraMounts` +
   privileged node-plugin config validated in K0.
+- **37-k3b notes.**
+  - *`harness k8s-scenario`* is in `crates/harness/src/k8s*`: kind only
+    (it loads the image with `kind load` and reads the workers' mount
+    tables with `docker exec`). The scenarios run their file operations
+    as shell scripts in the pods and compare a listing taken there with
+    the `Model`. `csi-rwx-across-nodes` checks eventual convergence under
+    the default `--cto bounded`. It asserts nothing about what a lagging
+    reader sees: a read racing the replica's catch-up is not covered by
+    close-to-open.
+  - *`kind-e2e`* differs from §13's sketch. `install-native-s3.sh`,
+    `install-driver.sh`, `run-e2e.sh` and `testdriver.yaml` are K7's, with
+    the upstream e2e suite. Today the job runs `tests/csi/sanity-kind.sh`
+    and `harness k8s-scenario --all`, which bring up their own clusters,
+    S3 and chart. It runs on a self-hosted `fuse` runner (K0, question 5),
+    and only when the repository variable `CONSTELLATION_FUSE_RUNNER` is
+    `true`, so that a nightly with no such runner does not queue forever.
+  - *Fixed in k3a's node plugin:* the `last-view-count` annotation could
+    end up stale. Concurrent stages each counted and then patched, and
+    their patches landed out of order: `csi-many-pvs-one-pool` saw 23 of
+    25. A stale `0` with `idle-since` on a pod that is serving views is
+    exactly what K6b's idle GC would collect. Counting and patching are now
+    serialized, one lock per engine pod unit, and the patch is bounded by
+    10 s (a timed-out or failed patch is logged and the unit's next stage
+    or unstage records the count). Regression tests:
+    `concurrent_stages_leave_the_last_view_count_not_a_stale_one`,
+    `a_hung_view_count_patch_holds_up_neither_other_units_nor_its_own`.
 - **Gate:** CONVENTIONS gates; `csi-sanity`'s Node test group passes against
   a real kind cluster (not the in-memory K1/K2 backend); a pod mounts a PV
   and reads/writes through it; the RWX-across-nodes `k8s-scenario` passes;
@@ -2086,6 +2112,12 @@ can honestly recommend a `shards` value.
   opt-in for clusters whose node disks outlive the node (and for scratch
   classes). `fsync`'s cost under `s3` is one extra journal ship per call,
   which K7's parity lane should measure against `local`.
+- **K6b: idle GC never trusts `last-view-count` alone (37-k3b review).**
+  The annotation is best effort: the node plugin logs a failed or
+  timed-out (10 s) patch with a `warn` and moves on, so it can stay stale
+  until the unit's next stage or unstage. Before collecting an engine pod
+  that the annotation (with `idle-since`) shows idle, the GC re-checks
+  the pod with `view.list` and keeps it if it serves any view.
 - **Gate:** CONVENTIONS gates; the secret-rotation and node-drain
   `k8s-scenario`s pass; the "trash purge under load" `k8s-scenario`
   (§"Testing") passes, including the large-many-small-files trashed volume

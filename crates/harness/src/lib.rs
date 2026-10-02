@@ -9,6 +9,8 @@ pub mod corpus;
 pub mod csi_meta_ladder;
 pub mod docker;
 pub mod interop;
+pub mod interrupt;
+pub mod k8s;
 pub mod metabench;
 pub mod model;
 pub mod reqlog;

@@ -30,6 +30,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  # Plan 37 §13: the CSI driver's unit tests on their own (also part of
+  # `test`'s `--workspace`), the one CSI job cheap enough for every PR.
+  csi-unit:
+    name: crates/csi unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p constellation-csi
+
   integration:
     name: Integration (containerized FUSE + floci S3)
     runs-on: ubuntu-latest

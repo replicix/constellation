@@ -2994,6 +2994,95 @@ real store with no spawned tasks.
   subtree walk costs about 0.45 µs per entry warm; no CSI controller RPC
   pays it on a capped volume.
 
+### Kubernetes lane: `harness k8s-scenario` (plan 37 §12, K3)
+
+Scenarios that only exist behind the CSI driver run in their own harness
+mode, `harness k8s-scenario <name>... | --all` (`--list` names them; they
+are not in `harness list`, whose names are all `harness run`'s). Instead of
+local `Client`s it drives a kind cluster with `kubectl` and `helm`: every
+file operation runs in a non-root workload pod (`kubectl exec`, one shell
+script per block of seeded operations, contents inline in base64), every
+mount is the driver's (`NodeStageVolume` into a node-owned engine pod,
+`NodePublishVolume` into the pod), and the oracle is the same `Model`,
+compared against a listing taken in the pod (kind, size, SHA-256, symlink
+target: `Model::verify_observed`). Cross-node expectations use
+`eventually()`.
+
+- **Cluster.** `--kubeconfig` (or `$KUBECONFIG`) naming a kind cluster is
+  reused and left running; with neither, the harness creates `kind-harness`
+  (`$KIND_CLUSTER` names another) from `tests/csi/kind-config.yaml` with a
+  private kubeconfig and deletes it afterwards (`--keep` leaves it). An
+  existing cluster of that name is refused, not deleted. The scenarios
+  need two workers (`docker exec` into them reads their mount tables).
+  `$KUBECONFIG` must name one file (a `:`-separated list is refused; pass
+  the file with `--kubeconfig`).
+- **A reused cluster is taken over.** The run reinstalls the driver's
+  release with its own values only (`helm upgrade --install` without
+  `--reuse-values` resets any others), and `csi-plugin-restart-survives`
+  deletes every node- and controller-plugin pod in the driver namespace.
+  Never point two runs, or a run and other work, at one cluster. The run's
+  floci container (`<cluster>-k8s-floci-<run id>`) and its namespaces and
+  classes carry the run id, so those do not collide.
+- **Setup.** The image (`--image`, default `constellation-csi:dev`) is built
+  with `make csi-image` when the local docker lacks it (or with `--build`)
+  and `kind load`ed; the chart (`--chart`) is `helm upgrade --install`ed into
+  `--namespace` (PodSecurity `privileged`); a private in-memory floci runs
+  on the `kind` network for the run (`<cluster>-k8s-floci-<run id>`). Each scenario gets a namespace and a
+  pool `StorageClass` whose prefix carries the run id, so a reused cluster
+  never meets engine state of an earlier run's filesystem.
+- **Teardown, checked.** A scenario ends by deleting its pods and asserting
+  every volume it used is unstaged on every worker (no FUSE mount at
+  kubelet's staging path, `<sha256(volume handle)>/globalmount`; `csi-pod-rw`
+  is the positive control), then deleting its namespace and class, waiting
+  for the PVs to go, and removing its pool's engine pods (their GC is K6b's)
+  until none has come back for 30 s (the provisioner may repeat a
+  `DeleteVolume` after the PV is gone, and the controller then recreates
+  its engine pod).
+- **Interrupted.** SIGINT or SIGTERM stops the run in order: the running
+  scenario fails at its next `kubectl`/`kind` command or `eventually()`
+  poll, the rest are reported SKIPPED, the results file is written, and
+  what the run created goes: a cluster it created (with everything in it;
+  the per-scenario teardown is skipped then, since a CI cancellation's
+  second signal comes seconds later), its floci container, and on a
+  reused or `--keep` cluster its namespaces, classes and engine pods. A
+  second signal exits at once, leaving whatever is left; `kind-e2e`'s
+  `if: always()` step removes its fixed-name clusters and floci for that
+  case. A failed setup (cluster, image, chart, floci) is recorded in
+  `--results-json` as every selected scenario failing with its reason.
+- **SKIP.** Without `kubectl`, `helm`, `docker` or `kind` (`$KIND_BIN`) every
+  selected scenario is reported SKIPPED with the missing tool. A cluster
+  with fewer than two workers skips the scenarios that need two.
+- `--results-json` writes `harness run`'s results format (lane
+  `linux-k8s-kind`).
+
+| Scenario | What it proves |
+|---|---|
+| `csi-pod-rw` | A pod on worker 1 runs 4 seeded blocks through an RWO PVC, the model verified after each; the PV is staged on that worker only. After the pod is gone, a pod on worker 2 (an unstage and a fresh stage) sees the same tree and writes on. |
+| `csi-rwx-across-nodes` | Two pods on two workers, one RWX PVC. Six rounds alternate the writer; each writer starts once its node shows the model (an open after the other's close) and the other node must then converge. Then both write concurrently into their own directories and both converge on the merged model. Close-to-open in its default `bounded` form: visibility is eventual (`CONVERGE` = 120 s), and nothing is asserted about what a lagging reader sees meanwhile. |
+| `csi-many-pvs-one-pool` | 50 PVCs of one pool class, 10 pods alternating workers with 5 PVs each: one pool filesystem; each PV its own seeded tree, verified independently; exactly two node-owned engine pods (one per worker, 25 views each) and one controller-owned one; quotas per PV: a full 16 MiB PV refuses with `ENOSPC` while a 64 MiB one beside it (same pod, same engine) takes 24 MiB, and a 32 MiB PV on the other worker takes 24 MiB then refuses (2 MiB slack either way: the caps are soft, above, and a refusal may not come early either); the trees are intact afterwards and unstaging all 50 annotates both engine pods with 0 views. |
+| `csi-plugin-restart-survives` | A writer pod on worker 1 (a 4 KiB file + a log line + a read-back every 100 ms) and a reader on worker 2 run while every node-plugin pod and every controller replica is deleted. They are replaced and Ready, both loops go on with zero errors, the tree matches the model on both nodes and in a new pod published by the restarted plugin, a PVC created afterwards binds and stages, and the engine pods holding the FUSE sessions are the same incarnations with no restarts. |
+
+Gate run on the dev box (a created cluster, a prebuilt image; the tag must
+exist in the local docker, or the harness builds it with `make csi-image`):
+
+```bash
+make csi-image CSI_IMAGE=constellation-csi:k3b
+KIND_CLUSTER=kind-37-k3b target/release/harness k8s-scenario --all \
+    --image constellation-csi:k3b
+```
+
+On an existing cluster, `kind get kubeconfig --name <cluster> >
+/tmp/kubeconfig` and add `--kubeconfig /tmp/kubeconfig` (it is taken over,
+above).
+
+CI: `csi-unit` (`ci.yml`) runs `cargo test -p constellation-csi`; nightly's
+`csi-sanity` runs `make csi-sanity` on a hosted runner and `kind-e2e` runs
+`tests/csi/sanity-kind.sh` and `harness k8s-scenario --all` on a
+self-hosted runner labelled `fuse` (plan 37 "K0 results", question 5: a
+hosted runner's kind nodes are unverified). `kind-e2e` runs only when the
+repository variable `CONSTELLATION_FUSE_RUNNER` is `true`, so a nightly
+without such a runner skips it instead of queueing forever.
+
 ## CI notes
 
 - The `integration` job builds the runner image via buildx with

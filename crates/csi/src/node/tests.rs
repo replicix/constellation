@@ -788,3 +788,143 @@ async fn without_an_engine_backend_staging_is_unavailable() {
     .await
     .unwrap();
 }
+
+/// [`InMemoryNodeEngines`] whose `last-view-count` patches take longer
+/// the lower the count, as API-server round trips sometimes do: unordered,
+/// a stage that counted 1 lands after one that counted 2.
+struct SlowAnnotations(Arc<InMemoryNodeEngines>);
+
+#[async_trait::async_trait]
+impl NodeEngines for SlowAnnotations {
+    fn names(&self, pool: &PoolRef) -> (String, String) {
+        self.0.names(pool)
+    }
+    async fn engine(
+        &self,
+        pool: &PoolRef,
+        fs_uuid: &str,
+        reads_secret: bool,
+    ) -> Result<engines::NodeEngine, constellation_control::proto::ControlError> {
+        self.0.engine(pool, fs_uuid, reads_secret).await
+    }
+    async fn existing(
+        &self,
+        unit: &str,
+    ) -> Result<Option<engines::NodeEngine>, constellation_control::proto::ControlError> {
+        self.0.existing(unit).await
+    }
+    async fn set_view_count(
+        &self,
+        unit: &str,
+        views: usize,
+    ) -> Result<(), constellation_control::proto::ControlError> {
+        tokio::time::sleep(Duration::from_millis(100 / views.max(1) as u64)).await;
+        self.0.set_view_count(unit, views).await
+    }
+}
+
+#[tokio::test]
+async fn concurrent_stages_leave_the_last_view_count_not_a_stale_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(InMemoryNodeEngines::new("node-a"));
+    let slow = SlowAnnotations(inner.clone());
+    let node = NodeService::new(
+        "node-a".into(),
+        None,
+        Arc::new(FakeMounter::default()),
+        StateStore::open(&dir.path().join("volumes")).unwrap(),
+    );
+    let record = |n: u32| {
+        let mut r = VolumeRecord::new(&format!("vol-{n}"), &dir.path().join(format!("s{n}")));
+        r.unit = "unit".into();
+        r.pod = "pod".into();
+        r
+    };
+    node.state.put(record(1)).unwrap();
+    // The first stage counts 1 and is slow to record it; the second
+    // stage's volume lands meanwhile and it counts 2.
+    let first = node.record_views(&slow, "unit", "pod");
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        node.state.put(record(2)).unwrap();
+        node.record_views(&slow, "unit", "pod").await
+    };
+    tokio::join!(first, second);
+    assert_eq!(inner.view_count("unit"), Some(2));
+}
+
+/// [`InMemoryNodeEngines`] whose `last-view-count` patches of unit
+/// `hung` never come back, as against a hung API server.
+struct HungAnnotations(Arc<InMemoryNodeEngines>);
+
+#[async_trait::async_trait]
+impl NodeEngines for HungAnnotations {
+    fn names(&self, pool: &PoolRef) -> (String, String) {
+        self.0.names(pool)
+    }
+    async fn engine(
+        &self,
+        pool: &PoolRef,
+        fs_uuid: &str,
+        reads_secret: bool,
+    ) -> Result<engines::NodeEngine, constellation_control::proto::ControlError> {
+        self.0.engine(pool, fs_uuid, reads_secret).await
+    }
+    async fn existing(
+        &self,
+        unit: &str,
+    ) -> Result<Option<engines::NodeEngine>, constellation_control::proto::ControlError> {
+        self.0.existing(unit).await
+    }
+    async fn set_view_count(
+        &self,
+        unit: &str,
+        views: usize,
+    ) -> Result<(), constellation_control::proto::ControlError> {
+        if unit == "hung" {
+            std::future::pending::<()>().await;
+        }
+        self.0.set_view_count(unit, views).await
+    }
+}
+
+#[tokio::test]
+async fn a_hung_view_count_patch_holds_up_neither_other_units_nor_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(InMemoryNodeEngines::new("node-a"));
+    let hung = HungAnnotations(inner.clone());
+    let mut node = NodeService::new(
+        "node-a".into(),
+        None,
+        Arc::new(FakeMounter::default()),
+        StateStore::open(&dir.path().join("volumes")).unwrap(),
+    );
+    node.annotation_timeout = Duration::from_millis(500);
+    for (n, unit) in [(1, "hung"), (2, "ok")] {
+        let mut r = VolumeRecord::new(&format!("vol-{n}"), &dir.path().join(format!("s{n}")));
+        r.unit = unit.into();
+        r.pod = format!("pod-{unit}");
+        node.state.put(r).unwrap();
+    }
+    let t0 = std::time::Instant::now();
+    let stuck = node.record_views(&hung, "hung", "pod-hung");
+    let other = async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        node.record_views(&hung, "ok", "pod-ok").await;
+        t0.elapsed()
+    };
+    let ((), other_done) = tokio::join!(stuck, other);
+    // The other unit's patch did not queue behind the hung one.
+    assert!(
+        other_done < Duration::from_millis(400),
+        "unit ok recorded after {other_done:?}"
+    );
+    assert_eq!(inner.view_count("ok"), Some(1));
+    // The hung patch gave up at the timeout, not never.
+    let all = t0.elapsed();
+    assert!(
+        all >= Duration::from_millis(500) && all < Duration::from_secs(5),
+        "{all:?}"
+    );
+    assert_eq!(inner.view_count("hung"), None);
+}

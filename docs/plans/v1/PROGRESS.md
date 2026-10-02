@@ -34424,3 +34424,128 @@ during a 90s cut (0 -> 0)`. That is the evidence for the fix.
 - `snapacct` and `web-ui-smoke` extensions (M5 / M6); the perf numbers
   (fio regression, GC `full` vs `diff`): M8.
 - `/metrics` export of the counters: M8.
+
+## Plan 37 K3 — Node service: stage, publish, mount, RWX (K3 closed)
+
+Milestone K3 of [plan 37](wip/37-kubernetes-csi.md) (§15) in two chunks.
+37-k3a built the Node service, node-owned engine pods and their security
+(the review fix round is above). 37-k3b added the `harness k8s-scenario`
+mode, the four K3 scenarios and the CSI CI jobs, and fixed one bug in
+k3a's node plugin. Pods mount pool PVs through FUSE sessions held by one
+engine pod per (pool, node). The data is shared across nodes, and the
+mounts outlive the plugin pods.
+
+| Item | State | Where |
+|---|---|---|
+| `NodeStageVolume`/`NodeUnstageVolume`: `fuse_mount_fd` on the staging path, then `view.mount{PreopenedFd{mountpoint, opts}}` over `SCM_RIGHTS` to the node-owned engine pod. The plugin closes its copy of the descriptor, and the pod is created on demand per §7 (minus GC/drain). `NodePublishVolume`/`NodeUnpublishVolume`: bind mounts, `ro` per mount. `requiresRepublish` restages onto a new engine-pod incarnation (settled decision 12) (37-k3a) | DONE | `crates/csi/src/node/` |
+| `NodeGetVolumeStats` and `NodeGetVolumeHealth` (`VolumeCondition` from the stage-time xattr baseline, §11). On-disk stage records hold no secrets; a still-served view is adopted after a lost record (37-k3a) | DONE | `crates/csi/src/node/{mod,state}.rs` |
+| Node-owned engine pods: one per filesystem per node (`constellation-engine-<unit>-<node>`), pinned and unprivileged, owned by the DaemonSet. Their control grant sits in a root-owned, read-only policy directory. The node ServiceAccount has no Secret verbs. ValidatingAdmissionPolicies pin both roles to exact engine-pod shapes (37-k3a) | DONE | `crates/csi/src/engine_pods.rs`, `deploy/helm/constellation-csi/templates/` |
+| K0's gap 3: `view.unmount` of a preopened session answered by ending the session. Only `SIGTERM` is deferred while views are served. Handover format v4 (37-k3a) | DONE | `crates/frontend-fuse/src/session.rs`, `crates/cli/src/{node_runtime,handover}.rs` |
+| Dedicated layout: `CreateVolume`/expand (37-k3a). Delete waits for K6b | DONE (delete: K6b) | `crates/csi/src/controller.rs` |
+| `tests/csi/sanity-kind.sh` (csi-sanity Node group against the real plugin on kind) and `tests/csi/k3-smoke.sh` (37-k3a) | DONE | `tests/csi/` |
+| **`harness k8s-scenario <name>... \| --all`** (37-k3b), a new harness mode. It reuses the kind cluster that `--kubeconfig`/`$KUBECONFIG` names, or creates `kind-harness` (`$KIND_CLUSTER`) from `tests/csi/kind-config.yaml` with a private kubeconfig and deletes it afterwards. It builds the image when it is missing (`make csi-image`), `kind load`s it, installs the chart, runs a private floci, and gives each scenario a namespace and a pool class. File operations run in pods as seeded shell scripts mirrored into the `Model`, and the oracle compares a listing taken in the pod (`Model::verify_observed`). `eventually()` sets the cross-node deadlines. Every scenario ends with a checked teardown: no FUSE mount is left at any volume's staging path, and the PVs are deleted. It SKIPs loudly without kubectl/helm/docker/kind. `--list` and `--results-json` (lane `linux-k8s-kind`) are available | DONE | `crates/harness/src/k8s.rs`, `crates/harness/src/k8s/{remote,scenarios}.rs`, `crates/harness/src/model.rs` |
+| Scenarios `csi-pod-rw`, `csi-rwx-across-nodes`, `csi-many-pvs-one-pool`, `csi-plugin-restart-survives` (TESTING.md has the table) | DONE | `crates/harness/src/k8s/scenarios.rs` |
+| **Bug fixed in 37-k3a's node plugin**: the engine pod's `last-view-count` annotation could be stale. Concurrent stages each counted and then patched, and their patches landed out of order: 23 of 25 views in `csi-many-pvs-one-pool`. The same race can leave `0` and `idle-since` on a pod that is serving, which is what K6b's idle GC collects. Counting and patching are now serialized. Unit test `concurrent_stages_leave_the_last_view_count_not_a_stale_one` fails without the fix | DONE | `crates/csi/src/node/{mod,tests}.rs` |
+| CI: `csi-unit` (`ci.yml`, `cargo test -p constellation-csi`); nightly `csi-sanity` (`make csi-sanity`, hosted runner) and `kind-e2e` (`tests/csi/sanity-kind.sh` + `harness k8s-scenario --all`). `kind-e2e` runs on a self-hosted `[self-hosted, linux, x64, fuse]` runner (K0, question 5) and is gated on the repository variable `CONSTELLATION_FUSE_RUNNER == 'true'`. Both join the nightly summary | DONE | `.github/workflows/{ci,nightly}.yml` |
+| TESTING.md "Kubernetes lane"; plan §15 K3 "37-k3b notes" | DONE | `docs/how-to-guides/development/TESTING.md`, plan 37 |
+
+**csi-sanity Node group on kind** (`tests/csi/sanity-kind.sh`, real FUSE
+staging mounts, a real node-owned engine pod, floci): `Ran 24 of 103 Specs`,
+`SUCCESS! -- 24 Passed | 0 Failed | 1 Pending | 78 Skipped`. On the
+in-memory backends (`make csi-sanity`): Identity 3 passed; Identity,
+Controller and Node 43 passed.
+
+**k8s-scenario** (`harness k8s-scenario --all`, a fresh harness-created
+cluster, seed 42): `csi-pod-rw` PASSED in 32.5 s, `csi-rwx-across-nodes` 61.9 s,
+`csi-many-pvs-one-pool` 105.6 s (50 PVs: 2 node engine pods with 25 views
+each, plus 1 controller engine pod), `csi-plugin-restart-survives` 83.0 s
+(379 writer iterations, 0 errors, engine pods unchanged). Result:
+`ALL K8S SCENARIOS PASSED`.
+
+### Decisions taken here (the brief left them open)
+
+- **Kind only.** The mode loads the image with `kind load` and reads the
+  workers' mount tables with `docker exec`. Any other cluster is refused,
+  with the reason. It reuses a cluster only when `--kubeconfig`/`$KUBECONFIG`
+  is given (never the ambient `~/.kube/config`). It refuses to create over
+  an existing cluster of the same name rather than delete it, because on a
+  shared host that cluster may be another run's.
+- **A new pool per scenario per run** (the prefix carries the run id). A
+  reused cluster then never meets engine state from an earlier filesystem,
+  which crash-loops on its registry record. Teardown force-deletes the
+  scope's engine pods, since nothing else would until K6b.
+- **Close-to-open, not stronger.** Visibility under the default
+  `--cto bounded` is eventual (DESIGN §"Close-to-open"). `csi-rwx-across-nodes`
+  therefore gives a reader 120 s to converge on the model, starts each writer
+  only once its own node has converged (an open after the other's close), and
+  asserts nothing about a lagging reader's intermediate views. A first draft
+  that asserted "no torn reads" during the catch-up was dropped as stronger
+  than close-to-open.
+- **Quotas are soft** (TESTING.md). `csi-many-pvs-one-pool` allows 2 MiB
+  past a cap before `ENOSPC`. The independence claim is what it checks
+  exactly: pv-00 is full at 16 MiB while pv-01 next to it takes 24 MiB, and
+  pv-05 takes more than pv-00's cap.
+- **`harness list` is unchanged.** Other tooling turns its names into
+  `harness run` arguments, so the k8s scenarios list under
+  `harness k8s-scenario --list` instead. `harness run <k8s name>` points
+  there.
+- **The workload pods run the driver image**, which has `sh` and coreutils
+  and is already loaded on every node. Content travels base64 in one script
+  per block. A unit test runs the generated scripts with the host's `sh` and
+  checks them with the local `Model::verify`.
+- **`kind-e2e` is not §13's sketch.** `install-native-s3.sh`,
+  `install-driver.sh`, `run-e2e.sh` and the `testdriver.yaml` e2e belong to
+  K7. The job runs the two lanes that exist, and each brings up its own
+  cluster.
+
+### Gates (37-k3b worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `k3b`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` | 2219 passed, 0 failed, 44 ignored |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `tests/integration.sh`'s body against the floci already on 4566 (another agent's; reused per the host rules), prefix `k3b-run-…` | SMOKE TEST PASSED |
+| `target/release/harness run --shard {1..4}/4` (191 scenarios) | 186 PASSED, 3 SKIPPED (`transport-refused-registration`, `transport-enomem-ring`, `transport-abort-while-armed`: no `io-uring` feature in the plain release build), 2 FAILED: `ack-s3-failover` (known bug: C won the takeover, not B) and `mkdir-p-race` (one `EEXIST` from `create_dir_all` under host load average ~100; it then passed 9 of 9 re-runs. It is a pre-existing race in the forwarded-mkdir path, and this chunk touches no engine code) |
+| `sudo … harness run subtree-confinement` (root) | PASSED |
+| `docker compose --profile test run --rm compliance` (private `SMOKE_IMAGE`, floci's host port dropped by an override because 4566 was taken) | `8798 passed, 0 failed`, COMPLIANCE TEST PASSED (baseline: 0 known failures) |
+| `make csi-sanity` | Identity 3 passed; Identity\|Controller\|Node 43 passed |
+| fresh `kind-37-k3b`, `tests/csi/sanity-kind.sh` (image `constellation-csi:k3b-final`, musl fast path) | 24 Passed, 0 Failed, 1 Pending, 78 Skipped |
+| fresh `kind-37-k3b`, `tests/csi/k3-smoke.sh` (same image; regression for the node-plugin fix) | k3-smoke PASSED |
+| `KIND_CLUSTER=kind-37-k3b target/release/harness k8s-scenario --all --image constellation-csi:k3b-final` (harness-created cluster, deleted at the end) | 4 PASSED: ALL K8S SCENARIOS PASSED |
+
+### Exit criteria (plan 37 §15 K3)
+
+- [x] CONVENTIONS gates (above; the two harness failures are a known bug and a pre-existing flake, both reported).
+- [x] csi-sanity's Node test group passes against a real kind cluster (24/24).
+- [x] A pod mounts a PV and reads and writes through it (`csi-pod-rw`, `k3-smoke`).
+- [x] The RWX-across-nodes `k8s-scenario` passes (`csi-rwx-across-nodes`).
+- [x] "Many PVs in one pool, across nodes" passes with exactly one engine pod per (pool, node), not one per PV (`csi-many-pvs-one-pool`: 2 for 50 PVs).
+- [x] CSI plugin restart: mounts survive (`csi-plugin-restart-survives`).
+- [x] `kind-e2e` CI job stood up with the `extraMounts` + privileged node-plugin config (self-hosted FUSE runner, gated on `CONSTELLATION_FUSE_RUNNER`).
+
+### 37-k3b review fix round
+
+| Item | State | Where |
+|---|---|---|
+| Must-fix 1(a): SIGINT/SIGTERM are an orderly stop (`crate::interrupt`). The first signal sets a flag. Commands (`run_cmd`, `make csi-image`) are killed and fail, and `eventually()` stops polling. The running scenario fails, the rest are SKIPPED, the results file is written, and the run tears down what it created: its floci, a cluster it created (whose deletion takes everything, so the per-scenario teardown is skipped then), or its namespaces, classes and engine pods on a reused or `--keep` cluster. Teardown runs under a `Teardown` guard that lets its own commands finish. A second signal `_exit(130)`s at once | DONE | `crates/harness/src/{interrupt,k8s}.rs`, `scenarios.rs` (`eventually`) |
+| Must-fix 1(b): `kind-e2e`'s `if: always()` step deletes `nightly-sanity-kind`, `nightly-k8s-harness` and any `nightly-k8s-harness-k8s-floci*` | DONE | `.github/workflows/nightly.yml` |
+| Should-fix 1: the cluster's drop guard is armed only after `kind create cluster` succeeds. A create that this run killed (interrupted) is deleted explicitly, because it was past kind's own existence check | DONE | `k8s.rs` (`Cluster::acquire`) |
+| Should-fix 2: one `last-view-count` lock per engine-pod unit, and the PATCH bounded at 10 s (on timeout: a `warn`, and the unit's next stage or unstage records the count). Test `a_hung_view_count_patch_holds_up_neither_other_units_nor_its_own`. Plan §15 K6 gains a K6b rule: idle GC re-checks with `view.list` and never trusts the annotation alone | DONE | `crates/csi/src/node/{mod,tests}.rs`, plan 37 |
+| Should-fix 3: the floci container is `<cluster>-k8s-floci-<run id>` (run id = seconds-pid, also in namespaces and prefixes). Module docs and TESTING.md say a reused cluster is taken over: helm values are reset and `csi-plugin-restart-survives` deletes the plugin pods | DONE | `k8s.rs`, TESTING.md |
+| Nits: `--results-json` written when setup fails (every selected scenario failed, with the reason); the namespace is no longer leaked when the StorageClass apply fails; pv-00 and pv-05 `ENOSPC` lower bounds (cap − seeded tree − 2 MiB; observed 15 MiB and 7 MiB); `--list` doc; the TESTING.md example builds the tag it uses; the module-doc line wrap; a `:`-separated `$KUBECONFIG` is refused with a clear message | DONE | `k8s.rs`, `k8s/scenarios.rs`, `main.rs`, TESTING.md |
+| **Found by the SIGINT test, fixed:** on a reused cluster every scenario left its controller-owned engine pod behind, which then crash-looped once floci was gone. Two causes. The teardown selected pods by `fs-uuid`, which controller-owned pods do not carry; it now selects by `constellation.dev/pool`, computed with a copy of the driver's `pool_label` that a unit test pins. And the provisioner may repeat `DeleteVolume` after the PV is gone (seen 18 s later), so the controller recreates its pod. Teardown now deletes until none has come back for 30 s, at most 180 s | DONE | `k8s.rs` (`Scope::teardown`, `pool_label`) |
+
+Gates of the fix round (`CARGO_TARGET_DIR` unset; image
+`constellation-csi:k3b-fix`, musl fast path): fmt and clippy clean;
+`cargo test --workspace` 2287 passed, 0 failed, 46 ignored; `bash
+tests/smoke.sh` PASSED; `make csi-sanity` 3 + 43 passed; `KIND_CLUSTER=kind-37-k3b
+harness k8s-scenario --all` on a created cluster: 4 PASSED (69.3 s,
+71.2 s, 283.3 s, 129.1 s, under a concurrent `cargo test`), cluster and floci gone;
+`tests/csi/k3-smoke.sh` PASSED. SIGINT tests: SIGINT mid-`csi-many-pvs-one-pool` on
+a created cluster led to exit 1 within about 1 s, with no cluster, no containers and a results file that
+says interrupted. On a reused cluster the namespace, StorageClass, PVs,
+engine pods and floci were gone, the cluster was kept, and no engine pod
+came back within 45 s. `csi-pod-rw` passed on that reused cluster and left
+0 engine pods. SIGINT followed by SIGTERM led to exit 130 at once, and
+`kind-e2e`'s cleanup commands removed what was left.

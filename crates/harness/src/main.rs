@@ -7,6 +7,7 @@
 //!               [--s3-backend docker|process] [--frontend fuse]
 //!   harness smoke [BACKEND]
 //!   harness interop write|verify --bucket-dir DIR
+//!   harness k8s-scenario <name>...|--all [--kubeconfig PATH] [--chart DIR] [--image IMG]
 //!
 //! Requires: fusermount3, a release `constellation` binary
 //! (CONSTELLATION_BIN or target/release/constellation), and for the default
@@ -20,6 +21,7 @@ use constellation_harness::caps;
 use constellation_harness::corpus;
 use constellation_harness::csi_meta_ladder;
 use constellation_harness::interop;
+use constellation_harness::k8s;
 use constellation_harness::metabench;
 use constellation_harness::results::{self, Outcome, RunResults, Shard};
 use constellation_harness::s3env::{self, S3Backend};
@@ -83,6 +85,54 @@ enum Command {
         /// checker's wildcard for it) without a second frontend.
         #[arg(long = "without-cap", value_name = "CAP")]
         without_caps: Vec<caps::Cap>,
+    },
+    /// Plan 37 §12: scenarios driven through a kind cluster running the
+    /// CSI driver (`kubectl`/`helm`; see the `k8s` module docs). Reuses
+    /// the kind cluster `--kubeconfig`/$KUBECONFIG names, else creates
+    /// `kind-harness` and deletes it afterwards. SKIPs loudly without
+    /// kubectl, helm, docker or kind ($KIND_BIN).
+    K8sScenario {
+        /// Scenario names (see `--list`).
+        names: Vec<String>,
+        /// Run every k8s scenario.
+        #[arg(long)]
+        all: bool,
+        /// List the k8s scenarios (they are not in `harness list`, whose
+        /// names are all `harness run`'s).
+        #[arg(long)]
+        list: bool,
+        /// Kubeconfig of an existing kind cluster to reuse (default:
+        /// $KUBECONFIG; neither: create one).
+        #[arg(long)]
+        kubeconfig: Option<std::path::PathBuf>,
+        /// Context within --kubeconfig (default: its current context).
+        #[arg(long)]
+        context: Option<String>,
+        /// The Helm chart (default: deploy/helm/constellation-csi).
+        #[arg(long)]
+        chart: Option<std::path::PathBuf>,
+        /// The driver image; built with `make csi-image` when absent from
+        /// the local docker (or with --build), then `kind load`ed.
+        #[arg(long, default_value = "constellation-csi:dev")]
+        image: String,
+        /// Rebuild --image even when it exists.
+        #[arg(long)]
+        build: bool,
+        /// The driver's namespace.
+        #[arg(long, default_value = "constellation-csi")]
+        namespace: String,
+        /// Workload seed.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Write a results file (the `harness run` format).
+        #[arg(long, value_name = "PATH")]
+        results_json: Option<std::path::PathBuf>,
+        /// Lane recorded in the results file (default: linux-k8s-kind).
+        #[arg(long)]
+        lane: Option<String>,
+        /// Keep a cluster this run created (its kubeconfig path is printed).
+        #[arg(long)]
+        keep: bool,
     },
     /// Port of tests/smoke.sh: create a fs, mount, exercise POSIX ops,
     /// remount and verify persistence. BACKEND is a local directory (the
@@ -277,6 +327,40 @@ fn main() -> Result<()> {
             frontend,
             without_caps,
         }),
+        Command::K8sScenario { list: true, .. } => {
+            for s in k8s::K8S_SCENARIOS {
+                println!("{:28} {}", s.name, s.desc);
+            }
+            Ok(())
+        }
+        Command::K8sScenario {
+            names,
+            all,
+            list: false,
+            kubeconfig,
+            context,
+            chart,
+            image,
+            build,
+            namespace,
+            seed,
+            results_json,
+            lane,
+            keep,
+        } => k8s::run(k8s::Opts {
+            names,
+            all,
+            kubeconfig,
+            context,
+            chart,
+            image,
+            build,
+            namespace,
+            seed,
+            results_json,
+            lane,
+            keep,
+        }),
         Command::Smoke { backend } => smoke::run(backend),
         Command::Interop { action } => match action {
             InteropAction::Write {
@@ -459,6 +543,9 @@ fn run(opts: RunOpts) -> Result<()> {
                 .find(|s| s.name == n)
             {
                 Some(s) => v.push(s),
+                None if k8s::K8S_SCENARIOS.iter().any(|k| k.name == n) => {
+                    bail!("{n:?} is a Kubernetes scenario: `harness k8s-scenario {n}`")
+                }
                 None => bail!("unknown scenario {n:?} (try `harness list`)"),
             }
         }
