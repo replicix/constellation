@@ -39,11 +39,10 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::store::misc::{add_pending_claim_tx, cr_key};
+use crate::store::misc::{add_pending_claim_tx, cr_key, remove_pending_row_tx};
 use crate::store::Meta;
 use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
 use fjall::Readable;
-use std::collections::{BTreeSet, HashMap};
 
 const REMOTE_PREFIX: &[u8] = b"remote-chunk/";
 
@@ -83,13 +82,13 @@ fn decode_mark(key: &[u8], value: &[u8]) -> Option<RemoteChunk> {
     })
 }
 
-/// Pending uploads, looked up per `(hash, ino)` row, with the whole table
-/// read only when a spilled manifest (whose chunk list is not in the
-/// record) needs "does this inode have any pending row".
+/// Pending uploads, looked up per `(hash, ino)` row, and per inode
+/// through the `pending_upload_by_ino` mirror when a spilled manifest
+/// (whose chunk list is not in the record) needs "every pending row of
+/// this inode".
 pub(crate) struct PendingView<'a, R: Readable> {
     r: &'a R,
     meta: &'a Meta,
-    by_ino: Option<HashMap<Ino, BTreeSet<ChunkHash>>>,
     empty: bool,
 }
 
@@ -102,12 +101,7 @@ impl<'a, R: Readable> PendingView<'a, R> {
                 false
             }
         };
-        Ok(Self {
-            r,
-            meta,
-            by_ino: None,
-            empty,
-        })
+        Ok(Self { r, meta, empty })
     }
 
     fn row(&self, hash: &ChunkHash, ino: Ino) -> Result<bool, MetaError> {
@@ -115,27 +109,6 @@ impl<'a, R: Readable> PendingView<'a, R> {
             .r
             .get(&self.meta.pending_upload, cr_key(hash, ino))?
             .is_some())
-    }
-
-    fn ino_has_any(&mut self, ino: Ino) -> Result<bool, MetaError> {
-        if self.by_ino.is_none() {
-            let mut map: HashMap<Ino, BTreeSet<ChunkHash>> = HashMap::new();
-            for guard in self.r.iter(&self.meta.pending_upload) {
-                let (k, _) = guard.into_inner()?;
-                if k.len() != 40 {
-                    return Err(MetaError::Invalid("pending_upload key length".into()));
-                }
-                let hash = ChunkHash(k[..32].try_into().expect("32 bytes"));
-                let ino = u64::from_be_bytes(k[32..].try_into().expect("8 bytes"));
-                map.entry(ino).or_default().insert(hash);
-            }
-            self.by_ino = Some(map);
-        }
-        Ok(self
-            .by_ino
-            .as_ref()
-            .and_then(|m| m.get(&ino))
-            .is_some_and(|s| !s.is_empty()))
     }
 
     /// Whether any `WriteManifest` in `records` names a chunk that still
@@ -185,14 +158,7 @@ impl<'a, R: Readable> PendingView<'a, R> {
                 Ok(ChunkInfo::Inline(chunks)) => chunks.into_values().collect(),
                 // The list is not in the record (or the record is
                 // unreadable): every pending row of the inode counts.
-                _ => {
-                    self.ino_has_any(*ino)?;
-                    self.by_ino
-                        .as_ref()
-                        .and_then(|m| m.get(ino))
-                        .map(|s| s.iter().copied().collect())
-                        .unwrap_or_default()
-                }
+                _ => crate::store::misc::pending_for_ino_tx(self.r, self.meta, *ino)?,
             };
             for hash in &named {
                 if self.foreign_row(hash, *ino, node)? {
@@ -246,7 +212,7 @@ impl Meta {
         value.extend_from_slice(&now_ms.to_be_bytes());
         let mut tx = self.db.write_tx();
         for hash in hashes {
-            add_pending_claim_tx(&mut tx, &self.pending_upload, hash, ino)?;
+            add_pending_claim_tx(&mut tx, self, hash, ino)?;
             tx.insert(&self.local, remote_key(hash, ino), value.clone());
         }
         tx.commit()?;
@@ -326,7 +292,7 @@ impl Meta {
                 if let Some(mark) = decode_mark(&k, &v) {
                     let row = cr_key(&mark.hash, mark.ino);
                     if tx.get(&self.pending_upload, &row)?.is_some() {
-                        tx.remove(&self.pending_upload, row);
+                        remove_pending_row_tx(&mut tx, self, &mark.hash, mark.ino);
                         acked.push((mark.hash, mark.ino));
                     }
                 }

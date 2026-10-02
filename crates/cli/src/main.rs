@@ -82,8 +82,9 @@ enum Command {
         /// Filesystem source name reported by mount tools.
         #[arg(long)]
         fs_name: Option<String>,
-        /// What fsync() waits for: "local" (journal on disk; background
-        /// ship) or "s3" (record durable in the shared log).
+        /// What fsync() waits for: "local" (the file's queued chunks in
+        /// S3, the journal on disk; background ship) or "s3" (also the
+        /// record durable in the shared log).
         #[arg(long)]
         fsync_mode: Option<String>,
         /// Plan 39: bound how long fsync() waits for an unreachable S3

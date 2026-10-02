@@ -145,11 +145,11 @@ pub(crate) fn enroll_adopted_manifest_tx(
     match m.chunks {
         ChunkInfo::Inline(chunks) => {
             for hash in chunks.values() {
-                crate::store::misc::add_pending_claim_tx(tx, &meta.pending_upload, hash, ino)?;
+                crate::store::misc::add_pending_claim_tx(tx, meta, hash, ino)?;
             }
         }
         ChunkInfo::Spilled(blob) => {
-            crate::store::misc::add_pending_claim_tx(tx, &meta.pending_upload, &blob, ino)?;
+            crate::store::misc::add_pending_claim_tx(tx, meta, &blob, ino)?;
             tx.insert(&meta.local, adopted_spill_key(ino, &blob), Vec::new());
         }
     }
@@ -195,7 +195,7 @@ impl Meta {
             return Ok(());
         }
         for hash in chunks {
-            crate::store::misc::add_pending_claim_tx(&mut tx, &self.pending_upload, hash, ino)?;
+            crate::store::misc::add_pending_claim_tx(&mut tx, self, hash, ino)?;
         }
         tx.remove(&self.local, adopted_spill_key(ino, blob));
         tx.commit()?;
@@ -861,7 +861,7 @@ impl Meta {
                 .get(&self.pending_upload, pending_key(hash, ino))?
                 .is_some()
             {
-                tx.remove(&self.pending_upload, pending_key(hash, ino));
+                crate::store::misc::remove_pending_row_tx(&mut tx, self, hash, ino);
                 pending_removed += 1;
             }
             if tx.get(&self.local, poison_key(hash, ino))?.is_some() {

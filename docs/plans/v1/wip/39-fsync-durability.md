@@ -10,7 +10,9 @@ bounded by an explicit, documented operator opt-in
 (`--fsync-timeout`), the analogue of nfs(5)'s `soft`. It also makes
 `fsyncdir` a real barrier and reports a lock-fence discard to every open file
 description errseq-style. It does **not** change what each `--fsync-mode`
-waits *for* (§6).
+waits *for* (§6) — chunk 39b then did, by the maintainer's decision: an
+`fsync` drains all of the file's queued chunks in both modes, epochs
+included (§6).
 
 The decision (hard by default, soft on request, never break consistency or
 durability) was taken by the maintainer before this plan was written; this
@@ -199,12 +201,12 @@ the classified `SyncFailure` the sync task now replies with. The loop then:
   fence, a local error): returned as it was, unretried.
 
 A failed attempt never loses its place: **every retry, and the first attempt
-of an `fsync` after a failed one, drains the inode's pending chunks again**
-(`View::fsync_owed` across `fsync`s, the attempt counter within one), because
-the write session was already published and `flush_inode` alone would not wait
-for them. That closes the latent false success of §1. What it drains is still
-only what the mode waits for: nothing in an active continuation epoch, where
-`flush_detached` skips the drain too (§6).
+of an `fsync` after a failed one, drains the inode's pending chunks again**,
+because the write session was already published and `flush_inode` alone would
+not wait for them. That closes the latent false success of §1. (As first
+landed this was an in-memory, per-view `fsync_owed` set plus an attempt
+counter, and skipped in an active continuation epoch; chunk 39b replaced both
+with "every `fsync` drains the inode's `pending_upload` rows", §6.)
 
 The other sync-path waits found: the forwarded/in-doubt manifest commit
 (`submit_to_core`'s `InDoubt`, `Busy`/`NotHolder`, `Held`) is noted transient,
@@ -219,9 +221,9 @@ bounds a *reader's* wait for a non-owner's chunk, not an `fsync`'s, and is
 unchanged.
 
 `O_SYNC`/`O_DSYNC` writes (a write plus an `fdatasync`) take the same loop
-(`View::flush_sync_write`), with the same owed bookkeeping — a failed one
-leaves the inode owed, so the next `fsync` drains again instead of finding no
-write session and answering 0 — and, like `fsync`, wait on the `fsync` pool,
+(`View::flush_sync_write`) — a failed one leaves its chunks pending, so the
+next `fsync` drains them instead of finding no write session and answering 0
+— and, like `fsync`, wait on the `fsync` pool,
 never on a frontend worker, ended early by the caller's death (§3.3) or the
 soft timeout/kernel cap. Cut short they answer **`EIO`**, never `EINTR`: the
 bytes are written, but an `O_SYNC` write that returns claims them durable, and
@@ -360,7 +362,11 @@ errseq semantics for the lock fence's discards:
 | `fsync` journal barrier (`--fsync-mode s3`) | one round, `EIO` if it failed | same loop, the round's text classified |
 | `fsync` forwarded commit in doubt | `EIO` | retried (same rid semantics); its reply wait honours the kill, timeout and cap |
 | second `fsync` after a failed one (`local`) | could return 0 with chunks unuploaded | drains again: never a false success |
-| `O_SYNC`/`O_DSYNC` write | as `fsync`'s old behaviour, on the worker | as `fsync`'s new one, on the `fsync` pool, killable; `EIO` (not `EINTR`) when cut short; a failure leaves the inode owed |
+| `fsync` of a file closed under `--write-mode back`, or after a failed close (`local`; 39b) | 0 with the chunks only on this node | drains every `pending_upload` row of the inode, whoever queued it |
+| `fsync`/`O_SYNC` inside a continuation epoch (`local`; 39b) | 0 once the epoch is active, chunks only on this node | waits for the bucket (or a peer's handoff), hard-mount style |
+| `fsync` with a queued chunk lost from the cache and not in S3 (39b review) | 0 (the pass counted it unrecoverable) | `EIO`, every time while the row stays |
+| `fsync` on the sequencer of another node's `back` close, chunks still on the writer (`local`; 39b review) | 0 | waits until they are in S3, hard-mount style |
+| `O_SYNC`/`O_DSYNC` write | as `fsync`'s old behaviour, on the worker | as `fsync`'s new one, on the `fsync` pool, killable; `EIO` (not `EINTR`) when cut short; a failure leaves its chunks pending, and the next `fsync` drains them |
 | `fsyncdir` | `ENOSYS` → kernel no-ops forever | the barrier |
 | `FUSE_INTERRUPT` | `ENOSYS` → `no_interrupt` | marks a waiting `fsync`/`fsyncdir`/`O_SYNC` write; ended only once its caller has a fatal signal pending |
 | lock-fence discard | `EIO` once per inode | `EIO` once per description open at the discard, across mounts of the node and across `daemon --upgrade` |
@@ -389,41 +395,104 @@ All five landed in one chunk (`PROGRESS.md`, "Plan 39"), then a review round
 node-wide discard-error lifetime, the remaining sync-path waits made
 interruptible, the slow-first-attempt warning).
 
-## 6. Open: `--fsync-mode local` semantics
+## 6. Decided (chunk 39b): `--fsync-mode local` semantics
 
-**Deferred to the maintainer** (a separate analysis is in progress). Today
-`--fsync-mode local` does wait for the inode's chunk uploads when the `fsync`
-publishes a write session (the flush is force-through), but not for the
-journal, and not at all inside an active continuation epoch (plan 30 §M10:
-a single node's S3 cut starts one within about a second, after which `local`
-`fsync`s return once the node's own store is on disk). Whether `local` should
-keep waiting for chunk uploads is that analysis's question. **This plan does
-not change what any mode waits for**; it changes only how failures and
-outages are handled *while* waiting. In particular the owed drain of §3.2
-applies the epoch rule exactly as `flush_detached` does, and the outage
-scenarios run under `--fsync-mode s3`, where the wait for the bucket is the
-mode's contract regardless of epochs.
+**Decided by the maintainer: an `fsync` makes all of the file's outstanding
+data durable in S3, in both modes, whichever descriptor or process wrote it**
+— the Linux `fsync(2)` contract ("all modified in-core data of the file"), the
+one PostgreSQL's checkpointer relies on (backends write and close; the
+checkpointer later opens and `fsync`s). So:
 
-**Recorded outcome of this plan under `local` (review, to be fixed by chunk
-39b).** Traced by the reviewer: a `local` `fsync` started *before* an epoch
-drains on its first attempt, which fails as transient; its retry's owed drain
-is gated on `!epoch_active()`, and `finish_flush` returns `through &&
-!epoch_active`. Once the continuation epoch activates (about 1 s into a
-single-node or whole-cluster cut), the retry skips the drain and `meta.sync()`
-returns 0. So **a `local` `fsync` started before an epoch can succeed with its
-chunks only on this node (its cache and `pending_upload` rows) once the epoch
-activates** — process-crash/reboot durability, not node-loss durability.
-Before plan 39 the same `fsync` returned `EIO`. That is consistent with plan
-30's epoch rule but not with `writeback.rs`'s "applications asking for a
-barrier keep the stronger rule" outside the epoch exception. Separately,
-`local` never drains chunks published by an earlier `close()` under
-`--write-mode back`, or after a failed write-through close, since
-`flush_inode` then finds no session. **Chunk 39b** owns the fix: on every
-`fsync` in both modes drain the inode's `pending_upload` rows rather than rely
-on "this `fsync` published a session", decide explicitly whether an epoch
-exempts that (and remove the epoch gate from the owed drain if not), fold
-`fsync_owed` (per view, in memory) into that rule, and update `writeback.rs`
-and this section.
+- **`--fsync-mode local`**: the file's chunks are in S3 and this node's
+  metadata store is synced (plus whatever the ack policy gives the
+  manifest). **`--fsync-mode s3`**: additionally the journal up to the call
+  is shipped. What `s3` waits for is unchanged.
+- **The drain is the file's, not the call's.** Every `fsync` (`fdatasync`,
+  `O_SYNC`/`O_DSYNC` write) drains the inode's rows in the durable
+  `pending_upload` table (`View::durable_run`, `Meta::upload_pending_for_ino`)
+  after publishing its write session — instead of relying on "this `fsync`
+  published a session". That covers an earlier `close()` under
+  `--write-mode back`, a failed write-through close, a failed earlier `fsync`
+  or `O_SYNC` write, and a retry within one call. An inode with no row costs
+  one seek in the table's by-inode mirror (`pending_upload_by_ino`, a meta
+  keyspace kept in the same transaction as every row; built once at open on
+  an older store) and no sync-task round trip; the drain lists just that
+  inode's rows the same way (O(rows of the inode), not O(queue)).
+- **`fsync_owed` is gone.** The per-view, in-memory set (and the per-call
+  "owes a drain" flag) only approximated the table: it missed the `back`
+  close and the failed close, did not cross views of the node, and was lost
+  on restart. Nothing of it remains; the table is the source of truth.
+- **No epoch exemption for the barrier.** The review traced that once a
+  continuation epoch activates (about 1 s into a cut) a `local` `fsync`'s
+  retry skipped the owed drain and returned 0 with the chunks only on this
+  node. Checked for a consistency reason the epoch must exempt the drain and
+  found none: chunks are content-addressed and immutable, uploading one
+  early never violates "the log names no chunk S3 lacks" (the invariant runs
+  the other way), the drain holds no inode or shard lock while it waits
+  (`flush_inode` returns before it), and `--fsync-mode s3`'s barrier already
+  drains inside epochs. The epoch's rule — its writes are as durable as their
+  nodes — stays for `close()` (`finish_flush` still skips the drain there)
+  and every other mutation; an `fsync` asks for more, so it waits for the
+  bucket, or for a peer that can reach it (the drain's chunk handoff), under
+  §3's policy, bounded only by `--fsync-timeout` and the kernel cap. In a
+  whole-cluster outage that means a `local` `fsync` now waits for S3 to
+  return, as `s3`'s always did.
+- **The sequencer learns at once.** An `fsync`'s drain delivers the durable
+  reports *this file's* uploads owe (`meta::store::remote`,
+  `SyncRequest::DrainInode { fsync: true }`) before it replies, each send
+  bounded (2 s), instead of in the background — also when the drain
+  succeeded through a peer handoff; other files' reports stay with the
+  background passes. When the `fsync` returns, the sequencer a `back` close
+  forwarded the manifest to has acked the chunks, and a reader there does not
+  wait `CONSTELLATION_REMOTE_CHUNK_WAIT_S` for a report that died with the
+  writer.
+- **A lost chunk is `EIO`, every time.** A pending chunk of the file that is
+  in neither this node's cache nor S3 (a torn disk) was counted by the upload
+  pass as unrecoverable and the inode drain answered success. Now an
+  `fsync`'s drain fails `DrainShortfall::Lost`, permanent (`EIO`), the row
+  stays, and every later `fsync` of the file fails the same way until the
+  data is rewritten or the file removed — never 0. Closes and the background
+  rounds keep plan 30 §M4's behaviour (record it, hold only the records that
+  need it).
+- **`fsyncdir`**: unchanged. A directory has no chunks of its own (no
+  `pending_upload` rows), so the drain finds nothing; it covers its entries'
+  mutations, committed at the sequencer when each op returned, the local
+  store synced and, under `s3`, the journal shipped — not its files' data
+  (`fsync` each file, as on Linux).
+- **Chunks queued on other nodes, as this node sees them** (decided in the
+  39b review round). A `back` close on node A forwards its manifest to the
+  sequencer B with the chunks still pending on A; B enrolls them as remote
+  rows of the inode (`meta::store::remote`). An `fsync` of the file on B now
+  waits for those rows too — their reports, or B's own S3 checks, ack them —
+  under §3's policy: hard by default, bounded by `--fsync-timeout` and an
+  interrupt; each drain attempt waits up to 5 s (or
+  `CONSTELLATION_REMOTE_CHUNK_WAIT_S` if shorter) and then fails
+  `DrainShortfall::AwaitingRemote`, transient, so the retry loop's backoff,
+  warning and timeout apply. `CONSTELLATION_REMOTE_CHUNK_WAIT_S` running out
+  never turns into a 0 for an `fsync` (it still bounds a barrier round's and
+  a reader's wait). Under `s3` this was already the barrier's effect (the
+  held record kept it from completing); now `local` matches. A node that
+  neither wrote the file nor sequenced the close has no row and does not
+  wait: it cannot see A's queue. Where node disks are ephemeral the journal
+  is the remaining single copy until it ships, hence plan 37's
+  recommendation of `--fsync-mode s3` / `ack_policy = s3` as the
+  StorageClass default.
+
+Tests: `view::fsync_drain_tests` (a real engine, background uploads held: a
+`back` close, then `open` + `fsync` from another view and process — every
+queued chunk is in the bucket when it returns, both modes; a through-closed
+file's `fsync` runs no upload pass and no PUT; a lost chunk is `EIO` twice in
+a row, both modes; remote rows are waited for until the chunk is in S3, both
+modes, and a soft timeout ends that wait `EIO`),
+`authority_driver::tests::an_fsync_drain_through_a_handoff_reports_before_it_returns`,
+`upload::…::an_fsync_takes_only_its_own_files_reports`,
+`meta::store::misc::…::the_by_ino_mirror_follows_every_row` and
+`a_store_from_before_the_mirror_builds_it_at_open`, `durable_ack_tests::
+an_fsync_drains_a_back_closes_chunks_in_and_out_of_an_epoch`,
+`an_fsync_with_nothing_pending_asks_for_no_drain`; harness
+`writeback-fsync`'s second phase (B sequences, A writes under `back` with its
+uploads held, closes, re-opens and `fsync`s, is killed: B reads the file at
+once, from S3). PROGRESS, "Plan 39 — 39b".
 
 ## 7. Exit criteria
 

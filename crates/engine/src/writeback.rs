@@ -1,17 +1,53 @@
 //! Streaming-write and write-back policy (plan 08).
 //!
-//! The data plane has one durable queue: SQLite's `pending_upload`
-//! table. Write-through waits for that queue (scoped to the inode when
-//! possible); write-back journals locally and lets the existing sync
-//! task drain it before shipping metadata. There is deliberately no
-//! second background-upload path: continuation epochs, normal
-//! write-back, handoff, leave, and unmount all meet at the same drain.
+//! The data plane has one durable queue: the metadata store's (fjall)
+//! `pending_upload` partition. Write-through waits for that queue (scoped
+//! to the inode when possible); write-back journals locally and lets the
+//! existing sync task drain it before shipping metadata. There is
+//! deliberately no second background-upload path: continuation epochs,
+//! normal write-back, handoff, leave, and unmount all meet at the same
+//! drain.
 //!
 //! `fsync`, `fdatasync`, `O_SYNC`, and `--fsync-mode s3` conservatively
 //! force write-through. A local-only fsync could satisfy POSIX and
 //! survive process crash/reboot, but acknowledging bytes that still
 //! disappear with permanent node loss is surprising. Applications
 //! explicitly asking for a barrier therefore keep the stronger rule.
+//!
+//! **The rule is the file's, not the call's** (plan 39b). Linux `fsync(2)`
+//! makes "all modified in-core data of the file" durable, whichever
+//! descriptor or process wrote it — a PostgreSQL checkpointer `fsync`s
+//! files its backends wrote and closed. So an `fsync` (and `fdatasync`,
+//! and an `O_SYNC`/`O_DSYNC` write) drains every `pending_upload` row of
+//! the inode, in both `--fsync-mode`s (`View::durable_run`): the chunks an
+//! earlier `close()` under `back` queued, a failed write-through close's,
+//! a failed earlier `fsync`'s. `--fsync-mode local` then means "this
+//! file's chunks in S3 and this node's metadata store synced" (plus what
+//! the ack policy gives); `s3` additionally ships the journal.
+//!
+//! Before 39b this was asymmetric. `flush_inode` only drains a write
+//! session it publishes, so under `local` an `open` + `fsync` of a file
+//! closed under `back` found no session and returned with the chunks
+//! still only on this node; only `s3`'s barrier drained them. And inside
+//! a continuation epoch (plan 30 §M10) a `local` `fsync` skipped the drain
+//! altogether — including the retry of one started before the epoch,
+//! which then succeeded once the epoch activated. Both are gone: the
+//! epoch exempts a `close()` (`finish_flush` still skips its drain there),
+//! never a barrier, which waits for the bucket — or a peer's handoff —
+//! like an NFS `hard` mount, bounded only by `--fsync-timeout` (plan 39).
+//! The per-view, in-memory "owed" set plan 39 added for a failed `fsync`
+//! is gone with it: the durable table is the source of truth, survives a
+//! restart, and covers every way a chunk can be left behind. An inode
+//! with nothing pending costs one seek in the table's by-inode mirror
+//! (`pending_upload_by_ino`), no sync-task round trip.
+//!
+//! Never a false success: a queued chunk of the file that is in neither
+//! this node's cache nor S3 (a torn disk) fails the `fsync` `EIO`, now
+//! and every time after while its row stays; and on the node that
+//! sequenced another node's `back` close, the rows that close forwarded
+//! as pending (`meta::store::remote`) are waited for until the writer's
+//! upload lands — the `fsync` covers the file's chunks queued anywhere as
+//! this node sees them.
 //!
 //! Dirty pressure follows DESIGN.md §9: clean eviction happens inside
 //! `DiskCache::insert`, then writes are delayed increasingly from 75%

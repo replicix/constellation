@@ -4,8 +4,9 @@
 //! **Waits.** [`View::fsync_durable`] is what an `fsync` (and `fsyncdir`,
 //! which is the same barrier applied to a directory's committed entries)
 //! does once the lock fence let it through: publish the write session,
-//! drain what a failed earlier `fsync` left pending, and the barrier of the
-//! mount's `--fsync-mode` — retried through `crate::fsync_wait` while S3 is
+//! drain every chunk of the file still pending upload on this node,
+//! whoever queued it (plan 39b), and the barrier of the mount's
+//! `--fsync-mode` — retried through `crate::fsync_wait` while S3 is
 //! transiently away. A frontend that answers from another thread runs it on
 //! the `fsync` pool (`crate::fsync_wait::pool`), never on its own worker.
 //!
@@ -186,68 +187,52 @@ impl View {
         level: Durability,
         cancel: Option<constellation_vfs::CancelToken>,
     ) -> Result<(), Code> {
-        // A retry, or the first attempt after an `fsync` that failed, owes
-        // the drain an earlier attempt's publication already started: the
-        // write session is gone (published), so `flush_inode` alone would
-        // not wait for its chunks again and the retry would report durable
-        // what is not. What it waits for is still what the first attempt
-        // would have: nothing in an active continuation epoch (plan 30
-        // §M10: the epoch's writes are as durable as their nodes, and
-        // `flush_detached` skips the drain there too).
-        self.owing_run(ino, cancel, || self.sync_barrier_at(ino, level))
+        self.durable_run(ino, cancel, || self.sync_barrier_at(ino, level))
     }
 
     /// The retry loop shared by `fsync` and an `O_SYNC` write: publish
-    /// `ino` write-through, drain what an earlier failed attempt (or a
-    /// failed earlier call, `fsync_owed`) left pending, then `then`. The
-    /// owed mark is kept exactly while the last such call failed.
-    fn owing_run(
+    /// `ino` write-through, then drain every chunk of `ino` still in the
+    /// durable `pending_upload` table, then `then`.
+    ///
+    /// Plan 39b: the drain is the file's, not the call's. Linux `fsync(2)`
+    /// covers "all modified in-core data of the file", whoever wrote it —
+    /// a PostgreSQL checkpointer `fsync`s files backends wrote and closed
+    /// — so in both `--fsync-mode`s this waits for the chunks an earlier
+    /// `close()` under `--write-mode back` left queued, a failed
+    /// write-through close's, a failed earlier `fsync`'s or `O_SYNC`
+    /// write's (what the per-view, in-memory `fsync_owed` set used to
+    /// track; the table is the source of truth and survives a restart),
+    /// and a retry's own. And it waits for them in a continuation epoch
+    /// too (plan 30 §M10), hard-mount style: the epoch exempts a
+    /// `close()`, never a barrier. An inode with no pending row costs one
+    /// seek in the table's by-inode mirror and no sync-task round trip.
+    /// The drain itself (`SyncRequest::DrainInode { fsync: true }`) never
+    /// answers success with a row of the inode left: a lost chunk is a
+    /// permanent failure, rows another node still has to upload a
+    /// transient one this loop waits out.
+    fn durable_run(
         &self,
         ino: Ino,
         cancel: Option<constellation_vfs::CancelToken>,
         then: impl Fn() -> Result<(), Code>,
     ) -> Result<(), Code> {
-        let mut owed = self.fsync_owed.lock().unwrap().contains(&ino);
-        let result = self.fsync_waits().run(ino, cancel, || {
-            let owes_drain = std::mem::replace(&mut owed, true);
+        self.fsync_waits().run(ino, cancel, || {
             self.flush_inode(ino, true)?;
-            if owes_drain && !self.epoch_active() {
+            if self
+                .meta
+                .upload_pending_for_ino(ino)
+                .map_err(|error| error.code())?
+            {
                 self.drain_inode(ino)?;
             }
             then()
-        });
-        let mut owed = self.fsync_owed.lock().unwrap();
-        match result {
-            Ok(()) => {
-                owed.remove(&ino);
-            }
-            Err(_) => {
-                owed.insert(ino);
-            }
-        }
-        result
-    }
-
-    /// `ino` is gone (its last description closed after an unlink): no
-    /// later `fsync` can owe it anything.
-    pub(super) fn forget_fsync_owed(&self, ino: Ino) {
-        self.fsync_owed.lock().unwrap().remove(&ino);
-    }
-
-    /// Whether a continuation epoch is active (plan 30 §M10).
-    fn epoch_active(&self) -> bool {
-        self.sync.as_ref().is_some_and(|h| {
-            h.epoch_active
-                .as_ref()
-                .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
         })
     }
 
     /// An `O_SYNC`/`O_DSYNC` write's publication: [`Self::flush_inode`]
-    /// write-through, waiting out transient S3 failures like an `fsync`,
-    /// with the same owed bookkeeping — a write that failed here leaves
-    /// the inode owed, so the next `fsync` drains it again whatever the
-    /// mode instead of finding no write session and answering 0.
+    /// write-through and the inode's drain, waiting out transient S3
+    /// failures like an `fsync`. A write that failed here leaves its
+    /// chunks pending, so the next `fsync` drains them.
     ///
     /// Ended early (the caller killed, `cancel`; the soft timeout or the
     /// kernel cap) it answers `EIO`, never `EINTR`: the bytes are written,
@@ -258,7 +243,7 @@ impl View {
         ino: Ino,
         cancel: Option<constellation_vfs::CancelToken>,
     ) -> Result<(), Code> {
-        self.owing_run(ino, cancel, || Ok(()))
+        self.durable_run(ino, cancel, || Ok(()))
             .map_err(|code| match code {
                 Code::Intr => Code::Io,
                 code => code,

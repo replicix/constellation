@@ -617,7 +617,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "writeback-fsync",
-        desc: "fsync under write-back reaches S3 before kill -9",
+        desc: "fsync under write-back reaches S3 before kill -9; an fsync from a new descriptor after a back close makes the file readable on the sequencer with the writer dead",
         requires: &[],
         caps: &[],
         run: writeback_fsync,
@@ -7847,7 +7847,114 @@ fn writeback_fsync(seed: u64) -> Result<()> {
         "fsynced prefix was lost or corrupted"
     );
     client.unmount()?;
-    Ok(())
+    writeback_fsync_after_close(seed, &env, root.path())
+}
+
+/// `writeback-fsync`'s second phase (plan 39b): an `fsync` from a *new*
+/// descriptor, after the writer closed under `--write-mode back`, makes
+/// the file durable in S3 under the default `--fsync-mode local` — the
+/// PostgreSQL checkpointer shape. B holds the lease; A (not the
+/// sequencer) writes `d/f` under `back` with its background uploads held
+/// (a metered network, plan 31 C8), so the close leaves the chunks queued
+/// on A and B awaits them. A opens the file again, `fsync`s, and is
+/// killed at once: B must read the content straight away, from S3, with
+/// no `CONSTELLATION_REMOTE_CHUNK_WAIT_S` stall (30 s here). Before 39b
+/// the `fsync` returned 0 without uploading, and B's read waited out the
+/// 30 s and failed: the only copy died with A.
+fn writeback_fsync_after_close(seed: u64, env: &S3Env, root: &std::path::Path) -> Result<()> {
+    const WAIT_S: u64 = 30;
+    let backend = format!("s3://{BUCKET}/writeback-fsync-close-{}", ts());
+    let mk = |name: &str| -> Result<Client> {
+        Ok(Client::new(root, name, &env.endpoint, &backend)?
+            .with_own_node_key()
+            .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
+            .with_env("CONSTELLATION_REMOTE_CHUNK_WAIT_S", &WAIT_S.to_string()))
+    };
+    let mut b = mk("b")?;
+    let mut a = mk("a")?
+        .with_write_mode("back")
+        .with_env("CONSTELLATION_PROFILE_UPLOADS", "unmetered-only");
+    b.fs_create()?;
+    b.mount()?;
+    a.mount()?;
+    let result = (|| -> Result<()> {
+        wait_for_p2p(&[&a, &b])?;
+        std::fs::create_dir(b.mnt.join("d"))?;
+        eventually("B holds the lease", Duration::from_secs(30), || {
+            anyhow::ensure!(lease_of(&b)?["held"] == true, "{}", lease_of(&b)?);
+            Ok(())
+        })?;
+        eventually("d/ visible on A", Duration::from_secs(30), || {
+            anyhow::ensure!(a.mnt.join("d").is_dir(), "not yet");
+            Ok(())
+        })?;
+        let report = a.control(
+            "node.lifecycle",
+            serde_json::json!({ "event": { "NetworkChanged": { "reachable": true, "metered": true } } }),
+        )?;
+        anyhow::ensure!(
+            report["status"]["uploads_held"] == true,
+            "A's uploads are not held: {report}"
+        );
+        let data = pattern(seed ^ 0x39b, 3 * 1024 * 1024 + 12_345);
+        // The writer: write, close. No fsync.
+        std::fs::write(a.mnt.join("d/f"), &data)?;
+        let pending = a.control_status()?["writeback"]["pending_uploads"]
+            .as_u64()
+            .unwrap_or(0);
+        anyhow::ensure!(pending > 0, "the back close left nothing queued on A");
+        eventually("B awaits A's chunks", Duration::from_secs(10), || {
+            let awaited = b.control_status()?["writeback"]["remote_chunks_awaited"]
+                .as_u64()
+                .unwrap_or(0);
+            anyhow::ensure!(awaited > 0, "B awaits nothing");
+            Ok(())
+        })?;
+        // The checkpointer: a new descriptor, fsync.
+        let t = std::time::Instant::now();
+        std::fs::File::open(a.mnt.join("d/f"))?.sync_all()?;
+        let fsync_took = t.elapsed();
+        let a_status = a.control_status()?;
+        let b_awaits = b.control_status()?["writeback"]["remote_chunks_awaited"].clone();
+        eprintln!(
+            "    writeback-fsync: fsync after a back close took {fsync_took:?}; A pending {}, \
+             B awaits {b_awaits}",
+            a_status["writeback"]["pending_uploads"]
+        );
+        anyhow::ensure!(
+            a_status["writeback"]["pending_uploads"].as_u64() == Some(0),
+            "A's fsync returned with chunks still queued: {}",
+            a_status["writeback"]
+        );
+        anyhow::ensure!(
+            b_awaits.as_u64() == Some(0),
+            "A's fsync returned before B learned the chunks are up: {b_awaits}"
+        );
+        // A's disk is gone: nothing but S3 has the bytes now.
+        a.kill9()?;
+        let t = std::time::Instant::now();
+        let got = std::fs::read(b.mnt.join("d/f"))?;
+        let read_took = t.elapsed();
+        eprintln!("    writeback-fsync: B's read with A dead took {read_took:?}");
+        anyhow::ensure!(
+            got == data,
+            "B read {} bytes, not A's fsynced content",
+            got.len()
+        );
+        anyhow::ensure!(
+            read_took < Duration::from_secs(5),
+            "B's read stalled {read_took:?} (CONSTELLATION_REMOTE_CHUNK_WAIT_S = {WAIT_S})"
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        for c in [&a, &b] {
+            eprintln!("--- {} log ---\n{}", c.name, c.tail_log_n(60));
+        }
+    }
+    let _ = a.kill9();
+    let _ = b.unmount();
+    result
 }
 
 fn writeback_backpressure(seed: u64) -> Result<()> {

@@ -213,7 +213,7 @@ fn a_close_stuck_in_its_drain_holds_no_write_shard() {
         let started = std::time::Instant::now();
         let reply = loop {
             match core.try_recv() {
-                Ok(SyncRequest::DrainInode { ino, reply }) => {
+                Ok(SyncRequest::DrainInode { ino, reply, .. }) => {
                     assert_eq!(ino, file.ino);
                     break reply;
                 }
@@ -373,7 +373,7 @@ fn ops_against(
         let mut replies = replies.into_iter();
         while !fsync.is_finished() {
             match core.try_recv() {
-                Ok(SyncRequest::DrainInode { ino, reply }) => {
+                Ok(SyncRequest::DrainInode { ino, reply, .. }) => {
                     assert_eq!(ino, file.ino);
                     drains += 1;
                     let answer = replies.next().expect("more drains than scripted");
@@ -536,4 +536,100 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
         0,
         "nothing written under the lapsed grant was published"
     );
+}
+
+/// Plan 39b, scripted: one `fsync` of `file` (already written as the
+/// caller left it) against a core that answers every drain `Ok` and
+/// counts them.
+fn fsync_counting_drains(
+    fs: &View,
+    core: &mut tokio::sync::mpsc::UnboundedReceiver<SyncRequest>,
+    ino: Ino,
+) -> (Result<(), Code>, usize) {
+    use constellation_vfs::{Blocking, Caller, OpCtx, OpKind, Vfs};
+    let caller = Caller::new(0, 0, None);
+    let mut drains = 0;
+    let mut result = Ok(());
+    std::thread::scope(|scope| {
+        let fsync = scope.spawn(|| {
+            Blocking::run(|r| {
+                fs.fsync(
+                    &OpCtx::new(OpKind::Fsync, &caller),
+                    ino,
+                    constellation_vfs::Fh(0),
+                    constellation_vfs::Durability::Configured,
+                    r,
+                )
+            })
+            .map_err(|e| e.code())
+        });
+        while !fsync.is_finished() {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode {
+                    ino: drained,
+                    reply,
+                    ..
+                }) => {
+                    assert_eq!(drained, ino);
+                    drains += 1;
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        result = fsync.join().unwrap();
+    });
+    (result, drains)
+}
+
+/// Plan 39b: an `fsync` of a file whose chunks are all up — nothing of it
+/// in `pending_upload` — asks the sync task for no drain at all, however
+/// the file got there (here: a `back` close whose upload has since
+/// finished).
+#[test]
+fn an_fsync_with_nothing_pending_asks_for_no_drain() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    fs.do_write(file.ino, 0, b"closed under back").unwrap();
+    fs.flush_inode(file.ino, false).unwrap();
+    let rows: Vec<_> = meta
+        .pending_uploads()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, i)| *i == file.ino)
+        .collect();
+    assert!(!rows.is_empty(), "the back close queued its chunk");
+    // The background upload went through.
+    for (hash, ino) in rows {
+        meta.ack_upload(&hash, ino).unwrap();
+    }
+    let (result, drains) = fsync_counting_drains(&fs, &mut core, file.ino);
+    assert_eq!(result, Ok(()));
+    assert_eq!(drains, 0, "nothing pending: no drain");
+}
+
+/// Plan 39b: a `back` close's queued chunks are drained by the next
+/// `fsync` of the file under `--fsync-mode local` (no write session left
+/// to publish), and so they are inside a continuation epoch: the epoch
+/// exempts a `close()`, never a barrier (before, both returned 0 with the
+/// chunks only on this node).
+#[test]
+fn an_fsync_drains_a_back_closes_chunks_in_and_out_of_an_epoch() {
+    for epoch in [false, true] {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        let (mut fs, _dir, mut core) = holder_fs(meta.clone(), false);
+        fs.sync.as_mut().unwrap().epoch_active =
+            Some(Arc::new(std::sync::atomic::AtomicBool::new(epoch)));
+        fs.do_write(file.ino, 0, b"closed under back").unwrap();
+        fs.flush_inode(file.ino, false).unwrap();
+        let (result, drains) = fsync_counting_drains(&fs, &mut core, file.ino);
+        assert_eq!(result, Ok(()), "epoch={epoch}");
+        assert_eq!(
+            drains, 1,
+            "epoch={epoch}: the fsync drained the queued chunk"
+        );
+    }
 }

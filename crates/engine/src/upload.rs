@@ -43,7 +43,8 @@ const PRIORITY_UPLOAD_RESERVE: usize = 4;
 const PRIORITY_DRAIN_CHUNKS: u64 = 4;
 
 /// See docs/explanation/DESIGN.md §5b step 2 / `docs/plans/v1/done/08-p5b-streaming-writeback.md`.
-/// A durable pending-upload queue in SQLite is drained by a bounded pool;
+/// A durable pending-upload queue (the metadata store's fjall
+/// `pending_upload` partition) is drained by a bounded pool;
 /// the pool costs two things once it exists (dedup-probe RTT and the
 /// create-vs-overwrite decision), both handled by `put_mode` below.
 ///
@@ -169,6 +170,11 @@ pub struct UploadRuntime {
     last_put_ms: std::sync::atomic::AtomicI64,
     /// EC2 finding 1: chunk handoffs (`authority_driver::ChunkHandoff`).
     pub handoff: HandoffStats,
+    /// Upload passes started and chunk PUTs attempted (a pass that only
+    /// finds the chunk durable, or only awaits it, attempts none): how a
+    /// test tells "this `fsync` uploaded nothing" from "it was quick".
+    pub(crate) passes: std::sync::atomic::AtomicU64,
+    pub(crate) put_attempts: std::sync::atomic::AtomicU64,
 }
 
 /// The `durable_reports` key of a report owed to every peer.
@@ -334,6 +340,8 @@ impl UploadRuntime {
             inherited: Default::default(),
             last_put_ms: std::sync::atomic::AtomicI64::new(0),
             handoff: HandoffStats::default(),
+            passes: Default::default(),
+            put_attempts: Default::default(),
             hold: UploadHold::default(),
         }
     }
@@ -450,6 +458,26 @@ impl UploadRuntime {
         &self,
     ) -> std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>> {
         std::mem::take(&mut *self.durable_reports.lock().unwrap())
+    }
+
+    /// The reports owed for `hashes` only, per node (taken); the rest
+    /// stay owed for the background passes. An `fsync`'s drain sends its
+    /// own file's reports before it returns, not every peer's (plan 39b).
+    pub(crate) fn take_durable_reports_of(
+        &self,
+        hashes: &std::collections::HashSet<constellation_fs_core::ChunkHash>,
+    ) -> std::collections::HashMap<u64, Vec<constellation_fs_core::ChunkHash>> {
+        let mut owed = self.durable_reports.lock().unwrap();
+        let mut taken = std::collections::HashMap::new();
+        owed.retain(|node, owed| {
+            let (mine, rest): (Vec<_>, Vec<_>) = owed.drain(..).partition(|h| hashes.contains(h));
+            if !mine.is_empty() {
+                taken.insert(*node, mine);
+            }
+            *owed = rest;
+            !owed.is_empty()
+        });
+        taken
     }
 
     /// Whether this node should check S3 now for `hash`, which another
@@ -605,6 +633,8 @@ impl UploadRuntime {
             inherited: Default::default(),
             last_put_ms: std::sync::atomic::AtomicI64::new(0),
             handoff: HandoffStats::default(),
+            passes: Default::default(),
+            put_attempts: Default::default(),
             hold: UploadHold::default(),
         }
     }
@@ -630,6 +660,39 @@ pub async fn upload_dirty_chunks(
         bail!("pending upload chunk {hash} missing from local cache");
     }
     Ok(())
+}
+
+/// Why an `fsync`'s drain of one inode did not leave it durable although
+/// no request failed (plan 39b). Never a success: the rows stay pending.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DrainShortfall {
+    /// Pending chunks of the inode that are neither in the local cache nor
+    /// in S3: the content is gone, and no wait brings it back. Permanent
+    /// (`EIO`; the classifier matches "missing from local cache"), and
+    /// every later `fsync` of the inode fails the same way while the rows
+    /// remain — until the file is rewritten or removed.
+    #[error(
+        "{count} pending upload chunk(s) of inode {ino} (first {hash}) missing from local cache \
+         and not in S3"
+    )]
+    Lost {
+        ino: constellation_fs_core::Ino,
+        hash: constellation_fs_core::ChunkHash,
+        count: usize,
+    },
+    /// Chunks of the inode another node forwarded as pending (a `back`
+    /// close there, `meta::store::remote`) are not in S3 yet: that node
+    /// has them and reports them once up. Transient: the `fsync` keeps
+    /// waiting under plan 39's policy.
+    #[error(
+        "{awaiting} chunk(s) of inode {ino} another node forwarded as pending are not in S3 yet \
+         (waited {waited_s} s)"
+    )]
+    AwaitingRemote {
+        ino: constellation_fs_core::Ino,
+        awaiting: u64,
+        waited_s: u64,
+    },
 }
 
 /// What one upload pass found it cannot upload.
@@ -748,6 +811,9 @@ async fn upload_dirty_chunks_pass(
     depth: u8,
 ) -> Result<UploadReport> {
     use futures::StreamExt;
+    upload
+        .passes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if only_ino.is_none() {
         expand_adopted_spills(cache, meta, store).await?;
     }
@@ -755,10 +821,17 @@ async fn upload_dirty_chunks_pass(
         constellation_fs_core::ChunkHash,
         Vec<constellation_fs_core::Ino>,
     > = std::collections::HashMap::new();
-    for (hash, ino) in meta.pending_uploads()? {
-        if only_ino.is_some_and(|wanted| ino != wanted) {
-            continue;
-        }
+    // An inode's drain (an `fsync`'s) reads just that inode's rows through
+    // the by-inode mirror: O(its rows), not O(the whole queue).
+    let rows = match only_ino {
+        Some(ino) => meta
+            .pending_uploads_for_ino(ino)?
+            .into_iter()
+            .map(|hash| (hash, ino))
+            .collect(),
+        None => meta.pending_uploads()?,
+    };
+    for (hash, ino) in rows {
         if let Some(wanted) = only_part {
             if wanted != "p0" {
                 continue;
@@ -900,6 +973,9 @@ async fn upload_dirty_chunks_pass(
             let mut last = None;
             let started = std::time::Instant::now();
             for attempt in 0..3 {
+                upload
+                    .put_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match store.put_chunk_mode(&hash, &data, compression, mode).await {
                     Ok(result) => {
                         upload.last_put_ms.store(
@@ -1055,7 +1131,7 @@ async fn upload_dirty_chunks_pass(
 /// leave the pending row rather than silently dropping it (the "journal
 /// must wait" state that backs prerequisite 2's unmount gate).
 #[cfg(test)]
-mod pending_upload_tests {
+pub(crate) mod pending_upload_tests {
     use super::*;
     use constellation_fs_core::cache::{CacheVerify, ChunkState};
     use constellation_fs_core::ChunkHash;
@@ -1074,7 +1150,7 @@ mod pending_upload_tests {
     /// simulating a cut S3 path without needing toxiproxy for a unit
     /// test.
     #[derive(Debug)]
-    struct FailingStore {
+    pub(crate) struct FailingStore {
         inner: InMemory,
         fail_puts: AtomicBool,
         delay_puts: AtomicBool,
@@ -1085,7 +1161,7 @@ mod pending_upload_tests {
     }
 
     impl FailingStore {
-        fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
                 inner: InMemory::new(),
                 fail_puts: AtomicBool::new(false),
@@ -1097,7 +1173,7 @@ mod pending_upload_tests {
             })
         }
 
-        fn set_fail_puts(&self, fail: bool) {
+        pub(crate) fn set_fail_puts(&self, fail: bool) {
             self.fail_puts.store(fail, Ordering::SeqCst);
         }
 
@@ -2155,6 +2231,41 @@ mod pending_upload_tests {
         assert_eq!(reports[&9], vec![forwarded]);
         assert!(!reports[&9].contains(&other));
         assert!(upload.take_durable_reports().is_empty(), "sent once");
+    }
+
+    /// Plan 39b: an `fsync`'s drain takes only its own file's reports;
+    /// every other report stays owed for the background passes.
+    #[test]
+    fn an_fsync_takes_only_its_own_files_reports() {
+        let (mine, theirs, shared) = (
+            ChunkHash::of(b"this file"),
+            ChunkHash::of(b"another file"),
+            ChunkHash::of(b"both"),
+        );
+        let upload = UploadRuntime::for_test(true);
+        upload.note_forwarded(&[mine, shared], 2);
+        upload.note_forwarded(&[theirs, shared], 3);
+        upload.note_forwarded(&[theirs], 4);
+        for hash in [mine, theirs, shared] {
+            upload.note_up(&hash);
+        }
+        let only: std::collections::HashSet<_> = [mine, shared].into_iter().collect();
+        let mut taken = upload.take_durable_reports_of(&only);
+        for hashes in taken.values_mut() {
+            hashes.sort();
+        }
+        let mut both = vec![mine, shared];
+        both.sort();
+        assert_eq!(
+            taken,
+            [(2, both), (3, vec![shared])].into_iter().collect(),
+            "this file's reports, to every node owed one"
+        );
+        assert_eq!(
+            upload.take_durable_reports(),
+            [(3, vec![theirs]), (4, vec![theirs])].into_iter().collect(),
+            "the rest stays owed"
+        );
     }
 
     /// What a forward says is still pending: the chunks its manifest names

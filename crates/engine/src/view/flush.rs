@@ -263,7 +263,11 @@ impl View {
         let (reply, receive) = tokio::sync::oneshot::channel();
         handle
             .tx
-            .send(SyncRequest::DrainInode { ino, reply })
+            .send(SyncRequest::DrainInode {
+                ino,
+                fsync: crate::fsync_wait::in_scope(),
+                reply,
+            })
             .map_err(|_| Code::Io)?;
         // On the `fsync` path (plan 39) the wait also ends on an interrupt
         // or the soft timeout, and the failure is classified for its

@@ -33197,3 +33197,179 @@ load 30–45 from other agents):
   count). Extending eligibility to frozen files is an engine change outside
   Z3b's brief ("do not change the engine's eligibility rule"); until then
   only the writable-mount opt-in uses passthrough.
+
+## Plan 39 — 39b: fsync drains the file's queued chunks in both `--fsync-mode`s
+
+Chunk 39b (plan 39 §6, now "Decided"). The maintainer's rule: an `fsync`
+makes **all** of the file's outstanding data durable in S3, whichever
+descriptor or process wrote it — Linux `fsync(2)`'s contract, the one a
+PostgreSQL checkpointer relies on (backends write and close; the
+checkpointer later opens and `fsync`s). Before, under `--write-mode back` +
+`--fsync-mode local` (the default), `open` + `fsync` of a file whose chunks
+were still queued on this node returned 0 without uploading them, and inside
+a continuation epoch a `local` `fsync` (including the retry of one started
+before the epoch) skipped the drain altogether.
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| The drain is the file's, in both modes | done | `View::durable_run` (`crates/engine/src/view/durable.rs`, was `owing_run`): every attempt of an `fsync`/`fdatasync`/`O_SYNC` write publishes the write session (`flush_inode`, force-through), then drains the inode if it has any `pending_upload` row (`Meta::upload_pending_for_ino`, new in `crates/meta/src/store/misc.rs`: one seek in the `pending_upload_by_ino` mirror since the review round; nothing pending → no sync-task round trip), then the mode's barrier. `--fsync-mode s3`'s `Barrier` handler is unchanged |
+| `fsync_owed` | removed | the per-view in-memory set (and the per-call "owes a drain" flag) is gone; the durable table is the source of truth — it covers a `back` close, a failed write-through close, a failed `fsync`/`O_SYNC` write, other views of the node, and a restart. `forget_fsync_owed` call sites (`View::reap_after_unlink`, `release` of an unlinked inode) dropped |
+| Epoch exemption | removed for the barrier | no consistency reason found (plan 39 §6 records the check): chunks are immutable and content-addressed, an early upload never breaks "the log names no chunk S3 lacks", the drain holds no inode/shard lock, and `s3`'s barrier already drained in epochs. `close()` keeps the exemption (`finish_flush` unchanged). An `fsync` in an epoch now waits for the bucket or a peer's chunk handoff, bounded by `--fsync-timeout`/the kernel cap |
+| Sequencer told before `fsync` returns | done | `SyncRequest::DrainInode { fsync }` (`crates/engine/src/sync.rs`; `report` before the review round): set by `drain_inode` inside an `fsync` scope (`fsync_wait::in_scope()`); the driver's `Uploader::run_fsync` (`crates/engine/src/authority_driver.rs`; `run_reported` before) awaits the file's durable reports (2 s per send) instead of spawning them, so the sequencer that awaits a `back` close's forwarded chunks acks them before the `fsync` returns. Closes and the `ino: 0` drains (control, snapshot batches) pass `fsync: false`: unchanged |
+| `fsyncdir` | unchanged | a directory has no `pending_upload` rows; the scan finds nothing. Covers entries' mutations, not its files' data (documented) |
+| Docs | done | `writeback.rs` module doc (the rule, the former asymmetry and its removal, no epoch exemption for barriers, `fsync_owed` gone; "SQLite's `pending_upload` table" → the fjall partition, also in `upload.rs`); `durability-and-failover.md` (`--fsync-mode` bullets, outage section's epoch and false-success bullets, `fsyncdir`, write-back's `fsync` bullet); `configuration.md` `--fsync-mode` row; the CLI's `--fsync-mode` help; plan 39 header, §3.2, §4 table, §6 "Decided"; plan 37 K6: recommend `--fsync-mode s3` / `ack_policy = s3` as the StorageClass default where node disks are ephemeral |
+
+### Tests
+
+- `view::fsync_drain_tests` (new; a real `Engine` on a `file://` backend, its
+  background uploads held with `UploadHold`): `fsync_{local,s3}_from_another_descriptor_uploads_what_is_queued`
+  — a writer closes under `back` (4 chunks queued; under `s3` the close
+  uploads them) plus a chunk queued as a failed close leaves it; another
+  process on another view opens and `fsync`s; every queued chunk is in the
+  bucket and nothing of the file is pending when it returns. The `local`
+  variant fails on the pre-39b code (verified by disabling the drain).
+  `fsync_of_a_through_closed_file_has_nothing_to_upload`.
+- `durable_ack_tests`: `an_fsync_with_nothing_pending_asks_for_no_drain`
+  (scripted core: zero `DrainInode` requests),
+  `an_fsync_drains_a_back_closes_chunks_in_and_out_of_an_epoch` (fails on
+  the pre-39b code); plan 39's three owed-drain tests pass unchanged on the
+  new rule (all three fail with the drain disabled).
+- `pending_claim_tests` extended for `upload_pending_for_ino`.
+- Harness `writeback-fsync`, second phase (`writeback_fsync_after_close`): B
+  sequences, A writes `d/f` under `back` with uploads held (metered network),
+  closes, re-opens it and `fsync`s, is killed; B reads it at once from S3.
+  Passes in 2.6 s (fsync 28–38 ms, B's read 35–54 ms); against a binary with
+  the drain disabled it fails with "A's fsync returned with chunks still
+  queued: … pending_uploads: 4".
+
+### Gates (2026-10-02, kernel 7.3.0-rc4)
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean with and without `--features
+  constellation-frontend-fuse/io-uring`.
+- `cargo test -p` for all 19 packages, 0 failed: engine 492 (+7 ignored),
+  meta 281, authority 266, store-s3 227, control 135, net 99 + 3,
+  frontend-fuse 51, harness 51, csi 57, constellation 34, chaos 37, fs-core
+  68, vfs 58, mtree 71, platform 35, types 26, upload-concurrency 11,
+  uploadbench 4; model 138: lib and seven test binaries in debug, `locks`,
+  `positions`, `today_bugs` in `--release` (29, 9, 7).
+- `tests/smoke.sh` with `--fsync-mode local` and with `s3` (a wrapper binary
+  appending the flag to `mount`): passed both. Integration (`smoke.sh`
+  against the shared floci on 4566 — another chunk's — with the script's
+  `AWS_*`, private prefixes), both modes: passed. `cargo build --release
+  --workspace`: ok.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=c39b`): `writeback-latency`,
+  `writeback-bigfile`, `writeback-drain`, `writeback-fsync`,
+  `writeback-backpressure`, `small-file-write-path`, `nonowner-back-crash`,
+  `commit-strips-pending-upload`, `backup-takeover-holds-missing-chunks`
+  passed; `fio-blips` **5/5**; `s3-cut-one-node`, `e2e-two-nodes`,
+  `lease-handover` passed. Because the epoch exemption went: every epoch
+  scenario (`continuation-epoch`, `epoch-member-lost`,
+  `epoch-peer-reaching-s3-declines`, `epoch-missing-node`,
+  `epoch-member-dies-with-chunk`, `epoch-holder-retired`,
+  `epoch-slack-zero-unchanged`) and plan 39's `fsync-hard-outage`,
+  `fsync-soft-timeout`, `fsync-interrupt`, `fsyncdir-barrier` passed.
+
+### Real S3 (both targets, unique `c39b-<ts>-*` prefixes, purged afterwards: 976 and 1188 objects, 0 left)
+
+A throwaway driver outside the repo (the harness has no real-S3 backend).
+39b check = the harness phase above, two local daemons; `fio-blips`-style =
+the harness's fio verify (16M × 2, `--end_fsync=1`) looped 8× on one mount
+whose S3 path runs through a local CONNECT proxy (`AWS_PROXY_URL`) cut for
+800 ms every ~4.8 s, harness retry settings (`CONSTELLATION_S3_MAX_RETRIES=2`,
+`RETRY_TIMEOUT_MS=2000`).
+
+| | AWS us-west-2 | OVH Milan |
+|---|---|---|
+| 39b check, `fsync` after a `back` close (4 chunks, 3 MiB) | 111 / 123 / 129 ms (3/3 ok) | 1474 / 1681 / 1476 ms (3/3 ok) |
+| B's read with A dead | 101 / 87 / 88 ms | 1308 / 1282 / 1259 ms |
+| `back` close (A) | 7–9 ms | 7–8 ms |
+| fio-blips-style, 8 loops | 3/3 ok; 9.0–9.1 s, 2 cuts, fsync max wait 1.3 s, 0 retries | 3/3 ok; 133–211 s, 28–44 cuts, fsync max wait 28–51 s, 14–21 retries, 0 `EIO` |
+
+**Pre-existing finding (not 39b; close path untouched).** With A's uploads
+held (metered network), a non-owner `back` close whose forward B answers
+before A has applied B's latest records (`!base_ok`, A waiting for its own
+record in the log, `AwaitingLog`) stalls the full 120 s forward deadline and
+ends "in doubt": B cannot ship that record until A's chunks are up, and A's
+hold keeps them local. Seen on real S3 (a slower tail) on every run until the
+driver waited 15 s after B created the file; not on floci. Without the hold
+the background upload breaks the cycle, so the close then costs an upload
+anyway. A candidate for plan 31 C8 / plan 30 §M7: a requester in
+`AwaitingLog` for a record naming its own held chunks should upload them
+(an explicit durability need, as the hold already exempts).
+
+### Review round (2026-10-02)
+
+The review approved; the coordinator ruled its three should-fixes and four
+nits durability work to land before merge. The worktree was rebased onto
+main (37-K3a, 38-Z3b, the P2P fix) by the coordinator; no conflict markers
+were left to resolve.
+
+| Item | State | Where |
+|---|---|---|
+| 1. A lost chunk is never a success | fixed | `Uploader::run_fsync` (`crates/engine/src/authority_driver.rs`): an `fsync`'s inode drain whose pass reports rows of the inode as missing (not in the cache, not in S3) fails `upload::DrainShortfall::Lost`, classified permanent in `SyncFailure::from_error` → `EIO`; the rows stay, so every later `fsync` fails the same way. Not handed to a peer (a lost chunk is lost there too). Closes and background passes keep plan 30 §M4 (record, hold the records) |
+| 2. `fsync` on the sequencer waits for the inode's remote rows | fixed (coordinator's decision) | `run_fsync` re-runs the inode's pass while it reports rows another node forwarded as pending (`report.awaiting`, inode-scoped), as `run_complete` does for a barrier; after a 5 s slice (`FSYNC_REMOTE_SLICE`, or `CONSTELLATION_REMOTE_CHUNK_WAIT_S` if shorter) it fails `DrainShortfall::AwaitingRemote`, transient, and `FsyncWaits::run` keeps waiting (hard by default; `--fsync-timeout`/interrupt/kernel cap end it `EIO`/`EINTR`) — never 0 while a row is left. Plan 39 §6 records "fsync covers chunks queued on other nodes as seen by this node" |
+| 3. Reports after a peer handoff | fixed | `drain_with_handoff`: on an `fsync`'s drain that succeeds through `ChunkHandoff::hand_off` (which now returns the hashes it handed off), `send_durable_reports_of` those hashes before returning |
+| 4. `pending_upload` by inode | done | new meta keyspace `pending_upload_by_ino` (`ino ++ hash -> ()`), written in the same transaction as every row (`misc::add_pending_claim_tx` / new `misc::remove_pending_row_tx`, used by `ack_upload`, `cancel_pending_upload`, `clear_pending_uploads`, `purge_foreign_pending_uploads`, `ack_remote_chunks`, held-record drops); built once at open from the table on an older store (`Meta::build_pending_by_ino`, marker `pending_upload_by_ino_built` in `local`), so no format bump was needed. Used by `upload_pending_for_ino` (one seek), the new `pending_uploads_for_ino` (an inode drain's and `hand_off`'s listing), `PendingView`'s spilled-manifest lookup (was a whole-table map), and `pending_inos_for_hash` (a handoff's acks, was a table scan); vacuumed with the churn keyspaces |
+| 5. Only this inode's reports | done | `UploadRuntime::take_durable_reports_of`; `Uploader::send_durable_reports_of(Some(hashes))` for the file's rows; others stay for the background passes |
+| 6. No-upload assertion | done | `UploadRuntime::{passes, put_attempts}` counters; `fsync_of_a_through_closed_file_has_nothing_to_upload` asserts both unchanged across the `fsync` |
+| 7. Unlinked-but-open file | documented | `durability-and-failover.md`, outage section |
+| Rename | — | `SyncRequest::DrainInode { report }` → `{ fsync }` (it now carries the three rules above, not only the reports); `Uploader::run_reported` → `run_fsync` |
+
+**Measured** (release, this host): "does this inode have anything pending"
+with other inodes' rows queued — the review's scan vs the mirror —
+100 000 rows: 30.5 ms → 1.2 µs; 400 000 rows: 124 ms → 0.7 µs; one inode's
+rows: 31.7 ms → 3.3 µs, 130 ms → 11 µs
+(`meta … pending_claim_tests::pending_by_ino_cost`, ignored, by hand).
+End to end, `open` + `fsync` + `close` of a through-closed file with 100 000
+other rows queued (`view::fsync_drain_tests::fsync_with_nothing_pending_cost`,
+ignored, by hand): **12.6 ms** on the reviewed tree → **12 µs** now.
+
+**Tests added**: `fsync_{local,s3}_with_a_lost_chunk_is_eio` (a back-queued
+chunk removed from the cache plus a row whose chunk never reached it: `EIO`
+twice, rows stay, the file's other chunks uploaded),
+`fsync_{local,s3}_waits_for_remote_rows` (a scripted remote row: the `fsync`
+is still waiting after 1 s, the chunk lands in the bucket, the `fsync`
+returns 0 and the row is acked), `fsync_waiting_for_remote_rows_times_out_eio`
+(`--fsync-timeout 7s`: `EIO` at ≥ 7 s, row kept) — both lost-chunk tests,
+`fsync_local_waits_for_remote_rows` and the timeout test fail with
+`run_fsync` answering `Ok` as before (checked; the `s3` remote-row variant
+was not mutation-checked);
+`authority_driver::tests::an_fsync_drain_through_a_handoff_reports_before_it_returns`
+(two real P2P endpoints, this node's PUTs failing, node 2 accepting the
+handoff: node 2 holds the report when the drain returns; fails without the
+fix, checked); `upload::…::an_fsync_takes_only_its_own_files_reports`;
+`meta … the_by_ino_mirror_follows_every_row`,
+`a_store_from_before_the_mirror_builds_it_at_open`.
+
+**Gates** (prefix `c39f`): `cargo fmt --all -- --check` clean; clippy
+`-D warnings` clean with and without `--features
+constellation-frontend-fuse/io-uring`. `cargo test -p constellation-engine`
+501 passed, 0 failed (8 ignored); the rest of the workspace (excluding
+engine and model) 1599 passed, 0 failed (62 binaries); `constellation-model`
+138 passed (lib + 7 binaries debug, `locks`/`positions`/`today_bugs`
+release). `harness smoke` with a wrapper appending `--fsync-mode local`/`s3`
+to `mount` (3 mounts each, verified in the wrapper log): passed both;
+against the floci on 4566 with private prefixes, both modes: passed.
+`cargo build --release --workspace` ok. Harness: `writeback-latency`,
+`writeback-bigfile`, `writeback-drain`, `writeback-fsync` (fsync after a
+back close 26 ms, A pending 0, B awaits 0), `writeback-backpressure`,
+`small-file-write-path`, `nonowner-back-crash`,
+`commit-strips-pending-upload`, `backup-takeover-holds-missing-chunks`;
+`fio-blips` seeds 43–47 **5/5**; `s3-cut-one-node`, `e2e-two-nodes`,
+`lease-handover`; `fsync-hard-outage`, `fsync-soft-timeout`,
+`fsync-interrupt`, `fsyncdir-barrier`; `continuation-epoch`,
+`epoch-member-lost`, `epoch-peer-reaching-s3-declines`,
+`epoch-missing-node`, `epoch-member-dies-with-chunk`,
+`epoch-holder-retired`, `epoch-slack-zero-unchanged`; and, for the meta
+index, `backup-takeover-drops-held-chunks`, `node-leave`,
+`forwarded-mutations`, `e2e-spilled-manifest`, `unmount-drain`,
+`unmount-with-held-records`, `lifecycle-metered-uploads`,
+`session-forwarded-ryw`, `gc-open-orphan-hold` — all passed.
+
+**Not re-run: real S3.** This session had no credentials for either target
+in its environment, so the back-close `fsync` check on AWS us-west-2 and OVH
+Milan was not repeated; the figures above the review round are the first
+round's.

@@ -145,25 +145,66 @@ pub(crate) fn encode_claims(n: u32) -> Vec<u8> {
     n.to_le_bytes().to_vec()
 }
 
-/// Add one claim to `(hash, ino)`'s pending row inside `tx`.
+/// Add one claim to `(hash, ino)`'s pending row inside `tx` (and, for a
+/// new row, its `pending_upload_by_ino` mirror).
 pub(crate) fn add_pending_claim_tx(
     tx: &mut SingleWriterWriteTx,
-    pending_upload: &SingleWriterTxKeyspace,
+    meta: &Meta,
     hash: &ChunkHash,
     ino: Ino,
 ) -> Result<(), MetaError> {
     let key = cr_key(hash, ino);
     let n = tx
-        .get(pending_upload, &key)?
+        .get(&meta.pending_upload, &key)?
         .map_or(0, |v| pending_claims(&v));
-    tx.insert(pending_upload, key, encode_claims(n.saturating_add(1)));
+    if n == 0 {
+        tx.insert(&meta.pending_upload_by_ino, cri_key(ino, hash), Vec::new());
+    }
+    tx.insert(
+        &meta.pending_upload,
+        key,
+        encode_claims(n.saturating_add(1)),
+    );
     Ok(())
+}
+
+/// Remove `(hash, ino)`'s pending row and its `pending_upload_by_ino`
+/// mirror inside `tx`. Every removal of a row goes through here, so the
+/// mirror names exactly the rows that exist.
+pub(crate) fn remove_pending_row_tx(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    hash: &ChunkHash,
+    ino: Ino,
+) {
+    tx.remove(&meta.pending_upload, cr_key(hash, ino));
+    tx.remove(&meta.pending_upload_by_ino, cri_key(ino, hash));
 }
 
 pub(crate) fn cri_key(ino: Ino, hash: &ChunkHash) -> Vec<u8> {
     let mut k = ino.to_be_bytes().to_vec();
     k.extend_from_slice(&hash.0);
     k
+}
+
+/// The chunks `ino` has pending-upload rows for, read through `r` from
+/// the `pending_upload_by_ino` mirror.
+pub(crate) fn pending_for_ino_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    ino: Ino,
+) -> Result<Vec<ChunkHash>, MetaError> {
+    let mut out = Vec::new();
+    for guard in r.prefix(&meta.pending_upload_by_ino, ino.to_be_bytes()) {
+        let (k, _) = guard.into_inner()?;
+        if k.len() != 40 {
+            return Err(MetaError::Invalid(
+                "pending_upload_by_ino key length".into(),
+            ));
+        }
+        out.push(ChunkHash(k[8..40].try_into().unwrap()));
+    }
+    Ok(out)
 }
 
 /// Maintain `chunk_ref`/`chunk_ref_by_ino` in the same transaction as an
@@ -290,7 +331,7 @@ impl Meta {
     /// removes the row).
     pub fn add_pending_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
-        add_pending_claim_tx(&mut tx, &self.pending_upload, hash, ino)?;
+        add_pending_claim_tx(&mut tx, self, hash, ino)?;
         tx.commit()?;
         Ok(())
     }
@@ -317,8 +358,52 @@ impl Meta {
         Ok(r.prefix(&self.pending_upload, hash.0).next().is_some())
     }
 
+    /// Whether `ino` has any pending-upload row: its content (or content
+    /// another node forwarded for it, `store::remote`) still owes S3 a
+    /// PUT. One seek in the `pending_upload_by_ino` mirror, whatever the
+    /// size of the table: every `fsync` asks this first (plan 39b), and
+    /// one with nothing pending pays only this.
+    pub fn upload_pending_for_ino(&self, ino: Ino) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        match r
+            .prefix(&self.pending_upload_by_ino, ino.to_be_bytes())
+            .next()
+        {
+            None => Ok(false),
+            Some(guard) => {
+                guard.into_inner()?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// The chunks `ino` has pending-upload rows for, from the
+    /// `pending_upload_by_ino` mirror: O(rows of `ino`), not O(table) — an
+    /// inode drain's (an `fsync`'s) view of the queue.
+    pub fn pending_uploads_for_ino(&self, ino: Ino) -> Result<Vec<ChunkHash>, MetaError> {
+        let r = self.db.read_tx();
+        pending_for_ino_tx(&r, self, ino)
+    }
+
+    /// The inodes with a pending-upload row for `hash` (a prefix of the
+    /// hash-first table).
+    pub fn pending_inos_for_hash(&self, hash: &ChunkHash) -> Result<Vec<Ino>, MetaError> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for guard in r.prefix(&self.pending_upload, hash.0) {
+            let (k, _) = guard.into_inner()?;
+            if k.len() != 40 {
+                return Err(MetaError::Invalid("pending_upload key length".into()));
+            }
+            out.push(u64::from_be_bytes(k[32..40].try_into().unwrap()));
+        }
+        Ok(out)
+    }
+
     pub fn ack_upload(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
-        self.pending_upload.remove(cr_key(hash, ino))?;
+        let mut tx = self.db.write_tx();
+        remove_pending_row_tx(&mut tx, self, hash, ino);
+        tx.commit()?;
         // The row may have been another node's (`store::remote`): the
         // content is up, so its mark goes too.
         self.forget_remote_mark(hash, ino)
@@ -336,7 +421,7 @@ impl Meta {
             .map(|v| pending_claims(&v))
         {
             None => return Ok(()),
-            Some(n) if n <= 1 => tx.remove(&self.pending_upload, key),
+            Some(n) if n <= 1 => remove_pending_row_tx(&mut tx, self, hash, ino),
             Some(n) => tx.insert(&self.pending_upload, key, encode_claims(n - 1)),
         }
         tx.commit()?;
@@ -351,6 +436,13 @@ impl Meta {
             .collect::<Result<_, _>>()?;
         for k in keys {
             tx.remove(&self.pending_upload, k);
+        }
+        let mirror: Vec<Vec<u8>> = tx
+            .iter(&self.pending_upload_by_ino)
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for k in mirror {
+            tx.remove(&self.pending_upload_by_ino, k);
         }
         // Plan 30 §M4: the unrecoverable marks describe pending rows; with
         // the rows gone they would only be filtered out, so drop them too.
@@ -378,7 +470,8 @@ impl Meta {
             if k.len() == 40 {
                 let ino = u64::from_be_bytes(k[32..40].try_into().unwrap());
                 if (ino >> crate::store::INO_PREFIX_SHIFT) != prefix {
-                    tx.remove(&self.pending_upload, k);
+                    let hash = ChunkHash(k[..32].try_into().unwrap());
+                    remove_pending_row_tx(&mut tx, self, &hash, ino);
                     removed += 1;
                 }
             }
@@ -744,9 +837,13 @@ mod pending_claim_tests {
         meta.cancel_pending_upload(&h, file.ino).unwrap();
         assert_eq!(meta.pending_upload_claims(&h, file.ino).unwrap(), 1);
         assert_eq!(meta.pending_upload_claims(&h, 7).unwrap(), 1);
+        assert!(meta.upload_pending_for_ino(file.ino).unwrap());
         meta.ack_upload(&h, file.ino).unwrap();
         assert_eq!(meta.pending_upload_claims(&h, file.ino).unwrap(), 0);
         assert_eq!(meta.pending_uploads().unwrap(), vec![(h, 7)]);
+        // Per inode: 7's row is not `file`'s.
+        assert!(!meta.upload_pending_for_ino(file.ino).unwrap());
+        assert!(meta.upload_pending_for_ino(7).unwrap());
     }
 
     /// Rows written before claims were counted have an empty value: one
@@ -764,5 +861,168 @@ mod pending_claim_tests {
         meta.cancel_pending_upload(&h, 3).unwrap();
         meta.cancel_pending_upload(&h, 3).unwrap();
         assert!(meta.pending_uploads().unwrap().is_empty());
+    }
+
+    /// `pending_upload_by_ino` names exactly the rows `pending_upload`
+    /// holds.
+    fn assert_mirror(meta: &Meta) {
+        let mut table: Vec<(u64, ChunkHash)> = meta
+            .pending_uploads()
+            .unwrap()
+            .into_iter()
+            .map(|(h, i)| (i, h))
+            .collect();
+        table.sort();
+        let r = meta.db.read_tx();
+        let mut mirror: Vec<(u64, ChunkHash)> =
+            fjall::Readable::iter(&r, &meta.pending_upload_by_ino)
+                .map(|g| {
+                    let (k, _) = g.into_inner().unwrap();
+                    (
+                        u64::from_be_bytes(k[..8].try_into().unwrap()),
+                        ChunkHash(k[8..].try_into().unwrap()),
+                    )
+                })
+                .collect();
+        mirror.sort();
+        assert_eq!(table, mirror);
+        for (ino, _) in &table {
+            assert!(meta.upload_pending_for_ino(*ino).unwrap());
+            let mut by_ino = meta.pending_uploads_for_ino(*ino).unwrap();
+            by_ino.sort();
+            let want: Vec<ChunkHash> = table
+                .iter()
+                .filter(|(i, _)| i == ino)
+                .map(|(_, h)| *h)
+                .collect();
+            assert_eq!(by_ino, want);
+        }
+    }
+
+    /// Plan 39b: the by-inode mirror follows every way a row comes and
+    /// goes — claims, cancels, acks, a remote enrolment and its report,
+    /// a foreign purge, a clear.
+    #[test]
+    fn the_by_ino_mirror_follows_every_row() {
+        let meta = Meta::open_in_memory().unwrap();
+        let (a, b, c) = (
+            ChunkHash::of(b"a"),
+            ChunkHash::of(b"b"),
+            ChunkHash::of(b"c"),
+        );
+        let foreign = (7u64 << crate::store::INO_PREFIX_SHIFT) | 9;
+        meta.add_pending_upload(&a, 5).unwrap();
+        meta.add_pending_upload(&a, 5).unwrap();
+        meta.add_pending_upload(&b, 5).unwrap();
+        meta.add_pending_upload(&a, 6).unwrap();
+        meta.add_pending_upload(&c, foreign).unwrap();
+        assert_mirror(&meta);
+        assert!(!meta.upload_pending_for_ino(4).unwrap());
+        assert_eq!(meta.pending_inos_for_hash(&a).unwrap(), vec![5, 6]);
+        // One of two claims: the row (and its mirror) stays.
+        meta.cancel_pending_upload(&a, 5).unwrap();
+        assert_mirror(&meta);
+        assert_eq!(meta.pending_uploads_for_ino(5).unwrap().len(), 2);
+        meta.cancel_pending_upload(&a, 5).unwrap();
+        assert_mirror(&meta);
+        meta.ack_upload(&b, 5).unwrap();
+        assert_mirror(&meta);
+        assert!(!meta.upload_pending_for_ino(5).unwrap());
+        meta.enroll_remote_chunks(8, &[b], 2).unwrap();
+        assert_mirror(&meta);
+        assert!(meta.upload_pending_for_ino(8).unwrap());
+        meta.ack_remote_chunks(&[b]).unwrap();
+        assert_mirror(&meta);
+        assert!(!meta.upload_pending_for_ino(8).unwrap());
+        meta.purge_foreign_pending_uploads(0).unwrap();
+        assert_mirror(&meta);
+        assert!(!meta.upload_pending_for_ino(foreign).unwrap());
+        assert!(meta.upload_pending_for_ino(6).unwrap());
+        meta.clear_pending_uploads().unwrap();
+        assert_mirror(&meta);
+        assert!(!meta.upload_pending_for_ino(6).unwrap());
+    }
+
+    /// A store whose rows predate the mirror gets it built at open, once.
+    #[test]
+    fn a_store_from_before_the_mirror_builds_it_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = ChunkHash::of(b"old row");
+        {
+            let meta = Meta::open(dir.path()).unwrap();
+            meta.pending_upload
+                .insert(super::cr_key(&h, 11), super::encode_claims(1))
+                .unwrap();
+            meta.local.remove(crate::store::KV_PENDING_BY_INO).unwrap();
+            assert!(!meta.upload_pending_for_ino(11).unwrap());
+            meta.sync().unwrap();
+        }
+        let meta = Meta::open(dir.path()).unwrap();
+        assert!(meta.upload_pending_for_ino(11).unwrap());
+        assert_mirror(&meta);
+        meta.ack_upload(&h, 11).unwrap();
+        assert_mirror(&meta);
+    }
+
+    /// Plan 39b's measurement (run by hand: `cargo test --release -p
+    /// constellation-meta -- --ignored --nocapture pending_by_ino_cost`):
+    /// "does this inode have anything pending" and "this inode's rows"
+    /// with a large pending table of other inodes — the scan the review
+    /// flagged (what `upload_pending_for_ino` and an inode drain's listing
+    /// did before the mirror) against the mirror.
+    #[test]
+    #[ignore]
+    fn pending_by_ino_cost() {
+        use fjall::Readable;
+        let dir = tempfile::tempdir().unwrap();
+        let meta = Meta::open(dir.path()).unwrap();
+        for rows in [100_000u64, 400_000] {
+            let have = meta.pending_upload_count().unwrap();
+            for i in have..rows {
+                let h = ChunkHash::of(&i.to_le_bytes());
+                meta.add_pending_upload(&h, 1_000 + i % 5_000).unwrap();
+            }
+            let wanted = 999u64;
+            let reps = 20u32;
+            let started = std::time::Instant::now();
+            for _ in 0..reps {
+                let r = meta.db.read_tx();
+                let mut found = false;
+                for guard in r.iter(&meta.pending_upload) {
+                    let (k, _) = guard.into_inner().unwrap();
+                    if k[32..40] == wanted.to_be_bytes() {
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(!found);
+            }
+            let scan = started.elapsed() / reps;
+            let started = std::time::Instant::now();
+            for _ in 0..reps {
+                assert!(!meta.upload_pending_for_ino(wanted).unwrap());
+            }
+            let seek = started.elapsed() / reps;
+            let started = std::time::Instant::now();
+            for _ in 0..reps {
+                let n = meta
+                    .pending_uploads()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(_, i)| *i == 1_000)
+                    .count();
+                assert!(n > 0);
+            }
+            let list_scan = started.elapsed() / reps;
+            let started = std::time::Instant::now();
+            for _ in 0..reps {
+                assert!(!meta.pending_uploads_for_ino(1_000).unwrap().is_empty());
+            }
+            let list_seek = started.elapsed() / reps;
+            println!(
+                "{rows} pending rows: nothing-pending check scan {scan:?} -> mirror {seek:?}; \
+                 one inode's rows scan {list_scan:?} -> mirror {list_seek:?}"
+            );
+        }
     }
 }

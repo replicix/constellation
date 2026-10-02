@@ -53,6 +53,14 @@
 //! - `pending_upload` — `hash(32) ++ ino(8 BE) -> claims(u32 LE)`, the
 //!   number of outstanding claims on uploading that chunk for that inode
 //!   (an empty value, as older rows have, is one claim).
+//! - `pending_upload_by_ino` — `ino(8 BE) ++ hash(32) -> ()`, the by-ino
+//!   mirror of `pending_upload`'s rows (plan 39b: an `fsync` asks "does
+//!   this inode have anything pending" and drains just that inode's rows,
+//!   O(rows of the inode) rather than a scan of the whole queue). Written
+//!   in the same transaction as every row it mirrors
+//!   (`misc::add_pending_claim_tx` / `misc::remove_pending_row_tx`);
+//!   built from `pending_upload` once, at open, on a store that predates
+//!   it (`KV_PENDING_BY_INO`).
 //! - `chunk_ref` / `chunk_ref_by_ino` — `hash(32) ++ ino(8 BE) -> ()`
 //!   and its by-ino mirror `ino(8 BE) ++ hash(32) -> ()`, maintained in
 //!   the same transaction as every manifest change.
@@ -203,6 +211,9 @@ pub(crate) const KV_JOURNAL_ACKED: &str = "journal_acked";
 /// poisoned?" is one point read, not a range scan of a keyspace every
 /// journaled write rewrites.
 pub(crate) const KV_POISONED_COUNT: &str = "poisoned_count";
+/// Set once `pending_upload_by_ino` mirrors every `pending_upload` row
+/// (`Meta::build_pending_by_ino`).
+pub(crate) const KV_PENDING_BY_INO: &str = "pending_upload_by_ino_built";
 /// Monotonic counter behind the `dirty` keyspace (plan 29 M2): every key
 /// written to `ns` records the counter value it was touched at, so
 /// `clear_dirty_upto` can tell "still dirty at the counter a publish
@@ -466,6 +477,7 @@ pub struct Meta {
     pub(crate) atime_journal: SingleWriterTxKeyspace,
     pub(crate) local: SingleWriterTxKeyspace,
     pub(crate) pending_upload: SingleWriterTxKeyspace,
+    pub(crate) pending_upload_by_ino: SingleWriterTxKeyspace,
     pub(crate) chunk_ref: SingleWriterTxKeyspace,
     pub(crate) chunk_ref_by_ino: SingleWriterTxKeyspace,
     pub(crate) xattr_by_name: SingleWriterTxKeyspace,
@@ -751,6 +763,8 @@ impl Meta {
         let atime_journal = db.keyspace("atime_journal", KeyspaceCreateOptions::default)?;
         let local = db.keyspace("local", KeyspaceCreateOptions::default)?;
         let pending_upload = db.keyspace("pending_upload", KeyspaceCreateOptions::default)?;
+        let pending_upload_by_ino =
+            db.keyspace("pending_upload_by_ino", KeyspaceCreateOptions::default)?;
         let chunk_ref = db.keyspace("chunk_ref", KeyspaceCreateOptions::default)?;
         let chunk_ref_by_ino = db.keyspace("chunk_ref_by_ino", KeyspaceCreateOptions::default)?;
         let xattr_by_name = db.keyspace("xattr_by_name", KeyspaceCreateOptions::default)?;
@@ -777,6 +791,7 @@ impl Meta {
             atime_journal,
             local,
             pending_upload,
+            pending_upload_by_ino,
             chunk_ref,
             chunk_ref_by_ino,
             xattr_by_name,
@@ -817,6 +832,7 @@ impl Meta {
             path,
         };
         meta.bootstrap()?;
+        meta.build_pending_by_ino()?;
         let table = meta.delegation_table();
         meta.deleg_any
             .store(!table.is_empty(), std::sync::atomic::Ordering::Release);
@@ -835,6 +851,34 @@ impl Meta {
         let applied_seq = meta.applied_seq().unwrap_or(0);
         meta.session.seed_applied(applied_seq, meta.applied_pos());
         Ok(meta)
+    }
+
+    /// A store written before `pending_upload_by_ino` existed: build the
+    /// mirror from the table, once (marked by `KV_PENDING_BY_INO`).
+    fn build_pending_by_ino(&self) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        if kv_get_tx(&tx, &self.local, KV_PENDING_BY_INO)?.is_some() {
+            return Ok(());
+        }
+        let rows: Vec<Vec<u8>> = tx
+            .iter(&self.pending_upload)
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+        for k in rows {
+            if k.len() != 40 {
+                return Err(MetaError::Invalid("pending_upload key length".into()));
+            }
+            let hash = constellation_fs_core::ChunkHash(k[..32].try_into().expect("32 bytes"));
+            let ino = u64::from_be_bytes(k[32..].try_into().expect("8 bytes"));
+            tx.insert(
+                &self.pending_upload_by_ino,
+                misc::cri_key(ino, &hash),
+                Vec::new(),
+            );
+        }
+        kv_set_tx(&mut tx, &self.local, KV_PENDING_BY_INO, "1");
+        tx.commit()?;
+        Ok(())
     }
 
     fn bootstrap(&self) -> Result<(), MetaError> {
@@ -1450,9 +1494,10 @@ impl Meta {
     /// [`VACUUM_MIN_ENTRIES`], has its memtable flushed and is compacted
     /// to its last level, which drops them. Returns the keyspaces vacuumed.
     pub fn vacuum_churn(&self) -> Result<Vec<&'static str>, MetaError> {
-        let churn: [(&'static str, &SingleWriterTxKeyspace); 13] = [
+        let churn: [(&'static str, &SingleWriterTxKeyspace); 14] = [
             ("dirty", &self.dirty),
             ("pending_upload", &self.pending_upload),
+            ("pending_upload_by_ino", &self.pending_upload_by_ino),
             ("journal", &self.journal_ks),
             ("journal_tx", &self.journal_tx),
             ("spec", &self.spec),

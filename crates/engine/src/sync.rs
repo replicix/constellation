@@ -52,13 +52,23 @@ pub use constellation_store_s3::ErrorClass;
 
 impl SyncFailure {
     /// Classified from the error's chain: content this node lost, or a
-    /// local metadata-store failure, is permanent; the rest is the store's
-    /// table (`constellation_store_s3::classify`).
+    /// local metadata-store failure, is permanent; chunks another node
+    /// still has to upload are transient (plan 39b,
+    /// `crate::upload::DrainShortfall`); the rest is the store's table
+    /// (`constellation_store_s3::classify`).
     pub fn from_error(error: &anyhow::Error) -> Self {
+        let shortfall = error
+            .chain()
+            .find_map(|e| e.downcast_ref::<crate::upload::DrainShortfall>());
         let local = error
             .chain()
             .any(|e| e.downcast_ref::<constellation_meta::MetaError>().is_some());
-        let class = if local {
+        let class = if let Some(shortfall) = shortfall {
+            match shortfall {
+                crate::upload::DrainShortfall::Lost { .. } => ErrorClass::Permanent,
+                crate::upload::DrainShortfall::AwaitingRemote { .. } => ErrorClass::Transient,
+            }
+        } else if local {
             ErrorClass::Permanent
         } else {
             constellation_store_s3::classify_chain(error.chain())
@@ -122,8 +132,25 @@ pub enum SyncRequest {
     /// `chunk_handoff_after`, the chunks are handed to a peer that can
     /// reach S3 (`ChunkHandoff`), and the drain succeeds once that peer
     /// has them in S3.
+    ///
+    /// `fsync` (the drain of an `fsync` or an `O_SYNC` write, plan 39b;
+    /// `ino != 0`): the reply is a success only once nothing of `ino` is
+    /// pending here —
+    /// - the durable reports this file's chunks owe
+    ///   (`meta::store::remote`) are delivered before replying, each send
+    ///   bounded, also after a peer handoff — so once the `fsync` returns,
+    ///   the sequencer a `back` close forwarded the manifest to knows its
+    ///   chunks are up; other files' reports stay in the background;
+    /// - a pending chunk of `ino` neither in the cache nor in S3 fails it
+    ///   permanently (`crate::upload::DrainShortfall::Lost`), never `Ok`;
+    /// - rows of `ino` another node forwarded as pending (on the
+    ///   sequencer) are waited for, and still missing after a slice of
+    ///   the wait they fail it transiently
+    ///   (`DrainShortfall::AwaitingRemote`) so the `fsync`'s retry loop
+    ///   keeps waiting under plan 39's policy.
     DrainInode {
         ino: Ino,
+        fsync: bool,
         reply: tokio::sync::oneshot::Sender<Result<(), SyncFailure>>,
     },
     /// EC2 finding 1: `requester` cannot reach S3 and hands us `hashes`

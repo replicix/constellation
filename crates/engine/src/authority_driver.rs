@@ -1119,11 +1119,11 @@ impl Driver {
                     }
                 }
             }
-            SyncRequest::DrainInode { ino, reply } => {
+            SyncRequest::DrainInode { ino, fsync, reply } => {
                 let upload = self.uploader();
                 let handoff = (ino != 0).then(|| self.chunk_handoff());
                 tokio::spawn(async move {
-                    let r = drain_with_handoff(upload, handoff, ino).await;
+                    let r = drain_with_handoff(upload, handoff, ino, fsync && ino != 0).await;
                     let _ = reply.send(r.map_err(|e| crate::sync::SyncFailure::from_error(&e)));
                 });
                 None
@@ -3428,6 +3428,81 @@ impl Uploader {
         self.run_report(only_ino).await.map(|_| ())
     }
 
+    /// An `fsync`'s drain of `ino` (plan 39b): a pass over the inode's
+    /// rows, then the durable reports *those* chunks owe, delivered before
+    /// it returns rather than in the background (each send bounded, 2 s;
+    /// one not delivered is retried at the next pass, as before) — so when
+    /// the `fsync` returns, the sequencer a `back` close forwarded the
+    /// file's manifest to has acked its chunks, and a reader there does not
+    /// wait `CONSTELLATION_REMOTE_CHUNK_WAIT_S` for a report that died with
+    /// this node. Other files' reports go out from the background passes:
+    /// an unreachable peer costs this `fsync` nothing unless it awaits this
+    /// file. A report a concurrent background pass already took (it
+    /// uploaded the chunk this drain waited for) goes out from that pass's
+    /// own task.
+    ///
+    /// Never `Ok` with the inode not durable, whatever the cause:
+    /// - a pending chunk of `ino` that is neither in the cache nor in S3
+    ///   (a torn disk) is [`crate::upload::DrainShortfall::Lost`],
+    ///   permanent — `EIO` now and on every later `fsync` while the row
+    ///   stays (a background pass records it unrecoverable, M4);
+    /// - rows of `ino` another node forwarded as pending (this node is the
+    ///   sequencer of that node's `back` close, `meta::store::remote`) are
+    ///   waited for — their reports, or the S3 checks, ack them — as
+    ///   [`Self::run_complete`] does for a barrier; still there after
+    ///   [`FSYNC_REMOTE_SLICE`] (or `CONSTELLATION_REMOTE_CHUNK_WAIT_S`, if
+    ///   shorter) the drain fails
+    ///   [`crate::upload::DrainShortfall::AwaitingRemote`], transient, and
+    ///   the `fsync`'s retry loop keeps waiting under plan 39's policy (hard
+    ///   by default; `--fsync-timeout` and an interrupt bound it). A barrier
+    ///   gives up on such chunks after `CONSTELLATION_REMOTE_CHUNK_WAIT_S`
+    ///   and holds the records that need them; an `fsync` of the file never
+    ///   turns that into a success.
+    async fn run_fsync(&self, ino: constellation_fs_core::Ino) -> Result<()> {
+        let started = std::time::Instant::now();
+        let slice = crate::upload::remote_chunk_wait().min(FSYNC_REMOTE_SLICE);
+        loop {
+            let mine: std::collections::HashSet<_> = self
+                .meta
+                .pending_uploads_for_ino(ino)?
+                .into_iter()
+                .collect();
+            let result = crate::upload::upload_dirty_chunks_report(
+                &self.cache,
+                &self.meta,
+                &self.store,
+                self.compression,
+                &self.upload,
+                Some(ino),
+                None,
+            )
+            .await;
+            self.send_durable_reports_of(Some(&mine)).await;
+            let report = result?;
+            let lost: Vec<_> = report.missing.iter().filter(|(_, i)| *i == ino).collect();
+            if let Some((hash, _)) = lost.first() {
+                return Err(crate::upload::DrainShortfall::Lost {
+                    ino,
+                    hash: *hash,
+                    count: lost.len(),
+                }
+                .into());
+            }
+            if report.awaiting == 0 {
+                return Ok(());
+            }
+            if started.elapsed() >= slice {
+                return Err(crate::upload::DrainShortfall::AwaitingRemote {
+                    ino,
+                    awaiting: report.awaiting,
+                    waited_s: started.elapsed().as_secs(),
+                }
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The round's opportunistic pass, which the upload hold (plan 31 C8,
     /// `UploadMode::UnmeteredOnly`) keeps from taking new chunks.
     async fn run_background(&self) -> Result<()> {
@@ -3470,10 +3545,25 @@ impl Uploader {
     }
 
     async fn send_durable_reports(&self) {
+        self.send_durable_reports_of(None).await
+    }
+
+    /// [`Self::send_durable_reports`], limited to the reports `only`'s
+    /// chunks owe (`None`: every report owed).
+    async fn send_durable_reports_of(
+        &self,
+        only: Option<&std::collections::HashSet<constellation_fs_core::ChunkHash>>,
+    ) {
         let Some(peers) = &self.peers else {
             return;
         };
-        let mut reports = self.upload.take_durable_reports();
+        let mut reports = match only {
+            None => self.upload.take_durable_reports(),
+            Some(hashes) => self.upload.take_durable_reports_of(hashes),
+        };
+        if reports.is_empty() {
+            return;
+        }
         if let Some(all) = reports.remove(&crate::upload::REPORT_TO_ALL) {
             let known = peers.remote_snapshot();
             if known.is_empty() {
@@ -3636,6 +3726,13 @@ fn chunk_handoff_after_ms() -> u64 {
     })
 }
 
+/// How long one attempt of an `fsync`'s drain waits for chunks another
+/// node forwarded as pending before it answers
+/// [`crate::upload::DrainShortfall::AwaitingRemote`] and the `fsync`'s
+/// retry loop (its backoff, its "still trying" warning, its timeout)
+/// takes over (`Uploader::run_fsync`).
+const FSYNC_REMOTE_SLICE: Duration = Duration::from_secs(5);
+
 /// How long a peer may take to fetch and upload a handoff's chunks.
 const CHUNK_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Hashes per `ChunkHandoff` message (a frame is at most 64 KiB).
@@ -3652,16 +3749,42 @@ const CHUNK_HANDOFF_STICKY_MS: i64 = 30_000;
 /// puts them there that changes. This node's own upload keeps running
 /// in the background either way (a repeat PUT of content-addressed data
 /// is harmless).
+///
+/// `fsync` (an `fsync`'s drain of `ino`, plan 39b): the pass is
+/// [`Uploader::run_fsync`], and a drain that succeeds through a peer
+/// delivers the durable reports of the chunks it handed off before it
+/// returns, as the pass would have. A [`crate::upload::DrainShortfall`]
+/// is not handed off: a lost chunk is lost to the peer too, and a chunk
+/// another node still has is that node's to upload.
 async fn drain_with_handoff(
     upload: Uploader,
     handoff: Option<ChunkHandoff>,
     ino: constellation_fs_core::Ino,
+    fsync: bool,
 ) -> Result<()> {
     let (tx, mut done) = tokio::sync::oneshot::channel();
     let stats = upload.upload.clone();
+    let reporter = fsync.then(|| upload.clone());
     tokio::spawn(async move {
-        let _ = tx.send(upload.run((ino != 0).then_some(ino)).await);
+        let result = if fsync {
+            upload.run_fsync(ino).await
+        } else {
+            upload.run((ino != 0).then_some(ino)).await
+        };
+        let _ = tx.send(result);
     });
+    // After a successful handoff: the reports its chunks owe (`note_up`
+    // queued them), sent now on an `fsync`'s drain.
+    let handed_off = |hashes: Vec<constellation_fs_core::ChunkHash>| {
+        let reporter = reporter.clone();
+        async move {
+            if let Some(reporter) = reporter {
+                let hashes = hashes.into_iter().collect();
+                reporter.send_durable_reports_of(Some(&hashes)).await;
+            }
+            Ok(())
+        }
+    };
     let stopped = || anyhow::anyhow!("the drain task stopped");
     let after_ms = chunk_handoff_after_ms();
     let Some(handoff) = handoff.filter(|h| after_ms > 0 && h.possible()) else {
@@ -3688,10 +3811,13 @@ async fn drain_with_handoff(
             Ok(result) => {
                 let result = result.unwrap_or_else(|_| Err(stopped()));
                 if let Err(error) = &result {
-                    if !tried {
+                    let shortfall = error
+                        .downcast_ref::<crate::upload::DrainShortfall>()
+                        .is_some();
+                    if !tried && !shortfall {
                         tracing::info!(ino, %error, "drain failed; handing its chunks to a peer");
-                        if handoff.hand_off(ino).await {
-                            return Ok(());
+                        if let Some(hashes) = handoff.hand_off(ino).await {
+                            return handed_off(hashes).await;
                         }
                     }
                 }
@@ -3704,8 +3830,8 @@ async fn drain_with_handoff(
                     waited_ms = wait.as_millis() as u64,
                     "no upload has completed on this node for a while: handing the drain's chunks to a peer"
                 );
-                if handoff.hand_off(ino).await {
-                    return Ok(());
+                if let Some(hashes) = handoff.hand_off(ino).await {
+                    return handed_off(hashes).await;
                 }
             }
             Err(_) => {}
@@ -3761,20 +3887,16 @@ impl ChunkHandoff {
 
     /// Hand `ino`'s pending chunks to a peer — the lease holder first,
     /// then any other connected peer — and, once one has them in S3,
-    /// acknowledge them here as uploaded. `false`: nobody could.
-    async fn hand_off(&self, ino: constellation_fs_core::Ino) -> bool {
-        let rows = match self.meta.pending_uploads() {
-            Ok(rows) => rows,
-            Err(_) => return false,
-        };
-        let hashes: Vec<constellation_fs_core::ChunkHash> = rows
-            .iter()
-            .filter(|(_, i)| *i == ino)
-            .map(|(h, _)| *h)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        self.hand_off_hashes(hashes, &[], ino).await
+    /// acknowledge them here as uploaded: the chunks handed off. `None`:
+    /// nobody could.
+    async fn hand_off(
+        &self,
+        ino: constellation_fs_core::Ino,
+    ) -> Option<Vec<constellation_fs_core::ChunkHash>> {
+        let hashes = self.meta.pending_uploads_for_ino(ino).ok()?;
+        self.hand_off_hashes(hashes.clone(), &[], ino)
+            .await
+            .then_some(hashes)
     }
 
     /// Hand `hashes` (pending here) to a peer: the nodes in `first`, then
@@ -3843,12 +3965,9 @@ impl ChunkHandoff {
             }
             // Every chunk is in S3 now: this node's claims on them are
             // satisfied, whichever inode made them.
-            let set: std::collections::HashSet<_> = hashes.iter().copied().collect();
-            if let Ok(rows) = self.meta.pending_uploads() {
-                for (hash, i) in rows {
-                    if set.contains(&hash) {
-                        let _ = self.meta.ack_upload(&hash, i);
-                    }
+            for hash in &hashes {
+                for i in self.meta.pending_inos_for_hash(hash).unwrap_or_default() {
+                    let _ = self.meta.ack_upload(hash, i);
                 }
             }
             for hash in &hashes {
@@ -4477,5 +4596,180 @@ mod tests {
         assert_eq!(parse_u64_zero_ok(Some(" 35 "), 20), 35);
         assert_eq!(parse_u64_zero_ok(None, 20), 20);
         assert_eq!(parse_u64_zero_ok(Some("off"), 20), 20);
+    }
+
+    /// Plan 39b: an `fsync`'s drain that succeeds through a peer handoff
+    /// (this node's PUTs fail) delivers the durable report its chunk owes
+    /// before it returns — the sequencer the `back` close forwarded the
+    /// manifest to learns before the `fsync` does — as a drain this node
+    /// uploaded itself does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_fsync_drain_through_a_handoff_reports_before_it_returns() {
+        use super::{ChunkHandoff, Uploader};
+        use constellation_fs_core::cache::{ChunkState, DiskCache};
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::{Meta, MetaStore};
+        use constellation_net::{Payload, Peers};
+        use constellation_store_s3::{ChunkStore, CompressionSetting};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        /// Node 2: accepts every handoff, records every durable report.
+        struct Sequencer(Mutex<Vec<[u8; 32]>>);
+        impl constellation_net::PeerService for Sequencer {
+            fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
+            fn lease_requested(
+                &self,
+                part: String,
+                _requester: u64,
+                _epoch_applied: Option<u64>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>
+            {
+                Box::pin(async move {
+                    Payload::LeaseHandoff {
+                        part,
+                        epoch: 0,
+                        released: false,
+                        etag: None,
+                        head_seq: None,
+                    }
+                })
+            }
+            fn chunk_handoff_requested(
+                &self,
+                _requester: u64,
+                req_id: u64,
+                _hashes: Vec<[u8; 32]>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>
+            {
+                Box::pin(async move {
+                    Payload::ChunkHandoffReply {
+                        req_id,
+                        uploaded: true,
+                    }
+                })
+            }
+            fn chunks_durable(
+                &self,
+                _from: u64,
+                hashes: Vec<[u8; 32]>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+                Box::pin(async move { self.0.lock().unwrap().extend(hashes) })
+            }
+            fn node_id(&self) -> u64 {
+                2
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let topic = constellation_net::topic_for(Some(&[39u8; 32]), "fsync-handoff-report");
+        let (key_a, _) = constellation_net::load_or_create(&dir.path().join("a.key")).unwrap();
+        let (key_b, _) = constellation_net::load_or_create(&dir.path().join("b.key")).unwrap();
+        let pa = constellation_net::P2p::spawn(key_a, topic).await.unwrap();
+        let pb = constellation_net::P2p::spawn(key_b, topic).await.unwrap();
+        let registry = vec![
+            (
+                1u64,
+                pa.pubkey_hex(),
+                serde_json::to_value(pa.addr()).unwrap(),
+            ),
+            (
+                2u64,
+                pb.pubkey_hex(),
+                serde_json::to_value(pb.addr()).unwrap(),
+            ),
+        ];
+        let peers_a = Peers::new(pa, 1);
+        let peers_b = Peers::new(pb, 2);
+        peers_a.refresh_registry(registry.clone());
+        peers_b.refresh_registry(registry);
+        let sequencer = Arc::new(Sequencer(Mutex::new(Vec::new())));
+        {
+            let (peers_b, sequencer) = (peers_b.clone(), sequencer.clone());
+            tokio::spawn(async move { peers_b.serve(sequencer).await });
+        }
+        // Connected, so the handoff picks node 2 (an empty report: a no-op).
+        let started = std::time::Instant::now();
+        while !peers_a
+            .snapshot()
+            .iter()
+            .any(|p| p.node_id == 2 && p.connected)
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "never connected"
+            );
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                peers_a.request_to_node(
+                    2,
+                    &Payload::ChunksDurable {
+                        from: 1,
+                        hashes: Vec::new(),
+                    },
+                ),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let ino = meta.create(ROOT_INO, "relation", 0o644, 0, 0).unwrap().ino;
+        let cache = Arc::new(DiskCache::open(dir.path().join("cache"), 64 << 20).unwrap());
+        let failing = crate::upload::pending_upload_tests::FailingStore::new();
+        failing.set_fail_puts(true);
+        let store = Arc::new(ChunkStore::new(failing.clone()));
+        let data = vec![39u8; 4096];
+        let hash = store.hash(&data);
+        cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
+        meta.add_pending_upload(&hash, ino).unwrap();
+        let mut runtime = crate::upload::UploadRuntime::for_test(false);
+        runtime.coop = Some(crate::coop::Coop::new(
+            cache.clone(),
+            store.clone(),
+            peers_a.clone(),
+            1,
+            1 << 20,
+        ));
+        let upload = Arc::new(runtime);
+        // The `back` close forwarded the manifest to node 2 with the chunk
+        // still pending here: node 2 is owed the report.
+        upload.note_forwarded(&[hash], 2);
+        let uploader = Uploader {
+            cache: cache.clone(),
+            meta: meta.clone(),
+            store: store.clone(),
+            compression: CompressionSetting::RAW,
+            upload: upload.clone(),
+            peers: Some(peers_a.clone()),
+            node_id: 1,
+        };
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handoff = ChunkHandoff {
+            node_id: 1,
+            meta: meta.clone(),
+            cache,
+            store,
+            compression: CompressionSetting::RAW,
+            upload: upload.clone(),
+            peers: peers_a,
+            view: Arc::new(crate::lease::LeaseView::default()),
+            sync_tx,
+        };
+
+        super::drain_with_handoff(uploader, Some(handoff), ino, true)
+            .await
+            .expect("the drain succeeds through the peer");
+        assert!(
+            upload.handoff.ok.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the chunk went up through the peer"
+        );
+        assert!(!meta.upload_pending_for_ino(ino).unwrap());
+        assert_eq!(
+            *sequencer.0.lock().unwrap(),
+            vec![hash.0],
+            "the sequencer had the report when the drain returned"
+        );
+        assert!(upload.take_durable_reports().is_empty(), "sent, not owed");
     }
 }

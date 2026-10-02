@@ -1061,7 +1061,11 @@ impl BatchHost for EngineBatchHost {
     fn drain_own(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             self.ask("pending-chunk drain", |reply| {
-                crate::sync::SyncRequest::DrainInode { ino: 0, reply }
+                crate::sync::SyncRequest::DrainInode {
+                    ino: 0,
+                    fsync: false,
+                    reply,
+                }
             })
             .await?
             .map_err(|error| anyhow::anyhow!(error))

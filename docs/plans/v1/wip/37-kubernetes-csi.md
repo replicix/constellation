@@ -2070,6 +2070,22 @@ can honestly recommend a `shards` value.
   K6 adds exactly what the `Refreshing` Secret watch needs (the referenced
   Secrets, e.g. a namespaced `Role`/`resourceNames` per pool namespace),
   never a blanket cluster-wide `secrets` get — §"Security" RBAC above.
+- **Durability default where node disks are ephemeral (recommendation
+  from plan 39b, for K6/K7 to adopt).** Since plan 39b an `fsync` under
+  the default `--fsync-mode local` puts the file's chunks in S3, but the
+  file's *metadata* (its latest manifest, a rename, an unlink) is only in
+  the node's local journal until the journal ships, so a node whose disk
+  goes away with it (an instance-store volume, an `emptyDir` engine-pod
+  state dir, a spot node reclaimed, a node pool scaled down without
+  `node.leave`) loses acknowledged, `fsync`ed metadata: that node's disk
+  is the only copy until the journal ships. So the StorageClass default
+  should be `--fsync-mode s3` (an `fsync` also ships the journal), or the
+  pool filesystem created with `ack_policy = s3` (every acknowledged
+  mutation is in the bucket first), wherever the engine pods' state is
+  not on a durable, re-attachable volume; `local` stays a per-class
+  opt-in for clusters whose node disks outlive the node (and for scratch
+  classes). `fsync`'s cost under `s3` is one extra journal ship per call,
+  which K7's parity lane should measure against `local`.
 - **Gate:** CONVENTIONS gates; the secret-rotation and node-drain
   `k8s-scenario`s pass; the "trash purge under load" `k8s-scenario`
   (§"Testing") passes, including the large-many-small-files trashed volume

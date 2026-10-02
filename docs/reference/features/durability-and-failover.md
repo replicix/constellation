@@ -282,10 +282,21 @@ gets the epoch journal from its start again. See
 
 These are older, per-mount knobs that combine with the policies above:
 
-- `--fsync-mode local` (default): `fsync()` forces the node's metadata
-  store to disk and nudges the shipper.
-  `--fsync-mode s3`: `fsync()` also waits until the inode's chunks and
-  records are in the bucket. It is the per-call form of Layer C.
+- `--fsync-mode local` (default): `fsync()` (and `fdatasync()`) uploads
+  every chunk of the file still queued on this node — whoever wrote it,
+  through whichever descriptor, including writers that already closed it
+  under `--write-mode back` — forces the node's metadata store to disk and
+  nudges the shipper. The file's data is then in the bucket; its latest
+  manifest is as durable as the ack policy makes this node's journal.
+  `--fsync-mode s3`: `fsync()` also waits until the journal up to the call
+  (the file's records) is in the bucket. It is the per-call form of
+  Layer C.
+- Before plan 39b the two modes were asymmetric: under `local`, an
+  `fsync` only uploaded the chunks of writes it published itself, so
+  `open` + `fsync` of a file closed under `back` (a PostgreSQL
+  checkpointer's pattern) returned with the chunks only on this node's
+  disk. Linux's `fsync(2)` covers "all modified in-core data of the
+  file"; now both modes do.
 - **While it waits** (plan 39), `fsync()` behaves like an NFS `hard`
   mount in every mode: see [fsync during an S3 outage](#fsync-during-an-s3-outage).
 - `--write-mode through` (default): `close()` waits for the file's chunk
@@ -344,17 +355,40 @@ the same in every mode:
   the application. A host with the kernel's FUSE request timeout set
   (`fs.fuse.default_request_timeout`/`max_request_timeout`) caps every wait
   just below it, because the kernel would otherwise abort the connection.
-- **Never a false success.** No failure drops data; after a failed `fsync`
-  the next one drains what the failed one left (under `--fsync-mode local`
-  too, where a published file's chunks were otherwise no longer waited for).
+- **Never a false success.** No failure drops data; every `fsync` drains
+  whatever of the file is still queued on this node, so the one after a
+  failed `fsync` (or a failed close, or an `O_SYNC` write that failed)
+  waits for it again, in both modes. A queued chunk that is gone from the
+  node's disk cache and not in the bucket either (a torn or replaced
+  disk) cannot be uploaded by anyone: the `fsync` fails `EIO`, and so does
+  every later `fsync` of the file until it is rewritten or removed.
+- **Chunks another node still has to upload.** On the node that
+  sequenced a `back` close made elsewhere (the lease holder), the file's
+  chunks the writer had not uploaded yet are part of the file as that
+  node sees it: an `fsync` there waits until they are in the bucket (the
+  writer's report, or the node's own S3 check), with the same hard-mount
+  policy. `CONSTELLATION_REMOTE_CHUNK_WAIT_S` does not end that wait with
+  a success; `--fsync-timeout` ends it with `EIO`. A node that neither
+  wrote the file nor sequenced the close does not see the writer's queue
+  and does not wait for it.
+- **An unlinked file that is still open**: an `fsync` of it uploads its
+  queued chunks like any other file's (a deleted file's data is still the
+  file's until its last descriptor closes); garbage collection reclaims
+  them afterwards.
 - **Inside a continuation epoch** (S3 away; a single node enters one within
-  about a second) an `--fsync-mode local` `fsync` does not wait for the
-  bucket at all — the epoch's writes are as durable as their nodes, as
-  before plan 39. Under `--fsync-mode s3` it waits for the bucket. Whether
-  `local` should wait for chunk uploads is open (plan 39 §6).
+  about a second) an `fsync` still waits for the file's chunks to reach the
+  bucket — through a peer that can reach S3 (chunk handoff, after
+  `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`), or once S3 returns — in both
+  modes (plan 39b). The epoch lets `close()` and every other mutation go
+  on without S3, its writes as durable as their nodes; an `fsync` asks for
+  more than that. Until plan 39b a `--fsync-mode local` `fsync` returned
+  there with the chunks only on this node.
 - **`fsync` of a directory** (`fsyncdir`) is the same barrier for its
   entries: their mutations committed, the local store synced, under
-  `--fsync-mode s3` the journal shipped. Before plan 39 it was a silent no-op.
+  `--fsync-mode s3` the journal shipped. A directory has no chunks, so
+  there is nothing to upload; it does not upload its files' chunks either
+  (`fsync` each file for that, as on Linux). Before plan 39 it was a
+  silent no-op.
 
 Visible as `status.fsync` (`waiting`, `longest_wait_ms`, `retries`,
 `timeouts`, `permanent_errors`, `interrupted`, …) and `constellation_fsync_*`
@@ -399,10 +433,14 @@ What `back` gives up, and what it keeps:
   need a completed `close()` to be readable everywhere at once should
   not use `back`, or should `fsync`.
 - **`fsync`.** One on a file with unflushed writes flushes them as
-  `through` would (upload, then commit). One after the `close()` under
-  `--fsync-mode local` returns once this node's store is on disk — the
-  chunks are, in its cache — as it does everywhere; under `--fsync-mode
-  s3` it also uploads the file's pending chunks first.
+  `through` would (upload, then commit). One after the `close()` — from
+  any descriptor or process on the writing node — uploads the chunks the
+  close left queued before it returns, in both `--fsync-mode`s (plan
+  39b), and tells the sequencer they are up, so a reader there does not
+  wait for them even if the writer dies right after. An `fsync` on the
+  sequencer waits for the writer's queue (see [fsync during an S3
+  outage](#fsync-during-an-s3-outage)); on any other node it does not
+  see it: the queue belongs to the writing node until it drains.
 - **Correctness is unchanged**: rebases, exactly-once forwarding,
   conflict detection, locks (a lock's release flushes through) and
   failover behave as under `through`.

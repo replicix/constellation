@@ -912,7 +912,11 @@ impl EngineControl {
         if requested == writeback::WriteMode::Through {
             let (reply, receive) = tokio::sync::oneshot::channel();
             self.sync_tx
-                .send(sync::SyncRequest::DrainInode { ino: 0, reply })
+                .send(sync::SyncRequest::DrainInode {
+                    ino: 0,
+                    fsync: false,
+                    reply,
+                })
                 .map_err(|_| "sync task is not running".to_string())?;
             tokio::task::block_in_place(|| {
                 self.rt

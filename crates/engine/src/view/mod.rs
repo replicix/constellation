@@ -128,6 +128,8 @@ mod confine_tests;
 #[cfg(test)]
 mod durable_ack_tests;
 #[cfg(test)]
+mod fsync_drain_tests;
+#[cfg(test)]
 mod memcache_tests;
 #[cfg(test)]
 mod passthrough_tests;
@@ -341,11 +343,6 @@ pub struct View {
     /// its inode (§6.12: a handle addresses only that one) and the discard
     /// error event it has seen ([`durable`]'s module doc).
     handles: durable::Handles,
-    /// Inodes whose last `fsync` failed after its write session was
-    /// published: the next one drains their pending chunks whatever the
-    /// mode, so it never reports durable what the failed one could not
-    /// make durable (plan 39 §3.2).
-    fsync_owed: Mutex<std::collections::HashSet<Ino>>,
     /// What each passthrough open holds until its `release`
     /// ([`PassthroughHandle`]), per inode. Keyed by inode and not by
     /// handle because `release` does not tell the engine which of an
@@ -479,7 +476,6 @@ impl View {
             inode_ops: InodeOps::new(),
             opens: Mutex::new(HashMap::new()),
             handles: durable::Handles::default(),
-            fsync_owed: Mutex::new(std::collections::HashSet::new()),
             passthrough: Mutex::new(HashMap::new()),
             writers: Mutex::new(HashMap::new()),
             passthrough_on: std::sync::atomic::AtomicBool::new(deps.caps.passthrough),
@@ -580,10 +576,6 @@ impl View {
             .holds
             .as_ref()
             .is_some_and(|h| h.sources().is_open(ino));
-        if !open_here {
-            // Nothing of this view can `fsync` it again.
-            self.forget_fsync_owed(ino);
-        }
         if open_here || open_elsewhere {
             if let Some(h) = &self.holds {
                 h.nudge();

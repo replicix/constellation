@@ -1176,7 +1176,6 @@ impl Vfs for View {
         // with the write session a flush kept for the descriptors
         // (`flush_inode`: an unlinked file publishes nothing).
         if last && self.unlinked(ino) {
-            self.forget_fsync_owed(ino);
             self.drop_writes(ino);
             if let Ok(Some(attr)) = self.meta.getattr(ino) {
                 if attr.nlink == 0 {
