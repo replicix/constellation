@@ -30411,3 +30411,75 @@ assertion and the `v`-covered assertion fail too.
 | `cargo test --workspace --no-fail-fast` | exit 0, 1891 passed, 0 failed |
 | `bash tests/smoke.sh` | SMOKE TEST PASSED |
 | `harness run` forwarded-mutations, forward-timeout-reexec, holder-crash-phantom-shadow, holder-crash-phantom-new-holder, stale-base-rename-divergence, session-forwarded-ryw, session-exists-observed, session-ryw-after-holder-kill, mkdir-p-race, holder-ships-under-forward-load, takeover-marker-strands-promptly, snapshot-churn, lease-fencing | all PASSED |
+
+## Plan 37 K1 — `crates/csi` skeleton, packaging, driver registration
+
+Milestone K1 of [plan 37](wip/37-kubernetes-csi.md) (§15), chunks 37-k1a
+(crate skeleton + Identity service) and 37-k1b (image, Helm chart, kind
+registration). The driver registers on a kind cluster; no Controller/Node
+volume RPC exists yet (K2/K3).
+
+| Item | State | Where |
+|---|---|---|
+| `constellation-csi` crate: CSI v1.13.0 proto vendored, Identity service, controller/node services wired as `UNIMPLEMENTED` stubs, `ControlClient` trait + in-memory fake, tonic server over a unix socket (37-k1a) | DONE | `crates/csi/` |
+| `make csi-sanity`: csi-sanity's Identity group against `constellation-csi --controller` (37-k1a) | DONE | `Makefile`, `tests/csi/sanity.sh` |
+| `NodeGetInfo` (the k8s node name): `node-driver-registrar` fails registration without it, so the K1 "driver registers" gate needs it. Alongside K2a's `NodeGetCapabilities` (empty — K3 advertises `STAGE_UNSTAGE_VOLUME` with the RPCs) and `NodeUnpublishVolume` (`OK`) | DONE | `crates/csi/src/node.rs` |
+| One image: static musl `constellation-csi` + `constellation` (engine pods start from the same image, §14), `debian:bookworm-slim` + `fuse3`, uid 65532 by default | DONE | `deploy/docker/constellation-csi.Dockerfile`, `make csi-image` |
+| Helm chart: `CSIDriver` (`attachRequired:false`, `podInfoOnMount`, `requiresRepublish`, `fsGroupPolicy: File`, `seLinuxMount:false`), controller Deployment (2 replicas, preferred anti-affinity, unprivileged, liveness sidecar, provisioner/resizer/snapshotter placeholders gated by `sidecars.*.enabled`, leader-election flags), node DaemonSet (privileged, uid 0, `system-node-critical`, RollingUpdate; `kubeletDir` mounted at its host path and `hostRoot`, both Bidirectional, so kubelet's `staging_target_path`/`target_path` resolve inside the plugin; registrar `v2.18.0` + livenessprobe `v2.20.0`), ServiceAccounts, Roles/ClusterRoles (§9: the driver's own rules, plus each sidecar's upstream rules unmodified, rendered only when that sidecar is enabled), `NOTES.txt` with the PodSecurity/pool-trust text and a `TODO(37-k7b)` sharding placeholder | DONE | `deploy/helm/constellation-csi/` |
+| `tests/csi/kind-up.sh [--install]`, `kind-down.sh`, `kind-sanity.sh` (csi-sanity Identity inside a worker against the plugin's hostPath socket) | DONE | `tests/csi/` |
+| Helm `templates/tests/` round-trip hook (§14) | DEFERRED | needs Controller/Node RPCs — K3 |
+| CI job | DEFERRED | 37-k3b |
+
+**Registration on kind** (`kind-37-k1b`, 1 control-plane + 2 workers from
+`tests/csi/kind-config.yaml`, deleted afterwards): `kubectl get csidriver
+csi.constellation.dev` → `ATTACHREQUIRED false, PODINFOONMOUNT true,
+REQUIRESREPUBLISH true, MODES Persistent`; `kubectl get csinode` → `DRIVERS 1`
+on all three nodes (the DaemonSet tolerates everything, so the control-plane
+node runs the plugin too); controller 2/2 ×2 and node 3/3 ×3, 0 restarts,
+livenessprobe serving `:9809`. csi-sanity Identity group against the deployed
+node plugin's hostPath socket (`tests/csi/kind-sanity.sh`): `Ran 3 of 103
+Specs … SUCCESS! -- 3 Passed | 0 Failed | 1 Pending | 99 Skipped`. After the
+rebase onto K2a, `make csi-sanity` (Identity + Controller, in-memory backend):
+`Ran 21 of 103 Specs … SUCCESS! -- 21 Passed | 0 Failed | 1 Pending | 81
+Skipped`. Re-verified on kind after the review fixes: no ServiceAccount can
+`get secrets` (`kubectl auth can-i … --as=…constellation-csi-{node,controller}`
+→ `no`); the node plugin sees `/var/lib/kubelet` and `/var/lib/constellation-csi`
+at their host paths as `shared` mounts; with all three sidecar rule sets
+rendered the controller SA gets the resizer's `pods` watch and
+`volumeattributesclasses` list; the two controller replicas land on different
+workers when scheduled from zero (preferred anti-affinity).
+
+**Decisions.** One image with the engine binary included (§14 default).
+Sidecar images are pulled by the nodes, not `kind load`ed (multi-arch
+manifests fail `ctr import` with a missing digest); `CSI_SIDECARS_PRELOAD=1`
+opts in. The namespace PodSecurity label is applied by `kind-up.sh`, not the
+chart (Helm should not own a pre-existing namespace); `NOTES.txt` tells the
+operator. **No `secrets` access at all** (review of 37-k1b): §9 forbids a
+blanket cluster-wide read, the CSI convention has the sidecars/kubelet
+resolve `*-secret-name` and pass the bytes, and nothing before K6 reads a
+Secret; K6 adds exactly what the `Refreshing` watch needs (recorded in the
+plan's K6 notes). Pods are namespace-scoped Roles.
+
+**Gate results for this chunk** (after the rebase onto `ac3a076`, with the
+review fixes). `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo test --workspace` green, run crate
+by crate to fit the tool time limit: 1954 passed, 0 failed (model-checker
+`#[ignore]`s as designed); `bash tests/smoke.sh` PASSED on a fresh release
+build; `make csi-image` builds (BuildKit cache mounts, like
+`tests/docker/Dockerfile.dist`); `make csi-sanity` 21/21; `helm lint --strict`
+0 failed (one INFO: `icon`); kind registration as above, cluster deleted.
+The workspace-test failures seen earlier (`completion_ownership`, a `shipper`
+test) were this host's 1024 open-file soft limit under the full parallel run,
+not order or timing bugs; with `ulimit -n 65536` they pass, and
+`completion_ownership` was also fixed on main by `f0871f4`.
+
+`harness run` (full matrix) and the compliance lane (8798/8798) are **not**
+K1's: their failures on this host (SELinux enforcing) are owned by the
+separate `box-gates` chunk, and the coordinator re-runs K1's milestone gate
+after box-gates lands.
+
+Exit criteria: [x] image builds [x] `helm lint` clean [x] driver registers on
+both workers [x] livenessprobe healthy [x] csi-sanity Identity green on the
+deployed plugin [x] cluster deleted [x] chunk gates (fmt, clippy, workspace
+tests, smoke, csi-image, csi-sanity, helm lint, kind) [ ] harness + compliance
+(box-gates, then the coordinator's K1 milestone re-run).

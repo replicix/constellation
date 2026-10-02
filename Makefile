@@ -43,7 +43,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 -include local.mk
 
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
-	check ci clean smoke integration csi-sanity compose compose-down harness harness-docker \
+	check ci clean smoke integration csi-sanity csi-image compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
 	dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live check-cross vfs-bench
@@ -119,6 +119,13 @@ smoke: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Host smoke test (local file backend;
 
 integration: $(RELEASE_BIN) ## Host integration (floci S3 in docker)
 	tests/integration.sh
+
+CSI_IMAGE ?= constellation-csi:dev
+
+csi-image: ## Build the constellation-csi image (static musl; one image for controller + node + engine pods)
+	docker build -f deploy/docker/constellation-csi.Dockerfile \
+		--build-arg CONSTELLATION_GIT_DESCRIBE="$$(git describe --tags --always --dirty 2>/dev/null)" \
+		-t $(CSI_IMAGE) .
 
 csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity + Controller groups against constellation-csi on its in-memory backend (plan 37 K1+K2; needs CSI_SANITY_BIN or csi-sanity on PATH)
 	CONSTELLATION_CSI_BIN=$(abspath $(RELEASE_CSI)) tests/csi/sanity.sh

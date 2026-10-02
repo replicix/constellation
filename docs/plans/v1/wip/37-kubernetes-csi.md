@@ -1955,6 +1955,12 @@ can honestly recommend a `shards` value.
   purge worker and controller-owned engine pod implemented per settled
   decision 19 and §"Deletion and purge"** (rate limiting, `/.trash/`
   listing, GC interaction).
+- **Secret RBAC (decided at 37-k1b review).** The K1 chart grants **no**
+  `secrets` access: sidecars/kubelet resolve the `*-secret-name` references
+  and pass the bytes in the request, and nothing before K6 reads a Secret.
+  K6 adds exactly what the `Refreshing` Secret watch needs (the referenced
+  Secrets, e.g. a namespaced `Role`/`resourceNames` per pool namespace),
+  never a blanket cluster-wide `secrets` get — §"Security" RBAC above.
 - **Gate:** CONVENTIONS gates; the secret-rotation and node-drain
   `k8s-scenario`s pass; the "trash purge under load" `k8s-scenario`
   (§"Testing") passes, including the large-many-small-files trashed volume

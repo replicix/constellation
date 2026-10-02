@@ -1,0 +1,131 @@
+# Plan 37 §9. Engine-pod lifecycle: pods, namespace-scoped (never
+# cluster-wide pod creation). PV/PVC read for the observability labels.
+# No Secret read: under the CSI secret-reference convention the sidecars and
+# kubelet resolve `*-secret-name` and pass the bytes in the request, and no
+# K1 code reads a Secret. K6's `Refreshing` credentials watch revisits this,
+# scoped to that need, never as a blanket cluster-wide read.
+{{- range $role := list "controller" "node" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: constellation-csi-{{ $role }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: constellation-csi-{{ $role }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: constellation-csi-{{ $role }}}
+subjects:
+  - {kind: ServiceAccount, name: constellation-csi-{{ $role }}, namespace: {{ $.Release.Namespace }}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: constellation-csi-{{ $role }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes, persistentvolumeclaims]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: constellation-csi-{{ $role }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: constellation-csi-{{ $role }}}
+subjects:
+  - {kind: ServiceAccount, name: constellation-csi-{{ $role }}, namespace: {{ $.Release.Namespace }}}
+{{- end }}
+{{- /*
+Controller sidecars: each upstream rule set unmodified (deploy/kubernetes/
+rbac*.yaml at the pinned tag), bound to the controller ServiceAccount, and
+rendered only when that sidecar is enabled.
+*/}}
+{{- $sidecarRules := dict
+  "provisioner" (dict
+    "cluster" (list
+      (dict "apiGroups" (list "") "resources" (list "persistentvolumes") "verbs" (list "get" "list" "watch" "create" "patch" "delete"))
+      (dict "apiGroups" (list "") "resources" (list "persistentvolumeclaims") "verbs" (list "get" "list" "watch" "update"))
+      (dict "apiGroups" (list "storage.k8s.io") "resources" (list "storageclasses") "verbs" (list "get" "list" "watch"))
+      (dict "apiGroups" (list "") "resources" (list "events") "verbs" (list "list" "watch" "create" "update" "patch"))
+      (dict "apiGroups" (list "snapshot.storage.k8s.io") "resources" (list "volumesnapshots") "verbs" (list "get" "list" "watch" "update"))
+      (dict "apiGroups" (list "snapshot.storage.k8s.io") "resources" (list "volumesnapshotcontents") "verbs" (list "get" "list"))
+      (dict "apiGroups" (list "storage.k8s.io") "resources" (list "csinodes") "verbs" (list "get" "list" "watch"))
+      (dict "apiGroups" (list "") "resources" (list "nodes") "verbs" (list "get" "list" "watch"))
+      (dict "apiGroups" (list "storage.k8s.io") "resources" (list "volumeattachments") "verbs" (list "get" "list" "watch")))
+    "namespaced" (list
+      (dict "apiGroups" (list "coordination.k8s.io") "resources" (list "leases") "verbs" (list "get" "watch" "list" "delete" "update" "create"))
+      (dict "apiGroups" (list "storage.k8s.io") "resources" (list "csistoragecapacities") "verbs" (list "get" "list" "watch" "create" "update" "patch" "delete"))
+      (dict "apiGroups" (list "") "resources" (list "pods") "verbs" (list "get"))
+      (dict "apiGroups" (list "apps") "resources" (list "replicasets") "verbs" (list "get"))))
+  "resizer" (dict
+    "cluster" (list
+      (dict "apiGroups" (list "") "resources" (list "persistentvolumes") "verbs" (list "get" "list" "watch" "patch"))
+      (dict "apiGroups" (list "") "resources" (list "persistentvolumeclaims") "verbs" (list "get" "list" "watch"))
+      (dict "apiGroups" (list "") "resources" (list "pods") "verbs" (list "get" "list" "watch"))
+      (dict "apiGroups" (list "") "resources" (list "persistentvolumeclaims/status") "verbs" (list "patch"))
+      (dict "apiGroups" (list "") "resources" (list "events") "verbs" (list "list" "watch" "create" "update" "patch"))
+      (dict "apiGroups" (list "storage.k8s.io") "resources" (list "volumeattributesclasses") "verbs" (list "get" "list" "watch")))
+    "namespaced" (list
+      (dict "apiGroups" (list "coordination.k8s.io") "resources" (list "leases") "verbs" (list "get" "watch" "list" "delete" "update" "create"))))
+  "snapshotter" (dict
+    "cluster" (list
+      (dict "apiGroups" (list "") "resources" (list "events") "verbs" (list "list" "watch" "create" "update" "patch"))
+      (dict "apiGroups" (list "snapshot.storage.k8s.io") "resources" (list "volumesnapshotclasses") "verbs" (list "get" "list" "watch"))
+      (dict "apiGroups" (list "snapshot.storage.k8s.io") "resources" (list "volumesnapshotcontents") "verbs" (list "get" "list" "watch" "update" "patch"))
+      (dict "apiGroups" (list "snapshot.storage.k8s.io") "resources" (list "volumesnapshotcontents/status") "verbs" (list "update" "patch"))
+      (dict "apiGroups" (list "groupsnapshot.storage.k8s.io") "resources" (list "volumegroupsnapshotclasses") "verbs" (list "get" "list" "watch"))
+      (dict "apiGroups" (list "groupsnapshot.storage.k8s.io") "resources" (list "volumegroupsnapshotcontents") "verbs" (list "get" "list" "watch" "update" "patch"))
+      (dict "apiGroups" (list "groupsnapshot.storage.k8s.io") "resources" (list "volumegroupsnapshotcontents/status") "verbs" (list "update" "patch")))
+    "namespaced" (list
+      (dict "apiGroups" (list "coordination.k8s.io") "resources" (list "leases") "verbs" (list "get" "watch" "list" "delete" "update" "create"))))
+}}
+{{- range $name := list "provisioner" "resizer" "snapshotter" }}
+{{- if (index $.Values.sidecars $name).enabled }}
+{{- $rules := index $sidecarRules $name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: constellation-csi-{{ $name }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+rules: {{- toYaml $rules.cluster | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: constellation-csi-{{ $name }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: constellation-csi-{{ $name }}}
+subjects:
+  - {kind: ServiceAccount, name: constellation-csi-controller, namespace: {{ $.Release.Namespace }}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: constellation-csi-{{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+rules: {{- toYaml $rules.namespaced | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: constellation-csi-{{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: constellation-csi-{{ $name }}}
+subjects:
+  - {kind: ServiceAccount, name: constellation-csi-controller, namespace: {{ $.Release.Namespace }}}
+{{- end }}
+{{- end }}

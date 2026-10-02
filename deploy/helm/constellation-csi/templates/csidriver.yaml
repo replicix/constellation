@@ -1,0 +1,14 @@
+# Plan 37 settled decisions 4, 11, 12, 13.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.driverName }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  requiresRepublish: true
+  fsGroupPolicy: File
+  seLinuxMount: false
+  storageCapacity: false
+  volumeLifecycleModes: [Persistent]

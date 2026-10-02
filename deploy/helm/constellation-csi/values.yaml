@@ -1,0 +1,81 @@
+# Values for the constellation-csi chart (plan 37 §14).
+
+# The CSI driver name; StorageClass.provisioner and VolumeSnapshotClass.driver
+# must carry exactly this (plan 37 settled decision 2).
+driverName: csi.constellation.dev
+
+image:
+  # One image carries constellation-csi (--controller / --node) and the
+  # `constellation` engine binary the node plugin starts as engine pods.
+  repository: constellation-csi
+  tag: dev
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Sidecars, pinned to the versions plan 37 §14 verified.
+sidecars:
+  registry: registry.k8s.io/sig-storage
+  nodeDriverRegistrar: {image: csi-node-driver-registrar, tag: v2.18.0}
+  livenessprobe: {image: livenessprobe, tag: v2.20.0}
+  # Placeholders: 37-k2b wires these into the controller Deployment. Enabling
+  # one renders it plus its upstream RBAC (templates/rbac.yaml), but the K1
+  # driver implements no Controller RPCs, so it does nothing useful yet.
+  provisioner: {enabled: false, image: csi-provisioner, tag: v6.3.0}
+  resizer: {enabled: false, image: csi-resizer, tag: v2.3.0}
+  snapshotter: {enabled: false, image: csi-snapshotter, tag: v8.6.0}
+
+# kubelet's root directory on the node (the registrar and staging paths hang
+# off it). Non-default distributions (k0s, microk8s, ...) override this.
+kubeletDir: /var/lib/kubelet
+
+# hostPath root of the node-local layout (plan 37 §7): node-identity/,
+# sockets/<unit>/{fd-handoff,control}.sock.
+hostRoot: /var/lib/constellation-csi
+# Where engine pods' control sockets live; the control-acl service grant's
+# socket_glob must match <controlSocketRoot>/*/control.sock.
+controlSocketRoot: /var/lib/constellation-csi/sockets
+
+# Engine-pod defaults (consumed by the node plugin from K3 on; the K1 binary
+# accepts and ignores them).
+engineProfile:
+  idleTtl: 10m
+  handoffDrainTimeout: 30s
+  handoffTotalTimeout: 120s
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 2Gi}
+
+# Purge worker (controller; K4).
+purge:
+  interval: 1h
+  grace: 24h
+  maxConcurrentDeletes: 4
+
+controller:
+  replicas: 2
+  leaderElection:
+    leaseDuration: 15s
+    renewDeadline: 10s
+    retryPeriod: 5s
+  resources:
+    csi: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 256Mi}}
+    sidecar: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 128Mi}}
+  nodeSelector: {}
+  tolerations: []
+  livenessPort: 9808
+
+node:
+  resources:
+    csi: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 512Mi}}
+    sidecar: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 128Mi}}
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  livenessPort: 9809
+  # Mounts in running pods depend on the node plugin: schedule it first.
+  priorityClassName: system-node-critical
+  maxUnavailable: 1
+
+# Log filter (RUST_LOG).
+logLevel: info

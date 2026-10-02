@@ -1,0 +1,103 @@
+# Node DaemonSet (plan 37 §4, §9): the only privileged workload. It calls
+# mount(2) for the FUSE staging mount, so the kubelet directories carry
+# Bidirectional propagation back out to the host. Runs as uid 0: the
+# control-acl service grant matches uid 0 + the control socket path.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: constellation-csi-node
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: constellation-csi
+      app.kubernetes.io/component: node
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: {{ .Values.node.maxUnavailable }}}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: constellation-csi
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: constellation-csi-node
+      priorityClassName: {{ .Values.node.priorityClassName }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: constellation-csi
+          image: {{ include "csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --node
+            - --node-id=$(NODE_NAME)
+            - --endpoint=unix:///csi/csi.sock
+            - --control-socket-root={{ .Values.controlSocketRoot }}
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - {name: RUST_LOG, value: {{ .Values.logLevel | quote }}}
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsNonRoot: false
+          resources: {{- toYaml .Values.node.resources.csi | nindent 12 }}
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi, mountPropagation: Bidirectional}
+            # kubelet hands out staging_target_path under plugins/ and
+            # target_path under pods/: both must resolve at the host path.
+            - {name: kubelet-dir, mountPath: {{ .Values.kubeletDir }}, mountPropagation: Bidirectional}
+            # §7 staging/ mounts made here must reach the host too.
+            - {name: host-root, mountPath: {{ .Values.hostRoot }}, mountPropagation: Bidirectional}
+            - {name: dev-fuse, mountPath: /dev/fuse}
+        - name: node-driver-registrar
+          image: {{ include "csi.sidecar" (dict "root" . "sc" .Values.sidecars.nodeDriverRegistrar) }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ include "csi.pluginDir" . }}/csi.sock
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources: {{- toYaml .Values.node.resources.sidecar | nindent 12 }}
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+            - {name: registration-dir, mountPath: /registration}
+        - name: liveness-probe
+          image: {{ include "csi.sidecar" (dict "root" . "sc" .Values.sidecars.livenessprobe) }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port={{ .Values.node.livenessPort }}
+          ports:
+            - {name: healthz, containerPort: {{ .Values.node.livenessPort }}, protocol: TCP}
+          livenessProbe:
+            httpGet: {path: /healthz, port: healthz}
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources: {{- toYaml .Values.node.resources.sidecar | nindent 12 }}
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+      volumes:
+        - name: plugin-dir
+          hostPath: {path: {{ include "csi.pluginDir" . }}, type: DirectoryOrCreate}
+        - name: registration-dir
+          hostPath: {path: {{ .Values.kubeletDir }}/plugins_registry, type: Directory}
+        - name: kubelet-dir
+          hostPath: {path: {{ .Values.kubeletDir }}, type: Directory}
+        - name: host-root
+          hostPath: {path: {{ .Values.hostRoot }}, type: DirectoryOrCreate}
+        - name: dev-fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}

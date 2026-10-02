@@ -1,0 +1,17 @@
+constellation-csi installed as driver {{ .Values.driverName }}.
+
+PodSecurity: the node plugin is privileged (fuse mount, bind mounts,
+Bidirectional propagation). Label namespace {{ .Release.Namespace }} with
+  pod-security.kubernetes.io/enforce=privileged
+Engine pods run in the same namespace with individually hardened specs; the
+namespace label is the accepted trade-off (plan 37 §9).
+
+Pool trust model: volumes of one pool share a Constellation filesystem and
+engine process. Different tenants need different StorageClasses, not just
+different PVCs.
+
+Verify registration:
+  kubectl get csidriver {{ .Values.driverName }}
+  kubectl get csinode
+
+Sharding guidance: TODO(37-k7b) — filled in from the K0b pool metadata ceiling.
