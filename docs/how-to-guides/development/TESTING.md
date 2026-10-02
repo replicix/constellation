@@ -66,7 +66,11 @@ its arguments; `CONSTELLATION_BIN` still selects the binary under test
 (default `$CARGO_TARGET_DIR/debug/constellation`). It creates a filesystem, runs `doctor`, mounts
 it over FUSE, and exercises: namespace ops (mkdir/rename/symlink),
 `snapshot policy check` (locally, an invalid expression's caret, and
-`--against` a `csi:`-held snapshot through the daemon), multi-chunk files, partial in-place edits, truncate, append,
+`--against` a `csi:`-held snapshot through the daemon), the `snapshot policy
+set/show/ls/pause/resume/rm` round trip on a directory (an invalid
+expression's caret, a file refused, `--dry-run` writing nothing, `rm`
+declined without `--yes`, `rm --expire` refused until M4) and `snapshot ls
+--orphaned`, multi-chunk files, partial in-place edits, truncate, append,
 snapshot space accounting (plan 32 M5c: a 2 MiB file only one of three
 snapshots keeps; `snapshot space --verify` = 0 mismatches, `snapshot ls`'s
 `USED`/`WRITTEN` and footer, `-p -s used`, `snapshot delete --dry-run`'s
@@ -483,7 +487,8 @@ unchanged (the platform unmount runs the same `fusermount3 -u` / `-uz`).
 
 `harness smoke [backend]` is `tests/smoke.sh` ported to Rust (see above):
 create + `doctor`, refused double create, mount, namespace ops,
-`snapshot policy check` (local, caret, `--against`), a 3.5 MiB
+`snapshot policy check` (local, caret, `--against`), the `snapshot policy
+set/show/ls/pause/resume/rm` round trip, a 3.5 MiB
 multi-chunk file, partial edit, truncate, append, snapshot sizes (`snapshot
 space --verify`, `snapshot ls` size columns, `delete --dry-run`'s reclaim
 estimate), unlink-while-open,

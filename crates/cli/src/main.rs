@@ -6,6 +6,7 @@ mod daemonize;
 mod handover;
 mod node_runtime;
 mod parallelism;
+mod policy_cli;
 mod serve;
 mod snapshot_cli;
 mod startup;
@@ -597,11 +598,15 @@ enum SnapshotCommand {
         #[arg(long)]
         json: bool,
         /// Only snapshots a policy took.
-        #[arg(long, conflicts_with = "manual")]
+        #[arg(long, conflicts_with_all = ["manual", "orphaned"])]
         auto: bool,
         /// Only snapshots taken by hand.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "orphaned")]
         manual: bool,
+        /// Only auto snapshots whose policy is gone or does not parse
+        /// (`auto (orphaned)`: never expired automatically).
+        #[arg(long)]
+        orphaned: bool,
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
@@ -684,10 +689,69 @@ enum SnapshotCommand {
     },
 }
 
-/// `constellation snapshot policy …`. Plan 32 M2 adds `set`, `show`,
-/// `ls`, `rm`, `pause` and `resume` here.
+/// `constellation snapshot policy …` (plan 32 Step 5). Every target is
+/// `myfs:/path` (or a bare `/path` with `--state-dir`); the daemon
+/// evaluates, the CLI prints what it returns.
 #[derive(Subcommand)]
 enum SnapshotPolicyCommand {
+    /// Bind a policy to a directory. Shows the delta first (what it
+    /// creates, how many existing snapshots it would expire); asks before
+    /// writing one that would expire any. Exit 2 on a parse error.
+    Set {
+        /// `myfs:/path`: the directory.
+        target: String,
+        /// The policy, e.g. '5m:1d 1h:7d 1d:30d; tz=Europe/Budapest'.
+        expr: String,
+        /// Do not ask before a change that would expire snapshots.
+        #[arg(long)]
+        yes: bool,
+        /// Show the delta; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// A directory's policy, its state, and its auto snapshots with what
+    /// keeps each (or `expire`).
+    Show {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Every policy root and orphaned auto-snapshot stream: PATH, INO,
+    /// POLICY, STATE (armed, paused, unparseable, orphaned), AUTO
+    /// SNAPSHOTS. `myfs:/path` keeps the roots at or below that directory.
+    Ls {
+        target: Option<String>,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Remove a directory's policy (asks first). Its auto snapshots are
+    /// kept, orphaned, and never expired automatically.
+    Rm {
+        target: String,
+        /// Also delete the policy's non-held auto snapshots. Not
+        /// available until expiry ships (plan 32 M4).
+        #[arg(long)]
+        expire: bool,
+        /// Do not ask.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Stop the policy creating and expiring snapshots; it stays set.
+    Pause {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Undo `pause`.
+    Resume {
+        target: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Explain a policy expression without setting it: its canonical
     /// form, the steady-state upper bound, a simulated count and any
     /// warnings. Runs locally; `--against` asks the daemon to evaluate it
@@ -1777,6 +1841,7 @@ fn main() -> Result<()> {
                     json,
                     auto,
                     manual,
+                    orphaned,
                     state_dir,
                 } => {
                     let (path, dir) = match (target, state_dir) {
@@ -1796,9 +1861,10 @@ fn main() -> Result<()> {
                     let sort = sort
                         .map(|raw| snapshot_cli::Column::parse(&raw))
                         .transpose()?;
-                    let filter = match (auto, manual) {
-                        (true, _) => snapshot_cli::OriginFilter::Auto,
-                        (_, true) => snapshot_cli::OriginFilter::Manual,
+                    let filter = match (auto, manual, orphaned) {
+                        (true, _, _) => snapshot_cli::OriginFilter::Auto,
+                        (_, true, _) => snapshot_cli::OriginFilter::Manual,
+                        (_, _, true) => snapshot_cli::OriginFilter::Orphaned,
                         _ => snapshot_cli::OriginFilter::All,
                     };
                     // The whole subtree: `ls myfs:/projects` lists
@@ -1809,12 +1875,27 @@ fn main() -> Result<()> {
                     // builds the index): only when they are shown.
                     let sizes = snapshot_cli::wants_sizes(json, &columns, sort);
                     let params = api::SnapshotListParams { path: None, sizes };
+                    let orphaned = if snapshot_cli::wants_orphans(filter, &columns, sort, json) {
+                        let (set, warning) = snapshot_cli::orphans_or_degrade(
+                            filter,
+                            rt.block_on(control::call::<cm::SnapshotPolicyList>(
+                                &dir,
+                                Default::default(),
+                            )),
+                        )?;
+                        if let Some(w) = warning {
+                            eprintln!("{w}");
+                        }
+                        set
+                    } else {
+                        Default::default()
+                    };
                     ctl::<cm::SnapshotList>(&rt, &dir, params, |l| {
                         let rows: Vec<_> = l
                             .snapshots
                             .into_iter()
                             .filter(|row| {
-                                filter.keep(row)
+                                filter.keep(row, &orphaned)
                                     && path
                                         .as_deref()
                                         .is_none_or(|p| snapshot_cli::under(&row.path, p))
@@ -1825,7 +1906,9 @@ fn main() -> Result<()> {
                         } else {
                             print!(
                                 "{}",
-                                snapshot_cli::render_table(&rows, &columns, sort, parsable)
+                                snapshot_cli::render_table(
+                                    &rows, &columns, sort, parsable, &orphaned
+                                )
                             );
                             if !parsable {
                                 let now = snapshot_cli::now_ms();
@@ -3584,7 +3667,59 @@ fn run_snapshot_policy_command(
             }
             Ok(())
         }
+        SnapshotPolicyCommand::Set {
+            target,
+            expr,
+            yes,
+            dry_run,
+            state_dir,
+        } => {
+            let (dir, path) = policy_target(&target, state_dir)?;
+            rt.block_on(policy_cli::set(&dir, path, expr, yes, dry_run))
+        }
+        SnapshotPolicyCommand::Show { target, state_dir } => {
+            let (dir, path) = policy_target(&target, state_dir)?;
+            rt.block_on(policy_cli::show(&dir, path))
+        }
+        SnapshotPolicyCommand::Ls { target, state_dir } => {
+            let (dir, under) = match (target, state_dir) {
+                (Some(target), state_dir) => {
+                    let (dir, path) = policy_target(&target, state_dir)?;
+                    (dir, Some(path))
+                }
+                (None, Some(dir)) => (dir, None),
+                (None, None) => {
+                    bail!("TARGET (a registered filesystem name, `myfs`) or --state-dir")
+                }
+            };
+            rt.block_on(policy_cli::ls(&dir, under))
+        }
+        SnapshotPolicyCommand::Rm {
+            target,
+            expire,
+            yes,
+            state_dir,
+        } => {
+            let (dir, path) = policy_target(&target, state_dir)?;
+            rt.block_on(policy_cli::rm(&dir, path, expire, yes))
+        }
+        SnapshotPolicyCommand::Pause { target, state_dir } => {
+            let (dir, path) = policy_target(&target, state_dir)?;
+            rt.block_on(policy_cli::pause(&dir, path, true))
+        }
+        SnapshotPolicyCommand::Resume { target, state_dir } => {
+            let (dir, path) = policy_target(&target, state_dir)?;
+            rt.block_on(policy_cli::pause(&dir, path, false))
+        }
     }
+}
+
+/// A `snapshot policy` target's state dir and directory path: `myfs`
+/// is the root, `myfs:/path` that directory, and a bare `/path` (with
+/// `--state-dir`) is taken as given.
+fn policy_target(target: &str, state_dir: Option<PathBuf>) -> Result<(PathBuf, String)> {
+    let (t, dir) = resolve_target(target, state_dir)?;
+    Ok((dir, target::effective_path(&t)))
 }
 
 /// `snapshot policy check`'s report. Every figure is the method's: this
@@ -3636,47 +3771,11 @@ fn print_policy_check(expr: &str, r: &api::SnapPolicyCheckResult) {
                     "  {:<32} {:<17} {}",
                     v.name,
                     fmt_utc_ms(v.created_unix_ms),
-                    kept_by(v)
+                    policy_cli::kept_by(v)
                 );
             }
         }
     }
-}
-
-/// A verdict's `KEPT BY` cell (plan 32 Step 5): the keeping tiers as
-/// `5m·1h·1d`, `last=n`, a hold by owner namespace (`held: csi`), or
-/// `expire` for one the policy would delete.
-fn kept_by(v: &api::SnapVerdict) -> String {
-    if !v.keep {
-        return "expire".to_string();
-    }
-    let tiers: Vec<&str> = v
-        .reasons
-        .iter()
-        .filter(|r| r.kind == "tier")
-        .filter_map(|r| r.every.as_deref())
-        .collect();
-    let mut parts = Vec::new();
-    if !tiers.is_empty() {
-        parts.push(tiers.join("·"));
-    }
-    for r in &v.reasons {
-        match r.kind.as_str() {
-            "tier" => {}
-            "last" => parts.push(format!("last={}", r.last.unwrap_or(1))),
-            "held" => parts.push(
-                match r.held_by.as_deref().and_then(|by| by.split(':').next()) {
-                    Some(ns) if !ns.is_empty() => format!("held: {ns}"),
-                    _ => "held".to_string(),
-                },
-            ),
-            "grace" => parts.push("grace".to_string()),
-            "not_candidate" if v.origin == "auto" => parts.push("another policy".to_string()),
-            "not_candidate" => parts.push(v.origin.clone()),
-            other => parts.push(other.to_string()),
-        }
-    }
-    parts.join(", ")
 }
 
 fn fmt_utc_ms(ms: i64) -> String {

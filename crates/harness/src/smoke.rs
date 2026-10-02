@@ -374,6 +374,129 @@ fn snapshot_space(m: &Mount, state: &str) -> Result<()> {
     Ok(())
 }
 
+/// `snapshot policy set|show|ls|pause|resume|rm` and `snapshot ls
+/// --orphaned` against the mounted `/dir` (plan 32 M2), which holds one
+/// held manual snapshot: the policy expires nothing, so `set` writes
+/// without asking. Leaves `/dir` without a policy.
+fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
+    say("snapshot policy set/show/ls/pause/resume/rm, snapshot ls --orphaned");
+    let run = |args: &[&str]| -> Result<(std::process::ExitStatus, String, String)> {
+        let out = m
+            .cmd(args)
+            .args(["--state-dir", state])
+            .stdin(Stdio::null())
+            .output()?;
+        Ok((
+            out.status,
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    };
+    let (st, _, err) = run(&["snapshot", "policy", "set", "/dir", "1h:1d 7m:1d"])?;
+    ensure!(
+        st.code() == Some(2) && err.contains("1h:1d 7m:1d\n      ^ "),
+        "FAIL: policy set of an invalid policy ({st}): {err}"
+    );
+    fs::write(m.mnt.join("dir/policy-file"), "x")?;
+    let (st, _, err) = run(&["snapshot", "policy", "set", "/dir/policy-file", "1h:1d"])?;
+    ensure!(
+        !st.success() && err.contains("not a directory"),
+        "FAIL: policy set on a file ({st}): {err}"
+    );
+    fs::remove_file(m.mnt.join("dir/policy-file"))?;
+    let (st, out, err) = run(&["snapshot", "policy", "set", "/dir", "30s:10m", "--dry-run"])?;
+    ensure!(
+        st.success()
+            && out.contains("/dir (ino ")
+            && out.contains("(no policy) -> 30s:10m")
+            && out.contains("creates every 30s; will expire nothing; ")
+            && out.contains("warning: sub-minute tier")
+            && out.contains("dry run: nothing written"),
+        "FAIL: policy set --dry-run ({st}): {out}{err}"
+    );
+    let (st, _, err) = run(&["snapshot", "policy", "show", "/dir"])?;
+    ensure!(
+        !st.success() && err.contains("no snapshot policy"),
+        "FAIL: a dry run wrote a policy ({st}): {err}"
+    );
+    let (st, out, err) = run(&["snapshot", "policy", "set", "/dir", "1d:7d   1h:1d"])?;
+    ensure!(
+        st.success() && out.contains("/dir: snapshot policy set: 1h:1d 1d:7d"),
+        "FAIL: policy set ({st}): {out}{err}"
+    );
+    let (st, out, err) = run(&["snapshot", "policy", "show", "/dir"])?;
+    ensure!(
+        st.success()
+            && out.contains("  policy:  1h:1d 1d:7d\n")
+            && out.contains("  state:   armed\n")
+            && out.contains("would expire 0 of 1 snapshots"),
+        "FAIL: policy show ({st}): {out}{err}"
+    );
+    let ls_row = |want: &str| -> Result<()> {
+        let (st, out, err) = run(&["snapshot", "policy", "ls"])?;
+        let row: Vec<String> = out
+            .lines()
+            .find(|l| l.starts_with("/dir "))
+            .map(|l| {
+                l.split("  ")
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ensure!(
+            st.success()
+                && out.starts_with("PATH ")
+                && row.len() == 5
+                && row[3] == want
+                && row[4] == "0",
+            "FAIL: policy ls, want {want} ({st}): {out}{err}"
+        );
+        Ok(())
+    };
+    ls_row("armed")?;
+    let (st, out, err) = run(&["snapshot", "policy", "pause", "/dir"])?;
+    ensure!(
+        st.success() && out.contains("/dir: paused (1h:1d 1d:7d; paused)"),
+        "FAIL: policy pause ({st}): {out}{err}"
+    );
+    ls_row("paused")?;
+    let (st, out, err) = run(&["snapshot", "policy", "resume", "/dir"])?;
+    ensure!(
+        st.success() && out.contains("/dir: armed (1h:1d 1d:7d)"),
+        "FAIL: policy resume ({st}): {out}{err}"
+    );
+    ls_row("armed")?;
+    let (st, out, err) = run(&["snapshot", "policy", "rm", "/dir", "--expire", "--yes"])?;
+    ensure!(
+        !st.success() && err.contains("not available until expiry ships"),
+        "FAIL: policy rm --expire ({st}): {out}{err}"
+    );
+    // No terminal, no answer: declined.
+    let (st, _, err) = run(&["snapshot", "policy", "rm", "/dir"])?;
+    ensure!(
+        !st.success() && err.contains("[y/N]") && err.contains("nothing removed"),
+        "FAIL: policy rm without --yes ({st}): {err}"
+    );
+    ls_row("armed")?;
+    let (st, out, err) = run(&["snapshot", "policy", "rm", "/dir", "--yes"])?;
+    ensure!(
+        st.success() && out.contains("/dir: snapshot policy removed; 0 auto snapshot(s) kept"),
+        "FAIL: policy rm ({st}): {out}{err}"
+    );
+    let (st, out, err) = run(&["snapshot", "policy", "ls"])?;
+    ensure!(
+        st.success() && out == "no snapshot policies\n",
+        "FAIL: policy ls after rm ({st}): {out}{err}"
+    );
+    let (st, out, err) = run(&["snapshot", "ls", "--orphaned"])?;
+    ensure!(
+        st.success() && out == "no snapshots\n",
+        "FAIL: snapshot ls --orphaned ({st}): {out}{err}"
+    );
+    Ok(())
+}
+
 fn smoke(m: &mut Mount, work: &Path) -> Result<()> {
     let mnt = m.mnt.clone();
     let backend = m.backend.clone();
@@ -515,6 +638,8 @@ fn smoke(m: &mut Mount, work: &Path) -> Result<()> {
         against.status,
         String::from_utf8_lossy(&against.stderr)
     );
+
+    policy_round_trip(m, &state)?;
 
     say("multi-chunk file (3.5 MiB across 1 MiB chunks)");
     let reference = work.join("random.bin");

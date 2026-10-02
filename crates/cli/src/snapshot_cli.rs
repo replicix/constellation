@@ -18,6 +18,11 @@
 //! `snapshot space` prints Step 5's breakdown from `snapshot.space`; every
 //! figure in it is the daemon's, the CLI only lays it out.
 //!
+//! An auto snapshot whose `policy_ino` carries no parseable policy reads
+//! `auto (orphaned)` in `ORIGIN` (plan 32 Step 4.2: never expired
+//! automatically). Which streams are orphaned is the daemon's answer
+//! (`snapshot.policy.list`), not something the CLI works out.
+//!
 //! Times print in UTC (`CREATED (UTC)`), computed here from the Unix
 //! epoch: no timezone database yet. The policy chunks bring one, and with
 //! it the option of the policy's own `tz`.
@@ -34,6 +39,7 @@ use anyhow::{bail, Result};
 use constellation_control::methods as cm;
 use constellation_control::proto::types as api;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// One column of the table.
@@ -175,7 +181,7 @@ impl Column {
     /// `-s`'s order for this column: numbers as numbers, absent values
     /// first. `REFER` without the index's figure orders by the
     /// creation-time `refer_bytes` it then shows.
-    fn compare(self, a: &api::SnapshotStatus, b: &api::SnapshotStatus) -> Ordering {
+    fn compare(self, a: &api::SnapshotStatus, b: &api::SnapshotStatus, ctx: &Ctx) -> Ordering {
         match self {
             Column::Created => a.created_unix_ms.cmp(&b.created_unix_ms),
             Column::Refer => {
@@ -191,7 +197,7 @@ impl Column {
             Column::Policy => a.policy_ino.cmp(&b.policy_ino),
             // Nothing to order by until M4 fills it in.
             Column::Expires => Ordering::Equal,
-            _ => self.cell(a, false).cmp(&self.cell(b, false)),
+            _ => self.cell(a, ctx).cmp(&self.cell(b, ctx)),
         }
     }
 
@@ -220,7 +226,8 @@ impl Column {
         }
     }
 
-    fn cell(self, row: &api::SnapshotStatus, parsable: bool) -> String {
+    fn cell(self, row: &api::SnapshotStatus, ctx: &Ctx) -> String {
+        let parsable = ctx.parsable;
         match self {
             Column::Name => format!("{}@{}", row.path, row.name),
             Column::Created if parsable => row.created_unix_ms.to_string(),
@@ -233,6 +240,9 @@ impl Column {
                     when
                 }
             }
+            // Step 4.2: an auto snapshot no parseable policy owns is never
+            // expired automatically, and says so.
+            Column::Origin if is_orphaned(row, ctx.orphaned) => "auto (orphaned)".into(),
             Column::Origin => row.origin.clone(),
             Column::Used | Column::Written | Column::Refer | Column::Lsize => {
                 self.size_cell(row, parsable)
@@ -250,6 +260,61 @@ impl Column {
             Column::Policy => row.policy_ino.to_string(),
         }
     }
+}
+
+/// What a cell needs besides its row.
+struct Ctx<'a> {
+    parsable: bool,
+    orphaned: &'a BTreeSet<u64>,
+}
+
+/// Whether `snapshot ls` needs the orphan set: `--orphaned` filters on it
+/// and the `ORIGIN` column (shown or sorted on) labels with it.
+pub fn wants_orphans(
+    filter: OriginFilter,
+    columns: &[Column],
+    sort: Option<Column>,
+    json: bool,
+) -> bool {
+    filter == OriginFilter::Orphaned
+        || (!json && (columns.contains(&Column::Origin) || sort == Some(Column::Origin)))
+}
+
+/// The orphan set from the `snapshot.policy.list` answer. Only the
+/// `--orphaned` filter depends on it: a failed fetch there is the error;
+/// elsewhere it is a warning and the listing degrades to plain `auto`.
+pub fn orphans_or_degrade(
+    filter: OriginFilter,
+    fetched: Result<api::SnapPolicyListing>,
+) -> Result<(BTreeSet<u64>, Option<String>)> {
+    match fetched {
+        Ok(listing) => Ok((orphaned_streams(&listing), None)),
+        Err(e) if filter == OriginFilter::Orphaned => Err(e),
+        Err(e) => Ok((
+            BTreeSet::new(),
+            Some(format!(
+                "warning: could not tell which auto snapshots are orphaned \
+                 (snapshot.policy.list failed: {e:#}); showing plain `auto`"
+            )),
+        )),
+    }
+}
+
+/// Whether `row` is an auto snapshot of one of the `orphaned` streams
+/// (`policy_ino`s that `snapshot.policy.list` reports as orphaned).
+pub fn is_orphaned(row: &api::SnapshotStatus, orphaned: &BTreeSet<u64>) -> bool {
+    row.origin == "auto" && orphaned.contains(&row.policy_ino)
+}
+
+/// The `policy_ino`s `snapshot.policy.list` reports as orphaned: their
+/// auto snapshots have no parseable policy.
+pub fn orphaned_streams(listing: &api::SnapPolicyListing) -> BTreeSet<u64> {
+    listing
+        .roots
+        .iter()
+        .filter(|r| r.orphaned)
+        .map(|r| r.ino)
+        .collect()
 }
 
 /// `KEPT BY`: the hold, by its owner's namespace (`held: csi` reads
@@ -325,33 +390,39 @@ pub fn under(path: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Which snapshots `--auto`/`--manual` keep.
+/// Which snapshots `--auto`/`--manual`/`--orphaned` keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginFilter {
     All,
     Auto,
     Manual,
+    Orphaned,
 }
 
 impl OriginFilter {
-    pub fn keep(self, row: &api::SnapshotStatus) -> bool {
+    pub fn keep(self, row: &api::SnapshotStatus, orphaned: &BTreeSet<u64>) -> bool {
         match self {
             OriginFilter::All => true,
             OriginFilter::Auto => row.origin == "auto",
             OriginFilter::Manual => row.origin == "manual",
+            OriginFilter::Orphaned => is_orphaned(row, orphaned),
         }
     }
 }
 
 /// The table, or `no snapshots`. Rows are in chain order per path (path,
 /// then commit seq, then creation time) unless `sort` names a column; a
-/// sort is stable, so ties keep that order.
+/// sort is stable, so ties keep that order. `orphaned` are the orphaned
+/// streams' `policy_ino`s ([`orphaned_streams`]), whose auto snapshots
+/// read `auto (orphaned)`.
 pub fn render_table(
     rows: &[api::SnapshotStatus],
     columns: &[Column],
     sort: Option<Column>,
     parsable: bool,
+    orphaned: &BTreeSet<u64>,
 ) -> String {
+    let ctx = Ctx { parsable, orphaned };
     if rows.is_empty() {
         return "no snapshots\n".into();
     }
@@ -365,11 +436,11 @@ pub fn render_table(
         ))
     });
     if let Some(column) = sort {
-        rows.sort_by(|a, b| column.compare(a, b));
+        rows.sort_by(|a, b| column.compare(a, b, &ctx));
     }
     let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|row| columns.iter().map(|c| c.cell(row, parsable)).collect())
+        .map(|row| columns.iter().map(|c| c.cell(row, &ctx)).collect())
         .collect();
     let widths: Vec<usize> = columns
         .iter()
@@ -634,8 +705,9 @@ pub fn now_ms() -> u64 {
 }
 
 /// The confirmation `snapshot delete` asks for before deleting more than
-/// one snapshot. Anything but `y`/`yes` (EOF included) declines.
-fn confirm(question: &str) -> Result<bool> {
+/// one snapshot (and `snapshot policy set|rm` before an expiring or
+/// orphaning change). Anything but `y`/`yes` (EOF included) declines.
+pub fn confirm(question: &str) -> Result<bool> {
     use std::io::Write;
     let mut err = std::io::stderr().lock();
     write!(err, "{question} [y/N] ")?;
@@ -832,7 +904,7 @@ mod tests {
         let mut auto = row("/projects", "auto-1", 1, 1_790_600_000_000);
         auto.origin = "auto".into();
         let rows = vec![held_csi, held_user, held_plain, auto];
-        let table = render_table(&rows, DEFAULT_COLUMNS, None, false);
+        let table = render_table(&rows, DEFAULT_COLUMNS, None, false, &BTreeSet::new());
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(
             lines[0]
@@ -888,7 +960,13 @@ mod tests {
         b.refer_bytes = Some(1 << 20);
         b.creator = 7;
         let columns = Column::parse_list("name,refer,seq,id,creator,policy").unwrap();
-        let table = render_table(&[a.clone(), b.clone()], &columns, Some(Column::Refer), true);
+        let table = render_table(
+            &[a.clone(), b.clone()],
+            &columns,
+            Some(Column::Refer),
+            true,
+            &BTreeSet::new(),
+        );
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(
             lines[0].split_whitespace().collect::<Vec<_>>(),
@@ -902,12 +980,12 @@ mod tests {
             lines[2].split_whitespace().collect::<Vec<_>>(),
             ["/v@a", "10485760", "2", "id-a", "-", "-"]
         );
-        let created = render_table(&[a, b], &[Column::Created], None, true);
+        let created = render_table(&[a, b], &[Column::Created], None, true, &BTreeSet::new());
         assert_eq!(created.lines().nth(1), Some("1000"));
         assert!(Column::parse("kept_by").is_ok() && Column::parse("KEPT-BY").is_ok());
         assert!(Column::parse_list("name,size").is_err());
         assert_eq!(
-            render_table(&[], DEFAULT_COLUMNS, None, false),
+            render_table(&[], DEFAULT_COLUMNS, None, false, &BTreeSet::new()),
             "no snapshots\n"
         );
         assert!(under("/a", "/") && under("/a/b", "/a") && under("/a", "/a/"));
@@ -969,7 +1047,7 @@ mod tests {
         );
         let zero = sized(row("/p", "zero", 3, 3000), 0, 0, 87_295_506_841);
         let rows = vec![big, small, zero];
-        let table = render_table(&rows, DEFAULT_COLUMNS, None, false);
+        let table = render_table(&rows, DEFAULT_COLUMNS, None, false, &BTreeSet::new());
         // The index's REFER, not `≈refer_bytes`; a real 0 is printed as 0.
         assert_eq!(cells(&table, 1)[3..6], ["4.1G", "6.0G", "80G"], "{table}");
         assert_eq!(cells(&table, 2)[3..6], ["3.0M", "9.0M", "81G"], "{table}");
@@ -982,13 +1060,14 @@ mod tests {
             &[Column::Name, Column::Used],
             Some(Column::Used),
             false,
+            &BTreeSet::new(),
         );
         let order: Vec<String> = (1..=3).map(|i| cells(&sorted, i)[0].clone()).collect();
         assert_eq!(order, ["/p@zero", "/p@small", "/p@big"]);
 
         // `-p`: exact bytes; `-o lsize` is an extra column.
         let columns = Column::parse_list("name,used,written,refer,lsize").unwrap();
-        let exact = render_table(&rows[..1], &columns, None, true);
+        let exact = render_table(&rows[..1], &columns, None, true, &BTreeSet::new());
         assert_eq!(
             cells(&exact, 0),
             ["NAME", "USED", "WRITTEN", "REFER", "LSIZE"]
@@ -1028,7 +1107,13 @@ mod tests {
         building.size_state = Some(api::SizeState::Building);
         building.building_pct = Some(37);
         building.refer_bytes = Some(5 << 30);
-        let table = render_table(&[building.clone()], DEFAULT_COLUMNS, None, false);
+        let table = render_table(
+            &[building.clone()],
+            DEFAULT_COLUMNS,
+            None,
+            false,
+            &BTreeSet::new(),
+        );
         assert_eq!(
             table.matches("building (37%)").count(),
             3,
@@ -1040,6 +1125,7 @@ mod tests {
             &[Column::Used, Column::Refer],
             None,
             true,
+            &BTreeSet::new(),
         );
         assert_eq!(cells(&exact, 1), ["-", "-"]);
         assert_eq!(
@@ -1050,7 +1136,13 @@ mod tests {
         let mut off = row("/p", "o", 1, 1000);
         off.size_state = Some(api::SizeState::Off);
         off.refer_bytes = Some(5 << 30);
-        let table = render_table(&[off.clone()], DEFAULT_COLUMNS, None, false);
+        let table = render_table(
+            &[off.clone()],
+            DEFAULT_COLUMNS,
+            None,
+            false,
+            &BTreeSet::new(),
+        );
         // USED/WRITTEN `-`; REFER falls back to the creation-time size.
         assert_eq!(cells(&table, 1)[3..6], ["-", "-", "≈5.0G"], "{table}");
         assert_eq!(
@@ -1058,7 +1150,7 @@ mod tests {
             Some("USED/WRITTEN/REFER: snapshot accounting is off (CONSTELLATION_SNAPACCT=off)")
         );
         off.refer_bytes = None;
-        let table = render_table(&[off], DEFAULT_COLUMNS, None, false);
+        let table = render_table(&[off], DEFAULT_COLUMNS, None, false, &BTreeSet::new());
         assert_eq!(cells(&table, 1)[3..6], ["-", "-", "-"], "{table}");
     }
 
@@ -1193,5 +1285,106 @@ mod tests {
         );
         assert_eq!(exact_duration(90_000), "90s");
         assert_eq!(ago(3 * 86_400_000, 86_400_000), "2d ago");
+    }
+
+    #[test]
+    fn orphaned_auto_snapshots_say_so_and_filter() {
+        let mut owned = row("/p", "auto-1", 1, 1000);
+        owned.origin = "auto".into();
+        owned.policy_ino = 10;
+        let mut orphan = row("/q", "auto-2", 2, 2000);
+        orphan.origin = "auto".into();
+        orphan.policy_ino = 11;
+        // A manual snapshot of an orphaned stream's directory is manual.
+        let mut manual = row("/q", "monday", 3, 3000);
+        manual.policy_ino = 11;
+        let listing = api::SnapPolicyListing {
+            roots: vec![
+                api::SnapPolicyRoot {
+                    ino: 10,
+                    canonical: Some("1h:1d".into()),
+                    auto_snapshots: 1,
+                    ..Default::default()
+                },
+                api::SnapPolicyRoot {
+                    ino: 11,
+                    auto_snapshots: 1,
+                    orphaned: true,
+                    ..Default::default()
+                },
+            ],
+        };
+        let orphaned = orphaned_streams(&listing);
+        assert_eq!(orphaned, BTreeSet::from([11]));
+        let rows = [owned, orphan, manual];
+        let table = render_table(
+            &rows,
+            &[Column::Name, Column::Origin],
+            None,
+            false,
+            &orphaned,
+        );
+        let lines: Vec<Vec<&str>> = table
+            .lines()
+            .map(|l| {
+                l.split("  ")
+                    .filter(|c| !c.is_empty())
+                    .map(str::trim)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(lines[1], ["/p@auto-1", "auto"]);
+        assert_eq!(lines[2], ["/q@auto-2", "auto (orphaned)"]);
+        assert_eq!(lines[3], ["/q@monday", "manual"]);
+        let kept: Vec<&str> = rows
+            .iter()
+            .filter(|r| OriginFilter::Orphaned.keep(r, &orphaned))
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(kept, ["auto-2"]);
+        assert!(OriginFilter::Auto.keep(&rows[1], &BTreeSet::new()));
+    }
+
+    #[test]
+    fn orphan_fetch_failure_degrades_except_for_the_filter() {
+        let fail = || Err(anyhow::anyhow!("control socket gone"));
+        let (set, warn) = orphans_or_degrade(OriginFilter::All, fail()).unwrap();
+        assert!(set.is_empty());
+        assert!(warn.unwrap().contains("control socket gone"));
+        assert!(orphans_or_degrade(OriginFilter::Orphaned, fail()).is_err());
+        let (set, warn) =
+            orphans_or_degrade(OriginFilter::All, Ok(api::SnapPolicyListing::default())).unwrap();
+        assert!(set.is_empty() && warn.is_none());
+        // Fetched only when something uses it.
+        assert!(wants_orphans(
+            OriginFilter::All,
+            DEFAULT_COLUMNS,
+            None,
+            false
+        ));
+        assert!(!wants_orphans(
+            OriginFilter::All,
+            &[Column::Name],
+            None,
+            false
+        ));
+        assert!(!wants_orphans(
+            OriginFilter::Auto,
+            DEFAULT_COLUMNS,
+            None,
+            true
+        ));
+        assert!(wants_orphans(
+            OriginFilter::Orphaned,
+            &[Column::Name],
+            None,
+            true
+        ));
+        // And the degraded table says plain `auto`.
+        let mut r = row("/q", "auto-2", 2, 2000);
+        r.origin = "auto".into();
+        r.policy_ino = 11;
+        let table = render_table(&[r], &[Column::Origin], None, false, &set);
+        assert!(!table.contains("orphaned"), "{table}");
     }
 }

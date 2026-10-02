@@ -32578,6 +32578,80 @@ the service's logical-over-stored ratio), the CLI lays them out.
 
 ### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m5c`)
 
+## Plan 32 M2 — policy binding and CLI
+
+**Milestone M2 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 3.1
+plus Step 5's `policy set/show/ls/rm/pause/resume` and `snapshot ls
+--orphaned`): closed.** Two chunks: `32-m2a` (the xattr gate, root
+discovery, `SnapSchedStats`, the `snapshot.policy.{list,show,set,remove,pause}`
+methods with the `confirm_expiring` guard — its detail and decisions stay in
+"Plan 32 M2a (policy binding)" above) and `32-m2b` (this one: the CLI and the
+milestone gate). A policy can be set, shown, listed, paused, resumed and
+removed from the command line; **nothing runs**: no scheduler (M3), no
+expiry (M4). M2 creates and deletes no snapshot. The CLI prints what the
+daemon returns and evaluates no retention itself.
+
+| Item | State | Where |
+|---|---|---|
+| **M2a** setxattr gate for `user.constellation.snapshots` (directories only, never scratch or below scratch, parse or `EINVAL` with the reason in `node.status.snapsched.last_parse_error`; the converse scratch gate); replay never validates | DONE (`32-m2a`) | `crates/engine/src/view/ops.rs` |
+| **M2a** root discovery `Meta::snapshot_policy_roots()` (rename-safe by inode); `SnapSchedStats` with every Step 9 field in `node.status` | DONE (`32-m2a`) | `crates/meta/src/store/misc.rs`, `crates/engine/src/snapsched.rs` |
+| **M2a** `snapshot.policy.list/show` (viewer), `set/remove/pause` (admin, audited); `set`'s `dry_run` delta and its `confirm_expiring` guard (`conflict` with the delta as details); `remove {expire}` refused until M4 | DONE (`32-m2a`) | `crates/engine/src/control/snapsched.rs`, `crates/control/src/{methods.rs,proto/types.rs}` |
+| `snapshot policy set <fs:path> '<expr>' [--yes] [--dry-run]`: `set{dry_run}` first; an `invalid` refusal carrying `{offset, message}` prints the caret (exit 2, as `policy check`); prints the change (`previous -> canonical`), the delta sentence (`creates every 5m; will expire 312 snapshots; <grace_note>`), up to 10 expiring ids, the server's warnings (sub-minute tier, bound > 2000); asks `[y/N]` when `would_expire > 0` unless `--yes`; `--dry-run` stops after the preview; then `set{confirm_expiring: would_expire of the preview}`. A `conflict` whose delta count differs is reported ("would now expire M, not the N previewed; rerun") and exits non-zero, never retried | DONE | `crates/cli/src/policy_cli.rs` (`set`) |
+| `snapshot policy show <fs:path>`: path, ino, canonical policy (and the stored text when it differs), state, the caret of an unparseable one, auto count, the server's `would expire N of M`, then the root's **own auto snapshots** with `KEPT BY` from the server's verdicts (`5m·1h`, `last=n`, `held: csi`, `expire`); without verdicts (no parseable policy) its auto snapshots from `snapshot.list`, marked `orphaned` (or `held`) | DONE | `crates/cli/src/policy_cli.rs` (`show`, `render_shown`) |
+| `snapshot policy ls [<fs[:path]>]` (or `--state-dir` alone): `PATH INO POLICY STATE AUTO SNAPSHOTS`, STATE ∈ armed/paused/unparseable/orphaned, an unlinked stream's path `(unlinked)`; a path keeps the roots at or below it | DONE | `crates/cli/src/policy_cli.rs` (`ls`, `render_roots`) |
+| `snapshot policy rm <fs:path> [--yes]` (asks, naming the policy and how many auto snapshots stay orphaned; declined → "nothing removed", non-zero); `--expire` is parsed and answered "not available until expiry ships (plan 32 M4)", non-zero, before any prompt or call | DONE | `crates/cli/src/policy_cli.rs` (`rm`) |
+| `snapshot policy pause|resume <fs:path>` → `/dir: paused (1h:1d 1d:7d; paused)` | DONE | `crates/cli/src/policy_cli.rs` (`pause`) |
+| `snapshot ls --orphaned` (conflicts with `--auto`/`--manual`), and the `ORIGIN` cell `auto (orphaned)` for an auto snapshot whose `policy_ino` `snapshot.policy.list` reports `orphaned`; `snapshot.policy.list` is asked only when the listing has an auto snapshot. `--json` keeps its shape (filtered) | DONE | `crates/cli/src/snapshot_cli.rs` (`orphaned_streams`, `is_orphaned`, `OriginFilter::Orphaned`), `crates/cli/src/main.rs` |
+| `snapshot policy check`'s `KEPT BY` helper moved to `policy_cli::kept_by` (shared with `show`) | DONE | `crates/cli/src/policy_cli.rs` |
+| Unit tests: the delta sentence (plural, singular, paused), the preview (change line, 10 ids + "and N more", unchanged, no previous), the roots table (every state, `(unlinked)`, component-aware filter), `show` (own autos only, verdict cells, stored-vs-canonical, unparseable caret + orphans), caret only for an `invalid` refusal with offset details, `auto (orphaned)` and `--orphaned` filtering | DONE | `crates/cli/src/policy_cli.rs` (6), `crates/cli/src/snapshot_cli.rs` (`orphaned_auto_snapshots_say_so_and_filter`) |
+| Smoke lane: `set` of a bad expression (exit 2, caret under byte 6), `set` on a file (non-zero, "not a directory"), `--dry-run` with a sub-minute warning writes nothing (`show` → "no snapshot policy"), `set` → `show` (armed, `would expire 0 of 1`) → `ls` armed → `pause` → `ls` paused → `resume` → `rm --expire` refused → `rm` without `--yes` declined (stdin closed) → `rm --yes` → `ls` "no snapshot policies" → `snapshot ls --orphaned` "no snapshots" | DONE | `crates/harness/src/smoke.rs` (`policy_round_trip`), `docs/how-to-guides/development/TESTING.md` |
+
+### Decisions taken here (the brief left them open)
+
+- **Every parse error comes from the daemon.** `set` sends the expression
+  straight to `set{dry_run}` and renders the caret from the refusal's
+  details, so the CLI and the daemon can never disagree on what parses
+  (unlike `policy check`, which parses locally so a typo needs no daemon:
+  `set` needs one anyway). Exit code 2, as `policy check` and `prune check`.
+- **`confirm_expiring` is always the preview's count**, also when it is 0: a
+  change that previewed 0 and would now expire some is refused by the
+  daemon rather than written unconfirmed.
+- **`rm` reads `show` first** (to name the policy and the auto count in the
+  prompt, and to say "no snapshot policy" for an orphaned stream rather than
+  asking); `rm --expire` is refused locally, before the prompt, with the
+  same meaning as the daemon's `REMOVE_EXPIRE_REFUSED`. M4 replaces this
+  with the confirmed `remove{expire, confirm_expiring}` flow.
+- **STATE precedence**: `unparseable` (the error is the actionable fact, even
+  when the stream is also orphaned) > `orphaned` (no expression) > `paused`
+  > `armed`.
+- **`show` lists the root's own auto snapshots** (`origin = auto`,
+  `policy_ino` = the root) — not its manual snapshots nor another policy's,
+  which the verdicts also carry. The summary line `would expire N of M`
+  counts every snapshot the server evaluated.
+- **`ls --orphaned` needs the daemon's orphan set**, so every `snapshot ls`
+  with an auto snapshot in it makes a second (viewer) call; a listing with
+  none does not.
+
+### Sample output
+
+```
+$ constellation snapshot policy set /projects '5m:1d 1h:7d 1d:30d' --dry-run --state-dir …
+/projects (ino 1099511628800): (no policy) -> 5m:1d 1h:7d 1d:30d
+creates every 5m; will expire nothing; nothing is deleted now: expiry is not active until the scheduler's expiry step ships
+dry run: nothing written
+
+$ constellation snapshot policy ls --state-dir …
+PATH           INO            POLICY              STATE   AUTO SNAPSHOTS
+/projects      1099511628800  5m:1d 1h:7d 1d:30d  armed   0
+/projects/web  1099511629824  30s:1h; paused      paused  0
+
+$ constellation snapshot policy set /projects '1h:1d 7m:1d' --state-dir …   # exit 2
+1h:1d 7m:1d
+      ^ `7m` does not divide an hour; use a divisor of 60 (1m, 2m, 3m, 4m, 5m, 6m, 10m, 12m, 15m, 20m or 30m)
+```
+
+### Gates (`32-m2b` worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m2b`)
+
 | Command | Result |
 |---|---|
 | `cargo fmt --all` | no diff (`--check` exit 0) |
@@ -32681,3 +32755,27 @@ release build ok. Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=f39x`):
 `/dev/fuse` reader); `s3-cut-one-node`, `upgrade-under-load`,
 `session-handover-idle`, `e2e-two-nodes` passed. Compliance not re-run this
 round (not in the round's gate list).
+
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0: **2099 passed, 0 failed** |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | its body run by hand (`AWS_*` as in the script, `tests/smoke.sh s3://constellation-ci/run-m2b-…`) against the floci another agent holds on `:4566`: SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run` (full matrix, 187 scenarios) | `--shard 1/2` ran 84 of its 94 scenarios before the tool's 40-minute limit stopped it (83 PASSED, `ack-s3-failover` FAILED: "B does not hold a newer epoch … holder 3" — the known takeover-winner bug); the other 103 ran by name in five slices: 99 PASSED, 3 SKIPPED (`transport-refused-registration`, `transport-enomem-ring`, `transport-abort-while-armed`: the plain release build has no `io-uring` feature), `sqlite-first-touch-latency` FAILED (a 57 s SQLite stall, load average 78). Reruns alone: `ack-s3-failover` PASSED, `sqlite-first-touch-latency` PASSED (124 s), `subtree-confinement` PASSED as root (`sudo env PATH=$PATH …`, prefix `m2b-root`). Every scenario passed or skipped for a missing feature; this chunk touches only the CLI |
+| `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed**, COMPLIANCE TEST PASSED (baseline: 0 known failures); `SMOKE_IMAGE=m2b-smoke:local` built from this tree, a `/tmp` override dropping floci's host port (4566 held by another agent) |
+
+### Exit criteria (plan 32 Step 12, M2)
+
+- [x] Step 3.1: the xattr gate, root discovery (`32-m2a`).
+- [x] `snapshot policy set` with the caret, the delta, warnings, confirmation, `--dry-run`, and the server-checked `confirm_expiring` (no silent retry).
+- [x] `snapshot policy show / ls / rm / pause / resume`; `rm --expire` parsed and refused until M4.
+- [x] `snapshot ls --orphaned` and `auto (orphaned)`.
+- [x] Nothing runs: no snapshot is created or deleted by anything in M2; no retention math in the CLI.
+- [x] Full CONVENTIONS gates (above).
+
+### Not done here (deliberately)
+
+- `rm --expire` (M4), the real grace note (M4), `reclaim` in the delta (M5).
+- `CREATED` in the policy's `tz` (the tables stay UTC).
+- An `--json` for the policy commands: not asked for; the methods'
+  results are the machine interface.
