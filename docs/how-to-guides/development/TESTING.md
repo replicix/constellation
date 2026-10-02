@@ -815,7 +815,12 @@ roots:
   proves explicit `.constellation/snapshot/<name>/` lookup still returns the
   frozen bytes. It separately checks that `.constellation` is absent from
   ordinary `readdir`, then deletes the snapshot and requires new frozen-view
-  reads to fail while the live file remains intact.
+  reads to fail while the live file remains intact. Its second phase (plan
+  32 Step 0.1) mounts a second node that creates, holds, releases and
+  deletes snapshots while the first holds the write lease and keeps
+  writing a counter file: the lease's holder and epoch must not change,
+  a held snapshot must refuse deletion, and the surviving snapshots'
+  frozen counters must be non-decreasing and within what was written.
 - `clone-workflow` eagerly clones snapshot metadata, independently edits the
   origin and clone, verifies both byte strings, and checks the frozen source
   remained unchanged. Deleting the snapshot must not affect the clone.

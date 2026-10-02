@@ -274,12 +274,39 @@ impl SnapshotManager {
     /// from, which policy owns it, and whether it is born held (plan 37's
     /// `snapshot.create{hold}`). Returns the summary line and the row as
     /// recorded, so a caller need not look it up again.
+    ///
+    /// This is the whole operation on whichever node calls it, with no
+    /// regard for who holds the write lease: the daemon goes through
+    /// [`crate::snapshot_batch`], which runs the same pieces
+    /// ([`Self::prepare_create`], [`Self::publish_commit`],
+    /// [`Self::put_record`], then the row) at the root-lease holder.
     pub async fn create_with(
         &self,
         path: &str,
         name: &str,
         options: &SnapshotOptions,
     ) -> Result<(String, SnapshotRow)> {
+        let (path, ino) = self.prepare_create(path, name, options)?;
+        let commit = self.publish_commit().await?;
+        let row = match self
+            .put_record(&path, name, options, self.creator, ino, commit)
+            .await?
+        {
+            PutRecord::Put(row) => row,
+            PutRecord::AlreadyExists(_) => bail!("snapshot {path}@{name} already exists"),
+        };
+        self.meta.record_snapshot(&row)?;
+        Ok((created_detail(&row, commit.0), row))
+    }
+
+    /// Validate a creation and resolve its directory: the normalized
+    /// path and the directory's inode, as this replica has them.
+    pub fn prepare_create(
+        &self,
+        path: &str,
+        name: &str,
+        options: &SnapshotOptions,
+    ) -> Result<(String, Ino)> {
         validate_name(name)?;
         if let Some(by) = options.owner() {
             validate_owner(by)?;
@@ -296,11 +323,34 @@ impl SnapshotManager {
         if attr.kind != InodeKind::Dir {
             bail!("snapshot path must be a directory");
         }
+        Ok((path, ino))
+    }
+
+    /// Force a metadata publish: the commit `(seq, root)` that now
+    /// reflects this node's replica, which a snapshot taken now retains.
+    pub async fn publish_commit(&self) -> Result<(u64, NodeHash)> {
         let publish = self
             .publish
             .as_ref()
             .context("this mount cannot publish a metadata commit, so it cannot take snapshots")?;
-        let (seq, root) = publish().await?;
+        publish().await
+    }
+
+    /// Write `path@name`'s bucket object for directory `ino` of `commit`
+    /// (a create-if-absent: the name is the CAS), and return the row to
+    /// record — which the caller journals, under whatever write
+    /// admission it holds. [`PutRecord::AlreadyExists`] when the object
+    /// is already there; nothing is written then.
+    pub async fn put_record(
+        &self,
+        path: &str,
+        name: &str,
+        options: &SnapshotOptions,
+        creator: u64,
+        ino: Ino,
+        commit: (u64, NodeHash),
+    ) -> Result<PutRecord> {
+        let (seq, root) = commit;
         tracing::debug!(%path, name, seq, root = %root.to_hex(), ino, "snapshot: publish returned");
         // The commit must actually hold the directory: a path created
         // after the last shipped segment would otherwise freeze nothing.
@@ -331,9 +381,9 @@ impl SnapshotManager {
             }
         };
         let record = SnapshotRecord::new(
-            &path,
+            path,
             name,
-            self.creator,
+            creator,
             SnapshotTreeRoot {
                 seq,
                 root: root.to_hex(),
@@ -345,35 +395,29 @@ impl SnapshotManager {
         .with_extensions(options.origin, options.policy_ino, refer_bytes);
         match self.records.create(&record).await {
             Ok(()) => {}
-            Err(StoreError::AlreadyExists) => bail!("snapshot {path}@{name} already exists"),
+            Err(StoreError::AlreadyExists) => return Ok(PutRecord::AlreadyExists(record.id())),
             Err(error) => return Err(error.into()),
         }
-        let row = SnapshotRow {
+        Ok(PutRecord::Put(SnapshotRow {
             id: record.id(),
-            path,
+            path: path.to_string(),
             name: name.to_string(),
             root_hash: snapshot.encode(),
             created_unix_ms: record.created_unix_ms,
             origin: options.origin,
             policy_ino: options.policy_ino,
             held: options.held,
-            creator: self.creator,
+            creator,
             held_by: options.owner().map(str::to_string),
             refer_bytes,
-        };
-        self.meta.record_snapshot(&row)?;
-        let detail = format!(
-            "created snapshot {}@{} ({}, metadata commit {seq}){}",
-            record.path,
-            record.name,
-            record.id(),
-            match (row.held, row.owner()) {
-                (true, Some(by)) => format!(", held by {by}"),
-                (true, None) => ", held".to_string(),
-                (false, _) => String::new(),
-            }
-        );
-        Ok((detail, row))
+        }))
+    }
+
+    /// Remove `path@name`'s bucket object (after its row is gone: a
+    /// failure in between leaves an orphan object, never a dangling row).
+    pub async fn delete_record(&self, path: &str, name: &str) -> Result<()> {
+        self.records.delete(path, name).await?;
+        Ok(())
     }
 
     /// Plan 32 §0.4: set or release `target`'s retention hold. `target` is
@@ -402,12 +446,7 @@ impl SnapshotManager {
             .meta
             .set_snapshot_hold(&id, held, by, force)?
             .with_context(|| format!("no such snapshot: {target}"))?;
-        let detail = match (held, row.owner()) {
-            (true, Some(by)) => format!("held snapshot {}@{} for {by}", row.path, row.name),
-            (true, None) => format!("held snapshot {}@{}", row.path, row.name),
-            (false, _) => format!("released snapshot {}@{}", row.path, row.name),
-        };
-        Ok((detail, row))
+        Ok((hold_detail(&row), row))
     }
 
     /// The row for a snapshot id or a `path@name` selector.
@@ -551,13 +590,7 @@ impl SnapshotManager {
             let id = constellation_store_s3::snapshot_id(&path, name);
             if let Some(row) = self.meta.snapshot_by_id(&id)? {
                 if row.held {
-                    bail!(
-                        "snapshot {path}@{name} is held{}; release it first (`snapshot release`) or pass --force",
-                        match row.owner() {
-                            Some(by) => format!(" by {by}"),
-                            None => String::new(),
-                        }
-                    );
+                    bail!("{}", held_refusal(&row));
                 }
             }
         }
@@ -725,6 +758,52 @@ async fn add_manifest_refs(
     Ok(())
 }
 
+/// What [`SnapshotManager::put_record`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutRecord {
+    /// The bucket object is written; journal this row.
+    Put(SnapshotRow),
+    /// The name is taken: this id's object already exists.
+    AlreadyExists(String),
+}
+
+/// `snapshot create`'s summary line for a recorded row.
+pub fn created_detail(row: &SnapshotRow, seq: u64) -> String {
+    format!(
+        "created snapshot {}@{} ({}, metadata commit {seq}){}",
+        row.path,
+        row.name,
+        row.id,
+        match (row.held, row.owner()) {
+            (true, Some(by)) => format!(", held by {by}"),
+            (true, None) => ", held".to_string(),
+            (false, _) => String::new(),
+        }
+    )
+}
+
+/// `snapshot hold`/`release`'s summary line for the row as now recorded.
+pub fn hold_detail(row: &SnapshotRow) -> String {
+    match (row.held, row.owner()) {
+        (true, Some(by)) => format!("held snapshot {}@{} for {by}", row.path, row.name),
+        (true, None) => format!("held snapshot {}@{}", row.path, row.name),
+        (false, _) => format!("released snapshot {}@{}", row.path, row.name),
+    }
+}
+
+/// Why a delete without `force` refuses a held snapshot.
+pub fn held_refusal(row: &SnapshotRow) -> String {
+    format!(
+        "snapshot {}@{} is held{}; release it first (`snapshot release`) or pass --force",
+        row.path,
+        row.name,
+        match row.owner() {
+            Some(by) => format!(" by {by}"),
+            None => String::new(),
+        }
+    )
+}
+
 pub fn split_selector(selector: &str) -> Result<(String, String)> {
     let (path, name) = selector
         .rsplit_once('@')
@@ -768,7 +847,7 @@ pub fn validate_owner(by: &str) -> Result<()> {
     }
 }
 
-fn validate_name(name: &str) -> Result<()> {
+pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('/') || name.contains('@') {
         bail!("snapshot name must be non-empty and contain neither '/' nor '@'");
     }

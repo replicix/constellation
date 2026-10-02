@@ -104,6 +104,12 @@ pub const SPECULATION_OUTSTANDING: &str = "this replica has forwarded ops the lo
 /// reports a deferral.
 const PUBLISH_NOW_ATTEMPTS: usize = 3;
 
+/// [`TreePublisher::publish_now`]'s error when every attempt deferred —
+/// on a holder that keeps writing, new dirty keys kept arriving. As
+/// transient as [`SPECULATION_OUTSTANDING`]: a snapshot's publish hook
+/// retries both.
+pub const PUBLISH_DEFERRED: &str = "the metadata publish was deferred";
+
 /// Where the published tree's identity is remembered across restarts.
 const KV_ROOT: &str = "mtree/root";
 const KV_SEQ: &str = "mtree/commit_seq";
@@ -478,7 +484,7 @@ impl TreePublisher {
         }
         if self.meta.has_dirty() {
             anyhow::bail!(
-                "the metadata publish was deferred (this replica is behind the chain head, \
+                "{PUBLISH_DEFERRED} (this replica is behind the chain head, \
                  or a concurrent commit overlaps its batch); retry shortly"
             );
         }

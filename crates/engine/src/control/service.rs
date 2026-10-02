@@ -6,7 +6,9 @@
 //! [`super`] runs it on a blocking thread.
 
 use super::{fuse_requests_status, normalize_control_path, peer_addr_strings, EngineControl};
-use crate::{backend, doctor, fsck, gc, held, leave, paths, snapshot, sync, writeback};
+use crate::{
+    backend, doctor, fsck, gc, held, leave, paths, snapshot, snapshot_batch, sync, writeback,
+};
 use constellation_control::proto::types as api;
 use constellation_store_s3::ChunkStore;
 
@@ -34,10 +36,15 @@ pub(crate) fn snapshot_status(row: constellation_meta::SnapshotRow) -> api::Snap
 }
 
 impl EngineControl {
-    /// Snapshot/clone control requests are metadata mutations too: acquire
-    /// the subtree partition and force its pending data + journal through
-    /// before observing or publishing an immutable root.
-    pub(crate) fn snapshot_barrier(&self, path: &str) -> std::result::Result<(), String> {
+    /// `clone.create` is a namespace mutation: take the root write lease
+    /// (the clone's inodes are written here, under it) and force the
+    /// subtree's pending data + journal through before reading the source.
+    /// (`quota.set` takes only the lease, [`Self::acquire_write_lease`].)
+    /// Snapshot rows do *not* come through here — they execute at
+    /// whichever node holds the lease ([`Self::snapshot_batch`], plan 32
+    /// Step 0.1), so taking, deleting or holding a snapshot never moves
+    /// it.
+    pub(crate) fn acquire_namespace_barrier(&self, path: &str) -> std::result::Result<(), String> {
         let ino = self
             .meta
             .resolve_path(path)
@@ -54,9 +61,9 @@ impl EngineControl {
 
     /// Take the write lease for a control-plane metadata mutation that is
     /// journaled like any other (`quota.set`), without
-    /// [`Self::snapshot_barrier`]'s drain: holding the lease is what makes
-    /// the local journal record shippable, and nothing is observed or
-    /// published that pending writes would need to be part of.
+    /// [`Self::acquire_namespace_barrier`]'s drain: holding the lease is
+    /// what makes the local journal record shippable, and nothing is
+    /// observed or published that pending writes would need to be part of.
     pub(crate) fn acquire_write_lease(&self) -> std::result::Result<(), String> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.sync_tx
@@ -68,6 +75,33 @@ impl EngineControl {
             return Err("subtree write lease is held by another node".into());
         }
         Ok(())
+    }
+
+    /// Plan 32 Step 0.1: run snapshot row operations as one batch at the
+    /// root-lease holder (here, forwarded to it, or here after taking a
+    /// free lease) and return the per-item results in item order. The
+    /// same API the scheduler reaches through
+    /// [`crate::Engine::snapshot_batches`] without a control round trip.
+    pub fn snapshot_batch(
+        &self,
+        items: Vec<snapshot_batch::SnapshotItem>,
+    ) -> std::result::Result<Vec<snapshot_batch::ItemResult>, String> {
+        let batches = self.engine.snapshot_batches().clone();
+        // One control request is one batch and one attempt: the caller
+        // (a person, or the CLI) retries with a new request.
+        let rid = batches.next_rid();
+        tokio::task::block_in_place(|| self.rt.block_on(batches.submit(rid, items)))
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// A batch of one, whose single result the caller interprets.
+    fn snapshot_item(
+        &self,
+        item: snapshot_batch::SnapshotItem,
+    ) -> std::result::Result<snapshot_batch::ItemResult, String> {
+        self.snapshot_batch(vec![item])?
+            .pop()
+            .ok_or_else(|| "the snapshot batch returned no result".to_string())
     }
 
     /// Assemble the pruner's dependency bundle from the daemon's shared
@@ -843,21 +877,41 @@ impl EngineControl {
         Ok(format!("write mode set to {}", requested.as_str()))
     }
 
+    /// `snapshot.create`: a batch of one, `origin` as given (manual from
+    /// the control protocol). A name already taken is today's error,
+    /// whether the object came from an earlier create or from this one's
+    /// own retry on another holder (the scheduler, not this, counts the
+    /// latter as success).
     pub(crate) fn snapshot_create(
         &self,
         selector: &str,
         options: &snapshot::SnapshotOptions,
     ) -> std::result::Result<(String, api::SnapshotStatus), String> {
         let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
-        self.snapshot_barrier(&path)?;
-        let snapshots = self.snapshots.clone();
-        let (detail, row) = tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(snapshots.create_with(&path, &name, options))
-        })
-        .map_err(|error| format!("{error:#}"))?;
-        let _ = self.sync_tx.send(sync::SyncRequest::Nudge);
-        Ok((detail, snapshot_status(row)))
+        if let Some(by) = options.owner() {
+            snapshot::validate_owner(by).map_err(|error| format!("{error:#}"))?;
+        }
+        let item = snapshot_batch::SnapshotItem::Create {
+            path: path.clone(),
+            name: name.clone(),
+            origin: options.origin,
+            policy_ino: options.policy_ino,
+            creator: self.node_id,
+            held: options.held,
+            held_by: options.owner().map(str::to_string),
+            skip_if_unchanged_since: None,
+        };
+        match self.snapshot_item(item)? {
+            snapshot_batch::ItemResult::Created { seq, row, .. } => {
+                let row = snapshot_batch::row_from_wire(row);
+                Ok((snapshot::created_detail(&row, seq), snapshot_status(row)))
+            }
+            snapshot_batch::ItemResult::AlreadyExists { .. } => {
+                Err(format!("snapshot {path}@{name} already exists"))
+            }
+            snapshot_batch::ItemResult::Refused { reason } => Err(reason),
+            other => Err(format!("unexpected snapshot create result {other:?}")),
+        }
     }
 
     /// Plan 32 §0.4: set or release a retention hold. `target` is a
@@ -865,11 +919,11 @@ impl EngineControl {
     ///
     /// A hold is a journaled metadata mutation like create and delete, and
     /// it is only worth anything if it reaches the whole cluster: a hold
-    /// written on a node that may not write the subtree would be invisible
-    /// to the holder, whose `snapshot.delete` (and plan 32 Step 4's
-    /// expiry) reads `held` from its own replica. So resolve the row for
-    /// its path, then take the same barrier `snapshot_delete` takes — it
-    /// is what refuses a read-only member and a peer-held lease.
+    /// written on a node that may not write would be invisible to the
+    /// holder, whose `snapshot.delete` (and plan 32 Step 4's expiry)
+    /// reads `held` from its own replica. So it is a batch item: the
+    /// holder writes it (plan 32 Step 0.1), under the owner rule its
+    /// replica's transaction checks.
     pub(crate) fn snapshot_hold(
         &self,
         target: &str,
@@ -877,18 +931,26 @@ impl EngineControl {
         by: Option<&str>,
         force: bool,
     ) -> std::result::Result<(String, api::SnapshotStatus), String> {
-        let row = self
-            .snapshots
-            .row(target)
-            .map_err(|error| format!("{error:#}"))?;
-        self.snapshot_barrier(&row.path)?;
-        let snapshots = self.snapshots.clone();
-        let (detail, row) = tokio::task::block_in_place(|| {
-            self.rt.block_on(snapshots.hold(target, held, by, force))
-        })
-        .map_err(|error| format!("{error:#}"))?;
-        let _ = self.sync_tx.send(sync::SyncRequest::Nudge);
-        Ok((detail, snapshot_status(row)))
+        let by = by.filter(|by| !by.is_empty());
+        if let Some(by) = by {
+            snapshot::validate_owner(by).map_err(|error| format!("{error:#}"))?;
+        }
+        let id = snapshot::snapshot_id_of(target).map_err(|error| format!("{error:#}"))?;
+        let item = snapshot_batch::SnapshotItem::Hold {
+            id,
+            held,
+            by: by.map(str::to_string),
+            force,
+        };
+        match self.snapshot_item(item)? {
+            snapshot_batch::ItemResult::HoldSet { row } => {
+                let row = snapshot_batch::row_from_wire(row);
+                Ok((snapshot::hold_detail(&row), snapshot_status(row)))
+            }
+            snapshot_batch::ItemResult::NotFound => Err(format!("no such snapshot: {target}")),
+            snapshot_batch::ItemResult::Refused { reason } => Err(reason),
+            other => Err(format!("unexpected snapshot hold result {other:?}")),
+        }
     }
 
     pub(crate) fn snapshot_list(
@@ -907,13 +969,22 @@ impl EngineControl {
         force: bool,
     ) -> std::result::Result<String, String> {
         let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
-        self.snapshot_barrier(&path)?;
-        let snapshots = self.snapshots.clone();
-        let result =
-            tokio::task::block_in_place(|| self.rt.block_on(snapshots.delete(&path, &name, force)))
-                .map_err(|error| format!("{error:#}"))?;
-        let _ = self.sync_tx.send(sync::SyncRequest::Nudge);
-        Ok(result)
+        let item = snapshot_batch::SnapshotItem::Delete {
+            id: constellation_store_s3::snapshot_id(&path, &name),
+            force,
+        };
+        match self.snapshot_item(item)? {
+            snapshot_batch::ItemResult::Deleted => Ok(format!("deleted snapshot {path}@{name}")),
+            snapshot_batch::ItemResult::DeletedObjectRemains { reason } => Err(format!(
+                "snapshot {path}@{name}: its row was deleted, but deleting its snaps/ object \
+                 failed (left as an orphan): {reason}"
+            )),
+            snapshot_batch::ItemResult::NotFound => {
+                Err(format!("snapshot {path}@{name} does not exist"))
+            }
+            snapshot_batch::ItemResult::Refused { reason } => Err(reason),
+            other => Err(format!("unexpected snapshot delete result {other:?}")),
+        }
     }
 
     pub(crate) fn clone_snapshot(
@@ -922,7 +993,7 @@ impl EngineControl {
         destination: &str,
     ) -> std::result::Result<String, String> {
         let (path, name) = snapshot::split_selector(selector).map_err(|error| error.to_string())?;
-        self.snapshot_barrier(&path)?;
+        self.acquire_namespace_barrier(&path)?;
         let snapshots = self.snapshots.clone();
         let destination = destination.to_string();
         let result = tokio::task::block_in_place(|| {
@@ -1088,8 +1159,9 @@ impl EngineControl {
     pub(crate) fn set_quota(&self, max_bytes: Option<u64>) -> std::result::Result<String, String> {
         use constellation_meta::MetaStore;
         // The lease, not a barrier. This used to run `snapshot_barrier("/")`
-        // first, which waits for the node's *whole* journal backlog to
-        // reach zero within one sync round and fails the call ("journal not
+        // (since renamed `acquire_namespace_barrier`) first, which waits
+        // for the node's *whole* journal backlog to reach zero within one
+        // sync round and fails the call ("journal not
         // shipped: no lease") whenever concurrent writes keep it nonzero —
         // plan 37 K0 Track B measured that as most `quota.set`s failing at
         // 64 concurrent CSI `CreateVolume`s. A snapshot needs that drain

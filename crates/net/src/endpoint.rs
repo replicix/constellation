@@ -710,6 +710,24 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
+    /// Plan 32 Step 0.1: `requester` asks this node, as the root-lease
+    /// holder, to execute a snapshot batch. The sender is already checked
+    /// to be `requester` (the batch's rid keys this node's dedup). Default:
+    /// not the holder (a node without a snapshot executor).
+    fn snapshot_batch_requested(
+        &self,
+        _requester: u64,
+        req_id: u64,
+        _rid: (u64, u32, u64),
+        _items: Vec<crate::message::SnapshotItem>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        Box::pin(async move {
+            Payload::SnapshotBatchReply {
+                req_id,
+                outcome: crate::message::SnapshotBatchOutcome::NotHolder,
+            }
+        })
+    }
     /// `from` reports chunks it forwarded as pending now durable in S3
     /// ([`Payload::ChunksDurable`]). Default: ignored.
     fn chunks_durable(

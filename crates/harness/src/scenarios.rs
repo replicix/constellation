@@ -382,7 +382,9 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "snapshot-lifecycle",
-        desc: "snapshot remains frozen behind hidden .constellation view, then becomes stale",
+        desc: "snapshot remains frozen behind hidden .constellation view, then becomes stale; \
+               a second node snapshots, holds and deletes while the first writes, and the \
+               write lease never moves",
         requires: &[],
         caps: &[],
         run: snapshot_lifecycle,
@@ -2432,7 +2434,21 @@ fn fsck_while_mounted(_seed: u64) -> Result<()> {
 fn snapshot_lifecycle(_seed: u64) -> Result<()> {
     let (env, root) = setup("snapshot-lifecycle")?;
     let _proxy = env.s3_proxy()?;
-    let mut client = one_client(&env, root.path(), &format!("snap-life-{}", ts()))?;
+    let backend = format!("s3://{BUCKET}/snap-life-{}", ts());
+    // Two nodes on one filesystem: the second phase snapshots from c1
+    // while c0 holds the lease and writes. A long idle release keeps the
+    // lease with c0 between its writes.
+    let tune = |c: Client, key: &str| {
+        let _ = std::fs::remove_file(key);
+        c.with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "30000")
+            .with_env("CONSTELLATION_NODE_KEY", key)
+    };
+    let mut client = tune(
+        Client::new(root.path(), "c0", &env.endpoint, &backend)?,
+        "/tmp/.constellation-snap-life-c0.key",
+    );
+    client.fs_create()?;
+    client.mount()?;
     std::fs::create_dir(client.mnt.join("project"))?;
     std::fs::write(client.mnt.join("project/data"), b"frozen")?;
     client.snapshot_create("/project@first")?;
@@ -2462,6 +2478,97 @@ fn snapshot_lifecycle(_seed: u64) -> Result<()> {
         std::fs::read(client.mnt.join("project/data"))? == b"live-moved",
         "snapshot deletion changed the live tree"
     );
+
+    // Plan 32 Step 0.1: a snapshot taken, held and deleted on a node that
+    // does not hold the write lease runs at the holder; the lease stays
+    // where it is (holder and epoch), while the holder keeps writing.
+    let mut other = tune(
+        Client::new(root.path(), "c1", &env.endpoint, &backend)?,
+        "/tmp/.constellation-snap-life-c1.key",
+    );
+    other.mount()?;
+    wait_for_p2p(&[&client, &other])?;
+    std::fs::write(client.mnt.join("project/counter"), b"0")?;
+    eventually("c0 holds the lease", Duration::from_secs(20), || {
+        let lease = lease_of(&client)?;
+        anyhow::ensure!(lease["held"] == true, "c0 does not hold the lease: {lease}");
+        Ok(())
+    })?;
+    let before = lease_of(&client)?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (mnt, stop) = (client.mnt.clone(), stop.clone());
+        std::thread::spawn(move || -> Result<u64> {
+            let mut k = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                k += 1;
+                std::fs::write(mnt.join("project/counter"), k.to_string())?;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(k)
+        })
+    };
+    let mut seen = Vec::new();
+    let phase = (|| -> Result<()> {
+        for i in 0..3 {
+            std::thread::sleep(Duration::from_millis(200));
+            other.snapshot_create(&format!("/project@busy{i}"))?;
+        }
+        other.snapshot_hold("/project@busy0", true)?;
+        anyhow::ensure!(
+            other.snapshot_delete("/project@busy0").is_err(),
+            "a held snapshot was deleted"
+        );
+        other.snapshot_hold("/project@busy0", false)?;
+        other.snapshot_delete("/project@busy0")?;
+        Ok(())
+    })();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let written = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("the writer panicked"))??;
+    phase?;
+    let after = lease_of(&client)?;
+    eprintln!("    snapshot-lifecycle: lease before {before} after {after}, {written} writes");
+    anyhow::ensure!(
+        after["held"] == true
+            && after["holder"] == before["holder"]
+            && after["epoch"] == before["epoch"],
+        "snapshots from a non-holder moved the lease: before {before}, after {after}"
+    );
+    anyhow::ensure!(lease_of(&other)?["held"] != true, "c1 took the lease");
+    // Each surviving snapshot froze some point of the holder's counter,
+    // in creation order; the deleted one is gone on both nodes.
+    for i in 1..3 {
+        let path = other
+            .mnt
+            .join(format!("project/.constellation/snapshot/busy{i}/counter"));
+        let mut value = 0;
+        eventually(
+            &format!("busy{i} is visible on c1"),
+            Duration::from_secs(20),
+            || {
+                value = std::fs::read_to_string(&path)?.trim().parse::<u64>()?;
+                Ok(())
+            },
+        )?;
+        seen.push(value);
+    }
+    anyhow::ensure!(
+        seen.windows(2).all(|w| w[0] <= w[1]) && seen.iter().all(|v| *v <= written),
+        "snapshot counters {seen:?} are not a prefix of the holder's {written} writes"
+    );
+    eventually("busy0 is gone on c0", Duration::from_secs(20), || {
+        anyhow::ensure!(
+            !client
+                .mnt
+                .join("project/.constellation/snapshot/busy0")
+                .exists(),
+            "busy0 still listed"
+        );
+        Ok(())
+    })?;
+    other.unmount()?;
     client.unmount()
 }
 

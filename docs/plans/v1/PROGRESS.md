@@ -30483,3 +30483,23 @@ both workers [x] livenessprobe healthy [x] csi-sanity Identity green on the
 deployed plugin [x] cluster deleted [x] chunk gates (fmt, clippy, workspace
 tests, smoke, csi-image, csi-sanity, helm lint, kind) [ ] harness + compliance
 (box-gates, then the coordinator's K1 milestone re-run).
+
+## Plan 32 M0a (holder-side snapshot batch)
+
+Plan 32 Step 0.1 only (chunk `32-m0a`): every snapshot row write runs at
+the root-lease holder, so creating, deleting or holding a snapshot never
+moves the write lease. No scheduler, expiry, GC or accounting change; the
+row/record/`LogRecord` layout of Step 0.4 is untouched. The M0 close-out
+chunk writes the full section.
+
+| Item | State | Where |
+|---|---|---|
+| Wire types `SnapshotItem::{Create, Delete, Hold}`, `SnapshotItemResult::{Created, Skipped, AlreadyExists, Deleted, NotFound, HoldSet, Refused, DeletedObjectRemains}`, `SnapshotRowWire`, `SnapshotBatchOutcome::{Done, NotHolder, Failed}`; `Payload::SnapshotBatchRequest`/`SnapshotBatchReply` **appended** at the end of `Payload` (test pins the variant indexes) | DONE | `crates/net/src/message.rs` (re-exported by `constellation_engine::snapshot_batch`) |
+| `SnapshotBatcher`: routing (holds → local; live holder → requester drains its own chunks (`DrainInode{0}`) and forwards over the peer path; live holder but P2P off → `Acquire` (`wanted_by` handover) then local, as before batches; nobody → `Acquire` then local; forward failure → error, never acquire), holder executor (drain per distinct create path, one publish, items in order), bounded `recent` results by rid (lease-loss refusals never kept), `submit(rid, items)` for retrying callers, `subtree_unchanged` stub for `32-m3b` | DONE | `crates/engine/src/snapshot_batch.rs` |
+| Holder-side serving of `SnapshotBatchRequest` | DONE | `crates/engine/src/p2p.rs`, `crates/net/src/{endpoint,peers}.rs` |
+| `SnapshotManager` split into `prepare_create` / `publish_commit` / `put_record` / `delete_record` so the batch can publish once | DONE | `crates/engine/src/snapshot.rs`, `crates/engine/src/mtree_publish.rs` |
+| `snapshot.create/delete/hold` go through the batch; `snapshot_barrier` renamed `acquire_namespace_barrier`, kept only for `clone.create` (`quota.set` takes the lease alone since 37-K2a); engine API `Engine::snapshot_batches()` / `EngineControl::snapshot_batch(items)` | DONE | `crates/engine/src/control/service.rs`, `crates/engine/src/node.rs` |
+| `CONSTELLATION_SNAPSHOT_FORWARD_TIMEOUT_MS` (default 30 s) | DONE | `docs/reference/configuration.md`, `docs/reference/features/forwarded-mutations.md` |
+| Tests: lease never moves under 10 snapshots from a non-holder while the holder writes (prefix-monotone counters); deletes/holds converge; duplicate rid / retry after holder change → `AlreadyExists`; no holder → acquire; unreachable holder → error, no lease move; unchanged root → `Skipped`; P2P off → `wanted_by` then acquire, no forward; a forwarded create drains the requester's chunks first; a lease-loss refusal is not replayed to a same-rid retry | DONE | `crates/engine/src/snapshot_batch.rs` tests |
+| Harness: `snapshot-lifecycle` gains a second node that snapshots/holds/deletes while the first writes; asserts lease holder+epoch unchanged | DONE | `crates/harness/src/scenarios.rs` |
+| Delegations: a root `Barrier` for a directory inside a delegated subtree does not reach the delegate (its unstreamed tail is not drained) — recorded, not redesigned | RECORDED | `crates/authority/src/core/tests.rs` `a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate` |

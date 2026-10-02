@@ -444,6 +444,11 @@ impl Client {
         self.control_command(&["snapshot", "delete", selector])
     }
 
+    /// `snapshot hold` (or `release`) of a selector or id, no owner.
+    pub fn snapshot_hold(&self, selector: &str, held: bool) -> Result<()> {
+        self.control_command(&["snapshot", if held { "hold" } else { "release" }, selector])
+    }
+
     pub fn clone_snapshot(&self, selector: &str, destination: &str) -> Result<()> {
         self.control_command(&["clone", selector, destination])
     }

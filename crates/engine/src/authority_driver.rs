@@ -4068,6 +4068,26 @@ impl Standalone {
         self.settle().await
     }
 
+    /// Ship everything and publish a commit as a snapshot needs it: the
+    /// commit `(seq, root)` that now reflects this replica
+    /// (`SyncRequest::Publish`'s answer in the daemon).
+    pub async fn publish_commit(&mut self) -> Result<(u64, constellation_mtree::NodeHash)> {
+        self.control(Control::PublishNow).await?;
+        self.settle().await?;
+        let epoch = self.core.ship().last_ship_epoch;
+        self.publisher
+            .as_mut()
+            .context("this standalone driver has no tree publisher")?
+            .publish_now(epoch)
+            .await
+    }
+
+    /// Copy the core's lease state into `view`, as the daemon's driver
+    /// does after every event (tests that need the fast path's gate).
+    pub fn mirror(&self, view: &crate::lease::LeaseView) {
+        view.mirror(self.core.lease(), now(), self.core.config(), false);
+    }
+
     /// Run every queued event and pending IO to completion (no timers).
     async fn settle(&mut self) -> Result<()> {
         while !self.queue.is_empty()

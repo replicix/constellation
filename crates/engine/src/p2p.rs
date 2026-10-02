@@ -23,6 +23,9 @@ const EPOCH_MEMBER_S3_PROBE: std::time::Duration = std::time::Duration::from_mil
 
 pub(crate) struct P2pBridge {
     pub(crate) node_id: u64,
+    /// Plan 32 Step 0.1: executes a peer's snapshot batch when this node
+    /// holds the root lease.
+    pub(crate) snapshot_batches: std::sync::Arc<crate::snapshot_batch::SnapshotBatcher>,
     pub(crate) nudge: tokio::sync::mpsc::UnboundedSender<sync::SyncRequest>,
     pub(crate) epochs: std::sync::Arc<epoch::EpochManager>,
     /// The bucket, for an epoch proposal's member-side S3 probe.
@@ -459,6 +462,36 @@ impl constellation_net::PeerService for P2pBridge {
                 position_streams: position.streams_wire(),
                 gen,
             }
+        })
+    }
+
+    fn snapshot_batch_requested(
+        &self,
+        requester: u64,
+        req_id: u64,
+        rid: (u64, u32, u64),
+        items: Vec<constellation_net::SnapshotItem>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
+    {
+        Box::pin(async move {
+            tracing::debug!(
+                requester,
+                items = items.len(),
+                "snapshot batch forwarded to this node"
+            );
+            // The rid keys this node's dedup: a peer may only name its own.
+            if rid.0 != requester {
+                let outcome = constellation_net::SnapshotBatchOutcome::Failed(format!(
+                    "batch rid belongs to node {}, not the requester {requester}",
+                    rid.0
+                ));
+                return constellation_net::Payload::SnapshotBatchReply { req_id, outcome };
+            }
+            let outcome = self
+                .snapshot_batches
+                .execute(crate::snapshot_batch::rid_from_wire(rid), &items)
+                .await;
+            constellation_net::Payload::SnapshotBatchReply { req_id, outcome }
         })
     }
 

@@ -249,6 +249,9 @@ pub struct Engine {
     cache: Arc<DiskCache>,
     compression: CompressionSetting,
     snapshots: Arc<snapshot::SnapshotManager>,
+    /// Plan 32 Step 0.1: every snapshot row write, routed to the
+    /// root-lease holder.
+    snapshot_batches: Arc<crate::snapshot_batch::SnapshotBatcher>,
     staging_dir: PathBuf,
     staging_budget: Arc<staging::StagingBudget>,
     lease_mode: constellation_store_s3::LeaseMode,
@@ -677,9 +680,14 @@ impl Engine {
                             .map_err(|_| anyhow::anyhow!("metadata publish stopped"))?
                         {
                             Ok(commit) => return Ok(commit),
+                            // Plan 32 Step 0.1: snapshots now run at the
+                            // holder, which may be writing continuously; a
+                            // publish that kept deferring behind its writes
+                            // is retried the same way.
                             Err(e)
                                 if (e.contains(crate::mtree_publish::SPECULATION_OUTSTANDING)
-                                    || e.contains("speculation outstanding"))
+                                    || e.contains("speculation outstanding")
+                                    || e.contains(crate::mtree_publish::PUBLISH_DEFERRED))
                                     && waited < 100 =>
                             {
                                 waited += 1;
@@ -1057,7 +1065,24 @@ impl Engine {
                 .context("adopting the root directory owner")?;
         }
         phase(&on_phase, "starting the node's background tasks");
+        let snapshot_batches = Arc::new(crate::snapshot_batch::SnapshotBatcher::new(
+            node_id,
+            meta.clone(),
+            snapshots.clone(),
+            Arc::new(crate::snapshot_batch::EngineBatchHost {
+                node_id,
+                lease: lease_view.clone(),
+                sync_tx: sync_tx.clone(),
+                store: store.inner().clone(),
+                lease_mode,
+                peers: peers.clone(),
+                next_req: std::sync::atomic::AtomicU64::new(1),
+            }),
+            forward.clone(),
+            read_only_member,
+        ));
         let bridge = Arc::new(crate::p2p::P2pBridge {
+            snapshot_batches: snapshot_batches.clone(),
             node_id,
             nudge: sync_tx.clone(),
             epochs: epochs.clone(),
@@ -1445,6 +1470,7 @@ impl Engine {
             cache,
             compression,
             snapshots,
+            snapshot_batches,
             staging_dir,
             staging_budget,
             lease_mode,
@@ -2028,6 +2054,14 @@ impl Engine {
     }
     pub fn snapshots(&self) -> &Arc<snapshot::SnapshotManager> {
         &self.snapshots
+    }
+    /// Plan 32 Step 0.1: snapshot creates, deletes and holds, executed at
+    /// the root-lease holder ([`crate::snapshot_batch`]). The scheduler
+    /// calls [`crate::snapshot_batch::SnapshotBatcher::submit`] directly,
+    /// with one rid per batch ([`crate::snapshot_batch::SnapshotBatcher::next_rid`])
+    /// kept across that batch's retries.
+    pub fn snapshot_batches(&self) -> &Arc<crate::snapshot_batch::SnapshotBatcher> {
+        &self.snapshot_batches
     }
     pub fn staging_budget(&self) -> &Arc<staging::StagingBudget> {
         &self.staging_budget

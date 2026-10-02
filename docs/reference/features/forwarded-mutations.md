@@ -21,6 +21,7 @@ holder's S3 inbox instead.
 - [Status and logs](#status-and-logs)
 - [Failure and fallback](#failure-and-fallback)
 - [The inbox: forwarding without P2P](#the-inbox-forwarding-without-p2p)
+- [Snapshot batches](#snapshot-batches)
 - [References](#references)
 
 ## Terminology
@@ -691,6 +692,88 @@ path, cluster locks are unavailable and a strict open tails S3 instead
 
 - `MAX_BATCH_BYTES` (1 MiB) is defined but not enforced; a batch is
   bounded by its op count (512).
+
+## Snapshot batches
+
+Snapshot rows are journaled metadata too — a create writes the
+`snaps/<id>.json` object and a `SnapCreate2` row, a delete removes the
+row and then the object, a hold writes a `SnapHold` row — so they can
+only reach the cluster from the root-lease holder. They do not go
+through `MutateRequest`: a create drains, ships and publishes a metadata
+commit first, which is work for the holder's sync task and its bucket,
+not an op the authority core sequences. Instead every snapshot row write
+is an item of a **snapshot batch** (plan 32 Step 0.1,
+`crates/engine/src/snapshot_batch.rs`), routed like a system op and
+never by moving the lease:
+
+| This node | The lease object | The batch |
+|---|---|---|
+| holds a usable root lease | — | executes here |
+| does not | names a live holder, and P2P is on here | uploads this node's own pending chunks (a batch with a create), then is sent to the holder as `SnapshotBatchRequest` |
+| does not | names a live holder, and P2P is off here | asks for the lease as every write in that mode does (`wanted_by`, cooperative handover) and executes here once it has it |
+| does not | names nobody, an expired or released lease, or this node | acquires the free lease and executes here |
+
+A live holder is never preempted while a peer path to it exists. A
+forward that fails (the holder unreachable or not dialable, a transport
+error, `CONSTELLATION_SNAPSHOT_FORWARD_TIMEOUT_MS`, the holder answering
+`NotHolder` because it released meanwhile) is the caller's error;
+nothing falls back to acquiring — the scheduler retries on its next
+tick. **P2P off is a different case**: with no peer path at all
+(`Peers::disabled()`, an S3-only cluster) there is nothing to forward
+to, and a non-holder writes nothing in that mode without the lease, so a
+snapshot operation takes the old route: `Acquire` registers in
+`wanted_by`, the call fails "held by another node" while the holder
+still holds, the holder hands over at its next round, and a retry runs
+the batch locally — exactly what snapshots did before batches. (The S3
+inbox, M13, is not used for snapshot batches.)
+
+Before a forwarded batch that creates a snapshot, the requester drains
+its own pending chunk uploads (`SyncRequest::DrainInode { ino: 0 }`, all
+of them: chunks are not indexed by subtree). Its writes reach the
+holder as forwarded rows whose chunks only it has, and the holder's
+drain cannot ship those rows until the chunks are in S3; this is what
+the requester's own `Barrier` did when it took the lease. A drain
+failure is the caller's error, before anything is forwarded.
+
+`snapshot create`, `snapshot delete` and `snapshot hold`/`release` all
+take this path; `clone` still takes the lease and a barrier
+(`acquire_namespace_barrier`), and `quota set` takes the lease alone.
+
+`SnapshotBatchRequest { requester, req_id, rid, items }` carries the
+items (`Create`, `Delete`, `Hold`) as typed postcard data, and
+`SnapshotBatchReply { req_id, outcome }` answers `Done(results)`,
+`NotHolder` or `Failed(reason)`; per-item results are `Created` (with
+the recorded row), `Skipped`, `AlreadyExists`, `Deleted`, `NotFound`,
+`HoldSet` (the row), `Refused` and `DeletedObjectRemains` (the row is
+deleted but deleting the `snaps/` object failed; `snapshot delete`
+reports it as an error, as before batches, and the orphan object is left
+to plan 32 §0.3's reconciliation). Both were appended at the end of
+`Payload`. The executing holder drains what `Barrier` drains for each
+distinct create path, forces **one** publish for the whole batch, then
+runs the items in order.
+
+**Exactly once.** The rid is allocated once per batch
+(`next_system_rid`) and reused by every retry. The executing node keeps
+the last 1024 batch results by rid and answers a duplicate from them
+(batches execute one at a time there, so a duplicate that arrives while
+its original runs waits for it). A retry that crosses a holder change
+reaches a node without that memory; the `snaps/` create-if-absent is the
+backstop — the retried create finds its own object and answers
+`AlreadyExists` (a manual `snapshot create` reports that as "already
+exists", plan 32's scheduler as success), a retried delete finds no row
+(`NotFound`), and a hold is idempotent. A batch with an item refused
+because the executor lost the lease mid-batch (`Refused` starting "this
+node lost the root write lease") is not kept: that item did not run, and
+the retry under the same rid runs it. Callers that retry use
+`SnapshotBatcher::submit(rid, items)` with one rid from `next_rid()`;
+the control-protocol commands allocate one per request.
+
+**Inside a delegated subtree** the drain is the root holder's own
+`Barrier`: it ships the root's journal, which holds whatever the
+delegate has streamed to the root, and sends the delegate nothing. A
+snapshot of a delegated subtree therefore freezes the delegate's writes
+as of its last streamed batch (pinned by the authority core test
+`a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate`).
 
 ## References
 

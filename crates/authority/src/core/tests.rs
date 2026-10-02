@@ -8789,3 +8789,95 @@ mod portable_codes {
         }
     }
 }
+
+/// Plan 32 Step 0.1 (chunk 32-m0a) records what a snapshot's drain
+/// reaches inside a delegated subtree, without redesigning delegations:
+/// the root holder's `Barrier` for a directory node 2 holds a write
+/// delegation on is an ordinary round — upload, ship this node's journal
+/// — and completes without a single message to the delegate. So what the
+/// delegate has executed but not yet streamed to the root (its stream
+/// tail) is not drained: a snapshot of a delegated subtree freezes the
+/// root's replica as of the delegate's last streamed batch.
+#[test]
+fn a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate() {
+    let (mut h, dir) = root_with_dir();
+    crate::replica::Replica::apply_segment(
+        &h.meta,
+        2,
+        1,
+        0,
+        &[],
+        &[],
+        &[LogRecord::Delegate {
+            dir,
+            node: 2,
+            gen: 1,
+            designated: false,
+            range: (0, 0),
+        }],
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    assert!(
+        h.core
+            .deleg_view()
+            .gens
+            .iter()
+            .any(|&(d, node, ..)| d == dir && node == 2),
+        "the delegation is live at the root: {:?}",
+        h.core.deleg_view()
+    );
+    let barrier = OpId(1 << 50);
+    let mut queue: std::collections::VecDeque<Event> = [Event::Control {
+        op: barrier,
+        req: Control::Barrier { ino: Some(dir) },
+    }]
+    .into();
+    let mut to_delegate = Vec::new();
+    let mut done = None;
+    for _ in 0..200 {
+        let Some(event) = queue.pop_front() else {
+            break;
+        };
+        let out = h.step(event);
+        for (to, msg) in sends(&out) {
+            if to == 2 {
+                to_delegate.push(format!("{msg:?}"));
+            }
+        }
+        for action in &out {
+            match action {
+                Action::ControlDone { op, result } if *op == barrier => done = Some(result.clone()),
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::Poll,
+                    ..
+                } => queue.push_back(Event::Timer { id: *id }),
+                Action::UploadDirtyChunks { op, .. } => queue.push_back(Event::UploadsDone {
+                    op: *op,
+                    result: UploadResult::Done { held: 0 },
+                }),
+                Action::S3 { op, req } => {
+                    let result = match req {
+                        S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                        S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                        S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                        S3Op::HeartbeatRead => S3Result::Heartbeats(Ok(Vec::new())),
+                        _ => continue,
+                    };
+                    queue.push_back(Event::S3 { op: *op, result });
+                }
+                _ => {}
+            }
+        }
+        if done.is_some() {
+            break;
+        }
+    }
+    assert_eq!(done, Some(Ok(ControlOk::Done)), "the barrier completes");
+    assert!(
+        to_delegate.is_empty(),
+        "the barrier asked the delegate for something: {to_delegate:?}"
+    );
+}

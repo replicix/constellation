@@ -1235,7 +1235,8 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | PromiseRequest { requester, .. }
         | LockRequest { requester, .. }
         | LockTest { requester, .. }
-        | ChunkHandoff { requester, .. } => *requester,
+        | ChunkHandoff { requester, .. }
+        | SnapshotBatchRequest { requester, .. } => *requester,
         ChunksDurable { from, .. }
         | DelegateStream { from, .. }
         | DelegRenew { from, .. }
@@ -1363,6 +1364,16 @@ async fn handle_stream<S: PeerService>(
                 None
             }
         }
+        Payload::SnapshotBatchRequest {
+            requester,
+            req_id,
+            rid,
+            items,
+        } => Some(
+            service
+                .snapshot_batch_requested(requester, req_id, rid, items)
+                .await,
+        ),
         Payload::ChunksDurable { from, hashes } => {
             // Only the node that forwarded the chunks as pending speaks
             // for them, never a peer on its behalf.
@@ -1656,6 +1667,7 @@ async fn handle_stream<S: PeerService>(
         | Payload::LockRenewed { .. }
         | Payload::LockTestReply { .. }
         | Payload::ChunkHandoffReply { .. }
+        | Payload::SnapshotBatchReply { .. }
         | Payload::Ok { .. } => None,
     };
     let served_us = t0.elapsed().as_micros() as u64;

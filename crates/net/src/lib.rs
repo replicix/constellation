@@ -54,7 +54,8 @@ pub use handoff::{handle_request, interpret_reply, Handoff, RequestOutcome};
 pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
 pub use message::{
     ChunkDecline, ChunkStatus, EpochCarrier, EpochClaim, LockOutcomeWire, LockRenewResultWire,
-    LockRenewWire, LockTestOutcomeWire, Payload, Signed, ALPN,
+    LockRenewWire, LockTestOutcomeWire, Payload, Signed, SnapshotBatchOutcome, SnapshotItem,
+    SnapshotItemResult, SnapshotRowWire, ALPN,
 };
 pub use paths::PathSummary;
 pub use peers::{run_gossip, Peer, PeerEnrollment, Peers, Refresher};

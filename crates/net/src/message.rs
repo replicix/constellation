@@ -602,6 +602,27 @@ pub enum Payload {
         req_id: u64,
         uploaded: bool,
     },
+    // ---- Plan 32 Step 0.1: snapshot rows at the root-lease holder
+    // (appended: postcard encodes the variant index, so a new variant
+    // anywhere but the end would renumber every one after it) ----
+    /// A non-holder asks the root-lease holder to execute a snapshot
+    /// batch: every snapshot row write (create, delete, hold) goes
+    /// through here, so taking, deleting or holding a snapshot never
+    /// moves the write lease. Answered by [`Payload::SnapshotBatchReply`].
+    SnapshotBatchRequest {
+        requester: u64,
+        req_id: u64,
+        /// The batch's exactly-once identity (`constellation_meta::Rid`
+        /// as a tuple, as in [`Payload::MutateRequest`]), allocated once
+        /// and kept across every retry: the holder answers a duplicate
+        /// from the results it kept, without executing it again.
+        rid: (u64, u32, u64),
+        items: Vec<SnapshotItem>,
+    },
+    SnapshotBatchReply {
+        req_id: u64,
+        outcome: SnapshotBatchOutcome,
+    },
 }
 
 /// Plan 30 §M14: `constellation_authority::LockOutcome` on the wire.
@@ -919,6 +940,81 @@ mod tests {
         );
     }
 
+    /// Plan 32 Step 0.1: the snapshot batch variants are appended after
+    /// every existing one (postcard encodes the variant index, so the
+    /// earlier variants keep theirs), and both round-trip a signature.
+    #[test]
+    fn snapshot_batch_variants_are_appended_and_round_trip() {
+        let tag = |payload: &Payload| postcard::to_allocvec(payload).unwrap()[0];
+        let last_before = tag(&Payload::ChunkHandoffReply {
+            req_id: 0,
+            uploaded: false,
+        });
+        let request = Payload::SnapshotBatchRequest {
+            requester: 2,
+            req_id: 9,
+            rid: (2, u32::MAX, 1 << 32 | 7),
+            items: vec![
+                SnapshotItem::Create {
+                    path: "/vol".into(),
+                    name: "auto-20260928T1405Z".into(),
+                    origin: 1,
+                    policy_ino: 42,
+                    creator: 2,
+                    held: false,
+                    held_by: None,
+                    skip_if_unchanged_since: Some("mtree:3:00:42".into()),
+                },
+                SnapshotItem::Delete {
+                    id: "abc".into(),
+                    force: false,
+                },
+                SnapshotItem::Hold {
+                    id: "abc".into(),
+                    held: true,
+                    by: Some("user:op".into()),
+                    force: false,
+                },
+            ],
+        };
+        let reply = Payload::SnapshotBatchReply {
+            req_id: 9,
+            outcome: SnapshotBatchOutcome::Done(vec![
+                SnapshotItemResult::Created {
+                    id: "abc".into(),
+                    seq: 4,
+                    root_hash: "mtree:4:00:42".into(),
+                    row: SnapshotRowWire {
+                        id: "abc".into(),
+                        held_by: Some("csi:x".into()),
+                        refer_bytes: Some(9),
+                        ..Default::default()
+                    },
+                },
+                SnapshotItemResult::Skipped,
+                SnapshotItemResult::AlreadyExists { id: "abc".into() },
+                SnapshotItemResult::Deleted,
+                SnapshotItemResult::NotFound,
+                SnapshotItemResult::HoldSet {
+                    row: SnapshotRowWire::default(),
+                },
+                SnapshotItemResult::Refused {
+                    reason: "held".into(),
+                },
+                SnapshotItemResult::DeletedObjectRemains {
+                    reason: "503".into(),
+                },
+            ]),
+        };
+        assert_eq!(tag(&request), last_before + 1);
+        assert_eq!(tag(&reply), last_before + 2);
+        let k = key();
+        for payload in [request, reply] {
+            let signed = Signed::new(&k, &payload).unwrap();
+            assert_eq!(signed.verify().unwrap().1, payload);
+        }
+    }
+
     #[test]
     fn oversized_frame_is_refused() {
         let k = key();
@@ -1148,4 +1244,106 @@ mod tests {
         let est = wire_len(&payload);
         assert!(est.abs_diff(real) <= 8, "estimate {est} vs real {real}");
     }
+}
+
+/// Plan 32 Step 0.1: one snapshot row operation of a
+/// [`Payload::SnapshotBatchRequest`]. Plain data, so the engine's
+/// executor and the wire share one definition
+/// (`constellation_engine::snapshot_batch` re-exports it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotItem {
+    /// Take `path@name`. `origin`/`policy_ino`/`creator`/`held`/`held_by`
+    /// are the row's plan 32 §0.4 fields; `creator` is the node that
+    /// asked, not the holder that executes.
+    Create {
+        path: String,
+        name: String,
+        origin: u8,
+        policy_ino: u64,
+        creator: u64,
+        held: bool,
+        held_by: Option<String>,
+        /// An encoded `SnapshotRoot` (`mtree:<seq>:<root>:<ino>`): skip
+        /// the snapshot when the subtree has not changed since that one
+        /// (plan 32 Step 3.4).
+        skip_if_unchanged_since: Option<String>,
+    },
+    /// Delete snapshot `id`; a held one only with `force`.
+    Delete { id: String, force: bool },
+    /// Set or release snapshot `id`'s retention hold, under the owner
+    /// rule of plan 32 §0.4 (`force` overrides it).
+    Hold {
+        id: String,
+        held: bool,
+        by: Option<String>,
+        force: bool,
+    },
+}
+
+/// Plan 32 Step 0.1: one item's result, in item order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotItemResult {
+    /// The snapshot exists now: its `snaps/` object and its row. `row`
+    /// is the row as recorded, so a requester need not wait for its
+    /// replica to hear of it.
+    Created {
+        id: String,
+        seq: u64,
+        root_hash: String,
+        row: SnapshotRowWire,
+    },
+    /// The subtree did not change since `skip_if_unchanged_since`:
+    /// nothing written.
+    Skipped,
+    /// The `snaps/` object already exists (the name is taken — by this
+    /// same batch on an earlier holder, when a retry crossed a holder
+    /// change). Nothing written.
+    AlreadyExists {
+        id: String,
+    },
+    Deleted,
+    NotFound,
+    /// The hold row as now recorded.
+    HoldSet {
+        row: SnapshotRowWire,
+    },
+    /// Refused or failed; nothing (more) written for this item.
+    Refused {
+        reason: String,
+    },
+    /// A delete removed the row, but deleting its `snaps/` object
+    /// failed: the snapshot is gone from every listing, and the object
+    /// is an orphan (plan 32 §0.3's reconciliation removes it). The
+    /// caller reports `reason` as an error, as before batches.
+    DeletedObjectRemains {
+        reason: String,
+    },
+}
+
+/// `constellation_meta::SnapshotRow` on the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRowWire {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub root_hash: String,
+    pub created_unix_ms: i64,
+    pub origin: u8,
+    pub policy_ino: u64,
+    pub held: bool,
+    pub creator: u64,
+    pub held_by: Option<String>,
+    pub refer_bytes: Option<u64>,
+}
+
+/// Plan 32 Step 0.1: how a holder answered a snapshot batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotBatchOutcome {
+    /// Executed (now, or earlier under the same rid): per-item results.
+    Done(Vec<SnapshotItemResult>),
+    /// This node does not hold the root lease; nothing executed.
+    NotHolder,
+    /// The batch could not run (its drain or its publish failed);
+    /// nothing executed. The requester may retry under the same rid.
+    Failed(String),
 }
