@@ -31360,3 +31360,68 @@ M2's `policy set/show/ls/rm/pause/resume` and the xattr gate (the
 `SnapshotPolicyCommand` group is where they go), the scheduler (M3), expiry
 (M4), sizes (M5), the UI (M6). `snapshot.policy.simulate` has no CLI verb: the
 brief asks for `check --simulate`, and the timeline is the web UI's.
+
+## Fix: `git-under-flock-causal`'s oracle and git's automatic maintenance
+
+Chunk `git-flock-causal`. On the EC2 build host the scenario failed on a
+clean main (`fe32940`): "reader c: N publications visible before an object
+they depend on" (2 of 2 runs here, 3 and 54 violations; several more
+today). Harness-only fix; no product code changes.
+
+### Root cause (oracle, not product)
+
+The host's git is 2.55 (installed 2026-10-01). After a commit it starts
+`git maintenance run --auto --detach`, which repacks the loose objects
+(`repack -d -l --cruft --write-midx`: packs plus a multi-pack-index) and
+deletes the loose copies. That happens in the background, outside the
+turn lock, on the committing node. The reader decided visibility by
+`stat`ing `objects/xx/<oid>` only, so every packed object read as
+"missing". A diagnostic run confirmed it for each violation: `git cat-file
+-t <missing oid>` answered `blob`/`commit`, the repository had 8-11 packs,
+and the loose name was absent from `readdir`. The same happens on a local
+disk (40 commits of this shape: 14 packs, 0 loose objects). No causal
+order was broken. The reflog and ref pointed at objects git could read.
+A bisect over main is meaningless: the trigger is the host's git, not a
+commit.
+
+The run also showed a second oracle gap. A reader killed in the middle of
+a check (`mark_dead`, then `kill -9`) stats an empty mountpoint, and
+that also reads as "missing".
+
+### Fix
+
+- `GIT_CONFIG` (every git command in `gitflock.rs`): `maintenance.auto=false`
+  and `gc.auto=0`. The workloads stay as designed: loose objects written
+  under the lock, with no repack running on one node while the other
+  commits. `git-under-flock-gc` still runs `git gc` explicitly, under the
+  lock.
+- `check_publication` counts an object as visible if it is loose *or* in a
+  pack (`missing_from_packs`, a `cat-file --batch-check`, run only when a
+  pack index exists). A check that the reader's own mount restart overlapped
+  (the `ALIVE` file's inode changed or vanished) and that saw nothing
+  missing on a live mount returns `Interrupted`, and the commit is checked
+  again on the new mount. Findings carry a UTC timestamp.
+- Tests (`gitflock::tests`): a commit under `GIT_CONFIG` starts no
+  maintenance (`GIT_TRACE`) while an unpinned one does, and packed+pruned
+  objects count as visible. It fails with `maintenance.auto=true`. A dead
+  reader mount gives `Interrupted`, and a live one gives a violation.
+
+### Found, not fixed here
+
+- **P2P stalls when a local interface vanishes.** In 1 of 10 runs, a
+  committer's `create` forward to the root went unanswered for 120 s
+  (`Forwarded->1`/`Backoff` loop), past the 90 s FUSE stall threshold. The
+  root saw the delegate as silent, and the turn lock's recall went
+  unanswered and was outwaited. In a diagnostic run, a 66 s stall had the
+  same shape. Both started within 10 ms of another agent's docker bridge
+  being removed (`br-eeeb50ce4974` at 03:16:12.518 vs the op at
+  03:16:12.509; `br-c4f6e561eff8` at 02:45:06.95 vs 02:45:06.948). This
+  host removes about one bridge every 5 s, and each daemon advertises one
+  direct address per bridge (8 here). When the vanished address carried
+  the selected QUIC path, iroh logged `could not close last open path` and
+  the link stayed dead for minutes. This belongs to the P2P layer, not to
+  this scenario.
+- **Reader lock starvation**: in one pre-fix run the reader's `flock` waited
+  ~280 s while the two committers alternated. The root logged repeated
+  "recall went unanswered; outwaited it" for the reader's grant. That run
+  also falls inside bridge churn.

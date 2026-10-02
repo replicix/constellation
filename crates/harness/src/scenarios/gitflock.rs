@@ -49,9 +49,12 @@
 //!   before it appends the reflog line, and appends the reflog before it
 //!   renames the ref, so a reader that sees the publication must see the
 //!   objects (causal order: no effect visible before what it follows).
-//!   The ref must never regress either. Every `GIT_FLOCK_FSCK_EVERY_S`
-//!   (20) the reader takes the turn lock, checks that the ref is the last
-//!   acknowledged commit, and runs `git fsck --full`. The lock matters:
+//!   An object counts as visible loose or in a pack; a look that the
+//!   reader's own mount restart overlapped is not a finding (the commit
+//!   is checked again on the new mount). The ref must never regress
+//!   either. Every `GIT_FLOCK_FSCK_EVERY_S` (20) the reader takes the
+//!   turn lock, checks that the ref is the last acknowledged commit, and
+//!   runs `git fsck --full`. The lock matters:
 //!   fsck scans the object directories first and reads the refs and
 //!   reflogs afterwards, so a commit that lands in between makes it
 //!   report `missing blob/tree/commit` and `invalid reflog entry` on any
@@ -74,6 +77,10 @@
 //! `GIT_FLOCK_MAX_TURN_S` (b2b/rounds/causal: a turn longer than this
 //! fails the run; default 30), `GIT_FLOCK_FSCK_EVERY_S`,
 //! `GIT_FLOCK_READER_RESTARTS`.
+//!
+//! Git runs with a fixed configuration ([`GIT_CONFIG`]): an empty `HOME`,
+//! no system config, and no automatic maintenance (a detached repack
+//! outside the turn lock is not the workload).
 
 use super::m9::{c_deny_path, node_id};
 use super::{eventually, journal_drained, lease_of, setup, ts, wait_for_p2p};
@@ -199,8 +206,30 @@ fn git_timeout() -> Duration {
     Duration::from_secs(env_u64("GIT_FLOCK_GIT_TIMEOUT_S", 120))
 }
 
-/// `git -C repo args...` with a clean, fixed configuration, bounded by
-/// [`git_timeout`].
+/// The configuration every git command here runs with (on top of an empty
+/// `HOME` and no system config). Automatic maintenance is off: a commit
+/// starts `git maintenance run --auto --detach`, which in recent git (2.55
+/// on the EC2 build host) packs the loose objects (packs plus a
+/// multi-pack-index) and deletes the loose copies — in the background,
+/// outside the turn lock, on whichever node committed. The workloads are
+/// about loose objects written under the lock (`tmp_obj_*`, `link`, `unlink`, refs through `*.lock`); a repack
+/// running on one node while the other commits is a different workload
+/// (`git-under-flock-gc` runs `git gc` explicitly, under the lock), and a
+/// reader stat-ing loose objects would see the packed ones vanish (git
+/// 2.55: 14 packs and no loose object after 40 commits on a local disk).
+const GIT_CONFIG: [&str; 8] = [
+    "-c",
+    "user.name=gitflock",
+    "-c",
+    "user.email=gitflock@test",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "gc.auto=0",
+];
+
+/// `git -C repo args...` with a clean, fixed configuration ([`GIT_CONFIG`]),
+/// bounded by [`git_timeout`].
 fn git(repo: &Path, home: &Path, args: &[&str]) -> Result<std::process::Output> {
     let (repo, home) = (repo.to_path_buf(), home.to_path_buf());
     let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -209,7 +238,7 @@ fn git(repo: &Path, home: &Path, args: &[&str]) -> Result<std::process::Output> 
         Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["-c", "user.name=gitflock", "-c", "user.email=gitflock@test"])
+            .args(GIT_CONFIG)
             .args(&owned)
             .env("HOME", &home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -559,7 +588,7 @@ fn git_within(
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["-c", "user.name=gitflock", "-c", "user.email=gitflock@test"])
+        .args(GIT_CONFIG)
         .args(args)
         .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -603,6 +632,23 @@ fn git_within(
     })
 }
 
+/// UTC time of day (`HH:MM:SS.mmmZ`), to line a finding up with the
+/// daemons' logs.
+fn wall() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let s = ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}Z",
+        (s / 3600) % 24,
+        (s / 60) % 60,
+        s % 60,
+        ms % 1000
+    )
+}
+
 fn is_oid(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -615,6 +661,79 @@ fn object_visible(git_dir: &Path, oid: &str) -> std::io::Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// Which of `oids` git cannot find (`cat-file --batch-check`): what is
+/// not loose may be in a pack. Only asked when the repository has a pack
+/// index at all, which with [`GIT_CONFIG`] only `git-under-flock-gc`'s
+/// `git gc` writes.
+fn missing_from_packs(
+    repo: &Path,
+    git_dir: &Path,
+    home: &Path,
+    oids: &[String],
+) -> Result<Vec<String>> {
+    let has_pack = std::fs::read_dir(git_dir.join("objects/pack"))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().ends_with(".idx"))
+        })
+        .unwrap_or(false);
+    if !has_pack || oids.is_empty() {
+        return Ok(oids.to_vec());
+    }
+    let (repo, home, input) = (
+        repo.to_path_buf(),
+        home.to_path_buf(),
+        oids.join("\n") + "\n",
+    );
+    let out = bounded(
+        "git cat-file --batch-check",
+        Duration::from_secs(60),
+        move || {
+            use std::io::Write;
+            use std::process::Stdio;
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(GIT_CONFIG)
+                .args(["cat-file", "--batch-check=%(objectname)"])
+                .env("HOME", &home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            // Fed from a thread of its own: git answers while it reads,
+            // and a list longer than the pipe would otherwise block both
+            // ends. Stdin closes when the writer drops it.
+            let mut stdin = child.stdin.take().unwrap();
+            let feeder = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+            let out = child.wait_with_output()?;
+            feeder.join().unwrap_or(Ok(()))?;
+            Ok::<_, std::io::Error>(out)
+        },
+    )??;
+    if !out.status.success() {
+        bail!(
+            "cat-file --batch-check: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // A missing object is answered `<oid> missing`.
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_suffix(" missing"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Which incarnation of the mount `mnt` is: the inode of its [`ALIVE`]
+/// file, which `mount_live` creates anew on every mount and `mark_dead`
+/// removes before a kill. `None` while the mount is dead.
+fn mount_incarnation(mnt: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(mnt.join(ALIVE)).ok().map(|m| m.ino())
 }
 
 /// Everything commit `oid` needs: itself, its tree, every tree and blob
@@ -663,71 +782,113 @@ fn closure_of(repo: &Path, home: &Path, oid: &str) -> Result<Vec<String>> {
     Ok(objects)
 }
 
+/// What one commit's check found.
+enum Check {
+    /// Every object it needs was visible.
+    Clean,
+    /// A publication visible before what it depends on.
+    Violation(String),
+    /// The reader's own mount was killed or remounted before anything was
+    /// seen missing on a live mount: a dead mount's empty mountpoint says
+    /// nothing about causal order. The commit is checked again.
+    Interrupted,
+}
+
 /// The commit `oid`, named by `via` (a reflog line, the ref), must have
-/// every object it depends on visible. What is missing is polled until
-/// it appears (how long that took is part of the finding) or 15 s pass.
+/// every object it depends on visible — loose or packed. What is missing
+/// is polled until it appears (how long that took is part of the
+/// finding) or 15 s pass. Only what a live mount showed counts: a look
+/// that the mount's death or remount overlapped is not a finding.
 fn check_publication(
+    mnt: &Path,
     repo: &Path,
     git_dir: &Path,
     home: &Path,
     oid: &str,
     via: &str,
-) -> Option<String> {
+) -> Check {
     let t = Instant::now();
     let mut first: Option<String> = None;
     loop {
+        let incarnation = mount_incarnation(mnt);
         let problem = match object_visible(git_dir, oid) {
-            Ok(false) => Some(format!("the commit object {oid} is missing")),
             Err(e) => Some(format!("the commit object {oid}: {e}")),
-            Ok(true) => match closure_of(repo, home, oid) {
-                Err(e) => Some(format!("{e:#}")),
-                Ok(objects) => {
-                    let mut missing = Vec::new();
-                    let mut errors = Vec::new();
-                    for o in &objects {
-                        match object_visible(git_dir, o) {
-                            Ok(true) => {}
-                            Ok(false) => missing.push(o.clone()),
-                            Err(e) => errors.push(format!("{o}: {e}")),
+            Ok(loose) => {
+                let commit_missing = if loose {
+                    Ok(Vec::new())
+                } else {
+                    missing_from_packs(repo, git_dir, home, &[oid.to_string()])
+                };
+                match commit_missing {
+                    Err(e) => Some(format!("{e:#}")),
+                    Ok(m) if !m.is_empty() => Some(format!("the commit object {oid} is missing")),
+                    Ok(_) => match closure_of(repo, home, oid) {
+                        Err(e) => Some(format!("{e:#}")),
+                        Ok(objects) => {
+                            let mut not_loose = Vec::new();
+                            let mut errors = Vec::new();
+                            for o in &objects {
+                                match object_visible(git_dir, o) {
+                                    Ok(true) => {}
+                                    Ok(false) => not_loose.push(o.clone()),
+                                    Err(e) => errors.push(format!("{o}: {e}")),
+                                }
+                            }
+                            let missing = missing_from_packs(repo, git_dir, home, &not_loose)
+                                .unwrap_or_else(|e| {
+                                    errors.push(format!("{e:#}"));
+                                    not_loose
+                                });
+                            if missing.is_empty() && errors.is_empty() {
+                                None
+                            } else {
+                                Some(format!(
+                                    "{} of the {} objects it needs missing{}{}",
+                                    missing.len(),
+                                    objects.len(),
+                                    missing
+                                        .iter()
+                                        .take(3)
+                                        .map(|m| format!(" {m}"))
+                                        .collect::<String>(),
+                                    errors
+                                        .iter()
+                                        .take(3)
+                                        .map(|e| format!("; {e}"))
+                                        .collect::<String>()
+                                ))
+                            }
                         }
-                    }
-                    if missing.is_empty() && errors.is_empty() {
-                        None
-                    } else {
-                        Some(format!(
-                            "{} of the {} objects it needs missing{}{}",
-                            missing.len(),
-                            objects.len(),
-                            missing
-                                .iter()
-                                .take(3)
-                                .map(|m| format!(" {m}"))
-                                .collect::<String>(),
-                            errors
-                                .iter()
-                                .take(3)
-                                .map(|e| format!("; {e}"))
-                                .collect::<String>()
-                        ))
-                    }
+                    },
                 }
-            },
+            }
         };
+        if incarnation.is_none() || mount_incarnation(mnt) != incarnation {
+            return match first {
+                None => Check::Interrupted,
+                Some(p) => Check::Violation(format!(
+                    "{via} named {oid} with {p}; the reader's mount was restarted {:?} later, before it resolved",
+                    t.elapsed()
+                )),
+            };
+        }
         match problem {
             None => {
-                return first.map(|p| {
-                    format!(
+                return match first {
+                    None => Check::Clean,
+                    Some(p) => Check::Violation(format!(
                         "{via} named {oid} with {p}; all visible after {:?}",
                         t.elapsed()
-                    )
-                });
+                    )),
+                };
             }
             Some(p) => {
+                let p = format!("{p} (at {})", wall());
                 if first.is_none() {
                     first = Some(p.clone());
                 }
                 if t.elapsed() > Duration::from_secs(15) {
-                    return Some(format!(
+                    return Check::Violation(format!(
                         "{via} named {oid} with {}; still {p} after {:?}",
                         first.unwrap(),
                         t.elapsed()
@@ -861,24 +1022,36 @@ fn reader(
                 if lines.len() < reflog_lines {
                     reflog_lines = 0;
                 }
+                let mut upto = lines.len();
                 for (k, line) in lines.iter().enumerate().skip(reflog_lines) {
                     let Some(oid) = line.split(' ').nth(1) else {
                         continue;
                     };
                     if is_oid(oid) && checked.insert(oid.to_string()) {
-                        log.lock().unwrap().checked += 1;
-                        if let Some(p) = check_publication(
+                        match check_publication(
+                            &mnt,
                             &repo,
                             &git_dir,
                             &home,
                             oid,
                             &format!("reflog line {}", k + 1),
                         ) {
-                            log.lock().unwrap().violations.push(format!("{name}: {p}"));
+                            Check::Clean => log.lock().unwrap().checked += 1,
+                            Check::Violation(p) => {
+                                let mut l = log.lock().unwrap();
+                                l.checked += 1;
+                                l.violations.push(format!("{name}: {p}"));
+                            }
+                            Check::Interrupted => {
+                                // Again from this line on the next mount.
+                                checked.remove(oid);
+                                upto = k;
+                                break;
+                            }
                         }
                     }
                 }
-                reflog_lines = lines.len();
+                reflog_lines = upto;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -893,10 +1066,18 @@ fn reader(
         let r = master_ref(&repo);
         if is_oid(&r) && last_ref.as_deref() != Some(r.as_str()) {
             if checked.insert(r.clone()) {
-                log.lock().unwrap().checked += 1;
-                if let Some(p) = check_publication(&repo, &git_dir, &home, &r, "refs/heads/master")
-                {
-                    log.lock().unwrap().violations.push(format!("{name}: {p}"));
+                match check_publication(&mnt, &repo, &git_dir, &home, &r, "refs/heads/master") {
+                    Check::Clean => log.lock().unwrap().checked += 1,
+                    Check::Violation(p) => {
+                        let mut l = log.lock().unwrap();
+                        l.checked += 1;
+                        l.violations.push(format!("{name}: {p}"));
+                    }
+                    Check::Interrupted => {
+                        checked.remove(&r);
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
                 }
             }
             if let Some(prev) = &last_ref {
@@ -1912,4 +2093,131 @@ fn verify(
         let _ = f.unmount();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repository on a local disk, committed to as the workloads do;
+    /// `None` when git is not installed.
+    fn repo_with_commits(commits: u64) -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+        Command::new("git").arg("--version").output().ok()?;
+        let dir = tempfile::tempdir().unwrap();
+        let (mnt, home) = (dir.path().join("mnt"), dir.path().join("home"));
+        let repo = mnt.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        git_ok(&repo, &home, &["init", "-q"]).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        for i in 0..commits {
+            campaign_edit(&repo, "t", i, &mut rng).unwrap();
+            git_ok(&repo, &home, &["add", "-A"]).unwrap();
+            git_ok(&repo, &home, &["commit", "-q", "-m", &format!("t-{i}")]).unwrap();
+        }
+        Some((dir, mnt, home))
+    }
+
+    fn has_pack(git_dir: &Path) -> bool {
+        std::fs::read_dir(git_dir.join("objects/pack"))
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().is_some_and(|x| x == "idx"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Git 2.55's automatic maintenance (a detached `git maintenance run
+    /// --auto` after each commit) packed the loose objects outside any
+    /// turn lock, and the causal reader then reported every packed object
+    /// as missing. `GIT_CONFIG` keeps git from starting it, and the
+    /// reader counts a packed object as visible.
+    #[test]
+    fn objects_stay_loose_and_packed_ones_count_as_visible() {
+        let Some((_dir, mnt, home)) = repo_with_commits(3) else {
+            eprintln!("git is not installed; skipped");
+            return;
+        };
+        let repo = mnt.join("repo");
+        let git_dir = repo.join(".git");
+        let commit = |config: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(config)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["commit", "-q", "--allow-empty", "-m", "traced"])
+                .env("HOME", &home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TRACE", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stderr).contains("maintenance run")
+        };
+        assert!(
+            !commit(&GIT_CONFIG),
+            "a commit started automatic maintenance"
+        );
+        // What the pin is for: unpinned, a commit starts it (git 2.29+).
+        assert!(commit(&[]), "an unpinned commit did not start maintenance");
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(mnt.join(ALIVE), b"").unwrap();
+        let head = git_ok(&repo, &home, &["rev-parse", "HEAD"]).unwrap();
+        assert!(matches!(
+            check_publication(&mnt, &repo, &git_dir, &home, &head, "test"),
+            Check::Clean
+        ));
+
+        // Packed and pruned: no loose copy left, yet every object is
+        // visible to git, and so to the check.
+        git_ok(&repo, &home, &["gc", "-q", "--prune=now"]).unwrap();
+        assert!(has_pack(&git_dir));
+        let objects = closure_of(&repo, &home, &head).unwrap();
+        assert!(objects.len() > 10);
+        assert!(objects
+            .iter()
+            .all(|o| !object_visible(&git_dir, o).unwrap()));
+        assert!(missing_from_packs(&repo, &git_dir, &home, &objects)
+            .unwrap()
+            .is_empty());
+        let absent = "0123456789abcdef0123456789abcdef01234567".to_string();
+        assert_eq!(
+            missing_from_packs(&repo, &git_dir, &home, std::slice::from_ref(&absent)).unwrap(),
+            vec![absent]
+        );
+        assert!(matches!(
+            check_publication(&mnt, &repo, &git_dir, &home, &head, "test"),
+            Check::Clean
+        ));
+    }
+
+    /// A look at a dead mount (the reader killed mid-check: its empty
+    /// mountpoint shows nothing) is not a causal violation; the commit is
+    /// checked again on the next mount.
+    #[test]
+    fn a_dead_reader_mount_interrupts_the_check() {
+        let Some((_dir, mnt, home)) = repo_with_commits(1) else {
+            eprintln!("git is not installed; skipped");
+            return;
+        };
+        let repo = mnt.join("repo");
+        let git_dir = repo.join(".git");
+        let head = git_ok(&repo, &home, &["rev-parse", "HEAD"]).unwrap();
+        // The objects vanish with the mount, and so does `ALIVE`.
+        std::fs::rename(&repo, mnt.join("elsewhere")).unwrap();
+        assert!(matches!(
+            check_publication(&mnt, &repo, &git_dir, &home, &head, "test"),
+            Check::Interrupted
+        ));
+        // On a live mount the same absence is a violation.
+        std::fs::write(mnt.join(ALIVE), b"").unwrap();
+        std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let t = Instant::now();
+        assert!(matches!(
+            check_publication(&mnt, &repo, &git_dir, &home, &head, "test"),
+            Check::Violation(_)
+        ));
+        assert!(t.elapsed() >= Duration::from_secs(15));
+    }
 }

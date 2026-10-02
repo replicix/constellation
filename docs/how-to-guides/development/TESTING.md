@@ -293,9 +293,10 @@ fresh node and checks every round's repository.
 workload with every node that does not commit reading through its own
 mount: a reader watches the reflog and `refs/heads/master` and, for
 every commit either names, checks that the commit object, its tree and
-every object under it are visible (git writes them all before the
-reflog line, and the reflog line before the ref rename, so a reader
-that sees the publication must see the objects); the ref must never
+every object under it are visible, loose or packed (git writes them all
+before the reflog line, and the reflog line before the ref rename, so a
+reader that sees the publication must see the objects; a look that the
+reader's own restart overlapped is redone on the new mount); the ref must never
 move to a commit that does not descend from the previous one; every
 `GIT_FLOCK_FSCK_EVERY_S` (20 s) the reader takes the turn lock, checks
 that the ref is the last acknowledged commit and runs `git fsck
@@ -309,6 +310,10 @@ its backup, the committers' turn checks (stale ref, overlapping,
 failed or slow turns) are then reported as under faults, not fatal.
 It needs 3–4 nodes (3 by default); with `GIT_FLOCK_COMMITTERS=last`
 the sequencer is a reader.
+Every git scenario runs git with an empty `HOME`, no system config and
+automatic maintenance off (`maintenance.auto=false`, `gc.auto=0`):
+recent git (2.55) repacks loose objects in a detached process after a
+commit, outside the turn lock, which is not the workload.
 `GIT_FLOCK_SECS` sets the duration (60 s; 150 s with faults, 180 s for
 b2b and causal, 90 s per round), `GIT_FLOCK_NODES` the node count (2–4),
 `GIT_FLOCK_COMMITTERS=last` makes the last two nodes commit (neither is
