@@ -2080,6 +2080,65 @@ unlock still go through — without the budget that queue deadlocks), and
 that a refused registration fails the session by name. `tests/wire.rs` stays the
 `/dev/fuse` socket-pair suite.
 
+## FUSE passthrough (plan 38 Z3)
+
+A Linux mount whose daemon holds `CAP_SYS_ADMIN`, on a kernel that offers
+`FUSE_PASSTHROUGH` (6.9+, `CONFIG_FUSE_PASSTHROUGH`), answers a read-only
+open of a single-chunk, cached, verified file with the chunk file itself
+(`FOPEN_PASSTHROUGH`); the kernel serves its reads. By default only a
+read-only mount (a snapshot view) asks for it; a writable mount needs
+`CONSTELLATION_FUSE_PASSTHROUGH=1`, which every scenario below but
+`passthrough-default-by-mount-mode` sets on its clients. Unprivileged runs never
+get it (`node.status` `fuse.mounts[].passthrough.unavailable_reason =
+no_cap_sys_admin`), so most lanes test the ordinary path and the
+passthrough scenarios need root:
+
+| Scenario | Asserts |
+|---|---|
+| `passthrough-eviction-while-open` | `fuse.mounts[].passthrough.opens` and `cache.open_pins` equal the open-descriptor count (1, 2, 1); the cache filled 3× past its budget and pruned to zero keeps the held chunk; after the close it is evicted |
+| `passthrough-remote-write-cto` | two nodes: A's passthrough handle keeps the bytes it was opened on after B rewrites the file; a fresh open on A sees B's bytes even with the old handle open; after the close a new open is passthrough on the new chunk; no passthrough read reaches A's daemon |
+| `passthrough-local-writer` | one mount: a read-write open of a passthrough-open file is `ETXTBSY` (`refused_opens`); a write-only open is served and every later open sees its write; the earlier passthrough handle keeps its bytes until closed |
+| `passthrough-odirect` | an `O_DIRECT` read of a passthrough-open file fetches every byte from the cache's block device although the page cache is warm (`/proc/thread-self/io` `read_bytes`), and neither it nor a buffered read reaches the daemon. Its work dir is under `CONSTELLATION_HARNESS_DISK_DIR` (default `/var/tmp`), which must not be tmpfs |
+| `passthrough-handover` | a passthrough handle held across `daemon --upgrade`: the new image counts it and holds its pin (a prune keeps the chunk), a new open of the file shares the handed-over backing id, the close releases both |
+| `passthrough-disabled-by-verify-always` | `--cache-verify always`: `enabled = false`, reason `cache_verify_always`, no pin, every read reaches the daemon — privileged or not (it requires nothing) |
+| `passthrough-default-by-mount-mode` | without the opt-in: a writable mount reports reason `writable_mount`, holds no passthrough handle and serves a read-write open beside a reader; a read-only mount of a snapshot of the same file negotiates passthrough (no reason), reads the bytes and answers a read-write open `EROFS` (it counts no passthrough open: snapshot files are not eligible yet, see plan 38 §3(c)) |
+
+All but `passthrough-disabled-by-verify-always` `require` `CAP_SYS_ADMIN` and `linux>=6.9` — `requires`
+entries that name a host capability rather than a binary
+(`suites::missing`) — and SKIP loudly without them (`requires CAP_SYS_ADMIN
+(run the harness as root)`). With both present a mount that does not get
+passthrough is a failure carrying its reason, not a skip. The kernel
+refuses a backing file on a stacked filesystem (`ELOOP`), so the harness's
+`TMPDIR` must not be overlayfs (the scenarios check and say so).
+
+```bash
+sudo env HOME=/var/tmp/harness-home PATH=$PATH CONSTELLATION_HARNESS_DOCKER_PREFIX=me-root \
+    target/release/harness run passthrough-eviction-while-open passthrough-remote-write-cto \
+    passthrough-local-writer passthrough-odirect passthrough-handover \
+    passthrough-disabled-by-verify-always passthrough-default-by-mount-mode
+```
+
+(Root and an unprivileged user cannot share a docker prefix: the prefix's
+lock file in `/tmp` is created by whoever runs first.)
+
+`crates/frontend-fuse/tests/wire.rs` covers the reply encoding without a
+kernel: an `Opened` with a backing on a session whose fake kernel offered
+`FUSE_PASSTHROUGH` is answered `FOPEN_PASSTHROUGH` with the backing id (the
+ioctls faked through `FuseFs::with_passthrough_ops`), later opens of the
+inode reuse it or are answered `FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO`, a
+read-write one is the view's own errno when the view refuses it and
+`ETXTBSY` (the view's handle released again) when it does not, the id is
+closed exactly once at the last
+release, and an ordinary handle or a failed registration falls back to the
+plain reply. `crates/frontend-fuse/src/passthrough.rs`'s unit tests cover
+the per-inode table (the kernel's one-I/O-mode-per-inode rule) and its
+handover round trip; the engine's `view::passthrough_tests` cover
+eligibility, the write-intent refusal, the pins and their re-pinning
+across a handover, plus the session's one-time probe registration
+(`backing_open` when the kernel refuses it). `CONSTELLATION_FUSE_PASSTHROUGH=0`
+turns it off for a whole run, read-only mounts included (the passthrough
+scenarios set `1` on their own clients, except the default-mode one).
+
 ## Cross-node `flock`/`fcntl` (plan 30 M14)
 
 `--locks cluster` (the default when P2P is on; `CONSTELLATION_LOCKS`)

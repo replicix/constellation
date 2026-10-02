@@ -1280,6 +1280,7 @@ dependencies = [
  "fuser",
  "libc",
  "postcard",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",

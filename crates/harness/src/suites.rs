@@ -16,14 +16,8 @@ use std::process::Command;
 /// is missing.
 pub const FUSE_URING: &str = "fuse-uring";
 
-/// Whether `requirement` is checked by [`unavailable`] rather than
-/// [`have`].
-pub fn is_platform_requirement(requirement: &str) -> bool {
-    requirement == FUSE_URING
-}
-
-/// Why a platform requirement is not met here, or `None` when it is (or
-/// when `requirement` is a host binary, which [`have`] checks).
+/// Why [`FUSE_URING`] is not met here, or `None` when it is (or when
+/// `requirement` is anything else, which [`missing`] checks).
 pub fn unavailable(requirement: &str) -> Option<String> {
     if requirement != FUSE_URING {
         return None;
@@ -88,6 +82,61 @@ fn fuse_uring_unavailable() -> Option<String> {
     }
 }
 
+/// A `requires` entry naming a host capability rather than a binary:
+/// the process must hold `CAP_SYS_ADMIN` (FUSE passthrough registers
+/// backing files with it, plan 38 Z3b).
+pub const CAP_SYS_ADMIN: &str = "CAP_SYS_ADMIN";
+/// A `requires` entry naming the kernel FUSE passthrough first shipped in.
+pub const LINUX_6_9: &str = "linux>=6.9";
+
+/// Why a scenario's `requires` entry is not met on this host, or `None`.
+/// A binary is looked up on `PATH`; [`FUSE_URING`], [`CAP_SYS_ADMIN`]
+/// and [`LINUX_6_9`] are checked as what they name. Either way the scenario SKIPs loudly,
+/// naming the reason.
+pub fn missing(req: &str) -> Option<String> {
+    match req {
+        FUSE_URING => fuse_uring_unavailable(),
+        CAP_SYS_ADMIN => (!has_cap_sys_admin())
+            .then(|| "requires CAP_SYS_ADMIN (run the harness as root)".to_string()),
+        LINUX_6_9 => {
+            let release = kernel_release();
+            (!kernel_at_least(&release, 6, 9))
+                .then(|| format!("requires Linux >= 6.9 (this is {release})"))
+        }
+        bin => (!have(bin)).then(|| format!("{bin} not installed")),
+    }
+}
+
+/// `CapEff` of this process holds `CAP_SYS_ADMIN` (bit 21).
+pub fn has_cap_sys_admin() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("CapEff:"))
+                .and_then(|h| u64::from_str_radix(h.trim(), 16).ok())
+        })
+        .is_some_and(|caps| caps & (1 << 21) != 0)
+}
+
+fn kernel_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "an unknown kernel".to_string())
+}
+
+/// `release` (`uname -r`) is at least `major.minor`.
+fn kernel_at_least(release: &str, major: u32, minor: u32) -> bool {
+    let mut parts = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    let (Some(a), Some(b)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    (a, b) >= (major, minor)
+}
+
 pub fn have(bin: &str) -> bool {
     Command::new("which")
         .arg(bin)
@@ -148,4 +197,18 @@ pub fn stress_ng(mnt: &Path, stressors: &[&str], timeout_s: u32) -> Result<()> {
         run(cmd, &format!("stress-ng {s}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_releases_compare_by_major_and_minor() {
+        assert!(kernel_at_least("7.3.0-0.rc4.fc46.x86_64", 6, 9));
+        assert!(kernel_at_least("6.9.0", 6, 9));
+        assert!(!kernel_at_least("6.8.12-300.fc40", 6, 9));
+        assert!(kernel_at_least("6.10.1", 6, 9));
+        assert!(!kernel_at_least("garbage", 6, 9));
+    }
 }

@@ -1,8 +1,9 @@
 //! Plan 38 §3(c): which opens are answered with the chunk file itself
 //! (`Opened::backing`), what the handle holds while it lives, and what it
 //! releases. Driven through the `Vfs` trait exactly as a frontend drives
-//! it — no kernel, no FUSE: the `FOPEN_PASSTHROUGH` wiring is the plan's
-//! next chunk, and everything asserted here is true without it.
+//! it — no kernel, no FUSE: the `FOPEN_PASSTHROUGH` wiring is the FUSE
+//! adapter's (plan 38 Z3b, `constellation-frontend-fuse`), and everything
+//! asserted here is true without it.
 
 use super::*;
 use constellation_fs_core::cache::{CacheVerify, Resident};
@@ -47,10 +48,10 @@ fn env_with(verify: CacheVerify, seed: impl FnOnce(&std::path::Path)) -> Env {
 }
 
 /// The view behind [`env_with`], before it is wrapped: a frontend that
-/// *consumes* `Opened::backing`. No real frontend declares that before
-/// plan 38 Z3b wires the FUSE reply (`FrontendCaps::passthrough`), and
-/// the engine offers nothing to a frontend that would drop it, so every
-/// test here says so explicitly.
+/// *consumes* `Opened::backing`. Linux FUSE only learns that it can at
+/// `FUSE_INIT` and says so through `Vfs::frontend_negotiated`, and the
+/// engine offers nothing to a frontend that would drop it, so every test
+/// here says so explicitly, the same way.
 fn fs_with(
     meta: Arc<Meta>,
     verify: CacheVerify,
@@ -64,6 +65,8 @@ fn fs_with(
             .with_verify(verify)
     });
     fs.caps.passthrough = true;
+    let caps = fs.caps.clone();
+    fs.frontend_negotiated(&caps);
     (fs, dir, cache)
 }
 
@@ -85,15 +88,15 @@ impl Env {
     }
 
     fn release(&self, ino: Ino) {
+        self.release_with(ino, OpenFlags::READ);
+    }
+
+    /// `release` of a handle opened with `flags` (the kernel sends the
+    /// handle's own flags, which is how write-intent handles are counted).
+    fn release_with(&self, ino: Ino, flags: OpenFlags) {
         Blocking::run(|r| {
-            self.fs.release(
-                &self.cx(OpKind::Release),
-                ino,
-                Fh(ino),
-                OpenFlags::READ,
-                None,
-                r,
-            )
+            self.fs
+                .release(&self.cx(OpKind::Release), ino, Fh(ino), flags, None, r)
         })
         .expect("release");
     }
@@ -209,7 +212,7 @@ fn a_frontend_that_cannot_consume_a_backing_file_is_not_offered_one() {
     });
     assert!(
         !fs.caps().passthrough,
-        "no frontend declares passthrough before plan 38 Z3b"
+        "Linux FUSE declares passthrough only once FUSE_INIT agreed it"
     );
     let e = Env {
         fs,
@@ -226,7 +229,7 @@ fn a_frontend_that_cannot_consume_a_backing_file_is_not_offered_one() {
     // `node.status` says so, and why (plan 38 §5).
     let status = e.fs.passthrough_status();
     assert!(!status.enabled && status.opens == 0);
-    assert!(status.unavailable_reason.unwrap().contains("frontend"));
+    assert_eq!(status.unavailable_reason, Some("frontend"));
     // Reads go the ordinary way, exactly as before this plan.
     assert_eq!(e.read(ino, 0, 4096), data);
     e.release(ino);
@@ -250,8 +253,164 @@ fn a_write_intent_open_is_not_offered_a_backing_file() {
         );
         assert_eq!(e.cache.open_pin_count(&hash), 0, "{flags:?} took a pin");
         assert_eq!(e.fs.passthrough_handles(ino), 0);
-        e.release(ino);
+        e.release_with(ino, flags);
     }
+    // Every write-intent handle closed: the next read-only open is eligible.
+    assert!(e.open_ro(ino).backing.is_some());
+    e.release(ino);
+}
+
+/// Plan 38 Z3b: a handle that can write the file keeps every read-only
+/// open of it off passthrough until it closes — such a handle's writes are
+/// visible to an ordinary read (the `WriteState` overlay) and would never
+/// be to a passthrough one, which reads the chunk file.
+#[test]
+fn a_writer_keeps_read_only_opens_off_passthrough_until_it_closes() {
+    let e = env();
+    let (ino, _) = file(&e, "writer", 4096, 21);
+    let hash = e.chunks(ino)[0];
+    for writer in [OpenFlags::WRITE, OpenFlags::READ | OpenFlags::WRITE] {
+        let _w = e.open(ino, writer);
+        // Before it wrote a byte: there is no write session yet, only the
+        // handle, and that is enough.
+        assert!(
+            e.open_ro(ino).backing.is_none(),
+            "{writer:?} open, yet a reader was offered passthrough"
+        );
+        assert_eq!(e.cache.open_pin_count(&hash), 0);
+        e.release(ino);
+        e.release_with(ino, writer);
+    }
+    // Two writers: the first close leaves the second counted.
+    e.open(ino, OpenFlags::WRITE);
+    e.open(ino, OpenFlags::WRITE);
+    e.release_with(ino, OpenFlags::WRITE);
+    assert!(e.open_ro(ino).backing.is_none());
+    e.release(ino);
+    e.release_with(ino, OpenFlags::WRITE);
+    let opened = e.open_ro(ino);
+    assert_eq!(opened.backing.map(|b| b.hash), Some(hash.0));
+    e.release(ino);
+    // A writer that `create` opened counts the same way (as root: the
+    // test's files are root's, in root's directory).
+    let root = Caller::new(0, 0, None);
+    let (created, _) = Blocking::run(|r| {
+        e.fs.create(
+            &OpCtx::new(OpKind::Create, &root),
+            ROOT_INO,
+            Name::new("writer"),
+            0o100644,
+            OpenFlags::WRITE,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(created.attr.ino, ino, "create opened the existing file");
+    assert!(e.open_ro(ino).backing.is_none());
+    e.release(ino);
+    e.release_with(ino, OpenFlags::WRITE);
+    assert!(e.open_ro(ino).backing.is_some());
+    e.release(ino);
+}
+
+/// What the frontend negotiated decides, not what it declared before it
+/// existed (Linux FUSE learns at `FUSE_INIT`): off stops new offers and
+/// leaves an open handle's pin to its own `release`.
+#[test]
+fn the_frontends_negotiation_turns_offers_on_and_off() {
+    let e = env();
+    let (ino, _) = file(&e, "negotiated", 4096, 22);
+    let hash = e.chunks(ino)[0];
+    let held = e.open_ro(ino);
+    assert!(held.backing.is_some());
+    let mut caps = e.fs.caps().clone();
+    caps.passthrough = false;
+    e.fs.frontend_negotiated(&caps);
+    assert!(e.open_ro(ino).backing.is_none());
+    assert_eq!(
+        e.cache.open_pin_count(&hash),
+        1,
+        "the held handle keeps its pin"
+    );
+    e.release(ino);
+    e.release(ino);
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
+    caps.passthrough = true;
+    e.fs.frontend_negotiated(&caps);
+    assert!(e.open_ro(ino).backing.is_some());
+    e.release(ino);
+}
+
+/// Coordinator requirement for plan 38 Z3b: a chunk backing a live
+/// passthrough handle is never evictable across a handover. The kernel
+/// keeps serving the handed-over descriptor from the old process's
+/// backing file, so the old view keeps its pin until it is gone (the
+/// process `exec`s — `Engine::close_view_for_handover` leaves the pins),
+/// and the resumed view re-pins the same chunk from the snapshot before
+/// that. Two views of one disk cache stand in for the two images.
+#[test]
+fn a_chunk_backing_a_live_handle_is_never_evictable_across_a_handover() {
+    let e = env();
+    let (ino, data) = file(&e, "handed-over", 4096, 23);
+    let hash = e.chunks(ino)[0];
+    let held = e.open_ro(ino);
+    let backing = held.backing.clone().expect("backing chunk file");
+    // A write-intent handle on another file crosses too.
+    let (other, _) = file(&e, "other", 100, 24);
+    e.open(other, OpenFlags::WRITE);
+
+    let snapshot = e.fs.export_handles();
+    assert_eq!(snapshot.passthrough, vec![(ino, vec![hash.0])]);
+    assert_eq!(snapshot.writers, vec![(other, 1)]);
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert_eq!(
+        serde_json::from_str::<HandleTableSnapshot>(&json).unwrap(),
+        snapshot
+    );
+
+    // The new image's view, on the same node's cache, adopts it.
+    let next = super::quota_tests::test_fs_on(
+        e.meta.clone(),
+        CHUNK,
+        e.cache.clone(),
+        e._dir.path().join("staging-next"),
+    );
+    let mut caps = next.caps().clone();
+    caps.passthrough = true;
+    next.frontend_negotiated(&caps);
+    next.import_handles(&snapshot);
+    assert_eq!(e.cache.open_pin_count(&hash), 2, "both images pin it");
+    assert_eq!(next.passthrough_hashes(ino), vec![hash]);
+
+    // The old image goes away (its pins with it): still pinned, by the
+    // new one, through any prune.
+    drop(e.fs);
+    assert_eq!(e.cache.open_pin_count(&hash), 1);
+    let report = e.cache.prune_to(0).unwrap();
+    assert!(
+        e.cache.contains(&hash),
+        "evicted under a live handle: {report:?}"
+    );
+    assert_eq!(through_fd(&backing), data);
+    // The writer crossed: a reader of `other` is not offered passthrough.
+    let cx = OpCtx::new(OpKind::Open, &e.caller);
+    let opened =
+        Blocking::run(|r| next.open(&cx, other, OpenFlags::READ, OpenOwner::NONE, r)).unwrap();
+    assert!(opened.backing.is_none());
+
+    // The handed-over handle's release, on the new view, lets it go.
+    let rel = |ino: Ino, flags: OpenFlags| {
+        let cx = OpCtx::new(OpKind::Release, &e.caller);
+        Blocking::run(|r| next.release(&cx, ino, Fh(ino), flags, None, r)).unwrap();
+    };
+    rel(ino, OpenFlags::READ);
+    assert_eq!(e.cache.open_pin_count(&hash), 0);
+    e.cache.prune_to(0).unwrap();
+    assert!(!e.cache.contains(&hash), "evictable once the handle closed");
+    rel(other, OpenFlags::READ);
+    rel(other, OpenFlags::WRITE);
+    assert!(next.export_handles().writers.is_empty());
 }
 
 #[test]
@@ -422,10 +581,7 @@ fn cache_verify_always_never_offers_a_backing_file() {
     assert_eq!(e.fs.passthrough_handles(ino), 0);
     let status = e.fs.passthrough_status();
     assert!(!status.enabled);
-    assert!(status
-        .unavailable_reason
-        .unwrap()
-        .contains("--cache-verify always"));
+    assert_eq!(status.unavailable_reason, Some("cache_verify_always"));
     // Reads are unaffected: they go the ordinary way, as always.
     assert_eq!(e.read(ino, 0, 4096), data);
     e.release(ino);

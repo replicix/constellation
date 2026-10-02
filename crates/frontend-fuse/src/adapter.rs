@@ -38,10 +38,11 @@
 //! die, and the data stays pending. Other ops ignore interrupts, as
 //! before.
 
+use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, PreOpen};
 use crate::reply::{
     AttrReply, BytesReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply, LseekReply,
-    OpenReply, ReadReply, StatfsReply, WriteReply, XattrListReply, XattrReply, F_RDLCK, F_UNLCK,
-    F_WRLCK,
+    OpenCtx, OpenReply, ReadReply, StatfsReply, Undo, WriteReply, XattrListReply, XattrReply,
+    F_RDLCK, F_UNLCK, F_WRLCK,
 };
 use constellation_types::{Code, Rdev};
 use constellation_vfs::{
@@ -103,9 +104,15 @@ pub struct FuseFs<V: Vfs> {
     deferred: Arc<Deferred>,
     /// Plan 39 §3.3: the requests `FUSE_INTERRUPT` may cancel.
     interrupts: Arc<Interrupts>,
+    /// Plan 38 Z3b: whether this session serves opens with
+    /// `FOPEN_PASSTHROUGH`, and the per-inode state that keeps its
+    /// replies within the kernel's rules (`passthrough`'s module doc).
+    passthrough: Arc<PassthroughState>,
 }
 
 impl<V: Vfs> FuseFs<V> {
+    /// An adapter that does not ask for passthrough (a mount asks with
+    /// [`Self::with_passthrough`]).
     pub fn new(vfs: Arc<V>, caps: FrontendCaps, tuning: KernelTuning) -> Self {
         Self {
             vfs,
@@ -114,7 +121,28 @@ impl<V: Vfs> FuseFs<V> {
             obs: Arc::default(),
             deferred: Arc::default(),
             interrupts: Arc::default(),
+            passthrough: PassthroughState::new(PassthroughWish::Off(reason::DISABLED)),
         }
+    }
+
+    /// Ask for passthrough at `FUSE_INIT` (or not, and why).
+    pub fn with_passthrough(self, wish: PassthroughWish) -> Self {
+        self.passthrough.set_wish(wish);
+        self
+    }
+
+    /// Passthrough with `ops` standing in for the backing-id ioctls and
+    /// `CAP_SYS_ADMIN` assumed: what the wire tests drive, since a socket
+    /// pair standing in for `/dev/fuse` has neither.
+    #[doc(hidden)]
+    pub fn with_passthrough_ops(mut self, ops: Box<dyn BackingOps>) -> Self {
+        self.passthrough = PassthroughState::with_ops(PassthroughWish::On, ops, true);
+        self
+    }
+
+    /// This session's passthrough state (`node.status`, the handover).
+    pub fn passthrough(&self) -> &Arc<PassthroughState> {
+        &self.passthrough
     }
 
     pub(crate) fn deferred(&self) -> &Arc<Deferred> {
@@ -127,10 +155,6 @@ impl<V: Vfs> FuseFs<V> {
         self.obs.clone()
     }
 
-    /// The session's observer. A filesystem served without a
-    /// [`crate::FuseSession`] (the wire tests drive one over a socket
-    /// pair) never has its slot filled and counts as `/dev/fuse`, which
-    /// is what such a connection is.
     /// Replace how a caller's fatal signal is detected (tests; see
     /// [`fatal_signal_pending`]).
     pub fn with_fatal_signal_probe(mut self, probe: fn(u32) -> bool) -> Self {
@@ -160,6 +184,10 @@ impl<V: Vfs> FuseFs<V> {
         );
     }
 
+    /// The session's observer. A filesystem served without a
+    /// [`crate::FuseSession`] (the wire tests drive one over a socket
+    /// pair) never has its slot filled and counts as `/dev/fuse`, which
+    /// is what such a connection is.
     #[inline]
     fn obs(&self) -> &Observer {
         self.obs.get_or_init(|| {
@@ -170,6 +198,27 @@ impl<V: Vfs> FuseFs<V> {
             )
         })
     }
+
+    /// The view's side of a refused open, given back (`reply::Undo`).
+    fn undo(&self, req: &Request, flags: OpenFlags) -> Undo {
+        let vfs = self.vfs.clone();
+        let caller = caller(req);
+        Box::new(move |ino, fh: Fh| {
+            struct Discard;
+            impl constellation_vfs::Responder<()> for Discard {
+                fn done(self, _: constellation_vfs::VfsResult<()>) {}
+            }
+            let cx = constellation_vfs::OpCtx::new(OpKind::Release, &caller);
+            vfs.release(&cx, ino, fh, flags, None, Discard);
+        })
+    }
+}
+
+/// Whether an open with `flags` intends to change the file: what keeps a
+/// passthrough open from starting while it is under way, and what the
+/// engine's eligibility rule refuses (plan 38 §3(c)).
+pub(crate) fn open_flags_write_intent(flags: OpenFlags) -> bool {
+    flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC | OpenFlags::APPEND)
 }
 
 /// The requests whose reply may come from another thread after the fuser
@@ -692,6 +741,22 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
                 );
             }
         }
+        // Plan 38 Z3b: passthrough only for a process that can register
+        // backing files and a kernel that offers it; `max_stack_depth`
+        // is what turns it on for the connection, so it stays 0
+        // otherwise (and with it, the kernel's passthrough code is never
+        // entered). The outcome is logged once and told to the view, which
+        // offers backing files only when this said yes.
+        let outcome = self.passthrough.want_from_kernel().and_then(|()| {
+            config
+                .add_capabilities(InitFlags::FUSE_PASSTHROUGH)
+                .map_err(|_| reason::KERNEL)?;
+            let _ = config.set_max_stack_depth(1);
+            Ok(())
+        });
+        self.passthrough.settle(outcome);
+        self.caps.passthrough = self.passthrough.enabled();
+        self.vfs.frontend_negotiated(&self.caps);
         Ok(())
     }
 
@@ -844,16 +909,24 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: fuser::ReplyCreate,
     ) {
         let caller = caller(req);
+        let flags = open_flags(flags);
         let op = self.obs().begin(OpKind::Create, parent.0);
         let _in = op.enter();
+        let cx = OpenCtx {
+            ino: 0,
+            flags,
+            pre: PreOpen::Unregistered,
+            pt: self.passthrough.clone(),
+            undo: self.undo(req, flags),
+        };
         self.vfs.create(
             &op.ctx(&caller),
             parent.0,
             name(n),
             mode,
-            open_flags(flags),
+            flags,
             OpenOwner::NONE,
-            op.responder(CreateReply(reply)),
+            op.responder(CreateReply { reply, cx }),
         );
     }
 
@@ -927,14 +1000,26 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
         let caller = caller(req);
+        let flags = open_flags(flags.0);
         let op = self.obs().begin(OpKind::Open, ino.0);
         let _in = op.enter();
+        // A read-write open of an inode open in passthrough mode is
+        // refused (`ETXTBSY`) at the reply, after the view answered, so
+        // the view's own refusals win (`passthrough`'s module doc).
+        let pre = self.passthrough.before_open(ino.0, flags);
+        let cx = OpenCtx {
+            ino: ino.0,
+            flags,
+            pre,
+            pt: self.passthrough.clone(),
+            undo: self.undo(req, flags),
+        };
         self.vfs.open(
             &op.ctx(&caller),
             ino.0,
-            open_flags(flags.0),
+            flags,
             OpenOwner::NONE,
-            op.responder(OpenReply(reply)),
+            op.responder(OpenReply { reply, cx }),
         );
     }
 
@@ -1095,6 +1180,10 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Release, ino.0);
         let _in = op.enter();
+        // The kernel has let go of the handle — its backing file
+        // included — before it sends `RELEASE`; the inode's backing id
+        // goes with its last passthrough handle.
+        self.passthrough.release(ino.0);
         self.vfs.release(
             &op.ctx(&caller),
             ino.0,

@@ -85,6 +85,19 @@ done
 sort -o "$RESULTS" "$RESULTS"
 
 say "results: $total_ok passed, $total_fail failed"
+# Plan 38 Z3b: whether FUSE passthrough served any of it (a privileged run
+# on a kernel that offers it does; `opens_total` counts the opens the
+# kernel was handed a backing file for, and `unavailable_reason` says why
+# not). The status is joined onto one line first, so this reads compact
+# and pretty-printed JSON alike: the `passthrough` object holds no nested
+# object, so it ends at its first `}`. `sed`, as above.
+passthrough=$("$BIN" status tests --state-dir "$STATE" 2>/dev/null \
+    | tr -d '\n' \
+    | sed -n 's/.*"passthrough": *{\([^}]*\)}.*/\1/p' \
+    | tr ',' '\n' \
+    | sed -n 's/^ *"\(enabled\|opens_total\|unavailable_reason\|refused_opens\)": *\(.*[^ ]\) *$/\1=\2/p' \
+    | tr '\n' ' ')
+say "FUSE passthrough: ${passthrough:-unknown}"
 
 # Diff against the baseline (which may be absent or read-only).
 BASE_SORTED="$WORK/baseline-sorted.txt"

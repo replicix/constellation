@@ -57,11 +57,15 @@
 
 use crate::adapter::{Deferred, FuseFs, KernelTuning};
 use crate::notify::{FuseNotifySink, NotifyGate};
+use crate::passthrough::{
+    reason, PassthroughHandoff, PassthroughPolicy, PassthroughState, PassthroughWish,
+    PASSTHROUGH_ENV,
+};
 use crate::stats::SessionStats;
 use constellation_types::Code;
 use constellation_vfs::{Blocking, Caller, FrontendCaps, Observer, OpCtx, OpKind, Vfs};
 use fuser::{NegotiatedInit, Transport};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -133,6 +137,11 @@ pub struct TransportConfig {
     pub policy: TransportPolicy,
     /// `io_uring_queue_depth`: ignored unless `policy` resolves to a ring.
     pub uring_queue_depth: usize,
+    /// Plan 38 Z3b: which mounts ask for FUSE passthrough — by default the
+    /// read-only ones ([`PassthroughPolicy`]; [`PASSTHROUGH_ENV`];
+    /// [`Self::with_cache_verify_always`]). Independent of `policy`:
+    /// passthrough needs no ring (plan 38 §2.4).
+    pub passthrough: PassthroughPolicy,
 }
 
 impl Default for TransportConfig {
@@ -140,6 +149,7 @@ impl Default for TransportConfig {
         Self {
             policy: TransportPolicy::default(),
             uring_queue_depth: DEFAULT_URING_QUEUE_DEPTH,
+            passthrough: PassthroughPolicy::platform_default(),
         }
     }
 }
@@ -195,10 +205,36 @@ impl TransportConfig {
                 })?,
             None => uring_queue_depth.unwrap_or(DEFAULT_URING_QUEUE_DEPTH),
         };
+        // `CONSTELLATION_FUSE_PASSTHROUGH`: unset is the default (read-only
+        // mounts only); `1` opts writable mounts in too, `ETXTBSY` caveat
+        // and all (the `passthrough` module doc); `0` turns it off. An
+        // unknown value is an error, as for the transport above — an
+        // operator who typed it wanted one answer or the other, and either
+        // silent default is the opposite of one of them.
+        let passthrough = match get(PASSTHROUGH_ENV) {
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "1" | "on" | "true" | "yes" => PassthroughPolicy::On,
+                "0" | "off" | "false" | "no" => PassthroughPolicy::Off(reason::DISABLED),
+                _ => return Err(format!("{PASSTHROUGH_ENV}={raw}: expected 1 or 0")),
+            },
+            None => PassthroughPolicy::platform_default(),
+        };
         Ok(Self {
             policy,
             uring_queue_depth: depth,
+            passthrough,
         })
+    }
+
+    /// `--cache-verify always`: no passthrough, whatever
+    /// [`PASSTHROUGH_ENV`] says. Every byte served must be hashed on the
+    /// read that serves it, and a passthrough handle's reads never reach
+    /// the daemon (plan 38 §2.3). The engine refuses to offer a backing
+    /// file under `always` too; this keeps the mount from even asking the
+    /// kernel, and makes the reason the one `node.status` reports.
+    pub fn with_cache_verify_always(mut self) -> Self {
+        self.passthrough = PassthroughPolicy::Off(reason::CACHE_VERIFY_ALWAYS);
+        self
     }
 }
 
@@ -246,6 +282,19 @@ pub struct MountOptions {
     /// This session may be detached and resumed in another process image,
     /// so `transport` is pinned.
     handover: bool,
+    /// Plan 38 Z3b: whether to ask for FUSE passthrough at `FUSE_INIT`
+    /// (single-chunk read-only opens served by the kernel from the chunk
+    /// file). From [`TransportConfig::passthrough`]: by default
+    /// ([`PassthroughPolicy::ReadOnlyMounts`]) only a [`Self::read_only`]
+    /// mount asks; [`PassthroughPolicy::On`] is the opt-in for writable
+    /// mounts too, with the `ETXTBSY` caveat the `passthrough` module doc
+    /// describes. Whether the session *gets* it is up to the process's
+    /// `CAP_SYS_ADMIN` and the kernel (the same doc), reported per mount
+    /// in `node.status`.
+    ///
+    /// A handover-capable session asks too: the backing ids it registers
+    /// cross a handover with the session (`FuseHandoff::passthrough`).
+    pub passthrough: PassthroughPolicy,
 }
 
 impl MountOptions {
@@ -270,7 +319,14 @@ impl MountOptions {
             asked: cfg.policy,
             uring_queue_depth: cfg.uring_queue_depth,
             handover: false,
+            passthrough: cfg.passthrough,
         }
+    }
+
+    /// What this mount asks the kernel for, passthrough-wise: its
+    /// [`Self::passthrough`] policy applied to [`Self::read_only`].
+    pub fn passthrough_wish(&self) -> PassthroughWish {
+        self.passthrough.wish(self.read_only)
     }
 
     /// Options for a session that may later be detached and resumed in
@@ -423,6 +479,15 @@ pub struct FuseHandoff {
     /// its name, possibly in another mount namespace, and ending the
     /// session closes the connection instead of unmounting by path.
     pub foreign: bool,
+    /// Plan 38 Z3b: which inodes the kernel holds open in which mode, and
+    /// the backing ids — still registered — of those in passthrough mode
+    /// ([`PassthroughHandoff`]).
+    pub passthrough: PassthroughHandoff,
+}
+
+/// Whether a connection's `FUSE_INIT` turned passthrough on.
+fn negotiated_passthrough(init: &NegotiatedInit) -> bool {
+    init.max_stack_depth > 0 && init.flags & fuser::InitFlags::FUSE_PASSTHROUGH.bits() != 0
 }
 
 impl FuseHandoff {
@@ -550,6 +615,9 @@ struct Shared {
     ending: std::sync::atomic::AtomicBool,
     gate: Arc<NotifyGate>,
     deferred: Arc<Deferred>,
+    /// Plan 38 Z3b: the session's passthrough state (its table crosses a
+    /// handover in [`FuseHandoff::passthrough`]).
+    passthrough: Arc<PassthroughState>,
     /// The detach waiting for the session thread's answer, and whether
     /// that thread is gone (nobody would answer).
     pending: Mutex<Pending>,
@@ -606,15 +674,27 @@ pub fn mount_source<V: Vfs>(
                 opts.is_handover_capable(),
                 "a PreopenedFd session's options must be handover-capable"
             );
-            let fs = FuseFs::new(view.clone(), caps, opts.tuning);
+            let fs = FuseFs::new(view.clone(), caps.clone(), opts.tuning)
+                .with_passthrough(opts.passthrough_wish());
             let deferred = fs.deferred().clone();
             let observer = fs.observer_slot();
+            let passthrough = fs.passthrough().clone();
             let mut config = config;
             config.io_uring = false;
             share_fd_without_a_device(&mut config);
             let session = fuser::Session::from_fd(fs, fd, config.acl, config.clone())?;
             FuseSession::new(
-                session, deferred, observer, opts, view, config, None, true, None,
+                session,
+                deferred,
+                observer,
+                passthrough,
+                &caps,
+                opts,
+                view,
+                config,
+                None,
+                true,
+                None,
             )
         }
         MountSource::Path(mountpoint, kernel) => {
@@ -695,9 +775,11 @@ fn mount_path<V: Vfs>(
     caps: FrontendCaps,
     config: fuser::Config,
 ) -> std::io::Result<FuseSession<V>> {
-    let fs = FuseFs::new(view.clone(), caps, opts.tuning);
+    let declared = caps.clone();
+    let fs = FuseFs::new(view.clone(), caps, opts.tuning).with_passthrough(opts.passthrough_wish());
     let deferred = fs.deferred().clone();
     let observer = fs.observer_slot();
+    let passthrough = fs.passthrough().clone();
     if privileged() {
         let fd = mount_fd(mountpoint, kernel)?;
         let session = match fuser::Session::from_fd(fs, fd, config.acl, config.clone()) {
@@ -712,6 +794,8 @@ fn mount_path<V: Vfs>(
             session,
             deferred,
             observer,
+            passthrough,
+            &declared,
             opts,
             view.clone(),
             config,
@@ -738,6 +822,8 @@ fn mount_path<V: Vfs>(
         session,
         deferred,
         observer,
+        passthrough,
+        &declared,
         opts,
         view.clone(),
         config,
@@ -784,6 +870,8 @@ impl<V: Vfs> FuseSession<V> {
         mut session: fuser::Session<FuseFs<V>>,
         deferred: Arc<Deferred>,
         observer: Arc<OnceLock<Observer>>,
+        passthrough: Arc<PassthroughState>,
+        caps: &FrontendCaps,
         opts: &MountOptions,
         vfs: Arc<V>,
         config: fuser::Config,
@@ -802,6 +890,7 @@ impl<V: Vfs> FuseSession<V> {
             session.negotiated_init().as_ref(),
             transport,
             opts.uring_queue_depth,
+            passthrough.clone(),
         ));
         let _ = observer.set(Observer::new(
             crate::adapter::FRONTEND,
@@ -818,6 +907,27 @@ impl<V: Vfs> FuseSession<V> {
             None
         };
         let gate = NotifyGate::new(session.notifier());
+        // The backing-id ioctls go to the connection; a duplicate of the
+        // session's descriptor is the same connection, usable from any
+        // worker and by `release` long after the open that registered
+        // the id.
+        passthrough.set_transport(transport.name());
+        if passthrough.enabled() || !passthrough.export().inodes.is_empty() {
+            passthrough.set_device(session.as_fd().try_clone_to_owned()?);
+        }
+        // `CapEff` and the kernel's offer are not proof the kernel will
+        // register a backing file for this process (a user namespace, a
+        // cache on overlayfs): one probe, before anything is served, and
+        // the view stops offering backing files if it failed.
+        if passthrough.enabled() {
+            if let Some(file) = vfs.passthrough_probe() {
+                if !passthrough.probe(file) {
+                    let mut caps = caps.clone();
+                    caps.passthrough = false;
+                    vfs.frontend_negotiated(&caps);
+                }
+            }
+        }
         Ok(Self {
             session,
             vfs,
@@ -832,6 +942,7 @@ impl<V: Vfs> FuseSession<V> {
                 ending: std::sync::atomic::AtomicBool::new(false),
                 gate,
                 deferred,
+                passthrough,
                 pending: Mutex::new(Pending::default()),
                 detaching: Mutex::new(()),
             }),
@@ -867,9 +978,29 @@ impl<V: Vfs> FuseSession<V> {
         );
         config.io_uring = false;
         share_fd_without_a_device(&mut config);
-        let fs = FuseFs::new(view.clone(), caps, opts.tuning);
+        let mut caps = caps;
+        let fs = FuseFs::new(view.clone(), caps.clone(), opts.tuning)
+            .with_passthrough(opts.passthrough_wish());
         let deferred = fs.deferred().clone();
         let observer = fs.observer_slot();
+        let passthrough = fs.passthrough().clone();
+        // Plan 38 Z3b: no `FUSE_INIT` here, so what the first server
+        // agreed decides, and the handed-over table says which inodes are
+        // in which mode. Its backing ids are still registered: the kernel
+        // goes on serving their handles, every later open of those inodes
+        // must reuse them, and this process closes them at their last
+        // release — whether or not *it* may start new ones.
+        passthrough.import(&handoff.passthrough);
+        let outcome = passthrough.want_from_kernel().and_then(|()| {
+            if negotiated_passthrough(&handoff.init) {
+                Ok(())
+            } else {
+                Err(reason::KERNEL)
+            }
+        });
+        passthrough.settle(outcome);
+        caps.passthrough = passthrough.enabled();
+        view.frontend_negotiated(&caps);
         let session = fuser::Session::from_fd_resumed(
             fs,
             handoff.fuse_fd,
@@ -881,6 +1012,8 @@ impl<V: Vfs> FuseSession<V> {
             session,
             deferred,
             observer,
+            passthrough,
+            &caps,
             opts,
             view,
             config,
@@ -900,6 +1033,12 @@ impl<V: Vfs> FuseSession<V> {
     /// What this session's `FUSE_INIT` agreed.
     pub fn negotiated_init(&self) -> Option<NegotiatedInit> {
         self.session.negotiated_init()
+    }
+
+    /// This session's passthrough state: `node.status`'s
+    /// `fuse.passthrough` reads [`PassthroughState::status`] from it.
+    pub fn passthrough(&self) -> Arc<PassthroughState> {
+        self.shared.passthrough.clone()
     }
 
     /// The transport this session serves its connection over: what
@@ -1232,6 +1371,9 @@ impl SessionControl {
                 init,
                 mountpoint,
                 foreign: self.shared.foreign,
+                // Taken once every worker stopped: nothing changes it now,
+                // and its backing ids stay registered for the next server.
+                passthrough: self.shared.passthrough.export(),
             },
             view: export(),
         })
@@ -1330,6 +1472,109 @@ mod tests {
         }
     }
 
+    /// Plan 38 Z3b: `CONSTELLATION_FUSE_PASSTHROUGH` and
+    /// `--cache-verify always`, as `MountOptions` and the adapter see them.
+    #[test]
+    fn the_passthrough_knob_and_cache_verify_always() {
+        let none = |_: &str| None;
+        let var = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let tuning = KernelTuning::for_workers(2);
+        // By default (Linux) only a read-only mount asks — plain or
+        // handover-capable alike; a writable one says why it does not
+        // (review 38-z3b must-fix 1: `open(O_RDWR)` would meet ETXTBSY).
+        let cfg = TransportConfig::resolve_from(none, None, None).unwrap();
+        assert_eq!(cfg.passthrough, PassthroughPolicy::ReadOnlyMounts);
+        let mut plain = MountOptions::new("p", 2, tuning, cfg);
+        assert_eq!(
+            plain.passthrough_wish(),
+            PassthroughWish::Off(reason::WRITABLE_MOUNT)
+        );
+        plain.read_only = true;
+        assert_eq!(plain.passthrough_wish(), PassthroughWish::On);
+        let mut pinned = MountOptions::handover_capable("h", 2, tuning, cfg, HandoverCapable);
+        assert_eq!(
+            pinned.passthrough_wish(),
+            PassthroughWish::Off(reason::WRITABLE_MOUNT)
+        );
+        pinned.read_only = true;
+        assert_eq!(pinned.passthrough_wish(), PassthroughWish::On);
+        // `1` opts writable mounts in; the mount option says the same.
+        let cfg =
+            TransportConfig::resolve_from(var(&[(PASSTHROUGH_ENV, "1")]), None, None).unwrap();
+        assert_eq!(cfg.passthrough, PassthroughPolicy::On);
+        let opted = MountOptions::new("p", 2, tuning, cfg);
+        assert_eq!(opted.passthrough_wish(), PassthroughWish::On);
+        let mut by_option = MountOptions::new(
+            "p",
+            2,
+            tuning,
+            TransportConfig::resolve_from(none, None, None).unwrap(),
+        );
+        by_option.passthrough = PassthroughPolicy::On;
+        assert_eq!(by_option.passthrough_wish(), PassthroughWish::On);
+        // The env turns it off, or back on; anything else is an error.
+        for off in ["0", "off", " FALSE "] {
+            let pairs: &'static [(&'static str, &'static str)] =
+                Box::leak(Box::new([(PASSTHROUGH_ENV, off)]));
+            let cfg = TransportConfig::resolve_from(var(pairs), None, None).unwrap();
+            assert_eq!(
+                cfg.passthrough,
+                PassthroughPolicy::Off(reason::DISABLED),
+                "{off}"
+            );
+            let mut opts = MountOptions::new("p", 2, tuning, cfg);
+            opts.read_only = true;
+            assert_eq!(
+                opts.passthrough_wish(),
+                PassthroughWish::Off(reason::DISABLED)
+            );
+        }
+        let err = TransportConfig::resolve_from(var(&[(PASSTHROUGH_ENV, "maybe")]), None, None)
+            .expect_err("an unknown value must be refused");
+        assert!(err.contains(PASSTHROUGH_ENV), "{err}");
+        // `--cache-verify always` forces it off, whatever the env said,
+        // and says why.
+        let cfg = TransportConfig::resolve_from(var(&[(PASSTHROUGH_ENV, "1")]), None, None)
+            .unwrap()
+            .with_cache_verify_always();
+        let mut opts = MountOptions::new("p", 2, tuning, cfg);
+        opts.read_only = true;
+        assert_eq!(
+            opts.passthrough_wish(),
+            PassthroughWish::Off(reason::CACHE_VERIFY_ALWAYS)
+        );
+        // ... and the adapter built from those options never asks the
+        // kernel, so `node.status` reports exactly that reason.
+        let fs = FuseFs::new(
+            Arc::new(MockVfs::new()),
+            FrontendCaps::linux_fuse(false),
+            tuning,
+        )
+        .with_passthrough(opts.passthrough_wish());
+        assert_eq!(
+            fs.passthrough().want_from_kernel(),
+            Err(reason::CACHE_VERIFY_ALWAYS)
+        );
+        fs.passthrough().settle(Err(reason::CACHE_VERIFY_ALWAYS));
+        let status = fs.passthrough().status();
+        assert!(!status.enabled);
+        assert_eq!(
+            status.unavailable_reason.as_deref(),
+            Some(reason::CACHE_VERIFY_ALWAYS)
+        );
+        assert!(
+            status.fallbacks.is_empty(),
+            "an operator's choice, not a downgrade"
+        );
+    }
+
     /// Plan 38 §3(e)'s hard rule, as a type-level fact rather than a
     /// convention: the only route to a handover-capable `MountOptions` is
     /// the constructor that takes the marker, and it pins `dev-fuse`.
@@ -1338,6 +1583,7 @@ mod tests {
         let asked = TransportConfig {
             policy: TransportPolicy::Auto,
             uring_queue_depth: 4,
+            ..TransportConfig::default()
         };
         let plain = MountOptions::new("plain", 2, KernelTuning::for_workers(2), asked);
         assert_eq!(plain.transport(), TransportPolicy::Auto);
@@ -1375,6 +1621,7 @@ mod tests {
             TransportConfig {
                 policy: TransportPolicy::Auto,
                 uring_queue_depth: 3,
+                ..TransportConfig::default()
             },
         );
         let config = auto.config();

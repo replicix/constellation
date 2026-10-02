@@ -4,9 +4,11 @@
 //! itself ([`PassthroughChunk`] in [`constellation_vfs::Opened`]) instead
 //! of promising to serve its reads.
 //!
-//! Nothing here talks to a kernel — the Linux FUSE wiring that turns a
-//! backing file into `FOPEN_PASSTHROUGH` is the next chunk of the plan.
-//! What this module owns is the part that is the engine's either way:
+//! Nothing here talks to a kernel — the Linux FUSE adapter turns a
+//! backing file into a `FOPEN_PASSTHROUGH` reply (plan 38 Z3b,
+//! `constellation-frontend-fuse`'s `passthrough` module, which also owns
+//! the kernel's per-inode rules this module cannot see). What this module
+//! owns is the part that is the engine's either way:
 //! deciding eligibility once, at open; keeping the chunk file alive and
 //! un-evicted for exactly as long as the handle; and firing the two
 //! read-path hooks that a passthrough handle's reads would otherwise
@@ -36,11 +38,16 @@
 //! overlay, keeps reading the committed chunk instead. That is a real
 //! read-after-write break within one mount, and it is not fixable from
 //! here (eligibility is decided once, at open, and there is no way to
-//! revoke a backing file mid-open). Plan 38 Z3b closes it at the open
-//! instead, by refusing passthrough while any handle on the inode was
-//! opened with write intent: `open` and `release` both carry the handle's
-//! `OpenFlags`, so the view's `opens` table can count write-intent
-//! handles per inode and this rule can read that count.
+//! revoke a backing file mid-open). Plan 38 Z3b closes most of it at the
+//! open instead: passthrough is refused while any handle on the inode was
+//! opened for writing (`writers`, counted from the `OpenFlags` that `open`
+//! and `release` both carry) or while it has a write session. What is
+//! left is the order the other way round — a passthrough handle opened
+//! *first*, a writer after it — and that is close-to-open by design: the
+//! passthrough handle keeps the bytes it was opened on until it is closed
+//! and reopened, as it would for a writer on another node (plan 38
+//! §3(c), and the FUSE adapter's module doc for what the kernel lets a
+//! later open of such an inode be).
 //!
 //! # Scan-ahead and atime move to the open
 //!
@@ -61,17 +68,24 @@ use super::*;
 /// `Arc` of the file keeps that open file description alive even if the
 /// frontend drops its own clone of it without telling the engine.
 ///
-/// `hash` names the chunk the handle sits on. Nothing in this chunk of
-/// the plan needs it beyond diagnostics and the tests, but a handover
-/// does: once plan 38 Z3b registers backing ids with a kernel, a resumed
-/// view has to re-pin and reopen the chunks the handed-over descriptors
-/// are still being served from, and `export_handles` can only carry what
-/// the table knows (`handoff.rs`'s module doc records this as a Z3b
-/// requirement).
+/// `hash` names the chunk the handle sits on: a handover carries it, so
+/// the resumed view can re-pin the chunks the kernel still serves the
+/// handed-over descriptors from (`handoff.rs`'s module doc).
 pub(super) struct PassthroughHandle {
     hash: ChunkHash,
     _pin: OpenPin,
-    _fd: Arc<std::fs::File>,
+    /// `None` only for a handle a handover brought in whose chunk file
+    /// could not be reopened: the kernel holds its own reference to the
+    /// file it serves from, so the pin is what matters here.
+    _fd: Option<Arc<std::fs::File>>,
+}
+
+/// Whether an open with `flags` can write the file: the access mode, as
+/// the kernel's `f_flags` keeps it until `release` (`O_TRUNC` and
+/// `O_CREAT` are gone from it by then, so they cannot be what a count
+/// that `release` decrements is keyed on).
+pub(super) fn writes(flags: OpenFlags) -> bool {
+    flags.contains(OpenFlags::WRITE)
 }
 
 /// A view's passthrough, as [`View::passthrough_status`] reports it.
@@ -110,7 +124,10 @@ impl View {
         // a frontend that declares it gets offered one (plan 31 §6.6's
         // `FrontendCaps`; Linux FUSE declares it in plan 38 Z3b, with the
         // `FOPEN_PASSTHROUGH` reply that consumes it).
-        if !self.caps.passthrough {
+        if !self
+            .passthrough_on
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
         // `--cache-verify always` promises that every byte served is
@@ -124,6 +141,13 @@ impl View {
         // Any write intent at all: the handle would have to be able to
         // change the file, and a backing file is read-only here.
         if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC | OpenFlags::APPEND) {
+            return None;
+        }
+        // Another handle on this inode can write it (plan 38 Z3b): what it
+        // writes would be visible to an ordinary read through the
+        // `WriteState` overlay and never to a passthrough handle, so the
+        // inode is served by the daemon until every writer has closed.
+        if self.writers.lock().unwrap().get(&ino).copied().unwrap_or(0) > 0 {
             return None;
         }
         // One chunk holds the whole file, and an empty file has no chunk
@@ -208,7 +232,7 @@ impl View {
             .push(PassthroughHandle {
                 hash,
                 _pin: pin,
-                _fd: Arc::clone(&fd),
+                _fd: Some(Arc::clone(&fd)),
             });
         // The read-path hooks this handle's reads will never reach (see
         // the module doc). Observable change: an eligible open bumps
@@ -228,6 +252,97 @@ impl View {
         })
     }
 
+    /// An `open`/`create` of `ino` with `flags` was answered: count it if
+    /// it can write.
+    pub(super) fn note_writer_open(&self, ino: Ino, flags: OpenFlags) {
+        if writes(flags) {
+            *self.writers.lock().unwrap().entry(ino).or_insert(0) += 1;
+        }
+    }
+
+    /// A handle opened with `flags` was released.
+    pub(super) fn note_writer_release(&self, ino: Ino, flags: OpenFlags) {
+        if !writes(flags) {
+            return;
+        }
+        let mut writers = self.writers.lock().unwrap();
+        if let std::collections::hash_map::Entry::Occupied(mut slot) = writers.entry(ino) {
+            if *slot.get() <= 1 {
+                slot.remove();
+            } else {
+                *slot.get_mut() -= 1;
+            }
+        }
+    }
+
+    /// The frontend learned whether it can consume a backing file
+    /// ([`constellation_vfs::Vfs::frontend_negotiated`]). Turning it off
+    /// leaves the handles already open alone: their pins go at their
+    /// `release`, as always.
+    pub(super) fn set_passthrough_on(&self, on: bool) {
+        self.passthrough_on
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The passthrough handles a handover carries, per inode: the chunk
+    /// each one sits on, oldest first ([`HandleTableSnapshot`]).
+    pub(super) fn export_passthrough(&self) -> Vec<(Ino, Vec<[u8; 32]>)> {
+        let mut out: Vec<(Ino, Vec<[u8; 32]>)> = self
+            .passthrough
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(ino, hs)| (*ino, hs.iter().map(|h| h.hash.0).collect()))
+            .collect();
+        out.sort_unstable_by_key(|(ino, _)| *ino);
+        out
+    }
+
+    /// Re-pin the chunks a handed-over view's passthrough handles sit on
+    /// (plan 38 Z3b). The kernel keeps serving those handles from the
+    /// previous process's backing files across the handover — it holds its
+    /// own reference to each — so what has to be rebuilt here is only the
+    /// pin that keeps the disk cache from evicting the chunk under them,
+    /// and the trim at `release` then works on the imported entries
+    /// exactly as on the view's own.
+    ///
+    /// A chunk that is no longer resident cannot be pinned, and is logged:
+    /// the handle still reads its bytes (the kernel's reference keeps the
+    /// unlinked file), but the cache's `used` no longer covers them until
+    /// it closes — the "deferred free" this plan otherwise avoids. The old
+    /// process keeps its own pins until it `exec`s
+    /// (`Engine::close_view_for_handover`), so the only window for that is
+    /// the new image's start-up before this view reopens.
+    pub(super) fn import_passthrough(&self, handles: &[(Ino, Vec<[u8; 32]>)]) {
+        let mut map = self.passthrough.lock().unwrap();
+        for (ino, hashes) in handles {
+            for raw in hashes {
+                let hash = ChunkHash(*raw);
+                let pin = match self.cache.pin_open(&hash) {
+                    Ok(pin) => pin,
+                    Err(error) => {
+                        tracing::warn!(
+                            ino,
+                            hash = %hash.to_hex(),
+                            %error,
+                            "passthrough: a handed-over handle's chunk is no longer cached; \
+                             it stays readable but unaccounted until the handle closes"
+                        );
+                        continue;
+                    }
+                };
+                let fd = std::fs::File::open(self.cache.chunk_path(&hash))
+                    .ok()
+                    .map(Arc::new);
+                map.entry(*ino).or_default().push(PassthroughHandle {
+                    hash,
+                    _pin: pin,
+                    _fd: fd,
+                });
+            }
+        }
+    }
+
     /// One of `ino`'s passthrough handles is gone (its `release`), and
     /// `remaining` handles of any kind are still open on it.
     ///
@@ -244,13 +359,16 @@ impl View {
     /// the last close trims to zero, so nothing leaks either.
     ///
     /// What stays imprecise is *which* pin a trim drops when the inode
-    /// has both passthrough and ordinary handles, or two passthrough
-    /// handles on different chunks (a write landed in between): the
-    /// oldest pins are kept. Each handle's own descriptor keeps its bytes
-    /// readable regardless (`remove`'s doc), so the cost is at worst the
-    /// cache's `used` briefly not covering a file an fd still holds, and
-    /// closing that last gap needs handle identity from the frontend,
-    /// which plan 38 Z3b's backing ids supply.
+    /// has pins on two chunks (a write landed between two opens): the
+    /// oldest pins are kept. With Linux FUSE that is almost always the
+    /// right one, because the kernel serves every passthrough handle of an
+    /// inode from the backing file of the *first* passthrough open of it
+    /// (the FUSE adapter's per-inode rule) and the oldest pin is that
+    /// open's. The exception is two opens racing a manifest change whose
+    /// replies land out of order, where the kept pin can be the other
+    /// chunk's; the kernel's own reference keeps the bytes readable
+    /// regardless (`remove`'s doc), so the cost is the cache's `used`
+    /// briefly not covering a file an fd still holds.
     pub(super) fn drop_passthrough(&self, ino: Ino, remaining: u32) {
         // Dropped outside the map's lock: releasing a pin takes the disk
         // cache's state lock, which other threads hold while taking this
@@ -280,17 +398,12 @@ impl View {
     /// a frontend's death does not always drop the `View` promptly (the
     /// host may still hold an `Arc` while it tears the mount down), and a
     /// pin held past the handle it belongs to is a chunk the cache cannot
-    /// evict for no reason anybody can see. Handles do not survive a
-    /// handover either: the pins and the descriptors are this process's,
-    /// and `import_handles` has nothing to rebuild them from — the next
-    /// process's own opens establish their own. That is a hazard plan 38
-    /// Z3b has to close, not a settled design: once a backing id is
-    /// registered with a kernel, the kernel keeps serving reads through
-    /// *this* process's descriptor across a handover, and the resumed
-    /// view holding no pin leaves that chunk evictable under a live
-    /// backing. The handover snapshot has to carry the per-inode chunk
-    /// hashes ([`PassthroughHandle::hash`]) so the resumed view can
-    /// re-pin and reopen them.
+    /// evict for no reason anybody can see. A handover does *not* come
+    /// through here (`Engine::close_view_for_handover`): the kernel goes
+    /// on serving the handed-over handles from this process's backing
+    /// files, so the pins stay until the process `exec`s, and the resumed
+    /// view re-pins the same chunks from the snapshot
+    /// ([`Self::import_passthrough`]).
     pub(crate) fn drop_all_passthrough(&self) {
         let dropped = std::mem::take(&mut *self.passthrough.lock().unwrap());
         for (ino, handles) in &dropped {
@@ -305,12 +418,14 @@ impl View {
     }
 
     /// Whether this view offers passthrough at all, how many opens it
-    /// backs right now, and if it offers none, why: `node.status`'s
-    /// `fuse.mounts[].passthrough` and the
-    /// `constellation_fuse_passthrough_opens` gauge (plan 38 §5). The
-    /// reasons are the two of [`Self::passthrough_backing`]'s refusals that
-    /// hold for every open on the view; the per-open ones (write intent,
-    /// size, residency) are not a property of the mount.
+    /// backs right now, and if it offers none, why — what `node.status`'s
+    /// `fuse.mounts[].passthrough` reports for a view whose host has no
+    /// better answer. A Linux FUSE host does: its session knows what the
+    /// kernel agreed and how many handles the kernel serves from a backing
+    /// file (plan 38 Z3b), and its answer wins. The reasons are the two of
+    /// [`Self::passthrough_backing`]'s refusals that hold for every open
+    /// on the view; the per-open ones (write intent, size, residency) are
+    /// not a property of the mount.
     pub fn passthrough_status(&self) -> PassthroughStatus {
         let opens = self
             .passthrough
@@ -319,13 +434,15 @@ impl View {
             .values()
             .map(|handles| handles.len() as u64)
             .sum();
-        let unavailable_reason = if !self.caps.passthrough {
-            Some(
-                "the frontend does not read from backing files (Linux FUSE's \
-                 FOPEN_PASSTHROUGH lands in plan 38 Z3b)",
-            )
-        } else if self.cache.verify_mode() != CacheVerify::Admit {
-            Some("--cache-verify always: every byte served is hashed on the read that serves it")
+        // The FUSE session's reason names (`cache_verify_always` first, as
+        // there: it is the operator's choice and holds whatever else does).
+        let unavailable_reason = if self.cache.verify_mode() != CacheVerify::Admit {
+            Some("cache_verify_always")
+        } else if !self
+            .passthrough_on
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Some("frontend")
         } else {
             None
         };
@@ -336,15 +453,15 @@ impl View {
         }
     }
 
-    /// How many passthrough handles `ino` has open (tests; the
-    /// operator-facing count is [`Self::passthrough_status`]'s).
+    /// How many passthrough handles `ino` has open (tests; the operator's
+    /// count is the FUSE session's, which knows what the kernel was told).
     #[cfg(test)]
     pub(crate) fn passthrough_handles(&self, ino: Ino) -> usize {
         self.passthrough_hashes(ino).len()
     }
 
     /// The chunks `ino`'s passthrough handles sit on, oldest open first
-    /// (what a Z3b handover snapshot would have to carry).
+    /// (what a handover snapshot carries).
     #[cfg(test)]
     pub(crate) fn passthrough_hashes(&self, ino: Ino) -> Vec<ChunkHash> {
         self.passthrough

@@ -631,6 +631,115 @@ contract is also the *literal* mechanism (the kernel's own fd semantics)
 rather than an invalidation message this plan would otherwise have to send
 and didn't).
 
+**Local writers, and the kernel's one-mode-per-inode rule (Z3b, as
+built).** Two facts the eligibility rule above did not account for, found
+in `fs/fuse/iomode.c`/`passthrough.c`/`backing.c` (master, re-read for Z3b)
+and confirmed on 7.3-rc4:
+
+1. *The kernel keeps one I/O mode per inode.* While any handle of an inode
+   is open with `FOPEN_PASSTHROUGH`, every other open of it must be too, on
+   the **same** backing file (`fuse_file_io_open`: an ordinary reply is
+   `EIO` to the opener, a different backing id `EBUSY` → `EIO`); while any
+   is open the ordinary, page-cached way, a passthrough open is refused
+   (`ETXTBSY` → `EIO`). The engine decides per open; the FUSE adapter keeps
+   a per-inode table (`crates/frontend-fuse/src/passthrough.rs`) and shapes
+   every reply to that rule: an eligible open goes passthrough only when no
+   ordinary handle of the inode is open (or about to be: a write-intent
+   open registers before it calls the view); while some handle is in
+   passthrough mode every open reuses its backing id — plain passthrough for
+   a read-only open the engine offered the same chunk, otherwise
+   `FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO`, which sends the handle's reads and
+   writes to the daemon (so it sees the current bytes) and leaves only
+   `mmap` on the backing file.
+2. *The kernel opens the backing file with the opener's flags*
+   (`backing_file_open(file, file->f_flags, …)`), so a read-write open
+   answered with the backing id could write the content-addressed chunk
+   file through a shared writable `mmap`. A **read-write open of an inode
+   in passthrough mode is therefore refused with `ETXTBSY`** until its
+   passthrough handles close — the errno Linux already gives an open for
+   writing of a running executable. A write-only open cannot be `mmap`ed
+   and is served (direct I/O, by the daemon).
+
+The coordinator's local read-after-write requirement is met as follows: an
+open is never passthrough while any handle of the inode can write it (the
+view counts write-access handles, `writers`, and refuses) or while it has a
+write session. **A write-intent open that arrives *after* a passthrough open
+is close-to-open on the same mount**: the earlier passthrough handle keeps
+the bytes it was opened on until it is closed, exactly as for a writer on
+another node, while every open *after* the writer sees the writer's bytes
+(asserted by the `passthrough-local-writer` scenario and documented for
+users in `docs/reference/configuration.md`, "FUSE passthrough").
+
+**Default: read-only mounts only (review 38-z3b, coordinator decision).**
+The two facts above force a non-standard outcome on one legal POSIX call.
+Once an inode has a passthrough handle, `fuse_file_io_open` turns any
+reply to a later open that is not `FOPEN_PASSTHROUGH` on the same backing
+(plain, or `FOPEN_DIRECT_IO` alone) into `EIO`, and the only other answer
+(`FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO`) makes `fuse_passthrough_open` open
+the backing file with the opener's `f_flags` — writable for an `O_RDWR`
+opener, whose `MAP_SHARED|PROT_WRITE` `mmap` (routed to
+`fuse_passthrough_mmap`) would write the content-addressed chunk. Demotion
+is impossible: there is no revoke, and `fuse_inode_uncached_io_start`
+requires the same `fb`. So `open(O_RDWR)` of a file another process holds
+open by passthrough must get *some* error; `ETXTBSY` is the least bad, but
+its timing depends on what else happens to have the file open, and it hits
+ordinary programs: `fopen(f, "r+")`, Java `RandomAccessFile(f, "rw")`,
+Python `open(f, "r+b")`, SQLite's read-write open while a `?mode=ro`
+connection holds the database, `fallocate(1)`. pjdfstest cannot see it
+(it never holds a file open across another process's open). Against a gain
+of ~25 % CPU-s/GiB on the cold small-file lane only, the decision is:
+
+- **Read-only mounts** (`MountOptions::read_only`, a frozen snapshot view,
+  which the kernel mounts `ro`): passthrough **on by default** — there
+  `open(O_RDWR)` is `EROFS` in the VFS before FUSE sees it, so the conflict
+  is unreachable.
+- **Writable mounts**: **off by default** (`node.status` reason
+  `writable_mount`, not logged as a downgrade). `CONSTELLATION_FUSE_PASSTHROUGH=1`
+  (or `MountOptions::passthrough = PassthroughPolicy::On`) is the
+  documented opt-in carrying the `ETXTBSY` caveat and the list above
+  (`docs/reference/configuration.md`, "FUSE passthrough").
+
+*Gap found while testing the decision:* the only read-only mounts are
+frozen snapshot views, and `View::open` answers their files (synthetic
+`Frozen` nodes) before the eligibility rule runs, so a read-only mount
+negotiates passthrough (`enabled: true`) but is never offered a backing
+file. Until eligibility covers frozen files (an engine change, outside
+Z3b), the default serves nothing by passthrough and only the opt-in does.
+
+The `ETXTBSY` refusal is made at the open's *reply*, after the view
+answered (the view's handle is released again), so the view's own
+`EROFS`/`ENOENT`/`EACCES` win over it. A related edge the kernel leaves on
+opted-in writable mounts: a `FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO` handle
+(write-only opener, `backing_busy`, an open after a writer) `read()`s the
+current bytes through the daemon, but `fuse_file_mmap` routes its `mmap`
+to `fuse_passthrough_mmap` whenever `ff->passthrough` is set, so it maps
+the *old* chunk until every passthrough handle of the inode closes — not
+fixable from userspace, documented next to the `ETXTBSY` note.
+
+`CapEff` showing `CAP_SYS_ADMIN` is not proof the kernel's `capable()`
+(initial user namespace) agrees, and a cache directory on overlayfs is
+refused as stacked (`ELOOP`): each session therefore registers and closes
+one probe file in the cache directory before it serves
+(`PassthroughState::probe`, `Vfs::passthrough_probe`), and a failure turns
+passthrough off for the session with reason `backing_open`, logged once,
+instead of reporting `enabled` while every open falls back.
+
+**Handover keeps the pins (Z3b).** A backing id belongs to the connection,
+not to the process (`fc->backing_files_map`), and the kernel's
+`fuse_backing` holds its own reference to the backing file, so the kernel
+goes on serving a handed-over passthrough handle from the old process's
+chunk file. The FUSE session's handoff therefore carries the adapter's
+per-inode table with the ids still registered (`FuseHandoff::passthrough`;
+the resumed session reuses an id for later opens of that inode and closes
+it at the last release), the view's snapshot carries each passthrough
+handle's chunk hash and the write-intent counts
+(`HandleTableSnapshot::{passthrough, writers}`), the resumed view re-pins
+those chunks, and the old image keeps its own pins until it `exec`s
+(`close_view_for_handover` no longer drops them). What crosses changed, so
+`HANDOVER_VERSION` is 4 (plan 39 took 3 for its per-open handles and
+discard error events, which cross alongside): an image without the table
+is refused by the handover ABI check rather than resumed.
+
 ### 3(d) Zero-copy on 7.3+
 
 `FUSE_IO_URING_CMD_ADD_QUEUE` with the `FUSE_URING_ZERO_COPY` flag,

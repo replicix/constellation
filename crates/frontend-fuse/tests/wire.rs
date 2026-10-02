@@ -194,6 +194,13 @@ const KERNEL_INIT_FLAGS: u32 = (1 << 1) | (1 << 10) | (1 << 18); // POSIX_LOCKS 
 
 impl Kernel {
     fn start<V: Vfs>(vfs: Arc<V>, caps: FrontendCaps, workers: usize) -> Kernel {
+        let fs = FuseFs::new(vfs, caps, KernelTuning::for_workers(workers));
+        Kernel::start_fs(fs, KERNEL_INIT_FLAGS, 0)
+    }
+
+    /// A session over `fs`, whose kernel offers `flags`/`flags2` at
+    /// `FUSE_INIT` (`flags2` needs `FUSE_INIT_EXT` in `flags`).
+    fn start_fs<V: Vfs>(fs: FuseFs<V>, flags: u32, flags2: u32) -> Kernel {
         let (kernel, daemon) = UnixDatagram::pair().expect("socketpair");
         kernel
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -217,16 +224,15 @@ impl Kernel {
             .u32(7)
             .u32(36)
             .u32(1 << 17)
-            .u32(KERNEL_INIT_FLAGS)
-            .u32(0)
+            .u32(flags)
+            .u32(flags2)
             .bytes(&[0u8; 44]);
         let init_unique = k.send(op::INIT, 0, &body.0);
         let mut config = fuser::Config::default();
         config.acl = fuser::SessionACL::All;
         config.n_threads = Some(1);
         // Thread `DYING_PID` has a fatal signal pending; no other has.
-        let fs = FuseFs::new(vfs, caps, KernelTuning::for_workers(workers))
-            .with_fatal_signal_probe(|pid| pid == DYING_PID);
+        let fs = fs.with_fatal_signal_probe(|pid| pid == DYING_PID);
         let session =
             fuser::Session::from_fd(fs, OwnedFd::from(daemon), fuser::SessionACL::All, config)
                 .expect("the FUSE handshake");
@@ -1536,5 +1542,259 @@ fn an_o_sync_write_is_killable_like_an_fsync() {
             "flags {flags:#o} from {pid}"
         );
     }
+    k.finish();
+}
+
+// ------------------------------------------------------- passthrough (Z3b)
+
+/// The backing-id ioctls, faked: a socket pair standing in for
+/// `/dev/fuse` has none. Records every registration and close.
+#[derive(Default)]
+struct FakeBacking {
+    opened: std::sync::Mutex<Vec<u32>>,
+    closed: std::sync::Mutex<Vec<u32>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+/// A foreign trait on a local type (an `Arc` is not one).
+struct FakeOps(Arc<FakeBacking>);
+
+impl constellation_frontend_fuse::passthrough::BackingOps for FakeOps {
+    fn open(
+        &self,
+        _dev: Option<std::os::fd::BorrowedFd<'_>>,
+        _fd: std::os::fd::BorrowedFd<'_>,
+    ) -> std::io::Result<u32> {
+        if self.0.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        }
+        let mut opened = self.0.opened.lock().unwrap();
+        let id = 40 + opened.len() as u32;
+        opened.push(id);
+        Ok(id)
+    }
+
+    fn close(&self, _dev: Option<std::os::fd::BorrowedFd<'_>>, id: u32) -> std::io::Result<()> {
+        self.0.closed.lock().unwrap().push(id);
+        Ok(())
+    }
+}
+
+const FUSE_INIT_EXT: u32 = 1 << 30;
+/// `FUSE_PASSTHROUGH` is bit 37: bit 5 of `flags2`.
+const FLAGS2_PASSTHROUGH: u32 = 1 << (37 - 32);
+const FOPEN_DIRECT_IO: u32 = 1 << 0;
+const FOPEN_PASSTHROUGH: u32 = 1 << 7;
+
+fn passthrough_kernel(offer: bool) -> (Kernel, MockVfs, Arc<FakeBacking>) {
+    let mock = MockVfs::new();
+    let fake = Arc::new(FakeBacking::default());
+    let fs = FuseFs::new(
+        Arc::new(mock.clone()),
+        FrontendCaps::linux_fuse(false),
+        KernelTuning::for_workers(1),
+    )
+    .with_passthrough_ops(Box::new(FakeOps(fake.clone())));
+    let flags2 = if offer { FLAGS2_PASSTHROUGH } else { 0 };
+    let k = Kernel::start_fs(fs, KERNEL_INIT_FLAGS | FUSE_INIT_EXT, flags2);
+    (k, mock, fake)
+}
+
+fn backing(byte: u8) -> constellation_vfs::PassthroughChunk {
+    constellation_vfs::PassthroughChunk {
+        fd: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+        len: 1,
+        hash: [byte; 32],
+    }
+}
+
+fn opened_with(fh: u64, b: Option<constellation_vfs::PassthroughChunk>) -> Opened {
+    Opened {
+        fh: Fh(fh),
+        backing: b,
+    }
+}
+
+/// `fuse_open_out`: `(fh, open_flags, backing_id)`.
+fn open_out(r: &Reply) -> (u64, u32, u32) {
+    assert_eq!(r.ok().len(), 16, "fuse_open_out");
+    (r.u64_at(0), r.u32_at(8), r.u32_at(12))
+}
+
+#[test]
+fn passthrough_is_negotiated_only_when_the_kernel_offers_it() {
+    // Offered: `FUSE_PASSTHROUGH` agreed and `max_stack_depth` 1 — what
+    // turns it on in the kernel (`fuse_init_out.max_stack_depth`, offset
+    // 36; `flags2` at 32).
+    let (k, mock, _) = passthrough_kernel(true);
+    assert_ne!(k.init.u32_at(32) & FLAGS2_PASSTHROUGH, 0, "agreed");
+    assert_eq!(k.init.u32_at(36), 1, "max_stack_depth");
+    let _ = mock;
+    k.finish();
+    // Not offered: neither, and no backing is ever registered.
+    let (mut k, mock, fake) = passthrough_kernel(false);
+    assert_eq!(k.init.u32_at(32) & FLAGS2_PASSTHROUGH, 0);
+    assert_eq!(k.init.u32_at(36), 0, "max_stack_depth stays 0");
+    mock.always_open(Script::ok(opened_with(9, Some(backing(1)))));
+    let r = k.call(op::OPEN, 9, &Body::new().i32(libc::O_RDONLY).u32(0));
+    assert_eq!(open_out(&r), (9, 0, 0), "the backing is ignored");
+    assert!(fake.opened.lock().unwrap().is_empty());
+    k.finish();
+}
+
+#[test]
+fn an_opened_backing_becomes_a_passthrough_reply_and_is_closed_once() {
+    let (mut k, mock, fake) = passthrough_kernel(true);
+    mock.always_release(Script::ok(()));
+    mock.always_open(Script::ok(opened_with(9, Some(backing(1)))));
+    let ro = Body::new().i32(libc::O_RDONLY).u32(0);
+    let r = k.call(op::OPEN, 9, &ro);
+    assert_eq!(
+        open_out(&r),
+        (9, FOPEN_PASSTHROUGH, 40),
+        "passthrough on id 40"
+    );
+    // A second open of the same chunk reuses the id: the kernel refuses a
+    // different backing for an inode already in passthrough mode.
+    let r = k.call(op::OPEN, 9, &ro);
+    assert_eq!(open_out(&r), (9, FOPEN_PASSTHROUGH, 40));
+    assert_eq!(*fake.opened.lock().unwrap(), vec![40], "registered once");
+    // A write-only open of it: same backing, served by the daemon.
+    mock.always_open(Script::ok(opened_with(9, None)));
+    let r = k.call(op::OPEN, 9, &Body::new().i32(libc::O_WRONLY).u32(0));
+    assert_eq!(open_out(&r), (9, FOPEN_PASSTHROUGH | FOPEN_DIRECT_IO, 40));
+    // A read-write open the view refuses itself (a frozen view's EROFS,
+    // ENOENT, EACCES): the view's errno, not ETXTBSY (review 38-z3b
+    // must-fix 2).
+    for code in [Code::ReadOnly, Code::NotFound, Code::Access] {
+        mock.always_open(Script::fail(code));
+        let r = k.call(op::OPEN, 9, &Body::new().i32(RW).u32(0));
+        assert_eq!(r.errno(), code.to_linux_errno(), "{code:?}");
+    }
+    // A read-write open the view accepts: ETXTBSY, and the view's handle
+    // is released again at once.
+    mock.always_open(Script::ok(opened_with(9, None)));
+    let releases = mock.calls_of(OpKind::Release).len();
+    let r = k.call(op::OPEN, 9, &Body::new().i32(RW).u32(0));
+    assert_eq!(r.errno(), libc::ETXTBSY);
+    assert_eq!(mock.calls_of(OpKind::Release).len(), releases + 1);
+    assert!(fake.closed.lock().unwrap().is_empty(), "the backing stays");
+    // Three releases close the id exactly once, at the last.
+    let release = Body::new().u64(9).i32(libc::O_RDONLY).u32(0).u64(0);
+    for left in [2, 1] {
+        k.call(op::RELEASE, 9, &release).ok();
+        assert!(fake.closed.lock().unwrap().is_empty(), "{left} still open");
+    }
+    k.call(op::RELEASE, 9, &release).ok();
+    assert_eq!(*fake.closed.lock().unwrap(), vec![40]);
+    // The view saw every release (its pins go there): the three, and the
+    // refused open's.
+    assert_eq!(mock.calls_of(OpKind::Release).len(), 4);
+    // Nothing open: the read-write open goes through now.
+    mock.always_open(Script::ok(opened_with(9, None)));
+    let r = k.call(op::OPEN, 9, &Body::new().i32(RW).u32(0));
+    assert_eq!(open_out(&r), (9, 0, 0));
+    k.finish();
+}
+
+#[test]
+fn an_ordinary_handle_or_a_failed_registration_falls_back_to_a_plain_open() {
+    let (mut k, mock, fake) = passthrough_kernel(true);
+    mock.always_release(Script::ok(()));
+    // An ordinary handle open on the inode: the kernel would refuse a
+    // passthrough open (ETXTBSY, EIO to the opener), so it is plain.
+    mock.always_open(Script::ok(opened_with(5, None)));
+    k.call(op::OPEN, 5, &Body::new().i32(RW).u32(0)).ok();
+    mock.always_open(Script::ok(opened_with(5, Some(backing(1)))));
+    let r = k.call(op::OPEN, 5, &Body::new().i32(libc::O_RDONLY).u32(0));
+    assert_eq!(open_out(&r), (5, 0, 0));
+    assert!(fake.opened.lock().unwrap().is_empty());
+    // The registration fails (EPERM: no CAP_SYS_ADMIN where it counts):
+    // plain, and nothing to close.
+    fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    mock.always_open(Script::ok(opened_with(6, Some(backing(2)))));
+    let r = k.call(op::OPEN, 6, &Body::new().i32(libc::O_RDONLY).u32(0));
+    assert_eq!(open_out(&r), (6, 0, 0));
+    k.call(op::RELEASE, 6, &Body::new().u64(6).i32(0).u32(0).u64(0))
+        .ok();
+    assert!(fake.closed.lock().unwrap().is_empty());
+    k.finish();
+}
+
+/// Plan 39's handle bookkeeping and this chunk's backing ids, together:
+/// every passthrough open is the view's own handle, an `fsync` on one
+/// reaches the view with that handle (the kernel sends it to the daemon
+/// even in passthrough mode), every release — the refused read-write
+/// open's included — hands the view back the handle it was opened with,
+/// and the backing id is closed exactly once, at the inode's last
+/// passthrough release.
+#[test]
+fn a_passthrough_handle_fsyncs_and_releases_its_own_handle_and_the_id_once() {
+    let (mut k, mock, fake) = passthrough_kernel(true);
+    mock.always_release(Script::ok(()));
+    mock.always_fsync(Script::ok(()));
+    mock.on_open(Script::ok(opened_with(11, Some(backing(3)))));
+    mock.on_open(Script::ok(opened_with(12, Some(backing(3)))));
+    mock.on_open(Script::ok(opened_with(13, None)));
+    let ro = Body::new().i32(libc::O_RDONLY).u32(0);
+    let r = k.call(op::OPEN, 7, &ro);
+    assert_eq!(open_out(&r), (11, FOPEN_PASSTHROUGH, 40));
+    let r = k.call(op::OPEN, 7, &ro);
+    assert_eq!(open_out(&r), (12, FOPEN_PASSTHROUGH, 40));
+    // A read-write open the view accepted with handle 13: ETXTBSY, and
+    // handle 13 goes back to the view.
+    let r = k.call(op::OPEN, 7, &Body::new().i32(RW).u32(0));
+    assert_eq!(r.errno(), libc::ETXTBSY);
+    assert_eq!(
+        mock.last_call().unwrap().args,
+        Args::Release {
+            ino: 7,
+            fh: Fh(13),
+            flags: OpenFlags::READ | OpenFlags::WRITE,
+            owner: None,
+        }
+    );
+    // fsync and fdatasync on the first handle: the view's barrier on it.
+    for datasync in [0u32, 1] {
+        let r = k.call(op::FSYNC, 7, &Body::new().u64(11).u32(datasync).u32(0));
+        assert_eq!(r.error, 0);
+        assert_eq!(
+            mock.last_call().unwrap().args,
+            Args::Fsync {
+                ino: 7,
+                fh: Fh(11),
+                level: Durability::Configured
+            }
+        );
+    }
+    assert!(
+        fake.closed.lock().unwrap().is_empty(),
+        "fsync closes nothing"
+    );
+    let release = |fh: u64| Body::new().u64(fh).i32(libc::O_RDONLY).u32(0).u64(0);
+    k.call(op::RELEASE, 7, &release(11)).ok();
+    assert!(
+        fake.closed.lock().unwrap().is_empty(),
+        "handle 12 still open"
+    );
+    k.call(op::RELEASE, 7, &release(12)).ok();
+    assert_eq!(*fake.closed.lock().unwrap(), vec![40], "closed once");
+    // Each handle went back to the view once, with its own number.
+    let released: Vec<Fh> = mock
+        .calls_of(OpKind::Release)
+        .into_iter()
+        .map(|c| match c.args {
+            Args::Release { fh, .. } => fh,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(released, vec![Fh(13), Fh(11), Fh(12)]);
+    assert_eq!(*fake.opened.lock().unwrap(), vec![40], "registered once");
+    // The inode left passthrough mode: the next open registers anew.
+    mock.on_open(Script::ok(opened_with(14, Some(backing(3)))));
+    let r = k.call(op::OPEN, 7, &ro);
+    assert_eq!(open_out(&r), (14, FOPEN_PASSTHROUGH, 41));
+    k.call(op::RELEASE, 7, &release(14)).ok();
+    assert_eq!(*fake.closed.lock().unwrap(), vec![40, 41]);
     k.finish();
 }

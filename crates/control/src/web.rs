@@ -635,6 +635,11 @@ pub fn render_metrics(status: &StatusReport) -> String {
         status.cache.pinned_bytes
     );
     gauge!(
+        "constellation_cache_open_pins",
+        "Chunk holders kept un-evictable for open FUSE passthrough handles.",
+        status.cache.open_pins
+    );
+    gauge!(
         "constellation_cache_memory_budget_bytes",
         "Chunk memory cache budget (0: off).",
         status.cache.memory_budget_bytes
@@ -1254,6 +1259,8 @@ mod tests {
                         enabled: true,
                         opens: 3,
                         unavailable_reason: None,
+                        refused_opens: 0,
+                        opens_total: 0,
                     },
                     ..Default::default()
                 },

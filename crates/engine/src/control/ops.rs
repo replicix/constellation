@@ -622,8 +622,9 @@ pub(super) mod tests {
     }
 
     /// Plan 38 §5: the host's per-session FUSE state reaches
-    /// `node.status.fuse` per mount, with the view's own passthrough
-    /// status filled in by the engine; the host's process-wide fallback
+    /// `node.status.fuse` per mount — its passthrough section included
+    /// (plan 38 Z3b: the session's is the authoritative one), the view's
+    /// own filled in where the host has none; the host's process-wide fallback
     /// counter reaches `/metrics` and `stats.subscribe`; and the mount's
     /// `MountInfo::transport` is the same value.
     #[test]
@@ -644,12 +645,15 @@ pub(super) mod tests {
             views[0].fuse = Some(api::FuseMountStatus {
                 transport: "dev_fuse".into(),
                 last_fallback: Some(fallback.clone()),
-                // What the host claims is overwritten by the engine.
+                // The id is overwritten by the engine; the session's
+                // passthrough section is kept.
                 id: 999,
                 passthrough: api::FusePassthroughStatus {
                     enabled: true,
                     opens: 42,
                     unavailable_reason: None,
+                    refused_opens: 3,
+                    opens_total: 9,
                 },
                 ..Default::default()
             });
@@ -670,10 +674,16 @@ pub(super) mod tests {
         let mount = &status.fuse.mounts[0];
         assert_eq!((mount.id, mount.mountpoint.as_str()), (id, "/ops-test/0"));
         assert_eq!(mount.last_fallback.as_ref(), Some(&fallback));
-        // `linux_fuse` declares no passthrough until plan 38 Z3b.
-        assert!(!mount.passthrough.enabled);
-        assert_eq!(mount.passthrough.opens, 0);
-        assert!(mount.passthrough.unavailable_reason.is_some());
+        assert_eq!(
+            mount.passthrough,
+            api::FusePassthroughStatus {
+                enabled: true,
+                opens: 42,
+                unavailable_reason: None,
+                refused_opens: 3,
+                opens_total: 9,
+            }
+        );
         let info = status.mounts.iter().find(|m| m.id == id).unwrap();
         assert_eq!(info.transport.as_deref(), Some("dev_fuse"));
         // Round-trips as the schema describes it.
@@ -701,7 +711,7 @@ pub(super) mod tests {
         for line in [
             r#"constellation_fuse_transport_fallbacks_total{from="uring",to="dev_fuse",reason="kernel_not_offered"} 1"#,
             "constellation_fuse_zero_copy_reads_total 0",
-            r#"constellation_fuse_passthrough_opens{mountpoint="/ops-test/0"} 0"#,
+            r#"constellation_fuse_passthrough_opens{mountpoint="/ops-test/0"} 42"#,
             r#"constellation_fuse_uring_queue_depth{mountpoint="/ops-test/0",transport="dev_fuse"} 0"#,
         ] {
             assert!(body.lines().any(|l| l == line), "{line}\n{body}");
@@ -715,7 +725,15 @@ pub(super) mod tests {
             sample.counters["constellation_fuse_zero_copy_reads_total"],
             0
         );
-        assert_eq!(sample.gauges["constellation_fuse_passthrough_opens"], 0.0);
+        assert_eq!(sample.gauges["constellation_fuse_passthrough_opens"], 42.0);
         assert_eq!(sample.gauges["constellation_fuse_uring_queue_depth"], 0.0);
+
+        // A host with no passthrough answer of its own gets the view's:
+        // `linux_fuse` declares none until `FUSE_INIT` agrees it.
+        host.0.lock().unwrap()[0].fuse.as_mut().unwrap().passthrough = Default::default();
+        let mount = f.svc.status().fuse.mounts[0].passthrough.clone();
+        assert!(!mount.enabled);
+        assert_eq!(mount.opens, 0);
+        assert_eq!(mount.unavailable_reason.as_deref(), Some("frontend"));
     }
 }

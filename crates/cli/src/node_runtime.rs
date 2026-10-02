@@ -270,6 +270,15 @@ impl NodeRuntime {
         let profile =
             EngineProfile::from_env(EngineProfile::desktop()).map_err(anyhow::Error::msg)?;
         let engine = engines.add_engine(fs_id, engine, host.clone(), profile)?;
+        // Plan 38 Z3b: `--cache-verify always` (or its env override, which
+        // only the engine has resolved) turns passthrough off for every
+        // mount, with that as the reason `node.status` reports.
+        let fuse_transport =
+            if engine.cache().verify_mode() == constellation_fs_core::cache::CacheVerify::Always {
+                fuse_transport.with_cache_verify_always()
+            } else {
+                fuse_transport
+            };
         let node = Arc::new(NodeRuntime {
             host,
             engines,

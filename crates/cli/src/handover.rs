@@ -122,7 +122,9 @@ use std::time::{Duration, Instant};
 /// parse this handoff nor serve the handles the kernel holds, so the ABI
 /// probe refuses the mix up front. 4 — plan 37 K3a, a mount carries
 /// `foreign` (made by someone else, `view.mount{PreopenedFd}`).
-pub const HANDOVER_VERSION: u32 = 4;
+/// 5 — plan 38 Z3b, passthrough table + write-intent counts + passthrough
+/// chunk hashes.
+pub const HANDOVER_VERSION: u32 = 5;
 
 /// `daemon.lock`'s descriptor (held for the process's life; handed on).
 static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
@@ -328,6 +330,9 @@ pub struct MountHandoff {
     /// image ends the session rather than unmounting `mountpoint`, which
     /// is only its name (`FuseHandoff::foreign`).
     foreign: bool,
+    /// Plan 38 Z3b: the session's passthrough table, its backing ids
+    /// still registered (`FuseHandoff::passthrough`).
+    passthrough: constellation_frontend_fuse::PassthroughHandoff,
     view: ViewHandoff,
 }
 
@@ -765,7 +770,12 @@ fn hand_over(node: Arc<NodeRuntime>, binary: PathBuf, detached: Vec<Detached>) {
         tracing::warn!(error = %format!("{e:#}"), "the pre-handover drain left work for the next image");
     }
     let mut mounts = Vec::new();
+    // Kept until the `exec`: a view's passthrough pins keep the chunks the
+    // kernel serves handed-over handles from un-evictable (plan 38 Z3b),
+    // and the next image re-pins them from the snapshot.
+    let mut views = Vec::new();
     for (t, handoff) in detached {
+        views.push(t.view.clone());
         let view = match handoff.view {
             Ok(view) => view,
             Err(_) => unreachable!("prepare keeps only exported views"),
@@ -781,6 +791,7 @@ fn hand_over(node: Arc<NodeRuntime>, binary: PathBuf, detached: Vec<Detached>) {
             foreign: handoff.fuse.foreign,
             fuse_fd: handoff.fuse.fuse_fd.into_raw_fd(),
             init: handoff.fuse.init,
+            passthrough: handoff.fuse.passthrough,
             view,
         });
     }
@@ -971,6 +982,7 @@ fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
             init: m.init,
             mountpoint: Some(m.mountpoint.clone()),
             foreign: m.foreign,
+            passthrough: m.passthrough.clone(),
         },
         view.clone(),
         &options,
@@ -1057,6 +1069,7 @@ mod tests {
                 constellation_frontend_fuse::TransportConfig {
                     policy: constellation_frontend_fuse::TransportPolicy::Auto,
                     uring_queue_depth: 4,
+                    ..Default::default()
                 },
             ),
             mounts: Vec::new(),

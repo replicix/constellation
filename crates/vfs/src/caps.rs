@@ -78,12 +78,13 @@ pub struct FrontendCaps {
     pub abortable: bool,
     /// The frontend can read a handle's data straight from a backing file
     /// the engine hands it ([`crate::Opened::backing`], plan 38 §3(c)).
-    /// `false` — every frontend, until one demonstrably consumes it —
-    /// means the engine never offers one, so it never opens a chunk file
-    /// or holds it un-evictable for a reader that would ignore it. Linux
-    /// FUSE sets it once its adapter wires `FOPEN_PASSTHROUGH` (plan 38
-    /// Z3b); there is no [`Cap`] for it yet because nothing gates a test
-    /// or a scenario on it (as for `max_io` and `deferrable`).
+    /// `false` means the engine never offers one, so it never opens a
+    /// chunk file or holds it un-evictable for a reader that would ignore
+    /// it. Linux FUSE declares `false` and turns it on at `FUSE_INIT`,
+    /// when the kernel offered `FUSE_PASSTHROUGH` and the process holds
+    /// `CAP_SYS_ADMIN` (plan 38 Z3b, `Vfs::frontend_negotiated`); there
+    /// is no [`Cap`] for it because a scenario gates on the kernel and the
+    /// capability, not on the frontend (as for `max_io` and `deferrable`).
     pub passthrough: bool,
 }
 
@@ -114,9 +115,10 @@ impl FrontendCaps {
             deferrable: OpKindSet::ALL,
             open_unlinked: OpenUnlinked::Keep,
             abortable: true,
-            // Plan 38 Z3b wires the adapter's `FOPEN_PASSTHROUGH` reply
-            // and flips this where the kernel negotiates it; until then
-            // the adapter would drop a backing file it was handed.
+            // Off until `FUSE_INIT` says otherwise: the adapter flips it
+            // (and tells the view, `Vfs::frontend_negotiated`) only when
+            // the kernel offered `FUSE_PASSTHROUGH` and the process can
+            // register backing files (plan 38 Z3b).
             passthrough: false,
         }
     }
@@ -302,7 +304,7 @@ mod tests {
             assert!(caps.abortable);
             assert!(
                 !caps.passthrough,
-                "the adapter ignores Opened::backing until plan 38 Z3b"
+                "declared off; FUSE_INIT turns it on where the kernel agrees"
             );
             assert_eq!(caps.max_io, 16 << 20);
             for &kind in OpKind::ALL {

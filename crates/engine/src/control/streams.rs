@@ -281,6 +281,7 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
             .max()
             .unwrap_or(0) as f64,
     );
+    g("cache_open_pins", status.cache.open_pins as f64);
     StatsSample {
         unix_ms: now_ms(),
         counters,

@@ -8,13 +8,15 @@
 //! view's, beneath the trait; this crate holds the FUSE protocol: flag
 //! decoding, the attribute and errno encodings ([`reply_code`]), the
 //! `FUSE_INIT` negotiation, the kernel's cache notifications
-//! ([`FuseNotifySink`]), the dispatcher sizing ([`threads`]), the mount
-//! itself ([`mount`]) and what a session reports about its transport
+//! ([`FuseNotifySink`]), the dispatcher sizing ([`threads`]), FUSE
+//! passthrough ([`passthrough`], plan 38 Z3b), the mount itself
+//! ([`mount`]) and what a session reports about its transport
 //! ([`stats`]). It is the only crate that depends on
 //! `fuser`.
 
 mod adapter;
 mod notify;
+pub mod passthrough;
 mod reply;
 mod session;
 pub mod stats;
@@ -24,6 +26,10 @@ pub use adapter::{FuseFs, KernelTuning};
 pub use constellation_vfs::FrontendCaps;
 pub use fuser::{NegotiatedInit, Transport};
 pub use notify::FuseNotifySink;
+pub use passthrough::{
+    has_cap_sys_admin, InodeHandoff, PassthroughHandoff, PassthroughPolicy, PassthroughState,
+    PassthroughStatus, PassthroughWish, PASSTHROUGH_ENV,
+};
 pub use reply::reply_code;
 pub use session::{
     mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, HandoverCapable,

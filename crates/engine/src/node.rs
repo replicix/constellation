@@ -1860,10 +1860,11 @@ impl Engine {
     /// application still has open).
     pub fn close_view_for_handover(&self, view: &View) {
         let id = view.id();
-        // As `close_view`: the descriptors and the pins are this
-        // process's, and `import_handles` has nothing to rebuild them
-        // from — the resumed view's own opens do that.
-        view.drop_all_passthrough();
+        // Not `drop_all_passthrough`, unlike `close_view`: the kernel goes
+        // on serving the handed-over passthrough handles from the backing
+        // files this process registered, so their chunks stay pinned here
+        // until the process `exec`s (the view lives that long), and the
+        // resumed view re-pins them from the snapshot (plan 38 Z3b).
         if let Some(k) = &self.kernel_inval {
             k.unregister(id);
         }

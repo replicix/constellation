@@ -473,25 +473,11 @@ fn run(opts: RunOpts) -> Result<()> {
             skipped.push(s.name);
             continue;
         }
-        // Plan 38 Z2a: a kernel/build requirement, skipped with its reason.
-        if let Some(why) = s.requires.iter().find_map(|r| suites::unavailable(r)) {
-            eprintln!("=== {} SKIPPED ({why})", s.name);
-            report.push(s.name, Outcome::Skipped, 0.0, Some(why));
-            skipped.push(s.name);
-            continue;
-        }
-        if let Some(missing) = s
-            .requires
-            .iter()
-            .find(|b| !suites::is_platform_requirement(b) && !suites::have(b))
-        {
-            eprintln!("=== {} SKIPPED ({missing} not installed)", s.name);
-            report.push(
-                s.name,
-                Outcome::Skipped,
-                0.0,
-                Some(format!("{missing} not installed")),
-            );
+        // A missing tool, or a kernel/build/privilege requirement (plan 38
+        // Z2a/Z3b), is a skip that names it.
+        if let Some(missing) = s.requires.iter().find_map(|r| suites::missing(r)) {
+            eprintln!("=== {} SKIPPED ({missing})", s.name);
+            report.push(s.name, Outcome::Skipped, 0.0, Some(missing));
             skipped.push(s.name);
             continue;
         }

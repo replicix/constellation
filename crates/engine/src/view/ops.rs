@@ -96,6 +96,14 @@ fn err<T>(code: Code) -> Result<T, VfsError> {
 const XATTR_VALUE_MAX: usize = 64 * 1024;
 
 impl Vfs for View {
+    fn frontend_negotiated(&self, caps: &FrontendCaps) {
+        self.set_passthrough_on(caps.passthrough);
+    }
+
+    fn passthrough_probe(&self) -> Option<std::io::Result<std::fs::File>> {
+        Some(self.cache.probe_file())
+    }
+
     fn identity(&self) -> ViewIdentity {
         ViewIdentity {
             id: self.id,
@@ -892,6 +900,7 @@ impl Vfs for View {
         match attr {
             Ok(Some(attr)) => {
                 *self.opens.lock().unwrap().entry(ino).or_insert(0) += 1;
+                self.note_writer_open(ino, flags);
                 // Plan 38 §3(c): a read-only open of a one-chunk file
                 // whose chunk is cached and verified is answered with the
                 // chunk file itself, and the pin that keeps it where the
@@ -931,6 +940,7 @@ impl Vfs for View {
         match result {
             Ok((attr, _created)) => {
                 *self.opens.lock().unwrap().entry(attr.ino).or_insert(0) += 1;
+                self.note_writer_open(attr.ino, flags);
                 r.done(Ok((
                     self.entry_out(&attr),
                     Opened::new(self.open_handle(attr.ino)),
@@ -1157,6 +1167,7 @@ impl Vfs for View {
         // disk cache's pin on it (plan 38 §3(c)). `release` does not name
         // which handle closed, so what is dropped is whatever the inode
         // holds beyond the handles still open on it.
+        self.note_writer_release(ino, flags);
         self.drop_passthrough(ino, still_open);
         if last {
             self.forget_discard_errors(ino);

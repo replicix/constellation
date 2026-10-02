@@ -9,10 +9,11 @@
 //! on every path, including a `lock-wait` thread that could not be
 //! started (`constellation_engine::locks::ClusterLocks::lock`).
 
+use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
 use constellation_types::Code;
 use constellation_vfs::{
-    Attr, DirSink, Entry, FileKind, Ino, LockKind, LockStatus, Opened, ReadData, Responder, StatFs,
-    VfsResult, XattrNameBuf,
+    Attr, DirSink, Entry, Fh, FileKind, Ino, LockKind, LockStatus, OpenFlags, Opened, ReadData,
+    Responder, StatFs, VfsResult, XattrNameBuf,
 };
 use fuser::{
     Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
@@ -21,6 +22,7 @@ use fuser::{
 };
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 /// The Linux FUSE boundary (plan 31 §7): the one place a portable [`Code`]
@@ -171,30 +173,138 @@ impl Responder<()> for EmptyReply {
     }
 }
 
-pub(crate) struct OpenReply(pub ReplyOpen);
+/// Gives back the view's side of an open that was answered but must be
+/// refused after all (`passthrough`'s module doc: a read-write open of an
+/// inode in passthrough mode): a `release` of the handle the view counted.
+pub(crate) type Undo = Box<dyn FnOnce(Ino, Fh) + Send>;
+
+/// How an open's reply is shaped by the session's passthrough state
+/// (plan 38 §3(b)): the inode, the decoded flags and what the open
+/// registered before it called the view.
+pub(crate) struct OpenCtx {
+    pub ino: Ino,
+    pub flags: OpenFlags,
+    pub pre: PreOpen,
+    pub pt: Arc<PassthroughState>,
+    pub undo: Undo,
+}
+
+/// The `FOPEN_*` word and backing id of an answer that is not a refusal.
+fn fopen(answer: OpenAnswer) -> Option<(FopenFlags, Option<u32>)> {
+    match answer {
+        OpenAnswer::Plain => Some((FopenFlags::empty(), None)),
+        OpenAnswer::Passthrough { id, direct_io } => Some((
+            if direct_io {
+                FopenFlags::FOPEN_DIRECT_IO
+            } else {
+                FopenFlags::empty()
+            },
+            Some(id),
+        )),
+        OpenAnswer::Refuse(_) => None,
+    }
+}
+
+pub(crate) struct OpenReply {
+    pub reply: ReplyOpen,
+    pub cx: OpenCtx,
+}
 
 impl Responder<Opened> for OpenReply {
     fn done(self, r: VfsResult<Opened>) {
+        let OpenReply { reply, cx } = self;
         match r {
-            Ok(o) => self.0.opened(FileHandle(o.fh.0), FopenFlags::empty()),
-            Err(e) => self.0.error(reply_code(e.code())),
+            Ok(o) => {
+                // Without passthrough on the session `o.backing` is simply
+                // dropped here; the engine's pin on it goes at `release`.
+                let answer = cx
+                    .pt
+                    .on_open_reply(cx.ino, cx.flags, cx.pre, o.backing.as_ref());
+                let fh = FileHandle(o.fh.0);
+                match fopen(answer) {
+                    Some((flags, None)) => reply.opened(fh, flags),
+                    Some((flags, Some(id))) => {
+                        // SAFETY: `id` is registered on this connection and
+                        // stays so until the inode's last passthrough handle
+                        // is released (`PassthroughState::release`), which
+                        // cannot precede this reply; `into_raw` below keeps
+                        // the wrapper from closing it.
+                        let backing = unsafe { reply.wrap_backing(id) };
+                        reply.opened_passthrough(fh, flags, &backing);
+                        let _ = backing.into_raw();
+                    }
+                    None => {
+                        (cx.undo)(cx.ino, o.fh);
+                        if let OpenAnswer::Refuse(code) = answer {
+                            reply.error(reply_code(code));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                cx.pt.open_failed(cx.ino, cx.pre);
+                reply.error(reply_code(e.code()))
+            }
         }
     }
 }
 
-pub(crate) struct CreateReply(pub ReplyCreate);
+pub(crate) struct CreateReply {
+    pub reply: ReplyCreate,
+    /// `ino` is learnt from the reply; `pre` is always `Unregistered`.
+    pub cx: OpenCtx,
+}
 
 impl Responder<(Entry, Opened)> for CreateReply {
     fn done(self, r: VfsResult<(Entry, Opened)>) {
+        let CreateReply { reply, cx } = self;
         match r {
-            Ok((e, o)) => self.0.created(
-                &e.attr.ttl,
-                &fuse_attr(&e.attr),
-                Generation(e.generation),
-                FileHandle(o.fh.0),
-                FopenFlags::empty(),
-            ),
-            Err(e) => self.0.error(reply_code(e.code())),
+            Ok((e, o)) => {
+                // A create can open an existing inode (no `O_EXCL`), and
+                // that inode may be in passthrough mode: the kernel's
+                // per-inode rule applies to it exactly as to an open.
+                //
+                // A `Refuse` here cannot be undone in full: the view's
+                // `create` has already run `O_TRUNC` on the existing file
+                // (a create, unlike an open, carries it to the view), and
+                // the release below gives back only the handle. It is
+                // reachable only when the kernel had no positive dentry
+                // for a file that exists — another node created it since
+                // this one last looked — because otherwise the kernel
+                // sends `FUSE_OPEN`, not `FUSE_CREATE`; and only on a
+                // writable mount that opted in to passthrough. The caller
+                // gets `ETXTBSY` with the truncate kept, as a writer on
+                // another node truncating the file would have left it.
+                let answer = cx
+                    .pt
+                    .on_open_reply(e.attr.ino, cx.flags, cx.pre, o.backing.as_ref());
+                let fh = FileHandle(o.fh.0);
+                let attr = fuse_attr(&e.attr);
+                let generation = Generation(e.generation);
+                match fopen(answer) {
+                    Some((flags, None)) => reply.created(&e.attr.ttl, &attr, generation, fh, flags),
+                    Some((flags, Some(id))) => {
+                        // SAFETY: as in `OpenReply`.
+                        let backing = unsafe { reply.wrap_backing(id) };
+                        reply.created_passthrough(
+                            &e.attr.ttl,
+                            &attr,
+                            generation,
+                            fh,
+                            flags,
+                            &backing,
+                        );
+                        let _ = backing.into_raw();
+                    }
+                    None => {
+                        (cx.undo)(e.attr.ino, o.fh);
+                        if let OpenAnswer::Refuse(code) = answer {
+                            reply.error(reply_code(code));
+                        }
+                    }
+                }
+            }
+            Err(e) => reply.error(reply_code(e.code())),
         }
     }
 }

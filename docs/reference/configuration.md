@@ -60,7 +60,7 @@ because they combine with it. See [Durability and failover](features/durability-
 |---|---|---|---|---|---|
 | `--cto` | `bounded` | `bounded`, `strict` | `CONSTELLATION_CTO` | no | close-to-open mode (plan 30 M8). `strict`: an open, lookup or listing sees every close another node completed before it began |
 | `--locks` | `cluster` with P2P, `local` without | `local`, `cluster` | `CONSTELLATION_LOCKS` | no | `flock`/`fcntl` scope (plan 30 M14). An explicit `cluster` with P2P off fails the mount |
-| `--cache-verify` | `admit` | `admit`, `always` | `CONSTELLATION_CACHE_VERIFY` | no | when a disk-cache read re-hashes the chunk file it read (plan 38 §2.3). Every chunk is blake3-verified exactly once regardless — **while it streams in** from S3 or a peer, before it is ever admitted. `admit`: the local copy is trusted afterwards; a file a restart's directory scan found is still hashed on its first read (and then trusted). `always`: every disk read hashes again, so local corruption after admission (a bad sector, a scrub miss, a writer into the cache directory) is caught on the next read instead of at the next restart, at one blake3 pass per read. Echoed in `node.status` as `cache.cache_verify` (node-wide, so the per-mount `fuse` section does not repeat it); an unparseable `CONSTELLATION_CACHE_VERIFY` is warned about and ignored (see below the table), while an unparseable `--cache-verify` fails the mount before the daemon forks. Plan 38's later milestones also make `always` disable FUSE zero-copy and passthrough, which by construction let the kernel serve a chunk file without the daemon seeing the bytes |
+| `--cache-verify` | `admit` | `admit`, `always` | `CONSTELLATION_CACHE_VERIFY` | no | when a disk-cache read re-hashes the chunk file it read (plan 38 §2.3). Every chunk is blake3-verified exactly once regardless — **while it streams in** from S3 or a peer, before it is ever admitted. `admit`: the local copy is trusted afterwards; a file a restart's directory scan found is still hashed on its first read (and then trusted). `always`: every disk read hashes again, so local corruption after admission (a bad sector, a scrub miss, a writer into the cache directory) is caught on the next read instead of at the next restart, at one blake3 pass per read. Echoed in `node.status` as `cache.cache_verify` (node-wide, so the per-mount `fuse` section does not repeat it); an unparseable `CONSTELLATION_CACHE_VERIFY` is warned about and ignored (see below the table), while an unparseable `--cache-verify` fails the mount before the daemon forks. `always` also turns FUSE passthrough off (see [FUSE passthrough](#fuse-passthrough) below; `node.status` reports the reason `cache_verify_always`), and plan 38 Z4 will do the same for zero-copy: both let the kernel serve a chunk file without the daemon seeing the bytes |
 | `--fuse-transport` | `dev-fuse` | `dev-fuse`, `auto` | `CONSTELLATION_FUSE_TRANSPORT` | no | **`auto` is not the default until plan 38 Z2c** (see the note below the table). Which transport this daemon's **plain** Linux mounts are served over (plan 38 §2.4). `dev-fuse`: `read(2)`/`writev(2)` on `/dev/fuse`, every kernel and every platform. `auto`: run the ladder — FUSE-over-io_uring when the binary carries the `io-uring` cargo feature, the kernel is 6.14+ with `fuse.enable_uring=Y`, and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once rather than failing the mount. Runtime-negotiated, never a build-time choice, and fixed for a connection's life: what a mount actually got is `node.status`'s per-mount `transport` (`dev_fuse`/`uring`/`uring_zc`, in `mounts[]` and in `fuse.mounts[]`), and the label `transport` on that mount's `constellation_vfs_ops_total`/`constellation_vfs_op_seconds` rows. A mount that asked for `auto` and got `/dev/fuse` records why in `fuse.mounts[].last_fallback` (`reason`: `no_io_uring_feature`, `kernel_not_offered`, `ring_setup_failed` or `handover_capable`, with a free-text `detail` and the time) and counts once in `constellation_fuse_transport_fallbacks_total{from,to,reason}`; the default `dev-fuse` asked for no ring and records no fallback. **A mount served over a ring cannot be handed to another process image**, so `daemon --upgrade`/`node.handoff` refuses it by name (plan 38 §3(e)/Z0a) — unmount and remount is the only upgrade path for such a mount. Mounts that are handover-capable by construction (`view.mount` on a descriptor somebody else opened, and anything an upgrade resumes) are `dev_fuse` whatever this says — with `auto` set, they report a `handover_capable` fallback |
 | `--fuse-uring-queue-depth` | `8` | a positive integer | `CONSTELLATION_FUSE_URING_QUEUE_DEPTH` | no | ring entries per kernel queue, read only when a mount's transport resolves to a ring. The reserved buffer is `queues x depth x max_write` of `MAP_NORESERVE` address space per mount (plan 38 §4), so this is the knob for an operator who has measured their own RSS/throughput trade-off and wants a different point on it. It also bounds blocking lock waits: at most `depth - 1` of one queue's entries wait for a lock (see the note below the table), so a depth of `1` serves every contended blocking `fcntl`/`flock` lock with `ENOLCK`. Reported per mount as `node.status`'s `fuse.mounts[].uring_queue_depth` and `/metrics`' `constellation_fuse_uring_queue_depth{mountpoint,transport}` — `0` on a `/dev/fuse` mount, which has no ring queues. Handover-capable mounts never use it (they are `dev_fuse`) |
 | `--fsync-mode` | `local` | `local`, `s3` | none | yes | what `fsync()` waits for. `local`: the node's metadata store is forced to disk. `s3`: also the file's chunks and the journal up to the call are in the bucket. `s3` also forces `--write-mode through`. Whatever it waits for, it waits like an NFS `hard` mount (plan 39): a *transient* S3 failure (timeout, refused or reset connection, 5xx, `SlowDown`, …) is retried with backoff until the data is durable, never answered `EIO`; a failure waiting cannot fix (`AccessDenied`, `NoSuchBucket`, a disabled KMS key, …) is `EIO` at once. Killable, not interruptible (as NFS `hard`): a signal the process handles (a timer, a caught `SIGINT`/`SIGTERM`) leaves it waiting, and only a signal that kills the process (`SIGKILL`, an unhandled default-fatal signal) ends the wait (`EINTR`, which the dying process never sees) — detected from the caller thread's pending `SIGKILL` in `/proc/<tid>/status`, so a caller the daemon cannot see there (another pid namespace, `hidepid`) is not killable until S3 returns or a timeout below ends the wait. An `O_SYNC`/`O_DSYNC` write waits the same way and answers `EIO` when cut short. In every failed case the data stays pending and the next `fsync` waits for it again. `fsyncdir` (an `fsync` of a directory) is the same barrier for the directory's entries |
@@ -92,15 +92,12 @@ Stop the daemon, or set the environment variable before the mount that
 starts it.
 
 **FUSE passthrough** (plan 38 §3(c): the kernel reads a single-chunk file
-straight from its cached chunk) has no knob of its own yet — there is no
-`CONSTELLATION_FUSE_PASSTHROUGH`; the frontend that consumes backing files
-lands in plan 38 Z3b. Until then every mount reports
-`fuse.mounts[].passthrough.enabled: false` with its `unavailable_reason`, and
-`constellation_fuse_passthrough_opens` is 0. When it lands it is off under
-`--cache-verify always` (the kernel serving bytes the daemon never sees cannot
-be "hashed on every read"), and `unavailable_reason` says so. Zero-copy reads (plan 38 Z4) are likewise counted
-(`fuse.mounts[].zero_copy_reads`, `constellation_fuse_zero_copy_reads_total`)
-and are 0 until then.
+straight from its cached chunk) is on by default for **read-only** mounts
+(snapshot views) where the kernel and the process allow it, and off for
+writable mounts unless opted in; see [FUSE passthrough](#fuse-passthrough) below for its
+knob, `CONSTELLATION_FUSE_PASSTHROUGH`, and what it changes. Zero-copy reads
+(plan 38 Z4) are counted (`fuse.mounts[].zero_copy_reads`,
+`constellation_fuse_zero_copy_reads_total`) and are 0 until then.
 
 > **Note — `--fuse-transport auto` / `CONSTELLATION_FUSE_TRANSPORT=auto`
 > is not the default yet** (plan 38 Z2c flips plain mounts). It only takes
@@ -148,6 +145,96 @@ and are 0 until then.
 > for the test harness only** (`transport-refused-registration`): a mount
 > that asks for the ring registers it malformed, the kernel refuses, and the
 > mount falls back to `/dev/fuse`. Never set it otherwise.
+
+### FUSE passthrough
+
+On Linux 6.9+ (built with `CONFIG_FUSE_PASSTHROUGH`), a daemon holding
+`CAP_SYS_ADMIN` answers a **read-only open of a file whose whole content is
+one chunk already verified in the local disk cache** by handing the kernel
+the chunk file itself (plan 38 §3(c), Z3): the kernel then serves every read
+of that descriptor from the chunk file, and the daemon never sees them.
+
+**By default only read-only mounts use it** (a snapshot view, which the
+kernel mounts `ro`). A writable mount uses it only with
+`CONSTELLATION_FUSE_PASSTHROUGH=1`, because there it changes what a legal
+`open(O_RDWR)` returns (`ETXTBSY`, below) — on a read-only mount that open
+is `EROFS` before the daemon sees it, so the change cannot arise. Every
+condition is checked once per mount (and per open), and anything short of
+all of them is the ordinary path; a mount that asked and could not have it
+logs that **once** as `passthrough unavailable: <reason>`. A mount checks
+the kernel really accepts a file of the cache directory as a backing file
+once, before it serves anything: a process whose `CAP_SYS_ADMIN` is only a
+user namespace's (`EPERM`), or a cache directory on a stacked filesystem
+such as overlayfs (`ELOOP`), turns it off for the mount with reason
+`backing_open`.
+
+> **Today a read-only mount negotiates passthrough but serves no file by
+> it.** The only read-only mounts are snapshot views, whose files are
+> served as frozen snapshot nodes that the eligibility rule above does not
+> cover yet (it applies to the live tree). Until it does, passthrough
+> serves files only on writable mounts that opted in.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `CONSTELLATION_FUSE_PASSTHROUGH` | unset: read-only mounts only | `1` (also `on`/`true`/`yes`) turns it on for writable mounts too, **with the `ETXTBSY` caveat below**; `0` (`off`/`false`/`no`) turns it off for every mount the daemon makes, read-only ones included. Any other value fails the mount, as an unparseable `CONSTELLATION_FUSE_TRANSPORT` does. Read once, when the daemon starts (like `--fuse-transport`). An embedder sets the same through `MountOptions::passthrough` |
+| `--cache-verify always` | — | turns it off whatever the variable says (the reason reported is `cache_verify_always`) |
+
+What a mount got is `node.status`'s per-mount `fuse.mounts[].passthrough`:
+`enabled`, `opens` (descriptors the kernel serves from a chunk file right
+now), `unavailable_reason` (`writable_mount` — the default on a writable
+mount —, `disabled`, `cache_verify_always`, `no_cap_sys_admin`, `kernel`,
+`backing_open`, `platform`) and
+`refused_opens` (below); `cache.open_pins` counts the disk-cache pins those
+descriptors hold. `/metrics` has `constellation_fuse_passthrough_opens`,
+`constellation_cache_open_pins` and
+`constellation_fuse_transport_fallbacks_total{from="passthrough",to,reason}`
+— the per-mount reasons above, plus per-open `backing_open` (the kernel
+refused to register the chunk file: typically a cache directory on a
+stacked filesystem such as overlayfs, `ELOOP`), `cached_handle_open` (the
+file was also open the ordinary way) and `backing_busy` (the file changed
+while a passthrough descriptor of it was open).
+
+What changes for applications:
+
+- **A passthrough descriptor keeps the bytes it was opened on until it is
+  closed** — close-to-open. That is what a write on another node always
+  meant; on the *same* mount it is new: a descriptor opened *before* a
+  local writer opened the file does not see what the writer writes (every
+  open *after* the writer does, and while any descriptor can write the file,
+  no open of it is passthrough). Close and reopen to see new bytes.
+- **On a writable mount that opted in, a read-write open of a file that is
+  open in passthrough mode fails with `ETXTBSY`** until those descriptors
+  close — whichever process holds them. The kernel requires every open of
+  such a file to share its chunk file (`fs/fuse/iomode.c`: anything else is
+  `EIO`), and a read-write one could write into the cache through a shared
+  `mmap`. Programs that hit this while another process reads the same
+  file: `fopen(f, "r+")`, Java `RandomAccessFile(f, "rw")`, Python
+  `open(f, "r+b")`, SQLite opening a database read-write while a read-only
+  connection holds it, `fallocate(1)`. Write-only opens (appenders,
+  `dd of=`, `rsync --inplace`), new files and editors that save by rename
+  are unaffected: a write-only open is served (by the daemon) and is
+  visible to every later open. When the view itself refuses the open
+  (`EACCES`, `ENOENT`), that is the answer, not `ETXTBSY`.
+- **An `mmap` can show older bytes than `read(2)`** on a writable mount
+  that opted in: while any passthrough descriptor of a file is open, a
+  later descriptor of it (one opened after a write, local or from another
+  node, or a write-only one) reads and writes through the daemon and sees
+  the current bytes, but the kernel maps *its* `mmap` onto the chunk file
+  the first passthrough descriptor was opened on — the old bytes — until
+  every passthrough descriptor of the file is closed. Nothing in the
+  daemon can change this (the kernel has no way to revoke a backing file).
+- **`O_DIRECT` reads of a passthrough descriptor go to the cache's block
+  device** even when the chunk is in the page cache.
+- **An eligible open counts as a read for atime**: with `--atime` on, it
+  bumps the file's atime even if the application never reads a byte.
+- A chunk under an open passthrough descriptor is never evicted; the disk
+  cache's budget can therefore be held by open files, bounded by the open
+  files themselves.
+- Passthrough descriptors survive `daemon --upgrade`: the new image keeps
+  the kernel's backing files and the cache pins. The handover format
+  changed with it (version 3), so an upgrade from or to a binary without
+  passthrough is refused by `daemon --upgrade`'s ABI check; unmount and
+  remount instead.
 
 ### Per-filesystem settings
 

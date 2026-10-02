@@ -46,6 +46,29 @@ pub trait Vfs: Send + Sync + 'static {
         ViewIdentity::default()
     }
 
+    /// The frontend serving this view has settled with its kernel what it
+    /// can actually do, which may be less (or more) than the
+    /// [`crate::FrontendCaps`] it declared before it existed. Only
+    /// [`crate::FrontendCaps::passthrough`] is read today: Linux FUSE
+    /// learns at `FUSE_INIT` whether it can register backing files (plan
+    /// 38 Z3b), after the view was opened. Called before the frontend
+    /// serves anything, and again by a resumed session. Ignored by
+    /// default.
+    fn frontend_negotiated(&self, caps: &crate::FrontendCaps) {
+        let _ = caps;
+    }
+
+    /// A regular file on the filesystem this view's backing files
+    /// ([`crate::Opened::backing`]) live on, for a frontend to check once,
+    /// before it serves, that its kernel will really accept one (Linux
+    /// FUSE registers it as a passthrough backing file and closes it at
+    /// once, plan 38 Z3b: a user namespace's `CAP_SYS_ADMIN` or a stacked
+    /// filesystem is refused there and nowhere earlier). `None`: this view
+    /// never hands out backing files, so there is nothing to check.
+    fn passthrough_probe(&self) -> Option<std::io::Result<std::fs::File>> {
+        None
+    }
+
     /// Resolve `name` in `parent`.
     fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R);
 

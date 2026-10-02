@@ -649,6 +649,27 @@ impl DiskCache {
     /// [`OpenPin`] can open it. Take the pin *first*: a pinned entry is
     /// never evicted, so the path cannot be unlinked between the two
     /// (the other order races with a prune).
+    /// A new, already unlinked regular file in the cache directory: the
+    /// filesystem every chunk file lives on, for a frontend's one-time
+    /// check that its kernel accepts a file from there as a passthrough
+    /// backing file (plan 38 Z3b). It never has a name a scan could see
+    /// (a crash between the create and the unlink leaves a `.tmp` at the
+    /// root, which no scan reads either).
+    pub fn probe_file(&self) -> std::io::Result<fs::File> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self
+            .root
+            .join(format!("passthrough-probe-{}-{n}.tmp", std::process::id()));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let _ = fs::remove_file(&path);
+        Ok(file)
+    }
+
     pub fn chunk_path(&self, hash: &ChunkHash) -> PathBuf {
         self.path_for(hash)
     }
@@ -678,6 +699,17 @@ impl DiskCache {
             cache: Arc::clone(self),
             hash: *hash,
         })
+    }
+
+    /// [`OpenPin`]s over every chunk (`node.status`'s `cache.open_pins`).
+    pub fn open_pin_total(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .open_pins
+            .values()
+            .map(|n| u64::from(*n))
+            .sum()
     }
 
     /// How many [`OpenPin`]s `hash` currently has (tests, diagnostics).
@@ -1335,6 +1367,20 @@ mod tests {
         c.insert(&h, &d, ChunkState::Clean).unwrap();
         assert_eq!(c.get(&h).unwrap(), Some(d));
         assert_eq!(c.usage().used, 100);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_probe_file_is_a_nameless_regular_file_in_the_cache_dir() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 1024).unwrap();
+        let before: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        let f = c.probe_file().unwrap();
+        assert!(f.metadata().unwrap().is_file());
+        assert_eq!(f.metadata().unwrap().nlink(), 0, "unlinked");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), before.len());
+        assert_eq!(c.usage().used, 0);
     }
 
     #[test]

@@ -53,6 +53,8 @@ mod m9;
 /// The OVH real-S3 run's findings: the create race, a non-owner's
 /// per-op S3 round trip.
 mod ovh;
+/// Plan 38 §6/Z3b: FUSE passthrough on a real kernel.
+mod passthrough;
 /// Campaign 6 B-1: a lease holder's `kill -9` and its rejoin, and a
 /// `daemon.lock` still held by a daemon the kernel has killed.
 mod rejoin;
@@ -1410,6 +1412,75 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[crate::suites::FUSE_URING],
         caps: &[Cap::FuseAbort],
         run: transport::transport_abort_while_armed,
+    },
+    Scenario {
+        name: "passthrough-eviction-while-open",
+        desc: "plan 38 §6/Z3b: a single-chunk file held open read-only is served by FUSE \
+               passthrough; node.status counts each descriptor and the disk cache holds one \
+               open pin per descriptor; the cache filled 3x past its budget and pruned to zero \
+               keeps the chunk; after the close it is evicted like any other",
+        requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
+        caps: &[],
+        run: passthrough::eviction_while_open,
+    },
+    Scenario {
+        name: "passthrough-remote-write-cto",
+        desc: "plan 38 §6/Z3b: two nodes; a passthrough handle open on A keeps the bytes it \
+               was opened on after B rewrites the file (close-to-open), while a fresh open on \
+               A sees B's bytes even with the old handle open; after the close a new open is \
+               passthrough on the new chunk",
+        requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
+        caps: &[],
+        run: passthrough::remote_write_cto,
+    },
+    Scenario {
+        name: "passthrough-local-writer",
+        desc: "plan 38 §3(c)/Z3b: on one mount, a read-write open of a passthrough-open file \
+               is refused ETXTBSY; a write-only open is served and every later open sees its \
+               write, while the passthrough handle opened before it keeps its bytes until \
+               closed",
+        requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
+        caps: &[],
+        run: passthrough::local_writer,
+    },
+    Scenario {
+        name: "passthrough-odirect",
+        desc: "plan 38 §6/Z3b: an O_DIRECT read of a passthrough-open file fetches every byte \
+               from the cache's block device even with the chunk warm in the page cache \
+               (/proc/thread-self/io), and no passthrough read, buffered or direct, reaches \
+               the daemon",
+        requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
+        caps: &[],
+        run: passthrough::odirect,
+    },
+    Scenario {
+        name: "passthrough-handover",
+        desc: "plan 38 Z3b: a passthrough handle held across `daemon --upgrade`: the new image \
+               counts it and holds its chunk's pin (a prune keeps the chunk), a new open of the \
+               file reuses the handed-over backing id, and the close in the new image releases \
+               both",
+        requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
+        caps: &[],
+        run: passthrough::handover,
+    },
+    Scenario {
+        name: "passthrough-disabled-by-verify-always",
+        desc: "plan 38 §2.3/Z3b: a mount with --cache-verify always reports passthrough off \
+               with reason cache_verify_always (privileged or not), holds no open pin, and \
+               every read reaches the daemon",
+        requires: &[],
+        caps: &[],
+        run: passthrough::disabled_by_verify_always,
+    },
+    Scenario {
+        name: "passthrough-default-by-mount-mode",
+        desc: "plan 38 §3(c)/Z3b: without CONSTELLATION_FUSE_PASSTHROUGH a writable mount \
+               does not ask (reason writable_mount; a read-write open beside a reader is \
+               ordinary), while a read-only mount of a snapshot of the same file negotiates it \
+               and answers a read-write open EROFS",
+        requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
+        caps: &[],
+        run: passthrough::default_by_mount_mode,
     },
     Scenario {
         name: "lifecycle-suspend-mid-write",

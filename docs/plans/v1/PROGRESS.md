@@ -32675,6 +32675,15 @@ handled signal does not: killable, not interruptible, as NFS `hard`), and
 for data that is still only local. What each `--fsync-mode` waits *for* is
 unchanged (§6 leaves `local`'s chunk wait to the maintainer).
 
+## Plan 38 Z3 — FUSE passthrough for single-chunk read-only opens
+
+Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z3,
+in two chunks: **Z3a** (engine side, `8a8516c`) decides eligibility at open
+and pins the chunk, and **Z3b** (FUSE side, this section) turns
+`Opened::backing` into a `FOPEN_PASSTHROUGH` reply on a kernel and process
+that allow it, reports it, keeps it consistent with the kernel's per-inode
+I/O-mode rule, and carries it across `daemon --upgrade`. **Z3 is closed.**
+
 ### What landed
 
 | Item | State | Where |
@@ -33068,3 +33077,123 @@ and no serde alias is added.
 | `helm lint --strict deploy/helm/constellation-csi`; `make csi-sanity` | 0 failed; Identity 3 passed, Identity\|Controller\|Node 43 passed |
 | fresh `kind-37-k3a`, `tests/csi/k2-smoke.sh` (image `constellation-csi:k3a-fix2`, musl fast path) | k2-smoke PASSED, policies type-check, 1 positive control admitted, 12 controller-SA negatives denied |
 | fresh `kind-37-k3a`, `tests/csi/k3-smoke.sh` (same image) | k3-smoke PASSED, 12 node-SA negatives denied |
+
+| `Opened::backing` / `PassthroughChunk` (fd, len, hash) | done (Z3a) | `crates/vfs/src/types.rs`; `FrontendCaps::passthrough` (`crates/vfs/src/caps.rs`) gates whether the engine offers one at all |
+| Eligibility at open | done (Z3a), extended in Z3b | `View::passthrough_backing` (`crates/engine/src/view/passthrough.rs`): read-only, no write intent, regular non-empty file, no write session (attached or pending flush), one inline chunk, `file_len == size`, resident **and verified**, `--cache-verify admit`. Z3b adds: no other handle of the inode open for writing (`View::writers`, counted from the `OpenFlags` that `open`/`create` and `release` carry), and the frontend's *negotiated* capability (`passthrough_on`, set through the new `Vfs::frontend_negotiated`) instead of the one it declared before `FUSE_INIT` |
+| Pin-while-open | done (Z3a) | `DiskCache::pin_open`/`OpenPin` (`crates/fs-core/src/cache.rs`): a per-chunk refcount that keeps the chunk un-evictable without changing accounting; `release` trims an inode's pins to its handles still open. Z3b adds `DiskCache::open_pin_total` → `node.status` `cache.open_pins`, `/metrics` `constellation_cache_open_pins`, `stats.subscribe` `cache_open_pins` |
+| Scan-ahead and **atime at open** | done (Z3a) | A passthrough-eligible open fires the scan-ahead hook and **bumps atime at open** (with `--atime` on), because none of the handle's reads reach the daemon. Observable change: such an open moves atime even if nothing is read. Documented for users in `docs/reference/configuration.md` ("FUSE passthrough") |
+| Capability detection at `FUSE_INIT` | done | `FuseFs::init` (`crates/frontend-fuse/src/adapter.rs`): asks for `FUSE_PASSTHROUGH` and sets `max_stack_depth = 1` **only** when the mount wants it, the process holds `CAP_SYS_ADMIN` (`/proc/self/status` `CapEff`, `passthrough::has_cap_sys_admin`) and the kernel offers the flag; otherwise `max_stack_depth` stays 0. Only then is `FrontendCaps::passthrough` set and told to the view (`Vfs::frontend_negotiated`) — coordinator requirement 3 |
+| Logged-once fallback with reason | done | `PassthroughState::settle`/`unavailable` (`crates/frontend-fuse/src/passthrough.rs`): `passthrough unavailable: <reason>: <explanation>` once per session; reasons `writable_mount`, `disabled`, `cache_verify_always`, `no_cap_sys_admin`, `kernel`, `backing_open` (the session's one probe registration of a file in the cache dir failed — overlayfs `ELOOP`, namespace-only `CAP_SYS_ADMIN` `EPERM`; `PassthroughState::probe`), `platform`; per open `backing_open` (an ioctl failing after a good probe; warned once per mount, every one counted), `cached_handle_open`, `backing_busy` |
+| `MountOptions::passthrough` + `CONSTELLATION_FUSE_PASSTHROUGH=0\|1` | done | `TransportConfig::resolve` (`crates/frontend-fuse/src/session.rs`), the `CONSTELLATION_FUSE_TRANSPORT` idiom (an unknown value is an error). **Default (after review 38-z3b): read-only mounts only** — `PassthroughPolicy::ReadOnlyMounts`; a writable mount reports `writable_mount` unless `CONSTELLATION_FUSE_PASSTHROUGH=1` / `MountOptions::passthrough = PassthroughPolicy::On` opts it in (see "Review fix round" below). `--cache-verify always` forces it off with its own reason (`TransportConfig::with_cache_verify_always`, applied in `cli::node_runtime` from the engine's resolved mode); asserted by `session::tests::the_passthrough_knob_and_cache_verify_always` and the `passthrough-disabled-by-verify-always` scenario |
+| `OpenReply`/`CreateReply` passthrough branch | done | `crates/frontend-fuse/src/reply.rs`: `opened_passthrough`/`created_passthrough` with the inode's backing id; any registration error falls back to the plain reply and counts. A session without passthrough ignores `backing` (the engine's pin still goes at `release`) |
+| Backing-id lifetime: released exactly once | done | One id per *inode* (the kernel requires every passthrough open of an inode to use the same backing file), registered at its first passthrough open and closed (`FUSE_DEV_IOC_BACKING_CLOSE`) at its last passthrough handle's `release`. Kept raw rather than as fuser's `BackingId` (whose `Drop` closes it) because a handover must leave it registered; the reply wraps and `into_raw`s it |
+| The kernel's one-I/O-mode-per-inode rule | done (found in Z3b) | Per-inode table in `passthrough.rs` (module doc): no passthrough open while an ordinary handle is open or a write-intent open is in flight; while in passthrough mode every open reuses the id (`FOPEN_PASSTHROUGH \| FOPEN_DIRECT_IO` when the engine did not offer the same chunk, or for a write-only open); **a read-write open of an inode in passthrough mode is `ETXTBSY`** (an ordinary reply would be `EIO`, a passthrough one opens the chunk file read-write in the kernel), refused at the reply so the view's own `EROFS`/`ENOENT`/`EACCES` win. Plan 38 §3(c) "Local writers, and the kernel's one-mode-per-inode rule" |
+| Local read-after-write (coordinator requirement 2) | done | Refused at open while any handle can write the inode or it has a write session; a writer arriving *after* a passthrough open is close-to-open on the same mount — documented in plan 38 §3(c) and `docs/reference/configuration.md`, asserted by the `passthrough-local-writer` scenario and `view::passthrough_tests::a_writer_keeps_read_only_opens_off_passthrough_until_it_closes` |
+| Handover keeps the pins (coordinator requirement 1) | done | `HandleTableSnapshot::{writers, passthrough}` (`crates/engine/src/view/handoff.rs`): the resumed view re-pins each passthrough handle's chunk (`View::import_passthrough`); the old image keeps its pins until it `exec`s (`Engine::close_view_for_handover` no longer drops them, `cli::handover::hand_over` holds the views). The FUSE session's table with its still-registered ids crosses as `FuseHandoff::passthrough`. `HANDOVER_VERSION` 3 → 4 on top of plan 39's 3, whose per-open handles and discard error events cross alongside (no compatibility with older images, per the maintainer rule). Tests: `view::passthrough_tests::a_chunk_backing_a_live_handle_is_never_evictable_across_a_handover`, `passthrough::tests::the_table_round_trips_a_handover`, harness `passthrough-handover` |
+| Observability | done | `node.status` `fuse.mounts[].passthrough {enabled, opens, opens_total, unavailable_reason, refused_opens}` from the session (`SessionStats::passthrough`, `cli::control::fuse_mount_status`; the engine keeps the view's own answer only for a host without a session); `constellation_fuse_passthrough_opens{mountpoint}` gauge; `constellation_fuse_transport_fallbacks_total{from="passthrough",to,reason}` in `/metrics` and `stats.subscribe`; `cache.open_pins`. Schema re-blessed (`CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`) |
+| Wire tests | done | `crates/frontend-fuse/tests/wire.rs`: negotiation only when the fake kernel offers `FUSE_PASSTHROUGH` (`max_stack_depth` 1 vs 0 in `fuse_init_out`); an `Opened` with a backing → `FOPEN_PASSTHROUGH` + backing id in `fuse_open_out`, reuse, `DIRECT_IO` for a write-only open, for read-write the view's errno when it refuses and `ETXTBSY` (view handle released) when it does not, id closed once at the last release; plain fallback for an ordinary handle and for a failed registration. The ioctls cannot exist on a socket pair, so they are faked through `FuseFs::with_passthrough_ops`/`BackingOps`; the real ioctls are covered by the root harness runs below |
+| Rebase onto plan 39 | done | handoff carries plan 39's `handles`/`errors` and this chunk's `writers`/`passthrough` (`HandleTableSnapshot`), `HANDOVER_VERSION` 4; the adapter keeps plan 39's `Interrupts` (deferred `fsync`/`fsyncdir`, killable `O_SYNC` writes) and this chunk's passthrough open/create reply path; `create`/`open` take a per-open handle (`View::open_handle`) and note write intent. Wire test `a_passthrough_handle_fsyncs_and_releases_its_own_handle_and_the_id_once`: two passthrough opens and a refused read-write open each get their own view handle, `fsync`/`fdatasync` reach the view with the handle, every release (the refused open's included) returns its own handle, and the backing id is closed once, at the last passthrough release |
+| Harness scenarios | done | `crates/harness/src/scenarios/passthrough.rs`: `passthrough-eviction-while-open`, `passthrough-remote-write-cto`, `passthrough-local-writer`, `passthrough-odirect`, `passthrough-handover` (`requires` `CAP_SYS_ADMIN` + `linux>=6.9`, new non-binary `requires` entries via `suites::missing`; SKIP loudly otherwise; with both present a mount that does not get passthrough FAILs with its reason), `passthrough-disabled-by-verify-always` (requires nothing), `passthrough-default-by-mount-mode` (fix round; requires both) |
+| Docs | done | `docs/reference/configuration.md` "FUSE passthrough"; `docs/how-to-guides/development/TESTING.md` "FUSE passthrough (plan 38 Z3)"; plan 38 §3(c) |
+
+### fio read-cost gate, passthrough on and off
+
+`tests/read-cpu-gate.sh` (Z0b's), this host: 32 vCPU, kernel 7.3.0-rc4,
+release build without the `io-uring` feature (so passthrough is shown to
+work without it), `dev_fuse`, default knobs. "on" and "off" are root runs
+with `CONSTELLATION_FUSE_PASSTHROUGH=1`/`0`; "unpriv" is the plain
+unprivileged run (`no_cap_sys_admin`). Medians of 3 repeats, except
+`smallfiles`, which is 13 repeats per leg pooled over four interleaved runs
+because it is very noisy here (single repeats ranged 8.7–32 CPU-s/GiB on
+either leg; other agents were building on the host). The Z0b column is the
+committed baseline (`tests/read-cpu-baseline.json`, kernel 7.0 host), for
+reference only.
+
+| lane | Z0b baseline CPU-s/GiB | unpriv | off | **on** | MiB/s off → on | memcache misses off → on |
+|---|---|---|---|---|---|---|
+| `cold-seq-1m` | 3.50 | 2.30 | 2.52 | 2.10 | 1747 → 1620 | 127 → 127 |
+| `warm-disk-seq-1m` | 0.98 | 0.60 | 0.60 | 0.62 | 1772 → 1662 | 129 → 129 |
+| `warm-mem-seq-1m` | 0.22 | 0.18 | 0.20 | 0.20 | 4376 → 3850 | 0 → 0 |
+| `rand-4k-dio` | 7.15 | 7.04 | 10.14 | 6.86 | 625 → 644 | 0 → 0 |
+| `smallfiles` | 13.48 | 13.84 | **16.2** | **12.1** | **95 → 181** | **10 → 0** |
+
+Only `smallfiles` (4096 one-chunk 64 KiB files) can be passthrough: the
+other lanes read 256/512 MiB multi-chunk files, which are never eligible,
+and their differences are run-to-run noise. `smallfiles` is a *cold* lane
+(emptied cache), so a file is eligible only once the cross-file scan-ahead
+has fetched it before fio opens it; the memcache-miss column going to 0 is
+the signature that its reads no longer reach the daemon. The gate passed
+in all three modes.
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` | pass |
+| `bash tests/smoke.sh` (unprivileged; root) | pass; pass |
+| `bash tests/integration.sh` | pass (against the floci another worktree already had on :4566) |
+| `harness run` full matrix, unprivileged (`--shard 1/2`, `--shard 2/4` + `4/4`) | 189 scenarios: all pass, the 5 `CAP_SYS_ADMIN` passthrough scenarios SKIP loudly; `idle-cost` failed once at 61.0 S3 req/min against a budget of 60 under host load, then passed twice |
+| root: the six passthrough scenarios | all pass (each mount reports `enabled: true`) |
+| root: `cold-cache readahead e2e-basic fio-latency`, `subtree-confinement` | pass |
+| `docker compose --profile test run --rm compliance` | **8798/8798**. The container has `CAP_SYS_ADMIN`, so the session negotiates passthrough (`enabled=true`), but its cache is on the container's overlayfs, where the kernel refuses backing files: `opens_total=0` |
+| the same with `/tmp` on tmpfs (backing files register) | **8798/8798**, `enabled=true`, `opens_total=1`: pjdfstest rarely opens a non-empty cached file read-only, so it mostly shows that passthrough being on does not break POSIX semantics for everything else |
+
+### Review fix round (review 38-z3b)
+
+| Finding | State | Where |
+|---|---|---|
+| Must-fix 1: default-on gave writable mounts a timing-dependent `ETXTBSY` on `open(O_RDWR)` | fixed — coordinator decision (c)+(b): on by default only for read-only mounts (`open(O_RDWR)` is `EROFS` in the VFS there), off on writable mounts (reason `writable_mount`, not a logged downgrade), `CONSTELLATION_FUSE_PASSTHROUGH=1` / `MountOptions::passthrough = PassthroughPolicy::On` the documented opt-in with the `ETXTBSY` caveat and the affected patterns. Kernel analysis (`fs/fuse/iomode.c`) recorded in plan 38 §3(c) | `PassthroughPolicy` (`crates/frontend-fuse/src/passthrough.rs`), `TransportConfig`/`MountOptions::passthrough_wish` (`session.rs`); tests `session::tests::the_passthrough_knob_and_cache_verify_always`, `passthrough::tests::the_default_asks_only_for_read_only_mounts`, harness `passthrough-default-by-mount-mode` (writable, no knob → off, no `ETXTBSY`; read-only → negotiated) and `passthrough-local-writer` (writable + opt-in → `ETXTBSY`) |
+| Must-fix 2: `ETXTBSY` pre-empted the view's `EACCES`/`EROFS`/`ENOENT` | fixed: `before_open` never refuses; the read-write refusal moved to `on_open_reply`, after the view answered, and the view's handle is released (`Undo`). Safe because a view's `open` has no side effect a release does not undo (`O_TRUNC` is applied by the kernel after the open; no `FUSE_ATOMIC_O_TRUNC`) | `passthrough.rs`, `adapter.rs` (`OpenRefused` removed); tests `passthrough::tests::a_read_write_open_is_refused_only_after_the_view_accepted_it`, `wire.rs` `an_opened_backing_becomes_a_passthrough_reply_and_is_closed_once` (both orders: `EROFS`/`ENOENT`/`EACCES` from the view, then `ETXTBSY` + one extra view release) |
+| Should-fix 1: `CapEff` trusted where the kernel's `capable()`/stacking check refuses | fixed: one `BACKING_OPEN`+`CLOSE` probe per session in `FuseSession::new`, before it serves, on an unlinked file in the cache dir (`Vfs::passthrough_probe` → `DiskCache::probe_file`); failure → `enabled: false`, reason `backing_open`, logged once, view told (`frontend_negotiated`) | `passthrough.rs` `PassthroughState::probe`, `session.rs`, `crates/vfs/src/vfs.rs`, `crates/engine/src/view/ops.rs`, `crates/fs-core/src/cache.rs`; tests `passthrough::tests::the_probe_settles_a_session_whose_kernel_refuses_backing_files`, `cache::tests::a_probe_file_is_a_nameless_regular_file_in_the_cache_dir`; the compliance container (cache on overlayfs) now reports `backing_open` instead of `enabled=true` |
+| Should-fix 2: a `FOPEN_PASSTHROUGH\|FOPEN_DIRECT_IO` handle `mmap`s the old chunk | documented (not fixable from userspace) next to the `ETXTBSY` note | `docs/reference/configuration.md` "FUSE passthrough", `passthrough.rs` module doc, plan 38 §3(c) |
+| Should-fix 3: `HANDOVER_VERSION` collision | kept at main's value + 1 (= 3 on this base) per the coordinator; renumbered at merge | `crates/cli/src/handover.rs` |
+| Nits | dead `io.idle()` branch removed; `PassthroughHandoff::enabled` dropped (the resumed session negotiates its own); the create-path `Refuse` after an `O_TRUNC` create is documented at `CreateReply` (reachable only for a negative-dentry race with a remote create, on an opted-in writable mount); `tests/compliance.sh` joins the status onto one line before extracting the `passthrough` object | `passthrough.rs`, `reply.rs`, `tests/compliance.sh` |
+
+Gates of the fix round (rebased onto `f338e27`; 32 vCPU, kernel 7.3.0-rc4,
+load 30–45 from other agents):
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings`, and with `--features constellation-frontend-fuse/io-uring` | clean; clean |
+| `cargo test`, every workspace crate by `-p` | 0 failed (`constellation-model`'s `locks`/`positions`/`today_bugs` model checks run with `--release` to fit the tool's 10-minute limit) |
+| `bash tests/smoke.sh` unprivileged; root | PASSED; PASSED |
+| integration (`tests/smoke.sh s3://constellation-ci/…` against the floci already on :4566) | PASSED |
+| root `harness run` the 7 passthrough scenarios | all PASSED |
+| unprivileged, the same 7 | 6 SKIPPED (`requires CAP_SYS_ADMIN`), `passthrough-disabled-by-verify-always` PASSED |
+| `harness run e2e-basic cold-cache readahead session-handover-idle upgrade-under-load` unprivileged; + `fio-latency` as root with `CONSTELLATION_FUSE_PASSTHROUGH=1` | all PASSED |
+| compliance, default (writable → off) | **8798/8798**, `enabled=false unavailable_reason="writable_mount"` |
+| compliance, `-e CONSTELLATION_FUSE_PASSTHROUGH=1` (cache on overlayfs) | **8798/8798**, `enabled=false unavailable_reason="backing_open"` (the probe) |
+| compliance, opt-in with `/tmp` on tmpfs | **8798/8798**, `enabled=true opens_total=1` |
+| root `READ_CPU_LANES=smallfiles READ_CPU_REPEATS=3 tests/read-cpu-gate.sh`, opt-in `1` / `0` / unset | PASSED all: 16.16 / 20.52 / 11.20 CPU-s/GiB, 103 / 60 / 204 MiB/s, memcache misses **0** / 10 / 10. The CPU and rate columns are load noise on this host (see above); the miss column is the signature: only the opt-in serves the small files by passthrough, and unset on a writable mount behaves as off |
+
+### Plan 38 §9 item 5 exit criteria
+
+- [x] Passthrough eligibility (§3(c)), the `Opened`/`View::open` extension,
+      the pin-while-open `DiskCache` guard and the scan-ahead/atime move to
+      `open()` land (Z3a), consumed by the FUSE adapter (Z3b).
+- [x] The passthrough fault-injection scenarios pass on a privileged 7.3
+      host: eviction-while-open, remote-write close-to-open (the plan's
+      "remote-write-invalidation"), `O_DIRECT`, plus local-writer, handover
+      and verify-always; unprivileged they SKIP loudly.
+- [x] Works without the `io-uring` feature (every run above).
+- [x] Every downgrade is logged once and visible in `node.status`
+      (`unavailable_reason`) and `/metrics` (`fallbacks_total{from="passthrough"}`).
+
+### Open
+
+- The kernel only lets a *read-write* open of a file that is open in
+  passthrough mode be another passthrough open on the same backing file,
+  which would make the content-addressed chunk writable through `mmap`.
+  Z3b answers such an open `ETXTBSY` until the passthrough descriptors
+  close — since the fix round only on writable mounts that opted in.
+  Lifting it needs per-inode backing revocation, which the kernel does
+  not have.
+- **The read-only default serves nothing yet.** The only read-only mounts
+  are frozen snapshot views, whose files `View::open` answers as synthetic
+  `Frozen` nodes before Z3a's eligibility rule runs, so such a mount
+  negotiates passthrough (`enabled: true`) but is never offered a backing
+  file (`passthrough-default-by-mount-mode` asserts the negotiation, not a
+  count). Extending eligibility to frozen files is an engine change outside
+  Z3b's brief ("do not change the engine's eligibility rule"); until then
+  only the writable-mount opt-in uses passthrough.

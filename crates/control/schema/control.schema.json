@@ -530,6 +530,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "open_pins": {
+          "default": 0,
+          "description": "Holders of a chunk kept un-evictable for an open passthrough\nhandle (plan 38 §3(c)'s pin-while-open), summed over chunks: equal\nto the mounts' `fuse.passthrough.opens` when every such handle sits\non the chunk the engine offered it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "pinned_bytes": {
           "default": 0,
           "description": "Bytes protected from eviction by local pins.",
@@ -2537,6 +2544,8 @@
           "default": {
             "enabled": false,
             "opens": 0,
+            "opens_total": 0,
+            "refused_opens": 0,
             "unavailable_reason": null
           }
         },
@@ -2581,9 +2590,23 @@
           "minimum": 0,
           "type": "integer"
         },
+        "opens_total": {
+          "default": 0,
+          "description": "Opens answered with a backing file since the session started (a\nlane can tell from it that passthrough actually served something).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refused_opens": {
+          "default": 0,
+          "description": "Read-write opens refused (`ETXTBSY`) because the file was open in\npassthrough mode (plan 38 §3(c), Z3b).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "unavailable_reason": {
           "default": null,
-          "description": "Why `enabled` is false; `None` when it is true.",
+          "description": "Why `enabled` is false; `None` when it is true: `writable_mount`\n(the default for a writable mount: only read-only mounts use it\nunless `CONSTELLATION_FUSE_PASSTHROUGH=1`), `disabled`,\n`cache_verify_always`, `no_cap_sys_admin`, `kernel`, `backing_open`\n(the kernel refused the session's probe registration: a user\nnamespace, a cache on overlayfs) or `platform` (plan 38 Z3b).",
           "type": [
             "string",
             "null"

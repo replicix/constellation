@@ -12,6 +12,7 @@ constellation-platform.workspace = true
 # `serializable`: `NegotiatedInit` crosses processes in a session handover.
 fuser = { workspace = true, features = ["serializable"] }
 libc.workspace = true
+serde.workspace = true
 tracing.workspace = true
 
 [features]

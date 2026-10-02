@@ -266,6 +266,7 @@ impl EngineControl {
                 memory_coalesced: memory.coalesced,
                 memory_evictions: memory.evictions,
                 cache_verify: self.cache.verify_mode().as_str().to_string(),
+                open_pins: self.cache.open_pin_total(),
             },
             lease: p0_lease,
             p2p,

@@ -108,9 +108,19 @@ impl DaemonHost {
 }
 
 /// A FUSE session's transport state in the protocol's shape (plan 38
-/// §5). The engine fills in the mount's id, mountpoint and passthrough.
+/// §5), its passthrough section included (Z3b: the session knows what the
+/// kernel agreed and how many handles it serves from a backing file). The
+/// engine fills in the mount's id and mountpoint.
 fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::FuseMountStatus {
+    let p = stats.passthrough();
     api::FuseMountStatus {
+        passthrough: api::FusePassthroughStatus {
+            enabled: p.enabled,
+            opens: p.opens,
+            unavailable_reason: p.unavailable_reason,
+            refused_opens: p.refused_opens,
+            opens_total: p.opens_total,
+        },
         transport: stats.transport().name().to_string(),
         uring_queue_depth: stats.uring_queue_depth(),
         zero_copy_reads: stats.zero_copy_reads(),

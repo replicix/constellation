@@ -32,19 +32,19 @@
 //! - **`reached`**: a confined view's cache of inodes known inside it,
 //!   so an inode it handed out and that was since renamed out of the
 //!   subtree stays addressable by handle exactly as before.
-//!
-//! What does *not* cross yet, and must: a passthrough open's backing
-//! chunk (`passthrough.rs`, plan 38 §3(c)). The pin and the descriptor
-//! are this process's, so `close_view_for_handover` drops them — harmless
-//! while no frontend consumes `Opened::backing`
-//! (`FrontendCaps::passthrough` is false everywhere until plan 38 Z3b),
-//! because the resumed view's reads come back to the daemon. Once a
-//! backing id is registered with a kernel, the kernel keeps serving a
-//! handed-over descriptor from the old process's chunk file while the
-//! resumed view holds no pin on it — an evictable chunk under a live
-//! backing. Z3b therefore adds the per-inode chunk hashes
-//! (`View::passthrough_hashes`) to [`HandleTableSnapshot`] and re-pins
-//! and reopens them in [`View::import_handles`].
+//! - **`writers`**: the write-intent handles among `opens`, which refuse
+//!   passthrough on their inode (plan 38 Z3b).
+//! - **`passthrough`**: the chunk each passthrough handle sits on (plan 38
+//!   §3(c)). A backing file registered with the kernel outlives the
+//!   process that registered it — the kernel holds its own reference and
+//!   keeps serving the handed-over descriptor from it — so the resumed
+//!   view must hold the disk-cache pin that keeps the chunk where the
+//!   kernel reads it. [`View::import_handles`] re-pins (and reopens) each
+//!   one; the old process keeps its own pins until it `exec`s
+//!   (`Engine::close_view_for_handover` leaves them), so the pin is never
+//!   let go of before the new one exists except across the new image's
+//!   own start-up. The backing *ids* are the FUSE session's, and cross in
+//!   its own handoff (`constellation_frontend_fuse::FuseHandoff`).
 
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,11 @@ pub struct HandleTableSnapshot {
     /// The synthetic registry: `(ino, key, node)` and the next number.
     synthetic: Vec<(Ino, String, SyntheticWire)>,
     synthetic_next: Ino,
+    /// `(inode, write-intent handles)` among `opens`.
+    pub writers: Vec<(Ino, u32)>,
+    /// `(inode, chunk hashes)`: the chunk each passthrough handle on the
+    /// inode reads from, oldest first.
+    pub passthrough: Vec<(Ino, Vec<[u8; 32]>)>,
 }
 
 /// A synthetic node, opaquely (its type is the engine's own).
@@ -116,6 +121,7 @@ impl View {
         reached.sort_unstable();
         reached.dedup();
         let registry = self.synthetic.lock().unwrap();
+        let next = registry.next;
         let mut synthetic: Vec<(Ino, String, SyntheticWire)> = registry
             .keys
             .iter()
@@ -127,7 +133,16 @@ impl View {
             })
             .collect();
         synthetic.sort_by_key(|(ino, _, _)| *ino);
+        drop(registry);
         let (handles, handles_next) = self.handles.export();
+        let mut writers: Vec<(Ino, u32)> = self
+            .writers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(ino, n)| (*ino, *n))
+            .collect();
+        writers.sort_unstable();
         HandleTableSnapshot {
             opens,
             handles,
@@ -135,7 +150,9 @@ impl View {
             errors: self.meta.locks().export_errors(),
             reached,
             synthetic,
-            synthetic_next: registry.next,
+            synthetic_next: next,
+            writers,
+            passthrough: self.export_passthrough(),
         }
     }
 
@@ -155,6 +172,13 @@ impl View {
         self.meta
             .locks()
             .import_errors(&snapshot.errors, seen.unwrap_or(0));
+        {
+            let mut writers = self.writers.lock().unwrap();
+            for (ino, n) in &snapshot.writers {
+                *writers.entry(*ino).or_insert(0) += n;
+            }
+        }
+        self.import_passthrough(&snapshot.passthrough);
         for ino in &snapshot.reached {
             self.reach.mark(*ino);
         }

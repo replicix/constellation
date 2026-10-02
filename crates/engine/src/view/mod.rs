@@ -352,6 +352,18 @@ pub struct View {
     /// inode's passthrough opens ended, so several concurrent passthrough
     /// opens of one file are several entries in one vector.
     passthrough: Mutex<HashMap<Ino, Vec<PassthroughHandle>>>,
+    /// Handles per inode opened with write intent (`OpenFlags::WRITE`,
+    /// `TRUNC` or `APPEND`), a subset of `opens`: plan 38 §3(c) refuses a
+    /// passthrough open while any exists, because a passthrough handle
+    /// reads the chunk file and would never see what such a handle writes
+    /// (`passthrough.rs`'s module doc).
+    writers: Mutex<HashMap<Ino, u32>>,
+    /// Whether the frontend serving this view can consume
+    /// [`constellation_vfs::Opened::backing`] — `caps.passthrough` at open,
+    /// then whatever the frontend's own negotiation with its kernel said
+    /// ([`constellation_vfs::Vfs::frontend_negotiated`]): Linux FUSE only
+    /// learns at `FUSE_INIT`, after the view exists.
+    passthrough_on: std::sync::atomic::AtomicBool,
     /// Sequential readahead.
     pub(crate) prefetch: crate::prefetch::Prefetcher,
     /// Cross-file readahead for ordered directory walks.
@@ -469,6 +481,8 @@ impl View {
             handles: durable::Handles::default(),
             fsync_owed: Mutex::new(std::collections::HashSet::new()),
             passthrough: Mutex::new(HashMap::new()),
+            writers: Mutex::new(HashMap::new()),
+            passthrough_on: std::sync::atomic::AtomicBool::new(deps.caps.passthrough),
             prefetch,
             scan,
             coop: deps.coop,

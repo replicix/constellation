@@ -32,11 +32,12 @@
 //! and the setup failed", and with the `io-uring` feature the host probe
 //! (`fuser::uring_unavailable`) supplies the detail.
 
+use crate::passthrough::{PassthroughState, PassthroughStatus};
 use crate::session::TransportPolicy;
 use fuser::{InitFlags, NegotiatedInit, Transport};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Why a session that asked for the ring is served over `/dev/fuse`: the
@@ -161,6 +162,18 @@ static FALLBACKS: Mutex<BTreeMap<(&'static str, &'static str, &'static str), u64
 /// plan 38 Z4, so this stays 0 until then.
 static ZERO_COPY_READS: AtomicU64 = AtomicU64::new(0);
 
+/// Count one fallback (plan 38 Z3b's passthrough downgrades, which happen
+/// per mount and per open rather than at the handshake: `from` is
+/// `passthrough`, `to` the session's transport, `reason` one of
+/// [`crate::passthrough::reason`]'s names).
+pub(crate) fn count_fallback(from: &'static str, to: &'static str, reason: &'static str) {
+    *FALLBACKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry((from, to, reason))
+        .or_default() += 1;
+}
+
 /// `(from, to, reason, count)` for every fallback this process took.
 pub fn fallback_counts() -> Vec<(&'static str, &'static str, &'static str, u64)> {
     FALLBACKS
@@ -191,6 +204,8 @@ pub struct SessionStats {
     uring_queue_depth: u32,
     last_fallback: Option<TransportFallback>,
     zero_copy_reads: AtomicU64,
+    /// The session's passthrough state (plan 38 Z3b), read live.
+    passthrough: Option<Arc<PassthroughState>>,
 }
 
 impl SessionStats {
@@ -202,10 +217,24 @@ impl SessionStats {
         init: Option<&NegotiatedInit>,
         negotiated: Transport,
         uring_queue_depth: usize,
+        passthrough: Arc<PassthroughState>,
     ) -> Self {
         let feature = cfg!(feature = "io-uring");
         let reason = classify(asked, pinned, feature, init, negotiated);
-        Self::with_fallback(negotiated, uring_queue_depth, reason)
+        Self {
+            passthrough: Some(passthrough),
+            ..Self::with_fallback(negotiated, uring_queue_depth, reason)
+        }
+    }
+
+    /// The session's passthrough (plan 38 Z3b): whether it registers
+    /// backing files, how many handles the kernel serves from one now,
+    /// why not. A `SessionStats` built without a session reports it off.
+    pub fn passthrough(&self) -> PassthroughStatus {
+        self.passthrough
+            .as_ref()
+            .map(|p| p.status())
+            .unwrap_or_default()
     }
 
     fn with_fallback(
@@ -242,6 +271,7 @@ impl SessionStats {
             },
             last_fallback,
             zero_copy_reads: AtomicU64::new(0),
+            passthrough: None,
         }
     }
 
@@ -353,6 +383,9 @@ mod tests {
             Some(&init(true)),
             Transport::DevFuse,
             8,
+            crate::passthrough::PassthroughState::new(crate::passthrough::PassthroughWish::Off(
+                crate::passthrough::reason::DISABLED,
+            )),
         );
         let fallback = stats.last_fallback().expect("the fallback is recorded");
         assert_eq!(

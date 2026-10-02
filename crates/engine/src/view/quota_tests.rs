@@ -35,6 +35,18 @@ pub(super) fn test_fs_with(
     let cache_root = dir.path().join("cache");
     std::fs::create_dir_all(&cache_root).unwrap();
     let cache = Arc::new(open_cache(&cache_root));
+    let fs = test_fs_on(meta, chunk_size, cache.clone(), dir.path().join("staging"));
+    (fs, dir, cache)
+}
+
+/// A view over an existing `cache` (a second process's view of the same
+/// node, in the handover tests), staging under `staging_dir`.
+pub(super) fn test_fs_on(
+    meta: Arc<Meta>,
+    chunk_size: u32,
+    cache: Arc<DiskCache>,
+    staging_dir: std::path::PathBuf,
+) -> View {
     let store = Arc::new(ChunkStore::new(Arc::new(InMemory::new())));
     let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
         meta.clone(),
@@ -52,11 +64,11 @@ pub(super) fn test_fs_with(
         FsDependencies {
             meta,
             store,
-            cache: cache.clone(),
+            cache,
             rt: handle,
             sync: None,
             coop: None,
-            staging_dir: dir.path().join("staging"),
+            staging_dir,
             staging_budget: StagingBudget::new(1 << 30),
             snapshots,
             atime: Arc::new(crate::atime::AtimeAccumulator::new(
@@ -75,7 +87,7 @@ pub(super) fn test_fs_with(
         CompressionSetting::RAW,
     );
     std::mem::forget(rt);
-    (fs, dir, cache)
+    fs
 }
 
 /// A second view of the same node has the inode open: `unlink`'s

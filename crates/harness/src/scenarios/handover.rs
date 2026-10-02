@@ -84,7 +84,7 @@ pub(super) fn try_upgrade(c: &Client) -> Result<std::process::Output> {
 
 /// [`try_upgrade`] that must succeed (the daemon re-execs the binary it
 /// was started from). Returns the time it took.
-fn upgrade(c: &Client) -> Result<Duration> {
+pub(super) fn upgrade(c: &Client) -> Result<Duration> {
     let started = Instant::now();
     let out = try_upgrade(c)?;
     let took = started.elapsed();

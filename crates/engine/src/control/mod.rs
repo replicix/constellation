@@ -102,8 +102,11 @@ pub struct HostView {
     /// because this crate names no frontend types. `None` for a view with
     /// no FUSE session behind it (a control-only embedder, the engine's
     /// fixtures). The engine fills in what is its own — the mount's id and
-    /// mountpoint, and `passthrough`, which the view decides
-    /// ([`View::passthrough_status`]) — whatever the host put there.
+    /// mountpoint — whatever the host put there, and `passthrough` when the
+    /// host left it at its default: a Linux FUSE host reports its
+    /// session's (what the kernel agreed and how many handles it serves
+    /// from a backing file, plan 38 Z3b), which only the session knows;
+    /// another gets the view's own ([`View::passthrough_status`]).
     pub fuse: Option<api::FuseMountStatus>,
     /// The engine view behind it (`view.stats` asks it).
     pub view: Option<Arc<View>>,
@@ -282,8 +285,8 @@ impl EngineControl {
     }
 
     /// `node.status.fuse` (plan 38 §5): the host's per-session transport
-    /// state with the view's own passthrough status, and the host's
-    /// process-wide counters.
+    /// state — with the view's own passthrough status where the host has
+    /// none — and the host's process-wide counters.
     pub(crate) fn fuse_status(&self) -> api::FuseStatus {
         let mut views = self.host.views();
         views.sort_by_key(|v| v.id);
@@ -293,13 +296,18 @@ impl EngineControl {
                 let mut fuse = v.fuse?;
                 fuse.id = v.id;
                 fuse.mountpoint = v.mountpoint.display().to_string();
-                if let Some(view) = &v.view {
-                    let p = view.passthrough_status();
-                    fuse.passthrough = api::FusePassthroughStatus {
-                        enabled: p.enabled,
-                        opens: p.opens,
-                        unavailable_reason: p.unavailable_reason.map(str::to_string),
-                    };
+                match &v.view {
+                    Some(view) if fuse.passthrough == api::FusePassthroughStatus::default() => {
+                        let p = view.passthrough_status();
+                        fuse.passthrough = api::FusePassthroughStatus {
+                            enabled: p.enabled,
+                            opens: p.opens,
+                            unavailable_reason: p.unavailable_reason.map(str::to_string),
+                            refused_opens: 0,
+                            opens_total: 0,
+                        };
+                    }
+                    _ => {}
                 }
                 Some(fuse)
             })

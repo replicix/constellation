@@ -680,9 +680,22 @@ pub struct FusePassthroughStatus {
     /// (`constellation_fuse_passthrough_opens`).
     #[serde(default)]
     pub opens: u64,
-    /// Why `enabled` is false; `None` when it is true.
+    /// Why `enabled` is false; `None` when it is true: `writable_mount`
+    /// (the default for a writable mount: only read-only mounts use it
+    /// unless `CONSTELLATION_FUSE_PASSTHROUGH=1`), `disabled`,
+    /// `cache_verify_always`, `no_cap_sys_admin`, `kernel`, `backing_open`
+    /// (the kernel refused the session's probe registration: a user
+    /// namespace, a cache on overlayfs) or `platform` (plan 38 Z3b).
     #[serde(default)]
     pub unavailable_reason: Option<String>,
+    /// Read-write opens refused (`ETXTBSY`) because the file was open in
+    /// passthrough mode (plan 38 §3(c), Z3b).
+    #[serde(default)]
+    pub refused_opens: u64,
+    /// Opens answered with a backing file since the session started (a
+    /// lane can tell from it that passthrough actually served something).
+    #[serde(default)]
+    pub opens_total: u64,
 }
 
 /// One transport downgrade (plan 38 §2.4).
@@ -2092,6 +2105,12 @@ pub struct CacheStatus {
     /// `"always"`, but says so by the absence, not by the value.
     #[serde(default)]
     pub cache_verify: String,
+    /// Holders of a chunk kept un-evictable for an open passthrough
+    /// handle (plan 38 §3(c)'s pin-while-open), summed over chunks: equal
+    /// to the mounts' `fuse.passthrough.opens` when every such handle sits
+    /// on the chunk the engine offered it.
+    #[serde(default)]
+    pub open_pins: u64,
 }
 
 // ---------------------------------------------------------------------------
