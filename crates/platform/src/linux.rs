@@ -669,9 +669,42 @@ garbage line without the separator
             let _ = done_rx.recv();
         });
         let thread = rx.recv().unwrap();
+        // The handler allocates, so it is only safe on a thread that is
+        // parked: wait until the worker sleeps in its futex, not merely
+        // until it has sent its tid (it may still hold channel or
+        // allocator locks).
+        let task = format!("/proc/self/task/{}", thread.tid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let stat = std::fs::read_to_string(format!("{task}/stat")).unwrap_or_default();
+            // `pid (comm) S ...`: the state follows the last `)`.
+            let sleeping = stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                == Some("S");
+            let wchan = std::fs::read_to_string(format!("{task}/wchan")).unwrap_or_default();
+            // wchan may be hidden (`0`) without privilege: state `S` then suffices.
+            if sleeping && (wchan.starts_with("futex") || wchan.trim() == "0" || wchan.is_empty()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never parked: stat={stat:?} wchan={wchan:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         p.request_backtrace(thread).unwrap();
         done_tx.send(()).unwrap();
-        worker.join().unwrap();
+        // A regression that wedges the worker fails the test, not the run.
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = joined_tx.send(worker.join());
+        });
+        joined_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the worker hung after the backtrace signal")
+            .unwrap();
         // A thread that no longer exists is an error, not a crash.
         assert!(p
             .request_backtrace(ThreadRef {

@@ -4356,14 +4356,86 @@ mod tests {
     /// with the same op id get separate side replicas (before: both used
     /// `…-rebuild-<pid>-<op>`, and the shipper's two retention-gap tests,
     /// run side by side, swapped each other's namespace in).
-    #[test]
-    fn standalone_rebuilds_never_share_a_side_replica() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn standalone_rebuilds_never_share_a_side_replica() {
+        use super::{Meta, Standalone};
         use constellation_authority::OpId;
+        use constellation_fs_core::types::ROOT_INO;
+        use constellation_meta::MetaStore;
+        use constellation_store_s3::LeaseMode;
+        use object_store::memory::InMemory;
+        use std::sync::Arc;
+        use std::sync::Arc as StdArc;
+
+        const FILES: usize = 40;
+        // A log holding `FILES` files named `<tag>-<i>`.
+        async fn log_of(tag: &'static str) -> StdArc<InMemory> {
+            let store = StdArc::new(InMemory::new());
+            let meta = Arc::new(Meta::open_in_memory().unwrap());
+            meta.set_node_prefix(1).unwrap();
+            let mut writer = Standalone::new(meta.clone(), store.clone(), 1, LeaseMode::Cas);
+            assert!(writer.acquire().await.unwrap());
+            for i in 0..FILES {
+                meta.create(ROOT_INO, &format!("{tag}-{i}"), 0o644, 0, 0)
+                    .unwrap();
+            }
+            writer.sync().await.unwrap();
+            store
+        }
+        // A fresh replica on `store`, with a rebuild queued under `op`.
+        fn rebuilder(store: &StdArc<InMemory>, op: OpId) -> (Arc<Meta>, Standalone) {
+            let meta = Arc::new(Meta::open_in_memory().unwrap());
+            meta.set_node_prefix(2).unwrap();
+            let mut driver = Standalone::new(meta.clone(), store.clone(), 2, LeaseMode::Cas);
+            driver.pending_rebuild.push_back(op);
+            (meta, driver)
+        }
+
+        let alpha = log_of("alpha").await;
+        let beta = log_of("beta").await;
+        // The helper alone: distinct paths for one op id.
         let op = OpId(7);
-        let a = super::standalone_rebuild_dir(op);
-        let b = super::standalone_rebuild_dir(op);
+        let (a, b) = (
+            super::standalone_rebuild_dir(op),
+            super::standalone_rebuild_dir(op),
+        );
         assert_ne!(a, b);
         assert_eq!(a.parent(), Some(std::env::temp_dir().as_path()));
+
+        // Overlapping rebuilds with the same op id, many rounds: each ends
+        // with its own log's namespace and none of the other's.
+        for round in 0..10 {
+            let (meta_a, mut drv_a) = rebuilder(&alpha, op);
+            let (meta_b, mut drv_b) = rebuilder(&beta, op);
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let (ga, gb) = (gate.clone(), gate);
+            let ta = tokio::spawn(async move {
+                ga.wait().await;
+                drv_a.step().await.unwrap();
+            });
+            let tb = tokio::spawn(async move {
+                gb.wait().await;
+                drv_b.step().await.unwrap();
+            });
+            ta.await.unwrap();
+            tb.await.unwrap();
+            for i in 0..FILES {
+                for (meta, own, other) in [(&meta_a, "alpha", "beta"), (&meta_b, "beta", "alpha")] {
+                    assert!(
+                        meta.lookup(ROOT_INO, &format!("{own}-{i}"))
+                            .unwrap()
+                            .is_some(),
+                        "round {round}: the {own} replica lost {own}-{i}"
+                    );
+                    assert!(
+                        meta.lookup(ROOT_INO, &format!("{other}-{i}"))
+                            .unwrap()
+                            .is_none(),
+                        "round {round}: the {own} replica got {other}-{i}"
+                    );
+                }
+            }
+        }
     }
 
     /// The placement's share and rate knobs take `0` as a value (it turns
