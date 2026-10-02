@@ -2366,6 +2366,151 @@
       },
       "type": "object"
     },
+    "FuseFallback": {
+      "description": "One transport downgrade (plan 38 §2.4).",
+      "properties": {
+        "at_unix_ms": {
+          "description": "When the handshake recorded it, Unix milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "detail": {
+          "default": "",
+          "description": "What refused, as precisely as the daemon knows.",
+          "type": "string"
+        },
+        "from": {
+          "description": "What was asked for (`uring`).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "The rung that refused, a fixed name: `handover_capable`,\n`no_io_uring_feature`, `kernel_not_offered`, `ring_setup_failed`.",
+          "type": "string"
+        },
+        "to": {
+          "description": "What the connection got (`dev_fuse`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "reason",
+        "at_unix_ms"
+      ],
+      "type": "object"
+    },
+    "FuseFallbackCount": {
+      "description": "One (from, to, reason) of [`FuseStatus::transport_fallbacks`].",
+      "properties": {
+        "count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "from": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "reason",
+        "count"
+      ],
+      "type": "object"
+    },
+    "FuseMountStatus": {
+      "description": "One mount of [`FuseStatus`].",
+      "properties": {
+        "id": {
+          "description": "The mount's id ([`MountInfo::id`]).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_fallback": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FuseFallback"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The transport fallback this mount's handshake took, if it took\none (plan 38 §2.4: logged once, and visible here)."
+        },
+        "mountpoint": {
+          "type": "string"
+        },
+        "passthrough": {
+          "$ref": "#/$defs/FusePassthroughStatus",
+          "default": {
+            "enabled": false,
+            "opens": 0,
+            "unavailable_reason": null
+          }
+        },
+        "transport": {
+          "description": "What the connection negotiated: `dev_fuse`, `uring` or `uring_zc`,\nfixed for the connection's life.",
+          "type": "string"
+        },
+        "uring_queue_depth": {
+          "default": 0,
+          "description": "Ring entries per kernel queue; 0 on `dev_fuse` (no ring queues).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "zero_copy_reads": {
+          "default": 0,
+          "description": "Reads this mount served zero-copy (0 until plan 38 Z4).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "mountpoint",
+        "transport"
+      ],
+      "type": "object"
+    },
+    "FusePassthroughStatus": {
+      "description": "Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a\nsingle-chunk file's cached chunk directly.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Eligible opens are offered a backing file.",
+          "type": "boolean"
+        },
+        "opens": {
+          "default": 0,
+          "description": "Opens currently backed by a chunk file\n(`constellation_fuse_passthrough_opens`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unavailable_reason": {
+          "default": null,
+          "description": "Why `enabled` is false; `None` when it is true.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "FuseRequestsStatus": {
       "description": "The FUSE request watchdog (`crate::fuse_watch`, EC2 campaign 7\nB-2): requests in flight, and those unanswered past\n`CONSTELLATION_FUSE_REQUEST_STALL_S`.",
       "properties": {
@@ -2414,6 +2559,35 @@
         "stalled_total": {
           "default": 0,
           "description": "Requests ever reported as stalled since the daemon started.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "FuseStatus": {
+      "description": "Plan 38 §5's `fuse` section: what each FUSE mount's connection is\nserved over and what of the read path's fast lanes it uses, plus the\nprocess-wide counters behind `constellation_fuse_*`.\n\n`cache_verify` (`admit`/`always`, plan 38 §2.3), which decides whether\npassthrough and zero-copy may be used at all, is node-wide and is\nreported once, as [`CacheStatus::cache_verify`]; it is deliberately not\nrepeated here.",
+      "properties": {
+        "mounts": {
+          "default": [],
+          "description": "One entry per mount with a FUSE session behind it, by mount id.",
+          "items": {
+            "$ref": "#/$defs/FuseMountStatus"
+          },
+          "type": "array"
+        },
+        "transport_fallbacks": {
+          "default": [],
+          "description": "Every transport fallback this process took, by (from, to, reason):\n`constellation_fuse_transport_fallbacks_total`. Process-wide, so\nit survives the unmount of the mount that took one.",
+          "items": {
+            "$ref": "#/$defs/FuseFallbackCount"
+          },
+          "type": "array"
+        },
+        "zero_copy_reads_total": {
+          "default": 0,
+          "description": "Reads served zero-copy by every session of this process\n(`constellation_fuse_zero_copy_reads_total`; 0 until plan 38 Z4).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3685,7 +3859,7 @@
         },
         "transport": {
           "default": null,
-          "description": "Plan 38 §5: the FUSE transport this mount's connection negotiated\n— `dev_fuse`, `uring` or `uring_zc` — fixed for the connection's\nlife. `None` on a host with no FUSE session behind the view (a\ncontrol-only embedder, the engine's own fixtures) and in a report\nfrom a daemon older than plan 38 Z1b. The rest of plan 38 §5's\n`fuse` section (ring queue depth, passthrough and zero-copy\ncounters, the last transport fallback and its reason) lands with\nthe transport integration; the per-mount transport belongs here,\nwith the mount it describes.",
+          "description": "Plan 38 §5: the FUSE transport this mount's connection negotiated\n— `dev_fuse`, `uring` or `uring_zc` — fixed for the connection's\nlife. `None` on a host with no FUSE session behind the view (a\ncontrol-only embedder, the engine's own fixtures) and in a report\nfrom a daemon older than plan 38 Z1b. The same value as this\nmount's [`FuseMountStatus::transport`] in [`StatusReport::fuse`],\nwhich carries the rest of plan 38 §5's per-mount transport state;\nkept here too because it describes the mount, and every mount\nlisting (`view.mount`'s answer included) carries it.",
           "type": [
             "string",
             "null"
@@ -6268,6 +6442,15 @@
         "fs_uuid": {
           "type": "string"
         },
+        "fuse": {
+          "$ref": "#/$defs/FuseStatus",
+          "default": {
+            "mounts": [],
+            "transport_fallbacks": [],
+            "zero_copy_reads_total": 0
+          },
+          "description": "Plan 38 §5: the FUSE read-path transport, per mount and\nprocess-wide."
+        },
         "fuse_requests": {
           "$ref": "#/$defs/FuseRequestsStatus",
           "default": {
@@ -6811,7 +6994,7 @@
       "type": "object"
     },
     "VfsOpSeries": {
-      "description": "One (frontend, view, op) of [`VfsOpsStatus`].",
+      "description": "One (frontend, view, transport, op) of [`VfsOpsStatus`].",
       "properties": {
         "buckets": {
           "default": [],
@@ -6846,6 +7029,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "transport": {
+          "description": "Plan 38 §5: the kernel transport that carried the ops — `dev_fuse`,\n`uring` or `uring_zc` for the FUSE frontend, `n/a` for any other.",
+          "type": "string"
+        },
         "view": {
           "default": null,
           "description": "The view's allowlisted metric label; absent for a view with none.",
@@ -6857,12 +7044,13 @@
       },
       "required": [
         "frontend",
+        "transport",
         "op"
       ],
       "type": "object"
     },
     "VfsOpsStatus": {
-      "description": "Every frontend op counted so far, per (frontend, view, op): the numbers\nbehind `constellation_vfs_ops_total{frontend,view,op,outcome}` and the\n`constellation_vfs_op_seconds{frontend,view,op}` histogram. Only series\nwith something counted are present; `view` is the allowlisted metric\nlabel of a view (plan 31 §9.10), never its full label map.",
+      "description": "Every frontend op counted so far, per (frontend, view, transport, op):\nthe numbers behind\n`constellation_vfs_ops_total{frontend,view,op,outcome,transport}` and the\n`constellation_vfs_op_seconds{frontend,view,op,transport}` histogram. Only series\nwith something counted are present; `view` is the allowlisted metric\nlabel of a view (plan 31 §9.10), never its full label map.",
       "properties": {
         "bucket_bounds_s": {
           "default": [],

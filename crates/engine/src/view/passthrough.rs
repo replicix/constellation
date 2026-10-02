@@ -74,6 +74,17 @@ pub(super) struct PassthroughHandle {
     _fd: Arc<std::fs::File>,
 }
 
+/// A view's passthrough, as [`View::passthrough_status`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassthroughStatus {
+    /// Eligible opens are offered a backing file.
+    pub enabled: bool,
+    /// Opens holding one now.
+    pub opens: u64,
+    /// Why `enabled` is false.
+    pub unavailable_reason: Option<&'static str>,
+}
+
 impl View {
     /// The chunk file `ino` may be read from directly for an `open` with
     /// `flags`, or `None` — which is every open that is not exactly the
@@ -293,9 +304,40 @@ impl View {
         }
     }
 
-    /// How many passthrough handles `ino` has open. Tests only for now:
-    /// the operator-facing count belongs with the rest of this plan's
-    /// `node.status`/metrics work, not here.
+    /// Whether this view offers passthrough at all, how many opens it
+    /// backs right now, and if it offers none, why: `node.status`'s
+    /// `fuse.mounts[].passthrough` and the
+    /// `constellation_fuse_passthrough_opens` gauge (plan 38 §5). The
+    /// reasons are the two of [`Self::passthrough_backing`]'s refusals that
+    /// hold for every open on the view; the per-open ones (write intent,
+    /// size, residency) are not a property of the mount.
+    pub fn passthrough_status(&self) -> PassthroughStatus {
+        let opens = self
+            .passthrough
+            .lock()
+            .unwrap()
+            .values()
+            .map(|handles| handles.len() as u64)
+            .sum();
+        let unavailable_reason = if !self.caps.passthrough {
+            Some(
+                "the frontend does not read from backing files (Linux FUSE's \
+                 FOPEN_PASSTHROUGH lands in plan 38 Z3b)",
+            )
+        } else if self.cache.verify_mode() != CacheVerify::Admit {
+            Some("--cache-verify always: every byte served is hashed on the read that serves it")
+        } else {
+            None
+        };
+        PassthroughStatus {
+            enabled: unavailable_reason.is_none(),
+            opens,
+            unavailable_reason,
+        }
+    }
+
+    /// How many passthrough handles `ino` has open (tests; the
+    /// operator-facing count is [`Self::passthrough_status`]'s).
     #[cfg(test)]
     pub(crate) fn passthrough_handles(&self, ino: Ino) -> usize {
         self.passthrough_hashes(ino).len()

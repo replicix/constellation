@@ -2236,15 +2236,33 @@ classification and listing filter never leaking a hidden name, `IdentityMap`,
 ## Op metrics, tracing and `vfs-bench` (plan 31 C7a)
 
 Every frontend op is counted when its responder completes
-(`constellation_vfs::metrics`): `constellation_vfs_ops_total{frontend,view,op,outcome}`
+(`constellation_vfs::metrics`): `constellation_vfs_ops_total{frontend,view,op,outcome,transport}`
 (counter; `outcome` is `ok` or the `Code` name) and
-`constellation_vfs_op_seconds{frontend,view,op}` (histogram, 10 us to 60 s),
+`constellation_vfs_op_seconds{frontend,view,op,transport}` (histogram, 10 us to 60 s),
 served by `GET /metrics` on the web adapter. `view` is present only for a
 view labelled with an allowlisted key (`METRIC_LABELS`, today `pv`); the rest of
-a view's labels never become series. `stats.subscribe` samples carry the totals
+a view's labels never become series. `transport` (plan 38 §5) is the FUSE
+session's negotiated `dev_fuse`/`uring`/`uring_zc`, and `n/a` on any other
+frontend. `stats.subscribe` samples carry the totals
 `constellation_vfs_ops_total` and `constellation_vfs_ops_refused_total`. Each op
-also gets an `OpId` and a `vfs.op` tracing span at debug level:
+also gets an `OpId` and a `vfs.op` tracing span at debug level, with
+`op`, `frontend`, `transport` and the view among its fields:
 `RUST_LOG=constellation_vfs::observe=debug`.
+
+The FUSE transport itself (plan 38 Z2b) is `node.status`'s `fuse` section — per
+mount the negotiated `transport`, `uring_queue_depth`, `passthrough {enabled,
+opens, unavailable_reason}`, `zero_copy_reads` and the `last_fallback {from, to,
+reason, detail, at_unix_ms}` its handshake took, plus the process-wide
+`transport_fallbacks` and `zero_copy_reads_total` — and on `/metrics`
+`constellation_fuse_transport_fallbacks_total{from,to,reason}`,
+`constellation_fuse_zero_copy_reads_total`, and per `mountpoint`
+`constellation_fuse_passthrough_opens` and `constellation_fuse_uring_queue_depth`.
+Tests: `cargo test -p constellation-frontend-fuse --lib stats` (every rung of the
+fallback ladder names its reason; a fallback is on its session and counted once),
+`control::ops::tests::the_fuse_section_reports_each_mount_and_the_fallbacks`
+(`node.status`, `/metrics` and `stats.subscribe` together), and on a real mount
+`harness smoke`'s `status` step and the `web-ui-smoke` scenario's `/metrics`
+check (the FUSE op rows carry the mount's negotiated transport).
 
 `node.ops` (control) lists the request watchdog's in-flight and stalled ops per
 view, with the view's labels; `view` and `min_age_s` filter it.

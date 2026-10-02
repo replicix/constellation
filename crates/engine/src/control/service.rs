@@ -657,6 +657,7 @@ impl EngineControl {
             lifecycle: self.engine.lifecycle().status(),
             s3: backend::s3_request_counts(),
             vfs_ops: super::ops::vfs_ops_status(),
+            fuse: self.fuse_status(),
         }
     }
 

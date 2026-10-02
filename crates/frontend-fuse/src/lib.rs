@@ -8,14 +8,16 @@
 //! view's, beneath the trait; this crate holds the FUSE protocol: flag
 //! decoding, the attribute and errno encodings ([`reply_code`]), the
 //! `FUSE_INIT` negotiation, the kernel's cache notifications
-//! ([`FuseNotifySink`]), the dispatcher sizing ([`threads`]) and the
-//! mount itself ([`mount`]). It is the only crate that depends on
+//! ([`FuseNotifySink`]), the dispatcher sizing ([`threads`]), the mount
+//! itself ([`mount`]) and what a session reports about its transport
+//! ([`stats`]). It is the only crate that depends on
 //! `fuser`.
 
 mod adapter;
 mod notify;
 mod reply;
 mod session;
+pub mod stats;
 pub mod threads;
 
 pub use adapter::{FuseFs, KernelTuning};
@@ -28,6 +30,7 @@ pub use session::{
     MountOptions, MountSource, SessionControl, SessionExit, SessionHandoff, TransportConfig,
     TransportPolicy, DEFAULT_URING_QUEUE_DEPTH, TRANSPORT_ENV, URING_QUEUE_DEPTH_ENV,
 };
+pub use stats::{FallbackReason, SessionStats, TransportFallback};
 
 /// The capabilities this frontend declares: [`FrontendCaps::linux_fuse`]
 /// (`cluster_locks`: the mount forwards POSIX/`flock` locks to the view).

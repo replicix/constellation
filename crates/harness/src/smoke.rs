@@ -12,7 +12,8 @@
 //! The steps: create a fs (a second create must be refused), mount, POSIX
 //! namespace ops, a 3.5 MiB multi-chunk file, partial in-place edit,
 //! truncate, append, unlink-while-open, rm/rmdir, unmount, remount and
-//! verify persistence, remount with a cold chunk cache, `status`.
+//! verify persistence, remount with a cold chunk cache, `status`, and the
+//! node's `status` naming the FUSE transport the mount negotiated.
 
 use crate::client::is_mountpoint;
 use anyhow::{bail, ensure, Context, Result};
@@ -22,6 +23,52 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Plan 38 §5 on a real mount: `status` names the transport the mount
+/// negotiated in `mounts[]` and in `fuse.mounts[]` alike, and the ops this
+/// run just made through it are counted under that same `transport`
+/// label. Whatever the transport (`CONSTELLATION_FUSE_TRANSPORT` may ask
+/// for the ring), the three must agree; a mount that fell back says it
+/// is on `/dev/fuse`.
+fn transport_is_reported(status: &serde_json::Value, mnt: &Path) -> Result<()> {
+    let mount = &status["mounts"][0];
+    let transport = mount["transport"]
+        .as_str()
+        .with_context(|| format!("FAIL: status names no transport: {mount}"))?;
+    ensure!(
+        matches!(transport, "dev_fuse" | "uring" | "uring_zc"),
+        "FAIL: unknown transport {transport:?}"
+    );
+    let fuse = status["fuse"]["mounts"]
+        .as_array()
+        .context("FAIL: status has no fuse.mounts")?;
+    let ours = fuse
+        .iter()
+        .find(|f| f["id"] == mount["id"] && f["mountpoint"] == mount["mountpoint"])
+        .with_context(|| format!("FAIL: fuse.mounts has no {}: {fuse:?}", mnt.display()))?;
+    ensure!(
+        ours["transport"] == transport,
+        "FAIL: fuse.mounts says {} but mounts says {transport}",
+        ours["transport"]
+    );
+    if !ours["last_fallback"].is_null() {
+        ensure!(
+            transport == "dev_fuse",
+            "FAIL: a fallback recorded on a {transport} mount: {ours}"
+        );
+    }
+    let series = status["vfs_ops"]["series"]
+        .as_array()
+        .context("FAIL: status has no vfs_ops.series")?;
+    let fuse_rows: Vec<&serde_json::Value> =
+        series.iter().filter(|s| s["frontend"] == "fuse").collect();
+    ensure!(!fuse_rows.is_empty(), "FAIL: no FUSE op was counted");
+    ensure!(
+        fuse_rows.iter().all(|s| s["transport"] == transport),
+        "FAIL: FUSE op series not all labelled transport={transport}: {fuse_rows:?}"
+    );
+    Ok(())
+}
 
 /// `tests/lib.sh`'s `say`.
 fn say(msg: &str) {
@@ -436,6 +483,19 @@ fn smoke(m: &mut Mount, work: &Path) -> Result<()> {
         String::from_utf8_lossy(&status.stdout).contains("uuid"),
         "FAIL: status output has no uuid"
     );
+
+    say("node status: the FUSE transport (plan 38 §5)");
+    let node = m
+        .cmd(&["status", &backend, "--state-dir"])
+        .arg(&m.state)
+        .output()?;
+    ensure!(
+        node.status.success(),
+        "node status failed ({}): {}",
+        node.status,
+        String::from_utf8_lossy(&node.stderr)
+    );
+    transport_is_reported(&serde_json::from_slice(&node.stdout)?, &mnt)?;
 
     m.unmount();
     Ok(())

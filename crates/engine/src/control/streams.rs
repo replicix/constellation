@@ -207,6 +207,21 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
         "cache_memory_evictions_total",
         status.cache.memory_evictions,
     );
+    // Plan 38 §5: the FUSE transport counters, their labelled series
+    // summed as the op metrics' are.
+    c(
+        "fuse_transport_fallbacks_total",
+        status
+            .fuse
+            .transport_fallbacks
+            .iter()
+            .map(|f| f.count)
+            .sum(),
+    );
+    c(
+        "fuse_zero_copy_reads_total",
+        status.fuse.zero_copy_reads_total,
+    );
     let mut g = |name: &str, v: f64| {
         gauges.insert(format!("constellation_{name}"), v);
     };
@@ -243,6 +258,27 @@ pub(crate) fn sample_of(status: &StatusReport) -> StatsSample {
     );
     g("fuse_requests_stalled", status.fuse_requests.stalled as f64);
     g("views", status.mounts.len() as f64);
+    // Per-mount gauges as one number each: passthrough opens summed over
+    // the mounts, the deepest ring queue (0: no mount is on a ring).
+    g(
+        "fuse_passthrough_opens",
+        status
+            .fuse
+            .mounts
+            .iter()
+            .map(|m| m.passthrough.opens)
+            .sum::<u64>() as f64,
+    );
+    g(
+        "fuse_uring_queue_depth",
+        status
+            .fuse
+            .mounts
+            .iter()
+            .map(|m| m.uring_queue_depth)
+            .max()
+            .unwrap_or(0) as f64,
+    );
     StatsSample {
         unix_ms: now_ms(),
         counters,

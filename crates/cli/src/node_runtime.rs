@@ -143,8 +143,10 @@ pub struct MountInfo {
     pub subtree: String,
     pub mountpoint: PathBuf,
     pub since: Instant,
-    /// The FUSE transport this mount's connection negotiated (plan 38 §5).
-    pub transport: constellation_frontend_fuse::Transport,
+    /// What this mount's FUSE session reports about its transport (plan
+    /// 38 §5): the negotiated transport, ring queue depth, the fallback
+    /// its handshake took, zero-copy reads.
+    pub fuse: Arc<constellation_frontend_fuse::SessionStats>,
     pub view: Arc<View>,
     pub qos: constellation_engine::ViewQos,
     pub confine_links: bool,
@@ -154,10 +156,11 @@ pub(crate) struct MountHandle {
     pub(crate) subtree: String,
     pub(crate) mountpoint: PathBuf,
     since: Instant,
-    /// Plan 38 §5: the transport this session's `FUSE_INIT` negotiated
-    /// (`dev_fuse`/`uring`/`uring_zc`), fixed for the connection's life
-    /// and reported per mount by `node.status`.
-    pub(crate) transport: constellation_frontend_fuse::Transport,
+    /// Plan 38 §5: what this session reports about its transport — the
+    /// one `FUSE_INIT` negotiated (`dev_fuse`/`uring`/`uring_zc`, fixed
+    /// for the connection's life), its ring queue depth and the fallback
+    /// it took — reported per mount by `node.status.fuse`.
+    pub(crate) fuse: Arc<constellation_frontend_fuse::SessionStats>,
     unmounter: Mutex<constellation_frontend_fuse::FuseUnmounter>,
     /// Plan 31 C4b: what a handover needs of the view and its session.
     pub(crate) fs_name: String,
@@ -496,8 +499,22 @@ impl NodeRuntime {
         // `node.status`. A mount that asked for `auto` and got
         // `dev_fuse` is the ladder degrading as designed -- fuser logged
         // the reason during the handshake -- not a failure.
-        let transport = session.transport();
-        tracing::info!(?mountpoint, transport = transport.name(), "FUSE transport");
+        let fuse = session.stats();
+        match fuse.last_fallback() {
+            None => tracing::info!(
+                ?mountpoint,
+                transport = fuse.transport().name(),
+                "FUSE transport"
+            ),
+            Some(fallback) => tracing::info!(
+                ?mountpoint,
+                transport = fuse.transport().name(),
+                fallback_from = fallback.from.name(),
+                fallback_reason = fallback.reason.as_str(),
+                detail = %fallback.detail,
+                "FUSE transport (fell back)"
+            ),
+        }
         let id = MountId(fs.id());
         // So that a takeover after a kill can abort this mount's
         // connection if it is left wedged (`daemon_lock::abort_stale_mounts`).
@@ -512,7 +529,7 @@ impl NodeRuntime {
                 subtree,
                 mountpoint,
                 since: Instant::now(),
-                transport,
+                fuse,
                 unmounter: Mutex::new(unmounter),
                 fs_name,
                 allow_other,
@@ -717,7 +734,7 @@ impl NodeRuntime {
                 subtree: handle.subtree.clone(),
                 mountpoint: handle.mountpoint.clone(),
                 since: handle.since,
-                transport: handle.transport,
+                fuse: handle.fuse.clone(),
                 view: handle.view.clone(),
                 qos: handle.qos,
                 confine_links: handle.confine_links,

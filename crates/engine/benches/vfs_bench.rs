@@ -222,7 +222,7 @@ impl Scenario {
                 id: 1,
                 metric_view: Some("pv-bench".into()),
             },
-            OpMetrics::detached("bench", Some("pv-bench")),
+            OpMetrics::detached("bench", Some("pv-bench"), "dev_fuse"),
         );
         Scenario {
             backend,

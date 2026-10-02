@@ -113,6 +113,7 @@ mod write_gate;
 
 pub use confine::LINK_DOMAIN_XATTR;
 pub use handoff::{HandleTableSnapshot, ViewHandoff};
+pub use passthrough::PassthroughStatus;
 pub use spec::{metric_view_label, ViewQos, ViewSpec, METRIC_LABELS};
 
 #[cfg(test)]

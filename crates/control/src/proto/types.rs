@@ -67,11 +67,11 @@ pub struct MountInfo {
     /// — `dev_fuse`, `uring` or `uring_zc` — fixed for the connection's
     /// life. `None` on a host with no FUSE session behind the view (a
     /// control-only embedder, the engine's own fixtures) and in a report
-    /// from a daemon older than plan 38 Z1b. The rest of plan 38 §5's
-    /// `fuse` section (ring queue depth, passthrough and zero-copy
-    /// counters, the last transport fallback and its reason) lands with
-    /// the transport integration; the per-mount transport belongs here,
-    /// with the mount it describes.
+    /// from a daemon older than plan 38 Z1b. The same value as this
+    /// mount's [`FuseMountStatus::transport`] in [`StatusReport::fuse`],
+    /// which carries the rest of plan 38 §5's per-mount transport state;
+    /// kept here too because it describes the mount, and every mount
+    /// listing (`view.mount`'s answer included) carries it.
     #[serde(default)]
     pub transport: Option<String>,
 }
@@ -562,11 +562,105 @@ pub struct StatusReport {
     /// `constellation_vfs_ops_total` and `constellation_vfs_op_seconds`.
     #[serde(default)]
     pub vfs_ops: VfsOpsStatus,
+    /// Plan 38 §5: the FUSE read-path transport, per mount and
+    /// process-wide.
+    #[serde(default)]
+    pub fuse: FuseStatus,
 }
 
-/// Every frontend op counted so far, per (frontend, view, op): the numbers
-/// behind `constellation_vfs_ops_total{frontend,view,op,outcome}` and the
-/// `constellation_vfs_op_seconds{frontend,view,op}` histogram. Only series
+/// Plan 38 §5's `fuse` section: what each FUSE mount's connection is
+/// served over and what of the read path's fast lanes it uses, plus the
+/// process-wide counters behind `constellation_fuse_*`.
+///
+/// `cache_verify` (`admit`/`always`, plan 38 §2.3), which decides whether
+/// passthrough and zero-copy may be used at all, is node-wide and is
+/// reported once, as [`CacheStatus::cache_verify`]; it is deliberately not
+/// repeated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FuseStatus {
+    /// One entry per mount with a FUSE session behind it, by mount id.
+    #[serde(default)]
+    pub mounts: Vec<FuseMountStatus>,
+    /// Every transport fallback this process took, by (from, to, reason):
+    /// `constellation_fuse_transport_fallbacks_total`. Process-wide, so
+    /// it survives the unmount of the mount that took one.
+    #[serde(default)]
+    pub transport_fallbacks: Vec<FuseFallbackCount>,
+    /// Reads served zero-copy by every session of this process
+    /// (`constellation_fuse_zero_copy_reads_total`; 0 until plan 38 Z4).
+    #[serde(default)]
+    pub zero_copy_reads_total: u64,
+}
+
+/// One mount of [`FuseStatus`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FuseMountStatus {
+    /// The mount's id ([`MountInfo::id`]).
+    pub id: u64,
+    pub mountpoint: String,
+    /// What the connection negotiated: `dev_fuse`, `uring` or `uring_zc`,
+    /// fixed for the connection's life.
+    pub transport: String,
+    /// Ring entries per kernel queue; 0 on `dev_fuse` (no ring queues).
+    #[serde(default)]
+    pub uring_queue_depth: u32,
+    #[serde(default)]
+    pub passthrough: FusePassthroughStatus,
+    /// Reads this mount served zero-copy (0 until plan 38 Z4).
+    #[serde(default)]
+    pub zero_copy_reads: u64,
+    /// The transport fallback this mount's handshake took, if it took
+    /// one (plan 38 §2.4: logged once, and visible here).
+    #[serde(default)]
+    pub last_fallback: Option<FuseFallback>,
+}
+
+/// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a
+/// single-chunk file's cached chunk directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FusePassthroughStatus {
+    /// Eligible opens are offered a backing file.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Opens currently backed by a chunk file
+    /// (`constellation_fuse_passthrough_opens`).
+    #[serde(default)]
+    pub opens: u64,
+    /// Why `enabled` is false; `None` when it is true.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+}
+
+/// One transport downgrade (plan 38 §2.4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FuseFallback {
+    /// What was asked for (`uring`).
+    pub from: String,
+    /// What the connection got (`dev_fuse`).
+    pub to: String,
+    /// The rung that refused, a fixed name: `handover_capable`,
+    /// `no_io_uring_feature`, `kernel_not_offered`, `ring_setup_failed`.
+    pub reason: String,
+    /// What refused, as precisely as the daemon knows.
+    #[serde(default)]
+    pub detail: String,
+    /// When the handshake recorded it, Unix milliseconds.
+    pub at_unix_ms: u64,
+}
+
+/// One (from, to, reason) of [`FuseStatus::transport_fallbacks`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FuseFallbackCount {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+    pub count: u64,
+}
+
+/// Every frontend op counted so far, per (frontend, view, transport, op):
+/// the numbers behind
+/// `constellation_vfs_ops_total{frontend,view,op,outcome,transport}` and the
+/// `constellation_vfs_op_seconds{frontend,view,op,transport}` histogram. Only series
 /// with something counted are present; `view` is the allowlisted metric
 /// label of a view (plan 31 §9.10), never its full label map.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -579,13 +673,16 @@ pub struct VfsOpsStatus {
     pub series: Vec<VfsOpSeries>,
 }
 
-/// One (frontend, view, op) of [`VfsOpsStatus`].
+/// One (frontend, view, transport, op) of [`VfsOpsStatus`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VfsOpSeries {
     pub frontend: String,
     /// The view's allowlisted metric label; absent for a view with none.
     #[serde(default)]
     pub view: Option<String>,
+    /// Plan 38 §5: the kernel transport that carried the ops — `dev_fuse`,
+    /// `uring` or `uring_zc` for the FUSE frontend, `n/a` for any other.
+    pub transport: String,
     pub op: String,
     /// Ops per outcome: `ok`, or a `Code` name (`NotFound`, ...).
     #[serde(default)]

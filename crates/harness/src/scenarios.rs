@@ -3767,6 +3767,46 @@ fn web_ui_smoke(_seed: u64) -> Result<()> {
     ] {
         anyhow::ensure!(metrics.contains(gauge), "/metrics omitted {gauge}");
     }
+    // Plan 38 §5: the op metrics of this real mount carry the transport
+    // its connection negotiated (`dev_fuse` unless the lane asked for the
+    // ring and got it), and the FUSE transport families are exported.
+    let transport = status["mounts"][0]["transport"]
+        .as_str()
+        .context("status names no transport")?
+        .to_string();
+    let label = format!("transport=\"{transport}\"");
+    anyhow::ensure!(
+        metrics
+            .lines()
+            .any(|l| l.starts_with("constellation_vfs_ops_total{")
+                && l.contains("frontend=\"fuse\"")
+                && l.contains(&label)),
+        "/metrics has no FUSE op row labelled {label}"
+    );
+    anyhow::ensure!(
+        metrics
+            .lines()
+            .filter(|l| l.starts_with("constellation_vfs_op") && l.contains("frontend=\"fuse\""))
+            .all(|l| l.contains(&label)),
+        "/metrics has a FUSE op row not labelled {label}"
+    );
+    for family in [
+        "# TYPE constellation_fuse_transport_fallbacks_total counter",
+        "# TYPE constellation_fuse_zero_copy_reads_total counter",
+        "# TYPE constellation_fuse_passthrough_opens gauge",
+        "# TYPE constellation_fuse_uring_queue_depth gauge",
+    ] {
+        anyhow::ensure!(
+            metrics.lines().any(|l| l == family),
+            "/metrics omitted {family}"
+        );
+    }
+    anyhow::ensure!(
+        metrics
+            .lines()
+            .any(|l| l.starts_with("constellation_fuse_uring_queue_depth{") && l.contains(&label)),
+        "/metrics has no queue depth for the mount"
+    );
     client.unmount()?;
     Ok(())
 }

@@ -217,6 +217,10 @@ fn a_frontend_that_cannot_consume_a_backing_file_is_not_offered_one() {
     assert!(e.open_ro(ino).backing.is_none());
     assert_eq!(e.cache.open_pin_count(&hash), 0);
     assert_eq!(e.fs.passthrough_handles(ino), 0);
+    // `node.status` says so, and why (plan 38 §5).
+    let status = e.fs.passthrough_status();
+    assert!(!status.enabled && status.opens == 0);
+    assert!(status.unavailable_reason.unwrap().contains("frontend"));
     // Reads go the ordinary way, exactly as before this plan.
     assert_eq!(e.read(ino, 0, 4096), data);
     e.release(ino);
@@ -410,6 +414,12 @@ fn cache_verify_always_never_offers_a_backing_file() {
     assert!(e.open_ro(ino).backing.is_none());
     assert_eq!(e.cache.open_pin_count(&hash), 0);
     assert_eq!(e.fs.passthrough_handles(ino), 0);
+    let status = e.fs.passthrough_status();
+    assert!(!status.enabled);
+    assert!(status
+        .unavailable_reason
+        .unwrap()
+        .contains("--cache-verify always"));
     // Reads are unaffected: they go the ordinary way, as always.
     assert_eq!(e.read(ino, 0, 4096), data);
     e.release(ino);
@@ -424,10 +434,16 @@ fn the_pin_count_is_the_number_of_concurrent_opens() {
     assert!(handles.iter().all(|o| o.backing.is_some()));
     assert_eq!(e.cache.open_pin_count(&hash), 3);
     assert_eq!(e.fs.passthrough_handles(ino), 3);
+    // What `node.status.fuse` and `constellation_fuse_passthrough_opens`
+    // report for the mount.
+    let status = e.fs.passthrough_status();
+    assert_eq!((status.enabled, status.opens), (true, 3));
+    assert_eq!(status.unavailable_reason, None);
     for expected in [2, 1, 0] {
         e.release(ino);
         assert_eq!(e.cache.open_pin_count(&hash), expected);
         assert_eq!(e.fs.passthrough_handles(ino), expected as usize);
+        assert_eq!(e.fs.passthrough_status().opens, u64::from(expected));
     }
     // Every descriptor handed out is still the file's content.
     for o in &handles {

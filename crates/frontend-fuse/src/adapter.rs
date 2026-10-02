@@ -40,7 +40,7 @@ use fuser::{
 };
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The `frontend` label of this crate's op metrics and spans.
@@ -76,8 +76,12 @@ pub struct FuseFs<V: Vfs> {
     caps: FrontendCaps,
     tuning: KernelTuning,
     /// Op ids, the `vfs.op` span and the op metrics (plan 31 §6.10), for
-    /// this session's view.
-    obs: Observer,
+    /// this session's view, labelled with the transport the session
+    /// negotiated (plan 38 §5). That is only known once the handshake has
+    /// run, after this filesystem was handed to fuser, so the session
+    /// fills the slot right after `FUSE_INIT` ([`Self::observer_slot`]),
+    /// before any request is served.
+    obs: Arc<OnceLock<Observer>>,
     /// Requests answered from another thread and not answered yet (plan
     /// 31 §6.11: a handover drains them, or refuses).
     deferred: Arc<Deferred>,
@@ -85,18 +89,38 @@ pub struct FuseFs<V: Vfs> {
 
 impl<V: Vfs> FuseFs<V> {
     pub fn new(vfs: Arc<V>, caps: FrontendCaps, tuning: KernelTuning) -> Self {
-        let obs = Observer::new(FRONTEND, &vfs.identity());
         Self {
             vfs,
             caps,
             tuning,
-            obs,
+            obs: Arc::default(),
             deferred: Arc::default(),
         }
     }
 
     pub(crate) fn deferred(&self) -> &Arc<Deferred> {
         &self.deferred
+    }
+
+    /// Where the session puts this filesystem's [`Observer`] once it knows
+    /// the negotiated transport.
+    pub(crate) fn observer_slot(&self) -> Arc<OnceLock<Observer>> {
+        self.obs.clone()
+    }
+
+    /// The session's observer. A filesystem served without a
+    /// [`crate::FuseSession`] (the wire tests drive one over a socket
+    /// pair) never has its slot filled and counts as `/dev/fuse`, which
+    /// is what such a connection is.
+    #[inline]
+    fn obs(&self) -> &Observer {
+        self.obs.get_or_init(|| {
+            Observer::new(
+                FRONTEND,
+                &self.vfs.identity(),
+                fuser::Transport::DevFuse.name(),
+            )
+        })
     }
 }
 
@@ -393,7 +417,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn lookup(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEntry) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Lookup, parent.0);
+        let op = self.obs().begin(OpKind::Lookup, parent.0);
         let _in = op.enter();
         self.vfs.lookup(
             &op.ctx(&caller),
@@ -405,7 +429,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Getattr, ino.0);
+        let op = self.obs().begin(OpKind::Getattr, ino.0);
         let _in = op.enter();
         self.vfs.getattr(
             &op.ctx(&caller),
@@ -443,7 +467,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             atime: atime.map(time_set),
             mtime: mtime.map(time_set),
         };
-        let op = self.obs.begin(OpKind::Setattr, ino.0);
+        let op = self.obs().begin(OpKind::Setattr, ino.0);
         let _in = op.enter();
         self.vfs.setattr(
             &op.ctx(&caller),
@@ -456,7 +480,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Readlink, ino.0);
+        let op = self.obs().begin(OpKind::Readlink, ino.0);
         let _in = op.enter();
         self.vfs
             .readlink(&op.ctx(&caller), ino.0, op.responder(BytesReply(reply)));
@@ -472,7 +496,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEntry,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Mkdir, parent.0);
+        let op = self.obs().begin(OpKind::Mkdir, parent.0);
         let _in = op.enter();
         self.vfs.mkdir(
             &op.ctx(&caller),
@@ -497,7 +521,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // FUSE carries the kernel's 32-bit `new_encode_dev`; the contract
         // (and the journal) carry the portable pair (plan 31 §7).
         let rdev: Rdev = constellation_platform::from_linux_fuse_rdev(rdev);
-        let op = self.obs.begin(OpKind::Mknod, parent.0);
+        let op = self.obs().begin(OpKind::Mknod, parent.0);
         let _in = op.enter();
         self.vfs.mknod(
             &op.ctx(&caller),
@@ -518,7 +542,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEntry,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Link, ino.0);
+        let op = self.obs().begin(OpKind::Link, ino.0);
         let _in = op.enter();
         self.vfs.link(
             &op.ctx(&caller),
@@ -540,7 +564,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: fuser::ReplyCreate,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Create, parent.0);
+        let op = self.obs().begin(OpKind::Create, parent.0);
         let _in = op.enter();
         self.vfs.create(
             &op.ctx(&caller),
@@ -562,7 +586,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEntry,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Symlink, parent.0);
+        let op = self.obs().begin(OpKind::Symlink, parent.0);
         let _in = op.enter();
         self.vfs.symlink(
             &op.ctx(&caller),
@@ -575,7 +599,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn unlink(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEmpty) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Unlink, parent.0);
+        let op = self.obs().begin(OpKind::Unlink, parent.0);
         let _in = op.enter();
         self.vfs.unlink(
             &op.ctx(&caller),
@@ -587,7 +611,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn rmdir(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEmpty) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Rmdir, parent.0);
+        let op = self.obs().begin(OpKind::Rmdir, parent.0);
         let _in = op.enter();
         self.vfs.rmdir(
             &op.ctx(&caller),
@@ -608,7 +632,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEmpty,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Rename, parent.0);
+        let op = self.obs().begin(OpKind::Rename, parent.0);
         let _in = op.enter();
         self.vfs.rename(
             &op.ctx(&caller),
@@ -623,7 +647,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Open, ino.0);
+        let op = self.obs().begin(OpKind::Open, ino.0);
         let _in = op.enter();
         self.vfs.open(
             &op.ctx(&caller),
@@ -646,7 +670,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyData,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Read, ino.0);
+        let op = self.obs().begin(OpKind::Read, ino.0);
         let _in = op.enter();
         self.vfs.read(
             &op.ctx(&caller),
@@ -673,7 +697,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyWrite,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Write, ino.0);
+        let op = self.obs().begin(OpKind::Write, ino.0);
         let _in = op.enter();
         self.vfs.write(
             &op.ctx(&caller),
@@ -695,7 +719,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEmpty,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Flush, ino.0);
+        let op = self.obs().begin(OpKind::Flush, ino.0);
         let _in = op.enter();
         self.vfs.flush(
             &op.ctx(&caller),
@@ -715,7 +739,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEmpty,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Fsync, ino.0);
+        let op = self.obs().begin(OpKind::Fsync, ino.0);
         let _in = op.enter();
         self.vfs.fsync(
             &op.ctx(&caller),
@@ -737,7 +761,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEmpty,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Release, ino.0);
+        let op = self.obs().begin(OpKind::Release, ino.0);
         let _in = op.enter();
         self.vfs.release(
             &op.ctx(&caller),
@@ -758,7 +782,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyDirectory,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Readdir, ino.0);
+        let op = self.obs().begin(OpKind::Readdir, ino.0);
         let _in = op.enter();
         self.vfs.readdir(
             &op.ctx(&caller),
@@ -780,7 +804,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         position: u32,
         reply: ReplyEmpty,
     ) {
-        let op = self.obs.begin(OpKind::Setxattr, ino.0);
+        let op = self.obs().begin(OpKind::Setxattr, ino.0);
         if position != 0 {
             // macOS's resource-fork offset; a Linux kernel always sends 0.
             // Refused here, and counted like any other refusal.
@@ -802,7 +826,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn getxattr(&self, req: &Request, ino: INodeNo, n: &OsStr, size: u32, reply: ReplyXattr) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Getxattr, ino.0);
+        let op = self.obs().begin(OpKind::Getxattr, ino.0);
         let _in = op.enter();
         self.vfs.getxattr(
             &op.ctx(&caller),
@@ -814,7 +838,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Listxattr, ino.0);
+        let op = self.obs().begin(OpKind::Listxattr, ino.0);
         let _in = op.enter();
         self.vfs.listxattr(
             &op.ctx(&caller),
@@ -825,7 +849,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn removexattr(&self, req: &Request, ino: INodeNo, n: &OsStr, reply: ReplyEmpty) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Removexattr, ino.0);
+        let op = self.obs().begin(OpKind::Removexattr, ino.0);
         let _in = op.enter();
         self.vfs.removexattr(
             &op.ctx(&caller),
@@ -837,7 +861,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
 
     fn statfs(&self, req: &Request, ino: INodeNo, reply: fuser::ReplyStatfs) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Statfs, ino.0);
+        let op = self.obs().begin(OpKind::Statfs, ino.0);
         let _in = op.enter();
         self.vfs
             .statfs(&op.ctx(&caller), ino.0, op.responder(StatfsReply(reply)));
@@ -854,7 +878,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEmpty,
     ) {
         let caller = caller(req);
-        let op = self.obs.begin(OpKind::Fallocate, ino.0);
+        let op = self.obs().begin(OpKind::Fallocate, ino.0);
         let _in = op.enter();
         self.vfs.fallocate(
             &op.ctx(&caller),
@@ -877,7 +901,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyLseek,
     ) {
         // Refused here or not, the op is counted.
-        let op = self.obs.begin(OpKind::Seek, ino.0);
+        let op = self.obs().begin(OpKind::Seek, ino.0);
         if offset < 0 {
             op.responder(LseekReply(reply))
                 .done(Err(Code::NoDeviceOrAddress.into()));
@@ -922,7 +946,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         } else {
             LockKind::Read
         };
-        let op = self.obs.begin(OpKind::LockTest, ino.0);
+        let op = self.obs().begin(OpKind::LockTest, ino.0);
         let _in = op.enter();
         self.vfs.lock_test(
             &op.ctx(&caller),
@@ -954,7 +978,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let kind = match typ {
             F_UNLCK => {
-                let op = self.obs.begin(OpKind::LockRelease, ino.0);
+                let op = self.obs().begin(OpKind::LockRelease, ino.0);
                 let _in = op.enter();
                 self.vfs.lock_release(
                     &op.ctx(&caller),
@@ -971,14 +995,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             // Not reachable from the kernel, which validates `l_type`
             // (and builds `flock`'s itself) before asking.
             _ => {
-                self.obs
+                self.obs()
                     .begin(OpKind::LockAcquire, ino.0)
                     .responder(EmptyReply(reply))
                     .done(Err(Code::Invalid.into()));
                 return;
             }
         };
-        let op = self.obs.begin(OpKind::LockAcquire, ino.0);
+        let op = self.obs().begin(OpKind::LockAcquire, ino.0);
         let _in = op.enter();
         let cx = op.ctx(&caller);
         let spec = lock_spec(lock_owner, start, end, kind, pid);

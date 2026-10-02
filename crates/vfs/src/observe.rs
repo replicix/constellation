@@ -25,7 +25,10 @@
 //!
 //! **Labels.** The span carries the view's numeric id and its `view`
 //! label, the allowlisted metric label (`ViewSpec::metric_labels`, plan
-//! 31 §9.10) — the same value the metrics carry. The view's full label
+//! 31 §9.10) — the same value the metrics carry — and the session's
+//! `transport` (plan 38 §5: `dev_fuse`/`uring`/`uring_zc` for FUSE,
+//! [`NO_TRANSPORT`](crate::metrics::NO_TRANSPORT) elsewhere), so a trace shows which kernel path served
+//! a read without cross-referencing the metrics. The view's full label
 //! map is logged once, when the view opens, and is visible in
 //! `view.list` and `node.ops`; it is not repeated on every op.
 
@@ -50,23 +53,26 @@ pub struct ViewIdentity {
 #[derive(Clone)]
 pub struct Observer {
     frontend: &'static str,
+    transport: &'static str,
     view_id: u64,
     view: Option<Arc<str>>,
     metrics: Arc<OpMetrics>,
 }
 
 impl Observer {
-    /// The observer of `frontend` serving `identity`, counting into the
+    /// The observer of `frontend` serving `identity` over `transport`
+    /// ([`NO_TRANSPORT`](crate::metrics::NO_TRANSPORT) for a frontend without one), counting into the
     /// process-wide metrics a scrape sees ([`crate::metrics::snapshot`]).
-    pub fn new(frontend: &'static str, identity: &ViewIdentity) -> Self {
+    pub fn new(frontend: &'static str, identity: &ViewIdentity, transport: &'static str) -> Self {
         Self::with_metrics(
             frontend,
             identity,
-            OpMetrics::for_view(frontend, identity.metric_view.as_deref()),
+            OpMetrics::for_view(frontend, identity.metric_view.as_deref(), transport),
         )
     }
 
-    /// As [`Self::new`], counting into `metrics` (a benchmark's own).
+    /// As [`Self::new`], counting into `metrics` (a benchmark's own); the
+    /// span's `transport` is the one `metrics` is labelled with.
     pub fn with_metrics(
         frontend: &'static str,
         identity: &ViewIdentity,
@@ -74,6 +80,7 @@ impl Observer {
     ) -> Self {
         Self {
             frontend,
+            transport: metrics.transport(),
             view_id: identity.id,
             view: identity.metric_view.as_deref().map(Arc::from),
             metrics,
@@ -95,6 +102,7 @@ impl Observer {
             ino,
             op_id = id.0,
             frontend = self.frontend,
+            transport = self.transport,
             view_id = self.view_id,
             view = self.view.as_deref(),
         );
@@ -209,8 +217,11 @@ mod tests {
             id: 7,
             metric_view: Some("pv-1".into()),
         };
-        let observer =
-            Observer::with_metrics("unit", &identity, OpMetrics::detached("unit", Some("pv-1")));
+        let observer = Observer::with_metrics(
+            "unit",
+            &identity,
+            OpMetrics::detached("unit", Some("pv-1"), "uring"),
+        );
         let caller = Caller::root();
         let id = tracing::subscriber::with_default(subscriber, || {
             let op = observer.begin(OpKind::Lookup, 42);
@@ -229,6 +240,7 @@ mod tests {
             "ino=42",
             &format!("op_id={}", id.0),
             "frontend=\"unit\"",
+            "transport=\"uring\"",
             "view_id=7",
             "view=\"pv-1\"",
         ] {
@@ -242,7 +254,7 @@ mod tests {
         let observer = Observer::with_metrics(
             "unit",
             &ViewIdentity::default(),
-            OpMetrics::detached("unit", None),
+            OpMetrics::detached("unit", None, crate::metrics::NO_TRANSPORT),
         );
         // (Whether the span is the empty one depends on tracing's
         // process-wide callsite cache, which another test's subscriber

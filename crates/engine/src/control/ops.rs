@@ -125,6 +125,7 @@ pub(crate) fn vfs_ops_status() -> VfsOpsStatus {
             .map(|s| VfsOpSeries {
                 frontend: s.frontend.to_string(),
                 view: s.view,
+                transport: s.transport.to_string(),
                 op: s.op.to_string(),
                 outcomes: s
                     .outcomes
@@ -152,12 +153,16 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    /// A host whose views are the ones the test hands it.
-    struct Host(Mutex<Vec<HostView>>);
+    /// A host whose views are the ones the test hands it, and whose
+    /// process-wide FUSE counters are the test's too.
+    struct Host(Mutex<Vec<HostView>>, Mutex<api::FuseStatus>);
 
     impl ControlHost for Host {
         fn views(&self) -> Vec<HostView> {
             self.0.lock().unwrap().clone()
+        }
+        fn fuse_counters(&self) -> api::FuseStatus {
+            self.1.lock().unwrap().clone()
         }
         fn mount(&self, _: &ViewMountParams, _: Option<OwnedFd>) -> Result<ViewInfo, ControlError> {
             Err(ControlError::unsupported("the fixture mounts nothing"))
@@ -182,6 +187,7 @@ mod tests {
         _dir: tempfile::TempDir,
         rt: tokio::runtime::Runtime,
         svc: Arc<EngineControl>,
+        host: Arc<Host>,
         views: Vec<Arc<View>>,
     }
 
@@ -239,15 +245,16 @@ mod tests {
                 qos: Default::default(),
                 confine_links: false,
                 // No FUSE session in this fixture.
-                transport: None,
+                fuse: None,
                 view: Some(view.clone()),
             });
             views.push(view);
         }
         let prefetch = views[0].prefetch_stats();
+        let host = Arc::new(Host(Mutex::new(hosted), Mutex::default()));
         let svc = EngineControl::new(
             engine,
-            Arc::new(Host(Mutex::new(hosted))),
+            host.clone(),
             crate::log_buffer::LogBuffer::default(),
             prefetch,
             "ops-test",
@@ -256,6 +263,7 @@ mod tests {
             _dir: dir,
             rt,
             svc,
+            host,
             views,
         }
     }
@@ -464,7 +472,7 @@ mod tests {
         assert_eq!(identity.metric_view.as_deref(), Some("pv-9"));
         // A frontend of this test's own, so the process-wide registry other
         // tests share cannot add to these counts.
-        let obs = Observer::new("scrape-test", &identity);
+        let obs = Observer::new("scrape-test", &identity, "dev_fuse");
         let caller = Caller::root();
         for _ in 0..3 {
             let op = obs.begin(OpKind::Getattr, ROOT_INO);
@@ -509,11 +517,21 @@ mod tests {
         for line in [
             "# TYPE constellation_vfs_ops_total counter".to_string(),
             "# TYPE constellation_vfs_op_seconds histogram".to_string(),
-            format!(r#"constellation_vfs_ops_total{{{labels},op="getattr",outcome="ok"}} 3"#),
-            format!(r#"constellation_vfs_ops_total{{{labels},op="lookup",outcome="NotFound"}} 2"#),
-            format!(r#"constellation_vfs_op_seconds_count{{{labels},op="getattr"}} 3"#),
-            format!(r#"constellation_vfs_op_seconds_bucket{{{labels},op="getattr",le="+Inf"}} 3"#),
-            format!(r#"constellation_vfs_op_seconds_count{{{labels},op="lookup"}} 2"#),
+            format!(
+                r#"constellation_vfs_ops_total{{{labels},op="getattr",transport="dev_fuse",outcome="ok"}} 3"#
+            ),
+            format!(
+                r#"constellation_vfs_ops_total{{{labels},op="lookup",transport="dev_fuse",outcome="NotFound"}} 2"#
+            ),
+            format!(
+                r#"constellation_vfs_op_seconds_count{{{labels},op="getattr",transport="dev_fuse"}} 3"#
+            ),
+            format!(
+                r#"constellation_vfs_op_seconds_bucket{{{labels},op="getattr",transport="dev_fuse",le="+Inf"}} 3"#
+            ),
+            format!(
+                r#"constellation_vfs_op_seconds_count{{{labels},op="lookup",transport="dev_fuse"}} 2"#
+            ),
         ] {
             assert!(body.lines().any(|l| l == line), "{line}\n{body}");
         }
@@ -590,5 +608,103 @@ mod tests {
             sample.gauges["constellation_cache_memory_used_bytes"],
             65536.0
         );
+    }
+
+    /// Plan 38 §5: the host's per-session FUSE state reaches
+    /// `node.status.fuse` per mount, with the view's own passthrough
+    /// status filled in by the engine; the host's process-wide fallback
+    /// counter reaches `/metrics` and `stats.subscribe`; and the mount's
+    /// `MountInfo::transport` is the same value.
+    #[test]
+    fn the_fuse_section_reports_each_mount_and_the_fallbacks() {
+        let f = fixture(&[&[], &[]]);
+        let fallback = api::FuseFallback {
+            from: "uring".into(),
+            to: "dev_fuse".into(),
+            reason: "kernel_not_offered".into(),
+            detail: "fuse.enable_uring is N".into(),
+            at_unix_ms: 1_700_000_000_000,
+        };
+        let host = &f.host;
+        {
+            let mut views = host.0.lock().unwrap();
+            // The first view has a FUSE session that fell back; the second
+            // has none (a control-only view) and is not in the section.
+            views[0].fuse = Some(api::FuseMountStatus {
+                transport: "dev_fuse".into(),
+                last_fallback: Some(fallback.clone()),
+                // What the host claims is overwritten by the engine.
+                id: 999,
+                passthrough: api::FusePassthroughStatus {
+                    enabled: true,
+                    opens: 42,
+                    unavailable_reason: None,
+                },
+                ..Default::default()
+            });
+        }
+        *host.1.lock().unwrap() = api::FuseStatus {
+            transport_fallbacks: vec![api::FuseFallbackCount {
+                from: "uring".into(),
+                to: "dev_fuse".into(),
+                reason: "kernel_not_offered".into(),
+                count: 1,
+            }],
+            ..Default::default()
+        };
+
+        let status = f.svc.status();
+        let id = f.views[0].id();
+        assert_eq!(status.fuse.mounts.len(), 1, "{:?}", status.fuse);
+        let mount = &status.fuse.mounts[0];
+        assert_eq!((mount.id, mount.mountpoint.as_str()), (id, "/ops-test/0"));
+        assert_eq!(mount.last_fallback.as_ref(), Some(&fallback));
+        // `linux_fuse` declares no passthrough until plan 38 Z3b.
+        assert!(!mount.passthrough.enabled);
+        assert_eq!(mount.passthrough.opens, 0);
+        assert!(mount.passthrough.unavailable_reason.is_some());
+        let info = status.mounts.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(info.transport.as_deref(), Some("dev_fuse"));
+        // Round-trips as the schema describes it.
+        let json = serde_json::to_value(&status.fuse).unwrap();
+        assert_eq!(
+            json["mounts"][0]["last_fallback"]["reason"],
+            "kernel_not_offered"
+        );
+        let back: api::FuseStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status.fuse);
+
+        let app = web::app(Arc::new(router(&f.svc)));
+        let body = f.rt.block_on(async {
+            let request = axum::http::Request::builder()
+                .uri("/metrics")
+                .header("host", "127.0.0.1")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        });
+        for line in [
+            r#"constellation_fuse_transport_fallbacks_total{from="uring",to="dev_fuse",reason="kernel_not_offered"} 1"#,
+            "constellation_fuse_zero_copy_reads_total 0",
+            r#"constellation_fuse_passthrough_opens{mountpoint="/ops-test/0"} 0"#,
+            r#"constellation_fuse_uring_queue_depth{mountpoint="/ops-test/0",transport="dev_fuse"} 0"#,
+        ] {
+            assert!(body.lines().any(|l| l == line), "{line}\n{body}");
+        }
+        let sample = streams::sample_of(&status);
+        assert_eq!(
+            sample.counters["constellation_fuse_transport_fallbacks_total"],
+            1
+        );
+        assert_eq!(
+            sample.counters["constellation_fuse_zero_copy_reads_total"],
+            0
+        );
+        assert_eq!(sample.gauges["constellation_fuse_passthrough_opens"], 0.0);
+        assert_eq!(sample.gauges["constellation_fuse_uring_queue_depth"], 0.0);
     }
 }

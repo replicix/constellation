@@ -1,6 +1,7 @@
 //! Unified op metrics (plan 31 §6.10): `constellation_vfs_ops_total
-//! {frontend,op,outcome}` and `constellation_vfs_op_seconds{frontend,op}`,
-//! recorded once per op, when its responder completes.
+//! {frontend,view,op,outcome,transport}` and
+//! `constellation_vfs_op_seconds{frontend,view,op,transport}`, recorded
+//! once per op, when its responder completes.
 //!
 //! # Why the responder
 //!
@@ -14,7 +15,7 @@
 //!
 //! # No allocation, no lookup on the hot path
 //!
-//! An [`OpMetrics`] is built once per (frontend, view) and holds one
+//! An [`OpMetrics`] is built once per (frontend, view, transport) and holds one
 //! [`Series`] per [`OpKind`]: a fixed array of atomic counters indexed by
 //! outcome, a fixed array of atomic histogram buckets, and an atomic
 //! nanosecond sum. Recording an op is three relaxed `fetch_add`s at
@@ -26,6 +27,14 @@
 //! allowlisted `ViewSpec::metric_labels` (the engine's; plan 31 §9.10,
 //! bounded cardinality) — it arrives here as one already-rendered string.
 //!
+//! # Transport
+//!
+//! Plan 38 §3(b)/§5: which kernel transport carried the op — on FUSE
+//! rows the session's negotiated `dev_fuse`, `uring` or `uring_zc`, fixed
+//! for the connection's life; every other frontend reports [`NO_TRANSPORT`]
+//! (`n/a`). One `&'static str` fixed at construction, like the frontend's
+//! name, so the label adds no work per op and at most four values.
+//!
 //! # Outcome
 //!
 //! `ok`, or the [`Code`]'s name ([`Code::name`]): a bounded set of at
@@ -35,7 +44,7 @@
 //! # Lifetime
 //!
 //! [`OpMetrics::for_view`] shares one series set between every
-//! frontend session of the same (frontend, view label) — a handover's
+//! frontend session of the same (frontend, view label, transport) — a handover's
 //! resumed session, two mounts of one volume — so a scrape never sees a
 //! counter step backwards when one of them ends. The registry holds them
 //! weakly: when the last session of a label is gone its series are too
@@ -49,6 +58,11 @@ use constellation_types::Code;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
+
+/// The `transport` label of a frontend with no notion of one (every
+/// frontend but FUSE): one fixed value, so the label's cardinality stays
+/// bounded.
+pub const NO_TRANSPORT: &str = "n/a";
 
 /// Outcome slots per op: slot 0 is `ok`, slot `n` is the [`Code`] with
 /// wire number `n`.
@@ -121,46 +135,56 @@ impl Series {
     }
 }
 
-/// The metrics of one (frontend, view): see the module doc.
+/// The metrics of one (frontend, view, transport): see the module doc.
 pub struct OpMetrics {
     frontend: &'static str,
     view: Option<Box<str>>,
+    transport: &'static str,
     series: Box<[Series]>,
 }
 
 static REGISTRY: Mutex<Vec<Weak<OpMetrics>>> = Mutex::new(Vec::new());
 
 impl OpMetrics {
-    fn build(frontend: &'static str, view: Option<&str>) -> Arc<Self> {
+    fn build(frontend: &'static str, view: Option<&str>, transport: &'static str) -> Arc<Self> {
         Arc::new(Self {
             frontend,
             view: view.map(Box::from),
+            transport,
             series: OpKind::ALL.iter().map(|_| Series::new()).collect(),
         })
     }
 
     /// The process-wide metrics of `frontend` serving the view labelled
     /// `view` (the allowlisted label value, already rendered; `None` for
-    /// a view with none), created on first use and shared afterwards.
-    /// Scraped by [`snapshot`].
-    pub fn for_view(frontend: &'static str, view: Option<&str>) -> Arc<Self> {
+    /// a view with none) over `transport` ([`NO_TRANSPORT`] for a frontend
+    /// without one), created on first use and shared afterwards. Scraped
+    /// by [`snapshot`].
+    pub fn for_view(
+        frontend: &'static str,
+        view: Option<&str>,
+        transport: &'static str,
+    ) -> Arc<Self> {
         let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         registry.retain(|m| m.strong_count() > 0);
-        let existing = registry
-            .iter()
-            .filter_map(Weak::upgrade)
-            .find(|m| m.frontend == frontend && m.view.as_deref() == view);
+        let existing = registry.iter().filter_map(Weak::upgrade).find(|m| {
+            m.frontend == frontend && m.view.as_deref() == view && m.transport == transport
+        });
         if let Some(existing) = existing {
             return existing;
         }
-        let metrics = Self::build(frontend, view);
+        let metrics = Self::build(frontend, view, transport);
         registry.push(Arc::downgrade(&metrics));
         metrics
     }
 
     /// Metrics no scrape sees (a benchmark's own, a test's).
-    pub fn detached(frontend: &'static str, view: Option<&str>) -> Arc<Self> {
-        Self::build(frontend, view)
+    pub fn detached(
+        frontend: &'static str,
+        view: Option<&str>,
+        transport: &'static str,
+    ) -> Arc<Self> {
+        Self::build(frontend, view, transport)
     }
 
     pub fn frontend(&self) -> &'static str {
@@ -169,6 +193,10 @@ impl OpMetrics {
 
     pub fn view(&self) -> Option<&str> {
         self.view.as_deref()
+    }
+
+    pub fn transport(&self) -> &'static str {
+        self.transport
     }
 
     /// Count one op: `None` is `ok`, `Some(code)` a refusal.
@@ -241,12 +269,15 @@ impl<R: DirSink> DirSink for Timed<R> {
     }
 }
 
-/// One (frontend, view, op) as scraped: the counters of every
+/// One (frontend, view, transport, op) as scraped: the counters of every
 /// [`OpMetrics`] sharing it, summed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpSeries {
     pub frontend: &'static str,
     pub view: Option<String>,
+    /// `dev_fuse`/`uring`/`uring_zc` on FUSE rows, [`NO_TRANSPORT`]
+    /// elsewhere.
+    pub transport: &'static str,
     pub op: &'static str,
     /// Ops per outcome (`ok` or a [`Code::name`]), non-zero ones only.
     pub outcomes: Vec<(&'static str, u64)>,
@@ -276,7 +307,7 @@ fn outcome_name(slot: usize) -> Option<&'static str> {
 }
 
 /// Every op counted so far by a live [`OpMetrics`], one entry per
-/// (frontend, view, op name) with anything counted. `setlk`'s two kinds
+/// (frontend, view, transport, op name) with anything counted. `setlk`'s two kinds
 /// (acquire and release) are one series, as their name is.
 pub fn snapshot() -> Vec<OpSeries> {
     let live: Vec<Arc<OpMetrics>> = {
@@ -303,7 +334,10 @@ pub fn snapshot() -> Vec<OpSeries> {
             let sum_ns = series.sum_ns.load(Relaxed);
             let view = metrics.view.as_deref();
             let existing = out.iter_mut().find(|s| {
-                s.frontend == metrics.frontend && s.view.as_deref() == view && s.op == kind.name()
+                s.frontend == metrics.frontend
+                    && s.view.as_deref() == view
+                    && s.transport == metrics.transport
+                    && s.op == kind.name()
             });
             match existing {
                 Some(s) => {
@@ -321,6 +355,7 @@ pub fn snapshot() -> Vec<OpSeries> {
                 None => out.push(OpSeries {
                     frontend: metrics.frontend,
                     view: view.map(str::to_owned),
+                    transport: metrics.transport,
                     op: kind.name(),
                     outcomes,
                     buckets,
@@ -329,7 +364,9 @@ pub fn snapshot() -> Vec<OpSeries> {
             }
         }
     }
-    out.sort_by(|a, b| (a.frontend, &a.view, a.op).cmp(&(b.frontend, &b.view, b.op)));
+    out.sort_by(|a, b| {
+        (a.frontend, &a.view, a.transport, a.op).cmp(&(b.frontend, &b.view, b.transport, b.op))
+    });
     out
 }
 
@@ -374,7 +411,7 @@ mod tests {
 
     #[test]
     fn a_completed_op_is_counted_once_by_outcome_and_latency() {
-        let m = OpMetrics::for_view("unit", Some("v-counted"));
+        let m = OpMetrics::for_view("unit", Some("v-counted"), NO_TRANSPORT);
         let started = Instant::now();
         let ok = Blocking::run(|r: Blocking<u8>| m.timed(OpKind::Getattr, started, r).done(Ok(1)));
         assert_eq!(ok, Ok(1));
@@ -398,7 +435,7 @@ mod tests {
 
     #[test]
     fn a_responder_dropped_unanswered_counts_as_io_and_never_twice() {
-        let m = OpMetrics::for_view("unit", Some("v-dropped"));
+        let m = OpMetrics::for_view("unit", Some("v-dropped"), NO_TRANSPORT);
         let got = Blocking::<u8>::run(|r| drop(m.timed(OpKind::Read, Instant::now(), r)));
         assert_eq!(got, Err(Code::Io.into()));
         // Completed on another thread, as a deferred op is.
@@ -413,14 +450,17 @@ mod tests {
 
     #[test]
     fn views_of_one_label_share_series_and_lock_ops_share_a_name() {
-        let a = OpMetrics::for_view("unit", Some("v-shared"));
-        let b = OpMetrics::for_view("unit", Some("v-shared"));
+        let a = OpMetrics::for_view("unit", Some("v-shared"), NO_TRANSPORT);
+        let b = OpMetrics::for_view("unit", Some("v-shared"), NO_TRANSPORT);
         assert!(Arc::ptr_eq(&a, &b));
         assert!(!Arc::ptr_eq(
             &a,
-            &OpMetrics::for_view("unit", Some("v-other"))
+            &OpMetrics::for_view("unit", Some("v-other"), NO_TRANSPORT)
         ));
-        assert!(!Arc::ptr_eq(&a, &OpMetrics::for_view("unit", None)));
+        assert!(!Arc::ptr_eq(
+            &a,
+            &OpMetrics::for_view("unit", None, NO_TRANSPORT)
+        ));
         a.record(OpKind::LockAcquire, None, Duration::from_micros(20));
         b.record(OpKind::LockRelease, None, Duration::from_micros(20));
         let s = series_of("v-shared", "setlk").unwrap();
@@ -437,10 +477,30 @@ mod tests {
         assert!(gone, "the series outlived its last user");
     }
 
+    /// Plan 38 §5: one view served over two transports (a ring mount and
+    /// a `/dev/fuse` one of the same volume) is two series, told apart by
+    /// the `transport` label alone.
+    #[test]
+    fn each_transport_of_a_view_is_its_own_series() {
+        let ring = OpMetrics::for_view("unit", Some("v-transport"), "uring");
+        let dev = OpMetrics::for_view("unit", Some("v-transport"), "dev_fuse");
+        assert!(!Arc::ptr_eq(&ring, &dev));
+        assert_eq!(ring.transport(), "uring");
+        ring.record(OpKind::Read, None, Duration::from_micros(5));
+        dev.record(OpKind::Read, None, Duration::from_micros(5));
+        dev.record(OpKind::Read, None, Duration::from_micros(5));
+        let reads: Vec<(&str, u64)> = snapshot()
+            .into_iter()
+            .filter(|s| s.view.as_deref() == Some("v-transport") && s.op == "read")
+            .map(|s| (s.transport, s.count()))
+            .collect();
+        assert_eq!(reads, vec![("dev_fuse", 2), ("uring", 1)]);
+    }
+
     #[test]
     fn a_readdir_sink_wrapped_still_collects() {
         use crate::responder::CollectDir;
-        let m = OpMetrics::detached("unit", None);
+        let m = OpMetrics::detached("unit", None, NO_TRANSPORT);
         let (sink, wait) = CollectDir::pair(8);
         let mut sink = m.timed(OpKind::Readdir, Instant::now(), sink);
         assert!(!sink.add(2, 1, FileKind::File, b"f"));

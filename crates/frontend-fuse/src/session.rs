@@ -56,12 +56,13 @@
 
 use crate::adapter::{Deferred, FuseFs, KernelTuning};
 use crate::notify::{FuseNotifySink, NotifyGate};
+use crate::stats::SessionStats;
 use constellation_types::Code;
-use constellation_vfs::{Blocking, Caller, FrontendCaps, OpCtx, OpKind, Vfs};
+use constellation_vfs::{Blocking, Caller, FrontendCaps, Observer, OpCtx, OpKind, Vfs};
 use fuser::{NegotiatedInit, Transport};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// Which transport a mount asks the kernel to serve it over (plan 38
@@ -234,6 +235,10 @@ pub struct MountOptions {
     /// Private, and `DevFuse` for a [`Self::handover_capable`] session
     /// whatever the knob said — see [`HandoverCapable`].
     transport: TransportPolicy,
+    /// What the transport knob asked for before any handover pin: a
+    /// pinned session that was asked for `Auto` took a fallback, and
+    /// `node.status` says so (plan 38 §2.4, [`crate::stats`]).
+    asked: TransportPolicy,
     /// `io_uring_queue_depth`, read only when `transport` resolves to a
     /// ring.
     uring_queue_depth: usize,
@@ -261,6 +266,7 @@ impl MountOptions {
             n_threads,
             tuning,
             transport: cfg.policy,
+            asked: cfg.policy,
             uring_queue_depth: cfg.uring_queue_depth,
             handover: false,
         }
@@ -313,6 +319,7 @@ impl MountOptions {
             return self;
         }
         self.transport = policy;
+        self.asked = policy;
         self
     }
 
@@ -500,6 +507,8 @@ struct Shared {
     /// connection. Only a `DevFuse` session can be handed over, so this is
     /// what [`SessionControl::detach`] refuses by (plan 38 §3(e)).
     transport: Transport,
+    /// What this session reports about its transport (plan 38 §5).
+    stats: Arc<SessionStats>,
     /// `None` for a session that was never armed, which is every session
     /// whose `transport` is not `DevFuse`.
     detacher: Mutex<Option<fuser::SessionDetacher>>,
@@ -558,6 +567,7 @@ pub fn mount_source<V: Vfs>(
     let config = opts.config();
     let fs = FuseFs::new(view.clone(), caps, opts.tuning);
     let deferred = fs.deferred().clone();
+    let observer = fs.observer_slot();
     match source {
         MountSource::PreopenedFd(fd) => {
             // Somebody else holds this connection and may want it handed
@@ -571,7 +581,7 @@ pub fn mount_source<V: Vfs>(
             let mut config = config;
             config.io_uring = false;
             let session = fuser::Session::from_fd(fs, fd, config.acl, config.clone())?;
-            FuseSession::new(session, deferred, view, config, None, None)
+            FuseSession::new(session, deferred, observer, opts, view, config, None, None)
         }
         MountSource::Path(mountpoint, kernel) if privileged() => {
             let fd = mount_fd(&mountpoint, &kernel)?;
@@ -583,7 +593,16 @@ pub fn mount_source<V: Vfs>(
                     return Err(error);
                 }
             };
-            FuseSession::new(session, deferred, view, config, Some(mountpoint), None)
+            FuseSession::new(
+                session,
+                deferred,
+                observer,
+                opts,
+                view,
+                config,
+                Some(mountpoint),
+                None,
+            )
         }
         MountSource::Path(mountpoint, kernel) => {
             let mut options = vec![fuser::MountOption::FSName(kernel.fsname.clone())];
@@ -603,6 +622,8 @@ pub fn mount_source<V: Vfs>(
             FuseSession::new(
                 session,
                 deferred,
+                observer,
+                opts,
                 view,
                 config,
                 Some(mountpoint),
@@ -641,9 +662,15 @@ fn unmount_path(path: &Path, lazy: bool) -> std::io::Result<()> {
 }
 
 impl<V: Vfs> FuseSession<V> {
+    /// `observer`: the filesystem's [`FuseFs::observer_slot`], filled here
+    /// now that the handshake has settled the transport its ops and spans
+    /// are labelled with — before [`Self::run`] serves any request.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         mut session: fuser::Session<FuseFs<V>>,
         deferred: Arc<Deferred>,
+        observer: Arc<OnceLock<Observer>>,
+        opts: &MountOptions,
         vfs: Arc<V>,
         config: fuser::Config,
         mountpoint: Option<PathBuf>,
@@ -654,6 +681,18 @@ impl<V: Vfs> FuseSession<V> {
         // `/dev/fuse` (plan 38 §3(e), Z0a). fuser refuses to arm one, so
         // ask it only for the transport that can be.
         let transport = session.transport();
+        let stats = Arc::new(SessionStats::at_handshake(
+            opts.asked,
+            opts.handover,
+            session.negotiated_init().as_ref(),
+            transport,
+            opts.uring_queue_depth,
+        ));
+        let _ = observer.set(Observer::new(
+            crate::adapter::FRONTEND,
+            &vfs.identity(),
+            transport.name(),
+        ));
         let detacher = if transport.is_dev_fuse() {
             Some(session.detacher()?)
         } else {
@@ -670,6 +709,7 @@ impl<V: Vfs> FuseSession<V> {
             config,
             shared: Arc::new(Shared {
                 transport,
+                stats,
                 detacher: Mutex::new(detacher),
                 fuser_unmounter: Mutex::new(fuser_unmounter),
                 mountpoint: Mutex::new(mountpoint),
@@ -711,6 +751,7 @@ impl<V: Vfs> FuseSession<V> {
         config.io_uring = false;
         let fs = FuseFs::new(view.clone(), caps, opts.tuning);
         let deferred = fs.deferred().clone();
+        let observer = fs.observer_slot();
         let session = fuser::Session::from_fd_resumed(
             fs,
             handoff.fuse_fd,
@@ -718,8 +759,16 @@ impl<V: Vfs> FuseSession<V> {
             config.clone(),
             handoff.init,
         )?;
-        let mut resumed =
-            FuseSession::new(session, deferred, view, config, handoff.mountpoint, None)?;
+        let mut resumed = FuseSession::new(
+            session,
+            deferred,
+            observer,
+            opts,
+            view,
+            config,
+            handoff.mountpoint,
+            None,
+        )?;
         if let Some(sink) = sink {
             sink.gate().reopen(Some(resumed.session.notifier()));
             Arc::get_mut(&mut resumed.shared)
@@ -741,6 +790,13 @@ impl<V: Vfs> FuseSession<V> {
     /// fuser, during the handshake). Fixed for the life of the connection.
     pub fn transport(&self) -> Transport {
         self.shared.transport
+    }
+
+    /// What this session reports about its transport (plan 38 §5): the
+    /// negotiated transport, ring queue depth, the fallback its handshake
+    /// took and its zero-copy read count.
+    pub fn stats(&self) -> Arc<SessionStats> {
+        self.shared.stats.clone()
     }
 
     /// The handle that unmounts or detaches this session from any thread.
@@ -1502,6 +1558,24 @@ mod tests {
             session.negotiated_init().expect("negotiated").transport,
             expected,
             "the negotiated record and the session agree"
+        );
+        // Plan 38 §2.4/§5: the session's stats say what it got, and a
+        // fallback is recorded exactly where the host could not grant it.
+        let stats = session.stats();
+        assert_eq!(stats.transport(), expected);
+        match stats.last_fallback() {
+            None => assert!(!expected.is_dev_fuse(), "a fallback went unrecorded"),
+            Some(fallback) => {
+                assert!(expected.is_dev_fuse(), "{fallback:?} on a ring session");
+                assert_eq!((fallback.from, fallback.to), (Transport::Uring, expected));
+                assert_ne!(fallback.reason, crate::FallbackReason::HandoverCapable);
+                eprintln!("recorded fallback: {fallback:?}");
+            }
+        }
+        assert_eq!(
+            stats.uring_queue_depth() > 0,
+            !expected.is_dev_fuse(),
+            "a queue depth exactly when there are ring queues"
         );
         let handover_capable = session.transport().is_dev_fuse();
         let (control, thread) = serve(session);

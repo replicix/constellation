@@ -42,7 +42,7 @@
 
 use crate::authz::Principal;
 use crate::methods::{method_info, NodeStatus, StreamKind};
-use crate::proto::types::{FileStat, StatusReport, VfsOpSeries, VfsOpsStatus};
+use crate::proto::types::{FileStat, FuseStatus, StatusReport, VfsOpSeries, VfsOpsStatus};
 use crate::proto::{ControlError, ErrorKind};
 use crate::server::{
     dispatch_in_process, dispatch_stream_in_process, DispatchOptions, Router, StreamItem,
@@ -800,6 +800,7 @@ pub fn render_metrics(status: &StatusReport) -> String {
         status.prune.refused_lag
     );
     render_vfs_ops(&mut output, &status.vfs_ops);
+    render_fuse(&mut output, &status.fuse);
     output
 }
 
@@ -818,10 +819,11 @@ fn label_value(value: &str) -> String {
 }
 
 /// The unified op metrics (plan 31 §6.10) as a counter and a histogram:
-/// `constellation_vfs_ops_total{frontend,view,op,outcome}` and
-/// `constellation_vfs_op_seconds{frontend,view,op}`. `view` (the
+/// `constellation_vfs_ops_total{frontend,view,op,outcome,transport}` and
+/// `constellation_vfs_op_seconds{frontend,view,op,transport}`. `view` (the
 /// allowlisted metric label of a view, plan 31 §9.10) is left out for a
-/// view that has none.
+/// view that has none; `transport` (plan 38 §5) is always there —
+/// `dev_fuse`/`uring`/`uring_zc` on FUSE rows, `n/a` on any other.
 fn render_vfs_ops(output: &mut String, ops: &VfsOpsStatus) {
     use std::fmt::Write;
     output.push_str(
@@ -834,6 +836,7 @@ fn render_vfs_ops(output: &mut String, ops: &VfsOpsStatus) {
             let _ = write!(l, ",view=\"{}\"", label_value(view));
         }
         let _ = write!(l, ",op=\"{}\"", label_value(&s.op));
+        let _ = write!(l, ",transport=\"{}\"", label_value(&s.transport));
         l
     };
     for series in &ops.series {
@@ -878,6 +881,62 @@ fn render_vfs_ops(output: &mut String, ops: &VfsOpsStatus) {
         let _ = writeln!(
             output,
             "constellation_vfs_op_seconds_count{{{l}}} {cumulative}"
+        );
+    }
+}
+
+/// Plan 38 §5's FUSE transport metrics: the process-wide
+/// `constellation_fuse_transport_fallbacks_total{from,to,reason}` and
+/// `constellation_fuse_zero_copy_reads_total` counters, and per mount (by
+/// `mountpoint`, as many series as there are mounts) the
+/// `constellation_fuse_passthrough_opens` and
+/// `constellation_fuse_uring_queue_depth` gauges.
+fn render_fuse(output: &mut String, fuse: &FuseStatus) {
+    use std::fmt::Write;
+    output.push_str(
+        "# HELP constellation_fuse_transport_fallbacks_total FUSE sessions that asked for the io_uring transport and were served over another, by the rung that refused.\n\
+         # TYPE constellation_fuse_transport_fallbacks_total counter\n",
+    );
+    for f in &fuse.transport_fallbacks {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_transport_fallbacks_total{{from=\"{}\",to=\"{}\",reason=\"{}\"}} {}",
+            label_value(&f.from),
+            label_value(&f.to),
+            label_value(&f.reason),
+            f.count
+        );
+    }
+    let _ = write!(
+        output,
+        "# HELP constellation_fuse_zero_copy_reads_total FUSE reads served zero-copy from a registered buffer.\n\
+         # TYPE constellation_fuse_zero_copy_reads_total counter\n\
+         constellation_fuse_zero_copy_reads_total {}\n",
+        fuse.zero_copy_reads_total
+    );
+    output.push_str(
+        "# HELP constellation_fuse_passthrough_opens Open FUSE handles the kernel reads straight from a cached chunk file.\n\
+         # TYPE constellation_fuse_passthrough_opens gauge\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_passthrough_opens{{mountpoint=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            m.passthrough.opens
+        );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_uring_queue_depth Ring entries per kernel queue of a FUSE mount's io_uring transport (0: /dev/fuse).\n\
+         # TYPE constellation_fuse_uring_queue_depth gauge\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_uring_queue_depth{{mountpoint=\"{}\",transport=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            label_value(&m.transport),
+            m.uring_queue_depth
         );
     }
 }
@@ -1021,6 +1080,7 @@ mod tests {
                 VfsOpSeries {
                     frontend: "fuse".into(),
                     view: Some("pv-\"1\"".into()),
+                    transport: "dev_fuse".into(),
                     op: "getattr".into(),
                     outcomes: [("NotFound".to_string(), 1), ("ok".to_string(), 2)].into(),
                     buckets: vec![1, 1, 1],
@@ -1029,6 +1089,7 @@ mod tests {
                 VfsOpSeries {
                     frontend: "fuse".into(),
                     view: None,
+                    transport: "n/a".into(),
                     op: "read".into(),
                     outcomes: [("ok".to_string(), 1)].into(),
                     buckets: vec![1, 0, 0],
@@ -1040,15 +1101,65 @@ mod tests {
         render_vfs_ops(&mut out, &ops);
         for line in [
             "# TYPE constellation_vfs_ops_total counter",
-            "constellation_vfs_ops_total{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",outcome=\"ok\"} 2",
-            "constellation_vfs_ops_total{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",outcome=\"NotFound\"} 1",
-            "constellation_vfs_ops_total{frontend=\"fuse\",op=\"read\",outcome=\"ok\"} 1",
+            "constellation_vfs_ops_total{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",transport=\"dev_fuse\",outcome=\"ok\"} 2",
+            "constellation_vfs_ops_total{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",transport=\"dev_fuse\",outcome=\"NotFound\"} 1",
+            "constellation_vfs_ops_total{frontend=\"fuse\",op=\"read\",transport=\"n/a\",outcome=\"ok\"} 1",
             "# TYPE constellation_vfs_op_seconds histogram",
-            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",op=\"read\",le=\"0.00001\"} 1",
-            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",le=\"0.5\"} 2",
-            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",le=\"+Inf\"} 3",
-            "constellation_vfs_op_seconds_sum{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\"} 1.5",
-            "constellation_vfs_op_seconds_count{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\"} 3",
+            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",op=\"read\",transport=\"n/a\",le=\"0.00001\"} 1",
+            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",transport=\"dev_fuse\",le=\"0.5\"} 2",
+            "constellation_vfs_op_seconds_bucket{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",transport=\"dev_fuse\",le=\"+Inf\"} 3",
+            "constellation_vfs_op_seconds_sum{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",transport=\"dev_fuse\"} 1.5",
+            "constellation_vfs_op_seconds_count{frontend=\"fuse\",view=\"pv-\\\"1\\\"\",op=\"getattr\",transport=\"dev_fuse\"} 3",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+        }
+    }
+
+    #[test]
+    fn fuse_transport_metrics_render_per_mount_and_process_wide() {
+        use crate::proto::types::{FuseFallbackCount, FuseMountStatus, FusePassthroughStatus};
+        let fuse = FuseStatus {
+            mounts: vec![
+                FuseMountStatus {
+                    id: 1,
+                    mountpoint: "/mnt/a".into(),
+                    transport: "uring".into(),
+                    uring_queue_depth: 8,
+                    passthrough: FusePassthroughStatus {
+                        enabled: true,
+                        opens: 3,
+                        unavailable_reason: None,
+                    },
+                    ..Default::default()
+                },
+                FuseMountStatus {
+                    id: 2,
+                    mountpoint: "/mnt/\"b\"".into(),
+                    transport: "dev_fuse".into(),
+                    ..Default::default()
+                },
+            ],
+            transport_fallbacks: vec![FuseFallbackCount {
+                from: "uring".into(),
+                to: "dev_fuse".into(),
+                reason: "kernel_not_offered".into(),
+                count: 2,
+            }],
+            zero_copy_reads_total: 0,
+        };
+        let mut out = String::new();
+        render_fuse(&mut out, &fuse);
+        for line in [
+            "# TYPE constellation_fuse_transport_fallbacks_total counter",
+            "constellation_fuse_transport_fallbacks_total{from=\"uring\",to=\"dev_fuse\",reason=\"kernel_not_offered\"} 2",
+            "# TYPE constellation_fuse_zero_copy_reads_total counter",
+            "constellation_fuse_zero_copy_reads_total 0",
+            "# TYPE constellation_fuse_passthrough_opens gauge",
+            "constellation_fuse_passthrough_opens{mountpoint=\"/mnt/a\"} 3",
+            "constellation_fuse_passthrough_opens{mountpoint=\"/mnt/\\\"b\\\"\"} 0",
+            "# TYPE constellation_fuse_uring_queue_depth gauge",
+            "constellation_fuse_uring_queue_depth{mountpoint=\"/mnt/a\",transport=\"uring\"} 8",
+            "constellation_fuse_uring_queue_depth{mountpoint=\"/mnt/\\\"b\\\"\",transport=\"dev_fuse\"} 0",
         ] {
             assert!(out.lines().any(|l| l == line), "{line}\n{out}");
         }

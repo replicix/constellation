@@ -81,4 +81,4 @@ pub use node::{
 pub use profile::{
     BackgroundMode, EngineProfile, LeaseMode, P2pMode, UploadMode, CACHE_VERIFY_ENV,
 };
-pub use view::{HandleTableSnapshot, View, ViewHandoff, ViewQos, ViewSpec};
+pub use view::{HandleTableSnapshot, PassthroughStatus, View, ViewHandoff, ViewQos, ViewSpec};

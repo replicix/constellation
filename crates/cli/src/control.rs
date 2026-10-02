@@ -20,8 +20,8 @@ use anyhow::{bail, Result};
 use constellation_control::fd::OwnedFd;
 use constellation_control::methods::Method;
 use constellation_control::proto::types::{
-    HandedOffView, HandoffParams, HandoffReport, HandoffTarget, HandoverStatus, MountSource,
-    ViewInfo, ViewMountParams,
+    self as api, HandedOffView, HandoffParams, HandoffReport, HandoffTarget, HandoverStatus,
+    MountSource, ViewInfo, ViewMountParams,
 };
 use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_control::transport::locate_socket;
@@ -107,6 +107,24 @@ impl DaemonHost {
     }
 }
 
+/// A FUSE session's transport state in the protocol's shape (plan 38
+/// §5). The engine fills in the mount's id, mountpoint and passthrough.
+fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::FuseMountStatus {
+    api::FuseMountStatus {
+        transport: stats.transport().name().to_string(),
+        uring_queue_depth: stats.uring_queue_depth(),
+        zero_copy_reads: stats.zero_copy_reads(),
+        last_fallback: stats.last_fallback().map(|f| api::FuseFallback {
+            from: f.from.name().to_string(),
+            to: f.to.name().to_string(),
+            reason: f.reason.as_str().to_string(),
+            detail: f.detail.clone(),
+            at_unix_ms: f.at_unix_ms,
+        }),
+        ..Default::default()
+    }
+}
+
 fn failed(e: anyhow::Error) -> ControlError {
     ControlError::failed(format!("{e:#}"))
 }
@@ -129,10 +147,26 @@ impl ControlHost for DaemonHost {
                     max_staging_bytes: m.qos.max_staging_bytes,
                 },
                 confine_links: m.confine_links,
-                transport: Some(m.transport.name().to_string()),
+                fuse: Some(fuse_mount_status(&m.fuse)),
                 view: Some(m.view),
             })
             .collect()
+    }
+
+    fn fuse_counters(&self) -> api::FuseStatus {
+        api::FuseStatus {
+            mounts: Vec::new(),
+            transport_fallbacks: constellation_frontend_fuse::stats::fallback_counts()
+                .into_iter()
+                .map(|(from, to, reason, count)| api::FuseFallbackCount {
+                    from: from.into(),
+                    to: to.into(),
+                    reason: reason.into(),
+                    count,
+                })
+                .collect(),
+            zero_copy_reads_total: constellation_frontend_fuse::stats::zero_copy_reads_total(),
+        }
     }
 
     fn mount(&self, p: &ViewMountParams, fd: Option<OwnedFd>) -> Result<ViewInfo, ControlError> {

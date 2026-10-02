@@ -45,7 +45,7 @@ pub use caps::{Cap, CasePolicy, FrontendCaps, OpenUnlinked, PushInval, XattrSupp
 pub use ctx::{Caller, CancelToken, OpCtx, OpId, OpKind, OpKindSet, Principal};
 pub use error::{VfsError, VfsResult};
 pub use events::{FrontendEvents, Invalidation};
-pub use metrics::{OpMetrics, OpSeries, Timed};
+pub use metrics::{OpMetrics, OpSeries, Timed, NO_TRANSPORT};
 pub use name::{Name, NameBuf, XattrName, XattrNameBuf};
 pub use observe::{ObservedOp, Observer, ViewIdentity};
 pub use policy::{IdentityMap, NamePolicy, PolicyStack, XattrPolicy, NAME_MAX};

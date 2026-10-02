@@ -89,12 +89,15 @@ pub struct HostView {
     pub labels: BTreeMap<String, String>,
     pub qos: api::ViewQos,
     pub confine_links: bool,
-    /// Plan 38 §5: the FUSE transport this view's session negotiated
-    /// (`dev_fuse`/`uring`/`uring_zc`), as `node.status` reports it per
-    /// mount. A `String` rather than the frontend's `Transport`: this
-    /// crate names no frontend types, and a host with no FUSE session
-    /// behind the view (a control-only embedder) has `None`.
-    pub transport: Option<String>,
+    /// Plan 38 §5: what the view's FUSE session reports about its
+    /// transport — the negotiated `transport`, `uring_queue_depth`,
+    /// `zero_copy_reads` and `last_fallback`, in the protocol's shape
+    /// because this crate names no frontend types. `None` for a view with
+    /// no FUSE session behind it (a control-only embedder, the engine's
+    /// fixtures). The engine fills in what is its own — the mount's id and
+    /// mountpoint, and `passthrough`, which the view decides
+    /// ([`View::passthrough_status`]) — whatever the host put there.
+    pub fuse: Option<api::FuseMountStatus>,
     /// The engine view behind it (`view.stats` asks it).
     pub view: Option<Arc<View>>,
 }
@@ -122,6 +125,15 @@ pub trait ControlHost: Send + Sync + 'static {
 
     /// Where an in-place upgrade stands.
     fn handover_status(&self) -> HandoverStatus;
+
+    /// Plan 38 §5: the process-wide FUSE counters —
+    /// [`api::FuseStatus::transport_fallbacks`] and
+    /// [`api::FuseStatus::zero_copy_reads_total`]; `mounts` is ignored
+    /// (the engine builds it from [`Self::views`]). A host with no FUSE
+    /// frontend has nothing to count.
+    fn fuse_counters(&self) -> api::FuseStatus {
+        api::FuseStatus::default()
+    }
 
     /// `node.handoff`.
     fn handoff(
@@ -255,9 +267,38 @@ impl EngineControl {
                 subtree: v.subtree,
                 mountpoint: v.mountpoint.display().to_string(),
                 mounted_ms_ago: v.since.elapsed().as_millis() as u64,
-                transport: v.transport,
+                transport: v.fuse.map(|f| f.transport),
             })
             .collect()
+    }
+
+    /// `node.status.fuse` (plan 38 §5): the host's per-session transport
+    /// state with the view's own passthrough status, and the host's
+    /// process-wide counters.
+    pub(crate) fn fuse_status(&self) -> api::FuseStatus {
+        let mut views = self.host.views();
+        views.sort_by_key(|v| v.id);
+        let mounts = views
+            .into_iter()
+            .filter_map(|v| {
+                let mut fuse = v.fuse?;
+                fuse.id = v.id;
+                fuse.mountpoint = v.mountpoint.display().to_string();
+                if let Some(view) = &v.view {
+                    let p = view.passthrough_status();
+                    fuse.passthrough = api::FusePassthroughStatus {
+                        enabled: p.enabled,
+                        opens: p.opens,
+                        unavailable_reason: p.unavailable_reason.map(str::to_string),
+                    };
+                }
+                Some(fuse)
+            })
+            .collect();
+        api::FuseStatus {
+            mounts,
+            ..self.host.fuse_counters()
+        }
     }
 
     /// A `ControlVfs` over the service's own whole-filesystem view, as
