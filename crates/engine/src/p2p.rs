@@ -1029,7 +1029,7 @@ pub(crate) async fn start_p2p(
         }
     };
     let relay = p2p.relay_label().to_string();
-    let addr = p2p.addr();
+    let addr = p2p.advertised_addr().await;
     let pubkey = p2p.pubkey_hex();
     let peers = constellation_net::Peers::new(p2p, node_id);
     // Publish how peers reach us, then learn about them.
@@ -1057,6 +1057,53 @@ pub(crate) async fn start_p2p(
         "P2P fast path ready"
     );
     peers
+}
+
+/// Re-publish this node's P2P address when the registry's copy (in
+/// `scan`) is not what [`constellation_net::Peers::advertised_addr_now`]
+/// gives now: an admitted interface came, went or changed its address
+/// since the last publish (or the home relay changed). Peers dial what
+/// the registry says, so a stale record leaves them dialing addresses
+/// that are gone. The published address carries no observed (NAT)
+/// addresses ([`constellation_net::AddrPolicy::filter`]), so a relay
+/// reconnect that changes those re-publishes nothing.
+pub async fn republish_addr_if_changed(
+    peers: &constellation_net::Peers,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    node_id: u64,
+    version: &str,
+    scan: &constellation_store_s3::RegistryScan,
+) {
+    let (Some(addr), Some(pubkey)) = (peers.advertised_addr_now().await, peers.pubkey_hex()) else {
+        return;
+    };
+    // No direct address at all (the network is down, or not up yet): the
+    // record we have is the best guess at what comes back.
+    if constellation_net::addrs::direct_addrs(&addr).is_empty() {
+        return;
+    }
+    let Some(own) = scan.live().into_iter().find(|n| n.node_id == node_id) else {
+        return;
+    };
+    let published = own
+        .p2p_addr
+        .and_then(|v| serde_json::from_value::<constellation_net::EndpointAddr>(v).ok());
+    if published.as_ref() == Some(&addr) {
+        return;
+    }
+    let Ok(addr_json) = serde_json::to_value(&addr) else {
+        return;
+    };
+    tracing::info!(
+        before = ?published.map(|a| a.addrs),
+        now = ?addr.addrs,
+        "local P2P addresses changed; re-publishing the registry record"
+    );
+    if let Err(e) =
+        constellation_store_s3::publish_p2p(store, node_id, &pubkey, addr_json, version).await
+    {
+        tracing::warn!(error = %e, "could not re-publish our P2P address");
+    }
 }
 
 /// Re-read the registry into the peer directory and allowlist.

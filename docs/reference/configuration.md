@@ -528,6 +528,10 @@ unmount or lease handoff. A dropped bump only costs freshness.
 | `CONSTELLATION_P2P` | `on` | boolean | complete iroh fast path |
 | `CONSTELLATION_P2P_RELAY` | `off` | `off` (also `disabled`, `none`, `0`, `false`), `default`/`public`/`n0`, or comma-separated relay URLs | iroh relay policy |
 | `CONSTELLATION_P2P_RELAY_TOKEN` | unset | string | optional bearer token for custom relays |
+| `CONSTELLATION_P2P_INTERFACES` | unset (every interface) | comma-separated interface names, `*` and `?` wildcards; empty or `*` admits all | which local interfaces' addresses this node publishes in the registry as its P2P address, and whose loss resets its peer connections |
+| `CONSTELLATION_P2P_INTERFACES_DENY` | `docker*,br-*,veth*,virbr*,vnet*,cni*,flannel*,cali*,vxlan*,cilium*,weave*,podman*,lxcbr*,lxdbr*,kube-*` | comma-separated patterns as above; empty or `none` denies nothing | interfaces never published, even if `CONSTELLATION_P2P_INTERFACES` matches them. The default refuses container and VM plumbing, whose addresses come and go with other workloads. VPN and overlay tunnels (`tun*`, `wg*`, `tailscale*`) are admitted on purpose: they may be the only route between two hosts |
+| `CONSTELLATION_P2P_PATH_IDLE_MS` | `5000` | milliseconds, clamped to `300`..`15000` | how long a direct QUIC path may receive nothing before it is abandoned and its data moves to another path — only when the connection has another path open: a connection's last path is never abandoned on this timer. Each path is pinged every third of it. iroh's default is 15 s, and iroh caps it there (and ignores a keepalive above 5 s) |
+| `CONSTELLATION_P2P_DIAL_TIMEOUT_MS` | `5000` | milliseconds, minimum `500` | how long one dial to a peer may take. The request that started it fails (and falls back to S3) and the next request dials afresh. Raise it if first dials over a relay (relay handshake plus holepunching) take longer than this |
 | `CONSTELLATION_COOP` | `on` | boolean | cooperative cache |
 | `CONSTELLATION_COOP_DIGEST` | `exact` | `exact` (alias `rbsr`) or `bloom`; an unknown value warns and uses `exact` | how peers learn each other's cached chunks: exact mirrors kept by reconciliation, or bloom digests |
 | `CONSTELLATION_DIGEST_INTERVAL_S` | `30` | seconds, minimum `1` | exact: summary heartbeat and liveness sweep; bloom: snapshot rotation |
@@ -536,6 +540,27 @@ unmount or lease handoff. A dropped bump only costs freshness.
 `CONSTELLATION_P2P=off` disables forwarding, placement messages, segment
 push, handoff acceleration, and cooperative peer transfer. Correctness and
 eventual convergence continue through S3.
+
+The published P2P address carries only addresses on admitted interfaces.
+If no admitted interface has an address, every address is published
+rather than none. iroh still exchanges all local addresses with a peer
+in-band, so paths to the others may open, but each node selects a path to
+an address its peer published whenever one is open. The rest serve only as
+backups. The published address leaves out addresses no local interface
+holds (NAT mappings a relay observed), which iroh re-learns in-band; it
+keeps the relay URL. A node re-publishes its address within about 5 s of an
+admitted address or its home relay changing, and peers re-check their
+connection to it only if the address that connection uses is no longer
+published. When an admitted local address disappears, the peer connections
+with a path over it are closed and re-dialed over the remaining addresses
+(typically well under a second); connections that never used it carry on.
+
+How fast a dead link is noticed depends on its paths. A connection with
+another path open moves to it after `CONSTELLATION_P2P_PATH_IDLE_MS`. A
+connection with a single path (the usual case between two hosts) is
+checked when a request over it goes unanswered: if nothing at all comes
+back within 3 s, it is replaced. Otherwise it closes after iroh's 30 s
+connection idle timeout.
 
 All nodes of a fleet should use the same `CONSTELLATION_COOP_DIGEST`: a
 mixed pair does not use each other as chunk sources. See

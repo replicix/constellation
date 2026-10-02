@@ -43,6 +43,11 @@ pub struct PathSummary {
     pub relay: u32,
     /// Every open path's kind and RTT estimate, the selected one first.
     pub rtts: Vec<(PathKind, Duration)>,
+    /// The selected path's remote socket address, when it is direct.
+    pub selected_addr: Option<std::net::SocketAddr>,
+    /// The selected path's local address, when it is direct and noq
+    /// knows it.
+    pub selected_local: Option<std::net::IpAddr>,
 }
 
 impl PathSummary {
@@ -68,6 +73,12 @@ impl PathSummary {
             };
             if path.is_selected() {
                 out.selected = Some(kind);
+                if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
+                    out.selected_addr = Some(*addr);
+                    if let iroh::endpoint::LocalTransportAddr::Ip(local) = path.local_addr() {
+                        out.selected_local = *local;
+                    }
+                }
             }
             rtts.push((path.is_selected(), kind, path.rtt()));
         }

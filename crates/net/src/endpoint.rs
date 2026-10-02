@@ -11,6 +11,7 @@
 //! never answers, and a gossip topic that never forms all degrade to the
 //! S3 polling path that phases 1–2 already rely on.
 
+use crate::addrs::{AddrPolicy, PreferredPaths};
 use crate::allowlist::{Allowlist, Decision};
 use crate::message::{ChunkDecline, ChunkStatus, Payload, Signed, ALPN};
 use crate::relay::RelayPolicy;
@@ -42,6 +43,69 @@ pub(crate) const PROBE_WINDOW: Duration = Duration::from_secs(3);
 const RESTART_PROBE_WINDOW: Duration = Duration::from_secs(2);
 /// Poll interval for a probe's receive counter.
 const PROBE_TICK: Duration = Duration::from_millis(25);
+
+/// Default for `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`: how long one dial
+/// may take before the request that started it fails (its caller falls
+/// back) and the next request dials afresh. A dial sends its Initials
+/// to every known address of the peer at once, so on a direct link the
+/// handshake takes one or two round trips; 5 s leaves room for a lossy
+/// first flight (QUIC's first Initial retransmit is after about 1 s) and
+/// for a relay handshake, but not for the 30 s idle timeout a dial to
+/// vanished addresses would otherwise run into.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long [`P2p::advertised_addr`] waits for iroh's interface scan.
+const ADDR_SCAN_WAIT: Duration = Duration::from_secs(2);
+/// Default for `CONSTELLATION_P2P_PATH_IDLE_MS`: how long a network path
+/// may go without receiving anything before noq abandons it, if the
+/// connection has another path open. iroh's own default is 15 s, and
+/// until then a path whose address vanished keeps carrying (and losing)
+/// application data (see [`crate::addrs`]).
+pub const PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// iroh's ceiling for a path idle timeout (`PATH_MAX_IDLE_TIMEOUT`; it
+/// clamps larger values with a warning). Its keepalive ceiling is a
+/// third of it (5 s), so `path_idle / 3` is always accepted.
+const PATH_IDLE_MAX: Duration = Duration::from_secs(15);
+
+/// `CONSTELLATION_P2P_PATH_IDLE_MS`, else [`PATH_IDLE_TIMEOUT`]; clamped
+/// to 300 ms ..= 15 s.
+fn path_idle_timeout() -> Duration {
+    ms_knob("CONSTELLATION_P2P_PATH_IDLE_MS", PATH_IDLE_TIMEOUT)
+        .clamp(Duration::from_millis(300), PATH_IDLE_MAX)
+}
+
+/// `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`, else [`DIAL_TIMEOUT`]; at least
+/// 500 ms.
+fn dial_timeout() -> Duration {
+    ms_knob("CONSTELLATION_P2P_DIAL_TIMEOUT_MS", DIAL_TIMEOUT).max(Duration::from_millis(500))
+}
+
+fn ms_knob(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
+/// iroh's transport settings with dead-path detection bounded by
+/// `path_idle`: every path is pinged three times per idle period, so a
+/// live one never idles out on a single lost keepalive. A path that
+/// receives nothing for `path_idle` is abandoned (its in-flight data
+/// moved to the other paths) — but only when another path is open: noq
+/// refuses to abandon a connection's last path on a local timer
+/// (`ClosePathError::LastOpenPath`; only the peer may). So this speeds
+/// up the multipath case (two nodes on one host, a peer with several
+/// addresses, a direct path next to a relay one); a connection down to
+/// one path, the usual one between hosts, is still found dead only by
+/// [`Pool::probe`] (3 s after a request goes unanswered) or by iroh's
+/// 30 s connection idle timeout. Relay paths keep iroh's own longer
+/// timeout (it sets one per relay path).
+fn transport_config(path_idle: Duration) -> iroh::endpoint::QuicTransportConfig {
+    iroh::endpoint::QuicTransportConfig::builder()
+        .default_path_keep_alive_interval(path_idle / 3)
+        .default_path_max_idle_timeout(path_idle)
+        .build()
+}
 
 /// Why a pooled connection is being probed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +166,8 @@ struct Pool {
     /// datagram, so a slow peer costs at most one extra ping per
     /// unanswered request, never a pile of them).
     probing: Mutex<HashSet<iroh::EndpointId>>,
+    /// Probes started, for tests.
+    probes: std::sync::atomic::AtomicUsize,
     key: SecretKey,
     on_evict: Mutex<Option<EvictHook>>,
 }
@@ -118,6 +184,7 @@ impl Pool {
             connections: Mutex::new(HashMap::new()),
             tracked: Mutex::new(HashMap::new()),
             probing: Mutex::new(HashSet::new()),
+            probes: std::sync::atomic::AtomicUsize::new(0),
             key,
             on_evict: Mutex::new(None),
         }
@@ -139,6 +206,8 @@ impl Pool {
         if !self.probing.lock().unwrap().insert(id) {
             return;
         }
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pool = self.clone();
         rt.spawn(async move {
             pool.probe(id, why).await;
@@ -345,6 +414,103 @@ impl Pool {
         closed
     }
 
+    /// Close every open connection, pooled or tracked, that has a direct
+    /// path over one of the `lost` local addresses
+    /// ([`crate::addrs::path_uses_lost`]), and every one for which that
+    /// cannot be told (no path at all, or a direct one whose local
+    /// address noq does not know); then run the evict hook for each peer
+    /// that lost one, so it is re-dialed and its gossip link re-formed at
+    /// once. A connection whose paths all run between addresses that are
+    /// still there is left alone.
+    ///
+    /// Any open path counts, not only the selected one: each end selects
+    /// its own path, and a connection that one end resets while the other
+    /// keeps it is worse than either — the close frame may go out over the
+    /// dead path, and the keeping end then waits on a connection the other
+    /// end forgot (seen in `tests/addr_churn.rs`: a 23 s gap). Both ends
+    /// see the same set of paths, so on a peer on this host — the case a
+    /// lost address breaks — both reset the same connections. Returns
+    /// `(closed, kept)`. See [`watch_local_addrs`].
+    async fn reset_using(
+        &self,
+        lost: &HashSet<std::net::IpAddr>,
+        why: &'static str,
+    ) -> (usize, usize) {
+        let affected = |conn: &iroh::endpoint::Connection| {
+            let paths = conn.paths();
+            let mut verdict = Some(false);
+            for path in paths.iter() {
+                // A relay path does not use a local interface address the
+                // way a direct one does: the relay connection is TCP, and
+                // its own reconnect handles a lost source address.
+                let iroh::TransportAddr::Ip(remote) = path.remote_addr() else {
+                    continue;
+                };
+                let local = match path.local_addr() {
+                    iroh::endpoint::LocalTransportAddr::Ip(ip) => *ip,
+                    _ => None,
+                };
+                match crate::addrs::path_uses_lost(Some(remote.ip()), local, lost) {
+                    Some(true) => return true,
+                    Some(false) => {}
+                    None => verdict = None,
+                }
+            }
+            // No path left at all, or one whose local end is unknown.
+            paths.iter().next().is_none() || verdict.is_none()
+        };
+        let mut peers: HashSet<iroh::EndpointId> = HashSet::new();
+        let (mut closed, mut kept) = (0usize, 0usize);
+        let slots: Vec<(iroh::EndpointId, ConnectionSlot)> = self
+            .connections
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, slot)| (*id, slot.clone()))
+            .collect();
+        for (id, slot) in slots {
+            let mut slot = slot.lock().await;
+            match slot.as_ref() {
+                Some(conn) if conn.close_reason().is_none() && affected(conn) => {
+                    if let Some(conn) = slot.take() {
+                        conn.close(iroh::endpoint::VarInt::from_u32(0), why.as_bytes());
+                    }
+                    closed += 1;
+                    peers.insert(id);
+                }
+                Some(conn) if conn.close_reason().is_none() => kept += 1,
+                _ => {}
+            }
+        }
+        let tracked: Vec<iroh::endpoint::Connection> = self
+            .tracked
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .filter_map(|weak| weak.upgrade())
+            .collect();
+        for conn in tracked {
+            if conn.close_reason().is_some() {
+                continue;
+            }
+            if affected(&conn) {
+                conn.close(iroh::endpoint::VarInt::from_u32(0), why.as_bytes());
+                closed += 1;
+                peers.insert(conn.remote_id());
+            } else {
+                kept += 1;
+            }
+        }
+        let hook = self.on_evict.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            for id in peers {
+                hook(id);
+            }
+        }
+        (closed, kept)
+    }
+
     /// Drop `stable`'s connection from the pool (if it is still the one
     /// pooled for `id`) and close it, so requests still waiting on it
     /// fail now instead of at their own timeouts; then close every other
@@ -376,6 +542,73 @@ impl Pool {
     }
 }
 
+/// Resets the connections that used a local address on an admitted
+/// interface ([`AddrPolicy`]) when it disappears — an interface went down
+/// or away, or lost its address.
+///
+/// noq does migrate a path whose local address vanished, but when the
+/// vanished address is also the *remote* one — a peer on this same host,
+/// reached over a local address — it re-opens the path to that same dead
+/// address, still marked validated and available, and keeps scheduling
+/// stream data onto it until the path idles out; a stream that had data in
+/// flight there (gossip's long-lived ones) could stay stuck for minutes. A
+/// fresh connection lands on an address that exists within a round trip,
+/// so on such a loss every connection whose selected path had the lost
+/// address at either end — or whose path cannot be told — is closed
+/// (peers get the close frame and drop theirs at once), and the evict
+/// hook re-dials each such peer and re-forms gossip ([`Pool::reset_using`]).
+/// Connections to other peers, over other addresses, carry on. Addresses
+/// on refused interfaces (container bridges, which come and go all the
+/// time) never trigger this: the link does not use them (see
+/// [`crate::addrs`]).
+///
+/// `CONSTELLATION_P2P_TEST_NO_ADDR_WATCH=1` turns the watch off. It is a
+/// test switch, not a knob: with it (and the old address and path idle
+/// settings) `tests/addr_churn.rs` measures the behaviour before this
+/// fix.
+async fn watch_local_addrs(pool: Weak<Pool>, policy: AddrPolicy) {
+    use iroh::Watcher;
+    if std::env::var("CONSTELLATION_P2P_TEST_NO_ADDR_WATCH").is_ok_and(|v| v == "1") {
+        tracing::warn!("CONSTELLATION_P2P_TEST_NO_ADDR_WATCH: local address losses are ignored");
+        return;
+    }
+    // Our own monitor, not iroh's address watch: without relays iroh
+    // refreshes its direct addresses only on its 20–25 s periodic run
+    // after the first link change, not on each one.
+    let monitor = match netwatch::netmon::Monitor::new().await {
+        Ok(monitor) => monitor,
+        Err(error) => {
+            // Expected in a container without netlink access; the paths
+            // still idle out, only slower.
+            tracing::info!(%error, "no network monitor; a lost local address is noticed only \
+                 when the paths using it idle out");
+            return;
+        }
+    };
+    let mut state = monitor.interface_state();
+    let mut known = policy.admitted_local_ips(&crate::addrs::interfaces_of(&state.get()));
+    while let Ok(now) = state.updated().await {
+        let now = policy.admitted_local_ips(&crate::addrs::interfaces_of(&now));
+        let lost: Vec<std::net::IpAddr> = known.difference(&now).copied().collect();
+        known = now;
+        if lost.is_empty() {
+            continue;
+        }
+        let Some(pool) = pool.upgrade() else {
+            return;
+        };
+        let lost: HashSet<std::net::IpAddr> = lost.into_iter().collect();
+        let (closed, kept) = pool.reset_using(&lost, "local address gone").await;
+        tracing::info!(
+            ?lost,
+            closed,
+            kept,
+            "a local P2P address disappeared; reset the peer connections that used it, to \
+             re-dial over the remaining ones"
+        );
+    }
+}
+
 /// Watches every completed handshake: tracks the connection (for
 /// [`Pool::evict`]), and on an inbound one — a peer dialing us afresh
 /// may be a new incarnation behind a connection we still pool — has the
@@ -391,7 +624,8 @@ impl Pool {
 /// tracked and probed only when its key is already on the allowlist;
 /// a peer that enrolled since the last registry read is admitted by the
 /// handler's refresh as before, and its restart, if any, is caught by
-/// the registry path (`Peers::refresh_registry` → `suspect_restart`).
+/// the registry path (`Peers::refresh_registry` → `suspect_moved`: the
+/// restart publishes a new port).
 ///
 /// Plan 31 C8: it is also where [`Admission`] is enforced — an inbound
 /// connection is refused right after its handshake while this endpoint is
@@ -1021,6 +1255,13 @@ pub struct P2p {
     relay: String,
     /// Plan 31 C8: dial-only and quiesced ([`InboundWatch`]).
     admission: Arc<Admission>,
+    /// The path selector, fed each peer's published addresses
+    /// ([`crate::addrs`]).
+    preferred: Arc<PreferredPaths>,
+    /// Which local interfaces' addresses [`Self::advertised_addr`] keeps.
+    policy: AddrPolicy,
+    /// `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`, read at spawn.
+    dial_timeout: Duration,
 }
 
 /// Derive the gossip topic. Prefers the `gossip_secret` from
@@ -1053,6 +1294,7 @@ impl P2p {
         let relay_mode = relay.to_iroh()?;
         let relay_label = relay.label();
         let admission = Arc::new(Admission::default());
+        let preferred = Arc::new(PreferredPaths::default());
         let endpoint = Endpoint::builder(presets::Minimal)
             // Registry remains the peer directory (DESIGN.md §8). Relays
             // are optional connectivity help when direct addrs cannot
@@ -1061,6 +1303,8 @@ impl P2p {
             .secret_key(key.clone())
             .address_lookup(lookup.clone())
             .alpns(vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()])
+            .transport_config(transport_config(path_idle_timeout()))
+            .path_selector(preferred.clone())
             .hooks(InboundWatch {
                 pool: Arc::downgrade(&pool),
                 allow: Arc::downgrade(&allow),
@@ -1069,6 +1313,8 @@ impl P2p {
             .bind()
             .await
             .context("binding the iroh endpoint")?;
+        let policy = AddrPolicy::from_env();
+        tokio::spawn(watch_local_addrs(Arc::downgrade(&pool), policy.clone()));
         let gossip = Gossip::builder()
             .max_message_size(crate::message::GOSSIP_MAX_MESSAGE_SIZE)
             .spawn(endpoint.clone());
@@ -1083,6 +1329,9 @@ impl P2p {
             pool,
             relay: relay_label,
             admission,
+            preferred,
+            policy,
+            dial_timeout: dial_timeout(),
         })
     }
 
@@ -1137,13 +1386,35 @@ impl P2p {
         self.endpoint.network_change().await;
     }
 
-    /// Teach iroh how to reach a peer learned from the registry.
+    /// Teach iroh how to reach a peer learned from the registry, and
+    /// prefer paths to those addresses ([`crate::addrs`]).
     pub fn learn_addr(&self, addr: EndpointAddr) {
+        self.preferred.learn(&addr);
         self.lookup.add_endpoint_info(addr);
     }
 
+    /// Every address iroh knows for this endpoint, container bridges
+    /// included. What peers should dial is [`Self::advertised_addr`].
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    /// The address to publish in the registry: [`Self::addr`] without the
+    /// addresses of interfaces the [`AddrPolicy`] refuses. Waits up to
+    /// [`ADDR_SCAN_WAIT`] for iroh's first interface scan, so a node that
+    /// mounts right after binding does not publish an empty address.
+    pub async fn advertised_addr(&self) -> EndpointAddr {
+        let deadline = tokio::time::Instant::now() + ADDR_SCAN_WAIT;
+        while self.endpoint.addr().addrs.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.advertised_addr_now().await
+    }
+
+    /// [`Self::advertised_addr`] without the wait: for a periodic check
+    /// that must not stall while the node has no address at all.
+    pub async fn advertised_addr_now(&self) -> EndpointAddr {
+        self.policy.filter_now(&self.endpoint.addr()).await
     }
 
     /// Relay policy label active on this endpoint.
@@ -1288,6 +1559,25 @@ impl P2p {
     /// The peer `id` may have restarted (its registry record changed):
     /// probe the connection pooled for it and evict it if it is dead.
     pub fn suspect_restart(&self, id: iroh::EndpointId) {
+        self.pool.suspect(id, Suspicion::Restarted);
+    }
+
+    /// The peer `id` re-published a record whose direct addresses are
+    /// not the ones it published before (`published` are the new ones,
+    /// [`crate::addrs::direct_addrs`]): probe the pooled connection as
+    /// [`Self::suspect_restart`] does, unless its selected path goes to
+    /// one of `published` — that address is still the peer's, so the
+    /// connection is fine whatever else moved. A restart publishes a new
+    /// port (iroh binds port 0), so it is never mistaken for that.
+    pub fn suspect_moved(
+        &self,
+        id: iroh::EndpointId,
+        published: &std::collections::BTreeSet<std::net::SocketAddr>,
+    ) {
+        let selected = self.path_summary_now(id).and_then(|s| s.selected_addr);
+        if selected.is_some_and(|a| published.contains(&crate::addrs::canonical(a))) {
+            return;
+        }
         self.pool.suspect(id, Suspicion::Restarted);
     }
 
@@ -1494,10 +1784,13 @@ impl P2p {
             }
             *slot = None;
         }
-        let conn = self
-            .endpoint
-            .connect(peer.clone(), ALPN)
+        // Bounded: the gate is held across the dial, and a dial whose
+        // every address is gone would otherwise hold it — and every other
+        // request to this peer — for the whole QUIC handshake timeout.
+        let limit = self.dial_timeout;
+        let conn = tokio::time::timeout(limit, self.endpoint.connect(peer.clone(), ALPN))
             .await
+            .map_err(|_| anyhow::anyhow!("dialing peer timed out after {limit:?}"))?
             .context("dialing peer")?;
         *slot = Some(conn.clone());
         Ok(conn)
@@ -1516,14 +1809,22 @@ impl P2p {
         }
     }
 
+    /// How many probes of a pooled connection were started.
+    #[cfg(test)]
+    pub(crate) fn probes_started(&self) -> usize {
+        self.pool.probes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many remote endpoint ids have a tracked connection.
     #[cfg(test)]
     pub(crate) fn tracked_peers(&self) -> usize {
         self.pool.tracked.lock().unwrap().len()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn pooled_connection_id(&self, peer: iroh::EndpointId) -> Option<usize> {
+    /// The pooled connection's id, to tell whether it was replaced. For
+    /// tests (`tests/addr_churn.rs` is an integration test, hence `pub`).
+    #[doc(hidden)]
+    pub async fn pooled_connection_id(&self, peer: iroh::EndpointId) -> Option<usize> {
         let gate = self.pool.gate(&peer)?;
         let id = gate.lock().await.as_ref().map(|conn| conn.stable_id());
         id

@@ -118,6 +118,10 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bun
 # topic for push invalidation and lease handoff.
 iroh = "1"
 iroh-gossip = "0.101"
+# The interface monitor iroh itself runs on; keep this pinned to the
+# version the resolved iroh depends on (one copy in the tree), and bump
+# it together with iroh.
+netwatch = "0.19.3"
 
 # Vendored fjall 3.1.10 with a one-function fix for a shutdown deadlock in
 # `DatabaseInner::drop`; see vendor/fjall/CONSTELLATION-PATCH.md for what

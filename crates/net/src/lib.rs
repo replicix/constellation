@@ -29,6 +29,7 @@
 //! other nodes unable to write there rather than degrading to some
 //! default — that IS the safety property, not a fallback from one.
 
+pub mod addrs;
 pub mod allowlist;
 pub mod bloom;
 pub mod endpoint;
@@ -41,6 +42,7 @@ pub mod peers;
 pub mod reconcile;
 pub mod relay;
 
+pub use addrs::AddrPolicy;
 pub use allowlist::{Allowlist, Decision};
 pub use bloom::Bloom;
 pub use endpoint::{

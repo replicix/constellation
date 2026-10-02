@@ -196,6 +196,18 @@ impl Peers {
         Some(self.inner.as_ref()?.p2p.addr())
     }
 
+    /// What this node publishes in the registry (see
+    /// [`crate::endpoint::P2p::advertised_addr`]).
+    pub async fn advertised_addr(&self) -> Option<EndpointAddr> {
+        Some(self.inner.as_ref()?.p2p.advertised_addr().await)
+    }
+
+    /// [`Self::advertised_addr`] without waiting for a first interface
+    /// scan, for the periodic re-publish check.
+    pub async fn advertised_addr_now(&self) -> Option<EndpointAddr> {
+        Some(self.inner.as_ref()?.p2p.advertised_addr_now().await)
+    }
+
     pub fn pubkey_hex(&self) -> Option<String> {
         Some(self.inner.as_ref()?.p2p.pubkey_hex())
     }
@@ -265,15 +277,25 @@ impl Peers {
                 // from bare endpoint ids, can dial this peer at all.
                 inner.p2p.learn_addr(addr.clone());
                 let prev = inner.peers.lock().unwrap().get(&rec.node_id).cloned();
-                // The peer re-published its record: a new mount (a
-                // restart, possibly under the same key after a crash).
-                // Any connection we pool to it may lead to the dead
-                // previous incarnation; have it probed now.
+                // The peer re-published its record with other direct
+                // addresses: a new mount (a restart, possibly under the
+                // same key after a crash, always on a new port), or its
+                // interfaces changed. A connection we pool to it may lead
+                // to the dead previous incarnation, or to an address that
+                // is gone; have it probed now unless its selected path
+                // goes to an address the peer still publishes. A record
+                // re-published with the same direct addresses (only its
+                // relay URL or timestamp changed) moves nothing: probing
+                // then would only risk evicting a live connection of a
+                // busy peer. A same-key restart that kept the port is
+                // still caught when the new incarnation dials us
+                // (`InboundWatch`) or a request goes unanswered.
                 if let Some(prev) = prev.as_ref() {
+                    let published = crate::addrs::direct_addrs(&addr);
                     if prev.addr.id == addr.id
-                        && (prev.addr != addr || prev.p2p_updated_unix != rec.p2p_updated_unix)
+                        && crate::addrs::direct_addrs(&prev.addr) != published
                     {
-                        inner.p2p.suspect_restart(addr.id);
+                        inner.p2p.suspect_moved(addr.id, &published);
                     }
                 }
                 peers.insert(
@@ -316,6 +338,15 @@ impl Peers {
         let inner = self.inner.as_ref()?;
         let id = inner.peers.lock().unwrap().get(&node_id)?.addr.id;
         inner.p2p.path_summary_now(id)
+    }
+
+    /// The id of the connection pooled to `node_id`, to tell whether it
+    /// was replaced. For tests.
+    #[doc(hidden)]
+    pub async fn pooled_connection_id(&self, node_id: u64) -> Option<usize> {
+        let inner = self.inner.as_ref()?;
+        let id = inner.peers.lock().unwrap().get(&node_id)?.addr.id;
+        inner.p2p.pooled_connection_id(id).await
     }
 
     pub fn snapshot(&self) -> Vec<Peer> {
@@ -1894,6 +1925,94 @@ mod tests {
         let svc = service.clone();
         tokio::spawn(async move { serving.serve(svc).await });
         (holder, asker, service)
+    }
+
+    /// A peer's re-published record probes the connection pooled to it
+    /// only when its direct addresses moved away from the one that
+    /// connection uses. A new relay URL or timestamp (what a relay
+    /// reconnect, or any re-publish with the same addresses, changes)
+    /// probes nothing and evicts nothing; neither does a new address set
+    /// that still has the connection's address.
+    #[tokio::test]
+    async fn a_republished_record_probes_only_when_the_used_address_moved() {
+        let (holder, asker, _service) = pair(false).await;
+        assert!(asker.ping_node(1).await);
+        let p2p = &asker.inner.as_ref().unwrap().p2p;
+        let a_key = holder.pubkey_hex().unwrap();
+        let b_rec = |addr: &EndpointAddr| PeerEnrollment {
+            node_id: 2,
+            pubkey_hex: asker.pubkey_hex().unwrap(),
+            addr_json: serde_json::to_value(addr).unwrap(),
+            ..(0u64, String::new(), serde_json::Value::Null).into()
+        };
+        let b_addr = asker.node_addr().unwrap();
+        let publish = |addr: &EndpointAddr, at: i64| {
+            asker.refresh_registry(vec![
+                PeerEnrollment {
+                    node_id: 1,
+                    pubkey_hex: a_key.clone(),
+                    addr_json: serde_json::to_value(addr).unwrap(),
+                    p2p_updated_unix: Some(at),
+                    ..(0u64, String::new(), serde_json::Value::Null).into()
+                },
+                b_rec(&b_addr),
+            ])
+        };
+        let pooled = p2p
+            .pooled_connection_id(holder.node_addr().unwrap().id)
+            .await;
+        let selected = asker
+            .path_summary(1)
+            .and_then(|s| s.selected_addr)
+            .expect("a direct path is selected");
+        let mut addr = holder.node_addr().unwrap();
+        publish(&addr, 1);
+        let probes = p2p.probes_started();
+
+        // Only the relay URL and the timestamp change.
+        addr.addrs.insert(iroh::TransportAddr::Relay(
+            "https://relay.example.com".parse().unwrap(),
+        ));
+        publish(&addr, 2);
+        // The selected address stays, another one goes.
+        let mut fewer = addr.clone();
+        fewer.addrs.retain(|a| match a {
+            iroh::TransportAddr::Ip(sa) => {
+                let sa = *sa;
+                crate::addrs::canonical(sa) == crate::addrs::canonical(selected)
+            }
+            _ => true,
+        });
+        fewer
+            .addrs
+            .insert(iroh::TransportAddr::Ip("192.0.2.7:7".parse().unwrap()));
+        publish(&fewer, 3);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(p2p.probes_started(), probes, "nothing moved that we use");
+        assert_eq!(
+            p2p.pooled_connection_id(holder.node_addr().unwrap().id)
+                .await,
+            pooled
+        );
+
+        // The address the connection uses is gone from the record: probed,
+        // and kept, since it answers.
+        let mut moved = addr.clone();
+        moved
+            .addrs
+            .retain(|a| !matches!(a, iroh::TransportAddr::Ip(_)));
+        moved
+            .addrs
+            .insert(iroh::TransportAddr::Ip("192.0.2.7:7".parse().unwrap()));
+        publish(&moved, 4);
+        assert_eq!(p2p.probes_started(), probes + 1, "the used address moved");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            p2p.pooled_connection_id(holder.node_addr().unwrap().id)
+                .await,
+            pooled,
+            "a live connection survives its probe"
+        );
     }
 
     /// Plan 31 C8: a quiesced endpoint closes what it has and admits

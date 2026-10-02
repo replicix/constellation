@@ -1184,6 +1184,7 @@ impl Engine {
                     meta.clone(),
                     sync_tx.clone(),
                 );
+                let version = version.clone();
                 let background = background.clone();
                 rt.spawn(async move {
                     let mut tick: u64 = 0;
@@ -1198,6 +1199,16 @@ impl Engine {
                         tick += 1;
                         if tick.is_multiple_of(SLACK_REREAD_TICKS) {
                             reread_slack(&store_inner, &sync_tx).await;
+                        }
+                        if let Some(scan) = scan.as_ref() {
+                            crate::p2p::republish_addr_if_changed(
+                                &peers,
+                                store_inner.clone(),
+                                node_id,
+                                &version,
+                                scan,
+                            )
+                            .await;
                         }
                         // The scan just listed and (ETag-cached) read our
                         // record: live, so there is nothing to check. Only

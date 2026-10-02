@@ -32779,3 +32779,175 @@ round (not in the round's gate list).
 - `CREATED` in the policy's `tz` (the tables stay UTC).
 - An `--json` for the policy commands: not asked for; the methods'
   results are the machine interface.
+
+## Fix: P2P links stall for minutes when local interfaces come and go (`p2p-addr-churn`)
+
+On the EC2 build host, P2P links between two daemons stalled for 60-120 s,
+and once for about 7 minutes. Each stall began within about 10 ms of
+another job removing a docker bridge. Forwards to the lease holder went
+unanswered, lock recalls were outwaited, and a 4 s lock grant took 451 s.
+The cause is the P2P layer (iroh 1.1 over noq multipath QUIC, UDP), not the
+lease or lock layers.
+
+### Mechanism
+
+- **Advertised and dialled addresses.** `start_p2p` published
+  `endpoint.addr()` once at mount and never refreshed it. That is one
+  direct address per up, non-link-local interface: every docker bridge,
+  8 on this host. iroh also sends every local address to the peer in-band,
+  for holepunching.
+- **Path choice.** iroh's default selector takes the path with the lowest
+  RTT. Two nodes on one host therefore often talked over a bridge address.
+- **A vanished address.** If the selected path's address was also the
+  *remote* address (a peer on the same host), noq re-opened the path to
+  that same dead address. It kept the path validated and available and
+  went on scheduling stream data onto it. That lasted until the path
+  idle timeout, which is iroh's 15 s (5 s path heartbeat). Long-lived
+  gossip streams with data in flight there stayed stuck. Each new bridge
+  (about one every 5 s here) offered a new low-RTT path to select and then
+  lose, so the stalls added up to minutes.
+- **Liveness.** A path is abandoned on its idle timeout only while the
+  connection has another path open: noq refuses to abandon the last path on
+  a local timer (`ClosePathError::LastOpenPath`). A connection down to one
+  path is found dead only by `Pool::probe` (3 s after a request goes
+  unanswered) or by iroh's 30 s connection idle timeout. No interface event
+  reset anything.
+- **Dials.** `endpoint.connect` had no bound and ran under the per-peer
+  dial gate. A dial whose addresses were all gone blocked every other
+  request to that peer for the whole QUIC handshake timeout.
+- **Stale registry records.** A record kept its mount-time addresses until
+  the next remount.
+
+### Repro: `crates/net/tests/addr_churn.rs`
+
+The test re-runs itself under `sudo -n ip netns exec` in a private netns
+and skips on a host without passwordless sudo. The netns has a default
+route into a dummy device, two stable dummy interfaces, and six
+`br-*` bridges. Two in-process daemons ping each other every 100 ms and
+gossip every 200 ms in both directions. The test then:
+
+1. removes every bridge and churns others every 500 ms. Bound: no gap over
+   1 s.
+2. adds an admitted interface the link does not use, then deletes it.
+   Bound: neither pooled connection is replaced, and no gap over 1 s.
+3. deletes the interface that carries the selected path, twice, with the
+   other stable address still up. Bound: both directions recover within
+   2 s.
+
+The "before" row is reproducible from this tree. The test-only switch
+`CONSTELLATION_P2P_TEST_NO_ADDR_WATCH=1` turns the interface watch off.
+Together with `CONSTELLATION_P2P_INTERFACES_DENY=none` (every interface
+published, so the path selector ranks every direct path alike, which is
+iroh's own biased-RTT choice), `CONSTELLATION_P2P_PATH_IDLE_MS=15000`
+(iroh's default) and `CONSTELLATION_P2P_DIAL_TIMEOUT_MS=600000`, it runs
+the old behaviour:
+
+| Build | Bridge churn: longest gap | Unused address loss | Address loss: longest gap |
+|---|---|---|---|
+| before (the four settings above), 3 runs | 4.5 s, 3.7 s, 7.0 s: **fails 3 of 3** | at most 0.21 s | 3.6-5.7 s: **fails 3 of 3** |
+| after, 5 runs | at most 0.23 s (the ping and gossip cadence) | at most 0.21 s; 0 connections closed, 5 kept per side | 0.36-0.78 s |
+
+The first review-round "before" numbers (HEAD plus an `advertised_addr`
+shim, in a worktree that no longer exists: 15.8 s churn once, 17.3 s loss
+once) are not reproducible from this tree and are superseded by the row
+above.
+
+### Fix
+
+- **`crates/net/src/addrs.rs`**:
+  - `AddrPolicy`: the registry address carries the direct addresses that
+    admitted interfaces hold, and the relay URL. Container and VM plumbing
+    is denied by default. VPN and overlay tunnels (`tun*`, `wg*`,
+    `tailscale*`) are admitted on purpose. Addresses no local interface
+    holds (NAT mappings a relay observed) are left out: iroh re-learns
+    them, and they may change whenever the relay reconnects. Peers get
+    them in-band anyway. If no admitted interface has an address, every
+    locally held address is published rather than none.
+  - `PreferredPaths`: an iroh `PathSelector` that ranks paths to a peer's
+    published addresses above every other direct path, and those above
+    relay paths. Within a rank, iroh's biased-RTT rule applies. Paths to
+    bridge addresses stay open as idle backups: noq sends no data on them
+    while a preferred path exists.
+  - `path_uses_lost`, `direct_addrs`: the decisions below, unit-tested.
+- **`crates/net/src/endpoint.rs`**:
+  - Path keepalive is a third of `CONSTELLATION_P2P_PATH_IDLE_MS`, which
+    defaults to 5 s and is clamped to 300 ms..15 s (iroh's ceiling). This
+    shortens failover only where another path is open: two nodes on one
+    host, a peer with several addresses, a direct path next to a relay
+    one.
+  - `watch_local_addrs`: a netwatch monitor. When an admitted local
+    address disappears, `Pool::reset_using` closes the connections that
+    have a direct path over it (as local or remote address), plus the
+    connections where that cannot be told (no path, or a path whose local
+    address noq does not know). It then runs the evict hook for those
+    peers, which re-dials them and re-forms gossip. Connections whose
+    paths all avoid the lost address carry on. Any open path counts, not
+    only the selected one. Each end selects its own path, and when one end
+    reset a connection the other kept, the close frame went out over the
+    dead path and the keeping end waited 23 s (seen in this test). Both
+    ends see the same paths, so they now reset the same connections.
+  - A dial is bounded by `CONSTELLATION_P2P_DIAL_TIMEOUT_MS` (5 s).
+  - `advertised_addr` waits up to 2 s for iroh's first interface scan (at
+    mount). `advertised_addr_now`, used on the 5 s registry tick, does not
+    wait.
+  - `suspect_moved`: see the registry bullet below. The `paths.rs` summary
+    reports the selected path's remote and local addresses.
+- **`crates/engine`**: `start_p2p` publishes `advertised_addr()`. Every 5 s,
+  the registry tick re-publishes the record if the live address differs
+  from it (`republish_addr_if_changed`). It skips the check while the node
+  has no direct address at all.
+- **`Peers::refresh_registry`**: a re-published record probes the pooled
+  connection only when the peer's *direct* address set changed and the
+  connection's selected remote address is not in the new set. Before, any
+  change of `p2p_updated_unix` probed with the 2 s restart window. A new
+  relay URL or timestamp alone now probes nothing. A restart publishes a
+  new port (iroh binds port 0), so it still probes. A same-key restart
+  that kept its port is still caught by `InboundWatch` or by an unanswered
+  request.
+- Plan 31 C8 dial-only endpoints are unaffected. The reset only closes
+  connections; it changes nothing that is accepted.
+- `netwatch` is a workspace dependency pinned to the version iroh 1.1
+  resolves (0.19.3). iroh's `unstable-custom-transports` feature is on
+  only for the `PathSelector` API; a comment in `crates/net/Cargo.toml`
+  says so.
+
+### Knobs (see `docs/reference/configuration.md`)
+
+`CONSTELLATION_P2P_INTERFACES`, `CONSTELLATION_P2P_INTERFACES_DENY`,
+`CONSTELLATION_P2P_PATH_IDLE_MS`, `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`.
+`CONSTELLATION_P2P_TEST_NO_ADDR_WATCH` is a test switch, documented only
+where it is read.
+
+### Decisions
+
+- The dial timeout default stays at 5 s rather than being derived from the
+  path idle timeout. The two measure different things (a handshake versus
+  a silent path), and 5 s covers a lossy first flight and a relay
+  handshake. A cross-region relay deployment that needs longer can raise
+  it.
+- The connection idle timeout stays at iroh's 30 s. A dead *peer* is found
+  faster by `Pool::probe`.
+- `republish_addr_if_changed` uses the same overwrite PUT as `publish_p2p`.
+  An `ro` flag written in the same instant could be lost (single writer per
+  key; the flag is rewritten on the next toggle). This was accepted rather
+  than adding a CAS loop.
+
+### Review fix round
+
+Must fix 1 (the docs and comments overstated path idle): corrected in
+`endpoint.rs`, `addrs.rs`, the Mechanism and Fix sections above, and
+`configuration.md`. These now record the last-path rule, the 15 s clamp
+and the 5 s keepalive ceiling. Should fix 1-5 and the nits are done as
+described above.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p <crate>` for every package | all pass, 0 failed: net 113 + 2 (`addr_churn`) + 3, engine 467 (7 ignored) + 1, authority 266, store-s3 223, meta 281, control 135, mtree 71, fs-core 68, vfs 58, csi 57, harness 51, frontend-fuse 46, chaos 37, platform 35, constellation 34, types 26, upload-concurrency 11, uploadbench 4. model: lib and every test binary except `locks` (the model crate depends on no other workspace crate) |
+| `cargo test -p constellation-net --test addr_churn` | after: 5/5 pass. Before (the four settings above): 3/3 fail. See the table |
+| `cargo build --release --workspace --bins` | exit 0 |
+| `CONSTELLATION_BIN=target/release/constellation bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| harness, `CONSTELLATION_HARNESS_DOCKER_PREFIX=p2pchurnfx` | `forwarded-mutations`, `lease-handover`, `e2e-two-nodes`, `s3-cut-one-node` PASSED; `lock-grant-dead-generation` 3/3 and `git-under-flock-b2b` 3/3 PASSED; `p2p-invalidation`, `p2p-handover`, `p2p-partition-tolerance`, `p2p-same-identity-restart`, `epoch-peer-reaching-s3-declines`, `existence-peer-hint`, `p2p-partition-one-node`, `idle-cost-link-flap`, `no-peer-in-budget`, `p2p-off-no-delegation`, `inbox-create-storm-p2p-off`, `inbox-sporadic-write-p2p-off` all PASSED |

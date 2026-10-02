@@ -1375,6 +1375,7 @@ dependencies = [
  "futures-lite",
  "iroh",
  "iroh-gossip",
+ "netwatch",
  "postcard",
  "serde",
  "serde_json",
