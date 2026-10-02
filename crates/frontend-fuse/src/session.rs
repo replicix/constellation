@@ -64,6 +64,158 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+/// Which transport a mount asks the kernel to serve it over (plan 38
+/// §3(e)). A *policy*, not an outcome: what the connection ended up on is
+/// [`FuseSession::transport`], runtime-negotiated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransportPolicy {
+    /// Run plan 38 §2.4's ladder: FUSE-over-io_uring when this build
+    /// carries the `io-uring` feature and the kernel and the process both
+    /// grant it, `/dev/fuse` `writev` whenever anything in that chain
+    /// says no. Every refusal is a logged, observable downgrade, never a
+    /// mount failure.
+    Auto,
+    /// `/dev/fuse` `read`/`writev`, on every kernel and every platform.
+    /// The default for **every** mount at plan 38 Z1 (Z2c is what flips
+    /// plain mounts to [`Self::Auto`]), and permanently the only policy a
+    /// handover-capable session may have ([`MountOptions::handover_capable`]).
+    #[default]
+    DevFuse,
+}
+
+impl TransportPolicy {
+    /// `auto` / `dev-fuse`, as the knob and the CLI flag spell them.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "dev-fuse" | "dev_fuse" => Some(Self::DevFuse),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::DevFuse => "dev-fuse",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Env override of `--fuse-transport` ([`TransportConfig::resolve`]).
+pub const TRANSPORT_ENV: &str = "CONSTELLATION_FUSE_TRANSPORT";
+/// Env override of `--fuse-uring-queue-depth` ([`TransportConfig::resolve`]).
+pub const URING_QUEUE_DEPTH_ENV: &str = "CONSTELLATION_FUSE_URING_QUEUE_DEPTH";
+
+/// Ring entries per kernel queue, when the ring is what a mount gets.
+/// The Skory fork's default, and libfuse's; plan 38 §4 works the ring's
+/// memory budget out as `queues x depth x payload`, so this is one of the
+/// two numbers an operator who has measured their own trade-off turns.
+pub const DEFAULT_URING_QUEUE_DEPTH: usize = 8;
+
+/// The transport knob, resolved once (plan 38 §4): what a *plain* mount
+/// of this host asks for. A handover-capable session ignores it
+/// ([`MountOptions::handover_capable`]).
+///
+/// [`Default`] is the shipped default — `dev-fuse`, depth 8 — and reads
+/// no environment, so a test or a library embedder gets today's transport
+/// without a knob in sight. The daemon calls [`Self::resolve`] once,
+/// before it forks, and carries the answer to every mount it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportConfig {
+    pub policy: TransportPolicy,
+    /// `io_uring_queue_depth`: ignored unless `policy` resolves to a ring.
+    pub uring_queue_depth: usize,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            policy: TransportPolicy::default(),
+            uring_queue_depth: DEFAULT_URING_QUEUE_DEPTH,
+        }
+    }
+}
+
+impl TransportConfig {
+    /// [`CONSTELLATION_FUSE_TRANSPORT`](TRANSPORT_ENV) /
+    /// [`CONSTELLATION_FUSE_URING_QUEUE_DEPTH`](URING_QUEUE_DEPTH_ENV),
+    /// else the `--fuse-transport` / `--fuse-uring-queue-depth` flags,
+    /// else the default.
+    ///
+    /// The env wins over the flag, as `CONSTELLATION_PROFILE` wins over
+    /// the profile its caller passes and `CONSTELLATION_CACHE_VERIFY`
+    /// over `--cache-verify`: an operator must be able to put one host
+    /// on one transport without editing what starts the daemon.
+    ///
+    /// Unlike `--cache-verify`, an unparseable value is an **error**
+    /// rather than a warned-about fall-through, following
+    /// `CONSTELLATION_PROFILE` ("an unknown value is an error, not a
+    /// silent default"): a transport is not a safety setting whose
+    /// stricter reading must survive a typo, and `dev-fuse` is what an
+    /// ignored `auto` would silently give — the opposite of what the
+    /// operator asked for, with the kernel's whole fast path quietly off.
+    pub fn resolve(
+        policy: Option<TransportPolicy>,
+        uring_queue_depth: Option<usize>,
+    ) -> Result<Self, String> {
+        Self::resolve_from(|key| std::env::var(key).ok(), policy, uring_queue_depth)
+    }
+
+    /// [`Self::resolve`] over any variable source (tests).
+    pub fn resolve_from(
+        var: impl Fn(&str) -> Option<String>,
+        policy: Option<TransportPolicy>,
+        uring_queue_depth: Option<usize>,
+    ) -> Result<Self, String> {
+        let get = |key: &str| {
+            var(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let policy = match get(TRANSPORT_ENV) {
+            Some(raw) => TransportPolicy::parse(&raw)
+                .ok_or_else(|| format!("{TRANSPORT_ENV}={raw}: expected auto or dev-fuse"))?,
+            None => policy.unwrap_or_default(),
+        };
+        let depth = match get(URING_QUEUE_DEPTH_ENV) {
+            Some(raw) => raw
+                .parse::<usize>()
+                .ok()
+                .filter(|d| *d > 0)
+                .ok_or_else(|| {
+                    format!("{URING_QUEUE_DEPTH_ENV}={raw}: expected a positive integer")
+                })?,
+            None => uring_queue_depth.unwrap_or(DEFAULT_URING_QUEUE_DEPTH),
+        };
+        Ok(Self {
+            policy,
+            uring_queue_depth: depth,
+        })
+    }
+}
+
+/// The marker [`MountOptions::handover_capable`] takes: proof at the call
+/// site that this session is one `SessionControl::detach` may be asked to
+/// hand to another process image — `constellation daemon --upgrade`'s own
+/// target mounts, and plan 37's CSI engine-pod
+/// [`MountSource::PreopenedFd`] sessions.
+///
+/// It exists so that "a handover-capable session is `/dev/fuse`" (plan 38
+/// §3(e)) is a thing the type system asks about rather than a convention
+/// a future caller can forget: `MountOptions`'s transport fields are
+/// private, the only way to a `TransportPolicy::Auto` mount is
+/// [`MountOptions::new`], and the only way to a handover-capable one is
+/// this constructor, which pins [`TransportPolicy::DevFuse`] whatever the
+/// knob says.
+#[derive(Debug, Clone, Copy)]
+pub struct HandoverCapable;
+
 /// How a view is mounted.
 #[derive(Debug, Clone)]
 pub struct MountOptions {
@@ -78,26 +230,107 @@ pub struct MountOptions {
     pub n_threads: usize,
     /// The kernel request queue `FUSE_INIT` negotiates.
     pub tuning: KernelTuning,
-    /// Ask the kernel to serve this mount over FUSE-over-io_uring
-    /// ([`fuser::Transport::Uring`]) instead of `/dev/fuse` reads and
-    /// `writev`s (plan 38 §2.4's ladder, step 2).
-    ///
-    /// Only a request: the transport is **runtime-negotiated**, never a
-    /// build-time choice. It is granted when this build carries the
-    /// `io-uring` feature, the kernel is 6.14+ with `fuse.enable_uring=Y`,
-    /// and `io_uring_setup(2)` and the ring reservation both succeed;
-    /// every refusal is logged once and the mount serves over `/dev/fuse`
-    /// (see [`FuseSession::transport`]).
-    ///
-    /// A mount that asks for the ring **cannot be handed over**
-    /// ([`SessionControl::detach`] refuses it, plan 38 §3(e)/Z0a), so
-    /// `constellation daemon --upgrade`'s and the CSI engine pod's mounts
-    /// must leave this `false`. Every mount Constellation makes today
-    /// does: the user-facing transport policy is plan 38 Z1b's.
-    pub io_uring: bool,
+    /// What transport this mount asks for (plan 38 §2.4's ladder).
+    /// Private, and `DevFuse` for a [`Self::handover_capable`] session
+    /// whatever the knob said — see [`HandoverCapable`].
+    transport: TransportPolicy,
+    /// `io_uring_queue_depth`, read only when `transport` resolves to a
+    /// ring.
+    uring_queue_depth: usize,
+    /// This session may be detached and resumed in another process image,
+    /// so `transport` is pinned.
+    handover: bool,
 }
 
 impl MountOptions {
+    /// Options for a plain mount — one nothing will ever hand to another
+    /// process image — with `cfg`'s transport policy.
+    ///
+    /// `allow_other` and `read_only` default to `false`; set them on the
+    /// returned value (they are what the mount *is*, not what it may be).
+    pub fn new(
+        fs_name: impl Into<String>,
+        n_threads: usize,
+        tuning: KernelTuning,
+        cfg: TransportConfig,
+    ) -> Self {
+        Self {
+            fs_name: fs_name.into(),
+            allow_other: false,
+            read_only: false,
+            n_threads,
+            tuning,
+            transport: cfg.policy,
+            uring_queue_depth: cfg.uring_queue_depth,
+            handover: false,
+        }
+    }
+
+    /// Options for a session that may later be detached and resumed in
+    /// another process image: [`TransportPolicy::DevFuse`], permanently
+    /// and whatever `cfg` says (plan 38 §3(e)/Z0a — a connection whose
+    /// ring queues became ready can never be served over `/dev/fuse`
+    /// again, so `detach` refuses it outright and there is nothing to
+    /// hand over).
+    ///
+    /// A `cfg` asking for [`TransportPolicy::Auto`] is logged at info, not
+    /// refused: the knob is host-wide, and a host that wants the ring for
+    /// its plain mounts must not fail to mount the ones it can upgrade.
+    pub fn handover_capable(
+        fs_name: impl Into<String>,
+        n_threads: usize,
+        tuning: KernelTuning,
+        cfg: TransportConfig,
+        _: HandoverCapable,
+    ) -> Self {
+        let fs_name = fs_name.into();
+        if cfg.policy != TransportPolicy::DevFuse {
+            tracing::info!(
+                fs_name = %fs_name,
+                asked = %cfg.policy,
+                env = TRANSPORT_ENV,
+                "this session can be handed to another process image, so it is served over \
+                 /dev/fuse whatever the transport knob asks for (a ring session cannot be \
+                 detached)"
+            );
+        }
+        Self {
+            transport: TransportPolicy::DevFuse,
+            handover: true,
+            ..Self::new(fs_name, n_threads, tuning, cfg)
+        }
+    }
+
+    /// Override the transport of a plain mount. A no-op (logged) on a
+    /// [`Self::handover_capable`] one: the pin is the point.
+    pub fn with_transport(mut self, policy: TransportPolicy) -> Self {
+        if self.handover {
+            tracing::info!(
+                fs_name = %self.fs_name,
+                asked = %policy,
+                "a handover-capable session stays on /dev/fuse"
+            );
+            return self;
+        }
+        self.transport = policy;
+        self
+    }
+
+    /// What transport this mount asks for.
+    pub fn transport(&self) -> TransportPolicy {
+        self.transport
+    }
+
+    /// Ring entries per kernel queue, when the ring is what it gets.
+    pub fn uring_queue_depth(&self) -> usize {
+        self.uring_queue_depth
+    }
+
+    /// Whether this session may be handed to another process image.
+    pub fn is_handover_capable(&self) -> bool {
+        self.handover
+    }
+
     /// The kernel mount these options describe, at `mountpoint`.
     pub fn source(&self, mountpoint: &Path) -> MountSource {
         let mut opts = constellation_platform::MountOpts::new(self.fs_name.clone());
@@ -115,46 +348,30 @@ impl MountOptions {
         };
         config.n_threads = Some(self.n_threads.max(1));
         config.clone_fd = cfg!(target_os = "linux") && config.n_threads != Some(1);
+        config.io_uring_queue_depth = self.uring_queue_depth.clamp(1, u32::MAX as usize) as u32;
         // One ring per worker thread, the kernel's per-CPU queues
         // partitioned across them (plan 38 §3(a)/§4): fuser sizes the set
         // from `n_threads`, not from the CPU count the kernel would
         // otherwise give a ring each. `clone_fd` is ignored when the ring
         // is active -- the ring's own per-worker queues are what it
         // exists for -- and fuser logs that once.
-        if self.io_uring || uring_forced() {
+        if self.transport == TransportPolicy::Auto {
             if cfg!(feature = "io-uring") {
                 config.io_uring = true;
             } else {
                 // A ladder that degrades: asking for a transport this
                 // build cannot speak is a downgrade, not a mount failure
                 // (fuser's own `Config::io_uring` would refuse the mount).
+                // Logged once per mount, as every other rung's refusal is
+                // (plan 38 §2.4).
                 tracing::warn!(
-                    "io_uring requested but this build has no io-uring feature; using /dev/fuse"
+                    fs_name = %self.fs_name,
+                    "transport auto, but this build has no io-uring feature; using /dev/fuse"
                 );
             }
         }
         config
     }
-}
-
-/// Plan 38 Z1a's test hook: `CONSTELLATION_FUSE_URING=1` asks every mount
-/// this process makes for the ring transport, so the smoke and harness
-/// lanes can run a whole daemon on it without a user-facing knob existing
-/// yet. Z1b replaces it with `CONSTELLATION_FUSE_TRANSPORT`
-/// (`auto | dev-fuse`) and a `TransportPolicy` on `MountOptions`; nothing
-/// production reads this, and unset -- its only state in production --
-/// leaves every mount on `/dev/fuse`.
-///
-/// It is a blunt instrument on purpose: it turns the ring on for *every*
-/// mount, including the handover-capable ones, so setting it while running
-/// `cargo test` or the `session-handover-idle`/`upgrade-under-load`
-/// scenarios makes those fail by design -- a ring session refuses to be
-/// handed over. Set it for the ring-on smoke and harness legs only.
-fn uring_forced() -> bool {
-    matches!(
-        std::env::var("CONSTELLATION_FUSE_URING").as_deref(),
-        Ok("1" | "true" | "yes")
-    )
 }
 
 /// Where a session's connection comes from (see the module doc).
@@ -343,6 +560,16 @@ pub fn mount_source<V: Vfs>(
     let deferred = fs.deferred().clone();
     match source {
         MountSource::PreopenedFd(fd) => {
+            // Somebody else holds this connection and may want it handed
+            // back (plan 37's engine pod; plan 38 §3(e)): `/dev/fuse`
+            // whatever `opts` asked for, so the pin holds even for a
+            // caller that built plain options by mistake.
+            debug_assert!(
+                opts.is_handover_capable(),
+                "a PreopenedFd session's options must be handover-capable"
+            );
+            let mut config = config;
+            config.io_uring = false;
             let session = fuser::Session::from_fd(fs, fd, config.acl, config.clone())?;
             FuseSession::new(session, deferred, view, config, None, None)
         }
@@ -472,9 +699,15 @@ impl<V: Vfs> FuseSession<V> {
         // A resumed connection is `/dev/fuse` -- `check_resumable` refuses
         // anything else -- and there is no handshake here to create rings
         // in, so asking for the ring would be silently ignored. Clear it
-        // rather than carry a request nothing can honor (this is what
-        // makes Z1a's `CONSTELLATION_FUSE_URING` hook safe to leave set
-        // across a `daemon --upgrade`).
+        // rather than carry a request nothing can honor. Belt and braces:
+        // every caller builds these options with
+        // [`MountOptions::handover_capable`], which pins the policy
+        // already, and `CONSTELLATION_FUSE_TRANSPORT=auto` is therefore
+        // safe to leave set across a `daemon --upgrade`.
+        debug_assert!(
+            opts.transport() == TransportPolicy::DevFuse,
+            "a resumed session's options must be handover-capable"
+        );
         config.io_uring = false;
         let fs = FuseFs::new(view.clone(), caps, opts.tuning);
         let deferred = fs.deferred().clone();
@@ -502,7 +735,7 @@ impl<V: Vfs> FuseSession<V> {
     }
 
     /// The transport this session serves its connection over: what
-    /// [`MountOptions::io_uring`] asked for if the kernel, the build and
+    /// [`MountOptions::transport`] asked for if the kernel, the build and
     /// the process's capabilities all granted it, and
     /// [`Transport::DevFuse`] otherwise (the reason was logged once, by
     /// fuser, during the handshake). Fixed for the life of the connection.
@@ -650,6 +883,14 @@ impl SessionControl {
         }
     }
 
+    /// The transport this session's connection is served over. A
+    /// non-[`Transport::DevFuse`] one cannot be handed to another process
+    /// image at all (plan 38 §3(e)), so `daemon --upgrade`'s preflight
+    /// reads this and refuses by name before it detaches anything.
+    pub fn transport(&self) -> Transport {
+        self.shared.transport
+    }
+
     /// Requests waiting for a deferred reply right now.
     pub fn deferred_replies(&self) -> usize {
         self.shared.deferred.count()
@@ -754,6 +995,130 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::time::Instant;
 
+    // ---------------------------------------------- the transport knob
+
+    /// No kernel needed: the knob's precedence, spellings and refusals.
+    #[test]
+    fn the_transport_knob_wins_over_the_flag() {
+        let none = |_: &str| None;
+        let var = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        // Nothing set anywhere: the shipped default (plan 38 Z1 leaves
+        // every mount on `/dev/fuse`; Z2c is what flips plain mounts).
+        let cfg = TransportConfig::resolve_from(none, None, None).unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::DevFuse);
+        assert_eq!(cfg.uring_queue_depth, DEFAULT_URING_QUEUE_DEPTH);
+        // The flag alone.
+        let cfg =
+            TransportConfig::resolve_from(none, Some(TransportPolicy::Auto), Some(4)).unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::Auto);
+        assert_eq!(cfg.uring_queue_depth, 4);
+        // The env over the flag, either way round, and tolerant of
+        // whitespace and case as the other knobs' parsers are.
+        let cfg = TransportConfig::resolve_from(
+            var(&[(TRANSPORT_ENV, " AUTO "), (URING_QUEUE_DEPTH_ENV, "16")]),
+            Some(TransportPolicy::DevFuse),
+            Some(4),
+        )
+        .unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::Auto);
+        assert_eq!(cfg.uring_queue_depth, 16);
+        let cfg = TransportConfig::resolve_from(
+            var(&[(TRANSPORT_ENV, "dev_fuse")]),
+            Some(TransportPolicy::Auto),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::DevFuse);
+        // An empty value is "unset", not a parse error: an exported but
+        // empty variable is what a shell leaves behind.
+        let cfg = TransportConfig::resolve_from(
+            var(&[(TRANSPORT_ENV, "  ")]),
+            Some(TransportPolicy::Auto),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::Auto);
+        // Unparseable is an error, not a silent `dev-fuse` (see
+        // `TransportConfig::resolve`'s doc for why this knob differs from
+        // `--cache-verify`).
+        let err = TransportConfig::resolve_from(var(&[(TRANSPORT_ENV, "uring")]), None, None)
+            .expect_err("an unknown transport must be refused");
+        assert!(
+            err.contains(TRANSPORT_ENV) && err.contains("uring"),
+            "{err}"
+        );
+        for bad in [
+            &[(URING_QUEUE_DEPTH_ENV, "0")],
+            &[(URING_QUEUE_DEPTH_ENV, "-1")],
+            &[(URING_QUEUE_DEPTH_ENV, "lots")],
+        ] {
+            let err = TransportConfig::resolve_from(var(bad), None, None)
+                .expect_err("a non-positive queue depth must be refused");
+            assert!(err.contains(URING_QUEUE_DEPTH_ENV), "{err}");
+        }
+    }
+
+    /// Plan 38 §3(e)'s hard rule, as a type-level fact rather than a
+    /// convention: the only route to a handover-capable `MountOptions` is
+    /// the constructor that takes the marker, and it pins `dev-fuse`.
+    #[test]
+    fn a_handover_capable_session_ignores_the_knob() {
+        let asked = TransportConfig {
+            policy: TransportPolicy::Auto,
+            uring_queue_depth: 4,
+        };
+        let plain = MountOptions::new("plain", 2, KernelTuning::for_workers(2), asked);
+        assert_eq!(plain.transport(), TransportPolicy::Auto);
+        assert!(!plain.is_handover_capable());
+        assert_eq!(plain.uring_queue_depth(), 4);
+
+        let pinned = MountOptions::handover_capable(
+            "pinned",
+            2,
+            KernelTuning::for_workers(2),
+            asked,
+            HandoverCapable,
+        );
+        assert_eq!(pinned.transport(), TransportPolicy::DevFuse);
+        assert!(pinned.is_handover_capable());
+        // Not even an explicit override gets through it.
+        let still = pinned.clone().with_transport(TransportPolicy::Auto);
+        assert_eq!(still.transport(), TransportPolicy::DevFuse);
+        // A plain mount's override does.
+        assert_eq!(
+            plain.with_transport(TransportPolicy::DevFuse).transport(),
+            TransportPolicy::DevFuse
+        );
+    }
+
+    /// What `MountOptions` asks fuser for. `Auto` without the feature is
+    /// a downgrade (the ladder's step 2->3), not a mount failure --
+    /// `fuser::Config::io_uring` would refuse the mount outright.
+    #[test]
+    fn auto_asks_fuser_for_the_ring_only_where_the_build_can_serve_it() {
+        let auto = MountOptions::new(
+            "auto",
+            2,
+            KernelTuning::for_workers(2),
+            TransportConfig {
+                policy: TransportPolicy::Auto,
+                uring_queue_depth: 3,
+            },
+        );
+        let config = auto.config();
+        assert_eq!(config.io_uring, cfg!(feature = "io-uring"));
+        assert_eq!(config.io_uring_queue_depth, 3);
+        let dev = auto.with_transport(TransportPolicy::DevFuse).config();
+        assert!(!dev.io_uring);
+    }
+
     fn kernel_available() -> bool {
         // SAFETY: no preconditions.
         let root = unsafe { libc::geteuid() } == 0;
@@ -764,30 +1129,37 @@ mod tests {
         true
     }
 
+    /// A handover-capable session's options: these tests are the detach
+    /// protocol's own, and `HandoverCapable` is what pins them to
+    /// `/dev/fuse` however the ambient `CONSTELLATION_FUSE_TRANSPORT` is
+    /// set (so a ring-on harness leg does not break them).
     fn options() -> MountOptions {
-        MountOptions {
-            fs_name: "constellation-handover-test".into(),
-            allow_other: true,
-            read_only: false,
-            n_threads: 2,
-            tuning: KernelTuning::for_workers(2),
-            io_uring: false,
-        }
+        let mut opts = MountOptions::handover_capable(
+            "constellation-handover-test",
+            2,
+            KernelTuning::for_workers(2),
+            TransportConfig::default(),
+            HandoverCapable,
+        );
+        opts.allow_other = true;
+        opts
     }
 
-    /// Plan 38 Z1a. `io_uring: true`, and `allow_other` off so the mount
-    /// goes through `fusermount3` where the tests run unprivileged. Two
+    /// Plan 38 Z1b: a plain mount asking for the ladder
+    /// (`TransportPolicy::Auto`), with `allow_other` off so the mount goes
+    /// through `fusermount3` where the tests run unprivileged. Two
     /// workers, so the ring set is two rings sharing the kernel's per-CPU
     /// queues round-robin (§3(a): one ring per worker, not per CPU).
     fn uring_options() -> MountOptions {
-        MountOptions {
-            fs_name: "constellation-uring-test".into(),
-            allow_other: false,
-            read_only: false,
-            n_threads: 2,
-            tuning: KernelTuning::for_workers(2),
-            io_uring: true,
-        }
+        MountOptions::new(
+            "constellation-uring-test",
+            2,
+            KernelTuning::for_workers(2),
+            TransportConfig {
+                policy: TransportPolicy::Auto,
+                ..TransportConfig::default()
+            },
+        )
     }
 
     /// The transport this host can actually grant, probed the way the
@@ -1122,7 +1494,7 @@ mod tests {
         };
         let expected = transport_this_host_grants();
         eprintln!(
-            "mounted with io_uring: true; this host grants {expected}, the session reports {}",
+            "mounted with transport auto; this host grants {expected}, the session reports {}",
             session.transport()
         );
         assert_eq!(session.transport(), expected);
@@ -1179,10 +1551,7 @@ mod tests {
         // fs name), so `fusermount3` mounts this where tests run unprivileged
         // and without `user_allow_other`: the refusal is then a gate on an
         // ordinary host too, not only on a box that can grant the ring.
-        let opts = MountOptions {
-            io_uring: false,
-            ..uring_options()
-        };
+        let opts = uring_options().with_transport(TransportPolicy::DevFuse);
         let session = match mount(Arc::new(vfs.clone()), dir.path(), &opts, caps()) {
             Ok(session) => session,
             Err(e) => {

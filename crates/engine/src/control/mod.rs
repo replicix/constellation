@@ -86,6 +86,12 @@ pub struct HostView {
     pub labels: BTreeMap<String, String>,
     pub qos: api::ViewQos,
     pub confine_links: bool,
+    /// Plan 38 §5: the FUSE transport this view's session negotiated
+    /// (`dev_fuse`/`uring`/`uring_zc`), as `node.status` reports it per
+    /// mount. A `String` rather than the frontend's `Transport`: this
+    /// crate names no frontend types, and a host with no FUSE session
+    /// behind the view (a control-only embedder) has `None`.
+    pub transport: Option<String>,
     /// The engine view behind it (`view.stats` asks it).
     pub view: Option<Arc<View>>,
 }
@@ -246,6 +252,7 @@ impl EngineControl {
                 subtree: v.subtree,
                 mountpoint: v.mountpoint.display().to_string(),
                 mounted_ms_ago: v.since.elapsed().as_millis() as u64,
+                transport: v.transport,
             })
             .collect()
     }

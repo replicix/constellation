@@ -72,6 +72,8 @@ impl ControlHost for FixtureHost {
             labels: p.labels.clone(),
             qos: p.qos.clone(),
             confine_links: p.confine_links,
+            // The fixture has no FUSE (`mount` refuses a non-path source).
+            transport: None,
             view: Some(view),
         };
         self.views.lock().unwrap().push(hv.clone());

@@ -57,6 +57,46 @@ services:
     <<: *suite
     command: ["compliance"]
 
+  # The same pjdfstest run on plan 38's transport ladder
+  # (`CONSTELLATION_FUSE_TRANSPORT=auto`), so POSIX compliance is gated on
+  # every transport and not only on `/dev/fuse` (plan 38 §6: "pjdfstest
+  # 8798/8798 on every transport"). Its own image and its own profile,
+  # because reaching the ring needs two things the default suite image and
+  # the default container do not have:
+  #
+  #  * the `io-uring` cargo feature in the binary (`CARGO_FEATURES` below);
+  #  * `seccomp:unconfined`. Docker's default seccomp profile blocks
+  #    `io_uring_setup(2)`, `io_uring_enter(2)` and `io_uring_register(2)`
+  #    outright, and a blocked setup is invisible in sysfs — the mount
+  #    would quietly fall back to `/dev/fuse` and the lane would pass
+  #    while testing nothing (plan 38 §8). It is set *only* here, never on
+  #    the `smoke`/`compliance`/`stress` services, whose point is to run
+  #    under an ordinary container profile.
+  #
+  # The host kernel decides the rest: 6.14+ with `fuse.enable_uring=Y`.
+  # On a host without it the leg still runs and still has to pass, on the
+  # `/dev/fuse` fallback — which is the ladder's own promise.
+  #
+  #   docker compose --profile test-uring run --rm compliance-uring
+  #   make compliance-uring
+  compliance-uring:
+    <<: *suite
+    image: ${SUITE_URING_IMAGE:-constellation-suite-uring:local}
+    build:
+      context: .
+      dockerfile: tests/docker/Dockerfile
+      target: suite
+      args:
+        CARGO_FEATURES: constellation-frontend-fuse/io-uring
+    profiles: ["test-uring"]
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+    environment:
+      <<: *suite-env
+      CONSTELLATION_FUSE_TRANSPORT: auto
+    command: ["compliance"]
+
   # Data-integrity (fio verify) + metadata churn (stress-ng).
   stress:
     <<: *suite

@@ -30,8 +30,15 @@ export CARGO_TERM_COLOR ?= always
 COMPOSE_SUITES ?=
 HARNESS_SCENARIOS ?=
 HARNESS_SEED ?= 42
-# FUSE transports the matrix lane runs (plan 38 §6). `auto` joins at Z1.
-TRANSPORTS ?= dev-fuse
+# FUSE transports the matrix lane runs (plan 38 §6): `dev-fuse` and the
+# ladder (`auto`), which falls back to `/dev/fuse` where the build or the
+# kernel cannot grant the ring and must pass either way.
+TRANSPORTS ?= dev-fuse auto
+# Cargo features for the binaries the lanes build. The ring transport is
+# off by default; `make ... CARGO_FEATURES=constellation-frontend-fuse/io-uring`
+# (or `make build-uring`) is what puts it in.
+CARGO_FEATURES ?=
+FEATURE_FLAGS = $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES),)
 BENCH_FILES ?= 20000
 UPLOADBENCH_LIVE_CONTROLLERS ?= aimd,pid
 UPLOADBENCH_LIVE_DURATION ?= 60
@@ -45,6 +52,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration csi-sanity csi-image compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
+	harness-transport-matrix build-uring compliance-uring \
 	dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live check-cross vfs-bench
 
@@ -59,6 +67,7 @@ help: ## Show this help
 	@echo "  HARNESS_SCENARIOS=\"..\" scenario names (default: all)"
 	@echo "  HARNESS_SEED=$(HARNESS_SEED)         harness workload seed"
 	@echo "  TRANSPORTS=\"$(TRANSPORTS)\"  FUSE transports for transport-matrix"
+	@echo "  CARGO_FEATURES=\"$(CARGO_FEATURES)\"  cargo features for the built binaries"
 	@echo "  BENCH_FILES=$(BENCH_FILES)       files for harness bench"
 	@echo "  BUCKET=<local.mk>       s3://bucket/prefix for uploadbench-live (see local.mk.example)"
 	@echo "  UPLOADBENCH_LIVE_CONTROLLERS=$(UPLOADBENCH_LIVE_CONTROLLERS)"
@@ -77,10 +86,10 @@ build-chaos: $(RELEASE_CHAOS) ## Build chaos consistency tool (release)
 # otherwise make these recipes no-ops. Cargo itself is incremental.
 # `&:` = one recipe produces both outputs (GNU make 4.3+).
 $(RELEASE_BIN) $(RELEASE_HARNESS) $(RELEASE_CHAOS) &: FORCE
-	$(CARGO) build --release -p constellation -p constellation-harness -p constellation-chaos
+	$(CARGO) build --release $(FEATURE_FLAGS) -p constellation -p constellation-harness -p constellation-chaos
 
 $(DEBUG_BIN) $(DEBUG_HARNESS) $(DEBUG_CHAOS) &: FORCE
-	$(CARGO) build -p constellation -p constellation-harness -p constellation-chaos
+	$(CARGO) build $(FEATURE_FLAGS) -p constellation -p constellation-harness -p constellation-chaos
 
 # constellation-csi (plan 37) is not a default workspace member (it is
 # Kubernetes/Linux-only — see Cargo.toml), so it needs its own `-p` build
@@ -184,8 +193,22 @@ perf-gate: $(RELEASE_BIN) $(RELEASE_HARNESS) ## vfs-bench (§6.9 dispatch + allo
 read-cpu-gate: $(RELEASE_BIN) ## Daemon CPU-s/GiB + peak RSS on a real mount, fio-driven (plan 38 §6); needs fio, no root
 	tests/read-cpu-gate.sh
 
-transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Read-path scenarios once per FUSE transport (plan 38 §6; only `dev-fuse` exists yet)
+# The lane's `auto` leg is only coverage with the ring built in; on a host
+# that grants it, tests/transport-matrix.sh fails a leg that fell back.
+transport-matrix harness-transport-matrix: CARGO_FEATURES = constellation-frontend-fuse/io-uring
+
+transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Read-path scenarios once per FUSE transport (plan 38 §6)
 	TRANSPORTS="$(TRANSPORTS)" tests/transport-matrix.sh
+
+harness-transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## FULL fault-injection matrix once per FUSE transport (plan 38 §6; slow)
+	TRANSPORTS="$(TRANSPORTS)" SCENARIOS=all tests/transport-matrix.sh
+
+build-uring: ## Release binaries with the FUSE-over-io_uring transport built in (plan 38 §3(a))
+	$(MAKE) build-release CARGO_FEATURES=constellation-frontend-fuse/io-uring
+
+compliance-uring: ## pjdfstest in a container whose binary has the ring and whose seccomp permits io_uring (plan 38 §6)
+	docker compose --profile test-uring build compliance-uring
+	docker compose --profile test-uring run --rm compliance-uring
 
 uploadbench-build: ## Build the adaptive-upload-concurrency benchmark
 	$(CARGO) build -p uploadbench --release

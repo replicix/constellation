@@ -24,8 +24,9 @@ pub use fuser::{NegotiatedInit, Transport};
 pub use notify::FuseNotifySink;
 pub use reply::reply_code;
 pub use session::{
-    mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, MountOptions,
-    MountSource, SessionControl, SessionExit, SessionHandoff,
+    mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, HandoverCapable,
+    MountOptions, MountSource, SessionControl, SessionExit, SessionHandoff, TransportConfig,
+    TransportPolicy, DEFAULT_URING_QUEUE_DEPTH, TRANSPORT_ENV, URING_QUEUE_DEPTH_ENV,
 };
 
 /// The capabilities this frontend declares: [`FrontendCaps::linux_fuse`]

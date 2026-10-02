@@ -3682,6 +3682,14 @@
         },
         "subtree": {
           "type": "string"
+        },
+        "transport": {
+          "default": null,
+          "description": "Plan 38 §5: the FUSE transport this mount's connection negotiated\n— `dev_fuse`, `uring` or `uring_zc` — fixed for the connection's\nlife. `None` on a host with no FUSE session behind the view (a\ncontrol-only embedder, the engine's own fixtures) and in a report\nfrom a daemon older than plan 38 Z1b. The rest of plan 38 §5's\n`fuse` section (ring queue depth, passthrough and zero-copy\ncounters, the last transport fallback and its reason) lands with\nthe transport integration; the per-mount transport belongs here,\nwith the mount it describes.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

@@ -30538,3 +30538,361 @@ chunk writes the full section.
 | Tests: lease never moves under 10 snapshots from a non-holder while the holder writes (prefix-monotone counters); deletes/holds converge; duplicate rid / retry after holder change → `AlreadyExists`; no holder → acquire; unreachable holder → error, no lease move; unchanged root → `Skipped`; P2P off → `wanted_by` then acquire, no forward; a forwarded create drains the requester's chunks first; a lease-loss refusal is not replayed to a same-rid retry | DONE | `crates/engine/src/snapshot_batch.rs` tests |
 | Harness: `snapshot-lifecycle` gains a second node that snapshots/holds/deletes while the first writes; asserts lease holder+epoch unchanged | DONE | `crates/harness/src/scenarios.rs` |
 | Delegations: a root `Barrier` for a directory inside a delegated subtree does not reach the delegate (its unstreamed tail is not drained) — recorded, not redesigned | RECORDED | `crates/authority/src/core/tests.rs` `a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate` |
+
+## Plan 38 Z1 — the vendored FUSE-over-io_uring transport and `TransportPolicy`
+
+Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z1,
+landed in two chunks: **Z1a** vendored the userspace half of
+FUSE-over-io_uring into `vendor/fuser` behind the `io-uring` cargo feature
+(commit `a73d103`), and **Z1b** — this chunk — put the user-facing policy on
+top of it: a `TransportPolicy` on `MountOptions`, the
+`CONSTELLATION_FUSE_TRANSPORT` / `CONSTELLATION_FUSE_URING_QUEUE_DEPTH` knobs
+and their CLI flags, the negotiated transport in `node.status`, the transport
+matrix lane's `auto` leg, pjdfstest on both transports, and the standing
+`transport-detach-refused` scenario. **The ring is still off for every
+mount**: `TransportPolicy::DevFuse` is the default everywhere, and only an
+explicit `auto` (a lane leg, a scenario, an operator) asks for the ladder —
+Z2c is the milestone that flips plain mounts.
+
+**Z1 is closed on the `dev-fuse` leg and NOT closed on the ring leg.** On
+the ring, one blocked request stalls unrelated requests on the same queue
+(`s3-cut-one-node`, below); the coordinator moved that exit criterion to
+**Z2a**, which owns the fix and gates on it. Until then `auto` is
+documented as experimental (`docs/reference/configuration.md`).
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| `patches/0002-io-uring-transport.patch` | done (Z1a) | `vendor/fuser/patches/0002-io-uring-transport.patch`, every hunk marked `CONSTELLATION PATCH (io-uring)`; `tools/vendor-fuser.sh --check` reproduces `vendor/fuser` byte for byte from 0.18.0 + 0001 + 0002. Four new files (`src/uring/{mem,mod,ring,staging}.rs`) lifted from the Skory/fuser fork at `0104570`, the `Session`/`reply.rs`/`request.rs` seam re-made by hand against our 0.18.0 + patch 0001 |
+| Vendor-vs-rewrite verdict | done (Z1a) | **VENDOR** (lift the ring module, re-make the seam) — the rubric and its evidence are the table in `vendor/fuser/CONSTELLATION-PATCH.md`'s "The io-uring transport" section: MIT licence unchanged; the ring is separable from the fork's unrelated drift (26 of 47 hunks apply to pristine 0.18.0, all 21 rejects are context clashes with statx/tmpfile/idmap work); the fork's own suite passes against our copy (**72/0** without the feature, **157/0** with it); every one of the 51 `unsafe` sites carries a `SAFETY:` comment, and the threading model (`SINGLE_ISSUER` + ring-thread enable, foreign-thread commits via `eventfd`, `ManuallyDrop` mapping leaked while entries are in the kernel) was read and recorded one claim at a time |
+| `Transport` + `NegotiatedInit.transport`, `detach`/`check_resumable` refusal | done (Z1a) | `vendor/fuser/src/session.rs`: `Transport::{DevFuse,Uring,UringZeroCopy}` exists in **every** build (a build without the feature must still refuse to resume a ring connection rather than read `/dev/fuse` and hang); `FuseSession::transport`, `FuseHandoff::transport`, `SessionControl::detach`'s refusal in `crates/frontend-fuse/src/session.rs` |
+| `MountOptions::transport: TransportPolicy` | done | `crates/frontend-fuse/src/session.rs`: `TransportPolicy::{Auto,DevFuse}`, `Default` = `DevFuse`. `Auto` sets `mnt::mount_options::Config::io_uring = cfg!(feature = "io-uring")` and logs a one-line downgrade when the feature is absent (asking fuser for a transport the build cannot speak would make it refuse the *mount*; the ladder degrades instead). The field is **private**: `MountOptions::new` is the only way to a plain mount and `MountOptions::handover_capable` the only way to a pinned one |
+| `MountOptions::uring_queue_depth` | done, default 8 | same file; `DEFAULT_URING_QUEUE_DEPTH`, carried into `Config::io_uring_queue_depth` (clamped to ≥ 1) and read only when the policy resolves to a ring |
+| `HandoverCapable`, the hard rule as a type | done | `MountOptions::handover_capable(fs_name, n_threads, tuning, cfg, HandoverCapable)` pins `DevFuse` whatever the knob says and logs at info when the knob asked for `auto` (plan 38 §3(e)/Z0a: a ring session cannot be detached at all). Its three call sites are every handover-capable session there is: `node_runtime::add_mount`'s `preopened.is_some()` branch (`view.mount{PreopenedFd}`, plan 37's CSI pods), `handover::SessionInfoParts::options` and `handover::resume_mount` (`daemon --upgrade`'s resumed mounts). `FuseSession::resume` keeps its `config.io_uring = false` and gained a `debug_assert!` that the options it was handed are the pinned kind |
+| `CONSTELLATION_FUSE_TRANSPORT` / `CONSTELLATION_FUSE_URING_QUEUE_DEPTH` + `--fuse-transport` / `--fuse-uring-queue-depth` | done | `TransportConfig::resolve` (`frontend-fuse::session`): env wins over flag, as `CONSTELLATION_PROFILE` and `CONSTELLATION_CACHE_VERIFY` do; empty means unset; case- and whitespace-insensitive; **an unparseable value is an error**, not a warned-about fall-through (see the decision below). Flags on `mount` (`crates/cli/src/main.rs`), resolved before the fork so a typo reaches the terminal; `NodeConfig::fuse_transport` → `NodeRuntime::fuse_transport` is what every mount this daemon makes reads; carried across `daemon --upgrade` in `NodeHandoff` (`#[serde(default)]`, so an older image's handoff still resumes) and re-resolved in the new image, so the environment still wins |
+| `node.status`: the negotiated transport per mount | done | `MountInfo::transport: Option<String>` (`crates/control/src/proto/types.rs`, `#[serde(default)]`), filled from `MountHandle::transport` (`cli::node_runtime`, recorded at mount time from `FuseSession::transport()` and logged once as `FUSE transport`), through `HostView::transport` (`engine::control`). `None` for a view with no FUSE session behind it (a control-only embedder, the engine's fixtures) and in an older daemon's report. Deliberately *only* this field: plan 38 §5's full `fuse` section (queue depth, passthrough/zero-copy counters, the last fallback and its reason) is Z2b's, and this is the shape it extends. Schema re-blessed (`CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`) |
+| `daemon --upgrade` preflight refusal | done | `cli::handover::prepare` refuses the whole upgrade **before** anything is detached, naming each ring-served mountpoint and its transport and saying what to do instead (unmount and remount, or mount with `--fuse-transport dev-fuse`). `SessionControl::detach` refuses it too (Z1a); this is the preflight that keeps a multi-view handover from detaching half its views for nothing |
+| Transport matrix lane, `auto` leg | done | `tests/transport-matrix.sh` runs `dev-fuse` and `auto`; **neither leg ever skips** — a host that cannot grant the ring runs `auto` as a fallback leg, which is the ladder's own promise and the one property the lane can check anywhere. `SCENARIOS=all` runs the full matrix per leg (`make harness-transport-matrix`); `make build-uring` is the feature build; `CARGO_FEATURES` reaches the `Makefile`'s release recipe |
+| pjdfstest on both transports | done | `docker-compose.yml`'s new `compliance-uring` service (profile `test-uring`, `make compliance-uring`): its own image built with `CARGO_FEATURES=constellation-frontend-fuse/io-uring` (a `tests/docker/Dockerfile` build arg) and `security_opt: [apparmor:unconfined, seccomp:unconfined]`, because Docker's default seccomp profile blocks `io_uring_setup(2)` outright and a blocked setup leaves nothing in sysfs to see — the lane would pass while testing nothing. The relaxation is on that service only; `smoke`/`compliance`/`stress` keep running under an ordinary container profile on purpose |
+| Scenario `transport-detach-refused` | done | `crates/harness/src/scenarios/transport.rs`, in `SCENARIOS` and in the lane's default list. **One scenario, two expected outcomes keyed on the transport the mount negotiated**: it always asks for `auto`, reads `node.status`, and then requires `daemon --upgrade` to be *refused* (the error naming the transport, generation unchanged, pid unchanged, `node.status` still `uring`) on a ring session, or to *succeed* (generation + 1, the resumed session `dev_fuse`) where the ladder fell back. Either way a writer, a creator and a reader run throughout, no syscall may fail, the mountpoint may not blink (`Watcher`'s `st_dev`), and every byte written is verified before and after a remount |
+| `session-handover-idle` / `upgrade-under-load` pinned | done | `crates/harness/src/scenarios/handover.rs`: both now mount with `CONSTELLATION_FUSE_TRANSPORT=dev-fuse` explicitly, so the `auto` leg of the matrix lane does not silently turn the two handover scenarios into tests of a refusal. Not a weakening: a daemon whose plain mounts are on a ring cannot be upgraded in place, by design, and `transport-detach-refused` is the scenario for that |
+| Transport parity without a kernel (plan 38 §6's `tests/wire.rs` counterpart) | done | `vendor/fuser`: `uring::ring::test::dispatch_over_a_fake_ring` is the in-memory seam (a `Ring` over `/dev/zero`, no io_uring at all — `Ring::new` and `RingIo::open` were already separate), and `session.rs`'s `transport_parity_is_byte_for_byte` dispatches eight requests (entry hit, errno, attr, a read answered by `data()` *and* by `fill()`, a request carrying its own payload, an incrementally built `readdir`, an xattr size probe) down both transports and asserts the reply bytes are **equal**. It needs no root, no mount and no `fuse.enable_uring=Y`, which is the point: the 18 real-kernel ring tests skip on an ordinary dev host and this one does not. It lives in `vendor/fuser` because the alternative was exporting `SessionEventLoop`, `RingCommit` and an entry constructor from that crate's public API for one Constellation-side test |
+| Each lane says which transport it actually got | done | A leg that asked for `auto` and silently fell back would otherwise pass as ring coverage (plan 38 §8's own risk). `tests/compliance.sh` prints `FUSE transport: <negotiated> (asked for <policy>)` after the mount (parsed out of `node.status` with `sed` — the suite image has neither `jq` nor `python3`); `tests/read-cpu-gate.sh` records a `negotiated` field in every result line and in its per-lane console line; `transport-detach-refused` prints it and keys its assertions on it; `cli::node_runtime` logs it once per mount |
+| Docs | done | `docs/reference/configuration.md` (both knobs in the settings table, the node-wide-not-per-view note, the "an unparseable value fails the mount" rule), `docs/how-to-guides/development/TESTING.md` (the transport table, the lane and its two legs, pjdfstest per transport, where the ring is tested without a kernel), `vendor/fuser/CONSTELLATION-PATCH.md` (the parity test and the seam; Z1a's `CONSTELLATION_FUSE_URING` test hook is gone, replaced by the policy) |
+
+### Decisions this chunk made
+
+- **An unparseable `CONSTELLATION_FUSE_TRANSPORT` is an error, unlike
+  `CONSTELLATION_CACHE_VERIFY`.** Z0b made the cache-verify env variable warn
+  and fall through, so a stale value in a shell profile cannot brick every
+  mount started from it, and because its fall-through is in the *stricter*
+  direction. A transport is the opposite shape: `dev-fuse` is what an ignored
+  `auto` would silently give, so the fall-through would quietly leave the
+  kernel's whole fast path off — the opposite of what the operator asked for.
+  Both the flag and the env variable therefore fail the mount before the fork,
+  as `--cto`/`--locks`/`--atime` do.
+- **The hard rule is a constructor, not a convention.** `MountOptions`'s
+  transport fields are private; `handover_capable` takes a `HandoverCapable`
+  marker and pins `DevFuse`; `with_transport` is a logged no-op on such a
+  session. A future caller that mounts something it later wants to `detach`
+  has to say so at the call site, and gets `/dev/fuse` by construction rather
+  than by remembering plan 38 §3(e).
+- **The knob is node-wide, not per-view.** It belongs to the daemon (it is
+  resolved once, before the fork, and a connection's transport is fixed for
+  its life), so a `mount` that merely attaches another view to a running
+  daemon cannot change it. Documented as such in `configuration.md`.
+- **The lane's `auto` leg never skips.** Z0b's skeleton skipped `auto`
+  because nothing read the variable. Now that something does, a host that
+  cannot grant the ring is still a host the ladder must serve: the leg runs
+  as a fallback leg and has to pass. What it negotiated is printed by
+  `transport-detach-refused` and visible in `node.status`, so a leg that
+  never reached the ring cannot be mistaken for ring coverage.
+- **The ring payload stays at `max_write` (16 MiB), not the bench's 1 MiB.**
+  Plan 38 §4 left the choice to Z1 "re-verified against real RSS". Measured
+  on `$RING_BOX` (see below): the 1.00 GiB per-mount mapping is
+  `MAP_NORESERVE` address space whose residency follows the traffic — 0.0 MiB
+  resident at idle and 3.2 MiB after a 128 MiB write plus three full reads.
+  Capping the payload would cap what one entry can carry (the kernel's
+  REGISTER wants `max(8192, max_write, max_pages × page)` per entry) and buy
+  address space that costs nothing on a 64-bit host. `--fuse-uring-queue-depth`
+  is the knob for an operator who disagrees.
+
+### The ring's real RSS on Constellation's own worker count (plan 38 §4)
+
+§4 worked the ring's memory out as `workers × queue_depth × payload` and
+left the payload choice to Z1 "re-verified against real RSS, not assumed".
+Z1a could only report the *reservation*; this is the measurement, on
+`$RING_BOX` (Ubuntu 26.04, kernel 7.0.0-34, `fuse.enable_uring=Y`, 8 CPUs →
+6 FUSE workers, 8 GiB RAM), the same daemon, the same workload, once per
+transport (one mount each, local-directory backend, `--cache-size 4G`):
+
+| | `dev-fuse` | `auto` → `uring` |
+|---|---|---|
+| daemon `VmSize`, idle | 2 643.8 MiB | 3 536.0 MiB (**+892 MiB**) |
+| daemon `VmRSS`, idle | 41.1 MiB | 40.7 MiB (**−0.4 MiB**) |
+| the ring mapping itself, idle | — | 1 024.2 MiB reserved, **0.0 MiB resident** |
+| daemon `VmRSS` after 128 MiB write + 3 full reads (buffered, O_DIRECT 1 MiB, O_DIRECT 4 KiB) | 302.9 MiB | 337.5 MiB (**+34.6 MiB**) |
+| the ring mapping itself, same point | — | 1 024.2 MiB reserved, **3.2 MiB resident** |
+
+So §4's "roughly 64 MiB to 1 GiB depending on that choice" is a range of
+**address space**: the mapping is `MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE`
+with `MADV_DONTFORK`, and what is resident is what the traffic touched —
+nothing at idle, 3.2 MiB after the workload above, against a 1.00 GiB
+reservation (8 possible CPUs × depth 8 × (16 MiB `max_write` + one page);
+the kernel's REGISTER sizes an entry's payload as
+`max(8192, max_write, max_pages × page_size)`, so the reservation follows
+`possible_cpus`, not the worker count — §4's formula should be read as
+"per possible CPU", which is the shape the kernel's queues have).
+
+**Decision: keep the payload at `max_write` (16 MiB).** Capping it at the
+bench's 1 MiB would cap what a single entry can carry (and so what the
+connection can negotiate for `max_write`/`max_pages`) to buy address space
+that is free on a 64-bit host and RSS that was never spent. The number that
+matters for a budget — the *additional* RSS over today's `/dev/fuse` path —
+is **+3.2 MiB of ring buffers** (+34.6 MiB of total daemon RSS) at one
+mount, not +1 GiB. `--fuse-uring-queue-depth` is there for an operator
+whose own measurement disagrees; the fio gate below records peak RSS per
+transport on every lane, which is where a leaked or over-sized pool would
+show up.
+
+### The fio cost gate per transport (plan 38 §6, Z0b's gate)
+
+`tests/read-cpu-gate.sh`, medians of 3 repeats, on `$RING_BOX` (8 CPUs, not
+the 32-CPU host Z0b's committed baseline belongs to, so these are **not**
+comparable with it — they are comparable with *each other*, which is the
+comparison the milestone needs). Both legs ran with the same
+`io-uring`-feature binary; the only difference is
+`CONSTELLATION_FUSE_TRANSPORT`. The `auto` leg negotiated `uring`, read back from
+`node.status` on the same box, binary and environment (and printed by
+`transport-detach-refused` on the same guest); the gate itself now records
+the negotiated transport in every result line, which is how a later run
+proves it rather than inferring it from the variable.
+
+| lane | CPU-s/GiB `dev-fuse` | CPU-s/GiB `uring` | peak RSS `dev-fuse` | peak RSS `uring` | MiB/s `dev-fuse` | MiB/s `uring` |
+|---|---|---|---|---|---|---|
+| `cold-seq-1m` | 2.500 | 2.480 | 740.8 | 735.0 | 948.1 | 937.7 |
+| `warm-disk-seq-1m` | 0.800 | 0.760 | 594.3 | 594.0 | 1 233.7 | 1 267.3 |
+| `warm-mem-seq-1m` | 0.160 | 0.140 | 594.7 | 595.4 | 4 654.5 | 5 688.9 |
+| `rand-4k-dio` | 5.116 | **3.808** (−26%) | 976.6 | 976.2 | 624.0 | 651.1 |
+| `smallfiles` | 23.480 | 25.280 (+8%) | 344.2 | 344.1 | 57.7 | 52.8 |
+
+Read with §4's "targets to re-measure, not promises" in mind: the ring's
+win shows up exactly where the bench said it would — the concurrent
+O_DIRECT 4 KiB lane, the one dominated by per-request cost — at **−26%
+daemon CPU per GiB**, well short of the bench's 4.7× because
+Constellation's own per-read work (manifest lookup, op lock, prefetch
+bookkeeping, memcache lookup) is most of what is being measured and is
+unchanged by the transport. The sequential lanes are a wash at this
+milestone, which is expected: Z2a is what makes a read reply ride the
+entry's own payload buffer (`ReplyData::fill`) instead of being copied into
+it, and `smallfiles` is per-open work, not per-read. Peak RSS is within
+0.8 MiB on every lane, which is the number the §4 decision above rests on.
+
+Gate verdict: no baseline existed for this host, so both legs **recorded**
+(`BASELINE WRITTEN`, to `/var/tmp/guest-read-cpu-{dev-fuse,auto}.json`,
+deliberately outside the repo — `tests/read-cpu-baseline.json` stays the
+32-CPU host's). Z2 is where the ring leg gets a committed baseline of its
+own, on a CI runner that can grant the ring.
+
+### One side-fix the gate forced: a too-large staging length is `EFBIG`, not `EIO`
+
+pjdfstest on the ring box failed two tests — `truncate/12.t:2` and
+`ftruncate/12.t:2` — **identically on both transports** (so: not a
+transport difference, which is what plan 38 §6's per-transport run is
+there to find). Both truncate a file to 999 999 999 999 999 bytes and
+accept `EFBIG`, `EINVAL` or success; Constellation answered **`EIO`**.
+
+The cause is not the transport and not the test: `view::staging_code`
+mapped every `StagingError::Io` to `Code::Io`, and a sparse `ftruncate` of
+the staging file is bounded by the **state directory's own filesystem**.
+The ring box's state directory is ext4, whose maximum file size is 16 TiB,
+so the backing `ftruncate` refuses with `EFBIG` — which the daemon then
+reported as `EIO`. The host's compliance lane never showed it because its
+state directory is ZFS, where the same `ftruncate` simply succeeds and the
+test takes its other branch (`expect 999999999999999 stat size`). Measured
+both ways, as root, inside the lane's own container: the mount answered
+`EIO` while the same ext4 answered `EFBIG` natively, and the file's size
+correctly stayed 0 either way.
+
+`staging_code` now passes a staging IO error through `Code::from_io_error`
+(the portable mapping CONVENTIONS.md names for "a real syscall's failure")
+and keeps the result **only** when it is `Code::FileTooBig`; every other
+staging IO error keeps today's `Code::Io`, so the write path's refusals are
+unchanged. Covered by `view::staging_code_tests` (the `EFBIG` kind maps to
+`FileTooBig`, four other kinds still map to `Io`, `Full` still maps to
+`NoSpace`). It cannot change anything on a host whose state directory has
+no such limit — on ZFS the error is never produced — which is why the
+host-side gates above stand unchanged.
+
+### Gates
+
+Host: this worktree, kernel 7.0.0-31, **`fuse.enable_uring=N`**,
+unprivileged, 32 CPUs, ZFS. Everything ring-specific can only *fall back*
+here, which is itself one of the two things the lane has to prove.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` / `cargo fmt --all -- --check` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo clippy --workspace --all-targets --features constellation-frontend-fuse/io-uring -- -D warnings` | clean |
+| `cargo test --workspace` | **1803 passed, 0 failed, 38 ignored** |
+| `cargo test --workspace --features constellation-frontend-fuse/io-uring` | **1803 passed, 0 failed, 38 ignored** (`--no-fail-fast`). Two earlier runs of this same tree each lost one *different* test to host load and passed it on re-run: `vfs::observe::tests::the_span_names_the_op_and_the_engine_events_nest_under_it` (it asserts a `debug!` event was recorded, which depends on the global max level that another test's scoped subscriber is raising and restoring concurrently) and `constellation-model`'s `design_is_clean_under_drift_with_the_margin` (a model check with a wall-clock budget; 30 s alone). Neither is this chunk's code, and the run above is green with both in it |
+| `cargo test --manifest-path vendor/fuser/Cargo.toml --lib` | **72 passed, 0 failed** |
+| `cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features io-uring` | **157 passed, 0 failed** (including `transport_parity_is_byte_for_byte`; the 18 real-kernel ring tests skip loudly on this `enable_uring=N` host) |
+| `tools/vendor-fuser.sh --check` | `ok: the patch set reproduces vendor/fuser exactly` (0.18.0 + patch 0001 + patch 0002) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | the floci body only: another worktree's compose project owns port 4566 and `docker compose up floci` cannot bind it (the coordinator's standing instruction is to reuse that endpoint, never to stop another session's container), so the lane ran as the script's own body — `AWS_ENDPOINT=http://localhost:4566` + `bash tests/smoke.sh s3://constellation-ci/run-…` → **SMOKE TEST PASSED** |
+| `target/release/harness run` (full matrix, seed 42) | Run **twice**: once before the `staging_code` fix below, and once on the final tree with freshly built release binaries. Both runs: **183 scenarios ran, 181 PASSED, 2 FAILED** — and only one of the two failures is the same in both. `subtree-confinement` fails deterministically in both, as it must on any unprivileged host: it sets `trusted.constellation.link_domain` with `setxattr(2)`, and the `trusted.*` namespace needs `CAP_SYS_ADMIN` (refused by the kernel's `xattr_permission` before the FUSE request is ever sent) — **it PASSES as root on the ring box, on the ring, in 1.5 s** (guest table). The other was a load-sensitive threshold each time, and each passes on a quiet re-run: `visibility-after-burst` (a poller may issue at most 4 S3 tail GETs during the markers once streams are up; it saw 17 under the load of two other sessions plus the ring guest, 1 on the re-run, against 1 526 with streams off) and `distant-bigfile-stable` (worst post-ramp-up 4 MiB block at 8.6 MiB/s against a 10.0 MiB/s floor while the mean was 1 175.7 MiB/s — the host and guest matrices were deliberately running at the same time; it PASSED on a quiet re-run afterwards, in 10.8 s). `transport-detach-refused` PASSED in both runs, on its fallback outcome (`negotiated dev_fuse; expecting the handover to be served`, 8 370 ops through the upgrade, longest syscall 170 ms) |
+| `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed** — COMPLIANCE TEST PASSED (baseline: 0 known failures), with the lane's new evidence line: `FUSE transport: dev_fuse (asked for dev-fuse)`. Run twice, before and after the `staging_code` fix, with the image rebuilt each time; identical both times. The compose project publishes nothing (a scratch `-f` override resets floci's `ports`, since another worktree owns :4566) and waits for the bucket the init hook creates before the suite runs — without that wait the first attempt raced it and died on `NoSuchBucket` |
+| `tests/read-cpu-gate.sh` (one lane, to exercise the new field) | `warm-mem-seq-1m r1 [dev_fuse]: 4266.7 MiB/s 0.16 cpu-s/GiB`, `"negotiated":"dev_fuse"` in the JSON line |
+
+Guest (`$RING_BOX` = `vm614`): Ubuntu 26.04, kernel 7.0.0-34,
+**`fuse.enable_uring=Y`**, 8 CPUs (→ 6 FUSE workers), 8 GiB RAM, ext4,
+binaries built `--features constellation-frontend-fuse/io-uring`.
+
+| Command | Result |
+|---|---|
+| `cargo build --release --features constellation-frontend-fuse/io-uring -p constellation -p constellation-harness -p constellation-chaos` | ok |
+| `CONSTELLATION_FUSE_TRANSPORT=dev-fuse bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `CONSTELLATION_FUSE_TRANSPORT=auto bash tests/smoke.sh` | SMOKE TEST PASSED (on the ring) |
+| `cargo test -p constellation-frontend-fuse --features io-uring` | passed (0 failed) |
+| `cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features io-uring` | **157 passed, 0 failed** — on this box the 18 real-kernel ring tests actually run, and the fork's own `fuse_over_io_uring_tests_ran` guard would fail if they had skipped on an `enable_uring=Y` kernel |
+| `TRANSPORTS="dev-fuse auto" tests/transport-matrix.sh` | **TRANSPORT MATRIX PASSED (dev-fuse auto)** — 11 scenarios per leg, ALL SCENARIOS PASSED on both. `transport-detach-refused` negotiated **`uring`** on both legs (it asks for `auto` itself) and took the **refusal** outcome: 6 522 / 6 607 ops through the attempted upgrade, longest syscall 69 / 66 ms, no load error, no mountpoint gap, every byte verified before and after a remount |
+| `CONSTELLATION_FUSE_TRANSPORT=auto target/release/harness run` (full matrix) | Run **twice** (before and after the `staging_code` fix). Final run: **181 PASSED, 2 FAILED** — `subtree-confinement` (the same root-only `trusted.*` xattr; **PASSES under `sudo` on the ring**, 1.5 s) and `s3-cut-one-node`, which is this chunk's one genuine transport finding (next section). The earlier run had 177 PASSED / 4 FAILED; all four were re-examined on both legs and none is a transport difference except `s3-cut-one-node`: `unmount-with-held-records` passes on a re-run on both transports (10.5 s / 9.0 s against 123 s when starved in the matrix), `visibility-after-burst` is the same latency-threshold flake as on the host (and fails in a different place each time on an 8-CPU box), and `ack-s3-failover` failed **identically on both transports** on this box (`B does not hold a newer epoch`, `expires_in_ms: 0` — an epoch-takeover deadline this guest misses; it PASSED on the 32-CPU host and passed again in the final guest run). `transport-detach-refused` PASSED on the ring in both runs (3 555 and 5 957 ops through the attempted upgrade, longest syscall 78 / 91 ms) |
+| `make compliance-uring` (pjdfstest, `CONSTELLATION_FUSE_TRANSPORT=auto`, `seccomp:unconfined`) | **8798 passed, 0 failed** — COMPLIANCE TEST PASSED, with `FUSE transport: uring (asked for auto)` on its own first line: the ring really carried all 8 798. The `dev-fuse` control run in the same container is **8798 passed, 0 failed** too (`FUSE transport: dev_fuse`) |
+| `tests/read-cpu-gate.sh`, both legs | recorded, table above (`BASELINE WRITTEN`, no baseline for this host) |
+| ring RSS, idle and under load, both legs | measured, table above |
+
+The container really does get the ring, which is the one thing the
+`compliance-uring` service exists to make true: inside it, with
+`seccomp:unconfined`, `node.status` reports `"transport": "uring"` and the
+daemon logs `FUSE transport transport="uring"`. Without the relaxation
+Docker's default profile blocks `io_uring_setup(2)` and the mount would
+fall back silently — which is why `tests/compliance.sh` now prints the
+negotiated transport on every run.
+
+### The finding the lane was built to produce: `s3-cut-one-node` stalls on the ring
+
+One scenario behaves **differently on the two transports**, which is
+exactly what plan 38 §6 built the matrix lane to surface ("a
+transport-specific regression shows up as a scenario failing on exactly
+one lane"). On the ring box, `s3-cut-one-node` — a node whose S3 is cut
+while a `--write-mode back` close is in flight, asserting that a metadata
+op on that node does not block for more than 5 s — fails about half the
+time over the ring and never over `/dev/fuse`:
+
+| leg | runs | result |
+|---|---|---|
+| `CONSTELLATION_FUSE_TRANSPORT=auto` (negotiated `uring`) | 10 | **5 PASSED, 5 FAILED** (`stat of the root on C blocked > 5s while a close was in flight`, or the same for an `ls -la` of the closing file's directory) |
+| `CONSTELLATION_FUSE_TRANSPORT=dev-fuse` | 8 | **8 PASSED** |
+
+Eight consecutive `/dev/fuse` passes against a one-in-two failure rate is
+a 0.4% coincidence, so this is a transport difference, not the box being
+slow. The review reproduced it independently (`auto`: seeds 1–3 PASS,
+**seed 4 FAILS** with "ls -la of the closing file's own directory on C
+blocked > 5s"; `dev-fuse`: seeds 4–7 all PASS).
+
+**Cause** (confirmed in the source by the review): fuser's
+`SessionEventLoop::handle_fetch` (`vendor/fuser/src/session.rs`, ~1312-1330,
+now carrying a `TODO(38-z2a)`) runs `req.dispatch(self)` **synchronously on
+the ring's own thread**. The kernel queues a request on the queue of the CPU
+that submitted it, and each queue is served by exactly one of fuser's
+per-worker rings. Constellation's adapter (`crates/frontend-fuse/src/adapter.rs`)
+only hands locks and cold reads to other threads, so a flush/release (or
+fsync) waiting on a cut S3 blocks every request the kernel put on that
+ring's queues — a `stat` or `ls` of an unrelated path included. The
+`/dev/fuse` transport has no such affinity: N workers read the same
+connection and a free one picks the next request up. Raising the worker
+count (`CONSTELLATION_FUSE_THREADS=24`) did **not** help, as expected: a
+queue still belongs to one ring.
+
+**Owner: Z2a (coordinator decision in the Z1b review).** Z2a takes blocking
+operations off the ring thread — flush/release/fsync and anything else that
+can wait on S3 — or hands fetched entries to a worker pool, and its gate is
+**`s3-cut-one-node` seeds 1–8 passing on `auto`** (negotiated `uring`). Z2c
+keeps it as a hard gate before `Auto` becomes a default. The scenario is
+left **failing and un-weakened** on the ring leg, and
+`--fuse-transport auto` / `CONSTELLATION_FUSE_TRANSPORT=auto` carries an
+"experimental, not for production until plan 38 Z2" warning in
+`docs/reference/configuration.md`. Nothing reaches the ring today without an
+explicit `auto`: `TransportPolicy` still defaults every mount to `DevFuse`.
+
+### Known failures owned elsewhere
+
+Seen in the full matrices of this chunk and its review, **not transport
+findings** and not Z1b's; a separate `box-gates` chunk triages host vs code:
+
+- `git-under-flock-causal` — a reader saw publications before the objects
+  they depend on. Fails on `dev-fuse` too (478.9 s in the review's run), so
+  not the ring; a consistency failure the coordinator is tracking.
+- `fio-blips` — EIO on fsync; `auto` 5/18, `dev-fuse` 1/12 in the review.
+  Present before this change, more frequent on the ring.
+- `subtree-confinement` — needs `CAP_SYS_ADMIN` (`trusted.*` xattr);
+  fails unprivileged, passes as root on both transports.
+
+### Exit criteria (plan 38 §9 item 3, and §7's Z1)
+
+- [x] `patches/0002-io-uring-transport.patch` exists, every hunk marked
+      `CONSTELLATION PATCH (io-uring)`, and re-applies cleanly through
+      `tools/vendor-fuser.sh --check` (byte-identical tree).
+- [x] Every REPORTED claim §3(a) depends on re-verified by the stated
+      rubric, and the vendor-vs-rewrite decision recorded
+      (`vendor/fuser/CONSTELLATION-PATCH.md`, "Where it came from, and the
+      rubric that let it in"; verdict **VENDOR**).
+- [x] The `io-uring` feature builds and is **off by default**; with it on,
+      no mount asks for the ring unless its policy is `Auto`, and no
+      mount's policy is `Auto` at this milestone.
+- [x] `NegotiatedInit.transport` and the `detach`/`check_resumable`
+      refusal of non-`DevFuse` sessions landed with the transport (Z1a),
+      and `daemon --upgrade` now refuses by name in its preflight (Z1b).
+- [ ] **Ring leg: not met — moved to Z2a.** Harness green on both
+      transports when explicitly selected via `CONSTELLATION_FUSE_TRANSPORT`:
+      the matrix lane's two legs are green on the ring box (11 scenarios
+      each) and the full matrix is 181/183 on both boxes, **but
+      `s3-cut-one-node` fails on the ring leg** (one blocked flush/release on
+      a ring thread stalls unrelated requests on that queue during an S3
+      cut; previous sections). Left failing rather than weakened; Z2a owns
+      the fix with `s3-cut-one-node` seeds 1–8 on `auto` as its gate.
+- [x] `dev-fuse` leg: harness green apart from the failures owned
+      elsewhere (above), which fail identically on both transports or need
+      root.
+- [x] pjdfstest on both transports: **8798/8798 on `dev_fuse`** (host lane, and the ring box's control run) and **8798/8798 on `uring`** (ring box, `make compliance-uring`), no exceptions added, baseline still 0 known failures
+- [x] The `tests/wire.rs`-style transport-parity test exists and runs
+      without a kernel (`transport_parity_is_byte_for_byte`).
+- [x] Report carries the harness summary lines, the pjdfstest tallies, the
+      fio gate's CPU-s/GiB and RSS per transport, and which legs ran
+      (§9 item 8).
+
+### Review fix round (Z1b)
+
+| Finding | Resolution |
+|---|---|
+| Must 1: ring thread stalls unrelated requests | Moved to **Z2a** by the coordinator (above). `TODO(38-z2a)` at `handle_fetch`'s dispatch (`vendor/fuser/src/session.rs`, carried in patch 0002, `--check` clean); `auto` marked experimental in `docs/reference/configuration.md` |
+| Should 1: refusal assertion could not fail | `transport-detach-refused` asserts `served over {negotiated}` (the per-mount part), not the bare transport name the message's generic "io_uring" already contains |
+| Should 2: lane built without the ring | `make transport-matrix` / `harness-transport-matrix` set `CARGO_FEATURES=constellation-frontend-fuse/io-uring` (target-specific; `FEATURE_FLAGS` is now recursively expanded so it applies). On a host with `fuse.enable_uring=Y` and `kernel.io_uring_disabled=0` the script exports `CONSTELLATION_FUSE_EXPECT_URING=1` and always runs `transport-detach-refused`, which fails if `auto` negotiated `dev_fuse`. Checked both ways on a ring host: feature build PASSES (negotiated `uring`), non-feature build FAILS the lane (rc 1) |
+| Should 3: pin only at construction | `mount_source`'s `PreopenedFd` branch forces `config.io_uring = false` and `debug_assert!`s `is_handover_capable()`. The `handover_probe` example that landed on main with Z1a's `io_uring` field now builds its options with `MountOptions::handover_capable` |
+| Should 4: resumed mounts never logged the ignored knob | `resume_mount` and `resume_in_place` pass `node.fuse_transport`; checked by hand (non-feature build, `CONSTELLATION_FUSE_TRANSPORT=auto`, `daemon --upgrade`): the resumed view logs "served over /dev/fuse whatever the transport knob asks for … asked=auto" |
+| Nit 1 | `memcache_counters`' doc comment moved back onto it in `tests/read-cpu-gate.sh` |
+| Nit 2 | `mount` attaching to a running daemon warns on stderr that `--fuse-transport`/`--fuse-uring-queue-depth` are ignored |
+
+Gates this round (ring host, kernel 7.3.0-rc4, `fuse.enable_uring=Y`):
+fmt clean; clippy `-D warnings` clean with and without the feature;
+`cargo test` every workspace crate (split by crate) 0 failed;
+`cargo test -p constellation-frontend-fuse --features io-uring` ok;
+`vendor/fuser` lib tests 157/0 (feature) and 72/0; `tools/vendor-fuser.sh
+--check` ok; `tests/smoke.sh` PASSED on `dev-fuse` and `auto`;
+`make transport-matrix TRANSPORTS="dev-fuse auto"`: TRANSPORT MATRIX PASSED
+(11/11 per leg, `transport-detach-refused` negotiated `uring` on both);
+`transport-detach-refused` + `session-handover-idle` PASSED on both legs.
+No full harness matrix this round (coordinator).
+
+### Not done here (deliberately)
+
+`TransportPolicy::Auto` is **not** the default for anything — Z2c flips
+plain mounts, and until then the ring is reached only by an explicit
+`auto`. No `ReadReply`/`WriteData` change (Z2a owns `ReplyData::fill`, and
+it is what the sequential lanes above are waiting for), no `transport`
+metric label and no `fuse` section in `node.status` beyond the one
+per-mount field (Z2b), no passthrough (Z3), no zero-copy (Z4). The 7.3
+zero-copy lane and `uring_zc` remain a name with no code behind it.

@@ -36,6 +36,11 @@ struct Cli {
     command: Command,
 }
 
+// `Mount` carries every daemon flag there is, so it is far larger than
+// the other variants. One of these is parsed per process, on the stack of
+// `main`, and `Box`ing it would buy a heap allocation and cost clap's
+// flat `#[arg]` ergonomics for every flag.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Filesystem lifecycle.
@@ -117,6 +122,29 @@ enum Command {
         /// read. CONSTELLATION_CACHE_VERIFY supplies the default.
         #[arg(long)]
         cache_verify: Option<String>,
+        /// FUSE transport for this daemon's plain mounts (plan 38 §2.4):
+        /// "dev-fuse" (the default) is the `/dev/fuse` `writev` path every
+        /// kernel and platform has; "auto" runs the transport ladder,
+        /// taking FUSE-over-io_uring when this build, the running kernel
+        /// (6.14+ with `fuse.enable_uring=Y`) and the process's sandbox
+        /// all grant it, and falling back to `/dev/fuse` — logged, and
+        /// visible in `node.status` — whenever one of them does not. A
+        /// mount that ends up on a ring **cannot be handed over**, so
+        /// `daemon --upgrade`/`node.handoff` refuses to detach it;
+        /// mounts somebody else handed us a descriptor for stay on
+        /// `/dev/fuse` regardless. CONSTELLATION_FUSE_TRANSPORT supplies
+        /// the default. Node-wide, not per-view: a `mount` that attaches a
+        /// view to an already-running daemon cannot change it.
+        #[arg(long)]
+        fuse_transport: Option<String>,
+        /// Ring entries per kernel queue when the transport is a ring
+        /// (default 8). The ring's memory budget is
+        /// `queues x depth x payload` (plan 38 §4), so this is the knob
+        /// for an operator who has measured their own RSS/throughput
+        /// trade-off. CONSTELLATION_FUSE_URING_QUEUE_DEPTH supplies the
+        /// default.
+        #[arg(long)]
+        fuse_uring_queue_depth: Option<usize>,
         /// Mount a snapshot selector through an automatically created clone.
         #[arg(long)]
         rw: bool,
@@ -940,6 +968,8 @@ fn main() -> Result<()> {
         read_only_member,
         atime,
         cache_verify,
+        fuse_transport,
+        fuse_uring_queue_depth,
         rw,
         clone_name,
         ephemeral,
@@ -965,6 +995,8 @@ fn main() -> Result<()> {
                 read_only_member,
                 atime,
                 cache_verify,
+                fuse_transport,
+                fuse_uring_queue_depth,
                 rw,
                 clone_name,
                 ephemeral,
@@ -1711,6 +1743,8 @@ struct MountArgs {
     read_only_member: bool,
     atime: Option<String>,
     cache_verify: Option<String>,
+    fuse_transport: Option<String>,
+    fuse_uring_queue_depth: Option<usize>,
     rw: bool,
     clone_name: Option<String>,
     ephemeral: bool,
@@ -1824,6 +1858,8 @@ fn cmd_mount(
         read_only_member,
         atime,
         cache_verify,
+        fuse_transport,
+        fuse_uring_queue_depth,
         rw,
         clone_name,
         ephemeral,
@@ -1858,6 +1894,28 @@ fn cmd_mount(
             );
         }
     }
+    // Plan 38 §4. Resolved here, before the fork, for the same reason
+    // `--cache-verify` is: a typo must reach this terminal. Unlike
+    // `--cache-verify`, a bad *env* value is an error too
+    // (`TransportConfig::resolve`'s doc says why): an ignored `auto`
+    // silently leaves the kernel's fast path off, which is the opposite
+    // of what whoever set it asked for.
+    let fuse_transport_flag = match fuse_transport.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            constellation_frontend_fuse::TransportPolicy::parse(raw).ok_or_else(|| {
+                anyhow::anyhow!("invalid --fuse-transport {raw:?} (expected auto or dev-fuse)")
+            })?,
+        ),
+    };
+    if fuse_uring_queue_depth == Some(0) {
+        bail!("invalid --fuse-uring-queue-depth 0 (expected a positive integer)");
+    }
+    let fuse_transport = constellation_frontend_fuse::TransportConfig::resolve(
+        fuse_transport_flag,
+        fuse_uring_queue_depth,
+    )
+    .map_err(anyhow::Error::msg)?;
     // Plan 30 §M14: refuse an explicit `--locks cluster` with P2P turned
     // off here, before forking (the daemon re-checks against the endpoint
     // it actually started).
@@ -2073,6 +2131,15 @@ fn cmd_mount(
     // the terminal); both are skipped when a daemon already serves this
     // state dir (we will attach, not unlock).
     let mount_passphrase = if daemon_socket_is_live(&state_dir) {
+        // The transport is the daemon's, fixed when it started: the views
+        // this invocation attaches are served the way it serves its own.
+        if fuse_transport_flag.is_some() || fuse_uring_queue_depth.is_some() {
+            eprintln!(
+                "warning: a daemon already serves this state dir; --fuse-transport and \
+                 --fuse-uring-queue-depth are ignored (the new views get the transport that \
+                 daemon started with; `constellation status` reports each mount's)"
+            );
+        }
         None
     } else {
         let check = check_fs_before_mount(&node_s3, registered_endpoint.as_deref(), &pin_target)?;
@@ -2104,6 +2171,7 @@ fn cmd_mount(
             read_only_member,
             atime_mode,
             cache_verify,
+            fuse_transport,
             web_ui.unwrap_or(0),
             log_buffer,
             views,
@@ -2124,6 +2192,7 @@ fn cmd_mount(
                 read_only_member,
                 atime_mode,
                 cache_verify,
+                fuse_transport,
                 web_ui.unwrap_or(0),
                 log_buffer,
                 views,
@@ -2197,6 +2266,8 @@ fn cmd_mount_body(
     read_only_member: bool,
     atime_mode: crate::atime::AtimeMode,
     cache_verify: Option<constellation_fs_core::cache::CacheVerify>,
+    // Plan 38 Z1b: the transport knob, already resolved (env over flag).
+    fuse_transport: constellation_frontend_fuse::TransportConfig,
     web_ui: u16,
     log_buffer: log_buffer::LogBuffer,
     views: Vec<ViewSpec>,
@@ -2417,6 +2488,7 @@ fn cmd_mount_body(
                     web_ui,
                     log_buffer,
                     resumed: None,
+                    fuse_transport,
                 },
                 handle,
             ) {
@@ -3470,6 +3542,7 @@ mod umount_tests {
                 web_ui: 0,
                 log_buffer: log_buffer::LogBuffer::default(),
                 resumed: None,
+                fuse_transport: Default::default(),
             },
             rt.handle().clone(),
         )

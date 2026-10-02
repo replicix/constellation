@@ -1790,8 +1790,11 @@ accounting), which is also the only shape that exercises the fetch path.
 | `smallfiles` | 4096 × 64 KiB files read sequentially over an empty disk cache: the per-open cost |
 
 One JSON line per lane per repeat goes to `$READ_CPU_OUT` (bandwidth,
-IOPS, clat p50/p99, daemon CPU, CPU-s/GiB, RSS, peak RSS, wall time, and
-the `CONSTELLATION_FUSE_TRANSPORT` the lane ran under). The median of
+IOPS, clat p50/p99, daemon CPU, CPU-s/GiB, RSS, peak RSS, wall time, the
+`CONSTELLATION_FUSE_TRANSPORT` the lane was *asked* for, and the
+`negotiated` transport `node.status` reports for the mount — `auto` is a
+request, and a leg that fell back to `dev_fuse` says so in its own
+numbers instead of being taken on trust). The median of
 `READ_CPU_REPEATS` (3) is compared with `tests/read-cpu-baseline.json`
 and fails only on a **large** regression — 4× the baseline's CPU per GiB,
 1.5× its peak RSS, plus a small absolute slack. The spread is the reason:
@@ -1827,30 +1830,110 @@ until plan 38's Z1 establishes a runner baseline.
 
 ## FUSE transport matrix (plan 38 §6)
 
+Constellation serves a Linux mount over one of two transports, chosen at
+mount time and fixed for the connection's life:
+
+| `CONSTELLATION_FUSE_TRANSPORT` / `--fuse-transport` | what a mount gets |
+|---|---|
+| `dev-fuse` (**the default**) | `read(2)`/`writev(2)` on `/dev/fuse`: every kernel, every platform |
+| `auto` | plan 38 §2.4's ladder — FUSE-over-io_uring when the binary carries the `io-uring` cargo feature, the kernel is 6.14+ with `fuse.enable_uring=Y`, and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once and reported in `node.status` |
+
+What a mount *negotiated* is in `node.status`'s per-mount `transport`
+field (`dev_fuse` / `uring` / `uring_zc`) and in the daemon's log
+(`FUSE transport`), so an `auto` mount that fell back is visible rather
+than assumed. Mounts that can be handed to another process image — a
+`view.mount` on a descriptor somebody else opened, and anything
+`daemon --upgrade` resumes — are `dev_fuse` whatever the knob says
+(§3(e): a ring session cannot be detached at all; the constructor that
+builds their `MountOptions` takes a `HandoverCapable` marker and pins it).
+
 `tests/transport-matrix.sh` (`make transport-matrix`) runs the read-path
-harness scenarios once per FUSE transport, so a transport-specific
-regression fails one leg instead of everything:
+harness scenarios once per transport, so a transport-specific regression
+fails one leg instead of everything:
 
 ```bash
-TRANSPORTS="dev-fuse" tests/transport-matrix.sh        # today's only leg
+tests/transport-matrix.sh                              # both legs
+TRANSPORTS="dev-fuse" tests/transport-matrix.sh        # one leg
 SCENARIOS="cold-cache readahead" tests/transport-matrix.sh
+SCENARIOS=all tests/transport-matrix.sh                # the full matrix per leg
 READ_CPU_GATE=1 tests/transport-matrix.sh              # + the cost gate per leg
+make harness-transport-matrix                          # = SCENARIOS=all
 ```
 
 Each leg exports `CONSTELLATION_FUSE_TRANSPORT` and writes
-`target/transport-matrix/<transport>.json`. Only **`dev-fuse`** — the
-`/dev/fuse` `writev` path Constellation has always used — exists today;
-`auto`/`uring`/`uring-zc` SKIP loudly until plan 38's Z1 vendors the
-io_uring transport, at which point `TRANSPORTS="dev-fuse auto"` is the CI
-invocation and the script needs no change. Until Z1 the env var is a name
-this lane sets and nothing in the daemon reads — it is recorded in each
-leg's results so the legs are distinguishable once they differ.
+`target/transport-matrix/<transport>.json`. **Neither leg ever skips.**
+`make transport-matrix` / `make harness-transport-matrix` build the binaries
+with the ring in; running the script directly needs them built that way:
 
-It is **not** a CI lane yet, deliberately: with one leg it runs scenarios
-the nightly fault-injection lane already runs, under an env var nothing
-reads. Z1 adds the `auto` leg and with it the reason to spend the CI time;
-until then it is run by hand (`make transport-matrix`) when touching the
-read path.
+```bash
+make build-uring     # = cargo build --release --features constellation-frontend-fuse/io-uring
+```
+
+On a kernel below 6.14, with `fuse.enable_uring=N`, or under a seccomp
+profile that denies `io_uring_setup`, the `auto` leg runs as a *fallback*
+leg, and still has to pass — that is the ladder's own promise, and the one
+property the lane can check on every host. On a host that **does** grant the
+ring (`fuse.enable_uring=Y`, `kernel.io_uring_disabled=0`) a fallback is a
+failure: the script exports `CONSTELLATION_FUSE_EXPECT_URING=1`, always
+runs `transport-detach-refused`, and that scenario fails if `auto`
+negotiated `dev_fuse` (typically a binary built without the feature).
+`EXPECT_URING=0|1` overrides the detection.
+
+The `transport-detach-refused` scenario is in the default list and is how
+each leg says what it negotiated (`the mount asked for auto and
+negotiated <transport>`). It is **one scenario with two expected
+outcomes**, keyed on that answer: on a ring session `daemon --upgrade`
+must be refused with an error naming the transport, losing no request and
+leaving the mount serving under the same pid and generation; on a session
+that fell back to `dev_fuse` the handover must succeed. Either way a
+writer, a creator and a reader run throughout and every byte they wrote
+must be there afterwards, before and after a remount.
+
+### pjdfstest on both transports
+
+POSIX compliance is gated per transport (plan 38 §6), still 8798/8798
+with no exceptions:
+
+```bash
+docker compose --profile test run --rm compliance          # dev-fuse
+make compliance-uring                                     # auto
+```
+
+`compliance-uring` is a separate compose service and image because the
+ring needs two things the default suite container does not have: the
+`io-uring` feature in the binary (a `CARGO_FEATURES` build arg) and
+`seccomp:unconfined`. Docker's default seccomp profile blocks
+`io_uring_setup(2)` outright, and a blocked setup leaves nothing in
+sysfs to see — the mount would quietly fall back and the lane would pass
+while testing nothing (plan 38 §8). The relaxation is on that service
+only; `smoke`/`compliance`/`stress` keep running under an ordinary
+container profile on purpose.
+
+Each run prints the transport it actually negotiated before it starts
+(`FUSE transport: uring (asked for auto)`), read back from `node.status`:
+`auto` is a request, and a run that fell back would otherwise be mistaken
+for ring coverage. On a 6.14+ `enable_uring=Y` host the `auto` lane is
+8798/8798 over the ring; on an older kernel it is 8798/8798 over
+`/dev/fuse`, and says so.
+
+### Where the ring is tested without a kernel
+
+`vendor/fuser`'s own suite carries the transport's unit coverage
+(`cargo test --manifest-path vendor/fuser/Cargo.toml --features io-uring`):
+the entry state machine, the staging layout against the ABI, the reply
+paths, and — without any io_uring at all, over an entry in an ordinary
+private mapping — that the *same* request bytes dispatched over
+`/dev/fuse` and over a ring entry produce **byte-identical** replies
+(`transport_parity_is_byte_for_byte`, plan 38 §6's "`tests/wire.rs`-style
+adapter test ... identical regardless of transport"). 18 further ring
+tests mount a real kernel mount and skip loudly on a
+`fuse.enable_uring=N` host; the fork's `fuse_over_io_uring_tests_ran`
+guard fails if the kernel advertises the flag while they skipped, so a
+silently-never-exercised ring cannot pass as green.
+`crates/frontend-fuse/tests/wire.rs` stays transport-independent by
+construction: it drives `FuseFs` through fuser's decode/encode over a
+socket pair, and the parity test above is what says the ring's seam
+produces the same bytes.
 
 ## Cross-node `flock`/`fcntl` (plan 30 M14)
 

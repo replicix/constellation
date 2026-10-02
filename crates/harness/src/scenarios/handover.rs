@@ -15,8 +15,14 @@
 //!   and `EIO` included) for every syscall, every write lands (the file is
 //!   compared byte for byte with what was written, before and after a
 //!   remount), and each upgrade's stall is reported.
+//!
+//! Both pin their mount to `/dev/fuse` (plan 38 §3(e)): a handover is a
+//! `/dev/fuse`-only capability, so a leg of the transport matrix lane
+//! running with `CONSTELLATION_FUSE_TRANSPORT=auto` must not turn these
+//! into tests of a refusal. `transport-detach-refused` (`super::transport`)
+//! is the scenario for the refusal.
 
-use super::{one_client, setup, ts};
+use super::{setup, ts};
 use crate::client::Client;
 use crate::model::Model;
 use crate::workload::Workload;
@@ -29,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-fn bin() -> PathBuf {
+pub(super) fn bin() -> PathBuf {
     std::env::var_os("CONSTELLATION_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -40,23 +46,47 @@ fn bin() -> PathBuf {
         })
 }
 
+/// A client whose mount is **handover-capable**, which on plan 38's
+/// ladder means `/dev/fuse`: `CONSTELLATION_FUSE_TRANSPORT=dev-fuse`,
+/// explicitly, so these scenarios keep testing the handover on the
+/// transport handover exists on even when the whole lane runs with
+/// `=auto` (plan 38 §3(e): a ring session refuses to be detached, and
+/// `transport-detach-refused` is the scenario for *that*). Not a
+/// weakening: a daemon whose plain mounts are on a ring cannot be
+/// upgraded in place either, by design.
+fn dev_fuse_client(env: &crate::s3env::S3Env, root: &Path, prefix: &str) -> Result<Client> {
+    let backend = format!("s3://{}/{prefix}", crate::s3env::BUCKET);
+    let mut c = Client::new(root, "c0", &env.endpoint, &backend)?
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", "dev-fuse");
+    c.fs_create()?;
+    c.mount()?;
+    Ok(c)
+}
+
 /// The daemon's handover generation, from its control socket.
-fn generation(c: &Client) -> Result<u64> {
+pub(super) fn generation(c: &Client) -> Result<u64> {
     let status = c.control_status()?;
     status["handover"]["generation"]
         .as_u64()
         .context("status has no handover.generation")
 }
 
-/// `constellation daemon --upgrade --state-dir <state>` (the daemon
-/// re-execs the binary it was started from). Returns the time it took.
-fn upgrade(c: &Client) -> Result<Duration> {
-    let started = Instant::now();
-    let out = std::process::Command::new(bin())
+/// `constellation daemon --upgrade --state-dir <state>` as a child
+/// process, whatever it answers: the caller decides whether a refusal is
+/// the expected outcome (`transport-detach-refused`) or a failure.
+pub(super) fn try_upgrade(c: &Client) -> Result<std::process::Output> {
+    std::process::Command::new(bin())
         .args(["daemon", "--upgrade", "--timeout-s", "120", "--state-dir"])
         .arg(c.state_dir())
         .output()
-        .context("running daemon --upgrade")?;
+        .context("running daemon --upgrade")
+}
+
+/// [`try_upgrade`] that must succeed (the daemon re-execs the binary it
+/// was started from). Returns the time it took.
+fn upgrade(c: &Client) -> Result<Duration> {
+    let started = Instant::now();
+    let out = try_upgrade(c)?;
     let took = started.elapsed();
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
@@ -76,13 +106,13 @@ fn upgrade(c: &Client) -> Result<Duration> {
 
 /// `stat`s the mountpoint every 5 ms until stopped: every error, and every
 /// `st_dev` other than the first, is a gap the kernel showed.
-struct Watcher {
+pub(super) struct Watcher {
     stop: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<Vec<String>>,
 }
 
 impl Watcher {
-    fn start(mnt: &Path) -> Result<Watcher> {
+    pub(super) fn start(mnt: &Path) -> Result<Watcher> {
         let dev = std::fs::metadata(mnt)?.dev();
         let mnt = mnt.to_path_buf();
         let stop = Arc::new(AtomicBool::new(false));
@@ -108,7 +138,7 @@ impl Watcher {
         Ok(Watcher { stop, thread })
     }
 
-    fn finish(self) -> Vec<String> {
+    pub(super) fn finish(self) -> Vec<String> {
         self.stop.store(true, Ordering::SeqCst);
         self.thread
             .join()
@@ -116,7 +146,7 @@ impl Watcher {
     }
 }
 
-fn daemon_cmdline(pid: u32) -> String {
+pub(super) fn daemon_cmdline(pid: u32) -> String {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
         .unwrap_or_default()
@@ -125,7 +155,7 @@ fn daemon_cmdline(pid: u32) -> String {
 pub fn session_handover_idle(seed: u64) -> Result<()> {
     let (env, root) = setup("handover-idle")?;
     let _proxy = env.s3_proxy()?;
-    let mut c = one_client(&env, root.path(), &format!("handover-idle-{}", ts()))?;
+    let mut c = dev_fuse_client(&env, root.path(), &format!("handover-idle-{}", ts()))?;
     let result = (|| -> Result<()> {
         let mut model = Model::default();
         let mut wl = Workload::new(seed, "w");
@@ -213,13 +243,13 @@ fn record(seed: u64, i: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-struct Load {
-    stop: Arc<AtomicBool>,
-    errors: Arc<Mutex<Vec<String>>>,
+pub(super) struct Load {
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) errors: Arc<Mutex<Vec<String>>>,
     /// The longest a single syscall of the load took.
-    max_stall_us: Arc<AtomicU64>,
-    ops: Arc<AtomicU64>,
-    threads: Vec<std::thread::JoinHandle<Result<u64>>>,
+    pub(super) max_stall_us: Arc<AtomicU64>,
+    pub(super) ops: Arc<AtomicU64>,
+    pub(super) threads: Vec<std::thread::JoinHandle<Result<u64>>>,
 }
 
 impl Load {
@@ -236,7 +266,7 @@ const RECORD: usize = 4096;
 /// Start the writer (appends records through one descriptor held open,
 /// `fsync`ing every 16), the creator (new files, written and closed) and
 /// the reader (re-reads a file through a held descriptor).
-fn start_load(mnt: &Path, seed: u64) -> Result<Load> {
+pub(super) fn start_load(mnt: &Path, seed: u64) -> Result<Load> {
     let stop = Arc::new(AtomicBool::new(false));
     let errors = Arc::new(Mutex::new(Vec::new()));
     let max_stall_us = Arc::new(AtomicU64::new(0));
@@ -340,7 +370,7 @@ fn start_load(mnt: &Path, seed: u64) -> Result<Load> {
 }
 
 /// Every record of `appended` and every created file, as written.
-fn verify_load(mnt: &Path, seed: u64, appended: u64, created: u64) -> Result<()> {
+pub(super) fn verify_load(mnt: &Path, seed: u64, appended: u64, created: u64) -> Result<()> {
     let mut file = std::fs::File::open(mnt.join("appended"))?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
@@ -368,7 +398,7 @@ fn verify_load(mnt: &Path, seed: u64, appended: u64, created: u64) -> Result<()>
 pub fn upgrade_under_load(seed: u64) -> Result<()> {
     let (env, root) = setup("handover-load")?;
     let _proxy = env.s3_proxy()?;
-    let mut c = one_client(&env, root.path(), &format!("handover-load-{}", ts()))?;
+    let mut c = dev_fuse_client(&env, root.path(), &format!("handover-load-{}", ts()))?;
     let result = (|| -> Result<()> {
         let pid = c.pid().context("no daemon pid")?;
         let first = generation(&c)?;

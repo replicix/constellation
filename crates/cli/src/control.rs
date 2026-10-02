@@ -129,6 +129,7 @@ impl ControlHost for DaemonHost {
                     max_staging_bytes: m.qos.max_staging_bytes,
                 },
                 confine_links: m.confine_links,
+                transport: Some(m.transport.name().to_string()),
                 view: Some(m.view),
             })
             .collect()

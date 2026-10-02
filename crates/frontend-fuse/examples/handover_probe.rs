@@ -60,8 +60,8 @@
 //! non-zero exit, not just a line in the JSON.
 
 use constellation_frontend_fuse::{
-    caps, mount_source, FuseHandoff, FuseSession, KernelTuning, MountOptions, MountSource,
-    SessionControl, SessionExit,
+    caps, mount_source, FuseHandoff, FuseSession, HandoverCapable, KernelTuning, MountOptions,
+    MountSource, SessionControl, SessionExit, TransportConfig,
 };
 use constellation_types::Code;
 use constellation_vfs::{
@@ -707,15 +707,17 @@ struct Live {
 }
 
 fn options(fs_name: &str, threads: usize) -> MountOptions {
-    MountOptions {
-        fs_name: fs_name.to_string(),
-        allow_other: true,
-        read_only: false,
-        n_threads: threads,
-        tuning: KernelTuning::for_workers(threads),
-        // The probe exercises the /dev/fuse handover: a ring session is never handed over.
-        io_uring: false,
-    }
+    // The probe exercises the /dev/fuse handover: a ring session is never
+    // handed over, and the marker pins the transport to say so.
+    let mut opts = MountOptions::handover_capable(
+        fs_name,
+        threads,
+        KernelTuning::for_workers(threads),
+        TransportConfig::default(),
+        HandoverCapable,
+    );
+    opts.allow_other = true;
+    opts
 }
 
 fn serve_main(args: &Args) -> Result<(), Fail> {

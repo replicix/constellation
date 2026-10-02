@@ -63,6 +63,17 @@ pub struct MountInfo {
     pub mountpoint: String,
     /// Milliseconds since this view was mounted.
     pub mounted_ms_ago: u64,
+    /// Plan 38 §5: the FUSE transport this mount's connection negotiated
+    /// — `dev_fuse`, `uring` or `uring_zc` — fixed for the connection's
+    /// life. `None` on a host with no FUSE session behind the view (a
+    /// control-only embedder, the engine's own fixtures) and in a report
+    /// from a daemon older than plan 38 Z1b. The rest of plan 38 §5's
+    /// `fuse` section (ring queue depth, passthrough and zero-copy
+    /// counters, the last transport fallback and its reason) lands with
+    /// the transport integration; the per-mount transport belongs here,
+    /// with the mount it describes.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

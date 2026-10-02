@@ -1318,6 +1318,9 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
                 return commit.commit_errno(Errno::EIO);
             }
         };
+        // TODO(38-z2a): this runs on the ring thread itself, so a request that blocks here
+        // (a flush/release/fsync waiting on S3) stalls every other request the kernel queues
+        // on this ring; offload blocking ops or hand fetched entries to a worker pool.
         let req = RequestWithSender::from_request(ReplySender::Ring(commit), request);
         if let Ok(Operation::Destroy(_)) = req.request.operation() {
             req.reply::<ReplyEmpty>().ok();
@@ -2345,6 +2348,240 @@ mod uring_test {
         });
         rx.recv_timeout(timeout)
             .unwrap_or_else(|_| panic!("umount_and_join did not return within {timeout:?}"))
+    }
+
+    /// CONSTELLATION PATCH (io-uring): plan 38 §6 -- the translation layer
+    /// (fuser decode -> `Filesystem` call -> reply object -> fuser encode)
+    /// must produce the **same bytes** whichever transport carries them,
+    /// because the only thing that differs is where the reply is written: a
+    /// `writev(2)` on `/dev/fuse`, or the fetched entry's own payload over
+    /// a ring. A transport that answered `LOOKUP` differently from the
+    /// other would be a compliance difference pjdfstest could only find on
+    /// a kernel that offers the ring; this finds it anywhere.
+    ///
+    /// No kernel, no io_uring and no root: the `/dev/fuse` leg writes into
+    /// a `SOCK_DGRAM` socket pair (`crates/frontend-fuse/tests/wire.rs`'s
+    /// trick -- fuser's channel accepts any descriptor and the kernel's
+    /// side of the protocol is whole messages), and the ring leg writes
+    /// into an entry in an ordinary private mapping whose commit SQE is
+    /// never submitted (`uring::ring::test::dispatch_over_a_fake_ring`).
+    /// So it runs on a `fuse.enable_uring=N` host too, which is the point:
+    /// the 18 real-kernel ring tests below skip there.
+    #[test]
+    fn transport_parity_is_byte_for_byte() {
+        use crate::ll::fuse_abi::fuse_opcode;
+        use crate::uring::ring::test::dispatch_over_a_fake_ring;
+        use crate::uring::staging::test::in_header;
+        use std::os::unix::net::UnixDatagram;
+
+        const IN_HEADER_SZ: usize = size_of::<crate::ll::fuse_abi::fuse_in_header>();
+        const OUT_HEADER_SZ: usize = size_of::<crate::ll::fuse_abi::fuse_out_header>();
+
+        /// An event loop over `sock`, which stands in for `/dev/fuse`.
+        fn event_loop(fs: RingFs, sock: UnixDatagram) -> SessionEventLoop<RingFs> {
+            let device = Arc::new(crate::dev_fuse::DevFuse(std::fs::File::from(
+                std::os::fd::OwnedFd::from(sock),
+            )));
+            SessionEventLoop {
+                thread_name: "parity".to_string(),
+                ch: Channel::new(device),
+                filesystem: Arc::new(FilesystemHolder { fs: Some(fs) }),
+                allowed: SessionACL::All,
+                session_owner: geteuid(),
+                detach: None,
+            }
+        }
+
+        // One request, in the one shape both legs are given it in.
+        let request = |opcode: u32, unique: u64, nodeid: u64, op_in: &[u8], payload: &[u8]| {
+            let len = (IN_HEADER_SZ + op_in.len() + payload.len()) as u32;
+            let mut bytes = in_header(len, opcode, unique).to_vec();
+            // `in_header` zeroes everything but len/opcode/unique; the ino
+            // the op addresses is the header's `nodeid` (offset 16).
+            bytes[16..24].copy_from_slice(&nodeid.to_le_bytes());
+            bytes.extend_from_slice(op_in);
+            bytes.extend_from_slice(payload);
+            bytes
+        };
+
+        // `fuse_read_in` / `fuse_write_in` / `fuse_getattr_in`, built by
+        // hand in the kernel's little-endian layouts (the test is about
+        // the *reply* bytes; the request layouts are asserted against the
+        // ABI by `uring::mem`'s own size tests).
+        let read_in = |fh: u64, offset: u64, size: u32| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&fh.to_le_bytes());
+            b.extend_from_slice(&offset.to_le_bytes());
+            b.extend_from_slice(&size.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // read_flags
+            b.extend_from_slice(&0u64.to_le_bytes()); // lock_owner
+            b.extend_from_slice(&0u32.to_le_bytes()); // flags
+            b.extend_from_slice(&0u32.to_le_bytes()); // padding
+            b
+        };
+        let write_in = |fh: u64, offset: u64, size: u32| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&fh.to_le_bytes());
+            b.extend_from_slice(&offset.to_le_bytes());
+            b.extend_from_slice(&size.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // write_flags
+            b.extend_from_slice(&0u64.to_le_bytes()); // lock_owner
+            b.extend_from_slice(&0u32.to_le_bytes()); // flags
+            b.extend_from_slice(&0u32.to_le_bytes()); // padding
+            b
+        };
+        let getattr_in = |fh: Option<u64>| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&(if fh.is_some() { 1u32 } else { 0 }).to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // dummy
+            b.extend_from_slice(&fh.unwrap_or(0).to_le_bytes());
+            b
+        };
+
+        // (name, opcode, unique, nodeid, op_in, payload, whether `read` answers with `fill`)
+        let cases: Vec<(&str, u32, u64, u64, Vec<u8>, Vec<u8>, bool)> = vec![
+            // A found and a missing LOOKUP: an entry reply and an errno
+            // reply, whose encodings differ in shape (16 + 128 against a
+            // bare 16-byte header).
+            (
+                "lookup hit",
+                fuse_opcode::FUSE_LOOKUP as u32,
+                11,
+                1,
+                Vec::new(),
+                b"hello.txt\0".to_vec(),
+                false,
+            ),
+            (
+                "lookup miss",
+                fuse_opcode::FUSE_LOOKUP as u32,
+                12,
+                1,
+                Vec::new(),
+                b"nope\0".to_vec(),
+                false,
+            ),
+            (
+                "getattr",
+                fuse_opcode::FUSE_GETATTR as u32,
+                13,
+                HELLO_INO.0,
+                getattr_in(None),
+                Vec::new(),
+                false,
+            ),
+            // A read answered with `data()`: a heap buffer and a `writev`
+            // over `/dev/fuse`, a copy into the entry over a ring.
+            (
+                "read data",
+                fuse_opcode::FUSE_READ as u32,
+                14,
+                HELLO_INO.0,
+                read_in(1, 0, 64),
+                Vec::new(),
+                false,
+            ),
+            // The same read answered with `fill()`: written in place in
+            // the entry over a ring, into a heap buffer and `writev`n over
+            // `/dev/fuse`. The bytes on the wire must still match.
+            (
+                "read fill",
+                fuse_opcode::FUSE_READ as u32,
+                15,
+                HELLO_INO.0,
+                read_in(1, 2, 32),
+                Vec::new(),
+                true,
+            ),
+            // A request with a payload of its own, which is what makes the
+            // ring entry's staging non-trivial (the request continues into
+            // the payload area).
+            (
+                "write",
+                fuse_opcode::FUSE_WRITE as u32,
+                16,
+                HELLO_INO.0,
+                write_in(1, 0, 11),
+                b"hello world".to_vec(),
+                false,
+            ),
+            // A reply the filesystem builds incrementally.
+            (
+                "readdir",
+                fuse_opcode::FUSE_READDIR as u32,
+                17,
+                1,
+                read_in(1, 0, 4096),
+                Vec::new(),
+                false,
+            ),
+            // The xattr size probe: a `ReplyXattr::size`, a different
+            // encoding again.
+            (
+                "getxattr size probe",
+                fuse_opcode::FUSE_GETXATTR as u32,
+                18,
+                HELLO_INO.0,
+                {
+                    let mut b = 0u32.to_le_bytes().to_vec(); // size: a probe
+                    b.extend_from_slice(&0u32.to_le_bytes()); // padding
+                    b
+                },
+                b"user.test\0".to_vec(),
+                false,
+            ),
+        ];
+
+        for (name, opcode, unique, nodeid, op_in, payload, fill) in cases {
+            let bytes = request(opcode, unique, nodeid, &op_in, &payload);
+
+            // The `/dev/fuse` leg: dispatch exactly as the event loop does
+            // (`ReplySender::Channel`), then read the datagram back.
+            let (ours, theirs) = UnixDatagram::pair().unwrap();
+            let se = event_loop(
+                RingFs {
+                    fill,
+                    ..RingFs::default()
+                },
+                ours,
+            );
+            let parsed =
+                ll::AnyRequest::try_from(&bytes[..]).expect("a well-formed request");
+            let req =
+                RequestWithSender::from_request(ReplySender::Channel(se.ch.sender()), parsed);
+            req.dispatch(&se);
+            let mut buf = vec![0u8; 1 << 16];
+            let n = theirs.recv(&mut buf).expect("a reply on the socket pair");
+            let dev_fuse = buf[..n].to_vec();
+
+            // The ring leg: the same request in an entry, dispatched
+            // through the same `handle_fetch` the ring thread calls.
+            let (ours, _theirs) = UnixDatagram::pair().unwrap();
+            let se = event_loop(
+                RingFs {
+                    fill,
+                    ..RingFs::default()
+                },
+                ours,
+            );
+            let ring = dispatch_over_a_fake_ring(&bytes, op_in.len(), |commit, req| {
+                se.handle_fetch(commit, req)
+            });
+
+            // Not a vacuous comparison: every case but the errno reply
+            // carries a body, and the errno reply is exactly a header.
+            let want_body = name != "lookup miss";
+            assert_eq!(
+                dev_fuse.len() > OUT_HEADER_SZ,
+                want_body,
+                "{name}: the /dev/fuse leg answered {} bytes",
+                dev_fuse.len()
+            );
+            assert_eq!(
+                dev_fuse, ring,
+                "{name}: /dev/fuse and the ring answered differently\n  dev_fuse: {dev_fuse:02x?}\n  ring:     {ring:02x?}"
+            );
+        }
     }
 
     #[test]

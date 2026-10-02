@@ -5,11 +5,18 @@
 # itself) run inside a container for reproducibility.
 
 FROM rust:1-bookworm AS build
+# Extra cargo features for the binaries (plan 38 §6): empty by default, so
+# the image is the shipped build. `constellation-frontend-fuse/io-uring`
+# puts the FUSE-over-io_uring transport in, which the `compliance-uring`
+# compose service needs (and which also needs a seccomp profile that
+# permits `io_uring_setup(2)` at *run* time -- see docker-compose.yml).
+ARG CARGO_FEATURES=
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p constellation -p constellation-harness \
+    cargo build --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
+        -p constellation -p constellation-harness \
     && cp target/release/constellation /constellation \
     && cp target/release/harness /harness
 

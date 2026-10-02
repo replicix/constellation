@@ -238,6 +238,8 @@ mod tests {
                 labels,
                 qos: Default::default(),
                 confine_links: false,
+                // No FUSE session in this fixture.
+                transport: None,
                 view: Some(view.clone()),
             });
             views.push(view);

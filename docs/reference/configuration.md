@@ -61,11 +61,18 @@ because they combine with it. See [Durability and failover](features/durability-
 | `--cto` | `bounded` | `bounded`, `strict` | `CONSTELLATION_CTO` | no | close-to-open mode (plan 30 M8). `strict`: an open, lookup or listing sees every close another node completed before it began |
 | `--locks` | `cluster` with P2P, `local` without | `local`, `cluster` | `CONSTELLATION_LOCKS` | no | `flock`/`fcntl` scope (plan 30 M14). An explicit `cluster` with P2P off fails the mount |
 | `--cache-verify` | `admit` | `admit`, `always` | `CONSTELLATION_CACHE_VERIFY` | no | when a disk-cache read re-hashes the chunk file it read (plan 38 §2.3). Every chunk is blake3-verified exactly once regardless — **while it streams in** from S3 or a peer, before it is ever admitted. `admit`: the local copy is trusted afterwards; a file a restart's directory scan found is still hashed on its first read (and then trusted). `always`: every disk read hashes again, so local corruption after admission (a bad sector, a scrub miss, a writer into the cache directory) is caught on the next read instead of at the next restart, at one blake3 pass per read. Echoed in `node.status` as `cache.cache_verify`; an unparseable `CONSTELLATION_CACHE_VERIFY` is warned about and ignored (see below the table), while an unparseable `--cache-verify` fails the mount before the daemon forks. Plan 38's later milestones also make `always` disable FUSE zero-copy and passthrough, which by construction let the kernel serve a chunk file without the daemon seeing the bytes |
+| `--fuse-transport` | `dev-fuse` | `dev-fuse`, `auto` | `CONSTELLATION_FUSE_TRANSPORT` | no | **`auto` is experimental and not for production until plan 38 Z2** (see the warning below the table). Which transport this daemon's **plain** Linux mounts are served over (plan 38 §2.4). `dev-fuse`: `read(2)`/`writev(2)` on `/dev/fuse`, every kernel and every platform. `auto`: run the ladder — FUSE-over-io_uring when the binary carries the `io-uring` cargo feature, the kernel is 6.14+ with `fuse.enable_uring=Y`, and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once rather than failing the mount. Runtime-negotiated, never a build-time choice, and fixed for a connection's life: what a mount actually got is `node.status`'s per-mount `transport` (`dev_fuse`/`uring`/`uring_zc`). **A mount served over a ring cannot be handed to another process image**, so `daemon --upgrade`/`node.handoff` refuses it by name (plan 38 §3(e)/Z0a) — unmount and remount is the only upgrade path for such a mount. Mounts that are handover-capable by construction (`view.mount` on a descriptor somebody else opened, and anything an upgrade resumes) are `dev_fuse` whatever this says |
+| `--fuse-uring-queue-depth` | `8` | a positive integer | `CONSTELLATION_FUSE_URING_QUEUE_DEPTH` | no | ring entries per kernel queue, read only when a mount's transport resolves to a ring. The reserved buffer is `queues x depth x max_write` of `MAP_NORESERVE` address space per mount (plan 38 §4), so this is the knob for an operator who has measured their own RSS/throughput trade-off and wants a different point on it |
 | `--fsync-mode` | `local` | `local`, `s3` | none | yes | what `fsync()` waits for. `local`: the node's metadata store is forced to disk. `s3`: also the file's chunks and the journal up to the call are in the bucket. `s3` also forces `--write-mode through` |
 | `--write-mode` | `through` | `through`, `back` | none | yes | chunk close policy. `through`: `close()` returns once the file's chunks are in S3 and its manifest is committed at the sequencer (one S3 round trip for a small file). `back`: `close()` returns once the chunks are queued durably on this node's disk and the manifest is committed at the sequencer (no S3 round trip, on the sequencer and on any other node); the bytes live only on this node until the upload drains. `fsync`, `O_SYNC`, `O_DSYNC`, `--fsync-mode s3` and a cluster lock's release always act as `through`. `constellation write-mode TARGET MODE` changes it on a running mount (switching to `through` drains the queue). Use `back` for bulk imports (untar, rsync, `cp -r`) and switch back afterwards; see [When to use `--write-mode back`](features/durability-and-failover.md#when-to-use---write-mode-back) |
 
-Values are case-insensitive for `--cto`, `--locks` and `--cache-verify`; any
-other value fails the mount. The one exception is
+Values are case-insensitive for `--cto`, `--locks`, `--cache-verify` and
+`--fuse-transport`; any other value fails the mount, and so does an
+unparseable `CONSTELLATION_FUSE_TRANSPORT` or
+`CONSTELLATION_FUSE_URING_QUEUE_DEPTH` — a transport is not a safety
+setting whose stricter reading survives a typo, and silently ignoring
+`auto` would leave the kernel's fast path off, which is the opposite of
+what was asked for. The one exception is
 `CONSTELLATION_CACHE_VERIFY`: an unparseable value there is **warned about
 and ignored** (the flag, or the default, applies), so a stale value in a
 shell profile cannot brick every mount started from it — `mount` prints the
@@ -74,7 +81,25 @@ warning and the mode it is using, the daemon logs it, and
 
 The flags that are not persisted apply to
 the mount command that carries them: a later bare `mount NAME` uses the
-environment or the default again.
+environment or the default again. `--fuse-transport` and
+`--fuse-uring-queue-depth` are the one pair that is **node-wide rather than
+per-view**: they belong to the daemon, so a `mount` that merely *attaches* a
+second view to an already-running daemon cannot change them (that daemon
+resolved them when it started, and a connection's transport is fixed for its
+life); such a `mount` prints a warning and carries on with the daemon's.
+Stop the daemon, or set the environment variable before the mount that
+starts it.
+
+> **Warning — `--fuse-transport auto` / `CONSTELLATION_FUSE_TRANSPORT=auto`
+> is experimental.** Over FUSE-over-io_uring a request is dispatched on the
+> ring's own thread, so one request that blocks — a `close`'s
+> flush/release, or an `fsync`, waiting on S3 while S3 is unreachable —
+> stalls every unrelated request the kernel queued on that ring (a `stat` or
+> `ls` in another directory can hang for as long as S3 does). `/dev/fuse`
+> (`dev-fuse`, the default) has no such coupling. Do not use `auto` in
+> production until plan 38 Z2 moves blocking operations off the ring thread;
+> it only takes effect on a binary built with the `io-uring` feature and a
+> kernel with `fuse.enable_uring=Y` anyway.
 
 ### Per-filesystem settings
 

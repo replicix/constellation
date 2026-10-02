@@ -194,12 +194,25 @@ pub struct NodeHandoff {
     /// the default, as a fresh mount would).
     #[serde(default)]
     cache_verify: Option<String>,
+    /// Plan 38 Z1b: `--fuse-transport` (`auto`/`dev-fuse`), absent in an
+    /// older image's handoff. The *resumed* mounts are `/dev/fuse` by
+    /// construction (a ring session cannot be handed over at all, §3(e));
+    /// this is for the views added to the new image afterwards, which
+    /// would otherwise lose a flag the environment did not also set.
+    #[serde(default)]
+    fuse_transport: Option<String>,
+    #[serde(default)]
+    fuse_uring_queue_depth: Option<usize>,
     pin_target: Option<constellation_engine::e2e_pin::PinTarget>,
     web_ui: u16,
 }
 
 impl NodeHandoff {
-    pub fn of(cfg: &EngineConfig, web_ui: u16) -> Self {
+    pub fn of(
+        cfg: &EngineConfig,
+        web_ui: u16,
+        fuse_transport: constellation_frontend_fuse::TransportConfig,
+    ) -> Self {
         Self {
             backend: cfg.backend.clone(),
             state_dir: cfg.state_dir.clone(),
@@ -212,9 +225,41 @@ impl NodeHandoff {
             read_only_member: cfg.read_only_member,
             atime: cfg.atime_mode.as_str().to_string(),
             cache_verify: cfg.cache_verify.map(|v| v.as_str().to_string()),
+            fuse_transport: Some(fuse_transport.policy.as_str().to_string()),
+            fuse_uring_queue_depth: Some(fuse_transport.uring_queue_depth),
             pin_target: cfg.pin_target.clone(),
             web_ui,
         }
+    }
+
+    /// What the previous image's `--fuse-transport` /
+    /// `--fuse-uring-queue-depth` were, as flags for
+    /// `TransportConfig::resolve` to apply the environment over (the new
+    /// image resolves them again, as a fresh `mount` does). An
+    /// unparseable stored value is an error: it can only have come from a
+    /// `--fuse-transport` this binary already accepted.
+    #[allow(clippy::type_complexity)]
+    fn fuse_transport_flags(
+        &self,
+    ) -> Result<(
+        Option<constellation_frontend_fuse::TransportPolicy>,
+        Option<usize>,
+    )> {
+        let policy = match &self.fuse_transport {
+            Some(raw) => Some(
+                constellation_frontend_fuse::TransportPolicy::parse(raw)
+                    .with_context(|| format!("the handoff's fuse transport {raw:?}"))?,
+            ),
+            None => None,
+        };
+        Ok((policy, self.fuse_uring_queue_depth))
+    }
+
+    /// [`Self::fuse_transport_flags`] with the environment applied over it.
+    fn fuse_transport(&self) -> Result<constellation_frontend_fuse::TransportConfig> {
+        let (policy, depth) = self.fuse_transport_flags()?;
+        constellation_frontend_fuse::TransportConfig::resolve(policy, depth)
+            .map_err(anyhow::Error::msg)
     }
 
     fn engine_config(&self) -> Result<EngineConfig> {
@@ -491,25 +536,25 @@ impl SessionInfoParts {
         }
     }
 
-    fn options(&self) -> MountOptions {
-        MountOptions {
-            fs_name: self.fs_name.clone(),
-            allow_other: self.allow_other,
-            read_only: self.read_only,
-            n_threads: self.fuse_threads,
-            tuning: constellation_frontend_fuse::KernelTuning::for_workers(
+    fn options(&self, cfg: constellation_frontend_fuse::TransportConfig) -> MountOptions {
+        // Handover-capable by construction: these options only ever resume
+        // a detached session (`resume_in_place`), and a resumed connection
+        // is `/dev/fuse` -- a ring session cannot be handed over at all
+        // (plan 38 §3(e)). The marker is what pins it, whatever
+        // `CONSTELLATION_FUSE_TRANSPORT` says. `cfg` is the node's knob,
+        // passed so an `auto` there is logged as ignored for this view.
+        let mut opts = MountOptions::handover_capable(
+            self.fs_name.clone(),
+            self.fuse_threads,
+            constellation_frontend_fuse::KernelTuning::for_workers(
                 crate::parallelism::thread_plan().fuse,
             ),
-            // Handover-capable by construction: these options only ever
-            // resume a detached session (`resume_in_place`), and a resumed
-            // connection is `/dev/fuse` -- a ring session cannot be handed
-            // over at all (plan 38 §3(e)). Asking here would change
-            // nothing in any case: `MountOptions::config` ORs Z1a's
-            // `CONSTELLATION_FUSE_URING` hook in, and `FuseSession::resume`
-            // clears `config.io_uring` for exactly this reason. Z1b's
-            // `TransportPolicy` is what pins the choice properly.
-            io_uring: false,
-        }
+            cfg,
+            constellation_frontend_fuse::HandoverCapable,
+        );
+        opts.allow_other = self.allow_other;
+        opts.read_only = self.read_only;
+        opts
     }
 }
 
@@ -593,6 +638,33 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
     if targets.is_empty() {
         return Err("no view is mounted".into());
     }
+    // Plan 38 §3(e): a session served over a ring can be handed over
+    // **never**, not "once something is released" -- so it is refused
+    // here, by name, before anything is detached, rather than as a
+    // `detach` failure part way through a multi-view handover (which
+    // would resume the views already detached in place for nothing).
+    // `SessionControl::detach` refuses it too; this is the preflight that
+    // tells the operator which mount and what to do about it.
+    let ring: Vec<String> = targets
+        .iter()
+        .filter(|t| !t.control.transport().is_dev_fuse())
+        .map(|t| {
+            format!(
+                "{} (served over {})",
+                t.info.mountpoint.display(),
+                t.control.transport()
+            )
+        })
+        .collect();
+    if !ring.is_empty() {
+        return Err(format!(
+            "refusing the upgrade: a FUSE session served over io_uring cannot be handed to \
+             another process image, on any kernel through 7.3 (plan 38 §3(e)) -- unmount and \
+             remount these views, or mount them with --fuse-transport dev-fuse to keep them \
+             upgradable in place: {}",
+            ring.join("; ")
+        ));
+    }
     let mut blockers = Vec::new();
     for t in &targets {
         for b in t.view.handover_blockers() {
@@ -644,7 +716,7 @@ fn resume_in_place(node: &Arc<NodeRuntime>, t: Target, fuse: FuseHandoff) {
     match FuseSession::resume(
         fuse,
         t.view.clone(),
-        &t.info.options(),
+        &t.info.options(node.fuse_transport),
         t.info.caps.clone(),
         Some(&t.info.sink),
     ) {
@@ -769,6 +841,13 @@ pub fn resume_main(
         Ok(engine) => engine,
         Err(e) => roll_back(handoff, &format!("{e:#}")),
     };
+    // Plan 38 Z1b: the knob the previous image ran with, re-resolved so
+    // the environment still wins. Only the views added *after* this
+    // resume can act on it; the resumed ones are `/dev/fuse` for good.
+    let fuse_transport = match handoff.node.fuse_transport() {
+        Ok(cfg) => cfg,
+        Err(e) => roll_back(handoff, &format!("{e:#}")),
+    };
     let state_dir = handoff
         .node
         .state_dir
@@ -784,6 +863,7 @@ pub fn resume_main(
                 generation: handoff.generation,
                 control,
             }),
+            fuse_transport,
         },
         rt.handle().clone(),
     ) {
@@ -844,18 +924,21 @@ fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
     let view =
         engine.open_view_resumed(m.view.spec, m.view.handles, caps.clone(), events.clone())?;
     node.ensure_status(&view);
-    let options = MountOptions {
-        fs_name: m.fs_name.clone(),
-        allow_other: m.allow_other,
-        read_only: m.read_only,
-        n_threads: m.fuse_threads,
-        tuning: constellation_frontend_fuse::KernelTuning::for_workers(
+    // A resumed connection is `/dev/fuse` by construction
+    // (`FuseHandoff::transport`, plan 38 §3(e)), and the marker says so at
+    // the call site rather than leaving it to a comment. The node's knob
+    // goes in so an `auto` there is logged as ignored for this view.
+    let mut options = MountOptions::handover_capable(
+        m.fs_name.clone(),
+        m.fuse_threads,
+        constellation_frontend_fuse::KernelTuning::for_workers(
             crate::parallelism::thread_plan().fuse,
         ),
-        // A resumed connection is `/dev/fuse` by construction
-        // (`FuseHandoff::transport`, plan 38 §3(e)).
-        io_uring: false,
-    };
+        node.fuse_transport,
+        constellation_frontend_fuse::HandoverCapable,
+    );
+    options.allow_other = m.allow_other;
+    options.read_only = m.read_only;
     let session = match FuseSession::resume(
         FuseHandoff {
             fuse_fd,
@@ -941,7 +1024,14 @@ mod tests {
             reaper_pid: Some(42),
             rollback_exe_fd: Some(9),
             is_rollback: false,
-            node: NodeHandoff::of(&engine, 8080),
+            node: NodeHandoff::of(
+                &engine,
+                8080,
+                constellation_frontend_fuse::TransportConfig {
+                    policy: constellation_frontend_fuse::TransportPolicy::Auto,
+                    uring_queue_depth: 4,
+                },
+            ),
             mounts: Vec::new(),
         }
     }
@@ -966,6 +1056,16 @@ mod tests {
             cfg.state_dir.as_deref(),
             Some(Path::new("/var/lib/constellation/x"))
         );
+        // Plan 38 Z1b: the transport knob survives the `exec` for the
+        // views the new image mounts afterwards. Asserted on the stored
+        // flags, not on `fuse_transport()`, which the ambient
+        // `CONSTELLATION_FUSE_TRANSPORT` is entitled to override.
+        let (policy, depth) = got.node.fuse_transport_flags().unwrap();
+        assert_eq!(
+            policy,
+            Some(constellation_frontend_fuse::TransportPolicy::Auto)
+        );
+        assert_eq!(depth, Some(4));
         assert!(cfg.pin_target.is_some());
         assert_eq!(got.node.web_ui, 8080);
     }

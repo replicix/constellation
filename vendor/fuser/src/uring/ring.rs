@@ -1494,6 +1494,68 @@ pub(crate) mod test {
         }
     }
 
+    /// CONSTELLATION PATCH (io-uring): one request dispatched over a ring entry with **no
+    /// io_uring and no kernel behind it** -- the entry is an ordinary private mapping, and the
+    /// commit's SQE is queued in `Live::pending` and never submitted -- and the reply bytes the
+    /// handler left in it, in the `/dev/fuse` wire shape (the 16-byte `fuse_out_header`
+    /// followed by `payload_sz` payload bytes, which is exactly what the `writev(2)` of the
+    /// other transport sends).
+    ///
+    /// `request` is the contiguous request the `/dev/fuse` parser is given (`fuse_in_header`,
+    /// then `op_in_len` bytes of fixed op arguments, then the op's payload); it is scattered
+    /// into the entry's header and payload areas the way the kernel scatters it, so that
+    /// `stage_request` has to reassemble it.
+    ///
+    /// This is the in-memory seam plan 38 §6 asks for: it lets a test compare what a
+    /// `Filesystem` answers over the two transports byte for byte, without root, a mount, or
+    /// `fuse.enable_uring=Y`. `session.rs`'s `transport_parity_is_byte_for_byte` is the test.
+    pub(crate) fn dispatch_over_a_fake_ring(
+        request: &[u8],
+        op_in_len: usize,
+        handle: impl FnOnce(RingCommit, &[u8]),
+    ) -> Vec<u8> {
+        const IN_HEADER_SZ: usize = size_of::<abi::fuse_in_header>();
+        let ring = fake_ring(1, true);
+        // The commit path skips the eventfd kick for the ring's own thread, which is what a
+        // dispatch from a fetch is; nothing here reads the eventfd.
+        ring.ring_thread.set(thread::current().id()).ok();
+        let e = &ring.entries[0];
+        let unique = u64_at(request, 8);
+        let op_in = &request[IN_HEADER_SZ..IN_HEADER_SZ + op_in_len];
+        let payload = &request[IN_HEADER_SZ + op_in_len..];
+        assert!(payload.len() <= e.payload_cap, "the fixture's payload fits");
+        let base = e.base.0.as_ptr();
+        // SAFETY: a test-owned entry with no command pending and no reference into it live.
+        // The header, `op_in` and the commit/payload-size fields lie inside the 288-byte
+        // header area, and the payload fits `payload_cap`.
+        unsafe {
+            ptr::copy_nonoverlapping(request.as_ptr(), base, IN_HEADER_SZ);
+            ptr::copy_nonoverlapping(op_in.as_ptr(), base.add(OP_IN_OFFSET), op_in_len);
+            ptr::write_unaligned(base.add(COMMIT_ID_OFFSET).cast::<u64>(), unique);
+            ptr::write_unaligned(
+                base.add(PAYLOAD_SZ_OFFSET).cast::<u32>(),
+                payload.len() as u32,
+            );
+            ptr::copy_nonoverlapping(payload.as_ptr(), base.add(e.gap), payload.len());
+        }
+        // Staged exactly as the ring thread stages a fetched entry.
+        // SAFETY: as above.
+        let staged = unsafe { stage_request(e.base.0, e.gap, e.payload_cap) }
+            .expect("the fixture's request is well formed");
+        let commit = fake_dispatched(&ring, 0, unique);
+        // SAFETY: as above; the slice dies with this statement, before the reply is read.
+        handle(commit, unsafe {
+            slice::from_raw_parts(staged.req.as_ptr(), staged.len)
+        });
+        let (_, _, _, payload_sz) = reply_fields(e);
+        let mut reply = header_bytes(e)[..OUT_HEADER_SZ].to_vec();
+        reply.extend_from_slice(payload_bytes(e, payload_sz as usize));
+        // The entry is never re-armed: let the ring drop without waiting for a CQE.
+        *e.state.lock() = EntryState::Dead;
+        ring.live.lock().in_kernel = 0;
+        reply
+    }
+
     /// A handle whose commit is refused: `NotConnected` when `conn_dead`, else a duplicate
     pub(crate) fn refused_commit(conn_dead: bool) -> RingCommit {
         let ring = fake_ring(1, true);

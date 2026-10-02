@@ -195,7 +195,7 @@ anything depended on it, by a fixed rubric mirroring plan 37 K0's
 |---|---|---|---|
 | a | **Licence** | **MIT, unchanged.** Same file, same copyright holder as upstream fuser; no added licence, no added notice. | `LICENSE.md` on `io-uring/bench` is byte-identical to `v0.18.0`'s ("The MIT License (MIT) … Copyright (c) 2020-present Christopher Berner"); `Cargo.toml` `license = "MIT"`. No new dependency beyond `io-uring` `0.7.14` (MIT OR Apache-2.0; the lock resolves 0.7.15) and three `nix` features already in the tree. `LICENSE.md` here is byte-identical to `v0.18.0`'s and to the fork's (`diff` of all three). |
 | b | **Base version vs our 0.18.0** | **The ring is separable; the fork's other drift is not ours.** The fork's `master` is `v0.18.0` + 52 commits, +4,052/−251 lines in `src/` alone (FUSE_STATX, TMPFILE, SYNCFS, `FUSE_ALLOW_IDMAP`, an ABI cleanup, a restructured `Session`) — none of it the ring. The ring stack's own `src/` diff is 47 hunks; applied to pristine 0.18.0, **26 land cleanly and 21 reject**, and every rejection is a context clash with that unrelated drift, not with the ring. All four new files (`src/uring/{mem,mod,ring,staging}.rs`, 4,266 lines = 56% of the patch) are additions and apply untouched. | `git diff --stat v0.18.0 origin/master -- src/`; `git apply --reject` of `git diff origin/master origin/io-uring/bench -- src/` onto a `v0.18.0` worktree: rejects in `session.rs` (13), `request.rs` (5), `lib.rs` (2), `mnt/mount_options.rs` (1). Crucially, 0.18.0 **already has** every type the integration needs — `ReplySender` (as an enum with a `Channel` variant), `RequestWithSender`, `SessionEventLoop`, `FilesystemHolder`, `DevFuse`, `FuseReadBuf`, `receive_retrying` — so the 21 rejected hunks were re-made by hand, small. |
-| c | **Its own test suite** | **Runs, and passes, against *our* copy.** The fork's suite: `master` 109 passed / 1 failed, the ring stack 130/1 without the feature and **209/1** with it (the single failure, `mnt::test::mount_unmount_external`, is pre-existing on `master` and a privilege problem — `EPERM` from the external mount helper with no root). Re-run against this vendored tree after the lift: **72 passed / 0 failed** without the feature, **156 / 0** with it (including the three this patch adds for the gather form and `Transport`), of which 18 real-kernel ring tests skip loudly on a `fuse.enable_uring=N` host and run on a 6.14+ one — all 156 pass on a kernel 7.0 host with `fuse.enable_uring=Y`, where they do run. The fork's own `fuse_over_io_uring_tests_ran` guard **fails** if the kernel advertises the flag while those tests skipped, so a silently-never-exercised ring cannot pass as green. | `cargo test --lib [--features io-uring]` in `/tmp/skory-fuser` and in `vendor/fuser`. The count differs from the fork's because the fork's suite also covers its unrelated drift (statx, tmpfile, idmap), which is not vendored. |
+| c | **Its own test suite** | **Runs, and passes, against *our* copy.** The fork's suite: `master` 109 passed / 1 failed, the ring stack 130/1 without the feature and **209/1** with it (the single failure, `mnt::test::mount_unmount_external`, is pre-existing on `master` and a privilege problem — `EPERM` from the external mount helper with no root). Re-run against this vendored tree after the lift: **72 passed / 0 failed** without the feature, **157 / 0** with it (including the three this patch adds for the gather form and `Transport`, and plan 38 Z1b's transport-parity test), of which 18 real-kernel ring tests skip loudly on a `fuse.enable_uring=N` host and run on a 6.14+ one — all 156 pass on a kernel 7.0 host with `fuse.enable_uring=Y`, where they do run. The fork's own `fuse_over_io_uring_tests_ran` guard **fails** if the kernel advertises the flag while those tests skipped, so a silently-never-exercised ring cannot pass as green. | `cargo test --lib [--features io-uring]` in `/tmp/skory-fuser` and in `vendor/fuser`. The count differs from the fork's because the fork's suite also covers its unrelated drift (statx, tmpfile, idmap), which is not vendored. |
 | d | **Soundness of the `unsafe`, and the threading model** | **Sound as read; no unexplained `unsafe`.** 51 `unsafe` mentions in the transport (`ring.rs` 36, `staging.rs` 9, `mem.rs` 6 — `mod.rs` has none), **every one carrying a `SAFETY:` comment naming the invariant it rests on**, and both `unsafe impl Send`/`Sync` (`RingMemory`, `EntryIov`, `EntryPtr`) stating the invariant that licenses them. Specifically checked, one by one: **`SINGLE_ISSUER` + `DEFER_TASKRUN`** — the ring is built `IORING_SETUP_R_DISABLED` and *enabled from the ring's own thread* (`register_enable_rings` inside `thread_main`), which is the documented way to bind the issuer to a thread other than the creator, and every SQE of a ring is pushed by that thread. **Replies from foreign threads** — `RingCommit` is `Clone + Send`; a commit from any other thread writes the reply, queues the entry index in `Live::pending` under the lock and kicks an `eventfd`, and the ring thread drains `pending` before every wait; a commit from the ring thread itself skips the `eventfd` (`ring_thread: OnceLock<ThreadId>`). A dedicated per-entry state machine (`InKernel`/`Dispatching`/`Deferred`/`Dispatched`/`Committing`/`Pending`/`Dead`) makes a duplicate commit a rejected error rather than a second write. **Entry buffer lifetimes** — one anonymous `MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE` mapping per ring, `MADV_DONTFORK` (so a `fork(2)` in the host process cannot leave the kernel writing into a child's copy), page-aligned strides, all arithmetic `checked_*`, and the kernel-shared header read only through `ptr::read_unaligned` so no Rust reference is ever formed over it; `staging.rs`'s own tests are written to be run under Miri (a heap stride behind a raw pointer, "so Miri checks the aliasing discipline of the code under test rather than the fixture"). **Cancellation on teardown** — `RingMemory` is held in `ManuallyDrop` and **leaked rather than unmapped** while `Live::in_kernel != 0`, so an unmap can never race a pending SQE; a `shutdown` flag exists precisely because the kernel posts no CQE at unmount for an entry held in userspace. **Unwind safety** — a panic inside a `fill` closure answers `EIO` through a `FillGuard` drop rather than leaving the request unanswered, and a panicking callback confines itself to its own ring (that ring answers `EIO`; other rings and the `/dev/fuse` reader keep serving). Layout is pinned by tests against the ABI (`assert_eq!(HEADER_SZ, 288)`, `OP_IN_OFFSET == 128`, …) rather than assumed. | Read of `src/uring/*.rs` and the `Session` integration; `grep` of every `unsafe` against its preceding comment. |
 | e | **Code size and shape** | **A clean lift for the module, a hand re-make for the seam.** 57% of the patch is the four new `src/uring/` files, taken as they stand. The seam into `Session`/`reply.rs`/`request.rs` is small in kind — one `ReplySender::Ring(RingCommit)` variant, one `Option<RingSet>` field, one hook in `handshake()`, one `serve_ring()` supervisor — and was re-made against 0.18.0 + patch 0001 because of (b). Nothing in the transport needed redesigning around this plan's own `NegotiatedInit`/`Transport` extension: the fork already produces exactly the shape §3(a) asked for (one ring per worker thread with the kernel's per-CPU queues partitioned across them, a dedicated `/dev/fuse` reader for `INIT`/`FORGET`/`INTERRUPT`/notifications, `ReplyData::fill`, replies from any thread, graceful fallback, `clone_fd` ignored). | `patches/0002-io-uring-transport.patch`: +7,620/−30 lines over 14 files, of which `src/uring/*` is +4,266 and `session.rs` is +2,623 — and 2,177 of `session.rs`'s 3,540 lines are now its test modules, so the non-test seam is about 440 lines. |
 
@@ -268,6 +268,32 @@ was not needed.
   four segments are handled without allocating. Plan 38 Z2a is what wires
   the adapter to it; this patch only provides it, with tests on both
   transports.
+- **An in-memory ring seam for transport-parity testing, and the parity
+  test itself.** Plan 38 §6 asks for a `tests/wire.rs`-style adapter test
+  proving "the adapter's translation layer (fuser decode → `Vfs` call →
+  responder → fuser encode) is identical regardless of transport, without
+  a real kernel or root". The fork has no such test and no seam for one:
+  its ring coverage either mounts a real kernel mount or pokes an entry's
+  state machine. `uring::ring::test::dispatch_over_a_fake_ring` is the
+  seam — it scatters a contiguous `/dev/fuse`-shaped request into an
+  entry of the fork's own `fake_ring` (a `Ring` over `/dev/zero`, no
+  io_uring at all, since `Ring::new` and `RingIo::open` are already
+  separate), stages it exactly as the ring thread does, dispatches it
+  through the same `SessionEventLoop::handle_fetch`, and reads the reply
+  back out of the entry in the `/dev/fuse` wire shape. The test,
+  `session.rs`'s `transport_parity_is_byte_for_byte`, dispatches eight
+  requests (an entry reply, an errno reply, an attr reply, a read
+  answered by `data()` *and* by `fill()`, a request carrying a payload of
+  its own, an incrementally built `readdir`, and an xattr size probe)
+  down both transports and asserts the reply bytes are equal. It runs
+  anywhere — no root, no mount, no `fuse.enable_uring=Y` — which is the
+  point: the 18 real-kernel ring tests skip on the dev host, and this
+  one does not. It is also where a Constellation-side counterpart would
+  have had to live: `FuseFs` is just another `Filesystem`, and putting
+  the seam in `crates/frontend-fuse` would have meant exporting
+  `SessionEventLoop`, `RingCommit` and an entry constructor from this
+  crate's public API for a test.
+
 - **One flaky test of the fork's own was fixed.** `uring::mem`'s
   `vm_flags` helper took a mapping's address range from one
   `/proc/self/maps` read and then looked that exact range up in a separate
@@ -427,9 +453,10 @@ fields, `validate_transport`'s refusals, `ReplyData::fill` over
 
 ### What uses it, and the proof
 
-`crates/frontend-fuse/src/session.rs`: `MountOptions::io_uring` asks for
-the transport (runtime-negotiated, never granted unless the build, the
-kernel and the process's capabilities all allow it),
+`crates/frontend-fuse/src/session.rs`: `MountOptions::transport`
+(`TransportPolicy::Auto`) asks for the transport (runtime-negotiated,
+never granted unless the build, the kernel and the process's capabilities
+all allow it),
 `FuseSession::transport()` reports what was granted, `FuseHandoff::transport()`
 reports what a handoff carries, and `SessionControl::detach` refuses a
 non-`DevFuse` session **first**, before anything is quiesced, with
@@ -439,10 +466,11 @@ non-`DevFuse` session **first**, before anything is quiesced, with
 can actually grant, so the same test is the fallback gate on a
 `fuse.enable_uring=N` host and the ring gate on a 6.14+ one.
 
-Every mount Constellation makes today leaves `io_uring: false`. Plan 38
-Z1a's `CONSTELLATION_FUSE_URING=1` is a **test hook** so the smoke and
-harness lanes can run a whole daemon on the ring; Z1b replaces it with a
-user-facing `TransportPolicy` and `CONSTELLATION_FUSE_TRANSPORT`.
+What asks for `io_uring: true` is plan 38 Z1b's `TransportPolicy`
+(`crates/frontend-fuse`'s `MountOptions::transport`, set from
+`--fuse-transport`/`CONSTELLATION_FUSE_TRANSPORT`): `Auto` asks, `DevFuse`
+— still the default for every mount — does not. Z1a's blunter
+`CONSTELLATION_FUSE_URING=1` test hook is gone with it.
 
 ### Upgrading fuser with both series
 

@@ -91,6 +91,10 @@ pub struct NodeConfig {
     pub engine: EngineConfig,
     pub web_ui: u16,
     pub log_buffer: log_buffer::LogBuffer,
+    /// Plan 38 Z1b: what transport this daemon's *plain* mounts ask for
+    /// (`--fuse-transport`/`CONSTELLATION_FUSE_TRANSPORT`, resolved once
+    /// before the fork). Handover-capable sessions ignore it.
+    pub fuse_transport: constellation_frontend_fuse::TransportConfig,
     /// Plan 31 C4b: this image's place in a chain of in-place upgrades
     /// (`None`: a fresh start), with the control socket the previous
     /// image bound.
@@ -139,6 +143,8 @@ pub struct MountInfo {
     pub subtree: String,
     pub mountpoint: PathBuf,
     pub since: Instant,
+    /// The FUSE transport this mount's connection negotiated (plan 38 §5).
+    pub transport: constellation_frontend_fuse::Transport,
     pub view: Arc<View>,
     pub qos: constellation_engine::ViewQos,
     pub confine_links: bool,
@@ -148,6 +154,10 @@ pub(crate) struct MountHandle {
     pub(crate) subtree: String,
     pub(crate) mountpoint: PathBuf,
     since: Instant,
+    /// Plan 38 §5: the transport this session's `FUSE_INIT` negotiated
+    /// (`dev_fuse`/`uring`/`uring_zc`), fixed for the connection's life
+    /// and reported per mount by `node.status`.
+    pub(crate) transport: constellation_frontend_fuse::Transport,
     unmounter: Mutex<constellation_frontend_fuse::FuseUnmounter>,
     /// Plan 31 C4b: what a handover needs of the view and its session.
     pub(crate) fs_name: String,
@@ -183,6 +193,9 @@ pub struct NodeRuntime {
     pub(crate) handover: crate::handover::HandoverState,
     /// The node's own settings, as the next image restarts it.
     pub(crate) handoff_config: crate::handover::NodeHandoff,
+    /// Plan 38 Z1b: `NodeConfig::fuse_transport`, for every mount this
+    /// daemon makes from now on.
+    pub(crate) fuse_transport: constellation_frontend_fuse::TransportConfig,
     /// The control socket a previous image bound (served from, instead of
     /// binding anew, by `ensure_status`).
     control_listener: Mutex<Option<std::os::unix::net::UnixListener>>,
@@ -204,8 +217,9 @@ impl NodeRuntime {
             web_ui,
             log_buffer,
             resumed,
+            fuse_transport,
         } = cfg;
-        let handoff_config = crate::handover::NodeHandoff::of(&engine, web_ui);
+        let handoff_config = crate::handover::NodeHandoff::of(&engine, web_ui, fuse_transport);
         let (generation, control_listener) = match resumed {
             Some(r) => (r.generation, r.control),
             None => (0, None),
@@ -240,6 +254,7 @@ impl NodeRuntime {
             shutdown_started: AtomicBool::new(false),
             handover: crate::handover::HandoverState::new(generation),
             handoff_config,
+            fuse_transport,
             control_listener: Mutex::new(control_listener),
         });
 
@@ -383,23 +398,37 @@ impl NodeRuntime {
         }
         let engine = &self.engine;
         tracing::info!(?mountpoint, state_dir = ?engine.state_dir(), fs = %engine.fsmeta().uuid, "mounting");
-        let mount_options = constellation_frontend_fuse::MountOptions {
-            fs_name,
-            allow_other,
-            read_only: frozen_view,
-            n_threads: fuse_threads,
-            // The kernel queue is sized for the host's worker count (the
-            // node-wide thread plan), whatever this view's own count.
-            tuning: constellation_frontend_fuse::KernelTuning::for_workers(
-                crate::parallelism::thread_plan().fuse,
-            ),
-            // Plan 38 Z1a leaves every production mount on `/dev/fuse`;
-            // the transport policy that may ask for the ring is Z1b's.
-            // Z1a's `CONSTELLATION_FUSE_URING` test hook still reaches
-            // this mount (`MountOptions::config` ORs it in), which is how
-            // the smoke and harness lanes exercise the ring transport.
-            io_uring: false,
+        // The kernel queue is sized for the host's worker count (the
+        // node-wide thread plan), whatever this view's own count.
+        let tuning = constellation_frontend_fuse::KernelTuning::for_workers(
+            crate::parallelism::thread_plan().fuse,
+        );
+        // Plan 38 §3(e): a `view.mount{PreopenedFd}` session is one
+        // somebody else mounted and may ask back for (plan 37's CSI
+        // engine-pod replacement hands the descriptor on), so it is
+        // handover-capable and pinned to `/dev/fuse` whatever the
+        // transport knob says. A mount this process made is plain: it
+        // takes the knob's policy, and `node.handoff`/`daemon --upgrade`
+        // refuses to detach it if that policy got it a ring (the refusal
+        // names the transport).
+        let mut mount_options = if preopened.is_some() {
+            constellation_frontend_fuse::MountOptions::handover_capable(
+                fs_name,
+                fuse_threads,
+                tuning,
+                self.fuse_transport,
+                constellation_frontend_fuse::HandoverCapable,
+            )
+        } else {
+            constellation_frontend_fuse::MountOptions::new(
+                fs_name,
+                fuse_threads,
+                tuning,
+                self.fuse_transport,
+            )
         };
+        mount_options.allow_other = allow_other;
+        mount_options.read_only = frozen_view;
         // An explicit session, so `remove_mount`/signals can unmount from
         // inside this process (its `FuseUnmounter`); without it, an
         // external kill leaves a dead mountpoint that needs `fusermount3
@@ -462,6 +491,13 @@ impl NodeRuntime {
         } = info;
         let unmounter = session.unmounter();
         let control = session.control();
+        // Plan 38 §2.4/§5: what the ladder actually negotiated for this
+        // connection, logged once here and reported per mount by
+        // `node.status`. A mount that asked for `auto` and got
+        // `dev_fuse` is the ladder degrading as designed -- fuser logged
+        // the reason during the handshake -- not a failure.
+        let transport = session.transport();
+        tracing::info!(?mountpoint, transport = transport.name(), "FUSE transport");
         let id = MountId(fs.id());
         // So that a takeover after a kill can abort this mount's
         // connection if it is left wedged (`daemon_lock::abort_stale_mounts`).
@@ -476,6 +512,7 @@ impl NodeRuntime {
                 subtree,
                 mountpoint,
                 since: Instant::now(),
+                transport,
                 unmounter: Mutex::new(unmounter),
                 fs_name,
                 allow_other,
@@ -680,6 +717,7 @@ impl NodeRuntime {
                 subtree: handle.subtree.clone(),
                 mountpoint: handle.mountpoint.clone(),
                 since: handle.since,
+                transport: handle.transport,
                 view: handle.view.clone(),
                 qos: handle.qos,
                 confine_links: handle.confine_links,
@@ -759,6 +797,7 @@ mod tests {
                 web_ui: 0,
                 log_buffer: log_buffer::LogBuffer::default(),
                 resumed: None,
+                fuse_transport: Default::default(),
             },
             rt.clone(),
         )

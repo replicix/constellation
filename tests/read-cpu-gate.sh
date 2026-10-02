@@ -41,8 +41,10 @@
 #   READ_CPU_RAND_SECONDS   random-read runtime per repeat (default 15)
 #   READ_CPU_CHUNK_MIB      filesystem chunk size (default 4, the shape
 #                           bench/fuse-read-path measured)
-#   CONSTELLATION_FUSE_TRANSPORT  recorded in every line; see
-#                           tests/transport-matrix.sh (only `dev-fuse` exists)
+#   CONSTELLATION_FUSE_TRANSPORT  the daemon's transport (`dev-fuse`/`auto`,
+#                           plan 38 §2.4), passed through to it and recorded
+#                           in every result line; see tests/transport-matrix.sh,
+#                           whose READ_CPU_GATE=1 mode runs this gate per leg
 #
 # Linux only (it reads `/proc/<pid>/stat`, `/proc/<pid>/status` and
 # `clear_refs`): another OS SKIPs, as a missing fio does. A missing fio
@@ -116,6 +118,24 @@ daemon_field_kib() { awk -v k="$1:" '$1 == k { print $2 }' "/proc/$MOUNT_PID/sta
 
 reset_peak_rss() { echo 5 >"/proc/$MOUNT_PID/clear_refs" 2>/dev/null || true; }
 
+# What the mount actually negotiated (plan 38 §5's per-mount `transport`),
+# as against `$TRANSPORT`, which is only what it was *asked* for: `auto`
+# falls back to `dev_fuse` on a kernel below 6.14, with
+# `fuse.enable_uring=N`, in a build without the `io-uring` feature, or
+# under a sandbox that denies `io_uring_setup(2)`. Recorded in every
+# result line so a ring leg that silently never reached the ring is
+# visible in the numbers rather than taken on trust.
+negotiated_transport() {
+    "$BIN" status "$FS_NAME" --state-dir "$STATE" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    m = json.load(sys.stdin)["mounts"]
+except Exception:
+    m = []
+print((m[0].get("transport") or "unknown") if m else "unknown")
+' || echo unknown
+}
+
 # The daemon's own chunk-memory-cache counters, which say what the CPU
 # numbers cannot on a noisy host: `misses` is one whole-chunk disk read
 # plus (under `always`, or for an unverified entry) one blake3 pass, so
@@ -158,6 +178,7 @@ run_fio() {
         return 1
     fi
     jq -c --arg lane "$lane" --arg transport "$TRANSPORT" \
+        --arg negotiated "$(negotiated_transport)" \
         --argjson rep "$rep" \
         --argjson cpu_s "$(awk -v a="$c0" -v b="$c1" -v t="$TICKS" 'BEGIN{printf "%.4f", (b-a)/t}')" \
         --argjson wall_s "$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b-a}')" \
@@ -171,7 +192,7 @@ run_fio() {
         '
         .jobs[0].read as $r
         | ($r.io_bytes / 1073741824) as $gib
-        | {lane: $lane, rep: $rep, transport: $transport,
+        | {lane: $lane, rep: $rep, transport: $transport, negotiated: $negotiated,
            read_gib: ($gib * 1000 | round / 1000),
            bw_mib_s: ($r.bw / 1024 * 10 | round / 10),
            iops: ($r.iops | . * 10 | round / 10),
@@ -184,7 +205,7 @@ run_fio() {
            memcache_hits: $mem_hits, memcache_misses: $mem_misses,
            memcache_chunks: $mem_chunks}
         ' "$json" >>"$OUT"
-    tail -1 "$OUT" | jq -r '"  \(.lane) r\(.rep): \(.bw_mib_s) MiB/s  \(.cpu_s_per_gib) cpu-s/GiB  \(.rss_hwm_mib) MiB peak RSS  \(.memcache_misses) memcache misses"'
+    tail -1 "$OUT" | jq -r '"  \(.lane) r\(.rep) [\(.negotiated)]: \(.bw_mib_s) MiB/s  \(.cpu_s_per_gib) cpu-s/GiB  \(.rss_hwm_mib) MiB peak RSS  \(.memcache_misses) memcache misses"'
 }
 
 # --- data ------------------------------------------------------------------

@@ -54,6 +54,9 @@ mod ovh;
 /// `daemon.lock` still held by a daemon the kernel has killed.
 mod rejoin;
 mod slowseal;
+/// Plan 38 §6/§3(e): the transport a mount negotiates, and whether a
+/// session on it can be handed over.
+mod transport;
 mod watermark;
 /// The small-file write path: S3 round trips per close, `back` for
 /// non-owners.
@@ -1330,6 +1333,16 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: handover::upgrade_under_load,
+    },
+    Scenario {
+        name: "transport-detach-refused",
+        desc: "plan 38 §3(e): a mount that asked for the transport ladder (auto) under load \
+               while `daemon --upgrade` runs -- refused with an error naming the transport on \
+               a ring session (no request lost, the mount keeps serving, node.status still \
+               reports uring), served on a session that fell back to dev_fuse",
+        requires: &[],
+        caps: &[],
+        run: transport::transport_detach_refused,
     },
     Scenario {
         name: "lifecycle-suspend-mid-write",

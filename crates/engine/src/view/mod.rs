@@ -129,6 +129,8 @@ mod qos_tests;
 #[cfg(test)]
 mod quota_tests;
 #[cfg(test)]
+mod staging_code_tests;
+#[cfg(test)]
 mod vfs_tests;
 
 use passthrough::PassthroughHandle;
@@ -387,7 +389,24 @@ pub struct View {
 fn staging_code(e: &crate::staging::StagingError) -> Code {
     match e {
         crate::staging::StagingError::Full { .. } => Code::NoSpace,
-        crate::staging::StagingError::Io(_) => Code::Io,
+        // A length the staging *filesystem* refuses as too large is
+        // `EFBIG`, not `EIO`: the state directory's own maximum file size
+        // bounds a sparse `ftruncate` of a staging file (ext4 stops at
+        // 16 TiB), and a `truncate(2)` past the maximum is exactly what
+        // POSIX gives `EFBIG` for. Found by pjdfstest's `truncate/12.t`
+        // and `ftruncate/12.t`, which truncate to ~909 TiB and accept
+        // `EFBIG`, `EINVAL` or success: with the state directory on ext4
+        // they saw `EIO` and failed (and on a filesystem with no such
+        // limit, like the ZFS the compliance lane's own host uses, the
+        // truncate simply succeeds, which is why the lane never showed
+        // it). Only this one errno changes shape; every other staging IO
+        // error keeps today's `Code::Io` rather than taking the whole
+        // `from_io_error` mapping, which would restate the write path's
+        // refusals wholesale.
+        crate::staging::StagingError::Io(e) => match Code::from_io_error(e) {
+            Code::FileTooBig => Code::FileTooBig,
+            _ => Code::Io,
+        },
     }
 }
 
