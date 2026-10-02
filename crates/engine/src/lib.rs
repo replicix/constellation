@@ -63,6 +63,7 @@ pub mod scan;
 pub mod shipper;
 mod singleton;
 pub mod snapacct;
+pub mod snapsched;
 pub mod snapshot;
 pub mod snapshot_batch;
 pub mod snapwalk;

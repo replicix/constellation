@@ -1,10 +1,27 @@
 //! The `snapshot.policy.*` methods (plan 32): automatic snapshot
 //! schedules, as the control protocol exposes them.
 //!
-//! M1 has only the read-only pair — `snapshot.policy.check` (Step 5's
-//! `policy check`) and `snapshot.policy.simulate` (Step 2's simulation,
-//! the web UI's retention timeline). M2 adds `set/show/list/remove/pause`
-//! here, M3 the scheduler's status.
+//! - `check` (Step 5's `policy check`) and `simulate` (Step 2's
+//!   simulation, the web UI's retention timeline) read only (M1).
+//! - `list` and `show` read the binding (M2): the policy roots are the
+//!   directories carrying [`SNAPSHOT_POLICY_XATTR`], found through the
+//!   replica's `xattr_by_name` index (`Meta::snapshot_policy_roots`) —
+//!   there is no registry. `list` adds the *orphaned* streams: auto
+//!   snapshots whose `policy_ino` carries no parseable policy, which are
+//!   never expired automatically (Step 4.2).
+//! - `set`, `remove` and `pause` write the binding (M2). Each writes the
+//!   xattr exactly as a `setxattr` would: through the service's own
+//!   whole-filesystem View ([`ControlVfs`]), so the View's setxattr gate
+//!   validates it and the mutation is forwarded to the holder like any
+//!   other. Never a direct `Meta` write: on a non-holder that would fork
+//!   the replica.
+//!
+//! Nothing here creates or deletes a snapshot; the scheduler (M3) and
+//! expiry (M4) do. `set` therefore only *previews* what a policy would
+//! expire, and guards it server-side: an expiring change is written only
+//! when the caller confirms the exact count it was shown
+//! (`confirm_expiring`, Step 7.3), so a stale client cannot confirm a
+//! different delta.
 //!
 //! Every number and verdict comes from `constellation_meta::snapsched`:
 //! the parse and the bound from [`SnapPolicy`], the verdicts from
@@ -26,18 +43,34 @@
 //! starts and its synthetic ticks are placed from. Verdicts over real
 //! rows do not depend on it (retention anchors on the newest candidate,
 //! never on the wall clock).
+//!
+//! ## What is stored
+//!
+//! A plain `setxattr` stores its bytes verbatim once the gate accepts
+//! them (plan 22's posture: what you set is what you read back). `set`
+//! and `pause` store the *canonical* form, which they compute anyway and
+//! which is what every reader displays; a later `pause` therefore also
+//! canonicalizes a verbatim expression.
 
-use super::{unary, EngineControl};
-use constellation_control::methods::{SnapshotPolicyCheck, SnapshotPolicySimulate};
+use super::{unary, ControlVfs, EngineControl};
+use constellation_control::methods::{
+    SnapshotPolicyCheck, SnapshotPolicyList, SnapshotPolicyPause, SnapshotPolicyRemove,
+    SnapshotPolicySet, SnapshotPolicyShow, SnapshotPolicySimulate,
+};
 use constellation_control::proto::types::{
     PolicyErrorInfo, SnapPolicyAgainst, SnapPolicyCheckParams, SnapPolicyCheckResult,
-    SnapPolicySimulateParams, SnapReason, SnapTimeline, SnapVerdict,
+    SnapPolicyDelta, SnapPolicyListing, SnapPolicyPauseParams, SnapPolicyRemoveParams,
+    SnapPolicyRoot, SnapPolicySetParams, SnapPolicyShown, SnapPolicySimulateParams, SnapReason,
+    SnapTimeline, SnapVerdict,
 };
-use constellation_control::proto::ControlError;
+use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_control::Router;
 use constellation_fs_core::InodeKind;
-use constellation_meta::snapsched::{check, retention, SnapFacts, SnapPolicy};
+use constellation_meta::snapsched::{
+    check, retention, SnapFacts, SnapPolicy, SNAPSHOT_POLICY_XATTR,
+};
 use constellation_meta::{Meta, MetaStore, SnapshotRow};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
@@ -47,6 +80,54 @@ pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     unary::<SnapshotPolicySimulate>(r, svc, |s, _, p| {
         policy_simulate(&s.meta, &p, constellation_store_s3::lease::now_unix_ms())
     });
+    unary::<SnapshotPolicyList>(r, svc, |s, _, _| policy_list(&s.meta));
+    unary::<SnapshotPolicyShow>(r, svc, |s, _, p| policy_show(&s.meta, &p.path));
+    unary::<SnapshotPolicySet>(r, svc, |s, c, p| {
+        let writer = Writer::new(s.browser(&c.principal)?);
+        policy_set(&s.meta, &writer, &p)
+    });
+    unary::<SnapshotPolicyRemove>(r, svc, |s, c, p| {
+        let writer = Writer::new(s.browser(&c.principal)?);
+        policy_remove(&s.meta, &writer, &p)
+    });
+    unary::<SnapshotPolicyPause>(r, svc, |s, c, p| {
+        let writer = Writer::new(s.browser(&c.principal)?);
+        policy_pause(&s.meta, &writer, &p)
+    });
+}
+
+/// What `expire` answers until the scheduler's expiry step (M4) exists.
+pub const REMOVE_EXPIRE_REFUSED: &str = "`expire` is not available yet: deleting a policy's \
+     snapshots ships with the scheduler's expiry step; remove the policy without it, and its \
+     auto snapshots are kept (orphaned)";
+
+/// `set`'s grace note until M4 replaces it with the real grace window.
+pub const GRACE_NOTE_INACTIVE: &str =
+    "nothing is deleted now: expiry is not active until the scheduler's expiry step ships";
+
+/// Writes a directory's policy xattr the way a `setxattr` would: through
+/// the View, as the calling principal, addressed to the inode that was
+/// evaluated ([`ControlVfs::snapshot_policy`]: a rename in between is a
+/// `conflict`). A refusal by the View's gate carries the gate's own
+/// reason, returned by the gate itself — never read back from the
+/// node-wide `last_parse_error` slot, which any concurrent `setfattr`
+/// may overwrite.
+struct Writer {
+    vfs: ControlVfs,
+}
+
+impl Writer {
+    fn new(vfs: ControlVfs) -> Writer {
+        Writer { vfs }
+    }
+
+    fn set(&self, root: &Root, value: &str) -> Result<(), ControlError> {
+        self.vfs.snapshot_policy(&root.path, root.ino, Some(value))
+    }
+
+    fn remove(&self, root: &Root) -> Result<(), ControlError> {
+        self.vfs.snapshot_policy(&root.path, root.ino, None)
+    }
 }
 
 /// A directory as a policy root: its normalized path, inode and rows,
@@ -101,6 +182,38 @@ fn origin_name(origin: u8) -> String {
     }
 }
 
+/// `policy` evaluated over `root`'s real rows, as if it were the
+/// directory's policy: every verdict, oldest first.
+fn against_of(policy: &SnapPolicy, root: &Root) -> SnapPolicyAgainst {
+    let facts: Vec<SnapFacts> = root.rows.iter().map(SnapFacts::from_row).collect();
+    let verdicts = retention::evaluate(policy, root.ino, &facts);
+    let verdicts: Vec<SnapVerdict> = root
+        .rows
+        .iter()
+        .zip(&verdicts)
+        .map(|(row, v)| SnapVerdict {
+            id: row.id.clone(),
+            path: row.path.clone(),
+            name: row.name.clone(),
+            created_unix_ms: row.created_unix_ms,
+            origin: origin_name(row.origin),
+            policy_ino: row.policy_ino,
+            held: row.held,
+            held_by: row.held_by.clone().filter(|by| !by.is_empty()),
+            keep: v.keep,
+            reasons: v.reasons.iter().map(mirror::<SnapReason>).collect(),
+            expires_unix_ms: v.expires_at,
+        })
+        .collect();
+    SnapPolicyAgainst {
+        path: root.path.clone(),
+        policy_ino: root.ino,
+        snapshots: verdicts.len() as u32,
+        would_expire: verdicts.iter().filter(|v| !v.keep).count() as u32,
+        verdicts,
+    }
+}
+
 /// `snapshot.policy.check` without `against`, needing no daemon: the
 /// CLI's local `policy check` calls this directly, so the daemonless and
 /// the daemon answers are the same code.
@@ -140,34 +253,7 @@ fn check_over(
     };
     let horizon = simulate_ms.map(|ms| i64::try_from(ms).unwrap_or(i64::MAX));
     let report = check::check(&policy, ino, &facts, now_ms, horizon);
-    let against = root.map(|root| {
-        let verdicts = retention::evaluate(&policy, root.ino, &facts);
-        let verdicts: Vec<SnapVerdict> = root
-            .rows
-            .iter()
-            .zip(&verdicts)
-            .map(|(row, v)| SnapVerdict {
-                id: row.id.clone(),
-                path: row.path.clone(),
-                name: row.name.clone(),
-                created_unix_ms: row.created_unix_ms,
-                origin: origin_name(row.origin),
-                policy_ino: row.policy_ino,
-                held: row.held,
-                held_by: row.held_by.clone().filter(|by| !by.is_empty()),
-                keep: v.keep,
-                reasons: v.reasons.iter().map(mirror::<SnapReason>).collect(),
-                expires_unix_ms: v.expires_at,
-            })
-            .collect();
-        SnapPolicyAgainst {
-            path: root.path.clone(),
-            policy_ino: root.ino,
-            snapshots: verdicts.len() as u32,
-            would_expire: verdicts.iter().filter(|v| !v.keep).count() as u32,
-            verdicts,
-        }
-    });
+    let against = root.map(|root| against_of(&policy, root));
     SnapPolicyCheckResult {
         ok: true,
         canonical: Some(report.canonical),
@@ -217,6 +303,221 @@ pub(crate) fn policy_simulate(
     let horizon = i64::try_from(p.horizon_ms).unwrap_or(i64::MAX);
     let timeline = retention::simulate(&policy, ino, &facts, now_ms, horizon);
     Ok(mirror(&timeline))
+}
+
+fn internal(e: constellation_meta::MetaError) -> ControlError {
+    ControlError::failed(e.to_string())
+}
+
+/// The policy xattr on `ino`, lossily as text; `None` when it has none.
+fn stored_policy(meta: &Meta, ino: u64) -> Result<Option<String>, ControlError> {
+    Ok(meta
+        .get_xattr(ino, SNAPSHOT_POLICY_XATTR)
+        .map_err(internal)?
+        .map(|v| String::from_utf8_lossy(&v).into_owned()))
+}
+
+/// Where `ino` is now; `None` once it is no longer linked anywhere.
+fn current_path(meta: &Meta, ino: u64) -> Option<String> {
+    if ino == constellation_fs_core::types::ROOT_INO {
+        return Some("/".into());
+    }
+    match meta.parents_of(ino) {
+        Ok(parents) if !parents.is_empty() => meta.path_of(ino).ok(),
+        _ => None,
+    }
+}
+
+/// The [`SnapPolicyRoot`] of `ino` carrying `expr` (or nothing), given
+/// every snapshot row.
+fn root_status(meta: &Meta, ino: u64, expr: Option<&str>, rows: &[SnapshotRow]) -> SnapPolicyRoot {
+    let auto_snapshots = rows
+        .iter()
+        .filter(|r| r.origin == 1 && r.policy_ino == ino)
+        .count() as u32;
+    let parsed = expr.map(SnapPolicy::parse);
+    let (canonical, paused, error) = match &parsed {
+        Some(Ok(policy)) => (Some(policy.to_string()), policy.paused, None),
+        Some(Err(e)) => (
+            None,
+            false,
+            Some(PolicyErrorInfo {
+                offset: e.offset as u64,
+                message: e.msg.clone(),
+            }),
+        ),
+        None => (None, false, None),
+    };
+    SnapPolicyRoot {
+        ino,
+        path: current_path(meta, ino),
+        expr: expr.unwrap_or_default().to_string(),
+        canonical,
+        paused,
+        error,
+        auto_snapshots,
+        orphaned: auto_snapshots > 0 && !matches!(parsed, Some(Ok(_))),
+    }
+}
+
+/// `snapshot.policy.list`: the policy roots, then the orphaned streams
+/// (auto snapshots whose `policy_ino` carries no policy at all), each
+/// ascending by inode. An unparseable root is listed once, as a root,
+/// with `orphaned` set when it has auto snapshots.
+pub(crate) fn policy_list(meta: &Meta) -> Result<SnapPolicyListing, ControlError> {
+    let marked = meta.snapshot_policy_roots().map_err(internal)?;
+    let rows = meta.snapshots(None).map_err(internal)?;
+    let mut roots: Vec<SnapPolicyRoot> = marked
+        .iter()
+        .map(|(ino, expr)| root_status(meta, *ino, Some(expr), &rows))
+        .collect();
+    let marked: BTreeSet<u64> = marked.iter().map(|(ino, _)| *ino).collect();
+    let orphans: BTreeSet<u64> = rows
+        .iter()
+        .filter(|r| r.origin == 1 && r.policy_ino != 0 && !marked.contains(&r.policy_ino))
+        .map(|r| r.policy_ino)
+        .collect();
+    roots.extend(
+        orphans
+            .into_iter()
+            .map(|ino| root_status(meta, ino, None, &rows)),
+    );
+    Ok(SnapPolicyListing { roots })
+}
+
+/// `snapshot.policy.show`.
+pub(crate) fn policy_show(meta: &Meta, path: &str) -> Result<SnapPolicyShown, ControlError> {
+    let root = root_of(meta, path)?;
+    let expr = stored_policy(meta, root.ino)?;
+    let all = meta.snapshots(None).map_err(internal)?;
+    let status = root_status(meta, root.ino, expr.as_deref(), &all);
+    if expr.is_none() && status.auto_snapshots == 0 {
+        return Err(ControlError::not_found(format!(
+            "{}: no snapshot policy",
+            root.path
+        )));
+    }
+    let verdicts = match expr.as_deref().map(SnapPolicy::parse) {
+        Some(Ok(policy)) => Some(against_of(&policy, &root)),
+        _ => None,
+    };
+    Ok(SnapPolicyShown {
+        root: status,
+        verdicts,
+    })
+}
+
+fn invalid_policy(e: constellation_meta::policy_lex::PolicyError) -> ControlError {
+    ControlError::invalid(format!("invalid policy {e}")).with_details(serde_json::json!({
+        "offset": e.offset,
+        "message": e.msg,
+    }))
+}
+
+/// `snapshot.policy.set`.
+///
+/// The guard covers a paused policy too: it expires nothing while
+/// paused, but resuming it is a `pause` call, which never asks again.
+/// `confirm_expiring` matters only when the policy would expire
+/// something; confirming a count for a change that expires nothing
+/// writes (nothing is at stake).
+fn policy_set(
+    meta: &Meta,
+    writer: &Writer,
+    p: &SnapPolicySetParams,
+) -> Result<SnapPolicyDelta, ControlError> {
+    let policy = SnapPolicy::parse(&p.expr).map_err(invalid_policy)?;
+    let root = root_of(meta, &p.path)?;
+    let previous = stored_policy(meta, root.ino)?;
+    let against = against_of(&policy, &root);
+    let mut delta = SnapPolicyDelta {
+        path: root.path.clone(),
+        ino: root.ino,
+        canonical: policy.to_string(),
+        previous,
+        creates_every: if policy.paused {
+            None
+        } else {
+            policy.finest().map(|every| every.to_string())
+        },
+        would_expire: against.would_expire,
+        would_expire_ids: against
+            .verdicts
+            .iter()
+            .filter(|v| !v.keep)
+            .map(|v| v.id.clone())
+            .collect(),
+        grace_note: GRACE_NOTE_INACTIVE.to_string(),
+        warnings: check::warnings(&policy),
+        written: false,
+    };
+    if p.dry_run {
+        return Ok(delta);
+    }
+    if delta.would_expire > 0 && p.confirm_expiring != Some(delta.would_expire) {
+        let asked = match p.confirm_expiring {
+            None => "no confirmation was given".to_string(),
+            Some(n) => format!("the confirmation was for {n}"),
+        };
+        return Err(ControlError::new(
+            ErrorKind::Conflict,
+            format!(
+                "{}: this policy would expire {} snapshot(s) and {asked}; \
+                 review the delta and confirm exactly {}",
+                root.path, delta.would_expire, delta.would_expire
+            ),
+        )
+        .with_details(serde_json::to_value(&delta).unwrap_or_default())
+        .with_remediation(format!("pass confirm_expiring = {}", delta.would_expire)));
+    }
+    writer.set(&root, &delta.canonical)?;
+    delta.written = true;
+    Ok(delta)
+}
+
+/// `snapshot.policy.remove`. The root's auto snapshots stay, orphaned:
+/// removing a policy freezes its snapshots and never sweeps them.
+fn policy_remove(
+    meta: &Meta,
+    writer: &Writer,
+    p: &SnapPolicyRemoveParams,
+) -> Result<SnapPolicyRoot, ControlError> {
+    if p.expire {
+        return Err(ControlError::unsupported(REMOVE_EXPIRE_REFUSED));
+    }
+    let root = root_of(meta, &p.path)?;
+    if stored_policy(meta, root.ino)?.is_none() {
+        return Err(ControlError::not_found(format!(
+            "{}: no snapshot policy",
+            root.path
+        )));
+    }
+    writer.remove(&root)?;
+    let rows = meta.snapshots(None).map_err(internal)?;
+    Ok(root_status(meta, root.ino, None, &rows))
+}
+
+/// `snapshot.policy.pause`: the stored policy, re-parsed, with `paused`
+/// set or cleared, written back in canonical form.
+fn policy_pause(
+    meta: &Meta,
+    writer: &Writer,
+    p: &SnapPolicyPauseParams,
+) -> Result<SnapPolicyRoot, ControlError> {
+    let root = root_of(meta, &p.path)?;
+    let expr = stored_policy(meta, root.ino)?
+        .ok_or_else(|| ControlError::not_found(format!("{}: no snapshot policy", root.path)))?;
+    let mut policy = SnapPolicy::parse(&expr).map_err(|e| {
+        ControlError::invalid(format!(
+            "{}: the stored policy does not parse ({e}); set a valid one first",
+            root.path
+        ))
+    })?;
+    policy.paused = p.paused;
+    let canonical = policy.to_string();
+    writer.set(&root, &canonical)?;
+    let rows = meta.snapshots(None).map_err(internal)?;
+    Ok(root_status(meta, root.ino, Some(&canonical), &rows))
 }
 
 #[cfg(test)]
@@ -472,5 +773,67 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(bad.kind, ErrorKind::Invalid);
+    }
+
+    /// `list` over what replay may hold: an unparseable expression
+    /// (replay never validates), a parseable one, and auto snapshots of
+    /// a directory that is gone — its stream is orphaned, with no path.
+    #[test]
+    fn list_reports_roots_unparseable_ones_and_orphaned_streams() {
+        use constellation_meta::SetXattrMode;
+        let meta = Meta::open_in_memory().unwrap();
+        let good = mkdir(&meta, "good");
+        let bad = mkdir(&meta, "bad");
+        let gone = mkdir(&meta, "gone");
+        meta.set_xattr(
+            good,
+            SNAPSHOT_POLICY_XATTR,
+            b"1d:7d 1h:1d",
+            SetXattrMode::Set,
+        )
+        .unwrap();
+        meta.set_xattr(
+            bad,
+            SNAPSHOT_POLICY_XATTR,
+            b"1h:1d 7m:1d",
+            SetXattrMode::Set,
+        )
+        .unwrap();
+        meta.record_snapshot(&auto("b1", "/bad", NOW - HOUR, bad))
+            .unwrap();
+        meta.record_snapshot(&auto("g1", "/good", NOW - HOUR, good))
+            .unwrap();
+        meta.record_snapshot(&auto("x1", "/gone", NOW - 2 * HOUR, gone))
+            .unwrap();
+        meta.record_snapshot(&auto("x2", "/gone", NOW - HOUR, gone))
+            .unwrap();
+        meta.rmdir(constellation_fs_core::types::ROOT_INO, "gone")
+            .unwrap();
+
+        let roots = policy_list(&meta).unwrap().roots;
+        let inos: Vec<u64> = roots.iter().map(|r| r.ino).collect();
+        assert_eq!(inos, [good, bad, gone], "roots by ino, then orphans");
+        let [g, b, x] = &roots[..] else {
+            unreachable!()
+        };
+        assert_eq!(g.path.as_deref(), Some("/good"));
+        assert_eq!(g.canonical.as_deref(), Some("1h:1d 1d:7d"));
+        assert_eq!((g.auto_snapshots, g.orphaned, g.paused), (1, false, false));
+        assert_eq!(b.expr, "1h:1d 7m:1d");
+        assert_eq!(b.canonical, None);
+        assert_eq!(b.error.as_ref().map(|e| e.offset), Some(6));
+        assert!(b.orphaned, "an unparseable policy orphans its snapshots");
+        assert_eq!(x.path, None, "the directory is gone");
+        assert_eq!(
+            (x.expr.as_str(), x.auto_snapshots, x.orphaned),
+            ("", 2, true)
+        );
+
+        // `show` refuses a directory with neither a policy nor autos.
+        mkdir(&meta, "plain");
+        let e = policy_show(&meta, "/plain").unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotFound);
+        let shown = policy_show(&meta, "/bad").unwrap();
+        assert!(shown.verdicts.is_none() && shown.root.orphaned);
     }
 }

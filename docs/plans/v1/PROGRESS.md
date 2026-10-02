@@ -31425,3 +31425,115 @@ that also reads as "missing".
   ~280 s while the two committers alternated. The root logged repeated
   "recall went unanswered; outwaited it" for the reader's grant. That run
   also falls inside bridge churn.
+
+## Plan 32 M2a (policy binding)
+
+**Chunk `32-m2a` of [plan 32](wip/32-snapshot-policies-and-space.md) M2 (Step
+3.1, plus the Step 5/7.3/7.6 control surface of the binding).** A snapshot
+policy can now be set, shown, listed, paused and removed, through `setfattr`
+or the control protocol. **Nothing runs yet**: no scheduler (M3), no expiry
+(M4); `set` only previews what a policy would expire. The policy lives only in
+the `user.constellation.snapshots` xattr — no registry. The CLI verbs are
+`32-m2b`.
+
+| Item | State | Where |
+|---|---|---|
+| setxattr gate for `SNAPSHOT_POLICY_XATTR`, next to prune's: shared directories only (`EINVAL` for anything else), never a scratch root, a scratch entry, or a shared directory below a scratch root (`EINVAL`); `SnapPolicy::parse` or `EINVAL`. Every refusal's reason (expression, byte offset, message) lands in `SnapSchedStats::last_parse_error` → `node.status.snapsched.last_parse_error`. The converse is gated too: marking `user.constellation.scratch=1` on a policy root **or any ancestor of one** is `EINVAL` (each `snapshot_policy_roots()` entry walked up its `parent_of` chain), recorded in `last_parse_error` under the expression `user.constellation.scratch=1` with a message starting "scratch refused". Replay never validates | DONE | `crates/engine/src/view/ops.rs` (`View::snapshot_policy_gate`) |
+| `browse.xattr` hits the same gate: it already drives the View's `setxattr` through `ControlVfs` (verified, test below) | DONE | `crates/engine/src/control/browse.rs` (unchanged) |
+| Root discovery `Meta::snapshot_policy_roots() -> Vec<(Ino, String)>`; `prune_roots` is now a thin wrapper over the shared `xattr_roots(name)` scan of `xattr_by_name` | DONE | `crates/meta/src/store/misc.rs` |
+| `SnapSchedStats` with **every Step 9 field** (`ticks`, `leader`, `roots`, `paused_roots`, `unparseable_roots`, `capped_roots`, `orphaned_snapshots`, `created`, `skipped_empty`, `create_failed`, `expired`, `skipped_reverify`, `skipped_grace`, `budget_expired`, `budget_stale`, `refused_lag`, `refused_state`, `last_create_unix_ms`, `last_error`, `last_parse_error`), created in `node.rs`, threaded to every `View` like `prune_stats` (`ViewDeps::snapsched_stats`) and to `EngineControl` | DONE | `crates/engine/src/snapsched.rs` (new), `crates/engine/src/node.rs`, `crates/engine/src/view/mod.rs`, `crates/engine/src/control/mod.rs` |
+| `StatusReport.snapsched: SnapSchedStatus` (all 20 fields, zero until M3/M4) | DONE | `crates/control/src/proto/types.rs`, `crates/engine/src/control/service.rs` |
+| Control methods `snapshot.policy.list` / `show` (viewer, read-only), `set` / `remove` / `pause` (admin, mutating, audited); table doc comments, role table, 65 methods; stub router + sample params; schema re-blessed; parity sweep rows | DONE | `crates/control/src/methods.rs`, `crates/control/src/tests.rs`, `crates/control/schema/control.schema.json`, `crates/engine/src/control/snapsched.rs`, `crates/engine/src/control/parity_tests.rs` |
+| `set`'s server-side expiry guard (Step 7.3): evaluates the new policy over the root's real rows with `retention::evaluate`; refuses (`conflict`, the delta as `details`, remediation `pass confirm_expiring = N`) when `would_expire > 0` unless `confirm_expiring == Some(would_expire)`; `dry_run` never writes | DONE | `crates/engine/src/control/snapsched.rs` (`policy_set`) |
+| `remove {expire: false}` orphans (rows untouched); `remove {expire: true}` refused (`unsupported`, `REMOVE_EXPIRE_REFUSED`) until M4 | DONE | `crates/engine/src/control/snapsched.rs` |
+| Tests: the gate end to end (file, scratch root, below scratch, bad expression with offset in status, verbatim storage, converse scratch marking, `set` through the gate with the reason in the message); `set` refusal without / with a wrong `confirm_expiring`, success with the right one, dry run writes nothing, a non-expiring change needs no confirmation; pause round trip; rename keeps the root; `remove` orphans and deletes nothing; `node.status.snapsched` has all 20 keys; `list` over replay-only states (unparseable root, deleted directory → `path: null`); root discovery across a rename | DONE | `crates/engine/src/control/snapsched_tests.rs` (2, new), `crates/engine/src/control/snapsched.rs` (`list_reports_roots_unparseable_ones_and_orphaned_streams`), `crates/meta/tests/prune_binding.rs` (`snapshot_policy_roots_follow_the_inode_across_a_rename`) |
+| Doc: scratch roots cannot carry a snapshot policy | DONE | `docs/reference/features/scratch-directories.md` |
+
+### Method shapes
+
+| Method | Role | Params → result |
+|---|---|---|
+| `snapshot.policy.list` | viewer | `{}` → `SnapPolicyListing { roots: [SnapPolicyRoot] }` |
+| `snapshot.policy.show` | viewer | `PathParams {path}` → `SnapPolicyShown { root: SnapPolicyRoot, verdicts: Option<SnapPolicyAgainst> }` |
+| `snapshot.policy.set` | admin | `SnapPolicySetParams {path, expr, confirm_expiring: Option<u32>, dry_run}` → `SnapPolicyDelta {path, ino, canonical, previous, creates_every, would_expire, would_expire_ids, grace_note, warnings, written}` |
+| `snapshot.policy.remove` | admin | `SnapPolicyRemoveParams {path, expire, confirm_expiring}` → `SnapPolicyRoot` (as it now stands) |
+| `snapshot.policy.pause` | admin | `SnapPolicyPauseParams {path, paused}` → `SnapPolicyRoot` |
+
+`SnapPolicyRoot = {ino, path: Option (None once unlinked), expr (as stored;
+"" without a policy), canonical: Option, paused, error: Option<{offset,
+message}>, auto_snapshots: u32, orphaned}`.
+
+### Decisions taken here (the brief left them open)
+
+- **Storage: verbatim for `setxattr`, canonical for the methods.** A plain
+  `setfattr` stores its bytes as given once the gate accepts them (plan 22's
+  posture: what you set reads back). `snapshot.policy.set` and `pause` write
+  the canonical form, which they compute anyway and every reader displays;
+  `pause` therefore canonicalizes a verbatim expression. `list`/`show` report
+  both `expr` and `canonical`.
+- **How `set` reaches the metadata path.** Through the control service's own
+  whole-filesystem View (`EngineControl::browser`, the same `ControlVfs` as
+  `browse.xattr`), as the calling principal: the View's gate validates, and
+  `mutate_op` applies on the holder or forwards like any mutation. Never a
+  direct `Meta` write. The write is addressed to the inode `set`/`pause`/
+  `remove` evaluated (`ControlVfs::snapshot_policy`): if the path now names
+  another inode (renamed meanwhile) it is `conflict`. Before writing it runs
+  the View's own gate (`View::snapshot_policy_gate`, which *returns* its
+  reason), so a refusal is `invalid` with that reason in the message — never
+  read back from the node-wide `last_parse_error` slot, which a concurrent
+  `setfattr` could overwrite.
+  `set` parses first itself, so an invalid expression is `invalid` with
+  `details: {offset, message}` before anything else.
+- **`confirm_expiring` only matters when something would expire.** A change
+  that expires nothing is written whatever the confirmation says (nothing is
+  at stake); an expiring one needs exactly the count. The guard covers a
+  `paused` expression too (it would expire once resumed); `pause` itself never
+  asks, since resuming does not change the rule the operator already
+  confirmed.
+- **Orphaned** = the stream has auto snapshots and no *parseable* policy owns
+  them (removed, unparseable, directory gone), as Step 4.2 defines it. `list`
+  shows every xattr root (unparseable ones with `error` and, when they have
+  autos, `orphaned`), then every `policy_ino` of an auto row that carries no
+  policy at all, each ascending by inode. `show` answers `not_found` for a
+  directory with neither a policy nor auto snapshots, and omits `verdicts`
+  when the policy does not parse (or is gone).
+- **`creates_every`** is the finest tier's interval, absent for a paused
+  policy. **`grace_note`** is fixed text for now (`GRACE_NOTE_INACTIVE`:
+  "nothing is deleted now: expiry is not active until the scheduler's expiry
+  step ships"); M4 replaces it. `previous` (the replaced expression) was added
+  to the delta for the CLI's diff line. No `reclaim` (M5).
+- **Scratch is checked by ancestry**, not only at the root: a shared directory
+  can predate its parent's scratch marking, and the gate walks `parent_of` to
+  the root. The converse gate (no scratch marking on a policy root) is the
+  same rule seen from the other xattr.
+- **Not here:** `/metrics` export of `constellation_snapsched_*` (Step 9's
+  export is M8); `docs/reference/features/snapshot-policies.md` (Step 10, M8).
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | exit 0, no diff (`cargo fmt --all -- --check` exit 0) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0: **2050 passed, 0 failed** |
+| `CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`, then `cargo test -p constellation-control` | schema re-blessed; 135 passed |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `bash tests/integration.sh` | its body run by hand (`AWS_*` as in the script, `tests/smoke.sh s3://constellation-ci/run-m2a-…`) against the floci another agent already had on `:4566`: `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | exit 0 |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX=m2a target/release/harness run prune xattr-roundtrip scratch-publish web-ui-smoke snapshot-lifecycle e2e-basic e2e-two-nodes` | all 7 `PASSED`, `ALL SCENARIOS PASSED` |
+
+Review fix round: complete reverse scratch rule (ancestors of a policy root;
+`no_directory_at_or_above_a_policy_root_may_become_scratch`), gate returns its
+reason (`set_reports_the_gates_own_reason_not_the_shared_status_slot`), ino
+check between evaluation and write
+(`a_write_to_a_directory_renamed_since_evaluation_is_a_conflict`), doc lines on
+`browse.xattr` bypassing `confirm_expiring` and `remove`'s ignored
+`confirm_expiring` — all in `crates/engine/src/control/snapsched_tests.rs`.
+
+### Exit criteria (M2a)
+
+- [x] Step 3.1: the setxattr gate (directories only, no scratch, parse or `EINVAL` with the reason in status); replay never validates.
+- [x] Root discovery over `xattr_by_name`, rename-safe by inode.
+- [x] `SnapSchedStats` / `node.status.snapsched` with every Step 9 field.
+- [x] `snapshot.policy.{list,show,set,remove,pause}` with the `confirm_expiring` guard; schema blessed; parity rows.
+- [x] Nothing creates or deletes a snapshot; no retention math outside `meta::snapsched`.

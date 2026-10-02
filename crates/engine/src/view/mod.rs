@@ -289,6 +289,10 @@ pub struct FsDependencies {
     /// and the control plane; the setxattr gate records the last policy
     /// parse rejection here.
     pub prune_stats: Arc<crate::prune::PruneStats>,
+    /// Node-level snapshot-schedule counters (plan 32), shared with the
+    /// scheduler and the control plane; the setxattr gate records the
+    /// last snapshot-policy parse rejection here.
+    pub snapsched_stats: Arc<crate::snapsched::SnapSchedStats>,
     /// The kernel invalidation thread's registry of FUSE requests in
     /// flight (`kernel_inval`); `InFlight::disabled()` without one.
     pub inflight: crate::kernel_inval::InFlight,
@@ -359,6 +363,8 @@ pub struct View {
     pub(crate) atime: Arc<crate::atime::AtimeAccumulator>,
     /// Prune counters (plan 22), shared node-wide.
     pub(crate) prune_stats: Arc<crate::prune::PruneStats>,
+    /// Snapshot-schedule counters (plan 32), shared node-wide.
+    pub(crate) snapsched_stats: Arc<crate::snapsched::SnapSchedStats>,
     /// Requests in flight, for the kernel invalidation thread: a
     /// notification for an inode with a request in flight would block
     /// in the kernel until that request is answered (`kernel_inval`).
@@ -451,6 +457,7 @@ impl View {
             statfs_ttl: statfs_ttl_from_env(),
             atime: deps.atime,
             prune_stats: deps.prune_stats,
+            snapsched_stats: deps.snapsched_stats,
             inflight: deps.inflight,
             holds: deps.holds,
             watch: deps.watch,

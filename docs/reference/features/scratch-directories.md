@@ -68,6 +68,13 @@ manifest records are appended.
 - Scratch state is node-private and is not restored after a crash or remount.
 - A crash before Publish cannot leave a shared-log orphan.
 - Only regular files can be published.
+- A scratch root, or anything below one, cannot carry an automatic snapshot
+  policy (`user.constellation.snapshots`): snapshots of node-private content
+  are meaningless. `setxattr` answers `EINVAL`, and so does marking as
+  scratch a directory that carries a policy or has a policy root anywhere
+  below it. The refusal's reason is in `node.status` →
+  `snapsched.last_parse_error`, recorded against the expression
+  `user.constellation.scratch=1` with a message starting "scratch refused".
 - Scratch directory trees, symlinks, devices, and hard-link graphs cannot be
   promoted as a unit.
 

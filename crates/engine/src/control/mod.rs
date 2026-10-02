@@ -9,7 +9,7 @@
 //! embedding host calls it in-process through the same [`Router`]. It lives
 //! in the engine, not in the CLI, because every host of an engine (the
 //! desktop daemon today; plan 37's CSI engine pod, plan 36's Android
-//! service) needs the same 60 methods with the same semantics, and
+//! service) needs the same 65 methods with the same semantics, and
 //! everything they touch — the metadata replica, the sync task, the
 //! snapshot manager, the registry, the op watchdog — is the engine's.
 //!
@@ -55,6 +55,8 @@ mod streams;
 
 #[cfg(test)]
 mod parity_tests;
+#[cfg(test)]
+mod snapsched_tests;
 
 pub use browse::ControlVfs;
 
@@ -178,6 +180,7 @@ pub struct EngineControl {
     pub(crate) placement: Arc<crate::placement::Placement>,
     pub(crate) atime: Arc<crate::atime::AtimeAccumulator>,
     pub(crate) prune_stats: Arc<crate::prune::PruneStats>,
+    pub(crate) snapsched_stats: Arc<crate::snapsched::SnapSchedStats>,
     pub(crate) lease_mode: constellation_store_s3::LeaseMode,
     pub(crate) read_only_member: bool,
     pub(crate) last_sync_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -231,6 +234,7 @@ impl EngineControl {
             placement: e.placement().clone(),
             atime: e.atime().clone(),
             prune_stats: e.prune_stats().clone(),
+            snapsched_stats: e.snapsched_stats().clone(),
             lease_mode: e.lease_mode(),
             read_only_member: e.read_only_member(),
             last_sync_ms: e.last_sync_ms().clone(),

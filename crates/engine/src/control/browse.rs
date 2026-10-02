@@ -17,7 +17,7 @@
 
 use crate::view::View;
 use constellation_control::proto::types::{FileStat, WriteResult, XattrOp, XattrResult};
-use constellation_control::proto::ControlError;
+use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, Blocking, Caller, CollectDir, Durability, Entry, Fh, FileKind, LockOwner, Name, OpCtx,
@@ -454,6 +454,62 @@ impl ControlVfs {
             }
         }
         Ok(out)
+    }
+
+    /// Plan 32: set (`Some`) or remove (`None`) the snapshot-policy xattr
+    /// of the directory `path` names — provided it still is inode
+    /// `expected`, the directory the caller evaluated. A rename in between
+    /// is a `conflict`, so a guard computed over one directory's rows can
+    /// never land on another. The write is addressed by inode, and a value
+    /// is first put through the View's own gate so a refusal carries its
+    /// reason; the setxattr then meets that gate again, as any would.
+    pub(crate) fn snapshot_policy(
+        &self,
+        path: &str,
+        expected: u64,
+        value: Option<&str>,
+    ) -> Result<(), ControlError> {
+        let name = constellation_meta::snapsched::SNAPSHOT_POLICY_XATTR;
+        let ino = self.resolve(path)?;
+        if ino != expected {
+            return Err(ControlError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "{path}: now names inode {ino}, not the directory {expected} that was \
+                     evaluated (renamed meanwhile); retry"
+                ),
+            ));
+        }
+        let Some(value) = value else {
+            return Blocking::run(|r| {
+                self.view
+                    .removexattr(&self.cx(OpKind::Removexattr), ino, XattrName::new(name), r)
+            })
+            .map_err(|e| vfs_err(path, e));
+        };
+        if let Err(refusal) = self.view.snapshot_policy_gate(ino, value.as_bytes()) {
+            return Err(match refusal.reason {
+                Some((offset, msg)) => ControlError::invalid(format!("{path}: {msg}"))
+                    .with_details(serde_json::json!({
+                        "path": path,
+                        "offset": offset,
+                        "message": msg,
+                    })),
+                None => ControlError::from(refusal.code)
+                    .with_details(serde_json::json!({ "path": path })),
+            });
+        }
+        Blocking::run(|r| {
+            self.view.setxattr(
+                &self.cx(OpKind::Setxattr),
+                ino,
+                XattrName::new(name),
+                value.as_bytes(),
+                SetXattrFlags::empty(),
+                r,
+            )
+        })
+        .map_err(|e| vfs_err(path, e))
     }
 
     /// `statfs` of the view's root and its recursive size/count (the

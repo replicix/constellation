@@ -22,7 +22,7 @@
 //!
 //! Because [`METHODS`], [`visit_all`] and the `impl Method` blocks come out of
 //! the same macro invocation, "a method exists but is missing from the table"
-//! cannot happen; the tests instead pin the *contents* (60 methods, no
+//! cannot happen; the tests instead pin the *contents* (65 methods, no
 //! duplicates, every one of the 37 old `Request` variants maps to exactly
 //! one).
 //!
@@ -37,9 +37,9 @@
 //!
 //! | class | role | methods |
 //! |---|---|---|
-//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs`, `snapshot.policy.check/simulate`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
+//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs`, `snapshot.policy.check/simulate/list/show`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
 //! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
-//! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
+//! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete`, `snapshot.policy.set/remove/pause`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
 //! `fsck.run` is admin although a dry run only reads: one method, one role,
 //! and the same method repairs and force-releases. `browse.xattr` is
@@ -291,6 +291,40 @@ define_methods! {
     /// UI's retention timeline). An invalid expression is `invalid`.
     SnapshotPolicySimulate { name: "snapshot.policy.simulate", role: Viewer, mutating: false, stream: None,
         params: SnapPolicySimulateParams, result: SnapTimeline }
+    /// Every policy root — a directory carrying
+    /// `user.constellation.snapshots` — and every orphaned auto-snapshot
+    /// stream, with its expression, parse state and auto-snapshot count
+    /// (plan 32 Step 3.1). Reads the replica only.
+    SnapshotPolicyList { name: "snapshot.policy.list", role: Viewer, mutating: false, stream: None,
+        params: Empty, result: SnapPolicyListing }
+    /// One directory's policy and, when it parses, its verdict over the
+    /// directory's real snapshots. `not_found` for a directory with
+    /// neither a policy nor auto snapshots.
+    SnapshotPolicyShow { name: "snapshot.policy.show", role: Viewer, mutating: false, stream: None,
+        params: PathParams, result: SnapPolicyShown }
+    /// Bind a policy to a directory, writing the canonical expression as
+    /// the xattr through the same View path a `setxattr` takes (the
+    /// validation gate, then a forwarded mutation). Refuses (`conflict`,
+    /// the delta in `details`) a change that would expire snapshots unless
+    /// `confirm_expiring` equals that count; `dry_run` only reports. A
+    /// rename of the directory between evaluation and write is `conflict`.
+    /// The guard is this method's: a plain `setxattr` (FUSE, or
+    /// `browse.xattr` as an Operator) passes the same validation gate but
+    /// asks no confirmation, as plan 32 sanctions — expiry's grace window
+    /// (M4) is what protects that path.
+    SnapshotPolicySet { name: "snapshot.policy.set", role: Admin, mutating: true, stream: None,
+        params: SnapPolicySetParams, result: SnapPolicyDelta }
+    /// Unbind a directory's policy. Its auto snapshots become orphaned and
+    /// are never deleted automatically; `expire` is refused until expiry
+    /// ships (plan 32 M4), and `confirm_expiring` is accepted but ignored
+    /// until then.
+    SnapshotPolicyRemove { name: "snapshot.policy.remove", role: Admin, mutating: true, stream: None,
+        params: SnapPolicyRemoveParams, result: SnapPolicyRoot }
+    /// Pause or resume a directory's policy: rewrite its canonical
+    /// expression with or without `paused`. Never asks for confirmation —
+    /// the retention rule itself does not change.
+    SnapshotPolicyPause { name: "snapshot.policy.pause", role: Admin, mutating: true, stream: None,
+        params: SnapPolicyPauseParams, result: SnapPolicyRoot }
     /// Clone a snapshot to a destination path.
     CloneCreate { name: "clone.create", role: Operator, mutating: true, stream: None,
         params: CloneParams, result: Ack }
@@ -313,7 +347,10 @@ define_methods! {
         params: RenameParams, result: Ack }
     BrowseDelete { name: "browse.delete", role: Admin, mutating: true, stream: None,
         params: DeleteParams, result: Ack }
-    /// Get/list/set/remove extended attributes.
+    /// Get/list/set/remove extended attributes. Setting
+    /// `user.constellation.snapshots` here meets the View's policy gate
+    /// but not `snapshot.policy.set`'s `confirm_expiring` guard (a
+    /// `setxattr` never asks; plan 32 relies on expiry's grace window).
     BrowseXattr { name: "browse.xattr", role: Operator, mutating: true, stream: None,
         params: XattrParams, result: XattrResult }
 
@@ -485,8 +522,9 @@ mod tests {
         assert_eq!(unique.len(), METHODS.len(), "duplicate method names");
         assert_eq!(
             METHODS.len(),
-            60,
-            "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate"
+            65,
+            "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate \
+             + snapshot.policy.list/show/set/remove/pause"
         );
         for m in METHODS {
             assert!(
@@ -567,6 +605,8 @@ mod tests {
             "view.stats",
             "snapshot.policy.check",
             "snapshot.policy.simulate",
+            "snapshot.policy.list",
+            "snapshot.policy.show",
         ] {
             assert_eq!(role(n), Role::Viewer, "{n}");
             assert!(!method_info(n).unwrap().mutating, "{n}");
@@ -593,8 +633,12 @@ mod tests {
             "node.handoff",
             "node.lifecycle",
             "quota.set",
+            "snapshot.policy.set",
+            "snapshot.policy.remove",
+            "snapshot.policy.pause",
         ] {
             assert_eq!(role(n), Role::Admin, "{n}");
+            assert!(method_info(n).unwrap().mutating, "{n}");
         }
         // Every read-only viewer method is non-mutating; every mutating
         // method needs at least operator.

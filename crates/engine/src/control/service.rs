@@ -653,6 +653,7 @@ impl EngineControl {
                     last_parse_error: s.last_parse_error.lock().ok().and_then(|g| g.clone()),
                 }
             },
+            snapsched: self.snapsched_stats.status(),
             fuse_requests: fuse_requests_status(&self.engine.op_watch().snapshot()),
             lifecycle: self.engine.lifecycle().status(),
             s3: backend::s3_request_counts(),

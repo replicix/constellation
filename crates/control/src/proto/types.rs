@@ -548,6 +548,11 @@ pub struct StatusReport {
     /// every counter zero.
     #[serde(default)]
     pub prune: PruneStatus,
+    /// Automatic snapshot schedules (plan 32 Step 9). Every counter the
+    /// plan names is present from M2 on; they stay zero until the
+    /// scheduler (M3) and expiry (M4) run.
+    #[serde(default)]
+    pub snapsched: SnapSchedStatus,
     /// The FUSE request watchdog (EC2 campaign 7 B-2).
     #[serde(default)]
     pub fuse_requests: FuseRequestsStatus,
@@ -795,6 +800,69 @@ pub struct PruneStatus {
     #[serde(default)]
     pub last_run_unix_ms: u64,
     /// Last setxattr policy rejection: `(expression, byte_offset, message)`.
+    #[serde(default)]
+    pub last_parse_error: Option<(String, usize, String)>,
+}
+
+/// Snapshot-schedule counters (plan 32 Step 9), surfaced in
+/// `constellation status`, on the web UI, and in `/metrics`.
+///
+/// `unparseable_roots`, `capped_roots` or `refused_*` above zero mean
+/// snapshots are silently not being taken; `create_failed` climbing while
+/// `expired` stays at zero is the healthy outage signature (expiry
+/// anchors on the newest snapshot, so an outage freezes it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapSchedStatus {
+    /// Scheduler ticks run on this node.
+    #[serde(default)]
+    pub ticks: u64,
+    /// This node holds the scheduler's singleton lease.
+    #[serde(default)]
+    pub leader: bool,
+    /// Policy roots at the last tick, and of them the paused, the
+    /// unparseable (skipped: nothing created, nothing expired) and the
+    /// capped ones (too many live auto snapshots to create more).
+    #[serde(default)]
+    pub roots: u64,
+    #[serde(default)]
+    pub paused_roots: u64,
+    #[serde(default)]
+    pub unparseable_roots: u64,
+    #[serde(default)]
+    pub capped_roots: u64,
+    /// Auto snapshots whose root carries no parseable policy any more:
+    /// kept, never expired automatically.
+    #[serde(default)]
+    pub orphaned_snapshots: u64,
+    #[serde(default)]
+    pub created: u64,
+    #[serde(default)]
+    pub skipped_empty: u64,
+    #[serde(default)]
+    pub create_failed: u64,
+    #[serde(default)]
+    pub expired: u64,
+    /// Expiry victims whose row changed before the delete (now held,
+    /// gone, or re-owned), and so were not deleted.
+    #[serde(default)]
+    pub skipped_reverify: u64,
+    /// Expiry victims kept by the grace window after a policy change.
+    #[serde(default)]
+    pub skipped_grace: u64,
+    #[serde(default)]
+    pub budget_expired: u64,
+    #[serde(default)]
+    pub budget_stale: u64,
+    #[serde(default)]
+    pub refused_lag: u64,
+    #[serde(default)]
+    pub refused_state: u64,
+    #[serde(default)]
+    pub last_create_unix_ms: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// The last policy a setxattr refused: `(expression, byte_offset,
+    /// message)`.
     #[serde(default)]
     pub last_parse_error: Option<(String, usize, String)>,
 }
@@ -2176,6 +2244,120 @@ pub struct SnapshotDeleteParams {
 pub struct CloneParams {
     pub selector: String,
     pub destination: String,
+}
+
+/// A policy root (plan 32 Step 3.1) as `snapshot.policy.list/show/pause`
+/// report it: a directory carrying `user.constellation.snapshots`, or an
+/// orphaned stream — auto snapshots whose `policy_ino` carries no
+/// parseable policy (removed, or the directory is gone), which are never
+/// expired automatically (Step 4.2).
+///
+/// `ino` is the root's identity (a rename changes `path`, nothing else).
+/// `path` is where it is now, absent when the inode is no longer linked.
+/// `expr` is the xattr exactly as stored (empty for a removed policy),
+/// `canonical` its canonical form when it parses, `error` where it does
+/// not. `auto_snapshots` counts every row with `origin=auto` and this
+/// `policy_ino`, held ones included; `orphaned` is set when there are
+/// some and no parseable policy owns them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyRoot {
+    pub ino: u64,
+    #[serde(default)]
+    pub path: Option<String>,
+    pub expr: String,
+    #[serde(default)]
+    pub canonical: Option<String>,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub error: Option<PolicyErrorInfo>,
+    #[serde(default)]
+    pub auto_snapshots: u32,
+    #[serde(default)]
+    pub orphaned: bool,
+}
+
+/// `snapshot.policy.list`: every policy root, then every orphaned
+/// stream whose directory carries no policy at all, each ascending by
+/// inode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyListing {
+    pub roots: Vec<SnapPolicyRoot>,
+}
+
+/// `snapshot.policy.show`: the root, and — when its policy parses — the
+/// policy evaluated over the directory's real snapshots (the same shape
+/// `snapshot.policy.check {against}` returns). A paused policy is still
+/// evaluated: the verdicts are what it does once resumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyShown {
+    pub root: SnapPolicyRoot,
+    #[serde(default)]
+    pub verdicts: Option<SnapPolicyAgainst>,
+}
+
+/// `snapshot.policy.set`: bind `expr` to the directory `path`.
+///
+/// The new policy is evaluated over the directory's real snapshots
+/// first. When it would expire any, the daemon writes only if
+/// `confirm_expiring` equals that count — the previewed delta, so a
+/// stale client cannot confirm a different one. `dry_run` never writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicySetParams {
+    pub path: String,
+    pub expr: String,
+    #[serde(default)]
+    pub confirm_expiring: Option<u32>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `snapshot.policy.set`'s delta (plan 32 Step 5). Also the `details` of
+/// the `conflict` refusal when an expiring change was not confirmed.
+///
+/// `canonical` is what is (or would be) stored. `previous` is the
+/// directory's expression before, if it had one. `creates_every` is the
+/// finest tier's interval (absent for a paused policy, which creates
+/// nothing). `would_expire`/`would_expire_ids` are the snapshots the new
+/// policy's verdict expires, oldest first. `grace_note` says when that
+/// would happen. `written` is whether the xattr was written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyDelta {
+    pub path: String,
+    pub ino: u64,
+    pub canonical: String,
+    #[serde(default)]
+    pub previous: Option<String>,
+    #[serde(default)]
+    pub creates_every: Option<String>,
+    pub would_expire: u32,
+    pub would_expire_ids: Vec<String>,
+    pub grace_note: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub written: bool,
+}
+
+/// `snapshot.policy.remove`: unbind the directory's policy. Its auto
+/// snapshots become orphaned and are kept. `expire` (delete them with the
+/// policy, confirmed by `confirm_expiring`) is refused until the
+/// scheduler's expiry step ships.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyRemoveParams {
+    pub path: String,
+    #[serde(default)]
+    pub expire: bool,
+    /// Accepted and ignored until `expire` ships (plan 32 M4).
+    #[serde(default)]
+    pub confirm_expiring: Option<u32>,
+}
+
+/// `snapshot.policy.pause`: set (`paused: true`) or clear the policy's
+/// `paused` flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyPauseParams {
+    pub path: String,
+    pub paused: bool,
 }
 
 /// `snapshot.refs`.

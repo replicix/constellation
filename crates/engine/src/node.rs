@@ -279,6 +279,8 @@ pub struct Engine {
     atime: Arc<crate::atime::AtimeAccumulator>,
     /// Node-level prune counters (plan 22).
     prune_stats: Arc<crate::prune::PruneStats>,
+    /// Node-level snapshot-schedule counters (plan 32).
+    snapsched_stats: Arc<crate::snapsched::SnapSchedStats>,
     /// Unix-ms heartbeat of the sync task's last loop pass.
     last_sync_ms: Arc<AtomicU64>,
     read_only_member: bool,
@@ -858,6 +860,7 @@ impl Engine {
         let atime_stats = crate::atime::AtimeStats::new();
         let atime = Arc::new(crate::atime::AtimeAccumulator::new(atime_mode, atime_stats));
         let prune_stats = crate::prune::PruneStats::new();
+        let snapsched_stats = crate::snapsched::SnapSchedStats::new();
         let last_sync_ms = Arc::new(AtomicU64::new(crate::prune::now_unix_ms()));
 
         // Background metadata sync: tail foreign segments + ship the
@@ -1491,6 +1494,7 @@ impl Engine {
             departed,
             atime,
             prune_stats,
+            snapsched_stats,
             last_sync_ms,
             read_only_member,
             fsync_s3,
@@ -1664,6 +1668,7 @@ impl Engine {
                 snapshots: self.snapshots.clone(),
                 atime: self.atime.clone(),
                 prune_stats: self.prune_stats.clone(),
+                snapsched_stats: self.snapsched_stats.clone(),
                 holds: Some(self.holds.clone()),
                 watch: self.op_watch.clone(),
                 caps,
@@ -2110,6 +2115,9 @@ impl Engine {
     }
     pub fn prune_stats(&self) -> &Arc<crate::prune::PruneStats> {
         &self.prune_stats
+    }
+    pub fn snapsched_stats(&self) -> &Arc<crate::snapsched::SnapSchedStats> {
+        &self.snapsched_stats
     }
     pub fn last_sync_ms(&self) -> &Arc<AtomicU64> {
         &self.last_sync_ms

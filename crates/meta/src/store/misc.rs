@@ -374,9 +374,24 @@ impl Meta {
 
     // --------------------------------------------------------- xattr_by_name
 
+    /// Every directory carrying a plan-22 prune policy, by inode.
     pub fn prune_roots(&self) -> Result<Vec<(Ino, String)>, MetaError> {
+        self.xattr_roots(crate::prune::PRUNE_XATTR)
+    }
+
+    /// Every directory carrying a plan-32 snapshot policy, by inode: the
+    /// policy roots. The xattr is the whole binding (no registry), so a
+    /// renamed root is still found, and its identity is the inode.
+    pub fn snapshot_policy_roots(&self) -> Result<Vec<(Ino, String)>, MetaError> {
+        self.xattr_roots(crate::snapsched::SNAPSHOT_POLICY_XATTR)
+    }
+
+    /// Every inode carrying the xattr `name`, with its value (lossily as
+    /// UTF-8), ascending by inode: one prefix scan of the `xattr_by_name`
+    /// index, which replay maintains for every shared xattr.
+    fn xattr_roots(&self, name: &str) -> Result<Vec<(Ino, String)>, MetaError> {
         let r = self.db.read_tx();
-        let mut prefix = crate::prune::PRUNE_XATTR.as_bytes().to_vec();
+        let mut prefix = name.as_bytes().to_vec();
         prefix.push(0);
         let mut out = Vec::new();
         for guard in r.prefix(&self.xattr_by_name, prefix.clone()) {

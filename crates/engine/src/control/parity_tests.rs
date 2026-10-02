@@ -139,6 +139,8 @@ const MUST_SUCCEED: &[&str] = &[
     "snapshot.list",
     "snapshot.policy.check",
     "snapshot.policy.simulate",
+    "snapshot.policy.list",
+    "snapshot.policy.set",
     "browse.readdir",
     "browse.inspect",
     "browse.stat",
@@ -192,6 +194,14 @@ fn params_for(name: &str, root_view: u64, backend_dir: &str) -> Value {
         "snapshot.policy.simulate" => {
             json!({"path": "/", "expr": "1h:1d", "horizon_ms": 3_600_000u64})
         }
+        // The root carries no policy until admin's `set` binds one (the
+        // same expression every time, over the root's empty history: it
+        // expires nothing, so no confirmation). `remove`/`pause` name a
+        // missing directory, so both calls fail alike.
+        "snapshot.policy.show" => json!({"path": "/no-such-dir"}),
+        "snapshot.policy.set" => json!({"path": "/", "expr": "1d:7d 1h:1d"}),
+        "snapshot.policy.remove" => json!({"path": "/no-such-dir"}),
+        "snapshot.policy.pause" => json!({"path": "/no-such-dir", "paused": true}),
         "browse.readdir" | "browse.inspect" | "browse.stat" => json!({"path": "/"}),
         "browse.read" => json!({"path": "/f"}),
         "browse.write" => {

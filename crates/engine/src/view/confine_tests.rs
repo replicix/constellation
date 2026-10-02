@@ -271,6 +271,7 @@ fn view_with_snapshots(
                 crate::atime::AtimeStats::new(),
             )),
             prune_stats: crate::prune::PruneStats::new(),
+            snapsched_stats: crate::snapsched::SnapSchedStats::new(),
             inflight: crate::kernel_inval::InFlight::disabled(),
             holds: None,
             watch: OpWatch::manual("test-watch", Duration::from_secs(30)),

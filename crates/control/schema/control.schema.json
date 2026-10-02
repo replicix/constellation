@@ -5386,6 +5386,236 @@
       ],
       "type": "object"
     },
+    "SnapPolicyDelta": {
+      "description": "`snapshot.policy.set`'s delta (plan 32 Step 5). Also the `details` of\nthe `conflict` refusal when an expiring change was not confirmed.\n\n`canonical` is what is (or would be) stored. `previous` is the\ndirectory's expression before, if it had one. `creates_every` is the\nfinest tier's interval (absent for a paused policy, which creates\nnothing). `would_expire`/`would_expire_ids` are the snapshots the new\npolicy's verdict expires, oldest first. `grace_note` says when that\nwould happen. `written` is whether the xattr was written.",
+      "properties": {
+        "canonical": {
+          "type": "string"
+        },
+        "creates_every": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "grace_note": {
+          "type": "string"
+        },
+        "ino": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "previous": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warnings": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "would_expire": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "would_expire_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "written": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "ino",
+        "canonical",
+        "would_expire",
+        "would_expire_ids",
+        "grace_note",
+        "written"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyListing": {
+      "description": "`snapshot.policy.list`: every policy root, then every orphaned\nstream whose directory carries no policy at all, each ascending by\ninode.",
+      "properties": {
+        "roots": {
+          "items": {
+            "$ref": "#/$defs/SnapPolicyRoot"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "roots"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyPauseParams": {
+      "description": "`snapshot.policy.pause`: set (`paused: true`) or clear the policy's\n`paused` flag.",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "paused": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "paused"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyRemoveParams": {
+      "description": "`snapshot.policy.remove`: unbind the directory's policy. Its auto\nsnapshots become orphaned and are kept. `expire` (delete them with the\npolicy, confirmed by `confirm_expiring`) is refused until the\nscheduler's expiry step ships.",
+      "properties": {
+        "confirm_expiring": {
+          "default": null,
+          "description": "Accepted and ignored until `expire` ships (plan 32 M4).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "expire": {
+          "default": false,
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyRoot": {
+      "description": "A policy root (plan 32 Step 3.1) as `snapshot.policy.list/show/pause`\nreport it: a directory carrying `user.constellation.snapshots`, or an\norphaned stream — auto snapshots whose `policy_ino` carries no\nparseable policy (removed, or the directory is gone), which are never\nexpired automatically (Step 4.2).\n\n`ino` is the root's identity (a rename changes `path`, nothing else).\n`path` is where it is now, absent when the inode is no longer linked.\n`expr` is the xattr exactly as stored (empty for a removed policy),\n`canonical` its canonical form when it parses, `error` where it does\nnot. `auto_snapshots` counts every row with `origin=auto` and this\n`policy_ino`, held ones included; `orphaned` is set when there are\nsome and no parseable policy owns them.",
+      "properties": {
+        "auto_snapshots": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "canonical": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyErrorInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expr": {
+          "type": "string"
+        },
+        "ino": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "orphaned": {
+          "default": false,
+          "type": "boolean"
+        },
+        "path": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paused": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ino",
+        "expr"
+      ],
+      "type": "object"
+    },
+    "SnapPolicySetParams": {
+      "description": "`snapshot.policy.set`: bind `expr` to the directory `path`.\n\nThe new policy is evaluated over the directory's real snapshots\nfirst. When it would expire any, the daemon writes only if\n`confirm_expiring` equals that count — the previewed delta, so a\nstale client cannot confirm a different one. `dry_run` never writes.",
+      "properties": {
+        "confirm_expiring": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "dry_run": {
+          "default": false,
+          "type": "boolean"
+        },
+        "expr": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "expr"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyShown": {
+      "description": "`snapshot.policy.show`: the root, and — when its policy parses — the\npolicy evaluated over the directory's real snapshots (the same shape\n`snapshot.policy.check {against}` returns). A paused policy is still\nevaluated: the verdicts are what it does once resumed.",
+      "properties": {
+        "root": {
+          "$ref": "#/$defs/SnapPolicyRoot"
+        },
+        "verdicts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SnapPolicyAgainst"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
     "SnapPolicySimulateParams": {
       "description": "`snapshot.policy.simulate` (plan 32 Step 2 \"Simulation\", Step 7.4):\nrun `expr` forward for `horizon_ms` from the daemon's clock, over the\nsnapshots of `path` (as that directory's policy) or over nothing.",
       "properties": {
@@ -5456,6 +5686,154 @@
       "required": [
         "id"
       ],
+      "type": "object"
+    },
+    "SnapSchedStatus": {
+      "description": "Snapshot-schedule counters (plan 32 Step 9), surfaced in\n`constellation status`, on the web UI, and in `/metrics`.\n\n`unparseable_roots`, `capped_roots` or `refused_*` above zero mean\nsnapshots are silently not being taken; `create_failed` climbing while\n`expired` stays at zero is the healthy outage signature (expiry\nanchors on the newest snapshot, so an outage freezes it).",
+      "properties": {
+        "budget_expired": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "budget_stale": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capped_roots": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "create_failed": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "created": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expired": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_create_unix_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_parse_error": {
+          "default": null,
+          "description": "The last policy a setxattr refused: `(expression, byte_offset,\nmessage)`.",
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "leader": {
+          "default": false,
+          "description": "This node holds the scheduler's singleton lease.",
+          "type": "boolean"
+        },
+        "orphaned_snapshots": {
+          "default": 0,
+          "description": "Auto snapshots whose root carries no parseable policy any more:\nkept, never expired automatically.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "paused_roots": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refused_lag": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refused_state": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "roots": {
+          "default": 0,
+          "description": "Policy roots at the last tick, and of them the paused, the\nunparseable (skipped: nothing created, nothing expired) and the\ncapped ones (too many live auto snapshots to create more).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skipped_empty": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skipped_grace": {
+          "default": 0,
+          "description": "Expiry victims kept by the grace window after a policy change.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skipped_reverify": {
+          "default": 0,
+          "description": "Expiry victims whose row changed before the delete (now held,\ngone, or re-owned), and so were not deleted.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ticks": {
+          "default": 0,
+          "description": "Scheduler ticks run on this node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unparseable_roots": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "SnapTimeline": {
@@ -6767,6 +7145,32 @@
             "watermark_ttl_ms": 0
           },
           "description": "Plan 30 §M6: the session wait on local reads (read-your-writes,\nmonotonic reads) and its latency distribution."
+        },
+        "snapsched": {
+          "$ref": "#/$defs/SnapSchedStatus",
+          "default": {
+            "budget_expired": 0,
+            "budget_stale": 0,
+            "capped_roots": 0,
+            "create_failed": 0,
+            "created": 0,
+            "expired": 0,
+            "last_create_unix_ms": 0,
+            "last_error": null,
+            "last_parse_error": null,
+            "leader": false,
+            "orphaned_snapshots": 0,
+            "paused_roots": 0,
+            "refused_lag": 0,
+            "refused_state": 0,
+            "roots": 0,
+            "skipped_empty": 0,
+            "skipped_grace": 0,
+            "skipped_reverify": 0,
+            "ticks": 0,
+            "unparseable_roots": 0
+          },
+          "description": "Automatic snapshot schedules (plan 32 Step 9). Every counter the\nplan names is present from M2 on; they stay zero until the\nscheduler (M3) and expiry (M4) run."
         },
         "speculation": {
           "$ref": "#/$defs/SpeculationStatus",
@@ -8208,6 +8612,61 @@
       },
       "result": {
         "$ref": "#/$defs/SnapPolicyCheckResult"
+      },
+      "streaming": "none"
+    },
+    "snapshot.policy.list": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/Empty"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapPolicyListing"
+      },
+      "streaming": "none"
+    },
+    "snapshot.policy.pause": {
+      "min_role": "admin",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/SnapPolicyPauseParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapPolicyRoot"
+      },
+      "streaming": "none"
+    },
+    "snapshot.policy.remove": {
+      "min_role": "admin",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/SnapPolicyRemoveParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapPolicyRoot"
+      },
+      "streaming": "none"
+    },
+    "snapshot.policy.set": {
+      "min_role": "admin",
+      "mutating": true,
+      "params": {
+        "$ref": "#/$defs/SnapPolicySetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapPolicyDelta"
+      },
+      "streaming": "none"
+    },
+    "snapshot.policy.show": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/PathParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SnapPolicyShown"
       },
       "streaming": "none"
     },

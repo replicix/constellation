@@ -1474,6 +1474,32 @@ impl Vfs for View {
                 }
             }
         }
+        // Snapshot-policy gate (plan 32 Step 3.1), the same posture as
+        // prune's: refuse a misplaced or unparseable policy here, so it
+        // never reaches the log. Replay never validates; the scheduler
+        // re-parses and skips what it cannot read.
+        if name == constellation_meta::snapsched::SNAPSHOT_POLICY_XATTR {
+            if let Err(refusal) = self.snapshot_policy_gate(ino, value) {
+                if let Some((offset, msg)) = &refusal.reason {
+                    let expr = String::from_utf8_lossy(value);
+                    self.snapsched_stats.record_parse_error(&expr, *offset, msg);
+                }
+                return r.done(err(refusal.code));
+            }
+        }
+        // ... and the converse: no directory at or above a policy root may
+        // become a scratch root, whose content is node-private and
+        // meaningless to snapshot.
+        if name == constellation_meta::SCRATCH_XATTR && value == b"1" {
+            if let Err(refusal) = self.scratch_policy_gate(ino) {
+                if let Some((offset, msg)) = &refusal.reason {
+                    let marking = format!("{}=1", constellation_meta::SCRATCH_XATTR);
+                    self.snapsched_stats
+                        .record_parse_error(&marking, *offset, msg);
+                }
+                return r.done(err(refusal.code));
+            }
+        }
         // Scratch files are node-private (scratch-directories.md) and
         // live outside the shared inode/xattr tables until `Publish`, so
         // their xattrs are staged locally here rather than mutated
@@ -1730,4 +1756,102 @@ impl View {
             code
         }
     }
+
+    /// Plan 32 Step 3.1: may `value` become `ino`'s snapshot policy? Only
+    /// a shared directory outside every scratch tree may carry one (a
+    /// snapshot of node-private content is meaningless), and only a
+    /// parseable expression. Every policy refusal is `EINVAL` with its
+    /// reason returned (`(offset, message)`; the offset is 0 unless the
+    /// expression failed to parse): `setxattr` stashes it in
+    /// `SnapSchedStats::last_parse_error`, since errno carries no message,
+    /// and `snapshot.policy.set` pre-checks with this very function to put
+    /// it in its own answer, never reading the shared slot back.
+    ///
+    /// The value is stored verbatim, as plan 22 stores a prune policy: a
+    /// `setxattr` reads back exactly what it wrote. The canonical form is
+    /// what `snapshot.policy.set` writes, and what every reader displays.
+    pub(crate) fn snapshot_policy_gate(&self, ino: Ino, value: &[u8]) -> Result<(), GateRefusal> {
+        let refuse = |msg: &str| GateRefusal {
+            code: Code::Invalid,
+            reason: Some((0, msg.to_string())),
+        };
+        let bare = |code: Code| GateRefusal { code, reason: None };
+        if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
+            return Err(refuse(
+                "a snapshot policy cannot be set inside a scratch directory",
+            ));
+        }
+        match self.meta.getattr(ino) {
+            Ok(Some(attr)) if attr.kind == InodeKind::Dir => {}
+            Ok(Some(_)) => return Err(refuse("a snapshot policy belongs to a directory")),
+            Ok(None) => return Err(bare(Code::NotFound)),
+            Err(e) => return Err(bare(e.code())),
+        }
+        // The directory itself, or an ancestor, marked scratch. Entries
+        // below a scratch root are node-private (caught above), but a
+        // shared directory can predate its parent's marking.
+        let mut cursor = Some(ino);
+        while let Some(cur) = cursor {
+            if self.meta.is_scratch_dir(cur).map_err(|e| bare(e.code()))? {
+                return Err(refuse(
+                    "a snapshot policy cannot be set on or inside a scratch directory",
+                ));
+            }
+            cursor = self.meta.parent_of(cur).map_err(|e| bare(e.code()))?;
+        }
+        let expr = String::from_utf8_lossy(value);
+        match constellation_meta::snapsched::SnapPolicy::parse(&expr) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(GateRefusal {
+                code: Code::Invalid,
+                reason: Some((e.offset, e.msg)),
+            }),
+        }
+    }
+
+    /// The converse of [`View::snapshot_policy_gate`]: may `ino` be marked
+    /// scratch? Not when it is a policy root or an ancestor of one — the
+    /// policy would then sit inside a scratch tree. The roots come from
+    /// the `xattr_by_name` index (a handful), each walked up to the root.
+    ///
+    /// A refusal is `EINVAL` with a reason that starts "scratch refused"
+    /// and names the policy in the way. `setxattr` records it in
+    /// `last_parse_error` under the expression `user.constellation.scratch=1`
+    /// (plan 22 likewise records its non-parse atime refusal in the prune
+    /// slot), so a status reader sees it was the scratch marking, not a
+    /// policy, that failed.
+    fn scratch_policy_gate(&self, ino: Ino) -> Result<(), GateRefusal> {
+        let bare = |e: constellation_meta::MetaError| GateRefusal {
+            code: e.code(),
+            reason: None,
+        };
+        for (root, expr) in self.meta.snapshot_policy_roots().map_err(bare)? {
+            let mut cursor = Some(root);
+            while let Some(cur) = cursor {
+                if cur == ino {
+                    let msg = if root == ino {
+                        format!("scratch refused: this directory carries snapshot policy `{expr}`")
+                    } else {
+                        format!(
+                            "scratch refused: directory inode {root} below this one carries \
+                             snapshot policy `{expr}`"
+                        )
+                    };
+                    return Err(GateRefusal {
+                        code: Code::Invalid,
+                        reason: Some((0, msg)),
+                    });
+                }
+                cursor = self.meta.parent_of(cur).map_err(bare)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why [`View::snapshot_policy_gate`] refused: the errno, and for a policy
+/// refusal (`EINVAL`) the `(offset, message)` reason.
+pub(crate) struct GateRefusal {
+    pub(crate) code: Code,
+    pub(crate) reason: Option<(usize, String)>,
 }
