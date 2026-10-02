@@ -118,6 +118,9 @@ The keys, as `crates/store-s3/src/layout.rs` and `nodes.rs` write them:
   holds/<node-id>.json            # TTL'd holds the GC honours (§3, §14)
   gc/                             # condemned-set pointers, candidate bookkeeping,
                                   # the deletion journal (§14)
+  gc/summary.json                 # the newest chunk round's census of chunks/
+                                  # (objects, stored bytes, as-of); read only by
+                                  # snapshot space accounting's compression estimate
   prune/journal/                  # the retention pruner's reports
   chunks/<aa>/<bb>/<hash>         # content-addressed data blocks (sharded by hash)
 ```

@@ -32169,3 +32169,164 @@ rerun (they ran on this change, above).
 - Policy commands, a timezone database, the policy's `tz` for `CREATED`:
   M1/M2 (`jiff` arrives with them).
 - The web UI's multi-select delete over `snapshot.delete_many`: M6.
+
+## Plan 32 M5b (accounting integration)
+
+Steps 6.2–6.3 of [plan 32](wip/32-snapshot-policies-and-space.md) on a
+node: the `32-m5a` index is built from the replica's real snapshot rows,
+kept equal to them and to the live tree, verified against a brute force,
+and reported in `node.status`. Advisory throughout: GC and snapshot
+deletion never read it, nothing is published, and every answer carries the
+commit it is "as of". The surfaces (CLI columns, `snapshot space`,
+`snapshot.reclaim`, UI) are `32-m5c`'s, on the API below.
+
+| Item | State | Where |
+|---|---|---|
+| `SnapAcctService` (one per engine, in `<state dir>/snapacct/`; named so because the index type is already `SnapAcct`), its task spawned by `Engine::start` behind the lifecycle's background gate, `Engine::snapacct()` | DONE | `crates/engine/src/snapacct/service.rs`, `crates/engine/src/node.rs` |
+| `CONSTELLATION_SNAPACCT=auto\|on\|off` (default `auto`), `CONSTELLATION_SNAPACCT_REFRESH_S` (60), `CONSTELLATION_SNAPACCT_BUDGET_MS` (500); tombstone lifetime from `CONSTELLATION_GC_HORIZON_S` + `CONSTELLATION_GC_INTERVAL_S` | DONE | `service.rs` `SnapAcctConfig::from_env`, `docs/reference/configuration.md` |
+| `auto`: nothing until a size query (demand). The query creates the index; the task builds it, then keeps maintaining while the node has a snapshot-policy root (`Meta::any_xattr_named(user.constellation.snapshots)`, one probe of the by-name xattr index) or its web UI is serving (`SnapAcctService::set_web_ui(true)`, called by the CLI once `--web-ui`'s listener binds); otherwise it catches up per query and goes dormant. With no index on disk and no demand the task only ever awaits a wake-up: no timer, no read | DONE | `service.rs` `maintaining`, `run`; `crates/cli/src/node_runtime.rs` |
+| Build = reconcile: rows grouped by `SnapshotRoot.ino`, ordered `(seq, created_unix_ms, root, id)` (GC's order made total); per chain the next operation of: delete a row-less snapshot (head: `step(prev, head)` first), clear a chain whose order contradicts the rows, append the next row (`ChainWalk::first`, then `step`s), or rewind + re-append the suffix for a row sorting before the head (`rederive_suffix`). Deletions are applied across every chain before any other operation (a re-created `path@name` id moves between chains). One index transaction per operation, so the index is its own resume cursor; `aux/built` in `snapacct_meta` marks the first complete pass; budget checked between operations; while building, the task rests as long as it worked | DONE | `service.rs` `plan`, `reconcile`, `execute` |
+| Reconcile trigger: `Meta::set_snapshot_change_hook` (+ `snapshot_gen`), fired by `record_snapshot`, `delete_snapshot_by_id` and replay of `SnapCreate`/`SnapCreate2`/`SnapDelete`; the task debounces 100 ms; the refresh tick re-reads the rows as a backstop (a full row diff, O(rows) local reads, so a lost hint costs nothing) | DONE | `crates/meta/src/store/{mod,snapshot}.rs`, `crates/meta/src/replay.rs` |
+| Queries answer `Building{pct}` (share of rows applied) unless the last pass matched every chain to the rows and no row changed since (`current`: `aux/built` ∧ last pass complete ∧ `snapshot_gen` unchanged) — the first build, a budget-cut pass, a cleared chain being re-applied, a stalled chain; never a partial number | DONE | `service.rs` `gate`, `current`, `locate` |
+| Live flags: live = `Meta::chunk_ref_any` (new: any `chunk_ref` row, pending upload or not — `chunk_ref_exists` answers dedup, not liveness) **or** a member of a live spilled chunk list. `chunk_ref` rows name a spilled list, never its members (`INLINE_CHUNKS_MAX` = 8, so every file over 32 MiB), so the live lists and their members are recorded in a new keyspace `snapacct_lspill` (`s`spill, `m`member·spill; index `FORMAT` 2) | DONE | `crates/meta/src/store/misc.rs`, `snapacct/mod.rs`, `service.rs` `is_live` |
+| Live refresh every `REFRESH_S`: newest commit from the bucket (`CommitChain::discover_head(known)`, ~2 GETs when nothing changed), `Tree::diff(accounted_root, head)`, every `0x01` key's old and new manifest; a spilled list whose liveness changed is fetched and its members recorded/forgotten; every chunk named that **is in the index** gets `set_live`. The commit is `aux/live_root` and the index's `accounted_seq` (= `as_of_seq`). The refresh only moves to a commit whose `applied` the replica's applied position covers (`vector_covers(mine, commit.applied)`, `follow_head`'s guard the other way round), looking back up to 8 commits; none → flags kept, retried next tick (`refreshes_deferred`). A refresh that cannot diff, or that a crash interrupted (`aux/refresh_pending`), recomputes every flag from the replica, labelled with a covered commit (none → seq 0, recomputed again next refresh); its spilled-list GETs run under the pass's time budget and resume (recorded lists are the cursor). The live total is `UsageTracker` | DONE | `service.rs` `refresh_live`, `covered_commit`, `refresh_by_diff`, `refresh_full`, `recompute_flags` |
+| `LSIZE`: `Occurrences::lsize()` and `Deltas::lsize_delta` — Σ apparent file size (`attrs.size` of the inode record), per in-subtree name like the chunk occurrences, computed in the same per-file term recomputation; snapwalk's randomized test now checks it | DONE | `crates/engine/src/snapwalk.rs` |
+| API for `32-m5c` (below); every answer carries `as_of_seq` (`accounted_seq`) and `as_of_ms` (`aux/as_of_ms`, the last caught-up pass) | DONE | `service.rs` |
+| `verify()`: catch up (forced refresh) under the work lock, then `BruteForce` — every snapshot walked in full with the tree reader (not snapwalk), exact chunk sets with sizes, the live set from the replica's manifests with spilled lists expanded — and diff: `USED`/`WRITTEN`/`REFER`/`LSIZE` per row, missing/extra snapshots, `reclaim` of each chain and of everything, the four buckets, plus `check_structure`; `verify_mismatches` | DONE | `crates/engine/src/snapacct/verify.rs` |
+| GC census: the chunk round counts its `chunks/` LIST (`ChunkCensus{chunk_objects, physical_bytes, as_of_ms}`) into `GcReport.census` (the opaque `gc.run` JSON) and, in real rounds, `gc/summary.json` (one PUT per round, failure only warned); `space` reads it (cached 10 min) for `compression_ratio` | DONE | `crates/store-s3/src/{gc,layout}.rs`, `crates/engine/src/gc.rs` |
+| Status: `StatusReport.snapacct` (`SnapAcctStatus`: mode, maintaining, building, build_progress_pct, indexed_chunks, index_bytes, as_of_seq, refresh_ms_last, verify_mismatches, stalled_chains, refreshes_deferred, passes, errors, last_error); `/metrics` `constellation_snapacct_*` gauges; schema re-blessed. No method added or changed, so no parity change | DONE | `crates/control/src/proto/types.rs`, `crates/control/src/web.rs`, `crates/engine/src/control/service.rs`, `crates/control/schema/control.schema.json` |
+| Tests: the real-stack model test (6 seeds × 70 steps: create, write, truncate, revert-to-old-content, unlink, hardlink, rename, directory rename across policy roots, mkdir, snapshot delete anywhere in a chain, hold/release, snapshots of `/a`, nested `/a/n`, `/b`, `/`; spilled lists; publish after each step; `verify()` == 0 mismatches after every step, every 10 steps random `reclaim` sets and one snapshot's numbers through the query API against the brute force); heavy variant 60 × 150 (`#[ignore]`, ≈200 s release, passed); `auto_without_requests_does_no_work`; `off_answers_off`; `a_deleted_index_is_rebuilt_identically`; `a_restart_resumes_a_partial_build` (4 operations, 40 %, `Building{40}`, a fresh service finishes with exactly the remaining walks/steps); `late_rows_and_head_deletion` (rederive path, head step-back, everything deleted → awaiting GC); `a_wipe_waits_for_the_index_to_be_free` (the recovery wipe is deferred until no pass holds the index, then rebuilds identically); `live_refresh_and_scoped_space` (a spilled file rewritten, `space(Some(path))` incl. a manifest-less truncated file and a hardlink, a restarted service answers `Building` until its first pass, the compression estimate); `a_lagging_follower_never_misses_an_unlink` / `a_lagging_follower_never_misses_a_rewrite_back` (a second replica applying the holder's shipped segments, refreshing — by diff and from a fresh index — while behind the newest commit, then catching up: verify == 0; both fail without the cover rule); `a_recreated_snapshot_id_moves_between_chains` (`/x@s1` deleted and re-created over a lower-ino directory: fails without deletions-first); `a_stalled_chain_does_not_stop_the_others` (an unreadable snapshot tree stalls its chain only, other chains still applied, queries `Building`, recovers when the row goes); `a_partial_index_never_answers_ready` (a budget-cut pass after the first build answers `Building`); `a_full_recompute_is_budgeted_and_resumes` (6 spilled lists under a zero time budget: one GET per pass, flags flipped once); `gc::tests::a_round_records_its_chunk_census`. Three planted bugs (diff refresh dropping its updates, spilled members never live, `LSIZE` deltas dropped) each fail the suite | DONE | `crates/engine/src/snapacct/service_tests.rs`, `crates/engine/src/gc.rs` |
+
+### Engine API (for `32-m5c`)
+
+All `async`, on `Arc<SnapAcctService>` (`Engine::snapacct()`); a query
+records demand and waits up to 2 s for a pending pass before answering.
+
+```rust
+pub enum SnapAnswer<T> { Ready(T), Building { pct: u8 }, Off }
+pub async fn snap_numbers(&self, id: &str) -> Result<SnapAnswer<Numbers>>
+    // Numbers { id, used, written, refer, lsize, as_of_seq, as_of_ms }
+pub async fn reclaim(&self, ids: &[String]) -> Result<SnapAnswer<ReclaimEstimate>>
+    // ReclaimEstimate { bytes, chunks, as_of_seq, as_of_ms }
+pub async fn space(&self, path: Option<&str>) -> Result<SnapAnswer<SpaceBreakdown>>
+    // SpaceBreakdown { live_logical, snapshots_total, unique, shared_snapshots_only,
+    //   shared_with_live, awaiting_gc (Amount{bytes, chunks} each but live_logical),
+    //   compression_ratio: Option<f64> /* estimate */, as_of_seq, as_of_ms }
+pub async fn verify(&self) -> Result<VerifyReport>
+    // VerifyReport { mismatches, details, snapshots, chunks, as_of_seq }
+pub fn set_web_ui(&self, enabled: bool); pub fn maintaining(&self) -> bool;
+pub fn stats(&self) -> &Arc<SnapAcctStats>; pub async fn catch_up(&self) -> Result<()>
+```
+
+An unknown id is an error; a known row not yet applied is `Building`.
+
+### Decisions taken here (the brief left them open)
+
+- **"Building" is a variant, not a flag.** The brief sketched
+  `ReclaimEstimate{…, building}`; every query returns `SnapAnswer` instead,
+  so `Off`/`Building`/numbers are one shape for all three queries.
+- **`auto` after the first request.** Maintained while a policy root exists
+  or the web UI serves *and the index exists*; a node restarted with an index
+  on disk and a policy root resumes maintaining without a new request (the
+  "first size request" happened in its past). Without either, each query
+  catches up (O(changes)) and the task goes dormant.
+- **Web UI enabled** = the daemon's HTTP listener bound (`--web-ui` /
+  `CONSTELLATION_WEB_UI_PORT` non-zero and `serve` succeeded); the CLI tells
+  the engine through `set_web_ui`.
+- **Liveness is not `chunk_ref_exists`.** That one skips refs whose upload
+  is pending (it answers "may a writer dedup against this") and cannot see
+  spilled-list members; the index uses `chunk_ref_any` plus its own record of
+  live spilled lists. The brief's `chunk_ref_exists` would have counted every
+  chunk of every file over 32 MiB as snapshot-only.
+- **`as_of_seq` = the commit the live flags are accounted against**
+  (`accounted_seq`, advanced only by the live refresh); snapshot applications
+  pass no seq. Snapshot rows are reconciled on every pass regardless.
+- **`space(path)`** scopes the snapshot buckets to chains whose directory is
+  at or under the path in the live tree now; `live_logical` is the subtree's
+  apparent size (`Meta::subtree_file_bytes`: Σ `attrs.size` from inode
+  records only, each inode once like the filesystem-wide counter, files
+  without a manifest included), `awaiting_gc` stays filesystem-wide (freed
+  chunks belong to no chain).
+- **Compression estimate** = mean logical size of an indexed chunk / mean
+  stored size of a `chunks/` object from the newest census: the LIST knows
+  physical sizes, not logical ones, so this assumes snapshot-held chunks
+  compress like the bucket's average. Labelled an estimate in the API docs.
+- **Recovery.** An index operation that fails clears that chain and
+  re-applies it from its rows; a second failure in a pass *stalls* that chain
+  for the pass (skipped, `stalled_chains`, warned once until it recovers) and
+  the other chains go on; while any chain is stalled queries answer
+  `Building`. A failed clear asks for a wipe, which the next `open` performs
+  (off the runtime, `spawn_blocking`) once nothing else holds the index; a
+  query racing it answers `Building`.
+- **Budget.** The first operation of a pass is always allowed (a pass that
+  spent its time on the flags still moves); spilled-list GETs of a full
+  recompute count against the time budget only (`max_ops_per_pass` counts
+  index operations).
+- **Refresh cost.** The service's commit chain uses a probe window of 1, and
+  an unchanged head is not re-fetched: an idle refresh is 2 GETs (the probe
+  that misses, the known head).
+- `verify` reads the live tree from the replica: a write not yet published,
+  or a commit this replica has not applied yet, can show as a live-flag
+  mismatch until the next refresh that the replica covers (documented). It
+  clears on followers too: the refresh never labels replica-derived flags
+  with a commit the replica has not applied.
+- **The cover rule is exact.** `Commit.applied`'s doc allows a tree to hold
+  its author's unshipped journal beyond `applied`, but a publish builds only
+  from the log-prefix state at `applied_seq` (`PublishBasis::AsIs` or
+  `Substituted` with the unshipped keys' before-images, otherwise `Defer`;
+  plan 30 §M3b) — only tests switch that off
+  (`set_publish_unshipped_for_tests`). So a replica covering `applied` has
+  every change the commit's tree has.
+
+### Not done
+
+- The `snapacct` harness scenario (plan 32 §11: `--verify` on two nodes,
+  dry-run reclaim == GC's deletions) needs `32-m5c`'s CLI.
+- Per-root `USED` gauges on `/metrics` (Step 9) need the per-root listing
+  `32-m5c` adds.
+
+**Measurement** (report only; release, in-process, in-memory bucket,
+`snapacct::service_tests::measure_build_time_and_footprint`): 10,000 files
+(100 dirs × 100, two chunks each), 50 snapshots of `/vol` with 20 file
+rewrites between each → 21,956 indexed chunks.
+
+| Figure | Value |
+|---|---|
+| Build (50 rows → built index, first walk + 49 steps + live init) | 0.38 s and 1.49 s (two runs, shared host) |
+| Directory, allocated blocks (fjall journal included; tables still in memtables) | 3.0 MB ≈ 140 B / indexed chunk |
+| Compacted tables (M5a's figure for the same structures) | ≈ 91 B / indexed chunk |
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0, no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --workspace` | exit 0; 81 test binaries, 2037 passed, 0 failed |
+| `cargo test --release -p constellation-engine snapacct::service_tests::model_agrees_with_brute_force_heavy -- --ignored` | passed (60 seeds × 150 steps, 203 s) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | first run: port 4566 held by another agent's floci, script body run against it: SMOKE TEST PASSED. Final run: this worktree's own floci exited at start (the SELinux bind-mount issue), so a private floci (`-p m5b`, `label:disable`, port 45866) and the script body: SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run gc-lifecycle gc-dedup-race snapshot-lifecycle snapshot-churn idle-cluster-is-quiet e2e-basic e2e-two-nodes web-ui-smoke` + `… run idle-cost` | ALL SCENARIOS PASSED (8/8); `idle-cost` failed once (followers' `GET log` ≈ 900/min from log tailing, host load ≈ 55; no accounting traffic, `GET commits` identical to the passing runs) and passed on the immediate rerun; all 9 also passed together on the pre-final build |
+| same GC/snapshot/e2e/web subset with `CONSTELLATION_SNAPACCT=on CONSTELLATION_SNAPACCT_REFRESH_S=2` | ALL SCENARIOS PASSED (5/5) |
+
+**Review fix round** (rebased onto main with `32-m2a`/`Z2b`; conflicts in
+`node.status`, the engine fields and `misc.rs` kept both sides): live-flag
+cover rule on followers, deletions-first reconcile with stalled chains,
+`Building` whenever the index is behind the rows, `space(path)` from inode
+sizes, budgeted/resumable full recompute, blocking open/wipe off the
+runtime, `stats.building` true from the start under `on`, a query racing a
+wipe answers `Building`, demand-clearing documented, `gc/summary.json` in
+DESIGN.md §2. Gates (`CARGO_TARGET_DIR` unset):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p <crate>` for all 19 crates (`constellation-model` per test binary) | all pass, 0 failed (engine 435 passed / 7 ignored; model `locks` 29 passed in 227 s); control schema re-blessed |
+| `cargo test --release -p constellation-engine snapacct::service_tests::model_agrees_with_brute_force_heavy -- --ignored` | passed (27 s) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `tests/integration.sh` body under `docker compose -p m5bfix` (port 4566 held by another worktree's floci; `ports: !override` to 45978) | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `harness run gc-lifecycle gc-dedup-race snapshot-lifecycle snapshot-churn` / `idle-cluster-is-quiet idle-cost e2e-two-nodes` (`CONSTELLATION_HARNESS_DOCKER_PREFIX=m5bfix`) | 4/4 and 3/3 passed, `idle-cost` first try |
+| same GC/snapshot subset + `e2e-two-nodes` with `CONSTELLATION_SNAPACCT=on CONSTELLATION_SNAPACCT_REFRESH_S=2` | 5/5 passed |

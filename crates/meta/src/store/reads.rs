@@ -362,6 +362,41 @@ impl Meta {
         Ok(out)
     }
 
+    /// The apparent bytes of the files at or under `ino`: Σ `attrs.size`,
+    /// each inode once however many names it has in the subtree (as the
+    /// filesystem-wide usage counter counts), files without a manifest
+    /// (sized by truncate) included. Reads inode records only, never a
+    /// manifest payload.
+    pub fn subtree_file_bytes(&self, ino: Ino) -> Result<u64, MetaError> {
+        let r = self.db.read_tx();
+        let Some(root_rec) = ns::get_inode_record(&r, &self.ns, ino)? else {
+            return Err(MetaError::NoEnt(ino));
+        };
+        if root_rec.attrs.kind == constellation_mtree::record::Kind::File {
+            return Ok(root_rec.attrs.size);
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0u64;
+        let mut stack = vec![ino];
+        while let Some(dir) = stack.pop() {
+            let range = keys::dentries_of(dir);
+            for guard in r.range(&self.ns, ns::key_range_bounds(&range)) {
+                let (_, v) = guard.into_inner()?;
+                let (child_ino, kind) =
+                    constellation_mtree::record::DentryRecord::ino_and_kind(&v)?;
+                if kind == constellation_mtree::record::Kind::Dir {
+                    stack.push(child_ino);
+                } else if kind == constellation_mtree::record::Kind::File && seen.insert(child_ino)
+                {
+                    if let Some(rec) = ns::get_inode_record(&r, &self.ns, child_ino)? {
+                        total = total.saturating_add(rec.attrs.size);
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Every raw key currently in `ns`, in key order. Exposed for tests
     /// and tooling that want to compare the local replica's key set
     /// against an independently built tree (plan 28 §P6: `ns`'s key set

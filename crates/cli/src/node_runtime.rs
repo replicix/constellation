@@ -701,7 +701,10 @@ impl NodeRuntime {
                 .block_on(constellation_control::web::serve(self.web_ui, router))
             {
                 Ok(address) => {
-                    tracing::info!(%address, "web UI listening (localhost only)")
+                    tracing::info!(%address, "web UI listening (localhost only)");
+                    // Plan 32 §6.3: under `CONSTELLATION_SNAPACCT=auto` an
+                    // enabled web UI keeps the accounting index maintained.
+                    e.snapacct().set_web_ui(true);
                 }
                 Err(error) => tracing::warn!(%error, "web UI unavailable"),
             }

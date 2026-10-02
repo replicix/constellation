@@ -207,6 +207,21 @@ impl Meta {
         Ok(false)
     }
 
+    /// Whether any live inode's manifest names `hash` directly (a data
+    /// chunk of an inline list, or a spilled list itself), whether or not
+    /// its upload is still pending: liveness, where
+    /// [`Meta::chunk_ref_exists`] answers "may a writer dedup against
+    /// it". Chunks inside a spilled list have no `chunk_ref` row.
+    pub fn chunk_ref_any(&self, hash: &ChunkHash) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        for guard in r.prefix(&self.chunk_ref, hash.0) {
+            if guard.key()?.len() == 40 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn live_manifest_hashes(&self) -> Result<HashSet<ChunkHash>, MetaError> {
         let r = self.db.read_tx();
         let mut out = HashSet::new();
@@ -373,6 +388,15 @@ impl Meta {
     }
 
     // --------------------------------------------------------- xattr_by_name
+
+    /// Whether any inode carries the xattr `name` (one probe of the
+    /// by-name index): e.g. "is there a snapshot-policy root at all".
+    pub fn any_xattr_named(&self, name: &str) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        let mut prefix = name.as_bytes().to_vec();
+        prefix.push(0);
+        Ok(r.prefix(&self.xattr_by_name, prefix).next().is_some())
+    }
 
     /// Every directory carrying a plan-22 prune policy, by inode.
     pub fn prune_roots(&self) -> Result<Vec<(Ino, String)>, MetaError> {

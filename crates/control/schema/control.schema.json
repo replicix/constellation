@@ -5262,6 +5262,101 @@
       ],
       "type": "object"
     },
+    "SnapAcctStatus": {
+      "description": "Plan 32 Step 9's `SnapAcctStats`: the node-local space-accounting\nindex (advisory; never published, never consulted by GC).",
+      "properties": {
+        "as_of_seq": {
+          "default": 0,
+          "description": "The commit every number is \"as of\".",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "build_progress_pct": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "building": {
+          "default": false,
+          "description": "The index does not match the snapshot rows (its first build, a\npass cut short by its budget, or a stalled chain): queries answer\n\"building\", never partial numbers.",
+          "type": "boolean"
+        },
+        "errors": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "index_bytes": {
+          "default": 0,
+          "description": "The index's on-disk tables.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "indexed_chunks": {
+          "default": 0,
+          "description": "Chunks held by at least one snapshot.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "maintaining": {
+          "default": false,
+          "description": "Whether the background task is keeping the index current now.",
+          "type": "boolean"
+        },
+        "mode": {
+          "default": "",
+          "description": "`CONSTELLATION_SNAPACCT`: \"auto\", \"on\" or \"off\".",
+          "type": "string"
+        },
+        "passes": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refresh_ms_last": {
+          "default": 0,
+          "description": "The last live-tree refresh's duration.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refreshes_deferred": {
+          "default": 0,
+          "description": "Live refreshes that found a newer commit this replica had not\napplied yet, and so kept the flags at the older one.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stalled_chains": {
+          "default": 0,
+          "description": "Chains the last pass could not apply (an operation failed twice);\nabove zero, queries answer \"building\" until they can be.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verify_mismatches": {
+          "default": 0,
+          "description": "The last `--verify`'s mismatch count.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "SnapCountPoint": {
       "description": "One step of a [`SnapTimeline`]'s count-over-time series: every live\nsnapshot (`total`) and the policy's own (`candidates`).",
       "properties": {
@@ -7303,6 +7398,26 @@
             "watermark_ttl_ms": 0
           },
           "description": "Plan 30 §M6: the session wait on local reads (read-your-writes,\nmonotonic reads) and its latency distribution."
+        },
+        "snapacct": {
+          "$ref": "#/$defs/SnapAcctStatus",
+          "default": {
+            "as_of_seq": 0,
+            "build_progress_pct": 0,
+            "building": false,
+            "errors": 0,
+            "index_bytes": 0,
+            "indexed_chunks": 0,
+            "last_error": null,
+            "maintaining": false,
+            "mode": "",
+            "passes": 0,
+            "refresh_ms_last": 0,
+            "refreshes_deferred": 0,
+            "stalled_chains": 0,
+            "verify_mismatches": 0
+          },
+          "description": "Plan 32 §6.3/Step 9: the space-accounting index. Default (`auto`,\nnever asked) leaves everything zero and `maintaining` false."
         },
         "snapsched": {
           "$ref": "#/$defs/SnapSchedStatus",

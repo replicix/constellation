@@ -139,6 +139,12 @@ pub fn gc_blob_candidates() -> Path {
     Path::from("gc/blob-candidates.json")
 }
 
+/// Plan 32 §6.1: the newest chunk GC round's census
+/// ([`crate::gc::ChunkCensus`]).
+pub fn gc_summary() -> Path {
+    Path::from("gc/summary.json")
+}
+
 pub fn gc_journal(ts: i64, nonce: &str) -> Path {
     Path::from(format!("gc/journal/{ts:016x}-{nonce}.json"))
 }

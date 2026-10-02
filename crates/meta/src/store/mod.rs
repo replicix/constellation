@@ -616,6 +616,11 @@ pub struct Meta {
     /// they touched, so another node's write is visible without waiting
     /// out the attribute/entry TTL).
     foreign_apply_hook: std::sync::OnceLock<ForeignApplyHook>,
+    /// Plan 32 §6.3: bumped (and the hook told) whenever a snapshot row
+    /// may have appeared or gone, so the accounting index reconciles
+    /// without polling the rows.
+    snapshot_gen: AtomicU64,
+    snapshot_hook: std::sync::RwLock<Option<SnapshotChangeHook>>,
     /// [`Meta::vacuum_churn`]: each churn keyspace's entry count right
     /// after its last vacuum.
     vacuum_baselines: std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
@@ -635,12 +640,43 @@ pub const VACUUM_MIN_ENTRIES: usize = 4096;
 /// See [`Meta::set_foreign_apply_hook`].
 pub type ForeignApplyHook = Box<dyn Fn(&[crate::record::LogRecord]) + Send + Sync>;
 
+/// See [`Meta::set_snapshot_change_hook`].
+pub type SnapshotChangeHook = Arc<dyn Fn() + Send + Sync>;
+
 impl Meta {
     /// Plan 30 §M7: call `hook` with the records of every foreign segment
     /// applied from now on ([`Meta::note_foreign_applied`]). Set once; a
     /// second call is ignored.
     pub fn set_foreign_apply_hook(&self, hook: ForeignApplyHook) {
         let _ = self.foreign_apply_hook.set(hook);
+    }
+
+    /// Plan 32 §6.3: call `hook` whenever a snapshot row may have been
+    /// created or deleted (a local write, or any record replayed). It is
+    /// a hint, called from inside the writer's path, so it must be cheap
+    /// and must not block; it can fire before the change's transaction
+    /// commits, so a listener reads the rows a moment later and keeps a
+    /// periodic reconcile as the backstop. Replaces any previous hook.
+    pub fn set_snapshot_change_hook(&self, hook: Option<SnapshotChangeHook>) {
+        *self.snapshot_hook.write().expect("snapshot hook lock") = hook;
+    }
+
+    /// How many snapshot-row changes [`Meta::note_snapshot_change`] has
+    /// seen: a cheap "did anything change since" check.
+    pub fn snapshot_gen(&self) -> u64 {
+        self.snapshot_gen.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn note_snapshot_change(&self) {
+        self.snapshot_gen.fetch_add(1, Ordering::AcqRel);
+        let hook = self
+            .snapshot_hook
+            .read()
+            .expect("snapshot hook lock")
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// A foreign segment carrying `records` was applied to this replica.
@@ -773,6 +809,8 @@ impl Meta {
             read_delegations: crate::readdeleg::ReadDelegations::default(),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
+            snapshot_gen: AtomicU64::new(0),
+            snapshot_hook: std::sync::RwLock::new(None),
             vacuum_baselines: Default::default(),
             usage: UsageTracker::new(0, 0),
             syncs: AtomicU64::new(0),

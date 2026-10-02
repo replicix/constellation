@@ -283,6 +283,8 @@ pub struct Engine {
     prune_stats: Arc<crate::prune::PruneStats>,
     /// Node-level snapshot-schedule counters (plan 32).
     snapsched_stats: Arc<crate::snapsched::SnapSchedStats>,
+    /// Plan 32 §6.3: this filesystem's space-accounting index.
+    snapacct: Arc<crate::snapacct::SnapAcctService>,
     /// Unix-ms heartbeat of the sync task's last loop pass.
     last_sync_ms: Arc<AtomicU64>,
     read_only_member: bool,
@@ -1314,6 +1316,24 @@ impl Engine {
         }
         let stop = Arc::new(AtomicBool::new(false));
         rt.spawn(holds.clone().run(stop.clone()));
+        // Plan 32 §6.3: the space-accounting index. Under the default
+        // `auto` its task sleeps until something asks for a size.
+        let snapacct = crate::snapacct::SnapAcctService::new(
+            crate::snapacct::SnapAcctConfig::from_env(),
+            crate::snapacct::SnapAcctDeps {
+                meta: meta.clone(),
+                chunks: store.clone(),
+                tree: tree_access.clone(),
+                // A refresh with nothing new is then one GET that misses
+                // and one of the known head (`discover_head`).
+                commits: constellation_store_s3::CommitChain::new(store.inner().clone())
+                    .with_sealing(tree_sealing.clone())
+                    .with_probe_window(1),
+                dir: state_dir.join(crate::snapacct::service::DIR),
+                fs_uuid: fsmeta.uuid.to_string(),
+            },
+        );
+        rt.spawn(snapacct.clone().run(stop.clone(), Some(background.clone())));
         // Read-time atime flush ticker (plan 20). Off-mode accumulators
         // never queue anything, so this loop drains empty and is cheap;
         // it only does work when the operator opted in.
@@ -1497,6 +1517,7 @@ impl Engine {
             atime,
             prune_stats,
             snapsched_stats,
+            snapacct,
             last_sync_ms,
             read_only_member,
             fsync_s3,
@@ -2122,6 +2143,11 @@ impl Engine {
     }
     pub fn snapsched_stats(&self) -> &Arc<crate::snapsched::SnapSchedStats> {
         &self.snapsched_stats
+    }
+    /// Plan 32 §6.3: the space-accounting index (`32-m5c`'s surfaces
+    /// query it; the host reports its web UI through it).
+    pub fn snapacct(&self) -> &Arc<crate::snapacct::SnapAcctService> {
+        &self.snapacct
     }
     pub fn last_sync_ms(&self) -> &Arc<AtomicU64> {
         &self.last_sync_ms

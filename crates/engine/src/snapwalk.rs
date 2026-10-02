@@ -153,6 +153,9 @@ pub struct Occurrence {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Occurrences {
     entries: HashMap<ChunkHash, Occurrence>,
+    /// `LSIZE` (plan 32 §6.1): Σ apparent file size under the directory,
+    /// once per in-subtree name, like the chunk occurrences.
+    lsize: u64,
 }
 
 impl Occurrences {
@@ -190,10 +193,24 @@ impl Occurrences {
         self.entries.keys()
     }
 
+    /// Σ apparent size of the files under the directory, per name.
+    pub fn lsize(&self) -> u64 {
+        self.lsize
+    }
+
     /// Advance to the next snapshot of the chain. Refuses a delta that
     /// would take a count below zero: deltas are exact, so that is a
     /// bug (or deltas applied to the wrong base), never a rounding.
     pub fn apply(&mut self, deltas: &Deltas) -> Result<()> {
+        self.lsize = self
+            .lsize
+            .checked_add_signed(deltas.lsize_delta)
+            .with_context(|| {
+                format!(
+                    "LSIZE {} would leave the u64 range after a delta of {}",
+                    self.lsize, deltas.lsize_delta
+                )
+            })?;
         for delta in deltas.iter() {
             let have = self.count(&delta.hash) as i64;
             let now = have + delta.delta;
@@ -222,7 +239,10 @@ impl Occurrences {
     /// `self − base`, as deltas: what [`ChainWalk::step`] computes from
     /// a diff, computed from two full walks instead.
     pub fn minus(&self, base: &Occurrences) -> Deltas {
-        let mut deltas = Deltas::default();
+        let mut deltas = Deltas {
+            lsize_delta: self.lsize as i64 - base.lsize as i64,
+            ..Deltas::default()
+        };
         for (hash, occurrence) in &self.entries {
             deltas.add(*hash, occurrence.size_bytes, occurrence.count as i64);
         }
@@ -249,6 +269,8 @@ pub struct Delta {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Deltas {
     entries: BTreeMap<ChunkHash, (i64, u64)>,
+    /// `LSIZE[next] − LSIZE[prev]`.
+    pub lsize_delta: i64,
     /// Set when the step could not be computed from the diff and was
     /// computed from two full walks instead. The deltas are just as
     /// exact; only the cost differs.
@@ -525,6 +547,13 @@ struct Inner {
     refetches: AtomicU64,
 }
 
+/// A file as one root records it.
+#[derive(Clone)]
+struct FileState {
+    size: u64,
+    manifest: Option<Vec<u8>>,
+}
+
 /// One root, read synchronously on a blocking thread.
 struct Side<'a> {
     tree: &'a Tree<Arc<NodeCache>>,
@@ -752,14 +781,15 @@ impl Inner {
         Ok(())
     }
 
-    /// A file's manifest bytes in one root; `None` for anything that is
-    /// not a file with content.
-    fn manifest_of(
+    /// A file's apparent size and manifest bytes in one root; `None` for
+    /// anything that is not a file (a file without content has no
+    /// manifest).
+    fn file_of(
         &self,
         side: &Side<'_>,
         ino: Ino,
         handle: &tokio::runtime::Handle,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<FileState>> {
         let Some(value) = side.tree.get(&side.root, &keys::inode(ino))? else {
             return Ok(None);
         };
@@ -771,11 +801,15 @@ impl Inner {
             blobs: &self.tree.blobs,
             handle,
         };
-        record
+        let manifest = record
             .manifest
             .as_ref()
             .map(|payload| resolver.payload(payload))
-            .transpose()
+            .transpose()?;
+        Ok(Some(FileState {
+            size: record.attrs.size,
+            manifest,
+        }))
     }
 
     /// The full walk: every dentry under `dir`, files counted once per
@@ -787,7 +821,7 @@ impl Inner {
         handle: &tokio::runtime::Handle,
     ) -> Result<Occurrences> {
         let mut occurrences = Occurrences::default();
-        let mut linked: HashMap<Ino, Option<Vec<u8>>> = HashMap::new();
+        let mut linked: HashMap<Ino, Option<FileState>> = HashMap::new();
         let mut stack = vec![dir];
         while let Some(parent) = stack.pop() {
             for (child, kind, nlink) in dentries(side, parent)? {
@@ -795,20 +829,22 @@ impl Inner {
                     Kind::Dir => stack.push(child),
                     Kind::File => {
                         // A hardlinked file is read once, counted per name.
-                        let bytes = if nlink > 1 {
+                        let file = if nlink > 1 {
                             match linked.get(&child) {
-                                Some(bytes) => bytes.clone(),
+                                Some(file) => file.clone(),
                                 None => {
-                                    let bytes = self.manifest_of(side, child, handle)?;
-                                    linked.insert(child, bytes.clone());
-                                    bytes
+                                    let file = self.file_of(side, child, handle)?;
+                                    linked.insert(child, file.clone());
+                                    file
                                 }
                             }
                         } else {
-                            self.manifest_of(side, child, handle)?
+                            self.file_of(side, child, handle)?
                         };
-                        if let Some(bytes) = bytes {
-                            self.add_manifest(&bytes, 1, handle, &mut |hash, size, count| {
+                        let Some(file) = file else { continue };
+                        occurrences.lsize += file.size;
+                        if let Some(bytes) = &file.manifest {
+                            self.add_manifest(bytes, 1, handle, &mut |hash, size, count| {
                                 occurrences.add(hash, size, count as u64)
                             })?;
                         }
@@ -930,7 +966,6 @@ impl Inner {
                 _ => {}
             }
         }
-        let mut add = |hash, size, count| deltas.add(hash, size, count);
         for ino in files {
             let links_before = match kind_of(before, ino)? {
                 Some(Kind::File) => {
@@ -947,17 +982,24 @@ impl Inner {
             if links_before == 0 && links_after == 0 {
                 continue;
             }
-            let manifest_before = match links_before {
+            let file_before = match links_before {
                 0 => None,
-                _ => self.manifest_of(before, ino, handle)?,
+                _ => self.file_of(before, ino, handle)?,
             };
-            let manifest_after = match links_after {
+            let file_after = match links_after {
                 0 => None,
-                _ => self.manifest_of(after, ino, handle)?,
+                _ => self.file_of(after, ino, handle)?,
             };
+            let size = |file: &Option<FileState>, links: u64| {
+                file.as_ref().map_or(0, |f| f.size as i64) * links as i64
+            };
+            deltas.lsize_delta += size(&file_after, links_after) - size(&file_before, links_before);
+            let manifest_before = file_before.and_then(|f| f.manifest);
+            let manifest_after = file_after.and_then(|f| f.manifest);
             if links_before == links_after && manifest_before == manifest_after {
                 continue;
             }
+            let mut add = |hash, size, count| deltas.add(hash, size, count);
             if let Some(bytes) = &manifest_before {
                 self.add_manifest(bytes, -(links_before as i64), handle, &mut add)?;
             }
@@ -1124,6 +1166,7 @@ mod tests {
                     match entry.kind {
                         InodeKind::Dir => stack.push(entry.ino),
                         InodeKind::File => {
+                            out.lsize += self.meta.getattr(entry.ino).unwrap().unwrap().size;
                             let Some(bytes) = self.meta.manifest(entry.ino).unwrap() else {
                                 continue;
                             };

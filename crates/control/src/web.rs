@@ -799,6 +799,51 @@ pub fn render_metrics(status: &StatusReport) -> String {
         "Prune passes refused because the replica was too stale.",
         status.prune.refused_lag
     );
+    gauge!(
+        "constellation_snapacct_building",
+        "Whether the space-accounting index is behind the snapshot rows (queries answer building).",
+        u8::from(status.snapacct.building)
+    );
+    gauge!(
+        "constellation_snapacct_build_progress_pct",
+        "Share of snapshot rows the accounting index has applied while building.",
+        status.snapacct.build_progress_pct
+    );
+    gauge!(
+        "constellation_snapacct_indexed_chunks",
+        "Chunks held by at least one snapshot, as indexed.",
+        status.snapacct.indexed_chunks
+    );
+    gauge!(
+        "constellation_snapacct_index_bytes",
+        "On-disk size of the accounting index's tables.",
+        status.snapacct.index_bytes
+    );
+    gauge!(
+        "constellation_snapacct_as_of_seq",
+        "The commit the accounting numbers are as of.",
+        status.snapacct.as_of_seq
+    );
+    gauge!(
+        "constellation_snapacct_refresh_ms_last",
+        "Duration of the last live-tree refresh, milliseconds.",
+        status.snapacct.refresh_ms_last
+    );
+    gauge!(
+        "constellation_snapacct_verify_mismatches",
+        "Mismatches the last accounting verify found.",
+        status.snapacct.verify_mismatches
+    );
+    gauge!(
+        "constellation_snapacct_stalled_chains",
+        "Snapshot chains the accounting index could not apply in its last pass.",
+        status.snapacct.stalled_chains
+    );
+    gauge!(
+        "constellation_snapacct_refreshes_deferred_total",
+        "Live refreshes deferred because the replica had not applied the newest commit.",
+        status.snapacct.refreshes_deferred
+    );
     render_vfs_ops(&mut output, &status.vfs_ops);
     render_fuse(&mut output, &status.fuse);
     output

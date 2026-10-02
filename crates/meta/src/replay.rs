@@ -616,6 +616,7 @@ fn apply_one(
                     *created_unix_ms,
                 )),
             )?;
+            meta.note_snapshot_change();
             Ok(Applied::Done)
         }
         LogRecord::SnapCreate2 {
@@ -649,6 +650,7 @@ fn apply_one(
                     held_by: None,
                 }),
             )?;
+            meta.note_snapshot_change();
             Ok(Applied::Done)
         }
         LogRecord::SnapHold { id, held, by } => {
@@ -679,6 +681,7 @@ fn apply_one(
                 dirty,
                 keys::subsystem(keys::Subsystem::Snapshot, id.as_bytes()),
             )?;
+            meta.note_snapshot_change();
             Ok(Applied::Done)
         }
         LogRecord::Clone { nodes, .. } => apply_clone(tx, meta, dirty, nodes, staged),

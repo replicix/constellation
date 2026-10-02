@@ -658,6 +658,27 @@ impl EngineControl {
                 }
             },
             snapsched: self.snapsched_stats.status(),
+            snapacct: {
+                use std::sync::atomic::Ordering::Relaxed;
+                let snapacct = self.engine.snapacct();
+                let s = snapacct.stats();
+                api::SnapAcctStatus {
+                    mode: snapacct.mode().as_str().to_string(),
+                    maintaining: snapacct.maintaining(),
+                    building: s.building.load(Relaxed),
+                    build_progress_pct: s.build_progress_pct.load(Relaxed),
+                    indexed_chunks: s.indexed_chunks.load(Relaxed),
+                    index_bytes: s.index_bytes.load(Relaxed),
+                    as_of_seq: s.as_of_seq.load(Relaxed),
+                    refresh_ms_last: s.refresh_ms_last.load(Relaxed),
+                    verify_mismatches: s.verify_mismatches.load(Relaxed),
+                    stalled_chains: s.stalled_chains.load(Relaxed),
+                    refreshes_deferred: s.refreshes_deferred.load(Relaxed),
+                    passes: s.passes.load(Relaxed),
+                    errors: s.errors.load(Relaxed),
+                    last_error: s.last_error.lock().ok().and_then(|g| g.clone()),
+                }
+            },
             fuse_requests: fuse_requests_status(&self.engine.op_watch().snapshot()),
             lifecycle: self.engine.lifecycle().status(),
             s3: backend::s3_request_counts(),

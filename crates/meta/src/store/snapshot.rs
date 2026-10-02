@@ -175,6 +175,7 @@ impl Meta {
         }
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
+        self.note_snapshot_change();
         Ok(())
     }
 
@@ -285,6 +286,7 @@ impl Meta {
         )?;
         self.finish_local(&mut tx, local)?;
         tx.commit()?;
+        self.note_snapshot_change();
         Ok(true)
     }
 

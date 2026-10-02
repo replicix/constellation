@@ -558,6 +558,10 @@ pub struct StatusReport {
     /// scheduler (M3) and expiry (M4) run.
     #[serde(default)]
     pub snapsched: SnapSchedStatus,
+    /// Plan 32 §6.3/Step 9: the space-accounting index. Default (`auto`,
+    /// never asked) leaves everything zero and `maintaining` false.
+    #[serde(default)]
+    pub snapacct: SnapAcctStatus,
     /// The FUSE request watchdog (EC2 campaign 7 B-2).
     #[serde(default)]
     pub fuse_requests: FuseRequestsStatus,
@@ -870,6 +874,54 @@ pub struct SnapSchedStatus {
     /// message)`.
     #[serde(default)]
     pub last_parse_error: Option<(String, usize, String)>,
+}
+
+/// Plan 32 Step 9's `SnapAcctStats`: the node-local space-accounting
+/// index (advisory; never published, never consulted by GC).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SnapAcctStatus {
+    /// `CONSTELLATION_SNAPACCT`: "auto", "on" or "off".
+    #[serde(default)]
+    pub mode: String,
+    /// Whether the background task is keeping the index current now.
+    #[serde(default)]
+    pub maintaining: bool,
+    /// The index does not match the snapshot rows (its first build, a
+    /// pass cut short by its budget, or a stalled chain): queries answer
+    /// "building", never partial numbers.
+    #[serde(default)]
+    pub building: bool,
+    #[serde(default)]
+    pub build_progress_pct: u64,
+    /// Chunks held by at least one snapshot.
+    #[serde(default)]
+    pub indexed_chunks: u64,
+    /// The index's on-disk tables.
+    #[serde(default)]
+    pub index_bytes: u64,
+    /// The commit every number is "as of".
+    #[serde(default)]
+    pub as_of_seq: u64,
+    /// The last live-tree refresh's duration.
+    #[serde(default)]
+    pub refresh_ms_last: u64,
+    /// The last `--verify`'s mismatch count.
+    #[serde(default)]
+    pub verify_mismatches: u64,
+    /// Chains the last pass could not apply (an operation failed twice);
+    /// above zero, queries answer "building" until they can be.
+    #[serde(default)]
+    pub stalled_chains: u64,
+    /// Live refreshes that found a newer commit this replica had not
+    /// applied yet, and so kept the flags at the older one.
+    #[serde(default)]
+    pub refreshes_deferred: u64,
+    #[serde(default)]
+    pub passes: u64,
+    #[serde(default)]
+    pub errors: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// One marked prune root, for `constellation prune ls`.

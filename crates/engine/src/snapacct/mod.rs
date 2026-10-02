@@ -105,12 +105,20 @@
 
 mod encoding;
 mod ops;
+pub mod service;
+mod verify;
 
+#[cfg(test)]
+mod service_tests;
 #[cfg(test)]
 mod tests;
 
 pub use encoding::ChunkEntry;
 pub use ops::NewSnapshot;
+pub use service::{
+    Numbers, ReclaimEstimate, SnapAcctConfig, SnapAcctDeps, SnapAcctMode, SnapAcctService,
+    SnapAcctStats, SnapAnswer, SpaceBreakdown, VerifyReport,
+};
 
 use crate::snapwalk::{Delta, Occurrences};
 use constellation_fs_core::ChunkHash;
@@ -270,6 +278,11 @@ pub struct SnapAcct {
     snap: SingleWriterTxKeyspace,
     meta: SingleWriterTxKeyspace,
     tomb: SingleWriterTxKeyspace,
+    /// The live tree's spilled chunk lists and their members
+    /// ([`SnapAcct::record_live_spill`]): `chunk_ref` rows name a spilled
+    /// list, never its members, so this is how a member's liveness is
+    /// known.
+    lspill: SingleWriterTxKeyspace,
     params: SnapAcctParams,
     clock: Clock,
     path: PathBuf,
@@ -344,6 +357,7 @@ impl SnapAcct {
             snap: ks("snapacct_snap")?,
             meta: ks("snapacct_meta")?,
             tomb: ks("snapacct_tomb")?,
+            lspill: ks("snapacct_lspill")?,
             db,
             params,
             clock: Arc::new(system_ms),
@@ -670,6 +684,7 @@ impl SnapAcct {
             &self.snap,
             &self.meta,
             &self.tomb,
+            &self.lspill,
         ]
         .iter()
         .map(|ks| ks.inner().disk_space())
@@ -774,6 +789,171 @@ impl SnapAcct {
         Ok(out)
     }
 
+    /// Every indexed chunk, in hash order. O(index): `--verify` and the
+    /// live refresh's fallback only.
+    pub fn for_each_chunk(
+        &self,
+        mut f: impl FnMut(ChunkHash, ChunkEntry) -> Result<()>,
+    ) -> Result<()> {
+        let r = self.db.read_tx();
+        for guard in r.iter(&self.chunk) {
+            let (k, v) = guard.into_inner()?;
+            let hash: [u8; 32] = k
+                .as_ref()
+                .try_into()
+                .map_err(|_| SnapAcctError::Corrupt("short chunk key".into()))?;
+            f(ChunkHash(hash), decode_chunk(&v)?)?;
+        }
+        Ok(())
+    }
+
+    /// Every registered chain as `(chain, dir ino)`, in chain order.
+    pub fn chains(&self) -> Result<Vec<(u32, u64)>> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for guard in r.prefix(&self.meta, b"chain/") {
+            let (k, v) = guard.into_inner()?;
+            let chain: [u8; 4] = k
+                .get(6..)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| SnapAcctError::Corrupt("short chain key".into()))?;
+            let rec: ChainRec = from_postcard(&v, "chain record")?;
+            out.push((u32::from_be_bytes(chain), rec.dir_ino));
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------- caller-owned state
+
+    /// A value the index's owner keeps next to it (its build cursor, the
+    /// commit its live flags are as of): stored in `snapacct_meta` under
+    /// `aux/<key>`, so it is wiped together with the index.
+    pub fn aux(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.meta.get(aux_key(key))?.map(|v| v.to_vec()))
+    }
+
+    pub fn put_aux(&self, key: &str, value: &[u8]) -> Result<()> {
+        let mut tx = self.db.write_tx();
+        tx.insert(&self.meta, aux_key(key), value.to_vec());
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_aux(&self, key: &str) -> Result<()> {
+        let mut tx = self.db.write_tx();
+        tx.remove(&self.meta, aux_key(key));
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether `spill` is recorded as a live spilled list.
+    pub fn live_spill_known(&self, spill: &ChunkHash) -> Result<bool> {
+        Ok(self.lspill.get(spill_key(spill))?.is_some())
+    }
+
+    /// Record `spill` as a list the live tree references, with its
+    /// `members` (idempotent).
+    pub fn record_live_spill(
+        &self,
+        spill: &ChunkHash,
+        members: impl IntoIterator<Item = ChunkHash>,
+    ) -> Result<()> {
+        let mut tx = self.db.write_tx();
+        for member in members {
+            tx.insert(&self.lspill, member_key(&member, spill), Vec::new());
+        }
+        tx.insert(&self.lspill, spill_key(spill), Vec::new());
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The live tree no longer references `spill` (idempotent).
+    pub fn forget_live_spill(
+        &self,
+        spill: &ChunkHash,
+        members: impl IntoIterator<Item = ChunkHash>,
+    ) -> Result<()> {
+        let mut tx = self.db.write_tx();
+        for member in members {
+            tx.remove(&self.lspill, member_key(&member, spill));
+        }
+        tx.remove(&self.lspill, spill_key(spill));
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether some recorded live spilled list has `chunk` as a member.
+    pub fn in_live_spill(&self, chunk: &ChunkHash) -> Result<bool> {
+        let mut prefix = Vec::with_capacity(33);
+        prefix.push(b'm');
+        prefix.extend_from_slice(&chunk.0);
+        Ok(self
+            .db
+            .read_tx()
+            .prefix(&self.lspill, prefix)
+            .next()
+            .is_some())
+    }
+
+    /// The recorded members of live spilled list `spill`, by a scan of
+    /// every recorded member: the fallback when the list itself can no
+    /// longer be read.
+    pub fn live_spill_members(&self, spill: &ChunkHash) -> Result<Vec<ChunkHash>> {
+        let r = self.db.read_tx();
+        let mut out = Vec::new();
+        for guard in r.prefix(&self.lspill, b"m") {
+            let key = guard.key()?;
+            if key.len() == 65 && key[33..] == spill.0 {
+                out.push(ChunkHash(key[1..33].try_into().expect("32 bytes")));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every recorded live spilled list.
+    pub fn live_spills(&self) -> Result<HashSet<ChunkHash>> {
+        let r = self.db.read_tx();
+        let mut out = HashSet::new();
+        for guard in r.prefix(&self.lspill, b"s") {
+            let key = guard.key()?;
+            if key.len() == 33 {
+                out.insert(ChunkHash(key[1..].try_into().expect("32 bytes")));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget every recorded live spilled list not in `keep`, members
+    /// included: one scan, committed in batches.
+    pub fn retain_live_spills(&self, keep: &HashSet<ChunkHash>) -> Result<()> {
+        let spill_of = |key: &[u8]| -> Option<ChunkHash> {
+            match (key.first(), key.len()) {
+                (Some(b's'), 33) => Some(ChunkHash(key[1..].try_into().expect("32 bytes"))),
+                (Some(b'm'), 65) => Some(ChunkHash(key[33..].try_into().expect("32 bytes"))),
+                _ => None,
+            }
+        };
+        let stale: Vec<Vec<u8>> = {
+            let r = self.db.read_tx();
+            let mut stale = Vec::new();
+            for guard in r.iter(&self.lspill) {
+                let key = guard.key()?;
+                if spill_of(&key).is_none_or(|spill| !keep.contains(&spill)) {
+                    stale.push(key.to_vec());
+                }
+            }
+            stale
+        };
+        for batch in stale.chunks(10_000) {
+            let mut tx = self.db.write_tx();
+            for key in batch {
+                tx.remove(&self.lspill, key.clone());
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
     /// A full scan checking every structural invariant and recomputing
     /// every counter from the chunk entries: the index's self-check
     /// (tests, `--verify`). O(index).
@@ -806,6 +986,27 @@ fn numbers(chain: u32, ord: u32, rec: SnapRec) -> SnapNumbers {
         refer: rec.refer,
         lsize: rec.lsize,
     }
+}
+
+fn aux_key(key: &str) -> Vec<u8> {
+    let mut out = b"aux/".to_vec();
+    out.extend_from_slice(key.as_bytes());
+    out
+}
+
+fn spill_key(spill: &ChunkHash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(33);
+    key.push(b's');
+    key.extend_from_slice(&spill.0);
+    key
+}
+
+fn member_key(member: &ChunkHash, spill: &ChunkHash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(65);
+    key.push(b'm');
+    key.extend_from_slice(&member.0);
+    key.extend_from_slice(&spill.0);
+    key
 }
 
 fn fs_counters(r: &impl Readable, meta: &SingleWriterTxKeyspace) -> Result<FsCounters> {

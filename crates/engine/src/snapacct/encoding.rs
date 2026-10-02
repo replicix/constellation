@@ -16,6 +16,10 @@
 //! | `snapacct_snap` | `chain` (4) `ord` (4) | [`SnapRec`] |
 //! | `snapacct_meta` | `header`, `next_chain`, `fs`, `chain/` chain, `ino/` ino, `id/` id | postcard |
 //! | `snapacct_tomb` | `h` hash / `t` since_ms (8) hash | `size`,`since_ms` varints / empty |
+//! | `snapacct_lspill` | `s` spill / `m` member spill | empty (live spilled lists, by member) |
+//!
+//! `snapacct_meta` also holds `aux/<key>`: the owner's state (the
+//! service's build cursor and live-refresh root), wiped with the index.
 
 use super::{Run, SnapAcctError, OPEN};
 use constellation_fs_core::ChunkHash;
@@ -24,7 +28,7 @@ use smallvec::SmallVec;
 
 /// Bumped whenever any encoding below changes: a mismatch on open wipes
 /// the index and it is rebuilt from replicated state.
-pub(super) const FORMAT: u32 = 1;
+pub(super) const FORMAT: u32 = 2;
 
 pub(super) const META_HEADER: &[u8] = b"header";
 pub(super) const META_NEXT_CHAIN: &[u8] = b"next_chain";

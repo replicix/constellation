@@ -163,6 +163,12 @@ pub struct GcReport {
     /// sweep and compaction). `None` when the phase did not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<crate::mtree_gc::MtreeGcReport>,
+    /// Plan 32 §6.1: what the round's LIST of `chunks/` counted (every
+    /// chunk object, protected or not, and its stored bytes). A real
+    /// round also writes it to `gc/summary.json`, where the accounting
+    /// index reads its compression estimate from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub census: Option<constellation_store_s3::ChunkCensus>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -250,6 +256,7 @@ struct Marked {
     snap_walk: SnapWalkMode,
     /// What snapshot reconciliation found and did before the mark.
     snaps: SnapFindings,
+    census: constellation_store_s3::ChunkCensus,
 }
 
 /// Chunk candidates come from a single pass: LIST `chunks/` and mark
@@ -385,11 +392,17 @@ async fn mark_chunks(
         .collect();
 
     let mut candidates = Vec::new();
+    let mut census = constellation_store_s3::ChunkCensus {
+        as_of_ms: now,
+        ..Default::default()
+    };
     let prefix = Path::from("chunks");
     for object in store.list(Some(&prefix)).try_collect::<Vec<_>>().await? {
         let Some(hash) = object.location.filename().and_then(ChunkHash::from_hex) else {
             continue;
         };
+        census.chunk_objects += 1;
+        census.physical_bytes += object.size;
         if !protected.contains(&hash)
             && object.last_modified.timestamp_millis() <= now - config.horizon_ms
         {
@@ -403,6 +416,13 @@ async fn mark_chunks(
     }
     candidates.extend(metadata_candidates(store, chunks.e2e_keys(), config, now).await?);
     candidates.sort_by(|a, b| a.key.cmp(&b.key));
+    if !verify_only {
+        // Advisory (an estimate's input): a failed PUT costs the round
+        // nothing.
+        if let Err(error) = constellation_store_s3::write_chunk_census(store, &census).await {
+            tracing::warn!(%error, "GC: could not write the chunk census");
+        }
+    }
 
     if verify_only || candidates.is_empty() {
         return Ok(Err(snaps.into_report(GcReport {
@@ -412,6 +432,7 @@ async fn mark_chunks(
             restored: Vec::new(),
             condemned_epoch: None,
             metadata: None,
+            census: Some(census),
         })));
     }
 
@@ -425,6 +446,7 @@ async fn mark_chunks(
         condemned,
         snap_walk: config.snap_walk,
         snaps,
+        census,
     }))
 }
 
@@ -445,6 +467,7 @@ async fn sweep_chunks(
         condemned,
         snap_walk,
         snaps,
+        census,
     } = marked;
     tail.tail_to_head(meta, lease_mode).await.context(
         "tailing the metadata log to head after the condemned-list wait, before deletion",
@@ -513,6 +536,7 @@ async fn sweep_chunks(
         restored: Vec::new(),
         condemned_epoch: Some(condemned.epoch),
         metadata: None,
+        census: Some(census),
     }))
 }
 
@@ -1945,6 +1969,57 @@ mod tests {
             .filter(|mark| mark.key.starts_with("snaps/"))
             .map(|mark| (mark.rule.as_str(), mark.key.as_str()))
             .collect()
+    }
+
+    /// Plan 32 §6.1: a real round records the census of its `chunks/`
+    /// LIST — every object and its stored bytes — in its report and in
+    /// `gc/summary.json`; a verify-only round reports it and writes
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_round_records_its_chunk_census() {
+        let fx = snap_fixture().await;
+        let mut objects = 0;
+        let mut bytes = 0;
+        for object in fx
+            .store
+            .list(Some(&Path::from("chunks")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+        {
+            objects += 1;
+            bytes += object.size;
+        }
+        assert!(objects >= 2);
+        let config = GcConfig {
+            horizon_ms: 3_600_000,
+            ..fast_config()
+        };
+        let report = fx.round(&config, true).await;
+        let census = report.census.expect("a verify-only round reports it");
+        assert_eq!(
+            (census.chunk_objects, census.physical_bytes),
+            (objects, bytes)
+        );
+        assert!(constellation_store_s3::read_chunk_census(&fx.store)
+            .await
+            .unwrap()
+            .is_none());
+        let report = fx.round(&config, false).await;
+        let census = report.census.expect("a real round reports it");
+        assert_eq!(
+            (census.chunk_objects, census.physical_bytes),
+            (objects, bytes)
+        );
+        assert!(census.as_of_ms > 0);
+        assert_eq!(
+            constellation_store_s3::read_chunk_census(&fx.store)
+                .await
+                .unwrap(),
+            Some(census)
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["census"]["chunk_objects"], objects);
     }
 
     /// Plan 32 §0.3: a `snaps/` object with no row is left alone while it

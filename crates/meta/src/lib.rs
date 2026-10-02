@@ -43,7 +43,7 @@ pub use store::spec::{
 };
 pub use store::{
     BootstrapIndexBuilder, DelegateTx, ForeignApplyHook, JournalBatch, LogPrefixView, Meta,
-    PublishBasis, SCRATCH_XATTR,
+    PublishBasis, SnapshotChangeHook, SCRATCH_XATTR,
 };
 
 use constellation_fs_core::{FileAttr, Ino};

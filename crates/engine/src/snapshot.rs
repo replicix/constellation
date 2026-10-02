@@ -61,7 +61,7 @@ impl TreeAccess {
     /// Run a synchronous tree read off the runtime. The node cache
     /// bridges to async I/O with `block_in_place`, which a blocking
     /// thread may do on any runtime flavour.
-    async fn read<T, F>(&self, root: NodeHash, f: F) -> Result<T>
+    pub(crate) async fn read<T, F>(&self, root: NodeHash, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&TreeReader<Arc<NodeCache>>, &Resolver<'_>) -> Result<T> + Send + 'static,

@@ -408,6 +408,41 @@ pub async fn append_journal(
     Ok(())
 }
 
+/// Plan 32 §6.1: what a chunk GC round's LIST of `chunks/` saw — every
+/// chunk object and their stored (physical: compressed, sealed) bytes —
+/// and when. The space-accounting index turns logical bytes into an
+/// *estimate* of physical ones with it; nothing else reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkCensus {
+    pub chunk_objects: u64,
+    pub physical_bytes: u64,
+    /// When the LIST ran (unix ms).
+    pub as_of_ms: i64,
+}
+
+/// The newest round's census, at `gc/summary.json` (overwritten by every
+/// round that completes its mark: one PUT a round).
+pub async fn write_chunk_census(
+    store: &Arc<dyn ObjectStore>,
+    census: &ChunkCensus,
+) -> Result<(), StoreError> {
+    store
+        .put(&layout::gc_summary(), serde_json::to_vec(census)?.into())
+        .await?;
+    Ok(())
+}
+
+/// The last census written, if any round has written one.
+pub async fn read_chunk_census(
+    store: &Arc<dyn ObjectStore>,
+) -> Result<Option<ChunkCensus>, StoreError> {
+    match store.get(&layout::gc_summary()).await {
+        Ok(result) => Ok(Some(serde_json::from_slice(&result.bytes().await?)?)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
