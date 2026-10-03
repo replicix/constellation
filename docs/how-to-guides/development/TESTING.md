@@ -2674,6 +2674,12 @@ other content after two minutes is a divergence.
 | `small-file-write-path` | S3 100 ms away each way; the sequencer and a non-owner each close 12 small unique files, under `--write-mode through`, then `back`. Asserted per writer from its counting relay: one chunk PUT per file and no chunk HEAD or `gc/condemned.json` GET in front of it; the sequencer takes the non-owner's durable report instead of checking S3 itself. `through`: close p50 under 1.5 S3 round trips on both; `back`: under half a round trip on both. Every file then reads back right on a third node. `WRITEPATH_LAT_MS` (100), `WRITEPATH_FILES` (12) |
 | `nonowner-back-crash` | S3 1 s away each way; the non-owner that is not the sequencer's backup closes files under `back` (fast), and a reader on the sequencer waits for a chunk still uploading instead of failing. Then more files, and the writer is killed with its uploads in flight: the sequencer awaits them (`status.writeback.remote_chunks_awaited`), no other node sees content S3 cannot serve, and after the remount (the pending uploads go up, reported to every peer) a third node reads every file right and `fsck` finds no dangling reference. `WRITEPATH_CRASH_LAT_MS` (1000), `WRITEPATH_FILES` |
 
+## Findings of the CSI kind lane
+
+| Scenario | What it checks |
+|---|---|
+| `append-setattr-size` | the K5 lane's busy-writer loss without Kubernetes. Two nodes (`a` holds the lease, `b` its backup; cluster locks, 1 MiB chunks, `CONSTELLATION_LEASE_PLACEMENT=off` so `b`'s publications are forwarded, as on kind). On `b`, then on `a`, one `O_APPEND` descriptor appends 64 KiB blocks, each carrying its index, for `APPEND_SETATTR_SECS` (8) s while a second descriptor `fdatasync`s the file every second and a third thread `chown`s it to its own group, `chmod`s it, `utimes` it and hard-links and unlinks a second name every 100 ms: what kubelet's fsGroup pass does on every republish (`requiresRepublish: true`, `fsGroupPolicy: File`). The appending descriptor's `close()` must return 0, and every acknowledged block must be in the file in order, with nothing after it, on the writer, on the other node and on a fresh third node. Before the fix a `setattr` or `link` reply carried the committed row's size; the kernel stored it in `i_size` and appended from there, so the file came up short (failure: `block 0 of N holds block K`). Root with `CONSTELLATION_FUSE_TRANSPORT=uring` runs the same on the ring |
+
 ## Cross-target type-check (`make check-cross`)
 
 `make check-cross` (`tools/check-cross.sh`, CI job `cross-check`) runs

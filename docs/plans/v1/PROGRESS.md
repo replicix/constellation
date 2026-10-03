@@ -38147,3 +38147,122 @@ rerun); `cargo build --release --workspace` ok; the harness runs above.
 ## Plan 32 M8b (docs)
 
 Plan 32 Step 10's documentation, docs only (no code, no plan or DESIGN edits). New `docs/reference/features/snapshot-policies.md` (grammar and valid interval set, settings, the plan's examples with `policy check` counts, the retention rule once, why the newest snapshot and not the clock, names, skip-empty, holds and `held_by` namespaces, orphans, grace, CLI, space columns with the "`USED` does not sum" note and "space returns after GC", web UI, metrics, failure modes); `docs/reference/configuration.md` (the Step 10 knobs were already in the tables from M3/M4/M5; added the cross-links, the `budget=` note, and replaced the stale "when M8 exports these counters" sentence); `prune.md` cross-link section; `docs/reference/README.md` index entry. Doc/code differences documented as the code has them: `budget=` parses but is not enforced (Step 8 not built; `budget_*` metrics stay 0); `day-start` must be a whole hour and a multiple of the finest hourly tier (plan: a multiple of the finest interval ≥ 1h); keep unit `min` exists and the canonical form prints minutes as `min`; `snapshot ls` prints `CREATED (UTC)`, not the policy tz; `held_by` is validated (`user:`/`csi:`, `policy:` reserved, unprefixed refused) and release needs the same owner; `snapshot delete`/`hold`/`release` take `--force`; extra knobs `CONSTELLATION_SNAPSCHED_EXPIRE_BATCH`, `_RESIGN_AFTER`, `CONSTELLATION_SNAPACCT_BUDGET_MS`; `CONSTELLATION_GC_SNAP_WALK=full` is "kept for one release".
+
+## Fix: acknowledged appends lost when a file's attributes change under its writer (`busy-writer-loss`)
+
+The K5a re-review found this with the K5 CSI lane's two writers on kind:
+an appending busy writer (one long-lived `O_APPEND` descriptor, 64 KiB
+blocks, `sync -d` from a second descriptor every 2 s) acknowledged 31,253
+blocks, and the file came up 22.7 MB short. Every `write`, every `fsync`
+and the descriptor's `close()` returned 0. It happened on a fresh cluster
+with no handoff. Other runs were 8 KiB, one block and 66 blocks short. A
+single-node `constellation mount` lost nothing.
+
+### Mechanism
+
+- The view answers `getattr` and `lookup` with the committed row's size
+  shadowed by the open write session's pending size
+  (`WriteShards::pending_len`). `setattr` did not: after its
+  `MutateOp::Setattr` it replied with `meta.getattr(ino)`, the committed
+  row alone. `link`'s entry reply and a scratch directory's `lookup` did
+  the same.
+- A busy appender's session always holds more than the committed row:
+  the row moves only when a flush publishes (a `sync -d`/`fsync` from the
+  other descriptor, a close), and the very next write opens a new
+  session. Right after the file is created the row says 0.
+- The kernel stores the size of every attribute reply in the inode's
+  `i_size` (FUSE without writeback cache trusts the server). It
+  positions each `O_APPEND` write at `i_size`. So after a `chmod` of the
+  file, the appender's next blocks landed at the committed size, over
+  bytes `write(2)` had already acknowledged. The engine wrote exactly what
+  it was asked at the offsets the kernel gave, so every call and the close
+  succeeded. The file ends short by the gap between the session's size and
+  the committed size at the moment of the `setattr`, and a block that does
+  not belong there appears at the overwrite point (the reviewer's `cmp`
+  difference at a 64 KiB boundary).
+- On kind the `setattr` comes from kubelet. The CSIDriver has
+  `requiresRepublish: true`, so kubelet calls `NodePublishVolume` again
+  every 60-90 s, and with `fsGroupPolicy: File` each publish re-applies
+  the pod's `fsGroup` to every file in the volume: a `chown :1000` and a
+  `chmod` to `0664`, as root from another pid namespace (`pid` 0). The
+  file being appended is included. A single-node mount had no such third
+  party, which is why it never lost anything. Two nodes, the backup,
+  cluster locks, 1 MiB chunks and floci are all irrelevant.
+- The size overlay has been missing from `setattr` since the first commit
+  (`8e5b5bd`, Phase 1, 2026-08-22: `getattr` had "Pending writes shadow
+  the committed size", `setattr` replied `meta.setattr`'s attr). Plan 31
+  C4a (`650021b`) moved the handler into `engine/src/view/ops.rs`
+  unchanged.
+
+### Evidence
+
+- A temporary watch in the view recorded each inode's acknowledged write
+  end and flagged any attribute reply below it (`#[track_caller]` on
+  `attr_out`/`entry_out`). On kind (fresh `kind-bwl` cluster, writer pod on
+  `bwl-worker`, the lease kept by the controller's engine pod) every flag
+  came from `ops.rs`'s `setattr` reply: `size=0 acked_end=23592960`,
+  `size=251764736 acked_end=253730816`, `size=1273077760
+  acked_end=1293590528`. The kernel's next writes came in at `off=0,
+  65536, ...`. Two runs before the fix lost 11.3 MB (53,213 blocks
+  acknowledged) and 26 MB (20,135 blocks). The log of the
+  `setattr`s showed only `gid=Some(1000)` and `mode=Some(0o100664)`, from
+  `caller_uid=0 pid=None`: at the pod's start, then every ~71 s.
+- Local, no Kubernetes: two `constellation mount`s on floci with the two
+  writers plus a `chmod 0644` every 5 s lost 72 MB in 30 s (0 errors,
+  `close` OK, a fresh third node read the same short file). Without the
+  `chmod`, 8 runs (writer on the holder or a non-owner, P2P flaps) lost
+  nothing.
+
+### Fix
+
+- `View::current_attr` (`engine/src/view/mod.rs`) reads the committed row
+  (or the scratch row) and applies the pending size under the write shard,
+  so a concurrent flush cannot retire the session between the two reads.
+  This is the ordering `getattr` already had. Every reply about an
+  existing inode now goes through it: `getattr`, `lookup` (including a
+  scratch directory's), `setattr`'s success path (the unlinked-orphan path
+  already overlaid), `link`'s entry, and an `O_CREAT` open of an existing
+  file (`create.rs`).
+- Test `view::vfs_tests::setattr_and_link_report_the_pending_size_an_appender_continues_from`:
+  the test writes 4 bytes, `fsync`s (committed row 4), writes 4 more
+  (pending 8), then runs `chmod`, `utimes` and `link`, and each reply must
+  carry 8. An append at the `chmod` reply's size must read back
+  `aaaabbbbcccc`. Before the fix it fails at the `chmod`'s size: `left: 4,
+  right: 8`.
+- Harness scenario `append-setattr-size` (TESTING.md, "Findings of the CSI
+  kind lane"): two nodes, the busy appender on the non-owner backup and
+  then on the holder, with `chown`/`chmod`/`utimes`/`link` every 100 ms
+  and `fdatasync` from another descriptor every second; every block is
+  checked in place on all three nodes.
+
+### Gates (this host, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `bwlh`, `TMPDIR=/var/tmp/bwl/htmp`; host load 50-260)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | clean; clean |
+| `cargo test --workspace` (in groups: all but meta/store-s3/authority/model; those three; `constellation-model --release` in three calls) | 1449 + 820 + 75 + 56 + 7 = 2407 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | OK |
+| `harness run append-setattr-size`, `/dev/fuse` (cluster locks keep `auto` there) | 20/20 PASSED (seeds 8-24 and three earlier runs). The pre-fix binary failed 4/4: `busy-b is 18874368 bytes, 26017792 acknowledged (7143424 short); block 0 of 397 (offset 0) holds block 26` |
+| the same as root, `CONSTELLATION_FUSE_TRANSPORT=uring` (all three mounts `transport="uring_zc"`) | 4/4 PASSED. The pre-fix binary failed 2/2 (13.1 MB and 0.7 MB short) |
+| `harness run stress-ng-fs` | 1 FAILED, then 2 PASSED: the failure was `c0: cluster locks lapsed under the run (locks.owners_fenced = 2)` at load ~240, a lock-renewal path this change does not touch. The reruns PASSED in 146 s and 190 s |
+| `fio-blips`, `writeback-latency`, `writeback-bigfile`, `writeback-drain`, `writeback-fsync`, `writeback-backpressure` | all PASSED |
+| `writeback-close-metered-nonowner` | FAILED 2/2 on the old base `346374b` (`close 4.3 s, rename 10.1 s`), without this fix too; main fixed it in `e2c5b7d` and it passes there |
+| `fsync-hard-outage`, `fsync-soft-timeout`, `fsync-interrupt`, `concurrent-create-no-excl` | all PASSED |
+| `docker compose -p bwl --profile test run --rm compliance` (private `SMOKE_IMAGE`, floci's host port dropped by an override: 4566 was taken) | `8798 passed, 0 failed`, COMPLIANCE TEST PASSED |
+| kind: K5's two writers (`cat fifo >> busy` appender with its close status, `sync -d` every 2 s, `dd conv=fsync` lines) on a fresh `kind-bwl` cluster per run, pool layout, 1 MiB chunks, 150 s; then a reader pod on `bwl-worker2` (a third engine) compares size and sha256 against the acknowledged blocks | 5/5 exact: 66,687 / 46,944 / 57,510 / 37,991 / 57,686 blocks (2.5-4.4 GB), 0 errors, `cat exit 0`, third node `sha256 MATCH` every run. A sixth run with the fix and the instrumentation also matched, with 26 kubelet `setattr`s logged |
+
+### Notes
+
+- `writeback-close-metered-nonowner` failed on the old base `346374b`
+  (with or without this fix); main fixed it in `e2c5b7d`, where it passes.
+- One window stays that the daemon cannot close: `FUSE_CREATE` answered
+  for an inode that already exists (the name appeared after the kernel's
+  negative lookup) while a local appender extends that inode. The reply
+  now carries `current_attr` (the pending size), which narrows it; what
+  remains is the kernel taking `fuse_iget` attributes with `attr_version`
+  0. It needs a concurrent hard link or cross-node create of that exact
+  name.
+- The kind lane needs `fsGroup` and `requiresRepublish` to reproduce. A
+  workload with no third party changing attributes (the single-node
+  `mount` repro) never triggered it.

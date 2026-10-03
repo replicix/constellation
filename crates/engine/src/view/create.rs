@@ -194,18 +194,7 @@ impl View {
         }
         // The current attributes, a pending write's size included (as a
         // lookup reports them).
-        let writes = self.writes.lock(ino);
-        let current = match self.meta.getattr(ino).map_err(|e| e.code())? {
-            Some(attr) => Some(attr),
-            None => self.meta.scratch_getattr(ino).map_err(|e| e.code())?,
-        };
-        let Some(mut attr) = current else {
-            return Ok(None);
-        };
-        if let Some(len) = self.writes.pending_len(&writes, ino) {
-            attr.size = len;
-        }
-        Ok(Some(attr))
+        self.current_attr(ino)
     }
 }
 

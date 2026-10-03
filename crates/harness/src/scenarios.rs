@@ -16,6 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The K5 lane's busy-writer loss: an `O_APPEND` writer whose file's
+/// attributes change under it.
+mod appendsize;
 /// A P2P cluster's nodes `kill -9`ed and restarted together.
 mod cluster_restart;
 /// Plan 31 §6.12: subtree confinement through the kernel.
@@ -1232,6 +1235,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::flock_cross_node,
+    },
+    Scenario {
+        name: "append-setattr-size",
+        desc: "the K5 kind lane's busy-writer loss: two nodes (a holds, b its backup, 1 MiB chunks); on b, then on a, one O_APPEND descriptor appends 64 KiB blocks while a second descriptor fsyncs every second and the file is chown'd, chmod'ed, touched and hard-linked every 100 ms (kubelet's fsGroup pass on every republish); every acknowledged block is in the file, in order, on both nodes and on a fresh third node (was: a setattr/link reply carried the committed size, the kernel appended there, the file came up short with every call and close() succeeding)",
+        requires: &[],
+        caps: &[],
+        run: appendsize::append_setattr_size,
     },
     Scenario {
         name: "concurrent-create-no-excl",

@@ -170,7 +170,13 @@ impl Vfs for View {
             .transpose();
         match scratch {
             Ok(Some(Some(attr))) => {
-                r.done(Ok(self.entry_out(&attr)));
+                // A scratch file being written has a session too.
+                // `None`: the inode vanished since the lookup; the looked-up
+                // row is the best there is.
+                match self.current_attr(attr.ino) {
+                    Ok(current) => r.done(Ok(self.entry_out(&current.unwrap_or(attr)))),
+                    Err(code) => r.done(err(code)),
+                }
                 return;
             }
             Ok(_) => {}
@@ -190,23 +196,17 @@ impl Vfs for View {
         );
         constellation_vfs::watch::stage("meta read");
         match self.meta.lookup(parent, &name) {
-            Ok(Some(mut attr)) => {
-                // Same overlay and the same ordering argument as
-                // `getattr`: a name looked up while its inode has pending
-                // writes must report the pending size, or the entry reply
-                // caches a stale one. The ino is only known after the
-                // lookup, so re-read the row under the shard lock.
-                let writes = self.writes.lock(attr.ino);
-                if !writes.contains_key(&attr.ino) {
-                    if let Ok(Some(fresh)) = self.meta.getattr(attr.ino) {
-                        attr = fresh;
-                    }
+            Ok(Some(attr)) => {
+                // A name looked up while its inode has pending writes
+                // must report the pending size, or the entry reply caches
+                // a stale one (`current_attr`). The ino is only known
+                // after the lookup, so the row is re-read under the shard.
+                // `None`: the inode vanished since the lookup; the looked-up
+                // row is the best there is.
+                match self.current_attr(attr.ino) {
+                    Ok(current) => r.done(Ok(self.entry_out(&current.unwrap_or(attr)))),
+                    Err(code) => r.done(err(code)),
                 }
-                if let Some(len) = self.writes.pending_len(&writes, attr.ino) {
-                    attr.size = len;
-                }
-                drop(writes);
-                r.done(Ok(self.entry_out(&attr)))
             }
             Ok(None) => r.done(err(self.beneath_non_dir(Code::NotFound, &[parent]))),
             Err(e) => r.done(err(e.code())),
@@ -227,36 +227,19 @@ impl Vfs for View {
             }
             return;
         }
-        // The write shard is taken *before* the committed row is read and
-        // held until the overlay below is applied. `flush_inode` commits
-        // the manifest and retires the write state under this same lock,
-        // so reading the row first and checking the shard afterwards
-        // could see the pre-flush size *and* no write state -- a reply
-        // the kernel then caches for TTL. With host-sized concurrent
-        // FUSE dispatch that interleaving is routine: the harness's
+        // Pending writes shadow the committed size (a session detached
+        // by an in-flight flush or read included), read under the write
+        // shard (`current_attr`): with host-sized concurrent FUSE
+        // dispatch, a row read before the shard check is routinely the
+        // pre-flush size with the session already retired — the harness's
         // single-client `baseline` read sizes of 0 back for just-closed
         // files about half the time.
         //
         // Plan 30 §M6: the session wait comes first — never block while
         // holding a write shard.
         self.session_wait(&[ReadKey::Ino(ino)]);
-        let writes = self.writes.lock(ino);
-        constellation_vfs::watch::stage("meta read");
-        let attr = self.meta.getattr(ino).and_then(|attr| {
-            if attr.is_some() {
-                Ok(attr)
-            } else {
-                self.meta.scratch_getattr(ino)
-            }
-        });
-        match attr {
-            Ok(Some(mut attr)) => {
-                // Pending writes shadow the committed size (a session
-                // detached by an in-flight flush or read included).
-                if let Some(len) = self.writes.pending_len(&writes, ino) {
-                    attr.size = len;
-                }
-                drop(writes);
+        match self.current_attr(ino) {
+            Ok(Some(attr)) => {
                 let attr = if requested_ino == constellation_fs_core::types::ROOT_INO {
                     self.visible_attr(attr)
                 } else {
@@ -265,7 +248,7 @@ impl Vfs for View {
                 r.done(Ok(self.attr_out(&attr)))
             }
             Ok(None) => r.done(err(Code::NotFound)),
-            Err(e) => r.done(err(e.code())),
+            Err(code) => r.done(err(code)),
         }
     }
 
@@ -357,10 +340,11 @@ impl Vfs for View {
                     attr
                 }),
             Err(error) => Err(error),
+            // A `chmod`/`chown`/`utimes` of a file still being written
+            // reports the session's size, not the committed row's
+            // (`current_attr`: the kernel takes this reply's size).
             Ok(()) => self
-                .meta
-                .getattr(ino)
-                .map_err(|error| error.code())
+                .current_attr(ino)
                 .and_then(|attr| attr.ok_or(Code::NotFound)),
         };
         match result {
@@ -568,10 +552,11 @@ impl Vfs for View {
             name: name.into_owned(),
         };
         match self.mutate_op(new_parent, op) {
-            Ok(()) => match self.meta.getattr(ino) {
+            // The linked inode may have a session open (`current_attr`).
+            Ok(()) => match self.current_attr(ino) {
                 Ok(Some(attr)) => r.done(Ok(self.entry_out(&attr))),
                 Ok(None) => r.done(err(Code::NotFound)),
-                Err(e) => r.done(err(e.code())),
+                Err(code) => r.done(err(code)),
             },
             Err(e) => r.done(err(e)),
         }

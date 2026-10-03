@@ -444,6 +444,116 @@ fn setattr_truncates_and_sets_times() {
     c.close(ino, o.fh).unwrap();
 }
 
+/// The kind lane's busy-writer loss: the kernel stores every attribute
+/// reply's size in `i_size` and positions an `O_APPEND` write there. A
+/// `chmod` (or a `link`) of a file whose write session holds more than
+/// its committed row answered the committed size, so the appender's next
+/// writes landed on bytes already acknowledged — every call, and the
+/// close, succeeding. Each reply about the inode reports the pending
+/// size; appending at it keeps every byte.
+#[test]
+fn setattr_and_link_report_the_pending_size_an_appender_continues_from() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "busy").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"aaaa").unwrap();
+    // A second descriptor's `fsync` publishes: the committed row says 4.
+    c.fsync(ino, o.fh).unwrap();
+    assert_eq!(c._meta.getattr(ino).unwrap().unwrap().size, 4);
+    // The long-lived descriptor appends on: a new session, pending 8.
+    c.write(ino, o.fh, 4, b"bbbb").unwrap();
+    assert_eq!(c._meta.getattr(ino).unwrap().unwrap().size, 4);
+    let chmod = Blocking::run(|r| {
+        c.view.setattr(
+            &c.cx(OpKind::Setattr),
+            ino,
+            None,
+            &SetAttr {
+                mode: Some(0o640),
+                ..SetAttr::default()
+            },
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(chmod.mode & 0o7777, 0o640);
+    assert_eq!(chmod.size, 8, "a chmod reports the session's size");
+    let touch = Blocking::run(|r| {
+        c.view.setattr(
+            &c.cx(OpKind::Setattr),
+            ino,
+            None,
+            &SetAttr {
+                mtime: Some(TimeSet::At(7_000_000_000)),
+                ..SetAttr::default()
+            },
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(touch.size, 8, "a utimes reports the session's size");
+    let linked = Blocking::run(|r| {
+        c.view.link(
+            &c.cx(OpKind::Link),
+            ino,
+            ROOT_INO,
+            Name::new("busy.link"),
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(linked.attr.size, 8, "a link's entry reports it too");
+    assert_eq!(c.lookup(ROOT_INO, "busy.link").unwrap().attr.size, 8);
+    // The kernel appends at the size the last reply gave it.
+    c.write(ino, o.fh, chmod.size, b"cccc").unwrap();
+    c.close(ino, o.fh).unwrap();
+    assert_eq!(c.getattr(ino).unwrap().size, 12);
+    let reopened = Blocking::run(|r| {
+        c.view.open(
+            &c.cx(OpKind::Open),
+            ino,
+            OpenFlags::READ,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(c.read(ino, reopened.fh, 0, 64).unwrap(), b"aaaabbbbcccc");
+}
+
+/// A scratch-directory file being appended to is looked up at its pending
+/// size (the lookup overlay is the scratch branch's own), and so is an
+/// `open(O_CREAT)` of a name that already exists (the create path's reply).
+#[test]
+fn lookup_and_create_of_an_existing_file_report_the_pending_size() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "busy").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"aaaa").unwrap();
+    c.fsync(ino, o.fh).unwrap();
+    c.write(ino, o.fh, 4, b"bbbb").unwrap();
+    assert_eq!(c._meta.getattr(ino).unwrap().unwrap().size, 4);
+    let (again, again_o) = c.create(ROOT_INO, "busy").unwrap();
+    assert_eq!(again.attr.ino, ino);
+    assert_eq!(again.attr.size, 8, "create of an existing name");
+    c.close(ino, again_o.fh).unwrap();
+    c.close(ino, o.fh).unwrap();
+
+    let scratch = c.mkdir(ROOT_INO, "tmp").unwrap().attr.ino;
+    c.setxattr(
+        scratch,
+        constellation_meta::SCRATCH_XATTR,
+        b"1",
+        SetXattrFlags::default(),
+    )
+    .unwrap();
+    let (e, o) = c.create(scratch, "f").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"abcdef").unwrap();
+    assert_eq!(c.lookup(scratch, "f").unwrap().attr.size, 6);
+    c.close(ino, o.fh).unwrap();
+}
+
 #[test]
 fn seek_fallocate_statfs_and_fsync() {
     let c = client();

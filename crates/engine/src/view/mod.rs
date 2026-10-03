@@ -751,6 +751,39 @@ impl View {
         attr
     }
 
+    /// `ino`'s attributes as every reply about an existing inode must
+    /// report them: the committed row (or the scratch one), its size
+    /// shadowed by a write session's pending size.
+    ///
+    /// The kernel stores whatever size an attribute reply carries — a
+    /// `setattr`'s, a `link`'s entry as much as a `getattr`'s — in the
+    /// inode's `i_size`, and positions every later `O_APPEND` write there.
+    /// A reply with the committed size of a file whose session holds
+    /// more makes the writer's next appends overwrite bytes `write(2)`
+    /// already acknowledged: a long-lived appender whose file another
+    /// process `chmod`s lost them, with every call and its `close()`
+    /// succeeding.
+    ///
+    /// The row is read under the write shard and the overlay applied
+    /// before it is released: `flush_inode` commits the manifest and
+    /// retires the session under the same lock, so reading the row first
+    /// and checking the shard afterwards could see the pre-flush size
+    /// *and* no session.
+    pub(super) fn current_attr(&self, ino: Ino) -> Result<Option<FileAttr>, Code> {
+        let writes = self.writes.lock(ino);
+        constellation_vfs::watch::stage("meta read");
+        let current = match self.meta.getattr(ino).map_err(|e| e.code())? {
+            Some(attr) => Some(attr),
+            None => self.meta.scratch_getattr(ino).map_err(|e| e.code())?,
+        };
+        Ok(current.map(|mut attr| {
+            if let Some(len) = self.writes.pending_len(&writes, ino) {
+                attr.size = len;
+            }
+            attr
+        }))
+    }
+
     /// The watchdog this view's ops register with.
     pub fn op_watch(&self) -> &OpWatch {
         &self.watch
