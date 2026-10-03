@@ -6243,6 +6243,68 @@ mod locks {
         assert_eq!(h.core.stats.lock_recalls_released, 1);
     }
 
+    /// The harness's `transport-lock-wait-budget` (a remount of a lone
+    /// node): the grants a holder made itself died with its process, so
+    /// they leave no restart quarantine — the restarted holder's first
+    /// non-blocking lock on a fresh file is granted, not `EAGAIN` for 20 s.
+    /// A grant a peer holds still quarantines the restart.
+    #[test]
+    fn a_holders_own_grants_do_not_quarantine_its_restart() {
+        let (mut h, ino) = holder_with_file();
+        let lock = |h: &mut Harness, op: u64, ino: Ino| {
+            let out = h.step(Event::Control {
+                op: OpId(op),
+                req: Control::Lock {
+                    ino,
+                    mode: X,
+                    blocking: false,
+                },
+            });
+            lock_answer(&out, op)
+        };
+        assert!(matches!(lock(&mut h, 5, ino), LockAnswer::Granted { .. }));
+        assert_eq!(h.meta.load_lock_quarantine(h.now.0), None);
+        let restart = |h: Harness| {
+            let mut core = Core::new(h.core.cfg.clone());
+            core.start(h.now, &h.meta, &mut Vec::new());
+            let mut h = Harness {
+                core,
+                meta: h.meta,
+                now: h.now.plus(10),
+            };
+            h.hold(2, None);
+            h
+        };
+        let mut h = restart(h);
+        let op = h.create("fresh");
+        let MutateOp::Create { ino: fresh, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        assert!(
+            matches!(lock(&mut h, 6, fresh), LockAnswer::Granted { .. }),
+            "a fresh file after the restart"
+        );
+        // A peer's grant may be honoured past the restart.
+        let op = h.create("peer");
+        let MutateOp::Create { ino: peer, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let out = request(&mut h, 2, 7, peer, X, false);
+        let [(2, OpId(7), LockOutcome::Granted { .. })] = lock_replies(&out).as_slice() else {
+            panic!("{out:?}")
+        };
+        let mut h = restart(h);
+        let op = h.create("later");
+        let MutateOp::Create { ino: later, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        assert!(matches!(lock(&mut h, 8, later), LockAnswer::WouldBlock));
+        assert_eq!(h.core.stats.lock_grace_refusals, 1);
+    }
+
     /// EC2 campaign 4 B-1: a lock orders *every* write of its previous
     /// holder before the next holder's reads, not only the locked file's.
     /// The release carries what its node was acknowledged (here: the

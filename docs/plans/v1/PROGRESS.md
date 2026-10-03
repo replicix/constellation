@@ -35915,3 +35915,84 @@ Before the fix it fails with "the roster was not re-read".
   (`usrquota`, 23–24 G used by all agents). The store was poisoned
   (`last_ship_error: fjall: FjallError: Poisoned`), so "a drains" never
   happened. This is environmental. No delegation existed in that run.
+
+  in `b458669` is the suspect. **Fixed** — see "Fix: a lone node's remount
+  refused every non-blocking lock for a lock TTL" below.
+
+## Fix: a lone node's remount refused every non-blocking lock for a lock TTL (`lock-wait-budget-regress`)
+
+`transport-lock-wait-budget` failed on main from `b458669`
+(`lock-fence-owner`) on, on every transport leg, unprivileged: in its
+`default-depth` round the holder's first `F_SETLK` on a fresh file got
+`EAGAIN`.
+
+### Mechanism
+
+- The scenario mounts one client (`c0`, a lone node with cluster locks),
+  runs the `explicit-depth` round, unmounts cleanly (the daemon exits and
+  releases its lease) and mounts again for `default-depth`.
+- Every grant the sequencer makes persists a restart horizon
+  (`grant until + 1 s`, `note_*_horizon`) before it is answered; a holder
+  that restarts grants no lock until the horizon has passed.
+  `b458669` split lock grants off onto their own horizon
+  (`lock_grant_horizon_ms`, loaded by `locks_start` →
+  `load_lock_quarantine` into `LockTables::set_quarantine`) and raised the
+  lock TTL from 5 s to 20 s.
+- Round 1's grants were all made by node 1 to node 1. The remounted daemon
+  logged `lock grants made before this restart may still be honoured; no
+  new lock grant until they have expired … wait_ms=19746` and acquired a
+  fresh lease (epoch 2, `takeover=false`). The holder's non-blocking
+  `F_SETLK` then hit `lock_serve` → `lock_grace_active` (the lock
+  quarantine) → `LockOutcome::WouldBlock` — node 1 answered itself `EAGAIN`.
+  No conflicting grant or lock was involved; it was the quarantine alone.
+- Before `b458669` lock grants wrote the *read-delegation* horizon, whose
+  restart quarantine holds the lease's gate (and with it every mutation),
+  so the same window delayed the holder instead of refusing it. Checked
+  on an export of `f86c044`: the remount logged `wait_ms=4740`, "takeover
+  gate waits out the read-delegation quarantine", and the scenario's
+  `create` of the round's file took 4.69 s; the lock was then granted
+  (PASSED). The separate lock quarantine deliberately does not close
+  the view, which turned the wait into an immediate `EAGAIN`, and the 20 s
+  TTL made it outlast any remount. Not bisected: only four commits lie
+  between the Z2c merge `f86c044` and `b458669`, and the log line naming
+  the quarantine is new in `b458669`.
+
+### Expectation
+
+The scenario is right. `cluster-locks.md` promises the restart quarantine
+for grants "that may still be honoured" elsewhere; a grant the holder
+made to itself cannot be: its held table and local locks live in the
+daemon's memory, the kernel's locks die with the FUSE connection, and a
+`--upgrade` handover is refused while any cluster lock is held. A lone
+node (or a holder whose grants were all its own) must grant a fresh file
+at once after a remount; SQLite or git on a single node would otherwise
+see `SQLITE_BUSY`/`EAGAIN` for up to 22 s after every restart.
+
+### Fix
+
+- **`crates/authority/src/core/locks.rs`, `Core::lock_try_grant`**: the
+  lock-grant horizon is noted only for a grant to another node
+  (`from != self.cfg.node_id`). Grants to peers, reclaims
+  (`on_lock_renew`'s grace path) and the takeover quarantine
+  (`backup.rs`) are unchanged. That is the only product change.
+- **Test** (`crates/authority/src/core/tests.rs`,
+  `locks::a_holders_own_grants_do_not_quarantine_its_restart`): a holder
+  grants itself, restarts (new `Core` over the same `Meta`) and its
+  non-blocking lock on a fresh file is granted; after a peer's grant the
+  next restart still answers `WouldBlock` and counts a grace refusal.
+  Failed before the fix (`load_lock_quarantine` returned the horizon).
+- **Docs**: `cluster-locks.md` "Restart inside the lease" says only grants
+  to other nodes extend the horizon.
+
+### Gates (this host, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` | clean, clean |
+| `cargo test -p constellation-authority --release` (sim included) | 279 passed, 0 failed, 11 ignored |
+| `cargo test -p constellation-meta` / `-p constellation-engine` | all passed / 530 passed, 0 failed |
+| `bash tests/smoke.sh` | PASSED |
+| `tests/transport-matrix.sh` (each leg in two scenario slices) | dev-fuse 19/19, auto 19/19, uring 19/19 (`transport-detach-refused` in each slice) |
+| `harness run transport-lock-wait-budget` ×5 (release, `--features io-uring` binaries) | 5/5 PASSED (failed 2/2 before the fix) |
+| `sqlite-two-nodes flock-cross-node sqlite-first-touch-latency lock-holder-partitioned lock-failover lock-holder-killed-contention lock-fence-at-close lock-latency lock-grant-dead-generation` | all PASSED |
+| `git-under-flock` ×2, `git-under-flock-rounds`, `git-under-flock-gc` | all PASSED |

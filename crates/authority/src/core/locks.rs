@@ -626,7 +626,14 @@ impl Core {
             }
         }
         let until = base.0.min(now.0) + ttl + self.lock_margin_ms();
-        if !replica.note_lock_grant_horizon(until) {
+        // The horizon is what this node's restart waits out, for grants
+        // honoured elsewhere. A grant to itself dies with the process (its
+        // held table and local locks are in memory, and a handover is
+        // refused under a cluster lock), so it must not keep the restarted
+        // node from granting: a lone node's remount answered every
+        // non-blocking lock `EAGAIN` for a lock TTL
+        // (`transport-lock-wait-budget`).
+        if from != self.cfg.node_id && !replica.note_lock_grant_horizon(until) {
             return Ok(LockOutcome::Busy);
         }
         // Every grant is a new id, an own grant re-asked for included:

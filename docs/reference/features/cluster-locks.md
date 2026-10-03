@@ -341,7 +341,11 @@ owner has replaced it.
 - **Restart inside the lease**: lock grants persist a horizon of their
   own (next to the read delegations' one). A holder that restarts grants
   no lock until that horizon has passed, and accepts reclaims meanwhile;
-  acknowledgements wait only for the read delegations' horizon.
+  acknowledgements wait only for the read delegations' horizon. Only
+  grants to other nodes extend the horizon: a grant the holder made to
+  itself died with its process (its local locks and held grants live in
+  memory, and a handover is refused while a cluster lock is held), so a
+  lone node that remounts grants at once.
 
 While any grant is live, the holder does not release the root lease
 when idle and declines a cooperative handoff. A cached grant (up to
