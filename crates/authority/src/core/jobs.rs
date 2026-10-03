@@ -15,7 +15,7 @@
 use super::lease::{PendingGate, Plan};
 use super::{Core, S3For};
 use crate::action::{Action, ControlOk, S3Op};
-use crate::event::{CasFailure, Control, PeerMsg, S3Result, UploadResult};
+use crate::event::{CasFailure, Control, PeerMsg, S3Failure, S3Result, UploadResult};
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
 use crate::segment;
@@ -192,6 +192,9 @@ enum Phase {
     /// Acquire: the CAS outstanding, and the object it writes (adopted
     /// exactly on success — see `Renew::sent`).
     Cas { plan: Plan, sent: Box<Lease> },
+    /// Acquire: `LeaseGet` after a CAS that failed without an answer (it
+    /// may have landed: `CasFailure::Failed`).
+    CasReread { plan: Plan, sent: Box<Lease> },
     /// Acquire: `LeaseRequest` sent to `holder`; waiting for its answer.
     /// `epoch_mode`: a continuation epoch's P2P-only handoff.
     LeaseRequest { req: OpId, epoch_mode: bool },
@@ -1350,6 +1353,7 @@ impl Core {
                     | Phase::Release
                     | Phase::ReleaseReread { .. }
                     | Phase::Cas { .. }
+                    | Phase::CasReread { .. }
             ),
         }
     }
@@ -2794,7 +2798,7 @@ impl Core {
         if prev.as_ref().is_some_and(|p| {
             takeover && p.released && !p.is_expired(now.0) && p.holder != self.cfg.node_id
         }) {
-            self.lock_on_released_takeover(now);
+            self.lock_on_released_takeover(now, replica);
         }
         let backup_tail_epoch = prev
             .as_ref()
@@ -3070,8 +3074,26 @@ impl Core {
                     self.finish_flush_job(now, false, replica, out);
                     return;
                 }
+                // The handoff was admitted with no lock grant out
+                // (`on_lease_request`), but grants go on being made while
+                // it uploads and ships: released now, they would be
+                // dropped under their holders' I/O (`locks-blips-tight`
+                // seed 2723). Declined like a live grant at admission.
+                if handoff && replica.locks().grants_len() > 0 {
+                    tracing::info!(
+                        node = self.cfg.node_id,
+                        grants = replica.locks().grants_len(),
+                        "handoff declined: lock grants were made while it flushed"
+                    );
+                    self.finish_flush_job(now, false, replica, out);
+                    return;
+                }
                 if self.lease.held.is_some() && !self.lease.lost {
                     self.begin_handoff_pause(now);
+                    // Closed from here, as an idle release is: no grant
+                    // (nor anything else) is admitted while the last atime
+                    // segment ships ahead of the release CAS.
+                    self.lease.releasing = true;
                     self.release_after_atime(now, replica, out);
                 } else {
                     self.finish_flush_job(now, true, replica, out);
@@ -3600,21 +3622,12 @@ impl Core {
                 self.finish_acquire(now, false, replica, out)
             }
             (Phase::Cas { plan, sent }, S3Result::LeasePut(Err(CasFailure::Failed(e)))) => {
-                tracing::warn!(node = self.cfg.node_id, error = %e, "lease CAS failed");
-                if let Plan::Claim { prev, .. } = &plan {
-                    self.epoch_tenure_cas_in_doubt(prev, &sent);
-                }
-                if let Plan::Claim {
-                    prev,
-                    takeover: true,
-                    ..
-                } = &plan
-                {
-                    if prev.holder != self.cfg.node_id {
-                        self.lease.ambiguous_claim = Some((sent.epoch, prev.clone()));
-                    }
-                }
-                self.finish_acquire(now, false, replica, out);
+                tracing::warn!(node = self.cfg.node_id, error = %e, "lease CAS failed; re-reading the lease");
+                let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
+                self.set_phase(Phase::CasReread { plan, sent }, Some(op));
+            }
+            (Phase::CasReread { plan, sent }, S3Result::LeaseGet(result)) => {
+                self.acquire_cas_reread(now, plan, *sent, result, replica, out)
             }
             (phase, result) => {
                 tracing::debug!(
@@ -3623,6 +3636,69 @@ impl Core {
                     ?result,
                     "unexpected S3 result for the job phase"
                 );
+            }
+        }
+    }
+
+    /// The re-read after an acquisition CAS that failed without an answer.
+    /// The object is the tenure the CAS wrote (same holder, epoch and
+    /// expiry, not released; a waiter's `wanted_by` edit since does not
+    /// matter): it landed (S3's "applied, then timed out"), and the lease
+    /// is this node's — won, as if the answer had come, adopting the
+    /// object read with its tag. Taken for lost, nothing made this node
+    /// adopt it until it expired: its peers read it as the holder and
+    /// asked it, and it answered every op and lock request
+    /// `NotHolder`/`NotOwner` (the lock waiters of `locks-blips-tight` with
+    /// in-doubt lease PUTs timed out after 60 s). Anything else: not
+    /// acquired, yet still in doubt — a PUT that timed out client-side can
+    /// apply after the re-read answered — so the in-doubt bookkeeping runs
+    /// whatever the re-read said (inert unless a later acquisition finds
+    /// exactly the object the CAS wrote).
+    fn acquire_cas_reread(
+        &mut self,
+        now: Ms,
+        plan: Plan,
+        sent: Lease,
+        result: Result<Option<(Lease, LeaseTag)>, S3Failure>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let tenure = |l: &Lease| (l.holder, l.epoch, l.expires_unix_ms, l.released);
+        match result {
+            Ok(Some((cur, tag))) if tenure(&cur) == tenure(&sent) => {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    epoch = sent.epoch,
+                    "the lease CAS in doubt landed"
+                );
+                self.stats.acquire_cas_in_doubt_landed += 1;
+                self.acquire_won(now, plan, cur, tag, replica, out);
+            }
+            result => {
+                if let Err(e) = result {
+                    tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed after a CAS in doubt");
+                }
+                self.note_acquire_cas_in_doubt(&plan, &sent);
+                self.finish_acquire(now, false, replica, out);
+            }
+        }
+    }
+
+    /// An acquisition CAS writing `sent` whose outcome is unknown: what a
+    /// later acquisition that finds `sent` must know about it (a kept
+    /// tenure's grants, a takeover's predecessor).
+    fn note_acquire_cas_in_doubt(&mut self, plan: &Plan, sent: &Lease) {
+        if let Plan::Claim { prev, .. } = plan {
+            self.epoch_tenure_cas_in_doubt(prev, sent);
+        }
+        if let Plan::Claim {
+            prev,
+            takeover: true,
+            ..
+        } = plan
+        {
+            if prev.holder != self.cfg.node_id {
+                self.lease.ambiguous_claim = Some((sent.epoch, prev.clone()));
             }
         }
     }

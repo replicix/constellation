@@ -169,6 +169,11 @@ pub enum SpecKind {
         epoch: u64,
         first: u64,
         last: u64,
+        /// The node whose stream carried it (the holder, or an epoch's
+        /// hold owner): the journal it stands for is that node's. A
+        /// stranded foreign row queues its replay under it
+        /// ([`StrandedOp::source`]).
+        source: u64,
         /// Plan 30 §M9: this node's own op. A requester subscribed to the
         /// holder's stream sees its op twice — on the stream and in its
         /// reply — and keeps *one* entry, this kind, whichever arrived
@@ -293,6 +298,9 @@ struct QueuedReplay {
     /// makes no conflict copy (the op's own requester replays it).
     #[serde(default)]
     foreign: bool,
+    /// A foreign entry's [`SpecKind::Streamed::source`]: the node whose
+    /// unshipped journal it came from. `None` for every other entry.
+    source: Option<u64>,
     /// Plan 30 §M11 phase 2b round 2: the delegation generation whose
     /// stream the op's reply named (a shadow accepted by a delegate);
     /// 0: the root's. Held from replay while that generation is live in
@@ -320,6 +328,8 @@ pub struct StrandedOp {
     pub refused: Option<Refusal>,
     /// Plan 30 §M9: see `QueuedReplay::foreign`.
     pub foreign: bool,
+    /// See `QueuedReplay::source`.
+    pub source: Option<u64>,
     /// Plan 30 §M11 phase 2b round 2: see `QueuedReplay::gen`.
     pub gen: u64,
 }
@@ -706,7 +716,7 @@ fn enqueue_replay_tx(
     op: MutateOp,
     before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, false, 0, before)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, None, 0, before)
 }
 
 /// [`enqueue_replay_tx`] for a shadow a delegate accepted under `gen`.
@@ -719,13 +729,14 @@ fn enqueue_replay_gen_tx(
     gen: u64,
     before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, false, gen, before)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, None, gen, before)
 }
 
 /// Queue `op` for replay by `rid` under `key`. `before` is the stranded
 /// row's before-images (empty when there are none): a truncate keeps the
 /// manifest it cut from them, and a manifest commit queued after one is
-/// rebased onto it ([`rebase_on_truncate`]).
+/// rebased onto it ([`rebase_on_truncate`]). `foreign`: the node whose
+/// stream carried another node's entry (see `QueuedReplay::source`).
 #[allow(clippy::too_many_arguments)]
 fn enqueue_replay_as_tx(
     tx: &mut SingleWriterWriteTx,
@@ -733,7 +744,7 @@ fn enqueue_replay_as_tx(
     key: u64,
     rid: Rid,
     mut op: MutateOp,
-    foreign: bool,
+    foreign: Option<u64>,
     gen: u64,
     before: &Before,
 ) -> Result<(), MetaError> {
@@ -743,7 +754,8 @@ fn enqueue_replay_as_tx(
         rid,
         op,
         refused: None,
-        foreign,
+        foreign: foreign.is_some(),
+        source: foreign,
         gen,
         truncate_base,
     };
@@ -1230,7 +1242,7 @@ fn redo_row_tx(
                 strand_local_tx(tx, meta, first, row.origin, &row.before)?;
                 out.locals += 1;
             }
-            SpecKind::Streamed { own, .. } => {
+            SpecKind::Streamed { own, source, .. } => {
                 // Plan 30 §M9: the tenure ended without shipping it; its
                 // successor re-ships what its backup held (or the op's
                 // requester replays it). Until then reads of its keys
@@ -1249,7 +1261,7 @@ fn redo_row_tx(
                         let op = MutateOp::Records {
                             records: row.records.clone(),
                         };
-                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, true, 0, &[])?;
+                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, Some(source), 0, &[])?;
                     }
                     out.hints += 1;
                 }
@@ -1332,6 +1344,7 @@ fn redo_row_tx(
 /// shadow it confirms (`spec_seq`, rid, op), if it is this node's own op.
 struct StreamedTx<'a> {
     epoch: u64,
+    source: u64,
     first: u64,
     last: u64,
     records: &'a [LogRecord],
@@ -1466,6 +1479,7 @@ fn insert_streamed_tx(
                 epoch: t.epoch,
                 first: t.first,
                 last: t.last,
+                source: t.source,
                 own: Some((rid, op)),
             };
             live.insert(
@@ -1504,6 +1518,7 @@ fn insert_streamed_tx(
                     epoch: t.epoch,
                     first: t.first,
                     last: t.last,
+                    source: t.source,
                     own: None,
                 },
                 applied,
@@ -2067,6 +2082,7 @@ pub(crate) fn refuse_queued_tx(
         op,
         refused: Some(refusal),
         foreign: false,
+        source: None,
         gen: 0,
         truncate_base: None,
     };
@@ -2130,6 +2146,7 @@ pub(crate) fn read_pending_replays(
             op: row.op,
             refused: row.refused,
             foreign: row.foreign,
+            source: row.source,
             gen: row.gen,
         });
     }
@@ -2370,12 +2387,14 @@ impl Meta {
     }
 
     /// Plan 30 §M9: install one of the holder's backup-acked journal
-    /// transactions (rows `first..=last` of its tenure at `epoch`) ahead
-    /// of the log, as a `Streamed` entry (see [`SpecKind::Streamed`]).
-    /// Installed already (see the first check): nothing happens.
+    /// transactions (rows `first..=last` of its tenure at `epoch`, streamed
+    /// by node `source`) ahead of the log, as a `Streamed` entry (see
+    /// [`SpecKind::Streamed`]). Installed already (see the first check):
+    /// nothing happens.
     pub fn install_streamed(
         &self,
         epoch: u64,
+        source: u64,
         first: u64,
         last: u64,
         records: &[LogRecord],
@@ -2452,6 +2471,7 @@ impl Meta {
                 cutoff,
                 StreamedTx {
                     epoch,
+                    source,
                     first,
                     last,
                     records,
@@ -2471,6 +2491,7 @@ impl Meta {
                     epoch,
                     first,
                     last,
+                    source,
                     own: Some((rid, op)),
                 };
                 put_row(&mut tx, &self.spec, seq, &row)?;
@@ -2489,6 +2510,7 @@ impl Meta {
                 epoch,
                 first,
                 last,
+                source,
                 own: None,
             },
             records,

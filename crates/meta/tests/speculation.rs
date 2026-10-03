@@ -337,9 +337,9 @@ fn a_hint_whose_refusal_was_streamed_first_is_not_installed() {
 
     let meta = Meta::open_in_memory().unwrap();
     apply(&meta, 1, 1, &seg1);
-    meta.install_streamed(1, 2, 2, std::slice::from_ref(&refused))
+    meta.install_streamed(1, HOLDER, 2, 2, std::slice::from_ref(&refused))
         .unwrap();
-    meta.install_streamed(1, 3, 4, &[rename, completed(other)])
+    meta.install_streamed(1, HOLDER, 3, 4, &[rename, completed(other)])
         .unwrap();
     let f3 = |m: &Meta| m.lookup(ROOT_INO, "f3").unwrap().map(|e| e.ino);
     assert_eq!(f3(&meta), Some(a));
@@ -1291,13 +1291,13 @@ fn a_streamed_transaction_goes_under_a_shadow_whose_reply_overtook_it() {
     apply(&meta, 1, 1, &seg1);
     assert!(meta.install_shadow(mine, 1, &op, &ours).unwrap());
     assert_eq!(mode(&meta), 0o640, "read-your-writes");
-    meta.install_streamed(1, 2, 3, &theirs).unwrap();
+    meta.install_streamed(1, HOLDER, 2, 3, &theirs).unwrap();
     assert_eq!(
         mode(&meta),
         0o640,
         "the streamed earlier write went over this node's later one"
     );
-    meta.install_streamed(1, 4, 5, &ours).unwrap();
+    meta.install_streamed(1, HOLDER, 4, 5, &ours).unwrap();
     assert_eq!(mode(&meta), 0o640, "the adopted shadow is not on top");
     meta.apply_segment_rows(2, 1, 5, &[2, 3, 4, 5], &[], &seg2, &TouchSet::default())
         .unwrap();
@@ -1509,8 +1509,9 @@ fn a_streamed_manifest_held_back_by_its_chunk_stays_speculation_until_it_ships()
         let meta = Meta::open_in_memory().unwrap();
         apply(&meta, 1, 1, &seg1);
         // The holder's epoch journal: jseq 2–3 the manifest, 4–5 the chmod.
-        meta.install_streamed(1, 2, 3, &manifest_tx).unwrap();
-        meta.install_streamed(1, 4, 5, &chmod_tx).unwrap();
+        meta.install_streamed(1, HOLDER, 2, 3, &manifest_tx)
+            .unwrap();
+        meta.install_streamed(1, HOLDER, 4, 5, &chmod_tx).unwrap();
         assert!(meta.has_outstanding_speculation());
         assert_eq!(basis(&meta), PublishBasis::Defer, "nothing published");
         // The holder ships the chmod ahead of the deferred manifest: its
@@ -1588,9 +1589,15 @@ fn a_streamed_transaction_the_tenure_ships_past_is_rolled_back() {
 
     let member = Meta::open_in_memory().unwrap();
     apply(&member, 1, 1, &seg1);
-    member.install_streamed(1, 2, 3, &manifest_tx).unwrap();
-    member.install_streamed(1, 4, 5, &chmod_f_tx).unwrap();
-    member.install_streamed(1, 6, 7, &chmod_g_tx).unwrap();
+    member
+        .install_streamed(1, HOLDER, 2, 3, &manifest_tx)
+        .unwrap();
+    member
+        .install_streamed(1, HOLDER, 4, 5, &chmod_f_tx)
+        .unwrap();
+    member
+        .install_streamed(1, HOLDER, 6, 7, &chmod_g_tx)
+        .unwrap();
     assert_eq!(member.speculation_counts().unwrap().outstanding, 3);
     assert!(member.manifest(f).unwrap().is_some());
 
@@ -1654,12 +1661,12 @@ fn a_streamed_transaction_installed_twice_is_installed_once() {
         completed(rid(1)),
     ];
     let recreate = [create("f2", f3, t0 + 2), completed(rid(2))];
-    meta.install_streamed(1, 2, 3, &rename).unwrap();
-    meta.install_streamed(1, 4, 5, &recreate).unwrap();
+    meta.install_streamed(1, HOLDER, 2, 3, &rename).unwrap();
+    meta.install_streamed(1, HOLDER, 4, 5, &recreate).unwrap();
     assert_eq!(meta.streamed_tip(1).unwrap(), Some(5));
     let before = raw_ns(&meta);
-    meta.install_streamed(1, 2, 3, &rename).unwrap();
-    meta.install_streamed(1, 4, 5, &recreate).unwrap();
+    meta.install_streamed(1, HOLDER, 2, 3, &rename).unwrap();
+    meta.install_streamed(1, HOLDER, 4, 5, &recreate).unwrap();
     assert_eq!(raw_ns(&meta), before, "installed twice");
     assert_eq!(meta.speculation_counts().unwrap().outstanding, 2);
     assert_eq!(

@@ -458,10 +458,11 @@ pub trait Replica {
         origin: (u64, u64),
     ) -> Result<(), MetaError>;
     /// Install a streamed transaction ahead of the log
-    /// (`SpecKind::Streamed`).
+    /// (`SpecKind::Streamed`), streamed by node `source`.
     fn install_streamed(
         &self,
         epoch: Epoch,
+        source: NodeId,
         first: u64,
         last: u64,
         records: &[LogRecord],
@@ -1202,11 +1203,12 @@ impl Replica for Meta {
     fn install_streamed(
         &self,
         epoch: Epoch,
+        source: NodeId,
         first: u64,
         last: u64,
         records: &[LogRecord],
     ) -> Result<(), MetaError> {
-        Meta::install_streamed(self, epoch, first, last, records)
+        Meta::install_streamed(self, epoch, source, first, last, records)
     }
 
     fn streamed_tip(&self, epoch: Epoch) -> Result<Option<u64>, MetaError> {

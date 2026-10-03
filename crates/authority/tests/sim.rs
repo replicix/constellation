@@ -335,6 +335,7 @@ fn replay_seed() {
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-blips") => locks_blips_config(),
         Ok("locks-blips-tight") => locks_blips_tight_config(),
+        Ok("locks-blips-tight-in-doubt") => locks_blips_tight_in_doubt_config(),
         Ok("locks-pause") => locks_pause_config(),
         Ok("locks-delegated") => locks_delegated_config(),
         Ok("locks-released-delegated") => locks_released_delegated_config(),
@@ -2612,6 +2613,7 @@ fn sweep_config() {
         "locks-faults" => locks_faults_config(),
         "locks-blips" => locks_blips_config(),
         "locks-blips-tight" => locks_blips_tight_config(),
+        "locks-blips-tight-in-doubt" => locks_blips_tight_in_doubt_config(),
         "locks-pause" => locks_pause_config(),
         "locks-delegated" => locks_delegated_config(),
         "locks-released-delegated" => locks_released_delegated_config(),
@@ -4042,6 +4044,23 @@ fn locks_blips_tight_config() -> SimConfig {
     c
 }
 
+/// `locks-blips-tight` with `locks-blips`' in-doubt lease PUTs back:
+/// back-to-back cuts with acquisition and release CASes that land but
+/// answer a timeout. On main before chunk lock-release-drop it failed
+/// seeds 403486, 405329, 412350, 413006 and 422266 of 403000..423000 (an
+/// acquisition in doubt that landed, adopted by nobody until it expired)
+/// and then 400925 (two non-holders naming each other the lock owner).
+fn locks_blips_tight_in_doubt_config() -> SimConfig {
+    let mut c = locks_blips_tight_config();
+    c.faults.extend(
+        locks_blips_config()
+            .faults
+            .into_iter()
+            .filter(|f| matches!(f.kind, FaultKind::S3Rule(_))),
+    );
+    c
+}
+
 /// The CI faults (two random ones per seed) under the lock workload.
 fn locks_faults_config() -> SimConfig {
     SimConfig {
@@ -4365,6 +4384,39 @@ fn locks_survive_s3_blips() {
         t.clients.unavailable, 0,
         "locks refused across blips: {t:?}"
     );
+}
+
+/// `locks-blips-tight` seed 2723: a lease request admitted with no lock
+/// grant out was served after two exclusive grants were made while the
+/// handoff flushed, and the release dropped them under their holders'
+/// I/O; the successor's grace went with its own epoch-flush release, and
+/// its re-claim of that lease granted over the live exclusive grant.
+#[test]
+fn locks_blips_tight_seed_2723_release_keeps_exclusion() {
+    let report = run_seed(2723, locks_blips_tight_config()).unwrap_or_else(|e| {
+        panic!("locks-blips-tight seed 2723: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight")
+    });
+    let mut t = M14Totals::default();
+    t.add(&report);
+    assert_eq!(t.lost, 0, "grants lost: {t:?}");
+    assert_eq!(t.clients.fenced_ios, 0, "I/O fenced: {t:?}");
+}
+
+/// `locks-blips-tight` with in-doubt lease PUTs: an acquisition CAS that
+/// landed but answered a timeout left the lease nobody's in practice
+/// (403486, 405329, 412350, 413006, 422266 on main: a lock waiter timed
+/// out after 60 s), and two non-holders that cached each other bounced
+/// every lock request between them (400925).
+#[test]
+fn locks_blips_tight_in_doubt_seeds_acquire() {
+    for seed in [400_925, 403_486, 405_329, 412_350, 413_006, 422_266] {
+        run_seed(seed, locks_blips_tight_in_doubt_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-blips-tight-in-doubt seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-blips-tight-in-doubt"
+            )
+        });
+    }
 }
 
 /// Plan 30 §M14: the CI's random faults under the lock workload.

@@ -625,6 +625,14 @@ Operational rules:
   single crashed holder then blocks TTL failover until it returns or is
   retired with `constellation leave --node-id`, which also fences its
   leases.
+- Retiring a node gives up its unshipped journal: writes it acknowledged
+  as holder or as an epoch's hold owner that never reached S3 (or the
+  successor's backup tail) are lost, as they would be if its disk were
+  gone. Other nodes drop what they had streamed of that journal
+  (`replays_of_retired_dropped`) instead of replaying it through the
+  successor, so no fragment of it surfaces. This covers ops the retired
+  node sequenced for others too; ops it forwarded to a live holder are
+  that holder's and are kept.
 - An epoch carries a lease only if the holder's claim was usable
   (outside the lease margin) when it acked. With the default half-TTL
   renewal, an outage that starts just before a renewal leaves the holder

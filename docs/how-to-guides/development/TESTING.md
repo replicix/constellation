@@ -2688,7 +2688,14 @@ fix the first seed already broke mutual exclusion: every close dropped
 the grant table). `locks-blips-tight` cuts in back-to-back pairs (300 to
 900 ms apart), so some cuts start between a close and the lease's
 re-claim, and requires the next epoch to carry the lease again
-(`epoch_closed_leases_reheld`). Replay one with
+(`epoch_closed_leases_reheld`); its seed 2723 is pinned
+(`locks_blips_tight_seed_2723_release_keeps_exclusion`: a handoff that
+dropped two live exclusive grants, and a successor whose release grace
+went with its own tenure). `locks-blips-tight-in-doubt` (sweep only, plus
+the pinned `locks_blips_tight_in_doubt_seeds_acquire`) adds `locks-blips`'
+in-doubt lease PUTs to that schedule: acquisition CASes that land but
+answer a timeout, and non-holders whose cached holders point at each
+other. Replay one with
 `AUTHORITY_SIM_SEED=<seed> AUTHORITY_SIM_CONFIG=<config> RUST_LOG=sim=debug,constellation_authority::core::locks=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
 
 Harness scenarios (the harness process is the application: it calls

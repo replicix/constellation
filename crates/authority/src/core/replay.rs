@@ -131,6 +131,9 @@ impl Core {
             return;
         }
         for head in &queued {
+            if self.drop_retired_origin(head, replica) {
+                continue;
+            }
             if folded_into_later_manifest(head, &queued) {
                 let _ = replica.forget_replay(head.queue_seq);
                 self.stats.stranded_replayed += 1;
@@ -233,6 +236,53 @@ impl Core {
             );
             return;
         }
+    }
+
+    /// A stranded foreign entry — a transaction this node held as streamed
+    /// speculation — whose *source* (the holder, or an epoch's hold owner,
+    /// whose stream carried it: `StrandedOp::source`) an admin retired
+    /// (`leave --node-id`, which fences its leases with its id in
+    /// `Lease::retired`): forgotten, not replayed. Streamed rows are the
+    /// source's unshipped journal, which died with it (an epoch's writes
+    /// are acknowledged on the hold owner's disk alone) and which the
+    /// operator gave up by retiring it; replayed, whatever part of it this
+    /// node happened to have streamed surfaced through the successor
+    /// (`epoch-holder-retired`, about one run in four: the hold owner's
+    /// write reached this member's stream before its `kill -9`). Keyed on
+    /// the source, not the requester (`rid.node`): an op a retired node
+    /// forwarded to a live holder is that holder's journal and replays,
+    /// and an op a live node forwarded to the retired holder went down
+    /// with the rest of its journal. The node's own ops are never foreign,
+    /// and a successor's backup tail (`Backup`-acknowledged rows) is not a
+    /// replay.
+    fn drop_retired_origin(&mut self, queued: &StrandedOp, replica: &dyn Replica) -> bool {
+        let Some(source) = queued.source.filter(|_| queued.foreign) else {
+            return false;
+        };
+        if source == self.cfg.node_id {
+            return false;
+        }
+        let retired = self
+            .lease
+            .held
+            .as_ref()
+            .map(|(l, _)| l)
+            .into_iter()
+            .chain(self.lease.last_seen.as_ref())
+            .any(|l| l.retired.contains(&source));
+        if !retired {
+            return false;
+        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            source,
+            rid = ?queued.rid,
+            "a retired node's stranded journal is not replayed"
+        );
+        self.note_unacked_refused(queued);
+        self.stats.replays_of_retired_dropped += 1;
+        let _ = replica.forget_replay(queued.queue_seq);
+        true
     }
 
     /// A refused replay: record the refusal and start its conflict copy.
@@ -485,7 +535,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
-        if queued.refused.is_some() {
+        if queued.refused.is_some() || self.drop_retired_origin(queued, replica) {
             return Ok(());
         }
         // Plan 30 §M11 phase 2b round 2: a delegate-accepted shadow stays

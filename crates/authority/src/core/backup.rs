@@ -2354,7 +2354,7 @@ impl Core {
                 });
                 continue;
             }
-            match replica.install_streamed(epoch, tx.first, tx.last, &tx.records) {
+            match replica.install_streamed(epoch, from, tx.first, tx.last, &tx.records) {
                 Ok(()) => {
                     replica.note_foreign_executed(&tx.records);
                     tracing::debug!(

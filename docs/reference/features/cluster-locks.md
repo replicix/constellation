@@ -381,7 +381,21 @@ owner has replaced it.
 While any grant is live, the holder does not release the root lease
 when idle and declines a cooperative handoff. A cached grant (up to
 `CONSTELLATION_LOCK_CACHE_IDLE_MS` after the last unlock) therefore
-keeps the lease where it is.
+keeps the lease where it is. The handoff is checked again when its
+flush ends: a grant made while it uploaded and shipped declines it
+too.
+
+A release that does drop live grants (a flush before `leave` or a
+suspension, a graceful shutdown with locks held) leaves them honoured
+by their holders until they lapse. Whoever holds the lease next makes
+no new grant until then and accepts reclaims meanwhile: a successor
+that takes over the released lease waits `ttl + margin` from its
+takeover, and the releasing node, should it claim its own released
+lease back (no takeover), waits until the last dropped grant would have
+expired. Both waits are kept on the node, not with the tenure, so they
+survive that tenure's own release: a successor whose next epoch flush
+released the lease a moment later, then claimed it back, granted over
+its predecessor's live exclusive grant (`locks-blips-tight` seed 2723).
 
 ### Delegations
 

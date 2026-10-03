@@ -490,14 +490,28 @@ impl Core {
     }
 
     /// Whether an earlier op of this node touching a common inode is
-    /// still in flight.
+    /// still in flight. A replay of a stranded op goes ahead of every other
+    /// op that has not left this node yet, whenever it was submitted: it
+    /// was acknowledged before anything in flight on its keys was
+    /// submitted (the gate kept them behind it then), and those may depend
+    /// on it. (An op already sent to the new holder is not held back: it
+    /// can still execute before the replay.) Ordered by submission,
+    /// a replay waited behind an op that waited for the log to carry its
+    /// acceptance by the dead holder — which never came: both waited for
+    /// the client deadline (40 s), and the op was answered in doubt
+    /// (`fuse-inval-storm` on uring: an unlink behind its own rename).
     fn gated(&self, rid: Rid) -> bool {
         let Some(me) = self.clients.get(&rid) else {
             return false;
         };
+        let replay = |c: &ClientOp| matches!(c.origin, Origin::Replay { .. });
         self.clients.iter().any(|(other, c)| {
             *other != rid
-                && c.order < me.order
+                && match (replay(c), replay(me)) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => c.order < me.order,
+                }
                 && !matches!(
                     c.phase,
                     Phase::InboxQueued { .. } | Phase::InboxWaiting { .. }
@@ -2329,6 +2343,73 @@ impl Core {
             );
             let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
             self.finish(now, rid, outcome, replica, out);
+        }
+    }
+
+    /// After every event, on a node that does not hold the lease: an op
+    /// accepted by an earlier holder on a base this replica had not
+    /// applied (`AwaitingLog`) whose epoch the log has since moved past
+    /// without its completion (`answer_awaiting_log` answers those that
+    /// came). The log is applied in order, so the dead holder's epoch is
+    /// all here and the acceptance never shipped — unless a sealed
+    /// backup's tail re-ships it under the new epoch, which the new
+    /// holder's gate applies before it answers. Either way it is the new
+    /// holder's to settle: the op goes there again by rid (in doubt:
+    /// answered from `completed`, or executed once). Before, it waited for
+    /// the client deadline (40 s) and its client heard in doubt (`EIO`);
+    /// only a node that took the lease itself resolved it
+    /// (`resolve_moot_waits`). Not before this node's own stranded ops
+    /// are replayed: those came first, and the op may depend on them.
+    pub(crate) fn reroute_ended_epoch_waits(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.clients.is_empty() || self.lease.held.is_some() || self.lease.epoch_held() {
+            return;
+        }
+        let max = self.ship.max_epoch;
+        let ended =
+            |c: &ClientOp| matches!(c.phase, Phase::AwaitingLog { epoch, .. } if epoch < max);
+        if !self.clients.values().any(ended) || self.own_replays_unsettled(replica) {
+            return;
+        }
+        let mut rids: Vec<(u64, Rid, Epoch)> = self
+            .clients
+            .iter()
+            .filter_map(|(rid, c)| match c.phase {
+                Phase::AwaitingLog { epoch, .. } if epoch < max => Some((c.order, *rid, epoch)),
+                _ => None,
+            })
+            .collect();
+        rids.sort_unstable();
+        for (_, rid, epoch) in rids {
+            if !self.clients.get(&rid).is_some_and(&ended) {
+                continue;
+            }
+            if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {
+                self.finish(now, rid, outcome, replica, out);
+                continue;
+            }
+            self.stats.awaiting_log_rerouted += 1;
+            tracing::debug!(
+                node = self.cfg.node_id,
+                ?rid,
+                epoch,
+                max,
+                "the log moved past the epoch that accepted an op without it: asking the new holder"
+            );
+            let c = self.clients.get_mut(&rid).expect("present");
+            c.phase = Phase::WaitingLease;
+            if let Some(t) = c.timer.take() {
+                self.cancel_timer(t, out);
+            }
+            if self.gated(rid) {
+                self.clients.get_mut(&rid).expect("present").phase = Phase::Gated;
+                continue;
+            }
+            self.route(now, rid, replica, out);
         }
     }
 

@@ -358,6 +358,28 @@ impl Core {
         self.lock_route_for(now, ino, replica, false)
     }
 
+    /// The route as answered to `from`'s request (`renewal`: see
+    /// `lock_route_for`). A non-owner never names the requester itself
+    /// as the owner: that is a cached holder at least as stale as the
+    /// requester's own (which named this node), and two non-holders that
+    /// each cached the other sent every request back and forth until a
+    /// lease expired (650acc8's review; `locks-blips-tight` with in-doubt
+    /// lease PUTs, seed 400925: 56 s after the last holder released).
+    /// `NotOwner { 0 }` sends it to the lease instead.
+    fn lock_route_answering(
+        &self,
+        now: Ms,
+        ino: Ino,
+        replica: &dyn Replica,
+        from: NodeId,
+        renewal: bool,
+    ) -> Route {
+        match self.lock_route_for(now, ino, replica, renewal) {
+            Route::Node(n) if n == from => Route::Unknown,
+            route => route,
+        }
+    }
+
     /// `renewal`: a held lease whose takeover gate is still pending (the
     /// view fenced for M9's floor) still serves renewals and reclaims —
     /// that is what the floor is for; only new grants wait (the
@@ -529,7 +551,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Served {
-        let (cap_ms, gen) = match self.lock_route(now, ino, replica) {
+        let (cap_ms, gen) = match self.lock_route_answering(now, ino, replica, from, false) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
             Route::Node(n) => return Served::Outcome(LockOutcome::NotOwner { owner: n }),
             Route::Unknown if self.lock_owner_resuming(now) => {
@@ -1243,7 +1265,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Option<LockOutcome> {
-        let (cap_ms, gen) = match self.lock_route(now, ino, replica) {
+        let (cap_ms, gen) = match self.lock_route_answering(now, ino, replica, from, false) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
             Route::Node(n) => return Some(LockOutcome::NotOwner { owner: n }),
             Route::Unknown => return Some(LockOutcome::NotOwner { owner: 0 }),
@@ -1466,7 +1488,7 @@ impl Core {
     ) -> LockRenewResult {
         // Renewed: the grant is in use (`LockState::served`).
         self.lk.served.remove(&(from, ino));
-        let (cap_ms, gen) = match self.lock_route_for(now, ino, replica, true) {
+        let (cap_ms, gen) = match self.lock_route_answering(now, ino, replica, from, true) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
             Route::Node(n) => return LockRenewResult::NotOwner { owner: n },
             Route::Unknown => return LockRenewResult::NotOwner { owner: 0 },
@@ -1543,7 +1565,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let outcome = match self.lock_route(now, ino, replica) {
+        let outcome = match self.lock_route_answering(now, ino, replica, from, false) {
             Route::Me { .. } => match replica.locks().first_conflicting(ino, from, mode, now.0) {
                 Some(g) => LockTestOutcome::Held {
                     node: g.node,
@@ -2196,7 +2218,13 @@ impl Core {
                     if !names_delegate {
                         self.lease.cached_holder = Some(owner);
                     }
-                } else if owner == 0 && from != self.cfg.node_id {
+                } else if from != self.cfg.node_id
+                    && (owner == 0 || self.lease.cached_holder == Some(from))
+                {
+                    // The node asked as the owner names no other one (or
+                    // names this node, or itself): what this node cached
+                    // is stale; the next attempt reads the lease rather
+                    // than ask it again.
                     self.lease.cached_holder = None;
                 }
                 self.lock_retry(now, op, out);
@@ -2284,6 +2312,7 @@ impl Core {
         if let Some(first) = replica.locks().next_renewal_ms(now.0) {
             at = at.min(Ms(first.max(now.0 + 1)));
         }
+        at = at.max(self.lock_relearn_floor(now));
         if let Some((t, armed)) = self.lk.renew_timer.zip(self.lk.renew_at) {
             if armed <= at {
                 return;
@@ -2427,6 +2456,22 @@ impl Core {
     /// "connected" until the transport notices, and a renewal that fails
     /// must not wait for that (the harness's lock-failover outwaited a
     /// live locker this way).
+    /// The earliest the renewal tick fires again while the lease read for
+    /// the owner (`lock_relearn_owner`) is in flight. The grants that
+    /// found no owner keep their renewal points (past), and the tick armed
+    /// from them fired every millisecond for as long as the read took — a
+    /// whole S3 cut long. Not later than the retry cadence of a lock
+    /// request: an owner learned meanwhile otherwise (a push, a hint, a
+    /// lock reply) is used at the next tick; the read's answer re-ticks at
+    /// once.
+    fn lock_relearn_floor(&self, now: Ms) -> Ms {
+        if self.lk.relearning {
+            now.plus(self.lock_resume_retry_ms())
+        } else {
+            now
+        }
+    }
+
     fn lock_relearn_owner(&mut self, out: &mut Vec<Action>) {
         if self.lk.relearning {
             return;
@@ -3055,13 +3100,42 @@ impl Core {
     /// A takeover of a lease its holder *released* (not expired): its
     /// grants were capped by a lease still live, so they may be honoured
     /// for up to `ttl` more — a grace on everything, reclaims admitted
-    /// (the sim found a successor granting at once).
-    pub(crate) fn lock_on_released_takeover(&mut self, now: Ms) {
-        let until = Ms(self.restamp(now));
-        self.lk
-            .grace
-            .push((constellation_fs_core::types::ROOT_INO, until));
+    /// (the sim found a successor granting at once). The whole-namespace
+    /// quarantine, not this tenure's `grace`: the grants are not this
+    /// tenure's, so they do not end with it. Kept per tenure, the grace
+    /// went with the successor's own release a moment later (an epoch's
+    /// flush), and its re-claim of the lease it had released — no
+    /// takeover — granted over the predecessor's live exclusive grant
+    /// (`locks-blips-tight` seed 2723).
+    pub(crate) fn lock_on_released_takeover(&mut self, now: Ms, replica: &dyn Replica) {
+        replica.locks().set_quarantine(self.restamp(now));
         self.stats.lock_grace_periods += 1;
+    }
+
+    /// The tenure ends and its grant table is dropped (`lock_on_lease_gone`
+    /// without a close that keeps it): grants still live there may be
+    /// honoured by their holders until they lapse, and so may grants a
+    /// grace protects (an outwaited delegate's). A successor that takes
+    /// the released lease over waits them out (`lock_on_released_takeover`);
+    /// this node re-claiming its own released lease is no takeover, so it
+    /// waits them out here: no new grant until the last one has lapsed.
+    /// Also on a deposal or an expiry, where no re-claim follows: harmless
+    /// there, and conservative — the quarantine is node-wide, so a
+    /// subtree's grace widens to the whole namespace until it lapses.
+    fn lock_quarantine_dropped_tenure(&mut self, now: Ms, replica: &dyn Replica) {
+        let grants = replica
+            .locks()
+            .grants_snapshot()
+            .into_iter()
+            .map(|g| g.until_ms)
+            .max()
+            .unwrap_or(0);
+        let grace = self.lk.grace.iter().map(|(_, u)| u.0).max().unwrap_or(0);
+        let until = grants.max(grace);
+        if until > now.0 {
+            replica.locks().set_quarantine(until);
+            self.stats.lock_grace_periods += 1;
+        }
     }
 
     pub(crate) fn locks_start(&mut self, now: Ms, replica: &dyn Replica) {
@@ -3104,6 +3178,7 @@ impl Core {
         // the tenure is over: nothing continues it any more.
         let kept = std::mem::take(&mut self.lk.keep_grants);
         if !kept {
+            self.lock_quarantine_dropped_tenure(now, replica);
             self.pr.closed_tenure.clear();
             self.pr.closed_lease = None;
             let n = replica.locks().clear_grants();

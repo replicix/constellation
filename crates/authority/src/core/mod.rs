@@ -549,6 +549,16 @@ pub struct Stats {
     /// A-1: forwards answered `Held` while this node re-adopts the live
     /// lease a previous incarnation of it left behind (a restart).
     pub readopt_for_forward: u64,
+    /// Acquisition CASes that failed without an answer and that the
+    /// re-read found landed (`jobs::acquire_cas_reread`).
+    pub acquire_cas_in_doubt_landed: u64,
+    /// `AwaitingLog` ops a non-holder sent to the new holder once the log
+    /// moved past the epoch that accepted them without them
+    /// (`client::reroute_ended_epoch_waits`).
+    pub awaiting_log_rerouted: u64,
+    /// Stranded foreign entries streamed by a node an admin retired,
+    /// forgotten instead of replayed (`replay::drop_retired_origin`).
+    pub replays_of_retired_dropped: u64,
     /// Accepted forwards not installed ahead of the log because the
     /// holder reported a stale base; answered once the log carried them.
     pub awaited_log: u64,
@@ -1546,6 +1556,7 @@ impl Core {
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
         self.resolve_moot_waits(now, replica, &mut out);
+        self.reroute_ended_epoch_waits(now, replica, &mut out);
         self.inbox_after_event(now, &mut out);
         self.stream_after_event(now, &mut out);
         self.backup_after_event(now, replica, &mut out);

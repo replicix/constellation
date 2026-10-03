@@ -39678,3 +39678,242 @@ listings. A failing loss check prints the missing names and B's/D's/log head
 seq. Assertions are otherwise unchanged; no product code touched. 10/10
 release-build runs passed (debug builds miss the 5 ms backup RTT budget, so
 A never lists B as a backup there; unrelated).
+
+
+## Fix: a lease release dropped live exclusive lock grants and another node granted over them (`lock-release-drop`)
+
+Sim `locks-blips-tight` seed 2723 broke mutual exclusion on main: node 1
+granted itself two exclusive locks (t=10937, 10961), released the lease at
+t=10972 with both grants live, and node 2 granted a shared lock on the
+first file at t=11361 while node 1's holder was still in I/O.
+
+### Root cause (two holes, both needed for the violation)
+
+1. **The handoff path.** `on_lease_request` admits a cooperative handoff
+   only with an empty grant table, then queues a `Handoff` job. While that
+   job uploads, ships and publishes, the lease is not `releasing` yet, so
+   the holder keeps granting; `flush_continue` then released the lease
+   without looking at the table again. That is the "release with no epoch
+   open, no idle release logged": it was a handoff (node 2's lease request
+   at about t=10916).
+2. **The successor's grace went with its own tenure.** Node 2 took the
+   released, unexpired lease over at t=11031, and `acquire_won` gave it the
+   released-takeover grace (`lock_on_released_takeover`) — in `lk.grace`,
+   which `lock_on_lease_gone` clears. Node 2's epoch flush released the
+   lease at t=11105 (no grants of its own), the grace went, and its
+   re-claim at t=11185 was its own lease (no takeover), so no new grace:
+   it granted over node 1's live exclusive grant.
+
+### Fix
+
+- `jobs::flush_continue`: a handoff whose flush ends with any grant in the
+  table is declined (`released: false`), like one at admission; from that
+  point the job is `releasing` (as an idle release is), so nothing is
+  granted while the last atime segment ships ahead of the CAS.
+- `locks::lock_on_released_takeover` sets the whole-namespace lock
+  quarantine (`LockTables::set_quarantine`, never lowered, kept on the
+  node) instead of a per-tenure `lk.grace` entry: the grants it protects
+  are not the tenure's, so they do not end with it.
+- New `locks::lock_quarantine_dropped_tenure`, called from
+  `lock_on_lease_gone` whenever the table is dropped (not kept at an
+  epoch's close): no new grant until the last dropped grant (and the last
+  active subtree grace) would have expired. That covers the releasing
+  node re-claiming its own released lease (no takeover, so no released-
+  takeover grace) — e.g. after a `Control::Flush` (`leave`, a suspension)
+  released with grants live. A successor on another node is covered by
+  the released-takeover quarantine. So no release drops a live grant
+  without someone waiting it out.
+
+### Queued follow-ups
+
+1. **Acquisition CAS in doubt that landed (fixed).** An acquisition CAS
+   answering `CasFailure::Failed` is now followed by a lease re-read
+   (`Phase::CasReread`, `jobs::acquire_cas_reread`): exactly the object it
+   wrote is the acquisition won (`acquire_won`, as if the answer had come;
+   `stats.acquire_cas_in_doubt_landed`); any other object is not; a failed
+   re-read keeps today's in-doubt bookkeeping (`ambiguous_claim`,
+   `epoch_tenure_cas_in_doubt`). Reproduced with the new sweep config
+   `locks-blips-tight-in-doubt` (`locks-blips-tight` plus `locks-blips`'
+   in-doubt lease PUTs): main fails seeds 403486, 405329, 412350, 413006,
+   422266 of 403000..423000, all "lock … not acquired within 60000 ms"
+   (seed 413006: node 1's "lock" acquisition landed at t=4453, peers saw
+   holder=1 epoch=2 and asked node 1, which answered `NotHolder`/`NotOwner`
+   until expiry). Seeds 403387 and 401007 named in the brief came from the
+   earlier chunk's variant of this config and do not map onto this one:
+   both pass on main and here.
+2. **`NotOwner` ping-pong (fixed).** With the in-doubt fix in, seed 400925
+   failed the same way: after the last holder released, node 1 cached node
+   3 and node 3 cached node 1, and each answered the other's lock requests
+   `NotOwner` naming the requester itself; the requester, told nothing
+   new, asked the same node again for 56 s. New `locks::lock_route_answering`
+   (used by `lock_serve`, `lock_serve_again`, `lock_renew_one`,
+   `on_lock_test`): a non-owner never names the requester as the owner
+   (`NotOwner { 0 }` sends it to the lease). And in `lock_op_outcome` a
+   `NotOwner` from the cached owner that names no other node clears the
+   cache, so the next attempt reads the lease.
+3. **Renewal re-tick every 1 ms (fixed).** A renewal that found no
+   reachable owner marked the grant failed (its renewal point in the past)
+   and issued the owner relearn read; the tick armed from that point fired
+   every millisecond until the read answered — a whole S3 cut. New
+   `locks::lock_relearn_floor`, applied in `lock_arm_renew_tick`: while the
+   relearn read is out, the tick fires no sooner than a lock request's
+   retry cadence (`lock_resume_retry_ms`, ≥ 10 ms). The read's answer still
+   re-ticks at once, and an owner learned some other way is used at the
+   next tick.
+4. **Directory history out of order (not reproduced).** Seeds 400903 and
+   401007 were the earlier chunk's config; `locks-blips-tight-in-doubt`
+   ran 400000..423000 on main (5 failures, all item 1) and here (0) with
+   no ordering failure. Nothing to fix from this config.
+5. **A replay gated behind an op waiting for a dead holder's log (fixed).**
+   The uring `fuse-inval-storm` evidence (`/var/tmp/fih/evidence`): node 1's
+   rename was acknowledged by the holder, its unlink of the new name
+   accepted on a base node 1 had not applied (`AwaitingLog`); the holder
+   died with both unshipped. After the takeover the rename was stranded and
+   its replay submitted at once, but `gated()` ordered it behind the unlink
+   (submitted earlier, same name), which waited for a log that never
+   carried it: both waited out the 40 s client deadline, the unlink was
+   answered in doubt (`EIO`), and the rename was replayed 7 ms later.
+   - `client::gated`: a replay (`Origin::Replay`) is earlier than every
+     other op on its keys, whenever it was submitted (it was acknowledged
+     before they were submitted: the gate kept them behind it then), and a
+     fresh op never holds a replay back.
+   - New `client::reroute_ended_epoch_waits`, run after every event next to
+     `resolve_moot_waits` (`Core::handle`): on a node that does not hold the
+     lease, an `AwaitingLog` op whose epoch the applied log has moved past
+     without its completion goes to the new holder again by rid (answered
+     from `completed` there, or executed once) — but only once this node's
+     own stranded ops are replayed (`own_replays_unsettled`), which came
+     first. `stats.awaiting_log_rerouted`.
+   - **Returning old root idling 60 s (`delegated-root-gone` seed 70044):
+     not reproduced on main.** The config needs `delegate-root-loss`'s
+     dead-root takeover; on main the dead root's lease is never taken over
+     in that schedule, and node 1 re-adopts epoch 1 at 41.9 s and works on.
+     With the same schedule on main, the 60 s waits that do show are the
+     delegates' `AwaitingLog` ops after the root's death (that branch's
+     finding 1). Hypothesis for 70044 (unverified): the returning root's
+     unshipped journal sends its ops down the lease path (`route`:
+     `journal_has_undelegated`), and they wait for an acquisition that
+     loses to the live successor until `acquire_deadline_ms` (60 s in that
+     config).
+6. **`epoch-holder-retired` (fixed).** B held the retired hold owner's
+   epoch write as streamed speculation, stranded it as a foreign entry,
+   and replayed it by rid through the successor: A's unflushed write
+   surfaced whenever A's stream reached B before the `kill -9`. New
+   `replay::drop_retired_origin`, called from `on_drain_tick` and
+   `replay_locally`: a stranded foreign entry whose node is in the lease's
+   `retired` list (held lease or the last object read; `leave --node-id`
+   fences every lease with it, and the carrier check notes that object
+   before the epoch closes) is forgotten, not replayed
+   (`stats.replays_of_retired_dropped`). An epoch's writes are acknowledged
+   on the hold owner's disk alone, and the operator gave that disk up. The
+   node's own ops are never foreign, and a successor's backup tail
+   (`Backup`-acknowledged rows) is not a replay. Kept logs: the drop fired
+   in seed 11 ("a retired node's stranded op is not replayed … rid=Rid {
+   node: 1, … }") and the run passed.
+
+### Functions touched (for the parallel `lock-fence-token`, `flex-crash-seeds`, `delegate-root-loss` work)
+
+- `core/locks.rs`: `lock_on_released_takeover` (signature: `+ replica`),
+  `lock_on_lease_gone` (one call added at the top of its `!kept` branch),
+  `lock_serve`, `lock_serve_again`, `lock_renew_one`, `on_lock_test` (each:
+  `lock_route`/`lock_route_for` → `lock_route_answering`, one line),
+  `lock_op_outcome` (the `NotOwner` arm's `else if`), `lock_arm_renew_tick`
+  (one line); new `lock_route_answering`, `lock_quarantine_dropped_tenure`,
+  `lock_relearn_floor`.
+- `core/jobs.rs`: `flush_continue`, `on_job_s3` (the acquisition CAS
+  `Failed` arm; new `CasReread` arm), `lease_cas_in_flight`, `acquire_won`
+  (the `lock_on_released_takeover` call); new `Phase::CasReread`,
+  `acquire_cas_reread`.
+- `core/client.rs`: `gated`; new `reroute_ended_epoch_waits`.
+- `core/replay.rs`: `on_drain_tick`, `replay_locally` (one check each); new
+  `drop_retired_origin`.
+- `core/mod.rs`: `Core::handle` (one call), `Stats` (three counters).
+- Not touched: `on_epoch_state`, `promise.rs`, the delegate paths.
+
+### Tests
+
+- Core (`core/tests.rs`): `a_handoff_is_declined_when_grants_were_made_while_it_flushed`,
+  `a_reclaim_of_an_own_released_lease_waits_out_the_dropped_grants`,
+  `a_released_takeovers_grace_outlives_the_successors_own_release`,
+  `an_acquisition_cas_in_doubt_is_reread_and_won_if_it_landed`,
+  `two_non_holders_caching_each_other_send_the_requester_to_the_lease`,
+  `a_renewal_with_no_reachable_owner_does_not_spin_while_it_relearns`,
+  `a_stranded_replay_is_not_gated_behind_an_op_awaiting_a_dead_epochs_log`,
+  `a_retired_nodes_stranded_op_is_not_replayed`. Each fails with its fix
+  reverted (checked). `a_sealed_backups_own_lease_at_the_next_epoch_reships_its_tail`
+  now answers the new re-read with a failure, so it still covers the
+  "still in doubt" path.
+- Sim (`tests/sim.rs`): `locks_blips_tight_seed_2723_release_keeps_exclusion`
+  (fails on main with the violation), `locks_blips_tight_in_doubt_seeds_acquire`
+  (400925, 403486, 405329, 412350, 413006, 422266); new sweep config
+  `locks-blips-tight-in-doubt`.
+
+### Gates (kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, sims with `TMPDIR=/dev/shm/lrd`, harness prefix `lrd` with `TMPDIR=/var/tmp/lrd/h`, load average 25–90)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | clean, clean |
+| `cargo test --workspace` in groups (`--no-fail-fast`, debug; authority and model in release) | 1027 + 1015 passed; authority 213 + 4 + 115 (11 ignored); model 75 + 56 + 7; 0 failed |
+| `sweep_config`, release, every lock config 0..5000: `locks`, `locks-partition`, `locks-skew`, `locks-failover`, `locks-failover-backup`, `locks-faults`, `locks-blips`, `locks-blips-tight`, `locks-pause`, `locks-delegated`, `locks-released-delegated`, `locks-writes`, `locks-delegated-writes`, `locks-released-writes`, `locks-failover-backup-writes`, `locks-blips-tight-in-doubt` | 0 failing in every sweep (final code) |
+| `locks-blips-tight-in-doubt` 400000..423000 | 0 failing (main: 5) |
+| `flex`, `flex-crash` 0..10000 | 0 failing, 0 failing |
+| 1,000 seeds each: `long-backup`, `delegated-holder-cut`, `long-delegated`, `long-acks3`, `long-sessions`, `long-strict`, `delegated-backup`, `long-delegated-backup`, `backup-hot`, `placement-hot`, `delegated-two-gens-root-crash`, `metered-shared`, `metered-shared-unbacked` | 0 failing (run before the retired-drop change, which only acts on retired nodes' foreign entries) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | ok |
+| `harness run` `lock-latency lock-fence-at-close lock-grant-dead-generation lock-holder-partitioned lock-failover lock-holder-killed-contention` | all PASSED |
+| `harness run` `git-under-flock git-under-flock-gc git-under-flock-b2b git-under-flock-rounds git-under-flock-causal git-under-flock-faults` (`GIT_FLOCK_ROUNDS=1`) | all PASSED (b2b re-run alone after its first slice hit my 480 s guard) |
+| `harness run` `epoch-holder-retired epoch-member-lost epoch-peer-reaching-s3-declines epoch-missing-node epoch-member-dies-with-chunk epoch-slack-zero-unchanged` | all PASSED |
+| `harness run epoch-holder-retired --seed N`, N = 1–8, 11–13 | 11/11 PASSED (main: 3/12 failed) |
+
+### Review round 1 (rebased onto main c612585)
+
+- **Should fix 1, `drop_retired_origin` keyed on the requester (fixed).**
+  The drop now keys on the node whose stream carried the entry, not on
+  `rid.node`. `SpecKind::Streamed` records `source` (the streaming node:
+  `Meta::install_streamed(epoch, source, …)`, `Replica::install_streamed`,
+  passed `from` by `backup::on_stream_ahead`), and a stranded foreign row
+  queues it as `QueuedReplay::source` / `StrandedOp::source` (`None` for
+  every other entry). So an op a retired node forwarded to a live holder
+  replays, and an op a live node forwarded to the retired holder is
+  dropped with the rest of that holder's journal. Test
+  `a_retired_nodes_stranded_journal_is_not_replayed` (replaces
+  `a_retired_nodes_stranded_op_is_not_replayed`) streams and strands real
+  entries for (requester, source) = (1, 1), (3, 1), (1, 3), plus a case
+  where nobody is retired. It fails with the old keying (checked). The
+  retirement rule is now in `durability-and-failover.md`, next to
+  `leave --node-id`.
+- **Should fix 2, in-doubt bookkeeping lost on a re-read finding another object (fixed).**
+  New `jobs::note_acquire_cas_in_doubt` (`epoch_tenure_cas_in_doubt` +
+  `ambiguous_claim`) runs whenever the re-read does not show the CAS
+  landed, whether the re-read failed or found another object. Test
+  `retention_gap::a_takeover_cas_in_doubt_keeps_its_predecessor_when_the_reread_finds_another`
+  fails with the call back in the `Err` arm only (checked).
+- **Nits:** the re-read compares the tenure (holder, epoch, expiry,
+  `released`) and adopts the object read with its tag, so a waiter's
+  `wanted_by` edit no longer hides a landed CAS. A case for this was
+  added to `an_acquisition_cas_in_doubt_is_reread_and_won_if_it_landed`.
+  Also: a comment on `lock_quarantine_dropped_tenure` (also runs on
+  deposal and expiry; node-wide); a softer `gated()` doc (an op already
+  sent to the new holder can still run first); the
+  `locks-blips-tight-in-doubt` doc now names the seeds it actually caught.
+- Functions touched this round: `jobs::acquire_cas_reread`, new
+  `jobs::note_acquire_cas_in_doubt`, `replay::drop_retired_origin`,
+  `backup::on_stream_ahead` (one argument), `Replica::install_streamed`,
+  `meta::spec` (`SpecKind::Streamed`, `QueuedReplay`, `StrandedOp`,
+  `StreamedTx`, `enqueue_replay_as_tx`, `redo_row_tx`'s strand arm,
+  `insert_streamed_tx`, `install_streamed`, `read_pending_replays`,
+  `refuse_queued_tx`); comments in `client::gated` and
+  `locks::lock_quarantine_dropped_tenure`.
+- Follow-up 5b: `delegated-root-gone` seed 70044 passes on this tree,
+  which now includes delegate-root-loss.
+- Gates: fmt, clippy `-D warnings` clean. `cargo test --release -p
+  constellation-authority`: 237 + 4 + 118 + 227 + … passed, 0 failed.
+  `cargo test -p constellation-meta`: 0 failed. Seed 2723 passes. Every
+  lock config 0..2000: 0 failing, except `locks-blips-tight` seed 200
+  ("two authorities at once (plan 30 §M10)": t=10762, an epoch hold on
+  node 1 while node 3 has a usable S3 lease). That seed fails identically
+  on plain main c612585 and on the round-0 tree rebased onto it, so it is
+  pre-existing and the same class as seed 8398. `flex`, `flex-crash`
+  0..2000: 0 failing. `harness run` on all six `lock-*` and six `epoch-*`
+  scenarios: all PASSED. `epoch-holder-retired` passed 4 more times
+  (5/5).
