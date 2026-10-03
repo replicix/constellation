@@ -586,8 +586,10 @@ enum SnapshotCommand {
     /// directory), `REFER` and `LSIZE` come from the node's accounting
     /// index — logical bytes, before compression, as of the commit the
     /// footer names; the first listing under CONSTELLATION_SNAPACCT=auto
-    /// builds it and shows `building (N%)` meanwhile. `EXPIRES` prints `-`
-    /// until expiry exists.
+    /// builds it and shows `building (N%)` meanwhile. `KEPT BY` names
+    /// what keeps an auto snapshot (`5m·1h·1d`, `last`, `grace`, `held…`)
+    /// and `EXPIRES` when its policy will delete it (`in 6d 23h`, `now`,
+    /// `never`; `-` when no policy decides: orphaned or paused).
     Ls {
         target: Option<String>,
         /// Columns, comma separated: name, created, origin, used, written,
@@ -777,11 +779,12 @@ enum SnapshotPolicyCommand {
         state_dir: Option<PathBuf>,
     },
     /// Remove a directory's policy (asks first). Its auto snapshots are
-    /// kept, orphaned, and never expired automatically.
+    /// kept, orphaned, and never expired automatically — unless
+    /// `--expire`.
     Rm {
         target: String,
-        /// Also delete the policy's non-held auto snapshots. Not
-        /// available until expiry ships (plan 32 M4).
+        /// Also delete the policy's non-held auto snapshots, after
+        /// confirming their count (held ones are kept).
         #[arg(long)]
         expire: bool,
         /// Do not ask.

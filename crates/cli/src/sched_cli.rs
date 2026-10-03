@@ -71,12 +71,14 @@ pub fn render_status(r: &api::SnapSchedReport) -> String {
     );
     out.push_str(&format!(
         "ticks {}  created {}  skipped-empty {}  create-failed {}  expired {}  \
-         refused-lag {}  refused-state {}\n",
+         skipped-reverify {}  skipped-grace {}  refused-lag {}  refused-state {}\n",
         s.ticks,
         s.created,
         s.skipped_empty,
         s.create_failed,
         s.expired,
+        s.skipped_reverify,
+        s.skipped_grace,
         s.refused_lag,
         s.refused_state,
     ));
@@ -126,8 +128,11 @@ pub fn render_status(r: &api::SnapSchedReport) -> String {
 }
 
 /// `snapshot sched run`'s report, and whether it counts as a failure
-/// (exit non-zero): refused, a whole-batch error, or a failed root. A dry
-/// run fails only when refused (it creates nothing to fail).
+/// (exit non-zero): refused, an error (a whole batch, or the expiry run),
+/// or a failed root. A row per root created (`created`, `skipped_empty`,
+/// …) and per snapshot the expiry run handled (`expired`,
+/// `skipped_reverify`; `would_expire` in a dry run). A dry run fails when
+/// refused, or when it cannot read the grace state.
 pub fn render_run(r: &api::SnapSchedRunResult) -> (String, bool) {
     let mut out = String::new();
     let mut failed = false;
@@ -141,9 +146,7 @@ pub fn render_run(r: &api::SnapSchedRunResult) -> (String, bool) {
         failed = true;
     }
     if let Some(e) = &r.error {
-        out.push_str(&format!(
-            "error: {e} (nothing created; the next tick retries)\n"
-        ));
+        out.push_str(&format!("error: {e} (the next tick retries)\n"));
         failed = true;
     }
     if r.roots.is_empty() {

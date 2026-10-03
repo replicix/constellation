@@ -343,11 +343,11 @@ define_methods! {
     SnapshotPolicySet { name: "snapshot.policy.set", role: Admin, mutating: true, stream: None,
         params: SnapPolicySetParams, result: SnapPolicyDelta }
     /// Unbind a directory's policy. Its auto snapshots become orphaned and
-    /// are never deleted automatically; `expire` is refused until expiry
-    /// ships (plan 32 M4), and `confirm_expiring` is accepted but ignored
-    /// until then.
+    /// are never deleted automatically — unless `expire`, which deletes
+    /// its unheld auto snapshots with it, confirmed by `confirm_expiring`
+    /// = the exact count (`dry_run` previews it).
     SnapshotPolicyRemove { name: "snapshot.policy.remove", role: Admin, mutating: true, stream: None,
-        params: SnapPolicyRemoveParams, result: SnapPolicyRoot }
+        params: SnapPolicyRemoveParams, result: SnapPolicyRemoved }
     /// Pause or resume a directory's policy: rewrite its canonical
     /// expression with or without `paused`. Never asks for confirmation —
     /// the retention rule itself does not change.

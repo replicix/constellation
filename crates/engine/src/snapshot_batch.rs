@@ -91,6 +91,18 @@ fn is_lease_lost(result: &ItemResult) -> bool {
     matches!(result, ItemResult::Refused { reason } if reason.starts_with(LEASE_LOST))
 }
 
+/// A batch's forward to the root-lease holder failed: the holder could
+/// not be reached (or did not answer in time) over the peer path. The
+/// context of [`SnapshotBatcher::run`]'s error in that case, so a caller
+/// tells it from other failures with `downcast_ref`: the snapshot
+/// scheduler resigns its lease after several ticks of it, so a node that
+/// can reach the holder takes over (plan 32 M4a).
+#[derive(Debug, thiserror::Error)]
+#[error("forwarding the snapshot operation to node {holder}, which holds the root write lease")]
+pub struct HolderUnreachable {
+    pub holder: u64,
+}
+
 /// How many batch results an executing node remembers by rid. A batch's
 /// retries come within seconds; this only has to outlast them.
 const RECENT_BATCHES: usize = 1024;
@@ -561,12 +573,7 @@ impl SnapshotBatcher {
                     .host
                     .forward(holder, rid, items)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "forwarding the snapshot operation to node {holder}, \
-                             which holds the root write lease"
-                        )
-                    })?;
+                    .with_context(|| HolderUnreachable { holder })?;
                 match outcome {
                     SnapshotBatchOutcome::Done(results) => {
                         self.host.catch_up().await;
@@ -927,7 +934,7 @@ impl SnapshotBatcher {
         // A held snapshot is never deleted out from under its owner
         // (plan 32 Step 5, plan 37's CSI driver).
         if row.held && !force {
-            return ItemResult::Refused {
+            return ItemResult::Held {
                 reason: snapshot::held_refusal(&row),
             };
         }
@@ -1791,7 +1798,7 @@ pub(crate) mod tests {
             other => panic!("{other:?}"),
         }
         assert!(
-            matches!(&results[1], ItemResult::Refused { reason } if reason.contains("is held by user:ops")),
+            matches!(&results[1], ItemResult::Held { reason } if reason.contains("is held by user:ops")),
             "{:?}",
             results[1]
         );

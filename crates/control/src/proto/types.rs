@@ -222,6 +222,18 @@ pub struct SnapshotStatus {
     /// With `size_state: building`: the share of snapshot rows applied.
     #[serde(default)]
     pub building_pct: Option<u8>,
+    /// Plan 32 Step 5's `KEPT BY`, for an unheld auto snapshot of an
+    /// *armed* policy root (parseable, not paused, directory present): the
+    /// tiers that keep it (`5m`, `1h`, …), then `last`; `["grace"]` while
+    /// only a grace window after a policy change keeps it; empty when the
+    /// next expiry run deletes it. `null` for every other snapshot (manual,
+    /// held — see `held`/`held_by` —, orphaned, paused). Always present.
+    pub kept_by: Option<Vec<String>>,
+    /// `EXPIRES`: when, if snapshots keep arriving on schedule, nothing
+    /// keeps it any more (Unix ms; a forecast for display, never an input
+    /// to expiry). `null` when `kept_by` is, when a `*` tier keeps it
+    /// forever, or when it is due now (`kept_by` empty). Always present.
+    pub expires_unix_ms: Option<i64>,
 }
 
 /// Whether a snapshot's sizes are available (plan 32 §6.3).
@@ -2576,18 +2588,51 @@ pub struct SnapPolicyDelta {
     pub written: bool,
 }
 
-/// `snapshot.policy.remove`: unbind the directory's policy. Its auto
-/// snapshots become orphaned and are kept. `expire` (delete them with the
-/// policy, confirmed by `confirm_expiring`) is refused until the
-/// scheduler's expiry step ships.
+/// `snapshot.policy.remove`: unbind the directory's policy. Without
+/// `expire` its auto snapshots become orphaned and are kept. With
+/// `expire`, its unheld auto snapshots are deleted together with the
+/// policy (plan 32 Step 4.2), and the call writes only when
+/// `confirm_expiring` is exactly the count it would delete (the same
+/// guard as `set`); `dry_run` previews that count and writes nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapPolicyRemoveParams {
     pub path: String,
     #[serde(default)]
     pub expire: bool,
-    /// Accepted and ignored until `expire` ships (plan 32 M4).
     #[serde(default)]
     pub confirm_expiring: Option<u32>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `snapshot.policy.remove`'s answer. `root` is the directory as it is
+/// now. `would_expire`/`would_expire_ids` are the root's unheld auto
+/// snapshots (what `expire` deletes; 0 without `expire`), oldest first.
+/// `expired` are the ones deleted; `skipped` the ones that changed under
+/// the call (held or gone meanwhile) and were kept; `error` is why the
+/// deletion stopped early, if it did (the policy is removed regardless).
+/// Also the `details` of the `conflict` refusal when `expire` was not
+/// confirmed with the right count.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicyRemoved {
+    pub root: SnapPolicyRoot,
+    pub would_expire: u32,
+    #[serde(default)]
+    pub would_expire_ids: Vec<String>,
+    #[serde(default)]
+    pub expired: Vec<String>,
+    #[serde(default)]
+    pub skipped: Vec<SnapPolicySkipped>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub written: bool,
+}
+
+/// A snapshot `snapshot.policy.remove {expire}` kept after all, and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapPolicySkipped {
+    pub id: String,
+    pub reason: String,
 }
 
 /// `snapshot.policy.pause`: set (`paused: true`) or clear the policy's
@@ -2652,9 +2697,10 @@ pub struct SnapSchedRootState {
 
 /// `snapshot.sched.run`: run one scheduler tick now, on this node.
 /// Without `dry_run` it takes the `_snapsched` lease if it is free (a
-/// tick on a node another one leads is refused, with the reason) and
-/// creates what is due; `dry_run` takes nothing and creates nothing, and
-/// reports what a tick would create from this node's replica.
+/// tick on a node another one leads is refused, with the reason), creates
+/// what is due and runs expiry for the roots due one (plan 32 Step 4);
+/// `dry_run` takes nothing, creates and deletes nothing, and reports what
+/// a tick would create and expire from this node's replica.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapSchedRunParams {
     #[serde(default)]
@@ -2662,9 +2708,11 @@ pub struct SnapSchedRunParams {
 }
 
 /// What one `snapshot.sched.run` tick did. `refused`: why it did nothing
-/// at all (a refusal gate, another leader, the scheduler disabled here).
-/// `error`: the batch failed as a whole (the holder unreachable, S3
-/// down); nothing was created and the next tick retries.
+/// (more) at all (a refusal gate, another leader, the scheduler disabled
+/// here, fenced mid-run). `error`: the creation batch failed as a whole
+/// (the holder unreachable, S3 down; nothing was created), or the expiry
+/// run stopped (the grace state unreadable or its CAS lost: nothing
+/// deleted; a delete batch failed); the next tick retries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapSchedRunResult {
     pub dry_run: bool,
@@ -2677,11 +2725,14 @@ pub struct SnapSchedRunResult {
     pub roots: Vec<SnapSchedRunRoot>,
 }
 
-/// One due root in a `snapshot.sched.run` result. `outcome` is
+/// One due root, or one snapshot the expiry run handled, in a
+/// `snapshot.sched.run` result. For a creation `outcome` is
 /// `would_create` (dry run), `created`, `skipped_empty` (nothing under
 /// the root changed since its newest snapshot), `already_exists` (the
 /// bucket's name was taken already — by an earlier leader, typically;
-/// success), or `failed` (with `error`).
+/// success), or `failed` (with `error`). For expiry (`name` and `id` the
+/// snapshot's) it is `would_expire` (dry run), `expired`, or
+/// `skipped_reverify` (with why in `error`: held or gone meanwhile).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapSchedRunRoot {
     pub ino: u64,

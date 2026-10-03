@@ -9,7 +9,10 @@
 //!
 //! This module holds [`SnapSchedStats`], the node's counters (Step 9), and
 //! [`Scheduler`], the task that **creates** the snapshots a policy
-//! describes (Steps 3.2–3.3). It never deletes one: expiry is M4.
+//! describes (Steps 3.2–3.3) and then **expires** the ones it no longer
+//! keeps (Step 4; the algorithm, its grace state and its never-delete
+//! rules are `crate::snapexpire`'s, the only code that deletes snapshots
+//! automatically).
 //!
 //! # The tick
 //!
@@ -58,11 +61,25 @@
 //!    the `snaps/` create-if-absent: no bucket ever gets two snapshots);
 //!    a refused item counts `create_failed`. A batch that fails as a whole
 //!    creates nothing and the next tick tries again.
-//! 6. **Audit**: one `snapsched/journal/` object per tick that created a
-//!    snapshot or failed one (`constellation_store_s3::snapsched`); a
+//! 6. **Expiry** (Step 4, `crate::snapexpire`), when the creation step
+//!    did not fail as a whole and this node still leads: for every armed
+//!    root (parseable, not paused, its directory present) whose last run
+//!    is at least `CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S` old, record the
+//!    grace state (`snapsched/state.json`, CAS), then delete what
+//!    retention and the grace windows expire — renewing the lease and
+//!    re-reading every victim before each delete batch.
+//! 7. **Audit**: one `snapsched/journal/` object per tick that created,
+//!    failed or deleted a snapshot (`constellation_store_s3::snapsched`); a
 //!    tick whose every answer was "unchanged" or "already exists" changed
 //!    nothing and writes none, so an idle skip-empty root costs no object
 //!    per bucket.
+//! 8. **An unreachable holder.** Snapshot batches have no S3 path (they
+//!    run at the root-lease holder, reached over P2P). A leader whose
+//!    batches cannot reach the holder for
+//!    `CONSTELLATION_SNAPSCHED_RESIGN_AFTER` ticks in a row resigns and
+//!    stays out for one lease TTL, so a node that can reach it — the
+//!    holder itself always can — leads instead ([`Scheduler`]'s
+//!    `track_holder`).
 //!
 //! A bucket this leader settled without a new row it can see is
 //! remembered (in memory, per root) so the next ticks of the same bucket
@@ -98,7 +115,8 @@
 //! (its snapshots are orphaned and kept, Step 4.4).
 
 use crate::singleton::{Fenced, HeldElsewhere, SingletonLease};
-use crate::snapshot_batch::{ItemResult, SnapshotBatcher, SnapshotItem};
+use crate::snapexpire;
+use crate::snapshot_batch::{HolderUnreachable, ItemResult, SnapshotBatcher, SnapshotItem};
 use constellation_control::proto::types::{
     SnapSchedReport, SnapSchedRootState, SnapSchedRunResult, SnapSchedRunRoot,
 };
@@ -106,7 +124,8 @@ use constellation_fs_core::Ino;
 use constellation_meta::snapsched::{retention, SnapFacts, SnapPolicy};
 use constellation_meta::{Meta, SnapshotRow};
 use constellation_store_s3::snapsched::{
-    SnapSchedJournalEntry, SnapSchedJournalRoot, SnapSchedJournalSkip, SnapSchedJournalSnap,
+    self as snapsched_store, SnapSchedJournalEntry, SnapSchedJournalRoot, SnapSchedJournalSkip,
+    SnapSchedJournalSnap, SnapSchedState,
 };
 use constellation_store_s3::{LeaseMode, StoreError};
 use object_store::ObjectStore;
@@ -245,6 +264,26 @@ pub struct SchedConfig {
     /// every lease (default 60 s), and never less than three ticks, so a
     /// leader renewing every tick cannot lapse between two of them.
     pub lease_ttl_ms: u64,
+    /// `CONSTELLATION_SNAPSCHED_GRACE_S` (default 86 400): after a root's
+    /// policy changes (or a root is first seen), expiry deletes only what
+    /// the old and the new policy both expire, for this long (Step 4.3).
+    pub grace: Duration,
+    /// `CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S` (default 60): the least
+    /// time between two expiry runs of one root.
+    pub expire_every: Duration,
+    /// `CONSTELLATION_SNAPSCHED_MAX_DELETES` (default 500): the most
+    /// snapshots one root's expiry run deletes; the rest wait for the
+    /// next run.
+    pub max_deletes: usize,
+    /// `CONSTELLATION_SNAPSCHED_EXPIRE_BATCH` (default 32, at most
+    /// `MAX_SNAPSHOT_DELETES_PER_BATCH`): victims per delete batch, each
+    /// batch renewed and re-read immediately before it is sent
+    /// (`crate::snapexpire`). `1` is plan §4.1's per-victim loop.
+    pub expire_batch: usize,
+    /// `CONSTELLATION_SNAPSCHED_RESIGN_AFTER` (default 3; 0 = never): a
+    /// leader whose batches cannot reach the root-lease holder for this
+    /// many ticks in a row resigns, so a node that can takes over.
+    pub resign_after: u32,
 }
 
 impl SchedConfig {
@@ -262,6 +301,15 @@ impl SchedConfig {
             max_per_root: env_u64("CONSTELLATION_SNAPSCHED_MAX_PER_ROOT", 5000) as usize,
             lease_ttl_ms: constellation_store_s3::lease::lease_ttl_ms()
                 .max(3 * tick.as_millis() as u64),
+            grace: Duration::from_secs(env_u64("CONSTELLATION_SNAPSCHED_GRACE_S", 86_400)),
+            expire_every: Duration::from_secs(env_u64(
+                "CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S",
+                60,
+            )),
+            max_deletes: env_u64("CONSTELLATION_SNAPSCHED_MAX_DELETES", 500) as usize,
+            expire_batch: (env_u64("CONSTELLATION_SNAPSCHED_EXPIRE_BATCH", 32) as usize)
+                .clamp(1, constellation_net::MAX_SNAPSHOT_DELETES_PER_BATCH),
+            resign_after: env_u64("CONSTELLATION_SNAPSCHED_RESIGN_AFTER", 3) as u32,
         }
     }
 }
@@ -427,6 +475,71 @@ struct SchedState {
     /// Per root, the bucket this leader already settled without a row it
     /// can see yet (see the module doc). Only roots of the last plan.
     settled: HashMap<Ino, Settled>,
+    /// Per root, when (scheduler clock) its last expiry run began.
+    last_expiry: HashMap<Ino, i64>,
+    /// Ticks in a row whose batch could not reach the root-lease holder.
+    unreachable_ticks: u32,
+    /// After resigning for that: no acquire before this instant.
+    backoff_until: Option<tokio::time::Instant>,
+}
+
+/// Whether a tick's batches reached the root-lease holder.
+#[derive(Debug, Default, Clone, Copy)]
+struct Reach {
+    reached: bool,
+    unreachable: bool,
+}
+
+/// How long a read grace state serves displays before it is read again.
+const GRACE_CACHE: Duration = Duration::from_secs(30);
+/// How long a display waits for that read when nothing was read yet (an
+/// old copy is served at once while a background read refreshes it).
+const GRACE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// An expiry run found no scheduler lease after `lead()` had taken it:
+/// unreachable, but the deletion path never stops without saying why.
+const NO_LEASE: &str = "internal: an expiry run without the scheduler lease; nothing expires";
+
+type GraceCache = Arc<Mutex<Option<(tokio::time::Instant, SnapSchedState)>>>;
+
+fn put_grace_cache(cache: &GraceCache, grace: &SnapSchedState) {
+    *cache.lock().unwrap() = Some((tokio::time::Instant::now(), grace.clone()));
+}
+
+/// A root an expiry run may delete from: its policy parses, it is not
+/// paused, and its directory is still there (a deleted root's snapshots
+/// are orphaned and kept, Step 4.4).
+fn expirable(p: &RootPlan) -> bool {
+    p.policy.is_some() && !p.paused && p.path.is_some()
+}
+
+/// The audit record of one root in this tick, before anything happened.
+fn journal_root(p: &RootPlan) -> SnapSchedJournalRoot {
+    SnapSchedJournalRoot {
+        root_ino: p.ino,
+        path: p.path.clone().unwrap_or_default(),
+        policy: p.policy.as_ref().map(|q| q.to_string()).unwrap_or_default(),
+        created: Vec::new(),
+        skipped: Vec::new(),
+        failed: Vec::new(),
+        deleted: Vec::new(),
+    }
+}
+
+/// A run result row for one snapshot an expiry run handled.
+fn expiry_root(
+    p: &RootPlan,
+    row: &SnapshotRow,
+    outcome: &str,
+    error: Option<String>,
+) -> SnapSchedRunRoot {
+    SnapSchedRunRoot {
+        ino: p.ino,
+        path: p.path.clone().unwrap_or_default(),
+        name: row.name.clone(),
+        outcome: outcome.to_string(),
+        id: Some(row.id.clone()),
+        error,
+    }
 }
 
 /// A bucket the leader need not ask about again.
@@ -465,6 +578,13 @@ pub struct Scheduler {
     state: tokio::sync::Mutex<SchedState>,
     /// The last creation failure per root, for `snapshot.sched.status`.
     errors: Mutex<BTreeMap<Ino, String>>,
+    /// The grace state as last read, and when (for displays).
+    grace_cache: GraceCache,
+    /// A background refresh of `grace_cache` is under way.
+    grace_refreshing: Arc<AtomicBool>,
+    /// Test seam: called before each delete batch.
+    #[cfg(test)]
+    before_delete: Mutex<Option<snapexpire::BeforeBatch>>,
 }
 
 impl Scheduler {
@@ -473,6 +593,10 @@ impl Scheduler {
             deps,
             state: tokio::sync::Mutex::new(SchedState::default()),
             errors: Mutex::new(BTreeMap::new()),
+            grace_cache: Arc::new(Mutex::new(None)),
+            grace_refreshing: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            before_delete: Mutex::new(None),
         })
     }
 
@@ -692,6 +816,9 @@ impl Scheduler {
         state
             .settled
             .retain(|ino, _| plans.iter().any(|p| p.ino == *ino));
+        state
+            .last_expiry
+            .retain(|ino, _| plans.iter().any(|p| p.ino == *ino));
         // 1. No policy anywhere: no S3 work at all.
         if plans.is_empty() {
             if let Some(lease) = state.lease.take() {
@@ -738,6 +865,55 @@ impl Scheduler {
                 .iter()
                 .map(|p| run_root(p, "would_create", None, None))
                 .collect();
+            // What an expiry run would delete now, by this replica and the
+            // grace state as last read, projected (`grace_view`).
+            match self.grace_view().await {
+                Some(grace) => {
+                    let grace_ms = self.grace_ms();
+                    for p in plans.iter().filter(|p| expirable(p)) {
+                        let policy = p.policy.as_ref().expect("an expirable root parses");
+                        let Ok(rows) = snapexpire::root_rows(&self.deps.meta, p.ino) else {
+                            continue;
+                        };
+                        let facts: Vec<SnapFacts> = rows.iter().map(SnapFacts::from_row).collect();
+                        let g = snapexpire::graced(
+                            policy,
+                            p.ino,
+                            &facts,
+                            grace.roots.get(&p.ino),
+                            now,
+                            grace_ms,
+                        );
+                        for (row, v) in rows.iter().zip(&g.verdicts) {
+                            if !v.keep {
+                                result.roots.push(expiry_root(p, row, "would_expire", None));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    result.error = Some(
+                        "the grace state (snapsched/state.json) could not be read: \
+                         what would expire is unknown"
+                            .into(),
+                    );
+                }
+            }
+            return result;
+        }
+        // A leader that resigned for an unreachable root-lease holder
+        // stays out for a lease TTL, so a node that can reach it takes
+        // over (see `track_holder`).
+        if state.lease.is_none()
+            && state
+                .backoff_until
+                .is_some_and(|until| tokio::time::Instant::now() < until)
+        {
+            result.refused = Some(
+                "this node resigned the snapshot scheduler: it could not reach the \
+                 root-lease holder; another node may lead meanwhile"
+                    .into(),
+            );
             return result;
         }
         // 3. Leadership, renewed at the start of the tick.
@@ -771,9 +947,46 @@ impl Scheduler {
                 self.note_error(Some(p.ino), format!("policy root {}: {error}", p.ino));
             }
         }
+        let mut audit = BTreeMap::new();
+        let mut reach = Reach::default();
+        // 4–5. Creation.
+        if self
+            .create(
+                &mut state,
+                &due,
+                position,
+                &mut result,
+                &mut audit,
+                &mut reach,
+            )
+            .await
+        {
+            // 6. Expiry, after creation, while still leading.
+            self.expire(&mut state, &plans, now, &mut result, &mut audit, &mut reach)
+                .await;
+        }
+        // 7. Audit, when this tick changed something or failed to.
+        self.write_audit(now, audit).await;
+        self.track_holder(&mut state, reach, &mut result).await;
+        result
+    }
+
+    /// Steps 4–5 of the tick: one batch creating every due root's
+    /// snapshot. `false` when the tick must stop here (fenced, or the
+    /// store or the batch failed as a whole).
+    async fn create(
+        &self,
+        state: &mut SchedState,
+        due: &[&RootPlan],
+        position: Option<(u64, u64)>,
+        result: &mut SnapSchedRunResult,
+        audit: &mut BTreeMap<Ino, SnapSchedJournalRoot>,
+        reach: &mut Reach,
+    ) -> bool {
+        let stats = &self.deps.stats;
         // 4. Nothing due: done.
         if due.is_empty() {
-            return result;
+            return true;
         }
         // 5. Renew immediately before the batch: a pause between the two
         // (a long plan, a stalled runtime) must not let two leaders
@@ -781,16 +994,12 @@ impl Scheduler {
         if let Some(lease) = state.lease.as_mut() {
             if let Err(error) = lease.renew().await {
                 if error.downcast_ref::<Fenced>().is_some() {
-                    state.lease = None;
-                    state.settled.clear();
-                    stats.leader.store(false, Ordering::Relaxed);
-                    result.leader = false;
-                    result.refused = Some("fenced: another node took the scheduler lease".into());
+                    self.fenced(state, result);
                 } else {
                     let error = format!("renewing the {LEASE_NAME} lease: {error:#}");
-                    self.fail_due(&due, error, &mut result);
+                    self.fail_due(due, error, result);
                 }
-                return result;
+                return false;
             }
         }
         let items: Vec<SnapshotItem> = due
@@ -808,26 +1017,21 @@ impl Scheduler {
             .collect();
         let batches = &self.deps.batches;
         let results = match batches.submit(batches.next_rid(), items).await {
-            Ok(results) => results,
+            Ok(results) => {
+                reach.reached = true;
+                results
+            }
             Err(error) => {
+                reach.unreachable |= error.downcast_ref::<HolderUnreachable>().is_some();
                 // Nothing was created; the next tick asks again (the
                 // names make a retry of a half-done batch harmless).
-                self.fail_due(&due, format!("snapshot batch: {error:#}"), &mut result);
-                return result;
+                self.fail_due(due, format!("snapshot batch: {error:#}"), result);
+                return false;
             }
         };
-        let mut audit = Vec::new();
         for (p, item) in due.iter().zip(results) {
             let name = p.name.clone().unwrap_or_default();
-            let mut journal = SnapSchedJournalRoot {
-                root_ino: p.ino,
-                path: p.path.clone().unwrap_or_default(),
-                policy: p.policy.as_ref().map(|q| q.to_string()).unwrap_or_default(),
-                created: Vec::new(),
-                skipped: Vec::new(),
-                failed: Vec::new(),
-                deleted: Vec::new(),
-            };
+            let journal = audit.entry(p.ino).or_insert_with(|| journal_root(p));
             let outcome = match item {
                 ItemResult::Created { id, row, .. } => {
                     inc(&stats.created, 1);
@@ -846,6 +1050,7 @@ impl Scheduler {
                         id: id.clone(),
                         name: name.clone(),
                         created_unix_ms: row.created_unix_ms,
+                        reason: None,
                     });
                     run_root(p, "created", Some(id), None)
                 }
@@ -898,26 +1103,396 @@ impl Scheduler {
                 }
             };
             result.roots.push(outcome);
-            audit.push(journal);
         }
-        // 6. Audit, when this tick changed something or failed to.
-        if !audit
+        true
+    }
+
+    /// The renewal was refused: another node took the lease. Leadership
+    /// ends here, before anything else is sent.
+    fn fenced(&self, state: &mut SchedState, result: &mut SnapSchedRunResult) {
+        tracing::info!("snapshot scheduler: fenced; another node leads now");
+        state.lease = None;
+        state.settled.clear();
+        self.deps.stats.leader.store(false, Ordering::Relaxed);
+        result.leader = false;
+        result.refused = Some("fenced: another node took the scheduler lease".into());
+    }
+
+    /// Step 6 of the tick: plan 32 Step 4's expiry run for every root due
+    /// one (`crate::snapexpire` has the algorithm and its reasons).
+    async fn expire(
+        &self,
+        state: &mut SchedState,
+        plans: &[RootPlan],
+        now: i64,
+        result: &mut SnapSchedRunResult,
+        audit: &mut BTreeMap<Ino, SnapSchedJournalRoot>,
+        reach: &mut Reach,
+    ) {
+        let config = &self.deps.config;
+        let stats = &self.deps.stats;
+        let every = config.expire_every.as_millis() as i64;
+        let runs: Vec<&RootPlan> = plans
             .iter()
-            .any(|r| !r.created.is_empty() || !r.failed.is_empty())
+            .filter(|p| expirable(p))
+            .filter(|p| {
+                state
+                    .last_expiry
+                    .get(&p.ino)
+                    .is_none_or(|last| now.saturating_sub(*last) >= every || now < *last)
+            })
+            .collect();
+        if runs.is_empty() {
+            return;
+        }
+        // 1. The grace state, recorded before anything is deleted.
+        let store = &self.deps.store;
+        let (mut grace, tag) = match snapsched_store::load_state(store).await {
+            Ok(read) => read,
+            Err(error) => {
+                let error = format!(
+                    "reading the grace state (snapsched/state.json): {error}; \
+                     nothing expires until it is readable"
+                );
+                self.note_error(None, error.clone());
+                result.error = Some(error);
+                return;
+            }
+        };
+        let grace_ms = self.grace_ms();
+        let seen: Vec<(Ino, String)> = plans
+            .iter()
+            .filter_map(|p| {
+                p.policy
+                    .as_ref()
+                    .map(|q| (p.ino, snapexpire::canonical_unpaused(q)))
+            })
+            .collect();
+        if snapexpire::observe(&mut grace, &seen, now, grace_ms) {
+            grace.updated_unix_ms = now;
+            grace.node = self.deps.node_id;
+            // Only the leader writes it: renew first.
+            let Some(lease) = state.lease.as_mut() else {
+                result.error = Some(NO_LEASE.into());
+                return;
+            };
+            if let Err(error) = lease.renew().await {
+                if error.downcast_ref::<Fenced>().is_some() {
+                    self.fenced(state, result);
+                } else {
+                    let error = format!("renewing the {LEASE_NAME} lease: {error:#}");
+                    self.note_error(None, error.clone());
+                    result.error = Some(error);
+                }
+                return;
+            }
+            let saved =
+                snapsched_store::save_state(store, self.deps.lease_mode, &grace, &tag).await;
+            if let Err(error) = saved {
+                let error = match error {
+                    StoreError::CasConflict => "recording the grace state: another writer \
+                         changed snapsched/state.json; nothing expires in this run (retried \
+                         next tick)"
+                        .to_string(),
+                    error => format!(
+                        "recording the grace state (snapsched/state.json): {error}; \
+                         nothing expires in this run"
+                    ),
+                };
+                self.note_error(None, error.clone());
+                result.error = Some(error);
+                return;
+            }
+        }
+        self.cache_grace(&grace);
+        // 2–4. Each root's run.
+        for p in runs {
+            state.last_expiry.insert(p.ino, now);
+            let policy = p.policy.as_ref().expect("an expirable root parses");
+            // The rows as they are now: after this tick's creation.
+            let rows = match snapexpire::root_rows(&self.deps.meta, p.ino) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    self.note_error(Some(p.ino), format!("reading the snapshot rows: {error:#}"));
+                    continue;
+                }
+            };
+            let facts: Vec<SnapFacts> = rows.iter().map(SnapFacts::from_row).collect();
+            let g = snapexpire::graced(
+                policy,
+                p.ino,
+                &facts,
+                grace.roots.get(&p.ino),
+                now,
+                grace_ms,
+            );
+            inc(&stats.skipped_grace, g.kept_by_grace() as u64);
+            let mut victims: Vec<SnapshotRow> = rows
+                .into_iter()
+                .zip(&g.verdicts)
+                .filter(|(_, v)| !v.keep)
+                .map(|(row, _)| row)
+                .collect();
+            victims.truncate(config.max_deletes);
+            if victims.is_empty() {
+                continue;
+            }
+            let Some(lease) = state.lease.as_mut() else {
+                result.error = Some(NO_LEASE.into());
+                return;
+            };
+            let run = snapexpire::delete_victims(
+                &self.deps.batches,
+                &self.deps.meta,
+                Some(lease),
+                p.ino,
+                &victims,
+                config.expire_batch,
+                self.before_delete(),
+            )
+            .await;
+            inc(&stats.expired, run.deleted.len() as u64);
+            inc(&stats.skipped_reverify, run.skipped.len() as u64);
+            reach.reached |= run.reached_holder;
+            reach.unreachable |= run.holder_unreachable;
+            if !run.deleted.is_empty() {
+                let journal = audit.entry(p.ino).or_insert_with(|| journal_root(p));
+                for row in &run.deleted {
+                    journal
+                        .deleted
+                        .push(snapexpire::journal_snap(row, snapexpire::REASON_NO_TIER));
+                    result.roots.push(expiry_root(p, row, "expired", None));
+                }
+            }
+            for (row, why) in &run.skipped {
+                result
+                    .roots
+                    .push(expiry_root(p, row, "skipped_reverify", Some(why.clone())));
+            }
+            if run.fenced {
+                self.fenced(state, result);
+                return;
+            }
+            if let Some(error) = run.error {
+                let error = format!("policy root {} expiry: {error}", p.ino);
+                self.note_error(Some(p.ino), error.clone());
+                result.error = Some(error);
+                return;
+            }
+        }
+    }
+
+    /// Write the tick's audit object when it created, failed or deleted
+    /// anything. A tick of only skips / already-exists writes none.
+    async fn write_audit(&self, now: i64, audit: BTreeMap<Ino, SnapSchedJournalRoot>) {
+        let roots: Vec<SnapSchedJournalRoot> = audit.into_values().collect();
+        if !roots
+            .iter()
+            .any(|r| !r.created.is_empty() || !r.failed.is_empty() || !r.deleted.is_empty())
         {
-            return result;
+            return;
         }
         let entry = SnapSchedJournalEntry {
             ts: now,
             node: self.deps.node_id,
-            roots: audit,
+            roots,
         };
-        if let Err(error) =
-            constellation_store_s3::snapsched::append_journal(&self.deps.store, &entry).await
-        {
+        if let Err(error) = snapsched_store::append_journal(&self.deps.store, &entry).await {
             tracing::warn!(error = %error, "snapshot scheduler: writing the audit object failed");
         }
-        result
+    }
+
+    /// The carried M3c gap (snapshot batches have no S3 path): a leader
+    /// whose batches cannot reach the root-lease holder for
+    /// `CONSTELLATION_SNAPSCHED_RESIGN_AFTER` ticks in a row gives the
+    /// `_snapsched` lease back and stays out for one lease TTL, so a node
+    /// that can reach the holder (the holder itself included) takes over.
+    /// A tick whose batch reached the holder resets the count; a tick
+    /// that sent nothing leaves it. If no node can reach the holder the
+    /// lease rotates through them, one TTL each — nothing is created or
+    /// deleted either way, so the rotation is harmless.
+    async fn track_holder(
+        &self,
+        state: &mut SchedState,
+        reach: Reach,
+        result: &mut SnapSchedRunResult,
+    ) {
+        if reach.reached && !reach.unreachable {
+            state.unreachable_ticks = 0;
+            return;
+        }
+        if !reach.unreachable {
+            return;
+        }
+        state.unreachable_ticks += 1;
+        let limit = self.deps.config.resign_after;
+        if limit == 0 || state.unreachable_ticks < limit {
+            return;
+        }
+        state.unreachable_ticks = 0;
+        if let Some(lease) = state.lease.take() {
+            let error = format!(
+                "resigned the snapshot scheduler: its batches could not reach the root-lease \
+                 holder for {limit} ticks in a row (CONSTELLATION_SNAPSCHED_RESIGN_AFTER); \
+                 another node may lead"
+            );
+            tracing::warn!("snapshot scheduler: {error}");
+            lease.release().await;
+            state.settled.clear();
+            state.backoff_until = Some(
+                tokio::time::Instant::now() + Duration::from_millis(self.deps.config.lease_ttl_ms),
+            );
+            self.deps.stats.leader.store(false, Ordering::Relaxed);
+            self.note_error(None, error);
+            result.leader = false;
+        }
+    }
+
+    fn grace_ms(&self) -> i64 {
+        i64::try_from(self.deps.config.grace.as_millis()).unwrap_or(i64::MAX)
+    }
+
+    fn cache_grace(&self, grace: &SnapSchedState) {
+        put_grace_cache(&self.grace_cache, grace);
+    }
+
+    /// The grace state for display (`snapshot.list`, `policy show`, the
+    /// `policy set` note, a dry run), *projected*: the bucket's copy with
+    /// what the next expiry run will record first ([`snapexpire::observe`]
+    /// of the policy roots this replica has now) applied, not written. So
+    /// a newly seen or just changed root shows the grace its run will
+    /// give it. The bucket's copy is the one the last expiry run read; when
+    /// that is older than [`GRACE_CACHE`] it is still served and a
+    /// background read refreshes it; only with no copy at all does the
+    /// call read (bounded by [`GRACE_READ_TIMEOUT`]). `None` when nothing
+    /// is known.
+    pub async fn grace_view(&self) -> Option<SnapSchedState> {
+        let cached = self.grace_cache.lock().unwrap().clone();
+        let mut state = match cached {
+            Some((at, state)) => {
+                if at.elapsed() >= GRACE_CACHE {
+                    self.refresh_grace_in_background();
+                }
+                state
+            }
+            None => match tokio::time::timeout(
+                GRACE_READ_TIMEOUT,
+                snapsched_store::load_state(&self.deps.store),
+            )
+            .await
+            {
+                Ok(Ok((state, _))) => {
+                    self.cache_grace(&state);
+                    state
+                }
+                _ => return None,
+            },
+        };
+        if let Ok(roots) = self.deps.meta.snapshot_policy_roots() {
+            let seen: Vec<(Ino, String)> = roots
+                .iter()
+                .filter_map(|(ino, expr)| {
+                    let policy = SnapPolicy::parse(expr).ok()?;
+                    Some((*ino, snapexpire::canonical_unpaused(&policy)))
+                })
+                .collect();
+            snapexpire::observe(&mut state, &seen, (self.deps.clock)(), self.grace_ms());
+        }
+        Some(state)
+    }
+
+    fn refresh_grace_in_background(&self) {
+        if self.grace_refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (store, cache) = (self.deps.store.clone(), self.grace_cache.clone());
+        let refreshing = self.grace_refreshing.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok((state, _))) =
+                tokio::time::timeout(GRACE_CACHE, snapsched_store::load_state(&store)).await
+            {
+                put_grace_cache(&cache, &state);
+            }
+            refreshing.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// The grace every display applies ([`Self::grace_view`] at this
+    /// node's clock and `GRACE_S`): `snapshot.list`, `policy show` and
+    /// the `policy set` note agree because they all use it.
+    pub async fn display_grace(&self) -> snapexpire::GraceView {
+        snapexpire::GraceView {
+            state: self.grace_view().await,
+            now: (self.deps.clock)(),
+            grace_ms: self.grace_ms(),
+        }
+    }
+
+    /// `KEPT BY` / `EXPIRES` for `snapshot.list` ([`snapexpire::listing`]).
+    pub async fn listing(&self) -> anyhow::Result<HashMap<String, snapexpire::Listed>> {
+        let grace = self.display_grace().await;
+        snapexpire::listing(&self.deps.meta, &grace)
+    }
+
+    /// `snapshot.policy.remove {expire}`: delete `victims` (the root's
+    /// unheld auto snapshots, oldest first) through the same re-read and
+    /// holder-side batch as an expiry run, after the policy is gone. No
+    /// scheduler lease: an operator's confirmed delete, like
+    /// `snapshot.delete`. Counts `expired` / `skipped_reverify` and writes
+    /// an audit object.
+    pub async fn expire_removed(
+        &self,
+        ino: Ino,
+        path: &str,
+        policy: &str,
+        victims: &[SnapshotRow],
+    ) -> snapexpire::DeleteRun {
+        let run = snapexpire::delete_victims(
+            &self.deps.batches,
+            &self.deps.meta,
+            None,
+            ino,
+            victims,
+            self.deps.config.expire_batch,
+            self.before_delete(),
+        )
+        .await;
+        let stats = &self.deps.stats;
+        inc(&stats.expired, run.deleted.len() as u64);
+        inc(&stats.skipped_reverify, run.skipped.len() as u64);
+        if !run.deleted.is_empty() {
+            let entry = SnapSchedJournalEntry {
+                ts: (self.deps.clock)(),
+                node: self.deps.node_id,
+                roots: vec![SnapSchedJournalRoot {
+                    root_ino: ino,
+                    path: path.to_string(),
+                    policy: policy.to_string(),
+                    created: Vec::new(),
+                    skipped: Vec::new(),
+                    failed: Vec::new(),
+                    deleted: run
+                        .deleted
+                        .iter()
+                        .map(|row| snapexpire::journal_snap(row, snapexpire::REASON_REMOVED))
+                        .collect(),
+                }],
+            };
+            if let Err(error) = snapsched_store::append_journal(&self.deps.store, &entry).await {
+                tracing::warn!(error = %error, "policy remove --expire: writing the audit object failed");
+            }
+        }
+        run
+    }
+
+    #[cfg(test)]
+    fn before_delete(&self) -> Option<snapexpire::BeforeBatch> {
+        self.before_delete.lock().unwrap().clone()
+    }
+
+    #[cfg(not(test))]
+    fn before_delete(&self) -> Option<snapexpire::BeforeBatch> {
+        None
     }
 
     /// `snapshot.sched.status`: the counters, the knobs, and every policy
@@ -1003,6 +1578,11 @@ mod tests {
             max_lag: Duration::from_secs(300),
             max_per_root: 5000,
             lease_ttl_ms: 1000,
+            grace: Duration::from_secs(86_400),
+            expire_every: Duration::from_secs(60),
+            max_deletes: 500,
+            expire_batch: 32,
+            resign_after: 3,
         }
     }
 
@@ -1969,5 +2549,861 @@ mod tests {
         assert_eq!(counting.requests.load(Ordering::SeqCst), 0);
         // The snapshot it took stays: removing a policy deletes nothing.
         assert_eq!(autos(&a).len(), 1);
+    }
+
+    // --- expiry (plan 32 Step 4, M4a) ----------------------------------
+
+    /// Expiry knobs for the tests: no grace window, a run every tick.
+    fn expiry_config() -> SchedConfig {
+        SchedConfig {
+            grace: Duration::ZERO,
+            expire_every: Duration::ZERO,
+            ..config()
+        }
+    }
+
+    /// The holder stamps `created_unix_ms` from the test clock, so the
+    /// stream spreads over the buckets the test clock walks.
+    fn stamp(n: &Node, now: &Arc<AtomicI64>) {
+        let now = now.clone();
+        *n.snapshots.created_clock.lock().unwrap() =
+            Some(Arc::new(move || now.load(Ordering::Relaxed)));
+    }
+
+    /// The ids `policy` keeps of `rows` (retention, the oracle).
+    fn kept_ids(policy: &str, ino: Ino, rows: &[SnapshotRow]) -> BTreeSet<String> {
+        let policy = SnapPolicy::parse(policy).unwrap();
+        let facts: Vec<SnapFacts> = rows.iter().map(SnapFacts::from_row).collect();
+        rows.iter()
+            .zip(retention::evaluate(&policy, ino, &facts))
+            .filter(|(_, v)| v.keep)
+            .map(|(r, _)| r.id.clone())
+            .collect()
+    }
+
+    /// Add the auto rows `n` lists now that `created` lacks.
+    fn record_new(created: &mut Vec<SnapshotRow>, n: &Node) {
+        for row in autos(n) {
+            if !created.iter().any(|c| c.id == row.id) {
+                created.push(row);
+            }
+        }
+    }
+
+    fn ids(rows: &[SnapshotRow]) -> BTreeSet<String> {
+        rows.iter().map(|r| r.id.clone()).collect()
+    }
+
+    async fn journal(store: &Arc<InMemory>) -> Vec<SnapSchedJournalEntry> {
+        let keys: Vec<ObjPath> = store
+            .list(Some(&snapsched_store::journal_prefix()))
+            .map_ok(|m| m.location)
+            .try_collect()
+            .await
+            .unwrap();
+        let mut entries = Vec::new();
+        for key in keys {
+            let body = store.get(&key).await.unwrap().bytes().await.unwrap();
+            entries.push(serde_json::from_slice::<SnapSchedJournalEntry>(&body).unwrap());
+        }
+        entries.sort_by_key(|e| e.ts);
+        entries
+    }
+
+    fn hold_item(id: &str, by: Option<&str>) -> SnapshotItem {
+        SnapshotItem::Hold {
+            id: id.to_string(),
+            held: true,
+            by: by.map(str::to_string),
+            force: false,
+        }
+    }
+
+    async fn hold(n: &Node, id: &str, by: Option<&str>) {
+        let results = n
+            .batcher
+            .submit(n.batcher.next_rid(), vec![hold_item(id, by)])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&results[0], ItemResult::HoldSet { row } if row.held),
+            "{results:?}"
+        );
+    }
+
+    /// `count` more snapshots of `/data`, one per 10 s bucket, taken by a
+    /// scheduler that records the grace state but deletes nothing
+    /// (`max_deletes: 0`); it resigns, so the test's own scheduler leads
+    /// next. Returns every auto row, oldest first.
+    /// The builder records the first sighting with `grace`, the window
+    /// the test's own scheduler is configured with: a recorded window
+    /// stays open for its recorded length whatever a later reader's
+    /// `grace` (Step 4.3).
+    async fn history(
+        a: &Node,
+        holder: &Node,
+        store: &Arc<InMemory>,
+        now: &Arc<AtomicI64>,
+        count: usize,
+        grace: Duration,
+    ) -> Vec<SnapshotRow> {
+        let builder = scheduler(
+            a,
+            store.clone(),
+            now,
+            SchedConfig {
+                max_deletes: 0,
+                grace,
+                ..expiry_config()
+            },
+        );
+        let before = autos(a).len();
+        for _ in 0..count {
+            assert_eq!(outcomes(&builder.tick(Run::Periodic).await), ["created"]);
+            advance(now, 10 * SEC);
+        }
+        builder.resign().await;
+        holder.sync().await;
+        if holder.id != a.id {
+            a.tail().await;
+        }
+        let rows = autos(a);
+        assert_eq!(rows.len(), before + count);
+        rows
+    }
+
+    /// Plan 32 Step 4 / Step 11: in steady state the surviving set is
+    /// `retention::evaluate` over **every** snapshot ever created — after
+    /// each tick, not just at the end. A manual snapshot of the same
+    /// directory survives throughout; every deletion is audited with its
+    /// reason, and `expired` counts exactly the deletions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn steady_state_survivors_are_evaluate_over_every_creation() {
+        const POLICY: &str = "10s:1m 1m:3m; last=2; skip-empty=no";
+        let (store, a, data) = solo(POLICY).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let manual = a
+            .batcher
+            .submit(
+                a.batcher.next_rid(),
+                vec![SnapshotItem::Create {
+                    path: "/data".into(),
+                    name: "by-hand".into(),
+                    origin: 0,
+                    policy_ino: 0,
+                    creator: 1,
+                    held: false,
+                    held_by: None,
+                    skip_if_unchanged_since: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(&manual[0], ItemResult::Created { .. }));
+        let sched = scheduler(&a, store.clone(), &now, expiry_config());
+        let mut created: Vec<SnapshotRow> = Vec::new();
+        for tick in 0..40 {
+            let report = sched.tick(Run::Periodic).await;
+            assert!(report.error.is_none(), "tick {tick}: {report:?}");
+            record_new(&mut created, &a);
+            let survivors = autos(&a);
+            assert_eq!(
+                ids(&survivors),
+                kept_ids(POLICY, data, &created),
+                "tick {tick}: the survivors are not evaluate(all creations)"
+            );
+            advance(&now, 10 * SEC);
+        }
+        assert_eq!(created.len(), 40);
+        let survivors = autos(&a);
+        let stats = sched.deps.stats.status();
+        assert_eq!(stats.expired as usize, created.len() - survivors.len());
+        assert!(stats.expired > 20, "{stats:?}");
+        assert_eq!(stats.skipped_reverify, 0);
+        assert!(
+            a.rows()
+                .iter()
+                .any(|r| r.name == "by-hand" && r.origin == 0),
+            "the manual snapshot survives"
+        );
+        let deleted: Vec<SnapSchedJournalSnap> = journal(&store)
+            .await
+            .into_iter()
+            .flat_map(|e| e.roots.into_iter().flat_map(|r| r.deleted))
+            .collect();
+        assert_eq!(deleted.len() as u64, stats.expired);
+        assert!(deleted
+            .iter()
+            .all(|d| d.reason.as_deref() == Some(snapexpire::REASON_NO_TIER)));
+        let gone: BTreeSet<String> = deleted.iter().map(|d| d.id.clone()).collect();
+        assert_eq!(gone, &ids(&created) - &ids(&survivors));
+        assert_eq!(snaps_objects(&store).await, survivors.len() + 1);
+    }
+
+    /// Step 4.1: a hold that lands between evaluation and the delete wins,
+    /// both ways it can land. Victim 0 is held at the holder B behind the
+    /// leader A's back (A's replica still has it unheld, so the re-read
+    /// passes and B's own check refuses it); victim 1 is held through A,
+    /// whose replica then sees it, so the re-read drops it. Both count
+    /// `skipped_reverify`, survive on both replicas, and the rest go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hold_between_evaluation_and_delete_wins() {
+        const POLICY: &str = "10s:1m; skip-empty=no";
+        let (store, a, b, data, _) = holder_b().await;
+        bind(&b, &[&a], data, POLICY).await;
+        let now = test_clock();
+        stamp(&b, &now);
+        let rows = history(&a, &b, &store, &now, 10, expiry_config().grace).await;
+        b.sync().await;
+        a.tail().await;
+        let sched = scheduler(
+            &a,
+            store.clone(),
+            &now,
+            SchedConfig {
+                expire_batch: 1,
+                ..expiry_config()
+            },
+        );
+        let (a_batcher, b_batcher) = (a.batcher.clone(), b.batcher.clone());
+        let (a_driver, b_driver, b_host) = (a.driver.clone(), b.driver.clone(), b.host.clone());
+        let hook: snapexpire::BeforeBatch = Arc::new(move |index, ids: Vec<String>| {
+            let (a_batcher, b_batcher) = (a_batcher.clone(), b_batcher.clone());
+            let (a_driver, b_driver, b_host) = (a_driver.clone(), b_driver.clone(), b_host.clone());
+            Box::pin(async move {
+                let via = match index {
+                    0 => (&b_batcher, "csi:content-uid"),
+                    1 => (&a_batcher, "user:ops"),
+                    _ => return,
+                };
+                let results = via
+                    .0
+                    .submit(via.0.next_rid(), vec![hold_item(&ids[0], Some(via.1))])
+                    .await
+                    .unwrap();
+                assert!(matches!(&results[0], ItemResult::HoldSet { .. }));
+                if index == 1 {
+                    // B ships it (the daemon's nudge) and A tails it.
+                    let mut driver = b_driver.lock().await;
+                    driver.sync().await.unwrap();
+                    driver.mirror(&b_host.view);
+                    drop(driver);
+                    a_driver.lock().await.tail_to_head().await.unwrap();
+                }
+            })
+        });
+        *sched.before_delete.lock().unwrap() = Some(hook);
+        let report = sched.tick(Run::Manual { dry_run: false }).await;
+        assert!(report.error.is_none(), "{report:?}");
+        let stats = sched.deps.stats.status();
+        // 10s:1m keeps 6 buckets, so the 4 oldest of 10 were victims.
+        assert_eq!(
+            (stats.skipped_reverify, stats.expired),
+            (2, 2),
+            "{report:?}"
+        );
+        let skipped: Vec<(&str, &str)> = report
+            .roots
+            .iter()
+            .filter(|r| r.outcome == "skipped_reverify")
+            .map(|r| (r.name.as_str(), r.error.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            skipped,
+            [
+                (rows[0].name.as_str(), "held at the holder"),
+                (rows[1].name.as_str(), "held")
+            ]
+        );
+        b.sync().await;
+        a.tail().await;
+        for n in [&a, &b] {
+            let left = autos(n);
+            // Victims 2 and 3 went; everything else (and the tick's own
+            // new snapshot) is there.
+            let gone = &ids(&rows) - &ids(&left);
+            assert_eq!(gone, ids(&rows[2..4]), "node {}", n.id);
+            assert_eq!(left.len(), rows.len() - 2 + 1, "node {}", n.id);
+            assert!(left[0].held && left[1].held);
+        }
+    }
+
+    /// Step 4.3: a root seen for the first time expires nothing for the
+    /// grace window (`skipped_grace` counts the survivors); a policy
+    /// shortened through the xattr deletes nothing the old policy keeps
+    /// inside the window, and after it exactly what the new one says.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grace_after_a_first_sighting_and_after_a_shortened_policy() {
+        const SHORT: &str = "10s:1m; skip-empty=no";
+        const LONG: &str = "10s:3m; skip-empty=no";
+        const WINDOW: i64 = 600 * SEC;
+        let (store, a, data) = solo(SHORT).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        // First sighting at t0 (the history's first tick records it); 20
+        // buckets of which SHORT keeps 6.
+        let t0 = now.load(Ordering::Relaxed);
+        let mut created = history(
+            &a,
+            &a,
+            &store,
+            &now,
+            20,
+            Duration::from_millis(WINDOW as u64),
+        )
+        .await;
+        let sched = scheduler(
+            &a,
+            store.clone(),
+            &now,
+            SchedConfig {
+                grace: Duration::from_millis(WINDOW as u64),
+                ..expiry_config()
+            },
+        );
+        for _ in 0..5 {
+            let report = sched.tick(Run::Periodic).await;
+            assert!(report.error.is_none(), "{report:?}");
+            advance(&now, 10 * SEC);
+        }
+        record_new(&mut created, &a);
+        let stats = sched.deps.stats.status();
+        assert_eq!(stats.expired, 0, "nothing inside the first-sighting window");
+        assert!(stats.skipped_grace >= 14, "{stats:?}");
+        assert_eq!(autos(&a).len(), 25);
+        // The window closes: exactly what SHORT says.
+        now.store(t0 + WINDOW, Ordering::Relaxed);
+        sched.tick(Run::Periodic).await;
+        record_new(&mut created, &a);
+        assert_eq!(ids(&autos(&a)), kept_ids(SHORT, data, &created));
+
+        // Lengthened to LONG: nothing more goes (LONG keeps a superset).
+        bind(&a, &[], data, LONG).await;
+        let mut created = autos(&a);
+        for _ in 0..24 {
+            advance(&now, 10 * SEC);
+            sched.tick(Run::Periodic).await;
+            record_new(&mut created, &a);
+            assert_eq!(ids(&autos(&a)), kept_ids(LONG, data, &created));
+        }
+        // Shortened to SHORT at T through the xattr: inside the window only
+        // what LONG also expires goes.
+        bind(&a, &[], data, SHORT).await;
+        let t = now.load(Ordering::Relaxed);
+        let grace_before = sched.deps.stats.status().skipped_grace;
+        for _ in 0..10 {
+            sched.tick(Run::Periodic).await;
+            record_new(&mut created, &a);
+            assert_eq!(
+                ids(&autos(&a)),
+                kept_ids(LONG, data, &created),
+                "inside the window only what both expire goes"
+            );
+            assert!(
+                autos(&a).len() > kept_ids(SHORT, data, &created).len(),
+                "the window held some back"
+            );
+            advance(&now, 10 * SEC);
+        }
+        assert!(sched.deps.stats.status().skipped_grace > grace_before);
+        // After it: exactly SHORT.
+        now.store(t + WINDOW, Ordering::Relaxed);
+        sched.tick(Run::Periodic).await;
+        record_new(&mut created, &a);
+        assert_eq!(ids(&autos(&a)), kept_ids(SHORT, data, &created));
+        // The grace record: SHORT since T, every window closed (a closed
+        // prior stays recorded a while; it decides nothing).
+        let (state, _) = snapsched_store::load_state(&(store.clone() as Arc<dyn ObjectStore>))
+            .await
+            .unwrap();
+        let entry = &state.roots[&data];
+        assert_eq!(
+            entry.canonical,
+            SnapPolicy::parse(SHORT).unwrap().to_string()
+        );
+        assert_eq!(entry.since_unix_ms, t);
+        let at = now.load(Ordering::Relaxed);
+        assert!(
+            entry.prior.iter().all(|p| p.until_unix_ms <= at),
+            "{entry:?}"
+        );
+    }
+
+    /// Step 4.3: a window's length is recorded with it. A first sighting
+    /// recorded under a day-long grace stays open for a leader configured
+    /// with ten minutes: it deletes nothing and keeps the prior in
+    /// `state.json`, so the window is still there for the next leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shorter_grace_leader_honours_a_longer_recorded_window() {
+        const POLICY: &str = "10s:1m; skip-empty=no";
+        let (store, a, _data) = solo(POLICY).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let day = Duration::from_secs(86_400);
+        let rows = history(&a, &a, &store, &now, 10, day).await;
+        let short = scheduler(
+            &a,
+            store.clone(),
+            &now,
+            SchedConfig {
+                grace: Duration::from_secs(600),
+                ..expiry_config()
+            },
+        );
+        advance(&now, 3600 * SEC);
+        let report = short.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        let stats = short.deps.stats.status();
+        assert_eq!(stats.expired, 0, "{report:?}");
+        assert!(stats.skipped_grace > 0, "{stats:?}");
+        let mut created = rows.clone();
+        record_new(&mut created, &a);
+        assert_eq!(autos(&a), created, "nothing deleted");
+        let (state, _) = snapsched_store::load_state(&(store.clone() as Arc<dyn ObjectStore>))
+            .await
+            .unwrap();
+        let prior = &state.roots.values().next().unwrap().prior;
+        assert!(
+            prior.iter().any(
+                |p| p.canonical.is_none() && p.until_unix_ms == p.replaced_unix_ms + 86_400_000
+            ),
+            "{prior:?}"
+        );
+    }
+
+    /// Step 4.2: a paused root deletes nothing, nor does a refused tick;
+    /// resuming is not a policy change, so expiry resumes at once although
+    /// a grace window is configured. Removing a policy orphans its
+    /// snapshots, and none is ever deleted afterwards, however long the
+    /// scheduler keeps ticking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn paused_refused_and_removed_roots_delete_nothing() {
+        const POLICY: &str = "10s:1m; skip-empty=no";
+        const PAUSED: &str = "10s:1m; skip-empty=no; paused";
+        let (store, a, data) = solo(POLICY).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        // The first sighting (and its window) is long past by the end.
+        let rows = history(&a, &a, &store, &now, 10, Duration::from_secs(30)).await;
+        let sched = scheduler(
+            &a,
+            store.clone(),
+            &now,
+            SchedConfig {
+                grace: Duration::from_secs(30),
+                ..expiry_config()
+            },
+        );
+        // Paused: nothing created, nothing deleted.
+        bind(&a, &[], data, PAUSED).await;
+        for _ in 0..3 {
+            let report = sched.tick(Run::Periodic).await;
+            assert!(report.roots.is_empty(), "paused: {report:?}");
+            advance(&now, 10 * SEC);
+        }
+        assert_eq!(autos(&a), rows);
+        // Refused (a departed node): nothing either.
+        bind(&a, &[], data, POLICY).await;
+        sched.deps.departed.store(true, Ordering::Relaxed);
+        assert!(sched.tick(Run::Periodic).await.refused.is_some());
+        assert_eq!(autos(&a), rows);
+        sched.deps.departed.store(false, Ordering::Relaxed);
+        // Resumed: not a change, no new window — the victims go now.
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        assert!(sched.deps.stats.status().expired > 0, "{report:?}");
+        let mut created = rows.clone();
+        record_new(&mut created, &a);
+        assert_eq!(ids(&autos(&a)), kept_ids(POLICY, data, &created));
+        assert_eq!(sched.deps.stats.status().skipped_grace, 0);
+        // Removed: its snapshots are orphaned and stay, tick after tick.
+        // (Another root keeps the scheduler busy: with no policy root at
+        // all a tick does nothing, not even count orphans.)
+        let other = a.meta.mkdir(1, "other", 0o755, 0, 0).unwrap().ino;
+        bind(&a, &[], other, "1h:1d; skip-empty=no").await;
+        let left = autos(&a);
+        a.meta.remove_xattr(data, SNAPSHOT_POLICY_XATTR).unwrap();
+        a.sync().await;
+        let expired = sched.deps.stats.status().expired;
+        for _ in 0..12 {
+            advance(&now, 10 * SEC);
+            sched.tick(Run::Periodic).await;
+        }
+        let left_now: Vec<SnapshotRow> = autos(&a)
+            .into_iter()
+            .filter(|r| r.policy_ino == data)
+            .collect();
+        assert_eq!(left_now, left);
+        let stats = sched.deps.stats.status();
+        assert_eq!(stats.expired, expired);
+        assert_eq!(stats.orphaned_snapshots, left.len() as u64);
+    }
+
+    /// Step 3.1 / 4.2: an unparseable policy written past the setxattr gate
+    /// (straight into the replica) is inert on both nodes: whichever leads
+    /// creates nothing and deletes nothing — though the last parseable
+    /// policy had victims — and the stream counts as orphaned everywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unparseable_policy_is_inert_on_both_nodes() {
+        let (store, a, b, data, _) = holder_b().await;
+        bind(&b, &[&a], data, "10s:1m; skip-empty=no").await;
+        let now = test_clock();
+        stamp(&b, &now);
+        let rows = history(&a, &b, &store, &now, 9, expiry_config().grace).await;
+        b.meta
+            .set_xattr(
+                data,
+                SNAPSHOT_POLICY_XATTR,
+                b"10s:1m; every now and then",
+                SetXattrMode::Set,
+            )
+            .unwrap();
+        b.sync().await;
+        a.tail().await;
+        let sa = scheduler(&a, store.clone(), &now, expiry_config());
+        let sb = scheduler(&b, store.clone(), &now, expiry_config());
+        for _ in 0..6 {
+            for s in [&sa, &sb] {
+                let report = s.tick(Run::Periodic).await;
+                assert!(report.roots.is_empty(), "{report:?}");
+            }
+            advance(&now, 10 * SEC);
+        }
+        b.sync().await;
+        a.tail().await;
+        for (n, s) in [(&a, &sa), (&b, &sb)] {
+            assert_eq!(ids(&autos(n)), ids(&rows), "node {}", n.id);
+            let stats = s.deps.stats.status();
+            assert_eq!(
+                (
+                    stats.unparseable_roots,
+                    stats.orphaned_snapshots,
+                    stats.expired
+                ),
+                (1, 9, 0)
+            );
+        }
+    }
+
+    /// A renewal refused mid-run (another node took `_snapsched` between two
+    /// delete batches) stops the deletions on the spot: the first batch's
+    /// victim is gone, nothing after it is sent, and the node no longer
+    /// leads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fenced_renewal_stops_the_deletions_at_once() {
+        let (store, a, _) = solo("10s:1m; skip-empty=no").await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = history(&a, &a, &store, &now, 9, expiry_config().grace).await;
+        let sched = scheduler(
+            &a,
+            store.clone(),
+            &now,
+            SchedConfig {
+                expire_batch: 1,
+                ..expiry_config()
+            },
+        );
+        let thief = store.clone() as Arc<dyn ObjectStore>;
+        let hook: snapexpire::BeforeBatch = Arc::new(move |index, _| {
+            let thief = thief.clone();
+            Box::pin(async move {
+                if index == 1 {
+                    let leases =
+                        constellation_store_s3::LeaseStore::new(thief, LEASE_NAME, LeaseMode::Cas);
+                    let (lease, tag) = leases.get().await.unwrap().unwrap();
+                    let other = constellation_store_s3::Lease::granted(
+                        LEASE_NAME,
+                        lease.holder ^ 1,
+                        lease.epoch + 1,
+                        60_000,
+                    );
+                    leases.try_swap(&other, &tag).await.unwrap();
+                }
+            })
+        });
+        *sched.before_delete.lock().unwrap() = Some(hook);
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.refused.unwrap().contains("fenced"));
+        assert!(!report.leader && !sched.deps.stats.leader.load(Ordering::Relaxed));
+        let stats = sched.deps.stats.status();
+        assert_eq!((stats.expired, stats.skipped_reverify), (1, 0));
+        let left = autos(&a);
+        // Ten rows (the tick created one) less the one deleted.
+        assert_eq!(left.len(), rows.len());
+        assert!(!ids(&left).contains(&rows[0].id), "victim 0 went");
+        assert!(ids(&left).contains(&rows[1].id), "victim 1 was never sent");
+        // Not the leader any more: the next tick takes nothing.
+        let next = sched.tick(Run::Periodic).await;
+        assert!(next.refused.is_some() && next.roots.is_empty(), "{next:?}");
+        assert_eq!(autos(&a).len(), rows.len());
+    }
+
+    /// A store where another writer replaces `snapsched/state.json` right
+    /// before each of this node's writes while `steal` is set: the CAS on
+    /// the ETag this node read is lost.
+    #[derive(Debug)]
+    struct StateThief {
+        inner: Arc<InMemory>,
+        steal: AtomicBool,
+    }
+
+    impl std::fmt::Display for StateThief {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "StateThief({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StateThief {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if *location == snapsched_store::state_key() && self.steal.load(Ordering::SeqCst) {
+                let theirs = SnapSchedState {
+                    node: 99,
+                    ..Default::default()
+                };
+                self.inner
+                    .put(location, serde_json::to_vec(&theirs).unwrap().into())
+                    .await?;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Step 4.3: a lost CAS on `snapsched/state.json` aborts the run's
+    /// deletions — the change it had to record (here a new policy) is not
+    /// in the bucket, so nothing is deleted on it — and the next tick
+    /// retries and deletes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_state_cas_aborts_the_deletions() {
+        let (store, a, data) = solo("10s:3m; skip-empty=no").await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = history(&a, &a, &store, &now, 9, expiry_config().grace).await;
+        bind(&a, &[], data, "10s:1m; skip-empty=no").await;
+        let thief = Arc::new(StateThief {
+            inner: store.clone(),
+            steal: AtomicBool::new(true),
+        });
+        let sched = scheduler(&a, thief.clone(), &now, expiry_config());
+        let report = sched.tick(Run::Manual { dry_run: false }).await;
+        assert!(
+            report
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("another writer"),
+            "{report:?}"
+        );
+        assert_eq!(sched.deps.stats.status().expired, 0);
+        assert_eq!(autos(&a).len(), rows.len() + 1, "nothing deleted");
+        // The other writer is done: the retry records and deletes.
+        thief.steal.store(false, Ordering::SeqCst);
+        let report = sched.tick(Run::Manual { dry_run: false }).await;
+        assert!(report.error.is_none(), "{report:?}");
+        assert_eq!(sched.deps.stats.status().expired, 4);
+        assert_eq!(autos(&a).len(), 6);
+    }
+
+    /// Plan 32 / plan 37: held snapshots — `csi:`, `user:` and plain alike
+    /// — are never expired, even as the oldest snapshots, the ones the
+    /// policy would expire first, and they do not count against the
+    /// candidates: what goes is exactly what `evaluate` over the unheld
+    /// ones expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn held_snapshots_of_every_owner_are_never_expired() {
+        const POLICY: &str = "10s:1m; skip-empty=no";
+        let (store, a, data) = solo(POLICY).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = history(&a, &a, &store, &now, 10, expiry_config().grace).await;
+        hold(&a, &rows[0].id, Some("csi:content-uid")).await;
+        hold(&a, &rows[1].id, Some("user:ops")).await;
+        hold(&a, &rows[2].id, None).await;
+        let sched = scheduler(
+            &a,
+            store.clone(),
+            &now,
+            SchedConfig {
+                expire_every: Duration::from_secs(3600),
+                ..expiry_config()
+            },
+        );
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        let left = autos(&a);
+        let mut unheld: Vec<SnapshotRow> = rows[3..].to_vec();
+        record_new(&mut unheld, &a);
+        let mut want: BTreeSet<String> = ids(&rows[..3]);
+        want.extend(kept_ids(POLICY, data, &unheld));
+        assert_eq!(ids(&left), want);
+        // 10 + 1 new; 3 held; 6 of the 8 unheld kept.
+        assert_eq!(sched.deps.stats.status().expired, 2);
+        // Many runs later the held ones are still there.
+        let sched = scheduler(&a, store.clone(), &now, expiry_config());
+        for _ in 0..12 {
+            advance(&now, 10 * SEC);
+            sched.tick(Run::Periodic).await;
+        }
+        let left = autos(&a);
+        for row in &rows[..3] {
+            assert!(left.iter().any(|r| r.id == row.id && r.held));
+        }
+        assert_eq!(left.len(), 3 + 6);
+    }
+
+    /// The carried M3c gap, option (a): a leader that cannot reach the
+    /// root-lease holder over P2P resigns after `resign_after` failed
+    /// ticks and stays out for a lease TTL; the holder (which can always
+    /// reach itself) takes over and creates. A shorter run of failures
+    /// that ends in a reachable batch does not resign: no flapping on a
+    /// blip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_that_cannot_reach_the_holder_resigns_and_the_holder_leads() {
+        let (store, a, b, data, _) = holder_b().await;
+        bind(&b, &[&a], data, "10s:1m; skip-empty=no").await;
+        let now = test_clock();
+        let cfg = SchedConfig {
+            lease_ttl_ms: 3000,
+            ..expiry_config()
+        };
+        let sa = scheduler(&a, store.clone(), &now, cfg.clone());
+        let sb = scheduler(&b, store.clone(), &now, cfg);
+        assert_eq!(outcomes(&sa.tick(Run::Periodic).await), ["created"]);
+        // A blip: two failed ticks, then the holder is reachable again.
+        a.host.unreachable.lock().unwrap().insert(2);
+        for _ in 0..2 {
+            advance(&now, 10 * SEC);
+            assert_eq!(outcomes(&sa.tick(Run::Periodic).await), ["failed"]);
+        }
+        a.host.unreachable.lock().unwrap().clear();
+        advance(&now, 10 * SEC);
+        assert_eq!(outcomes(&sa.tick(Run::Periodic).await), ["created"]);
+        // A partition: three failed ticks in a row, and A gives up.
+        a.host.unreachable.lock().unwrap().insert(2);
+        for k in 0..3 {
+            advance(&now, 10 * SEC);
+            let report = sa.tick(Run::Periodic).await;
+            assert_eq!(outcomes(&report), ["failed"]);
+            assert_eq!(report.leader, k < 2, "tick {k}: {report:?}");
+        }
+        assert!(!sa.deps.stats.leader.load(Ordering::Relaxed));
+        assert!(sa
+            .deps
+            .stats
+            .status()
+            .last_error
+            .unwrap()
+            .contains("resigned"));
+        // A stays out; B takes the released lease at once and creates.
+        let report = sa.tick(Run::Periodic).await;
+        assert!(report.refused.unwrap().contains("resigned"));
+        let report = sb.tick(Run::Periodic).await;
+        assert!(report.leader, "{report:?}");
+        assert_eq!(report.roots[0].outcome, "created", "{report:?}");
+        assert_eq!(
+            b.host.forwards.load(Ordering::Relaxed),
+            0,
+            "B ran it locally"
+        );
+        // A, back after its backoff, finds B leading.
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        sb.tick(Run::Periodic).await;
+        let report = sa.tick(Run::Periodic).await;
+        assert!(report.refused.unwrap().contains("another node leads"));
+    }
+
+    /// `snapshot.list`'s `KEPT BY` / `EXPIRES` source: armed roots only,
+    /// unheld auto rows only, `grace` while a window holds a victim back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_listing_shows_why_each_snapshot_is_kept() {
+        let (store, a, data) = solo("10s:1m; skip-empty=no").await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = history(&a, &a, &store, &now, 9, Duration::from_secs(3600)).await;
+        let sched = scheduler(
+            &a,
+            store.clone(),
+            &now,
+            SchedConfig {
+                grace: Duration::from_secs(3600),
+                ..expiry_config()
+            },
+        );
+        hold(&a, &rows[0].id, Some("csi:x")).await;
+        let listing = sched.listing().await.unwrap();
+        assert!(!listing.contains_key(&rows[0].id), "held: not filled");
+        // The first sighting (by `history`) is an hour's window here.
+        let cell = &listing[&rows[1].id];
+        assert_eq!(cell.kept_by, ["grace"]);
+        assert!(cell.expires_unix_ms.unwrap() > now.load(Ordering::Relaxed));
+        assert_eq!(listing[&rows[8].id].kept_by, ["10s", "last"]);
+        assert_eq!(listing[&rows[5].id].kept_by, ["10s"]);
+        // A scheduler with no window of its own still honours the
+        // recorded one ...
+        let plain = scheduler(&a, store.clone(), &now, expiry_config());
+        let listing = plain.listing().await.unwrap();
+        assert_eq!(listing[&rows[1].id].kept_by, ["grace"]);
+        // ... and once it has closed, the victims are due now.
+        advance(&now, 3600 * SEC);
+        let listing = plain.listing().await.unwrap();
+        assert!(listing[&rows[1].id].kept_by.is_empty());
+        assert_eq!(listing[&rows[1].id].expires_unix_ms, None);
+        // Paused: not armed, nothing filled.
+        bind(&a, &[], data, "10s:1m; skip-empty=no; paused").await;
+        assert!(sched.listing().await.unwrap().is_empty());
     }
 }

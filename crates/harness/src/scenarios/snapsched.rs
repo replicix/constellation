@@ -30,9 +30,15 @@
 //! taken in (no backfill of the nine missed buckets), and the schedule
 //! resumes at one per bucket.
 //!
-//! Neither scenario sees a snapshot deleted: the auto set only grows. M4
-//! (expiry) changes that assertion: `last=2` and the `1m:4m` tier then
-//! bound the set.
+//! Neither scenario sees a snapshot deleted, although expiry (plan 32 M4a)
+//! runs in both: `/proj` is a root the scheduler sees for the first time,
+//! and a first sighting expires nothing for `CONSTELLATION_SNAPSCHED_GRACE_S`
+//! (24 h by default; neither scenario shortens it), so the auto set only
+//! grows and every series check below stays exact. The retention oracle —
+//! a short grace, and "the surviving set equals `retention::evaluate` over
+//! the audit journal's creations" in place of the subset and
+//! consecutive-bucket checks — is `32-m4b`'s: it rewrites those checks, so
+//! it is not a one-line change.
 
 use super::m11::dump_logs_on_failure;
 use super::m9::node_id;
@@ -474,8 +480,9 @@ fn create_body(seed: u64, clients: &mut [Client; 2]) -> Result<()> {
             *leaders.entry(*id).or_default() += 1;
         }
         let now: BTreeSet<String> = polled(&clients[1])?.into_iter().map(|s| s.name).collect();
-        // Nothing is deleted in M3; M4's expiry makes this `last=2` +
-        // `1m:4m` bound the set instead.
+        // Nothing is deleted inside the first-sighting grace window (see
+        // the module doc); `32-m4b` replaces this with the retention
+        // oracle under a short window.
         ensure!(
             seen.is_subset(&now),
             "a snapshot vanished: had {seen:?}, now {now:?}"

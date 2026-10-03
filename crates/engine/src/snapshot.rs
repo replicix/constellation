@@ -202,6 +202,12 @@ pub struct SnapshotManager {
     /// the engine's injected host; the process-wide native one for a
     /// manager built without an engine (one-shot commands, tests).
     process: Option<Arc<dyn constellation_platform::Process>>,
+    /// Tests only: the clock a new snapshot's `created_unix_ms` is read
+    /// from (the scheduler's tests move one test clock for the leader and
+    /// the holder alike, so retention sees snapshots spread over buckets
+    /// without waiting for them).
+    #[cfg(test)]
+    pub(crate) created_clock: Arc<std::sync::Mutex<Option<TestClock>>>,
 }
 
 /// Plan 32 §0.4: what a creator sets beyond `path@name`. The default is
@@ -225,6 +231,10 @@ impl SnapshotOptions {
     }
 }
 
+/// A test clock for [`SnapshotManager::created_clock`].
+#[cfg(test)]
+pub(crate) type TestClock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 impl SnapshotManager {
     pub fn new(
         meta: Arc<Meta>,
@@ -241,6 +251,8 @@ impl SnapshotManager {
             tree: None,
             publish: None,
             process: None,
+            #[cfg(test)]
+            created_clock: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -433,6 +445,14 @@ impl SnapshotManager {
         // The hold is not part of the bucket object (plan 32 §0.4: it
         // lives only in the row, where releasing it can be recorded).
         .with_extensions(options.origin, options.policy_ino, refer_bytes);
+        #[cfg(test)]
+        let record = {
+            let mut record = record;
+            if let Some(clock) = self.created_clock.lock().unwrap().as_ref() {
+                record.created_unix_ms = clock();
+            }
+            record
+        };
         match self.records.create(&record).await {
             Ok(()) => {}
             Err(StoreError::AlreadyExists) => return Ok(PutRecord::AlreadyExists(record.id())),

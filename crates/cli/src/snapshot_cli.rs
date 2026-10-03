@@ -195,8 +195,7 @@ impl Column {
             Column::Seq => a.seq.cmp(&b.seq),
             Column::Creator => a.creator.cmp(&b.creator),
             Column::Policy => a.policy_ino.cmp(&b.policy_ino),
-            // Nothing to order by until M4 fills it in.
-            Column::Expires => Ordering::Equal,
+            Column::Expires => expires_key(a).cmp(&expires_key(b)),
             _ => self.cell(a, ctx).cmp(&self.cell(b, ctx)),
         }
     }
@@ -248,10 +247,7 @@ impl Column {
                 self.size_cell(row, parsable)
             }
             Column::KeptBy => kept_by(row),
-            // Manual and held snapshots never expire; an automatic one's
-            // expiry is M4's.
-            Column::Expires if row.held || row.origin == "manual" => "never".into(),
-            Column::Expires => "-".into(),
+            Column::Expires => expires(row, ctx),
             Column::Id => row.id.clone(),
             Column::Seq => row.seq.map_or_else(|| "-".into(), |s| s.to_string()),
             Column::Creator if row.creator == 0 => "-".into(),
@@ -266,6 +262,8 @@ impl Column {
 struct Ctx<'a> {
     parsable: bool,
     orphaned: &'a BTreeSet<u64>,
+    /// "Now" for `EXPIRES`' relative times (Unix ms).
+    now_ms: i64,
 }
 
 /// Whether `snapshot ls` needs the orphan set: `--orphaned` filters on it
@@ -318,16 +316,93 @@ pub fn orphaned_streams(listing: &api::SnapPolicyListing) -> BTreeSet<u64> {
 }
 
 /// `KEPT BY`: the hold, by its owner's namespace (`held: csi` reads
-/// differently from an operator's `held: user` and from a plain `held`),
-/// `—` when nothing keeps the snapshot. Retention reasons join in M4.
+/// differently from an operator's `held: user` and from a plain `held`);
+/// otherwise the daemon's retention reasons for an auto snapshot of an
+/// armed root — the keeping tiers as `5m·1h·1d`, then `last`, or `grace`
+/// while only a grace window keeps it; `—` when nothing keeps it (a
+/// manual or orphaned snapshot, or one the next expiry run deletes).
 fn kept_by(row: &api::SnapshotStatus) -> String {
-    if !row.held {
+    if row.held {
+        return match row.held_by.as_deref().filter(|by| !by.is_empty()) {
+            None => "held".into(),
+            Some(by) => format!("held: {}", by.split(':').next().unwrap_or(by)),
+        };
+    }
+    let Some(labels) = row.kept_by.as_ref().filter(|l| !l.is_empty()) else {
         return "—".into();
+    };
+    let tiers: Vec<&str> = labels
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !matches!(*l, "last" | "grace"))
+        .collect();
+    let mut parts = Vec::new();
+    if !tiers.is_empty() {
+        parts.push(tiers.join("·"));
     }
-    match row.held_by.as_deref().filter(|by| !by.is_empty()) {
-        None => "held".into(),
-        Some(by) => format!("held: {}", by.split(':').next().unwrap_or(by)),
+    parts.extend(
+        labels
+            .iter()
+            .map(String::as_str)
+            .filter(|l| matches!(*l, "last" | "grace"))
+            .map(str::to_string),
+    );
+    parts.join(", ")
+}
+
+/// `EXPIRES`: `never` for a manual or held snapshot, and for an auto one a
+/// `*` tier keeps for good; `in 6d 23h` (Unix ms with `-p`) for the
+/// daemon's forecast; `now` for one the next expiry run deletes; `-` when
+/// no policy decides (orphaned, paused, or a daemon that did not say).
+fn expires(row: &api::SnapshotStatus, ctx: &Ctx) -> String {
+    if row.held || row.origin == "manual" {
+        return "never".into();
     }
+    match (&row.kept_by, row.expires_unix_ms) {
+        (None, _) => "-".into(),
+        (Some(labels), _) if labels.is_empty() => "now".into(),
+        (Some(_), Some(at)) if ctx.parsable => at.to_string(),
+        (Some(_), Some(at)) => relative(at, ctx.now_ms),
+        (Some(_), None) => "never".into(),
+    }
+}
+
+/// `-s expires`: no forecast first, then due now, then by time, never
+/// last.
+fn expires_key(row: &api::SnapshotStatus) -> (u8, i64) {
+    if row.held || row.origin == "manual" {
+        return (3, 0);
+    }
+    match (&row.kept_by, row.expires_unix_ms) {
+        (None, _) => (0, 0),
+        (Some(labels), _) if labels.is_empty() => (1, 0),
+        (Some(_), Some(at)) => (2, at),
+        (Some(_), None) => (3, 0),
+    }
+}
+
+/// `at` relative to `now`: `in 6d 23h`, `in 4h 10m`, `in 5m`, `in 30s`
+/// (the two largest units); `now` once it is past.
+pub fn relative(at: i64, now: i64) -> String {
+    let secs = (at - now).div_euclid(1000);
+    if secs <= 0 {
+        return "now".into();
+    }
+    let (d, h, m, s) = (
+        secs / 86_400,
+        secs % 86_400 / 3600,
+        secs % 3600 / 60,
+        secs % 60,
+    );
+    let text = match (d, h, m) {
+        (0, 0, 0) => format!("{s}s"),
+        (0, 0, _) => format!("{m}m"),
+        (0, _, 0) => format!("{h}h"),
+        (0, _, _) => format!("{h}h {m}m"),
+        (_, 0, _) => format!("{d}d"),
+        _ => format!("{d}d {h}h"),
+    };
+    format!("in {text}")
 }
 
 /// `YYYY-MM-DD HH:MM` in UTC.
@@ -429,7 +504,30 @@ pub fn render_table(
     parsable: bool,
     orphaned: &BTreeSet<u64>,
 ) -> String {
-    let ctx = Ctx { parsable, orphaned };
+    render_table_at(
+        rows,
+        columns,
+        sort,
+        parsable,
+        orphaned,
+        constellation_store_s3::lease::now_unix_ms(),
+    )
+}
+
+/// [`render_table`] with `EXPIRES` relative to `now_ms`.
+pub fn render_table_at(
+    rows: &[api::SnapshotStatus],
+    columns: &[Column],
+    sort: Option<Column>,
+    parsable: bool,
+    orphaned: &BTreeSet<u64>,
+    now_ms: i64,
+) -> String {
+    let ctx = Ctx {
+        parsable,
+        orphaned,
+        now_ms,
+    };
     if rows.is_empty() {
         return "no snapshots\n".into();
     }
@@ -963,6 +1061,99 @@ mod tests {
                 "ORIGIN misaligned in {line:?}"
             );
         }
+    }
+
+    /// Plan 32 Step 5 (M4a): `KEPT BY` from the daemon's reasons, and
+    /// `EXPIRES` as a relative forecast, `now`, `never` or `-`.
+    #[test]
+    fn kept_by_and_expires_come_from_the_daemons_verdicts() {
+        let now = 1_790_603_759_000;
+        let auto = |name: &str, kept: Option<&[&str]>, at: Option<i64>| {
+            let mut r = row("/p", name, 1, now);
+            r.origin = "auto".into();
+            r.kept_by = kept.map(|k| k.iter().map(|s| s.to_string()).collect());
+            r.expires_unix_ms = at;
+            r
+        };
+        let day = 86_400_000;
+        let rows = vec![
+            auto(
+                "a-tiers",
+                Some(&["5m", "1h", "1d"]),
+                Some(now + 6 * day + 23 * 3_600_000 + 1),
+            ),
+            auto("b-last", Some(&["last"]), Some(now + 5 * 60_000)),
+            auto("c-grace", Some(&["grace"]), Some(now + 3_600_000)),
+            auto("d-due", Some(&[]), None),
+            auto("e-forever", Some(&["1y"]), None),
+            auto("f-orphan", None, None),
+        ];
+        let table = render_table_at(
+            &rows,
+            &[Column::Name, Column::KeptBy, Column::Expires],
+            None,
+            false,
+            &BTreeSet::new(),
+            now,
+        );
+        let cells: Vec<Vec<&str>> = table
+            .lines()
+            .skip(1)
+            .map(|l| {
+                l.split("  ")
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            cells,
+            [
+                vec!["/p@a-tiers", "5m·1h·1d", "in 6d 23h"],
+                vec!["/p@b-last", "last", "in 5m"],
+                vec!["/p@c-grace", "grace", "in 1h"],
+                vec!["/p@d-due", "—", "now"],
+                vec!["/p@e-forever", "1y", "never"],
+                vec!["/p@f-orphan", "—", "-"],
+            ],
+            "{table}"
+        );
+        let parsable = render_table_at(
+            &rows[..1],
+            &[Column::Expires],
+            None,
+            true,
+            &BTreeSet::new(),
+            now,
+        );
+        assert_eq!(
+            parsable.lines().nth(1),
+            Some((now + 6 * day + 23 * 3_600_000 + 1).to_string().as_str())
+        );
+        // `-s expires`: no forecast, due, soonest, never.
+        let sorted = render_table_at(
+            &rows,
+            &[Column::Name],
+            Some(Column::Expires),
+            false,
+            &BTreeSet::new(),
+            now,
+        );
+        let order: Vec<&str> = sorted.lines().skip(1).map(str::trim).collect();
+        assert_eq!(
+            order,
+            [
+                "/p@f-orphan",
+                "/p@d-due",
+                "/p@b-last",
+                "/p@c-grace",
+                "/p@a-tiers",
+                "/p@e-forever"
+            ]
+        );
+        assert_eq!(relative(now - 1, now), "now");
+        assert_eq!(relative(now + 30_000, now), "in 30s");
+        assert_eq!(relative(now + 2 * day, now), "in 2d");
     }
 
     #[test]

@@ -35357,3 +35357,204 @@ design and the measured memory are in `vendor/fuser/CONSTELLATION-PATCH.md`
   (`/var/tmp` export of `b458669`), as a user, so no zero-copy is involved.
   The `explicit-depth` round passes. Not bisected; the lock-fencing change
   in `b458669` is the suspect.
+
+## Plan 32 M4a (expiry)
+
+Step 4 of [plan 32](wip/32-snapshot-policies-and-space.md) (chunk `32-m4a`),
+plus Step 5's `policy rm --expire`, the `policy set` grace delta and `snapshot
+ls`'s `KEPT BY`/`EXPIRES`, and the carried M3c gap (an unreachable root-lease
+holder). **Policies now delete snapshots.** The only code that does so
+automatically is `crates/engine/src/snapexpire.rs`, called by the scheduler's
+tick after creation; `snapshot.policy.remove {expire}` uses its deletion half.
+
+| Item | State | Where |
+|---|---|---|
+| Expiry run per root, after creation in the same tick, at most once per `CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S` (60), only while leading and with no refusal gate up, only for *armed* roots (parseable, not `paused`, directory present) | DONE | `Scheduler::expire`, `snapexpire` module doc |
+| Victims = `retention::evaluate` over the root's auto rows read from the replica *after* creation, narrowed by the open grace windows (`grace_intersection` with each replaced policy, `grace_first_seen` for a first sighting); oldest first; at most `CONSTELLATION_SNAPSCHED_MAX_DELETES` (500) per root per run. No clock in the decision | DONE | `snapexpire::graced`, `root_rows` |
+| Per batch of `CONSTELLATION_SNAPSCHED_EXPIRE_BATCH` (32, clamp 1..256) victims: renew `_snapsched` (`Fenced` → leadership ends, nothing more sent), re-read each row (exists, `auto`, same `policy_ino`, not held, else `skipped_reverify`), then one holder-side batch of `SnapshotItem::Delete { force: false }`; the holder's own hold refusal (the structured `SnapshotItemResult::Held { reason }`, new on the wire) and `NotFound` also count `skipped_reverify`; any other refusal or a failed batch stops the run (`last_error`, next tick retries) | DONE | `snapexpire::delete_victims` |
+| Audit: deletions join the tick's `snapsched/journal/` object as `deleted: [{id, name, created_unix_ms, reason: "no tier keeps it"}]` (`reason` new, an `Option` with no serde attribute: always written, `null` on creations; nothing reads pre-M4a journals — `32-m4b`'s oracle reads only the journals of its own run); a tick that only deleted writes one too | DONE | `crates/store-s3/src/snapsched.rs` (`SnapSchedJournalSnap::reason`), `Scheduler::write_audit` |
+| Grace state `snapsched/state.json` (format below), read every run; written only by the leader, after a renewal, with an ETag CAS (`PutMode::Create` when absent; `Overwrite` in `LeaseMode::SingleWriter`). A failed read or a lost/failed CAS aborts the run's deletions (creation already happened) and is retried next tick | DONE | `store_s3::snapsched::{SnapSchedState, load_state, save_state}`, `snapexpire::observe` |
+| Never deleted automatically: manual; held (plain, `user:`, `csi:`); orphaned (no or unparseable policy: no run at all; counted in `orphaned_snapshots`); anything of a paused root; anything while a refusal gate is up | DONE | tests below |
+| `snapshot.policy.remove {expire, confirm_expiring, dry_run}` → `SnapPolicyRemoved {root, would_expire, would_expire_ids, expired, skipped, error, written}`: the root's unheld auto snapshots, guarded like `set` (Conflict unless `confirm_expiring` = the count; details = the preview); removes the xattr first, then deletes through `Scheduler::expire_removed` (same re-read + batch, no scheduler lease, audit reason `policy removed with --expire`, counts `expired`). Without `expire` it still only orphans. The `REMOVE_EXPIRE_REFUSED` placeholder is gone | DONE | `crates/engine/src/control/snapsched.rs`, `crates/control/src/proto/types.rs`, `methods.rs` |
+| CLI `snapshot policy rm <fs:path> [--expire] [--yes]`: a dry run, the question (`… and DELETE its N unheld auto snapshot(s)? held ones are kept`), then the call with `confirm_expiring = N`; a stale count is reported, nothing removed. Web UI's remove-with-expire uses the same dry run (it used the auto-snapshot count, held ones included) | DONE | `crates/cli/src/policy_cli.rs` (`rm`, `render_removed`), `crates/control/webui/snapshots.html` |
+| `policy set`'s `grace_note` is the real one (the `GRACE_NOTE_INACTIVE` placeholder is gone), the scheduler's own computation (the projected grace state with the new policy observed now, then `graced`): `nothing is deleted for 24h; after that 24 snapshots expire`; with deletions every open window shares, `M expire at the next expiry run (no open grace window keeps them); the other K not before 24h from now`; `the retention is unchanged: …` (a resume, a `skip-empty` flip — still naming an open window, e.g. a first sighting's); `paused: …`; `nothing expires now`; `no grace window (…GRACE_S=0)` | DONE | `control::snapsched::grace_note` |
+| `SnapshotStatus.kept_by: Option<Vec<String>>`, `expires_unix_ms: Option<i64>` (always serialized, `null` when absent, required on decode — no serde default; schema re-blessed), filled by `snapshot.list` for unheld auto snapshots of armed roots from `evaluate` + grace (`Scheduler::listing` → `display_grace`: the grace state as last read, projected with what the next run records first; an old copy is served while a background read refreshes it; only with no copy at all does a call wait, 2 s bound; best effort). `policy show`'s verdicts use the same `GraceView`, so both views agree | DONE | `snapexpire::listing`, `EngineControl::fill_retention` |
+| CLI `snapshot ls`: `KEPT BY` `5m·1h·1d`, `last`, `grace`, `held: csi` / `held: user` / `held`, `—`; `EXPIRES` `in 6d 23h` (Unix ms with `-p`), `now` (next run deletes it), `never` (manual, held, `*` tier), `-` (no policy decides); `-s expires` orders them | DONE | `crates/cli/src/snapshot_cli.rs` (`kept_by`, `expires`, `relative`, `render_table_at`) |
+| `snapshot sched run [--dry-run]` reports expiry rows (`would_expire`, `expired`, `skipped_reverify` with why); `sched status` adds `skipped-reverify`/`skipped-grace` | DONE | `Scheduler::tick`, `crates/cli/src/sched_cli.rs` |
+| **Carried M3c gap, option (a):** a leader whose batches (create or delete) fail with the new typed `snapshot_batch::HolderUnreachable` (the forward to the root-lease holder failed) for `CONSTELLATION_SNAPSCHED_RESIGN_AFTER` (3; 0 = never) ticks in a row releases `_snapsched` and does not try to lead for one lease TTL; a tick whose batch reached the holder resets the count. The holder (which never forwards to itself) or any node that reaches it takes over | DONE | `Scheduler::track_holder`, `snapshot_batch::HolderUnreachable` |
+| Config knobs documented where read and in `configuration.md`; TESTING.md smoke + snapsched notes | DONE | `SchedConfig`, `docs/reference/configuration.md`, `docs/how-to-guides/development/TESTING.md` |
+| Smoke lane: `snapshot ls -o name,kept-by,expires` shows the scheduler's snapshot `1h·1d, last` / `in …`; `policy rm --expire` declined without `--yes` (with the count in the question); the orphaned stream adopted again by `policy set` and deleted by `policy rm --expire --yes` (`1 auto snapshot(s) deleted, 0 kept`) instead of by hand | DONE | `crates/harness/src/smoke.rs` |
+
+### Tests (each never-delete case → its test)
+
+In-process multi-node, `crates/engine/src/snapsched.rs` (the M3 fixture; a
+test seam now stamps `created_unix_ms` from the test clock at the holder —
+`SnapshotManager::created_clock`, `#[cfg(test)]` — so the stream spreads over
+`s` buckets; `history()` builds a stream with `max_deletes: 0`):
+
+| Case | Test |
+|---|---|
+| Steady state: after each of 40 ticks the survivors equal `evaluate` over *every* creation (`10s:1m 1m:3m; last=2`); `expired` = deletions = journal `deleted` entries, all `no tier keeps it`; a **manual** snapshot of the root survives | `steady_state_survivors_are_evaluate_over_every_creation` |
+| A hold landing after evaluation, before the batch (seam `before_delete`): held at the holder behind the leader's back → the holder refuses; held through the leader → its re-read drops it. Both `skipped_reverify`, both survive on both replicas, the rest go | `a_hold_between_evaluation_and_delete_wins` |
+| Grace: a first sighting deletes nothing for the window (`skipped_grace` ≥ 14), then exactly `evaluate`; lengthening deletes nothing extra; a policy shortened via the xattr deletes only what the old one also expires inside the window, then exactly the new one; `state.json` records the change time and empties the closed priors | `grace_after_a_first_sighting_and_after_a_shortened_policy` |
+| **Paused** root deletes nothing; a **refusal gate** (departed) deletes nothing; resume is not a change (deletes at once, `skipped_grace` 0 with a 30 s grace configured); **removed policy** → orphaned, nothing deleted over 12 more ticks, `orphaned_snapshots` = their count | `paused_refused_and_removed_roots_delete_nothing` |
+| **Unparseable** policy written straight into the replica (past the gate) over a stream with victims: inert on both nodes (no create, no delete), `unparseable_roots` 1, `orphaned_snapshots` 9, `expired` 0 on each | `an_unparseable_policy_is_inert_on_both_nodes` |
+| `Fenced` mid-run (seam steals `_snapsched` before batch 2): batch 1's victim gone, victim 2 never sent, `leader` false, next tick takes nothing | `a_fenced_renewal_stops_the_deletions_at_once` |
+| `state.json` CAS lost (a store that rewrites the object right before this node's write): no deletion, `error` says so; the next tick records and deletes | `a_lost_state_cas_aborts_the_deletions` |
+| **Held `csi:` / `user:` / plain** snapshots as the oldest (the ones the policy would expire first) are never expired, and do not count against the candidates: what goes is `evaluate` over the unheld ones, and still after 12 more runs | `held_snapshots_of_every_owner_are_never_expired` |
+| Partitioned leader resigns after 3 failed ticks, stays out (`refused: … resigned`), the holder leads and creates locally; a 2-tick blip followed by a reachable batch does not resign; after the backoff the old leader finds the new one leading | `a_leader_that_cannot_reach_the_holder_resigns_and_the_holder_leads` |
+| Listing: held rows unfilled, `grace` with a forecast inside a window, `10s, last` / `10s`, victims empty without a window, paused root unfilled | `the_listing_shows_why_each_snapshot_is_kept` |
+| Pure grace bookkeeping (windows open/close, a change pushes the old policy, roots no longer seen are forgotten, priors bounded at 16 collapsing to "unknown", pause is not a change, `KEPT BY` cells) | `snapexpire::tests::*` (6) |
+| A leader with a shorter `GRACE_S` (10 min) does not close a window recorded under 24 h: nothing deleted, prior kept in `state.json` with its `until_unix_ms` (fix round) | `a_shorter_grace_leader_honours_a_longer_recorded_window`, `snapexpire::tests::a_shorter_local_grace_does_not_close_a_longer_recorded_window` |
+| A leader whose clock is 1 h ahead does not drop a prior from `state.json` early: a correct-clock leader still graces until the recorded end (fix round) | `snapexpire::tests::a_leader_with_its_clock_ahead_does_not_drop_a_prior_early` |
+| `policy show`, `snapshot.list` and the `set` note apply the same grace (fix round) | `control::snapsched::tests::show_list_and_note_apply_the_same_grace` |
+| `remove {expire}`: dry run counts the 8 unheld autos (2 held, one `csi:`), unconfirmed / wrong count → Conflict and nothing written, confirmed → 8 deleted; manual, held and another root's snapshot at the same path stay; `node.status` `expired` 8 | `control::snapsched_tests::remove_with_expire_deletes_the_roots_unheld_auto_snapshots` |
+| `state.json` round trip, create-if-absent loses to a racer, stale tag conflicts, a body missing a field refused, version 1 refused by its version, other version refused | `store_s3::snapsched::tests::the_state_round_trips_and_a_stale_tag_conflicts` |
+| CLI cells and `-s expires` | `snapshot_cli::tests::kept_by_and_expires_come_from_the_daemons_verdicts` |
+
+### `snapsched/state.json` (format 2)
+
+```json
+{"version": 2, "updated_unix_ms": 1790603759000, "node": 2,
+ "roots": {"1099511627777": {
+    "canonical": "10s:1m 1m:4m; last=2",
+    "since_unix_ms": 1790600000000,
+    "prior": [{"canonical": "10s:1m 1m:1h",
+               "replaced_unix_ms": 1790600000000,
+               "until_unix_ms": 1790686400000}]}}}
+```
+
+Per policy root (inode key): `canonical` = the canonical policy **without
+`paused`** last seen, `since_unix_ms` = when the leader first saw it, and
+`prior` = the policies it replaced whose window may still be open (a `null`
+canonical = the first-sighting "unknown", which keeps everything). A run
+expires only what the current policy and every open prior expire. Each prior
+stores `until_unix_ms` = `replaced_unix_ms` + the recording leader's
+`CONSTELLATION_SNAPSCHED_GRACE_S`; a reader keeps it open while `now <
+max(until_unix_ms, replaced_unix_ms + its own GRACE_S)`. A closed prior stays
+recorded for 24 h more (`PRIOR_KEEP_SLACK_MS`; it decides nothing) before it is
+dropped, so a leader whose clock runs ahead does not erase a window the next
+leader still honours. Every field is required (no serde defaults); version 1
+(no `until_unix_ms`) is refused by its version, no migration: a cluster that
+meets one expires nothing until it is deleted by hand. Roots no longer
+carrying a parseable policy are dropped too (re-binding later is a first
+sighting again); more than 16 priors collapse into one "unknown". Another
+`version` is refused (fail closed: nothing expires).
+
+### Decisions taken here
+
+- **Batching: 32 victims per delete batch** (`CONSTELLATION_SNAPSCHED_EXPIRE_BATCH`,
+  `1` = the plan's literal per-victim loop). The lease is renewed and every
+  victim re-read immediately before its batch is sent, so the window between
+  a victim's re-read and its delete is one batch round trip regardless of the
+  size, and the authoritative hold check runs at the holder per item anyway.
+  A 500-victim catch-up costs 16 renewals and forwards instead of 500.
+- **`MAX_DELETES` is per root per run** (a "run" is one root's, plan §4.1), so a
+  root with a large backlog does not starve the others.
+- **Grace keeps every replaced policy whose window is open**, not only the last
+  one: shortening `1d:1y` → `1d:7d` → `1d:6d` within an hour must not delete
+  year-old snapshots an hour after the first change.
+- **A change is dated when the leader first sees it** (a run reads and records
+  the state every time; paused roots are recorded too, so "pause, change,
+  resume a day later" deletes on resume — the change's window ran while
+  paused). A late sighting only delays deletions.
+- **No grace for a retention-neutral change**: comparing canonical forms with
+  `skip-empty` or `budget` changed opens a window, but the intersection of two
+  identical retentions is the new verdict, so it is a no-op in effect.
+- **`kept_by`/`expires_unix_ms` carry no serde attribute** (coordinator,
+  fix round): always serialized (`null` when absent), required on decode.
+  `skip_serializing_if` is forbidden in `proto::types` (postcard is
+  positional; test `no_postcard_hostile_serde_attributes`).
+- **`remove {expire}` removes the xattr first, then deletes** (so the
+  scheduler cannot create a new snapshot in between), takes no scheduler
+  lease (an operator's confirmed delete, like `snapshot.delete`), and its count
+  is the root's *unheld* auto snapshots (the web UI's old count included held
+  ones). A partial deletion still removes the policy and reports `error`.
+- **Carried gap: option (a), resign.** It cannot flap harmfully: the holder
+  executes locally and never fails this way, so leadership settles on a node
+  that reaches it; if *no* node can, the lease rotates once per
+  `RESIGN_AFTER` ticks + one TTL, and nothing is created or deleted either way.
+  A tick that sends no batch neither counts nor resets.
+- **With no policy root at all, a tick still counts no orphans** (M3's "one
+  index lookup and nothing else"): `orphaned_snapshots` reads 0 then;
+  `policy ls` still lists the orphaned streams.
+- **`policy show`'s verdicts are grace-aware** (fix round): the same
+  `snapexpire::GraceView` as `snapshot ls`; a snapshot only a window keeps has
+  the reason `grace`. `policy set`'s `would_expire` (the confirmed count) stays
+  the policy's own verdicts; the note says when they go.
+- **A hold refusal is structured** (fix round): the holder answers a
+  non-`force` delete of a held snapshot with `SnapshotItemResult::Held {
+  reason }` (appended to the wire enum), and expiry matches on it; nothing
+  parses the reason text.
+- **A batch can outlive the lease** (renewal is per batch, not during one):
+  harmless, an overlapping leader computes the same victims from the same
+  rows, policy text and recorded grace state.
+- **Wall-clock grace:** a leader's clock jumping forwards closes windows
+  early by the jump (backwards only keeps them open).
+
+### `snapsched-create` and the brief's expected failure
+
+The brief expected the "count only grows" assertion to fail now. It does not:
+`/proj` is a root the scheduler has never seen, and a first sighting expires
+nothing for `CONSTELLATION_SNAPSCHED_GRACE_S` (24 h; the scenario does not
+shorten it), so every growth, subset and consecutive-bucket check stays exact
+and the scenario passes unchanged in behaviour (comments updated). Exercising
+expiry there needs a short grace and replacing the subset and
+consecutive-bucket checks with "the survivors equal `retention::evaluate` over
+the audit journal's creations" — several checks, not one line: **marked for
+`32-m4b`**.
+
+### Not done here (`32-m4b` / later)
+
+- Harness retention oracle in `snapsched-create` (above) and "nothing expires
+  during the outage" with a short grace in `snapsched-s3-outage`; the
+  6-minute `snapsched` run with a manual and a held auto snapshot.
+- The `snap-drain-busy` change (drain to the op's own journal position) does
+  not touch this chunk: delete batches never drain (only creates do).
+- `docs/reference/features/snapshot-policies.md` and `/metrics` (M8).
+
+### Gates (2026-10-02, this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`, then `cargo test -p constellation-control` | re-blessed; 135 passed |
+| `cargo test --workspace --no-fail-fast` | **2280 passed, 0 failed** (per crate group, each under the tool's 10-minute limit: meta/store-s3/authority 779; the small crates 718; engine/cli/harness 645; model 75 + 56 + 7). A first engine run failed `coop::tests::a_burst_past_the_serve_cap_is_served_by_the_peer_not_s3` (2 of 9 chunks from S3, host load 31); 5/5 alone and green in the next full engine run — a load flake in code this chunk does not touch |
+| `cargo test -p constellation-engine --lib snapsched` ×3 | 36/36 each |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` (with the new steps) |
+| `bash tests/integration.sh` | port 4566 held by another agent's floci (`32-m3a-1002-070039-floci-1`): the script's body against it with its `AWS_*` settings (`tests/smoke.sh s3://constellation-ci/run-m4a-1790979515-…`): `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | exit 0 |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX=m4a target/release/harness run …` (three invocations) | `snapsched-create` PASSED 343.5 s (root lease holder 1 epoch 1 before and after; 19 snapshots; takeover gap 10 863 ms); `snapsched-s3-outage` 170.6 s, `snapshot-lifecycle` 5.6 s, `snapshot-churn` 10.3 s; `prune` 3.6 s, `gc-lifecycle` 3.3 s, `e2e-basic` 2.6 s, `e2e-two-nodes` 6.2 s, `snapacct` 52.3 s — all PASSED |
+
+### Fix round (review of 32-m4a, rebased on `b323b85`)
+
+| Finding | Resolution |
+|---|---|
+| Must 1: `#[serde(default)]` on `kept_by`/`expires_unix_ms` | removed; always serialized (`null`), schema re-blessed (only the two `"default": null` lines and the doc text changed). serde's derive still reads an *absent* `Option` as `None` (built in, like `last_ship_error`/`owner`/`max_bytes` in the same file); making absence an error needs `deserialize_with` plus a schemars override (`#[schemars(required)]` makes the field non-null), and the schema sampler treats non-required properties as omittable, so it was not done |
+| Should 2: grace length per reader | `SnapSchedPrior.until_unix_ms` (format 2); open while `now < max(until, replaced + local GRACE_S)`; closed priors kept 24 h more (`PRIOR_KEEP_SLACK_MS`) so a clock-ahead leader does not erase them; v1 refused by version |
+| Should 3: serde defaults in `state.json` | none left; a body missing a field fails to load (test). Journal `reason` has no attribute |
+| Should 4: `is_held_refusal` string sniffing | `SnapshotItemResult::Held { reason }` from the holder; `delete_victims`, `snapshot.delete` and the `delete` method match it; `is_held_refusal` removed |
+| Nits | `Origin::is_auto()` in `control/snapsched.rs`; the deletion path's two lease `else` branches set `result.error`; `grace_note` computed from the projected grace state (open first-sighting window named for an unchanged retention); `skipped_grace` documented per run (module doc, `configuration.md`); dry run / listing / `policy show` / note use the *projected* state (`observe` applied, not written); `grace_view` serves an old copy at once and refreshes it in the background (waits only with no copy); batch-outlives-lease and forward-clock-jump notes in the `snapexpire` module doc; `policy show` grace-aware |
+
+Gates (2026-10-03, `CARGO_TARGET_DIR` unset): `cargo fmt --all` no diff;
+`cargo clippy --workspace --all-targets -- -D warnings` clean;
+`CONSTELLATION_BLESS=1 cargo test -p constellation-control schema` then
+`cargo test -p constellation-control` 135 passed; `cargo test --no-fail-fast` in groups —
+engine/control/cli/harness 810 passed, meta/store-s3/authority/net 911 + 1
+(`the_state_round_trips…`, a wrong assertion of the new test, fixed and re-run green),
+the remaining small crates 467, `constellation-model` (release) 138 — 0 failed;
+`bash tests/smoke.sh` PASSED; `cargo build --release --workspace` ok; `harness run`
+(prefix `m4afix`, `TMPDIR` on /var): `snapsched-create` 350.3 s, `snapsched-s3-outage`
+155.2 s, `snapshot-lifecycle`, `snapshot-busy-latency`, `snapshot-churn`, `prune`,
+`gc-lifecycle`, `snapacct` 54.8 s, `e2e-basic` — all PASSED.
+
+### Exit criteria (M4a)
+
+- [x] Step 4.1: one run per root, renew + re-read before every delete batch, holder-side `Delete { force: false }`, audit with reasons.
+- [x] Step 4.2: manual, held (every owner), orphaned, paused, refused → never deleted; each with a test.
+- [x] Step 4.3: grace state in the bucket with an ETag CAS; a lost CAS deletes nothing; first sighting and shortened policy tested.
+- [x] Step 5: `policy rm --expire [--yes]`, the real grace delta, `KEPT BY` / `EXPIRES`.
+- [x] Step 9: `expired`, `skipped_reverify`, `skipped_grace` counted and shown.
+- [x] Carried M3c gap: a leader that cannot reach the holder resigns; partitioned leader and healthy takeover tested.
+- [ ] Harness retention oracle: `32-m4b`.

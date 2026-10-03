@@ -561,6 +561,22 @@ fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
         "FAIL: snapshot sched run, covered ({st}): {out}{err}"
     );
     ls_row("armed", "1")?;
+    // `snapshot ls`: why the policy keeps it, and until when (M4a).
+    let (st, out, err) = run(&["snapshot", "ls", "/dir", "-o", "name,kept-by,expires"])?;
+    let row = out
+        .lines()
+        .find(|l| l.starts_with(&format!("/dir@{auto_name} ")))
+        .map(|l| {
+            l.split("  ")
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ensure!(
+        st.success() && row.len() == 3 && row[1] == "1h·1d, last" && row[2].starts_with("in "),
+        "FAIL: snapshot ls KEPT BY / EXPIRES ({st}): {out}{err}"
+    );
 
     let (st, out, err) = run(&["snapshot", "policy", "pause", "/dir"])?;
     ensure!(
@@ -574,16 +590,20 @@ fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
         "FAIL: policy resume ({st}): {out}{err}"
     );
     ls_row("armed", "1")?;
-    let (st, out, err) = run(&["snapshot", "policy", "rm", "/dir", "--expire", "--yes"])?;
+    // No terminal, no answer: declined, with or without --expire.
+    for extra in [&[][..], &["--expire"][..]] {
+        let mut args = vec!["snapshot", "policy", "rm", "/dir"];
+        args.extend_from_slice(extra);
+        let (st, _, err) = run(&args)?;
+        ensure!(
+            !st.success() && err.contains("[y/N]") && err.contains("nothing removed"),
+            "FAIL: policy rm {extra:?} without --yes ({st}): {err}"
+        );
+    }
+    let (_, _, err) = run(&["snapshot", "policy", "rm", "/dir", "--expire"])?;
     ensure!(
-        !st.success() && err.contains("not available until expiry ships"),
-        "FAIL: policy rm --expire ({st}): {out}{err}"
-    );
-    // No terminal, no answer: declined.
-    let (st, _, err) = run(&["snapshot", "policy", "rm", "/dir"])?;
-    ensure!(
-        !st.success() && err.contains("[y/N]") && err.contains("nothing removed"),
-        "FAIL: policy rm without --yes ({st}): {err}"
+        err.contains("DELETE its 1 unheld auto snapshot(s)"),
+        "FAIL: policy rm --expire's question: {err}"
     );
     ls_row("armed", "1")?;
     let (st, out, err) = run(&["snapshot", "policy", "rm", "/dir", "--yes"])?;
@@ -601,12 +621,17 @@ fn policy_round_trip(m: &Mount, state: &str) -> Result<()> {
             && out.contains("auto (orphaned)"),
         "FAIL: snapshot ls --orphaned ({st}): {out}{err}"
     );
-    // Deleted by hand, the stream is gone, and the steps below see /dir's
-    // snapshots as they were.
-    let (st, out, err) = run(&["snapshot", "delete", &format!("/dir@{auto_name}")])?;
+    // Bound again and removed with --expire: the stream goes with the
+    // policy (plan 32 Step 4.2), and the steps below see /dir's snapshots
+    // as they were.
+    let (st, out, err) = run(&["snapshot", "policy", "set", "/dir", "1h:1d 1d:7d"])?;
+    ensure!(st.success(), "FAIL: policy set again ({st}): {out}{err}");
+    ls_row("armed", "1")?;
+    let (st, out, err) = run(&["snapshot", "policy", "rm", "/dir", "--expire", "--yes"])?;
     ensure!(
-        st.success(),
-        "FAIL: snapshot delete of {auto_name} ({st}): {out}{err}"
+        st.success()
+            && out.contains("/dir: snapshot policy removed; 1 auto snapshot(s) deleted, 0 kept"),
+        "FAIL: policy rm --expire ({st}): {out}{err}"
     );
     let (st, out, err) = run(&["snapshot", "policy", "ls"])?;
     ensure!(

@@ -393,49 +393,115 @@ pub async fn ls(dir: &Path, under_dir: Option<String>) -> Result<()> {
 }
 
 /// `snapshot policy rm <fs:path> [--expire] [--yes]`.
+///
+/// With `--expire`, like `set`: a dry run first, whose count of the
+/// root's unheld auto snapshots is shown and confirmed; the removal then
+/// passes that count back as `confirm_expiring`, and the daemon refuses
+/// it if the count changed meanwhile.
 pub async fn rm(dir: &Path, path: String, expire: bool, yes: bool) -> Result<()> {
-    if expire {
-        // The daemon refuses it too (`REMOVE_EXPIRE_REFUSED`); saying so
-        // before the prompt spares a confirmation that cannot be acted on.
-        bail!(
-            "snapshot policy rm --expire: not available until expiry ships (plan 32 M4); \
-             without --expire the policy is removed and its auto snapshots are kept, orphaned"
-        );
-    }
-    let shown =
-        control::call::<cm::SnapshotPolicyShow>(dir, api::PathParams { path: path.clone() })
-            .await?;
-    let root = &shown.root;
-    if root.expr.is_empty() {
-        bail!("{}: no snapshot policy", path_text(root));
-    }
+    let preview = control::try_call::<cm::SnapshotPolicyRemove>(
+        dir,
+        api::SnapPolicyRemoveParams {
+            path: path.clone(),
+            expire,
+            confirm_expiring: None,
+            dry_run: true,
+        },
+        None,
+    )
+    .await?
+    .map_err(|e| anyhow::anyhow!("{}", refusal(&e)))?;
+    let root = &preview.root;
     if !yes {
-        let question = format!(
-            "remove the snapshot policy of {} ({})? its {} auto snapshot(s) are kept, orphaned",
-            path_text(root),
-            policy_text(root),
-            root.auto_snapshots
-        );
+        let question = if expire {
+            format!(
+                "remove the snapshot policy of {} ({}) and DELETE its {} unheld auto \
+                 snapshot(s)? held ones are kept",
+                path_text(root),
+                policy_text(root),
+                preview.would_expire
+            )
+        } else {
+            format!(
+                "remove the snapshot policy of {} ({})? its {} auto snapshot(s) are kept, orphaned",
+                path_text(root),
+                policy_text(root),
+                root.auto_snapshots
+            )
+        };
         if !confirm(&question)? {
             bail!("nothing removed");
         }
     }
-    let now = control::call::<cm::SnapshotPolicyRemove>(
+    let done = control::try_call::<cm::SnapshotPolicyRemove>(
         dir,
         api::SnapPolicyRemoveParams {
             path,
-            expire: false,
-            confirm_expiring: None,
+            expire,
+            confirm_expiring: expire.then_some(preview.would_expire),
+            dry_run: false,
         },
+        None,
     )
     .await?;
-    println!(
-        "{}: snapshot policy removed; {} auto snapshot(s) kept{}",
-        path_text(&now),
-        now.auto_snapshots,
-        if now.orphaned { " (orphaned)" } else { "" }
-    );
+    let done = match done {
+        Ok(done) => done,
+        Err(e) if e.kind == ErrorKind::Conflict => {
+            let now = e
+                .details
+                .clone()
+                .and_then(|d| serde_json::from_value::<api::SnapPolicyRemoved>(d.0).ok());
+            match now {
+                Some(now) => bail!(
+                    "{}: nothing removed: it would now delete {} snapshot(s), not the {} \
+                     previewed (snapshots changed meanwhile); rerun to review",
+                    path_text(root),
+                    now.would_expire,
+                    preview.would_expire
+                ),
+                None => bail!("nothing removed: {}", refusal(&e)),
+            }
+        }
+        Err(e) => bail!("{}", refusal(&e)),
+    };
+    print!("{}", render_removed(&done, expire));
+    if done.error.is_some() {
+        bail!("the policy is removed, but not every snapshot was deleted");
+    }
     Ok(())
+}
+
+/// `rm`'s report: the removal, then (with `--expire`) what was deleted,
+/// what was kept after all and why, and an error that stopped it.
+pub fn render_removed(done: &api::SnapPolicyRemoved, expire: bool) -> String {
+    let root = &done.root;
+    let mut out = if expire {
+        format!(
+            "{}: snapshot policy removed; {} auto snapshot(s) deleted, {} kept{}\n",
+            path_text(root),
+            done.expired.len(),
+            root.auto_snapshots,
+            if root.auto_snapshots > 0 {
+                " (held, or changed meanwhile; orphaned)"
+            } else {
+                ""
+            }
+        )
+    } else {
+        format!(
+            "{}: snapshot policy removed; {} auto snapshot(s) kept{}\n",
+            path_text(root),
+            root.auto_snapshots,
+            if root.orphaned { " (orphaned)" } else { "" }
+        )
+    };
+    for skipped in &done.skipped {
+        out.push_str(&format!("  kept {}: {}\n", skipped.id, skipped.reason));
+    }
+    if let Some(error) = &done.error {
+        out.push_str(&format!("error: {error}\n"));
+    }
+    out
 }
 
 /// `snapshot policy pause|resume <fs:path>`.

@@ -853,7 +853,16 @@ Snapshot policies are stored per directory in the
 scheduler ticker; one of them leads, through the `_snapsched` singleton
 lease, and creates the due snapshots at the root-lease holder (creation
 never moves the write lease). With no policy anywhere a tick makes no S3
-request at all. The scheduler only creates; it never deletes a snapshot.
+request at all. After creating, the leader **expires** what the policy no
+longer keeps (plan 32 Step 4): only unheld `auto` snapshots of a root whose
+policy parses and is not paused, never a manual, held (`csi:`, `user:` or
+plain) or orphaned one, never while a refusal gate is up. Which snapshots
+go is `retention::evaluate` over the replica's rows; the clock only decides
+when. After a root's policy changes — or the first time the scheduler sees
+a root — a grace window keeps everything the previous policy (or, for a
+first sighting, anything) still keeps; the windows are recorded in
+`snapsched/state.json` (the leader writes it with an ETag CAS; a lost CAS
+deletes nothing that run). Pausing and resuming is not a change.
 `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` (skip-empty) is in the
 snapshot table above.
 
@@ -863,6 +872,11 @@ snapshot table above.
 | `CONSTELLATION_SNAPSCHED_TICK_MS` | `10000` | milliseconds | scheduler tick on every node; a due snapshot is taken within one tick of its bucket's start |
 | `CONSTELLATION_SNAPSCHED_MAX_LAG_S` | `300` | seconds | a tick refuses (`refused_lag`) when the replica trails the log tail by more than this |
 | `CONSTELLATION_SNAPSCHED_MAX_PER_ROOT` | `5000` | snapshots | a policy root with this many live auto snapshots (held ones included) gets no more: `capped_roots`, `last_error` naming the root, and an error in `snapshot.sched.status` |
+| `CONSTELLATION_SNAPSCHED_GRACE_S` | `86400` | seconds | the grace window after a root's policy changes (canonical form, `paused` ignored) or the root is first seen: until it closes, expiry deletes only what the old policy (every policy replaced inside the window) also expires, and nothing at all for a first sighting; survivors count `skipped_grace` (per run, so the same survivors count again every run). Each window is recorded with its end (this length added when it opens), and a node keeps a window open until the later of that end and its own length: a leader configured shorter (or `0`) never closes a window opened under a longer one. `0` opens no new windows. Wall-clock time: a leader whose clock is ahead closes windows early by that much |
+| `CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S` | `60` | seconds | the least time between two expiry runs of one policy root |
+| `CONSTELLATION_SNAPSCHED_MAX_DELETES` | `500` | snapshots | the most one root's expiry run deletes; the rest go in the next run |
+| `CONSTELLATION_SNAPSCHED_EXPIRE_BATCH` | `32` | snapshots, `1..256` | victims per delete batch; before each batch the leader renews `_snapsched` (a fenced renewal stops the run) and re-reads every victim (gone, held, re-owned → `skipped_reverify`). `1` renews and re-reads per victim |
+| `CONSTELLATION_SNAPSCHED_RESIGN_AFTER` | `3` | ticks, `0` = never | a leader whose snapshot batches cannot reach the root-lease holder over P2P for this many ticks in a row gives `_snapsched` back and stays out for one lease TTL, so a node that can reach the holder (the holder itself always can) leads instead |
 
 The `_snapsched` lease's TTL is `CONSTELLATION_LEASE_TTL_MS` (default
 60 s), raised to at least three ticks. `constellation snapshot sched status`
@@ -874,6 +888,14 @@ snapshot as `create_failed` on each tick, and catches up with one snapshot
 once per due root per tick, so a 90 s outage with one root and a 1 s tick
 reads about 90; when M8 exports these counters on `/metrics`, read the rate,
 not the value, as "ticks that could not create".
+
+`constellation snapshot policy rm <fs:path> --expire` deletes a root's
+unheld auto snapshots together with its policy, after confirming their
+count (`--yes` skips the question); without `--expire` they are kept,
+orphaned. `snapshot ls` shows, for each auto snapshot of an armed root,
+`KEPT BY` (`5m·1h·1d`, `last`, `grace`) and `EXPIRES` (`in 6d 23h`, `now`,
+`never`). Every deletion is recorded in the tick's `snapsched/journal/`
+object with its reason.
 
 ### FUSE and runtime threads
 

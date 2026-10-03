@@ -1026,7 +1026,34 @@ impl EngineControl {
             .map(snapshot_status)
             .collect();
         self.fill_sizes(&mut rows, sizes)?;
+        self.fill_retention(&mut rows);
         Ok(rows)
+    }
+
+    /// Plan 32 Step 5's `KEPT BY` / `EXPIRES` for the auto snapshots of
+    /// armed policy roots (`Scheduler::listing`: this replica's rows, the
+    /// policy text, and the grace state as last read). Best effort: a
+    /// listing never fails for it, the columns just stay empty.
+    fn fill_retention(&self, rows: &mut [api::SnapshotStatus]) {
+        if !rows.iter().any(|r| r.origin == "auto") {
+            return;
+        }
+        let sched = self.engine.snapsched().clone();
+        let listing =
+            tokio::task::block_in_place(|| self.rt.block_on(async move { sched.listing().await }));
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(error) => {
+                tracing::debug!(error = %format!("{error:#}"), "snapshot.list: no retention verdicts");
+                return;
+            }
+        };
+        for row in rows.iter_mut() {
+            if let Some(cell) = listing.get(&row.id) {
+                row.kept_by = Some(cell.kept_by.clone());
+                row.expires_unix_ms = cell.expires_unix_ms;
+            }
+        }
     }
 
     /// `snapshot.resolve`: plan 32 Step 5's selectors over this replica's
@@ -1193,7 +1220,8 @@ impl EngineControl {
                                 ),
                             })
                         }
-                        snapshot_batch::ItemResult::Refused { reason } => {
+                        snapshot_batch::ItemResult::Refused { reason }
+                        | snapshot_batch::ItemResult::Held { reason } => {
                             refused.push(api::SnapshotRefusal { id, reason })
                         }
                         other => refused.push(api::SnapshotRefusal {
@@ -1248,7 +1276,8 @@ impl EngineControl {
             snapshot_batch::ItemResult::NotFound => {
                 Err(format!("snapshot {path}@{name} does not exist"))
             }
-            snapshot_batch::ItemResult::Refused { reason } => Err(reason),
+            snapshot_batch::ItemResult::Refused { reason }
+            | snapshot_batch::ItemResult::Held { reason } => Err(reason),
             other => Err(format!("unexpected snapshot delete result {other:?}")),
         }
     }

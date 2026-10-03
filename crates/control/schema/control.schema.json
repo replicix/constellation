@@ -5844,17 +5844,20 @@
       "type": "object"
     },
     "SnapPolicyRemoveParams": {
-      "description": "`snapshot.policy.remove`: unbind the directory's policy. Its auto\nsnapshots become orphaned and are kept. `expire` (delete them with the\npolicy, confirmed by `confirm_expiring`) is refused until the\nscheduler's expiry step ships.",
+      "description": "`snapshot.policy.remove`: unbind the directory's policy. Without\n`expire` its auto snapshots become orphaned and are kept. With\n`expire`, its unheld auto snapshots are deleted together with the\npolicy (plan 32 Step 4.2), and the call writes only when\n`confirm_expiring` is exactly the count it would delete (the same\nguard as `set`); `dry_run` previews that count and writes nothing.",
       "properties": {
         "confirm_expiring": {
           "default": null,
-          "description": "Accepted and ignored until `expire` ships (plan 32 M4).",
           "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
             "null"
           ]
+        },
+        "dry_run": {
+          "default": false,
+          "type": "boolean"
         },
         "expire": {
           "default": false,
@@ -5866,6 +5869,56 @@
       },
       "required": [
         "path"
+      ],
+      "type": "object"
+    },
+    "SnapPolicyRemoved": {
+      "description": "`snapshot.policy.remove`'s answer. `root` is the directory as it is\nnow. `would_expire`/`would_expire_ids` are the root's unheld auto\nsnapshots (what `expire` deletes; 0 without `expire`), oldest first.\n`expired` are the ones deleted; `skipped` the ones that changed under\nthe call (held or gone meanwhile) and were kept; `error` is why the\ndeletion stopped early, if it did (the policy is removed regardless).\nAlso the `details` of the `conflict` refusal when `expire` was not\nconfirmed with the right count.",
+      "properties": {
+        "error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expired": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "root": {
+          "$ref": "#/$defs/SnapPolicyRoot"
+        },
+        "skipped": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SnapPolicySkipped"
+          },
+          "type": "array"
+        },
+        "would_expire": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "would_expire_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "written": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "root",
+        "would_expire",
+        "written"
       ],
       "type": "object"
     },
@@ -6000,6 +6053,22 @@
       "required": [
         "expr",
         "horizon_ms"
+      ],
+      "type": "object"
+    },
+    "SnapPolicySkipped": {
+      "description": "A snapshot `snapshot.policy.remove {expire}` kept after all, and why.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "reason"
       ],
       "type": "object"
     },
@@ -6179,7 +6248,7 @@
       "type": "object"
     },
     "SnapSchedRunParams": {
-      "description": "`snapshot.sched.run`: run one scheduler tick now, on this node.\nWithout `dry_run` it takes the `_snapsched` lease if it is free (a\ntick on a node another one leads is refused, with the reason) and\ncreates what is due; `dry_run` takes nothing and creates nothing, and\nreports what a tick would create from this node's replica.",
+      "description": "`snapshot.sched.run`: run one scheduler tick now, on this node.\nWithout `dry_run` it takes the `_snapsched` lease if it is free (a\ntick on a node another one leads is refused, with the reason), creates\nwhat is due and runs expiry for the roots due one (plan 32 Step 4);\n`dry_run` takes nothing, creates and deletes nothing, and reports what\na tick would create and expire from this node's replica.",
       "properties": {
         "dry_run": {
           "default": false,
@@ -6189,7 +6258,7 @@
       "type": "object"
     },
     "SnapSchedRunResult": {
-      "description": "What one `snapshot.sched.run` tick did. `refused`: why it did nothing\nat all (a refusal gate, another leader, the scheduler disabled here).\n`error`: the batch failed as a whole (the holder unreachable, S3\ndown); nothing was created and the next tick retries.",
+      "description": "What one `snapshot.sched.run` tick did. `refused`: why it did nothing\n(more) at all (a refusal gate, another leader, the scheduler disabled\nhere, fenced mid-run). `error`: the creation batch failed as a whole\n(the holder unreachable, S3 down; nothing was created), or the expiry\nrun stopped (the grace state unreadable or its CAS lost: nothing\ndeleted; a delete batch failed); the next tick retries.",
       "properties": {
         "dry_run": {
           "type": "boolean"
@@ -6227,7 +6296,7 @@
       "type": "object"
     },
     "SnapSchedRunRoot": {
-      "description": "One due root in a `snapshot.sched.run` result. `outcome` is\n`would_create` (dry run), `created`, `skipped_empty` (nothing under\nthe root changed since its newest snapshot), `already_exists` (the\nbucket's name was taken already — by an earlier leader, typically;\nsuccess), or `failed` (with `error`).",
+      "description": "One due root, or one snapshot the expiry run handled, in a\n`snapshot.sched.run` result. For a creation `outcome` is\n`would_create` (dry run), `created`, `skipped_empty` (nothing under\nthe root changed since its newest snapshot), `already_exists` (the\nbucket's name was taken already — by an earlier leader, typically;\nsuccess), or `failed` (with `error`). For expiry (`name` and `id` the\nsnapshot's) it is `would_expire` (dry run), `expired`, or\n`skipped_reverify` (with why in `error`: held or gone meanwhile).",
       "properties": {
         "error": {
           "default": null,
@@ -6887,6 +6956,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "expires_unix_ms": {
+          "description": "`EXPIRES`: when, if snapshots keep arriving on schedule, nothing\nkeeps it any more (Unix ms; a forecast for display, never an input\nto expiry). `null` when `kept_by` is, when a `*` tier keeps it\nforever, or when it is due now (`kept_by` empty). Always present.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "held": {
           "default": false,
           "description": "A retention hold: `snapshot.delete` refuses it without `force`,\nand plan 32's expiry never considers it.",
@@ -6902,6 +6979,16 @@
         },
         "id": {
           "type": "string"
+        },
+        "kept_by": {
+          "description": "Plan 32 Step 5's `KEPT BY`, for an unheld auto snapshot of an\n*armed* policy root (parseable, not paused, directory present): the\ntiers that keep it (`5m`, `1h`, …), then `last`; `[\"grace\"]` while\nonly a grace window after a policy change keeps it; empty when the\nnext expiry run deletes it. `null` for every other snapshot (manual,\nheld — see `held`/`held_by` —, orphaned, paused). Always present.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "lsize": {
           "default": null,
@@ -9660,7 +9747,7 @@
         "$ref": "#/$defs/SnapPolicyRemoveParams"
       },
       "result": {
-        "$ref": "#/$defs/SnapPolicyRoot"
+        "$ref": "#/$defs/SnapPolicyRemoved"
       },
       "streaming": "none"
     },

@@ -343,12 +343,13 @@ async function removePolicy(ino,expire){
   showMsg(r.error?`remove ${path}: ${errText(r.error)}`:"");load();return;
  }
  // The count the daemon checks `confirm_expiring` against is the root's
- // auto-snapshot count as policy.list reported it (held ones are never
- // expired, whatever the count says).
- const n=r0.auto_snapshots;
- if(!confirm(`Remove the snapshot policy of ${path} AND delete its ${n} auto snapshots?\n\nHeld snapshots are kept. This cannot be undone.`))return;
+ // unheld auto snapshots, as its own dry run counts them now.
+ const pre=await call("snapshot.policy.remove",{path,expire:true,dry_run:true});
+ if(pre.error){showMsg(`remove --expire ${path}: ${errText(pre.error)}`);return;}
+ const n=pre.ok.would_expire;
+ if(!confirm(`Remove the snapshot policy of ${path} AND delete its ${n} unheld auto snapshots?\n\nHeld snapshots are kept. This cannot be undone.`))return;
  const r=await call("snapshot.policy.remove",{path,expire:true,confirm_expiring:n});
- showMsg(r.error?`remove --expire ${path}: ${errText(r.error)}`:"");load();
+ showMsg(r.error?`remove --expire ${path}: ${errText(r.error)}`:(r.ok.error?`remove --expire ${path}: ${r.ok.error}`:""));load();
 }
 
 // ---- policy editor shell (M6b fills it) -------------------------------------

@@ -320,7 +320,11 @@ fn set_guards_expiry_pause_round_trips_and_remove_orphans() {
     assert_eq!(ids.len(), 24);
     assert_eq!(ids[0], json!("a00"));
     assert!(!ids.contains(&json!("manual")));
-    assert!(delta["grace_note"].as_str().unwrap().contains("not active"));
+    // A first policy opens the grace window: nothing goes for a day.
+    assert_eq!(
+        delta["grace_note"],
+        json!("nothing is deleted for 24h; after that 24 snapshots expire")
+    );
 
     // Unconfirmed, or confirmed for another count: refused, nothing written.
     for extra in [json!({}), json!({"confirm_expiring": 23})] {
@@ -379,18 +383,12 @@ fn set_guards_expiry_pause_round_trips_and_remove_orphans() {
     assert_eq!(listed["roots"][0]["path"], json!("/projects"));
     assert_eq!(listed["roots"][0]["auto_snapshots"], json!(48));
 
-    // `remove {expire}` waits for M4; plain `remove` orphans and keeps.
-    let e = f
-        .call(
-            "snapshot.policy.remove",
-            json!({"path": "/projects", "expire": true, "confirm_expiring": 48}),
-        )
-        .unwrap_err();
-    assert_eq!(e.kind, ErrorKind::Unsupported, "{e:?}");
-    assert_eq!(f.policy("/projects").as_deref(), Some("1h:3d"));
+    // Plain `remove` orphans and keeps.
     let removed = f.ok("snapshot.policy.remove", json!({"path": "/projects"}));
-    assert_eq!(removed["orphaned"], json!(true));
-    assert_eq!(removed["expr"], json!(""));
+    assert_eq!(removed["written"], json!(true));
+    assert_eq!(removed["would_expire"], json!(0));
+    assert_eq!(removed["root"]["orphaned"], json!(true));
+    assert_eq!(removed["root"]["expr"], json!(""));
     assert_eq!(f.policy("/projects"), None);
     assert_eq!(meta.snapshots(None).unwrap().len(), 49, "nothing deleted");
     let listed = f.ok("snapshot.policy.list", json!({}));
@@ -410,6 +408,95 @@ fn set_guards_expiry_pause_round_trips_and_remove_orphans() {
     let shown = f.ok("snapshot.policy.show", json!({"path": "/projects"}));
     assert_eq!(shown["verdicts"], Value::Null);
     assert_eq!(shown["root"]["orphaned"], json!(true));
+}
+
+/// Plan 32 Step 4.2: `remove {expire}` deletes the root's unheld auto
+/// snapshots with the policy — previewed by `dry_run`, refused unless
+/// confirmed with exactly that count, never a held one (`csi:` included),
+/// never a manual one or another root's — and plain `remove` deletes
+/// nothing.
+#[test]
+fn remove_with_expire_deletes_the_roots_unheld_auto_snapshots() {
+    let f = Fixture::new();
+    let proj = f.mkdir("/proj");
+    let other = f.mkdir("/other");
+    let now = constellation_store_s3::lease::now_unix_ms();
+    let meta = f.engine.meta();
+    for h in 0..10 {
+        let id = format!("a{h:02}");
+        meta.record_snapshot(&SnapshotRow {
+            origin: 1,
+            policy_ino: proj,
+            ..SnapshotRow::new(
+                &id,
+                "/proj",
+                &id,
+                "mtree:0:00:1",
+                now - (10 - h) * 3_600_000,
+            )
+        })
+        .unwrap();
+    }
+    meta.record_snapshot(&SnapshotRow::new(
+        "manual",
+        "/proj",
+        "manual",
+        "mtree:0:00:1",
+        now,
+    ))
+    .unwrap();
+    meta.record_snapshot(&SnapshotRow {
+        origin: 1,
+        policy_ino: other,
+        ..SnapshotRow::new("theirs", "/proj", "theirs", "mtree:0:00:1", now)
+    })
+    .unwrap();
+    f.ok(
+        "snapshot.policy.set",
+        json!({"path": "/proj", "expr": "1h:1d"}),
+    );
+    f.ok(
+        "snapshot.hold",
+        json!({"id": "a00", "held": true, "by": "csi:content-uid"}),
+    );
+    f.ok("snapshot.hold", json!({"id": "a01", "held": true}));
+
+    let preview = f.ok(
+        "snapshot.policy.remove",
+        json!({"path": "/proj", "expire": true, "dry_run": true}),
+    );
+    assert_eq!(preview["would_expire"], json!(8), "{preview}");
+    assert_eq!(preview["written"], json!(false));
+    assert_eq!(preview["would_expire_ids"][0], json!("a02"));
+    assert_eq!(f.policy("/proj").as_deref(), Some("1h:1d"));
+    for extra in [json!({}), json!({"confirm_expiring": 10})] {
+        let mut p = json!({"path": "/proj", "expire": true});
+        p.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let e = f.call("snapshot.policy.remove", p).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Conflict, "{extra}: {e:?}");
+        assert_eq!(e.details.unwrap().0["would_expire"], json!(8));
+        assert_eq!(f.policy("/proj").as_deref(), Some("1h:1d"), "{extra}");
+    }
+    let removed = f.ok(
+        "snapshot.policy.remove",
+        json!({"path": "/proj", "expire": true, "confirm_expiring": 8}),
+    );
+    assert_eq!(removed["written"], json!(true), "{removed}");
+    assert_eq!(removed["expired"].as_array().unwrap().len(), 8, "{removed}");
+    assert_eq!(removed["error"], Value::Null, "{removed}");
+    assert_eq!(f.policy("/proj"), None);
+    let mut left: Vec<String> = meta
+        .snapshots(None)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    left.sort();
+    assert_eq!(left, ["a00", "a01", "manual", "theirs"]);
+    let status = f.ok("node.status", json!({}));
+    assert_eq!(status["snapsched"]["expired"], json!(8), "{status}");
 }
 
 #[test]

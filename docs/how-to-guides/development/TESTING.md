@@ -68,14 +68,16 @@ it over FUSE, and exercises: namespace ops (mkdir/rename/symlink),
 `snapshot policy check` (locally, an invalid expression's caret, and
 `--against` a `csi:`-held snapshot through the daemon), the `snapshot policy
 set/show/ls/pause/resume/rm` round trip on a directory (an invalid
-expression's caret, a file refused, `--dry-run` writing nothing, `rm`
-declined without `--yes`, `rm --expire` refused until M4) with the
+expression's caret, a file refused, `--dry-run` writing nothing, `rm` and
+`rm --expire` declined without `--yes`) with the
 scheduler driven by hand (plan 32 M3; the smoke daemon's periodic tick is
 an hour away: `snapshot sched status` shows `/dir` due with nobody leading,
 `sched run --dry-run` reports `would_create`, `sched run` creates the
-`auto-…` snapshot and leads, a second run has `nothing due`, and after
-`policy rm` the snapshot is listed as `auto (orphaned)` until it is deleted
-by hand) and `snapshot ls --orphaned`, multi-chunk files, partial in-place edits, truncate, append,
+`auto-…` snapshot and leads, a second run has `nothing due`, `snapshot ls`
+shows it `KEPT BY` `1h·1d, last` and `EXPIRES` `in …` (plan 32 M4a), after
+`policy rm` the snapshot is listed as `auto (orphaned)`, and once the policy
+is set again `policy rm --expire --yes` deletes it with the policy) and
+`snapshot ls --orphaned`, multi-chunk files, partial in-place edits, truncate, append,
 snapshot space accounting (plan 32 M5c: a 2 MiB file only one of three
 snapshots keeps; `snapshot space --verify` = 0 mismatches, `snapshot ls`'s
 `USED`/`WRITTEN` and footer, `-p -s used`, `snapshot delete --dry-run`'s
@@ -962,9 +964,15 @@ Plan 32 M3 (automatic snapshot creation) adds two scenarios
 `10s:1m 1m:4m; last=2` on `/proj` by `setxattr`, tick the scheduler every
 second (`CONSTELLATION_SNAPSCHED_TICK_MS=1000`), and run a seeded writer that
 renames a fresh counter value into `/proj/counter` every 0.8–1.2 s, so every
-10 s bucket has a change (`skip-empty` is on). Nothing is ever deleted (the
-auto set only grows); plan 32 M4 (expiry) extends both with retention
-assertions.
+10 s bucket has a change (`skip-empty` is on). Nothing is deleted: expiry
+(plan 32 M4a) runs, but `/proj` is a first sighting, which expires nothing
+for the default 24 h grace window, so the auto set only grows. `32-m4b`
+replaces the growth checks with the retention oracle (a short grace; the
+survivors equal `retention::evaluate` over the audit journal's creations).
+Expiry itself is covered by the in-process tests in
+`crates/engine/src/snapsched.rs` (steady state against `evaluate`, a hold
+racing the delete, grace, orphans, an unparseable policy, a fenced renewal,
+a lost `state.json` CAS, held `csi:` snapshots, an unreachable holder).
 
 - `snapsched-create`: two nodes with their own node keys. `b` creates the
   filesystem, holds the root lease and runs the writer; `a` binds the policy

@@ -20,12 +20,16 @@
 //!   `crate::snapsched`): its counters and per-root state, and one tick on
 //!   demand.
 //!
-//! Nothing here creates or deletes a snapshot itself; the scheduler (M3,
-//! through `sched.run` or its ticker) and expiry (M4) do. `set` therefore only *previews* what a policy would
-//! expire, and guards it server-side: an expiring change is written only
-//! when the caller confirms the exact count it was shown
-//! (`confirm_expiring`, Step 7.3), so a stale client cannot confirm a
-//! different delta.
+//! Nothing here creates a snapshot, and only `remove {expire}` deletes
+//! any — through the scheduler's own re-read and holder-side batch
+//! (`Scheduler::expire_removed`); the scheduler (through `sched.run` or
+//! its ticker) creates and expires. `set` therefore only *previews* what a
+//! policy would expire (and, in `grace_note`, when: Step 4.3's window),
+//! and guards it server-side: an expiring change is written only when the
+//! caller confirms the exact count it was shown (`confirm_expiring`, Step
+//! 7.3), so a stale client cannot confirm a different delta. `remove
+//! {expire}` has the same guard over the count of the root's unheld auto
+//! snapshots.
 //!
 //! Every number and verdict comes from `constellation_meta::snapsched`:
 //! the parse and the bound from [`SnapPolicy`], the verdicts from
@@ -57,6 +61,7 @@
 //! canonicalizes a verbatim expression.
 
 use super::{unary, ControlVfs, EngineControl};
+use crate::snapexpire;
 use constellation_control::methods::{
     SnapshotPolicyCheck, SnapshotPolicyList, SnapshotPolicyPause, SnapshotPolicyRemove,
     SnapshotPolicySet, SnapshotPolicyShow, SnapshotPolicySimulate, SnapshotSchedRun,
@@ -65,8 +70,8 @@ use constellation_control::methods::{
 use constellation_control::proto::types::{
     PolicyErrorInfo, SnapPolicyAgainst, SnapPolicyCheckParams, SnapPolicyCheckResult,
     SnapPolicyDelta, SnapPolicyListing, SnapPolicyPauseParams, SnapPolicyRemoveParams,
-    SnapPolicyRoot, SnapPolicySetParams, SnapPolicyShown, SnapPolicySimulateParams, SnapReason,
-    SnapTimeline, SnapVerdict,
+    SnapPolicyRemoved, SnapPolicyRoot, SnapPolicySetParams, SnapPolicyShown,
+    SnapPolicySimulateParams, SnapPolicySkipped, SnapReason, SnapTimeline, SnapVerdict,
 };
 use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_control::Router;
@@ -75,6 +80,7 @@ use constellation_meta::snapsched::{
     check, retention, SnapFacts, SnapPolicy, SNAPSHOT_POLICY_XATTR,
 };
 use constellation_meta::{Meta, MetaStore, SnapshotRow};
+use constellation_store_s3::snapsched::SnapSchedState;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -86,14 +92,22 @@ pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
         policy_simulate(&s.meta, &p, constellation_store_s3::lease::now_unix_ms())
     });
     unary::<SnapshotPolicyList>(r, svc, |s, _, _| policy_list(&s.meta));
-    unary::<SnapshotPolicyShow>(r, svc, |s, _, p| policy_show(&s.meta, &p.path));
+    unary::<SnapshotPolicyShow>(r, svc, |s, _, p| {
+        policy_show(&s.meta, &p.path, &display_grace(s))
+    });
     unary::<SnapshotPolicySet>(r, svc, |s, c, p| {
         let writer = Writer::new(s.browser(&c.principal)?);
-        policy_set(&s.meta, &writer, &p)
+        policy_set(&s.meta, &writer, &p, &display_grace(s))
     });
     unary::<SnapshotPolicyRemove>(r, svc, |s, c, p| {
         let writer = Writer::new(s.browser(&c.principal)?);
-        policy_remove(&s.meta, &writer, &p)
+        policy_remove(&s.meta, &writer, &p, |root, policy, victims| {
+            s.rt.block_on(
+                s.engine
+                    .snapsched()
+                    .expire_removed(root.ino, &root.path, policy, victims),
+            )
+        })
     });
     unary::<SnapshotPolicyPause>(r, svc, |s, c, p| {
         let writer = Writer::new(s.browser(&c.principal)?);
@@ -113,14 +127,125 @@ pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     });
 }
 
-/// What `expire` answers until the scheduler's expiry step (M4) exists.
-pub const REMOVE_EXPIRE_REFUSED: &str = "`expire` is not available yet: deleting a policy's \
-     snapshots ships with the scheduler's expiry step; remove the policy without it, and its \
-     auto snapshots are kept (orphaned)";
+/// The scheduler's grace as every display applies it
+/// (`Scheduler::display_grace`).
+fn display_grace(s: &EngineControl) -> snapexpire::GraceView {
+    let sched = s.engine.snapsched().clone();
+    tokio::task::block_in_place(|| s.rt.block_on(async move { sched.display_grace().await }))
+}
 
-/// `set`'s grace note until M4 replaces it with the real grace window.
-pub const GRACE_NOTE_INACTIVE: &str =
-    "nothing is deleted now: expiry is not active until the scheduler's expiry step ships";
+/// `set`'s grace note (plan 32 Step 5): when what the new policy would
+/// expire is actually deleted. A change of retention (or a root's first
+/// policy) opens Step 4.3's grace window when the scheduler sees it, so
+/// only what every policy in an open window expires as well goes before
+/// the windows close; an unchanged retention (a resume, a `skip-empty`
+/// flip) opens none, but a window already open (a first sighting, an
+/// earlier change) still holds. With the grace state known this is the
+/// scheduler's own computation: the projected state
+/// ([`snapexpire::GraceView`]) with this policy observed now, then
+/// [`snapexpire::graced`]; unknown, only the stored policy is compared.
+/// Counted over the root's snapshots now.
+fn grace_note(
+    policy: &SnapPolicy,
+    previous: Option<&str>,
+    root: &Root,
+    new: &[SnapVerdict],
+    grace: &snapexpire::GraceView,
+) -> String {
+    let n = new.iter().filter(|v| !v.keep).count();
+    if policy.paused {
+        return "paused: nothing expires while it is paused".to_string();
+    }
+    if n == 0 {
+        return "nothing expires now".to_string();
+    }
+    let old = previous.and_then(|p| SnapPolicy::parse(p).ok());
+    let unchanged = old.as_ref().is_some_and(|old| {
+        snapexpire::canonical_unpaused(old) == snapexpire::canonical_unpaused(policy)
+    });
+    let snapshots = |k: usize| {
+        if k == 1 {
+            "1 snapshot".to_string()
+        } else {
+            format!("{k} snapshots")
+        }
+    };
+    let facts: Vec<SnapFacts> = root.rows.iter().map(SnapFacts::from_row).collect();
+    // How many go at the next run, and when the last open window closes.
+    let (now_n, until) = match &grace.state {
+        Some(state) => {
+            let mut mine = SnapSchedState::default();
+            if let Some(entry) = state.roots.get(&root.ino) {
+                mine.roots.insert(root.ino, entry.clone());
+            }
+            let seen = [(root.ino, snapexpire::canonical_unpaused(policy))];
+            snapexpire::observe(&mut mine, &seen, grace.now, grace.grace_ms);
+            let g = snapexpire::graced(
+                policy,
+                root.ino,
+                &facts,
+                mine.roots.get(&root.ino),
+                grace.now,
+                grace.grace_ms,
+            );
+            (g.verdicts.iter().filter(|v| !v.keep).count(), g.grace_until)
+        }
+        None if unchanged || grace.grace_ms == 0 => (n, None),
+        None => {
+            // What the old policy expires too goes without waiting.
+            let both = old.as_ref().map_or(0, |old| {
+                retention::evaluate(old, root.ino, &facts)
+                    .iter()
+                    .zip(new)
+                    .filter(|(o, n)| !o.keep && !n.keep)
+                    .count()
+            });
+            (both, Some(grace.now.saturating_add(grace.grace_ms)))
+        }
+    };
+    let lead = if unchanged {
+        "the retention is unchanged: "
+    } else if grace.grace_ms == 0 {
+        "no grace window (CONSTELLATION_SNAPSCHED_GRACE_S=0): "
+    } else {
+        ""
+    };
+    let Some(until) = until else {
+        return format!(
+            "{lead}{} expire at the scheduler's next expiry run",
+            snapshots(n)
+        );
+    };
+    let window = human_remaining(until.saturating_sub(grace.now));
+    if now_n == 0 {
+        format!(
+            "{lead}nothing is deleted for {window}; after that {} expire",
+            snapshots(n)
+        )
+    } else {
+        format!(
+            "{lead}{} expire at the next expiry run (no open grace window keeps them); \
+             the other {} not before {window} from now",
+            snapshots(now_n),
+            n - now_n
+        )
+    }
+}
+
+/// A remaining time in ms for a person, rounded up to the minute past
+/// the first one: `24h`, `23h59m`, `5m`, `45s`.
+fn human_remaining(ms: i64) -> String {
+    let secs = u64::try_from(ms).unwrap_or(0).div_ceil(1000);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs.div_ceil(60);
+    match (mins / 60, mins % 60) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m}m"),
+    }
+}
 
 /// Writes a directory's policy xattr the way a `setxattr` would: through
 /// the View, as the calling principal, addressed to the inode that was
@@ -203,11 +328,28 @@ fn origin_name(origin: u8) -> String {
 /// directory's policy: every verdict, oldest first.
 fn against_of(policy: &SnapPolicy, root: &Root) -> SnapPolicyAgainst {
     let facts: Vec<SnapFacts> = root.rows.iter().map(SnapFacts::from_row).collect();
-    let verdicts = retention::evaluate(policy, root.ino, &facts);
+    against_from(root, &retention::evaluate(policy, root.ino, &facts))
+}
+
+/// [`against_of`] with the scheduler's grace applied
+/// ([`snapexpire::GraceView::verdicts`], the same computation as
+/// `snapshot.list`'s `KEPT BY`/`EXPIRES`): what the next expiry run
+/// deletes is `keep: false`, and a snapshot only a grace window keeps
+/// has the reason `grace`.
+fn against_graced(
+    policy: &SnapPolicy,
+    root: &Root,
+    grace: &snapexpire::GraceView,
+) -> SnapPolicyAgainst {
+    let facts: Vec<SnapFacts> = root.rows.iter().map(SnapFacts::from_row).collect();
+    against_from(root, &grace.verdicts(policy, root.ino, &facts).verdicts)
+}
+
+fn against_from(root: &Root, verdicts: &[retention::Verdict]) -> SnapPolicyAgainst {
     let verdicts: Vec<SnapVerdict> = root
         .rows
         .iter()
-        .zip(&verdicts)
+        .zip(verdicts)
         .map(|(row, v)| SnapVerdict {
             id: row.id.clone(),
             path: row.path.clone(),
@@ -350,7 +492,7 @@ fn current_path(meta: &Meta, ino: u64) -> Option<String> {
 fn root_status(meta: &Meta, ino: u64, expr: Option<&str>, rows: &[SnapshotRow]) -> SnapPolicyRoot {
     let auto_snapshots = rows
         .iter()
-        .filter(|r| r.origin == 1 && r.policy_ino == ino)
+        .filter(|r| is_auto(r) && r.policy_ino == ino)
         .count() as u32;
     let parsed = expr.map(SnapPolicy::parse);
     let (canonical, paused, error) = match &parsed {
@@ -391,7 +533,7 @@ pub(crate) fn policy_list(meta: &Meta) -> Result<SnapPolicyListing, ControlError
     let marked: BTreeSet<u64> = marked.iter().map(|(ino, _)| *ino).collect();
     let orphans: BTreeSet<u64> = rows
         .iter()
-        .filter(|r| r.origin == 1 && r.policy_ino != 0 && !marked.contains(&r.policy_ino))
+        .filter(|r| is_auto(r) && r.policy_ino != 0 && !marked.contains(&r.policy_ino))
         .map(|r| r.policy_ino)
         .collect();
     roots.extend(
@@ -402,8 +544,18 @@ pub(crate) fn policy_list(meta: &Meta) -> Result<SnapPolicyListing, ControlError
     Ok(SnapPolicyListing { roots })
 }
 
-/// `snapshot.policy.show`.
-pub(crate) fn policy_show(meta: &Meta, path: &str) -> Result<SnapPolicyShown, ControlError> {
+fn is_auto(row: &SnapshotRow) -> bool {
+    retention::Origin::from_u8(row.origin).is_auto()
+}
+
+/// `snapshot.policy.show`. The verdicts are grace-aware (`grace`, the
+/// scheduler's [`snapexpire::GraceView`]), so `show` and `snapshot ls`'s
+/// `KEPT BY`/`EXPIRES` agree on what the next expiry run deletes.
+pub(crate) fn policy_show(
+    meta: &Meta,
+    path: &str,
+    grace: &snapexpire::GraceView,
+) -> Result<SnapPolicyShown, ControlError> {
     let root = root_of(meta, path)?;
     let expr = stored_policy(meta, root.ino)?;
     let all = meta.snapshots(None).map_err(internal)?;
@@ -415,7 +567,7 @@ pub(crate) fn policy_show(meta: &Meta, path: &str) -> Result<SnapPolicyShown, Co
         )));
     }
     let verdicts = match expr.as_deref().map(SnapPolicy::parse) {
-        Some(Ok(policy)) => Some(against_of(&policy, &root)),
+        Some(Ok(policy)) => Some(against_graced(&policy, &root, grace)),
         _ => None,
     };
     Ok(SnapPolicyShown {
@@ -442,6 +594,7 @@ fn policy_set(
     meta: &Meta,
     writer: &Writer,
     p: &SnapPolicySetParams,
+    grace: &snapexpire::GraceView,
 ) -> Result<SnapPolicyDelta, ControlError> {
     let policy = SnapPolicy::parse(&p.expr).map_err(invalid_policy)?;
     let root = root_of(meta, &p.path)?;
@@ -464,10 +617,17 @@ fn policy_set(
             .filter(|v| !v.keep)
             .map(|v| v.id.clone())
             .collect(),
-        grace_note: GRACE_NOTE_INACTIVE.to_string(),
+        grace_note: String::new(),
         warnings: check::warnings(&policy),
         written: false,
     };
+    delta.grace_note = grace_note(
+        &policy,
+        delta.previous.as_deref(),
+        &root,
+        &against.verdicts,
+        grace,
+    );
     if p.dry_run {
         return Ok(delta);
     }
@@ -492,26 +652,86 @@ fn policy_set(
     Ok(delta)
 }
 
-/// `snapshot.policy.remove`. The root's auto snapshots stay, orphaned:
-/// removing a policy freezes its snapshots and never sweeps them.
+/// `snapshot.policy.remove`. Without `expire` the root's auto snapshots
+/// stay, orphaned: removing a policy freezes its snapshots and never
+/// sweeps them. With `expire` (Step 4.2's explicit way) its unheld auto
+/// snapshots — counted now, confirmed by `confirm_expiring` like `set`'s
+/// guard — are deleted after the policy is gone (so the scheduler takes
+/// no new one meanwhile), through `expire`: the scheduler's re-read and
+/// holder-side batch (`Scheduler::expire_removed`). A snapshot held or
+/// deleted between the count and its delete is kept / skipped, not an
+/// error.
 fn policy_remove(
     meta: &Meta,
     writer: &Writer,
     p: &SnapPolicyRemoveParams,
-) -> Result<SnapPolicyRoot, ControlError> {
-    if p.expire {
-        return Err(ControlError::unsupported(REMOVE_EXPIRE_REFUSED));
-    }
+    expire: impl FnOnce(&Root, &str, &[SnapshotRow]) -> crate::snapexpire::DeleteRun,
+) -> Result<SnapPolicyRemoved, ControlError> {
     let root = root_of(meta, &p.path)?;
-    if stored_policy(meta, root.ino)?.is_none() {
+    let Some(expr) = stored_policy(meta, root.ino)? else {
         return Err(ControlError::not_found(format!(
             "{}: no snapshot policy",
             root.path
         )));
+    };
+    let victims: Vec<SnapshotRow> = if p.expire {
+        root.rows
+            .iter()
+            .filter(|r| is_auto(r) && r.policy_ino == root.ino && !r.held)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let all = meta.snapshots(None).map_err(internal)?;
+    let mut removed = SnapPolicyRemoved {
+        root: root_status(meta, root.ino, Some(&expr), &all),
+        would_expire: victims.len() as u32,
+        would_expire_ids: victims.iter().map(|r| r.id.clone()).collect(),
+        ..Default::default()
+    };
+    if p.dry_run {
+        return Ok(removed);
+    }
+    if p.expire && removed.would_expire > 0 && p.confirm_expiring != Some(removed.would_expire) {
+        let asked = match p.confirm_expiring {
+            None => "no confirmation was given".to_string(),
+            Some(n) => format!("the confirmation was for {n}"),
+        };
+        return Err(ControlError::new(
+            ErrorKind::Conflict,
+            format!(
+                "{}: removing the policy with expire deletes {} snapshot(s) and {asked}; \
+                 review and confirm exactly {}",
+                root.path, removed.would_expire, removed.would_expire
+            ),
+        )
+        .with_details(serde_json::to_value(&removed).unwrap_or_default())
+        .with_remediation(format!("pass confirm_expiring = {}", removed.would_expire)));
     }
     writer.remove(&root)?;
+    removed.written = true;
+    if !victims.is_empty() {
+        let policy = SnapPolicy::parse(&expr)
+            .map(|q| q.to_string())
+            .unwrap_or(expr.clone());
+        let run = expire(&root, &policy, &victims);
+        removed.expired = run.deleted.iter().map(|r| r.id.clone()).collect();
+        removed.skipped = run
+            .skipped
+            .iter()
+            .map(|(r, why)| SnapPolicySkipped {
+                id: r.id.clone(),
+                reason: why.clone(),
+            })
+            .collect();
+        removed.error = run
+            .error
+            .or_else(|| run.fenced.then(|| "the deletion was fenced".to_string()));
+    }
     let rows = meta.snapshots(None).map_err(internal)?;
-    Ok(root_status(meta, root.ino, None, &rows))
+    removed.root = root_status(meta, root.ino, None, &rows);
+    Ok(removed)
 }
 
 /// `snapshot.policy.pause`: the stored policy, re-parsed, with `paused`
@@ -848,9 +1068,80 @@ mod tests {
 
         // `show` refuses a directory with neither a policy nor autos.
         mkdir(&meta, "plain");
-        let e = policy_show(&meta, "/plain").unwrap_err();
+        let unknown = snapexpire::GraceView {
+            state: None,
+            now: NOW,
+            grace_ms: 24 * HOUR,
+        };
+        let e = policy_show(&meta, "/plain", &unknown).unwrap_err();
         assert_eq!(e.kind, ErrorKind::NotFound);
-        let shown = policy_show(&meta, "/bad").unwrap();
+        let shown = policy_show(&meta, "/bad", &unknown).unwrap();
         assert!(shown.verdicts.is_none() && shown.root.orphaned);
+    }
+
+    /// `show`'s verdicts, `snapshot.list`'s `KEPT BY` and `set`'s note
+    /// apply the same grace: inside a window they agree on what the next
+    /// run deletes (nothing during a first sighting), after it on
+    /// exactly what the policy expires.
+    #[test]
+    fn show_list_and_note_apply_the_same_grace() {
+        use constellation_meta::SetXattrMode;
+        let meta = Meta::open_in_memory().unwrap();
+        let proj = mkdir(&meta, "proj");
+        meta.set_xattr(proj, SNAPSHOT_POLICY_XATTR, b"1h:2h", SetXattrMode::Set)
+            .unwrap();
+        for h in 0..6 {
+            let id = format!("a{h}");
+            meta.record_snapshot(&auto(&id, "/proj", NOW - (6 - h) * HOUR, proj))
+                .unwrap();
+        }
+        // First seen at NOW - 1h: its window is open until NOW + 23h.
+        let mut state = SnapSchedState::default();
+        let canonical = snapexpire::canonical_unpaused(&SnapPolicy::parse("1h:2h").unwrap());
+        snapexpire::observe(&mut state, &[(proj, canonical)], NOW - HOUR, 24 * HOUR);
+        let view = |now| snapexpire::GraceView {
+            state: Some(state.clone()),
+            now,
+            grace_ms: 24 * HOUR,
+        };
+        let agree = |now| {
+            let grace = view(now);
+            let shown = policy_show(&meta, "/proj", &grace).unwrap();
+            let listed = snapexpire::listing(&meta, &grace).unwrap();
+            let verdicts = shown.verdicts.unwrap().verdicts;
+            for v in &verdicts {
+                assert_eq!(listed[&v.id].kept_by.is_empty(), !v.keep, "{now}: {v:?}");
+            }
+            verdicts
+        };
+        let inside = agree(NOW);
+        assert!(inside.iter().all(|v| v.keep));
+        assert_eq!(inside[0].reasons[0].kind, "grace");
+        let after = agree(NOW + 23 * HOUR);
+        assert_eq!(after.iter().filter(|v| !v.keep).count(), 4);
+        // The note: the retention is unchanged, but the first sighting's
+        // window still holds everything back.
+        let root = root_of(&meta, "/proj").unwrap();
+        let policy = SnapPolicy::parse("1h:2h").unwrap();
+        let plain = against_of(&policy, &root);
+        let note = grace_note(&policy, Some("1h:2h"), &root, &plain.verdicts, &view(NOW));
+        assert_eq!(
+            note,
+            "the retention is unchanged: nothing is deleted for 23h; after that 4 snapshots \
+             expire"
+        );
+        let note = grace_note(
+            &policy,
+            Some("1h:2h"),
+            &root,
+            &plain.verdicts,
+            &view(NOW + 23 * HOUR),
+        );
+        assert_eq!(
+            note,
+            "the retention is unchanged: 4 snapshots expire at the scheduler's next expiry run"
+        );
+        assert_eq!(human_remaining(23 * HOUR - 1), "23h");
+        assert_eq!(human_remaining(23 * HOUR - 60_001), "22h59m");
     }
 }

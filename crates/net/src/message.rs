@@ -1004,6 +1004,9 @@ mod tests {
                 SnapshotItemResult::DeletedObjectRemains {
                     reason: "503".into(),
                 },
+                SnapshotItemResult::Held {
+                    reason: "held by csi:x".into(),
+                },
             ]),
         };
         assert_eq!(tag(&request), last_before + 1);
@@ -1040,9 +1043,13 @@ mod tests {
 
         let mut outcome = SnapshotBatchOutcome::Done(
             (0..MAX_SNAPSHOT_DELETES_PER_BATCH)
-                .map(|_| SnapshotItemResult::Refused {
+                .map(|i| {
                     // Multi-byte chars, so the clip must find a boundary.
-                    reason: "é/".repeat(4096),
+                    let reason = "é/".repeat(4096);
+                    match i % 2 {
+                        0 => SnapshotItemResult::Refused { reason },
+                        _ => SnapshotItemResult::Held { reason },
+                    }
                 })
                 .collect(),
         );
@@ -1051,7 +1058,9 @@ mod tests {
             unreachable!()
         };
         for result in results {
-            let SnapshotItemResult::Refused { reason } = result else {
+            let (SnapshotItemResult::Refused { reason } | SnapshotItemResult::Held { reason }) =
+                result
+            else {
                 unreachable!()
             };
             assert!(
@@ -1377,6 +1386,13 @@ pub enum SnapshotItemResult {
     DeletedObjectRemains {
         reason: String,
     },
+    /// A delete without `force` refused because the snapshot is held
+    /// (plan 32 Step 5); `reason` is the message for a person. Its own
+    /// variant so a caller (plan 32 Step 4's expiry, which counts a hold
+    /// that won the race rather than failing) never parses `reason`.
+    Held {
+        reason: String,
+    },
 }
 
 /// `constellation_meta::SnapshotRow` on the wire.
@@ -1430,7 +1446,8 @@ impl SnapshotBatchOutcome {
             Self::Done(results) => {
                 for result in results {
                     if let SnapshotItemResult::Refused { reason }
-                    | SnapshotItemResult::DeletedObjectRemains { reason } = result
+                    | SnapshotItemResult::DeletedObjectRemains { reason }
+                    | SnapshotItemResult::Held { reason } = result
                     {
                         clip_reason(reason);
                     }
