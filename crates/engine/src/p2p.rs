@@ -698,7 +698,7 @@ impl constellation_net::PeerService for P2pBridge {
         holder: u64,
         req_id: u64,
         epoch: u64,
-        config_version: u64,
+        (config_version, candidacy): (u64, u64),
         from: u64,
         txs: Vec<u8>,
         through: u64,
@@ -730,6 +730,7 @@ impl constellation_net::PeerService for P2pBridge {
                     holder,
                     epoch,
                     config_version,
+                    candidacy,
                     from,
                     txs,
                     through,
@@ -776,6 +777,19 @@ impl constellation_net::PeerService for P2pBridge {
             epoch,
             base,
             txs,
+        });
+    }
+
+    fn holder_alive(&self, holder: u64, epoch: u64, candidacy: u64, listed: bool) {
+        if crate::fault::p2p_denied(holder) {
+            return;
+        }
+        let _ = self.nudge.send(sync::SyncRequest::PeerHolderAlive {
+            holder,
+            epoch,
+            candidacy,
+            listed,
+            at_unix_ms: constellation_store_s3::lease::now_unix_ms(),
         });
     }
 

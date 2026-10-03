@@ -39336,3 +39336,333 @@ Open from this round:
 - kind (`tests/csi/k5-handoff.sh`) was not run again: two other
   agents' kind clusters (`kind-37-k5b`, `kind-37-k6b`) were up.
 
+## Fix: an overloaded node's core stalled for seconds; its backups sealed it, lock grants lapsed, forwards waited (`overload-cascade`)
+
+Found by the stress-ng-fs lane (bug A): three P2P nodes of one
+filesystem, 44 stress-ng filesystem stressors each
+(`stress-ng-fs-nodes`). The lease holder's core stalled 2–4 s per step,
+its backups sealed the live holder about 1.5 s in (also with
+`CONSTELLATION_BACKUP_TAKEOVER_MS=10000`), non-holders' lock grants
+lapsed (`EIO` under their locks), forwards waited out 120 s, and a
+non-holder's FUSE workers all ended up waiting.
+
+### Measurements (not guesses)
+
+- `perf record` (frame pointers, root: SELinux denies an unprivileged
+  `perf` here) of the whole harness run, on-CPU samples and
+  `sched:sched_switch` (off-CPU) stacks, aggregated per daemon for the
+  samples inside `Core::handle`:
+  - On CPU, 94% of `replay::apply_one` and of FUSE `setxattr` was two
+    range scans of one inode's spilled xattrs (`ns::all_xattrs`,
+    `ns::clear_spilled_xattrs`): `put_inode` rewrote the whole set on every
+    change, so stress-ng's `xattr` stressor (4096 names on one file) left
+    names × changes versions in the memtable, and each scan walked them.
+  - Off CPU, the holder's 2.1 s `DelegateStream` step had **one** on-CPU
+    sample: 82 s of the run's in-step time was blocked on fjall's
+    single-writer lock (`write_tx`), behind FUSE workers.
+- The slow-step line now names the peer message and S3 result
+  (`PeerMsg::kind`) and reports the step's store time
+  (`meta::PriorityStats`: writer-lock waits, count/total/max, and syncs).
+  With it: after the xattr fix, steps still waited 0.5–5.5 s on the lock
+  with each holder keeping it for milliseconds (a temporary holder
+  backtrace showed ordinary FUSE ops) — the mutex is unfair (a releasing
+  thread takes it back before a woken waiter runs). Unit-reproduced: eight
+  busy writers, a ninth waits median 0.85 s, worst 12.5 s.
+- With a fair lock, steps with zero lock wait still took seconds and one
+  core `sync` took 2.5 s: fjall's `Journal::persist` held the journal
+  writer lock (taken by every commit) across `fsync`.
+- After those, the remaining multi-second steps had no store wait at all:
+  `/proc/pressure/io` showed `some` 55–76%, `full` 40–46% (the host's disk
+  saturated by a dozen agents; load average 100–350). A 4 s
+  `SegmentPublished` step with no actions is the process waiting on the
+  disk. Liveness must therefore tolerate slow steps.
+- Why `CONSTELLATION_BACKUP_TAKEOVER_MS` did not govern it: the seals
+  were by that timer, but (1) the backup's own core was slow, and the
+  driver serves its internal channel (timers) before the request channel
+  (peer messages), so a due watch fired with the holder's appends queued
+  behind it; (2) a holder that dropped a backup ("no acknowledgement
+  progress" — often its own slow step, the acks queued) stopped
+  heartbeating it, and the ex-backup sealed the live holder (harmless to
+  the lease, but sealed for good); (3) delegations: a delegate whose
+  renewal came a second late had its generation sealed through its backup
+  (`DelegSeal`) — governed by the 5 s delegation TTL, not the backup one.
+- Why lock grants lapsed: a delegate caps its grants at what is left of
+  its delegation less the margin, and the holding node takes another
+  margin off: at the 5 s delegation TTL a lock in a delegated subtree
+  (every per-node stress-ng directory is one, by placement) was granted
+  with `ttl` 2.3–2.9 s (debug log) and honoured ~1.5–2 s.
+- Forward/FUSE waits: `fallocate` was the last op behind the
+  pre-forwarding write gate (`require_lease_for`): on a non-holder it
+  asked the holder for the root lease and, refused, waited up to 2×TTL
+  with a FUSE worker held (7 of 12 workers in "lease acquisition" on both
+  non-holders in one run).
+
+### Fix
+
+| item | where |
+|---|---|
+| A spilled xattr set is changed one name at a time when it stays spilled (only that key and the `0x01` record are written; the inline/spilled decision reads at most `XATTR_INLINE` bytes of the rest); local and replay paths | `meta::store::ns::put_spilled_xattr`; `store::writes::{set_xattr,remove_xattr}`; `replay::{apply_set_xattr,apply_remove_xattr}` |
+| fjall's single-writer lock is a `WriterLock` with a priority class; the authority core's step (`meta::priority_writes`, set by the driver around handle + refresh + dispatch) goes first; ordinary writers defer at most 50 ms, and an overdue one gets the next turn after a priority hold (no starvation) | `vendor/fjall/src/tx/single_writer/writer_lock.rs` (CONSTELLATION PATCH 3); `meta::store::gate`; `Driver::step` |
+| `Journal::persist` flushes under the journal lock and syncs a dup of the file outside it | `vendor/fjall/src/journal/{mod,writer}.rs` (CONSTELLATION PATCH 4) |
+| The holder's liveness off the core's step: a driver task sends `HolderAlive {epoch, candidacy, listed}` to its committed backups and candidate every backup heartbeat interval while the lease is unexpired and the driver loop has progressed within `CONSTELLATION_HOLDER_STALL_MS` (15 s); the backup counts it like an append, from its arrival (round 2: the task stops with `Driver::run`, "hung" is the loop's progress stamp, not step time) | `engine::authority_driver::{holder_alive_task, AliveTask, AliveBook, alive_tick}`; `net::Payload::HolderAlive` (appended last); `engine::p2p::holder_alive`; `Event::HolderAlive`, `Core::on_holder_alive` |
+| A backup the holder dropped is told so (`listed: false`, 10 s) and drops its role instead of sealing the live holder — only for the candidacy the dismissal names (round 2) | same; `PeerMsg::BackupAppend::candidacy`, `BackupPeer::candidacy`, `Core::backup_candidacies` |
+| The driver hands the core a timer that measures a peer's silence only after the requests queued before it fired, for at most 500 ms of them (round 2: proactive timers are never delayed) | `Driver::run`, `measures_silence`, `drain_queued` |
+| `CONSTELLATION_DELEGATION_TTL_MS` defaults to the lock TTL (at least 5 s): a delegate's lock grants get about the root's window; a dead delegate's subtree is reclaimed after `ttl + margin` (~21 s, was ~6 s) | `engine::authority_driver::load_config` |
+| `fallocate` no longer takes the root lease (main carries the same fix since 346374b; this diff keeps main's); `require_lease{,_for}` and `fsync_wait::sleep` removed (dead) | `view::write_gate`, `fsync_wait` |
+| Instrumentation kept: `PeerMsg::kind` on every step line, store waits/syncs on the slow-step line, and a report of a core job in progress ≥ 20 s with the log cursor not moving (`Core::job_detail`) | `authority::event`, `Driver::step`, `Driver::refresh` |
+
+Functions touched in the parallel chunks' areas: none in `core/locks.rs`,
+`meta/src/locks.rs`, `meta/store/held.rs` or `core/holder.rs`;
+`core/backup.rs` gains `on_holder_alive` and changes to the candidacy,
+dismissal and slow-backup paths (`backup_select`, `backup_timeouts`,
+append/dismiss handling).
+
+### Tests
+
+- `meta::store::gate::tests::{a_priority_scope_goes_ahead_of_busy_writers,
+  ordinary_writers_are_not_starved_by_a_busy_priority_scope}` (median 0.85 s
+  → under one 5 ms hold; verified failing with the priority disabled), and
+  the same two in `writer_lock.rs` (run with `cargo test --manifest-path
+  vendor/fjall/Cargo.toml writer_lock`).
+- `meta/tests/engine.rs::a_spilled_xattr_set_changed_one_name_at_a_time_stores_the_whole_set_rule`:
+  the stored rows equal the whole-set planner's, byte for byte, after every
+  step of a stress-ng-shaped sequence, locally and replayed.
+- `core::tests::epoch_rules::{a_slow_holder_that_still_beats_off_its_core_is_not_sealed,
+  a_backup_its_holder_dropped_stops_watching_instead_of_sealing}`: the
+  deterministic reproduction of the seal (5 s without an append, beats
+  every 300 ms, this node's own 2 s stall with the beats queued) and of the
+  dismissal. The authority simulation has no off-core heartbeat to model
+  (it runs no driver), so the slow-step reproduction is at the core level.
+
+### Gates (2026-10-03, this host, kernel 7.3.0-rc4; load average 100–350, disk I/O pressure `full` 40–46% from other agents throughout)
+
+- fmt clean; clippy `-D warnings` clean.
+- `cargo test --workspace` (split per crate, `ulimit -n 65536`): meta 298,
+  authority 299 (lib 184, sim 111 + 11 ignored, meta_repro 4, release),
+  engine 550, model 138 (release), all other crates 1098 — 0 failed.
+- `tests/smoke.sh`: passed. Release build: done.
+- Harness (private prefix, `TMPDIR=/var/tmp/oc/tmp`), every `backup-*`,
+  `lock-*`, `*failover*`, `git-under-flock*`: all 20 PASSED —
+  `lock-holder-killed-contention` failed once at load ~250 (the owner
+  outwaited live holders' recalls: 1.2–2.3 s steps with no store wait
+  against its 3 s lock TTL) and passed on the retry;
+  `git-under-flock-rounds` ran with `GIT_FLOCK_ROUNDS=1` and
+  `git-under-flock-b2b` with `GIT_FLOCK_SECS=60` (the full ones do not
+  fit a 10-minute tool call at this load): 0 overlapping turns, 0 fenced,
+  0 lost in both.
+- pjdfstest compliance: 8798 passed, 0 failed.
+- `stress-ng-fs-nodes` ×5 (the scenario from the stress-ng-fs chunk, run
+  from a copy; not part of this diff): **all five FAILED** the scenario,
+  each on non-holders' FUSE workers still waiting at stress-ng's deadline.
+  Per run (seals of a live holder / takeovers / lost grants / lapse
+  discards / forward timeouts): 0/0/0/6/0, 0/0/0/11/0, 1/1/0/7/9,
+  0/0/0/2/0, 0/0/0/7/0. Before the fix, in 7 runs on the same host: a
+  seal and a takeover of the live holder in most of them, lapses on both
+  non-holders, and the stuck FUSE connections.
+
+### What remains (explained, not fixed)
+
+- **The non-holders' FUSE workers still fill up under this host's disk
+  saturation.** Dumped status at the deadline: their replicas fall
+  behind the root's log (n1 at seq ~2000 of 13000; a round's chunk upload
+  or a tail GET to the starved floci container taking 20–45 s, reported by
+  the stuck-job line), and every forwarded or delegated op's reply waits
+  for a `deps` position the replica has not reached (`delegate parks an
+  op ... reaches=false`), or, once its generation was sealed, for a
+  segment. It is throughput, not a lost wakeup: the cursor keeps moving
+  (slowly). In one run the delegate never learned its generation had
+  ended because its replica stopped following the log (the root dropped
+  it as a log-stream subscriber twice, `why="gone"`, during its own 7 s
+  stalls); that path deserves its own investigation on a quiet host.
+- **The one seal (run 3)** happened while the holder's step waited 7.2 s
+  for the writer lock: the backup heard no `HolderAlive` for 5 s although
+  the step was under `CONSTELLATION_HOLDER_STALL_MS`. The beats left a
+  process whose runtime threads were themselves blocked on the saturated
+  disk, over the P2P connection that also carries the log stream; a
+  dedicated liveness thread and stream would remove the remaining
+  coupling.
+- **Lapse discards** (2–11 per node per run) are still seen at load
+  250–350: with the 20 s delegation TTL a grant is honoured ~17 s, so
+  these are renewals that did not complete within ~8 s — the same
+  starved-process steps. No `lock grant lost` in any run.
+- Run 5's holder had two `stress-ng-lockf` processes in a blocking
+  `setlk` for 230 s with no stall reported (stage `running`): the local
+  lock-wait path (`engine/locks.rs`, the lock-fence-token and stress-ng-fs
+  chunks' area), not investigated here.
+
+### Review round 2 (rebased on main `de53bd1`, 2026-10-03)
+
+Merge: conflicts resolved keeping both sides (`core/tests.rs`, main's
+`BackupHold` next to `HolderAlive` in `net::{endpoint,peers}`); main's
+`fallocate` kept. `heartbeats_never_shorten_a_backup_hold` covers the two
+together: beats from the replaced holder or its successor never shorten
+a `BackupHold`, and silence after it still seals.
+
+Review findings:
+
+- **Stale dismissal wiped a re-added backup's tail (must-fix 1).** Each
+  bring-up of a backup now has a candidacy (time-based, unique per holder
+  across restarts) carried in every `BackupAppend`; a backup applies a
+  dismissal only to the candidacy it is backing under, so one still in
+  flight after the node was brought up again is ignored, and one that
+  arrives before the new candidacy's first append is harmless (the holder
+  counts the new candidacy from zero). The holder stops dismissing a node
+  the moment it lists it again (`AliveBook`). Core test
+  `pipelined_appends::a_stale_dismissal_never_wipes_a_readded_backups_tail`
+  (append → re-add → stale dismissal → append: nothing discarded, acks
+  through the tip; then the current candidacy's dismissal does end it);
+  driver test `the_alive_book_dismisses_dropped_candidacies_until_reselected`.
+- **`Payload::HolderAlive` mid-enum (must-fix 2):** moved to the end; no
+  ALPN bump (maintainer rule).
+- **Timer drain (should-fix 1):** only timers that measure a peer's
+  silence are handled after the backlog that reached the node before they
+  fired — the seal watch, request/renewal timeouts, and an owner's grant
+  expiries (lock grant, delegation, read delegation: handling a queued
+  renewal first only makes the owner wait longer) — for at most 500 ms,
+  after which the timer goes back once behind what else is due.
+  `LockRenewTick`, `DelegRenew`, `BackupTick` and every other timer are
+  handled in turn. Test `only_silence_timers_wait_for_the_backlog_and_only_so_long`.
+- **Writer-lock holder (should-fix 2):** `GatedDb::write_tx` is
+  `#[track_caller]` and remembers the last writer (call site, thread,
+  since); a priority wait ≥ 100 ms logs the transaction it waited behind
+  and how long it held the lock, and the slow-step line carries the
+  longest one (`store_lock_wait_max_behind`). Test
+  `a_slow_priority_wait_names_the_transaction_ahead`. What holds it for
+  seconds — measured with vendored fjall change 5 (a commit's phases):
+  ordinary FUSE transactions (`unlink`, `setattr`, `mkdir`, …) whose
+  commit spends 1–11 s in the **memtable inserts**: each insert takes its
+  LSM tree's version-history lock, which a flush or compaction holds for
+  writing while `persist_version` fsyncs the new version file, the
+  directory and `current` (lsm-tree 3.1.10). Under this host's I/O
+  pressure that is seconds, with the single-writer lock held.
+- **`holder_alive_task` lifetime (should-fix 3):** an `AliveTask` guard
+  aborts it and forgets the targets when `run` returns or its task dies;
+  "hung" is the driver loop's progress stamp (set on every wake-up and
+  every step, cleared while it waits for work). A driver stuck that long
+  is also reported on non-holders, with its thread's backtrace under
+  `CONSTELLATION_FUSE_STALL_BACKTRACE=1`. Tests
+  `the_heartbeat_task_stops_with_the_driver_loop`,
+  `the_holder_heartbeat_stops_with_the_lease_and_a_stuck_driver`.
+- **Delegation TTL default (should-fix 4):** new scenario
+  `delegate-crash-default-ttl`: at the default 20 s grant TTL, the third
+  node's write into the dead delegate's subtree returned 19.8 s after the
+  kill (bounds: more than 5 s, less than ttl + 10 s). PASSED.
+- **Driver-side tests (should-fix 5):** the four tests above; the
+  bookkeeping and tick logic are pure functions (`AliveBook::update`,
+  `alive_tick`, `drain_queued`) so they test without a cluster.
+- Nits: `Journal::persist` logs the per-mode text and path again; the
+  20 ms medians are 100 ms (still 8× under the unfair mutex's 0.85 s);
+  `WriterLock` documents its 10 ms polling and the ordinary writers'
+  (upstream) unfairness; TESTING.md lists `cargo test --manifest-path
+  vendor/fjall/Cargo.toml --lib`, and `vendor/fjall/{Cargo.lock,target}`
+  are ignored. `vendor/ISSUE-fjall.md` gains the two upstream issues
+  (unfair single-writer lock; fsync under the journal lock), each with a
+  reproducer run against crates.io fjall 3.1.11 and the fix applied
+  through `[patch.crates-io]`, and a note on lsm-tree's version-history
+  lock.
+
+Mechanisms found with the rebased tree (must-fix 4):
+
+- **Candidate churn** (54/60/22 bring-ups per run in review): an append's
+  request waited only `backup_ack_timeout_ms` (1 s) for its answer and was
+  then abandoned (`PeerFailed`, resend), so every acknowledgement a loaded
+  backup gave more than a second late was thrown away, and the 1 s
+  progress rule dropped it. While a candidate comes up the holder has no
+  backup, so every acknowledgement waits for S3 — the 30–65 s forwards of
+  the review's run 1. Fix: the holder's heartbeat answers mark a backup
+  alive (`Event::BackupAlive`); a backup known alive and not answering
+  short is given `CONSTELLATION_BACKUP_SLOW_MAX_MS` (10 s) to make
+  progress, and an append waits that long for its answer. A dead or
+  cut-off backup (no heartbeat answer) or a stuck one (short answers)
+  still goes at 1 s. Core test
+  `a_slow_backup_known_alive_is_kept_until_the_slow_bound`. Bring-ups per
+  run fell to 1–18 (from 46 in this tree's first run).
+- **A delegate's core at 100% CPU** (non-holders frozen for minutes, 200
+  stalled FUSE requests, in 4 of the first 6 runs after the churn fix
+  raised the holder's throughput): `perf` (frame pointers, symbols) of a
+  whole run put 62% of all samples on one non-holder's core thread, 73%
+  of those in `Meta::delegate_tx_pending` from `Core::complete_ready`: a
+  delegate re-checks every parked acknowledgement on every event, each
+  check reading all of its journal's transaction heads (and walking the
+  memtable's tombstones). Fix: one read per `complete_ready`
+  (`Replica::delegate_txs_pending`, `Core::deleg_stream_durable_cached`).
+  The next profiled run had no stalled request at all.
+- **Seals of a live holder** (2 of the 5 gate runs, one takeover each):
+  the backup heard nothing for 1.5 s although the holder's driver was
+  nowhere near the 15 s stall bound. In both, the holder's *whole process*
+  logged nothing for 1.5–4 s and a commit there spent 1.8 s (g2) and
+  2.3 s (g6) in its memtable inserts: every metadata read and write of the process waits on
+  the version-history lock while a flush/compaction fsyncs (std's
+  `RwLock` blocks new readers behind a waiting writer), so tokio's workers
+  block in metadata calls and the heartbeat task does not run. Not fixed:
+  it needs lsm-tree to persist a version before taking the lock (all
+  eight `upgrade_version` callers), a storage-engine change for its own
+  chunk; recorded in `vendor/ISSUE-fjall.md`.
+- **Lost grants** (6–8 per affected run): debug logs show a non-holder
+  granting itself a lock as a delegate (`granted a lock node=2 to=2`),
+  then renewing it 7 s later at the root (`lock renewals answered from=1
+  … Lost`) while its generation was still live: `lock_route_for` resolves
+  the inode's owner by its location, and the route of a delegate-granted
+  lock moved to the root (most likely the file was unlinked or renamed
+  out while locked). Locks area (lock-fence-token / epoch-lock-grants);
+  reported, not changed here.
+- **Delegates falling silent** (g3, g5): the root saw no renewal from a
+  live delegate for ~20 s and reclaimed its generation; the delegate's
+  core was running (no stuck-driver report) and its ops parked on the
+  generation. The renewals did not reach the root; whether the P2P path
+  or the delegate side, the info-level logs do not say. Open.
+
+### Gates (round 2, 2026-10-03; load average 30–170)
+
+- fmt clean; clippy `-D warnings` clean.
+- `cargo test` split, `ulimit -n 65536`: small crates 998, meta 301,
+  authority (release, with sim) 307 (+13 ignored), engine + cli + harness
+  690 (+11 ignored), model (release) 138 — 0 failed. Vendored fjall
+  (`cargo test --manifest-path vendor/fjall/Cargo.toml --lib`) 72, 0
+  failed, no untracked files.
+- `tests/smoke.sh` passed; release build done.
+- pjdfstest compliance (image rebuilt from this tree): 8798 passed, 0
+  failed.
+- Harness, private prefix, `TMPDIR=/var/tmp/occ`: `backup-departs`,
+  `backup-failover`, `backup-failover-with-delegation`,
+  `backup-partition`, `backup-takeover-drops-held-chunks`,
+  `backup-takeover-holds-missing-chunks`, `ack-s3-failover`,
+  `root-failover-with-delegates`, `lock-failover`, `lock-fence-at-close`,
+  `lock-grant-dead-generation`, `lock-holder-killed-contention`,
+  `lock-holder-partitioned`, `lock-latency`, `delegate-crash`,
+  `delegate-crash-default-ttl`, `delegate-crash-backup`,
+  `delegated-subtrees`, `delegated-op-latency`: all PASSED.
+  `delegate-partition` failed once (b's tenth write inside the cut took
+  12.8 s, so "stopped" was measured at 13.1 s against an 8 s bound) and
+  passed 3 of 3 on rerun.
+- `stress-ng-fs-nodes` ×5 (final code but for the grant-expiry drain,
+  which only g6 has): **all five FAILED**.
+
+| run | load | live-holder seals / takeovers | lost grants | lapse discards (EIO) | stalled FUSE requests (n0/n1/n2) | bring-ups | candidate timeouts | max holder step |
+|---|---|---|---|---|---|---|---|---|
+| g2 | 48–104 | 1 / 1 | 0 | 5 | 39 / 0 / 95 | 1 (+4 on the new holder) | 0 (+2) | 1.5 s |
+| g3 | 131–173 | 0 / 0 | 0 | 9 | 0 / 48 / 48 | 10 | 7 | 1.2 s |
+| g4 | 145–154 | 0 / 0 | 0 | 3 | 0 / 189 / 190 | 18 | 16 | 4.8 s |
+| g5 | 72–111 | 0 / 0 | 0 | 1 | 0 / 192 / 192 | 10 | 7 | 3.9 s |
+| g6 | 46–100 | 1 / 1 | 0 | 6 | 74 / 189 / 0 | 2 (+5) | 0 (+2) | 2.5 s |
+
+  Two more runs of the same code under `perf`/debug logging (p3, b1):
+  0 seals, no stalled request in p3 (48 in b1), lost grants 15 and 6. No
+  forward timeouts in any run.
+
+**Coordinator note at merge (after the Fable re-review).** Merged as an
+improvement; the chunk's evidence gate is not met. "Lapse discards" (writes
+discarded with EIO because the node no longer held the lock grant) were
+non-zero in every run: brief item 3 (renewals that do not starve) is not
+met, and the 20 s delegation TTL is a stopgap that trades a ~6 s → ~21 s
+reclaim of a dead delegate's subtree for fewer lapses. The re-review's two
+runs saw 3 and 15. Open, moved to the follow-up chunk: a backup whose steps
+take seconds still runs its silence watch with the holder's beats queued
+behind the 500 ms drain budget (sealed a live holder at `silent_ms=21872`);
+stalls measured on a base without 5f289b4 (dentry-limited invalidations)
+must be re-measured; `backup-takeover-holds-missing-chunks` failed once
+(102.6 s, EIO on close) unexplained; candidate churn (same candidate every
+~13 s); `BackupAlive` answered off-core says nothing about a hung backup
+core; one outstanding beat per peer with a 5 s timeout; the lsm-tree
+version-lock freeze (`slow commit: 15433 ms`, memtables 14.7 s) is the
+largest remaining holder stall.

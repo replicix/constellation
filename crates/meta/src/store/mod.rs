@@ -99,6 +99,8 @@
 pub(crate) mod atime;
 pub mod backup;
 mod bootstrap;
+mod gate;
+pub use gate::{priority_writes, PriorityStats};
 pub mod held;
 pub mod inbox;
 pub(crate) mod journal;
@@ -479,7 +481,7 @@ fn ns_options() -> KeyspaceCreateOptions {
 
 /// fjall-backed [`crate::MetaStore`].
 pub struct Meta {
-    pub(crate) db: SingleWriterTxDatabase,
+    pub(crate) db: gate::GatedDb,
     pub(crate) ns: SingleWriterTxKeyspace,
     pub(crate) atime: SingleWriterTxKeyspace,
     pub(crate) orphans: SingleWriterTxKeyspace,
@@ -726,7 +728,9 @@ impl Meta {
     /// What a *durability* contract covers (a journal, a backup tail) is
     /// described in `docs/reference/features/durability-and-failover.md`.
     pub fn sync(&self) -> Result<(), MetaError> {
+        let started = std::time::Instant::now();
         self.db.persist(fjall::PersistMode::SyncAll)?;
+        gate::note_sync(started.elapsed());
         self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -796,7 +800,7 @@ impl Meta {
         let backup_tail = db.keyspace("backup_tail", KeyspaceCreateOptions::default)?;
 
         let meta = Meta {
-            db,
+            db: gate::GatedDb::new(db),
             ns,
             atime,
             orphans,

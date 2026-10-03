@@ -86,6 +86,18 @@ const TTL_MS: u64 = 20_000;
 /// dead or cut-off delegate is reclaimed within the scenario.
 const DELEG_TTL_MS: u64 = 3_000;
 
+/// The default grant TTL (`CONSTELLATION_DELEGATION_TTL_MS` unset): the
+/// lock grant TTL, 20 s (`load_config`).
+const DEFAULT_DELEG_TTL_MS: u64 = 20_000;
+
+/// What [`cluster`] returns.
+type Cluster = (
+    crate::s3env::S3Env,
+    tempfile::TempDir,
+    Vec<Client>,
+    Vec<CountingProxy>,
+);
+
 /// `names` nodes on a fresh filesystem with `extra` env on every mount;
 /// node 0 holds the lease, `f` exists everywhere. The first `counting`
 /// nodes reach S3 through a counting proxy each (returned in order).
@@ -94,16 +106,21 @@ pub(super) fn cluster(
     names: &[&str],
     extra: &[(&str, &str)],
     counting: usize,
-) -> Result<(
-    crate::s3env::S3Env,
-    tempfile::TempDir,
-    Vec<Client>,
-    Vec<CountingProxy>,
-)> {
+) -> Result<Cluster> {
+    cluster_with_deleg_ttl(scenario, names, extra, counting, Some(DELEG_TTL_MS))
+}
+
+/// [`cluster`] with the grant TTL `deleg_ttl_ms` (`None`: the default).
+fn cluster_with_deleg_ttl(
+    scenario: &str,
+    names: &[&str],
+    extra: &[(&str, &str)],
+    counting: usize,
+    deleg_ttl_ms: Option<u64>,
+) -> Result<Cluster> {
     let (env, root) = setup(scenario)?;
     let backend = format!("s3://{BUCKET}/{scenario}-{}", ts());
     let ttl = TTL_MS.to_string();
-    let deleg_ttl = DELEG_TTL_MS.to_string();
     let mut clients = Vec::new();
     let mut proxies = Vec::new();
     if counting > 0 {
@@ -122,7 +139,6 @@ pub(super) fn cluster(
             .with_env("CONSTELLATION_LEASE_TTL_MS", &ttl)
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
             .with_env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
-            .with_env("CONSTELLATION_DELEGATION_TTL_MS", &deleg_ttl)
             // Plan 30 §M12: the placement is on by default; these
             // scenarios delegate by hand and measure single-sequencer
             // phases, so it is pinned off (`auto-placement` and the M12
@@ -145,6 +161,9 @@ pub(super) fn cluster(
                 "CONSTELLATION_FAULT_P2P_DENY_FILE",
                 &deny_path(root.path(), name).display().to_string(),
             );
+        if let Some(ms) = deleg_ttl_ms {
+            c = c.with_env("CONSTELLATION_DELEGATION_TTL_MS", &ms.to_string());
+        }
         for (k, v) in extra {
             c = c.with_env(k, v);
         }
@@ -841,8 +860,28 @@ pub fn cross_subtree_rename(_seed: u64) -> Result<()> {
 /// remounts with its journal — its acknowledged-but-unstreamed writes
 /// replay by rid through the root — and converges.
 pub fn delegate_crash(_seed: u64) -> Result<()> {
-    const NAME: &str = "delegate-crash";
-    let (_env, _root, mut clients, _) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
+    delegate_crash_with("delegate-crash", None)
+}
+
+/// `delegate-crash` at the default grant TTL (the lock grant TTL, 20 s;
+/// overload-cascade raised it from 5 s): the dead delegate's subtree is
+/// reclaimed about `ttl + margin` after its last renewal — a third node's
+/// write into it waits that long, and no longer.
+pub fn delegate_crash_default_ttl(_seed: u64) -> Result<()> {
+    delegate_crash_with("delegate-crash-default-ttl", Some(DEFAULT_DELEG_TTL_MS))
+}
+
+/// `default_ttl`: run at the default grant TTL (this long) instead of
+/// the scenarios' short [`DELEG_TTL_MS`].
+fn delegate_crash_with(scenario: &'static str, default_ttl: Option<u64>) -> Result<()> {
+    let deleg_ttl = default_ttl.unwrap_or(DELEG_TTL_MS);
+    let (_env, _root, mut clients, _) = cluster_with_deleg_ttl(
+        scenario,
+        &["a", "b", "c"],
+        &[],
+        0,
+        default_ttl.is_none().then_some(DELEG_TTL_MS),
+    )?;
     let result = (|| -> Result<()> {
         let a = &clients[0];
         let b = &clients[1];
@@ -867,7 +906,7 @@ pub fn delegate_crash(_seed: u64) -> Result<()> {
         let a = &clients[0];
         let c = &clients[2];
         eprintln!(
-            "    {NAME}: b (gen {gen}) killed after {} acknowledged writes",
+            "    {scenario}: b (gen {gen}) killed after {} acknowledged writes",
             names_b.len() + 1
         );
         // c's write into d1: refused by the dead delegate, executed by the
@@ -877,11 +916,12 @@ pub fn delegate_crash(_seed: u64) -> Result<()> {
         write_timed(&c.mnt.join(&name), name.as_bytes()).context("c writing into d1")?;
         let c_took = t.elapsed();
         let da = deleg_of(a)?;
-        print_deleg(NAME, "a", &da);
+        print_deleg(scenario, "a", &da);
+        let after_kill = killed.elapsed();
         eprintln!(
-            "    {NAME}: c's first write into d1 after the crash returned after {c_took:?} \
-             ({:?} after the kill; grant TTL {DELEG_TTL_MS} ms); reclaimed {} recalls expired {}",
-            killed.elapsed(),
+            "    {scenario}: c's first write into d1 after the crash returned after {c_took:?} \
+             ({after_kill:?} after the kill; grant TTL {deleg_ttl} ms); reclaimed {} recalls \
+             expired {}",
             n(&da, "reclaimed"),
             n(&da, "recalls_expired")
         );
@@ -889,10 +929,25 @@ pub fn delegate_crash(_seed: u64) -> Result<()> {
             n(&da, "reclaimed") + n(&da, "recalls_expired") >= 1 && n(&da, "ended") >= 1,
             "the root never reclaimed the dead delegate's grant: {da}"
         );
-        anyhow::ensure!(
-            c_took < Duration::from_millis(3 * DELEG_TTL_MS + 5_000),
-            "c's write waited {c_took:?}"
-        );
+        if default_ttl.is_some() {
+            // Reclaimed after the grant's expiry (renewed well before it,
+            // so it had seconds left at the kill, more than the short
+            // TTL's whole life), within `ttl + margin` of the last
+            // renewal plus slack for a loaded host.
+            anyhow::ensure!(
+                after_kill > Duration::from_millis(DELEG_TTL_MS + 2_000),
+                "reclaimed {after_kill:?} after the kill: the default TTL is not in effect"
+            );
+            anyhow::ensure!(
+                c_took < Duration::from_millis(deleg_ttl + 10_000),
+                "c's write waited {c_took:?}"
+            );
+        } else {
+            anyhow::ensure!(
+                c_took < Duration::from_millis(3 * DELEG_TTL_MS + 5_000),
+                "c's write waited {c_took:?}"
+            );
+        }
         anyhow::ensure!(
             std::fs::read(a.mnt.join(&name))? == name.as_bytes(),
             "the root does not show c's write"
@@ -909,7 +964,7 @@ pub fn delegate_crash(_seed: u64) -> Result<()> {
             all_visible(x, &all, Duration::from_secs(60))?;
         }
         let db = deleg_of(b)?;
-        print_deleg(NAME, "b (remounted)", &db);
+        print_deleg(scenario, "b (remounted)", &db);
         anyhow::ensure!(
             db["mine"].as_array().is_some_and(|m| m.is_empty()),
             "the remounted delegate still holds a grant: {db}"
@@ -925,7 +980,7 @@ pub fn delegate_crash(_seed: u64) -> Result<()> {
         ensure_no_conflicts(&[a, b, c])?;
         Ok(())
     })();
-    dump_logs_on_failure(NAME, &clients, &result);
+    dump_logs_on_failure(scenario, &clients, &result);
     unmount_all(&mut clients);
     result
 }

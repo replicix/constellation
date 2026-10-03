@@ -4,17 +4,18 @@
 
 mod keyspace;
 mod write_tx;
+// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 3).
+mod writer_lock;
 
 use crate::{
     keyspace::KeyspaceKey, Config, Database, KeyspaceCreateOptions, PersistMode, Snapshot,
 };
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::{path::Path, sync::Arc};
 
 pub use keyspace::SingleWriterTxKeyspace;
 pub use write_tx::WriteTransaction;
+pub use writer_lock::set_write_priority;
+use writer_lock::WriterLock;
 
 pub trait Openable {
     fn open(config: Config) -> crate::Result<Self>
@@ -26,7 +27,8 @@ pub trait Openable {
 #[derive(Clone)]
 pub struct TxDatabase {
     pub(crate) inner: Database,
-    single_writer_lock: Arc<Mutex<()>>,
+    // CONSTELLATION PATCH: a `WriterLock`, upstream a `Mutex<()>`.
+    single_writer_lock: Arc<WriterLock>,
 }
 
 impl Openable for TxDatabase {
@@ -57,8 +59,7 @@ impl TxDatabase {
     #[must_use]
     #[expect(clippy::missing_panics_doc)]
     pub fn write_tx(&self) -> WriteTransaction<'_> {
-        #[expect(clippy::expect_used)]
-        let guard = self.single_writer_lock.lock().expect("poisoned tx lock");
+        let guard = self.single_writer_lock.lock();
 
         let mut write_tx = WriteTransaction::new(
             self.clone(),

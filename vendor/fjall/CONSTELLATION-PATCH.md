@@ -1,4 +1,4 @@
-# Vendored fjall 3.1.10: shutdown deadlock fix
+# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report
 
 This directory is fjall **3.1.10** exactly as published on crates.io
 (checksum `cd201c93…c33f`, upstream commit
@@ -10,7 +10,7 @@ and both texts stay here unchanged.
 
 ## What is changed
 
-There are two changes, both marked `CONSTELLATION PATCH`:
+There are five changes, each marked `CONSTELLATION PATCH`:
 
 1. **`src/db.rs`, `impl Drop for DatabaseInner`**: this is the fix. The
    worker shutdown loop never blocks now.
@@ -19,6 +19,16 @@ There are two changes, both marked `CONSTELLATION PATCH`:
    `--cap-lints allow` the way a registry crate is, so upstream's existing
    warnings (dead code, `unsafe_code`) would otherwise show up in every build
    of this workspace.
+3. **`src/tx/single_writer/writer_lock.rs` (new), `mod.rs`, `write_tx.rs`,
+   `lib.rs`**: the single-writer lock is a `WriterLock` with a priority
+   class (`fjall::set_write_priority`), not a `Mutex<()>`. See
+   [Change 3](#change-3-a-fair-writer-lock-with-a-priority-class).
+4. **`src/journal/mod.rs`, `src/journal/writer.rs`**: `Journal::persist`
+   syncs the journal file outside the journal writer's lock. See
+   [Change 4](#change-4-sync-outside-the-journal-lock).
+5. **`src/batch/mod.rs`, `src/batch/slow_commit.rs` (new)**: a commit that
+   takes 500 ms or more logs where the time went. See
+   [Change 5](#change-5-a-slow-commit-says-where-its-time-went).
 
 The directory is also listed in the workspace `exclude` list. That way it is
 built as a plain dependency, and `cargo clippy --workspace`, `cargo fmt --all`
@@ -126,6 +136,76 @@ them. The patch keeps all of this:
   messages, and the final drain throws it away.
 - Nothing about journal persistence, `Journal::drop` or recovery changes.
 
+## Change 3: a fair writer lock with a priority class
+
+Every write transaction of a `SingleWriterTxDatabase` takes one lock.
+Upstream it is a `std::sync::Mutex<()>`, which is not fair: a thread that
+releases it and asks again takes it back before a woken waiter runs.
+Constellation's metadata store has one writer that must not wait behind
+the others, the node's authority core (a step of it is the node's whole
+authority: replies to forwarded writes, lock grants and renewals,
+delegation and backup traffic), and a dozen FUSE workers writing back to
+back. Under `stress-ng-fs-nodes` the core waited seconds per transaction
+for a lock each holder kept for milliseconds. Reproduced in
+`crates/meta/src/store/gate.rs`'s test with eight busy writers: median
+0.85 s, worst 12.5 s for the would-be priority writer with the mutex;
+under one writer's hold (5 ms) with this lock.
+
+- A thread that called `set_write_priority(true)` is served before every
+  ordinary writer that is waiting.
+- An ordinary writer that has waited `DEFER_MAX` (50 ms) is overdue: when
+  the last holder was a priority writer, the lock goes to an overdue
+  writer before the next priority one. A priority writer that writes
+  continuously alternates with the others instead of starving them.
+- Every wait is bounded (10 ms re-checks), so a wakeup that went to a
+  waiter which could not take the lock is never the last one.
+- There is no new lock-order constraint: a priority writer waits only for
+  the current holder, as with the mutex.
+
+`writer_lock.rs` has two unit tests (`cargo test --manifest-path
+vendor/fjall/Cargo.toml --lib`, not run by the workspace; listed in
+`docs/how-to-guides/development/TESTING.md`);
+`crates/meta/src/store/gate.rs` tests the same through `Meta`.
+
+## Change 4: sync outside the journal lock
+
+Every commit appends to the journal under the journal writer's mutex.
+Upstream's `Journal::persist` (behind `Database::persist`, which
+Constellation calls for every `fsync` on a mount and for every write whose
+safety rests on being remembered) held that mutex across the file's
+`fsync`, so one thread's sync stalled every writer of the database for as
+long as the disk took: seconds on a busy disk, observed as a 2.5 s sync
+inside a core step. Now the buffer is flushed under the mutex and the
+file is synced through a duplicate of its descriptor
+(`Writer::flush_for_sync`) after the mutex is released. A sync covers
+everything flushed before it, which is everything committed before the
+call; writes appended meanwhile may or may not be included, as with any
+concurrent `fsync`. A journal rotated meanwhile was synced by the
+rotation itself. Errors are returned (and poison the database in
+`Database::persist`) as before.
+
+## Change 5: a slow commit says where its time went
+
+A write transaction holds the single-writer lock until its commit
+returns, so one slow commit stalls every writer of the database (and the
+authority core's priority, change 3, cannot help: it waits for the
+holder). `OwnedWriteBatch::commit` now times its phases — the journal
+lock, the journal append, the batch's own persist, the keyspace table's
+lock, the memtable inserts, the rotation and back-pressure checks — and a
+commit of 500 ms or more is logged at `warn` (`slow commit: … ms for N
+items (journal_lock=…ms memtables=…ms …)`). Nothing else changes.
+
+What it showed under `stress-ng-fs-nodes` (overload-cascade, 2026-10-03):
+commits of a few rows took up to 11.2 s, nearly all of it in the
+memtable inserts. An insert is lock-free in the memtable, but first takes
+its LSM tree's version-history lock (`RwLock::read`). A flush
+(`register_tables`) or a compaction holds that lock for writing while it
+persists the new version (`persist_version`: the version file's and the
+directory's fsyncs, then `rewrite_atomic` of `current`, more fsyncs), so
+under I/O pressure every insert into that keyspace waits for the disk,
+with the database's single-writer lock held. That is lsm-tree 3.1.10's
+design, not this patch's; see `../ISSUE-fjall.md`.
+
 ## Tests
 
 `crates/meta/tests/fjall_drop_deadlock.rs` opens a database with 4 workers,
@@ -159,3 +239,8 @@ Once upstream fixes this (see `../ISSUE-fjall.md`, the issue to file):
 If the fix is still needed when moving to a newer fjall before upstream has
 it, vendor that version instead and re-apply the `db.rs` hunk. The hunk is
 self-contained and only touches `impl Drop for DatabaseInner`.
+
+Changes 3, 4 and 5 have no upstream counterpart: dropping the vendored copy
+means re-applying them to the new version (or giving up the writer
+priority and the unlocked sync, which brings back the stalls described
+above).

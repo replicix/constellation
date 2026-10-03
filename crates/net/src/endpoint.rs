@@ -1279,7 +1279,7 @@ pub trait PeerService: Send + Sync + 'static {
         _holder: u64,
         req_id: u64,
         epoch: u64,
-        _config_version: u64,
+        _config_version_candidacy: (u64, u64),
         _from: u64,
         _txs: Vec<u8>,
         _through: u64,
@@ -1300,6 +1300,9 @@ pub trait PeerService: Send + Sync + 'static {
     /// own state dir; hold the seal watch (`Payload::BackupHold`).
     /// Default ignores it.
     fn backup_hold(&self, _holder: u64, _epoch: u64, _for_ms: u64) {}
+    /// The lease holder's off-core liveness heartbeat
+    /// ([`Payload::HolderAlive`]). Default ignores it.
+    fn holder_alive(&self, _holder: u64, _epoch: u64, _candidacy: u64, _listed: bool) {}
     /// Plan 30 §M14: a node asks this one, as the owning sequencer, for
     /// a lock grant. Default: busy (no lock service here).
     fn lock_requested(

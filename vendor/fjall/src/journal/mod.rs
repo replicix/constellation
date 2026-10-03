@@ -119,9 +119,31 @@ impl Journal {
     }
 
     /// Persists the journal.
+    ///
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 4): the buffer
+    /// is flushed under the writer lock, but the file is synced through a
+    /// duplicate of its descriptor after the lock is released. Upstream
+    /// held the lock across the `fsync`, and every commit takes it, so one
+    /// thread's sync stalled every writer of the database for as long as
+    /// the disk took (seconds on a busy one).
     pub fn persist(&self, mode: PersistMode) -> crate::Result<()> {
-        let mut journal_writer = self.get_writer()?;
-        journal_writer.persist(mode).map_err(Into::into)
+        let file = self.get_writer()?.flush_for_sync(mode)?;
+        let Some((file, path)) = file else {
+            return Ok(());
+        };
+        match mode {
+            PersistMode::SyncAll => file.sync_all().inspect_err(|e| {
+                log::error!("Failed to fsync journal file at {}: {e:?}", path.display());
+            }),
+            PersistMode::SyncData => file.sync_data().inspect_err(|e| {
+                log::error!(
+                    "Failed to fsyncdata journal file at {}: {e:?}",
+                    path.display(),
+                );
+            }),
+            PersistMode::Buffer => Ok(()),
+        }
+        .map_err(Into::into)
     }
 
     pub fn recover<P: AsRef<Path>>(

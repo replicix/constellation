@@ -104,7 +104,7 @@ use constellation_mtree::keys;
 use constellation_mtree::record::{InodeRecord, Payload};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::Ordering;
 
 /// A `journal_tx` value: one journaled transaction still in `journal`.
@@ -590,6 +590,19 @@ impl Meta {
         Ok(read_journal_tx_heads(&r, self)?
             .iter()
             .any(|(_, h)| h.gen == gen && h.idx == idx))
+    }
+
+    /// [`Self::delegate_tx_pending`] for every delegate transaction at
+    /// once: the `(gen, idx)` of each still in the journal. One read of
+    /// the journal heads, which a caller checking many parked
+    /// acknowledgements would otherwise do once per acknowledgement.
+    pub fn delegate_txs_pending(&self) -> Result<HashSet<(u64, u64)>, MetaError> {
+        let r = self.db.read_tx();
+        Ok(read_journal_tx_heads(&r, self)?
+            .into_iter()
+            .filter(|(_, h)| h.gen != 0)
+            .map(|(_, h)| (h.gen, h.idx))
+            .collect())
     }
 
     /// Plan 30 §M11: whether the unshipped journal holds any transaction

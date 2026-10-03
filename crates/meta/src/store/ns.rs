@@ -285,6 +285,83 @@ pub(crate) fn put_inode(
     Ok(planned.xattrs)
 }
 
+/// One xattr of a spilled set set (`Some`) or removed (`None`), when the
+/// set stays spilled: only that name's `0x03` key and the `0x01` record
+/// (whose `attrs` carry the new ctime) are written. Returns `false`, having
+/// written nothing, when the change could bring the set back inline; the
+/// caller then rewrites the whole set through [`put_inode`].
+///
+/// [`put_inode`] removes and re-inserts every name of a spilled set,
+/// which put every name's key in the memtable once more per change (and
+/// captured every before-image for speculation): each later range scan of
+/// the set walked names × changes versions. A file with a few thousand
+/// xattrs (stress-ng's `xattr` stressor) took seconds per `setxattr`,
+/// under the store's single writer lock that every metadata write of the
+/// node, the authority core's included, waits for. Whether the set stays
+/// spilled only needs [`record::XATTR_INLINE`] bytes of the rest of it,
+/// so the scan stops there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn put_spilled_xattr(
+    tx: &mut SingleWriterWriteTx,
+    ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
+    blobs: &SingleWriterTxKeyspace,
+    ino: Ino,
+    rec: &InodeRecord,
+    attrs: Attrs,
+    name: &str,
+    value: Option<&[u8]>,
+) -> Result<bool, MetaError> {
+    if !rec.xattrs_spilled {
+        return Ok(false);
+    }
+    // `record::xattr_section_len` of the set after the change, counted
+    // only until it is over the inline budget.
+    let mut len = 2 + value.map_or(0, |v| 4 + name.len() + v.len());
+    if len <= record::XATTR_INLINE {
+        let range = keys::xattrs_of(ino);
+        for guard in tx.range(ns, range.start().to_vec()..range.end().to_vec()) {
+            let (k, v) = guard.into_inner()?;
+            let keys::Key::Xattr { name: other, .. } = keys::Key::parse(&k)? else {
+                continue;
+            };
+            if other == name.as_bytes() {
+                continue;
+            }
+            len += 4
+                + other.len()
+                + match Payload::decode(&v)? {
+                    Payload::Inline(bytes) => bytes.len(),
+                    // Only a value over `VALUE_SPILL` is a blob.
+                    Payload::Spilled(_) => record::VALUE_SPILL + 1,
+                };
+            if len > record::XATTR_INLINE {
+                break;
+            }
+        }
+        if len <= record::XATTR_INLINE {
+            return Ok(false);
+        }
+    }
+    let key = keys::xattr(ino, name.as_bytes());
+    match value {
+        Some(value) => {
+            let (payload, blob) = record::place_value(value.to_vec(), Meta::hash_blob);
+            if let Some(blob) = blob {
+                Meta::put_blob(tx, blobs, blob);
+            }
+            ns_insert(tx, ns, dirty, key, payload.encode())?;
+        }
+        None => ns_remove(tx, ns, dirty, key)?,
+    }
+    // What `record::plan_inode` would build: the attrs are fixed-size, so
+    // the manifest and target placements it chose stand.
+    let mut record = rec.clone();
+    record.attrs = attrs;
+    put_inode_record(tx, ns, dirty, ino, &record)?;
+    Ok(true)
+}
+
 pub(crate) fn put_dentry(
     tx: &mut SingleWriterWriteTx,
     ns: &SingleWriterTxKeyspace,

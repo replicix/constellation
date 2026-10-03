@@ -310,22 +310,6 @@ pub(crate) fn recv<T>(
     }
 }
 
-/// `std::thread::sleep`, cut short inside a scope by the interrupt or
-/// the deadline (the wait that follows then notes it and ends).
-pub(crate) fn sleep(duration: Duration) {
-    if !in_scope() {
-        return std::thread::sleep(duration);
-    }
-    let until = Instant::now() + duration;
-    loop {
-        let now = Instant::now();
-        if now >= until || stop_reason().is_some() {
-            return;
-        }
-        std::thread::sleep((until - now).min(POLL));
-    }
-}
-
 /// Counters for `node.status.fsync` (see [`FsyncWaits::status`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FsyncWaitStatus {

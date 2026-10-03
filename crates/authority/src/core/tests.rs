@@ -5372,6 +5372,7 @@ mod epoch_rules {
                 epoch: 1,
                 holder: 1,
                 config_version: 2,
+                candidacy: 1,
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
@@ -5424,6 +5425,7 @@ mod epoch_rules {
                 epoch: 1,
                 holder: 1,
                 config_version: 2,
+                candidacy: 1,
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
@@ -5480,6 +5482,168 @@ mod epoch_rules {
         let out = h.step(Event::Timer { id: watch });
         answer_takeover_read(&mut h, &out);
         assert_eq!(h.core.bk.sealed, 1, "the hold outlived its cap");
+    }
+
+    /// This node backs holder 1 at epoch 1 (`config_version` 2); the
+    /// watch timer it armed.
+    fn backing(h: &mut Harness) -> TimerId {
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(7),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs: Vec::new(),
+                through: 0,
+            },
+        });
+        let watch = timers(&out, TimerKind::BackupWatch);
+        assert_eq!(watch.len(), 1, "the watch is armed: {out:?}");
+        watch[0]
+    }
+
+    fn alive(h: &mut Harness, candidacy: u64, listed: bool, at: Ms) -> Vec<Action> {
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 1,
+            candidacy,
+            listed,
+            at,
+        })
+    }
+
+    /// `stress-ng-fs-nodes`: the holder's core takes seconds over its
+    /// steps, so its own heartbeat appends stop; its driver's off-core
+    /// heartbeat keeps coming. The backup does not seal a live holder —
+    /// also when its own core got to a heartbeat late, after the watch
+    /// fired (silence counts from the arrival). Once the heartbeats stop
+    /// too (a dead process, a hung core), silence seals as before.
+    #[test]
+    fn a_slow_holder_that_still_beats_off_its_core_is_not_sealed() {
+        let mut h = Harness::new(2);
+        let mut watch = backing(&mut h);
+        // Five seconds without an append, a beat every 300 ms.
+        for _ in 0..17 {
+            h.advance(300);
+            let at = h.now;
+            alive(&mut h, 1, true, at);
+        }
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed a holder that beats");
+        assert!(s3_ops(&out).is_empty(), "read the lease: {out:?}");
+        watch = timers(&out, TimerKind::BackupWatch)[0];
+        // This node's own core stalled 2 s while the beats kept arriving
+        // and queued up. The driver hands a timer over after what was
+        // queued before it (`Driver::run`), and each beat is stamped with
+        // its arrival: the window counts from the last one.
+        let start = h.now;
+        h.advance(2_000);
+        for i in 1..=6 {
+            alive(&mut h, 1, true, start.plus(300 * i));
+        }
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed on this node's own stall");
+        watch = timers(&out, TimerKind::BackupWatch)[0];
+        // Beats from another holder or epoch are not this holder's.
+        h.advance(2_000);
+        let at = h.now;
+        h.step(Event::HolderAlive {
+            from: 3,
+            epoch: 1,
+            candidacy: 1,
+            listed: true,
+            at,
+        });
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 2,
+            candidacy: 1,
+            listed: true,
+            at,
+        });
+        let out = h.step(Event::Timer { id: watch });
+        assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
+        answer_takeover_read(&mut h, &out);
+        assert_eq!(h.core.bk.sealed, 1, "silence seals");
+    }
+
+    /// The holder dropped this backup (it made no acknowledgement
+    /// progress) and says so: the backup stops watching and discards its
+    /// tail, instead of sealing the live holder 1.5 s later. A dismissal
+    /// of another candidacy (an earlier bring-up, overtaken by this one)
+    /// is ignored.
+    #[test]
+    fn a_backup_its_holder_dropped_stops_watching_instead_of_sealing() {
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        let now = h.now;
+        alive(&mut h, 0, false, now);
+        alive(&mut h, 2, false, now);
+        assert!(
+            h.core.bk.role.is_some(),
+            "another candidacy's dismissal applied"
+        );
+        alive(&mut h, 1, false, now);
+        assert!(h.core.bk.role.is_none(), "still backing");
+        h.advance(5_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed the holder that dropped it");
+        assert!(s3_ops(&out).is_empty(), "read the lease: {out:?}");
+        assert!(timers(&out, TimerKind::BackupWatch).is_empty());
+        // Re-added later: an append makes it a backup again.
+        backing(&mut h);
+        assert!(h.core.bk.role.is_some());
+    }
+
+    /// Plan 37 §8's hold and the off-core heartbeat together: the
+    /// replaced holder's last beats (and the successor's first ones,
+    /// before its first append) never shorten a hold — silence inside it
+    /// neither seals nor reads the lease — and once the hold has passed,
+    /// beats keep a live successor unsealed while silence still seals.
+    #[test]
+    fn heartbeats_never_shorten_a_backup_hold() {
+        let mut h = Harness::new(2);
+        let mut watch = backing(&mut h);
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupHold {
+                epoch: 1,
+                for_ms: 10_000,
+            },
+        });
+        assert_eq!(h.core.stats.backup_holds, 1);
+        let hold_end = h.now.plus(10_000);
+        // Beats for a second, then nothing for the rest of the hold.
+        for _ in 0..3 {
+            h.advance(300);
+            let at = h.now;
+            alive(&mut h, 1, true, at);
+        }
+        assert_eq!(h.core.bk.last_heard, hold_end, "a beat shortened the hold");
+        h.advance(8_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed inside the hold");
+        assert!(s3_ops(&out).is_empty(), "read the lease: {out:?}");
+        watch = timers(&out, TimerKind::BackupWatch)[0];
+        // Past the hold, the successor beats (no append yet): not sealed.
+        h.advance(1_000);
+        for _ in 0..5 {
+            h.advance(300);
+            let at = h.now;
+            alive(&mut h, 1, true, at);
+        }
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed a beating successor");
+        watch = timers(&out, TimerKind::BackupWatch)[0];
+        // Then silence: sealed.
+        h.advance(2_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
+        answer_takeover_read(&mut h, &out);
+        assert_eq!(h.core.bk.sealed, 1, "silence after the hold seals");
     }
 }
 
@@ -5590,6 +5754,9 @@ mod pipelined_appends {
         h.core.ack.peers.insert(
             2,
             crate::core::backup::BackupPeer {
+                candidacy: 1,
+                alive_at: h.now,
+                short_since_progress: false,
                 acked: 0,
                 sent_through: 0,
                 inflight: Default::default(),
@@ -5725,6 +5892,7 @@ mod pipelined_appends {
                 epoch: 1,
                 holder: 1,
                 config_version: 2,
+                candidacy: 1,
                 from: 1,
                 txs: batch,
                 through: 0,
@@ -5791,6 +5959,80 @@ mod pipelined_appends {
         assert!(h.core.stats.backup_ack_timeouts >= 1);
     }
 
+    /// overload-cascade: a backup that answers the holder's heartbeat
+    /// (`Event::BackupAlive`) is alive, and a loaded one acknowledges
+    /// seconds late: it is not dropped at `backup_ack_timeout_ms`, only
+    /// once it has made no progress for `backup_slow_max_ms`. One that
+    /// stops answering the heartbeat (dead, cut off) goes at the ack
+    /// timeout as before, and so does one that answers appends short
+    /// (alive but stuck).
+    #[test]
+    fn a_slow_backup_known_alive_is_kept_until_the_slow_bound() {
+        let timeout = 1_000i64;
+        let slow_max = 10_000i64;
+        // Steps 50 ms at a time with `alive` answers until `until` ms have
+        // passed since the start or the candidate is gone; `true` if gone.
+        let run = |h: &mut Harness, until: i64, alive: bool| -> bool {
+            let started = h.now;
+            while h.core.ack.candidate.is_some() && h.now.since(started) < until {
+                h.advance(50);
+                if alive {
+                    let at = h.now;
+                    h.step(Event::BackupAlive { from: 2, at });
+                }
+                if let Some(id) = h.core.ack.tick_timer {
+                    h.step(Event::Timer { id });
+                }
+            }
+            h.core.ack.candidate.is_none()
+        };
+        // Alive, its append unanswered: kept past the ack timeout, then
+        // dropped at the slow bound.
+        let mut h = holder_with_candidate();
+        assert_eq!(h.core.cfg.backup_ack_timeout_ms as i64, timeout);
+        assert_eq!(h.core.cfg.backup_slow_max_ms as i64, slow_max);
+        journal(&h, "a", 1);
+        assert_eq!(appends(&journaled(&mut h, 900)).len(), 1);
+        let start = h.now;
+        assert!(
+            !run(&mut h, 5 * timeout, true),
+            "a live, slow backup was dropped"
+        );
+        assert!(run(&mut h, slow_max, true), "kept past the slow bound");
+        assert!(h.now.since(start) >= slow_max);
+        assert!(h.now.since(start) < slow_max + 500);
+        // Silent: dropped at the ack timeout, as before.
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        journaled(&mut h, 900);
+        let start = h.now;
+        assert!(run(&mut h, 4 * timeout, false));
+        assert!(h.now.since(start) < timeout + 500, "{}", h.now.since(start));
+        // Alive at first, then silent: the ack timeout counts from the
+        // last answer.
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        journaled(&mut h, 900);
+        let start = h.now;
+        assert!(!run(&mut h, 3 * timeout, true));
+        assert!(run(&mut h, 4 * timeout, false));
+        assert!(h.now.since(start) < 4 * timeout + 500);
+        // Alive but answering short: stuck, dropped at the ack timeout.
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        let first = appends(&journaled(&mut h, 900));
+        journal(&h, "b", 2);
+        let second = appends(&journaled(&mut h, 901));
+        // The later append comes back short (the first never landed).
+        let out = ack(&mut h, second[0].0, 0);
+        assert!(appends(&out).is_empty(), "{out:?}");
+        assert!(h.core.ack.peers[&2].short_since_progress);
+        let start = h.now;
+        assert!(run(&mut h, 4 * timeout, true), "a stuck backup was kept");
+        assert!(h.now.since(start) < timeout + 500);
+        let _ = first;
+    }
+
     /// The backup side: a batch that overtook an earlier one is
     /// persisted but acknowledged only once the gap closes, and the ack
     /// then names the whole contiguous hold.
@@ -5811,6 +6053,7 @@ mod pipelined_appends {
                     epoch: 1,
                     holder: 1,
                     config_version: 2,
+                    candidacy: 1,
                     from: tx.first,
                     txs: vec![tx.clone()],
                     through: 0,
@@ -5843,6 +6086,114 @@ mod pipelined_appends {
             "the gap closed: both"
         );
         assert_eq!(b.meta.backup_acked(1).unwrap(), txs[1].last);
+    }
+
+    /// overload-cascade review: a dismissal (`HolderAlive { listed:
+    /// false }`) applies to the candidacy it names only. The holder
+    /// dropped this node (candidacy 10) and brought it up again (20),
+    /// counting acknowledgements from the new candidacy; the dismissal
+    /// of 10, repeated for a while and still in flight, must not wipe the
+    /// tail those acknowledgements stand for — the node would be promoted
+    /// with an empty tail, and a takeover after the holder's crash would
+    /// lose acknowledged writes. The current candidacy's dismissal does
+    /// end the role, and one that comes before the next bring-up's first
+    /// append is harmless (the holder counts that one from zero).
+    #[test]
+    fn a_stale_dismissal_never_wipes_a_readded_backups_tail() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        journal(&holder, "a", 1);
+        journal(&holder, "b", 2);
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        assert_eq!(txs.len(), 2);
+        let tip = txs[1].last;
+        let mut b = Harness::new(2);
+        let append = |b: &mut Harness,
+                      req: u64,
+                      candidacy: u64,
+                      from: u64,
+                      txs: Vec<constellation_meta::BackupTx>| {
+            let out = b.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::BackupAppend {
+                    req: OpId(req),
+                    epoch: 1,
+                    holder: 1,
+                    config_version: 2,
+                    candidacy,
+                    from,
+                    txs,
+                    through: 0,
+                },
+            });
+            out.iter()
+                .find_map(|a| match a {
+                    Action::Send {
+                        msg:
+                            PeerMsg::BackupAck {
+                                req: r,
+                                acked,
+                                sealed,
+                                ..
+                            },
+                        ..
+                    } if *r == OpId(req) => Some((*acked, *sealed)),
+                    _ => None,
+                })
+                .expect("an ack")
+        };
+        let dismiss = |b: &mut Harness, candidacy: u64| {
+            let at = b.now;
+            b.step(Event::HolderAlive {
+                from: 1,
+                epoch: 1,
+                candidacy,
+                listed: false,
+                at,
+            })
+        };
+        assert_eq!(
+            append(&mut b, 1, 10, 1, vec![txs[0].clone()]),
+            (txs[0].last, false)
+        );
+        // Re-added: the new candidacy streams from the start.
+        assert_eq!(append(&mut b, 2, 20, 1, txs.clone()), (tip, false));
+        // The stale dismissal: nothing discarded.
+        dismiss(&mut b, 10);
+        assert!(
+            b.core.bk.role.is_some(),
+            "the stale dismissal ended the role"
+        );
+        assert_eq!(b.core.bk.acked, tip);
+        assert_eq!(b.meta.backup_acked(1).unwrap(), tip);
+        assert_eq!(
+            b.meta.backup_tail(1).unwrap().len(),
+            2,
+            "the tail was wiped"
+        );
+        assert_eq!(b.core.stats.backup_dismissals, 0);
+        // The next append (a heartbeat) is acknowledged through the tip.
+        assert_eq!(append(&mut b, 3, 20, tip + 1, Vec::new()), (tip, false));
+        // An earlier candidacy's append that arrives late does not make
+        // its dismissal current again.
+        assert_eq!(append(&mut b, 4, 10, tip + 1, Vec::new()), (tip, false));
+        dismiss(&mut b, 10);
+        assert!(b.core.bk.role.is_some());
+        // The current candidacy's dismissal ends the role.
+        dismiss(&mut b, 20);
+        assert!(b.core.bk.role.is_none());
+        assert!(b.meta.backup_tail(1).unwrap().is_empty());
+        assert_eq!(b.core.stats.backup_dismissals, 1);
+        // Repeated before the next bring-up's first append: nothing to
+        // end; the next candidacy is acknowledged what it streams.
+        dismiss(&mut b, 20);
+        assert_eq!(
+            append(&mut b, 5, 30, 1, vec![txs[0].clone()]),
+            (txs[0].last, false)
+        );
+        dismiss(&mut b, 20);
+        assert!(b.core.bk.role.is_some());
+        assert_eq!(b.core.stats.backup_dismissals, 1);
     }
 
     /// EC2 follow-up 3a: under very slow S3 the holder's lease can sit
@@ -7036,6 +7387,7 @@ mod backup_crash {
                 epoch: 1,
                 holder: 1,
                 config_version: 2,
+                candidacy: 1,
                 from: 1,
                 txs,
                 through: 0,
@@ -7170,6 +7522,7 @@ mod backup_crash {
                 epoch: 1,
                 holder: 1,
                 config_version: 2,
+                candidacy: 1,
                 from: 1,
                 txs,
                 through: 0,
@@ -13951,7 +14304,7 @@ fn answer_takeover_read(h: &mut Harness, out: &[Action]) -> Vec<Action> {
 /// append at the same epoch) is acknowledged.
 #[test]
 fn a_backup_its_live_holder_removed_does_not_seal_and_can_be_invited_back() {
-    let append = |req| Event::Peer {
+    let append = |req, candidacy| Event::Peer {
         from: 1,
         msg: PeerMsg::BackupAppend {
             req: OpId(req),
@@ -13961,10 +14314,11 @@ fn a_backup_its_live_holder_removed_does_not_seal_and_can_be_invited_back() {
             from: 1,
             txs: Vec::new(),
             through: 0,
+            candidacy,
         },
     };
     let mut h = Harness::new(2);
-    let out = h.step(append(7));
+    let out = h.step(append(7, 1));
     let watch = timers(&out, TimerKind::BackupWatch)[0];
     // The holder removed this node and stopped appending.
     h.advance(2_000);
@@ -13980,9 +14334,9 @@ fn a_backup_its_live_holder_removed_does_not_seal_and_can_be_invited_back() {
         "kept the role it was removed from"
     );
     assert!(h.core.job.is_none(), "took over a live holder's lease");
-    // The holder invites it back as a candidate, in the same epoch.
+    // The holder invites it back as a new candidate, in the same epoch.
     h.advance(3_000);
-    let out = h.step(append(8));
+    let out = h.step(append(8, 2));
     assert!(
         matches!(
             sends(&out).as_slice(),
@@ -14007,6 +14361,7 @@ fn a_holder_heard_while_the_lease_is_read_is_not_sealed() {
             from: 1,
             txs: Vec::new(),
             through: 0,
+            candidacy: 1,
         },
     };
     let mut h = Harness::new(2);
@@ -14039,6 +14394,7 @@ fn a_continuation_epoch_opened_during_the_takeover_read_blocks_the_seal() {
             from: 1,
             txs: Vec::new(),
             through: 0,
+            candidacy: 1,
         },
     });
     let watch = timers(&out, TimerKind::BackupWatch)[0];

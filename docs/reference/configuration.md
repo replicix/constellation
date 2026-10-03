@@ -404,7 +404,7 @@ Plan 30 M6–M8. See [Close-to-open modes](features/cto-modes.md).
 | `CONSTELLATION_CTO` | `bounded` | `bounded`, `strict` | default for `--cto`; the flag wins |
 | `CONSTELLATION_SLOW_OP_MS` | `2000` | milliseconds; `0` turns it off | a FUSE mutation or create, or a client op of the authority core, slower than this is logged at WARN (the core's line lists the states the op went through: forwarded, parked at a delegate, waiting for an acknowledgement, ...) |
 | `CONSTELLATION_FUSE_REQUEST_STALL_S` | `30` | seconds; `0` turns the monitor off | the FUSE request watchdog: every request a FUSE worker handles is registered with the wait it last noted (a write shard, the inode's operation lock, the session wait, a chunk fetch, a reply from the authority core, ...); one older than this is logged at WARN, again every further threshold, and once more when it completes; `status` reports them under `fuse_requests` (a blocking lock request is listed, never counted) |
-| `CONSTELLATION_FUSE_STALL_BACKTRACE` | unset | `1` | with the watchdog: the first report of a stalled request also writes the handling thread's backtrace to the daemon log (a diagnostic for a build with symbols) |
+| `CONSTELLATION_FUSE_STALL_BACKTRACE` | unset | `1` | with the watchdog: the first report of a stalled request also writes the handling thread's backtrace to the daemon log (a diagnostic for a build with symbols); so does the report of an authority driver that has made no progress for `CONSTELLATION_HOLDER_STALL_MS` (the driver's thread) |
 | `CONSTELLATION_SESSION_WAIT_MS` | `2000` | milliseconds; `0` disables the wait | how long a read waits for this node's replica to reach the position its client already observed (read-your-writes, monotonic reads). On timeout the read answers from the replica and is counted as degraded, never an error |
 | `CONSTELLATION_READ_INDEX_BUDGET_MS` | `2000` | milliseconds, at least 1 | how long a strict read waits for the sequencer's ReadIndex answer before it reads the replica anyway (degraded) |
 | `CONSTELLATION_READ_DELEGATIONS` | on | boolean | this node, as sequencer, grants read delegations to strict readers. Off: every strict read costs a round trip. Always off with P2P off |
@@ -429,9 +429,11 @@ Plan 30 M9. See [Durability and failover](features/durability-and-failover.md).
 | `CONSTELLATION_ACK` | unset | `local`, `s3` | default for `fs create --ack-policy`. A mount whose environment sets it to something other than the filesystem's policy logs a warning and uses the filesystem's |
 | `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | milliseconds; `0` accepted | a peer is a backup candidate only while its measured RTT to the holder is within this. `0` means never use a backup |
 | `CONSTELLATION_BACKUPS` | `1` | count; `0` accepted | the most backups a holder keeps. `0` means none |
-| `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | milliseconds; `0` means the default | a backup that makes no acknowledgement progress for this long is removed by a lease CAS before the holder acknowledges anything further |
+| `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | milliseconds; `0` means the default | a backup that makes no acknowledgement progress for this long is removed by a lease CAS before the holder acknowledges anything further — unless it answers the holder's liveness heartbeat and is not answering appends short: then only after `CONSTELLATION_BACKUP_SLOW_MAX_MS` |
+| `CONSTELLATION_BACKUP_SLOW_MAX_MS` | `10000` | milliseconds; at least the ack timeout | how long a backup known alive (a loaded node whose core acknowledges late) may go without acknowledgement progress before it is removed anyway; also how long an append waits for its answer |
 | `CONSTELLATION_BACKUP_TAKEOVER_MS` | `1500` | milliseconds; `0` means the default | holder silence after which a backup seals the epoch and takes the lease over (under `ack=s3`, any peer may). Liveness only: safety comes from the seal and the log-slot CAS |
-| `CONSTELLATION_BACKUP_HEARTBEAT_MS` | `300` | milliseconds, clamped to at most a third of the takeover time | the holder's heartbeat append to an idle backup |
+| `CONSTELLATION_BACKUP_HEARTBEAT_MS` | `300` | milliseconds, clamped to at most a third of the takeover time | the holder's heartbeat append to an idle backup, and the interval of its off-core liveness heartbeat (`HolderAlive`) |
+| `CONSTELLATION_HOLDER_STALL_MS` | `15000` | milliseconds | a holder whose authority driver has made no progress for this long (one core step, or anything else it does between waits for work) stops its off-core liveness heartbeat, so its backups seal it a takeover time later; that long is a hung authority, not a busy one |
 | `CONSTELLATION_PRE_S3_STREAMING` | on | boolean | stream backup-acknowledged transactions to log-stream subscribers before they reach S3; subscribers hold them as speculation. Only used while the lease has a backup. Always off with P2P off |
 
 ### Continuation epochs
@@ -457,7 +459,7 @@ means the default; for `_MIN_OPS`, `_DOMINANCE`, `_LEAVE` and `_SPLIT`,
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
 | `CONSTELLATION_DELEGATION` | on | boolean | this node delegates subtrees (as the root) and accepts delegations (as a delegate). Off, or P2P off: no `Delegate` record is ever written |
-| `CONSTELLATION_DELEGATION_TTL_MS` | `5000` | milliseconds | a delegation grant's lifetime, renewed at half of it |
+| `CONSTELLATION_DELEGATION_TTL_MS` | the lock TTL (`CONSTELLATION_LOCK_TTL_MS`, 20 s), at least `5000` | milliseconds | a delegation grant's lifetime, renewed at half of it (a quarter while it has lock grants out). Lock grants under a delegation never outlive it, so it bounds them; it is also how long a dead delegate's subtree waits to be reclaimed |
 | `CONSTELLATION_DELEGATION_PLACEMENT` | on | boolean | the root delegates dominated subtrees and splits hot shared directories by itself. Off keeps manual `delegate` only. Needs `CONSTELLATION_DELEGATION` |
 | `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | milliseconds | placement's sliding window of ops per directory and node |
 | `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | ops per window; `0` accepted | rate floor: a subtree (or, for a split, the directory itself) needs this many ops in the window. `0`: no floor |

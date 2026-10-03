@@ -344,6 +344,7 @@ pub enum SyncRequest {
         holder: u64,
         epoch: u64,
         config_version: u64,
+        candidacy: u64,
         from: u64,
         txs: Vec<constellation_meta::BackupTx>,
         through: u64,
@@ -370,6 +371,15 @@ pub enum SyncRequest {
         epoch: u64,
         base: u64,
         txs: Vec<constellation_meta::BackupTx>,
+    },
+    /// The lease holder's off-core liveness heartbeat, stamped with its
+    /// arrival (unix ms): `Event::HolderAlive`.
+    PeerHolderAlive {
+        holder: u64,
+        epoch: u64,
+        candidacy: u64,
+        listed: bool,
+        at_unix_ms: i64,
     },
     /// Plan 30 §M10: a would-be taker asks this node for a heartbeat
     /// promise; answered with `(until, epoch_slack)` (`until: None`:

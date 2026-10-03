@@ -2,13 +2,14 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
+use super::writer_lock::WriterGuard;
 use crate::{
     snapshot_nonce::SnapshotNonce,
     tx::{single_writer::keyspace::SingleWriterTxKeyspace, write_tx::BaseTransaction},
     Guard, Iter, Keyspace, PersistMode, Readable, SingleWriterTxDatabase,
 };
 use lsm_tree::{UserKey, UserValue};
-use std::{ops::RangeBounds, sync::MutexGuard};
+use std::ops::RangeBounds;
 
 /// A single-writer (serialized) cross-keyspace transaction
 ///
@@ -21,7 +22,7 @@ use std::{ops::RangeBounds, sync::MutexGuard};
 /// are not held somewhere forever.
 #[clippy::has_significant_drop]
 pub struct WriteTransaction<'a> {
-    _guard: MutexGuard<'a, ()>,
+    _guard: WriterGuard<'a>,
     inner: BaseTransaction,
 }
 
@@ -79,7 +80,7 @@ impl<'tx> WriteTransaction<'tx> {
     pub(crate) fn new(
         db: SingleWriterTxDatabase,
         nonce: SnapshotNonce,
-        guard: MutexGuard<'tx, ()>,
+        guard: WriterGuard<'tx>,
     ) -> Self {
         Self {
             _guard: guard,

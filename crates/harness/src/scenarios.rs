@@ -1220,6 +1220,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m11::delegate_crash,
     },
     Scenario {
+        name: "delegate-crash-default-ttl",
+        desc: "overload-cascade: delegate-crash at the default grant TTL (the lock grant TTL, 20 s): the root reclaims the dead delegate's subtree about ttl + margin after its last renewal, so a third node's write into d1 waits more than the short test TTL's whole life and less than ttl + 10 s; then the same recovery as delegate-crash",
+        requires: &[],
+        caps: &[],
+        run: m11::delegate_crash_default_ttl,
+    },
+    Scenario {
         name: "marker-order",
         desc: "plan 30 M11: three writers each write data into d1 (delegated to b) then a marker into d2 (delegated to c); three watchers list d2 continuously: no node ever shows a marker without its data (the marker's deps carry the data's stream position)",
         requires: &[],

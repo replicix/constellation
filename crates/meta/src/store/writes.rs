@@ -1853,39 +1853,51 @@ impl MetaStore for Meta {
             _ => {}
         }
         let t = now_ns();
-        let mut xattrs = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?;
-        if let Some(slot) = xattrs.iter_mut().find(|(n, _)| n == name) {
-            slot.1 = value.to_vec();
-        } else {
-            xattrs.push((name.to_string(), value.to_vec()));
-        }
         let mut attrs = rec.attrs;
         attrs.ctime_ns = t;
-        let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
-            .into_iter()
-            .map(|(n, v)| (n.into_bytes(), v))
-            .collect();
-        let manifest = rec
-            .manifest
-            .as_ref()
-            .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
-            .transpose()?;
-        let target = rec
-            .symlink_target
-            .as_ref()
-            .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
-            .transpose()?;
-        ns::put_inode(
+        if !ns::put_spilled_xattr(
             &mut tx,
             &self.ns,
             dirty,
             &self.blobs,
             ino,
+            &rec,
             attrs,
-            manifest,
-            target,
-            &xattr_pairs,
-        )?;
+            name,
+            Some(value),
+        )? {
+            let mut xattrs = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?;
+            if let Some(slot) = xattrs.iter_mut().find(|(n, _)| n == name) {
+                slot.1 = value.to_vec();
+            } else {
+                xattrs.push((name.to_string(), value.to_vec()));
+            }
+            let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
+                .into_iter()
+                .map(|(n, v)| (n.into_bytes(), v))
+                .collect();
+            let manifest = rec
+                .manifest
+                .as_ref()
+                .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
+                .transpose()?;
+            let target = rec
+                .symlink_target
+                .as_ref()
+                .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
+                .transpose()?;
+            ns::put_inode(
+                &mut tx,
+                &self.ns,
+                dirty,
+                &self.blobs,
+                ino,
+                attrs,
+                manifest,
+                target,
+                &xattr_pairs,
+            )?;
+        }
         misc::xattr_by_name_put_tx(&mut tx, &self.xattr_by_name, name, ino, value);
         journal::append_tx(
             &mut tx,
@@ -1916,35 +1928,47 @@ impl MetaStore for Meta {
             return Err(MetaError::NoData);
         }
         let t = now_ns();
-        let mut xattrs = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?;
-        xattrs.retain(|(n, _)| n != name);
         let mut attrs = rec.attrs;
         attrs.ctime_ns = t;
-        let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
-            .into_iter()
-            .map(|(n, v)| (n.into_bytes(), v))
-            .collect();
-        let manifest = rec
-            .manifest
-            .as_ref()
-            .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
-            .transpose()?;
-        let target = rec
-            .symlink_target
-            .as_ref()
-            .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
-            .transpose()?;
-        ns::put_inode(
+        if !ns::put_spilled_xattr(
             &mut tx,
             &self.ns,
             dirty,
             &self.blobs,
             ino,
+            &rec,
             attrs,
-            manifest,
-            target,
-            &xattr_pairs,
-        )?;
+            name,
+            None,
+        )? {
+            let mut xattrs = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?;
+            xattrs.retain(|(n, _)| n != name);
+            let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
+                .into_iter()
+                .map(|(n, v)| (n.into_bytes(), v))
+                .collect();
+            let manifest = rec
+                .manifest
+                .as_ref()
+                .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
+                .transpose()?;
+            let target = rec
+                .symlink_target
+                .as_ref()
+                .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
+                .transpose()?;
+            ns::put_inode(
+                &mut tx,
+                &self.ns,
+                dirty,
+                &self.blobs,
+                ino,
+                attrs,
+                manifest,
+                target,
+                &xattr_pairs,
+            )?;
+        }
         misc::xattr_by_name_del_tx(&mut tx, &self.xattr_by_name, name, ino);
         journal::append_tx(
             &mut tx,

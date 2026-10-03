@@ -1410,6 +1410,8 @@ impl Core {
         // past its lease; the acknowledgement it was parked for was
         // never released, and its client heard `EIO` at the deadline).
         let shipped = replica.journal_acked_seq().unwrap_or(0);
+        // The delegate's journal is read at most once for all of them.
+        let mut pending = None;
         let ready: Vec<u64> = self
             .rd
             .parked
@@ -1420,8 +1422,9 @@ impl Core {
                     && p.durable
                         .is_none_or(|j| j <= shipped || self.durable_covers(j))
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))
-                    && p.stream_need
-                        .is_none_or(|(g, i)| self.deleg_stream_durable(g, i, replica))
+                    && p.stream_need.is_none_or(|(g, i)| {
+                        self.deleg_stream_durable_cached(g, i, replica, &mut pending)
+                    })
             })
             .map(|(id, _)| *id)
             .collect();

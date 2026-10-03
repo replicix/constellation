@@ -270,8 +270,16 @@ pub struct Config {
     pub stream_ahead_holdoff_ms: u64,
     /// `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (default 1000): a backup
     /// that makes no acknowledgement progress for this long is removed by
-    /// a lease CAS before the holder acknowledges anything further.
+    /// a lease CAS before the holder acknowledges anything further —
+    /// unless it is known alive (`Event::BackupAlive` within this long)
+    /// and has not answered short meanwhile: then only after
+    /// `backup_slow_max_ms`.
     pub backup_ack_timeout_ms: u64,
+    /// `CONSTELLATION_BACKUP_SLOW_MAX_MS` (default 10000): how long a
+    /// backup known alive may go without acknowledgement progress (its
+    /// own authority core is slow: a loaded node) before it is removed
+    /// anyway; also how long an append waits for its answer.
+    pub backup_slow_max_ms: u64,
     /// `CONSTELLATION_BACKUP_TAKEOVER_MS` (default 1500): a backup that
     /// has not heard from its holder for this long seals the epoch and
     /// takes the lease over; under `ack=s3`, any peer does. Liveness
@@ -460,6 +468,7 @@ impl Config {
             backup_max_inflight: 8,
             stream_ahead_holdoff_ms: 5,
             backup_ack_timeout_ms: 1_000,
+            backup_slow_max_ms: 10_000,
             backup_takeover_ms: 1_500,
             backup_heartbeat_ms: 300,
             backup_stable_ms: 2_000,
@@ -855,6 +864,9 @@ pub struct Stats {
     /// Plan 37 §8: holds a holder replaced on its own state dir asked of
     /// this backup's seal watch (`PeerMsg::BackupHold`).
     pub backup_holds: u64,
+    /// Backup roles ended by the holder's dismissal
+    /// (`Event::HolderAlive { listed: false }`).
+    pub backup_dismissals: u64,
     pub backup_takeovers: u64,
     pub backup_tail_applied: u64,
     /// Any peer: fast takeovers of an `ack=s3` lease.
@@ -1377,6 +1389,12 @@ impl Core {
         self.job.as_ref().map(|j| j.kind())
     }
 
+    /// The job in progress, in full (its phase and what it waits for),
+    /// for the driver's stuck-job report.
+    pub fn job_detail(&self) -> Option<String> {
+        self.job.as_ref().map(|j| format!("{j:?}"))
+    }
+
     /// Client ops in flight (rid → phase), for tests.
     pub fn clients(&self) -> impl Iterator<Item = (Rid, ClientPhase)> + '_ {
         self.clients.iter().map(|(rid, op)| (*rid, op.phase_kind()))
@@ -1516,6 +1534,14 @@ impl Core {
                 }
             }
             Event::SubscriberGone { node, req } => self.on_subscriber_gone(node, req),
+            Event::HolderAlive {
+                from,
+                epoch,
+                candidacy,
+                listed,
+                at,
+            } => self.on_holder_alive(from, epoch, candidacy, listed, at, replica),
+            Event::BackupAlive { from, at } => self.on_backup_alive(from, at),
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
@@ -1630,6 +1656,7 @@ impl Core {
                 epoch,
                 holder,
                 config_version,
+                candidacy,
                 from: from_jseq,
                 txs,
                 through,
@@ -1637,7 +1664,7 @@ impl Core {
                 now,
                 from,
                 req,
-                (epoch, holder, config_version),
+                (epoch, holder, config_version, candidacy),
                 from_jseq,
                 txs,
                 through,

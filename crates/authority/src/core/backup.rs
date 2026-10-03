@@ -141,6 +141,14 @@ pub(crate) struct BackupPeer {
     /// Whether the last append was a resync (the backup's `acked` did not
     /// match ours: it restarted, or we did).
     pub committed: bool,
+    /// This bring-up of the backup (`PeerMsg::BackupAppend::candidacy`).
+    pub candidacy: u64,
+    /// When it was last known alive (`Event::BackupAlive`; its bring-up
+    /// counts).
+    pub alive_at: Ms,
+    /// It answered an append short since its last progress: it is
+    /// processing appends but stuck, whether alive or not.
+    pub short_since_progress: bool,
 }
 
 /// One pipelined append: its request, send time and the rows it carries.
@@ -234,6 +242,8 @@ pub(crate) struct AckState {
     /// _cas_lands` counterexample's sibling: removing a backup that holds
     /// acknowledged, unshipped rows).
     acked_hwm: u64,
+    /// The last candidacy handed out (`BackupPeer::candidacy`).
+    last_candidacy: u64,
 }
 
 /// This node as a backup, and as a pre-S3 stream subscriber.
@@ -285,6 +295,10 @@ pub(crate) struct BackupState {
     /// The lease read in flight is a restarted backup's probe (not
     /// sealed first): it seals and takes over only an expired lease.
     restart_probe: bool,
+    /// The holder's latest candidacy for `role` this node has had an
+    /// append of (0: none since this process started): a dismissal
+    /// naming another one is stale.
+    candidacy: u64,
 }
 
 /// How many early `StreamAhead` batches a subscriber keeps.
@@ -314,6 +328,19 @@ pub struct AckView {
 }
 
 impl Core {
+    /// The backups the holder's off-core heartbeat goes to: the committed
+    /// ones and the candidate, each with its candidacy (0: none known —
+    /// such a node is never dismissed).
+    pub fn backup_candidacies(&self) -> Vec<(NodeId, u64)> {
+        self.lease
+            .backups()
+            .iter()
+            .copied()
+            .chain(self.ack.candidate)
+            .map(|n| (n, self.ack.peers.get(&n).map_or(0, |p| p.candidacy)))
+            .collect()
+    }
+
     pub(crate) fn backup_view(&self) -> AckView {
         let policy = match self.lease.ack_policy() {
             _ if self.lease.held.is_none() => "-",
@@ -856,6 +883,10 @@ impl Core {
             "bringing up a backup"
         );
         self.ack.candidate = Some(n);
+        // Unique per holder across its restarts too (time-based), so a
+        // dismissal of an earlier bring-up never matches this one.
+        let candidacy = (now.0.max(0) as u64).max(self.ack.last_candidacy + 1);
+        self.ack.last_candidacy = candidacy;
         self.ack.peers.insert(
             n,
             BackupPeer {
@@ -865,6 +896,9 @@ impl Core {
                 last_sent: Ms(0),
                 last_progress: now,
                 committed: false,
+                candidacy,
+                alive_at: now,
+                short_since_progress: false,
             },
         );
     }
@@ -934,6 +968,7 @@ impl Core {
             let last = txs.last().map(|t| t.last);
             let req = self.op_id();
             let p = self.ack.peers.get_mut(&n).expect("present");
+            let candidacy = p.candidacy;
             if let Some(last) = last {
                 p.sent_through = p.sent_through.max(last);
             }
@@ -961,6 +996,7 @@ impl Core {
                     epoch: lease.epoch,
                     holder: self.cfg.node_id,
                     config_version: lease.config_version,
+                    candidacy,
                     from: start,
                     txs,
                     through,
@@ -991,15 +1027,32 @@ impl Core {
     }
 
     /// A backup that makes no progress for `backup_ack_timeout_ms` is
-    /// removed (a committed one by a lease CAS) or dropped (a candidate).
+    /// removed (a committed one by a lease CAS) or dropped (a candidate)
+    /// — unless it is known alive and not answering short: a loaded node
+    /// whose authority core takes seconds over a step acknowledges
+    /// seconds late, and dropping it for that (then bringing it, or the
+    /// other loaded peer, up again from scratch) left the holder with no
+    /// backup for most of `stress-ng-fs-nodes`: every acknowledgement
+    /// waited for S3. Such a backup is removed after
+    /// `backup_slow_max_ms` without progress; a dead or cut-off one stops
+    /// answering the heartbeat and goes after `backup_ack_timeout_ms` as
+    /// before.
     fn backup_timeouts(&mut self, now: Ms, _replica: &dyn Replica, _out: &mut Vec<Action>) {
         let timeout = self.cfg.backup_ack_timeout_ms as i64;
+        let slow_max = (self.cfg.backup_slow_max_ms as i64).max(timeout);
         let tip_behind = |p: &BackupPeer| !p.inflight.is_empty();
         let stale: Vec<NodeId> = self
             .ack
             .peers
             .iter()
-            .filter(|(_, p)| tip_behind(p) && now.since(p.last_progress) >= timeout)
+            .filter(|(_, p)| {
+                let silent = now.since(p.last_progress);
+                tip_behind(p)
+                    && silent >= timeout
+                    && (now.since(p.alive_at) >= timeout
+                        || p.short_since_progress
+                        || silent >= slow_max)
+            })
             .map(|(n, _)| *n)
             .collect();
         for n in stale {
@@ -1303,6 +1356,9 @@ impl Core {
         // rather than the two of them resending forever (round 2).
         if acked > p.acked || acked >= entry.last {
             p.last_progress = now;
+            p.short_since_progress = false;
+        } else {
+            p.short_since_progress = true;
         }
         tracing::trace!(
             node = self.cfg.node_id,
@@ -1336,6 +1392,14 @@ impl Core {
         }
         // `backup_after_event` streams the next batch and releases the
         // parked acknowledgements.
+    }
+
+    /// `Event::BackupAlive`: `from` answered the holder's heartbeat sent
+    /// at `at`.
+    pub(crate) fn on_backup_alive(&mut self, from: NodeId, at: Ms) {
+        if let Some(p) = self.ack.peers.get_mut(&from) {
+            p.alive_at = p.alive_at.max(at);
+        }
     }
 
     /// `Event::PeerFailed` for an append: the ack will not come; the
@@ -1600,7 +1664,7 @@ impl Core {
         now: Ms,
         from: NodeId,
         req: OpId,
-        (epoch, holder, config_version): (Epoch, NodeId, u64),
+        (epoch, holder, config_version, candidacy): (Epoch, NodeId, u64, u64),
         from_jseq: u64,
         txs: Vec<BackupTx>,
         through: u64,
@@ -1650,6 +1714,7 @@ impl Core {
                     replica.set_backup_role(role);
                     self.bk.role = Some(role);
                 }
+                self.bk.candidacy = self.bk.candidacy.max(candidacy);
             }
             Some(role) if role.epoch > epoch => {
                 reply(0, true, out);
@@ -1665,6 +1730,7 @@ impl Core {
                 self.bk.role = Some(role);
                 self.bk.acked = replica.backup_acked(epoch);
                 self.bk.held.clear();
+                self.bk.candidacy = candidacy;
             }
         }
         self.bk.last_heard = now;
@@ -1781,6 +1847,71 @@ impl Core {
             );
         }
         ok
+    }
+
+    /// The holder's off-core heartbeat: as good as an append for the seal
+    /// watch (silence counts from `at`, when it arrived, not from when
+    /// this core got to it). A holder whose authority core is slow — a
+    /// busy or overloaded node takes seconds over a step — sends no
+    /// appends meanwhile, and its backups used to take that for death and
+    /// seal it ~1.5 s in; the heartbeat comes from a task of its driver
+    /// that keeps beating while the core is responsive (no step longer
+    /// than `CONSTELLATION_HOLDER_STALL_MS`) and stops at the lease's
+    /// expiry, so a hung core or a dead process still gets sealed.
+    ///
+    /// `listed: false` is the holder saying it dropped this node's
+    /// `candidacy` from its backups (a candidate that timed out, a
+    /// committed backup reconfigured out): the role is dropped and the
+    /// tail discarded, as a takeover attempt would after reading the
+    /// lease, instead of sealing a live holder first. It applies only to
+    /// the candidacy this node is backing under (the latest one it had an
+    /// append of): a dismissal is repeated for a while, and one that
+    /// arrives after the node was brought up again — the holder counting
+    /// its acknowledgements from the new candidacy — must not wipe the
+    /// tail those acknowledgements stand for. A dismissal that comes
+    /// before the new candidacy's first append is harmless: the holder
+    /// counts that candidacy's acknowledgements from zero.
+    pub(crate) fn on_holder_alive(
+        &mut self,
+        from: NodeId,
+        epoch: Epoch,
+        candidacy: u64,
+        listed: bool,
+        at: Ms,
+        replica: &dyn Replica,
+    ) {
+        let Some(role) = self.bk.role else {
+            return;
+        };
+        if role.holder != from || role.epoch != epoch || self.bk.sealed >= epoch {
+            return;
+        }
+        if listed {
+            self.bk.last_heard = self.bk.last_heard.max(at);
+            self.bk.restarted = false;
+            return;
+        }
+        if candidacy == 0 || candidacy != self.bk.candidacy || self.bk.takeover_get.is_some() {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                holder = from,
+                epoch,
+                candidacy,
+                backing = self.bk.candidacy,
+                "a dismissal of another candidacy: ignored"
+            );
+            return;
+        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            holder = from,
+            epoch,
+            candidacy,
+            "the holder dropped this backup; discarding the backup tail"
+        );
+        self.stats.backup_dismissals += 1;
+        self.bk.candidacy = 0;
+        self.backup_role_ends(replica);
     }
 
     /// Rule (b): the epoch closed; a member backup resumes its watch with

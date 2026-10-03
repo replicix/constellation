@@ -480,12 +480,15 @@ pub enum Payload {
     /// `txs` is postcard of `Vec<constellation_meta::BackupTx>`; `from`
     /// is the journal seq the batch starts at (the seq after what the
     /// backup last acknowledged), `through` the holder's shipped-through
-    /// seq. Answered by [`Payload::BackupAck`].
+    /// seq. `candidacy` names the holder's bring-up of this backup (a
+    /// dismissal, [`Payload::HolderAlive`], applies to it only). Answered
+    /// by [`Payload::BackupAck`].
     BackupAppend {
         holder: u64,
         req_id: u64,
         epoch: u64,
         config_version: u64,
+        candidacy: u64,
         from: u64,
         txs: Vec<u8>,
         through: u64,
@@ -665,6 +668,25 @@ pub enum Payload {
         holder: u64,
         epoch: u64,
         for_ms: u64,
+    },
+    // ---- overload-cascade: the holder's off-core liveness (appended,
+    // as above) ----
+    /// The lease holder's liveness, sent to its backups every backup
+    /// heartbeat interval by a task of the holder's driver, off its
+    /// authority core's step: a slow step (a busy or overloaded node)
+    /// silences the core's own heartbeat appends, and a backup that took
+    /// that for death sealed a live holder. Sent only while the core is
+    /// responsive (no step running longer than
+    /// `CONSTELLATION_HOLDER_STALL_MS`) and the lease unexpired.
+    /// `listed: false` goes to a backup the holder dropped (its
+    /// `candidacy`, as in [`Payload::BackupAppend`]): it stops watching
+    /// instead of sealing a holder that dropped it. Answered with
+    /// [`Payload::Ok`].
+    HolderAlive {
+        holder: u64,
+        epoch: u64,
+        candidacy: u64,
+        listed: bool,
     },
 }
 

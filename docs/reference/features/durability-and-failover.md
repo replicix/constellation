@@ -195,7 +195,8 @@ had.
 
 The 1.5 s window does not adapt to S3 latency, and does not need to:
 nothing on the heartbeat path touches S3 (the backup channel is P2P
-only, the renewal is never starved by the ship loop), and backups are
+only, the renewal is never starved by the ship loop, the liveness
+heartbeat does not wait for the core at all), and backups are
 chosen within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (5 ms), so the window
 is several hundred times the link's RTT. Scaling it with the P2P RTT
 would change nothing inside the budget. A longer window would only delay
@@ -203,6 +204,59 @@ a genuine failover, and the seal is safe at any threshold, so there is
 nothing to gain in safety either. `slow-s3-no-seal` (1.5 s per S3
 request, three minutes of writes from every node) checks that no live
 holder is sealed.
+
+**What "heard" means: liveness off the core's step.** The holder's
+appends come from its authority core, and a core step can take seconds
+on an overloaded node (CPU, disk, and the metadata writes of a busy
+mount all queue in front of it): its backups used to take that for death
+and seal a live holder about 1.5 s in (`stress-ng-fs-nodes`, three nodes
+of 44 stress-ng stressors each). So, besides the appends, a task of the
+holder's driver sends each listed backup (and a candidate being brought
+up) a `HolderAlive` heartbeat every `CONSTELLATION_BACKUP_HEARTBEAT_MS`,
+off the core's step. It stops when the lease expires, when the driver
+stops, and when the driver loop has made no progress for
+`CONSTELLATION_HOLDER_STALL_MS` (15 s; a core step, or anything else the
+driver does between waits for work): that long is a hung authority, and
+its backups then seal it a takeover window later. A dead process or a
+cut link stops it at once, so a crash still fails over in about 1.5 s. A
+backup counts a heartbeat like an append, from the moment it **arrived**
+(the P2P bridge stamps it), not from when its own core got to it. And a
+driver hands its core a timer that measures a peer's silence (the seal
+watch, request and renewal timeouts) only after the peer messages that
+were queued before it fired — for at most 500 ms of them, after which the
+timer goes back once behind whatever else is due — so an observer's own
+slow step is never read as the peer's silence (a seal watch used to fire
+with the holder's heartbeats waiting in the queue). Every other timer (a
+renewal to send, the backup tick) is handled in turn, never behind the
+backlog.
+
+The heartbeat also tells the holder its backups are alive: a backup that
+answers it is a live process with a working link, whatever its own core
+is doing. Such a backup that is slow to acknowledge (a loaded node whose
+core takes seconds over a step) is kept for up to
+`CONSTELLATION_BACKUP_SLOW_MAX_MS` (10 s) without acknowledgement
+progress, and an append waits that long for its answer. Before, an
+append's answer was abandoned after `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS`
+(1 s) and the backup dropped for making no progress: under
+`stress-ng-fs-nodes` the holder dropped and re-added candidates every
+second or two and had no backup most of the time, so every
+acknowledgement waited for S3. A backup that does not answer the
+heartbeat (dead, cut off), or that answers appends short (alive but
+stuck), still goes after the ack timeout.
+
+A backup the holder dropped (a candidate that timed out, a committed
+backup reconfigured out) used to keep watching and seal the live holder
+1.5 s later, harmlessly but for good (a sealed node is never invited back
+for the epoch). The holder now keeps telling it for 10 s that it was
+dropped (`HolderAlive` with `listed: false`), and the backup drops its
+role and tail instead. The dismissal names the **candidacy** it ends:
+each bring-up of a backup gets a fresh one (time-based, so a restarted
+holder's never repeats), carried in every `BackupAppend`, and a backup
+applies a dismissal only to the candidacy it is backing under. A node
+dropped and brought up again within the 10 s is therefore never wiped by
+the old candidacy's dismissal still in flight — the holder counts the new
+candidacy's acknowledgements from zero, and those stand for the tail the
+backup holds now. A lost dismissal leaves the old behaviour.
 
 A backup that restarts with its role persisted does not count its own
 downtime as the holder's silence: silence counts from the moment its
@@ -783,9 +837,11 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 | `CONSTELLATION_ACK` | unset | default for `fs create --ack-policy` (a mount only warns when it disagrees with the filesystem) |
 | `CONSTELLATION_BACKUP_RTT_BUDGET_MS` | `5` | backup candidates' RTT limit; `0` disables backups |
 | `CONSTELLATION_BACKUPS` | `1` | most backups; `0` disables backups |
-| `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | a backup without progress this long is removed |
+| `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` | `1000` | a backup without progress this long is removed (one known alive: after the slow bound) |
+| `CONSTELLATION_BACKUP_SLOW_MAX_MS` | `10000` | a backup known alive without progress this long is removed anyway |
 | `CONSTELLATION_BACKUP_TAKEOVER_MS` | `1500` | holder silence before a seal (or an `ack=s3` takeover) |
-| `CONSTELLATION_BACKUP_HEARTBEAT_MS` | `300` | heartbeat append to an idle backup |
+| `CONSTELLATION_BACKUP_HEARTBEAT_MS` | `300` | heartbeat append to an idle backup; the off-core liveness heartbeat's interval |
+| `CONSTELLATION_HOLDER_STALL_MS` | `15000` | a driver without progress this long stops the off-core liveness heartbeat (a hung authority is sealed) |
 | `CONSTELLATION_PRE_S3_STREAMING` | on | stream backup-acknowledged transactions ahead of S3 |
 | `fs create --epoch-slack f`, `fs set epoch-slack TARGET f` | `0` | continuation epoch slack |
 | `CONSTELLATION_PROMISE_TTL_S` | lease TTL / 4 | promise lifetime |

@@ -267,6 +267,11 @@ pub trait Replica {
     /// Phase 2b (`ack=s3`): transaction `(gen, idx)` of this delegate's
     /// stream is still in its journal (no applied segment carries it).
     fn delegate_tx_pending(&self, gen: u64, idx: u64) -> bool;
+    /// Every `(gen, idx)` of this delegate's streams still in its journal,
+    /// in one read (`delegate_tx_pending` for many transactions at once);
+    /// `None` when it cannot be read (every transaction counts as
+    /// pending).
+    fn delegate_txs_pending(&self) -> Option<std::collections::HashSet<(u64, u64)>>;
     /// Phase 2b: a delegate's backup persists its transactions; returns
     /// the highest index through which every transaction is in the log
     /// as this replica holds it or held here, contiguously above that
@@ -891,6 +896,10 @@ impl Replica for Meta {
 
     fn delegate_tx_pending(&self, gen: u64, idx: u64) -> bool {
         Meta::delegate_tx_pending(self, gen, idx).unwrap_or(true)
+    }
+
+    fn delegate_txs_pending(&self) -> Option<std::collections::HashSet<(u64, u64)>> {
+        Meta::delegate_txs_pending(self).ok()
     }
 
     fn deleg_backup_append(&self, gen: u64, txs: &[DelegateTx]) -> u64 {

@@ -33,7 +33,7 @@ use constellation_authority::{
     Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, InboxView,
     LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, Ms, NodeId, OpId,
     PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
-    S3Result, ShipState, Stats, TimerKind, UploadResult,
+    S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult,
 };
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::locks::{Grant, GrantId};
@@ -129,15 +129,7 @@ pub struct CoreStatus {
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::Submit { .. } => "Submit",
-        Event::Peer { msg, .. } => match msg {
-            PeerMsg::MutateRequest { .. } => "Peer(MutateRequest)",
-            PeerMsg::MutateReply { .. } => "Peer(MutateReply)",
-            PeerMsg::SegmentPublished { .. } => "Peer(SegmentPublished)",
-            PeerMsg::LogSubscribe { .. } => "Peer(LogSubscribe)",
-            PeerMsg::LogStream { .. } => "Peer(LogStream)",
-            PeerMsg::LogStreamEnd { .. } => "Peer(LogStreamEnd)",
-            _ => "Peer",
-        },
+        Event::Peer { msg, .. } => msg.kind(),
         Event::PeerFailed { .. } => "PeerFailed",
         Event::Timer { .. } => "Timer",
         Event::UploadsDone { .. } => "UploadsDone",
@@ -151,6 +143,8 @@ fn event_kind(event: &Event) -> &'static str {
         Event::OwnS3 { .. } => "OwnS3",
         Event::Activity { .. } => "Activity",
         Event::SubscriberGone { .. } => "SubscriberGone",
+        Event::HolderAlive { .. } => "HolderAlive",
+        Event::BackupAlive { .. } => "BackupAlive",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::Journaled => "Control(Journaled)",
@@ -160,7 +154,14 @@ fn event_kind(event: &Event) -> &'static str {
             Control::Acquire => "Control(Acquire)",
             _ => "Control",
         },
-        Event::S3 { .. } => "S3",
+        Event::S3 { result, .. } => match result {
+            S3Result::LeaseGet(_) => "S3(LeaseGet)",
+            S3Result::LeasePut(_) => "S3(LeasePut)",
+            S3Result::SegmentPut(_) => "S3(SegmentPut)",
+            S3Result::SegmentRun(_) => "S3(SegmentRun)",
+            S3Result::SegmentGap(_) => "S3(SegmentGap)",
+            _ => "S3",
+        },
     }
 }
 
@@ -413,7 +414,17 @@ enum ControlReply {
 #[allow(clippy::large_enum_variant)]
 enum Internal {
     Event(Event),
-    Control { req: Control, reply: ControlReply },
+    Control {
+        req: Control,
+        reply: ControlReply,
+    },
+    /// A core timer fired (`deferred`: put back once behind the backlog,
+    /// [`measures_silence`]).
+    Timer {
+        id: TimerId,
+        kind: TimerKind,
+        deferred: bool,
+    },
 }
 
 /// Read the core's tunables from the environment (the `CONSTELLATION_*`
@@ -537,7 +548,20 @@ pub fn load_config(
                 .as_str(),
             "0" | "off" | "false"
         );
-    c.delegation_ttl_ms = env_ms("CONSTELLATION_DELEGATION_TTL_MS", c.delegation_ttl_ms);
+    // Default: the lock grant TTL (at least the core's 5 s, which a short
+    // test TTL must not shorten). A delegate's lock grants never outlive
+    // its delegation (they are capped at what is left of it, less the
+    // margin, and the holding node takes another margin off), so at the
+    // core's 5 s a lock in a delegated subtree was honoured for at most
+    // ~3 s and renewed every second or so: one slow step on a busy node
+    // and it lapsed under the application's lock (`EIO`), and a delegate
+    // whose renewal came a second late had its generation sealed and
+    // drained by the root (`stress-ng-fs-nodes`). The price is the
+    // reclaim of a dead delegate's subtree, after `ttl + margin`.
+    c.delegation_ttl_ms = env_ms(
+        "CONSTELLATION_DELEGATION_TTL_MS",
+        c.lock_ttl_ms.max(c.delegation_ttl_ms),
+    );
     // Plan 30 §M11 phase 2b: the placement's knobs.
     // Plan 30 §M12: on by default (a dominant writer's subtree moves to
     // it, a hot shared directory splits into hash ranges);
@@ -584,6 +608,8 @@ pub fn load_config(
         c.backup_ack_timeout_ms,
     )
     .max(1);
+    c.backup_slow_max_ms = env_ms("CONSTELLATION_BACKUP_SLOW_MAX_MS", c.backup_slow_max_ms)
+        .max(c.backup_ack_timeout_ms);
     c.backup_takeover_ms = env_ms("CONSTELLATION_BACKUP_TAKEOVER_MS", c.backup_takeover_ms).max(1);
     c.backup_heartbeat_ms = env_ms("CONSTELLATION_BACKUP_HEARTBEAT_MS", c.backup_heartbeat_ms)
         .max(1)
@@ -696,6 +722,332 @@ pub struct Driver {
     /// Plan 30 §M7: the background upload pass rounds share.
     bulk_pass: BulkPass,
     round_upload_wait: Duration,
+    /// Who the holder's off-core heartbeat goes to (from the last
+    /// refresh), and the driver loop's progress stamp: see
+    /// [`holder_alive_task`].
+    alive: Arc<Mutex<Option<AliveTargets>>>,
+    busy_since: Arc<std::sync::atomic::AtomicI64>,
+    /// The thread the driver loop runs on now (its tokio worker), for the
+    /// stuck-driver backtrace.
+    loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
+    alive_book: AliveBook,
+    step_end: std::time::Instant,
+    /// The core's job and the replica's next log sequence, and since
+    /// when both have stayed the same (the stuck-job report,
+    /// [`STUCK_JOB`]).
+    job_since: Option<(JobKind, u64, std::time::Instant, bool)>,
+}
+
+/// A core job (a round, an acquisition, a flush, ...) in progress this
+/// long with the replica's log cursor not moving is reported once, in
+/// full: while a job holds the cursor the node applies nothing of the log.
+const STUCK_JOB: Duration = Duration::from_secs(20);
+
+/// The targets of the holder's off-core heartbeat ([`holder_alive_task`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AliveTargets {
+    epoch: u64,
+    /// The committed backups and the candidate being brought up, with
+    /// their candidacies (`Core::backup_candidacies`).
+    listed: Vec<(NodeId, u64)>,
+    /// Candidacies the holder dropped lately (`listed: false`).
+    dismissed: Vec<(NodeId, u64)>,
+    /// The lease's expiry: no heartbeat at or past it.
+    until_unix_ms: i64,
+}
+
+/// How long a dropped backup is told it was dropped (`HolderAlive` with
+/// `listed: false`); a lost message leaves it sealing, harmlessly, as
+/// before.
+const DISMISS_FOR_MS: i64 = 10_000;
+
+/// The driver's book of who [`holder_alive_task`] beats to: the backups of
+/// the lease this node holds, and the candidacies it dropped within
+/// [`DISMISS_FOR_MS`]. A node selected again is no longer told it was
+/// dropped (its new candidacy is listed); the backup applies a dismissal
+/// only to the candidacy it names, so one still in flight is harmless.
+#[derive(Debug, Default)]
+struct AliveBook {
+    /// node → (epoch, told until (unix ms), candidacy).
+    dismissed: HashMap<NodeId, (u64, i64, u64)>,
+    /// The last targets' epoch and listed backups.
+    prev: Option<(u64, Vec<(NodeId, u64)>)>,
+}
+
+impl AliveBook {
+    /// The targets for this refresh: `held` is the epoch and expiry of a
+    /// lease this node holds (`None`: none, or only within an open
+    /// continuation epoch), `listed` its backups.
+    fn update(
+        &mut self,
+        now_unix_ms: i64,
+        held: Option<(u64, i64)>,
+        listed: Vec<(NodeId, u64)>,
+    ) -> Option<AliveTargets> {
+        let Some((epoch, until_unix_ms)) = held else {
+            self.dismissed.clear();
+            self.prev = None;
+            return None;
+        };
+        self.dismissed
+            .retain(|_, (e, until, _)| *e == epoch && *until > now_unix_ms);
+        for (n, _) in &listed {
+            self.dismissed.remove(n);
+        }
+        if let Some((prev_epoch, prev)) = &self.prev {
+            if *prev_epoch == epoch {
+                for &(n, candidacy) in prev {
+                    if candidacy != 0 && !listed.iter().any(|(l, _)| *l == n) {
+                        self.dismissed
+                            .insert(n, (epoch, now_unix_ms + DISMISS_FOR_MS, candidacy));
+                    }
+                }
+            }
+        }
+        self.prev = Some((epoch, listed.clone()));
+        let mut dismissed: Vec<(NodeId, u64)> = self
+            .dismissed
+            .iter()
+            .map(|(n, (_, _, c))| (*n, *c))
+            .collect();
+        dismissed.sort_unstable();
+        Some(AliveTargets {
+            epoch,
+            listed,
+            dismissed,
+            until_unix_ms,
+        })
+    }
+}
+
+/// `CONSTELLATION_HOLDER_STALL_MS` (default 15000): a driver loop that
+/// has made no progress for this long (one core step, or anything else
+/// it does between waits for work) stops the holder's off-core
+/// heartbeat, so its backups seal it `CONSTELLATION_BACKUP_TAKEOVER_MS`
+/// later. That long is a hung authority, not a busy one; a dead process,
+/// a stopped driver or a cut link stops the heartbeat at once.
+fn holder_stall_ms() -> i64 {
+    env_ms("CONSTELLATION_HOLDER_STALL_MS", 15_000).max(1) as i64
+}
+
+/// What one tick of [`holder_alive_task`] does.
+#[derive(Debug, PartialEq, Eq)]
+enum AliveTick {
+    /// Not holding, or past the lease's expiry: nothing.
+    Idle,
+    /// The driver loop has not progressed for this long: no beats.
+    Hung(i64),
+    /// Beat these: `(node, candidacy, listed)`.
+    Beat(Vec<(NodeId, u64, bool)>),
+}
+
+/// `busy_since`: the driver loop's last progress stamp while it works
+/// (unix ms), 0 while it waits for work.
+fn alive_tick(t: Option<&AliveTargets>, now: i64, busy_since: i64, stall: i64) -> AliveTick {
+    let Some(t) = t else {
+        return AliveTick::Idle;
+    };
+    if now >= t.until_unix_ms {
+        return AliveTick::Idle;
+    }
+    if busy_since != 0 && now - busy_since > stall {
+        return AliveTick::Hung(now - busy_since);
+    }
+    AliveTick::Beat(
+        t.listed
+            .iter()
+            .map(|(n, c)| (*n, *c, true))
+            .chain(t.dismissed.iter().map(|(n, c)| (*n, *c, false)))
+            .collect(),
+    )
+}
+
+/// The holder's liveness for its backups, off the core's step (plan 30
+/// §M9's seal watch). The core heartbeats its backups with appends, from
+/// its own timers: a step that takes seconds (an overloaded node: CPU,
+/// disk, metadata writes queued behind the mount's) silenced them, and the
+/// backups sealed and deposed a live holder about 1.5 s in
+/// (`stress-ng-fs-nodes`). This task beats every backup heartbeat
+/// interval while the node holds an unexpired lease and the driver loop
+/// has progressed within [`holder_stall_ms`]; a backup counts a beat as
+/// it counts an append (`Event::HolderAlive`). A backup that answers is
+/// alive, whatever its own core is doing: the core hears so
+/// (`Event::BackupAlive`) and gives it longer to acknowledge. It runs for
+/// as long as [`Driver::run`] does ([`AliveTask`]).
+async fn holder_alive_task(
+    peers: constellation_net::Peers,
+    alive: Arc<Mutex<Option<AliveTargets>>>,
+    busy_since: Arc<std::sync::atomic::AtomicI64>,
+    every: Duration,
+    node_id: NodeId,
+    core: mpsc::UnboundedSender<Internal>,
+    loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
+) {
+    let stall = holder_stall_ms();
+    let backtraces = constellation_vfs::watch::backtraces_from_env();
+    let mut stalled = false;
+    // Beats still waiting for their answer: one per peer at a time.
+    let pending: Arc<Mutex<std::collections::HashSet<NodeId>>> = Arc::default();
+    loop {
+        tokio::time::sleep(every).await;
+        let targets = alive.lock().unwrap().clone();
+        let tick = alive_tick(
+            targets.as_ref(),
+            now_unix_ms(),
+            busy_since.load(Ordering::Relaxed),
+            stall,
+        );
+        // Whether or not this node holds a lease: a driver stuck this
+        // long is reported (with the thread's backtrace under
+        // `CONSTELLATION_FUSE_STALL_BACKTRACE=1`).
+        let busy = busy_since.load(Ordering::Relaxed);
+        let stuck_ms = now_unix_ms() - busy;
+        let hung = busy != 0 && stuck_ms > stall;
+        if hung != stalled {
+            stalled = hung;
+            if hung {
+                let thread = *loop_thread.lock().unwrap();
+                tracing::warn!(
+                    node = node_id,
+                    stuck_ms,
+                    tid = thread.tid,
+                    holding = targets.is_some(),
+                    "the authority driver has made no progress (a holder sends no more liveness \
+                     heartbeats: its backups will seal this tenure)"
+                );
+                if backtraces
+                    && constellation_platform::native()
+                        .process
+                        .request_backtrace(thread)
+                        .is_err()
+                {
+                    tracing::warn!(tid = thread.tid, "could not signal the driver's thread");
+                }
+            } else {
+                tracing::info!(node = node_id, "the authority driver is progressing again");
+            }
+        }
+        let (AliveTick::Beat(beats), Some(t)) = (tick, targets) else {
+            continue;
+        };
+        for (to, candidacy, listed) in beats {
+            if crate::fault::p2p_denied(to) || !pending.lock().unwrap().insert(to) {
+                continue;
+            }
+            let payload = Payload::HolderAlive {
+                holder: node_id,
+                epoch: t.epoch,
+                candidacy,
+                listed,
+            };
+            let peers = peers.clone();
+            let core = core.clone();
+            let pending = pending.clone();
+            let at = Ms(now_unix_ms());
+            // Answered late is still answered (a loaded peer's runtime
+            // takes its time): a request that times out marks the peer's
+            // link down in the directory, and timing beats out at the
+            // interval had the holder removing a live backup for "link
+            // down". The next beat to the peer waits for this one.
+            tokio::spawn(async move {
+                let answered = tokio::time::timeout(
+                    BEAT_TIMEOUT,
+                    peers.request_to_node_timeout(to, &payload, BEAT_TIMEOUT),
+                )
+                .await;
+                pending.lock().unwrap().remove(&to);
+                if listed && matches!(answered, Ok(Ok(_))) {
+                    let _ = core.send(Internal::Event(Event::BackupAlive { from: to, at }));
+                }
+            });
+        }
+    }
+}
+
+/// How long one beat of [`holder_alive_task`] waits for its answer.
+const BEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`holder_alive_task`] for the life of [`Driver::run`]: dropped when
+/// `run` returns or its task dies, it stops the beats and forgets the
+/// targets.
+struct AliveTask {
+    task: tokio::task::JoinHandle<()>,
+    alive: Arc<Mutex<Option<AliveTargets>>>,
+}
+
+impl Drop for AliveTask {
+    fn drop(&mut self) {
+        self.task.abort();
+        if let Ok(mut alive) = self.alive.lock() {
+            *alive = None;
+        }
+    }
+}
+
+/// Timers that measure a peer's silence (a reply, an append, a renewal
+/// that did not come): handled after the requests that reached this node
+/// before they fired ([`Driver::run`]), so this node's own stall is not
+/// taken for the peer's. That includes the expiries an owner keeps for a
+/// grant it handed out (a lock grant, a delegation, a read delegation):
+/// they outwait the holder's renewal, and handling a renewal that is
+/// already queued first only makes the owner wait longer before it acts
+/// on the expiry — the holder honours its grant from its own send time,
+/// so a later expiry is never unsafe (before, the owner dropped the grant
+/// and answered the queued renewal `Lost`). Every other timer (a renewal
+/// to send, a tick, a deadline this node keeps for itself) is handled in
+/// turn, never behind the backlog.
+fn measures_silence(kind: TimerKind) -> bool {
+    matches!(
+        kind,
+        TimerKind::BackupWatch
+            | TimerKind::ForwardTimeout
+            | TimerKind::JobRequestTimeout
+            | TimerKind::ReadIndexTimeout
+            | TimerKind::LockRequestTimeout
+            | TimerKind::LockRenewTimeout
+            | TimerKind::LockTestTimeout
+            | TimerKind::LockGrantExpiry
+            | TimerKind::DelegExpiry
+            | TimerKind::GrantExpiry
+            | TimerKind::StreamWatchdog
+    )
+}
+
+/// The most a silence timer's drain ([`measures_silence`]) spends on the
+/// backlog before the timer is put back behind what else is due, once.
+const SILENCE_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
+/// How a drain before a silence timer ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Drained {
+    /// Everything queued before it was handled.
+    All,
+    /// The budget ran out with some still queued.
+    OutOfTime,
+    /// The core stopped.
+    Stopped,
+}
+
+/// Handle up to `pending` queued items, for at most `budget`:
+/// `handle_next` handles the next one (`None`: the queue is empty;
+/// `Some(false)`: the core stopped).
+fn drain_queued(
+    pending: usize,
+    budget: Duration,
+    mut handle_next: impl FnMut() -> Option<bool>,
+) -> Drained {
+    let started = std::time::Instant::now();
+    for _ in 0..pending {
+        if started.elapsed() >= budget {
+            return Drained::OutOfTime;
+        }
+        match handle_next() {
+            None => break,
+            Some(false) => return Drained::Stopped,
+            Some(true) => {}
+        }
+    }
+    Drained::All
 }
 
 impl Driver {
@@ -748,6 +1100,14 @@ impl Driver {
             stream_buffer_bytes: log_stream_buffer_bytes() as u64,
             bulk_pass: BulkPass::default(),
             round_upload_wait: round_upload_wait(),
+            alive: Arc::default(),
+            busy_since: Arc::default(),
+            loop_thread: Arc::new(Mutex::new(
+                constellation_platform::process::ThreadRef::unknown(),
+            )),
+            alive_book: AliveBook::default(),
+            step_end: std::time::Instant::now(),
+            job_since: None,
         }
     }
 
@@ -832,98 +1192,182 @@ impl Driver {
                 }
             });
         }
-        let mut step_end = std::time::Instant::now();
+        let _alive_task = self.core.config().p2p.then(|| AliveTask {
+            task: tokio::spawn(holder_alive_task(
+                self.deps.peers.clone(),
+                self.alive.clone(),
+                self.busy_since.clone(),
+                Duration::from_millis(self.core.config().backup_heartbeat_ms.max(1)),
+                self.node_id,
+                self.int_tx.clone(),
+                self.loop_thread.clone(),
+            )),
+            alive: self.alive.clone(),
+        });
+        self.step_end = std::time::Instant::now();
+        enum Wake {
+            Internal(Internal),
+            Request(SyncRequest),
+        }
         loop {
-            let internal = tokio::select! {
+            // Waiting for work is not being stuck (`holder_alive_task`).
+            self.busy_since.store(0, Ordering::Relaxed);
+            let wake = tokio::select! {
                 biased;
                 msg = self.int_rx.recv() => match msg {
-                    Some(m) => m,
+                    Some(m) => Wake::Internal(m),
                     None => break,
                 },
                 req = self.sync_rx.recv() => match req {
-                    Some(req) => match self.on_request(req) {
-                        Some(internal) => internal,
-                        None => continue,
-                    },
+                    Some(req) => Wake::Request(req),
                     None => break,
                 },
             };
-            let waited_us = step_end.elapsed().as_micros() as u64;
-            let event = match internal {
-                Internal::Event(event) => event,
-                Internal::Control { req, reply } => {
-                    let op = self.control_id();
-                    self.controls.insert(op, reply);
-                    Event::Control { op, req }
-                }
+            self.busy_since.store(now_unix_ms(), Ordering::Relaxed);
+            *self.loop_thread.lock().unwrap() =
+                constellation_platform::native().process.current_thread();
+            let internal = match wake {
+                Wake::Internal(internal) => internal,
+                Wake::Request(req) => match self.on_request(req) {
+                    Some(internal) => internal,
+                    None => continue,
+                },
             };
-            self.deps
-                .last_sync_ms
-                .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
-            let kind = event_kind(&event);
-            let started = std::time::Instant::now();
-            let int_pending = self.int_rx.len();
-            let sync_pending = self.sync_rx.len();
-            let applies_segments = matches!(
-                &event,
-                Event::S3 {
-                    result: S3Result::SegmentRun(Ok(run)),
-                    ..
-                } if !run.is_empty()
-            ) || matches!(
-                &event,
-                Event::Peer {
-                    msg: PeerMsg::LogStream {
-                        segment: Some(_),
-                        ..
-                    },
-                    ..
-                }
-            );
-            let actions = self.core.handle(now(), event, &*self.deps.meta);
-            if applies_segments {
-                if let Some(holds) = &self.deps.holds {
-                    holds.nudge();
+            // A silence timer is handled after what reached this node
+            // before it fired: the requests and peer messages queued
+            // meanwhile (the internal channel is served first, so after a
+            // long step a due timer overtook them). It measures the peer's
+            // silence, not this node's own stall: a backup's seal watch
+            // fired with the holder's heartbeats sitting in the queue.
+            // Bounded: past `SILENCE_DRAIN_BUDGET` the timer goes back
+            // behind whatever else is due (once), so the proactive timers
+            // and S3 completions on the internal channel never wait out
+            // the backlog.
+            if let Internal::Timer { id, kind, deferred } = internal {
+                if measures_silence(kind) {
+                    let pending = self.sync_rx.len();
+                    let drained = drain_queued(pending, SILENCE_DRAIN_BUDGET, || {
+                        let req = self.sync_rx.try_recv().ok()?;
+                        if let Some(earlier) = self.on_request(req) {
+                            self.step(earlier);
+                        }
+                        Some(!self.core.stopped())
+                    });
+                    match drained {
+                        Drained::Stopped => return,
+                        Drained::OutOfTime if !deferred => {
+                            let _ = self.int_tx.send(Internal::Timer {
+                                id,
+                                kind,
+                                deferred: true,
+                            });
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
             }
-            let handled_us = started.elapsed().as_micros() as u64;
-            // The mirror first: a FUSE thread must see the releasing flag
-            // before the release's IO starts.
-            self.refresh();
-            let refreshed_us = started.elapsed().as_micros() as u64 - handled_us;
-            let action_kinds: Vec<&'static str> = actions.iter().map(action_kind).collect();
-            self.dispatch(actions);
-            let dispatched_us = started.elapsed().as_micros() as u64 - handled_us - refreshed_us;
-            tracing::trace!(
-                event = kind,
-                actions = ?action_kinds,
-                job = ?self.core.job(),
-                handled_us,
-                refreshed_us,
-                dispatched_us,
-                int_pending,
-                sync_pending,
-                waited_us,
-                "core step"
-            );
-            let step_us = handled_us + refreshed_us + dispatched_us;
-            if step_us >= SLOW_STEP_US {
-                // Everything the core does (backup heartbeats included)
-                // waits for this step: a long one silences the node.
-                tracing::warn!(
-                    event = kind,
-                    actions = ?action_kinds,
-                    handled_us,
-                    refreshed_us,
-                    dispatched_us,
-                    "slow core step"
-                );
-            }
-            step_end = std::time::Instant::now();
+            self.step(internal);
             if self.core.stopped() {
                 break;
             }
         }
+    }
+
+    /// One core step: the event, the mirror refresh, the actions.
+    fn step(&mut self, internal: Internal) {
+        let waited_us = self.step_end.elapsed().as_micros() as u64;
+        let event = match internal {
+            Internal::Event(event) => event,
+            Internal::Control { req, reply } => {
+                let op = self.control_id();
+                self.controls.insert(op, reply);
+                Event::Control { op, req }
+            }
+            Internal::Timer { id, .. } => Event::Timer { id },
+        };
+        self.deps
+            .last_sync_ms
+            .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
+        let kind = event_kind(&event);
+        // Progress (a drain runs several steps in one wake-up).
+        self.busy_since.store(now_unix_ms(), Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let int_pending = self.int_rx.len();
+        let sync_pending = self.sync_rx.len();
+        let applies_segments = matches!(
+            &event,
+            Event::S3 {
+                result: S3Result::SegmentRun(Ok(run)),
+                ..
+            } if !run.is_empty()
+        ) || matches!(
+            &event,
+            Event::Peer {
+                msg: PeerMsg::LogStream {
+                    segment: Some(_),
+                    ..
+                },
+                ..
+            }
+        );
+        // The step's metadata writes go ahead of the FUSE workers'
+        // (`priority_writes`): behind them, under a busy mount, one
+        // step took seconds, and everything the node's authority does
+        // waits for the step.
+        let ((action_kinds, handled_us, refreshed_us, dispatched_us), store) =
+            constellation_meta::priority_writes(|| {
+                let actions = self.core.handle(now(), event, &*self.deps.meta);
+                if applies_segments {
+                    if let Some(holds) = &self.deps.holds {
+                        holds.nudge();
+                    }
+                }
+                let handled_us = started.elapsed().as_micros() as u64;
+                // The mirror first: a FUSE thread must see the releasing
+                // flag before the release's IO starts.
+                self.refresh();
+                let refreshed_us = started.elapsed().as_micros() as u64 - handled_us;
+                let action_kinds: Vec<&'static str> = actions.iter().map(action_kind).collect();
+                self.dispatch(actions);
+                let dispatched_us =
+                    started.elapsed().as_micros() as u64 - handled_us - refreshed_us;
+                (action_kinds, handled_us, refreshed_us, dispatched_us)
+            });
+        tracing::trace!(
+            event = kind,
+            actions = ?action_kinds,
+            job = ?self.core.job(),
+            handled_us,
+            refreshed_us,
+            dispatched_us,
+            int_pending,
+            sync_pending,
+            waited_us,
+            "core step"
+        );
+        let step_us = handled_us + refreshed_us + dispatched_us;
+        if step_us >= SLOW_STEP_US {
+            // Everything the core does (backup heartbeats included)
+            // waits for this step: a long one silences the node.
+            tracing::warn!(
+                event = kind,
+                actions = ?action_kinds,
+                handled_us,
+                refreshed_us,
+                dispatched_us,
+                store_lock_waits = store.lock_waits,
+                store_lock_wait_us = store.lock_wait_us,
+                store_lock_wait_max_us = store.lock_wait_max_us,
+                store_lock_wait_max_behind = ?store
+                    .lock_wait_max_behind
+                    .map(|(at, held_us)| format!("{at} (held {} ms)", held_us / 1000)),
+                store_syncs = store.syncs,
+                store_sync_us = store.sync_us,
+                "slow core step"
+            );
+        }
+        self.step_end = std::time::Instant::now();
     }
 
     fn control_id(&mut self) -> OpId {
@@ -936,6 +1380,7 @@ impl Driver {
     /// status snapshot.
     fn refresh(&mut self) {
         let now = now();
+        self.publish_alive_targets(now);
         // Plan 30 §M12: what the FUSE fast path executed since the last
         // event, for the placement.
         let notes = self.deps.delegates.take_fast_path_notes();
@@ -960,6 +1405,25 @@ impl Driver {
         status.lease = self.deps.view.status();
         status.gate_pending = lease.gate.is_some();
         status.job = self.core.job();
+        let next_seq = self.core.ship().next_seq;
+        match (status.job, &mut self.job_since) {
+            (None, since) => *since = None,
+            (Some(job), Some((kind, seq, at, reported))) if *kind == job && *seq == next_seq => {
+                if !*reported && at.elapsed() >= STUCK_JOB {
+                    *reported = true;
+                    tracing::warn!(
+                        node = self.node_id,
+                        secs = at.elapsed().as_secs(),
+                        next_seq,
+                        job = self.core.job_detail().unwrap_or_default(),
+                        "a core job has been in progress for a long time, the log cursor not moving"
+                    );
+                }
+            }
+            (Some(job), since) => {
+                *since = Some((job, next_seq, std::time::Instant::now(), false));
+            }
+        }
         status.clients_in_flight = self.core.clients().count();
         status.inbox = self.core.inbox_view(now);
         status.copies = self.core.replay_copies(now);
@@ -992,6 +1456,27 @@ impl Driver {
         self.deps
             .epochs
             .set_claim_view(self.core.epoch_claim_view(now));
+    }
+
+    /// What [`holder_alive_task`] beats to: the lease this node holds,
+    /// its committed backups and candidate, and the candidacies it
+    /// dropped lately ([`AliveBook`]).
+    fn publish_alive_targets(&mut self, now: Ms) {
+        let lease = self.core.lease();
+        let held = match &lease.held {
+            Some((l, _)) if !lease.epoch_held() => Some((l.epoch, l.expires_unix_ms)),
+            _ => None,
+        };
+        let listed = if held.is_some() {
+            self.core.backup_candidacies()
+        } else {
+            Vec::new()
+        };
+        let targets = self.alive_book.update(now.0, held, listed);
+        let mut alive = self.alive.lock().unwrap();
+        if *alive != targets {
+            *alive = targets;
+        }
     }
 
     /// Tell the core the epoch machine's state when it changed (or
@@ -1440,6 +1925,7 @@ impl Driver {
                 holder,
                 epoch,
                 config_version,
+                candidacy,
                 from,
                 txs,
                 through,
@@ -1455,6 +1941,7 @@ impl Driver {
                         epoch,
                         holder,
                         config_version,
+                        candidacy,
                         from,
                         txs,
                         through,
@@ -1520,6 +2007,19 @@ impl Driver {
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::StreamAhead { epoch, base, txs },
+            })),
+            SyncRequest::PeerHolderAlive {
+                holder,
+                epoch,
+                candidacy,
+                listed,
+                at_unix_ms,
+            } => Some(Internal::Event(Event::HolderAlive {
+                from: holder,
+                epoch,
+                candidacy,
+                listed,
+                at: Ms(at_unix_ms),
             })),
             SyncRequest::PeerPromiseRequest {
                 requester,
@@ -1790,12 +2290,16 @@ impl Driver {
                 }
                 Action::Send { to, msg } => self.send(to, msg),
                 Action::S3 { op, req } => self.spawn_s3(op, req),
-                Action::SetTimer { id, at, .. } => {
+                Action::SetTimer { id, at, kind } => {
                     let tx = self.int_tx.clone();
                     let delay = Duration::from_millis((at.0 - now_unix_ms()).max(0) as u64);
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        let _ = tx.send(Internal::Event(Event::Timer { id }));
+                        let _ = tx.send(Internal::Timer {
+                            id,
+                            kind,
+                            deferred: false,
+                        });
                     });
                 }
                 Action::CancelTimer { .. } => {}
@@ -2946,13 +3450,19 @@ impl Driver {
                 epoch,
                 holder,
                 config_version,
+                candidacy,
                 from,
                 txs,
                 through,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
-                let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
+                // A slow backup's answer still counts (`backup_slow_max_ms`,
+                // `Core::backup_timeouts`): waiting only the ack timeout
+                // for it threw away every acknowledgement a loaded backup
+                // gave more than a second late.
+                let timeout = Duration::from_millis(self.core.config().backup_slow_max_ms);
+                let cut = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
                 let denied = crate::fault::p2p_denied(to);
                 let txs = match postcard::to_allocvec(&txs) {
                     Ok(b) => b,
@@ -2969,7 +3479,7 @@ impl Driver {
                 tokio::spawn(async move {
                     if denied {
                         // Fault injection: the link to this peer is cut.
-                        tokio::time::sleep(timeout).await;
+                        tokio::time::sleep(cut).await;
                         let _ = tx.send(Internal::Event(Event::PeerFailed {
                             req,
                             to,
@@ -2982,6 +3492,7 @@ impl Driver {
                         req_id: req.0,
                         epoch,
                         config_version,
+                        candidacy,
                         from,
                         txs,
                         through,
@@ -4655,6 +5166,165 @@ impl Standalone {
 #[cfg(test)]
 mod tests {
     use super::parse_u64_zero_ok;
+
+    /// The holder's dismissal bookkeeping: a backup it drops (a
+    /// candidate that timed out, a committed one reconfigured out) is
+    /// told so, naming the dropped candidacy, for `DISMISS_FOR_MS`; the
+    /// moment the node is selected again (a new candidacy) it is listed
+    /// and no longer dismissed; a new epoch or no lease forgets it all;
+    /// a node of unknown candidacy (0) is never dismissed.
+    #[test]
+    fn the_alive_book_dismisses_dropped_candidacies_until_reselected() {
+        use super::{AliveBook, DISMISS_FOR_MS};
+        let mut book = AliveBook::default();
+        let held = Some((4, 100_000));
+        let t = book.update(1_000, held, vec![(2, 10), (3, 11)]).unwrap();
+        assert_eq!(t.listed, vec![(2, 10), (3, 11)]);
+        assert!(t.dismissed.is_empty());
+        // Node 3's candidacy timed out.
+        let t = book.update(1_100, held, vec![(2, 10)]).unwrap();
+        assert_eq!(t.dismissed, vec![(3, 11)]);
+        let t = book.update(1_200, held, vec![(2, 10)]).unwrap();
+        assert_eq!(t.dismissed, vec![(3, 11)], "repeated");
+        // Brought up again: listed under its new candidacy, no dismissal.
+        let t = book.update(1_300, held, vec![(2, 10), (3, 12)]).unwrap();
+        assert_eq!(t.listed, vec![(2, 10), (3, 12)]);
+        assert!(
+            t.dismissed.is_empty(),
+            "still dismissing a re-selected node"
+        );
+        // Dropped again: the new candidacy is the one dismissed, until
+        // the window ends.
+        let t = book.update(1_400, held, vec![(2, 10)]).unwrap();
+        assert_eq!(t.dismissed, vec![(3, 12)]);
+        let t = book
+            .update(1_400 + DISMISS_FOR_MS, held, vec![(2, 10)])
+            .unwrap();
+        assert!(t.dismissed.is_empty(), "told past the window");
+        // Unknown candidacy: never dismissed.
+        book.update(20_000, held, vec![(2, 10), (5, 0)]);
+        let t = book.update(20_100, held, vec![(2, 10)]).unwrap();
+        assert!(t.dismissed.is_empty());
+        // A new epoch forgets the old one's dismissals; no lease, all.
+        book.update(20_200, held, Vec::new());
+        let t = book.update(20_300, Some((5, 100_000)), Vec::new()).unwrap();
+        assert!(
+            t.dismissed.is_empty(),
+            "an old epoch's dismissal carried over"
+        );
+        assert_eq!(book.update(20_400, None, Vec::new()), None);
+    }
+
+    /// The heartbeat task's tick: nothing without a lease or past its
+    /// expiry; no beats once the driver loop has made no progress for
+    /// longer than the stall (whatever it is stuck in), beats again once
+    /// it progresses; idle (waiting for work, `busy_since` 0) is alive.
+    #[test]
+    fn the_holder_heartbeat_stops_with_the_lease_and_a_stuck_driver() {
+        use super::{alive_tick, AliveTargets, AliveTick};
+        let t = AliveTargets {
+            epoch: 4,
+            listed: vec![(2, 10)],
+            dismissed: vec![(3, 11)],
+            until_unix_ms: 50_000,
+        };
+        assert_eq!(alive_tick(None, 1_000, 0, 15_000), AliveTick::Idle);
+        assert_eq!(alive_tick(Some(&t), 50_000, 0, 15_000), AliveTick::Idle);
+        let beats = AliveTick::Beat(vec![(2, 10, true), (3, 11, false)]);
+        assert_eq!(alive_tick(Some(&t), 20_000, 0, 15_000), beats);
+        assert_eq!(alive_tick(Some(&t), 20_000, 10_000, 15_000), beats);
+        assert_eq!(
+            alive_tick(Some(&t), 30_000, 10_000, 15_000),
+            AliveTick::Hung(20_000)
+        );
+        assert_eq!(alive_tick(Some(&t), 30_000, 29_000, 15_000), beats);
+    }
+
+    /// The task lives as long as `Driver::run`: dropping its guard (run
+    /// returned, or its task died) stops it and forgets the targets.
+    #[tokio::test]
+    async fn the_heartbeat_task_stops_with_the_driver_loop() {
+        use super::{AliveTargets, AliveTask};
+        use std::sync::{Arc, Mutex};
+        let alive = Arc::new(Mutex::new(Some(AliveTargets {
+            epoch: 1,
+            listed: Vec::new(),
+            dismissed: Vec::new(),
+            until_unix_ms: i64::MAX,
+        })));
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        drop(AliveTask {
+            task,
+            alive: alive.clone(),
+        });
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "still running");
+        assert!(alive.lock().unwrap().is_none(), "targets kept");
+    }
+
+    /// Only timers that measure a peer's silence (owners' grant expiries
+    /// included) wait for the backlog that reached the node before they
+    /// fired; renewals, ticks and this node's own deadlines never do. The drain handles what was queued in
+    /// order, stops at the budget (the timer then goes back behind what
+    /// else is due) and at a stopped core.
+    #[test]
+    fn only_silence_timers_wait_for_the_backlog_and_only_so_long() {
+        use super::{drain_queued, measures_silence, Drained};
+        use constellation_authority::TimerKind;
+        use std::time::Duration;
+        for kind in [
+            TimerKind::BackupWatch,
+            TimerKind::ForwardTimeout,
+            TimerKind::JobRequestTimeout,
+            TimerKind::LockRequestTimeout,
+            TimerKind::LockRenewTimeout,
+            TimerKind::LockGrantExpiry,
+            TimerKind::DelegExpiry,
+        ] {
+            assert!(measures_silence(kind), "{kind:?}");
+        }
+        for kind in [
+            TimerKind::LockRenewTick,
+            TimerKind::DelegRenew,
+            TimerKind::BackupTick,
+            TimerKind::Poll,
+            TimerKind::ClientDeadline,
+            TimerKind::StreamHeartbeat,
+        ] {
+            assert!(!measures_silence(kind), "{kind:?}");
+        }
+        // In order, only what was queued before (`pending`).
+        let mut queue: std::collections::VecDeque<u32> = (1..=5).collect();
+        let mut handled = Vec::new();
+        let d = drain_queued(3, Duration::from_secs(5), || {
+            let n = queue.pop_front()?;
+            handled.push(n);
+            Some(true)
+        });
+        assert_eq!(d, Drained::All);
+        assert_eq!(handled, vec![1, 2, 3]);
+        // An empty queue ends it early.
+        let d = drain_queued(10, Duration::from_secs(5), || {
+            queue.pop_front().map(|_| true)
+        });
+        assert_eq!(d, Drained::All);
+        // Slow steps: the budget ends it.
+        let mut queue: std::collections::VecDeque<u32> = (1..=5).collect();
+        let d = drain_queued(5, Duration::from_millis(30), || {
+            queue.pop_front()?;
+            std::thread::sleep(Duration::from_millis(20));
+            Some(true)
+        });
+        assert_eq!(d, Drained::OutOfTime);
+        // One or two (a loaded host oversleeps), never all five.
+        assert!((3..=4).contains(&queue.len()), "{queue:?}");
+        // A stopped core.
+        assert_eq!(
+            drain_queued(5, Duration::from_secs(5), || Some(false)),
+            Drained::Stopped
+        );
+    }
 
     /// Two standalone drivers in one process whose cores reach a rebuild
     /// with the same op id get separate side replicas (before: both used

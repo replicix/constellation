@@ -1322,9 +1322,10 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | LockMirror { from, .. } => *from,
         DelegRecall { root, .. } | DelegSeal { root, .. } => *root,
         // `BackupAppend::from` is a journal seq; `holder` is the sender.
-        ReadRecall { holder, .. } | BackupAppend { holder, .. } | BackupHold { holder, .. } => {
-            *holder
-        }
+        ReadRecall { holder, .. }
+        | BackupAppend { holder, .. }
+        | BackupHold { holder, .. }
+        | HolderAlive { holder, .. } => *holder,
         LockRecall { owner, .. } => *owner,
         EpochPropose { proposer, .. } | EpochAbort { proposer, .. } => *proposer,
         PeerRtts { node_id, .. } => *node_id,
@@ -1523,12 +1524,21 @@ async fn handle_stream<S: PeerService>(
             req_id,
             epoch,
             config_version,
+            candidacy,
             from,
             txs,
             through,
         } => Some(
             service
-                .backup_append_requested(holder, req_id, epoch, config_version, from, txs, through)
+                .backup_append_requested(
+                    holder,
+                    req_id,
+                    epoch,
+                    (config_version, candidacy),
+                    from,
+                    txs,
+                    through,
+                )
                 .await,
         ),
         Payload::StreamAhead {
@@ -1546,6 +1556,15 @@ async fn handle_stream<S: PeerService>(
             for_ms,
         } => {
             service.backup_hold(holder, epoch, for_ms);
+            Some(Payload::Ok { req_id: 0 })
+        }
+        Payload::HolderAlive {
+            holder,
+            epoch,
+            candidacy,
+            listed,
+        } => {
+            service.holder_alive(holder, epoch, candidacy, listed);
             Some(Payload::Ok { req_id: 0 })
         }
         Payload::DelegBackupAppend {

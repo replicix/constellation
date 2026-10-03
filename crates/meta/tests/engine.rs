@@ -406,3 +406,148 @@ fn the_vacuum_compacts_a_churned_keyspace_once() {
         Some(f.ino)
     );
 }
+
+// ------------------------------------- spilled xattrs changed one at a time
+
+/// The `ns` rows of `ino` (its `0x01` record and `0x03` xattrs) as
+/// `record::plan_inode` would write them for `model`, the xattr set the
+/// file should have — the whole-set rule, computed independently.
+fn planned_rows(
+    meta: &Meta,
+    ino: u64,
+    model: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let attr = meta.getattr(ino).unwrap().unwrap();
+    let attrs = Attrs {
+        kind: Kind::from_u8(attr.kind.as_u8()).unwrap(),
+        mode: attr.mode,
+        uid: attr.uid,
+        gid: attr.gid,
+        nlink: attr.nlink,
+        size: attr.size,
+        mtime_ns: attr.mtime_ns,
+        ctime_ns: attr.ctime_ns,
+        rdev: attr.rdev,
+    };
+    let xattrs: Vec<(Vec<u8>, Vec<u8>)> = model
+        .iter()
+        .map(|(n, v)| (n.as_bytes().to_vec(), v.clone()))
+        .collect();
+    let planned = record::plan_inode(attrs, None, None, &xattrs, hash_blob);
+    let mut rows = vec![(keys::inode(ino), planned.record.encode())];
+    if planned.xattrs == record::XattrPlacement::Spilled {
+        for (name, value) in &xattrs {
+            let (payload, _) = record::place_value(value.clone(), hash_blob);
+            rows.push((keys::xattr(ino, name), payload.encode()));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn stored_rows(meta: &Meta, ino: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let range = keys::xattrs_of(ino);
+    let mut rows: Vec<_> = meta
+        .ns_dump()
+        .unwrap()
+        .into_iter()
+        .filter(|(k, _)| {
+            *k == keys::inode(ino) || (range.start() <= k.as_slice() && k.as_slice() < range.end())
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// What stress-ng's `xattr` stressor does to one file (a few hundred
+/// names created, each replaced by a shorter value, then all removed),
+/// with a large value and the inline/spilled boundary crossed both ways.
+/// A spilled set is changed one name at a time
+/// (`ns::put_spilled_xattr`); the stored rows must be byte for byte what
+/// the whole-set rule produces, after every step, both executed locally
+/// and replayed from the log.
+#[test]
+fn a_spilled_xattr_set_changed_one_name_at_a_time_stores_the_whole_set_rule() {
+    use constellation_meta::LogRecord;
+    let ino = (1u64 << 40) | 9;
+    let local = Meta::open_in_memory().unwrap();
+    let f = local.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let replayed = Meta::open_in_memory().unwrap();
+    replayed
+        .apply_records(&[LogRecord::Create {
+            parent: ROOT_INO,
+            name: "f".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }])
+        .unwrap();
+    let mut steps: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    for i in 0..300 {
+        steps.push((
+            format!("user.var_{i}"),
+            Some(format!("orig-value-{i}").into_bytes()),
+        ));
+    }
+    steps.push(("user.big".into(), Some(vec![7u8; 4096])));
+    for i in 0..300 {
+        steps.push((
+            format!("user.var_{i}"),
+            Some(format!("value-{i}").into_bytes()),
+        ));
+    }
+    steps.push(("user.big".into(), None));
+    for i in 0..300 {
+        steps.push((format!("user.var_{i}"), None));
+    }
+    // Back and forth across the boundary on a small set.
+    for round in 0..3 {
+        for i in 0..20 {
+            steps.push((format!("user.k{i}"), Some(vec![b'v'; 4 + round])));
+        }
+        for i in 0..20 {
+            steps.push((format!("user.k{i}"), None));
+        }
+    }
+    let mut model = std::collections::BTreeMap::new();
+    for (n, (name, value)) in steps.into_iter().enumerate() {
+        let t = 10 + n as i64;
+        let record = match &value {
+            Some(value) => {
+                local
+                    .set_xattr(f.ino, &name, value, SetXattrMode::Set)
+                    .unwrap();
+                model.insert(name.clone(), value.clone());
+                LogRecord::SetXattr {
+                    ino,
+                    name: name.clone(),
+                    value: value.clone(),
+                    time_ns: t,
+                }
+            }
+            None => {
+                local.remove_xattr(f.ino, &name).unwrap();
+                model.remove(&name);
+                LogRecord::RemoveXattr {
+                    ino,
+                    name: name.clone(),
+                    time_ns: t,
+                }
+            }
+        };
+        replayed.apply_records(&[record]).unwrap();
+        assert_eq!(
+            stored_rows(&local, f.ino),
+            planned_rows(&local, f.ino, &model),
+            "local, step {n} ({name})"
+        );
+        assert_eq!(
+            stored_rows(&replayed, ino),
+            planned_rows(&replayed, ino, &model),
+            "replayed, step {n} ({name})"
+        );
+    }
+    assert!(local.list_xattrs(f.ino).unwrap().is_empty());
+}

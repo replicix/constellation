@@ -8,6 +8,9 @@
 # fuser's own test suite, run in place (vendor/fuser/CONSTELLATION-PATCH.md)
 /vendor/fuser/Cargo.lock
 /vendor/fuser/target
+# fjall's unit tests, run in place (vendor/fjall/CONSTELLATION-PATCH.md)
+/vendor/fjall/Cargo.lock
+/vendor/fjall/target
 /.scratch
 mount.sh
 umount.sh

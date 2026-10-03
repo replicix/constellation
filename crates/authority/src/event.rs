@@ -91,6 +91,23 @@ pub enum Event {
     /// stop streaming to it. The subscriber falls back to S3 and
     /// resubscribes on its own.
     SubscriberGone { node: NodeId, req: OpId },
+    /// The lease holder `from`'s off-core liveness heartbeat (the driver
+    /// sends it while its core is responsive; `Payload::HolderAlive`),
+    /// heard at `at` — its arrival, which may be well before this node's
+    /// core gets to it. `listed: false`: the holder dropped this node's
+    /// `candidacy` (`PeerMsg::BackupAppend::candidacy`) from its backups.
+    HolderAlive {
+        from: NodeId,
+        epoch: Epoch,
+        candidacy: u64,
+        listed: bool,
+        at: Ms,
+    },
+    /// The holder's side of the same heartbeat: backup `from` answered
+    /// one sent at `at` (its process and link are up, whatever its core
+    /// is doing). A backup known alive is given `backup_slow_max_ms`, not
+    /// `backup_ack_timeout_ms`, to make acknowledgement progress.
+    BackupAlive { from: NodeId, at: Ms },
     /// Local writes the driver's fast path executed without the core
     /// (the FUSE lease view's `admit`): the time of the last one, for the
     /// idle-release clock, and their rid seqs, for the ack tracker
@@ -449,11 +466,16 @@ pub enum PeerMsg {
     /// holder's shipped-through journal seq (the backup may trim below
     /// it). `config_version` is the lease's as the holder knows it, so a
     /// backup can tell a stale holder's appends from the current one's.
+    /// `candidacy` names the holder's bring-up of this backup (unique per
+    /// holder and growing; a backup dropped and re-added gets a new one):
+    /// a dismissal (`HolderAlive { listed: false }`) applies only to the
+    /// candidacy it names.
     BackupAppend {
         req: OpId,
         epoch: Epoch,
         holder: NodeId,
         config_version: u64,
+        candidacy: u64,
         from: u64,
         txs: Vec<BackupTx>,
         through: u64,
@@ -682,6 +704,52 @@ pub enum PeerMsg {
 }
 
 impl PeerMsg {
+    /// The variant's name, for the driver's trace and slow-step lines.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            PeerMsg::MutateRequest { .. } => "MutateRequest",
+            PeerMsg::MutateReply { .. } => "MutateReply",
+            PeerMsg::LeaseRequest { .. } => "LeaseRequest",
+            PeerMsg::LeaseHandoff { .. } => "LeaseHandoff",
+            PeerMsg::SegmentPublished { .. } => "SegmentPublished",
+            PeerMsg::LogSubscribe { .. } => "LogSubscribe",
+            PeerMsg::LogUnsubscribe { .. } => "LogUnsubscribe",
+            PeerMsg::LogStream { .. } => "LogStream",
+            PeerMsg::LogStreamEnd { .. } => "LogStreamEnd",
+            PeerMsg::ReadIndex { .. } => "ReadIndex",
+            PeerMsg::ReadIndexReply { .. } => "ReadIndexReply",
+            PeerMsg::DelegationRecall { .. } => "DelegationRecall",
+            PeerMsg::DelegationRecalled { .. } => "DelegationRecalled",
+            PeerMsg::BackupAppend { .. } => "BackupAppend",
+            PeerMsg::BackupAck { .. } => "BackupAck",
+            PeerMsg::StreamAhead { .. } => "StreamAhead",
+            PeerMsg::BackupHold { .. } => "BackupHold",
+            PeerMsg::PromiseRequest { .. } => "PromiseRequest",
+            PeerMsg::PromiseReply { .. } => "PromiseReply",
+            PeerMsg::DelegateStream { .. } => "DelegateStream",
+            PeerMsg::DelegateStreamAck { .. } => "DelegateStreamAck",
+            PeerMsg::DelegRenew { .. } => "DelegRenew",
+            PeerMsg::DelegRenewed { .. } => "DelegRenewed",
+            PeerMsg::DelegRecall { .. } => "DelegRecall",
+            PeerMsg::DelegRecalled { .. } => "DelegRecalled",
+            PeerMsg::DelegBackupAppend { .. } => "DelegBackupAppend",
+            PeerMsg::DelegBackupAck { .. } => "DelegBackupAck",
+            PeerMsg::DelegSeal { .. } => "DelegSeal",
+            PeerMsg::DelegSealed { .. } => "DelegSealed",
+            PeerMsg::LockRequest { .. } => "LockRequest",
+            PeerMsg::LockReply { .. } => "LockReply",
+            PeerMsg::LockGranted { .. } => "LockGranted",
+            PeerMsg::LockRecall { .. } => "LockRecall",
+            PeerMsg::LockRecalled { .. } => "LockRecalled",
+            PeerMsg::LockReleased { .. } => "LockReleased",
+            PeerMsg::LockRenew { .. } => "LockRenew",
+            PeerMsg::LockRenewed { .. } => "LockRenewed",
+            PeerMsg::LockMirror { .. } => "LockMirror",
+            PeerMsg::LockTest { .. } => "LockTest",
+            PeerMsg::LockTestReply { .. } => "LockTestReply",
+        }
+    }
+
     /// The correlation id this message *answers*, when it is a reply.
     pub fn answers(&self) -> Option<OpId> {
         match self {

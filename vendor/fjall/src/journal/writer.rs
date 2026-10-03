@@ -199,6 +199,39 @@ impl Writer {
         })
     }
 
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 4): flushes
+    /// the IO buffer, and for a syncing `mode` hands back a duplicate of
+    /// the file's descriptor (and the file's path, for the error) to sync
+    /// without holding the writer. A sync through it covers everything
+    /// written before the flush.
+    pub(crate) fn flush_for_sync(
+        &mut self,
+        mode: PersistMode,
+    ) -> std::io::Result<Option<(std::fs::File, PathBuf)>> {
+        log::trace!(
+            "Persisting journal at {} with mode={mode:?}",
+            self.path.display(),
+        );
+
+        if self.is_buffer_dirty {
+            self.file.flush().inspect_err(|e| {
+                log::error!(
+                    "Failed to flush journal IO buffers at {}: {e:?}",
+                    self.path.display(),
+                );
+            })?;
+            self.is_buffer_dirty = false;
+        }
+        match mode {
+            PersistMode::Buffer => Ok(None),
+            PersistMode::SyncAll | PersistMode::SyncData => self
+                .file
+                .get_ref()
+                .try_clone()
+                .map(|file| Some((file, self.path.clone()))),
+        }
+    }
+
     /// Persists the journal file.
     pub(crate) fn persist(&mut self, mode: PersistMode) -> std::io::Result<()> {
         log::trace!(

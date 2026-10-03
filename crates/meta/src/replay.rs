@@ -1319,14 +1319,28 @@ fn apply_set_xattr(
     let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
         return Ok(Applied::Done);
     };
+    let mut attrs = rec.attrs;
+    attrs.ctime_ns = t;
+    if ns::put_spilled_xattr(
+        tx,
+        &meta.ns,
+        dirty,
+        &meta.blobs,
+        ino,
+        &rec,
+        attrs,
+        name,
+        Some(value),
+    )? {
+        misc::xattr_by_name_put_tx(tx, &meta.xattr_by_name, name, ino, value);
+        return Ok(Applied::Done);
+    }
     let mut xattrs = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?;
     if let Some(slot) = xattrs.iter_mut().find(|(n, _)| n == name) {
         slot.1 = value.to_vec();
     } else {
         xattrs.push((name.to_string(), value.to_vec()));
     }
-    let mut attrs = rec.attrs;
-    attrs.ctime_ns = t;
     let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
         .into_iter()
         .map(|(n, v)| (n.into_bytes(), v))
@@ -1367,10 +1381,24 @@ fn apply_remove_xattr(
     let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
         return Ok(Applied::Done);
     };
-    let mut xattrs = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?;
-    xattrs.retain(|(n, _)| n != name);
     let mut attrs = rec.attrs;
     attrs.ctime_ns = t;
+    if ns::put_spilled_xattr(
+        tx,
+        &meta.ns,
+        dirty,
+        &meta.blobs,
+        ino,
+        &rec,
+        attrs,
+        name,
+        None,
+    )? {
+        misc::xattr_by_name_del_tx(tx, &meta.xattr_by_name, name, ino);
+        return Ok(Applied::Done);
+    }
+    let mut xattrs = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?;
+    xattrs.retain(|(n, _)| n != name);
     let xattr_pairs: Vec<(Vec<u8>, Vec<u8>)> = xattrs
         .into_iter()
         .map(|(n, v)| (n.into_bytes(), v))

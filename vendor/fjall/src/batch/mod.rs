@@ -9,6 +9,10 @@ use item::Item;
 use lsm_tree::{AbstractTree, UserKey, UserValue, ValueType};
 use std::collections::HashSet;
 
+// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 5).
+mod slow_commit;
+use slow_commit::{Phase, SlowCommit};
+
 /// An atomic write batch
 ///
 /// Allows atomically writing across keyspaces inside the [`Database`].
@@ -103,7 +107,11 @@ impl WriteBatch {
         }
 
         log::trace!("batch: Acquiring journal writer");
+        // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 5).
+        let mut timing = SlowCommit::start();
+        let items = self.data.len();
         let mut journal_writer = self.db.supervisor.journal.get_writer()?;
+        timing.mark(Phase::JournalLock);
 
         // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
         if self.db.is_poisoned.is_poisoned() {
@@ -121,6 +129,7 @@ impl WriteBatch {
                 self.db.is_poisoned.poison();
             })?;
 
+        timing.mark(Phase::JournalWrite);
         if let Some(mode) = self.durability {
             journal_writer.persist(mode).inspect_err(|e| {
                 log::error!(
@@ -134,6 +143,7 @@ impl WriteBatch {
         #[expect(clippy::mutable_key_type)]
         let mut keyspaces_with_possible_stall = HashSet::new();
 
+        timing.mark(Phase::Persist);
         #[expect(clippy::expect_used)]
         let keyspaces = self
             .db
@@ -141,6 +151,7 @@ impl WriteBatch {
             .keyspaces
             .read()
             .expect("lock is poisoned");
+        timing.mark(Phase::KeyspacesLock);
 
         let mut batch_size = 0u64;
 
@@ -161,6 +172,7 @@ impl WriteBatch {
             keyspaces_with_possible_stall.insert(item.keyspace.clone());
         }
 
+        timing.mark(Phase::Memtables);
         self.db.supervisor.snapshot_tracker.publish(batch_seqno);
 
         drop(journal_writer);
@@ -179,6 +191,8 @@ impl WriteBatch {
             keyspace.check_memtable_rotate(memtable_size);
             keyspace.local_backpressure();
         }
+        timing.mark(Phase::Backpressure);
+        timing.report(items);
 
         Ok(())
     }

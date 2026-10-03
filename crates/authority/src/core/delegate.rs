@@ -967,15 +967,45 @@ impl Core {
     /// Phase 2b: transaction `(gen, idx)` is durable enough to
     /// acknowledge: on the backup, or in a segment this replica applied.
     pub(crate) fn deleg_stream_durable(&self, gen: u64, idx: u64, replica: &dyn Replica) -> bool {
+        self.deleg_stream_durable_with(gen, idx, || replica.delegate_tx_pending(gen, idx))
+    }
+
+    /// [`Self::deleg_stream_durable`] with the journal read cached across
+    /// calls (`pending`, read on first need): `complete_ready` checks every
+    /// parked acknowledgement on every event, and one read of the journal
+    /// heads per check was most of a loaded delegate's core time while its
+    /// backup lagged (`stress-ng-fs-nodes`: 73% of the core thread's
+    /// samples, steps of seconds back to back).
+    pub(crate) fn deleg_stream_durable_cached(
+        &self,
+        gen: u64,
+        idx: u64,
+        replica: &dyn Replica,
+        pending: &mut Option<Option<std::collections::HashSet<(u64, u64)>>>,
+    ) -> bool {
+        self.deleg_stream_durable_with(gen, idx, || {
+            pending
+                .get_or_insert_with(|| replica.delegate_txs_pending())
+                .as_ref()
+                .is_none_or(|set| set.contains(&(gen, idx)))
+        })
+    }
+
+    fn deleg_stream_durable_with(
+        &self,
+        gen: u64,
+        idx: u64,
+        pending: impl FnOnce() -> bool,
+    ) -> bool {
         let Some(d) = self.dl.mine.get(&gen) else {
             return true;
         };
         if self.cfg.ack_s3 {
-            return !replica.delegate_tx_pending(gen, idx);
+            return !pending();
         }
         match d.backup {
             None => true,
-            Some(_) => d.backup_acked >= idx || !replica.delegate_tx_pending(gen, idx),
+            Some(_) => d.backup_acked >= idx || !pending(),
         }
     }
 

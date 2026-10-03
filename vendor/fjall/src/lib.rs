@@ -163,6 +163,9 @@ pub use tx::single_writer::{
     WriteTransaction as SingleWriterWriteTx,
 };
 
+// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 3).
+pub use tx::single_writer::set_write_priority;
+
 pub use tx::optimistic::{
     Conflict, OptimisticTxDatabase, OptimisticTxKeyspace, WriteTransaction as OptimisticWriteTx,
 };

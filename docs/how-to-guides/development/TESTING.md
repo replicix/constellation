@@ -8,6 +8,7 @@ nightly and on manual dispatch (`.github/workflows/nightly.yml`).
 | Lane | Command | Backend | Needs | Speed |
 |---|---|---|---|---|
 | Unit tests | `cargo test --workspace` | in-memory / tempdir | Rust | seconds |
+| Vendored fjall | `cargo test --manifest-path vendor/fjall/Cargo.toml --lib` | tempdir | Rust | seconds |
 | Host smoke | `tests/smoke.sh` (= `harness smoke`) | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
@@ -15,6 +16,12 @@ nightly and on manual dispatch (`.github/workflows/nightly.yml`).
 | xfstests | `make xfstests` | floci S3, separate test/scratch prefixes | docker | long |
 | Performance | `make perf-gate` | local floci S3 | Rust, fuse3, docker | minutes |
 | Read-path cost | `make read-cpu-gate` | local directory | Linux, Rust, fuse3, fio | ~5 min |
+
+The vendored fjall is outside the workspace (`vendor/fjall/CONSTELLATION-PATCH.md`),
+so its own unit tests — among them the writer lock's (`writer_lock`) and
+the journal's — run only through its manifest; run them after touching
+anything under `vendor/fjall`. Its `Cargo.lock` and `target/` are
+ignored.
 
 The fault-injection lane includes **`chaos-ci`**: same-path conflict races
 across three local mounts of one filesystem (create/mkdir/unlink/rename
@@ -1954,6 +1961,11 @@ relay of its own so requests can be attributed per role):
     the root, the dead node remounts with its journal (its acknowledged
     writes replay by rid), everything converges and `d1` is delegated
     again at a higher generation.
+  - `delegate-crash-default-ttl`: the same at the default grant TTL (the
+    lock grant TTL, 20 s; every other M11 scenario pins 3 s): the third
+    node's write waits for the reclaim, about `ttl + margin` after the
+    dead delegate's last renewal — more than the short TTL's whole life,
+    less than `ttl + 10 s`.
   - `marker-order`: three writers (the root and both delegates) each
     write data into `d1` (delegated to `b`) then a marker into `d2`
     (delegated to `c`), for 12 s; three watchers list `d2` continuously

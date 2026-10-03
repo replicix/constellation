@@ -156,7 +156,10 @@ delegated directory do not wait for its ship either. Status:
 
 ### Grants, renewal and expiry
 
-- A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (5 s). The delegate
+- A grant lasts `CONSTELLATION_DELEGATION_TTL_MS` (by default the lock
+  grant TTL, 20 s, and at least 5 s: lock grants under a delegation never
+  outlive it, and at 5 s a lock in a delegated subtree was honoured for
+  under 3 s and lapsed on any slow step). The delegate
   renews it at half its TTL (`DelegRenew`); the root answers with a new
   grant capped by the root's own lease (`expires − margin`), so a grant
   never outlives the lease it came from.
@@ -353,7 +356,7 @@ designations create no delegation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `CONSTELLATION_DELEGATION` | on | delegate and accept delegations |
-| `CONSTELLATION_DELEGATION_TTL_MS` | `5000` | grant lifetime |
+| `CONSTELLATION_DELEGATION_TTL_MS` | lock TTL (20 s), at least `5000` | grant lifetime |
 | `CONSTELLATION_DELEGATION_PLACEMENT` | on | automatic placement and splits |
 | `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | placement window |
 | `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | rate floor per window |
