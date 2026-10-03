@@ -440,7 +440,7 @@ impl Core {
                             self.stats.deps_overflow_to_root += 1;
                         } else if self.reaches(now, d.node) {
                             self.stats.deleg_forwarded += 1;
-                            self.send_forward(now, rid, d.node, out);
+                            self.send_forward(now, rid, d.node, replica, out);
                             return;
                         }
                     }
@@ -670,7 +670,7 @@ impl Core {
             if let Some(t) = self.clients.get_mut(&rid).and_then(|c| c.timer.take()) {
                 self.cancel_timer(t, out);
             }
-            self.send_forward(now, rid, 0, out);
+            self.send_forward(now, rid, 0, replica, out);
         }
     }
 
@@ -717,7 +717,9 @@ impl Core {
         }
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {
-            Some(holder) if self.reaches(now, holder) => self.send_forward(now, rid, holder, out),
+            Some(holder) if self.reaches(now, holder) => {
+                self.send_forward(now, rid, holder, replica, out)
+            }
             // A cache naming this node is not trustworthy on its own
             // (nothing invalidates it when the lease is lost); re-read.
             // An unreachable holder needs the lease object too: the
@@ -776,7 +778,7 @@ impl Core {
                     "holder learned from the lease"
                 );
                 if reaches {
-                    self.send_forward(now, rid, holder, out);
+                    self.send_forward(now, rid, holder, replica, out);
                 } else if self.cfg.inbox {
                     self.inbox_enqueue(now, rid, epoch, replica, out);
                 } else {
@@ -797,6 +799,7 @@ impl Core {
         now: Ms,
         rid: Rid,
         holder: NodeId,
+        replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         let req = self.op_id();
@@ -863,6 +866,7 @@ impl Core {
                 op: c.op.clone(),
                 acked_through,
                 deps,
+                applied: replica.applied_seq().unwrap_or(0),
             },
         });
     }
@@ -923,7 +927,7 @@ impl Core {
                 if replica.completed_position(rid).ok().flatten().is_some() {
                     // Delivered by the log already; the rest of what the
                     // holder evaluated against normally came with it.
-                    self.observe(rid, position, replica);
+                    self.observe_reply(rid, position, &own_chunks, replica, out);
                     self.finish(
                         now,
                         rid,
@@ -985,7 +989,7 @@ impl Core {
                             self.stats.queued_behind_takeover += 1;
                             self.lease_path(now, rid, replica, out);
                         } else {
-                            self.observe(rid, position, replica);
+                            self.observe_reply(rid, position, &own_chunks, replica, out);
                             self.finish(
                                 now,
                                 rid,
@@ -1064,7 +1068,7 @@ impl Core {
                 if holder != 0 && holder != from && holder != self.cfg.node_id && c.redirected < 2 {
                     c.redirected += 1;
                     self.stats.forward_redirects += 1;
-                    self.send_forward(now, rid, holder, out);
+                    self.send_forward(now, rid, holder, replica, out);
                 } else {
                     self.lease_path(now, rid, replica, out);
                 }
@@ -1094,7 +1098,7 @@ impl Core {
                     }
                 }
                 if !hinted {
-                    self.observe(rid, position, replica);
+                    self.observe_reply(rid, position, &own_chunks, replica, out);
                 }
                 self.finish(now, rid, outcome, replica, out);
             }
@@ -1102,7 +1106,7 @@ impl Core {
                 // Plan 30 §M6: a refusal observed the holder's state
                 // without installing anything here (this replaces plan 29
                 // M6's per-name causal wait: every later read waits).
-                self.observe(rid, position, replica);
+                self.observe_reply(rid, position, &own_chunks, replica, out);
                 self.finish(now, rid, outcome, replica, out)
             }
         }
@@ -1237,7 +1241,9 @@ impl Core {
         }
         let cached = self.lease.cached_holder.filter(|h| *h != self.cfg.node_id);
         match cached {
-            Some(holder) if self.reaches(now, holder) => self.send_forward(now, rid, holder, out),
+            Some(holder) if self.reaches(now, holder) => {
+                self.send_forward(now, rid, holder, replica, out)
+            }
             _ => self.route(now, rid, replica, out),
         }
     }
@@ -1363,7 +1369,7 @@ impl Core {
                 "S3 stalled: forwarding the op again instead of waiting on the lease path"
             );
             self.stats.s3_less_forwards += 1;
-            self.send_forward(now, rid, holder, out);
+            self.send_forward(now, rid, holder, replica, out);
         }
     }
 
@@ -1583,7 +1589,7 @@ impl Core {
                     let c = self.clients.get_mut(&rid).expect("present");
                     c.attempts = 0;
                     c.redirected = 0;
-                    self.send_forward(now, rid, holder, out);
+                    self.send_forward(now, rid, holder, replica, out);
                     return;
                 }
             }
@@ -1772,6 +1778,43 @@ impl Core {
     /// Plan 30 §M6: a client-visible reply to `rid` observed `position`
     /// without installing its effects here: raise `observed`. A replay's
     /// outcome is not client-visible and raises nothing.
+    /// [`Self::observe`] a reply's position, for an op that finishes
+    /// with it. Chunk close-stall-followup: every later read here waits
+    /// until the log reaches that position, and the sequencer said whether
+    /// that waits for this node's own held chunks (`OwnChunks`, through
+    /// the position: a `back` close of this node's answered at once and
+    /// still deferred there keeps every segment's `through` below it).
+    /// `Upload`: upload them now, as for an op's own record; nothing else
+    /// would on a metered network, and the reads would wait out the
+    /// session budget until the watermark's TTL drops it. `Streamed`: the
+    /// stream brings the position here.
+    fn observe_reply(
+        &mut self,
+        rid: Rid,
+        position: Position,
+        own_chunks: &OwnChunks,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let client = self
+            .clients
+            .get(&rid)
+            .is_some_and(|c| c.origin == Origin::Client);
+        self.observe(rid, position, replica);
+        if let (true, OwnChunks::Upload(inos)) = (client, own_chunks) {
+            if self.cfg.own_record_wait_ms > 0 && !inos.is_empty() {
+                self.stats.own_record_uploads += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    ?inos,
+                    "an observed position waits for this node's pending chunks: uploading them"
+                );
+                out.push(Action::UploadAwaited { inos: inos.clone() });
+            }
+        }
+    }
+
     fn observe(&self, rid: Rid, position: Position, replica: &dyn Replica) {
         if self
             .clients

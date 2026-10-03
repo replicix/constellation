@@ -404,6 +404,7 @@ impl constellation_net::PeerService for P2pBridge {
         acked_through: u64,
         deps: Vec<u8>,
         pending: Vec<[u8; 32]>,
+        applied: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -429,6 +430,7 @@ impl constellation_net::PeerService for P2pBridge {
                     acked_through,
                     deps,
                     pending,
+                    applied,
                     reply,
                 })
                 .is_ok()

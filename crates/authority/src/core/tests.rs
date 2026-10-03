@@ -333,6 +333,7 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
         op: op.clone(),
         acked_through: 0,
         deps: constellation_meta::Position::ZERO,
+        applied: 0,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -419,6 +420,7 @@ fn a_reply_base_names_the_unshipped_overlap() {
                 op,
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
+                applied: 0,
             },
         });
         match sends(&out)[0].1 {
@@ -1410,6 +1412,7 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
                 op,
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
+                applied: 0,
             },
         });
         match sends(&out)[0].1 {
@@ -2763,6 +2766,414 @@ mod own_chunks {
         assert_eq!(timers(&out, TimerKind::OwnRecordWait).len(), 1);
         (requester, rid, records)
     }
+
+    /// Chunk close-stall-followup: a requester that has applied the
+    /// reply's base installs the reply at once and never reads its
+    /// `own_chunks`, so the holder skips working them out; one that has
+    /// not still gets them — for its own close, and for the first one,
+    /// still deferred before it in the position it will observe. Node 2
+    /// closes `g1` and `g2` (shipped files, so the base is the floor, 5)
+    /// with a chunk pending on it each.
+    #[test]
+    fn a_reply_the_requester_installs_at_once_skips_the_walk() {
+        let (mut holder, _requester) = holding(AckPolicy::Local, Vec::new());
+        let files: Vec<u64> = ["g1", "g2"]
+            .into_iter()
+            .map(|name| {
+                let create = holder.create(name);
+                constellation_meta::execute_mutate(&holder.meta, &create, None).unwrap();
+                let MutateOp::Create { ino, .. } = create else {
+                    unreachable!()
+                };
+                ino
+            })
+            .collect();
+        let rows: Vec<u64> = holder
+            .meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b.into_iter().map(|(s, _)| s))
+            .collect();
+        holder.meta.ack_journal_rows_at(&rows, 5).unwrap();
+        holder.core.shipped_floor = 5;
+        for (i, (ino, applied, want)) in [
+            (files[0], 5, OwnChunks::None),
+            (files[1], 4, OwnChunks::Upload(files.clone())),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let chunk = ChunkHash::of(&ino.to_be_bytes());
+            holder.meta.enroll_remote_chunks(ino, &[chunk], 2).unwrap();
+            let manifest =
+                Manifest::from_sparse_chunks(4096, 14, [(0u64, chunk)].into(), 64, ChunkHash::of)
+                    .0
+                    .encode();
+            let out = holder.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::MutateRequest {
+                    req: OpId(40 + i as u64),
+                    rid: Rid {
+                        node: 2,
+                        incarnation: 1,
+                        seq: 1 + i as u64,
+                    },
+                    op: MutateOp::SetManifest {
+                        ino,
+                        base_manifest: None,
+                        manifest,
+                        size: 14,
+                    },
+                    acked_through: 0,
+                    deps: constellation_meta::Position::ZERO,
+                    applied,
+                },
+            });
+            let [(2, reply @ PeerMsg::MutateReply { base, .. })] = sends(&out)[..] else {
+                panic!("one reply: {out:?}")
+            };
+            assert_eq!(*base, Some(5));
+            assert_eq!(own_chunks_of(reply).0, want, "applied {applied}");
+        }
+    }
+
+    /// Chunk close-stall-followup, found on AWS (probes of 4–10 s): node
+    /// 2's close answered at once leaves its chunk held there and its
+    /// record deferred here, below every later segment's `through`. A
+    /// later op of node 2's that observes this journal's position — a
+    /// refusal, or an acceptance that completes through the log — waited
+    /// in every read after it until the session watermark's TTL, though
+    /// the op itself names nothing of the close. Node 1 now names the
+    /// close's inode for the position, and node 2 uploads it.
+    #[test]
+    fn an_observed_position_behind_a_held_close_asks_for_its_upload() {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (close, _, _) = back_close(&mut holder, true);
+        let MutateOp::SetManifest { ino, .. } = close else {
+            unreachable!()
+        };
+        let held = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 90,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &close, Some(held)).unwrap();
+        // A refusal.
+        let rid = requester.rid(1);
+        let unlink = MutateOp::Unlink {
+            parent: ROOT_INO,
+            name: "missing".into(),
+        };
+        let (reply, out) = forward(&mut holder, &mut requester, rid, unlink);
+        let (own, outcome) = own_chunks_of(&reply);
+        assert!(matches!(outcome, MutateOutcome::Errno(_)), "{reply:?}");
+        assert_eq!(own, OwnChunks::Upload(vec![ino]));
+        assert_eq!(uploads_awaited(&out), vec![ino]);
+        // A chmod of node 1's unshipped `x`, unrelated to the close, and
+        // accepted on a base node 2 lacks (`AwaitingLog`).
+        let create = holder.create("x");
+        let MutateOp::Create { ino: x, .. } = create else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&holder.meta, &create, None).unwrap();
+        let rid = requester.rid(2);
+        let chmod = MutateOp::Setattr {
+            ino: x,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        let (reply, out) = forward(&mut holder, &mut requester, rid, chmod);
+        assert_eq!(own_chunks_of(&reply).0, OwnChunks::Upload(vec![ino]));
+        assert!(requester
+            .core
+            .clients()
+            .any(|(r, phase)| r == rid && phase == ClientPhase::AwaitingLog));
+        assert_eq!(uploads_awaited(&out), vec![ino]);
+        // Reported up: nothing more to name.
+        holder
+            .meta
+            .ack_remote_chunks(&[ChunkHash::of(b"held on node 2")])
+            .unwrap();
+        let rid = requester.rid(3);
+        let unlink = MutateOp::Unlink {
+            parent: ROOT_INO,
+            name: "missing2".into(),
+        };
+        let (reply, out) = forward(&mut holder, &mut requester, rid, unlink);
+        assert_eq!(own_chunks_of(&reply).0, OwnChunks::None);
+        assert!(uploads_awaited(&out).is_empty());
+    }
+
+    /// Chunk close-stall-followup: an acknowledgement parked for
+    /// durability keeps what its transaction waits for between hold
+    /// intervals, and works it out again only every `own_record_wait_ms`.
+    /// A kept answer can only be too large (node 2 reported its chunk up
+    /// meanwhile): the refresh then says `None`.
+    #[test]
+    fn a_parked_acknowledgement_keeps_its_blockers_until_the_refresh() {
+        let (mut holder, _requester) = holding(AckPolicy::S3, Vec::new());
+        let (op, _, _) = back_close(&mut holder, true);
+        let MutateOp::SetManifest { ino, .. } = op else {
+            unreachable!()
+        };
+        let request = PeerMsg::MutateRequest {
+            req: OpId(50),
+            rid: Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            },
+            op,
+            acked_through: 0,
+            deps: constellation_meta::Position::ZERO,
+            applied: 0,
+        };
+        let tick = |holder: &mut Harness, ms: u64| {
+            let out = holder.step(Event::Peer {
+                from: 2,
+                msg: request.clone(),
+            });
+            let [held] = timers(&out, TimerKind::HeldReply)[..] else {
+                panic!("re-attached: {out:?}")
+            };
+            holder.advance(ms);
+            let out = holder.step(Event::Timer { id: held });
+            let [(2, reply)] = sends(&out)[..] else {
+                panic!("a held reply: {out:?}")
+            };
+            own_chunks_of(reply).0
+        };
+        let out = holder.step(Event::Peer {
+            from: 2,
+            msg: request.clone(),
+        });
+        let [(2, reply)] = sends(&out)[..] else {
+            panic!("held for upload: {out:?}")
+        };
+        assert_eq!(own_chunks_of(reply).0, OwnChunks::Upload(vec![ino]));
+        holder
+            .meta
+            .ack_remote_chunks(&[ChunkHash::of(b"held on node 2")])
+            .unwrap();
+        let hold = holder.core.cfg.recall_hold_ms;
+        assert_eq!(
+            tick(&mut holder, hold),
+            OwnChunks::Upload(vec![ino]),
+            "kept"
+        );
+        let wait = holder.core.cfg.own_record_wait_ms;
+        assert_eq!(tick(&mut holder, wait), OwnChunks::None, "refreshed");
+    }
+
+    /// Chunk close-stall-followup: the holder's cost of `own_chunks_for`
+    /// per forwarded op, measured as the whole core step that answers it.
+    /// A holder with a 10,000-transaction unshipped journal (its own
+    /// creates), node 2 a metered `back` forwarder with one close's chunk
+    /// still pending here (deferred), node 7 with 1,000 pending marks of
+    /// its own, and node 3 with none. Run in release:
+    /// `cargo test --release -p constellation-authority --lib
+    /// own_chunks::cost -- --ignored --nocapture`.
+    mod cost {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        const JOURNAL: usize = 10_000;
+        const OPS: usize = 200;
+
+        fn request(req: u64, rid: Rid, op: MutateOp) -> PeerMsg {
+            PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid,
+                op,
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+            }
+        }
+
+        fn rid_of(node: NodeId, seq: u64) -> Rid {
+            Rid {
+                node,
+                incarnation: 1,
+                seq,
+            }
+        }
+
+        fn chmod(ino: u64, mode: u32) -> MutateOp {
+            MutateOp::Setattr {
+                ino,
+                mode: Some(mode),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+            }
+        }
+
+        fn create_in(meta: &Meta, parent: u64, name: &str) -> MutateOp {
+            MutateOp::Create {
+                parent,
+                name: name.into(),
+                ino: meta.allocate_ino(parent).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            }
+        }
+
+        /// The holder as described above. Returns it, the inode node 2's
+        /// held close wrote, and a shipped directory nothing unshipped
+        /// touches.
+        fn loaded(policy: AckPolicy) -> (Harness, u64, u64) {
+            let (mut holder, _requester) = holding(policy, Vec::new());
+            let dir = MutateOp::Mkdir {
+                parent: ROOT_INO,
+                name: "rd".into(),
+                ino: holder.meta.allocate_ino(ROOT_INO).unwrap(),
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+            };
+            let MutateOp::Mkdir { ino: rd, .. } = dir else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&holder.meta, &dir, None).unwrap();
+            let (close, _, _) = back_close(&mut holder, true);
+            let MutateOp::SetManifest { ino: f, .. } = close else {
+                unreachable!()
+            };
+            // Ship the mkdir and f's create; the close stays deferred.
+            let rows: Vec<u64> = holder
+                .meta
+                .take_journal_grouped(usize::MAX)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(_, b)| b.into_iter().map(|(s, _)| s))
+                .collect();
+            holder.meta.ack_journal_rows_at(&rows, 1).unwrap();
+            constellation_meta::execute_mutate(&holder.meta, &close, Some(rid_of(2, 1))).unwrap();
+            for i in 0..JOURNAL {
+                let op = create_in(&holder.meta, ROOT_INO, &format!("h{i}"));
+                constellation_meta::execute_mutate(&holder.meta, &op, None).unwrap();
+            }
+            for i in 0..1_000u64 {
+                let ino = 1_000_000 + i;
+                holder
+                    .meta
+                    .enroll_remote_chunks(ino, &[ChunkHash::of(&ino.to_be_bytes())], 7)
+                    .unwrap();
+            }
+            (holder, f, rd)
+        }
+
+        fn report(what: &str, mut times: Vec<Duration>) {
+            times.sort();
+            let total: Duration = times.iter().sum();
+            eprintln!(
+                "COST {what}: n={} median={:?} mean={:?} p90={:?} max={:?}",
+                times.len(),
+                times[times.len() / 2],
+                total / times.len() as u32,
+                times[times.len() * 9 / 10],
+                times[times.len() - 1],
+            );
+        }
+
+        #[test]
+        #[ignore = "benchmark; run in release with --ignored --nocapture"]
+        fn per_forwarded_op_core_step() {
+            let (mut holder, f, rd) = loaded(AckPolicy::Local);
+            let mut req = 100;
+            let mut seq = 10;
+            let mut step = |holder: &mut Harness, from: NodeId, op: MutateOp| {
+                req += 1;
+                seq += 1;
+                let msg = request(req, rid_of(from, seq), op);
+                let t = Instant::now();
+                let out = holder.step(Event::Peer { from, msg });
+                let took = t.elapsed();
+                assert!(!sends(&out).is_empty(), "answered: {out:?}");
+                (took, out)
+            };
+            // Node 3 (nothing pending), creating in the shipped directory.
+            let mut t3 = Vec::new();
+            for i in 0..OPS {
+                let op = create_in(&holder.meta, rd, &format!("n3-{i}"));
+                t3.push(step(&mut holder, 3, op).0);
+            }
+            report("node 3 (nothing pending), create in rd", t3);
+            // Node 2 (its close pending), creating in the shipped directory:
+            // the reply's base is covered.
+            let mut t2 = Vec::new();
+            for i in 0..OPS {
+                let op = create_in(&holder.meta, rd, &format!("n2-{i}"));
+                t2.push(step(&mut holder, 2, op).0);
+            }
+            report("node 2 (close pending), create in rd (base covered)", t2);
+            // Node 2, chmod of its held file: depends on the close.
+            let mut tc = Vec::new();
+            for i in 0..OPS {
+                let (took, out) = step(&mut holder, 2, chmod(f, 0o600 + (i as u32 % 8)));
+                let [(2, reply)] = sends(&out)[..] else {
+                    panic!("{out:?}")
+                };
+                assert_eq!(own_chunks_of(reply).0, OwnChunks::Upload(vec![f]));
+                tc.push(took);
+            }
+            report("node 2 (close pending), chmod of the held file", tc);
+        }
+
+        #[test]
+        #[ignore = "benchmark; run in release with --ignored --nocapture"]
+        fn per_parked_reply_tick() {
+            let (mut holder, f, _rd) = loaded(AckPolicy::S3);
+            let mut requests = Vec::new();
+            for i in 0..20u64 {
+                let msg = request(200 + i, rid_of(2, 20 + i), chmod(f, 0o600 + (i as u32 % 8)));
+                let out = holder.step(Event::Peer {
+                    from: 2,
+                    msg: msg.clone(),
+                });
+                // Answered at once: `Held` asking for the upload.
+                let [(2, reply)] = sends(&out)[..] else {
+                    panic!("held for upload: {out:?}")
+                };
+                assert_eq!(own_chunks_of(reply).0, OwnChunks::Upload(vec![f]));
+                requests.push(msg);
+            }
+            let mut ticks = Vec::new();
+            for _round in 0..10 {
+                // Each retry re-attaches; the next tick answers it.
+                let mut held = Vec::new();
+                for msg in &requests {
+                    let out = holder.step(Event::Peer {
+                        from: 2,
+                        msg: msg.clone(),
+                    });
+                    assert!(sends(&out).is_empty(), "re-attached: {out:?}");
+                    held.extend(timers(&out, TimerKind::HeldReply));
+                }
+                assert_eq!(held.len(), 20, "parked for durability");
+                holder.advance(holder.core.cfg.recall_hold_ms);
+                for id in held {
+                    let t = Instant::now();
+                    let out = holder.step(Event::Timer { id });
+                    ticks.push(t.elapsed());
+                    let [(2, reply)] = sends(&out)[..] else {
+                        panic!("a held reply: {out:?}")
+                    };
+                    assert_eq!(own_chunks_of(reply).0, OwnChunks::Upload(vec![f]));
+                }
+            }
+            report("parked ack=s3 reply, one hold tick", ticks);
+        }
+    }
 }
 
 // ---- plan 30 §M7: log streams ----
@@ -3672,6 +4083,7 @@ mod cto {
                 op,
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
+                applied: 0,
             },
         })
     }
@@ -4321,6 +4733,64 @@ mod epoch_rules {
         );
     }
 
+    /// Chunk close-stall-followup: a stranded op's replay in an epoch
+    /// that refuses writes is neither resent every drain tick (each send
+    /// was answered in doubt and requeued) nor, after
+    /// `replay_lease_fallback_ms`, turned into a lease request the epoch
+    /// cannot grant. Once the epoch ends the drain resends it.
+    #[test]
+    fn a_stranded_replay_waits_out_an_epoch_that_refuses_writes() {
+        for frozen in [false, true] {
+            let mut h = Harness::new(2);
+            h.core.lease.cached_holder = Some(1);
+            h.step(Event::Peers {
+                links: vec![crate::event::PeerLink {
+                    node: 1,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: Some(Ms(0)),
+                }],
+            });
+            let rid = h.rid(1);
+            let op = h.create("a");
+            h.meta.queue_replay(rid, &op).unwrap();
+            h.step(refusing_epoch(frozen, vec![2]));
+            let ticks = h.core.cfg.replay_lease_fallback_ms / h.core.cfg.replay_drain_ms + 4;
+            for _ in 0..ticks {
+                h.advance(h.core.cfg.replay_drain_ms);
+                let mut out = Vec::new();
+                let now = h.now;
+                h.core.on_drain_tick(now, &h.meta, &mut out);
+                assert!(out.is_empty(), "frozen {frozen}: {out:?}");
+                assert!(h.core.job.is_none(), "no lease asked for");
+                assert!(!h.core.clients.contains_key(&rid));
+            }
+            assert_eq!(h.meta.pending_replays().unwrap().len(), 1, "still queued");
+            h.step(Event::Control {
+                op: OpId(902),
+                req: Control::Epoch {
+                    open: false,
+                    active: false,
+                    frozen: false,
+                    flushing: false,
+                    base: 0,
+                    carrier: None,
+                    stale_below: 0,
+                    members: Vec::new(),
+                },
+            });
+            h.advance(h.core.cfg.replay_drain_ms);
+            let mut out = Vec::new();
+            let now = h.now;
+            h.core.on_drain_tick(now, &h.meta, &mut out);
+            assert!(
+                matches!(sends(&out)[..], [(1, PeerMsg::MutateRequest { rid: r, .. })] if *r == rid),
+                "resent once the epoch is over: {out:?}"
+            );
+        }
+    }
+
     fn epoch(open: bool, active: bool, members: Vec<NodeId>) -> Event {
         Event::Control {
             op: OpId(900),
@@ -4513,6 +4983,7 @@ mod refusal_outcomes {
                 op,
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
+                applied: 0,
             },
         })
     }
@@ -8958,6 +9429,7 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
                 },
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
+                applied: 0,
             },
         });
         match sends(&out).first().map(|(_, m)| *m) {
@@ -9747,7 +10219,7 @@ fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted(
 
     // a finds a P2P path (or must be held back): withdrawn first.
     let mut out = Vec::new();
-    h.core.send_forward(h.now, a, 2, &mut out);
+    h.core.send_forward(h.now, a, 2, &h.meta, &mut out);
     let (op, req) = s3_ops(&out)[0];
     match req {
         S3Op::InboxTombstone { batch } => {
@@ -10032,6 +10504,7 @@ fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
         op: op.clone(),
         acked_through: 0,
         deps: constellation_meta::Position::ZERO,
+        applied: 0,
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -10112,6 +10585,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 op,
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
+                applied: 0,
             },
         });
         let (get, _) = s3_ops(&out)
@@ -10146,6 +10620,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 op,
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
+                applied: 0,
             },
         });
         assert!(
@@ -10190,6 +10665,7 @@ fn a_released_lease_is_not_readopted_for_a_forward() {
             op,
             acked_through: 0,
             deps: constellation_meta::Position::ZERO,
+            applied: 0,
         },
     });
     assert!(

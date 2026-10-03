@@ -36541,3 +36541,216 @@ engine pod.
 - [x] "Clone/restore within a pool, and refusal across pools" passes both halves (`csi-clone-cross-pool-refused`).
 - [x] `ListSnapshots` pagination matches csi-sanity's expectations (its pagination spec and the rest of the snapshot groups pass).
 - [x] Carried from 37-k3b: a repeated `DeleteVolume` starts no engine pod (unit test and the kind run above), and the harness's 30 s settle loop is gone.
+
+## Fix: close-stall follow-ups: one deferral rule, a cheap per-op check, and the residual wait on real S3 (`close-stall-followup`)
+
+Follow-ups from the final review of `31a461c` (close-stall-metered), and
+the real-S3 runs it asked for. Those runs found a residual wait cycle,
+fixed here in two parts (below).
+
+### 1. One deferral rule
+
+`store::held::plan` now produces the blame itself (`Blame { theirs, rid }`):
+the blame of every held or deferred transaction (by first seq) and the
+union through the rid's transaction (`Plan::blame`,
+`Plan::blame_through`). It is computed in the pass that decides what is
+held and deferred, so a change to the rule changes the blame with it.
+`deferral_blame` is a thin wrapper that stops the plan after the rid's
+transaction. The old copy treated a held transaction as deferred (a
+superset), and the new rule does too (taint of either kind carries
+blame). An uncaptured transaction counts as touching every key, as
+before. The property test
+`store::held::tests::blame::every_deferred_transaction_is_blamed_on_exactly_what_defers_it`
+(256 cases of up to 40 steps) builds random held journals: own pending
+closes, closes forwarded by nodes 7 and 8, chmods, renames, refusals that
+observed keys, capture toggled off and on, acks, poisonings, partial
+ships. It checks the plan against a pairwise, quadratic statement of the
+rule:
+- the set of waiting transactions matches;
+- every waiting transaction has a blame, and it is exactly its own seeds
+  plus the blame of what it depends on;
+- with every pending chunk attributed, no blame is empty;
+- `deferral_blame` agrees for every rid.
+
+Dropping the observed keys from the blame, or the uncaptured
+transactions' blame, makes it fail (checked).
+
+### 2. The holder's cost per forwarded op
+
+- **Per-node mark count.** `local`'s counter `remote_marks/<node>` counts
+  each node's remote-pending marks, stale ones included. Every mark write
+  and removal goes through `put_mark_tx`/`remove_mark_tx` (enrol,
+  re-enrol by another node, `ack_remote_chunks`, `forget_remote_mark`,
+  `drop-held --remote`, `clear_pending_uploads`). A forwarder with no
+  mark costs one point read. `META_FORMAT` is now 3: a format-2 store has
+  marks without counts. Test:
+  `store::remote::tests::each_nodes_mark_count_follows_its_marks`.
+- **Skip when the requester has the base.** `PeerMsg::MutateRequest` and
+  `Payload::MutateRequest` carry `applied`, the log seq the requester had
+  applied when it sent the op. `deps.seq` cannot stand in for it: that is
+  what the requester *observed*, which can run ahead of what it applied.
+  An acceptance whose `base` that covers is installed at once, so its
+  `own_chunks` would go unread, and the holder skips them. A refusal is
+  never skipped: it is observed whatever the base (see below). ALPN
+  `constellation/3`; `/2` joins `OLDER_ALPNS`. A delegate's execution
+  still works its answer out. Test:
+  `a_reply_the_requester_installs_at_once_skips_the_walk`.
+- **Parked replies.** `own_chunks_for` is split into
+  `own_record_blockers` (the walk) and `own_chunks_given` (the stream
+  decision). A reply parked for its acknowledgement keeps its blockers
+  (`ParkedWhat::Reply::blockers`, seeded at park time) and works them out
+  again only every `own_record_wait_ms`. A kept answer can only be too
+  large: the transaction and everything before it are fixed, so its
+  blockers shrink as the forwarder reports chunks up, and the forwarder's
+  driver skips an inode with nothing pending. The refresh bounds that, and
+  covers a row enrolled again meanwhile. Test:
+  `a_parked_acknowledgement_keeps_its_blockers_until_the_refresh`.
+
+Benchmark: `core::tests::own_chunks::cost` (ignored; release, `--ignored
+--nocapture`). A holder with a 10,000-transaction unshipped journal of
+its own creates, node 2 a metered `back` forwarder with one close's chunk
+held (deferred), node 7 with 1,000 pending marks, node 3 with none. Each
+row is the whole core step that answers the op, 200 ops:
+
+| Case | Before (median) | After (median) |
+|---|---|---|
+| node 3, nothing pending, create in a shipped dir | 139 µs | 26 µs |
+| node 2, close pending, create whose base node 2 has | 21.0 ms | 27 µs |
+| node 2, chmod of its held file (the walk is needed) | 22.4 ms | 23.3 ms |
+| parked `ack=s3` reply, one hold tick (20 parked, 10 rounds) | 14.7 ms | 0.46 µs (one walk per 10 s: ≈ 0.6 ms amortised) |
+
+Not done: a dependent op of a pending forwarder still walks the whole
+unshipped journal (23 ms at 10,000 transactions). That walk is what
+answers it, and it can only start at the oldest transaction naming one of
+the forwarder's chunks. Starting there needs the journal seq at enrolment
+in each mark, and that breaks when a row is acked and enrolled again
+before an earlier transaction naming it ships. Left for a follow-up.
+
+### 3. Nit: a refusing epoch
+
+`on_drain_tick` no longer resends a stranded replay, and the replay
+fallback no longer asks for a lease, while `epoch_refuses_writes()`. The
+time spent waiting does not count as stuck. The copy fallback's lease
+request is skipped there too. Test:
+`a_stranded_replay_waits_out_an_epoch_that_refuses_writes` (frozen and
+carrier-less). Without the guard, the replay was forwarded every tick.
+
+### 4. Real S3: the 4–10 s probes were a wait cycle
+
+The earlier AWS run's 4–6 s probes reproduced on the first two AWS runs
+here. `rename` took 10.02 s and 10.03 s, which failed the 10 s bound, and
+main-loop closes took up to 8.1 s. The logs show the forwarded op was
+not what waited. The op was sent only after A's session watermark was
+dropped at its TTL ("dropping a session watermark this replica has not
+reached"): the lookups before it waited. It came in two parts.
+
+**a. A position behind A's own held close.**
+1. A close of A's is answered on a base A has, so it is installed at
+   once. Its chunk stays held (metered), and B defers its record.
+2. Every later segment's `through` stops below that row.
+3. A's next op that observes B's position (an op that completes through
+   the log, a refusal: `Exists` from an `O_CREAT` open, `Conflict`)
+   raises A's watermark past it. Every later read then waits the session
+   budget (2 s) again and again, until the 10 s TTL drops the watermark.
+4. Only A's upload ends it, and nothing asks for it: B's answer named only
+   the op's own transaction's blockers.
+
+Fix: `Meta::remote_blockers` names the blame of every transaction through
+the op's (`DeferralBlame::through`), not only the op's own. The holder
+works it out for refusals too (`Errno`, `Conflict`, `Exists`). The
+requester uploads on `Upload` whenever it observes the reply's position
+(`Core::observe_reply`), not only while the op waits. Under a backed
+holder nothing changes: the stream carries the position (`Streamed`;
+`stream_reaches` now checks through the reply position). Tests:
+`an_observed_position_behind_a_held_close_asks_for_its_upload` (a
+refusal, then an unrelated chmod behind the held close; nothing after
+the report), and meta `held.rs` (an unrelated op after a deferred close
+names it; one journaled before does not).
+
+**b. The watermark stopped at the deferred rows' own ship.** With (a),
+two AWS runs still had one 4 s create each. B had shipped rows 14–18
+(segment 6) ahead of A's deferred close at 12–13. When A's report let
+12–13 ship (segment 7), `ack_rows_at` and `journal_through_after` set the
+watermark to 13, the highest seq of that ship, though 14–18 had already
+left the journal. In the in-order branch (nothing deferred any more) they
+did not even look. A had observed jseq 18 and waited for the next segment,
+which came only with A's next write. Fix: one rule,
+`journal::watermark_after`: just below the oldest row still in the
+journal (the rows leaving skipped), or, with none, the last seq handed
+out. It costs one journal seek per ack. Ships are not pipelined (the next
+take follows the previous ack), so rows earlier in the journal cannot
+still be in flight. Test: `a_manifest_whose_chunk_is_uploading_...`
+checks that the segment carrying the deferred manifest claims through the
+marker that shipped ahead of it.
+
+Harness: `writeback-close-metered-nonowner` now also requires A's
+`session.timeouts` not to rise through the closes and probes.
+
+Runs. The real-S3 driver is a patched copy of the harness in
+`/var/tmp/csf-real`: the backend is rewritten to `$S3_TEST_URL/csf-<t>-<ts>/…`
+and the floci `AWS_*` variables are skipped. Logs were kept with
+`CHAOS_KEEP_TMP`. The prefixes were purged with a guarded tool (name
+pattern `csf-(aws|ovh)-<10 digits>` under `$S3_TEST_URL`): AWS 1,894
+objects, OVH 370, 0 left.
+
+| Run | Unbacked: slowest close / chmod / rename | Backed | `ack=s3` | A session timeouts |
+|---|---|---|---|---|
+| AWS 1–2, before (a) | 8.1 s / 51 ms / **10.0 s** (fails) | — | — | many |
+| AWS 3–6, with (a) | ≤ 0.13 s, but **6.5 s** and **4.1 s** in runs 4 and 6 | ≤ 35 ms | ≤ 0.25 s | logged in runs 4, 6 |
+| AWS 21–25, final | 0.15–0.33 s / 0.9–350 ms / ≤ 3.3 ms | ≤ 0.50 s; probes ≤ 0.26 s | ≤ 0.17 s; probes ≤ 0.35 s | 0 |
+| OVH 32–34, final | 1.51–1.72 s / 0.93–0.97 s / ≤ 1.9 ms | ≤ 0.33 s; probes ≤ 59 ms | ≤ 2.63 s; probes ≤ 1.3 s | 0 |
+
+- Unbacked now uploads every close's chunk in this race (`pending 0` at
+  the end, where it was 1). The held close is exactly what later reads
+  wait for. Backed still uploads nothing (`pending 4`).
+- OVH run 31 failed in Backed with a 131 s probe close. The host's load
+  average was 164 then. Both nodes logged multi-second core steps (A 0.95
+  s and 6.8 s; B 3.1 s and 7.6 s), which set off a false "holder silent"
+  takeover in each direction (epochs 2 and 3) and a deposition with 7
+  stranded ops. Each replay was answered `Streamed` but waited out A's
+  10 s safety timer before its upload, about 11 s each, one after
+  another. The probe close queued behind them hit its 120 s deadline.
+  The trigger is the host. That a backed root's stream does not carry a
+  replay after such a deposition (`Streamed`, then the 10 s timer each)
+  is a follow-up.
+- Ten instrumented AWS runs (7–16, a debug line in the ship plan) did not
+  hit the 4 s case. The fix for (b) rests on runs 4 and 6 (`applied ...
+  jseq 13` vs `observed ... jseq 18`, segments 6 and 7) and the meta
+  test.
+
+### Gates (2026-10-03, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset)
+
+- `cargo fmt --all` no diff. `cargo clippy --workspace --all-targets --
+  -D warnings` clean.
+- `cargo test`, all 19 packages, 0 failed:
+  - meta 297
+  - authority 186 + 4, sim in `--release` 111 (11 ignored)
+  - types, platform, vfs, fs-core, mtree, net, control,
+    upload-concurrency, frontend-fuse, chaos, csi, uploadbench: 724 in
+    35 binaries
+  - engine, constellation, harness, store-s3: 893 in 20 binaries
+  - model in `--release` 138
+- `tests/smoke.sh` PASSED. `cargo build --release --workspace` ok.
+- Harness on floci (`CONSTELLATION_HARNESS_DOCKER_PREFIX=csf`, `TMPDIR`
+  on `/var`):
+  - `writeback-close-metered-nonowner` PASSED 3/3 (seeds 1, 3, 2;
+    Unbacked ≤ 0.75 s, Backed ≤ 73 ms, `ack=s3` ≤ 0.71 s). With
+    `CONSTELLATION_OWN_RECORD_WAIT_MS=0` it FAILS: the close of `d/f0`
+    takes 120.3 s.
+  - `nonowner-back-crash`, `takeover-resolves-awaiting-close`,
+    `lifecycle-metered-uploads` PASSED.
+  - `forwarded-mutations` failed once, in the paired run under load (98.7
+    s; c0's lease had expired, `expires_in_ms` 0, and c1 held epoch 2).
+    It then passed 5/5 (11–32 s).
+  - Also run: `poison-record-isolation`, `session-exists-observed`,
+    `session-forwarded-ryw`, `session-wait-degrades`,
+    `session-idle-latency`, `unmount-with-held-records` PASSED.
+    `session-stale-base-rename` failed once in that batch ("B already
+    sees the unlink: A shipped while held") and passed 3/3 alone.
+
+### Open
+
+- A pending forwarder's dependent op still walks the whole unshipped
+  journal (above).
+- Replays after a deposition answered `Streamed` that wait the safety
+  timer each (OVH run 31).

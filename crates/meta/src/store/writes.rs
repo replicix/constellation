@@ -89,7 +89,6 @@ impl Meta {
         applied_seq: u64,
     ) -> Result<(), MetaError> {
         use crate::store::spec::{retire_local_tx, retire_tx, Shipped};
-        let mut held_below = false;
         // Plan 30 §M11: the root's own ops forwarded to a delegate are
         // shadows here (§M6) that no segment apply completes: the
         // completions this ship carries retire them, as the segment
@@ -124,8 +123,7 @@ impl Meta {
                 Shipped::Set(&set)
             };
             let retired = retire_local_tx(tx, self, upto, applied_seq, Some(only))?;
-            held_below = retired.held_below;
-            if held_below {
+            if retired.held_below {
                 self.held_work
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -136,7 +134,6 @@ impl Meta {
             &self.local,
             journal_seqs,
             applied_seq,
-            held_below,
         )
     }
 

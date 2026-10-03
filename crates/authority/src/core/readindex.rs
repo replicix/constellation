@@ -120,6 +120,11 @@ pub(crate) enum ParkedWhat {
         position: Position,
         gen: u64,
         held_timer: Option<TimerId>,
+        /// Chunk close-stall-followup: what the op's transaction waits
+        /// for from `to` (`Core::own_record_blockers`), and when that was
+        /// worked out. Kept while the acknowledgement waits: see
+        /// `Core::on_held_reply_timer`.
+        blockers: Option<(Ms, constellation_meta::RemoteBlockers)>,
     },
     /// A local client op's `finish`.
     Finish { rid: Rid, outcome: MutateOutcome },
@@ -1002,6 +1007,7 @@ impl Core {
                 position,
                 gen,
                 held_timer: None,
+                blockers: None,
             },
         );
         self.rd.parked_rids.insert(rid, id);
@@ -1012,6 +1018,26 @@ impl Core {
         }) = self.rd.parked.get_mut(&id)
         {
             *held_timer = Some(timer);
+        }
+    }
+
+    /// Keep `blockers` (worked out at `now`) with `rid`'s parked reply
+    /// (see `Core::on_held_reply_timer`).
+    pub(crate) fn keep_parked_blockers(
+        &mut self,
+        now: Ms,
+        rid: Rid,
+        b: constellation_meta::RemoteBlockers,
+    ) {
+        let Some(id) = self.rd.parked_rids.get(&rid) else {
+            return;
+        };
+        if let Some(Parked {
+            what: ParkedWhat::Reply { blockers, .. },
+            ..
+        }) = self.rd.parked.get_mut(id)
+        {
+            *blockers = Some((now, b));
         }
     }
 
@@ -1116,6 +1142,7 @@ impl Core {
 
     pub(crate) fn on_held_reply_timer(
         &mut self,
+        now: Ms,
         id: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1124,6 +1151,19 @@ impl Core {
         // on the root, the stream's on a delegate) that needs its
         // requester's own chunks says so; a recall's or a parked
         // execution's never does (`OwnChunks`).
+        //
+        // Chunk close-stall-followup: what the transaction waits for is
+        // kept from one hold interval to the next and worked out again
+        // only every `own_record_wait_ms` (a walk of the unshipped journal
+        // when the requester has chunks pending here, inside this step,
+        // every 250 ms per parked reply otherwise). A kept answer can only
+        // be too large: the transaction and everything before it are
+        // fixed, so its blockers shrink as the requester reports chunks up
+        // (a kept inode it already uploaded costs it an empty pass); the
+        // refresh bounds that, and covers a row enrolled again meanwhile.
+        // The requester repeats its upload on the same period by itself.
+        let refresh = self.cfg.own_record_wait_ms.max(self.cfg.recall_hold_ms);
+        let mut fresh = None;
         let own_chunks = match self.rd.parked.get(&id) {
             Some(Parked {
                 what:
@@ -1133,19 +1173,37 @@ impl Core {
                         outcome,
                         position,
                         gen,
+                        blockers,
                         ..
                     },
                 durable,
                 stream_need,
                 ..
             }) if durable.is_some() || stream_need.is_some() => {
-                match self.own_chunks_for(*to, *rid, outcome, (*gen, position), replica) {
+                let blockers = match blockers {
+                    Some((at, kept)) if now < at.plus(refresh) => kept.clone(),
+                    _ => {
+                        let b = self.own_record_blockers(*to, *rid, outcome, *gen, replica);
+                        fresh = Some(b.clone());
+                        b
+                    }
+                };
+                match self.own_chunks_given(*to, (*gen, position), blockers, replica) {
                     upload @ OwnChunks::Upload(_) => upload,
                     _ => OwnChunks::None,
                 }
             }
             _ => OwnChunks::None,
         };
+        if let Some(b) = fresh {
+            if let Some(Parked {
+                what: ParkedWhat::Reply { blockers, .. },
+                ..
+            }) = self.rd.parked.get_mut(&id)
+            {
+                *blockers = Some((now, b));
+            }
+        }
         let (to, req, held_timer, durable) = match self.rd.parked.get_mut(&id) {
             Some(Parked {
                 what:
@@ -1398,6 +1456,8 @@ impl Core {
                     position,
                     gen,
                     held_timer,
+                    // Worked out afresh: the reply leaves once.
+                    blockers: _,
                 } => {
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
@@ -1451,7 +1511,10 @@ impl Core {
                         rid,
                         op,
                         acked_through,
-                        deps,
+                        // What the requester had applied when it sent the
+                        // op is not kept: 0 is below it, so the reply's
+                        // `own_chunks` are worked out (`Core::own_chunks_for`).
+                        (deps, 0),
                         replica,
                         out,
                     );

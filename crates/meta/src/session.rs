@@ -1403,25 +1403,17 @@ impl crate::store::Meta {
     }
 
     /// The acked watermark a ship of journal rows `seqs` will leave
-    /// (`store::journal::ack_rows_at`'s rule, read-only): the highest of
-    /// them, unless a row still in the journal (held back, M4) lies below
-    /// it — then just below that row. What a segment's `through` says.
+    /// (`store::journal::ack_rows_at`'s rule, read-only: just below the
+    /// oldest row left, or every seq handed out when none is;
+    /// `journal::watermark_after`). What a segment's `through` says.
     pub fn journal_through_after(&self, seqs: &[u64]) -> Result<u64, crate::MetaError> {
-        let acked = self.journal_acked_seq()?;
-        let Some(&upto) = seqs.iter().max() else {
-            return Ok(acked);
-        };
-        if !self.held_any.load(Ordering::Relaxed) {
-            return Ok(upto.max(acked));
+        let r = self.db.read_tx();
+        if seqs.is_empty() {
+            return crate::store::journal::acked_watermark(&r, &self.local);
         }
         let shipping: std::collections::HashSet<u64> = seqs.iter().copied().collect();
-        let first_left = self
-            .journal_seqs_between(acked + 1, upto)?
-            .into_iter()
-            .find(|s| !shipping.contains(s));
-        Ok(match first_left {
-            Some(s) => s.saturating_sub(1).max(acked),
-            None => upto.max(acked),
+        crate::store::journal::watermark_after(&r, &self.journal_ks, &self.local, |s| {
+            shipping.contains(&s)
         })
     }
 

@@ -61,7 +61,7 @@ Taken from the design discussion; do not relitigate them.
   by whoever starts the process, which is the same authority that chose
   to run a support build at all.
 - **Separate ALPN, separate allowlist.** `constellation-support/1`,
-  never the cluster ALPN (`constellation/2`, `crates/net/src/message.rs`); the registry allowlist
+  never the cluster ALPN (`constellation/3`, `crates/net/src/message.rs`); the registry allowlist
   (`crates/net/src/allowlist.rs`) is untouched and uninvolved. A support
   client is not a cluster peer and must never become one by accident —
   in particular, it does not gossip, does not hold leases, and does not

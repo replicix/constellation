@@ -465,6 +465,18 @@ What `back` gives up, and what it keeps:
   stream would carry the records uploads the chunks anyway (the stream
   stalled: its backup was lost, say). Before, such an op waited out its
   120 s deadline and failed in doubt.
+
+  The same holds for what the node *reads* after an op. A close answered
+  at once keeps its chunks held, and its records wait on the sequencer.
+  A later op whose answer the node has to catch up with (a refusal, or
+  an op that completes through the log) makes every later read wait
+  until the node's log reaches the sequencer's state at that op, which
+  includes the held close. So the answer also names the files of every
+  earlier op of the node that the sequencer still holds back, and the
+  node uploads them, again only when nothing else would bring those
+  records to it first. Before, such reads waited out
+  `CONSTELLATION_SESSION_WAIT_MS` again and again until the wait was
+  abandoned (4–10 s `open`, `rename` and `chmod` calls on AWS).
 - **Correctness is unchanged**: rebases, exactly-once forwarding,
   conflict detection, locks (a lock's release flushes through) and
   failover behave as under `through`.

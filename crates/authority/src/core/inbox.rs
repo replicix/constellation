@@ -756,7 +756,7 @@ impl Core {
                         c.attempts = 0;
                         c.redirected = 0;
                     }
-                    self.send_forward(now, rid, l.holder, out);
+                    self.send_forward(now, rid, l.holder, replica, out);
                 }
                 Some(l) if l.is_claimable(now.0) => {
                     // The holder is gone; whoever takes over drains the
@@ -1329,7 +1329,7 @@ impl Core {
                 if let Some(key) = key {
                     self.inbox_resubmit_cobatched(now, key, replica, out);
                 }
-                self.send_forward(now, rid, holder, out);
+                self.send_forward(now, rid, holder, replica, out);
             }
             other => {
                 tracing::debug!(

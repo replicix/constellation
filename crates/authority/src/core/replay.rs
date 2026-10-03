@@ -188,6 +188,17 @@ impl Core {
                 // resolve it); nothing to do this tick.
                 return;
             }
+            // Chunk close-stall-followup: in a continuation epoch that
+            // refuses writes (frozen, or carrying no lease) nothing can
+            // execute the replay: sent, it is answered in doubt and stays
+            // queued (never refused: it was acknowledged), so every tick
+            // resent it to the same answer, and the fallback below asked
+            // for a lease the epoch cannot grant. Wait for the epoch to
+            // end; the time spent waiting does not count as stuck.
+            if self.epoch_refuses_writes() {
+                self.replay.stuck_since = None;
+                return;
+            }
             let stuck_for = self.replay.stuck_since.get_or_insert(now).to_owned();
             if now.since(stuck_for) >= self.cfg.replay_lease_fallback_ms as i64
                 && self.lease.ship_epoch(now, &self.cfg).is_none()
@@ -300,9 +311,12 @@ impl Core {
                 .replay
                 .copy_lease_asked_at
                 .is_some_and(|at| now.since(at) < self.cfg.replay_lease_fallback_ms as i64);
+            // Not in an epoch that refuses writes: no lease can be had
+            // there (see `on_drain_tick`).
             if stalled_for >= self.cfg.replay_lease_fallback_ms as i64
                 && !asked_recently
                 && self.lease.ship_epoch(now, &self.cfg).is_none()
+                && !self.epoch_refuses_writes()
             {
                 tracing::warn!(
                     node = self.cfg.node_id,

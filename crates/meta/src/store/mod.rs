@@ -223,10 +223,12 @@ pub(crate) const KV_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
 /// store is created and checked by every open ([`Meta::check_format`]).
 pub(crate) const KV_FORMAT: &str = "format";
 /// The on-disk format this binary reads and writes. There is no migration:
-/// a store of another format is refused at open. 2: a `spec` hint row
+/// a store of another format is refused at open. 3: `local` counts each
+/// node's remote-pending marks (`store::remote`, `remote_marks/<node>`),
+/// which a format-2 store has without the counts. 2: a `spec` hint row
 /// carries the reply's whole `Position` (`SpecKind::Hint::at`), not a
 /// `seq` floor; 1 is every store written before the marker existed.
-pub const META_FORMAT: u32 = 2;
+pub const META_FORMAT: u32 = 3;
 
 pub type JournalBatch = Vec<(u64, crate::record::LogRecord)>;
 /// Plan 30 §M2: `Meta::recent`'s value type — see that field's doc. Each
@@ -2193,13 +2195,15 @@ mod format_tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let meta = Meta::open(dir.path()).unwrap();
-            meta.kv_set(KV_FORMAT, "3").unwrap();
+            meta.kv_set(KV_FORMAT, &(META_FORMAT + 1).to_string())
+                .unwrap();
             meta.sync().unwrap();
         }
         let msg = refusal(dir.path());
         assert!(
             msg.contains(&format!(
-                "on-disk format 3, this binary reads only format {META_FORMAT}"
+                "on-disk format {}, this binary reads only format {META_FORMAT}",
+                META_FORMAT + 1
             )),
             "{msg}"
         );

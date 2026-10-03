@@ -106,7 +106,7 @@ use crate::store::{
 };
 use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
 use fjall::Readable;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 const POISON_PREFIX: &[u8] = b"poisoned/";
@@ -394,28 +394,67 @@ struct Plan {
     held: Vec<Held>,
     deferred: Vec<Tx>,
     opaque: bool,
+    /// With [`Blame`]: the blame of every held or deferred transaction
+    /// planned (by its first journal seq; see [`Blame`]).
+    blame: BTreeMap<u64, BTreeSet<Ino>>,
+    /// With [`Blame::rid`]: that transaction's journal span, the plan
+    /// having stopped right after it; `None` when the journal holds no
+    /// unshipped transaction of that rid.
+    found: Option<(u64, u64)>,
+    /// With [`Blame`]: the union of every blame planned (through the
+    /// found transaction, or the whole journal).
+    blame_through: BTreeSet<Ino>,
+}
+
+/// Chunk close-stall-metered: what the plan should also say about one
+/// node's remote-pending chunks (`store::remote`). The **blame** of a held
+/// or deferred transaction is the set of inodes of `theirs` it waits for:
+/// those its own manifests name, plus the blame of every earlier held or
+/// deferred transaction it depends on — by a key it touches or observed
+/// that that one touched, or, where one of the two is uncaptured (its keys
+/// unknown), unconditionally. It is computed by the same pass that decides
+/// what is held and deferred, so the two cannot drift apart: a change to
+/// the rule changes the blame with it (`deferral_blame`).
+#[derive(Clone, Copy)]
+struct Blame<'a> {
+    theirs: &'a PoisonMap,
+    /// Stop after this rid's transaction (the rest cannot change its
+    /// blame: only earlier transactions are depended on).
+    rid: Option<crate::rid::Rid>,
 }
 
 /// See the module doc's "What is held" and "Deferred". A transaction is
 /// *held* if it is a poisoned seed or depends on a held one; otherwise
 /// *deferred* if it is a pending seed or depends on anything held or
 /// deferred; otherwise it ships. Taint accumulates per kind, so a
-/// transaction behind both is reported as held.
+/// transaction behind both is reported as held. With `blame`, also each
+/// held or deferred transaction's blame ([`Blame`]).
 fn plan(
     r: &impl Readable,
     meta: &Meta,
     poisoned: &PoisonMap,
     pending: &PoisonMap,
+    blame: Option<Blame<'_>>,
 ) -> Result<Plan, MetaError> {
     let mut tainted: HashSet<Vec<u8>> = HashSet::new();
     let mut deferred_keys: HashSet<Vec<u8>> = HashSet::new();
     let mut opaque = false;
     let mut opaque_deferred = false;
+    // The blame of each key a held or deferred transaction touched; that
+    // of every held or deferred uncaptured transaction (which every later
+    // one depends on); that of all of them (which an uncaptured one
+    // depends on).
+    let mut blame_of: HashMap<Vec<u8>, BTreeSet<Ino>> = HashMap::new();
+    let mut opaque_blame: BTreeSet<Ino> = BTreeSet::new();
+    let mut all_blame: BTreeSet<Ino> = BTreeSet::new();
     let mut out = Plan {
         ship: Vec::new(),
         held: Vec::new(),
         deferred: Vec::new(),
         opaque: false,
+        blame: BTreeMap::new(),
+        found: None,
+        blame_through: BTreeSet::new(),
     };
     for tx in transactions(r, meta)? {
         let seeds = seed_inos(&tx, poisoned);
@@ -423,15 +462,17 @@ fn plan(
             Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
             None => None,
         };
+        let row = local::get_journal_tx(r, meta, tx.first)?;
+        let found = blame
+            .and_then(|b| b.rid)
+            .is_some_and(|rid| row.as_ref().and_then(|t| t.rid) == Some(rid));
         // What the transaction observed without writing (a refusal's op:
         // `JournalTx::observed`): a dependency like a written key, but
         // it taints nothing after it. A refusal shipped ahead of the
         // deferred transaction it was refused because of put a refusal
         // in the log that the log's own prefix could not explain
         // (flex-crash seed 481).
-        let observed: Vec<Vec<u8>> = local::get_journal_tx(r, meta, tx.first)?
-            .map(|row| row.observed)
-            .unwrap_or_default();
+        let observed: Vec<Vec<u8>> = row.map(|row| row.observed).unwrap_or_default();
         let held = opaque
             || !seeds.is_empty()
             || observed.iter().any(|k| tainted.contains(k))
@@ -440,97 +481,107 @@ fn plan(
                 // Unknown keys: held once anything is.
                 None => !out.held.is_empty(),
             };
+        let deferred = !held
+            && (opaque_deferred
+                || !seed_inos(&tx, pending).is_empty()
+                || observed.iter().any(|k| deferred_keys.contains(k))
+                || match &keys {
+                    Some(keys) => keys.iter().any(|k| deferred_keys.contains(k)),
+                    None => !out.deferred.is_empty(),
+                });
+        if let (Some(b), true) = (blame, held || deferred) {
+            let mut mine: BTreeSet<Ino> = seed_inos(&tx, b.theirs).into_iter().collect();
+            match &keys {
+                Some(keys) => {
+                    for k in observed.iter().chain(keys) {
+                        if let Some(theirs) = blame_of.get(k) {
+                            mine.extend(theirs);
+                        }
+                    }
+                    mine.extend(&opaque_blame);
+                    for k in keys {
+                        blame_of.entry(k.clone()).or_default().extend(&mine);
+                    }
+                }
+                None => {
+                    mine.extend(&all_blame);
+                    opaque_blame.extend(&mine);
+                }
+            }
+            all_blame.extend(&mine);
+            out.blame.insert(tx.first, mine);
+        }
+        if found {
+            out.found = Some((tx.first, tx.last));
+        }
         if held {
             match &keys {
                 Some(keys) => tainted.extend(keys.iter().cloned()),
                 None => opaque = true,
             }
             out.held.push((tx, seeds, keys));
-            continue;
-        }
-        let deferred = opaque_deferred
-            || !seed_inos(&tx, pending).is_empty()
-            || observed.iter().any(|k| deferred_keys.contains(k))
-            || match &keys {
-                Some(keys) => keys.iter().any(|k| deferred_keys.contains(k)),
-                None => !out.deferred.is_empty(),
-            };
-        if deferred {
+        } else if deferred {
             match &keys {
                 Some(keys) => deferred_keys.extend(keys.iter().cloned()),
                 None => opaque_deferred = true,
             }
             out.deferred.push(tx);
-            continue;
+        } else {
+            out.ship.push(tx);
         }
-        out.ship.push(tx);
+        if found {
+            break;
+        }
     }
     out.opaque = opaque;
+    out.blame_through = all_blame;
     Ok(out)
 }
 
-/// Chunk close-stall-metered: whether the ship plan defers `rid`'s
-/// unshipped transaction, and if so, the inodes of `theirs` — one node's
-/// remote-pending chunks (`store::remote`) — that it waits for: those its
-/// own manifests name, and those of every deferred transaction it depends
-/// on by key, transitively ([`plan`]'s deferral, walked with the seeds
-/// that caused it). `None`: no unshipped transaction of `rid` (shipped,
-/// or never journaled here). A transaction held behind a lost chunk is
-/// planned as deferred here: the node's upload is still one of the things
-/// it waits for.
+/// [`deferral_blame`]'s answer.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeferralBlame {
+    /// The rid's unshipped transaction: its last journal seq and its
+    /// blame (empty when it ships as it is). `None`: no unshipped
+    /// transaction of the rid (shipped, or never journaled here).
+    pub(crate) tx: Option<(u64, BTreeSet<Ino>)>,
+    /// The blame of every held or deferred transaction through the rid's
+    /// (the whole unshipped journal when it has none): what a node that
+    /// observed this journal's position, right after the rid's
+    /// transaction, waits for before its log reaches that position.
+    pub(crate) through: BTreeSet<Ino>,
+}
+
+/// Chunk close-stall-metered: whether the ship plan holds or defers
+/// `rid`'s unshipped transaction, and if so its blame on `theirs` — one
+/// node's remote-pending chunks (`store::remote`): the inodes whose
+/// upload it waits for ([`Blame`]), and that of everything through it
+/// ([`DeferralBlame`]). A thin wrapper over [`plan`], so the answer
+/// follows the ship rule exactly.
 pub(crate) fn deferral_blame(
     r: &impl Readable,
     meta: &Meta,
     rid: crate::rid::Rid,
     theirs: &PoisonMap,
-) -> Result<Option<(u64, BTreeSet<Ino>)>, MetaError> {
+) -> Result<DeferralBlame, MetaError> {
+    let poisoned = read_poisoned(r, meta)?;
     let pending = read_pending(r, meta)?;
-    // The blame of each key a deferred transaction touched.
-    let mut blame_of: BTreeMap<Vec<u8>, BTreeSet<Ino>> = BTreeMap::new();
-    // Every deferred transaction's blame (what an uncaptured transaction,
-    // whose keys are unknown, depends on).
-    let mut all: BTreeSet<Ino> = BTreeSet::new();
-    let mut any_deferred = false;
-    let mut opaque = false;
-    for tx in transactions(r, meta)? {
-        let row = local::get_journal_tx(r, meta, tx.first)?;
-        let keys = match tx.spec_seq {
-            Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
-            None => None,
-        };
-        let observed = row.as_ref().map(|t| t.observed.as_slice()).unwrap_or(&[]);
-        let mut blame: BTreeSet<Ino> = seed_inos(&tx, theirs).into_iter().collect();
-        let mut deferred = !seed_inos(&tx, &pending).is_empty();
-        if opaque || (keys.is_none() && any_deferred) {
-            deferred = true;
-            blame.extend(all.iter().copied());
-        }
-        for k in observed.iter().chain(keys.iter().flatten()) {
-            if let Some(b) = blame_of.get(k) {
-                deferred = true;
-                blame.extend(b.iter().copied());
-            }
-        }
-        if deferred {
-            any_deferred = true;
-            match &keys {
-                Some(keys) => {
-                    for k in keys {
-                        blame_of.entry(k.clone()).or_default().extend(&blame);
-                    }
-                }
-                None => opaque = true,
-            }
-            all.extend(&blame);
-        }
-        if row.and_then(|t| t.rid) == Some(rid) {
-            return Ok(Some((
-                tx.last,
-                if deferred { blame } else { BTreeSet::new() },
-            )));
-        }
-    }
-    Ok(None)
+    let mut plan = plan(
+        r,
+        meta,
+        &poisoned,
+        &pending,
+        Some(Blame {
+            theirs,
+            rid: Some(rid),
+        }),
+    )?;
+    Ok(DeferralBlame {
+        tx: plan
+            .found
+            .map(|(first, last)| (last, plan.blame.remove(&first).unwrap_or_default())),
+        through: plan.blame_through,
+    })
 }
 
 fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
@@ -669,9 +720,9 @@ impl Meta {
             return self.take_journal_whole_txs(max);
         }
         self.held_work.fetch_add(1, Ordering::Relaxed);
-        let plan = plan(&r, self, &poisoned, &pending)?;
-        // Whether rows may be skipped: `journal_through_after` must not
-        // claim a skipped row shipped.
+        let plan = plan(&r, self, &poisoned, &pending, None)?;
+        // Whether rows may be skipped (the session counts a read that
+        // timed out meanwhile as `degraded_held`).
         self.held_any.store(
             !poisoned.is_empty() || !plan.held.is_empty() || !plan.deferred.is_empty(),
             Ordering::Relaxed,
@@ -778,7 +829,7 @@ impl Meta {
                  `--remote`)"
             )));
         };
-        let held = plan(&tx, self, &poisoned, &PoisonMap::new())?;
+        let held = plan(&tx, self, &poisoned, &PoisonMap::new(), None)?;
         // The inode's seeds, and every held transaction that depends on
         // them (key overlap, transitively, in journal order).
         let mut tainted: HashSet<Vec<u8>> = HashSet::new();
@@ -942,10 +993,7 @@ impl Meta {
             }
             // A row another node was to upload (`--remote`): its mark
             // goes with the row.
-            let remote = super::remote::remote_key(hash, ino);
-            if tx.get(&self.local, &remote)?.is_some() {
-                tx.remove(&self.local, remote);
-            }
+            super::remote::forget_remote_mark_tx(&mut tx, self, hash, ino)?;
         }
         counter_add_tx(&mut tx, &self.local, KV_POISONED_COUNT, -marks_removed)?;
         // An adopted spilled manifest of this inode (plan 30 §M9) is
@@ -1003,5 +1051,346 @@ mod tests {
         assert_eq!(clean.file_len, 8);
         assert_eq!(clean.chunks, ChunkInfo::Inline(BTreeMap::from([(0u64, a)])));
         assert!(names_any(b"not a manifest", &BTreeSet::from([a])));
+    }
+
+    // ---- chunk close-stall-followup: the blame is the ship rule's ----
+
+    mod blame {
+        use super::*;
+        use crate::mutate::{execute, MutateOp};
+        use crate::rid::Rid;
+        use crate::MetaStore;
+        use constellation_fs_core::types::ROOT_INO;
+        use proptest::prelude::*;
+
+        const FILES: usize = 4;
+        /// The forwarders whose chunks a close may name (node 7's is the
+        /// blame under test; node 8's is pending but not theirs).
+        const NODES: [u64; 2] = [7, 8];
+
+        #[derive(Clone, Debug)]
+        enum Step {
+            /// A close of file `f` naming chunk `c`: pending here (`None`,
+            /// the holder's own write-back), forwarded pending by a node,
+            /// or already up.
+            Close {
+                f: usize,
+                c: u8,
+                from: Option<Option<usize>>,
+            },
+            Chmod {
+                f: usize,
+                node: usize,
+            },
+            Rename {
+                f: usize,
+                to: usize,
+                node: usize,
+            },
+            /// A refusal that observed `f`'s name (a link onto it).
+            Refuse {
+                f: usize,
+                node: usize,
+            },
+            Capture(bool),
+            /// Ack the `k`-th pending row enrolled so far.
+            Ack(usize),
+            /// Record the `k`-th pending row as unrecoverable.
+            Poison(usize),
+            Ship,
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            let f = 0..FILES;
+            prop_oneof![
+                4 => (f.clone(), 0..6u8, prop_oneof![
+                    Just(None),
+                    Just(Some(None)),
+                    (0..NODES.len()).prop_map(|n| Some(Some(n))),
+                ])
+                    .prop_map(|(f, c, from)| Step::Close {
+                        f,
+                        c,
+                        from: from.map(|n: Option<usize>| n),
+                    }),
+                3 => (f.clone(), 0..3usize).prop_map(|(f, node)| Step::Chmod { f, node }),
+                2 => (f.clone(), 0..FILES, 0..3usize)
+                    .prop_map(|(f, to, node)| Step::Rename { f, to, node }),
+                1 => (f, 0..3usize).prop_map(|(f, node)| Step::Refuse { f, node }),
+                1 => any::<bool>().prop_map(Step::Capture),
+                2 => (0..16usize).prop_map(Step::Ack),
+                1 => (0..16usize).prop_map(Step::Poison),
+                1 => Just(Step::Ship),
+            ]
+        }
+
+        fn manifest_naming(hash: ChunkHash) -> Vec<u8> {
+            Manifest {
+                layout: constellation_fs_core::ChunkLayout::new(4096),
+                file_len: 7,
+                chunks: ChunkInfo::Inline(BTreeMap::from([(0u64, hash)])),
+            }
+            .encode()
+        }
+
+        /// Run `steps` on a fresh holder. Node 7's and 8's ops carry
+        /// their rids; index 2 stands for the holder itself (no rid).
+        fn journal(steps: &[Step]) -> Meta {
+            let meta = Meta::open_in_memory().unwrap();
+            meta.set_holder_epoch(1);
+            let mut inos = Vec::new();
+            for i in 0..FILES {
+                inos.push(
+                    meta.create(ROOT_INO, &format!("f{i}"), 0o644, 0, 0)
+                        .unwrap()
+                        .ino,
+                );
+            }
+            let shipped = |meta: &Meta, segment: u64| {
+                let seqs: Vec<u64> = meta
+                    .take_shippable(usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(s, _)| s)
+                    .collect();
+                if !seqs.is_empty() {
+                    meta.ack_journal_rows_at(&seqs, segment).unwrap();
+                }
+            };
+            shipped(&meta, 1);
+            let mut segment = 1;
+            let mut seq = 0;
+            let mut rid = |node: usize| {
+                seq += 1;
+                NODES.get(node).map(|&node| Rid {
+                    node,
+                    incarnation: 1,
+                    seq,
+                })
+            };
+            let mut rows: Vec<(ChunkHash, Ino)> = Vec::new();
+            let run = |meta: &Meta, rid: Option<Rid>, op: MutateOp| {
+                if let Err(e) = execute(meta, &op, rid) {
+                    if let Some(rid) = rid {
+                        meta.journal_refusal(rid, e.code(), Some(&op)).unwrap();
+                    }
+                }
+            };
+            for s in steps {
+                match s {
+                    Step::Close { f, c, from } => {
+                        let ino = inos[*f];
+                        let hash = ChunkHash::of(&[*c, *f as u8]);
+                        let manifest = manifest_naming(hash);
+                        match from {
+                            // A file renamed over is gone: nothing to close.
+                            Some(None) => {
+                                if meta
+                                    .set_manifest_dirty(ino, None, &manifest, 7, &[hash])
+                                    .is_ok()
+                                {
+                                    rows.push((hash, ino));
+                                }
+                            }
+                            Some(Some(n)) => {
+                                meta.enroll_remote_chunks(ino, &[hash], NODES[*n]).unwrap();
+                                rows.push((hash, ino));
+                                let op = MutateOp::SetManifest {
+                                    ino,
+                                    base_manifest: None,
+                                    manifest,
+                                    size: 7,
+                                };
+                                run(&meta, rid(*n), op);
+                            }
+                            None => {
+                                let _ = meta.set_manifest_with_base(ino, None, &manifest, 7);
+                            }
+                        }
+                    }
+                    Step::Chmod { f, node } => {
+                        let op = MutateOp::Setattr {
+                            ino: inos[*f],
+                            mode: Some(0o600),
+                            uid: None,
+                            gid: None,
+                            size: None,
+                            atime_ns: None,
+                            mtime_ns: None,
+                        };
+                        run(&meta, rid(*node), op);
+                    }
+                    Step::Rename { f, to, node } => {
+                        let op = MutateOp::Rename {
+                            parent: ROOT_INO,
+                            name: format!("f{f}"),
+                            new_parent: ROOT_INO,
+                            new_name: format!("f{to}"),
+                            noreplace: false,
+                        };
+                        run(&meta, rid(*node), op);
+                    }
+                    Step::Refuse { f, node } => {
+                        let op = MutateOp::Link {
+                            ino: inos[*f],
+                            parent: ROOT_INO,
+                            name: format!("f{f}"),
+                        };
+                        let r = rid(*node).unwrap_or(Rid {
+                            node: 9,
+                            incarnation: 1,
+                            seq: 0,
+                        });
+                        meta.journal_refusal(r, constellation_types::Code::Exists, Some(&op))
+                            .unwrap();
+                    }
+                    Step::Capture(on) => meta.set_holder_capture(*on),
+                    Step::Ack(k) => {
+                        if let Some((hash, ino)) = rows.get(*k) {
+                            meta.ack_upload(hash, *ino).unwrap();
+                        }
+                    }
+                    Step::Poison(k) => {
+                        if let Some(&pair) = rows.get(*k) {
+                            meta.note_unrecoverable_chunks(&[pair], false).unwrap();
+                        }
+                    }
+                    Step::Ship => {
+                        segment += 1;
+                        shipped(&meta, segment);
+                    }
+                }
+            }
+            meta
+        }
+
+        /// The rule written out pairwise, quadratic, as the module doc
+        /// states it (an uncaptured transaction touching every key): a
+        /// transaction waits if it is a pending seed or depends on an
+        /// earlier one that waits; its blame is its own seeds in `theirs`
+        /// and the blame of every waiting transaction it depends on.
+        /// Returns, per transaction (first seq), its rid, last seq and
+        /// `Some(blame)` if it waits.
+        #[allow(clippy::type_complexity)]
+        fn model(
+            meta: &Meta,
+            theirs: &PoisonMap,
+        ) -> Vec<(u64, Option<Rid>, u64, Option<BTreeSet<Ino>>)> {
+            let r = meta.db.read_tx();
+            let pending = read_pending(&r, meta).unwrap();
+            let mut out: Vec<(u64, Option<Rid>, u64, Option<BTreeSet<Ino>>)> = Vec::new();
+            let mut written: Vec<Option<BTreeSet<Vec<u8>>>> = Vec::new();
+            for tx in transactions(&r, meta).unwrap() {
+                let keys: Option<BTreeSet<Vec<u8>>> = tx.spec_seq.and_then(|seq| {
+                    spec::row_keys_and_origin(&r, meta, seq)
+                        .unwrap()
+                        .map(|(keys, _)| keys.into_iter().collect())
+                });
+                let row = local::get_journal_tx(&r, meta, tx.first).unwrap();
+                let mut touched = keys.clone();
+                if let (Some(t), Some(row)) = (touched.as_mut(), row.as_ref()) {
+                    t.extend(row.observed.iter().cloned());
+                }
+                let mut waits = !seed_inos(&tx, &pending).is_empty();
+                let mut blame: BTreeSet<Ino> = seed_inos(&tx, theirs).into_iter().collect();
+                for (i, (_, _, _, earlier)) in out.iter().enumerate() {
+                    let Some(earlier) = earlier else { continue };
+                    let depends = match (&written[i], &touched) {
+                        (Some(w), Some(t)) => !w.is_disjoint(t),
+                        _ => true,
+                    };
+                    if depends {
+                        waits = true;
+                        blame.extend(earlier);
+                    }
+                }
+                written.push(keys);
+                out.push((
+                    tx.first,
+                    row.and_then(|t| t.rid),
+                    tx.last,
+                    waits.then_some(blame),
+                ));
+            }
+            out
+        }
+
+        fn check(steps: &[Step]) {
+            let meta = journal(steps);
+            let r = meta.db.read_tx();
+            let poisoned = read_poisoned(&r, &meta).unwrap();
+            let pending = read_pending(&r, &meta).unwrap();
+            let node7 = crate::store::remote::remote_pending_from_tx(&r, &meta, 7).unwrap();
+            for theirs in [&node7, &pending] {
+                let expect = model(&meta, theirs);
+                let p = plan(
+                    &r,
+                    &meta,
+                    &poisoned,
+                    &pending,
+                    Some(Blame { theirs, rid: None }),
+                )
+                .unwrap();
+                let waiting: BTreeSet<u64> = p
+                    .held
+                    .iter()
+                    .map(|(t, _, _)| t.first)
+                    .chain(p.deferred.iter().map(|t| t.first))
+                    .collect();
+                let want: BTreeSet<u64> = expect
+                    .iter()
+                    .filter(|e| e.3.is_some())
+                    .map(|e| e.0)
+                    .collect();
+                assert_eq!(waiting, want, "what waits, {steps:?}");
+                assert_eq!(
+                    p.blame.keys().copied().collect::<BTreeSet<u64>>(),
+                    want,
+                    "a blame for every waiting transaction, {steps:?}"
+                );
+                let all: BTreeSet<Ino> = expect
+                    .iter()
+                    .filter_map(|e| e.3.clone())
+                    .flatten()
+                    .collect();
+                assert_eq!(p.blame_through, all, "{steps:?}");
+                for (first, rid, last, blame) in &expect {
+                    if let Some(blame) = blame {
+                        assert_eq!(&p.blame[first], blame, "tx {first}, {steps:?}");
+                        if std::ptr::eq(theirs, &pending) {
+                            assert!(!blame.is_empty(), "every wait is some chunk's, {steps:?}");
+                        }
+                    }
+                    if let (Some(rid), true) = (rid, std::ptr::eq(theirs, &node7)) {
+                        // Everything waiting up to and including it.
+                        let through: BTreeSet<Ino> = expect
+                            .iter()
+                            .take_while(|e| e.0 <= *first)
+                            .filter_map(|e| e.3.clone())
+                            .flatten()
+                            .collect();
+                        let got = deferral_blame(&r, &meta, *rid, theirs).unwrap();
+                        assert_eq!(
+                            got,
+                            DeferralBlame {
+                                tx: Some((*last, blame.clone().unwrap_or_default())),
+                                through,
+                            },
+                            "rid {rid:?}, {steps:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+            #[test]
+            fn every_deferred_transaction_is_blamed_on_exactly_what_defers_it(
+                steps in proptest::collection::vec(step(), 1..40)
+            ) {
+                check(&steps);
+            }
+        }
     }
 }

@@ -534,8 +534,20 @@ fn a_manifest_whose_chunk_is_uploading_is_deferred_and_others_ship() {
             .any(|r| matches!(r, LogRecord::WriteManifest { ino, .. } if *ino == big)),
         "the manifest ships once its chunk is up: {rest:?}"
     );
+    // Chunk close-stall-followup: the segment carrying the deferred
+    // manifest claims everything through the marker, which shipped ahead
+    // of it — not just its own rows (a node that observed the holder's
+    // position past the marker waited for the next segment).
+    let rest_seqs: Vec<u64> = rest.iter().map(|(s, _)| *s).collect();
+    let last = *seqs.iter().chain(&rest_seqs).max().unwrap();
+    assert!(
+        rest_seqs.iter().max().unwrap() < &last,
+        "the marker came after"
+    );
+    assert_eq!(meta.journal_through_after(&rest_seqs).unwrap(), last);
     ship(&meta, &rest, 2);
     assert_eq!(meta.journal_len().unwrap(), 0);
+    assert_eq!(meta.journal_acked_seq().unwrap(), last);
 }
 
 /// A later change to the deferred file depends on its manifest and waits
@@ -600,6 +612,17 @@ fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
     let ex = |seq: u64, op: MutateOp| {
         constellation_meta::execute_mutate(&meta, &op, Some(rid(seq))).unwrap()
     };
+    let setattr = |ino| MutateOp::Setattr {
+        ino,
+        mode: Some(0o600),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    // Unshipped too, but journaled before the close.
+    let before = ex(5, setattr(other));
     meta.enroll_remote_chunks(file, &[away], 7).unwrap();
     let close = ex(
         1,
@@ -610,15 +633,6 @@ fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
             size: 19,
         },
     );
-    let setattr = |ino| MutateOp::Setattr {
-        ino,
-        mode: Some(0o600),
-        uid: None,
-        gid: None,
-        size: None,
-        atime_ns: None,
-        mtime_ns: None,
-    };
     let chmod = ex(2, setattr(file));
     let unrelated = ex(3, setattr(other));
     let rename = ex(
@@ -639,7 +653,17 @@ fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
     assert_eq!(dependent.inos, vec![file], "the chmod depends on the close");
     assert!(dependent.through.is_some());
     assert_eq!(blockers(4, &rename, 7).inos, vec![file], "and the rename");
-    let free = blockers(3, &unrelated, 7);
+    // Chunk close-stall-followup: an op on an unrelated file does not wait
+    // for the close, but the position it was evaluated at does (node 7
+    // observes it), so its answer names the close's inode too; one
+    // journaled before the close waits for nothing of node 7's.
+    let unrelated = blockers(3, &unrelated, 7);
+    assert_eq!(unrelated.inos, vec![file], "its position: {unrelated:?}");
+    assert!(
+        unrelated.through.is_some(),
+        "still unshipped: {unrelated:?}"
+    );
+    let free = blockers(5, &before, 7);
     assert!(free.inos.is_empty(), "{free:?}");
     assert!(free.through.is_some(), "still unshipped: {free:?}");
     assert!(blockers(2, &chmod, 8).inos.is_empty(), "not node 8's");
@@ -651,4 +675,5 @@ fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
     // Reported up: nothing waits for node 7 any more.
     meta.ack_remote_chunks(&[away]).unwrap();
     assert!(blockers(2, &chmod, 7).inos.is_empty());
+    assert!(blockers(3, &[], 7).inos.is_empty());
 }

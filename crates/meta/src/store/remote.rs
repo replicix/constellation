@@ -36,12 +36,19 @@
 //! enrolled_ms(8 BE)`, beside the `pending_upload` row it qualifies. A
 //! mark without its row is stale (the row was acked or withdrawn) and
 //! means nothing; every reader checks both.
+//!
+//! `local`'s counter `remote_marks/<node>` counts the node's marks, stale
+//! ones included (every mark is written and removed through
+//! `put_mark_tx`/`remove_mark_tx`, which keep it). The sequencer asks "does
+//! this forwarder have anything pending here?" for every op it answers
+//! ([`Meta::remote_blockers`]); with nothing, the answer is that one point
+//! read rather than a scan of every node's marks.
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::store::held::{deferral_blame, seed_inos_of, PoisonMap};
+use crate::store::held::{deferral_blame, seed_inos_of, DeferralBlame, PoisonMap};
 use crate::store::misc::{add_pending_claim_tx, cr_key, remove_pending_row_tx};
-use crate::store::{local, Meta};
+use crate::store::{counter_add_tx, counter_get, local, Meta};
 use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
 use fjall::Readable;
 use std::collections::BTreeSet;
@@ -53,6 +60,59 @@ pub(crate) fn remote_key(hash: &ChunkHash, ino: Ino) -> Vec<u8> {
     k.extend_from_slice(&hash.0);
     k.extend_from_slice(&ino.to_be_bytes());
     k
+}
+
+/// The counter of `node`'s marks (a stale one included).
+fn mark_count_key(node: u64) -> String {
+    format!("{MARK_COUNT_PREFIX}{node}")
+}
+
+const MARK_COUNT_PREFIX: &str = "remote_marks/";
+
+/// Write the mark of `(hash, ino)` as `node`'s, keeping the counts.
+fn put_mark_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    hash: &ChunkHash,
+    ino: Ino,
+    node: u64,
+    value: Vec<u8>,
+) -> Result<(), MetaError> {
+    let key = remote_key(hash, ino);
+    if let Some(old) = tx.get(&meta.local, &key)? {
+        if let Some(mark) = decode_mark(&key, &old) {
+            counter_add_tx(tx, &meta.local, &mark_count_key(mark.node), -1)?;
+        }
+    }
+    tx.insert(&meta.local, key, value);
+    counter_add_tx(tx, &meta.local, &mark_count_key(node), 1)
+}
+
+/// Remove the mark under `key` (if any), keeping the counts. Returns it.
+fn remove_mark_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    key: &[u8],
+) -> Result<Option<RemoteChunk>, MetaError> {
+    let Some(value) = tx.get(&meta.local, key)? else {
+        return Ok(None);
+    };
+    tx.remove(&meta.local, key.to_vec());
+    let mark = decode_mark(key, &value);
+    if let Some(mark) = &mark {
+        counter_add_tx(tx, &meta.local, &mark_count_key(mark.node), -1)?;
+    }
+    Ok(mark)
+}
+
+/// Remove `(hash, ino)`'s mark (if any) in `tx`, keeping the counts.
+pub(crate) fn forget_remote_mark_tx(
+    tx: &mut fjall::SingleWriterWriteTx,
+    meta: &Meta,
+    hash: &ChunkHash,
+    ino: Ino,
+) -> Result<(), MetaError> {
+    remove_mark_tx(tx, meta, &remote_key(hash, ino)).map(|_| ())
 }
 
 fn remote_hash_prefix(hash: &ChunkHash) -> Vec<u8> {
@@ -197,12 +257,15 @@ pub(crate) fn remote_pending_for_ino_tx(
 
 /// `node`'s live remote-pending rows (marks with their pending row), per
 /// inode.
-fn remote_pending_from_tx(
+pub(crate) fn remote_pending_from_tx(
     r: &impl Readable,
     meta: &Meta,
     node: u64,
 ) -> Result<PoisonMap, MetaError> {
     let mut out = PoisonMap::new();
+    if counter_get(r, &meta.local, &mark_count_key(node))? == 0 {
+        return Ok(out);
+    }
     for guard in r.prefix(&meta.local, REMOTE_PREFIX) {
         let (k, v) = guard.into_inner()?;
         let Some(mark) = decode_mark(&k, &v) else {
@@ -218,13 +281,15 @@ fn remote_pending_from_tx(
     Ok(out)
 }
 
-/// What a forwarded op's transaction waits for from the node that
-/// forwarded it ([`Meta::remote_blockers`]).
+/// What a forwarded op's transaction, and the position it was evaluated
+/// at, wait for from the node that forwarded it
+/// ([`Meta::remote_blockers`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemoteBlockers {
     /// The inodes whose chunks that node forwarded as pending, and has not
-    /// reported up, the transaction cannot leave this node before: empty
-    /// when it waits for nothing of that node's.
+    /// reported up, that the transaction, or any transaction journaled
+    /// before it, cannot leave this node before: empty when nothing there
+    /// waits for that node.
     pub inos: Vec<Ino>,
     /// The transaction's last journal seq, when it is still unshipped
     /// here.
@@ -239,7 +304,7 @@ fn delegate_blame(
     gen: u64,
     rid: crate::rid::Rid,
     theirs: &PoisonMap,
-) -> Result<Option<(u64, BTreeSet<Ino>)>, MetaError> {
+) -> Result<DeferralBlame, MetaError> {
     let mut txs: Vec<(u64, local::JournalTx)> = local::read_journal_txs(r, meta)?
         .into_iter()
         .filter(|(_, row)| row.gen == gen)
@@ -250,10 +315,16 @@ fn delegate_blame(
         let records = local::journal_records(r, meta, first, row.last)?;
         blame.extend(seed_inos_of(records.iter().map(|(_, rec)| rec), theirs));
         if row.rid == Some(rid) {
-            return Ok(Some((row.last, blame)));
+            return Ok(DeferralBlame {
+                tx: Some((row.last, blame.clone())),
+                through: blame,
+            });
         }
     }
-    Ok(None)
+    Ok(DeferralBlame {
+        tx: None,
+        through: blame,
+    })
 }
 
 impl Meta {
@@ -276,7 +347,7 @@ impl Meta {
         let mut tx = self.db.write_tx();
         for hash in hashes {
             add_pending_claim_tx(&mut tx, self, hash, ino)?;
-            tx.insert(&self.local, remote_key(hash, ino), value.clone());
+            put_mark_tx(&mut tx, self, hash, ino, node, value.clone())?;
         }
         tx.commit()?;
         Ok(())
@@ -346,13 +417,12 @@ impl Meta {
         let mut acked = Vec::new();
         let mut tx = self.db.write_tx();
         for hash in hashes {
-            let marks: Vec<(Vec<u8>, Vec<u8>)> = tx
+            let marks: Vec<Vec<u8>> = tx
                 .prefix(&self.local, remote_hash_prefix(hash))
-                .map(|g| g.into_inner().map(|(k, v)| (k.to_vec(), v.to_vec())))
+                .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
                 .collect::<Result<_, _>>()?;
-            for (k, v) in marks {
-                tx.remove(&self.local, k.clone());
-                if let Some(mark) = decode_mark(&k, &v) {
+            for k in marks {
+                if let Some(mark) = remove_mark_tx(&mut tx, self, &k)? {
                     let row = cr_key(&mark.hash, mark.ino);
                     if tx.get(&self.pending_upload, &row)?.is_some() {
                         remove_pending_row_tx(&mut tx, self, &mark.hash, mark.ino);
@@ -367,10 +437,12 @@ impl Meta {
 
     /// Drop `(hash, ino)`'s remote mark (its row was acked by an upload).
     pub(crate) fn forget_remote_mark(&self, hash: &ChunkHash, ino: Ino) -> Result<(), MetaError> {
-        let key = remote_key(hash, ino);
-        if self.local.get(&key)?.is_some() {
-            self.local.remove(key)?;
+        if self.local.get(remote_key(hash, ino))?.is_none() {
+            return Ok(());
         }
+        let mut tx = self.db.write_tx();
+        forget_remote_mark_tx(&mut tx, self, hash, ino)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -382,6 +454,7 @@ impl Meta {
     ) -> Result<(), MetaError> {
         let marks: Vec<Vec<u8>> = tx
             .prefix(&self.local, REMOTE_PREFIX)
+            .chain(tx.prefix(&self.local, MARK_COUNT_PREFIX))
             .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
             .collect::<Result<_, _>>()?;
         for k in marks {
@@ -428,10 +501,22 @@ impl Meta {
     ///   ([`Self::delegate_txs_from`]): everything up to `rid`'s in the
     ///   generation's stream counts.
     ///
+    /// Chunk close-stall-followup: and those of every transaction
+    /// journaled before it that cannot leave this node before them, its
+    /// dependency or not. The reply carries the position the op was
+    /// evaluated at, all of this journal through its transaction, and a
+    /// node that observes it (an op that completed through the log, a
+    /// refusal) waits in every later read until its log reaches it. A
+    /// close of `node`'s answered at once, its chunk still held there,
+    /// keeps every segment's `through` below its row; `node`'s reads then
+    /// waited out the session budget, again and again, until the
+    /// watermark's TTL (4–10 s probes on AWS).
+    ///
     /// The sequencer's answer to the forward names them (`OwnChunks`), so
     /// a forwarder whose uploads are held (a metered network) uploads
-    /// them when it must wait for the transaction. One prefix scan of the
-    /// remote marks when `node` has none pending here (the common case).
+    /// them when it must wait for the transaction or its position. One
+    /// point read (the node's mark count) when `node` has no mark here
+    /// (the common case).
     pub fn remote_blockers(
         &self,
         rid: crate::rid::Rid,
@@ -450,10 +535,8 @@ impl Meta {
         } else {
             delegate_blame(&r, self, gen, rid, &theirs)?
         };
-        let through = found.as_ref().map(|(last, _)| *last);
-        if let Some((_, blame)) = found {
-            inos.extend(blame);
-        }
+        let through = found.tx.as_ref().map(|(last, _)| *last);
+        inos.extend(found.through);
         Ok(RemoteBlockers {
             inos: inos.into_iter().collect(),
             through,
@@ -505,6 +588,53 @@ mod tests {
         meta.ack_upload(&b, f.ino).unwrap();
         assert!(!meta.awaits_remote_chunk(&b).unwrap());
         assert!(meta.remote_chunks().unwrap().is_empty());
+    }
+
+    /// Chunk close-stall-followup: each node's mark count follows every
+    /// write and removal of its marks, so a count of 0 (one point read)
+    /// stands for "nothing of that node's is pending here".
+    #[test]
+    fn each_nodes_mark_count_follows_its_marks() {
+        let meta = Meta::open_in_memory().unwrap();
+        let count = |node: u64| {
+            let r = meta.db.read_tx();
+            counter_get(&r, &meta.local, &mark_count_key(node)).unwrap()
+        };
+        let pending_from = |node: u64| {
+            let r = meta.db.read_tx();
+            remote_pending_from_tx(&r, &meta, node).unwrap()
+        };
+        let (a, b, c) = (
+            ChunkHash::of(b"a"),
+            ChunkHash::of(b"b"),
+            ChunkHash::of(b"c"),
+        );
+        meta.enroll_remote_chunks(1, &[a, b], 7).unwrap();
+        meta.enroll_remote_chunks(2, &[c], 8).unwrap();
+        assert_eq!((count(7), count(8)), (2, 1));
+        // The same row forwarded again, now by node 8: the mark moves.
+        meta.enroll_remote_chunks(1, &[b], 8).unwrap();
+        assert_eq!((count(7), count(8)), (1, 2));
+        meta.enroll_remote_chunks(1, &[b], 8).unwrap();
+        assert_eq!(count(8), 2, "re-marking is not a second mark");
+        meta.ack_remote_chunks(&[a]).unwrap();
+        assert_eq!(count(7), 0);
+        assert!(pending_from(7).is_empty());
+        meta.ack_upload(&b, 1).unwrap();
+        assert_eq!(count(8), 1);
+        // A mark whose row went another way stays counted (stale), and is
+        // still filtered out by the scan behind the count.
+        meta.cancel_pending_upload(&c, 2).unwrap();
+        assert_eq!(count(8), 1);
+        assert!(pending_from(8).is_empty());
+        meta.forget_remote_mark(&c, 2).unwrap();
+        assert_eq!(count(8), 0);
+        meta.enroll_remote_chunks(3, &[a], 9).unwrap();
+        meta.clear_pending_uploads().unwrap();
+        assert_eq!(count(9), 0, "cleared with the marks");
+        meta.enroll_remote_chunks(3, &[a], 9).unwrap();
+        assert_eq!(count(9), 1);
+        assert_eq!(pending_from(9).len(), 1);
     }
 
     #[test]

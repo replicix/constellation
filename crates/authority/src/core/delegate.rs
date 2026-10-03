@@ -907,6 +907,7 @@ impl Core {
                         position,
                         gen,
                         held_timer: None,
+                        blockers: None,
                     }
                 };
                 self.park_stream_need(now, gen, idx, what);

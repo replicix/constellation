@@ -296,6 +296,14 @@ pub enum PeerMsg {
         /// causal dependencies): an executor runs the op only once its
         /// replica holds everything it names.
         deps: Position,
+        /// The log sequence the requester had applied when it sent the
+        /// op (chunk close-stall-followup). `deps.seq` is no stand-in: it
+        /// is what the requester *observed*, which can run ahead of what
+        /// it applied. A reply whose `base` this covers is installed there
+        /// at once, never `AwaitingLog`, so its `own_chunks` would go
+        /// unread and the holder skips working them out
+        /// (`Core::own_chunks_for`).
+        applied: Seq,
     },
     /// The holder's answer. `base` is the first form of plan 30 §M6's
     /// position on replies: the log position the requester must have

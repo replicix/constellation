@@ -650,6 +650,12 @@ fn close_race(
         );
         std::thread::sleep(Duration::from_millis(500));
         let puts_before = chunk_puts(&a)?;
+        let session_timeouts = |c: &Client| -> Result<u64> {
+            Ok(c.control_status()?["session"]["timeouts"]
+                .as_u64()
+                .unwrap_or(0))
+        };
+        let timeouts_before = session_timeouts(&a)?;
         // A real S3's round trip: B's ship of its create lags the
         // forward of A's close, as it did on AWS and OVH.
         proxy.latency(60, 20)?;
@@ -778,6 +784,19 @@ fn close_race(
                  still held (uploads {probe_uploads}, pending {pending})"
             );
         }
+        // Chunk close-stall-followup (AWS): a close answered at once, its
+        // chunk still held on A, was deferred on B below every later
+        // segment's `through`; A's next refusal or log-completed op
+        // observed B's position past it, and A's reads waited out the
+        // session budget until the watermark's TTL (4–10 s creates and
+        // probes). B now names the held close for the position, and a
+        // segment's `through` passes the rows shipped ahead of it.
+        let timeouts = session_timeouts(&a)? - timeouts_before;
+        anyhow::ensure!(
+            timeouts == 0,
+            "A's reads waited out the session budget {timeouts} time(s): a position it \
+             observed waited for its own held chunks"
+        );
         // A reads its own writes at once.
         verify(&a, &files, Duration::from_secs(5))?;
         proxy.remove_all_toxics()?;

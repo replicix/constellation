@@ -1053,6 +1053,7 @@ pub async fn run_gossip<S: PeerService>(
                 acked_through,
                 deps,
                 pending,
+                applied,
             } => {
                 // The request carries `rid`/`acked_through`, which mutate
                 // per-requester exactly-once dedup state: an enrolled peer
@@ -1069,8 +1070,14 @@ pub async fn run_gossip<S: PeerService>(
                     let service = service.clone();
                     let (part, op, deps, pending) =
                         (part.clone(), op.clone(), deps.clone(), pending.clone());
-                    let (requester, req_id, epoch_seen, rid, acked_through) =
-                        (*requester, *req_id, *epoch_seen, *rid, *acked_through);
+                    let (requester, req_id, epoch_seen, rid, acked_through, applied) = (
+                        *requester,
+                        *req_id,
+                        *epoch_seen,
+                        *rid,
+                        *acked_through,
+                        *applied,
+                    );
                     tokio::spawn(async move {
                         let _ = service
                             .mutate_requested(
@@ -1083,6 +1090,7 @@ pub async fn run_gossip<S: PeerService>(
                                 acked_through,
                                 deps,
                                 pending,
+                                applied,
                             )
                             .await;
                     });
@@ -1398,6 +1406,7 @@ async fn handle_stream<S: PeerService>(
             acked_through,
             deps,
             pending,
+            applied,
         } => {
             // The request carries `rid`/`acked_through`, which mutate
             // per-requester exactly-once dedup state: only the node that
@@ -1416,6 +1425,7 @@ async fn handle_stream<S: PeerService>(
                             acked_through,
                             deps,
                             pending,
+                            applied,
                         )
                         .await,
                 )

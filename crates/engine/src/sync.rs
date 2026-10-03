@@ -207,6 +207,9 @@ pub enum SyncRequest {
         /// Chunks the op's manifest names that are still uploading on the
         /// requester (`meta::store::remote`): enrolled before it executes.
         pending: Vec<ChunkHash>,
+        /// The log sequence the requester had applied when it sent the
+        /// op (`PeerMsg::MutateRequest::applied`).
+        applied: u64,
         reply: tokio::sync::oneshot::Sender<(
             constellation_meta::MutateOutcome,
             Option<u64>,

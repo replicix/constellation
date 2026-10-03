@@ -10,7 +10,10 @@ use crate::event::PeerMsg;
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
 use constellation_meta::delegation::Ownership;
-use constellation_meta::{MetaError, MutateOp, MutateOutcome, OwnChunks, Position, Rid, TouchSet};
+use constellation_meta::{
+    LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, RemoteBlockers, Rid,
+    TouchSet,
+};
 use constellation_types::Code;
 
 /// The keys `op` reads or writes, before it runs (a refusal touches
@@ -50,7 +53,7 @@ impl Core {
         rid: Rid,
         op: MutateOp,
         acked_through: u64,
-        deps: Position,
+        (deps, applied): (Position, Seq),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -318,9 +321,17 @@ impl Core {
             None => None,
         };
         let durable = self.ack_need(&position);
-        let own_chunks = self.own_chunks_for(from, rid, &outcome, (0, &position), replica);
-        let upload = matches!(own_chunks, OwnChunks::Upload(_));
         if wait.is_some() || durable.is_some() {
+            // Only an acknowledgement's wait for durability says now what
+            // it waits for (`held_for_upload`); the rest is worked out
+            // when the reply leaves.
+            let blockers = (durable.is_some() && req != OpId(0))
+                .then(|| self.own_record_blockers(from, rid, &outcome, 0, replica));
+            let own_chunks = match &blockers {
+                Some(b) => self.own_chunks_given(from, (0, &position), b.clone(), replica),
+                None => OwnChunks::None,
+            };
+            let upload = matches!(own_chunks, OwnChunks::Upload(_));
             self.park_reply(
                 now,
                 wait.unwrap_or_default(),
@@ -334,6 +345,9 @@ impl Core {
                 0,
                 out,
             );
+            if let Some(b) = blockers {
+                self.keep_parked_blockers(now, rid, b);
+            }
             if durable.is_some() && upload && req != OpId(0) {
                 self.held_for_upload(rid, own_chunks, out);
             }
@@ -344,6 +358,18 @@ impl Core {
             // retry is answered from the dedup.
             return;
         }
+        // Chunk close-stall-followup: a requester that has the reply's
+        // base installs an acceptance at once (it neither waits for its
+        // own record nor observes the reply's position), so what those
+        // wait for goes unread: skip the work. Not a refusal: it is
+        // observed whatever the base.
+        let installs =
+            matches!(outcome, MutateOutcome::Accepted { .. }) && base.is_some_and(|b| applied >= b);
+        let own_chunks = if installs {
+            OwnChunks::None
+        } else {
+            self.own_chunks_for(from, rid, &outcome, (0, &position), replica)
+        };
         out.push(Action::Send {
             to: from,
             msg: PeerMsg::MutateReply {
@@ -448,19 +474,58 @@ impl Core {
         (gen, position): (u64, &Position),
         replica: &dyn Replica,
     ) -> OwnChunks {
-        let MutateOutcome::Accepted { records, .. } = outcome else {
-            return OwnChunks::None;
+        let blockers = self.own_record_blockers(to, rid, outcome, gen, replica);
+        self.own_chunks_given(to, (gen, position), blockers, replica)
+    }
+
+    /// [`Self::own_chunks_for`]'s costly half: what the transaction waits
+    /// for from `to` (`Meta::remote_blockers`). One point read when `to`
+    /// has nothing pending here; otherwise a walk of the unshipped journal
+    /// (the ship plan's), which a reply parked for its acknowledgement
+    /// keeps rather than redoing every hold interval
+    /// (`Core::on_held_reply_timer`).
+    pub(crate) fn own_record_blockers(
+        &self,
+        to: NodeId,
+        rid: Rid,
+        outcome: &MutateOutcome,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> RemoteBlockers {
+        // The outcomes a requester waits on: an acceptance (its
+        // transaction, or the position it observes once the log brought
+        // it), and a refusal (it observes the position: chunk
+        // close-stall-followup).
+        let records: &[LogRecord] = match outcome {
+            MutateOutcome::Accepted { records, .. } | MutateOutcome::Exists { records, .. } => {
+                records
+            }
+            MutateOutcome::Errno(_) | MutateOutcome::Conflict { .. } => &[],
+            _ => return RemoteBlockers::default(),
         };
         if to == self.cfg.node_id {
-            return OwnChunks::None;
+            return RemoteBlockers::default();
         }
-        let blockers = replica.remote_blockers(rid, gen, records, to);
+        replica.remote_blockers(rid, gen, records, to)
+    }
+
+    /// [`Self::own_chunks_for`] from `blockers`: whether this node's
+    /// stream carries the records to `to` past them.
+    pub(crate) fn own_chunks_given(
+        &self,
+        to: NodeId,
+        (gen, position): (u64, &Position),
+        blockers: RemoteBlockers,
+        replica: &dyn Replica,
+    ) -> OwnChunks {
         if blockers.inos.is_empty() {
             return OwnChunks::None;
         }
+        // Through the op's transaction and the position it was evaluated
+        // at (a local write committing in between only makes that later).
         let through = blockers
             .through
-            .or(position.pending.map(|p| p.jseq))
+            .max(position.pending.map(|p| p.jseq))
             .unwrap_or(0);
         let streams = gen == 0
             && self.cfg.pre_s3_streaming

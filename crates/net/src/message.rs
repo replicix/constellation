@@ -21,10 +21,12 @@ use serde::{Deserialize, Serialize};
 /// ALPN for direct (non-gossip) requests. Versioned so a future
 /// message-set change can be negotiated rather than mis-parsed.
 ///
-/// `2`: `Payload::MutateReply` carries `own_chunks` (chunk
-/// close-stall-metered). Nodes of different versions do not talk P2P
-/// (no compatibility shim): a cluster upgrades all its nodes together.
-pub const ALPN: &[u8] = b"constellation/2";
+/// `3`: `Payload::MutateRequest` carries `applied` (chunk
+/// close-stall-followup). `2`: `Payload::MutateReply` carries
+/// `own_chunks` (chunk close-stall-metered). Nodes of different versions
+/// do not talk P2P (no compatibility shim): a cluster upgrades all its
+/// nodes together.
+pub const ALPN: &[u8] = b"constellation/3";
 
 /// Earlier versions of [`ALPN`]. An endpoint accepts their handshakes only
 /// to refuse the connection by name (closing it with a reason naming both
@@ -32,7 +34,7 @@ pub const ALPN: &[u8] = b"constellation/2";
 /// learn its version: either way both sides log the mismatch explicitly
 /// (`endpoint::log_version_mismatch`), where they used to log only
 /// rustls' "peer doesn't support any known protocol" every few seconds.
-pub const OLDER_ALPNS: &[&[u8]] = &[b"constellation/1"];
+pub const OLDER_ALPNS: &[&[u8]] = &[b"constellation/2", b"constellation/1"];
 
 /// Largest accepted frame. Messages are small; the cap just stops a
 /// malicious peer from making us allocate.
@@ -299,6 +301,11 @@ pub enum Payload {
         /// leaves it before they are in S3 (`meta::store::remote`).
         #[serde(default)]
         pending: Vec<[u8; 32]>,
+        /// The log sequence the requester had applied when it sent this
+        /// (chunk close-stall-followup): a reply whose base it covers is
+        /// installed there at once, so the holder skips working out what
+        /// the op's records wait for (`Core::own_chunks_for`).
+        applied: u64,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {

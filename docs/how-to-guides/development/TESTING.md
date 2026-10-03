@@ -2911,9 +2911,13 @@ a shell), in `crates/harness/src/scenarios/lifecycle.rs`:
   `d/rename`. Each close and each op must return within 10 s (the op
   used to stall 120 s, `EIO` in doubt: B answered that it waited for
   nothing of A's). Unbacked and `ack=s3`: `ack.own_record_uploads` rises
-  for them; backed: it does not and chunks stay pending. A reads its
-  writes at once; unmetered, both nodes read everything, with no
-  conflicts.
+  for them; backed: it does not and chunks stay pending. A's
+  `session.timeouts` must not rise through all of it: on AWS a close
+  answered at once with its chunk held stayed deferred on B, and A's next
+  refusal or log-completed op observed B's position past it, so A's reads
+  waited out the session budget until the watermark's TTL (4–10 s creates
+  and probes; chunk close-stall-followup). A reads its writes at once;
+  unmetered, both nodes read everything, with no conflicts.
 
 The profile knobs (`CONSTELLATION_PROFILE`, `CONSTELLATION_PROFILE_{P2P,
 LEASES,UPLOADS,BACKGROUND}`) are read by the daemon at start; the

@@ -529,51 +529,24 @@ pub(crate) fn ack_upto(
 /// `seqs` — a takeover's epoch-marker segment carries no journal rows but
 /// is still this replica's own, applied segment.
 ///
-/// `seqs` is usually the journal's head, so its highest seq becomes the
-/// acked watermark. Plan 30 §M4: a ship may skip held-back transactions
-/// (`store::held`), leaving rows below that; the watermark then stops
-/// just below the oldest one still here, so every journal scan (which
-/// starts past the watermark) keeps seeing it. Only then (`held_below`,
-/// from `spec::retire_local_tx`'s scan) is that row looked up; the
-/// ordinary ack does no extra read (plan 30 §M4 round 2).
+/// `seqs` is usually the journal's head. Plan 30 §M4/§M7: a ship may
+/// skip held-back or deferred transactions (`store::held`), leaving rows
+/// below it, and ship rows above them first. The watermark is the rule
+/// [`watermark_after`] states: just below the oldest row still here, so
+/// every journal scan (which starts past the watermark) keeps seeing it;
+/// with no row left, the last seq handed out. One seek per ack.
 pub(crate) fn ack_rows_at(
     tx: &mut SingleWriterWriteTx,
     journal: &SingleWriterTxKeyspace,
     local: &SingleWriterTxKeyspace,
     seqs: &[u64],
     applied_seq: u64,
-    held_below: bool,
 ) -> Result<(), MetaError> {
     for seq in seqs {
         tx.remove(journal, seq_key(*seq));
     }
-    if let Some(&upto) = seqs.iter().max() {
-        if !held_below {
-            note_acked_tx(tx, local, upto)?;
-            kv_set_tx(
-                tx,
-                local,
-                crate::store::KV_APPLIED_SEQ,
-                &applied_seq.to_string(),
-            );
-            return Ok(());
-        }
-        let from = acked_watermark(tx, local)?.saturating_add(1);
-        let remaining = match tx.range(journal, seq_key(from)..=seq_key(upto)).next() {
-            Some(guard) => {
-                let (k, _) = guard.into_inner()?;
-                Some(u64::from_be_bytes(
-                    k.as_ref()
-                        .try_into()
-                        .map_err(|_| MetaError::Invalid("journal key".into()))?,
-                ))
-            }
-            None => None,
-        };
-        let upto = match remaining {
-            Some(held) => held.saturating_sub(1),
-            None => upto,
-        };
+    if !seqs.is_empty() {
+        let upto = watermark_after(&*tx, journal, local, |_| false)?;
         note_acked_tx(tx, local, upto)?;
     }
     kv_set_tx(
@@ -583,6 +556,39 @@ pub(crate) fn ack_rows_at(
         &applied_seq.to_string(),
     );
     Ok(())
+}
+
+/// The acked watermark once the rows `leaving` names are gone: every row
+/// at or below it has left the journal. Just below the oldest row still
+/// here (`leaving` skipped); with none, the last seq handed out.
+///
+/// Chunk close-stall-followup: not the highest seq of the ship that
+/// leaves it. Rows a ship skipped (deferred behind a chunk still
+/// uploading) ship after the rows above them, and the ship that finally
+/// carries them used to leave the watermark at its own highest row, below
+/// the rows already shipped: its segment's `through` stopped there, and a
+/// node that had observed the holder's position past it (a refusal's
+/// reply) waited for the next segment, which came only with the next
+/// write (4 s creates on AWS).
+pub(crate) fn watermark_after(
+    r: &impl Readable,
+    journal: &SingleWriterTxKeyspace,
+    local: &SingleWriterTxKeyspace,
+    leaving: impl Fn(u64) -> bool,
+) -> Result<u64, MetaError> {
+    let acked = acked_watermark(r, local)?;
+    for guard in r.range(journal, seq_key(acked.saturating_add(1))..) {
+        let k = guard.key()?;
+        let seq = u64::from_be_bytes(
+            k.as_ref()
+                .try_into()
+                .map_err(|_| MetaError::Invalid("journal key".into()))?,
+        );
+        if !leaving(seq) {
+            return Ok(seq.saturating_sub(1).max(acked));
+        }
+    }
+    Ok(peek_next_seq(r, local)?.saturating_sub(1).max(acked))
 }
 
 // ------------------------------------------------------------ reintegration

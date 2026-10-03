@@ -1199,6 +1199,7 @@ impl Driver {
                 acked_through,
                 deps,
                 pending,
+                applied,
                 reply,
             } => {
                 let deps = Position::from_postcard(&deps);
@@ -1260,6 +1261,7 @@ impl Driver {
                         op,
                         acked_through,
                         deps,
+                        applied,
                     },
                 }))
             }
@@ -2634,6 +2636,7 @@ impl Driver {
                 op,
                 acked_through,
                 deps,
+                applied,
             } => {
                 // A manifest naming chunks still uploading here (a `back`
                 // close) says so; the recipient awaits them, and this
@@ -2684,6 +2687,7 @@ impl Driver {
                         acked_through,
                         deps: deps_bytes,
                         pending,
+                        applied,
                     };
                     let started = std::time::Instant::now();
                     if denied {

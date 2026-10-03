@@ -1041,6 +1041,7 @@ pub trait PeerService: Send + Sync + 'static {
         _acked_through: u64,
         _deps: Vec<u8>,
         _pending: Vec<[u8; 32]>,
+        _applied: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::MutateReply {
@@ -2021,7 +2022,7 @@ mod tests {
     }
 
     /// Review should-fix 2 (chunk close-stall-metered): a node of the
-    /// previous P2P version (an endpoint speaking only `constellation/1`)
+    /// previous P2P version (an endpoint speaking only `constellation/2`)
     /// refuses this node's dial; the failure is recognized as a version
     /// refusal (not a generic dial error), and the probe learns the peer's
     /// version, so the log names both. The other way round, an old node's
@@ -2058,7 +2059,7 @@ mod tests {
         let err = tokio::time::timeout(limit, new.endpoint().connect(old.addr(), ALPN))
             .await
             .expect("the dial completes")
-            .expect_err("the old node refuses constellation/2");
+            .expect_err("the old node refuses constellation/3");
         assert!(refused_alpn(&err), "{err:#} / {err:?}");
         assert_eq!(
             peer_version(new.endpoint(), &old.addr(), limit).await,
