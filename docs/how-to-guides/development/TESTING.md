@@ -2807,7 +2807,18 @@ AUTHORITY_SIM_SEED=152 cargo test -p constellation-authority --test sim replay_s
 AUTHORITY_SIM_SEED=200 AUTHORITY_SIM_CONFIG=bugb ...  # buga | bugb | s3:<rule index> | single | long | inbox | sessions | sessions-inbox | plain
 RUST_LOG=constellation_authority=debug,sim=debug ...  # narrate a replay
 cargo test -p constellation-authority --test sim -- --ignored long_random   # AUTHORITY_SIM_SEEDS, AUTHORITY_SIM_START
+AUTHORITY_SIM_CONFIG=long-backup AUTHORITY_SIM_START=50000 AUTHORITY_SIM_SEEDS=10000 AUTHORITY_SIM_THREADS=8 \
+  cargo test -p constellation-authority --release --test sim -- --ignored --exact sweep_config --nocapture
 ```
+
+`sweep_config` runs any `long_*` configuration in parallel, prints every
+failing seed (`SWEEP-FAIL`), and fails at the end: `long-sessions`
+(`long_random`), `long-strict`, `long-backup` and `long-acks3`
+(`long_backup`'s even and odd seeds), `backup-hot` and `placement-hot`
+(`long_backup_hot`), `flex`, `flex-crash`, `long-delegated`, and every
+lock configuration of `long_locks` (`locks`, `locks-partition`, …,
+`locks-failover-backup-writes`). Use each long test's own start (its
+source) to sweep the same seeds.
 
 A failing seed prints its replay command. The regression tests
 (`regression_bug_a_slow_holder_replies`,

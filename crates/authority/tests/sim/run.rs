@@ -665,6 +665,7 @@ impl Cluster {
     }
 
     pub fn restart(&self, id: NodeId, meta: Option<Arc<Meta>>) {
+        let meta_kept = meta.is_some();
         // Plan 30 §M10: the epoch state is persisted with the journal.
         let epoch = match (&meta, self.nodes.lock().unwrap().get(&id)) {
             (Some(_), Some(old)) => old.shared.epoch.lock().unwrap().clone(),
@@ -675,15 +676,24 @@ impl Cluster {
         // stranded by the root's recall and replayed as a conflict copy,
         // was checked as durable once its node had restarted — the new
         // incarnation's set was empty).
-        let tentative = self
+        let (tentative, refusals) = self
             .nodes
             .lock()
             .unwrap()
             .get(&id)
-            .map(|old| old.shared.tentative.lock().unwrap().clone())
+            .map(|old| {
+                (
+                    old.shared.tentative.lock().unwrap().clone(),
+                    old.shared.journaled_refusals.lock().unwrap().clone(),
+                )
+            })
             .unwrap_or_default();
         let handle = NodeHandle::start_with(&self.env, id, meta, epoch);
         handle.shared.tentative.lock().unwrap().extend(tentative);
+        // (Kept only with the journal: a fresh replica has none to drop.)
+        if meta_kept {
+            *handle.shared.journaled_refusals.lock().unwrap() = refusals;
+        }
         self.nodes.lock().unwrap().insert(id, Arc::new(handle));
     }
 

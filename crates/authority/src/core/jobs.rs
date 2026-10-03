@@ -181,8 +181,9 @@ enum Phase {
     /// Plan 30 §M8: waiting for read delegations to be recalled before
     /// the release CAS.
     RecallBeforeRelease,
-    /// `LeaseGet` after a release CAS conflict.
-    ReleaseReread,
+    /// `LeaseGet` after a release CAS conflict, or after a release CAS
+    /// that failed without an answer (`in_doubt`: it may have landed).
+    ReleaseReread { in_doubt: bool },
     /// A deposition recovery's `RebuildReplica` outstanding.
     Recover { op: OpId },
     /// Acquire: `LeaseGet` outstanding.
@@ -1346,7 +1347,7 @@ impl Core {
                 Phase::Renew { .. }
                     | Phase::RenewReread { .. }
                     | Phase::Release
-                    | Phase::ReleaseReread
+                    | Phase::ReleaseReread { .. }
                     | Phase::Cas { .. }
             ),
         }
@@ -3354,50 +3355,45 @@ impl Core {
             }
             // ---- release ----
             (Phase::Release, S3Result::LeasePut(Ok(_))) => {
-                let epoch = self.lease.epoch().unwrap_or(0);
-                self.lease.released();
-                self.deleg_on_lease_gone(now, replica, out);
-                replica.set_holder_epoch(0);
-                self.stats.releases += 1;
-                self.inbox.holder = None;
-                tracing::info!(node = self.cfg.node_id, epoch, "released the lease");
-                match kind {
-                    JobKind::Round => {
-                        if let Some(Job {
-                            what:
-                                What::Round {
-                                    epoch_flush_release: true,
-                                    ..
-                                },
-                            ..
-                        }) = self.job.as_ref()
-                        {
-                            out.push(Action::EpochFlushed);
-                        }
-                        self.finish_round(now, None, replica, out)
-                    }
-                    _ => self.finish_flush_job(now, true, replica, out),
-                }
+                self.release_landed(now, kind, replica, out)
             }
             (Phase::Release, S3Result::LeasePut(Err(CasFailure::Conflict))) => {
                 let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
-                self.set_phase(Phase::ReleaseReread, Some(op));
+                self.set_phase(Phase::ReleaseReread { in_doubt: false }, Some(op));
             }
             (Phase::Release, S3Result::LeasePut(Err(CasFailure::Failed(e)))) => {
-                tracing::warn!(node = self.cfg.node_id, error = %e, "lease release failed; keeping it");
-                self.lease.releasing = false;
-                match kind {
-                    JobKind::Round => self.finish_round(now, None, replica, out),
-                    _ => self.finish_flush_job(now, false, replica, out),
-                }
+                // No answer is not "not released": a PUT that timed out
+                // may have landed, and a released lease is anyone's at
+                // once. Keeping it then made two holders (long_backup
+                // seed 52088: the deposed one went on acknowledging its
+                // own writes under `Local`, rolled back and replayed
+                // after the new holder's). The re-read says which;
+                // `releasing` stays up, so nothing new is admitted until
+                // it answers.
+                tracing::warn!(
+                    node = self.cfg.node_id,
+                    error = %e,
+                    "lease release failed without an answer; re-reading the lease"
+                );
+                let op = self.issue_s3(S3Op::LeaseGet, S3For::Job, out);
+                self.set_phase(Phase::ReleaseReread { in_doubt: true }, Some(op));
             }
-            (Phase::ReleaseReread, S3Result::LeaseGet(result)) => {
+            (Phase::ReleaseReread { in_doubt }, S3Result::LeaseGet(result)) => {
                 let Some((mine, _)) = self.lease.held.clone() else {
                     self.lease.releasing = false;
                     self.lease_gone_mid_job(now, kind, replica, out);
                     return;
                 };
                 match result {
+                    // Our own release, landed.
+                    Ok(Some((cur, _)))
+                        if cur.holder == self.cfg.node_id
+                            && cur.epoch == mine.epoch
+                            && cur.released =>
+                    {
+                        self.release_landed(now, kind, replica, out);
+                        return;
+                    }
                     Ok(Some((cur, tag)))
                         if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
                     {
@@ -3407,6 +3403,21 @@ impl Core {
                         self.deposed(now, cur.holder, cur.epoch, mine.epoch, replica, out)
                     }
                     Ok(None) => self.deposed(now, 0, 0, mine.epoch, replica, out),
+                    Err(e) if in_doubt => {
+                        // Still unknown: the lease is given up here. Had
+                        // the release not landed, the object names this
+                        // node, unreleased, until it expires; the next
+                        // acquisition re-adopts it through the gate.
+                        tracing::warn!(
+                            node = self.cfg.node_id,
+                            error = %e.0,
+                            "lease re-read failed after a release in doubt; giving the lease up"
+                        );
+                        self.lease.released();
+                        self.deleg_on_lease_gone(now, replica, out);
+                        replica.set_holder_epoch(0);
+                        self.inbox.holder = None;
+                    }
                     Err(e) => {
                         tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed")
                     }
@@ -3577,6 +3588,40 @@ impl Core {
                 }
                 self.start_next_job(now, replica, out);
             }
+        }
+    }
+
+    /// The release CAS landed (its answer, or a re-read after none).
+    fn release_landed(
+        &mut self,
+        now: Ms,
+        kind: JobKind,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let epoch = self.lease.epoch().unwrap_or(0);
+        self.lease.released();
+        self.deleg_on_lease_gone(now, replica, out);
+        replica.set_holder_epoch(0);
+        self.stats.releases += 1;
+        self.inbox.holder = None;
+        tracing::info!(node = self.cfg.node_id, epoch, "released the lease");
+        match kind {
+            JobKind::Round => {
+                if let Some(Job {
+                    what:
+                        What::Round {
+                            epoch_flush_release: true,
+                            ..
+                        },
+                    ..
+                }) = self.job.as_ref()
+                {
+                    out.push(Action::EpochFlushed);
+                }
+                self.finish_round(now, None, replica, out)
+            }
+            _ => self.finish_flush_job(now, true, replica, out),
         }
     }
 

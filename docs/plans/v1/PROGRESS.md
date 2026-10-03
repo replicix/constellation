@@ -35515,6 +35515,234 @@ the audit journal's creations" — several checks, not one line: **marked for
 
 ### Gates (2026-10-02, this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
 
+## Fix: two long authority-simulation seeds, and what 10 000 seeds of every long test found (`sim-seeds`)
+
+On main 0d0291d, `long_backup` failed on seed 52088 and `long_locks` on
+seed 191524 (3 000-seed runs). On this tree (b458669) 52088 still
+failed and 191524 passed. Two more failures came out of the 10 000-seed
+sweeps, and both fail on 0d0291d too: `long-backup` 56774, and
+`locks-faults` 196041 and 204913. Three are product bugs and one is a
+simulation bug.
+
+### 1. `long_backup` seed 52088: a release that timed out after landing was kept (product)
+
+**Violated:** the strict acknowledgement order ("rid (2,1,18) returned
+before rid (1,1,9) was invoked but follows it in the log").
+
+**Trace.** Holder 2 (epoch 2, `Local`: no backup in budget yet) hands
+the lease back. Its release CAS (`LeaseSwap(released)`) hits an
+applied-then-timeout `leases/` PUT: the object in the bucket is released,
+but the answer is `Failed`. The `Release` arm logged "lease release
+failed; keeping it", cleared `releasing` and kept the lease. A released
+lease is anyone's at once, and node 3 claimed it (epoch 3) 220 ms later.
+Node 2's own lease state still said it held epoch 2 with time left. Once
+the handoff pause ended, it went on executing its own clients' writes as
+the root and acknowledged them under `Local`: (2,1,17) and (2,1,18).
+That made two holders, and the second saw nothing wrong: the backup
+candidates it invited answered `sealed`, and a client lease read named
+node 3, but neither touched the lease state. A foreign segment
+finally deposed it ("LEASE LOST"). (2,1,18) was replayed by rid after
+the new holder's ops, and (2,1,17) became a conflict copy.
+
+**Why a product bug.** The durability contract
+(`durability-and-failover.md`) lets `Local` lose a holder's own
+unshipped writes only to a holder *machine* failure. Here nothing
+failed but one S3 answer, and a node that may not hold the lease
+acknowledged writes as its holder. That is a single-writer violation,
+not a durability trade-off.
+
+**Fix** (`crates/authority/src/core/jobs.rs`). A release CAS that fails
+without an answer (`CasFailure::Failed`) is in doubt. It now re-reads
+the lease (`Phase::ReleaseReread { in_doubt: true }`), and `releasing`
+stays up meanwhile, so nothing new is admitted and forwards get
+`Busy`. The re-read decides:
+- our own object, released: the release landed. `release_landed`, the
+  success arm factored out, runs: released, handoff served,
+  `EpochFlushed` for an epoch flush.
+- ours and unreleased: the release did not land, and the lease is kept
+  with the fresh tag, as before.
+- another holder, or no object: deposed, as before.
+- the re-read failing too: the lease is given up locally. The handoff
+  is declined, and the requester reads the object itself. If the release
+  did not land, the object names this node, unreleased, until it
+  expires, and the next acquisition re-adopts it through the gate (M4).
+  The cost is liveness, never a second holder.
+
+The conflict path's re-read now also recognises its own released object
+as a landed release. Previously that object was adopted as held.
+
+In 52088, holder 2 and later holder 3 both take this path ("lease
+release failed without an answer; re-reading the lease", then "released
+the lease").
+
+**Regression tests:**
+- `core::tests::a_release_in_doubt_is_reread_before_anything_is_admitted`
+  covers both re-read outcomes. Before the fix, a new local mutation is
+  admitted right after the failed release, and no `LeaseGet` is issued.
+- `regression_long_backup_release_in_doubt_and_deposed_journal` (sim)
+  pins seed 52088.
+
+Both fail on the unfixed core.
+
+Not changed, noted: `RenewReread` adopts our own *released* object as
+held ("only the tag was stale"). With this fix the release path can no
+longer leave a held lease behind a landed release, so nothing reaches
+that branch with a released object.
+
+### 2. `long_locks` seed 191524: fixed by b458669, and the seed now takes another path (product, already fixed)
+
+**Violated (0d0291d):** liveness. "lock client t49 on node 3: Exclusive
+lock on lk0 not acquired within 60000ms" (`locks-partition`).
+
+**Trace (0d0291d).** On node 2, a *non-blocking* request of t33's got
+its grant (Exclusive, `first_use: true`) while t32 still held the lock
+locally. t33's `local_set` then met t32 (`Conflict`), so the
+non-blocking request gave up. t49's request recalled the grant at
+t=14.9 s. The recalled grant was then renewed for ever:
+`renewable()` kept every `first_use` grant renewed, and nothing cleared
+`first_use` once its requester had gone. At t=150 s the grant was still
+`recalled: true, first_use: true`, renewed every 500 ms, and t49 waited
+behind it.
+
+**Fixed by b458669** ("first use bounded", in that commit's section
+above). A recalled grant waits for its first local lock only within the
+first-use budget (4 s). `expire_first_use` then lets the renewal tick
+release it. The daemon's `ClusterLocks::set` clears `first_use` at once
+(`abandon_first_use`) when a request that asked for a grant fails. The
+core test `a_recalled_grant_never_used_is_released_after_the_first_use_budget`
+pins it deterministically.
+
+**Why it passes now.** With the default budget made unbounded on this
+tree, 191524 still passes. Its schedule moved: the lock-ghost traces
+diverge at t=4.0 s, where b458669's lock-path changes (owner fence,
+quarantine split, re-read before `ENOLCK`) take effect. So the seed no
+longer exercises the bug, and pinning it would test nothing. No new
+test. Note that the simulation's lock client does not mirror
+`abandon_first_use`: a non-blocking request that loses the local race
+just returns. The simulation therefore exercises only the budget path.
+
+### 3. `long-backup` seed 56774: a deposed holder answered from its own journal at the deadline (product)
+
+Found by the 10 000-seed sweep; fails on 0d0291d too.
+
+**Violated:** exactly-once ("rid (1,1,3) was refused (Enoent) but
+completed 1 times in the log").
+
+**Trace.**
+- Holder 1 (epoch 1) is paused 4.6 s. Backup 2 crashes and restarts
+  meanwhile.
+- On resuming, node 1 executes its client's `Rename f1→f2` and refuses
+  it `ENOENT`. The `Refused` row is journaled and the answer parks for
+  the backup's acknowledgement, which never comes: the backup sealed.
+- Node 2 takes over (epoch 2), and node 1 is deposed. Its deposition
+  recovery's tail keeps failing on an injected 409, so the journal is
+  not rolled back for 7 s.
+- At the client's deadline, `settled_outcome` answered `ENOENT` from
+  that `Refused` row.
+- The op was then replayed by rid under holder 2, and the rename
+  succeeded.
+
+**Why a product bug.** `settled_outcome`'s own contract says "a deposed
+holder's journal will be rolled back: never answered". The check was
+dead code: `mark_lost` clears `held`, so a deposed node took the
+not-holding branch first. That branch answers from any `completed` row,
+assuming a node without a lease only has rows from applied segments
+(fix 8 of plan 30 M9, acks3 700087). A deposed node whose recovery has
+not run yet still has its journal's rows. Under `Backup`, a client may
+hear only an outcome its backup holds.
+
+**Fix** (`crates/authority/src/core/client.rs`, `settled_outcome`). On
+a deposed node (`lease.lost`), an outcome its unshipped journal still
+carries (`journal_carries_outcome`: a `Completed`/`Refused` record for
+the rid) is not answered, and the op goes in doubt (`EIO`, retryable by
+rid). Rows from the log, or from the node's own shipped segments
+(700087's case), are still answered. In 56774 the client hears in doubt
+at the deadline, and its retry by rid is answered `Accepted` by holder 2.
+
+**Regression tests:**
+- `core::tests::backup_crash::a_deposed_holders_journaled_refusal_is_not_answered_at_the_deadline`
+  fails without the fix: `Outcome(Errno(NotFound))`.
+- The sim pin above carries seed 56774 too.
+
+### 4. `locks-faults` seeds 196041 and 204913: a dropped refusal was not tentative (simulation)
+
+Found by the 10 000-seed sweep; both fail on 0d0291d too.
+
+**Violated:** "history is not linearizable", from the generic
+Stateright tester. The log-witnessed check had passed.
+
+**Trace.**
+- 204913: holder 1 (`Local`) is cut from S3 for 2.4 s, then paused past
+  its lease. Meanwhile it executes forwarded ops, including (2,1,4)
+  `Rename f1→f0`, and refuses its own clients' (1,1,6) `Rename f1→f3` and
+  (1,1,7) `Unlink f1` against that state, with `ENOENT` answered at
+  once.
+- Node 3 takes over. Node 1's deposition rolls back its journal and
+  queues (2,1,4) for replay. (2,1,4) lands at log seq 12 and is
+  tentative.
+- `strand_local_tx` drops the two refusals by design: a refusal's
+  transaction has no op to replay, and its `completed` row goes with it.
+- 196041 is the same with a holder crash (restart with the journal kept)
+  and a forwarded `Create f2` refused `EEXIST` against a create that was
+  later replayed.
+
+**Why a simulation bug.** `Local` acknowledges without waiting. That a
+holder's acknowledged-but-unshipped effects can be rolled back and come
+back as replays is the design's L2 window (`durability-and-failover.md`,
+"Holder away past a takeover"), and the simulation already treats such
+ops as tentative. A refusal evaluated against those effects, and
+dropped by the same rollback, was answered from a decision the log
+never carries. It is tentative in exactly the same sense.
+
+The simulation took its tentative set from the replay queue only, so
+dropped refusals never entered it. The witnessed check counts a refusal
+explained by tentative effects as `observed_tentative` only when no
+log state in its window explains it. It places each refusal alone, so
+it passed refusals that cannot all be placed together. The generic
+tester places them jointly and failed.
+
+Under `strict_durability` (`Backup`/`S3`) refusals wait for durability.
+There the tentative set is not used, and a dropped acknowledged refusal
+still fails the run.
+
+**Fix** (`crates/authority/tests/sim/node.rs`, `run.rs`). Each node
+keeps the `Refused` rids its unshipped journal held after its last
+event (`Shared::journaled_refusals`). It is retaken when the journal's
+tip or length moves, and carried across a restart that keeps the
+journal. When the core's rollback counters move, a rid from that set
+whose `completed` row is gone is tentative. The tracking is reads only,
+so no schedule changes.
+
+**Regression test:** `regression_locks_faults_dropped_refusals_are_tentative`.
+Both seeds fail without the simulation fix (checked with the
+pre-fix binary).
+
+`sweep_config` also takes `long-sessions`, `long-strict`, `long-acks3`
+and `locks-failover-backup-writes` now, so every long configuration can
+be swept in parallel (TESTING.md).
+
+### Sweeps: 10 000 seeds of every long configuration (`--release`, `sweep_config`, 8 threads)
+
+Each sweep starts where its long test starts. `long_backup`'s even and
+odd configurations and `long_backup_hot`'s two were each swept over all
+10 000 seeds.
+
+| Configuration (long test) | Seeds | Failing before the fixes | Failing after |
+|---|---|---|---|
+| `long-sessions` (`long_random`) | 10000..20000 | — | 0 |
+| `long-strict` (`long_strict`) | 40000..50000 | — | 0 |
+| `long-backup` (`long_backup`) | 50000..60000 | 52088 (§1), 56774 (§3) | 0 |
+| `long-acks3` (`long_backup`) | 50000..60000 | 0 | 0 |
+| `backup-hot`, `placement-hot` (`long_backup_hot`) | 90000..100000 | — | 0, 0 |
+| `flex`, `flex-crash` (`long_flex`) | 20000.., 30000.. | — | 0, 0 |
+| `long-delegated` (`long_delegated`) | 70000..80000 | — | 0 |
+| `locks`, `locks-partition`, `locks-skew`, `locks-failover`, `locks-failover-backup`, `locks-pause`, `locks-delegated`, `locks-released-delegated`, `locks-writes`, `locks-delegated-writes`, `locks-released-writes`, `locks-failover-backup-writes` (`long_locks`) | 10 000 each from 190000, 191000, 192000, 193000, 194000, 197000, 196000, 198000, 199000, 200000, 201000, 202000 | — | 0 each |
+| `locks-faults` (`long_locks`) | 195000..205000 | 196041, 204913 (§4) | 0 |
+
+(—: swept only with the product fixes in, where it had no failure.)
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `simseeds`)
+
 | Command | Result |
 |---|---|
 | `cargo fmt --all` | no diff |
@@ -35558,3 +35786,13 @@ the remaining small crates 467, `constellation-model` (release) 138 — 0 failed
 - [x] Step 9: `expired`, `skipped_reverify`, `skipped_grace` counted and shown.
 - [x] Carried M3c gap: a leader that cannot reach the holder resigns; partitioned leader and healthy takeover tested.
 - [ ] Harness retention oracle: `32-m4b`.
+
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p constellation-meta -p constellation-store-s3` | 514 passed, 0 failed |
+| `cargo test --workspace` minus meta, store-s3, authority, model | 1388 passed, 0 failed |
+| `cargo test -p constellation-authority --release` | 164 + 4 + 110 (sim) passed, 0 failed |
+| `cargo test -p constellation-model --release` (lib and every test target, two calls) | 75 + 63 passed, 0 failed |
+| `cargo build --release --workspace` | ok |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `harness run` `lock-holder-partitioned lock-failover lock-fence-at-close lock-holder-killed-contention lock-latency lock-grant-dead-generation` | all PASSED. lock-failover's first attempt died at mount: "Disk quota exceeded" on the shared `/tmp` tmpfs. With `TMPDIR` on `/var` it PASSED |
+| `harness run` `backup-failover backup-departs backup-partition backup-takeover-holds-missing-chunks backup-takeover-drops-held-chunks backup-failover-with-delegation ack-s3-failover root-failover-with-delegates` | all PASSED. `backup-takeover-drops-held-chunks` failed once: "c1 daemon did not exit after unmount within 120s" after `fusermount3: … Device or resource busy`. It then passed 2/2 alone |

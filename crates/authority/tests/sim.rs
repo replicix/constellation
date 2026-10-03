@@ -1755,6 +1755,31 @@ fn regression_exists_hint_after_its_streamed_refusal() {
     }
 }
 
+/// `long_backup` seed 52088 (fix "a release in doubt", PROGRESS.md): the
+/// holder's release CAS timed out after it had landed (an
+/// applied-then-timeout `leases/` PUT), and the holder kept the lease.
+/// Another node claimed the released object at once; the old holder,
+/// under `Local`, went on executing and acknowledging its own clients'
+/// writes until a foreign segment told it, and they were replayed by rid
+/// after the new holder's ops (the strict acknowledgement-order check).
+/// The release's re-read now says whether it landed, and the node admits
+/// nothing meanwhile.
+///
+/// 56774 (fix "a deposed journal answered at the deadline"): a deposed
+/// holder whose recovery had not run yet answered its client from its
+/// own journaled refusal at the deadline (a deposed node holds no lease,
+/// and the not-holding branch took every `completed` row for the log's);
+/// the rename then ran by rid under the next holder and succeeded.
+#[test]
+fn regression_long_backup_release_in_doubt_and_deposed_journal() {
+    for seed in [52_088u64, 56_774] {
+        let report = run_seed(seed, long_backup_config()).unwrap_or_else(|e| {
+            panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=long-backup")
+        });
+        assert!(report.converged_checked, "seed {seed} did not converge");
+    }
+}
+
 /// Plan 30 §M9, the backup-crash sweeps (`fix-backup-crash`): one seed
 /// per class, each failing before its fix. The core and meta tests named
 /// in each comment pin the mechanisms deterministically; these pin the
@@ -2481,6 +2506,13 @@ fn sweep_config() {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "long-delegated" => long_delegated_config(),
         "long-backup" => long_backup_config(),
+        // `long_backup`'s odd seeds.
+        "long-acks3" => SimConfig {
+            core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+            ..long_backup_config()
+        },
+        "long-sessions" => long_sessions_config(),
+        "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
         "placement-hot" => placement_hot_config(),
@@ -2500,6 +2532,7 @@ fn sweep_config() {
         "locks-writes" => with_lock_writes(locks_config(), ""),
         "locks-delegated-writes" => with_lock_writes(locks_delegated_config(), "d2"),
         "locks-released-writes" => with_lock_writes(locks_released_delegated_config(), "d2"),
+        "locks-failover-backup-writes" => with_lock_writes(locks_failover_backup_config(), ""),
         other => panic!("sweep_config: unknown config {other}"),
     };
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -4165,6 +4198,23 @@ fn locks_without_the_fence_are_found() {
         .filter(|e| e.contains("mutual exclusion violated"))
         .count();
     assert!(caught > 0, "ignoring the fence was never caught");
+}
+
+/// `locks-faults` seeds 196041 and 204913 (fix "a dropped refusal is
+/// tentative", PROGRESS.md; a simulation fix): a `Local` holder cut from
+/// S3 (or crashed) past its lease had refused ops — its own client's and
+/// forwarded ones — against effects it had acknowledged and not shipped.
+/// Its rollback dropped those refusals (they are never replayed), as it
+/// rolls back the effects, which the checks treat as tentative; the
+/// refusals were not, and the generic tester could place them nowhere.
+/// The witnessed check had passed: it checks each refusal's window alone.
+#[test]
+fn regression_locks_faults_dropped_refusals_are_tentative() {
+    for seed in [196_041, 204_913] {
+        run_seed(seed, locks_faults_config()).unwrap_or_else(|e| {
+            panic!("locks-faults seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-faults")
+        });
+    }
 }
 
 /// `cargo test -p constellation-authority --release --test sim -- --ignored long_locks`

@@ -142,6 +142,14 @@ pub struct Shared {
     /// `history.rs`): read from the replay queue whenever the core's
     /// rollback counters move.
     pub tentative: Mutex<BTreeSet<Rid>>,
+    /// The rids whose `Refused` rows this node's unshipped journal held
+    /// after its last event. A rollback drops a stranded refusal (its
+    /// `completed` row goes with it; it is never replayed), so one that
+    /// is gone after a rollback was answered from a decision the log
+    /// never carried — tentative, like a rolled-back write (`locks-faults`
+    /// seeds 196041, 204913: `Local` holders cut off or crashed past
+    /// their lease; the generic tester could not place their refusals).
+    pub journaled_refusals: Mutex<BTreeSet<Rid>>,
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
     /// Plan 30 §M10.
     pub epoch: Mutex<SimEpoch>,
@@ -238,6 +246,7 @@ impl NodeHandle {
             paused_until: Mutex::new(None),
             conflict_copies: AtomicU64::new(0),
             tentative: Mutex::new(BTreeSet::new()),
+            journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
             epoch: Mutex::new(epoch),
             fast_path_executed: AtomicU64::new(0),
@@ -259,6 +268,7 @@ impl NodeHandle {
             rx,
             shared: shared.clone(),
             rolled_back_seen: (0, 0),
+            journal_seen: None,
             timers: HashSet::new(),
             timer_kinds: HashMap::new(),
             bootstrap: None,
@@ -354,6 +364,9 @@ struct Driver {
     rx: mpsc::UnboundedReceiver<Event>,
     shared: Arc<Shared>,
     rolled_back_seen: (u64, u64),
+    /// `(journal tip, journal length)` when `Shared::journaled_refusals`
+    /// was last taken.
+    journal_seen: Option<(u64, u64)>,
     timers: HashSet<constellation_authority::TimerId>,
     /// What each pending timer is for (the watchdog's histogram names
     /// the kind, not just "Timer").
@@ -624,6 +637,7 @@ impl Driver {
                 );
             }
             self.note_rollbacks();
+            self.note_journaled_refusals();
             self.dispatch(actions);
             self.refresh_view();
         }
@@ -672,12 +686,44 @@ impl Driver {
             return;
         }
         self.rolled_back_seen = now;
+        let mut t = self.shared.tentative.lock().unwrap();
         if let Ok(queue) = self.meta.pending_replays() {
-            let mut t = self.shared.tentative.lock().unwrap();
             for q in queue {
                 t.insert(q.rid);
             }
         }
+        self.shared
+            .journaled_refusals
+            .lock()
+            .unwrap()
+            .retain(|rid| match self.meta.completed_outcome(*rid) {
+                Ok(None) => {
+                    t.insert(*rid);
+                    false
+                }
+                _ => true,
+            });
+    }
+
+    /// Retake `Shared::journaled_refusals` when the journal changed.
+    fn note_journaled_refusals(&mut self) {
+        let seen = (
+            Replica::journal_tip(&*self.meta),
+            Replica::journal_len(&*self.meta).unwrap_or(0),
+        );
+        if self.journal_seen == Some(seen) {
+            return;
+        }
+        self.journal_seen = Some(seen);
+        let refusals: BTreeSet<Rid> = Replica::journal_txs_from(&*self.meta, 0, usize::MAX)
+            .into_iter()
+            .flat_map(|tx| tx.records)
+            .filter_map(|rec| match rec {
+                constellation_meta::LogRecord::Refused { rid, .. } => Some(rid),
+                _ => None,
+            })
+            .collect();
+        *self.shared.journaled_refusals.lock().unwrap() = refusals;
     }
 
     /// M12 round 2: the daemon's FUSE fast path (`SimConfig::fast_path`).

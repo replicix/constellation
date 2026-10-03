@@ -528,6 +528,87 @@ fn a_holders_handoff_queues_behind_the_round_then_flushes_and_releases() {
     assert!(h.core.job().is_none());
 }
 
+/// `long_backup` seed 52088: a release CAS that fails without an answer
+/// may have landed, and a released lease is anyone's at once. The holder
+/// used to keep it and go on executing its own writes as the holder (two
+/// holders); it now admits nothing until a re-read says which. Landed:
+/// released (the handoff is served). The re-read failing too: the lease
+/// is given up all the same (the handoff is declined; the requester
+/// reads the object itself).
+#[test]
+fn a_release_in_doubt_is_reread_before_anything_is_admitted() {
+    for reread_fails in [false, true] {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LeaseRequest {
+                req: OpId(5),
+                epoch_applied: None,
+            },
+        });
+        let upload = out
+            .iter()
+            .find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            })
+            .expect("the handoff uploads first");
+        let out = h.step(Event::UploadsDone {
+            op: upload,
+            result: UploadResult::Done { held: 0 },
+        });
+        let (release, req) = s3_ops(&out)[0];
+        let S3Op::LeaseSwap {
+            lease: released, ..
+        } = req.clone()
+        else {
+            panic!("{req:?}");
+        };
+        assert!(released.released);
+        let out = h.step(Event::S3 {
+            op: release,
+            result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+        });
+        assert!(
+            h.core
+                .lease
+                .new_mutation_epoch(h.now, h.core.config())
+                .is_none(),
+            "a release in doubt admitted a new local mutation"
+        );
+        assert!(
+            sends(&out).is_empty(),
+            "answered before the re-read: {out:?}"
+        );
+        let reread = match s3_ops(&out).as_slice() {
+            [(op, S3Op::LeaseGet)] => *op,
+            other => panic!("no lease re-read after a release in doubt: {other:?}"),
+        };
+        let result = if reread_fails {
+            S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into())))
+        } else {
+            S3Result::LeaseGet(Ok(Some((released.clone(), tag()))))
+        };
+        let out = h.step(Event::S3 { op: reread, result });
+        assert!(
+            matches!(
+                sends(&out)[0].1,
+                PeerMsg::LeaseHandoff { req: OpId(5), released, .. } if *released == !reread_fails
+            ),
+            "{out:?}"
+        );
+        assert!(h.core.lease().held.is_none(), "the lease was kept");
+        assert_eq!(h.meta.holder_epoch(), 0);
+        assert!(h
+            .core
+            .lease
+            .new_mutation_epoch(h.now, h.core.config())
+            .is_none());
+        assert!(h.core.job().is_none());
+    }
+}
+
 /// Slow S3 (slow-s3-no-seal): a round ships until the journal is empty,
 /// and with writes arriving faster than one segment PUT that is never.
 /// The lease was renewed only as a round opened, so under a live,
@@ -5486,6 +5567,45 @@ mod backup_crash {
             r[0].1,
             ClientReply::Outcome(MutateOutcome::Accepted { .. })
         ));
+    }
+
+    /// long-backup seed 56774: a holder's own op refused under a durable
+    /// policy (its `Refused` row journaled, the answer parked), then the
+    /// holder deposed before its recovery rolled the journal back. At the
+    /// deadline the row is not the log's — the op will run by rid under
+    /// the next holder, and may succeed there: the client hears in doubt,
+    /// not the refusal (it heard `ENOENT` for a rename that then ran).
+    #[test]
+    fn a_deposed_holders_journaled_refusal_is_not_answered_at_the_deadline() {
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        h.core.lease.held.as_mut().expect("held").0.ack_policy = AckPolicy::S3;
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Unlink {
+                parent: ROOT_INO,
+                name: "missing".into(),
+            },
+        });
+        assert!(replies(&out).is_empty(), "parked for the segment: {out:?}");
+        let deadline = timers(&out, TimerKind::ClientDeadline)[0];
+        assert!(
+            h.meta.completed_outcome(rid).unwrap().is_some(),
+            "the refusal is journaled"
+        );
+        let mut out = Vec::new();
+        h.core.deposed(h.now, 2, 2, 1, &h.meta, &mut out);
+        h.advance(60_000);
+        let out = h.step(Event::Timer { id: deadline });
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "{out:?}");
+        assert!(
+            matches!(r[0].1, ClientReply::InDoubt),
+            "answered from the deposed journal: {:?}",
+            r[0].1
+        );
     }
 
     /// long-backup seed 802943: the holder, cut from S3, could not renew;

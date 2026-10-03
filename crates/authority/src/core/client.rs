@@ -18,7 +18,8 @@ use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::{
-    CompletedOutcome, KeySet, MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet,
+    CompletedOutcome, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome, Position, Rid,
+    TouchSet,
 };
 use constellation_types::Code;
 use std::collections::BTreeSet;
@@ -291,6 +292,18 @@ pub(crate) fn completed_as_outcome(
         }
         CompletedOutcome::Refused { code } => Some(MutateOutcome::Errno(code)),
     }
+}
+
+/// Whether this node's unshipped journal holds `rid`'s outcome (its
+/// `Completed` or `Refused` record).
+fn journal_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
+    replica
+        .journal_txs_from(0, usize::MAX)
+        .iter()
+        .flat_map(|tx| &tx.records)
+        .any(|rec| {
+            matches!(rec, LogRecord::Completed { rid: r } | LogRecord::Refused { rid: r, .. } if *r == rid)
+        })
 }
 
 impl Core {
@@ -1984,10 +1997,19 @@ impl Core {
     /// journal is durable under the lease's policy (flex-crash seed 2140:
     /// the deadline fired between a takeover's CAS and its gate, and the
     /// client heard `EIO` for a rename the log carried at seq 7). A
-    /// deposed holder's journal will be rolled back: never answered.
+    /// deposed holder's journal will be rolled back: never answered —
+    /// and a deposed node holds no lease either (`mark_lost`), so until
+    /// its recovery has rolled the journal back, a row the journal still
+    /// carries is not the log's (long_backup seed 56774: the deposed
+    /// holder's own `Refused` row, never acknowledged, answered `ENOENT`
+    /// at the deadline; the op then ran by rid under the next holder and
+    /// succeeded).
     pub(crate) fn settled_outcome(&self, rid: Rid, replica: &dyn Replica) -> Option<MutateOutcome> {
         let holds = self.lease.held.is_some() || self.lease.epoch_held();
         if !holds {
+            if self.lease.lost && journal_carries_outcome(replica, rid) {
+                return None;
+            }
             return completed_as_outcome(replica, rid, self.ship.max_epoch);
         }
         if self.lease.lost {
