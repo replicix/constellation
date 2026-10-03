@@ -36754,3 +36754,193 @@ objects, OVH 370, 0 left.
   journal (above).
 - Replays after a deposition answered `Streamed` that wait the safety
   timer each (OVH run 31).
+
+## Fix: P2P stalls for a minute after a whole-cluster restart (`p2p-restart-auth`)
+
+`git-under-flock-faults` seed 1001 (dev-fuse) failed after the fault that
+`kill -9`s all four nodes at once and restarts them one by one. Forwards
+to the root timed out for over 2 minutes, and the root logged inbound QUIC
+"authentication failed". The suspects were stale peer addresses or node
+identities after a simultaneous restart. Neither was the cause.
+
+### What the logs showed
+
+The failing run's kept logs are
+`/tmp/harness-git-under-flock-faults-logs-1790975746311810873`.
+
+- **Identity.** Every node kept its key: one endpoint id per node across
+  all of its incarnations. The harness's `with_own_node_key` keeps the key
+  in the state dir, and a restart reuses it. The registry records were
+  current.
+- **The stall.** After the restart, `c`'s first write (the harness's
+  `gitflock-alive` marker) waited 56 s on a forward to the root `a`.
+  `a` and `c` formed their gossip link only after two back-to-back 30 s
+  gossip dial timeouts. At the end, `a` saw every peer as disconnected,
+  while they saw `a` as connected.
+- **Reproduction.** The new `p2p-cluster-restart` scenario reproduced it
+  with iroh debug logs. On the stuck node `d`, iroh's per-peer
+  `RemoteStateActor` for the root logged nothing for exactly 60 s from
+  its start. Meanwhile:
+  - iroh logged `RemoteStateActor inbox dropped message` for that actor;
+  - connections the root had dialed to `d` completed their QUIC handshake
+    at once but were handed to `d`'s handler 51 s later;
+  - every dial `d` made, to any peer, stayed "connecting";
+  - everything resumed in the same millisecond: the actor's start plus
+    60 s, which is iroh's `ACTOR_MAX_IDLE_TIMEOUT`.
+
+### Cause
+
+1. iroh 1.1 rebinds its UDP sockets on every *major* link change. On
+   this host, docker bridges of other jobs come and go about once a
+   second (`link change detected is_major=true` in every log).
+2. netwatch 0.19.3's `UdpSocket` parks a sender that meets the rebind's
+   write lock, or a socket that is not writable, in **one shared
+   `AtomicWaker`**. Each sender that parks replaces the waker of the one
+   before it, so the rebind's `wake_all` wakes only the last one.
+3. A `RemoteStateActor` relaying a dial's Initial packets (a dial with no
+   path yet, which is every dial right after a restart) can be a sender
+   that never gets woken. Its own 60 s idle sleep was the only other
+   wakeup its task had registered.
+4. iroh's socket actor hands every new dial (`ResolveRemote`) and every
+   new connection (`AddConnection`) to the per-peer actors one at a time,
+   with an awaited `send`. It blocks on the stuck actor's full 16-slot
+   inbox. For the rest of the minute the endpoint can neither dial
+   anyone nor hand an accepted connection to its ALPN handler. Peers
+   complete QUIC handshakes with it, so their pooled connections answer
+   `Pool::probe`, but their requests are never answered.
+5. A restart makes this likely: many dials are in flight at once, several
+   of them to dead addresses that keep retransmitting Initials through the
+   actors.
+
+"Authentication failed" is a side effect, not an identity problem. noq
+reports it when the first Initial of an unknown connection does not
+decrypt with the client Initial keys derived from its DCID
+(`Endpoint::accept`). This happens before TLS, so no key is compared. Such
+packets are stale handshake packets of dials abandoned while the endpoint
+was stuck. In the reproduction they appeared on the stuck node right after
+it resumed. This explanation is inferred from the timing; the packets'
+origin was not traced.
+
+The earlier `p2p-addr-churn` fix (6677eea) recorded "60-120 s" stalls that
+began just after a docker bridge was removed. That timing matches this
+lost wakeup, and this fix probably covers those too.
+
+### Fix
+
+- **`vendor/netwatch`**: netwatch 0.19.3, vendored through
+  `[patch.crates-io]` as `vendor/fjall` is. See
+  `vendor/netwatch/CONSTELLATION-PATCH.md` for what changed, the bug, and how
+  to drop the patch.
+  - `src/udp.rs`: the socket's `send_waker`/`recv_waker` are `Wakers`,
+    which keep and wake every parked task. A send that goes through also
+    wakes the senders still parked (`Wakers::wake_parked`, a single atomic
+    load when none are parked). This covers the other single-waker hole:
+    tokio's poll-readiness keeps only the latest task's waker too.
+  - `Cargo.toml`: `warnings = "allow"`.
+- The workspace `Cargo.toml` excludes `vendor/netwatch` and patches it in.
+  `Cargo.lock` drops netwatch's registry source and checksum.
+- No change in `crates/net`. Node keys are stored and loaded correctly:
+  they are per state dir in the harness and per host in production, and
+  they were never regenerated.
+
+### Recovery bound: 10 s after the last remount, measured at most 3 s
+
+A node that comes back reads the registry, so it dials the root's current
+address at once, and one handshake takes a round trip. The slowest
+legitimate path is a node that stayed up and holds a dial to the root's
+dead previous address. That dial fails after `DIAL_TIMEOUT` (5 s). The
+re-dial reaches the new address, learned from the root's own inbound
+connection or from the next registry read (every 5 s). That gives 5 s +
+5 s. Measured after the fix, over 26 runs (78 rounds): at most 2.9 s,
+most of it a restarted root re-adopting its lease (the read-delegation
+quarantine).
+
+### Tests
+
+- **`crates/net/tests/udp_rebind_wakeups.rs`** (new): 16 tasks each send
+  20 000 datagrams on one `netwatch::UdpSocket` while another thread
+  rebinds it every millisecond.
+  - Upstream netwatch: fails both runs (one at 2 000 and one at 20 000
+    datagrams per sender), with 15 of 16 senders still parked after 20 s.
+  - Vendored netwatch: passes 3 of 3, in about 0.3 s.
+- **`crates/net/tests/cluster_restart.rs`** (new, guard): the first node
+  back bootstraps gossip from a dead address while the peer restarts at a
+  new port under the same key. Both directions must answer within 5 s.
+  It passes with and without the fix: an in-process test cannot cause a
+  link change. It stays as a guard for the restart order.
+- **Harness `p2p-cluster-restart`** (new, `scenarios/cluster_restart.rs`):
+  - Four nodes with their own keys; `a` holds the root lease at first.
+  - Seeded rounds: the whole cluster, then one node, then two, killed with
+    `kill -9`. They restart in a seeded order up to
+    `CONSTELLATION_CLUSTER_RESTART_GAP_MS` (7000) apart.
+  - Link churn (`LinkChurn`): a private docker bridge
+    `<prefix>-linkchurn` is created and removed every 300 ms from the kill
+    until the round is measured. `CONSTELLATION_CLUSTER_RESTART_LINK_CHURN=0` turns it
+    off.
+  - The check: every non-holder's write is a P2P forward to the root within
+    10 s of the last remount. Everything converges at the end.
+  - A failure keeps every incarnation's mount log.
+  - `LinkChurn::finish` fails the scenario when churn was requested and
+    no bridge could be created (the docker error is reported).
+- **Review round**: `vendor/netwatch` now has `LICENSE-MIT` and
+  `LICENSE-APACHE` (from the upstream repository root at the recorded
+  commit); `CONSTELLATION-PATCH.md` records that no newer upstream fixes
+  the bug and the cancelled-waker hole. `udp_rebind_wakeups` counts failed
+  sends instead of unwrapping.
+- **Dial stall detector** (`crates/net/src/endpoint.rs`, `DialWatch`): when
+  every dial has timed out for longer than 2 x the dial timeout, one warn
+  (at most per 60 s) and `P2pStatus.dial_stalled`, exported as the gauge
+  `constellation_p2p_dial_stalled` (schema re-blessed). Cleared by any
+  dial that completes or fails without timing out. Unit test
+  `dial_watch_trips_on_a_run_of_timeouts_and_clears_on_an_answer`.
+  - `s3env::docker_prefix` is now `pub(crate)` for the network name.
+
+| Build | `p2p-cluster-restart` |
+|---|---|
+| `main` daemon (`CONSTELLATION_BIN`), link churn | **fails 4 of 4** (seeds 1-4): 49.8 s, 58.4 s, 54.7 s, 58.5 s in round 0 |
+| `main` daemon, no churn, 7 s gaps (relies on the host's own churn) | fails 4 of 8, about 50 s |
+| fixed, link churn | 16 of 16 PASSED, worst 2.8 s |
+| fixed, no churn, 7 s gaps | 10 of 10 PASSED, worst 2.9 s |
+
+### Decisions
+
+- **Fix in the dependency, not around it.** A retry or a shorter timeout
+  in `crates/net` would not help: the stuck endpoint cannot dial at all.
+  The lost wakeup is netwatch's, so the patch goes there, minimal and
+  marked, with the upstream commit recorded.
+- **Wake every parked task, not just a yielding retry on rebind.** This
+  also covers the not-writable case, which loses wakeups the same way.
+  The cost is a spurious poll for a task that was not waiting on that
+  event.
+- **Real link churn in the scenario.** A forced `Endpoint::network_change`
+  only re-reads interfaces; it rebinds only if they actually changed. A
+  docker bridge of the harness's own is what a container host produces
+  anyway, and the harness already depends on docker. It is not load:
+  about three `docker network` calls a second during the measured phase.
+- **iroh's own fragility is left upstream.** The socket actor awaits a send
+  to each per-peer inbox, so any one stuck actor stalls the endpoint. This
+  is worth an upstream issue, along with the netwatch one. Neither was
+  filed from here.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, `TMPDIR=/var/tmp/p2pra-tmp`, prefix `p2pra`)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test` for every workspace package, in seven calls | 2296 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `p2p-cluster-restart` x10 (seeds 1-10) | 10 PASSED, worst recovery 2.64 s |
+| `git-under-flock-faults --seed 1001` x5 | 5 PASSED (195-242 s each, no FUSE request stalled) |
+| every `p2p-*`, `coop-*`, `*failover*` x2 (p2p-invalidation, -handover, -partition-tolerance, -same-identity-restart, -partition-one-node, -off-no-delegation; coop-cache-hit, -fallback, -exact-churn, -digest-compare; backup-failover, ack-s3-failover, backup-failover-with-delegation, lock-failover, root-failover-with-delegates) | all PASSED twice, except `p2p-same-identity-restart`: see below |
+
+`p2p-same-identity-restart` failed in 1 of the 2 gate runs, and in 1 of 4
+extra runs. The error was "'c2 holds the lease (c2-again)' not reached
+within 30s", with c2 seeing an expired lease held by node 2. This failure
+is pre-existing: `main`'s daemon fails the same scenario 2 of 6
+(`CONSTELLATION_BIN` set to a build of `b323b85`), once with the
+identical error. In the runs that fail, c0/c1 see c2 reconnect only after
+2.8–3 s instead of within milliseconds. The lease moved off c2 while c2
+was down, and its later write is forwarded rather than re-taking the
+lease. That is a lease-placement assumption of the scenario, outside
+this fix. It is not investigated further here.

@@ -724,6 +724,12 @@ impl Peers {
         }
     }
 
+    /// Every dial has been timing out for over twice the dial timeout;
+    /// `false` with P2P disabled.
+    pub fn dial_stalled(&self) -> bool {
+        self.inner.as_ref().is_some_and(|i| i.p2p.dial_stalled())
+    }
+
     /// `(accepts inbound, gossips)`; `(false, false)` when disabled.
     pub fn admission(&self) -> (bool, bool) {
         self.inner

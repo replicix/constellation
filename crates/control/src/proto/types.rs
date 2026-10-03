@@ -1514,6 +1514,11 @@ pub struct P2pStatus {
     /// Active relay policy: `disabled`, `default`, or a custom URL label.
     #[serde(default)]
     pub relay: String,
+    /// Every P2P dial has timed out for longer than twice the dial
+    /// timeout (`constellation_p2p_dial_stalled`): this node's endpoint
+    /// is likely stuck, not its peers.
+    #[serde(default)]
+    pub dial_stalled: bool,
     #[serde(default)]
     pub peers: Vec<PeerStatus>,
 }

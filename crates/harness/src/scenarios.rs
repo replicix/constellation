@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// A P2P cluster's nodes `kill -9`ed and restarted together.
+mod cluster_restart;
 /// Plan 31 §6.12: subtree confinement through the kernel.
 mod confinement;
 mod coop_churn;
@@ -290,6 +292,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: p2p_same_identity_restart,
+    },
+    Scenario {
+        name: "p2p-cluster-restart",
+        desc: "fix p2p-restart-auth: kill -9 all four nodes at once (then one, then two), restart them in a seeded order while a docker bridge comes and goes (iroh rebinds its sockets): every node that does not hold the lease forwards a write to the root over P2P within 10 s of the last remount",
+        requires: &[],
+        caps: &[],
+        run: cluster_restart::p2p_cluster_restart,
     },
     Scenario {
         name: "coop-cache-hit",

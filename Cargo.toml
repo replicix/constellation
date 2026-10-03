@@ -54,6 +54,7 @@ exclude = [
     "bench/enginebench",
     "vendor/fjall",
     "vendor/fuser",
+    "vendor/netwatch",
 ]
 
 [workspace.package]
@@ -120,7 +121,8 @@ iroh = "1"
 iroh-gossip = "0.101"
 # The interface monitor iroh itself runs on; keep this pinned to the
 # version the resolved iroh depends on (one copy in the tree), and bump
-# it together with iroh.
+# it together with iroh. Vendored with a lost-wakeup fix (see
+# `[patch.crates-io]` below).
 netwatch = "0.19.3"
 
 # Vendored fjall 3.1.10 with a one-function fix for a shutdown deadlock in
@@ -132,6 +134,10 @@ netwatch = "0.19.3"
 fjall = { path = "vendor/fjall" }
 # Plan 31 C4b: FUSE session handover (vendor/fuser/CONSTELLATION-PATCH.md).
 fuser = { path = "vendor/fuser" }
+# Fix p2p-restart-auth: netwatch 0.19.3's UDP socket wakes only the last
+# of the tasks parked on it, which stalls iroh's endpoint for a minute
+# after a rebind (vendor/netwatch/CONSTELLATION-PATCH.md).
+netwatch = { path = "vendor/netwatch" }
 
 [profile.release]
 lto = "thin"

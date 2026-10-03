@@ -492,6 +492,11 @@ pub fn render_metrics(status: &StatusReport, sched: Option<&SnapSchedReport>) ->
         status.speculation.replay_conflicts
     );
     gauge!(
+        "constellation_p2p_dial_stalled",
+        "1 while every P2P dial has timed out for over twice the dial timeout (a stuck endpoint, not dead peers).",
+        u8::from(status.p2p.dial_stalled)
+    );
+    gauge!(
         "constellation_speculation_local",
         "This node's own unshipped transactions captured as speculation.",
         status.speculation.local

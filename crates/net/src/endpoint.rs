@@ -23,7 +23,7 @@ use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type ConnectionSlot = Arc<tokio::sync::Mutex<Option<iroh::endpoint::Connection>>>;
 /// Called with a peer's endpoint id after its pooled connection was
@@ -154,6 +154,68 @@ enum Suspicion {
 /// address (the registry's current one included) and lands on the new
 /// incarnation. The new incarnation's own fresh connections are closed
 /// too — it re-dials on demand, and gossip re-forms its neighbor link.
+/// Whether every dial of this endpoint is timing out: the signature of an
+/// endpoint that is stuck itself (the `p2p-restart-auth` stall) rather
+/// than of dead peers, because a peer that is down is one dial and a
+/// live one answers. Fed by [`P2p::connection`]'s dials only, so it is
+/// off the request hot path (a pooled connection never reaches it).
+#[derive(Debug, Default)]
+struct DialWatch {
+    state: Mutex<DialWatchState>,
+    stalled: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct DialWatchState {
+    /// When the current run of timeouts, with no dial completing or
+    /// failing another way in between, began.
+    since: Option<Instant>,
+    last_warn: Option<Instant>,
+}
+
+impl DialWatch {
+    /// At most one warning per this long.
+    const WARN_EVERY: Duration = Duration::from_secs(60);
+
+    /// A dial completed, or failed without timing out: the endpoint is
+    /// dialing.
+    fn answered(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.since = None;
+        self.stalled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A dial timed out after `limit`. Returns whether this call logged
+    /// the warning.
+    fn timed_out(&self, now: Instant, limit: Duration) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let since = *st.since.get_or_insert(now);
+        let run = now.saturating_duration_since(since);
+        if run <= 2 * limit {
+            return false;
+        }
+        self.stalled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if st
+            .last_warn
+            .is_some_and(|t| now.saturating_duration_since(t) < Self::WARN_EVERY)
+        {
+            return false;
+        }
+        st.last_warn = Some(now);
+        tracing::warn!(
+            "every P2P dial has timed out for {run:?} (limit {limit:?} each): the endpoint \
+             may be stuck, not its peers"
+        );
+        true
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.stalled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 struct Pool {
     connections: Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>,
     /// Every connection the endpoint completed a handshake for, either
@@ -1375,6 +1437,7 @@ pub struct P2p {
     policy: AddrPolicy,
     /// `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`, read at spawn.
     dial_timeout: Duration,
+    dial_watch: DialWatch,
 }
 
 /// Derive the gossip topic. Prefers the `gossip_secret` from
@@ -1451,6 +1514,7 @@ impl P2p {
             preferred,
             policy,
             dial_timeout: dial_timeout(),
+            dial_watch: DialWatch::default(),
         })
     }
 
@@ -1472,6 +1536,12 @@ impl P2p {
         self.admission
             .refuse_gossip
             .store(!allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether every dial has timed out for longer than twice the dial
+    /// timeout (`constellation_p2p_dial_stalled`).
+    pub fn dial_stalled(&self) -> bool {
+        self.dial_watch.is_stalled()
     }
 
     /// Whether inbound connections are admitted.
@@ -1909,10 +1979,16 @@ impl P2p {
         let limit = self.dial_timeout;
         let conn = match tokio::time::timeout(limit, self.endpoint.connect(peer.clone(), ALPN))
             .await
-            .map_err(|_| anyhow::anyhow!("dialing peer timed out after {limit:?}"))?
-        {
-            Ok(conn) => conn,
+            .map_err(|_| {
+                self.dial_watch.timed_out(Instant::now(), limit);
+                anyhow::anyhow!("dialing peer timed out after {limit:?}")
+            })? {
+            Ok(conn) => {
+                self.dial_watch.answered();
+                conn
+            }
             Err(e) => {
+                self.dial_watch.answered();
                 if refused_alpn(&e) && version_log_due(&peer.id) {
                     // Off the gate: learning the peer's version is one
                     // more dial, and the caller's error is the same.
@@ -2003,6 +2079,41 @@ fn transport_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review (p2p-restart-auth): a minute of timed-out dials was silent.
+    /// The watch trips only after every dial of a run, longer than
+    /// 2 × the limit, timed out, warns once per window, and clears when
+    /// one dial gets an answer.
+    #[test]
+    fn dial_watch_trips_on_a_run_of_timeouts_and_clears_on_an_answer() {
+        let w = DialWatch::default();
+        let limit = Duration::from_secs(5);
+        let t0 = Instant::now();
+        assert!(!w.timed_out(t0, limit));
+        assert!(!w.timed_out(t0 + limit, limit));
+        assert!(
+            !w.timed_out(t0 + 2 * limit, limit),
+            "exactly 2x is not over"
+        );
+        assert!(!w.is_stalled());
+        assert!(
+            w.timed_out(t0 + 3 * limit, limit),
+            "the first over 2x warns"
+        );
+        assert!(w.is_stalled());
+        assert!(
+            !w.timed_out(t0 + 4 * limit, limit),
+            "rate-limited: one warning per window"
+        );
+        assert!(w.is_stalled());
+        assert!(w.timed_out(t0 + 3 * limit + DialWatch::WARN_EVERY, limit));
+        w.answered();
+        assert!(!w.is_stalled(), "one answered dial clears it");
+        // A new run starts from scratch.
+        let t1 = t0 + Duration::from_secs(600);
+        assert!(!w.timed_out(t1, limit));
+        assert!(!w.is_stalled());
+    }
 
     #[test]
     fn topic_prefers_the_secret_over_the_uuid() {

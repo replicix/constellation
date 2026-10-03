@@ -45,7 +45,7 @@ pub const BUCKET: &str = "constellation-harness";
 /// with connection-refused somewhere unrelated. Giving each run a
 /// distinct prefix is the way to run two at once (e.g. a long matrix in
 /// one terminal and a single scenario in another).
-fn docker_prefix() -> String {
+pub(crate) fn docker_prefix() -> String {
     std::env::var("CONSTELLATION_HARNESS_DOCKER_PREFIX")
         .unwrap_or_else(|_| "constellation-harness".to_string())
 }

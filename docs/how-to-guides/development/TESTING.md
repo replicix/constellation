@@ -873,6 +873,45 @@ window or the TTL; with it, B asks A directly, A flushes and releases,
 and B's CAS succeeds. It asserts the write completes in well under half
 the idle window and that the epoch advanced. Observed: ~27–33 ms.
 
+`p2p-cluster-restart` (fix `p2p-restart-auth`) runs four nodes, each
+with its own node key in its state dir; `a` creates the filesystem and holds
+the root lease at first (after the first round another node may hold it).
+There are three seeded rounds: `kill -9` the whole cluster, then one
+node, then two. The victims restart one by one in a seeded order, up to
+`CONSTELLATION_CLUSTER_RESTART_GAP_MS` (default 7000) apart. From the kill until the
+round is measured, the harness creates and removes a docker bridge of
+its own every 300 ms (`<docker prefix>-linkchurn`). iroh rebinds its
+sockets on such a link change, as on any container host. Set
+`CONSTELLATION_CLUSTER_RESTART_LINK_CHURN=0` to turn the churn off. After the last
+remount, every node that does not hold the lease must have a write
+forwarded to the root over P2P within 10 s: `forwarded_ok` grows and
+`inbox_ops` does not. Writes that are not forwarded are retried every
+200 ms. A failure keeps every incarnation's mount log in
+`$TMPDIR/harness-p2p-cluster-restart-logs-*`. If churn is on and not one
+bridge could be created (docker address pools exhausted, no permission),
+the scenario fails with the docker error instead of passing unguarded.
+
+**Shared hosts:** each bridge create or remove is a major link change for
+*every* iroh endpoint on the host, not only this scenario's. While it
+runs, any other daemon built without the vendored netwatch patch (a
+release binary, another worktree's older build) can hit the 60 s stall
+this scenario reproduces. The network's name carries this run's private
+prefix and is removed afterwards (a SIGKILLed harness leaks one network,
+which the next run removes first).
+
+Observed results:
+
+- Before the fix: 50-60 s in round 0 of 4 of 4 seeds. netwatch's UDP
+  socket lost the wakeup of an iroh per-peer actor during a rebind, and
+  iroh's whole endpoint stalled behind that actor for its 60 s idle
+  timer. See `vendor/netwatch/CONSTELLATION-PATCH.md`.
+- After the fix: at most about 3 s. Most of that is a restarted root
+  re-adopting its lease.
+
+The mechanism has a unit test of its own,
+`crates/net/tests/udp_rebind_wakeups.rs`: 16 tasks send on one socket
+while it is rebound every millisecond.
+
 Phase 5 scenarios exercise the cooperative cache (DESIGN.md §7). Each
 one uses a distinct `CONSTELLATION_NODE_KEY` and
 `CONSTELLATION_DIGEST_INTERVAL_S=1` so membership propagates in the

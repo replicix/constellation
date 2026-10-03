@@ -224,6 +224,7 @@ impl EngineControl {
                 .node_addr()
                 .and_then(|a| serde_json::to_string(&a).ok()),
             relay: self.peers.relay_label(),
+            dial_stalled: self.peers.dial_stalled(),
             peers,
         };
         let enrolled = !self.departed.load(std::sync::atomic::Ordering::Relaxed)
