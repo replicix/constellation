@@ -460,3 +460,55 @@ fn a_fenced_owners_fsync_reports_a_pending_discard_once() {
     assert_eq!(fsync(&other, theirs.fh), Err(Code::Io), "reported once");
     assert_eq!(fsync(&other, theirs.fh), Ok(()));
 }
+
+/// A blocked lock wait ends with `Intr` when its op is cancelled (the
+/// FUSE adapter cancels a blocking `setlk` on any signal, as POSIX has
+/// `F_SETLKW` return `EINTR`): stress-ng's `lockf`/`lockmix` workers,
+/// which wait on each other, otherwise stayed unkillable in the kernel
+/// for ever. The cancelled waiter holds nothing; the holder keeps its lock.
+#[test]
+fn a_cancelled_blocking_lock_wait_answers_intr_and_holds_nothing() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let root = Caller::root();
+    let (file, _) = f.create(&root, ROOT_INO, "contended").unwrap();
+    let ino = file.attr.ino;
+    f.lock(ino, me, now_unix_ms() + 60_000);
+    let cancel = constellation_vfs::CancelToken::new();
+    let waiter = Caller::new(0, 0, Some(me));
+    let wait = |cancel: &constellation_vfs::CancelToken| {
+        Blocking::run(|r| {
+            f.fs.lock_acquire(
+                &OpCtx::new(OpKind::LockAcquire, &waiter).with_cancel(cancel),
+                ino,
+                Fh(ino),
+                LockSpec {
+                    owner: LockOwner(TURN_OWNER + 1),
+                    range: LockRange { start: 0, end: 10 },
+                    kind: LockKind::Write,
+                    pid: me,
+                },
+                true,
+                r,
+            )
+        })
+    };
+    let started = std::time::Instant::now();
+    let result = std::thread::scope(|s| {
+        let waiting = s.spawn(|| wait(&cancel));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiting.is_finished(), "the conflicting lock is held");
+        cancel.cancel();
+        waiting.join().unwrap()
+    });
+    assert_eq!(code(result), Code::Intr);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let held = f.meta.locks().local_locks(ino);
+    assert_eq!(held.len(), 1, "only the holder's lock: {held:?}");
+    assert_eq!(held[0].owner, TURN_OWNER);
+    // Already cancelled when it would have to wait: `Intr` at once.
+    assert_eq!(code(wait(&cancel)), Code::Intr);
+    // Released, the next wait is granted.
+    f.unlock(&root, ino).unwrap();
+    wait(&constellation_vfs::CancelToken::new()).unwrap();
+}

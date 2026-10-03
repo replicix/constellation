@@ -385,7 +385,7 @@ fn reclaim_listed(c: &Client) -> Result<Listed> {
 /// differences until the next refresh the replica covers (documented on
 /// `SnapAcctService::verify`), so it is retried for a bounded time; the
 /// last report is the error.
-fn verify_clean(c: &Client, when: &str) -> Result<()> {
+pub(super) fn verify_clean(c: &Client, when: &str) -> Result<()> {
     let mut last = String::new();
     eventually(
         &format!("{} verifies clean {when}", c.name),

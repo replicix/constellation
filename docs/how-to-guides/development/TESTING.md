@@ -125,6 +125,94 @@ all failure detail lines with `PJDFSTEST_DETAILS=all`.
   stressor.
 - a post-stress canary write verifies the mount survived.
 
+## Stress: every stress-ng filesystem stressor (`stress-ng-fs`)
+
+`tests/stress.sh` runs five stress-ng stressors one at a time. The
+`stress-ng-fs` harness lane (`crates/harness/src/scenarios/stressfs.rs`)
+runs **all** applicable filesystem stressors (`stress-ng --class
+filesystem?`, 0.22 has 60) **at once**, one instance each, with `--verify`,
+for 120 s, against a live mount behind the harness's fault proxy:
+
+| Scenario | What |
+|---|---|
+| `stress-ng-fs` | one node, one mount; accounting snapshots on, a few seed files written first, two snapshots of `/` taken mid-run |
+| `stress-ng-fs-faults` | the same under 40 ± 20 ms S3 latency and a 1.5 s S3 cut every 4–7 s; no snapshots. A **known-bug reproduction**: run it by name |
+| `stress-ng-fs-nodes` | the same on three P2P nodes of one filesystem at once, each in its own directory; snapshots from a non-holder. A **known-bug reproduction** (`KNOWN_BUG_REPROS`): run it by name |
+
+A run passes when all of these hold:
+
+- stress-ng's verdict for each stressor, read from its own `passed:` /
+  `failed:` / `skipped:` summary lines rather than the exit code, is pass
+  or skip. A failure is allowed only if the baseline lists the stressor.
+  A failure whose log mentions verification, a mismatch or corruption is
+  never baselined, and a stressor with no verdict (killed) fails.
+- stress-ng finishes within its timeout plus 120 s. Otherwise the stuck
+  processes are printed with their `wchan` and the daemon's
+  `fuse_requests`, the process group is killed, and the mount's FUSE
+  connection is aborted if they survive `SIGKILL`.
+- The daemon logged no panic, and no `ERROR` line except in the faults
+  scenario. No non-lock FUSE request stalled past the watchdog threshold.
+- No cluster lock grant lapsed and nothing was fenced for it:
+  `status.locks` `lost`, `fenced_io`, `owners_fenced` and
+  `owner_fenced_ops` are all 0. stress-ng tolerates some of the `EIO`s a
+  lapse causes, so its verdicts alone would miss one.
+- Afterwards the mount answers `stat` and `ls`, and a 1 MiB write, fsync
+  and read round trip works. On `-nodes`, every node also reads every
+  other node's file.
+- The spool drains (`journal_backlog` and `pending_uploads` reach 0).
+- With snapshots on, `snapshot space --verify` reports no mismatch.
+- No kernel message since the start names stress-ng or a hung task. The
+  log is read with `dmesg`, or `journalctl -k` when `dmesg` is
+  restricted. If neither is readable the check is skipped, and the run
+  says so.
+
+Each run prints a table of stressor, verdict, bogo-ops and note.
+`STRESS_NG_FS_REPORT=<file>` appends it as TSV (scenario, transport, node,
+stressor, verdict, bogo-ops).
+
+**Two-way baseline**, in the style of xfstests:
+
+- `tests/stress-ng-exclude.txt` lists the stressors that do not run, each
+  with a reason. Some never touch the mount: `getdent`, `handle`,
+  `procfs`, `statmount`, `eventfd` and `fd-fork`; the evidence is that
+  the daemon's `vfs_ops` saw only stress-ng's `statfs`. Others need a
+  root-only kernel feature or a different filesystem. `io` calls
+  `sync(2)` for the whole host. A `name@root` entry applies only to root
+  runs: as root, `iomix` writes `vm.drop_caches`. `fstat` stats `/dev` by
+  default, so the run points it at a directory of 32 files on the mount
+  (`--fstat-dir`). The stressors that only skip on FUSE (`acl`, `chattr`,
+  `fiemap`, `verity`) are not excluded: they run and report `skip`, so one
+  that starts to pass shows in the table.
+- `tests/stress-ng-baseline.txt` lists reproducible failures that are
+  known semantic gaps, each with a reason (today only `filename`:
+  non-UTF-8 names are stored lossily). A failure not listed fails the
+  run. A listed stressor that passes is printed as
+  `IMPROVEMENTS (remove from tests/stress-ng-baseline.txt)`.
+- Both lists are compiled into the harness. `STRESS_NG_FS_EXCLUDE` and
+  `STRESS_NG_FS_BASELINE` name other files instead. An entry naming a
+  stressor this stress-ng lacks fails the run as stale.
+
+```sh
+target/release/harness run stress-ng-fs
+CONSTELLATION_FUSE_TRANSPORT=uring target/release/harness run stress-ng-fs
+sudo env HOME=/root PATH=$PATH CONSTELLATION_FUSE_TRANSPORT=uring \
+    target/release/harness run stress-ng-fs      # as root: uring_zc, passthrough too
+target/release/harness run stress-ng-fs-nodes stress-ng-fs-faults  # known-bug repros
+# one stressor (or a few) through the whole harness, excluded ones included:
+STRESS_NG_FS_ONLY=lockmix STRESS_NG_FS_SECS=20 target/release/harness run stress-ng-fs
+# one stressor directly on a mount you made (fresh mount per stressor:
+# a hang leaves processes in FUSE until the connection is aborted):
+stress-ng --lockmix 1 --verify --timeout 20s --temp-path "$MNT" --metrics --seed 42
+```
+
+Other knobs: `STRESS_NG_FS_SECS` (120), `STRESS_NG_FS_INSTANCES` (1 per
+stressor), `STRESS_NG_FS_ARGS` (extra stress-ng arguments) and
+`STRESS_NG_FS_TMP`. The last sets where the mounts and caches live; the
+default is `/var/tmp`, because a run writes several hundred MiB. File sizes
+are capped at 128 MiB per stressor (`--hdd-bytes`, `--iomix-bytes`,
+`--fallocate-bytes`, `--sync-file-bytes`, `--copy-file-bytes`). Root runs
+must keep `HOME=/root`; afterwards check `find ~ -user root`.
+
 ## S3 emulation: floci
 
 Integration tests use [floci](https://github.com/floci-io/floci)
@@ -261,7 +349,9 @@ latency), `fio-blips` (fio verify while S3 is cut for 800 ms every
 leaning on the per-request retry budget, which the harness keeps tight at
 `CONSTELLATION_S3_MAX_RETRIES=2`), and `stress-ng-flap`
 (metadata churn during S3 flapping; the mount must stay healthy and
-the spool drain afterwards). Scenarios declare required host binaries
+the spool drain afterwards); the
+[`stress-ng-fs` lane](#stress-every-stress-ng-filesystem-stressor-stress-ng-fs)
+runs every applicable stress-ng filesystem stressor at once. Scenarios declare required host binaries
 and are skipped loudly when a tool is missing (CI installs fio and
 stress-ng, so nothing is skipped there).
 
@@ -1293,7 +1383,7 @@ Two checks:
 - Every one of the 6,400 created files is visible from both non-holder
   mounts within 2 seconds of the burst ending.
 
-### Known-bug reproductions (plan 30 M0; currently empty)
+### Known-bug reproductions (plan 30 M0)
 
 `harness list` prints a second catalog after the ordinary scenario list,
 headed `known-bug reproductions (expected to FAIL until fixed)`, backed
@@ -1303,7 +1393,21 @@ a documented bug as a regression. `harness run <name>` resolves a name
 in either list. When a later milestone fixes the bug, its scenario
 moves into `SCENARIOS` as the regression test. Plan 30 M2 moved
 `forward-timeout-reexec` (bug A) and M3a moved both bug B scenarios
-below, so the list is empty today.
+below. The list holds two scenarios of
+[the stress-ng-fs lane](#stress-every-stress-ng-filesystem-stressor-stress-ng-fs)
+today:
+
+- `stress-ng-fs-nodes`: under three nodes' worth of stress-ng, the lease
+  holder's core stalls for seconds at a time. The non-holders' lock grants
+  then lapse (`EIO` under their locks), backups seal the live holder's
+  epoch, and forwarded mutations wait out their 120 s timeout. One
+  non-holder ends with every FUSE worker waiting, and its stress-ng
+  processes cannot be killed.
+- `stress-ng-fs-faults` fails about one run in four. Every S3 cut opens a
+  continuation epoch on the single node, and closing it is handled as the
+  lease going away: all cluster lock grants are dropped, lock holders'
+  writes fail with `EIO` and new locks with `ENOLCK`. Once the epoch froze
+  instead, and a create after the run failed with `EROFS`.
 
 Reproducing these needed two things no scenario had before:
 

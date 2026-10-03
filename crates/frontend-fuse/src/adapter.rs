@@ -35,8 +35,30 @@
 //! every 100 ms while the request waits): the engine's wait ends, the
 //! caller — which the kernel keeps waiting for this answer even after
 //! `SIGKILL`, the request being already in userspace — is released to
-//! die, and the data stays pending. Other ops ignore interrupts, as
-//! before.
+//! die, and the data stays pending.
+//!
+//! A blocking lock (`F_SETLKW`, `F_OFD_SETLKW`, `flock` without `LOCK_NB`)
+//! registers too, under the other policy: **interruptible**. POSIX ends
+//! such a wait with `EINTR` on any signal, a handled one included, and
+//! programs rely on it — an `alarm(2)` bounding a lock wait, a timer that
+//! ends a worker (stress-ng's `lockf`/`lockmix`, whose processes otherwise
+//! wait on each other for ever and stay unkillable, the request being in
+//! userspace). Its interrupt cancels it at once; the wait answers `EINTR`
+//! and holds nothing. Other ops ignore interrupts, as before.
+//!
+//! The interrupt can also never come. FUSE-over-io_uring (seen on Linux
+//! 7.3) loses it when the signal arrives after the request is queued and
+//! before the ring hands it to the daemon: the kernel marks the request
+//! interrupted (its caller then waits killably, in `D`, with the signal
+//! still pending) but sends no `FUSE_INTERRUPT` for it, then or later. So
+//! a request that came over a ring does not rely on the interrupt alone:
+//! once it has waited [`FATAL_POLL`] it is checked against its caller's
+//! `/proc` state too — a lock wait whose caller has a deliverable signal
+//! pending answers `EINTR`, and a killable request whose caller is dying
+//! is released, both as if the interrupt had come. Over `/dev/fuse` the
+//! kernel's interrupt is reliable and alone decides: the caller's pending
+//! set includes process-directed signals (`ShdPnd`), which another thread
+//! of the caller may be the one to take, and must not end this wait.
 
 use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, PreOpen};
 use crate::reply::{
@@ -155,11 +177,19 @@ impl<V: Vfs> FuseFs<V> {
         self.obs.clone()
     }
 
-    /// Replace how a caller's fatal signal is detected (tests; see
-    /// [`fatal_signal_pending`]).
+    /// Replace how a caller's fatal (and any pending) signal is detected
+    /// (tests; see [`fatal_signal_pending`], [`signal_pending`]).
     pub fn with_fatal_signal_probe(mut self, probe: fn(u32) -> bool) -> Self {
-        self.interrupts = Arc::new(Interrupts::with_probe(probe));
+        // A dying thread has a signal pending; the test's other threads
+        // have none (they may be anybody's real pids here).
+        self.interrupts = Arc::new(Interrupts::with_probes(probe, probe));
         self
+    }
+
+    /// Whether this session's requests come over a ring, which may lose
+    /// their interrupts (module doc).
+    fn lossy(&self) -> bool {
+        self.obs().metrics().transport() != fuser::Transport::DevFuse.name()
     }
 
     /// `fsync` and `fsyncdir` (see there).
@@ -168,7 +198,7 @@ impl<V: Vfs> FuseFs<V> {
         let op = self.obs().begin(OpKind::Fsync, ino.0);
         let _in = op.enter();
         let unique = req.unique().0;
-        let token = self.interrupts.register(unique, req.pid());
+        let token = self.interrupts.register(unique, req.pid(), self.lossy());
         // Counted as a bounded deferral, like a cold read: a detach waits
         // for it (bounded) and refuses if it is still waiting for S3.
         let reply = op.responder(
@@ -394,17 +424,43 @@ fn status_has_sigkill_pending(status: &str) -> bool {
         .any(|mask| mask & sigkill != 0)
 }
 
+/// Whether the thread `tid` has a signal pending that it does not block —
+/// what makes the kernel's `signal_pending()` true and ends an
+/// interruptible wait: `(SigPnd | ShdPnd) & !SigBlk` in
+/// `/proc/<tid>/status`. An ignored signal is never queued, so it never
+/// shows. Unknowable (`tid` 0, a thread `/proc` does not show) is "no".
+pub fn signal_pending(tid: u32) -> bool {
+    if tid == 0 {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{tid}/status"))
+        .is_ok_and(|status| status_has_deliverable_signal(&status))
+}
+
+fn status_has_deliverable_signal(status: &str) -> bool {
+    let mask = |key: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())
+            .unwrap_or(0)
+    };
+    (mask("SigPnd:") | mask("ShdPnd:")) & !mask("SigBlk:") != 0
+}
+
 /// The requests that honour `FUSE_INTERRUPT`, by `unique` (see the module
 /// doc).
 pub(crate) struct Interrupts {
     state: std::sync::Mutex<InterruptState>,
     /// [`fatal_signal_pending`], or a test's stand-in.
     fatal: fn(u32) -> bool,
+    /// [`signal_pending`], or a test's stand-in.
+    pending: fn(u32) -> bool,
 }
 
 impl Default for Interrupts {
     fn default() -> Self {
-        Self::with_probe(fatal_signal_pending)
+        Self::with_probes(fatal_signal_pending, signal_pending)
     }
 }
 
@@ -414,6 +470,15 @@ struct Waiting {
     pid: u32,
     /// The kernel interrupted it: watched for a fatal signal.
     interrupted: bool,
+    /// Any interrupt cancels it, a handled signal's too (a blocking
+    /// lock wait; see the module doc).
+    any_signal: bool,
+    /// It came over a ring, which may lose its interrupt: past
+    /// [`FATAL_POLL`] its caller is checked without one.
+    lossy: bool,
+    /// Registered at: past [`FATAL_POLL`], the caller's own state is
+    /// checked even without an interrupt (see the module doc).
+    since: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -432,25 +497,80 @@ impl InterruptState {
             .retain(|(_, at)| now.duration_since(*at) < EARLY_INTERRUPT_KEPT);
     }
 
-    /// Interrupted, not cancelled yet.
+    /// Interrupted, or over a ring, and not cancelled yet.
     fn watched(&self) -> bool {
         self.waiting
             .values()
-            .any(|w| w.interrupted && !w.token.is_cancelled())
+            .any(|w| (w.interrupted || w.lossy) && !w.token.is_cancelled())
+    }
+
+    /// What [`Interrupts::probe`] checks now: each waiting request that is
+    /// not cancelled, with whether its caller's death (interrupted, or
+    /// over a ring and overdue) or any pending signal (a lock wait over a
+    /// ring, overdue) cancels it.
+    fn checks(&self) -> Vec<Check> {
+        let now = std::time::Instant::now();
+        self.waiting
+            .values()
+            .filter(|w| !w.token.is_cancelled())
+            .filter_map(|w| {
+                let overdue = w.lossy && now.duration_since(w.since) >= FATAL_POLL;
+                let check = Check {
+                    token: w.token.clone(),
+                    pid: w.pid,
+                    fatal: w.interrupted || overdue,
+                    pending: w.any_signal && overdue,
+                };
+                (check.fatal || check.pending).then_some(check)
+            })
+            .collect()
     }
 }
 
+/// A waiting request to check against its caller's `/proc` state, read
+/// outside the [`Interrupts`] lock.
+struct Check {
+    token: CancelToken,
+    pid: u32,
+    fatal: bool,
+    pending: bool,
+}
+
 impl Interrupts {
-    fn with_probe(fatal: fn(u32) -> bool) -> Self {
+    fn with_probes(fatal: fn(u32) -> bool, pending: fn(u32) -> bool) -> Self {
         Self {
             state: std::sync::Mutex::default(),
             fatal,
+            pending,
         }
     }
 
-    /// `unique`, from the thread `pid`, honours interrupts until its reply:
-    /// the token to wait on.
-    pub(crate) fn register(self: &Arc<Self>, unique: u64, pid: u32) -> CancelToken {
+    /// `unique`, from the thread `pid`, honours interrupts until its reply
+    /// — killable: cancelled once its interrupted caller is dying. `lossy`:
+    /// it came over a ring, which may lose the interrupt (module doc). The
+    /// token to wait on.
+    pub(crate) fn register(self: &Arc<Self>, unique: u64, pid: u32, lossy: bool) -> CancelToken {
+        self.register_as(unique, pid, false, lossy)
+    }
+
+    /// [`Self::register`], interruptible: any interrupt of `unique`
+    /// cancels it at once (a blocking lock wait).
+    pub(crate) fn register_interruptible(
+        self: &Arc<Self>,
+        unique: u64,
+        pid: u32,
+        lossy: bool,
+    ) -> CancelToken {
+        self.register_as(unique, pid, true, lossy)
+    }
+
+    fn register_as(
+        self: &Arc<Self>,
+        unique: u64,
+        pid: u32,
+        any_signal: bool,
+        lossy: bool,
+    ) -> CancelToken {
         let token = CancelToken::new();
         let mut st = self.state.lock().unwrap();
         st.prune_early();
@@ -467,9 +587,14 @@ impl Interrupts {
                 token: token.clone(),
                 pid,
                 interrupted,
+                any_signal,
+                lossy,
+                since: std::time::Instant::now(),
             },
         );
-        if interrupted {
+        if interrupted && any_signal {
+            token.cancel();
+        } else {
             self.watch(st);
         }
         token
@@ -484,7 +609,11 @@ impl Interrupts {
         let mut st = self.state.lock().unwrap();
         if let Some(w) = st.waiting.get_mut(&unique) {
             w.interrupted = true;
-            self.watch(st);
+            if w.any_signal {
+                w.token.cancel();
+            } else {
+                self.watch(st);
+            }
             return;
         }
         st.prune_early();
@@ -496,25 +625,30 @@ impl Interrupts {
         st.early.push_back((unique, std::time::Instant::now()));
     }
 
-    /// Cancel every interrupted request whose caller is dying.
-    fn cancel_dying(&self, st: &InterruptState) {
-        for w in st.waiting.values() {
-            if w.interrupted && !w.token.is_cancelled() && (self.fatal)(w.pid) {
-                w.token.cancel();
+    /// Cancel every checked request whose caller is dying, or, for a
+    /// lock wait over a ring, has a signal pending ([`InterruptState::checks`]).
+    /// Reads `/proc`: never called under the lock.
+    fn probe(&self, checks: Vec<Check>) {
+        for c in checks {
+            if c.fatal && (self.fatal)(c.pid) || c.pending && (self.pending)(c.pid) {
+                c.token.cancel();
             }
         }
     }
 
-    /// Check the interrupted requests now, and from a watcher thread every
+    /// Check the watched requests now, and from a watcher thread every
     /// [`FATAL_POLL`] for as long as one of them is still waiting (the
-    /// kernel interrupts a request once; the fatal signal may come later).
+    /// kernel interrupts a request once, or, over a ring, maybe never: the
+    /// fatal signal may come later, the interrupt not at all).
     fn watch(self: &Arc<Self>, mut st: std::sync::MutexGuard<'_, InterruptState>) {
-        self.cancel_dying(&st);
-        if st.watcher || !st.watched() {
+        let checks = st.checks();
+        let spawn = !st.watcher && st.watched();
+        st.watcher |= spawn;
+        drop(st);
+        self.probe(checks);
+        if !spawn {
             return;
         }
-        st.watcher = true;
-        drop(st);
         let this = Arc::downgrade(self);
         let spawned = std::thread::Builder::new()
             .name("fuse-interrupts".into())
@@ -524,9 +658,12 @@ impl Interrupts {
                     return;
                 };
                 let mut st = this.state.lock().unwrap();
-                this.cancel_dying(&st);
-                if !st.watched() {
-                    st.watcher = false;
+                let checks = st.checks();
+                let done = !st.watched();
+                st.watcher = !done;
+                drop(st);
+                this.probe(checks);
+                if done {
                     return;
                 }
             });
@@ -1090,7 +1227,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // like an `fsync` — on the engine's `fsync` pool, so a bounded
         // deferral, and ended by its caller's death.
         let unique = req.unique().0;
-        let token = self.interrupts.register(unique, req.pid());
+        let token = self.interrupts.register(unique, req.pid(), self.lossy());
         let reply = op.responder(
             self.deferred
                 .track_bounded(self.interrupts.guard(unique, WriteReply(reply))),
@@ -1428,15 +1565,24 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         };
         let op = self.obs().begin(OpKind::LockAcquire, ino.0);
         let _in = op.enter();
-        let cx = op.ctx(&caller);
         let spec = lock_spec(lock_owner, start, end, kind, pid);
         if sleep {
             // May answer from the view's `lock-wait` thread: counted, and
-            // counted as an op when that thread answers.
-            let reply = op.responder(self.deferred.track(EmptyReply(reply)));
+            // counted as an op when that thread answers. Interruptible
+            // (the module doc): a signal ends the wait with `EINTR`.
+            let unique = req.unique().0;
+            let token = self
+                .interrupts
+                .register_interruptible(unique, req.pid(), self.lossy());
+            let reply = op.responder(
+                self.deferred
+                    .track(self.interrupts.guard(unique, EmptyReply(reply))),
+            );
+            let cx = op.ctx(&caller).with_cancel(&token);
             self.vfs
                 .lock_acquire(&cx, ino.0, Fh(fh.0), spec, true, reply);
         } else {
+            let cx = op.ctx(&caller);
             self.vfs.lock_acquire(
                 &cx,
                 ino.0,
@@ -1466,13 +1612,13 @@ mod tests {
     /// fatal signal comes later; early or late; nothing else.
     #[test]
     fn interrupts_cancel_only_what_they_name_and_only_for_a_dying_caller() {
-        let i = Arc::new(Interrupts::with_probe(probe));
-        let living = i.register(10, 55);
+        let i = Arc::new(Interrupts::with_probes(probe, probe));
+        let living = i.register(10, 55, false);
         i.interrupt(10);
         std::thread::sleep(FATAL_POLL * 3);
         assert!(!living.is_cancelled(), "a handled signal keeps waiting");
         i.unregister(10);
-        let doomed = i.register(12, 66);
+        let doomed = i.register(12, 66, false);
         i.interrupt(11);
         assert!(!doomed.is_cancelled(), "another request's interrupt");
         i.interrupt(12);
@@ -1486,17 +1632,145 @@ mod tests {
         i.unregister(12);
         // Overtaken: the interrupt came before its request registered.
         i.interrupt(13);
-        assert!(i.register(13, 66).is_cancelled(), "an early interrupt");
+        assert!(
+            i.register(13, 66, false).is_cancelled(),
+            "an early interrupt"
+        );
         i.unregister(13);
-        assert!(!i.register(14, 66).is_cancelled(), "never interrupted");
+        assert!(
+            !i.register(14, 66, false).is_cancelled(),
+            "never interrupted"
+        );
         i.unregister(14);
         i.interrupt(15);
         assert!(
-            !i.register(15, 55).is_cancelled(),
+            !i.register(15, 55, false).is_cancelled(),
             "early, the caller lives"
         );
         i.unregister(15);
         assert!(!i.state.lock().unwrap().watched());
+    }
+
+    /// A blocking lock wait is interruptible: any interrupt cancels it at
+    /// once (POSIX's `EINTR` from `F_SETLKW`), early or late, a living
+    /// caller's too; it never needs the watcher.
+    #[test]
+    fn an_interruptible_request_is_cancelled_by_any_interrupt() {
+        let i = Arc::new(Interrupts::with_probes(probe, probe));
+        let lock = i.register_interruptible(20, 55, false);
+        let fsync = i.register(21, 55, false);
+        assert!(!lock.is_cancelled());
+        i.interrupt(21);
+        assert!(!lock.is_cancelled(), "another request's interrupt");
+        i.interrupt(20);
+        assert!(lock.is_cancelled(), "a handled signal ends a lock wait");
+        assert!(!fsync.is_cancelled(), "but not an fsync");
+        i.unregister(20);
+        i.unregister(21);
+        i.interrupt(22);
+        assert!(
+            i.register_interruptible(22, 55, false).is_cancelled(),
+            "an early interrupt"
+        );
+        i.unregister(22);
+        assert!(!i.state.lock().unwrap().watched());
+    }
+
+    /// This test's own dying thread, 88 (tests run in parallel: [`DYING`]
+    /// is the other test's), and thread 77, which has a handled signal
+    /// pending and is not dying.
+    static DYING_88: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn fatal_probe(pid: u32) -> bool {
+        pid == 88 && DYING_88.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn pending_probe(pid: u32) -> bool {
+        pid == 77 || fatal_probe(pid)
+    }
+
+    /// The interrupt may never come (FUSE-over-io_uring loses it for a
+    /// request interrupted before the ring delivered it): past
+    /// [`FATAL_POLL`] a ring's lock wait whose caller has a signal pending is
+    /// cancelled anyway, and so is a killable request whose caller is dying
+    /// — but not one whose caller merely has a handled signal pending.
+    #[test]
+    fn a_lost_interrupt_is_made_up_for_from_the_callers_state() {
+        let i = Arc::new(Interrupts::with_probes(fatal_probe, pending_probe));
+        let lock = i.register_interruptible(30, 77, true);
+        let calm_lock = i.register_interruptible(31, 55, true);
+        let fsync = i.register(32, 77, true);
+        assert!(!lock.is_cancelled(), "not before FATAL_POLL");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !lock.is_cancelled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(lock.is_cancelled(), "a signal pending, no interrupt");
+        std::thread::sleep(FATAL_POLL * 3);
+        assert!(!calm_lock.is_cancelled(), "no signal pending");
+        assert!(
+            !fsync.is_cancelled(),
+            "a handled signal does not end an fsync"
+        );
+        DYING_88.store(true, std::sync::atomic::Ordering::SeqCst);
+        let dying = i.register(33, 88, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !dying.is_cancelled() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(dying.is_cancelled(), "a dying caller, no interrupt");
+        for u in 30..=33 {
+            i.unregister(u);
+        }
+        assert!(!i.state.lock().unwrap().watched());
+    }
+
+    /// Over `/dev/fuse` the kernel's interrupt alone decides: a lock wait
+    /// whose caller shows a signal pending — a process-directed one,
+    /// say, that another of its threads handles — keeps waiting, and so
+    /// does a killable request of a dying caller the kernel has not
+    /// interrupted; neither needs the watcher.
+    #[test]
+    fn over_dev_fuse_only_the_kernels_interrupt_cancels() {
+        let i = Arc::new(Interrupts::with_probes(fatal_probe, pending_probe));
+        DYING_88.store(true, std::sync::atomic::Ordering::SeqCst);
+        let lock = i.register_interruptible(40, 77, false);
+        let fsync = i.register(41, 88, false);
+        assert!(!i.state.lock().unwrap().watched(), "nothing to poll");
+        std::thread::sleep(FATAL_POLL * 3);
+        assert!(!lock.is_cancelled(), "another thread's signal");
+        assert!(!fsync.is_cancelled(), "no interrupt yet");
+        i.interrupt(41);
+        assert!(fsync.is_cancelled(), "interrupted, and dying");
+        i.interrupt(40);
+        assert!(lock.is_cancelled(), "its own interrupt");
+        i.unregister(40);
+        i.unregister(41);
+    }
+
+    #[test]
+    fn a_deliverable_signal_is_pending_and_not_blocked() {
+        let status = |sig: &str, shd: &str, blk: &str| {
+            format!("Name:\tpg\nSigPnd:\t{sig}\nShdPnd:\t{shd}\nSigBlk:\t{blk}\nSigIgn:\t0\n")
+        };
+        let none = "0000000000000000";
+        assert!(!status_has_deliverable_signal(&status(none, none, none)));
+        // SIGALRM (14) pending, privately or for the process.
+        assert!(status_has_deliverable_signal(&status(
+            "0000000000002000",
+            none,
+            none
+        )));
+        assert!(status_has_deliverable_signal(&status(
+            none,
+            "0000000000002000",
+            none
+        )));
+        // ... but blocked: not deliverable.
+        assert!(!status_has_deliverable_signal(&status(
+            none,
+            "0000000000002000",
+            "0000000000002000"
+        )));
+        assert!(!signal_pending(0));
     }
 
     #[test]

@@ -202,12 +202,12 @@ impl Caller {
 /// by the engine at its wait points.
 ///
 /// **Linux FUSE sets it for `fsync`/`fsyncdir` and `O_SYNC`/`O_DSYNC`
-/// writes only, and only for a dying caller** (plan 39 §3.3: the vendored
-/// fuser delivers `FUSE_INTERRUPT`; the adapter cancels the request it
-/// names once the calling thread has a fatal signal pending — killable,
-/// as NFS `hard`, not interruptible by a handled signal). A blocked
-/// `F_SETLKW`/`flock` is not wired to it yet and returns only once
-/// granted, Ctrl-C or not (plan 31 §6.3's gap).
+/// writes only for a dying caller** (plan 39 §3.3: the vendored fuser
+/// delivers `FUSE_INTERRUPT`; the adapter cancels the request it names
+/// once the calling thread has a fatal signal pending — killable, as NFS
+/// `hard`, not interruptible by a handled signal), **and for a blocked
+/// `F_SETLKW`/`flock` on any signal** (interruptible, as POSIX has it: the
+/// wait answers `EINTR`).
 #[derive(Debug, Clone, Default)]
 pub struct CancelToken(Arc<AtomicBool>);
 

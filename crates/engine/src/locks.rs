@@ -43,11 +43,15 @@
 //! - `CONSTELLATION_LOCK_CACHE_IDLE_MS` (default 30000): how long an
 //!   unused cached grant is kept before it is released.
 //!
-//! Not supported: interrupting a blocked lock wait (the FUSE adapter wires
-//! `FUSE_INTERRUPT` to the `fsync` family only, plan 39 §3.3, so Ctrl-C of
-//! a blocked `flock`/`F_SETLKW` returns only once the lock is granted), and
-//! POSIX deadlock detection
-//! (`EDEADLK`) — two owners waiting on each other wait forever, as they do
+//! A blocked lock wait ends with `EINTR` when the frontend cancels it (the
+//! FUSE adapter does on any signal, as POSIX has `F_SETLKW` do): checked
+//! between the polls of a wait on a conflicting lock of this node and
+//! before each request to the sequencer. A request the owner has parked
+//! (another node holds a conflicting grant) is not withdrawn: that wait
+//! still returns only once the grant comes.
+//!
+//! Not supported: POSIX deadlock detection (`EDEADLK`) — two owners
+//! waiting on each other wait until a signal ends one wait, as they do
 //! with `flock`.
 
 use crate::sync::SyncRequest;
@@ -60,6 +64,7 @@ use constellation_meta::locks::{FencedOwner, Grant, GrantId, LocalLock, LocalOut
 use constellation_meta::{JournalPos, Meta, Position, ReadKey};
 use constellation_net::{LockOutcomeWire, LockRenewResultWire, LockRenewWire, LockTestOutcomeWire};
 use constellation_types::Code;
+use constellation_vfs::CancelToken;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -386,17 +391,23 @@ impl ClusterLocks {
     /// the runtime's blocking pool either: it is small (4 threads on one
     /// CPU) and the release a waiter waits for may itself need it (the
     /// driver's `Action::LockFlush`), so waiters must never be able to
-    /// fill it. The FUSE adapter does not wire `FUSE_INTERRUPT` to it: such
-    /// a wait cannot be cancelled from the application (see the module doc).
+    /// fill it. `cancel` (the op's, set by the frontend on a signal) ends
+    /// the wait with `Intr` (see the module doc for what it reaches).
     ///
     /// `done` answers the request (the view's completes the op's
     /// responder), on this thread or on the waiter's.
-    pub fn lock<F>(self: &Arc<Self>, ino: Ino, lock: LocalLock, sleep: bool, done: F)
-    where
+    pub fn lock<F>(
+        self: &Arc<Self>,
+        ino: Ino,
+        lock: LocalLock,
+        sleep: bool,
+        cancel: Option<CancelToken>,
+        done: F,
+    ) where
         F: FnOnce(Result<(), Code>) + Send + 'static,
     {
         if !sleep {
-            done(self.set(ino, lock, false));
+            done(self.set(ino, lock, false, None));
             return;
         }
         let this = self.clone();
@@ -410,7 +421,7 @@ impl ClusterLocks {
                 if let Some(op) = op {
                     op.adopt();
                 }
-                done(this.set(ino, lock, true))
+                done(this.set(ino, lock, true, cancel.as_ref()))
             });
         if let Err(error) = spawned {
             // The reply went with the closure; dropping it answers EIO.
@@ -421,16 +432,28 @@ impl ClusterLocks {
     /// [`Self::lock`] on the calling thread, blocking or not: for a
     /// frontend that cannot answer an op from another thread
     /// (`constellation_vfs::FrontendCaps::deferrable`).
-    pub fn lock_here(&self, ino: Ino, lock: LocalLock, sleep: bool) -> Result<(), Code> {
-        self.set(ino, lock, sleep)
+    pub fn lock_here(
+        &self,
+        ino: Ino,
+        lock: LocalLock,
+        sleep: bool,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(), Code> {
+        self.set(ino, lock, sleep, cancel)
     }
 
-    fn set(&self, ino: Ino, mut lock: LocalLock, sleep: bool) -> Result<(), Code> {
+    fn set(
+        &self,
+        ino: Ino,
+        mut lock: LocalLock,
+        sleep: bool,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(), Code> {
         // FUSE names the locking *thread*; the owner fence (and `getlk`)
         // need its process, named across pid reuse.
         (lock.pid, lock.pid_start) = process_of(lock.pid);
         let mut asked = false;
-        let r = self.set_inner(ino, lock, sleep, &mut asked);
+        let r = self.set_inner(ino, lock, sleep, cancel, &mut asked);
         if r.is_err() && asked {
             // A grant may have come for this request (or its answer was
             // lost after the core installed it) that it will now never
@@ -449,8 +472,10 @@ impl ClusterLocks {
         ino: Ino,
         lock: LocalLock,
         sleep: bool,
+        cancel: Option<&CancelToken>,
         asked: &mut bool,
     ) -> Result<(), Code> {
+        let cancelled = || cancel.is_some_and(CancelToken::is_cancelled);
         let mut rounds = 0u32;
         loop {
             match self.meta.locks().local_set(ino, lock, now_ms()) {
@@ -459,11 +484,17 @@ impl ClusterLocks {
                     if !sleep {
                         return Err(Code::Again);
                     }
+                    if cancelled() {
+                        return Err(Code::Intr);
+                    }
                     std::thread::sleep(LOCAL_POLL);
                 }
                 LocalOutcome::NeedGrant(mode) => {
                     if !sleep && rounds >= TRY_ROUNDS {
                         return Err(Code::Again);
+                    }
+                    if cancelled() {
+                        return Err(Code::Intr);
                     }
                     if rounds >= 2 {
                         // A grant that keeps being overtaken by recalls:

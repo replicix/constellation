@@ -1,0 +1,7 @@
+# Reproducible stress-ng-fs failures that are known semantic gaps.
+#
+# One `stressor # REASON: ...` per reproducible failure. The scenario
+# compares both ways: a failure not listed here fails it, and a listed
+# stressor that passes is printed as an improvement to remove. A
+# verification (data) failure is never covered by an entry.
+filename # REASON: names are stored as UTF-8 with invalid bytes replaced by U+FFFD (vfs NamePolicy::linux), so the probe's 254-byte name of bytes 1..255 grows past NAME_MAX (ENAMETOOLONG) and distinct non-UTF-8 names collide; `--filename-opts posix` passes

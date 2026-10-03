@@ -423,12 +423,19 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 
 ### Limits
 
-- **A blocked lock wait cannot be interrupted.** The FUSE adapter honours
-  `FUSE_INTERRUPT` only for the `fsync` family (plan 39), so Ctrl-C (or
-  `SIGKILL`) of a process blocked in `F_SETLKW` or `flock` returns only
-  once the lock is granted.
+- **A wait for another node's lock cannot be interrupted.** A signal
+  (Ctrl-C, `SIGKILL`, a handled `SIGALRM`) ends a blocked `F_SETLKW` or
+  `flock` with `EINTR` while it waits on a lock held on its own node, or
+  before its request reaches the owning sequencer. Once the owner has
+  parked the request because another node holds a conflicting grant, the
+  wait returns only once the lock is granted.
+- **`EINTR` even under `SA_RESTART`.** A signal whose handler was
+  installed with `SA_RESTART` restarts a native `F_SETLKW` transparently.
+  Over FUSE the wait ends with a plain `EINTR` (as with libfuse), so the
+  program sees it and must retry.
 - **No deadlock detection.** There is no `EDEADLK`: two owners waiting
-  on each other wait forever, as they do with `flock`.
+  on each other wait until a signal ends one of the waits, as they do
+  with `flock`.
 - **`flock` and `fcntl` share one table.** fuser delivers `flock`
   through `setlk`, so a `flock` and an `fcntl` lock taken by the *same*
   process on the same file conflict with each other. Linux keeps them
@@ -535,8 +542,8 @@ alternate on it.
 ### A lock waits forever
 
 A blocking wait retries until the owning sequencer is reachable. Check
-`unavailable` and P2P connectivity to the holder or delegate. The wait
-cannot be interrupted (see [Limits](#limits)).
+`unavailable` and P2P connectivity to the holder or delegate. A wait
+parked at the owner cannot be interrupted (see [Limits](#limits)).
 
 ### The mount fails with `cluster locks need P2P`
 

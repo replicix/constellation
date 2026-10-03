@@ -1412,6 +1412,77 @@ fn a_contended_setlkw_is_answered_from_the_view_s_wait_thread_once_released() {
     k.finish();
 }
 
+/// A blocked `F_SETLKW` ends with `EINTR` when the kernel interrupts it,
+/// for any signal (a handled `SIGALRM` included: POSIX's lock wait is
+/// interruptible, unlike `fsync`'s killable one); the interrupt itself is
+/// not answered, and the lock stays with its holder.
+#[test]
+fn an_interrupt_ends_a_blocked_setlkw_with_eintr() {
+    let mock = MockVfs::reference(FrontendCaps::linux_fuse(true));
+    let mut k = Kernel::start(Arc::new(mock.clone()), FrontendCaps::linux_fuse(true), 1);
+    let r = k.call(
+        op::CREATE,
+        ROOT_INO,
+        &Body::new()
+            .i32(RW | libc::O_CREAT)
+            .u32(0o100_644)
+            .u32(0)
+            .u32(0)
+            .cstr("locked"),
+    );
+    let ino = r.u64_at(0);
+    let fh = r.u64_at(128);
+    let lk = |owner: u64, typ: i32| {
+        Body::new()
+            .u64(fh)
+            .u64(owner)
+            .u64(0)
+            .u64(i64::MAX as u64)
+            .i32(typ)
+            .u32(owner as u32)
+            .u32(0)
+            .u32(0)
+    };
+    k.call(op::SETLK, ino, &lk(1, libc::F_WRLCK)).ok();
+    // A living caller (not the test's dying pid): a handled signal. 4242
+    // may be a real thread on this host, but `Kernel::start` installs the
+    // stand-in probe for both the fatal and the pending signal check, so
+    // its real `/proc` state is never read (and this session is
+    // `/dev/fuse`, where only the kernel's interrupt cancels a lock wait).
+    let waiter = k.send_as(op::SETLKW, ino, (1000, 100, 4242), &lk(2, libc::F_WRLCK).0);
+    assert!(
+        k.recv_within(Duration::from_millis(200)).is_none(),
+        "no answer while the lock is held"
+    );
+    k.send(op::INTERRUPT, 0, &Body::new().u64(waiter).0);
+    let r = k.recv();
+    assert_eq!(r.unique, waiter, "the interrupt itself is not answered");
+    assert_eq!(r.errno(), libc::EINTR);
+    assert_eq!(
+        k.call(op::SETLK, ino, &lk(3, libc::F_WRLCK)).errno(),
+        libc::EAGAIN,
+        "the holder keeps its lock"
+    );
+    // Over `/dev/fuse` a caller's signal state alone never ends the wait
+    // (another of its threads may take a process-directed signal): even a
+    // dying caller's waits for the kernel's interrupt.
+    let dying = k.send_as(
+        op::SETLKW,
+        ino,
+        (1000, 100, DYING_PID),
+        &lk(4, libc::F_WRLCK).0,
+    );
+    assert!(
+        k.recv_within(Duration::from_millis(500)).is_none(),
+        "no interrupt, no answer"
+    );
+    k.send(op::INTERRUPT, 0, &Body::new().u64(dying).0);
+    let r = k.recv();
+    assert_eq!(r.unique, dying);
+    assert_eq!(r.errno(), libc::EINTR);
+    k.finish();
+}
+
 #[test]
 fn forget_needs_no_reply_and_unknown_opcodes_are_refused_not_fatal() {
     let (mut k, mock) = plain();

@@ -78,7 +78,10 @@ Every plan ends with ALL of these green, run in this order:
 2. `cargo test --workspace` — zero failures.
 3. `bash tests/smoke.sh` and `bash tests/integration.sh` — pass.
 4. `target/release/harness run` — every scenario PASSED (fio/stress
-   SKIP acceptable if binary absent).
+   SKIP acceptable if binary absent). This includes `stress-ng-fs`
+   (every applicable stress-ng filesystem stressor at once): no stressor
+   may fail that `tests/stress-ng-baseline.txt` does not list, and never
+   on verification (TESTING.md, "stress-ng-fs").
 5. `docker compose --profile test run --rm compliance` — pjdfstest
    stays a FULL pass (8798/8798, empty baseline). Constellation has no
    compliance exceptions; do not add any.

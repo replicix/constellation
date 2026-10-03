@@ -1,0 +1,21 @@
+# stress-ng filesystem stressors that do not apply to a FUSE network
+# filesystem (or never touch the mount), for the `stress-ng-fs` harness
+# scenarios. One `stressor # REASON: ...` per line; every entry needs a
+# reason. Evidence: each stressor run alone for 3 s on a fresh mount with
+# the daemon's op counters read before and after (`status.vfs_ops`);
+# "never touches the mount" means the daemon saw nothing but the statfs of
+# stress-ng's free-space check.
+binderfs # REASON: mounts its own binderfs (CAP_SYS_ADMIN); never touches the mount
+bind-mount # REASON: bind-mounts in a new mount namespace (CAP_SYS_ADMIN): mount-table churn, not filesystem semantics
+eventfd # REASON: eventfd(2) counters; never touches the mount
+fanotify # REASON: needs CAP_SYS_ADMIN and marks the host's mounts, not --temp-path
+fd-fork # REASON: dups /dev/zero (--fd-fork-file takes no path); never touches the mount
+getdent # REASON: reads /proc, /dev and /sys directories; never touches the mount
+handle # REASON: name_to_handle_at on /proc files; never touches the mount
+io # REASON: calls sync(2), which flushes every filesystem on the (shared) host; fsync/syncfs on the mount is covered by iomix, sync-file, ioprio and hdd
+procfs # REASON: reads /proc and /sys; never touches the mount
+rofs # REASON: needs read-only filesystems (--rofs-dir) and aborts with "no resources" otherwise
+statmount # REASON: statmount(2)/listmount(2) over the host's mount table; never touches the mount
+# Root runs only (`name@root`): what a stressor does with privileges to the
+# whole (shared) host.
+iomix@root # REASON: as root it writes vm.drop_caches every few seconds, flushing the whole host's page cache; covered by every unprivileged run

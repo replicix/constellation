@@ -65,6 +65,8 @@ mod snapacct;
 mod snapbusy;
 /// Plan 32 M3: automatic snapshot creation (`snapsched-*`).
 mod snapsched;
+/// stress-ng's filesystem stressors, all at once, with verification.
+mod stressfs;
 /// Plan 38 §6/§3(e): the transport a mount negotiates, and whether a
 /// session on it can be handed over.
 pub mod transport;
@@ -609,6 +611,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: fsync::fsyncdir_barrier,
+    },
+    Scenario {
+        name: "stress-ng-fs",
+        desc: "every applicable stress-ng filesystem stressor at once with --verify on one mount (120 s, snapshots mid-run); per-stressor verdicts against tests/stress-ng-baseline.txt, no panic/ERROR, mount healthy, spool drains, snapshot space --verify clean",
+        requires: &["stress-ng"],
+        caps: &[],
+        run: stressfs::stress_ng_fs,
     },
     Scenario {
         name: "stress-ng-flap",
@@ -1600,13 +1609,48 @@ pub const SCENARIOS: &[Scenario] = &[
 /// `SCENARIOS`, unchanged, as its regression test. `harness list` prints
 /// them under their own heading; `harness run <name>` resolves a name in
 /// either list.
-pub const KNOWN_BUG_REPROS: &[Scenario] = &[];
+///
+/// `stress-ng-fs-nodes`: under three nodes' worth of stress-ng the lease
+/// holder's core stalls for seconds at a time; non-holders' lock grants
+/// lapse (`EIO` under their locks), backups seal the live holder's epoch,
+/// forwarded mutations wait out their 120 s timeout, and a non-holder's
+/// FUSE workers all end up waiting, leaving stress-ng processes unkillable
+/// (TESTING.md, "stress-ng-fs").
+///
+/// `stress-ng-fs-faults` (fails about one run in four): every S3 cut opens
+/// a continuation epoch on the single node, and its close is handled as
+/// the lease going away — every cluster lock grant is dropped (`lease
+/// gone: lock grants dropped`), the lock holders' writes fail with `EIO`
+/// and new locks with `ENOLCK` (`fcntl`: `F_OFD_SETLK` `ENOLCK`) until the
+/// lease is back; once the epoch froze instead and a create after the run
+/// failed with `EROFS`.
+pub const KNOWN_BUG_REPROS: &[Scenario] = &[
+    Scenario {
+        name: "stress-ng-fs-nodes",
+        desc: "stress-ng-fs on 3 P2P nodes of one filesystem at once, each in its own directory (shared lease, journal, cluster locks, forwarding); every node's verdicts, cross-node canaries",
+        requires: &["stress-ng"],
+        caps: &[],
+        run: stressfs::stress_ng_fs_nodes,
+    },
+    Scenario {
+        name: "stress-ng-fs-faults",
+        desc: "stress-ng-fs under 40+/-20 ms S3 latency and a 1.5 s S3 cut every 4-7 s",
+        requires: &["stress-ng"],
+        caps: &[],
+        run: stressfs::stress_ng_fs_faults,
+    },
+];
 
 fn setup(name: &str) -> Result<(S3Env, tempfile::TempDir)> {
+    setup_in(name, &std::env::temp_dir())
+}
+
+/// [`setup`] with the scenario's root (mounts, state, caches) under `dir`.
+fn setup_in(name: &str, dir: &std::path::Path) -> Result<(S3Env, tempfile::TempDir)> {
     let env = S3Env::start().context("starting S3 environment")?;
     let mut root = tempfile::Builder::new()
         .prefix(&format!("harness-{name}-"))
-        .tempdir()?;
+        .tempdir_in(dir)?;
     // CHAOS_KEEP_TMP=1 keeps mount logs + state dirs around after the
     // scenario returns, for offline inspection of failures.
     if std::env::var_os("CHAOS_KEEP_TMP").is_some_and(|v| v != "0") {

@@ -79,23 +79,6 @@ macro_rules! admit {
     };
 }
 
-/// Write gate (DESIGN.md §5): a mutating op may only proceed while this
-/// node holds the partition lease for `ino`'s partition. Acquisition is
-/// lazy — the first mutation after a mount or an idle release blocks
-/// here for one CAS.
-macro_rules! gate {
-    ($self:expr, $ino:expr, $r:ident) => {
-        if View::is_synthetic($ino) {
-            $r.done(Err(Code::ReadOnly.into()));
-            return;
-        }
-        if let Err(e) = $self.require_lease_for($ino) {
-            $r.done(Err(e.into()));
-            return;
-        }
-    };
-}
-
 /// A `setattr` time: the engine's clock for "now" (plan 30 §M12: the
 /// node's HLC, never below a stamp it applied, like every other timestamp
 /// a mutation writes).
@@ -1419,11 +1402,21 @@ impl Vfs for View {
         }
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
-        gate!(self, ino, r);
+        if View::is_synthetic(ino) {
+            r.done(err(Code::ReadOnly));
+            return;
+        }
+        // No lease: like a write or a truncation, an allocation changes
+        // this session's write state only, published with the file's next
+        // manifest — forwarded to the holder from any other node. Asking
+        // for the lease here (as before forwarding existed) made a
+        // non-holder's `fallocate` wait out a busy holder for 2xTTL and
+        // fail with EIO (stress-ng-fs-nodes: `iomix`, `fsize`, `sync-file`).
         if self.lock_fenced(ino) {
             r.done(err(Code::Io));
             return;
         }
+        self.lock_discard_tainted(ino);
         if len == 0 {
             r.done(err(Code::Invalid));
             return;
@@ -1742,11 +1735,14 @@ impl Vfs for View {
     /// frontend worker, and completes the responder from there — the
     /// deferred path of plan 31 §6.3, for a frontend that can answer from
     /// another thread (`FrontendCaps::deferrable`; one that cannot waits
-    /// here). The FUSE adapter wires interrupts to the `fsync` family only
-    /// (plan 39 §3.3): a blocked lock wait cannot be cancelled by a signal.
+    /// here). A blocking wait honours `cx.cancel`: the FUSE adapter
+    /// cancels it on any signal (interruptible, as POSIX's `F_SETLKW`),
+    /// and the wait then answers `Intr` (`EINTR`) holding nothing —
+    /// except a wait parked at another node's sequencer, which stays
+    /// uninterruptible (`crate::locks` module doc).
     fn lock_acquire<R: Responder<()>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         _fh: Fh,
         lock: LockSpec,
@@ -1781,16 +1777,27 @@ impl Vfs for View {
             end: lock.range.end,
         };
         if !self.caps.deferrable.contains(OpKind::LockAcquire) {
-            r.done(locks.lock_here(ino, local, sleep).map_err(VfsError::from));
+            r.done(
+                locks
+                    .lock_here(ino, local, sleep, cx.cancel)
+                    .map_err(VfsError::from),
+            );
             return;
         }
         // The engine answers through this callback, from this thread or
         // from its `lock-wait` thread; the watchdog registration ends
         // with the answer, wherever it is given.
-        locks.lock(ino, local, sleep, move |result: Result<(), Code>| {
-            r.done(result.map_err(VfsError::from));
-            drop(watch);
-        });
+        let cancel = cx.cancel.cloned();
+        locks.lock(
+            ino,
+            local,
+            sleep,
+            cancel,
+            move |result: Result<(), Code>| {
+                r.done(result.map_err(VfsError::from));
+                drop(watch);
+            },
+        );
     }
 
     /// `F_UNLCK`: drop `owner`'s locks in `range` (and, with none left on

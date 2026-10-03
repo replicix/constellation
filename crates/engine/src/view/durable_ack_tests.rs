@@ -783,3 +783,65 @@ fn a_close_the_sequencer_answers_not_found_fails_and_keeps_the_bytes() {
         "the session stays for a retry"
     );
 }
+
+/// stress-ng-fs-nodes: a non-holder's `fallocate` (allocate, keep-size,
+/// punch, zero-range) changes its write state like a write or a truncation
+/// and never asks the core for the lease — before, it waited out a busy
+/// holder for 2xTTL and failed with EIO. The new size and the zeroed
+/// ranges are this session's until the close forwards them.
+#[test]
+fn a_nonowner_fallocate_never_asks_for_the_lease() {
+    use constellation_vfs::{Blocking, FallocateMode, Fh, OpCtx, OpKind, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (mut fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    // Not the holder: the fast path is closed.
+    fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+    fs.do_write(file.ino, 0, &[7u8; 4096]).unwrap();
+    let caller = constellation_vfs::Caller::root();
+    let falloc = |off: u64, len: u64, mode: FallocateMode| {
+        Blocking::run(|r| {
+            fs.fallocate(
+                &OpCtx::new(OpKind::Fallocate, &caller),
+                file.ino,
+                Fh(0),
+                off,
+                len,
+                mode,
+                r,
+            )
+        })
+    };
+    std::thread::scope(|scope| {
+        let ops = scope.spawn(|| {
+            falloc(0, 1 << 20, FallocateMode::empty())?;
+            falloc(1 << 20, 1 << 20, FallocateMode::KEEP_SIZE)?;
+            falloc(
+                1024,
+                1024,
+                FallocateMode::PUNCH_HOLE | FallocateMode::KEEP_SIZE,
+            )?;
+            falloc(2048, 1024, FallocateMode::ZERO_RANGE)
+        });
+        let started = std::time::Instant::now();
+        while !ops.is_finished() {
+            if let Ok(req) = core.try_recv() {
+                assert!(
+                    !matches!(req, SyncRequest::Acquire { .. }),
+                    "fallocate asked for the lease"
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "fallocate is stuck"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ops.join().unwrap().unwrap();
+    });
+    while let Ok(req) = core.try_recv() {
+        assert!(!matches!(req, SyncRequest::Acquire { .. }));
+    }
+    let ws = fs.writes.lock(file.ino);
+    assert_eq!(ws.get(&file.ino).unwrap().file_len, 1 << 20);
+}
