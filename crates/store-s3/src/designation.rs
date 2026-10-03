@@ -29,14 +29,9 @@ use std::sync::Arc;
 
 pub const DESIGNATION_VERSION: u32 = 1;
 
-fn default_version() -> u32 {
-    DESIGNATION_VERSION
-}
-
 /// Exactly-one-designee claim over a subtree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Designation {
-    #[serde(default = "default_version")]
     pub v: u32,
     /// Absolute path this designation covers, e.g. `/site`.
     pub path: String,
@@ -45,14 +40,12 @@ pub struct Designation {
     pub created_unix_ms: i64,
     /// `--ro`: a read guarantee (via pinning) without write authority —
     /// non-designee writes are NOT restricted in this mode.
-    #[serde(default)]
     pub read_only: bool,
     /// Set by `online <path>`: the designation is over. Kept (rather
     /// than deleted) so a concurrent creator's overlap check and the
     /// TOCTOU tie-break above have something to compare timestamps
     /// against; a released designation is simply skipped as "not a
     /// covering claim" everywhere else.
-    #[serde(default)]
     pub released: bool,
 }
 

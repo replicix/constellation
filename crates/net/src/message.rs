@@ -292,14 +292,12 @@ pub enum Payload {
         acked_through: u64,
         /// Plan 30 §M11: postcard bytes of the requester's observed
         /// `constellation_meta::Position` (its causal dependencies).
-        #[serde(default)]
         deps: Vec<u8>,
         /// The chunks a `SetManifest` op names that are still uploading
         /// on the requester (a `--write-mode back` close). The recipient
         /// enrolls them as pending uploads of its own, awaited from the
         /// requester, before it executes the op, so nothing naming them
         /// leaves it before they are in S3 (`meta::store::remote`).
-        #[serde(default)]
         pending: Vec<[u8; 32]>,
         /// The log sequence the requester had applied when it sent this
         /// (chunk close-stall-followup): a reply whose base it covers is
@@ -318,21 +316,16 @@ pub enum Payload {
         /// evaluated the op — or `None` when the holder's unshipped
         /// journal already touched one of the op's keys (then only the
         /// log delivers the records, in their order).
-        #[serde(default)]
         base: Option<u64>,
         /// Plan 30 §M6: the state the holder evaluated the op against —
         /// its shipped-through log sequence, and its unshipped journal
         /// position `(epoch, journal seq)` if it had one
         /// (`constellation_meta::Position`).
-        #[serde(default)]
         position_seq: u64,
-        #[serde(default)]
         position_pending: Option<(u64, u64)>,
         /// Plan 30 §M11: the position's per-stream part (`(gen, idx)`).
-        #[serde(default)]
         position_streams: Vec<(u64, u64)>,
         /// Plan 30 §M11: the generation that executed the op (0: root).
-        #[serde(default)]
         gen: u64,
         /// Whether the op's transaction waits for the requester's own
         /// pending chunks (`constellation_meta::OwnChunks::to_wire`: 0
@@ -366,7 +359,6 @@ pub enum Payload {
         position_seq: u64,
         position_pending: Option<(u64, u64)>,
         grant: Option<(u64, u64, u64)>,
-        #[serde(default)]
         position_streams: Vec<(u64, u64)>,
     },
     /// Plan 30 §M11: a delegate streams its transactions of generation
@@ -392,10 +384,8 @@ pub enum Payload {
         req_id: u64,
         gen: u64,
         /// Phase 2b: the delegate's backup peer (0: none).
-        #[serde(default)]
         backup: u64,
         /// Plan 30 §M14: the delegate's executed stream head for `gen`.
-        #[serde(default)]
         stream_head: u64,
     },
     DelegRenewed {
@@ -405,15 +395,12 @@ pub enum Payload {
         /// Plan 30 §M14: postcard of the root's lock grants under the
         /// subtree (`Vec<constellation_meta::locks::Grant>`), handed over
         /// with the first renewal; empty otherwise.
-        #[serde(default)]
         locks: Vec<u8>,
         /// Plan 30 §M14: the remaining lock grace on the subtree (ms; 0:
         /// none) — see `PeerMsg::DelegRenewed::lock_grace_ms`.
-        #[serde(default)]
         lock_grace_ms: u64,
         /// Plan 30 §M14: postcard of the subtree's lock floor (a
         /// `constellation_meta::Position`; empty: none).
-        #[serde(default)]
         lock_floor: Vec<u8>,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
@@ -430,10 +417,8 @@ pub enum Payload {
         through: u64,
         /// Plan 30 §M14: postcard of the delegate's lock grants under the
         /// subtree, handed back to the root.
-        #[serde(default)]
         locks: Vec<u8>,
         /// Plan 30 §M14: postcard of the subtree's lock floor.
-        #[serde(default)]
         lock_floor: Vec<u8>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
@@ -580,7 +565,6 @@ pub enum Payload {
         from: u64,
         ino: u64,
         grant: (u64, u64),
-        #[serde(default)]
         position: Vec<u8>,
     },
     /// Renew grants at their owner; answered by [`Payload::LockRenewed`].
@@ -600,7 +584,6 @@ pub enum Payload {
         ver: u64,
         grants: Vec<u8>,
         /// Postcard of every lock floor the holder knows, joined.
-        #[serde(default)]
         floor: Vec<u8>,
     },
     /// `getlk`: is a conflicting grant held elsewhere? Answered by

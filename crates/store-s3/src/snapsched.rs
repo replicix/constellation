@@ -49,13 +49,9 @@ pub struct SnapSchedJournalRoot {
     pub path: String,
     /// The policy in canonical form.
     pub policy: String,
-    #[serde(default)]
     pub created: Vec<SnapSchedJournalSnap>,
-    #[serde(default)]
     pub skipped: Vec<SnapSchedJournalSkip>,
-    #[serde(default)]
     pub failed: Vec<SnapSchedJournalSkip>,
-    #[serde(default)]
     pub deleted: Vec<SnapSchedJournalSnap>,
 }
 

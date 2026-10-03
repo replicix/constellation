@@ -39917,3 +39917,25 @@ first file at t=11361 while node 1's holder was still in I/O.
   0..2000: 0 failing. `harness run` on all six `lock-*` and six `epoch-*`
   scenarios: all PASSED. `epoch-holder-retired` passed 4 more times
   (5/5).
+
+## serde-default-cleanup
+
+- Removed every `#[serde(default)]` that existed only so a newer reader
+  accepts older data: all reply/event/persisted types in
+  `control::proto::types` (the module docs already said defaults appear only
+  on request types), plus the persisted/wire types in authority `segment`,
+  cli `handover`, fs-core `types`, meta (`locks`, `record`, `session`,
+  `store::{backup,local,spec}`), net `message`, store-s3 (`commits`,
+  `designation`, `inbox`, `lease`, `nodes`, `snapsched`, `snapshot`),
+  engine `registry`, chaos `gen`. Net: ~760 attributes gone (874 -> ~110).
+- Kept: request params in `proto/types.rs` (omittable by API design,
+  incl. `Option`/`bool` flags, `Secret` options, `interval_ms`), and every
+  `default` paired with `skip_serializing_if` (engine `registry`, `gc`,
+  `e2e_pin`, store-s3 `store`/`nodes`/`lease`/`commits`), plus
+  `authz.rs` policy and `web.rs` request body.
+- Control schema re-blessed: `required` lists grow and the matching
+  `"default"` keywords disappear (schemars emits them for serde defaults).
+- Gates: fmt, clippy clean; workspace tests pass; smoke.sh passes;
+  harness web-ui-smoke, session/p2p/lease-handover, two-clients-shared pass.
+  Not run: webui-headless (no CHROME_BIN), csi-credential-revocation (no
+  versitygw), passthrough-handover (needs root); no `cli-*` scenarios exist.

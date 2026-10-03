@@ -139,7 +139,6 @@ pub(crate) struct JournalTx {
     /// refusal's op (`journal::PendingObserved`): the ship plan treats
     /// them as dependencies (`store::held`). Empty for a transaction
     /// that wrote what it read.
-    #[serde(default)]
     pub observed: Vec<Vec<u8>>,
 }
 

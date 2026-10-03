@@ -40,8 +40,7 @@ use std::sync::Arc;
 /// use short TTLs to exercise expiry and takeover).
 pub const DEFAULT_LEASE_TTL_MS: u64 = 60_000;
 
-/// Current lease encoding version. Readers accept anything they can
-/// deserialize (all fields default) so a future field is not a fault.
+/// Current lease encoding version.
 pub const LEASE_VERSION: u32 = 1;
 
 pub fn lease_ttl_ms() -> u64 {
@@ -62,22 +61,16 @@ pub fn now_unix_ms() -> i64 {
 /// Write authority over one partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
-    #[serde(default = "default_version")]
     pub v: u32,
-    #[serde(default)]
     pub partition: String,
     /// Node id of the holder (`nodes/<id>`); 0 means "never held".
-    #[serde(default)]
     pub holder: u64,
     /// Monotonic per-partition counter, bumped on every holder change.
     /// Stamped into every log segment the holder ships (fencing).
-    #[serde(default)]
     pub epoch: u64,
-    #[serde(default)]
     pub expires_unix_ms: i64,
     /// Set by a clean unmount: the partition is immediately claimable,
     /// no TTL to wait out.
-    #[serde(default)]
     pub released: bool,
     /// Node ids that have asked for this partition and are waiting, sorted
     /// and deduped. A would-be holder that finds the lease busy writes
@@ -91,10 +84,6 @@ pub struct Lease {
     /// and [`Lease::released`]: the request has been answered. Preserved by
     /// [`Lease::renewed`], or a holder renewing would erase the very
     /// request it is supposed to act on.
-    ///
-    /// `serde(default)` for the same reason as every other field here, not
-    /// for compatibility with older objects: see [`LEASE_VERSION`].
-    #[serde(default)]
     pub wanted_by: Vec<u64>,
     /// Plan 30 §M9: the holder's synchronous backups (node ids). Every
     /// acknowledgement the holder gives while `ack_policy` is `Backup`
@@ -102,18 +91,15 @@ pub struct Lease {
     /// and take the lease over without waiting for the TTL. Empty means
     /// no backup (today's behaviour). Changed only by the holder, by a
     /// CAS that bumps `config_version`.
-    #[serde(default)]
     pub backups: Vec<u64>,
     /// Plan 30 §M9: bumped by every change of `backups`/`ack_policy`
     /// (and by `granted_delegations`), so two readers can tell which of
     /// two objects with the same holder and epoch is newer.
-    #[serde(default)]
     pub config_version: u64,
     /// Plan 30 §M9: what an acknowledgement means under this tenure —
     /// see [`AckPolicy`]. A taker may claim an `S3` lease before it
     /// expires (the log-slot CAS fences the old holder), and a listed
     /// backup may claim a `Backup` one after sealing it.
-    #[serde(default)]
     pub ack_policy: AckPolicy,
     /// Plan 30 §M9: set (by one CAS, before the tenure's first read
     /// delegation) once this tenure may have granted read delegations. A
@@ -121,7 +107,6 @@ pub struct Lease {
     /// wait out the previous tenure's grant horizon before it acknowledges
     /// any mutation (`crate::lease`'s M9 section in the design notes);
     /// with it clear there is nothing to wait for.
-    #[serde(default)]
     pub granted_delegations: bool,
     /// Plan 30 §M10: node ids retired by an admin `leave --node-id`
     /// while this lease named them ([`fence_retired`]). Such a node never
@@ -150,10 +135,6 @@ pub enum AckPolicy {
     /// C, `ack=s3`). Any peer may take over on heartbeat silence: the
     /// next slot's CAS fences the old holder.
     S3,
-}
-
-fn default_version() -> u32 {
-    LEASE_VERSION
 }
 
 impl Lease {

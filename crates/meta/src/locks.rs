@@ -126,7 +126,6 @@ pub struct Grant {
     pub recalled: bool,
     /// The M11 generation it was granted (or installed) under; 0 for the
     /// root's table. A generation's grants leave with it.
-    #[serde(default)]
     pub gen: u64,
 }
 

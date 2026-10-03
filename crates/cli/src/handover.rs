@@ -227,7 +227,6 @@ pub struct NodeHandoff {
     fsync_s3: bool,
     /// Plan 39: `--fsync-timeout` in ms; `0` an explicit `hard`, absent
     /// no flag (`CONSTELLATION_FSYNC_TIMEOUT`, else wait until durable).
-    #[serde(default)]
     fsync_timeout_ms: Option<u64>,
     cto_strict: bool,
     locks: Option<bool>,
@@ -237,16 +236,13 @@ pub struct NodeHandoff {
     /// `"admit"`/`"always"`, or absent in an older image's handoff (the
     /// resumed node then falls back to `CONSTELLATION_CACHE_VERIFY` and
     /// the default, as a fresh mount would).
-    #[serde(default)]
     cache_verify: Option<String>,
     /// Plan 38 Z1b: `--fuse-transport` (`auto`/`uring`/`dev-fuse`). The
     /// *resumed* mounts are `/dev/fuse` by construction (a ring session
     /// cannot be handed over at all, §3(e)); this is for the views added
     /// to the new image afterwards, which would otherwise lose a flag the
     /// environment did not also set.
-    #[serde(default)]
     fuse_transport: Option<String>,
-    #[serde(default)]
     fuse_uring_queue_depth: Option<usize>,
     pin_target: Option<constellation_engine::e2e_pin::PinTarget>,
     web_ui: u16,

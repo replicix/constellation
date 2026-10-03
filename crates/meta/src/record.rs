@@ -24,7 +24,6 @@ pub struct CloneNode {
     pub rdev: Rdev,
     pub target: Option<String>,
     pub manifest: Option<Vec<u8>>,
-    #[serde(default)]
     pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
@@ -103,7 +102,6 @@ pub enum LogRecord {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        #[serde(default)]
         atime_ns: Option<i64>,
         mtime_ns: Option<i64>,
         time_ns: i64,
@@ -223,13 +221,11 @@ pub enum LogRecord {
         /// Plan 30 §M11 phase 2b: an offline designation (plans 03–05):
         /// never recalled by TTL or placement, only by `online`; a
         /// cross-subtree op touching it is refused (`EXDEV`).
-        #[serde(default)]
         designated: bool,
         /// Plan 30 §M12: the name-hash range of `dir` this generation
         /// owns (`(0, 0)`: the whole directory and its subtree; `(b,
         /// i)`: the names whose hash's top `b` bits are `i`, in `dir`
         /// itself only — GIGA+).
-        #[serde(default)]
         range: (u8, u32),
     },
     /// Plan 30 §M11: generation `gen` of the delegation on `dir` ended.

@@ -22,18 +22,13 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MountEntry {
     /// `""` means the root; may also be a `path@snapshot` selector.
-    #[serde(default)]
     pub subtree: String,
     pub mountpoint: PathBuf,
-    #[serde(default)]
     pub allow_other: bool,
-    #[serde(default)]
     pub fs_name: String,
-    #[serde(default)]
     pub rw: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clone_name: Option<String>,
-    #[serde(default)]
     pub ephemeral: bool,
     /// `--confine-links` (plan 31 §6.12).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -57,9 +52,7 @@ pub struct FsEntry {
     pub fsync_mode: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub write_mode: String,
-    #[serde(default)]
     pub read_only_member: bool,
-    #[serde(default)]
     pub web_ui: u16,
     /// The S3 endpoint this name's `meta.json` was last read from (or
     /// created at). Diagnostics only: a later command that resolves a
@@ -68,7 +61,7 @@ pub struct FsEntry {
     /// `AWS_CONFIG_FILE` / `AWS_ENDPOINT_URL` environment.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint: String,
-    #[serde(default, rename = "mounts")]
+    #[serde(rename = "mounts")]
     pub mounts: Vec<MountEntry>,
 }
 

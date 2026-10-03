@@ -16,110 +16,92 @@
       "description": "Plan 30 §M9: the acknowledgement policy, backups and seals.",
       "properties": {
         "ack_floor_waits": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "ack_s3": {
-          "default": false,
           "description": "This mount asks for `ack=s3`.",
           "type": "boolean"
         },
         "ack_wait_ms_total": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "acks_aborted": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "acks_waited": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "awaited_log": {
-          "default": 0,
           "description": "Accepted forwards of this node that could not install as a\nshadow (the holder ran unshipped work on their keys before them)\nand waited for their transaction, and of those, the ones the\npre-S3 stream answered before the log did.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "awaited_log_streamed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "awaited_log_streamed_deleg": {
-          "default": 0,
           "description": "Of `awaited_log_streamed`, a delegate's replies (answered from\nthe root's stream of its append of the delegate's transaction).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backing_acked": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backing_epoch": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backing_holder": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_ack_timeouts": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_acks": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_appends": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_persisted": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_tail_applied": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_takeovers": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backups": {
-          "default": [],
           "items": {
             "format": "uint64",
             "minimum": 0,
@@ -128,19 +110,16 @@
           "type": "array"
         },
         "backups_added": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backups_removed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "candidate": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -149,7 +128,6 @@
           ]
         },
         "config_version": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -161,187 +139,210 @@
           "type": "integer"
         },
         "durable": {
-          "default": 0,
           "description": "The durable journal seq (min over the backups' acks, or the\nshipped-through seq under `s3`); `u64::MAX` when nothing gates.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "epoch_carry_refused": {
-          "default": 0,
           "description": "Plan 30 §M10's claim rule: continuation-epoch activations that\ndid not carry this node's lease (an `ack=s3` lease, or a backup\noutside the epoch).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "gated": {
-          "default": false,
           "description": "The fast path is closed (local writes go through the core).",
           "type": "boolean"
         },
         "held_for_upload": {
-          "default": 0,
           "description": "As sequencer: forwarded replies answered `Held` at once because\nthe acknowledgement waits for chunks only the requester can upload\n(it is asked to upload them).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "own_record_uploads": {
-          "default": 0,
           "description": "Uploads of this node's pending chunks for its own forwarded `back`\nclose, despite the upload hold, because the close waited for\nrecords only those chunks release: once when the sequencer answered\nthat only this upload brings them back, and once per\n`CONSTELLATION_OWN_RECORD_WAIT_MS` the close then still waited, or\nwaited past a stream the sequencer said would carry them.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "own_rows_excused": {
-          "default": 0,
           "description": "Forward replies whose position this node observed less rows of its\nown whose effects it already carries (a `back` close's, deferred on\nthe sequencer behind its held chunks): no wait and no upload for\nthem.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "parked_acks": {
-          "default": 0,
           "description": "Acknowledgements parked for durability right now.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "policy": {
-          "default": "",
           "description": "The policy of the lease this node holds: \"local\", \"backup\", \"s3\",\nor \"-\" when it holds none.",
           "type": "string"
         },
         "reads_durability_blocked": {
-          "default": 0,
           "description": "Holder-local reads that waited for durability of the unshipped\nrows they would have observed.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "reconfig_cas": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refusals_journaled": {
-          "default": 0,
           "description": "Plan 30 §M9: definitive refusals of forwarded ops journaled as\noutcomes, and refused replays of never-acknowledged ops.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "s3_fast_takeovers": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "sealed_epoch": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "seals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stale_liveness_refusals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "streamed_ahead": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "streamed_dropped": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "streamed_installed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "unacked_replays_refused": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
       "required": [
-        "dead_root_acquires"
+        "ack_s3",
+        "policy",
+        "backups",
+        "config_version",
+        "durable",
+        "parked_acks",
+        "gated",
+        "backing_holder",
+        "backing_epoch",
+        "backing_acked",
+        "sealed_epoch",
+        "backups_added",
+        "backups_removed",
+        "reconfig_cas",
+        "backup_appends",
+        "backup_acks",
+        "backup_ack_timeouts",
+        "acks_waited",
+        "ack_wait_ms_total",
+        "acks_aborted",
+        "streamed_ahead",
+        "streamed_installed",
+        "streamed_dropped",
+        "awaited_log",
+        "awaited_log_streamed",
+        "awaited_log_streamed_deleg",
+        "own_record_uploads",
+        "own_rows_excused",
+        "held_for_upload",
+        "backup_persisted",
+        "seals",
+        "backup_takeovers",
+        "backup_tail_applied",
+        "s3_fast_takeovers",
+        "dead_root_acquires",
+        "ack_floor_waits",
+        "stale_liveness_refusals",
+        "epoch_carry_refused",
+        "refusals_journaled",
+        "unacked_replays_refused",
+        "reads_durability_blocked"
       ],
       "type": "object"
     },
     "AtimeStatus": {
       "properties": {
         "applied": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "coalesced": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "dropped_cap": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forward_err": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forward_ok": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "local_only": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "mode": {
-          "default": "",
           "description": "\"off\", \"relatime\", or \"lazy\".",
           "type": "string"
         },
         "queued": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skew_clamped": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "mode",
+        "queued",
+        "coalesced",
+        "applied",
+        "dropped_cap",
+        "forward_ok",
+        "forward_err",
+        "local_only",
+        "skew_clamped"
+      ],
       "type": "object"
     },
     "BrowseReadParams": {
@@ -497,7 +498,6 @@
           "type": "integer"
         },
         "cache_verify": {
-          "default": "",
           "description": "When a disk-cache read re-hashes the chunk file it read\n(`--cache-verify`, `CONSTELLATION_CACHE_VERIFY`; plan 38 §2.3):\n`\"admit\"` verifies a chunk once — in flight on the fetch, or on\nthe first read of a file a restart found on disk — and trusts it\nafterwards; `\"always\"` re-hashes every disk read. Empty when it\ncame from a daemon older than the knob — which behaved as\n`\"always\"`, but says so by the absence, not by the value.",
           "type": "string"
         },
@@ -507,81 +507,69 @@
           "type": "integer"
         },
         "memory_budget_bytes": {
-          "default": 0,
           "description": "The chunk memory cache: verified chunk contents kept in RAM so a\ncached read neither re-reads nor re-hashes the disk copy\n(`CONSTELLATION_CHUNK_MEMCACHE_BYTES`). Budget `0`: off.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "memory_chunks": {
-          "default": 0,
           "description": "Chunks resident in the memory cache.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "memory_coalesced": {
-          "default": 0,
           "description": "Reads that waited for a concurrent load of the same chunk.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "memory_evictions": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "memory_hits": {
-          "default": 0,
           "description": "Chunk reads served from memory.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "memory_misses": {
-          "default": 0,
           "description": "Chunk reads that loaded and verified the disk copy.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "memory_protected_bytes": {
-          "default": 0,
           "description": "Of `memory_used_bytes`, the protected (reused) segment.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "memory_used_bytes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "open_pins": {
-          "default": 0,
           "description": "Holders of a chunk kept un-evictable for an open passthrough\nhandle (plan 38 §3(c)'s pin-while-open), summed over chunks: equal\nto the mounts' `fuse.passthrough.opens` when every such handle sits\non the chunk the engine offered it.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "pinned_bytes": {
-          "default": 0,
           "description": "Bytes protected from eviction by local pins.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "staging_budget_bytes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "staging_bytes": {
-          "default": 0,
           "description": "In-flight (unflushed) write bytes staged to local disk, bounded\nindependently of the chunk cache (plan 07). Zero on daemons\nwith no open dirty inode.",
           "format": "uint64",
           "minimum": 0,
@@ -596,7 +584,20 @@
       "required": [
         "used_bytes",
         "budget_bytes",
-        "chunks"
+        "chunks",
+        "pinned_bytes",
+        "staging_bytes",
+        "staging_budget_bytes",
+        "memory_budget_bytes",
+        "memory_used_bytes",
+        "memory_chunks",
+        "memory_protected_bytes",
+        "memory_hits",
+        "memory_misses",
+        "memory_coalesced",
+        "memory_evictions",
+        "cache_verify",
+        "open_pins"
       ],
       "type": "object"
     },
@@ -662,7 +663,6 @@
       "description": "A failed control call. See the [module docs](self).",
       "properties": {
         "code": {
-          "default": null,
           "description": "The portable errno, when the failure is a filesystem refusal. On the\nwire it is `Code`'s own `u16`.",
           "format": "uint16",
           "maximum": 65535,
@@ -681,7 +681,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "Structured context; free-form."
         },
         "kind": {
@@ -691,7 +690,6 @@
           "type": "string"
         },
         "remediation": {
-          "default": null,
           "description": "What the caller can do about it.",
           "type": [
             "string",
@@ -730,278 +728,264 @@
     "CoopStatus": {
       "properties": {
         "bytes_served_to_peers": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "digest_bytes_received": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "digest_bytes_sent": {
-          "default": 0,
           "description": "Digest-plane traffic (summaries, deltas, rounds, or blooms).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "digest_capacity_exceeded": {
-          "default": false,
           "type": "boolean"
         },
         "digest_cpu_us": {
-          "default": 0,
           "description": "Microseconds spent building, applying and answering digests.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "digest_messages": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "digest_mode": {
-          "default": "",
           "description": "Plan 30 §M15: `exact` (mirrors + reconciliation) or `bloom`.",
           "type": "string"
         },
         "digest_rebuilds": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "epoch_member_fetches": {
-          "default": 0,
           "description": "Chunks fetched from another member of an open continuation epoch.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "fresh_hint_hits": {
-          "default": 0,
           "description": "Fetches of a chunk no mirror listed yet from the node that wrote\nthe manifest naming it (a file another node just wrote): served,\nand declined (the fetch then went on to S3).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "fresh_hint_misses": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "hedges_fired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "local_set_entries": {
-          "default": 0,
           "description": "Keys in this node's published servable set.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peer_errors": {
-          "default": 0,
           "description": "Hard negatives: transport / hash failures against a peer.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peer_false_positives": {
-          "default": 0,
           "description": "Peer declined with `Absent` a chunk our digest said it held.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peer_hits": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peer_misses": {
-          "default": 0,
           "description": "Soft negatives: every peer decline (busy, absent, recently\nremoved); see `peer_false_positives` / `peer_stale_misses`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peer_set_bytes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peer_set_entries": {
-          "default": 0,
           "description": "Entries held about peers' caches (mirror keys or bloom inserts).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peer_stale_misses": {
-          "default": 0,
           "description": "Peer had dropped the chunk within its recent-removal window.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "per_source": {
-          "default": [],
           "items": {
             "$ref": "#/$defs/SourceStatus"
           },
           "type": "array"
         },
         "reconcile_cpu_us": {
-          "default": 0,
           "description": "Part of `digest_cpu_us` spent on reconciliation rounds.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "reconcile_failures": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "reconcile_rounds": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "reconcile_sessions": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "s3_fetches": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stale_digests_pruned": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "peer_hits",
+        "peer_misses",
+        "peer_errors",
+        "s3_fetches",
+        "epoch_member_fetches",
+        "hedges_fired",
+        "bytes_served_to_peers",
+        "stale_digests_pruned",
+        "digest_rebuilds",
+        "digest_capacity_exceeded",
+        "per_source",
+        "digest_mode",
+        "peer_false_positives",
+        "peer_stale_misses",
+        "fresh_hint_hits",
+        "fresh_hint_misses",
+        "digest_bytes_sent",
+        "digest_bytes_received",
+        "digest_messages",
+        "digest_cpu_us",
+        "reconcile_sessions",
+        "reconcile_rounds",
+        "reconcile_failures",
+        "reconcile_cpu_us",
+        "local_set_entries",
+        "peer_set_entries",
+        "peer_set_bytes"
+      ],
       "type": "object"
     },
     "CtoStatus": {
       "description": "Plan 30 §M8: `cto=strict` reads, read delegations and recalls.",
       "properties": {
         "degraded": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "delegation_local": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "delegations_held": {
-          "default": 0,
           "description": "Delegations held right now, and recalls received.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "delegations_installed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "delegations_raced": {
-          "default": 0,
           "description": "Grants not installed because a recall overtook their reply.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "fuse_recall_wait_ms_total": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "fuse_writes_recalled": {
-          "default": 0,
           "description": "This node's own FUSE writes that waited for recalls, and how long.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grants": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grants_enabled": {
-          "default": false,
           "description": "This node, as sequencer, grants read delegations.",
           "type": "boolean"
         },
         "held_replies": {
-          "default": 0,
           "description": "Forwarded replies answered `Held` (and, as requester, retried).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "held_retries": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "holder_local": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "live_grants": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "parked_acks": {
-          "default": 0,
           "description": "Parked acknowledgements and recalls in flight right now.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "read_index": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "read_index_ms": {
-          "default": [],
           "items": {
             "format": "uint64",
             "minimum": 0,
@@ -1010,93 +994,111 @@
           "type": "array"
         },
         "read_index_ms_total": {
-          "default": 0,
           "description": "ReadIndex round trip plus the wait for its position, total ms and\nlog2 histogram (`[0]` < 1 ms, `[i]` < 2^i ms).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "read_index_refused": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "read_index_served": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recall_wait_ms_total": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recall_waits": {
-          "default": 0,
           "description": "Acknowledgements that waited for recalls, and the total wait (ms).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalled": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_acked": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_expired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_in_flight": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_sent": {
-          "default": 0,
           "description": "Recalls sent, acked, and outwaited (TTL + margin: the delegate was\nunreachable).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "renewals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "s3_tail": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "strict": {
-          "default": false,
           "description": "This mount is `--cto strict`.",
           "type": "boolean"
         },
         "strict_reads": {
-          "default": 0,
           "description": "Strict opens, lookups and listings, and how each was answered: by\nthis node as the sequencer, under a read delegation, after a\nReadIndex round trip, by tailing S3 (no live sequencer, or no\nP2P), or degraded (no answer in the budget).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "strict",
+        "grants_enabled",
+        "strict_reads",
+        "holder_local",
+        "delegation_local",
+        "read_index",
+        "s3_tail",
+        "degraded",
+        "read_index_ms_total",
+        "read_index_ms",
+        "renewals",
+        "delegations_installed",
+        "delegations_raced",
+        "delegations_held",
+        "recalled",
+        "read_index_served",
+        "read_index_refused",
+        "grants",
+        "live_grants",
+        "recalls_sent",
+        "recalls_acked",
+        "recalls_expired",
+        "recall_waits",
+        "recall_wait_ms_total",
+        "held_replies",
+        "held_retries",
+        "fuse_writes_recalled",
+        "fuse_recall_wait_ms_total",
+        "parked_acks",
+        "recalls_in_flight"
+      ],
       "type": "object"
     },
     "DelegateParams": {
@@ -1144,43 +1146,36 @@
       "description": "Plan 30 §M11: this node's delegation state.",
       "properties": {
         "acks_parked": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "appended_txs": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_acks": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_appends": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_persisted": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backup_seals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "backups": {
-          "default": [],
           "description": "As a delegate: `(gen, backup, backup_acked)`.",
           "items": {
             "maxItems": 3,
@@ -1207,86 +1202,72 @@
           "type": "array"
         },
         "cross_subtree": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "delegated": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "deps_overflow_to_root": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "deps_unsatisfied_at_append": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "deps_waits": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "designated": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "enabled": {
-          "default": false,
           "description": "`CONSTELLATION_DELEGATION` is on (and P2P).",
           "type": "boolean"
         },
         "ended": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "exec_parked": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "executed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "fast_path_executed": {
-          "default": 0,
           "description": "Ops the FUSE fast path executed here as the delegate (not\ncounted in `executed`, which is the core's).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "fast_path_routed": {
-          "default": 0,
           "description": "Plan 30 §M12: ops the root's fast path sent through the core\nbecause a live delegation owned their keys.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forwarded_to_delegate": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "gens": {
-          "default": [],
           "description": "As the root: `(dir, node, gen, cursor, until_ms, recall, ended)`.",
           "items": {
             "maxItems": 7,
@@ -1328,19 +1309,16 @@
           "type": "array"
         },
         "inherited": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "installed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "kinds": {
-          "default": [],
           "description": "As the root: `(gen, kind, backup)` per generation (kind: Manual,\nPlaced, Designated).",
           "items": {
             "maxItems": 3,
@@ -1371,7 +1349,6 @@
           "type": "integer"
         },
         "mine": {
-          "default": [],
           "description": "Delegations this node holds: `(dir, gen, until_ms, stopped,\nstreamed_through, executed, parked)`.",
           "items": {
             "maxItems": 7,
@@ -1415,62 +1392,52 @@
           "type": "array"
         },
         "not_owner": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "parked_expired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "place_delegated": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "place_evaluations": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "place_range_recalls": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "place_recalled": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "place_skipped_cooldown": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "place_skipped_unreachable": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "place_splits": {
-          "default": 0,
           "description": "Plan 30 §M12: hot directories split into hash ranges, and range\ngenerations recalled by the placement.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "placement": {
-          "default": [],
           "description": "The placement's busiest subtrees, `(dir, node, node_ops,\nsubtree_ops)` over the window (M12's input).",
           "items": {
             "maxItems": 4,
@@ -1502,116 +1469,97 @@
           "type": "array"
         },
         "read_grants": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "read_index_served": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_drained": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_expired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_received": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_sent": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "reclaimed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "redelegated": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refused_designated": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "renewals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "renewals_refused": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "restreams": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "sealed_drained": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "seals_sent": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stranded": {
-          "default": 0,
           "description": "Delegate rows stranded here by a recall (rolled back, replayed).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stream_refusals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stream_refused": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "streamed_txs": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "table": {
-          "default": [],
           "description": "The live table.",
           "items": {
             "$ref": "#/$defs/DelegationStatus"
@@ -1620,7 +1568,61 @@
         }
       },
       "required": [
-        "lapsed"
+        "enabled",
+        "table",
+        "mine",
+        "gens",
+        "executed",
+        "fast_path_executed",
+        "fast_path_routed",
+        "forwarded_to_delegate",
+        "deps_waits",
+        "parked_expired",
+        "lapsed",
+        "not_owner",
+        "installed",
+        "streamed_txs",
+        "stream_refused",
+        "renewals",
+        "renewals_refused",
+        "recalls_received",
+        "delegated",
+        "appended_txs",
+        "stream_refusals",
+        "deps_unsatisfied_at_append",
+        "cross_subtree",
+        "recalls_sent",
+        "recalls_drained",
+        "recalls_expired",
+        "reclaimed",
+        "ended",
+        "deps_overflow_to_root",
+        "exec_parked",
+        "stranded",
+        "kinds",
+        "backups",
+        "placement",
+        "inherited",
+        "refused_designated",
+        "designated",
+        "redelegated",
+        "seals_sent",
+        "sealed_drained",
+        "restreams",
+        "backup_appends",
+        "backup_acks",
+        "acks_parked",
+        "backup_persisted",
+        "backup_seals",
+        "place_evaluations",
+        "place_delegated",
+        "place_recalled",
+        "place_skipped_cooldown",
+        "place_skipped_unreachable",
+        "place_splits",
+        "place_range_recalls",
+        "read_index_served",
+        "read_grants"
       ],
       "type": "object"
     },
@@ -1628,7 +1630,6 @@
       "description": "Plan 30 §M11: one live delegation.",
       "properties": {
         "designated": {
-          "default": false,
           "description": "Phase 2b: an offline designation (never recalled by TTL or\nplacement).",
           "type": "boolean"
         },
@@ -1651,7 +1652,6 @@
           "type": "string"
         },
         "range": {
-          "default": "",
           "description": "Plan 30 §M12: `\"<idx>/<count>\"` for a hash range of the\ndirectory's names; empty for the whole directory.",
           "type": "string"
         }
@@ -1660,7 +1660,9 @@
         "dir",
         "path",
         "node",
-        "gen"
+        "gen",
+        "designated",
+        "range"
       ],
       "type": "object"
     },
@@ -1765,7 +1767,6 @@
     "DoctorStatus": {
       "properties": {
         "cas_probes": {
-          "default": [],
           "description": "Plan 30 §M4: what the provider answered at each CAS edge\n(`constellation_store_s3::probe`).",
           "items": {
             "$ref": "#/$defs/CasProbeStatus"
@@ -1779,14 +1780,15 @@
           "type": "boolean"
         },
         "versioning": {
-          "default": "",
           "description": "Plan 30 §M4: bucket versioning as seen on a probe PUT\n(informational).",
           "type": "string"
         }
       },
       "required": [
         "create_if_absent",
-        "etag_cas"
+        "etag_cas",
+        "cas_probes",
+        "versioning"
       ],
       "type": "object"
     },
@@ -1831,11 +1833,9 @@
       "description": "Live continuation-epoch snapshot.",
       "properties": {
         "active": {
-          "default": false,
           "type": "boolean"
         },
         "carrier": {
-          "default": null,
           "description": "Plan 30 §M10: the node whose lease the current (or last) epoch\ncarried.",
           "format": "uint64",
           "minimum": 0,
@@ -1845,34 +1845,29 @@
           ]
         },
         "epoch_id": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "epoch_slack": {
-          "default": 0,
           "description": "Plan 30 §M10: `f` (the filesystem's `epoch_slack`).",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "forwards_streamed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "handoffs_behind": {
-          "default": 0,
           "description": "Epoch hold transfers declined because the requester had not\napplied the holder's whole log.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "members": {
-          "default": [],
           "items": {
             "format": "uint64",
             "minimum": 0,
@@ -1881,80 +1876,87 @@
           "type": "array"
         },
         "own_s3_outage": {
-          "default": false,
           "description": "EC2 follow-up 3c: this node's S3 is failing while a live member's\nworks — its own outage, not the bucket's: it proposes no epoch.",
           "type": "boolean"
         },
         "promise_checks": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "promise_flush_exempt": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "promise_puts": {
-          "default": 0,
           "description": "Plan 30 §M10 counters (the core's): promises persisted and PUT;\npromise requests answered and refused; TTL-takeover promise checks\nrun, takeovers refused for too few promises, flush re-claims\nexempt; activations that found this node's claim stale.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "promise_requests_answered": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "promise_requests_refused": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "promise_until_ms": {
-          "default": 0,
           "description": "Plan 30 §M10: this node's last issued heartbeat promise (unix ms;\n0: none).",
           "format": "int64",
           "type": "integer"
         },
         "proposals": {
-          "default": 0,
           "description": "Proposals this node made (sent to its members).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stale_claims": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "streamed_ahead": {
-          "default": 0,
           "description": "Members keep following the hold owner's log stream during an\nepoch: journal transactions the hold owner streamed ahead, those\nthis member installed, and this member's forwards the stream\nanswered.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "streamed_installed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "takeovers_refused_promises": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "active",
+        "members",
+        "epoch_slack",
+        "promise_until_ms",
+        "own_s3_outage",
+        "proposals",
+        "promise_puts",
+        "promise_requests_answered",
+        "promise_requests_refused",
+        "promise_checks",
+        "takeovers_refused_promises",
+        "promise_flush_exempt",
+        "stale_claims",
+        "streamed_ahead",
+        "streamed_installed",
+        "forwards_streamed",
+        "handoffs_behind"
+      ],
       "type": "object"
     },
     "ErrorKind": {
@@ -2191,7 +2193,6 @@
           "type": "string"
         },
         "detail": {
-          "default": "",
           "type": "string"
         },
         "fs": {
@@ -2204,7 +2205,8 @@
       "required": [
         "fs",
         "check",
-        "ok"
+        "ok",
+        "detail"
       ],
       "type": "object"
     },
@@ -2289,13 +2291,11 @@
           "type": "string"
         },
         "chunk_size": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "compression": {
-          "default": "",
           "type": "string"
         },
         "credentials_generation": {
@@ -2310,22 +2310,18 @@
           "type": "integer"
         },
         "e2e": {
-          "default": false,
           "type": "boolean"
         },
         "name": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "prefix": {
-          "default": "",
           "type": "string"
         },
         "unlocked": {
-          "default": false,
           "description": "Whether this daemon has the credentials to open it (`fs.unlock`).",
           "type": "boolean"
         },
@@ -2333,13 +2329,18 @@
           "type": "string"
         },
         "write_mode": {
-          "default": "",
           "type": "string"
         }
       },
       "required": [
         "uuid",
         "bucket",
+        "prefix",
+        "chunk_size",
+        "compression",
+        "e2e",
+        "write_mode",
+        "unlocked",
         "credentials_generation",
         "credentials_in_use"
       ],
@@ -2429,81 +2430,83 @@
       "description": "Plan 39: the `fsync` policy (`hard` by default; `soft` with\n`--fsync-timeout`) and the waits it caused.",
       "properties": {
         "interrupted": {
-          "default": 0,
           "description": "`fsync`s answered `EINTR`.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "kernel_cap_ms": {
-          "default": 0,
           "description": "The cap the kernel's FUSE request timeout imposes, in ms (0: none).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "longest_wait_ms": {
-          "default": 0,
           "description": "How long the oldest of them has waited, in ms (0: none).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "max_wait_ms": {
-          "default": 0,
           "description": "The longest any `fsync` has waited since the node started, in ms.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "mode": {
-          "default": "",
           "description": "`hard` (wait until durable) or `soft` (`--fsync-timeout`).",
           "type": "string"
         },
         "permanent_errors": {
-          "default": 0,
           "description": "`fsync`s answered `EIO` for a failure waiting does not fix.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "retries": {
-          "default": 0,
           "description": "Attempts retried after a transient failure.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "timeout_ms": {
-          "default": 0,
           "description": "The soft timeout in ms (0: none).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "timeouts": {
-          "default": 0,
           "description": "`fsync`s answered `EIO` because the soft timeout (or the kernel cap)\nelapsed.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "waited": {
-          "default": 0,
           "description": "`fsync`s that retried at least once.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "waiting": {
-          "default": 0,
           "description": "`fsync`s waiting now after a failed attempt.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "mode",
+        "timeout_ms",
+        "kernel_cap_ms",
+        "waiting",
+        "longest_wait_ms",
+        "max_wait_ms",
+        "waited",
+        "retries",
+        "timeouts",
+        "permanent_errors",
+        "interrupted"
+      ],
       "type": "object"
     },
     "FuseFallback": {
@@ -2516,7 +2519,6 @@
           "type": "integer"
         },
         "detail": {
-          "default": "",
           "description": "What refused, as precisely as the daemon knows.",
           "type": "string"
         },
@@ -2537,6 +2539,7 @@
         "from",
         "to",
         "reason",
+        "detail",
         "at_unix_ms"
       ],
       "type": "object"
@@ -2585,11 +2588,9 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "The transport fallback this mount's handshake took, if it took\none (plan 38 §2.4: logged once, and visible here)."
         },
         "lock_wait_downgrades": {
-          "default": 0,
           "description": "Blocking lock requests this mount's ring served as non-blocking\n(see [`FuseStatus::lock_wait_downgrades_total`]); always 0 on\n`dev_fuse`.",
           "format": "uint64",
           "minimum": 0,
@@ -2599,28 +2600,19 @@
           "type": "string"
         },
         "passthrough": {
-          "$ref": "#/$defs/FusePassthroughStatus",
-          "default": {
-            "enabled": false,
-            "opens": 0,
-            "opens_total": 0,
-            "refused_opens": 0,
-            "unavailable_reason": null
-          }
+          "$ref": "#/$defs/FusePassthroughStatus"
         },
         "transport": {
           "description": "What the connection negotiated: `dev_fuse`, `uring` or `uring_zc`,\nfixed for the connection's life.",
           "type": "string"
         },
         "uring_queue_depth": {
-          "default": 0,
           "description": "Ring entries per kernel queue; 0 on `dev_fuse` (no ring queues).",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "zero_copy_reads": {
-          "default": 0,
           "description": "Reads this mount served zero-copy (0 until plan 38 Z4).",
           "format": "uint64",
           "minimum": 0,
@@ -2630,7 +2622,11 @@
       "required": [
         "id",
         "mountpoint",
-        "transport"
+        "transport",
+        "uring_queue_depth",
+        "passthrough",
+        "zero_copy_reads",
+        "lock_wait_downgrades"
       ],
       "type": "object"
     },
@@ -2638,33 +2634,28 @@
       "description": "Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a\nsingle-chunk file's cached chunk directly.",
       "properties": {
         "enabled": {
-          "default": false,
           "description": "Eligible opens are offered a backing file.",
           "type": "boolean"
         },
         "opens": {
-          "default": 0,
           "description": "Opens currently backed by a chunk file\n(`constellation_fuse_passthrough_opens`).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "opens_total": {
-          "default": 0,
           "description": "Opens answered with a backing file since the session started (a\nlane can tell from it that passthrough actually served something).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refused_opens": {
-          "default": 0,
           "description": "Read-write opens refused (`ETXTBSY`) because the file was open in\npassthrough mode (plan 38 §3(c), Z3b).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "unavailable_reason": {
-          "default": null,
           "description": "Why `enabled` is false; `None` when it is true: `writable_mount`\n(the default for a writable mount: only read-only mounts use it\nunless `CONSTELLATION_FUSE_PASSTHROUGH=1`), `disabled`,\n`cache_verify_always`, `no_cap_sys_admin`, `kernel`, `backing_open`\n(the kernel refused the session's probe registration: a user\nnamespace, a cache on overlayfs) or `platform` (plan 38 Z3b).",
           "type": [
             "string",
@@ -2672,47 +2663,47 @@
           ]
         }
       },
+      "required": [
+        "enabled",
+        "opens",
+        "refused_opens",
+        "opens_total"
+      ],
       "type": "object"
     },
     "FuseRequestsStatus": {
       "description": "The FUSE request watchdog (`crate::fuse_watch`, EC2 campaign 7\nB-2): requests in flight, and those unanswered past\n`CONSTELLATION_FUSE_REQUEST_STALL_S`.",
       "properties": {
         "in_flight": {
-          "default": 0,
           "description": "Requests being handled right now.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "oldest_s": {
-          "default": 0,
           "description": "The oldest request in flight, in seconds (blocking locks aside).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stall_threshold_s": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stalled": {
-          "default": 0,
           "description": "Of them, reported as stalled (older than the threshold).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stalled_completed": {
-          "default": 0,
           "description": "Of those, the ones that did complete eventually.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stalled_requests": {
-          "default": [],
           "description": "The stalled requests (and blocking lock waits past the\nthreshold, marked `blocking`), oldest first.",
           "items": {
             "$ref": "#/$defs/StalledFuseRequest"
@@ -2720,27 +2711,33 @@
           "type": "array"
         },
         "stalled_total": {
-          "default": 0,
           "description": "Requests ever reported as stalled since the daemon started.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "in_flight",
+        "stalled",
+        "stalled_total",
+        "stalled_completed",
+        "oldest_s",
+        "stall_threshold_s",
+        "stalled_requests"
+      ],
       "type": "object"
     },
     "FuseStatus": {
       "description": "Plan 38 §5's `fuse` section: what each FUSE mount's connection is\nserved over and what of the read path's fast lanes it uses, plus the\nprocess-wide counters behind `constellation_fuse_*`.\n\n`cache_verify` (`admit`/`always`, plan 38 §2.3), which decides whether\npassthrough and zero-copy may be used at all, is node-wide and is\nreported once, as [`CacheStatus::cache_verify`]; it is deliberately not\nrepeated here.",
       "properties": {
         "lock_wait_downgrades_total": {
-          "default": 0,
           "description": "Blocking lock requests (`F_SETLKW`, blocking `flock`) every ring\nsession of this process served as non-blocking because their ring\nqueue's lock-wait budget (`depth - 1` waiters) was spent — answered\n`ENOLCK` where the lock was contended\n(`constellation_fuse_lock_wait_downgrades_total`, plan 38 Z2c).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "mounts": {
-          "default": [],
           "description": "One entry per mount with a FUSE session behind it, by mount id.",
           "items": {
             "$ref": "#/$defs/FuseMountStatus"
@@ -2748,7 +2745,6 @@
           "type": "array"
         },
         "transport_fallbacks": {
-          "default": [],
           "description": "Every transport fallback this process took, by (from, to, reason):\n`constellation_fuse_transport_fallbacks_total`. Process-wide, so\nit survives the unmount of the mount that took one.",
           "items": {
             "$ref": "#/$defs/FuseFallbackCount"
@@ -2756,13 +2752,18 @@
           "type": "array"
         },
         "zero_copy_reads_total": {
-          "default": 0,
           "description": "Reads served zero-copy by every session of this process\n(`constellation_fuse_zero_copy_reads_total`; 0 until plan 38 Z4).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "mounts",
+        "transport_fallbacks",
+        "zero_copy_reads_total",
+        "lock_wait_downgrades_total"
+      ],
       "type": "object"
     },
     "GcReport": {
@@ -2805,7 +2806,6 @@
           "type": "string"
         },
         "transport": {
-          "default": "",
           "description": "The transport its connection is served over (`dev_fuse`: the only\none that can be handed over, plan 38 §3(e)).",
           "type": "string"
         }
@@ -2813,7 +2813,8 @@
       "required": [
         "id",
         "mountpoint",
-        "handles"
+        "handles",
+        "transport"
       ],
       "type": "object"
     },
@@ -2921,12 +2922,10 @@
       "description": "`node.handoff`'s result: answered once the sessions are detached; the\nreceiving image then serves them (for `Exec`, `node.status` reports\n`handover.generation` one higher).",
       "properties": {
         "detail": {
-          "default": "",
           "description": "A human-readable summary (the old `Upgrade` answer).",
           "type": "string"
         },
         "elapsed_ms": {
-          "default": 0,
           "description": "How long the step took.",
           "format": "uint64",
           "minimum": 0,
@@ -2941,7 +2940,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "`Socket` only: the state the step left."
         },
         "views": {
@@ -2952,7 +2950,9 @@
         }
       },
       "required": [
-        "views"
+        "detail",
+        "views",
+        "elapsed_ms"
       ],
       "type": "object"
     },
@@ -3014,13 +3014,15 @@
             "resumed": {
               "properties": {
                 "failed": {
-                  "default": [],
                   "items": {
                     "type": "string"
                   },
                   "type": "array"
                 }
               },
+              "required": [
+                "failed"
+              ],
               "type": "object"
             }
           },
@@ -3094,7 +3096,6 @@
           "type": "integer"
         },
         "last_error": {
-          "default": null,
           "description": "Why the last attempt did not happen, if it did not.",
           "type": [
             "string",
@@ -3126,7 +3127,6 @@
           "type": "integer"
         },
         "missing_chunks": {
-          "default": [],
           "description": "Hex hashes of the pending chunks gone from the local cache.",
           "items": {
             "type": "string"
@@ -3134,14 +3134,12 @@
           "type": "array"
         },
         "path": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "seeds": {
-          "default": 0,
           "description": "Held transactions whose manifest names them.",
           "format": "uint64",
           "minimum": 0,
@@ -3149,7 +3147,9 @@
         }
       },
       "required": [
-        "ino"
+        "ino",
+        "missing_chunks",
+        "seeds"
       ],
       "type": "object"
     },
@@ -3157,14 +3157,12 @@
       "description": "Plan 30 §M4: records held back behind unrecoverable pending chunks.",
       "properties": {
         "deferred": {
-          "default": 0,
           "description": "Plan 30 §M7: transactions deferred (not held) because a chunk their\nmanifest names is still uploading; they ship once it is up.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "inodes": {
-          "default": [],
           "description": "Each inode with unrecoverable chunks: `constellation repair\ndrop-held <ino>` discards its held records.",
           "items": {
             "$ref": "#/$defs/HeldInodeStatus"
@@ -3172,7 +3170,6 @@
           "type": "array"
         },
         "oldest_seq": {
-          "default": null,
           "description": "The oldest held journal seq.",
           "format": "uint64",
           "minimum": 0,
@@ -3182,18 +3179,15 @@
           ]
         },
         "opaque": {
-          "default": false,
           "description": "An uncaptured transaction (holder capture off) was held, so every\ntransaction after it is held too.",
           "type": "boolean"
         },
         "records": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "remote": {
-          "default": [],
           "description": "Pending chunks another node forwarded as still uploading there\n(`--write-mode back`, or any write inside a continuation epoch):\nthe transactions naming them are deferred (counted in\n`deferred`) until that node uploads them, or the sequencer finds\nthem in S3. If the node is gone for good, `constellation repair\ndrop-held <ino> --remote` drops them.",
           "items": {
             "$ref": "#/$defs/RemoteChunkStatus"
@@ -3201,13 +3195,20 @@
           "type": "array"
         },
         "transactions": {
-          "default": 0,
           "description": "Journaled transactions held back (the seeds and everything that\ndepends on them).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "transactions",
+        "records",
+        "opaque",
+        "deferred",
+        "inodes",
+        "remote"
+      ],
       "type": "object"
     },
     "Hello": {
@@ -3245,156 +3246,130 @@
       "description": "Plan 30 §M13: the S3 inbox — a non-holder's forwarded mutations\nwhen it has no P2P path to the holder, and the holder's polling of\nthem. Requester-side counters (`submitted_*`, `resubmitted_ops`,\n`unavailable`, `pending_ops`, `next_n`) and holder-side ones\n(`executed_ops`, `refused_ops`, `deduped_ops`, `drained_*`, `polls`,\n`poll_hits`, `gc_deleted`, `tracked_requesters`) are both reported by\nevery node; whichever role it plays moves.",
       "properties": {
         "avg_batch_ops": {
-          "default": 0.0,
           "description": "Requester side: ops per batch, mean and maximum.",
           "format": "double",
           "type": "number"
         },
         "avg_execute_ms": {
-          "default": 0.0,
           "format": "double",
           "type": "number"
         },
         "avg_outcome_wait_ms": {
-          "default": 0.0,
           "format": "double",
           "type": "number"
         },
         "avg_pickup_ms": {
-          "default": 0.0,
           "description": "Holder side: mean time from a batch's submission stamp to its\npoll hit (requester and holder clocks), and per-hit execute time.",
           "format": "double",
           "type": "number"
         },
         "avg_queue_wait_ms": {
-          "default": 0.0,
           "description": "Round-2 instrumentation, requester side: mean time from queueing\nan op to its batch being durable, from durable to its outcome\napplied from the log, and their sum.",
           "format": "double",
           "type": "number"
         },
         "avg_round_trip_ms": {
-          "default": 0.0,
           "format": "double",
           "type": "number"
         },
         "deduped_ops": {
-          "default": 0,
           "description": "Batch positions answered without executing (rid already had an\noutcome, or the position was below the watermark).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "drained_batches": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "drained_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "enabled": {
-          "default": false,
           "type": "boolean"
         },
         "escalated": {
-          "default": false,
           "description": "Plan 30 M13 round 3b (the hybrid): whether this node's inbox\ndemand is currently sustained enough that it is asking for the\nlease; how many times it started asking; the lease requests it\nsent for that; ops it forwarded through the inbox vs. ops it\nexecuted locally as holder.",
           "type": "boolean"
         },
         "escalations": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "executed_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "gc_deleted": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "inbox_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "largest_batch_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "lease_requests": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "leases_kept_for_p2p_side": {
-          "default": 0,
           "description": "EC2 finding 2: rounds in which this node, holding the lease,\nkept it from wanters across a P2P partition from the nodes using\nit.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "local_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "next_n": {
-          "default": 0,
           "description": "This node's next batch number under its current epoch.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "pending_ops": {
-          "default": 0,
           "description": "Submitted ops still waiting for their outcome in the log.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "poll_hits": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "polls": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refused_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "resubmitted_ops": {
-          "default": 0,
           "description": "Ops re-submitted by rid: under a newer epoch because a takeover\nstranded their batch, or in a new batch because one they shared\nwas withdrawn.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "roster": {
-          "default": [],
           "description": "The write-eligible roster this node's authority core last read\n(the registry, refreshed periodically and at a holder's inbox\ntenure start): who a holder polls with P2P off. A bench waits for\nit to name every node before timing.",
           "items": {
             "format": "uint64",
@@ -3404,45 +3379,73 @@
           "type": "array"
         },
         "submitted_batches": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "submitted_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "tombstones_read": {
-          "default": 0,
           "description": "Holder: withdrawn batches its polls read and stepped past.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "tracked_requesters": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "unavailable": {
-          "default": 0,
           "description": "Forwards the inbox could not take (no live holder to leave them\nwith, S3 refused the batch, or the in-doubt deadline passed); they\ntook the lease path.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "withdrawn_ops": {
-          "default": 0,
           "description": "Requester: batches this node withdrew (overwrote with a tombstone)\nbefore forwarding their op over P2P or holding it back.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "enabled",
+        "submitted_batches",
+        "submitted_ops",
+        "resubmitted_ops",
+        "withdrawn_ops",
+        "tombstones_read",
+        "unavailable",
+        "pending_ops",
+        "next_n",
+        "executed_ops",
+        "refused_ops",
+        "deduped_ops",
+        "drained_batches",
+        "drained_ops",
+        "polls",
+        "poll_hits",
+        "gc_deleted",
+        "tracked_requesters",
+        "roster",
+        "avg_queue_wait_ms",
+        "avg_outcome_wait_ms",
+        "avg_round_trip_ms",
+        "avg_pickup_ms",
+        "avg_execute_ms",
+        "avg_batch_ops",
+        "largest_batch_ops",
+        "escalated",
+        "escalations",
+        "lease_requests",
+        "leases_kept_for_p2p_side",
+        "inbox_ops",
+        "local_ops"
+      ],
       "type": "object"
     },
     "InspectStatus": {
@@ -3476,8 +3479,7 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "mode": {
           "format": "uint32",
@@ -3532,32 +3534,34 @@
       "description": "Partition lease state (DESIGN.md §4). `held` is this node's own\nauthority; `holder`/`epoch` also describe the *foreign* holder once\nthis node has been deposed, which is what `lost` reports.",
       "properties": {
         "epoch": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "expires_in_ms": {
-          "default": 0,
           "format": "int64",
           "type": "integer"
         },
         "held": {
-          "default": false,
           "type": "boolean"
         },
         "holder": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "lost": {
-          "default": false,
           "description": "This node was deposed: it refuses to ship and its unshipped\njournal is stranded pending reintegration.",
           "type": "boolean"
         }
       },
+      "required": [
+        "held",
+        "holder",
+        "epoch",
+        "expires_in_ms",
+        "lost"
+      ],
       "type": "object"
     },
     "LeaveParams": {
@@ -3676,24 +3680,20 @@
       "description": "Plan 31 C8: the engine's lifecycle, as `node.status` reports it and\n`node.lifecycle` answers: the profile it runs, what the host last said,\nand what is in force because of both.",
       "properties": {
         "background_paused": {
-          "default": false,
           "description": "In force: GC, prune, digests, pin refreshes, registry and\ndesignation polls are paused.",
           "type": "boolean"
         },
         "events": {
-          "default": 0,
           "description": "Lifecycle events applied since the engine started, and the last.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forward_only": {
-          "default": false,
           "description": "In force: the authority core never takes the lease from a live\nholder (the profile's `forward-only`, or a suspension).",
           "type": "boolean"
         },
         "last_event": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -3707,8 +3707,7 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "last_suspend": {
           "anyOf": [
@@ -3718,89 +3717,89 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "low_power": {
-          "default": false,
           "description": "The host asked for reduced background work (until the next\n`Foreground` or `Resumed`).",
           "type": "boolean"
         },
         "network_metered": {
-          "default": false,
           "type": "boolean"
         },
         "network_reachable": {
-          "default": false,
           "description": "The last `NetworkChanged` (reachable and unmetered until one says\notherwise).",
           "type": "boolean"
         },
         "p2p_accepts_inbound": {
-          "default": false,
           "description": "The P2P endpoint admits inbound connections / takes part in\ngossip (both false without P2P; a suspension refuses both, and\nonly this node's own requests dial out).",
           "type": "boolean"
         },
         "p2p_gossip": {
-          "default": false,
           "type": "boolean"
         },
         "profile": {
           "additionalProperties": {
             "type": "string"
           },
-          "default": {},
           "description": "The engine profile's modes: `p2p` (`listen`/`dial-only`/`off`),\n`leases` (`hold`/`forward-only`), `uploads`\n(`always`/`unmetered-only`), `background`\n(`continuous`/`on-demand`).",
           "type": "object"
         },
         "state": {
-          "default": "",
           "description": "`foreground`, `background`, `suspending` or `suspended`.",
           "type": "string"
         },
         "suspended": {
-          "default": false,
           "description": "In force: the core takes no lease at all (a suspension).",
           "type": "boolean"
         },
         "upload_deferrals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "uploads_held": {
-          "default": false,
           "description": "In force: opportunistic chunk uploads hold (`unmetered-only` on a\nmetered network), and how often the hold deferred one.",
           "type": "boolean"
         }
       },
+      "required": [
+        "profile",
+        "state",
+        "low_power",
+        "network_reachable",
+        "network_metered",
+        "forward_only",
+        "suspended",
+        "uploads_held",
+        "upload_deferrals",
+        "background_paused",
+        "p2p_accepts_inbound",
+        "p2p_gossip",
+        "events"
+      ],
       "type": "object"
     },
     "LockStatus": {
       "description": "Plan 30 §M14: `--locks cluster` — lock grants leased from the\nowning sequencer.",
       "properties": {
         "fenced_io": {
-          "default": 0,
           "description": "I/O refused with `EIO` under a lapsed grant.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "first_use_abandoned": {
-          "default": 0,
           "description": "Recalled grants given up before their first local lock (the\nrequester gave up, or the first-use budget ran out).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grace_refusals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grant_ms": {
-          "default": [],
           "items": {
             "format": "uint64",
             "minimum": 0,
@@ -3809,322 +3808,330 @@
           "type": "array"
         },
         "grant_ms_total": {
-          "default": 0,
           "description": "Grant round trips: total ms and log2 histogram (`[0]` < 1 ms).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grant_wait_ms_total": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "granted": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grants_degraded": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grants_held": {
-          "default": 0,
           "description": "Grants this node holds now (cached across unlocks).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grants_made": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grants_table": {
-          "default": 0,
           "description": "Live grants in this node's table.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "grants_waited": {
-          "default": 0,
           "description": "Grants whose floor this replica had not reached on arrival (the\nfirst read under the lock waited), how long those waits took in\nall, and the ones that timed out after the session budget: under\nsuch a grant the holder's reads were answered degraded, so the\nlock's visibility guarantee did not hold for that turn (logged at\nWARN too).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "local_conflicts": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "local_hits": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "lost": {
-          "default": 0,
           "description": "Grants the sequencer no longer knew (I/O under them is fenced).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "mode": {
-          "default": "",
           "description": "`cluster` or `local`.",
           "type": "string"
         },
         "owner_fenced_ops": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "owners_fenced": {
-          "default": 0,
           "description": "Lock owners fenced on this node (their grant lapsed under their\nlocal lock), and the ops of theirs refused with `EIO` for it, on\nany file.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalled": {
-          "default": 0,
           "description": "Recalls received (and how many found local locks), releases sent.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalled_busy": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_expired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_in_flight": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_released": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "recalls_sent": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "reclaimed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "released": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "released_superseded": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "renewals": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "requests": {
-          "default": 0,
           "description": "Local lock requests, answered under a held grant, refused by\nanother local owner, granted by the sequencer, refused\n(`EAGAIN`), or unavailable (`ENOLCK`).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "requests_in_flight": {
-          "default": 0,
           "description": "Right now: requests in flight, parked waiters, recalls in flight.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "requeued_in_place": {
-          "default": 0,
           "description": "Waiters re-parked at their old queue position after a grant to\nthem went unused, and releases that named a grant id this owner\nhad replaced (both ended a grant that was otherwise outwaited).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "unavailable": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "waiters": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "waiters_parked": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "would_block": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "mode",
+        "grants_held",
+        "requests",
+        "local_hits",
+        "local_conflicts",
+        "granted",
+        "would_block",
+        "unavailable",
+        "grant_ms_total",
+        "grant_ms",
+        "renewals",
+        "lost",
+        "recalled",
+        "recalled_busy",
+        "released",
+        "fenced_io",
+        "owners_fenced",
+        "owner_fenced_ops",
+        "first_use_abandoned",
+        "grants_waited",
+        "grant_wait_ms_total",
+        "grants_degraded",
+        "grants_table",
+        "grants_made",
+        "recalls_sent",
+        "recalls_released",
+        "recalls_expired",
+        "reclaimed",
+        "waiters_parked",
+        "grace_refusals",
+        "requeued_in_place",
+        "released_superseded",
+        "requests_in_flight",
+        "waiters",
+        "recalls_in_flight"
+      ],
       "type": "object"
     },
     "LogStreamStatus": {
       "description": "Plan 30 §M7: the direct log stream.",
       "properties": {
         "applied": {
-          "default": 0,
           "description": "Segments applied from the stream (no S3 GET), and rounds that\nskipped their S3 tail because the stream covered it.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "buffered": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "declined": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "duplicates": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "enabled": {
-          "default": false,
           "description": "`CONSTELLATION_LOG_STREAMS` (and P2P) on.",
           "type": "boolean"
         },
         "ended": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "frames_sent": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "gaps": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "live": {
-          "default": false,
           "type": "boolean"
         },
         "lost": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "overflows": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refused": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "served": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "serving": {
-          "default": 0,
           "description": "As the holder: subscribers served now, subscriptions accepted and\ndeclined, frames sent, and subscribers dropped for falling behind\n(their bounded buffer overflowed) or going away.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "subscribers_dropped": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "subscribes": {
-          "default": 0,
           "description": "Subscriptions made, and how they ended: refused (not the holder),\nended by the holder (it let the lease go), a frame gap, lost at the\ntransport, silent past the timeout, or a full reorder buffer.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "tail_skips": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "timeouts": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "upstream": {
-          "default": 0,
           "description": "The holder this node is subscribed to (0: none), whether a frame\nhas arrived on the subscription, and segments waiting in its\nreorder buffer for a sequence S3 must supply.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "enabled",
+        "upstream",
+        "live",
+        "buffered",
+        "applied",
+        "tail_skips",
+        "subscribes",
+        "refused",
+        "ended",
+        "gaps",
+        "lost",
+        "timeouts",
+        "overflows",
+        "duplicates",
+        "serving",
+        "served",
+        "declined",
+        "frames_sent",
+        "subscribers_dropped"
+      ],
       "type": "object"
     },
     "LogTailParams": {
@@ -4158,7 +4165,6 @@
           "type": "integer"
         },
         "chunks": {
-          "default": [],
           "description": "`index:chunk hash` of the first chunks (or the spilled list's\nhash), for telling apart what two nodes serve.",
           "items": {
             "type": "string"
@@ -4166,12 +4172,10 @@
           "type": "array"
         },
         "digest": {
-          "default": "",
           "description": "BLAKE3 of the encoded manifest: two nodes serving the same file\nversion agree on it.",
           "type": "string"
         },
         "file_len": {
-          "default": 0,
           "description": "The manifest's own length (the inode's `size` can differ while a\nsetattr and a manifest commit are apart).",
           "format": "uint64",
           "minimum": 0,
@@ -4184,7 +4188,10 @@
       "required": [
         "chunk_size",
         "chunk_count",
-        "spilled"
+        "spilled",
+        "file_len",
+        "digest",
+        "chunks"
       ],
       "type": "object"
     },
@@ -4235,7 +4242,6 @@
           "type": "string"
         },
         "transport": {
-          "default": null,
           "description": "Plan 38 §5: the FUSE transport this mount's connection negotiated\n— `dev_fuse`, `uring` or `uring_zc` — fixed for the connection's\nlife. `None` on a host with no FUSE session behind the view (a\ncontrol-only embedder, the engine's own fixtures) and in a report\nfrom a daemon older than plan 38 Z1b. The same value as this\nmount's [`FuseMountStatus::transport`] in [`StatusReport::fuse`],\nwhich carries the rest of plan 38 §5's per-mount transport state;\nkept here too because it describes the mount, and every mount\nlisting (`view.mount`'s answer included) carries it.",
           "type": [
             "string",
@@ -4389,7 +4395,6 @@
           "type": "integer"
         },
         "blocking": {
-          "default": false,
           "description": "A blocking lock request: unbounded by design, not a stall.",
           "type": "boolean"
         },
@@ -4407,7 +4412,6 @@
           "type": "string"
         },
         "stalled": {
-          "default": false,
           "description": "The watchdog has reported it as stalled.",
           "type": "boolean"
         },
@@ -4418,7 +4422,6 @@
           "type": "integer"
         },
         "view": {
-          "default": null,
           "description": "The view (by id) it belongs to.",
           "format": "uint64",
           "minimum": 0,
@@ -4433,7 +4436,9 @@
         "ino",
         "age_s",
         "stage",
-        "tid"
+        "tid",
+        "blocking",
+        "stalled"
       ],
       "type": "object"
     },
@@ -4486,7 +4491,6 @@
           "type": "array"
         },
         "stall_threshold_s": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4498,11 +4502,9 @@
           "type": "integer"
         },
         "truncated": {
-          "default": false,
           "type": "boolean"
         },
         "views": {
-          "default": [],
           "description": "Per view (by id), with its labels; operations of no view are under\n`view: null`. Counts cover all matching operations, not only the\nlisted ones.",
           "items": {
             "$ref": "#/$defs/ViewOps"
@@ -4514,7 +4516,10 @@
         "in_flight",
         "stalled",
         "oldest_s",
-        "ops"
+        "stall_threshold_s",
+        "ops",
+        "truncated",
+        "views"
       ],
       "type": "object"
     },
@@ -4522,21 +4527,18 @@
       "description": "EC2 campaign 8 A-1: this node's own S3 path. While it is stalled (no\nS3 request of this node completed for `CONSTELLATION_S3_STALL_MS`,\ndefault 6 s) client ops keep forwarding over P2P rather than waiting\non a lease acquisition that needs S3, and one not answered within\n`CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (default 20 s) fails with `EIO`\n(in doubt) — unless the peers report that none of them reaches S3\neither (a bucket outage, served by the continuation epoch).",
       "properties": {
         "deadlines": {
-          "default": 0,
           "description": "Ops that failed at the bound.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forwards": {
-          "default": 0,
           "description": "Ops on the lease path forwarded again.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "peers_reach_s3": {
-          "default": null,
           "description": "While stalled: some live peer reaches S3 (`true`), none does\n(`false`), or nobody answered (`null`).",
           "type": [
             "boolean",
@@ -4544,14 +4546,12 @@
           ]
         },
         "readopted_for_forward": {
-          "default": 0,
           "description": "Forwards this node answered `Held` while re-adopting the lease a\nprevious incarnation of it left behind.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "retries": {
-          "default": 0,
           "description": "Forward retries past the ordinary budget, made instead of the\nlease path.",
           "format": "uint64",
           "minimum": 0,
@@ -4561,7 +4561,6 @@
           "type": "boolean"
         },
         "stalled_for_ms": {
-          "default": null,
           "description": "How long the stall has lasted, as far as the core knows.",
           "format": "uint64",
           "minimum": 0,
@@ -4572,7 +4571,11 @@
         }
       },
       "required": [
-        "stalled"
+        "stalled",
+        "retries",
+        "forwards",
+        "deadlines",
+        "readopted_for_forward"
       ],
       "type": "object"
     },
@@ -4580,16 +4583,13 @@
       "description": "P2P fast-path state. Purely observational: the filesystem is correct\nwith `enabled: false` and every peer disconnected, just slower.",
       "properties": {
         "dial_stalled": {
-          "default": false,
           "description": "Every P2P dial has timed out for longer than twice the dial\ntimeout (`constellation_p2p_dial_stalled`): this node's endpoint\nis likely stuck, not its peers.",
           "type": "boolean"
         },
         "enabled": {
-          "default": false,
           "type": "boolean"
         },
         "node_addr": {
-          "default": null,
           "description": "This node's dialable address, as published to the registry.",
           "type": [
             "string",
@@ -4597,18 +4597,22 @@
           ]
         },
         "peers": {
-          "default": [],
           "items": {
             "$ref": "#/$defs/PeerStatus"
           },
           "type": "array"
         },
         "relay": {
-          "default": "",
           "description": "Active relay policy: `disabled`, `default`, or a custom URL label.",
           "type": "string"
         }
       },
+      "required": [
+        "enabled",
+        "relay",
+        "dial_stalled",
+        "peers"
+      ],
       "type": "object"
     },
     "PathParams": {
@@ -4642,26 +4646,22 @@
       "description": "Plan 30 §M4: the open network paths of the pooled connection to one\npeer (iroh 1.x on noq keeps several open at once: typically the relay\npath and, once holepunching succeeds, a direct one).",
       "properties": {
         "direct": {
-          "default": 0,
           "description": "Open direct (IP) paths.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "multipath": {
-          "default": false,
           "description": "More than one path is open, so a failure of the selected one can\nfail over without a new handshake.",
           "type": "boolean"
         },
         "relay": {
-          "default": 0,
           "description": "Open relay paths.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "rtts": {
-          "default": [],
           "description": "Round-trip estimate of each open path, `kind:ms`, selected first.",
           "items": {
             "type": "string"
@@ -4669,24 +4669,28 @@
           "type": "array"
         },
         "selected": {
-          "default": "",
           "description": "Kind of the path application data currently uses: `direct`,\n`relay`, or empty when no connection is pooled.",
           "type": "string"
         }
       },
+      "required": [
+        "selected",
+        "direct",
+        "relay",
+        "multipath",
+        "rtts"
+      ],
       "type": "object"
     },
     "PeerStatus": {
       "properties": {
         "addrs": {
-          "default": [],
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "connected": {
-          "default": false,
           "type": "boolean"
         },
         "coop": {
@@ -4698,11 +4702,9 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "Cooperative-cache source stats for this peer, when available."
         },
         "created_unix": {
-          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -4710,7 +4712,6 @@
           ]
         },
         "designations": {
-          "default": [],
           "description": "Offline designations this peer currently holds (paths).",
           "items": {
             "type": "string"
@@ -4718,26 +4719,22 @@
           "type": "array"
         },
         "endpoint_id": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "epoch_member": {
-          "default": false,
           "description": "Whether this peer is a member of the active continuation epoch.",
           "type": "boolean"
         },
         "hostname": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "last_seen_ms": {
-          "default": null,
           "description": "Milliseconds since this peer was last observed live.",
           "format": "uint64",
           "minimum": 0,
@@ -4752,7 +4749,6 @@
           "type": "integer"
         },
         "p2p_updated_unix": {
-          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -4760,34 +4756,23 @@
           ]
         },
         "path": {
-          "default": "",
           "description": "Connectivity path: `direct`, `relay`, `unknown`, or empty for S3.",
           "type": "string"
         },
         "paths": {
           "$ref": "#/$defs/PeerPathsStatus",
-          "default": {
-            "direct": 0,
-            "multipath": false,
-            "relay": 0,
-            "rtts": [],
-            "selected": ""
-          },
           "description": "Plan 30 §M4: every open QUIC path to this peer right now."
         },
         "pubkey": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "ro": {
-          "default": false,
           "type": "boolean"
         },
         "rtt_ms": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -4796,12 +4781,10 @@
           ]
         },
         "s3": {
-          "default": false,
           "description": "Synthetic S3 backend row (`node_id` 0). Always listed first among\n[`P2pStatus::peers`] so the UI can compare lat/BW/hit% with peers.",
           "type": "boolean"
         },
         "version": {
-          "default": null,
           "description": "Peer binary version from the registry (`git describe` / package).",
           "type": [
             "string",
@@ -4810,7 +4793,15 @@
         }
       },
       "required": [
-        "node_id"
+        "node_id",
+        "connected",
+        "addrs",
+        "ro",
+        "epoch_member",
+        "designations",
+        "s3",
+        "path",
+        "paths"
       ],
       "type": "object"
     },
@@ -4887,68 +4878,70 @@
     "PrefetchStatus": {
       "properties": {
         "abandoned": {
-          "default": 0,
           "description": "Times a stream's queued readahead was cancelled because the reader\nstopped consuming it (DESIGN.md §7 \"abandoned reader\").",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "abandoned_chunks": {
-          "default": 0,
           "description": "Chunks dropped from queues by those cancellations — GETs saved from\nreaders that never came back for them.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "gate_target": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "inflight": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "queued": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "scan_ahead_bytes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "scan_ahead_files": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stalls": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "streams": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "window_bytes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "inflight",
+        "queued",
+        "streams",
+        "window_bytes",
+        "stalls",
+        "gate_target",
+        "scan_ahead_files",
+        "scan_ahead_bytes",
+        "abandoned",
+        "abandoned_chunks"
+      ],
       "type": "object"
     },
     "Principal": {
@@ -5054,11 +5047,9 @@
       "description": "One marked prune root, for `constellation prune ls`.",
       "properties": {
         "armed": {
-          "default": false,
           "type": "boolean"
         },
         "note": {
-          "default": null,
           "description": "A note when the policy is unparseable or inert.",
           "type": [
             "string",
@@ -5072,13 +5063,14 @@
           "type": "string"
         },
         "valid": {
-          "default": false,
           "type": "boolean"
         }
       },
       "required": [
         "path",
-        "policy"
+        "policy",
+        "armed",
+        "valid"
       ],
       "type": "object"
     },
@@ -5103,43 +5095,36 @@
       "description": "Retention-pruning counters (plan 22), surfaced in `constellation\nstatus`, on the web UI, and in `/metrics`.",
       "properties": {
         "armed_roots": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "bytes_deleted": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "bytes_freed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "deleted": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "entries_examined": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "inert_roots": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "last_parse_error": {
-          "default": null,
           "description": "Last setxattr policy rejection: `(expression, byte_offset, message)`.",
           "maxItems": 3,
           "minItems": 3,
@@ -5162,72 +5147,80 @@
           ]
         },
         "last_run_unix_ms": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "leases_acquired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refused_lag": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "roots": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "runs": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "selected": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skipped_forward_err": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skipped_hardlink": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skipped_repartition": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skipped_reverify": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "unparseable_roots": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "runs",
+        "roots",
+        "armed_roots",
+        "unparseable_roots",
+        "inert_roots",
+        "entries_examined",
+        "selected",
+        "deleted",
+        "bytes_deleted",
+        "bytes_freed",
+        "skipped_reverify",
+        "skipped_forward_err",
+        "skipped_hardlink",
+        "skipped_repartition",
+        "leases_acquired",
+        "refused_lag",
+        "last_run_unix_ms"
+      ],
       "type": "object"
     },
     "QuotaGetParams": {
@@ -5250,7 +5243,6 @@
     "QuotaStatus": {
       "properties": {
         "max_bytes": {
-          "default": null,
           "description": "`None` = unlimited.",
           "format": "uint64",
           "minimum": 0,
@@ -5260,12 +5252,14 @@
           ]
         },
         "used_bytes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "used_bytes"
+      ],
       "type": "object"
     },
     "RdevSchema": {
@@ -5292,7 +5286,6 @@
       "description": "What deleting a set of snapshots would give back once GC has run (plan\n32 §6.1 `reclaim(D)`): the logical bytes and chunks no other snapshot\nand not the live tree reference, as of the accounting index's commit\n`as_of_seq`. While the index does not match the snapshots yet,\n`building` is set (with `building_pct`) and `bytes`/`chunks` are 0 and\nmean nothing: never a partial number.",
       "properties": {
         "as_of_ms": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -5306,7 +5299,6 @@
           "type": "boolean"
         },
         "building_pct": {
-          "default": 0,
           "format": "uint8",
           "maximum": 255,
           "minimum": 0,
@@ -5318,7 +5310,6 @@
           "type": "integer"
         },
         "chunk_hashes": {
-          "default": null,
           "description": "With `snapshot.reclaim`'s `list_chunks` (a test aid), the counted\nchunks' hashes (lowercase hex, sorted); `null` otherwise and while\nbuilding.",
           "items": {
             "type": "string"
@@ -5338,7 +5329,9 @@
         "bytes",
         "chunks",
         "as_of_seq",
-        "building"
+        "as_of_ms",
+        "building",
+        "building_pct"
       ],
       "type": "object"
     },
@@ -5360,22 +5353,24 @@
     "ReintegrationStatus": {
       "properties": {
         "conflicts_materialized": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "in_progress": {
-          "default": false,
           "type": "boolean"
         },
         "stranded_records": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "stranded_records",
+        "conflicts_materialized",
+        "in_progress"
+      ],
       "type": "object"
     },
     "RemoteChunkStatus": {
@@ -5403,7 +5398,6 @@
           "type": "integer"
         },
         "path": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -5492,72 +5486,73 @@
             "minimum": 0,
             "type": "integer"
           },
-          "default": {},
           "type": "object"
         },
         "copy": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "delete": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "get": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "head": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "last_answered_unix_ms": {
-          "default": 0,
           "description": "When S3 last answered a request (unix ms; 0: never) — a success,\nor an error of the request itself (not found, a failed\nprecondition), which proves the path works as well.",
           "format": "int64",
           "type": "integer"
         },
         "last_unanswered_error": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "last_unanswered_unix_ms": {
-          "default": 0,
           "description": "When a request last went unanswered (unix ms; 0: never), and why.",
           "format": "int64",
           "type": "integer"
         },
         "list": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "put": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "unanswered": {
-          "default": 0,
           "description": "Requests that failed other than as an error of the request itself\n(see `last_answered_unix_ms`): a transport error or timeout after\nthe client's own retries, a 5xx, a refusal.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "get",
+        "head",
+        "put",
+        "list",
+        "delete",
+        "copy",
+        "by_area",
+        "unanswered",
+        "last_answered_unix_ms",
+        "last_unanswered_unix_ms"
+      ],
       "type": "object"
     },
     "Secret": {
@@ -5568,85 +5563,72 @@
       "description": "Plan 30 §M6: the session wait FUSE reads go through\n(`constellation_meta::session`).",
       "properties": {
         "abandoned": {
-          "default": 0,
           "description": "Watermarks dropped after staying unreached for the TTL, and\nstream dependencies voided because the delegation table showed\ntheir generation ended before this incarnation (EC2 campaign 7\nB-2: either one left every read on the node degraded for good).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "budget_ms": {
-          "default": 0,
           "description": "`CONSTELLATION_SESSION_WAIT_MS` (0: disabled).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "covered": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "degraded_held": {
-          "default": 0,
           "description": "Timeouts while M4 held-back rows existed (a held row stalls the\nshipped-through position).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "fast": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "raised": {
-          "default": 0,
           "description": "Times the `observed` watermark rose (replies whose effects were\nnot installed here).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "reads": {
-          "default": 0,
           "description": "Reads checked, and how each ended: at once on the applied\nposition, at once on covering speculation, after a wait, or\ndegraded after the whole budget.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "replay_blocked": {
-          "default": 0,
           "description": "Reads that waited for a queued replay of this node's own write.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "timeouts": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "voided_ended": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "wait_ms_total": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "waited": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "waits_ms": {
-          "default": [],
           "description": "Waits by log2 milliseconds: `[0]` < 1 ms, `[i]` < 2^i ms.",
           "items": {
             "format": "uint64",
@@ -5656,13 +5638,28 @@
           "type": "array"
         },
         "watermark_ttl_ms": {
-          "default": 0,
           "description": "`CONSTELLATION_SESSION_WATERMARK_TTL_MS` (0: never dropped).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "budget_ms",
+        "reads",
+        "fast",
+        "covered",
+        "waited",
+        "timeouts",
+        "degraded_held",
+        "replay_blocked",
+        "waits_ms",
+        "wait_ms_total",
+        "raised",
+        "watermark_ttl_ms",
+        "abandoned",
+        "voided_ended"
+      ],
       "type": "object"
     },
     "SetQuotaParams": {
@@ -5711,107 +5708,108 @@
       "description": "Plan 32 Step 9's `SnapAcctStats`: the node-local space-accounting\nindex (advisory; never published, never consulted by GC).",
       "properties": {
         "as_of_seq": {
-          "default": 0,
           "description": "The commit every number is \"as of\".",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "build_progress_pct": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "building": {
-          "default": false,
           "description": "The index does not match the snapshot rows (its first build, a\npass cut short by its budget, or a stalled chain): queries answer\n\"building\", never partial numbers.",
           "type": "boolean"
         },
         "errors": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "index_bytes": {
-          "default": 0,
           "description": "The index's on-disk tables.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "indexed_chunks": {
-          "default": 0,
           "description": "Chunks held by at least one snapshot.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "last_error": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "live_recheck_full": {
-          "default": false,
           "description": "A full recompute of the live flags is pending a settled moment:\nthe space figures are an estimate until it runs.",
           "type": "boolean"
         },
         "live_rechecks": {
-          "default": 0,
           "description": "Chunks whose live flags the next settled refresh reads again.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "maintaining": {
-          "default": false,
           "description": "Whether the background task is keeping the index current now.",
           "type": "boolean"
         },
         "mode": {
-          "default": "",
           "description": "`CONSTELLATION_SNAPACCT`: \"auto\", \"on\" or \"off\".",
           "type": "string"
         },
         "passes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refresh_ms_last": {
-          "default": 0,
           "description": "The last live-tree refresh's duration.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refreshes_deferred": {
-          "default": 0,
           "description": "Live refreshes that found a newer commit this replica had not\napplied yet, and so kept the flags at the older one.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stalled_chains": {
-          "default": 0,
           "description": "Chains the last pass could not apply (an operation failed twice);\nabove zero, queries answer \"building\" until they can be.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "verify_mismatches": {
-          "default": 0,
           "description": "The last `--verify`'s mismatch count.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "mode",
+        "maintaining",
+        "building",
+        "build_progress_pct",
+        "indexed_chunks",
+        "index_bytes",
+        "as_of_seq",
+        "refresh_ms_last",
+        "verify_mismatches",
+        "stalled_chains",
+        "refreshes_deferred",
+        "live_rechecks",
+        "live_recheck_full",
+        "passes",
+        "errors"
+      ],
       "type": "object"
     },
     "SnapCountPoint": {
@@ -5915,11 +5913,9 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "canonical": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -5933,14 +5929,12 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "ok": {
           "type": "boolean"
         },
         "simulate_horizon_ms": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -5949,7 +5943,6 @@
           ]
         },
         "simulate_reached_ms": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -5958,11 +5951,9 @@
           ]
         },
         "simulate_truncated": {
-          "default": false,
           "type": "boolean"
         },
         "simulated_count": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -5971,7 +5962,6 @@
           ]
         },
         "steady_state_bound": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -5980,7 +5970,6 @@
           ]
         },
         "warnings": {
-          "default": [],
           "items": {
             "type": "string"
           },
@@ -5988,7 +5977,9 @@
         }
       },
       "required": [
-        "ok"
+        "ok",
+        "warnings",
+        "simulate_truncated"
       ],
       "type": "object"
     },
@@ -5999,7 +5990,6 @@
           "type": "string"
         },
         "creates_every": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6017,14 +6007,12 @@
           "type": "string"
         },
         "previous": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "warnings": {
-          "default": [],
           "items": {
             "type": "string"
           },
@@ -6052,6 +6040,7 @@
         "would_expire",
         "would_expire_ids",
         "grace_note",
+        "warnings",
         "written"
       ],
       "type": "object"
@@ -6120,14 +6109,12 @@
       "description": "`snapshot.policy.remove`'s answer. `root` is the directory as it is\nnow. `would_expire`/`would_expire_ids` are the root's unheld auto\nsnapshots (what `expire` deletes; 0 without `expire`), oldest first.\n`expired` are the ones deleted; `skipped` the ones that changed under\nthe call (held or gone meanwhile) and were kept; `error` is why the\ndeletion stopped early, if it did (the policy is removed regardless).\nAlso the `details` of the `conflict` refusal when `expire` was not\nconfirmed with the right count.",
       "properties": {
         "error": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "expired": {
-          "default": [],
           "items": {
             "type": "string"
           },
@@ -6137,7 +6124,6 @@
           "$ref": "#/$defs/SnapPolicyRoot"
         },
         "skipped": {
-          "default": [],
           "items": {
             "$ref": "#/$defs/SnapPolicySkipped"
           },
@@ -6149,7 +6135,6 @@
           "type": "integer"
         },
         "would_expire_ids": {
-          "default": [],
           "items": {
             "type": "string"
           },
@@ -6162,6 +6147,9 @@
       "required": [
         "root",
         "would_expire",
+        "would_expire_ids",
+        "expired",
+        "skipped",
         "written"
       ],
       "type": "object"
@@ -6170,13 +6158,11 @@
       "description": "A policy root (plan 32 Step 3.1) as `snapshot.policy.list/show/pause`\nreport it: a directory carrying `user.constellation.snapshots`, or an\norphaned stream — auto snapshots whose `policy_ino` carries no\nparseable policy (removed, or the directory is gone), which are never\nexpired automatically (Step 4.2).\n\n`ino` is the root's identity (a rename changes `path`, nothing else).\n`path` is where it is now, absent when the inode is no longer linked.\n`expr` is the xattr exactly as stored (empty for a removed policy),\n`canonical` its canonical form when it parses, `error` where it does\nnot. `auto_snapshots` counts every row with `origin=auto` and this\n`policy_ino`, held ones included; `orphaned` is set when there are\nsome and no parseable policy owns them.",
       "properties": {
         "auto_snapshots": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "canonical": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6190,8 +6176,7 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "expr": {
           "type": "string"
@@ -6202,24 +6187,24 @@
           "type": "integer"
         },
         "orphaned": {
-          "default": false,
           "type": "boolean"
         },
         "path": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "paused": {
-          "default": false,
           "type": "boolean"
         }
       },
       "required": [
         "ino",
-        "expr"
+        "expr",
+        "paused",
+        "auto_snapshots",
+        "orphaned"
       ],
       "type": "object"
     },
@@ -6266,8 +6251,7 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         }
       },
       "required": [
@@ -6320,14 +6304,12 @@
       "description": "Why retention keeps a snapshot, in the uniform four-key shape\n`constellation_meta::snapsched::Reason` serializes to: `kind` is\n`tier` (with `every`, e.g. `\"1h\"`), `last` (with `last`, the `n` of\n`last=n`), `held` (with `held_by`, the owner if recorded), `grace`, or\n`not_candidate` (manual, or another root's).",
       "properties": {
         "every": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "held_by": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6337,7 +6319,6 @@
           "type": "string"
         },
         "last": {
-          "default": null,
           "format": "uint32",
           "minimum": 0,
           "type": [
@@ -6416,7 +6397,6 @@
           "type": "integer"
         },
         "bucket_name": {
-          "default": null,
           "description": "The name the current bucket's snapshot has (or would have).",
           "type": [
             "string",
@@ -6424,7 +6404,6 @@
           ]
         },
         "canonical": {
-          "default": null,
           "description": "`None` when the policy does not parse.",
           "type": [
             "string",
@@ -6438,7 +6417,6 @@
           "type": "boolean"
         },
         "error": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6454,7 +6432,6 @@
           "type": "integer"
         },
         "last_created_unix_ms": {
-          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -6462,7 +6439,6 @@
           ]
         },
         "next_due_unix_ms": {
-          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -6470,7 +6446,6 @@
           ]
         },
         "path": {
-          "default": null,
           "description": "`None` when the directory is gone.",
           "type": [
             "string",
@@ -6517,7 +6492,6 @@
           "type": "boolean"
         },
         "error": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6527,7 +6501,6 @@
           "type": "boolean"
         },
         "refused": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6552,14 +6525,12 @@
       "description": "One due root, or one snapshot the expiry run handled, in a\n`snapshot.sched.run` result. For a creation `outcome` is\n`would_create` (dry run), `created`, `skipped_empty` (nothing under\nthe root changed since its newest snapshot), `already_exists` (the\nbucket's name was taken already — by an earlier leader, typically;\nsuccess), or `failed` (with `error`). For expiry (`name` and `id` the\nsnapshot's) it is `would_expire` (dry run), `expired`, or\n`skipped_reverify` (with why in `error`: held or gone meanwhile).",
       "properties": {
         "error": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "id": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6592,56 +6563,47 @@
       "description": "Snapshot-schedule counters (plan 32 Step 9), surfaced in\n`constellation status`, on the web UI, and in `/metrics`.\n\n`unparseable_roots`, `capped_roots` above zero, or a recent refusal\n(`refusing_recently`), mean snapshots are silently not being taken; `create_failed` climbing while\n`expired` stays at zero is the healthy outage signature (expiry\nanchors on the newest snapshot, so an outage freezes it).",
       "properties": {
         "budget_expired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "budget_stale": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "capped_roots": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "create_failed": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "created": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "expired": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "last_create_unix_ms": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "last_error": {
-          "default": null,
           "type": [
             "string",
             "null"
           ]
         },
         "last_parse_error": {
-          "default": null,
           "description": "The last policy a setxattr refused: `(expression, byte_offset,\nmessage)`.",
           "maxItems": 3,
           "minItems": 3,
@@ -6664,110 +6626,118 @@
           ]
         },
         "last_refused_unix_ms": {
-          "default": 0,
           "description": "When the scheduler last refused a tick (0 = never), and this node's\nclock when the status was read. `refused_*` are cumulative; the\nsilent-failure warning keys on this being recent instead.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "leader": {
-          "default": false,
           "description": "This node holds the scheduler's singleton lease.",
           "type": "boolean"
         },
         "lease_epoch": {
-          "default": 0,
           "description": "The `_snapsched` lease epoch this node last took or renewed (0 =\nnever). Two nodes reporting `leader` with the same epoch would be\ntwo leaders; a lower epoch is a predecessor that has not yet seen\nit was replaced.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "lease_until_unix_ms": {
-          "default": 0,
           "description": "While `leader`: when the lease lapses by this node's last renewal\n(Unix ms; `leader` turns false at it, a stalled leader included);\n0 otherwise.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "now_unix_ms": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "orphaned_snapshots": {
-          "default": 0,
           "description": "Auto snapshots whose root carries no parseable policy any more:\nkept, never expired automatically.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "paused_roots": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refused_lag": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refused_state": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "roots": {
-          "default": 0,
           "description": "Policy roots at the last tick, and of them the paused, the\nunparseable (skipped: nothing created, nothing expired) and the\ncapped ones (too many live auto snapshots to create more).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skipped_empty": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skipped_grace": {
-          "default": 0,
           "description": "Expiry victims kept by the grace window after a policy change.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "skipped_reverify": {
-          "default": 0,
           "description": "Expiry victims whose row changed before the delete (now held,\ngone, or re-owned), and so were not deleted.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "ticks": {
-          "default": 0,
           "description": "Scheduler ticks run on this node.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "unparseable_roots": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "ticks",
+        "leader",
+        "roots",
+        "paused_roots",
+        "unparseable_roots",
+        "capped_roots",
+        "orphaned_snapshots",
+        "created",
+        "skipped_empty",
+        "create_failed",
+        "expired",
+        "skipped_reverify",
+        "skipped_grace",
+        "budget_expired",
+        "budget_stale",
+        "refused_lag",
+        "refused_state",
+        "last_refused_unix_ms",
+        "now_unix_ms",
+        "last_create_unix_ms",
+        "lease_epoch",
+        "lease_until_unix_ms"
+      ],
       "type": "object"
     },
     "SnapTimeline": {
       "description": "`snapshot.policy.simulate`'s result: `constellation_meta::snapsched::\nTimeline`, field for field (its docs are the reference). The daemon's\nclock only places the synthetic future ticks; `now_unix_ms` says\nwhich instant that was.",
       "properties": {
         "cadence": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6820,7 +6790,6 @@
           "type": "array"
         },
         "steady_state_bound": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -6858,7 +6827,6 @@
           "type": "integer"
         },
         "expired_unix_ms": {
-          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -6866,7 +6834,6 @@
           ]
         },
         "expires_unix_ms": {
-          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -6877,7 +6844,6 @@
           "type": "boolean"
         },
         "held_by": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -6918,7 +6884,6 @@
           "type": "integer"
         },
         "expires_unix_ms": {
-          "default": null,
           "format": "int64",
           "type": [
             "integer",
@@ -6929,7 +6894,6 @@
           "type": "boolean"
         },
         "held_by": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -7197,7 +7161,6 @@
       "description": "One snapshot, as `snapshot.list`/`snapshot.create`/`snapshot.hold`\nreport it. Everything after `created_unix_ms` is plan 32 §0.4's row\nextension; a snapshot taken before it reports the defaults (`manual`,\nnot held, no owner, no size).",
       "properties": {
         "as_of_ms": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -7206,7 +7169,6 @@
           ]
         },
         "as_of_seq": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -7215,7 +7177,6 @@
           ]
         },
         "building_pct": {
-          "default": null,
           "description": "With `size_state: building`: the share of snapshot rows applied.",
           "format": "uint8",
           "maximum": 255,
@@ -7230,7 +7191,6 @@
           "type": "integer"
         },
         "creator": {
-          "default": 0,
           "description": "The node that took it; 0 = unknown.",
           "format": "uint64",
           "minimum": 0,
@@ -7245,12 +7205,10 @@
           ]
         },
         "held": {
-          "default": false,
           "description": "A retention hold: `snapshot.delete` refuses it without `force`,\nand plan 32's expiry never considers it.",
           "type": "boolean"
         },
         "held_by": {
-          "default": null,
           "description": "Who owns the hold: `user:<name>`, `csi:<VolumeSnapshotContent\nuid>`; absent for a plain hold with no recorded owner.",
           "type": [
             "string",
@@ -7271,7 +7229,6 @@
           ]
         },
         "lsize": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -7283,7 +7240,6 @@
           "type": "string"
         },
         "origin": {
-          "default": "",
           "description": "`manual` or `auto` (a snapshot policy's own).",
           "type": "string"
         },
@@ -7291,14 +7247,12 @@
           "type": "string"
         },
         "policy_ino": {
-          "default": 0,
           "description": "The directory inode carrying the owning policy; 0 for none.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "refer": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -7307,7 +7261,6 @@
           ]
         },
         "refer_bytes": {
-          "default": null,
           "description": "REFER: the subtree's logical size when the snapshot was taken —\nwhat restoring it needs (plan 37's CSI `size_bytes`). Absent when\nit was not available at creation.",
           "format": "uint64",
           "minimum": 0,
@@ -7320,7 +7273,6 @@
           "type": "string"
         },
         "seq": {
-          "default": null,
           "description": "The metadata commit the snapshot froze (its `root_hash`'s seq):\nwith `created_unix_ms`, the order of a chain (plan 32 §0.2).\nAbsent when the root does not parse.",
           "format": "uint64",
           "minimum": 0,
@@ -7338,11 +7290,9 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "Whether the sizes above are there: `ok`, `building` (the index\ndoes not match the snapshots yet; never a partial number) or `off`\n(`CONSTELLATION_SNAPACCT=off`). Absent when the caller did not ask\nfor sizes and the index had none ready."
         },
         "used": {
-          "default": null,
           "description": "Plan 32 §6.1's sizes, logical bytes, from this node's accounting\nindex, all \"as of\" the commit `as_of_seq` (`as_of_ms` when the\nindex last caught up): `USED` (chunks nothing else references,\nlive tree included), `WRITTEN` (new since the chain's previous\nsnapshot), `REFER` (the distinct chunks it references — exact, so\nunlike `refer_bytes` it is deduplicated), `LSIZE` (apparent size).\nPresent only with `size_state: ok`.",
           "format": "uint64",
           "minimum": 0,
@@ -7352,7 +7302,6 @@
           ]
         },
         "written": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -7366,7 +7315,11 @@
         "path",
         "name",
         "root_hash",
-        "created_unix_ms"
+        "created_unix_ms",
+        "origin",
+        "policy_ino",
+        "held",
+        "creator"
       ],
       "type": "object"
     },
@@ -7387,8 +7340,7 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "refused": {
           "items": {
@@ -7413,7 +7365,6 @@
     "SourceStatus": {
       "properties": {
         "aggregate_mbps_ewma": {
-          "default": null,
           "description": "Aggregate path throughput across concurrent streams (wall-clock).\nPrefer this over `goodput_mbps_ewma` when displaying \"S3 BW\" to operators.",
           "format": "double",
           "type": [
@@ -7422,13 +7373,11 @@
           ]
         },
         "err_rate": {
-          "default": 0.0,
           "description": "Hard negatives (transport/hash failures).",
           "format": "double",
           "type": "number"
         },
         "goodput_mbps_ewma": {
-          "default": null,
           "description": "Goodput EWMA from successful transfers only (per-stream body rate).",
           "format": "double",
           "type": [
@@ -7437,7 +7386,6 @@
           ]
         },
         "hit_rate": {
-          "default": 0.0,
           "description": "Successful fetches (EWMA complementary to miss/err).",
           "format": "double",
           "type": "number"
@@ -7446,24 +7394,20 @@
           "type": "string"
         },
         "miss_rate": {
-          "default": 0.0,
           "description": "Soft negatives (declines). Previously folded into `err_rate`.",
           "format": "double",
           "type": "number"
         },
         "ok_samples": {
-          "default": 0,
           "description": "Successful transfers contributing to lat/BW EWMAs.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "path": {
-          "default": "",
           "type": "string"
         },
         "transport_rtt_ms": {
-          "default": null,
           "format": "double",
           "type": [
             "number",
@@ -7471,7 +7415,6 @@
           ]
         },
         "ttfb_ms_ewma": {
-          "default": null,
           "description": "First-byte EWMA from successful transfers only.",
           "format": "double",
           "type": [
@@ -7481,7 +7424,12 @@
         }
       },
       "required": [
-        "id"
+        "id",
+        "hit_rate",
+        "miss_rate",
+        "err_rate",
+        "ok_samples",
+        "path"
       ],
       "type": "object"
     },
@@ -7526,14 +7474,12 @@
           "type": "boolean"
         },
         "building_pct": {
-          "default": 0,
           "format": "uint8",
           "maximum": 255,
           "minimum": 0,
           "type": "integer"
         },
         "estimate_pending": {
-          "default": false,
           "description": "A recheck of the live flags is pending a settled moment (the\nreplica never was at one commit's state): the \"shared with live\"\nand \"reclaimable\" figures are an estimate until it runs.",
           "type": "boolean"
         },
@@ -7550,7 +7496,6 @@
           "type": "integer"
         },
         "path": {
-          "default": null,
           "description": "The path asked about; absent for the whole filesystem.",
           "type": [
             "string",
@@ -7558,7 +7503,6 @@
           ]
         },
         "physical_estimate": {
-          "default": null,
           "description": "**Estimate**: `snapshots_total` in stored bytes (logical ×\n`physical_ratio`).",
           "format": "uint64",
           "minimum": 0,
@@ -7568,7 +7512,6 @@
           ]
         },
         "physical_ratio": {
-          "default": null,
           "description": "**Estimate**: stored bytes per logical byte (e.g. 0.61), from the\nlast GC round's census of `chunks/`; absent before any round wrote\none. Show physical figures derived from it with `≈`.",
           "format": "double",
           "type": [
@@ -7595,6 +7538,7 @@
       },
       "required": [
         "building",
+        "building_pct",
         "live_logical",
         "snapshots_total",
         "unique",
@@ -7603,7 +7547,8 @@
         "awaiting_gc",
         "gc_horizon_ms",
         "as_of_seq",
-        "as_of_ms"
+        "as_of_ms",
+        "estimate_pending"
       ],
       "type": "object"
     },
@@ -7653,94 +7598,95 @@
       "description": "Plan 30 §M3a: this node's speculation log (`constellation_meta::\nstore::spec`) — effects applied ahead of the durable log, and the\nstranded ops being replayed by rid.",
       "properties": {
         "copies_pending": {
-          "default": 0,
           "description": "Plan 30 §M4: refused replays whose `.constellation-conflict/` copy\ncould not be made yet (retried with backoff; later ops are not held\nup), and those failing for at least 10 s — a stall worth looking\nat (the node then also asks for the lease to make them locally).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "copies_stalled": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "depositions": {
-          "default": 0,
           "description": "Plan 30 §M3b: deposition recoveries run (rollback plus replay, or\nthe capture-off rebuild), since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "epoch_markers": {
-          "default": 0,
           "description": "Plan 30 §M3b: epoch-marker segments this node shipped right after a\ntakeover, since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "gate_pending": {
-          "default": false,
           "description": "Plan 30 §M3b: this node holds the lease but its takeover gate has\nnot completed (a marker or a local replay failed); new mutations are\nrefused until a sync round completes it.",
           "type": "boolean"
         },
         "local": {
-          "default": 0,
           "description": "Plan 30 §M3b: this node's own journaled transactions captured as\nspeculation and not yet shipped (a holder's unshipped journal).\nUnlike `outstanding`, these do not stop a publish: the publisher\nsubstitutes their before-images.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "local_rolled_back": {
-          "default": 0,
           "description": "Plan 30 §M3b: this node's own unshipped transactions rolled back\nbecause it was deposed (and queued for replay by rid), since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "outstanding": {
-          "default": 0,
           "description": "Outstanding shadows (accepted forwarded ops) and `Exists` hints not\nyet confirmed by the log. While non-zero this node does not publish\ncommits.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "pending_replay": {
-          "default": 0,
           "description": "Stranded ops queued for replay by rid.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "replay_conflicts": {
-          "default": 0,
           "description": "Stranded ops whose replay was refused and materialized as a\n`.constellation-conflict/` copy, since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "rolled_back": {
-          "default": 0,
           "description": "Speculative entries rolled back because a later epoch stranded\nthem, since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "stranded_replayed": {
-          "default": 0,
           "description": "Stranded ops replayed by rid and accepted, since start.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "outstanding",
+        "pending_replay",
+        "rolled_back",
+        "stranded_replayed",
+        "replay_conflicts",
+        "local",
+        "local_rolled_back",
+        "depositions",
+        "epoch_markers",
+        "gate_pending",
+        "copies_pending",
+        "copies_stalled"
+      ],
       "type": "object"
     },
     "SpoolStatus": {
       "description": "Spool observability (DESIGN.md §12): outstanding unflushed metadata.",
       "properties": {
         "conflicts": {
-          "default": 0,
           "description": "Foreign records skipped because a pending local op won (phase 2\nleaseless conflict detection).",
           "format": "uint64",
           "minimum": 0,
@@ -7766,14 +7712,12 @@
           ]
         },
         "ship_rounds_cancelled": {
-          "default": 0,
           "description": "Rounds dropped mid-flight for a request that still cancels one\n(plan 30 M2b: `Mutate`/`Forward` no longer do — see\n`shipper::SpoolInfo`'s doc).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "ship_rounds_completed": {
-          "default": 0,
           "description": "`run_managed_sync_round` invocations that ran to completion (plan\n30 M2b measurement counter — see `shipper::SpoolInfo`'s doc).",
           "format": "uint64",
           "minimum": 0,
@@ -7782,7 +7726,10 @@
       },
       "required": [
         "journal_backlog",
-        "head_seq"
+        "head_seq",
+        "conflicts",
+        "ship_rounds_completed",
+        "ship_rounds_cancelled"
       ],
       "type": "object"
     },
@@ -7794,7 +7741,6 @@
           "type": "integer"
         },
         "blocking": {
-          "default": false,
           "description": "A blocking lock request: unbounded by design, not a stall.",
           "type": "boolean"
         },
@@ -7822,7 +7768,8 @@
         "ino",
         "age_s",
         "stage",
-        "tid"
+        "tid",
+        "blocking"
       ],
       "type": "object"
     },
@@ -7874,65 +7821,10 @@
       "properties": {
         "ack": {
           "$ref": "#/$defs/AckStatus",
-          "default": {
-            "ack_floor_waits": 0,
-            "ack_s3": false,
-            "ack_wait_ms_total": 0,
-            "acks_aborted": 0,
-            "acks_waited": 0,
-            "awaited_log": 0,
-            "awaited_log_streamed": 0,
-            "awaited_log_streamed_deleg": 0,
-            "backing_acked": 0,
-            "backing_epoch": 0,
-            "backing_holder": 0,
-            "backup_ack_timeouts": 0,
-            "backup_acks": 0,
-            "backup_appends": 0,
-            "backup_persisted": 0,
-            "backup_tail_applied": 0,
-            "backup_takeovers": 0,
-            "backups": [],
-            "backups_added": 0,
-            "backups_removed": 0,
-            "candidate": null,
-            "config_version": 0,
-            "dead_root_acquires": 0,
-            "durable": 0,
-            "epoch_carry_refused": 0,
-            "gated": false,
-            "held_for_upload": 0,
-            "own_record_uploads": 0,
-            "own_rows_excused": 0,
-            "parked_acks": 0,
-            "policy": "",
-            "reads_durability_blocked": 0,
-            "reconfig_cas": 0,
-            "refusals_journaled": 0,
-            "s3_fast_takeovers": 0,
-            "sealed_epoch": 0,
-            "seals": 0,
-            "stale_liveness_refusals": 0,
-            "streamed_ahead": 0,
-            "streamed_dropped": 0,
-            "streamed_installed": 0,
-            "unacked_replays_refused": 0
-          },
           "description": "Plan 30 §M9: acknowledgement policy, backups, seals."
         },
         "atime": {
           "$ref": "#/$defs/AtimeStatus",
-          "default": {
-            "applied": 0,
-            "coalesced": 0,
-            "dropped_cap": 0,
-            "forward_err": 0,
-            "forward_ok": 0,
-            "local_only": 0,
-            "mode": "",
-            "queued": 0,
-            "skew_clamped": 0
-          },
           "description": "Read-time atime (plan 20). Default (`off`) leaves every counter\nzero and `mode` \"off\"."
         },
         "backend": {
@@ -7943,136 +7835,17 @@
         },
         "coop": {
           "$ref": "#/$defs/CoopStatus",
-          "default": {
-            "bytes_served_to_peers": 0,
-            "digest_bytes_received": 0,
-            "digest_bytes_sent": 0,
-            "digest_capacity_exceeded": false,
-            "digest_cpu_us": 0,
-            "digest_messages": 0,
-            "digest_mode": "",
-            "digest_rebuilds": 0,
-            "epoch_member_fetches": 0,
-            "fresh_hint_hits": 0,
-            "fresh_hint_misses": 0,
-            "hedges_fired": 0,
-            "local_set_entries": 0,
-            "peer_errors": 0,
-            "peer_false_positives": 0,
-            "peer_hits": 0,
-            "peer_misses": 0,
-            "peer_set_bytes": 0,
-            "peer_set_entries": 0,
-            "peer_stale_misses": 0,
-            "per_source": [],
-            "reconcile_cpu_us": 0,
-            "reconcile_failures": 0,
-            "reconcile_rounds": 0,
-            "reconcile_sessions": 0,
-            "s3_fetches": 0,
-            "stale_digests_pruned": 0
-          },
           "description": "Cooperative cache (phase 5, DESIGN.md §7)."
         },
         "cto": {
           "$ref": "#/$defs/CtoStatus",
-          "default": {
-            "degraded": 0,
-            "delegation_local": 0,
-            "delegations_held": 0,
-            "delegations_installed": 0,
-            "delegations_raced": 0,
-            "fuse_recall_wait_ms_total": 0,
-            "fuse_writes_recalled": 0,
-            "grants": 0,
-            "grants_enabled": false,
-            "held_replies": 0,
-            "held_retries": 0,
-            "holder_local": 0,
-            "live_grants": 0,
-            "parked_acks": 0,
-            "read_index": 0,
-            "read_index_ms": [],
-            "read_index_ms_total": 0,
-            "read_index_refused": 0,
-            "read_index_served": 0,
-            "recall_wait_ms_total": 0,
-            "recall_waits": 0,
-            "recalled": 0,
-            "recalls_acked": 0,
-            "recalls_expired": 0,
-            "recalls_in_flight": 0,
-            "recalls_sent": 0,
-            "renewals": 0,
-            "s3_tail": 0,
-            "strict": false,
-            "strict_reads": 0
-          },
           "description": "Plan 30 §M8: `cto=strict` and read delegations."
         },
         "delegation": {
           "$ref": "#/$defs/DelegationReport",
-          "default": {
-            "acks_parked": 0,
-            "appended_txs": 0,
-            "backup_acks": 0,
-            "backup_appends": 0,
-            "backup_persisted": 0,
-            "backup_seals": 0,
-            "backups": [],
-            "cross_subtree": 0,
-            "delegated": 0,
-            "deps_overflow_to_root": 0,
-            "deps_unsatisfied_at_append": 0,
-            "deps_waits": 0,
-            "designated": 0,
-            "enabled": false,
-            "ended": 0,
-            "exec_parked": 0,
-            "executed": 0,
-            "fast_path_executed": 0,
-            "fast_path_routed": 0,
-            "forwarded_to_delegate": 0,
-            "gens": [],
-            "inherited": 0,
-            "installed": 0,
-            "kinds": [],
-            "lapsed": 0,
-            "mine": [],
-            "not_owner": 0,
-            "parked_expired": 0,
-            "place_delegated": 0,
-            "place_evaluations": 0,
-            "place_range_recalls": 0,
-            "place_recalled": 0,
-            "place_skipped_cooldown": 0,
-            "place_skipped_unreachable": 0,
-            "place_splits": 0,
-            "placement": [],
-            "read_grants": 0,
-            "read_index_served": 0,
-            "recalls_drained": 0,
-            "recalls_expired": 0,
-            "recalls_received": 0,
-            "recalls_sent": 0,
-            "reclaimed": 0,
-            "redelegated": 0,
-            "refused_designated": 0,
-            "renewals": 0,
-            "renewals_refused": 0,
-            "restreams": 0,
-            "sealed_drained": 0,
-            "seals_sent": 0,
-            "stranded": 0,
-            "stream_refusals": 0,
-            "stream_refused": 0,
-            "streamed_txs": 0,
-            "table": []
-          },
           "description": "Plan 30 §M11."
         },
         "designations": {
-          "default": [],
           "description": "Live offline designations visible to this node (phase 4a,\nDESIGN.md §5.2). Replicated via S3, so every node's view should\nagree modulo the periodic refresh lag.",
           "items": {
             "$ref": "#/$defs/DesignationStatus"
@@ -8080,51 +7853,26 @@
           "type": "array"
         },
         "enrolled": {
-          "default": true,
           "description": "Whether this node's registry record is present and not retired.\nFalse after a successful `leave`, or when an admin retired us.",
           "type": "boolean"
         },
         "epoch": {
           "$ref": "#/$defs/EpochStatus",
-          "default": {
-            "active": false,
-            "carrier": null,
-            "epoch_id": null,
-            "epoch_slack": 0,
-            "forwards_streamed": 0,
-            "handoffs_behind": 0,
-            "members": [],
-            "own_s3_outage": false,
-            "promise_checks": 0,
-            "promise_flush_exempt": 0,
-            "promise_puts": 0,
-            "promise_requests_answered": 0,
-            "promise_requests_refused": 0,
-            "promise_until_ms": 0,
-            "proposals": 0,
-            "stale_claims": 0,
-            "streamed_ahead": 0,
-            "streamed_installed": 0,
-            "takeovers_refused_promises": 0
-          },
           "description": "Continuation epoch (phase 4b, DESIGN.md §5.3)."
         },
         "forward_dedup_hits": {
-          "default": 0,
           "description": "Plan 30 §M2: forwarded requests the holder answered from\n`recent`/`completed` instead of re-executing (a retried rid).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forward_indoubt_resolved": {
-          "default": 0,
           "description": "Plan 30 §M2: in-doubt ops the lease-path resolved against\n`completed` instead of re-executing (a genuine takeover finding\nthe op already happened).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forward_p50_ms": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -8133,20 +7881,17 @@
           ]
         },
         "forward_retries": {
-          "default": 0,
           "description": "Plan 30 §M2: same-rid forward retries this node's requester side\nmade (same holder, or a redirected one) before falling back to\nthe lease-acquisition path.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forwarded_err": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "forwarded_ok": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -8156,206 +7901,45 @@
         },
         "fsync": {
           "$ref": "#/$defs/FsyncStatus",
-          "default": {
-            "interrupted": 0,
-            "kernel_cap_ms": 0,
-            "longest_wait_ms": 0,
-            "max_wait_ms": 0,
-            "mode": "",
-            "permanent_errors": 0,
-            "retries": 0,
-            "timeout_ms": 0,
-            "timeouts": 0,
-            "waited": 0,
-            "waiting": 0
-          },
           "description": "Plan 39: `fsync`s waiting out an unreachable S3, and how they ended."
         },
         "fuse": {
           "$ref": "#/$defs/FuseStatus",
-          "default": {
-            "lock_wait_downgrades_total": 0,
-            "mounts": [],
-            "transport_fallbacks": [],
-            "zero_copy_reads_total": 0
-          },
           "description": "Plan 38 §5: the FUSE read-path transport, per mount and\nprocess-wide."
         },
         "fuse_requests": {
           "$ref": "#/$defs/FuseRequestsStatus",
-          "default": {
-            "in_flight": 0,
-            "oldest_s": 0,
-            "stall_threshold_s": 0,
-            "stalled": 0,
-            "stalled_completed": 0,
-            "stalled_requests": [],
-            "stalled_total": 0
-          },
           "description": "The FUSE request watchdog (EC2 campaign 7 B-2)."
         },
         "handover": {
           "$ref": "#/$defs/HandoverStatus",
-          "default": {
-            "generation": 0,
-            "last_error": null,
-            "pid": 0,
-            "upgrading": false
-          },
           "description": "Plan 31 C4b. First, as it was in the retired `crates/api` report:\n`constellation status` prints this struct, field order included."
         },
         "held": {
           "$ref": "#/$defs/HeldStatus",
-          "default": {
-            "deferred": 0,
-            "inodes": [],
-            "oldest_seq": null,
-            "opaque": false,
-            "records": 0,
-            "remote": [],
-            "transactions": 0
-          },
           "description": "Plan 30 §M4: journal records held back behind unrecoverable\npending chunks (everything else keeps shipping)."
         },
         "inbox": {
           "$ref": "#/$defs/InboxStatus",
-          "default": {
-            "avg_batch_ops": 0.0,
-            "avg_execute_ms": 0.0,
-            "avg_outcome_wait_ms": 0.0,
-            "avg_pickup_ms": 0.0,
-            "avg_queue_wait_ms": 0.0,
-            "avg_round_trip_ms": 0.0,
-            "deduped_ops": 0,
-            "drained_batches": 0,
-            "drained_ops": 0,
-            "enabled": false,
-            "escalated": false,
-            "escalations": 0,
-            "executed_ops": 0,
-            "gc_deleted": 0,
-            "inbox_ops": 0,
-            "largest_batch_ops": 0,
-            "lease_requests": 0,
-            "leases_kept_for_p2p_side": 0,
-            "local_ops": 0,
-            "next_n": 0,
-            "pending_ops": 0,
-            "poll_hits": 0,
-            "polls": 0,
-            "refused_ops": 0,
-            "resubmitted_ops": 0,
-            "roster": [],
-            "submitted_batches": 0,
-            "submitted_ops": 0,
-            "tombstones_read": 0,
-            "tracked_requesters": 0,
-            "unavailable": 0,
-            "withdrawn_ops": 0
-          },
           "description": "Plan 30 §M13: the S3 inbox (forwarding without P2P)."
         },
         "lease": {
           "$ref": "#/$defs/LeaseStatus",
-          "default": {
-            "epoch": 0,
-            "expires_in_ms": 0,
-            "held": false,
-            "holder": 0,
-            "lost": false
-          },
           "description": "Write authority for the one metadata stream (`p0`)."
         },
         "lifecycle": {
           "$ref": "#/$defs/LifecycleStatus",
-          "default": {
-            "background_paused": false,
-            "events": 0,
-            "forward_only": false,
-            "last_event": null,
-            "last_resume": null,
-            "last_suspend": null,
-            "low_power": false,
-            "network_metered": false,
-            "network_reachable": false,
-            "p2p_accepts_inbound": false,
-            "p2p_gossip": false,
-            "profile": {},
-            "state": "",
-            "suspended": false,
-            "upload_deferrals": 0,
-            "uploads_held": false
-          },
           "description": "Plan 31 C8: the engine profile and the host's lifecycle."
         },
         "locks": {
           "$ref": "#/$defs/LockStatus",
-          "default": {
-            "fenced_io": 0,
-            "first_use_abandoned": 0,
-            "grace_refusals": 0,
-            "grant_ms": [],
-            "grant_ms_total": 0,
-            "grant_wait_ms_total": 0,
-            "granted": 0,
-            "grants_degraded": 0,
-            "grants_held": 0,
-            "grants_made": 0,
-            "grants_table": 0,
-            "grants_waited": 0,
-            "local_conflicts": 0,
-            "local_hits": 0,
-            "lost": 0,
-            "mode": "",
-            "owner_fenced_ops": 0,
-            "owners_fenced": 0,
-            "recalled": 0,
-            "recalled_busy": 0,
-            "recalls_expired": 0,
-            "recalls_in_flight": 0,
-            "recalls_released": 0,
-            "recalls_sent": 0,
-            "reclaimed": 0,
-            "released": 0,
-            "released_superseded": 0,
-            "renewals": 0,
-            "requests": 0,
-            "requests_in_flight": 0,
-            "requeued_in_place": 0,
-            "unavailable": 0,
-            "waiters": 0,
-            "waiters_parked": 0,
-            "would_block": 0
-          },
           "description": "Plan 30 §M14: `--locks` and cross-node lock grants."
         },
         "log_stream": {
           "$ref": "#/$defs/LogStreamStatus",
-          "default": {
-            "applied": 0,
-            "buffered": 0,
-            "declined": 0,
-            "duplicates": 0,
-            "enabled": false,
-            "ended": 0,
-            "frames_sent": 0,
-            "gaps": 0,
-            "live": false,
-            "lost": 0,
-            "overflows": 0,
-            "refused": 0,
-            "served": 0,
-            "serving": 0,
-            "subscribers_dropped": 0,
-            "subscribes": 0,
-            "tail_skips": 0,
-            "timeouts": 0,
-            "upstream": 0
-          },
           "description": "Plan 30 §M7: the direct log stream (this node's subscription to\nthe holder, or the subscribers it serves as the holder)."
         },
         "mounts": {
-          "default": [],
           "description": "Every view this daemon currently has mounted (plan 21, step 1).\nWas a single `mountpoint: String` field; a daemon serves exactly\none view in every release before this one, so old single-view\nclients should read `mounts[0].mountpoint` if they need the\nscalar back, but the struct field itself is gone — multi-view is\nthe whole point of this change and there is no sane single value\nto keep reporting once more than one view is live.",
           "items": {
             "$ref": "#/$defs/MountInfo"
@@ -8363,7 +7947,6 @@
           "type": "array"
         },
         "node_id": {
-          "default": 0,
           "description": "This node's cluster-unique id (scopes ino allocation, marks log\nsegment origin).",
           "format": "uint64",
           "minimum": 0,
@@ -8371,30 +7954,13 @@
         },
         "own_s3": {
           "$ref": "#/$defs/OwnS3Status",
-          "default": {
-            "deadlines": 0,
-            "forwards": 0,
-            "peers_reach_s3": null,
-            "readopted_for_forward": 0,
-            "retries": 0,
-            "stalled": false,
-            "stalled_for_ms": null
-          },
           "description": "EC2 campaign 8 A-1: this node's own S3 path, and what its ops did\nwithout it."
         },
         "p2p": {
           "$ref": "#/$defs/P2pStatus",
-          "default": {
-            "dial_stalled": false,
-            "enabled": false,
-            "node_addr": null,
-            "peers": [],
-            "relay": ""
-          },
           "description": "P2P fast path (M3.3). `enabled: false` on daemons without it, or\nwhen `CONSTELLATION_P2P=off`."
         },
         "pins": {
-          "default": [],
           "description": "Locally pinned subtrees (phase 4a). Node-local, not replicated.",
           "items": {
             "$ref": "#/$defs/PinStatus"
@@ -8402,7 +7968,6 @@
           "type": "array"
         },
         "placement_reason": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -8410,166 +7975,38 @@
         },
         "prefetch": {
           "$ref": "#/$defs/PrefetchStatus",
-          "default": {
-            "abandoned": 0,
-            "abandoned_chunks": 0,
-            "gate_target": 0,
-            "inflight": 0,
-            "queued": 0,
-            "scan_ahead_bytes": 0,
-            "scan_ahead_files": 0,
-            "stalls": 0,
-            "streams": 0,
-            "window_bytes": 0
-          },
           "description": "Adaptive sequential and directory readahead."
         },
         "prune": {
           "$ref": "#/$defs/PruneStatus",
-          "default": {
-            "armed_roots": 0,
-            "bytes_deleted": 0,
-            "bytes_freed": 0,
-            "deleted": 0,
-            "entries_examined": 0,
-            "inert_roots": 0,
-            "last_parse_error": null,
-            "last_run_unix_ms": 0,
-            "leases_acquired": 0,
-            "refused_lag": 0,
-            "roots": 0,
-            "runs": 0,
-            "selected": 0,
-            "skipped_forward_err": 0,
-            "skipped_hardlink": 0,
-            "skipped_repartition": 0,
-            "skipped_reverify": 0,
-            "unparseable_roots": 0
-          },
           "description": "Retention pruning (plan 22). Default (no marked roots) leaves\nevery counter zero."
         },
         "quota": {
           "$ref": "#/$defs/QuotaStatus",
-          "default": {
-            "max_bytes": null,
-            "used_bytes": 0
-          },
           "description": "Optional cluster-wide logical byte cap and current used bytes."
         },
         "reintegration": {
           "$ref": "#/$defs/ReintegrationStatus",
-          "default": {
-            "conflicts_materialized": 0,
-            "in_progress": false,
-            "stranded_records": 0
-          },
           "description": "Stranded-journal reintegration (phase 4b)."
         },
         "s3": {
           "$ref": "#/$defs/S3RequestStatus",
-          "default": {
-            "by_area": {},
-            "copy": 0,
-            "delete": 0,
-            "get": 0,
-            "head": 0,
-            "last_answered_unix_ms": 0,
-            "last_unanswered_error": null,
-            "last_unanswered_unix_ms": 0,
-            "list": 0,
-            "put": 0,
-            "unanswered": 0
-          },
           "description": "Object-store requests this daemon has issued since it started\n(every filesystem it serves), by kind and by key area."
         },
         "session": {
           "$ref": "#/$defs/SessionStatus",
-          "default": {
-            "abandoned": 0,
-            "budget_ms": 0,
-            "covered": 0,
-            "degraded_held": 0,
-            "fast": 0,
-            "raised": 0,
-            "reads": 0,
-            "replay_blocked": 0,
-            "timeouts": 0,
-            "voided_ended": 0,
-            "wait_ms_total": 0,
-            "waited": 0,
-            "waits_ms": [],
-            "watermark_ttl_ms": 0
-          },
           "description": "Plan 30 §M6: the session wait on local reads (read-your-writes,\nmonotonic reads) and its latency distribution."
         },
         "snapacct": {
           "$ref": "#/$defs/SnapAcctStatus",
-          "default": {
-            "as_of_seq": 0,
-            "build_progress_pct": 0,
-            "building": false,
-            "errors": 0,
-            "index_bytes": 0,
-            "indexed_chunks": 0,
-            "last_error": null,
-            "live_recheck_full": false,
-            "live_rechecks": 0,
-            "maintaining": false,
-            "mode": "",
-            "passes": 0,
-            "refresh_ms_last": 0,
-            "refreshes_deferred": 0,
-            "stalled_chains": 0,
-            "verify_mismatches": 0
-          },
           "description": "Plan 32 §6.3/Step 9: the space-accounting index. Default (`auto`,\nnever asked) leaves everything zero and `maintaining` false."
         },
         "snapsched": {
           "$ref": "#/$defs/SnapSchedStatus",
-          "default": {
-            "budget_expired": 0,
-            "budget_stale": 0,
-            "capped_roots": 0,
-            "create_failed": 0,
-            "created": 0,
-            "expired": 0,
-            "last_create_unix_ms": 0,
-            "last_error": null,
-            "last_parse_error": null,
-            "last_refused_unix_ms": 0,
-            "leader": false,
-            "lease_epoch": 0,
-            "lease_until_unix_ms": 0,
-            "now_unix_ms": 0,
-            "orphaned_snapshots": 0,
-            "paused_roots": 0,
-            "refused_lag": 0,
-            "refused_state": 0,
-            "roots": 0,
-            "skipped_empty": 0,
-            "skipped_grace": 0,
-            "skipped_reverify": 0,
-            "ticks": 0,
-            "unparseable_roots": 0
-          },
           "description": "Automatic snapshot schedules (plan 32 Step 9). Every counter the\nplan names is present from M2 on; they stay zero until the\nscheduler (M3) and expiry (M4) run."
         },
         "speculation": {
           "$ref": "#/$defs/SpeculationStatus",
-          "default": {
-            "copies_pending": 0,
-            "copies_stalled": 0,
-            "depositions": 0,
-            "epoch_markers": 0,
-            "gate_pending": false,
-            "local": 0,
-            "local_rolled_back": 0,
-            "outstanding": 0,
-            "pending_replay": 0,
-            "replay_conflicts": 0,
-            "rolled_back": 0,
-            "stranded_replayed": 0
-          },
           "description": "Plan 30 §M3a speculation log and stranded-op recovery."
         },
         "spool": {
@@ -8581,47 +8018,64 @@
           "type": "integer"
         },
         "version": {
-          "default": "",
           "description": "Running binary version (`git describe` / package version).",
           "type": "string"
         },
         "vfs_ops": {
           "$ref": "#/$defs/VfsOpsStatus",
-          "default": {
-            "bucket_bounds_s": [],
-            "series": []
-          },
           "description": "The unified op metrics (plan 31 §6.10) `/metrics` exports as\n`constellation_vfs_ops_total` and `constellation_vfs_op_seconds`."
         },
         "writeback": {
           "$ref": "#/$defs/WritebackStatus",
-          "default": {
-            "dirty_bytes": 0,
-            "existence_bloom_hits": 0,
-            "existence_chunk_ref_hits": 0,
-            "existence_misses": 0,
-            "existence_peer_hints": 0,
-            "handoff_chunks": 0,
-            "handoff_chunks_accepted": 0,
-            "handoffs_ok": 0,
-            "handoffs_sent": 0,
-            "mode": "",
-            "pending_uploads": 0,
-            "remote_chunks_awaited": 0,
-            "remote_chunks_oldest_s": 0,
-            "remote_probe_enabled": false,
-            "remote_probe_hit_rate": 0.0,
-            "upload_concurrency": 0
-          },
           "description": "Phase 5b write-back queue and adaptive upload policy."
         }
       },
       "required": [
+        "handover",
         "fs_uuid",
         "backend",
+        "mounts",
+        "node_id",
+        "version",
+        "enrolled",
         "uptime_s",
         "spool",
-        "cache"
+        "cache",
+        "lease",
+        "p2p",
+        "pins",
+        "designations",
+        "delegation",
+        "epoch",
+        "reintegration",
+        "speculation",
+        "held",
+        "session",
+        "cto",
+        "locks",
+        "ack",
+        "coop",
+        "prefetch",
+        "writeback",
+        "fsync",
+        "forwarded_ok",
+        "forwarded_err",
+        "log_stream",
+        "forward_dedup_hits",
+        "forward_retries",
+        "forward_indoubt_resolved",
+        "own_s3",
+        "inbox",
+        "quota",
+        "atime",
+        "prune",
+        "snapsched",
+        "snapacct",
+        "fuse_requests",
+        "lifecycle",
+        "s3",
+        "vfs_ops",
+        "fuse"
       ],
       "type": "object"
     },
@@ -8661,7 +8115,6 @@
           "type": "integer"
         },
         "flush_error": {
-          "default": null,
           "type": [
             "string",
             "null"
@@ -8693,7 +8146,6 @@
           "type": "integer"
         },
         "view_errors": {
-          "default": [],
           "items": {
             "type": "string"
           },
@@ -8721,6 +8173,7 @@
         "within_deadline",
         "views",
         "views_synced",
+        "view_errors",
         "flushed",
         "lease_released",
         "journal_backlog",
@@ -8783,7 +8236,6 @@
       "description": "One (frontend, view, transport, op) of [`VfsOpsStatus`].",
       "properties": {
         "buckets": {
-          "default": [],
           "description": "Ops per latency bucket (not cumulative): one more than\n`bucket_bounds_s`, the last being `+Inf`.",
           "items": {
             "format": "uint64",
@@ -8804,12 +8256,10 @@
             "minimum": 0,
             "type": "integer"
           },
-          "default": {},
           "description": "Ops per outcome: `ok`, or a `Code` name (`NotFound`, ...).",
           "type": "object"
         },
         "sum_ns": {
-          "default": 0,
           "description": "The latencies' sum, nanoseconds.",
           "format": "uint64",
           "minimum": 0,
@@ -8820,7 +8270,6 @@
           "type": "string"
         },
         "view": {
-          "default": null,
           "description": "The view's allowlisted metric label; absent for a view with none.",
           "type": [
             "string",
@@ -8831,7 +8280,10 @@
       "required": [
         "frontend",
         "transport",
-        "op"
+        "op",
+        "outcomes",
+        "buckets",
+        "sum_ns"
       ],
       "type": "object"
     },
@@ -8839,7 +8291,6 @@
       "description": "Every frontend op counted so far, per (frontend, view, transport, op):\nthe numbers behind\n`constellation_vfs_ops_total{frontend,view,op,outcome,transport}` and the\n`constellation_vfs_op_seconds{frontend,view,op,transport}` histogram. Only series\nwith something counted are present; `view` is the allowlisted metric\nlabel of a view (plan 31 §9.10), never its full label map.",
       "properties": {
         "bucket_bounds_s": {
-          "default": [],
           "description": "The histogram's bucket upper bounds, seconds, ascending; each\nseries' last bucket is `+Inf`.",
           "items": {
             "format": "double",
@@ -8848,20 +8299,22 @@
           "type": "array"
         },
         "series": {
-          "default": [],
           "items": {
             "$ref": "#/$defs/VfsOpSeries"
           },
           "type": "array"
         }
       },
+      "required": [
+        "bucket_bounds_s",
+        "series"
+      ],
       "type": "object"
     },
     "ViewInfo": {
       "description": "One mounted view with its labels (`view.list` rows). The old\n`MountInfo` plus the §9.10 additions.",
       "properties": {
         "confine_links": {
-          "default": false,
           "type": "boolean"
         },
         "id": {
@@ -8873,7 +8326,6 @@
           "additionalProperties": {
             "type": "string"
           },
-          "default": {},
           "type": "object"
         },
         "mounted_ms_ago": {
@@ -8885,11 +8337,7 @@
           "type": "string"
         },
         "qos": {
-          "$ref": "#/$defs/ViewQos",
-          "default": {
-            "max_inflight_ops": null,
-            "max_staging_bytes": null
-          }
+          "$ref": "#/$defs/ViewQos"
         },
         "subtree": {
           "type": "string"
@@ -8899,7 +8347,10 @@
         "id",
         "subtree",
         "mountpoint",
-        "mounted_ms_ago"
+        "mounted_ms_ago",
+        "labels",
+        "qos",
+        "confine_links"
       ],
       "type": "object"
     },
@@ -8980,7 +8431,6 @@
           "additionalProperties": {
             "type": "string"
           },
-          "default": {},
           "description": "The view's full label map (`view.list`'s).",
           "type": "object"
         },
@@ -8995,7 +8445,6 @@
           "type": "integer"
         },
         "view": {
-          "default": null,
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -9005,6 +8454,7 @@
         }
       },
       "required": [
+        "labels",
         "in_flight",
         "stalled",
         "oldest_s"
@@ -9195,101 +8645,103 @@
     "WritebackStatus": {
       "properties": {
         "dirty_bytes": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "existence_bloom_hits": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "existence_chunk_ref_hits": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "existence_misses": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "existence_peer_hints": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "handoff_chunks": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "handoff_chunks_accepted": {
-          "default": 0,
           "description": "Chunks this node fetched from a peer and uploaded for it.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "handoffs_ok": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "handoffs_sent": {
-          "default": 0,
           "description": "EC2 finding 1: drains that handed their chunks to a peer because\nthis node's own uploads made no progress (this node's S3 path\nwas down), how many succeeded, and the chunks they covered.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "mode": {
-          "default": "",
           "type": "string"
         },
         "pending_uploads": {
-          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "remote_chunks_awaited": {
-          "default": 0,
           "description": "Pending rows for chunks other nodes forwarded in a manifest while\nthey were still uploading there (`--write-mode back` on a\nnon-owner): what this node's ship waits for their reports on.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "remote_chunks_oldest_s": {
-          "default": 0,
           "description": "The oldest of them, in seconds (0: none).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "remote_probe_enabled": {
-          "default": false,
           "type": "boolean"
         },
         "remote_probe_hit_rate": {
-          "default": 0.0,
           "format": "double",
           "type": "number"
         },
         "upload_concurrency": {
-          "default": 0,
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         }
       },
+      "required": [
+        "mode",
+        "dirty_bytes",
+        "pending_uploads",
+        "upload_concurrency",
+        "remote_probe_enabled",
+        "remote_probe_hit_rate",
+        "existence_bloom_hits",
+        "existence_chunk_ref_hits",
+        "existence_misses",
+        "existence_peer_hints",
+        "remote_chunks_awaited",
+        "remote_chunks_oldest_s",
+        "handoffs_sent",
+        "handoffs_ok",
+        "handoff_chunks",
+        "handoff_chunks_accepted"
+      ],
       "type": "object"
     },
     "XattrOp": {
@@ -9387,7 +8839,6 @@
       "description": "`browse.xattr`'s result: `value` for `Get`, `names` for `List`, both\nempty for `Set`/`Remove`.",
       "properties": {
         "names": {
-          "default": [],
           "items": {
             "type": "string"
           },
@@ -9401,10 +8852,12 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         }
       },
+      "required": [
+        "names"
+      ],
       "type": "object"
     }
   },

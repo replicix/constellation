@@ -188,7 +188,6 @@ pub struct Position {
     pub pending: Option<JournalPos>,
     /// Plan 30 §M11: plus, per delegation stream, what it held ahead of
     /// the log (see [`Streams`]).
-    #[serde(default)]
     pub streams: Streams,
 }
 
@@ -425,14 +424,11 @@ pub struct SessionStats {
     /// unreached, and stream dependencies voided because the persisted
     /// delegation table showed their generation ended (module doc, "A
     /// watermark nobody reaches").
-    #[serde(default)]
     pub abandoned: u64,
-    #[serde(default)]
     pub voided_ended: u64,
     /// Plan 30 §M9: reads on a holder under a `Backup`/`S3` acknowledgement
     /// policy whose wait began because the unshipped journal touched their
     /// keys and was not yet durable (on every backup, or in the log).
-    #[serde(default)]
     pub durability_blocked: u64,
     /// Plan 30 §M9: fast-path acknowledgements that waited for
     /// durability, their total wait, and those left in doubt (the lease

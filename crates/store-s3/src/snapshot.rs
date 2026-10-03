@@ -15,9 +15,7 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Plan 32 §0.4 added everything after `tree`, all `#[serde(default)]`:
-/// the change is additive, so [`SNAPSHOT_RECORD_VERSION`] stays 2 and a
-/// record written before it still reads.
+/// Plan 32 §0.4 added everything after `tree`.
 ///
 /// Every field here is immutable once written, which is why `held`/`held_by`
 /// are *not* among them (plan 32 §0.4: "they live only in the row"). A hold
@@ -35,14 +33,11 @@ pub struct SnapshotRecord {
     /// The directory inside a published metadata tree.
     pub tree: SnapshotTreeRoot,
     /// 0 manual, 1 policy-created.
-    #[serde(default)]
     pub origin: u8,
     /// The directory inode carrying the owning policy; 0 for none.
-    #[serde(default)]
     pub policy_ino: u64,
     /// The subtree's logical size at creation (REFER), when it was
     /// available.
-    #[serde(default)]
     pub refer_bytes: Option<u64>,
 }
 

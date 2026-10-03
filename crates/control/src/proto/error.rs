@@ -112,16 +112,13 @@ impl fmt::Display for ErrorKind {
 pub struct ControlError {
     /// The portable errno, when the failure is a filesystem refusal. On the
     /// wire it is `Code`'s own `u16`.
-    #[serde(default)]
     #[schemars(with = "Option<u16>")]
     pub code: Option<Code>,
     pub kind: ErrorKind,
     pub message: String,
     /// Structured context; free-form.
-    #[serde(default)]
     pub details: Option<JsonValue>,
     /// What the caller can do about it.
-    #[serde(default)]
     pub remediation: Option<String>,
 }
 

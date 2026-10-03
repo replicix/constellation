@@ -102,13 +102,9 @@ pub fn probe_window() -> usize {
 /// from the commit object alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitAgg {
-    #[serde(default)]
     pub bytes: u64,
-    #[serde(default)]
     pub files: u64,
-    #[serde(default)]
     pub keys: u64,
-    #[serde(default)]
     pub max_mtime: i64,
 }
 
@@ -134,9 +130,7 @@ impl From<constellation_mtree::Agg> for CommitAgg {
 /// optimization, never the source of truth.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Intent {
-    #[serde(default)]
     pub kind: String,
-    #[serde(default)]
     pub ops: u64,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, serde_json::Value>,
@@ -155,7 +149,6 @@ impl Intent {
 /// One complete state of the filesystem (§P2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Commit {
-    #[serde(default = "default_version")]
     pub v: u32,
     pub seq: u64,
     /// `seq - 1` for every commit but the first, whose parent is 0.
@@ -174,11 +167,8 @@ pub struct Commit {
     /// recognizable exactly as a late log segment is (§P3: leases are
     /// demoted to policy, and this is the policy guard).
     pub epoch: u64,
-    #[serde(default)]
     pub agg: CommitAgg,
-    #[serde(default)]
     pub intent: Intent,
-    #[serde(default)]
     pub unix_ms: i64,
     /// Log position this commit's tree reflects: the highest segment
     /// sequence applied to the replica it was built from (plan 28 §11,
@@ -197,17 +187,12 @@ pub struct Commit {
     /// its author's not-yet-shipped journal suffix; the author holds
     /// the lease, so the log appends that suffix after this position
     /// and replay absorbs it.
-    #[serde(default)]
     pub applied: u64,
 }
 
 /// `mine` has applied at least as much of the log as `theirs`.
 pub fn vector_covers(mine: u64, theirs: u64) -> bool {
     mine >= theirs
-}
-
-fn default_version() -> u32 {
-    COMMIT_VERSION
 }
 
 impl Commit {

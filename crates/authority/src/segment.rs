@@ -13,27 +13,23 @@ const SEGMENT_VERSION: u32 = 3;
 struct SegmentEnvelope {
     v: u32,
     node: u64,
-    #[serde(default)]
     epoch: u64,
     records: Vec<LogRecord>,
     /// Plan 30 §M6: the shipping holder's journal seq every row at or
     /// below which has now shipped (0: none). Appended last, so a reader
     /// that decodes only the first four fields (the harness's log
     /// checks) still reads the envelope.
-    #[serde(default)]
     through: u64,
     /// Plan 30 §M9: the shipping holder's journal seq of every journal
     /// row in `records` (atime ride-along rows have none), in record
     /// order. A backup trims its `backup_tail` by them, and a subscriber
     /// retires the pre-S3 streamed speculation they confirm — exactly,
     /// even when M4/M7 ship transactions out of journal order.
-    #[serde(default)]
     rows: Vec<u64>,
     /// Plan 30 §M11: the delegation origin `(gen, idx)` of each row in
     /// `rows` (`(0, 0)`: the shipper's own). A delegate retires its own
     /// transactions by it; every replica keeps its per-generation applied
     /// index from it.
-    #[serde(default)]
     origins: Vec<(u64, u64)>,
 }
 

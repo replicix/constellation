@@ -3,9 +3,11 @@
 //! Everything from `StatusReport` down to `DirectoryEntry` is copied from
 //! the retired `crates/api/src/types.rs` (deleted in C5b, so this is the
 //! surviving home, not a duplicate) with a `JsonSchema` derive added so the
-//! schema document covers it. They keep today's field names and
-//! `#[serde(default)]` markers: a JSON client that predates a counter still
-//! decodes a newer daemon's report.
+//! schema document covers it. They keep today's field names.
+//!
+//! `#[serde(default)]` appears only on request types (`*Params` and what
+//! they embed): a client may omit an optional parameter. Reply and event
+//! types never carry it, because every daemon writes every field.
 //!
 //! ## Rules every type in here follows
 //!
@@ -72,7 +74,6 @@ pub struct MountInfo {
     /// which carries the rest of plan 38 §5's per-mount transport state;
     /// kept here too because it describes the mount, and every mount
     /// listing (`view.mount`'s answer included) carries it.
-    #[serde(default)]
     pub transport: Option<String>,
 }
 
@@ -101,7 +102,6 @@ pub struct InspectStatus {
     /// packed `dev_t`.
     #[schemars(with = "RdevSchema")]
     pub rdev: constellation_types::Rdev,
-    #[serde(default)]
     pub manifest: Option<ManifestStatus>,
 }
 
@@ -112,15 +112,12 @@ pub struct ManifestStatus {
     pub spilled: bool,
     /// The manifest's own length (the inode's `size` can differ while a
     /// setattr and a manifest commit are apart).
-    #[serde(default)]
     pub file_len: u64,
     /// BLAKE3 of the encoded manifest: two nodes serving the same file
     /// version agree on it.
-    #[serde(default)]
     pub digest: String,
     /// `index:chunk hash` of the first chunks (or the spilled list's
     /// hash), for telling apart what two nodes serve.
-    #[serde(default)]
     pub chunks: Vec<String>,
 }
 
@@ -130,11 +127,9 @@ pub struct DoctorStatus {
     pub etag_cas: bool,
     /// Plan 30 §M4: what the provider answered at each CAS edge
     /// (`constellation_store_s3::probe`).
-    #[serde(default)]
     pub cas_probes: Vec<CasProbeStatus>,
     /// Plan 30 §M4: bucket versioning as seen on a probe PUT
     /// (informational).
-    #[serde(default)]
     pub versioning: String,
 }
 
@@ -168,31 +163,24 @@ pub struct SnapshotStatus {
     pub root_hash: String,
     pub created_unix_ms: i64,
     /// `manual` or `auto` (a snapshot policy's own).
-    #[serde(default)]
     pub origin: String,
     /// The directory inode carrying the owning policy; 0 for none.
-    #[serde(default)]
     pub policy_ino: u64,
     /// A retention hold: `snapshot.delete` refuses it without `force`,
     /// and plan 32's expiry never considers it.
-    #[serde(default)]
     pub held: bool,
     /// Who owns the hold: `user:<name>`, `csi:<VolumeSnapshotContent
     /// uid>`; absent for a plain hold with no recorded owner.
-    #[serde(default)]
     pub held_by: Option<String>,
     /// The node that took it; 0 = unknown.
-    #[serde(default)]
     pub creator: u64,
     /// REFER: the subtree's logical size when the snapshot was taken —
     /// what restoring it needs (plan 37's CSI `size_bytes`). Absent when
     /// it was not available at creation.
-    #[serde(default)]
     pub refer_bytes: Option<u64>,
     /// The metadata commit the snapshot froze (its `root_hash`'s seq):
     /// with `created_unix_ms`, the order of a chain (plan 32 §0.2).
     /// Absent when the root does not parse.
-    #[serde(default)]
     pub seq: Option<u64>,
     /// Plan 32 §6.1's sizes, logical bytes, from this node's accounting
     /// index, all "as of" the commit `as_of_seq` (`as_of_ms` when the
@@ -201,26 +189,18 @@ pub struct SnapshotStatus {
     /// snapshot), `REFER` (the distinct chunks it references — exact, so
     /// unlike `refer_bytes` it is deduplicated), `LSIZE` (apparent size).
     /// Present only with `size_state: ok`.
-    #[serde(default)]
     pub used: Option<u64>,
-    #[serde(default)]
     pub written: Option<u64>,
-    #[serde(default)]
     pub refer: Option<u64>,
-    #[serde(default)]
     pub lsize: Option<u64>,
-    #[serde(default)]
     pub as_of_seq: Option<u64>,
-    #[serde(default)]
     pub as_of_ms: Option<u64>,
     /// Whether the sizes above are there: `ok`, `building` (the index
     /// does not match the snapshots yet; never a partial number) or `off`
     /// (`CONSTELLATION_SNAPACCT=off`). Absent when the caller did not ask
     /// for sizes and the index had none ready.
-    #[serde(default)]
     pub size_state: Option<SizeState>,
     /// With `size_state: building`: the share of snapshot rows applied.
-    #[serde(default)]
     pub building_pct: Option<u8>,
     /// Plan 32 Step 5's `KEPT BY`, for an unheld auto snapshot of an
     /// *armed* policy root (parseable, not paused, directory present): the
@@ -262,11 +242,9 @@ pub struct DelegationStatus {
     pub gen: u64,
     /// Phase 2b: an offline designation (never recalled by TTL or
     /// placement).
-    #[serde(default)]
     pub designated: bool,
     /// Plan 30 §M12: `"<idx>/<count>"` for a hash range of the
     /// directory's names; empty for the whole directory.
-    #[serde(default)]
     pub range: String,
 }
 
@@ -274,133 +252,79 @@ pub struct DelegationStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DelegationReport {
     /// `CONSTELLATION_DELEGATION` is on (and P2P).
-    #[serde(default)]
     pub enabled: bool,
     /// The live table.
-    #[serde(default)]
     pub table: Vec<DelegationStatus>,
     /// Delegations this node holds: `(dir, gen, until_ms, stopped,
     /// streamed_through, executed, parked)`.
-    #[serde(default)]
     pub mine: Vec<(u64, u64, i64, bool, u64, u64, usize)>,
     /// As the root: `(dir, node, gen, cursor, until_ms, recall, ended)`.
-    #[serde(default)]
     pub gens: Vec<(u64, u64, u64, u64, i64, String, bool)>,
-    #[serde(default)]
     pub executed: u64,
     /// Ops the FUSE fast path executed here as the delegate (not
     /// counted in `executed`, which is the core's).
-    #[serde(default)]
     pub fast_path_executed: u64,
     /// Plan 30 §M12: ops the root's fast path sent through the core
     /// because a live delegation owned their keys.
-    #[serde(default)]
     pub fast_path_routed: u64,
-    #[serde(default)]
     pub forwarded_to_delegate: u64,
-    #[serde(default)]
     pub deps_waits: u64,
-    #[serde(default)]
     pub parked_expired: u64,
     /// Grants this delegate gave up unrenewed past the root's reclaim
     /// horizon (the root dead or cut off).
     pub lapsed: u64,
-    #[serde(default)]
     pub not_owner: u64,
-    #[serde(default)]
     pub installed: u64,
-    #[serde(default)]
     pub streamed_txs: u64,
-    #[serde(default)]
     pub stream_refused: u64,
-    #[serde(default)]
     pub renewals: u64,
-    #[serde(default)]
     pub renewals_refused: u64,
-    #[serde(default)]
     pub recalls_received: u64,
-    #[serde(default)]
     pub delegated: u64,
-    #[serde(default)]
     pub appended_txs: u64,
-    #[serde(default)]
     pub stream_refusals: u64,
-    #[serde(default)]
     pub deps_unsatisfied_at_append: u64,
-    #[serde(default)]
     pub cross_subtree: u64,
-    #[serde(default)]
     pub recalls_sent: u64,
-    #[serde(default)]
     pub recalls_drained: u64,
-    #[serde(default)]
     pub recalls_expired: u64,
-    #[serde(default)]
     pub reclaimed: u64,
-    #[serde(default)]
     pub ended: u64,
-    #[serde(default)]
     pub deps_overflow_to_root: u64,
-    #[serde(default)]
     pub exec_parked: u64,
     /// Delegate rows stranded here by a recall (rolled back, replayed).
-    #[serde(default)]
     pub stranded: u64,
     // ---- phase 2b ----
     /// As the root: `(gen, kind, backup)` per generation (kind: Manual,
     /// Placed, Designated).
-    #[serde(default)]
     pub kinds: Vec<(u64, String, u64)>,
     /// As a delegate: `(gen, backup, backup_acked)`.
-    #[serde(default)]
     pub backups: Vec<(u64, u64, u64)>,
     /// The placement's busiest subtrees, `(dir, node, node_ops,
     /// subtree_ops)` over the window (M12's input).
-    #[serde(default)]
     pub placement: Vec<(u64, u64, u64, u64)>,
-    #[serde(default)]
     pub inherited: u64,
-    #[serde(default)]
     pub refused_designated: u64,
-    #[serde(default)]
     pub designated: u64,
-    #[serde(default)]
     pub redelegated: u64,
-    #[serde(default)]
     pub seals_sent: u64,
-    #[serde(default)]
     pub sealed_drained: u64,
-    #[serde(default)]
     pub restreams: u64,
-    #[serde(default)]
     pub backup_appends: u64,
-    #[serde(default)]
     pub backup_acks: u64,
-    #[serde(default)]
     pub acks_parked: u64,
-    #[serde(default)]
     pub backup_persisted: u64,
-    #[serde(default)]
     pub backup_seals: u64,
-    #[serde(default)]
     pub place_evaluations: u64,
-    #[serde(default)]
     pub place_delegated: u64,
-    #[serde(default)]
     pub place_recalled: u64,
-    #[serde(default)]
     pub place_skipped_cooldown: u64,
-    #[serde(default)]
     pub place_skipped_unreachable: u64,
     /// Plan 30 §M12: hot directories split into hash ranges, and range
     /// generations recalled by the placement.
-    #[serde(default)]
     pub place_splits: u64,
-    #[serde(default)]
     pub place_range_recalls: u64,
-    #[serde(default)]
     pub read_index_served: u64,
-    #[serde(default)]
     pub read_grants: u64,
 }
 
@@ -416,35 +340,24 @@ pub struct PinStatus {
     pub chunks_total: u64,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 /// The FUSE request watchdog (`crate::fuse_watch`, EC2 campaign 7
 /// B-2): requests in flight, and those unanswered past
 /// `CONSTELLATION_FUSE_REQUEST_STALL_S`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct FuseRequestsStatus {
     /// Requests being handled right now.
-    #[serde(default)]
     pub in_flight: u64,
     /// Of them, reported as stalled (older than the threshold).
-    #[serde(default)]
     pub stalled: u64,
     /// Requests ever reported as stalled since the daemon started.
-    #[serde(default)]
     pub stalled_total: u64,
     /// Of those, the ones that did complete eventually.
-    #[serde(default)]
     pub stalled_completed: u64,
     /// The oldest request in flight, in seconds (blocking locks aside).
-    #[serde(default)]
     pub oldest_s: u64,
-    #[serde(default)]
     pub stall_threshold_s: u64,
     /// The stalled requests (and blocking lock waits past the
     /// threshold, marked `blocking`), oldest first.
-    #[serde(default)]
     pub stalled_requests: Vec<StalledFuseRequest>,
 }
 
@@ -458,7 +371,6 @@ pub struct StalledFuseRequest {
     /// The OS thread handling it.
     pub tid: u32,
     /// A blocking lock request: unbounded by design, not a stall.
-    #[serde(default)]
     pub blocking: bool,
 }
 
@@ -473,15 +385,13 @@ pub struct HandoverStatus {
     /// A handover is under way.
     pub upgrading: bool,
     /// Why the last attempt did not happen, if it did not.
-    #[serde(default)]
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct StatusReport {
     /// Plan 31 C4b. First, as it was in the retired `crates/api` report:
     /// `constellation status` prints this struct, field order included.
-    #[serde(default)]
     pub handover: HandoverStatus,
     pub fs_uuid: String,
     pub backend: String,
@@ -492,148 +402,107 @@ pub struct StatusReport {
     /// scalar back, but the struct field itself is gone — multi-view is
     /// the whole point of this change and there is no sane single value
     /// to keep reporting once more than one view is live.
-    #[serde(default)]
     pub mounts: Vec<MountInfo>,
     /// This node's cluster-unique id (scopes ino allocation, marks log
     /// segment origin).
-    #[serde(default)]
     pub node_id: u64,
     /// Running binary version (`git describe` / package version).
-    #[serde(default)]
     pub version: String,
     /// Whether this node's registry record is present and not retired.
     /// False after a successful `leave`, or when an admin retired us.
-    #[serde(default = "default_true")]
     pub enrolled: bool,
     pub uptime_s: u64,
     pub spool: SpoolStatus,
     pub cache: CacheStatus,
     /// Write authority for the one metadata stream (`p0`).
-    #[serde(default)]
     pub lease: LeaseStatus,
     /// P2P fast path (M3.3). `enabled: false` on daemons without it, or
     /// when `CONSTELLATION_P2P=off`.
-    #[serde(default)]
     pub p2p: P2pStatus,
     /// Locally pinned subtrees (phase 4a). Node-local, not replicated.
-    #[serde(default)]
     pub pins: Vec<PinStatus>,
     /// Live offline designations visible to this node (phase 4a,
     /// DESIGN.md §5.2). Replicated via S3, so every node's view should
     /// agree modulo the periodic refresh lag.
-    #[serde(default)]
     pub designations: Vec<DesignationStatus>,
     /// Plan 30 §M11.
-    #[serde(default)]
     pub delegation: DelegationReport,
     /// Continuation epoch (phase 4b, DESIGN.md §5.3).
-    #[serde(default)]
     pub epoch: EpochStatus,
     /// Stranded-journal reintegration (phase 4b).
-    #[serde(default)]
     pub reintegration: ReintegrationStatus,
     /// Plan 30 §M3a speculation log and stranded-op recovery.
-    #[serde(default)]
     pub speculation: SpeculationStatus,
     /// Plan 30 §M4: journal records held back behind unrecoverable
     /// pending chunks (everything else keeps shipping).
-    #[serde(default)]
     pub held: HeldStatus,
     /// Plan 30 §M6: the session wait on local reads (read-your-writes,
     /// monotonic reads) and its latency distribution.
-    #[serde(default)]
     pub session: SessionStatus,
     /// Plan 30 §M8: `cto=strict` and read delegations.
-    #[serde(default)]
     pub cto: CtoStatus,
     /// Plan 30 §M14: `--locks` and cross-node lock grants.
-    #[serde(default)]
     pub locks: LockStatus,
     /// Plan 30 §M9: acknowledgement policy, backups, seals.
-    #[serde(default)]
     pub ack: AckStatus,
     /// Cooperative cache (phase 5, DESIGN.md §7).
-    #[serde(default)]
     pub coop: CoopStatus,
     /// Adaptive sequential and directory readahead.
-    #[serde(default)]
     pub prefetch: PrefetchStatus,
     /// Phase 5b write-back queue and adaptive upload policy.
-    #[serde(default)]
     pub writeback: WritebackStatus,
     /// Plan 39: `fsync`s waiting out an unreachable S3, and how they ended.
-    #[serde(default)]
     pub fsync: FsyncStatus,
-    #[serde(default)]
     pub forwarded_ok: u64,
-    #[serde(default)]
     pub forwarded_err: u64,
-    #[serde(default)]
     pub forward_p50_ms: Option<u64>,
     /// Plan 30 §M7: the direct log stream (this node's subscription to
     /// the holder, or the subscribers it serves as the holder).
-    #[serde(default)]
     pub log_stream: LogStreamStatus,
     /// Plan 30 §M2: forwarded requests the holder answered from
     /// `recent`/`completed` instead of re-executing (a retried rid).
-    #[serde(default)]
     pub forward_dedup_hits: u64,
     /// Plan 30 §M2: same-rid forward retries this node's requester side
     /// made (same holder, or a redirected one) before falling back to
     /// the lease-acquisition path.
-    #[serde(default)]
     pub forward_retries: u64,
     /// Plan 30 §M2: in-doubt ops the lease-path resolved against
     /// `completed` instead of re-executing (a genuine takeover finding
     /// the op already happened).
-    #[serde(default)]
     pub forward_indoubt_resolved: u64,
     /// EC2 campaign 8 A-1: this node's own S3 path, and what its ops did
     /// without it.
-    #[serde(default)]
     pub own_s3: OwnS3Status,
     /// Plan 30 §M13: the S3 inbox (forwarding without P2P).
-    #[serde(default)]
     pub inbox: InboxStatus,
-    #[serde(default)]
     pub placement_reason: Option<String>,
     /// Optional cluster-wide logical byte cap and current used bytes.
-    #[serde(default)]
     pub quota: QuotaStatus,
     /// Read-time atime (plan 20). Default (`off`) leaves every counter
     /// zero and `mode` "off".
-    #[serde(default)]
     pub atime: AtimeStatus,
     /// Retention pruning (plan 22). Default (no marked roots) leaves
     /// every counter zero.
-    #[serde(default)]
     pub prune: PruneStatus,
     /// Automatic snapshot schedules (plan 32 Step 9). Every counter the
     /// plan names is present from M2 on; they stay zero until the
     /// scheduler (M3) and expiry (M4) run.
-    #[serde(default)]
     pub snapsched: SnapSchedStatus,
     /// Plan 32 §6.3/Step 9: the space-accounting index. Default (`auto`,
     /// never asked) leaves everything zero and `maintaining` false.
-    #[serde(default)]
     pub snapacct: SnapAcctStatus,
     /// The FUSE request watchdog (EC2 campaign 7 B-2).
-    #[serde(default)]
     pub fuse_requests: FuseRequestsStatus,
     /// Plan 31 C8: the engine profile and the host's lifecycle.
-    #[serde(default)]
     pub lifecycle: LifecycleStatus,
     /// Object-store requests this daemon has issued since it started
     /// (every filesystem it serves), by kind and by key area.
-    #[serde(default)]
     pub s3: S3RequestStatus,
     /// The unified op metrics (plan 31 §6.10) `/metrics` exports as
     /// `constellation_vfs_ops_total` and `constellation_vfs_op_seconds`.
-    #[serde(default)]
     pub vfs_ops: VfsOpsStatus,
     /// Plan 38 §5: the FUSE read-path transport, per mount and
     /// process-wide.
-    #[serde(default)]
     pub fuse: FuseStatus,
 }
 
@@ -648,23 +517,19 @@ pub struct StatusReport {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FuseStatus {
     /// One entry per mount with a FUSE session behind it, by mount id.
-    #[serde(default)]
     pub mounts: Vec<FuseMountStatus>,
     /// Every transport fallback this process took, by (from, to, reason):
     /// `constellation_fuse_transport_fallbacks_total`. Process-wide, so
     /// it survives the unmount of the mount that took one.
-    #[serde(default)]
     pub transport_fallbacks: Vec<FuseFallbackCount>,
     /// Reads served zero-copy by every session of this process
     /// (`constellation_fuse_zero_copy_reads_total`; 0 until plan 38 Z4).
-    #[serde(default)]
     pub zero_copy_reads_total: u64,
     /// Blocking lock requests (`F_SETLKW`, blocking `flock`) every ring
     /// session of this process served as non-blocking because their ring
     /// queue's lock-wait budget (`depth - 1` waiters) was spent — answered
     /// `ENOLCK` where the lock was contended
     /// (`constellation_fuse_lock_wait_downgrades_total`, plan 38 Z2c).
-    #[serde(default)]
     pub lock_wait_downgrades_total: u64,
 }
 
@@ -678,21 +543,16 @@ pub struct FuseMountStatus {
     /// fixed for the connection's life.
     pub transport: String,
     /// Ring entries per kernel queue; 0 on `dev_fuse` (no ring queues).
-    #[serde(default)]
     pub uring_queue_depth: u32,
-    #[serde(default)]
     pub passthrough: FusePassthroughStatus,
     /// Reads this mount served zero-copy (0 until plan 38 Z4).
-    #[serde(default)]
     pub zero_copy_reads: u64,
     /// The transport fallback this mount's handshake took, if it took
     /// one (plan 38 §2.4: logged once, and visible here).
-    #[serde(default)]
     pub last_fallback: Option<FuseFallback>,
     /// Blocking lock requests this mount's ring served as non-blocking
     /// (see [`FuseStatus::lock_wait_downgrades_total`]); always 0 on
     /// `dev_fuse`.
-    #[serde(default)]
     pub lock_wait_downgrades: u64,
 }
 
@@ -701,11 +561,9 @@ pub struct FuseMountStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FusePassthroughStatus {
     /// Eligible opens are offered a backing file.
-    #[serde(default)]
     pub enabled: bool,
     /// Opens currently backed by a chunk file
     /// (`constellation_fuse_passthrough_opens`).
-    #[serde(default)]
     pub opens: u64,
     /// Why `enabled` is false; `None` when it is true: `writable_mount`
     /// (the default for a writable mount: only read-only mounts use it
@@ -713,15 +571,12 @@ pub struct FusePassthroughStatus {
     /// `cache_verify_always`, `no_cap_sys_admin`, `kernel`, `backing_open`
     /// (the kernel refused the session's probe registration: a user
     /// namespace, a cache on overlayfs) or `platform` (plan 38 Z3b).
-    #[serde(default)]
     pub unavailable_reason: Option<String>,
     /// Read-write opens refused (`ETXTBSY`) because the file was open in
     /// passthrough mode (plan 38 §3(c), Z3b).
-    #[serde(default)]
     pub refused_opens: u64,
     /// Opens answered with a backing file since the session started (a
     /// lane can tell from it that passthrough actually served something).
-    #[serde(default)]
     pub opens_total: u64,
 }
 
@@ -737,7 +592,6 @@ pub struct FuseFallback {
     /// `ring_setup_failed`.
     pub reason: String,
     /// What refused, as precisely as the daemon knows.
-    #[serde(default)]
     pub detail: String,
     /// When the handshake recorded it, Unix milliseconds.
     pub at_unix_ms: u64,
@@ -762,9 +616,7 @@ pub struct FuseFallbackCount {
 pub struct VfsOpsStatus {
     /// The histogram's bucket upper bounds, seconds, ascending; each
     /// series' last bucket is `+Inf`.
-    #[serde(default)]
     pub bucket_bounds_s: Vec<f64>,
-    #[serde(default)]
     pub series: Vec<VfsOpSeries>,
 }
 
@@ -773,21 +625,17 @@ pub struct VfsOpsStatus {
 pub struct VfsOpSeries {
     pub frontend: String,
     /// The view's allowlisted metric label; absent for a view with none.
-    #[serde(default)]
     pub view: Option<String>,
     /// Plan 38 §5: the kernel transport that carried the ops — `dev_fuse`,
     /// `uring` or `uring_zc` for the FUSE frontend, `n/a` for any other.
     pub transport: String,
     pub op: String,
     /// Ops per outcome: `ok`, or a `Code` name (`NotFound`, ...).
-    #[serde(default)]
     pub outcomes: BTreeMap<String, u64>,
     /// Ops per latency bucket (not cumulative): one more than
     /// `bucket_bounds_s`, the last being `+Inf`.
-    #[serde(default)]
     pub buckets: Vec<u64>,
     /// The latencies' sum, nanoseconds.
-    #[serde(default)]
     pub sum_ns: u64,
 }
 
@@ -797,57 +645,37 @@ pub struct VfsOpSeries {
 /// the filesystem prefix (`log`, `leases`, `nodes`, `chunks`, …).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct S3RequestStatus {
-    #[serde(default)]
     pub get: u64,
-    #[serde(default)]
     pub head: u64,
-    #[serde(default)]
     pub put: u64,
-    #[serde(default)]
     pub list: u64,
-    #[serde(default)]
     pub delete: u64,
-    #[serde(default)]
     pub copy: u64,
-    #[serde(default)]
     pub by_area: std::collections::BTreeMap<String, u64>,
     /// Requests that failed other than as an error of the request itself
     /// (see `last_answered_unix_ms`): a transport error or timeout after
     /// the client's own retries, a 5xx, a refusal.
-    #[serde(default)]
     pub unanswered: u64,
     /// When S3 last answered a request (unix ms; 0: never) — a success,
     /// or an error of the request itself (not found, a failed
     /// precondition), which proves the path works as well.
-    #[serde(default)]
     pub last_answered_unix_ms: i64,
     /// When a request last went unanswered (unix ms; 0: never), and why.
-    #[serde(default)]
     pub last_unanswered_unix_ms: i64,
-    #[serde(default)]
     pub last_unanswered_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AtimeStatus {
     /// "off", "relatime", or "lazy".
-    #[serde(default)]
     pub mode: String,
-    #[serde(default)]
     pub queued: u64,
-    #[serde(default)]
     pub coalesced: u64,
-    #[serde(default)]
     pub applied: u64,
-    #[serde(default)]
     pub dropped_cap: u64,
-    #[serde(default)]
     pub forward_ok: u64,
-    #[serde(default)]
     pub forward_err: u64,
-    #[serde(default)]
     pub local_only: u64,
-    #[serde(default)]
     pub skew_clamped: u64,
 }
 
@@ -855,42 +683,24 @@ pub struct AtimeStatus {
 /// status`, on the web UI, and in `/metrics`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct PruneStatus {
-    #[serde(default)]
     pub runs: u64,
-    #[serde(default)]
     pub roots: u64,
-    #[serde(default)]
     pub armed_roots: u64,
-    #[serde(default)]
     pub unparseable_roots: u64,
-    #[serde(default)]
     pub inert_roots: u64,
-    #[serde(default)]
     pub entries_examined: u64,
-    #[serde(default)]
     pub selected: u64,
-    #[serde(default)]
     pub deleted: u64,
-    #[serde(default)]
     pub bytes_deleted: u64,
-    #[serde(default)]
     pub bytes_freed: u64,
-    #[serde(default)]
     pub skipped_reverify: u64,
-    #[serde(default)]
     pub skipped_forward_err: u64,
-    #[serde(default)]
     pub skipped_hardlink: u64,
-    #[serde(default)]
     pub skipped_repartition: u64,
-    #[serde(default)]
     pub leases_acquired: u64,
-    #[serde(default)]
     pub refused_lag: u64,
-    #[serde(default)]
     pub last_run_unix_ms: u64,
     /// Last setxattr policy rejection: `(expression, byte_offset, message)`.
-    #[serde(default)]
     pub last_parse_error: Option<(String, usize, String)>,
 }
 
@@ -917,74 +727,50 @@ impl SnapSchedStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapSchedStatus {
     /// Scheduler ticks run on this node.
-    #[serde(default)]
     pub ticks: u64,
     /// This node holds the scheduler's singleton lease.
-    #[serde(default)]
     pub leader: bool,
     /// Policy roots at the last tick, and of them the paused, the
     /// unparseable (skipped: nothing created, nothing expired) and the
     /// capped ones (too many live auto snapshots to create more).
-    #[serde(default)]
     pub roots: u64,
-    #[serde(default)]
     pub paused_roots: u64,
-    #[serde(default)]
     pub unparseable_roots: u64,
-    #[serde(default)]
     pub capped_roots: u64,
     /// Auto snapshots whose root carries no parseable policy any more:
     /// kept, never expired automatically.
-    #[serde(default)]
     pub orphaned_snapshots: u64,
-    #[serde(default)]
     pub created: u64,
-    #[serde(default)]
     pub skipped_empty: u64,
-    #[serde(default)]
     pub create_failed: u64,
-    #[serde(default)]
     pub expired: u64,
     /// Expiry victims whose row changed before the delete (now held,
     /// gone, or re-owned), and so were not deleted.
-    #[serde(default)]
     pub skipped_reverify: u64,
     /// Expiry victims kept by the grace window after a policy change.
-    #[serde(default)]
     pub skipped_grace: u64,
-    #[serde(default)]
     pub budget_expired: u64,
-    #[serde(default)]
     pub budget_stale: u64,
-    #[serde(default)]
     pub refused_lag: u64,
-    #[serde(default)]
     pub refused_state: u64,
     /// When the scheduler last refused a tick (0 = never), and this node's
     /// clock when the status was read. `refused_*` are cumulative; the
     /// silent-failure warning keys on this being recent instead.
-    #[serde(default)]
     pub last_refused_unix_ms: u64,
-    #[serde(default)]
     pub now_unix_ms: u64,
-    #[serde(default)]
     pub last_create_unix_ms: u64,
-    #[serde(default)]
     pub last_error: Option<String>,
     /// The last policy a setxattr refused: `(expression, byte_offset,
     /// message)`.
-    #[serde(default)]
     pub last_parse_error: Option<(String, usize, String)>,
     /// The `_snapsched` lease epoch this node last took or renewed (0 =
     /// never). Two nodes reporting `leader` with the same epoch would be
     /// two leaders; a lower epoch is a predecessor that has not yet seen
     /// it was replaced.
-    #[serde(default)]
     pub lease_epoch: u64,
     /// While `leader`: when the lease lapses by this node's last renewal
     /// (Unix ms; `leader` turns false at it, a stalled leader included);
     /// 0 otherwise.
-    #[serde(default)]
     pub lease_until_unix_ms: u64,
 }
 
@@ -993,53 +779,37 @@ pub struct SnapSchedStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapAcctStatus {
     /// `CONSTELLATION_SNAPACCT`: "auto", "on" or "off".
-    #[serde(default)]
     pub mode: String,
     /// Whether the background task is keeping the index current now.
-    #[serde(default)]
     pub maintaining: bool,
     /// The index does not match the snapshot rows (its first build, a
     /// pass cut short by its budget, or a stalled chain): queries answer
     /// "building", never partial numbers.
-    #[serde(default)]
     pub building: bool,
-    #[serde(default)]
     pub build_progress_pct: u64,
     /// Chunks held by at least one snapshot.
-    #[serde(default)]
     pub indexed_chunks: u64,
     /// The index's on-disk tables.
-    #[serde(default)]
     pub index_bytes: u64,
     /// The commit every number is "as of".
-    #[serde(default)]
     pub as_of_seq: u64,
     /// The last live-tree refresh's duration.
-    #[serde(default)]
     pub refresh_ms_last: u64,
     /// The last `--verify`'s mismatch count.
-    #[serde(default)]
     pub verify_mismatches: u64,
     /// Chains the last pass could not apply (an operation failed twice);
     /// above zero, queries answer "building" until they can be.
-    #[serde(default)]
     pub stalled_chains: u64,
     /// Live refreshes that found a newer commit this replica had not
     /// applied yet, and so kept the flags at the older one.
-    #[serde(default)]
     pub refreshes_deferred: u64,
     /// Chunks whose live flags the next settled refresh reads again.
-    #[serde(default)]
     pub live_rechecks: u64,
     /// A full recompute of the live flags is pending a settled moment:
     /// the space figures are an estimate until it runs.
-    #[serde(default)]
     pub live_recheck_full: bool,
-    #[serde(default)]
     pub passes: u64,
-    #[serde(default)]
     pub errors: u64,
-    #[serde(default)]
     pub last_error: Option<String>,
 }
 
@@ -1048,49 +818,34 @@ pub struct SnapAcctStatus {
 pub struct PruneRootStatus {
     pub path: String,
     pub policy: String,
-    #[serde(default)]
     pub armed: bool,
-    #[serde(default)]
     pub valid: bool,
     /// A note when the policy is unparseable or inert.
-    #[serde(default)]
     pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct QuotaStatus {
     /// `None` = unlimited.
-    #[serde(default)]
     pub max_bytes: Option<u64>,
-    #[serde(default)]
     pub used_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct PrefetchStatus {
-    #[serde(default)]
     pub inflight: u64,
-    #[serde(default)]
     pub queued: u64,
-    #[serde(default)]
     pub streams: u64,
-    #[serde(default)]
     pub window_bytes: u64,
-    #[serde(default)]
     pub stalls: u64,
-    #[serde(default)]
     pub gate_target: u32,
-    #[serde(default)]
     pub scan_ahead_files: u64,
-    #[serde(default)]
     pub scan_ahead_bytes: u64,
     /// Times a stream's queued readahead was cancelled because the reader
     /// stopped consuming it (DESIGN.md §7 "abandoned reader").
-    #[serde(default)]
     pub abandoned: u64,
     /// Chunks dropped from queues by those cancellations — GETs saved from
     /// readers that never came back for them.
-    #[serde(default)]
     pub abandoned_chunks: u64,
 }
 
@@ -1099,155 +854,101 @@ pub struct PrefetchStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct FsyncStatus {
     /// `hard` (wait until durable) or `soft` (`--fsync-timeout`).
-    #[serde(default)]
     pub mode: String,
     /// The soft timeout in ms (0: none).
-    #[serde(default)]
     pub timeout_ms: u64,
     /// The cap the kernel's FUSE request timeout imposes, in ms (0: none).
-    #[serde(default)]
     pub kernel_cap_ms: u64,
     /// `fsync`s waiting now after a failed attempt.
-    #[serde(default)]
     pub waiting: u64,
     /// How long the oldest of them has waited, in ms (0: none).
-    #[serde(default)]
     pub longest_wait_ms: u64,
     /// The longest any `fsync` has waited since the node started, in ms.
-    #[serde(default)]
     pub max_wait_ms: u64,
     /// `fsync`s that retried at least once.
-    #[serde(default)]
     pub waited: u64,
     /// Attempts retried after a transient failure.
-    #[serde(default)]
     pub retries: u64,
     /// `fsync`s answered `EIO` because the soft timeout (or the kernel cap)
     /// elapsed.
-    #[serde(default)]
     pub timeouts: u64,
     /// `fsync`s answered `EIO` for a failure waiting does not fix.
-    #[serde(default)]
     pub permanent_errors: u64,
     /// `fsync`s answered `EINTR`.
-    #[serde(default)]
     pub interrupted: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WritebackStatus {
-    #[serde(default)]
     pub mode: String,
-    #[serde(default)]
     pub dirty_bytes: u64,
-    #[serde(default)]
     pub pending_uploads: u64,
-    #[serde(default)]
     pub upload_concurrency: u32,
-    #[serde(default)]
     pub remote_probe_enabled: bool,
-    #[serde(default)]
     pub remote_probe_hit_rate: f64,
-    #[serde(default)]
     pub existence_bloom_hits: u64,
-    #[serde(default)]
     pub existence_chunk_ref_hits: u64,
-    #[serde(default)]
     pub existence_misses: u64,
-    #[serde(default)]
     pub existence_peer_hints: u64,
     /// Pending rows for chunks other nodes forwarded in a manifest while
     /// they were still uploading there (`--write-mode back` on a
     /// non-owner): what this node's ship waits for their reports on.
-    #[serde(default)]
     pub remote_chunks_awaited: u64,
     /// The oldest of them, in seconds (0: none).
-    #[serde(default)]
     pub remote_chunks_oldest_s: u64,
     /// EC2 finding 1: drains that handed their chunks to a peer because
     /// this node's own uploads made no progress (this node's S3 path
     /// was down), how many succeeded, and the chunks they covered.
-    #[serde(default)]
     pub handoffs_sent: u64,
-    #[serde(default)]
     pub handoffs_ok: u64,
-    #[serde(default)]
     pub handoff_chunks: u64,
     /// Chunks this node fetched from a peer and uploaded for it.
-    #[serde(default)]
     pub handoff_chunks_accepted: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CoopStatus {
-    #[serde(default)]
     pub peer_hits: u64,
     /// Soft negatives: every peer decline (busy, absent, recently
     /// removed); see `peer_false_positives` / `peer_stale_misses`.
-    #[serde(default)]
     pub peer_misses: u64,
     /// Hard negatives: transport / hash failures against a peer.
-    #[serde(default)]
     pub peer_errors: u64,
-    #[serde(default)]
     pub s3_fetches: u64,
     /// Chunks fetched from another member of an open continuation epoch.
-    #[serde(default)]
     pub epoch_member_fetches: u64,
-    #[serde(default)]
     pub hedges_fired: u64,
-    #[serde(default)]
     pub bytes_served_to_peers: u64,
-    #[serde(default)]
     pub stale_digests_pruned: u64,
-    #[serde(default)]
     pub digest_rebuilds: u64,
-    #[serde(default)]
     pub digest_capacity_exceeded: bool,
-    #[serde(default)]
     pub per_source: Vec<SourceStatus>,
     /// Plan 30 §M15: `exact` (mirrors + reconciliation) or `bloom`.
-    #[serde(default)]
     pub digest_mode: String,
     /// Peer declined with `Absent` a chunk our digest said it held.
-    #[serde(default)]
     pub peer_false_positives: u64,
     /// Peer had dropped the chunk within its recent-removal window.
-    #[serde(default)]
     pub peer_stale_misses: u64,
     /// Fetches of a chunk no mirror listed yet from the node that wrote
     /// the manifest naming it (a file another node just wrote): served,
     /// and declined (the fetch then went on to S3).
-    #[serde(default)]
     pub fresh_hint_hits: u64,
-    #[serde(default)]
     pub fresh_hint_misses: u64,
     /// Digest-plane traffic (summaries, deltas, rounds, or blooms).
-    #[serde(default)]
     pub digest_bytes_sent: u64,
-    #[serde(default)]
     pub digest_bytes_received: u64,
-    #[serde(default)]
     pub digest_messages: u64,
     /// Microseconds spent building, applying and answering digests.
-    #[serde(default)]
     pub digest_cpu_us: u64,
-    #[serde(default)]
     pub reconcile_sessions: u64,
-    #[serde(default)]
     pub reconcile_rounds: u64,
-    #[serde(default)]
     pub reconcile_failures: u64,
     /// Part of `digest_cpu_us` spent on reconciliation rounds.
-    #[serde(default)]
     pub reconcile_cpu_us: u64,
     /// Keys in this node's published servable set.
-    #[serde(default)]
     pub local_set_entries: u64,
     /// Entries held about peers' caches (mirror keys or bloom inserts).
-    #[serde(default)]
     pub peer_set_entries: u64,
-    #[serde(default)]
     pub peer_set_bytes: u64,
 }
 
@@ -1255,101 +956,70 @@ pub struct CoopStatus {
 pub struct SourceStatus {
     pub id: String,
     /// First-byte EWMA from successful transfers only.
-    #[serde(default)]
     pub ttfb_ms_ewma: Option<f64>,
     /// Goodput EWMA from successful transfers only (per-stream body rate).
-    #[serde(default)]
     pub goodput_mbps_ewma: Option<f64>,
     /// Aggregate path throughput across concurrent streams (wall-clock).
     /// Prefer this over `goodput_mbps_ewma` when displaying "S3 BW" to operators.
-    #[serde(default)]
     pub aggregate_mbps_ewma: Option<f64>,
     /// Successful fetches (EWMA complementary to miss/err).
-    #[serde(default)]
     pub hit_rate: f64,
     /// Soft negatives (declines). Previously folded into `err_rate`.
-    #[serde(default)]
     pub miss_rate: f64,
     /// Hard negatives (transport/hash failures).
-    #[serde(default)]
     pub err_rate: f64,
     /// Successful transfers contributing to lat/BW EWMAs.
-    #[serde(default)]
     pub ok_samples: u64,
-    #[serde(default)]
     pub transport_rtt_ms: Option<f64>,
-    #[serde(default)]
     pub path: String,
 }
 
 /// Live continuation-epoch snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EpochStatus {
-    #[serde(default)]
     pub active: bool,
-    #[serde(default)]
     pub epoch_id: Option<String>,
-    #[serde(default)]
     pub members: Vec<u64>,
     /// Plan 30 §M10: `f` (the filesystem's `epoch_slack`).
-    #[serde(default)]
     pub epoch_slack: u32,
     /// Plan 30 §M10: the node whose lease the current (or last) epoch
     /// carried.
-    #[serde(default)]
     pub carrier: Option<u64>,
     /// Plan 30 §M10: this node's last issued heartbeat promise (unix ms;
     /// 0: none).
-    #[serde(default)]
     pub promise_until_ms: i64,
     /// EC2 follow-up 3c: this node's S3 is failing while a live member's
     /// works — its own outage, not the bucket's: it proposes no epoch.
-    #[serde(default)]
     pub own_s3_outage: bool,
     /// Proposals this node made (sent to its members).
-    #[serde(default)]
     pub proposals: u64,
     /// Plan 30 §M10 counters (the core's): promises persisted and PUT;
     /// promise requests answered and refused; TTL-takeover promise checks
     /// run, takeovers refused for too few promises, flush re-claims
     /// exempt; activations that found this node's claim stale.
-    #[serde(default)]
     pub promise_puts: u64,
-    #[serde(default)]
     pub promise_requests_answered: u64,
-    #[serde(default)]
     pub promise_requests_refused: u64,
-    #[serde(default)]
     pub promise_checks: u64,
-    #[serde(default)]
     pub takeovers_refused_promises: u64,
-    #[serde(default)]
     pub promise_flush_exempt: u64,
-    #[serde(default)]
     pub stale_claims: u64,
     /// Members keep following the hold owner's log stream during an
     /// epoch: journal transactions the hold owner streamed ahead, those
     /// this member installed, and this member's forwards the stream
     /// answered.
-    #[serde(default)]
     pub streamed_ahead: u64,
-    #[serde(default)]
     pub streamed_installed: u64,
-    #[serde(default)]
     pub forwards_streamed: u64,
     /// Epoch hold transfers declined because the requester had not
     /// applied the holder's whole log.
-    #[serde(default)]
     pub handoffs_behind: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ReintegrationStatus {
-    #[serde(default)]
     pub stranded_records: u64,
-    #[serde(default)]
     pub conflicts_materialized: u64,
-    #[serde(default)]
     pub in_progress: bool,
 }
 
@@ -1361,52 +1031,40 @@ pub struct SpeculationStatus {
     /// Outstanding shadows (accepted forwarded ops) and `Exists` hints not
     /// yet confirmed by the log. While non-zero this node does not publish
     /// commits.
-    #[serde(default)]
     pub outstanding: u64,
     /// Stranded ops queued for replay by rid.
-    #[serde(default)]
     pub pending_replay: u64,
     /// Speculative entries rolled back because a later epoch stranded
     /// them, since start.
-    #[serde(default)]
     pub rolled_back: u64,
     /// Stranded ops replayed by rid and accepted, since start.
-    #[serde(default)]
     pub stranded_replayed: u64,
     /// Stranded ops whose replay was refused and materialized as a
     /// `.constellation-conflict/` copy, since start.
-    #[serde(default)]
     pub replay_conflicts: u64,
     /// Plan 30 §M3b: this node's own journaled transactions captured as
     /// speculation and not yet shipped (a holder's unshipped journal).
     /// Unlike `outstanding`, these do not stop a publish: the publisher
     /// substitutes their before-images.
-    #[serde(default)]
     pub local: u64,
     /// Plan 30 §M3b: this node's own unshipped transactions rolled back
     /// because it was deposed (and queued for replay by rid), since start.
-    #[serde(default)]
     pub local_rolled_back: u64,
     /// Plan 30 §M3b: deposition recoveries run (rollback plus replay, or
     /// the capture-off rebuild), since start.
-    #[serde(default)]
     pub depositions: u64,
     /// Plan 30 §M3b: epoch-marker segments this node shipped right after a
     /// takeover, since start.
-    #[serde(default)]
     pub epoch_markers: u64,
     /// Plan 30 §M3b: this node holds the lease but its takeover gate has
     /// not completed (a marker or a local replay failed); new mutations are
     /// refused until a sync round completes it.
-    #[serde(default)]
     pub gate_pending: bool,
     /// Plan 30 §M4: refused replays whose `.constellation-conflict/` copy
     /// could not be made yet (retried with backoff; later ops are not held
     /// up), and those failing for at least 10 s — a stall worth looking
     /// at (the node then also asks for the lease to make them locally).
-    #[serde(default)]
     pub copies_pending: u64,
-    #[serde(default)]
     pub copies_stalled: u64,
 }
 
@@ -1419,100 +1077,68 @@ pub struct SpeculationStatus {
 /// every node; whichever role it plays moves.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct InboxStatus {
-    #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
     pub submitted_batches: u64,
-    #[serde(default)]
     pub submitted_ops: u64,
     /// Ops re-submitted by rid: under a newer epoch because a takeover
     /// stranded their batch, or in a new batch because one they shared
     /// was withdrawn.
-    #[serde(default)]
     pub resubmitted_ops: u64,
     /// Requester: batches this node withdrew (overwrote with a tombstone)
     /// before forwarding their op over P2P or holding it back.
-    #[serde(default)]
     pub withdrawn_ops: u64,
     /// Holder: withdrawn batches its polls read and stepped past.
-    #[serde(default)]
     pub tombstones_read: u64,
     /// Forwards the inbox could not take (no live holder to leave them
     /// with, S3 refused the batch, or the in-doubt deadline passed); they
     /// took the lease path.
-    #[serde(default)]
     pub unavailable: u64,
     /// Submitted ops still waiting for their outcome in the log.
-    #[serde(default)]
     pub pending_ops: u64,
     /// This node's next batch number under its current epoch.
-    #[serde(default)]
     pub next_n: u64,
-    #[serde(default)]
     pub executed_ops: u64,
-    #[serde(default)]
     pub refused_ops: u64,
     /// Batch positions answered without executing (rid already had an
     /// outcome, or the position was below the watermark).
-    #[serde(default)]
     pub deduped_ops: u64,
-    #[serde(default)]
     pub drained_batches: u64,
-    #[serde(default)]
     pub drained_ops: u64,
-    #[serde(default)]
     pub polls: u64,
-    #[serde(default)]
     pub poll_hits: u64,
-    #[serde(default)]
     pub gc_deleted: u64,
-    #[serde(default)]
     pub tracked_requesters: u64,
     /// The write-eligible roster this node's authority core last read
     /// (the registry, refreshed periodically and at a holder's inbox
     /// tenure start): who a holder polls with P2P off. A bench waits for
     /// it to name every node before timing.
-    #[serde(default)]
     pub roster: Vec<u64>,
     /// Round-2 instrumentation, requester side: mean time from queueing
     /// an op to its batch being durable, from durable to its outcome
     /// applied from the log, and their sum.
-    #[serde(default)]
     pub avg_queue_wait_ms: f64,
-    #[serde(default)]
     pub avg_outcome_wait_ms: f64,
-    #[serde(default)]
     pub avg_round_trip_ms: f64,
     /// Holder side: mean time from a batch's submission stamp to its
     /// poll hit (requester and holder clocks), and per-hit execute time.
-    #[serde(default)]
     pub avg_pickup_ms: f64,
-    #[serde(default)]
     pub avg_execute_ms: f64,
     /// Requester side: ops per batch, mean and maximum.
-    #[serde(default)]
     pub avg_batch_ops: f64,
-    #[serde(default)]
     pub largest_batch_ops: u64,
     /// Plan 30 M13 round 3b (the hybrid): whether this node's inbox
     /// demand is currently sustained enough that it is asking for the
     /// lease; how many times it started asking; the lease requests it
     /// sent for that; ops it forwarded through the inbox vs. ops it
     /// executed locally as holder.
-    #[serde(default)]
     pub escalated: bool,
-    #[serde(default)]
     pub escalations: u64,
-    #[serde(default)]
     pub lease_requests: u64,
     /// EC2 finding 2: rounds in which this node, holding the lease,
     /// kept it from wanters across a P2P partition from the nodes using
     /// it.
-    #[serde(default)]
     pub leases_kept_for_p2p_side: u64,
-    #[serde(default)]
     pub inbox_ops: u64,
-    #[serde(default)]
     pub local_ops: u64,
 }
 
@@ -1520,68 +1146,46 @@ pub struct InboxStatus {
 /// with `enabled: false` and every peer disconnected, just slower.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct P2pStatus {
-    #[serde(default)]
     pub enabled: bool,
     /// This node's dialable address, as published to the registry.
-    #[serde(default)]
     pub node_addr: Option<String>,
     /// Active relay policy: `disabled`, `default`, or a custom URL label.
-    #[serde(default)]
     pub relay: String,
     /// Every P2P dial has timed out for longer than twice the dial
     /// timeout (`constellation_p2p_dial_stalled`): this node's endpoint
     /// is likely stuck, not its peers.
-    #[serde(default)]
     pub dial_stalled: bool,
-    #[serde(default)]
     pub peers: Vec<PeerStatus>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct PeerStatus {
     pub node_id: u64,
-    #[serde(default)]
     pub connected: bool,
-    #[serde(default)]
     pub rtt_ms: Option<u64>,
     /// Milliseconds since this peer was last observed live.
-    #[serde(default)]
     pub last_seen_ms: Option<u64>,
-    #[serde(default)]
     pub hostname: Option<String>,
     /// Peer binary version from the registry (`git describe` / package).
-    #[serde(default)]
     pub version: Option<String>,
-    #[serde(default)]
     pub pubkey: Option<String>,
-    #[serde(default)]
     pub endpoint_id: Option<String>,
-    #[serde(default)]
     pub addrs: Vec<String>,
-    #[serde(default)]
     pub created_unix: Option<i64>,
-    #[serde(default)]
     pub p2p_updated_unix: Option<i64>,
-    #[serde(default)]
     pub ro: bool,
     /// Whether this peer is a member of the active continuation epoch.
-    #[serde(default)]
     pub epoch_member: bool,
     /// Offline designations this peer currently holds (paths).
-    #[serde(default)]
     pub designations: Vec<String>,
     /// Cooperative-cache source stats for this peer, when available.
-    #[serde(default)]
     pub coop: Option<SourceStatus>,
     /// Synthetic S3 backend row (`node_id` 0). Always listed first among
     /// [`P2pStatus::peers`] so the UI can compare lat/BW/hit% with peers.
-    #[serde(default)]
     pub s3: bool,
     /// Connectivity path: `direct`, `relay`, `unknown`, or empty for S3.
-    #[serde(default)]
     pub path: String,
     /// Plan 30 §M4: every open QUIC path to this peer right now.
-    #[serde(default)]
     pub paths: PeerPathsStatus,
 }
 
@@ -1592,20 +1196,15 @@ pub struct PeerStatus {
 pub struct PeerPathsStatus {
     /// Kind of the path application data currently uses: `direct`,
     /// `relay`, or empty when no connection is pooled.
-    #[serde(default)]
     pub selected: String,
     /// Open direct (IP) paths.
-    #[serde(default)]
     pub direct: u32,
     /// Open relay paths.
-    #[serde(default)]
     pub relay: u32,
     /// More than one path is open, so a failure of the selected one can
     /// fail over without a new handshake.
-    #[serde(default)]
     pub multipath: bool,
     /// Round-trip estimate of each open path, `kind:ms`, selected first.
-    #[serde(default)]
     pub rtts: Vec<String>,
 }
 
@@ -1614,47 +1213,33 @@ pub struct PeerPathsStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStatus {
     /// `CONSTELLATION_SESSION_WAIT_MS` (0: disabled).
-    #[serde(default)]
     pub budget_ms: u64,
     /// Reads checked, and how each ended: at once on the applied
     /// position, at once on covering speculation, after a wait, or
     /// degraded after the whole budget.
-    #[serde(default)]
     pub reads: u64,
-    #[serde(default)]
     pub fast: u64,
-    #[serde(default)]
     pub covered: u64,
-    #[serde(default)]
     pub waited: u64,
-    #[serde(default)]
     pub timeouts: u64,
     /// Timeouts while M4 held-back rows existed (a held row stalls the
     /// shipped-through position).
-    #[serde(default)]
     pub degraded_held: u64,
     /// Reads that waited for a queued replay of this node's own write.
-    #[serde(default)]
     pub replay_blocked: u64,
     /// Waits by log2 milliseconds: `[0]` < 1 ms, `[i]` < 2^i ms.
-    #[serde(default)]
     pub waits_ms: Vec<u64>,
-    #[serde(default)]
     pub wait_ms_total: u64,
     /// Times the `observed` watermark rose (replies whose effects were
     /// not installed here).
-    #[serde(default)]
     pub raised: u64,
     /// `CONSTELLATION_SESSION_WATERMARK_TTL_MS` (0: never dropped).
-    #[serde(default)]
     pub watermark_ttl_ms: u64,
     /// Watermarks dropped after staying unreached for the TTL, and
     /// stream dependencies voided because the delegation table showed
     /// their generation ended before this incarnation (EC2 campaign 7
     /// B-2: either one left every read on the node degraded for good).
-    #[serde(default)]
     pub abandoned: u64,
-    #[serde(default)]
     pub voided_ended: u64,
 }
 
@@ -1662,82 +1247,52 @@ pub struct SessionStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CtoStatus {
     /// This mount is `--cto strict`.
-    #[serde(default)]
     pub strict: bool,
     /// This node, as sequencer, grants read delegations.
-    #[serde(default)]
     pub grants_enabled: bool,
     // ---- reader side ----
     /// Strict opens, lookups and listings, and how each was answered: by
     /// this node as the sequencer, under a read delegation, after a
     /// ReadIndex round trip, by tailing S3 (no live sequencer, or no
     /// P2P), or degraded (no answer in the budget).
-    #[serde(default)]
     pub strict_reads: u64,
-    #[serde(default)]
     pub holder_local: u64,
-    #[serde(default)]
     pub delegation_local: u64,
-    #[serde(default)]
     pub read_index: u64,
-    #[serde(default)]
     pub s3_tail: u64,
-    #[serde(default)]
     pub degraded: u64,
     /// ReadIndex round trip plus the wait for its position, total ms and
     /// log2 histogram (`[0]` < 1 ms, `[i]` < 2^i ms).
-    #[serde(default)]
     pub read_index_ms_total: u64,
-    #[serde(default)]
     pub read_index_ms: Vec<u64>,
-    #[serde(default)]
     pub renewals: u64,
-    #[serde(default)]
     pub delegations_installed: u64,
     /// Grants not installed because a recall overtook their reply.
-    #[serde(default)]
     pub delegations_raced: u64,
     /// Delegations held right now, and recalls received.
-    #[serde(default)]
     pub delegations_held: u64,
-    #[serde(default)]
     pub recalled: u64,
     // ---- sequencer side ----
-    #[serde(default)]
     pub read_index_served: u64,
-    #[serde(default)]
     pub read_index_refused: u64,
-    #[serde(default)]
     pub grants: u64,
-    #[serde(default)]
     pub live_grants: u64,
     /// Recalls sent, acked, and outwaited (TTL + margin: the delegate was
     /// unreachable).
-    #[serde(default)]
     pub recalls_sent: u64,
-    #[serde(default)]
     pub recalls_acked: u64,
-    #[serde(default)]
     pub recalls_expired: u64,
     /// Acknowledgements that waited for recalls, and the total wait (ms).
-    #[serde(default)]
     pub recall_waits: u64,
-    #[serde(default)]
     pub recall_wait_ms_total: u64,
     /// Forwarded replies answered `Held` (and, as requester, retried).
-    #[serde(default)]
     pub held_replies: u64,
-    #[serde(default)]
     pub held_retries: u64,
     /// This node's own FUSE writes that waited for recalls, and how long.
-    #[serde(default)]
     pub fuse_writes_recalled: u64,
-    #[serde(default)]
     pub fuse_recall_wait_ms_total: u64,
     /// Parked acknowledgements and recalls in flight right now.
-    #[serde(default)]
     pub parked_acks: u64,
-    #[serde(default)]
     pub recalls_in_flight: u64,
 }
 
@@ -1746,57 +1301,38 @@ pub struct CtoStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LockStatus {
     /// `cluster` or `local`.
-    #[serde(default)]
     pub mode: String,
     // ---- this node as a lock holder ----
     /// Grants this node holds now (cached across unlocks).
-    #[serde(default)]
     pub grants_held: u64,
     /// Local lock requests, answered under a held grant, refused by
     /// another local owner, granted by the sequencer, refused
     /// (`EAGAIN`), or unavailable (`ENOLCK`).
-    #[serde(default)]
     pub requests: u64,
-    #[serde(default)]
     pub local_hits: u64,
-    #[serde(default)]
     pub local_conflicts: u64,
-    #[serde(default)]
     pub granted: u64,
-    #[serde(default)]
     pub would_block: u64,
-    #[serde(default)]
     pub unavailable: u64,
     /// Grant round trips: total ms and log2 histogram (`[0]` < 1 ms).
-    #[serde(default)]
     pub grant_ms_total: u64,
-    #[serde(default)]
     pub grant_ms: Vec<u64>,
-    #[serde(default)]
     pub renewals: u64,
     /// Grants the sequencer no longer knew (I/O under them is fenced).
-    #[serde(default)]
     pub lost: u64,
     /// Recalls received (and how many found local locks), releases sent.
-    #[serde(default)]
     pub recalled: u64,
-    #[serde(default)]
     pub recalled_busy: u64,
-    #[serde(default)]
     pub released: u64,
     /// I/O refused with `EIO` under a lapsed grant.
-    #[serde(default)]
     pub fenced_io: u64,
     /// Lock owners fenced on this node (their grant lapsed under their
     /// local lock), and the ops of theirs refused with `EIO` for it, on
     /// any file.
-    #[serde(default)]
     pub owners_fenced: u64,
-    #[serde(default)]
     pub owner_fenced_ops: u64,
     /// Recalled grants given up before their first local lock (the
     /// requester gave up, or the first-use budget ran out).
-    #[serde(default)]
     pub first_use_abandoned: u64,
     /// Grants whose floor this replica had not reached on arrival (the
     /// first read under the lock waited), how long those waits took in
@@ -1804,43 +1340,27 @@ pub struct LockStatus {
     /// such a grant the holder's reads were answered degraded, so the
     /// lock's visibility guarantee did not hold for that turn (logged at
     /// WARN too).
-    #[serde(default)]
     pub grants_waited: u64,
-    #[serde(default)]
     pub grant_wait_ms_total: u64,
-    #[serde(default)]
     pub grants_degraded: u64,
     // ---- this node as a sequencer ----
     /// Live grants in this node's table.
-    #[serde(default)]
     pub grants_table: u64,
-    #[serde(default)]
     pub grants_made: u64,
-    #[serde(default)]
     pub recalls_sent: u64,
-    #[serde(default)]
     pub recalls_released: u64,
-    #[serde(default)]
     pub recalls_expired: u64,
-    #[serde(default)]
     pub reclaimed: u64,
-    #[serde(default)]
     pub waiters_parked: u64,
-    #[serde(default)]
     pub grace_refusals: u64,
     /// Waiters re-parked at their old queue position after a grant to
     /// them went unused, and releases that named a grant id this owner
     /// had replaced (both ended a grant that was otherwise outwaited).
-    #[serde(default)]
     pub requeued_in_place: u64,
-    #[serde(default)]
     pub released_superseded: u64,
     /// Right now: requests in flight, parked waiters, recalls in flight.
-    #[serde(default)]
     pub requests_in_flight: u64,
-    #[serde(default)]
     pub waiters: u64,
-    #[serde(default)]
     pub recalls_in_flight: u64,
 }
 
@@ -1856,24 +1376,18 @@ pub struct OwnS3Status {
     pub stalled: bool,
     /// While stalled: some live peer reaches S3 (`true`), none does
     /// (`false`), or nobody answered (`null`).
-    #[serde(default)]
     pub peers_reach_s3: Option<bool>,
     /// How long the stall has lasted, as far as the core knows.
-    #[serde(default)]
     pub stalled_for_ms: Option<u64>,
     /// Forward retries past the ordinary budget, made instead of the
     /// lease path.
-    #[serde(default)]
     pub retries: u64,
     /// Ops on the lease path forwarded again.
-    #[serde(default)]
     pub forwards: u64,
     /// Ops that failed at the bound.
-    #[serde(default)]
     pub deadlines: u64,
     /// Forwards this node answered `Held` while re-adopting the lease a
     /// previous incarnation of it left behind.
-    #[serde(default)]
     pub readopted_for_forward: u64,
 }
 
@@ -1881,54 +1395,35 @@ pub struct OwnS3Status {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LogStreamStatus {
     /// `CONSTELLATION_LOG_STREAMS` (and P2P) on.
-    #[serde(default)]
     pub enabled: bool,
     /// The holder this node is subscribed to (0: none), whether a frame
     /// has arrived on the subscription, and segments waiting in its
     /// reorder buffer for a sequence S3 must supply.
-    #[serde(default)]
     pub upstream: u64,
-    #[serde(default)]
     pub live: bool,
-    #[serde(default)]
     pub buffered: u64,
     /// Segments applied from the stream (no S3 GET), and rounds that
     /// skipped their S3 tail because the stream covered it.
-    #[serde(default)]
     pub applied: u64,
-    #[serde(default)]
     pub tail_skips: u64,
     /// Subscriptions made, and how they ended: refused (not the holder),
     /// ended by the holder (it let the lease go), a frame gap, lost at the
     /// transport, silent past the timeout, or a full reorder buffer.
-    #[serde(default)]
     pub subscribes: u64,
-    #[serde(default)]
     pub refused: u64,
-    #[serde(default)]
     pub ended: u64,
-    #[serde(default)]
     pub gaps: u64,
-    #[serde(default)]
     pub lost: u64,
-    #[serde(default)]
     pub timeouts: u64,
-    #[serde(default)]
     pub overflows: u64,
-    #[serde(default)]
     pub duplicates: u64,
     /// As the holder: subscribers served now, subscriptions accepted and
     /// declined, frames sent, and subscribers dropped for falling behind
     /// (their bounded buffer overflowed) or going away.
-    #[serde(default)]
     pub serving: u64,
-    #[serde(default)]
     pub served: u64,
-    #[serde(default)]
     pub declined: u64,
-    #[serde(default)]
     pub frames_sent: u64,
-    #[serde(default)]
     pub subscribers_dropped: u64,
 }
 
@@ -1937,24 +1432,18 @@ pub struct LogStreamStatus {
 pub struct HeldStatus {
     /// Journaled transactions held back (the seeds and everything that
     /// depends on them).
-    #[serde(default)]
     pub transactions: u64,
-    #[serde(default)]
     pub records: u64,
     /// The oldest held journal seq.
-    #[serde(default)]
     pub oldest_seq: Option<u64>,
     /// An uncaptured transaction (holder capture off) was held, so every
     /// transaction after it is held too.
-    #[serde(default)]
     pub opaque: bool,
     /// Plan 30 §M7: transactions deferred (not held) because a chunk their
     /// manifest names is still uploading; they ship once it is up.
-    #[serde(default)]
     pub deferred: u64,
     /// Each inode with unrecoverable chunks: `constellation repair
     /// drop-held <ino>` discards its held records.
-    #[serde(default)]
     pub inodes: Vec<HeldInodeStatus>,
     /// Pending chunks another node forwarded as still uploading there
     /// (`--write-mode back`, or any write inside a continuation epoch):
@@ -1962,7 +1451,6 @@ pub struct HeldStatus {
     /// `deferred`) until that node uploads them, or the sequencer finds
     /// them in S3. If the node is gone for good, `constellation repair
     /// drop-held <ino> --remote` drops them.
-    #[serde(default)]
     pub remote: Vec<RemoteChunkStatus>,
 }
 
@@ -1970,7 +1458,6 @@ pub struct HeldStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RemoteChunkStatus {
     pub ino: u64,
-    #[serde(default)]
     pub path: Option<String>,
     /// The node expected to upload it.
     pub node: u64,
@@ -1983,13 +1470,10 @@ pub struct RemoteChunkStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct HeldInodeStatus {
     pub ino: u64,
-    #[serde(default)]
     pub path: Option<String>,
     /// Hex hashes of the pending chunks gone from the local cache.
-    #[serde(default)]
     pub missing_chunks: Vec<String>,
     /// Held transactions whose manifest names them.
-    #[serde(default)]
     pub seeds: u64,
 }
 
@@ -1997,73 +1481,46 @@ pub struct HeldInodeStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AckStatus {
     /// This mount asks for `ack=s3`.
-    #[serde(default)]
     pub ack_s3: bool,
     /// The policy of the lease this node holds: "local", "backup", "s3",
     /// or "-" when it holds none.
-    #[serde(default)]
     pub policy: String,
-    #[serde(default)]
     pub backups: Vec<u64>,
-    #[serde(default)]
     pub candidate: Option<u64>,
-    #[serde(default)]
     pub config_version: u64,
     /// The durable journal seq (min over the backups' acks, or the
     /// shipped-through seq under `s3`); `u64::MAX` when nothing gates.
-    #[serde(default)]
     pub durable: u64,
     /// Acknowledgements parked for durability right now.
-    #[serde(default)]
     pub parked_acks: u64,
     /// The fast path is closed (local writes go through the core).
-    #[serde(default)]
     pub gated: bool,
     // ---- this node as a backup ----
-    #[serde(default)]
     pub backing_holder: u64,
-    #[serde(default)]
     pub backing_epoch: u64,
-    #[serde(default)]
     pub backing_acked: u64,
-    #[serde(default)]
     pub sealed_epoch: u64,
     // ---- counters ----
-    #[serde(default)]
     pub backups_added: u64,
-    #[serde(default)]
     pub backups_removed: u64,
-    #[serde(default)]
     pub reconfig_cas: u64,
-    #[serde(default)]
     pub backup_appends: u64,
-    #[serde(default)]
     pub backup_acks: u64,
-    #[serde(default)]
     pub backup_ack_timeouts: u64,
-    #[serde(default)]
     pub acks_waited: u64,
-    #[serde(default)]
     pub ack_wait_ms_total: u64,
-    #[serde(default)]
     pub acks_aborted: u64,
-    #[serde(default)]
     pub streamed_ahead: u64,
-    #[serde(default)]
     pub streamed_installed: u64,
-    #[serde(default)]
     pub streamed_dropped: u64,
     /// Accepted forwards of this node that could not install as a
     /// shadow (the holder ran unshipped work on their keys before them)
     /// and waited for their transaction, and of those, the ones the
     /// pre-S3 stream answered before the log did.
-    #[serde(default)]
     pub awaited_log: u64,
-    #[serde(default)]
     pub awaited_log_streamed: u64,
     /// Of `awaited_log_streamed`, a delegate's replies (answered from
     /// the root's stream of its append of the delegate's transaction).
-    #[serde(default)]
     pub awaited_log_streamed_deleg: u64,
     /// Uploads of this node's pending chunks for its own forwarded `back`
     /// close, despite the upload hold, because the close waited for
@@ -2071,50 +1528,36 @@ pub struct AckStatus {
     /// that only this upload brings them back, and once per
     /// `CONSTELLATION_OWN_RECORD_WAIT_MS` the close then still waited, or
     /// waited past a stream the sequencer said would carry them.
-    #[serde(default)]
     pub own_record_uploads: u64,
     /// Forward replies whose position this node observed less rows of its
     /// own whose effects it already carries (a `back` close's, deferred on
     /// the sequencer behind its held chunks): no wait and no upload for
     /// them.
-    #[serde(default)]
     pub own_rows_excused: u64,
     /// As sequencer: forwarded replies answered `Held` at once because
     /// the acknowledgement waits for chunks only the requester can upload
     /// (it is asked to upload them).
-    #[serde(default)]
     pub held_for_upload: u64,
-    #[serde(default)]
     pub backup_persisted: u64,
-    #[serde(default)]
     pub seals: u64,
-    #[serde(default)]
     pub backup_takeovers: u64,
-    #[serde(default)]
     pub backup_tail_applied: u64,
-    #[serde(default)]
     pub s3_fast_takeovers: u64,
     /// Root takeovers started because an op this node waits on (accepted,
     /// waiting for the log) needed a root whose lease had run out.
     pub dead_root_acquires: u64,
-    #[serde(default)]
     pub ack_floor_waits: u64,
-    #[serde(default)]
     pub stale_liveness_refusals: u64,
     /// Plan 30 §M10's claim rule: continuation-epoch activations that
     /// did not carry this node's lease (an `ack=s3` lease, or a backup
     /// outside the epoch).
-    #[serde(default)]
     pub epoch_carry_refused: u64,
     /// Plan 30 §M9: definitive refusals of forwarded ops journaled as
     /// outcomes, and refused replays of never-acknowledged ops.
-    #[serde(default)]
     pub refusals_journaled: u64,
-    #[serde(default)]
     pub unacked_replays_refused: u64,
     /// Holder-local reads that waited for durability of the unshipped
     /// rows they would have observed.
-    #[serde(default)]
     pub reads_durability_blocked: u64,
 }
 
@@ -2123,22 +1566,17 @@ pub struct AckStatus {
 /// this node has been deposed, which is what `lost` reports.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LeaseStatus {
-    #[serde(default)]
     pub held: bool,
-    #[serde(default)]
     pub holder: u64,
-    #[serde(default)]
     pub epoch: u64,
-    #[serde(default)]
     pub expires_in_ms: i64,
     /// This node was deposed: it refuses to ship and its unshipped
     /// journal is stranded pending reintegration.
-    #[serde(default)]
     pub lost: bool,
 }
 
 /// Spool observability (DESIGN.md §12): outstanding unflushed metadata.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SpoolStatus {
     /// Journal records not yet shipped to S3.
     pub journal_backlog: u64,
@@ -2146,59 +1584,45 @@ pub struct SpoolStatus {
     pub head_seq: u64,
     /// Foreign records skipped because a pending local op won (phase 2
     /// leaseless conflict detection).
-    #[serde(default)]
     pub conflicts: u64,
     /// Last sync error, if the most recent round failed (S3 outage).
     pub last_ship_error: Option<String>,
     /// `run_managed_sync_round` invocations that ran to completion (plan
     /// 30 M2b measurement counter — see `shipper::SpoolInfo`'s doc).
-    #[serde(default)]
     pub ship_rounds_completed: u64,
     /// Rounds dropped mid-flight for a request that still cancels one
     /// (plan 30 M2b: `Mutate`/`Forward` no longer do — see
     /// `shipper::SpoolInfo`'s doc).
-    #[serde(default)]
     pub ship_rounds_cancelled: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CacheStatus {
     pub used_bytes: u64,
     pub budget_bytes: u64,
     pub chunks: u64,
     /// Bytes protected from eviction by local pins.
-    #[serde(default)]
     pub pinned_bytes: u64,
     /// In-flight (unflushed) write bytes staged to local disk, bounded
     /// independently of the chunk cache (plan 07). Zero on daemons
     /// with no open dirty inode.
-    #[serde(default)]
     pub staging_bytes: u64,
-    #[serde(default)]
     pub staging_budget_bytes: u64,
     /// The chunk memory cache: verified chunk contents kept in RAM so a
     /// cached read neither re-reads nor re-hashes the disk copy
     /// (`CONSTELLATION_CHUNK_MEMCACHE_BYTES`). Budget `0`: off.
-    #[serde(default)]
     pub memory_budget_bytes: u64,
-    #[serde(default)]
     pub memory_used_bytes: u64,
     /// Chunks resident in the memory cache.
-    #[serde(default)]
     pub memory_chunks: u64,
     /// Of `memory_used_bytes`, the protected (reused) segment.
-    #[serde(default)]
     pub memory_protected_bytes: u64,
     /// Chunk reads served from memory.
-    #[serde(default)]
     pub memory_hits: u64,
     /// Chunk reads that loaded and verified the disk copy.
-    #[serde(default)]
     pub memory_misses: u64,
     /// Reads that waited for a concurrent load of the same chunk.
-    #[serde(default)]
     pub memory_coalesced: u64,
-    #[serde(default)]
     pub memory_evictions: u64,
     /// When a disk-cache read re-hashes the chunk file it read
     /// (`--cache-verify`, `CONSTELLATION_CACHE_VERIFY`; plan 38 §2.3):
@@ -2207,13 +1631,11 @@ pub struct CacheStatus {
     /// afterwards; `"always"` re-hashes every disk read. Empty when it
     /// came from a daemon older than the knob — which behaved as
     /// `"always"`, but says so by the absence, not by the value.
-    #[serde(default)]
     pub cache_verify: String,
     /// Holders of a chunk kept un-evictable for an open passthrough
     /// handle (plan 38 §3(c)'s pin-while-open), summed over chunks: equal
     /// to the mounts' `fuse.passthrough.opens` when every such handle sits
     /// on the chunk the engine offered it.
-    #[serde(default)]
     pub open_pins: u64,
 }
 
@@ -2573,18 +1995,12 @@ pub struct CloneParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapPolicyRoot {
     pub ino: u64,
-    #[serde(default)]
     pub path: Option<String>,
     pub expr: String,
-    #[serde(default)]
     pub canonical: Option<String>,
-    #[serde(default)]
     pub paused: bool,
-    #[serde(default)]
     pub error: Option<PolicyErrorInfo>,
-    #[serde(default)]
     pub auto_snapshots: u32,
-    #[serde(default)]
     pub orphaned: bool,
 }
 
@@ -2603,7 +2019,6 @@ pub struct SnapPolicyListing {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapPolicyShown {
     pub root: SnapPolicyRoot,
-    #[serde(default)]
     pub verdicts: Option<SnapPolicyAgainst>,
 }
 
@@ -2637,14 +2052,11 @@ pub struct SnapPolicyDelta {
     pub path: String,
     pub ino: u64,
     pub canonical: String,
-    #[serde(default)]
     pub previous: Option<String>,
-    #[serde(default)]
     pub creates_every: Option<String>,
     pub would_expire: u32,
     pub would_expire_ids: Vec<String>,
     pub grace_note: String,
-    #[serde(default)]
     pub warnings: Vec<String>,
     pub written: bool,
 }
@@ -2678,13 +2090,9 @@ pub struct SnapPolicyRemoveParams {
 pub struct SnapPolicyRemoved {
     pub root: SnapPolicyRoot,
     pub would_expire: u32,
-    #[serde(default)]
     pub would_expire_ids: Vec<String>,
-    #[serde(default)]
     pub expired: Vec<String>,
-    #[serde(default)]
     pub skipped: Vec<SnapPolicySkipped>,
-    #[serde(default)]
     pub error: Option<String>,
     pub written: bool,
 }
@@ -2733,26 +2141,20 @@ pub struct SnapSchedReport {
 pub struct SnapSchedRootState {
     pub ino: u64,
     /// `None` when the directory is gone.
-    #[serde(default)]
     pub path: Option<String>,
     /// The xattr as stored.
     pub expr: String,
     /// `None` when the policy does not parse.
-    #[serde(default)]
     pub canonical: Option<String>,
     pub paused: bool,
     pub due: bool,
-    #[serde(default)]
     pub next_due_unix_ms: Option<i64>,
     /// The name the current bucket's snapshot has (or would have).
-    #[serde(default)]
     pub bucket_name: Option<String>,
     /// Live auto snapshots of this root (held ones included).
     pub auto_snapshots: u64,
-    #[serde(default)]
     pub last_created_unix_ms: Option<i64>,
     pub capped: bool,
-    #[serde(default)]
     pub error: Option<String>,
     /// Σ `USED` of every snapshot of this directory (auto and manual),
     /// from the space-accounting index; `None` while the index is not
@@ -2783,9 +2185,7 @@ pub struct SnapSchedRunParams {
 pub struct SnapSchedRunResult {
     pub dry_run: bool,
     pub leader: bool,
-    #[serde(default)]
     pub refused: Option<String>,
-    #[serde(default)]
     pub error: Option<String>,
     /// The roots the tick asked a snapshot of, ascending by inode.
     pub roots: Vec<SnapSchedRunRoot>,
@@ -2805,9 +2205,7 @@ pub struct SnapSchedRunRoot {
     pub path: String,
     pub name: String,
     pub outcome: String,
-    #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -2974,11 +2372,8 @@ pub struct ViewInfo {
     pub subtree: String,
     pub mountpoint: String,
     pub mounted_ms_ago: u64,
-    #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    #[serde(default)]
     pub qos: ViewQos,
-    #[serde(default)]
     pub confine_links: bool,
 }
 
@@ -3124,9 +2519,7 @@ pub struct XattrParams {
 /// empty for `Set`/`Remove`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct XattrResult {
-    #[serde(default)]
     pub value: Option<ByteBuf>,
-    #[serde(default)]
     pub names: Vec<String>,
 }
 
@@ -3192,15 +2585,12 @@ pub struct ReclaimEstimate {
     pub bytes: u64,
     pub chunks: u64,
     pub as_of_seq: u64,
-    #[serde(default)]
     pub as_of_ms: u64,
     pub building: bool,
-    #[serde(default)]
     pub building_pct: u8,
     /// With `snapshot.reclaim`'s `list_chunks` (a test aid), the counted
     /// chunks' hashes (lowercase hex, sorted); `null` otherwise and while
     /// building.
-    #[serde(default)]
     pub chunk_hashes: Option<Vec<String>>,
 }
 
@@ -3217,10 +2607,8 @@ pub struct SpaceAmount {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SpaceBreakdown {
     /// The path asked about; absent for the whole filesystem.
-    #[serde(default)]
     pub path: Option<String>,
     pub building: bool,
-    #[serde(default)]
     pub building_pct: u8,
     /// Apparent size of the live tree (or of the subtree).
     pub live_logical: u64,
@@ -3242,18 +2630,15 @@ pub struct SpaceBreakdown {
     /// **Estimate**: stored bytes per logical byte (e.g. 0.61), from the
     /// last GC round's census of `chunks/`; absent before any round wrote
     /// one. Show physical figures derived from it with `≈`.
-    #[serde(default)]
     pub physical_ratio: Option<f64>,
     /// **Estimate**: `snapshots_total` in stored bytes (logical ×
     /// `physical_ratio`).
-    #[serde(default)]
     pub physical_estimate: Option<u64>,
     pub as_of_seq: u64,
     pub as_of_ms: u64,
     /// A recheck of the live flags is pending a settled moment (the
     /// replica never was at one commit's state): the "shared with live"
     /// and "reclaimable" figures are an estimate until it runs.
-    #[serde(default)]
     pub estimate_pending: bool,
 }
 
@@ -3282,7 +2667,6 @@ pub struct SnapshotsDeleted {
     pub resolved: Vec<SnapshotStatus>,
     pub deleted: Vec<String>,
     pub refused: Vec<SnapshotRefusal>,
-    #[serde(default)]
     pub reclaim: Option<ReclaimEstimate>,
 }
 
@@ -3327,11 +2711,8 @@ pub struct PolicyErrorInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapReason {
     pub kind: String,
-    #[serde(default)]
     pub every: Option<String>,
-    #[serde(default)]
     pub last: Option<u32>,
-    #[serde(default)]
     pub held_by: Option<String>,
 }
 
@@ -3350,11 +2731,9 @@ pub struct SnapVerdict {
     pub origin: String,
     pub policy_ino: u64,
     pub held: bool,
-    #[serde(default)]
     pub held_by: Option<String>,
     pub keep: bool,
     pub reasons: Vec<SnapReason>,
-    #[serde(default)]
     pub expires_unix_ms: Option<i64>,
 }
 
@@ -3385,23 +2764,14 @@ pub struct SnapPolicyAgainst {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapPolicyCheckResult {
     pub ok: bool,
-    #[serde(default)]
     pub canonical: Option<String>,
-    #[serde(default)]
     pub error: Option<PolicyErrorInfo>,
-    #[serde(default)]
     pub warnings: Vec<String>,
-    #[serde(default)]
     pub steady_state_bound: Option<u64>,
-    #[serde(default)]
     pub simulated_count: Option<u64>,
-    #[serde(default)]
     pub simulate_horizon_ms: Option<u64>,
-    #[serde(default)]
     pub simulate_truncated: bool,
-    #[serde(default)]
     pub simulate_reached_ms: Option<u64>,
-    #[serde(default)]
     pub against: Option<SnapPolicyAgainst>,
 }
 
@@ -3427,14 +2797,12 @@ pub struct SnapTimeline {
     pub paused: bool,
     pub now_unix_ms: i64,
     pub horizon_unix_ms: i64,
-    #[serde(default)]
     pub cadence: Option<String>,
     pub snapshots: Vec<SnapTimelineEntry>,
     pub counts: Vec<SnapCountPoint>,
     pub created: u32,
     pub expired: u32,
     pub final_count: u32,
-    #[serde(default)]
     pub steady_state_bound: Option<u64>,
     pub truncated: bool,
 }
@@ -3449,13 +2817,10 @@ pub struct SnapTimelineEntry {
     pub synthetic: bool,
     pub candidate: bool,
     pub held: bool,
-    #[serde(default)]
     pub held_by: Option<String>,
     pub keep: bool,
     pub reasons: Vec<SnapReason>,
-    #[serde(default)]
     pub expires_unix_ms: Option<i64>,
-    #[serde(default)]
     pub expired_unix_ms: Option<i64>,
 }
 
@@ -3507,17 +2872,14 @@ pub struct OpsReport {
     pub stalled: u64,
     /// The age of the oldest non-blocking one.
     pub oldest_s: u64,
-    #[serde(default)]
     pub stall_threshold_s: u64,
     /// The operations, oldest first, at most `OPS_LIST_MAX` of them
     /// (`truncated` says whether there were more).
     pub ops: Vec<OpEntry>,
-    #[serde(default)]
     pub truncated: bool,
     /// Per view (by id), with its labels; operations of no view are under
     /// `view: null`. Counts cover all matching operations, not only the
     /// listed ones.
-    #[serde(default)]
     pub views: Vec<ViewOps>,
 }
 
@@ -3536,23 +2898,18 @@ pub struct OpEntry {
     /// The OS thread handling it.
     pub tid: u32,
     /// A blocking lock request: unbounded by design, not a stall.
-    #[serde(default)]
     pub blocking: bool,
     /// The watchdog has reported it as stalled.
-    #[serde(default)]
     pub stalled: bool,
     /// The view (by id) it belongs to.
-    #[serde(default)]
     pub view: Option<u64>,
 }
 
 /// One view's share of `node.ops`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ViewOps {
-    #[serde(default)]
     pub view: Option<u64>,
     /// The view's full label map (`view.list`'s).
-    #[serde(default)]
     pub labels: BTreeMap<String, String>,
     pub in_flight: u64,
     pub stalled: u64,
@@ -3587,53 +2944,37 @@ pub struct LifecycleStatus {
     /// `leases` (`hold`/`forward-only`), `uploads`
     /// (`always`/`unmetered-only`), `background`
     /// (`continuous`/`on-demand`).
-    #[serde(default)]
     pub profile: BTreeMap<String, String>,
     /// `foreground`, `background`, `suspending` or `suspended`.
-    #[serde(default)]
     pub state: String,
     /// The host asked for reduced background work (until the next
     /// `Foreground` or `Resumed`).
-    #[serde(default)]
     pub low_power: bool,
     /// The last `NetworkChanged` (reachable and unmetered until one says
     /// otherwise).
-    #[serde(default)]
     pub network_reachable: bool,
-    #[serde(default)]
     pub network_metered: bool,
     /// In force: the authority core never takes the lease from a live
     /// holder (the profile's `forward-only`, or a suspension).
-    #[serde(default)]
     pub forward_only: bool,
     /// In force: the core takes no lease at all (a suspension).
-    #[serde(default)]
     pub suspended: bool,
     /// In force: opportunistic chunk uploads hold (`unmetered-only` on a
     /// metered network), and how often the hold deferred one.
-    #[serde(default)]
     pub uploads_held: bool,
-    #[serde(default)]
     pub upload_deferrals: u64,
     /// In force: GC, prune, digests, pin refreshes, registry and
     /// designation polls are paused.
-    #[serde(default)]
     pub background_paused: bool,
     /// The P2P endpoint admits inbound connections / takes part in
     /// gossip (both false without P2P; a suspension refuses both, and
     /// only this node's own requests dial out).
-    #[serde(default)]
     pub p2p_accepts_inbound: bool,
-    #[serde(default)]
     pub p2p_gossip: bool,
     /// Lifecycle events applied since the engine started, and the last.
-    #[serde(default)]
     pub events: u64,
-    #[serde(default)]
     pub last_event: Option<String>,
-    #[serde(default)]
     pub last_suspend: Option<SuspendReport>,
-    #[serde(default)]
     pub last_resume: Option<ResumeReport>,
 }
 
@@ -3648,12 +2989,10 @@ pub struct SuspendReport {
     /// per view that failed or did not finish in time.
     pub views: u64,
     pub views_synced: u64,
-    #[serde(default)]
     pub view_errors: Vec<String>,
     /// The flush — every pending chunk up, the journal shipped, the lease
     /// released — finished; why not, when it did not.
     pub flushed: bool,
-    #[serde(default)]
     pub flush_error: Option<String>,
     /// This node held no lease once the steps ran.
     pub lease_released: bool,
@@ -3813,10 +3152,7 @@ pub enum HandoffState {
     Sealed,
     /// Receiver: serving the views it resumed (failed ones listed in
     /// `failed`: their sessions ended).
-    Resumed {
-        #[serde(default)]
-        failed: Vec<String>,
-    },
+    Resumed { failed: Vec<String> },
     /// Receiver: gave up (aborted, or the deadline passed); it exits.
     Failed { reason: String },
 }
@@ -3830,7 +3166,6 @@ pub struct HandedOffView {
     pub handles: u64,
     /// The transport its connection is served over (`dev_fuse`: the only
     /// one that can be handed over, plan 38 §3(e)).
-    #[serde(default)]
     pub transport: String,
 }
 
@@ -3840,14 +3175,11 @@ pub struct HandedOffView {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HandoffReport {
     /// A human-readable summary (the old `Upgrade` answer).
-    #[serde(default)]
     pub detail: String,
     pub views: Vec<HandedOffView>,
     /// `Socket` only: the state the step left.
-    #[serde(default)]
     pub state: Option<HandoffState>,
     /// How long the step took.
-    #[serde(default)]
     pub elapsed_ms: u64,
 }
 
@@ -3902,21 +3234,14 @@ pub struct ControlEvent {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FsInfo {
     pub uuid: String,
-    #[serde(default)]
     pub name: Option<String>,
     pub bucket: String,
-    #[serde(default)]
     pub prefix: String,
-    #[serde(default)]
     pub chunk_size: u32,
-    #[serde(default)]
     pub compression: String,
-    #[serde(default)]
     pub e2e: bool,
-    #[serde(default)]
     pub write_mode: String,
     /// Whether this daemon has the credentials to open it (`fs.unlock`).
-    #[serde(default)]
     pub unlocked: bool,
     /// The daemon's own filesystem only (0 elsewhere): how many times
     /// `fs.unlock` has set the S3 credentials its engine signs with (0:
@@ -4011,7 +3336,6 @@ pub struct FsDoctorCheck {
     pub fs: String,
     pub check: String,
     pub ok: bool,
-    #[serde(default)]
     pub detail: String,
 }
 
@@ -4131,22 +3455,27 @@ mod tests {
 
     #[test]
     fn status_report_survives_postcard() {
-        // The largest type: build it from the minimal JSON a client with no
-        // optional counters would send, then push it through postcard.
-        let minimal = serde_json::json!({
-            "fs_uuid": "u", "backend": "s3", "uptime_s": 5,
-            "spool": {"journal_backlog": 0, "head_seq": 4},
-            "cache": {"used_bytes": 0, "budget_bytes": 10, "chunks": 0},
-            // A peer with a cooperative-cache source: the shape that once
-            // carried `skip_serializing_if`, which postcard cannot read back.
-            "p2p": {"peers": [{"node_id": 3, "coop": {"id": "s3"}}]}
+        // The largest type, with a peer carrying a cooperative-cache source:
+        // the shape that once carried `skip_serializing_if`, which postcard
+        // cannot read back.
+        let mut report = StatusReport {
+            fs_uuid: "u".into(),
+            backend: "s3".into(),
+            ..Default::default()
+        };
+        report.spool.head_seq = 4;
+        report.p2p.peers.push(PeerStatus {
+            node_id: 3,
+            coop: Some(SourceStatus {
+                id: "s3".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
         });
-        let report: StatusReport = serde_json::from_value(minimal).unwrap();
         let blob = Blob::encode(Encoding::Postcard, &report).unwrap();
         let back: StatusReport = blob.decode().unwrap();
         assert_eq!(back.fs_uuid, "u");
         assert_eq!(back.spool.head_seq, 4);
-        assert!(back.enrolled);
         let peer = &back.p2p.peers[0];
         assert_eq!(peer.node_id, 3);
         assert_eq!(peer.coop.as_ref().unwrap().id, "s3");

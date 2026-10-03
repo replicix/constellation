@@ -296,7 +296,6 @@ struct QueuedReplay {
     /// speculation. Queued so reads of its keys wait until the successor
     /// (which re-ships it, or dedups its replay) settles it; a refusal
     /// makes no conflict copy (the op's own requester replays it).
-    #[serde(default)]
     foreign: bool,
     /// A foreign entry's [`SpecKind::Streamed::source`]: the node whose
     /// unshipped journal it came from. `None` for every other entry.
@@ -307,13 +306,11 @@ struct QueuedReplay {
     /// the table — the delegate re-streams it to the successor root, or
     /// the generation ends — so a successor never executes it ahead of
     /// the delegate's earlier transactions (long-delegated seed 70075).
-    #[serde(default)]
     gen: u64,
     /// A size-only `setattr` (the FUSE truncate path, `O_TRUNC`
     /// included): the manifest its inode had just before it, from the
     /// stranded row's before-image. A manifest commit for the same inode
     /// queued after it is rebased onto this (see [`rebase_on_truncate`]).
-    #[serde(default)]
     truncate_base: Option<Vec<u8>>,
 }
 

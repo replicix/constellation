@@ -49,7 +49,6 @@ pub struct Profile {
     /// Plan 30 §M8: the mounts run `--cto strict`. Recorded in the
     /// history (an `Info` event `cto:strict`), which makes the
     /// close-to-open checker enforced when the history is checked.
-    #[serde(default)]
     pub cto_strict: bool,
 }
 

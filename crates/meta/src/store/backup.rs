@@ -66,7 +66,6 @@ pub struct BackupTx {
     /// retired, and every later segment's insert-before-`Local` redo
     /// re-applied it on top of newer state (delegated-holder-cut seed
     /// 1719: a stale `unlink f0` deleted the re-created `f0`).
-    #[serde(default)]
     pub origin: (u64, u64),
 }
 

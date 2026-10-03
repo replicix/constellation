@@ -58,11 +58,9 @@ pub struct NodeInfo {
     /// The roster's safety does not rest on this default: see
     /// [`write_eligible_roster`], which refuses to answer at all if any
     /// record fails to parse.
-    #[serde(default)]
     pub ro: bool,
     /// Permanent departure tombstone (phase 4c). The object stays so the
     /// numeric id is never recycled; epochs and P2P ignore it.
-    #[serde(default)]
     pub retired: bool,
     /// When the record was retired; absent on live members.
     #[serde(default, skip_serializing_if = "Option::is_none")]

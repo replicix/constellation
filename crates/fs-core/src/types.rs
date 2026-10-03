@@ -68,7 +68,6 @@ pub struct FileAttr {
     pub nlink: u32,
     /// Access time, nanoseconds since the unix epoch (noatime semantics:
     /// set by utimensat/touch, not implicitly by reads).
-    #[serde(default)]
     pub atime_ns: i64,
     /// Modification time, nanoseconds since the unix epoch.
     pub mtime_ns: i64,
@@ -77,7 +76,6 @@ pub struct FileAttr {
     /// Device number for block/char device nodes, `(0, 0)` otherwise. The
     /// portable pair (plan 31 §7); a frontend packs it into its OS's
     /// encoding at its own boundary.
-    #[serde(default)]
     pub rdev: Rdev,
 }
 

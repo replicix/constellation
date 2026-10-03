@@ -174,7 +174,6 @@ pub struct InboxBatch {
     /// written itself into `wanted_by` — it learns at its next poll of
     /// this requester rather than at its half-TTL renewal, with no extra
     /// S3 request on either side.
-    #[serde(default)]
     pub wants_lease: bool,
 }
 
