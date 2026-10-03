@@ -7,7 +7,12 @@
 # segments, the policy card, the (hidden) silent-failure banner, and no JS
 # error (the page writes a `data-js-error` marker on window errors,
 # unhandled rejections and console.error; Chrome's stderr is grepped for
-# `Uncaught` too). A screenshot is kept for the report.
+# `Uncaught` too). Then it opens the policy editor on /proj through the URL
+# (`#edit=/proj&preset=standard`: the editor loads the root's policy and
+# applies the Standard preset) and asserts the rows, the daemon's canonical
+# form, and the retention timeline SVG (one lane per tier plus held/manual,
+# ticks — future ones and the csi pin among them — and the count chart).
+# Screenshots of both are kept for the report.
 #
 # Usage: tests/webui-headless.sh
 #
@@ -21,6 +26,7 @@
 #   CONSTELLATION_BIN   binary under test (default
 #                       ${CARGO_TARGET_DIR:-target}/debug/constellation)
 #   WEBUI_SHOT          screenshot path (default: a fresh file under /tmp)
+#   WEBUI_EDITOR_SHOT   the editor's screenshot (default: next to WEBUI_SHOT)
 #   CONSTELLATION_SNAPSCHED  passed to the daemon; defaults to 0 here (rows
 #                       are deterministic); 1 runs the scheduler against
 #                       the paused policy
@@ -50,6 +56,7 @@ command -v curl >/dev/null || fail "curl is needed"
 work="$(mktemp -d /tmp/webui-headless.XXXXXX)"
 backend="$work/backend" mnt="$work/mnt" state="$work/state" log="$work/mount.log"
 shot="${WEBUI_SHOT:-$work/snapshots.png}"
+edshot="${WEBUI_EDITOR_SHOT:-$(dirname "$shot")/editor.png}"
 mkdir -p "$mnt" "$state"
 pid=""
 cleanup() {
@@ -61,9 +68,10 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     fi
-    # The screenshot outlives the work dir when it lives in it.
+    # The screenshots outlive the work dir when they live in it.
     if [ "${KEEP:-0}" != 1 ]; then
-        find "$work" -mindepth 1 -maxdepth 1 ! -name "$(basename "$shot")" -exec rm -rf {} + 2>/dev/null || true
+        find "$work" -mindepth 1 -maxdepth 1 ! -name "$(basename "$shot")" ! -name "$(basename "$edshot")" \
+            -exec rm -rf {} + 2>/dev/null || true
         rmdir "$work" 2>/dev/null || true
     fi
 }
@@ -165,4 +173,90 @@ say "headless Chrome: screenshot"
     || fail "chrome --screenshot failed"
 [ -s "$shot" ] || fail "no screenshot at $shot"
 echo "screenshot: $shot"
+
+# The policy editor (7.3) and the retention timeline (7.4), opened by the
+# URL: /proj's policy loaded, then the Standard preset applied. Everything
+# asserted below is drawn from snapshot.policy.check/simulate answers.
+edurl="$base/snapshots.html#edit=/proj&preset=standard"
+edflags=(--headless=new --disable-gpu --no-sandbox --hide-scrollbars --window-size=1500,1250
+         --virtual-time-budget=12000)
+say "headless Chrome: the policy editor ($edurl)"
+eddom="$work/editor-dom.html"
+"$chrome" "${edflags[@]}" --enable-logging=stderr --v=0 --dump-dom "$edurl" \
+    >"$eddom" 2>"$errlog" || { tail -20 "$errlog" >&2; fail "chrome --dump-dom (editor) failed"; }
+python3 - "$eddom" "$rendered" <<'PY2'
+import re, sys
+t = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+t = re.sub(r"<script\b.*?</script>", "", t, flags=re.S | re.I)
+t = re.sub(r"<!--.*?-->", "", t, flags=re.S)
+open(sys.argv[2], "w", encoding="utf-8").write(t)
+PY2
+count() { grep -o -- "$1" "$rendered" | wc -l; }
+check '<dialog id="policyEditor"[^>]* open' "the editor dialog, open"
+[ "$(count '<div class="tier" role="listitem"')" -eq 4 ] || fail "expected the Standard preset's 4 tier rows, found $(count '<div class="tier" role="listitem"')"
+echo "ok: 4 tier rows (the Standard preset)"
+check '<code id="edCanonical">15m:1d 1h:2d 1d:30d 1mo:1y; paused</code>' "the daemon's canonical form of the preset (the root's paused flag kept)"
+check '<svg id="timelineChart"' "the retention timeline"
+lanes="$(count '<g class="lane" data-lane="')"
+[ "$lanes" -ge 5 ] || fail "expected >= 5 timeline lanes (4 tiers + held/manual), found $lanes"
+for lane in tier:15m tier:1h tier:1d tier:1mo held; do
+    check "data-lane=\"$lane\"" "the $lane lane"
+done
+ticks="$(count 'class="mk tick')"
+[ "$ticks" -ge 3 ] || fail "expected timeline ticks, found $ticks"
+echo "ok: $ticks timeline ticks"
+check 'class="mk tick future"' "future (simulated) ticks"
+check '<g class="mk tick held"' "the held snapshot's pin"
+check '>csi</text>' "the pin's owner namespace label"
+check '<svg id="countChart"' "the snapshot-count step chart"
+if grep -q 'data-js-error' "$eddom"; then
+    grep -o '<div class="js-error"[^<]*' "$eddom" >&2
+    fail "the editor raised a JS error"
+fi
+if grep -E 'Uncaught|CONSOLE.*(Error|error)' "$errlog" >&2; then
+    fail "JS error in Chrome's log (editor)"
+fi
+echo "ok: no JS error (editor)"
+
+# Text → check: an expression typed into the field (`&expr=`, a `7m` tier)
+# comes back from snapshot.policy.check as an error at a byte offset, shown
+# with a caret under it as the CLI prints it; a valid one fills the rows
+# from the daemon's canonical form.
+say "headless Chrome: an invalid and a valid typed expression"
+for case in bad good; do
+    if [ "$case" = bad ]; then expr='5m:1d%207m:1d'; else expr='1d:7d%3B%20tz%3DEurope%2FBudapest%201h:1d'; fi
+    "$chrome" "${edflags[@]}" --dump-dom "$base/snapshots.html#edit=/proj&expr=$expr" \
+        >"$eddom" 2>"$errlog" || fail "chrome --dump-dom ($case expression) failed"
+    python3 - "$eddom" "$rendered" <<'PY2'
+import re, sys
+t = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+t = re.sub(r"<script\b.*?</script>", "", t, flags=re.S | re.I)
+open(sys.argv[2], "w", encoding="utf-8").write(t)
+PY2
+    grep -q 'data-js-error' "$eddom" && fail "the editor raised a JS error ($case expression)"
+    if [ "$case" = bad ]; then
+        # The caret sits under byte 6, the `7m` tier: `5m:1d 7m:1d` then
+        # six spaces and `^ `.
+        python3 - "$rendered" <<'PY2' || fail "no caret under byte 6 of the invalid expression"
+import html, re, sys
+t = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'<pre class="caret"[^>]*>(.*?)</pre>', t, re.S)
+assert m, "no caret block"
+lines = html.unescape(m.group(1)).split("\n")
+assert lines[0] == "5m:1d 7m:1d" and lines[1].startswith(" " * 6 + "^ "), lines
+print("ok: caret:", lines[1].strip())
+PY2
+    else
+        check '<code id="edCanonical">1h:1d 1d:7d; tz=Europe/Budapest</code>' "the canonical form of the typed expression"
+        [ "$(count '<div class="tier" role="listitem"')" -eq 2 ] || fail "the typed expression did not fill 2 tier rows"
+        check '<option value="1h" selected="">1 hour</option>' "the 1h row"
+        check '<option value="1d" selected="">1 day</option>' "the 1d row"
+        echo "ok: text → rows (2 rows from the canonical form)"
+    fi
+done
+
+"$chrome" "${edflags[@]}" --screenshot="$edshot" "$edurl" >/dev/null 2>&1 \
+    || fail "chrome --screenshot (editor) failed"
+[ -s "$edshot" ] || fail "no screenshot at $edshot"
+echo "screenshot: $edshot"
 echo "PASS: webui-headless"

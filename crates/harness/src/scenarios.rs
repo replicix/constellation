@@ -4218,6 +4218,94 @@ fn web_ui_smoke(_seed: u64) -> Result<()> {
             .is_some_and(|rows| rows.iter().any(|row| row["name"] == "web-ui-smoke")),
         "snapshot not listed through HTTP: {listed}"
     );
+    // Plan 32 Step 7: what the snapshots page's editor, timeline and space
+    // views call, over HTTP, each answer well-formed. An invalid
+    // expression is a *result* (`ok: false` with the byte offset the
+    // editor puts its caret under), not a failed call. The accounting
+    // index is built on first use, so `snapshot.space` is polled until it
+    // has caught up; `snapshot.reclaim` then answers for the snapshot
+    // above.
+    type Check = fn(&serde_json::Value) -> bool;
+    eventually("snapshot.space built", Duration::from_secs(60), || {
+        let space = request("snapshot.space", serde_json::json!({}))?;
+        anyhow::ensure!(space["building"] == false, "still building: {space}");
+        Ok(())
+    })?;
+    let step7: [(&str, serde_json::Value, Check); 5] = [
+        (
+            "snapshot.policy.check",
+            serde_json::json!({"expr": "1d:7d 1h:1d"}),
+            |r| {
+                r["ok"] == true
+                    && r["canonical"] == "1h:1d 1d:7d"
+                    && r["steady_state_bound"] == 31
+                    && r["simulated_count"].is_u64()
+            },
+        ),
+        (
+            "snapshot.policy.check",
+            serde_json::json!({"expr": "5m:1d 7m:1d"}),
+            |r| {
+                r["ok"] == false
+                    && r["error"]["offset"] == 6
+                    && r["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("7m"))
+                    && r["canonical"].is_null()
+            },
+        ),
+        (
+            "snapshot.policy.simulate",
+            serde_json::json!({"path": "/", "expr": "1h:1d", "horizon_ms": 86_400_000}),
+            |r| {
+                let snaps = r["snapshots"].as_array();
+                r["policy"] == "1h:1d"
+                    && r["cadence"] == "1h"
+                    && r["horizon_unix_ms"]
+                        .as_i64()
+                        .zip(r["now_unix_ms"].as_i64())
+                        .is_some_and(|(h, n)| h - n == 86_400_000)
+                    && r["created"].as_u64().is_some_and(|n| n >= 24)
+                    && r["counts"].as_array().is_some_and(|c| !c.is_empty())
+                    // The real manual snapshot is carried through, never
+                    // this policy's to expire; the rest are synthetic.
+                    && snaps.is_some_and(|s| {
+                        s.iter().any(|e| {
+                            e["synthetic"] == false && e["candidate"] == false && e["keep"] == true
+                        }) && s.iter().any(|e| e["synthetic"] == true)
+                    })
+            },
+        ),
+        ("snapshot.space", serde_json::json!({}), |r| {
+            r["building"] == false
+                && ["live_logical", "gc_horizon_ms", "as_of_seq"]
+                    .iter()
+                    .all(|k| r[*k].is_u64())
+                && [
+                    "snapshots_total",
+                    "unique",
+                    "shared_snapshots_only",
+                    "shared_with_live",
+                    "awaiting_gc",
+                ]
+                .iter()
+                .all(|k| r[*k]["bytes"].is_u64() && r[*k]["chunks"].is_u64())
+        }),
+        (
+            "snapshot.reclaim",
+            serde_json::json!({"selectors": ["/@web-ui-smoke"]}),
+            |r| {
+                r["building"] == false
+                    && ["bytes", "chunks", "as_of_seq"]
+                        .iter()
+                        .all(|k| r[*k].is_u64())
+            },
+        ),
+    ];
+    for (method, params, ok) in step7 {
+        let reply = request(method, params.clone())?;
+        anyhow::ensure!(ok(&reply), "{method} {params}: malformed answer {reply}");
+    }
     request(
         "snapshot.delete",
         serde_json::json!({"selector":"/@web-ui-smoke"}),

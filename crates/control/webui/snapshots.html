@@ -4,12 +4,14 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Constellation · Snapshots</title>
 <!--
-  Plan 32 Step 7 (7.1 space overview, 7.2 policy roots, 7.5 snapshot table and
-  "written over time"). Vanilla JS, no build step, hand-drawn SVG, the dark
+  Plan 32 Step 7 (7.1 space overview, 7.2 policy roots, 7.3 policy editor,
+  7.4 retention timeline, 7.5 snapshot table and "written over time").
+  Vanilla JS, no build step, hand-drawn SVG, the dark
   theme of index.html/peers.html. The page holds no retention or accounting
   logic: every number and verdict is an API answer rendered as is —
   snapshot.space for the bar, snapshot.reclaim for a selection, the
-  policy.show verdicts for KEPT BY/EXPIRES. Plan 33's SPA ports this screen
+  policy.show verdicts for KEPT BY/EXPIRES, policy.check for an expression's
+  validity and canonical form, policy.simulate for the timeline. Plan 33's SPA ports this screen
   later (its Screen 5).
 -->
 <style>
@@ -85,6 +87,35 @@ dialog::backdrop{background:#0008}
 #msg:empty{display:none}
 #msg{white-space:pre-wrap}
 #snapWarn{border:1px solid #6b2f3a;background:#32141a;color:#ff8f9c;border-radius:10px;padding:10px 16px}#snapWarn a{color:#ffd27a}
+/* Policy editor (7.3) and retention timeline (7.4) */
+dialog#policyEditor{width:min(1480px,97vw)}
+.ed-grid{display:grid;grid-template-columns:minmax(0,440px) minmax(0,1fr);gap:16px;margin-top:10px}
+@media (max-width:1100px){.ed-grid{grid-template-columns:minmax(0,1fr)}}
+.ed-grid section{min-width:0}
+.ed-grid h3{color:#8eb7ff;margin:4px 0 8px}
+.tier{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
+.tier .n{width:5.2em}
+.tier .lane-sw{width:10px;height:22px;border-radius:3px;flex:none;margin-right:4px}
+.ed-adv{margin:8px 0;border:1px solid #26304d;border-radius:6px;padding:6px 8px}
+.ed-adv summary{cursor:pointer;color:#8eb7ff}
+.ed-adv .kv{grid-template-columns:110px 1fr;align-items:center}
+textarea{width:100%;background:#0b1020;color:inherit;border:1px solid #3c4c78;border-radius:5px;padding:6px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;resize:vertical}
+pre.caret{margin:6px 0;padding:6px 8px;background:#32141a;border:1px solid #6b2f3a;border-radius:5px;overflow-x:auto;white-space:pre;font-size:13px}
+#edCheck{font-size:13px;margin:6px 0}
+#edCheck code{word-break:break-all}
+.ed-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:10px}
+#edSaveMsg{white-space:pre-wrap}
+#timelineChart,#countChart{width:100%;display:block}
+#timelineChart text,#countChart text{fill:#8e9abb;font-size:11px}
+#timelineChart text.lane-lbl{fill:#dbe4ff;font-size:12px}
+#timelineChart line.grid,#countChart line.grid{stroke:#1b243d}
+#timelineChart line.now,#countChart line.now{stroke:#8eb7ff;stroke-dasharray:3 3}
+#timelineChart .mk{cursor:default}
+.tl-legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;margin:6px 0}
+.tl-legend span{display:inline-flex;align-items:center;gap:5px}
+.tl-legend svg{flex:none}
+#confirmExpire{width:min(640px,94vw)}
+#confirmExpire ul{max-height:180px;overflow:auto;margin:6px 0;padding-left:20px}
 @media (max-width:700px){main{padding:10px}.kv{grid-template-columns:100px 1fr}td.name{min-width:140px}}
 </style>
 </head>
@@ -138,14 +169,61 @@ dialog::backdrop{background:#0008}
   </section>
 </main>
 
-<!-- Plan 32 M6b: the policy editor (7.3) and the retention timeline (7.4)
-     mount inside #policyEditorBody. This chunk ships the dialog shell and
-     the directory picker "Add policy" needs. -->
+<!-- The policy editor (7.3) and the retention timeline (7.4). `#edit=/dir`
+     in the URL opens it on load; `&preset=standard` then applies a preset,
+     `&expr=…` types an expression (the headless check uses all three). -->
 <dialog id="policyEditor" aria-labelledby="editorTitle">
-  <div class="head"><h2 id="editorTitle">Policy</h2><button type="button" onclick="policyEditor.close()" aria-label="close">✕</button></div>
+  <div class="head"><h2 id="editorTitle">Policy</h2><button type="button" onclick="closeEditor()" aria-label="close">✕</button></div>
   <div class="kv"><span>directory</span><span id="editorPath" class="mono">—</span></div>
   <div id="editorPicker"></div>
-  <div id="policyEditorBody" data-m6b="policy-editor"><p class="muted">The policy editor and retention timeline are not built yet (plan 32 M6b). Until then use <code>constellation snapshot policy set &lt;path&gt; '&lt;expr&gt;'</code>.</p></div>
+  <div id="policyEditorBody" class="ed-grid">
+   <section aria-labelledby="edTiersTitle">
+    <h3 id="edTiersTitle">Tiers</h3>
+    <div>presets
+     <button type="button" data-preset="light" title="1h:1d 1d:7d">Light</button>
+     <button type="button" data-preset="standard" title="15m:1d 1h:2d 1d:30d 1mo:1y">Standard</button>
+     <button type="button" data-preset="dense" title="5m:1d 1h:7d 1d:30d 1w:12w 1mo:1y">Dense</button>
+    </div>
+    <div id="tierRows" role="list" aria-label="tiers"></div>
+    <button type="button" id="addTier">+ Add tier</button>
+    <label class="muted" style="display:block;margin-top:4px"><input type="checkbox" id="edTestOnly"> show test-only intervals (1m, seconds)</label>
+    <details class="ed-adv" id="edAdvanced"><summary>Advanced</summary>
+     <div class="kv">
+      <label for="edTz">timezone</label><select id="edTz"></select>
+      <label for="edDayStart">day-start</label><span><input id="edDayStart" type="time" step="60" value="00:00"> <span class="muted">day/week/month/year boundary</span></span>
+      <label for="edWeekStart">week-start</label><select id="edWeekStart"><option value="mon">Monday (ISO)</option><option value="sun">Sunday</option></select>
+      <label for="edLast">last</label><span><input id="edLast" type="number" min="1" value="1" style="width:6em"> <span class="muted">newest kept always</span></span>
+      <label for="edSkipEmpty">skip-empty</label><select id="edSkipEmpty"><option value="yes">yes — skip when nothing changed</option><option value="no">no — one per interval, even idle</option></select>
+      <label for="edPaused">paused</label><span><input id="edPaused" type="checkbox"> <span class="muted">no creation, no expiry</span></span>
+      <label for="edBudget">budget</label><input id="edBudget" disabled placeholder="coming with budgets" aria-describedby="edBudgetNote">
+     </div>
+     <div id="edBudgetNote" class="muted note">budget: coming with budgets (plan 32 M7)</div>
+    </details>
+    <label for="edExpr"><b>Expression</b> <span class="muted">— what the CLI and <code>getfattr</code> show; paste or edit</span></label>
+    <textarea id="edExpr" rows="2" spellcheck="false" autocomplete="off" aria-describedby="edCheck"></textarea>
+    <div id="edCheck" aria-live="polite"></div>
+    <div class="ed-actions">
+     <button type="button" id="edSave">Save</button>
+     <button type="button" onclick="closeEditor()">Cancel</button>
+     <span id="edSaveMsg" role="status"></span>
+    </div>
+   </section>
+   <section aria-labelledby="tlTitle">
+    <div class="head" style="margin:0"><h3 id="tlTitle">Retention timeline</h3>
+     <label>horizon <select id="tlHorizon">
+      <option value="86400000">1 day</option><option value="604800000">7 days</option>
+      <option value="2592000000" selected>30 days</option><option value="7776000000">90 days</option>
+      <option value="15552000000">180 days</option><option value="31536000000">1 year</option></select></label></div>
+    <div id="timeline"><span class="muted">—</span></div>
+    <div id="tlSummary" class="muted note"></div>
+   </section>
+  </div>
+</dialog>
+
+<dialog id="confirmExpire" aria-labelledby="cxTitle">
+  <h2 id="cxTitle">This policy expires snapshots</h2>
+  <div id="cxBody"></div>
+  <div class="ed-actions"><button type="button" id="cxCancel">Cancel</button><button type="button" id="cxOk" class="danger">Save and expire</button></div>
 </dialog>
 
 <div id="tip" role="tooltip"></div>
@@ -354,30 +432,452 @@ async function removePolicy(ino,expire){
  showMsg(r.error?`remove --expire ${path}: ${errText(r.error)}`:(r.ok.error?`remove --expire ${path}: ${r.ok.error}`:""));load();
 }
 
-// ---- policy editor shell (M6b fills it) -------------------------------------
+// ---- 7.3 policy editor ------------------------------------------------------
+// The editor turns its rows into expression *text* (string building only)
+// and reads rows back from the daemon's canonical form. Whether a policy is
+// valid, what it keeps, what it expires and when are snapshot.policy.check /
+// .simulate / .set answers; the dropdowns offer the grammar's fixed sets
+// (the calendar-dividing intervals) and nothing else is validated here.
+const $=id=>document.getElementById(id);
+const INTERVALS=[["5m","5 min"],["10m","10 min"],["15m","15 min"],["20m","20 min"],["30m","30 min"],["1h","1 hour"],["2h","2 hours"],["3h","3 hours"],["4h","4 hours"],["6h","6 hours"],["8h","8 hours"],["12h","12 hours"],["1d","1 day"],["1w","1 week"],["1mo","1 month"],["1y","1 year"]];
+const TEST_INTERVALS=[["10s","10 s (test)"],["12s","12 s (test)"],["15s","15 s (test)"],["20s","20 s (test)"],["30s","30 s (test)"],["1m","1 min (test)"]];
+// `m` is minutes, serialized as the canonical `min` (a bare `m` keep next
+// to a monthly tier is a parse error: minute or month?).
+const KEEP_UNITS=[["m","min"],["h","hours"],["d","days"],["w","weeks"],["mo","months"],["y","years"],["*","forever"]];
+const PRESETS={light:"1h:1d 1d:7d",standard:"15m:1d 1h:2d 1d:30d 1mo:1y",dense:"5m:1d 1h:7d 1d:30d 1w:12w 1mo:1y"};
+// Categorical by tier, finest first: the dataviz dark categorical slots
+// 1–7 (slots 1–5 are the space bar's). Slot 8 (red) is reserved for
+// "would expire". Every lane carries its tier as a label: color is never
+// the only signal.
+const TIER_COLORS=["#3987e5","#d95926","#199e70","#c98500","#d55181","#008300","#9085e9"];
+const EXPIRE_RED="#e66767", NEUTRAL="#8e9abb", PIN="#dbe4ff";
+const BROWSER_TZ=(()=>{try{return Intl.DateTimeFormat().resolvedOptions().timeZone||"UTC";}catch(e){return"UTC";}})();
+const ed={rows:[],path:"/",seq:0,timer:null,checked:null,timeline:null,against:new Map(),origin:"rows",marks:[]};
+
+/** "15m:1d" (a preset, or a tier of the daemon's canonical form) → a row. */
+function rowOf(tier){
+ const i=tier.indexOf(":"), every=tier.slice(0,i), keep=tier.slice(i+1);
+ if(keep==="*")return{every,n:1,unit:"*"};
+ const m=/^(\d+)(min|mo|m|h|d|w|y)$/.exec(keep)||[null,"1","d"];
+ return{every,n:Number(m[1]),unit:m[2]==="min"?"m":m[2]};
+}
+const tierText=r=>`${r.every}:${r.unit==="*"?"*":r.n+(r.unit==="m"?"min":r.unit)}`;
+/** The tiers and settings of a canonical expression, by splitting it. */
+function splitPolicy(c){
+ const parts=String(c||"").split(";").map(s=>s.trim()).filter(Boolean);
+ const tiers=(parts[0]||"").split(/\s+/).filter(t=>t.includes(":"));
+ const set={tz:"UTC","day-start":"00:00","week-start":"mon",last:"1","skip-empty":"yes",budget:"",paused:false};
+ for(const p of parts.slice(1)){
+  if(p==="paused")set.paused=true;
+  else if(p.includes("="))set[p.slice(0,p.indexOf("="))]=p.slice(p.indexOf("=")+1);
+ }
+ return{tiers,set};
+}
+function ensureTz(tz){
+ const sel=$("edTz");
+ if(![...sel.options].some(o=>o.value===tz))sel.insertAdjacentHTML("afterbegin",`<option value="${esc(tz)}">${esc(tz)}</option>`);
+ sel.value=tz;
+}
+function fillTz(){
+ const sel=$("edTz");if(sel.options.length)return;
+ let zones=[];try{zones=Intl.supportedValuesOf("timeZone");}catch(e){}
+ zones=[...new Set(["UTC",BROWSER_TZ,...zones])];
+ sel.innerHTML=zones.map(z=>`<option value="${esc(z)}">${esc(z)}${z===BROWSER_TZ?" (this browser)":""}</option>`).join("");
+}
+function setSettings(s){
+ ensureTz(s.tz);
+ $("edDayStart").value=s["day-start"];$("edWeekStart").value=s["week-start"];
+ $("edLast").value=s.last;$("edSkipEmpty").value=s["skip-empty"];
+ $("edBudget").value=s.budget;$("edPaused").checked=s.paused;
+}
+/** Text → rows: the daemon's canonical form fills the rows and settings. */
+function applyCanonical(c){
+ const {tiers,set}=splitPolicy(c);
+ ed.rows=tiers.map(rowOf);
+ if(ed.rows.some(r=>TEST_INTERVALS.some(t=>t[0]===r.every)))$("edTestOnly").checked=true;
+ setSettings(set);
+ renderRows();
+}
+/** Rows → text: the rows and settings serialized, nothing checked. The
+ *  timezone is always written (the browser's is pre-selected for a new
+ *  policy, and the stored policy should say which one it is). */
+function exprOfRows(){
+ const s=["tz="+$("edTz").value];
+ const ds=$("edDayStart").value;if(ds&&ds!=="00:00")s.push("day-start="+ds);
+ if($("edWeekStart").value==="sun")s.push("week-start=sun");
+ const last=$("edLast").value.trim();if(last&&last!=="1")s.push("last="+last);
+ if($("edSkipEmpty").value==="no")s.push("skip-empty=no");
+ const b=$("edBudget").value.trim();if(b)s.push("budget="+b);
+ if($("edPaused").checked)s.push("paused");
+ return[ed.rows.map(tierText).join(" "),...s].join("; ");
+}
+function laneColorOf(every){
+ const t=splitPolicy(ed.checked&&ed.checked.ok?ed.checked.canonical:"").tiers.map(x=>x.slice(0,x.indexOf(":")));
+ const i=t.indexOf(every);return i<0?"#26304d":TIER_COLORS[i%TIER_COLORS.length];
+}
+function paintSwatches(){document.querySelectorAll("#tierRows .tier").forEach(d=>{d.querySelector(".lane-sw").style.background=laneColorOf(ed.rows[Number(d.dataset.i)].every);});}
+function renderRows(){
+ const opts=INTERVALS.concat($("edTestOnly").checked?TEST_INTERVALS:[]);
+ const box=$("tierRows");
+ box.innerHTML=ed.rows.map((r,i)=>{
+  const list=opts.some(o=>o[0]===r.every)?opts:opts.concat([[r.every,r.every]]);
+  return`<div class="tier" role="listitem" data-i="${i}">
+   <span class="lane-sw" aria-hidden="true"></span>
+   <label>every <select class="every" aria-label="tier ${i+1}: every">${list.map(([v,l])=>`<option value="${v}"${v===r.every?" selected":""}>${l}</option>`).join("")}</select></label>
+   <label>keep for <input class="n" type="number" min="1" value="${r.n}" aria-label="tier ${i+1}: keep for"${r.unit==="*"?" hidden":""}></label>
+   <select class="unit" aria-label="tier ${i+1}: keep unit">${KEEP_UNITS.map(([v,l])=>`<option value="${v}"${v===r.unit?" selected":""}>${l}</option>`).join("")}</select>
+   <button type="button" class="rm" aria-label="remove tier ${i+1}" title="remove this tier">✕</button></div>`;
+ }).join("")||'<span class="muted">no tiers — add one or pick a preset</span>';
+ box.querySelectorAll(".tier").forEach(d=>{
+  const r=ed.rows[Number(d.dataset.i)];
+  d.querySelector(".every").addEventListener("change",e=>{r.every=e.target.value;rowsChanged();});
+  d.querySelector(".n").addEventListener("input",e=>{r.n=e.target.value.trim()||"1";rowsChanged();});
+  d.querySelector(".unit").addEventListener("change",e=>{r.unit=e.target.value;d.querySelector(".n").hidden=r.unit==="*";rowsChanged();});
+  d.querySelector(".rm").addEventListener("click",()=>{ed.rows.splice(Number(d.dataset.i),1);renderRows();rowsChanged();});
+ });
+ paintSwatches();
+}
+function rowsChanged(){$("edExpr").value=exprOfRows();ed.origin="rows";schedule();}
+function applyPreset(name){ed.rows=PRESETS[name].split(" ").map(rowOf);renderRows();rowsChanged();}
+function schedule(delay=350){
+ clearTimeout(ed.timer);
+ $("edCheck").innerHTML='<span class="building">checking</span>';
+ ed.timer=setTimeout(refresh,delay);
+}
+/** A byte offset (the daemon's) as a column in the JS string. */
+function byteCol(s,b){
+ const enc=new TextEncoder();let n=0,col=0;
+ for(const ch of s){if(n>=b)break;n+=enc.encode(ch).length;col+=1;}
+ return col;
+}
+/** The CLI's caret rendering (`PolicyError::render`). */
+function caret(expr,e){
+ const flat=String(expr).replace(/[\r\n\t]/g," ");
+ return`<pre class="caret" role="alert">${esc(flat)}\n${" ".repeat(byteCol(flat,Number(e.offset)||0))}^ ${esc(e.message)}</pre>`;
+}
+function renderCheck(expr,c){
+ const el=$("edCheck");
+ if(!c.ok){el.innerHTML=caret(expr,c.error||{offset:0,message:"invalid"});return;}
+ const bound=c.steady_state_bound!=null?`≤ ${c.steady_state_bound}`:"none (a <code>*</code> tier keeps forever)";
+ const sim=c.simulated_count!=null
+  ?`simulated: ${c.simulate_truncated?"at least ":""}${c.simulated_count} after ${esc(span(c.simulate_truncated?c.simulate_reached_ms:c.simulate_horizon_ms))}${c.simulate_truncated?" (stopped early: too many to simulate the whole horizon)":""}`:"";
+ const ag=c.against?` · on <span class="mono">${esc(c.against.path)}</span>: would expire <b class="${c.against.would_expire?"bad":""}">${c.against.would_expire}</b> of ${c.against.snapshots} now`:"";
+ el.innerHTML=`<div><span class="ok">✓ valid</span> · canonical <code id="edCanonical">${esc(c.canonical)}</code></div>
+  <div class="muted">steady-state bound ${bound} · ${sim}${ag}</div>
+  ${(c.warnings||[]).map(w=>`<div class="warn">⚠ ${esc(w)}</div>`).join("")}`;
+}
+async function refresh(){
+ const seq=++ed.seq, expr=$("edExpr").value, origin=ed.origin, path=ed.path;
+ const horizon=Number($("tlHorizon").value);
+ let chk;
+ try{chk=await call("snapshot.policy.check",{expr,against:path,simulate_ms:horizon});}
+ catch(e){chk={error:{message:String(e&&e.message||e)}};}
+ if(seq!==ed.seq)return;
+ if(chk.error){$("edCheck").innerHTML=`<span class="bad">check: ${esc(errText(chk.error))}</span>`;return;}
+ const c=chk.ok;
+ renderCheck(expr,c);
+ if(!c.ok){
+  // The timeline keeps showing the last valid policy, marked as such.
+  $("timeline").style.opacity=".35";
+  $("tlSummary").textContent=ed.timeline?"the expression does not parse: the timeline shows the last valid one":"";
+  return;
+ }
+ ed.checked=c;
+ if(origin==="text")applyCanonical(c.canonical);
+ else paintSwatches();
+ ed.against=new Map(((c.against||{}).verdicts||[]).map(v=>[v.id,v]));
+ let sim;
+ try{sim=await call("snapshot.policy.simulate",{path,expr:c.canonical,horizon_ms:horizon});}
+ catch(e){sim={error:{message:String(e&&e.message||e)}};}
+ if(seq!==ed.seq)return;
+ if(sim.error){$("timeline").innerHTML=`<span class="bad">simulate: ${esc(errText(sim.error))}</span>`;return;}
+ ed.timeline=sim.ok;
+ renderTimeline();
+}
+function setPath(p){
+ ed.path=p;$("policyEditor").dataset.path=p;$("editorPath").textContent=p;
+}
 async function openEditor(path){
- const dlg=document.getElementById("policyEditor");
- document.getElementById("editorTitle").textContent=path?"Edit policy":"Add policy";
- document.getElementById("editorPath").textContent=path||"/";
- dlg.dataset.path=path||"/";
- const picker=document.getElementById("editorPicker");
- picker.innerHTML="";
+ const dlg=$("policyEditor");
+ fillTz();
+ $("editorPicker").innerHTML="";$("edSaveMsg").textContent="";$("edCheck").innerHTML="";
+ ed.timeline=null;ed.checked=null;ed.against=new Map();
+ $("timeline").innerHTML='<span class="muted">loading…</span>';$("tlSummary").textContent="";
+ setPath(path||"/");
+ $("editorTitle").textContent=path?"Edit policy":"Add policy";
  if(!dlg.open)dlg.showModal();
+ let root=null;
+ if(path){const r=await call("snapshot.policy.show",{path});if(r.ok)root=r.ok.root;}
+ if(root&&root.canonical!=null){applyCanonical(root.canonical);$("edExpr").value=root.canonical;ed.origin="rows";}
+ else if(root&&root.expr){$("edExpr").value=root.expr;ed.rows=[];renderRows();ed.origin="text";}
+ else{
+  // A new policy: the Light preset's tiers, the browser's timezone.
+  if(path)$("editorTitle").textContent="Add policy";
+  ed.rows=PRESETS.light.split(" ").map(rowOf);$("edTestOnly").checked=false;
+  setSettings({...splitPolicy("").set,tz:BROWSER_TZ});
+  renderRows();$("edExpr").value=exprOfRows();ed.origin="rows";
+ }
  if(!path)pickDir("/");
+ schedule(0);
+}
+function closeEditor(){
+ $("policyEditor").close();
+ if(location.hash.startsWith("#edit="))history.replaceState(null,"",location.pathname+location.search);
 }
 async function pickDir(dir){
- const dlg=document.getElementById("policyEditor");
- dlg.dataset.path=dir;
- document.getElementById("editorPath").textContent=dir;
- const picker=document.getElementById("editorPicker");
+ setPath(dir);schedule();
+ const picker=$("editorPicker");
  const r=await call("browse.readdir",{path:dir});
  if(r.error){picker.innerHTML=`<p class="bad">${esc(errText(r.error))}</p>`;return;}
  const up=dir!=="/"?[`<button type="button" data-dir="${esc(dir.replace(/\/[^/]+\/?$/,"")||"/")}">.. (up)</button>`]:[];
  const dirs=(r.ok.entries||[]).filter(e=>e.kind==="dir"&&!e.name.startsWith(".constellation"))
   .map(e=>`<button type="button" data-dir="${esc(e.path)}">📁 ${esc(e.name)}</button>`);
- picker.innerHTML=`<div class="muted">choose the directory the policy applies to</div><div class="picker" role="listbox" aria-label="directories">${up.concat(dirs).join("")||'<span class="muted">no subdirectories</span>'}</div>`;
+ const has=policyRoots.find(x=>x.path===dir&&x.canonical!=null);
+ picker.innerHTML=`<div class="muted">choose the directory the policy applies to${has?` — <span class="warn">it already has <code>${esc(has.canonical)}</code>; saving replaces it</span>`:""}</div><div class="picker" role="listbox" aria-label="directories">${up.concat(dirs).join("")||'<span class="muted">no subdirectories</span>'}</div>`;
  picker.querySelectorAll("[data-dir]").forEach(b=>b.addEventListener("click",()=>pickDir(b.dataset.dir)));
 }
+/** Save = a dry run, a confirm quoting the delta when it expires anything,
+ *  then the write carrying `confirm_expiring` = the previewed count. A
+ *  refusal (the count changed meanwhile) is shown, never retried. */
+// One save at a time: a second click while the preview or the confirm dialog
+// is open would race the first (and showModal on an open dialog throws).
+async function savePolicy(){
+ const btn=$("edSave");if(btn.disabled)return;
+ btn.disabled=true;
+ try{await savePolicyOnce();}finally{btn.disabled=false;}
+}
+async function savePolicyOnce(){
+ const path=ed.path, expr=$("edExpr").value, msg=$("edSaveMsg");
+ msg.className="muted";msg.textContent="previewing…";
+ const pre=await call("snapshot.policy.set",{path,expr,dry_run:true});
+ if(pre.error){
+  msg.className="bad";msg.textContent=`not saved: ${errText(pre.error)}`;
+  const d=pre.error.details;if(d&&d.offset!=null)$("edCheck").innerHTML=caret(expr,d);
+  return;
+ }
+ const d=pre.ok;let confirm_expiring=null;
+ if(d.would_expire>0){
+  if(!await confirmExpiring(d)){msg.className="muted";msg.textContent="not saved";return;}
+  confirm_expiring=d.would_expire;
+ }
+ msg.textContent="saving…";
+ const r=await call("snapshot.policy.set",confirm_expiring!=null?{path,expr,confirm_expiring}:{path,expr});
+ if(r.error){
+  const now=r.error.details&&r.error.details.would_expire;
+  msg.className="bad";
+  msg.textContent=`the daemon refused the save: ${errText(r.error)}`
+   +(now!=null&&now!==(confirm_expiring||0)?`\nThe delta changed after the preview (${confirm_expiring||0} → ${now} to expire). Nothing was written: review the timeline and save again.`:"");
+  schedule(0);return;
+ }
+ msg.className="ok";
+ msg.textContent=`saved: ${r.ok.canonical}${r.ok.would_expire?` · ${r.ok.would_expire} to expire — ${r.ok.grace_note}`:""}`;
+ $("editorTitle").textContent="Edit policy";
+ load();schedule(0);
+}
+function confirmExpiring(d){
+ const dlg=$("confirmExpire");
+ const byId=new Map(snaps.map(s=>[s.id,s]));
+ const names=d.would_expire_ids.map(id=>{const s=byId.get(id);return s?`${s.path}@${s.name}`:id;});
+ const n=d.would_expire, pl=n===1?"":"s";
+ $("cxBody").innerHTML=`<p>${d.previous?`<code>${esc(d.previous)}</code> → `:""}<code>${esc(d.canonical)}</code> on <span class="mono">${esc(d.path)}</span></p>
+  <p><b class="bad">expires ${n} snapshot${pl}</b>, <span id="cxReclaim" class="building">returns …</span></p>
+  ${d.grace_note?`<p class="warn">grace: ${esc(d.grace_note)}</p>`:""}
+  ${(d.warnings||[]).map(w=>`<p class="warn">⚠ ${esc(w)}</p>`).join("")}
+  <ul>${names.slice(0,50).map(x=>`<li class="mono">${esc(x)}</li>`).join("")}${names.length>50?`<li class="muted">… and ${names.length-50} more</li>`:""}</ul>
+  <p class="muted">The daemon writes only if exactly ${n} would still expire when you confirm; if that changed, it refuses and writes nothing.</p>`;
+ $("cxOk").textContent=`Save and expire ${n}`;
+ call("snapshot.reclaim",{selectors:d.would_expire_ids}).then(r=>{
+  const el=$("cxReclaim");if(!el)return;el.className="";
+  el.textContent=r.error?`reclaim unknown (${errText(r.error)})`:r.ok.building?`reclaim not known yet (accounting index building, ${r.ok.building_pct|0}%)`:`returns ≈ ${bytes(r.ok.bytes)} after GC`;
+ },()=>{});
+ dlg.showModal();
+ return new Promise(res=>{
+  const done=v=>{dlg.oncancel=null;if(dlg.open)dlg.close();res(v);};
+  $("cxOk").onclick=()=>done(true);$("cxCancel").onclick=()=>done(false);
+  dlg.oncancel=e=>{e.preventDefault();done(false);};
+ });
+}
+
+// ---- 7.4 retention timeline -------------------------------------------------
+// Drawn from snapshot.policy.simulate's Timeline only: which lane a tick
+// sits in is the `reasons` the daemon gave it (at the horizon, or — for an
+// existing snapshot the simulation expires later — snapshot.policy.check's
+// verdict now; a future snapshot the simulation creates and expires again
+// sits in its cadence's lane, the tier that created it). Nothing here
+// decides what is kept.
+const LOD_MAX=5000;
+function tzOf(policy){return splitPolicy(policy).set.tz;}
+function fmtIn(tz,opts){try{return new Intl.DateTimeFormat("en-GB",{timeZone:tz,...opts});}catch(e){return new Intl.DateTimeFormat("en-GB",{timeZone:"UTC",...opts});}}
+function reasonText(e){
+ if(!e.candidate)return e.held?`held${e.held_by?" by "+e.held_by:" (no owner recorded)"}`:"not this policy's (manual, or another root's)";
+ if(!e.reasons.length)return"nothing (expired)";
+ return e.reasons.map(r=>r.kind==="tier"?"every "+r.every:r.kind==="last"?"last="+(r.last??1):r.kind==="held"?"held":r.kind).join(" · ");
+}
+function renderTimeline(){
+ const tl=ed.timeline, el=$("timeline");
+ el.style.opacity="";
+ const tz=tzOf(tl.policy), now=tl.now_unix_ms;
+ const tiers=splitPolicy(tl.policy).tiers;
+ const lanes=tiers.map((t,i)=>({key:"tier:"+t.slice(0,t.indexOf(":")),label:t,color:TIER_COLORS[i%TIER_COLORS.length]}));
+ const laneIx=new Map(lanes.map((l,i)=>[l.key,i]));
+ const marks=[];
+ const add=(lane,kind,e,label)=>{
+  if(!laneIx.has(lane)){laneIx.set(lane,lanes.length);lanes.push({key:lane,label,color:lane==="expire"?EXPIRE_RED:NEUTRAL});}
+  marks.push({lane,kind,t:e.created_unix_ms,e,n:1});
+ };
+ let wouldExpire=0, others=0, existing=0;
+ for(const e of tl.snapshots){
+  if(!e.synthetic)existing++;
+  if(!e.candidate){others++;continue;}
+  // Not retention logic: `expired_unix_ms` is the daemon's own simulation verdict;
+  // comparing it with the daemon-supplied `now` only splits "expires at once"
+  // from "expires later in the simulated horizon".
+  if(!e.synthetic&&e.expired_unix_ms!=null&&e.expired_unix_ms<=now){wouldExpire++;add("expire","expire",e,"would expire");continue;}
+  const reasons=e.keep?e.reasons:!e.synthetic&&ed.against.has(e.id)?ed.against.get(e.id).reasons:[];
+  const kind=e.synthetic?"future":"solid";
+  let placed=false;
+  for(const r of reasons){
+   if(r.kind==="tier"){add("tier:"+r.every,kind,e,r.every);placed=true;}
+   else if(r.kind==="last"){add("last",kind,e,"last="+(r.last??1));placed=true;}
+   else if(r.kind==="grace"){add("grace",kind,e,"grace");placed=true;}
+  }
+  if(!placed&&tl.cadence)add("tier:"+tl.cadence,kind,e,tl.cadence);
+ }
+ // Held and manual snapshots last, in their own lane.
+ laneIx.set("held",lanes.length);lanes.push({key:"held",label:"held / manual",color:NEUTRAL});
+ for(const e of tl.snapshots)if(!e.candidate)marks.push({lane:"held",kind:e.held?"held":"manual",t:e.created_unix_ms,e,n:1});
+ // The x range: the oldest snapshot shown (or now) to the horizon.
+ let x0=now;for(const e of tl.snapshots)if(e.created_unix_ms<x0)x0=e.created_unix_ms;
+ let x1=Math.max(tl.horizon_unix_ms,x0+1);
+ const pad=(x1-x0)*0.01;x0-=pad;x1+=pad;
+ const W=1000,L=104,R=12,LH=26,T=16,AX=20;
+ const H=T+lanes.length*LH+AX;
+ const X=t=>L+(t-x0)/(x1-x0)*(W-L-R);
+ // Level of detail: past LOD_MAX ticks, the ticks of one lane and kind
+ // falling in the same 2-unit column become one mark with a count.
+ let shown=marks, merged=false;
+ if(marks.length>LOD_MAX){
+  merged=true;
+  const g=new Map();
+  for(const m of marks){
+   const k=`${m.lane}|${m.kind}|${Math.floor(X(m.t)/2)}`;
+   const a=g.get(k);
+   if(!a)g.set(k,{...m,first:m.t,last:m.t});
+   else{a.n++;a.first=Math.min(a.first,m.t);a.last=Math.max(a.last,m.t);}
+  }
+  shown=[...g.values()];
+ }
+ ed.marks=shown;
+ // Time axis: a step that gives at most 8 labels.
+ const STEPS=[3600e3,3*3600e3,6*3600e3,12*3600e3,864e5,2*864e5,7*864e5,14*864e5,30*864e5,91*864e5,182*864e5,365*864e5];
+ const step=STEPS.find(s=>(x1-x0)/s<=8)||STEPS[STEPS.length-1];
+ const fmt=step<864e5?fmtIn(tz,{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})
+  :step>=91*864e5?fmtIn(tz,{year:"numeric",month:"short"}):fmtIn(tz,{month:"short",day:"numeric"});
+ let axis="";
+ for(let t=Math.ceil(x0/step)*step;t<=x1;t+=step){
+  const x=X(t).toFixed(1);
+  axis+=`<line class="grid" x1="${x}" x2="${x}" y1="${T}" y2="${H-AX}"/><text x="${x}" y="${H-6}" text-anchor="middle">${esc(fmt.format(new Date(t)))}</text>`;
+ }
+ const nowX=X(now).toFixed(1);
+ const laneSvg=lanes.map((l,i)=>{
+  const y=T+i*LH;
+  return`<g class="lane" data-lane="${esc(l.key)}"><rect x="${L}" y="${y+1}" width="${W-L-R}" height="${LH-2}" rx="3" fill="${i%2?"#0e1530":"#121b38"}"/>
+   <rect x="2" y="${y+7}" width="8" height="12" rx="2" fill="${l.color}"/><text class="lane-lbl" x="14" y="${y+17}">${esc(l.label)}</text></g>`;
+ }).join("");
+ let lastLbl=-1e9;
+ const tickSvg=shown.map((m,k)=>{
+  const li=laneIx.get(m.lane), y=T+li*LH+5, h=LH-10, x=X(m.t), xs=x.toFixed(1), c=lanes[li].color;
+  const w=m.n>1?2.5:1.8;
+  if(m.kind==="expire")return`<g class="mk tick expire" data-k="${k}"><rect x="${(x-2).toFixed(1)}" y="${y}" width="4" height="${h}" fill="none" stroke="${EXPIRE_RED}" stroke-width="1.2"/><line x1="${(x-4).toFixed(1)}" y1="${y+h-2}" x2="${(x+4).toFixed(1)}" y2="${y+2}" stroke="${EXPIRE_RED}" stroke-width="1.4"/></g>`;
+  if(m.kind==="held"){
+   const lbl=m.e.held_by?ns(m.e.held_by):"held";
+   const text=x-lastLbl>46?`<text x="${(x+6).toFixed(1)}" y="${y+10}" style="fill:${PIN};font-size:10px">${esc(lbl)}</text>`:"";
+   if(text)lastLbl=x;
+   return`<g class="mk tick held" data-k="${k}"><circle cx="${xs}" cy="${y+4}" r="3.6" fill="${PIN}"/><line x1="${xs}" x2="${xs}" y1="${y+7}" y2="${y+h}" stroke="${PIN}" stroke-width="1.6"/>${text}</g>`;
+  }
+  const fill=m.kind==="manual"?NEUTRAL:c, op=m.kind==="future"?' opacity=".38"':"";
+  return`<rect class="mk tick ${m.kind}" data-k="${k}" x="${(x-w/2).toFixed(2)}" y="${y}" width="${w}" height="${h}" fill="${fill}"${op}/>`;
+ }).join("");
+ const summary=`${existing} existing (${wouldExpire} would expire now, ${others} held or not this policy's), ${tl.created} future created and ${tl.expired} expired by the horizon; ${tl.final_count} at the horizon`;
+ el.innerHTML=`<div class="tl-legend" aria-hidden="true">
+   <span><svg width="10" height="14"><rect x="4" y="0" width="2" height="14" fill="${TIER_COLORS[0]}"/></svg>existing, kept (colored by tier)</span>
+   <span><svg width="10" height="14"><rect x="4" y="0" width="2" height="14" fill="${TIER_COLORS[0]}" opacity=".38"/></svg>future (simulated)</span>
+   <span><svg width="12" height="14"><rect x="4" y="1" width="4" height="12" fill="none" stroke="${EXPIRE_RED}"/><line x1="2" y1="12" x2="10" y2="2" stroke="${EXPIRE_RED}"/></svg>would expire now</span>
+   <span><svg width="10" height="14"><circle cx="5" cy="4" r="3.5" fill="${PIN}"/><line x1="5" x2="5" y1="7" y2="14" stroke="${PIN}" stroke-width="1.6"/></svg>held (owner namespace)</span>
+   <span><svg width="10" height="14"><rect x="4" y="0" width="2" height="14" fill="${NEUTRAL}"/></svg>manual / another root's</span></div>
+  <svg id="timelineChart" viewBox="0 0 ${W} ${H}" role="img" aria-label="retention timeline: ${esc(summary)}">
+   ${laneSvg}${axis}<line class="now" x1="${nowX}" x2="${nowX}" y1="${T}" y2="${H-AX}"/><text x="${nowX}" y="${T-4}" text-anchor="middle" style="fill:#8eb7ff">now</text>${tickSvg}</svg>
+  ${countChart(tl,X,W,L,R,tz)}`;
+ $("tlSummary").textContent=summary+(tl.truncated?" · the simulation stopped early (too many snapshots to simulate the whole horizon)":"")
+  +(tl.paused?" · the policy is paused: the scheduler does nothing until it is resumed; this is what it does then":"")
+  +(merged?` · level of detail: ${marks.length} ticks drawn as ${shown.length} marks (hover for counts)`:"");
+ const svg=$("timelineChart"), tip=$("tip");
+ svg.addEventListener("mousemove",ev=>{
+  const g=ev.target.closest(".mk");if(!g){tip.style.display="none";return;}
+  tip.innerHTML=tlTip(ed.marks[Number(g.dataset.k)],tl);
+  tip.style.display="block";
+  tip.style.left=Math.min(window.innerWidth-tip.offsetWidth-8,ev.clientX+12)+"px";
+  tip.style.top=Math.max(8,ev.clientY-tip.offsetHeight-8)+"px";
+ });
+ svg.addEventListener("mouseleave",()=>tip.style.display="none");
+}
+function tlTip(m,tl){
+ if(m.n>1)return`<b>${m.n} snapshots</b> merged at this zoom<br>${esc(full(m.first))}<br>… ${esc(full(m.last))}`;
+ const e=m.e, s=snaps.find(x=>x.id===e.id), now=tl.now_unix_ms;
+ const name=s?`${s.path}@${s.name}`:e.id;
+ const fate=e.expired_unix_ms!=null
+  ?(e.expired_unix_ms<=now&&!e.synthetic?'<span class="bad">this policy would expire it now</span>':`expired by the simulation ${esc(full(e.expired_unix_ms))}`)
+  :e.expires_unix_ms!=null?`expires ${esc(full(e.expires_unix_ms))} (forecast)`
+  :e.candidate?"kept past the horizon":"never (not this policy's to expire)";
+ const used=s&&s.used!=null?esc(bytes(s.used)):e.synthetic?"— (future)":"—";
+ return`<b>${esc(name)}</b>${e.synthetic?' <span class="muted">future, simulated</span>':""}<br>created ${esc(full(e.created_unix_ms))}<br>kept by: ${esc(reasonText(e))}<br>${fate}<br>USED ${used}`;
+}
+/** The simulated snapshot count over time: snapshot.policy.simulate's
+ *  `counts` as step lines, every snapshot and the policy's own. */
+function countChart(tl,X,W,L,R,tz){
+ const pts=tl.counts||[];if(!pts.length)return"";
+ const H=120,T=8,B=8;
+ const max=Math.max(1,...pts.map(p=>p.total));
+ const Y=v=>T+(H-T-B)*(1-v/max);
+ const path=key=>{
+  let d=`M${X(pts[0].at_unix_ms).toFixed(1)} ${Y(pts[0][key]).toFixed(1)}`;
+  for(let i=1;i<pts.length;i++){if(pts[i][key]===pts[i-1][key])continue;d+=`H${X(pts[i].at_unix_ms).toFixed(1)}V${Y(pts[i][key]).toFixed(1)}`;}
+  return d+`H${X(tl.horizon_unix_ms).toFixed(1)}`;
+ };
+ const bound=tl.steady_state_bound!=null&&tl.steady_state_bound<=max*1.05
+  ?`<line x1="${L}" x2="${W-R}" y1="${Y(tl.steady_state_bound).toFixed(1)}" y2="${Y(tl.steady_state_bound).toFixed(1)}" stroke="${NEUTRAL}" stroke-dasharray="1 4"/><text x="${W-R}" y="${(Y(tl.steady_state_bound)-3).toFixed(1)}" text-anchor="end">bound ≤ ${tl.steady_state_bound}</text>`:"";
+ const nowX=X(tl.now_unix_ms).toFixed(1);
+ return`<div class="tl-legend"><b style="font-size:13px">snapshot count</b>
+   <span><svg width="18" height="4"><line x1="0" x2="18" y1="2" y2="2" stroke="${PIN}" stroke-width="2"/></svg>all snapshots</span>
+   <span><svg width="18" height="4"><line x1="0" x2="18" y1="2" y2="2" stroke="${TIER_COLORS[0]}" stroke-width="2" stroke-dasharray="4 3"/></svg>this policy's</span></div>
+  <svg id="countChart" viewBox="0 0 ${W} ${H}" role="img" aria-label="simulated snapshot count over time, from ${pts[0].total} to ${tl.final_count}">
+   <line class="grid" x1="${L}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}"/><line class="grid" x1="${L}" x2="${W-R}" y1="${Y(max)}" y2="${Y(max)}"/>
+   <text x="${L-6}" y="${Y(0)+4}" text-anchor="end">0</text><text x="${L-6}" y="${Y(max)+4}" text-anchor="end">${max}</text>
+   ${bound}<line class="now" x1="${nowX}" x2="${nowX}" y1="${T}" y2="${H-B}"/>
+   <path d="${path("total")}" fill="none" stroke="${PIN}" stroke-width="1.6"/>
+   <path d="${path("candidates")}" fill="none" stroke="${TIER_COLORS[0]}" stroke-width="1.6" stroke-dasharray="4 3"/></svg>`;
+}
+function wireEditor(){
+ document.querySelectorAll("[data-preset]").forEach(b=>b.addEventListener("click",()=>applyPreset(b.dataset.preset)));
+ $("addTier").addEventListener("click",()=>{ed.rows.push({every:"1d",n:30,unit:"d"});renderRows();rowsChanged();});
+ $("edTestOnly").addEventListener("change",renderRows);
+ ["edTz","edDayStart","edWeekStart","edLast","edSkipEmpty","edPaused"].forEach(id=>$(id).addEventListener("change",rowsChanged));
+ $("edLast").addEventListener("input",rowsChanged);
+ $("edExpr").addEventListener("input",()=>{ed.origin="text";schedule();});
+ $("tlHorizon").addEventListener("change",()=>schedule(0));
+ $("edSave").addEventListener("click",savePolicy);
+ $("policyEditor").addEventListener("close",()=>{$("tip").style.display="none";});
+}
+/** `#edit=/dir` opens the editor on that directory; then `&preset=name`
+ *  applies a preset, or `&expr=…` types an expression into the text field. */
+async function openFromHash(){
+ const h=new URLSearchParams(location.hash.slice(1));
+ if(!h.has("edit"))return;
+ await openEditor(h.get("edit")||null);
+ const p=h.get("preset");if(p&&PRESETS[p])applyPreset(p);
+ if(h.has("expr")){$("edExpr").value=h.get("expr");ed.origin="text";schedule();}
+}
+wireEditor();
 
 // ---- 7.5 snapshot table ---------------------------------------------------
 const orphanedInos=()=>new Set(policyRoots.filter(r=>r.orphaned).map(r=>r.ino));
@@ -712,7 +1212,7 @@ async function health(){
  catch(e){document.getElementById("health").innerHTML='<span class="bad">○ disconnected</span>';}
 }
 health();setInterval(health,5000);
-load();
+load();openFromHash();
 </script>
 </body>
 </html>

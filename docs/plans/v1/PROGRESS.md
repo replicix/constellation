@@ -36944,3 +36944,136 @@ identical error. In the runs that fail, c0/c1 see c2 reconnect only after
 was down, and its later write is forwarded rather than re-taking the
 lease. That is a lease-placement assumption of the scenario, outside
 this fix. It is not investigated further here.
+
+## Plan 32 M6 — web UI
+
+Step 12's milestone M6 of [plan 32](wip/32-snapshot-policies-and-space.md)
+("Step 7: the snapshots page, the policy editor, the retention simulator")
+is complete. Two chunks built it: `32-m6a` (the page, Steps 7.1, 7.2, 7.5;
+"Plan 32 M6a (snapshots page)" above keeps its decisions and API gaps) and
+`32-m6b` (this section: the policy editor 7.3, the retention timeline 7.4,
+the `web-ui-smoke` extension of Step 11, the headless check of the editor,
+and the full CONVENTIONS gates for the milestone). Everything is in
+`crates/control/webui/snapshots.html`: vanilla JS, no build step, no
+framework/bundler/CDN, the existing dark theme, hand-drawn SVG. The page
+holds **no retention, bucket, expiry or accounting logic**: validity and
+the canonical form are `snapshot.policy.check` answers, the timeline is
+`snapshot.policy.simulate`'s `Timeline` drawn as is, and the save is
+`snapshot.policy.set`'s own dry run and guard. No API method was added.
+
+**For plan 33:** this page is the vanilla reference that plan 33's Screen 5
+ports — the same API calls, the same "render answers only" rule, the same
+lanes/glyph vocabulary for the timeline.
+
+| Item | State | Where |
+|---|---|---|
+| **7.1** space overview, **7.2** policy-root cards, **7.5** snapshot table (filters, multi-select + reclaim footer, delete, holds, KEPT BY/EXPIRES), written-over-time chart, dashboard summary card, route test, `tests/webui-headless.sh` | DONE (`32-m6a`, "Plan 32 M6a (snapshots page)" above) | `crates/control/webui/snapshots.html`, `crates/control/webui/index.html`, `crates/control/src/web.rs` |
+| **7.3** tier rows `[every ▾] keep for [n][unit ▾] ✕` + "Add tier". The interval dropdown offers exactly 5m 10m 15m 20m 30m 1h 2h 3h 4h 6h 8h 12h 1d 1w 1mo 1y; "show test-only intervals" adds 10s 12s 15s 20s 30s 1m (ticked automatically when a loaded policy has one). Keep units min/h/d/w/mo/y and "forever" (`*`) | DONE (`32-m6b`) | `renderRows`, `INTERVALS`, `TEST_INTERVALS`, `KEEP_UNITS` |
+| **7.3** presets Light `1h:1d 1d:7d`, Standard `15m:1d 1h:2d 1d:30d 1mo:1y`, Dense `5m:1d 1h:7d 1d:30d 1w:12w 1mo:1y`: they fill the rows (explicit tiers; no stored name) and keep the advanced settings | DONE | `PRESETS`, `applyPreset` |
+| **7.3** Advanced (collapsed `<details>`): timezone (every `Intl.supportedValuesOf("timeZone")` zone; a new policy pre-selects the browser's `resolvedOptions().timeZone` and always writes `tz=` explicitly; a loaded policy without `tz=` shows UTC, the grammar's default), day-start, week-start, `last`, skip-empty, paused (kept from a loaded policy), and a disabled budget field labelled "coming with budgets" (M7) | DONE | `setSettings`, `exprOfRows` |
+| **7.3** expression field, two-way: rows → text is serialization of the rows only (`exprOfRows`); text → rows after a debounced (350 ms) `snapshot.policy.check` returns `canonical` (`applyCanonical` splits the canonical string). An error renders as the CLI's `PolicyError::render`: the expression, then a caret under the byte offset (converted to a column with `TextEncoder`) and the message. Shows the canonical form, the steady-state bound, the simulated count over the horizon, the `against` would-expire count and the daemon's warnings | DONE | `refresh`, `renderCheck`, `caret`, `byteCol` |
+| **7.3** Save: `snapshot.policy.set {dry_run: true}` → when `would_expire > 0` a confirm dialog quoting previous → canonical, "expires N snapshots, returns ≈ X after GC" (`snapshot.reclaim` over `would_expire_ids`), the `grace_note`, warnings and the names; then `set` with `confirm_expiring` = the previewed N. A refusal is shown verbatim with "the delta changed after the preview (3 → 5)… nothing was written", and never retried | DONE | `savePolicy`, `confirmExpiring`, `<dialog id="confirmExpire">` |
+| **7.4** timeline next to the editor, debounced `snapshot.policy.simulate {path, expr: canonical, horizon_ms}` (the directory's path, so an existing root's real snapshots are in it); horizon 1 d / 7 d / **30 d** / 90 d / 180 d / 1 y. x from the oldest snapshot shown (or now) to the horizon, "now" marked, time labels in the policy's timezone | DONE | `renderTimeline` |
+| **7.4** one lane per tier (labelled with the tier, `15m:1d`) plus `last=n` / `grace` / "would expire" lanes when present and a "held / manual" lane; existing snapshots solid ticks in the color of each lane that keeps them; would-expire ones hollow, struck-through red; held ones a pin labelled by the `held_by` namespace (`csi`, `user`, `held`); manual/another root's neutral; future ones faded; a legend for every glyph | DONE | `renderTimeline`, `TIER_COLORS` |
+| **7.4** hover: name (`path@name`, or the synthetic name), created, reasons, the fate (would expire now / expired by the simulation at / `expires_unix_ms` forecast / kept past the horizon), `USED` (from `snapshot.list`); level of detail above 5000 ticks (ticks of one lane and kind in the same 2-unit column merge into one mark with a count; the Dense preset over 30 d: 8680 ticks → 575 marks) | DONE | `tlTip`, `LOD_MAX` |
+| **7.4** step chart of the simulated count over time: `counts` as two step lines (every snapshot; the policy's own, dashed), the steady-state bound as a dotted line when in range | DONE | `countChart` |
+| `#edit=/dir` opens the editor on load; `&preset=name` applies a preset, `&expr=…` types an expression | DONE | `openFromHash` |
+| **Step 11 `web-ui-smoke`**: a table of `(method, params, shape check)` over HTTP — `snapshot.policy.check` valid (canonical `1h:1d 1d:7d`, bound 31, simulated count) and invalid (`ok: false`, `error.offset: 6`, no canonical), `snapshot.policy.simulate` over `/` (horizon − now = 1 d, cadence `1h`, ≥ 24 created, counts, the real snapshot as a kept non-candidate beside synthetic ones), `snapshot.space` (polled until built; every amount), `snapshot.reclaim` for the scenario's snapshot | DONE | `crates/harness/src/scenarios.rs` `web_ui_smoke` |
+| Headless check of the editor: `#edit=/proj&preset=standard` → dialog open, 4 tier rows, canonical `15m:1d 1h:2d 1d:30d 1mo:1y; paused`, timeline SVG with ≥ 5 lanes (`tier:15m`, `tier:1h`, `tier:1d`, `tier:1mo`, `held`), ticks (2911), future ticks, the csi pin labelled `csi`, the count chart, no JS error; `&expr=5m:1d 7m:1d` → caret under byte 6; a valid typed expression → rows from the canonical form; an editor screenshot | DONE | `tests/webui-headless.sh` |
+
+### Screenshots
+
+- `/tmp/32-m6b-chrome/snapshots.png` — the page (`tests/webui-headless.sh`, 1280×1600).
+- `/tmp/32-m6b-chrome/editor.png` — the editor on `/proj` with the Standard preset applied (paused root, a manual and a `csi:test`-held snapshot), 1500×1250.
+- `/tmp/32-m6b-chrome/dense.png` — the Dense preset on `/` over 30 days (level of detail in force).
+
+(Chromium from `zenika/alpine-chrome` in docker through a `CHROME_BIN` wrapper; the host has no Chrome.)
+
+### Decisions
+
+- **Lane placement uses only the daemon's reasons.** A `Timeline` entry
+  carries its reasons at the horizon, or — for one the simulation expires —
+  none (`keep: false`, the verdict "at the moment it was expired"). So a
+  tick's lanes are: its `reasons` when it survives to the horizon; for an
+  existing snapshot the simulation expires *later*, the reasons
+  `snapshot.policy.check {against: path}` gives it now (the editor already
+  makes that call for validity); for a synthetic snapshot the simulation
+  creates and expires again, the `cadence` lane (the finest tier, which is
+  what creates every synthetic snapshot). "Would expire now" is an existing
+  entry with `expired_unix_ms <= now_unix_ms` (the simulation's first pass,
+  the scheduler's next tick), drawn in its own labelled lane. None of this
+  decides what is kept.
+- **Rows are not reordered while the operator edits them**; the canonical
+  form (sorted, defaults dropped) is shown under the field. Text edits are
+  the direction that rebuilds the rows, from `canonical`, leaving the typed
+  text as typed (no cursor jumps).
+- **`m` is written `min`** in the expression (the canonical spelling): a
+  bare-`m` keep beside a monthly tier is a parse error by design.
+- **The dropdown follows the brief's interval set**; the grammar also
+  accepts 2m 3m 4m 6m 12m (divisors of 60, as the error text lists). A loaded
+  policy using one keeps it as an extra option in its row instead of losing it.
+- **A new policy starts from the Light preset** in the browser's timezone;
+  Save is always enabled (the daemon's dry run is the validation).
+- **The x axis starts at the oldest snapshot in the timeline** (or now),
+  not at a computed "oldest kept window": the latter would be retention
+  arithmetic in JS.
+- **Colors**: the dataviz reference palette's dark categorical slots 1–7
+  by tier, finest first (slots 1–5 are the space bar's), slot 8 red reserved
+  for "would expire", neutral for manual; every lane is labelled and every
+  glyph is in the legend, so color is never the only signal.
+- **Confirm dialog wording**: "returns ≈ X after GC" is `snapshot.reclaim`
+  over `would_expire_ids` (best effort: building/unavailable is said so);
+  the grace sentence is the daemon's `grace_note` verbatim.
+
+### API gaps (reported, not added)
+
+- `SnapTimelineEntry.reasons` is empty for a snapshot the simulation
+  expires, so the lane it lived in is not in the answer (worked around as
+  above). A `kept_by_until_expiry` (the reasons it last had) would let the
+  timeline place every tick from one call.
+- `SnapTimelineEntry` has no `USED`; hover joins `snapshot.list` by id.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `m6b`)
+
+Run 2026-10-03 on the shared EC2 host while other chunks were building and
+testing (load average 40–375 on 32 vCPUs over the harness runs; noted per
+row where it matters).
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --no-fail-fast` | 2349 passed, 0 failed, 47 ignored (77 test binaries). With `TMPDIR=/var/tmp` one unrelated test, `daemon_lock::tests::own_flock_is_found_and_live`, fails: `/proc/locks` names the btrfs superblock device, not the tempdir's `st_dev`. It passes with the default `/tmp`, which is what the row above used |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | port 4566 was already bound by another chunk's floci (`32-m3a-…-floci-1`), so per the host rules I ran the script's body against that endpoint with its `AWS_*` settings: `tests/smoke.sh s3://constellation-ci/run-m6b-…` → SMOKE TEST PASSED |
+| `cargo build --release --workspace` | ok |
+| `bash tests/webui-headless.sh` (`CHROME_BIN` = Chromium in docker) | **PASS**: 35 `ok:` lines (16 page, 15 editor, 4 typed-expression), both screenshots written |
+| `target/release/harness run --shard 1/2` (prefix `m6b`, `TMPDIR=/var/tmp`) | `shard 1/2: 103 of 205 scenario(s)`: 92 PASSED, 7 FAILED, 4 SKIPPED (passthrough, `requires CAP_SYS_ADMIN`). `Error: 7 scenario(s) failed: snapsched-create, distant-bigfile-stable, takeover-marker-strands-promptly, session-stale-base-rename, visibility-after-burst, fuse-inval-storm, auto-placement` |
+| `target/release/harness run --shard 2/2` | `shard 2/2: 102 of 205 scenario(s)`: 95 PASSED (**`web-ui-smoke` PASSED in 22.5s**), 4 FAILED, 3 SKIPPED (passthrough). `Error: 4 scenario(s) failed: distant-bigfile-stable-e2e, git-under-flock-rounds, sqlite-first-touch-latency, transport-lock-wait-budget` |
+| Each failure rerun alone (my build) | PASSED: `snapsched-create` (351.5 s), `takeover-marker-strands-promptly`, `session-stale-base-rename`, `auto-placement`, `distant-bigfile-stable-e2e`, `git-under-flock-rounds` (559.9 s). Still failing: `distant-bigfile-stable`, `visibility-after-burst`, `sqlite-first-touch-latency`, `fuse-inval-storm`, `transport-lock-wait-budget` |
+| Those five on **clean main** (the four changed files checked out at `310d23b`, release rebuilt, run alone, then my files restored and rebuilt) | `distant-bigfile-stable` FAILED (7.7 MiB/s worst block, floor 10.0, mean 2976 MiB/s); `sqlite-first-touch-latency` FAILED; `fuse-inval-storm` FAILED (same signature: "a … did not exit within 5s of kill -9: Z (zombie) … thread (kernel-inval): D in fuse_reverse_inval_entry"); `transport-lock-wait-budget` FAILED ("lock: Resource temporarily unavailable", already recorded as failing on its own commit b458669). `visibility-after-burst` PASSED (load ≈ 140) |
+| `visibility-after-burst` on my build, three more runs | FAILED each time on its latency thresholds (streams on/off p99 2.39–2.88 s, then 2.013 s, against 2 s, at load 80–275). It is in no way UI-related: this chunk changes no product Rust code, only the HTML string embedded in `constellation-control`, and the harness's `web_ui_smoke` function. PROGRESS already records it as load-sensitive ("17 tail GETs under the load of two other sessions … 1 on the re-run") |
+| Root-only (`sudo env -u XDG_RUNTIME_DIR HOME=/root … CONSTELLATION_HARNESS_DOCKER_PREFIX=m6b-root harness run subtree-confinement` + the 7 passthrough scenarios) | ALL SCENARIOS PASSED (8/8): `subtree-confinement` 46.6 s, `passthrough-{eviction-while-open, local-writer, handover, default-by-mount-mode, remote-write-cto, odirect, on-every-transport}`. No root-owned file left in `~` |
+| `docker compose --profile test run --rm compliance` (`SMOKE_IMAGE=m6b-smoke:local`, plus an override dropping floci's host port 4566, which another chunk held) | `== results: 8798 passed, 0 failed` · COMPLIANCE TEST PASSED (baseline: 0 known failures) |
+
+**Failure analysis.** The two the brief already lists as under investigation
+are not here. The rest are threshold or starvation failures. The
+`sqlite-first-touch-latency` logs show core steps of up to 4.9 s ("slow core
+step … handled_us=4949340"), then "holder silent: sealed its epoch" takeovers.
+`distant-bigfile-stable`/`-e2e` miss a throughput floor while their mean is
+hundreds of times above it. `fuse-inval-storm` is a real hang: the kill -9'd
+holder's `kernel-inval` thread is stuck in `fuse_reverse_inval_entry`. It
+reproduces on clean main, so it is pre-existing and not this chunk's (the
+zombie stayed until I aborted the run's leftover b/c FUSE connections through
+`/sys/fs/fuse/connections/<n>/abort`; the scenario's harness waited on it).
+
+### Exit criteria (M6)
+
+- [x] 7.1 space overview, 7.2 policy roots, 7.5 snapshot table (M6a).
+- [x] 7.3 policy editor: tier rows over the fixed interval set, presets as explicit tiers, advanced settings with the browser's timezone written explicitly, the expression field synced through `snapshot.policy.check` with the CLI's caret, a confirmed save guarded by `confirm_expiring`.
+- [x] 7.4 retention timeline from `snapshot.policy.simulate` only: lanes per tier + held/manual, solid / hollow-red / pin / faded ticks, hover, level of detail, count step chart.
+- [x] The UI holds no retention, bucket, expiry or accounting logic; no new API method.
+- [x] `web-ui-smoke` covers `snapshot.policy.check` (valid and invalid), `snapshot.policy.simulate`, `snapshot.space`, `snapshot.reclaim` over HTTP.
+- [x] `tests/webui-headless.sh` opens the editor, applies the Standard preset and asserts lanes and ticks (PASS).
+- [x] fmt, clippy, `cargo test --workspace`, smoke, integration (shared floci), release build, webui-headless PASS, compliance 8798/8798.
+- [ ] Full harness matrix all PASSED: 200 of 205 PASSED (187 in the two shards, 6 more when rerun alone, the 7 root-only SKIPs passed as root). `web-ui-smoke` and the root-only scenarios pass. `distant-bigfile-stable`, `sqlite-first-touch-latency`, `fuse-inval-storm` and `transport-lock-wait-budget` fail identically on a clean `310d23b` build (pre-existing). `visibility-after-burst` passed on main once but failed on this build under load 80–275, on identical product code (load-sensitive thresholds).

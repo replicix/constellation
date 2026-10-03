@@ -1169,6 +1169,38 @@ table (unix socket vs HTTP, every role) is a unit test instead:
 `constellation_engine::control::parity_tests` (`cargo test -p
 constellation-engine --lib control::`).
 
+Plan 32 M6 extends `web-ui-smoke` with a table of the calls the snapshots
+page's editor, timeline and space views make, each over HTTP and each
+answer checked for shape: `snapshot.policy.check` with a valid expression
+(canonical form, steady-state bound 31, a simulated count) and an invalid
+one (`ok: false` with `error.offset: 6` — a result, not a failed call),
+`snapshot.policy.simulate` over `/` (the horizon, the cadence, synthetic
+ticks and the real manual snapshot carried through as a non-candidate),
+`snapshot.space` (polled until the accounting index has caught up, then
+every breakdown amount) and `snapshot.reclaim` for the scenario's snapshot.
+
+The rendering itself has a separate, browser-driven check outside the
+harness: `tests/webui-headless.sh` (`make webui-check`). It starts a
+local-backend daemon with `--web-ui`, gives `/proj` a paused policy and two
+manual snapshots (one held by `csi:test`), and loads `/snapshots.html` in
+headless Chrome (`--dump-dom`, assertions on rendered markup only, plus a
+screenshot): the table rows, the "externally held" chip, the space bar,
+the policy card, the written-over-time chart. It then opens the policy
+editor through the URL — `#edit=/proj&preset=standard` loads the root's
+policy and applies the Standard preset — and asserts the four tier rows,
+the daemon's canonical form (`15m:1d 1h:2d 1d:30d 1mo:1y; paused`), and
+the retention timeline SVG: one lane per tier plus held/manual, ticks
+including simulated future ones and the csi pin labelled `csi`, and the
+count chart. Two more loads type expressions with `&expr=`: `5m:1d 7m:1d`
+must show the caret block with the caret under byte 6, and a valid one
+must come back as rows from the canonical form. Any JS error (the page
+marks window errors, unhandled rejections and `console.error` with
+`data-js-error`) fails it; a second screenshot shows the editor. It SKIPs
+(exit 0) without Chrome; `CHROME_BIN` takes any Chrome-flag-compatible
+wrapper (for example Chromium from `zenika/alpine-chrome` in docker with
+host networking and `/tmp` shared), `WEBUI_SHOT`/`WEBUI_EDITOR_SHOT` place
+the screenshots.
+
 Phase 8a adds three destructive-integrity scenarios:
 
 - `gc-lifecycle` creates live, dead, and snapshot-only chunks under a
