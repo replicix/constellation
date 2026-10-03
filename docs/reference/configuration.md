@@ -865,7 +865,12 @@ first sighting, anything) still keeps; the windows are recorded in
 `snapsched/state.json` (the leader writes it with an ETag CAS; a lost CAS
 deletes nothing that run). Pausing and resuming is not a change.
 `CONSTELLATION_SNAPSCHED_EMPTY_CHECK_KEYS` (skip-empty) is in the
-snapshot table above.
+snapshot table above. The policy grammar, the retention rule and the
+space columns are in
+[`features/snapshot-policies.md`](features/snapshot-policies.md). A policy's
+`budget=` setting parses but nothing enforces it yet. Space accounting
+knobs (`CONSTELLATION_SNAPACCT*`) and `CONSTELLATION_GC_SNAP_WALK` are in
+[Garbage collection](#garbage-collection).
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
@@ -892,8 +897,9 @@ A leader that cannot reach the store (an S3 outage) counts every due root's
 snapshot as `create_failed` on each tick, and catches up with one snapshot
 (not one per missed bucket) once the store is back. `create_failed` counts
 once per due root per tick, so a 90 s outage with one root and a 1 s tick
-reads about 90; when M8 exports these counters on `/metrics`, read the rate,
-not the value, as "ticks that could not create".
+reads about 90; the `constellation_snapsched_create_failed_total` counter on
+`/metrics` is the same number, so read its rate, not the value, as "ticks
+that could not create".
 
 `constellation snapshot policy rm <fs:path> --expire` deletes a root's
 unheld auto snapshots together with its policy, after confirming their

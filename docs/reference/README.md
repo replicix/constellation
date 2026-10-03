@@ -12,6 +12,7 @@ Technical descriptions of how specific parts of Constellation work.
 - [Durability and failover](features/durability-and-failover.md) — acknowledgement layers, backups chosen by RTT, seal-based failover, `ack=s3`, `--fsync-mode`/`--write-mode`, flexible continuation epochs
 - [Cluster locks](features/cluster-locks.md) — cross-node `flock`/`fcntl` as leased grants, `EIO` fencing, `--locks cluster|local`
 - [Cooperative cache membership](features/cooperative-cache.md) — exact mirrors vs blooms, reconciliation protocol, false-positive accounting
+- [Snapshot policies](features/snapshot-policies.md) — automatic snapshot schedules and retention, holds and orphans, per-snapshot space (`USED`/`WRITTEN`/`REFER`), `snapshot space`
 - [Scratch directories](features/scratch-directories.md) — node-private staging and Publish semantics
 - [Read-time atime](features/atime.md) — optional, batched, best-effort access-time updates
 - [Remote support](features/remote-support.md) — compile-time-gated support sessions: modes, capability table, trust model, audit

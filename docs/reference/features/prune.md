@@ -16,6 +16,7 @@ same lifecycle as any other metadata and cannot dangle.
 - [Inheritance](#inheritance)
 - [How pruning runs](#how-pruning-runs)
 - [Snapshots and clones](#snapshots-and-clones)
+- [Pruning under automatic snapshot policies](#pruning-under-automatic-snapshot-policies)
 - [CLI](#cli)
 - [Consistency and limits](#consistency-and-limits)
 - [References](#references)
@@ -162,6 +163,27 @@ before it was pruned stays fully readable there. Its chunks become
 reclaimable by GC only once the last reference — live *or* snapshot — is
 gone.
 
+## Pruning under automatic snapshot policies
+
+A directory under an [automatic snapshot policy](snapshot-policies.md)
+(`user.constellation.snapshots`) is snapshotted on a schedule, so a
+pruned file stays in **every automatic snapshot that captured it** until
+those snapshots expire. Under a dense policy (`5m:1d 1h:7d 1d:30d …`)
+that can be a month or more.
+
+- Prune alone will not free the space: the bytes are released only when
+  the last snapshot that holds them expires (or is deleted) **and** bucket
+  GC has run past its horizon.
+- To see where the space is, run `constellation snapshot space
+  <fs>:/path` (live data, unique to one snapshot, shared, awaiting GC) and
+  `constellation snapshot ls -s used`. `snapshot delete --dry-run
+  <selectors>` shows what deleting a set of snapshots would return.
+- Pruning and snapshots are independent: prune never touches a snapshot,
+  and expiry never touches a live file. If a subtree needs its space back
+  sooner, shorten its snapshot tiers (mind the 24 h
+  [grace window](snapshot-policies.md#grace-after-a-policy-change)) or
+  delete the snapshots that pin the most.
+
 ## CLI
 
 ```
@@ -193,5 +215,7 @@ constellation prune status <target>        # counters
   knobs.
 - [`atime.md`](atime.md) — the read-time atime feature `unused`/`lru`
   depend on.
+- [`snapshot-policies.md`](snapshot-policies.md) — automatic snapshots and
+  `snapshot space`, which decide when pruned bytes are actually released.
 - [`scratch-directories.md`](scratch-directories.md) — the xattr-marked
   root precedent.
