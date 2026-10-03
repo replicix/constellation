@@ -11198,6 +11198,43 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     let checked = (|| -> Result<()> {
         d.mount()
             .context("fresh node bootstrap from the head commit plus the log after it")?;
+        let log_head_now = || -> Result<u64> {
+            Ok(log_segment_seqs(&env.direct_endpoint, &prefix, "p0")?
+                .last()
+                .copied()
+                .unwrap_or(0))
+        };
+        if backup {
+            // The loss check below is only meaningful once B has sealed A
+            // and taken over (re-shipping A's acknowledged tail) and the
+            // log has stopped growing; under host load that takes a while.
+            eventually(
+                "B seals A and takes over as its backup",
+                Duration::from_secs(90),
+                || {
+                    let b_ack = b.control_status()?["ack"].clone();
+                    anyhow::ensure!(
+                        b_ack["backup_takeovers"].as_u64().unwrap_or(0) >= 1
+                            && b_ack["seals"].as_u64().unwrap_or(0) >= 1,
+                        "B has not yet sealed and taken over: {b_ack}"
+                    );
+                    Ok(())
+                },
+            )?;
+            let (mut last, mut since) = (log_head_now()?, Instant::now());
+            let settle_deadline = Instant::now() + Duration::from_secs(90);
+            while since.elapsed() < Duration::from_secs(2) {
+                anyhow::ensure!(
+                    Instant::now() < settle_deadline,
+                    "the log head kept moving for 90 s after B's takeover (now {last})"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                let now = log_head_now()?;
+                if now != last {
+                    (last, since) = (now, Instant::now());
+                }
+            }
+        }
         let mut listing = Vec::new();
         eventually(
             "b and the fresh d converge on the shipped log",
@@ -11248,11 +11285,29 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
             // (`>=`: the mkdir in flight at the kill may be on B — journaled
             // and backup-acked — without its return having reached the
             // writer.)
-            anyhow::ensure!(
-                shipped >= acked_n,
-                "A acknowledged {acked_n} mkdirs but only {shipped} are visible: the backup \
-                 lost an acknowledged mkdir"
-            );
+            if shipped < acked_n {
+                let have: std::collections::HashSet<&String> = listing.iter().collect();
+                let missing: Vec<String> = (0..acked_n)
+                    .map(burst_name)
+                    .filter(|n| !have.contains(n))
+                    .collect();
+                let seq = |c: &Client| -> u64 {
+                    c.control_status()
+                        .ok()
+                        .and_then(|s| s["spool"]["head_seq"].as_u64())
+                        .unwrap_or(0)
+                };
+                anyhow::bail!(
+                    "A acknowledged {acked_n} mkdirs but only {shipped} are visible: the backup \
+                     lost an acknowledged mkdir; missing {} names (first {:?}); b head_seq {}, \
+                     d head_seq {}, log head {}",
+                    missing.len(),
+                    &missing[..missing.len().min(10)],
+                    seq(&b),
+                    seq(&d),
+                    log_head_now()?
+                );
+            }
             let b_ack = b.control_status()?["ack"].clone();
             anyhow::ensure!(
                 b_ack["backup_takeovers"].as_u64().unwrap_or(0) >= 1

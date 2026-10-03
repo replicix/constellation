@@ -39666,3 +39666,15 @@ must be re-measured; `backup-takeover-holds-missing-chunks` failed once
 core; one outstanding beat per peer with a 5 s timeout; the lsm-tree
 version-lock freeze (`slow commit: 15433 ms`, memtables 14.7 s) is the
 largest remaining holder stall.
+### holder-publishes-log-prefix-backup: loss check after the takeover settles
+
+The scenario's loss check (`shipped >= acked_n`, contiguous prefix) used to
+run as soon as B and D agreed at the log head they read, before B's seal,
+takeover and re-ship of A's acknowledged tail, so host load could make it
+report acknowledged mkdirs as lost (once: 1638 acked, 1632 visible). It now
+first waits (90 s each) for B's `backup_takeovers >= 1` and `seals >= 1`,
+then for the log head to stay unchanged for 2 s, and only then compares
+listings. A failing loss check prints the missing names and B's/D's/log head
+seq. Assertions are otherwise unchanged; no product code touched. 10/10
+release-build runs passed (debug builds miss the 5 ms backup RTT budget, so
+A never lists B as a backup there; unrelated).
