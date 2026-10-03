@@ -10,6 +10,17 @@ Pool trust model: volumes of one pool share a Constellation filesystem and
 engine process. Different tenants need different StorageClasses, not just
 different PVCs.
 
+Snapshots and clones (K4) need the snapshot CRDs (VolumeSnapshot,
+VolumeSnapshotContent, VolumeSnapshotClass) and the snapshot-controller,
+installed once per cluster before this chart's csi-snapshotter sidecar
+(external-snapshotter {{ .Values.sidecars.snapshotter.tag }}: client/config/crd and
+deploy/kubernetes/snapshot-controller; tests/csi/snapshot-crds.sh does both).
+{{- if not .Values.sidecars.snapshotter.enabled }}
+The csi-snapshotter sidecar is disabled in this release.
+{{- end }}
+A clone or restore must use a StorageClass of the source's own pool: across
+pools (or shards) it is refused (INVALID_ARGUMENT), never a full copy.
+
 Verify registration:
   kubectl get csidriver {{ .Values.driverName }}
   kubectl get csinode

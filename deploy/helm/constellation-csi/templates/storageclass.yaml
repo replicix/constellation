@@ -15,3 +15,17 @@ volumeBindingMode: {{ .volumeBindingMode | default "Immediate" }}
 mountOptions: {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- end }}
+{{- /* Plan 37 §6: VolumeSnapshotClasses listed in .Values.volumeSnapshotClasses. */}}
+{{- range .Values.volumeSnapshotClasses }}
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: {{ .name }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+driver: {{ $.Values.driverName }}
+deletionPolicy: {{ .deletionPolicy | default "Delete" }}
+{{- with .parameters }}
+parameters: {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

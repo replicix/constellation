@@ -4,7 +4,7 @@
 //! §12: "a throwaway local `EngineProfile` ... so the sanity suite never
 //! touches real S3").
 
-use super::{ControlClient, Engines, PoolRef, SubtreeQuotaParams};
+use super::{ControlClient, Engines, Handle, PoolRef, SubtreeQuotaParams};
 use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::proto::types::{
@@ -16,7 +16,7 @@ use constellation_control::proto::types::{
     ViewUnmountParams, XattrOp, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -56,11 +56,18 @@ struct Registry {
     next_fs_uuid: u64,
 }
 
+/// A snapshot and the subtree it froze (paths relative to its root, `/`
+/// being the root itself).
+struct FrozenSnapshot {
+    status: SnapshotStatus,
+    frozen: Vec<(String, DirEntry)>,
+}
+
 struct State {
     /// Normalized path ("/", "/volumes/pvc-1") -> entry. The root always
     /// exists.
     tree: BTreeMap<String, DirEntry>,
-    snapshots: Vec<SnapshotStatus>,
+    snapshots: Vec<FrozenSnapshot>,
     views: BTreeMap<u64, Mounted>,
 }
 
@@ -101,6 +108,12 @@ pub struct InMemoryControl {
     /// Every subtree usage walk: a `quota_get` of anything but `/` (the
     /// real engine's `recursive_size`, O(entries)).
     usage_walks: AtomicU64,
+    /// Every `clone.create` call.
+    clones: AtomicU64,
+    /// How many of the next `clone.create` calls fail.
+    clone_failures: AtomicU32,
+    /// Every `snapshot.list` call.
+    snapshot_lists: AtomicU64,
 }
 
 impl Default for InMemoryControl {
@@ -130,6 +143,9 @@ impl InMemoryControl {
             any_path: std::sync::atomic::AtomicBool::new(false),
             fds_received: AtomicU64::new(0),
             unlocks: AtomicU64::new(0),
+            clones: AtomicU64::new(0),
+            clone_failures: AtomicU32::new(0),
+            snapshot_lists: AtomicU64::new(0),
         }
     }
 
@@ -206,6 +222,27 @@ impl InMemoryControl {
         self.usage_walks.load(Ordering::SeqCst)
     }
 
+    /// Fail the next `n` `clone.create` calls.
+    pub fn fail_next_clones(&self, n: u32) {
+        self.clone_failures.store(n, Ordering::SeqCst);
+    }
+
+    /// How many `clone.create` calls arrived.
+    pub fn clones(&self) -> u64 {
+        self.clones.load(Ordering::SeqCst)
+    }
+
+    /// How many `snapshot.list` calls arrived.
+    pub fn snapshot_lists(&self) -> u64 {
+        self.snapshot_lists.load(Ordering::SeqCst)
+    }
+
+    /// Every snapshot this filesystem holds, as `snapshot.list` reports it.
+    pub fn snapshots(&self) -> Vec<SnapshotStatus> {
+        let state = self.state.lock().unwrap();
+        state.snapshots.iter().map(|s| s.status.clone()).collect()
+    }
+
     /// How many times `quota_set` has been called, failures included.
     pub fn quota_set_calls(&self) -> u64 {
         self.quota_set_calls.load(Ordering::SeqCst)
@@ -273,6 +310,38 @@ fn parent_of(path: &str) -> Option<String> {
     } else {
         path[..slash].to_string()
     })
+}
+
+/// The engine's `split_selector`: `path@name`, split at the last `@`.
+fn split_selector(selector: &str) -> Result<(String, String), ControlError> {
+    let (path, name) = selector.rsplit_once('@').ok_or_else(|| {
+        ControlError::failed(format!(
+            "snapshot selector {selector:?} must be <path>@<name>"
+        ))
+    })?;
+    if name.is_empty() || name.contains('/') {
+        return Err(ControlError::failed(
+            "snapshot name must be non-empty and contain neither '/' nor '@'",
+        ));
+    }
+    Ok((normalize(path), name.to_string()))
+}
+
+/// The engine's hold-owner namespaces (`user:`, `csi:`).
+fn validate_owner(by: &str) -> Result<(), ControlError> {
+    match by.split_once(':') {
+        Some(("user" | "csi", rest)) if !rest.is_empty() => Ok(()),
+        _ => Err(ControlError::invalid(format!(
+            "hold owner {by:?} needs a namespace: `user:<name>` or `csi:<id>`"
+        ))),
+    }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl InMemoryControl {
@@ -519,110 +588,193 @@ impl ControlClient for InMemoryControl {
             .ok_or_else(|| ControlError::not_found(format!("{path} does not exist")))
     }
 
+    /// Like the engine's: `selector` is `path@name`, the path must exist,
+    /// a taken name is refused, and every refusal is `Failed` with a
+    /// message (the engine maps all of them through one `failed`). The
+    /// snapshot freezes a copy of the subtree, so clones see it as it was.
     async fn snapshot_create(
         &self,
         params: SnapshotCreateParams,
     ) -> Result<SnapshotCreated, ControlError> {
         let (held, owner) = params.hold_request().map_err(ControlError::invalid)?;
+        if let Some(by) = owner {
+            validate_owner(by)?;
+        }
+        let (path, name) = split_selector(&params.selector)?;
+        if name.contains(['%', '*']) {
+            return Err(ControlError::failed(
+                "snapshot name must be non-empty and contain none of '/', '@', '%', '*'",
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        if !state.tree.contains_key(&path) {
+            return Err(ControlError::failed(format!("{path}: not found")));
+        }
+        if state
+            .snapshots
+            .iter()
+            .any(|s| s.status.path == path && s.status.name == name)
+        {
+            return Err(ControlError::failed(format!(
+                "snapshot {path}@{name} already exists"
+            )));
+        }
+        let under = InMemoryControl::subtree_of(&state.tree, &path);
+        let refer: u64 = under.iter().map(|p| state.tree[p].used_bytes).sum();
+        let frozen = under
+            .iter()
+            .map(|p| {
+                let rel = if path == "/" {
+                    p.clone()
+                } else {
+                    normalize(&p[path.len()..])
+                };
+                (rel, state.tree[p].clone())
+            })
+            .collect();
         let id = format!(
-            "snap-{}",
+            "fakesnap{:08x}",
             self.next_snapshot_id.fetch_add(1, Ordering::SeqCst)
         );
-        let snapshot = SnapshotStatus {
-            id: id.clone(),
-            path: params.selector.clone(),
-            name: id,
+        let status = SnapshotStatus {
+            id,
+            path: path.clone(),
+            name: name.clone(),
+            created_unix_ms: unix_ms(),
             held,
             held_by: owner.map(str::to_string),
             origin: "manual".to_string(),
+            refer_bytes: Some(refer),
             ..Default::default()
         };
-        self.state.lock().unwrap().snapshots.push(snapshot.clone());
+        state.snapshots.push(FrozenSnapshot {
+            status: status.clone(),
+            frozen,
+        });
         Ok(SnapshotCreated {
-            detail: format!("snapshot of {} created", params.selector),
-            snapshot,
+            detail: format!("created snapshot {path}@{name}"),
+            snapshot: status,
         })
     }
 
     async fn snapshot_delete(&self, params: SnapshotDeleteParams) -> Result<Ack, ControlError> {
+        let (path, name) = split_selector(&params.selector)?;
         let mut state = self.state.lock().unwrap();
-        let Some(idx) = state
+        let idx = state
             .snapshots
             .iter()
-            .position(|s| s.id == params.selector || s.path == params.selector)
-        else {
-            return Ok(Ack::new("already gone"));
-        };
-        if state.snapshots[idx].held && !params.force {
-            return Err(ControlError::new(
-                constellation_control::proto::ErrorKind::Conflict,
-                format!("{} is held", params.selector),
-            ));
+            .position(|s| s.status.path == path && s.status.name == name)
+            .ok_or_else(|| {
+                ControlError::failed(format!("snapshot {path}@{name} does not exist"))
+            })?;
+        let status = &state.snapshots[idx].status;
+        if status.held && !params.force {
+            return Err(ControlError::failed(format!(
+                "snapshot {path}@{name} is held by {}; `snapshot release` first (or pass --force)",
+                status.held_by.as_deref().unwrap_or("a plain hold")
+            )));
         }
         state.snapshots.remove(idx);
-        Ok(Ack::new("deleted"))
+        Ok(Ack::new(format!("deleted snapshot {path}@{name}")))
     }
 
     async fn snapshot_list(
         &self,
         params: SnapshotListParams,
     ) -> Result<SnapshotListing, ControlError> {
+        self.snapshot_lists.fetch_add(1, Ordering::SeqCst);
         let state = self.state.lock().unwrap();
+        let path = params.path.as_deref().map(normalize);
         let snapshots = state
             .snapshots
             .iter()
-            .filter(|s| params.path.as_deref().is_none_or(|p| s.path == p))
+            .map(|s| &s.status)
+            .filter(|s| path.as_deref().is_none_or(|p| s.path == p))
             .cloned()
             .collect();
         Ok(SnapshotListing { snapshots })
     }
 
+    /// The engine's owner rule: a hold recorded under an owner is changed
+    /// only by that owner (a plain hold by a plain release), unless
+    /// `force`.
     async fn snapshot_hold(
         &self,
         params: SnapshotHoldParams,
     ) -> Result<SnapshotHeld, ControlError> {
+        let by = params.by.filter(|b| !b.is_empty());
+        if let Some(by) = &by {
+            validate_owner(by)?;
+        }
+        let selected = match params.id.contains('@') {
+            true => Some(split_selector(&params.id)?),
+            false => None,
+        };
         let mut state = self.state.lock().unwrap();
         let snapshot = state
             .snapshots
             .iter_mut()
-            .find(|s| s.id == params.id || s.path == params.id)
-            .ok_or_else(|| ControlError::not_found(format!("no snapshot {}", params.id)))?;
-        if snapshot.held
-            && !params.force
-            && snapshot.held_by.is_some()
-            && snapshot.held_by != params.by
-        {
-            return Err(ControlError::denied(format!(
-                "held by {}",
-                snapshot.held_by.as_deref().unwrap_or("?")
+            .map(|s| &mut s.status)
+            .find(|s| match &selected {
+                Some((path, name)) => &s.path == path && &s.name == name,
+                None => s.id == params.id,
+            })
+            .ok_or_else(|| ControlError::failed(format!("no such snapshot: {}", params.id)))?;
+        if snapshot.held && !params.force && snapshot.held_by != by {
+            return Err(ControlError::failed(format!(
+                "snapshot {}@{} is held by {}, not {}",
+                snapshot.path,
+                snapshot.name,
+                snapshot.held_by.as_deref().unwrap_or("a plain hold"),
+                by.as_deref().unwrap_or("a plain hold")
             )));
         }
         snapshot.held = params.held;
-        snapshot.held_by = params.by;
+        snapshot.held_by = if params.held { by } else { None };
         Ok(SnapshotHeld {
             detail: format!("held: {}", snapshot.held),
             snapshot: snapshot.clone(),
         })
     }
 
+    /// Like the engine's: from a snapshot (`path@name`) only, into a
+    /// destination that does not exist yet under a parent that does. The
+    /// copy is the frozen tree, xattrs included (the source volume's record
+    /// comes along, as it does from the engine); quotas do not travel.
     async fn clone_create(&self, params: CloneParams) -> Result<Ack, ControlError> {
-        let from = normalize(&params.selector);
+        self.clones.fetch_add(1, Ordering::SeqCst);
+        if self
+            .clone_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ControlError::failed("injected clone.create failure"));
+        }
+        let (path, name) = split_selector(&params.selector)?;
         let to = normalize(&params.destination);
         let mut state = self.state.lock().unwrap();
-        if !state.tree.contains_key(&from) {
-            return Err(ControlError::not_found(format!("{from} does not exist")));
+        let frozen = state
+            .snapshots
+            .iter()
+            .find(|s| s.status.path == path && s.status.name == name)
+            .map(|s| s.frozen.clone())
+            .ok_or_else(|| {
+                ControlError::failed(format!("snapshot {path}@{name} does not exist"))
+            })?;
+        if state.tree.contains_key(&to) {
+            return Err(ControlError::failed(format!("{to}: already exists")));
         }
-        let copies: Vec<(String, DirEntry)> = InMemoryControl::subtree_of(&state.tree, &from)
-            .into_iter()
-            .map(|p| {
-                let entry = state.tree.get(&p).expect("just listed").clone();
-                (InMemoryControl::remap(&from, &to, &p), entry)
-            })
-            .collect();
-        for (p, entry) in copies {
-            state.tree.insert(p, entry);
+        let parent = parent_of(&to).unwrap_or_else(|| "/".to_string());
+        if !state.tree.contains_key(&parent) {
+            return Err(ControlError::failed(format!("{parent}: not found")));
         }
-        Ok(Ack::new(format!("{from} cloned to {to}")))
+        for (rel, mut entry) in frozen {
+            entry.quota = None;
+            state
+                .tree
+                .insert(InMemoryControl::remap("/", &to, &rel), entry);
+        }
+        Ok(Ack::new(format!("cloned {path}@{name} to {to}")))
     }
 
     async fn view_mount(&self, params: ViewMountParams) -> Result<ViewInfo, ControlError> {
@@ -784,10 +936,21 @@ impl ControlClient for InMemoryControl {
 /// of N pool (or shard) filesystems each behind its own engine pod. Backs
 /// the controller's unit tests and `constellation-csi --in-memory-backend`
 /// (what `tests/csi/sanity.sh` runs `csi-sanity` against).
+///
+/// It also models which engine pods are up: [`Engines::filesystem`] starts
+/// one (counted, [`Self::starts`]), [`Self::stop_all`] is a teardown that
+/// deletes them, and the filesystems' trees survive it the way the data in
+/// S3 survives its pods. The CO's objects are modelled only when a test
+/// says which handles exist ([`Self::set_named`]); otherwise every handle
+/// is named, as there is no CO to ask.
 #[derive(Default)]
 pub struct InMemoryEngines {
     registry: Arc<InMemoryControl>,
     filesystems: Mutex<BTreeMap<String, Arc<InMemoryControl>>>,
+    running: Mutex<BTreeSet<String>>,
+    starts: AtomicU64,
+    retires: AtomicU64,
+    named: Mutex<Option<BTreeSet<String>>>,
 }
 
 impl InMemoryEngines {
@@ -800,6 +963,32 @@ impl InMemoryEngines {
     /// The registry client, for tests.
     pub fn registry_client(&self) -> Arc<InMemoryControl> {
         self.registry.clone()
+    }
+
+    /// How many engine pods have been started (a filesystem asked for
+    /// while none served it).
+    pub fn starts(&self) -> u64 {
+        self.starts.load(Ordering::SeqCst)
+    }
+
+    /// How many [`Engines::retire`] calls stopped a pod.
+    pub fn retires(&self) -> u64 {
+        self.retires.load(Ordering::SeqCst)
+    }
+
+    /// Whether an engine pod serves `uuid` now.
+    pub fn is_running(&self, uuid: &str) -> bool {
+        self.running.lock().unwrap().contains(uuid)
+    }
+
+    /// Delete every engine pod (a teardown); the data stays.
+    pub fn stop_all(&self) {
+        self.running.lock().unwrap().clear();
+    }
+
+    /// From now on the CO has exactly these objects (`None`: no CO).
+    pub fn set_named(&self, handles: Option<BTreeSet<String>>) {
+        *self.named.lock().unwrap() = handles;
     }
 }
 
@@ -817,6 +1006,9 @@ impl Engines for InMemoryEngines {
                 "no filesystem {fs_uuid} is registered"
             )));
         }
+        if self.running.lock().unwrap().insert(fs_uuid.to_string()) {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+        }
         let client = self
             .filesystems
             .lock()
@@ -829,6 +1021,36 @@ impl Engines for InMemoryEngines {
             })
             .clone();
         Ok(client)
+    }
+
+    async fn running(&self, fs_uuid: &str) -> Result<Option<Arc<dyn ControlClient>>, ControlError> {
+        if !self.is_running(fs_uuid) {
+            return Ok(None);
+        }
+        Ok(self
+            .filesystem_client(fs_uuid)
+            .map(|c| c as Arc<dyn ControlClient>))
+    }
+
+    async fn named(&self, handle: Handle<'_>) -> Result<bool, ControlError> {
+        let (Handle::Volume(h) | Handle::Snapshot(h)) = handle;
+        Ok(self
+            .named
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|set| set.contains(h)))
+    }
+
+    async fn retire(&self, fs_uuid: &str) -> Result<(), ControlError> {
+        if self.running.lock().unwrap().remove(fs_uuid) {
+            self.retires.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    async fn running_filesystems(&self) -> Result<Vec<String>, ControlError> {
+        Ok(self.running.lock().unwrap().iter().cloned().collect())
     }
 }
 
@@ -1056,10 +1278,11 @@ mod tests {
         })
         .await
         .unwrap();
+        c.set_used_bytes("/volumes/pv1", 7);
 
         let created = c
             .snapshot_create(SnapshotCreateParams {
-                selector: "/volumes/pv1".into(),
+                selector: "/volumes/pv1@s1".into(),
                 held_by: Some("csi:content-1".into()),
                 ..Default::default()
             })
@@ -1067,18 +1290,42 @@ mod tests {
             .unwrap();
         assert!(created.snapshot.held);
         assert_eq!(created.snapshot.held_by.as_deref(), Some("csi:content-1"));
+        assert_eq!(created.snapshot.refer_bytes, Some(7));
+        // A taken name, and a missing path, are refused like the engine
+        // refuses them: `Failed`.
+        for selector in ["/volumes/pv1@s1", "/volumes/nope@s2"] {
+            let e = c
+                .snapshot_create(SnapshotCreateParams {
+                    selector: selector.into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind, ErrorKind::Failed, "{selector}");
+        }
 
-        // A held snapshot refuses delete without force.
+        // A held snapshot refuses delete without force; another owner may
+        // not release it.
         let refused = c
             .snapshot_delete(SnapshotDeleteParams {
-                selector: created.snapshot.id.clone(),
+                selector: "/volumes/pv1@s1".into(),
                 force: false,
             })
             .await
             .unwrap_err();
-        assert_eq!(refused.kind, ErrorKind::Conflict);
+        assert!(refused.message.contains("csi:content-1"), "{refused}");
+        let wrong_owner = c
+            .snapshot_hold(SnapshotHoldParams {
+                id: created.snapshot.id.clone(),
+                held: false,
+                by: Some("user:x".into()),
+                force: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_owner.kind, ErrorKind::Failed);
 
-        // Release the hold, then delete cleanly.
+        // Release the hold (by id), then delete cleanly (by selector).
         c.snapshot_hold(SnapshotHoldParams {
             id: created.snapshot.id.clone(),
             held: false,
@@ -1088,54 +1335,67 @@ mod tests {
         .await
         .unwrap();
         c.snapshot_delete(SnapshotDeleteParams {
-            selector: created.snapshot.id.clone(),
+            selector: "/volumes/pv1@s1".into(),
             force: false,
         })
         .await
         .unwrap();
-
         let listing = c
             .snapshot_list(SnapshotListParams::default())
             .await
             .unwrap();
         assert!(listing.snapshots.is_empty());
-
-        // Deleting an already-gone snapshot is OK (idempotent).
+        // A gone snapshot is an error, as from the engine.
         c.snapshot_delete(SnapshotDeleteParams {
-            selector: created.snapshot.id,
+            selector: "/volumes/pv1@s1".into(),
             force: false,
         })
         .await
-        .unwrap();
+        .unwrap_err();
     }
 
     #[tokio::test]
-    async fn clone_copies_the_subtree() {
+    async fn clone_copies_the_frozen_subtree() {
         let c = InMemoryControl::default();
         c.browse_mkdir(MkdirParams {
-            path: "/volumes/source".into(),
+            path: "/volumes/source/sub".into(),
             mode: None,
             parents: true,
         })
         .await
         .unwrap();
-        c.browse_xattr(XattrParams {
-            path: "/volumes/source".into(),
-            op: XattrOp::Set {
-                name: "user.constellation.csi.pv".into(),
-                value: b"source".to_vec().into(),
-            },
+        let set = |path: &'static str, value: &'static [u8]| {
+            c.browse_xattr(XattrParams {
+                path: path.into(),
+                op: XattrOp::Set {
+                    name: "user.constellation.csi.pv".into(),
+                    value: value.to_vec().into(),
+                },
+            })
+        };
+        set("/volumes/source", b"source").await.unwrap();
+        c.snapshot_create(SnapshotCreateParams {
+            selector: "/volumes/source@s".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
-
+        // Changed after the snapshot: the clone does not see it.
+        set("/volumes/source", b"changed").await.unwrap();
+        // Only from a snapshot.
         c.clone_create(CloneParams {
             selector: "/volumes/source".into(),
             destination: "/volumes/clone".into(),
         })
         .await
+        .unwrap_err();
+        c.clone_create(CloneParams {
+            selector: "/volumes/source@s".into(),
+            destination: "/volumes/clone".into(),
+        })
+        .await
         .unwrap();
-
+        assert!(c.exists("/volumes/clone/sub"));
         let got = c
             .browse_xattr(XattrParams {
                 path: "/volumes/clone".into(),
@@ -1146,13 +1406,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.value.unwrap().0.as_ref(), b"source");
+        // Never over an existing destination.
+        c.clone_create(CloneParams {
+            selector: "/volumes/source@s".into(),
+            destination: "/volumes/clone".into(),
+        })
+        .await
+        .unwrap_err();
     }
 
-    /// `selector: "/"` is how every `layout: dedicated` snapshot/clone names
-    /// its source (plan 37 §3 decision 8, §5): the whole tree, not a literal
-    /// path match of just the root entry. Every other path must land one
-    /// level under the destination, with the separator intact, and the
-    /// root's own entry must become the destination itself.
+    /// `/@name` is how every `layout: dedicated` snapshot names its source
+    /// (the whole tree). Every other path must land one level under the
+    /// destination, with the separator intact, and the root's own entry
+    /// must become the destination itself.
     #[tokio::test]
     async fn clone_from_root_remaps_the_whole_tree() {
         let c = InMemoryControl::default();
@@ -1174,16 +1440,19 @@ mod tests {
         })
         .await
         .unwrap();
-
+        c.snapshot_create(SnapshotCreateParams {
+            selector: "/@all".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         c.clone_create(CloneParams {
-            selector: "/".into(),
+            selector: "/@all".into(),
             destination: "/volumes/clone".into(),
         })
         .await
         .unwrap();
 
-        // The root's own entry becomes the destination (not
-        // "/volumes/clonevolumes" or similar path corruption).
         let root_clone = c
             .browse_xattr(XattrParams {
                 path: "/volumes/clone".into(),
@@ -1194,29 +1463,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root_clone.value.unwrap().0.as_ref(), b"yes");
-        // Every original path survives untouched (clone, not move) and the
-        // destination mirrors the source tree one level down, separator
-        // intact.
         for p in [
             "/volumes/source",
             "/volumes/clone/volumes/source",
             "/volumes/clone/volumes/source/sub",
             "/volumes/clone/other",
         ] {
-            c.browse_xattr(XattrParams {
-                path: p.into(),
-                op: XattrOp::List,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("{p} should exist after cloning /: {e}"));
+            assert!(c.exists(p), "{p} should exist after cloning /");
         }
-        // The root invariant holds: "/" itself is untouched by a clone.
-        c.browse_xattr(XattrParams {
-            path: "/".into(),
-            op: XattrOp::List,
-        })
-        .await
-        .unwrap();
+        assert!(!c.exists("/volumes/clonevolumes"));
     }
 
     /// Renaming the root would leave nothing to satisfy `State::tree`'s "the

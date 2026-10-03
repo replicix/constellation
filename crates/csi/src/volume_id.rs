@@ -235,6 +235,70 @@ impl fmt::Display for VolumeId {
     }
 }
 
+/// A CSI snapshot's id (plan 37 K4): the source volume's id and the
+/// snapshot's name, `<volume_id>@<name>` — the control protocol's own
+/// `path@name` selector with the volume id standing in for the path, so
+/// the id names the filesystem, the shard, the subtree the snapshot was
+/// taken of, and the snapshot itself, and every snapshot RPC finds all of
+/// it in `snapshot_id` alone (settled decision 7's statelessness, extended
+/// to snapshots). The name is `CreateSnapshot`'s `req.name`.
+///
+/// `@` splits at the last one: a snapshot name never contains `@`
+/// ([`validate_snapshot_name`]), while a static handle's path may.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotId {
+    pub volume: VolumeId,
+    pub name: String,
+}
+
+/// A name a snapshot may take: one the engine accepts for a new snapshot
+/// (non-empty, none of `/`, `@`, `%`, `*` — the selector operators), and no
+/// longer than a volume name.
+pub fn validate_snapshot_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name is empty".into());
+    }
+    if name.contains(['/', '@', '%', '*', '\0']) {
+        return Err(format!(
+            "snapshot name {name:?} contains one of '/', '@', '%', '*' or NUL"
+        ));
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(format!(
+            "name is {} bytes, the limit is {MAX_NAME_LEN}",
+            name.len()
+        ));
+    }
+    Ok(())
+}
+
+impl SnapshotId {
+    pub fn parse(id: &str) -> Result<SnapshotId, ParseError> {
+        let (volume, name) = id.rsplit_once('@').ok_or_else(|| {
+            ParseError(format!("snapshot_id {id:?}: expected <volume_id>@<name>"))
+        })?;
+        validate_snapshot_name(name)
+            .map_err(|why| ParseError(format!("snapshot_id {id:?}: {why}")))?;
+        let volume =
+            VolumeId::parse(volume).map_err(|e| ParseError(format!("snapshot_id {id:?}: {e}")))?;
+        Ok(SnapshotId {
+            volume,
+            name: name.to_string(),
+        })
+    }
+
+    /// The engine's selector for it: `<subtree>@<name>`.
+    pub fn selector(&self) -> String {
+        format!("{}@{}", self.volume.subtree(), self.name)
+    }
+}
+
+impl fmt::Display for SnapshotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.volume, self.name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +387,41 @@ mod tests {
             assert!(validate_name(bad).is_err(), "{bad:?}");
         }
         assert!(validate_name(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn snapshot_ids_round_trip_and_name_their_source() {
+        let volume = VolumeId::Pool {
+            shard: 1,
+            fs_uuid: UUID.into(),
+            name: "pvc-1".into(),
+        };
+        let id = SnapshotId {
+            volume: volume.clone(),
+            name: "snapshot-9f".into(),
+        };
+        let s = id.to_string();
+        assert_eq!(s, format!("v1/pool/1/{UUID}/volumes/pvc-1@snapshot-9f"));
+        assert_eq!(SnapshotId::parse(&s).unwrap(), id);
+        assert_eq!(id.selector(), "/volumes/pvc-1@snapshot-9f");
+        let dedicated = SnapshotId::parse(&format!("v1/dedicated/{UUID}/@s")).unwrap();
+        assert_eq!(dedicated.selector(), "/@s");
+        // A static path may hold '@'; the name may not, so the last '@'
+        // splits them.
+        let st = SnapshotId::parse(&format!("{UUID}/data/a@b@snap")).unwrap();
+        assert_eq!(st.selector(), "/data/a@b@snap");
+        assert_eq!(st.name, "snap");
+        for bad in [
+            "reallyfakesnapshotid",
+            "none-exist-id",
+            "v1/pool/0/abc/volumes/pv@",
+            "v1/pool/0/abc/volumes/pv@a%b",
+            "v1/pool/0/abc/volumes/pv@a*",
+            "garbage@snap",
+        ] {
+            assert!(SnapshotId::parse(bad).is_err(), "{bad:?} should not parse");
+        }
+        validate_snapshot_name(&"s".repeat(128)).unwrap();
+        assert!(validate_snapshot_name(&"s".repeat(129)).is_err());
     }
 }

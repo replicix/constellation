@@ -19,11 +19,14 @@ sidecars:
   nodeDriverRegistrar: {image: csi-node-driver-registrar, tag: v2.18.0}
   livenessprobe: {image: livenessprobe, tag: v2.20.0}
   # Controller sidecars. Each renders with its upstream RBAC
-  # (templates/rbac.yaml). The snapshotter stays off until K4 implements
-  # the snapshot RPCs.
+  # (templates/rbac.yaml). The snapshotter (K4) needs the snapshot CRDs and
+  # the cluster-wide snapshot-controller installed first — once per
+  # cluster, not by this chart (plan 37 §14; tests/csi/snapshot-crds.sh
+  # installs both at the pinned tag). Without them it only logs errors;
+  # turn it off on a cluster that will never have them.
   provisioner: {enabled: true, image: csi-provisioner, tag: v6.3.0}
   resizer: {enabled: true, image: csi-resizer, tag: v2.2.1}
-  snapshotter: {enabled: false, image: csi-snapshotter, tag: v8.6.0}
+  snapshotter: {enabled: true, image: csi-snapshotter, tag: v8.6.0}
   # How long a sidecar waits for one Controller RPC. The first CreateVolume
   # of a pool starts that pool's engine pod and waits for it to become
   # ready, which takes longer than the sidecars' 10s default.
@@ -90,6 +93,19 @@ engineProfile:
 #     allowVolumeExpansion: true
 #     volumeBindingMode: Immediate
 storageClasses: []
+
+# VolumeSnapshotClasses to create with the chart (plan 37 §6; needs the
+# snapshot CRDs, see sidecars.snapshotter). A snapshot is a held
+# Constellation snapshot of the volume's subtree, taken through the pool's
+# engine pod, which already has the pool's credentials: no secret is
+# needed. A clone or restore (a PVC with a dataSource) must use a
+# StorageClass of the source's own pool (plan 37 settled decision 8).
+#
+# volumeSnapshotClasses:
+#   - name: constellation-snapshots
+#     deletionPolicy: Delete
+#     parameters: {}
+volumeSnapshotClasses: []
 
 # Purge worker (controller; K4).
 purge:

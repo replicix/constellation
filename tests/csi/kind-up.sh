@@ -55,6 +55,8 @@ if [ "${1:-}" = "--install" ]; then
         | kubectl --context "kind-$name" apply -f -
     kubectl --context "kind-$name" label namespace "$ns" \
         pod-security.kubernetes.io/enforce=privileged --overwrite
+    # The chart's csi-snapshotter needs them (plan 37 §14, K4).
+    KUBE_CONTEXT="kind-$name" "$root/tests/csi/snapshot-crds.sh"
     helm --kube-context "kind-$name" upgrade --install constellation-csi "$chart" \
         -n "$ns" --set image.repository="$repo" --set image.tag="$tag" \
         --wait --timeout 180s

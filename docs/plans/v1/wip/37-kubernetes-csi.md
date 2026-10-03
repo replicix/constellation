@@ -2059,6 +2059,78 @@ can honestly recommend a `shards` value.
   passes; the "clone/restore within a pool, and refusal across pools"
   `k8s-scenario` passes both halves; `ListSnapshots` pagination matches
   `csi-sanity`'s expectations.
+- **37-k4 notes (deviations and decisions).**
+  - *The hold's owner is `csi:<snapshot_id>`, not `csi:<VolumeSnapshotContent
+    uid>`* (settled decision 8, §5, §16). No CSI request carries the
+    content's uid: external-snapshotter sends `req.name`
+    (`snapshot-<VolumeSnapshot uid>`) and at most the content's *name*. The
+    snapshot id is what the content records as `status.snapshotHandle`, so
+    the owner still names the Kubernetes object, and it makes every
+    `csi:`-held row self-describing for `ListSnapshots`.
+  - *`snapshot_id` = `<source volume_id>@<req.name>`*: the engine's own
+    `path@name` selector with the volume id for the path, so the id names
+    the filesystem, the shard, the subtree and the snapshot. Snapshot names
+    may not contain `/`, `@`, `%`, `*` (the engine's rule for new names);
+    the 128-byte name limit is CSI's.
+  - *A clone lands in the source's shard*, not in `hash(req.name)`'s: the
+    destination is the class's pool shard the source lives in, and that
+    filesystem must be the source's (`fs.create`'s uuid compared). A
+    source in another pool, in a shard the class does not have, in a
+    dedicated filesystem, or a dedicated destination class, is
+    `INVALID_ARGUMENT` naming both filesystems.
+  - *A volume clone (`FromVolume`) goes through a transient snapshot*:
+    `clone.create` clones snapshots only, so the controller takes an
+    unheld `csi-clone-<hash of the new name>` snapshot of the source,
+    clones it and deletes it (the same name on every retry). It is deleted
+    on every path out of the create, failures included (best effort,
+    logged): it is manual and unheld, so plan 32's expiry never removes
+    it, and a clone abandoned with its PVC would otherwise pin the
+    source's chunks forever. Only a controller crash between the snapshot
+    and the delete leaves one, until that create's retry.
+  - *`DeleteSnapshot` with another hold*: when a human holds the snapshot
+    too (`snapshot hold --force` moved the owner to `user:…`, or a plain
+    hold), the RPC succeeds and the snapshot stays the human's.
+  - *`ListSnapshots` unfiltered* covers the filesystems an engine pod
+    serves now (it starts none); by `snapshot_id` it also finds snapshots
+    this driver does not hold (a pre-provisioned content importing a
+    human's snapshot). `GET_SNAPSHOT` (alpha) is implemented and
+    advertised too: `ListSnapshots` by id, `NOT_FOUND` when missing.
+  - *Deletes start nothing they do not need* (the 37-k3b review's bug).
+    `DeleteVolume`/`DeleteSnapshot` use an engine pod that is already up;
+    with none, they ask the API server whether the PV/content still exists
+    and answer `OK` at once if not, else start the pod, delete, and stop it
+    again. **Known window:** external-provisioner also calls `DeleteVolume`
+    with no PV when it cleans up after failing to save the PV. If then no
+    engine pod is up and this process did not create the volume (the
+    controller restarted in between), the answer is `OK` without trashing
+    it (logged at warn with the volume id), and the volume and its quota
+    stay until removed by hand. A volume this process created and has not
+    deleted is exempt: the controller remembers it, starts the engine and
+    trashes it (a delete repeated after that finds nothing remembered and
+    starts nothing).
+  - *Snapshot secrets are ignored.* §6's `VolumeSnapshotClass` example
+    names `snapshotter-secret-*`, but the driver never reads
+    `CreateSnapshotRequest.secrets`: the engine pod of the source's
+    filesystem is already running, or is rebuilt from the PV's/the
+    StorageClass's own parameters (§6), so a snapshot class needs no
+    secret.
+  - *Known CSI gap: unfiltered `ListSnapshots` covers only filesystems
+    with an engine pod up*, so snapshots in idle pools are not listed (by
+    `snapshot_id` or `source_volume_id` the filesystem is reached). Starting
+    every pool's pod for a listing would be worse.
+  - *`CreateSnapshot` reads every snapshot* of each running filesystem for
+    the name-collision check (`snapshot.list` has no name filter): O(all
+    snapshots, plan 32's automatic ones included) per create.
+  - *Snapshot CRDs and the snapshot-controller* are installed by
+    `tests/csi/snapshot-crds.sh` (external-snapshotter's manifests at the
+    pinned tag; upstream's controller manifest at v8.6.0 still names the
+    v8.5.0 image, so the script pins it). The chart enables the
+    csi-snapshotter sidecar by default.
+  - *A refused restore delays the namespace's deletion by minutes*:
+    external-provisioner keeps `volumesnapshot-as-source-protection` on the
+    source `VolumeSnapshot` while the refused PVC is in its "infeasible,
+    retries delayed" backoff (204 s in one run of
+    `csi-clone-cross-pool-refused`). Kubernetes behaviour, not the driver's.
 
 ### K5 — FUSE session handover in production
 

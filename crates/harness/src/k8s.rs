@@ -45,7 +45,10 @@
 //! 2. The chart (`--chart`, default `deploy/helm/constellation-csi`),
 //!    `helm upgrade --install`ed into `--namespace` (labelled
 //!    PodSecurity `privileged`: the node plugin is).
-//! 3. A private floci S3 (`<cluster>-k8s-floci-<run id>`) on the `kind`
+//! 3. The snapshot CRDs and the snapshot-controller
+//!    (`tests/csi/snapshot-crds.sh`, before the chart: its csi-snapshotter
+//!    sidecar needs them).
+//! 4. A private floci S3 (`<cluster>-k8s-floci-<run id>`) on the `kind`
 //!    docker network, in memory, removed at the end; its credentials as
 //!    one Secret in the driver namespace.
 //!
@@ -56,10 +59,13 @@
 //! S3 vanished crash-loops on its registry record). A scenario ends by
 //! deleting its pods and checking that every one of its volumes unstaged
 //! (no FUSE mount left at the volume's staging path on any worker), then
-//! its namespace and StorageClass, waiting for the PVs to be deleted, and
-//! finally removing its pool's engine pods (engine-pod GC is plan 37 K6b's,
-//! so nothing else would), again until none has come back for 30 s: a
-//! late duplicate `DeleteVolume` recreates the controller-owned one.
+//! its namespace (its `VolumeSnapshot`s with it), waiting for its PVs and
+//! `VolumeSnapshotContent`s to be deleted, then its StorageClasses and
+//! `VolumeSnapshotClass`, and finally removing its pools' engine pods
+//! (engine-pod GC is plan 37 K6b's, so nothing else would). Once deleted
+//! they stay deleted: a delete the sidecars repeat after their object is
+//! gone starts no engine pod (plan 37 K4 fixed the controller, which used
+//! to recreate one to answer it).
 //!
 //! Without `kubectl`, `helm`, `docker` or `kind` every selected scenario
 //! is reported SKIPPED with the missing tool, as `harness run` does for a
@@ -507,6 +513,14 @@ impl Env {
             "apiVersion": "v1", "kind": "Namespace",
             "metadata": {"name": ns, "labels": {"pod-security.kubernetes.io/enforce": "privileged"}}
         }))?;
+        eprintln!("=== snapshot CRDs and snapshot-controller (tests/csi/snapshot-crds.sh)");
+        let mut crds = Command::new("bash");
+        crds.arg(root.join("tests/csi/snapshot-crds.sh"))
+            .env("KUBECONFIG", &kube.kubeconfig);
+        if let Some(ctx) = &kube.context {
+            crds.env("KUBE_CONTEXT", ctx);
+        }
+        run_cmd(crds, None, Duration::from_secs(600)).context("tests/csi/snapshot-crds.sh")?;
         let chart = opts
             .chart
             .clone()
@@ -652,12 +666,26 @@ impl Env {
 pub struct Scope<'a> {
     pub env: &'a Env,
     pub ns: String,
+    /// The scope's first pool StorageClass.
     pub sc: String,
-    /// The driver's `constellation.dev/pool` label of the scope's class.
-    pool: String,
+    /// Every StorageClass of the scope ([`Scope::add_class`]), the first
+    /// included, with the driver's `constellation.dev/pool` label of its
+    /// pool.
+    classes: Vec<(String, String)>,
+    /// The scope's `VolumeSnapshotClass`, once made.
+    snapshot_class: Option<String>,
     pvcs: Vec<String>,
+    /// Set by [`Scope::expect_no_engine_return`]: after the teardown, wait
+    /// and check no engine pod of the scope's pools comes back.
+    no_engine_return: bool,
     done: bool,
 }
+
+/// How long [`Scope::expect_no_engine_return`] watches: the external
+/// provisioner's repeated `DeleteVolume` was seen 18 s after the PV went, and
+/// its retry backoff grows from seconds to minutes, so 60 s is over three
+/// times the observed repeat and past the first backoff steps.
+const NO_ENGINE_RETURN: Duration = Duration::from_secs(60);
 
 /// A pod's volume: PVC `claim` at `/data/<claim>`.
 pub fn data_dir(claim: &str) -> String {
@@ -667,15 +695,33 @@ pub fn data_dir(claim: &str) -> String {
 impl<'a> Scope<'a> {
     pub fn new(env: &'a Env, scenario: &str) -> Result<Self> {
         let ns = format!("k8s-{scenario}-{}", env.run_id);
-        let sc = ns.clone();
         env.kube.apply(&json!({
             "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}
         }))?;
-        let prefix = format!("k8s-harness/{}/{scenario}", env.run_id);
+        // From here on `Drop` removes the namespace (and the classes made
+        // so far).
+        let mut scope = Self {
+            env,
+            sc: ns.clone(),
+            ns,
+            classes: Vec::new(),
+            snapshot_class: None,
+            pvcs: Vec::new(),
+            no_engine_return: false,
+            done: false,
+        };
+        let sc = scope.sc.clone();
+        scope.class(&sc, &format!("k8s-harness/{}/{scenario}", env.run_id))?;
+        Ok(scope)
+    }
+
+    /// A pool StorageClass `name` of its own pool at `prefix`.
+    fn class(&mut self, name: &str, prefix: &str) -> Result<()> {
+        let env = self.env;
         let mut params = serde_json::Map::new();
         for (k, v) in [
             ("bucket", BUCKET.to_string()),
-            ("prefix", prefix.clone()),
+            ("prefix", prefix.to_string()),
             ("endpoint", env.endpoint.clone()),
             ("region", "us-east-1".into()),
             ("layout", "pool".into()),
@@ -699,26 +745,86 @@ impl<'a> Scope<'a> {
         ] {
             params.insert(k.into(), Value::String(v));
         }
-        // From here on `Drop` removes the namespace (and the class, if
-        // the apply below got that far).
-        let scope = Self {
-            env,
-            ns,
-            sc,
-            pool: pool_label(&env.endpoint, BUCKET, &prefix),
-            pvcs: Vec::new(),
-            done: false,
-        };
+        self.classes
+            .push((name.to_string(), pool_label(&env.endpoint, BUCKET, prefix)));
         env.kube.apply(&json!({
             "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
-            "metadata": {"name": scope.sc},
+            "metadata": {"name": name},
             "provisioner": "csi.constellation.dev",
             "parameters": params,
             "reclaimPolicy": "Delete",
             "volumeBindingMode": "Immediate",
             "allowVolumeExpansion": true,
+        }))
+    }
+
+    /// Another pool StorageClass of the scope, `<sc>-<suffix>`: a pool of
+    /// its own (its prefix differs), so a filesystem of its own.
+    pub fn add_class(&mut self, suffix: &str) -> Result<String> {
+        let name = format!("{}-{suffix}", self.sc);
+        let prefix = format!("k8s-harness/{}/{}-{suffix}", self.env.run_id, self.ns);
+        self.class(&name, &prefix)?;
+        Ok(name)
+    }
+
+    /// The scope's `VolumeSnapshotClass` (made on first use).
+    pub fn snapshot_class(&mut self) -> Result<String> {
+        if let Some(c) = &self.snapshot_class {
+            return Ok(c.clone());
+        }
+        let name = self.ns.clone();
+        self.snapshot_class = Some(name.clone());
+        self.env.kube.apply(&json!({
+            "apiVersion": "snapshot.storage.k8s.io/v1", "kind": "VolumeSnapshotClass",
+            "metadata": {"name": name},
+            "driver": "csi.constellation.dev",
+            "deletionPolicy": "Delete",
         }))?;
-        Ok(scope)
+        Ok(name)
+    }
+
+    /// `VolumeSnapshot` `name` of PVC `pvc`, of the scope's snapshot class.
+    pub fn volume_snapshot(&mut self, name: &str, pvc: &str) -> Result<()> {
+        let class = self.snapshot_class()?;
+        self.env.kube.apply(&json!({
+            "apiVersion": "snapshot.storage.k8s.io/v1", "kind": "VolumeSnapshot",
+            "metadata": {"name": name, "namespace": self.ns},
+            "spec": {
+                "volumeSnapshotClassName": class,
+                "source": {"persistentVolumeClaimName": pvc},
+            }
+        }))
+    }
+
+    /// Wait for `VolumeSnapshot` `name` to be ready to use: its content's
+    /// snapshot handle and its restore size.
+    pub fn wait_snapshot_ready(&self, name: &str, deadline: Duration) -> Result<(String, u64)> {
+        let mut found = (String::new(), 0);
+        crate::scenarios::eventually(
+            &format!("VolumeSnapshot {name} ready to use"),
+            deadline,
+            || {
+                let vs = self.kube().get(&["volumesnapshot", "-n", &self.ns, name])?;
+                let status = &vs["status"];
+                if let Some(e) = status["error"]["message"].as_str() {
+                    bail!("error: {e}");
+                }
+                if status["readyToUse"] != true {
+                    bail!("not ready: {status}");
+                }
+                let content = status["boundVolumeSnapshotContentName"]
+                    .as_str()
+                    .context("no bound content")?;
+                let c = self.kube().get(&["volumesnapshotcontent", content])?;
+                let handle = c["status"]["snapshotHandle"]
+                    .as_str()
+                    .context("the content has no snapshot handle")?;
+                let size = c["status"]["restoreSize"].as_u64().unwrap_or(0);
+                found = (handle.to_string(), size);
+                Ok(())
+            },
+        )?;
+        Ok(found)
     }
 
     pub fn kube(&self) -> &Kube {
@@ -727,6 +833,12 @@ impl<'a> Scope<'a> {
 
     /// Create PVC `name` of this scope's class (`size` like `1Gi`).
     pub fn pvc(&mut self, name: &str, size: &str, rwx: bool) -> Result<()> {
+        let class = self.sc.clone();
+        self.pvc_of_class(name, size, rwx, &class)
+    }
+
+    /// Create PVC `name` of StorageClass `class`.
+    pub fn pvc_of_class(&mut self, name: &str, size: &str, rwx: bool, class: &str) -> Result<()> {
         let mode = if rwx {
             "ReadWriteMany"
         } else {
@@ -737,12 +849,116 @@ impl<'a> Scope<'a> {
             "metadata": {"name": name, "namespace": self.ns},
             "spec": {
                 "accessModes": [mode],
-                "storageClassName": self.sc,
+                "storageClassName": class,
                 "resources": {"requests": {"storage": size}},
             }
         }))?;
         self.pvcs.push(name.to_string());
         Ok(())
+    }
+
+    /// Create PVC `name` of StorageClass `class` (the scope's own when
+    /// `None`) populated from `data_source` (a `dataSource` object: a
+    /// `VolumeSnapshot` or a `PersistentVolumeClaim`).
+    pub fn pvc_from(
+        &mut self,
+        name: &str,
+        size: &str,
+        class: Option<&str>,
+        data_source: Value,
+    ) -> Result<()> {
+        self.env.kube.apply(&json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": self.ns},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": class.unwrap_or(&self.sc),
+                "resources": {"requests": {"storage": size}},
+                "dataSource": data_source,
+            }
+        }))?;
+        self.pvcs.push(name.to_string());
+        Ok(())
+    }
+
+    /// Wait until PVCs `claims` are Bound.
+    pub fn wait_bound_claims(&self, claims: &[&str], deadline: Duration) -> Result<()> {
+        crate::scenarios::eventually(
+            &format!("PVCs {} Bound", claims.join(", ")),
+            deadline,
+            || {
+                let mut pending = Vec::new();
+                for c in claims {
+                    let phase = self.kube().run(&[
+                        "get",
+                        "pvc",
+                        "-n",
+                        &self.ns,
+                        c,
+                        "-o",
+                        "jsonpath={.status.phase}",
+                    ])?;
+                    if phase.trim() != "Bound" {
+                        pending.push(*c);
+                    }
+                }
+                if pending.is_empty() {
+                    Ok(())
+                } else {
+                    bail!("not Bound yet: {}", pending.join(", "))
+                }
+            },
+        )
+    }
+
+    /// The messages of the `Warning` events on PVC `pvc`.
+    pub fn pvc_warnings(&self, pvc: &str) -> Result<Vec<String>> {
+        let ev = self.kube().get(&[
+            "events",
+            "-n",
+            &self.ns,
+            "--field-selector",
+            &format!(
+                "involvedObject.kind=PersistentVolumeClaim,involvedObject.name={pvc},type=Warning"
+            ),
+        ])?;
+        Ok(ev["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["message"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// PVC `pvc`'s phase.
+    pub fn pvc_phase(&self, pvc: &str) -> Result<String> {
+        Ok(self
+            .kube()
+            .run(&[
+                "get",
+                "pvc",
+                "-n",
+                &self.ns,
+                pvc,
+                "-o",
+                "jsonpath={.status.phase}",
+            ])?
+            .trim()
+            .to_string())
+    }
+
+    /// The controller plugin's log lines (both replicas, all of them).
+    pub fn controller_log(&self) -> Result<String> {
+        self.kube().run(&[
+            "-n",
+            &self.env.driver_ns,
+            "logs",
+            "-l",
+            "app.kubernetes.io/component=controller",
+            "-c",
+            "constellation-csi",
+            "--tail=-1",
+        ])
     }
 
     /// Wait until every PVC of this scope is Bound.
@@ -886,6 +1102,41 @@ impl<'a> Scope<'a> {
             .collect())
     }
 
+    /// The engine's `snapshot.list` rows of filesystem `fs_uuid`, through
+    /// its controller-owned pod (`constellation snapshot ls --json`): what
+    /// the engine holds, not what Kubernetes says.
+    pub fn engine_snapshots(&self, fs_uuid: &str) -> Result<Vec<Value>> {
+        let pods = self.engine_pods(fs_uuid, "controller")?;
+        let pod = pods
+            .first()
+            .with_context(|| format!("no controller-owned engine pod for {fs_uuid}"))?;
+        let out = self.kube().run(&[
+            "exec",
+            "-n",
+            &self.env.driver_ns,
+            &pod.name,
+            "-c",
+            "engine",
+            "--",
+            "/usr/local/bin/constellation",
+            "snapshot",
+            "ls",
+            "--state-dir",
+            "/var/lib/constellation/state",
+            "--json",
+        ])?;
+        serde_json::from_str::<Vec<Value>>(out.trim())
+            .with_context(|| format!("parsing snapshot ls output {out:?}"))
+    }
+
+    /// Have `finish` also check that, once the scope's engine pods are
+    /// deleted, none comes back: a `DeleteVolume`/`DeleteSnapshot` the
+    /// sidecars repeat for an object that is gone must start nothing
+    /// (plan 37 K4). Waits [`NO_ENGINE_RETURN`] in `finish`.
+    pub fn expect_no_engine_return(&mut self) {
+        self.no_engine_return = true;
+    }
+
     /// Whether `handle` is staged on `worker`: a FUSE mount at kubelet's
     /// staging path for it (`<plugins>/kubernetes.io/csi/<driver>/
     /// <sha256(volume handle)>/globalmount`) in the node's mount table.
@@ -912,6 +1163,16 @@ impl<'a> Scope<'a> {
 
     fn teardown(&mut self, check: bool) -> Result<()> {
         let kube = self.env.kube.clone();
+        // Each phase's time, printed when slow: a teardown that hangs on
+        // one step (a finalizer, a sidecar's backoff) shows which.
+        let mut phase = Instant::now();
+        let mut lap = |what: &str| {
+            let took = phase.elapsed();
+            if took > Duration::from_secs(15) {
+                eprintln!("   teardown: {what} took {took:.1?}");
+            }
+            phase = Instant::now();
+        };
         let mut handles = Vec::new();
         for p in &self.pvcs {
             if let Ok(h) = self.volume_handle(p) {
@@ -946,6 +1207,7 @@ impl<'a> Scope<'a> {
                 },
             );
         }
+        lap("deleting the pods and the unstage check");
         let _ = kube.run(&[
             "delete",
             "namespace",
@@ -953,8 +1215,10 @@ impl<'a> Scope<'a> {
             "--wait=true",
             "--timeout=300s",
         ]);
+        lap("deleting the namespace");
+        let classes: Vec<&str> = self.classes.iter().map(|(c, _)| c.as_str()).collect();
         let gone = crate::scenarios::eventually(
-            "the scope's PVs deleted",
+            "the scope's PVs and snapshot contents deleted",
             Duration::from_secs(300),
             || {
                 let pvs = kube.get(&["pv"])?;
@@ -962,61 +1226,87 @@ impl<'a> Scope<'a> {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|p| p["spec"]["storageClassName"] == self.sc.as_str())
+                    .filter(|p| {
+                        p["spec"]["storageClassName"]
+                            .as_str()
+                            .is_some_and(|c| classes.contains(&c))
+                    })
                     .count();
-                if left == 0 {
-                    Ok(())
-                } else {
-                    bail!("{left} PV(s) of {} left", self.sc)
+                if left > 0 {
+                    bail!("{left} PV(s) of {} left", classes.join(", "));
                 }
+                if let Some(vsc) = &self.snapshot_class {
+                    let contents = kube.get(&["volumesnapshotcontent"])?;
+                    let left = contents["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|c| c["spec"]["volumeSnapshotClassName"] == vsc.as_str())
+                        .count();
+                    if left > 0 {
+                        bail!("{left} VolumeSnapshotContent(s) of {vsc} left");
+                    }
+                }
+                Ok(())
             },
         );
         if result.is_ok() && check {
             result = gone;
         }
-        let _ = kube.run(&["delete", "storageclass", &self.sc, "--ignore-not-found"]);
-        // Every engine pod of the pool, node- and controller-owned (the
-        // latter carries no `fs-uuid` label). The PVs being gone does not
-        // mean the provisioner is done: a second sync of a PV it already
-        // deleted calls `DeleteVolume` again (idempotent), and the
-        // controller recreates its engine pod to answer it, seconds after
-        // the PV went (18 s in the 37-k3b review fix's run). So delete
-        // until none has come back for `ENGINE_QUIET`, at most
-        // `ENGINE_SETTLE`: on a reused cluster a pod left now would stay
-        // (crash-looping once this run's floci is gone) until K6b's idle
-        // GC exists.
-        const ENGINE_QUIET: Duration = Duration::from_secs(30);
-        const ENGINE_SETTLE: Duration = Duration::from_secs(180);
-        let sel = format!("constellation.dev/pool={}", self.pool);
+        lap("waiting for the PVs and snapshot contents to go");
+        for c in &classes {
+            let _ = kube.run(&["delete", "storageclass", c, "--ignore-not-found"]);
+        }
+        if let Some(vsc) = &self.snapshot_class {
+            let _ = kube.run(&["delete", "volumesnapshotclass", vsc, "--ignore-not-found"]);
+        }
+        // Every engine pod of the scope's pools, node- and controller-owned
+        // (the latter carries no `fs-uuid` label). Deleted once: the
+        // controller starts no engine pod for a delete the provisioner
+        // repeats after the PV is gone (plan 37 K4), so none comes back.
         let ns = self.env.driver_ns.as_str();
-        let start = Instant::now();
-        let mut quiet_since = Instant::now();
-        while !interrupt::aborting() {
-            let present = kube
-                .run(&["get", "pods", "-n", ns, "-l", &sel, "-o", "name"])
-                .map(|o| !o.trim().is_empty())
-                .unwrap_or(true);
-            if present {
-                let _ = kube.run(&[
-                    "delete",
-                    "pods",
-                    "-n",
-                    ns,
-                    "-l",
-                    &sel,
-                    "--grace-period=0",
-                    "--force",
-                    "--ignore-not-found",
-                ]);
-                quiet_since = Instant::now();
-            } else if quiet_since.elapsed() >= ENGINE_QUIET {
-                break;
+        for (_, pool) in &self.classes {
+            let sel = format!("constellation.dev/pool={pool}");
+            let _ = kube.run(&[
+                "delete",
+                "pods",
+                "-n",
+                ns,
+                "-l",
+                &sel,
+                "--grace-period=0",
+                "--force",
+                "--ignore-not-found",
+                "--wait=true",
+                "--timeout=120s",
+            ]);
+        }
+        lap("deleting the classes and the engine pods");
+        if check && self.no_engine_return {
+            let seen = (|| -> Result<()> {
+                let deadline = Instant::now() + NO_ENGINE_RETURN;
+                while Instant::now() < deadline {
+                    for (_, pool) in &self.classes {
+                        let sel = format!("constellation.dev/pool={pool}");
+                        let pods = kube.get(&["pods", "-n", ns, "-l", &sel])?;
+                        let names: Vec<&str> = pods["items"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|p| p["metadata"]["name"].as_str())
+                            .collect();
+                        if !names.is_empty() {
+                            bail!("engine pod(s) {names:?} of pool {pool} came back after the teardown");
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+                Ok(())
+            })();
+            if result.is_ok() {
+                result = seen;
             }
-            if start.elapsed() > ENGINE_SETTLE {
-                eprintln!("warning: engine pods {sel} keep coming back after {ENGINE_SETTLE:?}");
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(5));
+            lap("checking no engine pod came back");
         }
         result
     }

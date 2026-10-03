@@ -169,6 +169,38 @@ pub trait Engines: Send + Sync {
     /// "already gone"; an implementation that merely cannot find a pod for
     /// it answers `Unavailable` (retryable), never `NotFound`.
     async fn filesystem(&self, fs_uuid: &str) -> Result<Arc<dyn ControlClient>, ControlError>;
+
+    /// An engine pod serving `fs_uuid` **only if one is up already**: never
+    /// created, recreated from a remembered spec, or rebuilt from the
+    /// cluster. `None` when there is none. The deletes start here, so that
+    /// a delete the CO repeats after the object is gone (external-provisioner
+    /// does, seconds after deleting the PV) brings nothing back.
+    async fn running(&self, fs_uuid: &str) -> Result<Option<Arc<dyn ControlClient>>, ControlError>;
+
+    /// Whether the CO still has an object naming `handle`: a
+    /// `PersistentVolume` of this driver with that `volumeHandle`, or a
+    /// `VolumeSnapshotContent` with that snapshot handle. The sidecars
+    /// delete their object only after the delete RPC succeeded, so `false`
+    /// means an earlier delete of it already did. Without a CO (the
+    /// in-memory backend, csi-sanity) every handle counts as named.
+    async fn named(&self, handle: Handle<'_>) -> Result<bool, ControlError>;
+
+    /// Stop the engine pod serving `fs_uuid`, which a delete brought up
+    /// only for itself, unless something else is using it by now.
+    async fn retire(&self, fs_uuid: &str) -> Result<(), ControlError>;
+
+    /// Every filesystem an engine pod serves now (an unfiltered
+    /// `ListSnapshots` lists their snapshots; it starts no pod).
+    async fn running_filesystems(&self) -> Result<Vec<String>, ControlError>;
+}
+
+/// A CO object's handle, for [`Engines::named`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handle<'a> {
+    /// A `PersistentVolume`'s `spec.csi.volumeHandle`.
+    Volume(&'a str),
+    /// A `VolumeSnapshotContent`'s snapshot handle.
+    Snapshot(&'a str),
 }
 
 mod fake;

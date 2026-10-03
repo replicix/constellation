@@ -48,6 +48,18 @@ pub const K8S_SCENARIOS: &[K8sScenario] = &[
         workers: 2,
         run: csi_plugin_restart_survives,
     },
+    K8sScenario {
+        name: "csi-snapshot-clone-mount",
+        desc: "VolumeSnapshot of a written PVC, then a PVC restored from it and a PVC cloned from the source, both mounted on the other worker: the restore is the tree at the snapshot, the clone the tree now, both metadata-only clones in the source's pool, independent of the source",
+        workers: 2,
+        run: csi_snapshot_clone_mount,
+    },
+    K8sScenario {
+        name: "csi-clone-cross-pool-refused",
+        desc: "clone and restore into the source's own pool bind and hold its data; the same clone and restore into another pool's StorageClass are refused (INVALID_ARGUMENT naming both filesystems) and stay Pending",
+        workers: 2,
+        run: csi_clone_cross_pool_refused,
+    },
 ];
 
 /// Cross-node visibility (log shipping + FUSE attribute TTLs) is
@@ -605,4 +617,325 @@ fn csi_plugin_restart_survives(env: &Env, seed: u64) -> Result<()> {
     );
     eprintln!("   engine pods unchanged (same uids, no restarts)");
     s.finish()
+}
+
+/// `pod`'s view of `dir` equals `model` now.
+fn verify_dir(s: &Scope, pod: &str, dir: &str, model: &Model) -> Result<()> {
+    let seen = s.listing(pod, dir)?;
+    model
+        .verify_observed(&seen)
+        .with_context(|| format!("{pod}'s view of {dir}"))
+}
+
+/// A `dataSource` naming VolumeSnapshot `name`.
+fn snapshot_source(name: &str) -> serde_json::Value {
+    serde_json::json!({"apiGroup": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot", "name": name})
+}
+
+/// A `dataSource` naming PVC `name` (a clone).
+fn pvc_source(name: &str) -> serde_json::Value {
+    serde_json::json!({"kind": "PersistentVolumeClaim", "name": name})
+}
+
+/// The engine's `clone.create` latency the controller logged for the
+/// volume at `subtree`, in ms (`cloned (metadata only) … subtree=… ms=…`).
+fn logged_clone_ms(log: &str, subtree: &str) -> Option<u64> {
+    let plain = strip_ansi(log);
+    plain
+        .lines()
+        .filter(|l| l.contains("cloned (metadata only)"))
+        .filter(|l| {
+            l.split_whitespace().any(|w| {
+                w.strip_prefix("subtree=")
+                    .is_some_and(|v| v.trim_matches('"') == subtree)
+            })
+        })
+        .find_map(|l| {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix("ms=")?.parse().ok())
+        })
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The volume subtree of a pool handle (`/volumes/<pv>`).
+fn subtree_of(handle: &str) -> Result<String> {
+    handle
+        .find("/volumes/")
+        .map(|i| handle[i..].to_string())
+        .with_context(|| format!("not a pool volume handle: {handle:?}"))
+}
+
+/// Plan 37 K4 gate: snapshot → clone → mount.
+fn csi_snapshot_clone_mount(env: &Env, seed: u64) -> Result<()> {
+    const BIG_MIB: u64 = 64;
+    let (w1, w2) = (&env.workers[0], &env.workers[1]);
+    let mut s = Scope::new(env, "csi-snap-clone")?;
+    s.pvc("src", "1Gi", false)?;
+    s.wait_bound(Duration::from_secs(300))?;
+    let src_handle = s.volume_handle("src")?;
+    let src_fs = fs_uuid_of(&src_handle)?;
+    s.pod("writer", w1, &["src"])?;
+    // A seeded tree under tree/ (the model's), and one big file beside it,
+    // so a clone that copied data would have something to copy.
+    let tree = |claim: &str| format!("{}/tree", data_dir(claim));
+    s.exec("writer", &format!("mkdir -p {}", tree("src")))?;
+    let mut model = Model::default();
+    let mut w = RemoteWorkload::new(seed, "src");
+    for block in 0..3 {
+        let script = w.block(&tree("src"), &mut model, 30);
+        s.exec("writer", &script)
+            .with_context(|| format!("block {block}"))?;
+    }
+    let big_sum = s
+        .exec(
+            "writer",
+            &format!(
+                "set -eu; cd {d}; head -c {n} /dev/urandom > big; sync; sha256sum big | cut -d' ' -f1",
+                d = data_dir("src"),
+                n = BIG_MIB << 20
+            ),
+        )?
+        .trim()
+        .to_string();
+    verify_dir(&s, "writer", &tree("src"), &model)?;
+    eprintln!(
+        "   src on {w1}: {} entries and a {BIG_MIB} MiB file",
+        model.nodes.len()
+    );
+
+    s.volume_snapshot("snap", "src")?;
+    let (handle, restore_size) = s.wait_snapshot_ready("snap", Duration::from_secs(300))?;
+    ensure!(
+        handle.starts_with(&format!("{src_handle}@snapshot-")),
+        "snapshot handle {handle:?} is not <source volume>@snapshot-<uid>"
+    );
+    ensure!(
+        restore_size >= BIG_MIB << 20,
+        "restoreSize {restore_size} is below the {BIG_MIB} MiB the volume held"
+    );
+    eprintln!("   snapshot {handle}: ready, restoreSize {restore_size}");
+    let at_snapshot = model.clone();
+    // The source moves on; the snapshot must not.
+    let script = w.block(&tree("src"), &mut model, 20);
+    s.exec("writer", &script)?;
+    s.exec("writer", &format!("rm {}/big", data_dir("src")))?;
+    verify_dir(&s, "writer", &tree("src"), &model)?;
+    let now = model.clone();
+
+    let t0 = std::time::Instant::now();
+    s.pvc_from("restored", "1Gi", None, snapshot_source("snap"))?;
+    s.pvc_from("clone", "1Gi", None, pvc_source("src"))?;
+    s.wait_bound_claims(&["restored", "clone"], Duration::from_secs(300))?;
+    let bound = t0.elapsed();
+    let mut clone_ms = Vec::new();
+    for claim in ["restored", "clone"] {
+        let h = s.volume_handle(claim)?;
+        ensure!(
+            fs_uuid_of(&h)? == src_fs,
+            "{claim} ({h}) is not in the source's pool filesystem {src_fs}"
+        );
+        let subtree = subtree_of(&h)?;
+        // Metadata only: the driver cloned with the engine's clone.create,
+        // and it took no time a 64 MiB copy would.
+        let log = s.controller_log()?;
+        let ms = logged_clone_ms(&log, &subtree)
+            .with_context(|| format!("no `cloned (metadata only)` log line for {subtree}"))?;
+        ensure!(ms < 10_000, "clone.create of {claim} took {ms} ms");
+        clone_ms.push(ms);
+    }
+    eprintln!(
+        "   restored + clone Bound {bound:.1?} after creation; clone.create took {clone_ms:?} ms"
+    );
+
+    s.pod("reader", w2, &["restored", "clone"])?;
+    let wait = |claim: &str, model: &Model| {
+        eventually(
+            &format!("reader's view of {claim} matches the model"),
+            CONVERGE,
+            || verify_dir(&s, "reader", &tree(claim), model),
+        )
+    };
+    wait("restored", &at_snapshot)?;
+    wait("clone", &now)?;
+    let sums = s.exec(
+        "reader",
+        "cd /data; sha256sum restored/big | cut -d' ' -f1; [ ! -e clone/big ] && echo absent",
+    )?;
+    let lines: Vec<&str> = sums.lines().map(str::trim).collect();
+    ensure!(
+        lines == [big_sum.as_str(), "absent"],
+        "big file: restored {lines:?}, expected [{big_sum}, absent]"
+    );
+    eprintln!(
+        "   on {w2}: restored = the tree at the snapshot (big file intact), clone = the tree now"
+    );
+
+    // Independent copies: writes to the clone and the restore stay there.
+    let mut clone_model = now.clone();
+    let mut wc = RemoteWorkload::new(seed ^ 0x5eed, "cl");
+    let script = wc.block(&tree("clone"), &mut clone_model, 30);
+    s.exec("reader", &script)?;
+    s.exec("reader", &format!("rm -r {}/*", tree("restored")))?;
+    verify_dir(&s, "reader", &tree("clone"), &clone_model)?;
+    verify_dir(&s, "reader", &tree("restored"), &Model::default())?;
+    verify_dir(&s, "writer", &tree("src"), &now)?;
+    eprintln!("   writes to the clone and the restore left the source as it was");
+
+    // Deleting the VolumeSnapshot must remove the engine's snapshot (the
+    // hold released, then deleted): asked of the engine itself, not of the
+    // content object. The clone's transient snapshot must be gone too.
+    let mine = |rows: &[serde_json::Value]| -> Vec<String> {
+        rows.iter()
+            .filter(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with("snapshot-") || n.starts_with("csi-clone-"))
+            })
+            .map(|r| r.to_string())
+            .collect()
+    };
+    let rows = s.engine_snapshots(&src_fs)?;
+    ensure!(
+        mine(&rows).len() == 1,
+        "before the delete the engine holds exactly the VolumeSnapshot's snapshot: {rows:?}"
+    );
+    s.kube().run(&[
+        "delete",
+        "volumesnapshot",
+        "snap",
+        "-n",
+        &s.ns,
+        "--wait=true",
+        "--timeout=180s",
+    ])?;
+    eventually(
+        "the engine's snapshot is gone",
+        Duration::from_secs(180),
+        || {
+            let left = mine(&s.engine_snapshots(&src_fs)?);
+            ensure!(left.is_empty(), "engine snapshot rows left: {left:?}");
+            Ok(())
+        },
+    )?;
+    eprintln!("   VolumeSnapshot deleted: the engine's snapshot row is gone");
+    s.expect_no_engine_return();
+    s.finish()
+}
+
+/// Plan 37 K4 gate: clone/restore within a pool, and refusal across pools.
+fn csi_clone_cross_pool_refused(env: &Env, seed: u64) -> Result<()> {
+    let (w1, w2) = (&env.workers[0], &env.workers[1]);
+    let mut s = Scope::new(env, "csi-clone-xpool")?;
+    let other = s.add_class("other")?;
+    s.pvc("src", "1Gi", false)?;
+    // A volume of the other pool, so that pool's filesystem exists.
+    s.pvc_of_class("other-vol", "1Gi", false, &other)?;
+    s.wait_bound(Duration::from_secs(300))?;
+    let src_handle = s.volume_handle("src")?;
+    let src_fs = fs_uuid_of(&src_handle)?;
+    let other_fs = fs_uuid_of(&s.volume_handle("other-vol")?)?;
+    ensure!(
+        src_fs != other_fs,
+        "the two classes share filesystem {src_fs}"
+    );
+
+    s.pod("writer", w1, &["src"])?;
+    let mut model = Model::default();
+    let mut w = RemoteWorkload::new(seed, "x");
+    let script = w.block(&data_dir("src"), &mut model, 40);
+    s.exec("writer", &script)?;
+    verify(&s, "writer", "src", &model)?;
+    s.volume_snapshot("snap", "src")?;
+    s.wait_snapshot_ready("snap", Duration::from_secs(300))?;
+
+    // Within the pool: both bind, in the source's filesystem, with its data.
+    s.pvc_from("clone-in", "1Gi", None, pvc_source("src"))?;
+    s.pvc_from("restore-in", "1Gi", None, snapshot_source("snap"))?;
+    s.wait_bound_claims(&["clone-in", "restore-in"], Duration::from_secs(300))?;
+    for claim in ["clone-in", "restore-in"] {
+        let h = s.volume_handle(claim)?;
+        ensure!(
+            fs_uuid_of(&h)? == src_fs,
+            "{claim} ({h}) left the source's pool"
+        );
+    }
+    s.pod("reader", w2, &["clone-in", "restore-in"])?;
+    converge(&s, "reader", "clone-in", &model)?;
+    converge(&s, "reader", "restore-in", &model)?;
+    eprintln!(
+        "   within the pool: clone and restore Bound in {src_fs}, both hold the source's tree"
+    );
+
+    // Across pools: refused, and they stay Pending.
+    s.pvc_from("clone-x", "1Gi", Some(&other), pvc_source("src"))?;
+    s.pvc_from("restore-x", "1Gi", Some(&other), snapshot_source("snap"))?;
+    for claim in ["restore-x", "clone-x"] {
+        let mut why = String::new();
+        eventually(
+            &format!("{claim} refused with InvalidArgument"),
+            Duration::from_secs(180),
+            || {
+                let warnings = s.pvc_warnings(claim)?;
+                match warnings
+                    .iter()
+                    .find(|m| m.contains("InvalidArgument") && m.contains(&src_fs))
+                {
+                    Some(m) => {
+                        why = m.clone();
+                        Ok(())
+                    }
+                    None => bail!("warnings so far: {warnings:?}"),
+                }
+            },
+        )?;
+        ensure!(
+            why.contains(&other_fs),
+            "{claim}'s refusal does not name the destination filesystem {other_fs}: {why}"
+        );
+        ensure!(
+            s.pvc_phase(claim)? == "Pending",
+            "{claim} is not Pending after its refusal"
+        );
+        eprintln!(
+            "   {claim}: refused: {}",
+            why.chars().take(300).collect::<String>()
+        );
+    }
+    s.finish()
+}
+
+#[cfg(test)]
+mod k4_tests {
+    use super::*;
+
+    #[test]
+    fn the_clone_log_line_is_found_by_subtree() {
+        let log = "\u{1b}[2m2026-10-02T21:23:15Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m constellation_csi::controller::snapshots: cloned (metadata only) selector=/volumes/a@s subtree=/volumes/pvc-b ms=12\n\
+                   x INFO cloned (metadata only) selector=/volumes/a@s subtree=/volumes/pvc-bb ms=99\n\
+                   y INFO cloned (metadata only) selector=/volumes/a@s subtree=\"/volumes/pvc-q\" ms=7\n";
+        assert_eq!(logged_clone_ms(log, "/volumes/pvc-b"), Some(12));
+        assert_eq!(logged_clone_ms(log, "/volumes/pvc-bb"), Some(99));
+        assert_eq!(logged_clone_ms(log, "/volumes/pvc-q"), Some(7));
+        assert_eq!(logged_clone_ms(log, "/volumes/pvc"), None);
+        assert_eq!(
+            subtree_of("v1/pool/0/u/volumes/pvc-1").unwrap(),
+            "/volumes/pvc-1"
+        );
+    }
 }

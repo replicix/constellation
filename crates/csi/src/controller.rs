@@ -1,8 +1,9 @@
-//! The Controller service (plan 37 §5, K2): `CreateVolume`, `DeleteVolume`,
-//! `ControllerExpandVolume`, `ValidateVolumeCapabilities` and
-//! `ControllerGetCapabilities`, driven entirely through [`Engines`] /
-//! [`ControlClient`]. Snapshots and clones are 37-k4's; every RPC not listed
-//! here answers `UNIMPLEMENTED` and is not advertised.
+//! The Controller service (plan 37 §5, K2, K4): `CreateVolume` (also from
+//! a snapshot or a volume), `DeleteVolume`, `ControllerExpandVolume`,
+//! `ValidateVolumeCapabilities`, `ControllerGetCapabilities`, and the
+//! snapshot RPCs ([`snapshots`]), driven entirely through [`Engines`] /
+//! [`ControlClient`]. Every RPC not listed here answers `UNIMPLEMENTED` and
+//! is not advertised.
 //!
 //! **Stateless** (settled decision 7). A volume *is* a directory
 //! `/volumes/<name>` in a pool filesystem, its record is the
@@ -36,6 +37,17 @@
 //! context. `DeleteVolume` of one is `FAILED_PRECONDITION` until plan 37
 //! K6b's purge primitive exists: dropping a whole filesystem is not a
 //! rename into `/.trash`.
+//!
+//! **A delete never brings an engine pod back.** external-provisioner may
+//! call `DeleteVolume` again after it deleted the PV (seen 18 s later, after
+//! a teardown had removed the pool's engine pods), and a delete that
+//! recreated the pool's pod to answer "already gone" would leave a pod
+//! nobody stops. So `DeleteVolume` (and `DeleteSnapshot`) work through an
+//! engine pod that is up already ([`Engines::running`]); with none, they
+//! ask the cluster whether the PV (the `VolumeSnapshotContent`) still
+//! exists — the sidecar deletes it only after the RPC succeeded — and
+//! answer `OK` at once if not. Only a delete that genuinely needs the
+//! engine starts one, and stops it again afterwards ([`Engines::retire`]).
 //!
 //! **`DeleteVolume` checks existence first** (`browse.xattr list` →
 //! `NotFound` → `OK`), before releasing the quota: a retried delete of a
@@ -76,7 +88,7 @@
 //! `volume_id` for the rest), so a delete can never interleave with a
 //! still-running create of the same volume.
 
-use crate::control_client::{ControlClient, Engines, PoolRef, SubtreeQuotaParams};
+use crate::control_client::{ControlClient, Engines, Handle, PoolRef, SubtreeQuotaParams};
 use crate::params::{ClassParams, Layout, PVC_NAMESPACE_KEY, PVC_NAME_KEY};
 use crate::proto::csi::v1::controller_server::Controller as ControllerRpc;
 use crate::proto::csi::v1::controller_service_capability::rpc::Type as RpcType;
@@ -210,8 +222,15 @@ pub struct ControllerService {
     engines: Option<Arc<dyn Engines>>,
     config: ControllerConfig,
     locks: VolumeLocks,
+    /// The same guard for snapshots, keyed by snapshot name.
+    snapshot_locks: VolumeLocks,
     /// `(bucket, pool prefix)` → that pool filesystem's create gate.
     pool_gates: Mutex<HashMap<(String, String), Arc<Semaphore>>>,
+    /// Pool volume ids this process created and has not deleted since: a
+    /// `DeleteVolume` of one is a real delete even when the CO names no PV
+    /// (the provisioner cleaning up a PV it failed to save), so it may start
+    /// the engine. A delete repeated after success finds nothing here.
+    created: Mutex<std::collections::HashSet<String>>,
 }
 
 impl ControllerService {
@@ -220,7 +239,9 @@ impl ControllerService {
             engines,
             config,
             locks: VolumeLocks::default(),
+            snapshot_locks: VolumeLocks::default(),
             pool_gates: Mutex::default(),
+            created: Mutex::default(),
         }
     }
 
@@ -273,6 +294,32 @@ impl ControllerService {
         }
     }
 
+    /// The pool shard `pool`'s filesystem uuid: `fs.create` through its
+    /// engine pod, idempotent, so the first volume creates the pool.
+    async fn pool_uuid(
+        &self,
+        engines: &Arc<dyn Engines>,
+        pool: &PoolRef,
+    ) -> Result<String, Status> {
+        let prefix = pool.prefix();
+        let registry = engines
+            .pool(pool)
+            .await
+            .map_err(|e| status("reaching the pool's engine", e))?;
+        let created = registry
+            .fs_create(pool.class.fs_create(prefix.clone()))
+            .await
+            .map_err(|e| match e.kind {
+                ErrorKind::Conflict | ErrorKind::Invalid => Status::invalid_argument(format!(
+                    "the StorageClass parameters do not match the existing pool filesystem at \
+                     s3://{}/{prefix}: {}",
+                    pool.class.bucket, e.message
+                )),
+                _ => status("fs.create", e),
+            })?;
+        Ok(created.uuid)
+    }
+
     async fn create_pool_volume(
         &self,
         engines: &Arc<dyn Engines>,
@@ -298,28 +345,14 @@ impl ControllerService {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         };
-        let registry = engines
-            .pool(&pool_ref)
-            .await
-            .map_err(|e| status("reaching the pool's engine", e))?;
-        let pool = registry
-            .fs_create(class.fs_create(prefix.clone()))
-            .await
-            .map_err(|e| match e.kind {
-                ErrorKind::Conflict | ErrorKind::Invalid => Status::invalid_argument(format!(
-                    "the StorageClass parameters do not match the existing pool filesystem at \
-                     s3://{}/{prefix}: {}",
-                    class.bucket, e.message
-                )),
-                _ => status("fs.create", e),
-            })?;
+        let pool_uuid = self.pool_uuid(engines, &pool_ref).await?;
         let fs = engines
-            .filesystem(&pool.uuid)
+            .filesystem(&pool_uuid)
             .await
             .map_err(|e| status("reaching the pool's engine", e))?;
         let id = VolumeId::Pool {
             shard,
-            fs_uuid: pool.uuid.clone(),
+            fs_uuid: pool_uuid,
             name: name.to_string(),
         };
         let subtree = id.subtree();
@@ -355,6 +388,7 @@ impl ControllerService {
             existing,
             fresh,
             &req.parameters,
+            "",
         )
         .await
     }
@@ -416,14 +450,25 @@ impl ControllerService {
         let existing = read_record(fs.as_ref(), &id.subtree()).await?;
         let mut context = req.parameters.clone();
         context.insert("prefix".into(), prefix);
-        self.commit_volume(fs.as_ref(), &id, req, capacity, existing, false, &context)
-            .await
+        self.commit_volume(
+            fs.as_ref(),
+            &id,
+            req,
+            capacity,
+            existing,
+            false,
+            &context,
+            "",
+        )
+        .await
     }
 
-    /// The common tail of both layouts' `CreateVolume` (module docs): the
-    /// volume's directory (`id.subtree()`) exists in `fs` and carries
-    /// `existing` as its record (`fresh`: this call just made it). Adopt,
-    /// compare or complete the record, then the quota, then the mark.
+    /// The common tail of both layouts' `CreateVolume`, and of a clone
+    /// (module docs): the volume's directory (`id.subtree()`) exists in
+    /// `fs` and carries `existing` as its record (`fresh`: this call just
+    /// made it). Adopt, compare or complete the record, then the quota,
+    /// then the mark. `source` is the record's content source (`""` for an
+    /// empty volume, [`snapshots`]' `snapshot:<id>`/`volume:<id>`).
     #[allow(clippy::too_many_arguments)]
     async fn commit_volume(
         &self,
@@ -434,10 +479,11 @@ impl ControllerService {
         existing: BTreeMap<String, String>,
         fresh: bool,
         context: &HashMap<String, String>,
+        source: &str,
     ) -> Result<Volume, Status> {
         let name = req.name.as_str();
         let subtree = id.subtree();
-        let source = String::new();
+        let source = source.to_string();
         let fs_uuid = id.fs_uuid();
         match existing.get(X_PV) {
             Some(pv) if pv != name => {
@@ -509,6 +555,59 @@ impl ControllerService {
         set_xattr(fs, &subtree, X_CREATED, &unix_ms().to_string()).await?;
         tracing::info!(volume_id = %id, capacity, "created volume");
         Ok(volume(id, capacity, context))
+    }
+
+    /// `DeleteVolume` of a pool volume through `fs` (module docs): gone
+    /// already → `OK`; else release the quota, then rename into `/.trash`.
+    async fn trash_volume(
+        &self,
+        fs: &dyn ControlClient,
+        id: &VolumeId,
+        name: &str,
+        subtree: &str,
+    ) -> Result<(), Status> {
+        // Gone already (trashed by an earlier attempt, or never made):
+        // decided here, not by how `quota.set` fails, and in O(1) — never
+        // a walk of the volume (module docs).
+        match fs
+            .browse_xattr(XattrParams {
+                path: subtree.to_string(),
+                op: XattrOp::List,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if e.kind == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(status(&format!("browse.xattr list {subtree}"), e)),
+        }
+        // Release the quota first (§"Deletion and purge"), then trash. A
+        // `NotFound` now is a concurrent delete outside this process.
+        match self.set_quota(fs, subtree, Some(0)).await {
+            Ok(_) => {}
+            Err(e) if e.kind == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(quota_status(subtree, e)),
+        }
+        fs.browse_mkdir(MkdirParams {
+            path: TRASH_DIR.to_string(),
+            mode: None,
+            parents: true,
+        })
+        .await
+        .map_err(|e| status("browse.mkdir /.trash", e))?;
+        let trashed = format!("{TRASH_DIR}/{name}-{}", unix_ms());
+        match fs
+            .browse_rename(RenameParams {
+                from: subtree.to_string(),
+                to: trashed.clone(),
+                overwrite: false,
+            })
+            .await
+        {
+            Ok(_) => tracing::info!(volume_id = %id, trashed, "deleted pool volume"),
+            Err(e) if e.kind == ErrorKind::NotFound => {}
+            Err(e) => return Err(status("browse.rename to trash", e)),
+        }
+        Ok(())
     }
 }
 
@@ -716,25 +815,27 @@ impl ControllerRpc for ControllerService {
         validate_name(&req.name).map_err(Status::invalid_argument)?;
         check_capabilities(&req.volume_capabilities).map_err(Status::invalid_argument)?;
         let capacity = requested_capacity(req.capacity_range.as_ref())?;
-        if req.volume_content_source.is_some() {
-            return Err(Status::unimplemented(
-                "volumes from a snapshot or a clone are plan 37 K4's (CLONE_VOLUME and \
-                 CREATE_DELETE_SNAPSHOT are not advertised yet)",
-            ));
-        }
         let class = ClassParams::parse(&req.parameters).map_err(Status::invalid_argument)?;
         let engines = self.engines()?;
         let _lock = self.locks.try_lock(req.name.clone())?;
-        let volume = match class.layout {
-            Layout::Pool => {
+        let volume = match (&req.volume_content_source, class.layout) {
+            (Some(content), _) => {
+                self.create_from_source(engines, &class, &req, capacity, content)
+                    .await?
+            }
+            (None, Layout::Pool) => {
                 self.create_pool_volume(engines, &class, &req, capacity)
                     .await?
             }
-            Layout::Dedicated => {
+            (None, Layout::Dedicated) => {
                 self.create_dedicated_volume(engines, &class, &req, capacity)
                     .await?
             }
         };
+        self.created
+            .lock()
+            .unwrap()
+            .insert(volume.volume_id.clone());
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(volume),
         }))
@@ -777,59 +878,21 @@ impl ControllerRpc for ControllerService {
             }
         };
         let _lock = self.locks.try_lock(lock_key(&id, &req.volume_id))?;
-        let fs = match engines.filesystem(id.fs_uuid()).await {
-            Ok(fs) => fs,
-            Err(e) if e.kind == ErrorKind::NotFound => {
-                return Ok(Response::new(DeleteVolumeResponse {}))
-            }
-            Err(e) => return Err(status("reaching the pool's engine", e)),
+        let uuid = id.fs_uuid().to_string();
+        let remembered = self.created.lock().unwrap().contains(&req.volume_id);
+        let Some((fs, started)) = self
+            .engine_for_delete(engines, &uuid, Handle::Volume(&req.volume_id), remembered)
+            .await?
+        else {
+            self.created.lock().unwrap().remove(&req.volume_id);
+            return Ok(Response::new(DeleteVolumeResponse {}));
         };
-        // Gone already (trashed by an earlier attempt, or never made):
-        // decided here, not by how `quota.set` fails, and in O(1) — never
-        // a walk of the volume (module docs).
-        match fs
-            .browse_xattr(XattrParams {
-                path: subtree.clone(),
-                op: XattrOp::List,
-            })
-            .await
-        {
-            Ok(_) => {}
-            Err(e) if e.kind == ErrorKind::NotFound => {
-                return Ok(Response::new(DeleteVolumeResponse {}))
-            }
-            Err(e) => return Err(status(&format!("browse.xattr list {subtree}"), e)),
+        let result = self.trash_volume(fs.as_ref(), &id, &name, &subtree).await;
+        self.retire_if_started(engines, fs, &uuid, started).await;
+        if result.is_ok() {
+            self.created.lock().unwrap().remove(&req.volume_id);
         }
-        // Release the quota first (§"Deletion and purge"), then trash. A
-        // `NotFound` now is a concurrent delete outside this process.
-        match self.set_quota(fs.as_ref(), &subtree, Some(0)).await {
-            Ok(_) => {}
-            Err(e) if e.kind == ErrorKind::NotFound => {
-                return Ok(Response::new(DeleteVolumeResponse {}))
-            }
-            Err(e) => return Err(quota_status(&subtree, e)),
-        }
-        fs.browse_mkdir(MkdirParams {
-            path: TRASH_DIR.to_string(),
-            mode: None,
-            parents: true,
-        })
-        .await
-        .map_err(|e| status("browse.mkdir /.trash", e))?;
-        let trashed = format!("{TRASH_DIR}/{name}-{}", unix_ms());
-        match fs
-            .browse_rename(RenameParams {
-                from: subtree.clone(),
-                to: trashed.clone(),
-                overwrite: false,
-            })
-            .await
-        {
-            Ok(_) => tracing::info!(volume_id = %id, trashed, "deleted pool volume"),
-            Err(e) if e.kind == ErrorKind::NotFound => {}
-            Err(e) => return Err(status("browse.rename to trash", e)),
-        }
-        Ok(Response::new(DeleteVolumeResponse {}))
+        result.map(|()| Response::new(DeleteVolumeResponse {}))
     }
 
     async fn controller_expand_volume(
@@ -945,13 +1008,17 @@ impl ControllerRpc for ControllerService {
         _request: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
         // Only what works: csi-sanity exercises whatever is advertised.
-        // 37-k4 adds CREATE_DELETE_SNAPSHOT, LIST_SNAPSHOTS and
-        // CLONE_VOLUME together with their RPCs. Not GET_CAPACITY (§11:
-        // an S3 bucket's capacity is meaningless to the scheduler), not
-        // PUBLISH_UNPUBLISH_VOLUME (settled decision 4), not LIST_VOLUMES.
+        // Not GET_CAPACITY (§11: an S3 bucket's capacity is meaningless to
+        // the scheduler), not PUBLISH_UNPUBLISH_VOLUME (settled decision
+        // 4), not LIST_VOLUMES.
         let capabilities = [
             RpcType::CreateDeleteVolume,
             RpcType::ExpandVolume,
+            RpcType::CreateDeleteSnapshot,
+            RpcType::ListSnapshots,
+            RpcType::CloneVolume,
+            // Alpha in the spec; ListSnapshots by id with NOT_FOUND.
+            RpcType::GetSnapshot,
             // Settled decision 14 accepts SINGLE_NODE_{SINGLE,MULTI}_WRITER.
             RpcType::SingleNodeMultiWriter,
         ]
@@ -1013,30 +1080,39 @@ impl ControllerRpc for ControllerService {
 
     async fn create_snapshot(
         &self,
-        _request: Request<CreateSnapshotRequest>,
+        request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        Err(unimplemented("CreateSnapshot (plan 37 K4)"))
+        let snapshot = self.create_snapshot_rpc(request.into_inner()).await?;
+        Ok(Response::new(CreateSnapshotResponse {
+            snapshot: Some(snapshot),
+        }))
     }
 
     async fn delete_snapshot(
         &self,
-        _request: Request<DeleteSnapshotRequest>,
+        request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
-        Err(unimplemented("DeleteSnapshot (plan 37 K4)"))
+        self.delete_snapshot_rpc(request.into_inner()).await?;
+        Ok(Response::new(DeleteSnapshotResponse {}))
     }
 
     async fn list_snapshots(
         &self,
-        _request: Request<ListSnapshotsRequest>,
+        request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
-        Err(unimplemented("ListSnapshots (plan 37 K4)"))
+        Ok(Response::new(
+            self.list_snapshots_rpc(request.into_inner()).await?,
+        ))
     }
 
     async fn get_snapshot(
         &self,
-        _request: Request<GetSnapshotRequest>,
+        request: Request<GetSnapshotRequest>,
     ) -> Result<Response<GetSnapshotResponse>, Status> {
-        Err(unimplemented("GetSnapshot (plan 37 K4)"))
+        let snapshot = self.get_snapshot_rpc(request.into_inner()).await?;
+        Ok(Response::new(GetSnapshotResponse {
+            snapshot: Some(snapshot),
+        }))
     }
 
     async fn controller_get_volume(
@@ -1057,6 +1133,8 @@ impl ControllerRpc for ControllerService {
 fn unimplemented(rpc: &str) -> Status {
     Status::unimplemented(format!("{rpc} is not implemented and not advertised"))
 }
+
+mod snapshots;
 
 #[cfg(test)]
 mod tests;

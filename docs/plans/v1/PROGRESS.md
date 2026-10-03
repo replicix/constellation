@@ -36444,3 +36444,100 @@ Gates (2026-10-03, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
 - [x] Step 9: per-root gauges for snapshot count and `USED` total, labelled by root ino, never path.
 - [x] Step 9: `unparseable_roots` / `capped_roots` / `refused_*` > 0 are surfaced in `status` and as a UI banner.
 - [ ] Steps 10–11 remainder (docs, harness scenarios, perf numbers): later M8 chunks.
+
+## Plan 37 K4 — Snapshots and clones (K4 closed)
+
+Milestone K4 of [plan 37](wip/37-kubernetes-csi.md) (§15), on plan 32's
+held snapshots (the "Plan 32 Step 0.4 (holds)" subset). A `VolumeSnapshot`
+is a held Constellation snapshot of the volume's subtree; a PVC restored
+from one, or cloned from another PVC, is a metadata-only `clone.create`
+inside the source's own pool filesystem. Across pools or shards the driver
+refuses rather than copy. The chunk also fixes the 37-k3b review's product
+bug: a `DeleteVolume` repeated after the PV was gone recreated the pool's
+engine pod.
+
+| Item | State | Where |
+|---|---|---|
+| `CreateSnapshot`: `snapshot.create{selector: <subtree>@<req.name>, held_by: "csi:<snapshot_id>"}` through the source's engine pod. `snapshot_id` = `<source volume_id>@<req.name>` (`SnapshotId`: names the filesystem, shard, subtree and snapshot). `size_bytes` = the row's `refer_bytes` (0 when absent), `ready_to_use: true`, `creation_time` from the row. Idempotent by name: the same name and source gives the same answer; a `csi:`-held snapshot with that name of another volume (in the source's filesystem or any filesystem with an engine pod up) is `ALREADY_EXISTS`. A missing source is `NOT_FOUND`; names with `/`, `@`, `%`, `*` are `INVALID_ARGUMENT` | DONE | `crates/csi/src/controller/snapshots.rs`, `crates/csi/src/volume_id.rs` |
+| `DeleteSnapshot`: release this driver's hold (`snapshot.hold{held: false, by}`), then `snapshot.delete`. If someone else holds it too (a human's `user:` hold, or a plain hold), the RPC succeeds and leaves the snapshot. Missing, already deleted, or an id this driver never minted → `OK` | DONE | `snapshots.rs` (`delete_held`) |
+| `ListSnapshots`: `csi:`-held rows, by `snapshot_id` (which also finds a snapshot this driver does not hold: a pre-provisioned content importing one), by `source_volume_id`, or unfiltered over the filesystems an engine pod serves now (it starts none). Ordered by id; `next_token` = `after:<last id>`; any other token → `ABORTED`. `GetSnapshot` (alpha): the same lookup by id, `NOT_FOUND` when missing | DONE | `snapshots.rs` |
+| `CreateVolume` from a `VolumeContentSource`. The destination is the class's pool shard the source lives in (not `hash(req.name)`'s), and that filesystem must be the source's (`fs.create`'s uuid compared). Then `clone.create` (from the snapshot, or for a volume source from a transient unheld `csi-clone-<hash>` snapshot that is deleted afterwards), then the record (`source` = `snapshot:<id>`/`volume:<id>`), quota and commit mark. The clone carries the source's record, so its `created` mark is removed first, and a retry that finds the raw copy completes it in place. Another pool, a shard the class lacks, a dedicated source or a dedicated destination class → `INVALID_ARGUMENT` naming both filesystems; a missing source → `NOT_FOUND` | DONE | `snapshots.rs` (`create_from_source`, `clone_into`), `crates/csi/src/controller.rs` |
+| Capabilities: `CREATE_DELETE_SNAPSHOT`, `LIST_SNAPSHOTS`, `CLONE_VOLUME`, `GET_SNAPSHOT` advertised | DONE | `controller.rs` |
+| **Bug fixed (37-k3b review):** deletes start no engine pod they do not need. `Engines::running` reaches a pod only if it is up (never creates, respawns or rebuilds one); with none, `Engines::named` asks the API server whether a PV (or `VolumeSnapshotContent`) still names the handle; if not → `OK` at once. A delete that needs the engine starts it and `Engines::retire`s it afterwards, unless another RPC holds a client into it. Unit tests `a_repeated_delete_after_the_pv_is_gone_starts_no_engine`, `a_delete_that_needs_the_engine_starts_it_and_stops_it` | DONE | `crates/csi/src/control_client.rs`, `crates/csi/src/engine_pods.rs`, `controller.rs`, `snapshots.rs` |
+| `InMemoryControl` models the engine's snapshot semantics: `path@name` selectors, frozen copies (clones see the tree at the snapshot), the hold-owner rule, `refer_bytes`, clones from snapshots only, into a new destination under an existing parent, every refusal `Failed`. `InMemoryEngines` models which engine pods are up (starts, `stop_all`, retires) and the CO's objects (`set_named`) | DONE | `crates/csi/src/control_client/fake.rs` |
+| Chart: the csi-snapshotter sidecar on by default; `volumeSnapshotClasses` values and template; the controller ClusterRole lists `volumesnapshotcontents` (and PVs) for the delete check; NOTES on the CRD/snapshot-controller prerequisites and on same-pool clones | DONE | `deploy/helm/constellation-csi/` |
+| `tests/csi/snapshot-crds.sh`: the snapshot CRDs and the snapshot-controller from external-snapshotter at the pinned tag (v8.6.0; upstream's controller manifest there still names v8.5.0, so the script pins the image); `tests/csi/kind-up.sh --install` runs it | DONE | `tests/csi/` |
+| `harness k8s-scenario`: installs the CRDs before the chart; scopes can have several pool classes (`Scope::add_class`) and a `VolumeSnapshotClass`; snapshot/restore/clone helpers; the teardown waits for the scope's PVs **and** snapshot contents, then deletes the pools' engine pods **once** (the 30 s "until none comes back" loop is gone) and prints any phase over 15 s | DONE | `crates/harness/src/k8s.rs` |
+| Scenarios `csi-snapshot-clone-mount`, `csi-clone-cross-pool-refused` | DONE | `crates/harness/src/k8s/scenarios.rs`, TESTING.md |
+
+### Decisions taken here (the brief left them open)
+
+- **The hold's owner is `csi:<snapshot_id>`**, not `csi:<VolumeSnapshotContent uid>`:
+  no CSI request carries the content's uid (external-snapshotter sends
+  `req.name` = `snapshot-<VolumeSnapshot uid>`, and at most the content's
+  name). The snapshot id is the content's `status.snapshotHandle`, so the
+  owner still names the Kubernetes object, and a listing needs nothing but
+  the row to report the id and the source volume. Plan 37 §15 K4 has the
+  note.
+- **A clone lands in the source's shard.** Routing it by `hash(req.name)`
+  would refuse three clones in four in a 4-shard pool.
+- **Volume clones go through a transient snapshot**, because `clone.create`
+  clones snapshots only (plan 32 is untouched).
+- **"Metadata-only" is shown by the controller's own `clone.create` timing**,
+  not by counting chunk objects. Chunks are content-addressed, so a data
+  copy would add no chunk objects either. The scenario clones a volume
+  with a 64 MiB file and requires the logged `clone.create` to take under
+  10 s (it took 5-9 ms).
+- **`ListSnapshots` unfiltered starts no engine pod**: it lists the
+  filesystems an engine pod serves now. By id or by source it reaches the
+  one filesystem the id names.
+- **`GET_SNAPSHOT` is advertised** (alpha; three more csi-sanity specs run).
+
+### Review round (37-k4 fixes)
+
+- A failed or abandoned volume clone deletes its transient `csi-clone-<hash>`
+  snapshot (`drop_transient`, every path out of `create_from_source`); unit
+  test `a_failed_volume_clone_leaves_no_transient_snapshot`.
+- `csi-snapshot-clone-mount` deletes the `VolumeSnapshot` and asks the
+  controller-owned engine pod (`constellation snapshot ls --json`) that no
+  `snapshot-*`/`csi-clone-*` row is left; it also has `finish` watch 60 s
+  after the engine pods are deleted that none comes back (the provisioner's
+  repeat was seen 18 s after the PV went).
+- `DeleteVolume` of a volume this process created and has not deleted starts
+  the engine even if no PV names it (a warn log otherwise: the "no PV, no pod,
+  not created here" window, documented in the plan's 37-k4 notes). Unit test
+  `a_delete_of_a_volume_this_process_created_trashes_it_without_a_pv`.
+- Notes in the plan: snapshot secrets ignored, unfiltered `ListSnapshots`
+  covers running engines only, the O(n) name check of `CreateSnapshot`.
+
+### Findings (not fixed here)
+
+- A restore that the driver refuses delays its namespace's deletion by
+  minutes. external-provisioner keeps `volumesnapshot-as-source-protection`
+  on the source `VolumeSnapshot` while the refused PVC sits in its
+  "infeasible, retries delayed" backoff: 204 s in one run of
+  `csi-clone-cross-pool-refused`. This is Kubernetes behaviour; the
+  scenario's teardown waits for it.
+
+### Gates (37-k4 worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `k4`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` | 2310 passed, 0 failed, 47 ignored |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `tests/integration.sh`'s body against the floci already on 4566 (another agent's; reused per the host rules), prefix `k4-run-…` | SMOKE TEST PASSED |
+| `target/release/harness run`: all 204 scenarios, run by name in slices under the tool's 10-minute foreground cap (`git-under-flock-rounds` alone, detached and polled) | 195 PASSED and 7 SKIPPED (the root-only `passthrough-*`) in the sweep; 2 FAILED once: `visibility-s3-latency` (an `EIO` on a write under injected S3 latency) and `p2p-same-identity-restart` (a daemon took over 120 s to exit after unmount). Both then passed 4 of 4 re-runs. This chunk changes no engine code |
+| `sudo env -u XDG_RUNTIME_DIR … CONSTELLATION_HARNESS_DOCKER_PREFIX=k4-root harness run subtree-confinement passthrough-…` (the 7 skipped) | 8 PASSED |
+| `docker compose -p k4c --profile test run --rm compliance` (private `SMOKE_IMAGE`, floci's host port dropped by an override because 4566 was taken) | `8798 passed, 0 failed`, COMPLIANCE TEST PASSED (baseline: 0 known failures) |
+| `make csi-sanity` | Identity 3 passed; Identity\|Controller\|Node **65 passed**, 0 failed, 1 pending, 37 skipped (43 before K4; the skips are ListVolumes, GetCapacity, ModifyVolume, ControllerPublish, topology and node expansion, none advertised) |
+| `KIND_CLUSTER=kind-37-k4 harness k8s-scenario --all --image constellation-csi:k4-final` (harness-created cluster, deleted at the end) | 6 PASSED: `csi-pod-rw` 55.2 s, `csi-rwx-across-nodes` 46.7 s, `csi-many-pvs-one-pool` 138.6 s, `csi-plugin-restart-survives` 119.8 s, `csi-snapshot-clone-mount` 49.9 s (clones Bound 2.8 s after creation, `clone.create` 38 and 6 ms), `csi-clone-cross-pool-refused` 208.6 s (170.6 s of it the namespace waiting on the provisioner's finalizer, above). ALL K8S SCENARIOS PASSED |
+| The teardown without the settle loop: `harness k8s-scenario csi-many-pvs-one-pool --keep` on a created cluster, then 90 s of watching | PASSED. The provisioner repeated `DeleteVolume` 17 times after the PVs were gone. Each one was answered "deleted already, starting nothing", and the cluster held 0 engine pods throughout. Cluster deleted |
+
+### Exit criteria (plan 37 §15 K4)
+
+- [x] CONVENTIONS gates (above; the two one-off harness failures passed 4 of 4 re-runs, reported).
+- [x] The snapshot→clone→mount `k8s-scenario` passes (`csi-snapshot-clone-mount`).
+- [x] "Clone/restore within a pool, and refusal across pools" passes both halves (`csi-clone-cross-pool-refused`).
+- [x] `ListSnapshots` pagination matches csi-sanity's expectations (its pagination spec and the rest of the snapshot groups pass).
+- [x] Carried from 37-k3b: a repeated `DeleteVolume` starts no engine pod (unit test and the kind run above), and the harness's 30 s settle loop is gone.

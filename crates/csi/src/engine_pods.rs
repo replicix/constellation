@@ -78,6 +78,17 @@
 //! `persistentvolumes` and `get` on `storageclasses` (the chart's
 //! controller ClusterRole).
 //!
+//! **Deletes start nothing they do not need** (37-k4, the 37-k3b review's
+//! bug: a `DeleteVolume` the provisioner repeated after the PV was gone
+//! recreated the pool's pod from its remembered spec). [`Engines::running`]
+//! reaches a pod only if it exists and is neither terminating nor
+//! terminated, never creating, respawning or rebuilding one;
+//! [`Engines::named`] lists `PersistentVolume`s / `VolumeSnapshotContent`s
+//! for the handle (`list` on both, the chart's controller ClusterRole); and
+//! [`Engines::retire`] deletes a pod a delete started for itself, unless
+//! another RPC holds a client into it by then (every client shares the
+//! cached relay, so the relay map's reference is then the only one).
+//!
 //! **Credentials.** An engine pod opens S3 at start, before any control
 //! call could hand it credentials, so `fs.unlock`-style per-request
 //! delivery (§9, 37-k6a) cannot start it. The request's secrets
@@ -93,7 +104,7 @@
 //! which is why `fs.create` through the pod must not name them again
 //! (the daemon refuses an `fs.create` that does).
 
-use crate::control_client::{ControlClient, Engines, PoolRef, SocketControlClient};
+use crate::control_client::{ControlClient, Engines, Handle, PoolRef, SocketControlClient};
 use crate::node::{NodeEngine, NodeEngines};
 use crate::params::ClassParams;
 use crate::volume_id::VolumeId;
@@ -1436,6 +1447,85 @@ impl EnginePodManager {
         Ok((pool, reads_secret))
     }
 
+    /// The controller-owned pod that served `fs_uuid` last (cached, else by
+    /// its label); it may be gone since.
+    async fn pod_for(&self, fs_uuid: &str) -> Result<Option<String>, ControlError> {
+        if let Some(name) = self.by_uuid.lock().unwrap().get(fs_uuid).cloned() {
+            return Ok(Some(name));
+        }
+        // The controller's own pods only: node-owned ones carry the label
+        // too, and are no business of the controller's.
+        let selector =
+            format!("{LABEL_COMPONENT}=engine,{LABEL_OWNER}=controller,{LABEL_FS_UUID}={fs_uuid}");
+        let pods = self
+            .pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| kube_err("listing engine pods", e))?;
+        Ok(pods.items.into_iter().filter_map(|p| p.metadata.name).min())
+    }
+
+    /// Whether a `PersistentVolume` of this driver has `handle`.
+    async fn pv_named(&self, handle: &str) -> Result<bool, ControlError> {
+        let pvs: Api<PersistentVolume> = Api::all(self.client.clone());
+        let mut params = ListParams::default().limit(500);
+        loop {
+            let page = pvs
+                .list(&params)
+                .await
+                .map_err(|e| kube_err("listing PersistentVolumes", e))?;
+            if page.items.iter().any(|pv| {
+                pv.spec
+                    .as_ref()
+                    .and_then(|s| s.csi.as_ref())
+                    .is_some_and(|c| {
+                        c.driver == crate::identity::DRIVER_NAME && c.volume_handle == handle
+                    })
+            }) {
+                return Ok(true);
+            }
+            match page.metadata.continue_ {
+                Some(token) if !token.is_empty() => params = params.continue_token(&token),
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// Whether a `VolumeSnapshotContent` of this driver has `handle` (as
+    /// the snapshot it made, or as a pre-provisioned one's source). No
+    /// snapshot CRDs installed: no such object can exist.
+    async fn content_named(&self, handle: &str) -> Result<bool, ControlError> {
+        let resource = kube::core::ApiResource {
+            group: "snapshot.storage.k8s.io".into(),
+            version: "v1".into(),
+            api_version: "snapshot.storage.k8s.io/v1".into(),
+            kind: "VolumeSnapshotContent".into(),
+            plural: "volumesnapshotcontents".into(),
+        };
+        let contents: Api<kube::core::DynamicObject> =
+            Api::all_with(self.client.clone(), &resource);
+        let mut params = ListParams::default().limit(500);
+        loop {
+            let page = match contents.list(&params).await {
+                Ok(page) => page,
+                Err(e) if is_status(&e, 404) => return Ok(false),
+                Err(e) => return Err(kube_err("listing VolumeSnapshotContents", e)),
+            };
+            if page.items.iter().any(|c| {
+                let d = &c.data;
+                d["spec"]["driver"] == crate::identity::DRIVER_NAME
+                    && (d["status"]["snapshotHandle"] == handle
+                        || d["spec"]["source"]["snapshotHandle"] == handle)
+            }) {
+                return Ok(true);
+            }
+            match page.metadata.continue_ {
+                Some(token) if !token.is_empty() => params = params.continue_token(&token),
+                _ => return Ok(false),
+            }
+        }
+    }
+
     /// Bring `name` up (from `spec` if it must be created) and connect.
     async fn connect(&self, name: &str, spec: Option<&Pod>) -> Result<Arc<Relay>, ControlError> {
         let lock = self.bringup_lock(name);
@@ -1485,23 +1575,7 @@ impl Engines for EnginePodManager {
     }
 
     async fn filesystem(&self, fs_uuid: &str) -> Result<Arc<dyn ControlClient>, ControlError> {
-        let known = self.by_uuid.lock().unwrap().get(fs_uuid).cloned();
-        let name = match known {
-            Some(name) => Some(name),
-            None => {
-                // The controller's own pods only: node-owned ones carry the
-                // label too, and are no business of the controller's.
-                let selector = format!(
-                    "{LABEL_COMPONENT}=engine,{LABEL_OWNER}=controller,{LABEL_FS_UUID}={fs_uuid}"
-                );
-                let pods = self
-                    .pods
-                    .list(&ListParams::default().labels(&selector))
-                    .await
-                    .map_err(|e| kube_err("listing engine pods", e))?;
-                pods.items.into_iter().filter_map(|p| p.metadata.name).min()
-            }
-        };
+        let name = self.pod_for(fs_uuid).await?;
         if let Some(name) = name {
             let spec = self.specs.lock().unwrap().get(&name).cloned();
             let present = spec.is_some()
@@ -1536,6 +1610,114 @@ impl Engines for EnginePodManager {
             )));
         }
         Ok(Arc::new(PoolClient(relay)))
+    }
+
+    async fn running(&self, fs_uuid: &str) -> Result<Option<Arc<dyn ControlClient>>, ControlError> {
+        let Some(name) = self.pod_for(fs_uuid).await? else {
+            return Ok(None);
+        };
+        let lock = self.bringup_lock(&name);
+        let _guard = lock.lock().await;
+        let Some(pod) = wait_existing_ready(&self.pods, &name, self.cfg.ready_timeout).await?
+        else {
+            return Ok(None);
+        };
+        let relay = self.relay(&pod).await?;
+        self.learn_uuid(&pod, &relay).await?;
+        Ok(Some(Arc::new(PoolClient(relay))))
+    }
+
+    async fn named(&self, handle: Handle<'_>) -> Result<bool, ControlError> {
+        match handle {
+            Handle::Volume(h) => self.pv_named(h).await,
+            Handle::Snapshot(h) => self.content_named(h).await,
+        }
+    }
+
+    /// Deleted only when no other caller holds a client into it: every
+    /// [`PoolClient`] shares the cached relay, so the relay map's own
+    /// reference is then the only one left.
+    async fn retire(&self, fs_uuid: &str) -> Result<(), ControlError> {
+        let Some(name) = self.pod_for(fs_uuid).await? else {
+            return Ok(());
+        };
+        let lock = self.bringup_lock(&name);
+        let _guard = lock.lock().await;
+        {
+            let mut relays = self.relays.lock().unwrap();
+            if let Some(relay) = relays.get(&name) {
+                if Arc::strong_count(relay) > 1 {
+                    tracing::debug!(pod = %name, "engine pod in use; not retiring it");
+                    return Ok(());
+                }
+            }
+            relays.remove(&name);
+        }
+        match self.pods.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {
+                tracing::info!(pod = %name, "stopped the engine pod a delete started");
+                Ok(())
+            }
+            Err(e) if is_status(&e, 404) => Ok(()),
+            Err(e) => Err(kube_err("deleting the engine pod", e)),
+        }
+    }
+
+    async fn running_filesystems(&self) -> Result<Vec<String>, ControlError> {
+        let selector = format!("{LABEL_COMPONENT}=engine,{LABEL_OWNER}=controller");
+        let pods = self
+            .pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| kube_err("listing engine pods", e))?;
+        let mut uuids: Vec<String> = pods
+            .items
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
+            .filter(|p| !matches!(pod_phase(p), "Failed" | "Succeeded"))
+            .filter_map(|p| p.metadata.labels.as_ref()?.get(LABEL_FS_UUID).cloned())
+            .collect();
+        uuids.sort();
+        uuids.dedup();
+        Ok(uuids)
+    }
+}
+
+/// Pod `name` once `Ready`, if it exists and is neither terminating nor
+/// terminated; `None` otherwise. Never creates or replaces it (what
+/// [`Engines::running`] promises). Polled like [`ensure_pod_ready`].
+async fn wait_existing_ready(
+    pods: &Api<Pod>,
+    name: &str,
+    ready_timeout: Duration,
+) -> Result<Option<Pod>, ControlError> {
+    let deadline = Instant::now() + ready_timeout;
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        let pod = pods
+            .get_opt(name)
+            .await
+            .map_err(|e| kube_err("reading the engine pod", e))?;
+        let Some(pod) = pod else { return Ok(None) };
+        if pod.metadata.deletion_timestamp.is_some()
+            || matches!(pod_phase(&pod), "Failed" | "Succeeded")
+        {
+            return Ok(None);
+        }
+        if pod_ready(&pod) {
+            return Ok(Some(pod));
+        }
+        if Instant::now() >= deadline {
+            return Err(ControlError::new(
+                ErrorKind::Timeout,
+                format!(
+                    "engine pod {name} is not ready after {ready_timeout:?} ({})",
+                    pod_waiting_on(&pod)
+                ),
+            ));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(3));
     }
 }
 

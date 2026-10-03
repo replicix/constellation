@@ -25,7 +25,11 @@
 # - `persistentvolumes` list and `storageclasses` get (cluster-wide): a
 #   DeleteVolume/ControllerExpandVolume whose engine pod is gone and whose
 #   spec this process never saw (a reinstall, a restart) rebuilds the pod
-#   from a PV naming the filesystem and that PV's StorageClass.
+#   from a PV naming the filesystem and that PV's StorageClass;
+# - `persistentvolumes` and `volumesnapshotcontents` list (cluster-wide,
+#   K4): a DeleteVolume/DeleteSnapshot with no engine pod up asks whether
+#   the PV/content still exists, and starts nothing when it does not (a
+#   delete the sidecar repeats after it succeeded).
 #
 # `pods/exec` + `pods` create in this (PodSecurity `privileged`) namespace
 # would make this ServiceAccount root-equivalent on every node (exec into
@@ -92,6 +96,9 @@ rules:
   - apiGroups: [storage.k8s.io]
     resources: [storageclasses]
     verbs: [get]
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshotcontents]
+    verbs: [list]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
