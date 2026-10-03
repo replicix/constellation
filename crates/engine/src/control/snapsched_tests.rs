@@ -196,13 +196,15 @@ fn the_setxattr_gate_admits_only_parseable_policies_on_shared_directories() {
         "budget_stale",
         "refused_lag",
         "refused_state",
+        "last_refused_unix_ms",
+        "now_unix_ms",
         "last_create_unix_ms",
         "last_error",
         "last_parse_error",
     ] {
         assert!(section.contains_key(key), "node.status.snapsched.{key}");
     }
-    assert_eq!(section.len(), 20, "{section:?}");
+    assert_eq!(section.len(), 22, "{section:?}");
     assert_eq!(section["ticks"], json!(0));
     assert_eq!(section["last_parse_error"], Value::Null);
 

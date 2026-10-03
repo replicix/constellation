@@ -383,6 +383,63 @@ fn a_listing_says_building_until_the_index_is_built() {
     assert_eq!(est["building"], false, "{est}");
 }
 
+/// `snapshot.sched.status`'s per-root `used_bytes` (the per-root
+/// `/metrics` gauge): Σ `USED` of the root directory's snapshots, from a
+/// peek — absent, and no work caused, until the index is current.
+#[test]
+fn sched_status_carries_a_roots_used_only_once_the_index_is_current() {
+    let f = fixture_with(&[&[]], Some(config(SnapAcctMode::Auto, Duration::ZERO)));
+    populate(&f);
+    call(
+        &f,
+        "snapshot.policy.set",
+        json!({"path": "/vol", "expr": "1h:1d"}),
+    )
+    .unwrap();
+    let acct = f.svc.engine.snapacct().clone();
+    let vol_root = |status: &Value| -> Value {
+        let roots = status["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "{status}");
+        assert_eq!(roots[0]["path"], "/vol", "{status}");
+        roots[0].clone()
+    };
+
+    let before = vol_root(&call(&f, "snapshot.sched.status", json!({})).unwrap());
+    assert!(before["used_bytes"].is_null(), "{before}");
+    assert_eq!(
+        acct.stats()
+            .passes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a status poll caused accounting work"
+    );
+
+    // Make `a3`'s copy of f2 unique to it (rewritten; `/other@b2`
+    // publishes the rewrite), and refresh the live flags (`--verify`, as
+    // above), so the sum is not 0.
+    let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    call(
+        &f,
+        "browse.write",
+        json!({"path": "/vol/f2", "data": constellation_control::proto::ByteBuf::from(data),
+               "create": true, "truncate": true}),
+    )
+    .unwrap();
+    call(&f, "snapshot.create", json!({"selector": "/other@b2"})).unwrap();
+    let verified = call(&f, "snapshot.space.verify", json!({})).unwrap();
+    assert_eq!(verified["mismatches"], 0, "{verified}");
+
+    let listing = ready_listing(&f);
+    let want: u64 = listing
+        .iter()
+        .filter(|r| r["path"] == "/vol")
+        .map(|r| r["used"].as_u64().unwrap())
+        .sum();
+    assert!(want > 0, "{listing:?}");
+    let after = vol_root(&call(&f, "snapshot.sched.status", json!({})).unwrap());
+    assert_eq!(after["used_bytes"], want, "{after}");
+}
+
 #[test]
 fn accounting_off_says_off_and_refuses_the_space_methods() {
     let f = fixture_with(

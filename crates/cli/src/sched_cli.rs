@@ -127,6 +127,82 @@ pub fn render_status(r: &api::SnapSchedReport) -> String {
     out
 }
 
+/// Plan 32 Step 9's silent-failure warning: a root whose policy does not
+/// parse or that is at the cap, or a tick refused (stale replica, unreadable
+/// state), means policies are in place and snapshots are not being taken,
+/// with nothing failing loudly. The web UI's banner tests the same fields.
+pub fn silent_failure(s: &api::SnapSchedStatus) -> Option<String> {
+    if s.unparseable_roots == 0 && s.capped_roots == 0 && !s.refusing_recently() {
+        return None;
+    }
+    Some(format!(
+        "WARNING: snapshots are silently not being taken (unparseable roots {}, \
+         capped roots {}, refused-lag {}, refused-state {}, last refused {}); see `constellation snapshot \
+         sched status`\n",
+        s.unparseable_roots,
+        s.capped_roots,
+        s.refused_lag,
+        s.refused_state,
+        opt_time(i64::try_from(s.last_refused_unix_ms).ok().filter(|t| *t > 0)),
+    ))
+}
+
+/// `constellation status`'s human summary of `node.status`'s `snapsched`
+/// and `snapacct` sections (the JSON itself stays on stdout for scripts):
+/// the scheduler block, the accounting block, and [`silent_failure`]'s
+/// warning first when it applies.
+pub fn render_node_summary(s: &api::SnapSchedStatus, a: &api::SnapAcctStatus) -> String {
+    let mut out = silent_failure(s).unwrap_or_default();
+    out.push_str(&format!(
+        "snapshot scheduler: {}\n",
+        if s.leader { "leader" } else { "not leading" }
+    ));
+    out.push_str(&format!(
+        "  roots {} (paused {}, unparseable {}, capped {})  orphaned snapshots {}\n",
+        s.roots, s.paused_roots, s.unparseable_roots, s.capped_roots, s.orphaned_snapshots,
+    ));
+    out.push_str(&format!(
+        "  created {}  skipped-empty {}  create-failed {}  expired {}  skipped-reverify {}  \
+         skipped-grace {}  refused-lag {}  refused-state {}  last created {}\n",
+        s.created,
+        s.skipped_empty,
+        s.create_failed,
+        s.expired,
+        s.skipped_reverify,
+        s.skipped_grace,
+        s.refused_lag,
+        s.refused_state,
+        opt_time(i64::try_from(s.last_create_unix_ms).ok()),
+    ));
+    if let Some(e) = &s.last_error {
+        out.push_str(&format!("  last error: {e}\n"));
+    }
+    if let Some((expr, offset, msg)) = &s.last_parse_error {
+        out.push_str(&format!(
+            "  last refused policy: {expr:?}: {msg} (byte {offset})\n"
+        ));
+    }
+    let state = if a.mode == "off" {
+        "off".to_string()
+    } else if a.building {
+        format!("building ({}%)", a.build_progress_pct)
+    } else if a.maintaining {
+        "current".to_string()
+    } else {
+        "idle (built on the first size request)".to_string()
+    };
+    out.push_str(&format!("accounting: {state} (mode {})\n", a.mode));
+    out.push_str(&format!(
+        "  indexed chunks {}  index bytes {}  as of seq {}  last refresh {} ms  \
+         verify mismatches {}\n",
+        a.indexed_chunks, a.index_bytes, a.as_of_seq, a.refresh_ms_last, a.verify_mismatches,
+    ));
+    if let Some(e) = &a.last_error {
+        out.push_str(&format!("  last error: {e}\n"));
+    }
+    out
+}
+
 /// `snapshot sched run`'s report, and whether it counts as a failure
 /// (exit non-zero): refused, an error (a whole batch, or the expiry run),
 /// or a failed root. A row per root created (`created`, `skipped_empty`,
@@ -183,6 +259,7 @@ pub async fn status(dir: &Path, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        print!("{}", silent_failure(&report.stats).unwrap_or_default());
         print!("{}", render_status(&report));
     }
     Ok(())
@@ -242,6 +319,107 @@ mod tests {
         assert_eq!(state(&r), "gone");
         r.canonical = None;
         assert_eq!(state(&r), "unparseable");
+    }
+
+    #[test]
+    fn the_silent_failure_warning_names_every_trigger_and_nothing_else() {
+        let quiet = api::SnapSchedStatus {
+            create_failed: 7,
+            budget_stale: 2,
+            now_unix_ms: 10_000_000,
+            ..Default::default()
+        };
+        assert_eq!(silent_failure(&quiet), None);
+        for set in [
+            |s: &mut api::SnapSchedStatus| s.unparseable_roots = 1,
+            |s: &mut api::SnapSchedStatus| s.capped_roots = 1,
+            |s: &mut api::SnapSchedStatus| {
+                s.last_refused_unix_ms = s.now_unix_ms - 1_000;
+                s.refused_lag = 1;
+            },
+        ] {
+            let mut s = quiet.clone();
+            set(&mut s);
+            let warning = silent_failure(&s).expect("warns");
+            assert!(
+                warning.starts_with("WARNING: snapshots are silently not being taken"),
+                "{warning}"
+            );
+        }
+    }
+
+    /// A refusal shows the warning; ten minutes later (the status's clock
+    /// moved on, the cumulative counters did not) it is gone.
+    #[test]
+    fn a_refusal_warns_for_ten_minutes_only() {
+        let mut s = api::SnapSchedStatus {
+            refused_state: 3,
+            last_refused_unix_ms: 5_000_000,
+            now_unix_ms: 5_000_000,
+            ..Default::default()
+        };
+        assert!(silent_failure(&s).is_some());
+        s.now_unix_ms = 5_000_000 + api::SNAPSCHED_REFUSAL_WARN_MS - 1;
+        assert!(silent_failure(&s).is_some());
+        s.now_unix_ms = 5_000_000 + api::SNAPSCHED_REFUSAL_WARN_MS;
+        assert_eq!(silent_failure(&s), None);
+        assert_eq!(s.refused_state, 3);
+    }
+
+    #[test]
+    fn node_summary_has_a_scheduler_and_an_accounting_block() {
+        let s = api::SnapSchedStatus {
+            leader: true,
+            roots: 2,
+            capped_roots: 1,
+            created: 5,
+            expired: 3,
+            last_error: Some("s3 down".into()),
+            last_parse_error: Some(("1h:30m".into(), 3, "keep < every".into())),
+            ..Default::default()
+        };
+        let a = api::SnapAcctStatus {
+            mode: "auto".into(),
+            maintaining: true,
+            building: true,
+            build_progress_pct: 40,
+            indexed_chunks: 11,
+            ..Default::default()
+        };
+        let text = render_node_summary(&s, &a);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[0].starts_with("WARNING: snapshots are silently"),
+            "{text}"
+        );
+        assert!(lines[0].contains("capped roots 1"), "{text}");
+        assert_eq!(lines[1], "snapshot scheduler: leader", "{text}");
+        assert!(
+            lines[2].contains("roots 2 (paused 0, unparseable 0, capped 1)"),
+            "{text}"
+        );
+        assert!(lines[3].contains("created 5"), "{text}");
+        assert!(lines[3].contains("expired 3"), "{text}");
+        assert_eq!(lines[4], "  last error: s3 down", "{text}");
+        assert!(
+            lines[5].contains("\"1h:30m\": keep < every (byte 3)"),
+            "{text}"
+        );
+        assert_eq!(lines[6], "accounting: building (40%) (mode auto)", "{text}");
+        assert!(lines[7].contains("indexed chunks 11"), "{text}");
+
+        let healthy = render_node_summary(
+            &api::SnapSchedStatus::default(),
+            &api::SnapAcctStatus {
+                mode: "off".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            healthy.starts_with("snapshot scheduler: not leading\n"),
+            "{healthy}"
+        );
+        assert!(healthy.contains("accounting: off (mode off)"), "{healthy}");
     }
 
     #[test]

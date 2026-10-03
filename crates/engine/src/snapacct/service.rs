@@ -1943,17 +1943,9 @@ impl SnapAcctService {
                 Err(other) => return Ok(cast(other)),
             }
         } else {
-            if self.cfg.mode == SnapAcctMode::Off {
-                return Ok(SnapAnswer::Off);
-            }
-            let open = if self.wipe_pending.load(Ordering::Acquire) {
-                None
-            } else {
-                self.index.lock().expect("index lock").clone()
-            };
-            match open {
-                Some(ix) if self.current(&ix)? => ix,
-                _ => return Ok(cast(self.building())),
+            match self.peek()? {
+                Ok(ix) => ix,
+                Err(other) => return Ok(cast(other)),
             }
         };
         let (as_of_seq, as_of_ms) = self.as_of(&ix)?;
@@ -1983,6 +1975,45 @@ impl SnapAcctService {
                     as_of_ms,
                 },
             );
+        }
+        Ok(SnapAnswer::Ready(out))
+    }
+
+    /// The open index when it is current right now; `Building` or `Off`
+    /// otherwise. Causes no work (no demand, no wake, no wait).
+    fn peek(&self) -> Result<Result<Arc<SnapAcct>, SnapAnswer<()>>> {
+        if self.cfg.mode == SnapAcctMode::Off {
+            return Ok(Err(SnapAnswer::Off));
+        }
+        let open = if self.wipe_pending.load(Ordering::Acquire) {
+            None
+        } else {
+            self.index.lock().expect("index lock").clone()
+        };
+        match open {
+            Some(ix) if self.current(&ix)? => Ok(Ok(ix)),
+            _ => Ok(Err(self.building())),
+        }
+    }
+
+    /// Σ `USED` of every snapshot of each directory in `dir_inos` (its
+    /// chain; 0 for one with none), keyed by inode: the per-root gauge
+    /// `/metrics` exports through `snapshot.sched.status`. Only a peek —
+    /// a scrape must never start a build — so `Building` whenever the
+    /// index is not current. Not what deleting them returns (`USED` does
+    /// not sum to `reclaim`).
+    pub fn chains_used_peek(&self, dir_inos: &[u64]) -> Result<SnapAnswer<HashMap<u64, u64>>> {
+        let ix = match self.peek()? {
+            Ok(ix) => ix,
+            Err(other) => return Ok(cast(other)),
+        };
+        let mut out = HashMap::with_capacity(dir_inos.len());
+        for &ino in dir_inos {
+            let used = match ix.chain_of(ino)? {
+                Some(chain) => ix.chain_numbers(chain)?.map_or(0, |c| c.used),
+                None => 0,
+            };
+            out.insert(ino, used);
         }
         Ok(SnapAnswer::Ready(out))
     }

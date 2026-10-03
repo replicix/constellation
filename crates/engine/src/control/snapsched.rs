@@ -116,10 +116,13 @@ pub(super) fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     // The scheduler (M3): its state, and one tick on demand. A tick
     // never fails as a call: refusals and batch errors are in the result.
     unary::<SnapshotSchedStatus>(r, svc, |s, _, _| {
-        s.engine
+        let mut report = s
+            .engine
             .snapsched()
             .report()
-            .map_err(|e| ControlError::failed(format!("{e:#}")))
+            .map_err(|e| ControlError::failed(format!("{e:#}")))?;
+        s.fill_roots_used(&mut report.roots)?;
+        Ok(report)
     });
     unary::<SnapshotSchedRun>(r, svc, |s, _, p| {
         let run = crate::snapsched::Run::Manual { dry_run: p.dry_run };

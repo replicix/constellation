@@ -891,11 +891,24 @@ pub struct PruneStatus {
     pub last_parse_error: Option<(String, usize, String)>,
 }
 
+/// How long after a refused scheduler tick the silent-failure warning stays up.
+pub const SNAPSCHED_REFUSAL_WARN_MS: u64 = 10 * 60 * 1000;
+
+impl SnapSchedStatus {
+    /// A tick was refused within [`SNAPSCHED_REFUSAL_WARN_MS`] of `now_unix_ms`
+    /// (a standing refusal gate refuses every tick, so it keeps this true).
+    pub fn refusing_recently(&self) -> bool {
+        self.last_refused_unix_ms > 0
+            && self.now_unix_ms.saturating_sub(self.last_refused_unix_ms)
+                < SNAPSCHED_REFUSAL_WARN_MS
+    }
+}
+
 /// Snapshot-schedule counters (plan 32 Step 9), surfaced in
 /// `constellation status`, on the web UI, and in `/metrics`.
 ///
-/// `unparseable_roots`, `capped_roots` or `refused_*` above zero mean
-/// snapshots are silently not being taken; `create_failed` climbing while
+/// `unparseable_roots`, `capped_roots` above zero, or a recent refusal
+/// (`refusing_recently`), mean snapshots are silently not being taken; `create_failed` climbing while
 /// `expired` stays at zero is the healthy outage signature (expiry
 /// anchors on the newest snapshot, so an outage freezes it).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -944,6 +957,13 @@ pub struct SnapSchedStatus {
     pub refused_lag: u64,
     #[serde(default)]
     pub refused_state: u64,
+    /// When the scheduler last refused a tick (0 = never), and this node's
+    /// clock when the status was read. `refused_*` are cumulative; the
+    /// silent-failure warning keys on this being recent instead.
+    #[serde(default)]
+    pub last_refused_unix_ms: u64,
+    #[serde(default)]
+    pub now_unix_ms: u64,
     #[serde(default)]
     pub last_create_unix_ms: u64,
     #[serde(default)]
@@ -2706,6 +2726,11 @@ pub struct SnapSchedRootState {
     pub capped: bool,
     #[serde(default)]
     pub error: Option<String>,
+    /// Σ `USED` of every snapshot of this directory (auto and manual),
+    /// from the space-accounting index; `None` while the index is not
+    /// current or accounting is off (a peek: asking never starts a build).
+    /// Not what deleting them returns: `USED` does not sum.
+    pub used_bytes: Option<u64>,
 }
 
 /// `snapshot.sched.run`: run one scheduler tick now, on this node.

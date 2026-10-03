@@ -315,7 +315,9 @@ enum Command {
     },
     /// Show filesystem information from the backend, or live daemon
     /// status (spool backlog, cache, every mounted view) from a
-    /// registered name / mount's state dir.
+    /// registered name / mount's state dir. Stdout is the JSON only (for
+    /// scripts); the human summary (snapshot scheduler, accounting, and the
+    /// "snapshots are silently not being taken" warning) goes to stderr.
     Status {
         target: Option<String>,
         #[arg(long, conflicts_with = "state_dir")]
@@ -1629,7 +1631,14 @@ fn main() -> Result<()> {
                 Default::default(),
                 daemon_lock::control_timeout(),
             ))?;
-            print_json(&s)
+            print_json(&s)?;
+            // The human blocks go to stderr: stdout stays the JSON that
+            // scripts and the harness parse.
+            eprint!(
+                "{}",
+                sched_cli::render_node_summary(&s.snapsched, &s.snapacct)
+            );
+            Ok(())
         }
         Command::Pin { target, state_dir } => {
             let (t, dir) = resolve_target(&target, state_dir)?;

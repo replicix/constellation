@@ -168,6 +168,9 @@ pub struct SnapSchedStats {
     /// frozen epoch, offline read-only, read-only member).
     pub refused_lag: AtomicU64,
     pub refused_state: AtomicU64,
+    /// When (scheduler clock) a tick was last refused; 0 = never. A standing
+    /// gate refuses every tick, so this stays fresh while one is up.
+    pub last_refused_unix_ms: AtomicU64,
     pub last_create_unix_ms: AtomicU64,
     /// The scheduler's last failure, as text.
     pub last_error: Mutex<Option<String>>,
@@ -215,6 +218,8 @@ impl SnapSchedStats {
             budget_stale: load(&self.budget_stale),
             refused_lag: load(&self.refused_lag),
             refused_state: load(&self.refused_state),
+            last_refused_unix_ms: load(&self.last_refused_unix_ms),
+            now_unix_ms: crate::prune::now_unix_ms(),
             last_create_unix_ms: load(&self.last_create_unix_ms),
             last_error: self.last_error.lock().ok().and_then(|g| g.clone()),
             last_parse_error: self.last_parse_error.lock().ok().and_then(|g| g.clone()),
@@ -840,6 +845,9 @@ impl Scheduler {
                 },
                 1,
             );
+            stats
+                .last_refused_unix_ms
+                .store(u64::try_from(now).unwrap_or(0), Ordering::Relaxed);
             tracing::debug!(reason = %why, "snapshot scheduler: tick refused");
             // The lease is kept, but no longer renewed: this node does
             // not lead now, and another takes over once it lapses. A
@@ -1522,6 +1530,7 @@ impl Scheduler {
                     auto_snapshots: p.auto_snapshots as u64,
                     last_created_unix_ms: p.last_created,
                     capped: p.capped,
+                    used_bytes: None,
                 })
                 .collect(),
         })
@@ -2004,6 +2013,11 @@ mod tests {
             .contains("read-only"));
         let stats = sched.deps.stats.status();
         assert_eq!((stats.refused_lag, stats.refused_state), (1, 2));
+        // The refusal is stamped with the scheduler's clock.
+        assert_eq!(
+            stats.last_refused_unix_ms,
+            u64::try_from(now.load(Ordering::Relaxed)).unwrap()
+        );
         assert_eq!(read_only.deps.stats.status().refused_state, 1);
         assert!(autos(&a).is_empty());
         assert!(!lease_object(&store).await, "a refused tick takes no lease");

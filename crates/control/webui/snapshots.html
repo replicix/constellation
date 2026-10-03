@@ -84,6 +84,7 @@ dialog::backdrop{background:#0008}
 .picker button{display:block;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid #1b243d;margin:0;border-radius:0}
 #msg:empty{display:none}
 #msg{white-space:pre-wrap}
+#snapWarn{border:1px solid #6b2f3a;background:#32141a;color:#ff8f9c;border-radius:10px;padding:10px 16px}#snapWarn a{color:#ffd27a}
 @media (max-width:700px){main{padding:10px}.kv{grid-template-columns:100px 1fr}td.name{min-width:140px}}
 </style>
 </head>
@@ -96,6 +97,7 @@ dialog::backdrop{background:#0008}
   <div><a href="/">← Dashboard</a> · <a href="/peers.html">Peers</a> · <span id="health">connecting…</span></div>
 </header>
 <main>
+  <div id="snapWarn" role="alert" hidden></div>
   <div id="msg" class="card bad" role="alert"></div>
 
   <section class="card" aria-labelledby="spaceTitle">
@@ -690,8 +692,23 @@ async function load(){
   else timer=setTimeout(load,building?2000:15000);
  }
 }
+// Plan 32 Step 9: the silent-failure banner, from node.status's snapsched
+// section — the same test as `constellation status`'s warning. A root whose
+// policy does not parse or that is at the cap, or a refused scheduler tick,
+// means policies are set and snapshots are not being taken.
+function snapWarn(s){
+ const t=(s&&s.snapsched)||{}, el=document.getElementById("snapWarn");
+ const recent=t.last_refused_unix_ms>0&&(t.now_unix_ms||0)-t.last_refused_unix_ms<600000;
+ const why=[[t.unparseable_roots,"unparseable policy root","unparseable policy roots"],
+  [t.capped_roots,"root at the auto snapshot cap","roots at the auto snapshot cap"],
+  [recent?t.refused_lag:0,"tick refused for a stale replica","ticks refused for a stale replica"],
+  [recent?t.refused_state:0,"tick refused for node state","ticks refused for node state"]]
+  .filter(([n])=>n>0).map(([n,one,many])=>`${n} ${n===1?one:many}`);
+ el.hidden=!why.length;
+ el.innerHTML=why.length?`<b>⚠ Snapshots are silently not being taken</b> on this node: ${why.map(esc).join(" · ")}. <a href="/snapshots.html">Policy roots</a> · <code>constellation snapshot sched status</code>`:"";
+}
 async function health(){
- try{const s=await(await fetch("/api/status")).json();document.getElementById("health").innerHTML='<span class="ok">● healthy</span> · '+esc(s.fs_uuid);}
+ try{const s=await(await fetch("/api/status")).json();document.getElementById("health").innerHTML='<span class="ok">● healthy</span> · '+esc(s.fs_uuid);snapWarn(s);}
  catch(e){document.getElementById("health").innerHTML='<span class="bad">○ disconnected</span>';}
 }
 health();setInterval(health,5000);

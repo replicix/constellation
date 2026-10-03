@@ -36396,3 +36396,51 @@ deadline). Run 2 took 81 ms.
 - After the gate runs, only test code and formatting changed: the net
   inbound test, then `cargo fmt`. Clippy, the net tests and the release
   build were re-run on top of those changes.
+
+## Plan 32 M8a (metrics): Step 9 on `/metrics`, in `constellation status` and in the web UI
+
+Exports and shows the `snapsched` and `snapacct` sections that `node.status` already
+carried (M3, M4a, M5). No new counter and no scheduler or accounting behaviour change.
+
+| Item | State | Where |
+|---|---|---|
+| `/metrics`: `constellation_snapsched_*`. States are gauges: `leader`, `roots`, `paused_roots`, `unparseable_roots`, `capped_roots`, `orphaned_snapshots`, `last_create_unix_ms`. Counts are `TYPE counter` `_total`, following the prune names: `ticks`, `created`, `skipped_empty`, `create_failed`, `expired`, `skipped_reverify`, `skipped_grace`, `budget_expired`, `budget_stale`, `refused_lag`, `refused_state`. The `last_error` texts are not exported | DONE | `crates/control/src/web.rs` (`render_snapsched`) |
+| `constellation_snapacct_*` (`building`, `build_progress_pct`, `indexed_chunks`, `index_bytes`, `as_of_seq`, `refresh_ms_last`, `verify_mismatches`, plus `stalled_chains`, `refreshes_deferred_total`, `live_rechecks`, `live_recheck_full`) | DONE (already exported by M5; unchanged) | `crates/control/src/web.rs` |
+| Per-root gauges `constellation_snapsched_root_snapshots{root_ino}` (the root's live auto snapshots, held ones included) and `constellation_snapsched_root_used_bytes{root_ino}`. The second is Σ `USED` over every snapshot of the root directory, auto and manual (the chain's `ChainNumbers.used`). Both are labelled by inode only. `/metrics` reads them from `snapshot.sched.status`; when that call fails, only the per-root series are left out | DONE | `crates/control/src/web.rs` (`sched_status`, `render_metrics(status, sched)`) |
+| `SnapSchedRootState.used_bytes: Option<u64>` on `snapshot.sched.status`. It is filled only by a **peek** (`SnapAcctService::chains_used_peek`, which shares `peek()` with `snap_numbers_many`'s no-demand path): a poll or scrape never starts or waits for a build. It is `None` while the index is not current or accounting is off. Schema re-blessed (`CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`), no serde default | DONE | `crates/control/src/proto/types.rs`, `crates/control/schema/control.schema.json`, `crates/engine/src/snapacct/service.rs`, `crates/engine/src/control/{snapspace,snapsched}.rs`, `crates/engine/src/snapsched.rs` |
+| `constellation status`: stdout stays the JSON (scripts, `tests/compliance.sh`, `read-cpu-gate.sh`, the harness `smoke` scenario parse it). Human blocks go to **stderr**: the silent-failure `WARNING:` line first, then the "snapshot scheduler" block (leader, roots/paused/unparseable/capped, orphaned, created/expired and the other counts, last created, last error, last refused policy) and the "accounting" block (state, mode, indexed chunks, index bytes, as-of seq, last refresh, verify mismatches, last error). `snapshot sched status` prints the same warning above its table | DONE | `crates/cli/src/sched_cli.rs` (`silent_failure`, `render_node_summary`), `crates/cli/src/main.rs` |
+| Web UI banner `#snapWarn` (`role="alert"`) on `index.html` and `snapshots.html`, read from `node.status`'s `snapsched` on each status poll. It uses the same test as the CLI: `unparseable_roots` or `capped_roots` > 0, or a refusal within the last 10 minutes (`last_refused_unix_ms` against the node's own `now_unix_ms`; gauge `constellation_snapsched_last_refused_unix_ms`) | DONE | `crates/control/webui/{index,snapshots}.html` |
+| Tests: the exposition text (`snapsched_metrics_render_gauges_counters_and_per_root_series_by_ino`: every series, its TYPE, one HELP/TYPE per name, ino labels, no path and no error text, no used series without a figure, no per-root series without a report); the per-root peek end to end (`sched_status_carries_a_roots_used_only_once_the_index_is_current`: absent and zero passes before a size request, then Σ `USED` of `/vol`'s rows); the CLI warning triggers and blocks (two `sched_cli` tests); the headless page check now asserts the banner is present and hidden on a healthy node | DONE | `crates/control/src/web.rs`, `crates/engine/src/control/snapspace_tests.rs`, `crates/cli/src/sched_cli.rs`, `tests/webui-headless.sh` |
+
+Decisions:
+- **`root_used_bytes` is Σ `USED`.** It is what the plan's "`USED` total" says and what the
+  chain already keeps; it costs O(1) per root. It is not `reclaim` of the root's snapshots
+  (`USED` does not sum), and the HELP text says so. The per-path `snapshot space` figure was
+  not used: it walks every indexed chunk and is a size *request*, so a scrape would trigger
+  builds.
+- **The CLI blocks go to stderr.** `constellation status` has always printed only JSON, and
+  several consumers parse its stdout. Turning it into a human report would need a full
+  renderer and a `--json` flag, which is beyond this chunk.
+- `refused_*` stay cumulative counters on `/metrics`; the warning and the banner key on a refusal
+  within the last 10 minutes instead (`SNAPSCHED_REFUSAL_WARN_MS`), so they clear on their own.
+  A standing refusal gate refuses every tick and keeps the stamp fresh while it is up.
+
+Gates (2026-10-03, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all` (then `-- --check`) | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` | exit 0: 2357 passed, 0 failed, 47 ignored |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` (its `status` JSON parse included) |
+| `cargo build --release --workspace` | ok |
+| `bash tests/webui-headless.sh` (`CHROME_BIN` = a wrapper around `zenika/alpine-chrome` in docker with host network; the host has no Chrome) | `PASS: webui-headless` (15 DOM checks including the hidden banner, no JS error) |
+| `CONSTELLATION_HARNESS_DOCKER_PREFIX=m8a target/release/harness run web-ui-smoke web-fleet` | `web-ui-smoke PASSED in 3.1s`, `web-fleet PASSED in 4.7s`, `ALL SCENARIOS PASSED` |
+| Manual live check: debug daemon, `CONSTELLATION_SNAPSCHED_MAX_PER_ROOT=1`, `TICK_MS=500`, policy `10s:1m` on `/proj` | `/metrics` showed `constellation_snapsched_capped_roots 1`, `created_total 1`, `root_snapshots{root_ino="1099511628800"} 1` and `root_used_bytes{…} 0`. `constellation status` printed the WARNING and both blocks on stderr. The `index.html` DOM showed the banner: "1 root at the auto snapshot cap" |
+
+### Exit criteria (M8a)
+
+- [x] Step 9: both stat sets on `/metrics` as `constellation_snapsched_*` / `constellation_snapacct_*`.
+- [x] Step 9: per-root gauges for snapshot count and `USED` total, labelled by root ino, never path.
+- [x] Step 9: `unparseable_roots` / `capped_roots` / `refused_*` > 0 are surfaced in `status` and as a UI banner.
+- [ ] Steps 10–11 remainder (docs, harness scenarios, perf numbers): later M8 chunks.

@@ -239,6 +239,27 @@ impl EngineControl {
         Ok(out)
     }
 
+    /// Each policy root's Σ `USED` for `snapshot.sched.status` (and so the
+    /// per-root `/metrics` gauge), when the index is current right now: a
+    /// peek, so a status poll or a scrape never causes accounting work.
+    pub(crate) fn fill_roots_used(
+        &self,
+        roots: &mut [api::SnapSchedRootState],
+    ) -> Result<(), ControlError> {
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let inos: Vec<u64> = roots.iter().map(|r| r.ino).collect();
+        if let SnapAnswer::Ready(used) =
+            self.snapacct().chains_used_peek(&inos).map_err(internal)?
+        {
+            for root in roots.iter_mut() {
+                root.used_bytes = used.get(&root.ino).copied();
+            }
+        }
+        Ok(())
+    }
+
     /// `snapshot.space.verify`.
     pub(crate) fn snapshot_space_verify(&self) -> Result<api::SpaceVerified, ControlError> {
         if self.snapacct().mode() == crate::snapacct::SnapAcctMode::Off {

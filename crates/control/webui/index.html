@@ -21,9 +21,11 @@ a{color:#8eb7ff;text-decoration:none}a:hover{text-decoration:underline}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:middle}
 .dot.on{background:#72e6a3;box-shadow:0 0 0 2px rgba(114,230,163,.2)}
 .dot.off{background:#5a657f}
+#snapWarn{border:1px solid #6b2f3a;background:#32141a;color:#ff8f9c;border-radius:10px;padding:10px 16px;margin:16px 20px 0}#snapWarn a{color:#ffd27a}
 </style>
 </head>
 <body><header><h1>Constellation control plane</h1><span><a href="/peers.html">Peers</a> · <a href="/snapshots.html">Snapshots</a> · <span id="health">connecting…</span></span></header>
+<div id="snapWarn" role="alert" hidden></div>
 <main>
 <section><h2>Dashboard</h2><div id="dashboard"></div></section>
 <section class="span2 clickable" onclick="if(!event.target.closest('a'))location.href='/peers.html'" title="Open peer details"><h2>Peers</h2><div id="peers"></div></section>
@@ -129,11 +131,27 @@ function peerRow(p){
   <td class="num">${pct(c.err_rate)}</td>
  </tr>`;
 }
+// Plan 32 Step 9: the silent-failure banner, from node.status's snapsched
+// section — the same test as `constellation status`'s warning. A root whose
+// policy does not parse or that is at the cap, or a refused scheduler tick,
+// means policies are set and snapshots are not being taken.
+function snapWarn(s){
+ const t=(s&&s.snapsched)||{}, el=document.getElementById("snapWarn");
+ const recent=t.last_refused_unix_ms>0&&(t.now_unix_ms||0)-t.last_refused_unix_ms<600000;
+ const why=[[t.unparseable_roots,"unparseable policy root","unparseable policy roots"],
+  [t.capped_roots,"root at the auto snapshot cap","roots at the auto snapshot cap"],
+  [recent?t.refused_lag:0,"tick refused for a stale replica","ticks refused for a stale replica"],
+  [recent?t.refused_state:0,"tick refused for node state","ticks refused for node state"]]
+  .filter(([n])=>n>0).map(([n,one,many])=>`${n} ${n===1?one:many}`);
+ el.hidden=!why.length;
+ el.innerHTML=why.length?`<b>⚠ Snapshots are silently not being taken</b> on this node: ${why.map(esc).join(" · ")}. <a href="/snapshots.html">Policy roots</a> · <code>constellation snapshot sched status</code>`:"";
+}
 let refreshing=false;
 async function refresh(){
  if(refreshing)return; refreshing=true;
  try{let s=await(await fetch("/api/status")).json();
  document.querySelector("#health").innerHTML='<span class="ok">healthy</span> · '+esc(s.fs_uuid);
+ snapWarn(s);
  const pf=s.prefetch||{};
  dashboard.innerHTML=`node <b>${s.node_id}</b> · ${esc(s.version||"—")} · uptime ${dur((s.uptime_s||0)*1000)}<br>${esc(s.backend)}<br>head ${s.spool.head_seq} · backlog ${s.spool.journal_backlog}<br>speculation ${(s.speculation||{}).outstanding||0} · replay queue ${(s.speculation||{}).pending_replay||0} · replayed ${(s.speculation||{}).stranded_replayed||0} · replay conflicts ${(s.speculation||{}).replay_conflicts||0}<br>local ${(s.speculation||{}).local||0} · deposed rollbacks ${(s.speculation||{}).local_rolled_back||0}${(s.speculation||{}).gate_pending?' · <span class="bad">takeover gate pending</span>':''}${(s.speculation||{}).copies_stalled?' · <span class="bad">'+(s.speculation||{}).copies_stalled+' conflict copies stalled</span>':''}${heldLine(s)}<br>inbox submitted ${(s.inbox||{}).submitted_ops||0} · pending ${(s.inbox||{}).pending_ops||0} · executed ${(s.inbox||{}).executed_ops||0} · refused ${(s.inbox||{}).refused_ops||0} · polls ${(s.inbox||{}).polls||0}/${(s.inbox||{}).poll_hits||0} · drained ${(s.inbox||{}).drained_batches||0}<br>${s.spool.last_ship_error?'<span class="bad">'+esc(s.spool.last_ship_error)+'</span>':'sync healthy'}<br>epoch ${s.epoch.active?esc(s.epoch.epoch_id):"inactive"} · designations ${s.designations.length}<br><br>${bytes(s.cache.used_bytes)} / ${bytes(s.cache.budget_bytes)} · ${s.cache.chunks} chunks<br>pinned ${bytes(s.cache.pinned_bytes||0)}<br>peer hits ${s.coop.peer_hits} · misses ${s.coop.peer_misses||0} (FP ${s.coop.peer_false_positives||0}) · errs ${s.coop.peer_errors||0} · S3 ${s.coop.s3_fetches} · hedges ${s.coop.hedges_fired}<br>prefetch ${pf.inflight||0}/${pf.gate_target||0} · queued ${pf.queued||0} · streams ${pf.streams||0}<br>window ${bytes(pf.window_bytes||0)} · stalls ${pf.stalls||0}<br>scan ${pf.scan_ahead_files||0} files · ${bytes(pf.scan_ahead_bytes||0)}`;
  const plist=s.p2p.peers||[];

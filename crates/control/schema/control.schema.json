@@ -6249,6 +6249,15 @@
         },
         "paused": {
           "type": "boolean"
+        },
+        "used_bytes": {
+          "description": "Σ `USED` of every snapshot of this directory (auto and manual),\nfrom the space-accounting index; `None` while the index is not\ncurrent or accounting is off (a peek: asking never starts a build).\nNot what deleting them returns: `USED` does not sum.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -6350,7 +6359,7 @@
       "type": "object"
     },
     "SnapSchedStatus": {
-      "description": "Snapshot-schedule counters (plan 32 Step 9), surfaced in\n`constellation status`, on the web UI, and in `/metrics`.\n\n`unparseable_roots`, `capped_roots` or `refused_*` above zero mean\nsnapshots are silently not being taken; `create_failed` climbing while\n`expired` stays at zero is the healthy outage signature (expiry\nanchors on the newest snapshot, so an outage freezes it).",
+      "description": "Snapshot-schedule counters (plan 32 Step 9), surfaced in\n`constellation status`, on the web UI, and in `/metrics`.\n\n`unparseable_roots`, `capped_roots` above zero, or a recent refusal\n(`refusing_recently`), mean snapshots are silently not being taken; `create_failed` climbing while\n`expired` stays at zero is the healthy outage signature (expiry\nanchors on the newest snapshot, so an outage freezes it).",
       "properties": {
         "budget_expired": {
           "default": 0,
@@ -6424,10 +6433,23 @@
             "null"
           ]
         },
+        "last_refused_unix_ms": {
+          "default": 0,
+          "description": "When the scheduler last refused a tick (0 = never), and this node's\nclock when the status was read. `refused_*` are cumulative; the\nsilent-failure warning keys on this being recent instead.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "leader": {
           "default": false,
           "description": "This node holds the scheduler's singleton lease.",
           "type": "boolean"
+        },
+        "now_unix_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "orphaned_snapshots": {
           "default": 0,
@@ -8266,7 +8288,9 @@
             "last_create_unix_ms": 0,
             "last_error": null,
             "last_parse_error": null,
+            "last_refused_unix_ms": 0,
             "leader": false,
+            "now_unix_ms": 0,
             "orphaned_snapshots": 0,
             "paused_roots": 0,
             "refused_lag": 0,

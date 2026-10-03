@@ -4,10 +4,10 @@
 # a directory, a policy root and two manual snapshots (one held by
 # `csi:test`), load /snapshots.html in headless Chrome, and assert on the
 # rendered DOM: the table rows, the "externally held" chip, the space-bar
-# segments, the policy card, and no JS error (the page writes a
-# `data-js-error` marker on window errors, unhandled rejections and
-# console.error; Chrome's stderr is grepped for `Uncaught` too). A
-# screenshot is kept for the report.
+# segments, the policy card, the (hidden) silent-failure banner, and no JS
+# error (the page writes a `data-js-error` marker on window errors,
+# unhandled rejections and console.error; Chrome's stderr is grepped for
+# `Uncaught` too). A screenshot is kept for the report.
 #
 # Usage: tests/webui-headless.sh
 #
@@ -148,6 +148,9 @@ check '<article class="root" data-ino="' "a policy-root card"
 check '1h:1d 1d:7d\|1d:7d 1h:1d' "the canonical expression"
 check '<svg id="writtenChart"' 'the "written over time" chart'
 check 'as of commit [0-9]' "the as-of footer"
+# Plan 32 Step 9: the silent-failure banner is there, and hidden on this
+# healthy node (no unparseable or capped root, no refused tick).
+check '<div id="snapWarn" role="alert" hidden="">' "the silent-failure banner, hidden while healthy"
 if grep -q 'data-js-error' "$dom"; then
     grep -o '<div class="js-error"[^<]*' "$dom" >&2
     fail "the page raised a JS error"

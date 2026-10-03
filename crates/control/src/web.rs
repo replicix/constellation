@@ -41,8 +41,11 @@
 //! those headers, while `curl` and the same-page UI carry a loopback host.
 
 use crate::authz::Principal;
+use crate::methods::SnapshotSchedStatus;
 use crate::methods::{method_info, NodeStatus, StreamKind};
-use crate::proto::types::{FileStat, FuseStatus, StatusReport, VfsOpSeries, VfsOpsStatus};
+use crate::proto::types::{
+    FileStat, FuseStatus, SnapSchedReport, SnapSchedStatus, StatusReport, VfsOpSeries, VfsOpsStatus,
+};
 use crate::proto::{ControlError, ErrorKind};
 use crate::server::{
     dispatch_in_process, dispatch_stream_in_process, DispatchOptions, Router, StreamItem,
@@ -410,22 +413,41 @@ fn content_disposition(file_name: &str) -> HeaderValue {
         .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""))
 }
 
+/// `snapshot.sched.status` for the per-root gauges. `None` when the call
+/// fails (a node without the method, a replica error): the scrape still
+/// serves every other metric, without the per-root series.
+async fn sched_status(router: &Router, principal: &Principal) -> Option<SnapSchedReport> {
+    let value = dispatch_in_process(
+        router,
+        principal,
+        <SnapshotSchedStatus as crate::methods::Method>::NAME,
+        serde_json::json!({}),
+    )
+    .await
+    .ok()?;
+    serde_json::from_value(value).ok()
+}
+
 async fn metrics(State(state): State<AppState>) -> HttpResponse {
     match node_status(&state.router, &state.principal).await {
-        Ok(status) => (
-            [(
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            )],
-            render_metrics(&status),
-        )
-            .into_response(),
+        Ok(status) => {
+            let sched = sched_status(&state.router, &state.principal).await;
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                render_metrics(&status, sched.as_ref()),
+            )
+                .into_response()
+        }
         Err(error) => error_response(error),
     }
 }
 
-/// The Prometheus text `/metrics` serves for `status`.
-pub fn render_metrics(status: &StatusReport) -> String {
+/// The Prometheus text `/metrics` serves for `status`, and with `sched`
+/// (`snapshot.sched.status`) the per-policy-root snapshot gauges.
+pub fn render_metrics(status: &StatusReport, sched: Option<&SnapSchedReport>) -> String {
     let mut output = String::new();
     macro_rules! gauge {
         ($name:literal, $help:literal, $value:expr) => {
@@ -839,6 +861,7 @@ pub fn render_metrics(status: &StatusReport) -> String {
         "Prune passes refused because the replica was too stale.",
         status.prune.refused_lag
     );
+    render_snapsched(&mut output, &status.snapsched, sched);
     gauge!(
         "constellation_snapacct_building",
         "Whether the space-accounting index is behind the snapshot rows (queries answer building).",
@@ -897,6 +920,167 @@ pub fn render_metrics(status: &StatusReport) -> String {
     render_vfs_ops(&mut output, &status.vfs_ops);
     render_fuse(&mut output, &status.fuse);
     output
+}
+
+/// Plan 32 Step 9's scheduler metrics: `constellation_snapsched_*` from
+/// `node.status`'s `snapsched` (states as gauges, event counts as `_total`
+/// counters; node-local, so only the leader's `created` moves), and from
+/// `snapshot.sched.status` one series per policy root of
+/// `constellation_snapsched_root_snapshots` and
+/// `constellation_snapsched_root_used_bytes`. Roots are labelled by
+/// `root_ino` only, never by path: paths are unbounded cardinality and may
+/// be sensitive. `root_used_bytes` is left out for a root while the
+/// accounting index is not current (it is a peek, never a build).
+fn render_snapsched(output: &mut String, s: &SnapSchedStatus, sched: Option<&SnapSchedReport>) {
+    use std::fmt::Write;
+    macro_rules! metric {
+        ($kind:literal, $name:literal, $help:literal, $value:expr) => {
+            output.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+            output.push_str(concat!("# TYPE ", $name, " ", $kind, "\n"));
+            let _ = writeln!(output, concat!($name, " {}"), $value);
+        };
+    }
+    metric!(
+        "gauge",
+        "constellation_snapsched_leader",
+        "Whether this node holds the snapshot scheduler's singleton lease.",
+        u8::from(s.leader)
+    );
+    metric!(
+        "gauge",
+        "constellation_snapsched_roots",
+        "Snapshot policy roots at the last tick.",
+        s.roots
+    );
+    metric!(
+        "gauge",
+        "constellation_snapsched_paused_roots",
+        "Snapshot policy roots paused at the last tick.",
+        s.paused_roots
+    );
+    metric!(
+        "gauge",
+        "constellation_snapsched_unparseable_roots",
+        "Snapshot policy roots whose policy failed to parse (nothing created, nothing expired).",
+        s.unparseable_roots
+    );
+    metric!(
+        "gauge",
+        "constellation_snapsched_capped_roots",
+        "Snapshot policy roots at the per-root auto snapshot cap (no more are created).",
+        s.capped_roots
+    );
+    metric!(
+        "gauge",
+        "constellation_snapsched_orphaned_snapshots",
+        "Auto snapshots whose root carries no parseable policy any more (kept, never expired automatically).",
+        s.orphaned_snapshots
+    );
+    metric!(
+        "gauge",
+        "constellation_snapsched_last_create_unix_ms",
+        "When this node last created an auto snapshot, Unix milliseconds (0: never).",
+        s.last_create_unix_ms
+    );
+    metric!(
+        "gauge",
+        "constellation_snapsched_last_refused_unix_ms",
+        "When this node's scheduler last refused a tick (stale replica, node state), Unix milliseconds (0: never).",
+        s.last_refused_unix_ms
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_ticks_total",
+        "Snapshot scheduler ticks run on this node.",
+        s.ticks
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_created_total",
+        "Auto snapshots this node created.",
+        s.created
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_skipped_empty_total",
+        "Due auto snapshots skipped because nothing changed (skip-empty).",
+        s.skipped_empty
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_create_failed_total",
+        "Auto snapshot creations that failed.",
+        s.create_failed
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_expired_total",
+        "Auto snapshots this node expired.",
+        s.expired
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_skipped_reverify_total",
+        "Expiry victims whose row changed before the delete (held, gone, re-owned), not deleted.",
+        s.skipped_reverify
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_skipped_grace_total",
+        "Expiry victims kept by the grace window after a policy change.",
+        s.skipped_grace
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_budget_expired_total",
+        "Auto snapshots expired by a policy space budget (budget=, plan 32 Step 8).",
+        s.budget_expired
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_budget_stale_total",
+        "Space-budget evaluations skipped because the accounting index was not fresh.",
+        s.budget_stale
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_refused_lag_total",
+        "Scheduler ticks refused because the replica was too stale.",
+        s.refused_lag
+    );
+    metric!(
+        "counter",
+        "constellation_snapsched_refused_state_total",
+        "Scheduler ticks refused for node state (departed, frozen epoch, read-only).",
+        s.refused_state
+    );
+    let Some(sched) = sched else {
+        return;
+    };
+    output.push_str(
+        "# HELP constellation_snapsched_root_snapshots Live auto snapshots of a policy root (held ones included).\n\
+         # TYPE constellation_snapsched_root_snapshots gauge\n",
+    );
+    for root in &sched.roots {
+        let _ = writeln!(
+            output,
+            "constellation_snapsched_root_snapshots{{root_ino=\"{}\"}} {}",
+            root.ino, root.auto_snapshots
+        );
+    }
+    output.push_str(
+        "# HELP constellation_snapsched_root_used_bytes Sum of USED over every snapshot of a policy root's directory (not what deleting them frees).\n\
+         # TYPE constellation_snapsched_root_used_bytes gauge\n",
+    );
+    for root in &sched.roots {
+        if let Some(used) = root.used_bytes {
+            let _ = writeln!(
+                output,
+                "constellation_snapsched_root_used_bytes{{root_ino=\"{}\"}} {used}",
+                root.ino
+            );
+        }
+    }
 }
 
 /// A Prometheus label value: backslash, quote and newline escaped.
@@ -1261,6 +1445,121 @@ mod tests {
         ] {
             assert!(out.lines().any(|l| l == line), "{line}\n{out}");
         }
+    }
+
+    #[test]
+    fn snapsched_metrics_render_gauges_counters_and_per_root_series_by_ino() {
+        use crate::proto::types::SnapSchedRootState;
+        let stats = SnapSchedStatus {
+            ticks: 12,
+            leader: true,
+            roots: 2,
+            paused_roots: 1,
+            unparseable_roots: 1,
+            capped_roots: 0,
+            orphaned_snapshots: 4,
+            created: 9,
+            skipped_empty: 3,
+            create_failed: 2,
+            expired: 5,
+            skipped_reverify: 1,
+            skipped_grace: 6,
+            budget_expired: 0,
+            budget_stale: 0,
+            refused_lag: 7,
+            refused_state: 8,
+            last_refused_unix_ms: 1_789_999_000_000,
+            now_unix_ms: 1_790_000_000_000,
+            last_create_unix_ms: 1_790_000_000_000,
+            last_error: Some("s3 down".into()),
+            last_parse_error: None,
+        };
+        let report = SnapSchedReport {
+            roots: vec![
+                SnapSchedRootState {
+                    ino: 42,
+                    path: Some("/secret \"project\"".into()),
+                    auto_snapshots: 17,
+                    used_bytes: Some(4096),
+                    ..Default::default()
+                },
+                // The accounting index is not current: no used series.
+                SnapSchedRootState {
+                    ino: 7,
+                    path: Some("/other".into()),
+                    auto_snapshots: 0,
+                    used_bytes: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut out = String::new();
+        render_snapsched(&mut out, &stats, Some(&report));
+        for line in [
+            "# TYPE constellation_snapsched_leader gauge",
+            "constellation_snapsched_leader 1",
+            "# TYPE constellation_snapsched_roots gauge",
+            "constellation_snapsched_roots 2",
+            "constellation_snapsched_paused_roots 1",
+            "constellation_snapsched_unparseable_roots 1",
+            "constellation_snapsched_capped_roots 0",
+            "constellation_snapsched_orphaned_snapshots 4",
+            "constellation_snapsched_last_create_unix_ms 1790000000000",
+            "constellation_snapsched_last_refused_unix_ms 1789999000000",
+            "# TYPE constellation_snapsched_ticks_total counter",
+            "constellation_snapsched_ticks_total 12",
+            "# TYPE constellation_snapsched_created_total counter",
+            "constellation_snapsched_created_total 9",
+            "constellation_snapsched_skipped_empty_total 3",
+            "constellation_snapsched_create_failed_total 2",
+            "constellation_snapsched_expired_total 5",
+            "constellation_snapsched_skipped_reverify_total 1",
+            "constellation_snapsched_skipped_grace_total 6",
+            "constellation_snapsched_budget_expired_total 0",
+            "constellation_snapsched_budget_stale_total 0",
+            "# TYPE constellation_snapsched_refused_lag_total counter",
+            "constellation_snapsched_refused_lag_total 7",
+            "constellation_snapsched_refused_state_total 8",
+            "# TYPE constellation_snapsched_root_snapshots gauge",
+            "constellation_snapsched_root_snapshots{root_ino=\"42\"} 17",
+            "constellation_snapsched_root_snapshots{root_ino=\"7\"} 0",
+            "# TYPE constellation_snapsched_root_used_bytes gauge",
+            "constellation_snapsched_root_used_bytes{root_ino=\"42\"} 4096",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line}\n{out}");
+        }
+        assert!(
+            !out.contains("root_used_bytes{root_ino=\"7\"}"),
+            "a root without a current figure has no used series:\n{out}"
+        );
+        // Labelled by inode only: no path (nor the error text) ever leaks.
+        assert!(!out.contains("secret") && !out.contains("/other"), "{out}");
+        assert!(!out.contains("s3 down"), "{out}");
+        // Every sample line has its HELP and TYPE, exactly once.
+        let names: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.split(['{', ' ']).next().unwrap())
+            .collect();
+        for name in &names {
+            assert_eq!(
+                out.matches(&format!("# TYPE {name} ")).count(),
+                1,
+                "{name}\n{out}"
+            );
+            assert_eq!(
+                out.matches(&format!("# HELP {name} ")).count(),
+                1,
+                "{name}\n{out}"
+            );
+        }
+
+        // Without `snapshot.sched.status`, the node-wide series alone.
+        let mut alone = String::new();
+        render_snapsched(&mut alone, &stats, None);
+        assert!(alone.contains("constellation_snapsched_created_total 9"));
+        assert!(!alone.contains("root_snapshots"), "{alone}");
     }
 
     #[test]
