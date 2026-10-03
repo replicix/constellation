@@ -1116,6 +1116,7 @@ pub trait PeerService: Send + Sync + 'static {
                 gen: 0,
                 own_chunks: 0,
                 own_inos: Vec::new(),
+                own_rows: Vec::new(),
             }
         })
     }

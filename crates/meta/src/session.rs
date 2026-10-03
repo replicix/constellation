@@ -501,6 +501,76 @@ struct Inner {
     /// it names are acknowledged rows of the predecessor that the
     /// successor ships next (see [`SessionState::owe`]).
     owed: Option<JournalPos>,
+    /// Chunk metered-own-rows: rows of `applied`'s tenure applied here
+    /// above its journal seq — shipped ahead of a row still deferred on
+    /// the holder, which keeps every segment's `through` below it (the
+    /// segments' `rows`). With `excused`, a watermark is reached past a
+    /// deferred row of this node's own.
+    ahead: Option<(u64, RowRanges)>,
+    /// Chunk metered-own-rows: rows of `observed`'s tenure that it does
+    /// not owe — this node's own transactions, unshipped on the holder,
+    /// whose effects this replica carries (`OwnRows::settle`). Every
+    /// other row through it is owed as before.
+    excused: std::collections::BTreeSet<u64>,
+}
+
+/// Disjoint inclusive journal seq ranges, `start -> end`.
+#[derive(Debug, Default, Clone)]
+struct RowRanges(std::collections::BTreeMap<u64, u64>);
+
+/// Most ranges [`Inner::ahead`] keeps; past it the lowest are dropped
+/// (a read then waits for the log, as without them).
+const AHEAD_RANGES_CAP: usize = 4096;
+/// Most rows [`Inner::excused`] keeps; past it none are (likewise).
+const EXCUSED_CAP: usize = 4096;
+
+impl RowRanges {
+    fn insert(&mut self, row: u64) {
+        if self.end_covering(row).is_some() {
+            return;
+        }
+        let mut start = row;
+        let mut end = row;
+        if let Some((&s, &e)) = self.0.range(..row).next_back() {
+            if e + 1 == row {
+                start = s;
+            }
+        }
+        if let Some(&e) = self.0.get(&(row + 1)) {
+            self.0.remove(&(row + 1));
+            end = e;
+        }
+        self.0.insert(start, end);
+        while self.0.len() > AHEAD_RANGES_CAP {
+            if let Some((s, e)) = self.0.pop_first() {
+                tracing::debug!(
+                    first = s,
+                    last = e,
+                    "rows applied ahead past the cap: forgotten (a read waits for them to ship)"
+                );
+            }
+        }
+    }
+
+    /// The end of the range holding `row`, if any.
+    fn end_covering(&self, row: u64) -> Option<u64> {
+        self.0
+            .range(..=row)
+            .next_back()
+            .filter(|(_, e)| **e >= row)
+            .map(|(_, e)| *e)
+    }
+
+    /// Forget everything at or below `row`.
+    fn prune_through(&mut self, row: u64) {
+        let keep = self.0.split_off(&(row + 1));
+        let straddling = self.0.iter().next_back().filter(|(_, e)| **e > row);
+        let mut rest = keep;
+        if let Some((_, e)) = straddling {
+            rest.insert(row + 1, *e);
+        }
+        self.0 = rest;
+    }
 }
 
 impl Inner {
@@ -563,6 +633,56 @@ impl Inner {
                 // generation's `(gen, 0)`) is reached by everyone.
                 i == 0 || self.voided.contains(&g) || self.streams.get(&g).is_some_and(|m| *m >= i)
             })
+    }
+
+    /// Whether `observed` is reached: [`Self::reaches`], or, with rows
+    /// excused, every row of its tenure through it that is not excused is
+    /// here — at or below the applied (or streamed) journal seq, or
+    /// applied out of order above it (`ahead`) — with its log and stream
+    /// parts reached as ever.
+    fn reaches_observed(&self) -> bool {
+        let target = self.observed;
+        if self.reaches(&target) {
+            return true;
+        }
+        let Some(p) = target.pending else {
+            return false;
+        };
+        if self.excused.is_empty() {
+            return false;
+        }
+        let owed = self
+            .owed
+            .is_some_and(|marker| p.epoch < marker.epoch && self.applied <= Some(marker));
+        if owed
+            || !self.reaches(&Position {
+                pending: None,
+                ..target
+            })
+        {
+            return false;
+        }
+        let Some(base) = self.applied.max(self.seeded).max(self.streamed) else {
+            return false;
+        };
+        if base.epoch != p.epoch {
+            return false;
+        }
+        let ahead = match &self.ahead {
+            Some((e, rows)) if *e == p.epoch => Some(rows),
+            _ => None,
+        };
+        let mut next = base.jseq + 1;
+        while next <= p.jseq {
+            if self.excused.contains(&next) {
+                next += 1;
+            } else if let Some(end) = ahead.and_then(|a| a.end_covering(next)) {
+                next = end + 1;
+            } else {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -705,7 +825,7 @@ impl SessionState {
             return false;
         };
         let observed = g.observed;
-        if g.reaches(&observed) {
+        if g.reaches_observed() {
             g.observed_since = None;
             return false;
         }
@@ -716,6 +836,7 @@ impl SessionState {
         let applied = g.applied_position();
         g.observed = applied;
         g.observed_since = None;
+        g.excused.clear();
         drop(g);
         self.stats.lock().unwrap().abandoned += 1;
         tracing::warn!(
@@ -1012,10 +1133,29 @@ impl SessionState {
     /// `through` (a fenced segment passes `None`: its journal position
     /// took no effect).
     pub fn advance(&self, seq: u64, through: Option<JournalPos>) {
+        self.advance_rows(seq, through, &[]);
+    }
+
+    /// [`Self::advance`] for a segment carrying journal `rows` of
+    /// `through`'s tenure (chunk metered-own-rows: those above the applied
+    /// journal seq are kept, see `Inner::ahead`).
+    pub fn advance_rows(&self, seq: u64, through: Option<JournalPos>, rows: &[u64]) {
         let mut g = self.inner.lock().unwrap();
         g.applied_seq = g.applied_seq.max(seq);
         if through > g.applied {
             g.applied = through;
+        }
+        if let Some(a) = g.applied {
+            if g.ahead.as_ref().is_none_or(|(e, _)| *e != a.epoch) {
+                g.ahead = Some((a.epoch, RowRanges::default()));
+            }
+            let (_, ahead) = g.ahead.as_mut().expect("set above");
+            if through.is_some_and(|t| t.epoch == a.epoch) {
+                for row in rows.iter().filter(|r| **r > a.jseq) {
+                    ahead.insert(*row);
+                }
+            }
+            ahead.prune_through(a.jseq);
         }
         let applied = g.applied_position();
         g.covering.retain(|(_, p)| !applied.dominates(p));
@@ -1042,6 +1182,17 @@ impl SessionState {
 
     /// A reply whose effects are not installed here observed `pos`.
     pub fn raise_observed(&self, pos: Position) {
+        self.raise_observed_excusing(pos, &[]);
+    }
+
+    /// [`Self::raise_observed`], except that the journal rows in
+    /// `excused` (inclusive ranges of `pos`'s tenure) are not owed: this
+    /// node's own transactions, still unshipped on the holder, whose
+    /// effects this replica carries (chunk metered-own-rows,
+    /// `OwnRows::settle`). Joined with what `observed` already excuses: a
+    /// row stays excused only if every observation whose position covers
+    /// it excuses it.
+    pub fn raise_observed_excusing(&self, pos: Position, excused: &[(u64, u64)]) {
         let mut g = self.inner.lock().unwrap();
         // Past the cap even after dropping what is reached (nine
         // generations owed at once), the newest are kept: the oldest
@@ -1064,12 +1215,43 @@ impl SessionState {
                 .with_streams_wire(&kept)
             }
         };
+        let fresh: std::collections::BTreeSet<u64> = excused
+            .iter()
+            .flat_map(|(first, last)| *first..=*last)
+            .take(EXCUSED_CAP + 1)
+            .collect();
+        let old = std::mem::take(&mut g.excused);
+        let observations = [(g.observed.pending, &old), (pos.pending, &fresh)];
+        let mut joined = std::collections::BTreeSet::new();
+        if let Some(e) = next.pending.map(|p| p.epoch) {
+            // A row not excused by an observation that covers it is owed.
+            let excuses = |row: u64| {
+                observations.iter().all(|(p, x)| match p {
+                    Some(p) if p.epoch == e => row > p.jseq || x.contains(&row),
+                    _ => true,
+                })
+            };
+            for (p, x) in &observations {
+                if p.is_some_and(|p| p.epoch == e) {
+                    joined.extend(x.iter().copied().filter(|r| excuses(*r)));
+                }
+            }
+        }
+        if joined.len() <= EXCUSED_CAP {
+            g.excused = joined;
+        }
         if next != g.observed {
             g.observed = next;
             g.observed_since = Some(Instant::now());
             drop(g);
             self.stats.lock().unwrap().raised += 1;
         }
+    }
+
+    /// Whether this replica reaches the `observed` watermark (with its
+    /// excused rows): a read waits for nothing it owes.
+    pub fn reaches_observed(&self) -> bool {
+        self.inner.lock().unwrap().reaches_observed()
     }
 
     /// Speculation installed for `keys` from a reply at `pos`.
@@ -1143,6 +1325,7 @@ impl SessionState {
         let mut g = self.inner.lock().unwrap();
         g.observed = Position::ZERO;
         g.observed_since = None;
+        g.excused.clear();
         g.covering.clear();
     }
 
@@ -1163,13 +1346,20 @@ impl SessionState {
             return None;
         }
         let g = self.inner.lock().unwrap();
-        // Both watermarks, joined when what they still owe fits the cap,
-        // else each on its own (never one dropped: see `join_owed`).
-        let targets: Vec<Position> = match g.join_owed(&g.observed, floor) {
-            Some(t) => vec![t],
-            None => vec![g.observed, *floor],
-        };
-        if targets.iter().all(|t| g.reaches(t)) {
+        // Both watermarks, each on its own (never one dropped: see
+        // `join_owed`); `observed` with the rows it excuses. A shadow
+        // must dominate what each still owes: the streams the replica
+        // already reaches are stripped (a root reply's position names
+        // none), unless what is owed overflows the cap.
+        let targets: Vec<Position> = [
+            (g.reaches_observed(), g.observed),
+            (g.reaches(floor), *floor),
+        ]
+        .into_iter()
+        .filter(|(reached, _)| !reached)
+        .map(|(_, t)| g.join_owed(&t, &Position::ZERO).unwrap_or(t))
+        .collect();
+        if targets.is_empty() {
             return Some(SessionWait::Fast);
         }
         let covered = keys.iter().all(|k| {
@@ -1440,6 +1630,87 @@ mod tests {
         Some(JournalPos { epoch, jseq })
     }
 
+    fn at(seq: u64, epoch: u64, jseq: u64) -> Position {
+        Position {
+            seq,
+            pending: jp(epoch, jseq),
+            streams: Streams::NONE,
+        }
+    }
+
+    /// Chunk metered-own-rows: this node's own close at rows 12–13 is
+    /// deferred on the holder (its chunk held here on a metered network),
+    /// so every segment's `through` stops at 11; rows 14–18 ship ahead of
+    /// it. A refusal observed the holder at 18. With 12–13 excused (the
+    /// close's effect is here), the watermark is reached once 14–18 are
+    /// applied, not before; without the excuse, only once 12–13 ship.
+    #[test]
+    fn an_observation_excusing_own_rows_is_reached_by_the_rows_shipped_around_them() {
+        let s = SessionState::default();
+        s.advance_rows(5, jp(1, 11), &[10, 11]);
+        s.raise_observed_excusing(at(5, 1, 18), &[(12, 13)]);
+        assert!(!s.reaches_observed(), "14-18 not applied yet");
+        s.advance_rows(6, jp(1, 11), &[14, 15]);
+        assert!(!s.reaches_observed(), "16-18 missing");
+        s.advance_rows(7, jp(1, 11), &[16, 17, 18]);
+        assert!(s.reaches_observed(), "everything but this node's own rows");
+        // A plain observation of the same position owes 12–13 again.
+        s.raise_observed(at(7, 1, 18));
+        assert!(!s.reaches_observed(), "12-13 are owed now");
+        s.advance_rows(8, jp(1, 18), &[12, 13]);
+        assert!(s.reaches_observed());
+    }
+
+    /// The join: a row stays excused only while every observation
+    /// covering it excuses it; one past the earlier position keeps the
+    /// later excuse; a newer tenure's position drops the older excuses.
+    #[test]
+    fn excused_rows_join_per_covering_observation() {
+        let s = SessionState::default();
+        s.advance_rows(5, jp(1, 11), &[]);
+        s.raise_observed_excusing(at(5, 1, 14), &[(12, 13)]);
+        s.raise_observed_excusing(at(5, 1, 20), &[(12, 13), (19, 20)]);
+        s.advance_rows(6, jp(1, 11), &[14, 15, 16, 17, 18]);
+        assert!(s.reaches_observed(), "12-13 and 19-20 excused by both");
+        // An observation at 16 that excuses nothing owes 12-13; 19-20
+        // lie past it and stay excused.
+        s.raise_observed(at(6, 1, 16));
+        assert!(!s.reaches_observed());
+        s.advance_rows(7, jp(1, 18), &[12, 13]);
+        assert!(s.reaches_observed(), "19-20 still excused");
+        // Another tenure: its position is what counts.
+        s.raise_observed_excusing(at(7, 2, 3), &[(1, 3)]);
+        assert!(!s.reaches_observed(), "nothing of tenure 2 applied");
+        s.advance_rows(8, jp(2, 0), &[]);
+        assert!(s.reaches_observed(), "tenure 2's rows 1-3 are all excused");
+    }
+
+    /// Rows applied out of order are kept as ranges and forgotten once
+    /// `through` passes them; a newer tenure starts afresh.
+    #[test]
+    fn rows_ahead_of_through_are_kept_as_ranges() {
+        let mut r = RowRanges::default();
+        for row in [5, 7, 6, 9, 10, 3] {
+            r.insert(row);
+        }
+        assert_eq!(
+            r.0.iter().map(|(a, b)| (*a, *b)).collect::<Vec<_>>(),
+            vec![(3, 3), (5, 7), (9, 10)]
+        );
+        assert_eq!(r.end_covering(6), Some(7));
+        assert_eq!(r.end_covering(8), None);
+        r.prune_through(6);
+        assert_eq!(
+            r.0.iter().map(|(a, b)| (*a, *b)).collect::<Vec<_>>(),
+            vec![(7, 7), (9, 10)]
+        );
+        r.insert(8);
+        assert_eq!(
+            r.0.iter().map(|(a, b)| (*a, *b)).collect::<Vec<_>>(),
+            vec![(7, 10)]
+        );
+    }
+
     /// EC2 campaign 7 (`git-under-flock-causal`, reader `b` after its
     /// remount): a lock grant's floor named generation 1 at index 816,
     /// ended before the restart; the fresh session state knew neither
@@ -1618,6 +1889,33 @@ mod tests {
             s.note_stream(g, 1);
         }
         assert!(s.ready(&k, 0, false, &floor));
+    }
+
+    /// Review of chunk metered-own-rows: `observed` keeps a stream entry
+    /// (a delegate's refusal) the replica has since reached, and a root
+    /// refusal raised its pending part past the applied rows. A shadow
+    /// from a root reply (its position names no streams) at a later
+    /// position covers the key: the stream it does not name is reached
+    /// and owed no more, so the read is covered, not made to wait.
+    #[test]
+    fn a_covered_read_ignores_streams_the_replica_already_reaches() {
+        let s = SessionState::default();
+        let mut delegated = Position::ZERO;
+        assert!(delegated.streams.raise(4, 3));
+        s.raise_observed(delegated);
+        s.raise_observed(at(2, 1, 7));
+        s.note_stream(4, 3);
+        let k = [ReadKey::Ino(9)];
+        s.note_covering(
+            KeySet {
+                dentries: Vec::new(),
+                inos: vec![9],
+            },
+            at(2, 1, 8),
+        );
+        assert!(s.ready(&k, 2, false, &Position::ZERO), "covered");
+        // An uncovered key still waits for the pending rows.
+        assert!(!s.ready(&[ReadKey::Ino(10)], 2, false, &Position::ZERO));
     }
 
     #[test]

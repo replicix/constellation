@@ -591,6 +591,7 @@ impl Core {
                             position: Position::ZERO,
                             gen: 0,
                             own_chunks: OwnChunks::None,
+                            own_rows: None,
                         },
                     });
                 }
@@ -626,6 +627,7 @@ impl Core {
                             position: Position::ZERO,
                             gen: 0,
                             own_chunks: OwnChunks::None,
+                            own_rows: None,
                         },
                     });
                 }
@@ -913,6 +915,7 @@ impl Core {
                                 position: Position::ZERO,
                                 gen: 0,
                                 own_chunks: OwnChunks::None,
+                                own_rows: None,
                             },
                         });
                     }
@@ -1136,6 +1139,7 @@ impl Core {
                 position: Position::ZERO,
                 gen: 0,
                 own_chunks,
+                own_rows: None,
             },
         });
     }
@@ -1183,7 +1187,8 @@ impl Core {
                 let blockers = match blockers {
                     Some((at, kept)) if now < at.plus(refresh) => kept.clone(),
                     _ => {
-                        let b = self.own_record_blockers(*to, *rid, outcome, *gen, replica);
+                        let upto = position.pending.map(|p| p.jseq);
+                        let b = self.own_record_blockers(*to, *rid, outcome, *gen, upto, replica);
                         fresh = Some(b.clone());
                         b
                     }
@@ -1249,6 +1254,7 @@ impl Core {
                     position: Position::ZERO,
                     gen: 0,
                     own_chunks,
+                    own_rows: None,
                 },
             });
         }
@@ -1464,8 +1470,8 @@ impl Core {
                         self.cancel_timer(t, out);
                     }
                     if let Some(req) = req {
-                        let own_chunks =
-                            self.own_chunks_for(to, rid, &outcome, (gen, &position), replica);
+                        let (own_chunks, own_rows) =
+                            self.own_reply_parts(to, rid, &outcome, (gen, &position), replica);
                         out.push(Action::Send {
                             to,
                             msg: PeerMsg::MutateReply {
@@ -1475,6 +1481,7 @@ impl Core {
                                 position,
                                 gen,
                                 own_chunks,
+                                own_rows,
                             },
                         });
                     }

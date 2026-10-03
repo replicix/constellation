@@ -471,12 +471,26 @@ What `back` gives up, and what it keeps:
   A later op whose answer the node has to catch up with (a refusal, or
   an op that completes through the log) makes every later read wait
   until the node's log reaches the sequencer's state at that op, which
-  includes the held close. So the answer also names the files of every
-  earlier op of the node that the sequencer still holds back, and the
-  node uploads them, again only when nothing else would bring those
-  records to it first. Before, such reads waited out
-  `CONSTELLATION_SESSION_WAIT_MS` again and again until the wait was
-  abandoned (4–10 s `open`, `rename` and `chmod` calls on AWS).
+  includes the held close. The node does not wait for, or upload, the
+  rows of its own ops that its replica already carries: the answer names
+  which of the sequencer's unshipped transactions through that state are
+  the node's own, and the node excuses those whose effects it has (the
+  close it installed when it was answered; a refusal, which changes
+  nothing). Its reads then wait only for everything else through that
+  state: another node's op that ships on its own arrives with the log;
+  one that the sequencer holds back behind this node's chunks (another
+  node's `chmod` of the held file) is named in the answer, and the node
+  uploads those chunks, again only when nothing else would bring those
+  records to it first. So does an op of its own it does not have yet
+  (the op itself, waiting for the log; an earlier incarnation's). Before,
+  such reads waited out `CONSTELLATION_SESSION_WAIT_MS` again and again
+  until the wait was abandoned (4–10 s `open`, `rename` and `chmod`
+  calls on AWS); and for a while after that fix every such answer made
+  the node upload the held close, which defeated the hold on a metered
+  network. A stranded op the node replays after a takeover uploads its
+  chunks at once even when the sequencer says its stream carries the
+  transaction: the stream may have carried it before the node's recovery
+  rolled it back, and it does not resend.
 - **Correctness is unchanged**: rebases, exactly-once forwarding,
   conflict detection, locks (a lock's release flushes through) and
   failover behave as under `through`.

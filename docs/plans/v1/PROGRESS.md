@@ -37077,3 +37077,407 @@ zombie stayed until I aborted the run's leftover b/c FUSE connections through
 - [x] `tests/webui-headless.sh` opens the editor, applies the Standard preset and asserts lanes and ticks (PASS).
 - [x] fmt, clippy, `cargo test --workspace`, smoke, integration (shared floci), release build, webui-headless PASS, compliance 8798/8798.
 - [ ] Full harness matrix all PASSED: 200 of 205 PASSED (187 in the two shards, 6 more when rerun alone, the 7 root-only SKIPs passed as root). `web-ui-smoke` and the root-only scenarios pass. `distant-bigfile-stable`, `sqlite-first-touch-latency`, `fuse-inval-storm` and `transport-lock-wait-budget` fail identically on a clean `310d23b` build (pre-existing). `visibility-after-burst` passed on main once but failed on this build under load 80–275, on identical product code (load-sensitive thresholds).
+
+## Fix: keep metered savings — a node does not wait, nor upload, for its own deferred rows (`metered-own-rows`)
+
+Follow-ups of `e2c5b7d` (close-stall-followup). That chunk made the
+holder name the requester's held chunks for everything up to an op's
+position, and the requester upload them whenever it observed that
+position. In unbacked mode a non-owner therefore uploaded every held
+close on a metered network (`pending 0`, 4 chunk PUTs): the hold was
+defeated in practice.
+
+### 1. Coordinator decision: don't upload just to wait for your own rows
+
+**When it is safe.** A requester A observes a position P of holder B (a
+refusal, an `Exists` without a hint, an op that completed through the
+log): every later read waits until A's applied log reaches P. P names
+B's log through `P.seq` plus B's journal through `P.jseq`. A row of that
+journal is in one of three states at reply time:
+- shipped already: in a segment at or below `P.seq`, which A has once it
+  applied `P.seq`;
+- unshipped and another node's (or B's own): A must have it before it
+  reads. One that ships on its own arrives with the log. One deferred
+  behind A's chunks (another node's `chmod` of A's held file) arrives
+  only after A's upload: A uploads for it;
+- unshipped and A's own transaction. If A's replica carries its effect
+  (a shadow still outstanding, or the log delivered it) or it has none (a
+  refusal), A does not need it. The shadow is the same records, installed
+  on a base A had, and nothing B ships after it can touch its keys
+  without being deferred behind it (the ship plan's key dependence). So
+  A's state equals B's at P once everything else through P is here. A
+  transaction of A's that A does not carry (the op itself while it awaits
+  the log, an earlier incarnation's) is waited for, and what it waits for
+  is uploaded.
+
+So A may proceed from its local state when only its own carried rows are
+missing. Any other node's row is still waited for, including one
+interleaved below P (shipped ahead of A's deferred close, or still
+unshipped).
+
+**How.**
+- Holder: `Meta::remote_blockers` takes the reply's position (`upto`,
+  `P.jseq`). With it, it also returns `own: OwnRows`: A's own unshipped
+  transactions through P (rid, journal span, whether its rows change
+  anything, what each waits for of A's chunks) and `others`, the blame of
+  every other held or deferred transaction through P. At most
+  `OWN_ROWS_CAP` (64) transactions are listed; with more, `None`. A
+  journaled refusal records its rid only in its `Refused` row
+  (`held::tx_rid`). The reply carries it as
+  `PeerMsg::MutateReply::own_rows` (P2P `Payload::MutateReply::own_rows`,
+  postcard; the wire format changes in place, no ALPN bump).
+- Requester: `Core::settle_own_rows` (`OwnRows::settle`): a transaction
+  with no effect, or whose effect `Meta::effects_installed` finds
+  (`completed`, a live shadow, a streamed transaction completing it), is
+  *excused*. The upload is narrowed to `others` plus what every
+  non-excused transaction waits for (`None` when empty). The excused rows
+  are kept with the op (`ClientOp::excused`) and given to
+  `SessionState::raise_observed_excusing`, both at once and when an
+  `AwaitingLog` op completes through the log.
+- Session: `observed` gets `excused`, a set of journal rows of its
+  tenure. A row stays excused only while every observation covering it
+  excuses it, so a plain raise owes rows again. The applied side keeps
+  `ahead`: the rows of the applied tenure that segments carried above
+  `through` (their envelope's `rows`; ranges, at most 4096), because a
+  deferred row keeps every segment's `through` below it. `observed` is
+  reached when it is reached as before, or when its log and stream parts
+  are reached and every row of its tenure between the applied (or
+  streamed) journal seq and `P.jseq` is ahead or excused
+  (`Inner::reaches_observed`). Owed takeover tails (`owe`) still block.
+  Journal seqs have no gaps except rows a `drop-held` removes; such a gap
+  makes the excuse fail, which costs a wait as before, never a stale
+  read.
+- `observe_reply` uploads only while `reaches_observed()` is false (rows
+  streamed or excused need nothing).
+
+Tests: `own_chunks::a_position_behind_only_own_rows_is_excused` covers
+the close and refusal excused (no upload, `reaches_observed`). Node 3's
+create interleaved below P is waited for without an upload until its
+segment, shipped ahead of the close, arrives; node 3's chmod deferred
+behind the close makes node 2 upload `g`. Without `settle_own_rows` it
+uploads `g` (checked). Session tests:
+`an_observation_excusing_own_rows_is_reached_by_the_rows_shipped_around_them`,
+`excused_rows_join_per_covering_observation`,
+`rows_ahead_of_through_are_kept_as_ranges`.
+
+### 2. The dedup answer skipped wrongly
+
+The base-covered skip (`installs`) now needs a fresh execution
+(`holder_execute`'s `executed`). The scenario: node 2's create `x` is
+accepted and its reply lost. Node 1 ships it, and its journal empties,
+which clears the unshipped key set. Node 2's close of `g` is then
+answered at once and deferred. Node 2's forward of `x` times out and is
+sent again. Node 1 answers from the dedup on a base node 2 has. Node 2
+has `x` from the log, so it installs nothing and observes the position
+behind the close. With the skip there was no `own_chunks` and no
+`own_rows`, and node 2's reads waited until the watermark's 10 s TTL.
+Test: `own_chunks::a_dedup_answer_still_says_what_its_position_waits_for`
+fails with the skip on a dedup answer (checked). The path needs the
+holder's journal to have emptied between the op and the close. While a
+deferred row stays unshipped, the unshipped key set is never cleared,
+so the base is `None` anyway.
+
+### 3. Refusal walk cost: the blame walk is kept per forwarder
+
+`held::plan` is now a resumable `Walk` (`Walk::step` classifies one
+transaction; `plan` loops it, so the ship rule has one statement).
+`held::blame_walk` keeps, per forwarding node, a `BlameCache`: the walk's
+state, the last journal seq walked, and every held, deferred or node-own
+transaction with its blame. It resumes from where the journal grew. It
+is valid while the pending, poisoned and node's remote rows equal the
+ones it was computed from, and while every held or deferred transaction
+it walked is still in the journal with the same capture. A ship-class
+transaction that leaves changes nothing: it taints and blames nothing.
+The node's own ship-class transactions that left are dropped from the
+list. Journal seqs only grow, so nothing appears before what was walked.
+The walk reads only `(through, upto]` (`transactions_between`). The
+property test now also runs the cached walk after every step (through
+half the tip and the tip). It checks it against the quadratic model,
+then against a fresh walk. Dropping the pending-map check makes it fail
+(checked).
+
+Benchmark `own_chunks::cost` (release, `--ignored --nocapture`; 10,000
+unshipped transactions, node 2 with one close deferred, node 7 with
+1,000 marks; whole core step, median):
+
+| Case | close-stall-followup | Now |
+|---|---|---|
+| node 3, nothing pending, create in a shipped dir | 26 µs | 26 µs |
+| node 2, close pending, create whose base node 2 has | 27 µs | 26 µs |
+| node 2, chmod of its held file (walk needed) | 23.3 ms | 0.44 ms |
+| node 2, refusal (brief: 24.8 ms) | 24.8 ms | 0.49 ms |
+| node 2, refusal right after a pending row changed (a re-walk) | — | 15.0 ms |
+| parked `ack=s3` reply, one hold tick | 0.46 µs | 0.56 µs |
+
+The remaining ~0.45 ms is reading the pending map (1,001 rows here) and
+node 2's marks to validate the cache. A re-walk happens after each
+change to the pending, poisoned or node's rows: an ack, an enrolment, or
+the holder's own write-back.
+
+### 4. Serial post-takeover replay waits (OVH run 31)
+
+In run 31 each replay was a dedup answer (`records: []`) on a base A
+lacked, answered `Streamed`, and A's stream never brought it. The
+recovery logs show A was deposed at 37.6 s and recovered at 37.98 s
+(rolled back, 7 replays queued). B had been streaming its epoch-3
+journal, including A's re-shipped tail, since 37.4 s. A dropped or
+rolled back what it got, and B's stream does not resend what its cursor
+has passed. A first attempt made the holder answer `Upload` when the
+stream's cursor had passed the op's rows. That broke the normal backed
+case: a reply parked for the backup's acknowledgement leaves after the
+stream sent the rows, and the frame and the reply race. Backed closes
+then uploaded (2–3 per run). It was reverted. The fix is on the
+requester: an op of `Origin::Replay` answered `Streamed` while it awaits
+the log uploads at once (`on_mutate_reply`). A replay's transaction was
+rolled back here by the recovery. Replays are rare, so at worst one
+metered upload per stranded op. Client ops still trust the stream. Test:
+`own_chunks::a_replay_answered_streamed_uploads_at_once` (a replay
+uploads; the same reply to a client op arms only the safety timer).
+Without the fix the replay arms the timer (checked). Running replays
+concurrently was not done: the queue's order is the stranded ops'
+causal order.
+
+### 5. Nits
+
+- **Mark counts at open.** `Meta::verify_mark_counts` (called by
+  `Meta::open`) recounts each node's remote marks and rewrites a count
+  that disagrees (a warning per node). Counts saturate at 0, so one lost
+  increment would make a node with live marks read as clean, and the
+  holder's one-point-read answer would bring the stall back silently.
+  Test: `store::remote::tests::a_wrong_mark_count_is_rebuilt`.
+- **A failed observed-position upload is repeated.**
+  `Core::repeat_observed_upload` arms `Timer::ObservedUpload`.
+  `on_observed_upload` repeats the upload every `own_record_wait_ms`
+  while the watermark stays unreached, at most 6 times per raise
+  (`OBSERVED_UPLOAD_REPEATS`). Test:
+  `own_chunks::an_observed_upload_is_repeated_until_the_watermark_is_reached`.
+
+Status: `ack.own_rows_excused` (replies whose own rows were excused;
+control schema re-blessed).
+
+### Functions touched
+
+- meta:
+  - `held`: `plan` (split into `Walk::step`), `transactions` →
+    `transactions_between`; new `blame_walk`, `BlameCache`, `Kept`,
+    `tx_rid`, `tx_keys_and_row`; `deferral_blame` is test-only now.
+  - `remote`: `Meta::remote_blockers` (with `upto`, `own`); new
+    `Meta::verify_mark_counts`.
+  - `spec`: new `Meta::effects_installed` (one read of the live list
+    per reply).
+  - `mutate`: new `OwnRows`, `OwnTx`, `OWN_ROWS_CAP`.
+  - `session`: `Inner` (`ahead`, `excused`, `reaches_observed`),
+    `advance` → `advance_rows`, `raise_observed_excusing`,
+    `reaches_observed`, `check`, `abandon_stale_watermark`, `reset`.
+  - `Meta::open`.
+- authority:
+  - holder: `on_mutate_request` (the `installs` skip), `own_chunks_for`
+    → `own_reply_parts`, `own_record_blockers(upto)`.
+  - client: `on_mutate_reply`, new `settle_own_rows`, `observe_reply`,
+    `observe`, new `repeat_observed_upload` / `on_observed_upload`.
+  - readindex: `on_held_reply_timer`, the parked reply's release.
+  - delegate: its reply (`own_rows: None`).
+  - `Replica` (`remote_blockers(upto)`, `raise_observed_excusing`,
+    `reaches_observed`, `effects_installed`, `apply_segment` →
+    `advance_rows`).
+  - `PeerMsg::MutateReply::own_rows`, `Timer::ObservedUpload`,
+    `Stats::own_rows_excused`.
+- engine: `send` (driver), the forward reply's decode,
+  `mutate_requested` (`p2p.rs`), `SyncRequest::Mutate`'s reply type,
+  status `own_rows_excused`.
+- net: `Payload::MutateReply::own_rows` (ALPN stays `constellation/3`).
+- harness: `close_race`'s new `d/held` step; `stale_base_rename_divergence`
+  pins `CONSTELLATION_BACKUPS=0`.
+- sim (tests): `SimConfig::upload_hold_ms`, `ChunkWorld`'s hold,
+  `upload_awaited`/`upload_forced`, its pass's cache-first order, the
+  `InboxPut` pre-upload, `NodeHandle::paused`, configs `metered-shared`
+  and `metered-shared-unbacked`.
+
+### Gates (2026-10-03, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset; host load average 220–300 throughout)
+
+- `cargo fmt --all` no diff. `cargo clippy --workspace --all-targets --
+  -D warnings` clean.
+- `cargo test`, 0 failed:
+  - meta 223 + 78 in 12 integration binaries
+  - authority 190 + 4, sim 111 (11 ignored) in debug and in `--release`
+  - types, platform, vfs, fs-core, mtree, net, control,
+    upload-concurrency, frontend-fuse, chaos, csi, uploadbench: 742 in
+    35 binaries
+  - engine, constellation, harness, store-s3: 908 in 20 binaries
+  - model in `--release` 138
+- `tests/smoke.sh` PASSED. `cargo build --release --workspace` ok.
+- Harness on floci (`CONSTELLATION_HARNESS_DOCKER_PREFIX=mor`, `TMPDIR`
+  on `/var`):
+  - `writeback-close-metered-nonowner` PASSED 3/3 (seeds 2, 1, 3). The
+    new step: Unbacked and Backed upload 0, 0 PUTs, `pending 1`, excused
+    1, reads ≤ 1.7 ms. After the loop, Unbacked is at `pending 1`: that
+    is the new `d/held` file, kept held. The loop's 4 PUTs and the 2
+    probe uploads are unchanged from close-stall-followup (see below).
+    One earlier seed-1 run failed
+    in AckS3: a 10.9 s chmod. Both nodes logged 8.7 s and 10.2 s core
+    steps at the same instant, at load average 230, and a false "holder
+    silent" takeover followed (the OVH-31 pattern). With
+    `CONSTELLATION_OWN_RECORD_WAIT_MS=0` it FAILS: the close of `d/f0`
+    takes 120.7 s. With the base binary (`e2c5b7d`) the new step FAILS:
+    Unbacked uploads 1, 1 PUT, pending 0.
+  - `forwarded-mutations`, `nonowner-back-crash`,
+    `takeover-resolves-awaiting-close`, `lifecycle-metered-uploads`
+    PASSED.
+  - `session-stale-base-rename` FAILED 4/4 ("B already sees the unlink:
+    A shipped while held"). B's log shows A's unlink installed from A's
+    pre-S3 stream ("streamed transaction installed ahead of the log"),
+    which the scenario's ship hold does not stop. It fails the same way
+    on the base `e2c5b7d` built from `git archive` (1/1, same host
+    load). Pre-existing; close-stall-followup saw it once.
+- Real S3 (`writeback-close-metered-nonowner`; a patched copy of the
+  harness in `/var/tmp/mor-real` rewrites the backend to
+  `$S3_TEST_URL/mor-<t>-<unix secs>/…`, skips the floci `AWS_*`, and
+  selects modes with `MOR_MODES`; each prefix was purged by a guarded
+  tool that accepts only `mor-(aws|ovh)-<10 digits>`, 0 objects left):
+
+| Run | d/held after the refusal (Unbacked / Backed) | Unbacked: slowest close, pending, probes | Backed: slowest close, uploads | `ack=s3`: slowest close | A session timeouts, dropped watermarks |
+|---|---|---|---|---|---|
+| AWS 1 | 0 uploads, pending 1 / 0, 1 | 0.44 s, 1, chmod 22 ms, rename 23 ms | 0.36 s, 0 | 0.31 s | 0, 0 |
+| AWS 2 | 0, 1 / 0, 1 | 1.88 s, 1, 25 ms, 23 ms | 63 ms, 0 | 1.81 s | 0, 0 |
+| AWS 3 | 0, 1 / 0, 1 | 0.20 s, 1, 53 ms, 20 ms | 0.12 s, 0 | 0.43 s | 0, 0 |
+| OVH 1 | 0, 1 / 0, 1 | 1.81 s, 1, 203 ms, 203 ms | 25 ms, 0 | 2.10 s | 0, 0 |
+| OVH 2 | 0, 1 / 0, 1 | 2.69 s, 1, 203 ms, 200 ms | 0.58 s, 0 | 1.83 s | 0, 0 |
+
+Held chunks: Unbacked ends the loop at `pending 1` in every run (`d/held`
+kept held through the refusal and every later observation). Backed ends
+at `pending 5`, `ack=s3` at `pending 0` (each close waits for its
+record). The loop's Unbacked closes still upload their own chunks (4 per
+run): each was answered on a base A lacked and waits for its own record,
+which is the race being reproduced.
+
+### Open
+
+- The holder's unshipped key set (`Meta::unshipped`) is cleared only
+  when the journal empties. With one of A's closes deferred, every later
+  op of A touching a key journaled since is answered with base `None`, so
+  it awaits the log, and a close among them uploads its own record. The
+  excuse covers observations, not those acceptances. A per-key bound on
+  the unshipped rows (as `UnshippedSeqs` keeps under a durability gate)
+  would let them install at once. Left: it changes the base rule.
+- The blame cache validation reads the pending map and the node's marks
+  per answer (≈ 0.45 ms with 1,000 marks). A version counter bumped after
+  each commit that changes them would make it O(1).
+
+### Review fixes (2026-10-03, rebased on `de53bd1`)
+
+- **Must fix 1, a covered read waited for a reached stream.**
+  `SessionState::check` had replaced `join_owed(observed, floor)` with
+  the raw targets, so a shadow from a root reply (its position names no
+  streams) could never dominate an `observed` that still listed a stream
+  the replica had since reached. Each unreached target now has its
+  reached streams stripped first (`join_owed(&t, &Position::ZERO)`, the
+  raw target on overflow). Test:
+  `session::tests::a_covered_read_ignores_streams_the_replica_already_reaches`
+  (the reviewer's probe; fails before the fix, checked).
+- **Should fix 1, one live-list read per reply.** `Meta::effect_installed`
+  is now `Meta::effects_installed(&[Rid])`: point reads of `completed`,
+  then one pass over the live list for the shadows and streamed
+  `Completed` rows of all the rids. `Core::settle_own_rows` calls it once.
+- **Should fix 2, sim coverage.**
+  - `FlexTotals` and the sweep summary count `own_rows_excused`.
+    `flex_a_member_dies_with_the_only_copy_of_a_chunk_and_returns`
+    asserts it is non-zero (62 over its 40 seeds).
+  - The chunk model got a metered hold (`SimConfig::upload_hold_ms`):
+    a round's pass leaves a node's own chunk dirty until it is that old.
+    `Action::UploadAwaited`, a complete pass (barrier, flush, handoff)
+    and an `InboxPut` (as the daemon's `inbox_manifests_pending`) put it
+    up at once. Two model fixes came with it. The pass now reads the
+    disk before treating a row as remote, as the daemon reads its cache
+    first: a deposed holder's replay could mark a node's own chunk
+    remote from the deposed node, which awaited it back, a cycle the
+    instant uploads had hidden. The stall sampler skips paused nodes,
+    which cannot ship.
+  - New configs `metered-shared` (backups, as `long-backup`) and
+    `metered-shared-unbacked`: 3 nodes on the 4 shared names, reads 0.3,
+    chunk writes 0.6, a 3 s hold, random faults. A non-owner's write
+    stays deferred across other nodes' creates, unlinks, renames and
+    reads of the same names. Test
+    `metered_shared_writes_held_across_other_nodes_ops` (30 seeds each).
+  - Sweeps (release, `sweep_config`, seeds 100000..102500): 0 failing in
+    both. `metered-shared`: 28,018 replies excusing own rows, 333,598 own
+    chunks held back by a pass, 9,846 uploaded past the hold.
+    `metered-shared-unbacked`: 22,152, 292,478, 14,252. Mutation check:
+    making `reaches_observed` excuse every row (other nodes' rows
+    included) fails 20 and 61 of those seeds with monotonic-read and
+    causal-order violations. Excusing own rows whose effect is not
+    installed is not caught: such a transaction was rolled back by a
+    recovery and is queued for replay, and the queued replay blocks reads
+    of its keys anyway.
+  - `flex` and `flex-crash` 1000..5000 after the model change: 0 failing.
+- **Should fix 3, cache entries dropped.** `remote_blockers` removes a
+  node's `BlameCache` when it finds nothing of the node pending. Test:
+  `records_wait_for_the_forwarders_upload_only_while_its_rows_are_pending`
+  checks the entry is dropped after the ack.
+- **`session-stale-base-rename`, the scenario.** It assumed B could not
+  see A's unlink while A's sync was held. Since plan 30 §M9, A's tenure
+  is backed when there is a backup, and the pre-S3 stream carries the
+  unlink to every subscriber, B included. `stale_base_rename_divergence`
+  (also behind `stale-base-rename-divergence`) now mounts all three nodes
+  with `CONSTELLATION_BACKUPS=0`, so the hold really keeps the unlink
+  from B. The checks are unchanged. 5/5 PASSED, plus
+  `stale-base-rename-divergence` 1/1. In each run B's rename waited
+  while the log was held and returned OK about 3.02 s later.
+- **Nits.** `RowRanges::insert` logs (debug) the ranges it drops past
+  the cap. `ObservedUpload` documents why its accumulating `inos` and
+  its uncancelled timer are harmless. The ALPN bump is reverted
+  (`constellation/3`, also in `wip/23-remote-support-mode.md`; the
+  wire format changes in place). The PROGRESS headline on `pending 1`
+  is corrected above.
+
+Gates (load average 30–140 during the runs):
+- `cargo fmt --all -- --check` clean. `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test`, 0 failed:
+  - meta: 224 lib + 78 integration
+  - authority: lib 191 (2 ignored), meta_repro 4, sim `--release` 112
+    (11 ignored)
+  - `--workspace` except model, authority and meta: 1,710 in 57
+    binaries
+  - model `--release`: 138
+- `cargo build --release` ok. `tests/smoke.sh` PASSED.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=mor2`,
+  `TMPDIR=/var/tmp/mor2`):
+  - `writeback-close-metered-nonowner`: 7 of 10 PASSED. Each passing run
+    looked like this:
+    - Unbacked: `d/held` 0 uploads, excused 1, 0 PUTs, `pending 1`; the
+      loop 4 uploads and 4 PUTs, `pending 1`; probes 2 uploads.
+    - Backed: `pending 5`, streamed 8, 0 uploads.
+    - `ack=s3`: 5 uploads.
+  - The 3 failures came at load average 67–136:
+    - an Unbacked close of 10.5 s, with core steps of 3.4 s on B and
+      1.3 s on A;
+    - an `ack=s3` close of 30.4 s after a false takeover ("LEASE LOST",
+      A took B's lease);
+    - a Backed close of 14.1 s. Its kept logs end at the mount (startup
+      alone took 16–29 s).
+  - Interleaved with the reviewed (staged) build at load 29–85: both
+    PASSED 4/4.
+  - With `CONSTELLATION_OWN_RECORD_WAIT_MS=0` it FAILS as required: the
+    close of `d/f0` stalled 120.5 s.
+  - `forwarded-mutations`, `nonowner-back-crash`,
+    `takeover-resolves-awaiting-close`, `lifecycle-metered-uploads`
+    PASSED (load 117). `session-stale-base-rename` 5/5 PASSED.
+- `own_chunks::cost` (release, medians, load about 100):
+  | Case | Median |
+  |---|---|
+  | refusal | 0.48 ms |
+  | chmod of the held file | 0.43 ms |
+  | re-walk | 24.3 ms (15.0 and 17.2 ms on quieter runs) |
+  | base-covered create | 26.7 µs |
+  | hold tick | 620 ns |
+- Real S3, `writeback-close-metered-nonowner`. The patched harness copy
+  in `/var/tmp/mor-real` uses a backend `$S3_TEST_URL/mor-real-<ns>`,
+  selects modes with `MOR_MODES`, and purges with a guard that accepts
+  only that pattern. Every prefix was purged, 0 objects left. Every run
+  PASSED, and A had 0 session timeouts in each (the scenario asserts it).
+
+| Run | Unbacked: `d/held` excused, pending; loop uploads/PUTs; slowest close | Backed: pending, streamed, uploads; slowest close | `ack=s3`: uploads; slowest close |
+|---|---|---|---|
+| AWS 1 | excused 1, pending 1; 4/4; 0.29 s | 5, 8, 0; 20 ms | 5; 0.31 s |
+| AWS 2 | excused 1, pending 1; 4/4; 0.16 s | 5, 8, 0; 40 ms | 5; 0.50 s |
+| OVH 1 | excused 1, pending 1; 4/4; 1.88 s | 5, 8, 0; 20 ms | 5; 1.73 s |

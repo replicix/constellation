@@ -69,6 +69,18 @@ pub struct ChunkWorld {
     /// Own pending rows found without bytes anywhere (a replay's adopted
     /// manifest of a departed node's chunk): marked unrecoverable.
     pub poisoned: AtomicU64,
+    /// Chunk metered-own-rows: the metered upload hold — a round's pass
+    /// leaves a node's own chunk dirty until it is this many ms old; only
+    /// `Action::UploadAwaited` (an op's or an observed position's
+    /// durability need, which the hold exempts) puts it up sooner. 0: no
+    /// hold.
+    pub hold_ms: AtomicU64,
+    /// When each chunk was written (for the hold).
+    written_at: Mutex<HashMap<ChunkHash, tokio::time::Instant>>,
+    /// Own chunks a round's pass left held.
+    pub held_back: AtomicU64,
+    /// Own chunks `Action::UploadAwaited` put up past the hold.
+    pub awaited_uploaded: AtomicU64,
 }
 
 impl ChunkWorld {
@@ -98,6 +110,10 @@ impl ChunkWorld {
             .entry(node)
             .or_default()
             .insert(hash);
+        self.written_at
+            .lock()
+            .unwrap()
+            .insert(hash, tokio::time::Instant::now());
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -162,21 +178,68 @@ impl ChunkWorld {
     /// up and their rows are acked; a remote row is acked once its chunk
     /// is in S3 (whoever put it there). With S3 cut nothing moves.
     pub fn upload_pass(&self, node: NodeId, meta: &Meta, ino: Option<Ino>, s3_up: bool) {
+        self.pass(node, meta, ino, s3_up, false)
+    }
+
+    /// `Action::UploadAwaited` (chunk metered-own-rows): `node`'s pass
+    /// for `inos`, past the metered hold.
+    pub fn upload_awaited(&self, node: NodeId, meta: &Meta, inos: &[Ino], s3_up: bool) {
+        for ino in inos {
+            self.pass(node, meta, Some(*ino), s3_up, true)
+        }
+    }
+
+    /// A complete pass (a barrier's, a flush's): past the metered hold.
+    pub fn upload_forced(&self, node: NodeId, meta: &Meta, ino: Option<Ino>, s3_up: bool) {
+        self.pass(node, meta, ino, s3_up, true)
+    }
+
+    fn pass(&self, node: NodeId, meta: &Meta, ino: Option<Ino>, s3_up: bool, forced: bool) {
         if !s3_up {
             return;
         }
+        let hold = std::time::Duration::from_millis(self.hold_ms.load(Ordering::Relaxed));
         let rows = meta.pending_uploads().unwrap_or_default();
         for (hash, row_ino) in rows {
             if ino.is_some_and(|i| i != row_ino) {
                 continue;
             }
-            if meta.remote_chunk(&hash, row_ino).ok().flatten().is_some() {
+            let on_disk = self
+                .dirty
+                .lock()
+                .unwrap()
+                .get(&node)
+                .is_some_and(|d| d.contains(&hash));
+            // As the daemon's pass: a remote row is awaited only when the
+            // bytes are not here (`upload.rs` reads the cache first). A
+            // deposed holder's replay can mark this node's own chunk
+            // remote from the deposed node, whose row is marked remote
+            // from this one in turn: uploading what is on disk breaks
+            // that cycle.
+            if !on_disk && meta.remote_chunk(&hash, row_ino).ok().flatten().is_some() {
                 if self.in_s3(&hash) {
                     let acked = meta.ack_remote_chunks(&[hash]).expect("ack remote");
                     self.remote_acked
                         .fetch_add(acked.len() as u64, Ordering::Relaxed);
                 }
                 continue;
+            }
+            // The metered hold: a round's pass leaves a young chunk of
+            // this node's own on its disk.
+            let young = !hold.is_zero()
+                && self
+                    .written_at
+                    .lock()
+                    .unwrap()
+                    .get(&hash)
+                    .is_some_and(|t| t.elapsed() < hold);
+            if young && on_disk && !self.in_s3(&hash) {
+                if forced {
+                    self.awaited_uploaded.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.held_back.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
             // This node's own chunk: on its disk, or already up (a row
             // re-enrolled for content that uploaded under another inode).

@@ -210,13 +210,7 @@ pub enum SyncRequest {
         /// The log sequence the requester had applied when it sent the
         /// op (`PeerMsg::MutateRequest::applied`).
         applied: u64,
-        reply: tokio::sync::oneshot::Sender<(
-            constellation_meta::MutateOutcome,
-            Option<u64>,
-            constellation_meta::Position,
-            u64,
-            constellation_meta::OwnChunks,
-        )>,
+        reply: tokio::sync::oneshot::Sender<crate::authority_driver::MutateReplyParts>,
     },
     /// `from` reports chunks it forwarded as pending durable in S3: ack
     /// the rows this node awaits for them (`meta::store::remote`).

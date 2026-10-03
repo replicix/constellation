@@ -193,6 +193,11 @@ pub struct SimConfig {
     /// probability the client writes the file — one fresh chunk, dirty on
     /// its node until its upload pass (`chunks.rs`).
     pub chunk_writes: f64,
+    /// Chunk metered-own-rows: the metered upload hold, in ms
+    /// (`ChunkWorld::hold_ms`; 0: none). A non-owner's write stays
+    /// deferred on the sequencer while its chunk is held, across the
+    /// other nodes' ops on the same names.
+    pub upload_hold_ms: u64,
     /// M12 round 2: model the daemon's FUSE fast path — a node holding a
     /// usable lease executes its own client ops outside the core
     /// (`view::View::mutate_op_rebasable_with_rid`), asking
@@ -430,6 +435,7 @@ impl Default for SimConfig {
             epoch_slack: 0,
             join_fresh: true,
             chunk_writes: 0.0,
+            upload_hold_ms: 0,
             dirs: Vec::new(),
             delegations: Vec::new(),
             designations: Vec::new(),
@@ -515,6 +521,10 @@ pub struct Report {
     pub deferred_seen: u64,
     pub remote_dropped: u64,
     pub member_gone: bool,
+    /// Chunk metered-own-rows: own chunks a round's pass left held, and
+    /// those `Action::UploadAwaited` put up past the hold.
+    pub held_back: u64,
+    pub awaited_uploaded: u64,
 }
 
 pub struct Cluster {
@@ -1980,6 +1990,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         seed,
         world: ChunkWorld::new(),
     };
+    env.world
+        .hold_ms
+        .store(cfg.upload_hold_ms, std::sync::atomic::Ordering::Relaxed);
     let cluster = Arc::new(Cluster {
         nodes: Mutex::new(BTreeMap::new()),
         env,
@@ -2168,7 +2181,11 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         .deferred_seen
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let v = n.view();
+                    // A paused node ships nothing until it resumes
+                    // (chunk metered-own-rows: with the upload hold, a
+                    // deferral outlasts a pause often enough).
                     let sequencing = v.held_epoch.is_some()
+                        && !n.paused()
                         && !v.epoch_held
                         && !v.gate_pending
                         && !v.lost
@@ -2678,6 +2695,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.deferred_seen = world.deferred_seen.load(ord);
         report.remote_dropped = world.remote_dropped.load(ord);
         report.member_gone = !world.gone.lock().unwrap().is_empty();
+        report.held_back = world.held_back.load(ord);
+        report.awaited_uploaded = world.awaited_uploaded.load(ord);
     }
     let counts = bucket.counts();
     report.s3_puts = counts.puts;
@@ -2723,9 +2742,29 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                // The chunk model: pending rows (hash, in S3, inode),
+                // remote marks, chunks only this node's disk holds.
+                let pending: Vec<_> = n
+                    .meta
+                    .pending_uploads()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|(h, i)| (format!("{h}"), world.in_s3(h), *i))
+                    .collect();
+                let remote: Vec<_> = n
+                    .meta
+                    .remote_chunks()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| format!("{c:?}"))
+                    .collect();
                 format!(
-                    "node {}: job {:?} journal {:?} held {:?} speculation {:?} live {:?} replays {}",
+                    "node {}: pending {:?} remote {:?} dirty {} job {:?} journal {:?} held {:?} \
+                     speculation {:?} live {:?} replays {}",
                     n.id,
+                    pending,
+                    remote,
+                    world.dirty_on(n.id),
                     n.view().job_phase,
                     rows,
                     n.meta.held_summary(),

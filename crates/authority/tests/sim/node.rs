@@ -349,6 +349,16 @@ impl NodeHandle {
     pub fn pause_until(&self, until: tokio::time::Instant) {
         *self.shared.paused_until.lock().unwrap() = Some(until);
     }
+
+    /// Whether a pause holds this node's event loop now (its view is the
+    /// one from before the pause, and it handles nothing).
+    pub fn paused(&self) -> bool {
+        self.shared
+            .paused_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| tokio::time::Instant::now() < until)
+    }
 }
 
 struct Driver {
@@ -824,13 +834,21 @@ impl Driver {
                     self.timers.remove(&id);
                     self.timer_kinds.remove(&id);
                 }
-                Action::UploadDirtyChunks { op, ino, .. } => {
+                Action::UploadDirtyChunks {
+                    op, ino, complete, ..
+                } => {
                     // The modelled pass (`chunks.rs`): this node's own
                     // dirty chunks go up when S3 is reachable, remote rows
                     // are acked once their chunk is there; nothing is
-                    // ever unrecoverable, so nothing is held back.
-                    self.world
-                        .upload_pass(self.id, &self.meta, ino, !self.bucket.is_cut(self.id));
+                    // ever unrecoverable, so nothing is held back. A
+                    // complete pass (a barrier, a flush, a handoff) is a
+                    // durability need: the metered hold exempts it.
+                    let s3_up = !self.bucket.is_cut(self.id);
+                    if complete {
+                        self.world.upload_forced(self.id, &self.meta, ino, s3_up);
+                    } else {
+                        self.world.upload_pass(self.id, &self.meta, ino, s3_up);
+                    }
                     let _ = self.tx.send(Event::UploadsDone {
                         op,
                         result: UploadResult::Done { held: 0 },
@@ -845,9 +863,17 @@ impl Driver {
                     let _ = self.tx.send(Event::RebuildDone { op, ok: false });
                 }
                 Action::RoundDone { .. } => {}
-                // The simulated chunks are never held; the round's pass
-                // uploads them.
-                Action::UploadAwaited { .. } => {}
+                // Chunk metered-own-rows: past the modelled metered hold
+                // (`ChunkWorld::hold_ms`); without one the round's pass
+                // has uploaded them already.
+                Action::UploadAwaited { inos } => {
+                    self.world.upload_awaited(
+                        self.id,
+                        &self.meta,
+                        &inos,
+                        !self.bucket.is_cut(self.id),
+                    );
+                }
                 Action::LockFlush { ino, grant } => {
                     // Plan 30 §M14: no file data in this simulation, so the
                     // flush is only a delay (seeded by the grant, so a
@@ -962,6 +988,7 @@ impl Driver {
         let tx = self.tx.clone();
         let world = self.world.clone();
         let id = self.id;
+        let (meta, s3_up) = (self.meta.clone(), !self.bucket.is_cut(self.id));
         tokio::spawn(async move {
             let leases = LeaseStore::new(store.clone(), "p0", LeaseMode::Cas);
             let log = LogStore::new(store.clone());
@@ -990,6 +1017,18 @@ impl Driver {
                         .map_err(|e| S3Failure(e.to_string())),
                 ),
                 S3Op::InboxPut { batch } => {
+                    // As the daemon (`inbox_manifests_pending`): the inbox
+                    // carries no pending-chunk list, so a manifest's
+                    // chunks go up first, past the metered hold.
+                    let inos: Vec<constellation_fs_core::Ino> = batch
+                        .ops
+                        .iter()
+                        .filter_map(|o| match MutateOp::from_postcard(&o.op) {
+                            Ok(MutateOp::SetManifest { ino, .. }) => Some(ino),
+                            _ => None,
+                        })
+                        .collect();
+                    world.upload_awaited(id, &meta, &inos, s3_up);
                     let inbox = InboxStore::new(store.clone());
                     S3Result::InboxPut(
                         inbox

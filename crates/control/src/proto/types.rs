@@ -2059,6 +2059,12 @@ pub struct AckStatus {
     /// waited past a stream the sequencer said would carry them.
     #[serde(default)]
     pub own_record_uploads: u64,
+    /// Forward replies whose position this node observed less rows of its
+    /// own whose effects it already carries (a `back` close's, deferred on
+    /// the sequencer behind its held chunks): no wait and no upload for
+    /// them.
+    #[serde(default)]
+    pub own_rows_excused: u64,
     /// As sequencer: forwarded replies answered `Held` at once because
     /// the acknowledgement waits for chunks only the requester can upload
     /// (it is asked to upload them).

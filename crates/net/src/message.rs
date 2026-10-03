@@ -340,6 +340,10 @@ pub enum Payload {
         /// upload releases them), and of which inodes (`own_inos`).
         own_chunks: u8,
         own_inos: Vec<u64>,
+        /// Chunk metered-own-rows: `constellation_meta::OwnRows::to_wire`
+        /// of the requester's own transactions unshipped through the
+        /// position (empty: not worked out).
+        own_rows: Vec<u8>,
     },
     /// Plan 30 §M8: a `cto=strict` reader asks the sequencer where the
     /// state of `ino` is (its record; with `dir`, its entries; with

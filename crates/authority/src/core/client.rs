@@ -150,7 +150,30 @@ pub(crate) struct ClientOp {
     pub own_record_timer: Option<crate::ids::TimerId>,
     pub own_record_inos: BTreeSet<Ino>,
     pub own_record_uploaded: bool,
+    /// Chunk metered-own-rows: the journal rows of the reply's position
+    /// this op's observation does not owe (`Core::settle_own_rows`): an
+    /// `AwaitingLog` op observes its position once the log answered it.
+    pub excused: Vec<(u64, u64)>,
 }
+
+/// Chunk metered-own-rows: an observed position's pending upload
+/// (`Core::repeat_observed_upload`).
+///
+/// `inos` accumulates across raises until the watermark is reached or
+/// the repeats run out, and the timer is not cancelled on a role change:
+/// both harmless, as a pass uploads only what is still pending here (an
+/// index lookup per inode for the rest) and stops once `observed` is
+/// reached.
+#[derive(Debug, Default)]
+pub(crate) struct ObservedUpload {
+    pub inos: BTreeSet<Ino>,
+    pub repeats: u32,
+    pub timer: Option<crate::ids::TimerId>,
+}
+
+/// How many times an observed position's upload is repeated
+/// (`own_record_wait_ms` apart) before it is left to the watermark's TTL.
+pub(crate) const OBSERVED_UPLOAD_REPEATS: u32 = 6;
 
 /// How many state changes a client op remembers for its slow-op log.
 pub(crate) const HISTORY_CAP: usize = 24;
@@ -411,6 +434,7 @@ impl Core {
                 own_record_timer: None,
                 own_record_inos: BTreeSet::new(),
                 own_record_uploaded: false,
+                excused: Vec::new(),
             },
         );
         // Causal order after a generation ended with this node's writes
@@ -880,7 +904,13 @@ impl Core {
         from: NodeId,
         req: OpId,
         outcome: MutateOutcome,
-        (base, position, gen, own_chunks): (Option<crate::ids::Seq>, Position, u64, OwnChunks),
+        (base, position, gen, own_chunks, own_rows): (
+            Option<crate::ids::Seq>,
+            Position,
+            u64,
+            OwnChunks,
+            Option<constellation_meta::OwnRows>,
+        ),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -896,6 +926,7 @@ impl Core {
         if let Some(t) = c.timer.take() {
             self.cancel_timer(t, out);
         }
+        let own_chunks = self.settle_own_rows(rid, own_chunks, own_rows.as_ref(), replica);
         self.stats.forwards_ok += 1;
         self.note_p2p_result(now, from, true);
         // Plan 30 §M11: whatever the reply installs here, this client's
@@ -927,7 +958,7 @@ impl Core {
                 if replica.completed_position(rid).ok().flatten().is_some() {
                     // Delivered by the log already; the rest of what the
                     // holder evaluated against normally came with it.
-                    self.observe_reply(rid, position, &own_chunks, replica, out);
+                    self.observe_reply(now, rid, position, &own_chunks, replica, out);
                     self.finish(
                         now,
                         rid,
@@ -954,6 +985,24 @@ impl Core {
                 }
                 let c = self.clients.get_mut(&rid).expect("present");
                 c.phase = Phase::AwaitingLog { epoch, position };
+                // Chunk metered-own-rows (OVH run 31): a replay of a
+                // stranded op waits for a transaction the sequencer's
+                // stream may have carried here already — before this
+                // node's deposition was recovered (a deposed holder drops
+                // the new holder's stream, and its recovery rolls back
+                // what it installed), so it is gone here and the stream
+                // does not resend it. Answered `Streamed`, each replay
+                // waited out the safety timer (10 s) before its upload,
+                // one after another (the queue replays one op at a time),
+                // and a close queued behind seven of them hit its 120 s
+                // deadline. Replays are rare (a takeover's stranded ops):
+                // upload at once.
+                let own_chunks = match own_chunks {
+                    OwnChunks::Streamed(inos) if matches!(c.origin, Origin::Replay { .. }) => {
+                        OwnChunks::Upload(inos)
+                    }
+                    own => own,
+                };
                 self.await_own_records(now, rid, own_chunks, out);
                 self.nudge(now, out);
             }
@@ -989,7 +1038,7 @@ impl Core {
                             self.stats.queued_behind_takeover += 1;
                             self.lease_path(now, rid, replica, out);
                         } else {
-                            self.observe_reply(rid, position, &own_chunks, replica, out);
+                            self.observe_reply(now, rid, position, &own_chunks, replica, out);
                             self.finish(
                                 now,
                                 rid,
@@ -1098,7 +1147,7 @@ impl Core {
                     }
                 }
                 if !hinted {
-                    self.observe_reply(rid, position, &own_chunks, replica, out);
+                    self.observe_reply(now, rid, position, &own_chunks, replica, out);
                 }
                 self.finish(now, rid, outcome, replica, out);
             }
@@ -1106,7 +1155,7 @@ impl Core {
                 // Plan 30 §M6: a refusal observed the holder's state
                 // without installing anything here (this replaces plan 29
                 // M6's per-name causal wait: every later read waits).
-                self.observe_reply(rid, position, &own_chunks, replica, out);
+                self.observe_reply(now, rid, position, &own_chunks, replica, out);
                 self.finish(now, rid, outcome, replica, out)
             }
         }
@@ -1775,9 +1824,64 @@ impl Core {
 
     // ---- finishing ----
 
-    /// Plan 30 §M6: a client-visible reply to `rid` observed `position`
-    /// without installing its effects here: raise `observed`. A replay's
-    /// outcome is not client-visible and raises nothing.
+    /// Chunk metered-own-rows: what of the reply's position this node
+    /// already has. The sequencer named its own transactions still
+    /// unshipped through the position (`OwnRows`): a `back` close answered
+    /// at once and deferred there behind its chunk, held here on a metered
+    /// network. Those whose effects this replica carries (or that have
+    /// none: refusals) are excused from the watermark the reply raises
+    /// (kept with the op: `observe` uses them, now or once the log answers
+    /// an `AwaitingLog` op), and nothing is uploaded for them; what the
+    /// rest wait for — this op's own transaction, an earlier incarnation's,
+    /// any other node's op deferred behind this node's chunks — still is.
+    /// Returns `own_chunks` narrowed to that (`None` when nothing is left).
+    ///
+    /// Safe because every row through the position is either at most the
+    /// log position a read waits for, or one of this node's own whose
+    /// effect is in this replica already, in the sequencer's order: the
+    /// sequencer evaluated the reply on its journal, this node's rows
+    /// included, and installed them here on the same state (an accepted
+    /// reply is installed only on its `base`, and only a transaction the
+    /// sequencer ships later than the rows below it can be deferred). Every
+    /// other node's row is still waited for; one deferred behind this
+    /// node's chunks makes this node upload them (`OwnRows::others`). A
+    /// shadow rolled back later (a deposition) queues its replay, which
+    /// every read of its keys waits for.
+    fn settle_own_rows(
+        &mut self,
+        rid: Rid,
+        own_chunks: OwnChunks,
+        own_rows: Option<&constellation_meta::OwnRows>,
+        replica: &dyn Replica,
+    ) -> OwnChunks {
+        let Some(rows) = own_rows else {
+            if let Some(c) = self.clients.get_mut(&rid) {
+                c.excused.clear();
+            }
+            return own_chunks;
+        };
+        let rids: Vec<Rid> = rows
+            .txs
+            .iter()
+            .filter(|t| t.effect)
+            .map(|t| t.rid)
+            .collect();
+        let installed = replica.effects_installed(&rids);
+        let (excused, upload) = rows.settle(|r| installed.contains(&r));
+        if !excused.is_empty() {
+            self.stats.own_rows_excused += 1;
+        }
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.excused = excused;
+        }
+        match own_chunks {
+            OwnChunks::None => OwnChunks::None,
+            _ if upload.is_empty() => OwnChunks::None,
+            OwnChunks::Streamed(_) => OwnChunks::Streamed(upload),
+            OwnChunks::Upload(_) => OwnChunks::Upload(upload),
+        }
+    }
+
     /// [`Self::observe`] a reply's position, for an op that finishes
     /// with it. Chunk close-stall-followup: every later read here waits
     /// until the log reaches that position, and the sequencer said whether
@@ -1787,9 +1891,13 @@ impl Core {
     /// `Upload`: upload them now, as for an op's own record; nothing else
     /// would on a metered network, and the reads would wait out the
     /// session budget until the watermark's TTL drops it. `Streamed`: the
-    /// stream brings the position here.
+    /// stream brings the position here. Chunk metered-own-rows: not when
+    /// the watermark is reached already (the rows are here, streamed or
+    /// excused), and repeated while it stays unreached
+    /// (`Core::on_observed_upload`: a pass that failed).
     fn observe_reply(
         &mut self,
+        now: Ms,
         rid: Rid,
         position: Position,
         own_chunks: &OwnChunks,
@@ -1802,7 +1910,7 @@ impl Core {
             .is_some_and(|c| c.origin == Origin::Client);
         self.observe(rid, position, replica);
         if let (true, OwnChunks::Upload(inos)) = (client, own_chunks) {
-            if self.cfg.own_record_wait_ms > 0 && !inos.is_empty() {
+            if self.cfg.own_record_wait_ms > 0 && !inos.is_empty() && !replica.reaches_observed() {
                 self.stats.own_record_uploads += 1;
                 tracing::debug!(
                     node = self.cfg.node_id,
@@ -1811,17 +1919,72 @@ impl Core {
                     "an observed position waits for this node's pending chunks: uploading them"
                 );
                 out.push(Action::UploadAwaited { inos: inos.clone() });
+                self.repeat_observed_upload(now, inos, out);
             }
         }
     }
 
+    /// Chunk metered-own-rows (review nit): repeat an observed position's
+    /// upload every `own_record_wait_ms` while the watermark stays
+    /// unreached, as an op's own-record upload is: one pass that failed
+    /// (S3 away a moment) left the reads waiting out the watermark's TTL.
+    /// A pass with nothing left to upload costs an index lookup per
+    /// inode. At most [`OBSERVED_UPLOAD_REPEATS`] times per raise.
+    fn repeat_observed_upload(&mut self, now: Ms, inos: &[Ino], out: &mut Vec<Action>) {
+        let u = &mut self.observed_upload;
+        u.inos.extend(inos.iter().copied());
+        u.repeats = 0;
+        if u.timer.is_none() {
+            let t = self.set_timer(
+                now.plus(self.cfg.own_record_wait_ms),
+                Timer::ObservedUpload,
+                out,
+            );
+            self.observed_upload.timer = Some(t);
+        }
+    }
+
+    /// `Timer::ObservedUpload` (see [`Self::repeat_observed_upload`]).
+    pub(crate) fn on_observed_upload(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.observed_upload.timer = None;
+        let u = &mut self.observed_upload;
+        if u.inos.is_empty() || replica.reaches_observed() || u.repeats >= OBSERVED_UPLOAD_REPEATS {
+            *u = ObservedUpload::default();
+            return;
+        }
+        u.repeats += 1;
+        let inos: Vec<Ino> = u.inos.iter().copied().collect();
+        self.stats.own_record_uploads += 1;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?inos,
+            "an observed position still waits for this node's pending chunks: uploading again"
+        );
+        out.push(Action::UploadAwaited { inos });
+        let t = self.set_timer(
+            now.plus(self.cfg.own_record_wait_ms),
+            Timer::ObservedUpload,
+            out,
+        );
+        self.observed_upload.timer = Some(t);
+    }
+
+    /// Plan 30 §M6: a client-visible reply to `rid` observed `position`
+    /// without installing its effects here: raise `observed`, less the
+    /// rows of this node's own its reply excused (`settle_own_rows`). A
+    /// replay's outcome is not client-visible and raises nothing.
     fn observe(&self, rid: Rid, position: Position, replica: &dyn Replica) {
-        if self
+        if let Some(c) = self
             .clients
             .get(&rid)
-            .is_some_and(|c| c.origin == Origin::Client)
+            .filter(|c| c.origin == Origin::Client)
         {
-            replica.raise_observed(position);
+            replica.raise_observed_excusing(position, &c.excused);
         }
     }
 

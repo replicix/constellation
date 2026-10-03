@@ -656,10 +656,83 @@ fn close_race(
                 .unwrap_or(0))
         };
         let timeouts_before = session_timeouts(&a)?;
+        // Chunk metered-own-rows (coordinator decision): a close of A's
+        // answered at once keeps its chunk held on A and its rows deferred
+        // on B, below every later segment's `through`. A's next refusal
+        // (`rmdir` of the non-empty `d/`, refused on B) observes B's
+        // position past them; they are A's own, and A carries the close.
+        // Unbacked, A uploaded the chunk for it (close-stall-followup);
+        // now it excuses its own rows: no upload, the chunk stays held,
+        // and the reads after it do not wait (checked with the session
+        // timeouts below). Backed, the stream needs no upload either.
+        let mut files = Vec::new();
+        {
+            let file = "d/held";
+            std::fs::write(a.mnt.join(file), b"")?;
+            // A applies its create from the log: the close is answered on
+            // a base it has.
+            std::thread::sleep(Duration::from_secs(3));
+            let data = content(seed, file, 100 * 1024);
+            let t = Instant::now();
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(a.mnt.join(file))?;
+                f.write_all(&data)?;
+            }
+            let close = t.elapsed();
+            let status = a.control_status()?;
+            let (uploads_before, excused_before) = (
+                status["ack"]["own_record_uploads"].as_u64().unwrap_or(0),
+                status["ack"]["own_rows_excused"].as_u64().unwrap_or(0),
+            );
+            let puts_before = chunk_puts(&a)?;
+            let refused = std::fs::remove_dir(a.mnt.join("d"))
+                .expect_err("d/ is not empty")
+                .raw_os_error();
+            anyhow::ensure!(
+                refused == Some(39),
+                "rmdir d: errno {refused:?}, not ENOTEMPTY"
+            );
+            // Reads after the refusal: of the held file, of d/.
+            let t = Instant::now();
+            anyhow::ensure!(
+                std::fs::read(a.mnt.join(file))? == data,
+                "{file} reads back"
+            );
+            let listed = std::fs::read_dir(a.mnt.join("d"))?.count();
+            let reads = t.elapsed();
+            let status = a.control_status()?;
+            let uploads =
+                status["ack"]["own_record_uploads"].as_u64().unwrap_or(0) - uploads_before;
+            let excused = status["ack"]["own_rows_excused"].as_u64().unwrap_or(0) - excused_before;
+            let pending = status["writeback"]["pending_uploads"].as_u64().unwrap_or(0);
+            let puts = chunk_puts(&a)? - puts_before;
+            eprintln!(
+                "    {name} [{mode:?}]: {file}: close {close:?}; after the refused rmdir: \
+                 own-record uploads {uploads}, excused {excused}, chunk PUTs {puts}, \
+                 pending {pending}, reads {reads:?} ({listed} entries)"
+            );
+            if mode != CloseRace::AckS3 {
+                anyhow::ensure!(
+                    uploads == 0 && puts == 0 && pending > 0,
+                    "A uploaded its held close for a position only its own rows held back \
+                     (uploads {uploads}, PUTs {puts}, pending {pending})"
+                );
+            }
+            if mode == CloseRace::Unbacked {
+                anyhow::ensure!(excused > 0, "A's own rows were not excused");
+            }
+            files.push(Acked {
+                name: file.to_string(),
+                hash: blake3::hash(&data),
+                len: data.len(),
+            });
+        }
         // A real S3's round trip: B's ship of its create lags the
         // forward of A's close, as it did on AWS and OVH.
         proxy.latency(60, 20)?;
-        let mut files = Vec::new();
         let mut slowest = Duration::ZERO;
         for i in 0..ROUNDS {
             let file = format!("d/f{i}");

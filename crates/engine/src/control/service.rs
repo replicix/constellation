@@ -355,6 +355,7 @@ impl EngineControl {
                     awaited_log_streamed: stats.awaited_log_streamed,
                     awaited_log_streamed_deleg: stats.awaited_log_streamed_deleg,
                     own_record_uploads: stats.own_record_uploads,
+                    own_rows_excused: stats.own_rows_excused,
                     held_for_upload: stats.held_for_upload,
                     backup_persisted: stats.backup_persisted,
                     seals: stats.seals,

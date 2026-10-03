@@ -600,6 +600,7 @@ impl Core {
                     position: Position::ZERO,
                     gen: 0,
                     own_chunks: OwnChunks::None,
+                    own_rows: None,
                 },
             });
         }
@@ -791,6 +792,7 @@ impl Core {
                         position: Position::ZERO,
                         gen: 0,
                         own_chunks: OwnChunks::None,
+                        own_rows: None,
                     },
                 });
             }
@@ -935,6 +937,10 @@ impl Core {
                     position,
                     gen,
                     own_chunks,
+                    // A delegate's own rows are not worked out
+                    // (`Meta::remote_blockers`): the requester waits for
+                    // everything through the position.
+                    own_rows: None,
                 },
             });
         }

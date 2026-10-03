@@ -556,6 +556,10 @@ pub struct Stats {
     /// `OwnChunks::Upload`, and once per `own_record_wait_ms` the op then
     /// still waited, or waited past a `Streamed` answer.
     pub own_record_uploads: u64,
+    /// Chunk metered-own-rows: forward replies whose position this node
+    /// observes less rows of its own whose effects it carries
+    /// (`Core::settle_own_rows`): no wait, and no upload, for them.
+    pub own_rows_excused: u64,
     /// Ops held (per check) because their `deps` named a transaction its
     /// generation ended without, while this node's replays settled; and
     /// ops re-sent with fresh `deps` after that
@@ -1024,6 +1028,8 @@ enum Timer {
     ForwardBackoff(Rid),
     /// `Core::await_own_records`'s safety timer for the op ran out.
     OwnRecordWait(Rid),
+    /// `Core::repeat_observed_upload`'s timer.
+    ObservedUpload,
     AcquireRetry(Rid),
     ClientDeadline(Rid),
     ReplayDrain,
@@ -1071,6 +1077,7 @@ impl Timer {
             Timer::ForwardTimeout(_) => TimerKind::ForwardTimeout,
             Timer::ForwardBackoff(_) => TimerKind::ForwardBackoff,
             Timer::OwnRecordWait(_) => TimerKind::OwnRecordWait,
+            Timer::ObservedUpload => TimerKind::ObservedUpload,
             Timer::AcquireRetry(_) => TimerKind::AcquireRetry,
             Timer::ClientDeadline(_) => TimerKind::ClientDeadline,
             Timer::ReplayDrain => TimerKind::ReplayDrain,
@@ -1160,6 +1167,9 @@ pub struct Core {
     acquire_waiters: Vec<(OpId, Control)>,
     acked: client::AckTracker,
     replay: replay::ReplayState,
+    /// Chunk metered-own-rows: an observed position's upload, repeated
+    /// while the watermark stays unreached (`Core::on_observed_upload`).
+    observed_upload: client::ObservedUpload,
     publishing: Option<OpId>,
     /// M4: journal transactions the last upload pass held back.
     held_back: u64,
@@ -1247,6 +1257,7 @@ impl Core {
             acquire_waiters: Vec::new(),
             acked: client::AckTracker::default(),
             replay: replay::ReplayState::default(),
+            observed_upload: Default::default(),
             publishing: None,
             held_back: 0,
             pending_plan: None,
@@ -1531,12 +1542,13 @@ impl Core {
                 position,
                 gen,
                 own_chunks,
+                own_rows,
             } => self.on_mutate_reply(
                 now,
                 from,
                 req,
                 outcome,
-                (base, position, gen, own_chunks),
+                (base, position, gen, own_chunks, own_rows),
                 replica,
                 out,
             ),
@@ -1824,6 +1836,7 @@ impl Core {
             Timer::ForwardTimeout(rid) => self.on_forward_timeout(now, rid, replica, out),
             Timer::ForwardBackoff(rid) => self.on_forward_backoff(now, rid, replica, out),
             Timer::OwnRecordWait(rid) => self.on_own_record_wait(now, rid, out),
+            Timer::ObservedUpload => self.on_observed_upload(now, replica, out),
             Timer::AcquireRetry(rid) => self.on_acquire_retry(now, rid, replica, out),
             Timer::ClientDeadline(rid) => self.on_client_deadline(now, rid, replica, out),
             Timer::ReplayDrain => {

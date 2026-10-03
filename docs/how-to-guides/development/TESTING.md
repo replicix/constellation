@@ -1600,7 +1600,9 @@ Plan 30 M13 scenarios (the S3 inbox; all three run with
 relay of its own so requests can be attributed per role):
 
 - **`stale-base-rename-divergence`** (plan 30 M5 phase 2, the
-  `MutateReply::base` rule on the wire). Three nodes with own P2P keys;
+  `MutateReply::base` rule on the wire). Three nodes with own P2P keys
+  and no backups (`CONSTELLATION_BACKUPS=0`: a backed tenure's pre-S3
+  stream would carry A's unlink to B past the sync hold);
   A's and B's sync rounds are held with
   `CONSTELLATION_FAULT_HOLD_SYNC_FILE=<root>/hold-{a,b}` (each daemon
   writes `<hold>.held` from the first round that sees the file, so the
@@ -2970,7 +2972,15 @@ a shell), in `crates/harness/src/scenarios/lifecycle.rs`:
   and closes it at once (before applying B's create). Three runs on fresh
   filesystems: B with no backup (`CONSTELLATION_BACKUPS=0`, `Local`), B
   backed by A, and `ack=s3`, all with the default
-  `CONSTELLATION_OWN_RECORD_WAIT_MS`. Every close must return within 10 s
+  `CONSTELLATION_OWN_RECORD_WAIT_MS`. First, in each run (chunk
+  metered-own-rows), A creates `d/held`, waits 3 s, writes it without
+  `O_TRUNC` (the close returns at once on a base A has, its chunk held)
+  and then `rmdir`s the non-empty `d/`: B refuses it (`ENOTEMPTY`) at a
+  position behind the held close's deferred rows, which are A's own.
+  Unbacked and backed, A must upload nothing for it (`ack.own_record_uploads`
+  and chunk PUTs unchanged, `writeback.pending_uploads` above 0) and read
+  the file and `d/` at once; unbacked, `ack.own_rows_excused` must rise
+  (A excused its own rows; before, it uploaded the chunk). Every close must return within 10 s
   (it used to stall 120 s and fail in doubt). Unbacked and `ack=s3`: B
   answers `OwnChunks::Upload`, and A's `ack.own_record_uploads` and chunk
   PUTs rise (the close uploaded what it waited on); under `ack=s3` B's
@@ -3034,7 +3044,11 @@ AUTHORITY_SIM_CONFIG=long-backup AUTHORITY_SIM_START=50000 AUTHORITY_SIM_SEEDS=1
 failing seed (`SWEEP-FAIL`), and fails at the end: `long-sessions`
 (`long_random`), `long-strict`, `long-backup` and `long-acks3`
 (`long_backup`'s even and odd seeds), `backup-hot` and `placement-hot`
-(`long_backup_hot`), `flex`, `flex-crash`, `long-delegated`, and every
+(`long_backup_hot`), `flex`, `flex-crash`, `metered-shared` and
+`metered-shared-unbacked` (chunk metered-own-rows: chunk writes held on
+their writers by a 3 s metered hold, `SimConfig::upload_hold_ms`, across
+other nodes' ops and reads on the same names; the summary counts
+replies excusing own rows and chunks held back), `long-delegated`, and every
 lock configuration of `long_locks` (`locks`, `locks-partition`, …,
 `locks-failover-backup-writes`). Use each long test's own start (its
 source) to sweep the same seeds.

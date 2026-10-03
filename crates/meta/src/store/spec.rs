@@ -2163,6 +2163,62 @@ impl Meta {
         self.install_shadow_from(rid, epoch, 0, op, records)
     }
 
+    /// Chunk metered-own-rows: which of `rids`' ops this replica carries
+    /// the effect of — the log delivered it (`completed`), or speculation
+    /// of it is outstanding (a shadow, or a streamed transaction
+    /// completing it). A stranded one is neither: rolled back and queued
+    /// for replay. One read of the live list answers them all (a reply
+    /// names up to `OWN_ROWS_CAP` transactions).
+    pub fn effects_installed(
+        &self,
+        rids: &[Rid],
+    ) -> Result<std::collections::BTreeSet<Rid>, MetaError> {
+        let r = self.db.read_tx();
+        let mut found = std::collections::BTreeSet::new();
+        let mut open = std::collections::BTreeSet::new();
+        for rid in rids {
+            if r.get(&self.completed, rid.to_key())?.is_some() {
+                found.insert(*rid);
+            } else {
+                open.insert(*rid);
+            }
+        }
+        if open.is_empty() {
+            return Ok(found);
+        }
+        for (seq, entry) in read_live(&r, self)? {
+            match entry {
+                LiveEntry::Shadow { rid, .. } if open.contains(&rid) => {
+                    // As `shadow_row_for`: the row must still be a shadow.
+                    if let Some(v) = r.get(&self.spec, seq_key(seq))? {
+                        let row: SpecRow = postcard::from_bytes(&v)?;
+                        if matches!(row.kind, SpecKind::Shadow { .. }) {
+                            open.remove(&rid);
+                            found.insert(rid);
+                        }
+                    }
+                }
+                LiveEntry::Streamed { .. } => {
+                    if let Some(v) = r.get(&self.spec, seq_key(seq))? {
+                        let row: SpecRow = postcard::from_bytes(&v)?;
+                        for rec in &row.records {
+                            if let LogRecord::Completed { rid } = rec {
+                                if open.remove(rid) {
+                                    found.insert(*rid);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if open.is_empty() {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
     /// The OVH run's finding 4: an accepted forward this replica could
     /// not install (the holder evaluated it behind unshipped work on its
     /// keys) whose transaction the holder's pre-S3 stream has installed

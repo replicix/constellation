@@ -295,6 +295,97 @@ impl OwnChunks {
     }
 }
 
+/// Chunk metered-own-rows: what keeps a reply's position from the
+/// requester's log, as the sequencer that answered it sees at reply time,
+/// so that the requester waits only for what it does not already have.
+///
+/// The position names the sequencer's whole journal through it, and a
+/// requester that observes it (a refusal, an op completed through the
+/// log) waits in every later read until its applied log reaches it. A
+/// `back` close of the requester's own answered at once keeps its chunks
+/// held there on a metered network and its rows deferred on the
+/// sequencer, below every later segment's `through`. Those rows are the
+/// requester's own transactions, whose effects its replica already
+/// carries (installed as shadows when they were answered): the requester
+/// need not wait for them, nor upload to bring them ([`Self::settle`]).
+/// Every other row through the position it still waits for — another
+/// node's op interleaved below it ships on its own, unless it is deferred
+/// behind the requester's chunks (its blame is in `others`: those are
+/// uploaded).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OwnRows {
+    /// The requester's own transactions still unshipped through the
+    /// position, in journal order.
+    pub txs: Vec<OwnTx>,
+    /// The requester's inodes that every other held or deferred
+    /// transaction through the position waits for (`Meta::remote_blockers`'
+    /// blame).
+    pub others: Vec<Ino>,
+}
+
+/// One of [`OwnRows::txs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnTx {
+    pub rid: crate::rid::Rid,
+    /// Its journal rows on the sequencer, `first..=last`.
+    pub first: u64,
+    pub last: u64,
+    /// Whether its rows change anything a read sees (a refusal's do not).
+    pub effect: bool,
+    /// The requester's inodes it waits for (empty: it ships on its own).
+    pub waits: Vec<Ino>,
+}
+
+/// Most transactions of the requester's [`OwnRows`] names; with more, the
+/// sequencer names none and the requester waits for everything, as
+/// before.
+pub const OWN_ROWS_CAP: usize = 64;
+
+impl OwnRows {
+    /// The requester's side. A transaction of its own whose effect its
+    /// replica carries (`installed`: a shadow still outstanding, or the
+    /// log delivered it), or that has none (a refusal), is *excused*: its
+    /// rows are not waited for. Any other one (the op's own transaction
+    /// that is still to come through the log, one of an earlier
+    /// incarnation's) is waited for, and so is what it waits for.
+    ///
+    /// Returns the excused rows (journal seq ranges) and the inodes to
+    /// upload: `others`, plus what every transaction not excused waits
+    /// for.
+    pub fn settle(
+        &self,
+        installed: impl Fn(crate::rid::Rid) -> bool,
+    ) -> (Vec<(u64, u64)>, Vec<Ino>) {
+        let mut excused = Vec::new();
+        let mut upload: std::collections::BTreeSet<Ino> = self.others.iter().copied().collect();
+        for t in &self.txs {
+            if !t.effect || installed(t.rid) {
+                excused.push((t.first, t.last));
+            } else {
+                upload.extend(&t.waits);
+            }
+        }
+        (excused, upload.into_iter().collect())
+    }
+
+    /// The P2P wire form of an answer's `Option<OwnRows>`
+    /// (`constellation_net::Payload::MutateReply::own_rows`): empty for
+    /// `None`, else postcard.
+    pub fn to_wire(rows: Option<&OwnRows>) -> Vec<u8> {
+        rows.and_then(|r| postcard::to_allocvec(r).ok())
+            .unwrap_or_default()
+    }
+
+    /// An empty or undecodable value reads as `None`: the requester then
+    /// waits for everything, as before the signal.
+    pub fn from_wire(bytes: &[u8]) -> Option<OwnRows> {
+        if bytes.is_empty() {
+            return None;
+        }
+        postcard::from_bytes(bytes).ok()
+    }
+}
+
 impl MutateOutcome {
     pub fn to_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_allocvec(self)

@@ -317,6 +317,23 @@ pub trait Replica {
     /// A client-visible reply whose effects are not installed here
     /// observed `pos`: local reads wait for it.
     fn raise_observed(&self, pos: Position);
+    /// [`Self::raise_observed`], except for the journal rows `excused`
+    /// (chunk metered-own-rows: this node's own transactions whose effects
+    /// it carries; `SessionState::raise_observed_excusing`).
+    fn raise_observed_excusing(&self, pos: Position, excused: &[(u64, u64)]) {
+        let _ = excused;
+        self.raise_observed(pos)
+    }
+    /// Whether local reads wait for nothing `observed` names.
+    fn reaches_observed(&self) -> bool {
+        false
+    }
+    /// Chunk metered-own-rows: which of this node's ops `rids` this
+    /// replica carries the effect of (`Meta::effects_installed`).
+    fn effects_installed(&self, rids: &[Rid]) -> std::collections::BTreeSet<Rid> {
+        let _ = rids;
+        std::collections::BTreeSet::new()
+    }
     /// Speculation for `keys` was installed from a reply at `pos`: reads of
     /// those keys need not wait for positions up to it.
     fn note_covering(&self, keys: KeySet, pos: Position);
@@ -386,14 +403,17 @@ pub trait Replica {
     /// `gen`'s, 0: the root's, with `records`) waits for — its own
     /// manifests' and those of what it depends on — and its last journal
     /// seq while unshipped (`Meta::remote_blockers`): `Core::own_chunks_for`.
+    /// With `upto`, through that journal seq (the reply's position), and
+    /// `node`'s own transactions through it.
     fn remote_blockers(
         &self,
         rid: Rid,
         gen: u64,
         records: &[LogRecord],
         node: NodeId,
+        upto: Option<u64>,
     ) -> constellation_meta::RemoteBlockers {
-        let _ = (rid, gen, records, node);
+        let _ = (rid, gen, records, node, upto);
         Default::default()
     }
     /// The highest journal seq allocated (0: none).
@@ -766,12 +786,13 @@ impl Replica for Meta {
                 jseq: through,
             });
         }
-        self.session().advance(
+        self.session().advance_rows(
             seq,
             Some(JournalPos {
                 epoch,
                 jseq: through,
             }),
+            rows,
         );
         Ok(Applied {
             stranded: applied.stranded,
@@ -951,6 +972,19 @@ impl Replica for Meta {
         self.session().raise_observed(pos)
     }
 
+    fn raise_observed_excusing(&self, pos: Position, excused: &[(u64, u64)]) {
+        self.session().raise_observed_excusing(pos, excused)
+    }
+
+    fn reaches_observed(&self) -> bool {
+        self.session().reaches_observed()
+    }
+
+    fn effects_installed(&self, rids: &[Rid]) -> std::collections::BTreeSet<Rid> {
+        // An error reads as "not here": the ops' rows are then waited for.
+        Meta::effects_installed(self, rids).unwrap_or_default()
+    }
+
     fn note_covering(&self, keys: KeySet, pos: Position) {
         self.session().note_covering(keys, pos)
     }
@@ -1055,10 +1089,11 @@ impl Replica for Meta {
         gen: u64,
         records: &[LogRecord],
         node: NodeId,
+        upto: Option<u64>,
     ) -> constellation_meta::RemoteBlockers {
         // An error reads as "everything of `node`'s pending here": the
         // forwarder uploads what may be needed (a cost, never a stall).
-        Meta::remote_blockers(self, rid, gen, records, node).unwrap_or_else(|_| {
+        Meta::remote_blockers(self, rid, gen, records, node, upto).unwrap_or_else(|_| {
             let mut inos: Vec<_> = Meta::remote_chunks(self)
                 .unwrap_or_default()
                 .into_iter()
@@ -1070,6 +1105,7 @@ impl Replica for Meta {
             constellation_meta::RemoteBlockers {
                 inos,
                 through: None,
+                own: None,
             }
         })
     }

@@ -300,6 +300,8 @@ fn replay_seed() {
         Ok("flex-long") => flex_config(),
         Ok("flex-backup") => flex_backup_config(),
         Ok("flex-zero") => flex_zero_config(),
+        Ok("metered-shared") => metered_shared_config(),
+        Ok("metered-shared-unbacked") => metered_shared_unbacked_config(),
         // Plan 30 §M11.
         Ok("delegated") => delegated_config(),
         Ok("delegated-marker") => delegated_marker_config(),
@@ -2132,6 +2134,9 @@ struct FlexTotals {
     remote_dropped: u64,
     members_gone: u64,
     converged: u64,
+    /// Chunk metered-own-rows: replies whose position was excused rows of
+    /// the requester's own (`CoreStats::own_rows_excused`).
+    own_rows_excused: u64,
 }
 
 fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTotals {
@@ -2158,6 +2163,7 @@ fn run_flex(label: &str, cfg: SimConfig, seeds: std::ops::Range<u64>) -> FlexTot
             t.promise_puts += s.promise_puts;
             t.promise_answers += s.promise_requests_answered;
             t.flush_exempt += s.promise_flush_exempt;
+            t.own_rows_excused += s.own_rows_excused;
         }
     }
     eprintln!("{label}: {t:?}");
@@ -2233,6 +2239,13 @@ fn flex_a_member_dies_with_the_only_copy_of_a_chunk_and_returns() {
     assert_eq!(t.members_gone, 0, "{t:?}");
     assert_eq!(t.remote_dropped, 0, "nothing needs dropping: {t:?}");
     assert_eq!(t.converged, t.seeds, "every seed converges: {t:?}");
+    // Chunk metered-own-rows: a member's write deferred on the hold
+    // owner's chunk wait sits below positions the member's other ops
+    // observe; those are excused, not waited for.
+    assert!(
+        t.own_rows_excused > 0,
+        "no reply ever excused the requester's own rows: {t:?}"
+    );
 }
 
 /// The same member never returns (`flex_crash_config`): the log still
@@ -2250,6 +2263,67 @@ fn flex_crash_a_member_gone_for_good_is_dropped_by_the_operator() {
     );
     assert!(t.deferred_seen > 0, "{t:?}");
     assert_eq!(t.converged, t.seeds, "every seed converges: {t:?}");
+}
+
+// ---- chunk metered-own-rows: a non-owner's held writes ----
+
+/// Chunk metered-own-rows: every node writes the files it creates (one
+/// chunk each) on the four names all nodes share, and a metered upload
+/// hold keeps each chunk on its writer for 3 s unless an op's or an
+/// observed position's durability need uploads it
+/// (`Action::UploadAwaited`). A non-owner's write therefore stays
+/// deferred on the sequencer across the other nodes' creates, unlinks,
+/// renames and reads of the same names, and across its own node's later
+/// ops, whose replies excuse its own rows below their positions
+/// (`Core::settle_own_rows`): its reads see its own writes, other nodes
+/// still wait for the log. Backups stream ahead of S3, as in
+/// `long-backup`; the CI's random faults on top.
+fn metered_shared_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 8,
+        read_ratio: 0.3,
+        chunk_writes: 0.6,
+        upload_hold_ms: 3_000,
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        ..SimConfig::default()
+    }
+}
+
+/// The same without backups: every wait on a held write is an upload
+/// (`OwnChunks::Upload`), never the stream.
+fn metered_shared_unbacked_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::sim_core_config),
+        ..metered_shared_config()
+    }
+}
+
+/// Chunk metered-own-rows: linearizable, read-your-writes and converged
+/// with writes held back on their writers, and the excuse fires (replies
+/// excuse own rows; chunks are held back by the hold).
+#[test]
+fn metered_shared_writes_held_across_other_nodes_ops() {
+    for (label, cfg) in [
+        ("metered-shared", metered_shared_config()),
+        ("metered-shared-unbacked", metered_shared_unbacked_config()),
+    ] {
+        let (mut excused, mut held, mut converged) = (0, 0, 0);
+        for seed in 1200..1230 {
+            let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            excused += report
+                .stats
+                .values()
+                .map(|s| s.own_rows_excused)
+                .sum::<u64>();
+            held += report.held_back;
+            converged += u64::from(report.converged_checked);
+        }
+        eprintln!("{label}: excused {excused}, held back {held}, converged {converged}/30");
+        assert!(held > 0, "{label}: the hold never kept a chunk back");
+        assert!(excused > 0, "{label}: no reply ever excused own rows");
+    }
 }
 
 /// Plan 30 §M10's documented gap: a node enrolled *during* an epoch is
@@ -2521,6 +2595,8 @@ fn sweep_config() {
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
         "flex-crash" => flex_crash_config(),
+        "metered-shared" => metered_shared_config(),
+        "metered-shared-unbacked" => metered_shared_unbacked_config(),
         // The lock configurations (`long_locks` runs them in sequence).
         "locks" => locks_config(),
         "locks-partition" => locks_partition_config(),
@@ -2542,7 +2618,12 @@ fn sweep_config() {
     let epoch_streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Fix "capture under an epoch hold": [remote rows enrolled, ship
     // plans seen deferring, transactions dropped for a departed member].
+    // Chunk metered-own-rows: [replies excusing own rows, own chunks a
+    // pass left held, own chunks uploaded past the hold].
     let chunks = std::sync::Arc::new([
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
@@ -2567,10 +2648,13 @@ fn sweep_config() {
                         streamed.fetch_add(s.awaited_log_streamed, ord);
                         streamed_deleg.fetch_add(s.awaited_log_streamed_deleg, ord);
                         epoch_streamed.fetch_add(s.epoch_streamed_installed, ord);
+                        chunks[3].fetch_add(s.own_rows_excused, ord);
                     }
                     chunks[0].fetch_add(report.remote_enrolled, ord);
                     chunks[1].fetch_add(report.deferred_seen, ord);
                     chunks[2].fetch_add(report.remote_dropped, ord);
+                    chunks[4].fetch_add(report.held_back, ord);
+                    chunks[5].fetch_add(report.awaited_uploaded, ord);
                 }
                 Err(e) => {
                     let head: String = e.lines().take(3).collect::<Vec<_>>().join(" | ");
@@ -2588,7 +2672,8 @@ fn sweep_config() {
     eprintln!(
         "sweep {label} {start}..{}: {} failing: {f:?}; answered from the stream: {} ({} a delegate's); \
          installed from an epoch's stream: {}; remote chunks enrolled: {}, ship plans deferring: {}, \
-         dropped for a departed member: {}",
+         dropped for a departed member: {}; replies excusing own rows: {}, own chunks held \
+         back: {}, uploaded past the hold: {}",
         start + seeds,
         f.len(),
         streamed.load(std::sync::atomic::Ordering::Relaxed),
@@ -2597,6 +2682,9 @@ fn sweep_config() {
         chunks[0].load(std::sync::atomic::Ordering::Relaxed),
         chunks[1].load(std::sync::atomic::Ordering::Relaxed),
         chunks[2].load(std::sync::atomic::Ordering::Relaxed),
+        chunks[3].load(std::sync::atomic::Ordering::Relaxed),
+        chunks[4].load(std::sync::atomic::Ordering::Relaxed),
+        chunks[5].load(std::sync::atomic::Ordering::Relaxed),
     );
     assert!(f.is_empty(), "failing seeds: {f:?}");
 }

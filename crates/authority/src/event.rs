@@ -340,6 +340,14 @@ pub enum PeerMsg {
         /// `Accepted`, and on a `Held` only while the acknowledgement
         /// itself waits for durability; `None` on every other answer.
         own_chunks: OwnChunks,
+        /// Chunk metered-own-rows: which of the unshipped transactions
+        /// through `position` are the requester's own, and what the rest
+        /// wait for of its chunks (`constellation_meta::OwnRows`), so it
+        /// waits, and uploads, only for what it lacks
+        /// (`Core::settle_own_rows`). `None`: not worked out (nothing of
+        /// the requester's pending there, a `Held`, a delegate's answer):
+        /// everything through the position is owed.
+        own_rows: Option<constellation_meta::OwnRows>,
     },
     /// "I want the lease" (`Payload::LeaseRequest`), sent to the holder.
     /// `epoch_applied`: `Some(applied)` asks for a continuation epoch's

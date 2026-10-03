@@ -1603,7 +1603,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "writeback-close-metered-nonowner",
-        desc: "plan 31 C8 + write-back: a non-owner's back close with its uploads held (metered), forwarded before it applied the holder's create of the file, returns promptly by uploading its own chunks when nothing else can bring its record back (unbacked holder: was a 120 s stall ending in doubt; ack=s3: likewise) and keeps them held when a backed holder's stream answers; then a chmod and a rename right after a back close that returned with its chunk held (ops depending on that close: also a 120 s stall before), in all three modes; content readable on the writer at once and on both nodes once unmetered",
+        desc: "plan 31 C8 + write-back: a non-owner's back close answered at once keeps its chunk held through a later refusal whose position only its own deferred rows hold back (no upload, no read wait); a non-owner's back close with its uploads held (metered), forwarded before it applied the holder's create of the file, returns promptly by uploading its own chunks when nothing else can bring its record back (unbacked holder: was a 120 s stall ending in doubt; ack=s3: likewise) and keeps them held when a backed holder's stream answers; then a chmod and a rename right after a back close that returned with its chunk held (ops depending on that close: also a 120 s stall before), in all three modes; content readable on the writer at once and on both nodes once unmetered",
         requires: &[],
         caps: &[],
         run: lifecycle::writeback_close_metered_nonowner,

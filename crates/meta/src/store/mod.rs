@@ -625,6 +625,9 @@ pub struct Meta {
     /// poisoned or held; the cost tests in `store::local` pin that it stays
     /// at zero otherwise.
     pub(crate) held_work: AtomicU64,
+    /// Chunk metered-own-rows: per forwarding node, the ship rule's blame
+    /// walk kept between answers (`held::BlameCache`).
+    pub(crate) blame_cache: std::sync::Mutex<std::collections::HashMap<u64, held::BlameCache>>,
     /// Plan 30 §M6: positions, the `observed` watermark and the read
     /// wait (`crate::session`).
     pub(crate) session: crate::session::SessionState,
@@ -830,6 +833,7 @@ impl Meta {
             unshipped_seqs: std::sync::Mutex::new(UnshippedSeqs::default()),
             backup_tail_floor: std::sync::Mutex::new(None),
             held_work: AtomicU64::new(0),
+            blame_cache: Default::default(),
             session: crate::session::SessionState::default(),
             read_delegations: crate::readdeleg::ReadDelegations::default(),
             locks: crate::locks::LockTables::default(),
@@ -844,6 +848,7 @@ impl Meta {
         meta.check_format()?;
         meta.bootstrap()?;
         meta.build_pending_by_ino()?;
+        meta.verify_mark_counts()?;
         let table = meta.delegation_table();
         meta.deleg_any
             .store(!table.is_empty(), std::sync::atomic::Ordering::Release);

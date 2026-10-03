@@ -46,7 +46,7 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
-use crate::store::held::{deferral_blame, seed_inos_of, DeferralBlame, PoisonMap};
+use crate::store::held::{blame_walk, seed_inos_of, DeferralBlame, PoisonMap};
 use crate::store::misc::{add_pending_claim_tx, cr_key, remove_pending_row_tx};
 use crate::store::{counter_add_tx, counter_get, local, Meta};
 use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
@@ -294,6 +294,12 @@ pub struct RemoteBlockers {
     /// The transaction's last journal seq, when it is still unshipped
     /// here.
     pub through: Option<u64>,
+    /// Chunk metered-own-rows: given the reply's position, the node's own
+    /// transactions through it and the rest's blame
+    /// (`constellation_meta::OwnRows`). `None`: not worked out (no
+    /// position, a delegate's execution, nothing of the node's pending
+    /// here, more than `OWN_ROWS_CAP` of its transactions).
+    pub own: Option<crate::mutate::OwnRows>,
 }
 
 /// [`Meta::remote_blockers`] for a delegate: the inodes of `theirs` that
@@ -351,6 +357,65 @@ impl Meta {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Chunk metered-own-rows (review nit): recount every node's marks and
+    /// rewrite a count that disagrees (`Meta::open`). A count of 0 is the
+    /// holder's "nothing of that node's is pending here" answer
+    /// ([`Self::remote_blockers`]' one point read); with live marks behind
+    /// it the forwarder would never be asked to upload them, and its ops
+    /// would stall silently — the counts saturate at 0, so one lost
+    /// increment would do it. Stale marks count, as everywhere. Returns
+    /// how many counts were rewritten.
+    pub(crate) fn verify_mark_counts(&self) -> Result<usize, MetaError> {
+        let mut tx = self.db.write_tx();
+        let mut want: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        for guard in tx.prefix(&self.local, REMOTE_PREFIX) {
+            let (k, v) = guard.into_inner()?;
+            if let Some(mark) = decode_mark(&k, &v) {
+                *want.entry(mark.node).or_default() += 1;
+            }
+        }
+        let mut have: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        for guard in tx.prefix(&self.local, MARK_COUNT_PREFIX) {
+            let (k, _) = guard.into_inner()?;
+            let node = std::str::from_utf8(&k[MARK_COUNT_PREFIX.len()..])
+                .ok()
+                .and_then(|n| n.parse::<u64>().ok());
+            if let Some(node) = node {
+                have.insert(node, counter_get(&tx, &self.local, &mark_count_key(node))?);
+            }
+        }
+        let mut fixed = 0;
+        for node in want
+            .keys()
+            .chain(have.keys())
+            .copied()
+            .collect::<BTreeSet<u64>>()
+        {
+            let (w, h) = (
+                want.get(&node).copied().unwrap_or(0),
+                have.get(&node).copied().unwrap_or(0),
+            );
+            if w != h {
+                tracing::warn!(
+                    node,
+                    marks = w,
+                    counted = h,
+                    "a forwarder's remote-mark count disagreed with its marks: rewritten"
+                );
+                if w == 0 {
+                    tx.remove(&self.local, mark_count_key(node).into_bytes());
+                } else {
+                    crate::store::counter_set_tx(&mut tx, &self.local, &mark_count_key(node), w);
+                }
+                fixed += 1;
+            }
+        }
+        if fixed > 0 {
+            tx.commit()?;
+        }
+        Ok(fixed)
     }
 
     /// The remote mark of `(hash, ino)`'s pending row, if the row exists
@@ -517,29 +582,75 @@ impl Meta {
     /// them when it must wait for the transaction or its position. One
     /// point read (the node's mark count) when `node` has no mark here
     /// (the common case).
+    ///
+    /// Chunk metered-own-rows: with `upto` (the journal seq of the
+    /// position the reply carries), through that position, and also which
+    /// of those transactions are `node`'s own and what each waits for
+    /// ([`RemoteBlockers::own`]); without it, through the rid's
+    /// transaction, or the whole journal when it has none. The walk is
+    /// kept per node between calls (`held::blame_walk`).
     pub fn remote_blockers(
         &self,
         rid: crate::rid::Rid,
         gen: u64,
         records: &[LogRecord],
         node: u64,
+        upto: Option<u64>,
     ) -> Result<RemoteBlockers, MetaError> {
         let r = self.db.read_tx();
         let theirs = remote_pending_from_tx(&r, self, node)?;
         if theirs.is_empty() {
+            // Nothing of the node's pending here: its walk is moot (and
+            // would otherwise stay cached, see `held::blame_walk`).
+            self.blame_cache.lock().unwrap().remove(&node);
             return Ok(RemoteBlockers::default());
         }
         let mut inos: BTreeSet<Ino> = seed_inos_of(records, &theirs).into_iter().collect();
-        let found = if gen == 0 {
-            deferral_blame(&r, self, rid, &theirs)?
-        } else {
-            delegate_blame(&r, self, gen, rid, &theirs)?
+        if gen != 0 {
+            let found = delegate_blame(&r, self, gen, rid, &theirs)?;
+            let through = found.tx.as_ref().map(|(last, _)| *last);
+            inos.extend(found.through);
+            return Ok(RemoteBlockers {
+                inos: inos.into_iter().collect(),
+                through,
+                own: None,
+            });
+        }
+        let kept = blame_walk(&r, self, node, &theirs, upto.unwrap_or(u64::MAX))?;
+        let found = kept.iter().find(|k| k.rid == Some(rid));
+        let through = found.map(|k| k.last);
+        // Without a position, through the rid's transaction (or all).
+        let bound = match (upto, found) {
+            (Some(upto), _) => upto,
+            (None, Some(k)) => k.last,
+            (None, None) => u64::MAX,
         };
-        let through = found.tx.as_ref().map(|(last, _)| *last);
-        inos.extend(found.through);
+        let mut others: BTreeSet<Ino> = BTreeSet::new();
+        let mut own = Vec::new();
+        for k in kept.iter().filter(|k| k.first <= bound) {
+            let waits = k.waits.clone().unwrap_or_default();
+            inos.extend(&waits);
+            match k.rid {
+                Some(r) if r.node == node => own.push(crate::mutate::OwnTx {
+                    rid: r,
+                    first: k.first,
+                    last: k.last,
+                    effect: k.effect,
+                    waits: waits.into_iter().collect(),
+                }),
+                _ => others.extend(waits),
+            }
+        }
+        let own = (upto.is_some() && own.len() <= crate::mutate::OWN_ROWS_CAP).then(|| {
+            crate::mutate::OwnRows {
+                txs: own,
+                others: others.into_iter().collect(),
+            }
+        });
         Ok(RemoteBlockers {
             inos: inos.into_iter().collect(),
             through,
+            own,
         })
     }
 }
@@ -588,6 +699,35 @@ mod tests {
         meta.ack_upload(&b, f.ino).unwrap();
         assert!(!meta.awaits_remote_chunk(&b).unwrap());
         assert!(meta.remote_chunks().unwrap().is_empty());
+    }
+
+    /// Chunk metered-own-rows: a count that disagrees with the marks (here
+    /// zeroed, as a saturated decrement would leave it) is rewritten at
+    /// open, and the holder sees the node's pending chunks again.
+    #[test]
+    fn a_wrong_mark_count_is_rebuilt() {
+        let meta = Meta::open_in_memory().unwrap();
+        let (a, b) = (ChunkHash::of(b"a"), ChunkHash::of(b"b"));
+        meta.enroll_remote_chunks(42, &[a, b], 7).unwrap();
+        meta.enroll_remote_chunks(43, &[a], 8).unwrap();
+        assert_eq!(meta.verify_mark_counts().unwrap(), 0, "consistent");
+        let pending = |meta: &Meta, node: u64| {
+            let r = meta.db.read_tx();
+            remote_pending_from_tx(&r, meta, node).unwrap().len()
+        };
+        let mut tx = meta.db.write_tx();
+        crate::store::counter_set_tx(&mut tx, &meta.local, &mark_count_key(7), 0);
+        crate::store::counter_set_tx(&mut tx, &meta.local, &mark_count_key(9), 3);
+        tx.commit().unwrap();
+        assert_eq!(pending(&meta, 7), 0, "the stall: node 7 reads as clean");
+        assert_eq!(meta.verify_mark_counts().unwrap(), 2);
+        assert_eq!(pending(&meta, 7), 1);
+        assert_eq!(pending(&meta, 8), 1);
+        let r = meta.db.read_tx();
+        assert_eq!(counter_get(&r, &meta.local, &mark_count_key(7)).unwrap(), 2);
+        assert_eq!(counter_get(&r, &meta.local, &mark_count_key(9)).unwrap(), 0);
+        drop(r);
+        assert_eq!(meta.verify_mark_counts().unwrap(), 0);
     }
 
     /// Chunk close-stall-followup: each node's mark count follows every
@@ -705,7 +845,7 @@ mod tests {
             seq: 1,
         };
         let waits = |records: &[LogRecord], node: u64| {
-            let b = meta.remote_blockers(rid, 0, records, node).unwrap();
+            let b = meta.remote_blockers(rid, 0, records, node, None).unwrap();
             assert_eq!(b.through, None, "never journaled here");
             !b.inos.is_empty()
         };
@@ -718,7 +858,12 @@ mod tests {
         assert!(!waits(&records(&[a]), 2));
         assert!(waits(&records(&[c]), 3));
         assert!(!waits(&[], 2));
+        let cached = |node: u64| meta.blame_cache.lock().unwrap().contains_key(&node);
+        assert!(cached(2) && cached(3), "each node's walk is kept");
         meta.ack_remote_chunks(&[b]).unwrap();
         assert!(!waits(&records(&[a, b]), 2));
+        // Chunk metered-own-rows (review): node 2 has nothing pending
+        // here any more, so its walk is dropped, not kept forever.
+        assert!(!cached(2) && cached(3));
     }
 }

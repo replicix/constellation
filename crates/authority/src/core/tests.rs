@@ -1140,6 +1140,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
             position: constellation_meta::Position::ZERO,
             gen: 0,
             own_chunks: OwnChunks::None,
+            own_rows: None,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -1526,6 +1527,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
             position: constellation_meta::Position::ZERO,
             gen: 0,
             own_chunks: OwnChunks::None,
+            own_rows: None,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -1609,6 +1611,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
             position: constellation_meta::Position::ZERO,
             gen: 0,
             own_chunks: OwnChunks::None,
+            own_rows: None,
         },
     });
     let answered: Vec<Rid> = replies(&out).into_iter().map(|(rid, _)| rid).collect();
@@ -2002,6 +2005,7 @@ fn awaiting_log_forward(name: &str) -> (Harness, Rid, Vec<LogRecord>) {
             },
             gen: 0,
             own_chunks: OwnChunks::None,
+            own_rows: None,
         },
     });
     assert!(replies(&out).is_empty(), "the op waits for the log");
@@ -2446,6 +2450,7 @@ mod own_chunks {
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
                 own_chunks: OwnChunks::None,
+                own_rows: None,
             },
         });
         assert!(uploads_awaited(&out).is_empty());
@@ -2756,6 +2761,7 @@ mod own_chunks {
                 },
                 gen: 0,
                 own_chunks: OwnChunks::Streamed(vec![ino]),
+                own_rows: None,
             },
         });
         assert_eq!(
@@ -2970,6 +2976,408 @@ mod own_chunks {
         assert_eq!(tick(&mut holder, wait), OwnChunks::None, "refreshed");
     }
 
+    /// Chunk metered-own-rows: node 1 holds unbacked; `name` is created
+    /// and shipped at seq 5, and node 2 applied that segment, so a close
+    /// of it by node 2 is answered on a base it has. Returns the inode.
+    fn shipped_file(holder: &mut Harness, requester: &Harness, name: &str) -> u64 {
+        let create = holder.create(name);
+        let MutateOp::Create { ino, .. } = create else {
+            unreachable!()
+        };
+        let created = constellation_meta::execute_mutate(&holder.meta, &create, None).unwrap();
+        ship_at(holder, Some(requester), 5);
+        let _ = created;
+        ino
+    }
+
+    /// Node 1 ships what its plan lets ship as segment `seq` (the deferred
+    /// rows stay); `requester`, if given, applies the segment. Returns the
+    /// rows shipped.
+    fn ship_at(holder: &mut Harness, requester: Option<&Harness>, seq: u64) -> Vec<u64> {
+        let batch: Vec<(u64, LogRecord)> = holder
+            .meta
+            .take_journal_grouped(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, b)| b)
+            .collect();
+        let rows: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+        let records: Vec<LogRecord> = batch.into_iter().map(|(_, r)| r).collect();
+        let through = Replica::journal_through_after(&holder.meta, &rows).unwrap();
+        holder.meta.ack_journal_rows_at(&rows, seq).unwrap();
+        holder.core.shipped_floor = seq;
+        holder.core.ship.head_seq = seq;
+        holder.core.ship.next_seq = seq + 1;
+        if let Some(r) = requester {
+            Replica::apply_segment(&r.meta, seq, 1, through, &rows, &[], &records).unwrap();
+        }
+        rows
+    }
+
+    fn own_rows_of(msg: &PeerMsg) -> Option<constellation_meta::OwnRows> {
+        match msg {
+            PeerMsg::MutateReply { own_rows, .. } => own_rows.clone(),
+            other => panic!("not a reply: {other:?}"),
+        }
+    }
+
+    /// Node 2's `back` close of `ino`, its chunk pending on node 2.
+    fn held_close(holder: &Harness, ino: u64) -> MutateOp {
+        let chunk = ChunkHash::of(&ino.to_be_bytes());
+        holder.meta.enroll_remote_chunks(ino, &[chunk], 2).unwrap();
+        MutateOp::SetManifest {
+            ino,
+            base_manifest: None,
+            manifest: Manifest::from_sparse_chunks(
+                4096,
+                14,
+                [(0u64, chunk)].into(),
+                64,
+                ChunkHash::of,
+            )
+            .0
+            .encode(),
+            size: 14,
+        }
+    }
+
+    fn unlink_missing(name: &str) -> MutateOp {
+        MutateOp::Unlink {
+            parent: ROOT_INO,
+            name: name.into(),
+        }
+    }
+
+    /// Chunk metered-own-rows (coordinator decision): node 2's close of
+    /// `g`, answered at once on a base it has, keeps its chunk held there
+    /// and its rows deferred here, below every later segment's `through`.
+    /// A refusal of node 2's then observes this journal's position. Node 1
+    /// still names `g` for it (a requester that lacked the close would
+    /// need it), but also says the rows through the position are node 2's
+    /// own: the close, which node 2 carries as a shadow, and the refusal,
+    /// which changes nothing. Node 2 excuses them: it uploads nothing, and
+    /// its reads wait for nothing. Before, it uploaded `g` (`pending 0`
+    /// on a metered network).
+    ///
+    /// Then another node's op interleaves below the position. One that
+    /// ships on its own (node 3's create) is waited for, without an upload,
+    /// until its segment arrives (shipped ahead of the close: `through`
+    /// still stops below the close). One deferred behind the close (node
+    /// 3's chmod of `g`) is waited for too, and only node 2's upload
+    /// releases it: `g` is uploaded.
+    #[test]
+    fn a_position_behind_only_own_rows_is_excused() {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let g = shipped_file(&mut holder, &requester, "g");
+        let close = requester.rid(1);
+        let op = held_close(&holder, g);
+        let (reply, out) = forward(&mut holder, &mut requester, close, op);
+        assert!(matches!(
+            own_chunks_of(&reply).1,
+            MutateOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            own_chunks_of(&reply).0,
+            OwnChunks::None,
+            "installed at once"
+        );
+        assert!(uploads_awaited(&out).is_empty());
+        assert_eq!(requester.core.clients().count(), 0, "answered: {out:?}");
+
+        let refusal = requester.rid(2);
+        let (reply, out) = forward(&mut holder, &mut requester, refusal, unlink_missing("m1"));
+        assert!(
+            matches!(own_chunks_of(&reply).1, MutateOutcome::Errno(_)),
+            "{reply:?}"
+        );
+        assert_eq!(own_chunks_of(&reply).0, OwnChunks::Upload(vec![g]));
+        let rows = own_rows_of(&reply).expect("worked out");
+        assert!(rows.others.is_empty(), "{rows:?}");
+        let txs: Vec<(Rid, bool, Vec<u64>)> = rows
+            .txs
+            .iter()
+            .map(|t| (t.rid, t.effect, t.waits.clone()))
+            .collect();
+        assert_eq!(txs, vec![(close, true, vec![g]), (refusal, false, vec![])]);
+        assert!(
+            uploads_awaited(&out).is_empty(),
+            "nothing to upload: {out:?}"
+        );
+        assert_eq!(requester.core.stats.own_rows_excused, 1);
+        assert_eq!(requester.core.stats.own_record_uploads, 0);
+        assert!(
+            requester.meta.session().reaches_observed(),
+            "only node 2's own rows are behind the position"
+        );
+
+        // Node 3's create: ships on its own.
+        let create = holder.create("h3");
+        let rid3 = |seq| Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &create, Some(rid3(1))).unwrap();
+        let rid = requester.rid(3);
+        let (reply, out) = forward(&mut holder, &mut requester, rid, unlink_missing("m2"));
+        assert_eq!(own_rows_of(&reply).unwrap().others, Vec::<u64>::new());
+        assert!(uploads_awaited(&out).is_empty(), "{out:?}");
+        assert!(
+            !requester.meta.session().reaches_observed(),
+            "node 3's create is owed"
+        );
+        let shipped = ship_at(&mut holder, Some(&requester), 6);
+        assert!(!shipped.is_empty());
+        assert!(
+            requester.meta.session().reaches_observed(),
+            "node 3's rows arrived, shipped ahead of the deferred close"
+        );
+
+        // Node 3's chmod of `g`: deferred behind node 2's close.
+        let chmod = MutateOp::Setattr {
+            ino: g,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &chmod, Some(rid3(2))).unwrap();
+        let rid = requester.rid(4);
+        let (reply, out) = forward(&mut holder, &mut requester, rid, unlink_missing("m3"));
+        assert_eq!(own_rows_of(&reply).unwrap().others, vec![g]);
+        assert_eq!(
+            uploads_awaited(&out),
+            vec![g],
+            "only the upload releases it"
+        );
+        assert!(!requester.meta.session().reaches_observed());
+    }
+
+    /// Chunk metered-own-rows (the follow-up review's dedup skip): node
+    /// 2's create `x` is accepted but the reply is lost; node 1 ships it
+    /// (its journal empties). Node 2's close of `g` is then answered at
+    /// once and deferred here. Node 2's forward of `x` times out and is
+    /// sent again: node 1 answers from its dedup, on a base node 2 has
+    /// applied. Node 2 has `x` from the log already, so it installs
+    /// nothing and observes the reply's position, behind the deferred
+    /// close. With the base-covered skip applied to the dedup answer it
+    /// carried no `own_chunks` nor `own_rows`: node 2's reads waited for
+    /// the close until the watermark's TTL (10 s).
+    #[test]
+    fn a_dedup_answer_still_says_what_its_position_waits_for() {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let g = shipped_file(&mut holder, &requester, "g");
+        let x = requester.rid(1);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid: x,
+            op: requester.create("x"),
+        });
+        let [(1, first)] = sends(&out)[..] else {
+            panic!("a forward: {out:?}")
+        };
+        let first = first.clone();
+        let timeout = timers(&out, TimerKind::ForwardTimeout)[0];
+        let lost = holder.step(Event::Peer {
+            from: 2,
+            msg: first,
+        });
+        assert_eq!(replies_to(&lost, 2).len(), 1, "answered, then lost");
+        ship_at(&mut holder, Some(&requester), 6);
+        let close = requester.rid(2);
+        let op = held_close(&holder, g);
+        let (reply, _) = forward(&mut holder, &mut requester, close, op);
+        assert!(matches!(
+            own_chunks_of(&reply).1,
+            MutateOutcome::Accepted { .. }
+        ));
+        assert!(requester.meta.session().reaches_observed());
+        // The retry.
+        requester.advance(requester.core.cfg.forward_timeout_ms);
+        let mut out = requester.step(Event::Timer { id: timeout });
+        for _ in 0..4 {
+            if !sends(&out).is_empty() {
+                break;
+            }
+            let backoff = timers(&out, TimerKind::ForwardBackoff);
+            let [id] = backoff[..] else {
+                panic!("a backoff or a retry: {out:?}")
+            };
+            requester.advance(requester.core.cfg.forward_backoff_ms * 4);
+            out = requester.step(Event::Timer { id });
+        }
+        let [(1, retry)] = sends(&out)[..] else {
+            panic!("the retry: {out:?}")
+        };
+        let retry = retry.clone();
+        let hits = holder.core.stats.forward_dedup_hits;
+        let answer = holder.step(Event::Peer {
+            from: 2,
+            msg: retry,
+        });
+        assert_eq!(holder.core.stats.forward_dedup_hits, hits + 1);
+        let [reply] = &replies_to(&answer, 2)[..] else {
+            panic!("one reply: {answer:?}")
+        };
+        assert!(
+            own_rows_of(reply).is_some(),
+            "worked out for a dedup answer: {reply:?}"
+        );
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: reply.clone(),
+        });
+        assert_eq!(replies(&out).len(), 1, "x answered: {out:?}");
+        assert!(uploads_awaited(&out).is_empty());
+        assert!(
+            requester.meta.session().reaches_observed(),
+            "node 2's reads wait for nothing: the close behind the position is its own"
+        );
+    }
+
+    fn replies_to(actions: &[Action], to: NodeId) -> Vec<PeerMsg> {
+        sends(actions)
+            .into_iter()
+            .filter(|(n, m)| *n == to && matches!(m, PeerMsg::MutateReply { .. }))
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+
+    /// Chunk metered-own-rows (OVH run 31): after a deposition, a
+    /// stranded `back` close of node 2's is replayed through the new
+    /// holder, which answers it on a base node 2 lacks and says its stream
+    /// carries the transaction (`Streamed`). It may have carried it
+    /// already, before node 2's recovery rolled it back, and the stream
+    /// does not resend: each replay waited out the 10 s safety timer
+    /// before its upload, one after another. A replay uploads at once; a
+    /// client's op still trusts the stream.
+    #[test]
+    fn a_replay_answered_streamed_uploads_at_once() {
+        for replay in [true, false] {
+            let (_holder, mut requester) = pair();
+            let rid = requester.rid(1);
+            let ino = 77;
+            let op = MutateOp::SetManifest {
+                ino,
+                base_manifest: None,
+                manifest: vec![1, 2, 3],
+                size: 3,
+            };
+            let out = if replay {
+                requester.meta.queue_replay(rid, &op).unwrap();
+                let cfg = requester.core.cfg.clone();
+                requester.core = Core::new(cfg);
+                let mut out = Vec::new();
+                requester
+                    .core
+                    .start(requester.now, &requester.meta, &mut out);
+                requester.step(Event::Peers {
+                    links: [1, 3]
+                        .into_iter()
+                        .map(|node| crate::event::PeerLink {
+                            node,
+                            connected: true,
+                            last_seen: None,
+                            rtt_ms: Some(1),
+                            since: Some(Ms(0)),
+                        })
+                        .collect(),
+                });
+                requester.core.lease.cached_holder = Some(1);
+                let drain = timers(&out, TimerKind::ReplayDrain)[0];
+                requester.step(Event::Timer { id: drain })
+            } else {
+                requester.step(Event::Submit {
+                    policy: Policy::Client,
+                    rid,
+                    op,
+                })
+            };
+            let req = sends(&out)
+                .into_iter()
+                .find_map(|(to, m)| match m {
+                    PeerMsg::MutateRequest { req, rid: r, .. } if to == 1 && *r == rid => {
+                        Some(*req)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("forwarded: {out:?}"));
+            let out = requester.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::MutateReply {
+                    req,
+                    outcome: MutateOutcome::Accepted {
+                        epoch: 3,
+                        records: Vec::new(),
+                    },
+                    base: None,
+                    position: constellation_meta::Position {
+                        seq: 9,
+                        pending: Some(constellation_meta::JournalPos { epoch: 3, jseq: 55 }),
+                        streams: Default::default(),
+                    },
+                    gen: 0,
+                    own_chunks: OwnChunks::Streamed(vec![ino]),
+                    own_rows: None,
+                },
+            });
+            assert!(requester
+                .core
+                .clients()
+                .any(|(r, phase)| r == rid && phase == ClientPhase::AwaitingLog));
+            if replay {
+                assert_eq!(uploads_awaited(&out), vec![ino], "a replay: {out:?}");
+            } else {
+                assert!(uploads_awaited(&out).is_empty(), "a client's op: {out:?}");
+                assert_eq!(timers(&out, TimerKind::OwnRecordWait).len(), 1);
+            }
+        }
+    }
+
+    /// Chunk metered-own-rows (review nit): an observed position's upload
+    /// is repeated every `own_record_wait_ms` while the watermark stays
+    /// unreached (a pass that failed), and stops once it is reached.
+    #[test]
+    fn an_observed_upload_is_repeated_until_the_watermark_is_reached() {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (close, _, _) = back_close(&mut holder, true);
+        let MutateOp::SetManifest { ino, .. } = close else {
+            unreachable!()
+        };
+        let held = Rid {
+            node: 2,
+            incarnation: 7,
+            seq: 90,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &close, Some(held)).unwrap();
+        let rid = requester.rid(1);
+        let (_, out) = forward(&mut holder, &mut requester, rid, unlink_missing("m"));
+        assert_eq!(
+            uploads_awaited(&out),
+            vec![ino],
+            "an earlier incarnation's close"
+        );
+        let [t] = timers(&out, TimerKind::ObservedUpload)[..] else {
+            panic!("the repeat timer: {out:?}")
+        };
+        requester.advance(requester.core.cfg.own_record_wait_ms);
+        let out = requester.step(Event::Timer { id: t });
+        assert_eq!(uploads_awaited(&out), vec![ino], "repeated");
+        let [t] = timers(&out, TimerKind::ObservedUpload)[..] else {
+            panic!("armed again: {out:?}")
+        };
+        requester.meta.session().advance(
+            1_000,
+            Some(constellation_meta::JournalPos { epoch: 9, jseq: 1 }),
+        );
+        requester.advance(requester.core.cfg.own_record_wait_ms);
+        let out = requester.step(Event::Timer { id: t });
+        assert!(uploads_awaited(&out).is_empty(), "reached: {out:?}");
+        assert!(timers(&out, TimerKind::ObservedUpload).is_empty());
+    }
+
     /// Chunk close-stall-followup: the holder's cost of `own_chunks_for`
     /// per forwarded op, measured as the whole core step that answers it.
     /// A holder with a 10,000-transaction unshipped journal (its own
@@ -3127,6 +3535,39 @@ mod own_chunks {
                 tc.push(took);
             }
             report("node 2 (close pending), chmod of the held file", tc);
+            // Chunk metered-own-rows: node 2's refusals (an unlink of a
+            // name that does not exist), which observe the position.
+            let mut tr = Vec::new();
+            for i in 0..OPS {
+                let op = MutateOp::Unlink {
+                    parent: rd,
+                    name: format!("missing-{i}"),
+                };
+                let (took, out) = step(&mut holder, 2, op);
+                let [(2, reply)] = sends(&out)[..] else {
+                    panic!("{out:?}")
+                };
+                assert!(matches!(own_chunks_of(reply).1, MutateOutcome::Errno(_)));
+                assert_eq!(own_chunks_of(reply).0, OwnChunks::Upload(vec![f]));
+                tr.push(took);
+            }
+            report("node 2 (close pending), refusal", tr);
+            // The first answer after the plan's inputs change walks again:
+            // node 7 reports one chunk up before each refusal.
+            let mut tw = Vec::new();
+            for i in 0..20u64 {
+                let ino = 1_000_000 + i;
+                holder
+                    .meta
+                    .ack_remote_chunks(&[ChunkHash::of(&ino.to_be_bytes())])
+                    .unwrap();
+                let op = MutateOp::Unlink {
+                    parent: rd,
+                    name: format!("cold-{i}"),
+                };
+                tw.push(step(&mut holder, 2, op).0);
+            }
+            report("node 2, refusal after a pending row changed (re-walk)", tw);
         }
 
         #[test]
@@ -4722,6 +5163,7 @@ mod epoch_rules {
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
                 own_chunks: OwnChunks::None,
+                own_rows: None,
             },
         });
         assert!(replies(&out).is_empty(), "{out:?}");
@@ -6114,6 +6556,7 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
             position: constellation_meta::Position::ZERO,
             gen: 0,
             own_chunks: OwnChunks::None,
+            own_rows: None,
         },
     });
     let backoff = timers(&out, TimerKind::ForwardBackoff);
@@ -6834,6 +7277,7 @@ mod backup_crash {
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
                 own_chunks: OwnChunks::None,
+                own_rows: None,
             },
         });
         let r = replies(&out);
@@ -10480,6 +10924,7 @@ fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
             position: constellation_meta::Position::ZERO,
             gen: 0,
             own_chunks: OwnChunks::None,
+            own_rows: None,
         },
     });
     assert!(
@@ -10798,6 +11243,7 @@ mod portable_codes {
             position,
             gen,
             own_chunks,
+            own_rows,
         } = msg
         else {
             panic!("not a mutate reply: {msg:?}")
@@ -10812,6 +11258,7 @@ mod portable_codes {
             gen: *gen,
             own_chunks: own_chunks.to_wire().0,
             own_inos: own_chunks.to_wire().1,
+            own_rows: constellation_meta::OwnRows::to_wire(own_rows.as_ref()),
         };
         let key = iroh::SecretKey::from_bytes(&[7; 32]);
         let frame = Signed::new(&key, &payload).unwrap().encode().unwrap();
@@ -10826,6 +11273,7 @@ mod portable_codes {
             gen,
             own_chunks,
             own_inos,
+            own_rows,
         } = received
         else {
             panic!("the frame decoded to another payload")
@@ -10842,6 +11290,7 @@ mod portable_codes {
             .with_streams_wire(&position_streams),
             gen,
             own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
+            own_rows: constellation_meta::OwnRows::from_wire(&own_rows),
         };
         (decoded, outcome)
     }

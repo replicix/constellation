@@ -30,6 +30,12 @@ use std::time::{Duration, Instant};
 /// Post-fix, B's rename blocks in `AwaitingLog` until the holds lift and
 /// the log carries the unlink and the rename in order, and A, B and C
 /// agree `f2` is `f1`'s inode with `f1`'s content and `f1` is gone.
+///
+/// No backups (`CONSTELLATION_BACKUPS=0` on every node): with one, A's
+/// tenure is backed and its pre-S3 stream carries the unlink to every
+/// subscriber, B included, which the sync hold does not stop — B then
+/// saw the unlink before its rename and the shape never formed (the
+/// scenario failed with "B already sees the unlink" since plan 30 §M9).
 pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
     let (env, root) = setup("stale-base-rename-divergence")?;
     let _proxy = env.s3_proxy()?;
@@ -37,7 +43,9 @@ pub fn stale_base_rename_divergence(_seed: u64) -> Result<()> {
     let hold_a = root.path().join("hold-a");
     let hold_b = root.path().join("hold-b");
     let mk = |name: &str, hold: Option<&Path>| -> Result<Client> {
-        let mut c = Client::new(root.path(), name, &env.endpoint, &backend)?.with_own_node_key();
+        let mut c = Client::new(root.path(), name, &env.endpoint, &backend)?
+            .with_own_node_key()
+            .with_env("CONSTELLATION_BACKUPS", "0");
         if let Some(hold) = hold {
             c = c.with_env(
                 "CONSTELLATION_FAULT_HOLD_SYNC_FILE",

@@ -322,16 +322,44 @@ struct Tx {
 /// The unshipped journal grouped into transactions, in journal order.
 /// Rows without a `journal_tx` row are one-row, uncaptured transactions.
 fn transactions(r: &impl Readable, meta: &Meta) -> Result<Vec<Tx>, MetaError> {
-    let rows = journal::take(r, &meta.journal_ks, &meta.local, usize::MAX)?;
-    let heads: BTreeMap<u64, local::JournalTxHead> =
-        local::read_journal_tx_heads(r, meta)?.into_iter().collect();
+    transactions_between(r, meta, 0, u64::MAX)
+}
+
+/// [`transactions`] for those starting after journal seq `after`, through
+/// `upto` (each read whole).
+fn transactions_between(
+    r: &impl Readable,
+    meta: &Meta,
+    after: u64,
+    upto: u64,
+) -> Result<Vec<Tx>, MetaError> {
+    let from = journal::acked_watermark(r, &meta.local)?
+        .max(after)
+        .saturating_add(1);
+    if from > upto {
+        return Ok(Vec::new());
+    }
+    let mut heads: BTreeMap<u64, local::JournalTxHead> = BTreeMap::new();
+    for guard in r.range(&meta.journal_tx, local::tx_key(from)..=local::tx_key(upto)) {
+        let (k, v) = guard.into_inner()?;
+        heads.insert(local::decode_tx_key(&k)?, postcard::from_bytes(&v)?);
+    }
+    let end = heads.values().map(|h| h.last).fold(upto, u64::max);
     let mut out: Vec<Tx> = Vec::new();
-    for (seq, rec) in rows {
+    for guard in r.range(
+        &meta.journal_ks,
+        journal::seq_key(from)..=journal::seq_key(end),
+    ) {
+        let (k, v) = guard.into_inner()?;
+        let (seq, rec) = journal::decode_row(&k, &v)?;
         if let Some(open) = out.last_mut() {
             if seq <= open.last {
                 open.rows.push((seq, rec));
                 continue;
             }
+        }
+        if seq > upto {
+            break;
         }
         let (last, spec_seq) = match heads.get(&seq) {
             Some(head) => (head.last.max(seq), head.spec_seq),
@@ -423,12 +451,132 @@ struct Blame<'a> {
     rid: Option<crate::rid::Rid>,
 }
 
-/// See the module doc's "What is held" and "Deferred". A transaction is
-/// *held* if it is a poisoned seed or depends on a held one; otherwise
-/// *deferred* if it is a pending seed or depends on anything held or
-/// deferred; otherwise it ships. Taint accumulates per kind, so a
-/// transaction behind both is reported as held. With `blame`, also each
-/// held or deferred transaction's blame ([`Blame`]).
+/// The ship rule's state after a prefix of the unshipped journal, in
+/// journal order ([`plan`]); [`Walk::step`] classifies the next
+/// transaction. Chunk metered-own-rows: kept between calls by the blame
+/// cache ([`BlameCache`]), which resumes it where the journal grew.
+#[derive(Clone, Default)]
+struct Walk {
+    tainted: HashSet<Vec<u8>>,
+    deferred_keys: HashSet<Vec<u8>>,
+    opaque: bool,
+    opaque_deferred: bool,
+    any_held: bool,
+    any_deferred: bool,
+    // The blame of each key a held or deferred transaction touched; that
+    // of every held or deferred uncaptured transaction (which every later
+    // one depends on); that of all of them (which an uncaptured one
+    // depends on).
+    blame_of: HashMap<Vec<u8>, BTreeSet<Ino>>,
+    opaque_blame: BTreeSet<Ino>,
+    all_blame: BTreeSet<Ino>,
+}
+
+/// What [`Walk::step`] made of a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Class {
+    Ship,
+    Held,
+    Deferred,
+}
+
+impl Walk {
+    /// See the module doc's "What is held" and "Deferred". A transaction
+    /// is *held* if it is a poisoned seed or depends on a held one;
+    /// otherwise *deferred* if it is a pending seed or depends on anything
+    /// held or deferred; otherwise it ships. Taint accumulates per kind,
+    /// so a transaction behind both is reported as held. With `theirs`,
+    /// also a held or deferred transaction's blame ([`Blame`]). Returns
+    /// its class, the poisoned inodes it is a seed for, and its blame.
+    fn step(
+        &mut self,
+        tx: &Tx,
+        keys: Option<&[Vec<u8>]>,
+        observed: &[Vec<u8>],
+        (poisoned, pending): (&PoisonMap, &PoisonMap),
+        theirs: Option<&PoisonMap>,
+    ) -> (Class, Vec<Ino>, Option<BTreeSet<Ino>>) {
+        let seeds = seed_inos(tx, poisoned);
+        // What the transaction observed without writing (a refusal's op:
+        // `JournalTx::observed`): a dependency like a written key, but
+        // it taints nothing after it. A refusal shipped ahead of the
+        // deferred transaction it was refused because of put a refusal
+        // in the log that the log's own prefix could not explain
+        // (flex-crash seed 481).
+        let held = self.opaque
+            || !seeds.is_empty()
+            || observed.iter().any(|k| self.tainted.contains(k))
+            || match keys {
+                Some(keys) => keys.iter().any(|k| self.tainted.contains(k)),
+                // Unknown keys: held once anything is.
+                None => self.any_held,
+            };
+        let deferred = !held
+            && (self.opaque_deferred
+                || !seed_inos(tx, pending).is_empty()
+                || observed.iter().any(|k| self.deferred_keys.contains(k))
+                || match keys {
+                    Some(keys) => keys.iter().any(|k| self.deferred_keys.contains(k)),
+                    None => self.any_deferred,
+                });
+        let mut blame = None;
+        if let (Some(theirs), true) = (theirs, held || deferred) {
+            let mut mine: BTreeSet<Ino> = seed_inos(tx, theirs).into_iter().collect();
+            match keys {
+                Some(keys) => {
+                    for k in observed.iter().chain(keys) {
+                        if let Some(theirs) = self.blame_of.get(k) {
+                            mine.extend(theirs);
+                        }
+                    }
+                    mine.extend(&self.opaque_blame);
+                    for k in keys {
+                        self.blame_of.entry(k.clone()).or_default().extend(&mine);
+                    }
+                }
+                None => {
+                    mine.extend(&self.all_blame);
+                    self.opaque_blame.extend(&mine);
+                }
+            }
+            self.all_blame.extend(&mine);
+            blame = Some(mine);
+        }
+        let class = if held {
+            match keys {
+                Some(keys) => self.tainted.extend(keys.iter().cloned()),
+                None => self.opaque = true,
+            }
+            self.any_held = true;
+            Class::Held
+        } else if deferred {
+            match keys {
+                Some(keys) => self.deferred_keys.extend(keys.iter().cloned()),
+                None => self.opaque_deferred = true,
+            }
+            self.any_deferred = true;
+            Class::Deferred
+        } else {
+            Class::Ship
+        };
+        (class, seeds, blame)
+    }
+}
+
+/// A transaction's key set (`None`: uncaptured) and its `journal_tx` row.
+type KeysAndRow = (Option<Vec<Vec<u8>>>, Option<local::JournalTx>);
+
+/// [`KeysAndRow`] of `tx`.
+fn tx_keys_and_row(r: &impl Readable, meta: &Meta, tx: &Tx) -> Result<KeysAndRow, MetaError> {
+    let keys = match tx.spec_seq {
+        Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
+        None => None,
+    };
+    Ok((keys, local::get_journal_tx(r, meta, tx.first)?))
+}
+
+/// The ship rule over the whole unshipped journal ([`Walk::step`]). With
+/// `blame`, also each held or deferred transaction's blame ([`Blame`]).
 fn plan(
     r: &impl Readable,
     meta: &Meta,
@@ -436,17 +584,7 @@ fn plan(
     pending: &PoisonMap,
     blame: Option<Blame<'_>>,
 ) -> Result<Plan, MetaError> {
-    let mut tainted: HashSet<Vec<u8>> = HashSet::new();
-    let mut deferred_keys: HashSet<Vec<u8>> = HashSet::new();
-    let mut opaque = false;
-    let mut opaque_deferred = false;
-    // The blame of each key a held or deferred transaction touched; that
-    // of every held or deferred uncaptured transaction (which every later
-    // one depends on); that of all of them (which an uncaptured one
-    // depends on).
-    let mut blame_of: HashMap<Vec<u8>, BTreeSet<Ino>> = HashMap::new();
-    let mut opaque_blame: BTreeSet<Ino> = BTreeSet::new();
-    let mut all_blame: BTreeSet<Ino> = BTreeSet::new();
+    let mut walk = Walk::default();
     let mut out = Plan {
         ship: Vec::new(),
         held: Vec::new(),
@@ -457,84 +595,35 @@ fn plan(
         blame_through: BTreeSet::new(),
     };
     for tx in transactions(r, meta)? {
-        let seeds = seed_inos(&tx, poisoned);
-        let keys = match tx.spec_seq {
-            Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
-            None => None,
-        };
-        let row = local::get_journal_tx(r, meta, tx.first)?;
+        let (keys, row) = tx_keys_and_row(r, meta, &tx)?;
         let found = blame
             .and_then(|b| b.rid)
-            .is_some_and(|rid| row.as_ref().and_then(|t| t.rid) == Some(rid));
-        // What the transaction observed without writing (a refusal's op:
-        // `JournalTx::observed`): a dependency like a written key, but
-        // it taints nothing after it. A refusal shipped ahead of the
-        // deferred transaction it was refused because of put a refusal
-        // in the log that the log's own prefix could not explain
-        // (flex-crash seed 481).
+            .is_some_and(|rid| tx_rid(&tx, row.as_ref()) == Some(rid));
         let observed: Vec<Vec<u8>> = row.map(|row| row.observed).unwrap_or_default();
-        let held = opaque
-            || !seeds.is_empty()
-            || observed.iter().any(|k| tainted.contains(k))
-            || match &keys {
-                Some(keys) => keys.iter().any(|k| tainted.contains(k)),
-                // Unknown keys: held once anything is.
-                None => !out.held.is_empty(),
-            };
-        let deferred = !held
-            && (opaque_deferred
-                || !seed_inos(&tx, pending).is_empty()
-                || observed.iter().any(|k| deferred_keys.contains(k))
-                || match &keys {
-                    Some(keys) => keys.iter().any(|k| deferred_keys.contains(k)),
-                    None => !out.deferred.is_empty(),
-                });
-        if let (Some(b), true) = (blame, held || deferred) {
-            let mut mine: BTreeSet<Ino> = seed_inos(&tx, b.theirs).into_iter().collect();
-            match &keys {
-                Some(keys) => {
-                    for k in observed.iter().chain(keys) {
-                        if let Some(theirs) = blame_of.get(k) {
-                            mine.extend(theirs);
-                        }
-                    }
-                    mine.extend(&opaque_blame);
-                    for k in keys {
-                        blame_of.entry(k.clone()).or_default().extend(&mine);
-                    }
-                }
-                None => {
-                    mine.extend(&all_blame);
-                    opaque_blame.extend(&mine);
-                }
-            }
-            all_blame.extend(&mine);
+        let (class, seeds, mine) = walk.step(
+            &tx,
+            keys.as_deref(),
+            &observed,
+            (poisoned, pending),
+            blame.map(|b| b.theirs),
+        );
+        if let Some(mine) = mine {
             out.blame.insert(tx.first, mine);
         }
         if found {
             out.found = Some((tx.first, tx.last));
         }
-        if held {
-            match &keys {
-                Some(keys) => tainted.extend(keys.iter().cloned()),
-                None => opaque = true,
-            }
-            out.held.push((tx, seeds, keys));
-        } else if deferred {
-            match &keys {
-                Some(keys) => deferred_keys.extend(keys.iter().cloned()),
-                None => opaque_deferred = true,
-            }
-            out.deferred.push(tx);
-        } else {
-            out.ship.push(tx);
+        match class {
+            Class::Held => out.held.push((tx, seeds, keys)),
+            Class::Deferred => out.deferred.push(tx),
+            Class::Ship => out.ship.push(tx),
         }
         if found {
             break;
         }
     }
-    out.opaque = opaque;
-    out.blame_through = all_blame;
+    out.opaque = walk.opaque;
+    out.blame_through = walk.all_blame;
     Ok(out)
 }
 
@@ -557,7 +646,10 @@ pub(crate) struct DeferralBlame {
 /// node's remote-pending chunks (`store::remote`): the inodes whose
 /// upload it waits for ([`Blame`]), and that of everything through it
 /// ([`DeferralBlame`]). A thin wrapper over [`plan`], so the answer
-/// follows the ship rule exactly.
+/// follows the ship rule exactly. Chunk metered-own-rows: the holder asks
+/// [`blame_walk`] (the same rule, resumed); this is the property test's
+/// statement of it.
+#[cfg(test)]
 pub(crate) fn deferral_blame(
     r: &impl Readable,
     meta: &Meta,
@@ -582,6 +674,158 @@ pub(crate) fn deferral_blame(
             .map(|(first, last)| (last, plan.blame.remove(&first).unwrap_or_default())),
         through: plan.blame_through,
     })
+}
+
+/// Chunk metered-own-rows: one unshipped transaction as
+/// [`blame_walk`] reports it about one node: every held or deferred one,
+/// and every one of that node's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Kept {
+    pub(crate) first: u64,
+    pub(crate) last: u64,
+    spec_seq: Option<u64>,
+    pub(crate) rid: Option<crate::rid::Rid>,
+    /// Whether its rows change anything a read sees: a refusal's
+    /// `Refused`, a `Completed` and an inbox acknowledgement only feed the
+    /// dedup.
+    pub(crate) effect: bool,
+    /// Its blame ([`Blame`]) when it is held or deferred; `None` when it
+    /// ships.
+    pub(crate) waits: Option<BTreeSet<Ino>>,
+}
+
+impl Kept {
+    /// Whether the journal still holds it as it was walked: its
+    /// `journal_tx` row with the same capture (a rewind re-captures a
+    /// rolled-back transaction under a fresh `spec_seq`), or, uncaptured,
+    /// its row.
+    fn still_there(&self, r: &impl Readable, meta: &Meta) -> Result<bool, MetaError> {
+        Ok(match local::get_journal_tx_head(r, meta, self.first)? {
+            Some(head) => head.spec_seq == self.spec_seq && head.last == self.last,
+            None => {
+                self.spec_seq.is_none()
+                    && r.get(&meta.journal_ks, journal::seq_key(self.first))?
+                        .is_some()
+            }
+        })
+    }
+}
+
+/// Chunk metered-own-rows (the follow-up review's refusal cost): the
+/// ship rule's walk for one node's blame, kept between the holder's
+/// answers to that node and resumed where the journal grew. A refusal of
+/// a node with chunks pending here walked the whole unshipped journal
+/// inside the core step (24.8 ms at 10,000 transactions), and the walk
+/// cannot start later: what the first deferred transaction taints decides
+/// every one after it.
+///
+/// Valid while nothing it was computed from changed:
+/// - the pending, poisoned and node's remote rows are the same (an ack,
+///   an enrolment, a poisoning, a holder's own write-back: re-walked);
+/// - every held or deferred transaction it walked is still in the journal,
+///   captured the same way (a ship of one, a deposition's strand, a
+///   rewind's re-capture, a `drop-held`: re-walked). A transaction that
+///   ships taints nothing and blames nothing, so one leaving changes
+///   nothing for those after it; only the node's own are dropped from the
+///   list then;
+/// - journal seqs only grow, so nothing appears before what was walked.
+pub(crate) struct BlameCache {
+    poisoned: PoisonMap,
+    pending: PoisonMap,
+    theirs: PoisonMap,
+    walk: Walk,
+    /// The last journal seq walked.
+    through: u64,
+    kept: Vec<Kept>,
+}
+
+/// Whether `rec` changes anything a read sees (see [`Kept::effect`]).
+fn has_effect(rec: &LogRecord) -> bool {
+    !matches!(
+        rec,
+        LogRecord::Completed { .. } | LogRecord::Refused { .. } | LogRecord::InboxAck { .. }
+    )
+}
+
+/// The rid a transaction ran under: its `journal_tx` row's, or, for a
+/// journaled refusal (which records none there), its `Refused` row's.
+fn tx_rid(tx: &Tx, row: Option<&local::JournalTx>) -> Option<crate::rid::Rid> {
+    row.and_then(|t| t.rid).or_else(|| {
+        tx.rows.iter().find_map(|(_, rec)| match rec {
+            LogRecord::Refused { rid, .. } => Some(*rid),
+            _ => None,
+        })
+    })
+}
+
+/// Chunk metered-own-rows: [`Kept`] for every unshipped transaction
+/// through journal seq `upto` that is held, deferred or `node`'s, with
+/// its blame on `theirs` (`node`'s live remote rows). Exactly what
+/// [`plan`] with [`Blame`] says, from the node's [`BlameCache`] when it
+/// is still valid.
+pub(crate) fn blame_walk(
+    r: &impl Readable,
+    meta: &Meta,
+    node: u64,
+    theirs: &PoisonMap,
+    upto: u64,
+) -> Result<Vec<Kept>, MetaError> {
+    let poisoned = read_poisoned(r, meta)?;
+    let pending = read_pending(r, meta)?;
+    let mut caches = meta.blame_cache.lock().unwrap();
+    let mut cache = match caches.remove(&node) {
+        Some(c) if c.poisoned == poisoned && c.pending == pending && &c.theirs == theirs => {
+            let mut valid = true;
+            let mut kept = Vec::with_capacity(c.kept.len());
+            for k in c.kept {
+                if k.still_there(r, meta)? {
+                    kept.push(k);
+                } else if k.waits.is_some() {
+                    valid = false;
+                    break;
+                }
+            }
+            valid.then_some(BlameCache { kept, ..c })
+        }
+        _ => None,
+    };
+    let mut c = match cache.take() {
+        Some(c) => c,
+        None => BlameCache {
+            poisoned,
+            pending,
+            theirs: theirs.clone(),
+            walk: Walk::default(),
+            through: 0,
+            kept: Vec::new(),
+        },
+    };
+    for tx in transactions_between(r, meta, c.through, upto)? {
+        let (keys, row) = tx_keys_and_row(r, meta, &tx)?;
+        let rid = tx_rid(&tx, row.as_ref());
+        let observed = row.map(|row| row.observed).unwrap_or_default();
+        let (class, _, waits) = c.walk.step(
+            &tx,
+            keys.as_deref(),
+            &observed,
+            (&c.poisoned, &c.pending),
+            Some(&c.theirs),
+        );
+        c.through = c.through.max(tx.last);
+        if class != Class::Ship || rid.is_some_and(|rid| rid.node == node) {
+            c.kept.push(Kept {
+                first: tx.first,
+                last: tx.last,
+                spec_seq: tx.spec_seq,
+                rid,
+                effect: tx.rows.iter().any(|(_, rec)| has_effect(rec)),
+                waits,
+            });
+        }
+    }
+    let out = c.kept.iter().filter(|k| k.first <= upto).cloned().collect();
+    caches.insert(node, c);
+    Ok(out)
 }
 
 fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {
@@ -1176,7 +1420,7 @@ mod tests {
                     }
                 }
             };
-            for s in steps {
+            for (i, s) in steps.iter().enumerate() {
                 match s {
                     Step::Close { f, c, from } => {
                         let ino = inos[*f];
@@ -1236,10 +1480,11 @@ mod tests {
                             parent: ROOT_INO,
                             name: format!("f{f}"),
                         };
+                        // (The holder's own: a rid of its own per refusal.)
                         let r = rid(*node).unwrap_or(Rid {
                             node: 9,
                             incarnation: 1,
-                            seq: 0,
+                            seq: i as u64,
                         });
                         meta.journal_refusal(r, constellation_types::Code::Exists, Some(&op))
                             .unwrap();
@@ -1259,6 +1504,17 @@ mod tests {
                         segment += 1;
                         shipped(&meta, segment);
                     }
+                }
+                // Chunk metered-own-rows: node 7's blame walk is kept
+                // between answers and resumed; ask after every step, as a
+                // holder does after every forwarded op, through the tip
+                // and through half of it.
+                let r = meta.db.read_tx();
+                let theirs = crate::store::remote::remote_pending_from_tx(&r, &meta, 7).unwrap();
+                if !theirs.is_empty() {
+                    let tip = journal::max_seq(&r, &meta.journal_ks, &meta.local).unwrap();
+                    blame_walk(&r, &meta, 7, &theirs, tip / 2).unwrap();
+                    blame_walk(&r, &meta, 7, &theirs, tip).unwrap();
                 }
             }
             meta
@@ -1307,7 +1563,7 @@ mod tests {
                 written.push(keys);
                 out.push((
                     tx.first,
-                    row.and_then(|t| t.rid),
+                    tx_rid(&tx, row.as_ref()),
                     tx.last,
                     waits.then_some(blame),
                 ));
@@ -1321,6 +1577,28 @@ mod tests {
             let poisoned = read_poisoned(&r, &meta).unwrap();
             let pending = read_pending(&r, &meta).unwrap();
             let node7 = crate::store::remote::remote_pending_from_tx(&r, &meta, 7).unwrap();
+            // Chunk metered-own-rows: the kept walk, resumed across the
+            // steps, says what the rule says: every waiting transaction
+            // with its blame, and every one of node 7's.
+            if !node7.is_empty() {
+                let expect = model(&meta, &node7);
+                let kept = blame_walk(&r, &meta, 7, &node7, u64::MAX).unwrap();
+                type Row = (u64, u64, Option<Rid>, Option<BTreeSet<Ino>>);
+                let want: Vec<Row> = expect
+                    .iter()
+                    .filter(|e| e.3.is_some() || e.1.is_some_and(|rid| rid.node == 7))
+                    .map(|e| (e.0, e.2, e.1, e.3.clone()))
+                    .collect();
+                let got: Vec<Row> = kept
+                    .iter()
+                    .map(|k| (k.first, k.last, k.rid, k.waits.clone()))
+                    .collect();
+                assert_eq!(got, want, "the kept walk, {steps:?}");
+                // A fresh walk agrees with the kept one.
+                meta.blame_cache.lock().unwrap().clear();
+                let fresh = blame_walk(&r, &meta, 7, &node7, u64::MAX).unwrap();
+                assert_eq!(fresh, kept, "{steps:?}");
+            }
             for theirs in [&node7, &pending] {
                 let expect = model(&meta, theirs);
                 let p = plan(

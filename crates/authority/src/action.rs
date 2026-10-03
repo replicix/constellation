@@ -213,6 +213,9 @@ pub enum TimerKind {
     /// A forwarded op still waits for its own records past
     /// `own_record_wait_ms`: upload the chunks they wait for.
     OwnRecordWait,
+    /// An observed position still waits for this node's pending chunks:
+    /// upload them again (`Core::on_observed_upload`).
+    ObservedUpload,
     /// Backoff before a client op re-asks for the lease.
     AcquireRetry,
     /// A client op's overall deadline (`acquire_deadline`, 2×TTL).

@@ -118,6 +118,7 @@ impl Core {
                         position: Position::ZERO,
                         gen: 0,
                         own_chunks: OwnChunks::None,
+                        own_rows: None,
                     },
                 });
             }
@@ -146,6 +147,7 @@ impl Core {
                             position: Position::ZERO,
                             gen: 0,
                             own_chunks: OwnChunks::None,
+                            own_rows: None,
                         },
                     });
                     return;
@@ -207,6 +209,7 @@ impl Core {
                                 position: Position::ZERO,
                                 gen: 0,
                                 own_chunks: OwnChunks::None,
+                                own_rows: None,
                             },
                         });
                         return;
@@ -226,6 +229,7 @@ impl Core {
                                     position: Position::ZERO,
                                     gen: 0,
                                     own_chunks: OwnChunks::None,
+                                    own_rows: None,
                                 },
                             });
                         }
@@ -316,6 +320,7 @@ impl Core {
         // Plan 30 §M9: and, accepted or refused, only once the journal
         // position it was evaluated at is durable under the lease's
         // acknowledgement policy.
+        let executed = fresh.is_some();
         let wait = match fresh {
             Some(inos) => self.recall_needed(now, &inos, Some(from), replica, out),
             None => None,
@@ -325,8 +330,9 @@ impl Core {
             // Only an acknowledgement's wait for durability says now what
             // it waits for (`held_for_upload`); the rest is worked out
             // when the reply leaves.
+            let upto = position.pending.map(|p| p.jseq);
             let blockers = (durable.is_some() && req != OpId(0))
-                .then(|| self.own_record_blockers(from, rid, &outcome, 0, replica));
+                .then(|| self.own_record_blockers(from, rid, &outcome, 0, upto, replica));
             let own_chunks = match &blockers {
                 Some(b) => self.own_chunks_given(from, (0, &position), b.clone(), replica),
                 None => OwnChunks::None,
@@ -362,13 +368,19 @@ impl Core {
         // base installs an acceptance at once (it neither waits for its
         // own record nor observes the reply's position), so what those
         // wait for goes unread: skip the work. Not a refusal: it is
-        // observed whatever the base.
-        let installs =
-            matches!(outcome, MutateOutcome::Accepted { .. }) && base.is_some_and(|b| applied >= b);
-        let own_chunks = if installs {
-            OwnChunks::None
+        // observed whatever the base. Chunk metered-own-rows: and only for
+        // a fresh execution. An answer from the dedup (a retry after a
+        // lost reply) may find its transaction shipped ahead of a
+        // deferred close of the requester's, already applied there: the
+        // requester then installs nothing and observes the position, and
+        // reads its `own_chunks`.
+        let installs = executed
+            && matches!(outcome, MutateOutcome::Accepted { .. })
+            && base.is_some_and(|b| applied >= b);
+        let (own_chunks, own_rows) = if installs {
+            (OwnChunks::None, None)
         } else {
-            self.own_chunks_for(from, rid, &outcome, (0, &position), replica)
+            self.own_reply_parts(from, rid, &outcome, (0, &position), replica)
         };
         out.push(Action::Send {
             to: from,
@@ -379,6 +391,7 @@ impl Core {
                 position,
                 gen: 0,
                 own_chunks,
+                own_rows,
             },
         });
     }
@@ -474,15 +487,37 @@ impl Core {
         (gen, position): (u64, &Position),
         replica: &dyn Replica,
     ) -> OwnChunks {
-        let blockers = self.own_record_blockers(to, rid, outcome, gen, replica);
-        self.own_chunks_given(to, (gen, position), blockers, replica)
+        self.own_reply_parts(to, rid, outcome, (gen, position), replica)
+            .0
+    }
+
+    /// [`Self::own_chunks_for`], and which of the unshipped transactions
+    /// through the reply's position are `to`'s own (chunk
+    /// metered-own-rows: `PeerMsg::MutateReply::own_rows`).
+    pub(crate) fn own_reply_parts(
+        &self,
+        to: NodeId,
+        rid: Rid,
+        outcome: &MutateOutcome,
+        (gen, position): (u64, &Position),
+        replica: &dyn Replica,
+    ) -> (OwnChunks, Option<constellation_meta::OwnRows>) {
+        let upto = position.pending.map(|p| p.jseq);
+        let mut blockers = self.own_record_blockers(to, rid, outcome, gen, upto, replica);
+        let own = blockers.own.take();
+        (
+            self.own_chunks_given(to, (gen, position), blockers, replica),
+            own,
+        )
     }
 
     /// [`Self::own_chunks_for`]'s costly half: what the transaction waits
-    /// for from `to` (`Meta::remote_blockers`). One point read when `to`
-    /// has nothing pending here; otherwise a walk of the unshipped journal
-    /// (the ship plan's), which a reply parked for its acknowledgement
-    /// keeps rather than redoing every hold interval
+    /// for from `to` (`Meta::remote_blockers`), through journal seq `upto`
+    /// (the reply's position). One point read when `to` has nothing
+    /// pending here; otherwise the ship plan's walk of the unshipped
+    /// journal, resumed from where the last answer to `to` left it
+    /// (`held::blame_walk`), which a reply parked for its acknowledgement
+    /// also keeps rather than redoing every hold interval
     /// (`Core::on_held_reply_timer`).
     pub(crate) fn own_record_blockers(
         &self,
@@ -490,6 +525,7 @@ impl Core {
         rid: Rid,
         outcome: &MutateOutcome,
         gen: u64,
+        upto: Option<u64>,
         replica: &dyn Replica,
     ) -> RemoteBlockers {
         // The outcomes a requester waits on: an acceptance (its
@@ -506,7 +542,7 @@ impl Core {
         if to == self.cfg.node_id {
             return RemoteBlockers::default();
         }
-        replica.remote_blockers(rid, gen, records, to)
+        replica.remote_blockers(rid, gen, records, to, upto)
     }
 
     /// [`Self::own_chunks_for`] from `blockers`: whether this node's

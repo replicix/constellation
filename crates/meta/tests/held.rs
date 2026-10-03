@@ -646,7 +646,8 @@ fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
         },
     );
     let blockers = |seq: u64, records: &[LogRecord], node: u64| {
-        meta.remote_blockers(rid(seq), 0, records, node).unwrap()
+        meta.remote_blockers(rid(seq), 0, records, node, None)
+            .unwrap()
     };
     assert_eq!(blockers(1, &close, 7).inos, vec![file], "its own manifest");
     let dependent = blockers(2, &chmod, 7);

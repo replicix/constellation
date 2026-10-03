@@ -62,7 +62,13 @@ const SLOW_STEP_US: u64 = 500_000;
 /// What a forwarded mutation's reply carries back to the bridge: the
 /// outcome, plan 30 §M6's `base`, the position and (§M11) the executing
 /// delegation generation (0: the root).
-pub type MutateReplyParts = (MutateOutcome, Option<u64>, Position, u64, OwnChunks);
+pub type MutateReplyParts = (
+    MutateOutcome,
+    Option<u64>,
+    Position,
+    u64,
+    (OwnChunks, Option<constellation_meta::OwnRows>),
+);
 
 /// Plan 30 §M14: an owner's answer to a `LockRenew`.
 pub type LockRenewResults = Vec<(constellation_fs_core::Ino, GrantId, LockRenewResult)>;
@@ -1211,7 +1217,7 @@ impl Driver {
                             None,
                             Position::ZERO,
                             0,
-                            OwnChunks::None,
+                            (OwnChunks::None, None),
                         ));
                         return None;
                     }
@@ -1238,7 +1244,7 @@ impl Driver {
                                 None,
                                 Position::ZERO,
                                 0,
-                                OwnChunks::None,
+                                (OwnChunks::None, None),
                             ));
                             return None;
                         }
@@ -2081,6 +2087,7 @@ impl Driver {
                 position,
                 gen,
                 own_chunks,
+                own_rows,
             } => {
                 tracing::trace!(target: "constellation::fwd", req = req.0, "mutate reply sent");
                 if let Some(tx) = self.mutate_replies.remove(&req) {
@@ -2094,10 +2101,10 @@ impl Driver {
                         // for.
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
-                            let _ = tx.send((outcome, base, position, gen, own_chunks));
+                            let _ = tx.send((outcome, base, position, gen, (own_chunks, own_rows)));
                         });
                     } else {
-                        let _ = tx.send((outcome, base, position, gen, own_chunks));
+                        let _ = tx.send((outcome, base, position, gen, (own_chunks, own_rows)));
                     }
                 }
             }
@@ -2722,6 +2729,7 @@ impl Driver {
                                 position: Position::ZERO,
                                 gen: 0,
                                 own_chunks: OwnChunks::None,
+                                own_rows: None,
                             },
                         }));
                         return;
@@ -2770,6 +2778,7 @@ impl Driver {
                             gen,
                             own_chunks,
                             own_inos,
+                            own_rows,
                         })) if req_id == req.0 => {
                             let position = Position {
                                 seq: position_seq,
@@ -2804,6 +2813,7 @@ impl Driver {
                                     position,
                                     gen,
                                     own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
+                                    own_rows: constellation_meta::OwnRows::from_wire(&own_rows),
                                 },
                             }));
                         }
@@ -2818,6 +2828,7 @@ impl Driver {
                                     position: Position::ZERO,
                                     gen: 0,
                                     own_chunks: OwnChunks::None,
+                                    own_rows: None,
                                 },
                             }));
                         }
