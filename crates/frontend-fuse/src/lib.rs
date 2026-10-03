@@ -15,6 +15,7 @@
 //! `fuser`.
 
 mod adapter;
+mod dentries;
 mod notify;
 pub mod passthrough;
 mod reply;
@@ -24,6 +25,7 @@ pub mod threads;
 
 pub use adapter::{FuseFs, KernelTuning};
 pub use constellation_vfs::FrontendCaps;
+pub use dentries::KernelEntries;
 pub use fuser::{NegotiatedInit, Transport};
 pub use notify::FuseNotifySink;
 pub use passthrough::{

@@ -28,14 +28,15 @@
 
 #![cfg(target_os = "linux")]
 
-use constellation_frontend_fuse::{FuseFs, KernelTuning};
+use constellation_frontend_fuse::{FuseFs, FuseNotifySink, KernelTuning};
 use constellation_types::{Code, Rdev};
 use constellation_vfs::mock::{Args, MockVfs, Script};
 use constellation_vfs::types::mode as modebits;
 use constellation_vfs::{
-    Attr, DirEntry, Durability, Entry, FallocateMode, Fh, FileKind, FrontendCaps, Ino, LockKind,
-    LockOwner, LockRange, LockSpec, LockStatus, OpKind, OpenFlags, OpenOwner, Opened, ReadData,
-    RenameFlags, SeekWhence, SetXattrFlags, StatFs, TimeSet, Vfs, XattrNameBuf, ROOT_INO,
+    Attr, DirEntry, Durability, Entry, FallocateMode, Fh, FileKind, FrontendCaps, FrontendEvents,
+    Ino, Invalidation, LockKind, LockOwner, LockRange, LockSpec, LockStatus, OpKind, OpenFlags,
+    OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetXattrFlags, StatFs, TimeSet, Vfs,
+    XattrNameBuf, ROOT_INO,
 };
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixDatagram;
@@ -201,6 +202,17 @@ impl Kernel {
     /// A session over `fs`, whose kernel offers `flags`/`flags2` at
     /// `FUSE_INIT` (`flags2` needs `FUSE_INIT_EXT` in `flags`).
     fn start_fs<V: Vfs>(fs: FuseFs<V>, flags: u32, flags2: u32) -> Kernel {
+        Kernel::start_fs_notifying(fs, flags, flags2).0
+    }
+
+    /// [`Self::start_fs`], and the session's notifier: what it writes
+    /// arrives here as a message with unique 0 and the notification code
+    /// in the error field.
+    fn start_fs_notifying<V: Vfs>(
+        fs: FuseFs<V>,
+        flags: u32,
+        flags2: u32,
+    ) -> (Kernel, fuser::Notifier) {
         let (kernel, daemon) = UnixDatagram::pair().expect("socketpair");
         kernel
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -238,8 +250,9 @@ impl Kernel {
                 .expect("the FUSE handshake");
         k.init = k.recv();
         assert_eq!(k.init.unique, init_unique);
+        let notifier = session.notifier();
         k.session = Some(std::thread::spawn(move || session.run()));
-        k
+        (k, notifier)
     }
 
     /// A request as (uid, gid, pid) of this kernel's caller; returns its
@@ -445,6 +458,98 @@ fn lookup_translates_the_call_and_encodes_the_entry() {
         Some("fuser-0"),
         "inline, on the fuser worker"
     );
+    k.finish();
+}
+
+/// `FUSE_NOTIFY_INVAL_INODE`, `FUSE_NOTIFY_INVAL_ENTRY`.
+const NOTIFY_INVAL_INODE: i32 = 2;
+const NOTIFY_INVAL_ENTRY: i32 = 3;
+
+/// An entry invalidation off the wire: its parent and name.
+fn inval_entry(n: &Reply) -> (u64, String) {
+    assert_eq!((n.unique, n.error), (0, NOTIFY_INVAL_ENTRY), "{n:?}");
+    let len = n.u32_at(8) as usize;
+    (
+        n.u64_at(0),
+        String::from_utf8(n.body[16..16 + len].to_vec()).unwrap(),
+    )
+}
+
+/// `FUSE_NOTIFY_INVAL_ENTRY` takes the parent directory's `i_rwsem` in the
+/// kernel, cached name or not, and a daemon `kill -9`ed while one waits
+/// for it never exits (`fuse-inval-storm`): so the sink writes one only
+/// for a name the kernel was handed by a reply and may still hold — never
+/// for one it never saw, and not after that reply's TTL — while
+/// attribute invalidations, which take no sleeping lock, always go out.
+#[test]
+fn entry_invalidations_are_written_only_for_names_the_kernel_may_hold() {
+    let mock = MockVfs::new();
+    mock.always_lookup(Script::ok(entry(42, FileKind::File)));
+    let mut short = entry(43, FileKind::Dir);
+    short.attr.ttl = Duration::from_millis(100);
+    mock.always_mkdir(Script::ok(short));
+    mock.always_rename(Script::ok(()));
+    let fs = FuseFs::new(
+        Arc::new(mock.clone()),
+        FrontendCaps::linux_fuse(false),
+        KernelTuning::for_workers(1),
+    );
+    let entries = fs.kernel_entries().clone();
+    let (mut k, notifier) = Kernel::start_fs_notifying(fs, KERNEL_INIT_FLAGS, 0);
+    let sink = FuseNotifySink::new(notifier, entries);
+    let entry_inval = |parent: Ino, name: &str| Invalidation::Entry {
+        parent,
+        name: name.into(),
+    };
+    let quiet = Duration::from_millis(300);
+
+    // Another node's name, never looked up here: nothing to drop.
+    sink.invalidate(&[entry_inval(5, "elsewhere")]);
+    assert!(k.recv_within(quiet).is_none(), "nothing was written");
+
+    // A name a lookup handed out (3 s TTL), in the same directory.
+    k.call(op::LOOKUP, 5, &Body::new().cstr("seen")).ok();
+    sink.invalidate(&[entry_inval(5, "elsewhere"), entry_inval(5, "seen")]);
+    assert_eq!(inval_entry(&k.recv()), (5, "seen".into()));
+    assert!(k.recv_within(quiet).is_none());
+
+    // Attributes always go out.
+    sink.invalidate(&[Invalidation::Attr { ino: 42 }]);
+    let n = k.recv();
+    assert_eq!((n.unique, n.error), (0, NOTIFY_INVAL_INODE));
+
+    // A local rename moves the kernel's dentry, and its validity, to the
+    // new name.
+    k.call(
+        op::RENAME,
+        5,
+        &Body::new().u64(6).cstr("seen").cstr("moved"),
+    )
+    .ok();
+    sink.invalidate(&[entry_inval(6, "moved")]);
+    assert_eq!(inval_entry(&k.recv()), (6, "moved".into()));
+
+    // A name handed out with a short TTL is written for until it expires.
+    k.call(
+        op::MKDIR,
+        5,
+        &Body::new().u32(0o755).u32(0o22).cstr("brief"),
+    )
+    .ok();
+    sink.invalidate(&[entry_inval(5, "brief")]);
+    assert_eq!(inval_entry(&k.recv()), (5, "brief".into()));
+    std::thread::sleep(Duration::from_millis(400));
+    sink.invalidate(&[entry_inval(5, "brief")]);
+    assert!(k.recv_within(quiet).is_none(), "expired: nothing to drop");
+
+    // A failed lookup hands out nothing.
+    mock.always_lookup(Script::fail(Code::NotFound));
+    assert_eq!(
+        k.call(op::LOOKUP, 5, &Body::new().cstr("gone")).errno(),
+        libc::ENOENT
+    );
+    sink.invalidate(&[entry_inval(5, "gone")]);
+    assert!(k.recv_within(quiet).is_none());
     k.finish();
 }
 

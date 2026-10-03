@@ -50,10 +50,12 @@ impl Dirs for XdgDirs {
     }
 }
 
-/// `flock(2)` locks. `holder` answers [`FileLock::holder_pid`], which only
-/// Linux can (from `/proc/locks`).
+/// `flock(2)` locks. `holders` answers [`FileLock::holder_pids`] and
+/// `opened_by` [`FileLock::opened_by`], which only Linux can (from
+/// `/proc`).
 pub(crate) struct UnixFileLock {
-    pub(crate) holder: fn(&Path) -> Option<u32>,
+    pub(crate) holders: fn(&Path) -> Vec<u32>,
+    pub(crate) opened_by: fn(u32, &Path) -> bool,
 }
 
 fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
@@ -91,8 +93,12 @@ impl FileLock for UnixFileLock {
         }
     }
 
-    fn holder_pid(&self, path: &Path) -> Option<u32> {
-        (self.holder)(path)
+    fn holder_pids(&self, path: &Path) -> Vec<u32> {
+        (self.holders)(path)
+    }
+
+    fn opened_by(&self, pid: u32, path: &Path) -> bool {
+        (self.opened_by)(pid, path)
     }
 }
 
@@ -289,7 +295,10 @@ mod tests {
 
     #[test]
     fn a_second_open_cannot_take_a_held_lock() {
-        let locks = UnixFileLock { holder: |_| None };
+        let locks = UnixFileLock {
+            holders: |_| Vec::new(),
+            opened_by: |_, _| false,
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.lock");
         let open = || crate::lock::open_lock_file(&path).unwrap();
@@ -302,7 +311,10 @@ mod tests {
         let waiter = {
             let path = path.clone();
             std::thread::spawn(move || {
-                let locks = UnixFileLock { holder: |_| None };
+                let locks = UnixFileLock {
+                    holders: |_| Vec::new(),
+                    opened_by: |_, _| false,
+                };
                 let guard = locks
                     .lock(crate::lock::open_lock_file(&path).unwrap())
                     .unwrap();
@@ -322,7 +334,10 @@ mod tests {
 
     #[test]
     fn a_leaked_guard_keeps_the_lock() {
-        let locks = UnixFileLock { holder: |_| None };
+        let locks = UnixFileLock {
+            holders: |_| Vec::new(),
+            opened_by: |_, _| false,
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.lock");
         let guard = locks

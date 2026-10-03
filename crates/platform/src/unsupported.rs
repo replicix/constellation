@@ -105,8 +105,11 @@ impl FileLock for Unsupported {
     fn try_lock(&self, _file: File) -> io::Result<Option<LockGuard>> {
         Err(unsupported("file locks"))
     }
-    fn holder_pid(&self, _path: &Path) -> Option<u32> {
-        None
+    fn holder_pids(&self, _path: &Path) -> Vec<u32> {
+        Vec::new()
+    }
+    fn opened_by(&self, _pid: u32, _path: &Path) -> bool {
+        false
     }
 }
 

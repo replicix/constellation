@@ -38346,3 +38346,324 @@ incarnation that the scenario exists to check.
 | `bash tests/smoke.sh` | SMOKE TEST PASSED |
 | `harness run p2p-same-identity-restart` ×20 (fixed) | **20/20 PASSED**. c0/c1 see c2 connected 2–2800 ms after the remount; forwards to it go over P2P in about 1.2–1.6 s |
 | `harness run p2p-invalidation p2p-handover p2p-partition-tolerance p2p-same-identity-restart p2p-partition-one-node backup-failover ack-s3-failover backup-failover-with-delegation p2p-off-no-delegation lock-failover root-failover-with-delegates` | All PASSED. Two failed in the first pass, which ran next to the slow sim under heavy disk load: `root-failover-with-delegates` ("too few writes landed: 27") passed on its next run. `p2p-partition-one-node` ("b (majority side) had a write take 13–15 s during the partition") failed twice and passed on the third run, once the IO pressure had dropped. It is the load-sensitive failure plan 32 M3c recorded. This change touches neither scenario |
+
+## Fix: a `kill -9`ed holder stays a zombie wedged in `fuse_reverse_inval_entry`, and nothing reaps it (`fuse-inval-hang`)
+
+Found by the 32-m6b matrix run; it also failed on a clean `main` build.
+`harness run fuse-inval-storm` hung: the killed holder's `kernel-inval`
+thread was stuck in the kernel, the process stayed a zombie, and the
+leftover connections had to be aborted by hand.
+
+### Reproduction and kernel evidence (Linux 7.3.0-rc4, `TMPDIR` on `/var`, btrfs)
+
+On `main` (c28d849) it reproduced on the first run. Round 2 failed with
+"a (pid …) did not exit within 5s of kill -9 … thread (kernel-inval): D
+(disk sleep) in fuse_reverse_inval_entry". The scenario's early exit
+left its workers running. Node c's unmount then failed (`EBUSY`), the
+cleanup killed c under load, and c wedged the same way. The harness
+blocked in the temp-dir removal and was killed by its timeout. Stacks of
+the zombie (pid 55999, as root):
+
+```
+55999  constellation  Z   (leader exited, FDSize 0)
+64539  kernel-inval   D   wchan fuse_reverse_inval_entry
+  fuse_reverse_inval_entry+0x5b  <- fuse_notify+0x4ed <- fuse_dev_do_write <- fuse_dev_write <- vfs_writev
+```
+
+The lock holder was a harness worker on c's mount, inside
+`getdents64 → iterate_dir → fuse_readdir_uncached → request_wait_answer+0x200`.
+`iterate_dir` holds the directory's `i_rwsem`, and the dead daemon had
+already read the `READDIR`. A second worker was queued in `lookup_open`.
+The connection showed `waiting=2`. Writing 1 to `abort` released
+everything at once.
+
+What the kernel does (`fs/fuse/notify.c`, `dir.c`, `dev.c` at v7.3-rc4):
+
+- `fuse_notify_inval_entry` takes `down_read(&fc->killsb)`. Then
+  `fuse_reverse_inval_entry` calls `inode_lock_nested(parent,
+  I_MUTEX_PARENT)` *before* looking the name up (+0x5b; the sleeping
+  rwsem frames are `__sched` and do not show). This is a plain
+  `down_write`: neither interruptible nor killable. It is taken whether
+  or not the name is cached, and also with `FUSE_EXPIRE_ONLY`.
+  `FUSE_NOTIFY_DELETE` follows the same path and also locks the child.
+- The VFS holds that `i_rwsem` from before a request is queued until
+  every request of the syscall is answered. `unlink` is a `LOOKUP` then
+  an `UNLINK`, and `getdents` issues several `READDIR`s, all under the
+  one lock.
+- `fuse_dev_release` ends the requests read through *that* device
+  descriptor and aborts the connection when it is the last one. A
+  multithreaded process's descriptors close only when its last thread
+  exits. So a server can never end its own connection while one of its
+  threads waits in a notification. Pending (unread) requests and
+  io_uring entries in user space end only at an abort.
+
+This is not a kernel bug to wait out. The lock is uninterruptible by
+design, and only something outside the dead process can break the
+cycle: the fusectl `abort`, `umount -f`, or a takeover's
+`abort_stale_mounts`. Nothing is filed upstream.
+
+### Which daemon code issues the notifications
+
+All invalidations are written by one thread, `kernel-inval`
+(`engine/src/kernel_inval.rs`), on both transports. A request-serving
+thread never writes one.
+
+- Over io_uring, notifications are still `writev(2)` on `/dev/fuse`. The
+  kernel refuses notifications through a ring
+  (`dev_uring.c`: "notify through fuse-io-uring not supported").
+- The other writers:
+  - `handover-inval` writes after the resumed session serves.
+  - The lock path's `invalidate_and_wait` is bounded, and it queues to
+    `kernel-inval` rather than writing itself.
+- A detach closes the notification gate while the session still serves.
+- `end_detached` retires the gate before the descriptor closes, so
+  shutdown already stops notifying first.
+
+So a live daemon never deadlocks: workers answer the request the
+notification waits behind. The hypothesis that "the answering thread is
+the notifier" does not apply. The cycle exists only once the process is
+dying.
+
+Three things made it frequent and unreleased:
+
+1. **The window was large under load.** The in-flight hold-back cannot
+   see two cases: a syscall that holds the lock while its request is
+   still queued in the kernel, and the gaps between one syscall's
+   requests. In a storm the directory lock is held almost continuously.
+   The holder also sent an entry invalidation for *every* foreign op,
+   even though its kernel had never looked those names up.
+2. **The zombie reaper was dead on btrfs.** `flock_holder_pid` keyed
+   `/proc/locks` by `stat`'s device. On btrfs that is the subvolume's
+   anonymous device (`0:38` here). `/proc/locks` and mountinfo name the
+   superblock's device (`00:25`). So the reaper read its live parent's
+   lock as released and left within 1.5 s of starting. Running
+   `zombie-reaper --parent <pid>` by hand on a daemon whose state dir is
+   under `/var/tmp` returned at once. On tmpfs `/tmp` it worked, which
+   is why earlier passes, run with `TMPDIR` on `/tmp`, never saw this.
+   This is also the "platform flock test fails with `TMPDIR` on `/var`"
+   noted earlier.
+3. **The harness turned one wedge into a hang.**
+   - A failing round left its workers running.
+   - `Client::kill9` and `unmount_exit` called `wait()` on a killed
+     daemon, which blocks for good on a wedged zombie.
+   - `Client::unmount` killed the daemon without releasing a wedge.
+
+### Fix
+
+- **Only notify what the kernel can hold** (`frontend-fuse/src/dentries.rs`,
+  `KernelEntries`).
+  - The daemon never answers a lookup with a negative entry. `ENOENT` is
+    cached as an already expired dentry that the kernel always looks up
+    again. So an entry invalidation can only matter for a positive
+    dentry handed out by one of our replies (`LOOKUP`, `CREATE`,
+    `MKDIR`, `MKNOD`, `SYMLINK`, `LINK`), within that reply's TTL. A
+    local `RENAME` moves the dentry and keeps its expiry.
+  - The adapter records each such name when the request arrives, as in
+    flight. The reply records it with `now + 2 × ttl` (at least
+    `ttl + 100 ms`): the kernel stamps the dentry's TTL in the calling
+    task only after it wakes from the reply, so a descheduled caller
+    starts it late. A rename carries each moved name's expiry over to the
+    new name, both ways for `RENAME_EXCHANGE`. If another request that
+    can install the old name is still in flight then (a revalidating
+    `LOOKUP`, sent without the directory lock), its reply lands on the
+    moved dentry but is recorded under the old name, so the new name gets
+    the longest TTL a reply may carry (1 s, or a longer one seen) plus
+    its slack.
+  - `FuseNotifySink` skips `Entry`/`Deleted` for a name that is neither
+    in flight nor unexpired. Attribute and data invalidations are never
+    filtered.
+  - Counting a name from request arrival keeps the kernel's ordering. A
+    notification decided while a lookup that read the replica before
+    the change is still in flight is still written, and it waits for
+    that lookup's directory lock as before. A request that reaches the
+    adapter after the decision reads the replica after the change.
+  - Keys are `(parent, 64-bit hash of the name)`. A collision only costs
+    an extra notification.
+  - A resumed session (handover) filters nothing for 5 s, because its
+    kernel holds dentries from the previous server.
+  - The state follows the gate: `NotifyGate::reopen` takes the resumed
+    session's `KernelEntries`. A detach abandoned in place keeps its own.
+- **`kernel_inval`** checks each notification's in-flight state again
+  right before its write. Before, one decision covered a whole batch of
+  writes, and each of those writes could wait in the kernel. The module
+  doc now records the 7.3 mechanics, the residual window, and the
+  release.
+- **Reaper / lock holder** (`platform/src/linux.rs`): the lookup matches
+  the inode under both `stat`'s device and the device mountinfo reports
+  for the file's mount. The mount is found from the open file's `mnt_id`
+  in `/proc/self/fdinfo`. New helper: `mount_device_in`.
+  - The superblock key is ambiguous: every btrfs subvolume numbers its
+    inodes from 257, so two subvolumes' `daemon.lock`s both show as
+    `00:25:257` (review must-fix). `FileLock::holder_pids` therefore
+    returns *every* matching pid (`flock_pids_in`), and
+    `FileLock::opened_by(pid, path)` confirms one: an fd under any of
+    `/proc/<pid>/task/*/fd` whose `stat` has the path's device and inode
+    (`stat` through the fd link gives the subvolume's own device; every
+    thread is looked at because a zombie leader has no file table).
+  - `daemon_lock::holder` (and so `take_over`, which re-verifies with
+    it) accepts a candidate only if it is `daemon.pid` or confirmed by
+    `opened_by`; several or unconfirmed candidates are `Unknown`, which
+    `take_over` never acts on. No candidate at all still falls back to
+    `daemon.pid`, as before.
+  - The reaper stays while `holder_pids` contains its parent, and before
+    it aborts anything it also requires the parent confirmed as the
+    holder of this very `daemon.lock` (after a takeover the recorded
+    mounts are the new daemon's).
+- **Harness**:
+  - `fuse-inval-storm` stops its workers on every exit path
+    (`StopOnDrop`). Every 8th cycle it lists the directory `ls -l` style,
+    stat-ing each name. For an entry TTL after each listing a kernel
+    then holds dentries for the other nodes' names, so the entry
+    invalidations, the window and the reaper stay exercised now that
+    unseen names are skipped.
+  - It prints the stall warnings it counts.
+  - `Client`: a killed daemon is waited for with a bound
+    (`release_killed`). If it is still there after 5 s, the connection of
+    its mount is aborted and it is waited for again, at most 10 s. This
+    applies in `kill9`, `kill9_within`, and the kill paths of `unmount`
+    and `unmount_exit`. Such a release is never silent: it prints
+    `!!! HARNESS RELEASED A WEDGED DAEMON` with the zombie's `/proc`
+    diagnosis, is counted, and `harness run` lists every one after its
+    summary; a daemon still there after the abort is an error (`kill9`
+    returns it).
+
+### Decisions
+
+- **No out-of-process notifier.** Moving the writes into a helper
+  process would keep the *daemon* from ever becoming a zombie. The helper
+  would wedge instead. Releasing the mount would still need an abort from
+  outside: a helper holding a `dup` keeps the device, so read requests
+  never end. A clone needs `/dev/fuse`, which the CSI engine pod does not
+  have. Pending and io_uring requests end only at an abort either way. So
+  the reaper's fusectl abort stays the release, and the work went into
+  making it work and into rarely needing it.
+- **Not `FUSE_NOTIFY_INC_EPOCH`.** It is lock-free in 7.3, but it expires
+  every dentry of the connection on each foreign apply. Under cross-node
+  churn that would disable the dentry cache.
+- **Own forwarded ops still invalidate.** A node's own op executed by the
+  holder comes back as a foreign apply. The node's kernel already holds
+  the correct dentry from its own reply. Skipping these would need
+  per-record origin tracking in the authority. They are left as they
+  are; with `ls -l` they are most of the stall warnings
+  (`entry "b-r1-w1-112"` on b).
+- `REAPER_GRACE` stays at 2 s. Observed releases took 2.07–3.13 s, inside
+  the scenario's 5 s bound.
+- **The wedge is made rare, not impossible; the reaper is the release.**
+  The review still saw 4 wedges in 60 kills, each released by the
+  reaper. The reaper is a child of the daemon, in the daemon's cgroup and
+  pid namespace. A container or pod kill (the cgroup's processes all
+  `SIGKILL`ed) takes the reaper with it, and then nothing aborts the
+  connection until the next `mount` of that state dir runs
+  `abort_stale_mounts`. Meanwhile the zombie keeps the mount, and every
+  process that touches it hangs. For CSI, the node plugin would have to
+  do the abort (it knows the mount and outlives the engine pod's
+  processes); not done here.
+
+### Tests
+
+- `frontend-fuse` (`dentries::tests`), 8 tests:
+  - in flight, then TTL expiry
+  - an error or a zero TTL installs nothing
+  - a shorter later reply does not shorten an earlier one
+  - concurrent requests
+  - rename and exchange carry-over; a failed rename moves nothing
+  - the resume window
+  - the sweep keeps names that are in flight
+- `tests/wire.rs`:
+  `entry_invalidations_are_written_only_for_names_the_kernel_may_hold`
+  runs the real adapter and sink over the socket-pair kernel:
+  - an unseen name writes nothing
+  - a looked-up name writes `FUSE_NOTIFY_INVAL_ENTRY` with the right
+    parent and name
+  - `INVAL_INODE` always goes out
+  - a rename moves validity to the new name
+  - a 100 ms TTL is written for, then not after expiry
+  - a failed lookup writes nothing
+- `platform`:
+  - `proc_locks_lookup_matches_the_inode` (either key; every holder of a
+    shared key, each once)
+  - `a_mounts_device_is_found_by_its_id`
+  - `own_flock_is_found_in_proc_locks_in_the_build_tree`: a btrfs
+    subvolume here. It fails without the fix.
+  - `another_process_is_seen_to_have_its_file_open` (`opened_by`)
+- `cli`: `daemon_lock::tests::the_reaper_stays_while_its_parent_holds_the_lock`
+  runs the real `reaper_main` on a lock in the build tree. It fails
+  without the fix: the reaper leaves after 1.5 s.
+- `cli`: `a_lock_on_another_subvolume_is_not_taken_for_ours` makes two
+  btrfs subvolumes (skipped where `btrfs subvolume create` fails or the
+  two `daemon.lock` inodes differ) and has `flock(1)` hold `b`'s lock:
+  `a`'s `holder_pids` names it (the ambiguity), `holder(a)` is `Unknown`,
+  `take_over(a)` refuses even with the wedged hook on it, `daemon.pid`
+  confirms it, and a reaper on `a` stays while we hold `a` and leaves
+  after.
+- `dentries::tests::a_rename_during_a_lookup_of_the_old_name_keeps_the_new_name_cached`.
+- Test temp dirs that need the build tree's filesystem live under
+  `target/<profile>/test-tmp`, not in the source tree.
+
+### Gates (worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, `TMPDIR=/var/tmp/fih` on btrfs, prefix `fih`)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test`, every workspace package, in five calls | 2433 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | exit 0 |
+| `fuse-inval-storm` dev-fuse x11 | 11 PASSED. 33 kills: 30 exited unaided (≤ 1.4 s), 3 released by the reaper (2.2, 2.2, 3.1 s). No zombie, no leftover mount |
+| `fuse-inval-storm` uring x17 | 16 PASSED, 1 FAILED (run 1: a surviving node's `rename` in flight for 58 s; see below, not this bug). 48 kills: 44 unaided, 4 reaper releases (2.1–2.3 s). No zombie or leftover connection |
+| same scenario, `main` daemon (HEAD c28d849) with only the harness changes, uring x3 | 3 FAILED: round 0 holder wedged in `fuse_reverse_inval_entry`, never reaped (the btrfs reaper bug) |
+| `session-handover-idle`, `transport-detach-refused`, `-refused-registration`, `-seccomp-denied`, `-enomem-ring`, `-abort-while-armed`, `-cluster-locks-auto`, `-lock-wait-budget` | 8 PASSED |
+| `passthrough-*` as root (`sudo env HOME=/root`), 8 scenarios | 8 PASSED; no root-owned files left in `~` |
+| pjdfstest compliance (`-p fih`, floci port reset) | 8798 passed, 0 failed (dev_fuse); `compliance-uring`: 8798 passed, 0 failed (uring_zc) |
+
+### Review fix round (rebased on `72438dc`)
+
+All review findings adopted; see the Fix, Decisions and Tests items above
+(the btrfs key ambiguity, the `2 × ttl` slack, the in-flight rename
+carry-over, the loud and counted harness release, the residual-case
+record, and the nits: `fuse_connection_of`'s doc back on it, test temp
+dirs under `target/`, the storm's "for an entry TTL after each listing").
+
+| Gate (`CARGO_TARGET_DIR` unset, `ulimit -n` 65536, `TMPDIR=/var/tmp/fihfix/tmp`, prefix `fihfix`, load 25–70) | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --no-fail-fast`, every workspace package, in 7 calls | 2478 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | ok |
+| `fuse-inval-storm` dev-fuse ×5 | 5 PASSED; 15 kills, 13 unaided, 2 released by the reaper (2.45, 2.49 s); no harness release |
+| `fuse-inval-storm` uring ×5 | 5 PASSED; 15 kills, 14 unaided, 1 reaper release (2.11 s); no harness release. 3 more runs were cut by my own 110 s `timeout` (too short under load: one in its final convergence check after 3 clean kills, two still in setup / round 1); no daemon, mount, container or zombie of mine was left |
+| `visibility-after-burst`, `visibility-s3-latency`, `p2p-invalidation`, `forwarded-mutations`, `coop-*` (4) | 8/8 PASSED on each transport |
+| `stale-base-rename-divergence`, `cross-subtree-rename`, `cross-range-rename`, `scratch-publish`, `session-stale-base-rename` | 5/5 PASSED on each transport |
+| pjdfstest `compliance` (`-p fihfix`, floci port reset) | 8798 passed, 0 failed (dev_fuse) |
+
+### Separate finding: dependent op stuck 40 s behind a stranded op after a holder kill (authority; not fixed here)
+
+Seen on the uring leg in 2 of 17 runs (dev-fuse 0 of 11). After the
+holder is killed, a surviving node's op that depends on its own journaled
+op stranded by the dead holder waits the full 40 s client deadline. It
+then answers `EIO` ("in doubt", `attempts=0`). The stranded op is
+replayed only *after* that deadline fires.
+
+Run uring #15, node a (killed holder b; c took over at 07:31:50, epoch 4):
+
+- `Unlink a-r2-w1-321.r`: submitted 07:31:33.6, in doubt at 07:32:13.636
+  after 40.0 s.
+- `Rename a-r2-w1-321 → .r`: Accepted at epoch 4 after 23.4 s, at
+  07:32:13.643.
+- `stranded op replayed by rid … seq 7390`: 07:32:13.644, right after the
+  unlink gave up.
+
+Run uring #1 is the same shape past the bound: a `rename` was still in
+flight 58 s later, the round's workers could not finish, and the
+scenario failed. The scenario tolerates errors on surviving nodes, so
+`#8` and `#15` passed with 2 and 1 `EIO`s. Logs: `/var/tmp/fih/evidence/uring15-{a,b,c}.log`
+(host-local). This is in `authority/src/core` (client deadline vs
+stranded-op replay ordering), outside the invalidation path, and left
+for its own fix.
+
+### Files
+
+`crates/frontend-fuse/src/{dentries.rs (new),adapter.rs,reply.rs,notify.rs,session.rs,lib.rs}`,
+`crates/frontend-fuse/tests/wire.rs`, `crates/engine/src/kernel_inval.rs`,
+`crates/platform/src/{linux.rs,lock.rs,unix.rs,macos.rs,unsupported.rs}`,
+`crates/cli/src/daemon_lock.rs`,
+`crates/harness/src/{client.rs,main.rs,scenarios.rs,scenarios/inval_storm.rs}`.

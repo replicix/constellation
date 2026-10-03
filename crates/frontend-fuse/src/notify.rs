@@ -24,7 +24,17 @@
 //! drops is at most a TTL of staleness for entries and attributes; the
 //! resuming host re-invalidates the data of every open file
 //! (`constellation-frontend-fuse`'s caller does, from the handle table).
+//!
+//! # Only what the kernel can hold
+//!
+//! An entry invalidation (and a delete) takes the parent directory's
+//! `i_rwsem` in the kernel whether or not the name is cached, so it is
+//! written only for a name the kernel can hold a valid dentry for
+//! ([`KernelEntries`], `dentries`'s module doc): the others drop nothing,
+//! and skipping them keeps this thread off the directory locks a `kill -9`
+//! could otherwise leave it parked on for good.
 
+use crate::dentries::KernelEntries;
 use constellation_vfs::{FrontendEvents, Invalidation};
 use fuser::{INodeNo, Notifier};
 use std::ffi::OsStr;
@@ -34,6 +44,8 @@ use std::time::{Duration, Instant};
 
 struct GateState {
     notifier: Option<Notifier>,
+    /// What the kernel of the session written to can hold.
+    entries: Arc<KernelEntries>,
     open: bool,
     /// Writes under way right now.
     writing: u32,
@@ -47,10 +59,11 @@ pub(crate) struct NotifyGate {
 }
 
 impl NotifyGate {
-    pub(crate) fn new(notifier: Notifier) -> Arc<Self> {
+    pub(crate) fn new(notifier: Notifier, entries: Arc<KernelEntries>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(GateState {
                 notifier: Some(notifier),
+                entries,
                 open: true,
                 writing: 0,
             }),
@@ -58,16 +71,16 @@ impl NotifyGate {
         })
     }
 
-    /// The notifier to write with, counted as a write under way; `None`
-    /// while the gate is closed.
-    fn enter(&self) -> Option<Notifier> {
+    /// The notifier to write with, and what its kernel can hold, counted
+    /// as a write under way; `None` while the gate is closed.
+    fn enter(&self) -> Option<(Notifier, Arc<KernelEntries>)> {
         let mut st = self.state.lock().unwrap();
         if !st.open {
             return None;
         }
         let notifier = st.notifier.clone()?;
         st.writing += 1;
-        Some(notifier)
+        Some((notifier, st.entries.clone()))
     }
 
     fn exit(&self) {
@@ -105,11 +118,13 @@ impl NotifyGate {
     }
 
     /// Open the gate again, writing through `notifier` from now on when
-    /// one is given (a resumed session's channel).
-    pub(crate) fn reopen(&self, notifier: Option<Notifier>) {
+    /// one is given (a resumed session's channel, with that session's
+    /// `entries`).
+    pub(crate) fn reopen(&self, session: Option<(Notifier, Arc<KernelEntries>)>) {
         let mut st = self.state.lock().unwrap();
-        if let Some(notifier) = notifier {
+        if let Some((notifier, entries)) = session {
             st.notifier = Some(notifier);
+            st.entries = entries;
         }
         st.open = true;
     }
@@ -123,10 +138,11 @@ pub struct FuseNotifySink {
 
 impl FuseNotifySink {
     /// A sink writing through `notifier`, never gated (a session that is
-    /// not handed over).
-    pub fn new(notifier: Notifier) -> Self {
+    /// not handed over), to the kernel whose dentries `entries` tracks
+    /// ([`crate::FuseFs::kernel_entries`] of the session's filesystem).
+    pub fn new(notifier: Notifier, entries: Arc<KernelEntries>) -> Self {
         Self {
-            gate: NotifyGate::new(notifier),
+            gate: NotifyGate::new(notifier, entries),
         }
     }
 
@@ -141,13 +157,19 @@ impl FuseNotifySink {
 
 impl FrontendEvents for FuseNotifySink {
     fn invalidate(&self, batch: &[Invalidation]) {
-        let Some(notifier) = self.gate.enter() else {
+        let Some((notifier, entries)) = self.gate.enter() else {
             return;
         };
         for inv in batch {
             // ENOENT (nothing cached) is the common answer; every error
             // only means there was nothing to drop.
             let _ = match inv {
+                Invalidation::Entry { parent, name }
+                | Invalidation::Deleted { parent, name, .. }
+                    if !entries.may_be_cached(*parent, name.as_bytes()) =>
+                {
+                    Ok(())
+                }
                 Invalidation::Entry { parent, name } => {
                     notifier.inval_entry(INodeNo(*parent), OsStr::from_bytes(name.as_bytes()))
                 }

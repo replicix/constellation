@@ -48,7 +48,10 @@ pub(crate) fn host_services() -> HostServices {
 }
 
 pub(crate) fn file_lock() -> Arc<dyn FileLock> {
-    Arc::new(UnixFileLock { holder: |_| None })
+    Arc::new(UnixFileLock {
+        holders: |_| Vec::new(),
+        opened_by: |_, _| false,
+    })
 }
 
 fn off_t(n: u64) -> io::Result<libc::off_t> {

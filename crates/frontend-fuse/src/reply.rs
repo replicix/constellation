@@ -9,6 +9,7 @@
 //! on every path, including a `lock-wait` thread that could not be
 //! started (`constellation_engine::locks::ClusterLocks::lock`).
 
+use crate::dentries::{EntryGuard, RenameGuard};
 use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
 use constellation_types::Code;
 use constellation_vfs::{
@@ -74,15 +75,21 @@ pub(crate) fn file_type(kind: FileKind) -> FileType {
     }
 }
 
-pub(crate) struct EntryReply(pub ReplyEntry);
+/// An entry reply, and the name it hands the kernel (`dentries`).
+pub(crate) struct EntryReply {
+    pub reply: ReplyEntry,
+    pub name: EntryGuard,
+}
 
 impl Responder<Entry> for EntryReply {
     fn done(self, r: VfsResult<Entry>) {
         match r {
-            Ok(e) => self
-                .0
-                .entry(&e.attr.ttl, &fuse_attr(&e.attr), Generation(e.generation)),
-            Err(e) => self.0.error(reply_code(e.code())),
+            Ok(e) => {
+                self.reply
+                    .entry(&e.attr.ttl, &fuse_attr(&e.attr), Generation(e.generation));
+                self.name.replied(e.attr.ttl);
+            }
+            Err(e) => self.reply.error(reply_code(e.code())),
         }
     }
 }
@@ -173,6 +180,26 @@ impl Responder<()> for EmptyReply {
     }
 }
 
+/// A rename's reply, and the dentries it moves in the kernel
+/// (`dentries`).
+pub(crate) struct RenameReply {
+    pub reply: ReplyEmpty,
+    pub names: RenameGuard,
+    pub exchange: bool,
+}
+
+impl Responder<()> for RenameReply {
+    fn done(self, r: VfsResult<()>) {
+        match r {
+            Ok(()) => {
+                self.reply.ok();
+                self.names.renamed(self.exchange);
+            }
+            Err(e) => self.reply.error(reply_code(e.code())),
+        }
+    }
+}
+
 /// Gives back the view's side of an open that was answered but must be
 /// refused after all (`passthrough`'s module doc: a read-write open of an
 /// inode in passthrough mode): a `release` of the handle the view counted.
@@ -253,11 +280,13 @@ pub(crate) struct CreateReply {
     pub reply: ReplyCreate,
     /// `ino` is learnt from the reply; `pre` is always `Unregistered`.
     pub cx: OpenCtx,
+    /// The name it hands the kernel (`dentries`).
+    pub name: EntryGuard,
 }
 
 impl Responder<(Entry, Opened)> for CreateReply {
     fn done(self, r: VfsResult<(Entry, Opened)>) {
-        let CreateReply { reply, cx } = self;
+        let CreateReply { reply, cx, name } = self;
         match r {
             Ok((e, o)) => {
                 // A create can open an existing inode (no `O_EXCL`), and
@@ -282,7 +311,10 @@ impl Responder<(Entry, Opened)> for CreateReply {
                 let attr = fuse_attr(&e.attr);
                 let generation = Generation(e.generation);
                 match fopen(answer) {
-                    Some((flags, None)) => reply.created(&e.attr.ttl, &attr, generation, fh, flags),
+                    Some((flags, None)) => {
+                        reply.created(&e.attr.ttl, &attr, generation, fh, flags);
+                        name.replied(e.attr.ttl);
+                    }
                     Some((flags, Some(id))) => {
                         // SAFETY: as in `OpenReply`.
                         let backing = unsafe { reply.wrap_backing(id) };
@@ -295,6 +327,7 @@ impl Responder<(Entry, Opened)> for CreateReply {
                             &backing,
                         );
                         let _ = backing.into_raw();
+                        name.replied(e.attr.ttl);
                     }
                     None => {
                         (cx.undo)(e.attr.ino, o.fh);

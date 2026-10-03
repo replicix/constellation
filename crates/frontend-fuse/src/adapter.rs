@@ -60,11 +60,12 @@
 //! set includes process-directed signals (`ShdPnd`), which another thread
 //! of the caller may be the one to take, and must not end this wait.
 
+use crate::dentries::{KernelEntries, RenameGuard};
 use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, PreOpen};
 use crate::reply::{
     AttrReply, BytesReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply, LseekReply,
-    OpenCtx, OpenReply, ReadReply, StatfsReply, Undo, WriteReply, XattrListReply, XattrReply,
-    F_RDLCK, F_UNLCK, F_WRLCK,
+    OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply, XattrListReply,
+    XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
 };
 use constellation_types::{Code, Rdev};
 use constellation_vfs::{
@@ -130,6 +131,10 @@ pub struct FuseFs<V: Vfs> {
     /// `FOPEN_PASSTHROUGH`, and the per-inode state that keeps its
     /// replies within the kernel's rules (`passthrough`'s module doc).
     passthrough: Arc<PassthroughState>,
+    /// The names the kernel can hold a valid dentry for: every reply that
+    /// hands it one is recorded, so the notification sink writes entry
+    /// invalidations only where they can drop something (`dentries`).
+    entries: Arc<KernelEntries>,
 }
 
 impl<V: Vfs> FuseFs<V> {
@@ -144,7 +149,15 @@ impl<V: Vfs> FuseFs<V> {
             deferred: Arc::default(),
             interrupts: Arc::default(),
             passthrough: PassthroughState::new(PassthroughWish::Off(reason::DISABLED)),
+            entries: KernelEntries::new(),
         }
+    }
+
+    /// The names this connection's kernel can hold a valid dentry for, as
+    /// the notification sink ([`crate::FuseNotifySink::new`]) consults
+    /// them.
+    pub fn kernel_entries(&self) -> &Arc<KernelEntries> {
+        &self.entries
     }
 
     /// Ask for passthrough at `FUSE_INIT` (or not, and why).
@@ -901,11 +914,15 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Lookup, parent.0);
         let _in = op.enter();
+        let name_guard = self.entries.begin(parent.0, n.as_bytes());
         self.vfs.lookup(
             &op.ctx(&caller),
             parent.0,
             name(n),
-            op.responder(EntryReply(reply)),
+            op.responder(EntryReply {
+                reply,
+                name: name_guard,
+            }),
         );
     }
 
@@ -980,12 +997,16 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Mkdir, parent.0);
         let _in = op.enter();
+        let name_guard = self.entries.begin(parent.0, n.as_bytes());
         self.vfs.mkdir(
             &op.ctx(&caller),
             parent.0,
             name(n),
             mode,
-            op.responder(EntryReply(reply)),
+            op.responder(EntryReply {
+                reply,
+                name: name_guard,
+            }),
         );
     }
 
@@ -1005,13 +1026,17 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let rdev: Rdev = constellation_platform::from_linux_fuse_rdev(rdev);
         let op = self.obs().begin(OpKind::Mknod, parent.0);
         let _in = op.enter();
+        let name_guard = self.entries.begin(parent.0, n.as_bytes());
         self.vfs.mknod(
             &op.ctx(&caller),
             parent.0,
             name(n),
             mode,
             rdev,
-            op.responder(EntryReply(reply)),
+            op.responder(EntryReply {
+                reply,
+                name: name_guard,
+            }),
         );
     }
 
@@ -1026,12 +1051,16 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Link, ino.0);
         let _in = op.enter();
+        let name_guard = self.entries.begin(newparent.0, newname.as_bytes());
         self.vfs.link(
             &op.ctx(&caller),
             ino.0,
             newparent.0,
             name(newname),
-            op.responder(EntryReply(reply)),
+            op.responder(EntryReply {
+                reply,
+                name: name_guard,
+            }),
         );
     }
 
@@ -1056,6 +1085,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             pt: self.passthrough.clone(),
             undo: self.undo(req, flags),
         };
+        let name_guard = self.entries.begin(parent.0, n.as_bytes());
         self.vfs.create(
             &op.ctx(&caller),
             parent.0,
@@ -1063,7 +1093,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             mode,
             flags,
             OpenOwner::NONE,
-            op.responder(CreateReply { reply, cx }),
+            op.responder(CreateReply {
+                reply,
+                cx,
+                name: name_guard,
+            }),
         );
     }
 
@@ -1078,12 +1112,16 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Symlink, parent.0);
         let _in = op.enter();
+        let name_guard = self.entries.begin(parent.0, link_name.as_bytes());
         self.vfs.symlink(
             &op.ctx(&caller),
             parent.0,
             name(link_name),
             target.as_os_str().as_bytes(),
-            op.responder(EntryReply(reply)),
+            op.responder(EntryReply {
+                reply,
+                name: name_guard,
+            }),
         );
     }
 
@@ -1124,14 +1162,24 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Rename, parent.0);
         let _in = op.enter();
+        let flags = rename_flags(flags.bits());
+        let names = RenameGuard::new(
+            &self.entries,
+            (parent.0, n.as_bytes()),
+            (newparent.0, newname.as_bytes()),
+        );
         self.vfs.rename(
             &op.ctx(&caller),
             parent.0,
             name(n),
             newparent.0,
             name(newname),
-            rename_flags(flags.bits()),
-            op.responder(EmptyReply(reply)),
+            flags,
+            op.responder(RenameReply {
+                reply,
+                names,
+                exchange: flags.contains(RenameFlags::EXCHANGE),
+            }),
         );
     }
 

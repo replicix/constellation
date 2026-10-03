@@ -1148,7 +1148,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "fuse-inval-storm",
-        desc: "campaign 6 B-1 (the deadlock): three nodes create, rename and unlink in one shared directory at full speed for INVAL_STORM_SECS (12) s per round, so every node's kernel is invalidated for the others' ops while it has requests in flight on that directory; INVAL_STORM_ROUNDS (3) rounds, each with kill -9 of the lease holder mid-load: no op exceeds its bound, no worker hangs, the killed daemon exits within 5 s (no zombie wedged in fuse_reverse_inval_entry), it remounts within 60 s and the directory converges everywhere",
+        desc: "campaign 6 B-1 (the deadlock): three nodes create, rename and unlink in one shared directory at full speed for INVAL_STORM_SECS (12) s per round, listing it ls -l style every 8th cycle (so for an entry TTL after each listing a kernel holds dentries for the others' names), so every node's kernel is invalidated for the others' ops while it has requests in flight on that directory; INVAL_STORM_ROUNDS (3) rounds, each with kill -9 of the lease holder mid-load: no op exceeds its bound, no worker hangs, the killed daemon exits within 5 s, unaided or released by its zombie reaper (no zombie left wedged in fuse_reverse_inval_entry), it remounts within 60 s and the directory converges everywhere",
         requires: &[],
         caps: &[Cap::FuseAbort, Cap::PushInvalFull],
         run: inval_storm::fuse_inval_storm,

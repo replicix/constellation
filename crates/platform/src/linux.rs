@@ -3,7 +3,7 @@
 //! FUSE mount ([`fuse_mount_fd`]).
 //!
 //! The `/proc` text parsers are public free functions ([`parse_mountinfo`],
-//! [`parse_process_facts`], [`flock_pid_in`]) so the shapes seen in the
+//! [`parse_process_facts`], [`flock_pids_in`]) so the shapes seen in the
 //! field can be tested verbatim, here and by the callers whose decisions
 //! depend on them.
 
@@ -43,7 +43,8 @@ pub(crate) fn host_services() -> HostServices {
 
 pub(crate) fn file_lock() -> Arc<dyn FileLock> {
     Arc::new(UnixFileLock {
-        holder: flock_holder_pid,
+        holders: flock_holder_pids,
+        opened_by: has_open,
     })
 }
 
@@ -63,28 +64,117 @@ fn cstring(path: &Path) -> io::Result<CString> {
 
 // ---------------------------------------------------------------- locks
 
-/// The pid `/proc/locks` names for the `FLOCK` on `lock`'s inode.
-fn flock_holder_pid(lock: &Path) -> Option<u32> {
+/// The pids `/proc/locks` names for an `FLOCK` on `lock`'s inode.
+///
+/// `/proc/locks` names an inode by its *superblock's* device
+/// (`i_sb->s_dev`), which is not always the `st_dev` a `stat(2)` reports:
+/// btrfs gives every subvolume an anonymous device of its own (a lock on
+/// `/var` of a Fedora host shows as `00:25:<ino>` while `stat` says
+/// `0:38`), and overlayfs may report a lower layer's. Looked up by the
+/// `stat` device alone, the lock of a live daemon on such a filesystem
+/// reads as released — which once made every zombie reaper on a btrfs
+/// state dir leave within 1.5 s of its start, so a wedged daemon was never
+/// reaped. So the inode is looked for under both devices: `stat`'s and
+/// the one mountinfo reports for the mount the file is on (found by the
+/// open file's `mnt_id`), which is the superblock's.
+///
+/// The superblock's key is ambiguous: every subvolume of one btrfs numbers
+/// its inodes from 257 under that one device, so two `daemon.lock`s in two
+/// subvolumes both show as `00:25:257`. Every matching pid is returned;
+/// [`has_open`] tells the one that holds *this* file.
+fn flock_holder_pids(lock: &Path) -> Vec<u32> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(lock).ok()?;
-    let locks = std::fs::read_to_string("/proc/locks").ok()?;
+    // A second open file description of a flock'd file leaves the lock
+    // alone when it closes (unlike a POSIX lock's).
+    let Ok(file) = File::open(lock) else {
+        return Vec::new();
+    };
+    let (Ok(meta), Ok(locks)) = (file.metadata(), std::fs::read_to_string("/proc/locks")) else {
+        return Vec::new();
+    };
+    let key = |major: u32, minor: u32| format!("{major:02x}:{minor:02x}:{}", meta.ino());
     let dev = meta.dev();
-    let (major, minor) = (libc::major(dev), libc::minor(dev));
-    let want = format!("{major:02x}:{minor:02x}:{}", meta.ino());
-    flock_pid_in(&locks, &want)
+    let mut keys = vec![key(libc::major(dev), libc::minor(dev))];
+    if let Some((major, minor)) = superblock_dev(&file) {
+        keys.push(key(major, minor));
+    }
+    flock_pids_in(&locks, &keys)
 }
 
-/// Find the pid of the `FLOCK` line on `inode` (`maj:min:ino`, as
-/// `/proc/locks` prints it) in `locks`.
-pub fn flock_pid_in(locks: &str, inode: &str) -> Option<u32> {
+/// Whether `pid` has `path`'s file open: an fd under any of its threads'
+/// `/proc/<pid>/task/<tid>/fd` whose target has `stat(path)`'s device and
+/// inode. `stat` through the fd link reports the subvolume's own device,
+/// so unlike `/proc/locks`' key this tells two subvolumes' files apart.
+/// Every thread is looked at because a zombie thread-group leader (a
+/// daemon `kill -9`ed while another thread is stuck in the kernel) has no
+/// file table of its own any more; the stuck thread still has it.
+fn has_open(pid: u32, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(want) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    for task in tasks.flatten() {
+        let Ok(fds) = std::fs::read_dir(task.path().join("fd")) else {
+            continue;
+        };
+        let mut any = false;
+        for fd in fds.flatten() {
+            any = true;
+            if let Ok(meta) = std::fs::metadata(fd.path()) {
+                if meta.dev() == want.dev() && meta.ino() == want.ino() {
+                    return true;
+                }
+            }
+        }
+        // Threads share one file table (the daemon never unshares it):
+        // the first thread that still has one has answered.
+        if any {
+            return false;
+        }
+    }
+    false
+}
+
+/// The `major:minor` mountinfo reports for the mount `file` is on.
+fn superblock_dev(file: &File) -> Option<(u32, u32)> {
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).ok()?;
+    let mnt_id = status_field(&fdinfo, "mnt_id")?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mount_device_in(&mountinfo, mnt_id)
+}
+
+/// The `major:minor` of mount `mnt_id` in a `/proc/<pid>/mountinfo`.
+pub fn mount_device_in(mountinfo: &str, mnt_id: &str) -> Option<(u32, u32)> {
+    mountinfo.lines().find_map(|line| {
+        // `95 44 0:37 /var /var rw,relatime shared:173 - btrfs /dev/nvme0n1p3 rw`
+        let mut fields = line.split(' ');
+        if fields.next()? != mnt_id {
+            return None;
+        }
+        let (major, minor) = fields.nth(1)?.split_once(':')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    })
+}
+
+/// The pids of the `FLOCK` lines on any of `inodes` (`maj:min:ino`, as
+/// `/proc/locks` prints it) in `locks`, each once, in order.
+pub fn flock_pids_in(locks: &str, inodes: &[String]) -> Vec<u32> {
+    let mut pids = Vec::new();
     for line in locks.lines() {
         // `1: FLOCK  ADVISORY  WRITE 161984 103:01:2098107 0 EOF`
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 6 && fields[1] == "FLOCK" && fields[5] == inode {
-            return fields[4].parse().ok();
+        if fields.len() >= 6 && fields[1] == "FLOCK" && inodes.iter().any(|i| fields[5] == i) {
+            if let Ok(pid) = fields[4].parse() {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
         }
     }
-    None
+    pids
 }
 
 // -------------------------------------------------------------- process
@@ -614,11 +704,36 @@ garbage line without the separator
     fn proc_locks_lookup_matches_the_inode() {
         let locks = "1: POSIX  ADVISORY  WRITE 1234 fd:01:5678 0 EOF\n\
                      2: FLOCK  ADVISORY  WRITE 161984 103:01:2098107 0 EOF\n\
-                     3: FLOCK  ADVISORY  WRITE 999 103:01:42 0 EOF\n";
-        assert_eq!(flock_pid_in(locks, "103:01:2098107"), Some(161984));
-        assert_eq!(flock_pid_in(locks, "103:01:42"), Some(999));
-        assert_eq!(flock_pid_in(locks, "fd:01:5678"), None);
-        assert_eq!(flock_pid_in(locks, "103:01:1"), None);
+                     3: FLOCK  ADVISORY  WRITE 999 103:01:42 0 EOF\n\
+                     4: FLOCK  ADVISORY  WRITE 777 00:25:257 0 EOF\n\
+                     5: FLOCK  ADVISORY  WRITE 888 00:25:257 0 EOF\n\
+                     6: FLOCK  ADVISORY  WRITE 777 00:25:257 0 EOF\n";
+        let find = |keys: &[&str]| {
+            flock_pids_in(
+                locks,
+                &keys.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(find(&["103:01:2098107"]), vec![161984]);
+        assert_eq!(find(&["103:01:42"]), vec![999]);
+        assert_eq!(find(&["fd:01:5678"]), Vec::<u32>::new());
+        assert_eq!(find(&["103:01:1"]), Vec::<u32>::new());
+        // btrfs: `stat` names the subvolume's anonymous device, the lock
+        // line the superblock's; either key finds it.
+        assert_eq!(find(&["00:38:42", "103:01:42"]), vec![999]);
+        // Two subvolumes' `daemon.lock`s, both inode 257 under the one
+        // superblock device: every holder is named, each once.
+        assert_eq!(find(&["00:38:257", "00:25:257"]), vec![777, 888]);
+    }
+
+    #[test]
+    fn a_mounts_device_is_found_by_its_id() {
+        let mountinfo = "44 1 0:37 /root / rw,relatime shared:1 - btrfs /dev/nvme0n1p3 rw\n\
+                         95 44 0:37 /var /var rw,relatime shared:173 - btrfs /dev/nvme0n1p3 rw\n\
+                         96 44 259:2 / /boot rw,relatime shared:2 - ext4 /dev/nvme0n1p2 rw\n";
+        assert_eq!(mount_device_in(mountinfo, "95"), Some((0, 37)));
+        assert_eq!(mount_device_in(mountinfo, "96"), Some((259, 2)));
+        assert_eq!(mount_device_in(mountinfo, "9"), None);
     }
 
     /// The real thing: a lock this process holds is attributed to this
@@ -629,9 +744,62 @@ garbage line without the separator
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.lock");
         let guard = locks.lock(open_lock_file(&path).unwrap()).unwrap();
-        assert_eq!(locks.holder_pid(&path), Some(std::process::id()));
+        assert!(locks.holder_pids(&path).contains(&std::process::id()));
+        assert!(locks.opened_by(std::process::id(), &path));
         drop(guard);
-        assert_eq!(locks.holder_pid(&path), None);
+        assert!(!locks.holder_pids(&path).contains(&std::process::id()));
+        assert!(!locks.opened_by(std::process::id(), &path));
+    }
+
+    /// A directory under the build's target dir (`target/<profile>/
+    /// test-tmp`), for tests that need the build tree's filesystem.
+    fn build_tree_tmp() -> tempfile::TempDir {
+        let exe = std::env::current_exe().unwrap();
+        // `target/<profile>/deps/<test binary>`
+        let dir = exe.parent().unwrap().parent().unwrap().join("test-tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        tempfile::tempdir_in(dir).unwrap()
+    }
+
+    /// The same in the build tree, which is where a filesystem whose
+    /// `stat` device differs from its superblock's (btrfs subvolumes) is
+    /// most likely on a dev host — `/tmp` is usually a tmpfs.
+    #[test]
+    fn own_flock_is_found_in_proc_locks_in_the_build_tree() {
+        let locks = file_lock();
+        let dir = build_tree_tmp();
+        let path = dir.path().join("daemon.lock");
+        let guard = locks.lock(open_lock_file(&path).unwrap()).unwrap();
+        assert!(locks.holder_pids(&path).contains(&std::process::id()));
+        drop(guard);
+        assert!(!locks.holder_pids(&path).contains(&std::process::id()));
+    }
+
+    /// `opened_by` tells which file another process has open: a child
+    /// that holds one of two files has that one open and not the other.
+    #[test]
+    fn another_process_is_seen_to_have_its_file_open() {
+        let locks = file_lock();
+        let dir = build_tree_tmp();
+        let held = dir.path().join("held.lock");
+        let other = dir.path().join("other.lock");
+        std::fs::write(&other, "").unwrap();
+        let file = open_lock_file(&held).unwrap();
+        // The child inherits the open file (`sleep` holds it).
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::from(file))
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let seen = (locks.opened_by(pid, &held), locks.opened_by(pid, &other));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(seen, (true, false));
+        assert!(
+            !locks.opened_by(pid, &held),
+            "a reaped process has nothing open"
+        );
     }
 
     #[test]

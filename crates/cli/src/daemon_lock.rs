@@ -77,18 +77,48 @@ impl std::fmt::Display for Holder {
 /// Identify and classify whoever holds `daemon.lock` in `state_dir`.
 pub fn holder(state_dir: &Path) -> Holder {
     let lock = state_dir.join(LOCK_NAME);
-    let pid = match lock_holder_pid(&lock) {
-        Some(pid) => pid,
-        None => match pid_file(state_dir) {
+    let candidates = lock_holder_pids(&lock);
+    let pid = if candidates.is_empty() {
+        match pid_file(state_dir) {
             Some(pid) => pid,
             None => {
                 return Holder::Unknown {
                     detail: "no flock on daemon.lock in /proc/locks and no daemon.pid".into(),
                 }
             }
-        },
+        }
+    } else {
+        match confirmed_holder(state_dir, &candidates) {
+            Some(pid) => pid,
+            None => {
+                return Holder::Unknown {
+                    detail: format!(
+                        "/proc/locks names pid(s) {candidates:?} for a flock under daemon.lock's                          device and inode, but none is daemon.pid or has daemon.lock open (the                          key is shared: btrfs subvolumes number their inodes alike)"
+                    ),
+                }
+            }
+        }
     };
     classify_pid(pid)
+}
+
+/// Of the pids `/proc/locks` names under `daemon.lock`'s device and inode
+/// (which may hold a lock on another subvolume's file of the same number,
+/// see `FileLock::holder_pids`), the one confirmed to hold *this* file:
+/// the pid in `daemon.pid`, or one that has this `daemon.lock` open.
+fn confirmed_holder(state_dir: &Path, candidates: &[u32]) -> Option<u32> {
+    let pid_file = pid_file(state_dir);
+    if let Some(pid) = candidates.iter().find(|&&pid| Some(pid) == pid_file) {
+        return Some(*pid);
+    }
+    let lock = state_dir.join(LOCK_NAME);
+    let mut confirmed = candidates
+        .iter()
+        .filter(|&&pid| native().file_lock.opened_by(pid, &lock));
+    match (confirmed.next(), confirmed.next()) {
+        (Some(pid), None) => Some(*pid),
+        _ => None,
+    }
 }
 
 /// The pid from `daemon.pid`, if any (written by a daemon once it is up;
@@ -101,10 +131,11 @@ fn pid_file(state_dir: &Path) -> Option<u32> {
         .ok()
 }
 
-/// The pid holding the `flock` on `lock`, when the host can tell (Linux:
-/// `/proc/locks` names it).
-fn lock_holder_pid(lock: &Path) -> Option<u32> {
-    native().file_lock.holder_pid(lock)
+/// The pids that may hold the `flock` on `lock`, when the host can tell
+/// (Linux: `/proc/locks` names them; more than one, or the wrong one, when
+/// another file shares the key — confirm with `confirmed_holder`).
+fn lock_holder_pids(lock: &Path) -> Vec<u32> {
+    native().file_lock.holder_pids(lock)
 }
 
 /// Classify `pid` from what the kernel reports about it and its threads.
@@ -241,7 +272,7 @@ pub fn take_over(state_dir: &Path, pid: u32) -> Result<()> {
     let _mutex = takeover_mutex(state_dir)?;
     match holder_for_takeover(state_dir) {
         Holder::Wedged { pid: now, .. } if now == pid => {}
-        Holder::Unknown { .. } if lock_holder_pid(&state_dir.join(LOCK_NAME)).is_none() => {
+        Holder::Unknown { .. } if lock_holder_pids(&state_dir.join(LOCK_NAME)).is_empty() => {
             // Released meanwhile (or another mount already rotated it):
             // nothing to do, the caller's next flock decides.
             return Ok(());
@@ -458,7 +489,7 @@ pub fn reaper_main(parent: u32, state_dir: &Path) -> Result<()> {
     let mut released_polls = 0u32;
     loop {
         std::thread::sleep(REAPER_POLL);
-        if lock_holder_pid(&lock) != Some(parent) {
+        if !lock_holder_pids(&lock).contains(&parent) {
             // Released (a clean exit, a crash whose file table closed, a
             // takeover), or `/proc/locks` unreadable: nothing to reap.
             // Leaving is for good, so a live parent must look released on
@@ -483,6 +514,15 @@ pub fn reaper_main(parent: u32, state_dir: &Path) -> Result<()> {
         };
         let since = *wedged_since.get_or_insert_with(Instant::now);
         if since.elapsed() < REAPER_GRACE {
+            continue;
+        }
+        // `/proc/locks` names the parent under daemon.lock's key, but the
+        // key is shared across btrfs subvolumes: once the state dir is
+        // taken over (the parent's lock moved aside as
+        // `daemon.lock.wedged-<pid>`), a parent seen there holds another
+        // file, and the mounts recorded now are the new daemon's. Act
+        // only on a parent confirmed to hold this very `daemon.lock`.
+        if confirmed_holder(state_dir, &[parent]) != Some(parent) {
             continue;
         }
         let stale = abort_stale_mounts(state_dir);
@@ -703,7 +743,7 @@ mod tests {
             .file_lock
             .lock(std::fs::File::create(&lock).unwrap())
             .unwrap();
-        assert_eq!(lock_holder_pid(&lock), Some(std::process::id()));
+        assert!(lock_holder_pids(&lock).contains(&std::process::id()));
         match holder(dir.path()) {
             Holder::Live { pid, .. } => assert_eq!(pid, std::process::id()),
             other => panic!("expected live, got {other:?}"),
@@ -713,7 +753,200 @@ mod tests {
         assert!(err.to_string().contains("changed hands"), "{err}");
         assert!(lock.exists());
         drop(file);
-        assert_eq!(lock_holder_pid(&lock), None);
+        assert!(!lock_holder_pids(&lock).contains(&std::process::id()));
+    }
+
+    /// The reaper stays while its parent holds the lock and leaves once
+    /// it is released — also where `stat`'s device is not the one
+    /// `/proc/locks` names (a btrfs subvolume: the build tree of a typical
+    /// dev host), where it once read the held lock as released and left
+    /// within 1.5 s of its start, so no wedged daemon was ever reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_reaper_stays_while_its_parent_holds_the_lock() {
+        let _hook = wedged_hook_guard();
+        let dir = build_tree_tmp();
+        let lock = dir.path().join(LOCK_NAME);
+        let file = native()
+            .file_lock
+            .lock(std::fs::File::create(&lock).unwrap())
+            .unwrap();
+        let state = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(reaper_main(std::process::id(), &state).is_ok());
+        });
+        assert!(
+            rx.recv_timeout(REAPER_POLL * (REAPER_RELEASED_POLLS + 3))
+                .is_err(),
+            "the reaper left while its parent held the lock"
+        );
+        drop(file);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+        assert!(!dir.path().join(REAPER_LOG).exists(), "nothing was reaped");
+    }
+
+    /// A directory under the build's target dir (`target/<profile>/
+    /// test-tmp`), for tests that need the build tree's filesystem (a
+    /// btrfs subvolume on a typical dev host; `/tmp` is usually a tmpfs).
+    fn build_tree_tmp() -> tempfile::TempDir {
+        let exe = std::env::current_exe().unwrap();
+        // `target/<profile>/deps/<test binary>`
+        let dir = exe.parent().unwrap().parent().unwrap().join("test-tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        tempfile::tempdir_in(dir).unwrap()
+    }
+
+    /// Two btrfs subvolumes, `a` and `b`, under a fresh build-tree temp
+    /// dir, each with a `daemon.lock` of the same inode number (every
+    /// subvolume numbers its inodes from 257), so `/proc/locks` names the
+    /// two alike. `None` where that cannot be made here (not btrfs, no
+    /// `btrfs` tool, numbers that differ).
+    struct Subvolumes {
+        dir: tempfile::TempDir,
+    }
+
+    impl Subvolumes {
+        fn make() -> Option<Subvolumes> {
+            use std::os::unix::fs::MetadataExt;
+            let dir = build_tree_tmp();
+            for sv in ["a", "b"] {
+                let made = std::process::Command::new("btrfs")
+                    .args(["subvolume", "create"])
+                    .arg(dir.path().join(sv))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if !matches!(made, Ok(s) if s.success()) {
+                    eprintln!("skipped: `btrfs subvolume create` is unavailable here");
+                    return None;
+                }
+            }
+            let subvolumes = Subvolumes { dir };
+            let ino = |sv: &str| {
+                std::fs::File::create(subvolumes.state(sv).join(LOCK_NAME))
+                    .and_then(|f| f.metadata())
+                    .map(|m| m.ino())
+                    .ok()
+            };
+            match (ino("a"), ino("b")) {
+                (Some(a), Some(b)) if a == b => Some(subvolumes),
+                other => {
+                    eprintln!("skipped: the two lock files' inodes differ: {other:?}");
+                    None
+                }
+            }
+        }
+
+        fn state(&self, sv: &str) -> PathBuf {
+            self.dir.path().join(sv)
+        }
+    }
+
+    impl Drop for Subvolumes {
+        fn drop(&mut self) {
+            // An empty subvolume is removed by `rmdir` (Linux 4.18+); a
+            // `btrfs subvolume delete` would need root.
+            for sv in ["a", "b"] {
+                let _ = std::fs::remove_dir_all(self.state(sv));
+            }
+        }
+    }
+
+    /// Must-fix of the fuse-inval-hang review: two state dirs in two
+    /// subvolumes of one btrfs, whose `daemon.lock`s share an inode number,
+    /// look alike in `/proc/locks`. Another process holds `b`'s lock; `a`'s
+    /// holder must not be taken for it — not classified (it is no holder
+    /// of `a`'s), not taken over (even when it would be wedged), and a
+    /// reaper watching `a`'s daemon must not act on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lock_on_another_subvolume_is_not_taken_for_ours() {
+        let _hook = wedged_hook_guard();
+        let Some(subvolumes) = Subvolumes::make() else {
+            return;
+        };
+        let (a, b) = (subvolumes.state("a"), subvolumes.state("b"));
+        // `-o`: only flock(1) itself holds the lock (its `sleep` does not
+        // inherit the fd); its own process group, so both go at the end.
+        let mut other = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("flock")
+                .arg("-o")
+                .arg(b.join(LOCK_NAME))
+                .args(["sleep", "60"])
+                .process_group(0)
+                .spawn()
+                .expect("running flock(1)")
+        };
+        let other_pid = other.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !lock_holder_pids(&b.join(LOCK_NAME)).contains(&other_pid) {
+            assert!(Instant::now() < deadline, "flock(1) never took b's lock");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let outcome = std::panic::catch_unwind(|| {
+            // The ambiguity itself: `a`'s unheld lock reads as held by
+            // `b`'s holder, which has only `b`'s open.
+            assert!(lock_holder_pids(&a.join(LOCK_NAME)).contains(&other_pid));
+            assert!(!native().file_lock.opened_by(other_pid, &a.join(LOCK_NAME)));
+            assert!(native().file_lock.opened_by(other_pid, &b.join(LOCK_NAME)));
+            assert!(
+                matches!(holder(&a), Holder::Unknown { .. }),
+                "{:?}",
+                holder(&a)
+            );
+            // b's holder is confirmed by its open file (no daemon.pid).
+            assert!(
+                matches!(holder(&b), Holder::Live { pid, .. } if pid == other_pid),
+                "{:?}",
+                holder(&b)
+            );
+            // Even assumed wedged, it is no holder of `a`'s to take over.
+            std::env::set_var(
+                "CONSTELLATION_FAULT_ASSUME_WEDGED_PID",
+                other_pid.to_string(),
+            );
+            let taken = take_over(&a, other_pid);
+            std::env::remove_var("CONSTELLATION_FAULT_ASSUME_WEDGED_PID");
+            assert!(taken.is_err(), "took a over from b's holder");
+            assert!(a.join(LOCK_NAME).exists());
+            // A `daemon.pid` naming it is what confirms a holder.
+            std::fs::write(a.join("daemon.pid"), other_pid.to_string()).unwrap();
+            assert!(
+                matches!(holder(&a), Holder::Live { pid, .. } if pid == other_pid),
+                "{:?}",
+                holder(&a)
+            );
+            std::fs::remove_file(a.join("daemon.pid")).unwrap();
+            // Our own lock on `a` beside it: the reaper finds its parent
+            // among the pids and stays until the lock is released.
+            let file = native()
+                .file_lock
+                .lock(std::fs::File::create(a.join(LOCK_NAME)).unwrap())
+                .unwrap();
+            assert!(matches!(holder(&a), Holder::Live { pid, .. } if pid == std::process::id()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let state = a.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(reaper_main(std::process::id(), &state).is_ok());
+            });
+            assert!(
+                rx.recv_timeout(REAPER_POLL * (REAPER_RELEASED_POLLS + 3))
+                    .is_err(),
+                "the reaper left while its parent held the lock"
+            );
+            drop(file);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+            assert!(!a.join(REAPER_LOG).exists(), "nothing was reaped");
+        });
+        // SAFETY: plain syscall on the process group of our own child.
+        unsafe { libc::kill(-(other_pid as libc::pid_t), libc::SIGKILL) };
+        let _ = other.wait();
+        drop(subvolumes);
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// With the holder assumed wedged (the test hook), the takeover moves

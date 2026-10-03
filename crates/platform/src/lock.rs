@@ -41,10 +41,20 @@ pub trait FileLock: Send + Sync {
     /// [`constellation_types::Code::Again`]), an error for anything else.
     fn try_lock(&self, file: File) -> io::Result<Option<LockGuard>>;
 
-    /// The pid holding the lock on `path`, when the host can tell (Linux:
-    /// `/proc/locks`). `None` when nobody holds it, or the host cannot
-    /// say.
-    fn holder_pid(&self, path: &Path) -> Option<u32>;
+    /// The pids that may hold the lock on `path`, when the host can tell
+    /// (Linux: `/proc/locks`). Empty when nobody holds it, or the host
+    /// cannot say. More than the holder may show: `/proc/locks` names a
+    /// file only by device and inode number, which other files can share
+    /// (btrfs numbers every subvolume's inodes from 257 under one
+    /// device), so a pid here holds *a* lock under the same name — confirm
+    /// it with [`FileLock::opened_by`] before acting on it.
+    fn holder_pids(&self, path: &Path) -> Vec<u32>;
+
+    /// Whether process `pid` has `path`'s very file (the same device and
+    /// inode as `stat(path)` reports) open, as far as the host can tell:
+    /// `false` when it does not, or when that cannot be seen (no `/proc`,
+    /// another user's process).
+    fn opened_by(&self, pid: u32, path: &Path) -> bool;
 }
 
 /// Open (creating, never truncating) the file a lock is taken on.

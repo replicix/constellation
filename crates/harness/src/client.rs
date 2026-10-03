@@ -694,10 +694,15 @@ impl Client {
                 std::thread::sleep(Duration::from_millis(100));
             }
             child.kill().ok();
+            let released = release_killed(&mut child, &self.name, &self.mnt, KILLED_EXIT);
             bail!(
-                "{} daemon did not exit after unmount within {:?}: {}",
+                "{} daemon did not exit after unmount within {:?}{}: {}",
                 self.name,
                 client_timeout(),
+                released
+                    .err()
+                    .map(|e| format!(" (and {e:#})"))
+                    .unwrap_or_default(),
                 self.tail_log()
             );
         }
@@ -719,11 +724,15 @@ impl Client {
             std::thread::sleep(Duration::from_millis(100));
         }
         child.kill().ok();
-        let _ = child.wait();
+        let released = release_killed(&mut child, &self.name, &self.mnt, KILLED_EXIT);
         let _ = unmount(&self.mnt, UnmountMode::Lazy);
         bail!(
-            "{} daemon did not exit within {within:?} of the unmount: {}",
+            "{} daemon did not exit within {within:?} of the unmount{}: {}",
             self.name,
+            released
+                .err()
+                .map(|e| format!(" (and {e:#})"))
+                .unwrap_or_default(),
             self.tail_log()
         )
     }
@@ -732,10 +741,10 @@ impl Client {
     pub fn kill9(&mut self) -> Result<()> {
         let mut child = self.child.take().context("not mounted")?;
         kill9(&mut child).context("SIGKILL")?;
-        child.wait()?;
+        let released = release_killed(&mut child, &self.name, &self.mnt, KILLED_EXIT);
         // The kernel keeps a dead FUSE mount around; detach it.
         let _ = unmount(&self.mnt, UnmountMode::Lazy);
-        Ok(())
+        released.map(|_| ())
     }
 
     /// [`Self::kill9`] that requires the process to be gone within
@@ -764,25 +773,22 @@ impl Client {
         } else {
             Some(zombie_diagnosis(pid))
         };
-        if !exited {
+        let released = if exited {
+            None
+        } else {
             // Release it: abort the connection of its mount, which ends
             // the requests its wedged thread waits behind.
-            if let Some(n) = fuse_connection_of(&self.mnt) {
-                let _ = constellation_platform::native().mounts.abort_fuse(n);
-            }
-            let t2 = Instant::now();
-            while t2.elapsed() < Duration::from_secs(10) && child.try_wait()?.is_none() {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
+            release_killed(&mut child, &self.name, &self.mnt, Duration::ZERO).err()
+        };
         // The kernel keeps a dead FUSE mount around; detach it (bounded:
         // a detach of a wedged mount would itself hang).
         detach_bounded(&self.mnt, Duration::from_secs(10));
         match diagnosis {
             None => Ok(took),
             Some(d) => bail!(
-                "{} (pid {pid}) did not exit within {within:?} of kill -9: {d}",
-                self.name
+                "{} (pid {pid}) did not exit within {within:?} of kill -9: {d}{}",
+                self.name,
+                released.map(|e| format!("; {e:#}")).unwrap_or_default()
             ),
         }
     }
@@ -1196,6 +1202,78 @@ fn zombie_diagnosis(pid: u32) -> String {
         }
     }
     out
+}
+
+/// How long a killed daemon gets to exit before [`release_killed`] aborts
+/// its connection: its zombie reaper aborts a wedged one after ~2.5 s.
+const KILLED_EXIT: Duration = Duration::from_secs(5);
+
+/// Every killed daemon the harness itself had to release
+/// ([`release_killed`]) in this process: `scenario: client (pid): what
+/// /proc said`.
+static RELEASED_BY_HARNESS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The killed daemons the harness had to release itself, because neither
+/// they nor their zombie reapers did (see [`release_killed`]); `harness
+/// run` reports them after its summary.
+pub fn released_by_harness() -> Vec<String> {
+    RELEASED_BY_HARNESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Wait up to `within` for a `SIGKILL`ed daemon to exit. One that stays a
+/// zombie — a thread wedged in a notification on its own FUSE connection,
+/// behind a request it can no longer answer (`constellation_engine::
+/// kernel_inval`'s module doc) — and that its reaper did not release is
+/// released here by aborting the connection of `mnt`, then waited for
+/// again (bounded): a plain `wait` would block the harness for good, and
+/// so would every later access to the mount. Such a release is never
+/// silent: it is printed with what `/proc` said about the zombie, and
+/// counted ([`released_by_harness`]) — a reaper that no longer works
+/// would otherwise only show in `fuse-inval-storm`. `Ok(true)`: it exited
+/// unaided; `Ok(false)`: released by the abort; an error when it is still
+/// there after it.
+fn release_killed(child: &mut Child, name: &str, mnt: &Path, within: Duration) -> Result<bool> {
+    let t = Instant::now();
+    while t.elapsed() < within {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = child.id();
+    let diagnosis = zombie_diagnosis(pid);
+    let connection = fuse_connection_of(mnt);
+    let aborted = connection.map(|n| constellation_platform::native().mounts.abort_fuse(n));
+    let line = format!(
+        "{}: {name} (pid {pid}) was still there {within:?} after kill -9 and its zombie reaper          had not released it; the harness aborted FUSE connection {} of {} ({}): {diagnosis}",
+        SCENARIO.lock().unwrap_or_else(|e| e.into_inner()),
+        connection.map_or("-".into(), |n| n.to_string()),
+        mnt.display(),
+        match &aborted {
+            None => "no connection mounted there".to_string(),
+            Some(Ok(())) => "aborted".to_string(),
+            Some(Err(e)) => format!("abort failed: {e}"),
+        },
+    );
+    eprintln!("!!! HARNESS RELEASED A WEDGED DAEMON: {line}");
+    RELEASED_BY_HARNESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(line);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(10) {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    bail!(
+        "{name} (pid {pid}) is still there 10 s after the harness aborted its FUSE connection: {}",
+        zombie_diagnosis(pid)
+    )
 }
 
 /// The FUSE connection number of the mount at `mountpoint` (Linux:

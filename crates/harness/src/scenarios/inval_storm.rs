@@ -8,14 +8,21 @@
 //! last `/dev/fuse` descriptor closes, which needs its last thread to
 //! exit, which is the one waiting. `kernel_inval` now holds a
 //! notification back while a request is in flight on its inode (and
-//! drops it once the TTL has done its job); `daemon_lock::
-//! abort_stale_mounts` releases a zombie the previous daemon left anyway.
+//! drops it once the TTL has done its job); the FUSE frontend writes an
+//! entry invalidation only for a name its kernel can hold a valid dentry
+//! for (`KernelEntries`); the daemon's zombie reaper aborts the
+//! connection of a daemon left wedged anyway, and `daemon_lock::
+//! abort_stale_mounts` does at the next mount.
 //!
 //! `fuse-inval-storm` makes the collision as likely as it gets: three
 //! nodes create, rename and unlink in one shared directory at full speed,
 //! so every node applies the others' ops (the holder executes the
 //! forwarded ones itself) and invalidates the directory in its kernel
-//! while its own workers keep requests in flight on it. Mid-load, the
+//! while its own workers keep requests in flight on it. Every 8th cycle a
+//! worker lists the directory `ls -l` style, stat-ing every name, so for
+//! an entry TTL after each listing a kernel also holds dentries for the
+//! other nodes' names then present, and their changes do need entry
+//! invalidations. Mid-load, the
 //! lease holder is `kill -9`ed. Checks: no completed op exceeded its
 //! bound, no worker hung, the killed daemon exited within 5 s (no zombie
 //! with a thread in `fuse_reverse_inval_entry`), it remounts within 60 s,
@@ -109,7 +116,10 @@ fn worker(
                 &dir,
                 Box::new(|| {
                     if i.is_multiple_of(8) {
-                        std::fs::read_dir(&dir)?.count();
+                        for e in std::fs::read_dir(&dir)? {
+                            // A name gone since the listing is the storm.
+                            let _ = e?.metadata();
+                        }
                     }
                     Ok(())
                 }),
@@ -129,6 +139,15 @@ fn worker(
         }
     }
     let _ = done.send(report);
+}
+
+/// Sets the flag when dropped.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 fn listing(dir: &Path) -> Result<BTreeSet<String>> {
@@ -175,6 +194,10 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
         for round in 0..rounds {
             let holder = current_holder(&clients, Duration::from_secs(60))?;
             let stop = Arc::new(AtomicBool::new(false));
+            // Every way out of the round stops the workers: a bail with
+            // them still running kept two mounts busy, so the cleanup's
+            // unmount failed and killed those daemons under load too.
+            let _stop_on_exit = StopOnDrop(stop.clone());
             let (done_tx, done_rx) = mpsc::channel();
             let mut currents: Vec<(usize, Current)> = Vec::new();
             let mut n_workers = 0;
@@ -351,6 +374,13 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
                  stale mounts aborted at takeover {left_behind}",
                 c.name
             );
+            for l in log
+                .lines()
+                .filter(|l| l.contains("blocked in the kernel"))
+                .take(3)
+            {
+                eprintln!("    {NAME}: {}: {}", c.name, l.trim());
+            }
         }
         let refs: Vec<&Client> = clients.iter().collect();
         ensure_no_conflicts(&refs)?;

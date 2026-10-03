@@ -73,6 +73,42 @@
 //! abort_stale_mounts` does that at takeover). Keeping this thread out of
 //! the kernel keeps the window for that cycle to the queueing delay.
 //!
+//! The residual window is not small under load. The kernel takes a
+//! directory's `i_rwsem` *before* it queues the request (so a request
+//! still queued in the kernel holds it unseen), and one syscall holds it
+//! across all of its requests (`unlink` is a `LOOKUP` and an `UNLINK`,
+//! `getdents` several `READDIR`s), with nothing in flight between them.
+//! Under a storm in one directory the thread was parked on its lock much
+//! of the time, and the `fuse-inval-storm` scenario's `kill -9` kept
+//! landing there (seen on Linux 7.3-rc4: the killed holder's
+//! `kernel-inval` in `D` at `fuse_reverse_inval_entry+0x5b` — the
+//! `inode_lock_nested` — behind a worker's `getdents` whose `READDIR` the
+//! dead daemon had read; leader `Z`, `waiting=2`). Two things keep it
+//! rare and short:
+//!
+//! - **The frontend writes an entry invalidation only for a name its
+//!   kernel can hold a valid dentry for** (`constellation-frontend-fuse`'s
+//!   `KernelEntries`): every reply that hands the kernel a name is
+//!   recorded with its TTL, and a name another node changed that this
+//!   kernel was never handed — or not within the TTL — has nothing to
+//!   drop. That is every foreign name in a storm, so the thread rarely
+//!   waits for a directory lock at all.
+//! - **The zombie reaper** (`constellation zombie-reaper`, a separate
+//!   process) aborts the connection of a daemon the kernel reports dead
+//!   but wedged, within a few seconds of the kill. Nothing inside the dead
+//!   process can: every thread but the wedged one is gone, and the
+//!   descriptors close only after that one exits. (It once never did on
+//!   btrfs: it looked the lock up by `stat`'s device, which on btrfs is
+//!   the subvolume's and not the superblock's `/proc/locks` names, read
+//!   the live daemon's lock as released and left at once.)
+//!
+//! What the kernel does is by design, not a bug to wait out: the lock is
+//! uninterruptible, and a connection ends only when its last device
+//! descriptor is released (`fuse_dev_release` ends the requests read
+//! through *that* descriptor, and aborts the connection when it was the
+//! last) — so a server can never end its own connection while one of its
+//! threads waits in a notification, however it dies.
+//!
 //! A watchdog logs a notification blocked in the kernel longer than
 //! `CONSTELLATION_KERNEL_INVAL_STALL_S` (default 5 s).
 //!
@@ -639,6 +675,13 @@ fn run(shared: Arc<Shared>) {
             }
         }
         for inval in to_send.drain(..) {
+            // Checked again right before the write: the decision is as old
+            // as the writes before this one, each of which may have waited
+            // in the kernel. One gone busy meanwhile stays pending, for
+            // the next decision to hold back or drop.
+            if inval.gate().is_some_and(|ino| shared.inflight_of(ino) > 0) {
+                continue;
+            }
             let Some(p) = pending.remove(&inval) else {
                 continue;
             };

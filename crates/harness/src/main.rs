@@ -609,6 +609,18 @@ fn run(opts: RunOpts) -> Result<()> {
         report.write(path)?;
         eprintln!("results written to {}", path.display());
     }
+    // Killed daemons that stayed zombies and that their own reapers did
+    // not release (each was printed as it happened): never silent.
+    let released = constellation_harness::client::released_by_harness();
+    if !released.is_empty() {
+        eprintln!(
+            "!!! the harness had to release {} wedged daemon(s) its zombie reaper did not:",
+            released.len()
+        );
+        for line in &released {
+            eprintln!("!!!   {line}");
+        }
+    }
     // An append to the transport census failed mid-run (each failure was
     // reported as it happened): the census is incomplete, so the run
     // fails even if every scenario passed.

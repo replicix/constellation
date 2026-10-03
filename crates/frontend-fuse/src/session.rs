@@ -56,6 +56,7 @@
 //! numbers are the replica's, the view keeps no lookup table).
 
 use crate::adapter::{Deferred, FuseFs, KernelTuning};
+use crate::dentries::KernelEntries;
 use crate::notify::{FuseNotifySink, NotifyGate};
 use crate::passthrough::{
     reason, PassthroughHandoff, PassthroughPolicy, PassthroughState, PassthroughWish,
@@ -789,6 +790,10 @@ struct Shared {
     /// connection instead of handing it out or resuming it.
     ending: std::sync::atomic::AtomicBool,
     gate: Arc<NotifyGate>,
+    /// What this connection's kernel can hold (the gate writes against
+    /// it; a detach abandoned in place keeps it, the filesystem being the
+    /// same).
+    entries: Arc<KernelEntries>,
     deferred: Arc<Deferred>,
     /// Plan 38 Z3b: the session's passthrough state (its table crosses a
     /// handover in [`FuseHandoff::passthrough`]).
@@ -947,6 +952,7 @@ pub fn mount_source<V: Vfs>(
                 .with_passthrough(opts.passthrough_wish());
             let deferred = fs.deferred().clone();
             let observer = fs.observer_slot();
+            let entries = fs.kernel_entries().clone();
             let passthrough = fs.passthrough().clone();
             let mut config = config;
             config.io_uring = false;
@@ -957,6 +963,7 @@ pub fn mount_source<V: Vfs>(
                 session,
                 deferred,
                 observer,
+                entries,
                 passthrough,
                 &caps,
                 opts,
@@ -1065,6 +1072,7 @@ fn mount_path<V: Vfs>(
     let fs = FuseFs::new(view.clone(), caps, opts.tuning).with_passthrough(opts.passthrough_wish());
     let deferred = fs.deferred().clone();
     let observer = fs.observer_slot();
+    let entries = fs.kernel_entries().clone();
     let passthrough = fs.passthrough().clone();
     if privileged() {
         let fd = mount_fd(mountpoint, kernel)?;
@@ -1080,6 +1088,7 @@ fn mount_path<V: Vfs>(
             session,
             deferred,
             observer,
+            entries,
             passthrough,
             &declared,
             opts,
@@ -1110,6 +1119,7 @@ fn mount_path<V: Vfs>(
         session,
         deferred,
         observer,
+        entries,
         passthrough,
         &declared,
         opts,
@@ -1160,6 +1170,7 @@ impl<V: Vfs> FuseSession<V> {
         mut session: fuser::Session<FuseFs<V>>,
         deferred: Arc<Deferred>,
         observer: Arc<OnceLock<Observer>>,
+        entries: Arc<KernelEntries>,
         passthrough: Arc<PassthroughState>,
         caps: &FrontendCaps,
         opts: &MountOptions,
@@ -1204,7 +1215,7 @@ impl<V: Vfs> FuseSession<V> {
             lock_waits,
             passthrough.clone(),
         ));
-        let gate = NotifyGate::new(session.notifier());
+        let gate = NotifyGate::new(session.notifier(), entries.clone());
         // The backing-id ioctls go to the connection; a duplicate of the
         // session's descriptor is the same connection, usable from any
         // worker and by `release` long after the open that registered
@@ -1239,6 +1250,7 @@ impl<V: Vfs> FuseSession<V> {
                 foreign,
                 ending: std::sync::atomic::AtomicBool::new(false),
                 gate,
+                entries,
                 deferred,
                 passthrough,
                 pending: Mutex::new(Pending::default()),
@@ -1283,6 +1295,9 @@ impl<V: Vfs> FuseSession<V> {
             .with_passthrough(opts.passthrough_wish());
         let deferred = fs.deferred().clone();
         let observer = fs.observer_slot();
+        let entries = fs.kernel_entries().clone();
+        // The kernel holds dentries the previous server handed out.
+        entries.resumed();
         let passthrough = fs.passthrough().clone();
         // Plan 38 Z3b: no `FUSE_INIT` here, so what the first server
         // agreed decides, and the handed-over table says which inodes are
@@ -1312,6 +1327,7 @@ impl<V: Vfs> FuseSession<V> {
             session,
             deferred,
             observer,
+            entries,
             passthrough,
             &caps,
             opts,
@@ -1324,7 +1340,10 @@ impl<V: Vfs> FuseSession<V> {
             None,
         )?;
         if let Some(sink) = sink {
-            sink.gate().reopen(Some(resumed.session.notifier()));
+            sink.gate().reopen(Some((
+                resumed.session.notifier(),
+                resumed.shared.entries.clone(),
+            )));
             Arc::get_mut(&mut resumed.shared)
                 .expect("a new session's state is not shared yet")
                 .gate = sink.gate().clone();
@@ -1480,7 +1499,9 @@ impl<V: Vfs> FuseSession<V> {
                         detached.init,
                     )?;
                     *shared.detacher.lock().unwrap() = Some(resumed.detacher()?);
-                    shared.gate.reopen(Some(resumed.notifier()));
+                    shared
+                        .gate
+                        .reopen(Some((resumed.notifier(), shared.entries.clone())));
                     session = resumed;
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(why));
