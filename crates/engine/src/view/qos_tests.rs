@@ -287,7 +287,7 @@ fn a_deferred_cold_read_answers_off_the_caller_and_holds_its_slot() {
         FnResponder::new(move |got: VfsResult<ReadData>| {
             entered
                 .send((
-                    got.map(|d| d.contiguous().into_owned()),
+                    got.map(|d| d.contiguous().unwrap().into_owned()),
                     std::thread::current().id(),
                 ))
                 .unwrap();
@@ -385,7 +385,7 @@ fn a_read_behind_another_ops_inode_lock_defers() {
         FnResponder::new(move |got: VfsResult<ReadData>| {
             answered
                 .send((
-                    got.map(|d| d.contiguous().into_owned()),
+                    got.map(|d| d.contiguous().unwrap().into_owned()),
                     std::thread::current().id(),
                 ))
                 .unwrap();

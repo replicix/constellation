@@ -9,6 +9,7 @@
 //! exactly where it always did (never earlier, at the frontend), keeping
 //! the order in which an op's checks answer.
 
+use crate::{VfsError, VfsResult};
 use bytes::Bytes;
 use constellation_types::{Code, Rdev};
 use smallvec::SmallVec;
@@ -119,12 +120,24 @@ pub struct Opened {
     /// reads the ordinary way", which is what every frontend that does
     /// not know about [`PassthroughChunk`] does by simply dropping it.
     pub backing: Option<PassthroughChunk>,
+    /// This handle's reads may be answered from chunk files
+    /// ([`ReadData::zero_copy`], plan 38 §3(d)): set only for a read-only
+    /// open of a frontend that negotiated zero-copy reads
+    /// ([`crate::FrontendCaps::zero_copy`]), which then marks the open so
+    /// its kernel hands it the reader's pages (Linux FUSE:
+    /// `FOPEN_IO_URING_ZERO_COPY`). Which reads actually are zero-copy is
+    /// decided per read; the rest of them come back as bytes.
+    pub zero_copy: bool,
 }
 
 impl Opened {
     /// A handle answered the ordinary way (no backing file).
     pub fn new(fh: Fh) -> Self {
-        Self { fh, backing: None }
+        Self {
+            fh,
+            backing: None,
+            zero_copy: false,
+        }
     }
 }
 
@@ -390,10 +403,116 @@ pub struct StatFs {
     pub frsize: u32,
 }
 
+/// A file a read is answered from without its bytes passing through this
+/// process (plan 38 §3(d)): a verified chunk file of the local disk cache,
+/// opened read-only, and whatever keeps it from being evicted while a read
+/// of it is in flight. The frontend's kernel reads it straight into the
+/// reader's pages (Linux FUSE over a zero-copy io_uring queue:
+/// `IORING_OP_READ_FIXED`).
+///
+/// `hold` is opaque here (the engine's disk-cache pin): this crate stays
+/// independent of the cache, and nothing but its `Drop` matters to a
+/// frontend. A [`ZeroCopyRead`] shares the source ([`Arc`]), so the hold
+/// lasts until the last read that names it is done — on whatever thread
+/// the frontend finishes it — and not merely until the engine answers.
+pub struct ZeroCopySource {
+    file: std::fs::File,
+    _hold: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ZeroCopySource {
+    pub fn new(file: std::fs::File, hold: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            file,
+            _hold: Box::new(hold),
+        }
+    }
+
+    /// The file, open read-only.
+    pub fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// `len` bytes from `offset`, read by this process: what a frontend
+    /// that cannot hand the file to its kernel answers with instead
+    /// ([`ReadData::contiguous`]). All of them or an error: the engine
+    /// names only a range the file holds, so a file that ends before it
+    /// is `UnexpectedEof`, never a short answer.
+    pub fn read_range(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        let mut done = 0;
+        while done < len {
+            #[cfg(unix)]
+            let n = std::os::unix::fs::FileExt::read_at(
+                &self.file,
+                &mut buf[done..],
+                offset + done as u64,
+            )?;
+            #[cfg(windows)]
+            let n = std::os::windows::fs::FileExt::seek_read(
+                &self.file,
+                &mut buf[done..],
+                offset + done as u64,
+            )?;
+            #[cfg(not(any(unix, windows)))]
+            let n = {
+                let _ = offset;
+                0
+            };
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("the file ends {done} bytes into a {len}-byte zero-copy range"),
+                ));
+            }
+            done += n;
+        }
+        Ok(buf)
+    }
+}
+
+impl fmt::Debug for ZeroCopySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZeroCopySource")
+            .field("file", &self.file)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A read answered as `len` bytes of `source` from `offset`
+/// ([`ReadData::zero_copy`]).
+#[derive(Debug, Clone)]
+pub struct ZeroCopyRead {
+    pub source: Arc<ZeroCopySource>,
+    pub offset: u64,
+    pub len: usize,
+}
+
+/// The same read of the same open source.
+impl PartialEq for ZeroCopyRead {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source)
+            && self.offset == other.offset
+            && self.len == other.len
+    }
+}
+
+impl Eq for ZeroCopyRead {}
+
 /// A read's bytes: a scatter list of shared buffers, so the engine can
 /// answer from its cache without a copy. Almost always one segment.
+///
+/// Or, on a handle opened with [`Opened::zero_copy`], a range of a file
+/// the frontend's kernel is to read itself ([`Self::zero_copy`]): then
+/// there are no segments. The engine answers that way only to a frontend
+/// that negotiated it ([`crate::FrontendCaps::zero_copy`]); any other
+/// still gets the right bytes from [`Self::contiguous`], read here (or
+/// `EIO` if they cannot be read).
 #[derive(Clone, Default, PartialEq, Eq)]
-pub struct ReadData(SmallVec<[Bytes; 4]>);
+pub struct ReadData {
+    segments: SmallVec<[Bytes; 4]>,
+    zero_copy: Option<ZeroCopyRead>,
+}
 
 impl ReadData {
     pub fn from_vec(bytes: Vec<u8>) -> Self {
@@ -403,19 +522,48 @@ impl ReadData {
     pub fn from_bytes(bytes: Bytes) -> Self {
         let mut segments = SmallVec::new();
         segments.push(bytes);
-        Self(segments)
+        Self {
+            segments,
+            zero_copy: None,
+        }
+    }
+
+    /// `len` bytes of `source` from `offset`, for the frontend's kernel to
+    /// read (plan 38 §3(d)).
+    pub fn zero_copy(source: Arc<ZeroCopySource>, offset: u64, len: usize) -> Self {
+        Self {
+            segments: SmallVec::new(),
+            zero_copy: Some(ZeroCopyRead {
+                source,
+                offset,
+                len,
+            }),
+        }
+    }
+
+    /// The file range this read is answered from, if it is a zero-copy one.
+    pub fn as_zero_copy(&self) -> Option<&ZeroCopyRead> {
+        self.zero_copy.as_ref()
     }
 
     pub fn push(&mut self, bytes: Bytes) {
-        self.0.push(bytes);
+        debug_assert!(
+            self.zero_copy.is_none(),
+            "bytes pushed onto a zero-copy read"
+        );
+        self.segments.push(bytes);
     }
 
+    /// The bytes, in order; empty for a zero-copy read.
     pub fn segments(&self) -> &[Bytes] {
-        &self.0
+        &self.segments
     }
 
     pub fn len(&self) -> usize {
-        self.0.iter().map(Bytes::len).sum()
+        match &self.zero_copy {
+            Some(zc) => zc.len,
+            None => self.segments.iter().map(Bytes::len).sum(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -423,21 +571,35 @@ impl ReadData {
     }
 
     /// The bytes in one slice: borrowed when there is one segment (the
-    /// common case, no copy), gathered otherwise.
-    pub fn contiguous(&self) -> Cow<'_, [u8]> {
-        match self.0.as_slice() {
+    /// common case, no copy), gathered otherwise. A zero-copy read is read
+    /// from its file here (for a reader that is not the frontend's kernel:
+    /// the control plane's `browse`, a frontend that never negotiated
+    /// zero-copy): all of its bytes, or `Code::Io` if the file cannot give
+    /// them, never a short answer. Byte reads cannot fail.
+    pub fn contiguous(&self) -> VfsResult<Cow<'_, [u8]>> {
+        if let Some(zc) = &self.zero_copy {
+            return match zc.source.read_range(zc.offset, zc.len) {
+                Ok(bytes) => Ok(Cow::Owned(bytes)),
+                Err(error) => {
+                    tracing::error!(%error, "reading a zero-copy read's file failed; answering EIO");
+                    Err(VfsError::new(Code::Io))
+                }
+            };
+        }
+        Ok(match self.segments.as_slice() {
             [] => Cow::Borrowed(&[]),
             [one] => Cow::Borrowed(one),
             many => Cow::Owned(many.iter().flat_map(|b| b.iter().copied()).collect()),
-        }
+        })
     }
 }
 
 impl fmt::Debug for ReadData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadData")
-            .field("segments", &self.0.len())
+            .field("segments", &self.segments.len())
             .field("len", &self.len())
+            .field("zero_copy", &self.zero_copy.is_some())
             .finish()
     }
 }
@@ -479,13 +641,13 @@ mod tests {
     fn read_data_is_contiguous_without_a_copy_when_it_is_one_segment() {
         let data = ReadData::from_vec(b"abc".to_vec());
         let seg_ptr = data.segments()[0].as_ptr();
-        match data.contiguous() {
+        match data.contiguous().unwrap() {
             Cow::Borrowed(b) => assert_eq!(b.as_ptr(), seg_ptr),
             Cow::Owned(_) => panic!("one segment was copied"),
         }
         let mut two = data.clone();
         two.push(Bytes::from_static(b"de"));
-        assert_eq!(&*two.contiguous(), b"abcde");
+        assert_eq!(&*two.contiguous().unwrap(), b"abcde");
         assert_eq!(two.len(), 5);
         assert!(ReadData::default().is_empty());
     }

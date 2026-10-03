@@ -30,13 +30,20 @@ fn any_caps() -> impl Strategy<Value = FrontendCaps> {
             any::<bool>(),
             0..2usize,
         ),
-        (any::<u32>(), 0..3usize, any::<bool>(), any::<bool>()),
+        (
+            any::<u32>(),
+            0..3usize,
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<u32>(),
+        ),
     )
         .prop_map(
             |(
                 (push, flush, locks, xattrs, virt),
                 (links, fallocate, seek, special, case),
-                (max_io, unlinked, abortable, passthrough),
+                (max_io, unlinked, abortable, passthrough, zero_copy, zero_copy_min_read),
             )| {
                 FrontendCaps {
                     push_inval: [PushInval::None, PushInval::Attr, PushInval::Full][push],
@@ -62,6 +69,8 @@ fn any_caps() -> impl Strategy<Value = FrontendCaps> {
                     ][unlinked],
                     abortable,
                     passthrough,
+                    zero_copy,
+                    zero_copy_min_read,
                 }
             },
         )
@@ -259,6 +268,6 @@ proptest! {
         }
         prop_assert_eq!(data.len(), want.len());
         prop_assert_eq!(data.is_empty(), want.is_empty());
-        prop_assert_eq!(&*data.contiguous(), &want[..]);
+        prop_assert_eq!(&*data.contiguous().unwrap(), &want[..]);
     }
 }

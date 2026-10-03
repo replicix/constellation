@@ -86,6 +86,22 @@ pub struct FrontendCaps {
     /// is no [`Cap`] for it because a scenario gates on the kernel and the
     /// capability, not on the frontend (as for `max_io` and `deferrable`).
     pub passthrough: bool,
+    /// The frontend can answer a read with a range of a file its kernel
+    /// reads straight into the reader's pages ([`crate::ReadData::zero_copy`],
+    /// plan 38 §3(d)). `false` means the engine never marks an open
+    /// [`crate::Opened::zero_copy`] nor answers a read that way. Linux FUSE
+    /// declares `false` and turns it on once its session settled on
+    /// zero-copy io_uring queues (kernel 7.3 buffer pools and
+    /// `CAP_SYS_ADMIN`, plan 38 Z4), again through
+    /// `Vfs::frontend_negotiated`.
+    pub zero_copy: bool,
+    /// With [`Self::zero_copy`]: the smallest read the engine answers
+    /// zero-copy, in bytes, and the smallest file whose open it marks (a
+    /// smaller file has no read that could qualify). Below it the copy is
+    /// cheaper than the kernel's extra trip for a zero-copy answer (plan
+    /// 38 Z4b's measurements; Linux FUSE:
+    /// `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ`). `0`: every read.
+    pub zero_copy_min_read: u32,
 }
 
 impl FrontendCaps {
@@ -120,6 +136,9 @@ impl FrontendCaps {
             // the kernel offered `FUSE_PASSTHROUGH` and the process can
             // register backing files (plan 38 Z3b).
             passthrough: false,
+            // Off until the session's transport is settled (plan 38 Z4).
+            zero_copy: false,
+            zero_copy_min_read: 0,
         }
     }
 }

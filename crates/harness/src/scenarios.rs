@@ -83,6 +83,8 @@ mod watermark;
 /// The small-file write path: S3 round trips per close, `back` for
 /// non-owners.
 mod writepath;
+/// Plan 38 §3(d)/Z4b: zero-copy reads on a 7.3 kernel.
+mod zerocopy;
 
 pub struct Scenario {
     pub name: &'static str,
@@ -1642,6 +1644,46 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],
         caps: &[],
         run: passthrough::on_every_transport,
+    },
+    Scenario {
+        name: "zero-copy-single-chunk",
+        desc: "plan 38 §3(d)/Z4b, 7.3 lane: on a uring_zc mount, reads inside one chunk of a \
+               multi-chunk file are answered by one READ_FIXED from the chunk file -- buffered \
+               (every data-carrying read counted) and O_DIRECT (each pread exactly one daemon \
+               read and one zero-copy read: first chunk, middle, short tail) -- byte-exact",
+        requires: &[suites::FUSE_URING_ZERO_COPY],
+        caps: &[],
+        run: zerocopy::single_chunk,
+    },
+    Scenario {
+        name: "zero-copy-chunk-spanning-fallback",
+        desc: "plan 38 §3(d)/Z4b, 7.3 lane: one O_DIRECT read crossing the 1 MiB chunk \
+               boundary is one daemon read answered by the memory-cache path (zero-copy count \
+               unchanged, bytes exact), and the same handle's next read inside one chunk is \
+               zero-copy again",
+        requires: &[suites::FUSE_URING_ZERO_COPY],
+        caps: &[],
+        run: zerocopy::chunk_spanning_fallback,
+    },
+    Scenario {
+        name: "zero-copy-eviction-while-inflight",
+        desc: "plan 38 §3(d)/Z4b, 7.3 lane: a reader hammering one chunk with zero-copy \
+               O_DIRECT reads while the cache is overfilled and pruned to nothing twice: the \
+               chunk stays (one open pin), every read is byte-exact and zero-copy; after the \
+               close the pin goes, the chunk is evictable and the file reads again",
+        requires: &[suites::FUSE_URING_ZERO_COPY],
+        caps: &[],
+        run: zerocopy::eviction_while_inflight,
+    },
+    Scenario {
+        name: "zero-copy-disabled-by-verify-always",
+        desc: "plan 38 §2.3/Z4b, 7.3 lane: a mount with --cache-verify always on a zero-copy \
+               host negotiates plain uring (no fallback), reports passthrough off with reason \
+               cache_verify_always, and under buffered and O_DIRECT reads counts no zero-copy \
+               read while the memory cache's hits move",
+        requires: &[suites::FUSE_URING_ZERO_COPY],
+        caps: &[],
+        run: zerocopy::disabled_by_verify_always,
     },
     Scenario {
         name: "transport-cluster-locks-auto",

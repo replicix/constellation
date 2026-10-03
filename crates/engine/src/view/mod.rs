@@ -113,6 +113,7 @@ mod shards;
 mod spec;
 mod synthetic;
 mod write_gate;
+mod zero_copy;
 
 /// A uniform draw from `[0, 1)` (backoff jitter).
 pub(crate) fn jitter() -> f64 {
@@ -147,6 +148,8 @@ mod staging_code_tests;
 mod subtree_quota;
 #[cfg(test)]
 mod vfs_tests;
+#[cfg(test)]
+mod zero_copy_tests;
 
 use passthrough::PassthroughHandle;
 use shards::*;
@@ -364,6 +367,16 @@ pub struct View {
     /// ([`constellation_vfs::Vfs::frontend_negotiated`]): Linux FUSE only
     /// learns at `FUSE_INIT`, after the view exists.
     passthrough_on: std::sync::atomic::AtomicBool,
+    /// The handles marked zero-copy at their open, by handle, each with
+    /// the chunk file its reads last came from ([`zero_copy`]'s module doc).
+    zero_copy: Mutex<HashMap<u64, Arc<zero_copy::ZeroCopyHandle>>>,
+    /// Whether the frontend takes zero-copy reads
+    /// ([`FrontendCaps::zero_copy`], then `Vfs::frontend_negotiated`, as
+    /// `passthrough_on`).
+    zero_copy_on: std::sync::atomic::AtomicBool,
+    /// The smallest read answered zero-copy, and the smallest file whose
+    /// open is marked ([`FrontendCaps::zero_copy_min_read`]).
+    zero_copy_min_read: std::sync::atomic::AtomicU32,
     /// Sequential readahead.
     pub(crate) prefetch: crate::prefetch::Prefetcher,
     /// Cross-file readahead for ordered directory walks.
@@ -485,6 +498,9 @@ impl View {
             passthrough: Mutex::new(HashMap::new()),
             writers: Mutex::new(HashMap::new()),
             passthrough_on: std::sync::atomic::AtomicBool::new(deps.caps.passthrough),
+            zero_copy: Mutex::new(HashMap::new()),
+            zero_copy_on: std::sync::atomic::AtomicBool::new(deps.caps.zero_copy),
+            zero_copy_min_read: std::sync::atomic::AtomicU32::new(deps.caps.zero_copy_min_read),
             prefetch,
             scan,
             coop: deps.coop,

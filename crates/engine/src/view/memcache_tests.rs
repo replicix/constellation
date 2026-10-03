@@ -147,7 +147,7 @@ fn cached_sequential_reads_load_each_chunk_once(e2e: bool) {
     let mut back = Vec::new();
     let mut offset = 0;
     while offset < data.len() as u64 {
-        back.extend_from_slice(&read(&e, ino, offset, step).contiguous());
+        back.extend_from_slice(&read(&e, ino, offset, step).contiguous().unwrap());
         offset += step;
     }
     assert_eq!(back, data);
@@ -175,7 +175,10 @@ fn cached_sequential_reads_load_each_chunk_once(e2e: bool) {
     );
     // A read across a chunk boundary and past EOF is still right.
     let tail = read(&e, ino, u64::from(CHUNK) * 2 - 100, u64::from(CHUNK));
-    assert_eq!(&*tail.contiguous(), &data[CHUNK as usize * 2 - 100..]);
+    assert_eq!(
+        &*tail.contiguous().unwrap(),
+        &data[CHUNK as usize * 2 - 100..]
+    );
 
     // The memory tier writes nothing to disk: the cache directory holds
     // the chunk files and nothing else (plaintext stays where the disk
@@ -220,7 +223,7 @@ fn a_corrupt_disk_copy_is_refetched_and_never_served(e2e: bool) {
     std::fs::write(&path, &bad).unwrap();
     let got = read(&e, ino, u64::from(CHUNK), 64 * 1024);
     assert_eq!(
-        &*got.contiguous(),
+        &*got.contiguous().unwrap(),
         &data[CHUNK as usize..CHUNK as usize + 64 * 1024],
         "the corrupt copy was served"
     );
@@ -233,7 +236,7 @@ fn a_corrupt_disk_copy_is_refetched_and_never_served(e2e: bool) {
     let _ = read(&e, ino, u64::from(CHUNK), 4096);
     assert!(e.cache.in_memory(&hashes[1]));
     let whole = read(&e, ino, 0, data.len() as u64);
-    assert_eq!(&*whole.contiguous(), &data[..]);
+    assert_eq!(&*whole.contiguous().unwrap(), &data[..]);
 }
 
 #[test]
@@ -261,7 +264,7 @@ fn a_fetched_chunk_is_resident_without_a_second_disk_read(e2e: bool) {
     }
     let before = e.cache.memory_stats().unwrap();
     let got = read(&e, ino, 0, data.len() as u64);
-    assert_eq!(&*got.contiguous(), &data[..], "the fetched bytes");
+    assert_eq!(&*got.contiguous().unwrap(), &data[..], "the fetched bytes");
     let after = e.cache.memory_stats().unwrap();
     assert!(
         hashes.iter().all(|h| e.cache.in_memory(h)),
@@ -277,7 +280,7 @@ fn a_fetched_chunk_is_resident_without_a_second_disk_read(e2e: bool) {
     assert!(hashes.iter().all(|h| e.cache.is_verified(h) == Some(true)));
     // Every byte of the file still reads back correctly from memory.
     let whole = read(&e, ino, 0, data.len() as u64);
-    assert_eq!(&*whole.contiguous(), &data[..]);
+    assert_eq!(&*whole.contiguous().unwrap(), &data[..]);
     assert_eq!(
         e.cache.memory_stats().unwrap().misses,
         before.misses,
@@ -317,7 +320,7 @@ fn admit_serves_a_chunk_this_process_verified_without_rehashing() {
     let bad = rot(&e, &hashes[1]);
     let got = read(&e, ino, u64::from(CHUNK), 4096);
     assert_eq!(
-        got.contiguous()[1000],
+        got.contiguous().unwrap()[1000],
         bad[1000],
         "under `admit` the trusted disk copy is served as it is"
     );
@@ -331,7 +334,7 @@ fn admit_serves_a_chunk_this_process_verified_without_rehashing() {
     rot(&e, &hashes[1]);
     let got = read(&e, ino, u64::from(CHUNK), 4096);
     assert_eq!(
-        &*got.contiguous(),
+        &*got.contiguous().unwrap(),
         &data[CHUNK as usize..CHUNK as usize + 4096]
     );
     assert_eq!(
@@ -351,7 +354,7 @@ fn evicting_a_chunk_drops_its_memory_copy(e2e: bool) {
     assert!(hashes.iter().all(|h| !e.cache.in_memory(h)));
     assert_eq!(e.cache.memory_stats().unwrap().used_bytes, 0);
     let back = read(&e, ino, 0, data.len() as u64);
-    assert_eq!(&*back.contiguous(), &data[..]);
+    assert_eq!(&*back.contiguous().unwrap(), &data[..]);
     // A prune the same.
     let _ = read(&e, ino, 0, data.len() as u64);
     assert!(hashes.iter().any(|h| e.cache.in_memory(h)));
@@ -389,15 +392,15 @@ fn a_clipped_read_does_not_touch_the_shared_chunk() {
     e.meta
         .setattr(ino, None, None, None, Some(5000), None, None)
         .unwrap();
-    let got = read(&e, ino, 0, 5000).contiguous().into_owned();
+    let got = read(&e, ino, 0, 5000).contiguous().unwrap().into_owned();
     assert_eq!(&got[..1000], &data[..1000]);
     assert!(got[1000..].iter().all(|b| *b == 0));
     e.fs.flush_inode(ino, false).unwrap();
-    let got = read(&e, ino, 0, 5000).contiguous().into_owned();
+    let got = read(&e, ino, 0, 5000).contiguous().unwrap().into_owned();
     assert_eq!(&got[..1000], &data[..1000]);
     assert!(got[1000..].iter().all(|b| *b == 0));
     // The twin (same chunk 0) still reads its full content, from memory.
     assert!(e.cache.in_memory(&hashes[0]));
     let twin_back = read(&e, twin.ino, 0, 5000);
-    assert_eq!(&*twin_back.contiguous(), &data[..5000]);
+    assert_eq!(&*twin_back.contiguous().unwrap(), &data[..5000]);
 }

@@ -140,7 +140,21 @@ fn push_zeros(out: &mut ReadData, mut n: usize) {
 }
 
 impl View {
+    /// A read never answered zero-copy (tests).
+    #[cfg(test)]
     pub(super) fn do_read(&self, ino: Ino, offset: u64, size: u64) -> Result<ReadData, Code> {
+        self.do_read_zc(ino, None, offset, size)
+    }
+
+    /// `size` bytes of `ino` from `offset`. `zc`: the handle's zero-copy
+    /// state, when it was marked at its open (`zero_copy`'s module doc).
+    pub(super) fn do_read_zc(
+        &self,
+        ino: Ino,
+        zc: Option<&super::zero_copy::ZeroCopyHandle>,
+        offset: u64,
+        size: u64,
+    ) -> Result<ReadData, Code> {
         // Serve pending (unflushed) state when present so read-after-write
         // within an open handle is coherent. The inode's operation lock
         // orders the read against writes and flushes of the same file for
@@ -160,7 +174,7 @@ impl View {
             None => self.inode_ops.lock(ino),
         };
         let ws = self.writes.detach(ino);
-        let result = self.do_read_detached(ino, ws.as_ref(), offset, size);
+        let result = self.do_read_detached(ino, ws.as_ref(), zc, offset, size);
         if let Some(ws) = ws {
             self.writes.reattach(ino, ws);
         }
@@ -215,6 +229,7 @@ impl View {
         &self,
         ino: Ino,
         ws: Option<&WriteState>,
+        zc: Option<&super::zero_copy::ZeroCopyHandle>,
         offset: u64,
         size: u64,
     ) -> Result<ReadData, Code> {
@@ -245,6 +260,26 @@ impl View {
         self.prefetch
             .on_read(ino, offset, len, self.chunk_size, &hashes);
         let layout = constellation_fs_core::ChunkLayout::new(self.chunk_size);
+        // Plan 38 §3(d): one slice of one verified, resident chunk, with no
+        // write session to overlay, goes to the frontend's kernel as the
+        // chunk file itself; anything else (a read spanning chunks above
+        // all) is answered below, as always (`zero_copy`'s module doc).
+        if let (Some(zc), None) = (zc, ws) {
+            let mut slices = layout.slices(offset, len);
+            if let (Some(slice), None) = (slices.next(), slices.next()) {
+                if let Some(data) = self.zero_copy_read(
+                    zc,
+                    ino,
+                    &manifest,
+                    &hashes,
+                    self.chunk_size,
+                    file_len,
+                    &slice,
+                ) {
+                    return Ok(data);
+                }
+            }
+        }
         let mut out = ReadData::default();
         for slice in layout.slices(offset, len) {
             let chunk_start = slice.index * self.chunk_size as u64;

@@ -101,6 +101,11 @@ services:
     environment:
       <<: *suite-env
       CONSTELLATION_FUSE_TRANSPORT: uring
+      # Zero-copy queues are opt-in (plan 38 Z4b); this lane asks for them,
+      # so a privileged run on a 7.3 kernel negotiates `uring_zc`. The
+      # threshold passes through (empty: the daemon's default).
+      CONSTELLATION_FUSE_URING_ZERO_COPY: ${CONSTELLATION_FUSE_URING_ZERO_COPY:-auto}
+      CONSTELLATION_FUSE_ZERO_COPY_MIN_READ: ${CONSTELLATION_FUSE_ZERO_COPY_MIN_READ:-}
     command: ["compliance"]
 
   # Data-integrity (fio verify) + metadata churn (stress-ng).

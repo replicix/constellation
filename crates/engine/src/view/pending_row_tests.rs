@@ -103,6 +103,7 @@ fn read_all(e: &Env, ino: Ino) -> Vec<u8> {
     e.fs.do_read(ino, 0, 1 << 20)
         .unwrap()
         .contiguous()
+        .unwrap()
         .into_owned()
 }
 

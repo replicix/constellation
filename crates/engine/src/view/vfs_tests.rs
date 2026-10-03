@@ -92,7 +92,7 @@ impl Client {
 
     fn read(&self, ino: Ino, fh: Fh, off: u64, len: u32) -> VfsResult<Vec<u8>> {
         Blocking::run(|r| self.view.read(&self.cx(OpKind::Read), ino, fh, off, len, r))
-            .map(|data| data.contiguous().into_owned())
+            .map(|data| data.contiguous().unwrap().into_owned())
     }
 
     fn close(&self, ino: Ino, fh: Fh) -> VfsResult<()> {

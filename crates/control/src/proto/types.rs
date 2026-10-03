@@ -523,7 +523,7 @@ pub struct FuseStatus {
     /// it survives the unmount of the mount that took one.
     pub transport_fallbacks: Vec<FuseFallbackCount>,
     /// Reads served zero-copy by every session of this process
-    /// (`constellation_fuse_zero_copy_reads_total`; 0 until plan 38 Z4).
+    /// (`constellation_fuse_zero_copy_reads_total`, plan 38 Z4b).
     pub zero_copy_reads_total: u64,
     /// Blocking lock requests (`F_SETLKW`, blocking `flock`) every ring
     /// session of this process served as non-blocking because their ring
@@ -545,7 +545,8 @@ pub struct FuseMountStatus {
     /// Ring entries per kernel queue; 0 on `dev_fuse` (no ring queues).
     pub uring_queue_depth: u32,
     pub passthrough: FusePassthroughStatus,
-    /// Reads this mount served zero-copy (0 until plan 38 Z4).
+    /// Reads this mount served zero-copy: one `READ_FIXED` from a chunk
+    /// file into the reader's pages (plan 38 Z4b; only on `uring_zc`).
     pub zero_copy_reads: u64,
     /// The transport fallback this mount's handshake took, if it took
     /// one (plan 38 §2.4: logged once, and visible here).

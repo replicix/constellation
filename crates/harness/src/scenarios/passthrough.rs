@@ -40,7 +40,7 @@ use std::time::Duration;
 
 /// Non-repeating bytes from `seed` (incompressible, so the chunk file is
 /// exactly the file).
-fn bytes(seed: u64, len: usize) -> Vec<u8> {
+pub(super) fn bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed | 1;
     (0..len)
         .map(|_| {
@@ -137,7 +137,7 @@ fn require_enabled(c: &Client) -> Result<()> {
 }
 
 /// Reads of the view answered by the daemon so far (every outcome).
-fn daemon_reads(c: &Client) -> Result<u64> {
+pub(super) fn daemon_reads(c: &Client) -> Result<u64> {
     let status = c.control_status()?;
     let series = status["vfs_ops"]["series"]
         .as_array()
@@ -151,7 +151,7 @@ fn daemon_reads(c: &Client) -> Result<u64> {
 }
 
 /// The disk cache's entries: `hash -> (size, state)`.
-fn cache_entries(c: &Client) -> Result<Vec<(String, u64, String)>> {
+pub(super) fn cache_entries(c: &Client) -> Result<Vec<(String, u64, String)>> {
     let listing = c.control("cache.list", serde_json::json!({}))?;
     Ok(listing["entries"]
         .as_array()
@@ -197,7 +197,7 @@ fn write_one_chunk(c: &Client, path: &Path, data: &[u8]) -> Result<String> {
     Ok(hash)
 }
 
-fn prune_all(c: &Client) -> Result<()> {
+pub(super) fn prune_all(c: &Client) -> Result<()> {
     c.control_call(
         "cache.prune",
         serde_json::json!({"target_bytes": 0}),
@@ -206,7 +206,7 @@ fn prune_all(c: &Client) -> Result<()> {
     Ok(())
 }
 
-fn cached(c: &Client, hash: &str) -> Result<bool> {
+pub(super) fn cached(c: &Client, hash: &str) -> Result<bool> {
     Ok(cache_entries(c)?.iter().any(|e| e.0 == hash))
 }
 
@@ -216,14 +216,17 @@ fn read_all(path: &Path) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-fn pread_all(f: &std::fs::File, len: usize) -> Result<Vec<u8>> {
+pub(super) fn pread_all(f: &std::fs::File, len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     f.read_exact_at(&mut buf, 0)?;
     Ok(buf)
 }
 
 /// Run `body` with `clients`, unmounting them on every path.
-fn with_clients(clients: &mut [Client], body: impl FnOnce(&[Client]) -> Result<()>) -> Result<()> {
+pub(super) fn with_clients(
+    clients: &mut [Client],
+    body: impl FnOnce(&[Client]) -> Result<()>,
+) -> Result<()> {
     let result = body(clients);
     for c in clients.iter_mut() {
         let _ = c.unmount();
@@ -457,13 +460,13 @@ fn thread_read_bytes() -> Result<u64> {
 }
 
 /// A page-aligned buffer for `O_DIRECT`.
-struct Aligned {
+pub(super) struct Aligned {
     ptr: *mut u8,
     layout: std::alloc::Layout,
 }
 
 impl Aligned {
-    fn new(len: usize) -> Self {
+    pub(super) fn new(len: usize) -> Self {
         let layout = std::alloc::Layout::from_size_align(len, 4096).unwrap();
         // SAFETY: a non-zero size.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -471,7 +474,7 @@ impl Aligned {
         Self { ptr, layout }
     }
 
-    fn as_mut(&mut self) -> &mut [u8] {
+    pub(super) fn as_mut(&mut self) -> &mut [u8] {
         // SAFETY: `layout.size()` bytes allocated above, owned here.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
     }
@@ -668,7 +671,7 @@ pub fn disabled_by_verify_always(seed: u64) -> Result<()> {
 
 /// The memory tier's `(hits, misses)` (`cache.memory_*`): every read the
 /// daemon serves from a chunk moves one of them.
-fn memcache(c: &Client) -> Result<(u64, u64)> {
+pub(super) fn memcache(c: &Client) -> Result<(u64, u64)> {
     let status = c.control_status()?;
     let cache = &status["cache"];
     Ok((

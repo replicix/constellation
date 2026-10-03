@@ -55,7 +55,8 @@ pub use responder::{
 pub use types::{
     Attr, Durability, Entry, FallocateMode, Fh, FileKind, Ino, LockKind, LockOwner, LockRange,
     LockSpec, LockStatus, OpenFlags, OpenOwner, Opened, PassthroughChunk, ReadData, RenameFlags,
-    SeekWhence, SetAttr, SetXattrFlags, SetXattrMode, StatFs, TimeSet, WriteData, ROOT_INO,
+    SeekWhence, SetAttr, SetXattrFlags, SetXattrMode, StatFs, TimeSet, WriteData, ZeroCopyRead,
+    ZeroCopySource, ROOT_INO,
 };
 pub use vfs::Vfs;
 pub use watch::{OpWatch, WatchKey, Watched};

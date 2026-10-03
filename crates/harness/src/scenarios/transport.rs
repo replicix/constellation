@@ -135,7 +135,7 @@ pub(crate) fn is_ring(transport: &str) -> bool {
 
 /// The transport `node.status` reports for the daemon's one mount
 /// (`dev_fuse` / `uring` / `uring_zc`, plan 38 §5).
-fn negotiated_transport(c: &Client) -> Result<String> {
+pub(super) fn negotiated_transport(c: &Client) -> Result<String> {
     let status = c.control_status()?;
     let mounts = status["mounts"]
         .as_array()

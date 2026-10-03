@@ -1923,6 +1923,7 @@ impl Engine {
         // so the passthrough handles' pins go now rather than whenever
         // the last `Arc<View>` happens to die (plan 38 §3(c)).
         view.drop_all_passthrough();
+        view.drop_all_zero_copy();
         if let Some(k) = &self.kernel_inval {
             k.unregister(id);
         }
@@ -3094,7 +3095,7 @@ mod tests {
                 })
                 .unwrap();
                 assert_eq!(
-                    data.contiguous().as_ref(),
+                    data.contiguous().unwrap().as_ref(),
                     &block(n)[..],
                     "{name} block {n}"
                 );

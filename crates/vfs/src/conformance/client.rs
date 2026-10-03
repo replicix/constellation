@@ -326,7 +326,7 @@ impl Client {
     pub fn read(&self, ino: Ino, fh: Fh, off: u64, len: u32) -> VfsResult<Vec<u8>> {
         self.read_async(ino, fh, off, len)
             .wait()
-            .map(|data: ReadData| data.contiguous().into_owned())
+            .and_then(|data: ReadData| data.contiguous().map(std::borrow::Cow::into_owned))
     }
 
     pub fn read_async(&self, ino: Ino, fh: Fh, off: u64, len: u32) -> Pending<ReadData> {

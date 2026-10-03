@@ -88,14 +88,36 @@ fn fuse_uring_unavailable() -> Option<String> {
 pub const CAP_SYS_ADMIN: &str = "CAP_SYS_ADMIN";
 /// A `requires` entry naming the kernel FUSE passthrough first shipped in.
 pub const LINUX_6_9: &str = "linux>=6.9";
+/// A `requires` entry for FUSE-over-io_uring zero-copy reads (plan 38 Z4):
+/// [`FUSE_URING`], [`CAP_SYS_ADMIN`] (a zero-copy queue is refused
+/// without it) and Linux >= 7.3, the first kernel whose `FUSE_INIT` offers
+/// io_uring buffer pools. Whether the running kernel really offers them is
+/// the mount's to find out: a scenario on a host meeting this requirement
+/// whose mount did not get `uring_zc` fails with the reason it logged.
+pub const FUSE_URING_ZERO_COPY: &str = "fuse-uring-zc";
 
 /// Why a scenario's `requires` entry is not met on this host, or `None`.
-/// A binary is looked up on `PATH`; [`FUSE_URING`], [`CAP_SYS_ADMIN`]
-/// and [`LINUX_6_9`] are checked as what they name. Either way the scenario SKIPs loudly,
+/// A binary is looked up on `PATH`; [`FUSE_URING`], [`FUSE_URING_ZERO_COPY`],
+/// [`CAP_SYS_ADMIN`] and [`LINUX_6_9`] are checked as what they name. Either way the scenario SKIPs loudly,
 /// naming the reason.
 pub fn missing(req: &str) -> Option<String> {
     match req {
         FUSE_URING => fuse_uring_unavailable(),
+        FUSE_URING_ZERO_COPY => {
+            let release = kernel_release();
+            if !kernel_at_least(&release, 7, 3) {
+                Some(format!(
+                    "requires Linux >= 7.3 for io_uring zero-copy (this is {release})"
+                ))
+            } else if !has_cap_sys_admin() {
+                Some(
+                    "requires CAP_SYS_ADMIN for io_uring zero-copy (run the harness as root)"
+                        .to_string(),
+                )
+            } else {
+                fuse_uring_unavailable()
+            }
+        }
         CAP_SYS_ADMIN => (!has_cap_sys_admin())
             .then(|| "requires CAP_SYS_ADMIN (run the harness as root)".to_string()),
         LINUX_6_9 => {

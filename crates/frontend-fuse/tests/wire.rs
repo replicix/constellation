@@ -1788,6 +1788,7 @@ fn opened_with(fh: u64, b: Option<constellation_vfs::PassthroughChunk>) -> Opene
     Opened {
         fh: Fh(fh),
         backing: b,
+        zero_copy: false,
     }
 }
 

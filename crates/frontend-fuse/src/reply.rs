@@ -11,10 +11,11 @@
 
 use crate::dentries::{EntryGuard, RenameGuard};
 use crate::passthrough::{OpenAnswer, PassthroughState, PreOpen};
+use crate::stats::ZeroCopyCounter;
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, DirSink, Entry, Fh, FileKind, Ino, LockKind, LockStatus, OpenFlags, Opened, ReadData,
-    Responder, StatFs, VfsResult, XattrNameBuf,
+    Responder, StatFs, VfsResult, XattrNameBuf, ZeroCopySource,
 };
 use fuser::{
     Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
@@ -22,6 +23,7 @@ use fuser::{
     ReplyStatfs, ReplyWrite, ReplyXattr, Transport,
 };
 use std::ffi::OsStr;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -134,9 +136,30 @@ impl Responder<Vec<u8>> for BytesReply {
 /// excess would not fit, and cutting it off would hand the application a
 /// silently different file. Debug builds stop on it; release builds answer
 /// `EIO`, never a truncated read.
+///
+/// A zero-copy answer (plan 38 §3(d): a range of a chunk file,
+/// [`ReadData::as_zero_copy`]) goes out as one `ReplyData::read_fixed`:
+/// on a request the kernel zero-copied, the ring's thread reads the file
+/// straight into the reader's pages and the read is counted
+/// (`constellation_fuse_zero_copy_reads_total`); on any other request
+/// fuser reads the range into the reply buffer itself (`pread(2)`), so
+/// the bytes are right whatever the request turned out to be. The reply
+/// owns a share of the chunk file and its disk-cache pin until the read is
+/// done, on whatever thread finishes it.
 pub(crate) struct ReadReply {
     pub reply: ReplyData,
     pub size: u32,
+    pub zero_copy: ZeroCopyCounter,
+}
+
+/// A zero-copy read's chunk file, for `read_fixed` (which wants an owned
+/// `AsFd`): the share keeps the file open and its chunk pinned.
+struct ZeroCopyFd(Arc<ZeroCopySource>);
+
+impl AsFd for ZeroCopyFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.file().as_fd()
+    }
 }
 
 impl Responder<ReadData> for ReadReply {
@@ -162,8 +185,20 @@ impl Responder<ReadData> for ReadReply {
         if data.is_empty() {
             return self.reply.data(&[]);
         }
+        if let Some(zc) = data.as_zero_copy() {
+            let zero_copied = self.reply.zero_copy();
+            self.reply
+                .read_fixed(ZeroCopyFd(Arc::clone(&zc.source)), zc.offset, zc.len);
+            if zero_copied {
+                self.zero_copy.count();
+            }
+            return;
+        }
         match self.reply.transport() {
-            Transport::DevFuse => self.reply.data(&data.contiguous()),
+            Transport::DevFuse => match data.contiguous() {
+                Ok(bytes) => self.reply.data(&bytes),
+                Err(error) => self.reply.error(reply_code(error.code())),
+            },
             _ => self.reply.gather(data.segments()),
         }
     }
@@ -249,6 +284,12 @@ impl Responder<Opened> for OpenReply {
                     .on_open_reply(cx.ino, cx.flags, cx.pre, o.backing.as_ref());
                 let fh = FileHandle(o.fh.0);
                 match fopen(answer) {
+                    // Plan 38 §3(d): the engine marked the open for
+                    // zero-copy reads (only a read-only one, on a session
+                    // that negotiated them); passthrough, where the
+                    // session gave it, wins above — the kernel then serves
+                    // the reads with no daemon involvement at all.
+                    Some((flags, None)) if o.zero_copy => reply.opened_zero_copy(fh, flags),
                     Some((flags, None)) => reply.opened(fh, flags),
                     Some((flags, Some(id))) => {
                         // SAFETY: `id` is registered on this connection and

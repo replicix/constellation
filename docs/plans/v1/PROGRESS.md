@@ -35358,6 +35358,389 @@ design and the measured memory are in `vendor/fuser/CONSTELLATION-PATCH.md`
   The `explicit-depth` round passes. Not bisected; the lock-fencing change
   in `b458669` is the suspect.
 
+## Plan 38 Z4 — zero-copy reads on 7.3 (Z4a fuser side + Z4b routing)
+
+Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z4,
+§3(d): a read that lies inside one verified, resident chunk is answered by
+the kernel reading that chunk file straight into the reader's pages (one
+`IORING_OP_READ_FIXED` on a zero-copy io_uring queue), with no byte passing
+through the daemon; every other read takes the memory-cache path on the same
+session. Z4a (`1952cf7`, section above) negotiated `uring_zc` and added the
+fuser API; Z4b (this section) routes Constellation's reads to it, wires
+`--cache-verify always` to turn it off, and adds the 7.3 lane. The ABI record
+(constants, structs and kernel behaviour re-verified against 7.3.0-rc4
+`165768bb7026`) is `vendor/fuser/CONSTELLATION-PATCH.md`, "Plan 38 Z4a:
+zero-copy queues on 7.3 (ABI 7.46)" → "The ABI, re-verified against the
+running kernel". **Z4 is closed.**
+
+### Items
+
+| Item | Chunk | State | Where |
+|---|---|---|---|
+| ABI re-verification, `ADD_QUEUE(FUSE_URING_ZERO_COPY)`/`ADD_BUFPOOL`, one transport per session, `opened_zero_copy`, `read_fixed`, pools unregistered by default | Z4a | done | section "Plan 38 Z4a" above |
+| `ReadData` carries an optional zero-copy answer: `ReadData::zero_copy(Arc<ZeroCopySource>, offset, len)`, `as_zero_copy()`; `ZeroCopySource` = the chunk file + an opaque hold (the disk-cache pin). A struct field, not an enum variant: every other frontend's `segments()`/`contiguous()` keeps working (and `contiguous()` reads the range if one ever reaches a frontend that never negotiated it); no allocation on the ordinary path | Z4b | done | `crates/vfs/src/types.rs` |
+| `Opened::zero_copy` (the open is marked), `FrontendCaps::zero_copy` (the frontend takes zero-copy reads; Linux FUSE turns it on once the session settled on `uring_zc`, through `Vfs::frontend_negotiated` from `FuseSession::new`, since the rings negotiate after the `FUSE_INIT` reply) | Z4b | done | `crates/vfs/src/{types,caps}.rs`, `crates/frontend-fuse/src/session.rs` |
+| Open rule: a read-only open (no `WRITE`/`TRUNC`/`APPEND`) of a non-empty regular file, no handle of the inode open for writing, no write session (attached or detached by a flush), `--cache-verify admit`, frontend negotiated. Passthrough's single-chunk bound and residency check are left out (residency is per chunk, so per read) | Z4b | done | `View::zero_copy_open`, `crates/engine/src/view/zero_copy.rs` |
+| Read rule (per request, in `do_read_detached`): marked handle, no `WriteState` (so no staged/sealed/punched bytes and no `floor`), **exactly one** slice from `layout.slices`, every byte below the committed manifest's `file_len` and the inode's size, a chunk (not a hole) resident **and verified** at a length covering the slice → `ReadData::zero_copy`; anything else → the memory-cache path, same session. Atime, scan-ahead and readahead bookkeeping run first, as for every read | Z4b | done | `View::zero_copy_read`, `crates/engine/src/view/io.rs` |
+| Chunk-spanning fallback: never a second `READ_FIXED`, never a whole-file object | Z4b | done | the one-slice test above; scenario `zero-copy-chunk-spanning-fallback`, engine `a_read_crossing_a_chunk_boundary_takes_the_ordinary_path` |
+| Pin while in flight: each marked handle caches the last chunk it read (file opened once, `DiskCache::pin_open` taken before the open, length checked against the accounting); a read hands the frontend a shared reference, which the reply owns until the kernel's read completes, so a handle that moves on or closes leaves an in-flight read's chunk pinned. One cached chunk per handle bounds what zero-copy holds un-evictable; dropped at `release`, all at `close_view`, and when the frontend stops taking zero-copy | Z4b | done | `ZeroCopyHandle`, `View::{note_zero_copy_open, drop_zero_copy, drop_all_zero_copy}`; engine `an_in_flight_zero_copy_read_pins_its_chunk_past_the_release`, `a_handle_holds_one_chunk_and_teardown_drops_them_all`; scenario `zero-copy-eviction-while-inflight` |
+| `ReadReply::done` issues `ReplyData::read_fixed` for a zero-copy answer; `OpenReply` answers a marked open `opened_zero_copy` when the passthrough table answers it plainly — passthrough, where the session has it, still wins (§2.1 row 7 vs 6) | Z4b | done | `crates/frontend-fuse/src/reply.rs`; wire `a_zero_copy_read_is_one_read_fixed_and_the_same_bytes_on_every_leg` (dev-fuse, uring, uring_zc legs) |
+| Metrics/status: `constellation_fuse_zero_copy_reads_total` and `fuse.mounts[].zero_copy_reads` count reads the kernel actually zero-copied (`ReplyData::zero_copy()`), per session (`ZeroCopyCounter`, shared by `FuseFs` and `SessionStats`) and per process; the span's `transport` field is `uring_zc` (the session's `Observer`); schema re-blessed (doc text) | Z4b | done | `crates/frontend-fuse/src/stats.rs`, `crates/control/src/proto/types.rs` |
+| `--cache-verify always` disables zero-copy and passthrough at mount: the FUSE host sets up no zero-copy queues at all (`TransportConfig::with_cache_verify_always` → `UringZeroCopy::Off`: plain `uring`, no pools mapped), and the engine refuses either under `Always` whatever a frontend says | Z4b | done | `session.rs` (+ unit test in `the_passthrough_knob_and_cache_verify_always`), `View::zero_copy_offered`; engine `cache_verify_always_marks_nothing_and_serves_every_read`; scenarios `zero-copy-disabled-by-verify-always`, `passthrough-disabled-by-verify-always` |
+| 7.3 lane: four scenarios `requires` `fuse-uring-zc` (`suites::FUSE_URING_ZERO_COPY`: the ring requirement, `CAP_SYS_ADMIN`, Linux >= 7.3), SKIP loudly elsewhere; a host meeting it whose mount is not `uring_zc` fails with the logged reason | Z4b | done | `crates/harness/src/scenarios/zerocopy.rs`, `suites.rs`; `.github/workflows/nightly.yml` job `zero-copy-7-3` (runner label `fuse-uring-zc`, variable `FUSE_URING_ZC_RUNNER`); `TESTING.md` "FUSE zero-copy reads: the 7.3 lane" |
+| The read-cost gate records each lane's zero-copy reads (`zero_copy_reads` in every JSON line and on the console) | Z4b | done | `tests/read-cpu-gate.sh` |
+| Docs | Z4b | done | `docs/reference/configuration.md` (what a `uring_zc` mount does, `--cache-verify always`), `TESTING.md`, `vendor/fuser/CONSTELLATION-PATCH.md` (the routing sentence), module doc of `view/zero_copy.rs` |
+
+### Decisions (where the brief left a choice)
+
+- **Shape**: an optional field on `ReadData`, not an enum or a parallel
+  responder: least invasive for the five frontends, and `vfs-bench` is
+  unchanged (`view/read` 18 allocations/op, ceiling 18; `perf-baseline.json`
+  untouched). fuser's `read_fixed` boxes its source (one allocation per
+  zero-copy reply), which is below the `View` boundary `vfs-bench` measures.
+- **The fd is cached per handle and opened lazily**, not taken from
+  `PassthroughChunk`: a passthrough-opened handle's reads never reach the
+  daemon, so there is nothing to share; one code path for every marked open.
+- ~~**The memory tier is not consulted**~~ — superseded in the fix round
+  (below): a chunk the memory tier holds, or a read below
+  `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ`, is served from memory.
+- ~~**Frozen snapshot files are not marked**~~ — superseded in the fix
+  round: `read_frozen` routes through the same rule.
+- **The counter counts what the kernel zero-copied**, not what the engine
+  answered with a file: a zero-copy answer to a request the kernel did not
+  register pages for is `pread` by fuser, correct bytes, uncounted.
+
+### fio read-cost gate per transport (Z0b's gate)
+
+`tests/read-cpu-gate.sh`, this host (32 vCPU, kernel 7.3.0-rc4, **as root**
+for all three legs so they are comparable: `uring_zc` needs `CAP_SYS_ADMIN`),
+`CONSTELLATION_FUSE_TRANSPORT=dev-fuse` (`dev_fuse`), `uring` +
+`CONSTELLATION_FUSE_URING_ZERO_COPY=off` (`uring`), `uring` + `auto`
+(`uring_zc`); two interleaved rounds of 3 repeats per leg, **median of 6**;
+load average 30–60 from other agents. CPU-s/GiB, earlier milestones'
+columns for reference (Z1 was an 8-CPU guest; Z0b the committed baseline):
+
+| lane | Z0b | Z1 `dev-fuse`→`uring` | Z2 `dev-fuse`→`uring` | Z3 passthrough on | **Z4 `dev_fuse`** | **Z4 `uring`** | **Z4 `uring_zc`** | zero-copy reads / rep |
+|---|---|---|---|---|---|---|---|---|
+| `cold-seq-1m` | 3.50 | 2.50→2.48 | 3.44→2.86 | 2.10 | 3.21 | 2.49 | 2.96 | 511 of 512 |
+| `warm-disk-seq-1m` | 0.98 | 0.80→0.76 | 0.65→0.58 | 0.62 | 0.66 | 0.57 | 0.64 | 384 of 512 |
+| `warm-mem-seq-1m` | 0.22 | 0.16→0.14 | 0.24→0.14 | 0.20 | 0.22 | 0.12 | 0.14 | 512 of 512 |
+| `rand-4k-dio` | 7.15 | 5.12→3.81 | 17.28→5.98 | 6.86 | 14.05 | 6.36 | **9.40** | ~1.57 M (all) |
+| `smallfiles` | 13.48 | 23.48→25.28 | 13.02→6.76 | 12.1 | 14.72 | 7.20 | 7.04 | 10 |
+
+| lane | peak RSS MiB `dev_fuse` / `uring` / `uring_zc` | MiB/s `dev_fuse` / `uring` / `uring_zc` |
+|---|---|---|
+| `cold-seq-1m` | 771 / 816 / **296** | 1 662 / 1 881 / **3 402** |
+| `warm-disk-seq-1m` | 603 / 616 / 610 | 1 595 / 1 744 / 1 531 |
+| `warm-mem-seq-1m` | 604 / 618 / 610 | 4 511 / 6 361 / 5 508 |
+| `rand-4k-dio` | 967 / 1 008 / 760 | 514 / 643 / 410 |
+| `smallfiles` | 355 / 354 / 352 | 131 / 236 / 247 |
+
+Read: the path engages exactly as designed (every 1 MiB sequential read is
+zero-copy once its chunk is resident and verified; `warm-disk`'s first read
+of each chunk after the restart must hash it, hence 384 of 512; `smallfiles`
+is a cold lane whose chunks are fetched by the read itself, hence 10). On
+this host and Constellation's read path, zero-copy **wins on the cold
+sequential lane** — 1.8× the throughput at a third of the peak RSS (nothing
+is copied into the memory tier; its CPU, 2.96 vs 2.49, is inside this host's
+spread of 1.9–3.7 vs 2.2–3.2) — and **loses CPU elsewhere**: `rand-4k-dio`
++48% CPU-s/GiB and −36% MiB/s against plain `uring`, warm lanes +12–17%.
+`perf` on the `rand-4k-dio` lane shows `iou-wrk-*` threads only on
+`uring_zc`: io_uring hands the buffered `READ_FIXED` from the chunk file to
+an io-wq worker (a thread hop per read), on top of the second ring round
+trip (`READ_FIXED`, then the commit) that a zero-copy reply needs. The
+bench's §2.1 row 6 expectation ("rand4k-dio ≈ the plain transport") does not
+hold here; the sequential CPU win it measured (0.044 vs 0.121) does not show
+either, because Constellation's per-read work dominates both. Every lane
+passed its own recorded baseline (`READ_CPU_BLESS`, per leg).
+
+Found on the way (pre-existing, not changed here): every read of a file
+whose chunk list is spilled (more chunks than fit inline — the gate's
+256/512 MiB files) loads the list from the chunk cache again
+(`View::chunk_list`), one memory-tier hit per read on every transport (the
+`uring` leg shows 2 hits per `rand-4k-dio` read, `uring_zc` 1 — the list
+only). On 4 KiB reads that is a measurable share of the per-read cost.
+
+### Gates (this host is both boxes: kernel 7.3.0-rc4, `fuse.enable_uring=Y`, 32 vCPU; load average 20–330 from other agents during the runs)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings`; `-p constellation-frontend-fuse` (feature off) | clean; clean |
+| `cargo test --workspace`, as seven slices under the 10-minute tool cap (`ulimit -n` 65536) | **2420 passed, 0 failed, 47 ignored** (frontend-fuse counted twice: without and with `io-uring`); re-run after the last code change: engine + harness + vfs 686/0, frontend-fuse `--features io-uring` 80/0 |
+| `tools/vendor-fuser.sh --check` | ok (patch 0001 untouched) |
+| `bash tests/smoke.sh` (user, `auto`) / (root, `CONSTELLATION_FUSE_TRANSPORT=uring`) | SMOKE TEST PASSED / SMOKE TEST PASSED |
+| `tests/integration.sh` (4566 held by another agent's floci: its body, `AWS_ENDPOINT=http://localhost:4566 tests/smoke.sh s3://constellation-ci/run-z4b-…`) | SMOKE TEST PASSED |
+| `make perf-gate` | **vfs-bench gate PASSED** (`view/read` 18 allocs/op = ceiling); the rate gate fails `writeback_import_files_per_sec` (1 182–1 476 vs floor 1 573) on every run here, and **main's own binaries fail it identically** under the same load, interleaved (main 1 179 / 1 467, this tree 1 341 / 1 395): host contention on the write path this chunk does not touch. Not loosened |
+| `docker compose --profile test run --rm compliance` (private `SMOKE_IMAGE`, floci port dropped by an override) | **8798 passed, 0 failed** — `FUSE transport: dev_fuse (asked for auto)` |
+| `compliance-uring` (daemon as **root** in the privileged suite container, zero-copy `auto`) | **8798 passed, 0 failed** — `FUSE transport: uring_zc (asked for uring)` |
+| `tests/read-cpu-gate.sh` × 3 transports (root) | recorded, table above |
+| ZC_BOX: four zero-copy scenarios, root, default policy | PASSED ×4 (and again in the full root matrix) |
+| RING_BOX: zero-copy scenarios unprivileged | SKIPPED ×4 (`requires CAP_SYS_ADMIN for io_uring zero-copy (run the harness as root)`); `e2e-basic cold-cache readahead` with `CONSTELLATION_FUSE_TRANSPORT=uring` PASSED |
+| Extra: 25 read-heavy scenarios as root with `CONSTELLATION_FUSE_TRANSPORT=uring` (every mount `uring_zc`; the second batch's transport census: 30 of 30 mounts `uring_zc`, cluster-lock mounts included) | 24 PASSED; `distant-bigfile-stable` (throughput floor) FAILED — fails on main too (below) |
+
+**Harness, full matrix (209 scenarios), user (host / RING_BOX lane, default
+`auto`)**, run as 30 round-robin shards and by name in slices under the tool
+cap: **all 209 ran; every scenario passed at least once on this tree**
+except the pre-existing ones below; the 4 zero-copy and 7 root-only
+passthrough scenarios SKIPPED. Failures and what became of them:
+- pre-existing, **reproduced with main `247fc59`'s own binaries** on the same
+  host: `commit-strips-pending-upload` (3/3 here, 2/2 main — "read 0 bytes" /
+  `ENOENT` on the joiner), `holder-crash-phantom-shadow` (main 1/1),
+  `stale-base-rename-divergence` and `session-stale-base-rename` (main 2/2),
+  `fuse-inval-storm` (main 1/1: the holder's `kernel-inval` thread stuck in
+  `fuse_reverse_inval_entry` after `kill -9`; another agent's daemons on
+  this host show the same stack), `distant-bigfile-stable` (main fails the
+  throughput floor too), `takeover-marker-strands-promptly` (here 3/4 pass,
+  main 3/5), `slow-s3-no-seal` (here 1/4, main 1/3 at load 60–120);
+- load flakes that passed on rerun: `git-under-flock-rounds` (one 28 s
+  `git commit` at load 74; all three rounds' checks had passed; PASSED with
+  `GIT_FLOCK_ROUNDS=2`, as 3 rounds exceed the tool cap here),
+  `log-retention-gap-open-orphan` (1 of 8: a byte mismatch reading an orphan
+  after the rebuild, 7 later runs passed; the non-zero-copy read path is
+  code-identical to main), `visibility-s3-latency`, `sqlite-first-touch-latency`,
+  `lock-holder-killed-contention`, `snapsched-create`,
+  `holder-publishes-log-prefix-backup`, `root-failover-with-delegates`,
+  `shared-dir-multi-writer`, `epoch-member-dies-with-chunk`.
+
+**Harness, full matrix, root (ZC_BOX, default policy: cluster-lock mounts on
+`dev_fuse`, the rest `uring_zc`)**: **all 209 ran**; failures:
+- root-only and **identical with main's binaries as root**:
+  `fsync-hard-outage`, `fsync-soft-timeout`, `fsync-interrupt`,
+  `unmount-drain`, `writeback-backpressure`, `s3-cut-create-holder-restart`,
+  `holder-publishes-log-prefix-backup`, `snapsched-create` — no write takes
+  the root lease before the scenario cuts S3 when the daemon runs as euid 0
+  (`adopt_root` is skipped); the harness fix (`create_holding` /
+  `hold_lease_before_cut`) is not on this base;
+- pre-existing as in the user lane: `fuse-inval-storm`,
+  `stale-base-rename-divergence`, `session-stale-base-rename`,
+  `distant-bigfile-stable-e2e` (main 2/2 fail);
+- load flakes that passed on rerun: `continuation-epoch` (failed 3 of 4 at
+  load 60–120; then 2/2 interleaved with main 2/2 at load 25),
+  `p2p-same-identity-restart`, `cto-recall-unreachable`,
+  `visibility-s3-latency`, `slow-s3-no-seal`, `git-under-flock-rounds`
+  (2 rounds).
+- `transport-lock-wait-budget` now PASSES as user and as root (it failed on
+  `b458669` at Z4a): depth 4 → 3 waited, 4 `ENOLCK`; default depth 32 → 31
+  waited, 4 `ENOLCK`.
+
+### For the coordinator: revisiting "cluster-lock mounts stay on `/dev/fuse` under `auto`" (Z2c option b)
+
+- **Lock-wait downgrades / `ENOLCK`**: unchanged by zero-copy — the budget is
+  `depth − 1` blocked waiters per CPU queue on `uring` and `uring_zc` alike
+  (`transport-lock-wait-budget`, root and user, numbers above). In the
+  default-policy matrices no cluster-lock mount was on the ring, so they
+  counted 0 downgrades; in the forced-`uring` root run (every mount
+  `uring_zc`, cluster locks included: `sqlite-two-nodes`,
+  `passwd-live-cluster`, `two-clients-shared`, `git-workflow`, …) nothing
+  failed with `ENOLCK`.
+- **CPU with zero-copy**: no CPU saving on Constellation's read lanes; a
+  cost on 4 KiB random (+48%) and warm lanes (+12–17%), a large RSS and
+  throughput win on cold sequential (table above). So zero-copy adds no
+  argument for putting cluster-lock mounts on the ring; the case for the
+  ring itself is Z2's (`uring` vs `dev_fuse`: −55% on `rand-4k-dio`, −45%
+  on warm-memory, −51% on `smallfiles` here).
+- Observation worth a follow-up either way: the io-wq hop could likely be
+  avoided by issuing the `READ_FIXED` with `RWF_NOWAIT`-style inline
+  completion or from an `O_DIRECT` chunk fd; and the spilled chunk list is
+  re-read on every read on every transport.
+
+### Fix round (review 38-z4b, 2026-10-03)
+
+Rebased by the coordinator onto main `670e57d`; the two conflicted files
+(`frontend-fuse/src/{adapter,session}.rs`) kept both sides (main's
+`KernelEntries` for the entry-invalidation filter, this chunk's
+`ZeroCopyCounter`).
+
+| Finding | Resolution | Where |
+|---|---|---|
+| Must 1: route by size (the memory-tier refusal was dropped by the coordinator's decision, below) | A read goes zero-copy if its one slice is `>= CONSTELLATION_FUSE_ZERO_COPY_MIN_READ`, whether or not the chunk is in the memory tier; an open of a file smaller than the threshold is not marked. The threshold is a knob (`<n>`/`<n>k`/`<n>m`, `0` = every read; unparseable = mount error), carried `TransportConfig` → `MountOptions` → `FrontendCaps::zero_copy_min_read` → the view at `frontend_negotiated`. **Default 512 KiB** from the new size lanes (table below). **`CONSTELLATION_FUSE_URING_ZERO_COPY` now defaults to `off`** (the coordinator's rule: the warm lanes still cost more CPU on `uring_zc`); `auto`/`pinned` are the opt-in, documented with the measured numbers | `view/zero_copy.rs`, `frontend-fuse/src/session.rs`, `vfs/src/caps.rs`, `configuration.md` ("When to turn it on") |
+| Must 1: tests, docs, scenario sizes | `a_chunk_held_in_memory_is_still_read_zero_copy` (a large read of an in-memory chunk is zero-copy, no memory hit, one pin; a below-threshold read of it is bytes, one memory hit); new `a_read_below_the_threshold_is_served_with_bytes`, `a_file_smaller_than_the_threshold_is_not_marked`, `the_zero_copy_min_read_knob`. The scenarios pin `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=8192` (no memory-tier override any more); `zero-copy-single-chunk` adds a one-page `O_DIRECT` read that must be `(0 zero-copy, 1 daemon)`. `compliance-uring` asks for `auto` explicitly (compose), so it still negotiates `uring_zc`; the nightly `zero-copy-7-3` matrix sets `auto` | `zero_copy_tests.rs`, `session.rs`, `scenarios/zerocopy.rs`, `docker-compose.yml`, `nightly.yml` |
+| Should 1: a cached source never rechecked residency | Every read re-reads `cache.resident(&hash)` (must be verified, same length as when opened) and `fstat`s the open file (`nlink > 0`); otherwise the cached source is dropped and the current file opened. Test `a_chunk_removed_as_corrupt_is_never_served_from_the_old_file` (rot in place → `get_verified` drops it → re-inserted: the read serves the new inode, not the unlinked one; fails on the old code) | `View::zero_copy_source` |
+| Should 2: one cached chunk per handle | A per-handle LRU of `ZERO_COPY_SOURCES` = 4 open, pinned chunk files. Measured (table below): no difference on the random lanes — 8 handles at random over 128 chunks rarely hit 4 entries, and the reopen (`resident` + `pin_open` + `open` + `fstat` + `close`) is below the noise of a `READ_FIXED` of ≥ 64 KiB. Kept for reads cycling over a few chunks | `ZeroCopyHandle`; `a_handle_holds_its_last_few_chunks_and_teardown_drops_them_all` |
+| Should 3: frozen files never marked | Routed `read_frozen` through the same rule (simpler than a per-mount transport decision, and it also covers `.constellation/snapshot` inside live views): `zero_copy_open_frozen` at open (not when passthrough answered it), and `read_frozen` → `zero_copy_read` with the frozen manifest's own chunk size. Test `a_frozen_multi_chunk_file_reads_zero_copy` | `view/synthetic.rs`, `view/ops.rs`, `passthrough_tests.rs` |
+| Should 4: `ReadData::contiguous()` short read | `contiguous()` returns `VfsResult<Cow<[u8]>>`: `Code::Io` (logged) when the file cannot give every byte; `ZeroCopySource::read_range` is `UnexpectedEof` on a file that ends early, never short. Callers: `ReadReply` answers `EIO`, `browse` returns the error, the conformance kit fails the check. (`browse` *was* a production path: on a zero-copy mount its opens were marked too) | `vfs/src/types.rs`, `reply.rs`, `control/browse.rs`, `conformance/{client,deferral}.rs` |
+| Nit: `len < need` cached and pinned | The length check is before the pin and the open; a cached source is reused only at the length it was opened | `zero_copy_source` |
+| Nit: passthrough handle also marked | An open answered with a backing file is not marked (live and frozen) | `ops.rs` |
+| Nit: idle handle keeps its chunk | Kept (now up to 4), as passthrough keeps its one; documented in the module doc and `configuration.md` | — |
+| Nit: bufpool-less 7.3 kernel FAILs, not SKIPs | Kept: the requirement is checked before any mount and the offer is only visible in `FUSE_INIT`; a silent non-engagement must be a visible failure. Documented in TESTING.md | — |
+| Nit: nightly leaves root-owned files | New `if: always()` step lists root-owned files in the workspace and `chown`s it back to the runner user | `nightly.yml` |
+| Nit: `policy_properties` ties the caps | `zero_copy` and `zero_copy_min_read` drawn independently | `vfs/tests/policy_properties.rs` |
+| Nit: spilled chunk list re-read per read | Pre-existing, every transport; not changed (follow-up) | `flush.rs` `chunk_list` |
+
+#### The threshold: read-size lanes (`tests/read-cpu-gate.sh --size-lanes`, new)
+
+Root, this host (32 vCPU, 7.3.0-rc4, load 20–45), 4 MiB chunks, 1 GiB memory
+tier; O_DIRECT reads of exactly S bytes over the 512 MiB file `cold-seq-1m`
+just read: on `uring` every read is a memory hit, on `uring_zc` with
+`CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0` every read is zero-copy from the
+chunk file (`zero_copy_reads` = all). Median of 3, CPU-s/GiB (MiB/s):
+
+| S | `dev_fuse` rand / seq | `uring` rand / seq | `uring_zc` rand / seq | zc vs memory hit |
+|---|---|---|---|---|
+| 64 KiB | 1.550 / 1.02 | 0.523 (7 593) / 0.22 | 0.707 (5 436) / 0.30 | +35% / +36% |
+| 128 KiB | 0.787 / 0.58 | 0.344 (14 377) / 0.18 | 0.395 (10 855) / 0.22 | +15% / +22% |
+| 256 KiB | 0.470 / 0.40 | 0.221 (21 189) / 0.14 | 0.232 (21 138) / 0.16 | +5% / +14% |
+| 512 KiB | 0.307 / 0.28 | 0.169 (26 433) / 0.18 | 0.173 (33 661) / 0.14 | +2% / −22% |
+| 1 MiB | 0.226 / 0.24 | 0.145 (30 774) / 0.14 | 0.146 (43 382) / 0.12 | +1% / −14% |
+
+Zero-copy stops costing CPU at 512 KiB, hence the default. Peak RSS on
+these lanes: `uring` 814–947 MiB, `uring_zc` 309–452 MiB.
+
+#### The default decision: standard lanes, final code
+
+Root, two interleaved rounds of 3, **median of 6**, load 25–40; `uring_zc` =
+`CONSTELLATION_FUSE_URING_ZERO_COPY=auto` with the default 512 KiB threshold
+and the memory-tier refusal. CPU-s/GiB (MiB/s; peak RSS MiB; zero-copy
+reads per rep):
+
+| lane | `dev_fuse` | `uring` | `uring_zc` |
+|---|---|---|---|
+| `cold-seq-1m` | 3.04 (1 781; 770) | 3.94 (1 825; 812) | 3.29 (**3 495**; **299**; 508/512) |
+| `warm-disk-seq-1m` | 0.65 (1 762; 606) | 0.57 (1 710; 609) | **0.75** (1 395; 618; 0) |
+| `warm-mem-seq-1m` | 0.21 (4 768; 607) | 0.15 (5 390; 617) | **0.31** (2 878; 626; 0) |
+| `rand-4k-dio` | 18.65 (526; 986) | 6.46 (648; 1 010) | **7.78** (621; 1 003; 0) |
+| `smallfiles` | 18.06 (201; 358) | 7.12 (246; 357) | 6.98 (248; 357; 0) |
+
+The warm lanes still cost more on `uring_zc` than on `uring`, so per the
+coordinator's rule **zero-copy queues are opt-in (`off` by default)**.
+`smallfiles` reached parity (64 KiB files are no longer marked).
+
+**Coordinator decision (applied below, "Memory refusal dropped"): drop the memory-tier refusal.**
+
+**Finding for the coordinator — the memory-tier refusal makes the warm
+lanes worse, not better.** On a *marked* handle the kernel hands every read
+over as registered pages; a read answered with bytes is bounced into them
+(the vendored fuser's `Ring::bounce_in`: a write into a memfd plus a
+`READ_FIXED` from it — one copy more than plain `uring`, plus the second
+ring round trip and the io-wq hop). So a memory hit on a marked handle costs
+more than the zero-copy read from the chunk file it replaced. Measured with
+a temporary build that drops only the `in_memory` refusal (same tree
+otherwise, same runs interleaved, median of 6):
+
+| lane | `uring` | `uring_zc`, as specified | `uring_zc`, no memory refusal | no memory refusal, threshold 0 |
+|---|---|---|---|---|
+| `warm-disk-seq-1m` | 0.57 | 0.75 (0 zc) | 0.63 (384 zc) | 0.62 (384 zc) |
+| `warm-mem-seq-1m` | 0.15 (5 390 MiB/s) | 0.31 (2 878) | **0.14** (5 418; 512 zc) | 0.13 (5 476) |
+| `rand-4k-dio` | 6.46 | 7.78 | 7.98 | 9.53 (all zc) |
+
+So the threshold is right for small reads (at 4 KiB the bounce, 7.8, beats a
+zero-copy read, 9.5), but on a marked handle the memory refusal doubles the
+warm-memory cost; without it warm-memory is at parity with `uring`, and
+warm-disk is within 10%. Neither variant reaches parity on every warm lane
+(warm-disk 0.62–0.63 vs 0.57, `rand-4k-dio` +20%), so the default would be
+`off` either way; but an operator who opts in is better served with the
+memory refusal dropped (keeping the threshold and not marking small files).
+Implemented as specified; the coordinator should decide whether to drop it.
+
+#### Memory refusal dropped (coordinator's decision)
+
+Routing now: a read on a marked handle goes zero-copy when its one slice is
+at least the threshold, in memory or not. Kept: default `off`, threshold,
+open rule, residency and `nlink` re-checks. Removed: the `in_memory` check
+in `view/zero_copy.rs`, the scenarios' `CONSTELLATION_CHUNK_MEMCACHE_BYTES=0`
+override; docs updated (`zero_copy.rs` module doc, `configuration.md`
+"When to turn it on", TESTING.md).
+
+Re-run, root, this host (loaded, other agents building), `uring` vs
+`uring_zc` (`auto`, default 512 KiB threshold), median of 3, CPU-s/GiB
+(MiB/s; peak RSS MiB; zero-copy reads per rep). The absolute numbers are
+not comparable with the table above (different load); compare columns:
+
+| lane | `uring` | `uring_zc` |
+|---|---|---|
+| `cold-seq-1m` | 1.86 (1 014; 856) | 1.52 (**1 459**; **354**; 509) |
+| `warm-disk-seq-1m` | 0.64 (1 043; 614) | 0.70 (957; 606; 384) |
+| `warm-mem-seq-1m` | 0.10 (4 163; 616) | 0.18 (1 759; 607; 512) |
+| `rand-4k-dio` | 3.41 (390; 1 016) | 5.86 (174; 963; 0) |
+
+On this run warm-memory shows no parity with `uring` (0.18 vs 0.10; the
+first rep of `uring_zc` was 0.14, 4 197 MiB/s, the later two 0.18–0.20 under
+rising load): host noise is large (the same lane on `dev_fuse` ranged
+0.14–0.18, 3 556–6 095 MiB/s), so the earlier no-refusal measurement (0.14
+vs 0.15) is the better estimate; the finding stands that the zero-copy read
+is not worse than the bounce it replaced (0.31 before the change). The
+warm-mem lane's zero-copy count is 512/512 now. Default stays `off`.
+
+Size lanes (`--size-lanes`, `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0`,
+`O_DIRECT`, median of 3), CPU-s/GiB rand / seq (zero-copy reads were
+counted on the `uring_zc` side; the `uring` side is memory hits):
+
+| S | `uring` | `uring_zc` |
+|---|---|---|
+| 64 KiB | 0.330 / 0.22 | 0.592 / 0.24 |
+| 128 KiB | 0.208 / 0.18 | 0.337 / 0.18 |
+| 256 KiB | 0.156 / 0.12 | 0.205 / 0.16 |
+| 512 KiB | 0.131 / 0.10 | 0.155 / 0.12 |
+| 1 MiB | 0.122 / 0.12 | 0.138 / 0.12 |
+
+Loaded-host rerun: zero-copy is costlier than the memory hit at every size
+here, narrowing to +13% (rand) and parity (seq) at 1 MiB; the earlier quiet
+run had it at parity from 512 KiB. The default threshold (512 KiB) is kept:
+the ordering by size is the same, and the cost below it is clear in both.
+`cold-seq-1m` over the same runs: 1.90 → 1.56 CPU-s/GiB, 824 → 308 MiB RSS.
+
+Gates for this step: `cargo fmt --check` and `cargo clippy --workspace
+--all-targets -D warnings` clean; `cargo test -p constellation-frontend-fuse
+--features io-uring` (61+29+7 passed) and `cargo test -p constellation-engine
+--lib view::` (166 passed, 2 ignored); the four zero-copy scenarios as root
+(`sudo env HOME=/root PATH=$PATH CONSTELLATION_HARNESS_DOCKER_PREFIX=z4bfix-root
+target/release/harness run zero-copy-…`) PASSED; `tests/smoke.sh` as root with
+`CONSTELLATION_FUSE_TRANSPORT=uring`, `…_URING_ZERO_COPY=auto`,
+`…_ZERO_COPY_MIN_READ=0` PASSED; nothing root-owned left in `~`.
+
+#### Fix-round gates (this host; `CARGO_TARGET_DIR` unset; `ulimit -n` 65536)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --no-fail-fast`, seven package groups under the 10-min cap (control+platform+csi+cli+harness+vfs / engine+frontend-fuse / frontend-fuse `--features io-uring` / the rest / authority+chaos+fs-core+meta / model ×2) | **all rc 0, 0 failed** (engine lib 569 passed, 9 ignored; frontend-fuse 61+29+7 with the feature; rest 468; authority/chaos/fs-core/meta 741; model 84 + 54) |
+| `a_mount_that_asks_for_the_ring_serves_on_whatever_it_gets` as root (`uring_options` now asks for `auto`) | PASSED: `uring_zc` with buffer pools offered |
+| `cargo bench -p constellation-engine --bench vfs_bench` | `view/read` 18 allocations/op (ceiling 18); `perf-baseline.json` untouched |
+| root: `harness run` the four `zero-copy-*` scenarios | 4 PASSED (buffered 4/4 zero-copy; eviction 915/915 zero-copy under two prunes) |
+| root: the eight `passthrough-*` scenarios | 8 PASSED |
+| root: `transport-detach-refused transport-refused-registration transport-seccomp-denied transport-enomem-ring transport-abort-while-armed transport-cluster-locks-auto transport-lock-wait-budget` | 7 PASSED (lock-wait budget: depth 4 → 3 waited / 4 `ENOLCK`; depth 32 → 31 / 4) |
+| user: the four `zero-copy-*` scenarios | 4 SKIPPED (`requires CAP_SYS_ADMIN for io_uring zero-copy (run the harness as root)`) |
+| user, `CONSTELLATION_FUSE_TRANSPORT=uring`: `e2e-basic cold-cache readahead` | 3 PASSED |
+| `bash tests/smoke.sh` (user) / root with `uring` + zero-copy `auto` + threshold 0 | SMOKE TEST PASSED / SMOKE TEST PASSED |
+| `tests/read-cpu-gate.sh`, root: standard lanes on `dev_fuse`, `uring`, `uring_zc` (×2 rounds each), size lanes on all three | READ-CPU GATE PASSED every run; tables above |
+| `docker compose --profile test-uring run --rm compliance-uring` (private `SMOKE_IMAGE`, floci's host port dropped by an override: 4566 is another agent's) | **8798 passed, 0 failed**, `FUSE transport: uring_zc (asked for uring)`; again with `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0`: 8798 / 0 |
+
+Not re-run in the fix round: the full harness matrix (user and root),
+`tests/integration.sh`, `make perf-gate`'s rate half, and the `dev_fuse`
+`compliance` lane (the routing only changes `uring_zc` sessions, which are now
+opt-in).
+
+### Plan 38 §9 item 6 exit criteria
+
+- [x] Zero-copy wiring behind kernel 7.3 detection (the INIT's
+      `FUSE_HAS_IO_URING_BUFPOOL`) and `CAP_SYS_ADMIN` (Z4a), reads routed
+      to it (Z4b)
+- [x] The chunk-spanning fallback to the memory-cache path asserted by a
+      scenario that constructs exactly that case (`zero-copy-chunk-spanning-fallback`:
+      one 8 KiB `O_DIRECT` read at `CHUNK − 4096`)
+- [x] The 7.3 lane runs where available (root on this host: 4/4 PASSED)
+      and SKIPs loudly elsewhere (unprivileged: 4/4 SKIPPED with the reason);
+      `nightly.yml` `zero-copy-7-3`
+- [x] `--cache-verify always` confirmed by tests to disable both zero-copy
+      and passthrough (`zero-copy-disabled-by-verify-always`:
+      `uring`, passthrough `cache_verify_always`, 0 zero-copy reads under
+      buffered and `O_DIRECT` reads, memory hits moving; engine and session
+      unit tests)
+- [x] pjdfstest 8798/8798 on `dev_fuse` and on `uring_zc` (root); no
+      exceptions added (fix round: `uring_zc` 8798/8798, default threshold
+      and threshold 0)
+- [x] Report: harness summaries per box, pjdfstest tallies, fio CPU-s/GiB
+      and RSS for all three transports next to Z0b–Z3
+
+#### Fix round 3 (review: docs only)
+
+- Memory-tier clauses removed (`session.rs` docs, `configuration.md`, `TESTING.md`; the scenarios do not turn the memory tier off, the doc says the tier does not matter).
+- Nightly `zero-copy-7-3` compliance lane runs with `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0` (compose passes it through), stated in TESTING.md; `read-cpu-zc-runner-sizes-*.json` added to the upload paths.
+- Nit left: the per-read `ZeroCopyCounter` `Arc` clone stays (`ReadReply` is moved into a detached task; a borrow needs a lifetime through the adapter, not a small change).
+- Gates: fmt, clippy, `cargo test -p constellation-frontend-fuse --features io-uring`, workflow YAML parse.
+
 ## Plan 32 M4a (expiry)
 
 Step 4 of [plan 32](wip/32-snapshot-policies-and-space.md) (chunk `32-m4a`),

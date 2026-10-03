@@ -222,7 +222,7 @@ jobs:
           docker compose --profile test build compliance
           docker compose --profile test run --rm -e CONSTELLATION_FUSE_TRANSPORT=dev-fuse \
             compliance 2>&1 | tee compliance-dev-fuse.log
-          make compliance-uring 2>&1 | tee compliance-uring.log
+          CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0 make compliance-uring 2>&1 | tee compliance-uring.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -232,6 +232,94 @@ jobs:
             compliance-*.log
             target/transport-matrix
             read-cpu-uring-runner-baseline-*.json
+
+  # Plan 38 §6/Z4b: the 7.3 lane ("run in the Rawhide guest"). FUSE-over-io_uring
+  # zero-copy needs a kernel whose FUSE_INIT offers io_uring buffer pools
+  # (7.3+) and CAP_SYS_ADMIN in the initial user namespace, so this runs as
+  # root on a self-hosted runner booted into such a kernel (label
+  # `fuse-uring-zc`). Elsewhere the four zero-copy scenarios SKIP loudly
+  # (their `requires`), which the transport-matrix job above shows. Without
+  # such a runner registered the job would queue forever: it runs only when
+  # the repository variable FUSE_URING_ZC_RUNNER is "true".
+  zero-copy-7-3:
+    needs: unit
+    if: vars.FUSE_URING_ZC_RUNNER == 'true'
+    runs-on: [self-hosted, linux, fuse-uring-zc]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The runner grants zero-copy (7.3+, the ring, root)
+        run: |
+          uname -r
+          test "$(cat /sys/module/fuse/parameters/enable_uring)" = Y
+          test "$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)" = 0
+          sudo -n true
+      - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
+      # The four zero-copy scenarios, then the whole matrix with zero-copy
+      # queues asked for (they are opt-in, plan 38 Z4b; the transport policy
+      # stays the default, so cluster-lock mounts stay on /dev/fuse), both
+      # as root (a root HOME of its own: the daemon must not write
+      # root-owned files into the runner user's ~/.config).
+      - run: |
+          set -o pipefail
+          sudo env HOME=/root PATH="$PATH" CONSTELLATION_HARNESS_DOCKER_PREFIX=zc \
+            target/release/harness run zero-copy-single-chunk \
+            zero-copy-chunk-spanning-fallback zero-copy-eviction-while-inflight \
+            zero-copy-disabled-by-verify-always 2>&1 | tee zero-copy-scenarios.log
+          sudo env HOME=/root PATH="$PATH" CONSTELLATION_HARNESS_DOCKER_PREFIX=zc \
+            CONSTELLATION_FUSE_URING_ZERO_COPY=auto \
+            target/release/harness run 2>&1 | tee zero-copy-matrix.log
+      # The cost gate on all three transports, as root (the uring_zc leg
+      # needs CAP_SYS_ADMIN; the other two run the same way to compare):
+      # each leg records its own baseline on a fresh checkout.
+      - run: |
+          set -o pipefail
+          for leg in dev-fuse:auto uring:off uring:auto; do
+            sudo env HOME=/root PATH="$PATH" CONSTELLATION_FUSE_TRANSPORT="${leg%%:*}" \
+              CONSTELLATION_FUSE_URING_ZERO_COPY="${leg##*:}" \
+              READ_CPU_BASELINE="read-cpu-zc-runner-baseline-${leg/:/-}.json" \
+              tests/read-cpu-gate.sh 2>&1 | tee -a read-cpu-zc.log
+          done
+          # The zero-copy threshold's measurement (never gated): the
+          # read-size lanes on `uring` and on `uring_zc` with every read
+          # zero-copy.
+          lanes="cold-seq-1m $(tests/read-cpu-gate.sh --size-lanes)"
+          for leg in off:512k auto:0; do
+            sudo env HOME=/root PATH="$PATH" CONSTELLATION_FUSE_TRANSPORT=uring \
+              CONSTELLATION_FUSE_URING_ZERO_COPY="${leg%%:*}" \
+              CONSTELLATION_FUSE_ZERO_COPY_MIN_READ="${leg##*:}" \
+              READ_CPU_LANES="$lanes" \
+              READ_CPU_BASELINE="read-cpu-zc-runner-sizes-${leg%%:*}.json" \
+              tests/read-cpu-gate.sh 2>&1 | tee -a read-cpu-zc-sizes.log
+          done
+      # pjdfstest with the daemon as root on the ring: the suite container
+      # has CAP_SYS_ADMIN, so `compliance-uring` negotiates uring_zc here
+      # (its first line says which transport it got).
+      - run: |
+          set -o pipefail
+          make compliance-uring 2>&1 | tee compliance-uring-zc.log
+          grep -q "FUSE transport: uring_zc" compliance-uring-zc.log
+      # The steps above ran as root inside the checkout (the gate writes
+      # its per-leg baselines here, the harness its results): hand
+      # everything back to the runner user, so a persistent runner's next
+      # checkout can clean the workspace, and show what root had left.
+      - name: No root-owned files left in the workspace
+        if: always()
+        run: |
+          sudo find "$GITHUB_WORKSPACE" -xdev -user root -print | head -50
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zero-copy-7-3
+          path: |
+            zero-copy-*.log
+            read-cpu-zc.log
+            read-cpu-zc-sizes.log
+            compliance-uring-zc.log
+            read-cpu-zc-runner-baseline-*.json
+            read-cpu-zc-runner-sizes-*.json
 
   linux-package:
     needs: performance
@@ -339,7 +427,7 @@ jobs:
 
   summary:
     if: always()
-    needs: [lint, unit, integration, compliance, harness, harness-lanes-linux, conformance, parity, xfstests, performance, transport-matrix, linux-package, csi-sanity, kind-e2e, macos]
+    needs: [lint, unit, integration, compliance, harness, harness-lanes-linux, conformance, parity, xfstests, performance, transport-matrix, zero-copy-7-3, linux-package, csi-sanity, kind-e2e, macos]
     runs-on: ubuntu-latest
     steps:
       - name: Publish summary

@@ -520,7 +520,7 @@ pub(super) fn a_cold_read_completes_from_another_thread(env: &Env<'_>) -> TestRe
         fail!("the cold read completed {} times", cold.completions);
     }
     let data = must("cold read", cold.result.expect("completed"));
-    if data.contiguous().as_ref() != content.as_slice() {
+    if data.contiguous().ok().as_deref() != Some(content.as_slice()) {
         fail!("the cold read returned other bytes");
     }
     if cold.completed_on == Some(me) {
@@ -529,7 +529,7 @@ pub(super) fn a_cold_read_completes_from_another_thread(env: &Env<'_>) -> TestRe
     // Warm now (the cold read cached it): answered inline, as before.
     let warm = once(|d| vfs.read(&OpCtx::new(OpKind::Read, &caller), ino, o.fh, 0, len, d));
     let data = must("warm read", warm.result.expect("completed"));
-    if data.contiguous().as_ref() != content.as_slice() {
+    if data.contiguous().ok().as_deref() != Some(content.as_slice()) {
         fail!("the warm read returned other bytes");
     }
     if !warm.before_return || warm.completed_on != Some(me) {
@@ -566,7 +566,7 @@ pub(super) fn a_non_deferrable_cold_read_parks_the_calling_thread(env: &Env<'_>)
         )
     });
     let data = must("cold read", s.result.expect("completed"));
-    if data.contiguous().as_ref() != content.as_slice() {
+    if data.contiguous().ok().as_deref() != Some(content.as_slice()) {
         fail!("the cold read returned other bytes");
     }
     if s.completions != 1 || !s.before_return || s.completed_on != Some(me) {

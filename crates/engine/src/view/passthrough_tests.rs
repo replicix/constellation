@@ -161,6 +161,7 @@ impl Env {
         })
         .expect("read")
         .contiguous()
+        .unwrap()
         .into_owned()
     }
 
@@ -972,6 +973,7 @@ impl Env {
         Blocking::run(|r| self.fs.read(&self.cx(OpKind::Read), ino, fh, off, len, r))
             .expect("read")
             .contiguous()
+            .unwrap()
             .into_owned()
     }
 }
@@ -1270,4 +1272,54 @@ fn a_frozen_passthrough_handle_crosses_a_handover() {
     );
     e.release_fh(ino, opened.fh);
     assert_eq!(e.cache.open_pin_count(&hash), 0);
+}
+
+/// Plan 38 Z4b: on a zero-copy frontend, a frozen file passthrough does
+/// not take (more than one chunk) is marked zero-copy, and a read inside
+/// one of its chunks is a range of that chunk's file, as for a live file;
+/// a read across a chunk boundary takes the ordinary path. A frozen file
+/// that passthrough takes is not marked: its reads never reach the daemon.
+#[test]
+fn a_frozen_multi_chunk_file_reads_zero_copy() {
+    let mut e = env();
+    let big = 2 * CHUNK as usize + 1000;
+    let (frozen, _nodes) = frozen_files(&mut e, &[("big", big), ("one", 4096)]);
+    let (ino, data) = frozen[0].clone();
+    let caps = FrontendCaps {
+        zero_copy: true,
+        zero_copy_min_read: 0,
+        ..e.fs.caps.clone()
+    };
+    e.fs.frontend_negotiated(&caps);
+
+    let one = e.open_ro(frozen[1].0);
+    assert!(one.backing.is_some() && !one.zero_copy, "passthrough wins");
+
+    let opened = e.open_ro(ino);
+    assert!(opened.backing.is_none());
+    assert!(opened.zero_copy);
+    let off = CHUNK as u64 + 100;
+    let got = Blocking::run(|r| e.fs.read(&e.cx(OpKind::Read), ino, opened.fh, off, 8192, r))
+        .expect("read");
+    let zc = got
+        .as_zero_copy()
+        .expect("a one-chunk read of a frozen file");
+    assert_eq!(zc.offset, 100);
+    assert_eq!(
+        &*got.contiguous().unwrap(),
+        &data[off as usize..off as usize + 8192]
+    );
+    let span = CHUNK as u64 - 10;
+    let got = Blocking::run(|r| e.fs.read(&e.cx(OpKind::Read), ino, opened.fh, span, 100, r))
+        .expect("read");
+    assert!(
+        got.as_zero_copy().is_none(),
+        "a spanning read went zero-copy"
+    );
+    assert_eq!(
+        e.read_fh(ino, opened.fh, span, 100),
+        data[span as usize..span as usize + 100]
+    );
+    e.release_fh(ino, opened.fh);
+    assert_eq!(e.fs.zero_copy_handles(), 0);
 }

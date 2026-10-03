@@ -24,6 +24,19 @@
 #   tests/read-cpu-gate.sh                    # gate against the baseline
 #   READ_CPU_BLESS=1 tests/read-cpu-gate.sh   # rewrite the baseline
 #   READ_CPU_LANES="cold-seq-1m" tests/read-cpu-gate.sh
+#   READ_CPU_LANES="$(tests/read-cpu-gate.sh --size-lanes)" tests/read-cpu-gate.sh
+#
+# The read-size lanes (plan 38 Z4b, opt-in, never in the default set and
+# never gated: they have no baseline) are `rand-<S>-dio` and `seq-<S>-dio`
+# for S in 64k 128k 256k 512k 1m: O_DIRECT reads of exactly S bytes, 8
+# random readers for READ_CPU_RAND_SECONDS or one sequential pass, over
+# `seq1_0` on the mount `cold-seq-1m` just filled. On `uring` that pass
+# admitted every chunk to the memory tier, so these lanes are memory hits;
+# on `uring_zc` it left them verified on disk and out of the tier (a
+# zero-copy read admits nothing), so with
+# CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0 every one of their reads is
+# zero-copy. The pair is the zero-copy threshold's measurement: a zero-copy
+# read of S bytes against the memory hit it replaces, per S.
 #
 # Knobs (all optional):
 #   CONSTELLATION_BIN       binary under test (default target/release/constellation)
@@ -68,6 +81,14 @@ SMALL_FILES="${READ_CPU_SMALL_FILES:-4096}"
 RAND_SECONDS="${READ_CPU_RAND_SECONDS:-15}"
 TRANSPORT="${CONSTELLATION_FUSE_TRANSPORT:-auto}"
 ALL_LANES="cold-seq-1m warm-disk-seq-1m warm-mem-seq-1m rand-4k-dio smallfiles"
+SIZES="64k 128k 256k 512k 1m"
+SIZE_LANES=""
+for size in $SIZES; do SIZE_LANES="$SIZE_LANES rand-$size-dio seq-$size-dio"; done
+SIZE_LANES="${SIZE_LANES# }"
+if [ "${1:-}" = --size-lanes ]; then
+    echo "$SIZE_LANES"
+    exit 0
+fi
 LANES="${READ_CPU_LANES:-$ALL_LANES}"
 # The gate wants a *comparable* memory tier, not the host's share of RAM.
 export CONSTELLATION_CHUNK_MEMCACHE_BYTES="${CONSTELLATION_CHUNK_MEMCACHE_BYTES:-1073741824}"
@@ -142,16 +163,21 @@ print((m[0].get("transport") or "unknown") if m else "unknown")
 # numbers cannot on a noisy host: `misses` is one whole-chunk disk read
 # plus (under `always`, or for an unverified entry) one blake3 pass, so
 # the verify-once change of plan 38 §2.3 shows up here exactly, with no
-# scheduler noise in it. `0 0 0` if the daemon cannot be reached.
+# scheduler noise in it. The fourth number is the mount's zero-copy reads
+# (plan 38 Z4b: reads the kernel served with one `READ_FIXED` from a chunk
+# file, only ever on `uring_zc`), so a zero-copy leg shows how much of the
+# lane actually took that path. `0 0 0 0` if the daemon cannot be reached.
 memcache_counters() {
     "$BIN" status "$FS_NAME" --state-dir "$STATE" 2>/dev/null | python3 -c '
 import json, sys
 try:
-    c = json.load(sys.stdin)["cache"]
+    s = json.load(sys.stdin)
+    c = s["cache"]
 except Exception:
-    print("0 0 0"); raise SystemExit
-print(c.get("memory_hits", 0), c.get("memory_misses", 0), c.get("memory_chunks", 0))
-' || echo "0 0 0"
+    print("0 0 0 0"); raise SystemExit
+zc = sum(m.get("zero_copy_reads", 0) for m in s.get("fuse", {}).get("mounts", []))
+print(c.get("memory_hits", 0), c.get("memory_misses", 0), c.get("memory_chunks", 0), zc)
+' || echo "0 0 0 0"
 }
 
 # --- fio -------------------------------------------------------------------
@@ -161,11 +187,11 @@ fio_common=(--ioengine=psync --group_reporting=1 --output-format=json --randrepe
 # appends one JSON line to $OUT.
 run_fio() {
     local lane="$1" rep="$2"; shift 3
-    local hits0 misses0 hits1 misses1 chunks1
+    local hits0 misses0 hits1 misses1 chunks1 zc0 zc1
     local json="$WORK/$lane.$rep.fio.json"
     reset_peak_rss
     local t0 c0 rc
-    read -r hits0 misses0 _ <<<"$(memcache_counters)"
+    read -r hits0 misses0 _ zc0 <<<"$(memcache_counters)"
     c0=$(daemon_cpu_ticks)
     t0=$(date +%s.%N)
     rc=0
@@ -173,7 +199,7 @@ run_fio() {
     local t1 c1
     c1=$(daemon_cpu_ticks)
     t1=$(date +%s.%N)
-    read -r hits1 misses1 chunks1 <<<"$(memcache_counters)"
+    read -r hits1 misses1 chunks1 zc1 <<<"$(memcache_counters)"
     if [ "$rc" -ne 0 ]; then
         echo "FAIL: fio failed in lane $lane (rep $rep):" >&2
         cat "$WORK/$lane.$rep.fio.err" >&2
@@ -191,6 +217,7 @@ run_fio() {
         --argjson mem_hits "$((hits1 - hits0))" \
         --argjson mem_misses "$((misses1 - misses0))" \
         --argjson mem_chunks "$chunks1" \
+        --argjson zc_reads "$((zc1 - zc0))" \
         '
         .jobs[0].read as $r
         | ($r.io_bytes / 1073741824) as $gib
@@ -205,9 +232,9 @@ run_fio() {
            rss_mib: $rss_mib, rss_hwm_mib: $rss_hwm_mib, wall_s: $wall_s,
            chunk_mib: $chunk_mib, memcache_bytes: $memcache,
            memcache_hits: $mem_hits, memcache_misses: $mem_misses,
-           memcache_chunks: $mem_chunks}
+           memcache_chunks: $mem_chunks, zero_copy_reads: $zc_reads}
         ' "$json" >>"$OUT"
-    tail -1 "$OUT" | jq -r '"  \(.lane) r\(.rep) [\(.negotiated)]: \(.bw_mib_s) MiB/s  \(.cpu_s_per_gib) cpu-s/GiB  \(.rss_hwm_mib) MiB peak RSS  \(.memcache_misses) memcache misses"'
+    tail -1 "$OUT" | jq -r '"  \(.lane) r\(.rep) [\(.negotiated)]: \(.bw_mib_s) MiB/s  \(.cpu_s_per_gib) cpu-s/GiB  \(.rss_hwm_mib) MiB peak RSS  \(.memcache_misses) memcache misses  \(.zero_copy_reads) zero-copy reads"'
 }
 
 # --- data ------------------------------------------------------------------
@@ -247,6 +274,25 @@ lane_rand_4k_dio() { # NAME REP
         --time_based=1 --runtime="$RAND_SECONDS" --size="${RAND_MIB}M" --filename="$MNT/rand_0"
 }
 
+lane_rand_dio() { # NAME REP SIZE
+    run_fio "$1" "$2" -- --name="$1" --rw=randread --bs="$3" --direct=1 --numjobs=8 \
+        --time_based=1 --runtime="$RAND_SECONDS" --size="${SEQ_MIB}M" --filename="$MNT/seq1_0"
+}
+
+lane_seq_dio() { # NAME REP SIZE
+    run_fio "$1" "$2" -- --name="$1" --rw=read --bs="$3" --direct=1 \
+        --size="${SEQ_MIB}M" --filename="$MNT/seq1_0"
+}
+
+wants_size_lane() {
+    local size
+    for size in $SIZES; do
+        wants "rand-$size-dio" && return 0
+        wants "seq-$size-dio" && return 0
+    done
+    return 1
+}
+
 lane_smallfiles() { # NAME REP
     run_fio "$1" "$2" -- --name="$1" --rw=read --bs=64k --direct=0 \
         --size="$((SMALL_FILES * 64))k" --nrfiles="$SMALL_FILES" --directory="$MNT/small" \
@@ -280,14 +326,20 @@ for rep in $(seq 1 "$REPEATS"); do
     say "repeat $rep/$REPEATS"
     # Cold: the fetch path. Its own mount, because emptying the cache
     # needs the daemon gone.
-    if wants cold-seq-1m || wants warm-disk-seq-1m || wants warm-mem-seq-1m || wants rand-4k-dio; then
+    if wants cold-seq-1m || wants warm-disk-seq-1m || wants warm-mem-seq-1m || wants rand-4k-dio \
+        || wants_size_lane; then
         empty_disk_cache
         mount_gate
         if wants cold-seq-1m; then
             lane_seq_buffered cold-seq-1m "$rep"
-        elif wants_warm_seq; then
+        elif wants_warm_seq || wants_size_lane; then
             warmup_seq # fetch seq1_0 into the disk cache this mount drops
         fi
+        # The read-size lanes, on what the pass above left (header).
+        for size in $SIZES; do
+            if wants "rand-$size-dio"; then lane_rand_dio "rand-$size-dio" "$rep" "$size"; fi
+            if wants "seq-$size-dio"; then lane_seq_dio "seq-$size-dio" "$rep" "$size"; fi
+        done
         fs_unmount
         # Warm disk, cold memory tier, cold kernel page cache (a fresh
         # FUSE connection has no cached pages for its inodes).

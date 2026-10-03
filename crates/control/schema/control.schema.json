@@ -2613,7 +2613,7 @@
           "type": "integer"
         },
         "zero_copy_reads": {
-          "description": "Reads this mount served zero-copy (0 until plan 38 Z4).",
+          "description": "Reads this mount served zero-copy: one `READ_FIXED` from a chunk\nfile into the reader's pages (plan 38 Z4b; only on `uring_zc`).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2752,7 +2752,7 @@
           "type": "array"
         },
         "zero_copy_reads_total": {
-          "description": "Reads served zero-copy by every session of this process\n(`constellation_fuse_zero_copy_reads_total`; 0 until plan 38 Z4).",
+          "description": "Reads served zero-copy by every session of this process\n(`constellation_fuse_zero_copy_reads_total`, plan 38 Z4b).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

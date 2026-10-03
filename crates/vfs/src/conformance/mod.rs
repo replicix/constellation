@@ -841,6 +841,8 @@ mod tests {
             open_unlinked: OpenUnlinked::SillyRename,
             abortable: false,
             passthrough: false,
+            zero_copy: false,
+            zero_copy_min_read: 0,
         }
     }
 

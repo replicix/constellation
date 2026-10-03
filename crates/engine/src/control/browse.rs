@@ -185,7 +185,10 @@ impl ControlVfs {
                 if data.is_empty() {
                     break;
                 }
-                let bytes = data.contiguous().into_owned();
+                let bytes = data
+                    .contiguous()
+                    .map_err(|e| vfs_err(path, e))?
+                    .into_owned();
                 off += bytes.len() as u64;
                 total += bytes.len() as u64;
                 if !sink(bytes) {

@@ -203,6 +203,7 @@ stressor, verdict, bogo-ops).
 target/release/harness run stress-ng-fs
 CONSTELLATION_FUSE_TRANSPORT=uring target/release/harness run stress-ng-fs
 sudo env HOME=/root PATH=$PATH CONSTELLATION_FUSE_TRANSPORT=uring \
+    CONSTELLATION_FUSE_URING_ZERO_COPY=auto \
     target/release/harness run stress-ng-fs      # as root: uring_zc, passthrough too
 target/release/harness run stress-ng-fs-nodes stress-ng-fs-faults  # known-bug repros
 # one stressor (or a few) through the whole harness, excluded ones included:
@@ -2657,6 +2658,77 @@ across a handover, plus the session's one-time probe registration
 (`backing_open` when the kernel refuses it). `CONSTELLATION_FUSE_PASSTHROUGH=0`
 turns it off for a whole run, read-only mounts included (the passthrough
 scenarios set `1` on their own clients, except the default-mode one).
+
+## FUSE zero-copy reads: the 7.3 lane (plan 38 Z4)
+
+A mount that asks for zero-copy queues (`CONSTELLATION_FUSE_URING_ZERO_COPY=auto`;
+opt-in since Z4b's measurements, `docs/reference/configuration.md`) and gets
+the ring with them (`uring_zc`: kernel 7.3+, whose `FUSE_INIT` offers
+io_uring buffer pools, and a daemon with `CAP_SYS_ADMIN` in the initial user
+namespace) marks read-only opens of files of at least
+`CONSTELLATION_FUSE_ZERO_COPY_MIN_READ` (512 KiB) for zero-copy, and answers
+each of their reads of at least that size that lies inside **one** verified
+chunk resident on disk with that chunk file: the
+ring's thread issues one `READ_FIXED` from it into the reader's pages, and
+`fuse.mounts[].zero_copy_reads` / `constellation_fuse_zero_copy_reads_total`
+count it. A read crossing a chunk boundary (or a smaller one, of a chunk
+not cached, or of a file with local writes pending) is
+answered from the memory cache as on `uring`, on the same mount. **Run this
+lane in the Rawhide guest** (or any host booted into 7.3+ with
+`fuse.enable_uring=Y`), as root:
+
+| Scenario | Asserts |
+|---|---|
+| `zero-copy-single-chunk` | on a `uring_zc` mount (anything else on this host is a failure with the reason logged), a 3-chunk + tail file read buffered: every data-carrying daemon read is zero-copy (all but at most two); `O_DIRECT` `pread`s in the first chunk, the middle of the third and the 12 345-byte tail are each exactly one daemon read and one zero-copy read; a one-page `O_DIRECT` read (below the scenario's threshold) is one daemon read and no zero-copy read; bytes exact |
+| `zero-copy-chunk-spanning-fallback` | one 8 KiB `O_DIRECT` read straddling the 1 MiB chunk boundary (`CHUNK - 4096`): one daemon read, zero-copy count unchanged, bytes exact; the same handle's next read inside chunk 1 is zero-copy again |
+| `zero-copy-eviction-while-inflight` | a reader issuing `O_DIRECT` zero-copy reads of one chunk (1 ms apart) while the 8 MiB cache is overfilled and pruned to nothing, twice: the chunk stays, `cache.open_pins` stays 1, every read byte-exact and counted; after the close the pin goes, a prune evicts the chunk and the file reads again |
+| `zero-copy-disabled-by-verify-always` | `--cache-verify always` on the same host: plain `uring` (no fallback recorded), passthrough off with reason `cache_verify_always`, buffered and `O_DIRECT` reads count no zero-copy read while `cache.memory_hits` moves |
+
+All four `require` `fuse-uring-zc` (`suites::FUSE_URING_ZERO_COPY`: the ring
+requirement, `CAP_SYS_ADMIN`, Linux >= 7.3) and SKIP loudly elsewhere
+(`requires CAP_SYS_ADMIN for io_uring zero-copy (run the harness as root)`,
+`requires Linux >= 7.3 for io_uring zero-copy (this is …)`). They mount with
+`CONSTELLATION_FUSE_TRANSPORT=uring`, `CONSTELLATION_FUSE_URING_ZERO_COPY=auto`,
+`CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=8192` and `--locks local`, whatever the
+harness's environment says; the memory tier does not matter (a chunk it
+holds is read zero-copy as well). A 7.3+ kernel that does not offer buffer
+pools makes them fail with the logged reason rather than SKIP: the
+requirement is checked before any mount, and the offer is only seen in
+`FUSE_INIT`, so a silent non-engagement is a visible failure.
+
+```bash
+sudo env HOME=/root PATH=$PATH TMPDIR=/var/tmp CONSTELLATION_HARNESS_DOCKER_PREFIX=me-root \
+    target/release/harness run zero-copy-single-chunk zero-copy-chunk-spanning-fallback \
+    zero-copy-eviction-while-inflight zero-copy-disabled-by-verify-always
+```
+
+In CI this is `nightly.yml`'s `zero-copy-7-3` job, on a self-hosted runner
+labelled `fuse-uring-zc` (enabled by the repository variable
+`FUSE_URING_ZC_RUNNER`): the four scenarios, the whole matrix as root with
+zero-copy queues asked for (the default transport policy), the read-cost gate
+on `dev-fuse`, `uring` (zero-copy off) and `uring_zc`, its read-size lanes
+(`tests/read-cpu-gate.sh --size-lanes`: `uring` against `uring_zc` with every
+read zero-copy, the threshold's measurement), and `make compliance-uring`,
+which asks for zero-copy queues and negotiates `uring_zc` in the privileged
+suite container (its first line says so; the job checks). The job runs it with
+`CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0`: pjdfstest's files and reads are far
+below the default 512 KiB threshold, so without it almost no open would be
+marked and the 8798 would say little about zero-copy reads. The job hands
+the workspace back to the runner user at the end (root wrote into it).
+
+Without a kernel: `crates/frontend-fuse/tests/wire_uring.rs`'s
+`a_zero_copy_read_is_one_read_fixed_and_the_same_bytes_on_every_leg` (an
+`Opened { zero_copy: true }` is answered with `FOPEN_IO_URING_ZERO_COPY`; a
+`ReadData::zero_copy` read is one `READ_FIXED` from the file on the in-memory
+7.3 kernel and counted, the same bytes by `pread` uncounted on `/dev/fuse`
+and plain `uring`), and the engine's `view::zero_copy_tests` (which opens are
+marked, the one-slice/verified/no-overlay rule, the threshold (a chunk
+held in memory is read zero-copy too), small files left unmarked, the chunk-spanning fallback,
+`--cache-verify always`, the pin held by an in-flight read past its handle's
+release, the four open chunk files per handle, a chunk dropped as corrupt
+and fetched again never served from the unlinked file); a frozen snapshot
+file's zero-copy reads are in `view::passthrough_tests`
+(`a_frozen_multi_chunk_file_reads_zero_copy`).
 
 ## Cross-node `flock`/`fcntl` (plan 30 M14)
 

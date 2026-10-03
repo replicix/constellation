@@ -99,6 +99,7 @@ const XATTR_VALUE_MAX: usize = 64 * 1024;
 impl Vfs for View {
     fn frontend_negotiated(&self, caps: &FrontendCaps) {
         self.set_passthrough_on(caps.passthrough);
+        self.set_zero_copy_on(caps.zero_copy, caps.zero_copy_min_read);
     }
 
     fn passthrough_probe(&self) -> Option<std::io::Result<std::fs::File>> {
@@ -880,7 +881,17 @@ impl Vfs for View {
                 // without its handle there (plan 38 Z3c).
                 let fh = self.open_handle(ino);
                 let backing = self.frozen_passthrough_backing(ino, flags, &node);
-                r.done(Ok(Opened { fh, backing }));
+                // Plan 38 §3(d), as for a live file below; nothing writes
+                // a frozen one.
+                let zero_copy = backing.is_none() && self.zero_copy_open_frozen(flags, &node);
+                if zero_copy {
+                    self.note_zero_copy_open(fh);
+                }
+                r.done(Ok(Opened {
+                    fh,
+                    backing,
+                    zero_copy,
+                }));
             } else {
                 r.done(err(Code::IsDir));
             }
@@ -904,9 +915,20 @@ impl Vfs for View {
                 // chunk file itself, and the pin that keeps it where the
                 // handle expects it is dropped in `release`.
                 let backing = self.passthrough_backing(ino, flags, &attr);
+                let fh = self.open_handle(ino);
+                // Plan 38 §3(d): a read-only open the frontend can serve
+                // zero-copy reads for is marked so; which of its reads are
+                // zero-copy is decided per read (`zero_copy`'s module doc).
+                // A passthrough open's reads never reach the daemon, so it
+                // is not marked.
+                let zero_copy = backing.is_none() && self.zero_copy_open(ino, flags, &attr);
+                if zero_copy {
+                    self.note_zero_copy_open(fh);
+                }
                 r.done(Ok(Opened {
-                    fh: self.open_handle(ino),
+                    fh,
                     backing,
+                    zero_copy,
                 }))
             }
             Ok(None) => r.done(err(Code::NotFound)),
@@ -968,9 +990,11 @@ impl Vfs for View {
             return;
         }
         let _inflight = self.inflight.enter(&[ino]);
+        // A handle marked zero-copy at its open (plan 38 §3(d)).
+        let zc = self.zero_copy_handle(fh);
         if View::is_synthetic(ino) {
-            match self.read_frozen(ino, off, len as u64) {
-                Ok(data) => r.done(Ok(ReadData::from_vec(data))),
+            match self.read_frozen(ino, zc.as_deref(), off, len as u64) {
+                Ok(data) => r.done(Ok(data)),
                 Err(error) => r.done(err(error)),
             }
             return;
@@ -981,13 +1005,15 @@ impl Vfs for View {
         }
         // A cold read defers to the completion pool (`io`'s module doc).
         let Some(view) = self.read_deferral() else {
-            match self.do_read(ino, off, len as u64) {
+            match self.do_read_zc(ino, zc.as_deref(), off, len as u64) {
                 Ok(data) => r.done(Ok(data)),
                 Err(e) => r.done(err(e)),
             }
             return;
         };
-        if let Some(result) = super::io::cold_probe::inline(|| self.do_read(ino, off, len as u64)) {
+        if let Some(result) =
+            super::io::cold_probe::inline(|| self.do_read_zc(ino, zc.as_deref(), off, len as u64))
+        {
             match result {
                 Ok(data) => r.done(Ok(data)),
                 Err(e) => r.done(err(e)),
@@ -1001,7 +1027,7 @@ impl Vfs for View {
         let (watch, inflight) = (_w, _inflight);
         crate::completion::CompletionPool::global().submit(move || {
             watch.adopt();
-            let result = view.do_read(ino, off, len as u64);
+            let result = view.do_read_zc(ino, zc.as_deref(), off, len as u64);
             match result {
                 Ok(data) => r.done(Ok(data)),
                 Err(e) => r.done(err(e)),
@@ -1119,6 +1145,7 @@ impl Vfs for View {
         // The description ends with this call however it answers (an
         // `enter!` refusal included): nothing addresses it any more.
         let _closed = self.handles.closing(fh);
+        self.drop_zero_copy(fh);
         let _w = self.watch.enter("release", ino);
         let ino = enter!(self, ino, r);
         if View::is_synthetic(ino) {

@@ -201,9 +201,28 @@ static FALLBACKS: Mutex<BTreeMap<(&'static str, &'static str, &'static str), u64
     Mutex::new(BTreeMap::new());
 
 /// Zero-copy reads served by every session of this process
-/// (`constellation_fuse_zero_copy_reads_total`). Nothing serves one before
-/// plan 38 Z4, so this stays 0 until then.
+/// (`constellation_fuse_zero_copy_reads_total`): reads the kernel handed
+/// over as registered pages and that were answered with one `READ_FIXED`
+/// from a chunk file (plan 38 Z4b).
 static ZERO_COPY_READS: AtomicU64 = AtomicU64::new(0);
+
+/// One session's zero-copy reads: shared by the session's filesystem,
+/// whose read replies count, and its [`SessionStats`], which report.
+#[derive(Debug, Clone, Default)]
+pub struct ZeroCopyCounter(Arc<AtomicU64>);
+
+impl ZeroCopyCounter {
+    /// Count one zero-copy read, on the session and in the process total.
+    pub fn count(&self) {
+        self.0.fetch_add(1, Relaxed);
+        ZERO_COPY_READS.fetch_add(1, Relaxed);
+    }
+
+    /// Reads counted so far.
+    pub fn get(&self) -> u64 {
+        self.0.load(Relaxed)
+    }
+}
 
 /// Count one fallback (plan 38 Z3b's passthrough downgrades, which happen
 /// per mount and per open rather than at the handshake: `from` is
@@ -294,7 +313,7 @@ pub struct SessionStats {
     transport: Transport,
     uring_queue_depth: u32,
     last_fallback: Option<TransportFallback>,
-    zero_copy_reads: AtomicU64,
+    zero_copy_reads: ZeroCopyCounter,
     /// The session's passthrough state (plan 38 Z3b), read live.
     passthrough: Option<Arc<PassthroughState>>,
     lock_wait_downgrades: LockWaitCounter,
@@ -358,7 +377,7 @@ impl SessionStats {
                 uring_queue_depth.clamp(1, u32::MAX as usize) as u32
             },
             last_fallback,
-            zero_copy_reads: AtomicU64::new(0),
+            zero_copy_reads: ZeroCopyCounter::default(),
             passthrough: None,
             lock_wait_downgrades: LockWaitCounter::default(),
         }
@@ -381,7 +400,13 @@ impl SessionStats {
 
     /// Zero-copy reads this session served.
     pub fn zero_copy_reads(&self) -> u64 {
-        self.zero_copy_reads.load(Relaxed)
+        self.zero_copy_reads.get()
+    }
+
+    /// Report the reads `counter` counts (the session's filesystem's).
+    pub(crate) fn with_zero_copy_reads(mut self, counter: ZeroCopyCounter) -> Self {
+        self.zero_copy_reads = counter;
+        self
     }
 
     /// Blocking lock requests this session's ring served as non-blocking
@@ -392,8 +417,7 @@ impl SessionStats {
 
     /// Count one zero-copy read (plan 38 Z4's read path).
     pub fn count_zero_copy_read(&self) {
-        self.zero_copy_reads.fetch_add(1, Relaxed);
-        ZERO_COPY_READS.fetch_add(1, Relaxed);
+        self.zero_copy_reads.count();
     }
 }
 

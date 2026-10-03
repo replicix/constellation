@@ -62,7 +62,7 @@ use crate::passthrough::{
     reason, PassthroughHandoff, PassthroughPolicy, PassthroughState, PassthroughWish,
     PASSTHROUGH_ENV,
 };
-use crate::stats::{Handshake, LockWaitCounter, SessionStats};
+use crate::stats::{Handshake, LockWaitCounter, SessionStats, ZeroCopyCounter};
 use constellation_types::Code;
 use constellation_vfs::{Blocking, Caller, FrontendCaps, Observer, OpCtx, OpKind, Vfs};
 use fuser::{NegotiatedInit, Transport};
@@ -158,7 +158,15 @@ pub const URING_QUEUE_DEPTH_ENV: &str = "CONSTELLATION_FUSE_URING_QUEUE_DEPTH";
 /// zero-copy queues ([`UringZeroCopy`], resolved with the rest of the
 /// transport knob by [`TransportConfig::resolve`]):
 ///
-/// - `auto` (the default): zero-copy queues wherever the kernel offers
+/// - `off` (the default): never; the ring stays `uring` with an entry
+///   buffer each. Measured on Constellation's read path (plan 38 Z4b,
+///   `docs/reference/configuration.md`), a zero-copy session costs more
+///   daemon CPU than plain `uring` on every warm lane — a read the memory
+///   tier or a small read answers with bytes is bounced into the reader's
+///   pages one copy more — and wins only cold sequential reads (about 2x
+///   the throughput at a third of the peak RSS). So it is opt-in, for
+///   cold-read-heavy mounts.
+/// - `auto`: zero-copy queues wherever the kernel offers
 ///   buffer pools (`FUSE_HAS_IO_URING_BUFPOOL`, 7.3+) and the daemon has
 ///   `CAP_SYS_ADMIN`, their buffer pools handed to the kernel unregistered:
 ///   a pool page becomes resident when a request first uses it and is never
@@ -169,26 +177,56 @@ pub const URING_QUEUE_DEPTH_ENV: &str = "CONSTELLATION_FUSE_URING_QUEUE_DEPTH";
 /// - `pinned`: the same, with the pools registered as an io_uring fixed
 ///   buffer: all of it resident and pinned from the mount on, charged to
 ///   `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`, in exchange for the kernel
-///   not importing a request's buffer per request. Opt-in.
-/// - `off`: never; the ring stays `uring` with an entry buffer each.
+///   not importing a request's buffer per request.
 ///
-/// Zero-copy only changes how replies reach the reader when a file is
-/// opened for it, which nothing in the adapter does yet (plan 38 Z4b);
-/// until then a `uring_zc` session serves exactly as a `uring` one, its
-/// requests' payloads travelling in pool buffers. An unknown value is an
-/// error, as for the other transport knobs.
+/// On a `uring_zc` session the view marks read-only opens for zero-copy
+/// (files of at least [`ZERO_COPY_MIN_READ_ENV`]) and answers a read of at
+/// least that size that lies in one verified chunk resident on disk
+/// with the chunk file, which the ring's thread
+/// hands to the kernel as one `READ_FIXED` into the reader's pages (plan
+/// 38 Z4b, `constellation_engine`'s `view::zero_copy`); every other read
+/// is answered with bytes as on `uring`. `--cache-verify always` turns it
+/// off ([`TransportConfig::with_cache_verify_always`]). An unknown value
+/// is an error, as for the other transport knobs.
 pub const URING_ZERO_COPY_ENV: &str = "CONSTELLATION_FUSE_URING_ZERO_COPY";
+
+/// Plan 38 Z4b: on a `uring_zc` session, the smallest read answered
+/// zero-copy, in bytes (`<n>`, `<n>k` or `<n>m`, binary units; `0`:
+/// every read), and the smallest file whose open is marked for it. A
+/// smaller read is answered with bytes: below the threshold the copy costs
+/// less than the kernel's extra trip for a zero-copy answer
+/// (`docs/reference/configuration.md` has the measured numbers). Default
+/// [`DEFAULT_ZERO_COPY_MIN_READ`]. An unparseable value
+/// is an error, as for the other transport knobs.
+pub const ZERO_COPY_MIN_READ_ENV: &str = "CONSTELLATION_FUSE_ZERO_COPY_MIN_READ";
+
+/// [`ZERO_COPY_MIN_READ_ENV`]'s default.
+pub const DEFAULT_ZERO_COPY_MIN_READ: u32 = 512 * 1024;
+
+/// `<n>`, `<n>k` or `<n>m` bytes (binary units), within `u32`.
+fn parse_min_read(raw: &str) -> Option<u32> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (digits, unit) = match raw.strip_suffix('k') {
+        Some(d) => (d, 1u64 << 10),
+        None => match raw.strip_suffix('m') {
+            Some(d) => (d, 1u64 << 20),
+            None => (raw.as_str(), 1),
+        },
+    };
+    let n = digits.trim().parse::<u64>().ok()?.checked_mul(unit)?;
+    u32::try_from(n).ok()
+}
 
 /// Plan 38 Z4: [`URING_ZERO_COPY_ENV`]'s three answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UringZeroCopy {
     /// Zero-copy queues where the kernel and the capability allow, their
     /// pools unregistered (resident as requests touch them).
-    #[default]
     Auto,
     /// The same, the pools registered (pinned, all resident from the start).
     Pinned,
-    /// No zero-copy queues.
+    /// No zero-copy queues (the default, [`URING_ZERO_COPY_ENV`]).
+    #[default]
     Off,
 }
 
@@ -256,6 +294,9 @@ pub struct TransportConfig {
     /// Plan 38 Z4: whether a mount that gets the ring tries zero-copy
     /// queues ([`URING_ZERO_COPY_ENV`]).
     pub uring_zero_copy: UringZeroCopy,
+    /// Plan 38 Z4b: the smallest zero-copy read
+    /// ([`ZERO_COPY_MIN_READ_ENV`]).
+    pub zero_copy_min_read: u32,
 }
 
 impl Default for TransportConfig {
@@ -265,6 +306,7 @@ impl Default for TransportConfig {
             uring_queue_depth: None,
             passthrough: PassthroughPolicy::platform_default(),
             uring_zero_copy: UringZeroCopy::default(),
+            zero_copy_min_read: DEFAULT_ZERO_COPY_MIN_READ,
         }
     }
 }
@@ -338,6 +380,12 @@ impl TransportConfig {
             })?,
             None => UringZeroCopy::default(),
         };
+        let zero_copy_min_read = match get(ZERO_COPY_MIN_READ_ENV) {
+            Some(raw) => parse_min_read(&raw).ok_or_else(|| {
+                format!("{ZERO_COPY_MIN_READ_ENV}={raw}: expected bytes, <n>k or <n>m")
+            })?,
+            None => DEFAULT_ZERO_COPY_MIN_READ,
+        };
         let passthrough = match get(PASSTHROUGH_ENV) {
             Some(raw) => match raw.to_ascii_lowercase().as_str() {
                 "1" | "on" | "true" | "yes" => PassthroughPolicy::On,
@@ -351,17 +399,22 @@ impl TransportConfig {
             uring_queue_depth: depth,
             passthrough,
             uring_zero_copy,
+            zero_copy_min_read,
         })
     }
 
     /// `--cache-verify always`: no passthrough, whatever
-    /// [`PASSTHROUGH_ENV`] says. Every byte served must be hashed on the
-    /// read that serves it, and a passthrough handle's reads never reach
-    /// the daemon (plan 38 §2.3). The engine refuses to offer a backing
-    /// file under `always` too; this keeps the mount from even asking the
-    /// kernel, and makes the reason the one `node.status` reports.
+    /// [`PASSTHROUGH_ENV`] says, and no zero-copy queues, whatever
+    /// [`URING_ZERO_COPY_ENV`] says. Every byte served must be hashed on
+    /// the read that serves it, and neither a passthrough handle's reads
+    /// nor a zero-copy read's bytes pass through the daemon (plan 38
+    /// §2.3). The engine refuses to offer either under `always` too; this
+    /// keeps the mount from even asking the kernel (no buffer pools are
+    /// mapped: the session is plain `uring`), and makes the reason the one
+    /// `node.status` reports.
     pub fn with_cache_verify_always(mut self) -> Self {
         self.passthrough = PassthroughPolicy::Off(reason::CACHE_VERIFY_ALWAYS);
+        self.uring_zero_copy = UringZeroCopy::Off;
         self
     }
 }
@@ -426,6 +479,8 @@ pub struct MountOptions {
     /// Plan 38 Z4: whether a ring mount tries zero-copy queues, from
     /// [`TransportConfig::uring_zero_copy`].
     uring_zero_copy: UringZeroCopy,
+    /// [`TransportConfig::zero_copy_min_read`].
+    zero_copy_min_read: u32,
 }
 
 impl MountOptions {
@@ -452,6 +507,7 @@ impl MountOptions {
             handover: false,
             passthrough: cfg.passthrough,
             uring_zero_copy: cfg.uring_zero_copy,
+            zero_copy_min_read: cfg.zero_copy_min_read,
         }
     }
 
@@ -954,6 +1010,7 @@ pub fn mount_source<V: Vfs>(
             let observer = fs.observer_slot();
             let entries = fs.kernel_entries().clone();
             let passthrough = fs.passthrough().clone();
+            let zero_copy_reads = fs.zero_copy_reads().clone();
             let mut config = config;
             config.io_uring = false;
             share_fd_without_a_device(&mut config);
@@ -965,6 +1022,7 @@ pub fn mount_source<V: Vfs>(
                 observer,
                 entries,
                 passthrough,
+                zero_copy_reads,
                 &caps,
                 opts,
                 plan,
@@ -1074,6 +1132,7 @@ fn mount_path<V: Vfs>(
     let observer = fs.observer_slot();
     let entries = fs.kernel_entries().clone();
     let passthrough = fs.passthrough().clone();
+    let zero_copy_reads = fs.zero_copy_reads().clone();
     if privileged() {
         let fd = mount_fd(mountpoint, kernel)?;
         let session = match fuser::Session::from_fd(fs, fd, config.acl, config.clone()) {
@@ -1090,6 +1149,7 @@ fn mount_path<V: Vfs>(
             observer,
             entries,
             passthrough,
+            zero_copy_reads,
             &declared,
             opts,
             plan,
@@ -1121,6 +1181,7 @@ fn mount_path<V: Vfs>(
         observer,
         entries,
         passthrough,
+        zero_copy_reads,
         &declared,
         opts,
         plan,
@@ -1172,6 +1233,7 @@ impl<V: Vfs> FuseSession<V> {
         observer: Arc<OnceLock<Observer>>,
         entries: Arc<KernelEntries>,
         passthrough: Arc<PassthroughState>,
+        zero_copy_reads: ZeroCopyCounter,
         caps: &FrontendCaps,
         opts: &MountOptions,
         plan: TransportPlan,
@@ -1203,18 +1265,21 @@ impl<V: Vfs> FuseSession<V> {
         };
         // Recorded (and a fallback counted) only once nothing here can fail
         // any more: a session that never serves took no fallback.
-        let stats = Arc::new(SessionStats::at_handshake(
-            Handshake {
-                asked: opts.asked,
-                pinned: opts.handover,
-                held_back_for_locks: plan.held_back_for_locks,
-                init: session.negotiated_init().as_ref(),
-                negotiated: transport,
-                uring_queue_depth: plan.depth,
-            },
-            lock_waits,
-            passthrough.clone(),
-        ));
+        let stats = Arc::new(
+            SessionStats::at_handshake(
+                Handshake {
+                    asked: opts.asked,
+                    pinned: opts.handover,
+                    held_back_for_locks: plan.held_back_for_locks,
+                    init: session.negotiated_init().as_ref(),
+                    negotiated: transport,
+                    uring_queue_depth: plan.depth,
+                },
+                lock_waits,
+                passthrough.clone(),
+            )
+            .with_zero_copy_reads(zero_copy_reads),
+        );
         let gate = NotifyGate::new(session.notifier(), entries.clone());
         // The backing-id ioctls go to the connection; a duplicate of the
         // session's descriptor is the same connection, usable from any
@@ -1228,14 +1293,24 @@ impl<V: Vfs> FuseSession<V> {
         // register a backing file for this process (a user namespace, a
         // cache on overlayfs): one probe, before anything is served, and
         // the view stops offering backing files if it failed.
+        let mut probe_failed = false;
         if passthrough.enabled() {
             if let Some(file) = vfs.passthrough_probe() {
-                if !passthrough.probe(file) {
-                    let mut caps = caps.clone();
-                    caps.passthrough = false;
-                    vfs.frontend_negotiated(&caps);
-                }
+                probe_failed = !passthrough.probe(file);
             }
+        }
+        // Plan 38 Z4b: zero-copy reads are a property of the transport,
+        // which is only settled now (the rings negotiate it after the
+        // `FUSE_INIT` reply, `fuser::RingSet::start`): the view marks
+        // opens for them, and answers reads with chunk files, only on a
+        // session whose every queue is a zero-copy one.
+        let zero_copy = transport == Transport::UringZeroCopy;
+        if probe_failed || zero_copy {
+            let mut caps = caps.clone();
+            caps.passthrough = passthrough.enabled();
+            caps.zero_copy = zero_copy;
+            caps.zero_copy_min_read = opts.zero_copy_min_read;
+            vfs.frontend_negotiated(&caps);
         }
         Ok(Self {
             session,
@@ -1299,6 +1374,7 @@ impl<V: Vfs> FuseSession<V> {
         // The kernel holds dentries the previous server handed out.
         entries.resumed();
         let passthrough = fs.passthrough().clone();
+        let zero_copy_reads = fs.zero_copy_reads().clone();
         // Plan 38 Z3b: no `FUSE_INIT` here, so what the first server
         // agreed decides, and the handed-over table says which inodes are
         // in which mode. Its backing ids are still registered: the kernel
@@ -1329,6 +1405,7 @@ impl<V: Vfs> FuseSession<V> {
             observer,
             entries,
             passthrough,
+            zero_copy_reads,
             &caps,
             opts,
             plan,
@@ -1932,13 +2009,17 @@ mod tests {
         // `--cache-verify always` forces it off, whatever the env said,
         // and says why.
         let cfg = TransportConfig::resolve_from(
-            var(&[(PASSTHROUGH_ENV, "1")]),
+            var(&[(PASSTHROUGH_ENV, "1"), (URING_ZERO_COPY_ENV, "pinned")]),
             None,
             None,
             TransportPolicy::default(),
         )
         .unwrap()
         .with_cache_verify_always();
+        // Plan 38 Z4b: and no zero-copy queues, whatever the env said:
+        // the session is plain `uring` (no pools mapped at all).
+        assert_eq!(cfg.uring_zero_copy, UringZeroCopy::Off);
+        assert_eq!(cfg.uring_zero_copy.fuser(), (false, false));
         let mut opts = MountOptions::new("p", 2, tuning, cfg);
         opts.read_only = true;
         assert_eq!(
@@ -2047,7 +2128,7 @@ mod tests {
     }
 
     /// Plan 38 Z4: `CONSTELLATION_FUSE_URING_ZERO_COPY` resolves with the
-    /// rest of the transport knob -- `auto` by default, an unknown value
+    /// rest of the transport knob -- `off` by default, an unknown value
     /// refused -- and reaches fuser as its two zero-copy switches.
     #[test]
     fn the_zero_copy_knob_reaches_fuser() {
@@ -2060,13 +2141,11 @@ mod tests {
             };
             TransportConfig::resolve_from(get, None, None, TransportPolicy::Uring)
         };
-        assert_eq!(
-            resolve(vec![]).unwrap().uring_zero_copy,
-            UringZeroCopy::Auto
-        );
+        // Opt-in (plan 38 Z4b's measurements, the knob's doc).
+        assert_eq!(resolve(vec![]).unwrap().uring_zero_copy, UringZeroCopy::Off);
         assert_eq!(
             TransportConfig::default().uring_zero_copy,
-            UringZeroCopy::Auto
+            UringZeroCopy::Off
         );
         assert!(
             !fuser::Config::default().io_uring_register_pool,
@@ -2092,6 +2171,49 @@ mod tests {
             let err =
                 resolve(vec![(URING_ZERO_COPY_ENV, old.to_owned())]).expect_err("an unknown value");
             assert!(err.contains(URING_ZERO_COPY_ENV), "{err}");
+        }
+    }
+
+    /// Plan 38 Z4b: the zero-copy threshold knob — bytes, `k`, `m`, `0`;
+    /// anything else (or past `u32`) is an error.
+    #[test]
+    fn the_zero_copy_min_read_knob() {
+        let resolve = |raw: Option<&str>| {
+            let raw = raw.map(str::to_owned);
+            TransportConfig::resolve_from(
+                move |key| {
+                    (key == ZERO_COPY_MIN_READ_ENV)
+                        .then(|| raw.clone())
+                        .flatten()
+                },
+                None,
+                None,
+                TransportPolicy::Uring,
+            )
+        };
+        assert_eq!(
+            resolve(None).unwrap().zero_copy_min_read,
+            DEFAULT_ZERO_COPY_MIN_READ
+        );
+        assert_eq!(
+            TransportConfig::default().zero_copy_min_read,
+            DEFAULT_ZERO_COPY_MIN_READ
+        );
+        for (raw, want) in [
+            ("0", 0),
+            ("4096", 4096),
+            (" 128K ", 128 << 10),
+            ("1m", 1 << 20),
+        ] {
+            assert_eq!(
+                resolve(Some(raw)).unwrap().zero_copy_min_read,
+                want,
+                "{raw}"
+            );
+        }
+        for bad in ["-1", "1g", "lots", "4096m"] {
+            let err = resolve(Some(bad)).expect_err("an unparseable value");
+            assert!(err.contains(ZERO_COPY_MIN_READ_ENV), "{err}");
         }
     }
 
@@ -2178,6 +2300,9 @@ mod tests {
             KernelTuning::for_workers(2),
             TransportConfig {
                 policy: TransportPolicy::Auto,
+                // Zero-copy queues where this host grants them (they are
+                // opt-in), so the transport test below covers `uring_zc`.
+                uring_zero_copy: UringZeroCopy::Auto,
                 ..TransportConfig::default()
             },
         )

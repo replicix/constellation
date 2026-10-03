@@ -67,6 +67,7 @@ use crate::reply::{
     OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply, XattrListReply,
     XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
 };
+use crate::stats::ZeroCopyCounter;
 use constellation_types::{Code, Rdev};
 use constellation_vfs::{
     Caller, CancelToken, Durability, FallocateMode, Fh, FrontendCaps, LockKind, LockOwner,
@@ -135,6 +136,9 @@ pub struct FuseFs<V: Vfs> {
     /// hands it one is recorded, so the notification sink writes entry
     /// invalidations only where they can drop something (`dentries`).
     entries: Arc<KernelEntries>,
+    /// Plan 38 Z4b: this session's zero-copy reads, counted by the read
+    /// replies, reported by the session's stats.
+    zero_copy_reads: ZeroCopyCounter,
 }
 
 impl<V: Vfs> FuseFs<V> {
@@ -150,6 +154,7 @@ impl<V: Vfs> FuseFs<V> {
             interrupts: Arc::default(),
             passthrough: PassthroughState::new(PassthroughWish::Off(reason::DISABLED)),
             entries: KernelEntries::new(),
+            zero_copy_reads: ZeroCopyCounter::default(),
         }
     }
 
@@ -178,6 +183,11 @@ impl<V: Vfs> FuseFs<V> {
     /// This session's passthrough state (`node.status`, the handover).
     pub fn passthrough(&self) -> &Arc<PassthroughState> {
         &self.passthrough
+    }
+
+    /// This session's zero-copy read count (its stats report it).
+    pub(crate) fn zero_copy_reads(&self) -> &ZeroCopyCounter {
+        &self.zero_copy_reads
     }
 
     pub(crate) fn deferred(&self) -> &Arc<Deferred> {
@@ -1230,7 +1240,11 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             size,
             // A cold read may be answered from the engine's completion
             // pool: counted until it is, for a detach to drain.
-            op.responder(self.deferred.track_bounded(ReadReply { reply, size })),
+            op.responder(self.deferred.track_bounded(ReadReply {
+                reply,
+                size,
+                zero_copy: self.zero_copy_reads.clone(),
+            })),
         );
     }
 

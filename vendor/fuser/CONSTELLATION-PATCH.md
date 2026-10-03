@@ -535,9 +535,15 @@ also tries **zero-copy queues** when the kernel offers buffer pools and the
 process has `CAP_SYS_ADMIN`; `Transport::UringZeroCopy` is what it then
 negotiates. A filesystem marks an open for zero-copy with
 `ReplyOpen::opened_zero_copy` and answers its reads with
-`ReplyData::read_fixed(fd, offset, len)`. Routing Constellation's reads to it
-is plan 38 Z4b; nothing in `crates/frontend-fuse` opens a file for zero-copy
-yet.
+`ReplyData::read_fixed(fd, offset, len)`. Constellation's reads are routed
+to it by plan 38 Z4b, outside this crate: the engine marks read-only opens
+(`Opened::zero_copy`, answered with `opened_zero_copy`) and answers a read
+inside one verified chunk with the chunk file, which `crates/frontend-fuse`'s
+`ReadReply` hands to `read_fixed` (`docs/plans/v1/PROGRESS.md`, "Plan 38 Z4").
+Constellation asks for zero-copy queues only when
+`CONSTELLATION_FUSE_URING_ZERO_COPY` is `auto` or `pinned` (opt-in since
+Z4b's measurements); this crate's own `Config::io_uring_zero_copy` default
+is unchanged.
 
 #### The ABI, re-verified against the running kernel (2026-10-02)
 
@@ -801,7 +807,7 @@ mapping itself (`Rss` of its VMA in `/proc/<pid>/smaps`) at the three points.
 |---|---|---|---|---|---|---|
 | user, `uring` | `uring` | 6.20 GB | 44 MB | 299 MB | 781 MB | -- |
 | root, zero-copy `off` | `uring` | 6.20 GB | 44-52 MB | 405-482 MB | 759-841 MB | -- |
-| root, `auto` (unpinned, the default) | `uring_zc` | 2.70 GB | 43-50 MB | 347-471 MB | 731-845 MB | 0 / 14-30 / **256 MB** |
+| root, `auto` (unpinned; Constellation's default until Z4b's fix round made zero-copy opt-in) | `uring_zc` | 2.70 GB | 43-50 MB | 347-471 MB | 731-845 MB | 0 / 14-30 / **256 MB** |
 | root, `pinned` | `uring_zc` | 2.70 GB | 299-303 MB | 643-713 MB | 732-862 MB | **256 / 256 / 256 MB** |
 | root, `auto`, depth 32 | `uring_zc` | 4.21 GB | 44-48 MB | 425-518 MB | 827-918 MB | not isolated (*) |
 | root, `pinned`, depth 32 | `uring_zc` | 4.21 GB | 1,071-1,074 MB | 1,355-1,469 MB | 1,518-1,628 MB | 1,024 / 1,024 / 1,024 MB |

@@ -485,7 +485,7 @@ fn the_ring_and_dev_fuse_answer_byte_for_byte_alike() {
     );
     // And they are the right bytes, not merely the same ones.
     assert_eq!(ring[3].body(), b"hello", "a one-segment read");
-    let joined = multi_segment().contiguous().into_owned();
+    let joined = multi_segment().contiguous().unwrap().into_owned();
     assert_eq!(
         ring[4].body(),
         &joined[..],
@@ -670,7 +670,11 @@ fn a_cold_read_answered_from_a_foreign_thread_completes() {
         assert_eq!(first.unique(), fast, "{leg:?}: the getattr is not held up");
         let second = k.recv();
         assert_eq!(second.unique(), slow);
-        assert_eq!(second.body(), &multi_segment().contiguous()[..], "{leg:?}");
+        assert_eq!(
+            second.body(),
+            &multi_segment().contiguous().unwrap()[..],
+            "{leg:?}"
+        );
         assert!(mock.wait_for_completions(2, Duration::from_secs(5)));
         let read = mock
             .completions()
@@ -812,4 +816,57 @@ fn blocking_lock_waits_never_take_a_queues_last_entry() {
     assert_eq!(answer(&mut k, done, "the last unlock").error(), 0);
     assert_eq!(downgrades(), 1, "a waiter that waited is no downgrade");
     k.finish();
+}
+
+/// Plan 38 Z4b: an open the view marked zero-copy is answered with
+/// `FOPEN_IO_URING_ZERO_COPY` on every leg (the kernel ignores the flag
+/// where no zero-copy queue serves it), and a read the view answered with
+/// a range of a file reaches the reader as exactly those bytes on every
+/// leg: by one `READ_FIXED` into the registered pages, counted as a
+/// zero-copy read, on the zero-copy leg; by fuser's `pread(2)` into the
+/// reply buffer, uncounted, on the others.
+#[test]
+fn a_zero_copy_read_is_one_read_fixed_and_the_same_bytes_on_every_leg() {
+    const FOPEN_IO_URING_ZERO_COPY: u32 = 1 << 8;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chunk");
+    std::fs::write(&path, b"0123456789abcdef").unwrap();
+    for leg in [Leg::DevFuse, Leg::Ring, Leg::RingZeroCopy] {
+        let source = Arc::new(constellation_vfs::ZeroCopySource::new(
+            std::fs::File::open(&path).unwrap(),
+            (),
+        ));
+        let mock = MockVfs::new();
+        mock.always_open(Script::ok(Opened {
+            fh: Fh(3),
+            backing: None,
+            zero_copy: true,
+        }));
+        mock.always_release(Script::ok(()));
+        mock.always_flush(Script::ok(()));
+        mock.always_read(Script::ok(ReadData::zero_copy(source, 3, 5)));
+        let before = constellation_frontend_fuse::stats::zero_copy_reads_total();
+        let mut k = Kernel::start(&mock, leg);
+        let open = k.call(op::OPEN, 9, &Body::default().i32(libc::O_RDONLY).u32(0));
+        let open_flags = u32::from_le_bytes(open.body()[8..12].try_into().unwrap());
+        assert_ne!(
+            open_flags & FOPEN_IO_URING_ZERO_COPY,
+            0,
+            "{leg:?}: the open is marked zero-copy"
+        );
+        let read = k.call(op::READ, 9, &read_body(3, 0, 4096));
+        assert_eq!(read.body(), b"34567", "{leg:?}: the file's bytes");
+        let counted = constellation_frontend_fuse::stats::zero_copy_reads_total() - before;
+        if leg == Leg::RingZeroCopy {
+            assert_eq!(
+                k.ring.as_ref().unwrap().read_fixed_served(),
+                1,
+                "one READ_FIXED, from the file"
+            );
+            assert_eq!(counted, 1, "a zero-copy read is counted");
+        } else {
+            assert_eq!(counted, 0, "{leg:?}: nothing was zero-copied");
+        }
+        k.finish();
+    }
 }

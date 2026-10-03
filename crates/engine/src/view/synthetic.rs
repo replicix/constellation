@@ -386,7 +386,13 @@ impl View {
         Ok(manifest)
     }
 
-    pub(crate) fn read_frozen(&self, ino: Ino, offset: u64, size: u64) -> Result<Vec<u8>, Code> {
+    pub(super) fn read_frozen(
+        &self,
+        ino: Ino,
+        zc: Option<&super::zero_copy::ZeroCopyHandle>,
+        offset: u64,
+        size: u64,
+    ) -> Result<ReadData, Code> {
         let node = self.synthetic_node(ino).ok_or(Code::Stale)?;
         if !self.synthetic_active(&node) {
             return Err(Code::Stale);
@@ -413,9 +419,28 @@ impl View {
             "frozen read: manifest loaded"
         );
         if offset >= manifest.file_len {
-            return Ok(Vec::new());
+            return Ok(ReadData::default());
         }
         let len = size.min(manifest.file_len - offset);
+        // Plan 38 §3(d): one slice of one verified, resident chunk goes to
+        // the frontend's kernel as the chunk file, as for a live file
+        // (`zero_copy`'s module doc); a frozen file has nothing to overlay.
+        if let Some(zc) = zc {
+            let mut slices = manifest.layout.slices(offset, len);
+            if let (Some(slice), None) = (slices.next(), slices.next()) {
+                if let Some(data) = self.zero_copy_read(
+                    zc,
+                    ino,
+                    &manifest,
+                    &hashes,
+                    manifest.layout.chunk_size,
+                    manifest.file_len,
+                    &slice,
+                ) {
+                    return Ok(data);
+                }
+            }
+        }
         let mut out = Vec::with_capacity(len as usize);
         for slice in manifest.layout.slices(offset, len) {
             let chunk = self
@@ -435,6 +460,6 @@ impl View {
             }
             out.extend_from_slice(&chunk[start..end]);
         }
-        Ok(out)
+        Ok(ReadData::from_vec(out))
     }
 }
