@@ -233,6 +233,68 @@ pub enum MutateOutcome {
     },
 }
 
+/// What a forwarded op's transaction waits for from the node that
+/// forwarded it, as the sequencer answering it sees at reply time (chunk
+/// close-stall-metered). A `--write-mode back` close forwards its
+/// manifest with chunks still pending on the forwarder; the sequencer
+/// enrolls them (`Meta::enroll_remote_chunks`) and ships — or, as a
+/// delegate, streams — the close only once the forwarder reports them up,
+/// and with it every later transaction that depends on it (a `chmod` or a
+/// `rename` of the same file: `Meta::remote_blockers`). A forwarder that
+/// must see its op's transaction (its reply came on state it has not
+/// applied, or the acknowledgement waits for it) needs those chunks up,
+/// and with its uploads held on a metered network nothing else would put
+/// them there. Each variant but `None` names the inodes whose pending
+/// chunks it is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OwnChunks {
+    /// Nothing of the forwarder's is pending in what the transaction
+    /// waits for (or the outcome carries none, or the hold is not an
+    /// acknowledgement's).
+    #[default]
+    None,
+    /// It waits for the forwarder's pending chunks of these inodes, but
+    /// the sequencer's pre-S3 stream carries it to the forwarder past
+    /// them (a backed root, or a continuation epoch's hold owner, that it
+    /// subscribes to, with nothing else's pending chunk in the way): the
+    /// upload is not on the path.
+    Streamed(Vec<Ino>),
+    /// It waits for the forwarder's pending chunks of these inodes and
+    /// nothing brings it back to the forwarder, or acknowledges it, until
+    /// they are in S3: upload them now.
+    Upload(Vec<Ino>),
+}
+
+impl OwnChunks {
+    /// The P2P wire form (`constellation_net::Payload::MutateReply`'s
+    /// `own_chunks` and `own_inos`).
+    pub fn to_wire(&self) -> (u8, Vec<Ino>) {
+        match self {
+            OwnChunks::None => (0, Vec::new()),
+            OwnChunks::Streamed(inos) => (1, inos.clone()),
+            OwnChunks::Upload(inos) => (2, inos.clone()),
+        }
+    }
+
+    /// An unknown value reads as [`OwnChunks::None`]: the forwarder then
+    /// relies on its rounds, as before the signal.
+    pub fn from_wire(v: u8, inos: Vec<Ino>) -> Self {
+        match v {
+            1 => OwnChunks::Streamed(inos),
+            2 => OwnChunks::Upload(inos),
+            _ => OwnChunks::None,
+        }
+    }
+
+    /// The inodes whose pending chunks are named (empty for `None`).
+    pub fn inos(&self) -> &[Ino] {
+        match self {
+            OwnChunks::None => &[],
+            OwnChunks::Streamed(inos) | OwnChunks::Upload(inos) => inos,
+        }
+    }
+}
+
 impl MutateOutcome {
     pub fn to_postcard(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_allocvec(self)

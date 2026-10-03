@@ -420,7 +420,7 @@ impl constellation_net::PeerService for P2pBridge {
             let (reply, receive) = tokio::sync::oneshot::channel();
             let started = std::time::Instant::now();
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate request queued");
-            let (outcome, base, position, gen) = if self
+            let (outcome, base, position, gen, own_chunks) = if self
                 .nudge
                 .send(sync::SyncRequest::Mutate {
                     requester,
@@ -438,6 +438,7 @@ impl constellation_net::PeerService for P2pBridge {
                     None,
                     constellation_meta::Position::ZERO,
                     0,
+                    constellation_meta::OwnChunks::None,
                 ))
             } else {
                 (
@@ -445,6 +446,7 @@ impl constellation_net::PeerService for P2pBridge {
                     None,
                     constellation_meta::Position::ZERO,
                     0,
+                    constellation_meta::OwnChunks::None,
                 )
             };
             tracing::trace!(target: "constellation::fwd", rid = rid.seq, rnode = rid.node, "mutate reply taken");
@@ -453,6 +455,7 @@ impl constellation_net::PeerService for P2pBridge {
                 service_us = started.elapsed().as_micros() as u64,
                 "forwarded mutate served"
             );
+            let own_wire = own_chunks.to_wire();
             constellation_net::Payload::MutateReply {
                 req_id,
                 outcome: outcome.to_postcard().unwrap_or_default(),
@@ -461,6 +464,8 @@ impl constellation_net::PeerService for P2pBridge {
                 position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
                 position_streams: position.streams_wire(),
                 gen,
+                own_chunks: own_wire.0,
+                own_inos: own_wire.1,
             }
         })
     }

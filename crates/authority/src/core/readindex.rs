@@ -76,7 +76,9 @@ use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
 use crate::ids::{Ms, NodeId, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
-use constellation_meta::{HeldDelegation, MutateOp, MutateOutcome, Position, RecallNeed, Rid};
+use constellation_meta::{
+    HeldDelegation, MutateOp, MutateOutcome, OwnChunks, Position, RecallNeed, Rid,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A strict read waiting for its answer.
@@ -583,6 +585,7 @@ impl Core {
                             base: None,
                             position: Position::ZERO,
                             gen: 0,
+                            own_chunks: OwnChunks::None,
                         },
                     });
                 }
@@ -617,6 +620,7 @@ impl Core {
                             base: None,
                             position: Position::ZERO,
                             gen: 0,
+                            own_chunks: OwnChunks::None,
                         },
                     });
                 }
@@ -903,6 +907,7 @@ impl Core {
                                 base: None,
                                 position: Position::ZERO,
                                 gen: 0,
+                                own_chunks: OwnChunks::None,
                             },
                         });
                     }
@@ -1056,7 +1061,91 @@ impl Core {
         true
     }
 
-    pub(crate) fn on_held_reply_timer(&mut self, id: u64, out: &mut Vec<Action>) {
+    /// Chunk close-stall-metered: `rid`'s reply was just parked for its
+    /// acknowledgement's durability, and that waits for chunks only its
+    /// requester can upload (`OwnChunks::Upload`): say so now, as a `Held`
+    /// the requester re-sends after `held_retry_ms` (re-attaching), rather
+    /// than after the hold interval — under `ack=s3` every forwarded `back`
+    /// close would wait that long before its upload began.
+    pub(crate) fn held_for_upload(
+        &mut self,
+        rid: Rid,
+        own_chunks: OwnChunks,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(&id) = self.rd.parked_rids.get(&rid) else {
+            return;
+        };
+        let Some(Parked {
+            what:
+                ParkedWhat::Reply {
+                    to,
+                    req,
+                    held_timer,
+                    ..
+                },
+            ..
+        }) = self.rd.parked.get_mut(&id)
+        else {
+            return;
+        };
+        let Some(req) = req.take() else {
+            return;
+        };
+        let to = *to;
+        let old = held_timer.take();
+        if let Some(old) = old {
+            self.cancel_timer(old, out);
+        }
+        self.stats.held_replies += 1;
+        self.stats.held_for_upload += 1;
+        out.push(Action::Send {
+            to,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::Held {
+                    retry_ms: self.cfg.held_retry_ms,
+                },
+                base: None,
+                position: Position::ZERO,
+                gen: 0,
+                own_chunks,
+            },
+        });
+    }
+
+    pub(crate) fn on_held_reply_timer(
+        &mut self,
+        id: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        // Chunk close-stall-metered: an acknowledgement's wait (durability
+        // on the root, the stream's on a delegate) that needs its
+        // requester's own chunks says so; a recall's or a parked
+        // execution's never does (`OwnChunks`).
+        let own_chunks = match self.rd.parked.get(&id) {
+            Some(Parked {
+                what:
+                    ParkedWhat::Reply {
+                        to,
+                        rid,
+                        outcome,
+                        position,
+                        gen,
+                        ..
+                    },
+                durable,
+                stream_need,
+                ..
+            }) if durable.is_some() || stream_need.is_some() => {
+                match self.own_chunks_for(*to, *rid, outcome, (*gen, position), replica) {
+                    upload @ OwnChunks::Upload(_) => upload,
+                    _ => OwnChunks::None,
+                }
+            }
+            _ => OwnChunks::None,
+        };
         let (to, req, held_timer, durable) = match self.rd.parked.get_mut(&id) {
             Some(Parked {
                 what:
@@ -1101,6 +1190,7 @@ impl Core {
                     base: None,
                     position: Position::ZERO,
                     gen: 0,
+                    own_chunks,
                 },
             });
         }
@@ -1314,6 +1404,8 @@ impl Core {
                         self.cancel_timer(t, out);
                     }
                     if let Some(req) = req {
+                        let own_chunks =
+                            self.own_chunks_for(to, rid, &outcome, (gen, &position), replica);
                         out.push(Action::Send {
                             to,
                             msg: PeerMsg::MutateReply {
@@ -1322,6 +1414,7 @@ impl Core {
                                 base,
                                 position,
                                 gen,
+                                own_chunks,
                             },
                         });
                     }

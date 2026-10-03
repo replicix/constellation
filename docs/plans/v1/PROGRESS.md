@@ -35996,3 +35996,403 @@ see `SQLITE_BUSY`/`EAGAIN` for up to 22 s after every restart.
 | `harness run transport-lock-wait-budget` ×5 (release, `--features io-uring` binaries) | 5/5 PASSED (failed 2/2 before the fix) |
 | `sqlite-two-nodes flock-cross-node sqlite-first-touch-latency lock-holder-partitioned lock-failover lock-holder-killed-contention lock-fence-at-close lock-latency lock-grant-dead-generation` | all PASSED |
 | `git-under-flock` ×2, `git-under-flock-rounds`, `git-under-flock-gc` | all PASSED |
+
+## Fix: a metered non-owner's `back` close stalled 120 s and ended in doubt (`close-stall-metered`)
+
+Chunk 39b found this on real S3 (AWS and OVH), and floci never showed it.
+Node A, which does not hold the lease (B does), writes a file under
+`--write-mode back` while its uploads are held for a metered network
+(`CONSTELLATION_PROFILE_UPLOADS=unmetered-only`, plan 31 C8), then calls
+`close()`. The close blocked for the whole 120 s forward deadline and was
+answered in doubt (`EIO`). It did not happen when A waited about 15 s
+before closing.
+
+### The wait cycle
+
+1. A's close forwards `SetManifest`. The manifest names chunks still
+   pending on A (`meta::store::remote`). B enrols them as remote-pending
+   rows of its own, executes the op, and replies `Accepted`.
+2. The reply's `base` is one A has not applied. Either B's unshipped
+   journal touched the file (`None`: B's create, or A's own
+   `O_TRUNC` setattr just before), or it names a segment A has not tailed
+   yet. A cannot install the shadow ahead of records it follows, so the
+   op goes to `AwaitingLog` and waits for its own record to arrive.
+3. Two things can bring that record to A:
+   - B's ship: plan 30 §M7's ship plan defers the record until the remote
+     rows are acknowledged, that is, until A reports the chunks are up.
+   - B's pre-S3 stream-ahead, which goes to the forwarder past its own
+     pending chunks (`releasable_prefix(.., Some(n))`). B streams ahead
+     only rows a backup holds (`AckPolicy::Backup`, or an epoch hold).
+     Under `Local` it streams nothing. `Local` covers a tenure's first
+     seconds, before the backup is brought up (about 5 s in the
+     harness), and every tenure without a peer within the RTT budget, or
+     with `CONSTELLATION_BACKUPS=0`.
+4. A's chunks go up only with A's sync rounds, through the background
+   pass, which the upload hold skips. Nothing else uploads them.
+
+So A waits for B's ship, B's ship waits for A's upload, and A's upload
+waits for an unmetered network. The forward deadline ends the wait at
+120 s and the op goes in doubt. Waiting 15 s helped because by then B
+had a backup and its stream answered (and B's create had shipped and been
+applied).
+
+Under `ack=s3` the same cycle appears in another phase. B parks the
+acknowledgement until the record lands in S3 and answers `Held` every
+`recall_hold_ms` (`Forwarded`/`Backoff` loop). The record waits for the
+held chunks in the same way: 120 s, then in doubt.
+
+With a backed holder there is no stall: closes took 7–18 ms, answered
+from the stream, and every chunk stayed held. Without the hold, the
+background round eventually breaks the cycle, so a close in this race
+already cost an upload.
+
+### Fix
+
+When the requester's close cannot finish until its chunks are up, it
+uploads them. This is the same exemption plan 31 C8 gives every explicit
+durability need (`fsync`, barriers, handoff, unmount): the close is
+blocked on exactly these bytes, and holding them back does not save the
+upload, it only defers it past the deadline.
+
+The first round guessed when that was: a 1 s timer on the requester, and
+an upload with every forward under `ack=s3`. The review round replaced the
+guess with the sequencer's answer, which is exact at reply time.
+
+- The sequencer says what the records wait for (`OwnChunks`, in
+  `constellation_meta`; `Core::own_chunks_for`, `core/holder.rs`). Its
+  replica knows exactly which chunks of the records the forwarder named
+  as pending and has not reported up (`store/remote.rs`: a pending row
+  marked remote from that node; since review round 2 also through the
+  op's dependencies, `Meta::remote_blockers`, below). Nothing
+  of the forwarder's: `None`. Otherwise `Streamed` when its pre-S3 stream
+  carries the forwarder's own transaction past those chunks: a root with
+  committed backups (`Backup`), or a continuation epoch's hold owner, and
+  the forwarder subscribes to its stream. In every other case, `Upload`:
+  `Local` with no backup, `S3`, a non-subscriber, and a delegate's
+  execution (a delegate streams and backs up nothing naming a pending
+  chunk).
+- Where it says so: `PeerMsg::MutateReply::own_chunks`, on `Accepted`, and
+  on `Held` only while the acknowledgement itself waits for durability (a
+  root's `durable`, a delegate's stream need) and that needs the upload.
+  A recall's, a lost dependency's, a delegate re-route's or a parked
+  execution's `Held` carries `None`. A reply parked for durability that
+  needs the upload is answered `Held { held_retry_ms }` with `Upload` at
+  once (`Core::held_for_upload`, `Stats::held_for_upload`). Otherwise
+  under `ack=s3` the requester would hear it only after `recall_hold_ms`.
+  The retry re-attaches to the parked reply.
+- The requester (`Core::await_own_records`, `core/client.rs`): on
+  `Upload` (`AwaitingLog`, or `Held`) it emits `Action::UploadAwaited`
+  once, at once. On `Streamed` (`AwaitingLog`) it only arms the safety
+  timer, `CONSTELLATION_OWN_RECORD_WAIT_MS`, now 10 s by default. The
+  timer covers a stream that stalls after the reply (a backup lost); it is
+  long because a backed stream answers in milliseconds and a short grace
+  would upload on the metered network whenever a loaded host is slow.
+  After an upload the timer repeats it every grace while the op exists,
+  whatever its phase (a new holder ships the same records only once the
+  same chunks are up). The timer is kept in `ClientOp::own_record_timer`
+  and cancelled by `finish` and `finish_in_doubt`. `0` turns all of it
+  off, which brings the stall back (used to show the fix is load-bearing).
+- Driver (`authority_driver.rs`): `UploadAwaited` runs the inode's upload
+  pass (`Uploader::run(Some(ino))`, which the hold does not stop, as for an
+  `fsync`'s drain), and skips it when `pending_uploads_for_ino` is empty.
+  Its durable reports let the sequencer ack the rows and ship.
+- Wire: `constellation_net::Payload::MutateReply::own_chunks` (`u8`, no
+  serde default) and the ALPN bumped to `constellation/2`: nodes of the
+  two versions do not talk P2P (no compatibility, per the maintainer
+  rule).
+- Status: `ack.own_record_uploads`, `ack.held_for_upload` (schema
+  re-blessed). Docs: `configuration.md`, `durability-and-failover.md`
+  (`back` on metered networks), `TESTING.md`.
+
+Not done: B streaming ahead under `Local`. Under `Local` no backup holds
+the rows, so a subscriber's installed speculation could not be confirmed
+by a takeover in the same order, which is why the stream is gated on
+backups. Not done either: skipping the hold for every non-owner `back`
+close. That would upload on a metered network even when the stream
+answers, which is the common case once a backup is up.
+
+What the sequencer cannot know at reply time: a backup lost (or
+committed) afterwards. A `Streamed` answer then leaves the safety timer to
+upload. The reverse direction (`Upload`, then a backup committed) only
+costs an upload the stream would have saved.
+
+### Review round (also in this chunk)
+
+- Must-fix: `fsync-interrupt` and `fsync-hard-outage` failed as root
+  only. `adopt_root` skips the root-owner `Setattr` for euid 0, so
+  nothing took the lease before the scenario cut S3, and the file's
+  create waited out its 120 s client deadline (`EIO`) before any
+  `fsync`. Each fsync scenario (`fsync-soft-timeout` too) now creates its
+  file and waits for `lease.held` before the cut (`fsync.rs`,
+  `create_holding`). An audit of every other S3 cut in the harness found
+  the same dependence in `unmount-drain` and `writeback-backpressure`,
+  fixed the same way (`hold_lease_before_cut`). `fio-blips` and
+  `stress-ng-flap` cut for under 2 s while the first create may still
+  need the lease. As root that only delays them (the acquire retry backs
+  off to 2 s), so they are left as they are. That a real root mount whose
+  first mutation comes during an outage waits 120 s and fails `EIO` under
+  `--fsync-mode s3` is plan 39's behaviour: no lease can be had without
+  S3.
+- `Held` replies of every kind used to arm the timer (should-fix 1): now
+  only an acknowledgement's `Upload`. A forward with nothing pending used
+  to upload under `ack=s3` (should-fix 2): now nothing (`None`, and the
+  driver's empty check). The timer was neither tracked nor cancelled
+  (should-fix 3): fixed. Nits: stats doc, `TimerKind::OwnRecordWait` doc,
+  phase comment.
+
+### Tests
+
+- `core::tests::own_chunks` (authority), eight tests:
+  `an_unbacked_holder_asks_for_the_upload_and_the_forwarder_uploads_at_once`
+  (flag ⇒ immediate upload; the timer repeats it),
+  `an_s3_acknowledgement_waiting_for_the_forwarders_chunk_is_held_for_its_upload_at_once`
+  (immediate `Held{Upload}`, re-attach, a later `Held` uploads nothing
+  more), `a_recall_hold_uploads_nothing`,
+  `the_holder_says_streamed_only_where_its_stream_carries_the_record`
+  (`Local`/`Backup`/`S3`, a delegate, a non-subscriber, other nodes,
+  reported chunks),
+  `a_streamed_answer_keeps_the_chunks_held_and_finishing_cancels_the_timer`,
+  `a_stalled_stream_uploads_after_the_grace`,
+  `a_forward_with_nothing_pending_uploads_nothing` (both `ack` settings),
+  `a_zero_wait_turns_the_mechanism_off`. With the requester's `Upload`
+  arm removed, 2 fail. With the holder answering `None`, 4 fail (checked).
+- `meta` `store::remote::tests::records_wait_for_the_forwarders_upload_only_while_its_rows_are_pending`.
+- Harness `writeback-close-metered-nonowner` (`scenarios/lifecycle.rs`).
+  A 60 ms S3 latency toxic; A is metered `unmetered-only` under `back`;
+  four times, B creates `d/f<i>` and A overwrites and closes it at once.
+  Three fresh filesystems: B unbacked (`CONSTELLATION_BACKUPS=0`), B
+  backed by A, and `ack=s3`, all on the default settings (the first
+  round's 10 s override for `Backed` is gone). Under `ack=s3`, B's
+  `held_for_upload` must rise.
+
+| Run (floci) | Unbacked | Backed | `ack=s3` |
+|---|---|---|---|
+| mechanism off (`CONSTELLATION_OWN_RECORD_WAIT_MS=0`) | **fails**: close 120.2 s, in doubt (`Forwarded->1`, `AwaitingLog`) | — | — |
+| round 1 (1 s timer) | slowest 1.64 s, 4 uploads, 4 PUTs | slowest 18 ms (10 s override) | slowest 0.63 s, 8 uploads for 4 files |
+| review round | slowest 0.62 s, 4 uploads, 4 PUTs | slowest 19 ms, 0 uploads, 0 PUTs, 4 pending, 8 streamed | slowest 0.64 s, 4 uploads, B held 4 for upload |
+
+- Real S3 uses the throwaway driver outside the repo: the same three
+  modes on two local daemons, no toxic, a unique `csm-<tag>-<ts>`
+  sub-prefix of `$S3_TEST_URL`, purged afterwards with 0 objects left
+  (74 objects on each target in the review round).
+
+| Target | Mechanism off (unbacked, round 1) | Unbacked | Backed | `ack=s3` |
+|---|---|---|---|---|
+| AWS us-west-2, round 1 | **120.1, 124.0, 124.0, 124.0 s**, in doubt | 1.10–1.23 s | 9–18 ms, 0 uploads, 4 pending | 106–156 ms |
+| AWS us-west-2, review round | — | 93–133 ms, 4 uploads | 7–18 ms, 0 uploads, 4 pending | 85–162 ms, 4 uploads |
+| OVH Milan, round 1 | **120.4, 124.2, 124.2, 124.2 s**, in doubt | 2.29–2.69 s | 8–18 ms | 1.28–1.72 s |
+| OVH Milan, review round | — | 0.95–1.48 s, 4 uploads | 7–18 ms, 0 uploads, 4 pending | 1.31–2.04 s, 4 uploads |
+
+In every fixed run A read its writes at once, and both nodes read every
+file byte-exact after unmetering. A stalled backed stream was not
+simulated on real S3. The unit test covers it.
+
+### Gates (review round, 2026-10-02, kernel 7.3.0-rc4)
+
+- `cargo fmt --all -- --check` clean. `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test -p` for all 19 packages, 0 failed: authority 165 + 4 + 107
+  (sim, 11 ignored), engine 515 + 1, meta (lib 210), store-s3 227,
+  control 135, net 113 + 1 + 2 + 3, harness 49 + 2 + 1, csi 78 + 1,
+  constellation 44 + 3, frontend-fuse 27 + 41, fs-core 71, mtree
+  49 + 6 + 15 + 1, vfs 47 + 11, chaos 37, platform 35, types 18 + 8,
+  upload-concurrency 11, uploadbench 4. model in `--release`: 138 passed.
+- `tests/smoke.sh` passed. `cargo build --release --workspace` ok.
+- Harness (`CONSTELLATION_HARNESS_DOCKER_PREFIX=csm2`): the brief's
+  filter, 67 scenarios, run twice in ten slices: **65 PASSED, 2 SKIPPED,
+  0 FAILED both times**. `transport-enomem-ring` was skipped because the
+  plain release build had no `io-uring` feature on that base (before
+  plan 38 Z2c; on the rebased base it runs: see review round 2), and
+  `passthrough-handover` because it needs root. As root it passed.
+  `snapshot-lifecycle`, `commit-strips-pending-upload`,
+  `p2p-partition-one-node` and `visibility-after-burst`, which flaked in
+  the reviewer's loaded run, passed both times.
+- As root (`sudo env PATH=$PATH CONSTELLATION_HARNESS_DOCKER_PREFIX=csm2r`):
+  `fsync-interrupt` and `fsync-hard-outage` passed 3/3 each, and
+  `fsync-soft-timeout`, `unmount-drain` and `writeback-backpressure`
+  passed. Unprivileged, `fsync-interrupt` and `fsync-hard-outage` passed
+  3/3 each, and the other three passed.
+
+### Review round 2 (coordinator rebase onto main `b458669`)
+
+- **Must-fix 1, dependent ops.** The same cycle remained through an op
+  that depends on a held close without naming its chunks. Reviewer's
+  repro: A creates `d/h`, waits, writes it without `O_TRUNC` and closes
+  (1.4 ms: the base was applied, the chunk stays held), then `chmod
+  d/h`, which took **120 s, then `EIO`**. Plan 30 §M4's ship plan defers
+  the setattr with the close, because it touches the inode's key. Its
+  reply's base is not applied on A (`AwaitingLog`), and B answered `None`
+  because the setattr's own records name no chunk. Now:
+  - The sequencer decides from the op's transaction and its
+    dependencies: `Meta::remote_blockers(rid, gen, records, node)`
+    (`store/remote.rs`). It returns the inodes whose chunks `node`
+    forwarded as pending that the transaction cannot leave this node
+    before. As root, `store::held::deferral_blame` walks the ship plan's
+    deferral (same seeds, key sets, observed keys and opaque rule as
+    `plan`), carrying which of the node's inodes caused each deferred
+    key. As a delegate, every transaction of the generation's stream up
+    to the op's counts, because `delegate_txs_from` stops at the first
+    pending chunk. The cost is one prefix scan of the remote marks when
+    the forwarder has nothing pending (the common case), and a plan walk
+    only when it does.
+  - `OwnChunks::{Streamed, Upload}` now carry those inodes
+    (`MutateReply::own_chunks`, wire `own_chunks` + `own_inos`; the ALPN
+    was already bumped to `constellation/2` in this chunk). The requester
+    acts for any op, not only `SetManifest` (`Core::await_own_records`;
+    `ClientOp::own_record_inos` accumulates, and a reply naming a new
+    inode re-arms the upload). `Action::UploadAwaited { inos }` runs one
+    upload pass per inode.
+  - Under `ack=s3` the dependent op's `Held` now asks for the upload too
+    (the same `held_for_upload` path). Covered by the unit test and the
+    harness scenario.
+- **Must-fix 2, `EROFS` vs a 120 s `EIO` in a carrier-less epoch**
+  (present on main too). `writes_refused` gated only admission. An op
+  already on the lease path was refused only at a *freeze*
+  (`refuse_waiting_for_lease`), and that skipped `LearnHolder`. Now
+  `Core::epoch_refuses_writes` holds when the epoch is frozen, or active
+  with no carrier (`pr.carried`, the same inputs as the engine's
+  `EpochManager::writes_refused`):
+  - every epoch report while it holds refuses the ops in `LearnHolder`,
+    `WaitingLease` and `AcquireRetry`;
+  - `route`'s lease read and `lease_path` refuse an op routed there
+    afterwards (an op admitted just before the gate closed);
+  - an op never sent to a holder (`!forwarded && attempts == 0`) gets
+    `EROFS`, and an op already sent keeps the settled outcome or the
+    in-doubt `EIO`, as at a freeze;
+  - a stranded op's replay is never refused (it would become a conflict
+    copy of an acknowledged write). It is answered in doubt, stays
+    queued, and the drain resends it. Before this, a freeze refused
+    replays too.
+
+  The 20 s S3-less bound (`s3_less`) is deliberately not applied in an
+  epoch. The docs say a bucket outage is the epoch's, and with this fix
+  nothing waits for the lease in an epoch that refuses writes. The docs
+  now say so (`durability-and-failover.md`, the carrier-less and freeze
+  bullets).
+- **Should-fix 1, `Streamed` behind a blocked stream.** `Streamed` now
+  also requires `Core::stream_reaches` (`core/backup.rs`). That check
+  runs `releasable_prefix(.., Some(to))` from the subscriber's
+  stream-ahead cursor through the op's transaction (its last journal
+  seq from `remote_blockers`, else the reply position), within one
+  stream batch. An epoch hold owner streams everything. Otherwise the
+  answer is `Upload`. The stream can only stop at a chunk the forwarder
+  lacks (the sequencer's own write-back, or another node's forwarded
+  close), never at the forwarder's own, and then only the log brings the
+  op, which also waits for the forwarder's chunks. So `Upload` is
+  necessary, not just cheaper than the 10 s timer. If the log also waits
+  for another node's chunks, the op waits for that node's uploads; the
+  docs say so.
+- **Should-fix 2, ALPN mismatch in the logs.** `message::OLDER_ALPNS`
+  (`constellation/1`):
+  - The endpoint accepts those handshakes only so that an `OlderVersion`
+    router handler can close them, with a reason naming this node's
+    version, and log a rate-limited `warn` naming both versions.
+  - A dial the peer refuses (`refused_alpn`: rustls' "peer doesn't
+    support any known protocol") spawns one probe dial per older ALPN to
+    learn the peer's version, then logs the same `warn`. If the peer
+    accepts none (a newer peer), the `warn` lists what was tried.
+  - Rate limit: once per peer per 60 s (`version_log_due`).
+- **Nits.** `wip/23-remote-support-mode.md` names the current ALPN.
+  `a_forward_with_nothing_pending_uploads_nothing` now gives the holder
+  an `S3` lease: parked for durability, answered `Held` after the hold
+  interval with `None`, and `held_for_upload` stays 0. The gates line
+  about `transport-enomem-ring` is corrected above.
+- **Coordinator item 0.** Rebuilt on `b458669`. The control schema is
+  unchanged by this round, because `AckStatus` is untouched.
+  `core/delegate.rs` changes only at the `own_chunks_for` call (its new
+  signature) and the `matches!` on `Upload`; `core/locks.rs` and
+  `inbox.rs` are untouched.
+
+Tests added or changed:
+- meta `tests/held.rs`:
+  `an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks`
+  covers a chmod and a rename depending on node 7's close, an unrelated
+  op, another node, and the case after the report. The
+  `store::remote` unit test now uses `remote_blockers`.
+- authority `core::tests::own_chunks`:
+  - `an_op_depending_on_a_held_close_asks_for_the_close_chunks`: `Local`
+    gives `Accepted` with `Upload([f])` and the op `AwaitingLog`; `S3`
+    gives `Held` with `Upload([f])`; both upload `f` at once, and an op
+    on another file gets `None`.
+  - `a_stream_blocked_before_the_op_asks_for_the_upload`: the backed
+    root answers `Streamed`, and `Upload` once its own write-back is
+    journaled first.
+  - The existing eight are adapted to the inode lists.
+  - With the dependency walk dropped (records only), the new meta and
+    core dependency tests fail (checked).
+- authority `core::tests::epoch_rules`:
+  - `an_op_never_sent_is_refused_erofs_when_a_carrierless_epoch_activates`
+    covers `LearnHolder`, a lease wait, an op routed after the
+    activation (no S3 read), and the same at a freeze.
+  - `an_op_already_sent_stays_in_doubt_when_a_carrierless_epoch_activates`.
+  - Both fail on the old rule (frozen only).
+- net `endpoint::tests::a_peer_of_another_version_is_named`: a raw
+  endpoint speaking only `constellation/1` refuses the dial,
+  `refused_alpn` recognises it, the probe learns `constellation/1`, the
+  log is rate-limited, and an ordinary dial failure is not taken for a
+  refusal. `peers::tests::an_older_version_is_closed_with_our_version_named`:
+  a `constellation/1` dial into a serving node passes the handshake and
+  is closed with a reason naming `constellation/2`.
+- Harness `writeback-close-metered-nonowner` gained the dependent-op
+  probe in all three modes. A creates `d/chmod` (then `d/rename`),
+  waits 3 s, writes it without `O_TRUNC`, then `chmod`s (renames) it.
+  Every close and op must finish within 10 s. Unbacked and `ack=s3`: A's
+  `own_record_uploads` rises for the probes. Backed: it does not, and
+  chunks stay pending.
+
+| Run | Unbacked | Backed | `ack=s3` |
+|---|---|---|---|
+| floci, dependency walk dropped | closes ≤ 0.69 s, then **`chmod` 120.0 s, `EIO`** (scenario fails) | — | — |
+| floci | closes ≤ 0.73 s; `chmod` 272 ms, `rename` 1.2 ms; 1 probe upload | closes ≤ 28 ms; `chmod` 5 ms, `rename` 8 ms; 0 uploads, 4 pending | closes ≤ 1.43 s; `chmod` 142 ms, `rename` 127 ms; 2 probe uploads |
+| AWS us-west-2, run 1 | closes ≤ 0.21 s; probe closes 4.1 / 1.1 s, `chmod` 6.0 s, `rename` 4.0 s; 2 probe uploads | ≤ 33 ms; 6 / 6 ms; 0 uploads | ≤ 0.15 s; 22 / 40 ms; 2 probe uploads |
+| AWS us-west-2, run 2 | ≤ 0.17 s; `chmod` 81 ms, `rename` 0.5 ms; 1 probe upload | ≤ 17 ms; 6 / 7 ms; 0 uploads | ≤ 0.22 s; 33 / 32 ms; 2 probe uploads |
+| OVH Milan | ≤ 1.69 s; `chmod` 0.96 s, `rename` 0.8 ms; 1 probe upload | ≤ 17 ms; 5 / 5 ms; 0 uploads | ≤ 1.46 s; 200 / 200 ms; 2 probe uploads |
+
+The real-S3 runs used a patched harness copy in `/var/tmp` (the floci
+backend rewritten to `$S3_TEST_URL/csmr3-{aws,ovh}-<ts>/…`). The
+sub-prefixes were purged afterwards with a delete guarded by name
+pattern: 195 objects on AWS, 93 on OVH, 0 left. AWS run 1's probes took
+4–6 s. In that run one main-loop close had returned on an applied base
+with its chunk still held (`pending 1`), and the probes then waited for
+B's ship and A's tail on real S3. That is slow, but it is not the stall
+(it is bounded by B's ship round and A's catch-up, not by the 120 s
+deadline). Run 2 took 81 ms.
+
+#### Gates (review round 2, 2026-10-02/03, base `b458669`)
+
+- `cargo fmt --all -- --check` clean. `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test -p` for all 19 packages, 0 failed:
+  - authority 174 + 4 + 108 (sim, 11 ignored)
+  - meta 214 (lib) + 1 + 6 + 11 + 1 + 12 + 12 (`held`) + 3 + 3 + 1 + 6 + 19
+  - engine 526 + 1
+  - net 114 + 1 + 2 + 3, then 115 with the inbound-version test added
+    afterwards
+  - control 135, store-s3 227, harness 60 + 2 + 1, csi 80 + 1
+  - constellation 49 + 3, frontend-fuse 45 + 27, fs-core 71
+  - mtree 49 + 6 + 15 + 1, vfs 47 + 11, chaos 37, platform 36
+  - types 18 + 8, upload-concurrency 11, uploadbench 4
+  - model in `--release`: 138 passed
+- `cargo build --release --workspace` ok. `tests/smoke.sh` with the
+  release binary: PASSED.
+- Harness, the brief's filter (71 scenarios on this base),
+  `CONSTELLATION_HARNESS_DOCKER_PREFIX=csm3h`, two full passes:
+  - **Pass 1: 68 PASSED, 2 SKIPPED (root), 1 FAILED.**
+    `holder-publishes-log-prefix` failed with "b daemon did not exit
+    after unmount within 120s", after `fusermount3: … Device or resource
+    busy` on B's mount at teardown. The scenario's assertions had passed
+    before that. Alone it then passed 3/3. The same teardown failure is
+    recorded above for `e2e-two-nodes` (plan 38, passed on re-run), and
+    nothing in this round touches unmount.
+  - **Pass 2: 69 PASSED, 2 SKIPPED, 0 FAILED** (`ALL RUN SCENARIOS
+    PASSED`).
+  - `transport-enomem-ring` runs on this base and passed both times.
+- As root (`sudo env -u XDG_RUNTIME_DIR HOME=/root …`, prefix `csm3r`):
+  `fsync-hard-outage`, `fsync-interrupt`, `fsync-soft-timeout`,
+  `unmount-drain`, `writeback-backpressure`, `passthrough-handover` and
+  `passthrough-on-every-transport` all PASSED. `~/.config/constellation`
+  is still owned by the user.
+- Real S3 on both targets (table above), sub-prefixes purged.
+- After the gate runs, only test code and formatting changed: the net
+  inbound test, then `cargo fmt`. Clippy, the net tests and the release
+  build were re-run on top of those changes.

@@ -10,7 +10,7 @@ use crate::event::PeerMsg;
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
 use constellation_meta::delegation::Ownership;
-use constellation_meta::{MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet};
+use constellation_meta::{MetaError, MutateOp, MutateOutcome, OwnChunks, Position, Rid, TouchSet};
 use constellation_types::Code;
 
 /// The keys `op` reads or writes, before it runs (a refusal touches
@@ -114,6 +114,7 @@ impl Core {
                         base: None,
                         position: Position::ZERO,
                         gen: 0,
+                        own_chunks: OwnChunks::None,
                     },
                 });
             }
@@ -141,6 +142,7 @@ impl Core {
                             base: None,
                             position: Position::ZERO,
                             gen: 0,
+                            own_chunks: OwnChunks::None,
                         },
                     });
                     return;
@@ -201,6 +203,7 @@ impl Core {
                                 base: None,
                                 position: Position::ZERO,
                                 gen: 0,
+                                own_chunks: OwnChunks::None,
                             },
                         });
                         return;
@@ -219,6 +222,7 @@ impl Core {
                                     base: None,
                                     position: Position::ZERO,
                                     gen: 0,
+                                    own_chunks: OwnChunks::None,
                                 },
                             });
                         }
@@ -314,6 +318,8 @@ impl Core {
             None => None,
         };
         let durable = self.ack_need(&position);
+        let own_chunks = self.own_chunks_for(from, rid, &outcome, (0, &position), replica);
+        let upload = matches!(own_chunks, OwnChunks::Upload(_));
         if wait.is_some() || durable.is_some() {
             self.park_reply(
                 now,
@@ -328,6 +334,9 @@ impl Core {
                 0,
                 out,
             );
+            if durable.is_some() && upload && req != OpId(0) {
+                self.held_for_upload(rid, own_chunks, out);
+            }
             return;
         }
         if req == OpId(0) {
@@ -343,6 +352,7 @@ impl Core {
                 base,
                 position,
                 gen: 0,
+                own_chunks,
             },
         });
     }
@@ -402,6 +412,66 @@ impl Core {
             out,
         );
         self.acquiring()
+    }
+
+    /// Chunk close-stall-metered: what `rid`'s transaction (`outcome`'s
+    /// records, evaluated at `position`) waits for from `to`, the node
+    /// that forwarded the op (`OwnChunks`, carried on the reply). Exact as
+    /// of now: the chunks `to` forwarded as still pending and has not
+    /// reported up that the transaction cannot leave this node before —
+    /// its own manifests', and those of every unshipped transaction it
+    /// depends on (`Meta::remote_blockers`: a `chmod` right after a `back`
+    /// close of the same file waits for the close's chunks too). They
+    /// reach `to` before those chunks are in S3 only through this node's
+    /// pre-S3 stream, which carries a forwarder's own transactions past
+    /// its pending chunks (`Core::stream_ahead`) but streams only rows a
+    /// backup holds — a backed root, or a continuation epoch's hold owner
+    /// — only to a subscriber, and only up to the first transaction naming
+    /// a chunk that subscriber lacks (this node's own write-back, another
+    /// node's forwarded close: `Core::stream_reaches`). Otherwise the ship
+    /// plan defers them until `to`'s report — under `Local` with no backup
+    /// (none in budget, the first seconds of a tenure,
+    /// `CONSTELLATION_BACKUPS=0`), under `S3`, or behind a chunk the
+    /// stream stops at — and `to`'s upload is one of the things the
+    /// segment carrying them waits for: `Upload`. Whatever else it waits
+    /// for (this node's own uploads, another forwarder's) comes with that
+    /// node's own rounds. A delegate's execution (`gen != 0`) streams and
+    /// backs up nothing naming a pending chunk (`Meta::delegate_txs_from`):
+    /// only the upload releases it. A later change (a backup lost, or
+    /// committed) is the requester's safety timer's to cover
+    /// (`Core::await_own_records`).
+    pub(crate) fn own_chunks_for(
+        &self,
+        to: NodeId,
+        rid: Rid,
+        outcome: &MutateOutcome,
+        (gen, position): (u64, &Position),
+        replica: &dyn Replica,
+    ) -> OwnChunks {
+        let MutateOutcome::Accepted { records, .. } = outcome else {
+            return OwnChunks::None;
+        };
+        if to == self.cfg.node_id {
+            return OwnChunks::None;
+        }
+        let blockers = replica.remote_blockers(rid, gen, records, to);
+        if blockers.inos.is_empty() {
+            return OwnChunks::None;
+        }
+        let through = blockers
+            .through
+            .or(position.pending.map(|p| p.jseq))
+            .unwrap_or(0);
+        let streams = gen == 0
+            && self.cfg.pre_s3_streaming
+            && (self.epoch_streams_ahead() || !self.lease.backups().is_empty())
+            && self.stream_subscribers().contains(&to)
+            && self.stream_reaches(to, through, replica);
+        if streams {
+            OwnChunks::Streamed(blockers.inos)
+        } else {
+            OwnChunks::Upload(blockers.inos)
+        }
     }
 
     /// The base a requester needs for this op's reply (see

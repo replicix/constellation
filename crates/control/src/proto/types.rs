@@ -2026,6 +2026,19 @@ pub struct AckStatus {
     /// the root's stream of its append of the delegate's transaction).
     #[serde(default)]
     pub awaited_log_streamed_deleg: u64,
+    /// Uploads of this node's pending chunks for its own forwarded `back`
+    /// close, despite the upload hold, because the close waited for
+    /// records only those chunks release: once when the sequencer answered
+    /// that only this upload brings them back, and once per
+    /// `CONSTELLATION_OWN_RECORD_WAIT_MS` the close then still waited, or
+    /// waited past a stream the sequencer said would carry them.
+    #[serde(default)]
+    pub own_record_uploads: u64,
+    /// As sequencer: forwarded replies answered `Held` at once because
+    /// the acknowledgement waits for chunks only the requester can upload
+    /// (it is asked to upload them).
+    #[serde(default)]
+    pub held_for_upload: u64,
     #[serde(default)]
     pub backup_persisted: u64,
     #[serde(default)]

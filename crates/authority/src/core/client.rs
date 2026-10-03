@@ -18,8 +18,8 @@ use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::{
-    CompletedOutcome, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome, Position, Rid,
-    TouchSet,
+    CompletedOutcome, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position,
+    Rid, TouchSet,
 };
 use constellation_types::Code;
 use std::collections::BTreeSet;
@@ -142,6 +142,14 @@ pub(crate) struct ClientOp {
     /// op is logged with them when it finishes (`finish`).
     pub submitted: Ms,
     pub history: Vec<(i64, String)>,
+    /// Chunk close-stall-metered: the safety timer of
+    /// `Core::await_own_records` (cancelled when the op finishes), the
+    /// inodes whose pending chunks here the op's transaction waits for
+    /// (as its sequencers named them), and whether this op already
+    /// uploaded them all (`Action::UploadAwaited`).
+    pub own_record_timer: Option<crate::ids::TimerId>,
+    pub own_record_inos: BTreeSet<Ino>,
+    pub own_record_uploaded: bool,
 }
 
 /// How many state changes a client op remembers for its slow-op log.
@@ -400,6 +408,9 @@ impl Core {
                 deps_held: false,
                 submitted: now,
                 history: Vec::new(),
+                own_record_timer: None,
+                own_record_inos: BTreeSet::new(),
+                own_record_uploaded: false,
             },
         );
         // Causal order after a generation ended with this node's writes
@@ -716,6 +727,12 @@ impl Core {
                     self.finish_in_doubt(now, rid, replica, out);
                     return;
                 }
+                if self.epoch_refuses_writes() {
+                    // The lease read leads to a forward to nobody or to
+                    // the lease path, which cannot end in this epoch.
+                    self.refuse_on_lease_path(now, rid, Code::ReadOnly, replica, out);
+                    return;
+                }
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = Phase::LearnHolder;
                 }
@@ -859,7 +876,7 @@ impl Core {
         from: NodeId,
         req: OpId,
         outcome: MutateOutcome,
-        (base, position, gen): (Option<crate::ids::Seq>, Position, u64),
+        (base, position, gen, own_chunks): (Option<crate::ids::Seq>, Position, u64, OwnChunks),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -933,6 +950,7 @@ impl Core {
                 }
                 let c = self.clients.get_mut(&rid).expect("present");
                 c.phase = Phase::AwaitingLog { epoch, position };
+                self.await_own_records(now, rid, own_chunks, out);
                 self.nudge(now, out);
             }
             MutateOutcome::Accepted { epoch, records } => {
@@ -994,6 +1012,12 @@ impl Core {
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = Phase::Backoff;
                     c.timer = Some(timer);
+                }
+                // Only an acknowledgement waiting for durability that
+                // needs this node's chunks says `Upload`; a recall's, a
+                // lost dependency's or a redirect's hold never does.
+                if matches!(own_chunks, OwnChunks::Upload(_)) {
+                    self.await_own_records(now, rid, own_chunks, out);
                 }
             }
             MutateOutcome::NotHolder { holder } => {
@@ -1361,6 +1385,13 @@ impl Core {
             self.finish_in_doubt(now, rid, replica, out);
             return;
         }
+        if self.epoch_refuses_writes() {
+            // Admitted before the engine's gate closed, or routed here
+            // after: the lease path cannot end in this epoch.
+            self.refuse_on_lease_path(now, rid, Code::ReadOnly, replica, out);
+            return;
+        }
+        let c = self.clients.get_mut(&rid).expect("present");
         if !matches!(c.phase, Phase::WaitingLease) {
             self.stats.lease_path_taken += 1;
         }
@@ -1433,8 +1464,13 @@ impl Core {
         }
     }
 
-    /// Answer every op on the lease path with `code` (a frozen
-    /// continuation epoch).
+    /// Answer every op on the lease path with `code` (a frozen epoch's,
+    /// or a carrier-less one's, `EROFS`): an op never sent to a holder is
+    /// refused; one that was sent gets the log's answer, else in doubt
+    /// ([`Self::refuse_on_lease_path`]). `LearnHolder` counts: its lease
+    /// read leads only to the lease path or to a forward, and in such an
+    /// epoch the lease path cannot end (no write executes under it) — the
+    /// read's late answer finds no op.
     pub(crate) fn refuse_waiting_for_lease(
         &mut self,
         now: Ms,
@@ -1445,34 +1481,67 @@ impl Core {
         let waiting: Vec<Rid> = self
             .clients
             .iter()
-            .filter(|(_, c)| matches!(c.phase, Phase::WaitingLease | Phase::AcquireRetry))
+            .filter(|(_, c)| {
+                matches!(
+                    c.phase,
+                    Phase::LearnHolder | Phase::WaitingLease | Phase::AcquireRetry
+                )
+            })
             .map(|(rid, _)| *rid)
             .collect();
         for rid in waiting {
-            // Flex-crash seed 10248: not an op sent anywhere before — it
-            // may have taken effect (a forward whose reply was lost), so
-            // "refused" would be a lie, and its resubmission would not
-            // check `completed`: it executed a second time and answered
-            // `EEXIST` for its own create. The log's answer if this node
-            // has applied it (a node holding nothing has `completed` rows
-            // from applied segments only, as at the deadline); otherwise
-            // in doubt (`EIO`, retryable by rid; the resubmission is in
-            // doubt too).
-            let sent = self
-                .clients
-                .get(&rid)
-                .is_some_and(|c| c.forwarded || c.attempts > 0);
-            if !sent {
-                self.finish(now, rid, MutateOutcome::Errno(code), replica, out);
-                continue;
-            }
-            if let Some(outcome) = self.settled_outcome(rid, replica) {
-                self.stats.forward_indoubt_resolved += 1;
-                self.finish(now, rid, outcome, replica, out);
-                continue;
-            }
-            self.finish_in_doubt(now, rid, replica, out);
+            self.refuse_on_lease_path(now, rid, code, replica, out);
         }
+    }
+
+    /// Chunk close-stall-metered (review must-fix 2): whether this node
+    /// is in a continuation epoch under which no write can execute — one
+    /// that froze, or one whose claim resolution carried no lease (no hold
+    /// owner): the engine's write gate refuses new writes with `EROFS`
+    /// (`EpochManager::writes_refused`), and an op on the lease path would
+    /// otherwise wait for its 2 × TTL deadline (120 s) and end in doubt.
+    pub(crate) fn epoch_refuses_writes(&self) -> bool {
+        self.epoch.frozen || (self.epoch.active && self.pr.carried.is_none())
+    }
+
+    /// `rid` is on the lease path in an epoch that refuses writes.
+    /// Flex-crash seed 10248: an op sent anywhere before may have taken
+    /// effect (a forward whose reply was lost), so "refused" would be a
+    /// lie, and its resubmission would not check `completed`: it executed
+    /// a second time and answered `EEXIST` for its own create. It gets the
+    /// log's answer if this node has applied it (a node holding nothing
+    /// has `completed` rows from applied segments only, as at the
+    /// deadline); otherwise in doubt (`EIO`, retryable by rid; the
+    /// resubmission is in doubt too). One never sent gets `code` — but
+    /// never a stranded op's replay: refused, it would become a conflict
+    /// copy of a write that was acknowledged; in doubt, it stays queued
+    /// and the drain resends it once the epoch is over.
+    fn refuse_on_lease_path(
+        &mut self,
+        now: Ms,
+        rid: Rid,
+        code: Code,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(c) = self.clients.get(&rid) else {
+            return;
+        };
+        let sent = c.forwarded || c.attempts > 0;
+        if matches!(c.origin, Origin::Replay { .. }) {
+            self.finish_in_doubt(now, rid, replica, out);
+            return;
+        }
+        if !sent {
+            self.finish(now, rid, MutateOutcome::Errno(code), replica, out);
+            return;
+        }
+        if let Some(outcome) = self.settled_outcome(rid, replica) {
+            self.stats.forward_indoubt_resolved += 1;
+            self.finish(now, rid, outcome, replica, out);
+            return;
+        }
+        self.finish_in_doubt(now, rid, replica, out);
     }
 
     fn schedule_acquire_retry(&mut self, now: Ms, rid: Rid, out: &mut Vec<Action>) {
@@ -1710,6 +1779,121 @@ impl Core {
             .is_some_and(|c| c.origin == Origin::Client)
         {
             replica.raise_observed(position);
+        }
+    }
+
+    /// Plan 31 C8 × write-back (chunk close-stall-metered): this node's
+    /// forwarded op waits for its own transaction — accepted on state
+    /// this replica has not applied (`AwaitingLog`), or answered `Held`
+    /// while the holder's acknowledgement waits for durability — and the
+    /// sequencer said what it waits for from here (`OwnChunks`,
+    /// `Core::own_chunks_for`). A `--write-mode back` close forwards its
+    /// manifest with chunks still pending here (`meta::store::remote`);
+    /// the sequencer ships that transaction, and every later one that
+    /// depends on it (a `chmod` or a `rename` of the same file, plan 30
+    /// §M4's key dependence), only once this node reports the chunks up,
+    /// and with the upload hold on (a metered network) this node's rounds
+    /// upload nothing, so the op used to wait out the whole forward
+    /// deadline and end in doubt (chunk 39b on real S3; the review's
+    /// `chmod` right after the close). Any op, not only the close: the
+    /// answer names the inodes whose chunks it waits for.
+    ///
+    /// - `Upload`: nothing but this node's upload brings the transaction
+    ///   back (no backup holds it, so no pre-S3 stream carries it;
+    ///   `ack=s3`; the stream stops before it at a chunk this node lacks;
+    ///   a delegate's execution): upload the inodes' pending chunks now
+    ///   (`Action::UploadAwaited`). That is a durability need of this op,
+    ///   as an `fsync`'s is, and the hold exempts it.
+    /// - `Streamed`: the sequencer's stream carries it here past those
+    ///   chunks, which stay held. Only a stream that stalls (a backup
+    ///   lost after the reply) leaves the op waiting: past
+    ///   `own_record_wait_ms` the safety timer uploads them anyway.
+    /// - `None`: nothing of this node's is pending in what it waits for.
+    ///
+    /// After an upload the timer repeats it every `own_record_wait_ms`
+    /// while the op still exists (a pass that failed). The op's phase is
+    /// not consulted: whatever it waits in after this (a retry, a new
+    /// holder, the lease path) its transaction still needs the same
+    /// chunks in S3 before any sequencer ships it, and a pass with
+    /// nothing left to upload costs one index lookup per inode in the
+    /// driver. The timer is cancelled when the op finishes.
+    pub(crate) fn await_own_records(
+        &mut self,
+        now: Ms,
+        rid: Rid,
+        own_chunks: OwnChunks,
+        out: &mut Vec<Action>,
+    ) {
+        let wait = self.cfg.own_record_wait_ms;
+        // `0` turns the whole mechanism off (the stall comes back: for
+        // reproducing it).
+        if wait == 0 {
+            return;
+        }
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
+        let (inos, upload) = match own_chunks {
+            OwnChunks::None => return,
+            OwnChunks::Streamed(inos) => (inos, false),
+            OwnChunks::Upload(inos) => (inos, true),
+        };
+        let fresh = inos.iter().any(|ino| !c.own_record_inos.contains(ino));
+        c.own_record_inos.extend(inos);
+        if fresh {
+            c.own_record_uploaded = false;
+        }
+        if upload {
+            if !c.own_record_uploaded {
+                self.upload_own_records(now, rid, out);
+            }
+        } else if c.own_record_timer.is_none() {
+            let t = self.set_timer(now.plus(wait), Timer::OwnRecordWait(rid), out);
+            self.clients
+                .get_mut(&rid)
+                .expect("present")
+                .own_record_timer = Some(t);
+        }
+    }
+
+    /// `Timer::OwnRecordWait`: the op still waits (a stale fire finds no
+    /// op: the timer is cancelled when it finishes).
+    pub(crate) fn on_own_record_wait(&mut self, now: Ms, rid: Rid, out: &mut Vec<Action>) {
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
+        c.own_record_timer = None;
+        self.upload_own_records(now, rid, out);
+    }
+
+    fn upload_own_records(&mut self, now: Ms, rid: Rid, out: &mut Vec<Action>) {
+        let Some(c) = self.clients.get_mut(&rid) else {
+            return;
+        };
+        if c.own_record_inos.is_empty() {
+            return;
+        }
+        let inos: Vec<Ino> = c.own_record_inos.iter().copied().collect();
+        c.own_record_uploaded = true;
+        let old = c.own_record_timer.take();
+        if let Some(old) = old {
+            self.cancel_timer(old, out);
+        }
+        self.stats.own_record_uploads += 1;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            ?rid,
+            ?inos,
+            "forwarded op waits for its own transaction: uploading the pending chunks it needs"
+        );
+        out.push(Action::UploadAwaited { inos });
+        let wait = self.cfg.own_record_wait_ms;
+        if wait > 0 {
+            let t = self.set_timer(now.plus(wait), Timer::OwnRecordWait(rid), out);
+            self.clients
+                .get_mut(&rid)
+                .expect("present")
+                .own_record_timer = Some(t);
         }
     }
 
@@ -2043,6 +2227,9 @@ impl Core {
         if let Some(t) = c.timer {
             self.cancel_timer(t, out);
         }
+        if let Some(t) = c.own_record_timer {
+            self.cancel_timer(t, out);
+        }
         self.inbox_forget(rid);
         match c.origin {
             Origin::Client => {
@@ -2114,6 +2301,9 @@ impl Core {
         self.log_if_slow(now, rid, &c, &format!("{outcome:?}"), replica);
         self.cancel_timer(c.deadline, out);
         if let Some(t) = c.timer {
+            self.cancel_timer(t, out);
+        }
+        if let Some(t) = c.own_record_timer {
             self.cancel_timer(t, out);
         }
         self.inbox_forget(rid);

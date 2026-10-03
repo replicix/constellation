@@ -576,3 +576,79 @@ fn a_dependent_of_a_deferred_manifest_waits_with_it() {
     );
     assert_eq!(mode_of(&meta, big), 0o600);
 }
+
+/// Chunk close-stall-metered (review must-fix 1): a sequencer tells a
+/// forwarder which of its pending chunks an op's transaction waits for
+/// (`Meta::remote_blockers`) — not only the chunks its own manifest
+/// names, but those of every deferred transaction it depends on by key.
+/// A `chmod` or a `rename` of a file right after node 7's `back` close of
+/// it names no chunk, yet the ship plan defers it with the close until
+/// node 7 reports its chunk up; an op on an unrelated file waits for
+/// nothing of node 7's, and nothing waits for another node.
+#[test]
+fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let away = ChunkHash::of(b"pending on node 7");
+    let rid = |seq: u64| constellation_meta::Rid {
+        node: 7,
+        incarnation: 1,
+        seq,
+    };
+    let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
+    let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
+    let ex = |seq: u64, op: MutateOp| {
+        constellation_meta::execute_mutate(&meta, &op, Some(rid(seq))).unwrap()
+    };
+    meta.enroll_remote_chunks(file, &[away], 7).unwrap();
+    let close = ex(
+        1,
+        MutateOp::SetManifest {
+            ino: file,
+            base_manifest: None,
+            manifest: manifest_naming(away, 19),
+            size: 19,
+        },
+    );
+    let setattr = |ino| MutateOp::Setattr {
+        ino,
+        mode: Some(0o600),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    let chmod = ex(2, setattr(file));
+    let unrelated = ex(3, setattr(other));
+    let rename = ex(
+        4,
+        MutateOp::Rename {
+            parent: ROOT_INO,
+            name: "file".into(),
+            new_parent: ROOT_INO,
+            new_name: "moved".into(),
+            noreplace: false,
+        },
+    );
+    let blockers = |seq: u64, records: &[LogRecord], node: u64| {
+        meta.remote_blockers(rid(seq), 0, records, node).unwrap()
+    };
+    assert_eq!(blockers(1, &close, 7).inos, vec![file], "its own manifest");
+    let dependent = blockers(2, &chmod, 7);
+    assert_eq!(dependent.inos, vec![file], "the chmod depends on the close");
+    assert!(dependent.through.is_some());
+    assert_eq!(blockers(4, &rename, 7).inos, vec![file], "and the rename");
+    let free = blockers(3, &unrelated, 7);
+    assert!(free.inos.is_empty(), "{free:?}");
+    assert!(free.through.is_some(), "still unshipped: {free:?}");
+    assert!(blockers(2, &chmod, 8).inos.is_empty(), "not node 8's");
+    // The plan agrees: the close, the chmod and the rename are deferred.
+    assert!(records(&batch(&meta))
+        .iter()
+        .all(|r| !matches!(r, LogRecord::Setattr { ino, .. } if *ino == file)),);
+    assert_eq!(meta.held_summary().deferred, 3);
+    // Reported up: nothing waits for node 7 any more.
+    meta.ack_remote_chunks(&[away]).unwrap();
+    assert!(blockers(2, &chmod, 7).inos.is_empty());
+}

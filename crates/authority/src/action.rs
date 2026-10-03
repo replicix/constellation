@@ -61,6 +61,16 @@ pub enum Action {
         /// whole journal shipped.
         complete: bool,
     },
+    /// Plan 31 C8 × write-back: this node's forwarded op waits for its
+    /// own transaction, which the sequencer ships only once the chunks of
+    /// `inos` this node forwarded as pending are up — its own `back`
+    /// close's, or those of a close it depends on (a `chmod` right after
+    /// one) — the sequencer said so (`OwnChunks::Upload`), or its stream
+    /// did not bring the transaction within `own_record_wait_ms`
+    /// (`Core::await_own_records`). Upload those inodes' chunks still
+    /// pending here now, whatever the upload hold says, and report them to
+    /// the nodes they were forwarded to; the core expects no event back.
+    UploadAwaited { inos: Vec<Ino> },
     /// Publish a metadata commit from the replica's log-prefix state
     /// (`TreePublisher::publish` with `Meta::publish_basis_at`) and report
     /// `Event::PublishDone`. The core has already checked it is the
@@ -200,6 +210,9 @@ pub enum TimerKind {
     ForwardTimeout,
     /// Backoff before the same-rid retry of a forward.
     ForwardBackoff,
+    /// A forwarded op still waits for its own records past
+    /// `own_record_wait_ms`: upload the chunks they wait for.
+    OwnRecordWait,
     /// Backoff before a client op re-asks for the lease.
     AcquireRetry,
     /// A client op's overall deadline (`acquire_deadline`, 2×TTL).

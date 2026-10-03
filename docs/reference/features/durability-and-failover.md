@@ -441,6 +441,30 @@ What `back` gives up, and what it keeps:
   sequencer waits for the writer's queue (see [fsync during an S3
   outage](#fsync-during-an-s3-outage)); on any other node it does not
   see it: the queue belongs to the writing node until it drains.
+- **Metered networks** (`CONSTELLATION_PROFILE_UPLOADS=unmetered-only`).
+  The upload queue waits for an unmetered network, but an op that cannot
+  finish without its node's chunks does not. When a node that is not the
+  sequencer forwards a `back` close, the sequencer ships the close's
+  records only once that node's chunks are up, and with them every later
+  op that depends on the close (a `chmod`, `rename` or `unlink` of the
+  same file: the ship plan defers it with the close). Its answer to any
+  forwarded op names the files whose chunks on the node the op waits for,
+  and says whether anything else brings the op's records back to the node
+  first. A backed sequencer's pre-S3 stream does, so the chunks stay held
+  — unless the stream stops before the op at a chunk the node does not
+  have (the sequencer's own write-back, another node's forwarded close):
+  then only the log brings it, and it is answered as below. When nothing
+  does (no backup: no peer within the RTT budget, the first seconds of a
+  tenure, `CONSTELLATION_BACKUPS=0`; or `ack=s3`, where the
+  acknowledgement itself waits for the records to land; or a delegate)
+  and the node must wait for the records (the answer came on state it
+  has not applied yet, or the acknowledgement waits), it uploads those
+  files' chunks at once. If the log also waits for another node's chunks,
+  the op waits for that node's uploads too. An op still waiting
+  `CONSTELLATION_OWN_RECORD_WAIT_MS` (10 s) after the sequencer said its
+  stream would carry the records uploads the chunks anyway (the stream
+  stalled: its backup was lost, say). Before, such an op waited out its
+  120 s deadline and failed in doubt.
 - **Correctness is unchanged**: rebases, exactly-once forwarding,
   conflict detection, locks (a lock's release flushes through) and
   failover behave as under `through`.
@@ -500,6 +524,14 @@ Operational rules:
 - An epoch whose claim resolution carried no lease has no hold owner, so
   no write can execute under it: its members refuse writes with `EROFS`
   (as a frozen epoch does) rather than letting them time out as `EIO`.
+  That includes a write submitted before the epoch activated (or froze)
+  that is still waiting for the lease (reading the lease object,
+  acquiring, or backing off between attempts) and was never sent to a
+  holder: it is refused `EROFS` at the activation, where it used to wait
+  for the 2 × TTL (120 s) deadline and fail `EIO`. A write that was sent
+  to a holder is answered as at a freeze (below). (The 20 s bound for a
+  node without S3 does not apply in an epoch, and is not needed there:
+  nothing waits for the lease in it.)
   Once S3 is back, any member closes it, frozen or not (nothing was
   written under it), and the lease is decided by CAS again.
 - A member of an epoch that carries a lease closes it once S3 is back
@@ -589,9 +621,10 @@ Operational rules:
   flush (the obligation is persisted), so the members always see it
   move.
 - An op already sent to a holder is never refused `EROFS` when an epoch
-  freezes: it may have taken effect. It gets the log's answer if this
-  node has applied one, else `EIO` (in doubt, retried by the same
-  request id).
+  freezes (or activates without a lease): it may have taken effect. It
+  gets the log's answer if this node has applied one, else `EIO` (in
+  doubt, retried by the same request id). Neither is a stranded op's
+  replay: it stays queued and is resent once the epoch is over.
 - A TTL takeover costs one `heartbeat/` LIST even at `f = 0`.
 
 ### Epochs and fast takeovers

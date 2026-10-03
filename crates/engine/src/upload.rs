@@ -74,6 +74,9 @@ const PRIORITY_DRAIN_CHUNKS: u64 = 4;
 /// an unmount's or a suspension's final flush — each needs its chunks in
 /// S3 to answer at all, and waiting out a metered network there would hold
 /// the authority core's one job slot (and the lease renewals behind it).
+/// Nor is a forwarded `back` close that still waits on the sequencer for
+/// its own record (`Action::UploadAwaited`): that record ships only once
+/// these chunks are up, so the close would wait out its forward deadline.
 #[derive(Debug, Default)]
 pub struct UploadHold {
     held: std::sync::atomic::AtomicBool,

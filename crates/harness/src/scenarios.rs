@@ -1583,6 +1583,13 @@ pub const SCENARIOS: &[Scenario] = &[
         caps: &[],
         run: lifecycle::lifecycle_metered_uploads,
     },
+    Scenario {
+        name: "writeback-close-metered-nonowner",
+        desc: "plan 31 C8 + write-back: a non-owner's back close with its uploads held (metered), forwarded before it applied the holder's create of the file, returns promptly by uploading its own chunks when nothing else can bring its record back (unbacked holder: was a 120 s stall ending in doubt; ack=s3: likewise) and keeps them held when a backed holder's stream answers; then a chmod and a rename right after a back close that returned with its chunk held (ops depending on that close: also a 120 s stall before), in all three modes; content readable on the writer at once and on both nodes once unmetered",
+        requires: &[],
+        caps: &[],
+        run: lifecycle::writeback_close_metered_nonowner,
+    },
 ];
 
 /// Plan 30 M0: scenarios that reproduce a known, not-yet-fixed bug
@@ -3583,6 +3590,25 @@ fn p2p_invalidation(_seed: u64) -> Result<()> {
 /// Lease state from a node's control API.
 fn lease_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["lease"].clone())
+}
+
+/// Wait until `c` holds the lease a write just before took. A scenario
+/// that cuts S3 and then writes on a node must have that node hold the
+/// lease first: none can be had without S3, and the write would wait out
+/// its 120 s client deadline and fail `EIO`. Unprivileged, the first
+/// mount's root-owner adoption (`engine::node::adopt_root`, a `Setattr`
+/// through the lease path) took it as a side effect; as root that
+/// adoption is skipped, so only an explicit write before the cut does.
+fn hold_lease_before_cut(c: &Client) -> Result<()> {
+    eventually(
+        &format!("{} holds the lease before the cut", c.name),
+        Duration::from_secs(30),
+        || {
+            let lease = lease_of(c)?;
+            anyhow::ensure!(lease["held"] == true, "{lease}");
+            Ok(())
+        },
+    )
 }
 
 /// P2P state from a node's control API.
@@ -7772,6 +7798,10 @@ fn unmount_drain(seed: u64) -> Result<()> {
 
     let data = pattern(seed, 2 * 1024 * 1024);
     let path = c0.mnt.join("f.bin");
+    // The empty file first, while S3 is up, so the node holds the lease
+    // when it goes (`hold_lease_before_cut`).
+    std::fs::File::create(&path)?;
+    hold_lease_before_cut(&c0)?;
 
     // Cut S3 before the write so the eager upload in `flush_inode`
     // cannot succeed; the chunk lands in the local cache Dirty and in
@@ -8067,9 +8097,10 @@ fn writeback_backpressure(seed: u64) -> Result<()> {
         .with_env("CONSTELLATION_STAGING_BUDGET", "2097152");
     client.fs_create()?;
     client.mount()?;
-    proxy.cut()?;
     let path = client.mnt.join("pressure");
     let mut file = std::fs::File::create(&path)?;
+    hold_lease_before_cut(&client)?;
+    proxy.cut()?;
     let started = std::time::Instant::now();
     let mut saw_enospc = false;
     for i in 0..32 {

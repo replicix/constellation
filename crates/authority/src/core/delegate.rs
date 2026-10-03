@@ -60,7 +60,9 @@ use crate::ids::{Ms, NodeId, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
-use constellation_meta::{LogRecord, MetaError, MutateOp, MutateOutcome, Position, Rid, TouchSet};
+use constellation_meta::{
+    LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, Rid, TouchSet,
+};
 use constellation_types::Code;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -597,6 +599,7 @@ impl Core {
                     base: None,
                     position: Position::ZERO,
                     gen: 0,
+                    own_chunks: OwnChunks::None,
                 },
             });
         }
@@ -787,6 +790,7 @@ impl Core {
                         base: None,
                         position: Position::ZERO,
                         gen: 0,
+                        own_chunks: OwnChunks::None,
                     },
                 });
             }
@@ -880,6 +884,11 @@ impl Core {
         // Phase 2b: under a backup (or `ack=s3`) the acknowledgement
         // waits until the transaction is on the backup (or in a segment
         // this replica applied); the row streams meanwhile.
+        let own_chunks = if from == 0 {
+            OwnChunks::None
+        } else {
+            self.own_chunks_for(from, rid, &outcome, (gen, &position), replica)
+        };
         if let Some(idx) = exec_idx {
             if self.deleg_ack_gated(gen) && !self.deleg_stream_durable(gen, idx, replica) {
                 self.stats.deleg_acks_parked += 1;
@@ -901,6 +910,12 @@ impl Core {
                     }
                 };
                 self.park_stream_need(now, gen, idx, what);
+                if matches!(own_chunks, OwnChunks::Upload(_)) {
+                    // Neither this delegate's backup nor its stream to
+                    // the root carries the transaction before the
+                    // requester's chunks are up.
+                    self.held_for_upload(rid, own_chunks, out);
+                }
                 self.deleg_backup_stream(now, replica, out);
                 return;
             }
@@ -918,6 +933,7 @@ impl Core {
                     base,
                     position,
                     gen,
+                    own_chunks,
                 },
             });
         }

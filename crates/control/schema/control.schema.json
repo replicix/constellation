@@ -173,6 +173,20 @@
           "description": "The fast path is closed (local writes go through the core).",
           "type": "boolean"
         },
+        "held_for_upload": {
+          "default": 0,
+          "description": "As sequencer: forwarded replies answered `Held` at once because\nthe acknowledgement waits for chunks only the requester can upload\n(it is asked to upload them).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "own_record_uploads": {
+          "default": 0,
+          "description": "Uploads of this node's pending chunks for its own forwarded `back`\nclose, despite the upload hold, because the close waited for\nrecords only those chunks release: once when the sequencer answered\nthat only this upload brings them back, and once per\n`CONSTELLATION_OWN_RECORD_WAIT_MS` the close then still waited, or\nwaited past a stream the sequencer said would carry them.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "parked_acks": {
           "default": 0,
           "description": "Acknowledgements parked for durability right now.",
@@ -7620,6 +7634,8 @@
             "durable": 0,
             "epoch_carry_refused": 0,
             "gated": false,
+            "held_for_upload": 0,
+            "own_record_uploads": 0,
             "parked_acks": 0,
             "policy": "",
             "reads_durability_blocked": 0,

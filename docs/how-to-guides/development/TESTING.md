@@ -1532,7 +1532,12 @@ relay of its own so requests can be attributed per role):
 - **Plan 39, `fsync` under S3 outages** (`crates/harness/src/scenarios/fsync.rs`;
   the outage scenarios mount `--fsync-mode s3`, because a single node's cut
   starts a continuation epoch within a second and a `local` `fsync` in an
-  epoch does not wait for the bucket):
+  epoch does not wait for the bucket). Each creates its file and waits for
+  `lease.held` before the cut: no lease can be had during the cut, and
+  only unprivileged did the mount's root-owner adoption take one first
+  (as root the file's create waited 120 s and failed `EIO`;
+  `unmount-drain` and `writeback-backpressure` do the same for the same
+  reason):
   - `fsync-hard-outage`: S3 cut for 20 s under an `fsync` of unuploaded
     data; it must still be waiting when the cut ends (`status.fsync.waiting`
     1, `longest_wait_ms` past 5 s), then return 0, log "S3 unreachable,
@@ -2784,6 +2789,27 @@ a shell), in `crates/harness/src/scenarios/lifecycle.rs`:
   pending_uploads` ≥ 8, the peer sees none of the content), an `fsync`'d
   file still uploads at once and reaches the peer; `metered: false` drains
   the queue and every file is intact on both nodes.
+- `writeback-close-metered-nonowner`: B sequences, A writes under
+  `--write-mode back` with `unmetered-only` on a metered network and a
+  60 ms S3 latency toxic; four times B creates `d/f<i>` and A overwrites
+  and closes it at once (before applying B's create). Three runs on fresh
+  filesystems: B with no backup (`CONSTELLATION_BACKUPS=0`, `Local`), B
+  backed by A, and `ack=s3`, all with the default
+  `CONSTELLATION_OWN_RECORD_WAIT_MS`. Every close must return within 10 s
+  (it used to stall 120 s and fail in doubt). Unbacked and `ack=s3`: B
+  answers `OwnChunks::Upload`, and A's `ack.own_record_uploads` and chunk
+  PUTs rise (the close uploaded what it waited on); under `ack=s3` B's
+  `ack.held_for_upload` rises too (it asked at once). Backed: none do and
+  every chunk stays pending (B answered `Streamed`; its stream carried the
+  record). Then, still metered, the review's dependent ops: A creates
+  `d/chmod`, waits 3 s, writes it without `O_TRUNC` (the close returns at
+  once, its chunk held) and `chmod`s it; the same with a `rename` of
+  `d/rename`. Each close and each op must return within 10 s (the op
+  used to stall 120 s, `EIO` in doubt: B answered that it waited for
+  nothing of A's). Unbacked and `ack=s3`: `ack.own_record_uploads` rises
+  for them; backed: it does not and chunks stay pending. A reads its
+  writes at once; unmetered, both nodes read everything, with no
+  conflicts.
 
 The profile knobs (`CONSTELLATION_PROFILE`, `CONSTELLATION_PROFILE_{P2P,
 LEASES,UPLOADS,BACKGROUND}`) are read by the daemon at start; the

@@ -20,7 +20,19 @@ use serde::{Deserialize, Serialize};
 
 /// ALPN for direct (non-gossip) requests. Versioned so a future
 /// message-set change can be negotiated rather than mis-parsed.
-pub const ALPN: &[u8] = b"constellation/1";
+///
+/// `2`: `Payload::MutateReply` carries `own_chunks` (chunk
+/// close-stall-metered). Nodes of different versions do not talk P2P
+/// (no compatibility shim): a cluster upgrades all its nodes together.
+pub const ALPN: &[u8] = b"constellation/2";
+
+/// Earlier versions of [`ALPN`]. An endpoint accepts their handshakes only
+/// to refuse the connection by name (closing it with a reason naming both
+/// versions), and a dial the peer refused is retried with them once, to
+/// learn its version: either way both sides log the mismatch explicitly
+/// (`endpoint::log_version_mismatch`), where they used to log only
+/// rustls' "peer doesn't support any known protocol" every few seconds.
+pub const OLDER_ALPNS: &[&[u8]] = &[b"constellation/1"];
 
 /// Largest accepted frame. Messages are small; the cap just stops a
 /// malicious peer from making us allocate.
@@ -315,6 +327,12 @@ pub enum Payload {
         /// Plan 30 §M11: the generation that executed the op (0: root).
         #[serde(default)]
         gen: u64,
+        /// Whether the op's transaction waits for the requester's own
+        /// pending chunks (`constellation_meta::OwnChunks::to_wire`: 0
+        /// no, 1 yes but streamed to it past them, 2 yes and only its
+        /// upload releases them), and of which inodes (`own_inos`).
+        own_chunks: u8,
+        own_inos: Vec<u64>,
     },
     /// Plan 30 §M8: a `cto=strict` reader asks the sequencer where the
     /// state of `ino` is (its record; with `dir`, its entries; with

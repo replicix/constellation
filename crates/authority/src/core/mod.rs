@@ -223,6 +223,17 @@ pub struct Config {
     /// How long a forwarded op's reply is held for recalls before it is
     /// answered `Held` (below the requester's forward timeout).
     pub recall_hold_ms: u64,
+    /// The safety net under the sequencer's `OwnChunks` answer: how long
+    /// this node's forwarded op may wait for its own records in
+    /// `AwaitingLog` when the sequencer said its stream would carry them
+    /// past this node's pending chunks (`OwnChunks::Streamed`) before the
+    /// driver uploads them anyway (`Action::UploadAwaited`), and how often
+    /// an upload the sequencer asked for is repeated while the op still
+    /// waits (a pass that failed). `CONSTELLATION_OWN_RECORD_WAIT_MS`,
+    /// default 10000; 0 turns the mechanism off, `Upload` answers included
+    /// (the stall comes back: for reproducing it). See
+    /// `Core::await_own_records`.
+    pub own_record_wait_ms: u64,
     /// The retry delay a `Held` answer asks for.
     pub held_retry_ms: u64,
     /// A strict read's overall budget for its ReadIndex (then degraded:
@@ -438,6 +449,7 @@ impl Config {
             read_delegations: true,
             read_delegation_ttl_ms: 5_000,
             recall_hold_ms: 250,
+            own_record_wait_ms: 10_000,
             held_retry_ms: 10,
             read_index_deadline_ms: 2_000,
             recall_before_ack: true,
@@ -539,6 +551,11 @@ pub struct Stats {
     /// position names a delegation stream): answered from the root's
     /// pre-S3 stream once it carried the root's append of them.
     pub awaited_log_streamed_deleg: u64,
+    /// Uploads of this node's pending chunks for its own forwarded op's
+    /// records (`Action::UploadAwaited`): once when the sequencer answered
+    /// `OwnChunks::Upload`, and once per `own_record_wait_ms` the op then
+    /// still waited, or waited past a `Streamed` answer.
+    pub own_record_uploads: u64,
     /// Ops held (per check) because their `deps` named a transaction its
     /// generation ended without, while this node's replays settled; and
     /// ops re-sent with fresh `deps` after that
@@ -645,6 +662,10 @@ pub struct Stats {
     pub recall_wait_ms_total: u64,
     /// Holder: forwarded replies answered `Held` (the requester retried).
     pub held_replies: u64,
+    /// Holder: of those, answered at once because the acknowledgement
+    /// waits for chunks only the requester can upload
+    /// (`Core::held_for_upload`, `OwnChunks::Upload`).
+    pub held_for_upload: u64,
     /// Requester: forwards answered `Held` and retried.
     pub held_retries: u64,
     /// Reader: ReadIndex requests sent, answered, degraded, and strict
@@ -998,6 +1019,8 @@ enum Timer {
     Poll,
     ForwardTimeout(Rid),
     ForwardBackoff(Rid),
+    /// `Core::await_own_records`'s safety timer for the op ran out.
+    OwnRecordWait(Rid),
     AcquireRetry(Rid),
     ClientDeadline(Rid),
     ReplayDrain,
@@ -1044,6 +1067,7 @@ impl Timer {
             Timer::Poll => TimerKind::Poll,
             Timer::ForwardTimeout(_) => TimerKind::ForwardTimeout,
             Timer::ForwardBackoff(_) => TimerKind::ForwardBackoff,
+            Timer::OwnRecordWait(_) => TimerKind::OwnRecordWait,
             Timer::AcquireRetry(_) => TimerKind::AcquireRetry,
             Timer::ClientDeadline(_) => TimerKind::ClientDeadline,
             Timer::ReplayDrain => TimerKind::ReplayDrain,
@@ -1492,7 +1516,16 @@ impl Core {
                 base,
                 position,
                 gen,
-            } => self.on_mutate_reply(now, from, req, outcome, (base, position, gen), replica, out),
+                own_chunks,
+            } => self.on_mutate_reply(
+                now,
+                from,
+                req,
+                outcome,
+                (base, position, gen, own_chunks),
+                replica,
+                out,
+            ),
             PeerMsg::LeaseRequest { req, epoch_applied } => {
                 self.on_lease_request(now, from, req, epoch_applied, replica, out)
             }
@@ -1775,6 +1808,7 @@ impl Core {
             }
             Timer::ForwardTimeout(rid) => self.on_forward_timeout(now, rid, replica, out),
             Timer::ForwardBackoff(rid) => self.on_forward_backoff(now, rid, replica, out),
+            Timer::OwnRecordWait(rid) => self.on_own_record_wait(now, rid, out),
             Timer::AcquireRetry(rid) => self.on_acquire_retry(now, rid, replica, out),
             Timer::ClientDeadline(rid) => self.on_client_deadline(now, rid, replica, out),
             Timer::ReplayDrain => {
@@ -1805,7 +1839,7 @@ impl Core {
             Timer::StreamWatchdog => self.on_stream_watchdog(now, out),
             Timer::GrantExpiry(grant) => self.on_grant_expiry(now, grant, replica, out),
             Timer::GrantQuarantine => self.on_grant_quarantine(now, replica, out),
-            Timer::HeldReply(park) => self.on_held_reply_timer(park, out),
+            Timer::HeldReply(park) => self.on_held_reply_timer(park, replica, out),
             Timer::ReadIndexTimeout(req) => self.on_read_index_timeout(now, req, out),
             Timer::ReadIndexRetry(op) => self.on_read_index_retry(now, op, replica, out),
             Timer::ReadIndexDeadline(op) => self.on_read_index_deadline(op, replica, out),
@@ -2194,9 +2228,12 @@ impl Core {
         if !state.open && !state.flushing {
             self.skip_ship = false;
         }
-        if state.frozen && !before.frozen {
-            // A frozen epoch refuses writes (EROFS): every op waiting for
-            // the lease hears it now rather than at its deadline.
+        if self.epoch_refuses_writes() {
+            // A frozen epoch, or one whose claim resolution carried no
+            // lease (no hold owner: chunk close-stall-metered's review
+            // must-fix 2), refuses writes (EROFS): every op waiting for
+            // the lease hears it now rather than at its 2 × TTL deadline.
+            // Idempotent: a repeated report finds nothing waiting.
             self.refuse_waiting_for_lease(now, Code::ReadOnly, replica, out);
         }
     }

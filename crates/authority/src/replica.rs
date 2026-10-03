@@ -381,6 +381,21 @@ pub trait Replica {
         let _ = subscriber;
         txs.len()
     }
+    /// The inodes whose chunks `node` forwarded as pending, and has not
+    /// reported up, that `rid`'s transaction (executed here as stream
+    /// `gen`'s, 0: the root's, with `records`) waits for — its own
+    /// manifests' and those of what it depends on — and its last journal
+    /// seq while unshipped (`Meta::remote_blockers`): `Core::own_chunks_for`.
+    fn remote_blockers(
+        &self,
+        rid: Rid,
+        gen: u64,
+        records: &[LogRecord],
+        node: NodeId,
+    ) -> constellation_meta::RemoteBlockers {
+        let _ = (rid, gen, records, node);
+        Default::default()
+    }
     /// The highest journal seq allocated (0: none).
     fn journal_tip(&self) -> u64;
     /// Backup side: persist the holder's transactions (`true` when
@@ -1032,6 +1047,31 @@ impl Replica for Meta {
         // An error reads as "nothing is releasable": the S3 ship still
         // carries everything, gated by its own plan.
         Meta::releasable_prefix(self, txs, subscriber).unwrap_or(0)
+    }
+
+    fn remote_blockers(
+        &self,
+        rid: Rid,
+        gen: u64,
+        records: &[LogRecord],
+        node: NodeId,
+    ) -> constellation_meta::RemoteBlockers {
+        // An error reads as "everything of `node`'s pending here": the
+        // forwarder uploads what may be needed (a cost, never a stall).
+        Meta::remote_blockers(self, rid, gen, records, node).unwrap_or_else(|_| {
+            let mut inos: Vec<_> = Meta::remote_chunks(self)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| c.node == node)
+                .map(|c| c.ino)
+                .collect();
+            inos.sort_unstable();
+            inos.dedup();
+            constellation_meta::RemoteBlockers {
+                inos,
+                through: None,
+            }
+        })
     }
 
     fn journal_tip(&self) -> u64 {

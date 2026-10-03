@@ -64,14 +64,42 @@ fn status_u64(c: &Client, path: &[&str]) -> Result<u64> {
         .with_context(|| format!("status.{} missing", path.join(".")))
 }
 
-/// A file with `data` written and not yet flushed (written during a cut:
-/// its chunks exist only on this node until something uploads them).
+/// Create the empty file `path` on `c` while S3 is still reachable, and
+/// wait until `c` holds the lease the create took.
+///
+/// What these scenarios test is an `fsync`'s wait for *data* during a cut,
+/// so the node must already hold the lease when S3 goes: no lease can be
+/// had without S3 (plan 39: a mutation that needs one during an outage
+/// waits out its 120 s client deadline and fails `EIO` — before any
+/// `fsync`). They used to cut right after the mount and create the file
+/// during the cut, which passed only unprivileged: there the mount's
+/// root-owner adoption (`engine::node::adopt_root`, a `Setattr` through
+/// the lease path) had taken the lease already; as root that adoption is
+/// skipped, so the create waited 120 s and the scenario failed.
+fn create_holding(c: &Client, path: &Path) -> Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)?;
+    eventually(
+        "the node holds the lease before the cut",
+        Duration::from_secs(30),
+        || {
+            let lease = c.control_status()?["lease"].clone();
+            anyhow::ensure!(lease["held"] == true, "{lease}");
+            Ok(())
+        },
+    )
+}
+
+/// The file `create_holding` made, with `data` written and not yet flushed
+/// (written during a cut: its chunks exist only on this node until
+/// something uploads them).
 fn staged(path: &Path, data: &[u8]) -> Result<std::fs::File> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .create_new(true)
-        .mode(0o644)
         .open(path)?;
     f.write_all(data)?;
     Ok(f)
@@ -120,8 +148,10 @@ pub(super) fn fsync_hard_outage(seed: u64) -> Result<()> {
         "the default fsync policy is hard"
     );
     let data = seeded(seed, 3 << 20);
-    // Cut first: a sequential writer's full chunks start uploading as soon
-    // as they are sealed, so data written before the cut is already up.
+    create_holding(&c, &c.mnt.join("f"))?;
+    // Cut before the data: a sequential writer's full chunks start
+    // uploading as soon as they are sealed, so data written before the cut
+    // is already up.
     proxy.cut()?;
     let file = staged(&c.mnt.join("f"), &data)?;
     let started = Instant::now();
@@ -177,6 +207,7 @@ pub(super) fn fsync_soft_timeout(seed: u64) -> Result<()> {
         "--fsync-timeout 2s: {fsync}"
     );
     let data = seeded(seed, 2 << 20);
+    create_holding(&c, &c.mnt.join("f"))?;
     proxy.cut()?;
     let file = staged(&c.mnt.join("f"), &data)?;
     let started = Instant::now();
@@ -237,6 +268,7 @@ pub(super) fn fsync_interrupt(seed: u64) -> Result<()> {
     let input = root.path().join("payload");
     std::fs::write(&input, &data)?;
     let target = c.mnt.join("f");
+    create_holding(&c, &target)?;
 
     proxy.cut()?;
     // Python's default SIGINT handling is an interactive program's Ctrl-C:

@@ -212,6 +212,7 @@ pub enum SyncRequest {
             Option<u64>,
             constellation_meta::Position,
             u64,
+            constellation_meta::OwnChunks,
         )>,
     },
     /// `from` reports chunks it forwarded as pending durable in S3: ack

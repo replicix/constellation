@@ -845,6 +845,9 @@ impl Driver {
                     let _ = self.tx.send(Event::RebuildDone { op, ok: false });
                 }
                 Action::RoundDone { .. } => {}
+                // The simulated chunks are never held; the round's pass
+                // uploads them.
+                Action::UploadAwaited { .. } => {}
                 Action::LockFlush { ino, grant } => {
                     // Plan 30 §M14: no file data in this simulation, so the
                     // flush is only a delay (seeded by the grant, so a

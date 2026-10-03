@@ -900,14 +900,43 @@ impl Peers {
             inner: inner.clone(),
             service,
         };
-        let router = iroh::protocol::Router::builder(inner.p2p.endpoint().clone())
+        let mut router = iroh::protocol::Router::builder(inner.p2p.endpoint().clone())
             .accept(ALPN, handler)
-            .accept(iroh_gossip::ALPN, inner.p2p.gossip().clone())
-            .spawn();
+            .accept(iroh_gossip::ALPN, inner.p2p.gossip().clone());
+        for &alpn in crate::message::OLDER_ALPNS {
+            router = router.accept(alpn, OlderVersion { alpn });
+        }
+        let router = router.spawn();
         // Hold the router for the daemon's lifetime; dropping it would
         // abort the accept loop.
         std::mem::forget(router);
         std::future::pending::<()>().await
+    }
+}
+
+/// An earlier version of our ALPN (`message::OLDER_ALPNS`): refuse the
+/// connection with a reason naming this node's version, and log the
+/// mismatch by name (rate-limited per peer).
+#[derive(Debug)]
+struct OlderVersion {
+    alpn: &'static [u8],
+}
+
+impl iroh::protocol::ProtocolHandler for OlderVersion {
+    fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> impl std::future::Future<Output = std::result::Result<(), iroh::protocol::AcceptError>> + Send
+    {
+        let peer = conn.remote_id();
+        if crate::endpoint::version_log_due(&peer) {
+            crate::endpoint::log_version_mismatch(&peer, Some(self.alpn), true);
+        }
+        conn.close(
+            iroh::endpoint::VarInt::from_u32(crate::endpoint::VERSION_MISMATCH),
+            &crate::endpoint::version_reason(),
+        );
+        std::future::ready(Ok(()))
     }
 }
 
@@ -2018,6 +2047,38 @@ mod tests {
     /// Plan 31 C8: a quiesced endpoint closes what it has and admits
     /// nothing either way; dial-only refuses only inbound connections;
     /// unquiesced, it serves again.
+    /// Review should-fix 2 (chunk close-stall-metered): a node of the
+    /// previous P2P version dialing this one is accepted at the handshake
+    /// only to be closed with a reason naming this node's version (and the
+    /// mismatch logged by name), not refused by rustls' anonymous "peer
+    /// doesn't support any known protocol".
+    #[tokio::test]
+    async fn an_older_version_is_closed_with_our_version_named() {
+        let (holder, _asker, _service) = pair(false).await;
+        let addr = holder.inner.as_ref().unwrap().p2p.addr();
+        let old = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .secret_key(iroh::SecretKey::generate())
+            .bind()
+            .await
+            .unwrap();
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            old.connect(addr, crate::message::OLDER_ALPNS[0]),
+        )
+        .await
+        .expect("the dial completes")
+        .expect("the handshake accepts the older ALPN");
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(20), conn.closed())
+            .await
+            .expect("closed by the new node");
+        let text = format!("{closed:?}");
+        assert!(
+            text.contains(&String::from_utf8_lossy(crate::message::ALPN).into_owned()),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn quiesce_and_dial_only_gate_connections() {
         let (holder, asker, _service) = pair(false).await;

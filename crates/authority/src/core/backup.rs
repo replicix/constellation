@@ -1400,6 +1400,38 @@ impl Core {
             && !self.epoch.frozen
     }
 
+    /// Chunk close-stall-metered (`Core::own_chunks_for`): whether the
+    /// pre-S3 stream carries this node's journal through seq `through` to
+    /// subscriber `to` without waiting for S3 — what [`Self::stream_ahead`]
+    /// would release to it from its cursor once the rows are durable. It
+    /// stops before a transaction naming a chunk pending here that `to`
+    /// does not have (this node's own write-back, another node's forwarded
+    /// close), and then only the segment brings the rest: the forwarder's
+    /// upload is on that path. A window longer than one stream batch reads
+    /// as "does not reach" (a forwarder's upload costs less than a stall).
+    pub(crate) fn stream_reaches(&self, to: NodeId, through: u64, replica: &dyn Replica) -> bool {
+        if self.epoch_streams_ahead() {
+            return true;
+        }
+        let cursor = self
+            .ack
+            .ahead_of
+            .get(&to)
+            .copied()
+            .unwrap_or(self.ack.streamed_through);
+        if through <= cursor {
+            return true;
+        }
+        let rows = self.cfg.backup_batch_rows.max(1);
+        let txs: Vec<BackupTx> = replica
+            .journal_txs_from(cursor + 1, rows)
+            .into_iter()
+            .filter(|t| t.last <= through)
+            .collect();
+        txs.last().is_some_and(|t| t.last >= through)
+            && replica.releasable_prefix(&txs, Some(to)) >= txs.len()
+    }
+
     /// Stream the epoch journal again from its start (a member
     /// subscribed): the next stream-ahead pass resends everything.
     pub(crate) fn restream_ahead(&mut self) {

@@ -6,7 +6,7 @@ use super::*;
 use crate::action::{ClientReply, S3Op};
 use crate::event::{CasFailure, PeerMsg, Policy, S3Result, UploadResult};
 use constellation_fs_core::types::ROOT_INO;
-use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, Rid};
+use constellation_meta::{LogRecord, Meta, MetaStore, MutateOp, MutateOutcome, OwnChunks, Rid};
 use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
 
 struct Harness {
@@ -1137,6 +1137,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
             base: Some(0),
             position: constellation_meta::Position::ZERO,
             gen: 0,
+            own_chunks: OwnChunks::None,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -1521,6 +1522,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
             base: Some(0),
             position: constellation_meta::Position::ZERO,
             gen: 0,
+            own_chunks: OwnChunks::None,
         },
     });
     assert_eq!(replies(&out).len(), 1);
@@ -1603,6 +1605,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
             base: Some(0),
             position: constellation_meta::Position::ZERO,
             gen: 0,
+            own_chunks: OwnChunks::None,
         },
     });
     let answered: Vec<Rid> = replies(&out).into_iter().map(|(rid, _)| rid).collect();
@@ -1995,6 +1998,7 @@ fn awaiting_log_forward(name: &str) -> (Harness, Rid, Vec<LogRecord>) {
                 streams: Default::default(),
             },
             gen: 0,
+            own_chunks: OwnChunks::None,
         },
     });
     assert!(replies(&out).is_empty(), "the op waits for the log");
@@ -2112,6 +2116,653 @@ fn an_awaiting_log_forward_under_the_held_epoch_or_a_continuation_hold_keeps_wai
         requester.core.clients().collect::<Vec<_>>(),
         vec![(rid, ClientPhase::AwaitingLog)]
     );
+}
+
+/// Chunk close-stall-metered (PROGRESS, "Fix: a metered non-owner's
+/// `back` close stalled 120 s"): node 2 closes `f` under `--write-mode
+/// back` with its uploads held (a metered network), so the manifest it
+/// forwards names a chunk still pending on it, which node 1 enrolls as
+/// node 2's (the driver does that before the op executes). Node 1's
+/// answer says whether the records wait for node 2's upload
+/// (`OwnChunks`); node 2 uploads at once when nothing else brings them
+/// back, keeps them held when a stream does, and a safety timer covers a
+/// stream that stalls.
+mod own_chunks {
+    use super::*;
+    use constellation_fs_core::{ChunkHash, Manifest};
+    use constellation_store_s3::AckPolicy;
+
+    fn uploads_awaited(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::UploadAwaited { inos } => Some(inos.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn own_record_timers(h: &Harness) -> usize {
+        h.core
+            .timers
+            .values()
+            .filter(|(t, _)| matches!(t, Timer::OwnRecordWait(_)))
+            .count()
+    }
+
+    /// Node 1 holds under `policy` (with `backups`); `Local` with nobody
+    /// in budget is the unbacked tenure chunk 39b met on real S3.
+    fn holding(policy: AckPolicy, backups: Vec<NodeId>) -> (Harness, Harness) {
+        let (mut holder, requester) = pair();
+        let lease = Lease {
+            ack_policy: policy,
+            backups,
+            ..lease_of(1, 1, holder.now.plus(10_000).0)
+        };
+        holder.core.lease.adopt(holder.now, lease, tag(), None);
+        holder.core.ack.eligible = Some(false);
+        (holder, requester)
+    }
+
+    /// Node 1 creates `f` (unshipped: a forward touching it is answered
+    /// on a base node 2 has not applied), and node 2's close of it names
+    /// one chunk — pending on node 2, enrolled on node 1 when `pending`.
+    /// Returns the close, its records as node 1 would journal them, and
+    /// node 1's records of the create.
+    fn back_close(
+        holder: &mut Harness,
+        pending: bool,
+    ) -> (MutateOp, Vec<LogRecord>, Vec<LogRecord>) {
+        let create = holder.create("f");
+        let MutateOp::Create { ino, .. } = create else {
+            unreachable!()
+        };
+        let created = constellation_meta::execute_mutate(&holder.meta, &create, None).unwrap();
+        let chunk = ChunkHash::of(b"held on node 2");
+        let manifest =
+            Manifest::from_sparse_chunks(4096, 14, [(0u64, chunk)].into(), 64, ChunkHash::of)
+                .0
+                .encode();
+        if pending {
+            holder.meta.enroll_remote_chunks(ino, &[chunk], 2).unwrap();
+        }
+        let op = MutateOp::SetManifest {
+            ino,
+            base_manifest: None,
+            manifest,
+            size: 14,
+        };
+        let records = vec![LogRecord::WriteManifest {
+            ino,
+            base_manifest: None,
+            manifest: match &op {
+                MutateOp::SetManifest { manifest, .. } => manifest.clone(),
+                _ => unreachable!(),
+            },
+            size: 14,
+            time_ns: 0,
+        }];
+        (op, records, created)
+    }
+
+    /// Node 2 submits `op`; node 1 answers its forward. Returns node 1's
+    /// reply and what node 2 did with it.
+    fn forward(
+        holder: &mut Harness,
+        requester: &mut Harness,
+        rid: Rid,
+        op: MutateOp,
+    ) -> (PeerMsg, Vec<Action>) {
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+        });
+        assert!(uploads_awaited(&out).is_empty(), "not with the forward");
+        let sent = sends(&out);
+        let [(1, request)] = sent.as_slice() else {
+            panic!("expected one forward to node 1: {sent:?}")
+        };
+        let answer = holder.step(Event::Peer {
+            from: 2,
+            msg: (*request).clone(),
+        });
+        let replies: Vec<PeerMsg> = sends(&answer)
+            .into_iter()
+            .filter(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateReply { .. }))
+            .map(|(_, m)| m.clone())
+            .collect();
+        let [reply] = replies.as_slice() else {
+            panic!("expected one reply to node 2: {answer:?}")
+        };
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: reply.clone(),
+        });
+        (reply.clone(), out)
+    }
+
+    fn own_chunks_of(msg: &PeerMsg) -> (OwnChunks, &MutateOutcome) {
+        match msg {
+            PeerMsg::MutateReply {
+                own_chunks,
+                outcome,
+                ..
+            } => (own_chunks.clone(), outcome),
+            other => panic!("not a reply: {other:?}"),
+        }
+    }
+
+    /// Unbacked (`Local`, nobody in budget): no stream carries node 2's
+    /// record back before its chunk is up, and the ship waits for that
+    /// chunk. Node 1 says `Upload`, node 2 uploads at once. Before the
+    /// fix nothing did: the close waited out the forward deadline and was
+    /// answered in doubt.
+    #[test]
+    fn an_unbacked_holder_asks_for_the_upload_and_the_forwarder_uploads_at_once() {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (op, _, _) = back_close(&mut holder, true);
+        let MutateOp::SetManifest { ino, .. } = op else {
+            unreachable!()
+        };
+        let rid = requester.rid(1);
+        let (reply, out) = forward(&mut holder, &mut requester, rid, op);
+        let (own, outcome) = own_chunks_of(&reply);
+        assert!(
+            matches!(outcome, MutateOutcome::Accepted { .. }),
+            "{reply:?}"
+        );
+        assert_eq!(own, OwnChunks::Upload(vec![ino]));
+        assert_eq!(
+            requester.core.clients().collect::<Vec<_>>(),
+            vec![(rid, ClientPhase::AwaitingLog)]
+        );
+        assert_eq!(uploads_awaited(&out), vec![ino]);
+        assert_eq!(requester.core.stats.own_record_uploads, 1);
+        // The safety timer repeats it while the op still waits (a pass
+        // that failed).
+        let [again] = timers(&out, TimerKind::OwnRecordWait)[..] else {
+            panic!("one safety timer: {out:?}")
+        };
+        requester.advance(requester.core.cfg.own_record_wait_ms);
+        let out = requester.step(Event::Timer { id: again });
+        assert_eq!(uploads_awaited(&out), vec![ino]);
+        assert_eq!(requester.core.stats.own_record_uploads, 2);
+    }
+
+    /// Should-fix 2: a forward whose manifest names nothing pending on
+    /// node 2 (a `through` close, or its chunks already reported up) is
+    /// answered `None`, and node 2 uploads nothing and arms nothing — under
+    /// an `S3` lease on node 1 too, where the reply is parked for
+    /// durability and answered `Held` after the hold interval, not at once
+    /// as `held_for_upload` would.
+    #[test]
+    fn a_forward_with_nothing_pending_uploads_nothing() {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (op, _, _) = back_close(&mut holder, false);
+        let (reply, out) = {
+            let rid = requester.rid(1);
+            forward(&mut holder, &mut requester, rid, op)
+        };
+        assert_eq!(own_chunks_of(&reply).0, OwnChunks::None);
+        assert!(uploads_awaited(&out).is_empty(), "{out:?}");
+        assert!(timers(&out, TimerKind::OwnRecordWait).is_empty());
+        assert_eq!(requester.core.stats.own_record_uploads, 0);
+
+        let (mut holder, mut requester) = holding(AckPolicy::S3, Vec::new());
+        let (op, _, _) = back_close(&mut holder, false);
+        let rid = requester.rid(1);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+        });
+        let sent = sends(&out);
+        let [(1, request)] = sent.as_slice() else {
+            panic!("expected one forward to node 1: {sent:?}")
+        };
+        let answer = holder.step(Event::Peer {
+            from: 2,
+            msg: (*request).clone(),
+        });
+        assert!(sends(&answer).is_empty(), "parked: {answer:?}");
+        assert_eq!(holder.core.stats.held_for_upload, 0);
+        let held = timers(&answer, TimerKind::HeldReply)[0];
+        holder.advance(holder.core.cfg.recall_hold_ms);
+        let answer = holder.step(Event::Timer { id: held });
+        let [(2, reply)] = sends(&answer)[..] else {
+            panic!("a held reply: {answer:?}")
+        };
+        let (own, outcome) = own_chunks_of(reply);
+        assert!(matches!(outcome, MutateOutcome::Held { .. }), "{reply:?}");
+        assert_eq!(own, OwnChunks::None);
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: reply.clone(),
+        });
+        assert!(uploads_awaited(&out).is_empty(), "{out:?}");
+        assert!(timers(&out, TimerKind::OwnRecordWait).is_empty());
+
+        // Nor does an op that names no chunk at all.
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let op = requester.create("g");
+        let (reply, out) = {
+            let rid = requester.rid(1);
+            forward(&mut holder, &mut requester, rid, op)
+        };
+        assert_eq!(own_chunks_of(&reply).0, OwnChunks::None);
+        assert!(uploads_awaited(&out).is_empty());
+    }
+
+    /// `ack=s3` (the holder's lease policy `S3`): the acknowledgement
+    /// waits for the record's segment, which waits for node 2's chunk.
+    /// Node 1 parks the reply and says so at once — a `Held` asking for
+    /// the upload and a quick retry, not after the hold interval — and
+    /// node 2 uploads. Before the fix it was `Held` every hold interval
+    /// until the forward deadline.
+    #[test]
+    fn an_s3_acknowledgement_waiting_for_the_forwarders_chunk_is_held_for_its_upload_at_once() {
+        let (mut holder, mut requester) = holding(AckPolicy::S3, Vec::new());
+        let (op, _, _) = back_close(&mut holder, true);
+        let MutateOp::SetManifest { ino, .. } = op else {
+            unreachable!()
+        };
+        let rid = requester.rid(1);
+        let (reply, out) = forward(&mut holder, &mut requester, rid, op);
+        let (own, outcome) = own_chunks_of(&reply);
+        assert_eq!(
+            outcome,
+            &MutateOutcome::Held {
+                retry_ms: holder.core.cfg.held_retry_ms
+            }
+        );
+        assert_eq!(own, OwnChunks::Upload(vec![ino]));
+        assert_eq!(holder.core.stats.held_for_upload, 1);
+        assert_eq!(uploads_awaited(&out), vec![ino]);
+        // The retry re-attaches; a later `Held` of the same wait does not
+        // upload again (the safety timer repeats it if it must).
+        let retry = timers(&out, TimerKind::ForwardBackoff)[0];
+        requester.advance(holder.core.cfg.held_retry_ms);
+        let out = requester.step(Event::Timer { id: retry });
+        let sent = sends(&out);
+        let [(1, request)] = sent.as_slice() else {
+            panic!("expected the retry: {sent:?}")
+        };
+        let answer = holder.step(Event::Peer {
+            from: 2,
+            msg: (*request).clone(),
+        });
+        assert!(
+            sends(&answer).is_empty(),
+            "re-attached to the parked reply: {answer:?}"
+        );
+        let held = timers(&answer, TimerKind::HeldReply)[0];
+        holder.advance(holder.core.cfg.recall_hold_ms);
+        let answer = holder.step(Event::Timer { id: held });
+        let [(2, reply)] = sends(&answer)[..] else {
+            panic!("a held reply: {answer:?}")
+        };
+        assert_eq!(own_chunks_of(reply).0, OwnChunks::Upload(vec![ino]));
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: reply.clone(),
+        });
+        assert!(uploads_awaited(&out).is_empty(), "uploaded once: {out:?}");
+        assert_eq!(requester.core.stats.own_record_uploads, 1);
+    }
+
+    /// A `Held` that is not an acknowledgement waiting for node 2's
+    /// chunks — a recall's, a lost dependency's, a delegate re-route's —
+    /// carries `None`, and node 2 neither uploads nor arms a timer
+    /// (should-fix 1: such a hold may last `recall_hold_ms`, 60 s, and the
+    /// record ships without node 2's upload).
+    #[test]
+    fn a_recall_hold_uploads_nothing() {
+        let (_holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let rid = requester.rid(1);
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::SetManifest {
+                ino: 77,
+                base_manifest: None,
+                manifest: vec![1, 2, 3],
+                size: 3,
+            },
+        });
+        let [(1, PeerMsg::MutateRequest { req, .. })] = sends(&out)[..] else {
+            panic!("expected a forward: {out:?}")
+        };
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req: *req,
+                outcome: MutateOutcome::Held { retry_ms: 50 },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+            },
+        });
+        assert!(uploads_awaited(&out).is_empty());
+        assert!(timers(&out, TimerKind::OwnRecordWait).is_empty());
+        assert_eq!(own_record_timers(&requester), 0);
+    }
+
+    /// The holder's side of the signal, case by case: `Streamed` only for
+    /// a stream subscriber of a backed root (whose stream carries the
+    /// forwarder's own transaction past its pending chunks); `Upload` for a
+    /// non-subscriber, an unbacked or `S3` tenure, and a delegate's
+    /// execution; `None` for records naming nothing of the requester's.
+    #[test]
+    fn the_holder_says_streamed_only_where_its_stream_carries_the_record() {
+        let (mut holder, _sub, sub_req) = stream_pair();
+        let (_, records, _) = back_close(&mut holder, true);
+        let accepted = MutateOutcome::Accepted {
+            epoch: 1,
+            records: records.clone(),
+        };
+        let ino = match &records[0] {
+            LogRecord::WriteManifest { ino, .. } => *ino,
+            other => panic!("{other:?}"),
+        };
+        // Not journaled here: the records alone say what it waits for.
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 99,
+        };
+        let zero = constellation_meta::Position::ZERO;
+        let ask = |h: &Harness, to: NodeId, gen: u64| {
+            h.core
+                .own_chunks_for(to, rid, &accepted, (gen, &zero), &h.meta)
+        };
+        let upload = OwnChunks::Upload(vec![ino]);
+        // `Local`, no backup: nothing streams ahead.
+        assert_eq!(ask(&holder, 2, 0), upload);
+        let backed = |h: &mut Harness, policy: AckPolicy, backups: Vec<NodeId>| {
+            let lease = Lease {
+                ack_policy: policy,
+                backups,
+                ..lease_of(1, 1, h.now.plus(10_000).0)
+            };
+            h.core.lease.adopt(h.now, lease, tag(), None);
+        };
+        backed(&mut holder, AckPolicy::Backup, vec![3]);
+        assert_eq!(ask(&holder, 2, 0), OwnChunks::Streamed(vec![ino]));
+        assert_eq!(ask(&holder, 2, 5), upload, "a delegate's");
+        // The records name nothing of node 4's.
+        assert_eq!(ask(&holder, 4, 0), OwnChunks::None);
+        // Node 2 not subscribed: no stream reaches it.
+        holder.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LogUnsubscribe { req: sub_req },
+        });
+        assert_eq!(ask(&holder, 2, 0), upload, "not a subscriber");
+        backed(&mut holder, AckPolicy::S3, Vec::new());
+        assert_eq!(ask(&holder, 2, 0), upload);
+        // Not accepted: nothing to say.
+        assert_eq!(
+            holder
+                .core
+                .own_chunks_for(2, rid, &MutateOutcome::Busy, (0, &zero), &holder.meta),
+            OwnChunks::None
+        );
+        // Reported up: nothing waits for node 2 any more.
+        holder
+            .meta
+            .ack_remote_chunks(&[ChunkHash::of(b"held on node 2")])
+            .unwrap();
+        assert_eq!(ask(&holder, 2, 0), OwnChunks::None);
+    }
+
+    /// Backed: node 1's stream carries node 2's record to it past its
+    /// held chunk (`Streamed`), so nothing is uploaded on the metered
+    /// network — only the safety timer is armed. When the record arrives
+    /// the op finishes and the timer is cancelled (should-fix 3).
+    #[test]
+    fn a_streamed_answer_keeps_the_chunks_held_and_finishing_cancels_the_timer() {
+        let (requester, rid, records) = streamed_awaiting_log();
+        let mut requester = requester;
+        assert_eq!(requester.core.stats.own_record_uploads, 0);
+        let timer = requester
+            .core
+            .clients
+            .get(&rid)
+            .and_then(|c| c.own_record_timer)
+            .expect("the safety timer");
+        // The record arrives (here: the segment carrying it applied).
+        crate::replica::Replica::apply_segment(&requester.meta, 1, 1, 0, &[], &[], &records)
+            .unwrap();
+        let mut out = Vec::new();
+        let now = requester.now;
+        requester
+            .core
+            .answer_awaiting_log(now, &requester.meta, &mut out);
+        assert_eq!(requester.core.clients().count(), 0, "finished: {out:?}");
+        assert_eq!(replies(&out).len(), 1);
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::CancelTimer { id } if *id == timer)),
+            "the safety timer is cancelled with the op: {out:?}"
+        );
+        assert_eq!(own_record_timers(&requester), 0);
+        assert!(uploads_awaited(&out).is_empty());
+    }
+
+    /// Backed, but the stream stalls (its backup lost after the reply,
+    /// say): past `own_record_wait_ms` the safety timer uploads anyway.
+    #[test]
+    fn a_stalled_stream_uploads_after_the_grace() {
+        let (mut requester, _rid, records) = streamed_awaiting_log();
+        let ino = records
+            .iter()
+            .find_map(|r| match r {
+                LogRecord::WriteManifest { ino, .. } => Some(*ino),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the close: {records:?}"));
+        let timer = requester
+            .core
+            .timers
+            .iter()
+            .find(|(_, (t, _))| matches!(t, Timer::OwnRecordWait(_)))
+            .map(|(id, _)| *id)
+            .expect("the safety timer");
+        requester.advance(requester.core.cfg.own_record_wait_ms);
+        let out = requester.step(Event::Timer { id: timer });
+        assert_eq!(uploads_awaited(&out), vec![ino]);
+        assert_eq!(requester.core.stats.own_record_uploads, 1);
+        assert_eq!(own_record_timers(&requester), 1, "repeated while it waits");
+    }
+
+    /// `CONSTELLATION_OWN_RECORD_WAIT_MS=0` turns it all off (the stall
+    /// comes back: for reproducing it).
+    #[test]
+    fn a_zero_wait_turns_the_mechanism_off() {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        requester.core.cfg.own_record_wait_ms = 0;
+        let (op, _, _) = back_close(&mut holder, true);
+        let (reply, out) = {
+            let rid = requester.rid(1);
+            forward(&mut holder, &mut requester, rid, op)
+        };
+        assert!(matches!(own_chunks_of(&reply).0, OwnChunks::Upload(_)));
+        assert!(uploads_awaited(&out).is_empty());
+        assert_eq!(own_record_timers(&requester), 0);
+    }
+
+    fn chmod(ino: u64) -> MutateOp {
+        MutateOp::Setattr {
+            ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        }
+    }
+
+    /// Review must-fix 1: node 2's `back` close of `f` was forwarded (its
+    /// chunk still held on node 2), and node 2 then `chmod`s `f` (here
+    /// from a fresh requester state: in the repro the close had already
+    /// returned on an applied base). The chmod's records name no chunk,
+    /// but node 1's ship plan defers it with the close (plan 30 §M4's key
+    /// dependence), and its reply comes on a base node 2 has not applied:
+    /// it waits for the log, which waits for node 2's chunk. Node 1 says
+    /// `Upload` naming `f`, and node 2 uploads `f`'s chunks at once —
+    /// under `Local` with no backup, and as a `Held` under `ack=s3`.
+    /// Before, the answer was `None` and the chmod stalled 120 s, EIO.
+    #[test]
+    fn an_op_depending_on_a_held_close_asks_for_the_close_chunks() {
+        for policy in [AckPolicy::Local, AckPolicy::S3] {
+            let (mut holder, mut requester) = holding(policy, Vec::new());
+            let (close, _, _) = back_close(&mut holder, true);
+            let MutateOp::SetManifest { ino, .. } = close else {
+                unreachable!()
+            };
+            let rid = requester.rid(1);
+            forward(&mut holder, &mut requester, rid, close);
+            let (_, mut requester) = holding(policy, Vec::new());
+            let rid = requester.rid(2);
+            let (reply, out) = forward(&mut holder, &mut requester, rid, chmod(ino));
+            let (own, outcome) = own_chunks_of(&reply);
+            assert_eq!(own, OwnChunks::Upload(vec![ino]), "{policy:?}: {reply:?}");
+            match policy {
+                AckPolicy::S3 => {
+                    assert!(matches!(outcome, MutateOutcome::Held { .. }), "{reply:?}")
+                }
+                _ => {
+                    assert!(
+                        matches!(outcome, MutateOutcome::Accepted { .. }),
+                        "{reply:?}"
+                    );
+                    assert_eq!(
+                        requester.core.clients().collect::<Vec<_>>(),
+                        vec![(rid, ClientPhase::AwaitingLog)]
+                    );
+                }
+            }
+            assert_eq!(uploads_awaited(&out), vec![ino], "{policy:?}");
+            if policy == AckPolicy::S3 {
+                // (Every acknowledgement waits for a segment there.)
+                continue;
+            }
+            // An op on another file waits for nothing of node 2's.
+            let other = holder.create("g");
+            let (_, mut requester) = holding(policy, Vec::new());
+            let rid = requester.rid(3);
+            let (reply, out) = forward(&mut holder, &mut requester, rid, other);
+            assert_eq!(own_chunks_of(&reply).0, OwnChunks::None, "{reply:?}");
+            assert!(uploads_awaited(&out).is_empty());
+        }
+    }
+
+    /// Review should-fix 1: a backed root streams node 2's transaction to
+    /// it past node 2's own pending chunk, but not past one node 2 does not
+    /// have — here node 1's own write-back of another file, journaled
+    /// first. Then the stream stops before node 2's close and only the
+    /// segment brings it, after node 2's chunk is up: `Upload`, not a
+    /// `Streamed` that would cost node 2 the safety timer's 10 s first.
+    #[test]
+    fn a_stream_blocked_before_the_op_asks_for_the_upload() {
+        for blocked in [false, true] {
+            let (mut holder, _sub, _req) = stream_pair();
+            let lease = Lease {
+                ack_policy: AckPolicy::Backup,
+                backups: vec![3],
+                ..lease_of(1, 1, holder.now.plus(10_000).0)
+            };
+            holder.core.lease.adopt(holder.now, lease, tag(), None);
+            if blocked {
+                let own = ChunkHash::of(b"node 1's own write-back");
+                let g = holder.meta.create(ROOT_INO, "g", 0o644, 0, 0).unwrap().ino;
+                let manifest =
+                    Manifest::from_sparse_chunks(4096, 9, [(0u64, own)].into(), 64, ChunkHash::of)
+                        .0
+                        .encode();
+                holder
+                    .meta
+                    .set_manifest_dirty(g, None, &manifest, 9, &[own])
+                    .unwrap();
+            }
+            let (close, _, _) = back_close(&mut holder, true);
+            let MutateOp::SetManifest { ino, .. } = close else {
+                unreachable!()
+            };
+            let rid = Rid {
+                node: 2,
+                incarnation: 1,
+                seq: 1,
+            };
+            let records =
+                constellation_meta::execute_mutate(&holder.meta, &close, Some(rid)).unwrap();
+            let accepted = MutateOutcome::Accepted { epoch: 1, records };
+            let own = holder.core.own_chunks_for(
+                2,
+                rid,
+                &accepted,
+                (0, &constellation_meta::Position::ZERO),
+                &holder.meta,
+            );
+            if blocked {
+                assert_eq!(own, OwnChunks::Upload(vec![ino]));
+            } else {
+                assert_eq!(own, OwnChunks::Streamed(vec![ino]));
+            }
+        }
+    }
+
+    /// Node 2's close of a file of node 1's, accepted by a backed node 1
+    /// on a base node 2 has not applied, answered `Streamed`: it waits for
+    /// the log (`AwaitingLog`) with the safety timer armed.
+    fn streamed_awaiting_log() -> (Harness, Rid, Vec<LogRecord>) {
+        let (mut holder, mut requester) = holding(AckPolicy::Local, Vec::new());
+        let (op, _, created) = back_close(&mut holder, true);
+        let MutateOp::SetManifest { ino, .. } = op else {
+            unreachable!()
+        };
+        let rid = requester.rid(1);
+        let closed = constellation_meta::execute_mutate(&holder.meta, &op, Some(rid)).unwrap();
+        // Node 1's create, then node 2's close, as the segment that will
+        // carry them.
+        let records: Vec<LogRecord> = created.into_iter().chain(closed).collect();
+        let out = requester.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+        });
+        let [(1, PeerMsg::MutateRequest { req, .. })] = sends(&out)[..] else {
+            panic!("expected a forward: {out:?}")
+        };
+        let out = requester.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req: *req,
+                outcome: MutateOutcome::Accepted {
+                    epoch: 1,
+                    records: records.clone(),
+                },
+                base: None,
+                position: constellation_meta::Position {
+                    seq: 1,
+                    pending: Some(constellation_meta::JournalPos { epoch: 1, jseq: 9 }),
+                    streams: Default::default(),
+                },
+                gen: 0,
+                own_chunks: OwnChunks::Streamed(vec![ino]),
+            },
+        });
+        assert_eq!(
+            requester.core.clients().collect::<Vec<_>>(),
+            vec![(rid, ClientPhase::AwaitingLog)]
+        );
+        assert!(uploads_awaited(&out).is_empty(), "the stream answers");
+        assert_eq!(timers(&out, TimerKind::OwnRecordWait).len(), 1);
+        (requester, rid, records)
+    }
 }
 
 // ---- plan 30 §M7: log streams ----
@@ -3528,6 +4179,148 @@ mod epoch_rules {
     use super::*;
     use constellation_store_s3::AckPolicy;
 
+    /// A carrier-less activation (the claim resolution carried no lease)
+    /// or a freeze of an epoch `members` are in.
+    fn refusing_epoch(frozen: bool, members: Vec<NodeId>) -> Event {
+        Event::Control {
+            op: OpId(901),
+            req: Control::Epoch {
+                open: true,
+                active: !frozen,
+                frozen,
+                flushing: false,
+                base: 0,
+                carrier: None,
+                stale_below: 0,
+                members,
+            },
+        }
+    }
+
+    fn refused(out: &[Action], rid: Rid) -> bool {
+        replies(out).iter().any(|(r, reply)| {
+            *r == rid
+                && matches!(
+                    reply,
+                    ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))
+                )
+        })
+    }
+
+    /// Chunk close-stall-metered, review must-fix 2: a lone node without a
+    /// lease, S3 cut. Its op entered the lease path (reading the lease, or
+    /// waiting for an acquisition that never completes) before the
+    /// carrier-less epoch activated. The engine's gate refuses new writes
+    /// with `EROFS` from the activation on; the op already queued used to
+    /// wait for its 2 × TTL deadline (120 s) and end in doubt (`EIO`),
+    /// though it was never sent anywhere. Now it is refused `EROFS` at the
+    /// activation, and an op routed afterwards is refused at once — not
+    /// after a lease read on a cut S3. The same at a freeze.
+    #[test]
+    fn an_op_never_sent_is_refused_erofs_when_a_carrierless_epoch_activates() {
+        for frozen in [false, true] {
+            let mut h = Harness::new(2);
+            // Reading the lease (the read never answers: S3 is cut).
+            let learning = h.rid(1);
+            let op = h.create("a");
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid: learning,
+                op,
+            });
+            let (get, req) = s3_ops(&out)[0];
+            assert!(matches!(req, S3Op::LeaseGet));
+            // Waiting for the lease: its read said nobody holds it.
+            let waiting = h.rid(2);
+            let op = h.create("b");
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid: waiting,
+                op,
+            });
+            let (get2, _) = s3_ops(&out)[0];
+            h.step(Event::S3 {
+                op: get2,
+                result: S3Result::LeaseGet(Ok(None)),
+            });
+            let phases: Vec<_> = h.core.clients().collect();
+            assert!(
+                phases.contains(&(learning, ClientPhase::LearnHolder))
+                    && phases
+                        .iter()
+                        .any(|(r, p)| *r == waiting && *p != ClientPhase::LearnHolder),
+                "{phases:?}"
+            );
+            let out = h.step(refusing_epoch(frozen, vec![2]));
+            assert!(refused(&out, learning), "frozen={frozen}: {out:?}");
+            assert!(refused(&out, waiting), "frozen={frozen}: {out:?}");
+            assert_eq!(h.core.clients().count(), 0);
+            // The lease read's late answer finds no op.
+            let out = h.step(Event::S3 {
+                op: get,
+                result: S3Result::LeaseGet(Ok(None)),
+            });
+            assert!(replies(&out).is_empty());
+            // Routed after the activation: refused at once, no S3 read.
+            let late = h.rid(3);
+            let op = h.create("c");
+            let out = h.step(Event::Submit {
+                policy: Policy::Client,
+                rid: late,
+                op,
+            });
+            assert!(refused(&out, late), "frozen={frozen}: {out:?}");
+            assert!(s3_ops(&out).is_empty(), "{out:?}");
+        }
+    }
+
+    /// An op that was sent to a holder before (here: forwarded, then
+    /// answered `NotHolder`, so it took the lease path) is never refused
+    /// `EROFS` — it may have taken effect: in doubt (`EIO`), as at a
+    /// freeze.
+    #[test]
+    fn an_op_already_sent_stays_in_doubt_when_a_carrierless_epoch_activates() {
+        let mut h = Harness::new(2);
+        h.core.lease.cached_holder = Some(1);
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 1,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(1),
+                since: Some(Ms(0)),
+            }],
+        });
+        let rid = h.rid(1);
+        let op = h.create("a");
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op,
+        });
+        let [(1, PeerMsg::MutateRequest { req, .. })] = sends(&out)[..] else {
+            panic!("expected a forward: {out:?}")
+        };
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req: *req,
+                outcome: MutateOutcome::NotHolder { holder: 0 },
+                base: None,
+                position: constellation_meta::Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+            },
+        });
+        assert!(replies(&out).is_empty(), "{out:?}");
+        let out = h.step(refusing_epoch(false, vec![2]));
+        let r = replies(&out);
+        assert!(
+            matches!(r.as_slice(), [(x, ClientReply::InDoubt)] if *x == rid),
+            "{out:?}"
+        );
+    }
+
     fn epoch(open: bool, active: bool, members: Vec<NodeId>) -> Event {
         Event::Control {
             op: OpId(900),
@@ -4777,6 +5570,7 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 0,
+            own_chunks: OwnChunks::None,
         },
     });
     let backoff = timers(&out, TimerKind::ForwardBackoff);
@@ -5496,6 +6290,7 @@ mod backup_crash {
                 base: Some(0),
                 position: constellation_meta::Position::ZERO,
                 gen: 0,
+                own_chunks: OwnChunks::None,
             },
         });
         let r = replies(&out);
@@ -9140,6 +9935,7 @@ fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
             base: None,
             position: constellation_meta::Position::ZERO,
             gen: 0,
+            own_chunks: OwnChunks::None,
         },
     });
     assert!(
@@ -9453,6 +10249,7 @@ mod portable_codes {
             base,
             position,
             gen,
+            own_chunks,
         } = msg
         else {
             panic!("not a mutate reply: {msg:?}")
@@ -9465,6 +10262,8 @@ mod portable_codes {
             position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
             position_streams: position.streams_wire(),
             gen: *gen,
+            own_chunks: own_chunks.to_wire().0,
+            own_inos: own_chunks.to_wire().1,
         };
         let key = iroh::SecretKey::from_bytes(&[7; 32]);
         let frame = Signed::new(&key, &payload).unwrap().encode().unwrap();
@@ -9477,6 +10276,8 @@ mod portable_codes {
             position_pending,
             position_streams,
             gen,
+            own_chunks,
+            own_inos,
         } = received
         else {
             panic!("the frame decoded to another payload")
@@ -9492,6 +10293,7 @@ mod portable_codes {
             }
             .with_streams_wire(&position_streams),
             gen,
+            own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
         };
         (decoded, outcome)
     }

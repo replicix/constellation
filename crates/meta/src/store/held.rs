@@ -362,8 +362,16 @@ fn names_any(manifest: &[u8], missing: &BTreeSet<ChunkHash>) -> bool {
 
 /// The poisoned inodes `tx` is a seed for.
 fn seed_inos(tx: &Tx, poisoned: &PoisonMap) -> Vec<Ino> {
+    seed_inos_of(tx.rows.iter().map(|(_, rec)| rec), poisoned)
+}
+
+/// The inodes of `poisoned` whose chunks `records`' manifests name.
+pub(crate) fn seed_inos_of<'a>(
+    records: impl IntoIterator<Item = &'a LogRecord>,
+    poisoned: &PoisonMap,
+) -> Vec<Ino> {
     let mut out = Vec::new();
-    for (_, rec) in &tx.rows {
+    for rec in records {
         if let LogRecord::WriteManifest { ino, manifest, .. } = rec {
             if let Some(missing) = poisoned.get(ino) {
                 if names_any(manifest, missing) && !out.contains(ino) {
@@ -459,6 +467,70 @@ fn plan(
     }
     out.opaque = opaque;
     Ok(out)
+}
+
+/// Chunk close-stall-metered: whether the ship plan defers `rid`'s
+/// unshipped transaction, and if so, the inodes of `theirs` — one node's
+/// remote-pending chunks (`store::remote`) — that it waits for: those its
+/// own manifests name, and those of every deferred transaction it depends
+/// on by key, transitively ([`plan`]'s deferral, walked with the seeds
+/// that caused it). `None`: no unshipped transaction of `rid` (shipped,
+/// or never journaled here). A transaction held behind a lost chunk is
+/// planned as deferred here: the node's upload is still one of the things
+/// it waits for.
+pub(crate) fn deferral_blame(
+    r: &impl Readable,
+    meta: &Meta,
+    rid: crate::rid::Rid,
+    theirs: &PoisonMap,
+) -> Result<Option<(u64, BTreeSet<Ino>)>, MetaError> {
+    let pending = read_pending(r, meta)?;
+    // The blame of each key a deferred transaction touched.
+    let mut blame_of: BTreeMap<Vec<u8>, BTreeSet<Ino>> = BTreeMap::new();
+    // Every deferred transaction's blame (what an uncaptured transaction,
+    // whose keys are unknown, depends on).
+    let mut all: BTreeSet<Ino> = BTreeSet::new();
+    let mut any_deferred = false;
+    let mut opaque = false;
+    for tx in transactions(r, meta)? {
+        let row = local::get_journal_tx(r, meta, tx.first)?;
+        let keys = match tx.spec_seq {
+            Some(seq) => spec::row_keys_and_origin(r, meta, seq)?.map(|(keys, _)| keys),
+            None => None,
+        };
+        let observed = row.as_ref().map(|t| t.observed.as_slice()).unwrap_or(&[]);
+        let mut blame: BTreeSet<Ino> = seed_inos(&tx, theirs).into_iter().collect();
+        let mut deferred = !seed_inos(&tx, &pending).is_empty();
+        if opaque || (keys.is_none() && any_deferred) {
+            deferred = true;
+            blame.extend(all.iter().copied());
+        }
+        for k in observed.iter().chain(keys.iter().flatten()) {
+            if let Some(b) = blame_of.get(k) {
+                deferred = true;
+                blame.extend(b.iter().copied());
+            }
+        }
+        if deferred {
+            any_deferred = true;
+            match &keys {
+                Some(keys) => {
+                    for k in keys {
+                        blame_of.entry(k.clone()).or_default().extend(&blame);
+                    }
+                }
+                None => opaque = true,
+            }
+            all.extend(&blame);
+        }
+        if row.and_then(|t| t.rid) == Some(rid) {
+            return Ok(Some((
+                tx.last,
+                if deferred { blame } else { BTreeSet::new() },
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn summarize(plan: &Plan, poisoned: &PoisonMap) -> HeldSummary {

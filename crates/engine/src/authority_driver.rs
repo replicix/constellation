@@ -37,7 +37,7 @@ use constellation_authority::{
 };
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::locks::{Grant, GrantId};
-use constellation_meta::{JournalPos, Meta, MutateOp, MutateOutcome, Position, Rid};
+use constellation_meta::{JournalPos, Meta, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
 use constellation_net::{LogEvent, Payload};
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::lease::now_unix_ms;
@@ -62,7 +62,7 @@ const SLOW_STEP_US: u64 = 500_000;
 /// What a forwarded mutation's reply carries back to the bridge: the
 /// outcome, plan 30 §M6's `base`, the position and (§M11) the executing
 /// delegation generation (0: the root).
-pub type MutateReplyParts = (MutateOutcome, Option<u64>, Position, u64);
+pub type MutateReplyParts = (MutateOutcome, Option<u64>, Position, u64, OwnChunks);
 
 /// Plan 30 §M14: an owner's answer to a `LockRenew`.
 pub type LockRenewResults = Vec<(constellation_fs_core::Ino, GrantId, LockRenewResult)>;
@@ -169,6 +169,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::CancelTimer { .. } => "CancelTimer",
         Action::S3 { req, .. } => s3_kind(req),
         Action::UploadDirtyChunks { .. } => "UploadDirtyChunks",
+        Action::UploadAwaited { .. } => "UploadAwaited",
         Action::Publish { .. } => "Publish",
         Action::FollowHead { .. } => "FollowHead",
         Action::Announce { .. } => "Announce",
@@ -502,6 +503,11 @@ pub fn load_config(
         );
     c.read_delegation_ttl_ms = crate::cto::read_delegation_ttl_ms();
     c.recall_hold_ms = (c.forward_timeout_ms / 2).max(1);
+    // How long a forwarded `back` close may wait on the holder for its
+    // own record before its held chunks go up (`Action::UploadAwaited`;
+    // 0: never).
+    c.own_record_wait_ms =
+        env_u64_zero_ok("CONSTELLATION_OWN_RECORD_WAIT_MS", c.own_record_wait_ms);
     // Plan 30 §M14: cluster locks follow P2P here; `node_runtime` applies
     // the mount's `--locks` (`crate::locks::cluster_effective`).
     c.locks = p2p;
@@ -1204,6 +1210,7 @@ impl Driver {
                             None,
                             Position::ZERO,
                             0,
+                            OwnChunks::None,
                         ));
                         return None;
                     }
@@ -1230,6 +1237,7 @@ impl Driver {
                                 None,
                                 Position::ZERO,
                                 0,
+                                OwnChunks::None,
                             ));
                             return None;
                         }
@@ -1732,6 +1740,46 @@ impl Driver {
                     });
                 }
                 Action::CancelTimer { .. } => {}
+                Action::UploadAwaited { inos } => {
+                    // The inodes' passes, not the round's background one:
+                    // the upload hold does not stop them (an `fsync`'s
+                    // drain is the same pass). Their reports tell the
+                    // holder, which then ships the waiting transaction. A
+                    // repeat (the core's safety timer) after the chunks
+                    // went up finds no row and costs one index lookup.
+                    let inos: Vec<_> = inos
+                        .into_iter()
+                        .filter(|ino| {
+                            !self
+                                .deps
+                                .meta
+                                .pending_uploads_for_ino(*ino)
+                                .is_ok_and(|rows| rows.is_empty())
+                        })
+                        .collect();
+                    if inos.is_empty() {
+                        continue;
+                    }
+                    let upload = self.uploader();
+                    let held = self.deps.upload.hold.is_held();
+                    tokio::spawn(async move {
+                        for ino in inos {
+                            if let Err(error) = upload.run(Some(ino)).await {
+                                tracing::debug!(
+                                    ino,
+                                    error = %format!("{error:#}"),
+                                    "upload for a forwarded op waiting on its own transaction failed"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    ino,
+                                    held,
+                                    "uploaded the chunks a forwarded op waited on"
+                                );
+                            }
+                        }
+                    });
+                }
                 Action::UploadDirtyChunks {
                     op,
                     ino,
@@ -1979,6 +2027,7 @@ impl Driver {
                 base,
                 position,
                 gen,
+                own_chunks,
             } => {
                 tracing::trace!(target: "constellation::fwd", req = req.0, "mutate reply sent");
                 if let Some(tx) = self.mutate_replies.remove(&req) {
@@ -1992,10 +2041,10 @@ impl Driver {
                         // for.
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
-                            let _ = tx.send((outcome, base, position, gen));
+                            let _ = tx.send((outcome, base, position, gen, own_chunks));
                         });
                     } else {
-                        let _ = tx.send((outcome, base, position, gen));
+                        let _ = tx.send((outcome, base, position, gen, own_chunks));
                     }
                 }
             }
@@ -2618,6 +2667,7 @@ impl Driver {
                                 base: None,
                                 position: Position::ZERO,
                                 gen: 0,
+                                own_chunks: OwnChunks::None,
                             },
                         }));
                         return;
@@ -2663,6 +2713,8 @@ impl Driver {
                             position_pending,
                             position_streams,
                             gen,
+                            own_chunks,
+                            own_inos,
                         })) if req_id == req.0 => {
                             let position = Position {
                                 seq: position_seq,
@@ -2696,6 +2748,7 @@ impl Driver {
                                     base,
                                     position,
                                     gen,
+                                    own_chunks: OwnChunks::from_wire(own_chunks, own_inos),
                                 },
                             }));
                         }
@@ -2709,6 +2762,7 @@ impl Driver {
                                     base: None,
                                     position: Position::ZERO,
                                     gen: 0,
+                                    own_chunks: OwnChunks::None,
                                 },
                             }));
                         }
@@ -4502,6 +4556,7 @@ impl Standalone {
                     ok: true,
                 }),
                 Action::CancelTimer { .. }
+                | Action::UploadAwaited { .. }
                 | Action::Announce { .. }
                 | Action::RoundDone { .. }
                 | Action::RefreshRoster

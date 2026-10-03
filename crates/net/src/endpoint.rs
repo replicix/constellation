@@ -13,7 +13,7 @@
 
 use crate::addrs::{AddrPolicy, PreferredPaths};
 use crate::allowlist::{Allowlist, Decision};
-use crate::message::{ChunkDecline, ChunkStatus, Payload, Signed, ALPN};
+use crate::message::{ChunkDecline, ChunkStatus, Payload, Signed, ALPN, OLDER_ALPNS};
 use crate::relay::RelayPolicy;
 use anyhow::{Context, Result};
 use iroh::address_lookup::memory::MemoryLookup;
@@ -609,6 +609,116 @@ async fn watch_local_addrs(pool: Weak<Pool>, policy: AddrPolicy) {
     }
 }
 
+/// How often one peer's P2P version mismatch is logged
+/// ([`log_version_mismatch`]).
+const VERSION_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// When each peer's version mismatch was last logged (by endpoint id).
+static VERSION_LOGGED: std::sync::LazyLock<Mutex<HashMap<[u8; 32], std::time::Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether `peer`'s version mismatch is due to be logged (once per
+/// [`VERSION_LOG_EVERY`]); marks it logged.
+pub(crate) fn version_log_due(peer: &iroh::EndpointId) -> bool {
+    let now = std::time::Instant::now();
+    let mut logged = VERSION_LOGGED.lock().unwrap();
+    logged.retain(|_, at| now.duration_since(*at) < VERSION_LOG_EVERY);
+    match logged.entry(*peer.as_bytes()) {
+        std::collections::hash_map::Entry::Occupied(_) => false,
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(now);
+            true
+        }
+    }
+}
+
+fn alpn_name(alpn: &[u8]) -> String {
+    String::from_utf8_lossy(alpn).into_owned()
+}
+
+/// Whether a failed dial is the peer refusing every ALPN offered: the TLS
+/// `no_application_protocol` alert, which rustls reports as "peer doesn't
+/// support any known protocol" — a node of another P2P version.
+pub(crate) fn refused_alpn(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut text = format!("{err} {err:?}");
+    let mut source = err.source();
+    while let Some(e) = source {
+        text.push(' ');
+        text.push_str(&e.to_string());
+        source = e.source();
+    }
+    let text = text.to_ascii_lowercase();
+    text.contains("known protocol")
+        || text.contains("no_application_protocol")
+        || text.contains("noapplicationprotocol")
+}
+
+/// Review should-fix 2 (chunk close-stall-metered): a P2P version
+/// mismatch, logged by name — rate-limited per peer, at `warn`, since
+/// nodes of different versions do not talk P2P at all (every forward,
+/// stream and backup between them fails over to S3 paths). `theirs`:
+/// the version the peer speaks, when known.
+pub(crate) fn log_version_mismatch(peer: &iroh::EndpointId, theirs: Option<&[u8]>, inbound: bool) {
+    let ours = alpn_name(ALPN);
+    match theirs {
+        Some(theirs) => tracing::warn!(
+            peer = %peer.fmt_short(),
+            ours,
+            theirs = alpn_name(theirs),
+            inbound,
+            "P2P protocol version mismatch: the peer speaks another version and the two \
+             nodes cannot talk P2P (a cluster upgrades all its nodes together)"
+        ),
+        None => tracing::warn!(
+            peer = %peer.fmt_short(),
+            ours,
+            older = ?OLDER_ALPNS.iter().map(|a| alpn_name(a)).collect::<Vec<_>>(),
+            "P2P protocol version mismatch: the peer refused this node's version and \
+             none it knows (it runs a newer one?); the two nodes cannot talk P2P"
+        ),
+    }
+}
+
+/// The peer refused [`ALPN`]: dial it once with each of [`OLDER_ALPNS`]
+/// to learn which version it speaks, close at once, and log the mismatch.
+async fn probe_peer_version(endpoint: Endpoint, peer: EndpointAddr, limit: Duration) {
+    let theirs = peer_version(&endpoint, &peer, limit).await;
+    log_version_mismatch(&peer.id, theirs, false);
+}
+
+/// Which of [`OLDER_ALPNS`] `peer` accepts, if any (the connection is
+/// closed at once).
+async fn peer_version(
+    endpoint: &Endpoint,
+    peer: &EndpointAddr,
+    limit: Duration,
+) -> Option<&'static [u8]> {
+    for &alpn in OLDER_ALPNS {
+        if let Ok(Ok(conn)) =
+            tokio::time::timeout(limit, endpoint.connect(peer.clone(), alpn)).await
+        {
+            conn.close(
+                iroh::endpoint::VarInt::from_u32(VERSION_MISMATCH),
+                &version_reason(),
+            );
+            return Some(alpn);
+        }
+    }
+    None
+}
+
+/// The QUIC close code of a connection refused for its P2P version.
+pub(crate) const VERSION_MISMATCH: u32 = 0x5645; // "VE"
+
+/// The close reason naming this node's version.
+pub(crate) fn version_reason() -> Vec<u8> {
+    format!(
+        "P2P protocol version mismatch: this node speaks {}",
+        alpn_name(ALPN)
+    )
+    .into_bytes()
+}
+
 /// Watches every completed handshake: tracks the connection (for
 /// [`Pool::evict`]), and on an inbound one — a peer dialing us afresh
 /// may be a new incarnation behind a connection we still pool — has the
@@ -941,6 +1051,8 @@ pub trait PeerService: Send + Sync + 'static {
                 position_pending: None,
                 position_streams: Vec::new(),
                 gen: 0,
+                own_chunks: 0,
+                own_inos: Vec::new(),
             }
         })
     }
@@ -1302,7 +1414,13 @@ impl P2p {
             .relay_mode(relay_mode)
             .secret_key(key.clone())
             .address_lookup(lookup.clone())
-            .alpns(vec![ALPN.to_vec(), iroh_gossip::ALPN.to_vec()])
+            .alpns(
+                [ALPN, iroh_gossip::ALPN]
+                    .into_iter()
+                    .chain(OLDER_ALPNS.iter().copied())
+                    .map(<[u8]>::to_vec)
+                    .collect(),
+            )
             .transport_config(transport_config(path_idle_timeout()))
             .path_selector(preferred.clone())
             .hooks(InboundWatch {
@@ -1788,10 +1906,24 @@ impl P2p {
         // every address is gone would otherwise hold it — and every other
         // request to this peer — for the whole QUIC handshake timeout.
         let limit = self.dial_timeout;
-        let conn = tokio::time::timeout(limit, self.endpoint.connect(peer.clone(), ALPN))
+        let conn = match tokio::time::timeout(limit, self.endpoint.connect(peer.clone(), ALPN))
             .await
             .map_err(|_| anyhow::anyhow!("dialing peer timed out after {limit:?}"))?
-            .context("dialing peer")?;
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                if refused_alpn(&e) && version_log_due(&peer.id) {
+                    // Off the gate: learning the peer's version is one
+                    // more dial, and the caller's error is the same.
+                    tokio::spawn(probe_peer_version(
+                        self.endpoint.clone(),
+                        peer.clone(),
+                        limit,
+                    ));
+                }
+                return Err(anyhow::Error::from(e).context("dialing peer"));
+            }
+        };
         *slot = Some(conn.clone());
         Ok(conn)
     }
@@ -1886,6 +2018,70 @@ mod tests {
         assert_ne!(from_secret, a);
         // Deterministic, so every node of one filesystem agrees.
         assert_eq!(a, topic_for(None, "uuid-a"));
+    }
+
+    /// Review should-fix 2 (chunk close-stall-metered): a node of the
+    /// previous P2P version (an endpoint speaking only `constellation/1`)
+    /// refuses this node's dial; the failure is recognized as a version
+    /// refusal (not a generic dial error), and the probe learns the peer's
+    /// version, so the log names both. The other way round, an old node's
+    /// dial is accepted at the handshake only to be closed with a reason
+    /// naming this node's version.
+    #[tokio::test]
+    async fn a_peer_of_another_version_is_named() {
+        let topic = topic_for(Some(&[2u8; 32]), "fs");
+        let new = P2p::spawn(SecretKey::generate(), topic).await.unwrap();
+        let old = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![OLDER_ALPNS[0].to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        // The old node's accept loop (a handshake runs only once an
+        // incoming connection is accepted).
+        let ep = old.clone();
+        let serve = tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        conn.closed().await;
+                    }
+                });
+            }
+        });
+        let deadline = tokio::time::Instant::now() + ADDR_SCAN_WAIT;
+        while old.addr().addrs.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let limit = Duration::from_secs(10);
+        let err = tokio::time::timeout(limit, new.endpoint().connect(old.addr(), ALPN))
+            .await
+            .expect("the dial completes")
+            .expect_err("the old node refuses constellation/2");
+        assert!(refused_alpn(&err), "{err:#} / {err:?}");
+        assert_eq!(
+            peer_version(new.endpoint(), &old.addr(), limit).await,
+            Some(OLDER_ALPNS[0])
+        );
+        assert!(version_log_due(&old.id()));
+        assert!(!version_log_due(&old.id()), "rate-limited per peer");
+        // A dial that fails for another reason is not a version refusal.
+        let gone = Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let addr = gone.addr();
+        gone.close().await;
+        if let Ok(Err(err)) =
+            tokio::time::timeout(Duration::from_secs(3), new.endpoint().connect(addr, ALPN)).await
+        {
+            assert!(!refused_alpn(&err), "{err:#}");
+        }
+        serve.abort();
     }
 
     /// End-to-end over real QUIC on loopback: a direct request reaches the

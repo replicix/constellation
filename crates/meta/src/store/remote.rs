@@ -39,10 +39,12 @@
 
 use crate::error::MetaError;
 use crate::record::LogRecord;
+use crate::store::held::{deferral_blame, seed_inos_of, PoisonMap};
 use crate::store::misc::{add_pending_claim_tx, cr_key, remove_pending_row_tx};
-use crate::store::Meta;
+use crate::store::{local, Meta};
 use constellation_fs_core::{ChunkHash, ChunkInfo, Ino, Manifest};
 use fjall::Readable;
+use std::collections::BTreeSet;
 
 const REMOTE_PREFIX: &[u8] = b"remote-chunk/";
 
@@ -191,6 +193,67 @@ pub(crate) fn remote_pending_for_ino_tx(
         }
     }
     Ok(out)
+}
+
+/// `node`'s live remote-pending rows (marks with their pending row), per
+/// inode.
+fn remote_pending_from_tx(
+    r: &impl Readable,
+    meta: &Meta,
+    node: u64,
+) -> Result<PoisonMap, MetaError> {
+    let mut out = PoisonMap::new();
+    for guard in r.prefix(&meta.local, REMOTE_PREFIX) {
+        let (k, v) = guard.into_inner()?;
+        let Some(mark) = decode_mark(&k, &v) else {
+            continue;
+        };
+        if mark.node == node
+            && r.get(&meta.pending_upload, cr_key(&mark.hash, mark.ino))?
+                .is_some()
+        {
+            out.entry(mark.ino).or_default().insert(mark.hash);
+        }
+    }
+    Ok(out)
+}
+
+/// What a forwarded op's transaction waits for from the node that
+/// forwarded it ([`Meta::remote_blockers`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteBlockers {
+    /// The inodes whose chunks that node forwarded as pending, and has not
+    /// reported up, the transaction cannot leave this node before: empty
+    /// when it waits for nothing of that node's.
+    pub inos: Vec<Ino>,
+    /// The transaction's last journal seq, when it is still unshipped
+    /// here.
+    pub through: Option<u64>,
+}
+
+/// [`Meta::remote_blockers`] for a delegate: the inodes of `theirs` that
+/// the transactions of stream `gen` up to `rid`'s (in stream order) name.
+fn delegate_blame(
+    r: &impl Readable,
+    meta: &Meta,
+    gen: u64,
+    rid: crate::rid::Rid,
+    theirs: &PoisonMap,
+) -> Result<Option<(u64, BTreeSet<Ino>)>, MetaError> {
+    let mut txs: Vec<(u64, local::JournalTx)> = local::read_journal_txs(r, meta)?
+        .into_iter()
+        .filter(|(_, row)| row.gen == gen)
+        .collect();
+    txs.sort_by_key(|(_, row)| row.idx);
+    let mut blame = BTreeSet::new();
+    for (first, row) in txs {
+        let records = local::journal_records(r, meta, first, row.last)?;
+        blame.extend(seed_inos_of(records.iter().map(|(_, rec)| rec), theirs));
+        if row.rid == Some(rid) {
+            return Ok(Some((row.last, blame)));
+        }
+    }
+    Ok(None)
 }
 
 impl Meta {
@@ -348,6 +411,54 @@ impl Meta {
         }
         Ok(txs.len())
     }
+
+    /// Chunk close-stall-metered: the inodes whose chunks `node`
+    /// forwarded as pending (its `back` close's manifest, enrolled by
+    /// [`Self::enroll_remote_chunks`]) and has not reported up yet that
+    /// `rid`'s transaction — just executed here for `node`, with
+    /// `records` — cannot leave this node before. Those its own manifests
+    /// name, and those of every earlier transaction it depends on:
+    ///
+    /// - as the root (`gen` 0), the ship plan defers a transaction that
+    ///   touches a key a deferred one touched (`store::held`, plan 30
+    ///   §M4/§M7), so a `chmod` right after a `back` close of the same file
+    ///   waits for the close's chunks as much as the close does;
+    /// - as a delegate (`gen` ≠ 0), the stream to the root stops at the
+    ///   first transaction naming a pending chunk and keeps its order
+    ///   ([`Self::delegate_txs_from`]): everything up to `rid`'s in the
+    ///   generation's stream counts.
+    ///
+    /// The sequencer's answer to the forward names them (`OwnChunks`), so
+    /// a forwarder whose uploads are held (a metered network) uploads
+    /// them when it must wait for the transaction. One prefix scan of the
+    /// remote marks when `node` has none pending here (the common case).
+    pub fn remote_blockers(
+        &self,
+        rid: crate::rid::Rid,
+        gen: u64,
+        records: &[LogRecord],
+        node: u64,
+    ) -> Result<RemoteBlockers, MetaError> {
+        let r = self.db.read_tx();
+        let theirs = remote_pending_from_tx(&r, self, node)?;
+        if theirs.is_empty() {
+            return Ok(RemoteBlockers::default());
+        }
+        let mut inos: BTreeSet<Ino> = seed_inos_of(records, &theirs).into_iter().collect();
+        let found = if gen == 0 {
+            deferral_blame(&r, self, rid, &theirs)?
+        } else {
+            delegate_blame(&r, self, gen, rid, &theirs)?
+        };
+        let through = found.as_ref().map(|(last, _)| *last);
+        if let Some((_, blame)) = found {
+            inos.extend(blame);
+        }
+        Ok(RemoteBlockers {
+            inos: inos.into_iter().collect(),
+            through,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -433,5 +544,51 @@ mod tests {
         meta.ack_upload(&a, f.ino).unwrap();
         meta.ack_remote_chunks(&[b]).unwrap();
         assert_eq!(meta.releasable_prefix(&txs, None).unwrap(), 3);
+    }
+
+    /// The sequencer's `OwnChunks` question for a transaction it does not
+    /// hold unshipped (only the records count): do these records wait for
+    /// `node`'s upload? Only a row marked remote from that node counts —
+    /// not another node's, not this node's own pending chunk, and not
+    /// once the node reported it up.
+    #[test]
+    fn records_wait_for_the_forwarders_upload_only_while_its_rows_are_pending() {
+        let meta = Meta::open_in_memory().unwrap();
+        let f = File { ino: 42 };
+        let (a, b, c) = (
+            ChunkHash::of(b"a"),
+            ChunkHash::of(b"b"),
+            ChunkHash::of(b"c"),
+        );
+        let records = |hashes: &[ChunkHash]| {
+            vec![LogRecord::WriteManifest {
+                ino: f.ino,
+                base_manifest: None,
+                manifest: manifest_of(hashes),
+                size: 4096,
+                time_ns: 0,
+            }]
+        };
+        let rid = crate::rid::Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 1,
+        };
+        let waits = |records: &[LogRecord], node: u64| {
+            let b = meta.remote_blockers(rid, 0, records, node).unwrap();
+            assert_eq!(b.through, None, "never journaled here");
+            !b.inos.is_empty()
+        };
+        assert!(!waits(&records(&[a, b]), 2));
+        meta.enroll_remote_chunks(f.ino, &[b], 2).unwrap();
+        meta.enroll_remote_chunks(f.ino, &[c], 3).unwrap();
+        meta.add_pending_upload(&a, f.ino).unwrap();
+        assert!(waits(&records(&[a, b]), 2));
+        assert!(!waits(&records(&[a, b]), 3));
+        assert!(!waits(&records(&[a]), 2));
+        assert!(waits(&records(&[c]), 3));
+        assert!(!waits(&[], 2));
+        meta.ack_remote_chunks(&[b]).unwrap();
+        assert!(!waits(&records(&[a, b]), 2));
     }
 }

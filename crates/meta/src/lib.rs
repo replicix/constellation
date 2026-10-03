@@ -19,7 +19,7 @@ pub mod store;
 
 pub use constellation_mtree::keys::snapshot_id;
 pub use error::MetaError;
-pub use mutate::{execute as execute_mutate, MutateOp, MutateOutcome};
+pub use mutate::{execute as execute_mutate, MutateOp, MutateOutcome, OwnChunks};
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
 pub use readdeleg::{
     recall_inos, recall_inos_executed, recall_inos_of_op, CtoStats, HeldDelegation,
@@ -37,6 +37,7 @@ pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
 pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
+pub use store::remote::RemoteBlockers;
 pub use store::spec::{
     Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,
     LOCAL_REPLAY_INCARNATION,

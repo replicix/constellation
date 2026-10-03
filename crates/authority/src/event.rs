@@ -13,7 +13,7 @@
 
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
-use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, Position, Rid};
+use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
 use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::InboxBatch;
 use constellation_store_s3::{Lease, LeaseTag};
@@ -325,6 +325,13 @@ pub enum PeerMsg {
         /// (0: the root). A shadow or hint installed from the reply
         /// strands when the log recalls it.
         gen: u64,
+        /// Chunk close-stall-metered: whether the op's records wait for
+        /// the requester's own pending chunks (a `back` close forwarded
+        /// with them still uploading there), and whether anything but its
+        /// upload brings them back to it (`Core::own_chunks_for`). Set on
+        /// `Accepted`, and on a `Held` only while the acknowledgement
+        /// itself waits for durability; `None` on every other answer.
+        own_chunks: OwnChunks,
     },
     /// "I want the lease" (`Payload::LeaseRequest`), sent to the holder.
     /// `epoch_applied`: `Some(applied)` asks for a continuation epoch's
