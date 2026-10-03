@@ -301,11 +301,206 @@ pub fn configure_s3_client(builder: AmazonS3Builder) -> AmazonS3Builder {
     builder
         .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
         .with_retry(retry)
+        .with_http_connector(RedactingConnector)
+}
+
+/// The HTTP connector of every S3 client [`configure_s3_client`] builds:
+/// reqwest's, with each error response's body cut down to its S3 error
+/// code before object_store sees it.
+///
+/// **Why** (plan 37 K6a): object_store puts an error response's body into
+/// its error text, and an S3 authentication failure's body echoes the
+/// request — `<AWSAccessKeyId>`, `<StringToSign>`, `<CanonicalRequest>`
+/// (AWS, versitygw, MinIO all do). That text reaches the daemon's log, a
+/// control error, a CSI plugin's gRPC status and from there a kubelet event
+/// on a tenant's pod. Rewritten here, once, it cannot reach any of them:
+/// the body that is left is `<Error><Code>…</Code><Message>…</Message></Error>`
+/// with the code (what [`crate::classify`] decides by) and a fixed message
+/// — for 401/403, that S3 refused the credentials. The status line is
+/// untouched. Bodies of successful responses are never read here.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RedactingConnector;
+
+impl object_store::client::HttpConnector for RedactingConnector {
+    fn connect(
+        &self,
+        options: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        let inner = object_store::client::ReqwestConnector::default().connect(options)?;
+        Ok(object_store::client::HttpClient::new(RedactingService(
+            inner,
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct RedactingService(object_store::client::HttpClient);
+
+#[async_trait::async_trait]
+impl object_store::client::HttpService for RedactingService {
+    async fn call(
+        &self,
+        req: object_store::client::HttpRequest,
+    ) -> Result<object_store::client::HttpResponse, object_store::client::HttpError> {
+        let response = self.0.execute(req).await?;
+        let status = response.status().as_u16();
+        if status < 400 {
+            return Ok(response);
+        }
+        let (mut parts, body) = response.into_parts();
+        let body = read_capped(body.bytes_stream(), ERROR_BODY_CAP).await?;
+        let redacted = redacted_error_body(status, &String::from_utf8_lossy(&body));
+        parts.headers.remove("content-length");
+        Ok(object_store::client::HttpResponse::from_parts(
+            parts,
+            redacted.into(),
+        ))
+    }
+}
+
+/// How much of an error response's body is read: S3 puts the `<Code>`
+/// first, and only the code survives.
+const ERROR_BODY_CAP: usize = 64 * 1024;
+
+/// The first `cap` bytes of `stream`; the rest is not read.
+async fn read_capped(
+    mut stream: futures::stream::BoxStream<
+        'static,
+        Result<bytes::Bytes, object_store::client::HttpError>,
+    >,
+    cap: usize,
+) -> Result<Vec<u8>, object_store::client::HttpError> {
+    use futures::StreamExt;
+    let mut body = Vec::new();
+    while body.len() < cap {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = chunk?;
+        let room = cap - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    Ok(body)
+}
+
+/// What [`RedactingConnector`] leaves of an error response's `body`: its
+/// `<Code>` (restricted to an S3 error code's alphabet) and a fixed
+/// message. Never anything else of the body.
+pub fn redacted_error_body(status: u16, body: &str) -> String {
+    let code = body
+        .split_once("<Code>")
+        .and_then(|(_, rest)| rest.split_once("</Code>"))
+        .map(|(code, _)| code.trim())
+        .filter(|c| {
+            !c.is_empty()
+                && c.len() <= 64
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        });
+    let message = match status {
+        401 | 403 => "S3 refused the credentials (the rest of its error body is withheld)",
+        _ => "the rest of S3's error body is withheld",
+    };
+    match code {
+        Some(code) => format!("<Error><Code>{code}</Code><Message>{message}</Message></Error>"),
+        None => format!("<Error><Message>{message}</Message></Error>"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn an_error_body_is_read_up_to_the_cap_only() {
+        use futures::StreamExt;
+        let chunk = bytes::Bytes::from(vec![b'x'; 40 * 1024]);
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = polled.clone();
+        // A body that never ends: reading it unbounded would not return.
+        let endless = futures::stream::repeat_with(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(chunk.clone())
+        })
+        .boxed();
+        let read = super::read_capped(endless, 64 * 1024).await.unwrap();
+        assert_eq!(read.len(), 64 * 1024);
+        assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // The code at the front survives the cut.
+        let mut body = b"<Error><Code>SlowDown</Code>".to_vec();
+        body.resize(200 * 1024, b'y');
+        let one = futures::stream::iter([Ok(bytes::Bytes::from(body))]).boxed();
+        let cut = super::read_capped(one, 64 * 1024).await.unwrap();
+        assert!(
+            super::redacted_error_body(503, &String::from_utf8_lossy(&cut))
+                .contains("<Code>SlowDown</Code>")
+        );
+    }
+
     use super::*;
+
+    /// An S3 authentication failure's body, as AWS and versitygw send it:
+    /// it echoes the key id and the string to sign.
+    const LEAKY_403: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we \
+        calculated does not match the signature you provided.</Message>\
+        <AWSAccessKeyId>AKIDLEAKCANARY</AWSAccessKeyId><StringToSign>AWS4-HMAC-SHA256&#xA;\
+        20261003T000000Z&#xA;20261003/us-east-1/s3/aws4_request&#xA;CANARYSTRINGTOSIGN\
+        </StringToSign><CanonicalRequest>GET&#xA;/b/meta.json</CanonicalRequest></Error>";
+
+    /// Plan 37 K6a: no part of an S3 error body but its code reaches an
+    /// error text — not through object_store's error, nor `StoreError`,
+    /// nor an anyhow chain — and the failure still classifies by its code.
+    #[tokio::test]
+    async fn an_s3_error_body_never_reaches_an_error_message() {
+        let (endpoint, _) = crate::scripted_http::scripted_s3_replies(vec![
+            crate::scripted_http::Reply::with_body(403, LEAKY_403),
+        ])
+        .await;
+        let s3 = configure_s3_client(
+            AmazonS3Builder::new()
+                .with_endpoint(&endpoint)
+                .with_allow_http(true)
+                .with_bucket_name("b")
+                .with_region("us-east-1")
+                .with_access_key_id("AKIDLEAKCANARY")
+                .with_secret_access_key("s"),
+        )
+        .build()
+        .unwrap();
+        let store = crate::ChunkStore::new(std::sync::Arc::new(s3));
+        let e = store.load_fs().await.unwrap_err();
+        let classified = crate::classify(&e);
+        let chained = format!("{:#}", anyhow::Error::new(e).context("reading meta.json"));
+        for text in [&chained, &format!("{chained:?}")] {
+            for leak in [
+                "AKIDLEAKCANARY",
+                "CANARYSTRINGTOSIGN",
+                "StringToSign",
+                "CanonicalRequest",
+            ] {
+                assert!(!text.contains(leak), "{leak} leaked: {text}");
+            }
+        }
+        assert!(chained.contains("403"), "{chained}");
+        assert!(chained.contains("SignatureDoesNotMatch"), "{chained}");
+        assert!(chained.contains("S3 refused the credentials"), "{chained}");
+        assert_eq!(classified, crate::ErrorClass::Permanent);
+    }
+
+    #[test]
+    fn a_redacted_body_keeps_only_a_plain_code() {
+        assert_eq!(
+            redacted_error_body(
+                404,
+                "<Error><Code>NoSuchKey</Code><Key>secret/path</Key></Error>"
+            ),
+            "<Error><Code>NoSuchKey</Code><Message>the rest of S3's error body is withheld\
+             </Message></Error>"
+        );
+        // A code that is not one (markup, spaces) is dropped, not echoed.
+        let odd = redacted_error_body(403, "<Code>AKID <x>y</x></Code>");
+        assert!(!odd.contains("AKID"), "{odd}");
+        assert!(redacted_error_body(500, "<html>proxy</html>").starts_with("<Error><Message>"));
+    }
 
     #[test]
     fn provider_name_is_read_without_the_keys() {

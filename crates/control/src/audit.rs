@@ -29,6 +29,11 @@
 //!   *received* encoding (canonical JSON, or the postcard bytes), so a JSON
 //!   and a postcard call with the same arguments digest differently; the
 //!   record names the encoding.
+//! - **`on_behalf_of`, when the caller names one** (plan 37 K6a): a short
+//!   token the client attaches to the call (`Request::on_behalf_of`, e.g.
+//!   the CSI driver's PersistentVolume name), so a line written for a
+//!   service principal says which volume it was about. It is the
+//!   principal's claim, not an identity: authorization never reads it.
 //! - **The outcome, not the message.** `ok`, or `err` with the
 //!   [`ErrorKind`]; error messages can echo user data.
 //! - **A `kind = "service"` grant (plan 33 U1) widens the `principal`
@@ -142,6 +147,12 @@ pub struct AuditRecord {
     /// (see the module docs).
     pub params_digest: String,
     pub outcome: AuditOutcome,
+    /// Whom the caller said it acted for (`Request::on_behalf_of`): the
+    /// CSI driver's PersistentVolume name. A claim of the principal's,
+    /// recorded verbatim (it is validated to a short, plain token), and
+    /// absent from the line when the call made none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
 }
 
 /// What `params_digest` holds for a method with secret params.
@@ -267,6 +278,7 @@ mod tests {
             encoding: Encoding::Json,
             params_digest: params_digest(&Blob::Json(serde_json::json!({"a": 1}))),
             outcome: AuditOutcome::Err(ErrorKind::Denied),
+            on_behalf_of: None,
         }
     }
 

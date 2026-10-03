@@ -97,21 +97,30 @@ impl EngineControl {
         self.unlocked.lock().unwrap().get(fs).cloned()
     }
 
+    /// A store at `url`, signed with what `fs.unlock` gave `key`, else
+    /// with this engine's own credential source — the AWS chain for a CLI
+    /// daemon, the unlocked keys of an engine pod started with
+    /// `serve --await-unlock` (whose `fs.create` names its own location).
     async fn open_store(&self, url: &str, key: Option<&str>) -> Result<ChunkStore, ControlError> {
-        let creds = key.and_then(|k| self.unlocked(k));
-        let (backend, _) = backend::open_backend_described_with(url, creds.as_ref())
+        let creds = key
+            .and_then(|k| self.unlocked(k))
+            .unwrap_or_else(|| self.engine.credentials().clone());
+        let creds = Some(&creds);
+        let (backend, _) = backend::open_backend_described_with(url, creds)
             .await
             .map_err(failed)?;
         Ok(ChunkStore::new(backend))
     }
 
-    /// `name` → its registry entry, or `uuid` → this engine's backend.
+    /// `name` → its registry entry, or `uuid` (or the backend URL itself,
+    /// as an engine pod's CSI plugin names it before it knows the uuid) →
+    /// this engine's backend.
     fn resolve_fs(&self, fs: &str) -> Result<(String, Option<FsEntry>), ControlError> {
         let registry = Registry::load().map_err(failed)?;
         if let Some(entry) = registry.entry(fs) {
             return Ok((entry.s3.clone(), Some(entry.clone())));
         }
-        if fs == self.fs_uuid {
+        if fs == self.fs_uuid || fs == self.backend {
             return Ok((self.backend.clone(), None));
         }
         Err(ControlError::not_found(format!(
@@ -170,6 +179,11 @@ impl EngineControl {
                 e2e: meta.e2e,
                 write_mode: self.write_mode.get().as_str().to_string(),
                 unlocked: self.unlocked(&self.fs_uuid).is_some(),
+                credentials_generation: self.engine.credentials().generation(),
+                credentials_in_use: match &**self.engine.credentials() {
+                    CredentialSource::Static(store) => store.in_use_generation(),
+                    _ => 0,
+                },
             });
         }
         Ok(FsListing { filesystems: out })
@@ -440,7 +454,18 @@ impl EngineControl {
         Ok(FsDoctorReport { checks })
     }
 
-    pub(crate) fn fs_unlock(&self, p: FsUnlockParams) -> Result<String, ControlError> {
+    /// `fs.unlock` (module docs). A rotation of this engine's own static
+    /// source is tried first: one authenticated read (`meta.json`) signed
+    /// with the new pair, and a pair S3 refuses is refused here (`Denied`;
+    /// `Unavailable` when S3 could not be asked) with the old one left in
+    /// use — a typo in a rotated Secret must not stop every running engine
+    /// at once.
+    pub(crate) async fn fs_unlock(&self, p: FsUnlockParams) -> Result<String, ControlError> {
+        let ticket = self
+            .unlock_order
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         let c = p.credentials;
         let has_keys = c.access_key_id.is_some() || c.secret_access_key.is_some();
         if has_keys && (c.access_key_id.is_none() || c.secret_access_key.is_none()) {
@@ -453,24 +478,76 @@ impl EngineControl {
         }
         let (_, entry) = self.resolve_fs(&p.fs)?;
         let own = entry.as_ref().is_none_or(|e| e.s3 == self.backend);
-        // Rotation of this engine's own static source, in place.
+        let rotation = own && matches!(&**self.engine.credentials(), CredentialSource::Static(_));
+        if rotation {
+            if let (Some(id), Some(secret)) = (&c.access_key_id, &c.secret_access_key) {
+                let trial = EphemeralSecretStore::new();
+                trial
+                    .replace(&[
+                        (
+                            CredentialSource::ACCESS_KEY_ID,
+                            Some(id.expose().as_bytes()),
+                        ),
+                        (
+                            CredentialSource::SECRET_ACCESS_KEY,
+                            Some(secret.expose().as_bytes()),
+                        ),
+                        (
+                            CredentialSource::SESSION_TOKEN,
+                            c.session_token.as_ref().map(|t| t.expose().as_bytes()),
+                        ),
+                    ])
+                    .map_err(failed)?;
+                self.probe_credentials(&p.fs, CredentialSource::Static(trial))
+                    .await?;
+            }
+        }
+        // Rotation of this engine's own static source, in place: one
+        // generation, so the S3 provider never sees half a key pair and
+        // re-resolves on its next request (`backend::SourceCredentials`).
         let store = match (own, &**self.engine.credentials()) {
             (true, CredentialSource::Static(store)) => store.clone(),
             _ => EphemeralSecretStore::new(),
         };
-        let put = |name: &str, value: &str| store.put(name, value.as_bytes()).map_err(failed);
+        let mut entries: Vec<(&str, Option<&[u8]>)> = Vec::new();
         if let (Some(id), Some(secret)) = (&c.access_key_id, &c.secret_access_key) {
-            put(CredentialSource::ACCESS_KEY_ID, id.expose())?;
-            put(CredentialSource::SECRET_ACCESS_KEY, secret.expose())?;
-            match &c.session_token {
-                Some(token) => put(CredentialSource::SESSION_TOKEN, token.expose())?,
-                None => store
-                    .delete(CredentialSource::SESSION_TOKEN)
-                    .map_err(failed)?,
-            }
+            entries.push((
+                CredentialSource::ACCESS_KEY_ID,
+                Some(id.expose().as_bytes()),
+            ));
+            entries.push((
+                CredentialSource::SECRET_ACCESS_KEY,
+                Some(secret.expose().as_bytes()),
+            ));
+            entries.push((
+                CredentialSource::SESSION_TOKEN,
+                c.session_token.as_ref().map(|t| t.expose().as_bytes()),
+            ));
+            // A rotation replaces expiring keys with whatever it brings.
+            entries.push((CredentialSource::EXPIRY, None));
         }
         if let Some(passphrase) = &c.e2e_passphrase {
-            put(E2E_PASSPHRASE, passphrase.expose())?;
+            entries.push((E2E_PASSPHRASE, Some(passphrase.expose().as_bytes())));
+        }
+        // A slower trial read of an older push must not land after a newer
+        // one: the last push (by arrival) wins.
+        let mut applied = self.unlock_order.1.lock().unwrap();
+        if ticket < *applied {
+            return Ok(format!(
+                "{}: superseded by a later fs.unlock; nothing changed",
+                p.fs
+            ));
+        }
+        *applied = ticket;
+        store.replace(&entries).map_err(failed)?;
+        if let (true, false, Some(passphrase)) = (own, rotation, &c.e2e_passphrase) {
+            // An engine on its environment's keys: what a handoff hands its
+            // successor is kept apart from `store` (a fresh one), and must
+            // not go stale.
+            if let Some(kept) = self.host.handoff_secrets() {
+                kept.replace(&[(E2E_PASSPHRASE, Some(passphrase.expose().as_bytes()))])
+                    .map_err(failed)?;
+            }
         }
         let source = Arc::new(CredentialSource::Static(store));
         let mut unlocked = self.unlocked.lock().unwrap();
@@ -478,11 +555,59 @@ impl EngineControl {
         if own {
             unlocked.insert(self.fs_uuid.clone(), source);
         }
-        Ok(match (own, &**self.engine.credentials()) {
-            (true, CredentialSource::Static(_)) => {
-                format!("{}: credentials rotated in the running engine", p.fs)
-            }
-            _ => format!("{}: credentials held in memory for fs.* calls", p.fs),
+        drop(unlocked);
+        drop(applied);
+        Ok(match rotation {
+            true => format!("{}: credentials rotated in the running engine", p.fs),
+            false => format!("{}: credentials held in memory for fs.* calls", p.fs),
         })
+    }
+
+    /// One authenticated read of this engine's `meta.json` signed by
+    /// `source` (see [`Self::fs_unlock`]). The error says what S3 answered
+    /// — its status and error code, never its body (the S3 client's
+    /// connector withholds it) — and that nothing changed.
+    async fn probe_credentials(
+        &self,
+        fs: &str,
+        source: CredentialSource,
+    ) -> Result<(), ControlError> {
+        use constellation_control::proto::ErrorKind;
+        let source = Arc::new(source);
+        let checked = async {
+            let (backend, _) = backend::open_backend_described_with(&self.backend, Some(&source))
+                .await
+                .map_err(|e| (ErrorKind::Denied, format!("{e:#}")))?;
+            ChunkStore::new(backend)
+                .load_fs()
+                .await
+                .map(drop)
+                .map_err(
+                    |e| match constellation_store_s3::classify(&e).is_transient() {
+                        true => (
+                            ErrorKind::Unavailable,
+                            format!("S3 could not be asked (reading meta.json: {e})"),
+                        ),
+                        false => (
+                            ErrorKind::Denied,
+                            format!("reading meta.json with them: {e}"),
+                        ),
+                    },
+                )
+        };
+        let (kind, why) = match tokio::time::timeout(Duration::from_secs(30), checked).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(refusal)) => refusal,
+            Err(_) => (
+                ErrorKind::Unavailable,
+                "S3 did not answer the trial read within 30 s".to_string(),
+            ),
+        };
+        Err(ControlError::new(
+            kind,
+            format!(
+                "{fs}: the new credentials were refused, and the ones in use stay in use: {why}"
+            ),
+        ))
     }
 }

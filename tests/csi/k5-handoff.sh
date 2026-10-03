@@ -27,7 +27,13 @@
 #      exactly the blocks it wrote, and its longest call — the
 #      client-visible pause — is printed with every call over 200 ms and
 #      when it happened;
-#   7. whether the backup (the controller's engine pod) sealed the
+#   7. 37-k6a: the class is `static-ephemeral`, so both engine pods run
+#      `--await-unlock` with no credential in their spec or environment,
+#      and the upgraded node plugin (restarted by the upgrade: it holds no
+#      node-stage secret any more) cannot unlock the replacement itself —
+#      the replacement must log that it took the old pod's credentials
+#      from the handoff's `Credentials` step;
+#   8. whether the backup (the controller's engine pod) sealed the
 #      holder's epoch during the handoff (37-k5a's backup hold should
 #      keep it from doing so), and the replacement's startup phases.
 #
@@ -123,6 +129,7 @@ parameters:
   region: "us-east-1"
   layout: "pool"
   chunkSize: "1MiB"
+  credentialSource: "static-ephemeral"
   csi.storage.k8s.io/provisioner-secret-name: constellation-s3-creds
   csi.storage.k8s.io/provisioner-secret-namespace: "$ns"
   csi.storage.k8s.io/node-stage-secret-name: constellation-s3-creds
@@ -242,6 +249,16 @@ fuse_mount() { # the staging FUSE mount on the worker: "<mount id> <mountpoint>"
 mount_before=$(fuse_mount)
 [ -n "$mount_before" ] || { echo "no staging FUSE mount on $w1"; exit 1; }
 echo "   engine pod $old on $old_image; staging mount $mount_before"
+no_credentials() { # no_credentials POD: --await-unlock, nothing in its spec or environment
+    k -n "$ns" get pod "$1" -o json | jq -e '
+        (.spec.containers[0].args | any(. == "--await-unlock"))
+        and ([.spec.containers[0].env[]? | select(.valueFrom != null
+            or (.name | test("AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|CONSTELLATION_PASSPHRASE")))]
+            | length == 0)
+        and (.spec.containers[0].envFrom == null)' >/dev/null \
+        || { echo "engine pod $1 does not wait for fs.unlock, or carries credentials"; exit 1; }
+}
+no_credentials "$old"
 
 echo "== helm upgrade: image tag ${CSI_IMAGE##*:} -> ${next##*:}"
 upgraded_at=$(date +%s)
@@ -268,6 +285,12 @@ done
 [ -z "$(k -n "$ns" get pod "$old" -o name 2>/dev/null || true)" ] \
     || { echo "the old engine pod $old is still there"; exit 1; }
 echo "   $old ($old_image) -> $new ($next) in $(( $(date +%s) - upgraded_at )) s after the upgrade"
+no_credentials "$new"
+# Captured first: `grep -q` ending a pipe early fails it under pipefail.
+new_log=$(k -n "$ns" logs "$new" -c engine 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+grep -q 'handed-over credentials accepted' <<<"$new_log" \
+    || { echo "the replacement $new did not get its credentials from the handoff"; exit 1; }
+echo "   $new waited for its credentials and got them from $old over the handoff"
 
 # The node plugin on the new image (the one that ran the handoff), not a
 # terminating predecessor.

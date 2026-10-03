@@ -181,15 +181,27 @@ pub trait Engines: Send + Sync {
     /// An engine pod serving filesystem `fs_uuid`. `NotFound` only when the
     /// filesystem itself is known to be gone, which `DeleteVolume` reads as
     /// "already gone"; an implementation that merely cannot find a pod for
-    /// it answers `Unavailable` (retryable), never `NotFound`.
-    async fn filesystem(&self, fs_uuid: &str) -> Result<Arc<dyn ControlClient>, ControlError>;
+    /// it answers `Unavailable` (retryable), never `NotFound`. `secrets`:
+    /// what the request carried (`req.secrets`, possibly empty), to unlock
+    /// a pod that waits for its credentials ([`crate::credentials`]).
+    async fn filesystem(
+        &self,
+        fs_uuid: &str,
+        secrets: &crate::credentials::Secrets,
+    ) -> Result<Arc<dyn ControlClient>, ControlError>;
 
     /// An engine pod serving `fs_uuid` **only if one is up already**: never
     /// created, recreated from a remembered spec, or rebuilt from the
     /// cluster. `None` when there is none. The deletes start here, so that
     /// a delete the CO repeats after the object is gone (external-provisioner
     /// does, seconds after deleting the PV) brings nothing back.
-    async fn running(&self, fs_uuid: &str) -> Result<Option<Arc<dyn ControlClient>>, ControlError>;
+    /// `secrets` as for [`Self::filesystem`]: a running pod may still
+    /// wait for its credentials.
+    async fn running(
+        &self,
+        fs_uuid: &str,
+        secrets: &crate::credentials::Secrets,
+    ) -> Result<Option<Arc<dyn ControlClient>>, ControlError>;
 
     /// Whether the CO still has an object naming `handle`: a
     /// `PersistentVolume` of this driver with that `volumeHandle`, or a
@@ -220,4 +232,4 @@ pub enum Handle<'a> {
 mod fake;
 mod socket;
 pub use fake::{InMemoryControl, InMemoryEngines};
-pub use socket::SocketControlClient;
+pub use socket::{SocketControlClient, DEFAULT_CALL_TIMEOUT};

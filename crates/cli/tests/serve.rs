@@ -5,11 +5,13 @@
 //! the subtree quota `quota.set{subtree}` the controller's `CreateVolume`
 //! sends.
 
-use constellation_control::methods::{BrowseMkdir, FsCreate, FsList, QuotaGet, QuotaSet};
-use constellation_control::proto::types::{
-    FsCreateParams, MkdirParams, QuotaGetParams, SetQuotaParams,
+use constellation_control::methods::{
+    BrowseMkdir, FsCreate, FsList, FsUnlock, NodePing, QuotaGet, QuotaSet,
 };
-use constellation_control::proto::ErrorKind;
+use constellation_control::proto::types::{
+    FsCreateParams, FsUnlockParams, MkdirParams, QuotaGetParams, SetQuotaParams, UnlockCredentials,
+};
+use constellation_control::proto::{ErrorKind, Secret};
 use constellation_control::transport::StreamTransport;
 use constellation_control::{Client, ClientOptions, Principal};
 use std::path::Path;
@@ -180,6 +182,308 @@ fn serve_answers_the_control_protocol_through_a_relay() {
     assert!(status.success(), "{status:?}");
 }
 
+/// Plan 37 K6a: `serve --await-unlock` takes its credentials (and an E2E
+/// passphrase) from `fs.unlock` on the control socket only — nothing in
+/// its environment — answers nothing else until then, starts once they
+/// open the filesystem, and takes a rotation later without a restart;
+/// both unlocks are in the audit log, with the caller's attribution and
+/// no digest of the secrets.
+#[test]
+fn serve_await_unlock_takes_its_credentials_from_the_control_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let s3 = dir.path().join("s3");
+    let url = s3.display().to_string();
+    let socket = dir.path().join("sockets/pool/control.sock");
+    let state = dir.path().join("state");
+    let child = Command::new(BIN)
+        .arg("serve")
+        .arg("--s3")
+        .arg(&s3)
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("--control-socket")
+        .arg(&socket)
+        .args([
+            "--create",
+            "--e2e",
+            "--await-unlock",
+            "--chunk-size",
+            "1048576",
+        ])
+        .env("XDG_RUNTIME_DIR", dir.path().join("run"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env_remove("CONSTELLATION_PASSPHRASE")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon(child);
+    // The readiness probe passes on the gate.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ping(&socket) {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "serve exited before answering node.ping"
+        );
+        assert!(Instant::now() < deadline, "serve never answered node.ping");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!s3.join("meta.json").exists(), "created before fs.unlock");
+    let unlock = |fs: &str, key: &str, passphrase: Option<&str>| FsUnlockParams {
+        fs: fs.to_string(),
+        credentials: UnlockCredentials {
+            access_key_id: Some(Secret::new(key)),
+            secret_access_key: Some(Secret::new(format!("{key}-secret"))),
+            session_token: None,
+            e2e_passphrase: passphrase.map(Secret::new),
+        },
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let gate = Client::connect_unix(&socket).await.unwrap();
+        gate.call::<NodePing>(Default::default()).await.unwrap();
+        let waiting = gate.call::<FsList>(Default::default()).await.unwrap_err();
+        assert_eq!(waiting.kind, ErrorKind::Unavailable, "{waiting:?}");
+        assert!(waiting.message.contains("fs.unlock"), "{waiting:?}");
+        let wrong = gate
+            .call::<FsUnlock>(unlock("s3://elsewhere/x", "K1", Some("pw")))
+            .await
+            .unwrap_err();
+        assert_eq!(wrong.kind, ErrorKind::Invalid, "{wrong:?}");
+        // An E2E filesystem cannot be made without its passphrase: refused,
+        // and the gate keeps waiting.
+        let refused = gate
+            .call::<FsUnlock>(unlock(&url, "K1", None))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::Unavailable, "{refused:?}");
+        assert!(refused.message.contains("passphrase"), "{refused:?}");
+        let started = constellation_control::client::on_behalf_of(
+            "pvc-k6a",
+            gate.call::<FsUnlock>(unlock(&url, "K1", Some("correct horse"))),
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.detail.contains("credentials accepted"),
+            "{started:?}"
+        );
+        assert!(s3.join("meta.json").exists());
+
+        // The daemon proper, on a new connection, on the same socket.
+        let client = Client::connect_unix(&socket).await.unwrap();
+        let own = |l: &constellation_control::proto::types::FsListing| {
+            l.filesystems
+                .iter()
+                .find(|f| f.name.is_none())
+                .cloned()
+                .unwrap()
+        };
+        let listing = client.call::<FsList>(Default::default()).await.unwrap();
+        let fs = own(&listing);
+        assert!(fs.e2e, "{fs:?}");
+        assert_eq!(fs.credentials_generation, 1, "{fs:?}");
+        // A rotation: the running engine's source, in place.
+        let rotated = constellation_control::client::on_behalf_of(
+            "pvc-k6a",
+            client.call::<FsUnlock>(unlock(&url, "K2", None)),
+        )
+        .await
+        .unwrap();
+        assert!(rotated.detail.contains("rotated"), "{rotated:?}");
+        let fs = own(&client.call::<FsList>(Default::default()).await.unwrap());
+        assert_eq!(fs.credentials_generation, 2, "{fs:?}");
+        // The gate's connection is closed shortly after the start.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while gate.is_connected() {
+            assert!(
+                Instant::now() < deadline,
+                "the gate's connection stayed open"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    let audit = std::fs::read_to_string(state.join("control-audit.jsonl")).unwrap();
+    let unlocks: Vec<serde_json::Value> = audit
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["method"] == "fs.unlock")
+        .collect();
+    // Two refused at the gate, the one that started the engine, the rotation.
+    assert_eq!(unlocks.len(), 4, "{audit}");
+    for r in &unlocks {
+        assert_eq!(r["params_digest"], "withheld:secret-params", "{r}");
+    }
+    let attributed: Vec<_> = unlocks
+        .iter()
+        .filter(|r| r["on_behalf_of"] == "pvc-k6a")
+        .map(|r| r["outcome"].clone())
+        .collect();
+    assert_eq!(
+        attributed,
+        [serde_json::json!("ok"), serde_json::json!("ok")],
+        "{audit}"
+    );
+    for secret in ["K1-secret", "K2-secret", "correct horse"] {
+        assert!(!audit.contains(secret), "the audit log holds a secret");
+    }
+
+    unsafe {
+        libc::kill(daemon.0.id() as i32, libc::SIGTERM);
+    }
+    let status = exit_status(&mut daemon, "serve --await-unlock");
+    assert!(status.success(), "{status:?}");
+}
+
+/// `serve --await-unlock` on the local backend at `s3`, its state in
+/// `dir`, with nothing in its environment that could unlock it.
+fn awaiting_serve(dir: &Path, s3: &Path, socket: &Path, extra: &[&str]) -> Daemon {
+    awaiting_serve_env(dir, s3, socket, extra, &[])
+}
+
+/// [`awaiting_serve`] with extra environment.
+fn awaiting_serve_env(
+    dir: &Path,
+    s3: &Path,
+    socket: &Path,
+    extra: &[&str],
+    envs: &[(&str, &Path)],
+) -> Daemon {
+    let child = Command::new(BIN)
+        .arg("serve")
+        .arg("--s3")
+        .arg(s3)
+        .arg("--state-dir")
+        .arg(dir.join("state"))
+        .arg("--control-socket")
+        .arg(socket)
+        .args(["--await-unlock", "--chunk-size", "1048576"])
+        .args(extra)
+        .envs(envs.iter().copied())
+        .env("XDG_RUNTIME_DIR", dir.join("run"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env_remove("CONSTELLATION_PASSPHRASE")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut daemon = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ping(socket) {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "serve exited before answering node.ping"
+        );
+        assert!(Instant::now() < deadline, "serve never answered node.ping");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    daemon
+}
+
+/// `fs.unlock` of `fs` with a fixture key pair and `passphrase`.
+fn unlock_with(fs: &str, passphrase: Option<&str>) -> FsUnlockParams {
+    FsUnlockParams {
+        fs: fs.to_string(),
+        credentials: UnlockCredentials {
+            access_key_id: Some(Secret::new("K1")),
+            secret_access_key: Some(Secret::new("K1-secret")),
+            session_token: None,
+            e2e_passphrase: passphrase.map(Secret::new),
+        },
+    }
+}
+
+/// Plan 37 K6a review: an engine waiting for `fs.unlock` stops at once on
+/// `SIGTERM` (and `SIGINT`), exiting 0 — as its container's PID 1 it would
+/// otherwise ignore the signal and hold up a pod deletion for its whole
+/// grace period — and its memory never goes into a core dump.
+#[test]
+fn serve_waiting_for_unlock_stops_on_a_signal_and_dumps_no_core() {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sockets/pool/control.sock");
+        let mut daemon = awaiting_serve(dir.path(), &dir.path().join("s3"), &socket, &["--create"]);
+        let pid = daemon.0.id();
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+        let core = limits
+            .lines()
+            .find(|l| l.starts_with("Max core file size"))
+            .unwrap();
+        let fields: Vec<&str> = core.split_whitespace().collect();
+        assert_eq!(&fields[4..6], ["0", "0"], "{core}");
+        // Not dumpable: the kernel makes its /proc entries root's.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(format!("/proc/{pid}/status"))
+                .unwrap()
+                .uid();
+            assert_eq!(owner, 0, "serve --await-unlock is still dumpable");
+        }
+        let sent = Instant::now();
+        signal(&daemon, sig);
+        let status = exit_status(&mut daemon, "on a signal while waiting for fs.unlock");
+        assert!(status.success(), "signal {sig}: {status:?}");
+        assert!(
+            sent.elapsed() < Duration::from_secs(10),
+            "signal {sig}: took {:?} to stop",
+            sent.elapsed()
+        );
+    }
+}
+
+/// Plan 37 K6a review: a wrong E2E passphrase is refused at the gate
+/// (`Unavailable`, naming the passphrase) and the gate keeps waiting —
+/// the engine never starts on it and crash-loops — and the right one
+/// then starts it.
+#[test]
+fn serve_refuses_a_wrong_passphrase_at_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let s3 = dir.path().join("s3");
+    let url = s3.display().to_string();
+    let socket = dir.path().join("sockets/pool/control.sock");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Made, then stopped.
+    let mut daemon = awaiting_serve(dir.path(), &s3, &socket, &["--create", "--e2e"]);
+    rt.block_on(async {
+        let gate = Client::connect_unix(&socket).await.unwrap();
+        gate.call::<FsUnlock>(unlock_with(&url, Some("correct horse")))
+            .await
+            .unwrap();
+    });
+    signal(&daemon, libc::SIGTERM);
+    assert!(exit_status(&mut daemon, "after the first start").success());
+
+    let mut daemon = awaiting_serve(dir.path(), &s3, &socket, &[]);
+    rt.block_on(async {
+        let gate = Client::connect_unix(&socket).await.unwrap();
+        for (passphrase, why) in [
+            (None, "e2e_passphrase"),
+            (Some("battery staple"), "passphrase"),
+        ] {
+            let refused = gate
+                .call::<FsUnlock>(unlock_with(&url, passphrase))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.kind, ErrorKind::Denied, "{refused:?}");
+            assert!(refused.message.contains(why), "{refused:?}");
+            assert!(!refused.message.contains("battery"), "{refused:?}");
+        }
+        let waiting = gate.call::<FsList>(Default::default()).await.unwrap_err();
+        assert!(waiting.message.contains("fs.unlock"), "{waiting:?}");
+        gate.call::<FsUnlock>(unlock_with(&url, Some("correct horse")))
+            .await
+            .unwrap();
+    });
+    assert!(daemon.0.try_wait().unwrap().is_none(), "serve exited");
+    signal(&daemon, libc::SIGTERM);
+    assert!(exit_status(&mut daemon, "after the second start").success());
+}
+
 /// A root-only test's `serve` daemon with one preopened view (plan 37's
 /// `NodeStageVolume` shape): this process plays the CSI node plugin — it
 /// mounts with `fuse_mount_fd` and sends the descriptor with
@@ -201,6 +505,48 @@ fn serve_with_a_preopened_view() -> Option<Preopened> {
 /// [`serve_with_a_preopened_view`] with extra `serve` arguments and
 /// environment.
 fn serve_with_a_preopened_view_and(args: &[&str], envs: &[(&str, &str)]) -> Option<Preopened> {
+    serve_with_a_preopened_view_in(tempfile::tempdir().unwrap(), args, envs, None)
+}
+
+/// [`serve_with_a_preopened_view_and`] under a control allowlist written
+/// to `policy`: the node plugin's grant ([`node_plugin_policy`]) on the
+/// unit's control sockets.
+fn serve_with_a_preopened_view_and_policy(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    policy: &Path,
+) -> Option<Preopened> {
+    serve_with_a_preopened_view_in(tempfile::tempdir().unwrap(), args, envs, Some(policy))
+}
+
+/// The node plugin's `kind = "service"` grant for `uid` (as
+/// `constellation_csi::engine_pods::node_engine_policy` writes it), with
+/// `label`, on the control socket `control{-name}.sock` of each of `names`
+/// under `dir` (`""`: `control.sock`).
+fn node_plugin_policy(dir: &Path, uid: u32, label: &str, names: &[&str]) -> String {
+    let dir = std::fs::canonicalize(dir).unwrap();
+    names
+        .iter()
+        .map(|name| {
+            let file = match *name {
+                "" => "control.sock".to_string(),
+                name => format!("control-{name}.sock"),
+            };
+            format!(
+                "[[grant]]\nkind = \"service\"\nprincipal = \"uid:{uid}\"\nsocket = {:?}\n\
+                 role = \"admin\"\nlabel = {label:?}\n",
+                dir.join("sockets/unit").join(file).display().to_string()
+            )
+        })
+        .collect()
+}
+
+fn serve_with_a_preopened_view_in(
+    dir: tempfile::TempDir,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    policy: Option<&Path>,
+) -> Option<Preopened> {
     // SAFETY: no preconditions.
     if unsafe { libc::geteuid() } != 0 || !Path::new("/dev/fuse").exists() {
         eprintln!("skipping: needs root and /dev/fuse (mount(2))");
@@ -209,8 +555,18 @@ fn serve_with_a_preopened_view_and(args: &[&str], envs: &[(&str, &str)]) -> Opti
     use constellation_control::methods::ViewMount;
     use constellation_control::proto::types::{MountSource, MountViewOpts, ViewMountParams};
 
-    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("sockets/unit/control.sock");
+    if let Some(policy) = policy {
+        std::fs::write(
+            policy,
+            node_plugin_policy(dir.path(), 0, "csi-node-plugin", &["", "b", "c"]),
+        )
+        .unwrap();
+    }
+    let policy_env: Vec<(&str, &Path)> = policy
+        .map(|p| ("CONSTELLATION_CONTROL_POLICY", p))
+        .into_iter()
+        .collect();
     let child = Command::new(BIN)
         .arg("serve")
         .arg("--s3")
@@ -222,6 +578,7 @@ fn serve_with_a_preopened_view_and(args: &[&str], envs: &[(&str, &str)]) -> Opti
         .arg("--create")
         .args(args)
         .envs(envs.iter().copied())
+        .envs(policy_env)
         .env("XDG_RUNTIME_DIR", dir.path().join("run"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .stdout(Stdio::null())
@@ -235,6 +592,17 @@ fn serve_with_a_preopened_view_and(args: &[&str], envs: &[(&str, &str)]) -> Opti
         assert!(Instant::now() < deadline, "serve never answered node.ping");
         std::thread::sleep(Duration::from_millis(100));
     }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    if args.contains(&"--await-unlock") {
+        // The plugin's first call to a pod that waits for its credentials.
+        let url = dir.path().join("s3").display().to_string();
+        rt.block_on(async {
+            let gate = Client::connect_unix(&socket).await.unwrap();
+            gate.call::<FsUnlock>(unlock_with(&url, None))
+                .await
+                .unwrap();
+        });
+    }
 
     let staging = dir.path().join("staging/pv-a/globalmount");
     std::fs::create_dir_all(&staging).unwrap();
@@ -242,7 +610,6 @@ fn serve_with_a_preopened_view_and(args: &[&str], envs: &[(&str, &str)]) -> Opti
     kernel.allow_other = true;
     let fd = constellation_platform::linux::fuse_mount_fd(&staging, &kernel).unwrap();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let client = rt
         .block_on(Client::connect_unix(&socket))
         .expect("the daemon's unix socket");
@@ -433,6 +800,16 @@ fn standby_with(
     name: &str,
     args: &[&str],
 ) -> (Daemon, std::path::PathBuf, std::path::PathBuf) {
+    standby_with_env(dir, name, args, &[])
+}
+
+/// [`standby_with`] with extra environment.
+fn standby_with_env(
+    dir: &Path,
+    name: &str,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+) -> (Daemon, std::path::PathBuf, std::path::PathBuf) {
     let socket = dir.join(format!("sockets/unit/control-{name}.sock"));
     let handoff = dir.join(format!("sockets/unit/handoff-{name}.sock"));
     let child = Command::new(BIN)
@@ -446,6 +823,7 @@ fn standby_with(
         .arg("--handoff-socket")
         .arg(&handoff)
         .args(args)
+        .envs(envs.iter().copied())
         .env("XDG_RUNTIME_DIR", dir.join(format!("run-{name}")))
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdout(Stdio::null())
@@ -734,6 +1112,324 @@ fn a_preopened_view_is_handed_to_a_second_serve_without_an_error() {
     umount(&staging);
 }
 
+/// 37-k6a with K5a: the standby of an engine that got its credentials
+/// through `fs.unlock` waits for them too (`--await-unlock`: nothing in
+/// its environment), gets them from the old engine itself in the
+/// `Credentials` step — before any session stops, and before which it
+/// refuses `Receive` — and serves the handed-over session on them with no
+/// error for a writer. Its memory never goes into a core dump either. The
+/// caller is the node plugin's `kind = "service"` grant (root here, as in
+/// a node pod).
+#[test]
+fn an_unlocked_engines_standby_gets_its_credentials_over_the_handoff() {
+    use constellation_control::methods::FsList;
+    let policy_dir = tempfile::tempdir().unwrap();
+    let policy = policy_dir.path().join("control-allow.toml");
+    let policy_env = [("CONSTELLATION_CONTROL_POLICY", policy.as_path())];
+    let Some(Preopened {
+        mut daemon,
+        staging,
+        rt,
+        client,
+        _dir,
+        ..
+    }) = serve_with_a_preopened_view_and_policy(&["--await-unlock"], &[], &policy)
+    else {
+        return;
+    };
+    let (mut next, next_socket, handoff) =
+        standby_with_env(_dir.path(), "b", &["--await-unlock"], &policy_env);
+    let new = standby_client(&rt, &mut next, &handoff);
+    assert_no_core(next.0.id());
+    // No credentials yet: no `Receive`.
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let early = rt
+        .block_on(new.call_with_fd::<NodeHandoff>(phase(HandoffPhase::Receive), theirs.into()))
+        .unwrap_err();
+    assert!(early.message.contains("Credentials"), "{early:?}");
+
+    let writer = Writer::start(staging.join("w"));
+    std::thread::sleep(Duration::from_millis(300));
+    // Step 0: old → this process → new, one opaque frame.
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        constellation_control::handoff_wire::read_secret(&mut ours).unwrap()
+    });
+    rt.block_on(old_credentials(&client, theirs))
+        .expect("the old engine's credentials step");
+    let frame = reader
+        .join()
+        .unwrap()
+        .expect("it holds its fs.unlock credentials");
+    let text = String::from_utf8_lossy(&frame).to_string();
+    assert!(
+        text.contains("K1-secret"),
+        "the very pair fs.unlock gave it"
+    );
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let relay = std::thread::spawn(move || {
+        constellation_control::handoff_wire::write_secret(&mut ours, Some(&frame)).unwrap()
+    });
+    let got = rt
+        .block_on(new.call_with_fd::<NodeHandoff>(phase(HandoffPhase::Credentials), theirs.into()))
+        .expect("the standby takes them");
+    relay.join().unwrap();
+    assert!(!got.detail.contains("K1"), "{got:?}");
+
+    prepare_and_relay(&rt, &client, &new);
+    rt.block_on(new.call::<NodeHandoff>(HandoffParams {
+        deadline_ms: Some(60_000),
+        ..phase(HandoffPhase::Seal)
+    }))
+    .expect("seal");
+    rt.block_on(client.call::<NodeHandoff>(phase(HandoffPhase::Commit)))
+        .expect("commit");
+    wait_resumed(&rt, &new);
+    assert!(exit_status(&mut daemon, "after its commit").success());
+    std::thread::sleep(Duration::from_millis(500));
+    let (written, errors) = writer.finish();
+    assert!(errors.is_empty(), "the writer saw errors: {errors:?}");
+    check_written(&staging.join("w"), written, 4096);
+
+    // It serves on the handed-over credentials (a static source, one
+    // generation), and its own successor could get them the same way.
+    let client = rt.block_on(Client::connect_unix(&next_socket)).unwrap();
+    let listing = rt
+        .block_on(client.call::<FsList>(Default::default()))
+        .unwrap();
+    let own = listing
+        .filesystems
+        .iter()
+        .find(|f| f.name.is_none())
+        .unwrap();
+    assert_eq!(own.credentials_generation, 1, "{own:?}");
+    // Only to a standby of its own: with none waiting, none are handed out.
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let none = rt.block_on(old_credentials(&client, theirs)).unwrap_err();
+    assert!(none.message.contains("no handoff is pending"), "{none:?}");
+    let (mut third, _, third_handoff) =
+        standby_with_env(_dir.path(), "c", &["--await-unlock"], &policy_env);
+    standby_client(&rt, &mut third, &third_handoff);
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        constellation_control::handoff_wire::read_secret(&mut ours).unwrap()
+    });
+    rt.block_on(old_credentials(&client, theirs)).unwrap();
+    assert!(reader.join().unwrap().is_some());
+    drop(third);
+    let audit = std::fs::read_to_string(_dir.path().join("state/control-audit.jsonl")).unwrap();
+    assert!(!audit.contains("K1-secret"), "the audit log holds a secret");
+    use constellation_control::methods::ViewUnmount;
+    use constellation_control::proto::types::ViewUnmountParams;
+    rt.block_on(client.call_bounded::<ViewUnmount>(
+        ViewUnmountParams {
+            mountpoint: staging.clone(),
+        },
+        Duration::from_secs(30),
+    ))
+    .expect("view.unmount on the new daemon");
+    umount(&staging);
+}
+
+/// A serving engine's `Credentials` step onto `theirs`.
+async fn old_credentials(
+    client: &Client,
+    theirs: std::os::unix::net::UnixStream,
+) -> Result<HandoffReport, constellation_control::proto::ControlError> {
+    client
+        .call_with_fd::<NodeHandoff>(phase(HandoffPhase::Credentials), theirs.into())
+        .await
+}
+
+/// `pid` dumps no core (`forbid_core_dumps`).
+fn assert_no_core(pid: u32) {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+    let core = limits
+        .lines()
+        .find(|l| l.starts_with("Max core file size"))
+        .unwrap();
+    let fields: Vec<&str> = core.split_whitespace().collect();
+    assert_eq!(&fields[4..6], ["0", "0"], "{core}");
+}
+
+/// A standby that waits for its credentials stops at once on `SIGTERM`
+/// (and `SIGINT`) while nothing is committed — as its container's PID 1
+/// it would otherwise ignore it for the pod's whole grace period — and
+/// dumps no core.
+#[test]
+fn an_awaiting_standby_stops_on_a_signal_before_any_commit() {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sockets/unit/control.sock");
+        let s3 = dir.path().join("s3");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _old = awaiting_serve(dir.path(), &s3, &socket, &["--create"]);
+        let url = s3.display().to_string();
+        rt.block_on(async {
+            let gate = Client::connect_unix(&socket).await.unwrap();
+            gate.call::<FsUnlock>(unlock_with(&url, None))
+                .await
+                .unwrap();
+        });
+        let (mut next, _, handoff) = standby_with(dir.path(), "b", &["--await-unlock"]);
+        standby_client(&rt, &mut next, &handoff);
+        assert_no_core(next.0.id());
+        let sent = Instant::now();
+        signal(&next, sig);
+        let status = exit_status(&mut next, "on a signal as a standby");
+        assert!(status.success(), "signal {sig}: {status:?}");
+        assert!(
+            sent.elapsed() < Duration::from_secs(10),
+            "signal {sig}: took {:?}",
+            sent.elapsed()
+        );
+    }
+}
+
+/// Must-fix 2 of 37-k6a's review: a serving engine hands its
+/// `fs.unlock` credentials to the node plugin only — the caller that
+/// matched its `kind = "service"` grant labelled `csi-node-plugin` — never
+/// to its owner (anybody who can exec into its pod runs as that uid) nor
+/// to another admin grant, and only while a standby waits on its state
+/// dir.
+#[test]
+fn a_serving_engines_credentials_go_to_the_node_plugin_only() {
+    // SAFETY: no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    for label in [None, Some("csi-other"), Some("csi-node-plugin")] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sockets/unit/control.sock");
+        let s3 = dir.path().join("s3");
+        let policy = dir.path().join("control-allow.toml");
+        let grants = match label {
+            Some(label) => node_plugin_policy(dir.path(), uid, label, &["", "b"]),
+            None => String::new(),
+        };
+        std::fs::write(&policy, grants).unwrap();
+        let policy_env = [("CONSTELLATION_CONTROL_POLICY", policy.as_path())];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _old = awaiting_serve_env(dir.path(), &s3, &socket, &["--create"], &policy_env);
+        let url = s3.display().to_string();
+        let client = rt.block_on(async {
+            let gate = Client::connect_unix(&socket).await.unwrap();
+            gate.call::<FsUnlock>(unlock_with(&url, None))
+                .await
+                .unwrap();
+            Client::connect_unix(&socket).await.unwrap()
+        });
+        let refused = |what: &str| {
+            let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let err = rt
+                .block_on(old_credentials(&client, theirs))
+                .expect_err(what);
+            assert!(!err.message.contains("K1"), "{err:?}");
+            err
+        };
+        if label != Some("csi-node-plugin") {
+            // Not even with a standby waiting.
+            let (mut next, _, handoff) =
+                standby_with_env(dir.path(), "b", &["--await-unlock"], &policy_env);
+            standby_client(&rt, &mut next, &handoff);
+            let err = refused("the owner or another grant");
+            assert_eq!(err.kind, ErrorKind::Denied, "{label:?}: {err:?}");
+            assert!(
+                err.message.contains("only the CSI node plugin"),
+                "{label:?}: {err:?}"
+            );
+            continue;
+        }
+        let err = refused("no standby waits");
+        assert!(err.message.contains("no handoff is pending"), "{err:?}");
+        let (mut next, _, handoff) =
+            standby_with_env(dir.path(), "b", &["--await-unlock"], &policy_env);
+        standby_client(&rt, &mut next, &handoff);
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            ours.set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            constellation_control::handoff_wire::read_secret(&mut ours).unwrap()
+        });
+        rt.block_on(old_credentials(&client, theirs))
+            .expect("the node plugin takes them for a pending handoff");
+        assert!(reader.join().unwrap().is_some());
+        // The standby's marker goes with its wait.
+        signal(&next, libc::SIGTERM);
+        assert!(exit_status(&mut next, "on SIGTERM as a standby").success());
+        let err = refused("the standby is gone");
+        assert!(err.message.contains("no handoff is pending"), "{err:?}");
+    }
+}
+
+/// 37-k6a review nit: an engine on its environment's keys keeps only an
+/// unlocked E2E passphrase for its successor, and a later passphrase-only
+/// `fs.unlock` replaces that one — the handoff hands over the current
+/// passphrase, not the one it started with.
+#[test]
+fn a_passphrase_rotation_reaches_the_handoff() {
+    // SAFETY: no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("sockets/unit/control.sock");
+    let s3 = dir.path().join("s3");
+    let policy = dir.path().join("control-allow.toml");
+    std::fs::write(
+        &policy,
+        node_plugin_policy(dir.path(), uid, "csi-node-plugin", &[""]),
+    )
+    .unwrap();
+    let policy_env = [("CONSTELLATION_CONTROL_POLICY", policy.as_path())];
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _old = awaiting_serve_env(
+        dir.path(),
+        &s3,
+        &socket,
+        &["--create", "--e2e"],
+        &policy_env,
+    );
+    let url = s3.display().to_string();
+    let passphrase_only = |p: &str| FsUnlockParams {
+        fs: url.clone(),
+        credentials: UnlockCredentials {
+            e2e_passphrase: Some(Secret::new(p)),
+            ..Default::default()
+        },
+    };
+    let client = rt.block_on(async {
+        let gate = Client::connect_unix(&socket).await.unwrap();
+        gate.call::<FsUnlock>(passphrase_only("first passphrase"))
+            .await
+            .unwrap();
+        let client = Client::connect_unix(&socket).await.unwrap();
+        client
+            .call::<FsUnlock>(passphrase_only("second passphrase"))
+            .await
+            .unwrap();
+        client
+    });
+    let (mut next, _, handoff) =
+        standby_with_env(dir.path(), "b", &["--await-unlock"], &policy_env);
+    standby_client(&rt, &mut next, &handoff);
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = std::thread::spawn(move || {
+        ours.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        constellation_control::handoff_wire::read_secret(&mut ours).unwrap()
+    });
+    rt.block_on(old_credentials(&client, theirs)).unwrap();
+    let frame = reader.join().unwrap().expect("it holds a passphrase");
+    let held: UnlockCredentials = serde_json::from_slice(&frame).unwrap();
+    assert!(
+        held.access_key_id.is_none(),
+        "the environment's keys stay out"
+    );
+    assert!(
+        held.e2e_passphrase
+            .as_ref()
+            .is_some_and(|p| p.expose() == "second passphrase"),
+        "the rotated passphrase is handed over"
+    );
+}
+
 /// Every step before the commit is undone by `Abort`: the old daemon
 /// serves again in place (the writer sees no error), the standby drops
 /// what it received and exits 0.
@@ -845,6 +1541,126 @@ fn a_committed_handoff_outlasts_the_seal_deadline() {
     );
     drop(next);
     std::thread::sleep(Duration::from_millis(200));
+    umount(&staging);
+}
+
+/// Must-fix 1 of 37-k6a's review: a signal that reaches a sealed standby
+/// (a node drain signals both pods) does not end it while the sender may
+/// still commit — the plugin sends `Commit` right after `Seal` answers,
+/// without asking whether the standby lives. The commit lands, the
+/// standby serves the sessions (the writer sees no error), and the signal
+/// is not lost either (should-fix 1): the node takes it as its own, so
+/// with a view mounted it waits for the view (§7), then exits 0.
+#[test]
+fn a_signal_between_seal_and_commit_loses_no_session() {
+    use constellation_control::methods::ViewUnmount;
+    use constellation_control::proto::types::ViewUnmountParams;
+    let Some(Preopened {
+        mut daemon,
+        staging,
+        rt,
+        client,
+        _dir,
+        ..
+    }) = serve_with_a_preopened_view()
+    else {
+        return;
+    };
+    let (mut next, next_socket, handoff) = standby(_dir.path(), "b");
+    let new = standby_client(&rt, &mut next, &handoff);
+    let writer = Writer::start(staging.join("w"));
+    std::thread::sleep(Duration::from_millis(300));
+    prepare_and_relay(&rt, &client, &new);
+    rt.block_on(new.call::<NodeHandoff>(HandoffParams {
+        deadline_ms: Some(60_000),
+        ..phase(HandoffPhase::Seal)
+    }))
+    .expect("seal");
+    signal(&next, libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        next.0.try_wait().unwrap().is_none(),
+        "a sealed standby outlives a signal while the sender may commit"
+    );
+    let committed = rt
+        .block_on(client.call::<NodeHandoff>(phase(HandoffPhase::Commit)))
+        .expect("commit");
+    assert_eq!(committed.state, Some(HandoffState::Committed));
+    wait_resumed(&rt, &new);
+    assert!(exit_status(&mut daemon, "after its commit").success());
+    std::thread::sleep(Duration::from_millis(500));
+    let (written, errors) = writer.finish();
+    assert!(errors.is_empty(), "the writer saw errors: {errors:?}");
+    check_written(&staging.join("w"), written, 4096);
+    // The signal was handed to the node: deferred while the view is
+    // mounted, then the process ends with it.
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        next.0.try_wait().unwrap().is_none(),
+        "the SIGTERM is deferred while a view is mounted"
+    );
+    let client = rt.block_on(Client::connect_unix(&next_socket)).unwrap();
+    rt.block_on(client.call_bounded::<ViewUnmount>(
+        ViewUnmountParams {
+            mountpoint: staging.clone(),
+        },
+        Duration::from_secs(30),
+    ))
+    .expect("view.unmount on the new daemon");
+    let status = exit_status(&mut next, "on the signal it got while sealed");
+    assert!(status.success(), "{status:?}");
+    umount(&staging);
+}
+
+/// The other half of the same fix: a sealed standby that got a signal and
+/// sees no commit exits at the seal's deadline (not later), and the sender
+/// serves its sessions again on `Abort`.
+#[test]
+fn a_signalled_sealed_standby_exits_at_its_deadline_without_a_commit() {
+    let Some(Preopened {
+        daemon,
+        staging,
+        rt,
+        client,
+        _dir,
+        ..
+    }) = serve_with_a_preopened_view()
+    else {
+        return;
+    };
+    let (mut next, _, handoff) = standby(_dir.path(), "b");
+    let new = standby_client(&rt, &mut next, &handoff);
+    let writer = Writer::start(staging.join("w"));
+    std::thread::sleep(Duration::from_millis(300));
+    prepare_and_relay(&rt, &client, &new);
+    rt.block_on(new.call::<NodeHandoff>(HandoffParams {
+        deadline_ms: Some(3000),
+        ..phase(HandoffPhase::Seal)
+    }))
+    .expect("seal");
+    let sent = Instant::now();
+    signal(&next, libc::SIGTERM);
+    let status = exit_status(&mut next, "at its seal deadline");
+    assert!(status.success(), "{status:?}");
+    assert!(
+        sent.elapsed() >= Duration::from_millis(2500) && sent.elapsed() < Duration::from_secs(15),
+        "exited after {:?}",
+        sent.elapsed()
+    );
+    let back = rt
+        .block_on(client.call::<NodeHandoff>(phase(HandoffPhase::Abort)))
+        .expect("the old daemon's abort");
+    assert_eq!(back.state, Some(HandoffState::Serving));
+    std::thread::sleep(Duration::from_millis(500));
+    let (written, errors) = writer.finish();
+    assert!(errors.is_empty(), "the writer saw errors: {errors:?}");
+    assert_eq!(
+        std::fs::metadata(staging.join("w")).unwrap().len(),
+        written * 4096
+    );
+    drop(daemon);
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = std::fs::metadata(&staging);
     umount(&staging);
 }
 

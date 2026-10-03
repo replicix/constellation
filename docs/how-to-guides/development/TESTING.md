@@ -3351,7 +3351,11 @@ real store with no spawned tasks.
   count is checked against the blocks written; its longest call is printed
   as the client-visible pause. The lane also prints whether the backup
   (the controller's engine pod) sealed the holder's epoch across the
-  handoff and the replacement's startup phases. `helm upgrade` runs
+  handoff and the replacement's startup phases. The class is
+  `static-ephemeral` (37-k6a): both engine pods must run `--await-unlock`
+  with no credential in their spec or environment, and the replacement
+  must log that it took the old pod's credentials from the handoff's
+  `Credentials` step (the upgraded node plugin holds none). `helm upgrade` runs
   without `--wait` (kubelet can take minutes to roll the node DaemonSet on
   a loaded host); the replacement engine pod is polled for up to
   `K5_ROLLOUT_S` (900 s). **Known exception, temporary:** the busy file
@@ -3448,6 +3452,10 @@ target: `Model::verify_observed`). Cross-node expectations use
   `--namespace` (PodSecurity `privileged`), after the snapshot CRDs and the
   snapshot-controller (`tests/csi/snapshot-crds.sh`, external-snapshotter at
   the chart's pinned tag; idempotent); a private in-memory floci runs
+
+  `--namespace` (PodSecurity `privileged`), with
+  `credentials.watchedSecrets` naming the Secret `csi-secret-rotation`
+  rotates (`constellation-k8s-harness-rotating`); a private in-memory floci runs
   on the `kind` network for the run (`<cluster>-k8s-floci-<run id>`). Each scenario gets a namespace and a
   pool `StorageClass` whose prefix carries the run id, so a reused cluster
   never meets engine state of an earlier run's filesystem.
@@ -3483,6 +3491,8 @@ target: `Model::verify_observed`). Cross-node expectations use
 | `csi-pod-rw` | A pod on worker 1 runs 4 seeded blocks through an RWO PVC, the model verified after each; the PV is staged on that worker only. After the pod is gone, a pod on worker 2 (an unstage and a fresh stage) sees the same tree and writes on. |
 | `csi-rwx-across-nodes` | Two pods on two workers, one RWX PVC. Six rounds alternate the writer; each writer starts once its node shows the model (an open after the other's close) and the other node must then converge. Then both write concurrently into their own directories and both converge on the merged model. Close-to-open in its default `bounded` form: visibility is eventual (`CONVERGE` = 120 s), and nothing is asserted about what a lagging reader sees meanwhile. |
 | `csi-many-pvs-one-pool` | 50 PVCs of one pool class, 10 pods alternating workers with 5 PVs each: one pool filesystem; each PV its own seeded tree, verified independently; exactly two node-owned engine pods (one per worker, 25 views each) and one controller-owned one; quotas per PV: a full 16 MiB PV refuses with `ENOSPC` while a 64 MiB one beside it (same pod, same engine) takes 24 MiB, and a 32 MiB PV on the other worker takes 24 MiB then refuses (2 MiB slack either way: the caps are soft, above, and a refusal may not come early either); the trees are intact afterwards and unstaging all 50 annotates both engine pods with 0 views. |
+| `csi-secret-rotation` | Plan 37 K6a, `Refreshing(callback)`: a `credentialSource: refreshing` class (the watched Secret is also its provisioner and node-stage secret). A writer pod on worker 1 and a reader on worker 2 (as in `csi-plugin-restart-survives`) run while the Secret is rotated twice. After each rotation every engine pod of the pool — both node-owned ones and the controller-owned one — reports through `fs.list` (over `kubectl exec … control-relay`) a credentials generation one higher and its S3 clients signing with it (`credentials_in_use`), within 180 s; the writer keeps going; a PVC created afterwards binds (the controller provisions with the new pair). Each node engine's audit log has an `fs.unlock` line per unlock (the start and both rotations) by the `csi-node-plugin` service principal (uid 0), with the params digest withheld, the rotations `on_behalf_of` `secret:<namespace>/<name>`, and the stage's `view.mount` by the same principal with `on_behalf_of` naming the PV; every line of the controller-owned engine's audit log is by the `csi-controller` service principal (uid 65532, the image's allowlist), with the start and both rotations among them and a CSI call naming the PV. No pod spec, engine-process environment (`/proc/1/environ`), engine or plugin log, audit log, or file under either worker's hostRoot holds a key pair of any generation (the hostRoot is searched before and after the rotations). Every engine pod and both plugins run with `RLIMIT_CORE` 0, and the unprivileged ones are not dumpable. Zero I/O errors, the tree matches the model on both workers, the staging mounts keep their mount ids and the engine pods their uids and restart counts: no remount. floci accepts any key pair, so "the old pair stops working" is shown from the engines' side (the generation in use), not by S3 refusing it; `harness run csi-credential-revocation` shows the refusal on versitygw. |
+| `csi-pod-security` | Plan 37 §9 / K6 gate, a kube-bench-style check of the privilege split: every driver pod's spec is re-created by a server dry run in a throwaway namespace enforcing PodSecurity `restricted` (ServiceAccount, node and priority stripped). The controller replicas and the controller-owned engine pod are admitted; the node-owned engine pod is refused for its hostPath volumes and nothing else (its containers meet `restricted`'s rules: non-root, no capability, no escalation, read-only root, `RuntimeDefault` seccomp); the node plugin is refused as privileged. |
 | `csi-plugin-restart-survives` | A writer pod on worker 1 (a 4 KiB file + a log line + a read-back every 100 ms) and a reader on worker 2 run while every node-plugin pod and every controller replica is deleted. They are replaced and Ready, both loops go on with zero errors, the tree matches the model on both nodes and in a new pod published by the restarted plugin, a PVC created afterwards binds and stages, and the engine pods holding the FUSE sessions are the same incarnations with no restarts. |
 | `csi-snapshot-clone-mount` | A pod on worker 1 writes a seeded tree and a 64 MiB file into a PVC; a `VolumeSnapshot` of it is ready with the handle `<volume handle>@snapshot-<uid>` and a `restoreSize` of at least the data; the source then moves on (more ops, the big file removed). A PVC restored from the snapshot and a PVC cloned from the source bind in the source's pool filesystem, and the controller logged a metadata-only `clone.create` for each (under 10 s with the 64 MiB file in the tree; the run prints the times). A pod on worker 2 sees the restore as the tree at the snapshot (big file's SHA-256 intact) and the clone as the tree now; writes into the clone and the restore leave the source's tree as it was. |
 | `csi-clone-cross-pool-refused` | Two pool classes (two filesystems). Within the source's pool, a PVC clone and a restore from a `VolumeSnapshot` bind in the source's filesystem and hold its tree (read on the other worker). The same clone and restore with the other pool's class get a `ProvisioningFailed` warning with `InvalidArgument` naming both filesystems, and stay `Pending` (plan 37 settled decision 8: never a silent full copy). |
@@ -3507,6 +3517,31 @@ self-hosted runner labelled `fuse` (plan 37 "K0 results", question 5: a
 hosted runner's kind nodes are unverified). `kind-e2e` runs only when the
 repository variable `CONSTELLATION_FUSE_RUNNER` is `true`, so a nightly
 without such a runner skips it instead of queueing forever.
+
+### Credential revocation on a signature-checking S3 (plan 37 K6a)
+
+```bash
+tests/ci/install-native-s3.sh /var/tmp/native-s3     # once: versitygw
+CONSTELLATION_VERSITYGW_BIN=/var/tmp/native-s3/versitygw \
+    target/release/harness run csi-credential-revocation
+```
+
+floci accepts any key pair, so the kind lane cannot show S3 refusing an old
+one. `csi-credential-revocation` runs `constellation serve --await-unlock
+--create` (an engine pod's command, minus Kubernetes) on a versitygw of its
+own with its internal IAM (cache off): two accounts, `A` and `B`. Unlocked
+with `A` over the control socket, a writer writes and reads back a file
+every 50 ms (`browse.write`/`browse.read`); the scenario rotates to `B`
+(`fs.unlock`), waits until `fs.list` says the S3 clients sign with it,
+revokes `A`, and requires the writer to carry on with no error. A rotation
+to the revoked `A` and one to `B` with a wrong secret are refused
+(`Denied`, naming `InvalidAccessKeyId`/`SignatureDoesNotMatch`) with the
+generation unchanged. A fresh engine (new state dir) then refuses `A` at its
+credential gate, starts with `B` and reads every file back. The audit log
+holds the two accepted and two refused `fs.unlock`, and no error text, log
+or audit line holds a key id, a secret or S3's error body (versitygw echoes
+the key id and the string to sign there). It needs no docker; without a
+versitygw binary it fails, naming the install script.
 
 ## CI notes
 

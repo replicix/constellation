@@ -8,7 +8,8 @@
 #
 # Non-root by default (uid 65532). The node DaemonSet overrides to uid 0 +
 # privileged: only it calls mount(2), and the control-acl service grant
-# matches uid 0 (plan 37 §9). fuse3 is here for `fusermount3`.
+# matches uid 0 (plan 37 §9); a controller-owned engine pod's grant (uid
+# 65532, `csi-controller`) is the file below. fuse3 is here for `fusermount3`.
 
 FROM rust:1-bookworm AS build
 RUN apt-get update \
@@ -33,5 +34,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends fuse3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /constellation-csi /constellation /usr/local/bin/
+# A controller-owned engine pod's allowlist (CONSTELLATION_CONTROL_POLICY):
+# the controller's relay is the `csi-controller` service on its socket.
+COPY deploy/docker/controller-engine-control-allow.toml /etc/constellation-csi/controller-engine/control-allow.toml
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/constellation-csi"]

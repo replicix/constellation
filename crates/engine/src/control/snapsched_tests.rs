@@ -42,6 +42,7 @@ impl ControlHost for NoViews {
         &self,
         _: &HandoffParams,
         _: Option<OwnedFd>,
+        _: Option<&constellation_control::authz::ServiceMatch>,
     ) -> Result<HandoffReport, ControlError> {
         Err(ControlError::unsupported("no handoff here"))
     }

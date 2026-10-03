@@ -347,7 +347,7 @@ impl ControllerService {
         };
         let pool_uuid = self.pool_uuid(engines, &pool_ref).await?;
         let fs = engines
-            .filesystem(&pool_uuid)
+            .filesystem(&pool_uuid, &pool_ref.secrets)
             .await
             .map_err(|e| status("reaching the pool's engine", e))?;
         let id = VolumeId::Pool {
@@ -441,7 +441,7 @@ impl ControllerService {
                 _ => status("fs.create", e),
             })?;
         let fs = engines
-            .filesystem(&created.uuid)
+            .filesystem(&created.uuid, &fs_ref.secrets)
             .await
             .map_err(|e| status("reaching the volume's engine", e))?;
         let id = VolumeId::Dedicated {
@@ -805,6 +805,54 @@ fn lock_key(id: &VolumeId, raw: &str) -> String {
     }
 }
 
+/// A request's `secrets` as [`crate::credentials::Secrets`].
+pub(crate) fn secrets_of(
+    secrets: &std::collections::HashMap<String, String>,
+) -> crate::credentials::Secrets {
+    secrets
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Whom a CSI call is for, as every engine audit line it causes records
+/// it (`on_behalf_of`, plan 37 K6a): the PersistentVolume's name — a pool
+/// volume's id carries it — else the volume id itself (a dedicated or a
+/// static volume), squeezed into the protocol's token alphabet.
+pub(crate) fn attribution(volume_id: &str) -> String {
+    match VolumeId::parse(volume_id) {
+        Ok(id) => attribution_of_volume(&id),
+        Err(_) => attribution_of(volume_id),
+    }
+}
+
+/// [`attribution`] of a parsed volume id.
+pub(crate) fn attribution_of_volume(id: &VolumeId) -> String {
+    match id {
+        VolumeId::Pool { name, .. } => attribution_of(name),
+        _ => attribution_of(&id.to_string()),
+    }
+}
+
+/// `name` in `on_behalf_of`'s alphabet and length.
+pub(crate) fn attribution_of(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '@' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    out.truncate(constellation_control::proto::ON_BEHALF_OF_MAX);
+    if out.is_empty() {
+        out.push('-');
+    }
+    out
+}
+
 #[tonic::async_trait]
 impl ControllerRpc for ControllerService {
     async fn create_volume(
@@ -812,33 +860,37 @@ impl ControllerRpc for ControllerService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let req = request.into_inner();
-        validate_name(&req.name).map_err(Status::invalid_argument)?;
-        check_capabilities(&req.volume_capabilities).map_err(Status::invalid_argument)?;
-        let capacity = requested_capacity(req.capacity_range.as_ref())?;
-        let class = ClassParams::parse(&req.parameters).map_err(Status::invalid_argument)?;
-        let engines = self.engines()?;
-        let _lock = self.locks.try_lock(req.name.clone())?;
-        let volume = match (&req.volume_content_source, class.layout) {
-            (Some(content), _) => {
-                self.create_from_source(engines, &class, &req, capacity, content)
-                    .await?
-            }
-            (None, Layout::Pool) => {
-                self.create_pool_volume(engines, &class, &req, capacity)
-                    .await?
-            }
-            (None, Layout::Dedicated) => {
-                self.create_dedicated_volume(engines, &class, &req, capacity)
-                    .await?
-            }
-        };
-        self.created
-            .lock()
-            .unwrap()
-            .insert(volume.volume_id.clone());
-        Ok(Response::new(CreateVolumeResponse {
-            volume: Some(volume),
-        }))
+        let who = attribution_of(&req.name);
+        constellation_control::client::on_behalf_of(who, async move {
+            validate_name(&req.name).map_err(Status::invalid_argument)?;
+            check_capabilities(&req.volume_capabilities).map_err(Status::invalid_argument)?;
+            let capacity = requested_capacity(req.capacity_range.as_ref())?;
+            let class = ClassParams::parse(&req.parameters).map_err(Status::invalid_argument)?;
+            let engines = self.engines()?;
+            let _lock = self.locks.try_lock(req.name.clone())?;
+            let volume = match (&req.volume_content_source, class.layout) {
+                (Some(content), _) => {
+                    self.create_from_source(engines, &class, &req, capacity, content)
+                        .await?
+                }
+                (None, Layout::Pool) => {
+                    self.create_pool_volume(engines, &class, &req, capacity)
+                        .await?
+                }
+                (None, Layout::Dedicated) => {
+                    self.create_dedicated_volume(engines, &class, &req, capacity)
+                        .await?
+                }
+            };
+            self.created
+                .lock()
+                .unwrap()
+                .insert(volume.volume_id.clone());
+            Ok(Response::new(CreateVolumeResponse {
+                volume: Some(volume),
+            }))
+        })
+        .await
     }
 
     async fn delete_volume(
@@ -846,53 +898,63 @@ impl ControllerRpc for ControllerService {
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
-        if req.volume_id.is_empty() {
-            return Err(Status::invalid_argument("volume_id is required"));
-        }
-        let engines = self.engines()?;
-        let id = match VolumeId::parse(&req.volume_id) {
-            Ok(id) => id,
-            // Not an id this driver ever minted, so no such volume: CSI
-            // makes deleting a nonexistent volume `OK`.
-            Err(e) => {
-                tracing::info!(error = %e, "DeleteVolume of an unparseable id: nothing to do");
-                return Ok(Response::new(DeleteVolumeResponse {}));
+        let who = attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            if req.volume_id.is_empty() {
+                return Err(Status::invalid_argument("volume_id is required"));
             }
-        };
-        let (name, subtree) = match &id {
-            VolumeId::Pool { name, .. } => (name.clone(), id.subtree()),
-            VolumeId::Static { .. } => {
-                return Err(Status::failed_precondition(
-                    "statically provisioned volumes are never deleted by this driver; use \
+            let engines = self.engines()?;
+            let id = match VolumeId::parse(&req.volume_id) {
+                Ok(id) => id,
+                // Not an id this driver ever minted, so no such volume: CSI
+                // makes deleting a nonexistent volume `OK`.
+                Err(e) => {
+                    tracing::info!(error = %e, "DeleteVolume of an unparseable id: nothing to do");
+                    return Ok(Response::new(DeleteVolumeResponse {}));
+                }
+            };
+            let (name, subtree) = match &id {
+                VolumeId::Pool { name, .. } => (name.clone(), id.subtree()),
+                VolumeId::Static { .. } => {
+                    return Err(Status::failed_precondition(
+                        "statically provisioned volumes are never deleted by this driver; use \
                      persistentVolumeReclaimPolicy: Retain (plan 37 settled decision 17)",
-                ))
-            }
-            VolumeId::Dedicated { fs_uuid } => {
-                return Err(Status::failed_precondition(format!(
-                    "volume {} is a whole filesystem ({fs_uuid}, layout \"dedicated\"), and \
+                    ))
+                }
+                VolumeId::Dedicated { fs_uuid } => {
+                    return Err(Status::failed_precondition(format!(
+                        "volume {} is a whole filesystem ({fs_uuid}, layout \"dedicated\"), and \
                      deleting one needs the purge primitive of plan 37 K6b, which does not exist \
                      yet: retain it (persistentVolumeReclaimPolicy: Retain), or remove the \
                      filesystem's bucket prefix by hand once its PV is gone",
-                    req.volume_id
-                )))
+                        req.volume_id
+                    )))
+                }
+            };
+            let _lock = self.locks.try_lock(lock_key(&id, &req.volume_id))?;
+            let uuid = id.fs_uuid().to_string();
+            let remembered = self.created.lock().unwrap().contains(&req.volume_id);
+            let Some((fs, started)) = self
+                .engine_for_delete(
+                    engines,
+                    &uuid,
+                    Handle::Volume(&req.volume_id),
+                    remembered,
+                    &secrets_of(&req.secrets),
+                )
+                .await?
+            else {
+                self.created.lock().unwrap().remove(&req.volume_id);
+                return Ok(Response::new(DeleteVolumeResponse {}));
+            };
+            let result = self.trash_volume(fs.as_ref(), &id, &name, &subtree).await;
+            self.retire_if_started(engines, fs, &uuid, started).await;
+            if result.is_ok() {
+                self.created.lock().unwrap().remove(&req.volume_id);
             }
-        };
-        let _lock = self.locks.try_lock(lock_key(&id, &req.volume_id))?;
-        let uuid = id.fs_uuid().to_string();
-        let remembered = self.created.lock().unwrap().contains(&req.volume_id);
-        let Some((fs, started)) = self
-            .engine_for_delete(engines, &uuid, Handle::Volume(&req.volume_id), remembered)
-            .await?
-        else {
-            self.created.lock().unwrap().remove(&req.volume_id);
-            return Ok(Response::new(DeleteVolumeResponse {}));
-        };
-        let result = self.trash_volume(fs.as_ref(), &id, &name, &subtree).await;
-        self.retire_if_started(engines, fs, &uuid, started).await;
-        if result.is_ok() {
-            self.created.lock().unwrap().remove(&req.volume_id);
-        }
-        result.map(|()| Response::new(DeleteVolumeResponse {}))
+            result.map(|()| Response::new(DeleteVolumeResponse {}))
+        })
+        .await
     }
 
     async fn controller_expand_volume(
@@ -900,69 +962,74 @@ impl ControllerRpc for ControllerService {
         request: Request<ControllerExpandVolumeRequest>,
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
         let req = request.into_inner();
-        if req.volume_id.is_empty() {
-            return Err(Status::invalid_argument("volume_id is required"));
-        }
-        if req.capacity_range.is_none() {
-            return Err(Status::invalid_argument("capacity_range is required"));
-        }
-        let wanted = requested_capacity(req.capacity_range.as_ref())?;
-        if let Some(cap) = &req.volume_capability {
-            capability_supported(cap).map_err(Status::invalid_argument)?;
-        }
-        let engines = self.engines()?;
-        let id = VolumeId::parse(&req.volume_id).map_err(|e| Status::not_found(e.to_string()))?;
-        if let VolumeId::Static { .. } = id {
-            return Err(Status::invalid_argument(
-                "statically provisioned volumes have no driver-managed capacity",
-            ));
-        }
-        let subtree = id.subtree();
-        let _lock = self.locks.try_lock(lock_key(&id, &req.volume_id))?;
-        let fs = engines
-            .filesystem(id.fs_uuid())
-            .await
-            .map_err(|e| status("reaching the volume's engine", e))?;
-        // The cap alone: raising a cap never walks the volume (module
-        // docs) — above the old cap is above what the cap admitted.
-        let current = fs
-            .quota_cap(&subtree)
-            .await
-            .map_err(|e| status(&format!("quota.get {subtree}"), e))?;
-        // Only capping a volume that had none can land below its contents,
-        // and only that (rare) case pays for the walk.
-        if current.is_none() && wanted > 0 {
-            let used = fs
-                .quota_get(&subtree)
+        let who = attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            if req.volume_id.is_empty() {
+                return Err(Status::invalid_argument("volume_id is required"));
+            }
+            if req.capacity_range.is_none() {
+                return Err(Status::invalid_argument("capacity_range is required"));
+            }
+            let wanted = requested_capacity(req.capacity_range.as_ref())?;
+            if let Some(cap) = &req.volume_capability {
+                capability_supported(cap).map_err(Status::invalid_argument)?;
+            }
+            let engines = self.engines()?;
+            let id =
+                VolumeId::parse(&req.volume_id).map_err(|e| Status::not_found(e.to_string()))?;
+            if let VolumeId::Static { .. } = id {
+                return Err(Status::invalid_argument(
+                    "statically provisioned volumes have no driver-managed capacity",
+                ));
+            }
+            let subtree = id.subtree();
+            let _lock = self.locks.try_lock(lock_key(&id, &req.volume_id))?;
+            let fs = engines
+                .filesystem(id.fs_uuid(), &secrets_of(&req.secrets))
                 .await
-                .map_err(|e| status(&format!("quota.get {subtree}"), e))?
-                .used_bytes;
-            if wanted < used {
-                return Err(Status::out_of_range(format!(
-                    "{wanted} bytes is below the {used} bytes already used"
-                )));
-            }
-        }
-        // Grow only: a request at or below the current cap is already
-        // satisfied (and `0`, "no particular size", leaves it alone).
-        let capacity = match current {
-            Some(cap) if cap >= wanted => cap,
-            None if wanted == 0 => 0,
-            _ => {
-                self.set_quota(fs.as_ref(), &subtree, Some(wanted))
+                .map_err(|e| status("reaching the volume's engine", e))?;
+            // The cap alone: raising a cap never walks the volume (module
+            // docs) — above the old cap is above what the cap admitted.
+            let current = fs
+                .quota_cap(&subtree)
+                .await
+                .map_err(|e| status(&format!("quota.get {subtree}"), e))?;
+            // Only capping a volume that had none can land below its contents,
+            // and only that (rare) case pays for the walk.
+            if current.is_none() && wanted > 0 {
+                let used = fs
+                    .quota_get(&subtree)
                     .await
-                    .map_err(|e| quota_status(&subtree, e))?;
-                wanted
+                    .map_err(|e| status(&format!("quota.get {subtree}"), e))?
+                    .used_bytes;
+                if wanted < used {
+                    return Err(Status::out_of_range(format!(
+                        "{wanted} bytes is below the {used} bytes already used"
+                    )));
+                }
             }
-        };
-        if let VolumeId::Pool { .. } = id {
-            set_xattr(fs.as_ref(), &subtree, X_CAPACITY, &capacity.to_string()).await?;
-        }
-        Ok(Response::new(ControllerExpandVolumeResponse {
-            capacity_bytes: i64::try_from(capacity).unwrap_or(i64::MAX),
-            // Settled decision 6: the quota is the whole size.
-            node_expansion_required: false,
-        }))
+            // Grow only: a request at or below the current cap is already
+            // satisfied (and `0`, "no particular size", leaves it alone).
+            let capacity = match current {
+                Some(cap) if cap >= wanted => cap,
+                None if wanted == 0 => 0,
+                _ => {
+                    self.set_quota(fs.as_ref(), &subtree, Some(wanted))
+                        .await
+                        .map_err(|e| quota_status(&subtree, e))?;
+                    wanted
+                }
+            };
+            if let VolumeId::Pool { .. } = id {
+                set_xattr(fs.as_ref(), &subtree, X_CAPACITY, &capacity.to_string()).await?;
+            }
+            Ok(Response::new(ControllerExpandVolumeResponse {
+                capacity_bytes: i64::try_from(capacity).unwrap_or(i64::MAX),
+                // Settled decision 6: the quota is the whole size.
+                node_expansion_required: false,
+            }))
+        })
+        .await
     }
 
     async fn validate_volume_capabilities(
@@ -970,37 +1037,42 @@ impl ControllerRpc for ControllerService {
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
         let req = request.into_inner();
-        if req.volume_id.is_empty() {
-            return Err(Status::invalid_argument("volume_id is required"));
-        }
-        if req.volume_capabilities.is_empty() {
-            return Err(Status::invalid_argument("volume_capabilities is required"));
-        }
-        let engines = self.engines()?;
-        let id = VolumeId::parse(&req.volume_id).map_err(|e| Status::not_found(e.to_string()))?;
-        let fs = engines
-            .filesystem(id.fs_uuid())
-            .await
-            .map_err(|e| status("reaching the volume's engine", e))?;
-        fs.quota_cap(&id.subtree())
-            .await
-            .map_err(|e| status(&format!("quota.get {}", id.subtree()), e))?;
-        let response = match check_capabilities(&req.volume_capabilities) {
-            Ok(()) => ValidateVolumeCapabilitiesResponse {
-                confirmed: Some(validate_volume_capabilities_response::Confirmed {
-                    volume_context: req.volume_context,
-                    volume_capabilities: req.volume_capabilities,
-                    parameters: req.parameters,
-                    mutable_parameters: req.mutable_parameters,
-                }),
-                message: String::new(),
-            },
-            Err(why) => ValidateVolumeCapabilitiesResponse {
-                confirmed: None,
-                message: why,
-            },
-        };
-        Ok(Response::new(response))
+        let who = attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            if req.volume_id.is_empty() {
+                return Err(Status::invalid_argument("volume_id is required"));
+            }
+            if req.volume_capabilities.is_empty() {
+                return Err(Status::invalid_argument("volume_capabilities is required"));
+            }
+            let engines = self.engines()?;
+            let id =
+                VolumeId::parse(&req.volume_id).map_err(|e| Status::not_found(e.to_string()))?;
+            let fs = engines
+                .filesystem(id.fs_uuid(), &secrets_of(&req.secrets))
+                .await
+                .map_err(|e| status("reaching the volume's engine", e))?;
+            fs.quota_cap(&id.subtree())
+                .await
+                .map_err(|e| status(&format!("quota.get {}", id.subtree()), e))?;
+            let response = match check_capabilities(&req.volume_capabilities) {
+                Ok(()) => ValidateVolumeCapabilitiesResponse {
+                    confirmed: Some(validate_volume_capabilities_response::Confirmed {
+                        volume_context: req.volume_context,
+                        volume_capabilities: req.volume_capabilities,
+                        parameters: req.parameters,
+                        mutable_parameters: req.mutable_parameters,
+                    }),
+                    message: String::new(),
+                },
+                Err(why) => ValidateVolumeCapabilitiesResponse {
+                    confirmed: None,
+                    message: why,
+                },
+            };
+            Ok(Response::new(response))
+        })
+        .await
     }
 
     async fn controller_get_capabilities(
@@ -1082,7 +1154,10 @@ impl ControllerRpc for ControllerService {
         &self,
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        let snapshot = self.create_snapshot_rpc(request.into_inner()).await?;
+        let req = request.into_inner();
+        let who = attribution(&req.source_volume_id);
+        let snapshot =
+            constellation_control::client::on_behalf_of(who, self.create_snapshot_rpc(req)).await?;
         Ok(Response::new(CreateSnapshotResponse {
             snapshot: Some(snapshot),
         }))
@@ -1092,7 +1167,12 @@ impl ControllerRpc for ControllerService {
         &self,
         request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
-        self.delete_snapshot_rpc(request.into_inner()).await?;
+        let req = request.into_inner();
+        let who = match crate::volume_id::SnapshotId::parse(&req.snapshot_id) {
+            Ok(id) => attribution_of_volume(&id.volume),
+            Err(_) => attribution_of(&req.snapshot_id),
+        };
+        constellation_control::client::on_behalf_of(who, self.delete_snapshot_rpc(req)).await?;
         Ok(Response::new(DeleteSnapshotResponse {}))
     }
 

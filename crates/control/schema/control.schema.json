@@ -2280,6 +2280,17 @@
           "default": "",
           "type": "string"
         },
+        "credentials_generation": {
+          "description": "The daemon's own filesystem only (0 elsewhere): how many times\n`fs.unlock` has set the S3 credentials its engine signs with (0:\nit signs with the environment's AWS chain), and the newest of those\ngenerations a signed S3 request has used. The two are equal once a\nrotation has reached the running S3 clients (plan 37 K6a).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "credentials_in_use": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "e2e": {
           "default": false,
           "type": "boolean"
@@ -2310,7 +2321,9 @@
       },
       "required": [
         "uuid",
-        "bucket"
+        "bucket",
+        "credentials_generation",
+        "credentials_in_use"
       ],
       "type": "object"
     },
@@ -2877,6 +2890,11 @@
         {
           "const": "status",
           "description": "Receiver: where the adoption stands ([`HandoffReport::state`]).",
+          "type": "string"
+        },
+        {
+          "const": "credentials",
+          "description": "Either side, before `Prepare` (37-k6a): the credentials an engine\npod got through `fs.unlock` (plan 37 §9) cross to its standby, which\nhas no other way to get them — nothing is in its pod spec or\nenvironment, and the node plugin may have restarted since it last\nheld them. The sender writes them as one frame onto the unix stream\nsocket attached to the request (`crate::handoff_wire::write_secret`;\nan empty frame when it holds none), the receiver reads that frame\nfrom the socket attached to its own request, checks the credentials\nagainst the bucket and pre-opens its backend with them. Nothing\npauses: no session stops for it. A standby started `--await-unlock`\nrefuses `Receive` until it has them.",
           "type": "string"
         }
       ]

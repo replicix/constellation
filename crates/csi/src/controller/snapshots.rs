@@ -74,8 +74,9 @@
 //! quota and the new mark; a retry that finds the raw copy (the source's
 //! `pv` in the record) completes it in place.
 
-use super::{read_record, status, ControllerService, X_CREATED, X_PV};
+use super::{read_record, secrets_of, status, ControllerService, X_CREATED, X_PV};
 use crate::control_client::{ControlClient, Engines, Handle, PoolRef};
+use crate::credentials::Secrets;
 use crate::params::{ClassParams, Layout};
 use crate::proto::csi::v1::volume_content_source::Type as SourceType;
 use crate::proto::csi::v1::*;
@@ -207,9 +208,10 @@ impl ControllerService {
         fs_uuid: &str,
         handle: Handle<'_>,
         remembered: bool,
+        secrets: &Secrets,
     ) -> Result<Option<(Arc<dyn ControlClient>, bool)>, Status> {
         if let Some(fs) = engines
-            .running(fs_uuid)
+            .running(fs_uuid, secrets)
             .await
             .map_err(|e| status("reaching the filesystem's engine", e))?
         {
@@ -230,7 +232,7 @@ impl ControllerService {
             );
             return Ok(None);
         }
-        match engines.filesystem(fs_uuid).await {
+        match engines.filesystem(fs_uuid, secrets).await {
             Ok(fs) => Ok(Some((fs, true))),
             Err(e) if e.kind == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(status("reaching the filesystem's engine", e)),
@@ -266,6 +268,7 @@ impl ControllerService {
         }
         validate_snapshot_name(&req.name).map_err(Status::invalid_argument)?;
         let engines = self.engines()?;
+        let secrets = secrets_of(&req.secrets);
         let volume = VolumeId::parse(&req.source_volume_id)
             .map_err(|e| Status::not_found(format!("source volume: {e}")))?;
         let _lock = self.snapshot_locks.try_lock(req.name.clone())?;
@@ -274,7 +277,7 @@ impl ControllerService {
             name: req.name.clone(),
         };
         let fs = engines
-            .filesystem(id.volume.fs_uuid())
+            .filesystem(id.volume.fs_uuid(), &secrets)
             .await
             .map_err(|e| status("reaching the source volume's engine", e))?;
         let path = id.volume.subtree();
@@ -294,7 +297,7 @@ impl ControllerService {
             if taken.is_some() {
                 break;
             }
-            if let Some(other_fs) = reach(engines, &uuid).await? {
+            if let Some(other_fs) = reach(engines, &uuid, &Secrets::new()).await? {
                 taken = taken_by_other(other_fs.as_ref(), &id).await?;
             }
         }
@@ -348,7 +351,13 @@ impl ControllerService {
         let _lock = self.snapshot_locks.try_lock(id.name.clone())?;
         let uuid = id.volume.fs_uuid().to_string();
         let Some((fs, started)) = self
-            .engine_for_delete(engines, &uuid, Handle::Snapshot(&req.snapshot_id), false)
+            .engine_for_delete(
+                engines,
+                &uuid,
+                Handle::Snapshot(&req.snapshot_id),
+                false,
+                &secrets_of(&req.secrets),
+            )
             .await?
         else {
             return Ok(());
@@ -378,12 +387,13 @@ impl ControllerService {
             ),
         };
         let engines = self.engines()?;
+        let secrets = secrets_of(&req.secrets);
         let mut found: Vec<Snapshot> = Vec::new();
         if !req.snapshot_id.is_empty() {
             let Ok(id) = SnapshotId::parse(&req.snapshot_id) else {
                 return Ok(ListSnapshotsResponse::default());
             };
-            if let Some(fs) = reach(engines, id.volume.fs_uuid()).await? {
+            if let Some(fs) = reach(engines, id.volume.fs_uuid(), &secrets).await? {
                 if let Some(row) = find(fs.as_ref(), &id.volume.subtree(), &id.name).await? {
                     found.push(snapshot_of(&id, &row));
                 }
@@ -392,7 +402,7 @@ impl ControllerService {
             let Ok(volume) = VolumeId::parse(&req.source_volume_id) else {
                 return Ok(ListSnapshotsResponse::default());
             };
-            if let Some(fs) = reach(engines, volume.fs_uuid()).await? {
+            if let Some(fs) = reach(engines, volume.fs_uuid(), &secrets).await? {
                 for row in list(fs.as_ref(), Some(&volume.subtree())).await? {
                     if let Some(id) = csi_id(&row).filter(|id| id.volume == volume) {
                         found.push(snapshot_of(&id, &row));
@@ -405,7 +415,19 @@ impl ControllerService {
                 .await
                 .map_err(|e| status("listing the running engines", e))?;
             for uuid in uuids {
-                let Some(fs) = reach(engines, &uuid).await? else {
+                // An unfiltered list that cannot reach one engine is an error,
+                // not a silently partial list; it names the filesystem
+                // (pool) it is waiting for.
+                let reached = reach(engines, &uuid, &Secrets::new()).await.map_err(|s| {
+                    Status::new(
+                        s.code(),
+                        format!(
+                            "listing snapshots: filesystem {uuid} is not reachable yet: {}",
+                            s.message()
+                        ),
+                    )
+                })?;
+                let Some(fs) = reached else {
                     continue;
                 };
                 for row in list(fs.as_ref(), None).await? {
@@ -451,7 +473,8 @@ impl ControllerService {
         let id =
             SnapshotId::parse(&req.snapshot_id).map_err(|e| Status::not_found(e.to_string()))?;
         let engines = self.engines()?;
-        let fs = reach(engines, id.volume.fs_uuid())
+        let secrets = secrets_of(&req.secrets);
+        let fs = reach(engines, id.volume.fs_uuid(), &secrets)
             .await?
             .ok_or_else(|| Status::not_found(format!("no filesystem {}", id.volume.fs_uuid())))?;
         let row = find(fs.as_ref(), &id.volume.subtree(), &id.name)
@@ -541,7 +564,7 @@ impl ControllerService {
             )));
         }
         let fs = engines
-            .filesystem(&pool_uuid)
+            .filesystem(&pool_uuid, &pool_ref.secrets)
             .await
             .map_err(|e| status("reaching the pool's engine", e))?;
         let id = VolumeId::Pool {
@@ -785,11 +808,16 @@ async fn delete_held(fs: &dyn ControlClient, id: &SnapshotId) -> Result<(), Stat
 
 /// The engine of `fs_uuid` for a read: `None` when the filesystem is
 /// unknown (`NotFound`), so a listing of something gone is empty.
+/// `secrets`: the request's, only when they belong to that filesystem's
+/// pool — another pool's engine is reached with none (it runs unlocked
+/// already, or the read fails `UNAVAILABLE`), never with credentials that
+/// would then be pushed to it as a rotation.
 async fn reach(
     engines: &Arc<dyn Engines>,
     fs_uuid: &str,
+    secrets: &Secrets,
 ) -> Result<Option<Arc<dyn ControlClient>>, Status> {
-    match engines.filesystem(fs_uuid).await {
+    match engines.filesystem(fs_uuid, secrets).await {
         Ok(fs) => Ok(Some(fs)),
         Err(e) if e.kind == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(status("reaching the filesystem's engine", e)),

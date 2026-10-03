@@ -75,6 +75,22 @@
 //! - **`Abort`**: every prepared session is served again, in place (or, a
 //!   prepare still under way, as soon as it ends).
 //!
+//! - **`Credentials`** (37-k6a, before `Prepare`: nothing pauses): the
+//!   credentials `fs.unlock` gave this engine pod (`serve --await-unlock`,
+//!   plan 37 §9) — the store its static source signs from, so a rotation
+//!   since is included — written as one frame onto the stream socket
+//!   attached to the request (`handoff_wire::write_secret`; an empty frame
+//!   when it holds none). The standby has no other source: nothing is in
+//!   its pod spec or environment, and the node plugin forgets a
+//!   `static-ephemeral` class's secret when it restarts — which a chart
+//!   upgrade, the very thing that rolls engine pods, does. The frame is
+//!   never logged; the node plugin relays it without reading it. Admin is
+//!   not enough to ask: only the node plugin — the caller matched its
+//!   `kind = "service"` grant ([`NODE_PLUGIN_LABEL`]), never the owner
+//!   rule, since anybody who can exec into the pod runs as the owner — and
+//!   only while a standby waits on the state dir ([`STANDBY_MARKER`]) and
+//!   nothing is committed ([`may_take_credentials`]).
+//!
 //! # The receiver (a standby `constellation serve --handoff-socket`)
 //!
 //! `serve` with `--handoff-socket` that finds the state dir locked does
@@ -107,6 +123,22 @@
 //! *sender* (`Serving`, or a handoff of its own under way): two roles, two
 //! questions, not two answers to one.
 //!
+//! A standby started `--await-unlock` has no credentials of its own: it
+//! pre-opens nothing until a `Credentials` step brings them (they are
+//! checked against the bucket first — a pair the bucket refuses fails the
+//! step, before any session stopped), and refuses `Receive` until then.
+//! Its engine starts on them. A `SIGTERM`/`SIGINT` before the `Seal`
+//! ends the standby as an `Abort` does. Once sealed it does not: the node
+//! plugin sends `Commit` right after `Seal` answers, without asking
+//! whether the standby still lives, so a standby that exited before the
+//! marker appeared could leave no process holding the sessions. A sealed
+//! standby notes the signal and keeps waiting: past the seal's deadline
+//! with no marker it exits (the sender, whose own deadline is earlier,
+//! serves its copies again); once the marker is there it holds the only
+//! copies, serves them, and passes the signal on to the node, whose own
+//! handling (§7: `SIGTERM` deferred while views are mounted) takes it
+//! from there.
+//!
 //! A handed-over descriptor only ever reaches `FuseSession::resume` (never
 //! the `FUSE_INIT` handshake of a new mount, which would wait forever on
 //! it — K0 question 1); it arrives blocking (`SessionControl::detach`
@@ -115,6 +147,7 @@
 use crate::handover::{self, Detached, MountHandoff, HANDOVER_VERSION};
 use crate::node_runtime::NodeRuntime;
 use anyhow::{Context, Result};
+use constellation_control::authz::ServiceMatch;
 use constellation_control::proto::types::{
     HandedOffView, HandoffParams, HandoffPhase, HandoffReport, HandoffState, Pong,
 };
@@ -252,11 +285,50 @@ fn marker(state_dir: &Path) -> PathBuf {
     state_dir.join(COMMIT_MARKER)
 }
 
+/// Written into the state dir by a standby for as long as it waits
+/// (removed when the wait ends, whichever way; one a killed standby left
+/// is removed by the state dir's next holder at its start): a serving
+/// engine hands its credentials over only while it exists
+/// ([`may_take_credentials`]).
+pub const STANDBY_MARKER: &str = "handoff.standby";
+
+fn standby_marker(state_dir: &Path) -> PathBuf {
+    state_dir.join(STANDBY_MARKER)
+}
+
+/// Remove a [`STANDBY_MARKER`] a killed standby left: nobody waits as the
+/// standby of a holder that only now starts (`serve`, on taking the state
+/// dir).
+pub(crate) fn clear_stale_standby_marker(state_dir: &Path) {
+    let _ = std::fs::remove_file(standby_marker(state_dir));
+}
+
+/// [`STANDBY_MARKER`], for the life of a standby's wait.
+struct StandbyMarker(PathBuf);
+
+impl StandbyMarker {
+    fn write(state_dir: &Path) -> Result<StandbyMarker> {
+        let path = standby_marker(state_dir);
+        std::fs::write(&path, format!("pid {}\n", std::process::id()))
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(StandbyMarker(path))
+    }
+}
+
+impl Drop for StandbyMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// `node.handoff{target: Socket}` on a serving daemon (the sender phases).
+/// `service`: the `kind = "service"` grant the caller matched
+/// (`CallCtx::service`).
 pub fn sender(
     node: &Arc<NodeRuntime>,
     p: &HandoffParams,
     fd: Option<OwnedFd>,
+    service: Option<&ServiceMatch>,
 ) -> Result<HandoffReport, ControlError> {
     if !cfg!(target_os = "linux") {
         return Err(ControlError::unsupported(
@@ -290,10 +362,124 @@ pub fn sender(
             };
             Ok(report(String::new(), Vec::new(), state, started))
         }
+        Some(HandoffPhase::Credentials) => {
+            may_take_credentials(
+                service,
+                node.engine().state_dir(),
+                node.handover.socket.committed.load(Ordering::SeqCst),
+            )?;
+            let fd = fd.ok_or_else(|| {
+                ControlError::invalid("credentials need the receiving socket attached")
+            })?;
+            send_credentials(node, fd, started)
+        }
         Some(HandoffPhase::Receive | HandoffPhase::Seal) => Err(ControlError::invalid(
             "this daemon is serving, not a standby: it has nothing to receive",
         )),
     }
+}
+
+/// The label of the node plugin's `kind = "service"` grant on a node-owned
+/// engine pod's sockets (`constellation_csi::engine_pods::node_engine_policy`).
+pub const NODE_PLUGIN_LABEL: &str = "csi-node-plugin";
+
+/// Who may take a serving engine's credentials with a `Credentials` step,
+/// and when (module docs): the node plugin — the caller matched its
+/// `kind = "service"` grant ([`NODE_PLUGIN_LABEL`]) on this socket; the
+/// owner rule makes the engine's own uid admin, and anybody who can exec
+/// into its pod runs as that uid — and only while a standby waits on
+/// `state_dir` ([`STANDBY_MARKER`]) and nothing is committed yet.
+fn may_take_credentials(
+    service: Option<&ServiceMatch>,
+    state_dir: &Path,
+    committed: bool,
+) -> Result<(), ControlError> {
+    if service.is_none_or(|s| s.label != NODE_PLUGIN_LABEL) {
+        return Err(ControlError::denied(format!(
+            "only the CSI node plugin (its kind = \"service\" grant, label = \
+             {NODE_PLUGIN_LABEL:?}) takes this engine's credentials, for a handoff; the owner and \
+             any other grant do not"
+        )));
+    }
+    if committed || !standby_marker(state_dir).exists() {
+        return Err(ControlError::invalid(
+            "no handoff is pending: no standby waits on this engine's state dir",
+        ));
+    }
+    Ok(())
+}
+
+/// The sender's `Credentials` (module docs): what `fs.unlock` gave this
+/// engine, as one generation of its store, onto `fd`.
+fn send_credentials(
+    node: &Arc<NodeRuntime>,
+    fd: OwnedFd,
+    started: Instant,
+) -> Result<HandoffReport, ControlError> {
+    let mut sock = UnixStream::from(fd);
+    let io = |e: std::io::Error| ControlError::failed(format!("writing the credentials: {e}"));
+    sock.set_nonblocking(false).map_err(io)?;
+    sock.set_write_timeout(Some(STREAM_TIMEOUT)).map_err(io)?;
+    let frame = node
+        .handoff_secrets()
+        .map(|store| unlock_credentials(&store))
+        .transpose()?
+        .flatten();
+    constellation_control::handoff_wire::write_secret(&mut sock, frame.as_deref().map(|f| &f[..]))
+        .map_err(io)?;
+    let detail = match frame {
+        Some(_) => "the fs.unlock credentials were handed over",
+        None => "this engine holds no fs.unlock credentials",
+    };
+    tracing::info!(sent = frame.is_some(), "socket handoff: credentials step");
+    Ok(report(
+        detail.into(),
+        Vec::new(),
+        HandoffState::Serving,
+        started,
+    ))
+}
+
+/// `store`'s credentials (one generation) as `fs.unlock` carries them,
+/// serialized; `None` when it holds none. Every copy is wiped once dropped:
+/// the `Secret`s on drop, the encoding in a buffer sized up front (no
+/// reallocation leaves one behind).
+fn unlock_credentials(
+    store: &constellation_platform::EphemeralSecretStore,
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, ControlError> {
+    use constellation_control::proto::Secret;
+    use constellation_platform::CredentialSource as C;
+    let (_, secrets) = store.snapshot();
+    let text = |name: &str| -> Result<Option<Secret>, ControlError> {
+        secrets
+            .get(name)
+            .map(|s| {
+                s.expose_str().map(Secret::new).ok_or_else(|| {
+                    // Never the value, nor any part of it.
+                    ControlError::failed(format!(
+                        "this engine's {name} is not UTF-8, so a handoff cannot carry it \
+                         (fs.unlock only ever gives text): nothing was handed over, and this \
+                         pod keeps serving; give it its credentials again with fs.unlock"
+                    ))
+                })
+            })
+            .transpose()
+    };
+    let credentials = constellation_control::proto::types::UnlockCredentials {
+        access_key_id: text(C::ACCESS_KEY_ID)?,
+        secret_access_key: text(C::SECRET_ACCESS_KEY)?,
+        session_token: text(C::SESSION_TOKEN)?,
+        e2e_passphrase: text(crate::serve::E2E_PASSPHRASE)?,
+    };
+    if credentials == Default::default() {
+        return Ok(None);
+    }
+    // JSON escapes a byte into at most 6.
+    let values: usize = secrets.values().map(|s| s.expose().len()).sum();
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(6 * values + 256));
+    serde_json::to_writer(&mut *out, &credentials)
+        .map_err(|e| ControlError::failed(format!("encoding the credentials: {e}")))?;
+    Ok(Some(out))
 }
 
 fn prepare(
@@ -691,7 +877,23 @@ struct Standby {
     inner: Mutex<(Phase, Vec<Received>)>,
     changed: Condvar,
     state_dir: PathBuf,
+    /// `serve --await-unlock`: what takes a `Credentials` step's
+    /// credentials (module docs). `None`: the standby uses its
+    /// environment's, and drops any handed over.
+    credentials: Option<CredentialsHook>,
+    /// A `Credentials` step delivered them (`Receive` waits for it when
+    /// [`Self::credentials`] is set).
+    has_credentials: std::sync::atomic::AtomicBool,
 }
+
+/// What a standby that awaits its credentials does with the ones a
+/// `Credentials` step brought: checks them and keeps them for its engine
+/// (`crate::serve`). Its `Ok` is the step's detail. Never logs them.
+pub type CredentialsHook = Box<
+    dyn Fn(constellation_control::proto::types::UnlockCredentials) -> Result<String, ControlError>
+        + Send
+        + Sync,
+>;
 
 impl Standby {
     fn state(&self) -> HandoffState {
@@ -739,12 +941,54 @@ impl Standby {
         let done = |detail: String| Ok(report(detail, self.views(), self.state(), started));
         match p.phase {
             Some(HandoffPhase::Status) => done(String::new()),
+            Some(HandoffPhase::Credentials) => {
+                let fd = fd
+                    .ok_or_else(|| ControlError::invalid("credentials need the stream attached"))?;
+                if !matches!(self.inner.lock().unwrap().0, Phase::Waiting) {
+                    return Err(ControlError::invalid("this standby is sealed"));
+                }
+                let mut sock = UnixStream::from(fd);
+                let io = |e: std::io::Error| {
+                    ControlError::failed(format!("reading the credentials: {e}"))
+                };
+                sock.set_nonblocking(false).map_err(io)?;
+                sock.set_read_timeout(Some(STREAM_TIMEOUT)).map_err(io)?;
+                let frame =
+                    constellation_control::handoff_wire::read_secret(&mut sock).map_err(io)?;
+                let Some(hook) = &self.credentials else {
+                    return done(
+                        "this standby takes its credentials from its environment; the handed-over \
+                         ones were dropped"
+                            .into(),
+                    );
+                };
+                let Some(frame) = frame else {
+                    return Err(ControlError::invalid(
+                        "the sender holds no fs.unlock credentials, and this standby waits for \
+                         them (--await-unlock)",
+                    ));
+                };
+                // Never the parser's message: it may quote the input.
+                let credentials = serde_json::from_slice(&frame).map_err(|_| {
+                    ControlError::invalid("the handed-over credentials are not readable")
+                })?;
+                drop(frame);
+                let detail = hook(credentials)?;
+                self.has_credentials.store(true, Ordering::SeqCst);
+                done(detail)
+            }
             Some(HandoffPhase::Receive) => {
                 let fd = fd.ok_or_else(|| {
                     ControlError::invalid("receive needs the record stream attached")
                 })?;
                 if !matches!(self.inner.lock().unwrap().0, Phase::Waiting) {
                     return Err(ControlError::invalid("this standby is sealed"));
+                }
+                if self.credentials.is_some() && !self.has_credentials.load(Ordering::SeqCst) {
+                    return Err(ControlError::invalid(
+                        "this standby waits for its credentials (--await-unlock): a Credentials \
+                         step comes before Receive",
+                    ));
                 }
                 // Read without holding the state: `Status` keeps answering.
                 let records = read_records(fd)?;
@@ -830,7 +1074,7 @@ impl Standby {
                 done("aborted".into())
             }
             _ => Err(ControlError::invalid(
-                "a standby receives a handoff (receive, seal, abort, status)",
+                "a standby receives a handoff (credentials, receive, seal, abort, status)",
             )),
         }
     }
@@ -886,9 +1130,17 @@ pub enum StandbyOutcome {
 pub struct Adoption {
     standby: Arc<Standby>,
     received: Vec<Received>,
+    signal: Option<&'static str>,
 }
 
 impl Adoption {
+    /// A signal that came once sealed, before the sender committed (or
+    /// after): the node handles it once it serves
+    /// (`NodeRuntime::deliver_signal`).
+    pub fn signal(&self) -> Option<&'static str> {
+        self.signal
+    }
+
     /// The handover generation the node serves as.
     pub fn generation(&self) -> u32 {
         self.received
@@ -903,16 +1155,29 @@ impl Adoption {
 /// take `state_dir`'s lock, or until it is aborted or times out. The
 /// handoff socket keeps answering `Status` afterwards, for the life of the
 /// process.
+///
+/// `credentials`: a standby that awaits them (`serve --await-unlock`, the
+/// module docs). `stop`: the signal that ends the wait, once one came
+/// (`None` until then) — at once until sealed; once sealed, at the seal's
+/// deadline if the sender has not committed by then, and otherwise passed
+/// on with the adoption ([`Adoption::signal`]).
 pub fn standby(
     rt: &tokio::runtime::Handle,
     socket: &Path,
     state_dir: &Path,
+    credentials: Option<CredentialsHook>,
+    stop: tokio::sync::watch::Receiver<Option<&'static str>>,
 ) -> Result<StandbyOutcome> {
     let standby = Arc::new(Standby {
         inner: Mutex::new((Phase::Waiting, Vec::new())),
         changed: Condvar::new(),
         state_dir: state_dir.to_path_buf(),
+        credentials,
+        has_credentials: std::sync::atomic::AtomicBool::new(false),
     });
+    // Before the socket: the plugin asks the sender for its credentials
+    // as soon as this answers.
+    let _waiting = StandbyMarker::write(state_dir)?;
     serve_standby(rt, socket, &standby)?;
     tracing::info!(
         socket = %socket.display(),
@@ -921,8 +1186,42 @@ pub fn standby(
     );
     crate::startup::phase("waiting as a handoff standby");
     let give_up_at = Instant::now() + standby_timeout();
+    // A signal that came once sealed: honoured at the deadline, or passed
+    // on to the node once it serves.
+    let mut noted: Option<&'static str> = None;
     loop {
+        let signal = *stop.borrow();
         let mut inner = standby.inner.lock().unwrap();
+        if let Some(signal) = signal {
+            match &inner.0 {
+                // Unsealed, the sender commits nothing: its own copies
+                // serve again, as on an `Abort`.
+                Phase::Waiting => {
+                    let reason = format!("stopped by {signal}");
+                    inner.0 = Phase::Failed {
+                        reason: reason.clone(),
+                    };
+                    inner.1.clear();
+                    return Ok(StandbyOutcome::GiveUp(reason));
+                }
+                // Sealed, the sender may commit at any moment — whether
+                // this process still lives or not: giving up now, before
+                // its marker exists, can leave no process holding the
+                // sessions. So the signal only ends the wait as the
+                // deadline does (the sender refuses a commit past its own,
+                // earlier, one), and if the marker comes first it is the
+                // node's to handle once it serves.
+                Phase::Sealed { .. } if noted.is_none() => {
+                    noted = Some(signal);
+                    tracing::warn!(
+                        signal,
+                        "signal received while sealed: waiting for the sender's commit (then \
+                         serving, and handling the signal) or the deadline (then exiting)"
+                    );
+                }
+                _ => {}
+            }
+        }
         match &inner.0 {
             Phase::Failed { reason } => return Ok(StandbyOutcome::GiveUp(reason.clone())),
             Phase::Waiting if Instant::now() >= give_up_at => {
@@ -965,6 +1264,7 @@ pub fn standby(
                         return Ok(StandbyOutcome::Adopt(Adoption {
                             standby: standby.clone(),
                             received,
+                            signal: noted,
                         }));
                     }
                     crate::LockOutcome::Attach if committed => {
@@ -991,12 +1291,18 @@ pub fn standby(
                             // No commit, and none can come any more (the
                             // sender refuses one past its own, earlier,
                             // deadline): it serves its own copies again.
-                            let reason = "the sender did not commit before the deadline";
+                            let reason = match noted {
+                                Some(signal) => format!(
+                                    "stopped by {signal}; the sender did not commit before the \
+                                     deadline"
+                                ),
+                                None => "the sender did not commit before the deadline".into(),
+                            };
                             inner.0 = Phase::Failed {
-                                reason: reason.into(),
+                                reason: reason.clone(),
                             };
                             inner.1.clear();
-                            return Ok(StandbyOutcome::GiveUp(reason.into()));
+                            return Ok(StandbyOutcome::GiveUp(reason));
                         } else {
                             drop(inner);
                             std::thread::sleep(Duration::from_millis(20));
@@ -1055,7 +1361,9 @@ fn serve_standby(rt: &tokio::runtime::Handle, socket: &Path, standby: &Arc<Stand
 /// Resume every adopted view on `node` (module docs); the ones that fail
 /// end their mounts and are reported by `Status`.
 pub fn resume(node: &Arc<NodeRuntime>, adoption: Adoption) -> usize {
-    let Adoption { standby, received } = adoption;
+    let Adoption {
+        standby, received, ..
+    } = adoption;
     let mut failed = Vec::new();
     let mut served = 0;
     for Received { record, fd } in received {
@@ -1082,4 +1390,69 @@ pub fn resume(node: &Arc<NodeRuntime>, adoption: Adoption) -> usize {
 pub fn failed(adoption: Adoption, reason: String) {
     let mut inner = adoption.standby.inner.lock().unwrap();
     inner.0 = Phase::Failed { reason };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use constellation_platform::{CredentialSource as C, EphemeralSecretStore};
+
+    /// A held pair goes out as `fs.unlock` takes it, an empty store as
+    /// nothing, and a value a handoff cannot carry fails with a cause that
+    /// names the key, never the value.
+    #[test]
+    fn the_sender_encodes_its_held_credentials() {
+        let store = EphemeralSecretStore::new();
+        assert!(unlock_credentials(&store).unwrap().is_none());
+        store
+            .replace(&[
+                (C::ACCESS_KEY_ID, Some(b"AKID".as_slice())),
+                (C::SECRET_ACCESS_KEY, Some(b"s\"e/c\\ret".as_slice())),
+            ])
+            .unwrap();
+        let frame = unlock_credentials(&store).unwrap().unwrap();
+        let back: constellation_control::proto::types::UnlockCredentials =
+            serde_json::from_slice(&frame).unwrap();
+        assert_eq!(back.access_key_id.unwrap().expose(), "AKID");
+        assert_eq!(back.secret_access_key.unwrap().expose(), "s\"e/c\\ret");
+        assert!(back.session_token.is_none());
+
+        store
+            .replace(&[(C::SECRET_ACCESS_KEY, Some(b"\xffSECRETBYTES".as_slice()))])
+            .unwrap();
+        let err = unlock_credentials(&store).unwrap_err();
+        assert!(err.message.contains(C::SECRET_ACCESS_KEY), "{err:?}");
+        assert!(err.message.contains("not UTF-8"), "{err:?}");
+        assert!(!err.message.contains("SECRETBYTES"), "{err:?}");
+    }
+
+    /// The sender's `Credentials` gate: the node plugin's service grant,
+    /// and a standby waiting on the state dir, before any commit.
+    #[test]
+    fn only_the_node_plugin_takes_credentials_for_a_pending_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = |label: &str| ServiceMatch {
+            uid: 0,
+            socket: dir.path().join("control.sock"),
+            label: label.into(),
+        };
+        let plugin = grant(NODE_PLUGIN_LABEL);
+        let other = grant("csi-controller");
+        for service in [None, Some(&other)] {
+            let err = may_take_credentials(service, dir.path(), false).unwrap_err();
+            assert_eq!(
+                err.kind,
+                constellation_control::ErrorKind::Denied,
+                "{err:?}"
+            );
+        }
+        let err = may_take_credentials(Some(&plugin), dir.path(), false).unwrap_err();
+        assert!(err.message.contains("no handoff is pending"), "{err:?}");
+        let waiting = StandbyMarker::write(dir.path()).unwrap();
+        may_take_credentials(Some(&plugin), dir.path(), false).unwrap();
+        assert!(may_take_credentials(Some(&plugin), dir.path(), true).is_err());
+        assert!(may_take_credentials(Some(&other), dir.path(), false).is_err());
+        drop(waiting);
+        assert!(may_take_credentials(Some(&plugin), dir.path(), false).is_err());
+    }
 }

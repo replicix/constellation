@@ -8,6 +8,7 @@
 //!
 //! | step | request | undone by |
 //! |---|---|---|
+//! | 0 Credentials (37-k6a) | old `Credentials` onto a socketpair this plugin reads, relayed to new `Credentials` on a second one: the `fs.unlock` credentials the old pod holds, which the replacement has no other way to get (plan 37 §9; this plugin forgets a `static-ephemeral` class's secret when it restarts, and a chart upgrade restarts it). Nothing pauses yet | new `Abort` |
 //! | 1-3 Quiesce, Drain, Snapshot | old `Prepare` | old `Abort` (a failed prepare resumes in place by itself; one still running when the abort comes does as soon as it ends) |
 //! | 4 Transfer | old `Transfer` onto a socketpair this plugin reads ([`constellation_control::handoff_wire`]) | old `Abort` |
 //! | 4 Transfer, relayed | new `Receive`, every record and descriptor on a second socketpair (this plugin's copies closed once sent) | new `Abort` (drops what it holds), old `Abort` |
@@ -136,6 +137,7 @@ impl HandoffConfig {
 /// Where a handoff failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    Credentials,
     Prepare,
     Transfer,
     Receive,
@@ -147,6 +149,7 @@ pub enum Step {
 impl Step {
     pub fn name(self) -> &'static str {
         match self {
+            Step::Credentials => "credentials",
             Step::Prepare => "prepare",
             Step::Transfer => "transfer",
             Step::Receive => "receive",
@@ -326,6 +329,11 @@ pub async fn run(
     watch: &dyn ReplacementWatch,
     cfg: &HandoffConfig,
 ) -> Outcome {
+    // 0. The credentials, before any session stops: the pause the K5
+    // notes gate starts at `Prepare`, and so does `elapsed`.
+    if let Err(error) = step(Step::Credentials, cfg.total, relay_credentials(old, new)).await {
+        return roll_back(old, Some(new), Step::Credentials, error).await;
+    }
     let started = Instant::now();
     let deadline = started + cfg.total;
     let left = || deadline.saturating_duration_since(Instant::now());
@@ -559,6 +567,53 @@ pub async fn run(
     }
 }
 
+/// Step 0: the old pod's `fs.unlock` credentials to the new one, through
+/// this process as one opaque frame each way
+/// ([`constellation_control::handoff_wire::write_secret`]) — never parsed,
+/// never logged, wiped once written. The new pod checks them against the
+/// bucket before it answers.
+async fn relay_credentials(
+    old: &dyn ControlClient,
+    new: &dyn ControlClient,
+) -> Result<HandoffReport, ControlError> {
+    let io = |what: &str, e: std::io::Error| ControlError::failed(format!("{what}: {e}"));
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(|e| io("socketpair", e))?;
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut ours = ours;
+        ours.set_read_timeout(Some(STREAM_TIMEOUT))?;
+        constellation_control::handoff_wire::read_secret(&mut ours)
+    });
+    if let Err(e) = old
+        .node_handoff_fd(socket(HandoffPhase::Credentials), theirs.into())
+        .await
+    {
+        reader.abort();
+        return Err(e);
+    }
+    let frame: Option<zeroize::Zeroizing<Vec<u8>>> = reader
+        .await
+        .map_err(|e| ControlError::failed(format!("reading the credentials: {e}")))?
+        .map_err(|e| io("reading the credentials", e))?;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(|e| io("socketpair", e))?;
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut ours = ours;
+        ours.set_write_timeout(Some(STREAM_TIMEOUT))?;
+        constellation_control::handoff_wire::write_secret(
+            &mut ours,
+            frame.as_deref().map(|f| &f[..]),
+        )
+    });
+    let got = new
+        .node_handoff_fd(socket(HandoffPhase::Credentials), theirs.into())
+        .await;
+    let wrote = writer
+        .await
+        .map_err(|e| ControlError::failed(format!("relaying the credentials: {e}")))?;
+    let report = got?;
+    wrote.map_err(|e| io("relaying the credentials", e))?;
+    Ok(report)
+}
+
 /// One request of `what`, bounded by `within`: a step that hangs is a
 /// failed step, never a stuck handoff.
 async fn step(
@@ -690,10 +745,13 @@ mod tests {
         );
         assert_eq!(new.fds_received(), 2, "one descriptor per view, relayed");
         use HandoffPhase::*;
-        assert_eq!(old.handoff_calls(), [Prepare, Transfer, Commit]);
+        assert_eq!(
+            old.handoff_calls(),
+            [Credentials, Prepare, Transfer, Commit]
+        );
         let calls = new.handoff_calls();
-        assert_eq!(calls[..2], [Receive, Seal]);
-        assert!(calls[2..].iter().all(|p| *p == Status));
+        assert_eq!(calls[..3], [Credentials, Receive, Seal]);
+        assert!(calls[3..].iter().all(|p| *p == Status));
         // The standby waits for a commit past the moment the old engine
         // stops accepting one (its own deadline, `total` + the margin).
         let sender = old.handoff_params(Prepare).unwrap().deadline_ms.unwrap();
@@ -774,6 +832,8 @@ mod tests {
     async fn every_failure_before_the_commit_rolls_back() {
         use HandoffPhase::*;
         for (on_old, phase, step) in [
+            (true, Credentials, Step::Credentials),
+            (false, Credentials, Step::Credentials),
             (true, Prepare, Step::Prepare),
             (true, Transfer, Step::Transfer),
             (false, Receive, Step::Receive),
@@ -808,6 +868,58 @@ mod tests {
             assert_eq!(new.handoff_calls().contains(&Abort), reached, "{phase:?}");
             assert!(!outcome.cut_over());
         }
+    }
+
+    /// 37-k6a: a replacement started `--await-unlock` gets the old
+    /// engine's `fs.unlock` credentials from the old engine itself, before
+    /// any session stops — this plugin holds none to send (it restarted).
+    #[tokio::test]
+    async fn an_awaiting_standby_gets_the_old_engines_credentials_first() {
+        use constellation_control::proto::types::{FsUnlockParams, UnlockCredentials};
+        use constellation_control::proto::Secret;
+        let (old, new) = pair().await;
+        old.fs_unlock(FsUnlockParams {
+            fs: "s3://b/pool".into(),
+            credentials: UnlockCredentials {
+                access_key_id: Some(Secret::new("KEY-A")),
+                secret_access_key: Some(Secret::new("secret-a")),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+        new.gate();
+        let outcome = run(old.as_ref(), new.as_ref(), &Unwatched, &cfg()).await;
+        assert!(
+            matches!(outcome, Outcome::Succeeded { views: 2, .. }),
+            "{outcome:?}"
+        );
+        assert!(!new.is_gated(), "unlocked by the handed-over credentials");
+        assert_eq!(new.last_unlock_key().as_deref(), Some("KEY-A"));
+        use HandoffPhase::*;
+        assert_eq!(old.handoff_calls()[..2], [Credentials, Prepare]);
+        assert_eq!(new.handoff_calls()[..2], [Credentials, Receive]);
+    }
+
+    /// An awaiting replacement whose predecessor holds no credentials
+    /// cannot serve: the handoff stops before any session does.
+    #[tokio::test]
+    async fn an_awaiting_standby_with_nothing_to_get_rolls_back_before_the_prepare() {
+        let (old, new) = pair().await;
+        new.gate();
+        let outcome = run(old.as_ref(), new.as_ref(), &Unwatched, &cfg()).await;
+        match &outcome {
+            Outcome::RolledBack {
+                step: Step::Credentials,
+                error,
+                restored: true,
+            } => assert!(error.contains("no fs.unlock credentials"), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        use HandoffPhase::*;
+        assert_eq!(old.handoff_calls(), [Credentials, Abort]);
+        assert_eq!(new.handoff_calls(), [Credentials, Abort]);
+        assert_eq!(old.view_mountpoints().len(), 2);
     }
 
     /// The old engine's own deadline served its sessions again just before
@@ -851,8 +963,8 @@ mod tests {
             other => panic!("{other:?}"),
         }
         use HandoffPhase::*;
-        assert_eq!(old.handoff_calls(), [Prepare, Abort]);
-        assert!(new.handoff_calls().is_empty());
+        assert_eq!(old.handoff_calls(), [Credentials, Prepare, Abort]);
+        assert_eq!(new.handoff_calls(), [Credentials]);
     }
 
     /// After the commit nothing can be undone: a replacement that cannot

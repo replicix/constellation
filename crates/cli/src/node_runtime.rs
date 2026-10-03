@@ -35,7 +35,7 @@ use constellation_engine::{
     DeferredEvents, Engine, EngineConfig, EngineHost, EngineProfile, FsId, ResourceBudget, View,
     ViewSpec,
 };
-use constellation_platform::HostServices;
+use constellation_platform::{EphemeralSecretStore, HostServices};
 use constellation_types::Code;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -110,7 +110,50 @@ pub struct NodeConfig {
     /// period, not the signal, bounds a pod deletion its node plugin did
     /// not drain); `SIGINT` and a second `SIGTERM` drain at once.
     pub persistent: bool,
+    /// Handlers installed before the node started (`constellation
+    /// serve`, which waits for `fs.unlock` or as a handoff standby first):
+    /// the node takes them over instead of installing its own, so a signal
+    /// that came in between is not lost. `None`: installed at start.
+    pub signals: Option<StopSignals>,
 }
+
+/// `SIGTERM`/`SIGINT` handlers, installed once and handed on: a signal
+/// that arrives while nobody waits on them is kept until somebody does
+/// (a handler installed later would not see it).
+#[cfg(unix)]
+pub struct StopSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+#[cfg(not(unix))]
+pub struct StopSignals;
+
+#[cfg(unix)]
+impl StopSignals {
+    /// Within a runtime.
+    pub fn install() -> Result<StopSignals> {
+        use anyhow::Context;
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(StopSignals {
+            term: signal(SignalKind::terminate()).context("installing a SIGTERM handler")?,
+            int: signal(SignalKind::interrupt()).context("installing a SIGINT handler")?,
+        })
+    }
+
+    /// The next one's name (`SIGTERM` or `SIGINT`). Cancel-safe.
+    pub async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => SIGTERM,
+            _ = self.int.recv() => SIGINT,
+        }
+    }
+}
+
+/// [`StopSignals::recv`]'s names, as [`NodeRuntime::deliver_signal`]
+/// takes them.
+pub const SIGTERM: &str = "SIGTERM";
+pub const SIGINT: &str = "SIGINT";
 
 /// What a handed-over image inherits besides its views
 /// (`crate::handover`).
@@ -225,6 +268,10 @@ pub struct NodeRuntime {
     /// The view a headless node serves its control API from
     /// ([`Self::serve_headless`]); never FUSE-mounted.
     headless_view: Mutex<Option<Arc<View>>>,
+    /// [`Self::keep_handoff_secrets`].
+    handoff_secrets: Mutex<Option<EphemeralSecretStore>>,
+    /// [`Self::deliver_signal`]: `true` for a `SIGTERM`.
+    delivered_signals: tokio::sync::mpsc::UnboundedSender<bool>,
 }
 
 /// The options `add_mount` mounts a view with. Plan 38 §3(e): a
@@ -298,6 +345,7 @@ impl NodeRuntime {
             fuse_transport,
             control_socket,
             persistent,
+            signals,
         } = cfg;
         let handoff_config = crate::handover::NodeHandoff::of(&engine, web_ui, fuse_transport);
         let (generation, control_listener) = match resumed {
@@ -331,6 +379,7 @@ impl NodeRuntime {
             } else {
                 fuse_transport
             };
+        let (delivered_signals, mut delivered) = tokio::sync::mpsc::unbounded_channel();
         let node = Arc::new(NodeRuntime {
             host,
             engines,
@@ -350,26 +399,32 @@ impl NodeRuntime {
             stop_when_empty: AtomicBool::new(false),
             stopped: (Mutex::new(false), std::sync::Condvar::new()),
             headless_view: Mutex::new(None),
+            handoff_secrets: Mutex::new(None),
+            delivered_signals,
         });
 
         // Signals are node-level: unmount every currently-mounted view,
         // then run the one clean node shutdown. The actual unmount+join
         // work happens on a plain OS thread (not this async task) so a
         // slow drain never blocks a tokio worker; a second signal aborts
-        // immediately regardless of how far that drain got.
+        // immediately regardless of how far that drain got. A signal
+        // `deliver_signal` passes on counts as one received here.
         {
             let node = node.clone();
             rt.spawn(async move {
                 #[cfg(unix)]
                 {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
-                        tracing::warn!("failed to install SIGINT handler; Ctrl-C will not unmount");
-                        return;
-                    };
-                    let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
-                        tracing::warn!("failed to install SIGTERM handler");
-                        return;
+                    let mut signals = match signals {
+                        Some(signals) => signals,
+                        None => match StopSignals::install() {
+                            Ok(signals) => signals,
+                            Err(e) => {
+                                tracing::warn!(error = %format!("{e:#}"),
+                                    "failed to install the signal handlers; SIGTERM and Ctrl-C \
+                                     will not unmount");
+                                return;
+                            }
+                        },
                     };
                     // Plan 37 §7: only SIGTERM is deferred, and only on a
                     // persistent node serving views — they are served for
@@ -380,15 +435,14 @@ impl NodeRuntime {
                     let mut deferred = false;
                     loop {
                         let term = tokio::select! {
-                            _ = sigint.recv() => {
-                                tracing::info!("SIGINT received; unmounting FUSE");
-                                false
-                            }
-                            _ = sigterm.recv() => {
-                                tracing::info!("SIGTERM received; unmounting FUSE");
-                                true
-                            }
+                            name = signals.recv() => name == SIGTERM,
+                            Some(term) = delivered.recv() => term,
                         };
+                        if term {
+                            tracing::info!("SIGTERM received; unmounting FUSE");
+                        } else {
+                            tracing::info!("SIGINT received; unmounting FUSE");
+                        }
                         if !term || !node.persistent || deferred {
                             break;
                         }
@@ -426,14 +480,15 @@ impl NodeRuntime {
                     // A second signal during the post-unmount drain aborts immediately
                     // so a hung ship/upload cannot trap the process forever.
                     tokio::select! {
-                        _ = sigint.recv() => {}
-                        _ = sigterm.recv() => {}
+                        _ = signals.recv() => {}
+                        Some(_) = delivered.recv() => {}
                     }
                     tracing::error!("second signal during shutdown; exiting immediately");
                     std::process::exit(130);
                 }
                 #[cfg(not(unix))]
                 {
+                    let _ = (signals, delivered);
                     tracing::warn!("signal-driven FUSE unmount is only supported on Unix");
                 }
             });
@@ -750,9 +805,13 @@ impl NodeRuntime {
             let inherited = self.control_listener.lock().unwrap().take();
             match inherited {
                 Some(listener) => {
-                    let path = match locate_socket(state_dir) {
-                        Some(path) => path,
-                        None => socket_path_for_state_dir(&*self.host.dirs, state_dir)?,
+                    // An explicit socket (`serve`'s, whose credential gate
+                    // bound it first) is where it is bound; a handed-over
+                    // one is where the old image recorded it.
+                    let path = match (&self.control_socket, locate_socket(state_dir)) {
+                        (Some(path), _) => path.clone(),
+                        (None, Some(path)) => path,
+                        (None, None) => socket_path_for_state_dir(&*self.host.dirs, state_dir)?,
                     };
                     UnixSocketListener::from_std(listener, &path)
                         .context("serving the handed-over control socket")
@@ -926,6 +985,38 @@ impl NodeRuntime {
         result
     }
 
+    /// Serve the control API on `listener`, already bound at the
+    /// configured control socket (`serve --await-unlock` bound it to wait
+    /// for its credentials), instead of binding it anew: clients that
+    /// connected meanwhile wait in its backlog. Before
+    /// [`Self::serve_headless`].
+    pub fn adopt_control_listener(&self, listener: std::os::unix::net::UnixListener) {
+        *self.control_listener.lock().unwrap() = Some(listener);
+    }
+
+    /// Keep `secrets` — what `fs.unlock` gave `serve --await-unlock` (or
+    /// what its predecessor handed over), the very store its static
+    /// credential source signs from, so a rotation is in it too — for a
+    /// socket handoff's `Credentials` step to give its successor
+    /// (`crate::handoff_socket`). In memory only, like the store itself.
+    pub(crate) fn keep_handoff_secrets(&self, secrets: EphemeralSecretStore) {
+        *self.handoff_secrets.lock().unwrap() = Some(secrets);
+    }
+
+    /// Act on a `SIGTERM` or `SIGINT` (`name`, as [`StopSignals::recv`]
+    /// names it) as if the node's own handler had received it just now
+    /// (§7's deferral included): one that came before the node could
+    /// handle it (`constellation serve`: a handoff standby that got it
+    /// once sealed, and adopted its views anyway).
+    pub fn deliver_signal(&self, name: &'static str) {
+        let _ = self.delivered_signals.send(name == SIGTERM);
+    }
+
+    /// What [`Self::keep_handoff_secrets`] kept.
+    pub(crate) fn handoff_secrets(&self) -> Option<EphemeralSecretStore> {
+        self.handoff_secrets.lock().unwrap().clone()
+    }
+
     /// A node with no FUSE view at all (`constellation serve`): open an
     /// unmounted view of the root for the control service to report from,
     /// and start the control API. Fails when the control socket could not
@@ -1025,6 +1116,7 @@ mod tests {
                 fuse_transport: Default::default(),
                 control_socket: None,
                 persistent: false,
+                signals: None,
             },
             rt.clone(),
         )

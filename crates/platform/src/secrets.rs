@@ -15,10 +15,11 @@
 //!   passphrases per request from the CSI plugin and must never write them
 //!   to a hostPath or a container filesystem.
 //!
-//! [`CredentialSource`] is where an engine's S3 credentials come from. It
-//! is defined here and not wired yet: `EngineConfig` (C3) gains a
-//! `credentials: CredentialSource`, and C5's `fs.unlock` control method
-//! fills the `Static`/`Refreshing` kinds at runtime.
+//! [`CredentialSource`] is where an engine's S3 credentials come from
+//! (`EngineConfig::credentials`). The `fs.unlock` control method fills a
+//! `Static` one at runtime and rotates it in place; plan 37's engine pods
+//! (`constellation serve --await-unlock`) start from one that is empty
+//! until the CSI plugin's first `fs.unlock`.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -263,11 +264,82 @@ impl SecretStore for FileSecretStore {
     }
 }
 
+/// Keep this process's memory out of core dumps (plan 37 K6a): a process
+/// whose credentials live only in memory — an engine pod waiting for
+/// `fs.unlock`, the CSI plugins holding the Secrets they pass on — must not
+/// write them wherever the node's `core_pattern` points when it crashes.
+/// `RLIMIT_CORE` 0 stops a core file (and handlers like systemd-coredump
+/// that honour it); on Linux the process is also made non-dumpable
+/// (`PR_SET_DUMPABLE` 0), which stops every core handler and keeps other
+/// processes of the same uid from reading its memory through `/proc` or
+/// `ptrace`. A no-op where neither exists.
+pub fn forbid_core_dumps() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid rlimit for this process.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: PR_SET_DUMPABLE takes one integer argument.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Whether [`forbid_core_dumps`] is in effect for this process.
+pub fn core_dumps_forbidden() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: PR_GET_DUMPABLE takes no argument.
+        if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return false;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        // SAFETY: a valid out-pointer.
+        if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } != 0 || limit.rlim_cur != 0 {
+            return false;
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    false
+}
+
 /// Secrets held in this process's memory only. Cloning shares the same
 /// secrets (a handle); the values are wiped when the last handle drops.
+///
+/// Every change bumps a **generation**, read with the values in one
+/// critical section ([`Self::snapshot`]), so a reader that caches what it
+/// derived from the store (the engine's S3 credential provider) can tell
+/// that it is stale without comparing secrets. [`Self::replace`] changes
+/// several names under one generation: a rotation's key id and secret
+/// never appear half-swapped. The generation the reader last *used* is
+/// recorded back ([`Self::note_in_use`]), which is how a rotation shows
+/// that the running S3 clients picked it up (plan 37 K6a).
 #[derive(Clone, Default)]
 pub struct EphemeralSecretStore {
-    secrets: Arc<Mutex<HashMap<String, Secret>>>,
+    inner: Arc<EphemeralInner>,
+}
+
+#[derive(Default)]
+struct EphemeralInner {
+    secrets: Mutex<(HashMap<String, Secret>, u64)>,
+    in_use: std::sync::atomic::AtomicU64,
 }
 
 impl EphemeralSecretStore {
@@ -275,26 +347,74 @@ impl EphemeralSecretStore {
         EphemeralSecretStore::default()
     }
 
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Secret>> {
-        self.secrets.lock().unwrap_or_else(|p| p.into_inner())
+    fn map(&self) -> std::sync::MutexGuard<'_, (HashMap<String, Secret>, u64)> {
+        self.inner.secrets.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// How many secrets it holds.
     pub fn len(&self) -> usize {
-        self.map().len()
+        self.map().0.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map().is_empty()
+        self.map().0.is_empty()
+    }
+
+    /// How many changes the store has seen (0: never written).
+    pub fn generation(&self) -> u64 {
+        self.map().1
+    }
+
+    /// Every secret and the generation they belong to, read at once.
+    pub fn snapshot(&self) -> (u64, HashMap<String, Secret>) {
+        let map = self.map();
+        (map.1, map.0.clone())
+    }
+
+    /// Set (`Some`) or remove (`None`) several names as one change.
+    pub fn replace(&self, entries: &[(&str, Option<&[u8]>)]) -> io::Result<()> {
+        for (name, _) in entries {
+            check_name(name)?;
+        }
+        let mut map = self.map();
+        for (name, value) in entries {
+            match value {
+                Some(v) => {
+                    map.0.insert(name.to_string(), Secret::new(v.to_vec()));
+                }
+                None => {
+                    map.0.remove(*name);
+                }
+            }
+        }
+        map.1 += 1;
+        Ok(())
+    }
+
+    /// Record that generation `generation` is what a reader now uses.
+    pub fn note_in_use(&self, generation: u64) {
+        self.inner
+            .in_use
+            .fetch_max(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The newest generation a reader said it uses (0: none yet).
+    pub fn in_use_generation(&self) -> u64 {
+        self.inner.in_use.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 impl std::fmt::Debug for EphemeralSecretStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut names: Vec<String> = self.map().keys().cloned().collect();
-        names.sort();
+        let (generation, names) = {
+            let map = self.map();
+            let mut names: Vec<String> = map.0.keys().cloned().collect();
+            names.sort();
+            (map.1, names)
+        };
         f.debug_struct("EphemeralSecretStore")
             .field("names", &names)
+            .field("generation", &generation)
             .finish()
     }
 }
@@ -302,28 +422,24 @@ impl std::fmt::Debug for EphemeralSecretStore {
 impl SecretStore for EphemeralSecretStore {
     fn get(&self, name: &str) -> io::Result<Option<Secret>> {
         check_name(name)?;
-        Ok(self.map().get(name).cloned())
+        Ok(self.map().0.get(name).cloned())
     }
 
     fn put(&self, name: &str, value: &[u8]) -> io::Result<()> {
-        check_name(name)?;
-        self.map()
-            .insert(name.to_string(), Secret::new(value.to_vec()));
-        Ok(())
+        self.replace(&[(name, Some(value))])
     }
 
     fn delete(&self, name: &str) -> io::Result<()> {
-        check_name(name)?;
-        self.map().remove(name);
-        Ok(())
+        self.replace(&[(name, None)])
     }
 
     fn update(&self, name: &str, f: Update<'_>) -> io::Result<()> {
         check_name(name)?;
         let mut map = self.map();
-        let next = f(map.get(name).map(Secret::expose))?;
+        let next = f(map.0.get(name).map(Secret::expose))?;
         if let Some(next) = next {
-            map.insert(name.to_string(), Secret::new(next));
+            map.0.insert(name.to_string(), Secret::new(next));
+            map.1 += 1;
         }
         Ok(())
     }
@@ -426,18 +542,37 @@ impl CredentialSource {
     /// error when a static source lacks the key id or secret (not
     /// unlocked yet).
     pub fn resolve(&self) -> io::Result<Option<Credential>> {
+        self.resolve_generation().map(|(_, c)| c)
+    }
+
+    /// The generation of what [`Self::resolve`] would give: a static
+    /// source's store generation (it changes with every rotation), `0`
+    /// for the other kinds (the chain renews itself, a refreshing source
+    /// is asked every time).
+    pub fn generation(&self) -> u64 {
         match self {
-            CredentialSource::AwsDefaultChain => Ok(None),
-            CredentialSource::Refreshing(supply) => Ok(Some(supply())),
+            CredentialSource::Static(store) => store.generation(),
+            _ => 0,
+        }
+    }
+
+    /// [`Self::resolve`], with the generation the answer belongs to (read
+    /// in one critical section with it, so a rotation in between cannot
+    /// pair a new key id with an old generation).
+    pub fn resolve_generation(&self) -> io::Result<(u64, Option<Credential>)> {
+        match self {
+            CredentialSource::AwsDefaultChain => Ok((0, None)),
+            CredentialSource::Refreshing(supply) => Ok((0, Some(supply()))),
             CredentialSource::Static(store) => {
+                let (generation, secrets) = store.snapshot();
                 let missing = |what: &str| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("the static credential source has no {what}"),
                     )
                 };
-                let id = store
-                    .get(Self::ACCESS_KEY_ID)?
+                let id = secrets
+                    .get(Self::ACCESS_KEY_ID)
                     .ok_or_else(|| missing(Self::ACCESS_KEY_ID))?;
                 let access_key_id = id
                     .expose_str()
@@ -445,20 +580,32 @@ impl CredentialSource {
                         io::Error::new(io::ErrorKind::InvalidData, "access key id is not UTF-8")
                     })?
                     .to_string();
-                let secret_access_key = store
-                    .get(Self::SECRET_ACCESS_KEY)?
+                let secret_access_key = secrets
+                    .get(Self::SECRET_ACCESS_KEY)
+                    .cloned()
                     .ok_or_else(|| missing(Self::SECRET_ACCESS_KEY))?;
-                let expiry = store
-                    .get(Self::EXPIRY)?
+                let expiry = secrets
+                    .get(Self::EXPIRY)
                     .and_then(|s| s.expose_str().and_then(|t| t.parse::<u64>().ok()))
                     .map(|secs| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
-                Ok(Some(Credential {
-                    access_key_id,
-                    secret_access_key,
-                    session_token: store.get(Self::SESSION_TOKEN)?,
-                    expiry,
-                }))
+                Ok((
+                    generation,
+                    Some(Credential {
+                        access_key_id,
+                        secret_access_key,
+                        session_token: secrets.get(Self::SESSION_TOKEN).cloned(),
+                        expiry,
+                    }),
+                ))
             }
+        }
+    }
+
+    /// Record that the S3 clients now sign with generation `generation`
+    /// (a static source only; see [`EphemeralSecretStore::note_in_use`]).
+    pub fn note_in_use(&self, generation: u64) {
+        if let CredentialSource::Static(store) = self {
+            store.note_in_use(generation);
         }
     }
 }
@@ -672,6 +819,48 @@ mod tests {
         // Not unlocked yet: an error, not a guess.
         let empty = CredentialSource::Static(EphemeralSecretStore::new());
         assert_eq!(empty.resolve().unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_rotation_is_one_generation_and_never_half_applied() {
+        let store = EphemeralSecretStore::new();
+        assert_eq!(store.generation(), 0);
+        let source = CredentialSource::Static(store.clone());
+        store
+            .replace(&[
+                (CredentialSource::ACCESS_KEY_ID, Some(b"OLD")),
+                (CredentialSource::SECRET_ACCESS_KEY, Some(b"old-secret")),
+                (CredentialSource::SESSION_TOKEN, Some(b"old-token")),
+            ])
+            .unwrap();
+        let (g1, c1) = source.resolve_generation().unwrap();
+        assert_eq!((g1, c1.unwrap().access_key_id.as_str()), (1, "OLD"));
+        // A rotation drops the token and swaps the pair under one bump.
+        store
+            .replace(&[
+                (CredentialSource::ACCESS_KEY_ID, Some(b"NEW")),
+                (CredentialSource::SECRET_ACCESS_KEY, Some(b"new-secret")),
+                (CredentialSource::SESSION_TOKEN, None),
+            ])
+            .unwrap();
+        let (g2, c2) = source.resolve_generation().unwrap();
+        let c2 = c2.unwrap();
+        assert_eq!(g2, 2);
+        assert_eq!(c2.access_key_id, "NEW");
+        assert_eq!(c2.secret_access_key.expose(), b"new-secret");
+        assert!(c2.session_token.is_none());
+        assert_eq!(source.generation(), 2);
+        // What a reader uses is recorded, and never goes backwards.
+        assert_eq!(store.in_use_generation(), 0);
+        source.note_in_use(2);
+        source.note_in_use(1);
+        assert_eq!(store.in_use_generation(), 2);
+        // put/delete/update are changes too; a no-op update is not.
+        store.put("x", b"1").unwrap();
+        store.delete("x").unwrap();
+        store.update("x", &mut |_| Ok(None)).unwrap();
+        assert_eq!(store.generation(), 4);
+        assert!(!format!("{store:?}").contains("secret\""));
     }
 
     #[test]

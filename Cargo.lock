@@ -1198,6 +1198,7 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1211,6 +1212,7 @@ dependencies = [
  "constellation-control",
  "constellation-platform",
  "constellation-types",
+ "futures",
  "hyper-util",
  "k8s-openapi",
  "kube",
@@ -1230,6 +1232,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -1403,6 +1406,7 @@ dependencies = [
 name = "constellation-store-s3"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
  "argon2",
  "async-trait",
  "aws-config",

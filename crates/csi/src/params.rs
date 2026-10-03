@@ -40,6 +40,57 @@ pub enum Layout {
     Dedicated,
 }
 
+/// Where a class's engine pods get their S3 credentials (plan 37 §9,
+/// StorageClass parameter `credentialSource`). Whatever the kind, nothing
+/// reaches an engine pod through its spec, environment, image or a
+/// hostPath file: bytes travel only as `fs.unlock` over its control socket
+/// and live in its `EphemeralSecretStore`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CredentialMode {
+    /// `static-ephemeral` (the default): the `csi.storage.k8s.io/*-secret-*`
+    /// Secret the sidecars and kubelet resolve per request. The engine pod
+    /// waits for its first `fs.unlock` (`serve --await-unlock`); a changed
+    /// Secret reaches a running pod with the next request that carries it
+    /// (a `CreateVolume`, a `NodeStageVolume`).
+    StaticEphemeral,
+    /// `refreshing`: as `static-ephemeral`, plus the plugins watch the
+    /// Secret named by `credentialSecretName`/`credentialSecretNamespace`
+    /// and push every change to the running engine pods at once
+    /// (`Refreshing(callback)`: rotation without a remount).
+    Refreshing,
+    /// `aws-default-chain`: no Secret at all; the engine pod's own
+    /// ServiceAccount (IRSA, EKS Pod Identity) and the AWS SDK's chain. An
+    /// E2E pool still gets its passphrase through `fs.unlock`.
+    AwsDefaultChain,
+}
+
+impl CredentialMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialMode::StaticEphemeral => "static-ephemeral",
+            CredentialMode::Refreshing => "refreshing",
+            CredentialMode::AwsDefaultChain => "aws-default-chain",
+        }
+    }
+}
+
+/// A Secret to watch (`credentialSource: refreshing`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SecretRef {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl std::fmt::Display for SecretRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.namespace, self.name)
+    }
+}
+
+/// The class parameters naming the Secret a `refreshing` class watches.
+pub const CREDENTIAL_SECRET_NAME: &str = "credentialSecretName";
+pub const CREDENTIAL_SECRET_NAMESPACE: &str = "credentialSecretNamespace";
+
 /// One `StorageClass`'s parameters, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassParams {
@@ -55,6 +106,9 @@ pub struct ClassParams {
     pub compression: Option<String>,
     pub e2e: bool,
     pub write_mode: Option<String>,
+    pub credentials: CredentialMode,
+    /// The Secret a `refreshing` class watches (`None` for the others).
+    pub credential_secret: Option<SecretRef>,
 }
 
 impl ClassParams {
@@ -78,6 +132,8 @@ impl ClassParams {
                         | "writeMode"
                         | "engineProfile"
                         | "credentialSource"
+                        | "credentialSecretName"
+                        | "credentialSecretNamespace"
                 )
             })
             .collect();
@@ -139,15 +195,50 @@ impl ClassParams {
                 ));
             }
         }
-        // Consumed by K6's credential plumbing; validated here so a typo
-        // fails at provisioning time rather than at the first mount.
-        if let Some(source) = get("credentialSource") {
-            if !matches!(source, "secret" | "aws-default-chain") {
+        let credentials = match get("credentialSource") {
+            None | Some("static-ephemeral") => CredentialMode::StaticEphemeral,
+            Some("refreshing") => CredentialMode::Refreshing,
+            Some("aws-default-chain") => CredentialMode::AwsDefaultChain,
+            Some(other) => {
                 return Err(format!(
-                    "credentialSource {source:?} is not one of \"secret\", \"aws-default-chain\""
-                ));
+                    "credentialSource {other:?} is not one of \"static-ephemeral\", \
+                     \"refreshing\", \"aws-default-chain\""
+                ))
             }
-        }
+        };
+        let credential_secret = match (
+            get(CREDENTIAL_SECRET_NAME),
+            get(CREDENTIAL_SECRET_NAMESPACE),
+            credentials,
+        ) {
+            (Some(name), Some(namespace), CredentialMode::Refreshing) => {
+                for (key, v) in [
+                    (CREDENTIAL_SECRET_NAME, name),
+                    (CREDENTIAL_SECRET_NAMESPACE, namespace),
+                ] {
+                    if !is_dns_subdomain(v) {
+                        return Err(format!("{key} {v:?} is not a Kubernetes object name"));
+                    }
+                }
+                Some(SecretRef {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                })
+            }
+            (_, _, CredentialMode::Refreshing) => {
+                return Err(format!(
+                    "credentialSource \"refreshing\" needs {CREDENTIAL_SECRET_NAME} and \
+                     {CREDENTIAL_SECRET_NAMESPACE}: the Secret to watch"
+                ))
+            }
+            (None, None, _) => None,
+            _ => {
+                return Err(format!(
+                    "{CREDENTIAL_SECRET_NAME}/{CREDENTIAL_SECRET_NAMESPACE} apply to \
+                     credentialSource \"refreshing\" only"
+                ))
+            }
+        };
         Ok(ClassParams {
             bucket,
             prefix,
@@ -159,7 +250,16 @@ impl ClassParams {
             compression: get("compression").map(str::to_string),
             e2e,
             write_mode: get("writeMode").map(str::to_string),
+            credentials,
+            credential_secret,
         })
+    }
+
+    /// Whether this class's engine pods start with `--await-unlock`: they
+    /// need something only `fs.unlock` brings — S3 keys, or an E2E
+    /// passphrase even on the AWS chain.
+    pub fn awaits_unlock(&self) -> bool {
+        self.credentials != CredentialMode::AwsDefaultChain || self.e2e
     }
 
     /// The shard `name` lives on: FNV-1a over the name, mod `shards`.
@@ -227,6 +327,18 @@ pub fn volume_context(parameters: &HashMap<String, String>) -> HashMap<String, S
 /// A statically provisioned volume's shard (`volumeAttributes.shard`);
 /// the one context key that is not a class parameter.
 pub const SHARD_KEY: &str = "shard";
+
+/// A Kubernetes object name (RFC 1123 subdomain).
+fn is_dns_subdomain(s: &str) -> bool {
+    s.len() <= 253
+        && s.split('.').all(|l| {
+            !l.is_empty()
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
+}
 
 fn join(prefix: &str, leaf: &str) -> String {
     if prefix.is_empty() {
@@ -330,12 +442,100 @@ mod tests {
                 vec![("bucket", "b"), ("credentialSource", "x")],
                 "credentialSource",
             ),
+            (
+                vec![("bucket", "b"), ("credentialSource", "secret")],
+                "credentialSource",
+            ),
+            (
+                vec![("bucket", "b"), ("credentialSource", "refreshing")],
+                "credentialSecretName",
+            ),
+            (
+                vec![
+                    ("bucket", "b"),
+                    ("credentialSource", "refreshing"),
+                    ("credentialSecretName", "s"),
+                ],
+                "credentialSecretNamespace",
+            ),
+            (
+                vec![
+                    ("bucket", "b"),
+                    ("credentialSource", "refreshing"),
+                    ("credentialSecretName", "Not_A_Name"),
+                    ("credentialSecretNamespace", "ns"),
+                ],
+                "credentialSecretName",
+            ),
+            (
+                vec![
+                    ("bucket", "b"),
+                    ("credentialSecretName", "s"),
+                    ("credentialSecretNamespace", "ns"),
+                ],
+                "refreshing",
+            ),
             (vec![("bucket", "b"), ("prefix", "a/../b")], "prefix"),
             (vec![("bucket", "b"), ("filesystem", "old")], "filesystem"),
         ] {
             let e = ClassParams::parse(&params(&kv)).unwrap_err();
             assert!(e.contains(needle), "{kv:?}: {e}");
         }
+    }
+
+    /// Plan 37 §9: the three credential sources, and which of them make
+    /// an engine pod wait for `fs.unlock`.
+    #[test]
+    fn credential_sources_are_selected_by_the_class() {
+        let parse = |kv: &[(&str, &str)]| {
+            let mut all = vec![("bucket", "b")];
+            all.extend_from_slice(kv);
+            ClassParams::parse(&params(&all)).unwrap()
+        };
+        let default = parse(&[]);
+        assert_eq!(default.credentials, CredentialMode::StaticEphemeral);
+        assert_eq!(default.credential_secret, None);
+        assert!(default.awaits_unlock());
+        assert_eq!(
+            parse(&[("credentialSource", "static-ephemeral")]).credentials,
+            CredentialMode::StaticEphemeral
+        );
+        let refreshing = parse(&[
+            ("credentialSource", "refreshing"),
+            ("credentialSecretName", "s3-creds"),
+            ("credentialSecretNamespace", "tenant-a"),
+        ]);
+        assert_eq!(refreshing.credentials, CredentialMode::Refreshing);
+        assert_eq!(
+            refreshing.credential_secret,
+            Some(SecretRef {
+                namespace: "tenant-a".into(),
+                name: "s3-creds".into()
+            })
+        );
+        assert!(refreshing.awaits_unlock());
+        let chain = parse(&[("credentialSource", "aws-default-chain")]);
+        assert_eq!(chain.credentials, CredentialMode::AwsDefaultChain);
+        assert!(!chain.awaits_unlock(), "IRSA: nothing to wait for");
+        let chain_e2e = parse(&[("credentialSource", "aws-default-chain"), ("e2e", "true")]);
+        assert!(
+            chain_e2e.awaits_unlock(),
+            "the passphrase still comes by fs.unlock"
+        );
+        // The watched Secret's name flows to the node with the volume
+        // context (not a sidecar key), so the plugin knows what to watch.
+        let ctx = volume_context(&params(&[
+            ("bucket", "b"),
+            ("credentialSource", "refreshing"),
+            ("credentialSecretName", "s3-creds"),
+            ("credentialSecretNamespace", "tenant-a"),
+            ("csi.storage.k8s.io/node-stage-secret-name", "s3-creds"),
+        ]));
+        assert_eq!(
+            ctx.get("credentialSecretName").map(String::as_str),
+            Some("s3-creds")
+        );
+        assert!(!ctx.keys().any(|k| k.starts_with("csi.storage.k8s.io/")));
     }
 
     #[test]

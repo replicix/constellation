@@ -178,6 +178,7 @@ pub(super) mod tests {
             &self,
             _: &HandoffParams,
             _: Option<OwnedFd>,
+            _: Option<&constellation_control::authz::ServiceMatch>,
         ) -> Result<HandoffReport, ControlError> {
             Err(ControlError::unsupported("the fixture cannot hand over"))
         }

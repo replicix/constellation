@@ -97,7 +97,10 @@ impl Fixture {
     /// The concrete per-filesystem fake behind a volume id.
     async fn fs_of(&self, volume_id: &str) -> Arc<InMemoryControl> {
         let id = VolumeId::parse(volume_id).unwrap();
-        self.engines.filesystem(id.fs_uuid()).await.unwrap();
+        self.engines
+            .filesystem(id.fs_uuid(), &Default::default())
+            .await
+            .unwrap();
         self.engines.filesystem_client(id.fs_uuid()).unwrap()
     }
 }
@@ -158,6 +161,42 @@ async fn create_writes_the_record_and_the_quota() {
     );
     // The pool's own root carries no cap: the quota is per volume.
     assert_eq!(fs.quota_get("/").await.unwrap().max_bytes, None);
+}
+
+/// Plan 37 K6a: every call a CSI RPC makes to an engine carries the PV
+/// it is about (`on_behalf_of`), so the engine's audit line for it is
+/// attributable; calls outside an RPC carry none.
+#[tokio::test]
+async fn every_engine_call_of_an_rpc_names_its_volume() {
+    let f = fixture();
+    let v = f.create(create_req("pvc-attr", GIB)).await.unwrap();
+    f.expand(&v.volume_id, 2 * GIB).await.unwrap();
+    f.delete(&v.volume_id).await.unwrap();
+    let fs = f.fs_of(&v.volume_id).await;
+    let calls = fs.calls();
+    let made_by_rpcs: Vec<_> = calls.iter().filter(|(m, _)| *m != "fs.create").collect();
+    assert!(made_by_rpcs.len() >= 6, "{calls:?}");
+    for (method, who) in &made_by_rpcs {
+        // `fs_of`'s own lookup happens outside any RPC.
+        if who.is_none() {
+            continue;
+        }
+        assert_eq!(who.as_deref(), Some("pvc-attr"), "{method}");
+    }
+    for m in ["browse.mkdir", "quota.set", "browse.rename"] {
+        assert!(
+            calls
+                .iter()
+                .any(|(c, who)| *c == m && who.as_deref() == Some("pvc-attr")),
+            "{m} not attributed: {calls:?}"
+        );
+    }
+    assert_eq!(attribution_of("pvc-1 with\nnewline"), "pvc-1_with_newline");
+    assert_eq!(
+        attribution(&v.volume_id),
+        "pvc-attr",
+        "a pool volume's id names its PV"
+    );
 }
 
 #[tokio::test]

@@ -11,20 +11,25 @@
 //! 1. brings up this node's engine pod of that pool filesystem
 //!    (`constellation-engine-<pool>[-shard-k]-<node>`, [`NodeEngines`]) and
 //!    checks it serves the filesystem the id names (`fs.list`);
-//! 2. hands it the request's credentials with `fs.unlock`, once per pod
-//!    incarnation — a new pod or a restart of its engine container (the
-//!    pod already started with the pool's credentials `Secret`, which only
-//!    the controller writes: an engine opens S3 at start; the unlock is
-//!    what makes the node-stage secret, and a rotation of it, reach a
-//!    running pod);
-//! 3. reads the volume directory's record (`user.constellation.csi.*`),
+//!    Its credentials go with the bring-up ([`crate::credentials`]): a pod
+//!    of a class that needs them starts with `--await-unlock` and answers
+//!    nothing until `fs.unlock` brings them, which [`NodeEngines::engine`]
+//!    sends once per pod incarnation (a new pod, or a restart of its
+//!    engine container) and again whenever they differ from what that
+//!    incarnation got. They come from the request's node-stage secret, or
+//!    for a `refreshing` class from the watched Secret, or — for a restage
+//!    whose request carries none — from what this plugin last sent the
+//!    unit, held in memory only. A `refreshing` class's watch also pushes
+//!    every change of the Secret to the running pod at once: rotation
+//!    with no remount;
+//! 2. reads the volume directory's record (`user.constellation.csi.*`),
 //!    which fails `NOT_FOUND` for a volume that is not there;
-//! 4. mounts FUSE at the staging path (`fuse_mount_fd`, [`Mounter`]) and
+//! 3. mounts FUSE at the staging path (`fuse_mount_fd`, [`Mounter`]) and
 //!    sends the descriptor with `view.mount{PreopenedFd}` over the pod's
 //!    hostPath control socket, naming the staging path as the view's
 //!    mountpoint; the plugin's copy of the descriptor is closed as soon as
 //!    it is sent, so the engine pod is the connection's only holder;
-//! 5. records the volume ([`StateStore`]) and the pod's view count.
+//! 4. records the volume ([`StateStore`]) and the pod's view count.
 //!
 //! The session is `/dev/fuse` by construction: a `view.mount{PreopenedFd}`
 //! is served handover-capable, which pins the transport whatever the engine
@@ -44,9 +49,13 @@
 //! publish) unless that bind is already there; dead (`ENOTCONN`: the engine
 //! pod crashed and took the connection with it), it restages first against
 //! the pod's next incarnation, from the volume context and the recorded
-//! state — no node-stage secret is needed, the pod reads the pool's
-//! `Secret`. Containers started before the crash keep their dead bind until
-//! they restart: a new mount at the target reaches only new mounts of it.
+//! state — with the credentials this plugin last sent the unit (or the
+//! watched Secret's), since a publish carries no node-stage secret; a
+//! plugin restarted since then has none for a `static-ephemeral` class,
+//! and the restage fails `UNAVAILABLE` saying so until a request brings
+//! the secret again. Containers started before the crash keep their dead
+//! bind until they restart: a new mount at the target reaches only new
+//! mounts of it.
 //!
 //! **`NodeGetVolumeStats`** is `view.stats` (the subtree's recursive bytes
 //! and entries) plus the subtree's quota cap (`quota.get{cap_only}`, so the
@@ -70,8 +79,9 @@ pub mod state;
 
 use crate::control_client::PoolRef;
 use crate::controller::{read_record, status, VolumeLocks, X_NAMESPACE, X_PV, X_PVC};
+use crate::credentials::{is_awaiting_unlock, unlock_params, Refresher, Secrets};
 use crate::engine_pods::pool_label;
-use crate::params::{ClassParams, SHARD_KEY};
+use crate::params::{ClassParams, CredentialMode, SecretRef, SHARD_KEY};
 use crate::proto::csi::v1::node_server::Node as NodeRpc;
 use crate::proto::csi::v1::node_service_capability::rpc::Type as RpcType;
 use crate::proto::csi::v1::node_service_capability::{Rpc, Type as CapabilityType};
@@ -82,14 +92,13 @@ use crate::proto::csi::v1::volume_usage::Unit;
 use crate::proto::csi::v1::*;
 use crate::volume_id::VolumeId;
 use constellation_control::proto::types::{
-    FsUnlockParams, MountSource, MountViewOpts, UnlockCredentials, ViewListParams, ViewMountParams,
-    ViewStatsParams, ViewUnmountParams,
+    MountSource, MountViewOpts, ViewListParams, ViewMountParams, ViewStatsParams, ViewUnmountParams,
 };
-use constellation_control::proto::{ErrorKind, Secret};
+use constellation_control::proto::ErrorKind;
 pub use engines::{Drift, InMemoryNodeEngines, NodeEngine, NodeEngines, Replacement};
 pub use mounter::{FakeMounter, FuseMountOptions, LinuxMounter, MountState, Mounter};
 use state::{StateStore, VolumeRecord};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -134,8 +143,19 @@ pub struct NodeService {
     mounter: Arc<dyn Mounter>,
     state: StateStore,
     locks: VolumeLocks,
-    /// Pod incarnations `fs.unlock` has reached (module docs, step 2).
-    unlocked: Mutex<HashSet<String>>,
+    /// The `refreshing` classes' Secret watch (`None`: outside a cluster).
+    refresher: Option<Arc<Refresher>>,
+    /// unit → the credentials last sent its engine pod, in memory only:
+    /// what unlocks a replacement pod for a restage (module docs).
+    remembered: Arc<Mutex<HashMap<String, Secrets>>>,
+    /// Units whose watched Secret is pushed to their pod on every change,
+    /// and the task doing it.
+    rotating: Mutex<HashMap<String, (SecretRef, tokio::task::AbortHandle)>>,
+    /// One per engine pod unit, held across recording a staged volume and
+    /// keeping its credentials, and across forgetting them: stages of
+    /// different volumes of one unit run concurrently, and an unstage's
+    /// "no volume left" check must not interleave with their record.
+    unit_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Held from counting an engine pod's views to the end of the patch
     /// that records the count. Stages and unstages of different volumes
     /// run concurrently; without it two of them count 24 and 25, and their
@@ -149,8 +169,16 @@ pub struct NodeService {
     annotation_timeout: Duration,
     /// Plan 37 §8: one gate per engine-pod unit. Stages and unstages hold
     /// it shared; a rollout's handoff holds it alone, so no view comes or
-    /// goes while the unit's sessions change hands ([`rollout`]).
-    unit_gates: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    /// goes while the unit's sessions change hands ([`rollout`]). A
+    /// `refreshing` class's rotation push holds it shared too, so a
+    /// rotation never lands on the pod a handoff is retiring.
+    ///
+    /// **Lock order** (37-k6a): a unit gate first, then the unit's
+    /// bring-up lock (`NodeEngines`), then [`Self::unit_locks`]; nothing
+    /// takes a unit gate while it holds one of the others. The unit lock
+    /// is a plain mutex never held across an `await`, and the handoff
+    /// (which holds the gate alone) takes neither of the others.
+    unit_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
     /// The handoff's bounds and the rollouts' bookkeeping.
     handoff: handoff::HandoffConfig,
     rollout: rollout::RolloutState,
@@ -169,10 +197,13 @@ impl NodeService {
             mounter,
             state,
             locks: VolumeLocks::default(),
-            unlocked: Mutex::default(),
+            refresher: None,
+            remembered: Arc::default(),
+            rotating: Mutex::default(),
+            unit_locks: Mutex::default(),
             views_annotation: Mutex::default(),
             annotation_timeout: ANNOTATION_TIMEOUT,
-            unit_gates: Mutex::default(),
+            unit_gates: Arc::default(),
             handoff: handoff::HandoffConfig::default(),
             rollout: rollout::RolloutState::default(),
         }
@@ -190,12 +221,7 @@ impl NodeService {
     }
 
     fn unit_gate(&self, unit: &str) -> Arc<tokio::sync::RwLock<()>> {
-        self.unit_gates
-            .lock()
-            .unwrap()
-            .entry(unit.to_string())
-            .or_default()
-            .clone()
+        gate_of(&self.unit_gates, unit)
     }
 
     /// `unit`'s gate, shared: what every RPC that touches a staging mount
@@ -206,6 +232,12 @@ impl NodeService {
     /// acquisition behind a waiting rollout would deadlock.
     async fn shared_gate(&self, unit: &str) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.unit_gate(unit).read_owned().await
+    }
+
+    /// Watch the Secrets `refreshing` classes name (module docs).
+    pub fn with_refresher(mut self, refresher: Arc<Refresher>) -> NodeService {
+        self.refresher = Some(refresher);
+        self
     }
 
     fn engines(&self) -> Result<&Arc<dyn NodeEngines>, Status> {
@@ -280,59 +312,141 @@ impl NodeService {
         }
     }
 
-    /// `fs.unlock` with the request's secrets, once per pod incarnation
-    /// (module docs, step 2).
-    async fn unlock(
-        &self,
-        engine: &NodeEngine,
-        fs_uuid: &str,
-        secrets: &BTreeMap<String, String>,
-    ) -> Result<(), Status> {
-        if self.unlocked.lock().unwrap().contains(&engine.incarnation) {
-            return Ok(());
-        }
-        let get = |k: &str| secrets.get(k).filter(|v| !v.is_empty()).map(Secret::new);
-        let credentials = UnlockCredentials {
-            access_key_id: get("aws_access_key_id"),
-            secret_access_key: get("aws_secret_access_key"),
-            session_token: get("aws_session_token"),
-            e2e_passphrase: get("e2e_passphrase"),
-        };
-        let keys = credentials.access_key_id.is_some() && credentials.secret_access_key.is_some();
-        if keys || credentials.e2e_passphrase.is_some() {
-            let creds = if keys {
-                credentials
+    /// The credentials for `unit`'s engine pod (module docs, step 1): a
+    /// `refreshing` class's watched Secret, else the request's, else what
+    /// this plugin last sent the unit.
+    async fn credentials_for(&self, unit: &str, pool: &PoolRef) -> Option<Secrets> {
+        let from_request = unlock_params("", &pool.secrets).map(|_| pool.secrets.clone());
+        if let (CredentialMode::Refreshing, Some(secret), Some(refresher)) = (
+            pool.class.credentials,
+            &pool.class.credential_secret,
+            &self.refresher,
+        ) {
+            self.watch_rotations(unit, secret);
+            // A request that carries the secret need not wait for the
+            // watch's first read; one that does not may.
+            let wait = if from_request.is_some() {
+                Duration::ZERO
             } else {
-                // A half key pair is the class's business, not a reason to
-                // refuse the passphrase.
-                UnlockCredentials {
-                    e2e_passphrase: credentials.e2e_passphrase,
-                    ..Default::default()
-                }
+                Duration::from_secs(10)
             };
-            engine
-                .client
-                .fs_unlock(FsUnlockParams {
-                    fs: fs_uuid.to_string(),
-                    credentials: creds,
-                })
-                .await
-                .map_err(|e| match e.kind {
-                    ErrorKind::Denied => Status::permission_denied(format!(
-                        "fs.unlock on {}: {}",
-                        engine.pod, e.message
-                    )),
-                    _ => status(&format!("fs.unlock on {}", engine.pod), e),
-                })?;
+            if let Some(data) = refresher.current(secret, wait).await {
+                return Some((*data).clone());
+            }
         }
-        self.unlocked
+        from_request.or_else(|| self.remembered.lock().unwrap().get(unit).cloned())
+    }
+
+    /// Push each change of `secret` to `unit`'s engine pod (once per unit).
+    fn watch_rotations(&self, unit: &str, secret: &SecretRef) {
+        let (Some(refresher), Some(engines)) = (&self.refresher, &self.engines) else {
+            return;
+        };
+        let mut rotating = self.rotating.lock().unwrap();
+        if rotating.contains_key(unit) {
+            return;
+        }
+        let mut latest = refresher.subscribe(secret);
+        latest.borrow_and_update();
+        let engines = engines.clone();
+        let remembered = self.remembered.clone();
+        let gates = self.unit_gates.clone();
+        let (pushed_to, landed_for) = (unit.to_string(), unit.to_string());
+        let task = tokio::spawn(crate::credentials::follow_rotations(
+            latest,
+            secret.clone(),
+            unit.to_string(),
+            move |data| {
+                let engines = engines.clone();
+                let unit = pushed_to.clone();
+                let gate = gate_of(&gates, &unit);
+                async move {
+                    // Never into a handoff: it lands on the pod that serves
+                    // once the handoff is over (a rotation sent to the old
+                    // pod after the standby took its credentials would be
+                    // lost with it).
+                    let _gate = gate.read_owned().await;
+                    engines.rotate(&unit, &data).await
+                }
+            },
+            move |data| {
+                remembered
+                    .lock()
+                    .unwrap()
+                    .insert(landed_for.clone(), data.clone());
+            },
+        ));
+        rotating.insert(unit.to_string(), (secret.clone(), task.abort_handle()));
+    }
+
+    fn unit_lock(&self, unit: &str) -> Arc<Mutex<()>> {
+        self.unit_locks
             .lock()
             .unwrap()
-            .insert(engine.incarnation.clone());
+            .entry(unit.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Record `record` and keep what unlocks its unit's engine pod, as one
+    /// step with respect to [`Self::forget_credentials`].
+    fn record_and_keep(
+        &self,
+        record: VolumeRecord,
+        pool: &PoolRef,
+        credentials: Option<Secrets>,
+    ) -> Result<(), Status> {
+        let unit = record.unit.clone();
+        let lock = self.unit_lock(&unit);
+        let _held = lock.lock().unwrap();
+        self.state
+            .put(record)
+            .map_err(internal("recording the volume"))?;
+        self.keep_credentials(&unit, pool, credentials);
         Ok(())
     }
 
-    /// Stage `id` at `staging` (module docs, steps 1-5) and record it.
+    /// Keep what unlocks `unit`'s engine pod (`credentials`, and its
+    /// Secret's watch for a `refreshing` class) while it serves a volume
+    /// of this node: called once a volume of it is recorded.
+    fn keep_credentials(&self, unit: &str, pool: &PoolRef, credentials: Option<Secrets>) {
+        if let Some(credentials) = credentials {
+            self.remembered
+                .lock()
+                .unwrap()
+                .insert(unit.to_string(), credentials);
+        }
+        if let (CredentialMode::Refreshing, Some(secret)) =
+            (pool.class.credentials, &pool.class.credential_secret)
+        {
+            self.watch_rotations(unit, secret);
+        }
+    }
+
+    /// Drop what [`Self::keep_credentials`] kept for `unit` once no volume
+    /// of this node is staged through it any more: the plugin holds no
+    /// credentials it has no use for.
+    fn forget_credentials(&self, unit: &str) {
+        let lock = self.unit_lock(unit);
+        let _held = lock.lock().unwrap();
+        if self.state.all().iter().any(|r| r.unit == unit) {
+            return;
+        }
+        self.remembered.lock().unwrap().remove(unit);
+        let stopped = self.rotating.lock().unwrap().remove(unit);
+        if let Some((secret, task)) = stopped {
+            task.abort();
+            if let Some(refresher) = &self.refresher {
+                refresher.release(&secret);
+            }
+        }
+        tracing::debug!(
+            unit,
+            "no volume left on the engine pod: its credentials forgotten"
+        );
+    }
+
+    /// Stage `id` at `staging` (module docs, steps 1-4) and record it.
     /// The caller holds the pool's unit gate ([`Self::shared_gate`]).
     #[allow(clippy::too_many_arguments)]
     async fn stage(
@@ -342,13 +456,36 @@ impl NodeService {
         volume_id: &str,
         staging: &Path,
         pool: PoolRef,
-        reads_secret: bool,
+        context: BTreeMap<String, String>,
+        published: std::collections::BTreeSet<PathBuf>,
+    ) -> Result<(), Status> {
+        let (unit, _) = engines.names(&pool);
+        let staged = self
+            .stage_inner(engines, id, volume_id, staging, pool, context, published)
+            .await;
+        if staged.is_err() {
+            // A failed stage must not leave its unit's Secret watch behind.
+            self.forget_credentials(&unit);
+        }
+        staged
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_inner(
+        &self,
+        engines: &dyn NodeEngines,
+        id: &VolumeId,
+        volume_id: &str,
+        staging: &Path,
+        pool: PoolRef,
         context: BTreeMap<String, String>,
         published: std::collections::BTreeSet<PathBuf>,
     ) -> Result<(), Status> {
         let fs_uuid = id.fs_uuid();
+        let (unit, _) = engines.names(&pool);
+        let credentials = self.credentials_for(&unit, &pool).await;
         let engine = engines
-            .engine(&pool, fs_uuid, reads_secret)
+            .engine(&pool, fs_uuid, credentials.as_ref())
             .await
             .map_err(|e| {
                 status(
@@ -358,11 +495,22 @@ impl NodeService {
             })?;
 
         // 1. The pod serves the filesystem the id names.
-        let listing = engine
-            .client
-            .fs_list()
-            .await
-            .map_err(|e| status(&format!("fs.list on {}", engine.pod), e))?;
+        let listing = engine.client.fs_list().await.map_err(|e| {
+            if is_awaiting_unlock(&e) {
+                Status::unavailable(format!(
+                    "engine pod {} waits for its credentials, and this plugin has none for it: \
+                     the request carries no node-stage secret, and none was sent to this unit \
+                     since the plugin started (a static-ephemeral class's engine pod that \
+                     restarted after the plugin did; name the secret in the class's \
+                     csi.storage.k8s.io/node-publish-secret-name too, so a publish carries \
+                     it, or recreate the pod using the volume, so kubelet stages it again \
+                     with its secret)",
+                    engine.pod
+                ))
+            } else {
+                status(&format!("fs.list on {}", engine.pod), e)
+            }
+        })?;
         match listing.filesystems.iter().find(|f| f.name.is_none()) {
             Some(own) if own.uuid == fs_uuid => {}
             Some(own) => {
@@ -381,11 +529,7 @@ impl NodeService {
                 )))
             }
         }
-        // 2. Its credentials.
-        if !pool.secrets.is_empty() {
-            self.unlock(&engine, fs_uuid, &pool.secrets).await?;
-        }
-        // 3. The volume, and its record as of now.
+        // 2. The volume, and its record as of now.
         let subtree = id.subtree();
         let xattrs = read_record(engine.client.as_ref(), &subtree)
             .await
@@ -402,7 +546,6 @@ impl NodeService {
         record.fs_uuid = fs_uuid.to_string();
         record.subtree = subtree.clone();
         record.xattrs = xattrs.clone();
-        record.reads_secret = reads_secret;
         record.context = context;
         record.published = published;
 
@@ -423,9 +566,7 @@ impl NodeService {
             if ours && self.probe(staging).await.served() {
                 tracing::info!(volume_id, staging = %staging.display(), pod = %engine.pod,
                     "adopting a view staged before this plugin lost its record");
-                self.state
-                    .put(record)
-                    .map_err(internal("recording the volume"))?;
+                self.record_and_keep(record, &pool, credentials)?;
                 self.record_views(engines, &engine.unit, &engine.pod).await;
                 return Ok(());
             }
@@ -442,7 +583,7 @@ impl NodeService {
             }
         }
 
-        // 4. The mount, and the view on it.
+        // 3. The mount, and the view on it.
         self.unmount(staging).await?;
         let target = staging.to_path_buf();
         let fd = self
@@ -520,14 +661,25 @@ impl NodeService {
                 engine.pod
             )));
         }
-        // 5. Recorded.
-        self.state
-            .put(record)
-            .map_err(internal("recording the volume"))?;
+        // 4. Recorded.
+        self.record_and_keep(record, &pool, credentials)?;
         self.record_views(engines, &engine.unit, &engine.pod).await;
         tracing::info!(volume_id, staging = %staging.display(), pod = %engine.pod, "staged");
         Ok(())
     }
+}
+
+/// `unit`'s gate in `gates` ([`NodeService::unit_gates`]).
+fn gate_of(
+    gates: &Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    unit: &str,
+) -> Arc<tokio::sync::RwLock<()>> {
+    gates
+        .lock()
+        .unwrap()
+        .entry(unit.to_string())
+        .or_default()
+        .clone()
 }
 
 fn internal(what: &'static str) -> impl Fn(std::io::Error) -> Status {
@@ -657,51 +809,53 @@ impl NodeRpc for NodeService {
         request: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
         let req = request.into_inner();
-        required(&req.volume_id, "volume_id")?;
-        required(&req.staging_target_path, "staging_target_path")?;
-        access_mode(req.volume_capability.as_ref())?;
-        let id = parse_id(&req.volume_id)?;
-        let engines = self.engines()?.clone();
-        let _lock = self.locks.try_lock(req.volume_id.clone())?;
-        let staging = PathBuf::from(&req.staging_target_path);
-        let pool = location(&req.volume_context, &id, &req.secrets)?;
-        // Never while the unit's sessions change hands (`rollout`).
-        let _gate = self.shared_gate(&engines.names(&pool).0).await;
+        let who = crate::controller::attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            required(&req.volume_id, "volume_id")?;
+            required(&req.staging_target_path, "staging_target_path")?;
+            access_mode(req.volume_capability.as_ref())?;
+            let id = parse_id(&req.volume_id)?;
+            let engines = self.engines()?.clone();
+            let _lock = self.locks.try_lock(req.volume_id.clone())?;
+            let staging = PathBuf::from(&req.staging_target_path);
+            let pool = location(&req.volume_context, &id, &req.secrets)?;
+            // Never while the unit's sessions change hands (`rollout`).
+            let _gate = self.shared_gate(&engines.names(&pool).0).await;
 
-        let mut published = Default::default();
-        if let Some(record) = self.state.get(&req.volume_id) {
-            let served = self.probe(&record.staging_path).await.served();
-            match (record.staging_path == staging, served) {
-                (true, true) => return Ok(Response::new(NodeStageVolumeResponse {})),
-                (false, true) => {
-                    return Err(Status::already_exists(format!(
-                        "volume {} is already staged at {}",
-                        req.volume_id,
-                        record.staging_path.display()
-                    )))
-                }
-                // Dead or gone: staged again below, its publishes kept.
-                (same, false) => {
-                    if !same {
-                        self.unmount(&record.staging_path).await?;
+            let mut published = Default::default();
+            if let Some(record) = self.state.get(&req.volume_id) {
+                let served = self.probe(&record.staging_path).await.served();
+                match (record.staging_path == staging, served) {
+                    (true, true) => return Ok(Response::new(NodeStageVolumeResponse {})),
+                    (false, true) => {
+                        return Err(Status::already_exists(format!(
+                            "volume {} is already staged at {}",
+                            req.volume_id,
+                            record.staging_path.display()
+                        )))
                     }
-                    published = record.published;
+                    // Dead or gone: staged again below, its publishes kept.
+                    (same, false) => {
+                        if !same {
+                            self.unmount(&record.staging_path).await?;
+                        }
+                        published = record.published;
+                    }
                 }
             }
-        }
-        let reads_secret = !pool.secrets.is_empty();
-        self.stage(
-            engines.as_ref(),
-            &id,
-            &req.volume_id,
-            &staging,
-            pool,
-            reads_secret,
-            recordable(&req.volume_context),
-            published,
-        )
-        .await?;
-        Ok(Response::new(NodeStageVolumeResponse {}))
+            self.stage(
+                engines.as_ref(),
+                &id,
+                &req.volume_id,
+                &staging,
+                pool,
+                recordable(&req.volume_context),
+                published,
+            )
+            .await?;
+            Ok(Response::new(NodeStageVolumeResponse {}))
+        })
+        .await
     }
 
     async fn node_unstage_volume(
@@ -709,57 +863,62 @@ impl NodeRpc for NodeService {
         request: Request<NodeUnstageVolumeRequest>,
     ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
         let req = request.into_inner();
-        required(&req.volume_id, "volume_id")?;
-        required(&req.staging_target_path, "staging_target_path")?;
-        let _lock = self.locks.try_lock(req.volume_id.clone())?;
-        let staging = PathBuf::from(&req.staging_target_path);
-        // Never while the unit's sessions change hands (`rollout`).
-        let unit = self.state.get(&req.volume_id).map(|r| r.unit);
-        let _gate = match unit {
-            Some(unit) => Some(self.shared_gate(&unit).await),
-            None => None,
-        };
-        // The plugin made the mount; unmounting it also ends the engine's
-        // session on it (the kernel aborts the connection).
-        self.unmount(&staging).await?;
-        let Some(record) = self
-            .state
-            .get(&req.volume_id)
-            .filter(|r| r.staging_path == staging)
-        else {
-            return Ok(Response::new(NodeUnstageVolumeResponse {}));
-        };
-        if let Some(engines) = &self.engines {
-            // And the view goes from the engine — at once, ended or not.
-            match engines.existing(&record.unit).await {
-                Ok(Some(engine)) => match engine
-                    .client
-                    .view_unmount(ViewUnmountParams {
-                        mountpoint: staging.clone(),
-                    })
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) if e.kind == ErrorKind::NotFound => {}
-                    Err(e) => return Err(status(&format!("view.unmount on {}", engine.pod), e)),
-                },
-                // A pod that is gone took its views with it.
-                Ok(None) => {}
-                Err(e) => tracing::warn!(pod = %record.pod, error = %e,
-                    "the engine pod is unreachable; its view of the unstaged volume goes with it"),
+        let who = crate::controller::attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            required(&req.volume_id, "volume_id")?;
+            required(&req.staging_target_path, "staging_target_path")?;
+            let _lock = self.locks.try_lock(req.volume_id.clone())?;
+            let staging = PathBuf::from(&req.staging_target_path);
+            // Never while the unit's sessions change hands (`rollout`).
+            let unit = self.state.get(&req.volume_id).map(|r| r.unit);
+            let _gate = match unit {
+                Some(unit) => Some(self.shared_gate(&unit).await),
+                None => None,
+            };
+            // The plugin made the mount; unmounting it also ends the engine's
+            // session on it (the kernel aborts the connection).
+            self.unmount(&staging).await?;
+            let Some(record) = self
+                .state
+                .get(&req.volume_id)
+                .filter(|r| r.staging_path == staging)
+            else {
+                return Ok(Response::new(NodeUnstageVolumeResponse {}));
+            };
+            if let Some(engines) = &self.engines {
+                // And the view goes from the engine — at once, ended or not.
+                match engines.existing(&record.unit).await {
+                    Ok(Some(engine)) => match engine
+                        .client
+                        .view_unmount(ViewUnmountParams {
+                            mountpoint: staging.clone(),
+                        })
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) if e.kind == ErrorKind::NotFound => {}
+                        Err(e) => return Err(status(&format!("view.unmount on {}", engine.pod), e)),
+                    },
+                    // A pod that is gone took its views with it.
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(pod = %record.pod, error = %e,
+                        "the engine pod is unreachable; its view of the unstaged volume goes with it"),
+                }
+                self.state
+                    .remove(&req.volume_id)
+                    .map_err(internal("removing the volume's record"))?;
+                self.forget_credentials(&record.unit);
+                self.record_views(engines.as_ref(), &record.unit, &record.pod)
+                    .await;
+            } else {
+                self.state
+                    .remove(&req.volume_id)
+                    .map_err(internal("removing the volume's record"))?;
             }
-            self.state
-                .remove(&req.volume_id)
-                .map_err(internal("removing the volume's record"))?;
-            self.record_views(engines.as_ref(), &record.unit, &record.pod)
-                .await;
-        } else {
-            self.state
-                .remove(&req.volume_id)
-                .map_err(internal("removing the volume's record"))?;
-        }
-        tracing::info!(volume_id = %req.volume_id, staging = %staging.display(), "unstaged");
-        Ok(Response::new(NodeUnstageVolumeResponse {}))
+            tracing::info!(volume_id = %req.volume_id, staging = %staging.display(), "unstaged");
+            Ok(Response::new(NodeUnstageVolumeResponse {}))
+        })
+        .await
     }
 
     async fn node_publish_volume(
@@ -767,115 +926,122 @@ impl NodeRpc for NodeService {
         request: Request<NodePublishVolumeRequest>,
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
         let req = request.into_inner();
-        required(&req.volume_id, "volume_id")?;
-        required(&req.target_path, "target_path")?;
-        let mode = access_mode(req.volume_capability.as_ref())?;
-        required(&req.staging_target_path, "staging_target_path")?;
-        let id = parse_id(&req.volume_id)?;
-        let _lock = self.locks.try_lock(req.volume_id.clone())?;
-        let staging = PathBuf::from(&req.staging_target_path);
-        let target = PathBuf::from(&req.target_path);
-        let mut record = self
-            .state
-            .get(&req.volume_id)
-            .filter(|r| r.staging_path == staging)
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "volume {} is not staged at {}",
-                    req.volume_id,
-                    staging.display()
-                ))
-            })?;
-        // Never while the unit's sessions change hands (`rollout`): the
-        // staging mount's probe would wait for it anyway.
-        let _gate = self.shared_gate(&record.unit).await;
-        if mode == Mode::SingleNodeSingleWriter {
-            if let Some(other) = record.published.iter().find(|p| **p != target) {
-                return Err(Status::failed_precondition(format!(
-                    "volume {} is single-writer and already published at {}",
-                    req.volume_id,
-                    other.display()
-                )));
-            }
-        }
-
-        // Settled decision 12: every publish checks the staging mount.
-        let staged = match self.probe(&staging).await {
-            Probe::State(MountState::Alive { dev, .. }) => Some(dev),
-            Probe::Wedged => None,
-            Probe::State(state) => {
-                tracing::warn!(volume_id = %req.volume_id, ?state,
-                    "the staging mount is not served (its engine pod died?): restaging");
-                let engines = self.engines()?.clone();
-                let context: HashMap<String, String> = if recordable(&req.volume_context).is_empty()
-                {
-                    record.context.clone().into_iter().collect()
-                } else {
-                    req.volume_context.clone()
-                };
-                let pool = location(&context, &id, &HashMap::new())?;
-                self.stage(
-                    engines.as_ref(),
-                    &id,
-                    &req.volume_id,
-                    &staging,
-                    pool,
-                    record.reads_secret,
-                    recordable(&context),
-                    record.published.clone(),
-                )
-                .await?;
-                record = self
-                    .state
-                    .get(&req.volume_id)
-                    .ok_or_else(|| Status::internal("the restaged volume has no record"))?;
-                match self.probe(&staging).await {
-                    Probe::State(MountState::Alive { dev, .. }) => Some(dev),
-                    _ => None,
-                }
-            }
-        };
-
-        let read_only = req.readonly || reader_only(mode);
-        match (self.probe(&target).await, staged) {
-            // Already this volume's bind (the same device as the staging
-            // mount), as asked: nothing to do. Bound the other way round
-            // (read-only, asked read-write, or the reverse): the CSI spec's
-            // incompatible republish.
-            (Probe::State(MountState::Alive { dev, read_only: ro }), Some(staged))
-                if dev == staged =>
-            {
-                if ro != read_only {
-                    return Err(Status::already_exists(format!(
-                        "volume {} is already published at {} {}, not {}",
+        let who = crate::controller::attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            required(&req.volume_id, "volume_id")?;
+            required(&req.target_path, "target_path")?;
+            let mode = access_mode(req.volume_capability.as_ref())?;
+            required(&req.staging_target_path, "staging_target_path")?;
+            let id = parse_id(&req.volume_id)?;
+            let _lock = self.locks.try_lock(req.volume_id.clone())?;
+            let staging = PathBuf::from(&req.staging_target_path);
+            let target = PathBuf::from(&req.target_path);
+            let mut record = self
+                .state
+                .get(&req.volume_id)
+                .filter(|r| r.staging_path == staging)
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "volume {} is not staged at {}",
                         req.volume_id,
-                        target.display(),
-                        if ro { "read-only" } else { "read-write" },
-                        if read_only { "read-only" } else { "read-write" },
+                        staging.display()
+                    ))
+                })?;
+            // Never while the unit's sessions change hands (`rollout`): the
+            // staging mount's probe would wait for it anyway.
+            let _gate = self.shared_gate(&record.unit).await;
+            if mode == Mode::SingleNodeSingleWriter {
+                if let Some(other) = record.published.iter().find(|p| **p != target) {
+                    return Err(Status::failed_precondition(format!(
+                        "volume {} is single-writer and already published at {}",
+                        req.volume_id,
+                        other.display()
                     )));
                 }
             }
-            (Probe::State(MountState::NotMounted), _) => {
-                self.bind(&staging, &target, read_only).await?;
+
+            // Settled decision 12: every publish checks the staging mount.
+            let staged = match self.probe(&staging).await {
+                Probe::State(MountState::Alive { dev, .. }) => Some(dev),
+                Probe::Wedged => None,
+                Probe::State(state) => {
+                    tracing::warn!(volume_id = %req.volume_id, ?state,
+                        "the staging mount is not served (its engine pod died?): restaging");
+                    let engines = self.engines()?.clone();
+                    let context: HashMap<String, String> =
+                        if recordable(&req.volume_context).is_empty() {
+                            record.context.clone().into_iter().collect()
+                        } else {
+                            req.volume_context.clone()
+                        };
+                    // The publish secret, when the class names one
+                    // (`csi.storage.k8s.io/node-publish-secret-name`):
+                    // what unlocks a replacement engine pod after this
+                    // plugin restarted and forgot the stage secret.
+                    let pool = location(&context, &id, &req.secrets)?;
+                    self.stage(
+                        engines.as_ref(),
+                        &id,
+                        &req.volume_id,
+                        &staging,
+                        pool,
+                        recordable(&context),
+                        record.published.clone(),
+                    )
+                    .await?;
+                    record = self
+                        .state
+                        .get(&req.volume_id)
+                        .ok_or_else(|| Status::internal("the restaged volume has no record"))?;
+                    match self.probe(&staging).await {
+                        Probe::State(MountState::Alive { dev, .. }) => Some(dev),
+                        _ => None,
+                    }
+                }
+            };
+
+            let read_only = req.readonly || reader_only(mode);
+            match (self.probe(&target).await, staged) {
+                // Already this volume's bind (the same device as the staging
+                // mount), as asked: nothing to do. Bound the other way round
+                // (read-only, asked read-write, or the reverse): the CSI spec's
+                // incompatible republish.
+                (Probe::State(MountState::Alive { dev, read_only: ro }), Some(staged))
+                    if dev == staged =>
+                {
+                    if ro != read_only {
+                        return Err(Status::already_exists(format!(
+                            "volume {} is already published at {} {}, not {}",
+                            req.volume_id,
+                            target.display(),
+                            if ro { "read-only" } else { "read-write" },
+                            if read_only { "read-only" } else { "read-write" },
+                        )));
+                    }
+                }
+                (Probe::State(MountState::NotMounted), _) => {
+                    self.bind(&staging, &target, read_only).await?;
+                }
+                (Probe::Wedged, None) => {
+                    return Err(Status::unavailable(format!(
+                        "the staging mount {} does not answer",
+                        staging.display()
+                    )))
+                }
+                // A dead bind of an earlier session, or something else.
+                _ => {
+                    self.unmount(&target).await?;
+                    self.bind(&staging, &target, read_only).await?;
+                }
             }
-            (Probe::Wedged, None) => {
-                return Err(Status::unavailable(format!(
-                    "the staging mount {} does not answer",
-                    staging.display()
-                )))
+            if record.published.insert(target.clone()) {
+                self.state
+                    .put(record)
+                    .map_err(internal("recording the publish"))?;
             }
-            // A dead bind of an earlier session, or something else.
-            _ => {
-                self.unmount(&target).await?;
-                self.bind(&staging, &target, read_only).await?;
-            }
-        }
-        if record.published.insert(target.clone()) {
-            self.state
-                .put(record)
-                .map_err(internal("recording the publish"))?;
-        }
-        Ok(Response::new(NodePublishVolumeResponse {}))
+            Ok(Response::new(NodePublishVolumeResponse {}))
+        })
+        .await
     }
 
     async fn node_unpublish_volume(
@@ -883,36 +1049,40 @@ impl NodeRpc for NodeService {
         request: Request<NodeUnpublishVolumeRequest>,
     ) -> Result<Response<NodeUnpublishVolumeResponse>, Status> {
         let req = request.into_inner();
-        required(&req.volume_id, "volume_id")?;
-        required(&req.target_path, "target_path")?;
-        let _lock = self.locks.try_lock(req.volume_id.clone())?;
-        let target = PathBuf::from(&req.target_path);
-        // Never while the unit's sessions change hands (`rollout`).
-        let unit = self.state.get(&req.volume_id).map(|r| r.unit);
-        let _gate = match unit {
-            Some(unit) => Some(self.shared_gate(&unit).await),
-            None => None,
-        };
-        self.unmount(&target).await?;
-        // The CSI spec: the plugin removes what it created at the path.
-        match std::fs::remove_dir(&target) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(Status::internal(format!(
-                    "removing {}: {e}",
-                    target.display()
-                )))
+        let who = crate::controller::attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            required(&req.volume_id, "volume_id")?;
+            required(&req.target_path, "target_path")?;
+            let _lock = self.locks.try_lock(req.volume_id.clone())?;
+            let target = PathBuf::from(&req.target_path);
+            // Never while the unit's sessions change hands (`rollout`).
+            let unit = self.state.get(&req.volume_id).map(|r| r.unit);
+            let _gate = match unit {
+                Some(unit) => Some(self.shared_gate(&unit).await),
+                None => None,
+            };
+            self.unmount(&target).await?;
+            // The CSI spec: the plugin removes what it created at the path.
+            match std::fs::remove_dir(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "removing {}: {e}",
+                        target.display()
+                    )))
+                }
             }
-        }
-        if let Some(mut record) = self.state.get(&req.volume_id) {
-            if record.published.remove(&target) {
-                self.state
-                    .put(record)
-                    .map_err(internal("recording the unpublish"))?;
+            if let Some(mut record) = self.state.get(&req.volume_id) {
+                if record.published.remove(&target) {
+                    self.state
+                        .put(record)
+                        .map_err(internal("recording the unpublish"))?;
+                }
             }
-        }
-        Ok(Response::new(NodeUnpublishVolumeResponse {}))
+            Ok(Response::new(NodeUnpublishVolumeResponse {}))
+        })
+        .await
     }
 
     async fn node_get_volume_stats(
@@ -920,69 +1090,73 @@ impl NodeRpc for NodeService {
         request: Request<NodeGetVolumeStatsRequest>,
     ) -> Result<Response<NodeGetVolumeStatsResponse>, Status> {
         let req = request.into_inner();
-        required(&req.volume_id, "volume_id")?;
-        required(&req.volume_path, "volume_path")?;
-        let record = self.state.get(&req.volume_id).ok_or_else(|| {
-            Status::not_found(format!("volume {} is not staged here", req.volume_id))
-        })?;
-        // Never while the unit's sessions change hands (`rollout`).
-        let _gate = self.shared_gate(&record.unit).await;
-        let path = PathBuf::from(&req.volume_path);
-        if path != record.staging_path && !record.published.contains(&path) {
-            return Err(Status::not_found(format!(
-                "volume {} is not mounted at {}",
-                req.volume_id,
-                path.display()
-            )));
-        }
-        let engines = self.engines()?;
-        let engine = engines
-            .existing(&record.unit)
-            .await
-            .map_err(|e| status(&format!("reaching {}", record.pod), e))?
-            .ok_or_else(|| {
-                Status::unavailable(format!(
-                    "engine pod {} is not running; the volume is restaged on its next publish",
-                    record.pod
-                ))
+        let who = crate::controller::attribution(&req.volume_id);
+        constellation_control::client::on_behalf_of(who, async move {
+            required(&req.volume_id, "volume_id")?;
+            required(&req.volume_path, "volume_path")?;
+            let record = self.state.get(&req.volume_id).ok_or_else(|| {
+                Status::not_found(format!("volume {} is not staged here", req.volume_id))
             })?;
-        let stats = engine
-            .client
-            .view_stats(ViewStatsParams {
-                id: None,
-                mountpoint: Some(record.staging_path.clone()),
-            })
-            .await
-            .map_err(|e| status(&format!("view.stats on {}", engine.pod), e))?;
-        let cap = match engine.client.quota_cap(&record.subtree).await {
-            Ok(cap) => cap,
-            Err(e) if e.kind == ErrorKind::NotFound => None,
-            Err(e) => return Err(status(&format!("quota.get {}", record.subtree), e)),
-        };
-        // §11: capacity is the subtree's quota; without one, what the
-        // view's statfs reports.
-        let used = stats.rsize;
-        let (total, available) = match cap {
-            Some(cap) => (cap, cap.saturating_sub(used)),
-            None => (stats.total_bytes, stats.available_bytes),
-        };
-        let inodes_total = stats.inodes_total.max(stats.rcount);
-        Ok(Response::new(NodeGetVolumeStatsResponse {
-            usage: vec![
-                VolumeUsage {
-                    available: to_i64(available),
-                    total: to_i64(total),
-                    used: to_i64(used),
-                    unit: Unit::Bytes as i32,
-                },
-                VolumeUsage {
-                    available: to_i64(inodes_total.saturating_sub(stats.rcount)),
-                    total: to_i64(inodes_total),
-                    used: to_i64(stats.rcount),
-                    unit: Unit::Inodes as i32,
-                },
-            ],
-        }))
+            // Never while the unit's sessions change hands (`rollout`).
+            let _gate = self.shared_gate(&record.unit).await;
+            let path = PathBuf::from(&req.volume_path);
+            if path != record.staging_path && !record.published.contains(&path) {
+                return Err(Status::not_found(format!(
+                    "volume {} is not mounted at {}",
+                    req.volume_id,
+                    path.display()
+                )));
+            }
+            let engines = self.engines()?;
+            let engine = engines
+                .existing(&record.unit)
+                .await
+                .map_err(|e| status(&format!("reaching {}", record.pod), e))?
+                .ok_or_else(|| {
+                    Status::unavailable(format!(
+                        "engine pod {} is not running; the volume is restaged on its next publish",
+                        record.pod
+                    ))
+                })?;
+            let stats = engine
+                .client
+                .view_stats(ViewStatsParams {
+                    id: None,
+                    mountpoint: Some(record.staging_path.clone()),
+                })
+                .await
+                .map_err(|e| status(&format!("view.stats on {}", engine.pod), e))?;
+            let cap = match engine.client.quota_cap(&record.subtree).await {
+                Ok(cap) => cap,
+                Err(e) if e.kind == ErrorKind::NotFound => None,
+                Err(e) => return Err(status(&format!("quota.get {}", record.subtree), e)),
+            };
+            // §11: capacity is the subtree's quota; without one, what the
+            // view's statfs reports.
+            let used = stats.rsize;
+            let (total, available) = match cap {
+                Some(cap) => (cap, cap.saturating_sub(used)),
+                None => (stats.total_bytes, stats.available_bytes),
+            };
+            let inodes_total = stats.inodes_total.max(stats.rcount);
+            Ok(Response::new(NodeGetVolumeStatsResponse {
+                usage: vec![
+                    VolumeUsage {
+                        available: to_i64(available),
+                        total: to_i64(total),
+                        used: to_i64(used),
+                        unit: Unit::Bytes as i32,
+                    },
+                    VolumeUsage {
+                        available: to_i64(inodes_total.saturating_sub(stats.rcount)),
+                        total: to_i64(inodes_total),
+                        used: to_i64(stats.rcount),
+                        unit: Unit::Inodes as i32,
+                    },
+                ],
+            }))
+        })
+        .await
     }
 
     async fn node_get_volume_health(

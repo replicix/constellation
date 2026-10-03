@@ -61,7 +61,14 @@ impl Rig {
     /// The pool's engine on this node, with volume `pvc-a` planted in it
     /// carrying a controller-shaped record.
     async fn plant(&self) -> Arc<InMemoryControl> {
-        let control = self.engines.plant(&pool(1), UUID);
+        self.plant_in(&pool(1)).await
+    }
+
+    /// [`Self::plant`] for a pool of another class (the same location).
+    async fn plant_in(&self, pool: &PoolRef) -> Arc<InMemoryControl> {
+        let control = self.engines.plant(pool, UUID);
+        // The engine waits for its credentials (a static-ephemeral class),
+        // so the volume is planted behind its back.
         control.plant_dir("/volumes/pvc-a");
         for (k, v) in [
             (X_PV, "pvc-a"),
@@ -69,7 +76,7 @@ impl Rig {
             (X_NAMESPACE, "tenant"),
             ("user.constellation.csi.created", "1"),
         ] {
-            set_xattr(&control, "/volumes/pvc-a", k, v).await;
+            control.plant_xattr("/volumes/pvc-a", k, v.as_bytes());
         }
         control
     }
@@ -233,6 +240,7 @@ async fn stage_publish_unpublish_unstage() {
     let staging = rig.staging();
 
     rig.stage(&staging).await.unwrap();
+    let staged_calls = control.calls();
     // The FUSE mount is the plugin's; its descriptor went to the engine
     // with a view named by the staging path.
     assert!(rig.mounter.mount_at(&staging).unwrap().source.is_none());
@@ -252,11 +260,17 @@ async fn stage_publish_unpublish_unstage() {
         1,
         "the request's credentials reach the pod"
     );
+    assert_eq!(control.last_unlock_key().as_deref(), Some("id"));
+    assert!(!control.is_gated());
+    // Plan 37 K6a: the engine's audit line for each call names the PV.
+    assert!(!staged_calls.is_empty());
+    for (method, who) in staged_calls {
+        assert_eq!(who.as_deref(), Some("pvc-a"), "{method}");
+    }
     assert_eq!(rig.engines.view_count(&rig.unit()), Some(1));
     let record = rig.node.state.get(&volume_id()).unwrap();
     assert_eq!(record.fs_uuid, UUID);
     assert_eq!(record.xattrs[X_PV], "pvc-a");
-    assert!(record.reads_secret);
     assert!(
         record.context.contains_key("bucket") && !record.context.contains_key("aws_access_key_id")
     );
@@ -481,10 +495,12 @@ async fn a_dead_staging_mount_is_restaged_on_the_next_publish() {
             .len(),
         1
     );
-    // The restage had no secret to send; the pod reads the unit's Secret.
-    assert_eq!(control.unlocks(), 1);
+    // The publish carries no secret: the new incarnation (an empty
+    // credential store) gets what the plugin last sent the unit.
+    assert_eq!(control.unlocks(), 2);
+    assert_eq!(control.last_unlock_key().as_deref(), Some("id"));
     let record = rig.node.state.get(&volume_id()).unwrap();
-    assert!(record.reads_secret && record.published.contains(&target));
+    assert!(record.published.contains(&target));
     assert!(rig.health().await.is_empty());
 
     // A stage after a crash restages too (and unlocks the new pod).
@@ -492,7 +508,7 @@ async fn a_dead_staging_mount_is_restaged_on_the_next_publish() {
     rig.mounter.kill(&staging);
     rig.stage(&staging).await.unwrap();
     assert_eq!(control.fds_received(), 3);
-    assert_eq!(control.unlocks(), 2);
+    assert_eq!(control.unlocks(), 3);
     assert!(matches!(
         rig.mounter.state(&staging),
         MountState::Alive { .. }
@@ -789,6 +805,267 @@ async fn without_an_engine_backend_staging_is_unavailable() {
     .unwrap();
 }
 
+/// Plan 37 §9: the remembered credentials live in the plugin's memory
+/// only. A restarted plugin whose engine pod then dies cannot restage a
+/// `static-ephemeral` volume from a publish (no secret in it): the publish
+/// fails `UNAVAILABLE`, saying why, instead of serving a dead mount — and a
+/// publish that brings the class's node-publish secret repairs it, as a
+/// stage that brings the secret would.
+#[tokio::test]
+async fn a_restarted_plugin_cannot_unlock_a_crashed_engine_without_a_secret() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    let target = rig.target(1);
+    rig.publish(&target, Mode::MultiNodeMultiWriter)
+        .await
+        .unwrap();
+    let restarted = Rig::service(&rig.dir, &rig.mounter, &rig.engines);
+    rig.engines.crash(&rig.unit());
+    rig.mounter.kill(&staging);
+    assert!(control.is_gated());
+    let refused = restarted
+        .node_publish_volume(Request::new(NodePublishVolumeRequest {
+            volume_id: volume_id(),
+            staging_target_path: staging.display().to_string(),
+            target_path: target.display().to_string(),
+            volume_capability: Some(capability(Mode::MultiNodeMultiWriter)),
+            volume_context: context(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert!(
+        refused.message().contains("waits for its credentials"),
+        "{refused:?}"
+    );
+    assert_eq!(control.unlocks(), 1);
+    restarted
+        .node_publish_volume(Request::new(NodePublishVolumeRequest {
+            volume_id: volume_id(),
+            staging_target_path: staging.display().to_string(),
+            target_path: target.display().to_string(),
+            volume_capability: Some(capability(Mode::MultiNodeMultiWriter)),
+            volume_context: context(),
+            secrets: stage_req(&staging).secrets,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(control.unlocks(), 2);
+    assert!(!control.is_gated());
+    assert!(matches!(
+        rig.mounter.state(&staging),
+        MountState::Alive { .. }
+    ));
+}
+
+/// Plan 37 §9 `credentialSource: aws-default-chain`: no secret, no
+/// unlock — the engine pod never waits (it signs with its own
+/// ServiceAccount's chain).
+#[tokio::test]
+async fn an_aws_default_chain_engine_is_never_unlocked() {
+    let rig = Rig::new();
+    let mut ctx = context();
+    ctx.insert("credentialSource".into(), "aws-default-chain".into());
+    let mut class = ctx.clone();
+    class.retain(|k, _| !k.contains('/'));
+    let chain = PoolRef {
+        class: ClassParams::parse(&class).unwrap(),
+        shard: 1,
+        secrets: Default::default(),
+    };
+    let control = rig.plant_in(&chain).await;
+    assert!(!control.is_gated());
+    let mut req = stage_req(&rig.staging());
+    req.volume_context = ctx;
+    req.secrets.clear();
+    rig.node.node_stage_volume(Request::new(req)).await.unwrap();
+    assert_eq!(control.unlocks(), 0);
+    assert_eq!(control.fds_received(), 1);
+}
+
+/// Plan 37 §9 `Refreshing(callback)`: a `refreshing` class's engine pod
+/// is unlocked from the watched Secret (here with no node-stage secret in
+/// the request at all), and every rotation of that Secret is pushed to the
+/// running pod at once — the same FUSE mount, no restage — and is what a
+/// crashed pod's replacement gets.
+#[tokio::test]
+async fn a_refreshing_class_pushes_each_rotation_to_the_running_engine() {
+    use crate::credentials::fake::FakeSecrets;
+    let secret = |id: &str| -> Secrets {
+        [("aws_access_key_id", id), ("aws_secret_access_key", "k")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let fake = Arc::new(FakeSecrets::default());
+    fake.set(Some(secret("WATCHED-1")));
+    let dir = tempfile::tempdir().unwrap();
+    let mounter = Arc::new(FakeMounter::default());
+    let engines = Arc::new(InMemoryNodeEngines::new("node-a"));
+    let refresher = Refresher::with_backoff(Arc::new(fake.clone()), Duration::from_millis(10));
+    let rig = Rig {
+        node: Rig::service(&dir, &mounter, &engines).with_refresher(refresher),
+        dir,
+        mounter,
+        engines,
+    };
+    let mut ctx = context();
+    for (k, v) in [
+        ("credentialSource", "refreshing"),
+        ("credentialSecretName", "s3-creds"),
+        ("credentialSecretNamespace", "tenant"),
+    ] {
+        ctx.insert(k.into(), v.into());
+    }
+    let mut class = ctx.clone();
+    class.retain(|k, _| !k.contains('/'));
+    let refreshing = PoolRef {
+        class: ClassParams::parse(&class).unwrap(),
+        shard: 1,
+        secrets: Default::default(),
+    };
+    let control = rig.plant_in(&refreshing).await;
+    let staging = rig.staging();
+    let mut req = stage_req(&staging);
+    req.volume_context = ctx;
+    req.secrets.clear();
+    rig.node.node_stage_volume(Request::new(req)).await.unwrap();
+    assert_eq!(control.last_unlock_key().as_deref(), Some("WATCHED-1"));
+    let mount = dev(&rig.mounter, &staging);
+
+    let unit = rig.engines.names(&refreshing).0;
+    for n in 2..=3 {
+        fake.set(Some(secret(&format!("WATCHED-{n}"))));
+        let want = format!("WATCHED-{n}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while control.last_unlock_key().as_deref() != Some(want.as_str()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rotation {n} not pushed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(control.unlocks(), 3, "one unlock per distinct credential");
+    assert_eq!(dev(&rig.mounter, &staging), mount, "no remount");
+    assert_eq!(control.fds_received(), 1);
+    // A rotation to the same bytes (a resync) sends nothing.
+    fake.set(Some(secret("WATCHED-3")));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(control.unlocks(), 3);
+    // A crash's replacement gets the latest rotation.
+    rig.engines.crash(&unit);
+    rig.mounter.kill(&staging);
+    assert!(control.is_gated());
+    rig.node
+        .node_stage_volume(Request::new({
+            let mut r = stage_req(&staging);
+            r.volume_context = rig
+                .node
+                .state
+                .get(&volume_id())
+                .unwrap()
+                .context
+                .into_iter()
+                .collect();
+            r.secrets.clear();
+            r
+        }))
+        .await
+        .unwrap();
+    assert!(!control.is_gated());
+    assert_eq!(control.last_unlock_key().as_deref(), Some("WATCHED-3"));
+    // Each push names the Secret it came from in the engine's audit line.
+    let pushes: Vec<_> = control
+        .calls()
+        .into_iter()
+        .filter(|(m, _)| *m == "fs.unlock")
+        .collect();
+    assert!(
+        pushes
+            .iter()
+            .filter(|(_, who)| who.as_deref() == Some("secret:tenant/s3-creds"))
+            .count()
+            >= 2,
+        "{pushes:?}"
+    );
+
+    // The last volume of the unit unstaged: the plugin forgets the unit's
+    // credentials and stops pushing to it.
+    rig.unstage().await.unwrap();
+    assert!(rig.node.remembered.lock().unwrap().get(&unit).is_none());
+    assert!(rig.node.rotating.lock().unwrap().is_empty());
+    let unlocks = control.unlocks();
+    fake.set(Some(secret("WATCHED-4")));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        control.unlocks(),
+        unlocks,
+        "pushed to a unit with no volume"
+    );
+}
+
+/// Plan 37 K6a review: the plugin keeps a unit's credentials only while
+/// one of its volumes is staged here.
+#[tokio::test]
+async fn an_unstaged_units_credentials_are_forgotten() {
+    let rig = Rig::new();
+    rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    assert!(rig
+        .node
+        .remembered
+        .lock()
+        .unwrap()
+        .contains_key(&rig.unit()));
+    rig.unstage().await.unwrap();
+    assert!(!rig
+        .node
+        .remembered
+        .lock()
+        .unwrap()
+        .contains_key(&rig.unit()));
+}
+
+/// Plan 37 K6a review: an unstage's "no volume left" check waits for a
+/// concurrent stage of another volume of the same unit to finish recording
+/// it and keeping its credentials, then sees the volume and forgets nothing.
+#[test]
+fn forgetting_waits_for_a_concurrent_stage_of_the_same_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Arc::new(NodeService::new(
+        "node-a".into(),
+        None,
+        Arc::new(FakeMounter::default()),
+        StateStore::open(&dir.path().join("volumes")).unwrap(),
+    ));
+    // The stage is between recording its volume and keeping credentials.
+    let lock = node.unit_lock("unit");
+    let held = lock.lock().unwrap();
+    let forgetting = {
+        let node = node.clone();
+        std::thread::spawn(move || node.forget_credentials("unit"))
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!forgetting.is_finished(), "forgot without the unit's lock");
+    let mut r = VolumeRecord::new("vol-2", &dir.path().join("s2"));
+    r.unit = "unit".into();
+    r.pod = "pod".into();
+    node.state.put(r).unwrap();
+    node.remembered
+        .lock()
+        .unwrap()
+        .insert("unit".into(), Secrets::new());
+    drop(held);
+    forgetting.join().unwrap();
+    assert!(node.remembered.lock().unwrap().contains_key("unit"));
+}
+
 /// [`InMemoryNodeEngines`] whose `last-view-count` patches take longer
 /// the lower the count, as API-server round trips sometimes do: unordered,
 /// a stage that counted 1 lands after one that counted 2.
@@ -803,9 +1080,16 @@ impl NodeEngines for SlowAnnotations {
         &self,
         pool: &PoolRef,
         fs_uuid: &str,
-        reads_secret: bool,
+        unlock: Option<&Secrets>,
     ) -> Result<engines::NodeEngine, constellation_control::proto::ControlError> {
-        self.0.engine(pool, fs_uuid, reads_secret).await
+        self.0.engine(pool, fs_uuid, unlock).await
+    }
+    async fn rotate(
+        &self,
+        unit: &str,
+        secrets: &Secrets,
+    ) -> Result<bool, constellation_control::proto::ControlError> {
+        self.0.rotate(unit, secrets).await
     }
     async fn existing(
         &self,
@@ -866,9 +1150,16 @@ impl NodeEngines for HungAnnotations {
         &self,
         pool: &PoolRef,
         fs_uuid: &str,
-        reads_secret: bool,
+        unlock: Option<&Secrets>,
     ) -> Result<engines::NodeEngine, constellation_control::proto::ControlError> {
-        self.0.engine(pool, fs_uuid, reads_secret).await
+        self.0.engine(pool, fs_uuid, unlock).await
+    }
+    async fn rotate(
+        &self,
+        unit: &str,
+        secrets: &Secrets,
+    ) -> Result<bool, constellation_control::proto::ControlError> {
+        self.0.rotate(unit, secrets).await
     }
     async fn existing(
         &self,
@@ -962,6 +1253,9 @@ async fn a_drifted_engine_pod_hands_its_views_to_a_replacement() {
     assert_eq!(rig.engines.spec_of(&rig.unit()).as_deref(), Some("spec-2"));
     let new = rig.engines.control(&rig.unit()).unwrap();
     assert!(!Arc::ptr_eq(&new, &old));
+    // 37-k6a: it waited for its credentials, and got the old pod's.
+    assert!(!new.is_gated());
+    assert_eq!(new.last_unlock_key(), old.last_unlock_key());
     assert_eq!(new.view_mountpoints(), [staging.display().to_string()]);
     assert_eq!(dev(&rig.mounter, &staging), mount, "the same mount");
     assert!(matches!(
@@ -980,6 +1274,107 @@ async fn a_drifted_engine_pod_hands_its_views_to_a_replacement() {
     assert!(new.view_mountpoints().is_empty());
     let metrics = rig.node.handoff_metrics().render();
     assert!(metrics.contains("constellation_csi_handoff_total{outcome=\"succeeded\"} 1"));
+}
+
+/// 37-k6a with K5a: a `static-ephemeral` engine pod is handed over by a
+/// node plugin that restarted since it staged the volume — so holds no
+/// secret for it (the chart upgrade that rolls the pods restarts it) — and
+/// the replacement serves on the very credentials the old pod held,
+/// handed over by the old pod itself.
+#[tokio::test]
+async fn a_restarted_plugin_hands_over_an_engine_it_holds_no_credentials_for() {
+    let rig = Rig::new();
+    let old = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    assert_eq!(old.last_unlock_key().as_deref(), Some("id"));
+    let mount = dev(&rig.mounter, &staging);
+    let rig = Rig {
+        node: Rig::service(&rig.dir, &rig.mounter, &rig.engines),
+        ..rig
+    };
+    assert!(rig.node.remembered.lock().unwrap().is_empty());
+
+    rig.engines.set_desired("spec-2");
+    let rolled = rig.node.rollout_once().await;
+    assert!(
+        matches!(
+            &rolled[..],
+            [(_, Rolled::HandedOff(Outcome::Succeeded { views: 1, .. }))]
+        ),
+        "{rolled:?}"
+    );
+    let new = rig.engines.control(&rig.unit()).unwrap();
+    assert!(!Arc::ptr_eq(&new, &old));
+    assert!(!new.is_gated(), "unlocked by the handoff");
+    assert_eq!(new.last_unlock_key().as_deref(), Some("id"));
+    assert_eq!(new.unlocks(), 0, "no fs.unlock from this plugin");
+    assert_eq!(dev(&rig.mounter, &staging), mount, "the same mount");
+}
+
+/// The lock order (37-k6a with K5a): a `refreshing` class's rotation push
+/// holds the unit's gate shared, so one that comes while a handoff holds
+/// the gate waits for it, and lands on the pod that serves afterwards
+/// rather than on the one being retired.
+#[tokio::test]
+async fn a_rotation_waits_for_a_running_handoff() {
+    use crate::credentials::fake::FakeSecrets;
+    let secret = |id: &str| -> Secrets {
+        [("aws_access_key_id", id), ("aws_secret_access_key", "k")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let fake = Arc::new(FakeSecrets::default());
+    fake.set(Some(secret("WATCHED-1")));
+    let dir = tempfile::tempdir().unwrap();
+    let mounter = Arc::new(FakeMounter::default());
+    let engines = Arc::new(InMemoryNodeEngines::new("node-a"));
+    let refresher = Refresher::with_backoff(Arc::new(fake.clone()), Duration::from_millis(10));
+    let rig = Rig {
+        node: Rig::service(&dir, &mounter, &engines).with_refresher(refresher),
+        dir,
+        mounter,
+        engines,
+    };
+    let mut ctx = context();
+    for (k, v) in [
+        ("credentialSource", "refreshing"),
+        ("credentialSecretName", "s3-creds"),
+        ("credentialSecretNamespace", "tenant"),
+    ] {
+        ctx.insert(k.into(), v.into());
+    }
+    let mut class = ctx.clone();
+    class.retain(|k, _| !k.contains('/'));
+    let refreshing = PoolRef {
+        class: ClassParams::parse(&class).unwrap(),
+        shard: 1,
+        secrets: Default::default(),
+    };
+    let control = rig.plant_in(&refreshing).await;
+    let mut req = stage_req(&rig.staging());
+    req.volume_context = ctx;
+    req.secrets.clear();
+    rig.node.node_stage_volume(Request::new(req)).await.unwrap();
+    assert_eq!(control.last_unlock_key().as_deref(), Some("WATCHED-1"));
+    let unit = rig.engines.names(&refreshing).0;
+
+    // A handoff holds the gate; the Secret rotates meanwhile.
+    let held = rig.node.unit_gate(&unit).write_owned().await;
+    fake.set(Some(secret("WATCHED-2")));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        control.last_unlock_key().as_deref(),
+        Some("WATCHED-1"),
+        "not pushed into the handoff"
+    );
+    drop(held);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while control.last_unlock_key().as_deref() != Some("WATCHED-2") {
+        assert!(std::time::Instant::now() < deadline, "rotation not pushed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]

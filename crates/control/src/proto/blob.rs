@@ -311,7 +311,10 @@ impl JsonSchema for ByteBuf {
 }
 
 /// A secret string (passphrase, key material). Serializes as a plain
-/// string; `Debug` never shows it.
+/// string; `Debug` never shows it; its bytes are wiped when it is dropped
+/// (so are those of a message holding it, `UnlockCredentials` included).
+/// What the codec copies on the way — a JSON encoder's output, a decoder's
+/// scratch buffer for an escaped string — is the caller's to wipe.
 #[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
@@ -324,6 +327,12 @@ impl Secret {
     /// The secret. Named so that a grep for `expose` finds every use.
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
 

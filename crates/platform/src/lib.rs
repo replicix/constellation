@@ -112,7 +112,8 @@ pub use lock::{FileLock, LockGuard};
 pub use mounts::{MountEntry, MountOpts, MountTable, UnmountMode};
 pub use process::{Lineage, Process, ProcessFacts, TaskFacts, ThreadRef};
 pub use secrets::{
-    Credential, CredentialSource, EphemeralSecretStore, FileSecretStore, Secret, SecretStore,
+    core_dumps_forbidden, forbid_core_dumps, Credential, CredentialSource, EphemeralSecretStore,
+    FileSecretStore, Secret, SecretStore,
 };
 
 /// The rdev conversions at the Linux boundary (plan 31 §7): the portable

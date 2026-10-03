@@ -10,7 +10,8 @@
 //! the engine pod's hostPath unix socket can carry.
 
 use crate::control_client::{ControlClient, InMemoryControl, PoolRef};
-use crate::engine_pods::unit_name;
+use crate::credentials::{fingerprint, unlock_params, Secrets};
+use crate::engine_pods::{unit_name, unlock_target};
 use async_trait::async_trait;
 use constellation_control::proto::ControlError;
 use std::collections::BTreeMap;
@@ -39,18 +40,26 @@ pub trait NodeEngines: Send + Sync {
     /// is none (§7 "Creation"), once it is ready. `fs_uuid` is the
     /// filesystem the volume being staged names (the pod's
     /// `constellation.dev/fs-uuid` label; the caller still checks that the
-    /// pod serves it). `reads_secret`: the pod reads the unit's credentials
-    /// `Secret`, refreshed from `pool.secrets` when they are given.
+    /// pod serves it). `unlock`: the credentials to send a pod that waits
+    /// for them (`crate::credentials`) — sent once per incarnation, and
+    /// again when they differ from what it got (a rotation). Without them
+    /// a waiting pod is returned as it is, and answers
+    /// [`constellation_control::proto::AWAITING_UNLOCK`].
     async fn engine(
         &self,
         pool: &PoolRef,
         fs_uuid: &str,
-        reads_secret: bool,
+        unlock: Option<&Secrets>,
     ) -> Result<NodeEngine, ControlError>;
 
     /// The engine pod of `unit` when it is running and ready; `None` when
     /// it is not (gone, or not ready yet). Never creates one.
     async fn existing(&self, unit: &str) -> Result<Option<NodeEngine>, ControlError>;
+
+    /// Push `secrets` to the running pod of `unit` (a `refreshing` class's
+    /// rotation): `false` when there is no such pod, or it needs no
+    /// credentials. Never creates one.
+    async fn rotate(&self, unit: &str, secrets: &Secrets) -> Result<bool, ControlError>;
 
     /// Record how many staged volumes the pod of `unit` serves (§7's
     /// `last-view-count` annotation, and since when it has served none: the
@@ -146,6 +155,13 @@ struct FakeEngine {
     spec: String,
     /// Its replacement, waiting as a standby.
     standby: Option<Arc<InMemoryControl>>,
+    /// Started as `--await-unlock` (its class needs credentials), so every
+    /// new incarnation waits for an `fs.unlock` again.
+    awaits: bool,
+    /// The `--s3` URL its `fs.unlock` names.
+    target: String,
+    /// (incarnation, fingerprint) of the last unlock.
+    unlocked: Option<(u64, [u8; 32])>,
 }
 
 /// [`NodeEngines`] over [`InMemoryControl`]s, one per unit, serving the
@@ -254,10 +270,10 @@ impl InMemoryNodeEngines {
     /// can plant volumes in it.
     pub fn plant(&self, pool: &PoolRef, fs_uuid: &str) -> Arc<InMemoryControl> {
         let (unit, _) = self.names(pool);
-        self.get_or_start(&unit, fs_uuid)
+        self.get_or_start(&unit, pool, fs_uuid)
     }
 
-    fn get_or_start(&self, unit: &str, fs_uuid: &str) -> Arc<InMemoryControl> {
+    fn get_or_start(&self, unit: &str, pool: &PoolRef, fs_uuid: &str) -> Arc<InMemoryControl> {
         let mut engines = self.engines.lock().unwrap();
         let engine = engines.entry(unit.to_string()).or_insert_with(|| {
             self.created.fetch_add(1, Ordering::SeqCst);
@@ -265,14 +281,45 @@ impl InMemoryNodeEngines {
             if self.any_path {
                 control.accept_any_path();
             }
+            let awaits = pool.class.awaits_unlock();
+            if awaits {
+                control.gate();
+            }
             FakeEngine {
                 incarnation: self.next.fetch_add(1, Ordering::SeqCst),
                 control: Arc::new(control),
                 spec: self.desired.lock().unwrap().clone(),
                 standby: None,
+                awaits,
+                target: unlock_target(pool),
+                unlocked: None,
             }
         });
         engine.control.clone()
+    }
+
+    /// The fake's `fs.unlock` (the real one's rules: once per incarnation,
+    /// again for other credentials).
+    async fn unlock(&self, unit: &str, secrets: &Secrets) -> Result<bool, ControlError> {
+        let (control, params, key) = {
+            let engines = self.engines.lock().unwrap();
+            let Some(engine) = engines.get(unit).filter(|e| e.awaits) else {
+                return Ok(false);
+            };
+            let key = (engine.incarnation, fingerprint(secrets));
+            if engine.unlocked == Some(key) {
+                return Ok(true);
+            }
+            let Some(params) = unlock_params(&engine.target, secrets) else {
+                return Ok(false);
+            };
+            (engine.control.clone(), params, key)
+        };
+        control.fs_unlock(params).await?;
+        if let Some(engine) = self.engines.lock().unwrap().get_mut(unit) {
+            engine.unlocked = Some(key);
+        }
+        Ok(true)
     }
 
     /// The engine of `unit`, if one runs.
@@ -292,6 +339,10 @@ impl InMemoryNodeEngines {
         if let Some(engine) = engines.get_mut(unit) {
             engine.incarnation = self.next.fetch_add(1, Ordering::SeqCst);
             engine.control.drop_views();
+            if engine.awaits {
+                // A new process: an empty EphemeralSecretStore.
+                engine.control.gate();
+            }
         }
     }
 
@@ -329,11 +380,18 @@ impl NodeEngines for InMemoryNodeEngines {
         &self,
         pool: &PoolRef,
         fs_uuid: &str,
-        _reads_secret: bool,
+        unlock: Option<&Secrets>,
     ) -> Result<NodeEngine, ControlError> {
         let (unit, _) = self.names(pool);
-        self.get_or_start(&unit, fs_uuid);
+        self.get_or_start(&unit, pool, fs_uuid);
+        if let Some(secrets) = unlock {
+            self.unlock(&unit, secrets).await?;
+        }
         Ok(self.connect(&unit).expect("just started"))
+    }
+
+    async fn rotate(&self, unit: &str, secrets: &Secrets) -> Result<bool, ControlError> {
+        self.unlock(unit, secrets).await
     }
 
     async fn existing(&self, unit: &str) -> Result<Option<NodeEngine>, ControlError> {
@@ -377,6 +435,11 @@ impl NodeEngines for InMemoryNodeEngines {
             .get_mut(unit)
             .ok_or_else(|| ControlError::not_found(format!("no engine pod for {unit}")))?;
         let standby = Arc::new(InMemoryControl::standby_for(&engine.control));
+        if engine.awaits {
+            // `--await-unlock`: only the handoff's `Credentials` step
+            // unlocks it.
+            standby.gate();
+        }
         if let Some(why) = self.fail_resume.lock().unwrap().take() {
             standby.fail_resume(&why);
         }
@@ -435,6 +498,9 @@ impl NodeEngines for InMemoryNodeEngines {
                 engine.control = standby;
             }
             engine.control.drop_views();
+            if engine.awaits {
+                engine.control.gate();
+            }
             engine.incarnation = self.next.fetch_add(1, Ordering::SeqCst);
             engine.spec = desired;
         }

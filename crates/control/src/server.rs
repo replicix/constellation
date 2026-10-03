@@ -111,6 +111,11 @@ pub struct CallCtx {
     pub principal: Principal,
     /// The role that admitted them.
     pub role: Role,
+    /// The `kind = "service"` grant the caller matched on this socket, if
+    /// one did (whatever row gave the role): a handler that serves one
+    /// service only checks it here (`node.handoff`'s sender `Credentials`,
+    /// plan 37 §9), since the owner rule makes the daemon's own uid admin.
+    pub service: Option<crate::authz::ServiceMatch>,
     /// Cancelled by `Cancel{id}` or a dropped connection. Long handlers
     /// `select!` on `cancel.cancelled()`.
     pub cancel: CancellationToken,
@@ -130,6 +135,7 @@ impl CallCtx {
         CallCtx {
             principal,
             role,
+            service: None,
             cancel: CancellationToken::new(),
             call_id: 0,
             method: "",
@@ -200,6 +206,9 @@ pub struct Router {
     audit: Arc<dyn AuditSink>,
     features: Vec<String>,
     options: ServeOptions,
+    /// What a known method this router registers no handler for answers
+    /// (`None`: "not implemented by this daemon").
+    unregistered: Option<ControlError>,
 }
 
 impl Default for Router {
@@ -243,7 +252,17 @@ impl Router {
             audit: Arc::new(NullAuditSink),
             features: Vec::new(),
             options: ServeOptions::default(),
+            unregistered: None,
         }
+    }
+
+    /// Answer every known method this router has no handler for with
+    /// `error` instead of "not implemented" — a router that serves a few
+    /// methods *for now* (plan 37 K6a: an engine pod waiting for its
+    /// credentials says so, retryably, to whatever else arrives).
+    pub fn with_unregistered_error(mut self, error: ControlError) -> Router {
+        self.unregistered = Some(error);
+        self
     }
 
     pub fn with_policy(mut self, policy: Policy) -> Router {
@@ -444,6 +463,7 @@ impl Router {
                         min_role = %info.min_role,
                         matched = %r.matched,
                         service_label = r.service.as_ref().map(|s| s.label.as_str()),
+                        on_behalf_of = inv.on_behalf_of.as_deref(),
                         "resolved the role of a mutating call"
                     ),
                     None => tracing::debug!(
@@ -459,6 +479,7 @@ impl Router {
                     &info,
                     inv.encoding,
                     &inv.params,
+                    inv.on_behalf_of.clone(),
                 )
             }
             _ => AuditTicket::none(),
@@ -468,11 +489,24 @@ impl Router {
             Err(err)
         };
 
+        if let Some(who) = &inv.on_behalf_of {
+            if !crate::proto::valid_on_behalf_of(who) {
+                return reject(
+                    ticket,
+                    ControlError::invalid(format!(
+                        "on_behalf_of must be 1-{} bytes of [A-Za-z0-9._:/@-]",
+                        crate::proto::ON_BEHALF_OF_MAX
+                    )),
+                );
+            }
+        }
         let Some(role) = role else {
             return reject(ticket, no_role(&inv.principal));
         };
         let Some(entry) = entry else {
-            let err = if known.is_some() {
+            let err = if let (Some(_), Some(err)) = (known, &self.unregistered) {
+                err.clone()
+            } else if known.is_some() {
                 ControlError::unsupported(format!(
                     "{} is not implemented by this daemon",
                     inv.method
@@ -498,6 +532,7 @@ impl Router {
         let ctx = CallCtx {
             principal: inv.principal,
             role,
+            service: resolution.and_then(|r| r.service),
             cancel: inv.cancel,
             call_id: inv.call_id,
             method: entry.info.name,
@@ -524,6 +559,8 @@ pub(crate) struct Invocation {
     pub principal: Principal,
     pub method: String,
     pub params: Blob,
+    /// `Request::on_behalf_of` (validated in `start`).
+    pub on_behalf_of: Option<String>,
     pub cancel: CancellationToken,
     pub call_id: u64,
     pub fd: Option<OwnedFd>,
@@ -555,6 +592,7 @@ struct TicketInner {
     method: &'static str,
     encoding: Encoding,
     digest: String,
+    on_behalf_of: Option<String>,
 }
 
 impl AuditTicket {
@@ -569,7 +607,11 @@ impl AuditTicket {
         info: &MethodInfo,
         encoding: Encoding,
         params: &Blob,
+        on_behalf_of: Option<String>,
     ) -> AuditTicket {
+        // An attribution that fails validation is refused before the
+        // handler runs; the refusal's line must not carry it either.
+        let on_behalf_of = on_behalf_of.filter(|w| crate::proto::valid_on_behalf_of(w));
         let digest = if info.secret_params {
             WITHHELD_DIGEST.to_string()
         } else {
@@ -583,6 +625,7 @@ impl AuditTicket {
                 method: info.name,
                 encoding,
                 digest,
+                on_behalf_of,
             }),
         }
     }
@@ -601,6 +644,7 @@ impl AuditTicket {
                 encoding: t.encoding,
                 params_digest: t.digest,
                 outcome,
+                on_behalf_of: t.on_behalf_of,
             });
         }
     }
@@ -1069,6 +1113,7 @@ impl Call {
             principal,
             method: request.method,
             params: request.params,
+            on_behalf_of: request.on_behalf_of,
             cancel: token.clone(),
             call_id: id,
             fd,
@@ -1248,6 +1293,7 @@ pub async fn dispatch_in_process_with(
         principal: principal.clone(),
         method: method.to_string(),
         params: Blob::Json(params),
+        on_behalf_of: None,
         cancel: cancel.clone(),
         call_id: 0,
         fd: options.fd,
@@ -1287,6 +1333,7 @@ pub async fn dispatch_stream_in_process(
         principal: principal.clone(),
         method: method.to_string(),
         params: Blob::Json(params),
+        on_behalf_of: None,
         cancel: cancel.clone(),
         call_id: 0,
         fd: options.fd,

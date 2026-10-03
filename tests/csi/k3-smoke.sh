@@ -264,6 +264,14 @@ denied_create "an engine pod under another ServiceAccount" \
     'del(.spec.serviceAccount) | .spec.serviceAccountName = "constellation-csi-node"'
 denied_create "an engine pod with envFrom" \
     '.spec.containers[0].envFrom = [{secretRef: {name: "constellation-s3-creds"}}]'
+denied_create "an engine pod reading a Secret into its environment" \
+    '.spec.containers[0].env += [{name: "X", valueFrom: {secretKeyRef: {name: "constellation-s3-creds", key: "aws_access_key_id"}}}]'
+denied_create "an engine pod with an init container" \
+    '.spec.initContainers = [.spec.containers[0] | .name = "init" | del(.startupProbe, .readinessProbe, .livenessProbe)]'
+denied_create "an engine pod adding a capability" \
+    '.spec.containers[0].securityContext.capabilities.add = ["CHOWN"]'
+denied_create "an engine pod whose hostPath kubelet may create" \
+    '(.spec.volumes[] | select(.name == "sockets") | .hostPath.type) = "DirectoryOrCreate"'
 # exec has no RBAC grant at all, the policy refuses it besides.
 if as_w2 -n "$ns" exec "$e2" -c engine -- true >/dev/null 2>&1; then
     echo "allowed, but must not be: exec into an engine pod"

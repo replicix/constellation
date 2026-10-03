@@ -215,7 +215,8 @@ define_methods! {
     NodeHandoff { name: "node.handoff", role: Admin, mutating: true, stream: None,
         params: HandoffParams, result: HandoffReport,
         requires_fd: |p| matches!(p.target, HandoffTarget::Socket)
-            && matches!(p.phase, Some(HandoffPhase::Transfer | HandoffPhase::Receive)) }
+            && matches!(p.phase, Some(HandoffPhase::Transfer | HandoffPhase::Receive
+                | HandoffPhase::Credentials)) }
     /// Inject a host lifecycle event (plan 31 §10, C8): the engine applies
     /// it (a `Suspending` runs its whole sequence) before this answers.
     NodeLifecycle { name: "node.lifecycle", role: Admin, mutating: true, stream: None,
@@ -739,6 +740,7 @@ mod tests {
             (Some(HandoffPhase::Receive), true),
             (Some(HandoffPhase::Seal), false),
             (Some(HandoffPhase::Status), false),
+            (Some(HandoffPhase::Credentials), true),
         ] {
             let p = HandoffParams {
                 target: HandoffTarget::Socket,

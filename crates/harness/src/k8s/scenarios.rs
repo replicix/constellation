@@ -6,7 +6,10 @@
 //! unstaged.
 
 use super::remote::RemoteWorkload;
-use super::{data_dir, fs_uuid_of, EnginePod, Env, Scope};
+use super::{
+    data_dir, fs_uuid_of, rotating_key, rotating_secret, EnginePod, Env, Scope, ROTATING_SECRET,
+};
+use crate::docker::docker;
 use crate::model::{Model, Node};
 use crate::scenarios::eventually;
 use anyhow::{bail, ensure, Context, Result};
@@ -59,6 +62,18 @@ pub const K8S_SCENARIOS: &[K8sScenario] = &[
         desc: "clone and restore into the source's own pool bind and hold its data; the same clone and restore into another pool's StorageClass are refused (INVALID_ARGUMENT naming both filesystems) and stay Pending",
         workers: 2,
         run: csi_clone_cross_pool_refused,
+    },
+    K8sScenario {
+        name: "csi-secret-rotation",
+        desc: "a `refreshing` class's Secret rotated twice under a writing pod and a reader on the other worker: no remount, no engine restart, zero errors; every engine pod's S3 clients sign with the new pair (fs.list generations), each push is in its audit log under the node plugin's service principal, and no pod spec, environment or hostPath file holds a credential",
+        workers: 2,
+        run: csi_secret_rotation,
+    },
+    K8sScenario {
+        name: "csi-pod-security",
+        desc: "the privilege split of plan 37 §9, as PodSecurity admission judges it (server dry runs in a `restricted` namespace): controller and controller-owned engine pod admitted, node-owned engine pods refused for their hostPaths only, the node plugin refused as privileged",
+        workers: 1,
+        run: csi_pod_security,
     },
 ];
 
@@ -917,6 +932,582 @@ fn csi_clone_cross_pool_refused(env: &Env, seed: u64) -> Result<()> {
             why.chars().take(300).collect::<String>()
         );
     }
+    s.finish()
+}
+
+/// An engine pod's own filesystem entry in `fs.list`: (generation set by
+/// `fs.unlock`, generation its S3 clients last signed with).
+fn credential_generations(env: &Env, pod: &str) -> Result<(u64, u64)> {
+    let listing = env
+        .kube
+        .engine_call(&env.driver_ns, pod, "fs.list", serde_json::json!({}))?;
+    let own = listing["filesystems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|f| f["name"].is_null())
+        .with_context(|| format!("{pod} lists no filesystem of its own"))?;
+    Ok((
+        own["credentials_generation"].as_u64().unwrap_or(0),
+        own["credentials_in_use"].as_u64().unwrap_or(0),
+    ))
+}
+
+/// An engine pod's audit log (its state dir's `control-audit.jsonl`).
+fn audit_log(env: &Env, pod: &str) -> Result<Vec<serde_json::Value>> {
+    let out = env.kube.run(&[
+        "exec",
+        "-n",
+        &env.driver_ns,
+        pod,
+        "-c",
+        "engine",
+        "--",
+        "cat",
+        "/var/lib/constellation/state/control-audit.jsonl",
+    ])?;
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).context("parsing an audit line"))
+        .collect()
+}
+
+/// Whether `haystack` holds the rotating Secret's `generation`th pair —
+/// said without ever printing either value.
+fn holds_pair(haystack: &str, generation: u32) -> bool {
+    haystack.contains(&rotating_key(generation))
+        || haystack.contains(&format!("k8s-harness-rotation-secret-{generation}"))
+}
+
+/// Whether any file under the workers' hostRoot holds a key id or secret
+/// of the rotating Secret's `generations` (named, never printed).
+fn host_root_holds_no_pair(
+    workers: &[&String],
+    generations: std::ops::RangeInclusive<u32>,
+) -> Result<()> {
+    for w in workers {
+        for g in generations.clone() {
+            let found = docker(&[
+                "exec",
+                w,
+                "sh",
+                "-c",
+                &format!(
+                    "grep -rlF -e {} -e k8s-harness-rotation-secret-{g} /var/lib/constellation-csi \
+                     2>/dev/null | head -n 3; true",
+                    rotating_key(g)
+                ),
+            ])?;
+            ensure!(
+                found.trim().is_empty(),
+                "files under {w}'s hostRoot hold generation {g}'s key pair: {}",
+                found.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Core dumps are off (plan 37 K6a review) in every engine pod of
+/// `engines` and in both plugins: `RLIMIT_CORE` 0 for each one's PID 1,
+/// and the unprivileged ones are not dumpable (the kernel makes a
+/// non-dumpable process's `/proc` entries root's, as their own uid sees).
+fn no_core_dumps(env: &Env, engines: &[EnginePod]) -> Result<()> {
+    let ns = env.driver_ns.as_str();
+    let mut checked: Vec<(String, &str, bool)> = engines
+        .iter()
+        .map(|e| (e.name.clone(), "engine", true))
+        .collect();
+    for (component, unprivileged) in [("node", false), ("controller", true)] {
+        let pods = env.kube.run(&[
+            "get",
+            "pods",
+            "-n",
+            ns,
+            "-l",
+            &format!("app.kubernetes.io/component={component}"),
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ])?;
+        for pod in pods.split_whitespace() {
+            checked.push((pod.to_string(), "constellation-csi", unprivileged));
+        }
+    }
+    for (pod, container, unprivileged) in &checked {
+        let out = env.kube.run(&[
+            "exec",
+            "-n",
+            ns,
+            pod,
+            "-c",
+            container,
+            "--",
+            "sh",
+            "-c",
+            "grep '^Max core file size' /proc/1/limits; stat -c %u /proc/1/status",
+        ])?;
+        let mut lines = out.lines();
+        let limits: Vec<&str> = lines.next().unwrap_or("").split_whitespace().collect();
+        ensure!(
+            limits.get(4..6) == Some(&["0", "0"][..]),
+            "{pod}: core dumps are on ({limits:?})"
+        );
+        let owner = lines.next().unwrap_or("").trim();
+        ensure!(
+            !unprivileged || owner == "0",
+            "{pod}: its PID 1 is dumpable (/proc/1 owned by uid {owner})"
+        );
+    }
+    Ok(())
+}
+
+/// Plan 37 §12 / K6a: `Refreshing(callback)` — the Secret rotates under a
+/// writing pod and nothing is remounted.
+fn csi_secret_rotation(env: &Env, seed: u64) -> Result<()> {
+    let (w1, w2) = (&env.workers[0], &env.workers[1]);
+    let tag = format!("r{seed}");
+    let ns = env.driver_ns.as_str();
+    // Back to the first pair, whatever an earlier run on this cluster left.
+    env.kube.apply(&rotating_secret(ns, 1))?;
+    let mut s = Scope::with_class(
+        env,
+        "csi-secret-rotation",
+        ROTATING_SECRET,
+        &[
+            ("credentialSource", "refreshing".into()),
+            ("credentialSecretName", ROTATING_SECRET.into()),
+            ("credentialSecretNamespace", ns.into()),
+        ],
+    )?;
+    s.pvc("vol", "1Gi", true)?;
+    s.wait_bound(Duration::from_secs(300))?;
+    let handle = s.volume_handle("vol")?;
+    let fs = fs_uuid_of(&handle)?;
+    s.spawn_pod("writer", w1, &["vol"], Some(&writer_script("vol", &tag)))?;
+    s.wait_ready("writer", Duration::from_secs(300))?;
+    s.spawn_pod("reader", w2, &["vol"], Some(&reader_script("vol")))?;
+    s.wait_ready("reader", Duration::from_secs(300))?;
+    eventually("the writer under way", Duration::from_secs(60), || {
+        ensure!(
+            count(&s, "writer")? >= 20,
+            "writer not at 20 iterations yet"
+        );
+        Ok(())
+    })?;
+    let nodes = s.engine_pods(&fs, "node")?;
+    ensure!(
+        nodes.len() == 2,
+        "expected engine pods on {w1} and {w2}: {nodes:?}"
+    );
+    let ctl = s.engine_pods(&fs, "controller")?;
+    ensure!(
+        ctl.len() == 1,
+        "controller engine pods of the pool: {ctl:?}"
+    );
+    let engines: Vec<EnginePod> = nodes.iter().chain(ctl.iter()).cloned().collect();
+    let mounts_before = [
+        s.staging_mount_id(w1, &handle)?,
+        s.staging_mount_id(w2, &handle)?,
+    ];
+    ensure!(
+        mounts_before.iter().all(Option::is_some),
+        "the volume is not staged on both workers: {mounts_before:?}"
+    );
+    let mut generation: Vec<u64> = Vec::new();
+    for e in &engines {
+        let (set, used) = credential_generations(env, &e.name)?;
+        ensure!(set >= 1, "{} was never unlocked (generation {set})", e.name);
+        generation.push(set);
+        eprintln!("   {}: credentials generation {set}, in use {used}", e.name);
+    }
+
+    // §9: nothing outside the engines' memory holds a credential — not a
+    // pod spec, an environment, a log line, nor a file under hostRoot.
+    for e in &engines {
+        let spec = env
+            .kube
+            .run(&["get", "pod", "-n", ns, &e.name, "-o", "json"])?;
+        ensure!(
+            !holds_pair(&spec, 1),
+            "{}'s pod spec holds the key pair",
+            e.name
+        );
+        let log = env.kube.run(&["logs", "-n", ns, &e.name, "-c", "engine"])?;
+        ensure!(!holds_pair(&log, 1), "{}'s log holds the key pair", e.name);
+    }
+    // The engine processes' environments, read on the nodes as root: the
+    // engines are not dumpable, so not even their own uid may read them
+    // (`no_core_dumps`).
+    for w in [w1, w2] {
+        let environ = docker(&[
+            "exec",
+            w,
+            "sh",
+            "-c",
+            "for d in /proc/[0-9]*; do \
+               if tr '\\0' ' ' < $d/cmdline 2>/dev/null | grep -q '^/usr/local/bin/constellation serve '; \
+               then echo \"pid ${d#/proc/}\"; cat $d/environ; echo; fi; \
+             done",
+        ])?;
+        ensure!(
+            environ.contains("pid "),
+            "no engine process found on {w} to check its environment"
+        );
+        ensure!(
+            !holds_pair(&environ, 1),
+            "an engine process on {w} has the key pair in its environment"
+        );
+    }
+    host_root_holds_no_pair(&[w1, w2], 1..=1)?;
+    eprintln!("   no pod spec, environment, engine log or hostRoot file holds the key pair");
+    no_core_dumps(env, &engines)?;
+    eprintln!("   core dumps are off in every engine pod and both plugins");
+
+    for round in 2..=3u32 {
+        let at = count(&s, "writer")?;
+        env.kube.apply(&rotating_secret(ns, round))?;
+        let want: Vec<u64> = generation.iter().map(|g| g + 1).collect();
+        eventually(
+            &format!("rotation {round} reached every engine pod's S3 clients"),
+            Duration::from_secs(180),
+            || {
+                for (e, want) in engines.iter().zip(&want) {
+                    let (set, used) = credential_generations(env, &e.name)?;
+                    ensure!(
+                        set == *want && used == set,
+                        "{}: generation {set} (want {want}), in use {used}",
+                        e.name
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        generation = want;
+        eventually("the writer going on", Duration::from_secs(60), || {
+            ensure!(count(&s, "writer")? >= at + 10, "writer stalled");
+            Ok(())
+        })?;
+        eprintln!(
+            "   rotation {round}: every engine signs with it (generations {generation:?}); writer at {}",
+            count(&s, "writer")?
+        );
+    }
+
+    // The pushes, in each node engine's audit log: `fs.unlock`, granted
+    // to the node plugin's service principal; and the stage's `view.mount`
+    // under the same principal, attributed to the PV.
+    let pv = s.kube().run(&[
+        "get",
+        "pvc",
+        "-n",
+        &s.ns,
+        "vol",
+        "-o",
+        "jsonpath={.spec.volumeName}",
+    ])?;
+    let pv = pv.trim().to_string();
+    for e in &nodes {
+        let lines = audit_log(env, &e.name)?;
+        let service = |r: &serde_json::Value| {
+            r["principal"]["kind"] == "service"
+                && r["principal"]["uid"] == 0
+                && r["principal"]["label"] == "csi-node-plugin"
+        };
+        let unlocks: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|r| r["method"] == "fs.unlock" && r["outcome"] == "ok")
+            .collect();
+        ensure!(
+            unlocks.len() >= 3 && unlocks.iter().all(|r| service(r)),
+            "{}: {} successful fs.unlock lines (want the start and two rotations), all by \
+             the csi-node-plugin service principal: {unlocks:?}",
+            e.name,
+            unlocks.len()
+        );
+        // The watch's pushes name the Secret they came from.
+        let from_secret = format!("secret:{ns}/{ROTATING_SECRET}");
+        ensure!(
+            unlocks
+                .iter()
+                .filter(|r| r["on_behalf_of"] == from_secret.as_str())
+                .count()
+                >= 2,
+            "{}: fewer than two fs.unlock lines on behalf of {from_secret}: {unlocks:?}",
+            e.name
+        );
+        ensure!(
+            unlocks
+                .iter()
+                .all(|r| r["params_digest"] == "withheld:secret-params"),
+            "{}: an fs.unlock line carries a params digest",
+            e.name
+        );
+        ensure!(
+            lines.iter().any(|r| r["method"] == "view.mount"
+                && service(r)
+                && r["on_behalf_of"] == pv.as_str()),
+            "{}: no view.mount line by the csi-node-plugin service principal naming {pv}",
+            e.name
+        );
+        let raw = serde_json::to_string(&lines)?;
+        ensure!(
+            !(1..=3).any(|g| holds_pair(&raw, g)),
+            "{}'s audit log holds a credential",
+            e.name
+        );
+        eprintln!(
+            "   {}: audit log has {} fs.unlock by the csi-node-plugin service principal, view.mount for {pv}",
+            e.name,
+            unlocks.len()
+        );
+    }
+
+    // The controller-owned engine pod: its relay is the csi-controller
+    // service (the image's allowlist), for the pushes and for the CSI
+    // calls, which name the PV.
+    for e in &ctl {
+        let lines = audit_log(env, &e.name)?;
+        let service = |r: &serde_json::Value| {
+            r["principal"]["kind"] == "service"
+                && r["principal"]["uid"] == 65532
+                && r["principal"]["label"] == "csi-controller"
+        };
+        ensure!(
+            !lines.is_empty() && lines.iter().all(service),
+            "{}: an audit line not by the csi-controller service principal: {lines:?}",
+            e.name
+        );
+        ensure!(
+            lines
+                .iter()
+                .any(|r| r["method"] != "fs.unlock" && r["on_behalf_of"] == pv.as_str()),
+            "{}: no CSI call attributed to {pv}: {lines:?}",
+            e.name
+        );
+        let unlocks = lines
+            .iter()
+            .filter(|r| r["method"] == "fs.unlock" && r["outcome"] == "ok")
+            .count();
+        ensure!(
+            unlocks >= 3,
+            "{}: {unlocks} successful fs.unlock lines (want the start and two rotations)",
+            e.name
+        );
+        let raw = serde_json::to_string(&lines)?;
+        ensure!(
+            !(1..=3).any(|g| holds_pair(&raw, g)),
+            "{}'s audit log holds a credential",
+            e.name
+        );
+        eprintln!(
+            "   {}: {} audit lines, all by the csi-controller service principal; {unlocks} fs.unlock",
+            e.name,
+            lines.len()
+        );
+    }
+    // No pair of any generation on either worker's hostRoot.
+    host_root_holds_no_pair(&[w1, w2], 1..=3)?;
+
+    // Nor did a plugin log one, whatever it pushed.
+    for component in ["node", "controller"] {
+        let logs = env.kube.run(&[
+            "logs",
+            "-n",
+            ns,
+            "-l",
+            &format!("app.kubernetes.io/component={component}"),
+            "-c",
+            "constellation-csi",
+            "--tail=-1",
+        ])?;
+        ensure!(
+            !(1..=3).any(|g| holds_pair(&logs, g)),
+            "a {component} plugin's log holds a credential"
+        );
+    }
+
+    // The controller provisions with the rotated pair.
+    s.pvc("after", "64Mi", true)?;
+    s.wait_bound(Duration::from_secs(300))?;
+
+    for pod in ["writer", "reader"] {
+        s.exec(pod, "touch /tmp/stop")?;
+    }
+    let mut n = 0;
+    eventually("the writer stopped", Duration::from_secs(60), || {
+        n = s.exec("writer", "cat /tmp/final")?.trim().parse()?;
+        Ok(())
+    })?;
+    for pod in ["writer", "reader"] {
+        let errors = s.exec(pod, "cat /tmp/errors 2>/dev/null || true")?;
+        ensure!(
+            errors.trim().is_empty(),
+            "{pod} saw I/O errors across the rotations:\n{errors}"
+        );
+    }
+    let model = writer_model(&tag, n);
+    verify(&s, "writer", "vol", &model)?;
+    converge(&s, "reader", "vol", &model)?;
+    // No remount: the same staging mounts, the same engine incarnations.
+    let mounts_after = [
+        s.staging_mount_id(w1, &handle)?,
+        s.staging_mount_id(w2, &handle)?,
+    ];
+    ensure!(
+        mounts_before == mounts_after,
+        "the staging mounts changed: {mounts_before:?} -> {mounts_after:?}"
+    );
+    let key = |v: &[EnginePod]| -> Vec<(String, String, u64)> {
+        let mut k: Vec<_> = v
+            .iter()
+            .map(|p| (p.name.clone(), p.uid.clone(), p.restarts))
+            .collect();
+        k.sort();
+        k
+    };
+    let after: Vec<EnginePod> = s
+        .engine_pods(&fs, "node")?
+        .into_iter()
+        .chain(s.engine_pods(&fs, "controller")?)
+        .collect();
+    ensure!(
+        key(&engines) == key(&after),
+        "engine pods changed across the rotations: {engines:?} -> {after:?}"
+    );
+    eprintln!("   {n} iterations, zero errors; same staging mounts and engine incarnations");
+    s.finish()
+}
+
+/// What PodSecurity `restricted` says of `pod` (its spec, re-created by a
+/// server dry run in `ns`, a namespace that enforces `restricted`):
+/// `None` when admitted, else the violations.
+fn psa_violations(env: &Env, ns: &str, pod: &serde_json::Value) -> Result<Option<String>> {
+    let mut clone = pod.clone();
+    let name = pod["metadata"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    clone["metadata"] = serde_json::json!({"name": name, "namespace": ns});
+    clone["status"] = serde_json::Value::Null;
+    if let Some(spec) = clone["spec"].as_object_mut() {
+        // Not PodSecurity's business, and not present in that namespace.
+        spec.remove("serviceAccountName");
+        spec.remove("serviceAccount");
+        spec.remove("nodeName");
+        spec.remove("priorityClassName");
+        spec.remove("priority");
+    }
+    match env.kube.run_stdin(
+        &["create", "--dry-run=server", "-f", "-"],
+        clone.to_string().as_bytes(),
+        Duration::from_secs(60),
+    ) {
+        Ok(_) => Ok(None),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            match msg.split_once("violates PodSecurity") {
+                Some((_, v)) => Ok(Some(v.trim().to_string())),
+                None => bail!("dry run of {name} failed, but not for PodSecurity: {msg}"),
+            }
+        }
+    }
+}
+
+/// Plan 37 §9 / K6 gate: the privilege split, as admission judges it.
+fn csi_pod_security(env: &Env, _seed: u64) -> Result<()> {
+    let w1 = &env.workers[0];
+    let mut s = Scope::new(env, "csi-pod-security")?;
+    s.pvc("vol", "64Mi", true)?;
+    s.wait_bound(Duration::from_secs(300))?;
+    s.pod("p", w1, &["vol"])?;
+    let fs = fs_uuid_of(&s.volume_handle("vol")?)?;
+    let node_engine = s.engine_pods(&fs, "node")?;
+    let ctl_engine = s.engine_pods(&fs, "controller")?;
+    ensure!(
+        node_engine.len() == 1 && ctl_engine.len() == 1,
+        "engine pods: {node_engine:?} {ctl_engine:?}"
+    );
+    let probe_ns = format!("k8s-psa-{}", env.run_id);
+    env.kube.apply(&serde_json::json!({
+        "apiVersion": "v1", "kind": "Namespace",
+        "metadata": {"name": probe_ns, "labels": {
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest",
+        }}
+    }))?;
+    let judged = (|| -> Result<()> {
+        // Admission resolves the default ServiceAccount before PodSecurity
+        // sees the pod: wait for the namespace to have one.
+        eventually(
+            "the probe namespace's default ServiceAccount",
+            Duration::from_secs(60),
+            || {
+                env.kube
+                    .run(&["get", "serviceaccount", "default", "-n", &probe_ns])
+                    .map(drop)
+            },
+        )?;
+        let pods = env.kube.get(&["pods", "-n", &env.driver_ns])?;
+        let mut seen = BTreeSet::new();
+        for pod in pods["items"].as_array().into_iter().flatten() {
+            if !pod["metadata"]["deletionTimestamp"].is_null() {
+                continue;
+            }
+            let name = pod["metadata"]["name"].as_str().unwrap_or_default();
+            let labels = &pod["metadata"]["labels"];
+            let role = match (
+                labels["app.kubernetes.io/component"].as_str(),
+                labels["constellation.dev/owner"].as_str(),
+            ) {
+                (Some("controller"), _) => "controller",
+                (Some("node"), _) => "node plugin",
+                (Some("engine"), Some("controller")) => "controller-owned engine",
+                (Some("engine"), Some("node")) => "node-owned engine",
+                _ => continue,
+            };
+            let verdict = psa_violations(env, &probe_ns, pod)?;
+            eprintln!(
+                "   {role:<24} {name}: {}",
+                verdict.as_deref().unwrap_or("admitted under restricted")
+            );
+            match role {
+                "controller" | "controller-owned engine" => ensure!(
+                    verdict.is_none(),
+                    "{role} pod {name} is not PodSecurity-restricted: {verdict:?}"
+                ),
+                "node-owned engine" => {
+                    let v = verdict.clone().unwrap_or_default();
+                    // Its only violation: the hostPaths §7 needs
+                    // ("restricted volume types (… hostPath)"; the message
+                    // names every violated check).
+                    ensure!(
+                        v.contains("restricted volume types")
+                            && v.contains("\"hostPath\"")
+                            && !v.contains("privileged")
+                            && !v.contains("host namespaces")
+                            && !v.contains("hostPort")
+                            && !v.contains("runAsUser")
+                            && !v.contains("allowPrivilegeEscalation")
+                            && !v.contains("unrestricted capabilities")
+                            && !v.contains("runAsNonRoot")
+                            && !v.contains("seccompProfile"),
+                        "node-owned engine pod {name}: want only its hostPath volumes refused, got {v:?}"
+                    );
+                }
+                _ => ensure!(
+                    verdict.as_deref().is_some_and(|v| v.contains("privileged")),
+                    "the node plugin {name} should be privileged: {verdict:?}"
+                ),
+            }
+            seen.insert(role);
+        }
+        ensure!(seen.len() == 4, "did not judge every role (saw {seen:?})");
+        Ok(())
+    })();
+    let _ = env
+        .kube
+        .run(&["delete", "namespace", &probe_ns, "--wait=false"]);
+    judged?;
     s.finish()
 }
 

@@ -24,6 +24,7 @@ mod cluster_restart;
 /// Plan 31 §6.12: subtree confinement through the kernel.
 mod confinement;
 mod coop_churn;
+mod credrot;
 mod ec2;
 /// Plan 39: `fsync` under S3 outages (hard, soft, interrupted) and
 /// `fsyncdir`.
@@ -358,6 +359,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: gc_lifecycle,
+    },
+    Scenario {
+        name: "csi-credential-revocation",
+        desc: "plan 37 K6a: a serve --await-unlock engine on a signature-checking versitygw rotated from account A to B with A then revoked, under a writer: zero errors; rotations to the revoked or a wrong pair refused, the pair in use kept; a fresh engine reads every file back",
+        requires: &[],
+        caps: &[],
+        run: credrot::csi_credential_revocation,
     },
     Scenario {
         name: "snapacct",

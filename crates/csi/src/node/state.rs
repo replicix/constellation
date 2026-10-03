@@ -28,7 +28,7 @@ use std::sync::Mutex;
 
 /// The record format; bump on any change (no migration of old records:
 /// an unreadable record is skipped, see the module docs).
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// One staged volume (module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,9 +45,6 @@ pub struct VolumeRecord {
     /// was staged (lossy UTF-8), the baseline `NodeGetVolumeHealth`
     /// compares against (plan 37 §11 "VolumeCondition").
     pub xattrs: BTreeMap<String, String>,
-    /// Whether the engine pod reads a credentials `Secret`, so a restage
-    /// without the request's secrets brings it up the same way.
-    pub reads_secret: bool,
     /// The volume context it was staged with (the pool's location; the
     /// sidecars put no secret there), for a restage from a request that
     /// lacks it.
@@ -67,7 +64,6 @@ impl VolumeRecord {
             fs_uuid: String::new(),
             subtree: String::new(),
             xattrs: BTreeMap::new(),
-            reads_secret: false,
             context: BTreeMap::new(),
             published: BTreeSet::new(),
         }

@@ -19,14 +19,25 @@
 //! reading. Blocking I/O on a blocking socket: both ends run it on a
 //! thread of their own.
 //!
+//! A [`HandoffPhase::Credentials`] stream is one frame of the same header
+//! with no descriptor at all, and no end mark: the engine's `fs.unlock`
+//! credentials (the daemon's JSON, opaque here too), or a zero length when
+//! it holds none ([`write_secret`], [`read_secret`]). The bytes are wiped
+//! once read or written; nothing here logs them.
+//!
 //! [`HandoffPhase::Transfer`]: crate::proto::types::HandoffPhase::Transfer
 //! [`HandoffPhase::Receive`]: crate::proto::types::HandoffPhase::Receive
+//! [`HandoffPhase::Credentials`]: crate::proto::types::HandoffPhase::Credentials
 
 use crate::transport::unix::{recv_with_fds, send_with_fds};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use zeroize::Zeroizing;
+
+/// The largest credentials frame accepted.
+pub const MAX_SECRET: usize = 64 * 1024;
 
 /// The largest record accepted (a view's handle table, in JSON).
 pub const MAX_RECORD: usize = 256 * 1024 * 1024;
@@ -99,6 +110,59 @@ pub fn read_record(sock: &mut UnixStream) -> io::Result<Option<(Vec<u8>, OwnedFd
     Ok(Some((record, fd)))
 }
 
+/// Write a credentials frame: `secret`, or a zero length for none.
+pub fn write_secret(sock: &mut UnixStream, secret: Option<&[u8]>) -> io::Result<()> {
+    let secret = secret.unwrap_or_default();
+    if secret.len() > MAX_SECRET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a credentials frame is at most {MAX_SECRET} bytes"),
+        ));
+    }
+    let mut frame = Zeroizing::new(Vec::with_capacity(4 + secret.len()));
+    frame.extend_from_slice(&(secret.len() as u32).to_be_bytes());
+    frame.extend_from_slice(secret);
+    sock.write_all(&frame)?;
+    sock.flush()
+}
+
+/// Read a credentials frame: `None` for a zero length. A descriptor with
+/// it, or a frame cut short, is an error.
+pub fn read_secret(sock: &mut UnixStream) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+    let mut header = [0u8; 4];
+    let mut fds = VecDeque::new();
+    let mut got = 0;
+    while got < header.len() {
+        let n = recv_with_fds(sock.as_fd().as_raw_fd(), &mut header[got..], &mut fds)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the credentials stream ended without its frame",
+            ));
+        }
+        got += n;
+    }
+    if !fds.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a descriptor arrived with the credentials frame",
+        ));
+    }
+    let len = u32::from_be_bytes(header) as usize;
+    if len == 0 {
+        return Ok(None);
+    }
+    if len > MAX_SECRET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a {len}-byte credentials frame (at most {MAX_SECRET})"),
+        ));
+    }
+    let mut secret = Zeroizing::new(vec![0u8; len]);
+    sock.read_exact(&mut secret)?;
+    Ok(Some(secret))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +207,22 @@ mod tests {
         assert!(read_record(&mut b).unwrap().is_some());
         let err = read_record(&mut b).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_credentials_frame_crosses_and_none_is_a_zero_length() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        write_secret(&mut a, Some(b"{\"k\":1}")).unwrap();
+        assert_eq!(
+            read_secret(&mut b).unwrap().unwrap().as_slice(),
+            b"{\"k\":1}"
+        );
+        write_secret(&mut a, None).unwrap();
+        assert!(read_secret(&mut b).unwrap().is_none());
+        drop(a);
+        assert_eq!(
+            read_secret(&mut b).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 }

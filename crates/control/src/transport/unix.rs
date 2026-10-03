@@ -383,6 +383,8 @@ pub(crate) fn recv_with_fds(
 pub struct UnixSocketListener {
     listener: UnixListener,
     path: PathBuf,
+    /// Remove the socket file on drop (the default).
+    unlink: bool,
 }
 
 impl UnixSocketListener {
@@ -449,6 +451,7 @@ impl UnixSocketListener {
         Ok(UnixSocketListener {
             listener,
             path: path.to_path_buf(),
+            unlink: true,
         })
     }
 
@@ -464,7 +467,17 @@ impl UnixSocketListener {
         Ok(UnixSocketListener {
             listener: UnixListener::from_std(listener)?,
             path: path.to_path_buf(),
+            unlink: true,
         })
+    }
+
+    /// Leave the socket file in place when this drops: another descriptor
+    /// of the same listening socket ([`Self::try_clone_std`]) serves on
+    /// (plan 37 K6a: `serve --await-unlock` answers on a clone until the
+    /// engine starts, then hands the original to the daemon).
+    pub fn keep_path_on_drop(mut self) -> UnixSocketListener {
+        self.unlink = false;
+        self
     }
 
     /// A second descriptor for the same listening socket (to hand on across
@@ -492,7 +505,9 @@ impl Listener for UnixSocketListener {
 
 impl Drop for UnixSocketListener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.unlink {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

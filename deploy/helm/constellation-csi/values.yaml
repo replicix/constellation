@@ -81,18 +81,30 @@ engineProfile:
     limits: {memory: 2Gi}
 
 # StorageClasses to create with the chart (plan 37 §6). Each entry is a
-# name, the class parameters, and the optional standard fields. The
-# Secret named by the csi.storage.k8s.io/provisioner-secret-* parameters
-# holds aws_access_key_id / aws_secret_access_key (and e2e_passphrase for
-# an e2e pool); omit those parameters for credentialSource:
-# aws-default-chain (IRSA / EKS Pod Identity on the engine pods).
+# name, the class parameters, and the optional standard fields.
+#
+# Credentials (plan 37 §9, `credentialSource`): whatever the source, they
+# reach an engine pod only as `fs.unlock` over its control socket — never
+# in its pod spec, its environment, its image or a hostPath file.
+# - `static-ephemeral` (default): the Secret named by the
+#   csi.storage.k8s.io/{provisioner,node-stage,controller-expand}-secret-*
+#   parameters holds aws_access_key_id / aws_secret_access_key (and
+#   e2e_passphrase for an e2e pool); the sidecars and kubelet resolve it
+#   per request. A changed Secret reaches running engine pods with the
+#   next request that carries it.
+# - `refreshing`: as static-ephemeral, plus `credentialSecretName` /
+#   `credentialSecretNamespace` naming the same Secret, which the plugins
+#   watch and push to running engine pods on every change (rotation with
+#   no remount). List that Secret under credentials.watchedSecrets below.
+# - `aws-default-chain`: no secret parameters; the engine pods' own
+#   ServiceAccount (IRSA / EKS Pod Identity). An e2e class still needs
+#   node-stage/provisioner secrets carrying e2e_passphrase.
 #
 # The provisioner secret must live in the driver's namespace (this
 # release's): external-provisioner reads it with the controller's
 # ServiceAccount, which may read Secrets only here (plan 37 §9), so a
 # class naming a secret in another namespace (`tenant-a`, or
-# `${pvc.namespace}`) fails CreateVolume with `forbidden`. Cross-namespace
-# secrets come with 37-k6a's scoped rule.
+# `${pvc.namespace}`) fails CreateVolume with `forbidden`.
 #
 # storageClasses:
 #   - name: constellation-rwx
@@ -103,8 +115,15 @@ engineProfile:
 #       # region: us-west-2
 #       layout: pool
 #       shards: "1"
+#       credentialSource: refreshing
+#       credentialSecretName: constellation-s3-creds
+#       credentialSecretNamespace: constellation-csi
 #       csi.storage.k8s.io/provisioner-secret-name: constellation-s3-creds
 #       csi.storage.k8s.io/provisioner-secret-namespace: constellation-csi
+#       csi.storage.k8s.io/node-stage-secret-name: constellation-s3-creds
+#       csi.storage.k8s.io/node-stage-secret-namespace: constellation-csi
+#       csi.storage.k8s.io/node-publish-secret-name: constellation-s3-creds
+#       csi.storage.k8s.io/node-publish-secret-namespace: constellation-csi
 #       csi.storage.k8s.io/controller-expand-secret-name: constellation-s3-creds
 #       csi.storage.k8s.io/controller-expand-secret-namespace: constellation-csi
 #     reclaimPolicy: Delete
@@ -115,15 +134,35 @@ storageClasses: []
 # VolumeSnapshotClasses to create with the chart (plan 37 §6; needs the
 # snapshot CRDs, see sidecars.snapshotter). A snapshot is a held
 # Constellation snapshot of the volume's subtree, taken through the pool's
-# engine pod, which already has the pool's credentials: no secret is
-# needed. A clone or restore (a PVC with a dataSource) must use a
-# StorageClass of the source's own pool (plan 37 settled decision 8).
+# engine pod, which the controller has usually unlocked already. Name the
+# pool's Secret as the snapshotter secret anyway: a controller that
+# restarted since, facing an engine pod waiting for its credentials, unlocks
+# it from the request (plan 37 §9). A clone or restore (a PVC with a
+# dataSource) must use a StorageClass of the source's own pool (plan 37
+# settled decision 8).
 #
 # volumeSnapshotClasses:
 #   - name: constellation-snapshots
 #     deletionPolicy: Delete
-#     parameters: {}
+#     parameters:
+#       csi.storage.k8s.io/snapshotter-secret-name: constellation-s3-creds
+#       csi.storage.k8s.io/snapshotter-secret-namespace: constellation-csi
 volumeSnapshotClasses: []
+
+# The engine pods' ServiceAccount (`constellation-csi-engine`, bound to no
+# Role, no token mounted). For `credentialSource: aws-default-chain` give it
+# IRSA's annotation (`eks.amazonaws.com/role-arn: arn:aws:iam::…:role/…`), or
+# an EKS Pod Identity association: the EKS webhook then projects a token into
+# every engine pod, which the pod-access policies admit (and nothing else).
+engineServiceAccount:
+  annotations: {}
+
+credentials:
+  # The Secrets `credentialSource: refreshing` classes watch, as
+  # {namespace, name}: both plugins may get/list/watch exactly these
+  # (templates/rbac.yaml), nothing else.
+  #   - {namespace: constellation-csi, name: constellation-s3-creds}
+  watchedSecrets: []
 
 # Purge worker (controller; K4).
 purge:

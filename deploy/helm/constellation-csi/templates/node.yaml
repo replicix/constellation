@@ -5,7 +5,12 @@
 # through their hostPath control sockets under hostRoot; it runs as uid 0,
 # which the service grant it writes into each pod's root-owned
 # <hostRoot>/policy/<unit>/ admits (crates/csi/src/engine_pods.rs,
-# NodeEnginePods). It holds no permission on Secrets.
+# NodeEnginePods). It holds no permission on Secrets but get/list/watch on
+# the ones credentials.watchedSecrets names (`refreshing` classes); the
+# credentials it hands an engine pod travel only as `fs.unlock` over that
+# socket. It also makes each engine pod's state and socket directories,
+# owned by the engine's uid, before creating the pod (no root init
+# container in an engine pod).
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:

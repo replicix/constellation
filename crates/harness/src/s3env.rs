@@ -468,6 +468,113 @@ impl Drop for ChildGuard {
     }
 }
 
+/// A native versitygw of one scenario's own, with its internal IAM
+/// (`--iam-dir`, cache off, so a deleted user is refused at once): the S3
+/// server that checks every signature, for proving that a revoked key pair
+/// is refused (plan 37 K6a `csi-credential-revocation`). The root account
+/// is the harness's fixed pair ([`crate::s3auth`]); [`BUCKET`] exists.
+pub struct Versitygw {
+    /// Where the S3 API answers (`http://127.0.0.1:<port>`).
+    pub endpoint: String,
+    bin: PathBuf,
+    _proc: ChildGuard,
+    _dir: tempfile::TempDir,
+}
+
+impl Versitygw {
+    /// Whether the binary is there (`$CONSTELLATION_VERSITYGW_BIN`,
+    /// `PATH`, `~/.local/bin`): why not, if it is not.
+    pub fn missing() -> Option<String> {
+        find_bin("CONSTELLATION_VERSITYGW_BIN", "versitygw")
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    pub fn start() -> Result<Versitygw> {
+        let bin = find_bin("CONSTELLATION_VERSITYGW_BIN", "versitygw")?;
+        let dir = tempfile::Builder::new()
+            .prefix("constellation-harness-vgw-")
+            .tempdir()
+            .context("creating the versitygw temp dir")?;
+        let (data, iam) = (dir.path().join("data"), dir.path().join("iam"));
+        std::fs::create_dir(&data)?;
+        std::fs::create_dir(&iam)?;
+        let port = free_ports(1)?[0];
+        let mut proc = ChildGuard::spawn(
+            "versitygw",
+            Command::new(&bin)
+                .args(["--access", crate::s3auth::ACCESS_KEY])
+                .args(["--secret", crate::s3auth::SECRET_KEY])
+                .args(["--region", crate::s3auth::REGION])
+                .args(["--port", &format!("127.0.0.1:{port}")])
+                .arg("--iam-dir")
+                .arg(&iam)
+                .arg("--iam-cache-disable")
+                .arg("--quiet")
+                .arg("posix")
+                .arg(&data),
+            &dir.path().join("versitygw.log"),
+        )?;
+        let endpoint = format!("http://127.0.0.1:{port}");
+        wait_for("versitygw", 60, &mut proc, || {
+            crate::s3auth::signed("GET", &format!("{endpoint}/"))
+                .call()
+                .is_ok()
+        })?;
+        create_bucket(&endpoint, BUCKET, true)?;
+        Ok(Versitygw {
+            endpoint,
+            bin,
+            _proc: proc,
+            _dir: dir,
+        })
+    }
+
+    fn admin(&self, args: &[&str]) -> Result<()> {
+        let out = Command::new(&self.bin)
+            .arg("admin")
+            .args(["--access", crate::s3auth::ACCESS_KEY])
+            .args(["--secret", crate::s3auth::SECRET_KEY])
+            .args(["--region", crate::s3auth::REGION])
+            .args(["--endpoint-url", &self.endpoint])
+            .args(args)
+            .output()
+            .context("running versitygw admin")?;
+        // Its output names the user's key id, never the secret; neither is
+        // printed here.
+        ensure_ok(&out, args.first().copied().unwrap_or("admin"))
+    }
+
+    /// An account with access to every bucket (role `admin`).
+    pub fn create_user(&self, access: &str, secret: &str) -> Result<()> {
+        self.admin(&[
+            "create-user",
+            "--access",
+            access,
+            "--secret",
+            secret,
+            "--role",
+            "admin",
+        ])
+    }
+
+    /// Revoke `access`: S3 refuses its signature from the next request on.
+    pub fn delete_user(&self, access: &str) -> Result<()> {
+        self.admin(&["delete-user", "--access", access])
+    }
+}
+
+fn ensure_ok(out: &std::process::Output, what: &str) -> Result<()> {
+    if !out.status.success() {
+        bail!(
+            "versitygw admin {what} failed ({}): {} bytes of stderr withheld",
+            out.status,
+            out.stderr.len()
+        );
+    }
+    Ok(())
+}
+
 /// Poll `ready` until it holds, failing early (with the process's log) if the
 /// process exits first.
 fn wait_for(

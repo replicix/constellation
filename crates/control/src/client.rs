@@ -88,6 +88,24 @@ const CHUNK_BUFFER: usize = 64;
 /// Events buffered per subscription before the subscriber is cut off.
 const EVENT_BUFFER: usize = 1024;
 
+tokio::task_local! {
+    static ON_BEHALF_OF: String;
+}
+
+/// Run `f` with every call it makes, on any [`Client`], carrying
+/// `who` as [`Request::on_behalf_of`] (plan 37 K6a: the CSI driver wraps
+/// each RPC in the PersistentVolume it is about, so every audit line the
+/// engine writes for it names the volume). Calls made from tasks `f`
+/// spawns are not covered: a task-local does not cross `spawn`.
+pub async fn on_behalf_of<F: std::future::Future>(who: impl Into<String>, f: F) -> F::Output {
+    ON_BEHALF_OF.scope(who.into(), f).await
+}
+
+/// The attribution [`on_behalf_of`] set for the current task, if any.
+pub fn current_on_behalf_of() -> Option<String> {
+    ON_BEHALF_OF.try_with(Clone::clone).ok()
+}
+
 /// How to introduce yourself.
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
@@ -579,6 +597,7 @@ impl Client {
             id: guard.id,
             method: method.to_string(),
             params,
+            on_behalf_of: current_on_behalf_of(),
         };
         let payload = self.encoding().to_bytes(&request);
         let sent = match payload {

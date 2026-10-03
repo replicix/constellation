@@ -26,6 +26,8 @@ thiserror.workspace = true
 blake3.workspace = true
 toml.workspace = true
 schemars = { version = "1", features = ["derive"] }
+# A handed-over engine's credentials, wiped once relayed (`handoff_wire`).
+zeroize = "1.9.0"
 axum = { version = "0.8", optional = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }

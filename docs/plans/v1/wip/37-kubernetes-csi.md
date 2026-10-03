@@ -1311,6 +1311,127 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
     accepting a mid-session credential swap (this is a plan 31 engine
     capability — `fs.unlock` is defined to be re-callable, not
     mount-time-only) rather than requiring a remount.
+  *As built (37-k6a):* the StorageClass values are `static-ephemeral`
+  (default), `refreshing` and `aws-default-chain` (`crates/csi/src/params.rs`,
+  `CredentialMode`). **Nothing reaches an engine pod but `fs.unlock`**: K2's
+  per-pool credentials `Secret` read through `secretKeyRef` env vars is gone
+  (and with it the controller's Secret create/patch). An engine pod of a
+  class that needs credentials runs `constellation serve --await-unlock`
+  (`crates/cli/src/serve.rs`): its control socket is bound before the daemon
+  starts and answers only `node.ping` (so the readiness probe passes) and
+  `fs.unlock` naming its `--s3` URL — everything else is `Unavailable`,
+  `constellation_control::proto::AWAITING_UNLOCK` — under the daemon's own
+  allowlist and audit log; the credentials are checked against the bucket
+  (a wrong pair is an `fs.unlock` error and the gate keeps waiting), then
+  the node starts on `CredentialSource::Static(EphemeralSecretStore)` with
+  the same listening socket handed over (clients wait in its backlog), and
+  only then is that `fs.unlock` answered. The plugins send it over a
+  connection of its own once per pod incarnation (pod uid + container id)
+  and again whenever the credentials they hold differ (a rotation, in place:
+  `EphemeralSecretStore::replace` bumps one generation, and the engine's S3
+  credential provider re-resolves on its next request,
+  `engine::backend::SourceCredentials`). `Refreshing(callback)` is the
+  plugins' Secret watch (`crate::credentials::Refresher`: list + watch with
+  a `metadata.name` field selector, re-listed with backoff), whose callback
+  is that `fs.unlock` — the engine side is the static store rotated in
+  place, not a closure in the engine. `credentialSecretName`/
+  `credentialSecretNamespace` name the watched Secret, because neither
+  `CreateVolume` nor `NodeStageVolume` carries the `*-secret-name` the
+  sidecars resolved. The plugins keep the last credentials per engine pod in
+  memory only, so a crashed engine's restage from a `NodePublishVolume`
+  still unlocks its replacement; a node plugin restarted since then can for
+  a `static-ephemeral` class only when the class names
+  `node-publish-secret-name` (the restage passes the publish secret),
+  otherwise the restage fails `UNAVAILABLE` saying so. The node plugin
+  forgets a unit's credentials (and stops its watch) once no volume of it
+  is staged on the node. *37-k6a review round:* a rotation is tried before
+  it is used — the running engine reads `meta.json` signed with the new
+  pair and refuses the `fs.unlock` (`Denied`, the old pair stays) when S3
+  refuses it; the gate also checks an E2E passphrase against the keyring
+  and keeps waiting on a wrong one; `SIGTERM`/`SIGINT` end a waiting gate
+  with status 0 (an engine is its container's PID 1); every S3 client's
+  HTTP connector cuts error bodies down to their `<Code>`
+  (`store_s3::aws_auth::RedactingConnector`: S3 auth errors echo the key id
+  and string to sign into object_store's error text); the engine and both
+  plugins run with core dumps off. Rotation pushes from the watch carry
+  `on_behalf_of: secret:<ns>/<name>` and are retried with backoff while the
+  engine is starting or cannot ask S3. `harness run
+  csi-credential-revocation` proves a revoked pair is refused on versitygw
+  (which validates signatures). `fs.list` reports the daemon's own
+  `credentials_generation` and `credentials_in_use` (the generation its S3
+  clients last signed with), which is how `csi-secret-rotation` proves a
+  rotation reached the S3 clients against a floci that accepts any key.
+  `aws-default-chain` pods do not wait (unless E2E, for the passphrase); the
+  pod-access policies admit the EKS IRSA / Pod Identity projected token, and
+  `engineServiceAccount.annotations` carries IRSA's role annotation.
+  *With K5a's handoff (37-k6a merge round):* a replacement engine pod
+  (§8) runs `--await-unlock` like its predecessor, so it must get the
+  credentials too, without a Secret or an env var. Two ways were weighed:
+  the node plugin pushing `fs.unlock` to the standby before `Receive`, or
+  the old engine handing them over itself. The plugin cannot be relied on:
+  it holds a `static-ephemeral` class's secret in memory only, and the
+  chart upgrade that rolls the engine pods restarts the plugin first — the
+  very handoff that needs the secret runs in a plugin that forgot it. So the
+  old engine hands them over: a new `node.handoff{Socket}` phase,
+  `Credentials`, runs **before `Prepare`** (no session is stopped yet, so it
+  is outside the client-visible pause and a failure rolls back trivially).
+  The sender writes the credentials `fs.unlock` gave it — the very store
+  its static source signs from, so a rotation since is included, as one
+  generation — as one frame onto a socketpair
+  (`handoff_wire::write_secret`); the plugin relays the frame unread to the
+  standby's own `Credentials` (zeroized once written — the frame buffers,
+  the sender's encoding buffer, and every `proto::Secret`, so
+  `UnlockCredentials` too, on drop; only a JSON decoder's scratch buffer
+  for an escaped string is not; nothing logs it, and
+  a malformed frame's parse error is never echoed); the standby checks the
+  pair against the bucket as the gate checks an `fs.unlock` (a refused pair
+  fails the step), pre-opens its backend with them (an `--await-unlock`
+  standby pre-opens nothing before), refuses `Receive` until it has them,
+  starts its engine on them and keeps them for its own successor (an
+  engine on its environment's keys keeps only an unlocked passphrase there,
+  and a later passphrase-only `fs.unlock` updates it). It is
+  `node.handoff` on the same sockets that already hand over the
+  `/dev/fuse` descriptors, but admin is not enough for the sender's
+  `Credentials`: the caller must have matched the `kind = "service"` grant
+  labelled `csi-node-plugin` (`CallCtx::service`), never the owner rule —
+  anybody with `pods/exec` on an engine pod runs as its uid, which is
+  admin, and `fs.unlock` is otherwise write-only — and a handoff must be
+  pending: a standby waits on the state dir (`handoff.standby`, written for
+  the life of its wait) and nothing is committed. A standby gets
+  `forbid_core_dumps` as the gate does. **Signals:** both waits install the
+  same `SIGTERM`/`SIGINT` handling before any socket exists (the gate's, and
+  the standby's — which had none: as its container's PID 1 it ignored
+  them). A standby honours one at once only before `Seal` (exit 0, as an
+  `Abort`): the plugin sends `Commit` right after `Seal` answers without
+  asking whether the standby lives, so a sealed standby that exited before
+  the marker appeared could leave no process holding the sessions. Once
+  sealed it notes the signal and keeps waiting — past the seal's deadline
+  with no marker it exits (the sender's own deadline is earlier, so it
+  serves its copies again); once the marker is there it adopts, serves, and
+  passes the signal to the node (`NodeRuntime::deliver_signal`, after the
+  views are resumed, so §7 defers a `SIGTERM` while they are mounted). The
+  handlers themselves are handed to the node (`NodeConfig::signals`)
+  rather than replaced, so a signal between the wait's end and the node's
+  start is not lost either. **Lock order** (node plugin): a unit's gate (K5a; shared by every
+  RPC, held alone by a handoff) → the unit's bring-up lock (`NodeEngines`)
+  → the unit's credential lock (`NodeService::unit_locks`, a plain mutex
+  never held across an `await`). A `refreshing` class's rotation push now
+  takes the unit gate shared, so a rotation arriving mid-handoff waits and
+  lands on the pod that serves afterwards instead of on the retiring one
+  (after the `Credentials` step it would have been lost with it). An
+  engine pod still waiting for `fs.unlock` serves no view, so a rollout
+  retires it rather than handing it over. Proof: csi
+  `node::tests::a_restarted_plugin_hands_over_an_engine_it_holds_no_credentials_for`,
+  `a_rotation_waits_for_a_running_handoff`,
+  `node::handoff::tests::an_awaiting_standby_*`; cli
+  `handoff_socket::tests::only_the_node_plugin_takes_credentials_for_a_pending_handoff`,
+  `serve` tests `a_serving_engines_credentials_go_to_the_node_plugin_only`,
+  `a_passphrase_rotation_reaches_the_handoff`; root `serve` tests
+  `an_unlocked_engines_standby_gets_its_credentials_over_the_handoff`,
+  `an_awaiting_standby_stops_on_a_signal_before_any_commit`,
+  `a_signal_between_seal_and_commit_loses_no_session`,
+  `a_signalled_sealed_standby_exits_at_its_deadline_without_a_commit`; on kind,
+  `tests/csi/k5-handoff.sh` (a `static-ephemeral` class).
 - **Service principal identity.** The CSI node plugin is a *service
   principal* under plan 33's `control-acl.toml` (a targeted addition to
   U1's grant `kind`s — `unix_group`/`unix_user`/`windows_sid`/`device`,
@@ -1349,6 +1470,20 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   would only add configuration surface without a real isolation boundary
   (both already have to be trusted with full filesystem read/write to do
   their jobs).
+  *As built (37-k6a):* the grant stays `admin` (the k3a correction above:
+  `fs.unlock` is admin-only too). Every control call a CSI RPC makes carries
+  the PersistentVolume it is about as `Request.on_behalf_of` (a task-local,
+  `constellation_control::client::on_behalf_of`), which the engine records
+  in the audit line next to the principal (`on_behalf_of`, validated to a
+  short token, never read by authorization); `csi-secret-rotation` reads a
+  node engine pod's `control-audit.jsonl` and asserts its `fs.unlock` and
+  `view.mount` lines carry `{"kind":"service","uid":0,…,"label":"csi-node-plugin"}`
+  and the PV. The controller-owned pod has its grant too (37-k6a review):
+  one `kind = "service"` row for uid 65532 (the relay runs as the engine's
+  uid) on its socket, label `csi-controller`, baked into the image
+  (`deploy/docker/controller-engine-control-allow.toml`) and named by
+  `CONSTELLATION_CONTROL_POLICY`; `csi-secret-rotation` asserts that
+  principal in the controller-owned pod's audit log.
 - **RBAC (Kubernetes).** Standard CSI sidecar `ClusterRole`s
   (`external-provisioner`, `external-resizer`, `external-snapshotter`
   upstream-recommended rules, unmodified) plus a `constellation-csi`-specific
@@ -1368,6 +1503,13 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   token's `authentication.kubernetes.io/node-name`, and no subresource is
   allowed. Created pods are held to exactly the shape the plugin builds
   (`deploy/helm/constellation-csi/templates/exec-policy.yaml`).
+  *As built (37-k6a):* the controller keeps `secrets` get only (what
+  external-provisioner/-resizer read); `credentials.watchedSecrets` grants
+  both plugins `get`/`list`/`watch` on exactly the named Secrets of
+  `refreshing` classes (`resourceNames`; the watch's field selector is what
+  RBAC authorizes against the name). Verified on kind: `can-i get
+  secret/<watched>` → yes, `can-i get|list|create|patch secrets` → no for the
+  node ServiceAccount.
 - **PodSecurity.** The node plugin's namespace runs at PodSecurity
   `privileged` (it must — `fuse_mount_fd`, bind mounts and `Bidirectional`
   mount propagation are all denied under `restricted`/`baseline`); engine
@@ -1384,6 +1526,25 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   kubelet-created, root-owned `DirectoryOrCreate` hostPaths to the engine's
   uid 65532 — admitted only because the namespace is `privileged`; the
   engine container itself stays non-root with no capabilities.
+  *As built (37-k6a):* the init container is gone from both roles. The
+  controller-owned pod's state dir and socket are `emptyDir`s (no hostPath:
+  it never serves a view and is reached by exec relay), so it is
+  PodSecurity-`restricted` as a whole; the node plugin makes a node-owned
+  pod's `<hostRoot>/{node-identity,sockets}/<unit>` itself, owned by 65532,
+  mode 0700, through `O_NOFOLLOW` descriptors under root-owned parents
+  (`engine_pods::prepare_unit_dirs`), and the pod mounts them `type:
+  Directory`. Both roles' containers carry `restricted`'s rules (non-root,
+  `drop: [ALL]`, no escalation, read-only root, `RuntimeDefault` seccomp);
+  the policies now refuse an init container, any added capability, any
+  `valueFrom` env, a writable root and a hostPath kubelet would create. The
+  namespace stays one `privileged` namespace: a node-owned engine pod's
+  hostPaths are refused by every level below `privileged`, so a separate
+  namespace would not make it `restricted`. `harness k8s-scenario
+  csi-pod-security` re-creates every driver pod by server dry run in a
+  `restricted` namespace: controller and controller-owned engine pod
+  admitted, node-owned engine pod refused for "restricted volume types
+  (hostPath)" only, node plugin refused as privileged. The split is in
+  `deploy/helm/constellation-csi/README.md`.
 - **The controller ServiceAccount is root-equivalent unless admission holds
   it (37-k2b).** K2 grants it `pods` create/patch/delete and `pods/exec`
   create/get in the driver namespace — the engine-pod lifecycle and the
@@ -1423,6 +1584,8 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   node-root. Moving engine pods to their own `restricted`-capable namespace
   would remove the init container's need for `privileged` too; that is
   K6a's to weigh.
+  *Weighed in 37-k6a:* not moved — see the PodSecurity note above; the
+  init container is gone without it.
 - **Which pods are privileged, summarized**: node plugin — yes
   (`CAP_SYS_ADMIN` via `privileged: true`, `Bidirectional` mount
   propagation). Controller — no. Engine pods, node-owned and
@@ -2388,6 +2551,11 @@ What §8 became against real engine pods, where it had to differ:
   until the unit's next stage or unstage. Before collecting an engine pod
   that the annotation (with `idle-since`) shows idle, the GC re-checks
   the pod with `view.list` and keeps it if it serves any view.
+- **K6b: registry churn of rescheduled controller-owned engine pods
+  (37-k6a review).** The controller-owned engine pod keeps its state on
+  `emptyDir`, so every reschedule rejoins the cluster as a fresh node and
+  leaves a dead node record in the registry. K6b's GC/purge should expire
+  those records (or give the pod a stable identity) so they do not pile up.
 - **Gate:** CONVENTIONS gates; the secret-rotation and node-drain
   `k8s-scenario`s pass; the "trash purge under load" `k8s-scenario`
   (§"Testing") passes, including the large-many-small-files trashed volume

@@ -3751,6 +3751,18 @@ pub enum HandoffPhase {
     Seal,
     /// Receiver: where the adoption stands ([`HandoffReport::state`]).
     Status,
+    /// Either side, before `Prepare` (37-k6a): the credentials an engine
+    /// pod got through `fs.unlock` (plan 37 §9) cross to its standby, which
+    /// has no other way to get them — nothing is in its pod spec or
+    /// environment, and the node plugin may have restarted since it last
+    /// held them. The sender writes them as one frame onto the unix stream
+    /// socket attached to the request (`crate::handoff_wire::write_secret`;
+    /// an empty frame when it holds none), the receiver reads that frame
+    /// from the socket attached to its own request, checks the credentials
+    /// against the bucket and pre-opens its backend with them. Nothing
+    /// pauses: no session stops for it. A standby started `--await-unlock`
+    /// refuses `Receive` until it has them.
+    Credentials,
 }
 
 /// `node.handoff` (plan 31 §6.11). With [`HandoffTarget::Socket`] every
@@ -3900,6 +3912,13 @@ pub struct FsInfo {
     /// Whether this daemon has the credentials to open it (`fs.unlock`).
     #[serde(default)]
     pub unlocked: bool,
+    /// The daemon's own filesystem only (0 elsewhere): how many times
+    /// `fs.unlock` has set the S3 credentials its engine signs with (0:
+    /// it signs with the environment's AWS chain), and the newest of those
+    /// generations a signed S3 request has used. The two are equal once a
+    /// rotation has reached the running S3 clients (plan 37 K6a).
+    pub credentials_generation: u64,
+    pub credentials_in_use: u64,
 }
 
 /// `fs.list`'s result.

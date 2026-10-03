@@ -136,6 +136,15 @@ pub trait ControlHost: Send + Sync + 'static {
     /// Where an in-place upgrade stands.
     fn handover_status(&self) -> HandoverStatus;
 
+    /// The store a handoff hands this engine's `fs.unlock` credentials over
+    /// from (`constellation serve --await-unlock`; plan 37 §9), when it is
+    /// not the engine's own static source: an engine on its environment's
+    /// keys keeps only an unlocked E2E passphrase there. `fs.unlock` keeps
+    /// it current.
+    fn handoff_secrets(&self) -> Option<constellation_platform::EphemeralSecretStore> {
+        None
+    }
+
     /// Plan 38 §5: the process-wide FUSE counters —
     /// [`api::FuseStatus::transport_fallbacks`] and
     /// [`api::FuseStatus::zero_copy_reads_total`]; `mounts` is ignored
@@ -145,11 +154,13 @@ pub trait ControlHost: Send + Sync + 'static {
         api::FuseStatus::default()
     }
 
-    /// `node.handoff`.
+    /// `node.handoff`. `service`: the `kind = "service"` grant the caller
+    /// matched ([`constellation_control::CallCtx::service`]).
     fn handoff(
         &self,
         params: &HandoffParams,
         fd: Option<OwnedFd>,
+        service: Option<&constellation_control::authz::ServiceMatch>,
     ) -> Result<HandoffReport, ControlError>;
 }
 
@@ -199,6 +210,11 @@ pub struct EngineControl {
     browse: Mutex<Option<Arc<View>>>,
     /// `fs.unlock`'s credentials, by the name (or uuid) they were given for.
     pub(crate) unlocked: Mutex<HashMap<String, Arc<constellation_platform::CredentialSource>>>,
+    /// `fs.unlock` arrival order: each call takes a ticket (`.0`) when it
+    /// arrives and, after its trial read, applies only if no later arrival
+    /// has applied already (`.1`), so the last push wins however the
+    /// trial reads interleave.
+    pub(crate) unlock_order: (std::sync::atomic::AtomicU64, Mutex<u64>),
     pub(crate) events: streams::EventBus,
 }
 
@@ -254,6 +270,7 @@ impl EngineControl {
             log_buffer,
             browse: Mutex::new(None),
             unlocked: Mutex::new(HashMap::new()),
+            unlock_order: Default::default(),
             events: streams::EventBus::new(),
         })
     }
@@ -519,6 +536,8 @@ pub(crate) struct Call {
     /// need more than the method's minimum role checks it itself
     /// (`snapshot.hold`'s `force`).
     role: constellation_control::authz::Role,
+    /// [`constellation_control::CallCtx::service`].
+    service: Option<constellation_control::authz::ServiceMatch>,
     fd: Option<OwnedFd>,
 }
 
@@ -533,6 +552,7 @@ fn unary<M: Method>(router: &mut Router, svc: &Arc<EngineControl>, body: Body<M>
         let call = Call {
             principal: ctx.principal.clone(),
             role: ctx.role,
+            service: ctx.service.take(),
             fd: ctx.take_fd(),
         };
         async move { blocking(move || body(&svc, call, params)).await }
@@ -561,7 +581,9 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     streams::register_logs_tail(r, svc);
     unary::<NodeDoctor>(r, svc, |s, _, _| s.doctor().map_err(failed));
     unary::<NodeOps>(r, svc, |s, _, p| s.node_ops(&p));
-    unary::<NodeHandoff>(r, svc, |s, call, p| s.host.handoff(&p, call.fd));
+    unary::<NodeHandoff>(r, svc, |s, call, p| {
+        s.host.handoff(&p, call.fd, call.service.as_ref())
+    });
     unary::<NodeLifecycle>(r, svc, |s, _, p| s.lifecycle(&p));
 
     // ---- pin / designation ----
@@ -858,5 +880,11 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
             async move { svc.fs_doctor(p.fs).await }
         });
     }
-    unary::<FsUnlock>(r, svc, |s, _, p| s.fs_unlock(p).map(Ack::new));
+    {
+        let svc = svc.clone();
+        r.register::<FsUnlock, _, _>(move |_c, p| {
+            let svc = svc.clone();
+            async move { svc.fs_unlock(p).await.map(Ack::new) }
+        });
+    }
 }

@@ -45,7 +45,7 @@ pub fn control_call_at(
 }
 
 /// The runtime every control call of the (synchronous) harness runs on.
-fn control_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn control_runtime() -> &'static tokio::runtime::Runtime {
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

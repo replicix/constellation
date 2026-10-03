@@ -133,12 +133,13 @@ impl RolloutState {
 /// as serving: never retire what cannot be asked).
 async fn serves_views(engines: &dyn NodeEngines, unit: &str) -> bool {
     match engines.existing(unit).await {
-        Ok(Some(engine)) => engine
-            .client
-            .view_list(Default::default())
-            .await
-            .map(|listing| !listing.views.is_empty())
-            .unwrap_or(true),
+        Ok(Some(engine)) => match engine.client.view_list(Default::default()).await {
+            Ok(listing) => !listing.views.is_empty(),
+            // Still waiting for its credentials (37-k6a): it serves
+            // nothing yet.
+            Err(e) if crate::credentials::is_awaiting_unlock(&e) => false,
+            Err(_) => true,
+        },
         Ok(None) => false,
         Err(_) => true,
     }

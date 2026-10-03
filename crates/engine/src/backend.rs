@@ -118,15 +118,21 @@ pub async fn open_backend_described_with(
 }
 
 /// An engine's `CredentialSource` as object_store's credential provider:
-/// resolved on first use and again once what it gave expires.
+/// resolved on first use, again once what it gave expires, and again when
+/// the source changed under it — a static source's generation moves with
+/// every `fs.unlock` rotation (plan 37 K6a), so the next request signs
+/// with the new keys and no client is rebuilt. Each answer records its
+/// generation as the one in use (`CredentialSource::note_in_use`), which
+/// is what `fs.list` reports as the rotation the S3 clients have taken.
 struct SourceCredentials {
     source: Arc<constellation_platform::CredentialSource>,
-    cached: tokio::sync::Mutex<
-        Option<(
-            Arc<object_store::aws::AwsCredential>,
-            Option<std::time::SystemTime>,
-        )>,
-    >,
+    cached: tokio::sync::Mutex<Option<CachedCredential>>,
+}
+
+struct CachedCredential {
+    credential: Arc<object_store::aws::AwsCredential>,
+    expiry: Option<std::time::SystemTime>,
+    generation: u64,
 }
 
 impl std::fmt::Debug for SourceCredentials {
@@ -142,23 +148,27 @@ impl object_store::CredentialProvider for SourceCredentials {
     async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
         let mut cached = self.cached.lock().await;
         let now = std::time::SystemTime::now();
-        if let Some((credential, expiry)) = cached.as_ref() {
+        if let Some(c) = cached.as_ref() {
             // Re-asked two minutes early, as the SDK adapter does.
-            if expiry.is_none_or(|at| now + std::time::Duration::from_secs(120) < at) {
-                return Ok(credential.clone());
+            let fresh = c
+                .expiry
+                .is_none_or(|at| now + std::time::Duration::from_secs(120) < at);
+            if fresh && c.generation == self.source.generation() {
+                self.source.note_in_use(c.generation);
+                return Ok(c.credential.clone());
             }
         }
-        let resolved = self
-            .source
-            .resolve()
-            .map_err(|e| object_store::Error::Generic {
-                store: "S3",
-                source: Box::new(e),
-            })?
-            .ok_or_else(|| object_store::Error::Generic {
-                store: "S3",
-                source: "the credential source defers to the AWS chain".into(),
-            })?;
+        let (generation, resolved) =
+            self.source
+                .resolve_generation()
+                .map_err(|e| object_store::Error::Generic {
+                    store: "S3",
+                    source: Box::new(e),
+                })?;
+        let resolved = resolved.ok_or_else(|| object_store::Error::Generic {
+            store: "S3",
+            source: "the credential source defers to the AWS chain".into(),
+        })?;
         let credential = Arc::new(object_store::aws::AwsCredential {
             key_id: resolved.access_key_id.clone(),
             secret_key: String::from_utf8_lossy(resolved.secret_access_key.expose()).into_owned(),
@@ -167,7 +177,12 @@ impl object_store::CredentialProvider for SourceCredentials {
                 .as_ref()
                 .map(|t| String::from_utf8_lossy(t.expose()).into_owned()),
         });
-        *cached = Some((credential.clone(), resolved.expiry));
+        *cached = Some(CachedCredential {
+            credential: credential.clone(),
+            expiry: resolved.expiry,
+            generation,
+        });
+        self.source.note_in_use(generation);
         Ok(credential)
     }
 }
@@ -461,6 +476,45 @@ mod tests {
             source: "404".into(),
         }));
         assert!(last_s3_completion_ms() > 0);
+    }
+
+    /// Plan 37 K6a: an `fs.unlock` rotation reaches the next signed
+    /// request through the same provider (no client rebuilt), the old key
+    /// is never handed out again, and the generation in use follows.
+    #[tokio::test]
+    async fn a_rotated_static_source_signs_the_next_request_with_the_new_key() {
+        use constellation_platform::{CredentialSource, EphemeralSecretStore};
+        use object_store::CredentialProvider;
+        let store = EphemeralSecretStore::new();
+        let pair = |id: &[u8], secret: &[u8]| {
+            store
+                .replace(&[
+                    (CredentialSource::ACCESS_KEY_ID, Some(id)),
+                    (CredentialSource::SECRET_ACCESS_KEY, Some(secret)),
+                ])
+                .unwrap()
+        };
+        pair(b"KEY-A", b"secret-a");
+        let source = Arc::new(CredentialSource::Static(store.clone()));
+        let provider = SourceCredentials {
+            source: source.clone(),
+            cached: tokio::sync::Mutex::new(None),
+        };
+        for _ in 0..3 {
+            assert_eq!(provider.get_credential().await.unwrap().key_id, "KEY-A");
+        }
+        assert_eq!(store.in_use_generation(), 1);
+        pair(b"KEY-B", b"secret-b");
+        assert_eq!(store.in_use_generation(), 1, "nothing signed since");
+        let next = provider.get_credential().await.unwrap();
+        assert_eq!(
+            (next.key_id.as_str(), next.secret_key.as_str()),
+            ("KEY-B", "secret-b")
+        );
+        assert_eq!(store.in_use_generation(), 2);
+        for _ in 0..3 {
+            assert_eq!(provider.get_credential().await.unwrap().key_id, "KEY-B");
+        }
     }
 
     #[tokio::test]

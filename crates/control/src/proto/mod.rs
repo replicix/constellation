@@ -21,8 +21,10 @@
 //!
 //! - **No protocol version.** The handshake negotiates the *encoding* and
 //!   *features* only (§9.3): there is one control protocol and no
-//!   compatibility mode. Additive change happens through new methods, new
-//!   `#[serde(default)]` fields and new `features` strings.
+//!   compatibility mode. Additive change happens through new methods and
+//!   new `features` strings; a changed envelope or params type (the postcard
+//!   encoding is positional, and nothing defaults) takes a new build on both
+//!   peers.
 //! - **Hello and Welcome are always JSON**, so an unknown or future peer
 //!   can be spoken to before anything is agreed. The server picks the
 //!   *client's first* encoding that it supports ([`negotiate`]).
@@ -148,6 +150,32 @@ pub struct Request {
     pub id: u64,
     pub method: String,
     pub params: Blob,
+    /// Whom the caller acts for, as the caller says (plan 37 K6a: the CSI
+    /// driver names the PersistentVolume a call is about). Recorded in the
+    /// audit line next to the principal, which stays the only identity
+    /// authorization looks at: this is attribution a trusted service adds,
+    /// never a credential. At most [`ON_BEHALF_OF_MAX`] bytes of
+    /// `[A-Za-z0-9._:/@-]`; anything else is refused `Invalid`.
+    pub on_behalf_of: Option<String>,
+}
+
+/// The message (`Unavailable`) of every call but `node.ping`/`fs.unlock`
+/// to an engine that waits for its credentials (`constellation serve
+/// --await-unlock`, plan 37 K6a), so a client can tell "unlock me first"
+/// from an engine that is down.
+pub const AWAITING_UNLOCK: &str = "this engine is waiting for fs.unlock to supply its credentials";
+
+/// The longest [`Request::on_behalf_of`] a server accepts.
+pub const ON_BEHALF_OF_MAX: usize = 253;
+
+/// Whether `s` is an acceptable [`Request::on_behalf_of`]: short, and
+/// nothing that could forge or break an audit or log line.
+pub fn valid_on_behalf_of(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= ON_BEHALF_OF_MAX
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'@' | b'-')
+        })
 }
 
 /// The outcome half of a [`Response`].
@@ -238,15 +266,17 @@ mod tests {
             id: 7,
             method: "pin.add".into(),
             params: Blob::Json(serde_json::json!({"path": "/a"})),
+            on_behalf_of: None,
         };
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
-            r#"{"id":7,"method":"pin.add","params":{"path":"/a"}}"#
+            r#"{"id":7,"method":"pin.add","params":{"path":"/a"},"on_behalf_of":null}"#
         );
         let req = Request {
             id: 7,
             method: "pin.add".into(),
             params: Blob::encode(Encoding::Postcard, &Empty {}).unwrap(),
+            on_behalf_of: None,
         };
         let bytes = Encoding::Postcard.to_bytes(&req).unwrap();
         assert_eq!(

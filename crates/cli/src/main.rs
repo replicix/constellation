@@ -296,6 +296,12 @@ enum Command {
         /// handed over and it has exited.
         #[arg(long)]
         handoff_socket: Option<PathBuf>,
+        /// Take the S3 credentials (and an E2E passphrase) from the first
+        /// `fs.unlock` on the control socket, never from the environment:
+        /// until then the socket answers only `node.ping` and `fs.unlock`
+        /// (a Kubernetes engine pod, plan 37 §9).
+        #[arg(long)]
+        await_unlock: bool,
     },
     /// (internal) Relay stdin/stdout to a control socket, so a caller with
     /// only an exec stream into this host (the CSI controller, plan 37)
@@ -1319,6 +1325,7 @@ fn main() -> Result<()> {
         cache_size,
         write_mode,
         handoff_socket,
+        await_unlock,
     } = cli.command
     {
         return serve::cmd_serve(
@@ -1334,6 +1341,7 @@ fn main() -> Result<()> {
                 cache_size,
                 write_mode,
                 handoff_socket,
+                await_unlock,
             },
             log_buffer,
         );
@@ -2964,6 +2972,7 @@ fn cmd_mount_body(
                     fuse_transport,
                     control_socket: None,
                     persistent: false,
+                    signals: None,
                 },
                 handle,
             ) {
@@ -4239,6 +4248,7 @@ mod umount_tests {
                 fuse_transport: Default::default(),
                 control_socket: None,
                 persistent: false,
+                signals: None,
             },
             rt.handle().clone(),
         )

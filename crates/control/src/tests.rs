@@ -759,6 +759,7 @@ async fn reusing_an_in_flight_request_id_is_rejected() {
             id,
             method: "quota.get".into(),
             params: Blob::Json(json!({})),
+            on_behalf_of: None,
         };
         Frame::new(FrameKind::Request, Encoding::Json.to_bytes(&r).unwrap())
     };
@@ -796,6 +797,7 @@ async fn request_id_zero_is_reserved() {
         id: 0,
         method: "node.ping".into(),
         params: Blob::Json(json!({})),
+        on_behalf_of: None,
     };
     client_end
         .send_frame(Frame::new(
@@ -837,6 +839,7 @@ async fn cancel_racing_completion_yields_exactly_one_response_per_call() {
                     id,
                     method: "pin.add".into(),
                     params: Blob::encode(enc, &PathParams { path: "/r".into() }).unwrap(),
+                    on_behalf_of: None,
                 };
                 t.send_frame(Frame::new(FrameKind::Request, enc.to_bytes(&r).unwrap()))
                     .await
@@ -892,6 +895,7 @@ async fn cancel_racing_completion_yields_exactly_one_response_per_call() {
             id,
             method: method.into(),
             params: params.unwrap(),
+            on_behalf_of: None,
         };
         client_end
             .send_frame(Frame::new(FrameKind::Request, enc.to_bytes(&r).unwrap()))
@@ -1416,6 +1420,7 @@ async fn chunk_frames_have_seq_and_a_single_last() {
         id: 9,
         method: "browse.read".into(),
         params: Blob::Json(json!({"path": "/big"})),
+        on_behalf_of: None,
     };
     client_end
         .send_frame(Frame::new(
@@ -1474,6 +1479,7 @@ async fn event_frames_use_the_request_id_and_cancel_ends_them() {
         id: 4,
         method: "events.subscribe".into(),
         params: Blob::Json(json!({})),
+        on_behalf_of: None,
     };
     client_end
         .send_frame(Frame::new(
@@ -1654,6 +1660,76 @@ async fn a_real_socket_peer_is_identified_by_its_credentials() {
 // ---------------------------------------------------------------------------
 // Audit
 // ---------------------------------------------------------------------------
+
+/// Plan 37 K6a: a call made under `client::on_behalf_of` carries the
+/// attribution to the audit line (both encodings, and only the calls in
+/// scope); one that could forge a log line is refused, and audited
+/// without it.
+#[tokio::test]
+async fn on_behalf_of_reaches_the_audit_line_and_is_validated() {
+    for options in [ClientOptions::default(), ClientOptions::postcard()] {
+        let probes = Probes::default();
+        let audit = Arc::new(MemoryAuditSink::new());
+        let router = test_router(&probes)
+            .with_policy(Policy::owner_only(1000))
+            .with_audit(audit.clone());
+        let client = Client::in_process_as(router, unix_principal(1000, &[1000]), options)
+            .await
+            .unwrap();
+        let add = || client.call::<PinAdd>(PathParams { path: "/r".into() });
+        crate::client::on_behalf_of("pvc-1a2b", async {
+            assert_eq!(
+                crate::client::current_on_behalf_of().as_deref(),
+                Some("pvc-1a2b")
+            );
+            add().await.unwrap();
+        })
+        .await;
+        add().await.unwrap();
+        let refused = crate::client::on_behalf_of("pvc-1\n{\"forged\":1}", add()).await;
+        assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
+        let long = "p".repeat(crate::proto::ON_BEHALF_OF_MAX + 1);
+        let refused = crate::client::on_behalf_of(long, add()).await;
+        assert_eq!(refused.unwrap_err().kind, ErrorKind::Invalid);
+
+        let records = audit.records();
+        assert_eq!(records.len(), 4, "{records:?}");
+        assert_eq!(records[0].on_behalf_of.as_deref(), Some("pvc-1a2b"));
+        assert_eq!(records[0].outcome, AuditOutcome::Ok);
+        assert_eq!(records[1].on_behalf_of, None);
+        for r in &records[2..] {
+            assert_eq!(r.on_behalf_of, None);
+            assert_eq!(r.outcome, AuditOutcome::Err(ErrorKind::Invalid));
+        }
+        // The file sink's line: present when set, absent (not null) when not.
+        let line = serde_json::to_string(&records[0]).unwrap();
+        assert!(line.contains(r#""on_behalf_of":"pvc-1a2b""#), "{line}");
+        let line = serde_json::to_string(&records[1]).unwrap();
+        assert!(!line.contains("on_behalf_of"), "{line}");
+    }
+}
+
+/// A router that serves some methods only for now answers the rest with
+/// its own error, not "not implemented".
+#[tokio::test]
+async fn a_router_can_answer_unregistered_methods_with_its_own_error() {
+    let mut router =
+        Router::new().with_unregistered_error(ControlError::unavailable("waiting for fs.unlock"));
+    router.register::<NodePing, _, _>(|_, _| async { Ok(Pong {}) });
+    let client = Client::in_process_as(router, Principal::InProcess, ClientOptions::default())
+        .await
+        .unwrap();
+    client.call::<NodePing>(Empty {}).await.unwrap();
+    let e = client
+        .call::<PinAdd>(PathParams { path: "/r".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable);
+    assert!(e.message.contains("fs.unlock"), "{e:?}");
+    // An unknown method is still unknown.
+    let e = client.call_json("no.such", json!({})).await.unwrap_err();
+    assert!(e.message.contains("unknown method"), "{e:?}");
+}
 
 #[tokio::test]
 async fn only_mutating_calls_are_audited_with_a_digest_and_never_the_params() {

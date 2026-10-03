@@ -26,17 +26,19 @@
 //! change leaves them running. Reaping a pool's pod once the pool is empty
 //! is 37-k6b's (with the purge worker), not this module's.
 //!
-//! **hostPath layout.** The pod's state dir (the meta store: durable state
-//! that should survive a container restart) is
-//! `<hostRoot>/node-identity/<unit>-controller/` and its control socket
-//! `<hostRoot>/sockets/<unit>-controller/control.sock`, both
-//! `DirectoryOrCreate` — §7's tree, with a `-controller` suffix so the
-//! controller-owned pod never collides with a node-owned pod of the same
-//! pool on the same node (K3). kubelet creates those directories root-owned;
-//! a one-shot init container (uid 0, `CAP_CHOWN` only) hands them to the
-//! engine's uid. A rescheduled pod starts with an empty state dir on its new
-//! node — harmless for a node that never holds a view: it rejoins as a fresh
-//! Constellation node and replays the pool's log.
+//! **No hostPath, no init container.** The controller-owned pod never
+//! holds a view and nobody but the controller reaches it (through the exec
+//! relay below), so its state dir (the meta store) and its control socket
+//! are `emptyDir`s: they survive a container restart (`OnFailure`), a
+//! rescheduled pod starts empty and rejoins as a fresh Constellation node
+//! that replays the pool's log — harmless for a node that never serves a
+//! view. That leaves nothing for a root init container to `chown`, and
+//! makes the pod PodSecurity-`restricted` as a whole (plan 37 §9, K6a):
+//! non-root, every capability dropped, no privilege escalation, read-only
+//! root, `RuntimeDefault` seccomp, only `emptyDir` volumes. (A node-owned
+//! pod needs hostPaths, which no PodSecurity level below `privileged`
+//! admits; its node plugin makes them, owned by the engine's uid —
+//! [`NodeEnginePods`].)
 //!
 //! **Readiness** is the daemon's own: an exec probe running
 //! `constellation control-relay --ping` (one `node.ping` over the socket).
@@ -72,9 +74,9 @@
 //! and the provisioner secret named by the class (its `${pvc.namespace}`,
 //! `${pvc.name}` and `${pv.name}` templates resolved from the PV) — read
 //! with the controller's own ServiceAccount, so only from the driver's
-//! namespace; elsewhere the pool's surviving credentials `Secret` is
-//! reused, and failing both the RPC stays `UNAVAILABLE` and says why. The
-//! rebuilt pod must turn out to serve that uuid. That needs `list` on
+//! namespace or a Secret the chart lets it watch (failing that the pod
+//! comes up and waits, and the RPC is `UNAVAILABLE` until one carries the
+//! secret). The rebuilt pod must turn out to serve that uuid. That needs `list` on
 //! `persistentvolumes` and `get` on `storageclasses` (the chart's
 //! controller ClusterRole).
 //!
@@ -89,24 +91,32 @@
 //! another RPC holds a client into it by then (every client shares the
 //! cached relay, so the relay map's reference is then the only one).
 //!
-//! **Credentials.** An engine pod opens S3 at start, before any control
-//! call could hand it credentials, so `fs.unlock`-style per-request
-//! delivery (§9, 37-k6a) cannot start it. The request's secrets
-//! (`req.secrets`, the class's provisioner secret resolved by
-//! external-provisioner) are written to one `Secret` per pool in the
-//! driver's namespace — `constellation-engine-<unit>-controller-credentials`, owned
-//! like the pod — and the pod reads them as environment variables
-//! (`secretKeyRef`, so they never appear in the pod spec). That needs
-//! `secrets` get/create/update in the driver's namespace only (K1 granted
-//! none); a class with no secret (`credentialSource: aws-default-chain`)
-//! leaves the pod on the SDK's default chain (IRSA, EKS Pod Identity). The
-//! endpoint and region come from the class as `AWS_ENDPOINT`/`AWS_REGION`,
-//! which is why `fs.create` through the pod must not name them again
-//! (the daemon refuses an `fs.create` that does).
+//! **Credentials** ([`crate::credentials`]). Nothing in a pod spec: an
+//! engine pod of a class that needs credentials runs `constellation serve
+//! --await-unlock` and waits for them on its control socket. The manager
+//! sends `fs.unlock` (naming the pod's `--s3` URL) with the request's
+//! secrets (`req.secrets`: the class's provisioner, controller-expand or
+//! snapshotter secret, resolved by the sidecars) whenever it reaches a new
+//! incarnation of the pod — over a one-shot relay, since the gate answers
+//! nothing else and closes its connections once the engine runs — and
+//! again on the live relay when a request brings different secrets (a
+//! rotation, in place). It keeps the last secrets per pod in memory to
+//! unlock a replacement no request has secrets for yet; for a
+//! `refreshing` class it also watches the class's Secret and pushes every
+//! change at once. A pod it can unlock with nothing is `UNAVAILABLE`,
+//! saying so. A class on `aws-default-chain` (and not E2E) starts on the
+//! SDK's chain and is never unlocked. The endpoint and region come from
+//! the class as `AWS_ENDPOINT`/`AWS_REGION` (not secrets), which is why
+//! `fs.create` through the pod must not name them again (the daemon
+//! refuses an `fs.create` that does). The controller therefore needs no
+//! write access to Secrets at all — only what external-provisioner itself
+//! reads, and `get`/`list`/`watch` on the Secrets `refreshing` classes
+//! name (the chart's `credentials.watchedSecrets`).
 
 use crate::control_client::{ControlClient, Engines, Handle, PoolRef, SocketControlClient};
+use crate::credentials::{fingerprint, is_awaiting_unlock, unlock_params, Refresher, Secrets};
 use crate::node::{Drift, NodeEngine, NodeEngines, Replacement};
-use crate::params::ClassParams;
+use crate::params::{ClassParams, CredentialMode, SecretRef};
 use crate::volume_id::VolumeId;
 use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
@@ -123,14 +133,12 @@ use constellation_control::transport::StreamTransport;
 use constellation_control::{Client, ClientOptions, Principal};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, ExecAction,
-    HostPathVolumeSource, PersistentVolume, Pod, PodSecurityContext, PodSpec, Probe,
-    ResourceRequirements, SeccompProfile, Secret, SecretKeySelector, SecurityContext, Toleration,
-    Volume, VolumeMount,
+    Capabilities, Container, EmptyDirVolumeSource, EnvVar, ExecAction, HostPathVolumeSource,
+    PersistentVolume, Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements,
+    SeccompProfile, Secret, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
-use k8s_openapi::ByteString;
 use kube::api::{Api, AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -176,15 +184,6 @@ pub const ANNOTATION_ENGINE_CONFIG: &str = "constellation.dev/engine-config";
 pub const ANNOTATION_HANDOFF_FALLBACK: &str = "constellation.dev/handoff-fallback";
 const ANNOTATION_S3: &str = "constellation.dev/s3";
 const ANNOTATION_ENDPOINT: &str = "constellation.dev/endpoint";
-
-/// The secret keys an engine pod reads, and the variables they become
-/// (plan 37 §6's `Secret` layout).
-const SECRET_ENV: [(&str, &str); 4] = [
-    ("aws_access_key_id", "AWS_ACCESS_KEY_ID"),
-    ("aws_secret_access_key", "AWS_SECRET_ACCESS_KEY"),
-    ("aws_session_token", "AWS_SESSION_TOKEN"),
-    ("e2e_passphrase", "CONSTELLATION_PASSPHRASE"),
-];
 
 /// How engine pods are made. Read from the controller's environment
 /// ([`Self::from_env`]); the chart sets every variable.
@@ -295,10 +294,6 @@ pub fn pod_name(pool: &PoolRef) -> String {
     format!("constellation-engine-{}-controller", unit_name(pool))
 }
 
-fn secret_name(pod: &str) -> String {
-    format!("{pod}-credentials")
-}
-
 /// `constellation-engine-<unit>-<node>`, a pod name (a DNS subdomain, at
 /// most 253 bytes): node names may be 253 bytes themselves, so a longer
 /// one keeps its head and gets a stable BLAKE3 suffix of the whole name.
@@ -333,24 +328,6 @@ impl EngineRole {
             EngineRole::Controller => pod_name(pool),
             EngineRole::Node { node } => node_pod_name(&unit_name(pool), node),
         }
-    }
-
-    /// The pod's directory under `<hostRoot>/{node-identity,sockets}/`:
-    /// §7's `<unit>`, with a `-controller` suffix for the controller's own
-    /// so the two never share a meta store or a socket on one node.
-    pub fn host_dir(&self, pool: &PoolRef) -> String {
-        match self {
-            EngineRole::Controller => format!("{}-controller", unit_name(pool)),
-            EngineRole::Node { .. } => unit_name(pool),
-        }
-    }
-
-    /// The credentials `Secret` the pod reads: the pool's, which only the
-    /// controller writes (from `CreateVolume`'s provisioner secret) — a
-    /// node's pod references it, and the node plugin holds no permission
-    /// on Secrets at all (plan 37 §9; [`NodeEnginePods`]).
-    pub fn secret_name(&self, pool: &PoolRef) -> String {
-        secret_name(&pod_name(pool))
     }
 
     fn owner_label(&self) -> &'static str {
@@ -579,6 +556,29 @@ pub fn pod_generation(pod: &Pod) -> u32 {
         .unwrap_or(0)
 }
 
+/// The control-socket allowlist of a controller-owned engine pod: the
+/// controller's relay, exec'd into the pod as the engine's own uid, is the
+/// `csi-controller` service on the pod's socket (admin, as the node
+/// plugin's grant), so the audit log names the service rather than the
+/// bare owner uid. Baked into the image
+/// (`deploy/docker/controller-engine-control-allow.toml`, at
+/// [`CONTROLLER_POD_POLICY`]): the controller-owned pod has no hostPath to
+/// be handed one through.
+pub fn controller_engine_policy() -> String {
+    format!(
+        "[[grant]]\n\
+         kind = \"service\"\n\
+         principal = \"uid:{ENGINE_UID}\"\n\
+         socket = \"{POD_SOCKET}\"\n\
+         role = \"admin\"\n\
+         label = \"csi-controller\"\n"
+    )
+}
+
+/// Where the image holds [`controller_engine_policy`].
+pub const CONTROLLER_POD_POLICY: &str =
+    "/etc/constellation-csi/controller-engine/control-allow.toml";
+
 /// Where a node-owned engine pod reads [`node_engine_policy`] from: its
 /// `<hostRoot>/policy/<unit>/` directory, mounted read-only.
 pub const POD_POLICY: &str = "/etc/constellation-csi/policy/control-allow.toml";
@@ -588,57 +588,50 @@ pub const POLICY_FILE: &str = "control-allow.toml";
 /// `<hostRoot>/policy/`: root-owned, never mounted writable into a pod.
 pub const POLICY_DIR: &str = "policy";
 
-/// Write `contents` to `<root>/<dirs…>/<file>` as root (the node plugin)
-/// without trusting anything below `root` that someone else could have
-/// planted (plan 37 settled decision 10: the engine pod is unprivileged,
-/// and a privileged writer must not become its tool). Every directory is
-/// created if missing (mode 0755) and opened with `O_NOFOLLOW`, and must
-/// be owned by this process's uid and writable by nobody else — so nobody
-/// else can have put a symlink or a hard link in it; the file is written
-/// to a fresh `O_EXCL|O_NOFOLLOW` temporary next to it, synced and renamed
-/// over the old one within the same directory descriptor. Unchanged
-/// contents are not rewritten.
-pub fn write_private_file(
-    root: &std::path::Path,
-    dirs: &[&str],
-    file: &str,
-    contents: &[u8],
-) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::io::{Error, ErrorKind, Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
+fn path_component(s: &str) -> std::io::Result<std::ffi::CString> {
+    use std::io::{Error, ErrorKind};
+    if s.is_empty() || s == "." || s == ".." || s.contains('/') {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{s:?} is not a single path component"),
+        ));
+    }
+    std::ffi::CString::new(s).map_err(|e| Error::new(ErrorKind::InvalidInput, e))
+}
 
-    let name = |s: &str| -> std::io::Result<CString> {
-        if s.is_empty() || s == "." || s == ".." || s.contains('/') {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("{s:?} is not a single path component"),
-            ));
-        }
-        CString::new(s).map_err(|e| Error::new(ErrorKind::InvalidInput, e))
-    };
-    let cvt = |rc: libc::c_int| {
-        if rc < 0 {
-            Err(Error::last_os_error())
-        } else {
-            Ok(rc)
-        }
-    };
-    // SAFETY: no preconditions.
-    let me = unsafe { libc::geteuid() };
-    let open_dir = |at: libc::c_int, path: &CString, shown: &dyn std::fmt::Display| {
-        // SAFETY: a valid NUL-terminated path; the result is checked.
-        let fd = cvt(unsafe {
-            libc::openat(
-                at,
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        })
-        .map_err(|e| Error::new(e.kind(), format!("opening {shown}: {e}")))?;
-        // SAFETY: a descriptor we just opened and own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+fn cvt(rc: libc::c_int) -> std::io::Result<libc::c_int> {
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(rc)
+    }
+}
+
+/// Open directory `path` (relative to `at`) without following a link; if
+/// `private`, it must be owned by this process's uid and writable by
+/// nobody else.
+fn open_dir_nofollow(
+    at: libc::c_int,
+    path: &std::ffi::CStr,
+    shown: &dyn std::fmt::Display,
+    private: bool,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: a valid NUL-terminated path; the result is checked.
+    let fd = cvt(unsafe {
+        libc::openat(
+            at,
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })
+    .map_err(|e| Error::new(e.kind(), format!("opening {shown}: {e}")))?;
+    // SAFETY: a descriptor we just opened and own.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if private {
+        // SAFETY: no preconditions.
+        let me = unsafe { libc::geteuid() };
         // SAFETY: `st` is written by fstat before it is read.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         cvt(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
@@ -653,16 +646,28 @@ pub fn write_private_file(
                 ),
             ));
         }
-        Ok::<OwnedFd, Error>(fd)
-    };
+    }
+    Ok(fd)
+}
 
+/// `<root>/<dirs…>`, each created if missing (mode 0755) and opened with
+/// `O_NOFOLLOW`, each owned by this process's uid and writable by nobody
+/// else — so nobody else can have put a symlink or a hard link in any of
+/// them. The last one's descriptor.
+fn private_dir_chain(
+    root: &std::path::Path,
+    dirs: &[&str],
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     std::fs::create_dir_all(root)?;
-    let root_c = CString::new(root.as_os_str().as_bytes())
+    let root_c = std::ffi::CString::new(root.as_os_str().as_bytes())
         .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-    let mut dir = open_dir(libc::AT_FDCWD, &root_c, &root.display())?;
+    let mut dir = open_dir_nofollow(libc::AT_FDCWD, &root_c, &root.display(), true)?;
     let mut shown = root.to_path_buf();
     for d in dirs {
-        let c = name(d)?;
+        let c = path_component(d)?;
         shown.push(d);
         // SAFETY: a valid NUL-terminated name relative to an open dir.
         match cvt(unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) }) {
@@ -675,9 +680,30 @@ pub fn write_private_file(
                 ))
             }
         }
-        dir = open_dir(dir.as_raw_fd(), &c, &shown.display())?;
+        dir = open_dir_nofollow(dir.as_raw_fd(), &c, &shown.display(), true)?;
     }
-    let file_c = name(file)?;
+    Ok(dir)
+}
+
+/// Write `contents` to `<root>/<dirs…>/<file>` as root (the node plugin)
+/// without trusting anything below `root` that someone else could have
+/// planted (plan 37 settled decision 10: the engine pod is unprivileged,
+/// and a privileged writer must not become its tool). Every directory is
+/// created if missing and checked as [`private_dir_chain`] does; the file
+/// is written to a fresh `O_EXCL|O_NOFOLLOW` temporary next to it, synced
+/// and renamed over the old one within the same directory descriptor.
+/// Unchanged contents are not rewritten.
+pub fn write_private_file(
+    root: &std::path::Path,
+    dirs: &[&str],
+    file: &str,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let dir = private_dir_chain(root, dirs)?;
+    let file_c = path_component(file)?;
     // Unchanged: nothing to do (read without following a link).
     // SAFETY: a valid NUL-terminated name relative to an open dir.
     let have = unsafe {
@@ -698,7 +724,7 @@ pub fn write_private_file(
             return Ok(());
         }
     }
-    let tmp_c = name(&format!(".{file}.tmp"))?;
+    let tmp_c = path_component(&format!(".{file}.tmp"))?;
     // A leftover temporary (ours, from a crash) goes first; O_EXCL below
     // then guarantees a fresh inode of our own.
     // SAFETY: a valid NUL-terminated name relative to an open dir.
@@ -735,6 +761,51 @@ pub fn write_private_file(
     Ok(())
 }
 
+/// The node-owned engine pod's own hostPath directories,
+/// `<root>/<sub>/<unit>/` for each of `subs`, made by the node plugin
+/// (root) before it creates the pod, owned by the engine's `uid:gid`,
+/// mode 0700 — which is what lets the pod mount them `type: Directory`
+/// with no root init container to `chown` what kubelet would create
+/// root-owned (plan 37 §9, K6a). `<root>` and `<root>/<sub>` are checked
+/// as [`private_dir_chain`] does, so the unit directory's parent is one
+/// only root can change; the unit directory itself is opened with
+/// `O_NOFOLLOW` (a link there is refused, never followed) and changed
+/// through its descriptor.
+pub fn prepare_unit_dirs(
+    root: &std::path::Path,
+    subs: &[&str],
+    unit: &str,
+    uid: u32,
+    gid: u32,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    let unit_c = path_component(unit)?;
+    for sub in subs {
+        let parent = private_dir_chain(root, &[sub])?;
+        let shown = root.join(sub).join(unit);
+        // SAFETY: a valid NUL-terminated name relative to an open dir.
+        match cvt(unsafe { libc::mkdirat(parent.as_raw_fd(), unit_c.as_ptr(), 0o700) }) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(Error::new(
+                    e.kind(),
+                    format!("mkdir {}: {e}", shown.display()),
+                ))
+            }
+        }
+        let dir = open_dir_nofollow(parent.as_raw_fd(), &unit_c, &shown.display(), false)?;
+        // SAFETY: an open descriptor.
+        cvt(unsafe { libc::fchown(dir.as_raw_fd(), uid, gid) })
+            .map_err(|e| Error::new(e.kind(), format!("chown {}: {e}", shown.display())))?;
+        // SAFETY: an open descriptor.
+        cvt(unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) })
+            .map_err(|e| Error::new(e.kind(), format!("chmod {}: {e}", shown.display())))?;
+    }
+    Ok(())
+}
+
 /// The backend URL `constellation serve --s3` gets.
 fn s3_url(pool: &PoolRef) -> String {
     let prefix = pool.prefix();
@@ -756,7 +827,7 @@ fn env(name: &str, value: impl Into<String>) -> EnvVar {
 /// The controller-owned engine pod of `pool` (module docs). Pure: no API
 /// call, so the spec is unit-tested.
 pub fn engine_pod(pool: &PoolRef, cfg: &EnginePodConfig, owner: Option<&OwnerReference>) -> Pod {
-    engine_pod_with(pool, cfg, owner, !pool.secrets.is_empty())
+    build_engine_pod(pool, cfg, owner, &EngineRole::Controller)
 }
 
 /// The node-owned engine pod of `pool` on `node` (plan 37 §7), owned by
@@ -768,13 +839,12 @@ pub fn node_engine_pod(
     cfg: &EnginePodConfig,
     node: &str,
     owner: Option<&OwnerReference>,
-    reads_secret: bool,
     fs_uuid: &str,
 ) -> Pod {
     let role = EngineRole::Node {
         node: node.to_string(),
     };
-    let mut pod = build_engine_pod(pool, cfg, owner, reads_secret, &role);
+    let mut pod = build_engine_pod(pool, cfg, owner, &role);
     if let Some(labels) = pod.metadata.labels.as_mut() {
         labels.insert(LABEL_NODE.to_string(), label_value(node));
         labels.insert(LABEL_UNIT.to_string(), unit_name(pool));
@@ -800,25 +870,29 @@ pub fn node_engine_pod_gen(
     cfg: &EnginePodConfig,
     node: &str,
     owner: Option<&OwnerReference>,
-    reads_secret: bool,
     fs_uuid: &str,
     generation: u32,
 ) -> Pod {
-    let mut pod = node_engine_pod(pool, cfg, node, owner, reads_secret, fs_uuid);
+    let mut pod = node_engine_pod(pool, cfg, node, owner, fs_uuid);
     set_generation(&mut pod, &unit_name(pool), node, generation);
     pod
 }
 
-/// [`engine_pod`], with whether the pod reads the pool's credentials
-/// `Secret` decided by the caller: a rebuilt pool may reuse a surviving
-/// one whose bytes the controller does not hold.
-fn engine_pod_with(
-    pool: &PoolRef,
-    cfg: &EnginePodConfig,
-    owner: Option<&OwnerReference>,
-    reads_secret: bool,
-) -> Pod {
-    build_engine_pod(pool, cfg, owner, reads_secret, &EngineRole::Controller)
+/// The `fs` an engine pod's `fs.unlock` names: its `--s3` URL, which its
+/// credential gate checks (it knows no uuid before it can read the
+/// bucket) and the running daemon resolves to itself.
+pub fn unlock_target(pool: &PoolRef) -> String {
+    s3_url(pool)
+}
+
+/// Whether `pod` runs its engine with `--await-unlock` (from its own
+/// spec, so a pod made by an older plugin generation is read as it is).
+pub fn awaits_unlock(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.containers.iter().find(|c| c.name == ENGINE_CONTAINER))
+        .and_then(|c| c.args.as_ref())
+        .is_some_and(|a| a.iter().any(|x| x == "--await-unlock"))
 }
 
 /// Both roles' engine pod (module docs, [`node_engine_pod`]).
@@ -826,11 +900,12 @@ fn build_engine_pod(
     pool: &PoolRef,
     cfg: &EnginePodConfig,
     owner: Option<&OwnerReference>,
-    reads_secret: bool,
     role: &EngineRole,
 ) -> Pod {
     let name = role.pod_name(pool);
-    let unit = role.host_dir(pool);
+    // A node-owned pod's directory under `<hostRoot>/{node-identity,
+    // sockets,policy}/` (§7's `<unit>`); the controller's has none.
+    let unit = unit_name(pool);
     let class = &pool.class;
     let mut labels = BTreeMap::from([
         (
@@ -872,6 +947,11 @@ fn build_engine_pod(
     if class.e2e {
         args.push("--e2e".into());
     }
+    // Plan 37 §9: the credentials (and an E2E passphrase) arrive only as
+    // `fs.unlock` over the control socket (`crate::credentials`).
+    if class.awaits_unlock() {
+        args.push("--await-unlock".into());
+    }
     // The class's `writeMode` is not passed: it is a property of a mounted
     // view (`view.mount`'s write mode), and a controller-owned pod mounts
     // none. The node-owned pods that do mount get it from K3 on; `fs.create`
@@ -889,10 +969,16 @@ fn build_engine_pod(
         // §6: "server" is the only engine profile through K6.
         env("CONSTELLATION_PROFILE", "server"),
     ];
-    if let EngineRole::Node { .. } = role {
-        // The node plugin's grant on this pod's socket (`node_engine_policy`).
-        envs.push(env("CONSTELLATION_CONTROL_POLICY", POD_POLICY));
-    }
+    envs.push(env(
+        "CONSTELLATION_CONTROL_POLICY",
+        match role {
+            // The node plugin's grant on this pod's socket
+            // (`node_engine_policy`).
+            EngineRole::Node { .. } => POD_POLICY,
+            // The controller's (`controller_engine_policy`), in the image.
+            EngineRole::Controller => CONTROLLER_POD_POLICY,
+        },
+    ));
     if let Some(endpoint) = &class.endpoint {
         envs.push(env("AWS_ENDPOINT", endpoint.clone()));
         envs.push(env("AWS_ENDPOINT_URL", endpoint.clone()));
@@ -904,23 +990,6 @@ fn build_engine_pod(
         envs.push(env("AWS_REGION", region.clone()));
         envs.push(env("AWS_DEFAULT_REGION", region.clone()));
     }
-    if reads_secret {
-        for (key, var) in SECRET_ENV {
-            envs.push(EnvVar {
-                name: var.into(),
-                value_from: Some(EnvVarSource {
-                    secret_key_ref: Some(SecretKeySelector {
-                        name: role.secret_name(pool),
-                        key: key.into(),
-                        optional: Some(true),
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-    }
-
     let ping = Probe {
         exec: Some(ExecAction {
             command: Some(vec![
@@ -934,12 +1003,24 @@ fn build_engine_pod(
         timeout_seconds: Some(5),
         ..Default::default()
     };
-    let host_dir = |sub: &str| Volume {
+    // A node-owned pod's state and socket are §7's hostPaths, which its
+    // plugin makes owned by the engine's uid before it creates the pod
+    // (`prepare_unit_dirs`): no root init container to `chown` them. The
+    // controller-owned pod's are `emptyDir`s (module docs).
+    let host_root = cfg.host_root.trim_end_matches('/');
+    let unit_dir = |sub: &str| Volume {
         name: sub.into(),
-        host_path: Some(HostPathVolumeSource {
-            path: format!("{}/{sub}/{unit}", cfg.host_root.trim_end_matches('/')),
-            type_: Some("DirectoryOrCreate".into()),
-        }),
+        host_path: match role {
+            EngineRole::Node { .. } => Some(HostPathVolumeSource {
+                path: format!("{host_root}/{sub}/{unit}"),
+                type_: Some("Directory".into()),
+            }),
+            EngineRole::Controller => None,
+        },
+        empty_dir: match role {
+            EngineRole::Node { .. } => None,
+            EngineRole::Controller => Some(EmptyDirVolumeSource::default()),
+        },
         ..Default::default()
     };
     let mut mounts = vec![
@@ -960,8 +1041,8 @@ fn build_engine_pod(
         },
     ];
     let mut volumes = vec![
-        host_dir("node-identity"),
-        host_dir("sockets"),
+        unit_dir("node-identity"),
+        unit_dir("sockets"),
         Volume {
             name: "scratch".into(),
             empty_dir: Some(EmptyDirVolumeSource::default()),
@@ -981,16 +1062,14 @@ fn build_engine_pod(
         volumes.push(Volume {
             name: POLICY_DIR.into(),
             host_path: Some(HostPathVolumeSource {
-                path: format!(
-                    "{}/{POLICY_DIR}/{unit}",
-                    cfg.host_root.trim_end_matches('/')
-                ),
+                path: format!("{host_root}/{POLICY_DIR}/{unit}"),
                 // Made by the plugin before it creates the pod.
                 type_: Some("Directory".into()),
             }),
             ..Default::default()
         });
     }
+    // PodSecurity `restricted`'s container rules, whole (plan 37 §9).
     let unprivileged = SecurityContext {
         allow_privilege_escalation: Some(false),
         capabilities: Some(Capabilities {
@@ -998,6 +1077,11 @@ fn build_engine_pod(
             add: None,
         }),
         read_only_root_filesystem: Some(true),
+        run_as_non_root: Some(true),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".into(),
+            localhost_profile: None,
+        }),
         ..Default::default()
     };
 
@@ -1047,29 +1131,6 @@ fn build_engine_pod(
                 }),
                 ..Default::default()
             }),
-            init_containers: Some(vec![Container {
-                // kubelet creates `DirectoryOrCreate` hostPaths root-owned.
-                name: "own-host-dirs".into(),
-                image: Some(cfg.image.clone()),
-                image_pull_policy: cfg.image_pull_policy.clone(),
-                command: Some(vec![
-                    "chown".into(),
-                    format!("{ENGINE_UID}:{ENGINE_UID}"),
-                    POD_STATE_DIR.into(),
-                    POD_SOCKET_DIR.into(),
-                ]),
-                security_context: Some(SecurityContext {
-                    run_as_user: Some(0),
-                    run_as_non_root: Some(false),
-                    capabilities: Some(Capabilities {
-                        drop: Some(vec!["ALL".into()]),
-                        add: Some(vec!["CHOWN".into()]),
-                    }),
-                    ..unprivileged.clone()
-                }),
-                volume_mounts: Some(mounts[..2].to_vec()),
-                ..Default::default()
-            }]),
             containers: vec![Container {
                 name: ENGINE_CONTAINER.into(),
                 image: Some(cfg.image.clone()),
@@ -1101,43 +1162,6 @@ fn build_engine_pod(
             ..Default::default()
         }),
         status: None,
-    }
-}
-
-/// The pool's credentials `Secret` for `role`'s pods: only the keys an
-/// engine pod reads.
-fn credentials_secret(
-    pool: &PoolRef,
-    cfg: &EnginePodConfig,
-    owner: Option<&OwnerReference>,
-    role: &EngineRole,
-) -> Secret {
-    let data = SECRET_ENV
-        .iter()
-        .filter_map(|(key, _)| {
-            pool.secrets
-                .get(*key)
-                .map(|v| (key.to_string(), ByteString(v.as_bytes().to_vec())))
-        })
-        .collect();
-    Secret {
-        metadata: ObjectMeta {
-            name: Some(role.secret_name(pool)),
-            namespace: Some(cfg.namespace.clone()),
-            labels: Some(BTreeMap::from([
-                (
-                    "app.kubernetes.io/name".to_string(),
-                    "constellation-csi".to_string(),
-                ),
-                (LABEL_COMPONENT.to_string(), "engine".to_string()),
-                (LABEL_POOL.to_string(), pool_label(pool)),
-            ])),
-            owner_references: owner.map(|o| vec![o.clone()]),
-            ..Default::default()
-        },
-        type_: Some("Opaque".into()),
-        data: Some(data),
-        ..Default::default()
     }
 }
 
@@ -1270,32 +1294,6 @@ fn pod_waiting_on(pod: &Pod) -> String {
     }
 }
 
-/// Create or refresh a credentials `Secret` to hold exactly `wanted`'s
-/// data.
-async fn ensure_credentials(secrets: &Api<Secret>, wanted: Secret) -> Result<(), ControlError> {
-    let name = wanted.metadata.name.clone().unwrap_or_default();
-    match secrets.get_opt(&name).await {
-        Ok(Some(existing)) if existing.data == wanted.data => Ok(()),
-        Ok(Some(_)) => {
-            // Rotation reaches a running pod only at its next start
-            // (environment variables); a node-owned pod also gets the new
-            // bytes at once through `fs.unlock` (`crate::node`).
-            let patch = serde_json::json!({ "data": wanted.data });
-            secrets
-                .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                .await
-                .map(drop)
-                .map_err(|e| kube_err("updating the engine credentials secret", e))
-        }
-        Ok(None) => match secrets.create(&PostParams::default(), &wanted).await {
-            Ok(_) => Ok(()),
-            Err(e) if is_status(&e, 409) => Ok(()),
-            Err(e) => Err(kube_err("creating the engine credentials secret", e)),
-        },
-        Err(e) => Err(kube_err("reading the engine credentials secret", e)),
-    }
-}
-
 /// Pod `name`, created from `spec` when absent and recreated (from `spec`,
 /// else from its own) when it has terminated, once it is `Ready`: polled
 /// with exponential backoff (200 ms doubling to 3 s) for at most
@@ -1380,6 +1378,11 @@ struct Relay {
     uid: String,
     client: Arc<SocketControlClient>,
     process: kube::api::AttachedProcess,
+    /// The fingerprint of the credentials this process last unlocked the
+    /// incarnation with ([`crate::credentials::fingerprint`]); `None`:
+    /// not by this process (it may need none, or another controller
+    /// process did it).
+    unlocked: Mutex<Option<[u8; 32]>>,
 }
 
 impl Drop for Relay {
@@ -1392,7 +1395,6 @@ impl Drop for Relay {
 pub struct EnginePodManager {
     client: kube::Client,
     pods: Api<Pod>,
-    secrets: Api<Secret>,
     cfg: EnginePodConfig,
     owner: Option<OwnerReference>,
     relays: Mutex<HashMap<String, Arc<Relay>>>,
@@ -1404,13 +1406,25 @@ pub struct EnginePodManager {
     specs: Mutex<HashMap<String, Pod>>,
     /// Serializes bringing up one pod (create, wait, dial) per pod name.
     bringup: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// pod name → the last secrets a request (or the watch) brought for
+    /// it, in memory only: what unlocks a replacement incarnation no
+    /// request has secrets for yet (module docs).
+    secrets: Mutex<HashMap<String, Secrets>>,
+    /// pod name → its pool's watched Secret (`refreshing` classes).
+    watched: Mutex<HashMap<String, SecretRef>>,
+    refresher: Arc<Refresher>,
+    this: std::sync::Weak<EnginePodManager>,
 }
 
 impl EnginePodManager {
     /// Resolves the owner `Deployment` once (its uid goes into every
     /// `ownerReference`); a missing one is logged and engine pods are then
     /// unowned.
-    pub async fn new(client: kube::Client, cfg: EnginePodConfig) -> EnginePodManager {
+    pub async fn new(
+        client: kube::Client,
+        cfg: EnginePodConfig,
+        refresher: Arc<Refresher>,
+    ) -> Arc<EnginePodManager> {
         let owner = match &cfg.owner_deployment {
             Some(name) => {
                 let deployments: Api<Deployment> = Api::namespaced(client.clone(), &cfg.namespace);
@@ -1432,9 +1446,8 @@ impl EnginePodManager {
             }
             None => None,
         };
-        EnginePodManager {
+        Arc::new_cyclic(|this| EnginePodManager {
             pods: Api::namespaced(client.clone(), &cfg.namespace),
-            secrets: Api::namespaced(client.clone(), &cfg.namespace),
             client,
             cfg,
             owner,
@@ -1442,7 +1455,11 @@ impl EnginePodManager {
             by_uuid: Mutex::default(),
             specs: Mutex::default(),
             bringup: Mutex::default(),
-        }
+            secrets: Mutex::default(),
+            watched: Mutex::default(),
+            refresher,
+            this: this.clone(),
+        })
     }
 
     fn bringup_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1454,33 +1471,29 @@ impl EnginePodManager {
             .clone()
     }
 
-    /// Create or refresh the pool's credentials `Secret`.
-    async fn ensure_secret(&self, pool: &PoolRef) -> Result<(), ControlError> {
-        let wanted = credentials_secret(
-            pool,
-            &self.cfg,
-            self.owner.as_ref(),
-            &EngineRole::Controller,
-        );
-        ensure_credentials(&self.secrets, wanted).await
-    }
-
     /// The pod, created from `spec` when absent and recreated when it has
     /// terminated, once it is `Ready`.
     async fn ensure_ready(&self, name: &str, spec: Option<&Pod>) -> Result<Pod, ControlError> {
         ensure_pod_ready(&self.pods, name, spec, self.cfg.ready_timeout).await
     }
 
-    /// The live relay into `pod`, dialled anew when the pod was replaced
-    /// or the old relay died.
-    async fn relay(&self, pod: &Pod) -> Result<Arc<Relay>, ControlError> {
+    /// The cached relay into `pod`'s incarnation, if it is still up.
+    fn live_relay(&self, pod: &Pod) -> Option<Arc<Relay>> {
+        let name = pod.metadata.name.as_deref().unwrap_or_default();
+        let uid = pod.metadata.uid.as_deref().unwrap_or_default();
+        self.relays
+            .lock()
+            .unwrap()
+            .get(name)
+            .filter(|r| r.uid == uid && r.client.is_connected())
+            .cloned()
+    }
+
+    /// A new relay into `pod` (`constellation control-relay` through the
+    /// exec API), bounded by `timeout` per call; not cached.
+    async fn exec_relay(&self, pod: &Pod, timeout: Duration) -> Result<Relay, ControlError> {
         let name = pod.metadata.name.clone().unwrap_or_default();
         let uid = pod.metadata.uid.clone().unwrap_or_default();
-        if let Some(relay) = self.relays.lock().unwrap().get(&name) {
-            if relay.uid == uid && relay.client.is_connected() {
-                return Ok(relay.clone());
-            }
-        }
         let attach = AttachParams {
             container: Some(ENGINE_CONTAINER.into()),
             stdin: true,
@@ -1515,17 +1528,224 @@ impl EnginePodManager {
             Principal::InProcess,
         ));
         let client = Client::from_transport(transport, ClientOptions::default()).await?;
-        let relay = Arc::new(Relay {
+        Ok(Relay {
             uid,
-            client: Arc::new(SocketControlClient::new(client)),
+            client: Arc::new(SocketControlClient::new(client).with_timeout(timeout)),
             process,
-        });
+            unlocked: Mutex::new(None),
+        })
+    }
+
+    /// A relay for every later call, cached.
+    async fn dial_relay(&self, pod: &Pod) -> Result<Arc<Relay>, ControlError> {
+        let name = pod.metadata.name.clone().unwrap_or_default();
+        let relay = Arc::new(
+            self.exec_relay(pod, crate::control_client::DEFAULT_CALL_TIMEOUT)
+                .await?,
+        );
         self.relays
             .lock()
             .unwrap()
             .insert(name.clone(), relay.clone());
         tracing::debug!(pod = %name, "control relay connected");
         Ok(relay)
+    }
+
+    /// The credentials to unlock pod `name` with when no request brought
+    /// any: the last ones seen, else its watched Secret's.
+    async fn known_secrets(&self, name: &str) -> Option<Secrets> {
+        if let Some(have) = self.secrets.lock().unwrap().get(name).cloned() {
+            return Some(have);
+        }
+        let watched = self.watched.lock().unwrap().get(name).cloned()?;
+        let data = self
+            .refresher
+            .current(&watched, Duration::from_secs(10))
+            .await?;
+        Some((*data).clone())
+    }
+
+    /// `fs.unlock` over a relay of its own: the first one of an
+    /// incarnation reaches its credential gate, which answers once the
+    /// engine runs and then closes its connections (module docs). Bounded
+    /// by the ready timeout: the engine starts before the answer.
+    async fn unlock_once(&self, pod: &Pod, secrets: &Secrets) -> Result<(), ControlError> {
+        let name = pod.metadata.name.as_deref().unwrap_or_default();
+        let Some(params) = unlock_params(&pod_unlock_target(pod), secrets) else {
+            return Err(ControlError::unavailable(format!(
+                "engine pod {name} waits for its credentials, and the secret this request \
+                 carries holds neither aws_access_key_id/aws_secret_access_key nor \
+                 e2e_passphrase"
+            )));
+        };
+        let relay = self.exec_relay(pod, self.cfg.ready_timeout).await?;
+        relay.client.fs_unlock(params).await.map_err(|e| {
+            ControlError::new(
+                e.kind,
+                format!("fs.unlock on engine pod {name}: {}", e.message),
+            )
+        })?;
+        tracing::info!(pod = name, "engine pod unlocked");
+        Ok(())
+    }
+
+    /// Bring `name` up (from `spec` if it must be created), unlock it if it
+    /// waits for its credentials, push `secrets` to it if they are new to
+    /// it, and connect (module docs).
+    async fn connect(
+        &self,
+        name: &str,
+        spec: Option<&Pod>,
+        secrets: &Secrets,
+    ) -> Result<Arc<Relay>, ControlError> {
+        let lock = self.bringup_lock(name);
+        let _guard = lock.lock().await;
+        self.remember(name, secrets);
+        let pod = self.ensure_ready(name, spec).await?;
+        self.attach(name, &pod, secrets).await
+    }
+
+    /// Keep `secrets` (if they hold credentials) as pod `name`'s, to unlock
+    /// a later incarnation with.
+    fn remember(&self, name: &str, secrets: &Secrets) {
+        if unlock_params("", secrets).is_some() {
+            self.secrets
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), secrets.clone());
+        }
+    }
+
+    /// [`Self::connect`] to `pod`, `Ready` already; the caller holds its
+    /// bring-up lock.
+    async fn attach(
+        &self,
+        name: &str,
+        pod: &Pod,
+        secrets: &Secrets,
+    ) -> Result<Arc<Relay>, ControlError> {
+        let pod = pod.clone();
+        let awaits = awaits_unlock(&pod);
+        let relay = match self.live_relay(&pod) {
+            Some(relay) => relay,
+            None if awaits => match self.known_secrets(name).await {
+                Some(known) => {
+                    self.unlock_once(&pod, &known).await?;
+                    let relay = self.dial_relay(&pod).await?;
+                    *relay.unlocked.lock().unwrap() = Some(fingerprint(&known));
+                    relay
+                }
+                None => {
+                    // Perhaps unlocked by an earlier controller process:
+                    // the daemon answers; a gate says it waits.
+                    let relay = self.dial_relay(&pod).await?;
+                    if let Err(e) = relay.client.fs_list().await {
+                        self.relays.lock().unwrap().remove(name);
+                        return Err(if is_awaiting_unlock(&e) {
+                            ControlError::unavailable(format!(
+                                "engine pod {name} waits for its credentials, and neither this \
+                                 request nor this controller has them (the class's \
+                                 provisioner/controller-expand secret, or its watched Secret)"
+                            ))
+                        } else {
+                            e
+                        });
+                    }
+                    relay
+                }
+            },
+            None => self.dial_relay(&pod).await?,
+        };
+        // A request with other credentials than the incarnation has: a
+        // rotation, in place (the daemon swaps its credential source).
+        if awaits && unlock_params("", secrets).is_some() {
+            let fp = fingerprint(secrets);
+            if *relay.unlocked.lock().unwrap() != Some(fp) {
+                if let Some(params) = unlock_params(&pod_unlock_target(&pod), secrets) {
+                    relay.client.fs_unlock(params).await?;
+                    *relay.unlocked.lock().unwrap() = Some(fp);
+                }
+            }
+        }
+        self.learn_uuid(&pod, &relay).await?;
+        Ok(relay)
+    }
+
+    /// For a `refreshing` class: remember pod `name`'s Secret and push each
+    /// change of it to the pod, from a task of its own (once per pod).
+    fn watch_rotations(&self, name: &str, pool: &PoolRef) {
+        let Some(secret) = pool.class.credential_secret.clone() else {
+            return;
+        };
+        if pool.class.credentials != CredentialMode::Refreshing {
+            return;
+        }
+        let first = self
+            .watched
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), secret.clone())
+            .is_none();
+        if !first {
+            return;
+        }
+        let latest = self.refresher.subscribe(&secret);
+        let (this, landed_in) = (self.this.clone(), self.this.clone());
+        let (pod, landed_pod) = (name.to_string(), name.to_string());
+        tokio::spawn(crate::credentials::follow_rotations(
+            latest,
+            secret,
+            name.to_string(),
+            move |data| {
+                let this = this.clone();
+                let pod = pod.clone();
+                async move {
+                    match this.upgrade() {
+                        Some(manager) => manager.rotate(&pod, &data).await,
+                        None => Ok(false),
+                    }
+                }
+            },
+            move |data| {
+                if let Some(manager) = landed_in.upgrade() {
+                    manager.remember(&landed_pod, data);
+                }
+            },
+        ));
+    }
+
+    /// Push `data` to pod `name` now, if it is up and has other
+    /// credentials (`Ok(true)`); otherwise (`Ok(false)`) it is what the
+    /// next incarnation gets. An error is the engine's refusal, or no
+    /// answer.
+    async fn rotate(&self, name: &str, data: &Secrets) -> Result<bool, ControlError> {
+        if unlock_params("", data).is_none() {
+            return Ok(false);
+        }
+        let relay = self.relays.lock().unwrap().get(name).cloned();
+        let Some(relay) = relay.filter(|r| r.client.is_connected()) else {
+            return Ok(false);
+        };
+        let fp = fingerprint(data);
+        if *relay.unlocked.lock().unwrap() == Some(fp) {
+            return Ok(false);
+        }
+        let target = match self.pods.get_opt(name).await {
+            Ok(Some(pod)) if awaits_unlock(&pod) => pod_unlock_target(&pod),
+            Ok(_) => return Ok(false),
+            Err(e) => {
+                return Err(kube_err(
+                    "reading the engine pod to rotate its credentials",
+                    e,
+                ))
+            }
+        };
+        let Some(params) = unlock_params(&target, data) else {
+            return Ok(false);
+        };
+        relay.client.fs_unlock(params).await?;
+        *relay.unlocked.lock().unwrap() = Some(fp);
+        Ok(true)
     }
 
     /// Learn (and label) the filesystem uuid `pod` serves, once per pod.
@@ -1564,96 +1784,6 @@ impl EnginePodManager {
         };
         self.by_uuid.lock().unwrap().insert(uuid, name);
         Ok(())
-    }
-
-    /// The pool serving `fs_uuid`, rebuilt from the cluster's PVs and
-    /// `StorageClass`es with its credentials (module docs), and whether its
-    /// pod reads a credentials `Secret` (`pool.secrets` may be empty when a
-    /// surviving one is reused).
-    async fn rebuild_pool(&self, fs_uuid: &str) -> Result<(PoolRef, bool), ControlError> {
-        let pvs: Api<PersistentVolume> = Api::all(self.client.clone());
-        let mut params = ListParams::default().limit(500);
-        let found = loop {
-            let page = pvs
-                .list(&params)
-                .await
-                .map_err(|e| kube_err("listing PersistentVolumes", e))?;
-            if let Some(hit) = page
-                .items
-                .into_iter()
-                .find_map(|pv| pool_shard_of(&pv, fs_uuid).map(|shard| (pv, shard)))
-            {
-                break Some(hit);
-            }
-            match page.metadata.continue_ {
-                Some(token) if !token.is_empty() => params = params.continue_token(&token),
-                _ => break None,
-            }
-        };
-        let Some((pv, shard)) = found else {
-            // Nothing names this filesystem any more: retryable, never a
-            // silent "deleted" (the filesystem may well still hold data).
-            return Err(ControlError::unavailable(format!(
-                "no engine pod serves filesystem {fs_uuid}, and no PersistentVolume of this                  driver names it to rebuild one from"
-            )));
-        };
-        let pv_name = pv.metadata.name.clone().unwrap_or_default();
-        let class_name = pv
-            .spec
-            .as_ref()
-            .and_then(|s| s.storage_class_name.clone())
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| {
-                ControlError::unavailable(format!(
-                    "PersistentVolume {pv_name} names no StorageClass to rebuild filesystem                      {fs_uuid}'s engine pod from"
-                ))
-            })?;
-        let classes: Api<StorageClass> = Api::all(self.client.clone());
-        let class = classes
-            .get(&class_name)
-            .await
-            .map_err(|e| kube_err(&format!("reading StorageClass {class_name}"), e))?;
-        let (mut pool, secret_ref) = pool_from_pv(&pv, &class, shard).map_err(|why| {
-            ControlError::unavailable(format!("rebuilding {pv_name}'s pool: {why}"))
-        })?;
-        let mut reads_secret = false;
-        if let Some((namespace, name)) = secret_ref {
-            reads_secret = true;
-            let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
-            match secrets.get_opt(&name).await {
-                Ok(Some(secret)) => {
-                    pool.secrets = secret
-                        .data
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(k, v)| (k, String::from_utf8_lossy(&v.0).into_owned()))
-                        .collect();
-                }
-                // Not readable by the controller (another namespace, plan
-                // §9) or gone: the pool's own copy may have survived.
-                other => {
-                    let own = secret_name(&pod_name(&pool));
-                    let survived = self
-                        .secrets
-                        .get_opt(&own)
-                        .await
-                        .map_err(|e| kube_err("reading the engine credentials secret", e))?
-                        .is_some();
-                    if !survived {
-                        let why = match other {
-                            Err(e) => e.to_string(),
-                            _ => "not found".into(),
-                        };
-                        return Err(ControlError::unavailable(format!(
-                            "rebuilding filesystem {fs_uuid}'s engine pod needs the provisioner                              secret {namespace}/{name} ({why}), and the pool's own copy {own}                              is gone too"
-                        )));
-                    }
-                }
-            }
-        }
-        tracing::info!(fs_uuid, pv = %pv_name, class = %class_name,
-            "rebuilding a lost engine pod's spec from its PersistentVolume");
-        Ok((pool, reads_secret))
     }
 
     /// The controller-owned pod that served `fs_uuid` last (cached, else by
@@ -1735,15 +1865,92 @@ impl EnginePodManager {
         }
     }
 
-    /// Bring `name` up (from `spec` if it must be created) and connect.
-    async fn connect(&self, name: &str, spec: Option<&Pod>) -> Result<Arc<Relay>, ControlError> {
-        let lock = self.bringup_lock(name);
-        let _guard = lock.lock().await;
-        let pod = self.ensure_ready(name, spec).await?;
-        let relay = self.relay(&pod).await?;
-        self.learn_uuid(&pod, &relay).await?;
-        Ok(relay)
+    /// The pool serving `fs_uuid`, rebuilt from the cluster's PVs and
+    /// `StorageClass`es, with its provisioner secret's data when the
+    /// controller may read it (module docs).
+    async fn rebuild_pool(&self, fs_uuid: &str) -> Result<PoolRef, ControlError> {
+        let pvs: Api<PersistentVolume> = Api::all(self.client.clone());
+        let mut params = ListParams::default().limit(500);
+        let found = loop {
+            let page = pvs
+                .list(&params)
+                .await
+                .map_err(|e| kube_err("listing PersistentVolumes", e))?;
+            if let Some(hit) = page
+                .items
+                .into_iter()
+                .find_map(|pv| pool_shard_of(&pv, fs_uuid).map(|shard| (pv, shard)))
+            {
+                break Some(hit);
+            }
+            match page.metadata.continue_ {
+                Some(token) if !token.is_empty() => params = params.continue_token(&token),
+                _ => break None,
+            }
+        };
+        let Some((pv, shard)) = found else {
+            // Nothing names this filesystem any more: retryable, never a
+            // silent "deleted" (the filesystem may well still hold data).
+            return Err(ControlError::unavailable(format!(
+                "no engine pod serves filesystem {fs_uuid}, and no PersistentVolume of this \
+                 driver names it to rebuild one from"
+            )));
+        };
+        let pv_name = pv.metadata.name.clone().unwrap_or_default();
+        let class_name = pv
+            .spec
+            .as_ref()
+            .and_then(|s| s.storage_class_name.clone())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                ControlError::unavailable(format!(
+                    "PersistentVolume {pv_name} names no StorageClass to rebuild filesystem \
+                     {fs_uuid}'s engine pod from"
+                ))
+            })?;
+        let classes: Api<StorageClass> = Api::all(self.client.clone());
+        let class = classes
+            .get(&class_name)
+            .await
+            .map_err(|e| kube_err(&format!("reading StorageClass {class_name}"), e))?;
+        let (mut pool, secret_ref) = pool_from_pv(&pv, &class, shard).map_err(|why| {
+            ControlError::unavailable(format!("rebuilding {pv_name}'s pool: {why}"))
+        })?;
+        if let Some((namespace, name)) = secret_ref {
+            let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
+            match secrets.get_opt(&name).await {
+                Ok(Some(secret)) => {
+                    pool.secrets = secret
+                        .data
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, v)| (k, String::from_utf8_lossy(&v.0).into_owned()))
+                        .collect();
+                }
+                // Not readable by the controller (another namespace, plan
+                // §9) or gone: the pod comes up and waits, and a request
+                // that carries the secret unlocks it.
+                Ok(None) => tracing::warn!(fs_uuid, secret = %format!("{namespace}/{name}"),
+                    "the rebuilt pool's provisioner secret does not exist"),
+                Err(e) => tracing::warn!(fs_uuid, secret = %format!("{namespace}/{name}"),
+                    error = %e, "cannot read the rebuilt pool's provisioner secret"),
+            }
+        }
+        tracing::info!(fs_uuid, pv = %pv_name, class = %class_name,
+            "rebuilding a lost engine pod's spec from its PersistentVolume");
+        Ok(pool)
     }
+}
+
+/// The `fs.unlock` target of a running engine pod: the `--s3` URL its
+/// annotation records ([`unlock_target`] for its pool).
+fn pod_unlock_target(pod: &Pod) -> String {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_S3))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// A terminated pod's spec, as a fresh pod object.
@@ -1770,20 +1977,22 @@ fn respawn(old: &Pod) -> Pod {
 #[async_trait]
 impl Engines for EnginePodManager {
     async fn pool(&self, pool: &PoolRef) -> Result<Arc<dyn ControlClient>, ControlError> {
-        if !pool.secrets.is_empty() {
-            self.ensure_secret(pool).await?;
-        }
         let spec = engine_pod(pool, &self.cfg, self.owner.as_ref());
         let name = pod_name(pool);
         self.specs
             .lock()
             .unwrap()
             .insert(name.clone(), spec.clone());
-        let relay = self.connect(&name, Some(&spec)).await?;
+        self.watch_rotations(&name, pool);
+        let relay = self.connect(&name, Some(&spec), &pool.secrets).await?;
         Ok(Arc::new(PoolClient(relay)))
     }
 
-    async fn filesystem(&self, fs_uuid: &str) -> Result<Arc<dyn ControlClient>, ControlError> {
+    async fn filesystem(
+        &self,
+        fs_uuid: &str,
+        secrets: &Secrets,
+    ) -> Result<Arc<dyn ControlClient>, ControlError> {
         let name = self.pod_for(fs_uuid).await?;
         if let Some(name) = name {
             let spec = self.specs.lock().unwrap().get(&name).cloned();
@@ -1795,22 +2004,23 @@ impl Engines for EnginePodManager {
                     .map_err(|e| kube_err("reading the engine pod", e))?
                     .is_some();
             if present {
-                let relay = self.connect(&name, spec.as_ref()).await?;
+                let relay = self.connect(&name, spec.as_ref(), secrets).await?;
                 return Ok(Arc::new(PoolClient(relay)));
             }
         }
         // No pod and no spec: rebuild both from the cluster (module docs).
-        let (pool, reads_secret) = self.rebuild_pool(fs_uuid).await?;
-        if !pool.secrets.is_empty() {
-            self.ensure_secret(&pool).await?;
+        let mut pool = self.rebuild_pool(fs_uuid).await?;
+        if unlock_params("", secrets).is_some() {
+            pool.secrets = secrets.clone();
         }
-        let spec = engine_pod_with(&pool, &self.cfg, self.owner.as_ref(), reads_secret);
+        let spec = engine_pod(&pool, &self.cfg, self.owner.as_ref());
         let name = pod_name(&pool);
         self.specs
             .lock()
             .unwrap()
             .insert(name.clone(), spec.clone());
-        let relay = self.connect(&name, Some(&spec)).await?;
+        self.watch_rotations(&name, &pool);
+        let relay = self.connect(&name, Some(&spec), &pool.secrets).await?;
         let serves = self.by_uuid.lock().unwrap().get(fs_uuid).cloned();
         if serves.as_deref() != Some(name.as_str()) {
             return Err(ControlError::failed(format!(
@@ -1821,7 +2031,11 @@ impl Engines for EnginePodManager {
         Ok(Arc::new(PoolClient(relay)))
     }
 
-    async fn running(&self, fs_uuid: &str) -> Result<Option<Arc<dyn ControlClient>>, ControlError> {
+    async fn running(
+        &self,
+        fs_uuid: &str,
+        secrets: &Secrets,
+    ) -> Result<Option<Arc<dyn ControlClient>>, ControlError> {
         let Some(name) = self.pod_for(fs_uuid).await? else {
             return Ok(None);
         };
@@ -1831,8 +2045,8 @@ impl Engines for EnginePodManager {
         else {
             return Ok(None);
         };
-        let relay = self.relay(&pod).await?;
-        self.learn_uuid(&pod, &relay).await?;
+        self.remember(&name, secrets);
+        let relay = self.attach(&name, &pod, secrets).await?;
         Ok(Some(Arc::new(PoolClient(relay))))
     }
 
@@ -1943,8 +2157,10 @@ async fn wait_existing_ready(
 /// pod on the node and every mount with it, which is the outage §2.1 puts
 /// engine pods in their own pods to avoid. Uninstalling the driver still
 /// takes them (the `DaemonSet` goes). Its hostPaths are §7's own,
-/// `<hostRoot>/{node-identity,sockets}/<unit>/`: the meta store survives
-/// a container restart, and the node identity with it.
+/// `<hostRoot>/{node-identity,sockets}/<unit>/`, made by the plugin owned
+/// by the engine's uid before the pod is created ([`prepare_unit_dirs`]):
+/// the meta store survives a container restart, and the node identity
+/// with it.
 ///
 /// **Reaching it.** The plugin is on the same node, so it dials the pod's
 /// control socket directly through the shared hostPath — the only
@@ -1956,16 +2172,12 @@ async fn wait_existing_ready(
 /// `CONSTELLATION_CONTROL_POLICY` — and never into `sockets/<unit>/`, which
 /// the engine owns and could plant a symlink in ([`write_private_file`]).
 ///
-/// **Credentials.** The node plugin has no permission on Secrets (plan 37
-/// §9): an engine opens S3 at start, so the pod references the pool's
-/// credentials `Secret` the *controller* writes on `CreateVolume`
-/// (`constellation-engine-<unit>-controller-credentials`, [`EngineRole::secret_name`]),
-/// and kubelet resolves it (the node authorizer admits a pod's own
-/// `secretKeyRef`s); the request's node-stage secret then reaches the
-/// running pod through `fs.unlock` (`crate::node`), which is also how a
-/// rotation does. A pool no `CreateVolume` of this driver has seen (only
-/// static PVs) has no such `Secret`: its node pods start on the SDK's
-/// default chain (IRSA, EKS Pod Identity) or not at all.
+/// **Credentials** ([`crate::credentials`]). The node plugin has no
+/// permission on Secrets but the ones `refreshing` classes name: what
+/// unlocks a node's engine pod is the request's node-stage secret
+/// (kubelet resolves it), sent with `fs.unlock` over a connection of its
+/// own once per incarnation, and again whenever the plugin is handed other
+/// credentials for it (a later stage, a watched Secret's change).
 pub struct NodeEnginePods {
     pods: Api<Pod>,
     cfg: EnginePodConfig,
@@ -1973,6 +2185,9 @@ pub struct NodeEnginePods {
     owner: Option<OwnerReference>,
     /// pod name → (incarnation, connection) of the incarnation last dialled.
     clients: Mutex<HashMap<String, (String, Arc<SocketControlClient>)>>,
+    /// pod name → (incarnation, fingerprint) of the last `fs.unlock` this
+    /// process sent it.
+    unlocked: Mutex<HashMap<String, (String, [u8; 32])>>,
     bringup: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -2007,6 +2222,7 @@ impl NodeEnginePods {
             node,
             owner,
             clients: Mutex::default(),
+            unlocked: Mutex::default(),
             bringup: Mutex::default(),
         }
     }
@@ -2085,7 +2301,15 @@ impl NodeEnginePods {
                 "writing the engine pod's allowlist {}: {e}",
                 root.join(POLICY_DIR).join(unit).join(POLICY_FILE).display()
             ))
-        })
+        })?;
+        prepare_unit_dirs(
+            root,
+            &["node-identity", "sockets"],
+            unit,
+            ENGINE_UID as u32,
+            ENGINE_UID as u32,
+        )
+        .map_err(|e| ControlError::failed(format!("preparing the engine pod's directories: {e}")))
     }
 
     fn bringup_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -2095,6 +2319,57 @@ impl NodeEnginePods {
             .entry(name.to_string())
             .or_default()
             .clone()
+    }
+
+    /// `fs.unlock` to `pod` over a connection of its own (module docs:
+    /// the gate answers nothing else and closes its connections), unless
+    /// this incarnation already has exactly these credentials from us.
+    async fn unlock_pod(
+        &self,
+        pod: &Pod,
+        unit: &str,
+        secrets: &Secrets,
+    ) -> Result<(), ControlError> {
+        let name = pod.metadata.name.clone().unwrap_or_default();
+        let inc = incarnation(pod);
+        let fp = fingerprint(secrets);
+        let had = self.unlocked.lock().unwrap().get(&name).cloned();
+        if had.as_ref() == Some(&(inc.clone(), fp)) {
+            return Ok(());
+        }
+        let Some(params) = unlock_params(&pod_unlock_target(pod), secrets) else {
+            return Ok(());
+        };
+        let socket = self
+            .sockets_dir(unit)
+            .join(control_socket_file(pod_generation(pod)));
+        let client = SocketControlClient::connect_unix(&socket)
+            .await
+            .map_err(|e| {
+                ControlError::unavailable(format!(
+                    "dialling engine pod {name} at {}: {}",
+                    socket.display(),
+                    e.message
+                ))
+            })?
+            .with_timeout(self.cfg.ready_timeout);
+        client.fs_unlock(params).await.map_err(|e| {
+            ControlError::new(
+                e.kind,
+                format!("fs.unlock on engine pod {name}: {}", e.message),
+            )
+        })?;
+        let first = had.as_ref().is_none_or(|(i, _)| *i != inc);
+        if first {
+            // A connection made before it started was the gate's.
+            self.clients.lock().unwrap().remove(&name);
+        }
+        self.unlocked
+            .lock()
+            .unwrap()
+            .insert(name.clone(), (inc, fp));
+        tracing::info!(pod = %name, rotation = !first, "engine pod unlocked");
+        Ok(())
     }
 
     /// A connection to `pod` (ready), dialled anew for a new incarnation or
@@ -2219,7 +2494,7 @@ impl NodeEngines for NodeEnginePods {
         &self,
         pool: &PoolRef,
         fs_uuid: &str,
-        reads_secret: bool,
+        unlock: Option<&Secrets>,
     ) -> Result<NodeEngine, ControlError> {
         let unit = unit_name(pool);
         // One bring-up per unit, whatever generation its pod is.
@@ -2232,12 +2507,14 @@ impl NodeEngines for NodeEnginePods {
             &self.cfg,
             &self.node,
             self.owner.as_ref(),
-            reads_secret,
             fs_uuid,
             generation,
         );
         let name = node_pod_name_gen(&unit, &self.node, generation);
         let pod = ensure_pod_ready(&self.pods, &name, Some(&spec), self.cfg.ready_timeout).await?;
+        if let (true, Some(secrets)) = (awaits_unlock(&pod), unlock) {
+            self.unlock_pod(&pod, &unit, secrets).await?;
+        }
         self.dial(&pod, &unit).await
     }
 
@@ -2245,6 +2522,20 @@ impl NodeEngines for NodeEnginePods {
         match self.serving(unit).await? {
             Some(pod) => self.dial(&pod, unit).await.map(Some),
             None => Ok(None),
+        }
+    }
+
+    async fn rotate(&self, unit: &str, secrets: &Secrets) -> Result<bool, ControlError> {
+        // The bring-up's lock (one per unit, whatever generation its pod
+        // is): a rotation never meets a pod half brought up.
+        let lock = self.bringup_lock(unit);
+        let _guard = lock.lock().await;
+        match self.serving(unit).await? {
+            Some(pod) if awaits_unlock(&pod) => {
+                self.unlock_pod(&pod, unit, secrets).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -2691,7 +2982,7 @@ mod tests {
         let long = pool(&[("bucket", "b"), ("prefix", &"Ü".repeat(80))], 63);
         assert!(is_dns_label(&pool_label(&long)), "{}", pool_label(&long));
         let socket = format!(
-            "/var/lib/constellation-csi/sockets/{}-controller/control.sock",
+            "/var/lib/constellation-csi/sockets/{}/control.sock",
             unit_name(&long)
         );
         assert!(socket.len() < 108, "{socket}");
@@ -2715,7 +3006,7 @@ mod tests {
         let json = serde_json::to_string(&pod).unwrap();
         assert!(
             !json.contains("AKIA-not-in-the-spec"),
-            "secrets stay in the Secret"
+            "credentials never enter a pod spec"
         );
         let spec = pod.spec.as_ref().unwrap();
         assert_eq!(spec.node_name, None, "§7: never nodeName-pinned");
@@ -2723,17 +3014,13 @@ mod tests {
         let psc = spec.security_context.as_ref().unwrap();
         assert_eq!(psc.run_as_non_root, Some(true));
         let engine = &spec.containers[0];
-        let sc = engine.security_context.as_ref().unwrap();
-        assert_eq!(sc.allow_privilege_escalation, Some(false));
-        assert_eq!(sc.privileged, None);
-        assert_eq!(
-            sc.capabilities.as_ref().unwrap().drop.as_deref(),
-            Some(&["ALL".to_string()][..])
-        );
-        assert!(sc.capabilities.as_ref().unwrap().add.is_none());
+        assert_restricted(engine);
         let args = engine.args.as_ref().unwrap();
         assert_eq!(args[..3], ["serve", "--s3", "s3://b/pool"]);
         assert!(args.windows(2).any(|w| w == ["--chunk-size", "1048576"]));
+        // §9: the credentials come by fs.unlock, never from the environment.
+        assert!(args.contains(&"--await-unlock".to_string()));
+        assert!(awaits_unlock(&pod));
         let envs = engine.env.as_ref().unwrap();
         let value = |n: &str| {
             envs.iter()
@@ -2743,45 +3030,70 @@ mod tests {
         assert_eq!(value("AWS_ENDPOINT").as_deref(), Some("http://floci:4566"));
         assert_eq!(value("AWS_ALLOW_HTTP").as_deref(), Some("true"));
         assert_eq!(value("AWS_REGION").as_deref(), Some("us-east-1"));
-        let key = envs.iter().find(|e| e.name == "AWS_ACCESS_KEY_ID").unwrap();
-        let sel = key
-            .value_from
-            .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(sel.name, format!("{}-credentials", pod_name(&p)));
+        assert!(envs.iter().all(|e| e.value_from.is_none()), "{envs:?}");
+        for var in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "CONSTELLATION_PASSPHRASE",
+        ] {
+            assert!(
+                envs.iter().all(|e| e.name != var),
+                "{var} in the environment"
+            );
+        }
         assert!(engine.readiness_probe.as_ref().unwrap().exec.is_some());
         let labels = pod.metadata.labels.as_ref().unwrap();
         assert_eq!(labels[LABEL_COMPONENT], "engine");
         assert_eq!(labels[LABEL_OWNER], "controller");
         assert_eq!(labels[LABEL_SHARD], "0");
-        let paths: Vec<String> = spec
-            .volumes
-            .as_ref()
-            .unwrap()
-            .iter()
-            .filter_map(|v| v.host_path.as_ref().map(|h| h.path.clone()))
-            .collect();
-        let unit = unit_name(&p);
         assert_eq!(
-            paths,
-            [
-                format!("/var/lib/constellation-csi/node-identity/{unit}-controller"),
-                format!("/var/lib/constellation-csi/sockets/{unit}-controller"),
-            ]
+            pod_unlock_target(&pod),
+            unlock_target(&p),
+            "fs.unlock names the --s3 URL"
         );
-        // The only privilege anywhere: the init container's CHOWN.
-        let init = &spec.init_containers.as_ref().unwrap()[0];
-        let caps = init
-            .security_context
-            .as_ref()
-            .unwrap()
-            .capabilities
-            .as_ref()
-            .unwrap();
-        assert_eq!(caps.add.as_deref(), Some(&["CHOWN".to_string()][..]));
+        // PodSecurity `restricted` as a whole: emptyDirs only, no init
+        // container (nothing to chown), no hostPath.
+        assert!(spec.init_containers.is_none());
+        let volumes = spec.volumes.as_ref().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .all(|v| v.empty_dir.is_some() && v.host_path.is_none()),
+            "{volumes:?}"
+        );
+        let names: Vec<&str> = volumes.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["node-identity", "sockets", "scratch"]);
+        // A class on the AWS chain does not wait; an E2E one still does.
+        let chain = pool(
+            &[("bucket", "b"), ("credentialSource", "aws-default-chain")],
+            0,
+        );
+        assert!(!awaits_unlock(&engine_pod(&chain, &cfg(), None)));
+        let chain_e2e = pool(
+            &[
+                ("bucket", "b"),
+                ("credentialSource", "aws-default-chain"),
+                ("e2e", "true"),
+            ],
+            0,
+        );
+        assert!(awaits_unlock(&engine_pod(&chain_e2e, &cfg(), None)));
+    }
+
+    /// PodSecurity `restricted`'s container rules (plan 37 §9).
+    fn assert_restricted(c: &Container) {
+        let sc = c.security_context.as_ref().unwrap();
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(sc.privileged, None);
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.read_only_root_filesystem, Some(true));
+        assert_eq!(
+            sc.seccomp_profile.as_ref().map(|p| p.type_.as_str()),
+            Some("RuntimeDefault")
+        );
+        let caps = sc.capabilities.as_ref().unwrap();
+        assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+        assert!(caps.add.is_none());
     }
 
     /// Plan 37 §7: a node's engine pod is the controller's shape, pinned,
@@ -2793,7 +3105,7 @@ mod tests {
         p.secrets
             .insert("aws_access_key_id".into(), "AKIA-not-in-the-spec".into());
         let node = "ip-10-0-0-1.ec2.internal";
-        let pod = node_engine_pod(&p, &cfg(), node, None, true, "uuid-1");
+        let pod = node_engine_pod(&p, &cfg(), node, None, "uuid-1");
         assert!(!serde_json::to_string(&pod)
             .unwrap()
             .contains("AKIA-not-in-the-spec"));
@@ -2828,22 +3140,17 @@ mod tests {
             .iter()
             .any(|e| e.name == "CONSTELLATION_CONTROL_POLICY"
                 && e.value.as_deref() == Some(POD_POLICY)));
-        let key = envs.iter().find(|e| e.name == "AWS_ACCESS_KEY_ID").unwrap();
-        let sel = key
-            .value_from
+        assert!(envs.iter().all(|e| e.value_from.is_none()), "{envs:?}");
+        assert!(args.contains(&"--await-unlock".to_string()));
+        assert_restricted(engine);
+        assert!(spec.init_containers.is_none(), "no root init container");
+        // The plugin makes the unit's directories (`prepare_unit_dirs`):
+        // the pod requires them to exist rather than have kubelet create
+        // them root-owned.
+        assert!(spec.volumes.as_ref().unwrap().iter().all(|v| v
+            .host_path
             .as_ref()
-            .unwrap()
-            .secret_key_ref
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            sel.name,
-            format!("constellation-engine-{unit}-controller-credentials"),
-            "the pool's Secret, which only the controller writes"
-        );
-        let sc = engine.security_context.as_ref().unwrap();
-        assert_eq!(sc.privileged, None);
-        assert_eq!(sc.allow_privilege_escalation, Some(false));
+            .is_none_or(|h| h.type_.as_deref() == Some("Directory"))));
         let paths: Vec<String> = spec
             .volumes
             .as_ref()
@@ -2871,13 +3178,6 @@ mod tests {
         assert_eq!(policy.read_only, Some(true));
         assert!(POD_POLICY.starts_with(&format!("{}/", policy.mount_path)));
         assert!(!POD_POLICY.starts_with(POD_SOCKET_DIR));
-        let init = &spec.init_containers.as_ref().unwrap()[0];
-        assert!(init
-            .volume_mounts
-            .as_ref()
-            .unwrap()
-            .iter()
-            .all(|m| m.name != POLICY_DIR));
         // The controller's pod of the same pool stays apart.
         let controller = engine_pod(&p, &cfg(), None);
         assert_ne!(controller.metadata.name, pod.metadata.name);
@@ -2897,7 +3197,7 @@ mod tests {
         let p = pool(&[("bucket", "b"), ("prefix", "pool")], 0);
         let node = "w1";
         let unit = unit_name(&p);
-        let first = node_engine_pod(&p, &cfg(), node, None, true, "uuid-1");
+        let first = node_engine_pod(&p, &cfg(), node, None, "uuid-1");
         let args = |pod: &Pod| {
             pod.spec.as_ref().unwrap().containers[0]
                 .args
@@ -2965,10 +3265,15 @@ mod tests {
         let spec = next.spec.as_ref().unwrap();
         let engine = &spec.containers[0];
         assert_eq!(engine.image.as_deref(), Some("constellation-csi:next"));
-        assert_eq!(
-            spec.init_containers.as_ref().unwrap()[0].image.as_deref(),
-            Some("constellation-csi:next")
+        assert!(
+            spec.init_containers.is_none(),
+            "no root init container (37-k6a)"
         );
+        // 37-k6a: the replacement waits for its credentials as its
+        // predecessor did — they come over the handoff, never in its spec.
+        assert!(awaits_unlock(&first));
+        assert!(awaits_unlock(&next));
+        assert!(engine.env.iter().flatten().all(|e| e.value_from.is_none()));
         let probe = engine.readiness_probe.as_ref().unwrap();
         let command = probe.exec.as_ref().unwrap().command.as_ref().unwrap();
         assert_eq!(
@@ -3029,6 +3334,43 @@ mod tests {
                 assert!(policy.contains(&format!("socket = \"{POD_SOCKET_DIR}/{file}\"")));
             }
         }
+    }
+
+    /// Must-fix 37-k6a: the controller-owned pod's allowlist is one
+    /// service grant, for the engine's uid on the pod's socket, labelled
+    /// `csi-controller`; the image's copy is the same text.
+    #[test]
+    fn the_controllers_grant_is_in_the_image_and_named_by_the_pod() {
+        let policy = controller_engine_policy();
+        let baked = include_str!("../../../deploy/docker/controller-engine-control-allow.toml");
+        let grants = |text: &str| {
+            text.lines()
+                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(grants(baked), grants(&policy));
+        assert!(policy.contains("principal = \"uid:65532\""));
+        assert!(policy.contains("label = \"csi-controller\""));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(POLICY_FILE);
+        std::fs::write(&path, baked).unwrap();
+        let loaded =
+            constellation_control::Policy::load(&path, Some(65532)).expect("a loadable allowlist");
+        assert_eq!(loaded.grants().len(), 1);
+        let pod = engine_pod(
+            &pool(&[("bucket", "b"), ("prefix", "pool")], 0),
+            &cfg(),
+            None,
+        );
+        let envs = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        assert!(envs.iter().any(|e| e.name == "CONSTELLATION_CONTROL_POLICY"
+            && e.value.as_deref() == Some(CONTROLLER_POD_POLICY)));
+        let dockerfile = include_str!("../../../deploy/docker/constellation-csi.Dockerfile");
+        assert!(
+            dockerfile.contains(CONTROLLER_POD_POLICY),
+            "the image does not install {CONTROLLER_POD_POLICY}"
+        );
     }
 
     #[test]
@@ -3114,6 +3456,52 @@ mod tests {
         assert!(write_private_file(&root, &["a/b"], POLICY_FILE, b"x").is_err());
     }
 
+    /// The node plugin makes a node-owned pod's hostPath directories,
+    /// owned by the engine (so no root init container chowns them), and
+    /// never follows a link planted where one of them goes.
+    #[test]
+    fn unit_dirs_are_made_for_the_engine_and_never_through_a_link() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        // SAFETY: no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        prepare_unit_dirs(&root, &["node-identity", "sockets"], "unit-a", uid, gid).unwrap();
+        for sub in ["node-identity", "sockets"] {
+            let meta = std::fs::symlink_metadata(root.join(sub).join("unit-a")).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+        // Idempotent, and it repairs a mode.
+        std::fs::set_permissions(
+            root.join("sockets/unit-a"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        prepare_unit_dirs(&root, &["sockets"], "unit-a", uid, gid).unwrap();
+        let mode = std::fs::metadata(root.join("sockets/unit-a"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A link where a unit directory goes: refused, its target untouched.
+        let target = dir.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("sockets/unit-b")).unwrap();
+        let err = prepare_unit_dirs(&root, &["sockets"], "unit-b", uid, gid).unwrap_err();
+        assert!(err.to_string().contains("unit-b"), "{err}");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "followed the link");
+        // A parent anyone could change is refused.
+        std::fs::set_permissions(root.join("sockets"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        assert!(prepare_unit_dirs(&root, &["sockets"], "unit-a", uid, gid).is_err());
+        // Not a path component: refused.
+        assert!(prepare_unit_dirs(&root, &["sockets"], "../x", uid, gid).is_err());
+    }
+
     #[test]
     fn label_values_are_valid_whatever_the_node_name() {
         assert_eq!(label_value("worker-1"), "worker-1");
@@ -3126,22 +3514,6 @@ mod tests {
         assert!(v.len() <= 63, "{v}");
         assert_ne!(v, label_value(&format!("{}.example.org", "a".repeat(80))));
         assert!(v.bytes().next().unwrap().is_ascii_alphanumeric());
-    }
-
-    #[test]
-    fn the_credentials_secret_carries_only_known_keys() {
-        let mut p = pool(&[("bucket", "b")], 0);
-        p.secrets.insert("aws_access_key_id".into(), "id".into());
-        p.secrets
-            .insert("aws_secret_access_key".into(), "key".into());
-        p.secrets.insert("unrelated".into(), "x".into());
-        let secret = credentials_secret(&p, &cfg(), None, &EngineRole::Controller);
-        let keys: Vec<&String> = secret.data.as_ref().unwrap().keys().collect();
-        assert_eq!(keys, ["aws_access_key_id", "aws_secret_access_key"]);
-        // And a pool with no secret gets no secret references at all.
-        let bare = engine_pod(&pool(&[("bucket", "b")], 0), &cfg(), None);
-        let envs = bare.spec.unwrap().containers[0].env.clone().unwrap();
-        assert!(envs.iter().all(|e| e.value_from.is_none()));
     }
 
     fn pv(handle: &str, driver: &str, class: &str) -> PersistentVolume {
@@ -3227,11 +3599,11 @@ mod tests {
             engine_pod(&created, &cfg(), None)
         );
         assert_eq!(secret, Some(("tenant-a".into(), "s3-data".into())));
-        // A reused surviving Secret is referenced exactly as a fresh one.
+        // Secrets never shape the pod: one with and one without are one spec.
         let mut with = created.clone();
         with.secrets.insert("aws_access_key_id".into(), "x".into());
         assert_eq!(
-            engine_pod_with(&pool_ref, &cfg(), None, true),
+            engine_pod(&pool_ref, &cfg(), None),
             engine_pod(&with, &cfg(), None)
         );
         // A class with no secret, and a class that cannot hold the shard.

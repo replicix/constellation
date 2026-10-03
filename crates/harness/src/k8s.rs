@@ -50,7 +50,13 @@
 //!    sidecar needs them).
 //! 4. A private floci S3 (`<cluster>-k8s-floci-<run id>`) on the `kind`
 //!    docker network, in memory, removed at the end; its credentials as
-//!    one Secret in the driver namespace.
+//!    one Secret in the driver namespace, and a second one
+//!    (`constellation-k8s-harness-rotating`) that `csi-secret-rotation`
+//!    rotates, which the chart lets the plugins watch
+//!    (`credentials.watchedSecrets`). floci accepts any key pair, so the
+//!    rotation scenario proves the swap from the engines' side (the
+//!    generation their S3 clients sign with, the audit log) rather than by
+//!    the old pair being refused.
 //!
 //! Each scenario then gets its own namespace and its own pool StorageClass
 //! whose prefix carries the run id. A new prefix is a new pool filesystem,
@@ -96,6 +102,8 @@ pub const HARNESS_CLUSTER: &str = "kind-harness";
 pub const DEFAULT_LANE: &str = "linux-k8s-kind";
 const BUCKET: &str = "k8s-harness";
 const CREDS_SECRET: &str = "constellation-k8s-harness-creds";
+/// The Secret `csi-secret-rotation` rotates (`credentialSource: refreshing`).
+pub const ROTATING_SECRET: &str = "constellation-k8s-harness-rotating";
 const RELEASE: &str = "constellation-csi";
 /// How long one `kubectl exec` may take before the harness calls the
 /// mount hung.
@@ -259,6 +267,54 @@ impl Kube {
             EXEC_TIMEOUT,
         )
         .with_context(|| format!("exec in {ns}/{pod}"))
+    }
+
+    /// One control call to an engine pod's daemon, over `kubectl exec` of
+    /// `constellation control-relay` (as the controller reaches its pods):
+    /// the relay runs as the engine's uid, the daemon's owner.
+    pub fn engine_call(&self, ns: &str, pod: &str, method: &str, params: Value) -> Result<Value> {
+        use constellation_control::transport::StreamTransport;
+        use constellation_control::{Client, ClientOptions, Principal};
+        let mut cmd = tokio::process::Command::new("kubectl");
+        cmd.arg("--kubeconfig").arg(&self.kubeconfig);
+        if let Some(ctx) = &self.context {
+            cmd.arg("--context").arg(ctx);
+        }
+        cmd.args(["exec", "-i", "-n", ns, pod, "-c", "engine", "--"])
+            .args([
+                "/usr/local/bin/constellation",
+                "control-relay",
+                "--socket",
+                "/run/constellation-csi/control.sock",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        crate::client::control_runtime().block_on(async {
+            let call = async {
+                let mut relay = cmd.spawn().context("spawning kubectl exec")?;
+                let stream = tokio::io::join(
+                    relay.stdout.take().context("relay stdout")?,
+                    relay.stdin.take().context("relay stdin")?,
+                );
+                let transport =
+                    std::sync::Arc::new(StreamTransport::new(stream, Principal::InProcess));
+                let client = Client::from_transport(transport, ClientOptions::default())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("handshake with {pod}: {}", e.message))?;
+                let out = client
+                    .call_json(method, params)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{method} on {pod}: {}", e.message));
+                drop(client);
+                let _ = relay.kill().await;
+                out
+            };
+            tokio::time::timeout(Duration::from_secs(60), call)
+                .await
+                .map_err(|_| anyhow::anyhow!("{method} on {pod}: no answer within 60 s"))?
+        })
     }
 
     fn helm(&self) -> Command {
@@ -538,6 +594,12 @@ impl Env {
             .args(["-n", &ns])
             .args(["--set", &format!("image.repository={repo}")])
             .args(["--set", &format!("image.tag={tag}")])
+            .args([
+                "--set",
+                &format!("credentials.watchedSecrets[0].namespace={ns}"),
+                "--set",
+                &format!("credentials.watchedSecrets[0].name={ROTATING_SECRET}"),
+            ])
             .args(["--wait", "--timeout", "300s"]);
         run_cmd(h, None, Duration::from_secs(420)).context("helm upgrade --install")?;
         for what in [
@@ -599,6 +661,7 @@ impl Env {
             "metadata": {"name": CREDS_SECRET, "namespace": ns},
             "stringData": {"aws_access_key_id": "test", "aws_secret_access_key": "test"}
         }))?;
+        kube.apply(&rotating_secret(&ns, 1))?;
         Ok(Self {
             kube,
             cluster: cluster.name.clone(),
@@ -660,6 +723,24 @@ impl Env {
     }
 }
 
+/// The rotating Secret's `generation`th key pair: fixture values for floci,
+/// which takes any. Never printed by the scenarios all the same.
+pub fn rotating_secret(ns: &str, generation: u32) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": {"name": ROTATING_SECRET, "namespace": ns},
+        "stringData": {
+            "aws_access_key_id": rotating_key(generation),
+            "aws_secret_access_key": format!("k8s-harness-rotation-secret-{generation}"),
+        }
+    })
+}
+
+/// The access key id of [`rotating_secret`]'s `generation`th pair.
+pub fn rotating_key(generation: u32) -> String {
+    format!("k8s-harness-rotation-key-{generation}")
+}
+
 /// One scenario's Kubernetes objects: a namespace for its PVCs and pods,
 /// a pool StorageClass of its own. `finish` tears them down and checks
 /// the teardown; `Drop` is the backstop when a scenario fails first.
@@ -672,6 +753,10 @@ pub struct Scope<'a> {
     /// included, with the driver's `constellation.dev/pool` label of its
     /// pool.
     classes: Vec<(String, String)>,
+    /// The Secret every class of the scope reads (provisioner and
+    /// node-stage), and the parameters they carry besides.
+    secret: String,
+    extra: Vec<(String, String)>,
     /// The scope's `VolumeSnapshotClass`, once made.
     snapshot_class: Option<String>,
     pvcs: Vec<String>,
@@ -694,6 +779,17 @@ pub fn data_dir(claim: &str) -> String {
 
 impl<'a> Scope<'a> {
     pub fn new(env: &'a Env, scenario: &str) -> Result<Self> {
+        Self::with_class(env, scenario, CREDS_SECRET, &[])
+    }
+
+    /// [`Scope::new`] whose class reads `secret` (provisioner and
+    /// node-stage) and carries `extra` parameters besides.
+    pub fn with_class(
+        env: &'a Env,
+        scenario: &str,
+        secret: &str,
+        extra: &[(&str, String)],
+    ) -> Result<Self> {
         let ns = format!("k8s-{scenario}-{}", env.run_id);
         env.kube.apply(&json!({
             "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}
@@ -705,6 +801,11 @@ impl<'a> Scope<'a> {
             sc: ns.clone(),
             ns,
             classes: Vec::new(),
+            secret: secret.to_string(),
+            extra: extra
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
             snapshot_class: None,
             pvcs: Vec::new(),
             no_engine_return: false,
@@ -728,7 +829,7 @@ impl<'a> Scope<'a> {
             ("chunkSize", "1MiB".into()),
             (
                 "csi.storage.k8s.io/provisioner-secret-name",
-                CREDS_SECRET.into(),
+                self.secret.clone(),
             ),
             (
                 "csi.storage.k8s.io/provisioner-secret-namespace",
@@ -736,7 +837,7 @@ impl<'a> Scope<'a> {
             ),
             (
                 "csi.storage.k8s.io/node-stage-secret-name",
-                CREDS_SECRET.into(),
+                self.secret.clone(),
             ),
             (
                 "csi.storage.k8s.io/node-stage-secret-namespace",
@@ -744,6 +845,9 @@ impl<'a> Scope<'a> {
             ),
         ] {
             params.insert(k.into(), Value::String(v));
+        }
+        for (k, v) in &self.extra {
+            params.insert(k.clone(), Value::String(v.clone()));
         }
         self.classes
             .push((name.to_string(), pool_label(&env.endpoint, BUCKET, prefix)));
@@ -1149,6 +1253,22 @@ impl<'a> Scope<'a> {
         Ok(mounts
             .lines()
             .any(|l| l.contains(&format!("/{hash}/globalmount ")) && l.contains(" - fuse")))
+    }
+
+    /// The mount id (`/proc/self/mountinfo`'s first field) of `handle`'s
+    /// staging mount on `worker`, if it is staged there: a remount is a new
+    /// id.
+    pub fn staging_mount_id(&self, worker: &str, handle: &str) -> Result<Option<String>> {
+        let hash: String = crate::model::sha256_of(handle.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let mounts = docker(&["exec", worker, "cat", "/proc/self/mountinfo"])?;
+        Ok(mounts
+            .lines()
+            .find(|l| l.contains(&format!("/{hash}/globalmount ")) && l.contains(" - fuse"))
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_string))
     }
 
     /// Delete the scope's pods, check every volume unstaged on every

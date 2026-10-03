@@ -993,6 +993,7 @@ pub fn resume_main(
             // headless `serve` node is replaced by restarting its pod.
             control_socket: None,
             persistent: false,
+            signals: None,
         },
         rt.handle().clone(),
     ) {

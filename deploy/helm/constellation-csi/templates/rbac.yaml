@@ -1,16 +1,19 @@
 # Plan 37 §9. Engine-pod lifecycle: pods, namespace-scoped (never
 # cluster-wide pod creation). PV/PVC read for the observability labels.
 # No cluster-wide Secret read: the sidecars and kubelet resolve
-# `*-secret-name` and pass the bytes in the request.
+# `*-secret-name` and pass the bytes in the request, and the plugins hand
+# them to an engine pod only as `fs.unlock` over its control socket
+# (37-k6a: nothing in a pod spec, an environment or a Secret the driver
+# writes).
 #
 # The node plugin additionally (37-k3a): `pods` patch (its engine pods'
 # view-count annotations, §7), `daemonsets` get on its own DaemonSet
 # (the engine pods' owner), and (37-k5a) `events` create: an engine-pod
-# handoff and a rollout's fallback are reported on the pod (§8, §10). No Secret permission at all: its engine pods
-# reference the pool's credentials Secret the controller writes (kubelet
-# resolves a pod's own secretKeyRefs through the node authorizer), and the
-# node-stage secret reaches a running engine through fs.unlock. It never
-# execs: it reaches its engine pods through their hostPath sockets.
+# handoff and a rollout's fallback are reported on the pod (§8, §10). No
+# Secret permission but the watched ones below: a replacement engine pod
+# gets its credentials from the pod it replaces, over the handoff (37-k6a),
+# never from a Secret. It never execs: it reaches its engine pods through
+# their hostPath sockets.
 #
 # The controller additionally (37-k2b, crates/csi/src/engine_pods.rs):
 # - `pods` patch: labels a controller-owned engine pod with the filesystem
@@ -18,9 +21,11 @@
 # - `pods/exec` create/get: the controller reaches an engine pod's control
 #   socket through an exec relay, and this grant *is* that channel's
 #   authorization (no network listener exists);
-# - `secrets` get/create/patch, in this namespace only: an engine pod opens
-#   S3 at start, so the request's provisioner-secret bytes are written to
-#   one Secret per pool here and read by the pod as `secretKeyRef`s;
+# - `secrets` get, in this namespace only: what external-provisioner and
+#   external-resizer (running as this ServiceAccount) read to resolve a
+#   class's provisioner/controller-expand secret — and what a rebuild of a
+#   lost engine pod reads. Never create or update (37-k6a removed the
+#   per-pool credentials Secret K2 wrote);
 # - `deployments` get: the controller Deployment's uid, for the engine
 #   pods' ownerReferences;
 # - `persistentvolumes` list and `storageclasses` get (cluster-wide): a
@@ -39,6 +44,12 @@
 # controller-owned engine pods of exactly the engine shape, and exec to the
 # control relay's command; see plan 37 §9. Engine pods run as the
 # `constellation-csi-engine` ServiceAccount, which nothing here binds.
+#
+# `credentials.watchedSecrets` (37-k6a, `credentialSource: refreshing`):
+# both plugins get `get`/`list`/`watch` on exactly those Secrets, by name
+# (`resourceNames`; the plugins list and watch with a `metadata.name` field
+# selector, which RBAC authorizes against the name), in each Secret's own
+# namespace — never a namespace's Secrets, never cluster-wide.
 {{- range $role := list "controller" "node" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -64,7 +75,7 @@ rules:
   {{- if eq $role "controller" }}
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, create, patch]
+    verbs: [get]
   - apiGroups: [""]
     resources: [pods/exec]
     # `get`: the exec stream is a WebSocket upgrade of a GET request.
@@ -197,4 +208,29 @@ roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: constellation-c
 subjects:
   - {kind: ServiceAccount, name: constellation-csi-controller, namespace: {{ $.Release.Namespace }}}
 {{- end }}
+{{- end }}
+{{- range $i, $w := .Values.credentials.watchedSecrets }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: constellation-csi-watch-{{ $w.name }}
+  namespace: {{ $w.namespace }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ $w.name | quote }}]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: constellation-csi-watch-{{ $w.name }}
+  namespace: {{ $w.namespace }}
+  labels: {{- include "csi.labels" $ | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: constellation-csi-watch-{{ $w.name }}}
+subjects:
+  - {kind: ServiceAccount, name: constellation-csi-controller, namespace: {{ $.Release.Namespace }}}
+  - {kind: ServiceAccount, name: constellation-csi-node, namespace: {{ $.Release.Namespace }}}
 {{- end }}

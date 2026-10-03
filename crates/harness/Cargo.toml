@@ -33,7 +33,7 @@ constellation-control.workspace = true
 # (`snapsched/journal/*.json`, `snapsched/state.json`), read back with the
 # writer's own types by the `snapsched*` scenarios' retention oracle.
 constellation-store-s3.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 fjall = { version = "3.1", package = "fjall" }
 # `s3auth`: SigV4 for the harness's own raw S3 requests against the process
 # backend (versitygw rejects anonymous requests, floci does not). Both are

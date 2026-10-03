@@ -1040,7 +1040,7 @@ unrelated processes on the host:
 kind = "service"
 principal = "uid:0"
 socket = "/var/lib/constellation-csi/sockets/pv-1/control.sock"
-role = "operator"
+role = "admin"
 label = "csi-node-plugin"
 ```
 
@@ -1066,7 +1066,40 @@ the method's minimum.
 
 The audit log of mutating calls (`control-audit.jsonl` in the daemon's state
 dir) is one JSON line per call; see the `constellation_control::audit` module
-docs for its exact fields.
+docs for its exact fields. A call whose client named whom it acts for
+(`Request.on_behalf_of`, e.g. the CSI driver's PersistentVolume name, plan
+37 K6a) carries `"on_behalf_of":"pvc-…"` in its line; it is the caller's
+claim, validated to at most 253 bytes of `[A-Za-z0-9._:/@-]` and never read
+by authorization. The plan 37 CSI node plugin's grant on an engine pod is
+`role = "admin"` (its `view.mount`/`view.unmount`/`fs.unlock` are
+admin-only methods), one row per engine pod's socket.
+
+**`constellation serve --await-unlock`** (plan 37 §9, K6a: Kubernetes engine
+pods): the S3 credentials and an E2E passphrase come from the first
+`fs.unlock` on the control socket (naming the `--s3` URL), never from the
+environment (`AWS_ACCESS_KEY_ID`, `CONSTELLATION_PASSPHRASE` are not read).
+Until then the socket — already under this allowlist and writing to this
+audit log — answers only `node.ping` and `fs.unlock`, and everything else
+`Unavailable` ("this engine is waiting for fs.unlock to supply its
+credentials"). The credentials are checked against the bucket before the
+daemon starts, and an E2E filesystem's passphrase against its keyring (a
+wrong pair or passphrase is an `fs.unlock` error, `Unavailable`, and the
+engine keeps waiting); `SIGTERM`/`SIGINT` while it waits exits 0 at once.
+A later `fs.unlock` rotates them in the running engine after one trial
+read of `meta.json` with the new pair: a pair S3 refuses is refused
+(`Denied`; `Unavailable` when S3 could not be asked) and the pair in use
+stays. The rotation shows in `fs.list` as the daemon's own entry's
+`credentials_generation` and `credentials_in_use` (the generation its S3
+clients last signed with). The process runs with core dumps off
+(`RLIMIT_CORE` 0, `PR_SET_DUMPABLE` 0), as do both CSI plugins.
+
+S3 error responses never reach an error text with their body: every S3
+client keeps only the error's `<Code>` and a fixed message (`S3 refused
+the credentials` for 401/403), because an authentication error's body
+echoes the request's access key id and string to sign. A controller-owned
+engine pod reads `CONSTELLATION_CONTROL_POLICY=/etc/constellation-csi/controller-engine/control-allow.toml`
+from the image: one `kind = "service"` grant for uid 65532 on its socket,
+`role = "admin"`, `label = "csi-controller"`.
 
 ### Fault injection (testing only)
 

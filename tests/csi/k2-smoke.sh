@@ -21,9 +21,13 @@
 #      else and into a node-plugin pod is denied; the engine pod's own
 #      shape is admitted (server dry run), a privileged pod and engine
 #      pods running `sh`, with a service-account token, under another
-#      ServiceAccount, with `envFrom`, another Secret, a projected token,
-#      another hostPath, an `sh` init container or a lifecycle hook are
-#      denied;
+#      ServiceAccount, with `envFrom`, a Secret in its environment, a
+#      projected token, a hostPath, an init container, an added capability,
+#      a writable root or a lifecycle hook are denied (the EKS IRSA webhook's
+#      projected token is admitted, another audience or a writable mount of
+#      it is not); the engine pod has
+#      no credentials in its spec or environment (37-k6a: they come by
+#      `fs.unlock`);
 #   7. a lost engine pod the controller has no spec for (controller pods
 #      restarted, then the engine pod deleted) is rebuilt from the PV and
 #      its StorageClass by the next expansion;
@@ -161,9 +165,19 @@ jq -e '.spec.containers[0].securityContext.allowPrivilegeEscalation == false
 jq -e '.spec.nodeName != null and (.metadata.ownerReferences[0].kind == "Deployment")' \
     <<<"$spec" >/dev/null || { echo "engine pod not scheduled / not owned by the controller Deployment"; exit 1; }
 
+# 37-k6a: no credential in the pod spec or the engine's environment.
+jq -e '([.spec.containers[0].env[] | select(.valueFrom != null or (.name | test("AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|CONSTELLATION_PASSPHRASE")))] | length == 0)
+       and (.spec.containers[0].args | any(. == "--await-unlock"))
+       and (.spec.initContainers == null)
+       and ([.spec.volumes[] | select(.hostPath != null)] | length == 0)' \
+    <<<"$spec" >/dev/null || { echo "engine pod carries credentials, an init container or a hostPath"; exit 1; }
 in_pod() { k -n "$ns" exec "$pod" -c engine -- /usr/local/bin/constellation "$@"; }
 s3url="s3://$bucket/constellation-csi/k2-pool"
-meta_uuid=$(in_pod status --s3 "$s3url" 2>/dev/null | jq -r .uuid)
+# The engine's environment holds no credentials: this one-off reader gets
+# the test pair on its own command line.
+meta_uuid=$(k -n "$ns" exec "$pod" -c engine -- env AWS_ACCESS_KEY_ID=test \
+    AWS_SECRET_ACCESS_KEY=test /usr/local/bin/constellation status --s3 "$s3url" 2>/dev/null \
+    | jq -r .uuid)
 echo "   meta.json uuid at $s3url: $meta_uuid"
 [ "$meta_uuid" = "$uuid_a" ] || { echo "meta.json uuid $meta_uuid != volume uuid $uuid_a"; exit 1; }
 
@@ -222,7 +236,7 @@ denied() { # denied WHAT CMD...: the call must fail with this policy's denial
 denied "exec into $pod running sh" \
     k "${as_ctl[@]}" -n "$ns" exec "$pod" -c engine -- sh -c id
 # The real engine pod's shape, as a new pod of another unit (the policy ties
-# the name, the hostPaths and the credentials Secret to one unit).
+# the name to the engine shape).
 unit=${pod#constellation-engine-}
 unit=${unit%-controller}
 clone() { # clone JQ: $pod's spec as a new pod, edited by JQ
@@ -241,6 +255,22 @@ denied_create() { # denied_create WHAT JQ: the clone, edited by JQ, is refused
     fi
     refused "$1" "$out"
 }
+# credentialSource: aws-default-chain on EKS: the IRSA webhook's projected
+# token (and its literal env) is the one addition the policy admits.
+irsa='.spec.volumes += [{name: "aws-iam-token", projected: {sources: [{serviceAccountToken:
+        {audience: "sts.amazonaws.com", expirationSeconds: 86400, path: "token"}}]}}]
+    | .spec.containers[0].volumeMounts += [{name: "aws-iam-token", readOnly: true,
+        mountPath: "/var/run/secrets/eks.amazonaws.com/serviceaccount"}]
+    | .spec.containers[0].env += [{name: "AWS_ROLE_ARN", value: "arn:aws:iam::1:role/x"},
+        {name: "AWS_WEB_IDENTITY_TOKEN_FILE",
+         value: "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"}]'
+clone "$irsa" | k "${as_ctl[@]}" -n "$ns" create --dry-run=server -f - >/dev/null \
+    || { echo "the controller SA may not create its engine pod with the IRSA token"; exit 1; }
+echo "   admitted: the engine pod with the EKS IRSA projected token"
+denied_create "an IRSA-named token for another audience" \
+    "$irsa"' | (.spec.volumes[] | select(.name == "aws-iam-token") | .projected.sources[0].serviceAccountToken.audience) = "kubernetes"'
+denied_create "a writable IRSA token mount" \
+    "$irsa"' | (.spec.containers[0].volumeMounts[] | select(.name == "aws-iam-token") | .readOnly) = false'
 denied_create "an engine-shaped pod running sh" '.spec.containers[0].command = ["sh", "-c", "id"]'
 denied_create "an engine pod with automountServiceAccountToken: true" \
     '.spec.automountServiceAccountToken = true'
@@ -248,14 +278,18 @@ denied_create "an engine pod under another ServiceAccount" \
     'del(.spec.serviceAccount) | .spec.serviceAccountName = "constellation-csi-controller"'
 denied_create "an engine pod with envFrom" \
     '.spec.containers[0].envFrom = [{secretRef: {name: "constellation-s3-creds"}}]'
-denied_create "an engine pod reading another Secret" \
+denied_create "an engine pod reading a Secret into its environment" \
     '.spec.containers[0].env += [{name: "X", valueFrom: {secretKeyRef: {name: "constellation-s3-creds", key: "aws_access_key_id"}}}]'
 denied_create "an engine pod with a projected token volume" \
     '.spec.volumes += [{name: "tok", projected: {sources: [{serviceAccountToken: {path: "t"}}]}}]'
-denied_create "an engine pod mounting another host directory" \
-    '(.spec.volumes[] | select(.name == "sockets") | .hostPath.path) = "/var/lib/kubelet"'
-denied_create "an engine pod whose init container runs sh" \
-    '.spec.initContainers[0].command = ["sh", "-c", "id"]'
+denied_create "an engine pod mounting a host directory" \
+    '(.spec.volumes[] | select(.name == "sockets")) |= {name: "sockets", hostPath: {path: "/var/lib/kubelet"}}'
+denied_create "an engine pod with an init container" \
+    '.spec.initContainers = [.spec.containers[0] | .name = "init" | del(.startupProbe, .readinessProbe, .livenessProbe)]'
+denied_create "an engine pod adding a capability" \
+    '.spec.containers[0].securityContext.capabilities.add = ["CHOWN"]'
+denied_create "an engine pod with a writable root" \
+    '.spec.containers[0].securityContext.readOnlyRootFilesystem = false'
 denied_create "an engine pod with a lifecycle hook" \
     '.spec.containers[0].lifecycle = {postStart: {exec: {command: ["sh", "-c", "id"]}}}'
 

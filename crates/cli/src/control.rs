@@ -61,9 +61,25 @@ pub fn daemon_router(
     state_dir: &Path,
     bound_socket: Option<PathBuf>,
 ) -> Router {
+    with_daemon_policy(
+        constellation_engine::control::router(service),
+        state_dir,
+        bound_socket,
+    )
+}
+
+/// `router` under this daemon's allowlist and audit log — the ones
+/// [`daemon_router`] uses, so `serve --await-unlock`'s credential gate
+/// (which answers before the engine exists) admits and records exactly
+/// who the daemon will.
+pub fn with_daemon_policy(
+    router: Router,
+    state_dir: &Path,
+    bound_socket: Option<PathBuf>,
+) -> Router {
     let (owner, _) = constellation_platform::native().process.effective_ids();
     let policy = load_policy(policy_path().as_deref(), owner, bound_socket);
-    let mut router = constellation_engine::control::router(service).with_policy(policy);
+    let mut router = router.with_policy(policy);
     match constellation_control::FileAuditSink::open(&state_dir.join(AUDIT_FILE)) {
         Ok(sink) => router = router.with_audit(Arc::new(sink)),
         Err(e) => tracing::warn!(error = %e, "control audit log unavailable"),
@@ -293,15 +309,20 @@ impl ControlHost for DaemonHost {
         }
     }
 
+    fn handoff_secrets(&self) -> Option<constellation_platform::EphemeralSecretStore> {
+        self.node.upgrade()?.handoff_secrets()
+    }
+
     fn handoff(
         &self,
         p: &HandoffParams,
         _fd: Option<OwnedFd>,
+        service: Option<&constellation_control::authz::ServiceMatch>,
     ) -> Result<HandoffReport, ControlError> {
         let binary = match &p.target {
             HandoffTarget::Exec { binary } => binary.clone(),
             HandoffTarget::Socket => {
-                return crate::handoff_socket::sender(&self.node()?, p, _fd);
+                return crate::handoff_socket::sender(&self.node()?, p, _fd, service);
             }
         };
         if p.phase.is_some() || p.deadline_ms.is_some() {

@@ -1,0 +1,15 @@
+# The control-socket allowlist of a controller-owned engine pod (plan 37 §9,
+# K6a): the CSI controller's relay (`constellation control-relay`, exec'd
+# into the pod as its uid 65532) is the `csi-controller` service on the
+# pod's socket, so every call it makes is attributed to that service in the
+# pod's audit log. Baked into the image at
+# /etc/constellation-csi/controller-engine/control-allow.toml and named by
+# CONSTELLATION_CONTROL_POLICY in the pod spec. Must equal
+# `constellation_csi::engine_pods::controller_engine_policy()` (a unit test
+# holds them together).
+[[grant]]
+kind = "service"
+principal = "uid:65532"
+socket = "/run/constellation-csi/control.sock"
+role = "admin"
+label = "csi-controller"

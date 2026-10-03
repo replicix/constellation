@@ -106,6 +106,16 @@ pub struct InMemoryControl {
     fds_received: AtomicU64,
     /// How many `fs.unlock` calls arrived.
     unlocks: AtomicU64,
+    /// The access key id of the last `fs.unlock` (tests only: this fake
+    /// never runs anywhere a credential matters).
+    last_unlock_key: Mutex<Option<String>>,
+    /// An engine waiting for its credentials (`serve --await-unlock`):
+    /// everything but `fs.unlock` and `node.ping` answers
+    /// [`constellation_control::proto::AWAITING_UNLOCK`] until an unlock.
+    gated: std::sync::atomic::AtomicBool,
+    /// Every call, with the `on_behalf_of` attribution it would carry on
+    /// the wire (`constellation_control::client::on_behalf_of`).
+    calls: Mutex<Vec<(&'static str, Option<String>)>>,
     /// Every subtree usage walk: a `quota_get` of anything but `/` (the
     /// real engine's `recursive_size`, O(entries)).
     usage_walks: AtomicU64,
@@ -181,6 +191,9 @@ impl InMemoryControl {
             any_path: std::sync::atomic::AtomicBool::new(false),
             fds_received: AtomicU64::new(0),
             unlocks: AtomicU64::new(0),
+            last_unlock_key: Mutex::new(None),
+            gated: std::sync::atomic::AtomicBool::new(false),
+            calls: Mutex::new(Vec::new()),
             clones: AtomicU64::new(0),
             clone_failures: AtomicU32::new(0),
             snapshot_lists: AtomicU64::new(0),
@@ -380,6 +393,23 @@ impl InMemoryControl {
                 };
                 Ok(self.handoff_report(&h, state))
             }
+            HandoffPhase::Credentials => {
+                let fd = fd.ok_or_else(|| ControlError::invalid("credentials need a socket"))?;
+                let mut sock = std::os::unix::net::UnixStream::from(fd);
+                // What the last `fs.unlock` brought (the fake keeps only
+                // the key id; this fake never runs where a key matters).
+                let frame = self.last_unlock_key.lock().unwrap().clone().map(|key| {
+                    serde_json::to_vec(&constellation_control::proto::types::UnlockCredentials {
+                        access_key_id: Some(constellation_control::proto::Secret::new(key)),
+                        secret_access_key: Some(constellation_control::proto::Secret::new("fake")),
+                        ..Default::default()
+                    })
+                    .expect("credentials")
+                });
+                constellation_control::handoff_wire::write_secret(&mut sock, frame.as_deref())
+                    .map_err(|e| ControlError::failed(e.to_string()))?;
+                Ok(self.handoff_report(&h, HandoffState::Serving))
+            }
             HandoffPhase::Receive | HandoffPhase::Seal => Err(ControlError::invalid(
                 "this engine is serving, not a standby",
             )),
@@ -393,9 +423,39 @@ impl InMemoryControl {
         fd: Option<OwnedFd>,
     ) -> Result<HandoffReport, ControlError> {
         match phase {
+            HandoffPhase::Credentials => {
+                if h.sealed || h.aborted {
+                    return Err(ControlError::invalid("this standby is sealed"));
+                }
+                let fd = fd.ok_or_else(|| ControlError::invalid("credentials need the stream"))?;
+                let mut sock = std::os::unix::net::UnixStream::from(fd);
+                let frame = constellation_control::handoff_wire::read_secret(&mut sock)
+                    .map_err(|e| ControlError::failed(e.to_string()))?;
+                if !self.is_gated() {
+                    // Not `--await-unlock`: its environment's credentials.
+                    return Ok(self.handoff_report(h, HandoffState::Standby { received: 0 }));
+                }
+                let frame = frame.ok_or_else(|| {
+                    ControlError::invalid("the sender holds no fs.unlock credentials")
+                })?;
+                let credentials: constellation_control::proto::types::UnlockCredentials =
+                    serde_json::from_slice(&frame)
+                        .map_err(|_| ControlError::invalid("unreadable credentials"))?;
+                *self.last_unlock_key.lock().unwrap() = credentials
+                    .access_key_id
+                    .as_ref()
+                    .map(|k| k.expose().to_string());
+                self.gated.store(false, Ordering::SeqCst);
+                Ok(self.handoff_report(h, HandoffState::Standby { received: 0 }))
+            }
             HandoffPhase::Receive => {
                 if h.sealed || h.aborted {
                     return Err(ControlError::invalid("this standby is sealed"));
+                }
+                if self.is_gated() {
+                    return Err(ControlError::invalid(
+                        "this standby waits for its credentials: Credentials before Receive",
+                    ));
                 }
                 let fd = fd.ok_or_else(|| ControlError::invalid("receive needs the stream"))?;
                 let mut sock = std::os::unix::net::UnixStream::from(fd);
@@ -471,6 +531,57 @@ impl InMemoryControl {
             }
             _ => Err(ControlError::invalid("a standby only receives")),
         }
+    }
+
+    /// Every call so far: its control method and the attribution the
+    /// caller's task carried.
+    pub fn calls(&self) -> Vec<(&'static str, Option<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn note(&self, method: &'static str) {
+        self.calls.lock().unwrap().push((
+            method,
+            constellation_control::client::current_on_behalf_of(),
+        ));
+    }
+
+    /// Set extended attribute `name` on `path` directly (test setup: a
+    /// waiting engine answers no `browse.xattr`).
+    pub fn plant_xattr(&self, path: &str, name: &str, value: &[u8]) {
+        let path = normalize(path);
+        let mut state = self.state.lock().unwrap();
+        state
+            .tree
+            .entry(path)
+            .or_default()
+            .xattrs
+            .insert(name.to_string(), value.to_vec());
+    }
+
+    /// Wait for an `fs.unlock` before answering anything else, as an
+    /// engine pod started with `--await-unlock` does.
+    pub fn gate(&self) {
+        self.gated.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether it still waits for its first `fs.unlock`.
+    pub fn is_gated(&self) -> bool {
+        self.gated.load(Ordering::SeqCst)
+    }
+
+    /// The access key id the last `fs.unlock` carried.
+    pub fn last_unlock_key(&self) -> Option<String> {
+        self.last_unlock_key.lock().unwrap().clone()
+    }
+
+    fn gate_check(&self) -> Result<(), ControlError> {
+        if self.is_gated() {
+            return Err(ControlError::unavailable(
+                constellation_control::proto::AWAITING_UNLOCK,
+            ));
+        }
+        Ok(())
     }
 
     /// An engine serving filesystem `uuid` (what `fs.list` reports).
@@ -703,6 +814,8 @@ impl InMemoryControl {
 #[async_trait]
 impl ControlClient for InMemoryControl {
     async fn fs_create(&self, params: FsCreateParams) -> Result<FsCreated, ControlError> {
+        self.note("fs.create");
+        self.gate_check()?;
         let mut registry = self.registry.lock().unwrap();
         let key = (params.bucket.clone(), params.prefix.clone());
         if let Some(uuid) = registry.filesystems.get(&key) {
@@ -720,12 +833,21 @@ impl ControlClient for InMemoryControl {
         })
     }
 
-    async fn fs_unlock(&self, _params: FsUnlockParams) -> Result<Ack, ControlError> {
+    async fn fs_unlock(&self, params: FsUnlockParams) -> Result<Ack, ControlError> {
+        self.note("fs.unlock");
         self.unlocks.fetch_add(1, Ordering::SeqCst);
+        *self.last_unlock_key.lock().unwrap() = params
+            .credentials
+            .access_key_id
+            .as_ref()
+            .map(|k| k.expose().to_string());
+        self.gated.store(false, Ordering::SeqCst);
         Ok(Ack::new("unlocked"))
     }
 
     async fn fs_list(&self) -> Result<FsListing, ControlError> {
+        self.note("fs.list");
+        self.gate_check()?;
         let mut filesystems: Vec<FsInfo> = self
             .registry
             .lock()
@@ -752,6 +874,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn browse_mkdir(&self, params: MkdirParams) -> Result<FileStat, ControlError> {
+        self.note("browse.mkdir");
+        self.gate_check()?;
         let path = normalize(&params.path);
         let mut state = self.state.lock().unwrap();
         if !params.parents {
@@ -784,6 +908,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn browse_xattr(&self, params: XattrParams) -> Result<XattrResult, ControlError> {
+        self.note("browse.xattr");
+        self.gate_check()?;
         let path = normalize(&params.path);
         if self.any_path.load(Ordering::SeqCst) {
             self.plant_dir(&path);
@@ -814,6 +940,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn browse_rename(&self, params: RenameParams) -> Result<Ack, ControlError> {
+        self.note("browse.rename");
+        self.gate_check()?;
         let from = normalize(&params.from);
         let to = normalize(&params.to);
         if from == "/" {
@@ -855,6 +983,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn quota_get(&self, subtree: &str) -> Result<QuotaStatus, ControlError> {
+        self.note("quota.get");
+        self.gate_check()?;
         let path = normalize(subtree);
         let state = self.state.lock().unwrap();
         let entry = state
@@ -875,6 +1005,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn quota_set(&self, params: SubtreeQuotaParams) -> Result<QuotaStatus, ControlError> {
+        self.note("quota.set");
+        self.gate_check()?;
         self.quota_set_calls.fetch_add(1, Ordering::SeqCst);
         let injected = self
             .quota_set_failures
@@ -903,6 +1035,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn quota_cap(&self, subtree: &str) -> Result<Option<u64>, ControlError> {
+        self.note("quota.get");
+        self.gate_check()?;
         let path = normalize(subtree);
         let state = self.state.lock().unwrap();
         state
@@ -920,6 +1054,8 @@ impl ControlClient for InMemoryControl {
         &self,
         params: SnapshotCreateParams,
     ) -> Result<SnapshotCreated, ControlError> {
+        self.note("snapshot.create");
+        self.gate_check()?;
         let (held, owner) = params.hold_request().map_err(ControlError::invalid)?;
         if let Some(by) = owner {
             validate_owner(by)?;
@@ -982,6 +1118,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn snapshot_delete(&self, params: SnapshotDeleteParams) -> Result<Ack, ControlError> {
+        self.note("snapshot.delete");
+        self.gate_check()?;
         let (path, name) = split_selector(&params.selector)?;
         let mut state = self.state.lock().unwrap();
         let idx = state
@@ -1006,6 +1144,8 @@ impl ControlClient for InMemoryControl {
         &self,
         params: SnapshotListParams,
     ) -> Result<SnapshotListing, ControlError> {
+        self.note("snapshot.list");
+        self.gate_check()?;
         self.snapshot_lists.fetch_add(1, Ordering::SeqCst);
         let state = self.state.lock().unwrap();
         let path = params.path.as_deref().map(normalize);
@@ -1026,6 +1166,8 @@ impl ControlClient for InMemoryControl {
         &self,
         params: SnapshotHoldParams,
     ) -> Result<SnapshotHeld, ControlError> {
+        self.note("snapshot.hold");
+        self.gate_check()?;
         let by = params.by.filter(|b| !b.is_empty());
         if let Some(by) = &by {
             validate_owner(by)?;
@@ -1066,6 +1208,8 @@ impl ControlClient for InMemoryControl {
     /// copy is the frozen tree, xattrs included (the source volume's record
     /// comes along, as it does from the engine); quotas do not travel.
     async fn clone_create(&self, params: CloneParams) -> Result<Ack, ControlError> {
+        self.note("clone.create");
+        self.gate_check()?;
         self.clones.fetch_add(1, Ordering::SeqCst);
         if self
             .clone_failures
@@ -1102,6 +1246,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn view_mount(&self, params: ViewMountParams) -> Result<ViewInfo, ControlError> {
+        self.note("view.mount");
+        self.gate_check()?;
         let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
         let mountpoint = match &params.source {
             MountSource::Path { mountpoint, .. } => mountpoint.display().to_string(),
@@ -1148,6 +1294,8 @@ impl ControlClient for InMemoryControl {
         params: ViewMountParams,
         fd: OwnedFd,
     ) -> Result<ViewInfo, ControlError> {
+        self.note("view.mount");
+        self.gate_check()?;
         if !matches!(params.source, MountSource::PreopenedFd { .. }) {
             return Err(ControlError::invalid(
                 "a descriptor goes with a PreopenedFd source only",
@@ -1159,6 +1307,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn view_list(&self, params: ViewListParams) -> Result<ViewListing, ControlError> {
+        self.note("view.list");
+        self.gate_check()?;
         let state = self.state.lock().unwrap();
         let views = state
             .views
@@ -1181,6 +1331,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn view_unmount(&self, params: ViewUnmountParams) -> Result<Ack, ControlError> {
+        self.note("view.unmount");
+        self.gate_check()?;
         let mut state = self.state.lock().unwrap();
         let mountpoint = params.mountpoint.display().to_string();
         let Some(id) = state
@@ -1198,6 +1350,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn view_stats(&self, params: ViewStatsParams) -> Result<ViewStatsReport, ControlError> {
+        self.note("view.stats");
+        self.gate_check()?;
         let state = self.state.lock().unwrap();
         let named = params.mountpoint.as_ref().map(|m| m.display().to_string());
         let (id, view) = state
@@ -1229,6 +1383,7 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn node_ping(&self) -> Result<Pong, ControlError> {
+        self.note("node.ping");
         if self.unreachable.load(Ordering::SeqCst) {
             return Err(ControlError::unavailable("engine pod is unreachable"));
         }
@@ -1236,9 +1391,13 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn node_handoff(&self, params: HandoffParams) -> Result<HandoffReport, ControlError> {
+        self.note("node.handoff");
         if params.target == HandoffTarget::Socket {
+            // A standby's handoff socket has no credential gate, and a
+            // sender's control socket is past it.
             return self.socket_handoff(params, None);
         }
+        self.gate_check()?;
         Ok(HandoffReport {
             detail: "fake handoff".to_string(),
             views: params
@@ -1267,6 +1426,8 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn node_leave(&self, _params: LeaveParams) -> Result<Ack, ControlError> {
+        self.note("node.leave");
+        self.gate_check()?;
         Ok(Ack::new("left"))
     }
 }
@@ -1340,7 +1501,11 @@ impl Engines for InMemoryEngines {
         Ok(self.registry.clone())
     }
 
-    async fn filesystem(&self, fs_uuid: &str) -> Result<Arc<dyn ControlClient>, ControlError> {
+    async fn filesystem(
+        &self,
+        fs_uuid: &str,
+        _secrets: &crate::credentials::Secrets,
+    ) -> Result<Arc<dyn ControlClient>, ControlError> {
         if !self.registry.knows_filesystem(fs_uuid) {
             return Err(ControlError::not_found(format!(
                 "no filesystem {fs_uuid} is registered"
@@ -1363,7 +1528,11 @@ impl Engines for InMemoryEngines {
         Ok(client)
     }
 
-    async fn running(&self, fs_uuid: &str) -> Result<Option<Arc<dyn ControlClient>>, ControlError> {
+    async fn running(
+        &self,
+        fs_uuid: &str,
+        _secrets: &crate::credentials::Secrets,
+    ) -> Result<Option<Arc<dyn ControlClient>>, ControlError> {
         if !self.is_running(fs_uuid) {
             return Ok(None);
         }
@@ -1942,7 +2111,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let fs_a = engines.filesystem(&a.uuid).await.unwrap();
+        let fs_a = engines
+            .filesystem(&a.uuid, &Default::default())
+            .await
+            .unwrap();
         // The same (bucket, prefix) through a per-filesystem client: the
         // registry is shared, so the uuid is the same.
         let again = fs_a
@@ -1965,12 +2137,19 @@ mod tests {
             .filesystem_client(&a.uuid)
             .unwrap()
             .exists("/volumes"));
-        let fs_b = engines.filesystem(&b.uuid).await.unwrap();
+        let fs_b = engines
+            .filesystem(&b.uuid, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(
             fs_b.quota_get("/volumes").await.unwrap_err().kind,
             ErrorKind::NotFound
         );
-        let unknown = engines.filesystem("nope").await.err().unwrap();
+        let unknown = engines
+            .filesystem("nope", &Default::default())
+            .await
+            .err()
+            .unwrap();
         assert_eq!(unknown.kind, ErrorKind::NotFound);
     }
 }

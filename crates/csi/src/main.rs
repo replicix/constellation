@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use constellation_csi::control_client::{Engines, InMemoryEngines};
 use constellation_csi::controller::{ControllerConfig, ControllerService};
+use constellation_csi::credentials::{KubeSecrets, Refresher};
 use constellation_csi::engine_pods::NodeEnginePods;
 use constellation_csi::engine_pods::{EnginePodConfig, EnginePodManager};
 use constellation_csi::identity::IdentityService;
@@ -66,6 +67,9 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Both plugins hold credentials in memory (the Secrets they pass to
+    // engine pods with `fs.unlock`): never in a core dump.
+    constellation_platform::forbid_core_dumps().context("disabling core dumps")?;
     match (cli.controller, cli.node) {
         (false, false) => bail!("one of --controller or --node is required"),
         (true, false) if cli.node_id.is_some() => {
@@ -115,7 +119,9 @@ async fn run(cli: Cli) -> Result<()> {
                 image = %config.image,
                 "engine pods: controller-owned, reached by exec relay"
             );
-            Some(Arc::new(EnginePodManager::new(client, config).await))
+            // `credentialSource: refreshing` classes' Secrets, watched.
+            let refresher = Refresher::new(Arc::new(KubeSecrets::new(client.clone())));
+            Some(EnginePodManager::new(client, config, refresher).await)
         } else {
             // Outside a cluster there is nowhere to start engine pods:
             // every volume RPC answers UNAVAILABLE.
@@ -137,6 +143,7 @@ async fn run(cli: Cli) -> Result<()> {
         tracing::info!(endpoint = %path.display(), node_id, "constellation-csi starting (node)");
         let state = StateStore::open(&cli.host_root.join("volumes"))
             .with_context(|| format!("opening {}/volumes", cli.host_root.display()))?;
+        let mut refresher = None;
         let (engines, mounter): (Option<Arc<dyn NodeEngines>>, Arc<dyn Mounter>) =
             if cli.in_memory_backend {
                 tracing::warn!(
@@ -161,6 +168,7 @@ async fn run(cli: Cli) -> Result<()> {
                     host_root = %config.host_root,
                     "engine pods: node-owned, reached through their hostPath sockets"
                 );
+                refresher = Some(Refresher::new(Arc::new(KubeSecrets::new(client.clone()))));
                 (
                     Some(Arc::new(
                         NodeEnginePods::new(client, config, node_id.clone()).await,
@@ -176,8 +184,11 @@ async fn run(cli: Cli) -> Result<()> {
             };
         let rollouts = engines.is_some() && !cli.in_memory_backend;
         let handoff = HandoffConfig::from_env().map_err(anyhow::Error::msg)?;
-        let service =
-            Arc::new(NodeService::new(node_id, engines, mounter, state).with_handoff(handoff));
+        let mut service = NodeService::new(node_id, engines, mounter, state).with_handoff(handoff);
+        if let Some(refresher) = refresher {
+            service = service.with_refresher(refresher);
+        }
+        let service = Arc::new(service);
         // Plan 37 §8: roll engine pods whose spec drifted, by handover.
         match rollout::interval_from_env().map_err(anyhow::Error::msg)? {
             Some(interval) if rollouts => {
