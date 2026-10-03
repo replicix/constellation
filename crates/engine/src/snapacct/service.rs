@@ -381,6 +381,45 @@ pub struct ReclaimEstimate {
     pub as_of_ms: u64,
 }
 
+/// [`SnapAcctService::budget_plan`]'s answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BudgetAnswer {
+    Plan(BudgetPlan),
+    /// The index is being built, or did not catch up with the rows in
+    /// time: no figure.
+    Building {
+        pct: u8,
+    },
+    /// Current, but as of longer ago than the budget accepts.
+    Stale {
+        as_of_ms: u64,
+    },
+    /// `CONSTELLATION_SNAPACCT=off`.
+    Off,
+}
+
+/// What a space budget gives up (plan 32 Step 8), in logical bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BudgetPlan {
+    /// `reclaim` of every candidate: the policy's snapshot-only bytes now.
+    pub used: u64,
+    /// What would remain once `chosen` are deleted: `used − reclaim(chosen)`.
+    /// A chunk `chosen` shares with the snapshots left still counts (they
+    /// keep it). Never above the true figure — a chunk shared with a
+    /// snapshot outside the measured set is not in `used` — so the
+    /// budget can only err towards deleting less.
+    pub remaining: u64,
+    /// The victims, in the order given: its shortest prefix that brings
+    /// `remaining` within the budget (all of it, capped, when none does).
+    pub chosen: Vec<String>,
+    /// How many `reclaim` scans the plan took (each one reads every
+    /// birth in its chains' span, under the pass lock): `used`'s, and a
+    /// binary search over the prefixes, at most `2 + ⌈log₂ n⌉`.
+    pub scans: u32,
+    pub as_of_seq: u64,
+    pub as_of_ms: u64,
+}
+
 /// `snapshot space`'s breakdown. With a path, the snapshot buckets cover
 /// the chains of directories at or under it (as the live tree places
 /// them now), `live_logical` is the subtree's apparent size, and
@@ -2071,6 +2110,127 @@ impl SnapAcctService {
         )))
     }
 
+    /// The live-tree refresh cadence (`CONSTELLATION_SNAPACCT_REFRESH_S`):
+    /// an answer older than twice this is stale for a space budget.
+    pub fn refresh_interval(&self) -> Duration {
+        self.cfg.refresh
+    }
+
+    /// Plan 32 Step 8: which of a policy's `candidates` its space budget
+    /// gives up. `used = reclaim(candidates)` is the policy's
+    /// snapshot-only bytes; when that exceeds `budget`, the victims are
+    /// the shortest prefix of `order` (a subset of `candidates`,
+    /// `retention::budget_order`; at most `max_chosen` of it) after whose
+    /// deletion `used − reclaim(prefix)` — what would remain — is within
+    /// the budget, or the whole capped order when none is. `reclaim` of a
+    /// prefix only grows with it, so the prefix is found by binary search
+    /// ([`shortest_prefix`]): a bounded number of scans
+    /// ([`BudgetPlan::scans`]) whatever the order's length.
+    ///
+    /// Only from a **fresh** index: current (every row applied, no build,
+    /// no stalled chain) and `as_of_ms` within `max_age` of now
+    /// ([`BudgetAnswer::Stale`] otherwise). A snapshot created a moment
+    /// ago leaves the index not current until the task's next pass, so
+    /// while the index is built and only a pass is pending this waits for
+    /// it, up to `wait`; a real build answers `Building` at once. The
+    /// whole computation runs under the pass lock, so no pass changes the
+    /// index between two of its `reclaim` reads.
+    pub async fn budget_plan(
+        &self,
+        candidates: &[String],
+        order: &[String],
+        budget: u64,
+        max_chosen: usize,
+        max_age: Duration,
+        wait: Duration,
+    ) -> Result<BudgetAnswer> {
+        let deadline = Instant::now() + wait;
+        let (ix, _work) = loop {
+            let ix = match self.gate().await? {
+                Ok(ix) => ix,
+                Err(SnapAnswer::Off) => return Ok(BudgetAnswer::Off),
+                Err(SnapAnswer::Building { pct }) => {
+                    if self.stats.building.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        return Ok(BudgetAnswer::Building { pct });
+                    }
+                    tokio::time::sleep(DEBOUNCE).await;
+                    continue;
+                }
+                Err(SnapAnswer::Ready(())) => unreachable!("gate answers the index"),
+            };
+            let work = self.work.lock().await;
+            let mut indexed = true;
+            for id in candidates {
+                if ix.locate(id)?.is_none() {
+                    indexed = false;
+                    break;
+                }
+            }
+            if self.current(&ix)? && indexed {
+                break (ix, work);
+            }
+            drop(work);
+            if Instant::now() >= deadline {
+                return Ok(BudgetAnswer::Building {
+                    pct: match self.building() {
+                        SnapAnswer::Building { pct } => pct,
+                        _ => 0,
+                    },
+                });
+            }
+            self.wake.notify_one();
+            tokio::time::sleep(DEBOUNCE).await;
+        };
+        let (as_of_seq, as_of_ms) = self.as_of(&ix)?;
+        let age = now_ms().saturating_sub(as_of_ms);
+        if age > max_age.as_millis() as u64 {
+            return Ok(BudgetAnswer::Stale { as_of_ms });
+        }
+        let candidates = candidates.to_vec();
+        let order = order.to_vec();
+        let plan = blocking(move || {
+            let mut place: HashMap<String, (u32, u32)> = HashMap::new();
+            for id in &candidates {
+                let at = ix.locate(id)?.ok_or_else(|| {
+                    SnapAcctError::Corrupt(format!("snapshot {id} vanished from the index"))
+                })?;
+                place.insert(id.clone(), at);
+            }
+            // The victims on offer: `order` restricted to the measured
+            // set, each once, at most `max_chosen`.
+            let mut seen: BTreeSet<&String> = BTreeSet::new();
+            let offer: Vec<&String> = order
+                .iter()
+                .filter(|id| place.contains_key(*id) && seen.insert(*id))
+                .take(max_chosen)
+                .collect();
+            let offer_at: Vec<(u32, u32)> = offer.iter().map(|id| place[*id]).collect();
+            let mut scans = 0u32;
+            let mut reclaim = |at: &[(u32, u32)]| -> Result<u64> {
+                if at.is_empty() {
+                    return Ok(0);
+                }
+                scans += 1;
+                Ok(ix.reclaim(at)?.bytes)
+            };
+            let all: Vec<(u32, u32)> = place.values().copied().collect();
+            let used = reclaim(&all)?;
+            let (take, remaining) =
+                shortest_prefix(offer.len(), used, budget, |k| reclaim(&offer_at[..k]))?;
+            let chosen: Vec<String> = offer[..take].iter().map(|id| (*id).clone()).collect();
+            Ok(BudgetPlan {
+                used,
+                remaining,
+                chosen,
+                scans,
+                as_of_seq,
+                as_of_ms,
+            })
+        })
+        .await?;
+        Ok(BudgetAnswer::Plan(plan))
+    }
+
     /// `snapshot space` (see [`SpaceBreakdown`]).
     pub async fn space(&self, path: Option<&str>) -> Result<SnapAnswer<SpaceBreakdown>> {
         let ix = match self.gate().await? {
@@ -2299,9 +2459,97 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// The shortest `k ≤ n` with `used − freed(k) ≤ budget`, and that
+/// figure; `(n, used − freed(n))` when even `k = n` is not enough, `(0,
+/// used)` when nothing is needed. `freed(k)` — `reclaim` of the first `k`
+/// victims — must not decrease with `k` (a bigger set frees every chunk
+/// a smaller one does), which makes "within budget" monotone and lets a
+/// binary search find `k` with at most `1 + ⌈log₂ n⌉` calls of `freed`.
+fn shortest_prefix(
+    n: usize,
+    used: u64,
+    budget: u64,
+    mut freed: impl FnMut(usize) -> Result<u64>,
+) -> Result<(usize, u64)> {
+    if used <= budget || n == 0 {
+        return Ok((0, used));
+    }
+    let remaining = used.saturating_sub(freed(n)?);
+    if remaining > budget {
+        return Ok((n, remaining));
+    }
+    // `lo` is not enough (0: `used` is over), `hi` is.
+    let (mut lo, mut hi, mut best) = (0, n, remaining);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let left = used.saturating_sub(freed(mid)?);
+        if left <= budget {
+            (hi, best) = (mid, left);
+        } else {
+            lo = mid;
+        }
+    }
+    Ok((hi, best))
+}
+
 /// Run index work (fjall transactions, tree reads) off the runtime.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await
         .context("snapshot accounting task")?
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::shortest_prefix;
+
+    /// A linear search over the same prefixes, the definition.
+    fn linear(freed: &[u64], used: u64, budget: u64) -> (usize, u64) {
+        let n = freed.len() - 1;
+        (0..=n)
+            .map(|k| (k, used.saturating_sub(freed[k])))
+            .find(|(_, left)| *left <= budget)
+            .unwrap_or((n, used.saturating_sub(freed[n])))
+    }
+
+    /// Against the linear definition over non-decreasing `freed` series
+    /// (flat runs included: victims sharing a chunk free nothing until
+    /// the last of them goes), and within `1 + ⌈log₂ n⌉` calls of it.
+    #[test]
+    fn the_shortest_prefix_matches_a_linear_search_in_logarithmic_scans() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..2_000 {
+            let n = (next() % 600) as usize;
+            let mut freed = vec![0u64];
+            for _ in 0..n {
+                let step = if next() % 3 == 0 { 0 } else { next() % 100 };
+                freed.push(freed.last().unwrap() + step);
+            }
+            let used = freed[n] + next() % 200;
+            let budget = next() % (used + 50);
+            let mut calls = 0u32;
+            let got = shortest_prefix(n, used, budget, |k| {
+                calls += 1;
+                Ok(freed[k])
+            })
+            .unwrap();
+            assert_eq!(got, linear(&freed, used, budget), "round {round}");
+            let bound = 1 + (usize::BITS - n.leading_zeros());
+            assert!(calls <= bound, "round {round}: {calls} calls for {n}");
+        }
+        // 500 victims (the default MAX_DELETES), only the last enough.
+        let mut calls = 0;
+        let got = shortest_prefix(500, 1_000, 0, |k| {
+            calls += 1;
+            Ok(if k == 500 { 1_000 } else { 0 })
+        })
+        .unwrap();
+        assert_eq!((got, calls), ((500, 0), 10));
+    }
 }

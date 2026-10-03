@@ -105,7 +105,7 @@ head -c 3145728 /dev/urandom >"$mnt/proj/a.bin"
 head -c 1048576 /dev/urandom >"$mnt/proj/sub/b.bin"
 "$bin" snapshot create /proj@second --by csi:test --state-dir "$state" >>"$log" 2>&1 \
     || fail "snapshot create /proj@second --by csi:test"
-api snapshot.policy.set '{"path":"/proj","expr":"1h:1d 1d:7d"}' >/dev/null \
+api snapshot.policy.set '{"path":"/proj","expr":"1h:1d 1d:7d; budget=1G"}' >/dev/null \
     || fail "snapshot.policy.set /proj"
 # Paused, so a live scheduler (CONSTELLATION_SNAPSCHED=1) adds no auto snapshot
 # and the row count stays deterministic.
@@ -154,6 +154,10 @@ check 'unique to one snapshot (' "the space legend"
 check 'USED values do not sum to the total' 'the "USED values do not sum" note'
 check '<article class="root" data-ino="' "a policy-root card"
 check '1h:1d 1d:7d\|1d:7d 1h:1d' "the canonical expression"
+# Plan 32 Step 8: the card's budget line, used / limit (the root has no
+# auto snapshot, so nothing counts against it).
+check '<span>budget</span>' "the policy card's budget line"
+check '>1 GiB</span>' "the budget's limit"
 check '<svg id="writtenChart"' 'the "written over time" chart'
 check 'as of commit [0-9]' "the as-of footer"
 # Plan 32 Step 9: the silent-failure banner is there, and hidden on this
@@ -195,7 +199,7 @@ count() { grep -o -- "$1" "$rendered" | wc -l; }
 check '<dialog id="policyEditor"[^>]* open' "the editor dialog, open"
 [ "$(count '<div class="tier" role="listitem"')" -eq 4 ] || fail "expected the Standard preset's 4 tier rows, found $(count '<div class="tier" role="listitem"')"
 echo "ok: 4 tier rows (the Standard preset)"
-check '<code id="edCanonical">15m:1d 1h:2d 1d:30d 1mo:1y; paused</code>' "the daemon's canonical form of the preset (the root's paused flag kept)"
+check '<code id="edCanonical">15m:1d 1h:2d 1d:30d 1mo:1y; budget=1G; paused</code>' "the daemon's canonical form of the preset (the root's budget and paused flag kept)"
 check '<svg id="timelineChart"' "the retention timeline"
 lanes="$(count '<g class="lane" data-lane="')"
 [ "$lanes" -ge 5 ] || fail "expected >= 5 timeline lanes (4 tiers + held/manual), found $lanes"

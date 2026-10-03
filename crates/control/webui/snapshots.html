@@ -195,9 +195,9 @@ pre.caret{margin:6px 0;padding:6px 8px;background:#32141a;border:1px solid #6b2f
       <label for="edLast">last</label><span><input id="edLast" type="number" min="1" value="1" style="width:6em"> <span class="muted">newest kept always</span></span>
       <label for="edSkipEmpty">skip-empty</label><select id="edSkipEmpty"><option value="yes">yes — skip when nothing changed</option><option value="no">no — one per interval, even idle</option></select>
       <label for="edPaused">paused</label><span><input id="edPaused" type="checkbox"> <span class="muted">no creation, no expiry</span></span>
-      <label for="edBudget">budget</label><input id="edBudget" disabled placeholder="coming with budgets" aria-describedby="edBudgetNote">
+      <label for="edBudget">budget</label><span><input id="edBudget" placeholder="none (e.g. 500G)" spellcheck="false" autocomplete="off" style="width:9em" aria-describedby="edBudgetNote"></span>
      </div>
-     <div id="edBudgetNote" class="muted note">budget: coming with budgets (plan 32 M7)</div>
+     <div id="edBudgetNote" class="muted note">budget: a soft cap on what deleting every unheld auto snapshot of this root would return (logical bytes; stored ≈ logical ÷ the compression ratio). Over it, the scheduler expires snapshots the tiers still keep — finer tiers' oldest first, the coarsest tier's last — never the newest <code>last</code> or held ones, only from a fresh accounting index, and not during a grace window.</div>
     </details>
     <label for="edExpr"><b>Expression</b> <span class="muted">— what the CLI and <code>getfattr</code> show; paste or edit</span></label>
     <textarea id="edExpr" rows="2" spellcheck="false" autocomplete="off" aria-describedby="edCheck"></textarea>
@@ -390,6 +390,12 @@ function renderRoots(){
   const used=ex.usedBuilding?`<span class="building">building (${ex.usedBuilding}%)</span>`
    :ex.used!=null?`<span title="${esc(exact(ex.used))}">${esc(bytes(ex.used))}</span> <span class="muted">(snapshots at or under this path)</span>`
    :'<span class="muted">—</span>';
+  // The budget (plan 32 Step 8): the scheduler's last measure of its
+  // snapshot-only bytes (on the leading node only), against the limit; its
+  // note when the budget is not met or could not be judged.
+  const budget=st.budget_bytes!=null?`<span>budget</span><span${st.budget_used_bytes!=null&&st.budget_used_bytes>st.budget_bytes?' class="bad"':""}>
+    <span title="${st.budget_used_bytes!=null?esc(exact(st.budget_used_bytes)):"measured by the leading node's scheduler on its expiry runs; not known here"}">${st.budget_used_bytes!=null?esc(bytes(st.budget_used_bytes)):"?"}</span> / <span title="${esc(exact(st.budget_bytes))}">${esc(bytes(st.budget_bytes))}</span>
+    <span class="muted">logical</span>${st.budget_note?`<div class="muted">${esc(st.budget_note)}</div>`:""}</span>`:"";
   const p=JSON.stringify(r.path||"");
   const actions=r.path?`<div>
     <button type="button" onclick='openEditor(${esc(p)})'>Edit</button>
@@ -406,6 +412,7 @@ function renderRoots(){
     ${st.error?`<span>last error</span><span class="bad">${esc(st.error)}</span>`:""}
     <span>auto snapshots</span><span>${r.auto_snapshots}${ex.steady!=null?` <span class="muted">· steady state ≤ ${ex.steady}</span>`:""}</span>
     <span>USED Σ</span><span>${used}</span>
+    ${budget}
    </div>${actions}</article>`;
  }).join("");
 }
@@ -861,8 +868,9 @@ function wireEditor(){
  document.querySelectorAll("[data-preset]").forEach(b=>b.addEventListener("click",()=>applyPreset(b.dataset.preset)));
  $("addTier").addEventListener("click",()=>{ed.rows.push({every:"1d",n:30,unit:"d"});renderRows();rowsChanged();});
  $("edTestOnly").addEventListener("change",renderRows);
- ["edTz","edDayStart","edWeekStart","edLast","edSkipEmpty","edPaused"].forEach(id=>$(id).addEventListener("change",rowsChanged));
+ ["edTz","edDayStart","edWeekStart","edLast","edSkipEmpty","edPaused","edBudget"].forEach(id=>$(id).addEventListener("change",rowsChanged));
  $("edLast").addEventListener("input",rowsChanged);
+ $("edBudget").addEventListener("input",rowsChanged);
  $("edExpr").addEventListener("input",()=>{ed.origin="text";schedule();});
  $("tlHorizon").addEventListener("change",()=>schedule(0));
  $("edSave").addEventListener("click",savePolicy);

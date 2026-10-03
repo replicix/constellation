@@ -10,7 +10,7 @@
 
 use crate::control;
 use crate::policy_cli::align;
-use crate::snapshot_cli::utc_seconds;
+use crate::snapshot_cli::{human_bytes, utc_seconds};
 use anyhow::{bail, Result};
 use constellation_control::methods as cm;
 use constellation_control::proto::types as api;
@@ -71,7 +71,8 @@ pub fn render_status(r: &api::SnapSchedReport) -> String {
     );
     out.push_str(&format!(
         "ticks {}  created {}  skipped-empty {}  create-failed {}  expired {}  \
-         skipped-reverify {}  skipped-grace {}  refused-lag {}  refused-state {}\n",
+         skipped-reverify {}  skipped-grace {}  budget-expired {}  budget-stale {}  \
+         refused-lag {}  refused-state {}\n",
         s.ticks,
         s.created,
         s.skipped_empty,
@@ -79,6 +80,8 @@ pub fn render_status(r: &api::SnapSchedReport) -> String {
         s.expired,
         s.skipped_reverify,
         s.skipped_grace,
+        s.budget_expired,
+        s.budget_stale,
         s.refused_lag,
         s.refused_state,
     ));
@@ -115,16 +118,44 @@ pub fn render_status(r: &api::SnapSchedReport) -> String {
                 state(root).into(),
                 next_cell(root),
                 opt_time(root.last_created_unix_ms),
+                budget_cell(root),
                 root.error.clone().unwrap_or_else(|| "-".into()),
             ]
         })
         .collect();
     out.push_str(&align(
-        &["PATH", "POLICY", "STATE", "NEXT", "LAST CREATED", "ERROR"],
+        &[
+            "PATH",
+            "POLICY",
+            "STATE",
+            "NEXT",
+            "LAST CREATED",
+            "BUDGET",
+            "ERROR",
+        ],
         &rows,
     ));
-    out.push_str("times UTC\n");
+    for root in &r.roots {
+        if let Some(note) = &root.budget_note {
+            out.push_str(&format!(
+                "budget of {}: {note}\n",
+                root.path.as_deref().unwrap_or("(unlinked)")
+            ));
+        }
+    }
+    out.push_str("times UTC; budgets in logical bytes\n");
     out
+}
+
+/// `BUDGET`: `used / limit` in logical bytes (`?` until this node's
+/// scheduler has measured it: it does not lead, or its last run could
+/// not), `-` without a budget.
+fn budget_cell(root: &api::SnapSchedRootState) -> String {
+    match (root.budget_bytes, root.budget_used_bytes) {
+        (None, _) => "-".into(),
+        (Some(limit), Some(used)) => format!("{} / {}", human_bytes(used), human_bytes(limit)),
+        (Some(limit), None) => format!("? / {}", human_bytes(limit)),
+    }
 }
 
 /// Plan 32 Step 9's silent-failure warning: a root whose policy does not
@@ -163,13 +194,16 @@ pub fn render_node_summary(s: &api::SnapSchedStatus, a: &api::SnapAcctStatus) ->
     ));
     out.push_str(&format!(
         "  created {}  skipped-empty {}  create-failed {}  expired {}  skipped-reverify {}  \
-         skipped-grace {}  refused-lag {}  refused-state {}  last created {}\n",
+         skipped-grace {}  budget-expired {}  budget-stale {}  refused-lag {}  refused-state {}  \
+         last created {}\n",
         s.created,
         s.skipped_empty,
         s.create_failed,
         s.expired,
         s.skipped_reverify,
         s.skipped_grace,
+        s.budget_expired,
+        s.budget_stale,
         s.refused_lag,
         s.refused_state,
         opt_time(i64::try_from(s.last_create_unix_ms).ok()),
@@ -428,8 +462,11 @@ mod tests {
         due.due = true;
         due.bucket_name = Some("auto-20261002T120010Z".into());
         due.last_created_unix_ms = Some(1_790_000_000_000);
-        let mut later = root(Some("/db"), "1h:1d");
+        let mut later = root(Some("/db"), "1h:1d; budget=2G");
         later.next_due_unix_ms = Some(1_790_000_000_000);
+        later.budget_bytes = Some(2 << 30);
+        later.budget_used_bytes = Some(3 << 30);
+        later.budget_note = Some("over budget, cannot be met: …".into());
         let mut bad = root(None, "garbage");
         bad.canonical = None;
         bad.error = Some("unknown tier".into());
@@ -463,7 +500,12 @@ mod tests {
         let header = lines.iter().position(|l| l.starts_with("PATH")).unwrap();
         assert_eq!(
             lines[header].split_whitespace().collect::<Vec<_>>(),
-            ["PATH", "POLICY", "STATE", "NEXT", "LAST", "CREATED", "ERROR"]
+            ["PATH", "POLICY", "STATE", "NEXT", "LAST", "CREATED", "BUDGET", "ERROR"]
+        );
+        assert!(lines[header + 2].contains("3.0G / 2.0G"), "{text}");
+        assert!(
+            text.contains("budget of /db: over budget, cannot be met: …\n"),
+            "{text}"
         );
         assert!(lines[header + 1].starts_with("/proj"), "{text}");
         assert!(lines[header + 1].contains("due"), "{text}");

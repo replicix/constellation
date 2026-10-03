@@ -6403,6 +6403,31 @@
             "null"
           ]
         },
+        "budget_bytes": {
+          "description": "The policy's `budget=` (plan 32 Step 8), logical bytes; `None`\nwithout one (or unparseable).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "budget_note": {
+          "description": "The budget step's last word on this root from this node's\nscheduler, when it could not do what the budget asks: over budget\nwith only the `last` floor and held snapshots left (unmeetable,\nreported, not an error), the accounting index stale or building\n(`budget_stale`), a grace window holding it back, or the run's\ndelete cap reached. `None` once a run finds the root within budget,\nand on a node that does not lead (cleared when leadership ends).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "budget_used_bytes": {
+          "description": "What the budget measures — `reclaim` of the root's unheld auto\nsnapshots the tier rule keeps, logical bytes — as this node's\nscheduler last measured it, less what that run's budget victims\nwere to return: the figure it expects after the run (a victim a\nhold saved meanwhile is not added back). Never a scan of its own:\n`None` on a node that does not lead, before its first measuring\nrun, after a run that could not measure (see `budget_note`), and\nwithout a budget. Physical bytes ≈ this × `snapshot.space`'s\n`physical_ratio` (stored bytes per logical byte).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "canonical": {
           "description": "`None` when the policy does not parse.",
           "type": [
@@ -6522,7 +6547,7 @@
       "type": "object"
     },
     "SnapSchedRunRoot": {
-      "description": "One due root, or one snapshot the expiry run handled, in a\n`snapshot.sched.run` result. For a creation `outcome` is\n`would_create` (dry run), `created`, `skipped_empty` (nothing under\nthe root changed since its newest snapshot), `already_exists` (the\nbucket's name was taken already — by an earlier leader, typically;\nsuccess), or `failed` (with `error`). For expiry (`name` and `id` the\nsnapshot's) it is `would_expire` (dry run), `expired`, or\n`skipped_reverify` (with why in `error`: held or gone meanwhile).",
+      "description": "One due root, or one snapshot the expiry run handled, in a\n`snapshot.sched.run` result. For a creation `outcome` is\n`would_create` (dry run), `created`, `skipped_empty` (nothing under\nthe root changed since its newest snapshot), `already_exists` (the\nbucket's name was taken already — by an earlier leader, typically;\nsuccess), or `failed` (with `error`). For expiry (`name` and `id` the\nsnapshot's) it is `would_expire` (dry run), `expired`, or\n`skipped_reverify` (with why in `error`: held or gone meanwhile);\nfor the space budget (plan 32 Step 8) `would_budget_expire` (dry run)\nor `budget_expired`, and in a dry run `budget_note` (no `name`/`id`;\n`error` says why the budget decides nothing or is not met).",
       "properties": {
         "error": {
           "type": [

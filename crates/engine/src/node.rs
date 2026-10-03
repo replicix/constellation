@@ -1500,6 +1500,7 @@ impl Engine {
             stats: snapsched_stats.clone(),
             config: crate::snapsched::SchedConfig::from_env(),
             clock: crate::snapsched::wall_clock(),
+            snapacct: Some(snapacct.clone()),
         });
         snapsched.spawn(&rt, stop.clone(), Some(background.clone()));
         // Retention pruner ticker (plan 22, Step 4). The default has no

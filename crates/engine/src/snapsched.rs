@@ -67,7 +67,11 @@
 //!    is at least `CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S` old, record the
 //!    grace state (`snapsched/state.json`, CAS), then delete what
 //!    retention and the grace windows expire — renewing the lease and
-//!    re-reading every victim before each delete batch.
+//!    re-reading every victim before each delete batch — and then, for a
+//!    policy with `budget=` and outside any grace window, what the space
+//!    budget gives up beyond the tier windows, only from a fresh
+//!    accounting index (Step 8; `crate::snapexpire`'s "The space
+//!    budget").
 //! 7. **Audit**: one `snapsched/journal/` object per tick that created,
 //!    failed or deleted a snapshot (`constellation_store_s3::snapsched`); a
 //!    tick whose every answer was "unchanged" or "already exists" changed
@@ -115,6 +119,7 @@
 //! (its snapshots are orphaned and kept, Step 4.4).
 
 use crate::singleton::{Fenced, HeldElsewhere, SingletonLease};
+use crate::snapacct::{BudgetAnswer, SnapAcctService};
 use crate::snapexpire;
 use crate::snapshot_batch::{HolderUnreachable, ItemResult, SnapshotBatcher, SnapshotItem};
 use constellation_control::proto::types::{
@@ -379,6 +384,10 @@ pub struct SchedDeps {
     pub stats: Arc<SnapSchedStats>,
     pub config: SchedConfig,
     pub clock: Clock,
+    /// The space-accounting index a `budget=` policy is enforced from
+    /// (plan 32 Step 8); `None`: budgets are never enforced (counted
+    /// `budget_stale`).
+    pub snapacct: Option<Arc<SnapAcctService>>,
 }
 
 // --- what the replica says ------------------------------------------------
@@ -534,6 +543,64 @@ const GRACE_CACHE: Duration = Duration::from_secs(30);
 /// How long a display waits for that read when nothing was read yet (an
 /// old copy is served at once while a background read refreshes it).
 const GRACE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the budget step waits for the accounting index to catch up
+/// with a snapshot this tick created (the index's task applies it within
+/// its debounce): past it the step is skipped as `budget_stale`.
+const BUDGET_INDEX_WAIT: Duration = Duration::from_secs(5);
+
+/// Whether an expiry run goes on with its next step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Go,
+    Stop,
+}
+
+/// What the budget step decided for one root.
+enum BudgetChoice {
+    /// Nothing to delete, and why the budget could not decide (`stale`:
+    /// the index was not fresh, which counts `budget_stale`).
+    Note { note: String, stale: bool },
+    /// The budget's victims (maybe none), oldest-least-valuable first,
+    /// what to report when they do not bring the root within budget, and
+    /// the bytes that would remain once they are gone.
+    Victims {
+        rows: Vec<SnapshotRow>,
+        note: Option<String>,
+        remaining: u64,
+    },
+}
+
+/// The budget step's last word on one root, for `snapshot.sched.status`
+/// (`budget_note`, `budget_used_bytes`): kept only while this node leads,
+/// and only for roots whose policy has a budget.
+#[derive(Clone, Debug, Default)]
+struct BudgetView {
+    note: Option<String>,
+    /// [`BudgetChoice::Victims`]'s `remaining` from the last step that
+    /// measured; `None` after one that could not.
+    used: Option<u64>,
+}
+
+/// Why the budget step does not run for a root this time, if it does
+/// not: an open grace window (the safer of the two choices Step 8
+/// allows), or the tier rule's `tier` victims filling the run's
+/// `max_deletes` (no room left for the budget's).
+fn budget_held_back(grace_until: Option<i64>, tier: usize, max_deletes: usize) -> Option<String> {
+    if let Some(until) = grace_until {
+        Some(format!(
+            "budget held back: a grace window after a policy change is open until {until} \
+             (Unix ms); the budget expires nothing meanwhile"
+        ))
+    } else if tier >= max_deletes {
+        Some(format!(
+            "budget waits: the tier rule's {tier} victim(s) fill this run's \
+             CONSTELLATION_SNAPSCHED_MAX_DELETES ({max_deletes})"
+        ))
+    } else {
+        None
+    }
+}
+
 /// An expiry run found no scheduler lease after `lead()` had taken it:
 /// unreachable, but the deletion path never stops without saying why.
 const NO_LEASE: &str = "internal: an expiry run without the scheduler lease; nothing expires";
@@ -617,6 +684,9 @@ pub struct Scheduler {
     state: tokio::sync::Mutex<SchedState>,
     /// The last creation failure per root, for `snapshot.sched.status`.
     errors: Mutex<BTreeMap<Ino, String>>,
+    /// The budget step's last word per root (`budget_note`,
+    /// `budget_used_bytes`), cleared when leadership ends.
+    budget_view: Mutex<BTreeMap<Ino, BudgetView>>,
     /// The grace state as last read, and when (for displays).
     grace_cache: GraceCache,
     /// A background refresh of `grace_cache` is under way.
@@ -632,6 +702,7 @@ impl Scheduler {
             deps,
             state: tokio::sync::Mutex::new(SchedState::default()),
             errors: Mutex::new(BTreeMap::new()),
+            budget_view: Mutex::new(BTreeMap::new()),
             grace_cache: Arc::new(Mutex::new(None)),
             grace_refreshing: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -686,6 +757,23 @@ impl Scheduler {
                 lease.release().await;
             }
             self.deps.stats.leader.store(false, Ordering::Relaxed);
+            self.forget_budget();
+        }
+    }
+
+    /// Leadership ended: what the budget step said is no longer this
+    /// node's to report (the next leader's runs say it).
+    fn forget_budget(&self) {
+        self.budget_view.lock().unwrap().clear();
+    }
+
+    /// Record the budget step's word on `ino`; nothing to say drops it.
+    fn set_budget_view(&self, ino: Ino, view: BudgetView) {
+        let mut views = self.budget_view.lock().unwrap();
+        if view.note.is_none() && view.used.is_none() {
+            views.remove(&ino);
+        } else {
+            views.insert(ino, view);
         }
     }
 
@@ -739,6 +827,7 @@ impl Scheduler {
                     state.lease = None;
                     state.settled.clear();
                     stats.leader.store(false, Ordering::Relaxed);
+                    self.forget_budget();
                     return Ok(false);
                 }
                 // Still ours as far as anyone knows: keep it and retry
@@ -771,10 +860,12 @@ impl Scheduler {
                     ) =>
             {
                 stats.leader.store(false, Ordering::Relaxed);
+                self.forget_budget();
                 Ok(false)
             }
             Err(error) => {
                 stats.leader.store(false, Ordering::Relaxed);
+                self.forget_budget();
                 Err(error)
             }
         }
@@ -858,6 +949,11 @@ impl Scheduler {
         state
             .last_expiry
             .retain(|ino, _| plans.iter().any(|p| p.ino == *ino));
+        self.budget_view.lock().unwrap().retain(|ino, _| {
+            plans
+                .iter()
+                .any(|p| p.ino == *ino && p.policy.as_ref().is_some_and(|q| q.budget.is_some()))
+        });
         // 1. No policy anywhere: no S3 work at all.
         if plans.is_empty() {
             if let Some(lease) = state.lease.take() {
@@ -866,6 +962,7 @@ impl Scheduler {
             }
             state.settled.clear();
             stats.leader.store(false, Ordering::Relaxed);
+            self.forget_budget();
             result.leader = false;
             return result;
         }
@@ -926,9 +1023,42 @@ impl Scheduler {
                             now,
                             grace_ms,
                         );
+                        let mut tier = 0;
                         for (row, v) in rows.iter().zip(&g.verdicts) {
                             if !v.keep {
+                                tier += 1;
                                 result.roots.push(expiry_root(p, row, "would_expire", None));
+                            }
+                        }
+                        // What the budget would give up after them (Step
+                        // 8), from the index as it is; nothing (and why)
+                        // while a grace window is open or the tiers alone
+                        // fill the run.
+                        let Some(budget) = policy.budget else {
+                            continue;
+                        };
+                        let max_deletes = self.deps.config.max_deletes;
+                        if let Some(note) = budget_held_back(g.grace_until, tier, max_deletes) {
+                            result.roots.push(budget_note_row(p, note));
+                        } else {
+                            let room = max_deletes - tier;
+                            match self.budget_choice(p.ino, policy, budget, room).await {
+                                BudgetChoice::Victims { rows, note, .. } => {
+                                    for row in &rows {
+                                        result.roots.push(expiry_root(
+                                            p,
+                                            row,
+                                            "would_budget_expire",
+                                            None,
+                                        ));
+                                    }
+                                    if let Some(note) = note {
+                                        result.roots.push(budget_note_row(p, note));
+                                    }
+                                }
+                                BudgetChoice::Note { note, .. } => {
+                                    result.roots.push(budget_note_row(p, note));
+                                }
                             }
                         }
                     }
@@ -1156,6 +1286,7 @@ impl Scheduler {
         state.lease = None;
         state.settled.clear();
         self.deps.stats.leader.store(false, Ordering::Relaxed);
+        self.forget_budget();
         result.leader = false;
         result.refused = Some("fenced: another node took the scheduler lease".into());
     }
@@ -1275,52 +1406,242 @@ impl Scheduler {
                 .filter(|(_, v)| !v.keep)
                 .map(|(row, _)| row)
                 .collect();
+            let tier = victims.len();
             victims.truncate(config.max_deletes);
-            if victims.is_empty() {
-                continue;
-            }
-            let Some(lease) = state.lease.as_mut() else {
-                result.error = Some(NO_LEASE.into());
-                return;
-            };
-            let run = snapexpire::delete_victims(
-                &self.deps.batches,
-                &self.deps.meta,
-                Some(lease),
-                p.ino,
-                &victims,
-                config.expire_batch,
-                self.before_delete(),
-            )
-            .await;
-            inc(&stats.expired, run.deleted.len() as u64);
-            inc(&stats.skipped_reverify, run.skipped.len() as u64);
-            reach.reached |= run.reached_holder;
-            reach.unreachable |= run.holder_unreachable;
-            if !run.deleted.is_empty() {
-                let journal = audit.entry(p.ino).or_insert_with(|| journal_root(p));
-                for row in &run.deleted {
-                    journal
-                        .deleted
-                        .push(snapexpire::journal_snap(row, snapexpire::REASON_NO_TIER));
-                    result.roots.push(expiry_root(p, row, "expired", None));
+            if !victims.is_empty() {
+                let flow = self
+                    .delete_run(
+                        state,
+                        p,
+                        &victims,
+                        snapexpire::REASON_NO_TIER,
+                        result,
+                        audit,
+                        reach,
+                    )
+                    .await;
+                if flow == Flow::Stop {
+                    return;
                 }
             }
-            for (row, why) in &run.skipped {
-                result
-                    .roots
-                    .push(expiry_root(p, row, "skipped_reverify", Some(why.clone())));
+            // Step 8, after the tier rule's deletions.
+            let Some(budget) = policy.budget else {
+                self.budget_view.lock().unwrap().remove(&p.ino);
+                continue;
+            };
+            if let Some(note) = budget_held_back(g.grace_until, tier, config.max_deletes) {
+                let note = Some(note);
+                self.set_budget_view(p.ino, BudgetView { note, used: None });
+                continue;
             }
-            if run.fenced {
-                self.fenced(state, result);
-                return;
+            let room = config.max_deletes - tier;
+            match self.budget_choice(p.ino, policy, budget, room).await {
+                BudgetChoice::Note { note, stale } => {
+                    if stale {
+                        inc(&stats.budget_stale, 1);
+                    }
+                    let note = Some(note);
+                    self.set_budget_view(p.ino, BudgetView { note, used: None });
+                }
+                BudgetChoice::Victims {
+                    rows,
+                    note,
+                    remaining,
+                } => {
+                    let used = Some(remaining);
+                    self.set_budget_view(p.ino, BudgetView { note, used });
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let flow = self
+                        .delete_run(
+                            state,
+                            p,
+                            &rows,
+                            snapexpire::REASON_BUDGET,
+                            result,
+                            audit,
+                            reach,
+                        )
+                        .await;
+                    if flow == Flow::Stop {
+                        return;
+                    }
+                }
             }
-            if let Some(error) = run.error {
-                let error = format!("policy root {} expiry: {error}", p.ino);
-                self.note_error(Some(p.ino), error.clone());
-                result.error = Some(error);
-                return;
+        }
+    }
+
+    /// Delete one root's `victims` through [`snapexpire::delete_victims`]
+    /// under the scheduler lease, and account for it: `expired` (and
+    /// `budget_expired` for the budget's), `skipped_reverify`, the audit
+    /// with `reason`, the run's rows. [`Flow::Stop`] when the run must end
+    /// (fenced, or a batch failed).
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_run(
+        &self,
+        state: &mut SchedState,
+        p: &RootPlan,
+        victims: &[SnapshotRow],
+        reason: &str,
+        result: &mut SnapSchedRunResult,
+        audit: &mut BTreeMap<Ino, SnapSchedJournalRoot>,
+        reach: &mut Reach,
+    ) -> Flow {
+        let stats = &self.deps.stats;
+        let Some(lease) = state.lease.as_mut() else {
+            result.error = Some(NO_LEASE.into());
+            return Flow::Stop;
+        };
+        let run = snapexpire::delete_victims(
+            &self.deps.batches,
+            &self.deps.meta,
+            Some(lease),
+            p.ino,
+            victims,
+            self.deps.config.expire_batch,
+            self.before_delete(),
+        )
+        .await;
+        let budget = reason == snapexpire::REASON_BUDGET;
+        inc(&stats.expired, run.deleted.len() as u64);
+        if budget {
+            inc(&stats.budget_expired, run.deleted.len() as u64);
+        }
+        inc(&stats.skipped_reverify, run.skipped.len() as u64);
+        reach.reached |= run.reached_holder;
+        reach.unreachable |= run.holder_unreachable;
+        if !run.deleted.is_empty() {
+            let journal = audit.entry(p.ino).or_insert_with(|| journal_root(p));
+            for row in &run.deleted {
+                journal.deleted.push(snapexpire::journal_snap(row, reason));
+                let outcome = if budget { "budget_expired" } else { "expired" };
+                result.roots.push(expiry_root(p, row, outcome, None));
             }
+        }
+        for (row, why) in &run.skipped {
+            result
+                .roots
+                .push(expiry_root(p, row, "skipped_reverify", Some(why.clone())));
+        }
+        if run.fenced {
+            self.fenced(state, result);
+            return Flow::Stop;
+        }
+        if let Some(error) = run.error {
+            let error = format!("policy root {} expiry: {error}", p.ino);
+            self.note_error(Some(p.ino), error.clone());
+            result.error = Some(error);
+            return Flow::Stop;
+        }
+        Flow::Go
+    }
+
+    /// Plan 32 Step 8 for one root, after the tier rule's deletions and
+    /// outside any grace window: which of its snapshots `budget=` gives
+    /// up, at most `room`. The rows are read again (the tier step just
+    /// deleted some), the victim order is [`retention::budget_order`]
+    /// over the tier rule's verdicts, and the bytes are the accounting
+    /// index's `reclaim` — only from a fresh one
+    /// ([`SnapAcctService::budget_plan`]: current, and as of no longer
+    /// than twice `CONSTELLATION_SNAPACCT_REFRESH_S` ago); a stale,
+    /// building or absent index is a [`BudgetChoice::Note`] counting
+    /// `budget_stale`.
+    ///
+    /// The measured set is the candidates the tier rule **keeps**. A tier
+    /// victim the leader's replica (and so its index) still lists — the
+    /// holder deleted it, the deletion has not synced here yet — would
+    /// otherwise count its own bytes against the budget, and the budget
+    /// would delete a kept snapshot for bytes that are already going.
+    /// Leaving the tier victims out can only under-count (a chunk shared
+    /// with one of them is not counted until it is gone): the budget
+    /// errs towards deleting less, and the next run sees the rest.
+    async fn budget_choice(
+        &self,
+        ino: Ino,
+        policy: &SnapPolicy,
+        budget: u64,
+        room: usize,
+    ) -> BudgetChoice {
+        let stale = |note: String| BudgetChoice::Note { note, stale: true };
+        let Some(acct) = self.deps.snapacct.as_ref() else {
+            return stale("budget not enforced: no space accounting on this node".into());
+        };
+        let rows = match snapexpire::root_rows(&self.deps.meta, ino) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return BudgetChoice::Note {
+                    note: format!("budget: reading the snapshot rows: {error:#}"),
+                    stale: false,
+                }
+            }
+        };
+        let facts: Vec<SnapFacts> = rows.iter().map(SnapFacts::from_row).collect();
+        let verdicts = retention::evaluate(policy, ino, &facts);
+        let kept: Vec<String> = facts
+            .iter()
+            .zip(&verdicts)
+            .filter(|(f, v)| f.is_candidate(ino) && v.keep)
+            .map(|(f, _)| f.id.clone())
+            .collect();
+        let order = retention::budget_order(policy, ino, &facts, &verdicts);
+        let max_age = acct.refresh_interval().saturating_mul(2);
+        let answer = acct
+            .budget_plan(&kept, &order, budget, room, max_age, BUDGET_INDEX_WAIT)
+            .await;
+        let plan = match answer {
+            Ok(BudgetAnswer::Plan(plan)) => plan,
+            Ok(BudgetAnswer::Building { pct }) => {
+                return stale(format!(
+                    "budget not enforced: the space-accounting index is building ({pct}%)"
+                ))
+            }
+            Ok(BudgetAnswer::Stale { as_of_ms }) => {
+                return stale(format!(
+                    "budget not enforced: the space-accounting index is stale (as of {as_of_ms} \
+                     Unix ms, more than 2 × CONSTELLATION_SNAPACCT_REFRESH_S ago)"
+                ))
+            }
+            Ok(BudgetAnswer::Off) => {
+                return stale(
+                    "budget not enforced: space accounting is off (CONSTELLATION_SNAPACCT=off)"
+                        .into(),
+                )
+            }
+            Err(error) => {
+                return BudgetChoice::Note {
+                    note: format!("budget: the space-accounting index: {error:#}"),
+                    stale: false,
+                }
+            }
+        };
+        let note = if plan.remaining <= budget {
+            None
+        } else if plan.chosen.len() >= room {
+            Some(format!(
+                "over budget: {} of {} bytes would remain after this run's {} deletion(s) \
+                 (CONSTELLATION_SNAPSCHED_MAX_DELETES); the next run continues",
+                plan.remaining,
+                budget,
+                plan.chosen.len()
+            ))
+        } else {
+            Some(format!(
+                "over budget, cannot be met: {} of {} bytes remain with every snapshot the budget \
+                 may expire gone; the rest is the newest `last` and held snapshots",
+                plan.remaining, budget
+            ))
+        };
+        let by_id: HashMap<&str, &SnapshotRow> = rows.iter().map(|r| (r.id.as_str(), r)).collect();
+        let victims = plan
+            .chosen
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()).map(|r| (*r).clone()))
+            .collect();
+        BudgetChoice::Victims {
+            rows: victims,
+            note,
+            remaining: plan.remaining,
         }
     }
 
@@ -1385,6 +1706,7 @@ impl Scheduler {
                 tokio::time::Instant::now() + Duration::from_millis(self.deps.config.lease_ttl_ms),
             );
             self.deps.stats.leader.store(false, Ordering::Relaxed);
+            self.forget_budget();
             self.note_error(None, error);
             result.leader = false;
         }
@@ -1543,6 +1865,7 @@ impl Scheduler {
         let now = (self.deps.clock)();
         let (plans, _) = plan_roots(&self.deps.meta, now, self.deps.config.max_per_root)?;
         let errors = self.errors.lock().unwrap().clone();
+        let budgets = self.budget_view.lock().unwrap().clone();
         Ok(SnapSchedReport {
             node_id: self.deps.node_id,
             enabled: self.deps.config.enabled,
@@ -1565,9 +1888,25 @@ impl Scheduler {
                     last_created_unix_ms: p.last_created,
                     capped: p.capped,
                     used_bytes: None,
+                    budget_bytes: p.policy.as_ref().and_then(|q| q.budget),
+                    budget_used_bytes: budgets.get(&p.ino).and_then(|b| b.used),
+                    budget_note: budgets.get(&p.ino).and_then(|b| b.note.clone()),
                 })
                 .collect(),
         })
+    }
+}
+
+/// A dry run's word on a root's budget that names no snapshot: why it
+/// cannot decide, or why what it would delete is not enough.
+fn budget_note_row(p: &RootPlan, note: String) -> SnapSchedRunRoot {
+    SnapSchedRunRoot {
+        ino: p.ino,
+        path: p.path.clone().unwrap_or_default(),
+        name: String::new(),
+        outcome: "budget_note".to_string(),
+        id: None,
+        error: Some(note),
     }
 }
 
@@ -1656,6 +1995,7 @@ mod tests {
             stats: SnapSchedStats::new(),
             config,
             clock: Arc::new(move || now.load(Ordering::Relaxed)),
+            snapacct: None,
         })
     }
 
@@ -2133,6 +2473,7 @@ mod tests {
             stats: SnapSchedStats::new(),
             config: config(),
             clock: Arc::new(move || now.load(Ordering::Relaxed)),
+            snapacct: None,
         }
     }
 
@@ -3502,5 +3843,683 @@ mod tests {
         // Paused: not armed, nothing filled.
         bind(&a, &[], data, "10s:1m; skip-empty=no; paused").await;
         assert!(sched.listing().await.unwrap().is_empty());
+    }
+
+    // --- the space budget (plan 32 Step 8, M7) --------------------------
+
+    use crate::snapacct::{SnapAcctConfig, SnapAcctDeps, SnapAcctMode, SnapAcctParams};
+    use constellation_fs_core::manifest::{Manifest, SparseChunks};
+    use constellation_fs_core::ChunkHash;
+    use constellation_store_s3::{ChunkStore, CommitChain};
+
+    const MIB: u64 = 1 << 20;
+
+    /// Two tiers that keep every snapshot of a two-minute history (the
+    /// 10 s tier for ten minutes, the minutely forever), so only the
+    /// budget deletes; `last=2`.
+    fn budget_policy(budget: &str) -> String {
+        format!("10s:10min 1m:*; last=2; skip-empty=no; budget={budget}")
+    }
+
+    /// `f` := one chunk of `size` bytes of its own content: each snapshot
+    /// of a history written this way owns its chunk alone once the next
+    /// write replaces it in the live tree.
+    fn write_chunk(n: &Node, f: Ino, tag: usize, size: u64) {
+        let mut chunks = SparseChunks::new();
+        chunks.insert(0, ChunkHash::of(format!("budget/{tag}").as_bytes()));
+        let (manifest, _) = Manifest::from_sparse_chunks(
+            constellation_fs_core::DEFAULT_CHUNK_SIZE,
+            size,
+            chunks,
+            64,
+            ChunkHash::of,
+        );
+        n.meta.set_manifest(f, &manifest.encode(), size).unwrap();
+    }
+
+    /// A real space-accounting index over `n`'s replica and the bucket.
+    fn accounting(
+        n: &Node,
+        store: &Arc<InMemory>,
+        dir: &std::path::Path,
+        refresh: Duration,
+        mode: SnapAcctMode,
+    ) -> Arc<SnapAcctService> {
+        let bucket = store.clone() as Arc<dyn ObjectStore>;
+        SnapAcctService::new(
+            SnapAcctConfig {
+                mode,
+                refresh,
+                budget: Duration::from_secs(3600),
+                max_ops_per_pass: None,
+                answer_wait: Duration::from_millis(200),
+                params: SnapAcctParams::default(),
+            },
+            SnapAcctDeps {
+                meta: n.meta.clone(),
+                chunks: Arc::new(ChunkStore::new(bucket.clone())),
+                tree: n.snapshots.tree().unwrap().clone(),
+                commits: CommitChain::new(bucket),
+                dir: dir.join("snapacct"),
+                fs_uuid: "budget".into(),
+            },
+        )
+    }
+
+    /// `count` snapshots of `/data`, one per 10 s bucket, `/data/f`
+    /// rewritten with a fresh 1 MiB chunk before each, taken by a
+    /// scheduler that deletes nothing and records the first sighting with
+    /// `grace`. The clock stays inside the last one's bucket, so the next
+    /// tick creates nothing. Returns every auto row, oldest first.
+    async fn budget_history(
+        a: &Node,
+        store: &Arc<InMemory>,
+        now: &Arc<AtomicI64>,
+        data: Ino,
+        count: usize,
+        grace: Duration,
+    ) -> Vec<SnapshotRow> {
+        let tags: Vec<usize> = (0..count).collect();
+        budget_history_of(a, store, now, data, &tags, grace).await
+    }
+
+    /// [`budget_history`] with `f`'s chunk before each snapshot named by
+    /// `tags`: equal tags, the same chunk (shared by those snapshots).
+    async fn budget_history_of(
+        a: &Node,
+        store: &Arc<InMemory>,
+        now: &Arc<AtomicI64>,
+        data: Ino,
+        tags: &[usize],
+        grace: Duration,
+    ) -> Vec<SnapshotRow> {
+        let count = tags.len();
+        let f = a.meta.lookup(data, "f").unwrap().unwrap().ino;
+        let builder = scheduler(
+            a,
+            store.clone(),
+            now,
+            SchedConfig {
+                max_deletes: 0,
+                grace,
+                ..expiry_config()
+            },
+        );
+        for (i, tag) in tags.iter().enumerate() {
+            if i > 0 {
+                advance(now, 10 * SEC);
+            }
+            write_chunk(a, f, *tag, MIB);
+            assert_eq!(outcomes(&builder.tick(Run::Periodic).await), ["created"]);
+        }
+        builder.resign().await;
+        a.sync().await;
+        let rows = autos(a);
+        assert_eq!(rows.len(), count);
+        rows
+    }
+
+    fn budget_scheduler(
+        a: &Node,
+        store: &Arc<InMemory>,
+        now: &Arc<AtomicI64>,
+        acct: Option<Arc<SnapAcctService>>,
+        config: SchedConfig,
+    ) -> Arc<Scheduler> {
+        let mut deps = deps_of(a, store.clone() as Arc<dyn ObjectStore>, now);
+        deps.config = config;
+        deps.snapacct = acct;
+        Scheduler::new(deps)
+    }
+
+    /// The ids of the snapshots the minutely (coarsest) tier keeps.
+    fn coarsest_kept(policy: &str, ino: Ino, rows: &[SnapshotRow]) -> BTreeSet<String> {
+        let policy = SnapPolicy::parse(policy).unwrap();
+        let facts: Vec<SnapFacts> = rows.iter().map(SnapFacts::from_row).collect();
+        let coarsest = policy.coarsest().unwrap();
+        rows.iter()
+            .zip(retention::evaluate(&policy, ino, &facts))
+            .filter(|(_, v)| v.tiers().any(|t| t == coarsest))
+            .map(|(r, _)| r.id.clone())
+            .collect()
+    }
+
+    fn budget_order_of(policy: &str, ino: Ino, rows: &[SnapshotRow]) -> Vec<String> {
+        let policy = SnapPolicy::parse(policy).unwrap();
+        let facts: Vec<SnapFacts> = rows.iter().map(SnapFacts::from_row).collect();
+        let verdicts = retention::evaluate(&policy, ino, &facts);
+        retention::budget_order(&policy, ino, &facts, &verdicts)
+    }
+
+    fn note_of(sched: &Scheduler, ino: Ino) -> Option<String> {
+        sched
+            .budget_view
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .and_then(|b| b.note.clone())
+    }
+
+    /// Plan 32 Step 8 over a real index: twelve snapshots each owning
+    /// 1 MiB (the newest shares its chunk with the live tree, so the
+    /// policy's snapshot-only bytes are 11 MiB) under `budget=5M`. The
+    /// budget deletes exactly six — the prefix of `budget_order`, and none
+    /// a minutely representative while finer ones remain — through the
+    /// expiry path (audit reason `budget`, `budget_expired` and `expired`
+    /// both 6); a dry run first names the same six. The `last` two
+    /// survive; a second run finds the root within budget and deletes
+    /// nothing; the status shows the limit and the 5 MiB that remain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn over_budget_the_oldest_non_coarsest_representatives_go_first() {
+        let policy = budget_policy("5M");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = budget_history(&a, &store, &now, data, 12, Duration::ZERO).await;
+        let state = tempfile::TempDir::new().unwrap();
+        let acct = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::On,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        tokio::spawn(acct.clone().run(stop.clone(), None));
+        acct.catch_up().await.unwrap();
+        let candidates: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let used = acct.reclaim(&candidates).await.unwrap().ready().unwrap();
+        assert_eq!(used.bytes, 11 * MIB, "the index's view of the history");
+
+        let order = budget_order_of(&policy, data, &rows);
+        let want: Vec<String> = order[..6].to_vec();
+        let coarse = coarsest_kept(&policy, data, &rows);
+        assert!(
+            order.len() - coarse.len() >= 6,
+            "enough fine points: {order:?}"
+        );
+        assert!(
+            want.iter().all(|id| !coarse.contains(id)),
+            "{want:?} vs {coarse:?}"
+        );
+        let sched = budget_scheduler(&a, &store, &now, Some(acct.clone()), expiry_config());
+        let dry = sched.tick(Run::Manual { dry_run: true }).await;
+        let would: Vec<String> = dry
+            .roots
+            .iter()
+            .filter(|r| r.outcome == "would_budget_expire")
+            .map(|r| r.id.clone().unwrap())
+            .collect();
+        assert_eq!(would, want, "{dry:?}");
+        assert_eq!(autos(&a).len(), 12, "a dry run deletes nothing");
+
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        assert_eq!(outcomes(&report), ["budget_expired"; 6], "{report:?}");
+        let survivors = ids(&autos(&a));
+        let gone: BTreeSet<String> = want.iter().cloned().collect();
+        assert_eq!(survivors, &ids(&rows) - &gone);
+        assert!(survivors.contains(&rows[10].id) && survivors.contains(&rows[11].id));
+        assert!(coarse.is_subset(&survivors), "the minutelies stay");
+        let stats = sched.deps.stats.status();
+        assert_eq!(
+            (stats.budget_expired, stats.expired, stats.budget_stale),
+            (6, 6, 0)
+        );
+        let deleted: Vec<SnapSchedJournalSnap> = journal(&store)
+            .await
+            .into_iter()
+            .flat_map(|e| e.roots.into_iter().flat_map(|r| r.deleted))
+            .collect();
+        assert_eq!(deleted.len(), 6);
+        assert!(deleted
+            .iter()
+            .all(|d| d.reason.as_deref() == Some(snapexpire::REASON_BUDGET)));
+        assert_eq!(note_of(&sched, data), None);
+
+        // Within budget now: the next run deletes nothing.
+        let again = sched.tick(Run::Periodic).await;
+        assert!(again.error.is_none() && again.roots.is_empty(), "{again:?}");
+        assert_eq!(autos(&a).len(), 6);
+        assert_eq!(sched.deps.stats.status().budget_expired, 6);
+        acct.catch_up().await.unwrap();
+        let left: Vec<String> = autos(&a).iter().map(|r| r.id.clone()).collect();
+        let now_used = acct.reclaim(&left).await.unwrap().ready().unwrap();
+        assert_eq!(now_used.bytes, 5 * MIB);
+        // The status shows the scheduler's own figure, no scan of its own.
+        let status = sched.report().unwrap();
+        assert_eq!(status.roots[0].budget_bytes, Some(5 * MIB));
+        assert_eq!(status.roots[0].budget_used_bytes, Some(5 * MIB));
+        assert_eq!(status.roots[0].budget_note, None);
+        // A node that no longer leads reports no budget figures.
+        sched.resign().await;
+        let status = sched.report().unwrap();
+        assert_eq!(
+            (
+                status.roots[0].budget_used_bytes,
+                status.roots[0].budget_note.clone()
+            ),
+            (None, None)
+        );
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// An unmeetable budget (`1K` against 1 MiB snapshots): everything the
+    /// budget may expire goes, the held oldest and the `last` two stay,
+    /// and the root carries a note saying it cannot be met — not an
+    /// error, not `last_error`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unmeetable_budget_keeps_last_and_held_and_is_reported() {
+        let policy = budget_policy("1K");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = budget_history(&a, &store, &now, data, 6, Duration::ZERO).await;
+        hold(&a, &rows[0].id, Some("csi:x")).await;
+        let state = tempfile::TempDir::new().unwrap();
+        let acct = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::On,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        tokio::spawn(acct.clone().run(stop.clone(), None));
+        acct.catch_up().await.unwrap();
+        let sched = budget_scheduler(&a, &store, &now, Some(acct), expiry_config());
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        let survivors = ids(&autos(&a));
+        let want: BTreeSet<String> = [&rows[0], &rows[4], &rows[5]]
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        assert_eq!(survivors, want);
+        let stats = sched.deps.stats.status();
+        assert_eq!((stats.budget_expired, stats.budget_stale), (3, 0));
+        assert_eq!(stats.last_error, None);
+        let note = note_of(&sched, data).expect("an unmet budget is reported");
+        assert!(note.contains("cannot be met"), "{note}");
+        assert!(note.contains(&format!("{MIB} of 1024 bytes")), "{note}");
+        assert_eq!(sched.report().unwrap().roots[0].budget_note, Some(note));
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Only from a fresh index: one whose last pass is older than twice
+    /// `CONSTELLATION_SNAPACCT_REFRESH_S` decides nothing (`budget_stale`,
+    /// a note); caught up again, the same budget deletes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stale_index_deletes_nothing_and_counts_budget_stale() {
+        let policy = budget_policy("1K");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = budget_history(&a, &store, &now, data, 4, Duration::ZERO).await;
+        let state = tempfile::TempDir::new().unwrap();
+        // No task: nothing refreshes the index behind the test's back.
+        let acct = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(1),
+            SnapAcctMode::On,
+        );
+        acct.catch_up().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
+        let sched = budget_scheduler(&a, &store, &now, Some(acct.clone()), expiry_config());
+        let report = sched.tick(Run::Periodic).await;
+        assert!(
+            report.error.is_none() && report.roots.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(ids(&autos(&a)), ids(&rows));
+        let stats = sched.deps.stats.status();
+        assert_eq!((stats.budget_stale, stats.budget_expired), (1, 0));
+        assert!(note_of(&sched, data).unwrap().contains("stale"));
+        acct.catch_up().await.unwrap();
+        let report = sched.tick(Run::Periodic).await;
+        assert_eq!(outcomes(&report), ["budget_expired"; 2], "{report:?}");
+        assert_eq!(sched.deps.stats.status().budget_stale, 1);
+    }
+
+    /// Snapshots sharing a chunk the live tree no longer has (review of
+    /// M7, must-fix 1): s0–s2 share 1 MiB, s3 owns 1 MiB, the `last` two
+    /// hold only the live chunk; `budget=1536K` against 2 MiB. Deleting
+    /// one of s0–s2 frees nothing while the other two keep the chunk, so
+    /// what would remain is `used − reclaim(chosen)`, not `reclaim(kept −
+    /// chosen)`. With room for one deletion the run deletes one and says
+    /// the root is still over budget; with room enough the next run meets
+    /// the budget in one go — exactly the shortest prefix of the order
+    /// that frees a chunk — and the note is gone. Dropping the budget
+    /// from the policy drops the root's figures from the status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_snapshot_only_chunks_count_until_their_last_referrer_goes() {
+        let policy = budget_policy("1536K");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows =
+            budget_history_of(&a, &store, &now, data, &[0, 0, 0, 1, 2, 2], Duration::ZERO).await;
+        let state = tempfile::TempDir::new().unwrap();
+        let acct = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::On,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        tokio::spawn(acct.clone().run(stop.clone(), None));
+        acct.catch_up().await.unwrap();
+        let candidates: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let used = acct.reclaim(&candidates).await.unwrap().ready().unwrap();
+        assert_eq!(used.bytes, 2 * MIB, "chunk A once, chunk B, not the live C");
+
+        // The plan itself: the shortest prefix of the order that frees a
+        // chunk (s3's, or the last of s0–s2), in a bounded number of scans.
+        let order = budget_order_of(&policy, data, &rows);
+        assert_eq!(order.len(), 4, "{order:?}");
+        let shared: BTreeSet<&String> = rows[..3].iter().map(|r| &r.id).collect();
+        let take = (1..=order.len())
+            .find(|k| {
+                let prefix: BTreeSet<&String> = order[..*k].iter().collect();
+                prefix.contains(&rows[3].id) || shared.is_subset(&prefix)
+            })
+            .unwrap();
+        let want: Vec<String> = order[..take].to_vec();
+        let plan = match acct
+            .budget_plan(
+                &candidates,
+                &order,
+                1536 * 1024,
+                500,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+        {
+            BudgetAnswer::Plan(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(plan.used, 2 * MIB);
+        assert_eq!(plan.chosen, want);
+        assert_eq!(plan.remaining, MIB);
+        assert!(plan.scans <= 4, "{plan:?}");
+
+        // Room for one: one deleted, and the root is reported over budget.
+        let one = budget_scheduler(
+            &a,
+            &store,
+            &now,
+            Some(acct.clone()),
+            SchedConfig {
+                max_deletes: 1,
+                ..expiry_config()
+            },
+        );
+        let report = one.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        assert_eq!(outcomes(&report), ["budget_expired"], "{report:?}");
+        let note = note_of(&one, data).expect("still over budget");
+        assert!(note.starts_with("over budget:"), "{note}");
+        assert!(
+            note.contains(&format!("{} of {} bytes", 2 * MIB, 1536 * 1024)),
+            "{note}"
+        );
+        let status = one.report().unwrap();
+        assert_eq!(status.roots[0].budget_used_bytes, Some(2 * MIB));
+        one.resign().await;
+        assert_eq!(
+            note_of(&one, data),
+            None,
+            "resigning forgets the budget's word"
+        );
+
+        // Room enough: the rest of the prefix goes in one run.
+        let sched = budget_scheduler(&a, &store, &now, Some(acct.clone()), expiry_config());
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        let survivors = ids(&autos(&a));
+        let gone: BTreeSet<String> = want.iter().cloned().collect();
+        assert_eq!(survivors, &ids(&rows) - &gone, "{report:?}");
+        assert_eq!(note_of(&sched, data), None);
+        acct.catch_up().await.unwrap();
+        let left: Vec<String> = survivors.iter().cloned().collect();
+        let after = acct.reclaim(&left).await.unwrap().ready().unwrap();
+        assert!(after.bytes <= 1536 * 1024, "{after:?}");
+        assert_eq!(
+            sched.report().unwrap().roots[0].budget_used_bytes,
+            Some(MIB)
+        );
+        assert_eq!(sched.deps.stats.status().budget_expired, take as u64 - 1);
+
+        // No budget any more: no budget figures for the root.
+        bind(&a, &[], data, "10s:10min 1m:*; last=2; skip-empty=no").await;
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        let status = sched.report().unwrap();
+        assert_eq!(status.roots[0].budget_bytes, None);
+        assert!(sched.budget_view.lock().unwrap().is_empty());
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// No room for the budget (the run's delete cap is 0 here, or the tier
+    /// victims fill it): the step does not run, and says it waits — never
+    /// "over budget" for a root it did not measure — in the dry run too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn without_room_the_budget_step_waits_and_says_so() {
+        let policy = budget_policy("1G");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = budget_history(&a, &store, &now, data, 3, Duration::ZERO).await;
+        let state = tempfile::TempDir::new().unwrap();
+        let acct = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::On,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        tokio::spawn(acct.clone().run(stop.clone(), None));
+        acct.catch_up().await.unwrap();
+        let config = SchedConfig {
+            max_deletes: 0,
+            ..expiry_config()
+        };
+        let sched = budget_scheduler(&a, &store, &now, Some(acct), config);
+        let dry = sched.tick(Run::Manual { dry_run: true }).await;
+        let notes: Vec<&str> = dry
+            .roots
+            .iter()
+            .filter(|r| r.outcome == "budget_note")
+            .map(|r| r.error.as_deref().unwrap())
+            .collect();
+        assert_eq!(notes.len(), 1, "{dry:?}");
+        assert!(notes[0].starts_with("budget waits:"), "{dry:?}");
+        let report = sched.tick(Run::Periodic).await;
+        assert!(
+            report.error.is_none() && report.roots.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(ids(&autos(&a)), ids(&rows));
+        let note = note_of(&sched, data).unwrap();
+        assert!(note.starts_with("budget waits:"), "{note}");
+        assert!(!note.contains("over budget"), "{note}");
+        let stats = sched.deps.stats.status();
+        assert_eq!((stats.budget_stale, stats.budget_expired), (0, 0));
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// A building index, accounting off, or none at all: nothing deleted,
+    /// each run counts `budget_stale` and says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_building_off_or_absent_index_deletes_nothing() {
+        let policy = budget_policy("1K");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = budget_history(&a, &store, &now, data, 4, Duration::ZERO).await;
+        let state = tempfile::TempDir::new().unwrap();
+        let building = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::On,
+        );
+        let off = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::Off,
+        );
+        for (acct, why) in [
+            (Some(building), "building"),
+            (Some(off), "off"),
+            (None, "no space accounting"),
+        ] {
+            let sched = budget_scheduler(&a, &store, &now, acct, expiry_config());
+            let report = sched.tick(Run::Periodic).await;
+            assert!(
+                report.error.is_none() && report.roots.is_empty(),
+                "{why}: {report:?}"
+            );
+            assert_eq!(ids(&autos(&a)), ids(&rows), "{why}");
+            let stats = sched.deps.stats.status();
+            assert_eq!((stats.budget_stale, stats.budget_expired), (1, 0), "{why}");
+            let note = note_of(&sched, data).unwrap();
+            assert!(note.contains(why), "{why}: {note}");
+            sched.resign().await;
+        }
+    }
+
+    /// A hold landing between the budget's choice and its delete batch
+    /// wins (the same re-read as the tier rule's victims): that snapshot
+    /// survives as `skipped_reverify`, the others go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hold_landing_mid_budget_run_survives() {
+        let policy = budget_policy("1K");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let rows = budget_history(&a, &store, &now, data, 6, Duration::ZERO).await;
+        let state = tempfile::TempDir::new().unwrap();
+        let acct = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::On,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        tokio::spawn(acct.clone().run(stop.clone(), None));
+        acct.catch_up().await.unwrap();
+        let sched = budget_scheduler(
+            &a,
+            &store,
+            &now,
+            Some(acct),
+            SchedConfig {
+                expire_batch: 1,
+                ..expiry_config()
+            },
+        );
+        let batcher = a.batcher.clone();
+        let hook: snapexpire::BeforeBatch = Arc::new(move |index, ids: Vec<String>| {
+            let batcher = batcher.clone();
+            Box::pin(async move {
+                if index == 1 {
+                    let results = batcher
+                        .submit(
+                            batcher.next_rid(),
+                            vec![hold_item(&ids[0], Some("user:ops"))],
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(&results[0], ItemResult::HoldSet { .. }));
+                }
+            })
+        });
+        *sched.before_delete.lock().unwrap() = Some(hook);
+        let order = budget_order_of(&policy, data, &rows);
+        assert_eq!(order.len(), 4);
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        let skipped: Vec<&str> = report
+            .roots
+            .iter()
+            .filter(|r| r.outcome == "skipped_reverify")
+            .map(|r| r.id.as_deref().unwrap())
+            .collect();
+        assert_eq!(skipped, [order[1].as_str()]);
+        let survivors = ids(&autos(&a));
+        assert!(survivors.contains(&order[1]));
+        for gone in [&order[0], &order[2], &order[3]] {
+            assert!(!survivors.contains(gone), "{gone}");
+        }
+        let stats = sched.deps.stats.status();
+        assert_eq!((stats.budget_expired, stats.skipped_reverify), (3, 1));
+        assert!(autos(&a).iter().any(|r| r.id == order[1] && r.held));
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Grace (the safer choice): while any grace window is open on the
+    /// root — here the first sighting's — the budget deletes nothing and
+    /// says so; once it closes, the budget acts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_budget_waits_for_the_grace_window() {
+        let policy = budget_policy("1K");
+        let (store, a, data) = solo(&policy).await;
+        let now = test_clock();
+        stamp(&a, &now);
+        let grace = Duration::from_secs(3600);
+        let rows = budget_history(&a, &store, &now, data, 6, grace).await;
+        let state = tempfile::TempDir::new().unwrap();
+        let acct = accounting(
+            &a,
+            &store,
+            state.path(),
+            Duration::from_secs(3600),
+            SnapAcctMode::On,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        tokio::spawn(acct.clone().run(stop.clone(), None));
+        acct.catch_up().await.unwrap();
+        let config = SchedConfig {
+            grace,
+            ..expiry_config()
+        };
+        let sched = budget_scheduler(&a, &store, &now, Some(acct.clone()), config);
+        let report = sched.tick(Run::Periodic).await;
+        assert!(
+            report.error.is_none() && report.roots.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(ids(&autos(&a)), ids(&rows));
+        let stats = sched.deps.stats.status();
+        assert_eq!((stats.budget_stale, stats.budget_expired), (0, 0));
+        assert!(note_of(&sched, data).unwrap().contains("grace window"));
+        // A dry run inside the window names no budget victim either.
+        let dry = sched.tick(Run::Manual { dry_run: true }).await;
+        assert!(
+            !dry.roots.iter().any(|r| r.outcome == "would_budget_expire"),
+            "{dry:?}"
+        );
+        advance(&now, 3600 * SEC + 10 * SEC);
+        let report = sched.tick(Run::Periodic).await;
+        assert!(report.error.is_none(), "{report:?}");
+        // The hour moved the 10 s tier's window: the tier rule takes the
+        // older points, the budget what is left above the `last` floor.
+        assert_eq!(outcomes(&report)[0], "created");
+        assert!(sched.deps.stats.status().budget_expired >= 1, "{report:?}");
+        assert_eq!(autos(&a).len(), 2, "{report:?}");
+        // Both hold only the live tree's chunk: within budget, no note.
+        assert_eq!(note_of(&sched, data), None);
+        stop.store(true, Ordering::Relaxed);
     }
 }

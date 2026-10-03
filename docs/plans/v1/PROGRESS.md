@@ -40322,3 +40322,135 @@ first file at t=11361 while node 1's holder was still in I/O.
   harness web-ui-smoke, session/p2p/lease-handover, two-clients-shared pass.
   Not run: webui-headless (no CHROME_BIN), csi-credential-revocation (no
   versitygw), passthrough-handover (needs root); no `cli-*` scenarios exist.
+
+## Plan 32 M7 — space budget
+
+**Milestone M7 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 8,
+optional; chunk `32-m7`): `budget=<size>` now deletes.** It is the only rule
+that expires snapshots the tier windows keep. Base `72438dc`.
+
+| Item | State | Where |
+|---|---|---|
+| Victim order, pure: `retention::budget_order(policy, policy_ino, snaps, verdicts) -> Vec<id>` — kept candidates whose verdict reasons are all tiers, outside the newest `last`; first those the **coarsest tier does not keep**, oldest first, then the coarsest tier's, oldest first. Never held / manual / another root's / `last` / a graced verdict / an index the verdicts do not cover | DONE | `crates/meta/src/snapsched/retention.rs` |
+| Budget step in the expiry run, after the tier deletions: no grace window open, room left under `MAX_DELETES`, the rows re-read, `reclaim(kept candidates)`; when over budget the victims are the shortest prefix `P` of the order with `reclaim(kept) − reclaim(P)` within it (binary search, review round 1); the chosen deleted through exactly the M4 path (`delete_victims`: renew, re-read, holder batch, audit reason `budget`) | DONE | `Scheduler::budget_choice`, `Scheduler::delete_run` (`crates/engine/src/snapsched.rs`); `snapexpire::REASON_BUDGET` and the module doc's "The space budget" |
+| Fresh index only: `SnapAcctService::budget_plan` — current (every row applied, no build), `as_of_ms` within `2 × CONSTELLATION_SNAPACCT_REFRESH_S`; waits up to 5 s for the pass a snapshot created this tick needs (only while built: a real build answers at once); the whole plan under the pass lock, off the runtime, in at most `2 + ⌈log₂ n⌉` `reclaim` scans. Stale, building, off or absent → nothing deleted, `budget_stale` += 1, a note | DONE | `crates/engine/src/snapacct/service.rs` (`BudgetAnswer`, `BudgetPlan`, `shortest_prefix`, `refresh_interval`) |
+| Unmeetable (order exhausted, still over) → `budget_note` "over budget, cannot be met …" on the root; not `result.error`, not `last_error`. Cap reached → a "next run continues" note. Within budget → note cleared | DONE | `SnapSchedRootState::budget_note` |
+| Counters: a budget deletion counts `expired` **and** `budget_expired` (a subset, so `expired` stays "every automatic deletion" and still equals the journal's `deleted` count) | DONE | `Scheduler::delete_run` |
+| Status: `SnapSchedRootState.{budget_bytes, budget_used_bytes, budget_note}` (`budget_used_bytes` = the leading scheduler's last measured figure, what it expects to remain after the run: no scan per poll, review round 1). Control schema re-blessed with `CONSTELLATION_BLESS=1` | DONE | `crates/control/src/proto/types.rs`, `Scheduler::report` |
+| `snapshot.sched.run`: outcomes `budget_expired`, and in a dry run `would_budget_expire` / `budget_note` | DONE | `Scheduler::tick` |
+| CLI `snapshot sched status`: `budget-expired`/`budget-stale` counters, a `BUDGET` column (`used / limit`, `? / limit` until this node's scheduler has measured it), `budget of <path>: <note>` lines; `constellation status` summary counts them too | DONE | `crates/cli/src/sched_cli.rs` |
+| Web UI: the editor's budget field (Advanced) enabled, with what it means; the policy card's `budget used / limit (logical)` line, red when over, with the daemon's note | DONE | `crates/control/webui/snapshots.html`, `tests/webui-headless.sh` (the card line and the editor keeping `budget=1G`) |
+| Docs: `CONSTELLATION_SNAPACCT_REFRESH_S` and `CONSTELLATION_SNAPSCHED_MAX_DELETES` rows say what the budget uses them for | DONE | `docs/reference/configuration.md` |
+
+### Decisions taken here
+
+- **Grace: the budget deletes nothing while any grace window is open on the
+  root** (first sighting, or any canonical change — a `budget=` change is
+  one). The alternative, intersecting with the pre-change policy's budget
+  decision, can only delete a subset of the new decision; skipping deletes
+  none of it, so it is the safer of the two, and it is what protects an
+  operator who lowers a budget by mistake (the TrueNAS footgun, for space).
+  The cost: a budget acts `CONSTELLATION_SNAPSCHED_GRACE_S` (24 h) after a
+  policy is first seen or changed. The tier rule's own grace is unchanged.
+- **"Representative of the coarsest tier" = kept by the coarsest tier** (the
+  oldest candidate of its coarsest bucket, *and* that bucket inside the
+  coarsest window): the rule's own test, so the order agrees with `KEPT BY`.
+- **The measured set is the candidates the tier rule keeps**, not all
+  candidates: a tier victim the holder has deleted but the leader's replica
+  (and so its index) still lists would otherwise count its own bytes, and the
+  budget would delete a kept snapshot for bytes already going. Leaving them
+  out can only under-count, so the budget errs towards deleting less; the
+  next run (60 s) sees the rest. `budget_used_bytes` in status reports the
+  scheduler's own figure for the same set (review round 1).
+- **Budget and tier deletions share `MAX_DELETES` per run**, tier victims
+  first; while the tier rule alone fills it, the budget waits (note).
+- **Logical bytes.** Physical ≈ logical × `snapshot.space`'s `physical_ratio`
+  (stored bytes per logical byte); documented in the status field, the editor and the module
+  doc. A chunk's live flag may be up to one refresh old: a chunk that just
+  became live again could still count, at most the bytes changed within one
+  `CONSTELLATION_SNAPACCT_REFRESH_S` — the bound the plan's freshness rule
+  accepts.
+- **The unmeetable note is not `last_error`**: `last_error` is the
+  scheduler's last failure (the UI's banner reads it); an unmet budget is
+  reported per root instead (`budget_note`, `sched status`, the card).
+
+### Tests
+
+| Case | Test |
+|---|---|
+| Order on a 30-hour hourly history under `1h:1d 1d:7d; last=2`: hourlies the daily tier does not keep (oldest first, minus the floor), then the dailies; a held, a manual and another root's snapshot never in it; input order irrelevant | `retention::tests::budget_order_sheds_the_fine_tiers_first_then_the_coarsest` |
+| Floor and grace: only `last` left → empty; graced verdicts → empty; verdicts not covering the slice → the uncovered are never victims | `retention::tests::budget_order_never_goes_below_last_nor_past_grace` |
+| Property (192 cases, random policies/histories incl. DST zones): only kept tier-only candidates, never held/manual/other-ino/`last`, each once, non-coarsest before coarsest, each run oldest first, exactly the eligible set, same order for a shuffled input | `retention::tests::prop_budget_order_is_safe_and_deterministic` |
+| Real index (in-process, `SnapAcctService` over the node's replica and bucket): 12 snapshots × 1 MiB own chunk = 11 MiB under `budget=5M` → exactly the first 6 of `budget_order` deleted, none a minutely representative; the dry run names the same 6; `budget_expired` = `expired` = 6, journal reason `budget`; `last` and the minutelies survive; the next run deletes nothing; status limit 5 MiB, `reclaim` 5 MiB and status `budget_used_bytes` 5 MiB, no note; after `resign` no figures | `snapsched::tests::over_budget_the_oldest_non_coarsest_representatives_go_first` |
+| Unmeetable `budget=1K`: a `csi:` hold on the oldest and the `last` two survive, the 3 others go, note "cannot be met" with `1048576 of 1024 bytes`, `last_error` none | `snapsched::tests::an_unmeetable_budget_keeps_last_and_held_and_is_reported` |
+| Stale index (refresh 1 s, no pass for 2.3 s): nothing deleted, `budget_stale` 1, note "stale"; caught up, the same tick deletes | `snapsched::tests::a_stale_index_deletes_nothing_and_counts_budget_stale` |
+| Building index, `CONSTELLATION_SNAPACCT=off`, no accounting: nothing deleted, `budget_stale` 1 each, the note says which | `snapsched::tests::a_building_off_or_absent_index_deletes_nothing` |
+| A hold landing between the choice and the batch (seam, via the holder's batcher): that victim `skipped_reverify` and held, the other 3 deleted | `snapsched::tests::a_hold_landing_mid_budget_run_survives` |
+| Grace: a first sighting's window → nothing deleted, note "grace window", no `would_budget_expire` in a dry run; after the window the budget acts | `snapsched::tests::the_budget_waits_for_the_grace_window` |
+| CLI `BUDGET` column and note line | `sched_cli::tests::status_names_the_leader_counters_and_every_root` |
+
+The five scheduler tests passed 5 runs in a row (≈ 2.4 s together).
+
+### `fsyncdir-barrier` (scenario bug on main; change dropped on rebase, main fixes it its own way)
+
+`31a461c` changed `fsync.rs`'s `staged()` to open an existing file (its
+callers now create theirs with `create_holding` before the cut) but left
+`fsyncdir_barrier`'s `.tmp{i}` uncreated, so the scenario failed at once
+with a bare `No such file or directory` on main as well. It now creates the
+file first (no cut in that scenario); assertions unchanged. PASSED 13.2 s.
+
+### Gates (host load 25–200 during the runs)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all` | no diff (`-- --check` clean after the last edit) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` (in 7 package groups under the 600 s tool cap, `--no-fail-fast`, `ulimit -n 65536`) | **2472 passed, 0 failed** |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `bash tests/integration.sh` | port 4566 held by another agent's floci (`32-m3a-…-floci-1`): the script's body run against it with the script's `AWS_*` settings, prefix `s3://constellation-ci/m7budget-1791025304-1001543` → `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | ok |
+| `bash tests/webui-headless.sh` (`CHROME_BIN` = Chromium from `zenika/alpine-chrome` in docker) | `PASS: webui-headless` (incl. `ok: the policy card's budget line`, `ok: the budget's limit`, the editor's `15m:1d 1h:2d 1d:30d 1mo:1y; budget=1G; paused`); a first attempt timed out at the editor step under load |
+| `target/release/harness run` (one scenario per call, prefix `m7b`, `TMPDIR=/var/tmp/m7h`) | 209 scenarios: **200 PASSED** unprivileged + the 7 passthrough SKIPs **PASSED as root** (`subtree-confinement` PASSED as root too). Failed first, PASSED on a rerun: `snapshot-busy-latency` (P2P not up in 30 s), `snapsched` (the M3c gap bound, 16.75 s vs 16 s — the known load flake; 405.6 s PASSED on rerun), `takeover-marker-strands-promptly`, `holder-publishes-log-prefix-backup` (1638 acked vs 1632 visible once; PASSED on rerun — not snapshot code, worth watching), `epoch-missing-node`, `sqlite-first-touch-latency`, `distant-bigfile-stable-e2e`, `fsyncdir-barrier` (after the fix above). `git-under-flock-rounds` PASSED alone in 447.8 s. **Not green:** `distant-bigfile-stable` (worst block 7.6–9.0 MiB/s vs a 10 MiB/s floor, 3 runs; fails identically on clean main, see M6 and M4b) and `fuse-inval-storm` (known bug; not run, it leaves stuck FUSE mounts on this host) |
+| `docker compose --profile test run --rm compliance` (`SMOKE_IMAGE=m7b-smoke:local`, floci's host port reset by an override) | `== results: 8798 passed, 0 failed`, `COMPLIANCE TEST PASSED (baseline: 0 known failures)` |
+
+No scenario uses `budget=` (the in-process tests run a real index; the
+harness has no budget scenario), so the matrix exercises M7 only as "a
+policy without `budget=` behaves as in M4".
+
+### Exit criteria (plan 32 Step 12, M7)
+
+- [x] Step 8: `budget=` bounds `reclaim(candidates)`; oldest non-coarsest-representatives first, then the oldest remaining; never below `last`, never held.
+- [x] Only on a fresh index (as of ≤ 2 × `REFRESH_S`, not building); otherwise skip and count `budget_stale`.
+- [x] Unmeetable reported, not an error.
+- [x] Logical bytes, physical ≈ logical × `physical_ratio` documented.
+- [x] One delete path (M4's), a hold landing mid-run wins.
+- [x] Editor budget field enabled; card shows `budget: used / limit`.
+- [ ] Full matrix all PASSED: 207 of 209; `distant-bigfile-stable` pre-existing on main, `fuse-inval-storm` a known bug.
+
+### Review round 1 (review `20261003-151617`, verdict fix)
+
+Rebased onto main 8558555+ by the coordinator (the `fsyncdir-barrier` change
+dropped; main fixes it its own way).
+
+| Finding | Resolution |
+|---|---|
+| Must 1: "what would remain" was `reclaim(kept − chosen)`, which drops a chunk still kept by a remaining snapshot when it also has a referrer in `chosen` | `remaining = used − reclaim(chosen)` (`BudgetPlan::remaining`). Still never above the true figure (a chunk shared with a tier victim is outside `used`), so it can only err towards deleting less. Test `snapsched::tests::shared_snapshot_only_chunks_count_until_their_last_referrer_goes`: s0–s2 share a non-live 1 MiB chunk, s3 owns 1 MiB, `budget=1536K`; with `MAX_DELETES=1` one goes and the note says "over budget" with 2 MiB left; with room the budget is met in one run (exactly the shortest prefix of the order that frees a chunk), note cleared, status 1 MiB |
+| Must 2: up to `room + 1` full `reclaim` scans under the pass lock | `reclaim(prefix)` is monotone in the prefix, so `shortest_prefix` binary-searches it: `used`'s scan plus at most `1 + ⌈log₂ n⌉` (10 for 500). `BudgetPlan::scans` counts them; `snapacct::service::budget_tests::the_shortest_prefix_matches_a_linear_search_in_logarithmic_scans` (2000 random monotone series incl. flat runs, against a linear search, bound on calls) and the shared-chunk test (`scans ≤ 4` for 4 victims) |
+| Should 1: status measured a different set with a fresh scan per poll, and a racing delete could fail `snapshot.sched.status` | `budget_used_bytes` is the scheduler's own last figure per root (`BudgetView`, what it expects to remain after the run); `fill_roots_used` no longer scans for it and `reclaim_peek` is gone, so no peek error can reach the status call |
+| Should 2: `room == 0` said "over budget" unmeasured | `budget_held_back` skips the step when the tier victims fill `MAX_DELETES` (including `MAX_DELETES=0`) with a "budget waits" note, in the real and the dry run alike. Test `snapsched::tests::without_room_the_budget_step_waits_and_says_so` |
+| Should 3: notes kept on a former leader / for roots no longer budgeted | `forget_budget()` on resign, a lost or fenced lease, a failed renewal, no policy roots; each tick drops entries for roots without a `budget=`. Asserted in the 5 MiB test (after `resign`) and the shared-chunk test (policy without budget) |
+| Nit: `physical_ratio` direction | physical ≈ logical × `physical_ratio` (stored bytes per logical byte), in `types.rs`, the schema (re-blessed), `snapexpire.rs` and this section |
+| Nit: dry run silent when `room == 0` | same `budget_held_back` note as the real run |
+
+Gates (host load 30–95): `cargo fmt --all -- --check` clean; `cargo clippy
+--workspace --all-targets -- -D warnings` clean; `cargo test` in 4 groups
+(`-p constellation-engine` 570, the rest without engine/fs-core/harness 1864,
+`-p constellation-fs-core` 71, `-p constellation-harness` 75) **2580 passed,
+0 failed**; `CONSTELLATION_BLESS=1 cargo test -p constellation-control schema`
+leaves the schema unchanged; `cargo build --release --workspace` ok; `bash
+tests/webui-headless.sh` PASS; harness (prefix `m7f`, `TMPDIR=/var/tmp/m7f`):
+`snapsched` 386.2 s, `snapsched-grace` 136.3 s, `snapacct` 51.2 s,
+`snapshot-lifecycle` 10.9 s, `snapshot-mount` 40.3 s, `snapshot-churn` 10.3 s
+PASSED; `snapshot-busy-latency` FAILED once at load ~90 (9.3 s vs a 3.6 s
+bound on a busy holder; no budget in it), then PASSED twice in a row (12.1 s,
+12.2 s) at load ~30.

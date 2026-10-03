@@ -2162,6 +2162,27 @@ pub struct SnapSchedRootState {
     /// current or accounting is off (a peek: asking never starts a build).
     /// Not what deleting them returns: `USED` does not sum.
     pub used_bytes: Option<u64>,
+    /// The policy's `budget=` (plan 32 Step 8), logical bytes; `None`
+    /// without one (or unparseable).
+    pub budget_bytes: Option<u64>,
+    /// What the budget measures — `reclaim` of the root's unheld auto
+    /// snapshots the tier rule keeps, logical bytes — as this node's
+    /// scheduler last measured it, less what that run's budget victims
+    /// were to return: the figure it expects after the run (a victim a
+    /// hold saved meanwhile is not added back). Never a scan of its own:
+    /// `None` on a node that does not lead, before its first measuring
+    /// run, after a run that could not measure (see `budget_note`), and
+    /// without a budget. Physical bytes ≈ this × `snapshot.space`'s
+    /// `physical_ratio` (stored bytes per logical byte).
+    pub budget_used_bytes: Option<u64>,
+    /// The budget step's last word on this root from this node's
+    /// scheduler, when it could not do what the budget asks: over budget
+    /// with only the `last` floor and held snapshots left (unmeetable,
+    /// reported, not an error), the accounting index stale or building
+    /// (`budget_stale`), a grace window holding it back, or the run's
+    /// delete cap reached. `None` once a run finds the root within budget,
+    /// and on a node that does not lead (cleared when leadership ends).
+    pub budget_note: Option<String>,
 }
 
 /// `snapshot.sched.run`: run one scheduler tick now, on this node.
@@ -2199,7 +2220,10 @@ pub struct SnapSchedRunResult {
 /// bucket's name was taken already — by an earlier leader, typically;
 /// success), or `failed` (with `error`). For expiry (`name` and `id` the
 /// snapshot's) it is `would_expire` (dry run), `expired`, or
-/// `skipped_reverify` (with why in `error`: held or gone meanwhile).
+/// `skipped_reverify` (with why in `error`: held or gone meanwhile);
+/// for the space budget (plan 32 Step 8) `would_budget_expire` (dry run)
+/// or `budget_expired`, and in a dry run `budget_note` (no `name`/`id`;
+/// `error` says why the budget decides nothing or is not met).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapSchedRunRoot {
     pub ino: u64,

@@ -134,8 +134,8 @@ mod tests;
 pub use encoding::ChunkEntry;
 pub use ops::NewSnapshot;
 pub use service::{
-    Numbers, ReclaimEstimate, SnapAcctConfig, SnapAcctDeps, SnapAcctMode, SnapAcctService,
-    SnapAcctStats, SnapAnswer, SpaceBreakdown, VerifyReport,
+    BudgetAnswer, BudgetPlan, Numbers, ReclaimEstimate, SnapAcctConfig, SnapAcctDeps, SnapAcctMode,
+    SnapAcctService, SnapAcctStats, SnapAnswer, SpaceBreakdown, VerifyReport,
 };
 
 use crate::snapwalk::{Delta, Occurrences};

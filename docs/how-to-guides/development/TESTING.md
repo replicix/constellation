@@ -1253,14 +1253,17 @@ every breakdown amount) and `snapshot.reclaim` for the scenario's snapshot.
 
 The rendering itself has a separate, browser-driven check outside the
 harness: `tests/webui-headless.sh` (`make webui-check`). It starts a
-local-backend daemon with `--web-ui`, gives `/proj` a paused policy and two
+local-backend daemon with `--web-ui`, gives `/proj` a paused policy with a
+`budget=1G` and two
 manual snapshots (one held by `csi:test`), and loads `/snapshots.html` in
 headless Chrome (`--dump-dom`, assertions on rendered markup only, plus a
 screenshot): the table rows, the "externally held" chip, the space bar,
-the policy card, the written-over-time chart. It then opens the policy
+the policy card (with its `budget` used / limit line), the
+written-over-time chart. It then opens the policy
 editor through the URL — `#edit=/proj&preset=standard` loads the root's
 policy and applies the Standard preset — and asserts the four tier rows,
-the daemon's canonical form (`15m:1d 1h:2d 1d:30d 1mo:1y; paused`), and
+the daemon's canonical form (`15m:1d 1h:2d 1d:30d 1mo:1y; budget=1G;
+paused`: the root's settings kept), and
 the retention timeline SVG: one lane per tier plus held/manual, ticks
 including simulated future ones and the csi pin labelled `csi`, and the
 count chart. Two more loads type expressions with `&expr=`: `5m:1d 7m:1d`

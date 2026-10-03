@@ -305,6 +305,75 @@ pub fn grace_first_seen(new: &[Verdict]) -> Vec<Verdict> {
         .collect()
 }
 
+/// Step 8's victim order for `budget=`: which kept candidates a space
+/// budget gives up, first to last. The caller deletes a prefix of it, as
+/// short as gets the policy's snapshot-only bytes under the budget; the
+/// bytes are the accounting index's business, the order is this rule's.
+///
+/// `verdicts` are the ones the tier rule (and any grace) decided over the
+/// same `snaps`, index for index ([`evaluate`]). The order holds only
+/// candidates those verdicts **keep** — what they expire, the tier step
+/// deletes anyway — and never:
+///
+/// * a non-candidate: manual, held (whatever the owner), another
+///   `policy_ino`'s;
+/// * one of the newest `last` candidates (the floor, `last ≥ 1`: the
+///   newest snapshot is never deleted automatically, L3);
+/// * one kept by [`Reason::Grace`] or [`Reason::Last`] in `verdicts`, or
+///   by an index the verdicts do not cover (fail closed: the scheduler
+///   does not run the budget during a grace window at all, so a graced
+///   verdict here is a caller's mistake that must not delete).
+///
+/// The rest come in two runs, each oldest first: the candidates the
+/// **coarsest** tier does not keep, then the ones it does. "Kept by the
+/// coarsest tier" is the rule's own test — the oldest candidate of its
+/// coarsest bucket, that bucket inside the coarsest window — so the long
+/// history the policy promises (the monthlies of `… 1mo:1y`) is shed
+/// last, and the finer, shorter-lived tiers' extra points first (snapper's
+/// `SPACE_LIMIT`, VSS `MaxSize`). Ties order as [`evaluate`] does (time,
+/// then id), so the order is a function of the inputs alone.
+pub fn budget_order(
+    policy: &SnapPolicy,
+    policy_ino: u64,
+    snaps: &[SnapFacts],
+    verdicts: &[Verdict],
+) -> Vec<String> {
+    let Some(tz) = policy_time_zone(policy) else {
+        return Vec::new();
+    };
+    let rule = Rule { policy, tz };
+    let cands = rule.candidates(policy_ino, snaps);
+    let n = cands.len();
+    let coarsest = policy.coarsest();
+    let mut by_coarsest = vec![false; n];
+    rule.for_each_kept_representative(&cands, |i, tier| {
+        if Some(tier.every) == coarsest {
+            by_coarsest[i] = true;
+        }
+    });
+    let floor = n.saturating_sub(rule.last());
+    let eligible = |pos: usize| {
+        if pos >= floor {
+            return false;
+        }
+        match verdicts.get(cands[pos].snap) {
+            Some(v) => v.keep && v.reasons.iter().all(|r| matches!(r, Reason::Tier(_))),
+            None => false,
+        }
+    };
+    let id = |pos: usize| snaps[cands[pos].snap].id.clone();
+    let mut order: Vec<String> = (0..n)
+        .filter(|&pos| eligible(pos) && !by_coarsest[pos])
+        .map(id)
+        .collect();
+    order.extend(
+        (0..n)
+            .filter(|&pos| eligible(pos) && by_coarsest[pos])
+            .map(id),
+    );
+    order
+}
+
 /// Step 3.3's creation rule: is this root due for a snapshot at
 /// `now_ms`?
 ///
@@ -2574,5 +2643,147 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    // --- Step 8: the budget's victim order -----------------------------
+
+    /// Hourly for 30 hours under `1h:1d 1d:7d; last=2`: the tier rule
+    /// expires hours 1–5 (outside the hourly window, not a daily). The
+    /// budget order is the hourlies the daily tier does not keep, oldest
+    /// first, without the `last` floor (hours 28, 29), then the dailies
+    /// (hours 0 and 24); a held, a manual and another root's snapshot in
+    /// the middle are never in it.
+    #[test]
+    fn budget_order_sheds_the_fine_tiers_first_then_the_coarsest() {
+        let p = policy("1h:1d 1d:7d; last=2");
+        let mut snaps: Vec<SnapFacts> = (0..30).map(|h| auto(T0 + h * HOUR)).collect();
+        snaps.push(held(T0 + 10 * HOUR + MIN, Some("csi:x")));
+        snaps.push(manual(T0 + 11 * HOUR + MIN));
+        snaps.push(SnapFacts {
+            id: "foreign".into(),
+            policy_ino: 7,
+            ..auto(T0 + 12 * HOUR + MIN)
+        });
+        let verdicts = evaluate(&p, INO, &snaps);
+        let order = budget_order(&p, INO, &snaps, &verdicts);
+        let hours = |hs: &[i64]| -> Vec<String> {
+            hs.iter().map(|h| format!("s{}", T0 + h * HOUR)).collect()
+        };
+        let mut want = hours(&(6..24).chain(25..28).collect::<Vec<_>>());
+        want.extend(hours(&[0, 24]));
+        assert_eq!(order, want);
+        // Input order does not matter.
+        let mut rev = snaps.clone();
+        rev.reverse();
+        let rev_verdicts = evaluate(&p, INO, &rev);
+        assert_eq!(budget_order(&p, INO, &rev, &rev_verdicts), want);
+    }
+
+    /// The floor holds however small the history: one candidate, or only
+    /// `last` of them, gives an empty order; graced verdicts give nothing
+    /// they keep for grace; an uncovered verdict index is never a victim.
+    #[test]
+    fn budget_order_never_goes_below_last_nor_past_grace() {
+        let p = policy("1h:1d; last=3");
+        let snaps: Vec<SnapFacts> = (0..3).map(|h| auto(T0 + h * HOUR)).collect();
+        assert!(budget_order(&p, INO, &snaps, &evaluate(&p, INO, &snaps)).is_empty());
+        let one = vec![auto(T0)];
+        assert!(budget_order(&p, INO, &one, &evaluate(&p, INO, &one)).is_empty());
+        let snaps: Vec<SnapFacts> = (0..6).map(|h| auto(T0 + h * HOUR)).collect();
+        let plain = evaluate(&p, INO, &snaps);
+        assert_eq!(
+            budget_order(&p, INO, &snaps, &plain),
+            vec![
+                format!("s{T0}"),
+                format!("s{}", T0 + HOUR),
+                format!("s{}", T0 + 2 * HOUR)
+            ]
+        );
+        // Every verdict graced: nothing.
+        let graced: Vec<Verdict> = plain
+            .iter()
+            .map(|v| {
+                let mut v = v.clone();
+                v.reasons.insert(0, Reason::Grace);
+                v
+            })
+            .collect();
+        assert!(budget_order(&p, INO, &snaps, &graced).is_empty());
+        // Verdicts that do not cover the slice: the uncovered are kept.
+        assert_eq!(
+            budget_order(&p, INO, &snaps, &plain[..1]),
+            vec![format!("s{T0}")]
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 192, max_shrink_iters: 2_000, ..ProptestConfig::default() })]
+
+        /// Step 8's guarantees, over random policies and histories: the
+        /// order holds only candidates the verdicts keep for a tier, never
+        /// a held, manual or other root's snapshot, never one of the
+        /// newest `last`, each at most once; the non-coarsest come before
+        /// the coarsest, each run oldest first; and it is a function of
+        /// the set, not of the slice's order.
+        #[test]
+        fn prop_budget_order_is_safe_and_deterministic(
+            (policy, snaps) in arb_policy_and_history(60),
+            seed in any::<u64>(),
+        ) {
+            let verdicts = evaluate(&policy, INO, &snaps);
+            let order = budget_order(&policy, INO, &snaps, &verdicts);
+            let by_id: std::collections::HashMap<&str, usize> =
+                snaps.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
+            let mut cands: Vec<&SnapFacts> = snaps.iter().filter(|s| s.is_candidate(INO)).collect();
+            cands.sort_by(|a, b| (a.created_unix_ms, &a.id).cmp(&(b.created_unix_ms, &b.id)));
+            let last = policy.last.max(1) as usize;
+            let floor: std::collections::HashSet<&str> =
+                cands.iter().rev().take(last).map(|s| s.id.as_str()).collect();
+            let coarsest = policy.coarsest().unwrap();
+            let mut seen = std::collections::HashSet::new();
+            let mut in_coarsest = false;
+            let mut prev: Option<(i64, &str)> = None;
+            for id in &order {
+                prop_assert!(seen.insert(id.clone()), "{} twice", id);
+                let i = by_id[id.as_str()];
+                let s = &snaps[i];
+                prop_assert!(s.is_candidate(INO), "{} is not a candidate", id);
+                prop_assert!(!s.held && s.origin.is_auto() && s.policy_ino == INO);
+                prop_assert!(!floor.contains(id.as_str()), "{} is in the last floor", id);
+                prop_assert!(verdicts[i].keep, "{} is expired by the tiers already", id);
+                let coarse = verdicts[i].tiers().any(|t| t == coarsest);
+                if coarse && !in_coarsest {
+                    in_coarsest = true;
+                    prev = None;
+                }
+                prop_assert_eq!(coarse, in_coarsest, "{} out of its run", id);
+                let key = (s.created_unix_ms, s.id.as_str());
+                if let Some(p) = prev {
+                    prop_assert!(p < key, "{} not oldest first", id);
+                }
+                prev = Some(key);
+            }
+            // Every kept, tier-only, non-floor candidate is in it.
+            let expected = cands
+                .iter()
+                .filter(|s| !floor.contains(s.id.as_str()))
+                .filter(|s| {
+                    let v = &verdicts[by_id[s.id.as_str()]];
+                    v.keep && v.reasons.iter().all(|r| matches!(r, Reason::Tier(_)))
+                })
+                .count();
+            prop_assert_eq!(order.len(), expected);
+            // Shuffled input, same order.
+            let mut shuffled = snaps.clone();
+            let mut x = seed | 1;
+            for i in (1..shuffled.len()).rev() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                shuffled.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+            let again = budget_order(&policy, INO, &shuffled, &evaluate(&policy, INO, &shuffled));
+            prop_assert_eq!(again, order);
+        }
     }
 }

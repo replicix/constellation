@@ -47,6 +47,46 @@
 //! 500-victim catch-up into 16 renewals and 16 forwards instead of 500 of
 //! each; `1` is the plan's literal per-victim loop.
 //!
+//! # The space budget (Step 8)
+//!
+//! A policy with `budget=<size>` is the one rule that deletes snapshots
+//! the tier windows keep. After a root's tier deletions in the same run
+//! (`Scheduler::budget_choice` in `crate::snapsched`):
+//!
+//! 1. **Not during grace.** While any grace window is open on the root
+//!    (a first sighting, or a policy change — a `budget=` change is one)
+//!    the budget deletes nothing and the root carries a note. Of plan
+//!    §4.3's two options this is the safer: intersecting with the old
+//!    policy's budget decision could only delete a subset of what the new
+//!    one asks, and skipping deletes none of it, so lowering a budget by
+//!    mistake costs nothing for `CONSTELLATION_SNAPSCHED_GRACE_S`. Nor
+//!    while the tier rule alone fills the run's `MAX_DELETES`.
+//! 2. **Only from a fresh index.** The bytes are the space-accounting
+//!    index's `reclaim` (logical, deduplicated bytes; physical ≈ logical ×
+//!    `snapshot.space`'s `physical_ratio`, stored bytes per logical
+//!    byte). The index must
+//!    be current — every row applied, no build — and as of no longer than
+//!    `2 × CONSTELLATION_SNAPACCT_REFRESH_S` ago; otherwise the step is
+//!    skipped and counts `budget_stale` (accounting off, or absent, too).
+//! 3. **Victims**: the rows read again, the tier rule's verdicts, and
+//!    `retention::budget_order` over them: kept candidates outside the
+//!    newest `last`, those the coarsest tier does not keep first, oldest
+//!    first, then the coarsest tier's. The measured set is the candidates
+//!    the tier rule keeps, `U = reclaim(kept)`. When `U` exceeds the
+//!    budget the victims are the shortest prefix `P` of the order with
+//!    `U − reclaim(P)` — what would remain: a chunk `P` shares with a
+//!    snapshot left behind still counts — within it (the whole order,
+//!    capped by the run's room, when no prefix is). `reclaim(P)` grows
+//!    with `P`, so a binary search finds it in `O(log n)` scans, all
+//!    under one index lock (`SnapAcctService::budget_plan`).
+//! 4. **Deletion** is exactly the tier victims' path above — renew,
+//!    re-read, holder-side batch, a hold landing in between wins — with
+//!    audit reason `budget` ([`REASON_BUDGET`]), counting `expired` and
+//!    `budget_expired`.
+//! 5. A budget that cannot be met — everything the order offers is gone
+//!    and the rest is the `last` floor or held — is a note on the root
+//!    (`snapshot.sched.status`'s `budget_note`), not an error.
+//!
 //! # What is never deleted automatically (Step 4.2)
 //!
 //! Manual snapshots and other policies' snapshots are not candidates
@@ -104,6 +144,9 @@ use std::sync::Arc;
 
 /// The audit reason of a scheduled expiry.
 pub const REASON_NO_TIER: &str = "no tier keeps it";
+/// The audit reason of a deletion the policy's `budget=` asked for
+/// (plan 32 Step 8): the tier rule keeps it, the space budget does not.
+pub const REASON_BUDGET: &str = "budget";
 /// The audit reason of `snapshot policy rm --expire`.
 pub const REASON_REMOVED: &str = "policy removed with --expire";
 

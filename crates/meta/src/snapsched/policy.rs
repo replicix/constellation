@@ -321,8 +321,9 @@ pub struct SnapPolicy {
     pub last: u32,
     /// Skip creation when nothing under the root changed (L8).
     pub skip_empty: bool,
-    /// Step 8's soft cap on this policy's snapshot-only bytes. Parsed
-    /// here; nothing consumes it yet.
+    /// Step 8's soft cap on this policy's snapshot-only bytes (logical:
+    /// `reclaim` of its candidates), enforced by the scheduler's expiry
+    /// run beyond the tier windows, in [`super::retention::budget_order`].
     pub budget: Option<u64>,
     /// The maintenance switch: stops creation *and* expiry, keeps
     /// everything. Better than removing the policy, which would trip the
@@ -1191,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn budget_is_parsed_but_unused() {
+    fn budget_parses() {
         assert_eq!(
             p("1d:30d; budget=500G").budget,
             Some(500 * 1024 * 1024 * 1024)
