@@ -987,6 +987,7 @@ impl Driver {
         let store = self.store.clone();
         let tx = self.tx.clone();
         let world = self.world.clone();
+        let bucket = self.bucket.clone();
         let id = self.id;
         let (meta, s3_up) = (self.meta.clone(), !self.bucket.is_cut(self.id));
         tokio::spawn(async move {
@@ -1031,11 +1032,14 @@ impl Driver {
                     world.upload_awaited(id, &meta, &inos, s3_up);
                     let inbox = InboxStore::new(store.clone());
                     S3Result::InboxPut(
-                        inbox
-                            .put_batch(&batch)
-                            .await
-                            .map(|_| ())
-                            .map_err(cas_failure),
+                        match world.upload_before_inbox(id, &batch, !bucket.is_cut(id)) {
+                            Ok(()) => inbox
+                                .put_batch(&batch)
+                                .await
+                                .map(|_| ())
+                                .map_err(cas_failure),
+                            Err(e) => Err(CasFailure::Failed(e)),
+                        },
                     )
                 }
                 S3Op::InboxRun {

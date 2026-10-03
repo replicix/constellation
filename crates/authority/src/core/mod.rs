@@ -2055,6 +2055,7 @@ impl Core {
                 stale_below,
             } => {
                 self.pr.carried = carrier;
+                self.pr.epoch_members.clone_from(&members);
                 self.on_epoch_state(
                     now,
                     EpochState {
@@ -2213,6 +2214,28 @@ impl Core {
                 self.stats.epoch_stale_claims += 1;
                 let mine = self.lease.epoch().unwrap_or(0);
                 self.deposed(now, 0, stale_below, mine, replica, out);
+            } else if !self.lease.lost && self.epoch_carries_let_go() {
+                // Flex-crash seed 16364: the activation carries the lease
+                // this node is RELEASING (it acked while holding it, then
+                // its idle release began before the activation arrived:
+                // a paused node, its events late), or has released or
+                // given up in doubt since. The release CAS may land (or
+                // has), and a released lease is anyone's without
+                // promises, so no hold may stand on it. Adopting it
+                // anyway, the release's in-doubt give-up wiped the hold,
+                // nobody held the epoch, and its members waited for the
+                // carried lease to move for good. This node owes that
+                // move instead (`owes_move`): it closes its epoch once S3
+                // is back, and re-claims the lease if the release did not
+                // land (`epoch_carrier_checked`, `epoch_reclaim_due`); or
+                // it holds the epoch after all if the release ends with
+                // the lease kept (`epoch_hold_after_kept_release`).
+                //
+                // Not the lease an epoch's close let go, its re-claim
+                // pending (the block above): that lease was never
+                // released (no release CAS), stands in S3 as this node's,
+                // and is held again here as before the close.
+                self.owe_epoch_move(replica);
             } else if !self.lease.lost && self.carries_mine() && self.epoch_may_carry(members) {
                 // The activation carries exactly this node's lease (the
                 // claim it acked: same epoch and expiry, `carries_mine`).
@@ -2237,6 +2260,7 @@ impl Core {
             }
         } else if state.active
             && self.lease.usable(now, &self.cfg)
+            && !self.lease.releasing
             && !self.lease.epoch_held()
             && self.carries_mine()
             && self.epoch_may_carry(members)
@@ -2272,11 +2296,20 @@ impl Core {
             // 2236: a report after its own close adopted the hold again
             // beside the next S3 holder.
             let ended = |c: &crate::event::Carrier| self.hold_ended_is(c.epoch, c.expires_unix_ms);
-            if let Some(c) = self
+            // Nor one whose lease this node released (or is releasing,
+            // or issued the release CAS for before a restart): that
+            // hold's move is owed instead (`owes_move`).
+            let let_go = |c: &crate::event::Carrier| {
+                let it = Some((c.epoch, c.expires_unix_ms));
+                self.pr.owes_move == it || self.pr.released == it
+            };
+            let carried = self
                 .pr
                 .carried
-                .filter(|c| c.node == self.cfg.node_id && !ended(c))
-            {
+                .filter(|c| c.node == self.cfg.node_id && !ended(c));
+            if carried.is_some_and(|c| let_go(&c)) {
+                self.owe_epoch_move(replica);
+            } else if let Some(c) = carried {
                 tracing::info!(
                     node = self.cfg.node_id,
                     epoch = c.epoch,
@@ -2289,6 +2322,12 @@ impl Core {
             }
         }
         self.restore_epoch_hold(now, replica);
+        if !state.open {
+            // The epoch closed: no move is owed any more (this node's own
+            // close made it a re-claim, `end_epoch_hold`; anyone else's
+            // means the carried lease moved).
+            self.settle_owed_move(replica);
+        }
         if !state.open && before.open {
             // Plan 30 §M9/§M10 rule (b): a member backup ran no seal
             // watch while its epoch was open; it resumes now, with a

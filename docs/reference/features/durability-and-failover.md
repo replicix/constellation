@@ -582,6 +582,29 @@ Operational rules:
   all along (`stress-ng-fs-faults`). An epoch carrying it makes the node
   hold the lease again, as before the close, with its epoch hold: writes
   and locks go on, and the next close re-claims it.
+- A lease being released is a different state from one an epoch's close
+  let go. The close sends no release: the lease stays in S3 as this
+  node's, and nobody can take it without a CAS on that object or the
+  promises of the members, so an epoch may carry it (above). A release
+  CAS, once it lands, makes the lease anyone's without promises, so no
+  hold stands on a lease being released or released. A node still
+  claims a lease it is releasing (the release may fail, and an epoch
+  carrying nothing refuses every write), but an activation carrying a
+  lease it is releasing, or one it has released or given up with the
+  release in doubt since (it acked before the release began: a paused
+  node handles its events late), adopts no hold. The node owes the
+  epoch's close instead, and that obligation is persisted. Once S3 is
+  back it closes the epoch, and re-claims the lease if the release did
+  not land. If the release ends with the lease kept (a failed handoff
+  flush, a re-read that finds the lease standing), it holds the epoch
+  after all and the obligation is dropped. If it gives the lease up in
+  doubt while holding the epoch, the hold goes, the move is owed, and
+  writes are refused (`EROFS`) until the epoch closes: nobody holds it.
+  The lease a release CAS is about to replace is persisted before the
+  CAS goes out (`local["lease_released"]`), so a restart after the CAS
+  landed owes the move too, rather than holding an epoch on a lease
+  anyone may have claimed; the record is cleared when the release ends
+  with the lease kept or the node acquires a lease.
 - The close keeps the lease's [cluster lock](cluster-locks.md#failover)
   grants. The re-claim's CAS replacing the lease the close let go (or
   the object a re-claim CAS in doubt may have written over it) proves

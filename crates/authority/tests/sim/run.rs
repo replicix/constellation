@@ -2172,6 +2172,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         stalled.remove(&id);
                         continue;
                     }
+                    // A paused process ships nothing until it resumes, and
+                    // its view is from before the pause (flex-crash seeds
+                    // 19013, 21497, 28752: the hold owner paused through
+                    // the heal; chunk metered-own-rows: with the upload
+                    // hold, a deferral outlasts a pause often enough). Its
+                    // count is frozen, not reset: a stall split by a pause
+                    // still adds up.
+                    if n.paused() {
+                        continue;
+                    }
                     let held = n.meta.held_summary();
                     if held.deferred == 0 {
                         stalled.remove(&id);
@@ -2181,11 +2191,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                         .deferred_seen
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let v = n.view();
-                    // A paused node ships nothing until it resumes
-                    // (chunk metered-own-rows: with the upload hold, a
-                    // deferral outlasts a pause often enough).
                     let sequencing = v.held_epoch.is_some()
-                        && !n.paused()
                         && !v.epoch_held
                         && !v.gate_pending
                         && !v.lost

@@ -1555,8 +1555,24 @@ impl Core {
     /// owner): the engine's write gate refuses new writes with `EROFS`
     /// (`EpochManager::writes_refused`), and an op on the lease path would
     /// otherwise wait for its 2 × TTL deadline (120 s) and end in doubt.
+    ///
+    /// Also one carrying this node's lease that it gave up with its
+    /// release in doubt (`PromiseState::given_up`): nobody holds that
+    /// epoch, nor can until it closes (this node owes the move,
+    /// `owes_move`), so a write would only wait out its deadline.
     pub(crate) fn epoch_refuses_writes(&self) -> bool {
-        self.epoch.frozen || (self.epoch.active && self.pr.carried.is_none())
+        self.epoch.frozen
+            || (self.epoch.active && (self.pr.carried.is_none() || self.epoch_carried_given_up()))
+    }
+
+    /// The active epoch carries the lease this node gave up in doubt, and
+    /// it holds no epoch.
+    fn epoch_carried_given_up(&self) -> bool {
+        !self.lease.epoch_held()
+            && self.lease.held.is_none()
+            && self.pr.carried.is_some_and(|c| {
+                c.node == self.cfg.node_id && self.pr.given_up == Some((c.epoch, c.expires_unix_ms))
+            })
     }
 
     /// `rid` is on the lease path in an epoch that refuses writes.

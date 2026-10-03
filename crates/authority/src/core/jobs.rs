@@ -22,6 +22,7 @@ use crate::segment;
 use constellation_fs_core::Ino;
 use constellation_meta::{JournalPos, LogRecord};
 use constellation_store_s3::{Lease, LeaseTag};
+use constellation_types::Code;
 
 /// EC2 campaign 8 A-1: the reason of an acquisition started because a
 /// peer forwarded an op while the lease still names this node (see
@@ -1586,6 +1587,11 @@ impl Core {
                             // or not anything waits to ship: members close
                             // only once it has moved (`epoch_reclaim_due`).
                             self.end_epoch_hold(replica, true);
+                        } else if self.owes_carried_move() {
+                            // The owed close (`owes_move`): it owes the
+                            // carried lease's re-claim as a hold owner
+                            // would, should the release not have landed.
+                            self.end_epoch_hold(replica, true);
                         }
                         out.push(Action::EpochClose);
                         self.skip_ship = false;
@@ -1979,6 +1985,15 @@ impl Core {
         let Some((lease, tag)) = self.lease.held.clone() else {
             return;
         };
+        // Durable before the CAS goes out: a restart after it landed must
+        // know the lease was let go (`PromiseState::released`), or an
+        // activation carrying it would hold an epoch on a lease anyone
+        // may claim without promises. Not persisted, it does not go out.
+        if !self.record_release(&lease, replica) {
+            self.lease.releasing = false;
+            self.job_failed(now, "persisting the released lease".into(), replica, out);
+            return;
+        }
         let op = self.issue_s3(
             S3Op::LeaseSwap {
                 lease: lease.released(),
@@ -2023,6 +2038,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        self.epoch_hold_after_kept_release(now, replica);
         let Some(job) = self.job.take() else {
             return;
         };
@@ -2709,6 +2725,7 @@ impl Core {
             self.stats.takeovers += 1;
         }
         self.lease.adopt(now, lease, tag, Some(gate));
+        self.release_superseded(true, replica);
         self.shipped_touches.clear();
         self.shipped_floor = self.ship.head_seq;
         self.ship.held_tail_at = Some(now);
@@ -2993,6 +3010,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.lease.releasing = false;
+        self.epoch_hold_after_kept_release(now, replica);
         let Some(job) = self.job.take() else {
             return;
         };
@@ -3436,16 +3454,27 @@ impl Core {
                             error = %e.0,
                             "lease re-read failed after a release in doubt; giving the lease up"
                         );
+                        let carried_mine = self.epoch_carries(&mine);
+                        self.pr.released = Some((mine.epoch, mine.expires_unix_ms));
+                        self.pr.given_up = self.pr.released;
                         self.lease.released();
+                        self.owe_given_up_move(carried_mine, replica);
                         self.deleg_on_lease_gone(now, replica, out);
                         replica.set_holder_epoch(0);
                         self.inbox.holder = None;
+                        if self.epoch_refuses_writes() {
+                            // Nobody holds the epoch now: what waits for
+                            // the lease hears `EROFS` at once, not at its
+                            // deadline.
+                            self.refuse_waiting_for_lease(now, Code::ReadOnly, replica, out);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(node = self.cfg.node_id, error = %e.0, "lease re-read failed")
                     }
                 }
                 self.lease.releasing = false;
+                self.epoch_hold_after_kept_release(now, replica);
                 match kind {
                     JobKind::Round => self.finish_round(now, None, replica, out),
                     _ => self.finish_flush_job(now, false, replica, out),
@@ -3626,6 +3655,9 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let epoch = self.lease.epoch().unwrap_or(0);
+        if let Some((l, _)) = &self.lease.held {
+            self.pr.released = Some((l.epoch, l.expires_unix_ms));
+        }
         self.lease.released();
         self.deleg_on_lease_gone(now, replica, out);
         replica.set_holder_epoch(0);
@@ -3765,7 +3797,14 @@ impl Core {
             }
             _ => false,
         };
-        if !still_carried {
+        // Or the carried lease is this node's own and it owes the move
+        // (`owes_move`: it was releasing that lease at the activation,
+        // flex-crash seed 16364): nobody holds the epoch, and its members
+        // wait for this node.
+        let owed = carried.is_some_and(|c| c.node == self.cfg.node_id)
+            && !self.lease.epoch_held()
+            && self.owes_carried_move();
+        if !still_carried || owed {
             self.epoch_probe_close(out);
             return;
         }

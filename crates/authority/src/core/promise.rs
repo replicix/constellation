@@ -144,6 +144,8 @@ pub(crate) struct PromiseState {
     pub advertising: Option<u32>,
     /// The lease the current (or last) continuation epoch carried.
     pub carried: Option<Carrier>,
+    /// The members of the epoch last reported (`Control::Epoch`).
+    pub epoch_members: Vec<NodeId>,
     /// Admin `leave --node-id` retired this node.
     pub retired: bool,
     /// The running takeover check.
@@ -159,6 +161,38 @@ pub(crate) struct PromiseState {
     /// never re-adopted (flex-crash seeds 166, 2236). The flag: this node
     /// closed the epoch itself and owes the lease's re-claim.
     pub hold_ended: Option<(Epoch, i64, bool)>,
+    /// The carried lease (epoch, expiry), this node's own, whose epoch
+    /// it acked and then did not hold, because it was releasing that
+    /// lease (or had released it, `released`) when the activation came
+    /// (flex-crash seed 16364): no hold may stand on a lease the release
+    /// may have freed, and nobody else holds the epoch. This node owes
+    /// its close and the lease's move: it closes once S3 is back
+    /// (`epoch_carrier_checked`), and that close owes the re-claim as a
+    /// hold owner's does (`hold_ended`'s flag). Dropped when this node
+    /// holds that epoch after all (the release did not happen:
+    /// `adopt_epoch_hold`), when it lets a hold go (`end_epoch_hold`),
+    /// and when the epoch closes. Persisted (`local["epoch_owes_move"]`):
+    /// a restart must not adopt the hold on it either.
+    pub owes_move: Option<(Epoch, i64)>,
+    /// The lease (epoch, expiry) this node last released, or gave up
+    /// with its release in doubt: an activation carrying exactly it
+    /// (acked before the release began, delivered after it ended) owes
+    /// the move (`owes_move`) instead of adopting a hold on a lease
+    /// anyone may have claimed since without promises. A restart loads
+    /// it from the record the release CAS persisted before it went out
+    /// (`release_record`): the release may have landed. Cleared when a
+    /// lease is acquired (`release_superseded`): a new lease has a new
+    /// expiry, so no activation carrying the old one matches it.
+    pub released: Option<(Epoch, i64)>,
+    /// `local["lease_released"]` as persisted: the lease whose release
+    /// CAS this node issued last (written before the CAS goes out,
+    /// `issue_release`). Cleared when that release ends with the lease
+    /// kept, or a lease is acquired.
+    pub release_record: Option<(Epoch, i64)>,
+    /// The lease this process gave up with its release in doubt (the
+    /// re-read failed too): while the open epoch carries it and nobody
+    /// holds the epoch, writes are refused (`epoch_refuses_writes`).
+    pub given_up: Option<(Epoch, i64)>,
     /// This node closed its epoch while owning the hold, and its journal
     /// has not all reached the log yet: it is still the epoch's
     /// authority, and promises nothing.
@@ -206,6 +240,11 @@ impl Core {
         self.pr.restored_hold = replica.epoch_hold_persisted();
         self.pr.persisted_hold = self.pr.restored_hold;
         self.pr.hold_ended = replica.epoch_hold_ended();
+        self.pr.owes_move = replica.epoch_owes_move();
+        self.pr.release_record = replica.lease_released();
+        if self.pr.release_record.is_some() {
+            self.pr.released = self.pr.release_record;
+        }
         self.advertise_slack(now, replica, out);
     }
 
@@ -455,6 +494,12 @@ impl Core {
     // ---- the claim, for the driver's epoch coordinator ----
 
     pub fn epoch_claim_view(&self, now: Ms) -> EpochClaimView {
+        // A lease being released is claimed too: the activation then
+        // owes the move (`owes_move`) and adopts the hold only if the
+        // release ends with the lease kept (`epoch_hold_after_kept_release`).
+        // Claiming nothing, an outage that began during a release's flush
+        // formed an epoch carrying no lease, which refused every write
+        // (`EROFS`) until the heal even when the release failed.
         let held = if self.lease.usable(now, &self.cfg) && !self.lease.epoch_held() {
             self.lease.held.as_ref().map(|(l, _)| l.clone())
         } else {
@@ -687,10 +732,16 @@ impl Core {
     /// This node lets its epoch hold go for good (a handoff, the close):
     /// record the carried lease so nothing adopts that hold again here.
     /// `closed`: it closed the epoch itself (S3 is back), and owes the
-    /// carried lease's re-claim (`epoch_reclaim_due`). `false` if it
-    /// could not be persisted.
+    /// carried lease's re-claim (`epoch_reclaim_due`); that is recorded
+    /// in memory even if persisting it fails (this process still owes
+    /// it). Any move this node owed without a hold (`owes_move`) is
+    /// settled by the close only: a hold that merely vanished (a release
+    /// given up in doubt wiped it, `owe_given_up_move`) leaves the move
+    /// owed, and a handoff needs a hold, which an owed move never has.
+    /// `false` if it could not be persisted.
     pub(crate) fn end_epoch_hold(&mut self, replica: &dyn Replica, closed: bool) -> bool {
         let Some(c) = self.pr.carried else {
+            self.settle_owed_move(replica);
             return true;
         };
         let ended = Some((c.epoch, c.expires_unix_ms, closed));
@@ -698,18 +749,180 @@ impl Core {
             .pr
             .hold_ended
             .is_some_and(|(e, x, _)| (e, x) == (c.epoch, c.expires_unix_ms));
-        if same && !closed {
-            return true;
-        }
-        if self.pr.hold_ended == ended {
+        if (same && !closed) || self.pr.hold_ended == ended {
+            if closed {
+                self.settle_owed_move(replica);
+            }
             return true;
         }
         if let Err(error) = replica.persist_epoch_hold_ended(ended) {
             tracing::warn!(node = self.cfg.node_id, %error, "persisting the ended epoch hold failed");
+            if closed {
+                self.pr.hold_ended = ended;
+                self.settle_owed_move(replica);
+            }
             return false;
         }
         self.pr.hold_ended = ended;
+        if closed {
+            self.settle_owed_move(replica);
+        }
         true
+    }
+
+    /// The activation carries this node's own lease, but the lease is
+    /// being released, or was released (or given up in doubt) by this
+    /// process: the move is owed (`PromiseState::owes_move`), and no
+    /// hold is adopted.
+    pub(crate) fn epoch_carries_let_go(&self) -> bool {
+        let me = self.cfg.node_id;
+        !self.lease.epoch_held()
+            && self.pr.carried.is_some_and(|c| {
+                c.node == me
+                    && ((self.lease.releasing && self.carries_mine())
+                        || self.pr.released == Some((c.epoch, c.expires_unix_ms)))
+            })
+    }
+
+    /// The open epoch carries exactly `lease`, this node's.
+    pub(crate) fn epoch_carries(&self, lease: &Lease) -> bool {
+        self.epoch.open
+            && self.pr.carried.is_some_and(|c| {
+                (c.node, c.epoch, c.expires_unix_ms)
+                    == (self.cfg.node_id, lease.epoch, lease.expires_unix_ms)
+                    && lease.holder == self.cfg.node_id
+            })
+    }
+
+    /// A release given up in doubt (`ReleaseReread`, the re-read failed
+    /// too) wiped the lease and with it any epoch hold on it. If the open
+    /// epoch carries that lease, nobody holds the epoch now and its
+    /// members wait for the carried lease to move: this node owes that
+    /// move (`owes_move`), as it does for a lease it was releasing at the
+    /// activation. Recorded after the wipe; the hold's end in
+    /// `promise_after_event` (`end_epoch_hold(.., false)`) leaves it.
+    pub(crate) fn owe_given_up_move(&mut self, carried_mine: bool, replica: &dyn Replica) {
+        if carried_mine && self.epoch.open {
+            self.owe_epoch_move(replica);
+        }
+    }
+
+    /// Persist the lease whose release CAS is about to go out
+    /// (`PromiseState::release_record`): a restart after the CAS landed
+    /// must not adopt an epoch hold on it. `false` if it could not be
+    /// persisted (the release must not go out).
+    pub(crate) fn record_release(&mut self, lease: &Lease, replica: &dyn Replica) -> bool {
+        let it = Some((lease.epoch, lease.expires_unix_ms));
+        if self.pr.release_record == it {
+            return true;
+        }
+        if let Err(error) = replica.persist_lease_released(it) {
+            tracing::warn!(node = self.cfg.node_id, %error, "persisting the released lease failed");
+            return false;
+        }
+        self.pr.release_record = it;
+        true
+    }
+
+    /// The persisted release record is moot: its release ended with the
+    /// lease kept (this process neither saw it land nor gave it up), or
+    /// `acquired` a lease since (a new expiry: no activation carrying the
+    /// released one matches it). An acquisition clears the in-memory
+    /// `released` and `given_up` too.
+    pub(crate) fn release_superseded(&mut self, acquired: bool, replica: &dyn Replica) {
+        if acquired {
+            self.pr.released = None;
+            self.pr.given_up = None;
+        } else if self.lease.releasing || self.pr.released == self.pr.release_record {
+            return;
+        }
+        if self.pr.release_record.is_none() {
+            return;
+        }
+        match replica.persist_lease_released(None) {
+            Ok(()) => self.pr.release_record = None,
+            // A stale record only makes a restart owe the move of an epoch
+            // carrying that lease rather than hold it.
+            Err(error) => tracing::warn!(
+                node = self.cfg.node_id,
+                %error,
+                "clearing the released lease failed"
+            ),
+        }
+    }
+
+    /// Record that this node owes the carried lease's move
+    /// (`PromiseState::owes_move`). Kept in memory even if persisting it
+    /// fails: this process then still never adopts that hold, and only
+    /// a restart before the close could (the restart's late adoption
+    /// of the carried hold, as before the record existed).
+    pub(crate) fn owe_epoch_move(&mut self, replica: &dyn Replica) {
+        let Some(c) = self.pr.carried else {
+            return;
+        };
+        let owed = Some((c.epoch, c.expires_unix_ms));
+        if self.pr.owes_move == owed {
+            return;
+        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            epoch = c.epoch,
+            "the continuation epoch carries the lease this node is releasing (or released): \
+             no hold; it owes the epoch's close"
+        );
+        self.pr.owes_move = owed;
+        if let Err(error) = replica.persist_epoch_owes_move(owed) {
+            tracing::warn!(node = self.cfg.node_id, %error, "persisting the owed epoch move failed");
+        }
+    }
+
+    /// The carried lease is the one this node owes the move of.
+    pub(crate) fn owes_carried_move(&self) -> bool {
+        self.pr
+            .carried
+            .is_some_and(|c| self.pr.owes_move == Some((c.epoch, c.expires_unix_ms)))
+    }
+
+    /// The owed move is settled (or moot): a hold was adopted, let go,
+    /// or the epoch closed.
+    pub(crate) fn settle_owed_move(&mut self, replica: &dyn Replica) {
+        if self.pr.owes_move.is_none() {
+            return;
+        }
+        self.pr.owes_move = None;
+        if let Err(error) = replica.persist_epoch_owes_move(None) {
+            // A stale record only makes a restart in the same epoch close
+            // it (once S3 is back) rather than adopt the carried hold.
+            tracing::warn!(node = self.cfg.node_id, %error, "clearing the owed epoch move failed");
+        }
+    }
+
+    /// The release this node was running ended with its lease kept (a
+    /// failed handoff flush, a re-read that found it standing): if the
+    /// active epoch carries that lease and this node owes its move, it
+    /// is the epoch's holder after all and adopts the hold. Leaving the
+    /// obligation, nobody held the epoch, and writes stopped at the
+    /// lease's expiry until the heal.
+    pub(crate) fn epoch_hold_after_kept_release(&mut self, now: Ms, replica: &dyn Replica) {
+        if !self.lease.releasing && self.lease.held.is_some() {
+            self.release_superseded(false, replica);
+        }
+        if self.lease.releasing
+            || self.lease.lost
+            || self.lease.epoch_held()
+            || !self.epoch.active
+            || !self.owes_carried_move()
+            || !self.carries_mine()
+            || !self.epoch_may_carry(&self.pr.epoch_members.clone())
+        {
+            return;
+        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            "the release of the carried lease did not happen: adopting the epoch hold"
+        );
+        let epoch = self.lease.epoch().unwrap_or(1);
+        self.adopt_epoch_hold(now, epoch, replica);
     }
 
     /// Whether the carried lease `hold_ended` names is `c`'s.
@@ -788,6 +1001,7 @@ impl Core {
             .carried
             .map(|c| (c.node, c.epoch, c.expires_unix_ms));
         self.epoch_tenure_resumed(carried, true, replica);
+        self.settle_owed_move(replica);
         self.lease.adopt_epoch_hold(now, epoch);
         replica.set_holder_epoch(self.lease.epoch_hold().unwrap_or(0));
     }
@@ -827,6 +1041,13 @@ impl Core {
         if self.pr.hold_ended.map(|(e, _, _)| e) == Some(epoch) {
             // Handed away before the crash (persisted before the reply):
             // the successor owns it.
+            return;
+        }
+        if self.epoch_carries_let_go() {
+            // Its lease's release CAS went out before the crash and may
+            // have landed (`PromiseState::released`, from the persisted
+            // record): the move is owed, no hold restored.
+            self.owe_epoch_move(replica);
             return;
         }
         tracing::info!(

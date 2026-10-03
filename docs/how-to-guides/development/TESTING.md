@@ -3253,7 +3253,8 @@ and the third, form an epoch of 2/3 and keep writing) and `flex-crash`
 (`AUTHORITY_SIM_START`, `AUTHORITY_SIM_SEEDS`, `AUTHORITY_SIM_THREADS`)
 and prints how many transactions members installed from an epoch's
 stream. `flex_crash_regression_seeds` pins every flex-crash seed below
-20 000 that ever failed, `flex_crash_seed_30702_an_epoch_hold_goes_only_to_a_caught_up_member`
+20 000 that ever failed, `flex_crash_seeds_de53bd1` the five seeds of
+0..30 000 that still failed on `de53bd1`, `flex_crash_seed_30702_an_epoch_hold_goes_only_to_a_caught_up_member`
 the handoff rule, and `flex_members_follow_the_epoch_holders_stream`
 the epoch stream (members install the hold owner's journal and their
 forwards are answered from it). `RUST_LOG=constellation_authority=debug`

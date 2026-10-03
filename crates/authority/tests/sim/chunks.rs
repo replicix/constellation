@@ -268,6 +268,46 @@ impl ChunkWorld {
         }
     }
 
+    /// What the daemon's `S3Op::InboxPut` arm does before the PUT
+    /// (`authority_driver.rs`, `inbox_manifests_pending`): the inbox
+    /// carries no pending-chunk list, so a manifest goes through it only
+    /// once its chunks are up — the upload pass for each such inode,
+    /// failing the PUT if they cannot go up. Without it the sim put
+    /// batches naming chunks only the sender's disk held (flex-crash seed
+    /// 4373: the sender died for good, the next holder drained its batch
+    /// and shipped the manifest of a chunk S3 never got).
+    pub fn upload_before_inbox(
+        &self,
+        node: NodeId,
+        batch: &constellation_store_s3::inbox::InboxBatch,
+        s3_up: bool,
+    ) -> Result<(), String> {
+        let Some(meta) = self.metas.lock().unwrap().get(&node).cloned() else {
+            return Ok(());
+        };
+        // One pass per inode, as the daemon dedups them.
+        let mut inos = BTreeSet::new();
+        for op in &batch.ops {
+            let Ok(constellation_meta::MutateOp::SetManifest { ino, manifest, .. }) =
+                constellation_meta::MutateOp::from_postcard(&op.op)
+            else {
+                continue;
+            };
+            if !self.pending_on(node, &manifest).is_empty() {
+                inos.insert(ino);
+            }
+        }
+        // Past the metered hold, as the daemon's (`Uploader::run` is not
+        // the background pass: `upload_dirty_chunks_report`).
+        for ino in inos {
+            self.upload_forced(node, &meta, Some(ino), s3_up);
+            if !s3_up {
+                return Err("uploading a manifest's chunks before the inbox: S3 cut".into());
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `hash`, awaited by someone from `uploader`, is never
     /// coming: not in S3, and the uploader is gone for good, or has
     /// nothing of it (no pending row: it dropped it), or awaits it in

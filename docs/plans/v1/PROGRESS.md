@@ -38667,3 +38667,339 @@ for its own fix.
 `crates/platform/src/{linux.rs,lock.rs,unix.rs,macos.rs,unsupported.rs}`,
 `crates/cli/src/daemon_lock.rs`,
 `crates/harness/src/{client.rs,main.rs,scenarios.rs,scenarios/inval_storm.rs}`.
+
+## Fix: three `flex-crash` simulation seeds fail on main (`flex-crash-seeds`)
+
+The metered-own-rows review swept `flex-crash` 1000..21000 and found
+4373, 16364 and 19013 failing, on `e2c5b7d` too. A sweep of 0..30 000
+on `de53bd1` found five: those three plus 21497 and 28752, which fail the
+same way as 19013. `flex` 0..30 000 was clean. The seeds had three
+different causes: one product bug and two places where the simulation did
+not match the daemon.
+
+### 16364: an epoch carrying a lease its holder was releasing never closed (product)
+
+Violated: liveness. A client op was never answered within 540 s of
+simulated time, and the cluster had no authority from the heal on.
+
+- Node 1 holds the lease. It is paused from 626 ms to 2065 ms. At 1200 ms
+  nodes [1, 2] lose S3 and the link to node 3. At 1500 ms the epoch forms
+  from node 1's *published* claim view (a stalled core's coordinator acks
+  from that view in the daemon too) and carries node 1's lease (epoch 1,
+  expiring at 6053).
+- At 2065 ms node 1 resumes and handles its queued events in order. A round
+  decides to **idle-release** the lease (`releasing = true`); then the
+  activation arrives, and `on_epoch_state` adopts the epoch hold on that
+  same lease (`carries_mine`).
+- With S3 cut, the release PUT fails without an answer and the re-read
+  fails too. `ReleaseReread { in_doubt: true }` gives the lease up
+  (`LeaseState::released`), and that also clears the epoch hold.
+  `promise_after_event` sees the hold go and records it as ended
+  (`hold_ended`, not closed). Nobody holds the epoch now.
+- At the heal every member runs the epoch probe. Neither node holds
+  anything, and the epoch carries node 1's lease, so each one reads the
+  object (`epoch_carrier_checked`). The release had not landed, so the
+  object is still the carried lease. Each member keeps its epoch open and
+  waits for "the holder" to move it, node 1 included, which is waiting
+  for itself. Members of an open epoch promise nothing, so node 3's
+  takeover is refused every time ("too few promises outlast the lease"),
+  and nodes 1 and 2 run no S3 acquisition. The cluster stays stuck for good.
+
+Why it is a product bug: DESIGN §5.3 and plan 30 §M10 make a hold safe
+only because nobody else can take the carried lease: members promise
+nothing, and a taker needs promises. A lease that is being released breaks
+that rule. If the release CAS lands, the lease is anyone's with no promise
+check (`promise_check_needed` skips released leases), so a node could take it
+without asking any member while the releasing node held the epoch on it.
+The core had already committed to giving the lease away (`releasing`:
+nothing new is admitted), so it must not take authority from that lease
+while the release may land, nor from a lease whose release has landed or
+was given up in doubt. That still leaves the epoch with
+a carried lease and no hold owner, and the members' close rule (close only
+once the carried lease has moved) needs someone to move it. That can only
+be the carrier.
+
+### 4373: a segment named a chunk S3 did not hold (simulation bug)
+
+Violated: `a segment named a chunk S3 does not hold` (`ChunkWorld::check_segment`).
+
+- Epoch [1, 2] with holder 2. Node 1's own `CutS3` fault (2463 ms + 1755 ms)
+  ends at 4218 ms with `set_cut(1, false)`, which also lifts the epoch
+  outage's cut on node 1 early. At 4366 ms node 1 cannot reach holder 2 and
+  puts an **inbox batch** to S3 with a `SetManifest` of `0x406` naming its
+  chunk `066188d4…`, which is dirty on its disk only. At 4400 ms node 1
+  crashes for good.
+- At 25 945 ms node 2's takeover gate drains the older epochs' batches. It
+  executes node 1's `SetManifest` and ships it in segment 24, and the chunk
+  was never in S3.
+
+Why it is a simulation bug: the daemon's `S3Op::InboxPut` arm
+(`engine/src/authority_driver.rs`, `inbox_manifests_pending`) uploads the
+chunks of every manifest in the batch *before* the PUT ("the inbox carries
+no pending-chunk list … a manifest goes through it only once its chunks are
+up") and fails the PUT if it cannot. The sim's driver put the batch as is.
+The oracle is right. The sim's driver now does what the daemon does. The
+overlapping cut faults are realistic: S3 coming back to one member during
+an epoch is allowed, and the daemon handles it.
+
+### 19013, 21497, 28752: "the log stalled behind a deferred transaction" (oracle bug)
+
+Violated: the run's stall sampler ("kept N shippable journal row(s)
+unshipped for 5 s behind deferred transaction(s)"), always at t = 11000.
+
+All three pause the hold owner (node 3) for 6–7 s, starting before the
+heal (4920 + 6997, 4796 + 6216, 4630 + 6461 ms). The sampler counts a node
+as sequencing from its last published `CoreView` (`held_epoch`, not lost,
+S3 not cut). A paused node's view is the one from before its pause, and
+the node handles no event, so it ships nothing until the pause ends.
+`run_fault`'s `Pause` models a stopped process ("events queue up and are
+handled, late, once the pause ends"). The sampler checks that a node that
+*can* ship does not stall behind one absent member's chunk. It already
+skipped dead nodes, and now it skips paused ones the same way: their count
+restarts. The sampler keeps running after the pause, so a stall after the
+node resumes is still caught. All three seeds pass, and nothing fired
+after the resume.
+
+### Fix
+
+Product (`crates/authority/src/core/`):
+
+- **`promise.rs`, `PromiseState`**: two new fields. `owes_move` is the
+  carried lease (epoch, expiry), this node's own, whose epoch it owes the
+  close of without holding it. It is persisted (`local["epoch_owes_move"]`,
+  **`replica.rs`, `Replica::epoch_owes_move` / `persist_epoch_owes_move`**).
+  `released` is the lease this process last released or gave up in doubt
+  (memory only). New helpers: `Core::epoch_carries_let_go`,
+  `owe_epoch_move`, `owes_carried_move`, `settle_owed_move`,
+  `epoch_hold_after_kept_release`. `epoch_members` keeps the last reported
+  members for that last helper.
+- **`mod.rs`, `Core::on_epoch_state`**: an activation that carries this
+  node's lease while `lease.releasing`, or carries exactly the lease it
+  released or gave up (`released`), adopts no hold and records
+  `owes_move`. The M12 late-adopt path skips a carrier in `owes_move` or
+  `released`. The "re-affirming" branch skips a releasing lease. A report
+  of a closed epoch settles `owes_move`.
+- **`jobs.rs`, `Core::epoch_carrier_checked`**: a member whose carried
+  lease is its own, which holds no hold and owes the move, closes its
+  epoch (`epoch_probe_close`) instead of waiting for itself.
+- **`jobs.rs`, `Core::on_uploads_done`** (the probe's close): an owed
+  close calls `end_epoch_hold(replica, true)` as a hold owner's close
+  does. `epoch_reclaim_due` then re-claims the lease after the close if
+  it still stands. If the release did land, the object reads released,
+  the "moved" rule closes every member, and nothing is re-claimed.
+- **`jobs.rs`, `release_landed` and the `ReleaseReread` arm**: these
+  record `released`. **`finish_flush_job` and the `ReleaseReread` arm**:
+  if the release ends with the lease kept, the epoch is active, and it
+  carries that lease, the node adopts the hold
+  (`epoch_hold_after_kept_release`).
+- **`promise.rs`, `Core::adopt_epoch_hold` / `Core::end_epoch_hold`**:
+  any hold adopted, handed off or closed settles `owes_move`.
+  `end_epoch_hold(.., true)` keeps the re-claim obligation in memory even
+  if persisting it fails.
+- **`promise.rs`, `Core::epoch_claim_view`**: a lease being released is
+  not offered as an epoch claim, so the formation never carries it.
+  (Reverted in fix round 2: an epoch formed during a release carried
+  nothing and refused every write even when the release failed.)
+
+Simulation (`crates/authority/tests/sim/`):
+
+- **`chunks.rs`, `ChunkWorld::upload_before_inbox`** (new), called from
+  **`node.rs`, `Driver::spawn_s3`** (`S3Op::InboxPut`): before the PUT,
+  run the upload pass for each `SetManifest` whose chunks are pending on
+  the sender, and fail the PUT if S3 is cut.
+- **`run.rs`**, the deferred-stall sampler in `run_inner`: the count of
+  a paused node (`NodeHandle::paused`, from main's metered-own-rows) is
+  frozen, not reset. A stall split by a pause still adds up.
+
+Tests:
+
+- `core::tests::an_epoch_carrying_a_lease_being_released_is_closed_and_reclaimed_by_its_carrier`
+  drives the 16364 interleaving deterministically: activation while
+  releasing, in-doubt give-up, re-report, then S3 back with the carried
+  object still standing. It expects no hold, an `EpochClose`, and a
+  re-claim CAS that moves the lease. It failed before the fix ("an epoch
+  hold adopted on a lease being released").
+- `core::tests::an_owed_epoch_move_is_dropped_once_the_hold_is_adopted_and_handed_off`
+  (review must-fix 1),
+  `a_carrier_whose_release_ends_with_the_lease_kept_adopts_the_epoch_hold`
+  (should-fix 2) and
+  `an_activation_carrying_a_released_lease_owes_the_move_and_adopts_nothing`
+  (should-fix 1, which includes a restart). All three fail on the first
+  round's code.
+- `sim.rs`, `flex_crash_seeds_de53bd1`: seeds 16364, 4373, 19013, 21497,
+  28752 (all failed on `de53bd1`).
+
+### Sweeps (release, 8 threads)
+
+| Config, seeds | Before (`de53bd1`) | After |
+|---|---|---|
+| `flex-crash` 0..30 000 | 5 failing: 4373, 16364, 19013, 21497, 28752 | 0 failing |
+| `flex` 0..30 000 | 0 failing | 0 failing |
+
+### Gates, first round (superseded by the fix rounds' tables below; this host, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` | no diff, clean |
+| `cargo test -p constellation-authority -p constellation-meta --release` | all passed (authority lib 188, sim 112 passed / 11 ignored, meta all passed) |
+| `cargo test --workspace --no-fail-fast` (run in six package groups to fit the tool cap) | 2436 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | ok |
+
+### Exit criteria
+
+- [x] Each seed reproduced on main, its mechanism and violated invariant named.
+- [x] Product bug or sim/oracle bug, justified from the design and the daemon's code. The two oracle and simulation changes bring the sim in line with the daemon and loosen no assertion.
+- [x] The product bug is fixed at its source, with a deterministic core test that failed before the fix. All five seeds are pinned.
+- [x] `flex-crash` and `flex` 0..30 000 clean in release.
+
+### Fix round (review: must-fix 1, should-fix 1-4, nits; rebased on `72438dc`)
+
+- **Must-fix 1**: the "owes the move" obligation was `hold_ended`'s
+  `closed` flag, and it went stale. A carrier whose release was abandoned
+  later adopted the hold on the kept lease and handed it to node 2 over
+  P2P. A handoff keeps a `true` flag, so at the heal it closed the epoch
+  that node 2 held, and re-claimed the lease. The obligation is now its
+  own persisted field (`owes_move`). Adopting a hold, handing it off, the
+  close, and a closed-epoch report all drop it.
+- **Should-fix 1**: an activation delivered after the release landed (or
+  was given up in doubt) carries a lease `lease.held` no longer has. The
+  late-adopt path used to take the hold on it. The process now remembers
+  the lease it released (`released`), so that activation owes the move,
+  and the persisted `owes_move` keeps a restart from adopting it either.
+  Open: a restart between the release and the activation has no
+  `released`, and the late adoption still applies there (the window the
+  M12 restart path always had).
+- **Should-fix 2**: a release that ends with the lease kept, while the
+  active epoch carries it, adopts the hold. This covers a failed handoff
+  flush and a re-read that finds the lease standing. A frozen epoch
+  adopts at the thaw through the normal path.
+- **Should-fix 3**: `owe_epoch_move` keeps the obligation in memory even
+  if persisting fails. This process then never adopts that hold, and only
+  a restart could, as before the record existed. `end_epoch_hold(.., true)`
+  also keeps its re-claim obligation in memory on a persist failure.
+  Marking the lease lost was not used: it is persisted the same way, so
+  it gives no more across a restart, and it would have dropped a lease
+  that may still be valid in the middle of its release job.
+- **Should-fix 4 / merge with metered-own-rows**: there is now one
+  paused-node check in the stall sampler, and it freezes the count.
+- **Composition with epoch-lock-grants (650acc8)**: a lease being or
+  having been RELEASED (a release CAS may land, after which anyone may
+  claim it without promises) gets no epoch claim and no hold, and its
+  carrier owes the close. A lease CLOSED by an epoch whose re-claim is
+  pending was never released, stands in S3 as this node's, and is
+  claimed and held again (`epoch_closed_claim`, the re-hold block). The
+  two states cannot overlap: `epoch_closed_claim` needs
+  `lease.held == None`, and `releasing` needs a held lease. In
+  `on_epoch_state` the order is: the re-hold block, the stale claim, the
+  owed move, carries-mine, then the closed-claim-stale branch. Both rules
+  are stated in code comments and in `durability-and-failover.md`.
+- **Nits**: `upload_before_inbox` dedups inodes. The TESTING.md sentence
+  is reworded. The safety claim above is reworded.
+
+Gates (fix round, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p constellation-authority -p constellation-meta --release` | all passed (authority lib 209, sim 114 / 11 ignored) |
+| `sweep_config` `flex-crash` 0..30 000, `flex` 0..30 000 (release, 8 threads) | 0 failing |
+| `sweep_config` `locks-blips` 0..3000, `metered-shared` 0..1000 | 0 failing |
+| `sweep_config` `locks-blips-tight` 0..3000 | 1 failing: **2723**, which also fails on `72438dc` (see below) |
+| `cargo test --workspace --no-fail-fast` (package groups) | 2468 passed, 0 failed |
+| `cargo build --release --workspace` | ok |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+
+`locks-blips-tight` seed 2723 fails mutual exclusion: node 1 (t17,
+Exclusive, in I/O since 10 937) and node 2 (t33, Shared) at 11 361. It
+fails the same way with every file of this change reverted to `72438dc`.
+None of this change's paths run in it (no owed-move or kept-release
+log). Node 1 re-acquires at epoch 2 for a lock at 10 884 and makes two
+Exclusive grants at 10 937 and 10 961. At 10 972 it releases the lease
+and drops both ("lease gone: lock grants dropped"), with no epoch open
+and no idle-release or handoff log. Node 2 takes the lease at 11 031 and
+grants Shared while t17 is still in I/O. Not this mechanism: it is a
+release that drops live lock grants, which belongs to the
+lock-fence-token / epoch-lock-grants area. Left open.
+
+### Fix round 2 (review verdict approve: should-fix 1-3, nits; rebased on `5f289b4`)
+
+- **Should-fix 3 (safety): the release record is durable.** `released`
+  was memory-only. When the release CAS landed and the process restarted
+  before the activation carrying that lease arrived, the late adoption
+  took the hold on a released lease, which any node with S3 could claim
+  without promises. `issue_release` now persists the lease it is about
+  to release (`local["lease_released"]`, **`Replica::lease_released` /
+  `persist_lease_released`**, `Core::record_release`) before the CAS goes
+  out; if that write fails, the CAS does not go out and the job fails
+  with the lease kept. `promise_start` loads the record into `released`,
+  so after a restart the activation (`epoch_carries_let_go`), the late
+  adoption and `restore_epoch_hold` all take the owed-move route.
+  `release_superseded` clears the record when the release ends with the
+  lease kept, and clears it together with `released` and `given_up`
+  when a lease is acquired (`acquire_won`). A new lease
+  has a new expiry, so no activation carrying the old one matches it.
+  This answers the second nit (the doc comment on `released` says so).
+- **Should-fix 1: the in-doubt give-up of a held epoch's lease.** In the
+  `ReleaseReread { in_doubt: true }` give-up arm, if the open epoch
+  carries exactly the lease being given up (`epoch_carries`), the move is
+  recorded after the wipe (`owe_given_up_move`). `end_epoch_hold` now
+  settles `owes_move` only for the close (`closed`): a hold that merely
+  vanished leaves it. A handoff needs a hold, which an owed move never
+  has. `epoch_carries_let_go` now requires `!epoch_held()`, so a thaw
+  during the release does not record a move under a standing hold.
+- **Should-fix 2: the claim during a release.** `epoch_claim_view` again
+  offers a lease being released, and the owed-move path covers both
+  outcomes: kept means the hold is adopted, landed means the move is
+  owed. For a lease given up in doubt, the process records it
+  (`given_up`), and `epoch_refuses_writes` refuses while the active epoch
+  carries that lease and nobody holds the epoch
+  (`epoch_carried_given_up`). The give-up arm answers waiting ops `EROFS`
+  at once (`refuse_waiting_for_lease`). A landed release is not refused
+  this way: its object reads released and the epoch closes at the heal
+  as before.
+- **Nits.** `finish_round` calls `epoch_hold_after_kept_release`, so a
+  Round whose release is abandoned through `job_failed` adopts the hold
+  too. `released`'s doc comment explains when it is cleared.
+  `upload_before_inbox` uses the forced pass (`upload_forced`), because
+  the daemon's `Uploader::run(Some(ino))` is `upload_dirty_chunks_report`
+  (not the background pass) and goes past the metered hold. The first
+  gates table is labelled as the first round's.
+
+Functions touched this round: `promise.rs` `promise_start`,
+`epoch_claim_view`, `end_epoch_hold`, `epoch_carries_let_go`,
+`epoch_hold_after_kept_release`, `restore_epoch_hold`, new
+`epoch_carries`, `owe_given_up_move`, `record_release`,
+`release_superseded`; `jobs.rs` `issue_release`, `finish_round`, the
+`ReleaseReread` arm of the job S3 dispatch, `acquire_won`;
+`client.rs` `epoch_refuses_writes`, new `epoch_carried_given_up`;
+`mod.rs` `on_epoch_state` (the late adoption owes instead of declining);
+`replica.rs` the two new `Replica` methods; sim `chunks.rs`
+`upload_before_inbox`.
+
+New core tests (each fails with its fix toggled off; checked one toggle
+at a time):
+`a_restart_after_the_release_cas_went_out_owes_the_move_instead_of_holding`
+(release record not loaded),
+`the_release_record_is_cleared_by_a_kept_release_and_by_an_acquisition`,
+`a_held_epochs_release_given_up_in_doubt_owes_the_move_and_refuses_writes`
+(the reviewer's scenario. It fails without `owe_given_up_move`, with
+`end_epoch_hold(false)` settling, without the `!epoch_held()` check, and
+without the `EROFS` rule), and
+`an_outage_during_a_release_that_ends_kept_serves_writes` (fails with
+the claim exclusion back).
+
+Gates (fix round 2, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p constellation-authority -p constellation-meta --release` (`TMPDIR=/dev/shm`) | all passed (authority lib 213 / 2 ignored, sim 114 / 11 ignored, meta lib 224) |
+| `sweep_config` `flex-crash` 0..20 000, `flex` 0..20 000 (release, 8 threads) | 0 failing |
+| `sweep_config` `locks-blips` 0..3000, `metered-shared` 0..1000 | 0 failing |
+| `cargo test --workspace --no-fail-fast` (one run) | 2539 passed, 0 failed, 49 ignored |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | ok |
+
+`locks-blips-tight` 2723 is owned by `lock-release-drop` and was not
+re-run.

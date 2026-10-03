@@ -11076,6 +11076,636 @@ fn a_hold_owner_with_nothing_to_flush_reclaims_the_carried_lease_at_the_close() 
     assert!(!h.core.epoch_reclaim_due(), "the obligation settled");
 }
 
+/// Flex-crash seed 16364: the holder acked an epoch claim of its lease,
+/// was paused, and on resuming began its idle release before the
+/// activation reached its core. The release CAS may land — a released
+/// lease is anyone's without promises — so no hold may stand on it; and
+/// adopting one anyway, the release's in-doubt give-up (S3 cut) wiped
+/// it: nobody held the epoch, its members waited for the carried lease
+/// to move, the carrier waited for itself, and no promise was ever given
+/// again. Now the activation adopts nothing and records that this node
+/// owes the move; once S3 is back it closes its epoch and re-claims the
+/// lease its release did not free.
+#[test]
+fn an_epoch_carrying_a_lease_being_released_is_closed_and_reclaimed_by_its_carrier() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = crate::event::Carrier {
+        node: 1,
+        epoch: carried.epoch,
+        expires_unix_ms: carried.expires_unix_ms,
+    };
+    let state = |open: bool, active: bool, frozen: bool, flushing: bool| Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Epoch {
+            open,
+            active,
+            frozen,
+            flushing,
+            base: 0,
+            members: vec![1, 2],
+            carrier: Some(carrier),
+            stale_below: 1,
+        },
+    };
+    // The idle release is in its final section when the activation lands.
+    h.core.lease.releasing = true;
+    h.step(state(true, true, false, false));
+    assert!(
+        !h.core.lease.epoch_held(),
+        "an epoch hold adopted on a lease being released"
+    );
+    // The release CAS fails without an answer and the re-read fails too:
+    // the lease is given up locally (`ReleaseReread { in_doubt: true }`).
+    h.core.lease.released();
+    // A re-report (a freeze and a thaw) adopts nothing either.
+    h.step(state(true, false, true, false));
+    h.step(state(true, true, false, false));
+    assert!(!h.core.lease.epoch_held(), "the given-up lease re-adopted");
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let (mut closed, mut reclaimed) = (false, None);
+    for _ in 0..200 {
+        if reclaimed.is_some() {
+            break;
+        }
+        let mut next = Vec::new();
+        for action in std::mem::take(&mut out) {
+            match action {
+                Action::EpochClose => {
+                    closed = true;
+                    next.extend(h.step(state(false, false, false, true)));
+                }
+                Action::UploadDirtyChunks { op, .. } => next.extend(h.step(Event::UploadsDone {
+                    op,
+                    result: UploadResult::Done { held: 0 },
+                })),
+                Action::S3 { op, req } => {
+                    let result = match req {
+                        S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                        S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                        // The release never landed: the carried lease stands.
+                        S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((carried.clone(), tag())))),
+                        S3Op::LeaseSwap { lease, .. } => {
+                            if closed && lease.holder == 1 && !lease.released {
+                                reclaimed = Some(lease.clone());
+                            }
+                            S3Result::LeasePut(Ok(tag()))
+                        }
+                        _ => continue,
+                    };
+                    next.extend(h.step(Event::S3 { op, result }));
+                }
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::Poll,
+                    ..
+                } => {
+                    next.extend(h.step(Event::Timer { id }));
+                }
+                _ => {}
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        h.advance(20);
+        out = next;
+    }
+    assert!(closed, "the carrier never closed its epoch");
+    let lease = reclaimed.expect("the carried lease was not re-claimed at the close");
+    assert_eq!(lease.epoch, carried.epoch);
+    assert_ne!(
+        lease.expires_unix_ms, carried.expires_unix_ms,
+        "the re-claim moves the carried lease"
+    );
+}
+
+/// The `Control::Epoch` report for an epoch of members 1 and 2 carrying
+/// `carrier`.
+fn epoch_report(
+    carrier: crate::event::Carrier,
+    open: bool,
+    active: bool,
+    frozen: bool,
+    flushing: bool,
+) -> Event {
+    Event::Control {
+        op: OpId(1 << 40),
+        req: Control::Epoch {
+            open,
+            active,
+            frozen,
+            flushing,
+            base: 0,
+            members: vec![1, 2],
+            carrier: Some(carrier),
+            stale_below: 1,
+        },
+    }
+}
+
+/// The holder serves an (epoch-less) handoff request from node 3: the
+/// release CAS is in flight, `releasing` up. Its op.
+fn handoff_release_in_flight(h: &mut Harness) -> OpId {
+    let out = h.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::LeaseRequest {
+            req: OpId(5),
+            epoch_applied: None,
+        },
+    });
+    let upload = out
+        .iter()
+        .find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the handoff uploads first");
+    let out = h.step(Event::UploadsDone {
+        op: upload,
+        result: UploadResult::Done { held: 0 },
+    });
+    assert!(h.core.lease.releasing);
+    let (release, req) = s3_ops(&out)[0];
+    assert!(matches!(req, S3Op::LeaseSwap { lease, .. } if lease.released));
+    release
+}
+
+/// S3 back: run the polls until the epoch closes and the carried lease
+/// is re-claimed, or nothing is left to do. Lease reads answer `object`.
+/// Whether it closed, and the re-claim's lease.
+fn epoch_probe_until_close(
+    h: &mut Harness,
+    carrier: crate::event::Carrier,
+    object: Lease,
+) -> (bool, Option<Lease>) {
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let (mut closed, mut reclaimed) = (false, None);
+    for _ in 0..200 {
+        if reclaimed.is_some() {
+            break;
+        }
+        let mut next = Vec::new();
+        for action in std::mem::take(&mut out) {
+            match action {
+                Action::EpochClose => {
+                    closed = true;
+                    next.extend(h.step(epoch_report(carrier, false, false, false, true)));
+                }
+                Action::UploadDirtyChunks { op, .. } => next.extend(h.step(Event::UploadsDone {
+                    op,
+                    result: UploadResult::Done { held: 0 },
+                })),
+                Action::S3 { op, req } => {
+                    let result = match req {
+                        S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                        S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                        S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((object.clone(), tag())))),
+                        S3Op::LeaseSwap { lease, .. } => {
+                            if closed && lease.holder == 1 && !lease.released {
+                                reclaimed = Some(lease.clone());
+                            }
+                            S3Result::LeasePut(Ok(tag()))
+                        }
+                        _ => continue,
+                    };
+                    next.extend(h.step(Event::S3 { op, result }));
+                }
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::Poll,
+                    ..
+                } => {
+                    next.extend(h.step(Event::Timer { id }));
+                }
+                _ => {}
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        h.advance(20);
+        out = next;
+    }
+    (closed, reclaimed)
+}
+
+fn carrier_of(lease: &Lease) -> crate::event::Carrier {
+    crate::event::Carrier {
+        node: lease.holder,
+        epoch: lease.epoch,
+        expires_unix_ms: lease.expires_unix_ms,
+    }
+}
+
+/// Review of flex-crash seed 16364's fix (must-fix 1): the move a
+/// releasing carrier owes is its own record, dropped once it holds the
+/// epoch after all. The release ended with the lease kept while the
+/// epoch was frozen, the thaw adopted the hold on the kept lease, and
+/// node 2 then took the hold over P2P. With the obligation left standing
+/// (it was `hold_ended`'s "closed" flag, which a handoff keeps), node 1
+/// closed the epoch at the heal while node 2 owned its hold and journal,
+/// and re-claimed the lease beside it. Now node 1 waits for node 2, as
+/// any member does.
+#[test]
+fn an_owed_epoch_move_is_dropped_once_the_hold_is_adopted_and_handed_off() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let release = handoff_release_in_flight(&mut h);
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(!h.core.lease.epoch_held());
+    assert_eq!(
+        h.core.pr.owes_move,
+        Some((carried.epoch, carried.expires_unix_ms))
+    );
+    // Frozen, then the release CAS conflicts and the re-read finds the
+    // lease standing: kept.
+    h.step(epoch_report(carrier, true, false, true, false));
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((carried.clone(), tag())))),
+    });
+    assert!(!h.core.lease.releasing);
+    assert!(h.core.lease.held.is_some(), "the lease was kept");
+    // The thaw adopts the hold on the kept lease: the move is not owed.
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(h.core.lease.epoch_held());
+    assert_eq!(h.core.pr.owes_move, None);
+    assert_eq!(h.meta.epoch_owes_move(), None);
+    // Node 2 takes the hold over P2P.
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::LeaseRequest {
+            req: OpId(6),
+            epoch_applied: Some(h.core.ship.head_seq),
+        },
+    });
+    assert!(
+        matches!(
+            sends(&out)[0].1,
+            PeerMsg::LeaseHandoff {
+                req: OpId(6),
+                released: true,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert!(!h.core.lease.epoch_held());
+    assert_eq!(
+        h.core.pr.hold_ended,
+        Some((carried.epoch, carried.expires_unix_ms, false))
+    );
+    // The heal: the carried lease stands (node 2's flush re-claims it);
+    // node 1 must not close the epoch, nor re-claim.
+    let (closed, reclaimed) = epoch_probe_until_close(&mut h, carrier, carried.clone());
+    assert!(!closed, "a member closed the epoch its peer holds");
+    assert!(reclaimed.is_none());
+}
+
+/// Should-fix 2 of that review: the release a carrier was running at the
+/// activation ends with the lease kept (here the CAS conflicts and the
+/// re-read finds it standing) while the epoch is active: the node is the
+/// epoch's holder after all and adopts the hold. Only owing the move,
+/// nobody held the epoch, and writes stopped at the lease's expiry until
+/// the heal.
+#[test]
+fn a_carrier_whose_release_ends_with_the_lease_kept_adopts_the_epoch_hold() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let release = handoff_release_in_flight(&mut h);
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(!h.core.lease.epoch_held());
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((carried.clone(), tag())))),
+    });
+    assert!(h.core.lease.held.is_some(), "the lease was kept");
+    assert!(
+        h.core.lease.epoch_held(),
+        "the kept carried lease's epoch has no holder"
+    );
+    assert_eq!(h.core.pr.owes_move, None);
+    assert_eq!(h.meta.epoch_owes_move(), None);
+}
+
+/// Should-fix 1 of that review: the release landed before the activation
+/// carrying the lease (acked before the release began) was delivered.
+/// `lease.held` is empty, and the late adoption ("restarted into the open
+/// epoch") took the hold on a released lease any node with S3 could
+/// claim without promises. Now the activation carrying exactly the lease
+/// this process released owes the move, a restart keeps that, and the
+/// heal closes the epoch (the lease moved: no re-claim).
+#[test]
+fn an_activation_carrying_a_released_lease_owes_the_move_and_adopts_nothing() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let release = handoff_release_in_flight(&mut h);
+    h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    assert!(h.core.lease.held.is_none(), "released");
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(
+        !h.core.lease.epoch_held(),
+        "an epoch hold adopted on a released lease"
+    );
+    assert_eq!(
+        h.core.pr.owes_move,
+        Some((carried.epoch, carried.expires_unix_ms))
+    );
+    assert_eq!(h.meta.epoch_owes_move(), h.core.pr.owes_move);
+    // A restart into the open epoch adopts nothing either.
+    let cfg = h.core.config().clone();
+    h.core = Core::new(cfg);
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(
+        !h.core.lease.epoch_held(),
+        "a restart adopted the hold on a released lease"
+    );
+    // The heal: the lease object is the released one, so the epoch
+    // closes and nothing is re-claimed.
+    let (closed, reclaimed) = epoch_probe_until_close(&mut h, carrier, carried.released());
+    assert!(closed, "the epoch never closed");
+    assert!(reclaimed.is_none(), "a released lease re-claimed");
+    assert_eq!(h.core.pr.owes_move, None, "the close settles the move");
+}
+
+/// Review round 3, should-fix 3 (a safety hole): the record that this
+/// node let a lease go was memory-only. The release CAS landed, the
+/// process died before its answer, and the restarted core adopted the
+/// hold of an activation carrying that lease (the late adoption) while
+/// any node with S3 could claim the released object without promises:
+/// two authorities. The release record is durable before the CAS goes
+/// out now, and a restart owes the move instead.
+#[test]
+fn a_restart_after_the_release_cas_went_out_owes_the_move_instead_of_holding() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    let _release = handoff_release_in_flight(&mut h);
+    assert_eq!(
+        h.meta.lease_released(),
+        id,
+        "the release record is not durable before the CAS"
+    );
+    // The CAS lands in S3; the process dies before its answer.
+    let cfg = h.core.config().clone();
+    h.core = Core::new(cfg);
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(
+        !h.core.lease.epoch_held(),
+        "a restart adopted the hold on a lease whose release went out"
+    );
+    assert_eq!(h.core.pr.owes_move, id, "the move is owed instead");
+    // A freeze and a thaw adopt nothing either.
+    h.step(epoch_report(carrier, true, false, true, false));
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(!h.core.lease.epoch_held());
+    // The heal: the object is the released lease, the epoch closes, and
+    // nothing is re-claimed.
+    let (closed, reclaimed) = epoch_probe_until_close(&mut h, carrier, carried.released());
+    assert!(closed, "the epoch never closed");
+    assert!(reclaimed.is_none(), "a released lease re-claimed");
+}
+
+/// The release record is cleared once a lease is acquired (a new expiry:
+/// no activation carrying the released lease matches it), and when the
+/// release ends with the lease kept.
+#[test]
+fn the_release_record_is_cleared_by_a_kept_release_and_by_an_acquisition() {
+    // Kept: the CAS conflicts and the re-read finds the lease standing.
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let release = handoff_release_in_flight(&mut h);
+    assert!(h.meta.lease_released().is_some());
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((carried.clone(), tag())))),
+    });
+    assert!(h.core.lease.held.is_some(), "the lease was kept");
+    assert_eq!(
+        h.meta.lease_released(),
+        None,
+        "a kept lease's record stands"
+    );
+    assert_eq!(h.core.pr.released, None);
+
+    // Landed, a restart, then an acquisition of the released object.
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let release = handoff_release_in_flight(&mut h);
+    h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Ok(tag())),
+    });
+    h.advance(1_000);
+    let cfg = h.core.config().clone();
+    h.core = Core::new(cfg);
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    assert_eq!(
+        h.core.pr.released,
+        Some((carried.epoch, carried.expires_unix_ms))
+    );
+    let out = h.step(Event::Control {
+        op: OpId(700),
+        req: Control::Acquire,
+    });
+    let (get, _) = s3_ops(&out)[0];
+    let mut out = h.step(Event::S3 {
+        op: get,
+        result: S3Result::LeaseGet(Ok(Some((carried.released(), tag())))),
+    });
+    for _ in 0..10 {
+        let Some((op, req)) = s3_ops(&out).first().map(|(o, r)| (*o, (*r).clone())) else {
+            break;
+        };
+        let result = match req {
+            S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. } => S3Result::LeasePut(Ok(tag())),
+            S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+            _ => break,
+        };
+        out = h.step(Event::S3 { op, result });
+    }
+    let held = h.core.lease.held.as_ref().expect("acquired").0.clone();
+    assert_ne!(held.expires_unix_ms, carried.expires_unix_ms);
+    assert_eq!(
+        h.meta.lease_released(),
+        None,
+        "the acquisition left the record"
+    );
+    assert_eq!(h.core.pr.released, None);
+}
+
+/// Review round 3, should-fix 1: the carrier held the epoch normally, the
+/// epoch froze, a non-member's request started a handoff, and the release
+/// CAS failed in doubt with the re-read failing too. The give-up wiped
+/// the lease and its hold, the hold's end settled the owed move, and at
+/// the heal the carrier found its lease standing, owed nothing and waited
+/// for itself: nobody closed the epoch. A thaw while the release ran also
+/// recorded the move while the hold still stood. Now the give-up records
+/// the move after the wipe, the hold's end leaves it, writes are refused
+/// (`EROFS`) at once, and the heal closes the epoch and re-claims.
+#[test]
+fn a_held_epochs_release_given_up_in_doubt_owes_the_move_and_refuses_writes() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let id = Some((carried.epoch, carried.expires_unix_ms));
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(h.core.lease.epoch_held(), "the carrier holds the epoch");
+    h.step(epoch_report(carrier, true, false, true, false));
+    let release = handoff_release_in_flight(&mut h);
+    // A thaw while the release runs: the hold stands, nothing is owed.
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(h.core.lease.epoch_held());
+    assert_eq!(
+        h.core.pr.owes_move, None,
+        "a move owed under a standing hold"
+    );
+    // An op waiting for the lease meanwhile.
+    let waiting = h.rid(1);
+    let op = h.create("a");
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Failed("timed out".into()))),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: waiting,
+        op,
+    });
+    assert!(
+        h.core.clients().any(|(r, _)| r == waiting),
+        "the op does not wait for the lease"
+    );
+    let out = h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Err(crate::event::S3Failure("timed out".into()))),
+    });
+    assert!(h.core.lease.held.is_none(), "given up");
+    assert!(!h.core.lease.epoch_held());
+    assert_eq!(h.core.pr.owes_move, id, "the give-up's move is not owed");
+    assert_eq!(h.meta.epoch_owes_move(), id);
+    let refused = |out: &[Action], rid: Rid| {
+        replies(out).iter().any(|(r, reply)| {
+            *r == rid
+                && matches!(
+                    reply,
+                    ClientReply::Outcome(MutateOutcome::Errno(Code::ReadOnly))
+                )
+        })
+    };
+    assert!(
+        refused(&out, waiting),
+        "an op waits out its deadline in an epoch nobody holds: {out:?}"
+    );
+    // A write routed now is refused at once, with no S3 read.
+    let late = h.rid(2);
+    let op = h.create("b");
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: late,
+        op,
+    });
+    assert!(refused(&out, late), "{out:?}");
+    assert!(s3_ops(&out).is_empty(), "{out:?}");
+    // The heal: the release did not land, the carried lease stands; the
+    // carrier closes its epoch and re-claims it.
+    let (closed, reclaimed) = epoch_probe_until_close(&mut h, carrier, carried.clone());
+    assert!(closed, "the carrier never closed its epoch");
+    let lease = reclaimed.expect("the carried lease was not re-claimed at the close");
+    assert_eq!(lease.epoch, carried.epoch);
+    assert_eq!(h.core.pr.owes_move, None, "the close settles the move");
+}
+
+/// Review round 3, should-fix 2: an outage that begins during a release
+/// (here the handoff's release CAS is in flight) claims the lease being
+/// released. Claiming nothing formed an epoch that carried no lease and
+/// refused every write (`EROFS`) until the heal, though the release then
+/// failed and the node held a usable lease. Now the activation owes the
+/// move, the release ending kept adopts the hold, and writes are served.
+#[test]
+fn an_outage_during_a_release_that_ends_kept_serves_writes() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let carried = h.core.lease.held.as_ref().unwrap().0.clone();
+    let carrier = carrier_of(&carried);
+    let release = handoff_release_in_flight(&mut h);
+    let claim = h.core.epoch_claim_view(h.now).held;
+    assert_eq!(
+        claim.map(|l| (l.epoch, l.expires_unix_ms)),
+        Some((carried.epoch, carried.expires_unix_ms)),
+        "a lease being released is not claimed"
+    );
+    h.step(epoch_report(carrier, true, true, false, false));
+    assert!(!h.core.lease.epoch_held());
+    let out = h.step(Event::S3 {
+        op: release,
+        result: S3Result::LeasePut(Err(CasFailure::Conflict)),
+    });
+    let (reread, _) = s3_ops(&out)[0];
+    h.step(Event::S3 {
+        op: reread,
+        result: S3Result::LeaseGet(Ok(Some((carried.clone(), tag())))),
+    });
+    assert!(
+        h.core.lease.epoch_held(),
+        "the kept lease's epoch has no holder"
+    );
+    assert!(!h.core.epoch_refuses_writes());
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    assert!(
+        replies(&out).iter().any(|(r, reply)| *r == rid
+            && matches!(reply, ClientReply::Outcome(MutateOutcome::Accepted { .. }))),
+        "{out:?}"
+    );
+}
+
 /// A member of an epoch carrying another member's lease, once S3 is back:
 /// it reads the lease object and closes only when the carried lease is no
 /// longer there (flex-crash seed 4309: "a segment past `base`" closed a

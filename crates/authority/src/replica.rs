@@ -496,6 +496,16 @@ pub trait Replica {
     /// still owes the re-claim of that lease (`Core::epoch_reclaim_due`).
     fn epoch_hold_ended(&self) -> Option<(Epoch, i64, bool)>;
     fn persist_epoch_hold_ended(&self, ended: Option<(Epoch, i64, bool)>) -> Result<(), MetaError>;
+    /// The carried lease (`epoch`, `expires_unix_ms`), this node's own,
+    /// whose epoch it owes the close of without holding it
+    /// (`local["epoch_owes_move"]`, `PromiseState::owes_move`).
+    fn epoch_owes_move(&self) -> Option<(Epoch, i64)>;
+    fn persist_epoch_owes_move(&self, owed: Option<(Epoch, i64)>) -> Result<(), MetaError>;
+    /// The lease (`epoch`, `expires_unix_ms`) this node last issued the
+    /// release CAS for (`local["lease_released"]`, written before the CAS
+    /// goes out; `PromiseState::released` after a restart).
+    fn lease_released(&self) -> Option<(Epoch, i64)>;
+    fn persist_lease_released(&self, released: Option<(Epoch, i64)>) -> Result<(), MetaError>;
 }
 
 impl Replica for Meta {
@@ -1249,5 +1259,29 @@ impl Replica for Meta {
             .map(|(e, x, r)| format!("{e}:{x}:{}", u8::from(r)))
             .unwrap_or_default();
         Meta::kv_set_durable(self, "epoch_hold_ended", &v)
+    }
+
+    fn epoch_owes_move(&self) -> Option<(Epoch, i64)> {
+        let v = Meta::kv_get(self, "epoch_owes_move").ok().flatten()?;
+        let (epoch, expires) = v.split_once(':')?;
+        Some((epoch.parse().ok()?, expires.parse().ok()?))
+    }
+
+    fn persist_epoch_owes_move(&self, owed: Option<(Epoch, i64)>) -> Result<(), MetaError> {
+        let v = owed.map(|(e, x)| format!("{e}:{x}")).unwrap_or_default();
+        Meta::kv_set_durable(self, "epoch_owes_move", &v)
+    }
+
+    fn lease_released(&self) -> Option<(Epoch, i64)> {
+        let v = Meta::kv_get(self, "lease_released").ok().flatten()?;
+        let (epoch, expires) = v.split_once(':')?;
+        Some((epoch.parse().ok()?, expires.parse().ok()?))
+    }
+
+    fn persist_lease_released(&self, released: Option<(Epoch, i64)>) -> Result<(), MetaError> {
+        let v = released
+            .map(|(e, x)| format!("{e}:{x}"))
+            .unwrap_or_default();
+        Meta::kv_set_durable(self, "lease_released", &v)
     }
 }

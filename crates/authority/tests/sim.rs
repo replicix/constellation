@@ -3625,6 +3625,25 @@ fn flex_crash_regression_seeds() {
     }
 }
 
+/// The flex-crash seeds of 1000..30 000 that failed on `de53bd1`
+/// (sweep by the metered-own-rows review, then this fix's own). 16364:
+/// an activation carrying the lease its holder had begun idle-releasing
+/// (paused across the formation) — the hold it adopted was wiped by the
+/// release's in-doubt give-up, nobody held the epoch and it never closed;
+/// now no hold is adopted on a lease being (or already) released, and
+/// its carrier owes the close and the re-claim once S3 is back. 4373: the sim's inbox PUT did
+/// not upload the batch's manifest chunks first, as the daemon does, so
+/// a sender that died for good left a batch naming a chunk only its disk
+/// held. 19013, 21497, 28752: the stall sampler counted a paused hold
+/// owner as sequencing (it ships nothing until it resumes).
+#[test]
+fn flex_crash_seeds_de53bd1() {
+    for seed in [16364, 4373, 19013, 21497, 28752] {
+        run_seed(seed, flex_crash_config())
+            .unwrap_or_else(|e| panic!("flex-crash seed {seed}: {e}"));
+    }
+}
+
 /// Plan 30 §M10 × §M9: the members of a continuation epoch keep following
 /// the hold owner's log stream, and it streams its epoch journal ahead.
 /// The flex workload has clients on every node, so the member forwards
